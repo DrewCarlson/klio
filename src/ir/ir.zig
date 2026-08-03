@@ -4231,10 +4231,20 @@ pub const Module = struct {
             const score = applicability.applicable(sig, proof_args, scope) orelse continue;
             if (score.ext_key.?[0] != 0 and tier < best_tier) best_tier = tier;
         }
-        if (best_tier == 255) return .{};
+        if (best_tier == 255) {
+            if (std.c.getenv("KLIO_REX_TRACE") != null) {
+                if (applicability.trace_call_span) |sp| std.debug.print("[rex-exit] {s} no-applicable-tier at=f{d}:{d}\n", .{ name, sp.file.int(), sp.start });
+            }
+            return .{};
+        }
         // A same-or-inner-tier declaration whose visibility metadata is not
         // complete cannot be compared safely with the ranked set.
-        if (unknown_best_tier <= best_tier) return .{ .applicable = true };
+        if (unknown_best_tier <= best_tier) {
+            if (std.c.getenv("KLIO_REX_TRACE") != null) {
+                if (applicability.trace_call_span) |sp| std.debug.print("[rex-exit] {s} unknown-tier {d}<={d} at=f{d}:{d}\n", .{ name, unknown_best_tier, best_tier, sp.file.int(), sp.start });
+            }
+            return .{ .applicable = true };
+        }
 
         var ranked_sigs: std.ArrayList(applicability.SigView) = .empty;
         var ranked_ids: std.ArrayList(FuncId) = .empty;
@@ -4258,7 +4268,11 @@ pub const Module = struct {
         var best_unknown = false;
         var tied = false;
         for (ranked_sigs.items, ranked_ids.items, ranked_unknowns.items) |*sig, fid, unknown| {
-            const score = applicability.applicable(sig, proof_args, ranked_scope) orelse continue;
+            const maybe_score = applicability.applicable(sig, proof_args, ranked_scope);
+            if (maybe_score == null and std.c.getenv("KLIO_REX_TRACE") != null) {
+                if (applicability.trace_call_span) |sp| std.debug.print("[rex-key] {s} fid={d} DISQUALIFIED at=f{d}:{d}\n", .{ name, fid.int(), sp.file.int(), sp.start });
+            }
+            const score = maybe_score orelse continue;
             const key = score.ext_key.?;
             if (std.c.getenv("KLIO_REX_TRACE") != null) {
                 if (applicability.trace_call_span) |sp| {
