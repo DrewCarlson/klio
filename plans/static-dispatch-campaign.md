@@ -1340,3 +1340,19 @@ apply the refutation THERE). The slice was reverted rather than kept
 unproven; re-derive it from this entry once the emission site is
 identified — the refutation logic itself (head inequality + both
 builtin identities + evidenceSubtypeCb negative) behaved as designed.
+
+## Addendum 3 — minusArray fifth level: relowered test bodies bypass the operator resolver (2026-08-03)
+
+With the flip applied and the operator lowering's lhs extended through
+staticBareReceiverType (prop-head channel answers `data -> T`), the
+`[binop]` probe (kept, KLIO_HOP_TRACE) printed ZERO rows during the
+minus test run — including for the PASSING minusElement — while the
+bake-time Duration sites do print. The lazily-relowered @Test method
+bodies never reach lowerResolvedBinaryOperator: the relower path lowers
+Binary through some other arm. Next probe: find the relower's Binary
+routing (start at lowerBinary's callers and the deferred_func_section
+body lowering; confirm with [binop] rows appearing for minusElement),
+then route it through lowerResolvedBinaryOperator; the lhs prop-head
+extension (staticBareReceiverType blk in lowerResolvedBinaryOperator)
+re-applies from this entry once the routing is fixed. All experiments
+reverted; battery green.

@@ -959,7 +959,7 @@ fn lowerResolvedBinaryOperator(
 
     const args = rhs[0..1];
     const ident = ast.Ident{ .name = method, .span = call_span };
-    switch (try lowerResolvedMemberCall(
+    const member_form = try lowerResolvedMemberCall(
         b,
         lhs,
         ident,
@@ -968,7 +968,15 @@ fn lowerResolvedBinaryOperator(
         &.{},
         declared_lhs_ty,
         .{},
-    )) {
+    );
+    if (runtime.getenvSlice("KLIO_HOP_TRACE") != null) {
+        std.debug.print("[binop] {s} lhs_ty={s} member={s}\n", .{
+            method,
+            declared_lhs_ty.name,
+            @tagName(std.meta.activeTag(member_form)),
+        });
+    }
+    switch (member_form) {
         .lowered => |reg| return reg,
         .deferred => return null,
         .none => {},
