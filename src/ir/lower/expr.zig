@@ -8049,6 +8049,10 @@ fn argLitKind(e: *const Expr) ?LitKind {
         .BoolLit => .boolean,
         .CharLit => .char,
         .StringTemplate => .string,
+        // A signed literal is a literal: `nextInt(-1)` carries numeric
+        // evidence exactly as `nextInt(1)` does.
+        .Unary => |u| if ((u.op == .Neg or u.op == .Pos) and
+            (u.expr.* == .IntLit or u.expr.* == .FloatLit)) .numeric else null,
         else => null,
     };
 }
