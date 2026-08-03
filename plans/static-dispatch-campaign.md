@@ -152,6 +152,21 @@ trustworthy self-time view — a hand-rolled tree parser double-counted):
   lock-free reads need an RCU-style snapshot, not a raw pointer.
 - Waits dominate raw samples (19.5k of 26k across threads — parked
   workers); always read the active-CPU slice, not totals.
+- ARGS POOL BUILT AND MEASURED NEUTRAL (13.37s -> 13.5s, x2 runs): the
+  EvalTls args pool landed (acquireArgsCap/releaseArgs, frame carriers
+  recycled at Frame.deinit, drain folded into the regs drain) and the
+  three main builders converted (argsListFromSlice, the member
+  fast-path list, packVarargArgs) — no benchmark movement. Conclusion:
+  the 1,903-sample memcpy leaf is dominated by the persistent-vector
+  DATA copies (`buffer.copyOf(size+1)` per add, `copyInto` per
+  mutation) — INHERENT algorithmic work the JVM also does, just on
+  faster arrays — not by carrier allocation. The pool stays (zero-risk
+  infra; marginal alloc savings) but per-call carrier work is NOT the
+  next lever. What remains is the core loop itself: instruction
+  dispatch + value move/retain cost per op. The credible next steps
+  are (a) a superinstruction/fast-path pass for the hottest op
+  sequences (GetField+CallVirtual pairs), (b) the bytecode VM. Both
+  are design-scale, not spot fixes.
 - removeRange verified NOT pathological (no drains, one 20k
   `fastForEach on host List keyed=false` walk family): its 78s is raw
   interpreted volume — 4 reps x 100 iters x 100 lists x (addAll(100) +

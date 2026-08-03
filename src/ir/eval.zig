@@ -164,6 +164,8 @@ const EvalTls = struct {
 
     /// Free-list of frame register buffers (see `acquireRegs`).
     regs_pool: std.ArrayListUnmanaged([]Value) = .empty,
+    /// Free-list of frame ARG/CAPTURE carrier buffers (see `acquireArgsCap`).
+    args_pool: std.ArrayListUnmanaged([]Value) = .empty,
     /// Lexical-origin override for file-private visibility (see
     /// `RefSiteOverride`).
     ref_site_override: ?RefSiteOverride = null,
@@ -433,7 +435,8 @@ fn releaseRegs(ev: *EvalTls, allocator: Allocator, regs: *std.ArrayList(Value)) 
         return;
     }
     regs.deinit(ra);
-    if (!gc_pool and ev.eval_depth == 0 and ev.regs_pool.items.len > 0) drainRegsPool(ev, allocator);
+    if (!gc_pool and ev.eval_depth == 0 and
+        (ev.regs_pool.items.len > 0 or ev.args_pool.items.len > 0)) drainRegsPool(ev, allocator);
 }
 
 /// Free every pooled register buffer. Called when the outermost frame unwinds
@@ -442,6 +445,49 @@ fn drainRegsPool(ev: *EvalTls, allocator: Allocator) void {
     const ra = regsAlloc(allocator);
     for (ev.regs_pool.items) |buf| ra.free(buf);
     ev.regs_pool.clearRetainingCapacity();
+    for (ev.args_pool.items) |buf| allocator.free(buf);
+    ev.args_pool.deinit(allocator);
+    ev.args_pool = .empty;
+}
+
+/// Per-thread free-list of frame ARG-carrier buffers. Every interpreted
+/// call allocates a `Value` list for its params (and one for captures)
+/// that lives until the frame tears down — the alloc+memcpy pair was the
+/// single largest active-CPU leaf in the concurrent-collection profiles.
+/// Pooled under the refcount backend only: the tracing GC owns list
+/// memory and must never see it hand-recycled, and the arena never frees.
+const ARGS_POOL_MAX: usize = 64;
+
+pub fn acquireArgsCap(allocator: Allocator, cap: usize) Allocator.Error!std.ArrayList(Value) {
+    if (runtime.reclaimEnabled()) {
+        const ev = &evtls;
+        if (ev.args_pool.items.len > 0) {
+            const buf = ev.args_pool.items[ev.args_pool.items.len - 1];
+            if (buf.len >= cap) {
+                ev.args_pool.items.len -= 1;
+                return .{ .items = buf[0..0], .capacity = buf.len };
+            }
+        }
+    }
+    var list: std.ArrayList(Value) = .empty;
+    try list.ensureTotalCapacityPrecise(allocator, @max(cap, 4));
+    return list;
+}
+
+/// Return an arg/capture carrier to the pool (refcount backend) or free it.
+/// The values inside are the caller's responsibility; only the buffer is
+/// recycled.
+pub fn releaseArgs(allocator: Allocator, list: *std.ArrayList(Value)) void {
+    if (runtime.reclaimEnabled() and list.capacity != 0) {
+        const ev = &evtls;
+        if (ev.args_pool.items.len < ARGS_POOL_MAX) {
+            const buf = list.allocatedSlice();
+            list.* = .empty;
+            ev.args_pool.append(allocator, buf) catch allocator.free(buf);
+            return;
+        }
+    }
+    list.deinit(allocator);
 }
 
 /// An in-flight `resumeContinuation` on this thread: while it rebuilds a parked
@@ -2477,9 +2523,12 @@ const Frame = struct {
             }
             self.pending_finally.release(self.allocator);
         }
+        // Args before regs: `releaseRegs` runs the depth-0 pool drain, so
+        // the outermost frame's own carriers must already be pooled (or
+        // they leak past the drain).
+        releaseArgs(self.allocator, &self.params);
+        releaseArgs(self.allocator, &self.captures);
         releaseRegs(self.tls, self.allocator, &self.regs);
-        self.params.deinit(self.allocator);
-        self.captures.deinit(self.allocator);
         chainRelease(self.tls, &self.enclosing_this);
     }
 

@@ -8315,8 +8315,8 @@ fn funcAt(module: *const Module, fid: FuncId) ?Func {
 }
 
 fn argsListFromSlice(allocator: Allocator, slice: []const Value) Allocator.Error!std.ArrayList(Value) {
-    var l: std.ArrayList(Value) = .empty;
-    try l.appendSlice(allocator, slice);
+    var l = try ir.eval.acquireArgsCap(allocator, slice.len);
+    l.appendSliceAssumeCapacity(slice);
     return l;
 }
 
@@ -10079,8 +10079,7 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     // hot member-dispatch path).
     const has_vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
     if (!has_vararg and args.len + 1 >= f.params.len) {
-        var list: std.ArrayList(Value) = .empty;
-        try list.ensureTotalCapacityPrecise(allocator, args.len + 1);
+        var list = try ir.eval.acquireArgsCap(allocator, args.len + 1);
         list.appendAssumeCapacity(receiver.*);
         list.appendSliceAssumeCapacity(args);
         if (trace.invariantsEnabled()) {

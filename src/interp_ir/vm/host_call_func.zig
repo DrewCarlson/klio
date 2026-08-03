@@ -190,8 +190,7 @@ fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(
     // machinery (only reachable through named/defaulted shapes).
     if (tail_fixed != 0 and args.items.len < vp + tail_fixed) return args.*;
     const n_var = if (args.items.len > vp + tail_fixed) args.items.len - vp - tail_fixed else 0;
-    var out: std.ArrayList(Value) = .empty;
-    try out.ensureTotalCapacity(allocator, n_params);
+    var out = try ir.eval.acquireArgsCap(allocator, n_params);
     var i: usize = 0;
     while (i < vp and i < args.items.len) : (i += 1) {
         out.appendAssumeCapacity(args.items[i]);
@@ -213,7 +212,7 @@ fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(
         try out.append(allocator, .Null);
         try out.append(allocator, .Null);
     }
-    args.deinit(allocator);
+    ir.eval.releaseArgs(allocator, args);
     return out;
 }
 
