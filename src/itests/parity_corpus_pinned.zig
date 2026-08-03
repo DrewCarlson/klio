@@ -1568,6 +1568,15 @@ test "anon_object_outer_prop_iterator" {
     );
 }
 
+test "factory_lambda_local_star" {
+    try check("factory_lambda_local_star",
+        \\4
+        \\A
+        \\7
+        \\
+    );
+}
+
 test "ext_body_bare_iterator_star" {
     try check("ext_body_bare_iterator_star",
         \\3
@@ -1589,6 +1598,20 @@ test "toplevel_prop_bare_receiver" {
 test "sequence_scope_outer_iterator" {
     try check("sequence_scope_outer_iterator",
         \\[1, 3, 5]
+        \\
+    );
+}
+
+test "interface_prop_receiver_iterator" {
+    try check("interface_prop_receiver_iterator",
+        \\3
+        \\
+    );
+}
+
+test "ext_prop_receiver_typed_read" {
+    try check("ext_prop_receiver_typed_read",
+        \\5
         \\
     );
 }

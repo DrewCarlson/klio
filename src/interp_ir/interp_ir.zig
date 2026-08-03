@@ -564,17 +564,24 @@ pub const ProgramImage = struct {
                 // body must be settled to the intrinsic here exactly like a
                 // top-level form (`kotlinx.atomicfu.locks.ReentrantLock.
                 // lock`'s no-op body held no lock under a spliced
-                // `withLock`).
+                // `withLock`). CONCRETE classes only: a call resolved to an
+                // INTERFACE / abstract method must dispatch virtually on the
+                // runtime class — its intrinsic serves host-repr builtin
+                // receivers, and settling the header fid ran
+                // `kotlin.collections.List.isEmpty` against an interpreted
+                // `PersistentList` instance.
                 if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| {
                     const owner_fqn = fqn[0..dot];
                     if (module.classIdByFqn(owner_fqn)) |cid| {
                         if (cid.int() < module.classes.items.len) {
                             const cls = &module.classes.items[cid.int()];
-                            for (cls.methods) |mid| {
-                                const mf = module.funcById(mid) orelse continue;
-                                if (!std.mem.eql(u8, mf.name, simple)) continue;
-                                if (genericOverloadKeepsBody(module, mid, mf)) continue;
-                                try self.resolved_native.put(mid.int(), intrinsic);
+                            if (!cls.is_interface and !cls.is_abstract) {
+                                for (cls.methods) |mid| {
+                                    const mf = module.funcById(mid) orelse continue;
+                                    if (!std.mem.eql(u8, mf.name, simple)) continue;
+                                    if (genericOverloadKeepsBody(module, mid, mf)) continue;
+                                    try self.resolved_native.put(mid.int(), intrinsic);
+                                }
                             }
                         }
                     }

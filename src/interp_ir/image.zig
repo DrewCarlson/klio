@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 37;
+pub const FORMAT_VERSION: u32 = 38;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -615,6 +615,7 @@ const RegistryImage = struct {
     mangled_nested: []StrKV,
     class_const_inits: []struct { a: []const u8, b: []const u8, v: ir.Const },
     class_prop_type_heads: []PairStrEntry,
+    ext_prop_type_heads: []PairStrEntry,
     iface_member_ext_recv: []PairStrEntry,
     private_fn_files: []KV(FuncId, FileId),
     file_packages: []KV(FileId, []const u8),
@@ -1407,6 +1408,7 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
             break :blk list;
         },
         .class_prop_type_heads = try pairMapToSlice(a, &r.class_prop_type_heads),
+        .ext_prop_type_heads = try pairMapToSlice(a, &r.ext_prop_type_heads),
         .iface_member_ext_recv = try pairMapToSlice(a, &r.iface_member_ext_recv),
         .private_fn_files = try autoMapToSlice(FuncId, FileId, a, &r.private_fn_files),
         .file_packages = try autoMapToSlice(FileId, []const u8, a, &r.file_packages),
@@ -2136,6 +2138,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     for (ri.mangled_nested) |kv| try r.mangled_nested.put(kv.k, kv.v);
     for (ri.class_const_inits) |entry| try r.class_const_inits.put(.{ .a = entry.a, .b = entry.b }, entry.v);
     for (ri.class_prop_type_heads) |entry| try r.class_prop_type_heads.put(.{ .a = entry.a, .b = entry.b }, entry.v);
+    for (ri.ext_prop_type_heads) |entry| try r.ext_prop_type_heads.put(.{ .a = entry.a, .b = entry.b }, entry.v);
     for (ri.iface_member_ext_recv) |entry| try r.iface_member_ext_recv.put(.{ .a = entry.a, .b = entry.b }, entry.v);
     for (ri.private_fn_files) |kv| try r.private_fn_files.put(kv.k, kv.v);
     for (ri.file_packages) |kv| try r.file_packages.put(kv.k, kv.v);

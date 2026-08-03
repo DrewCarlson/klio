@@ -4821,7 +4821,21 @@ pub const Module = struct {
                 // applicability-neutral downstream. `KLIO_STAR_RET=0`
                 // disables.
                 if (!projected_ok) {
-                    if (typeMentionsAnyParamName(&f.return_ty, owner_class.type_params)) {
+                    // The return may reference the owner's parameters by RAW
+                    // name or by the class-param IDENTITY mangle (an
+                    // inherited interface header's `Iterator<E>` carries
+                    // `$class$ N i:E` in its args) — test both, or the star
+                    // fill skips exactly the headers the completeness check
+                    // then refuses (`Set.iterator` stayed underivable).
+                    const mentions = blk_m: {
+                        if (typeMentionsAnyParamName(&f.return_ty, owner_class.type_params)) break :blk_m true;
+                        for (owner_class.type_params) |param| {
+                            const ident = try classTypeParamIdentity(a, owner, param);
+                            if (typeMentionsAnyParamName(&f.return_ty, &.{ident})) break :blk_m true;
+                        }
+                        break :blk_m false;
+                    };
+                    if (mentions) {
                         if (std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0")) return null;
                         for (owner_class.type_params) |param| {
                             try bindings.append(a, .{
@@ -4830,6 +4844,27 @@ pub const Module = struct {
                             });
                         }
                     }
+                }
+            }
+        }
+        if (std.c.getenv("KLIO_ICRT") != null) {
+            std.debug.print("[icrt] fn={s} ret={s} ret_args={d} decl_sig={} kind={s} owner={} owner_tps={d} fn_tps={d} bindings={d}\n", .{
+                f.fqn,
+                f.return_ty.name,
+                f.return_ty.args.len,
+                decl_sig != null,
+                if (decl_sig) |sig| @tagName(sig.kind) else "-",
+                owner_id != null,
+                if (owner_id) |o| (if (o.int() < self.classes.items.len) self.classes.items[o.int()].type_params.len else 999) else 0,
+                function_type_params.len,
+                bindings.items.len,
+            });
+        }
+        if (std.c.getenv("KLIO_ICRT") != null) {
+            if (f.return_ty.args.len != 0) std.debug.print("[icrt2] {s} arg0={s}\n", .{ f.fqn, f.return_ty.args[0].name });
+            if (owner_id) |o| {
+                if (o.int() < self.classes.items.len) {
+                    for (self.classes.items[o.int()].type_params) |tp| std.debug.print("[icrt2] {s} owner_tp={s}\n", .{ f.fqn, tp });
                 }
             }
         }
@@ -4842,10 +4877,11 @@ pub const Module = struct {
 
         const first_param: usize = @intFromBool(funcHasImplicitThis(f));
         // An extension receiver written head-only (a bare implicit `this`)
-        // cannot bind the declared receiver's type parameters; erase the
-        // still-unbound ones to `*` at the end instead of refusing, exactly
-        // as the owner-projection arm above does for members.
-        var recv_bind_failed = false;
+        // cannot bind the declared receiver's type parameters; the erasure
+        // pass below substitutes `*` for the still-unbound ones instead of
+        // refusing, exactly as the owner-projection arm above does for
+        // members. A receiver WITH arguments that fails to bind is a real
+        // mismatch and still refuses here.
         if (first_param != 0 and
             (decl_sig == null or decl_sig.?.kind != .instance_method))
         {
@@ -4861,13 +4897,7 @@ pub const Module = struct {
                     if (actual_receiver.args.len != 0 or
                         std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0"))
                         return null;
-                    recv_bind_failed = true;
                 }
-            } else {
-                // A receiver-less top-level pick (a bare call resolved by
-                // name alone) binds no receiver params at all; same erasure.
-                recv_bind_failed =
-                    !std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0");
             }
         }
         const params = f.params[first_param..];
@@ -4950,7 +4980,15 @@ pub const Module = struct {
             }
         }
 
-        if (recv_bind_failed) {
+        // A function type parameter still unbound after the receiver and every
+        // argument had their chance erases to `*` rather than refusing the
+        // whole return: `MutableList(3) { ... }` (a receiver-less generic
+        // factory whose lambda carries no inferred type) yields
+        // `MutableList<*>` — the HEAD binds the local's member calls, and `*`
+        // is applicability-neutral downstream. A hard bind CONFLICT still
+        // refused above; this only covers absence. A result erased to a bare
+        // `*` head is refused below as before.
+        if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0")) {
             for (function_type_params) |tp| {
                 var bound = false;
                 for (bindings.items) |bd| {
@@ -4965,11 +5003,18 @@ pub const Module = struct {
                 });
             }
         }
-        if (!returnTypeBindingsComplete(f.return_ty, type_params, bindings.items)) return null;
+        if (!returnTypeBindingsComplete(f.return_ty, type_params, bindings.items)) {
+            if (std.c.getenv("KLIO_ICRT") != null) std.debug.print("[icrt] {s}: bindings incomplete\n", .{f.fqn});
+            return null;
+        }
         const substituted = try substituteType(a, f.return_ty, bindings.items);
         // A return erased to a bare `*` head names nothing a caller can bind
         // against; it would only pollute the local's declared-type record.
-        if (std.mem.eql(u8, staticTypeHead(substituted.name), "*")) return null;
+        if (std.mem.eql(u8, staticTypeHead(substituted.name), "*")) {
+            if (std.c.getenv("KLIO_ICRT") != null) std.debug.print("[icrt] {s}: star head\n", .{f.fqn});
+            return null;
+        }
+        if (std.c.getenv("KLIO_ICRT") != null) std.debug.print("[icrt] {s}: OK -> {s}\n", .{ f.fqn, substituted.name });
         return try substituted.clone(allocator);
     }
 
@@ -9107,6 +9152,13 @@ pub const ModuleRegistry = struct {
     /// call on the property resolves against the static type, as
     /// kotlinc does.
     class_prop_type_heads: StrPairMap([]const u8),
+    /// `(extension-receiver head, property name)` -> declared type head for
+    /// TOP-LEVEL extension properties (`val IntArray.indices: IntRange`
+    /// records `(IntArray, indices) -> IntRange`). Recorded in the decl
+    /// scan, before any body lowers, so a bare `indices` read inside an
+    /// array extension body types statically even while the stdlib itself
+    /// is still lowering.
+    ext_prop_type_heads: StrPairMap([]const u8),
     /// `FuncId` → declaring-class simple name for *member extension
     /// functions* (`class C { fun R.f(...) { … } }`). Empty for
     /// top-level extensions.
@@ -9279,6 +9331,7 @@ pub const ModuleRegistry = struct {
             .delegated_body_props = StrPairSet.init(allocator),
             .recv_fn_props = StrPairMap([]const u8).init(allocator),
             .class_prop_type_heads = StrPairMap([]const u8).init(allocator),
+            .ext_prop_type_heads = StrPairMap([]const u8).init(allocator),
             .member_ext_owner_class = std.AutoHashMap(FuncId, []const u8).init(allocator),
             .private_fn_files = std.AutoHashMap(FuncId, FileId).init(allocator),
             .iface_member_ext_recv = StrPairMap([]const u8).init(allocator),
@@ -9358,6 +9411,7 @@ pub const ModuleRegistry = struct {
         self.delegated_body_props.deinit();
         self.recv_fn_props.deinit();
         self.class_prop_type_heads.deinit();
+        self.ext_prop_type_heads.deinit();
         self.member_ext_owner_class.deinit();
         self.private_fn_files.deinit();
         self.iface_member_ext_recv.deinit();
@@ -9503,6 +9557,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.class_prop_type_heads.iterator();
             while (it.next()) |e| try out.class_prop_type_heads.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.ext_prop_type_heads.iterator();
+            while (it.next()) |e| try out.ext_prop_type_heads.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.member_ext_owner_class.iterator();

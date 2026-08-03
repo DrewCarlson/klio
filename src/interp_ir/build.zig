@@ -997,6 +997,22 @@ fn collectDeclPkgs(allocator: Allocator, d: *const Decl, pkg: []const u8, out: *
 /// scoping. Uses the property-FQN override map (which already carries the
 /// package-qualified FQN for packaged properties) and `decl_pkg` for the
 /// package, falling back to the package derived from the FQN.
+/// Record a top-level EXTENSION property's declared type head keyed by its
+/// receiver head, in the decl scan before any body lowers — the bare-read
+/// type channel (`extPropReturnHead`) answers from this map even while the
+/// declaring library itself is still lowering (`val IntArray.indices:
+/// IntRange` types the `indices` receiver inside `_Arrays.kt` bodies).
+fn noteExtPropTypeHead(module: *Module, p: *const ast.Property) Allocator.Error!void {
+    const recv = &(p.receiver_type orelse return);
+    const ty = &(p.ty orelse return);
+    if (ty.function != null or ty.name.name.len == 0) return;
+    if (recv.name.name.len == 0) return;
+    try module.registry.ext_prop_type_heads.put(
+        .{ .a = recv.name.name, .b = p.name.name },
+        ty.name.name,
+    );
+}
+
 fn notePropScope(
     a: Allocator,
     module: *Module,
@@ -2232,6 +2248,7 @@ fn buildModuleWithOverrides(
                         try top_props.put(d.Property.name.name, {});
                         try notePropScope(a, module, func_fqn_overrides, decl_pkg, package_prefix, d.Property);
                     }
+                    if (d.* == .Property) try noteExtPropTypeHead(module, d.Property);
                 }
             }
         }
@@ -2240,6 +2257,7 @@ fn buildModuleWithOverrides(
                 try top_props.put(d.Property.name.name, {});
                 try notePropScope(a, module, func_fqn_overrides, decl_pkg, package_prefix, d.Property);
             }
+            if (d.* == .Property) try noteExtPropTypeHead(module, d.Property);
         }
         ir.lower.setTopLevelPropNames(top_props);
     }
@@ -3650,7 +3668,7 @@ fn buildModuleWithOverrides(
             const nm = try std.fmt.allocPrint(a, "__ext_get_{s}_{s}", .{ recv_name, p.name.name });
             const fid = switch (getter.body) {
                 .Expr => |body| try ir.lower.lowerAccessorExprWithExpected(module, recv_name, &empty_members, &.{"this"}, &body, nm, p.ty),
-                .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv_name, &empty_members, &.{"this"}, &blk, nm),
+                .Block => |blk| try ir.lower.lowerAccessorBlockRet(module, recv_name, &empty_members, &.{"this"}, &blk, nm, p.ty),
             };
             if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
                 if (std.mem.eql(u8, w, p.name.name))

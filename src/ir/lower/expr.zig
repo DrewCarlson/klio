@@ -2419,14 +2419,19 @@ fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const
     // The enclosing class, else the EXTENSION RECEIVER — a bare name inside
     // `fun UByteArray.indices()` is a member of the receiver, and a top-level
     // extension has no enclosing class at all, so the search stopped there.
+    const tr = if (runtime.getenvSlice("KLIO_EXT_TRACE")) |w| std.mem.eql(u8, w, recv_name) else false;
     const owner = b.ownerClass() orelse blk: {
         if (std.mem.eql(u8, runtime.getenvSlice("KLIO_EXT_RECV_PROP") orelse "1", "0")) return null;
         // The splice-receiver hint serves the same role inside an inline
         // extension splice, where the body's builder has no recvTy of its
         // own.
-        const head = b.recvTy() orelse b.spliceRecvTy() orelse return null;
+        const head = b.recvTy() orelse b.spliceRecvTy() orelse {
+            if (tr) std.debug.print("[sbrt] {s}: no owner, no recvTy\n", .{recv_name});
+            return null;
+        };
         break :blk typeHead(std.mem.trimEnd(u8, head, "?"));
     };
+    if (tr) std.debug.print("[sbrt] {s}: owner={s}\n", .{ recv_name, owner });
     if (propTypeHeadOn(b, owner, recv_name)) |h| return h;
     return extPropReturnHead(b, owner, recv_name);
 }
@@ -2438,31 +2443,55 @@ fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const
 /// extension body is an `IntRange`, so the desugared `for (i in indices)`
 /// iterator call binds.
 fn extPropReturnHead(b: *const FuncBuilder, head: []const u8, name: []const u8) ?[]const u8 {
+    if (extPropDeclHead(b, head, name)) |h| return h;
     if (extPropGetterReturn(b, head, name)) |h| return h;
     for (applicability.builtinSupersOf(head)) |sup| {
+        if (extPropDeclHead(b, sup, name)) |h| return h;
         if (extPropGetterReturn(b, sup, name)) |h| return h;
     }
     if (b.module.registry.class_super_names.get(head)) |chain| {
         for (chain) |sup| {
+            if (extPropDeclHead(b, applicability.simpleName(sup), name)) |h| return h;
             if (extPropGetterReturn(b, applicability.simpleName(sup), name)) |h| return h;
         }
     }
     return null;
 }
 
-fn extPropGetterReturn(b: *const FuncBuilder, head: []const u8, name: []const u8) ?[]const u8 {
-    var buf: [160]u8 = undefined;
-    const gname = std.fmt.bufPrint(&buf, "__ext_get_{s}_{s}", .{ head, name }) catch return null;
-    const fids = b.module.funcsBySimpleName(gname);
-    if (fids.len == 0) return null;
-    const f = b.module.funcById(fids[0]) orelse return null;
-    var h = std.mem.trimEnd(u8, f.return_ty.name, "?");
+/// The declaration-scan channel: `(receiver head, name)` recorded before
+/// any body lowers, so the answer exists while the declaring library is
+/// itself still lowering. The head must still name a class to be useful
+/// dispatch evidence.
+fn extPropDeclHead(b: *const FuncBuilder, head: []const u8, name: []const u8) ?[]const u8 {
+    const raw = b.module.registry.ext_prop_type_heads.get(.{ .a = head, .b = name }) orelse return null;
+    var h = std.mem.trimEnd(u8, raw, "?");
     if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
     if (h.len == 0 or std.mem.eql(u8, h, "Unit")) return null;
     const cid = (if (std.mem.indexOfScalar(u8, h, '.') != null)
         b.module.classIdByFqn(h)
     else
         b.module.uniqueClassIdBySimpleName(typeHead(h)));
+    if (cid == null) return null;
+    return h;
+}
+
+fn extPropGetterReturn(b: *const FuncBuilder, head: []const u8, name: []const u8) ?[]const u8 {
+    const tr = if (runtime.getenvSlice("KLIO_EXT_TRACE")) |w| std.mem.eql(u8, w, name) else false;
+    var buf: [160]u8 = undefined;
+    const gname = std.fmt.bufPrint(&buf, "__ext_get_{s}_{s}", .{ head, name }) catch return null;
+    const fids = b.module.funcsBySimpleName(gname);
+    if (tr) std.debug.print("[extpget] gname={s} fids={d}\n", .{ gname, fids.len });
+    if (fids.len == 0) return null;
+    const f = b.module.funcById(fids[0]) orelse return null;
+    var h = std.mem.trimEnd(u8, f.return_ty.name, "?");
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (tr) std.debug.print("[extpget] ret head={s}\n", .{h});
+    if (h.len == 0 or std.mem.eql(u8, h, "Unit")) return null;
+    const cid = (if (std.mem.indexOfScalar(u8, h, '.') != null)
+        b.module.classIdByFqn(h)
+    else
+        b.module.uniqueClassIdBySimpleName(typeHead(h)));
+    if (tr) std.debug.print("[extpget] cid={?}\n", .{cid});
     if (cid == null) return null;
     return h;
 }
