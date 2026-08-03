@@ -14322,8 +14322,19 @@ fn lowerResolvedMemberCall(
             if (b.module.dispatchForTarget(static_owner, resolved.target.?)) |d| {
                 resolved.dispatch = d;
             }
-        } else if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null) {
-            std.debug.print("[promo-proof] {s}.{s} nargs={d} HELD why={s}\n", .{ head, name.name, args.len, ir.Module.mpp_why });
+        } else {
+            if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null) {
+                std.debug.print("[promo-proof] {s}.{s} nargs={d} HELD why={s}\n", .{ head, name.name, args.len, ir.Module.mpp_why });
+            }
+            // A member REFUTED by an authoritative argument is not the
+            // binding at all: fall to the extension path with the
+            // refutation recorded, so the ranker's strict-winner rule can
+            // commit the extension kotlinc binds
+            // (`set.removeAll(iterable)` -> MutableCollection.removeAll).
+            if (std.mem.eql(u8, ir.Module.mpp_why, "member-arg-refuted")) {
+                last_member_refuted = true;
+                return .none;
+            }
         }
     }
     if (promo_ext_why == .none and

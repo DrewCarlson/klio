@@ -4555,6 +4555,8 @@ pub const Module = struct {
         var best: ?FuncId = null;
         var best_key: [8]i32 = .{std.math.minInt(i32)} ** 8;
         var best_unknown = false;
+        var best_recv_param: ?TypeRef = null;
+        var best_fid_for_recv: ?FuncId = null;
         var tied = false;
         for (ranked_sigs.items, ranked_ids.items, ranked_unknowns.items) |*sig, fid, unknown| {
             const maybe_score = applicability.applicable(sig, proof_args, ranked_scope);
@@ -4575,6 +4577,8 @@ pub const Module = struct {
                 best = fid;
                 best_key = key;
                 best_unknown = unknown;
+                best_recv_param = if (sig.params.len != 0) sig.params[0].ty else null;
+                best_fid_for_recv = fid;
                 tied = false;
             } else if (extensionKeyEquivalent(key, best_key)) {
                 tied = true;
@@ -4618,9 +4622,51 @@ pub const Module = struct {
         const sole_survivor = !sole_off and ids.items.len == 1 and
             ranked_sigs.items.len == 1 and scoped_receiver.args.len != 0 and
             (receiver_pruned != 0 or (ctx.member_refuted and sole_same_file));
+        // The widened member-refuted commit: when the MEMBER was refuted by
+        // an authoritative argument, the strict ext_key winner commits even
+        // with an unproven receiver instantiation — every supplied argument
+        // is authoritative (unauthoritative args cannot refute a member, so
+        // reaching here with member_refuted implies authority), the key
+        // strictly beat every rival (untied), and kotlinc has no member to
+        // prefer. The trimIndent hazard was the FILE-blind sole rule
+        // without key strictness; this rule requires both.
+        var refuted_args_authoritative = true;
+        for (proof_args) |pa| {
+            if (pa.ty == null and pa.literal_kind == null and
+                !pa.is_lambda and pa.lambda_arity == null)
+            {
+                refuted_args_authoritative = false;
+                break;
+            }
+        }
+        // The winner's declared receiver must RELATE to the static
+        // receiver (same head, proven subtype, or the winner's own type
+        // parameter): an argument-keyed winner on an unrelated receiver is
+        // exactly the over-commit that put a Map-family extension on a
+        // Sequence (SequenceTest.flatten).
+        const winner_recv_related = blk: {
+            const brp = best_recv_param orelse break :blk false;
+            var wh = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, brp.name, "?")));
+            if (std.mem.startsWith(u8, wh, "out#")) wh = wh["out#".len..];
+            if (std.mem.startsWith(u8, wh, "in#")) wh = wh["in#".len..];
+            const bfid = best_fid_for_recv orelse break :blk false;
+            if (self.funcTypeParamIndex(bfid, wh) != null) break :blk true;
+            if (wh.len > 0 and wh.len <= 2 and std.ascii.isUpper(wh[0])) break :blk true;
+            const rh = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?")));
+            if (rh.len == 0) break :blk false;
+            if (std.mem.eql(u8, rh, wh)) break :blk true;
+            if (evidenceSubtypeCb(@ptrCast(@constCast(self)), rh, wh)) break :blk true;
+            for (applicability.builtinSupersOf(rh)) |sup| {
+                if (std.mem.eql(u8, sup, wh)) break :blk true;
+            }
+            break :blk false;
+        };
+        const refuted_member_strict_winner = ctx.member_refuted and
+            best != null and !tied and refuted_args_authoritative and
+            winner_recv_related;
         if (tied or
             (best_unknown and !receiver_supplies_lambda and !renamed_best and
-                !sole_survivor))
+                !sole_survivor and !refuted_member_strict_winner))
             return .{ .applicable = true };
         const dispatch_owner = if (best) |target|
             (if (self.registry.member_ext_owner_class.get(target)) |owner|
