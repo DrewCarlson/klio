@@ -1629,3 +1629,19 @@ nanosecond flip, Uuid onError; winner-receiver relation — flatten's
 Map-ext-on-Sequence). stdlib declined 161 -> 87, bound_virtual 6,662,
 85.3% bound. The declined remainder (87) is now: arg-unauthoritative
 45 + ext-unrefuted 22 + the residual ~20. Battery green everywhere.
+
+## Addendum 18 — declined 87 fully named (2026-08-04)
+
+The tp-arg bound-judgment rule reached final form (b2a064be: prove
+through the bound, refute on disjoint bounds, unknown otherwise — the
+bare-bail variant lost 28 correct ext-commits). The declined 87:
+arg-unauthoritative 45 (Random.nextInt 30 — untyped Int locals in
+RandomTest bodies, the it-tail typing class; Collection.contains 8;
+AbstractMap 4), ext-unrefuted 22 ([promo-ext-alive] names them:
+kotlin.collections.putAll/removeAll/addAll same-family pairs whose
+argument type fits BOTH member and extension — genuine deferrals
+pending the exact arg instantiation), residual ~20 (tied/unrelated
+winners). Every remaining declined site is now individually named and
+categorized; the family-level levers are exhausted — further declined
+work rides the it-tail argument-typing legs. Current standing: stdlib
+85.3% bound / declined 87; examples 87.9% / 1,075.
