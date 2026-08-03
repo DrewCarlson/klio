@@ -8559,7 +8559,16 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     // applicability evidence while lowering the inline body. A spliced
     // lambda argument deliberately skips this channel: its free names resolve
     // in the caller scopes and may shadow a same-named inline parameter.
-    if (b.lambda_splice_resolve == null) {
+    if (b.lambda_splice_resolve == null or
+        (b.resolve(p.segments[0].name) == null and
+            !b.knowsOuter(p.segments[0].name)))
+    {
+        // The spliced-caller-lambda skip exists for CALLER names that
+        // shadow an inline parameter. A name the caller WINDOW cannot see
+        // at all (`destination.append` inside filterIndexedTo's predicate
+        // splice — the window deliberately skips the inline fn's own
+        // scopes) can only mean the spliced parameter, so its declared
+        // source type stays as evidence.
         if (b.spliceParamTy(p.segments[0].name)) |declared| {
             if (declared.function == null) {
                 return .{
