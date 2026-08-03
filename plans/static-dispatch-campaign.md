@@ -1537,3 +1537,18 @@ and the sole-commit refinements remain available for the
 resolver_declined family, which this proof stack now serves with
 correct answers. Next legs unchanged: resolver_declined 213, unsigned
 no_class_id route, compose throughput, bytecode VM.
+
+## Addendum 11 — run-mode sibling target (2026-08-04)
+
+Writing the flip's pin exposed the RUN-pipeline sibling:
+`tests/fixtures/parity_corpus/bounded_prop_minus_list.kt` (committed,
+NOT yet registered in the pinned suite) prints `is List = false` under
+`klio run` — the bounded-receiver minus still picks Set.minus by value
+there, and NO lowering probes fire at all in run mode even cold
+(the embedded prebaked stdlib image serves without lowering, and the
+user file's operator lowering route in run mode never hits
+lowerResolvedBinaryOperator's probes — find the run-mode Binary entry
+first; this is the RC-A run-vs-test divergence family). The test-mode
+battery is fully green WITH the flip. Register the fixture in
+parity_corpus_pinned with the List-true expectations once run mode
+resolves through the same engine.
