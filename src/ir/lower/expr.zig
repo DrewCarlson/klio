@@ -9083,6 +9083,49 @@ fn staticCallReturnTypeRef(
                             return fwd;
                         }
                     }
+                    // The OUTER implicit receivers: a bare `iterator()`
+                    // inside a `sequence { }` receiver lambda resolves
+                    // against the enclosing extension's receiver when
+                    // SequenceScope misses — the same tower the emission
+                    // walk consults.
+                    for (b.implicit_receiver_tower.items) |entry| {
+                        var outer_head = std.mem.trimEnd(u8, entry.head, "?");
+                        if (std.mem.indexOfScalar(u8, outer_head, '<')) |lt| outer_head = outer_head[0..lt];
+                        if (std.mem.eql(u8, typeHead(outer_head), bare_head)) continue;
+                        const outer_cid = (if (std.mem.indexOfScalar(u8, outer_head, '.') != null)
+                            b.module.classIdByFqn(outer_head)
+                        else
+                            b.module.uniqueClassIdBySimpleName(typeHead(outer_head))) orelse continue;
+                        var outer_recv = ir.TypeRef{
+                            .name = try b.allocator.dupe(u8, entry.head),
+                            .nullable = false,
+                            .args = &.{},
+                        };
+                        const outer_resolved = b.module.resolveMemberCall(
+                            outer_cid,
+                            name.name,
+                            shape_set.shapes,
+                            .{
+                                .caller_file = name.span.file,
+                                .lexical_owner = null,
+                                .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
+                                .receiver_type = outer_recv,
+                            },
+                        );
+                        if (outer_resolved.target) |t| {
+                            if (bt) std.debug.print("[bareret] {s} tower {s} target\n", .{ name.name, outer_head });
+                            if (receiver) |*old| old.deinit(b.allocator);
+                            receiver = outer_recv;
+                            break :blk t;
+                        }
+                        if (try bareExtensionTarget(b, name, outer_recv, shape_set.shapes, owned_type_param_bounds)) |t| {
+                            if (bt) std.debug.print("[bareret] {s} tower {s} ext target\n", .{ name.name, outer_head });
+                            if (receiver) |*old| old.deinit(b.allocator);
+                            receiver = outer_recv;
+                            break :blk t;
+                        }
+                        outer_recv.deinit(b.allocator);
+                    }
                 }
                 break :blk sole_global orelse return null;
             };

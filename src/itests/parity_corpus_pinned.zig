@@ -1586,6 +1586,13 @@ test "toplevel_prop_bare_receiver" {
     );
 }
 
+test "sequence_scope_outer_iterator" {
+    try check("sequence_scope_outer_iterator",
+        \\[1, 3, 5]
+        \\
+    );
+}
+
 test "setter_value_param_typed" {
     try check("setter_value_param_typed",
         \\6
