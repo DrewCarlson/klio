@@ -8800,6 +8800,24 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
                 .args = &.{},
             }).clone(b.allocator);
         }
+        // Primitive arrays iterate their scalar kind the same way.
+        const prim_arrays = [_]struct { a: []const u8, e: []const u8 }{
+            .{ .a = "BooleanArray", .e = "Boolean" }, .{ .a = "ByteArray", .e = "Byte" },
+            .{ .a = "ShortArray", .e = "Short" },     .{ .a = "IntArray", .e = "Int" },
+            .{ .a = "LongArray", .e = "Long" },       .{ .a = "CharArray", .e = "Char" },
+            .{ .a = "FloatArray", .e = "Float" },     .{ .a = "DoubleArray", .e = "Double" },
+            .{ .a = "UByteArray", .e = "UByte" },     .{ .a = "UShortArray", .e = "UShort" },
+            .{ .a = "UIntArray", .e = "UInt" },       .{ .a = "ULongArray", .e = "ULong" },
+        };
+        for (prim_arrays) |pa| {
+            if (std.mem.eql(u8, h, pa.a)) {
+                return try (ir.TypeRef{
+                    .name = pa.e,
+                    .nullable = false,
+                    .args = &.{},
+                }).clone(b.allocator);
+            }
+        }
     }
     if (ty.args.len != 1) return null;
     const elem = ty.args[0].name;
