@@ -1619,3 +1619,13 @@ memberPromotionProven's enumeration (it already walks the reachable
 ext set); [promo-pair] rows name the sites. The 2 EnumEntriesList
 pairs are an identity-mangle compare miss in the same walk
 (param `$class$ 155 1:T` vs arg `T` — normalize both sides).
+
+## Addendum 16 — the ext-commit widening LANDS (2026-08-04)
+
+fd5ebc65: member-refuted calls fall to the extension path and the
+ranker commits the strict winner under three guards, each pinned by
+the regression that derived it (full argument authority — Duration
+nanosecond flip, Uuid onError; winner-receiver relation — flatten's
+Map-ext-on-Sequence). stdlib declined 161 -> 87, bound_virtual 6,662,
+85.3% bound. The declined remainder (87) is now: arg-unauthoritative
+45 + ext-unrefuted 22 + the residual ~20. Battery green everywhere.
