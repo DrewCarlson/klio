@@ -2421,7 +2421,10 @@ fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const
     // extension has no enclosing class at all, so the search stopped there.
     const owner = b.ownerClass() orelse blk: {
         if (std.mem.eql(u8, runtime.getenvSlice("KLIO_EXT_RECV_PROP") orelse "1", "0")) return null;
-        const head = b.recvTy() orelse return null;
+        // The splice-receiver hint serves the same role inside an inline
+        // extension splice, where the body's builder has no recvTy of its
+        // own.
+        const head = b.recvTy() orelse b.spliceRecvTy() orelse return null;
         break :blk typeHead(std.mem.trimEnd(u8, head, "?"));
     };
     if (propTypeHeadOn(b, owner, recv_name)) |h| return h;
