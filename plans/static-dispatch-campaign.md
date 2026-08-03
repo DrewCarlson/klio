@@ -1472,3 +1472,25 @@ caller on that path; if [binop-in] shows both typing channels null, the
 prop-head consult (staticBareReceiverType under the flip) is the fix
 point. The head-blind proof fix (d7f4c2d5) stands regardless and was
 the chain's real defect.
+
+## Addendum 8 — protocol run facts and the bracketing requirement (2026-08-04)
+
+Single-variable protocol run (flip + all probes, control rows verified
+present) established: the test-site operator DOES enter
+lowerResolvedBinaryOperator with data typed T by BOTH channels
+([binop-in] lazy=T bare=T owner=IterableTests x4 — level 5's "bypass"
+was stale-binary noise); the member arm answers none ([binop] member=
+none x4); the extension path runs the hop (T -> Iterable via the raw-
+name record; note the identity-mangled sibling record carries NO args
+and sits FIRST — a hop-order hazard to fix when touching this again);
+bake-window loops show hop -> generic_applies=true -> KEPT for the
+2308 family. What remains unattributed: the test-site ranking's
+FINALIST stage produces no rows at the test span (f2:17.5k) in the
+same run — neither keys, nor DISQUALIFIED, nor exit-arm rows — while
+other f2 calls (windowed, indexOfFirst) do print finalists. The row-
+grep methodology cannot separate per-call windows any further: the
+next tool is a BRACKET pair (resolveExtensionCall entry/exit rows with
+name+span+outcome under the rex trace), after which the residual site
+reads off directly. Landed this cycle: exit-arm rows, DISQUALIFIED
+rows, span-carrying finalist rows (all rex-gated). Flip reverted;
+battery green.
