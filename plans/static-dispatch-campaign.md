@@ -1582,3 +1582,23 @@ lambda/receiver typing channels landed; rebuild it from the Addendum-
 dated entry and measure), ext_generic_receiver 22 (the now-sound
 generic proof may serve these — include in the re-derive). The gate
 stays in-tree default-OFF for the ranker-level cases it was built for.
+
+## Addendum 14 — the promotion proof LANDS, third derivation (2026-08-04)
+
+memberPromotionProven (f64340af) commits deferred members under full
+argument authority in two tiers: proven-applicable members commit by
+scope order alone (with positional owner-instantiation substitution:
+contains(element: E) on Iterable<String> proves against String);
+non-refuted members commit when every reachable same-name extension is
+refuted by arity or argument. First two derivations measured zero for
+lack of argument authority; the session's typing channels supplied it
+(164 of 213 sites typed vs 49 at the second derivation). Census:
+stdlib resolver_declined 213 -> 169, bound_virtual 6,029 (84.5%
+bound); examples declined 2,699 -> 2,123 (-576!), 87.5% bound — the
+largest single-slice declined move of the campaign. Held remainder is
+honest: ext-unrefuted 96 (genuine competitors needing the
+argument-side disproofs to grow), arg-unauthoritative 45 (the it-tail
+families), member-arg-refuted 6 (correct declines). Battery green
+including both compose suites. The detail-probe UB lesson from this
+arc: never stash borrowed TypeRef name slices in threadlocals across
+the fn boundary — print inline or copy.
