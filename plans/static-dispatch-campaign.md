@@ -162,7 +162,26 @@ trustworthy self-time view — a hand-rolled tree parser double-counted):
   mutation) — INHERENT algorithmic work the JVM also does, just on
   faster arrays — not by carrier allocation. The pool stays (zero-risk
   infra; marginal alloc savings) but per-call carrier work is NOT the
-  next lever. What remains is the core loop itself: instruction
+  next lever — UNDER THE REFCOUNT BACKEND. Post-measurement discovery:
+  the DEFAULT backend is the tracing GC (`KLIO_RECLAIM` unset), where
+  the args pool never engages (it is reclaim-gated), so the neutral
+  result says nothing about GC-mode carrier churn. Backend A/B on the
+  benchmark: KLIO_RECLAIM=1 HANGS before the test starts (the
+  refcount teardown is unreconciled on the coroutine path — known);
+  KLIO_RECLAIM=arena aborts at the 8GiB RSS cap. The GC is the only
+  viable backend for this workload, so the GC-mode args-carrier churn
+  (the exact churn the regs pool's own comment calls "the dominant
+  allocation churn on call-heavy code" before regs got c_allocator
+  pooling under GC) is still an OPEN lever. Extending the pool to GC
+  requires the regs discipline — TOTAL producer conversion so buffer
+  origin is uniform by construction: a GC-heap buffer parked in the
+  (non-root) pool can be collected and reused-after-free, and mixing
+  origins frees GC memory with c_allocator. Producers = every list
+  passed into evalWith/evalWithCaptures*/composableEval/FlatCallReq
+  .args plus the eval-internal frame rebuilds (resume/persist). Audit
+  them all, route them through acquireArgsCap, then flip
+  acquire/release to a shared argsAlloc() (c_allocator under GC,
+  mirroring regsAlloc) with external-bytes accounting like regs. What remains is the core loop itself: instruction
   dispatch + value move/retain cost per op. The credible next steps
   are (a) a superinstruction/fast-path pass for the hottest op
   sequences (GetField+CallVirtual pairs), (b) the bytecode VM. Both
