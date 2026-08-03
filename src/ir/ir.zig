@@ -3188,6 +3188,46 @@ pub const Module = struct {
             const w = std.c.getenv("KLIO_GRA_TRACE") orelse break :blk false;
             break :blk std.mem.eql(u8, std.mem.span(w), staticTypeHead(actual.name));
         };
+        // The HEADS must relate before argument binding proves anything: a
+        // `Sequence<T>` receiver pattern never applies to an
+        // `Iterable<String>` actual — kotlinc drops the candidate outright —
+        // and binding `T := String` head-blind committed
+        // `kotlin.sequences.minus` for an Iterable-typed receiver. A pattern
+        // head that is itself one of the declaration's parameters keeps the
+        // binding walk as the authority.
+        {
+            const pat_head = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, pattern.name, "?")));
+            var pat_is_param = false;
+            for (declared_params) |dp| {
+                if (std.mem.eql(u8, dp.param, pat_head)) {
+                    pat_is_param = true;
+                    break;
+                }
+            }
+            if (!pat_is_param) {
+                const act_head = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, actual.name, "?")));
+                if (act_head.len != 0 and pat_head.len != 0 and
+                    !std.mem.eql(u8, act_head, pat_head))
+                {
+                    var act_erased = actual;
+                    act_erased.args = &.{};
+                    var pat_erased = pattern;
+                    pat_erased.args = &.{};
+                    const act_id = self.staticTypeClassId(act_erased);
+                    const pat_id = self.staticTypeClassId(pat_erased);
+                    const unrelated = if (act_id != null and pat_id != null)
+                        !self.classIdIsOrExtends(act_id.?, pat_id.?)
+                    else
+                        self.staticBuiltinIdentity(act_erased, act_head) == .yes and
+                            self.staticBuiltinIdentity(pat_erased, pat_head) == .yes and
+                            !evidenceSubtypeCb(@ptrCast(@constCast(self)), act_head, pat_head);
+                    if (unrelated) {
+                        if (gra_trace) std.debug.print("[gra] {s} vs {s}: head unrelated\n", .{ actual.name, pattern.name });
+                        return false;
+                    }
+                }
+            }
+        }
         if (!try self.bindReceiverTypeParams(
             a,
             actual,
@@ -4220,6 +4260,9 @@ pub const Module = struct {
         for (ranked_sigs.items, ranked_ids.items, ranked_unknowns.items) |*sig, fid, unknown| {
             const score = applicability.applicable(sig, proof_args, ranked_scope) orelse continue;
             const key = score.ext_key.?;
+            if (std.c.getenv("KLIO_REX_TRACE") != null) {
+                std.debug.print("[rex-key] {s} fid={d} key={any} low={} unknown={}\n", .{ name, fid.int(), key, score.low_priority, unknown });
+            }
             if (key[0] == 0 or (any_ordinary and score.low_priority)) continue;
             if (best == null or extensionKeyGreater(key, best_key)) {
                 best = fid;
