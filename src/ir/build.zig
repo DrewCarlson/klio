@@ -2219,6 +2219,29 @@ pub const FuncBuilder = struct {
         return self.type_param_bound_refs.getPtr(name);
     }
 
+    /// Owned snapshot of the full bound refs, for carrying into a pending
+    /// lambda/local-fn body.
+    pub fn typeParamBoundRefsSlice(
+        self: *const FuncBuilder,
+    ) Allocator.Error!?[]ir.PendingBoundRef {
+        if (self.type_param_bound_refs.count() == 0) return null;
+        var out = try self.allocator.alloc(ir.PendingBoundRef, self.type_param_bound_refs.count());
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*r| r.ref.deinit(self.allocator);
+            self.allocator.free(out);
+        }
+        var it = self.type_param_bound_refs.iterator();
+        while (it.next()) |entry| {
+            out[filled] = .{
+                .param = entry.key_ptr.*,
+                .ref = try entry.value_ptr.clone(self.allocator),
+            };
+            filled += 1;
+        }
+        return out;
+    }
+
     pub fn typeParamBoundsSlice(
         self: *const FuncBuilder,
     ) Allocator.Error!?[]const ir.ModuleRegistry.TypeParamBound {

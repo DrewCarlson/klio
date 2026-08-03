@@ -1426,6 +1426,13 @@ pub const SelfLocalFn = struct {
     mangled: []const u8,
 };
 
+/// One full type-parameter bound ref (with type arguments) carried into a
+/// pending lambda/local-fn body. Owned by the module allocator.
+pub const PendingBoundRef = struct {
+    param: []const u8,
+    ref: TypeRef,
+};
+
 pub const PendingLocalDeclTypes = struct {
     types: std.StringHashMap(TypeRef),
     nullable: std.StringHashMap(void),
@@ -1501,6 +1508,11 @@ pub const Module = struct {
     /// Effective upper bounds parallel to the type-parameter names carried
     /// into the pending lambda/local-function body. Not serialized.
     pending_lambda_type_param_bounds: ?[]const ModuleRegistry.TypeParamBound = null,
+    /// Full bound REFS (with type arguments) for the pending body, so a
+    /// receiver typed by a parameter substitutes inside nested lambdas too
+    /// (`data.any { it.startsWith("f") }` in a test method's expect-lambda).
+    /// Owned pairs; the lambda body takes ownership. Not serialized.
+    pending_lambda_type_param_bound_refs: ?[]PendingBoundRef = null,
     /// Instantiated value-parameter types for the pending lambda literal,
     /// derived from its resolved call-argument slot. The lambda body takes
     /// ownership and records them as ordinary local declared types.
@@ -4745,6 +4757,33 @@ pub const Module = struct {
         args: []const applicability.ArgShape,
         explicit_type_args: []const TypeRef,
     ) Allocator.Error!?TypeRef {
+        return self.instantiatedCallReturnTypeScoped(
+            allocator,
+            fid,
+            receiver,
+            dispatch_receiver,
+            args,
+            explicit_type_args,
+            false,
+        );
+    }
+
+    /// `owner_params_in_scope`: the CALLER's body is (lexically inside) the
+    /// target's own class, so the owner's type parameters are names the
+    /// caller resolves — a bare-head implicit-this projection keeps them as
+    /// THEMSELVES instead of erasing to `*`: `val data = createFrom(...)`
+    /// inside `IterableTests<T : Iterable<String>>` types `data: T`, which
+    /// the bound-ref channel then resolves.
+    pub fn instantiatedCallReturnTypeScoped(
+        self: *const Module,
+        allocator: Allocator,
+        fid: FuncId,
+        receiver: ?TypeRef,
+        dispatch_receiver: ?TypeRef,
+        args: []const applicability.ArgShape,
+        explicit_type_args: []const TypeRef,
+        owner_params_in_scope: bool,
+    ) Allocator.Error!?TypeRef {
         const f = self.funcById(fid) orelse return null;
         // An unannotated source function currently carries Unit as its
         // lowering placeholder. Do not present that placeholder as static
@@ -4835,12 +4874,15 @@ pub const Module = struct {
                         }
                         break :blk_m false;
                     };
-                    if (mentions) {
+    if (mentions) {
                         if (std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0")) return null;
                         for (owner_class.type_params) |param| {
                             try bindings.append(a, .{
                                 .name = try classTypeParamIdentity(a, owner, param),
-                                .ty = .{ .name = "*", .nullable = false, .args = &.{} },
+                                .ty = if (owner_params_in_scope)
+                                    .{ .name = param, .nullable = false, .args = &.{} }
+                                else
+                                    .{ .name = "*", .nullable = false, .args = &.{} },
                             });
                         }
                     }
@@ -5575,6 +5617,10 @@ pub const Module = struct {
         if (self.pending_lambda_own_recv_type) |*receiver| receiver.deinit(allocator);
         if (self.pending_lambda_type_params) |params| allocator.free(params);
         if (self.pending_lambda_type_param_bounds) |bounds| allocator.free(bounds);
+        if (self.pending_lambda_type_param_bound_refs) |refs| {
+            for (refs) |*r| r.ref.deinit(allocator);
+            allocator.free(refs);
+        }
         if (self.pending_lambda_param_types) |types| {
             for (types) |*ty| ty.deinit(allocator);
             allocator.free(types);
