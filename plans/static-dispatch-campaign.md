@@ -1359,3 +1359,22 @@ answers, rerun minusElement, and adjudicate; then fix the owner-key
 mismatch or the routing, whichever the rows show. The lhs prop-head
 extension (staticBareReceiverType blk) re-applies from this entry. All experiments
 reverted; battery green.
+
+## Captured-receiver arc — first two slices landed (2026-08-03, continued)
+
+Task #2's first mechanisms (1aa2ad0b, 2e3bdf3b): nested closures
+inherit (a) ACTIVE inline-splice param types (the spliceParamTy channel
+folded into the pending local-decl snapshot — `destination.add(it)`
+inside `transform(element)?.let { }` spliced from mapNotNullTo), and
+(b) PRE-DERIVED types for lazily-typed outer locals, derived in the
+OUTER builder's scope at snapshot time (`val iterator =
+listIterator(size)` captured by a closure). Census: stdlib
+no_receiver_type 1,124 -> 1,070 (captured family 87 -> 47, 83.7%
+bound); examples 9,234 -> 8,714 (86.7% bound) — the largest
+single-session examples move since the implicit-this commit. Battery
+green at every step. Remaining captured rows (47): takeLastWhile's
+iterator family persists (the callee body context that lowers those
+sites is NOT the lambda producer path — probe which body-lowering
+route emits them before extending), plus random/chunked/windowed
+shapes. Session total: stdlib 1,211 -> 1,070, bound 82.3% -> 83.7%;
+examples 86.1% -> 86.7%.
