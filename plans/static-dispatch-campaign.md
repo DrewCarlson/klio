@@ -1454,3 +1454,21 @@ the default. The eight levels stand as: hop -> Array disproof ->
 argument-position split (superseded) -> emission-site hunt
 (superseded) -> relower routing (superseded) -> bound double-read ->
 element-tie hypothesis (superseded) -> HEAD-BLIND PROOF (the root).
+
+## Addendum 7 — flip residual: the test site never reaches ranking (2026-08-04)
+
+With span attribution (KLIO_REX_TRACE + KLIO_EXTKEY_TRACE together),
+the flip run's ranked minus finalists all sit at STDLIB-INTERNAL spans
+(f33/f26:99883 — legitimate Sequence-receiver sites; the head-blind
+fix's committed winners there are correct). The failing TEST site
+(`data - arrayOf(...)`) produces NO ranked resolution and NO
+[binop-in]/[hop] rows in the same run — but probe-state trust across
+rebuilds broke twice in this arc, so treat that as UNVERIFIED until a
+fresh context runs ONE cold, single-variable pass: flip applied,
+KLIO_HOP_TRACE + KLIO_REX_TRACE + KLIO_EXTKEY_TRACE all set, grep
+binop-in/hop/rex-key for the test file's span. If the operator lowering
+is genuinely bypassed for relowered @Test bodies, find lowerBinary's
+caller on that path; if [binop-in] shows both typing channels null, the
+prop-head consult (staticBareReceiverType under the flip) is the fix
+point. The head-blind proof fix (d7f4c2d5) stands regardless and was
+the chain's real defect.
