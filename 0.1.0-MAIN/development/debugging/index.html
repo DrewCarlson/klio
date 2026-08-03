@@ -1425,10 +1425,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#resolution-audits-and-eager-mode" class="md-nav__link">
+  <a href="#resolution-audits-and-the-eager-front-end" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Resolution audits and eager mode
+        Resolution audits and the eager front end
       
     </span>
   </a>
@@ -1638,10 +1638,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#resolution-audits-and-eager-mode" class="md-nav__link">
+  <a href="#resolution-audits-and-the-eager-front-end" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Resolution audits and eager mode
+        Resolution audits and the eager front end
       
     </span>
   </a>
@@ -1889,6 +1889,24 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td><code>[ipick]</code></td>
 </tr>
 <tr>
+<td><code>KLIO_EXTKEY_TRACE</code></td>
+<td><code>&lt;fid&gt;[,&lt;fid&gt;]</code></td>
+<td>The eight-element extension ranking key for the named candidates, plus their parameter type heads. Ranking is lexicographic, so the first differing component is the one that decided</td>
+<td><code>[extkey]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_ARGTY_TRACE</code></td>
+<td><code>&lt;identifier&gt;</code></td>
+<td>The static type lowering actually used for that named expression, and whether it came from an inline splice's declared parameter type. Separates "no type" from "wrong type", which look identical from a failing test</td>
+<td><code>[argty]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_SPLICE_TRACE</code></td>
+<td><code>&lt;function name&gt;</code></td>
+<td>Whether a named <code>inline fun</code> reaches the splice path, and which parameter types the splice binds</td>
+<td><code>[splice]</code></td>
+</tr>
+<tr>
 <td><code>KLIO_LEAF_TRACE</code></td>
 <td><code>&lt;substring of a function name&gt;</code></td>
 <td>Why the frameless leaf-expression serve declined for a matching function (unsupported opcode, non-instance field receiver, unclaimed field route, callee that is not a leaf)</td>
@@ -1913,82 +1931,160 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td><code>[shadow]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_GLOBAL_TRACE</code></td>
+<td><code>KLIO_BARERET</code></td>
+<td><code>&lt;name&gt;</code> or <code>*</code></td>
+<td>Why a bare call does or does not lend its return type to the local it initializes: the receiver head it resolved against, the target, the final type, and each refusal</td>
+<td><code>[bareret]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_LI_NAMES</code></td>
+<td>set</td>
+<td>Names the callee of every local initializer that yields no static type. Pair with <code>KLIO_BARERET</code> on whichever name dominates</td>
+<td><code>[li-null]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_NORECV_NAMES</code></td>
+<td>a <code>[no-recv-path]</code> bucket name, or <code>*</code></td>
+<td>Names the receiver identifier behind each untyped bare-path receiver, split by why it is untyped (<code>local_no_decl_type</code>, <code>captured</code>, <code>enclosing_member</code>, <code>unknown</code>)</td>
+<td><code>[no-recv-name]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_COMP_TRACE</code></td>
+<td>set</td>
+<td>The type a destructured name takes from its <code>componentN()</code> accessor, or why none was available</td>
+<td><code>[comp]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_INIT_SELF</code></td>
+<td><code>0</code> to disable</td>
+<td>Off, a local's own name shadows its initializer's bare call again (<code>val iterator = iterator()</code>). For A/B measurement of that channel from one binary</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_TP_HEAD</code></td>
+<td><code>0</code> to disable</td>
+<td>Off, a type-parameter receiver resolves only through a bound that carries no type arguments, so <code>C : MutableCollection&lt;in T&gt;</code> names no owner again</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_EXT_RECV_PROP</code></td>
+<td><code>0</code> to disable</td>
+<td>Off, a bare name in a top-level extension's body stops resolving to the extension receiver's property, so it gets no declared type</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_MEMBER_INIT</code></td>
+<td><code>0</code> to disable</td>
+<td>Off, a property-read, indexed-read or ALIAS initializer (<code>val node = coord.layoutNode</code>, <code>val held = row[1]</code>, <code>val b = a</code>) stops lending its type to the local</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_RECV_CHAIN</code></td>
+<td><code>0</code> to disable</td>
+<td>Off, a member or indexed receiver is typed only from a declared type or a call's return type, never from the type a local's own initializer lends it</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_BIND_LUB</code></td>
+<td><code>0</code> to disable</td>
+<td>Off, a generic call's type-parameter constraints must be EQUAL across the receiver and every argument — a subsumed constraint (<code>getOrDefault(k, Derived())</code> on a Map of Base, <code>listOf(Derived(), base)</code>) rejects the instantiation again</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_TP_DISPROOF</code></td>
+<td><code>0</code> to disable</td>
+<td>Off, a receiver type argument that is a declared TYPE PARAMETER stops disproving concrete-element extension candidates (<code>Array&lt;T&gt;</code> no longer rules out <code>Array&lt;out Double&gt;.minOrNull</code>)</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_SOLE_EXT</code></td>
+<td><code>0</code> to disable</td>
+<td>Off, the single extension candidate left after the disproof pruned every competitor is withheld again instead of committed</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_DISPROOF_TRACE</code></td>
+<td>set</td>
+<td>Per-candidate receiver-compat decision in extension resolution: subtype result and both disproof-completeness answers</td>
+<td><code>[disproof]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_BARE_EXT</code></td>
+<td><code>0</code> to disable</td>
+<td>Off, a bare call in a receiver context resolves only MEMBERS of the implicit receiver — an extension written without <code>this.</code> (<code>toMutableList()</code> in an extension body) stops lending its return type</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_TP_RECV</code></td>
+<td><code>0</code> to disable</td>
+<td>Off, a call on a receiver typed by a TYPE PARAMETER (<code>M : MutableMap&lt;in K, MutableList&lt;T&gt;&gt;</code>) stops deriving its return type through the parameter's full upper bound, so the local it initializes loses its type again</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_SOLE_GLOBAL</code></td>
+<td><code>0</code> to disable</td>
+<td>Off, a bare call under a receiver context stops lending its return type even when its name has exactly one declaration program-wide</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_FACTORY_PROP</code></td>
+<td><code>0</code> to disable</td>
+<td>Off, only a CONSTRUCTOR call names an un-annotated property's type — a factory call (<code>val made = newBase()</code>) and a constructor PARAMETER (<code>private val held = start</code>) both stop registering a type head</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_NULL_CHAIN</code></td>
+<td><code>0</code> to disable</td>
+<td>Off, only a condition that is itself the whole <code>!= null</code> check narrows — an <code>&amp;&amp;</code> chain and an early-return guard stop smart-casting</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_INIT_KINDS</code></td>
+<td>set</td>
+<td>Names the AST kind of every local initializer that is NOT recorded, so the next gap in that list is data rather than a guess</td>
+<td><code>[init-kind]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_SLOT_TRACE</code></td>
+<td><code>&lt;name&gt;</code> or <code>*</code></td>
+<td>Each inherited-slot merge decision for methods of that simple name: the competing FuncIds and which one the class's table keeps</td>
+<td><code>[slot-merge]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_SLOT_DUMP</code></td>
 <td><code>&lt;name&gt;</code></td>
-<td>Which arm resolves a global lookup: cached value, function, or intrinsic</td>
-<td><code>[gtrace]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_OUTER_TRACE</code></td>
-<td><code>&lt;substr&gt;</code></td>
-<td>Inner-class enclosing <code>this@Outer</code> selection for IR names containing the substring</td>
-<td><code>[outer]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_ANON_AUDIT</code></td>
-<td>set</td>
-<td>Synthesized class name and captured names at each anonymous-object site</td>
-<td><code>[ANON]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_REBIND_AUDIT</code></td>
-<td>set</td>
-<td>Arity-guess <code>this</code> rebinds during closure invocation</td>
-<td><code>[REBIND]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_CVNRC</code></td>
-<td>set</td>
-<td>A this-less closure invoked on an instance receiver being rebound to <code>callValueWithThis</code></td>
-<td><code>[cvnrc]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_TRACE_RESOLVE</code></td>
-<td><code>name1,name2</code> or <code>*</code></td>
-<td>Per-dispatch decision log for the named function(s)</td>
-<td><code>[RESOLVE]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_TRACE_CHAIN</code></td>
-<td>set</td>
-<td>Adds the enclosing-<code>this</code> chain to each traced dispatch (with <code>KLIO_TRACE_RESOLVE</code>)</td>
-<td><code>[RESOLVE]   chain=</code></td>
-</tr>
-<tr>
-<td><code>KLIO_TRACE_PATH</code></td>
-<td>set; <code>0</code>/empty off</td>
-<td>One structured record per terminal dispatch site (proves single-path dispatch; see <code>scripts/assert_single_path.py</code>)</td>
-<td><code>[PATH]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_TRACE_INVARIANTS</code></td>
-<td>set; <code>0</code>/empty off</td>
-<td>Detect-only dispatch invariant checks, one machine-readable line per violation</td>
-<td><code>[INVARIANT]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_TRACE_CAPTURE</code></td>
-<td>set</td>
-<td>A lambda capture that fails to resolve and collapses to <code>Unit</code></td>
-<td><code>[CAPTURE]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_UNRESOLVED_TRACE</code></td>
-<td>set</td>
-<td>The unresolved bare name, function, and span just before an <code>Unbound</code> error</td>
-<td><code>[unresolved]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_INIT_DEBUG</code></td>
-<td>set</td>
-<td><code>object</code>/companion initializer first-failure and the cause take/swallow/restash steps</td>
-<td><code>[init-debug]</code></td>
+<td>Every <code>(class, slot) -&gt; implementation</code> entry whose target has that simple name, with the target's owner — what runtime virtual dispatch will actually reach</td>
+<td><code>[slot-dump]</code></td>
 </tr>
 </tbody>
 </table>
+<p>The <code>0</code>-to-disable rows above exist so one binary can be compared against
+itself: <code>scripts/examples-ab.sh KLIO_SOME_GATE</code> runs the examples corpus both
+ways and reports what differs. It skips the twelve examples that never
+terminate (each blocks on a window or event loop at ~0% CPU, at every commit) —
+left in, they cost twice the timeout apiece for no signal and turn a five-minute
+comparison into a three-hour one.</p>
+<p>| <code>KLIO_OPERATOR_TY</code> | <code>0</code> to disable | Off, an indexed read and the <code>times</code>/<code>div</code>/<code>rem</code>/<code>rangeTo</code> operators stop lending their declared return type to a receiver | — |
+| <code>KLIO_GLOBAL_TRACE</code> | <code>&lt;name&gt;</code> | Which arm resolves a global lookup: cached value, function, or intrinsic | <code>[gtrace]</code> |
+| <code>KLIO_OUTER_TRACE</code> | <code>&lt;substr&gt;</code> | Inner-class enclosing <code>this@Outer</code> selection for IR names containing the substring | <code>[outer]</code> |
+| <code>KLIO_ANON_AUDIT</code> | set | Synthesized class name and captured names at each anonymous-object site | <code>[ANON]</code> |
+| <code>KLIO_REBIND_AUDIT</code> | set | Arity-guess <code>this</code> rebinds during closure invocation | <code>[REBIND]</code> |
+| <code>KLIO_CVNRC</code> | set | A this-less closure invoked on an instance receiver being rebound to <code>callValueWithThis</code> | <code>[cvnrc]</code> |
+| <code>KLIO_TRACE_RESOLVE</code> | <code>name1,name2</code> or <code>*</code> | Per-dispatch decision log for the named function(s) | <code>[RESOLVE]</code> |
+| <code>KLIO_TRACE_CHAIN</code> | set | Adds the enclosing-<code>this</code> chain to each traced dispatch (with <code>KLIO_TRACE_RESOLVE</code>) | <code>[RESOLVE]   chain=</code> |
+| <code>KLIO_TRACE_PATH</code> | set; <code>0</code>/empty off | One structured record per terminal dispatch site (proves single-path dispatch; see <code>scripts/assert_single_path.py</code>) | <code>[PATH]</code> |
+| <code>KLIO_TRACE_INVARIANTS</code> | set; <code>0</code>/empty off | Detect-only dispatch invariant checks, one machine-readable line per violation | <code>[INVARIANT]</code> |
+| <code>KLIO_TRACE_CAPTURE</code> | set | A lambda capture that fails to resolve and collapses to <code>Unit</code> | <code>[CAPTURE]</code> |
+| <code>KLIO_UNRESOLVED_TRACE</code> | set | The unresolved bare name, function, and span just before an <code>Unbound</code> error | <code>[unresolved]</code> |
+| <code>KLIO_INIT_DEBUG</code> | set | <code>object</code>/companion initializer first-failure and the cause take/swallow/restash steps | <code>[init-debug]</code> |</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nv">KLIO_BARE_TRACE</span><span class="o">=</span>format<span class="w"> </span><span class="nv">KLIO_MISS_TRACE</span><span class="o">=</span>format<span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>repro.kt
 </code></pre></div>
-<h2 id="resolution-audits-and-eager-mode">Resolution audits and eager mode<a class="headerlink" href="#resolution-audits-and-eager-mode" title="Permanent link">&para;</a></h2>
+<h2 id="resolution-audits-and-the-eager-front-end">Resolution audits and the eager front end<a class="headerlink" href="#resolution-audits-and-the-eager-front-end" title="Permanent link">&para;</a></h2>
+<p>The resolver + type checker always run ahead of lowering; their overload
+picks and type heads feed it. There is no switch — <code>KLIO_EAGER</code> was removed
+once validation was identical with and without the evidence. A
+resolver/typeck failure still falls back to AST evidence alone, so a program
+that defeats the front end runs.</p>
 <p>The audit switches emit machine-readable divergence records the
 sweep scripts grep; see
 <a href="../testing/">Testing and verification</a> for the
@@ -2003,12 +2099,6 @@ sweep scripts grep; see
 </tr>
 </thead>
 <tbody>
-<tr>
-<td><code>KLIO_EAGER</code></td>
-<td>set</td>
-<td>Runs resolver + type checker ahead of lowering; their overload picks and type heads feed lowering. Falls back to lazy on any failure</td>
-<td>none</td>
-</tr>
 <tr>
 <td><code>KLIO_EAGER_AUDIT</code></td>
 <td>set</td>
@@ -2059,9 +2149,10 @@ sweep scripts grep; see
 </tr>
 </tbody>
 </table>
-<p><code>scripts/commontest-sweep.py --eager both</code> drives <code>KLIO_EAGER</code> for
-you: it runs the corpus with the variable unset and set to <code>1</code> and
-reports any divergence between the two modes.</p>
+<p><code>scripts/commontest-sweep.py</code> accepts <code>--eager</code> for compatibility and
+ignores it: there is only one pipeline, so <code>both</code> just runs the corpus
+twice and reports any run-to-run divergence (useful for catching
+nondeterminism, not modes).</p>
 <h2 id="errors-throws-and-hangs">Errors, throws, and hangs<a class="headerlink" href="#errors-throws-and-hangs" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
