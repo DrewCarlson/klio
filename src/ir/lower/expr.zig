@@ -2964,6 +2964,19 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // builder's set already includes what it inherited).
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
     b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
+    // Fold ACTIVE inline-splice param types into the snapshot: a nested
+    // closure inside a spliced body captures the callee's parameter by
+    // name (`destination.add(it)` inside `transform(element)?.let { ... }`
+    // spliced from mapNotNullTo), and the local-decl snapshot never saw
+    // the splice channel.
+    if (b.module.pending_lambda_local_decl_types) |*locals| {
+        var sp_it = b.spliceParamTyIterator();
+        while (sp_it.next()) |e| {
+            if (locals.types.contains(e.key_ptr.*)) continue;
+            const lowered_ty = try decl_mod.loweredTypeRef(b.allocator, e.value_ptr, true);
+            try locals.types.put(e.key_ptr.*, lowered_ty);
+        }
+    }
     const lowered = try lambda_body.lowerLambdaBodyCapturingKindWithIt(
         b.module,
         eff_params,

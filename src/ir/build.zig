@@ -2368,6 +2368,9 @@ pub const FuncBuilder = struct {
     pub fn spliceParamTy(self: *const FuncBuilder, name: []const u8) ?ast.TypeRef {
         return self.splice_param_tys.get(name);
     }
+    pub fn spliceParamTyIterator(self: *const FuncBuilder) std.StringHashMap(ast.TypeRef).Iterator {
+        return self.splice_param_tys.iterator();
+    }
     pub fn pushFinally(self: *FuncBuilder, block: ast.Block, body_entry: BlockId) Allocator.Error!void {
         try self.finally_stack.append(self.allocator, block);
         try self.finally_body_stack.append(self.allocator, body_entry);
