@@ -1426,6 +1426,13 @@ pub const SelfLocalFn = struct {
     mangled: []const u8,
 };
 
+/// One full type-parameter bound ref (with type arguments) carried into a
+/// pending lambda/local-fn body. Owned by the module allocator.
+pub const PendingBoundRef = struct {
+    param: []const u8,
+    ref: TypeRef,
+};
+
 pub const PendingLocalDeclTypes = struct {
     types: std.StringHashMap(TypeRef),
     nullable: std.StringHashMap(void),
@@ -1501,6 +1508,11 @@ pub const Module = struct {
     /// Effective upper bounds parallel to the type-parameter names carried
     /// into the pending lambda/local-function body. Not serialized.
     pending_lambda_type_param_bounds: ?[]const ModuleRegistry.TypeParamBound = null,
+    /// Full bound REFS (with type arguments) for the pending body, so a
+    /// receiver typed by a parameter substitutes inside nested lambdas too
+    /// (`data.any { it.startsWith("f") }` in a test method's expect-lambda).
+    /// Owned pairs; the lambda body takes ownership. Not serialized.
+    pending_lambda_type_param_bound_refs: ?[]PendingBoundRef = null,
     /// Instantiated value-parameter types for the pending lambda literal,
     /// derived from its resolved call-argument slot. The lambda body takes
     /// ownership and records them as ordinary local declared types.
@@ -2207,7 +2219,17 @@ pub const Module = struct {
         ty: TypeRef,
     ) bool {
         if (overrideQualifiedPath(ty) != null) return false;
-        if (self.funcTypeParamIndex(fid, staticTypeHead(ty.name)) != null) return true;
+        // A use-site projection hides the parameter from the raw head:
+        // `Array<out T>` contains T even though its argument's head spells
+        // `out#T` — without the strip the whole parameter routed through
+        // receiver compatibility and the generic proof never ran.
+        var head = staticTypeHead(ty.name);
+        if (std.mem.startsWith(u8, head, "out#")) {
+            head = head["out#".len..];
+        } else if (std.mem.startsWith(u8, head, "in#")) {
+            head = head["in#".len..];
+        }
+        if (self.funcTypeParamIndex(fid, head) != null) return true;
         for (overrideArgs(ty)) |arg| {
             if (self.staticTypeContainsFuncParam(fid, arg)) return true;
         }
@@ -2225,10 +2247,34 @@ pub const Module = struct {
         depth: u8,
     ) StaticCompatibility {
         if (depth >= 32) return .unknown;
+        // A use-site variance projection is transparent to compatibility:
+        // `Array<String>` against `Array<out T>` adjudicates String-vs-T,
+        // not String-vs-`out#T` (whose head names nothing and left the
+        // Array overload of `minus` unknown at the argument step).
+        if (std.mem.startsWith(u8, param.name, "out#") or
+            std.mem.startsWith(u8, param.name, "in#"))
+        {
+            var stripped = param;
+            stripped.name = if (std.mem.startsWith(u8, param.name, "out#"))
+                param.name["out#".len..]
+            else
+                param.name["in#".len..];
+            return self.staticGenericArgCompatibility(fid, actual, stripped, depth + 1);
+        }
+        if (std.mem.startsWith(u8, actual.name, "out#") or
+            std.mem.startsWith(u8, actual.name, "in#"))
+        {
+            var stripped = actual;
+            stripped.name = if (std.mem.startsWith(u8, actual.name, "out#"))
+                actual.name["out#".len..]
+            else
+                actual.name["in#".len..];
+            return self.staticGenericArgCompatibility(fid, stripped, param, depth + 1);
+        }
         const param_head = staticTypeHead(param.name);
         if (overrideQualifiedPath(param) == null) {
             if (self.staticFuncTypeParamBound(fid, param_head)) |bound| {
-                if (std.mem.eql(u8, staticTypeHead(bound), "Any")) return .compatible;
+                if (std.mem.eql(u8, applicability.simpleName(staticTypeHead(bound)), "Any")) return .compatible;
                 return self.staticReceiverCompatibility(
                     null,
                     actual,
@@ -2262,6 +2308,15 @@ pub const Module = struct {
             {
                 return .incompatible;
             }
+            // A Kotlin Array is NOT an Iterable/Collection/Sequence. The
+            // runtime models arrays against those interfaces for member
+            // dispatch convenience, but overload REFUTATION follows
+            // kotlinc: `minus(elements: Iterable<T>)` never takes an Array
+            // argument, so the Array sibling resolves statically instead
+            // of deferring the whole overload set to a runtime value pick.
+            if (arrayVsCollectionParam(actual_head, param_erased_head)) {
+                return .incompatible;
+            }
         }
         const classifier = self.staticReceiverCompatibility(
             null,
@@ -2273,6 +2328,27 @@ pub const Module = struct {
         const param_args = overrideArgs(param);
         if (param_args.len == 0) return .compatible;
         const actual_args = overrideArgs(actual);
+        // A head-matching actual whose ARGS are absent (a derivation that
+        // kept only the head — `arrayOf("foo","g")` shapes as bare `Array`)
+        // still satisfies a parameter whose every argument is one of the
+        // callee's OWN inferable type parameters: kotlinc binds them by
+        // inference, and applicability is not instantiation proof.
+        if (actual_args.len == 0 and param_args.len != 0) {
+            var all_own_tp = true;
+            for (param_args) |pa| {
+                var n = pa.name;
+                if (std.mem.startsWith(u8, n, "out#")) {
+                    n = n["out#".len..];
+                } else if (std.mem.startsWith(u8, n, "in#")) {
+                    n = n["in#".len..];
+                }
+                if (self.funcTypeParamIndex(fid, staticTypeHead(n)) == null) {
+                    all_own_tp = false;
+                    break;
+                }
+            }
+            if (all_own_tp) return .compatible;
+        }
         if (actual_args.len != param_args.len) return .unknown;
         var result: StaticCompatibility = .compatible;
         for (actual_args, param_args) |actual_arg, param_arg| {
@@ -2286,6 +2362,229 @@ pub const Module = struct {
             if (nested == .unknown) result = .unknown;
         }
         return result;
+    }
+
+    /// The promotion proof, third derivation (the first two measured zero
+    /// for lack of argument authority — the typing channels now supply it):
+    /// a deferred member commits when every supplied argument is
+    /// AUTHORITATIVE and member-compatible, and every same-name extension
+    /// reachable from the receiver's chain is refuted by arity or by an
+    /// argument. Conservative everywhere: an unjudgeable candidate keeps
+    /// the deferral.
+    pub threadlocal var mpp_why: []const u8 = "-";
+
+    pub fn memberPromotionProven(
+        self: *const Module,
+        member_fid: FuncId,
+        head: []const u8,
+        name: []const u8,
+        recv_ty: TypeRef,
+        shapes: []const applicability.ArgShape,
+        actual_bounds: []const ModuleRegistry.TypeParamBound,
+    ) bool {
+        mpp_why = "-";
+        const mf = self.funcById(member_fid) orelse {
+            mpp_why = "no-member-fn";
+            return false;
+        };
+        const m_off: usize = @intFromBool(funcHasImplicitThis(mf));
+        if (mf.params.len < m_off + shapes.len) {
+            mpp_why = "member-arity";
+            return false;
+        }
+        var member_fully_proven = true;
+        // The receiver's instantiation substitutes the owner's own type
+        // parameters positionally: `contains(element: E)` on an
+        // `Iterable<String>` receiver proves against String. Only the
+        // direct-instantiation case (receiver head IS the owner) is
+        // taken; projections keep the raw param and the conservative
+        // unknown below.
+        const owner_tps: []const []const u8 = blk: {
+            const ds = self.decl_sigs.get(member_fid.int()) orelse break :blk &.{};
+            const oid = ds.enclosing_class orelse break :blk &.{};
+            if (oid.int() >= self.classes.items.len) break :blk &.{};
+            const ocls = &self.classes.items[oid.int()];
+            if (!std.mem.eql(u8, applicability.simpleName(ocls.name), applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, recv_ty.name, "?")))))
+                break :blk &.{};
+            break :blk ocls.type_params;
+        };
+        for (shapes, mf.params[m_off .. m_off + shapes.len]) |sh, p| {
+            if (sh.ty == null and sh.literal_kind == null and !sh.is_lambda) {
+                mpp_why = "arg-unauthoritative";
+                return false;
+            }
+            if (sh.named != null or sh.is_spread) {
+                mpp_why = "named-or-spread";
+                return false;
+            }
+            var param_ty = p.ty;
+            var ph = staticTypeHead(std.mem.trimEnd(u8, param_ty.name, "?"));
+            if (parseClassTypeParamIdentity(ph)) |ident| ph = ident.param;
+            for (owner_tps, 0..) |tp, i| {
+                if (std.mem.eql(u8, tp, ph) and i < recv_ty.args.len and
+                    recv_ty.args[i].name.len != 0 and
+                    !std.mem.eql(u8, recv_ty.args[i].name, "*"))
+                {
+                    param_ty = recv_ty.args[i];
+                    break;
+                }
+            }
+            // Unsubstitutable class-parameter ARGS erase to `*` for the
+            // proof: `Collection<E>` under a head-only receiver behaves as
+            // `Collection<*>` — the head adjudicates, the parameter proves
+            // and refutes nothing (the star-erasure convention). This is
+            // what lifts removeAll/addAll/putAll members to the
+            // scope-order tier.
+            var star_buf: [8]TypeRef = undefined;
+            if (param_ty.args.len != 0 and param_ty.args.len <= star_buf.len) {
+                var all_tp = true;
+                for (param_ty.args) |pa| {
+                    var ah = staticTypeHead(std.mem.trimEnd(u8, pa.name, "?"));
+                    if (std.mem.startsWith(u8, ah, "out#")) ah = ah["out#".len..];
+                    if (std.mem.startsWith(u8, ah, "in#")) ah = ah["in#".len..];
+                    var is_tp = parseClassTypeParamIdentity(ah) != null or
+                        (ah.len > 0 and ah.len <= 2 and std.ascii.isUpper(ah[0]));
+                    if (!is_tp) for (owner_tps) |tp| {
+                        if (std.mem.eql(u8, tp, ah)) {
+                            is_tp = true;
+                            break;
+                        }
+                    };
+                    if (!is_tp) {
+                        all_tp = false;
+                        break;
+                    }
+                }
+                if (all_tp) {
+                    for (0..param_ty.args.len) |i| {
+                        star_buf[i] = .{ .name = "*", .nullable = false, .args = &.{} };
+                    }
+                    param_ty = .{
+                        .name = param_ty.name,
+                        .nullable = param_ty.nullable,
+                        .args = star_buf[0..param_ty.args.len],
+                    };
+                }
+            }
+            // Two tiers. A member PROVEN applicable on every argument
+            // commits by Kotlin's scope order alone — members outrank
+            // extensions, no refutation needed. A member merely
+            // NON-refuted (the removeAll/addAll/putAll family, whose
+            // `Collection<E>` params stay unknown without a receiver
+            // instantiation) still commits, but only when every reachable
+            // extension is refuted below.
+            switch (self.staticArgCompatibility(member_fid, sh, param_ty, actual_bounds)) {
+                .incompatible => {
+                    mpp_why = "member-arg-refuted";
+                    if (std.c.getenv("KLIO_PROMO_NAMES") != null) {
+                        std.debug.print("[promo-pair] {s}.{s} param={s}<{d}> arg={s}<{d}>\n", .{
+                            head,
+                            name,
+                            param_ty.name,
+                            param_ty.args.len,
+                            if (sh.ty) |t| t.name else "?",
+                            if (sh.ty) |t| t.args.len else 0,
+                        });
+                    }
+                    return false;
+                },
+                .unknown => member_fully_proven = false,
+                .compatible => {},
+            }
+        }
+        if (member_fully_proven) return true;
+        const chain: []const []const u8 = self.registry.class_super_names.get(head) orelse &.{};
+        for (self.funcsBySimpleName(name)) |fid| {
+            if (fid.int() == member_fid.int()) continue;
+            const f = self.funcById(fid) orelse continue;
+            const kind = self.declarationKind(fid, f);
+            if (kind != .top_level_extension and kind != .member_extension) continue;
+            const ds = self.decl_sigs.get(fid.int()) orelse {
+                mpp_why = "ext-no-sig";
+                return false;
+            };
+            const recv_ref = ds.receiver_ty orelse
+                (if (f.params.len != 0) f.params[0].ty else continue);
+            var r_head = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, recv_ref.name, "?")));
+            if (std.mem.startsWith(u8, r_head, "out#")) r_head = r_head["out#".len..];
+            if (std.mem.startsWith(u8, r_head, "in#")) r_head = r_head["in#".len..];
+            const generic_recv = self.funcTypeParamIndex(fid, r_head) != null or
+                (r_head.len <= 2 and r_head.len > 0 and std.ascii.isUpper(r_head[0]));
+            var reachable = generic_recv or std.mem.eql(u8, r_head, head);
+            if (!reachable) {
+                for (applicability.builtinSupersOf(head)) |sup| {
+                    if (std.mem.eql(u8, r_head, sup)) {
+                        reachable = true;
+                        break;
+                    }
+                }
+            }
+            if (!reachable) {
+                for (chain) |sup| {
+                    if (std.mem.eql(u8, r_head, applicability.simpleName(staticTypeHead(sup)))) {
+                        reachable = true;
+                        break;
+                    }
+                }
+            }
+            if (!reachable) continue;
+            // Arity refutation first: the DeclSig arity counts user args.
+            const required: usize = ds.arity.required;
+            const total: usize = if (ds.arity.has_vararg) std.math.maxInt(u32) else ds.arity.total;
+            if (shapes.len < required or shapes.len > total) continue;
+            if (f.params.len < 1 + shapes.len and !ds.arity.has_vararg) continue;
+            var refuted = false;
+            const n = @min(shapes.len, f.params.len -| 1);
+            for (shapes[0..n], f.params[1 .. 1 + n]) |sh, p| {
+                if (self.staticArgCompatibility(fid, sh, p.ty, actual_bounds) == .incompatible) {
+                    refuted = true;
+                    break;
+                }
+            }
+            if (!refuted) {
+                mpp_why = "ext-unrefuted";
+                if (std.c.getenv("KLIO_PROMO_NAMES") != null) {
+                    std.debug.print("[promo-ext-alive] {s}.{s} ext={s} recv={s}\n", .{
+                        head,
+                        name,
+                        f.fqn,
+                        recv_ref.name,
+                    });
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn recvRefuteOn() bool {
+        const S = struct {
+            var cached: ?bool = null;
+        };
+        if (S.cached) |v| return v;
+        const on = std.c.getenv("KLIO_RECV_REFUTE") != null;
+        S.cached = on;
+        return on;
+    }
+
+    fn arrayVsCollectionParam(actual_head: []const u8, param_head: []const u8) bool {
+        const is_array = std.mem.eql(u8, actual_head, "Array") or
+            for ([_][]const u8{
+                "BooleanArray", "ByteArray",  "ShortArray", "IntArray",
+                "LongArray",    "CharArray",  "FloatArray", "DoubleArray",
+                "UByteArray",   "UShortArray", "UIntArray", "ULongArray",
+            }) |n| {
+                if (std.mem.eql(u8, actual_head, n)) break true;
+            } else false;
+        if (!is_array) return false;
+        for ([_][]const u8{
+            "Iterable", "MutableIterable",   "Collection", "MutableCollection",
+            "List",     "MutableList",       "Set",        "MutableSet",
+            "Sequence",
+        }) |n| {
+            if (std.mem.eql(u8, param_head, n)) return true;
+        }
+        return false;
     }
 
     const StaticAliasHead = struct {
@@ -2584,7 +2883,19 @@ pub const Module = struct {
             // prove compatibility without both.
             return .unknown;
         }
-        if (param.args.len != 0) return .unknown;
+        if (param.args.len != 0) {
+            // All-star arguments prove and refute nothing (the star-erasure
+            // convention): `List<String>` against `Collection<*>`
+            // adjudicates by HEAD alone below.
+            var all_star = true;
+            for (param.args) |pa| {
+                if (!std.mem.eql(u8, pa.name, "*")) {
+                    all_star = false;
+                    break;
+                }
+            }
+            if (!all_star) return .unknown;
+        }
         if (self.staticTypeClassId(receiver)) |actual_id| {
             if (self.staticTypeClassId(param)) |declared_id| {
                 if (self.classIdIsOrExtends(actual_id, declared_id)) return .compatible;
@@ -2597,6 +2908,13 @@ pub const Module = struct {
             }
         }
         if (actual_builtin == .ambiguous) return .unknown;
+        // The registered supertype chain is evidence the hardcoded builtin
+        // table lacks: `MutableCollection` IS a `Collection` through the
+        // shipped source hierarchy, and the blind refutation below held the
+        // whole removeAll/addAll member family.
+        if (evidenceSubtypeCb(@ptrCast(@constCast(self)), actual, declared)) {
+            return .compatible;
+        }
         if (!(actual_builtin == .yes and staticBuiltinConcrete(actual)) and
             applicability.builtinSupersOf(actual).len == 0 and
             self.staticTypeClassId(receiver) == null and
@@ -3137,6 +3455,46 @@ pub const Module = struct {
             const w = std.c.getenv("KLIO_GRA_TRACE") orelse break :blk false;
             break :blk std.mem.eql(u8, std.mem.span(w), staticTypeHead(actual.name));
         };
+        // The HEADS must relate before argument binding proves anything: a
+        // `Sequence<T>` receiver pattern never applies to an
+        // `Iterable<String>` actual — kotlinc drops the candidate outright —
+        // and binding `T := String` head-blind committed
+        // `kotlin.sequences.minus` for an Iterable-typed receiver. A pattern
+        // head that is itself one of the declaration's parameters keeps the
+        // binding walk as the authority.
+        {
+            const pat_head = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, pattern.name, "?")));
+            var pat_is_param = false;
+            for (declared_params) |dp| {
+                if (std.mem.eql(u8, dp.param, pat_head)) {
+                    pat_is_param = true;
+                    break;
+                }
+            }
+            if (!pat_is_param) {
+                const act_head = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, actual.name, "?")));
+                if (act_head.len != 0 and pat_head.len != 0 and
+                    !std.mem.eql(u8, act_head, pat_head))
+                {
+                    var act_erased = actual;
+                    act_erased.args = &.{};
+                    var pat_erased = pattern;
+                    pat_erased.args = &.{};
+                    const act_id = self.staticTypeClassId(act_erased);
+                    const pat_id = self.staticTypeClassId(pat_erased);
+                    const unrelated = if (act_id != null and pat_id != null)
+                        !self.classIdIsOrExtends(act_id.?, pat_id.?)
+                    else
+                        self.staticBuiltinIdentity(act_erased, act_head) == .yes and
+                            self.staticBuiltinIdentity(pat_erased, pat_head) == .yes and
+                            !evidenceSubtypeCb(@ptrCast(@constCast(self)), act_head, pat_head);
+                    if (unrelated) {
+                        if (gra_trace) std.debug.print("[gra] {s} vs {s}: head unrelated\n", .{ actual.name, pattern.name });
+                        return false;
+                    }
+                }
+            }
+        }
         if (!try self.bindReceiverTypeParams(
             a,
             actual,
@@ -3198,6 +3556,10 @@ pub const Module = struct {
         return self.staticTypeIsSubtypeInner(a, actual, substituted, actual_bounds, 0);
     }
 
+    /// Diagnostic: the last route staticArgCompatibility answered through,
+    /// for the rex-arg row. Set on every return path below.
+    threadlocal var sac_route: []const u8 = "-";
+
     fn staticArgCompatibility(
         self: *const Module,
         fid: FuncId,
@@ -3205,18 +3567,23 @@ pub const Module = struct {
         param: TypeRef,
         actual_bounds: []const ModuleRegistry.TypeParamBound,
     ) StaticCompatibility {
+        sac_route = "-";
         const declared = staticTypeHead(param.name);
         if (overrideQualifiedPath(param) == null and
             self.funcTypeParamIndex(fid, declared) != null)
         {
-            if (arg.ty) |ty| return self.staticGenericArgCompatibility(
-                fid,
-                ty,
-                param,
-                0,
-            );
+            if (arg.ty) |ty| {
+                sac_route = "fn-tp-generic";
+                return self.staticGenericArgCompatibility(
+                    fid,
+                    ty,
+                    param,
+                    0,
+                );
+            }
             const bound = self.staticFuncTypeParamBound(fid, declared).?;
-            if (std.mem.eql(u8, staticTypeHead(bound), "Any")) return .compatible;
+            sac_route = "fn-tp-bound";
+            if (std.mem.eql(u8, applicability.simpleName(staticTypeHead(bound)), "Any")) return .compatible;
             return .unknown;
         }
         // A class-owned type parameter needs the receiver's class
@@ -3242,6 +3609,49 @@ pub const Module = struct {
                     }
                 }
                 if (required != null and arg.ty != null) {
+                    // A bare type-parameter ARGUMENT is never definite: the
+                    // caller's own `T` offered to the owner's `T` slot
+                    // (EnumEntriesList.indexOf(element: T) from a generic
+                    // body) can bind anything its bound admits.
+                    {
+                        var ah = staticTypeHead(std.mem.trimEnd(u8, arg.ty.?.name, "?"));
+                        if (parseClassTypeParamIdentity(ah)) |ident2| ah = ident2.param;
+                        var tp_bound: ?ModuleRegistry.TypeParamBound = null;
+                        for (actual_bounds) |ab| {
+                            if (std.mem.eql(u8, ab.param, ah)) {
+                                tp_bound = ab;
+                                break;
+                            }
+                        }
+                        if (tp_bound) |ab| {
+                            // Judge the parameter THROUGH its bound: every
+                            // instantiation of T satisfies the bound, so
+                            // bound <: required proves the argument, and a
+                            // provably disjoint bound/required pair refutes
+                            // it. Anything else is unknown.
+                            var barg_buf: [8]TypeRef = undefined;
+                            var bref = TypeRef{ .name = ab.bound, .nullable = false, .args = &.{} };
+                            if (ab.args.len != 0 and ab.args.len <= barg_buf.len) {
+                                for (ab.args, 0..) |an, i| {
+                                    barg_buf[i] = .{ .name = an, .nullable = false, .args = &.{} };
+                                }
+                                bref.args = barg_buf[0..ab.args.len];
+                            }
+                            if (self.staticTypeIsSubtypeWithBounds(
+                                self.registry.allocator,
+                                bref,
+                                required.?,
+                                actual_bounds,
+                            ) catch false) return .compatible;
+                            if (self.staticReceiverCompatibility(null, bref, required.?) == .incompatible and
+                                self.staticReceiverCompatibility(null, required.?, bref) == .incompatible)
+                            {
+                                return .incompatible;
+                            }
+                            return .unknown;
+                        }
+                        if (ah.len > 0 and ah.len <= 2 and std.ascii.isUpper(ah[0])) return .unknown;
+                    }
                     if (self.staticTypeIsSubtypeWithBounds(
                         self.registry.allocator,
                         arg.ty.?,
@@ -3299,6 +3709,7 @@ pub const Module = struct {
         }
         if (arg.ty) |ty| {
             if (self.staticTypeContainsFuncParam(fid, param)) {
+                sac_route = "contains-fn-tp";
                 return self.staticGenericArgCompatibility(fid, ty, param, 0);
             }
             if (typeContainsBoundParam(ty, actual_bounds)) {
@@ -3320,6 +3731,7 @@ pub const Module = struct {
             {
                 return .incompatible;
             }
+            sac_route = "recv-compat-tail";
             return self.staticReceiverCompatibility(fid, ty, param);
         }
         if (arg.is_lambda or arg.lambda_arity != null or arg.func_typed) {
@@ -3710,16 +4122,54 @@ pub const Module = struct {
         var scratch = std.heap.ArenaAllocator.init(self.registry.allocator);
         defer scratch.deinit();
         const sa = scratch.allocator();
-        const scoped_receiver = self.resolveTypeAliasAt(
+        var scoped_receiver = self.resolveTypeAliasAt(
             sa,
             receiver,
             ctx.caller_file,
             ctx.caller_package,
         ) catch return .{};
+        // A receiver still HEADED by a type parameter ranks with its full
+        // bound substituted: `data - "foo"` on a `T : Iterable<String>`
+        // receiver must refute `Set.minus` exactly as kotlinc does — an
+        // unresolved `T` head leaves every receiver-shaped candidate
+        // applicable, and the wrong overload can outrank the bound's own.
+        if (scoped_receiver.args.len == 0) {
+            const rhead = staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?"));
+            if (std.c.getenv("KLIO_HOP_TRACE") != null) {
+                std.debug.print("[hop] {s} recv={s} nbounds={d}\n", .{ name, rhead, ctx.actual_type_param_bounds.len });
+                for (ctx.actual_type_param_bounds) |b0| {
+                    std.debug.print("[hop]   {s} : {s} args={d}\n", .{ b0.param, b0.bound, b0.args.len });
+                }
+            }
+            for (ctx.actual_type_param_bounds) |b| {
+                if (!std.mem.eql(u8, b.param, rhead)) continue;
+                if (b.args.len == 0) break;
+                if (sa.alloc(TypeRef, b.args.len)) |hop_args| {
+                    for (b.args, hop_args) |an, *dst| {
+                        dst.* = .{ .name = an, .nullable = false, .args = &.{} };
+                    }
+                    scoped_receiver = .{
+                        .name = b.bound,
+                        .nullable = false,
+                        .args = hop_args,
+                    };
+                } else |_| {}
+                break;
+            }
+        }
         var ids: std.ArrayList(FuncId) = .empty;
         var tiers: std.ArrayList(u8) = .empty;
         var unknowns: std.ArrayList(bool) = .empty;
         var unknown_best_tier: u8 = 255;
+        // The per-call window delimiter for the rex trace: every candidate
+        // row until the next rex-call row belongs to this resolution.
+        if (std.c.getenv("KLIO_REX_TRACE") != null) {
+            if (applicability.trace_call_span) |sp| {
+                std.debug.print("[rex-call] {s} recv={s} rargs={d} at=f{d}:{d}\n", .{ name, scoped_receiver.name, scoped_receiver.args.len, sp.file.int(), sp.start });
+            } else {
+                std.debug.print("[rex-call] {s} recv={s} rargs={d}\n", .{ name, scoped_receiver.name, scoped_receiver.args.len });
+            }
+        }
         var candidate_it = self.bareCallCandidateIterator(name, ctx.caller_file);
         var receiver_pruned: usize = 0;
         candidate_loop: while (candidate_it.next()) |fid| {
@@ -3728,7 +4178,7 @@ pub const Module = struct {
             const kind = if (ds) |decl| decl.kind else f.kind;
             const is_member_extension = kind == .member_extension;
             const rex_trace = std.c.getenv("KLIO_REX_TRACE") != null;
-            if (rex_trace) std.debug.print("[rex] {s} fid={d} kind={s} enter\n", .{ name, fid.int(), @tagName(kind) });
+            if (rex_trace) std.debug.print("[rex] {s} fid={d} kind={s} enter recv={s} rargs={d}\n", .{ name, fid.int(), @tagName(kind), scoped_receiver.name, scoped_receiver.args.len });
             if ((kind != .top_level_extension and !is_member_extension) or
                 f.params.len == 0 or
                 !std.mem.eql(u8, f.params[0].name, "this")) continue;
@@ -3864,8 +4314,31 @@ pub const Module = struct {
                 scoped_receiver,
                 scoped_recv_param,
             );
+            // KLIO_RECV_REFUTE=1 (A/B, default OFF): kotlinc's static
+            // receiver semantics — a candidate whose declared receiver
+            // classifier is provably unrelated to the PROVEN static receiver
+            // is not a candidate at all (`Map.minus` never binds an
+            // Iterable-typed receiver). The lazy default keeps the
+            // runtime-polymorphic leniency until the audit adjudicates.
+            if (compatibility == .unknown and scoped_receiver.args.len != 0 and
+                recvRefuteOn())
+            {
+                const rh = staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?"));
+                const ph = staticTypeHead(std.mem.trimEnd(u8, scoped_recv_param.name, "?"));
+                if (!std.mem.eql(u8, rh, ph) and
+                    self.staticBuiltinIdentity(scoped_receiver, rh) == .yes and
+                    self.staticBuiltinIdentity(scoped_recv_param, ph) == .yes and
+                    !evidenceSubtypeCb(@ptrCast(@constCast(self)), rh, ph))
+                {
+                    compatibility = .incompatible;
+                }
+            }
             const declared_bounds = self.declaredTypeParamBounds(sa, fid) catch return .{};
-            if (rex_trace) std.debug.print("[rex] {s} fid={d} bounds={d} compat0={s}\n", .{ name, fid.int(), declared_bounds.len, @tagName(compatibility) });
+            if (rex_trace) {
+                std.debug.print("[rex] {s} fid={d} bounds={d} compat0={s}", .{ name, fid.int(), declared_bounds.len, @tagName(compatibility) });
+                for (declared_bounds) |db| std.debug.print(" {s}<:{s}", .{ db.param, db.bound });
+                std.debug.print("\n", .{});
+            }
             if (declared_bounds.len != 0) {
                 const generic_applies = self.staticGenericReceiverApplicable(
                     sa,
@@ -4009,6 +4482,16 @@ pub const Module = struct {
                         param.ty,
                         ctx.actual_type_param_bounds,
                     );
+                    if (rex_trace) {
+                        std.debug.print("[rex-arg] {s} fid={d} param={s} arg_ty={s} -> {s} route={s}\n", .{
+                            name,
+                            fid.int(),
+                            param.ty.name,
+                            if (arg.ty) |t| t.name else "-",
+                            @tagName(arg_compatibility),
+                            sac_route,
+                        });
+                    }
                     if (arg_compatibility == .incompatible) {
                         compatibility = .incompatible;
                         break;
@@ -4088,10 +4571,20 @@ pub const Module = struct {
             const score = applicability.applicable(sig, proof_args, scope) orelse continue;
             if (score.ext_key.?[0] != 0 and tier < best_tier) best_tier = tier;
         }
-        if (best_tier == 255) return .{};
+        if (best_tier == 255) {
+            if (std.c.getenv("KLIO_REX_TRACE") != null) {
+                if (applicability.trace_call_span) |sp| std.debug.print("[rex-exit] {s} no-applicable-tier at=f{d}:{d}\n", .{ name, sp.file.int(), sp.start });
+            }
+            return .{};
+        }
         // A same-or-inner-tier declaration whose visibility metadata is not
         // complete cannot be compared safely with the ranked set.
-        if (unknown_best_tier <= best_tier) return .{ .applicable = true };
+        if (unknown_best_tier <= best_tier) {
+            if (std.c.getenv("KLIO_REX_TRACE") != null) {
+                if (applicability.trace_call_span) |sp| std.debug.print("[rex-exit] {s} unknown-tier {d}<={d} at=f{d}:{d}\n", .{ name, unknown_best_tier, best_tier, sp.file.int(), sp.start });
+            }
+            return .{ .applicable = true };
+        }
 
         var ranked_sigs: std.ArrayList(applicability.SigView) = .empty;
         var ranked_ids: std.ArrayList(FuncId) = .empty;
@@ -4113,15 +4606,30 @@ pub const Module = struct {
         var best: ?FuncId = null;
         var best_key: [8]i32 = .{std.math.minInt(i32)} ** 8;
         var best_unknown = false;
+        var best_recv_param: ?TypeRef = null;
+        var best_fid_for_recv: ?FuncId = null;
         var tied = false;
         for (ranked_sigs.items, ranked_ids.items, ranked_unknowns.items) |*sig, fid, unknown| {
-            const score = applicability.applicable(sig, proof_args, ranked_scope) orelse continue;
+            const maybe_score = applicability.applicable(sig, proof_args, ranked_scope);
+            if (maybe_score == null and std.c.getenv("KLIO_REX_TRACE") != null) {
+                if (applicability.trace_call_span) |sp| std.debug.print("[rex-key] {s} fid={d} DISQUALIFIED at=f{d}:{d}\n", .{ name, fid.int(), sp.file.int(), sp.start });
+            }
+            const score = maybe_score orelse continue;
             const key = score.ext_key.?;
+            if (std.c.getenv("KLIO_REX_TRACE") != null) {
+                if (applicability.trace_call_span) |sp| {
+                    std.debug.print("[rex-key] {s} fid={d} key={any} low={} unknown={} at=f{d}:{d}\n", .{ name, fid.int(), key, score.low_priority, unknown, sp.file.int(), sp.start });
+                } else {
+                    std.debug.print("[rex-key] {s} fid={d} key={any} low={} unknown={}\n", .{ name, fid.int(), key, score.low_priority, unknown });
+                }
+            }
             if (key[0] == 0 or (any_ordinary and score.low_priority)) continue;
             if (best == null or extensionKeyGreater(key, best_key)) {
                 best = fid;
                 best_key = key;
                 best_unknown = unknown;
+                best_recv_param = if (sig.params.len != 0) sig.params[0].ty else null;
+                best_fid_for_recv = fid;
                 tied = false;
             } else if (extensionKeyEquivalent(key, best_key)) {
                 tied = true;
@@ -4165,9 +4673,51 @@ pub const Module = struct {
         const sole_survivor = !sole_off and ids.items.len == 1 and
             ranked_sigs.items.len == 1 and scoped_receiver.args.len != 0 and
             (receiver_pruned != 0 or (ctx.member_refuted and sole_same_file));
+        // The widened member-refuted commit: when the MEMBER was refuted by
+        // an authoritative argument, the strict ext_key winner commits even
+        // with an unproven receiver instantiation — every supplied argument
+        // is authoritative (unauthoritative args cannot refute a member, so
+        // reaching here with member_refuted implies authority), the key
+        // strictly beat every rival (untied), and kotlinc has no member to
+        // prefer. The trimIndent hazard was the FILE-blind sole rule
+        // without key strictness; this rule requires both.
+        var refuted_args_authoritative = true;
+        for (proof_args) |pa| {
+            if (pa.ty == null and pa.literal_kind == null and
+                !pa.is_lambda and pa.lambda_arity == null)
+            {
+                refuted_args_authoritative = false;
+                break;
+            }
+        }
+        // The winner's declared receiver must RELATE to the static
+        // receiver (same head, proven subtype, or the winner's own type
+        // parameter): an argument-keyed winner on an unrelated receiver is
+        // exactly the over-commit that put a Map-family extension on a
+        // Sequence (SequenceTest.flatten).
+        const winner_recv_related = blk: {
+            const brp = best_recv_param orelse break :blk false;
+            var wh = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, brp.name, "?")));
+            if (std.mem.startsWith(u8, wh, "out#")) wh = wh["out#".len..];
+            if (std.mem.startsWith(u8, wh, "in#")) wh = wh["in#".len..];
+            const bfid = best_fid_for_recv orelse break :blk false;
+            if (self.funcTypeParamIndex(bfid, wh) != null) break :blk true;
+            if (wh.len > 0 and wh.len <= 2 and std.ascii.isUpper(wh[0])) break :blk true;
+            const rh = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?")));
+            if (rh.len == 0) break :blk false;
+            if (std.mem.eql(u8, rh, wh)) break :blk true;
+            if (evidenceSubtypeCb(@ptrCast(@constCast(self)), rh, wh)) break :blk true;
+            for (applicability.builtinSupersOf(rh)) |sup| {
+                if (std.mem.eql(u8, sup, wh)) break :blk true;
+            }
+            break :blk false;
+        };
+        const refuted_member_strict_winner = ctx.member_refuted and
+            best != null and !tied and refuted_args_authoritative and
+            winner_recv_related;
         if (tied or
             (best_unknown and !receiver_supplies_lambda and !renamed_best and
-                !sole_survivor))
+                !sole_survivor and !refuted_member_strict_winner))
             return .{ .applicable = true };
         const dispatch_owner = if (best) |target|
             (if (self.registry.member_ext_owner_class.get(target)) |owner|
@@ -4705,18 +5255,28 @@ pub const Module = struct {
         const params = self.registry.func_type_params.get(fid) orelse return &.{};
         const bounds = try allocator.alloc(ModuleRegistry.TypeParamBound, params.items.len);
         const explicit = self.registry.func_type_param_bounds.get(fid) orelse &.{};
-        for (params.items, bounds) |param, *out| {
-            out.* = .{ .param = param, .bound = "kotlin.Any" };
+        // The param list can carry a DUPLICATE name when a declaration
+        // registered through both the header phase and body placement; one
+        // record per NAME, or the multi-bound arms downstream refuse a
+        // single-parameter declaration (`Iterable<T>.minus` read bounds=2
+        // and staticGenericReceiverApplicable declined every candidate).
+        var n: usize = 0;
+        outer: for (params.items) |param| {
+            for (bounds[0..n]) |seen| {
+                if (std.mem.eql(u8, seen.param, param)) continue :outer;
+            }
+            bounds[n] = .{ .param = param, .bound = "kotlin.Any" };
             for (explicit) |bound| {
                 if (std.mem.eql(u8, bound.param, param)) {
-                    out.bound = bound.bound;
-                    out.complete = bound.complete;
-                    out.head_only = bound.head_only;
+                    bounds[n].bound = bound.bound;
+                    bounds[n].complete = bound.complete;
+                    bounds[n].head_only = bound.head_only;
                     break;
                 }
             }
+            n += 1;
         }
-        return bounds;
+        return bounds[0..n];
     }
 
     /// Instantiate the structural return type of an already-resolved call.
@@ -4744,6 +5304,33 @@ pub const Module = struct {
         dispatch_receiver: ?TypeRef,
         args: []const applicability.ArgShape,
         explicit_type_args: []const TypeRef,
+    ) Allocator.Error!?TypeRef {
+        return self.instantiatedCallReturnTypeScoped(
+            allocator,
+            fid,
+            receiver,
+            dispatch_receiver,
+            args,
+            explicit_type_args,
+            false,
+        );
+    }
+
+    /// `owner_params_in_scope`: the CALLER's body is (lexically inside) the
+    /// target's own class, so the owner's type parameters are names the
+    /// caller resolves — a bare-head implicit-this projection keeps them as
+    /// THEMSELVES instead of erasing to `*`: `val data = createFrom(...)`
+    /// inside `IterableTests<T : Iterable<String>>` types `data: T`, which
+    /// the bound-ref channel then resolves.
+    pub fn instantiatedCallReturnTypeScoped(
+        self: *const Module,
+        allocator: Allocator,
+        fid: FuncId,
+        receiver: ?TypeRef,
+        dispatch_receiver: ?TypeRef,
+        args: []const applicability.ArgShape,
+        explicit_type_args: []const TypeRef,
+        owner_params_in_scope: bool,
     ) Allocator.Error!?TypeRef {
         const f = self.funcById(fid) orelse return null;
         // An unannotated source function currently carries Unit as its
@@ -4835,12 +5422,15 @@ pub const Module = struct {
                         }
                         break :blk_m false;
                     };
-                    if (mentions) {
+    if (mentions) {
                         if (std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0")) return null;
                         for (owner_class.type_params) |param| {
                             try bindings.append(a, .{
                                 .name = try classTypeParamIdentity(a, owner, param),
-                                .ty = .{ .name = "*", .nullable = false, .args = &.{} },
+                                .ty = if (owner_params_in_scope)
+                                    .{ .name = param, .nullable = false, .args = &.{} }
+                                else
+                                    .{ .name = "*", .nullable = false, .args = &.{} },
                             });
                         }
                     }
@@ -5575,6 +6165,10 @@ pub const Module = struct {
         if (self.pending_lambda_own_recv_type) |*receiver| receiver.deinit(allocator);
         if (self.pending_lambda_type_params) |params| allocator.free(params);
         if (self.pending_lambda_type_param_bounds) |bounds| allocator.free(bounds);
+        if (self.pending_lambda_type_param_bound_refs) |refs| {
+            for (refs) |*r| r.ref.deinit(allocator);
+            allocator.free(refs);
+        }
         if (self.pending_lambda_param_types) |types| {
             for (types) |*ty| ty.deinit(allocator);
             allocator.free(types);
@@ -10298,8 +10892,13 @@ test "member resolution separates class and caller function bounds" {
         },
         .actual_type_param_bounds = &actual_bounds,
     });
-    try testing.expect(resolved.target == null);
-    try testing.expect(!resolved.applicable);
+    // The caller's `T : CharSequence` proves nothing against the class's
+    // `T : Number` and refutes nothing either (one type can satisfy both
+    // bounds), so the single candidate commits only as DEFERRED — the
+    // runtime adjudicates. A `.virtual`/`.direct` result here means the
+    // two bound records were conflated into a false proof.
+    try testing.expect(resolved.target != null);
+    try testing.expect(resolved.dispatch == .deferred);
 }
 
 test "method slots link generic overrides and multiple interface roots" {

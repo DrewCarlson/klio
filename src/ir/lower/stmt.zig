@@ -560,6 +560,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         else
             try pending_bounds.toOwnedSlice(b.allocator);
         defer pending_bounds.deinit(b.allocator);
+        b.module.pending_lambda_type_param_bound_refs = try b.typeParamBoundRefsSlice();
         // The receiver type in scope inside this body: a local EXTENSION fn's
         // own declared receiver (innermost, wins bare-call disambiguation —
         // `fun MockViewValidator.value() { Text(…) }` must pick the

@@ -1662,9 +1662,9 @@ fn boundTypeRecordComplete(bound: *const ast.TypeRef) bool {
 /// not a function type, and not naming any of the class's own type
 /// parameters. `T : Iterable<String>` keeps ["String"];
 /// `C : MutableCollection<in T>` keeps nothing.
-fn concreteBoundArgs(
+pub fn concreteBoundArgs(
     allocator: Allocator,
-    class: *const ast.Class,
+    own_params: []const ast.TypeParam,
     upper: *const ast.TypeRef,
 ) Allocator.Error![]const []const u8 {
     if (upper.type_args.len == 0) return &.{};
@@ -1674,7 +1674,7 @@ fn concreteBoundArgs(
         const n = ta.ty.name.name;
         if (n.len == 0) return &.{};
         if (n.len <= 2 and std.ascii.isUpper(n[0])) return &.{};
-        for (class.type_params) |*other| {
+        for (own_params) |*other| {
             if (std.mem.eql(u8, other.name.name, n)) return &.{};
         }
     }
@@ -1698,7 +1698,7 @@ fn loweredClassTypeParamBounds(
                 .bound = upper.name.name,
                 .complete = boundTypeRecordComplete(upper),
                 .head_only = boundTypeRecordHeadOnly(upper),
-                .args = try concreteBoundArgs(allocator, class, upper),
+                .args = try concreteBoundArgs(allocator, class.type_params, upper),
             });
         }
         for (class.where_bounds) |*where_bound| {
@@ -1788,11 +1788,12 @@ fn addScopedTypeParamBounds(
                     }
                 }
                 if (!shadowed) {
-                    try b.addTypeParamBoundHead(
+                    try b.addTypeParamBoundHeadArgs(
                         bound.param,
                         bound.bound,
                         bound.complete,
                         bound.head_only,
+                        bound.args,
                     );
                     // A bound whose record kept CONCRETE type arguments
                     // also registers the full ref, so a receiver typed by
@@ -1853,7 +1854,16 @@ fn addScopedTypeParamBounds(
             complete = false;
             head_only = false;
         }
-        try b.addTypeParamBoundHead(param.name.name, bound, complete, head_only);
+        try b.addTypeParamBoundHeadArgs(
+            param.name.name,
+            bound,
+            complete,
+            head_only,
+            if (count == 1) if (bound_ast) |upper|
+                try concreteBoundArgs(b.allocator, f.type_params, upper)
+            else
+                &.{} else &.{},
+        );
         // The string record drops the bound's type ARGUMENTS; keep the full
         // lowered form when there are any, so a receiver typed by this
         // parameter can instantiate a call's return type through it.

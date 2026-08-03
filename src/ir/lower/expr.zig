@@ -952,6 +952,21 @@ fn lowerResolvedBinaryOperator(
     if (lhs.* == .Call or lhs.* == .Binary) {
         inferred_lhs_ty = try staticCallReturnTypeRef(b, lhs);
     }
+    if (runtime.getenvSlice("KLIO_HOP_TRACE") != null) {
+        const lazy = argDeclTypeRefLazy(b, lhs);
+        const bare: ?[]const u8 = if (lhs.* == .Path and lhs.Path.segments.len == 1)
+            staticBareReceiverType(b, lhs.Path.segments[0].name)
+        else
+            null;
+        std.debug.print("[binop-in] {s} lhs={s} inferred={s} lazy={s} bare={s} owner={s}\n", .{
+            method,
+            @tagName(std.meta.activeTag(lhs.*)),
+            if (inferred_lhs_ty) |t| t.name else "-",
+            if (lazy) |t| t.name else "-",
+            bare orelse "-",
+            b.ownerClass() orelse "-",
+        });
+    }
     const declared_lhs_ty = inferred_lhs_ty orelse
         argDeclTypeRefLazy(b, lhs) orelse return null;
     if (isPrimitiveTypeName(typeHead(declared_lhs_ty.name))) return null;
@@ -959,7 +974,7 @@ fn lowerResolvedBinaryOperator(
 
     const args = rhs[0..1];
     const ident = ast.Ident{ .name = method, .span = call_span };
-    switch (try lowerResolvedMemberCall(
+    const member_form = try lowerResolvedMemberCall(
         b,
         lhs,
         ident,
@@ -968,7 +983,15 @@ fn lowerResolvedBinaryOperator(
         &.{},
         declared_lhs_ty,
         .{},
-    )) {
+    );
+    if (runtime.getenvSlice("KLIO_HOP_TRACE") != null) {
+        std.debug.print("[binop] {s} lhs_ty={s} member={s}\n", .{
+            method,
+            declared_lhs_ty.name,
+            @tagName(std.meta.activeTag(member_form)),
+        });
+    }
+    switch (member_form) {
         .lowered => |reg| return reg,
         .deferred => return null,
         .none => {},
@@ -2933,6 +2956,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // cast inside the lambda body is still erased.
     b.module.pending_lambda_type_params = try b.typeParamNamesSlice();
     b.module.pending_lambda_type_param_bounds = try b.typeParamBoundsSlice();
+    b.module.pending_lambda_type_param_bound_refs = try b.typeParamBoundRefsSlice();
     // A lambda inside a local fn's body keeps that fn's self-identity (a
     // named local fn overrides this with its own before its body lowers).
     if (b.module.pending_lambda_self_fn == null) b.module.pending_lambda_self_fn = b.selfLocalFn();
@@ -2940,6 +2964,34 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // builder's set already includes what it inherited).
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
     b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
+    // Fold ACTIVE inline-splice param types into the snapshot: a nested
+    // closure inside a spliced body captures the callee's parameter by
+    // name (`destination.add(it)` inside `transform(element)?.let { ... }`
+    // spliced from mapNotNullTo), and the local-decl snapshot never saw
+    // the splice channel.
+    if (b.module.pending_lambda_local_decl_types) |*locals| {
+        var sp_it = b.spliceParamTyIterator();
+        while (sp_it.next()) |e| {
+            if (locals.types.contains(e.key_ptr.*)) continue;
+            const lowered_ty = try decl_mod.loweredTypeRef(b.allocator, e.value_ptr, true);
+            try locals.types.put(e.key_ptr.*, lowered_ty);
+        }
+        // Pre-derive the lazily-typed outer locals INTO the snapshot: a
+        // closure capturing `val iterator = listIterator(size)` sees only
+        // an on-demand derivation that cannot run in the closure's scope.
+        // Deriving here runs in the OUTER builder — the only scope the
+        // initializer was written in — and the closure inherits a plain
+        // declared type.
+        var init_it = b.localInitExprIterator();
+        while (init_it.next()) |e| {
+            if (locals.types.contains(e.key_ptr.*)) continue;
+            const prev_self = init_self_name;
+            if (b.localInitNameFree(e.key_ptr.*)) init_self_name = e.key_ptr.*;
+            const derived = staticCallReturnTypeRef(b, e.value_ptr.*) catch null;
+            init_self_name = prev_self;
+            if (derived) |ty| try locals.types.put(e.key_ptr.*, ty);
+        }
+    }
     const lowered = try lambda_body.lowerLambdaBodyCapturingKindWithIt(
         b.module,
         eff_params,
@@ -3937,7 +3989,23 @@ fn instantiatedLambdaValueParams(
         for (out[0..initialized]) |*ty| ty.deinit(b.allocator);
         b.allocator.free(out);
     }
+    // A slice that still quotes one of the CALLEE's own type parameters is
+    // not an answer: the head names nothing in the receiving scope, and
+    // recording it feeds the no-class bucket and disproves candidates a
+    // null leaves open (the splice-inheritance rule). Refuse the whole
+    // slice when any entry's head stayed unsubstituted.
+    const callee_tps = b.module.registry.func_type_params.get(func.id);
     for (out, instantiated.args[start .. start + count]) |*dst, src| {
+        if (callee_tps) |tps| {
+            const h = typeHead(std.mem.trimEnd(u8, src.name, "?"));
+            for (tps.items) |tp| {
+                if (std.mem.eql(u8, tp, h)) {
+                    for (out[0..initialized]) |*ty| ty.deinit(b.allocator);
+                    b.allocator.free(out);
+                    return null;
+                }
+            }
+        }
         dst.* = try src.clone(b.allocator);
         initialized += 1;
     }
@@ -3957,8 +4025,22 @@ fn deinitArgLambdaParamTypes(
     allocator.free(types);
 }
 
-/// Instantiated expected value-parameter types for each lambda argument,
-/// aligned through the same positional/named/trailing-lambda map as arity.
+/// The caller's body has the target's OWNER type parameters in lexical
+/// scope: every one of the owner's params is a registered type-param name
+/// on this builder. True only inside the owner's own (or a nested)
+/// declaration context.
+fn ownerParamsInScope(b: *FuncBuilder, target: FuncId) bool {
+    const ds = b.module.decl_sigs.get(target.int()) orelse return false;
+    const oid = ds.enclosing_class orelse return false;
+    if (oid.int() >= b.module.classes.items.len) return false;
+    const ocls = &b.module.classes.items[oid.int()];
+    if (ocls.type_params.len == 0) return false;
+    for (ocls.type_params) |tp| {
+        if (!b.isTypeParam(tp)) return false;
+    }
+    return true;
+}
+
 /// The receiver to substitute a generic callee's params from: a declared
 /// receiver carrying ARGUMENTS is authoritative; a bare type-param head
 /// resolves through its full bound ref when one was recorded
@@ -3973,6 +4055,8 @@ fn substitutionRecv(b: *FuncBuilder, declared: ?*const ir.TypeRef) ?*const ir.Ty
     return null;
 }
 
+/// Instantiated expected value-parameter types for each lambda argument,
+/// aligned through the same positional/named/trailing-lambda map as arity.
 fn argLambdaParamTypes(
     b: *FuncBuilder,
     func: *const Func,
@@ -7981,6 +8065,10 @@ fn argLitKind(e: *const Expr) ?LitKind {
         .BoolLit => .boolean,
         .CharLit => .char,
         .StringTemplate => .string,
+        // A signed literal is a literal: `nextInt(-1)` carries numeric
+        // evidence exactly as `nextInt(1)` does.
+        .Unary => |u| if ((u.op == .Neg or u.op == .Pos) and
+            (u.expr.* == .IntLit or u.expr.* == .FloatLit)) .numeric else null,
         else => null,
     };
 }
@@ -8283,11 +8371,11 @@ fn typeheadAuditOn() bool {
 /// class table cannot answer for them.
 fn headDeclaresTypeParams(b: *FuncBuilder, head: []const u8) bool {
     const generic_builtins = [_][]const u8{
-        "Array",       "List",     "MutableList", "Set",      "MutableSet",
-        "Map",         "MutableMap", "Collection", "MutableCollection",
-        "Iterable",    "MutableIterable", "Sequence", "Iterator",
-        "MutableIterator", "Comparable", "Comparator", "Pair", "Triple",
-        "Lazy",        "Result",   "Map.Entry",   "MutableMap.MutableEntry",
+        "Array",           "List",                    "MutableList", "Set",               "MutableSet",
+        "Map",             "MutableMap",              "Collection",  "MutableCollection", "Iterable",
+        "MutableIterable", "Sequence",                "Iterator",    "MutableIterator",   "Comparable",
+        "Comparator",      "Pair",                    "Triple",      "Lazy",              "Result",
+        "Map.Entry",       "MutableMap.MutableEntry",
     };
     for (generic_builtins) |g| {
         if (std.mem.eql(u8, g, head)) return true;
@@ -8317,6 +8405,9 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         // `this` for this body and must win. A spliced lambda argument skips
         // it because that lambda's receiver/free-name window is independent.
         if (b.lambda_splice_resolve == null) {
+            // The window's full receiver record wins over the head-only
+            // channel: iterating `this` needs the type arguments.
+            if (b.spliceRecvTyRef()) |ref| return ref.*;
             if (b.spliceRecvTy()) |head| {
                 return .{ .name = head, .nullable = false, .args = &.{} };
             }
@@ -8487,7 +8578,16 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     // applicability evidence while lowering the inline body. A spliced
     // lambda argument deliberately skips this channel: its free names resolve
     // in the caller scopes and may shadow a same-named inline parameter.
-    if (b.lambda_splice_resolve == null) {
+    if (b.lambda_splice_resolve == null or
+        (b.resolve(p.segments[0].name) == null and
+            !b.knowsOuter(p.segments[0].name)))
+    {
+        // The spliced-caller-lambda skip exists for CALLER names that
+        // shadow an inline parameter. A name the caller WINDOW cannot see
+        // at all (`destination.append` inside filterIndexedTo's predicate
+        // splice — the window deliberately skips the inline fn's own
+        // scopes) can only mean the spliced parameter, so its declared
+        // source type stays as evidence.
         if (b.spliceParamTy(p.segments[0].name)) |declared| {
             if (declared.function == null) {
                 return .{
@@ -8701,12 +8801,21 @@ fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.
 pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Error!?ir.TypeRef {
     var owned: ?ir.TypeRef = null;
     defer if (owned) |*t| t.deinit(b.allocator);
-    const ty: ir.TypeRef = blk: {
+    var ty: ir.TypeRef = blk: {
         if (argDeclTypeRef(b, iter)) |known| break :blk known;
         owned = (try staticCallReturnTypeRef(b, iter)) orelse
             (try localInitTypeRef(b, iter)) orelse return null;
         break :blk owned.?;
     };
+    // A type-parameter head resolves through its full bound ref: iterating
+    // a `T : Iterable<String>` receiver binds String elements.
+    {
+        var h0 = std.mem.trimEnd(u8, ty.name, "?");
+        if (std.mem.indexOfScalar(u8, h0, '<')) |lt| h0 = h0[0..lt];
+        if (ty.args.len == 0) {
+            if (b.typeParamBoundRef(typeHead(h0))) |bref| ty = bref.*;
+        }
+    }
     // Char sequences iterate Chars by their iterator, not by a type
     // argument — `for (element in this)` inside `CharSequence.all`'s
     // spliced body is the live case.
@@ -8722,6 +8831,24 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
                 .nullable = false,
                 .args = &.{},
             }).clone(b.allocator);
+        }
+        // Primitive arrays iterate their scalar kind the same way.
+        const prim_arrays = [_]struct { a: []const u8, e: []const u8 }{
+            .{ .a = "BooleanArray", .e = "Boolean" }, .{ .a = "ByteArray", .e = "Byte" },
+            .{ .a = "ShortArray", .e = "Short" },     .{ .a = "IntArray", .e = "Int" },
+            .{ .a = "LongArray", .e = "Long" },       .{ .a = "CharArray", .e = "Char" },
+            .{ .a = "FloatArray", .e = "Float" },     .{ .a = "DoubleArray", .e = "Double" },
+            .{ .a = "UByteArray", .e = "UByte" },     .{ .a = "UShortArray", .e = "UShort" },
+            .{ .a = "UIntArray", .e = "UInt" },       .{ .a = "ULongArray", .e = "ULong" },
+        };
+        for (prim_arrays) |pa| {
+            if (std.mem.eql(u8, h, pa.a)) {
+                return try (ir.TypeRef{
+                    .name = pa.e,
+                    .nullable = false,
+                    .args = &.{},
+                }).clone(b.allocator);
+            }
         }
     }
     if (ty.args.len != 1) return null;
@@ -9191,21 +9318,22 @@ fn staticCallReturnTypeRef(
             const member_of_enclosing = enclosingHasMemberNamed(b, name.name);
             const res = if (member_of_enclosing)
                 ir.Module.Resolution{ .target = null, .confidence = .deferred, .emit_form = .Call }
-            else try b.module.resolveCall(
-                b.allocator,
-                name.name,
-                b.self_package,
-                name.span.file,
-                shape_set.shapes,
-                lastArgIsLambda(call.args),
-                resolveCtxFor(
-                    b,
+            else
+                try b.module.resolveCall(
+                    b.allocator,
                     name.name,
-                    call.type_args,
-                    null,
-                    owned_type_param_bounds orelse &.{},
-                ),
-            );
+                    b.self_package,
+                    name.span.file,
+                    shape_set.shapes,
+                    lastArgIsLambda(call.args),
+                    resolveCtxFor(
+                        b,
+                        name.name,
+                        call.type_args,
+                        null,
+                        owned_type_param_bounds orelse &.{},
+                    ),
+                );
             defer b.allocator.free(res.candidate_set);
             var from_implicit_receiver = false;
             // A top-level pick made under a lambda's conservative receiver is
@@ -9613,19 +9741,42 @@ fn staticCallReturnTypeRef(
         call.span.file,
     );
     defer if (dispatch_receiver) |*ty| ty.deinit(b.allocator);
-    var inferred = try b.module.instantiatedCallReturnType(
+    var inferred = try b.module.instantiatedCallReturnTypeScoped(
         b.allocator,
         target,
         receiver,
         dispatch_receiver,
         shape_set.shapes,
         explicit,
+        ownerParamsInScope(b, target),
     );
     if (runtime.getenvSlice("KLIO_LAMRET_TRACE") != null and call.callee.* == .Path) {
         std.debug.print("[lamret-inst] callee={s} inferred={s}\n", .{
             call.callee.Path.segments[0].name,
             if (inferred) |t| t.name else "<null>",
         });
+    }
+    // Invoke convention: the pick is a fn-typed PROPERTY's accessor (zero
+    // value params) while the call supplies arguments — `createFrom("a")`
+    // reads the property and invokes the value, so the call's type is the
+    // fn type's declared RETURN (its last argument). The zero-params-with-
+    // args guard is the discriminator against fn-RETURNING functions.
+    if (inferred == null) {
+        if (b.module.funcById(target)) |tf| {
+            const has_this = tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this");
+            const value_params = tf.params.len - @intFromBool(has_this);
+            const rt = &tf.return_ty;
+            if (value_params == 0 and call.args.len != 0 and
+                std.mem.startsWith(u8, typeHead(rt.name), "Function") and rt.args.len != 0)
+            {
+                var hi = rt.args.len;
+                while (hi > 0 and rt.args[hi - 1].name.len != 0 and
+                    rt.args[hi - 1].name[0] == '#') hi -= 1;
+                if (hi != 0) {
+                    inferred = try rt.args[hi - 1].clone(b.allocator);
+                }
+            }
+        }
     }
     // Declaration order must not decide whether a caller's local types:
     // when the target is an un-annotated EXPRESSION body whose own decl
@@ -9847,10 +9998,8 @@ fn enrichLambdaArgShapes(
         od_depth -= 1;
         if (runtime.getenvSlice("KLIO_LAMRET_TRACE") != null) {
             std.debug.print("[lamret] target={s} arg#{d} pty={s} tail={s} p0={s} derived={s}\n", .{
-                tf.name, i, pty.name,
-                @tagName(std.meta.activeTag(tail.*)),
-                pty.args[0].name,
-                if (derived) |d| d.name else "<null>",
+                tf.name,                              i,                pty.name,
+                @tagName(std.meta.activeTag(tail.*)), pty.args[0].name, if (derived) |d| d.name else "<null>",
             });
         }
         var body_ty = derived orelse continue;
@@ -14046,6 +14195,20 @@ fn lowerResolvedMemberCall(
             }
         }
     }
+    // A declared type the module-wide lookups miss can still name a class
+    // the DECLARATION SITE can see: `Outer.Inner` written without its
+    // package resolves as a `.`-aligned FQN suffix (the type-position
+    // convention), and a bare nested-class name resolves through the
+    // enclosing classifier chain — inside `HexFormat`, `BytesHexFormat`
+    // names its nested sibling even though nested classes are deliberately
+    // invisible to the module-wide simple-name index.
+    if (owner_id == null) {
+        if (std.mem.indexOfScalar(u8, identity, '.') != null) {
+            owner_id = b.module.classIdByQualifiedSuffix(identity);
+        } else if (!b.isTypeParam(head)) {
+            owner_id = nestedClassIdAtLexicalSite(b, head);
+        }
+    }
     var static_owner = owner_id orelse {
         lmNote(.no_class_id);
         if (norecvCensusOn()) {
@@ -14060,7 +14223,14 @@ fn lowerResolvedMemberCall(
                 if (b.typeParamBound(head)) |tpb| {
                     std.debug.print("[no-class-head] {s} bound={s} complete={} head_only={}\n", .{ head, tpb.bound, tpb.complete, tpb.head_only });
                 } else {
-                    std.debug.print("[no-class-head] {s} no-bound-record tp={}\n", .{ head, b.isTypeParam(head) });
+                    std.debug.print("[no-class-head] {s} id={s} no-bound-record tp={} call={s} fn={s} owner={s}\n", .{
+                        head,
+                        identity,
+                        b.isTypeParam(head),
+                        name.name,
+                        build.currentRealFn() orelse "-",
+                        b.ownerClass() orelse "-",
+                    });
                 }
             }
         }
@@ -14159,8 +14329,12 @@ fn lowerResolvedMemberCall(
             .none;
     if (norecvCensusOn() and resolved.dispatch == .deferred and resolved.target != null) {
         if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null and promo_ext_why != .none) {
-            std.debug.print("[promo-ext] {s}.{s} nargs={d} why={s}\n", .{
-                head, name.name, args.len, @tagName(promo_ext_why),
+            var typed_args: usize = 0;
+            for (shapes) |sh| {
+                if (sh.ty != null or sh.literal_kind != null or sh.is_lambda) typed_args += 1;
+            }
+            std.debug.print("[promo-ext] {s}.{s} nargs={d} typed={d} why={s}\n", .{
+                head, name.name, args.len, typed_args, @tagName(promo_ext_why),
             });
         }
         if (promo_blocked_by_class) {
@@ -14175,6 +14349,45 @@ fn lowerResolvedMemberCall(
             .own_head => lm_promo[@intFromEnum(PromoBlock.ext_own_head)] += 1,
             .builtin_super => lm_promo[@intFromEnum(PromoBlock.ext_builtin_super)] += 1,
             .declared_super => lm_promo[@intFromEnum(PromoBlock.ext_declared_super)] += 1,
+        }
+    }
+    // Third-derivation promotion: the extension-shadow question answers by
+    // PROOF when every argument is authoritative — the member compatible,
+    // every reachable same-name extension refuted (`KLIO_MEMBER_PROMO=0`
+    // disables for A/B).
+    if (promo_ext_why != .none and !promo_blocked_by_class and
+        resolved.dispatch == .deferred and resolved.target != null and
+        !std.mem.eql(u8, runtime.getenvSlice("KLIO_MEMBER_PROMO") orelse "1", "0"))
+    {
+        const owned_bounds_promo = try b.typeParamBoundsSlice();
+        defer if (owned_bounds_promo) |bnd| b.allocator.free(bnd);
+        if (b.module.memberPromotionProven(
+            resolved.target.?,
+            head,
+            name.name,
+            recv_ty,
+            shapes,
+            owned_bounds_promo orelse &.{},
+        )) {
+            if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null) {
+                std.debug.print("[promo-proof] {s}.{s} nargs={d} PROMOTED\n", .{ head, name.name, args.len });
+            }
+            if (b.module.dispatchForTarget(static_owner, resolved.target.?)) |d| {
+                resolved.dispatch = d;
+            }
+        } else {
+            if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null) {
+                std.debug.print("[promo-proof] {s}.{s} nargs={d} HELD why={s}\n", .{ head, name.name, args.len, ir.Module.mpp_why });
+            }
+            // A member REFUTED by an authoritative argument is not the
+            // binding at all: fall to the extension path with the
+            // refutation recorded, so the ranker's strict-winner rule can
+            // commit the extension kotlinc binds
+            // (`set.removeAll(iterable)` -> MutableCollection.removeAll).
+            if (std.mem.eql(u8, ir.Module.mpp_why, "member-arg-refuted")) {
+                last_member_refuted = true;
+                return .none;
+            }
         }
     }
     if (promo_ext_why == .none and
@@ -14230,7 +14443,10 @@ fn lowerResolvedMemberCall(
         }
     }
     const has_spread = anySpread(args);
-    if (resolved.dispatch == .direct and has_spread) { declineNote(.direct_spread); return .deferred; }
+    if (resolved.dispatch == .direct and has_spread) {
+        declineNote(.direct_spread);
+        return .deferred;
+    }
     if (resolved.dispatch == .virtual) {
         const owner = &b.module.classes.items[static_owner.int()];
         // Numeric virtual slots operate on `Value.Instance`. Classifier ABI
@@ -14253,8 +14469,7 @@ fn lowerResolvedMemberCall(
         // representation could not serve.
         const vown_hold = (owner.is_value or owner.is_stub) and
             std.mem.eql(u8, runtime.getenvSlice("KLIO_VOWN") orelse "1", "0");
-        if (vown_hold or ast_type_args.len != 0)
-        {
+        if (vown_hold or ast_type_args.len != 0) {
             declineNote(if (owner.is_value)
                 .virtual_owner_value
             else if (owner.is_stub)
@@ -14302,12 +14517,18 @@ fn lowerResolvedMemberCall(
     // Lowering the receiver expression can append functions (a lambda in the
     // receiver lowers into the module's func table) and reallocate it,
     // invalidating `target`; re-fetch the pointer before reading it again.
-    target = b.module.funcById(func_id) orelse { declineNote(.target_unresolvable); return .deferred; };
+    target = b.module.funcById(func_id) orelse {
+        declineNote(.target_unresolvable);
+        return .deferred;
+    };
     if (resolved.dispatch == .virtual) {
         // A virtual target without even a receiver param cannot be bound
         // here on any path (the named/vararg mapping below already deferred
         // it); defer before the receiver-skipping scans slice params[1..].
-        if (target.params.len == 0) { declineNote(.virtual_no_receiver_param); return .deferred; }
+        if (target.params.len == 0) {
+            declineNote(.virtual_no_receiver_param);
+            return .deferred;
+        }
         const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
         var has_vararg = false;
         for (target.params[1..]) |param| if (param.is_vararg) {
@@ -14315,7 +14536,10 @@ fn lowerResolvedMemberCall(
             break;
         };
         const arg_params: ?[]u32 = if (anyNamedArg(ast_arg_names) or has_vararg) blk: {
-            const mapped = (try mapArgsToParams(b, target.params[1..], args, ast_arg_names)) orelse { declineNote(.arg_mapping_failed); return .deferred; };
+            const mapped = (try mapArgsToParams(b, target.params[1..], args, ast_arg_names)) orelse {
+                declineNote(.arg_mapping_failed);
+                return .deferred;
+            };
             defer b.allocator.free(mapped);
             for (mapped) |param| if (param == null) {
                 declineNote(.arg_mapping_failed);
@@ -14476,6 +14700,24 @@ fn lowerResolvedExtensionCall(
     if (target.is_inline) {
         const inline_decl = inline_state.inlineAstById(func_id.int()) orelse return null;
         inline_state.ensureInlineBody(inline_decl);
+        // The splice lowers its lambda arguments in its OWN arg loop, which
+        // bypasses `lowerArgRun`'s typing transfer — yet each lambda still
+        // lowers a closure body eagerly at emit. Compute the instantiated
+        // expected param types here so those bodies type their params; the
+        // spliced copy gets the same facts through the window channels.
+        const inline_lambda_param_types = try argLambdaParamTypesRecv(
+            b,
+            target,
+            selected_values,
+            selected_names,
+            ast_type_args,
+            1,
+            substitutionRecv(b, &recv_ty),
+        );
+        defer if (inline_lambda_param_types) |types|
+            deinitArgLambdaParamTypes(b.allocator, types);
+        b.pending_arg_lambda_param_types = inline_lambda_param_types;
+        defer b.pending_arg_lambda_param_types = null;
         const expected = b.peekExpected();
         const expected_ptr: ?*const ast.TypeRef = if (expected) |*ty| ty else null;
         return try tryInlineCallWithTypeArgs(

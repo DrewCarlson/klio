@@ -1376,6 +1376,28 @@ pub fn tryInlineCallWithTypeArgs(
         if (inline_state.inlineMemberOwner(f)) |ow| b.setSpliceRecvTy(ow);
     }
     defer b.setSpliceRecvTy(prev_splice_recv);
+    // The ACTUAL receiver's full static type enters the window when the
+    // call site derives one: iterating `this` inside the spliced body
+    // types its elements from the receiver's ARGUMENTS (`data.count { }`
+    // on `data: T` with `T : Iterable<String>` binds String elements),
+    // which the head-only channel above cannot carry. A bare
+    // type-parameter head resolves through the caller's full bound ref.
+    var recv_ref_owned: ?ir.TypeRef = null;
+    if (f.receiver_type != null) if (this_arg) |ra| blk: {
+        var got = expr_lower.argDeclTypeRefLazy(b, ra) orelse break :blk;
+        if (got.args.len == 0) {
+            var h = std.mem.trimEnd(u8, got.name, "?");
+            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            if (b.typeParamBoundRef(expr_lower.typeHead(h))) |bref| got = bref.*;
+        }
+        if (got.args.len == 0) break :blk;
+        recv_ref_owned = got.clone(b.allocator) catch break :blk;
+    };
+    const prev_recv_ref = b.setSpliceRecvTyRef(recv_ref_owned);
+    defer if (b.setSpliceRecvTyRef(prev_recv_ref)) |owned| {
+        var t = owned;
+        t.deinit(b.allocator);
+    };
     // Bare-call hygiene for the spliced body: its bare calls resolve
     // against the inline fn's own receiver (none for a receiver-less
     // inline fn), never the caller's class. The pre-splice hint is
@@ -1431,6 +1453,12 @@ pub fn tryInlineCallWithTypeArgs(
     var lambda_map = std.StringHashMap(*const ast.Expr).init(b.allocator);
     const arg_regs = try b.allocator.alloc(Reg, f.params.len);
     defer b.allocator.free(arg_regs);
+    // The caller's emitter computed instantiated expected param types per
+    // ARGUMENT slot (`lowerArgRun`'s transfer, which this loop bypasses):
+    // consume them here so each lambda's eagerly-lowered closure body
+    // types its params.
+    const arg_lambda_param_types = b.pending_arg_lambda_param_types;
+    b.pending_arg_lambda_param_types = null;
     var any_forwarded_lambda = false;
     var any_literal_lambda = false;
     for (f.params, 0..) |*p, i| {
@@ -1453,6 +1481,19 @@ pub fn tryInlineCallWithTypeArgs(
         // (which would swallow the first invocation slot as Null).
         if ((a.* == .Lambda or a.* == .AnonFun) and p.ty.function != null) {
             b.pending_lambda_arity = @intCast(p.ty.function.?.params.len);
+            if (arg_lambda_param_types) |slots| {
+                // `ordered[i]` points into the caller's arg slice; recover
+                // the ARGUMENT index the per-slot types are keyed by. The
+                // synthetic vararg expression lies outside the slice.
+                const base = @intFromPtr(args.ptr);
+                const off = @intFromPtr(a) -% base;
+                const idx = off / @sizeOf(Expr);
+                if (@intFromPtr(a) >= base and idx < args.len and
+                    idx < slots.len)
+                {
+                    b.pending_ref_lambda_param_types = slots[idx];
+                }
+            }
         }
         // A default-filled slot is CALLEE code: Kotlin evaluates a default
         // expression in the declaration's scope, where the extension
@@ -1468,6 +1509,7 @@ pub fn tryInlineCallWithTypeArgs(
             break :blk rr;
         } else coerced orelse try lowerExpr(b, a);
         b.pending_lambda_arity = -1;
+        b.pending_ref_lambda_param_types = null;
         arg_regs[i] = r;
         // A lambda argument is spliced inline (its body is expanded at the
         // call site), so it is never a closure value to box — skip boxing

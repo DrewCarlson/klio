@@ -471,6 +471,13 @@ pub const FuncBuilder = struct {
     /// preserves nullability, arguments, and classifier identity.
     recv_type_ref: ?TypeRef = null,
     splice_recv_ty: ?[]const u8 = null,
+    /// The active splice's ACTUAL receiver static type WITH its type
+    /// arguments, when the call site derived one (`data.count { }` on
+    /// `data: T`, `T : Iterable<String>`, records `Iterable<String>`).
+    /// `splice_recv_ty` keeps only the head, and iterating `this` inside
+    /// the spliced body needs the arguments to type the element. Owned
+    /// by the splice that set it.
+    splice_recv_ty_ref: ?TypeRef = null,
     splice_hint_active: bool = false,
     splice_hint_recv: ?[]const u8 = null,
     splice_hint_recv_ref: ?ast.TypeRef = null,
@@ -1396,6 +1403,17 @@ pub const FuncBuilder = struct {
     pub fn spliceRecvTy(self: *const FuncBuilder) ?[]const u8 {
         return self.splice_recv_ty;
     }
+    /// Swap the window's full receiver record, returning the previous one
+    /// so the splice restores (and frees its own) on exit.
+    pub fn setSpliceRecvTyRef(self: *FuncBuilder, ty: ?TypeRef) ?TypeRef {
+        const prev = self.splice_recv_ty_ref;
+        self.splice_recv_ty_ref = ty;
+        return prev;
+    }
+    pub fn spliceRecvTyRef(self: *const FuncBuilder) ?*const TypeRef {
+        if (self.splice_recv_ty_ref) |*t| return t;
+        return null;
+    }
     pub fn recvTy(self: *const FuncBuilder) ?[]const u8 {
         return self.recv_ty;
     }
@@ -1895,6 +1913,9 @@ pub const FuncBuilder = struct {
     pub fn localDeclTypeRef(self: *const FuncBuilder, name: []const u8) ?TypeRef {
         return self.local_decl_types.get(name);
     }
+    pub fn localInitExprIterator(self: *const FuncBuilder) std.StringHashMap(*const ast.Expr).Iterator {
+        return self.local_init_exprs.iterator();
+    }
     pub fn localInitExpr(self: *const FuncBuilder, name: []const u8) ?*const ast.Expr {
         return self.local_init_exprs.get(name);
     }
@@ -2141,12 +2162,25 @@ pub const FuncBuilder = struct {
         complete: bool,
         head_only: bool,
     ) Allocator.Error!void {
+        return self.addTypeParamBoundHeadArgs(name, bound, complete, head_only, &.{});
+    }
+    /// `bound_args`: the bound's concrete type-argument heads (see
+    /// `ModuleRegistry.TypeParamBound.args`) — registry-lifetime slices.
+    pub fn addTypeParamBoundHeadArgs(
+        self: *FuncBuilder,
+        name: []const u8,
+        bound: []const u8,
+        complete: bool,
+        head_only: bool,
+        bound_args: []const []const u8,
+    ) Allocator.Error!void {
         try self.type_param_names.put(name, {});
         try self.type_param_bounds.put(name, .{
             .param = name,
             .bound = bound,
             .complete = complete,
             .head_only = head_only,
+            .args = bound_args,
         });
     }
     pub fn addOwnedTypeParamBoundEvidence(
@@ -2217,6 +2251,29 @@ pub const FuncBuilder = struct {
     /// arguments, when the declaration wrote any.
     pub fn typeParamBoundRef(self: *const FuncBuilder, name: []const u8) ?*const TypeRef {
         return self.type_param_bound_refs.getPtr(name);
+    }
+
+    /// Owned snapshot of the full bound refs, for carrying into a pending
+    /// lambda/local-fn body.
+    pub fn typeParamBoundRefsSlice(
+        self: *const FuncBuilder,
+    ) Allocator.Error!?[]ir.PendingBoundRef {
+        if (self.type_param_bound_refs.count() == 0) return null;
+        var out = try self.allocator.alloc(ir.PendingBoundRef, self.type_param_bound_refs.count());
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*r| r.ref.deinit(self.allocator);
+            self.allocator.free(out);
+        }
+        var it = self.type_param_bound_refs.iterator();
+        while (it.next()) |entry| {
+            out[filled] = .{
+                .param = entry.key_ptr.*,
+                .ref = try entry.value_ptr.clone(self.allocator),
+            };
+            filled += 1;
+        }
+        return out;
     }
 
     pub fn typeParamBoundsSlice(
@@ -2331,6 +2388,9 @@ pub const FuncBuilder = struct {
     }
     pub fn spliceParamTy(self: *const FuncBuilder, name: []const u8) ?ast.TypeRef {
         return self.splice_param_tys.get(name);
+    }
+    pub fn spliceParamTyIterator(self: *const FuncBuilder) std.StringHashMap(ast.TypeRef).Iterator {
+        return self.splice_param_tys.iterator();
     }
     pub fn pushFinally(self: *FuncBuilder, block: ast.Block, body_entry: BlockId) Allocator.Error!void {
         try self.finally_stack.append(self.allocator, block);
