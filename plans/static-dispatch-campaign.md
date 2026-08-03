@@ -117,6 +117,18 @@ Flow 68. Start with `listOf`/`mutableListOf` and the `iterator()`
 chain, and the substitution of a caller's own type arguments into a
 generic member's return type (`getOrPut` returning `V`).
 
+Concrete first step, measured 2026-08-03: the `iterator` local family
+(516 examples-weighted, recv=SequenceScope 57/example + recv=Sequence
+direct) is `val iterator = iterator()` inside stdlib extension bodies.
+The resolved `Sequence.iterator()` returns `Iterator<T>` with the
+CALLER's `T` unbound, and the return-derivation refuses the generic
+head outright. Design: answer HEAD-WITH-STAR-ARGS (`Iterator<*>`, the
+421e8f8a star-erasure convention) — member binding on the head then
+binds `hasNext()`/`next()` virtual slots (T-independent signatures),
+while the `*` keeps element-dependent extension selection refused (the
+minOrNull IEEE hazard that killed plain head-only answers). Same shape
+should serve `getOrPut`/`toMutableList`/`listIterator` receivers.
+
 **The declared-type rule, which every later phase must keep:** a
 generic function's body is resolved once, against its type PARAMETERS,
 never against any one call site's instantiation. Eager evidence is
