@@ -952,6 +952,21 @@ fn lowerResolvedBinaryOperator(
     if (lhs.* == .Call or lhs.* == .Binary) {
         inferred_lhs_ty = try staticCallReturnTypeRef(b, lhs);
     }
+    if (runtime.getenvSlice("KLIO_HOP_TRACE") != null) {
+        const lazy = argDeclTypeRefLazy(b, lhs);
+        const bare: ?[]const u8 = if (lhs.* == .Path and lhs.Path.segments.len == 1)
+            staticBareReceiverType(b, lhs.Path.segments[0].name)
+        else
+            null;
+        std.debug.print("[binop-in] {s} lhs={s} inferred={s} lazy={s} bare={s} owner={s}\n", .{
+            method,
+            @tagName(std.meta.activeTag(lhs.*)),
+            if (inferred_lhs_ty) |t| t.name else "-",
+            if (lazy) |t| t.name else "-",
+            bare orelse "-",
+            b.ownerClass() orelse "-",
+        });
+    }
     const declared_lhs_ty = inferred_lhs_ty orelse
         argDeclTypeRefLazy(b, lhs) orelse return null;
     if (isPrimitiveTypeName(typeHead(declared_lhs_ty.name))) return null;
