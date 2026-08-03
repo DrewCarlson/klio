@@ -454,8 +454,11 @@ fn drainRegsPool(ev: *EvalTls, allocator: Allocator) void {
 /// call allocates a `Value` list for its params (and one for captures)
 /// that lives until the frame tears down — the alloc+memcpy pair was the
 /// single largest active-CPU leaf in the concurrent-collection profiles.
-/// Pooled under the refcount backend only: the tracing GC owns list
-/// memory and must never see it hand-recycled, and the arena never frees.
+/// Pooled under the refcount backend only. GC-mode pooling was measured
+/// NEGATIVE (13.1s -> 14.7s x2 on the concurrent benchmark): the slab run
+/// allocator is already a size-classed free-list, and the pool's
+/// top-of-stack fit check thrashes on mixed carrier sizes. The arena never
+/// frees; pooling is pointless there.
 const ARGS_POOL_MAX: usize = 64;
 
 pub fn acquireArgsCap(allocator: Allocator, cap: usize) Allocator.Error!std.ArrayList(Value) {

@@ -162,7 +162,7 @@ trustworthy self-time view — a hand-rolled tree parser double-counted):
   mutation) — INHERENT algorithmic work the JVM also does, just on
   faster arrays — not by carrier allocation. The pool stays (zero-risk
   infra; marginal alloc savings) but per-call carrier work is NOT the
-  next lever — UNDER THE REFCOUNT BACKEND. Post-measurement discovery:
+  next lever — UNDER ANY BACKEND (see below). Post-measurement discovery:
   the DEFAULT backend is the tracing GC (`KLIO_RECLAIM` unset), where
   the args pool never engages (it is reclaim-gated), so the neutral
   result says nothing about GC-mode carrier churn. Backend A/B on the
@@ -178,10 +178,17 @@ trustworthy self-time view — a hand-rolled tree parser double-counted):
   (non-root) pool can be collected and reused-after-free, and mixing
   origins frees GC memory with c_allocator. Producers = every list
   passed into evalWith/evalWithCaptures*/composableEval/FlatCallReq
-  .args plus the eval-internal frame rebuilds (resume/persist). Audit
-  them all, route them through acquireArgsCap, then flip
-  acquire/release to a shared argsAlloc() (c_allocator under GC,
-  mirroring regsAlloc) with external-bytes accounting like regs. What remains is the core loop itself: instruction
+  .args plus the eval-internal frame rebuilds (resume/persist). SUPERSEDED
+  BY MEASUREMENT: enabling the pool under GC (run-allocator buffers,
+  origin-uniform, no conversion needed) regressed 13.1s -> 14.7s x2 —
+  the slab run allocator is already a size-classed free-list and the
+  pool's top-of-stack fit check thrashes on mixed carrier sizes.
+  Reverted. The allocation family is now CLOSED with three measured
+  negatives (TL field cache -25%, refcount args pool neutral, GC args
+  pool -10%): the slab absorbs allocation cost; the remaining time is
+  the dispatch/execution loop itself. Also: same-day timings drift
+  upward with machine thermal state — only back-to-back A/B pairs are
+  valid; never compare against a number from hours earlier. What remains is the core loop itself: instruction
   dispatch + value move/retain cost per op. The credible next steps
   are (a) a superinstruction/fast-path pass for the hottest op
   sequences (GetField+CallVirtual pairs), (b) the bytecode VM. Both
