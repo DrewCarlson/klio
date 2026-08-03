@@ -13669,6 +13669,9 @@ fn lowerResolvedMemberCall(
         }
         if (promo_blocked_by_class) {
             lm_promo[@intFromEnum(PromoBlock.receiver_not_instance)] += 1;
+            if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null) {
+                std.debug.print("[promo-class] {s}.{s} nargs={d} why={s}\n", .{ head, name.name, args.len, @tagName(promo_ext_why) });
+            }
         } else switch (promo_ext_why) {
             .none => {},
             .index_stale => lm_promo[@intFromEnum(PromoBlock.ext_index_stale)] += 1,
@@ -13688,8 +13691,14 @@ fn lowerResolvedMemberCall(
         // all) still takes a DIRECT answer — a final method on a closed
         // host-backed class binds by fid; only a virtual answer stays
         // deferred for it.
+        // A VIRTUAL answer is accepted for stub/value receivers too: the
+        // runtime resolves the slot against an interpreted receiver's class
+        // and prefers the FQN-keyed intrinsic for host values (the VOWN
+        // model) — holding the deferral for blocked classes predates that
+        // and left every bodyless expect member (`Long.shl`,
+        // `MutableList.add`) and unsigned-array member dynamic.
         if (b.module.dispatchForTarget(static_owner, resolved.target.?)) |d| {
-            if (!promo_blocked_by_class or d == .direct) resolved.dispatch = d;
+            resolved.dispatch = d;
         }
     }
     if (resolved.dispatch == .deferred) {
