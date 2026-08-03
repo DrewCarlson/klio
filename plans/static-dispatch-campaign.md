@@ -1602,3 +1602,20 @@ families), member-arg-refuted 6 (correct declines). Battery green
 including both compose suites. The detail-probe UB lesson from this
 arc: never stash borrowed TypeRef name slices in threadlocals across
 the fn boundary — print inline or copy.
+
+## Addendum 15 — declined family decomposed to honesty (2026-08-04)
+
+After 162ce188 the stdlib declined 161 decomposes: PROMOTED 50 (the
+proof's commits), arg-unauthoritative 45 (it-tail), ext-unrefuted 22,
+member-arg-refuted 74 of which 66 are CORRECT — `set.removeAll(iterable)`
+sites where kotlinc binds the MutableCollection.removeAll(Iterable)
+EXTENSION, not the member. The next promotion class is therefore
+EXT-COMMIT-ON-MEMBER-REFUTATION beyond same-file: the sole-survivor
+rule exists (sole_same_file, the trimIndent-hazard note) and the
+now-sound proofs can widen it — commit the sole reachable extension
+when the member is REFUTED by an authoritative argument and exactly
+one extension survives arity+argument refutation. Re-derive from
+memberPromotionProven's enumeration (it already walks the reachable
+ext set); [promo-pair] rows name the sites. The 2 EnumEntriesList
+pairs are an identity-mangle compare miss in the same walk
+(param `$class$ 155 1:T` vs arg `T` — normalize both sides).
