@@ -10323,6 +10323,11 @@ fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []const 
             break :blk h.final() | 1;
         },
         .Result => 0x5261 | 1,
+        // A CLASS value (`Snapshot`'s companion-forwarding class receiver, a
+        // `::class`): member/extension resolution is a pure function of the
+        // referenced class cell — `currentSnapshot` on the snapshot companion
+        // class re-ran the full extension walk 90k times per benchmark.
+        .Class => |c| c.identity(),
         // Runtime shapes whose extension resolution is fully fixed by the
         // value's type tag, at exactly `typeFqn` granularity (prim kind for
         // arrays, kind + step-refinement for ranges). Identities are forced
@@ -11782,9 +11787,7 @@ fn narrowSameNameExtensionTwins(self: *VmHost, allocator: Allocator, receiver: *
 /// every single call (half of a recompose workload's runtime), and a walk
 /// MISS memoizes as METHOD_MISS so non-extension calls stop re-walking.
 fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
-    if (std.c.getenv("KLIO_WALK_TRACE") != null) {
-        std.debug.print("[extfb-walk] {s} on {s} strict={} static={s} declared={s}\n", .{ name, receiver.typeFqn(), strict_ext, static_recv orelse "-", declared_recv orelse "-" });
-    }
+
     runtime.prof.opRoute(3);
     var cache_key: ?root_mod.ProgramImage.InstanceMethodKey =
         instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv);
@@ -11817,6 +11820,9 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
     }
     var saw_member_ext = false;
+    if (std.c.getenv("KLIO_WALK_TRACE") != null) {
+        std.debug.print("[extfb-walk] {s} on {s} strict={} static={s} keyed={}\n", .{ name, receiver.typeFqn(), strict_ext, static_recv orelse "-", cache_key != null });
+    }
     const r = try extensionFnFallbackWalk(self, allocator, receiver, name, args, strict_ext, static_recv, declared_recv, cache_key, chain_key, &saw_member_ext);
     if (r == null) {
         if (!saw_member_ext) {

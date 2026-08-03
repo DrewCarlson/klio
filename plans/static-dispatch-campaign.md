@@ -83,6 +83,47 @@ call in a package-less file is rejected pre-run), threaded litmus 41/41
 (`python3 scripts/litmus-sweep.py` — first fully-green run of the
 suite), ir unit tests, `zig build test`.
 
+## Compose 100% baseline — the throughput campaign (2026-08-03)
+
+The user's standing requirement: stdlib AND compose test baselines are
+100%, no "known throughput-bound" write-offs. stdlib commontest is
+117/117. Compose's 7 failing tests are all concurrent snapshot-write
+stress tests over budget. Measured state (concurrentGlobalModification_add
+as the pinned benchmark; 1-worker == 3-worker time, so it is pure
+single-thread interpreter throughput, zero retry/contention waste):
+
+- 20.5s at start -> 13.7s now. Landed: field-WRITE memo, member-body
+  ext splice (killed 10,000 per-call receiver DRAINS from
+  `indexOfFirst` inside `AbstractList.indexOf`), anonKey stack buffers,
+  `.Class`-receiver keys for the ext-walk memo (90k redundant walks ->
+  0; time-neutral, the walks were cheap).
+- The harness caps runTest's default timeout at 10s
+  (kotlinx_coroutines_test_default_timeout in compose-test.sh) for hang
+  isolation; upstream's real default is 60s. `_add` at 13.7s passes
+  upstream semantics today. The REAL wall is the tests with
+  source-written 30s budgets: concurrentGlobalModifications_addAll
+  (~31s), concurrentMixingWriteApply_addAll_clear (~30s),
+  concurrentMixingWriteApply_addAll_removeRange (~78s -> needs 2.6x),
+  and the map-suite mirrors.
+- Remaining profile (execution phase, sample at 45s): core loop
+  execInst/runFlatLoop/evalWithCapturesChained ~1/3; productive
+  interpreted bodies (equals 82k calls, invokeMethodFuncId); getField
+  328 + instanceField 176; materializeInstance 166 via primaryCtorPath
+  (record/vector churn); ensureTotalCapacityPrecise 211 + slab 380
+  (alloc churn). No single spot fix left; next candidates in order:
+  (1) profile removeRange specifically (78s smells like interpreted
+  O(n^2) element shifting), (2) ctor/materialize churn on the
+  record-per-write path, (3) the general core-loop cost (the bytecode
+  VM this campaign's end state names).
+- Diagnostics added: KLIO_DRAIN_TRACE ([drain]), KLIO_WALK_TRACE
+  ([extfb-walk] at the real walk, [ir-walk]).
+- Tools: benchmark via `kotlinx_coroutines_test_default_timeout=300s
+  KLIO_TEST_WALL_CAP=400 scripts/compose-test.sh
+  SnapshotStateListTests.concurrentGlobalModification_add`; profile via
+  macOS `sample` ~45s into the run (earlier samples catch typecheck).
+  Stale-pack trap: drift caches under .klio-local/cache bake with the
+  CURRENT binary — clear after harness rebuilds when validating fixes.
+
 ## Remaining work
 
 ### 1. The typeck generic-argument project — the mass
