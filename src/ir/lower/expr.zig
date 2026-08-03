@@ -8272,6 +8272,27 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         }
         return null;
     }
+    // `this@label`: the receiver bound under that label — the builder's own
+    // receiver when its label matches (an ext body's label is its fn name),
+    // else the tower entry carrying it. `this@runningReduce.iterator()`
+    // inside the `sequence { }` body types as the OUTER Sequence receiver.
+    if (arg.* == .This) {
+        if (arg.This.qualifier) |q| {
+            if (b.own_this_label) |own| {
+                if (std.mem.eql(u8, own, q.name)) {
+                    if (b.recvTypeRef()) |receiver| return receiver;
+                    if (b.recvTy()) |head| return .{ .name = head, .nullable = false, .args = &.{} };
+                }
+            }
+            for (b.implicit_receiver_tower.items) |entry| {
+                const label = entry.label orelse continue;
+                if (std.mem.eql(u8, label, q.name)) {
+                    return .{ .name = entry.head, .nullable = false, .args = &.{} };
+                }
+            }
+        }
+        return null;
+    }
     switch (arg.*) {
         .IntLit => |lit| return .{
             .name = switch (lit.kind) {
@@ -13771,6 +13792,42 @@ fn lowerResolvedMemberCall(
                 if (b.localInitExpr(rn)) |ini| {
                     lm_norecv_init[1] += 1;
                     lm_norecv_call[@intFromEnum(classifyCallReturn(b, ini))] += 1;
+                    // `KLIO_NORECV_WHY=<name>`: at a counted site whose init
+                    // IS recorded, re-run the lazy deriver and print its
+                    // terminal, so the failing channel is named instead of
+                    // guessed (the self-shadow fix measured census-neutral;
+                    // this finds where these sites actually die).
+                    if (runtime.getenvSlice("KLIO_NORECV_WHY")) |want| {
+                        if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, rn)) {
+                            const redo = argDeclTypeRefLazy(b, receiver);
+                            const prev_self = init_self_name;
+                            if (b.localInitNameFree(rn)) init_self_name = rn;
+                            const full = staticCallReturnTypeRef(b, ini) catch null;
+                            init_self_name = prev_self;
+                            const why_head = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse "-";
+                            std.debug.print("[norecv-why] {s} init_tag={s} free={} redo={s} full={s} in_fn={s} head={s} head_cid={} it_cid={} anon={} nfuncs={d}\n", .{
+                                rn,
+                                @tagName(std.meta.activeTag(ini.*)),
+                                b.localInitNameFree(rn),
+                                if (redo) |r| r.name else "<null>",
+                                if (full) |r| r.name else "<null>",
+                                build.currentRealFn() orelse "-",
+                                why_head,
+                                b.module.uniqueClassIdBySimpleName(typeHead(std.mem.trimEnd(u8, why_head, "?"))) != null,
+                                b.module.uniqueClassIdBySimpleName("Iterator") != null,
+                                b.module.anon_side,
+                                b.module.funcs.items.len,
+                            });
+                            if (redo) |r| {
+                                var owned = r;
+                                owned.deinit(b.allocator);
+                            }
+                            if (full) |r| {
+                                var owned = r;
+                                owned.deinit(b.allocator);
+                            }
+                        }
+                    }
                 } else lm_norecv_init[0] += 1;
             }
         }

@@ -260,11 +260,25 @@ own prior binding is recognized as self (the standing-constraint
 recipe), and the init-chain read now sets `init_self_name` under
 `localInitNameFree`. Shadow refusals 1,396 -> 0. THE CENSUS FAMILY IS
 UNCHANGED at 516 — those sites fail through yet another channel:
-next probe is to trace WHICH deriver the counted sites use
-(the [no-recv-name] classification fires where declared_ty reached
-lowerResolvedMemberCall as null — add a KLIO_NORECV_NAMES detail print
-of the failed derivation's terminal for receiver Path locals whose
-localInitExpr IS recorded). The `iterator` local family
+probe LANDED as `KLIO_NORECV_WHY=<name>` (prints init tag,
+name-free state, lazy + full re-derivation terminals, enclosing fn,
+receiver head, head/Iterator cid presence, module identity). It
+identified TWO sub-families and one fix landed:
+- LANDED: `this@label.iterator()` inside receiver lambdas
+  (`runningReduce`'s `sequence { this@runningReduce.iterator() }`) —
+  argDeclTypeRefLazy's This arm only served the unqualified case; a
+  labeled `this` now answers from the builder's own label (an ext
+  body's label is its fn name) or the tower entry carrying the label.
+  End-to-end verified on the user shape ([2, 4] from a
+  `this@skipOdd.iterator()` sequence body).
+- REMAINING (the bulk of the 516): MEMBER-callee initializers whose
+  receiver is an interface PROPERTY — `Map.toList`'s
+  `val iterator = entries.iterator()`: the derivation must type bare
+  `entries` from the interface's declared property
+  (`class_prop_type_heads` for interface Map — verify the registry
+  records interface property heads at all), then `iterator()` on the
+  resulting `Set<...>` head via the star channel. Pick up in
+  staticCallReturnTypeRef's Member arm; `full=<null>` there today. The `iterator` local family
 (516 examples-weighted, recv=SequenceScope 57/example + recv=Sequence
 direct) is `val iterator = iterator()` inside stdlib extension bodies.
 The resolved `Sequence.iterator()` returns `Iterator<T>` with the
