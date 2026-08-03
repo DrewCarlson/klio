@@ -3764,6 +3764,12 @@ pub const Module = struct {
         // applicable, and the wrong overload can outrank the bound's own.
         if (scoped_receiver.args.len == 0) {
             const rhead = staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?"));
+            if (std.c.getenv("KLIO_HOP_TRACE") != null) {
+                std.debug.print("[hop] {s} recv={s} nbounds={d}\n", .{ name, rhead, ctx.actual_type_param_bounds.len });
+                for (ctx.actual_type_param_bounds) |b0| {
+                    std.debug.print("[hop]   {s} : {s} args={d}\n", .{ b0.param, b0.bound, b0.args.len });
+                }
+            }
             for (ctx.actual_type_param_bounds) |b| {
                 if (!std.mem.eql(u8, b.param, rhead)) continue;
                 if (b.args.len == 0) break;
@@ -3792,7 +3798,7 @@ pub const Module = struct {
             const kind = if (ds) |decl| decl.kind else f.kind;
             const is_member_extension = kind == .member_extension;
             const rex_trace = std.c.getenv("KLIO_REX_TRACE") != null;
-            if (rex_trace) std.debug.print("[rex] {s} fid={d} kind={s} enter\n", .{ name, fid.int(), @tagName(kind) });
+            if (rex_trace) std.debug.print("[rex] {s} fid={d} kind={s} enter recv={s} rargs={d}\n", .{ name, fid.int(), @tagName(kind), scoped_receiver.name, scoped_receiver.args.len });
             if ((kind != .top_level_extension and !is_member_extension) or
                 f.params.len == 0 or
                 !std.mem.eql(u8, f.params[0].name, "this")) continue;
