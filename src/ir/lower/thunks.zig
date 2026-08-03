@@ -452,6 +452,69 @@ pub fn lowerAccessorBlock(
     return pushFunc(module, func);
 }
 
+/// `lowerAccessorBlock`/`lowerAccessorExpr` with the SETTER's value
+/// parameter typed: `set(value) { if (value <= 0) ... }` resolves `value`
+/// against the property's declared type, so its member calls and templates
+/// bind statically.
+pub fn lowerSetterBlockTyped(
+    module: *Module,
+    owner_class: []const u8,
+    own_members: *const StringSet,
+    params: []const []const u8,
+    value_name: []const u8,
+    value_ty_head: ?[]const u8,
+    value_nullable: bool,
+    block: *const ast.Block,
+    name: []const u8,
+) Allocator.Error!FuncId {
+    const allocator = moduleAllocator(module);
+    var b = try FuncBuilder.init(allocator, module);
+    defer b.deinit();
+    b.setOwnerClass(owner_class);
+    b.setRecvTy(owner_class);
+    b.setOwnMembers(try cloneOwnMembers(allocator, own_members));
+    try setInitBlockBoxedVars(&b, allocator, params, block);
+    try bindParams(&b, params);
+    if (value_ty_head) |h| {
+        try b.setLocalDeclType(value_name, h);
+        if (value_nullable) try b.setLocalDeclNullable(value_name);
+    }
+    const v = try lowerBlock(&b, block);
+    b.terminate(.{ .Return = v });
+    var func = try b.finish(name, name, build.typeUnit());
+    func.has_receiver_param = leadsWithThis(params);
+    return pushFunc(module, func);
+}
+
+pub fn lowerSetterExprTyped(
+    module: *Module,
+    owner_class: []const u8,
+    own_members: *const StringSet,
+    params: []const []const u8,
+    value_name: []const u8,
+    value_ty_head: ?[]const u8,
+    value_nullable: bool,
+    expr: *const Expr,
+    name: []const u8,
+) Allocator.Error!FuncId {
+    const allocator = moduleAllocator(module);
+    var b = try FuncBuilder.init(allocator, module);
+    defer b.deinit();
+    b.setOwnerClass(owner_class);
+    b.setRecvTy(owner_class);
+    b.setOwnMembers(try cloneOwnMembers(allocator, own_members));
+    try bindParams(&b, params);
+    if (value_ty_head) |h| {
+        try b.setLocalDeclType(value_name, h);
+        if (value_nullable) try b.setLocalDeclNullable(value_name);
+    }
+    const v = try lowerExpr(&b, expr);
+    b.terminate(.{ .Return = v });
+    var func = try b.finish(name, name, build.typeUnit());
+    func.has_receiver_param = leadsWithThis(params);
+    return pushFunc(module, func);
+}
+
 pub fn lowerUnaryExprAsThunk(
     module: *Module,
     param_name: []const u8,

@@ -1586,6 +1586,15 @@ test "toplevel_prop_bare_receiver" {
     );
 }
 
+test "setter_value_param_typed" {
+    try check("setter_value_param_typed",
+        \\6
+        \\HI
+        \\bad 0
+        \\
+    );
+}
+
 test "ext_prop_type_bare_read" {
     try check("ext_prop_type_bare_read",
         \\n=3 last=2 total=12
