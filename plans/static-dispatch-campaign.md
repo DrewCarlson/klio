@@ -1711,3 +1711,55 @@ Where work stops, in priority order:
    concreteBoundArgs, two func_type_params registrations, THREE static
    compat provers) — the P2-completion unification of the static-proof
    stack is the single highest-leverage structural change remaining.
+
+## Addendum 21 — the declaration-scope resolution slice (2026-08-04)
+
+no_class_id: stdlib 33 -> 17, examples 466 -> 299 (c4b417d3). Two
+mechanisms, one exposed defect:
+
+- **Scoped class resolution at the member-bind site**: a dotted
+  `Outer.Inner` the FQN map misses resolves via
+  `classIdByQualifiedSuffix` (the type-position convention, ir.zig
+  2688); a bare simple head resolves via `nestedClassIdAtLexicalSite`
+  (owner chain + FQN-derived nesting — tree-free, works at bake-time
+  lowering).
+- **CORRECTION to the Addendum-19 "MEASURED ZERO, do not retry"
+  record**: the prior probe failed for two reasons that are NOT
+  "no owner class": (a) `classIdNestedIn` needs the `class_children`
+  tree, which is built at VM setup, AFTER bake-time lowering — every
+  tree-walk returned null; `nestedClassIdAtLexicalSite`'s FQN-derivation
+  arm is the tree-free path that works. (b) The `Builder` sites' record
+  was TRUNCATED (below), so even correct scoped resolution bound the
+  wrong class. The "file-scope class-alias resolution" design it called
+  for was not needed for this family.
+- **The truncated-record defect (real bug, sweep-caught)**:
+  `classPropHead` (+ the object arm) stored `ty.name.name` — the LAST
+  segment of a qualified type. `bytes: BytesHexFormat.Builder` recorded
+  `Builder`; the new scoped resolution then bound `HexFormat.Builder`
+  and its `build()` read `upperCase` on a `NumberHexFormat.Builder`
+  instance (NumberHexFormatTest, 5 tests). Property heads now keep
+  `qualified_path`. Pin: `nested_sibling_prop_head` (litmus 43),
+  verified failing against the pre-fix collector.
+- Residual 17, attributed (probe now prints identity/call/fn/owner):
+  R 4 (CoroutineContext.plus / CombinedContext.toString — callee-tp
+  leak, waits on call-site substitution), T 9 (AbstractCollection.
+  toString + CollectionTest lambdas — enclosing type params invisible
+  to lambda builders, `tp=false`), DeepRecursiveFunctionBlock 2 +
+  Function0 2 (function-type heads, no class by design).
+
+Unit-suite debt found and paid (70ead202): b2a064be's battery claim
+included "units green" without a run — it broke `member resolution
+separates class and caller function bounds`, which pinned the OLD
+checker-style refusal for a caller `T : CharSequence` against a class
+`T : Number` slot. The pair proves nothing and refutes nothing (one
+type can satisfy both bounds); the contract is a DEFERRED single-
+candidate commit, and the test now asserts exactly that (a static bind
+here would mean the bound records conflated). The bounds-metadata test
+also leaked the new `TypeParamBound.args` — freed. LESSON for every
+future battery: `zig build test` is part of the gate, not optional.
+
+Census after slice: total 9,593 — no_receiver 1,172 / nullable 120 /
+no_class 17 / declined 87 / bound_static 1,533 / bound_virtual 6,664
+(85.44% bound). Examples: 105,421 — declined 1,075 / no_class 299
+(88.02% bound). Battery: sweep 117/0, litmus 43/43, drift 266/266,
+units green, compose 61/65 + 56/59 (known throughput set).
