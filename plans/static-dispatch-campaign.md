@@ -2271,3 +2271,31 @@ genuinely-dynamic locals, fn-typed-param returns) plus what rides
 declined ties and the unsigned route. The remaining structural leg is
 ONE: the bytecode VM — the compose set (double-measured VM-bound)
 and the dynamic floor.
+
+## Addendum 48 (2026-08-04): annotated lambda/local-fn params bind their bodies
+
+Source-annotated lambda parameter types (and local `fun` params, which
+share the body lowering) now register as static types for member
+resolution; local-fn varargs register the materialized array head via
+`pending_lambda_vararg_params`. The compose pass stamps its appended
+`($composer: Composer, $changed: Int)` pair, which this channel binds.
+
+- Stdlib census: no_receiver 611 -> 599. (The census set's
+  CollectionTest.minWithOrNull/maxWithOrNull failures are set
+  artifacts: the pinned list omits comparisons/OrderingTest.kt, which
+  defines the imported STRING_CASE_INSENSITIVE_ORDER. Pre-existing.)
+- Compose-side census: unbound 10,085 -> 7,090; untyped-local family
+  6,161 -> 3,432; every $composer/$changed/$dirty site bound; bound
+  share 53.5% -> 66.2%.
+- Three latent defects exposed by the new static binds, fixed at the
+  mechanism: KClass-keyed extension properties now resolve for class
+  values (with the companion reroute gated to companion-keyed
+  registrations) and a klio actual ships for qualifiedOrSimpleName;
+  digitOf's actual gained the fullwidth rows its host intrinsic had;
+  local-fn vararg params register the array head (Duration tests read
+  the annotation's element head otherwise).
+
+Remaining top untyped-local names on the compose side after this:
+writer (581), slots (485), reader (255), it (239), groups (147),
+snapshot (139) — SlotWriter/SlotReader/array locals typed from
+initializer calls, the next binding family.
