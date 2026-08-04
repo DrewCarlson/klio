@@ -6444,6 +6444,11 @@ noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: *Fra
         defer allocator.free(tmp);
         try names_list.appendSlice(allocator, tmp);
     }
+    if (runtime.getenvSlice("KLIO_TRACE_PATH") != null) {
+        for (arg_values_list.items, 0..) |*av, ai| {
+            std.debug.print("[cv-arg] in={s} #{d} kind={s}\n", .{ frame.func.name, ai, @tagName(std.meta.activeTag(av.*)) });
+        }
+    }
     // Receiver-typed lambda bare invocation: prepend the calling
     // frame's `this` when the closure expects a leading `this`.
     const caller_this = callerThisValue(frame);

@@ -7716,6 +7716,9 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         pmg.get().pos = p + 1;
         pmg.deinit();
         iteratorSetLast(it, @intCast(p));
+        if (std.c.getenv("KLIO_ITER_TRACE") != null) {
+            std.debug.print("[iter-next] kind={s}\n", .{@tagName(std.meta.activeTag(v))});
+        }
         return .{ .ok = v };
     }
     // `ListIterator` navigation over the same `items`/`pos` cursor.
