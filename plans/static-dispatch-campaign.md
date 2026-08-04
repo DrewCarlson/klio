@@ -2072,3 +2072,18 @@ The windowed collateral under KLIO_AGREED_RET=1 is a DIFFERENT chain
 30) — the agreed-return channel stays parked on that one remaining
 collateral; its -72 census sites now wait on a single fix instead of
 two.
+
+## Addendum 35 — the sixth wrong answer; agreed-return LIVE (2026-08-04)
+
+2e379ae8. The windowed collateral decomposed into wrong answer #6:
+the extension ARITY gate's positional default-check dropped the
+transform overload, and the surviving sibling bound the trailing
+lambda into `partialWindows: Boolean` — the "iterator lacks hasNext"
+was an invokeMethod-swallowed "non-bool in branch" (KLIO_SELDBG
+revealed it; the seq drains now report the iterator kind under
+KLIO_SEQ_DIAG). The gate now honors the trailing-callable rule.
+
+With #5 (JIT stale-tag) and #6 both fixed, the agreed-return channel
+is LIVE by default: stdlib no_receiver 949 -> 876 (9.27%, bound
+88.8%), the full battery green. Six kotlinc-parity wrong answers
+found and fixed this session, each with a pin.
