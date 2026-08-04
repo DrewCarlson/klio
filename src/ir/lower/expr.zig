@@ -1163,7 +1163,20 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
         b.terminate(.{ .Branch = .{ .cond = l, .t = then_b, .f = else_b } });
         if (op == .And) {
             b.switchTo(then_b);
+            // The right operand sees every proof the left one establishes:
+            // `it is UByte && it.toByte() ...` smart-casts `it` for the
+            // member call, exactly as an `if` guard narrows its then-arm.
+            var narrowed: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer narrowed.deinit(b.allocator);
+            try narrowIsCheckAll(b, lhs, &narrowed);
+            var not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer not_null.deinit(b.allocator);
+            try narrowNullCheckAll(b, lhs, true, &not_null);
             const rv = try lowerExpr(b, rhs);
+            var nn = not_null.items.len;
+            while (nn > 0) : (nn -= 1) b.restoreLocal(not_null.items[nn - 1]);
+            var ni = narrowed.items.len;
+            while (ni > 0) : (ni -= 1) b.restoreLocal(narrowed.items[ni - 1]);
             try b.push(.{ .Move = .{ .dst = dst, .src = rv } });
             b.terminate(.{ .Goto = join });
             b.switchTo(else_b);
@@ -1176,7 +1189,14 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
             try b.push(.{ .Move = .{ .dst = dst, .src = true_r } });
             b.terminate(.{ .Goto = join });
             b.switchTo(else_b);
+            // `x == null || x.m()` runs its right operand only when the
+            // left is false, which proves the null-checks' falsy side.
+            var else_not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer else_not_null.deinit(b.allocator);
+            try narrowNullCheckAll(b, lhs, false, &else_not_null);
             const rv = try lowerExpr(b, rhs);
+            var en = else_not_null.items.len;
+            while (en > 0) : (en -= 1) b.restoreLocal(else_not_null.items[en - 1]);
             try b.push(.{ .Move = .{ .dst = dst, .src = rv } });
             b.terminate(.{ .Goto = join });
         }

@@ -1602,6 +1602,16 @@ test "bound_args_lambda_replay" {
     );
 }
 
+test "and_chain_smartcast" {
+    try check("and_chain_smartcast",
+        \\true
+        \\false
+        \\true
+        \\false
+        \\
+    );
+}
+
 test "nested_it_shadow_local_ext" {
     try check("nested_it_shadow_local_ext",
         \\[, abc, sort]
