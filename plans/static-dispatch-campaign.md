@@ -2212,3 +2212,22 @@ PRECISELY two builds, both specified by the addenda record:
 2. The bytecode VM — the compose throughput set (double-measured
    VM-bound at 13.5s vs the 10s budget, invariant under +2.4%
    bound) and the dynamic-dispatch floor.
+
+## Addendum 44 — substitution engine, step one (2026-08-04)
+
+The engine build begins as landable slices: the receiver-instantiation
+twins now share instantiatedTypeFromReceiverImpl(require_complete).
+Census-neutral, battery green. Next steps in order:
+1. Extract instantiatedCallReturnTypeScoped's binding solve
+   (receiver projection + named/positional/vararg arg binds +
+   explicit type args + star erasure) into pub solveCallBindings +
+   substituteBound — the engine's core, consumed first by the
+   existing return-type wrapper (neutrality checkpoint).
+2. Migrate instantiatedLambdaValueParams onto solveCallBindings
+   (adds ARG-evidence to lambda-param substitution — expected to
+   convert part of the it-tail).
+3. Feed the splice window's param records through it (destination/
+   element chains get full instantiation instead of the per-shape
+   approximations).
+4. Then the locals families re-census; what remains after 1-3 is
+   the genuinely-dynamic floor that rides the VM leg.
