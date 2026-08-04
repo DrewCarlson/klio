@@ -1907,3 +1907,23 @@ throughput set is core-loop-bound as priced — the bytecode VM leg,
 not a resolution or staleness artifact. The stale-pack hypothesis was
 tested and refuted; all future compose measurements now run against
 fresh packs.
+
+## Addendum 28 — when-narrowing lands; takeLastWhile capture family attributed (2026-08-04)
+
+9cc1a1ed: subjectless `when` branches narrow by their WHOLE condition
+(&&-chains + truthy null-checks, if-arm parity) — the
+contentDeepEqualsImpl family converted, no_receiver 975 -> 949, under
+ten percent for the first time.
+
+takeLastWhile (24 rows) attributed to its terminal shape: `val
+iterator = listIterator(size)` types fine at its own sites (bareret
+returns ListIterator args=1 in BOTH user and census contexts), but the
+`ArrayList<T>(n).apply { while (iterator.hasNext()) ... }` receiver
+lambda reads it as a CAPTURE (`which=captured`, lam_recv=ArrayList)
+where only the pre-derivation snapshot channel (2e3bdf3b) can type it
+— and that channel misses here even though the init expr is recorded
+and derivable in the outer builder. Next probe (Debug harness):
+whether the apply argument's closure lowering runs lowerLambda's
+pre-derivation loop at all in this doubly-spliced context, and
+whether the snapshot's contains-guard skips `iterator` on a stale
+same-named record.
