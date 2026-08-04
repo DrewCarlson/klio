@@ -2031,3 +2031,22 @@ un-parks -72 census sites.
 
 Probe kit landed (env-gated): KLIO_ITER_TRACE, cv-arg rows under
 KLIO_TRACE_PATH, operand-level KLIO_DUMP_FN.
+
+## Addendum 33 — the Char chain's last hop localized (2026-08-04)
+
+fid 5444 (kotlin.io.println expect) has ZERO BLOCKS — the invoke
+falls through to the io intrinsic, whose render path (display ->
+writeTo .Char -> writeChar) is verified correct. The corruption is
+NOT in println at all: [frame-bind] (new, 69f05fcb's kit + this
+commit) shows the closure FRAME binds param#1 as Int while [cv-arg]
+shows the dispatch passed Char. The defect is INSIDE the
+closure-invoke plumbing between execArmCallValue's copied arg list
+and Frame creation — and the lambda frame is created TWICE per
+iteration (once expected). Prime suspects for the next context:
+an arg-register RE-READ on a secondary invoke path (off-by-one on
+the args base would produce exactly (Int, Int) from r10/r11), or a
+double-dispatch where the second, wrong-args invocation wins.
+Repro: tp15.kt + KLIO_TRACE_PATH=1, grep cv-arg/frame-bind around
+the 97 line. This is the LAST unknown in the Addendum-31 wrong
+answer; everything upstream and downstream of this plumbing is
+verified correct.
