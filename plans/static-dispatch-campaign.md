@@ -1946,3 +1946,25 @@ member_overload_receiver_instantiation.
 
 declined 99 (two more false proofs un-committed). Census otherwise
 stable at 949 / 78 / 4 (88.2% bound); battery green everywhere.
+
+## Addendum 30 — the trailing-lambda mapping; agreed-return parked (2026-08-04)
+
+c54d5e7e. FOURTH latent prover bug of the session: both static provers
+judged a trailing lambda against a defaulted MIDDLE parameter
+(`windowed(2, 3) { transform }` refuted by `partialWindows: Boolean`).
+Both now map a trailing callable to the LAST parameter, the mapping
+every other channel already used. 31 bound_static give-backs were
+wrong-sibling commits of transform pairs.
+
+The agreed-return channel measured -72 sites but armed two behavioral
+collaterals through DOWNSTREAM channels (the windowed transform
+pipeline at runtime selection; a HexExtensions property-init lambda
+binding Char as Int) — parked behind KLIO_AGREED_RET=1 with the
+member-name guard in place, per the measured-negative precedent. The
+-72 return when the downstream channels are fixed; the A/B gate makes
+that re-probe a one-env-var experiment.
+
+Standing: 949 / 78 / 4 / 99 on 9,521 (88.1% bound), battery green
+everywhere. The disk-exhaustion interruption (zig cache + census
+logs) is resolved; scripts/prune-zig-cache.sh remains the periodic
+answer.
