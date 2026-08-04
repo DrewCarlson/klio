@@ -8496,6 +8496,23 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (arg.* == .As and !arg.As.safe) {
         return .{ .name = loweredTypeName(b, &arg.As.ty), .nullable = arg.As.ty.nullable, .args = &.{} };
     }
+    // A member PROPERTY READ as a receiver (`this.indices.reversed()`):
+    // the receiver's head plus the property's declared head answers —
+    // class properties through their recorded heads, extension
+    // properties through the getter contract and its supertype walk.
+    if (arg.* == .Member and !arg.Member.safe) {
+        const m = arg.Member;
+        if (argDeclTypeRefLazy(b, m.receiver)) |rt| {
+            var h = std.mem.trimEnd(u8, rt.name, "?");
+            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            const head = typeHead(h);
+            if (propTypeHeadOn(b, head, m.name.name) orelse
+                extPropReturnHead(b, head, m.name.name)) |ph|
+            {
+                return .{ .name = ph, .nullable = false, .args = &.{} };
+            }
+        }
+    }
     if (arg.* == .Call and arg.Call.callee.* == .Path and arg.Call.callee.Path.segments.len == 1) {
         const seg = arg.Call.callee.Path.segments[0];
         if (b.localCallReturn(seg.name)) |ret| {
@@ -14204,6 +14221,15 @@ fn lowerResolvedMemberCall(
         lm_norecv[@intFromEnum(std.meta.activeTag(receiver.*))] += 1;
         lm_norecv_eager[if (b.module.eagerTypeOf(receiver.span()) != null) 0 else 1] += 1;
         if (receiver.* == .Call) lm_norecv_call[@intFromEnum(classifyCallReturn(b, receiver))] += 1;
+        if (receiver.* == .Member) {
+            if (runtime.getenvSlice("KLIO_NORECV_NAMES") != null) {
+                std.debug.print("[no-recv-member] .{s} call={s} fn={s}\n", .{
+                    receiver.Member.name.name,
+                    name.name,
+                    build.currentRealFn() orelse "-",
+                });
+            }
+        }
         if (receiver.* == .Path and receiver.Path.segments.len == 1) {
             const rn = receiver.Path.segments[0].name;
             const which: NoRecvPath = if (b.resolve(rn) != null)
