@@ -2299,3 +2299,24 @@ Remaining top untyped-local names on the compose side after this:
 writer (581), slots (485), reader (255), it (239), groups (147),
 snapshot (139) — SlotWriter/SlotReader/array locals typed from
 initializer calls, the next binding family.
+
+## Addendum 49 (2026-08-04): mangled-classifier ctor typing
+
+`ctorInitTypeRef` walks the scope rename ladder (same-file/package
+references reach a collision-mangled internal class's registration)
+and falls back to exact-import FQN resolution. With addendum 48 this
+window takes the compose-side bound share 53.5% -> 72.4% (unbound
+10,085 -> 8,743 on comparable warm-state runs); stdlib stays 599.
+
+Remaining compose untyped-local families, by census weight: `it` 384
+(let/also shapes off call-return receivers), `m` 264, residual
+writer/slots 242/235 (openWriter().let { writer -> } — the callee-
+return-typed `let` param family), groups 196, hash2 176. These ride
+the same it-family channel task #1 built; the receiver is a call
+return whose head needs the mangled-aware resolution the ctor arm now
+has.
+
+Runtime effect on the concurrent probe: none measurable (~13.1s) — the
+newly-bound sites are composition machinery, not the snapshot-write
+loop. The five over-budget tests remain throughput-bound
+(addAll at 34.7s vs its 30s in-test budget).
