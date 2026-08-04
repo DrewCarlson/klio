@@ -2003,3 +2003,31 @@ pair). Separate finding from the same session: a top-level property
 whose init chain hits this shape reports `unresolved global` (tp3) —
 the init failure is silently swallowed at image load; the property
 never registers. Root-causing the Char bug should re-test tp3.
+
+## Addendum 32 — the Char chain, one hop from root (2026-08-04)
+
+The Addendum-31 wrong answer is now a THREE-LINK verified chain with
+one unknown left:
+1. The builtin String iterator yields .Char kinds ([iter-next],
+   verified in the exact failing run, interleaved with the output).
+2. The closure RECEIVES .Char ([cv-arg] #1 kind=Char immediately
+   before the wrong "97" line) — no coercion at bind (only the
+   Int->Long walks exist).
+3. The closure's `println(char)` is a CMG with a BOUNDED 2-candidate
+   set {fid 5443 println(), fid 5444 println(message: Any?)}; the
+   pick is 5444 (pts=10, the Any score) and ITS BODY renders the
+   .Char as its integer code. The same value through the STATIC
+   println route renders 'q' correctly (tp18) — so the defect is
+   inside fid 5444's source body chain (its inner print/toString
+   hop), not in the value or the pick.
+
+NEXT PROBE (one hop): dump fid 5444's body (KLIO_DUMP_FN=5444 on a
+COLD bake — image-loaded fns don't dump) and trace its inner hop;
+suspect the body's `print(message)`/toString dispatch on a .Char
+value taking a numeric rendering. Also explains tp3's swallowed
+top-prop-init failure (same chain under HEX_DIGITS init) and the
+parked agreed-return collaterals (Addendum 30) — fixing this leaf
+un-parks -72 census sites.
+
+Probe kit landed (env-gated): KLIO_ITER_TRACE, cv-arg rows under
+KLIO_TRACE_PATH, operand-level KLIO_DUMP_FN.
