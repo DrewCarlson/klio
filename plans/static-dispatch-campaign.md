@@ -2122,3 +2122,21 @@ chains. The member-read arm (Addendum 36) plus companion reads
 (Addendum 37) already took Member receivers 212 -> ~30.
 
 Standing: 690 / 78 / 4 / 99 on 9,351 — 90.7% bound, battery green.
+
+## Addendum 39 — the joinTo frontier, precisely (2026-08-04)
+
+The joinTo(...).toString() family's terminal state, one contradiction
+from root: the candidate WALK keeps fid 2267 (Iterable.joinTo) as the
+sole survivor — every argument compatible except the forwarded
+transform judged unknown (absent-args Function1 vs the receiver-
+substituted concrete param) — yet the RANKED scoring stage exits
+no-applicable-tier (best_tier=255, the observed applicable=false).
+applicableMember skips the receiver and scores tp-headed params at 5,
+and the callable arm returns 20 for member scopes on unparseable
+Function heads — so the null is in some OTHER scoreArg leaf for one
+of 2267's seven args. NEXT PROBE: KLIO_EXTKEY_TRACE=joinTo on the
+census prints the per-arg key vector; instrument scoreArg's `return
+null` paths if the key rows don't localize it. A sole-unknown typing
+channel (ExtensionResolution.sole_unknown, typing-only consumers) is
+the designed fix once the scorer agrees with the walk — drafted and
+reverted this cycle to keep the tree clean.
