@@ -149,3 +149,31 @@ pass + threaded loop for this subset behind KLIO_FLAT_VM
 exec arms (execArmCallValue etc. are already extracted noinline
 fns — the loop can call them directly), bench_corpus + full battery
 as the parity gate, then the compose re-measure.
+
+## Compose-side dispatch profile (2026-08-04) — the engine's targets
+
+concurrentGlobalModification_add (13.7s run, KLIO_DISPATCH_STATS):
+- 7,758,407 frame pushes; 5,896,920 flattenable (76% — compose
+  bodies carry more try/finally + ctx than the stdlib census's
+  99.9%).
+- call_member_virtual 4,626,064 (13.5% of all events) — the single
+  largest call population; each takes the virtual member path.
+- member_ladder 1,892,841 + member_flat_prepare 1,591,171 —
+  the name-based member arm's split: nearly 2M ladder entries per
+  test run.
+- call_static 3,340,070 with served_user_body 1,969,068 — exact
+  calls whose interpreted bodies each cost a frame + ladder when
+  fast_call does not qualify (extensions/members are excluded from
+  the current plan).
+
+BUILD PRIORITIES from these numbers, in order:
+1. Fuse `CallVirtual`/resolved `CallMember` into pushed activations
+   (the 4.6M population) — the slot is known; only the frame
+   ceremony remains.
+2. Widen `fastCallPlan` to extension/member bodies at exact arity
+   (unlocks pushed activations for most of served_user_body).
+3. Slot inline caches on the CallMemberOrGlobal/name-based arm
+   (the ~2M ladder entries).
+Each lands gated + measured against this exact test; the 13.5s ->
+<10s target needs roughly a quarter of the per-call ceremony gone,
+and populations 1+2 alone cover well past that fraction of events.
