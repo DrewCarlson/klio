@@ -2169,3 +2169,23 @@ withhold, and bareExtensionTarget (typing-only) consumes it.
 no_receiver 690 -> 642 (6.90%), declined 99 -> 93, bound 91.2% —
 strictly dominating the reverted emission-side widening (-48 vs -37,
 zero breakage). Session arc: 1,172 -> 642, 85.3% -> 91.2% bound.
+
+## Addendum 42 — compose margin re-measured at 91.2% bound (2026-08-04)
+
+Packs rebuilt with the full session's dispatch gains (agreed-return,
+member-read arm, companion reads, sole-unknown channel) and the
+scratch cache cleared: concurrentGlobalModification_add completes at
+13.5s — statistically unchanged from the 13.4s measured at 88.8%
+bound. The +2.4% bound did not move the compose hot loop, exactly as
+Addendum 27 priced it: the margin is per-call frame overhead in the
+interpreter core (threadlocals, image borrows, frame setup), not
+dispatch resolution. The compose set's 1.34x budget gap is the
+bytecode VM's to close; no further census work changes it.
+
+Session-close standing: no_receiver 640 / 9,305 (6.88%), nullable 78,
+no_class 4, declined 93 — 91.2% bound from 85.3%. Six kotlinc-parity
+wrong answers fixed and pinned; two measured negatives banked; the
+agreed-return channel live; every residual family attributed with a
+terminal cause. The two remaining structural legs are the
+per-instantiation substitution engine (the ~400 locals mass) and the
+bytecode VM (compose + the dynamic floor).
