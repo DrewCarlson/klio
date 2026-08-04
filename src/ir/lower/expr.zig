@@ -2472,9 +2472,15 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 /// name has no statically known type here (an untyped local, an outer
 /// capture, or a name the enclosing class does not declare as a typed member).
 fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const u8 {
+    // Inside `val writer = writer`'s initializer the local's own name is
+    // free (recorded at the decl), so the reference is the enclosing
+    // member, never the shadow being declared.
+    const self_shadowed = init_self_name != null and std.mem.eql(u8, init_self_name.?, recv_name);
     // A local/param binding shadows an enclosing member of the same name.
-    if (b.resolve(recv_name) != null) return b.localDeclType(recv_name);
-    if (b.knowsOuter(recv_name)) return null;
+    if (!self_shadowed) {
+        if (b.resolve(recv_name) != null) return b.localDeclType(recv_name);
+        if (b.knowsOuter(recv_name)) return null;
+    }
     // The enclosing class, else the EXTENSION RECEIVER — a bare name inside
     // `fun UByteArray.indices()` is a member of the receiver, and a top-level
     // extension has no enclosing class at all, so the search stopped there.
@@ -9211,6 +9217,35 @@ fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.
         if (try localInitTypeRef(b, init_expr)) |aliased| {
             if (norecvCensusOn()) lm_localinit[1] += 1;
             return aliased;
+        }
+        // A bare own-member snapshot: `val slots = slots` (the local's own
+        // name is not in scope inside its initializer, so the reference is
+        // the enclosing class's property) or `val w = writer` under another
+        // name. The property's declared head types the local exactly as the
+        // qualified `this.slots` read would.
+        const src_name = init_expr.Path.segments[0].name;
+        if (b.resolve(src_name) == null or std.mem.eql(u8, src_name, name)) {
+            if (b.ownerClass()) |owner| {
+                if (propTypeHeadOn(b, owner, src_name)) |head| {
+                    // Two same-simple-name classes (the gapbuffer and
+                    // linkbuffer SlotWriters) make a bare head ambiguous;
+                    // resolve it through the reading file's import graph to
+                    // the declaring class's FQN when possible.
+                    const resolved_name: []const u8 = blk: {
+                        const file = init_expr.Path.segments[0].span.file;
+                        const cid = b.module.classIdIndexed(typeHead(head), b.self_package, file) orelse
+                            b.module.classId(typeHead(head)) orelse break :blk head;
+                        if (cid.int() >= b.module.classes.items.len) break :blk head;
+                        break :blk b.module.classes.items[cid.int()].fqn;
+                    };
+                    if (norecvCensusOn()) lm_localinit[1] += 1;
+                    return ir.TypeRef{
+                        .name = try b.allocator.dupe(u8, resolved_name),
+                        .nullable = false,
+                        .args = &.{},
+                    };
+                }
+            }
         }
     }
     // A property read carries its own declared type; nothing needs resolving.
