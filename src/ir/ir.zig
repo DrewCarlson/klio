@@ -1023,6 +1023,24 @@ pub const FuncKind = enum {
 /// `this` as an enclosing receiver exactly as the full path does.
 pub const FAST_CALL_EXT_FLAG: u16 = 0x4000;
 
+/// Whether the declaration currently LOWERING carries
+/// `@Suppress("DEPRECATION_ERROR")`: under it kotlinc restores
+/// `@Deprecated(level = ERROR)` candidates to ordinary overload ranking,
+/// so the resolvers consult this when filtering low-priority overloads.
+threadlocal var suppress_deprecation_error: bool = false;
+
+pub fn setSuppressDeprecationError(v: bool) bool {
+    const prev = suppress_deprecation_error;
+    suppress_deprecation_error = v;
+    return prev;
+}
+
+/// The effective low-priority rank of a candidate at the current site: a
+/// deprecation-ERROR overload ranks ordinary under the suppression.
+pub fn rankLowPriority(f: *const Func) bool {
+    return f.low_priority and !(f.deprecated_error and suppress_deprecation_error);
+}
+
 pub const Func = struct {
     id: FuncId,
     name: []const u8,
@@ -1145,6 +1163,11 @@ pub const Func = struct {
     /// applies. Overload selection skips it while any normal sibling
     /// fits.
     low_priority: bool = false,
+    /// The low-priority mark came from `@Deprecated(level = ERROR|HIDDEN)`
+    /// (not `@LowPriorityInOverloadResolution`): a caller-side
+    /// `@Suppress("DEPRECATION_ERROR")` restores such a candidate to
+    /// ordinary ranking, exactly as kotlinc resolves under the suppression.
+    deprecated_error: bool = false,
     /// An `expect` declaration. Its `actual` may live outside the pack's source
     /// set, in which case NOTHING serves the call — and a bodyless declaration
     /// that nothing serves used to return `Unit` silently, which is the single
@@ -2330,6 +2353,9 @@ pub const Module = struct {
         const actual_head = staticTypeHead(actual_erased.name);
         const param_erased_head = staticTypeHead(param_erased.name);
         if (!std.mem.eql(u8, actual_head, param_erased_head)) {
+            // `Any` is the universal supertype: every classifier satisfies
+            // it, and the class table records no edges to it.
+            if (std.mem.eql(u8, applicability.simpleName(param_erased_head), "Any")) return .compatible;
             const actual_id = self.staticTypeClassId(actual_erased);
             const param_id = self.staticTypeClassId(param_erased);
             if (actual_id != null and param_id != null and
@@ -3729,6 +3755,16 @@ pub const Module = struct {
                     if (std.mem.eql(u8, staticTypeHead(ty.name), declared)) {
                         return .compatible;
                     }
+                    // An integer literal IS a Long in a Long slot (kotlinc
+                    // literal typing): `onTimeout(1000) { }` binds the
+                    // `timeMillis: Long` overload outright — leaving it
+                    // unknown withheld the sole survivor and deferred a
+                    // call kotlinc resolves statically.
+                    if (std.mem.eql(u8, staticTypeHead(ty.name), "Int") and
+                        std.mem.eql(u8, declared, "Long"))
+                    {
+                        return .compatible;
+                    }
                 }
                 // Integer literal coercion and floating/integral literal
                 // distinctions need value-aware evidence. A different
@@ -3774,8 +3810,12 @@ pub const Module = struct {
             // head-only tail proved `List<String>` against an instantiated
             // `List<List<String>>` (`Box<List<String>>.put(xs: List<T>)`)
             // and the wrong overload won. Heads still adjudicate first
-            // inside; absent-args grace and projections apply there.
-            if (ty.args.len != 0 or param.args.len != 0) {
+            // inside; absent-args grace and projections apply there. Routed
+            // only when the PARAM carries arguments: an instantiated actual
+            // against a plain-headed param (`MutableState<Int>` vs `Any?` on
+            // the memoized `remember`) is the ordinary erased-head question,
+            // and the prover's class-table walk has no edge to `Any`.
+            if (param.args.len != 0) {
                 sac_route = "generic-tail";
                 return self.staticGenericArgCompatibility(fid, ty, param, 0);
             }
@@ -3808,6 +3848,43 @@ pub const Module = struct {
             return .unknown;
         }
         return .unknown;
+    }
+
+    /// Whether the params a trailing-callable mapping would SKIP — those
+    /// between the last positional arg and the final parameter — all carry
+    /// defaults. Kotlin fills that gap from defaults only; mapping across
+    /// an undefaulted middle fabricates an applicability kotlinc rejects.
+    fn bargTraceEnv() ?[]const u8 {
+        const S = struct {
+            var cached: bool = false;
+            var val: ?[]const u8 = null;
+        };
+        if (!S.cached) {
+            S.val = if (std.c.getenv("KLIO_BARG_TRACE")) |w| std.mem.span(w) else null;
+            S.cached = true;
+        }
+        return S.val;
+    }
+
+    fn dropTraceEnv() ?[]const u8 {
+        const S = struct {
+            var cached: bool = false;
+            var val: ?[]const u8 = null;
+        };
+        if (!S.cached) {
+            S.val = if (std.c.getenv("KLIO_DROP_TRACE")) |w| std.mem.span(w) else null;
+            S.cached = true;
+        }
+        return S.val;
+    }
+
+    fn trailingGapDefaulted(params: []const Param, n_args: usize) bool {
+        if (n_args == 0 or n_args > params.len) return true;
+        var i = n_args - 1;
+        while (i + 1 < params.len) : (i += 1) {
+            if (!params[i].has_default) return false;
+        }
+        return true;
     }
 
     /// Builtin classifier heads no function value can convert to: the
@@ -3890,11 +3967,17 @@ pub const Module = struct {
             }
         };
         var result: StaticCompatibility = .compatible;
-        // A trailing lambda maps to the LAST parameter across defaulted
+        // A trailing lambda maps to the LAST parameter across DEFAULTED
         // middles, exactly as the extension ranker and arity mapping do.
+        // Kotlin fills the gap from defaults only: without the default
+        // check the single callable of `cont.tryResume(onCancellation)`
+        // mapped past the member's undefaulted `(value, idempotent)` and
+        // the token-returning member outranked the Boolean extension —
+        // a Symbol reached a branch and every `select` rendezvous hung.
         const trailing_lambda_arg = args.len != 0 and
             (args[args.len - 1].is_lambda or args[args.len - 1].lambda_arity != null or
-                args[args.len - 1].func_typed);
+                args[args.len - 1].func_typed) and
+            trailingGapDefaulted(params, args.len);
         for (args, 0..) |arg, ai| {
             const param = if (trailing_lambda_arg and ai + 1 == args.len and
                 args.len <= params.len)
@@ -4555,12 +4638,16 @@ pub const Module = struct {
                 compatibility = .unknown;
             } else {
                 // A trailing lambda fills the LAST parameter even when
-                // defaulted parameters are omitted between (`windowed(2, 3)
+                // DEFAULTED parameters are omitted between (`windowed(2, 3)
                 // { transform }` maps the lambda past `partialWindows`);
-                // judging it positionally refuted the overload kotlinc binds.
+                // judging it positionally refuted the overload kotlinc
+                // binds. The skipped middle must be all-defaulted (Kotlin
+                // fills the gap from defaults only) — see the member-side
+                // mapping's tryResume note.
                 const trailing_lambda_arg = args.len != 0 and
                     (args[args.len - 1].is_lambda or args[args.len - 1].lambda_arity != null or
-                        args[args.len - 1].func_typed);
+                        args[args.len - 1].func_typed) and
+                    trailingGapDefaulted(f.params[1..], args.len);
                 for (args, 0..) |arg, ai| {
                     const pi = if (trailing_lambda_arg and ai + 1 == args.len and
                         1 + args.len <= f.params.len)
@@ -4669,7 +4756,7 @@ pub const Module = struct {
             sigs[i] = .{
                 .params = params,
                 .has_body = true,
-                .low_priority = f.low_priority,
+                .low_priority = rankLowPriority(f),
                 .is_extension = true,
                 .fid = fid,
                 .package = f.package,
@@ -4921,7 +5008,7 @@ pub const Module = struct {
                 // virtual slot; executability belongs to dispatch, not
                 // overload applicability.
                 .has_body = true,
-                .low_priority = f.low_priority,
+                .low_priority = rankLowPriority(f),
                 .is_member = true,
                 .fid = fid,
                 .package = f.package,
@@ -7002,7 +7089,7 @@ pub const Module = struct {
         var first_lp: ?FuncId = null;
         for (candidates) |id| {
             if (self.funcById(id)) |f| {
-                if (f.low_priority) {
+                if (rankLowPriority(f)) {
                     if (first_lp == null) first_lp = id;
                     continue;
                 }
@@ -7035,7 +7122,7 @@ pub const Module = struct {
         for (candidates) |id| {
             if (self.memberExtOutOfScope(id, ctx_owner)) continue;
             if (self.funcById(id)) |f| {
-                if (f.low_priority) {
+                if (rankLowPriority(f)) {
                     if (first_lp == null) first_lp = id;
                     continue;
                 }
@@ -7073,7 +7160,7 @@ pub const Module = struct {
                 }
             }
             if (!has_vararg) continue;
-            if (f.low_priority) {
+            if (rankLowPriority(f)) {
                 if (first_lp == null) first_lp = id;
                 continue;
             }
@@ -7450,7 +7537,7 @@ pub const Module = struct {
             .params = f.params[off..end],
             .defaults = null,
             .has_body = true,
-            .low_priority = f.low_priority,
+            .low_priority = rankLowPriority(f),
             .is_member = off == 1 and f.kind == .instance_method,
             .is_extension = off == 1,
             .fid = id,
@@ -7787,7 +7874,7 @@ pub const Module = struct {
                     saw_bodyless = true;
                     continue;
                 };
-                if (f.low_priority) {
+                if (rankLowPriority(f)) {
                     saw_low = true;
                     continue;
                 }
@@ -7813,7 +7900,7 @@ pub const Module = struct {
                 if (used != 0) saw_default = true;
                 break :blk used;
             } else blk: {
-                if (f.low_priority) {
+                if (rankLowPriority(f)) {
                     saw_low = true;
                     continue;
                 }
@@ -8263,6 +8350,22 @@ pub const Module = struct {
                 param_ty,
                 actual_bounds,
             );
+            if (bargTraceEnv()) |w| {
+                if (self.funcById(fid)) |bf| {
+                    if (std.mem.eql(u8, w, bf.name)) {
+                        std.debug.print("[barg] {s}#{d} arg{d} param={s} arg_ty={s} lam={} -> {s} route={s}\n", .{
+                            bf.name,
+                            fid.int(),
+                            i,
+                            param_ty.name,
+                            if (arg.ty) |t| t.name else "-",
+                            arg.is_lambda,
+                            @tagName(compatibility),
+                            sac_route,
+                        });
+                    }
+                }
+            }
             if (compatibility == .incompatible) return .incompatible;
             if (compatibility == .unknown) result = .unknown;
         }
@@ -8295,18 +8398,31 @@ pub const Module = struct {
             .type_var = staticTypeVar,
         };
         var best = ApplicableBarePick{};
+        const drop_trace = blk: {
+            const w = dropTraceEnv() orelse break :blk false;
+            break :blk std.mem.eql(u8, w, name);
+        };
         for (candidates) |id| {
             const f = self.funcById(id) orelse continue;
             const kind = self.declarationKind(id, f);
             const is_receiver_formed = kind != .plain;
-            if (is_receiver_formed != receiver_formed or f.low_priority) continue;
+            if (is_receiver_formed != receiver_formed or rankLowPriority(f)) {
+                if (drop_trace) std.debug.print("[drop] {s}#{d} form={} lowpri={}\n", .{ name, id.int(), is_receiver_formed != receiver_formed, rankLowPriority(f) });
+                continue;
+            }
             if (receiver_formed) {
                 if (self.memberExtOutOfScope(id, ctx.owner_class)) continue;
                 if (ctx.receiver_known and
                     !self.extReceiverPlausible(id, f, ctx.owner_class)) continue;
             }
-            const sig = self.sigViewForApplicability(id, include_compiler_abi) orelse continue;
-            const score = applicability.applicable(&sig, args, scope) orelse continue;
+            const sig = self.sigViewForApplicability(id, include_compiler_abi) orelse {
+                if (drop_trace) std.debug.print("[drop] {s}#{d} no-sigview\n", .{ name, id.int() });
+                continue;
+            };
+            const score = applicability.applicable(&sig, args, scope) orelse {
+                if (drop_trace) std.debug.print("[drop] {s}#{d} inapplicable-shape\n", .{ name, id.int() });
+                continue;
+            };
             const static_compatibility = if (receiver_formed)
                 StaticCompatibility.unknown
             else
@@ -11913,14 +12029,16 @@ test "extension resolver proves receiver, scope, and overload identity" {
         .ty = .{ .name = "Int", .nullable = false, .args = &.{} },
         .literal_kind = .numeric,
     }};
-    try testing.expect(m.resolveExtensionCall("literalPick", .{
+    // kotlinc: an integer literal materializes as Long in a Long slot, and
+    // the Long overload is more specific than Any — the pick is static.
+    try testing.expectEqual(long_literal.int(), m.resolveExtensionCall("literalPick", .{
         .name = "String",
         .nullable = false,
         .args = &.{},
     }, &numeric_literal, .{
         .caller_file = FileId.from(0),
         .caller_package = "app",
-    }).target == null);
+    }).target.?.int());
 
     try testing.expect(m.resolveExtensionCall("aliasPick", .{
         .name = "String",

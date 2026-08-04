@@ -283,6 +283,32 @@ pub fn pkgTypeRenamesFor(pkg: []const u8) ?*const std.StringHashMap([]const u8) 
     return m.getPtr(pkg);
 }
 
+/// File-to-package view installed with the rename maps, so a decl-time head
+/// rename can serve a SAME-PACKAGE cross-file reference (the file map only
+/// covers the declaring file; imports resolve by FQN separately).
+pub const FilePkgMap = std.AutoHashMap(span_mod.FileId, []const u8);
+
+threadlocal var lower_file_pkgs: ?*const FilePkgMap = null;
+
+pub fn setLowerFilePkgs(m: ?*const FilePkgMap) ?*const FilePkgMap {
+    const prev = lower_file_pkgs;
+    lower_file_pkgs = m;
+    return prev;
+}
+
+/// The mangled lift name for `name` referenced from `file`, over BOTH rename
+/// scopes: the declaring file's own map, then the file's package map (an
+/// `internal` classifier renamed for its whole package).
+pub fn fileOrPkgTypeRename(name: []const u8, file: u32) ?[]const u8 {
+    if (fileTypeRename(name, file)) |rn| return rn;
+    const pkgs = lower_file_pkgs orelse return null;
+    const pkg = pkgs.get(span_mod.FileId.from(file)) orelse return null;
+    const r = pkgTypeRename(name, pkg);
+    if (r != null and std.c.getenv("KLIO_RENAME_TRACE") != null)
+        std.debug.print("[rnm-pkg] {s} pkg={s} -> {s} file={d}\n", .{ name, pkg, r.?, file });
+    return r;
+}
+
 /// Scope-true renames carried into a runtime anon-object member-body
 /// lowering: the lexical site's flattened rename snapshot from the
 /// `BuildObject` instruction. Installed around the side-module lowering

@@ -1602,6 +1602,31 @@ test "bound_args_lambda_replay" {
     );
 }
 
+test "trailing_callable_gap_defaults" {
+    try check("trailing_callable_gap_defaults",
+        \\ext:fn
+        \\ext:null
+        \\member3
+        \\
+    );
+}
+
+test "type_overload_runtime_pick" {
+    try check("type_overload_runtime_pick",
+        \\meta:7 d:2
+        \\bool:true w:1.5
+        \\
+    );
+}
+
+test "generic_arg_vs_any_param" {
+    try check("generic_arg_vs_any_param",
+        \\keyed:x
+        \\plain:y
+        \\
+    );
+}
+
 test "member_overload_receiver_instantiation" {
     try check("member_overload_receiver_instantiation",
         \\one

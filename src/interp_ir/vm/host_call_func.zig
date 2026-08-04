@@ -1241,7 +1241,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
         const target: ?FuncId = blk: {
             const g = self.prog.borrow();
             defer g.deinit();
-            break :blk g.get().resolvedRedirectTarget(module, func, args_in.len);
+            break :blk g.get().resolvedRedirectTargetShaped(module, func, args_in);
         };
         if (target) |cand| {
             // Re-entrancy guard for RECEIVER-formed headers: an abstract

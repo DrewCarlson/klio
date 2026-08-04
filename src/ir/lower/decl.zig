@@ -519,7 +519,7 @@ pub fn reserveMemberHeaders(
         }
         const fqn = try std.fmt.allocPrint(a, "{s}.{s}", .{ class_fqn, f.name.name });
         const return_ty = if (f.return_type) |*rt|
-            try loweredMemberTypeRef(module, a, owner_id, f, rt, false)
+            renameParamHead(try loweredMemberTypeRef(module, a, owner_id, f, rt, false), rt)
         else
             build.typeUnit();
         try module.funcs.append(a, .{
@@ -539,6 +539,7 @@ pub fn reserveMemberHeaders(
             .has_receiver_param = true,
             .is_inline = f.is_inline,
             .low_priority = isLowPriorityOverload(f),
+            .deprecated_error = annotationsAreDeprecatedError(f.annotations),
             .is_expect = f.is_expect,
             .is_override = f.is_override,
             .is_open = f.is_open,
@@ -1240,10 +1241,10 @@ pub fn loweredTypeName(allocator: Allocator, ty: *const ast.TypeRef) Allocator.E
 /// to its target. Scoped to the head (not generic arguments / function-type
 /// shapes) and to nominal, non-qualified references, so it cannot disturb the
 /// structural type an overload's symbol index reads.
-fn renameParamHead(ty: ir.TypeRef, src: *const ast.TypeRef) ir.TypeRef {
+pub fn renameParamHead(ty: ir.TypeRef, src: *const ast.TypeRef) ir.TypeRef {
     if (src.function != null or src.qualified_path != null) return ty;
     var out = ty;
-    out.name = build.fileTypeRename(ty.name, src.span.file.int()) orelse ty.name;
+    out.name = build.fileOrPkgTypeRename(ty.name, src.span.file.int()) orelse ty.name;
     return out;
 }
 
@@ -1365,6 +1366,10 @@ pub fn lowerFunctionBody(
     file_classes: *const FileClasses,
 ) Allocator.Error!Func {
     const a = module.registry.allocator;
+    const prev_sde = ir.setSuppressDeprecationError(
+        annotationsSuppressDeprecationError(f.annotations),
+    );
+    defer _ = ir.setSuppressDeprecationError(prev_sde);
     // Extension functions (`fun T.foo(...)`) need `this` bound as the
     // implicit first param so the body's references to `this` and
     // `this.x` resolve through the receiver reg rather than as a free
@@ -1914,6 +1919,10 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     const a = module.registry.allocator;
     const prev_real_fn = build.pushCurrentRealFn(f.name.name);
     defer build.popCurrentRealFn(prev_real_fn);
+    const prev_sde = ir.setSuppressDeprecationError(
+        annotationsSuppressDeprecationError(f.annotations),
+    );
+    defer _ = ir.setSuppressDeprecationError(prev_sde);
     const local_class_mark = build.localClassScopeMark();
     defer build.localClassScopeRestore(local_class_mark);
     const prev_owner = build.pushCurrentOwnerClass(owner_class);
@@ -2217,7 +2226,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     // Long = 0`). Inferred returns (no annotation) stay `Unit` —
     // harmless, as the coercion only triggers on an explicit `Long`.
     const return_ty: TypeRef = if (f.return_type) |*rt|
-        try loweredTypeRef(a, rt, false)
+        renameParamHead(try loweredTypeRef(a, rt, false), rt)
     else if (derived_return) |dr|
         dr
     else
@@ -2287,6 +2296,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     }
     func.is_suspend = f.is_suspend;
     func.low_priority = isLowPriorityOverload(f);
+    func.deprecated_error = annotationsAreDeprecatedError(f.annotations);
     func.is_expect = f.is_expect;
     func.is_override = f.is_override;
     func.is_open = f.is_open;
@@ -2334,6 +2344,37 @@ pub fn annotationsAreLowPriority(annotations: []const ast.Annotation) bool {
             // compatibility), so both rank as guard stubs.
             for (ann.args) |*arg| {
                 if (exprMentionsErrorOrHidden(arg)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// `@Deprecated(level = ERROR|HIDDEN)` alone — the SUPPRESSIBLE half of the
+/// low-priority mark (`@Suppress("DEPRECATION_ERROR")` at the caller restores
+/// such a candidate to ordinary ranking; `@LowPriorityInOverloadResolution`
+/// never ranks ordinary).
+pub fn annotationsAreDeprecatedError(annotations: []const ast.Annotation) bool {
+    for (annotations) |*ann| {
+        const leaf: []const u8 = if (ann.path.len != 0) ann.path[ann.path.len - 1].name else "";
+        if (std.mem.eql(u8, leaf, "Deprecated")) {
+            for (ann.args) |*arg| {
+                if (exprMentionsErrorOrHidden(arg)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Whether a declaration's annotations carry `@Suppress("DEPRECATION_ERROR")`.
+pub fn annotationsSuppressDeprecationError(annotations: []const ast.Annotation) bool {
+    for (annotations) |*ann| {
+        const leaf: []const u8 = if (ann.path.len != 0) ann.path[ann.path.len - 1].name else "";
+        if (!std.mem.eql(u8, leaf, "Suppress")) continue;
+        for (ann.args) |*arg| {
+            if (arg.* != .StringTemplate) continue;
+            for (arg.StringTemplate.parts) |part| {
+                if (part == .Text and std.mem.eql(u8, part.Text, "DEPRECATION_ERROR")) return true;
             }
         }
     }
