@@ -1927,3 +1927,22 @@ whether the apply argument's closure lowering runs lowerLambda's
 pre-derivation loop at all in this doubly-spliced context, and
 whether the snapshot's contains-guard skips `iterator` on a stale
 same-named record.
+
+## Addendum 29 — the shared leaf closes (2026-08-04)
+
+71985bb9: THIRD kotlinc-parity wrong answer of the session, found by
+construction from the plus-flip mechanism — the member resolver's
+sibling. `Box<List<String>>.put(arg)` answered "list" for kotlinc's
+"one": the argument-compat TAIL was head-only, so an instantiated
+`List<List<String>>` param accepted a `List<String>` argument. The
+tail now routes any generic pair through staticGenericArgCompatibility
+— with the ext ranker's receiver substitution (Addendum 25) and the
+member path's existing owner-projection substitution, all three
+static provers now adjudicate arguments through ONE args-aware leaf.
+The P2-completion unification's judgment layer is effectively done;
+what remains of it is mechanical consolidation (one entry fn), not
+semantics. Pins: plus_element_inference,
+member_overload_receiver_instantiation.
+
+declined 99 (two more false proofs un-committed). Census otherwise
+stable at 949 / 78 / 4 (88.2% bound); battery green everywhere.
