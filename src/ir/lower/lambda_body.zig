@@ -320,7 +320,11 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         module.pending_lambda_type_param_bounds = null;
         defer moduleAllocator(module).free(bounds);
         for (bounds) |bound| {
-            try b.addTypeParamBoundHead(bound.param, bound.bound, bound.complete, bound.head_only);
+            // Keep the bound's concrete ARGS (registry-lifetime slices):
+            // dropping them here degraded `T : Iterable<String>` to a
+            // head-only record one lambda level down, and the receiver
+            // bound hop then offered bare `T` to extension resolution.
+            try b.addTypeParamBoundHeadArgs(bound.param, bound.bound, bound.complete, bound.head_only, bound.args);
         }
     }
     if (module.pending_lambda_type_param_bound_refs) |refs| {

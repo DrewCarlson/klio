@@ -15310,6 +15310,38 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     // captures the enclosing lambda's, instead of binding a spurious null
     // parameter.
     const uarg_arity: ?[]const i16 = try memberCallArgArities(b, receiver, name.name, args, ast_arg_names);
+    // The dispatch stays deferred (a runtime subtype might serve the name
+    // as a MEMBER), but kotlinc types the argument lambdas against the
+    // STATIC declared-type resolution — which, with no member on the
+    // static type, is the extension candidate. Thread its instantiated
+    // param types so the closure bodies type their params.
+    var deferred_lambda_param_types: ?[]?[]ir.TypeRef = null;
+    defer if (deferred_lambda_param_types) |types|
+        deinitArgLambdaParamTypes(b.allocator, types);
+    if (declared_ty) |recv_ty| blk: {
+        var any_lambda = false;
+        for (args) |*a| {
+            if (a.* == .Lambda or a.* == .AnonFun) {
+                any_lambda = true;
+                break;
+            }
+        }
+        if (!any_lambda) break :blk;
+        const ext = try resolveExtensionCallForArgs(b, recv_ty, name, args, ast_arg_names);
+        const target_id = ext.target orelse break :blk;
+        const target = b.module.funcById(target_id) orelse break :blk;
+        var rt = recv_ty;
+        deferred_lambda_param_types = try argLambdaParamTypesRecv(
+            b,
+            target,
+            args,
+            ast_arg_names,
+            ast_type_args,
+            1,
+            substitutionRecv(b, &rt),
+        );
+        b.pending_arg_lambda_param_types = deferred_lambda_param_types;
+    }
     const run = try lowerArgRunWithArity(b, args, uarg_arity);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();

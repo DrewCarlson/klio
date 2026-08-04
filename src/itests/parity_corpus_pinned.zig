@@ -1594,6 +1594,14 @@ test "bound_args_lambda_param" {
     );
 }
 
+test "bound_args_lambda_replay" {
+    try check("bound_args_lambda_replay",
+        \\cs,cs
+        \\2
+        \\
+    );
+}
+
 test "nested_it_shadow_local_ext" {
     try check("nested_it_shadow_local_ext",
         \\[, abc, sort]
