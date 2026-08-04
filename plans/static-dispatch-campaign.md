@@ -2354,3 +2354,36 @@ wrong verdicts from a stale binary (a stash test rebuilt HEAD and the
 next sweep ran that binary) and from gates defaulting ON during
 "revert" tests. Both caught by re-running the matrix 3x stable before
 acting.
+
+## Addendum 51 (2026-08-05): the masked-regression cluster (ed946b6b)
+
+The corpus-drift sweep had been running a STALE scratch harness copy for
+six landings; a fresh binary surfaced three regressions the batteries
+never see (the drift corpus is the only compose-UI end-to-end gate):
+
+1. `unresolved global remember` (compose_ui_click + compose_uitext):
+   first-bad 71985bb9. The generic-pair route fired when EITHER side
+   carried type args, so the plugin-memoized `remember(key: Any?, ...)`
+   judged `MutableState<Int>` against `Any?` in the generic prover —
+   whose class-table walk has no edge to `Any` — and every overload
+   refuted. FIXED (ed946b6b): route requires the PARAM to carry args;
+   the prover treats `Any` as universal. Pin: generic_arg_vs_any_param.
+2. `non-bool in branch: TextOverflow(value=1)` (compose_uitext,
+   FontResolver init -> CoroutineContext.plus fold lambda): ALSO
+   first-bad 71985bb9, NOT covered by the fix (all four session gates
+   ruled out). The branch condition register receives a foreign
+   value-class instance inside the plus-fold lambda — the
+   universe-pollution shape from the misalignment recipe. OPEN.
+3. select_on_timeout_loses drift TIMEOUT. OPEN.
+
+Also this cycle: `KLIO_JIT=1` takes the compose concurrent probe
+12.7s -> 0.31s (41x) and the failing snapshot suites 5 -> 2 failures
+(the two left need ~1.4-2.3x more); a JIT Char-tag bug on static-call
+args and member receivers was fixed and pinned (aeb53b8e). The `test`
+subcommand's safe-profile default stands; the JIT question for the
+compose gate is scoped, not global.
+
+Process: the drift script now refreshes its harness copy automatically;
+the trap is recorded in the session memory. Two bisects this cycle were
+initially misread from a stale binary and gates defaulting ON during
+"revert" tests — both verdicts only accepted after 3x-stable reruns.
