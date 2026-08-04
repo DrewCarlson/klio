@@ -1023,6 +1023,24 @@ pub const FuncKind = enum {
 /// `this` as an enclosing receiver exactly as the full path does.
 pub const FAST_CALL_EXT_FLAG: u16 = 0x4000;
 
+/// Whether the declaration currently LOWERING carries
+/// `@Suppress("DEPRECATION_ERROR")`: under it kotlinc restores
+/// `@Deprecated(level = ERROR)` candidates to ordinary overload ranking,
+/// so the resolvers consult this when filtering low-priority overloads.
+threadlocal var suppress_deprecation_error: bool = false;
+
+pub fn setSuppressDeprecationError(v: bool) bool {
+    const prev = suppress_deprecation_error;
+    suppress_deprecation_error = v;
+    return prev;
+}
+
+/// The effective low-priority rank of a candidate at the current site: a
+/// deprecation-ERROR overload ranks ordinary under the suppression.
+pub fn rankLowPriority(f: *const Func) bool {
+    return f.low_priority and !(f.deprecated_error and suppress_deprecation_error);
+}
+
 pub const Func = struct {
     id: FuncId,
     name: []const u8,
@@ -1145,6 +1163,11 @@ pub const Func = struct {
     /// applies. Overload selection skips it while any normal sibling
     /// fits.
     low_priority: bool = false,
+    /// The low-priority mark came from `@Deprecated(level = ERROR|HIDDEN)`
+    /// (not `@LowPriorityInOverloadResolution`): a caller-side
+    /// `@Suppress("DEPRECATION_ERROR")` restores such a candidate to
+    /// ordinary ranking, exactly as kotlinc resolves under the suppression.
+    deprecated_error: bool = false,
     /// An `expect` declaration. Its `actual` may live outside the pack's source
     /// set, in which case NOTHING serves the call — and a bodyless declaration
     /// that nothing serves used to return `Unit` silently, which is the single
@@ -4669,7 +4692,7 @@ pub const Module = struct {
             sigs[i] = .{
                 .params = params,
                 .has_body = true,
-                .low_priority = f.low_priority,
+                .low_priority = rankLowPriority(f),
                 .is_extension = true,
                 .fid = fid,
                 .package = f.package,
@@ -4921,7 +4944,7 @@ pub const Module = struct {
                 // virtual slot; executability belongs to dispatch, not
                 // overload applicability.
                 .has_body = true,
-                .low_priority = f.low_priority,
+                .low_priority = rankLowPriority(f),
                 .is_member = true,
                 .fid = fid,
                 .package = f.package,
@@ -7002,7 +7025,7 @@ pub const Module = struct {
         var first_lp: ?FuncId = null;
         for (candidates) |id| {
             if (self.funcById(id)) |f| {
-                if (f.low_priority) {
+                if (rankLowPriority(f)) {
                     if (first_lp == null) first_lp = id;
                     continue;
                 }
@@ -7035,7 +7058,7 @@ pub const Module = struct {
         for (candidates) |id| {
             if (self.memberExtOutOfScope(id, ctx_owner)) continue;
             if (self.funcById(id)) |f| {
-                if (f.low_priority) {
+                if (rankLowPriority(f)) {
                     if (first_lp == null) first_lp = id;
                     continue;
                 }
@@ -7073,7 +7096,7 @@ pub const Module = struct {
                 }
             }
             if (!has_vararg) continue;
-            if (f.low_priority) {
+            if (rankLowPriority(f)) {
                 if (first_lp == null) first_lp = id;
                 continue;
             }
@@ -7450,7 +7473,7 @@ pub const Module = struct {
             .params = f.params[off..end],
             .defaults = null,
             .has_body = true,
-            .low_priority = f.low_priority,
+            .low_priority = rankLowPriority(f),
             .is_member = off == 1 and f.kind == .instance_method,
             .is_extension = off == 1,
             .fid = id,
@@ -7787,7 +7810,7 @@ pub const Module = struct {
                     saw_bodyless = true;
                     continue;
                 };
-                if (f.low_priority) {
+                if (rankLowPriority(f)) {
                     saw_low = true;
                     continue;
                 }
@@ -7813,7 +7836,7 @@ pub const Module = struct {
                 if (used != 0) saw_default = true;
                 break :blk used;
             } else blk: {
-                if (f.low_priority) {
+                if (rankLowPriority(f)) {
                     saw_low = true;
                     continue;
                 }
@@ -8299,7 +8322,7 @@ pub const Module = struct {
             const f = self.funcById(id) orelse continue;
             const kind = self.declarationKind(id, f);
             const is_receiver_formed = kind != .plain;
-            if (is_receiver_formed != receiver_formed or f.low_priority) continue;
+            if (is_receiver_formed != receiver_formed or rankLowPriority(f)) continue;
             if (receiver_formed) {
                 if (self.memberExtOutOfScope(id, ctx.owner_class)) continue;
                 if (ctx.receiver_known and

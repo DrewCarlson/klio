@@ -4130,6 +4130,17 @@ fn substitutionRecv(b: *FuncBuilder, declared: ?*const ir.TypeRef) ?*const ir.Ty
     if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (b.typeParamBoundRef(typeHead(head))) |ref| return ref;
     if (d.args.len != 0) return d;
+    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_SUBST_NONGEN") orelse "1", "0")) return null;
+    // A head-only receiver naming a NON-GENERIC class is complete: the head
+    // is the whole type, so `SlotWriter.let { writer -> }` binds
+    // `T := SlotWriter` exactly. Only a generic class's bare head (a `List`
+    // missing its element) says nothing.
+    const cid = (if (std.mem.indexOfScalar(u8, head, '.') != null)
+        b.module.classIdByFqn(head)
+    else
+        b.module.uniqueClassIdBySimpleName(typeHead(head))) orelse return null;
+    if (cid.int() >= b.module.classes.items.len) return null;
+    if (b.module.classes.items[cid.int()].type_params.len == 0) return d;
     return null;
 }
 
@@ -9445,6 +9456,12 @@ fn staticCallReturnTypeRef(
         );
     }
     if (call_expr.* != .Call) return null;
+    // A DIRECT constructor expression names its own type
+    // (`SlotTable().also { it.write { … } }` types `it` without a local
+    // in between); the guards inside decline shadowing locals/functions.
+    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_CTOR_RET") orelse "1", "0")) {
+        if (try ctorInitTypeRef(b, call_expr)) |ctor_ty| return ctor_ty;
+    }
     const call = call_expr.Call;
     if (call.is_infix and call.args.len == 2 and call.callee.* == .Path and
         call.callee.Path.segments.len == 1)

@@ -886,6 +886,8 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     defer _ = ir.build.setLowerFileTypeRenames(prev_ty_renames);
     const prev_pkg_renames = ir.build.setLowerPkgTypeRenames(&pkg_type_renames);
     defer _ = ir.build.setLowerPkgTypeRenames(prev_pkg_renames);
+    const prev_file_pkgs = ir.build.setLowerFilePkgs(&file_pkgs);
+    defer _ = ir.build.setLowerFilePkgs(prev_file_pkgs);
 
     const combined = KotlinFile{
         .package = null,
@@ -2477,7 +2479,7 @@ fn buildModuleWithOverrides(
                     for (f.params) |*p| {
                         ps[pi] = .{
                             .name = p.name.name,
-                            .ty = try ir.lower.decl.loweredTypeRef(a, &p.ty, true),
+                            .ty = ir.lower.decl.renameParamHead(try ir.lower.decl.loweredTypeRef(a, &p.ty, true), &p.ty),
                             .default = null,
                             .composable_arity = compose_pass.composableFunctionArity(&p.ty),
                             .is_property = false,
@@ -2496,7 +2498,7 @@ fn buildModuleWithOverrides(
                 .package = decl_pkg.get(f.span) orelse packageOfFqn(fqn, f.name.name),
                 .params = stub_params,
                 .return_ty = if (f.return_type) |*rt|
-                    try ir.lower.decl.loweredTypeRef(a, rt, true)
+                    ir.lower.decl.renameParamHead(try ir.lower.decl.loweredTypeRef(a, rt, true), rt)
                 else
                     ir.build.typeUnit(),
                 .return_ty_declared = f.return_type != null,
@@ -2510,6 +2512,7 @@ fn buildModuleWithOverrides(
                 .capture_order = &.{},
                 .implicit_label = null,
                 .low_priority = ir.lower.decl.isLowPriorityOverload(f),
+                .deprecated_error = ir.lower.decl.annotationsAreDeprecatedError(f.annotations),
                 .is_expect = f.is_expect,
             });
             try module.func_index.append(a, .{ .name = f.name.name, .id = id });
