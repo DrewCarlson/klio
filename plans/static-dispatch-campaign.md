@@ -1890,3 +1890,20 @@ generic, so the extension set ties as unknown/compatible with no
 strict winner. Those declines are honest under the evidence; they
 convert as the remaining arg-typing legs land, not by a ranker
 change. No quick slice here — the bucket is correctly priced.
+
+## Addendum 27 — compose throughput measured under fresh packs (2026-08-04)
+
+The five compose packs were rebuilt+reinstalled with the current
+harness (all session gains baked) and the scratch cache cleared —
+concurrentGlobalModification_add still completes at ~13.4s against
+the 10s runTest budget (1.34x). Profile of the test body (leaf
+attribution, staged sampling): the parked EventGate workers dominate
+raw samples (idle, not contention); the busy thread spends in the
+interp call chain (execInst/runFlatLoop/evalWithCapturesChained,
+callFunc*), with irMethodWalk already inline-cache-served and the
+residue in per-call frame overhead, threadlocal reads, image borrow,
+and string-keyed lookups on cold paths. CONCLUSION: the compose
+throughput set is core-loop-bound as priced — the bytecode VM leg,
+not a resolution or staleness artifact. The stale-pack hypothesis was
+tested and refuted; all future compose measurements now run against
+fresh packs.
