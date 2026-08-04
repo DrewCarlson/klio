@@ -2320,3 +2320,37 @@ Runtime effect on the concurrent probe: none measurable (~13.1s) — the
 newly-bound sites are composition machinery, not the snapshot-write
 loop. The five over-budget tests remain throughput-bound
 (addAll at 34.7s vs its 30s in-test budget).
+
+## Addendum 50 (2026-08-04): the substitution/rename wave (66416304)
+
+Four channels landed in one verified wave (duplicate-class repro
+harness under scratchpad/mangle/, control = drop the b.kt duplicate):
+
+1. substitutionRecv: a head-only receiver naming a NON-GENERIC class
+   IS the complete type — `T := SlotWriter` binds for
+   `openWriter().let { writer -> }`. The old rule (args-carrying heads
+   only) was built for bare generic heads and starved every
+   non-generic let/also/apply param.
+2. Return-head mangle renames: declared returns now rename like params
+   (decl + phase-1 header, both params and returns), and the rename
+   ladder gained the package scope (fileOrPkgTypeRename over an
+   installed file->package view). A same-package helper's
+   `testItems(): SlotTable` now resolves the mangled registration.
+3. staticCallReturnTypeRef ctor arm: a direct constructor expression
+   types itself (`SlotTable().also { it.write { … } }`).
+4. Exposed ranking divergence, fixed at the mechanism:
+   @Deprecated(level=ERROR) was conflated with
+   @LowPriorityInOverloadResolution; kotlinc restores the former under
+   caller-side @Suppress("DEPRECATION_ERROR"). Func.deprecated_error +
+   rankLowPriority + a suppression scope threaded from the enclosing
+   declaration now match kotlinc (stdlib deprecatedAppend pins it).
+
+Census: compose-side unbound 10,085 -> 8,359 across addenda 48-50
+(bound 53.5% -> 73.7%); stdlib 611 -> 591. Batteries green at every
+landing. Bisect gates: KLIO_SUBST_NONGEN, KLIO_CTOR_RET.
+
+Debug note for the record: two bisection runs in this wave produced
+wrong verdicts from a stale binary (a stash test rebuilt HEAD and the
+next sweep ran that binary) and from gates defaulting ON during
+"revert" tests. Both caught by re-running the matrix 3x stable before
+acting.
