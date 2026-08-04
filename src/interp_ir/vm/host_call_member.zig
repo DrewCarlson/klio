@@ -4103,8 +4103,7 @@ fn prepareFlatFromFid(self: *VmHost, allocator: Allocator, receiver: *const Valu
             std.debug.print("[invoke-method] {s}#{d} params={d} recv={s} FLAT\n", .{ f.fqn, target.int(), f.params.len, receiver.typeFqn() });
         }
     }
-    var list: std.ArrayList(Value) = .empty;
-    try list.ensureTotalCapacityPrecise(allocator, args.len + 1);
+    var list = try ir.eval.acquireArgsCap(allocator, args.len + 1);
     list.appendAssumeCapacity(receiver.*);
     list.appendSliceAssumeCapacity(args);
     if (trace.invariantsEnabled()) {
