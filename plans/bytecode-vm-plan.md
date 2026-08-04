@@ -177,3 +177,32 @@ BUILD PRIORITIES from these numbers, in order:
 Each lands gated + measured against this exact test; the 13.5s ->
 <10s target needs roughly a quarter of the per-call ceremony gone,
 and populations 1+2 alone cover well past that fraction of events.
+
+## Fusion landings (2026-08-04) — priorities 1-3 built and measured
+
+- P1 landed (c3b14684): `CallVirtual` slot dispatch and lowering-resolved
+  `CallMember` fuse into pushed activations (`prepareVirtualFlatCall` /
+  `prepareResolvedFlatCall`, gate `KLIO_FLAT_VCALL`). 1.81M of 1.81M slot
+  dispatches fuse on the compose probe; recursive user-body serves fell
+  1.97M -> 162K; wall 13.7s -> 12.9s. Two of the seven over-budget
+  snapshot tests flipped green (62/65 + 57/59).
+- P2 landed (70181c4e): `fastCallPlan` admits receiver-carrying bodies
+  (`FAST_CALL_EXT_FLAG`, call site seeds the enclosing receiver);
+  561K ext + 92K plain static fusions per run. Same commit fixed two
+  GetField site-memo defects: no-route claims no longer pin the site
+  (retry until a route exists) and a class-mismatched site serves from
+  the receiver's own (class, name) memo — 2.0M slow field-ladder walks
+  (the AbstractListIterator size/index reads) eliminated. Wall ~12.7s.
+- P3 landed (88a35107): CallMember instruction-site memo (class, argsig,
+  fid) replays 1.32M of 1.59M prepared serves without the string-keyed
+  probe. Measured NEUTRAL (12.8 vs 12.8 3-run A/B) — kept as strictly
+  less work and as the base for an intrinsic-route claim. Gate
+  `KLIO_MEMBER_SITE`.
+
+Corrected failure economics: `concurrentGlobalModifications_addAll` has
+its own `runTest(timeout = 30.seconds)` and completes in ~34s — the five
+remaining failures need ~15-30% more throughput, not multiples. The
+dominant remaining cost is the persistent-list iterator chain (contains
+-> iterator walk: ~2.5M element steps x 6 interpreted calls in the
+addAll variant) plus the name-based ladder's intrinsic tail
+(member_ladder 1.89M, served_intrinsic 3.2M).
