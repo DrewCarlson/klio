@@ -3731,6 +3731,15 @@ pub const Module = struct {
             {
                 return .incompatible;
             }
+            // A generic pair judges through the args-aware prover: the
+            // head-only tail proved `List<String>` against an instantiated
+            // `List<List<String>>` (`Box<List<String>>.put(xs: List<T>)`)
+            // and the wrong overload won. Heads still adjudicate first
+            // inside; absent-args grace and projections apply there.
+            if (ty.args.len != 0 or param.args.len != 0) {
+                sac_route = "generic-tail";
+                return self.staticGenericArgCompatibility(fid, ty, param, 0);
+            }
             sac_route = "recv-compat-tail";
             return self.staticReceiverCompatibility(fid, ty, param);
         }

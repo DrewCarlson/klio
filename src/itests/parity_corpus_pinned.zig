@@ -1602,6 +1602,14 @@ test "bound_args_lambda_replay" {
     );
 }
 
+test "member_overload_receiver_instantiation" {
+    try check("member_overload_receiver_instantiation",
+        \\one
+        \\list
+        \\
+    );
+}
+
 test "plus_element_inference" {
     try check("plus_element_inference",
         \\[[s], [a]]
