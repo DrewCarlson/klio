@@ -1336,10 +1336,24 @@ pub fn tryInlineCallWithTypeArgs(
     const member_splice = f.receiver_type == null and this_arg != null and
         inline_state.inlineMemberOwner(f) != null;
     const explicit_receiver = if ((f.receiver_type != null or member_splice) and
-        this_arg != null)
-        try lowerExpr(b, this_arg.?)
-    else
-        null;
+        this_arg != null) recv_blk: {
+        // The receiver is a NESTED expression: the caller's per-arg lambda
+        // typing stash (consumed by this splice's own arg loop below) must
+        // not leak into the receiver's lambdas — `ByteArray(2) { it }
+        // .scan("") { op }` typed the factory's `it` from scan's operation.
+        const sh_bm = b.pending_arg_broad_masks;
+        const sh_fg = b.pending_arg_fn_generic;
+        const sh_lp = b.pending_arg_lambda_param_types;
+        b.pending_arg_broad_masks = null;
+        b.pending_arg_fn_generic = null;
+        b.pending_arg_lambda_param_types = null;
+        defer {
+            b.pending_arg_broad_masks = sh_bm;
+            b.pending_arg_fn_generic = sh_fg;
+            b.pending_arg_lambda_param_types = sh_lp;
+        }
+        break :recv_blk try lowerExpr(b, this_arg.?);
+    } else null;
     try b.pushInlineDecl(fname, f);
     // The spliced extension's declared receiver is receiver EVIDENCE for
     // the body's own inline gates (`filterIsInstance<T>()` inside

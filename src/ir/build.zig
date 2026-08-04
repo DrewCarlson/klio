@@ -1750,6 +1750,14 @@ pub const FuncBuilder = struct {
     }
     /// Record a complete declared type. Takes ownership of `ty`.
     pub fn setLocalDeclTypeOwned(self: *FuncBuilder, name: []const u8, ty: TypeRef) Allocator.Error!void {
+        if (std.c.getenv("KLIO_VALTY_TRACE")) |w| {
+            if (std.mem.eql(u8, std.mem.span(w), name)) {
+                std.debug.print("[valty] WRITE {s} = {s}\n", .{ name, ty.name });
+                if (std.c.getenv("KLIO_VALTY_STACK") != null) {
+                    std.debug.dumpCurrentStackTrace(.{});
+                }
+            }
+        }
         var owned = ty;
         errdefer owned.deinit(self.allocator);
         if (try self.local_decl_types.fetchPut(name, owned)) |old| {

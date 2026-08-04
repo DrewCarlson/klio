@@ -5124,7 +5124,7 @@ pub const Module = struct {
         try self.method_dispatch.put(methodDispatchKey(runtime_class, slot), target);
     }
 
-    const TypeBinding = struct {
+    pub const TypeBinding = struct {
         name: []const u8,
         ty: TypeRef,
         /// The call site wrote this type argument out. Kotlin takes an
@@ -5152,6 +5152,12 @@ pub const Module = struct {
         for (bindings) |*binding| {
             if (std.mem.eql(u8, binding.name, name)) binding.ty = ty;
         }
+    }
+
+    /// Engine helper for external consumers: substitute `ty` through a
+    /// solved binding set (arena-scoped result).
+    pub fn substituteBoundType(allocator: Allocator, ty: TypeRef, bindings: []const TypeBinding) Allocator.Error!TypeRef {
+        return substituteType(allocator, ty, bindings);
     }
 
     fn substituteType(allocator: Allocator, ty: TypeRef, bindings: []const TypeBinding) Allocator.Error!TypeRef {

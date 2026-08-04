@@ -129,6 +129,22 @@ fn resolveSuperThisReg(b: *FuncBuilder) Allocator.Error!?Reg {
 /// Path in value position, which resolves to the companion object.
 /// Everything else defers to `lowerExpr`.
 pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
+    // A receiver is a NESTED expression: the enclosing call's per-arg
+    // typing stash must never reach the receiver's own lambdas —
+    // `ByteArray(2) { it.toByte() }.scan("") { op }` typed the factory's
+    // `it` from scan's operation through exactly this leak. Shield the
+    // stash for the whole receiver lowering.
+    const sh_bm = b.pending_arg_broad_masks;
+    const sh_fg = b.pending_arg_fn_generic;
+    const sh_lp = b.pending_arg_lambda_param_types;
+    b.pending_arg_broad_masks = null;
+    b.pending_arg_fn_generic = null;
+    b.pending_arg_lambda_param_types = null;
+    defer {
+        b.pending_arg_broad_masks = sh_bm;
+        b.pending_arg_fn_generic = sh_fg;
+        b.pending_arg_lambda_param_types = sh_lp;
+    }
     if (expr.* == .Path and expr.Path.segments.len == 1) {
         const segments = expr.Path.segments;
         const n = segments[0].name;
@@ -3955,6 +3971,7 @@ fn instantiatedLambdaValueParams(
     type_args: []const ast.TypeRef,
     include_function_receiver: bool,
     recv: ?*const ir.TypeRef,
+    shapes: ?[]const applicability.ArgShape,
 ) Allocator.Error!?[]ir.TypeRef {
     const arity = fnTypeArityAlias(b, fn_ty) orelse return null;
     if (arity < 0) return null;
@@ -3969,6 +3986,30 @@ fn instantiatedLambdaValueParams(
         dst.* = try loweredOwnedLocalTypeRef(b, src);
     }
     var instantiated = blk: {
+        // The ENGINE: solve every binding the call site offers — receiver,
+        // typed value arguments, explicit type args — in one pass and
+        // substitute the lambda's declared fn type through it. The bare-tp
+        // guard below refuses whatever stays unsubstituted.
+        engine: {
+            if (std.mem.eql(u8, runtime.getenvSlice("KLIO_ENGINE_LAMBDA") orelse "1", "0")) break :engine;
+            const sh = shapes orelse break :engine;
+            var scratch = std.heap.ArenaAllocator.init(b.allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const solved = (b.module.solveCallBindings(
+                a,
+                func.id,
+                func,
+                if (recv) |r| r.* else null,
+                null,
+                sh,
+                explicit,
+                false,
+            ) catch break :engine) orelse break :engine;
+            if (solved.bindings.len == 0) break :engine;
+            const substituted = ir.Module.substituteBoundType(a, fn_ty, solved.bindings) catch break :engine;
+            break :blk try substituted.clone(b.allocator);
+        }
         // With no explicit type args, the ACTUAL receiver may bind the
         // callee's params (`Iterable<String>.count` binds T := String).
         if (type_args.len == 0) {
@@ -4020,8 +4061,15 @@ fn instantiatedLambdaValueParams(
     // slice when any entry's head stayed unsubstituted.
     const callee_tps = b.module.registry.func_type_params.get(func.id);
     for (out, instantiated.args[start .. start + count]) |*dst, src| {
+        const h = typeHead(std.mem.trimEnd(u8, src.name, "?"));
+        // A star-erased head names nothing either — the engine's erasure
+        // marks an UNSOLVED parameter, which is a null answer here.
+        if (std.mem.eql(u8, h, "*")) {
+            for (out[0..initialized]) |*ty| ty.deinit(b.allocator);
+            b.allocator.free(out);
+            return null;
+        }
         if (callee_tps) |tps| {
-            const h = typeHead(std.mem.trimEnd(u8, src.name, "?"));
             for (tps.items) |tp| {
                 if (std.mem.eql(u8, tp, h)) {
                     for (out[0..initialized]) |*ty| ty.deinit(b.allocator);
@@ -4116,6 +4164,11 @@ fn argLambdaParamTypesRecv(
     }
     if (args.len == 0 or func.params.len < recv_offset) return null;
     for (args) |*arg| if (arg.* == .Spread) return null;
+    // One shape build per call: the engine consumes value-argument
+    // evidence alongside the receiver and explicit type args.
+    var lam_shape_set = try buildStaticReturnArgShapes(b, args, arg_names);
+    defer lam_shape_set.deinit(b.allocator);
+    const lam_shapes = lam_shape_set.shapes;
     const params = func.params[recv_offset..];
     const out = try b.allocator.alloc(?[]ir.TypeRef, args.len);
     for (out) |*slot| slot.* = null;
@@ -4139,6 +4192,7 @@ fn argLambdaParamTypesRecv(
                 type_args,
                 callable_ref,
                 recv,
+                lam_shapes,
             );
             any = any or slot.* != null;
         }
@@ -4163,6 +4217,7 @@ fn argLambdaParamTypesRecv(
                     type_args,
                     callable_ref,
                     recv,
+                    lam_shapes,
                 );
                 any = any or slot.* != null;
             }
