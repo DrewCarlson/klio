@@ -9394,6 +9394,49 @@ fn staticCallReturnTypeRef(
                 if (f.kind != .plain) break :blk_sole null;
                 break :blk_sole t;
             };
+            // When EVERY plain declaration of the name agrees on a concrete
+            // return head, the head is authoritative without picking a fid:
+            // `listOf(x)` beside `listOf(vararg)` both answer List, and the
+            // receiver context that blocks a confident pick cannot change
+            // what any pick would return. Args are kept only when every
+            // declaration's full return matches.
+            //
+            // MEASURED NET-NEGATIVE as a default (KLIO_AGREED_RET=1 to
+            // re-probe): -72 census sites, but two behavioral collaterals —
+            // SequenceTest.windowed's transform pipeline and the
+            // HexExtensions property-init lambda (its Char param bound Int)
+            // — both through downstream channels the new receiver typing
+            // armed. The conversions return when those channels are fixed.
+            const agreed_return: ?ir.TypeRef = blk_agree: {
+                if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_AGREED_RET") orelse "0", "1")) break :blk_agree null;
+                if (top_level_usable) break :blk_agree null;
+                if (enclosingHasMemberNamed(b, name.name)) break :blk_agree null;
+                // A name ANY class declares as a member may be a receiver
+                // member here (`iterator()` inside a Sequence extension is
+                // `this.iterator()`) — the agreed top-level return would
+                // type it from the wrong declarations entirely.
+                if (b.module.registry.class_member_names.contains(name.name)) break :blk_agree null;
+                const fids = b.module.funcsBySimpleName(name.name);
+                if (fids.len < 2) break :blk_agree null;
+                var seen: ?ir.TypeRef = null;
+                var args_agree = true;
+                for (fids) |fid2| {
+                    const f2 = b.module.funcById(fid2) orelse break :blk_agree null;
+                    if (f2.kind != .plain) continue;
+                    if (seen) |prev| {
+                        if (!std.mem.eql(u8, prev.name, f2.return_ty.name)) break :blk_agree null;
+                        if (prev.args.len != f2.return_ty.args.len) args_agree = false;
+                    } else seen = f2.return_ty;
+                }
+                var ret = seen orelse break :blk_agree null;
+                const h = typeHead(std.mem.trimEnd(u8, ret.name, "?"));
+                if (h.len == 0 or std.mem.eql(u8, h, "Unit") or
+                    (h.len <= 2 and std.ascii.isUpper(h[0])) or b.isTypeParam(h))
+                    break :blk_agree null;
+                if (staticTypeClassId(b, ret) == null) break :blk_agree null;
+                if (!args_agree) ret.args = &.{};
+                break :blk_agree ret;
+            };
             target = (if (top_level_usable) res.target else null) orelse blk: {
                 from_implicit_receiver = true;
                 // A BARE call in a receiver context is usually a member of the
@@ -9408,7 +9451,10 @@ fn staticCallReturnTypeRef(
                 // extension receivers and narrows.
                 const head_name = bareStaticRecvHead(b) orelse b.ownerClass() orelse {
                     if (bt) std.debug.print("[bareret] {s} no recv head\n", .{name.name});
-                    break :blk sole_global orelse return null;
+                    break :blk sole_global orelse {
+                        if (agreed_return) |ar| return try ar.clone(b.allocator);
+                        return null;
+                    };
                 };
                 const recv_ref = if (b.spliceHintActive())
                     // The window's ACTUAL receiver type wins over the
@@ -9473,7 +9519,10 @@ fn staticCallReturnTypeRef(
                         break :blk t;
                     }
                     if (bt) std.debug.print("[bareret] {s} no owner for {s}\n", .{ name.name, ident });
-                    break :blk sole_global orelse return null;
+                    break :blk sole_global orelse {
+                        if (agreed_return) |ar| return try ar.clone(b.allocator);
+                        return null;
+                    };
                 };
                 // The lexical owner makes PRIVATE members visible to their
                 // own class's bodies (`findClause` inside trySelectInternal).
@@ -9585,7 +9634,10 @@ fn staticCallReturnTypeRef(
                         outer_recv.deinit(b.allocator);
                     }
                 }
-                break :blk sole_global orelse return null;
+                break :blk sole_global orelse {
+                        if (agreed_return) |ar| return try ar.clone(b.allocator);
+                        return null;
+                    };
             };
             // A plain lambda that captures its lexical class receiver makes
             // bare-call emission conservative, but an unknown receiver lambda

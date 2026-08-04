@@ -3851,7 +3851,17 @@ pub const Module = struct {
             }
         };
         var result: StaticCompatibility = .compatible;
-        for (args, params[0..args.len]) |arg, param| {
+        // A trailing lambda maps to the LAST parameter across defaulted
+        // middles, exactly as the extension ranker and arity mapping do.
+        const trailing_lambda_arg = args.len != 0 and
+            (args[args.len - 1].is_lambda or args[args.len - 1].lambda_arity != null or
+                args[args.len - 1].func_typed);
+        for (args, 0..) |arg, ai| {
+            const param = if (trailing_lambda_arg and ai + 1 == args.len and
+                args.len <= params.len)
+                params[params.len - 1]
+            else
+                params[ai];
             const instantiated_param = if (bindings.items.len == 0)
                 param.ty
             else
@@ -4484,7 +4494,20 @@ pub const Module = struct {
                 // conservative until it models repeated vararg element slots.
                 compatibility = .unknown;
             } else {
-                for (args, f.params[1 .. 1 + args.len]) |arg, param| {
+                // A trailing lambda fills the LAST parameter even when
+                // defaulted parameters are omitted between (`windowed(2, 3)
+                // { transform }` maps the lambda past `partialWindows`);
+                // judging it positionally refuted the overload kotlinc binds.
+                const trailing_lambda_arg = args.len != 0 and
+                    (args[args.len - 1].is_lambda or args[args.len - 1].lambda_arity != null or
+                        args[args.len - 1].func_typed);
+                for (args, 0..) |arg, ai| {
+                    const pi = if (trailing_lambda_arg and ai + 1 == args.len and
+                        1 + args.len <= f.params.len)
+                        f.params.len - 1
+                    else
+                        1 + ai;
+                    const param = f.params[pi];
                     // The RECEIVER's instantiation constrains the callee's
                     // own type parameters before any argument is judged:
                     // `plus(elements: Iterable<T>)` on a `List<List<String>>`
