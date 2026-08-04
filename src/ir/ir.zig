@@ -5638,6 +5638,34 @@ pub const Module = struct {
         return try substituted.clone(allocator);
     }
 
+    /// `instantiatedTypeFromReceiver` without the completeness requirement:
+    /// substitute the parameters the receiver DOES bind and leave the rest
+    /// as written. For a `minOfWith(comparator) { selector }` the receiver
+    /// binds `T` but not the return-only `R`; the lambda-param consumer
+    /// needs the value-param portion (`T`), and its own guard refuses any
+    /// entry whose head stayed a bare parameter.
+    pub fn instantiatedTypeFromReceiverPartial(
+        self: *const Module,
+        allocator: Allocator,
+        fid: FuncId,
+        ty: TypeRef,
+        receiver: TypeRef,
+    ) Allocator.Error!?TypeRef {
+        const f = self.funcById(fid) orelse return null;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) return null;
+        const tp_list = self.registry.func_type_params.get(fid);
+        const tps: []const []const u8 = if (tp_list) |list| list.items else &.{};
+        if (tps.len == 0) return null;
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var bindings: std.ArrayList(TypeBinding) = .empty;
+        if (!try self.bindCallType(a, f.params[0].ty, receiver, tps, &bindings, 0)) return null;
+        if (bindings.items.len == 0) return null;
+        const substituted = try substituteType(a, ty, bindings.items);
+        return try substituted.clone(allocator);
+    }
+
     /// Instantiate an arbitrary type owned by a resolved declaration from
     /// explicit call-site type arguments. Returns null while any declaration
     /// type parameter used by `ty` remains unbound.

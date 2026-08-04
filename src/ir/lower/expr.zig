@@ -3953,7 +3953,11 @@ fn instantiatedLambdaValueParams(
         // callee's params (`Iterable<String>.count` binds T := String).
         if (type_args.len == 0) {
             if (recv) |r| {
-                if (try b.module.instantiatedTypeFromReceiver(
+                // Partial substitution: a return-only parameter (`R` in
+                // `minOfWith`'s selector) must not block binding the ones
+                // the receiver proves; the bare-tp guard below refuses any
+                // entry that stayed unsubstituted.
+                if (try b.module.instantiatedTypeFromReceiverPartial(
                     b.allocator,
                     func.id,
                     fn_ty,
