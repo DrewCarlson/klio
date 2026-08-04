@@ -9480,10 +9480,13 @@ fn staticCallReturnTypeRef(
                         .receiver_type = bare_recv,
                     },
                 );
-                if (bt) std.debug.print("[bareret] {s} on {s} target={s}\n", .{
+                if (bt) std.debug.print("[bareret] {s} on {s} target={s} owner_fqn={s} applicable={} stub={}\n", .{
                     name.name,
                     ident,
                     if (bare_resolved.target != null) "yes" else "no",
+                    b.module.classFqnById(owner) orelse "-",
+                    bare_resolved.applicable,
+                    if (owner.int() < b.module.classes.items.len) b.module.classes.items[owner.int()].is_stub else false,
                 });
                 if (bare_resolved.target) |member_target| break :blk member_target;
                 // No member serves it, and none is even applicable: a bare

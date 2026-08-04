@@ -4866,6 +4866,28 @@ pub const Module = struct {
                 if (!family) if (self.decl_sigs.get(existing.int())) |es| if (es.enclosing_class) |eo| {
                     if (self.overridesSlot(sa, eo, existing, fid) catch false) family = true;
                 };
+                if (!family) {
+                    // DIAMOND family: neither declaration overrides the
+                    // other, but both override one slot the RESOLUTION
+                    // owner inherits (`AbstractMutableCollection` sees
+                    // `iterator` from both `AbstractCollection` and
+                    // `MutableCollection`). Kotlin merges these into one
+                    // intersection slot; keep the declaration with the
+                    // more specific return type.
+                    const cand_o = self.overridesSlot(sa, owner, fid, existing) catch false;
+                    const exist_o = self.overridesSlot(sa, owner, existing, fid) catch false;
+                    if (cand_o or exist_o) {
+                        family = true;
+                        const cf = self.funcById(fid);
+                        const ef = self.funcById(existing);
+                        if (cf != null and ef != null and
+                            self.staticReceiverCompatibility(null, cf.?.return_ty, ef.?.return_ty) == .compatible and
+                            self.staticReceiverCompatibility(null, ef.?.return_ty, cf.?.return_ty) != .compatible)
+                        {
+                            best = fid;
+                        }
+                    }
+                }
                 if (!family) tied = true;
             }
         }
