@@ -8901,7 +8901,13 @@ fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.
     // A local or a function of the same name is not a constructor call.
     if (b.resolve(ident.name) != null or b.knowsOuter(ident.name)) return null;
     if (b.module.funcId(ident.name) != null) return null;
-    const cid = b.module.classIdIndexed(ident.name, b.self_package, ident.span.file) orelse return null;
+    // A collision-mangled internal class (`SlotTable$fN`) is absent from the
+    // simple-name index. A same-file/package reference reaches it through
+    // the scope rename ladder; a cross-package one through its exact import,
+    // which still resolves by FQN.
+    const ref_name = scopeTypeRename(b, ident.name, ident.span.file.int()) orelse ident.name;
+    const cid = b.module.classIdIndexed(ref_name, b.self_package, ident.span.file) orelse
+        b.module.classIdExactImport(ident.name, ident.span.file) orelse return null;
     // A MEMBER of the enclosing receiver shadows the constructor, exactly as
     // the emission router decides it (`fun Foo(): Bar` inside Host makes a
     // bare `Foo()` the member call). Typing the local as the class here bound
