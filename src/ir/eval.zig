@@ -389,6 +389,28 @@ inline fn regsAlloc(fallback: Allocator) Allocator {
     return fallback;
 }
 
+/// VM-plan P2: whether every instruction of `f` sits in the flattened
+/// engine's simple subset (register moves, consts, arithmetic, branches,
+/// returns, EXACT calls) with no catch/finally machinery. Coverage
+/// measurement first, engine second.
+fn classifyFlattenable(f: *const Func) u8 {
+    for (f.blocks) |*blk| {
+        if (blk.catches.len != 0 or blk.finally != null) return 2;
+        for (blk.insts) |*inst| {
+            switch (inst.*) {
+                .Move, .Const, .BinOp, .UnOp, .Not, .Trace, .LoadParam => {},
+                .Call => |c| if (!c.exact) return 2,
+                else => return 2,
+            }
+        }
+        switch (blk.terminator) {
+            .Goto, .Branch, .Return => {},
+            else => return 2,
+        }
+    }
+    return 1;
+}
+
 fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value) {
     const ra = regsAlloc(allocator);
     if (ev.regs_pool.items.len > 0) {
@@ -878,6 +900,10 @@ pub const DispatchKind = enum(u8) {
     /// contiguous stack and P2's call fusion drive this denominator down
     /// per call; the compose margin is the external gauge.
     frame_push,
+    /// VM-plan P2 coverage: frames whose Func the flattened engine's
+    /// simple-inst subset can execute end to end. The ratio to
+    /// `frame_push` is the engine's reachable share BEFORE it is built.
+    frame_push_flattenable,
 };
 const DISPATCH_KINDS = @typeInfo(DispatchKind).@"enum".fields.len;
 var dispatch_counts: [DISPATCH_KINDS]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
@@ -2449,6 +2475,12 @@ const Frame = struct {
         if (plan & 2 != 0) coerceIntArgsToLong(func, params.items);
         if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, params.items);
         dispatchBump(.frame_push);
+        if (dispatch_stats_state == 2) {
+            if (func.flat_class == 0) {
+                @constCast(func).flat_class = classifyFlattenable(func);
+            }
+            if (func.flat_class == 1) dispatchBump(.frame_push_flattenable);
+        }
         if (runtime.getenvSlice("KLIO_TRACE_PATH") != null) {
             for (params.items, 0..) |*pv, pi| {
                 const payload: i64 = switch (pv.*) {

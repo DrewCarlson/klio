@@ -1055,6 +1055,11 @@ pub const Func = struct {
     /// with a type-variable-typed one (generic Int/Long peer widening).
     /// Filled in place under the same benign-race convention as `fast_call`.
     coerce_plan: u8 = 0,
+    /// VM-plan P2 classification: 0 unknown, 1 flattenable (every
+    /// instruction in the simple subset, no catches/finally), 2 not.
+    /// Filled lazily under the same benign-race convention as
+    /// `coerce_plan`.
+    flat_class: u8 = 0,
     /// Index of `"this"` in `capture_order`, cached on first use by
     /// `callerThisValue` (hot: every GetField in a lambda frame consults
     /// it). `-2` = not yet computed, `-1` = no `this` capture.
