@@ -5431,26 +5431,27 @@ pub const Module = struct {
     /// THEMSELVES instead of erasing to `*`: `val data = createFrom(...)`
     /// inside `IterableTests<T : Iterable<String>>` types `data: T`, which
     /// the bound-ref channel then resolves.
-    pub fn instantiatedCallReturnTypeScoped(
+    /// The substitution engine's CORE: solve every callee type-parameter
+    /// binding one call site offers — explicit type args, the owner
+    /// projection, the receiver, named and positional/vararg arguments,
+    /// and the star erasure for what stays open. Consumers substitute
+    /// whatever slot they need against the result. Arena-scoped: the
+    /// bindings borrow `a` and the module.
+    pub const SolvedBindings = struct {
+        bindings: []TypeBinding,
+        type_params: []const []const u8,
+    };
+    pub fn solveCallBindings(
         self: *const Module,
-        allocator: Allocator,
+        a: Allocator,
         fid: FuncId,
+        f: *const Func,
         receiver: ?TypeRef,
         dispatch_receiver: ?TypeRef,
         args: []const applicability.ArgShape,
         explicit_type_args: []const TypeRef,
         owner_params_in_scope: bool,
-    ) Allocator.Error!?TypeRef {
-        const f = self.funcById(fid) orelse return null;
-        // An unannotated source function currently carries Unit as its
-        // lowering placeholder. Do not present that placeholder as static
-        // receiver evidence.
-        if (std.mem.eql(u8, staticTypeHead(f.return_ty.name), "Unit")) return null;
-
-        var scratch = std.heap.ArenaAllocator.init(allocator);
-        defer scratch.deinit();
-        const a = scratch.allocator();
-
+    ) Allocator.Error!?SolvedBindings {
         const type_params_list = self.registry.func_type_params.get(fid);
         const function_type_params: []const []const u8 = if (type_params_list) |list|
             list.items
@@ -5702,11 +5703,46 @@ pub const Module = struct {
                 });
             }
         }
-        if (!returnTypeBindingsComplete(f.return_ty, type_params, bindings.items)) {
+        return .{ .bindings = bindings.items, .type_params = type_params };
+    }
+
+    pub fn instantiatedCallReturnTypeScoped(
+        self: *const Module,
+        allocator: Allocator,
+        fid: FuncId,
+        receiver: ?TypeRef,
+        dispatch_receiver: ?TypeRef,
+        args: []const applicability.ArgShape,
+        explicit_type_args: []const TypeRef,
+        owner_params_in_scope: bool,
+    ) Allocator.Error!?TypeRef {
+        const f = self.funcById(fid) orelse return null;
+        // An unannotated source function currently carries Unit as its
+        // lowering placeholder. Do not present that placeholder as static
+        // receiver evidence.
+        if (std.mem.eql(u8, staticTypeHead(f.return_ty.name), "Unit")) return null;
+
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+
+        const solved = (try self.solveCallBindings(
+            a,
+            fid,
+            f,
+            receiver,
+            dispatch_receiver,
+            args,
+            explicit_type_args,
+            owner_params_in_scope,
+        )) orelse return null;
+        const bindings_items = solved.bindings;
+        const type_params = solved.type_params;
+        if (!returnTypeBindingsComplete(f.return_ty, type_params, bindings_items)) {
             if (std.c.getenv("KLIO_ICRT") != null) std.debug.print("[icrt] {s}: bindings incomplete\n", .{f.fqn});
             return null;
         }
-        const substituted = try substituteType(a, f.return_ty, bindings.items);
+        const substituted = try substituteType(a, f.return_ty, bindings_items);
         // A return erased to a bare `*` head names nothing a caller can bind
         // against; it would only pollute the local's declared-type record.
         if (std.mem.eql(u8, staticTypeHead(substituted.name), "*")) {
