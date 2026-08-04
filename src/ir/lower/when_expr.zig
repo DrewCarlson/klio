@@ -207,10 +207,18 @@ pub fn lowerWhenWithSubjectReg(
             .f = next_blk,
         } });
         b.switchTo(body_blk);
+        // A subjectless branch narrows by EVERY proof its condition
+        // establishes, `&&`-chains included (`v1 is ByteArray && v2 is
+        // ByteArray -> v1 contentEquals v2` smart-casts both), plus the
+        // truthy null-checks — the same collection an `if` guard applies.
+        var cond_narrowed: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+        defer cond_narrowed.deinit(b.allocator);
         const narrowed = if (subject != null)
             try narrowSubjectForBranch(b, subject, &branch)
-        else
-            try narrowConditionForBranch(b, &branch);
+        else blk: {
+            try narrowConditionForBranchAll(b, &branch, &cond_narrowed);
+            break :blk null;
+        };
         // `when (this) { is T -> ... }` smart-casts the implicit receiver:
         // the branch body's calls resolve extensions against T (kotlinc
         // resolves statically, so `is List -> this.single()` must select
@@ -227,6 +235,8 @@ pub fn lowerWhenWithSubjectReg(
         const v = try lowerExpr(b, &branch.body);
         if (narrowed_this) |prev| _ = b.setThisNarrow(prev);
         if (narrowed) |n| b.restoreLocal(n);
+        var cn = cond_narrowed.items.len;
+        while (cn > 0) : (cn -= 1) b.restoreLocal(cond_narrowed.items[cn - 1]);
         try b.push(.{ .Move = .{ .dst = result, .src = v } });
         b.terminate(.{ .Goto = join });
         b.switchTo(next_blk);
@@ -238,16 +248,20 @@ pub fn lowerWhenWithSubjectReg(
     return result;
 }
 
-/// A subjectless `when` branch whose sole condition is an `is` check carries
-/// the same smart-cast evidence as an `if` condition.
-fn narrowConditionForBranch(
+/// A subjectless `when` branch's condition carries the same smart-cast
+/// evidence as an `if` condition: every `is` check in its `&&` chain and
+/// every truthy null-check narrows for the branch body. Applied in source
+/// order; the caller restores in reverse.
+fn narrowConditionForBranchAll(
     b: *FuncBuilder,
     branch: *const ast.WhenBranch,
-) Allocator.Error!?build.FuncBuilder.NarrowedLocal {
-    if (branch.patterns.len != 1) return null;
+    out: *std.ArrayList(build.FuncBuilder.NarrowedLocal),
+) Allocator.Error!void {
+    if (branch.patterns.len != 1) return;
     const p = &branch.patterns[0];
-    if (p.kind != .Value) return null;
-    return expr_lower.narrowIsCheck(b, &p.kind.Value);
+    if (p.kind != .Value) return;
+    try expr_lower.narrowIsCheckAll(b, &p.kind.Value, out);
+    try expr_lower.narrowNullCheckAll(b, &p.kind.Value, true, out);
 }
 
 /// A single `is T` pattern over a bare-name subject smart-casts that name to
