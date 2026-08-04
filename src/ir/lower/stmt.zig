@@ -597,6 +597,15 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         b.module.pending_lambda_self_fn = .{ .name = f.name.name, .mangled = mangled_name };
         // Non-callable-local evidence flows into the body.
         b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
+        // Vararg param names: the body registers those as the materialized
+        // array head rather than the annotated element type.
+        var vararg_names: std.ArrayList([]const u8) = .empty;
+        defer vararg_names.deinit(b.allocator);
+        for (f.params) |p| {
+            if (p.is_vararg) try vararg_names.append(b.allocator, p.name.name);
+        }
+        b.module.pending_lambda_vararg_params = if (vararg_names.items.len != 0) vararg_names.items else null;
+        defer b.module.pending_lambda_vararg_params = null;
         // A bare `return` in an argument lambda nested in THIS local fn
         // returns from the local fn, not from the enclosing real function.
         // Push the local fn's name so such returns stamp it as their label,

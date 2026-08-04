@@ -46,10 +46,6 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "src/kotlin/collections/AbstractList.kt",
     "src/kotlin/collections/AbstractMap.kt",
     "src/kotlin/collections/AbstractSet.kt",
-    "native-wasm/src/kotlin/collections/AbstractMutableCollection.kt",
-    "native-wasm/src/kotlin/collections/AbstractMutableList.kt",
-    "native-wasm/src/kotlin/collections/AbstractMutableSet.kt",
-    "native-wasm/src/kotlin/collections/AbstractMutableMap.kt",
     "src/kotlin/collections/Collections.kt",
     "src/kotlin/collections/Iterables.kt",
     "src/kotlin/collections/Maps.kt",
@@ -234,6 +230,10 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-coroutines/Actuals.kt",
     "kotlin-coroutines/Intrinsics.kt",
     "kotlin-collections/CollectionsActuals.kt",
+    "kotlin-collections/AbstractMutableCollection.kt",
+    "kotlin-collections/AbstractMutableList.kt",
+    "kotlin-collections/AbstractMutableSet.kt",
+    "kotlin-collections/AbstractMutableMap.kt",
     "kotlin-collections/SequencesActuals.kt",
     "kotlin-comparisons/ComparisonsActuals.kt",
     "kotlin-io/Closeable.kt",
@@ -248,6 +248,7 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-text/TextActuals.kt",
     "kotlin-collections/MapActuals.kt",
     "kotlin-uuid/UuidActuals.kt",
+    "kotlin-reflect/ReflectActuals.kt",
 };
 
 /// The local upstream Kotlin checkout's `libraries/stdlib` directory, relative

@@ -1557,6 +1557,12 @@ pub const Module = struct {
     /// value (`var key = 0` beside the `key(...) {}` composable). Owned by the
     /// receiving builder once consumed. Not serialized.
     pending_lambda_nonfn_locals: ?std.StringHashMap(void) = null,
+    /// Names of the local `fun`'s vararg parameters for the body about to
+    /// lower: inside the body such a parameter's static type is the
+    /// MATERIALIZED array, never the element the annotation names, so the
+    /// declared-annotation registration must not record the element head.
+    /// Borrowed from the caller's AST for the lowering call's duration.
+    pending_lambda_vararg_params: ?[]const []const u8 = null,
     /// Declared type heads of enclosing locals captured by the lambda body
     /// about to lower. The runtime capture carries the value; this parallel
     /// lowering-only carrier preserves the compile-time type Kotlin inferred

@@ -1401,9 +1401,10 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 return errRes(.{ .Type = msg });
             }
             // A companion extension's getter `this` is the class's
-            // companion instance; route the class value to it.
+            // companion instance; route the class value to it. A KClass/Any
+            // keyed extension keeps the class value itself.
             var getter_recv = receiver.*;
-            if (receiver.* == .Class) {
+            if (receiver.* == .Class and try classExtPropUsesCompanion(self, allocator, recv_simple, name)) {
                 if (try companionInstanceForClass(self, recv_simple)) |comp| getter_recv = comp;
             }
             // A member-extension property's getter body has its declaring
@@ -2309,6 +2310,18 @@ fn resolveExtensionProp(
     return resolveExtensionPropImpl(self, allocator, receiver, recv_simple, name, false);
 }
 
+/// Whether a class-value receiver's resolved extension property was
+/// registered under the COMPANION key (`X.Companion`). Only that registration
+/// runs its getter with the companion instance as `this`; a `KClass`/`Any`
+/// keyed extension keeps the class value itself.
+fn classExtPropUsesCompanion(self: *VmHost, allocator: Allocator, recv_simple: []const u8, name: []const u8) Allocator.Error!bool {
+    const comp_key = try std.fmt.allocPrint(allocator, "{s}.Companion", .{recv_simple});
+    defer allocator.free(comp_key);
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    return lookupPairFunc(pg.get().extension_props, comp_key, name) != null;
+}
+
 /// Resolve and evaluate a (member-)extension property getter for `receiver`,
 /// or a delegated extension property. Mirrors the extension arm of the field
 /// ladder (`resolveExtensionProp` + owner-`this` seeding) but is entered
@@ -2328,9 +2341,10 @@ fn extensionPropRead(self: *VmHost, allocator: Allocator, receiver: *const Value
         const mptr: *const Module = self.module.asPtr();
         if (fid.int() >= mptr.funcCount()) return null;
         // A companion extension's getter `this` is the class's companion
-        // instance; route the class value to it.
+        // instance; route the class value to it. A KClass/Any keyed
+        // extension keeps the class value itself.
         var getter_recv = receiver.*;
-        if (receiver.* == .Class) {
+        if (receiver.* == .Class and try classExtPropUsesCompanion(self, allocator, recv_simple, name)) {
             if (try companionInstanceForClass(self, recv_simple)) |comp| getter_recv = comp;
         }
         // A member-extension property's getter body has its declaring class's
@@ -2583,6 +2597,11 @@ fn resolveExtensionPropImpl(
         const pg = self.prog.borrow();
         defer pg.deinit();
         if (lookupPairFunc(Pick.map(pg.get().*), comp_key, name)) |fid| return fid;
+        // A class value IS a `KClass`: a `val KClass<*>.x` extension applies
+        // to it directly (`qualifiedOrSimpleName` behind `KClass.cast`'s
+        // error message). The getter runs with the class value as `this`,
+        // never the companion.
+        if (lookupPairFunc(Pick.map(pg.get().*), "KClass", name)) |fid| return fid;
         if (lookupPairFunc(Pick.map(pg.get().*), "Any", name)) |fid| return fid;
         return null;
     }
