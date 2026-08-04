@@ -10933,6 +10933,20 @@ fn lowerPathCall(
             });
         }
     }
+    // A TYPE-DISPATCHED overload set the index deferred to runtime must
+    // reach an emit form whose runtime tail re-ranks by value types.
+    // Falling through to the bare-name value read handed the call to the
+    // global lookup's first-wins pick — the deprecated 9-param
+    // ActualParagraph sibling ran with a TextOverflow in its Boolean
+    // `ellipsis` slot.
+    if (res_final.target == null and !shadowed_by_class and
+        indexDeferReason(index_res) == .type_overload)
+    {
+        if (index_res.first) |first_cand| {
+            orEmitAudit(b, "type_overload_deferred", "CallMemberOrGlobal", name0);
+            return try emitMemberOrGlobal(b, expr, first_cand, false);
+        }
+    }
     if (res_final.target) |target| {
         if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
             if (std.mem.eql(u8, w, name0)) {
