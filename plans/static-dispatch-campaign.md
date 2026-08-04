@@ -2253,3 +2253,21 @@ and the inline this_arg lowering, with the WRITE-side valty trace
 640 -> 623 (6.71%), bound 91.4%. Session arc: 1,172 -> 623,
 85.3% -> 91.4%. Engine step four (the splice window onto
 solveCallBindings) remains, then the VM leg.
+
+## Addendum 47 — engine step four lands; the engine is BUILT (2026-08-04)
+
+All four engine steps are landed: (1) the receiver-instantiation
+twins unified; (2) solveCallBindings extracted as the one core —
+explicit args + owner projection + receiver + named/positional/
+vararg args + star erasure; (3) the lambda-param channels consume it
+(arg evidence reaches closure typing); (4) the splice window
+registers its solved fn-tp bindings as bound refs for every
+in-window consumer. no_receiver 623 -> 611 (6.58%), bound 91.6%.
+Session arc: 1,172 -> 611, 85.3% -> 91.6% — with SEVEN kotlinc-parity
+wrong answers fixed and pinned along the way.
+
+The residual 611 is the flat tail (scattered singles, the
+genuinely-dynamic locals, fn-typed-param returns) plus what rides
+declined ties and the unsigned route. The remaining structural leg is
+ONE: the bytecode VM — the compose set (double-measured VM-bound)
+and the dynamic floor.
