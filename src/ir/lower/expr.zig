@@ -8502,6 +8502,25 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     // properties through the getter contract and its supertype walk.
     if (arg.* == .Member and !arg.Member.safe) {
         const m = arg.Member;
+        // A CLASS-named receiver reads the companion's property
+        // (`Byte.MAX_VALUE.toLong()`): consult the companion's lifted key
+        // and the class's own record.
+        if (m.receiver.* == .Path and m.receiver.Path.segments.len == 1) {
+            const on = m.receiver.Path.segments[0].name;
+            if (on.len != 0 and std.ascii.isUpper(on[0]) and
+                b.resolve(on) == null and b.module.classId(on) != null)
+            {
+                var cb2: [96]u8 = undefined;
+                if (std.fmt.bufPrint(&cb2, "{s}$Companion", .{on}) catch null) |ck2| {
+                    if (b.module.registry.class_prop_type_heads.get(.{ .a = ck2, .b = m.name.name })) |head| {
+                        return .{ .name = head, .nullable = false, .args = &.{} };
+                    }
+                }
+                if (b.module.registry.class_prop_type_heads.get(.{ .a = on, .b = m.name.name })) |head| {
+                    return .{ .name = head, .nullable = false, .args = &.{} };
+                }
+            }
+        }
         if (argDeclTypeRefLazy(b, m.receiver)) |rt| {
             var h = std.mem.trimEnd(u8, rt.name, "?");
             if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
@@ -8608,6 +8627,15 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         {
             if (b.module.registry.class_prop_type_heads.get(.{ .a = owner, .b = p.segments[1].name })) |head| {
                 return .{ .name = head, .nullable = false, .args = &.{} };
+            }
+            // A class-named access reads the COMPANION's property
+            // (`Byte.MAX_VALUE.toLong()`): the head is recorded under the
+            // companion's lifted name.
+            var cb: [96]u8 = undefined;
+            if (std.fmt.bufPrint(&cb, "{s}$Companion", .{owner}) catch null) |ck| {
+                if (b.module.registry.class_prop_type_heads.get(.{ .a = ck, .b = p.segments[1].name })) |head| {
+                    return .{ .name = head, .nullable = false, .args = &.{} };
+                }
             }
         }
         return null;
