@@ -14248,7 +14248,23 @@ fn lowerResolvedMemberCall(
         if (!norecvCensusOn()) return .none;
         lm_norecv[@intFromEnum(std.meta.activeTag(receiver.*))] += 1;
         lm_norecv_eager[if (b.module.eagerTypeOf(receiver.span()) != null) 0 else 1] += 1;
-        if (receiver.* == .Call) lm_norecv_call[@intFromEnum(classifyCallReturn(b, receiver))] += 1;
+        if (receiver.* == .Call) {
+            lm_norecv_call[@intFromEnum(classifyCallReturn(b, receiver))] += 1;
+            if (runtime.getenvSlice("KLIO_NORECV_NAMES") != null) {
+                const callee = receiver.Call.callee;
+                const cn = switch (callee.*) {
+                    .Path => |cp| if (cp.segments.len != 0) cp.segments[cp.segments.len - 1].name else "?",
+                    .Member => |cm2| cm2.name.name,
+                    else => @tagName(std.meta.activeTag(callee.*)),
+                };
+                std.debug.print("[no-recv-callrecv] callee={s} kind={s} call={s} fn={s}\n", .{
+                    cn,
+                    @tagName(std.meta.activeTag(callee.*)),
+                    name.name,
+                    build.currentRealFn() orelse "-",
+                });
+            }
+        }
         if (receiver.* == .Member) {
             if (runtime.getenvSlice("KLIO_NORECV_NAMES") != null) {
                 std.debug.print("[no-recv-member] .{s} call={s} fn={s}\n", .{
