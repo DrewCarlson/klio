@@ -5724,12 +5724,21 @@ pub const Module = struct {
     /// stays incomplete — the caller keeps its explicit-args answer.
     /// `Iterable<T>.count(predicate: (T) -> Boolean)` on an
     /// `Iterable<String>` receiver instantiates `(String) -> Boolean`.
-    pub fn instantiatedTypeFromReceiver(
+    /// The substitution engine's receiver leg, shared by both entry
+    /// points: solve the callee's type parameters from the ACTUAL
+    /// receiver against the declared one, substitute into `ty`.
+    /// `require_complete` demands every parameter `ty` mentions be
+    /// bound (the return-type contract); without it the parameters the
+    /// receiver proves substitute and the rest stay as written (the
+    /// lambda-param contract — its consumer refuses leftover bare
+    /// heads itself).
+    fn instantiatedTypeFromReceiverImpl(
         self: *const Module,
         allocator: Allocator,
         fid: FuncId,
         ty: TypeRef,
         receiver: TypeRef,
+        require_complete: bool,
     ) Allocator.Error!?TypeRef {
         const f = self.funcById(fid) orelse return null;
         if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) return null;
@@ -5742,9 +5751,19 @@ pub const Module = struct {
         var bindings: std.ArrayList(TypeBinding) = .empty;
         if (!try self.bindCallType(a, f.params[0].ty, receiver, tps, &bindings, 0)) return null;
         if (bindings.items.len == 0) return null;
-        if (!returnTypeBindingsComplete(ty, tps, bindings.items)) return null;
+        if (require_complete and !returnTypeBindingsComplete(ty, tps, bindings.items)) return null;
         const substituted = try substituteType(a, ty, bindings.items);
         return try substituted.clone(allocator);
+    }
+
+    pub fn instantiatedTypeFromReceiver(
+        self: *const Module,
+        allocator: Allocator,
+        fid: FuncId,
+        ty: TypeRef,
+        receiver: TypeRef,
+    ) Allocator.Error!?TypeRef {
+        return self.instantiatedTypeFromReceiverImpl(allocator, fid, ty, receiver, true);
     }
 
     /// `instantiatedTypeFromReceiver` without the completeness requirement:
@@ -5760,19 +5779,7 @@ pub const Module = struct {
         ty: TypeRef,
         receiver: TypeRef,
     ) Allocator.Error!?TypeRef {
-        const f = self.funcById(fid) orelse return null;
-        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) return null;
-        const tp_list = self.registry.func_type_params.get(fid);
-        const tps: []const []const u8 = if (tp_list) |list| list.items else &.{};
-        if (tps.len == 0) return null;
-        var scratch = std.heap.ArenaAllocator.init(allocator);
-        defer scratch.deinit();
-        const a = scratch.allocator();
-        var bindings: std.ArrayList(TypeBinding) = .empty;
-        if (!try self.bindCallType(a, f.params[0].ty, receiver, tps, &bindings, 0)) return null;
-        if (bindings.items.len == 0) return null;
-        const substituted = try substituteType(a, ty, bindings.items);
-        return try substituted.clone(allocator);
+        return self.instantiatedTypeFromReceiverImpl(allocator, fid, ty, receiver, false);
     }
 
     /// Instantiate an arbitrary type owned by a resolved declaration from
