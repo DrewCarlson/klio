@@ -1850,3 +1850,28 @@ Residual no_receiver 1,062 by name: it 75 (nonEmptyLength local-ext
 toString 2, long tail), list 69 + destination 33 (substitution
 engine), v1 26, iterator 24, value 19, result 16, index 16. The
 substitution-engine families are now the largest coherent mass.
+
+## Addendum 25 — tp-param arguments and the receiver-bound judgment (2026-08-04)
+
+1ec9065c. The groupBy `list`/`destination` mass fell WITHOUT the full
+substitution engine: recording the ARGUMENT's static type for a
+tp-declared inline param (`destination: M`) was the missing link —
+no_receiver dropped under 1,000 for the first time (1,062 -> 963 at
+first landing, 975 after the soundness give-back).
+
+The landing exposed a REAL kotlinc-parity wrong answer, latent and
+reachable with plain declared types: `listOfLists.plus(elementList)`
+flattened (picked the Iterable overload) because the arg judgment
+treated the callee's own T as unconstrained while the receiver had
+bound it. Two fixes: the extension ranker substitutes the receiver's
+instantiation into every parameter before judging (the first concrete
+P2-unification step — instantiatedTypeFromReceiverPartial is now the
+shared substitution primitive), and bare-call emission inside splices
+prefers the window's ACTUAL receiver record (tp NAMES capture across
+nested same-named callees otherwise). Pin plus_element_inference
+covers all three routes.
+
+declined 87 -> 97: each new declines is a site whose old commit was
+the FALSE proof — honesty, not regression (the wrong-answer-fix
+precedent). Census standing: 975 / 78 / 4 / 97 on 9,578 (88.0%
+bound). Battery green everywhere at every landing.
