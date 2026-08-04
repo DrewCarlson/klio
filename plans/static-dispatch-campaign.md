@@ -2241,3 +2241,15 @@ first consumer. Neutrality verified end to end. Step three migrates
 instantiatedLambdaValueParams onto it (arg evidence reaches
 lambda-param substitution — the it-tail's lever); step four the
 splice window.
+
+## Addendum 46 — engine step three; wrong answer seven (2026-08-04)
+
+Arg evidence now reaches lambda-param typing through
+solveCallBindings (engine consumers: return types, lambda params ×2
+channels). The landing surfaced wrong answer #7 — the per-arg typing
+stash leaking into nested-receiver lambdas — sealed at lowerReceiver
+and the inline this_arg lowering, with the WRITE-side valty trace
+(+KLIO_VALTY_STACK) that pinpointed it in two runs. no_receiver
+640 -> 623 (6.71%), bound 91.4%. Session arc: 1,172 -> 623,
+85.3% -> 91.4%. Engine step four (the splice window onto
+solveCallBindings) remains, then the VM leg.
