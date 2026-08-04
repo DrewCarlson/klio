@@ -136,3 +136,16 @@ CallMemberOrGlobal fallthrough), excluding only the exotic tails
 per-frame. Re-run this classifier with the widened subset BEFORE
 building — target ≥80% frame coverage or re-scope again. The
 classifier + counters stay as the standing coverage instrument.
+
+## P2 widened coverage (2026-08-04): 99.92% — build green-lit
+
+The corrected subset (member/value calls, fields, index, globals,
+lambdas, casts; excluded: try/finally, spread, ctx, super) covers
+11,562,245 / 11,571,366 frames (99.92%). The engine built to this
+population reaches effectively every frame; per-frame deopt to the
+recursive eval covers the rest. NEXT CONTEXT: build the flattening
+pass + threaded loop for this subset behind KLIO_FLAT_VM
+(default off), with the handler-per-inst table reusing the existing
+exec arms (execArmCallValue etc. are already extracted noinline
+fns — the loop can call them directly), bench_corpus + full battery
+as the parity gate, then the compose re-measure.
