@@ -90,3 +90,10 @@ battery green (sweep/litmus/drift/units/compose baseline), behavior
 divergence is a wrong answer to root-cause (the seven pinned parity
 bugs all came from exactly such digs), and measured negatives get
 recorded and reverted, not argued with.
+
+## P0: landed (2026-08-04)
+
+frame_push under KLIO_DISPATCH_STATS. Baseline: 11,571,366 frames /
+one stdlib census run (36.98% of counted dispatch events) — the
+denominator P1/P2 exist to shrink. Compose gauge stands at 13.5s vs
+the 10s budget.
