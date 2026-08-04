@@ -9401,7 +9401,13 @@ fn staticCallReturnTypeRef(
                     break :blk sole_global orelse return null;
                 };
                 const recv_ref = if (b.spliceHintActive())
-                    (if (b.spliceHintRecvRef()) |rt|
+                    // The window's ACTUAL receiver type wins over the
+                    // declared one: `Iterable<String>` instantiates the
+                    // bare `iterator()`'s return where `Iterable<T>`
+                    // leaves the callee's own parameter in it.
+                    (if (b.spliceRecvTyRef()) |art|
+                        try art.clone(b.allocator)
+                    else if (b.spliceHintRecvRef()) |rt|
                         try decl_mod.loweredTypeRef(b.allocator, &rt, true)
                     else
                         null)
@@ -9480,14 +9486,25 @@ fn staticCallReturnTypeRef(
                         .receiver_type = bare_recv,
                     },
                 );
-                if (bt) std.debug.print("[bareret] {s} on {s} target={s} owner_fqn={s} applicable={} stub={}\n", .{
+                if (bt) std.debug.print("[bareret] {s} on {s} target={s} owner_fqn={s} applicable={} stub={} fn={s}\n", .{
                     name.name,
                     ident,
                     if (bare_resolved.target != null) "yes" else "no",
                     b.module.classFqnById(owner) orelse "-",
                     bare_resolved.applicable,
                     if (owner.int() < b.module.classes.items.len) b.module.classes.items[owner.int()].is_stub else false,
+                    build.currentRealFn() orelse "-",
                 });
+                if (bt and bare_resolved.target == null) {
+                    std.debug.print("[bareret]   tower_n={d} encl={s} recv={s}\n", .{
+                        b.implicit_receiver_tower.items.len,
+                        b.enclosingRecvTy() orelse "-",
+                        b.recvTy() orelse "-",
+                    });
+                    for (b.implicit_receiver_tower.items) |entry| {
+                        std.debug.print("[bareret]   tower entry head={s}\n", .{entry.head});
+                    }
+                }
                 if (bare_resolved.target) |member_target| break :blk member_target;
                 // No member serves it, and none is even applicable: a bare
                 // call in a receiver context may be an EXTENSION of the
@@ -9858,9 +9875,11 @@ fn staticCallReturnTypeRef(
     if (call.callee.* == .Path and call.callee.Path.segments.len == 1 and
         bareRetTraceFor(b, call.callee.Path.segments[0].name))
     {
-        std.debug.print("[bareret] {s} return={s}\n", .{
+        std.debug.print("[bareret] {s} return={s} args={d} fn={s}\n", .{
             call.callee.Path.segments[0].name,
             if (inferred) |i| i.name else "<null>",
+            if (inferred) |i| i.args.len else 0,
+            build.currentRealFn() orelse "-",
         });
     }
     if (call.callee.* == .Member and bareRetTraceFor(b, call.callee.Member.name.name)) {

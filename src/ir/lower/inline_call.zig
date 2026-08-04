@@ -1384,7 +1384,15 @@ pub fn tryInlineCallWithTypeArgs(
     // type-parameter head resolves through the caller's full bound ref.
     var recv_ref_owned: ?ir.TypeRef = null;
     if (f.receiver_type != null) if (this_arg) |ra| blk: {
-        var got = expr_lower.argDeclTypeRefLazy(b, ra) orelse break :blk;
+        var inferred: ?ir.TypeRef = null;
+        defer if (inferred) |*t| t.deinit(b.allocator);
+        var got = expr_lower.argDeclTypeRefLazy(b, ra) orelse got_blk: {
+            // A lazily-typed local (`val data = listOf(...)`) answers only
+            // through its initializer — the same chain the member path
+            // consults before resolving.
+            inferred = try expr_lower.staticExprTypeRef(b, ra);
+            break :got_blk inferred orelse break :blk;
+        };
         if (got.args.len == 0) {
             var h = std.mem.trimEnd(u8, got.name, "?");
             if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
