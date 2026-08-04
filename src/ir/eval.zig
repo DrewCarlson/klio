@@ -933,6 +933,10 @@ pub const DispatchKind = enum(u8) {
     member_range_iter,
     member_flat_prepare,
     member_ladder,
+    /// Slot-bound / lowering-resolved calls served as pushed activations on
+    /// the flat driver instead of through the recursive invoker.
+    virtual_flat_prepare,
+    resolved_flat_prepare,
     /// VM-plan P0 baseline: every interpreter frame constructed. P1's
     /// contiguous stack and P2's call fusion drive this denominator down
     /// per call; the compose margin is the external gauge.
@@ -1715,6 +1719,17 @@ fn flatEnabled() bool {
     const raw = runtime.getenvSlice("KLIO_FLAT");
     const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
     flat_enabled_cached = b;
+    return b;
+}
+
+/// `KLIO_FLAT_VCALL=0` keeps slot-bound and lowering-resolved member calls on
+/// the recursive invoker — the bisect switch for the fused virtual path.
+var vcall_flat_cached: ?bool = null;
+fn vcallFlatEnabled() bool {
+    if (vcall_flat_cached) |b| return b;
+    const raw = runtime.getenvSlice("KLIO_FLAT_VCALL");
+    const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
+    vcall_flat_cached = b;
     return b;
 }
 
@@ -6769,6 +6784,21 @@ noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *F
     defer recv.release(allocator);
     const args = try readArgRun(allocator, frame, cv.args, cv.n_args);
     defer allocator.free(args);
+    // Flat virtual dispatch: a slot resolved against a named receiver class
+    // to an interpreted body at the fully-applied no-vararg shape runs as a
+    // pushed activation on this driver, skipping the recursive invoker's
+    // per-call frame ceremony. Everything else falls through unchanged.
+    if (comptime @hasDecl(H, "prepareVirtualFlatCall")) {
+        if (flatEnabled() and vcallFlatEnabled() and cv.arg_params == null and argNamesAllNull(cv.arg_names)) {
+            if (try host.prepareVirtualFlatCall(allocator, &recv, cv.slot, args)) |prep0| {
+                dispatchBump(.virtual_flat_prepare);
+                var prep = prep0;
+                prep.dst = cv.dst;
+                frame.flat_call = prep;
+                return .flat_call;
+            }
+        }
+    }
     const names = try resolveArgNames(allocator, frame.module, cv.arg_names);
     defer allocator.free(names);
     const prev_tl = if (cv.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
@@ -6806,6 +6836,21 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             defer if (dispatch_recv) |value| value.release(allocator);
             const ra = try readArgRun(allocator, frame, cm.args, cm.n_args);
             defer allocator.free(ra);
+            // A lowering-resolved plain member at the fully-applied no-vararg
+            // shape runs as a pushed activation; member extensions (which
+            // seed the dispatch receiver) and every padded/vararg shape keep
+            // the recursive invoker.
+            if (comptime @hasDecl(H, "prepareResolvedFlatCall")) {
+                if (flatEnabled() and vcallFlatEnabled() and argNamesAllNull(cm.arg_names)) {
+                    if (try host.prepareResolvedFlatCall(allocator, &recv, fid, ra)) |prep0| {
+                        dispatchBump(.resolved_flat_prepare);
+                        var prep = prep0;
+                        prep.dst = cm.dst;
+                        frame.flat_call = prep;
+                        return .flat_call;
+                    }
+                }
+            }
             const dispatch_ptr: ?*const Value = if (dispatch_recv) |*value|
                 value
             else

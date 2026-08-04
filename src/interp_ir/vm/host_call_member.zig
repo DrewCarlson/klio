@@ -4126,6 +4126,87 @@ fn prepareFlatFromFid(self: *VmHost, allocator: Allocator, receiver: *const Valu
     };
 }
 
+/// `KLIO_VFLAT_TRACE=1` — one line per declined virtual flat prepare, with
+/// the reason, for diagnosing why a slot population stays recursive.
+var vflat_trace_cached: ?bool = null;
+fn vflatTraceOn() bool {
+    if (vflat_trace_cached) |b| return b;
+    const b = runtime.getenvSlice("KLIO_VFLAT_TRACE") != null;
+    vflat_trace_cached = b;
+    return b;
+}
+
+/// Flat-serve a bound virtual slot: resolve it against the receiver's class
+/// exactly as `invokeVirtualMember`'s main path does, admitting only the
+/// shape whose recursive serve would be a plain `[receiver] ++ args` frame —
+/// a named main-module receiver class whose slot entry is an executable
+/// interpreted body. Anonymous receivers (intrinsic shadowing, SAM targets,
+/// name-ladder fallbacks), runtime-defined classes, and unlinked or bodyless
+/// entries all decline to the recursive invoker unchanged.
+pub fn prepareVirtualFlatCall(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    slot: MethodSlotId,
+    args: []const Value,
+) Allocator.Error!?ir.eval.FlatCallReq {
+    const vtrace = vflatTraceOn();
+    if (receiver.* != .Instance) {
+        if (vtrace) std.debug.print("[vflat] decline non-instance {s}\n", .{@tagName(std.meta.activeTag(receiver.*))});
+        return null;
+    }
+    const target = blk: {
+        const instance = receiver.Instance.borrow();
+        defer instance.deinit();
+        const class = instance.get().class.borrow();
+        defer class.deinit();
+        if (class.get().is_anonymous) {
+            if (vtrace) std.debug.print("[vflat] decline anon {s}\n", .{class.get().fqn});
+            return null;
+        }
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const module = mg.get();
+        const runtime_class = module.classIdByFqn(class.get().fqn) orelse {
+            if (vtrace) std.debug.print("[vflat] decline no-classid {s}\n", .{class.get().fqn});
+            return null;
+        };
+        const t = module.methodSlotTarget(runtime_class, slot) orelse {
+            if (vtrace) std.debug.print("[vflat] decline no-slot-target {s} slot={d}\n", .{ class.get().fqn, slot.int() });
+            return null;
+        };
+        if (!virtualTargetExecutable(module, t)) {
+            if (vtrace) std.debug.print("[vflat] decline not-executable {s}\n", .{class.get().fqn});
+            return null;
+        }
+        break :blk t;
+    };
+    const req = try prepareFlatFromFid(self, allocator, receiver, args, target);
+    if (vtrace and req == null) std.debug.print("[vflat] decline shape fid={d}\n", .{target.int()});
+    return req;
+}
+
+/// Flat-serve a lowering-resolved plain member. Member extensions need their
+/// declaring class's `this` seeded as an enclosing receiver, and a bodyless
+/// declaration runs as its linked host symbol; both keep the recursive path.
+pub fn prepareResolvedFlatCall(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    fid: FuncId,
+    args: []const Value,
+) Allocator.Error!?ir.eval.FlatCallReq {
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const module = mg.get();
+        if (isMemberExt(module, fid)) return null;
+        const f = funcAt(module, fid) orelse return null;
+        if (!f.hasBody()) return null;
+    }
+    return prepareFlatFromFid(self, allocator, receiver, args, fid);
+}
+
 var route_trace_init: bool = false;
 var route_trace_val: ?[]const u8 = null;
 fn routeTraceOn(name: []const u8) bool {
