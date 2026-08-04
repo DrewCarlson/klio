@@ -759,6 +759,14 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
             if (cb(scope.ctx.?, fid, param_ty)) return 5;
         }
     }
+    if (std.c.getenv("KLIO_SCORE_TRACE") != null) {
+        std.debug.print("[score-null] param={s} v_ty={s} arg_ty={s} fid={?d}\n", .{
+            nm,
+            v_ty,
+            if (arg.ty) |t| t.name else "-",
+            if (sig.fid) |f| f.int() else null,
+        });
+    }
     return null;
 }
 
@@ -836,9 +844,13 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
     if (scope.member) return applicableMember(sig, args, scope);
 
     const params = sig.params;
+    const strace = std.c.getenv("KLIO_SCORE_TRACE") != null;
 
     // A bodyless `expect` / native / abstract stub is never selectable.
-    if (!sig.has_body) return null;
+    if (!sig.has_body) {
+        if (strace) std.debug.print("[app-null] fid={?d} no-body\n", .{if (sig.fid) |f| f.int() else null});
+        return null;
+    }
 
     const last_vararg = params.len > 0 and params[params.len - 1].is_vararg;
 
@@ -898,7 +910,10 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
         }
     }
 
-    if (params.len < args.len and !last_vararg) return null;
+    if (params.len < args.len and !last_vararg) {
+        if (strace) std.debug.print("[app-null] fid={?d} arity params={d} args={d}\n", .{ if (sig.fid) |f| f.int() else null, params.len, args.len });
+        return null;
+    }
 
     // Trailing-lambda rule: the last arg binds out of sequence to the last
     // function-typed parameter, provided the gap is all-defaulted.
@@ -955,7 +970,10 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
                 break;
             }
         }
-        if (!all_defaulted) return null;
+        if (!all_defaulted) {
+            if (strace) std.debug.print("[app-null] fid={?d} gap-not-defaulted params={d} args={d}\n", .{ if (sig.fid) |f| f.int() else null, params.len, args.len });
+            return null;
+        }
     }
 
     // A vararg application is less specific than an otherwise equal fixed
@@ -987,7 +1005,10 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
                 continue;
             }
         }
-        const sc = scoreArg(sig, &params[idx].ty, &args[idx], &scope) orelse return null;
+        const sc = scoreArg(sig, &params[idx].ty, &args[idx], &scope) orelse {
+            if (strace) std.debug.print("[app-null] fid={?d} arg{d} param={s} score-null\n", .{ if (sig.fid) |f| f.int() else null, idx, params[idx].ty.name });
+            return null;
+        };
         total += sc;
         if (argIsProven(&args[idx])) proven += 1 else unknown += 1;
     }
@@ -1369,7 +1390,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
         const p = pos orelse {
             if (comptime @import("builtin").link_libc) {
                 if (std.c.getenv("KLIO_APPLIC_TRACE") != null) {
-                    std.debug.print("[applic-reject] named-3 arg={s} params:", .{n});
+                    std.debug.print("[applic-reject] named-3 fid={?d} arg={s} params:", .{ if (sig.fid) |f| f.int() else null, n });
                     for (params) |*pp| std.debug.print(" {s}", .{pp.name});
                     std.debug.print("\n", .{});
                 }
