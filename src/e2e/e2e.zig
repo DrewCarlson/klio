@@ -195,7 +195,7 @@ test "function-JIT recursion matches the interpreter" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const cases = [_][]const u8{ "jit_recursion", "jit_inline_call_loop" };
+    const cases = [_][]const u8{ "jit_recursion", "jit_inline_call_loop", "jit_char_tag_static_call" };
     for (cases) |stem| {
         jit.resetForTest();
         const kt = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ EXAMPLES, stem });

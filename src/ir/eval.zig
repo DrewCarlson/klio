@@ -4644,10 +4644,11 @@ fn LoopTramp(comptime H: type) type {
                 }
             }
             const res = if (site.is_member) member: {
+                const recv_tag_src: usize = if (site.recv_tag_reg != 0) site.recv_tag_reg else site.recv_reg;
                 var recv = switch (cl.reg_types[site.recv_reg]) {
                     .object, .unknown => lc.frame.regs.items[site.recv_reg],
                     .null_ => Value.Null,
-                    else => jit_loop.valueFromSlotTagged(cl.reg_types[site.recv_reg], tctx.tags[site.recv_reg], tctx.slots[site.recv_reg]),
+                    else => jit_loop.valueFromSlotTagged(cl.reg_types[site.recv_reg], tctx.tags[recv_tag_src], tctx.slots[site.recv_reg]),
                 };
                 // A varying boxed receiver may be a different class this iteration;
                 // deopt unless it matches the class the return type was resolved for.
