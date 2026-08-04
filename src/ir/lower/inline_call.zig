@@ -1376,6 +1376,28 @@ pub fn tryInlineCallWithTypeArgs(
         if (inline_state.inlineMemberOwner(f)) |ow| b.setSpliceRecvTy(ow);
     }
     defer b.setSpliceRecvTy(prev_splice_recv);
+    // The ACTUAL receiver's full static type enters the window when the
+    // call site derives one: iterating `this` inside the spliced body
+    // types its elements from the receiver's ARGUMENTS (`data.count { }`
+    // on `data: T` with `T : Iterable<String>` binds String elements),
+    // which the head-only channel above cannot carry. A bare
+    // type-parameter head resolves through the caller's full bound ref.
+    var recv_ref_owned: ?ir.TypeRef = null;
+    if (f.receiver_type != null) if (this_arg) |ra| blk: {
+        var got = expr_lower.argDeclTypeRefLazy(b, ra) orelse break :blk;
+        if (got.args.len == 0) {
+            var h = std.mem.trimEnd(u8, got.name, "?");
+            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            if (b.typeParamBoundRef(expr_lower.typeHead(h))) |bref| got = bref.*;
+        }
+        if (got.args.len == 0) break :blk;
+        recv_ref_owned = got.clone(b.allocator) catch break :blk;
+    };
+    const prev_recv_ref = b.setSpliceRecvTyRef(recv_ref_owned);
+    defer if (b.setSpliceRecvTyRef(prev_recv_ref)) |owned| {
+        var t = owned;
+        t.deinit(b.allocator);
+    };
     // Bare-call hygiene for the spliced body: its bare calls resolve
     // against the inline fn's own receiver (none for a receiver-less
     // inline fn), never the caller's class. The pre-splice hint is

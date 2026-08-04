@@ -8389,6 +8389,9 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         // `this` for this body and must win. A spliced lambda argument skips
         // it because that lambda's receiver/free-name window is independent.
         if (b.lambda_splice_resolve == null) {
+            // The window's full receiver record wins over the head-only
+            // channel: iterating `this` needs the type arguments.
+            if (b.spliceRecvTyRef()) |ref| return ref.*;
             if (b.spliceRecvTy()) |head| {
                 return .{ .name = head, .nullable = false, .args = &.{} };
             }

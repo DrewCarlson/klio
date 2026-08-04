@@ -471,6 +471,13 @@ pub const FuncBuilder = struct {
     /// preserves nullability, arguments, and classifier identity.
     recv_type_ref: ?TypeRef = null,
     splice_recv_ty: ?[]const u8 = null,
+    /// The active splice's ACTUAL receiver static type WITH its type
+    /// arguments, when the call site derived one (`data.count { }` on
+    /// `data: T`, `T : Iterable<String>`, records `Iterable<String>`).
+    /// `splice_recv_ty` keeps only the head, and iterating `this` inside
+    /// the spliced body needs the arguments to type the element. Owned
+    /// by the splice that set it.
+    splice_recv_ty_ref: ?TypeRef = null,
     splice_hint_active: bool = false,
     splice_hint_recv: ?[]const u8 = null,
     splice_hint_recv_ref: ?ast.TypeRef = null,
@@ -1395,6 +1402,17 @@ pub const FuncBuilder = struct {
     }
     pub fn spliceRecvTy(self: *const FuncBuilder) ?[]const u8 {
         return self.splice_recv_ty;
+    }
+    /// Swap the window's full receiver record, returning the previous one
+    /// so the splice restores (and frees its own) on exit.
+    pub fn setSpliceRecvTyRef(self: *FuncBuilder, ty: ?TypeRef) ?TypeRef {
+        const prev = self.splice_recv_ty_ref;
+        self.splice_recv_ty_ref = ty;
+        return prev;
+    }
+    pub fn spliceRecvTyRef(self: *const FuncBuilder) ?*const TypeRef {
+        if (self.splice_recv_ty_ref) |*t| return t;
+        return null;
     }
     pub fn recvTy(self: *const FuncBuilder) ?[]const u8 {
         return self.recv_ty;
