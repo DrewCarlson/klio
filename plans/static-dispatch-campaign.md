@@ -1875,3 +1875,18 @@ declined 87 -> 97: each new declines is a site whose old commit was
 the FALSE proof — honesty, not regression (the wrong-answer-fix
 precedent). Census standing: 975 / 78 / 4 / 97 on 9,578 (88.0%
 bound). Battery green everywhere at every landing.
+
+## Addendum 26 — declined 97 re-decomposed under the new prover (2026-08-04)
+
+The promo probe names the whole set: ArrayList/MutableSet
+addAll/removeAll/retainAll (~60 rows) hold as member-arg-refuted with
+a live super-receiver extension; Random.nextInt 30 stays
+arg-unauthoritative; the unsigned `get` family (~56 promo-class rows)
+rides the host-symbol route. VERIFIED: the addAll shape COMMITS in
+user code (repro binds the Sequence extension exact on both ArrayList
+and MutableSet receivers) — the census's residual rows are
+stdlib-INTERNAL sites whose `elements` argument types are still
+generic, so the extension set ties as unknown/compatible with no
+strict winner. Those declines are honest under the evidence; they
+convert as the remaining arg-typing legs land, not by a ranker
+change. No quick slice here — the bucket is correctly priced.
