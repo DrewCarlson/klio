@@ -14270,6 +14270,15 @@ fn lowerResolvedMemberCall(
                 });
             }
         }
+        if (receiver.* == .Binary) {
+            if (runtime.getenvSlice("KLIO_NORECV_NAMES") != null) {
+                std.debug.print("[no-recv-binary] op={s} call={s} fn={s}\n", .{
+                    @tagName(receiver.Binary.op),
+                    name.name,
+                    build.currentRealFn() orelse "-",
+                });
+            }
+        }
         if (receiver.* == .Member) {
             if (runtime.getenvSlice("KLIO_NORECV_NAMES") != null) {
                 std.debug.print("[no-recv-member] .{s} call={s} fn={s}\n", .{
