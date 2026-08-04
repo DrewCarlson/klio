@@ -2050,3 +2050,25 @@ Repro: tp15.kt + KLIO_TRACE_PATH=1, grep cv-arg/frame-bind around
 the 97 line. This is the LAST unknown in the Addendum-31 wrong
 answer; everything upstream and downstream of this plumbing is
 verified correct.
+
+## Addendum 34 — the fifth wrong answer FIXED: JIT stale-tag rebox (2026-08-04)
+
+1ec6316f closes the Addendum-31/33 chain. Root cause: the loop JIT's
+native code copies argument SLOTS through Moves without updating the
+per-register tag array, so a trampolined callee's live-refreshed
+result tag (the unresolved `next()`'s Char) never reached the arg
+register's rebox — the closure received the char's CODE as an Int.
+Fix: each call site precomputes the register whose LIVE tag governs
+each argument (the same-block move-chain source); both trampoline
+argbuf builders read through it. KLIO_JIT=0 equivalence verified;
+pinned jit_char_tag_rebox.
+
+Bonus: the silently-swallowed top-level property init (tp3's
+`unresolved global`) was the SAME bug — the HexExtensions table build
+threw mid-init. Both now correct.
+
+The windowed collateral under KLIO_AGREED_RET=1 is a DIFFERENT chain
+(the source-windowed-on-host-generator interop suspected in Addendum
+30) — the agreed-return channel stays parked on that one remaining
+collateral; its -72 census sites now wait on a single fix instead of
+two.
