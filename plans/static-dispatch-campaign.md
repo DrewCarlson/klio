@@ -2160,3 +2160,12 @@ call form changes; the sole-unknown TYPING-ONLY channel (Addendum 39
 draft) remains the safer alternative shape — it lends the return
 type without touching emission, which the trimIndent hazard is
 about.
+
+## Addendum 41 — the sole-unknown typing channel lands (2026-08-04)
+
+The Addendum-39 design, implemented: ExtensionResolution.sole_unknown
+carries the untied strict-key winner past the unknown-argument
+withhold, and bareExtensionTarget (typing-only) consumes it.
+no_receiver 690 -> 642 (6.90%), declined 99 -> 93, bound 91.2% —
+strictly dominating the reverted emission-side widening (-48 vs -37,
+zero breakage). Session arc: 1,172 -> 642, 85.3% -> 91.2% bound.
