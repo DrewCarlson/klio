@@ -1829,3 +1829,24 @@ Next named families, probe-ready:
 - `list` 67 / `destination` 33 — unchanged, substitution engine.
 - Unsigned `sum`/`indexOfFirst` splice rows ride storage-mapped
   contexts (the splice window's receiver is the STORAGE array).
+
+## Addendum 24 — diamond slots and the window-receiver chain (2026-08-04)
+
+c0dfd25a: a DIAMOND of overrides is one slot family — resolution
+retries the slot test from the RESOLUTION owner and keeps the more
+specific return (AbstractMutableCollection's `iterator` ->
+MutableIterator). ad12b976: bare calls inside a splice window
+instantiate against the window's ACTUAL receiver, which now also
+forms from a lazily-typed local receiver. no_receiver 1,078 -> 1,062
+across the two; bound 87.1%.
+
+CORRECTION to Addendum 23: SequenceScope was never a family — the
+"target=no" row is an INTERMEDIATE print and the tower arm resolves
+those sites immediately after (the intermediate-row trap; the row
+now prints enough context to avoid the misread).
+
+Residual no_receiver 1,062 by name: it 75 (nonEmptyLength local-ext
+6, unsigned sum/indexOf splices ~16, windowed/joinToString 4,
+toString 2, long tail), list 69 + destination 33 (substitution
+engine), v1 26, iterator 24, value 19, result 16, index 16. The
+substitution-engine families are now the largest coherent mass.
