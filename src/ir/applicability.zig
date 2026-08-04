@@ -417,7 +417,7 @@ fn sameFid(a: ?FuncId, b: ?FuncId) bool {
 }
 
 /// A `TypeRef` denoting a Kotlin function type (mirrors `interp_ir.isFunctionType`).
-fn isFunctionTypeRef(ty: *const TypeRef) bool {
+pub fn isFunctionTypeRef(ty: *const TypeRef) bool {
     const n = simpleName(ty.name);
     return std.mem.startsWith(u8, n, "Function") or
         std.mem.indexOf(u8, ty.name, "->") != null;

@@ -4308,11 +4308,32 @@ pub const Module = struct {
                 if (args.len < required) continue;
             } else {
                 if (args.len > f.params.len - 1) continue;
+                // Trailing-callable rule at the ARITY gate: the last arg
+                // fills the LAST param when that param is function-typed,
+                // so only the MIDDLE gap must default — `windowed(2, 3)
+                // { transform }` binds the 4-value-param transform
+                // overload with `partialWindows` defaulted; the
+                // positional walk instead demanded `transform` itself
+                // default and dropped the overload kotlinc picks.
+                const trailing_call = args.len > 0 and args.len < f.params.len - 1 and
+                    (args[args.len - 1].is_lambda or
+                        args[args.len - 1].lambda_arity != null or
+                        args[args.len - 1].func_typed) and
+                    applicability.isFunctionTypeRef(&f.params[f.params.len - 1].ty);
                 var omitted_defaults = true;
-                for (f.params[1 + args.len ..]) |param| {
-                    if (!param.has_default and param.default == null) {
-                        omitted_defaults = false;
-                        break;
+                if (trailing_call) {
+                    for (f.params[args.len .. f.params.len - 1]) |param| {
+                        if (!param.has_default and param.default == null) {
+                            omitted_defaults = false;
+                            break;
+                        }
+                    }
+                } else {
+                    for (f.params[1 + args.len ..]) |param| {
+                        if (!param.has_default and param.default == null) {
+                            omitted_defaults = false;
+                            break;
+                        }
                     }
                 }
                 if (!omitted_defaults) continue;

@@ -9401,14 +9401,12 @@ fn staticCallReturnTypeRef(
             // what any pick would return. Args are kept only when every
             // declaration's full return matches.
             //
-            // MEASURED NET-NEGATIVE as a default (KLIO_AGREED_RET=1 to
-            // re-probe): -72 census sites, but two behavioral collaterals —
-            // SequenceTest.windowed's transform pipeline and the
-            // HexExtensions property-init lambda (its Char param bound Int)
-            // — both through downstream channels the new receiver typing
-            // armed. The conversions return when those channels are fixed.
+            // Both downstream collaterals that once parked this channel are
+            // fixed (the JIT stale-tag rebox; the arity gate's positional
+            // trailing-lambda blindness) — KLIO_AGREED_RET=0 re-parks it
+            // for A/B.
             const agreed_return: ?ir.TypeRef = blk_agree: {
-                if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_AGREED_RET") orelse "0", "1")) break :blk_agree null;
+                if (std.mem.eql(u8, runtime.getenvSlice("KLIO_AGREED_RET") orelse "1", "0")) break :blk_agree null;
                 if (top_level_usable) break :blk_agree null;
                 if (enclosingHasMemberNamed(b, name.name)) break :blk_agree null;
                 // A name ANY class declares as a member may be a receiver

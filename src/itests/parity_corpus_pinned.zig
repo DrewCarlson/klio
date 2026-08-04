@@ -1619,6 +1619,17 @@ test "plus_element_inference" {
     );
 }
 
+test "windowed_trailing_transform" {
+    try check("windowed_trailing_transform",
+        \\[01, 34]
+        \\[0, 1]
+        \\true
+        \\true
+        \\ok
+        \\
+    );
+}
+
 test "jit_char_tag_rebox" {
     try check("jit_char_tag_rebox",
         \\a
