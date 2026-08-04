@@ -2189,3 +2189,26 @@ agreed-return channel live; every residual family attributed with a
 terminal cause. The two remaining structural legs are the
 per-instantiation substitution engine (the ~400 locals mass) and the
 bytecode VM (compose + the dynamic floor).
+
+## Addendum 43 — attribution complete; the census program's converged state (2026-08-04)
+
+Every receiver KIND now carries a per-site attribution probe
+([no-recv-name], [no-recv-member], [no-recv-callrecv],
+[no-recv-binary]) and every bucket has been decomposed to named
+families with terminal causes. The Binary 46 are scattered singles;
+no coherent unconverted family remains outside the two structural
+legs. The census program of this campaign — convert what per-family
+mechanisms can convert, fix every wrong answer found beneath, keep
+the battery green — is at its converged state: 640 / 9,305 (6.88%
+untyped), 91.2% bound, from 1,172 / 85.3% at session start.
+
+The end-state ("fully static dispatching", compose green) is now
+PRECISELY two builds, both specified by the addenda record:
+1. The per-instantiation substitution engine — the ~400 locals mass
+   (it/iterator/value/result tails) whose types require call-site
+   tp instantiation the current per-channel substitutions
+   (instantiatedTypeFromReceiver/Partial, the window channels)
+   approximate one shape at a time.
+2. The bytecode VM — the compose throughput set (double-measured
+   VM-bound at 13.5s vs the 10s budget, invariant under +2.4%
+   bound) and the dynamic-dispatch floor.
