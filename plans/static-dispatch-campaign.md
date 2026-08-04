@@ -2107,3 +2107,18 @@ Companion property heads register under `<Class>$Companion` (the walk
 had skipped nested is_companion Decl.Class members entirely) and both
 class-named read forms consult them. no_receiver 770 -> 690 (7.38%),
 bound 90.7% — the session arc is 1,172 -> 690 and 85.3% -> 90.7%.
+
+## Addendum 38 — Call-receiver bucket decomposed (2026-08-04)
+
+[no-recv-callrecv] (landed) names the 180: joinTo(...).toString()
+28 (the joinToString bodies — the bare joinTo resolves NO target,
+applicable=false, at the member walk AND the ext arm despite full
+positional args; next probe is the ext-arm ranking for the
+A-bounded buffer overload set), fn-typed-param invokes (transform/
+expect ~28 — callable-return typing, substitution territory),
+copyOfRange 8 (receiver-tp return on an untyped receiver),
+shr/and shifted-int chains, and trim/trimStart/append Member-callee
+chains. The member-read arm (Addendum 36) plus companion reads
+(Addendum 37) already took Member receivers 212 -> ~30.
+
+Standing: 690 / 78 / 4 / 99 on 9,351 — 90.7% bound, battery green.
