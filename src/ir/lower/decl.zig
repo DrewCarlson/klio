@@ -91,7 +91,7 @@ fn appendUnique(a: Allocator, out: *std.ArrayList([]const u8), s: []const u8) Al
 /// The materialized array head a `vararg x: T` parameter has inside the
 /// body: the primitive-specialized array for primitive elements, `Array`
 /// otherwise.
-fn varargArrayHead(elem: []const u8) []const u8 {
+pub fn varargArrayHead(elem: []const u8) []const u8 {
     const eq = std.mem.eql;
     if (eq(u8, elem, "Byte")) return "ByteArray";
     if (eq(u8, elem, "Short")) return "ShortArray";

@@ -2894,6 +2894,11 @@ const Walker = struct {
         new_params[n + 1] = w.b.ident(changed_param);
         const new_tys = try w.a.alloc(?TypeRef, n + 2);
         for (new_tys, 0..) |*t, i| t.* = if (i < n and i < lam.param_tys.len) lam.param_tys[i] else null;
+        // The pair is declared, not inferred: the body's `$composer.…` group
+        // calls and `$changed and …` masks bind statically only when the
+        // lambda records the types the function form declares at its params.
+        new_tys[n] = w.b.typeRef("Composer");
+        new_tys[n + 1] = w.b.typeRef("Int");
         lam.params = new_params;
         lam.param_tys = new_tys;
         lam.implicit_it = false;

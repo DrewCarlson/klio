@@ -438,12 +438,32 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
             owned.deinit(b.allocator);
         }
     }
+    const vararg_names = module.pending_lambda_vararg_params;
+    module.pending_lambda_vararg_params = null;
     for (params, 0..) |p, i| {
         if (i >= param_tys.len) break;
         const ty = param_tys[i] orelse continue;
         if (ty.function) |ft| {
             try b.setLocalCallReturn(p.name, ft.ret.name.name, ft.ret.nullable);
         }
+        // A local `fun`'s vararg parameter is the MATERIALIZED array inside
+        // the body; its annotation names the element. Register the array
+        // head, exactly as the top-level declaration lowering does.
+        const is_vararg = blk: {
+            for (vararg_names orelse &.{}) |vn| {
+                if (std.mem.eql(u8, vn, p.name)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (is_vararg) {
+            try b.setLocalDeclType(p.name, decl.varargArrayHead(ty.name.name));
+            continue;
+        }
+        // A source-annotated (or pass-stamped) lambda parameter type is
+        // authoritative for member resolution in the body, exactly like a
+        // declared function parameter's.
+        try b.setLocalDeclTypeOwned(p.name, try decl.loweredTypeRef(b.allocator, &ty, true));
+        if (ty.nullable) try b.setLocalDeclNullable(p.name);
     }
     // A local contextual function's context parameters, stashed by its
     // declaration lowering, bind here before the body statements lower.

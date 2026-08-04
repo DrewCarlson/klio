@@ -17,6 +17,11 @@ internal actual fun digitOf(char: Char, radix: Int): Int {
         in '0'..'9' -> char - '0'
         in 'a'..'z' -> char - 'a' + 10
         in 'A'..'Z' -> char - 'A' + 10
+        // Fullwidth forms (U+FF10.. digits, U+FF21.. upper, U+FF41.. lower),
+        // matching the host `kotlin.Char.digitToInt` intrinsic's table.
+        in '０'..'９' -> char - '０'
+        in 'Ａ'..'Ｚ' -> char - 'Ａ' + 10
+        in 'ａ'..'ｚ' -> char - 'ａ' + 10
         else -> return -1
     }
     return if (digit < radix) digit else -1
