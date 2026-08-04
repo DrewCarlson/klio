@@ -2353,6 +2353,9 @@ pub const Module = struct {
         const actual_head = staticTypeHead(actual_erased.name);
         const param_erased_head = staticTypeHead(param_erased.name);
         if (!std.mem.eql(u8, actual_head, param_erased_head)) {
+            // `Any` is the universal supertype: every classifier satisfies
+            // it, and the class table records no edges to it.
+            if (std.mem.eql(u8, applicability.simpleName(param_erased_head), "Any")) return .compatible;
             const actual_id = self.staticTypeClassId(actual_erased);
             const param_id = self.staticTypeClassId(param_erased);
             if (actual_id != null and param_id != null and
@@ -3797,8 +3800,12 @@ pub const Module = struct {
             // head-only tail proved `List<String>` against an instantiated
             // `List<List<String>>` (`Box<List<String>>.put(xs: List<T>)`)
             // and the wrong overload won. Heads still adjudicate first
-            // inside; absent-args grace and projections apply there.
-            if (ty.args.len != 0 or param.args.len != 0) {
+            // inside; absent-args grace and projections apply there. Routed
+            // only when the PARAM carries arguments: an instantiated actual
+            // against a plain-headed param (`MutableState<Int>` vs `Any?` on
+            // the memoized `remember`) is the ordinary erased-head question,
+            // and the prover's class-table walk has no edge to `Any`.
+            if (param.args.len != 0) {
                 sac_route = "generic-tail";
                 return self.staticGenericArgCompatibility(fid, ty, param, 0);
             }
@@ -8286,6 +8293,22 @@ pub const Module = struct {
                 param_ty,
                 actual_bounds,
             );
+            if (std.c.getenv("KLIO_BARG_TRACE")) |w| {
+                if (self.funcById(fid)) |bf| {
+                    if (std.mem.eql(u8, std.mem.span(w), bf.name)) {
+                        std.debug.print("[barg] {s}#{d} arg{d} param={s} arg_ty={s} lam={} -> {s} route={s}\n", .{
+                            bf.name,
+                            fid.int(),
+                            i,
+                            param_ty.name,
+                            if (arg.ty) |t| t.name else "-",
+                            arg.is_lambda,
+                            @tagName(compatibility),
+                            sac_route,
+                        });
+                    }
+                }
+            }
             if (compatibility == .incompatible) return .incompatible;
             if (compatibility == .unknown) result = .unknown;
         }

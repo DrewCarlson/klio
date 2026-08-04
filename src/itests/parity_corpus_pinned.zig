@@ -1602,6 +1602,14 @@ test "bound_args_lambda_replay" {
     );
 }
 
+test "generic_arg_vs_any_param" {
+    try check("generic_arg_vs_any_param",
+        \\keyed:x
+        \\plain:y
+        \\
+    );
+}
+
 test "member_overload_receiver_instantiation" {
     try check("member_overload_receiver_instantiation",
         \\one
