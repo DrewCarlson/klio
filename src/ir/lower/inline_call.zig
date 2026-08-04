@@ -1336,10 +1336,24 @@ pub fn tryInlineCallWithTypeArgs(
     const member_splice = f.receiver_type == null and this_arg != null and
         inline_state.inlineMemberOwner(f) != null;
     const explicit_receiver = if ((f.receiver_type != null or member_splice) and
-        this_arg != null)
-        try lowerExpr(b, this_arg.?)
-    else
-        null;
+        this_arg != null) recv_blk: {
+        // The receiver is a NESTED expression: the caller's per-arg lambda
+        // typing stash (consumed by this splice's own arg loop below) must
+        // not leak into the receiver's lambdas — `ByteArray(2) { it }
+        // .scan("") { op }` typed the factory's `it` from scan's operation.
+        const sh_bm = b.pending_arg_broad_masks;
+        const sh_fg = b.pending_arg_fn_generic;
+        const sh_lp = b.pending_arg_lambda_param_types;
+        b.pending_arg_broad_masks = null;
+        b.pending_arg_fn_generic = null;
+        b.pending_arg_lambda_param_types = null;
+        defer {
+            b.pending_arg_broad_masks = sh_bm;
+            b.pending_arg_fn_generic = sh_fg;
+            b.pending_arg_lambda_param_types = sh_lp;
+        }
+        break :recv_blk try lowerExpr(b, this_arg.?);
+    } else null;
     try b.pushInlineDecl(fname, f);
     // The spliced extension's declared receiver is receiver EVIDENCE for
     // the body's own inline gates (`filterIsInstance<T>()` inside
@@ -1406,6 +1420,37 @@ pub fn tryInlineCallWithTypeArgs(
         var t = owned;
         t.deinit(b.allocator);
     };
+    // Engine step four: the caller's SOLVED bindings become window bound
+    // refs, so every consumer sees the call-site instantiation for each
+    // fn type parameter — argument-bound ones (joinTo's A := the buffer)
+    // included, not just the receiver-bound.
+    const S4Restore = struct { name: []const u8, prev: ?ir.TypeRef };
+    var s4_restores: std.ArrayList(S4Restore) = .empty;
+    defer s4_restores.deinit(b.allocator);
+    defer for (s4_restores.items) |*sr| {
+        if (sr.prev) |p| {
+            b.addTypeParamBoundRef(sr.name, p) catch {};
+        } else if (b.type_param_bound_refs.fetchRemove(sr.name)) |kv| {
+            var v = kv.value;
+            v.deinit(b.allocator);
+        }
+    };
+    if (b.module.pending_splice_solved) |solved| {
+        b.module.pending_splice_solved = null;
+        defer b.allocator.free(solved);
+        for (solved) |sb| {
+            const prev: ?ir.TypeRef = if (b.typeParamBoundRef(sb.name)) |p|
+                p.clone(b.allocator) catch null
+            else
+                null;
+            s4_restores.append(b.allocator, .{ .name = sb.name, .prev = prev }) catch {
+                var t = sb.ty;
+                t.deinit(b.allocator);
+                continue;
+            };
+            b.addTypeParamBoundRef(sb.name, sb.ty) catch {};
+        }
+    }
     // Bare-call hygiene for the spliced body: its bare calls resolve
     // against the inline fn's own receiver (none for a receiver-less
     // inline fn), never the caller's class. The pre-splice hint is

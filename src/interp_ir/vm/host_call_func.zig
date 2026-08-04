@@ -1015,7 +1015,6 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
     // `$composer` as ambient — which the flat path does via
     // `flatPlainCallOpen`. No exclusion needed.
     if (f.params.len > 253) return 1;
-    if (paramIsThis(f.params) or f.has_receiver_param) return 1;
     if (lastIsVararg(f.params)) return 1;
     if (hasNonFinalVararg(f.params)) return 1;
     if (funcDefaults(self, func) != null) return 1;
@@ -1025,7 +1024,13 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
     // (reified requires inline), and the fast path already requires the
     // call site to bake zero type arguments, so nothing needs the typed
     // dispatch.
-    return @as(u16, @intCast(f.params.len)) + 2;
+    const base = @as(u16, @intCast(f.params.len)) + 2;
+    // A receiver-carrying body (baked extension / member reached as a plain
+    // call): eligible, but the dispatch must seed the caller's `this` as an
+    // enclosing receiver — the flag tells the call site to do so.
+    if (paramIsThis(f.params) or f.has_receiver_param)
+        return base | ir.FAST_CALL_EXT_FLAG;
+    return base;
 }
 
 /// Lean dispatch for a fast-path call: run the body directly with `args_list`
@@ -2084,7 +2089,8 @@ pub fn prepareTypedFlatCall(self: *VmHost, allocator: Allocator, module: *const 
         plan = fastCallPlan(self, module, resolved);
         @constCast(f).fast_call = plan;
     }
-    if (!(plan >= 2 and plan - 2 == args.len)) return null;
+    const plan_arity = plan & 0x3FFF;
+    if (!(plan_arity >= 2 and plan_arity - 2 == args.len)) return null;
     var call_args: std.ArrayList(Value) = .empty;
     errdefer call_args.deinit(allocator);
     try call_args.appendSlice(allocator, args);

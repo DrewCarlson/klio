@@ -462,6 +462,16 @@ pub const Inst = union(enum) {
         /// member — so direct dispatch stays sound. Null keeps the virtual
         /// name-based path.
         resolved: ?FuncId = null,
+        /// Runtime site memo, single-fill (see `GetField.site_cls`): the first
+        /// Instance class whose by-name dispatch flat-resolved claims the
+        /// site; `site_sig` records the argument-type signature that
+        /// resolution was keyed under and `site_route` the packed target
+        /// (`FuncId << 1 | 1`, so a filled route is never 0). A later call
+        /// with the same receiver class and signature replays the target
+        /// without the string-keyed cache probe or the ladder.
+        site_cls: u64 = 0,
+        site_sig: u64 = 0,
+        site_route: u64 = 0,
         /// Declaring instance for a resolved member-extension target. The
         /// extension receiver remains in `receiver`; this second operand is
         /// the lexical/object dispatch receiver selected by Kotlin's implicit
@@ -1008,6 +1018,11 @@ pub const FuncKind = enum {
     member_extension,
 };
 
+/// `Func.fast_call` flag: the eligible body carries its receiver as the
+/// leading `"this"` param, so the fast dispatch seeds the caller's instance
+/// `this` as an enclosing receiver exactly as the full path does.
+pub const FAST_CALL_EXT_FLAG: u16 = 0x4000;
+
 pub const Func = struct {
     id: FuncId,
     name: []const u8,
@@ -1045,9 +1060,11 @@ pub const Func = struct {
     is_tailrec: bool = false,
     /// Monomorphic call fast-path plan, cached on first call (the evaluator
     /// fills it via the host). `0` = not yet computed, `1` = ineligible (use the
-    /// full dispatch), `>= 2` = eligible with `fast_call - 2` parameters: a plain
-    /// top-level user function a positional, exact-arity call dispatches straight
-    /// to its body. See `eval`'s `.Call` fast path.
+    /// full dispatch), otherwise the low 14 bits are the eligible parameter
+    /// count + 2: a user function a positional, exact-arity call dispatches
+    /// straight to its body. `FAST_CALL_EXT_FLAG` marks a receiver-carrying
+    /// body (baked extension / member) whose dispatch must seed the caller's
+    /// `this` as an enclosing receiver. See `eval`'s `.Call` fast path.
     fast_call: u16 = 0,
     /// Which argument-coercion walks can ever apply to this func's declared
     /// params, computed on first frame entry: bit0 = computed, bit1 = a
@@ -1055,6 +1072,11 @@ pub const Func = struct {
     /// with a type-variable-typed one (generic Int/Long peer widening).
     /// Filled in place under the same benign-race convention as `fast_call`.
     coerce_plan: u8 = 0,
+    /// VM-plan P2 classification: 0 unknown, 1 flattenable (every
+    /// instruction in the simple subset, no catches/finally), 2 not.
+    /// Filled lazily under the same benign-race convention as
+    /// `coerce_plan`.
+    flat_class: u8 = 0,
     /// Index of `"this"` in `capture_order`, cached on first use by
     /// `callerThisValue` (hot: every GetField in a lambda frame consults
     /// it). `-2` = not yet computed, `-1` = no `this` capture.
@@ -1513,6 +1535,11 @@ pub const Module = struct {
     /// (`data.any { it.startsWith("f") }` in a test method's expect-lambda).
     /// Owned pairs; the lambda body takes ownership. Not serialized.
     pending_lambda_type_param_bound_refs: ?[]PendingBoundRef = null,
+    /// Engine step four: the caller's SOLVED fn-tp bindings for an inline
+    /// splice, registered as window bound refs at entry. Names are
+    /// registry-stable fn-tp slices; tys owned by the lowering allocator
+    /// (the consumer moves them into the builder's ref map).
+    pending_splice_solved: ?[]Module.TypeBinding = null,
     /// Instantiated value-parameter types for the pending lambda literal,
     /// derived from its resolved call-argument slot. The lambda body takes
     /// ownership and records them as ordinary local declared types.
@@ -5124,7 +5151,7 @@ pub const Module = struct {
         try self.method_dispatch.put(methodDispatchKey(runtime_class, slot), target);
     }
 
-    const TypeBinding = struct {
+    pub const TypeBinding = struct {
         name: []const u8,
         ty: TypeRef,
         /// The call site wrote this type argument out. Kotlin takes an
@@ -5152,6 +5179,12 @@ pub const Module = struct {
         for (bindings) |*binding| {
             if (std.mem.eql(u8, binding.name, name)) binding.ty = ty;
         }
+    }
+
+    /// Engine helper for external consumers: substitute `ty` through a
+    /// solved binding set (arena-scoped result).
+    pub fn substituteBoundType(allocator: Allocator, ty: TypeRef, bindings: []const TypeBinding) Allocator.Error!TypeRef {
+        return substituteType(allocator, ty, bindings);
     }
 
     fn substituteType(allocator: Allocator, ty: TypeRef, bindings: []const TypeBinding) Allocator.Error!TypeRef {

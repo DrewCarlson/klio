@@ -150,6 +150,12 @@ pub const CallSite = struct {
     /// reboxed `item` (a Char produced by an unresolved `next()`) with the
     /// stale static Int tag and the closure received its code as an Int.
     arg_tag_regs: [3]u32 = .{ 0, 0, 0 },
+    /// Live-tag source for the member receiver, through the same Move-chain
+    /// walk as `arg_tag_regs`: a `Char` produced by an unresolved `next()`
+    /// and MOVED into the receiver slot reboxes with the producer's runtime
+    /// tag, not the receiver register's static one (native Moves copy slots,
+    /// never tags — the `isBlank` loop's `c.isWhitespace()` receiver).
+    recv_tag_reg: u32 = 0,
     /// Member-call fields. `is_member` selects `receiver.name(args)` dispatch;
     /// scalar receivers are rebuilt from slots and object receivers stay boxed.
     /// `recv_class` is the receiver's class identity at compile time, re-checked at
@@ -3071,6 +3077,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .block = bid,
                     .inst = @intCast(i),
                     .span = span,
+                    .arg_tag_regs = arg_tag_regs,
                 }) catch return null;
             } else {
                 // An inlined member call is emitted in place, not trampolined.
@@ -3106,6 +3113,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .arg_tag_regs = arg_tag_regs,
                     .is_member = true,
                     .recv_reg = mc.recv.int(),
+                    .recv_tag_reg = argTagSourceReg(blk_insts, i, mc.recv.int()),
                     .name = mc.name,
                     .resolved_member = mc.resolved,
                     .dispatch_recv_reg = if (mc.dispatch_recv) |reg| reg.int() else null,

@@ -389,6 +389,65 @@ inline fn regsAlloc(fallback: Allocator) Allocator {
     return fallback;
 }
 
+/// VM-plan P2: whether every instruction of `f` sits in the flattened
+/// engine's simple subset (register moves, consts, arithmetic, branches,
+/// returns, EXACT calls) with no catch/finally machinery. Coverage
+/// measurement first, engine second.
+fn classifyFlattenable(f: *const Func) u8 {
+    for (f.blocks) |*blk| {
+        if (blk.catches.len != 0 or blk.finally != null) return 2;
+        for (blk.insts) |*inst| {
+            switch (inst.*) {
+                // The COMMON population (the 0.09% lesson): everything the
+                // flattened engine must serve day one. Excluded tails deopt.
+                .Move,
+                .Const,
+                .BinOp,
+                .UnOp,
+                .Not,
+                .Trace,
+                .LoadParam,
+                .LoadCapture,
+                .MakeCell,
+                .CellGet,
+                .CellSet,
+                .GetField,
+                .SetField,
+                .Index,
+                .IndexSet,
+                .CallValue,
+                .CallValueOrMember,
+                .CallMemberOrValue,
+                .CallMember,
+                .CallVirtual,
+                .CallMemberOrGlobal,
+                .NewInstance,
+                .NewList,
+                .Cast,
+                .InstanceOf,
+                .NotNullAssert,
+                .LoadGlobal,
+                .LoadFromThisOrGlobal,
+                .StoreToThisOrGlobal,
+                .StoreGlobal,
+                .Lambda,
+                .AstLambda,
+                .PropertyRef,
+                .MemberRef,
+                .QualifiedThis,
+                => {},
+                .Call => {},
+                else => return 2,
+            }
+        }
+        switch (blk.terminator) {
+            .Goto, .Branch, .Return => {},
+            else => return 2,
+        }
+    }
+    return 1;
+}
+
 fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value) {
     const ra = regsAlloc(allocator);
     if (ev.regs_pool.items.len > 0) {
@@ -874,10 +933,24 @@ pub const DispatchKind = enum(u8) {
     member_range_iter,
     member_flat_prepare,
     member_ladder,
+    /// Slot-bound / lowering-resolved calls served as pushed activations on
+    /// the flat driver instead of through the recursive invoker.
+    virtual_flat_prepare,
+    resolved_flat_prepare,
+    /// Exact static calls fused by the cached fast plan, split by whether
+    /// the widened receiver-carrying admission served them.
+    static_flat_fuse,
+    static_flat_fuse_ext,
+    /// By-name member calls replayed from their instruction-site memo.
+    member_site_flat,
     /// VM-plan P0 baseline: every interpreter frame constructed. P1's
     /// contiguous stack and P2's call fusion drive this denominator down
     /// per call; the compose margin is the external gauge.
     frame_push,
+    /// VM-plan P2 coverage: frames whose Func the flattened engine's
+    /// simple-inst subset can execute end to end. The ratio to
+    /// `frame_push` is the engine's reachable share BEFORE it is built.
+    frame_push_flattenable,
 };
 const DISPATCH_KINDS = @typeInfo(DispatchKind).@"enum".fields.len;
 var dispatch_counts: [DISPATCH_KINDS]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
@@ -1652,6 +1725,28 @@ fn flatEnabled() bool {
     const raw = runtime.getenvSlice("KLIO_FLAT");
     const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
     flat_enabled_cached = b;
+    return b;
+}
+
+/// `KLIO_FLAT_VCALL=0` keeps slot-bound and lowering-resolved member calls on
+/// the recursive invoker — the bisect switch for the fused virtual path.
+var vcall_flat_cached: ?bool = null;
+fn vcallFlatEnabled() bool {
+    if (vcall_flat_cached) |b| return b;
+    const raw = runtime.getenvSlice("KLIO_FLAT_VCALL");
+    const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
+    vcall_flat_cached = b;
+    return b;
+}
+
+/// `KLIO_MEMBER_SITE=0` disables the CallMember instruction-site memo — the
+/// bisect switch for the by-name replay path.
+var member_site_cached: ?bool = null;
+fn memberSiteEnabled() bool {
+    if (member_site_cached) |b| return b;
+    const raw = runtime.getenvSlice("KLIO_MEMBER_SITE");
+    const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
+    member_site_cached = b;
     return b;
 }
 
@@ -2449,6 +2544,12 @@ const Frame = struct {
         if (plan & 2 != 0) coerceIntArgsToLong(func, params.items);
         if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, params.items);
         dispatchBump(.frame_push);
+        if (dispatch_stats_state == 2) {
+            if (func.flat_class == 0) {
+                @constCast(func).flat_class = classifyFlattenable(func);
+            }
+            if (func.flat_class == 1) dispatchBump(.frame_push_flattenable);
+        }
         if (runtime.getenvSlice("KLIO_TRACE_PATH") != null) {
             for (params.items, 0..) |*pv, pi| {
                 const payload: i64 = switch (pv.*) {
@@ -4543,10 +4644,11 @@ fn LoopTramp(comptime H: type) type {
                 }
             }
             const res = if (site.is_member) member: {
+                const recv_tag_src: usize = if (site.recv_tag_reg != 0) site.recv_tag_reg else site.recv_reg;
                 var recv = switch (cl.reg_types[site.recv_reg]) {
                     .object, .unknown => lc.frame.regs.items[site.recv_reg],
                     .null_ => Value.Null,
-                    else => jit_loop.valueFromSlotTagged(cl.reg_types[site.recv_reg], tctx.tags[site.recv_reg], tctx.slots[site.recv_reg]),
+                    else => jit_loop.valueFromSlotTagged(cl.reg_types[site.recv_reg], tctx.tags[recv_tag_src], tctx.slots[site.recv_reg]),
                 };
                 // A varying boxed receiver may be a different class this iteration;
                 // deopt unless it matches the class the return type was resolved for.
@@ -5550,7 +5652,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         .CallSpread => |cs| return execArmCallSpread(H, allocator, frame, cs, host),
         .CallSuper => |csup| return execArmCallSuper(H, allocator, frame, csup, host),
         .CallMemberOrGlobal => |cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
-        .CallMember => |cm| return execArmCallMember(H, allocator, frame, cm, host),
+        .CallMember => |*cm| return execArmCallMember(H, allocator, frame, cm, host),
         .CallVirtual => |cv| return execArmCallVirtual(H, allocator, frame, cv, host),
         .CallMemberOrValue => |cmv| return execArmCallMemberOrValue(H, allocator, frame, cmv, host),
         .CallValueOrMember => |cvm| return execArmCallValueOrMember(H, allocator, frame, cvm, host),
@@ -6067,13 +6169,17 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
     if (comptime @hasDecl(H, "fieldSiteRoute")) {
         if (recv == .Instance) {
             const w0 = @atomicLoad(u64, @constCast(&gf.site_cls), .acquire);
+            var site_mismatch = false;
             if (w0 > 1) fast: {
                 var getter_fid: u64 = 0;
                 {
                     const g = recv.Instance.borrow();
                     defer g.deinit();
                     const b = g.get();
-                    if (w0 != @as(u64, @intCast(b.class.identity()))) break :fast;
+                    if (w0 != @as(u64, @intCast(b.class.identity()))) {
+                        site_mismatch = true;
+                        break :fast;
+                    }
                     const route = @atomicLoad(u64, @constCast(&gf.site_route), .acquire);
                     if (route == 0) break :fast;
                     if (route & 3 == 1) {
@@ -6111,6 +6217,45 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                     }
                 }
             }
+            // A polymorphic site: the mono-class claim belongs to a
+            // different receiver class (an iterator hierarchy sharing one
+            // base-class read site). Serve this class from its own
+            // (class, name) memo route — one probe instead of the slow
+            // ladder — leaving the site's claim untouched.
+            if (site_mismatch) poly: {
+                const r = host.fieldSiteRoute(&recv, name) orelse break :poly;
+                if (r.route & 3 == 1) {
+                    const idx: usize = @intCast(r.route >> 2);
+                    const g = recv.Instance.borrow();
+                    defer g.deinit();
+                    const b = g.get();
+                    if (idx >= b.fields.items.len) break :poly;
+                    const f = &b.fields.items[idx];
+                    if (!std.mem.eql(u8, f.name, name) and
+                        !(std.mem.startsWith(u8, name, "$sgetter$") and
+                            name.len > f.name.len and
+                            std.mem.endsWith(u8, name, f.name) and
+                            name[name.len - f.name.len - 1] == '\u{1f}')) break :poly;
+                    const v = f.value;
+                    if (v == .Null or v == .Delegate) break :poly;
+                    v.retain();
+                    if (pushed_enclosing) popEnclosing();
+                    try frame.write(gf.dst, v);
+                    return .cont;
+                }
+                if (r.route & 3 == 2) {
+                    const got_g = host.runFieldGetter(allocator, @enumFromInt(r.route >> 2), recv);
+                    if (pushed_enclosing) popEnclosing();
+                    switch (try got_g) {
+                        .ok => |v| {
+                            v.retain();
+                            try frame.write(gf.dst, v);
+                            return .cont;
+                        },
+                        .err => |e| return raiseStep(frame, e),
+                    }
+                }
+            }
         }
     }
     runtime.prof.opRoute(14);
@@ -6123,14 +6268,16 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
             v.retain();
             if (comptime @hasDecl(H, "fieldSiteRoute")) {
                 if (recv == .Instance and @atomicLoad(u64, @constCast(&gf.site_cls), .monotonic) == 0) {
-                    var claim_cls: u64 = 1;
-                    var claim_route: u64 = 0;
+                    // Claim only once a route exists. The (class, name) memo
+                    // fills lazily — and not at all while the dispatch
+                    // universe is still unstable — so a no-route first read
+                    // must leave the site unclaimed for a later read to
+                    // retry, or a warmup-executed hot site is pinned to the
+                    // slow ladder for the whole run.
                     if (host.fieldSiteRoute(&recv, name)) |r| {
-                        claim_cls = r.cls;
-                        claim_route = r.route;
-                    }
-                    if (@cmpxchgStrong(u64, @constCast(&gf.site_cls), 0, claim_cls, .acq_rel, .monotonic) == null) {
-                        if (claim_route != 0) @atomicStore(u64, @constCast(&gf.site_route), claim_route, .release);
+                        if (@cmpxchgStrong(u64, @constCast(&gf.site_cls), 0, r.cls, .acq_rel, .monotonic) == null) {
+                            if (r.route != 0) @atomicStore(u64, @constCast(&gf.site_route), r.route, .release);
+                        }
                     }
                 }
             }
@@ -6271,11 +6418,35 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
                     plan = host.fastCallPlan(frame.module, call.func);
                     @constCast(cf).fast_call = plan;
                 }
-                // `plan - 2` is the eligible arity; a positional, exact-arity
-                // call dispatches straight to the body.
-                if (plan >= 2 and plan - 2 == call.n_args) {
+                // The low bits carry the eligible arity + 2; a positional,
+                // exact-arity call dispatches straight to the body.
+                const plan_arity = plan & 0x3FFF;
+                if (plan_arity >= 2 and plan_arity - 2 == call.n_args) {
                     const buf = try readArgRun(allocator, frame, call.args, call.n_args);
                     const args_list: std.ArrayList(Value) = .{ .items = buf, .capacity = buf.len };
+                    // A receiver-carrying body: seed the caller's instance
+                    // `this` as the enclosing receiver exactly as the full
+                    // path below does (lexical scope for a member extension,
+                    // dispatch visibility for anything else).
+                    var pushed_enclosing = false;
+                    if (plan & ir.FAST_CALL_EXT_FLAG != 0) {
+                        if (frameThisParam(frame)) |ct_idx| {
+                            const p = frame.params.items[ct_idx];
+                            if (p == .Instance) {
+                                const same = args_list.items.len > 0 and args_list.items[0] == .Instance and
+                                    ObjRef(InstanceData).ptrEq(p.Instance, args_list.items[0].Instance);
+                                if (!same) {
+                                    if (cf.kind == .member_extension) {
+                                        pushEnclosing(&frame.params.items[ct_idx]);
+                                    } else {
+                                        pushEnclosingAccess(&frame.params.items[ct_idx]);
+                                    }
+                                    pushed_enclosing = true;
+                                }
+                            }
+                        }
+                    }
+                    if (plan & ir.FAST_CALL_EXT_FLAG != 0) dispatchBump(.static_flat_fuse_ext) else dispatchBump(.static_flat_fuse);
                     // The flat driver runs the body as a pushed activation in
                     // the same dispatch loop — no native recursion per call.
                     if (flatEnabled()) {
@@ -6283,10 +6454,18 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
                             host.flatPlainCallOpen(cf, args_list.items)
                         else
                             false;
-                        frame.flat_call = .{ .func = cf, .args = args_list, .composer_pushed = composer_pushed, .dst = call.dst };
+                        frame.flat_call = .{
+                            .func = cf,
+                            .args = args_list,
+                            .composer_pushed = composer_pushed,
+                            .dst = call.dst,
+                            .pop_enclosing_n = if (pushed_enclosing) 1 else 0,
+                        };
                         return .flat_call;
                     }
-                    switch (try host.callFuncFast(allocator, frame.module, call.func, args_list)) {
+                    const fast_res = try host.callFuncFast(allocator, frame.module, call.func, args_list);
+                    if (pushed_enclosing) popEnclosing();
+                    switch (fast_res) {
                         .ok => |result| try frame.write(call.dst, result),
                         .err => |e| return raiseStep(frame, e),
                     }
@@ -6700,6 +6879,21 @@ noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *F
     defer recv.release(allocator);
     const args = try readArgRun(allocator, frame, cv.args, cv.n_args);
     defer allocator.free(args);
+    // Flat virtual dispatch: a slot resolved against a named receiver class
+    // to an interpreted body at the fully-applied no-vararg shape runs as a
+    // pushed activation on this driver, skipping the recursive invoker's
+    // per-call frame ceremony. Everything else falls through unchanged.
+    if (comptime @hasDecl(H, "prepareVirtualFlatCall")) {
+        if (flatEnabled() and vcallFlatEnabled() and cv.arg_params == null and argNamesAllNull(cv.arg_names)) {
+            if (try host.prepareVirtualFlatCall(allocator, &recv, cv.slot, args)) |prep0| {
+                dispatchBump(.virtual_flat_prepare);
+                var prep = prep0;
+                prep.dst = cv.dst;
+                frame.flat_call = prep;
+                return .flat_call;
+            }
+        }
+    }
     const names = try resolveArgNames(allocator, frame.module, cv.arg_names);
     defer allocator.free(names);
     const prev_tl = if (cv.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
@@ -6737,6 +6931,21 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             defer if (dispatch_recv) |value| value.release(allocator);
             const ra = try readArgRun(allocator, frame, cm.args, cm.n_args);
             defer allocator.free(ra);
+            // A lowering-resolved plain member at the fully-applied no-vararg
+            // shape runs as a pushed activation; member extensions (which
+            // seed the dispatch receiver) and every padded/vararg shape keep
+            // the recursive invoker.
+            if (comptime @hasDecl(H, "prepareResolvedFlatCall")) {
+                if (flatEnabled() and vcallFlatEnabled() and argNamesAllNull(cm.arg_names)) {
+                    if (try host.prepareResolvedFlatCall(allocator, &recv, fid, ra)) |prep0| {
+                        dispatchBump(.resolved_flat_prepare);
+                        var prep = prep0;
+                        prep.dst = cm.dst;
+                        frame.flat_call = prep;
+                        return .flat_call;
+                    }
+                }
+            }
             const dispatch_ptr: ?*const Value = if (dispatch_recv) |*value|
                 value
             else
@@ -6812,6 +7021,34 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     }
     const static_recv: ?[]const u8 = if (cm.static_recv) |sid| constStr(frame.module, sid) else null;
     const declared_recv: ?[]const u8 = if (cm.declared_recv) |did| constStr(frame.module, did) else null;
+    // Site memo replay: the claimed (class, arg-signature) pair serves its
+    // recorded target without the string-keyed cache probe. The signature is
+    // the same strict fold the method cache keys under, so the replay can
+    // never serve an overload that cache would have discriminated.
+    if (comptime @hasDecl(H, "memberSiteSig") and @hasDecl(H, "prepareMemberFlatFromFid")) {
+        if (flatEnabled() and memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.arg_names)) {
+            const w0 = @atomicLoad(u64, @constCast(&cm.site_cls), .acquire);
+            if (w0 > 1) site: {
+                {
+                    const g = recv.Instance.borrow();
+                    defer g.deinit();
+                    if (w0 != @as(u64, @intCast(g.get().class.identity()))) break :site;
+                }
+                const route = @atomicLoad(u64, @constCast(&cm.site_route), .acquire);
+                if (route == 0) break :site;
+                const sig_now = host.memberSiteSig(arg_values) orelse break :site;
+                if (sig_now != @atomicLoad(u64, @constCast(&cm.site_sig), .monotonic)) break :site;
+                if (try host.prepareMemberFlatFromFid(allocator, &recv, name_str, arg_values, @enumFromInt(@as(u32, @intCast(route >> 1))))) |prep0| {
+                    dispatchBump(.member_site_flat);
+                    var prep = prep0;
+                    prep.dst = cm.dst;
+                    prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
+                    frame.flat_call = prep;
+                    return .flat_call;
+                }
+            }
+        }
+    }
     // Flat member dispatch: a previously-resolved user method (or cached
     // top-level extension) at the fully-applied no-vararg shape runs as a
     // pushed activation. The host consults the same caches the recursive
@@ -6833,6 +7070,28 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 var prep = prep0;
                 prep.dst = cm.dst;
                 prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
+                // Claim the site memo for the resolved target, keyed by the
+                // receiver class and the strict argument signature. Claimed
+                // only once resolution is stable (the same gate the host's
+                // own caches fill under) and only for the positional form.
+                if (comptime @hasDecl(H, "memberSiteSig")) {
+                    if (memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.arg_names) and
+                        dispatchCacheStable() and
+                        @atomicLoad(u64, @constCast(&cm.site_cls), .monotonic) == 0)
+                    {
+                        if (host.memberSiteSig(arg_values)) |sig| {
+                            const cls: u64 = blk: {
+                                const g = recv.Instance.borrow();
+                                defer g.deinit();
+                                break :blk @intCast(g.get().class.identity());
+                            };
+                            if (cls > 1 and @cmpxchgStrong(u64, @constCast(&cm.site_cls), 0, cls, .acq_rel, .monotonic) == null) {
+                                @atomicStore(u64, @constCast(&cm.site_sig), sig, .monotonic);
+                                @atomicStore(u64, @constCast(&cm.site_route), (@as(u64, prep.func.id.int()) << 1) | 1, .release);
+                            }
+                        }
+                    }
+                }
                 frame.flat_call = prep;
                 runtime.prof.opRoute(5);
                 return .flat_call;

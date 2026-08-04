@@ -129,6 +129,22 @@ fn resolveSuperThisReg(b: *FuncBuilder) Allocator.Error!?Reg {
 /// Path in value position, which resolves to the companion object.
 /// Everything else defers to `lowerExpr`.
 pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
+    // A receiver is a NESTED expression: the enclosing call's per-arg
+    // typing stash must never reach the receiver's own lambdas —
+    // `ByteArray(2) { it.toByte() }.scan("") { op }` typed the factory's
+    // `it` from scan's operation through exactly this leak. Shield the
+    // stash for the whole receiver lowering.
+    const sh_bm = b.pending_arg_broad_masks;
+    const sh_fg = b.pending_arg_fn_generic;
+    const sh_lp = b.pending_arg_lambda_param_types;
+    b.pending_arg_broad_masks = null;
+    b.pending_arg_fn_generic = null;
+    b.pending_arg_lambda_param_types = null;
+    defer {
+        b.pending_arg_broad_masks = sh_bm;
+        b.pending_arg_fn_generic = sh_fg;
+        b.pending_arg_lambda_param_types = sh_lp;
+    }
     if (expr.* == .Path and expr.Path.segments.len == 1) {
         const segments = expr.Path.segments;
         const n = segments[0].name;
@@ -2456,9 +2472,15 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 /// name has no statically known type here (an untyped local, an outer
 /// capture, or a name the enclosing class does not declare as a typed member).
 fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const u8 {
+    // Inside `val writer = writer`'s initializer the local's own name is
+    // free (recorded at the decl), so the reference is the enclosing
+    // member, never the shadow being declared.
+    const self_shadowed = init_self_name != null and std.mem.eql(u8, init_self_name.?, recv_name);
     // A local/param binding shadows an enclosing member of the same name.
-    if (b.resolve(recv_name) != null) return b.localDeclType(recv_name);
-    if (b.knowsOuter(recv_name)) return null;
+    if (!self_shadowed) {
+        if (b.resolve(recv_name) != null) return b.localDeclType(recv_name);
+        if (b.knowsOuter(recv_name)) return null;
+    }
     // The enclosing class, else the EXTENSION RECEIVER — a bare name inside
     // `fun UByteArray.indices()` is a member of the receiver, and a top-level
     // extension has no enclosing class at all, so the search stopped there.
@@ -3955,6 +3977,7 @@ fn instantiatedLambdaValueParams(
     type_args: []const ast.TypeRef,
     include_function_receiver: bool,
     recv: ?*const ir.TypeRef,
+    shapes: ?[]const applicability.ArgShape,
 ) Allocator.Error!?[]ir.TypeRef {
     const arity = fnTypeArityAlias(b, fn_ty) orelse return null;
     if (arity < 0) return null;
@@ -3969,6 +3992,30 @@ fn instantiatedLambdaValueParams(
         dst.* = try loweredOwnedLocalTypeRef(b, src);
     }
     var instantiated = blk: {
+        // The ENGINE: solve every binding the call site offers — receiver,
+        // typed value arguments, explicit type args — in one pass and
+        // substitute the lambda's declared fn type through it. The bare-tp
+        // guard below refuses whatever stays unsubstituted.
+        engine: {
+            if (std.mem.eql(u8, runtime.getenvSlice("KLIO_ENGINE_LAMBDA") orelse "1", "0")) break :engine;
+            const sh = shapes orelse break :engine;
+            var scratch = std.heap.ArenaAllocator.init(b.allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const solved = (b.module.solveCallBindings(
+                a,
+                func.id,
+                func,
+                if (recv) |r| r.* else null,
+                null,
+                sh,
+                explicit,
+                false,
+            ) catch break :engine) orelse break :engine;
+            if (solved.bindings.len == 0) break :engine;
+            const substituted = ir.Module.substituteBoundType(a, fn_ty, solved.bindings) catch break :engine;
+            break :blk try substituted.clone(b.allocator);
+        }
         // With no explicit type args, the ACTUAL receiver may bind the
         // callee's params (`Iterable<String>.count` binds T := String).
         if (type_args.len == 0) {
@@ -4020,8 +4067,15 @@ fn instantiatedLambdaValueParams(
     // slice when any entry's head stayed unsubstituted.
     const callee_tps = b.module.registry.func_type_params.get(func.id);
     for (out, instantiated.args[start .. start + count]) |*dst, src| {
+        const h = typeHead(std.mem.trimEnd(u8, src.name, "?"));
+        // A star-erased head names nothing either — the engine's erasure
+        // marks an UNSOLVED parameter, which is a null answer here.
+        if (std.mem.eql(u8, h, "*")) {
+            for (out[0..initialized]) |*ty| ty.deinit(b.allocator);
+            b.allocator.free(out);
+            return null;
+        }
         if (callee_tps) |tps| {
-            const h = typeHead(std.mem.trimEnd(u8, src.name, "?"));
             for (tps.items) |tp| {
                 if (std.mem.eql(u8, tp, h)) {
                     for (out[0..initialized]) |*ty| ty.deinit(b.allocator);
@@ -4116,6 +4170,11 @@ fn argLambdaParamTypesRecv(
     }
     if (args.len == 0 or func.params.len < recv_offset) return null;
     for (args) |*arg| if (arg.* == .Spread) return null;
+    // One shape build per call: the engine consumes value-argument
+    // evidence alongside the receiver and explicit type args.
+    var lam_shape_set = try buildStaticReturnArgShapes(b, args, arg_names);
+    defer lam_shape_set.deinit(b.allocator);
+    const lam_shapes = lam_shape_set.shapes;
     const params = func.params[recv_offset..];
     const out = try b.allocator.alloc(?[]ir.TypeRef, args.len);
     for (out) |*slot| slot.* = null;
@@ -4139,6 +4198,7 @@ fn argLambdaParamTypesRecv(
                 type_args,
                 callable_ref,
                 recv,
+                lam_shapes,
             );
             any = any or slot.* != null;
         }
@@ -4163,6 +4223,7 @@ fn argLambdaParamTypesRecv(
                     type_args,
                     callable_ref,
                     recv,
+                    lam_shapes,
                 );
                 any = any or slot.* != null;
             }
@@ -8840,7 +8901,13 @@ fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.
     // A local or a function of the same name is not a constructor call.
     if (b.resolve(ident.name) != null or b.knowsOuter(ident.name)) return null;
     if (b.module.funcId(ident.name) != null) return null;
-    const cid = b.module.classIdIndexed(ident.name, b.self_package, ident.span.file) orelse return null;
+    // A collision-mangled internal class (`SlotTable$fN`) is absent from the
+    // simple-name index. A same-file/package reference reaches it through
+    // the scope rename ladder; a cross-package one through its exact import,
+    // which still resolves by FQN.
+    const ref_name = scopeTypeRename(b, ident.name, ident.span.file.int()) orelse ident.name;
+    const cid = b.module.classIdIndexed(ref_name, b.self_package, ident.span.file) orelse
+        b.module.classIdExactImport(ident.name, ident.span.file) orelse return null;
     // A MEMBER of the enclosing receiver shadows the constructor, exactly as
     // the emission router decides it (`fun Foo(): Bar` inside Host makes a
     // bare `Foo()` the member call). Typing the local as the class here bound
@@ -9156,6 +9223,35 @@ fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.
         if (try localInitTypeRef(b, init_expr)) |aliased| {
             if (norecvCensusOn()) lm_localinit[1] += 1;
             return aliased;
+        }
+        // A bare own-member snapshot: `val slots = slots` (the local's own
+        // name is not in scope inside its initializer, so the reference is
+        // the enclosing class's property) or `val w = writer` under another
+        // name. The property's declared head types the local exactly as the
+        // qualified `this.slots` read would.
+        const src_name = init_expr.Path.segments[0].name;
+        if (b.resolve(src_name) == null or std.mem.eql(u8, src_name, name)) {
+            if (b.ownerClass()) |owner| {
+                if (propTypeHeadOn(b, owner, src_name)) |head| {
+                    // Two same-simple-name classes (the gapbuffer and
+                    // linkbuffer SlotWriters) make a bare head ambiguous;
+                    // resolve it through the reading file's import graph to
+                    // the declaring class's FQN when possible.
+                    const resolved_name: []const u8 = blk: {
+                        const file = init_expr.Path.segments[0].span.file;
+                        const cid = b.module.classIdIndexed(typeHead(head), b.self_package, file) orelse
+                            b.module.classId(typeHead(head)) orelse break :blk head;
+                        if (cid.int() >= b.module.classes.items.len) break :blk head;
+                        break :blk b.module.classes.items[cid.int()].fqn;
+                    };
+                    if (norecvCensusOn()) lm_localinit[1] += 1;
+                    return ir.TypeRef{
+                        .name = try b.allocator.dupe(u8, resolved_name),
+                        .nullable = false,
+                        .args = &.{},
+                    };
+                }
+            }
         }
     }
     // A property read carries its own declared type; nothing needs resolving.
@@ -10189,7 +10285,7 @@ fn enrichLambdaArgShapes(
     }
 }
 
-fn buildStaticReturnArgShapes(
+pub fn buildStaticReturnArgShapes(
     b: *FuncBuilder,
     args: []const Expr,
     arg_names: []const ?[]const u8,
@@ -14926,6 +15022,46 @@ fn lowerResolvedExtensionCall(
             deinitArgLambdaParamTypes(b.allocator, types);
         b.pending_arg_lambda_param_types = inline_lambda_param_types;
         defer b.pending_arg_lambda_param_types = null;
+        // Engine step four: solve the callee's bindings ONCE (receiver +
+        // typed args) and hand them to the WINDOW as full bound refs —
+        // every in-window consumer (the bare return arm, substitutionRecv,
+        // element typing) then sees the call-site instantiation for every
+        // fn type parameter, argument-bound ones included. Registry-stable
+        // fn-tp names only; owner identities stay per-channel.
+        {
+            var sc2 = std.heap.ArenaAllocator.init(b.allocator);
+            defer sc2.deinit();
+            const a2 = sc2.allocator();
+            var sh_set2 = try buildStaticReturnArgShapes(b, selected_values, selected_names);
+            defer sh_set2.deinit(b.allocator);
+            if (b.module.solveCallBindings(a2, func_id, target, recv_ty, null, sh_set2.shapes, &.{}, false) catch null) |solved2| blk_s4: {
+                const fn_tps = b.module.registry.func_type_params.get(func_id) orelse break :blk_s4;
+                var outl: std.ArrayList(ir.Module.TypeBinding) = .empty;
+                errdefer {
+                    for (outl.items) |*e| {
+                        var t = e.ty;
+                        t.deinit(b.allocator);
+                    }
+                    outl.deinit(b.allocator);
+                }
+                for (solved2.bindings) |sb| {
+                    const h2 = typeHead(std.mem.trimEnd(u8, sb.ty.name, "?"));
+                    if (std.mem.eql(u8, h2, "*") or h2.len == 0) continue;
+                    var stable: ?[]const u8 = null;
+                    for (fn_tps.items) |tp| {
+                        if (std.mem.eql(u8, tp, sb.name)) {
+                            stable = tp;
+                            break;
+                        }
+                    }
+                    const sname = stable orelse continue;
+                    try outl.append(b.allocator, .{ .name = sname, .ty = try sb.ty.clone(b.allocator) });
+                }
+                if (outl.items.len != 0) {
+                    b.module.pending_splice_solved = try outl.toOwnedSlice(b.allocator);
+                } else outl.deinit(b.allocator);
+            }
+        }
         const expected = b.peekExpected();
         const expected_ptr: ?*const ast.TypeRef = if (expected) |*ty| ty else null;
         return try tryInlineCallWithTypeArgs(
