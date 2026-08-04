@@ -1808,3 +1808,24 @@ mapped), AbstractMutableCollection retain/remove iterator loops,
 nested `compareBy { it.take(2) }` (the inner lambda belongs to a
 DIFFERENT callee than the window), `list`/`destination` families
 unchanged (substitution engine). declined 87 unmoved by this arc.
+
+## Addendum 23 — short-circuit narrowing (2026-08-04)
+
+`&&`/`||` EXPRESSIONS now narrow their right operand by the left
+side's proofs (is-checks + null-checks, if-arm parity; 23e1a9e9,
+pinned and_chain_smartcast). nullable_or_generic 120 -> 78,
+bound +82 on a +50 site denominator. With 51cccf75's partial
+receiver substitution (return-only params no longer block the
+proven bindings), the cycle stands at: no_receiver 1,078 on 9,542
+sites (86.9% bound), no_class 4, declined 87.
+
+Next named families, probe-ready:
+- AbstractMutableCollection `val it = iterator()` loops (12 rows):
+  a LOCAL named `it` initialized from a bare call to the enclosing
+  class's own abstract member — the init-typing channel does not
+  resolve a bare member call against the enclosing hierarchy when
+  the simple name is program-wide ambiguous. The fix is owner-first
+  resolution in staticCallReturnTypeRef's bare-call arm.
+- `list` 67 / `destination` 33 — unchanged, substitution engine.
+- Unsigned `sum`/`indexOfFirst` splice rows ride storage-mapped
+  contexts (the splice window's receiver is the STORAGE array).
