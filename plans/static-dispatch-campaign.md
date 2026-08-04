@@ -2100,3 +2100,10 @@ Residual 770: Path locals 406 (it 72, iterator 24, value/result/
 index/expected/acc tails — substitution-engine and per-family), the
 remaining Member chains (~106), Call receivers 180 (not_simple_callee
 142 + no_func 80 + ambiguous 24), Binary 50.
+
+## Addendum 37 — companion-constant reads (2026-08-04)
+
+Companion property heads register under `<Class>$Companion` (the walk
+had skipped nested is_companion Decl.Class members entirely) and both
+class-named read forms consult them. no_receiver 770 -> 690 (7.38%),
+bound 90.7% — the session arc is 1,172 -> 690 and 85.3% -> 90.7%.
