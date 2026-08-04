@@ -97,3 +97,27 @@ frame_push under KLIO_DISPATCH_STATS. Baseline: 11,571,366 frames /
 one stdlib census run (36.98% of counted dispatch events) — the
 denominator P1/P2 exist to shrink. Compose gauge stands at 13.5s vs
 the 10s budget.
+
+## P1 recon (2026-08-04): frames already pool — spec adjusted
+
+`acquireRegs`/`releaseRegs` already recycle register buffers through
+a per-thread pool (top-of-stack, size-checked reuse; outermost
+teardown drains). The remaining per-frame costs are therefore:
+- pool MISSES (top-only size check — a mismatched top loses the
+  whole pool for that call),
+- the per-frame `appendNTimes(.Unit, n)` zero-fill (11.5M frames ×
+  avg regs of Unit writes),
+- and the callFuncTyped/Named/callFunc LADDER around every call —
+  which the profile already named as the dominant cost.
+
+ADJUSTMENT: fold P1 into P2 — the flattened engine's frames live on
+the contiguous stack with lazy/whole-span initialization, and call
+fusion bypasses the ladder in the same stroke. The standalone
+"contiguous frames under the recursive eval" slice would re-plumb
+memory the pool already serves; the measured costs all sit in the
+path P2 replaces. P0's frame_push counter remains the denominator;
+the compose 13.5s margin remains the gauge.
+
+Next context: begin P2 with the flattening pass over the simple-inst
+subset (Move/Const/BinOp/UnOp/Branch/Goto/Return), KLIO_FLAT_VM
+gated off, bench_corpus + full battery as the parity gate.
