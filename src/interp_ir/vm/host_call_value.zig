@@ -207,6 +207,11 @@ fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, cap
     }
     var call_args: std.ArrayList(Value) = .empty;
     try call_args.appendSlice(allocator, args);
+    if (callValueTraceOn()) {
+        for (call_args.items, 0..) |*av, ai| {
+            std.debug.print("[flat-prep] body=#{d} #{d} kind={s}\n", .{ info.body_func.int(), ai, @tagName(std.meta.activeTag(av.*)) });
+        }
+    }
     var capture_values: std.ArrayList(Value) = .empty;
     {
         const g = captures.borrow();

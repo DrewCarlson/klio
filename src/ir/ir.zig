@@ -2078,7 +2078,7 @@ pub const Module = struct {
 
     /// Class-identity hierarchy check used where simple names are not enough
     /// to prove Kotlin visibility or dispatch ownership.
-    fn classIdIsOrExtends(self: *const Module, sub: ClassId, super: ClassId) bool {
+    pub fn classIdIsOrExtends(self: *const Module, sub: ClassId, super: ClassId) bool {
         if (super.int() >= self.classes.items.len) return false;
         return self.classIdIsOrExtendsDepth(sub, super, 0);
     }
@@ -3731,6 +3731,15 @@ pub const Module = struct {
             {
                 return .incompatible;
             }
+            // A generic pair judges through the args-aware prover: the
+            // head-only tail proved `List<String>` against an instantiated
+            // `List<List<String>>` (`Box<List<String>>.put(xs: List<T>)`)
+            // and the wrong overload won. Heads still adjudicate first
+            // inside; absent-args grace and projections apply there.
+            if (ty.args.len != 0 or param.args.len != 0) {
+                sac_route = "generic-tail";
+                return self.staticGenericArgCompatibility(fid, ty, param, 0);
+            }
             sac_route = "recv-compat-tail";
             return self.staticReceiverCompatibility(fid, ty, param);
         }
@@ -3842,7 +3851,17 @@ pub const Module = struct {
             }
         };
         var result: StaticCompatibility = .compatible;
-        for (args, params[0..args.len]) |arg, param| {
+        // A trailing lambda maps to the LAST parameter across defaulted
+        // middles, exactly as the extension ranker and arity mapping do.
+        const trailing_lambda_arg = args.len != 0 and
+            (args[args.len - 1].is_lambda or args[args.len - 1].lambda_arity != null or
+                args[args.len - 1].func_typed);
+        for (args, 0..) |arg, ai| {
+            const param = if (trailing_lambda_arg and ai + 1 == args.len and
+                args.len <= params.len)
+                params[params.len - 1]
+            else
+                params[ai];
             const instantiated_param = if (bindings.items.len == 0)
                 param.ty
             else
@@ -4475,13 +4494,54 @@ pub const Module = struct {
                 // conservative until it models repeated vararg element slots.
                 compatibility = .unknown;
             } else {
-                for (args, f.params[1 .. 1 + args.len]) |arg, param| {
-                    const arg_compatibility = self.staticArgCompatibility(
-                        fid,
-                        arg,
-                        param.ty,
-                        ctx.actual_type_param_bounds,
-                    );
+                // A trailing lambda fills the LAST parameter even when
+                // defaulted parameters are omitted between (`windowed(2, 3)
+                // { transform }` maps the lambda past `partialWindows`);
+                // judging it positionally refuted the overload kotlinc binds.
+                const trailing_lambda_arg = args.len != 0 and
+                    (args[args.len - 1].is_lambda or args[args.len - 1].lambda_arity != null or
+                        args[args.len - 1].func_typed);
+                for (args, 0..) |arg, ai| {
+                    const pi = if (trailing_lambda_arg and ai + 1 == args.len and
+                        1 + args.len <= f.params.len)
+                        f.params.len - 1
+                    else
+                        1 + ai;
+                    const param = f.params[pi];
+                    // The RECEIVER's instantiation constrains the callee's
+                    // own type parameters before any argument is judged:
+                    // `plus(elements: Iterable<T>)` on a `List<List<String>>`
+                    // receiver requires `Iterable<List<String>>`, so a
+                    // `List<String>` argument REFUTES the candidate — the
+                    // raw `Iterable<T>` judged String-vs-T as "own tp,
+                    // anything goes" and falsely proved it. Substitute what
+                    // the receiver binds, then judge; unbound params keep
+                    // the raw path.
+                    var judged_param = param.ty;
+                    var subst_param: ?TypeRef = null;
+                    if (arg.ty != null and
+                        self.staticTypeContainsFuncParam(fid, param.ty))
+                    {
+                        if (self.instantiatedTypeFromReceiverPartial(
+                            sa,
+                            fid,
+                            param.ty,
+                            scoped_receiver,
+                        ) catch null) |s| {
+                            subst_param = s;
+                            judged_param = s;
+                        }
+                    }
+                    const arg_compatibility = if (subst_param != null and
+                        !self.staticTypeContainsFuncParam(fid, judged_param))
+                        self.staticGenericArgCompatibility(fid, arg.ty.?, judged_param, 0)
+                    else
+                        self.staticArgCompatibility(
+                            fid,
+                            arg,
+                            judged_param,
+                            ctx.actual_type_param_bounds,
+                        );
                     if (rex_trace) {
                         std.debug.print("[rex-arg] {s} fid={d} param={s} arg_ty={s} -> {s} route={s}\n", .{
                             name,
@@ -4866,6 +4926,28 @@ pub const Module = struct {
                 if (!family) if (self.decl_sigs.get(existing.int())) |es| if (es.enclosing_class) |eo| {
                     if (self.overridesSlot(sa, eo, existing, fid) catch false) family = true;
                 };
+                if (!family) {
+                    // DIAMOND family: neither declaration overrides the
+                    // other, but both override one slot the RESOLUTION
+                    // owner inherits (`AbstractMutableCollection` sees
+                    // `iterator` from both `AbstractCollection` and
+                    // `MutableCollection`). Kotlin merges these into one
+                    // intersection slot; keep the declaration with the
+                    // more specific return type.
+                    const cand_o = self.overridesSlot(sa, owner, fid, existing) catch false;
+                    const exist_o = self.overridesSlot(sa, owner, existing, fid) catch false;
+                    if (cand_o or exist_o) {
+                        family = true;
+                        const cf = self.funcById(fid);
+                        const ef = self.funcById(existing);
+                        if (cf != null and ef != null and
+                            self.staticReceiverCompatibility(null, cf.?.return_ty, ef.?.return_ty) == .compatible and
+                            self.staticReceiverCompatibility(null, ef.?.return_ty, cf.?.return_ty) != .compatible)
+                        {
+                            best = fid;
+                        }
+                    }
+                }
                 if (!family) tied = true;
             }
         }
@@ -5634,6 +5716,34 @@ pub const Module = struct {
         if (!try self.bindCallType(a, f.params[0].ty, receiver, tps, &bindings, 0)) return null;
         if (bindings.items.len == 0) return null;
         if (!returnTypeBindingsComplete(ty, tps, bindings.items)) return null;
+        const substituted = try substituteType(a, ty, bindings.items);
+        return try substituted.clone(allocator);
+    }
+
+    /// `instantiatedTypeFromReceiver` without the completeness requirement:
+    /// substitute the parameters the receiver DOES bind and leave the rest
+    /// as written. For a `minOfWith(comparator) { selector }` the receiver
+    /// binds `T` but not the return-only `R`; the lambda-param consumer
+    /// needs the value-param portion (`T`), and its own guard refuses any
+    /// entry whose head stayed a bare parameter.
+    pub fn instantiatedTypeFromReceiverPartial(
+        self: *const Module,
+        allocator: Allocator,
+        fid: FuncId,
+        ty: TypeRef,
+        receiver: TypeRef,
+    ) Allocator.Error!?TypeRef {
+        const f = self.funcById(fid) orelse return null;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) return null;
+        const tp_list = self.registry.func_type_params.get(fid);
+        const tps: []const []const u8 = if (tp_list) |list| list.items else &.{};
+        if (tps.len == 0) return null;
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var bindings: std.ArrayList(TypeBinding) = .empty;
+        if (!try self.bindCallType(a, f.params[0].ty, receiver, tps, &bindings, 0)) return null;
+        if (bindings.items.len == 0) return null;
         const substituted = try substituteType(a, ty, bindings.items);
         return try substituted.clone(allocator);
     }

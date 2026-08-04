@@ -1163,7 +1163,20 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
         b.terminate(.{ .Branch = .{ .cond = l, .t = then_b, .f = else_b } });
         if (op == .And) {
             b.switchTo(then_b);
+            // The right operand sees every proof the left one establishes:
+            // `it is UByte && it.toByte() ...` smart-casts `it` for the
+            // member call, exactly as an `if` guard narrows its then-arm.
+            var narrowed: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer narrowed.deinit(b.allocator);
+            try narrowIsCheckAll(b, lhs, &narrowed);
+            var not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer not_null.deinit(b.allocator);
+            try narrowNullCheckAll(b, lhs, true, &not_null);
             const rv = try lowerExpr(b, rhs);
+            var nn = not_null.items.len;
+            while (nn > 0) : (nn -= 1) b.restoreLocal(not_null.items[nn - 1]);
+            var ni = narrowed.items.len;
+            while (ni > 0) : (ni -= 1) b.restoreLocal(narrowed.items[ni - 1]);
             try b.push(.{ .Move = .{ .dst = dst, .src = rv } });
             b.terminate(.{ .Goto = join });
             b.switchTo(else_b);
@@ -1176,7 +1189,14 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
             try b.push(.{ .Move = .{ .dst = dst, .src = true_r } });
             b.terminate(.{ .Goto = join });
             b.switchTo(else_b);
+            // `x == null || x.m()` runs its right operand only when the
+            // left is false, which proves the null-checks' falsy side.
+            var else_not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
+            defer else_not_null.deinit(b.allocator);
+            try narrowNullCheckAll(b, lhs, false, &else_not_null);
             const rv = try lowerExpr(b, rhs);
+            var en = else_not_null.items.len;
+            while (en > 0) : (en -= 1) b.restoreLocal(else_not_null.items[en - 1]);
             try b.push(.{ .Move = .{ .dst = dst, .src = rv } });
             b.terminate(.{ .Goto = join });
         }
@@ -3953,7 +3973,11 @@ fn instantiatedLambdaValueParams(
         // callee's params (`Iterable<String>.count` binds T := String).
         if (type_args.len == 0) {
             if (recv) |r| {
-                if (try b.module.instantiatedTypeFromReceiver(
+                // Partial substitution: a return-only parameter (`R` in
+                // `minOfWith`'s selector) must not block binding the ones
+                // the receiver proves; the bare-tp guard below refuses any
+                // entry that stayed unsubstituted.
+                if (try b.module.instantiatedTypeFromReceiverPartial(
                     b.allocator,
                     func.id,
                     fn_ty,
@@ -8590,11 +8614,21 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         // source type stays as evidence.
         if (b.spliceParamTy(p.segments[0].name)) |declared| {
             if (declared.function == null) {
-                return .{
-                    .name = declared.name.name,
-                    .nullable = declared.nullable,
-                    .args = &.{},
-                };
+                // A declared head that is itself a TYPE PARAMETER of the
+                // spliced declaration (`destination: M`) names nothing the
+                // receiving scope can bind; the entry records the
+                // ARGUMENT's derived type under the local-decl channel
+                // below, and that concrete head must win.
+                const dh = declared.name.name;
+                const tp_head = ((dh.len > 0 and dh.len <= 2 and
+                    std.ascii.isUpper(dh[0])) or b.isTypeParam(dh));
+                if (!tp_head) {
+                    return .{
+                        .name = declared.name.name,
+                        .nullable = declared.nullable,
+                        .args = &.{},
+                    };
+                }
             }
         }
     }
@@ -9360,6 +9394,49 @@ fn staticCallReturnTypeRef(
                 if (f.kind != .plain) break :blk_sole null;
                 break :blk_sole t;
             };
+            // When EVERY plain declaration of the name agrees on a concrete
+            // return head, the head is authoritative without picking a fid:
+            // `listOf(x)` beside `listOf(vararg)` both answer List, and the
+            // receiver context that blocks a confident pick cannot change
+            // what any pick would return. Args are kept only when every
+            // declaration's full return matches.
+            //
+            // MEASURED NET-NEGATIVE as a default (KLIO_AGREED_RET=1 to
+            // re-probe): -72 census sites, but two behavioral collaterals —
+            // SequenceTest.windowed's transform pipeline and the
+            // HexExtensions property-init lambda (its Char param bound Int)
+            // — both through downstream channels the new receiver typing
+            // armed. The conversions return when those channels are fixed.
+            const agreed_return: ?ir.TypeRef = blk_agree: {
+                if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_AGREED_RET") orelse "0", "1")) break :blk_agree null;
+                if (top_level_usable) break :blk_agree null;
+                if (enclosingHasMemberNamed(b, name.name)) break :blk_agree null;
+                // A name ANY class declares as a member may be a receiver
+                // member here (`iterator()` inside a Sequence extension is
+                // `this.iterator()`) — the agreed top-level return would
+                // type it from the wrong declarations entirely.
+                if (b.module.registry.class_member_names.contains(name.name)) break :blk_agree null;
+                const fids = b.module.funcsBySimpleName(name.name);
+                if (fids.len < 2) break :blk_agree null;
+                var seen: ?ir.TypeRef = null;
+                var args_agree = true;
+                for (fids) |fid2| {
+                    const f2 = b.module.funcById(fid2) orelse break :blk_agree null;
+                    if (f2.kind != .plain) continue;
+                    if (seen) |prev| {
+                        if (!std.mem.eql(u8, prev.name, f2.return_ty.name)) break :blk_agree null;
+                        if (prev.args.len != f2.return_ty.args.len) args_agree = false;
+                    } else seen = f2.return_ty;
+                }
+                var ret = seen orelse break :blk_agree null;
+                const h = typeHead(std.mem.trimEnd(u8, ret.name, "?"));
+                if (h.len == 0 or std.mem.eql(u8, h, "Unit") or
+                    (h.len <= 2 and std.ascii.isUpper(h[0])) or b.isTypeParam(h))
+                    break :blk_agree null;
+                if (staticTypeClassId(b, ret) == null) break :blk_agree null;
+                if (!args_agree) ret.args = &.{};
+                break :blk_agree ret;
+            };
             target = (if (top_level_usable) res.target else null) orelse blk: {
                 from_implicit_receiver = true;
                 // A BARE call in a receiver context is usually a member of the
@@ -9374,10 +9451,19 @@ fn staticCallReturnTypeRef(
                 // extension receivers and narrows.
                 const head_name = bareStaticRecvHead(b) orelse b.ownerClass() orelse {
                     if (bt) std.debug.print("[bareret] {s} no recv head\n", .{name.name});
-                    break :blk sole_global orelse return null;
+                    break :blk sole_global orelse {
+                        if (agreed_return) |ar| return try ar.clone(b.allocator);
+                        return null;
+                    };
                 };
                 const recv_ref = if (b.spliceHintActive())
-                    (if (b.spliceHintRecvRef()) |rt|
+                    // The window's ACTUAL receiver type wins over the
+                    // declared one: `Iterable<String>` instantiates the
+                    // bare `iterator()`'s return where `Iterable<T>`
+                    // leaves the callee's own parameter in it.
+                    (if (b.spliceRecvTyRef()) |art|
+                        try art.clone(b.allocator)
+                    else if (b.spliceHintRecvRef()) |rt|
                         try decl_mod.loweredTypeRef(b.allocator, &rt, true)
                     else
                         null)
@@ -9433,7 +9519,10 @@ fn staticCallReturnTypeRef(
                         break :blk t;
                     }
                     if (bt) std.debug.print("[bareret] {s} no owner for {s}\n", .{ name.name, ident });
-                    break :blk sole_global orelse return null;
+                    break :blk sole_global orelse {
+                        if (agreed_return) |ar| return try ar.clone(b.allocator);
+                        return null;
+                    };
                 };
                 // The lexical owner makes PRIVATE members visible to their
                 // own class's bodies (`findClause` inside trySelectInternal).
@@ -9456,11 +9545,25 @@ fn staticCallReturnTypeRef(
                         .receiver_type = bare_recv,
                     },
                 );
-                if (bt) std.debug.print("[bareret] {s} on {s} target={s}\n", .{
+                if (bt) std.debug.print("[bareret] {s} on {s} target={s} owner_fqn={s} applicable={} stub={} fn={s}\n", .{
                     name.name,
                     ident,
                     if (bare_resolved.target != null) "yes" else "no",
+                    b.module.classFqnById(owner) orelse "-",
+                    bare_resolved.applicable,
+                    if (owner.int() < b.module.classes.items.len) b.module.classes.items[owner.int()].is_stub else false,
+                    build.currentRealFn() orelse "-",
                 });
+                if (bt and bare_resolved.target == null) {
+                    std.debug.print("[bareret]   tower_n={d} encl={s} recv={s}\n", .{
+                        b.implicit_receiver_tower.items.len,
+                        b.enclosingRecvTy() orelse "-",
+                        b.recvTy() orelse "-",
+                    });
+                    for (b.implicit_receiver_tower.items) |entry| {
+                        std.debug.print("[bareret]   tower entry head={s}\n", .{entry.head});
+                    }
+                }
                 if (bare_resolved.target) |member_target| break :blk member_target;
                 // No member serves it, and none is even applicable: a bare
                 // call in a receiver context may be an EXTENSION of the
@@ -9531,7 +9634,10 @@ fn staticCallReturnTypeRef(
                         outer_recv.deinit(b.allocator);
                     }
                 }
-                break :blk sole_global orelse return null;
+                break :blk sole_global orelse {
+                        if (agreed_return) |ar| return try ar.clone(b.allocator);
+                        return null;
+                    };
             };
             // A plain lambda that captures its lexical class receiver makes
             // bare-call emission conservative, but an unknown receiver lambda
@@ -9831,9 +9937,11 @@ fn staticCallReturnTypeRef(
     if (call.callee.* == .Path and call.callee.Path.segments.len == 1 and
         bareRetTraceFor(b, call.callee.Path.segments[0].name))
     {
-        std.debug.print("[bareret] {s} return={s}\n", .{
+        std.debug.print("[bareret] {s} return={s} args={d} fn={s}\n", .{
             call.callee.Path.segments[0].name,
             if (inferred) |i| i.name else "<null>",
+            if (inferred) |i| i.args.len else 0,
+            build.currentRealFn() orelse "-",
         });
     }
     if (call.callee.* == .Member and bareRetTraceFor(b, call.callee.Member.name.name)) {
@@ -13123,6 +13231,24 @@ fn lowerUnresolvedBareCall(
             // own receiver type, which carries the type arguments an overload
             // set that differs by element type needs.
             if (b.spliceHintActive()) {
+                // The window's ACTUAL receiver record wins when its head
+                // is (or extends) the declared one: `List<List<String>>`
+                // carries the instantiation the declared `Collection<T>`
+                // quotes as the callee's own parameter — and that
+                // parameter NAME can capture into an inner callee's
+                // same-named one.
+                if (b.spliceRecvTyRef()) |art| {
+                    const ah = typeHead(std.mem.trimEnd(u8, art.name, "?"));
+                    const fits = std.mem.eql(u8, ah, head_name) or fit: {
+                        const a_cid = b.module.uniqueClassIdBySimpleName(ah) orelse break :fit false;
+                        const d_cid = b.module.uniqueClassIdBySimpleName(head_name) orelse break :fit false;
+                        break :fit b.module.classIdIsOrExtends(a_cid, d_cid);
+                    };
+                    if (fits) {
+                        owned_recv_ty = try art.clone(b.allocator);
+                        break :blk owned_recv_ty.?;
+                    }
+                }
                 if (b.spliceHintRecvRef()) |rt| {
                     if (std.mem.eql(u8, typeHead(rt.name.name), head_name)) {
                         owned_recv_ty = try decl_mod.loweredTypeRef(b.allocator, &rt, true);
@@ -15310,6 +15436,38 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     // captures the enclosing lambda's, instead of binding a spurious null
     // parameter.
     const uarg_arity: ?[]const i16 = try memberCallArgArities(b, receiver, name.name, args, ast_arg_names);
+    // The dispatch stays deferred (a runtime subtype might serve the name
+    // as a MEMBER), but kotlinc types the argument lambdas against the
+    // STATIC declared-type resolution — which, with no member on the
+    // static type, is the extension candidate. Thread its instantiated
+    // param types so the closure bodies type their params.
+    var deferred_lambda_param_types: ?[]?[]ir.TypeRef = null;
+    defer if (deferred_lambda_param_types) |types|
+        deinitArgLambdaParamTypes(b.allocator, types);
+    if (declared_ty) |recv_ty| blk: {
+        var any_lambda = false;
+        for (args) |*a| {
+            if (a.* == .Lambda or a.* == .AnonFun) {
+                any_lambda = true;
+                break;
+            }
+        }
+        if (!any_lambda) break :blk;
+        const ext = try resolveExtensionCallForArgs(b, recv_ty, name, args, ast_arg_names);
+        const target_id = ext.target orelse break :blk;
+        const target = b.module.funcById(target_id) orelse break :blk;
+        var rt = recv_ty;
+        deferred_lambda_param_types = try argLambdaParamTypesRecv(
+            b,
+            target,
+            args,
+            ast_arg_names,
+            ast_type_args,
+            1,
+            substitutionRecv(b, &rt),
+        );
+        b.pending_arg_lambda_param_types = deferred_lambda_param_types;
+    }
     const run = try lowerArgRunWithArity(b, args, uarg_arity);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();

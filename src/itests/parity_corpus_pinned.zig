@@ -1594,6 +1594,51 @@ test "bound_args_lambda_param" {
     );
 }
 
+test "bound_args_lambda_replay" {
+    try check("bound_args_lambda_replay",
+        \\cs,cs
+        \\2
+        \\
+    );
+}
+
+test "member_overload_receiver_instantiation" {
+    try check("member_overload_receiver_instantiation",
+        \\one
+        \\list
+        \\
+    );
+}
+
+test "plus_element_inference" {
+    try check("plus_element_inference",
+        \\[[s], [a]]
+        \\[[s], [a]]
+        \\[[s], [a]]
+        \\
+    );
+}
+
+test "jit_char_tag_rebox" {
+    try check("jit_char_tag_rebox",
+        \\a
+        \\b
+        \\a
+        \\b
+        \\
+    );
+}
+
+test "and_chain_smartcast" {
+    try check("and_chain_smartcast",
+        \\true
+        \\false
+        \\true
+        \\false
+        \\
+    );
+}
+
 test "nested_it_shadow_local_ext" {
     try check("nested_it_shadow_local_ext",
         \\[, abc, sort]

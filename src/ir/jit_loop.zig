@@ -143,6 +143,13 @@ pub const CallSite = struct {
     /// native loop does not execute `.Trace`, so the frame's span is otherwise
     /// stale when a trampolined call throws.
     span: ?ir.Span = null,
+    /// The register whose LIVE tag governs each argument's rebox. The native
+    /// code copies argument SLOTS through `Move`s without touching the tag
+    /// array, so a trampolined callee's refreshed result tag must be read
+    /// through the move chain's SOURCE — `action(index++, item)` otherwise
+    /// reboxed `item` (a Char produced by an unresolved `next()`) with the
+    /// stale static Int tag and the closure received its code as an Int.
+    arg_tag_regs: [3]u32 = .{ 0, 0, 0 },
     /// Member-call fields. `is_member` selects `receiver.name(args)` dispatch;
     /// scalar receivers are rebuilt from slots and object receivers stay boxed.
     /// `recv_class` is the receiver's class identity at compile time, re-checked at
@@ -521,6 +528,30 @@ const InlineSite = struct {
 /// that can appear in a compiled loop body, including object-producing ops that
 /// `instReadsDef` deliberately omits). Used to confirm a register is loop-
 /// invariant — defined outside the loop, never written inside.
+/// The register whose LIVE tag governs `reg`'s rebox at the call at
+/// `call_idx`: walk same-block `Move`s backward (arg slots are filled by
+/// Moves immediately before their call), redirecting through each; any
+/// other definition of the current register terminates the chain there.
+fn argTagSourceReg(insts: []const Inst, call_idx: usize, reg: u32) u32 {
+    var r = reg;
+    var i = call_idx;
+    while (i > 0) {
+        i -= 1;
+        const inst = &insts[i];
+        if (inst.* == .Move) {
+            const mv = inst.Move;
+            if (mv.dst.int() == r) {
+                r = mv.src.int();
+                continue;
+            }
+        }
+        if (instAnyDst(inst)) |d| {
+            if (d.int() == r) break;
+        }
+    }
+    return r;
+}
+
 fn instAnyDst(inst: *const Inst) ?Reg {
     return switch (inst.*) {
         .Const => |x| x.dst,
@@ -2839,6 +2870,15 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     break;
                 }
             }
+            // Per-arg live-tag source through the move chain (see
+            // `CallSite.arg_tag_regs`).
+            var arg_tag_regs: [3]u32 = .{ 0, 0, 0 };
+            {
+                var q: u8 = 0;
+                while (q < n_args and q < 3) : (q += 1) {
+                    arg_tag_regs[q] = argTagSourceReg(blk_insts, i, args_reg + q);
+                }
+            }
             if (is_load_global) {
                 const lg = trampolinableGlobalOf(module, inst).?;
                 if (lg.dst.int() >= n_regs) return null;
@@ -2898,6 +2938,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .block = bid,
                     .inst = @intCast(i),
                     .span = span,
+                    .arg_tag_regs = arg_tag_regs,
                     .is_call_value = true,
                 }) catch return null;
             } else if (is_obj_index) {
@@ -3062,6 +3103,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .block = bid,
                     .inst = @intCast(i),
                     .span = span,
+                    .arg_tag_regs = arg_tag_regs,
                     .is_member = true,
                     .recv_reg = mc.recv.int(),
                     .name = mc.name,
