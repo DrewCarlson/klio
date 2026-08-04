@@ -937,6 +937,10 @@ pub const DispatchKind = enum(u8) {
     /// the flat driver instead of through the recursive invoker.
     virtual_flat_prepare,
     resolved_flat_prepare,
+    /// Exact static calls fused by the cached fast plan, split by whether
+    /// the widened receiver-carrying admission served them.
+    static_flat_fuse,
+    static_flat_fuse_ext,
     /// VM-plan P0 baseline: every interpreter frame constructed. P1's
     /// contiguous stack and P2's call fusion drive this denominator down
     /// per call; the compose margin is the external gauge.
@@ -6151,13 +6155,17 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
     if (comptime @hasDecl(H, "fieldSiteRoute")) {
         if (recv == .Instance) {
             const w0 = @atomicLoad(u64, @constCast(&gf.site_cls), .acquire);
+            var site_mismatch = false;
             if (w0 > 1) fast: {
                 var getter_fid: u64 = 0;
                 {
                     const g = recv.Instance.borrow();
                     defer g.deinit();
                     const b = g.get();
-                    if (w0 != @as(u64, @intCast(b.class.identity()))) break :fast;
+                    if (w0 != @as(u64, @intCast(b.class.identity()))) {
+                        site_mismatch = true;
+                        break :fast;
+                    }
                     const route = @atomicLoad(u64, @constCast(&gf.site_route), .acquire);
                     if (route == 0) break :fast;
                     if (route & 3 == 1) {
@@ -6195,6 +6203,45 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                     }
                 }
             }
+            // A polymorphic site: the mono-class claim belongs to a
+            // different receiver class (an iterator hierarchy sharing one
+            // base-class read site). Serve this class from its own
+            // (class, name) memo route — one probe instead of the slow
+            // ladder — leaving the site's claim untouched.
+            if (site_mismatch) poly: {
+                const r = host.fieldSiteRoute(&recv, name) orelse break :poly;
+                if (r.route & 3 == 1) {
+                    const idx: usize = @intCast(r.route >> 2);
+                    const g = recv.Instance.borrow();
+                    defer g.deinit();
+                    const b = g.get();
+                    if (idx >= b.fields.items.len) break :poly;
+                    const f = &b.fields.items[idx];
+                    if (!std.mem.eql(u8, f.name, name) and
+                        !(std.mem.startsWith(u8, name, "$sgetter$") and
+                            name.len > f.name.len and
+                            std.mem.endsWith(u8, name, f.name) and
+                            name[name.len - f.name.len - 1] == '\u{1f}')) break :poly;
+                    const v = f.value;
+                    if (v == .Null or v == .Delegate) break :poly;
+                    v.retain();
+                    if (pushed_enclosing) popEnclosing();
+                    try frame.write(gf.dst, v);
+                    return .cont;
+                }
+                if (r.route & 3 == 2) {
+                    const got_g = host.runFieldGetter(allocator, @enumFromInt(r.route >> 2), recv);
+                    if (pushed_enclosing) popEnclosing();
+                    switch (try got_g) {
+                        .ok => |v| {
+                            v.retain();
+                            try frame.write(gf.dst, v);
+                            return .cont;
+                        },
+                        .err => |e| return raiseStep(frame, e),
+                    }
+                }
+            }
         }
     }
     runtime.prof.opRoute(14);
@@ -6207,14 +6254,16 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
             v.retain();
             if (comptime @hasDecl(H, "fieldSiteRoute")) {
                 if (recv == .Instance and @atomicLoad(u64, @constCast(&gf.site_cls), .monotonic) == 0) {
-                    var claim_cls: u64 = 1;
-                    var claim_route: u64 = 0;
+                    // Claim only once a route exists. The (class, name) memo
+                    // fills lazily — and not at all while the dispatch
+                    // universe is still unstable — so a no-route first read
+                    // must leave the site unclaimed for a later read to
+                    // retry, or a warmup-executed hot site is pinned to the
+                    // slow ladder for the whole run.
                     if (host.fieldSiteRoute(&recv, name)) |r| {
-                        claim_cls = r.cls;
-                        claim_route = r.route;
-                    }
-                    if (@cmpxchgStrong(u64, @constCast(&gf.site_cls), 0, claim_cls, .acq_rel, .monotonic) == null) {
-                        if (claim_route != 0) @atomicStore(u64, @constCast(&gf.site_route), claim_route, .release);
+                        if (@cmpxchgStrong(u64, @constCast(&gf.site_cls), 0, r.cls, .acq_rel, .monotonic) == null) {
+                            if (r.route != 0) @atomicStore(u64, @constCast(&gf.site_route), r.route, .release);
+                        }
                     }
                 }
             }
@@ -6355,11 +6404,35 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
                     plan = host.fastCallPlan(frame.module, call.func);
                     @constCast(cf).fast_call = plan;
                 }
-                // `plan - 2` is the eligible arity; a positional, exact-arity
-                // call dispatches straight to the body.
-                if (plan >= 2 and plan - 2 == call.n_args) {
+                // The low bits carry the eligible arity + 2; a positional,
+                // exact-arity call dispatches straight to the body.
+                const plan_arity = plan & 0x3FFF;
+                if (plan_arity >= 2 and plan_arity - 2 == call.n_args) {
                     const buf = try readArgRun(allocator, frame, call.args, call.n_args);
                     const args_list: std.ArrayList(Value) = .{ .items = buf, .capacity = buf.len };
+                    // A receiver-carrying body: seed the caller's instance
+                    // `this` as the enclosing receiver exactly as the full
+                    // path below does (lexical scope for a member extension,
+                    // dispatch visibility for anything else).
+                    var pushed_enclosing = false;
+                    if (plan & ir.FAST_CALL_EXT_FLAG != 0) {
+                        if (frameThisParam(frame)) |ct_idx| {
+                            const p = frame.params.items[ct_idx];
+                            if (p == .Instance) {
+                                const same = args_list.items.len > 0 and args_list.items[0] == .Instance and
+                                    ObjRef(InstanceData).ptrEq(p.Instance, args_list.items[0].Instance);
+                                if (!same) {
+                                    if (cf.kind == .member_extension) {
+                                        pushEnclosing(&frame.params.items[ct_idx]);
+                                    } else {
+                                        pushEnclosingAccess(&frame.params.items[ct_idx]);
+                                    }
+                                    pushed_enclosing = true;
+                                }
+                            }
+                        }
+                    }
+                    if (plan & ir.FAST_CALL_EXT_FLAG != 0) dispatchBump(.static_flat_fuse_ext) else dispatchBump(.static_flat_fuse);
                     // The flat driver runs the body as a pushed activation in
                     // the same dispatch loop — no native recursion per call.
                     if (flatEnabled()) {
@@ -6367,10 +6440,18 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
                             host.flatPlainCallOpen(cf, args_list.items)
                         else
                             false;
-                        frame.flat_call = .{ .func = cf, .args = args_list, .composer_pushed = composer_pushed, .dst = call.dst };
+                        frame.flat_call = .{
+                            .func = cf,
+                            .args = args_list,
+                            .composer_pushed = composer_pushed,
+                            .dst = call.dst,
+                            .pop_enclosing_n = if (pushed_enclosing) 1 else 0,
+                        };
                         return .flat_call;
                     }
-                    switch (try host.callFuncFast(allocator, frame.module, call.func, args_list)) {
+                    const fast_res = try host.callFuncFast(allocator, frame.module, call.func, args_list);
+                    if (pushed_enclosing) popEnclosing();
+                    switch (fast_res) {
                         .ok => |result| try frame.write(call.dst, result),
                         .err => |e| return raiseStep(frame, e),
                     }

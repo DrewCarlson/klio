@@ -1008,6 +1008,11 @@ pub const FuncKind = enum {
     member_extension,
 };
 
+/// `Func.fast_call` flag: the eligible body carries its receiver as the
+/// leading `"this"` param, so the fast dispatch seeds the caller's instance
+/// `this` as an enclosing receiver exactly as the full path does.
+pub const FAST_CALL_EXT_FLAG: u16 = 0x4000;
+
 pub const Func = struct {
     id: FuncId,
     name: []const u8,
@@ -1045,9 +1050,11 @@ pub const Func = struct {
     is_tailrec: bool = false,
     /// Monomorphic call fast-path plan, cached on first call (the evaluator
     /// fills it via the host). `0` = not yet computed, `1` = ineligible (use the
-    /// full dispatch), `>= 2` = eligible with `fast_call - 2` parameters: a plain
-    /// top-level user function a positional, exact-arity call dispatches straight
-    /// to its body. See `eval`'s `.Call` fast path.
+    /// full dispatch), otherwise the low 14 bits are the eligible parameter
+    /// count + 2: a user function a positional, exact-arity call dispatches
+    /// straight to its body. `FAST_CALL_EXT_FLAG` marks a receiver-carrying
+    /// body (baked extension / member) whose dispatch must seed the caller's
+    /// `this` as an enclosing receiver. See `eval`'s `.Call` fast path.
     fast_call: u16 = 0,
     /// Which argument-coercion walks can ever apply to this func's declared
     /// params, computed on first frame entry: bit0 = computed, bit1 = a
