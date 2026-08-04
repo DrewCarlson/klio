@@ -835,6 +835,72 @@ pub const ProgramImage = struct {
         return null;
     }
 
+    /// Whether a runtime value can DEFINITELY not bind a parameter whose
+    /// declared head is `pn`: only the unambiguous builtin scalar kinds
+    /// refute. Permissive everywhere else — the filter exists to
+    /// discriminate SAME-ARITY expect redirects, never to re-rank.
+    fn redirectParamRefutes(pn: []const u8, v: runtime.Value) bool {
+        if (v == .Null) return false;
+        var h = pn;
+        if (std.mem.lastIndexOfScalar(u8, h, '.')) |d| h = h[d + 1 ..];
+        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+        h = std.mem.trimEnd(u8, h, "?");
+        const eq = std.mem.eql;
+        if (eq(u8, h, "Boolean")) return v != .Bool;
+        if (eq(u8, h, "Char")) return v != .Char;
+        if (eq(u8, h, "String")) return v != .String;
+        if (eq(u8, h, "Int") or eq(u8, h, "Long") or eq(u8, h, "Short") or eq(u8, h, "Byte") or
+            eq(u8, h, "UInt") or eq(u8, h, "ULong") or eq(u8, h, "UShort") or eq(u8, h, "UByte"))
+        {
+            return switch (v) {
+                .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte => false,
+                else => true,
+            };
+        }
+        if (eq(u8, h, "Float") or eq(u8, h, "Double")) {
+            return switch (v) {
+                .Float, .Double, .Int, .Long => false,
+                else => true,
+            };
+        }
+        return false;
+    }
+
+    /// `resolvedRedirectTarget` with the call's VALUES: among same-arity
+    /// siblings the pick skips a candidate whose declared scalar param the
+    /// value run definitely cannot bind. Two 9-param `ActualParagraph`
+    /// actuals differ only at `(ellipsis: Boolean, width: Float)` vs
+    /// `(overflow: TextOverflow, constraints: Constraints)`; the
+    /// declaration-order pick fed a TextOverflow into `ellipsis` and a
+    /// paragraph rendered a value class as its branch condition.
+    pub fn resolvedRedirectTargetShaped(self: *const ProgramImage, module: *const Module, func: FuncId, args: []const runtime.Value) ?FuncId {
+        if (std.c.getenv("KLIO_REDIR_TRACE") != null) {
+            if (module.funcById(func)) |hf| {
+                std.debug.print("[redir] {s}#{d} nargs={d} nredirects={d}\n", .{ hf.fqn, func.int(), args.len, self.resolvedRedirects(func).len });
+            }
+        }
+        var fallback: ?FuncId = null;
+        for (self.resolvedRedirects(func)) |cand| {
+            const g = module.funcById(cand) orelse continue;
+            const has_this = g.params.len != 0 and std.mem.eql(u8, g.params[0].name, "this");
+            const user = if (has_this) g.params.len - 1 else g.params.len;
+            const last_vararg = g.params.len != 0 and g.params[g.params.len - 1].is_vararg;
+            if (user != args.len and !last_vararg) continue;
+            if (fallback == null) fallback = cand;
+            const off: usize = if (has_this) 1 else 0;
+            var refuted = false;
+            for (args, 0..) |v, i| {
+                if (off + i >= g.params.len) break;
+                if (redirectParamRefutes(g.params[off + i].ty.name, v)) {
+                    refuted = true;
+                    break;
+                }
+            }
+            if (!refuted) return cand;
+        }
+        return fallback;
+    }
+
     /// The link-time-resolved native form for `func`, or `null` when the
     /// symbol's single form is its lowered body. Consulted by the VM
     /// dispatch paths in place of the deleted per-call FQN short-circuit.

@@ -3232,7 +3232,7 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
     // A deferred body has no blocks yet; wait for the post-materialize call.
     if (func.blocks.len == 0) return;
     dump_fn_done = true;
-    std.debug.print("[dump-fn] {s}#{d} params={d} blocks={d} recv_ty={?s} caps=", .{ func.name, func.id.int(), func.params.len, func.blocks.len, func.lambda_receiver_ty });
+    std.debug.print("[dump-fn] {s}#{d} params={d} blocks={d} recv_ty={?s} caps=", .{ func.fqn, func.id.int(), func.params.len, func.blocks.len, func.lambda_receiver_ty });
     for (func.capture_order) |cn| std.debug.print("{s},", .{cn});
     std.debug.print("\n", .{});
     for (func.blocks, 0..) |*blk, bi| {
@@ -3247,11 +3247,17 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
                 .CallMember => |x| std.debug.print(" name={s} recv=r{d} resolved={?d}", .{ constStr(module, x.name) orelse "?", x.receiver.int(), if (x.resolved) |f| f.int() else null }),
                 .LoadCapture => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
                 .Move => |x| std.debug.print(" dst=r{d} src=r{d}", .{ x.dst.int(), x.src.int() }),
+                .AstLambda => |x| std.debug.print(" dst=r{d} body=#{?d}", .{ x.dst.int(), if (x.body_func) |bf| bf.int() else null }),
+                .BinOp => |x| std.debug.print(" op={s} dst=r{d} lhs=r{d} rhs=r{d}", .{ @tagName(x.op), x.dst.int(), x.lhs.int(), x.rhs.int() }),
+                .CallVirtual => |x| std.debug.print(" slot={d} recv=r{d} dst=r{d}", .{ x.slot.int(), x.receiver.int(), x.dst.int() }),
                 else => {},
             }
             std.debug.print("\n", .{});
         }
-        std.debug.print("    term: {s}\n", .{@tagName(std.meta.activeTag(blk.terminator))});
+        switch (blk.terminator) {
+            .Branch => |br| std.debug.print("    term: Branch cond=r{d} t={d} f={d}\n", .{ br.cond.int(), br.t.int(), br.f.int() }),
+            else => std.debug.print("    term: {s}\n", .{@tagName(std.meta.activeTag(blk.terminator))}),
+        }
     }
 }
 
@@ -9389,7 +9395,12 @@ fn valueTruthy(allocator: Allocator, v: *const Value) Allocator.Error!union(enum
         .Bool => |b| return .{ .ok = b },
         else => {
             const s = v.display(allocator) catch "?";
-            const msg = try std.fmt.allocPrint(allocator, "non-bool in branch: {s}", .{s});
+            // Name the frame and its function so a wrong-value branch is
+            // attributable without a debugger: the value alone cannot say
+            // WHICH branch mis-wired.
+            const fname: []const u8 = if (currentFrameFunc()) |cf| cf.fqn else "?";
+            const fid: u32 = if (currentFrameFunc()) |cf| cf.id.int() else 0;
+            const msg = try std.fmt.allocPrint(allocator, "non-bool in branch: {s} (in {s}#{d})", .{ s, fname, fid });
             return .{ .err = .{ .Type = msg } };
         },
     }

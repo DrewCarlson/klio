@@ -8341,18 +8341,31 @@ pub const Module = struct {
             .type_var = staticTypeVar,
         };
         var best = ApplicableBarePick{};
+        const drop_trace = blk: {
+            const w = std.c.getenv("KLIO_DROP_TRACE") orelse break :blk false;
+            break :blk std.mem.eql(u8, std.mem.span(w), name);
+        };
         for (candidates) |id| {
             const f = self.funcById(id) orelse continue;
             const kind = self.declarationKind(id, f);
             const is_receiver_formed = kind != .plain;
-            if (is_receiver_formed != receiver_formed or rankLowPriority(f)) continue;
+            if (is_receiver_formed != receiver_formed or rankLowPriority(f)) {
+                if (drop_trace) std.debug.print("[drop] {s}#{d} form={} lowpri={}\n", .{ name, id.int(), is_receiver_formed != receiver_formed, rankLowPriority(f) });
+                continue;
+            }
             if (receiver_formed) {
                 if (self.memberExtOutOfScope(id, ctx.owner_class)) continue;
                 if (ctx.receiver_known and
                     !self.extReceiverPlausible(id, f, ctx.owner_class)) continue;
             }
-            const sig = self.sigViewForApplicability(id, include_compiler_abi) orelse continue;
-            const score = applicability.applicable(&sig, args, scope) orelse continue;
+            const sig = self.sigViewForApplicability(id, include_compiler_abi) orelse {
+                if (drop_trace) std.debug.print("[drop] {s}#{d} no-sigview\n", .{ name, id.int() });
+                continue;
+            };
+            const score = applicability.applicable(&sig, args, scope) orelse {
+                if (drop_trace) std.debug.print("[drop] {s}#{d} inapplicable-shape\n", .{ name, id.int() });
+                continue;
+            };
             const static_compatibility = if (receiver_formed)
                 StaticCompatibility.unknown
             else
