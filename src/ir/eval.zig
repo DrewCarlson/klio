@@ -2446,10 +2446,17 @@ const Frame = struct {
         if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, params.items);
         if (runtime.getenvSlice("KLIO_TRACE_PATH") != null) {
             for (params.items, 0..) |*pv, pi| {
-                std.debug.print("[frame-bind] fn={s} #{d} kind={s}\n", .{
+                const payload: i64 = switch (pv.*) {
+                    .Int => |x| @as(i64, x),
+                    .Char => |x| @as(i64, x),
+                    else => -1,
+                };
+                std.debug.print("[frame-bind] fn={s}#{d} #{d} kind={s} payload={d}\n", .{
                     if (func.fqn.len != 0) func.fqn else func.name,
+                    func.id.int(),
                     pi,
                     @tagName(std.meta.activeTag(pv.*)),
+                    payload,
                 });
             }
         }
@@ -4291,10 +4298,11 @@ fn LoopTramp(comptime H: type) type {
                 var k2: usize = 0;
                 while (k2 < site.n_args) : (k2 += 1) {
                     const ar = @as(usize, site.args_reg) + k2;
+                    const tr2: usize = if (k2 < 3 and site.arg_tag_regs[k2] != 0) site.arg_tag_regs[k2] else ar;
                     argbuf2[k2] = switch (cl.reg_types[ar]) {
                         .object => lc.frame.regs.items[ar],
                         .null_ => .Null,
-                        else => jit_loop.valueFromSlotTagged(cl.reg_types[ar], tctx.tags[ar], tctx.slots[ar]),
+                        else => jit_loop.valueFromSlotTagged(cl.reg_types[ar], tctx.tags[tr2], tctx.slots[ar]),
                     };
                 }
                 // Plain exact-arity closure: skip the value-dispatch preamble
@@ -4485,10 +4493,14 @@ fn LoopTramp(comptime H: type) type {
             var k: usize = 0;
             while (k < site.n_args) : (k += 1) {
                 const ar = @as(usize, site.args_reg) + k;
+                // The LIVE tag comes through the move chain's source: the
+                // native code copies arg SLOTS without updating the tag
+                // array (see CallSite.arg_tag_regs).
+                const tr: usize = if (k < 3 and site.arg_tag_regs[k] != 0) site.arg_tag_regs[k] else ar;
                 argbuf[k] = switch (cl.reg_types[ar]) {
                     .object => lc.frame.regs.items[ar],
                     .null_ => .Null,
-                    else => jit_loop.valueFromSlotTagged(cl.reg_types[ar], tctx.tags[ar], tctx.slots[ar]),
+                    else => jit_loop.valueFromSlotTagged(cl.reg_types[ar], tctx.tags[tr], tctx.slots[ar]),
                 };
             }
             // Native recursion: a compiled body calling a compiled (scalar)

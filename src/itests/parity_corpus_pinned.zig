@@ -1619,6 +1619,16 @@ test "plus_element_inference" {
     );
 }
 
+test "jit_char_tag_rebox" {
+    try check("jit_char_tag_rebox",
+        \\a
+        \\b
+        \\a
+        \\b
+        \\
+    );
+}
+
 test "and_chain_smartcast" {
     try check("and_chain_smartcast",
         \\true
