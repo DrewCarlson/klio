@@ -874,6 +874,10 @@ pub const DispatchKind = enum(u8) {
     member_range_iter,
     member_flat_prepare,
     member_ladder,
+    /// VM-plan P0 baseline: every interpreter frame constructed. P1's
+    /// contiguous stack and P2's call fusion drive this denominator down
+    /// per call; the compose margin is the external gauge.
+    frame_push,
 };
 const DISPATCH_KINDS = @typeInfo(DispatchKind).@"enum".fields.len;
 var dispatch_counts: [DISPATCH_KINDS]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
@@ -2444,6 +2448,7 @@ const Frame = struct {
         }
         if (plan & 2 != 0) coerceIntArgsToLong(func, params.items);
         if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, params.items);
+        dispatchBump(.frame_push);
         if (runtime.getenvSlice("KLIO_TRACE_PATH") != null) {
             for (params.items, 0..) |*pv, pi| {
                 const payload: i64 = switch (pv.*) {
