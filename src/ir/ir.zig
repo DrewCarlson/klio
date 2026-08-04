@@ -1827,6 +1827,12 @@ pub const Module = struct {
         /// The same source argument list can bind a visible extension after
         /// appending the Compose compiler ABI pair.
         compiler_abi_applicable: bool = false,
+        /// A strict-key winner whose only weakness is an UNKNOWN argument
+        /// verdict. Its identity is not in doubt — RETURN-TYPE derivation
+        /// may use it (the `joinTo(StringBuilder(), ...)` chain); emission
+        /// must NOT, dispatch commitment still requires proof (the
+        /// trimIndent hazard is precisely about emission).
+        sole_unknown: ?FuncId = null,
     };
 
     /// One ambiguous bare-call diagnostic: the call-site name and span
@@ -4799,7 +4805,7 @@ pub const Module = struct {
         if (tied or
             (best_unknown and !receiver_supplies_lambda and !renamed_best and
                 !sole_survivor and !refuted_member_strict_winner))
-            return .{ .applicable = true };
+            return .{ .applicable = true, .sole_unknown = if (!tied) best else null };
         const dispatch_owner = if (best) |target|
             (if (self.registry.member_ext_owner_class.get(target)) |owner|
                 self.classIdByFqn(owner)

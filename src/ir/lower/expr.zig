@@ -8971,7 +8971,12 @@ fn bareExtensionTarget(
         .call_name = name.name,
         .actual_type_param_bounds = bounds orelse &.{},
     };
-    if (b.module.resolveExtensionCall(name.name, recv, shapes, ctx).target) |t| return t;
+    {
+        const r = b.module.resolveExtensionCall(name.name, recv, shapes, ctx);
+        // TYPING-only consumer: a strict-key winner withheld solely on an
+        // unknown argument still lends its RETURN TYPE (never emission).
+        if (r.target orelse r.sole_unknown) |t| return t;
+    }
     // Kotlin resolves a bare call against EVERY implicit receiver,
     // innermost first. When the innermost head serves no extension, the
     // OUTER tower entries are the remaining candidates (`collect {}`
