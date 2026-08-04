@@ -2140,3 +2140,23 @@ null` paths if the key rows don't localize it. A sole-unknown typing
 channel (ExtensionResolution.sole_unknown, typing-only consumers) is
 the designed fix once the scorer agrees with the walk — drafted and
 reverted this cycle to keep the tree clean.
+
+## Addendum 40 — sole-survivor widening: measured, reverted (2026-08-04)
+
+Widening `receiver_pruned` to count proven receiver refusals at the
+erased-head stage (or at the shared incompatible exit) converts -37
+census sites INCLUDING the joinTo family and -4 declined — but breaks
+the trimIndent chain both ways (`call_member indentWidth on String`
+at runtime: three text tests). The named trimIndent hazard on the
+sole-survivor rule is real and still not understood mechanically —
+the breakage is an EMISSION change surfacing as a runtime name miss
+on a same-file private extension, which the current probes don't
+explain. Reverted to the exact pre-slice rule per the
+measured-negative precedent; tree verified green.
+
+NEXT PROBE for this -37: KLIO_DUMP_FN diff of the trimIndent/
+prependIndent lowering with the widening on vs off, to see which
+call form changes; the sole-unknown TYPING-ONLY channel (Addendum 39
+draft) remains the safer alternative shape — it lends the return
+type without touching emission, which the trimIndent hazard is
+about.
