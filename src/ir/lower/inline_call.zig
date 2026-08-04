@@ -1453,6 +1453,12 @@ pub fn tryInlineCallWithTypeArgs(
     var lambda_map = std.StringHashMap(*const ast.Expr).init(b.allocator);
     const arg_regs = try b.allocator.alloc(Reg, f.params.len);
     defer b.allocator.free(arg_regs);
+    // The caller's emitter computed instantiated expected param types per
+    // ARGUMENT slot (`lowerArgRun`'s transfer, which this loop bypasses):
+    // consume them here so each lambda's eagerly-lowered closure body
+    // types its params.
+    const arg_lambda_param_types = b.pending_arg_lambda_param_types;
+    b.pending_arg_lambda_param_types = null;
     var any_forwarded_lambda = false;
     var any_literal_lambda = false;
     for (f.params, 0..) |*p, i| {
@@ -1475,6 +1481,19 @@ pub fn tryInlineCallWithTypeArgs(
         // (which would swallow the first invocation slot as Null).
         if ((a.* == .Lambda or a.* == .AnonFun) and p.ty.function != null) {
             b.pending_lambda_arity = @intCast(p.ty.function.?.params.len);
+            if (arg_lambda_param_types) |slots| {
+                // `ordered[i]` points into the caller's arg slice; recover
+                // the ARGUMENT index the per-slot types are keyed by. The
+                // synthetic vararg expression lies outside the slice.
+                const base = @intFromPtr(args.ptr);
+                const off = @intFromPtr(a) -% base;
+                const idx = off / @sizeOf(Expr);
+                if (@intFromPtr(a) >= base and idx < args.len and
+                    idx < slots.len)
+                {
+                    b.pending_ref_lambda_param_types = slots[idx];
+                }
+            }
         }
         // A default-filled slot is CALLEE code: Kotlin evaluates a default
         // expression in the declaration's scope, where the extension
@@ -1490,6 +1509,7 @@ pub fn tryInlineCallWithTypeArgs(
             break :blk rr;
         } else coerced orelse try lowerExpr(b, a);
         b.pending_lambda_arity = -1;
+        b.pending_ref_lambda_param_types = null;
         arg_regs[i] = r;
         // A lambda argument is spliced inline (its body is expanded at the
         // call site), so it is never a closure value to box — skip boxing

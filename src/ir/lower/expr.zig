@@ -3989,7 +3989,23 @@ fn instantiatedLambdaValueParams(
         for (out[0..initialized]) |*ty| ty.deinit(b.allocator);
         b.allocator.free(out);
     }
+    // A slice that still quotes one of the CALLEE's own type parameters is
+    // not an answer: the head names nothing in the receiving scope, and
+    // recording it feeds the no-class bucket and disproves candidates a
+    // null leaves open (the splice-inheritance rule). Refuse the whole
+    // slice when any entry's head stayed unsubstituted.
+    const callee_tps = b.module.registry.func_type_params.get(func.id);
     for (out, instantiated.args[start .. start + count]) |*dst, src| {
+        if (callee_tps) |tps| {
+            const h = typeHead(std.mem.trimEnd(u8, src.name, "?"));
+            for (tps.items) |tp| {
+                if (std.mem.eql(u8, tp, h)) {
+                    for (out[0..initialized]) |*ty| ty.deinit(b.allocator);
+                    b.allocator.free(out);
+                    return null;
+                }
+            }
+        }
         dst.* = try src.clone(b.allocator);
         initialized += 1;
     }
@@ -14684,6 +14700,24 @@ fn lowerResolvedExtensionCall(
     if (target.is_inline) {
         const inline_decl = inline_state.inlineAstById(func_id.int()) orelse return null;
         inline_state.ensureInlineBody(inline_decl);
+        // The splice lowers its lambda arguments in its OWN arg loop, which
+        // bypasses `lowerArgRun`'s typing transfer — yet each lambda still
+        // lowers a closure body eagerly at emit. Compute the instantiated
+        // expected param types here so those bodies type their params; the
+        // spliced copy gets the same facts through the window channels.
+        const inline_lambda_param_types = try argLambdaParamTypesRecv(
+            b,
+            target,
+            selected_values,
+            selected_names,
+            ast_type_args,
+            1,
+            substitutionRecv(b, &recv_ty),
+        );
+        defer if (inline_lambda_param_types) |types|
+            deinitArgLambdaParamTypes(b.allocator, types);
+        b.pending_arg_lambda_param_types = inline_lambda_param_types;
+        defer b.pending_arg_lambda_param_types = null;
         const expected = b.peekExpected();
         const expected_ptr: ?*const ast.TypeRef = if (expected) |*ty| ty else null;
         return try tryInlineCallWithTypeArgs(
