@@ -2087,3 +2087,16 @@ With #5 (JIT stale-tag) and #6 both fixed, the agreed-return channel
 is LIVE by default: stdlib no_receiver 949 -> 876 (9.27%, bound
 88.8%), the full battery green. Six kotlinc-parity wrong answers
 found and fixed this session, each with a pin.
+
+## Addendum 36 — the member-read receiver arm (2026-08-04)
+
+One arm, -106: a member property READ as a receiver now lends its
+declared head (class-prop heads + the ext-prop getter contract with
+supertype walks). no_receiver 876 -> 770 (8.23%), bound 89.8% — from
+85.3% at session start. The [no-recv-member] attribution row is the
+probe that named the family in one census pass.
+
+Residual 770: Path locals 406 (it 72, iterator 24, value/result/
+index/expected/acc tails — substitution-engine and per-family), the
+remaining Member chains (~106), Call receivers 180 (not_simple_callee
+142 + no_func 80 + ambiguous 24), Binary 50.
