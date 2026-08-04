@@ -121,3 +121,18 @@ the compose 13.5s margin remains the gauge.
 Next context: begin P2 with the flattening pass over the simple-inst
 subset (Move/Const/BinOp/UnOp/Branch/Goto/Return), KLIO_FLAT_VM
 gated off, bench_corpus + full battery as the parity gate.
+
+## P2 coverage measurement (2026-08-04): 0.09% — scope corrected
+
+frame_push_flattenable / frame_push = 10,182 / 11,571,366 (0.09%).
+The "simple core first" phasing would build an engine that executes
+nothing real: interpreter frames are dominated by bodies containing
+CallMember/CallValue/field instructions. CORRECTION — P2 and P3
+merge, and the flattening bar inverts: the engine must handle the
+COMMON instruction population from day one (CallMember with slot
+caches, CallValue, GetField/SetField, the iterator protocol,
+CallMemberOrGlobal fallthrough), excluding only the exotic tails
+(try/finally, spread, ctx calls) which deopt to the recursive eval
+per-frame. Re-run this classifier with the widened subset BEFORE
+building — target ≥80% frame coverage or re-scope again. The
+classifier + counters stay as the standing coverage instrument.
