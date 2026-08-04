@@ -1420,6 +1420,37 @@ pub fn tryInlineCallWithTypeArgs(
         var t = owned;
         t.deinit(b.allocator);
     };
+    // Engine step four: the caller's SOLVED bindings become window bound
+    // refs, so every consumer sees the call-site instantiation for each
+    // fn type parameter — argument-bound ones (joinTo's A := the buffer)
+    // included, not just the receiver-bound.
+    const S4Restore = struct { name: []const u8, prev: ?ir.TypeRef };
+    var s4_restores: std.ArrayList(S4Restore) = .empty;
+    defer s4_restores.deinit(b.allocator);
+    defer for (s4_restores.items) |*sr| {
+        if (sr.prev) |p| {
+            b.addTypeParamBoundRef(sr.name, p) catch {};
+        } else if (b.type_param_bound_refs.fetchRemove(sr.name)) |kv| {
+            var v = kv.value;
+            v.deinit(b.allocator);
+        }
+    };
+    if (b.module.pending_splice_solved) |solved| {
+        b.module.pending_splice_solved = null;
+        defer b.allocator.free(solved);
+        for (solved) |sb| {
+            const prev: ?ir.TypeRef = if (b.typeParamBoundRef(sb.name)) |p|
+                p.clone(b.allocator) catch null
+            else
+                null;
+            s4_restores.append(b.allocator, .{ .name = sb.name, .prev = prev }) catch {
+                var t = sb.ty;
+                t.deinit(b.allocator);
+                continue;
+            };
+            b.addTypeParamBoundRef(sb.name, sb.ty) catch {};
+        }
+    }
     // Bare-call hygiene for the spliced body: its bare calls resolve
     // against the inline fn's own receiver (none for a receiver-less
     // inline fn), never the caller's class. The pre-splice hint is

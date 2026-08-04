@@ -1513,6 +1513,11 @@ pub const Module = struct {
     /// (`data.any { it.startsWith("f") }` in a test method's expect-lambda).
     /// Owned pairs; the lambda body takes ownership. Not serialized.
     pending_lambda_type_param_bound_refs: ?[]PendingBoundRef = null,
+    /// Engine step four: the caller's SOLVED fn-tp bindings for an inline
+    /// splice, registered as window bound refs at entry. Names are
+    /// registry-stable fn-tp slices; tys owned by the lowering allocator
+    /// (the consumer moves them into the builder's ref map).
+    pending_splice_solved: ?[]Module.TypeBinding = null,
     /// Instantiated value-parameter types for the pending lambda literal,
     /// derived from its resolved call-argument slot. The lambda body takes
     /// ownership and records them as ordinary local declared types.

@@ -10244,7 +10244,7 @@ fn enrichLambdaArgShapes(
     }
 }
 
-fn buildStaticReturnArgShapes(
+pub fn buildStaticReturnArgShapes(
     b: *FuncBuilder,
     args: []const Expr,
     arg_names: []const ?[]const u8,
@@ -14981,6 +14981,46 @@ fn lowerResolvedExtensionCall(
             deinitArgLambdaParamTypes(b.allocator, types);
         b.pending_arg_lambda_param_types = inline_lambda_param_types;
         defer b.pending_arg_lambda_param_types = null;
+        // Engine step four: solve the callee's bindings ONCE (receiver +
+        // typed args) and hand them to the WINDOW as full bound refs —
+        // every in-window consumer (the bare return arm, substitutionRecv,
+        // element typing) then sees the call-site instantiation for every
+        // fn type parameter, argument-bound ones included. Registry-stable
+        // fn-tp names only; owner identities stay per-channel.
+        {
+            var sc2 = std.heap.ArenaAllocator.init(b.allocator);
+            defer sc2.deinit();
+            const a2 = sc2.allocator();
+            var sh_set2 = try buildStaticReturnArgShapes(b, selected_values, selected_names);
+            defer sh_set2.deinit(b.allocator);
+            if (b.module.solveCallBindings(a2, func_id, target, recv_ty, null, sh_set2.shapes, &.{}, false) catch null) |solved2| blk_s4: {
+                const fn_tps = b.module.registry.func_type_params.get(func_id) orelse break :blk_s4;
+                var outl: std.ArrayList(ir.Module.TypeBinding) = .empty;
+                errdefer {
+                    for (outl.items) |*e| {
+                        var t = e.ty;
+                        t.deinit(b.allocator);
+                    }
+                    outl.deinit(b.allocator);
+                }
+                for (solved2.bindings) |sb| {
+                    const h2 = typeHead(std.mem.trimEnd(u8, sb.ty.name, "?"));
+                    if (std.mem.eql(u8, h2, "*") or h2.len == 0) continue;
+                    var stable: ?[]const u8 = null;
+                    for (fn_tps.items) |tp| {
+                        if (std.mem.eql(u8, tp, sb.name)) {
+                            stable = tp;
+                            break;
+                        }
+                    }
+                    const sname = stable orelse continue;
+                    try outl.append(b.allocator, .{ .name = sname, .ty = try sb.ty.clone(b.allocator) });
+                }
+                if (outl.items.len != 0) {
+                    b.module.pending_splice_solved = try outl.toOwnedSlice(b.allocator);
+                } else outl.deinit(b.allocator);
+            }
+        }
         const expected = b.peekExpected();
         const expected_ptr: ?*const ast.TypeRef = if (expected) |*ty| ty else null;
         return try tryInlineCallWithTypeArgs(
