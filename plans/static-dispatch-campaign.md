@@ -1968,3 +1968,38 @@ Standing: 949 / 78 / 4 / 99 on 9,521 (88.1% bound), battery green
 everywhere. The disk-exhaustion interruption (zig cache + census
 logs) is resolved; scripts/prune-zig-cache.sh remains the periodic
 answer.
+
+## Addendum 31 — the Char-coercion wrong answer, fully differentialized (2026-08-04)
+
+REAL user-visible wrong answer, PRE-EXISTING (both KLIO_AGREED_RET
+states), minimal repro:
+
+    const val DIGITS = "ab"
+    fun main() { DIGITS.forEachIndexed { i, c -> println(c) } }
+
+prints 97/98 where kotlinc prints a/b. The differential matrix:
+- typed receiver (literal or `val s: String`) -> SPLICED -> correct.
+- `forEach` (1-param) via the same dynamic pick -> correct Chars.
+- user-code mimic of the exact body (CharSequence + `action(index++,
+  item)`) -> correct.
+- ONLY the bake-lowered kotlin.text.forEachIndexed#1519 invoked
+  dynamically passes the item as an Int-kind value.
+- Runtime pick verified correct ([extpick] chosen=1519); host
+  builtinIterator and string_get both yield .Char; the caller's
+  block-2 instruction KINDS are IDENTICAL to the working user mimic
+  (CallMember next / Move / UnOp / Move / Move / CallValue) — the
+  divergence is OPERAND- or HINT-level in the baked next()/CallValue,
+  invisible to the current dump. Fresh bake reproduces (not an image
+  round-trip artifact).
+
+Next probe (queued): extend KLIO_DUMP_FN to print CallMember hint
+fields and register operands, then diff #1519 against the user mimic
+operand-by-operand. This bug is ALSO the collateral that parked the
+agreed-return channel (Addendum 30): the HexExtensions property init
+is exactly this shape, so fixing it un-parks -72 census sites.
+
+Repro fixtures preserved: scratchpad tp3-tp13 (tp11 is the minimal
+pair). Separate finding from the same session: a top-level property
+whose init chain hits this shape reports `unresolved global` (tp3) —
+the init failure is silently swallowed at image load; the property
+never registers. Root-causing the Char bug should re-test tp3.
