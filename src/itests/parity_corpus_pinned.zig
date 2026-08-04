@@ -1602,6 +1602,15 @@ test "bound_args_lambda_replay" {
     );
 }
 
+test "plus_element_inference" {
+    try check("plus_element_inference",
+        \\[[s], [a]]
+        \\[[s], [a]]
+        \\[[s], [a]]
+        \\
+    );
+}
+
 test "and_chain_smartcast" {
     try check("and_chain_smartcast",
         \\true

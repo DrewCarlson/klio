@@ -2078,7 +2078,7 @@ pub const Module = struct {
 
     /// Class-identity hierarchy check used where simple names are not enough
     /// to prove Kotlin visibility or dispatch ownership.
-    fn classIdIsOrExtends(self: *const Module, sub: ClassId, super: ClassId) bool {
+    pub fn classIdIsOrExtends(self: *const Module, sub: ClassId, super: ClassId) bool {
         if (super.int() >= self.classes.items.len) return false;
         return self.classIdIsOrExtendsDepth(sub, super, 0);
     }
@@ -4476,12 +4476,40 @@ pub const Module = struct {
                 compatibility = .unknown;
             } else {
                 for (args, f.params[1 .. 1 + args.len]) |arg, param| {
-                    const arg_compatibility = self.staticArgCompatibility(
-                        fid,
-                        arg,
-                        param.ty,
-                        ctx.actual_type_param_bounds,
-                    );
+                    // The RECEIVER's instantiation constrains the callee's
+                    // own type parameters before any argument is judged:
+                    // `plus(elements: Iterable<T>)` on a `List<List<String>>`
+                    // receiver requires `Iterable<List<String>>`, so a
+                    // `List<String>` argument REFUTES the candidate — the
+                    // raw `Iterable<T>` judged String-vs-T as "own tp,
+                    // anything goes" and falsely proved it. Substitute what
+                    // the receiver binds, then judge; unbound params keep
+                    // the raw path.
+                    var judged_param = param.ty;
+                    var subst_param: ?TypeRef = null;
+                    if (arg.ty != null and
+                        self.staticTypeContainsFuncParam(fid, param.ty))
+                    {
+                        if (self.instantiatedTypeFromReceiverPartial(
+                            sa,
+                            fid,
+                            param.ty,
+                            scoped_receiver,
+                        ) catch null) |s| {
+                            subst_param = s;
+                            judged_param = s;
+                        }
+                    }
+                    const arg_compatibility = if (subst_param != null and
+                        !self.staticTypeContainsFuncParam(fid, judged_param))
+                        self.staticGenericArgCompatibility(fid, arg.ty.?, judged_param, 0)
+                    else
+                        self.staticArgCompatibility(
+                            fid,
+                            arg,
+                            judged_param,
+                            ctx.actual_type_param_bounds,
+                        );
                     if (rex_trace) {
                         std.debug.print("[rex-arg] {s} fid={d} param={s} arg_ty={s} -> {s} route={s}\n", .{
                             name,

@@ -8614,11 +8614,21 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         // source type stays as evidence.
         if (b.spliceParamTy(p.segments[0].name)) |declared| {
             if (declared.function == null) {
-                return .{
-                    .name = declared.name.name,
-                    .nullable = declared.nullable,
-                    .args = &.{},
-                };
+                // A declared head that is itself a TYPE PARAMETER of the
+                // spliced declaration (`destination: M`) names nothing the
+                // receiving scope can bind; the entry records the
+                // ARGUMENT's derived type under the local-decl channel
+                // below, and that concrete head must win.
+                const dh = declared.name.name;
+                const tp_head = ((dh.len > 0 and dh.len <= 2 and
+                    std.ascii.isUpper(dh[0])) or b.isTypeParam(dh));
+                if (!tp_head) {
+                    return .{
+                        .name = declared.name.name,
+                        .nullable = declared.nullable,
+                        .args = &.{},
+                    };
+                }
             }
         }
     }
@@ -13169,6 +13179,24 @@ fn lowerUnresolvedBareCall(
             // own receiver type, which carries the type arguments an overload
             // set that differs by element type needs.
             if (b.spliceHintActive()) {
+                // The window's ACTUAL receiver record wins when its head
+                // is (or extends) the declared one: `List<List<String>>`
+                // carries the instantiation the declared `Collection<T>`
+                // quotes as the callee's own parameter — and that
+                // parameter NAME can capture into an inner callee's
+                // same-named one.
+                if (b.spliceRecvTyRef()) |art| {
+                    const ah = typeHead(std.mem.trimEnd(u8, art.name, "?"));
+                    const fits = std.mem.eql(u8, ah, head_name) or fit: {
+                        const a_cid = b.module.uniqueClassIdBySimpleName(ah) orelse break :fit false;
+                        const d_cid = b.module.uniqueClassIdBySimpleName(head_name) orelse break :fit false;
+                        break :fit b.module.classIdIsOrExtends(a_cid, d_cid);
+                    };
+                    if (fits) {
+                        owned_recv_ty = try art.clone(b.allocator);
+                        break :blk owned_recv_ty.?;
+                    }
+                }
                 if (b.spliceHintRecvRef()) |rt| {
                     if (std.mem.eql(u8, typeHead(rt.name.name), head_name)) {
                         owned_recv_ty = try decl_mod.loweredTypeRef(b.allocator, &rt, true);

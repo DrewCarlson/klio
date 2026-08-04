@@ -1467,6 +1467,13 @@ pub fn tryInlineCallWithTypeArgs(
     // types its params.
     const arg_lambda_param_types = b.pending_arg_lambda_param_types;
     b.pending_arg_lambda_param_types = null;
+    const PTySave = struct { name: []const u8, ty: ?ir.TypeRef };
+    var param_ty_saves: std.ArrayList(PTySave) = .empty;
+    defer param_ty_saves.deinit(b.allocator);
+    defer for (param_ty_saves.items) |*sv| {
+        b.clearLocalDeclType(sv.name);
+        if (sv.ty) |t| b.setLocalDeclTypeOwned(sv.name, t) catch {};
+    };
     var any_forwarded_lambda = false;
     var any_literal_lambda = false;
     for (f.params, 0..) |*p, i| {
@@ -1537,6 +1544,51 @@ pub fn tryInlineCallWithTypeArgs(
             try boxed_here.append(b.allocator, p.name.name);
         } else {
             try b.bind(p.name.name, r);
+        }
+        // A parameter DECLARED by one of the callee's own type parameters
+        // (`destination: M`) types nothing inside the body; the ARGUMENT's
+        // static type is the instantiation (`LinkedHashMap<K,
+        // MutableList<T>>` answers `getOrPut`'s V where `M` cannot).
+        // Record it under the local-decl channel — the spliceParamTy read
+        // falls through to it for tp heads — shadow-saving any same-named
+        // caller record. A bare tp HEAD in the derived answer is refused
+        // as everywhere; loose tp ARGS ride, the head still binds.
+        if (p.ty.function == null and !p.is_vararg) tp_arg: {
+            const dh = p.ty.name.name;
+            const tp_declared = (dh.len > 0 and dh.len <= 2 and
+                std.ascii.isUpper(dh[0])) or
+                blk_tp: {
+                    for (f.type_params) |*tp| {
+                        if (std.mem.eql(u8, tp.name.name, dh)) break :blk_tp true;
+                    }
+                    break :blk_tp false;
+                };
+            if (!tp_declared) break :tp_arg;
+            var derived_owned: ?ir.TypeRef = null;
+            defer if (derived_owned) |*t| t.deinit(b.allocator);
+            const derived: ?ir.TypeRef = expr_lower.argDeclTypeRefLazy(b, a) orelse dblk: {
+                derived_owned = try expr_lower.staticExprTypeRef(b, a);
+                break :dblk derived_owned;
+            };
+            // Clone BEFORE clearing: `derived` may borrow the very record
+            // the clear frees (a same-named caller local's).
+            var derived_clone: ?ir.TypeRef = null;
+            if (derived) |dv| {
+                var h = std.mem.trimEnd(u8, dv.name, "?");
+                if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+                const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
+                    b.isTypeParam(h);
+                if (!bare) derived_clone = try dv.clone(b.allocator);
+            }
+            // ALWAYS shadow the caller's same-named record for a
+            // tp-declared param — with nothing derivable the body must
+            // see NO record, never an unrelated caller local's.
+            try param_ty_saves.append(b.allocator, .{
+                .name = p.name.name,
+                .ty = if (b.localDeclTypeRef(p.name.name)) |t| try t.clone(b.allocator) else null,
+            });
+            b.clearLocalDeclType(p.name.name);
+            if (derived_clone) |dc| try b.setLocalDeclTypeOwned(p.name.name, dc);
         }
         // `noinline` parameters opt out of the inline-lambda splicing
         // path. Their argument value still flows through the binding
