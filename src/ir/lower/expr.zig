@@ -8496,6 +8496,42 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (arg.* == .As and !arg.As.safe) {
         return .{ .name = loweredTypeName(b, &arg.As.ty), .nullable = arg.As.ty.nullable, .args = &.{} };
     }
+    // A member PROPERTY READ as a receiver (`this.indices.reversed()`):
+    // the receiver's head plus the property's declared head answers —
+    // class properties through their recorded heads, extension
+    // properties through the getter contract and its supertype walk.
+    if (arg.* == .Member and !arg.Member.safe) {
+        const m = arg.Member;
+        // A CLASS-named receiver reads the companion's property
+        // (`Byte.MAX_VALUE.toLong()`): consult the companion's lifted key
+        // and the class's own record.
+        if (m.receiver.* == .Path and m.receiver.Path.segments.len == 1) {
+            const on = m.receiver.Path.segments[0].name;
+            if (on.len != 0 and std.ascii.isUpper(on[0]) and
+                b.resolve(on) == null and b.module.classId(on) != null)
+            {
+                var cb2: [96]u8 = undefined;
+                if (std.fmt.bufPrint(&cb2, "{s}$Companion", .{on}) catch null) |ck2| {
+                    if (b.module.registry.class_prop_type_heads.get(.{ .a = ck2, .b = m.name.name })) |head| {
+                        return .{ .name = head, .nullable = false, .args = &.{} };
+                    }
+                }
+                if (b.module.registry.class_prop_type_heads.get(.{ .a = on, .b = m.name.name })) |head| {
+                    return .{ .name = head, .nullable = false, .args = &.{} };
+                }
+            }
+        }
+        if (argDeclTypeRefLazy(b, m.receiver)) |rt| {
+            var h = std.mem.trimEnd(u8, rt.name, "?");
+            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            const head = typeHead(h);
+            if (propTypeHeadOn(b, head, m.name.name) orelse
+                extPropReturnHead(b, head, m.name.name)) |ph|
+            {
+                return .{ .name = ph, .nullable = false, .args = &.{} };
+            }
+        }
+    }
     if (arg.* == .Call and arg.Call.callee.* == .Path and arg.Call.callee.Path.segments.len == 1) {
         const seg = arg.Call.callee.Path.segments[0];
         if (b.localCallReturn(seg.name)) |ret| {
@@ -8591,6 +8627,15 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         {
             if (b.module.registry.class_prop_type_heads.get(.{ .a = owner, .b = p.segments[1].name })) |head| {
                 return .{ .name = head, .nullable = false, .args = &.{} };
+            }
+            // A class-named access reads the COMPANION's property
+            // (`Byte.MAX_VALUE.toLong()`): the head is recorded under the
+            // companion's lifted name.
+            var cb: [96]u8 = undefined;
+            if (std.fmt.bufPrint(&cb, "{s}$Companion", .{owner}) catch null) |ck| {
+                if (b.module.registry.class_prop_type_heads.get(.{ .a = ck, .b = p.segments[1].name })) |head| {
+                    return .{ .name = head, .nullable = false, .args = &.{} };
+                }
             }
         }
         return null;
@@ -8926,7 +8971,12 @@ fn bareExtensionTarget(
         .call_name = name.name,
         .actual_type_param_bounds = bounds orelse &.{},
     };
-    if (b.module.resolveExtensionCall(name.name, recv, shapes, ctx).target) |t| return t;
+    {
+        const r = b.module.resolveExtensionCall(name.name, recv, shapes, ctx);
+        // TYPING-only consumer: a strict-key winner withheld solely on an
+        // unknown argument still lends its RETURN TYPE (never emission).
+        if (r.target orelse r.sole_unknown) |t| return t;
+    }
     // Kotlin resolves a bare call against EVERY implicit receiver,
     // innermost first. When the innermost head serves no extension, the
     // OUTER tower entries are the remaining candidates (`collect {}`
@@ -9401,14 +9451,12 @@ fn staticCallReturnTypeRef(
             // what any pick would return. Args are kept only when every
             // declaration's full return matches.
             //
-            // MEASURED NET-NEGATIVE as a default (KLIO_AGREED_RET=1 to
-            // re-probe): -72 census sites, but two behavioral collaterals —
-            // SequenceTest.windowed's transform pipeline and the
-            // HexExtensions property-init lambda (its Char param bound Int)
-            // — both through downstream channels the new receiver typing
-            // armed. The conversions return when those channels are fixed.
+            // Both downstream collaterals that once parked this channel are
+            // fixed (the JIT stale-tag rebox; the arity gate's positional
+            // trailing-lambda blindness) — KLIO_AGREED_RET=0 re-parks it
+            // for A/B.
             const agreed_return: ?ir.TypeRef = blk_agree: {
-                if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_AGREED_RET") orelse "0", "1")) break :blk_agree null;
+                if (std.mem.eql(u8, runtime.getenvSlice("KLIO_AGREED_RET") orelse "1", "0")) break :blk_agree null;
                 if (top_level_usable) break :blk_agree null;
                 if (enclosingHasMemberNamed(b, name.name)) break :blk_agree null;
                 // A name ANY class declares as a member may be a receiver
@@ -14205,7 +14253,41 @@ fn lowerResolvedMemberCall(
         if (!norecvCensusOn()) return .none;
         lm_norecv[@intFromEnum(std.meta.activeTag(receiver.*))] += 1;
         lm_norecv_eager[if (b.module.eagerTypeOf(receiver.span()) != null) 0 else 1] += 1;
-        if (receiver.* == .Call) lm_norecv_call[@intFromEnum(classifyCallReturn(b, receiver))] += 1;
+        if (receiver.* == .Call) {
+            lm_norecv_call[@intFromEnum(classifyCallReturn(b, receiver))] += 1;
+            if (runtime.getenvSlice("KLIO_NORECV_NAMES") != null) {
+                const callee = receiver.Call.callee;
+                const cn = switch (callee.*) {
+                    .Path => |cp| if (cp.segments.len != 0) cp.segments[cp.segments.len - 1].name else "?",
+                    .Member => |cm2| cm2.name.name,
+                    else => @tagName(std.meta.activeTag(callee.*)),
+                };
+                std.debug.print("[no-recv-callrecv] callee={s} kind={s} call={s} fn={s}\n", .{
+                    cn,
+                    @tagName(std.meta.activeTag(callee.*)),
+                    name.name,
+                    build.currentRealFn() orelse "-",
+                });
+            }
+        }
+        if (receiver.* == .Binary) {
+            if (runtime.getenvSlice("KLIO_NORECV_NAMES") != null) {
+                std.debug.print("[no-recv-binary] op={s} call={s} fn={s}\n", .{
+                    @tagName(receiver.Binary.op),
+                    name.name,
+                    build.currentRealFn() orelse "-",
+                });
+            }
+        }
+        if (receiver.* == .Member) {
+            if (runtime.getenvSlice("KLIO_NORECV_NAMES") != null) {
+                std.debug.print("[no-recv-member] .{s} call={s} fn={s}\n", .{
+                    receiver.Member.name.name,
+                    name.name,
+                    build.currentRealFn() orelse "-",
+                });
+            }
+        }
         if (receiver.* == .Path and receiver.Path.segments.len == 1) {
             const rn = receiver.Path.segments[0].name;
             const which: NoRecvPath = if (b.resolve(rn) != null)
@@ -15454,7 +15536,9 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         }
         if (!any_lambda) break :blk;
         const ext = try resolveExtensionCallForArgs(b, recv_ty, name, args, ast_arg_names);
-        const target_id = ext.target orelse break :blk;
+        // Typing-only consumer: the withheld strict-key winner's param
+        // types are as good as a committed target's for the closures.
+        const target_id = ext.target orelse ext.sole_unknown orelse break :blk;
         const target = b.module.funcById(target_id) orelse break :blk;
         var rt = recv_ty;
         deferred_lambda_param_types = try argLambdaParamTypesRecv(

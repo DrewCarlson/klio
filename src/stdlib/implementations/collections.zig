@@ -4077,8 +4077,12 @@ fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 runtime.keepalivePushSlice(output.items);
                 defer runtime.keepaliveRestore(loop_keepalive);
                 if (takeCapReached(seq.ops, st.taken)) break;
-                const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse
+                const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse {
+                    if (std.c.getenv("KLIO_SEQ_DIAG") != null) {
+                        std.debug.print("[seq-diag] iterator lacks hasNext: iter kind={s} fqn={s}\n", .{ @tagName(std.meta.activeTag(iter)), iter.typeFqn() });
+                    }
                     return .{ .err = .{ .Type = "Sequence: iterator lacks hasNext" } };
+                };
                 const has = switch (hn) {
                     .ok => |x| x == .Bool and x.Bool,
                     .err => |e| return .{ .err = e },
@@ -4202,8 +4206,12 @@ fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.S
                 const loop_keepalive = runtime.keepaliveMark();
                 runtime.keepalivePushSlice(items.items);
                 defer runtime.keepaliveRestore(loop_keepalive);
-                const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse
+                const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse {
+                    if (std.c.getenv("KLIO_SEQ_DIAG") != null) {
+                        std.debug.print("[seq-diag] iterator lacks hasNext: iter kind={s} fqn={s}\n", .{ @tagName(std.meta.activeTag(iter)), iter.typeFqn() });
+                    }
                     return .{ .err = .{ .Type = "Sequence: iterator lacks hasNext" } };
+                };
                 const has = switch (hn) {
                     .ok => |x| x == .Bool and x.Bool,
                     .err => |e| return .{ .err = e },

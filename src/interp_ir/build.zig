@@ -1989,6 +1989,22 @@ fn buildModuleWithOverrides(
                     try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
                 }
             }
+            // COMPANION property heads register under the companion's
+            // lifted name (`Byte$Companion`) — the key a class-named read
+            // (`Byte.MAX_VALUE.toLong()`) consults.
+            for (c.members) |*cm| {
+                if (cm.* != .Class) continue;
+                const cobj = &cm.Class;
+                if (!cobj.is_companion) continue;
+                const ckey = try std.fmt.allocPrint(allocator, "{s}$Companion", .{c.name.name});
+                for (cobj.members) |*om| {
+                    if (om.* != .Property) continue;
+                    const cprop = om.Property;
+                    if (cprop.ty) |*ty| {
+                        try module.registry.class_prop_type_heads.put(.{ .a = ckey, .b = cprop.name.name }, ty.qualified_path orelse ty.name.name);
+                    }
+                }
+            }
         } else if (d.* == .Object) {
             const o = &d.Object;
             for (o.members) |*m| {

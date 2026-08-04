@@ -1827,6 +1827,12 @@ pub const Module = struct {
         /// The same source argument list can bind a visible extension after
         /// appending the Compose compiler ABI pair.
         compiler_abi_applicable: bool = false,
+        /// A strict-key winner whose only weakness is an UNKNOWN argument
+        /// verdict. Its identity is not in doubt — RETURN-TYPE derivation
+        /// may use it (the `joinTo(StringBuilder(), ...)` chain); emission
+        /// must NOT, dispatch commitment still requires proof (the
+        /// trimIndent hazard is precisely about emission).
+        sole_unknown: ?FuncId = null,
     };
 
     /// One ambiguous bare-call diagnostic: the call-site name and span
@@ -4308,11 +4314,32 @@ pub const Module = struct {
                 if (args.len < required) continue;
             } else {
                 if (args.len > f.params.len - 1) continue;
+                // Trailing-callable rule at the ARITY gate: the last arg
+                // fills the LAST param when that param is function-typed,
+                // so only the MIDDLE gap must default — `windowed(2, 3)
+                // { transform }` binds the 4-value-param transform
+                // overload with `partialWindows` defaulted; the
+                // positional walk instead demanded `transform` itself
+                // default and dropped the overload kotlinc picks.
+                const trailing_call = args.len > 0 and args.len < f.params.len - 1 and
+                    (args[args.len - 1].is_lambda or
+                        args[args.len - 1].lambda_arity != null or
+                        args[args.len - 1].func_typed) and
+                    applicability.isFunctionTypeRef(&f.params[f.params.len - 1].ty);
                 var omitted_defaults = true;
-                for (f.params[1 + args.len ..]) |param| {
-                    if (!param.has_default and param.default == null) {
-                        omitted_defaults = false;
-                        break;
+                if (trailing_call) {
+                    for (f.params[args.len .. f.params.len - 1]) |param| {
+                        if (!param.has_default and param.default == null) {
+                            omitted_defaults = false;
+                            break;
+                        }
+                    }
+                } else {
+                    for (f.params[1 + args.len ..]) |param| {
+                        if (!param.has_default and param.default == null) {
+                            omitted_defaults = false;
+                            break;
+                        }
                     }
                 }
                 if (!omitted_defaults) continue;
@@ -4778,7 +4805,7 @@ pub const Module = struct {
         if (tied or
             (best_unknown and !receiver_supplies_lambda and !renamed_best and
                 !sole_survivor and !refuted_member_strict_winner))
-            return .{ .applicable = true };
+            return .{ .applicable = true, .sole_unknown = if (!tied) best else null };
         const dispatch_owner = if (best) |target|
             (if (self.registry.member_ext_owner_class.get(target)) |owner|
                 self.classIdByFqn(owner)
@@ -5404,26 +5431,27 @@ pub const Module = struct {
     /// THEMSELVES instead of erasing to `*`: `val data = createFrom(...)`
     /// inside `IterableTests<T : Iterable<String>>` types `data: T`, which
     /// the bound-ref channel then resolves.
-    pub fn instantiatedCallReturnTypeScoped(
+    /// The substitution engine's CORE: solve every callee type-parameter
+    /// binding one call site offers — explicit type args, the owner
+    /// projection, the receiver, named and positional/vararg arguments,
+    /// and the star erasure for what stays open. Consumers substitute
+    /// whatever slot they need against the result. Arena-scoped: the
+    /// bindings borrow `a` and the module.
+    pub const SolvedBindings = struct {
+        bindings: []TypeBinding,
+        type_params: []const []const u8,
+    };
+    pub fn solveCallBindings(
         self: *const Module,
-        allocator: Allocator,
+        a: Allocator,
         fid: FuncId,
+        f: *const Func,
         receiver: ?TypeRef,
         dispatch_receiver: ?TypeRef,
         args: []const applicability.ArgShape,
         explicit_type_args: []const TypeRef,
         owner_params_in_scope: bool,
-    ) Allocator.Error!?TypeRef {
-        const f = self.funcById(fid) orelse return null;
-        // An unannotated source function currently carries Unit as its
-        // lowering placeholder. Do not present that placeholder as static
-        // receiver evidence.
-        if (std.mem.eql(u8, staticTypeHead(f.return_ty.name), "Unit")) return null;
-
-        var scratch = std.heap.ArenaAllocator.init(allocator);
-        defer scratch.deinit();
-        const a = scratch.allocator();
-
+    ) Allocator.Error!?SolvedBindings {
         const type_params_list = self.registry.func_type_params.get(fid);
         const function_type_params: []const []const u8 = if (type_params_list) |list|
             list.items
@@ -5675,11 +5703,46 @@ pub const Module = struct {
                 });
             }
         }
-        if (!returnTypeBindingsComplete(f.return_ty, type_params, bindings.items)) {
+        return .{ .bindings = bindings.items, .type_params = type_params };
+    }
+
+    pub fn instantiatedCallReturnTypeScoped(
+        self: *const Module,
+        allocator: Allocator,
+        fid: FuncId,
+        receiver: ?TypeRef,
+        dispatch_receiver: ?TypeRef,
+        args: []const applicability.ArgShape,
+        explicit_type_args: []const TypeRef,
+        owner_params_in_scope: bool,
+    ) Allocator.Error!?TypeRef {
+        const f = self.funcById(fid) orelse return null;
+        // An unannotated source function currently carries Unit as its
+        // lowering placeholder. Do not present that placeholder as static
+        // receiver evidence.
+        if (std.mem.eql(u8, staticTypeHead(f.return_ty.name), "Unit")) return null;
+
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+
+        const solved = (try self.solveCallBindings(
+            a,
+            fid,
+            f,
+            receiver,
+            dispatch_receiver,
+            args,
+            explicit_type_args,
+            owner_params_in_scope,
+        )) orelse return null;
+        const bindings_items = solved.bindings;
+        const type_params = solved.type_params;
+        if (!returnTypeBindingsComplete(f.return_ty, type_params, bindings_items)) {
             if (std.c.getenv("KLIO_ICRT") != null) std.debug.print("[icrt] {s}: bindings incomplete\n", .{f.fqn});
             return null;
         }
-        const substituted = try substituteType(a, f.return_ty, bindings.items);
+        const substituted = try substituteType(a, f.return_ty, bindings_items);
         // A return erased to a bare `*` head names nothing a caller can bind
         // against; it would only pollute the local's declared-type record.
         if (std.mem.eql(u8, staticTypeHead(substituted.name), "*")) {
@@ -5697,12 +5760,21 @@ pub const Module = struct {
     /// stays incomplete — the caller keeps its explicit-args answer.
     /// `Iterable<T>.count(predicate: (T) -> Boolean)` on an
     /// `Iterable<String>` receiver instantiates `(String) -> Boolean`.
-    pub fn instantiatedTypeFromReceiver(
+    /// The substitution engine's receiver leg, shared by both entry
+    /// points: solve the callee's type parameters from the ACTUAL
+    /// receiver against the declared one, substitute into `ty`.
+    /// `require_complete` demands every parameter `ty` mentions be
+    /// bound (the return-type contract); without it the parameters the
+    /// receiver proves substitute and the rest stay as written (the
+    /// lambda-param contract — its consumer refuses leftover bare
+    /// heads itself).
+    fn instantiatedTypeFromReceiverImpl(
         self: *const Module,
         allocator: Allocator,
         fid: FuncId,
         ty: TypeRef,
         receiver: TypeRef,
+        require_complete: bool,
     ) Allocator.Error!?TypeRef {
         const f = self.funcById(fid) orelse return null;
         if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) return null;
@@ -5715,9 +5787,19 @@ pub const Module = struct {
         var bindings: std.ArrayList(TypeBinding) = .empty;
         if (!try self.bindCallType(a, f.params[0].ty, receiver, tps, &bindings, 0)) return null;
         if (bindings.items.len == 0) return null;
-        if (!returnTypeBindingsComplete(ty, tps, bindings.items)) return null;
+        if (require_complete and !returnTypeBindingsComplete(ty, tps, bindings.items)) return null;
         const substituted = try substituteType(a, ty, bindings.items);
         return try substituted.clone(allocator);
+    }
+
+    pub fn instantiatedTypeFromReceiver(
+        self: *const Module,
+        allocator: Allocator,
+        fid: FuncId,
+        ty: TypeRef,
+        receiver: TypeRef,
+    ) Allocator.Error!?TypeRef {
+        return self.instantiatedTypeFromReceiverImpl(allocator, fid, ty, receiver, true);
     }
 
     /// `instantiatedTypeFromReceiver` without the completeness requirement:
@@ -5733,19 +5815,7 @@ pub const Module = struct {
         ty: TypeRef,
         receiver: TypeRef,
     ) Allocator.Error!?TypeRef {
-        const f = self.funcById(fid) orelse return null;
-        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) return null;
-        const tp_list = self.registry.func_type_params.get(fid);
-        const tps: []const []const u8 = if (tp_list) |list| list.items else &.{};
-        if (tps.len == 0) return null;
-        var scratch = std.heap.ArenaAllocator.init(allocator);
-        defer scratch.deinit();
-        const a = scratch.allocator();
-        var bindings: std.ArrayList(TypeBinding) = .empty;
-        if (!try self.bindCallType(a, f.params[0].ty, receiver, tps, &bindings, 0)) return null;
-        if (bindings.items.len == 0) return null;
-        const substituted = try substituteType(a, ty, bindings.items);
-        return try substituted.clone(allocator);
+        return self.instantiatedTypeFromReceiverImpl(allocator, fid, ty, receiver, false);
     }
 
     /// Instantiate an arbitrary type owned by a resolved declaration from
