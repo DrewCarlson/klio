@@ -941,6 +941,8 @@ pub const DispatchKind = enum(u8) {
     /// the widened receiver-carrying admission served them.
     static_flat_fuse,
     static_flat_fuse_ext,
+    /// By-name member calls replayed from their instruction-site memo.
+    member_site_flat,
     /// VM-plan P0 baseline: every interpreter frame constructed. P1's
     /// contiguous stack and P2's call fusion drive this denominator down
     /// per call; the compose margin is the external gauge.
@@ -1734,6 +1736,17 @@ fn vcallFlatEnabled() bool {
     const raw = runtime.getenvSlice("KLIO_FLAT_VCALL");
     const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
     vcall_flat_cached = b;
+    return b;
+}
+
+/// `KLIO_MEMBER_SITE=0` disables the CallMember instruction-site memo — the
+/// bisect switch for the by-name replay path.
+var member_site_cached: ?bool = null;
+fn memberSiteEnabled() bool {
+    if (member_site_cached) |b| return b;
+    const raw = runtime.getenvSlice("KLIO_MEMBER_SITE");
+    const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
+    member_site_cached = b;
     return b;
 }
 
@@ -5638,7 +5651,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         .CallSpread => |cs| return execArmCallSpread(H, allocator, frame, cs, host),
         .CallSuper => |csup| return execArmCallSuper(H, allocator, frame, csup, host),
         .CallMemberOrGlobal => |cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
-        .CallMember => |cm| return execArmCallMember(H, allocator, frame, cm, host),
+        .CallMember => |*cm| return execArmCallMember(H, allocator, frame, cm, host),
         .CallVirtual => |cv| return execArmCallVirtual(H, allocator, frame, cv, host),
         .CallMemberOrValue => |cmv| return execArmCallMemberOrValue(H, allocator, frame, cmv, host),
         .CallValueOrMember => |cvm| return execArmCallValueOrMember(H, allocator, frame, cvm, host),
@@ -7007,6 +7020,34 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     }
     const static_recv: ?[]const u8 = if (cm.static_recv) |sid| constStr(frame.module, sid) else null;
     const declared_recv: ?[]const u8 = if (cm.declared_recv) |did| constStr(frame.module, did) else null;
+    // Site memo replay: the claimed (class, arg-signature) pair serves its
+    // recorded target without the string-keyed cache probe. The signature is
+    // the same strict fold the method cache keys under, so the replay can
+    // never serve an overload that cache would have discriminated.
+    if (comptime @hasDecl(H, "memberSiteSig") and @hasDecl(H, "prepareMemberFlatFromFid")) {
+        if (flatEnabled() and memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.arg_names)) {
+            const w0 = @atomicLoad(u64, @constCast(&cm.site_cls), .acquire);
+            if (w0 > 1) site: {
+                {
+                    const g = recv.Instance.borrow();
+                    defer g.deinit();
+                    if (w0 != @as(u64, @intCast(g.get().class.identity()))) break :site;
+                }
+                const route = @atomicLoad(u64, @constCast(&cm.site_route), .acquire);
+                if (route == 0) break :site;
+                const sig_now = host.memberSiteSig(arg_values) orelse break :site;
+                if (sig_now != @atomicLoad(u64, @constCast(&cm.site_sig), .monotonic)) break :site;
+                if (try host.prepareMemberFlatFromFid(allocator, &recv, name_str, arg_values, @enumFromInt(@as(u32, @intCast(route >> 1))))) |prep0| {
+                    dispatchBump(.member_site_flat);
+                    var prep = prep0;
+                    prep.dst = cm.dst;
+                    prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
+                    frame.flat_call = prep;
+                    return .flat_call;
+                }
+            }
+        }
+    }
     // Flat member dispatch: a previously-resolved user method (or cached
     // top-level extension) at the fully-applied no-vararg shape runs as a
     // pushed activation. The host consults the same caches the recursive
@@ -7028,6 +7069,28 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 var prep = prep0;
                 prep.dst = cm.dst;
                 prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
+                // Claim the site memo for the resolved target, keyed by the
+                // receiver class and the strict argument signature. Claimed
+                // only once resolution is stable (the same gate the host's
+                // own caches fill under) and only for the positional form.
+                if (comptime @hasDecl(H, "memberSiteSig")) {
+                    if (memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.arg_names) and
+                        dispatchCacheStable() and
+                        @atomicLoad(u64, @constCast(&cm.site_cls), .monotonic) == 0)
+                    {
+                        if (host.memberSiteSig(arg_values)) |sig| {
+                            const cls: u64 = blk: {
+                                const g = recv.Instance.borrow();
+                                defer g.deinit();
+                                break :blk @intCast(g.get().class.identity());
+                            };
+                            if (cls > 1 and @cmpxchgStrong(u64, @constCast(&cm.site_cls), 0, cls, .acq_rel, .monotonic) == null) {
+                                @atomicStore(u64, @constCast(&cm.site_sig), sig, .monotonic);
+                                @atomicStore(u64, @constCast(&cm.site_route), (@as(u64, prep.func.id.int()) << 1) | 1, .release);
+                            }
+                        }
+                    }
+                }
                 frame.flat_call = prep;
                 runtime.prof.opRoute(5);
                 return .flat_call;

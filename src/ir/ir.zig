@@ -462,6 +462,16 @@ pub const Inst = union(enum) {
         /// member — so direct dispatch stays sound. Null keeps the virtual
         /// name-based path.
         resolved: ?FuncId = null,
+        /// Runtime site memo, single-fill (see `GetField.site_cls`): the first
+        /// Instance class whose by-name dispatch flat-resolved claims the
+        /// site; `site_sig` records the argument-type signature that
+        /// resolution was keyed under and `site_route` the packed target
+        /// (`FuncId << 1 | 1`, so a filled route is never 0). A later call
+        /// with the same receiver class and signature replays the target
+        /// without the string-keyed cache probe or the ladder.
+        site_cls: u64 = 0,
+        site_sig: u64 = 0,
+        site_route: u64 = 0,
         /// Declaring instance for a resolved member-extension target. The
         /// extension receiver remains in `receiver`; this second operand is
         /// the lexical/object dispatch receiver selected by Kotlin's implicit

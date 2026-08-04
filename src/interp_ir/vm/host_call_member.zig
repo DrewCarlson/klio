@@ -4136,6 +4136,38 @@ fn vflatTraceOn() bool {
     return b;
 }
 
+/// Argument-type signature for a CallMember instruction-site memo: the same
+/// strict primitive/identity fold the (class, name, sig) method cache keys
+/// under, so a site replay can never serve an overload the cache would have
+/// discriminated. Null = an unfingerprintable run; the site must not claim.
+pub fn memberSiteSig(self: *VmHost, args: []const Value) ?u64 {
+    // A zero-arg run has exactly one signature; skip the hash entirely —
+    // `next()`/`hasNext()` style calls dominate the replay population.
+    if (args.len == 0) return 2;
+    const sig = methodArgSig(self, args) orelse return null;
+    return if (sig == 0) 1 else sig;
+}
+
+/// Replay a CallMember site memo's claimed target as a flat call. A stored
+/// same-named instance field outranks a cached top-level extension (and an
+/// invoke-convention callable can shadow), so the presence of one declines
+/// to the full by-name path, exactly as the by-name prepare does.
+pub fn prepareMemberFlatFromFid(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    name: []const u8,
+    args: []const Value,
+    target: FuncId,
+) Allocator.Error!?ir.eval.FlatCallReq {
+    if (receiver.* == .Instance) {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        if (g.get().get(name) != null) return null;
+    }
+    return prepareFlatFromFid(self, allocator, receiver, args, target);
+}
+
 /// Flat-serve a bound virtual slot: resolve it against the receiver's class
 /// exactly as `invokeVirtualMember`'s main path does, admitting only the
 /// shape whose recursive serve would be a plain `[receiver] ++ args` frame —
