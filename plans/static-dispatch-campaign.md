@@ -2231,3 +2231,13 @@ Census-neutral, battery green. Next steps in order:
    approximations).
 4. Then the locals families re-census; what remains after 1-3 is
    the genuinely-dynamic floor that rides the VM leg.
+
+## Addendum 45 — engine step two: solveCallBindings extracted (2026-08-04)
+
+The engine's core is now one pub entry (solveCallBindings: explicit
+args + owner projection + receiver + named/positional/vararg args +
+star erasure -> SolvedBindings), with the return-type wrapper as its
+first consumer. Neutrality verified end to end. Step three migrates
+instantiatedLambdaValueParams onto it (arg evidence reaches
+lambda-param substitution — the it-tail's lever); step four the
+splice window.
