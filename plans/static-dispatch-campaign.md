@@ -1763,3 +1763,48 @@ no_class 17 / declined 87 / bound_static 1,533 / bound_virtual 6,664
 (85.44% bound). Examples: 105,421 — declined 1,075 / no_class 299
 (88.02% bound). Battery: sweep 117/0, litmus 43/43, drift 266/266,
 units green, compose 61/65 + 56/59 (known throughput set).
+
+## Addendum 22 — the lambda-typing completion arc (2026-08-04)
+
+Four commits (822e4f4e, 523fa569, 7e49f66e + the slice records above):
+stdlib no_receiver_type 1,172 -> 1,091, no_class_id 33 -> 4 (only
+DeepRecursiveFunctionBlock/Function0 — function-type heads with no
+class by design), bound 85.3% -> 86.2%. Examples no_receiver 9,980 ->
+9,469, no_class 299 -> 219. The `it` family fell 189 -> ~100. Every
+gate stayed green at every landing.
+
+The arc, mechanism by mechanism:
+- **Splice windows carry the receiver's FULL static type**
+  (`splice_recv_ty_ref`, 822e4f4e): the head-only channel starved
+  `for (element in this)` inside spliced extension bodies; the window
+  now records the call site's receiver type (bound-ref hop included)
+  and the `this` typing arm consults it first.
+- **Inline calls type their lambda arguments' closure bodies**
+  (523fa569): the splice's own arg loop bypassed `lowerArgRun`'s
+  transfer; the ext emitter now computes instantiated param types
+  before the inline branch and the loop consumes them per slot
+  (pointer-recovered arg index). The instantiation fallback's bare
+  callee-tp leak (T/R/S, no_class 17 -> 66 mid-arc) is refused at the
+  producer — `instantiatedLambdaValueParams` nulls the slice when any
+  entry's head is one of the callee's own tps.
+- **Deferred member calls type lambdas from the static extension**
+  (7e49f66e): a member-shadowed deferred call still types its lambdas
+  the way kotlinc does (against the static resolution = the ext
+  candidate). And the REPLAY defect underneath: lambda bound replay
+  dropped `TypeParamBound.args`, so one lambda level down
+  (`expect(1) { data.count { ... } }`) the bound hop offered bare `T`
+  and resolution tied. Args now survive replay. Pinned
+  bound_args_lambda_replay — behavior-bearing (static CharSequence
+  beats runtime String, kotlinc parity).
+
+Probe discipline note: the whole arc came from ONE repro file grown
+in three steps (declared-type property -> ctor-fn-typed property ->
+member-shadow -> expect-wrapper), each step converting or exposing
+the next channel. The census-row attribution (call/fn/splice columns
+added to [no-recv-name]) named each step's shape.
+
+Residual `it` (~100): unsigned-array splice contexts (~28, storage-
+mapped), AbstractMutableCollection retain/remove iterator loops,
+nested `compareBy { it.take(2) }` (the inner lambda belongs to a
+DIFFERENT callee than the window), `list`/`destination` families
+unchanged (substitution engine). declined 87 unmoved by this arc.
