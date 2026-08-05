@@ -5769,7 +5769,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             const arg_values = try readArgRun(allocator, frame, cvt.args, cvt.n_args);
             defer allocator.free(arg_values);
             const names = try resolveArgNames(allocator, frame.module, cvt.arg_names);
-            defer allocator.free(names);
+            defer freeArgNames(allocator, names);
             if (cvTraceOn()) {
                 std.debug.print("[cvt-instr] exact={} recv={s} n_args={d} caller={s}", .{
                     cvt.receiver_shape_exact, @tagName(std.meta.activeTag(recv)), arg_values.len, frame.func.name,
@@ -5805,7 +5805,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         },
         .CallSpread => |cs| return execArmCallSpread(H, allocator, frame, cs, host),
         .CallSuper => |csup| return execArmCallSuper(H, allocator, frame, csup, host),
-        .CallMemberOrGlobal => |cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
+        .CallMemberOrGlobal => |*cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
         .CallMember => |*cm| return execArmCallMember(H, allocator, frame, cm, host),
         .CallVirtual => |cv| return execArmCallVirtual(H, allocator, frame, cv, host),
         .CallMemberOrValue => |cmv| return execArmCallMemberOrValue(H, allocator, frame, cmv, host),
@@ -6630,7 +6630,7 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
     var arg_values = try readArgRun(allocator, frame, call.args, call.n_args);
     defer allocator.free(arg_values);
     var names = try resolveArgNames(allocator, frame.module, call.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     var ta: std.ArrayList([]const u8) = .empty;
     defer ta.deinit(allocator);
     for (call.type_args) |c| {
@@ -6709,7 +6709,7 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
                         const nn = try allocator.alloc(?[]const u8, names.len + 1);
                         nn[0] = null;
                         @memcpy(nn[1..], names);
-                        allocator.free(names);
+                        freeArgNames(allocator, names);
                         names = nn;
                     }
                 }
@@ -6799,7 +6799,7 @@ noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: *Fra
     defer names_list.deinit(allocator);
     {
         const tmp = try resolveArgNames(allocator, frame.module, cv.arg_names);
-        defer allocator.free(tmp);
+        defer freeArgNames(allocator, tmp);
         try names_list.appendSlice(allocator, tmp);
     }
     if (runtime.envOnce("KLIO_TRACE_PATH") != null) {
@@ -6891,7 +6891,7 @@ noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame: *Fr
     var effective_params: std.ArrayList(u32) = .empty;
     defer effective_params.deinit(allocator);
     const in_names = try resolveArgNames(allocator, frame.module, cs.arg_names);
-    defer allocator.free(in_names);
+    defer freeArgNames(allocator, in_names);
     for (cs.parts, 0..) |part, i| {
         const v = frame.read(part.reg);
         const name: ?[]const u8 = if (i < in_names.len) in_names[i] else null;
@@ -7011,7 +7011,7 @@ noinline fn execArmCallSuper(comptime H: type, allocator: Allocator, frame: *Fra
     const arg_values = try readArgRun(allocator, frame, csup.args, csup.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, csup.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     switch (try host.callSuper(allocator, &recv, owner_str, qual_str, name_str, arg_values, names)) {
         .ok => |rv| try frame.write(csup.dst, rv),
         .err => |e| return raiseStep(frame, e),
@@ -7048,7 +7048,7 @@ noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *F
         }
     }
     const names = try resolveArgNames(allocator, frame.module, cv.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     const prev_tl = if (cv.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
         H.setTrailingMemberCall(true)
     else
@@ -7162,7 +7162,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     const arg_values = try readArgRun(allocator, frame, cm.args, cm.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cm.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     // Keep the caller's instance `this` reachable while the
     // `recv.member(...)` dispatch resolves (the member-extension
     // visibility filter consults the chain); the callee's own
@@ -7290,7 +7290,7 @@ noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, fra
     const user_args = try readArgRun(allocator, frame, cmv.args, cmv.n_args);
     defer allocator.free(user_args);
     const names = try resolveArgNames(allocator, frame.module, cmv.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     const name_str = constStr(frame.module, cmv.name) orelse
         return raiseStep(frame, .{ .Type = "CallMemberOrValue: name not a string const" });
     var fb = frame.read(cmv.fallback);
@@ -7485,7 +7485,7 @@ noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator, fra
     const arg_values = try readArgRun(allocator, frame, cvm.args, cvm.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cvm.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     const invocable = valueInvocable(frame.module, callee_v);
     // A callable whose DECLARED params definitely refute the runtime
     // args is not the target — Kotlin resolved the call to the
@@ -7540,7 +7540,7 @@ noinline fn execArmNewInstance(comptime H: type, allocator: Allocator, frame: *F
     const arg_values = try readArgRun(allocator, frame, ni.args, ni.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, ni.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     // A bare `Inner(args)` inside a member of the enclosing
     // class is `this@Outer.Inner(args)`: pass the frame's own
     // `this` — a method's `this` param or a lambda's `this`
@@ -8097,7 +8097,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     const arg_values = try readArgRun(allocator, frame, cmg.args, cmg.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cmg.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     // A direct splice receiver (a bound `this` register) is the innermost
     // implicit receiver when present; otherwise the lambda capture slot, or —
     // when that is empty — the enclosing function's `this` *parameter*.
@@ -8220,8 +8220,29 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     // global (single candidate, no member/extension): skip the member passes.
     const func_p = @intFromPtr(frame.func);
     const cmg_skip = comptime @hasDecl(H, "cmgGlobalSkip");
-    const skip_member = cmg_skip and !is_ctor_name and !shadow_capture and
-        host.cmgGlobalSkip(func_p, &this_val, name_str, arg_values);
+    // The site's own memo answers first: a u64 compare against the receiver's
+    // class identity, with no receiver borrow and no hash of the key. The
+    // host's map stays the general answer (it survives across sites).
+    const site_key: ?struct { cls: u64, sig: u64 } = blk: {
+        if (!cmg_skip or is_ctor_name or shadow_capture) break :blk null;
+        if (this_val != .Instance) break :blk null;
+        if (comptime !@hasDecl(H, "memberSiteSig")) break :blk null;
+        const sig = host.memberSiteSig(arg_values) orelse break :blk null;
+        const cls: u64 = c: {
+            const g = this_val.Instance.borrow();
+            defer g.deinit();
+            break :c @intCast(g.get().class.identity());
+        };
+        if (cls == 0) break :blk null;
+        break :blk .{ .cls = cls, .sig = sig };
+    };
+    const site_skip = if (site_key) |k|
+        @atomicLoad(u64, @constCast(&cmg.skip_cls), .acquire) == k.cls and
+            @atomicLoad(u64, @constCast(&cmg.skip_sig), .monotonic) == k.sig
+    else
+        false;
+    const skip_member = site_skip or (cmg_skip and !is_ctor_name and !shadow_capture and
+        host.cmgGlobalSkip(func_p, &this_val, name_str, arg_values));
     var single_cand = false;
 
     if (routeTraceOn(name_str)) std.debug.print("[cmgsec] member-gate ctor={} shadow={} skip={}\n", .{ is_ctor_name, shadow_capture, skip_member });
@@ -8571,8 +8592,18 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // forever, so after one wall-capped test every later
         // `removeKnownCompositionLocked` in the same process resolved as
         // an unresolved global (the contamination cluster).
-        if (cmg_skip and single_cand and !is_ctor_name and !shadow_capture and first_real_err == null)
+        if (cmg_skip and single_cand and !is_ctor_name and !shadow_capture and first_real_err == null) {
             host.cmgGlobalRecord(func_p, &this_val, name_str, arg_values);
+            // Claim the site's own shortcut for the same verdict, under the
+            // same stability gate the host cache uses.
+            if (site_key) |k| {
+                if (dispatchCacheStable() and
+                    @cmpxchgStrong(u64, @constCast(&cmg.skip_cls), 0, k.cls, .acq_rel, .monotonic) == null)
+                {
+                    @atomicStore(u64, @constCast(&cmg.skip_sig), k.sig, .release);
+                }
+            }
+        }
         // Overloaded top-level function: select by runtime arg types
         // before falling back to the single global value baked in at
         // lower time.
@@ -9625,12 +9656,28 @@ fn spreadItems(allocator: Allocator, v: *const Value) Allocator.Error!union(enum
 
 /// Resolve a per-call `arg_names: []?ConstId` into a parallel
 /// `[]?[]const u8`. Empty input yields an empty output. Caller frees.
+/// All-null name runs for the positional shape, which is the overwhelming
+/// majority of calls: they carry no information beyond their length, so one
+/// shared constant run serves every arity up to the bound and the per-call
+/// allocation disappears. `freeArgNames` recognizes it and frees nothing.
+const ARG_NAMES_NULL_MAX: usize = 32;
+const arg_names_null: [ARG_NAMES_NULL_MAX]?[]const u8 = @splat(null);
+
 fn resolveArgNames(allocator: Allocator, module: *const Module, names: []const ?ConstId) Allocator.Error![]?[]const u8 {
+    if (names.len <= ARG_NAMES_NULL_MAX and argNamesAllNull(names)) {
+        return @constCast(arg_names_null[0..names.len]);
+    }
     const out = try allocator.alloc(?[]const u8, names.len);
     for (names, out) |opt, *dst| {
         dst.* = if (opt) |id| constStr(module, id) else null;
     }
     return out;
+}
+
+/// Release a run from `resolveArgNames`. The shared all-null run is static.
+fn freeArgNames(allocator: Allocator, names: []?[]const u8) void {
+    if (names.len != 0 and names.ptr == @constCast(&arg_names_null).ptr) return;
+    allocator.free(names);
 }
 
 fn valueTruthy(allocator: Allocator, v: *const Value) Allocator.Error!union(enum) { ok: bool, err: EvalError } {

@@ -690,6 +690,15 @@ pub const Inst = union(enum) {
         /// preserved through the deferred form so the global leg can
         /// type its dispatch (unsigned literal coercion, reified serving).
         type_args: []ConstId = &.{},
+        /// Site memo for the member-probe skip: the receiver class identity
+        /// (and argument signature) for which a previous execution of THIS
+        /// instruction found no member or extension and settled on the global
+        /// leg. A match skips the implicit-receiver walk. Single-fill under
+        /// the same benign-race convention as `CallMember`'s site route; the
+        /// host keeps an equivalent hash-keyed memo, which this shortcut
+        /// answers ahead of, without a borrow or a hash.
+        skip_cls: u64 = 0,
+        skip_sig: u64 = 0,
     },
     /// Write a global / top-level binding. Mirrors `LoadGlobal` for
     /// the write side: routed through `Host.store_global` so a
