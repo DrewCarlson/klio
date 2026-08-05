@@ -1926,3 +1926,15 @@ test "platform_collection_factories" {
         \\
     );
 }
+
+test "numeric_promotion_receiver" {
+    try check("numeric_promotion_receiver",
+        \\256
+        \\344
+        \\8
+        \\450
+        \\5
+        \\0
+        \\
+    );
+}
