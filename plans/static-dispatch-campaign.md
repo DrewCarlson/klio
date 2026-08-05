@@ -2746,3 +2746,20 @@ guard at its CONSUMER, not just correctness at its producer. The two name
 universes (checker source names, lowering mangled/qualified names) do not
 have to be reconciled for the channel to be safe — the consumer only has to
 decline what it cannot use.
+
+## Addendum 62 (2026-08-06): `concurrentMixingWriteApply_set` is contention-marginal
+
+The map suite reports 58/59 or 57/59 from run to run, and the difference is
+always `concurrentMixingWriteApply_set`. Measured directly:
+
+    run alone:        PASSED 29537ms, PASSED 29373ms
+    inside the suite: FAILED 30124ms, PASSED (earlier runs)
+
+It completes its full 100k mutations either way (addendum 57) and lands
+within ~2% of the 30s budget, so whether it passes is decided by what else
+is on the machine — the rest of the suite running before it, or another
+build. Do not read a 58->57 change as a regression without running that
+test alone first.
+
+The suite's real content is unchanged: `concurrentMixingWriteApply_clear`
+is the one test genuinely short of budget, at 5.5x.
