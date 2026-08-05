@@ -2613,3 +2613,30 @@ answers `MutableCollection` — it is a SPLICED inline body whose parameter
 types reach the caller through `spliceParamTy` without filling the local
 declared-type channel. That is the next unit, together with the `it`
 family (lambda parameters typed from the resolved callee).
+
+## Addendum 59 (2026-08-05): a receiver-lambda splice drops an outer local's type
+
+Repro in tree: `tests/fixtures/lowering_repros/receiver_splice_loses_local_type.kt`.
+
+    fun <T> List<T>.runA(): List<T> {
+        val iterator = listIterator(size)          // typed: MutableListIterator
+        return ArrayList<T>(1).apply {
+            while (iterator.hasPrevious()) add(iterator.previous())
+        }                                          // ^ NO receiver type here
+    }
+
+`KLIO_VALTY_TRACE=iterator` shows the local's declared type IS recorded and
+IS read at the sites outside the `apply`; the two sites inside the splice
+never consult `argDeclTypeRef` at all. `KLIO_NORECV_NAMES='*'` classifies
+them `local_no_decl_type` with `splice=ArrayList`, so the name resolves as
+a local in that window but carries no type.
+
+Ruled out: a plain `run { }` (no receiver) keeps the type, so it is the
+RECEIVER-lambda splice specifically; the enclosing function being `inline`
+makes no difference (both `runA` and `runB` fail identically); the lambda
+snapshot path in `lowerLambda` (which already pre-derives lazily-typed
+outer locals — its comment names this exact `iterator` shape) is not the
+path taken, because `apply` splices rather than lowering a lambda body.
+
+This is the last named cluster in `local_no_decl_type`. The other residual
+names — `symbol`/`index`/`array`, and the `it` family — are separate.
