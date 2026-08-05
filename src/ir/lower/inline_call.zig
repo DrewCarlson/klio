@@ -1633,7 +1633,22 @@ pub fn tryInlineCallWithTypeArgs(
                 .ty = if (b.localDeclTypeRef(p.name.name)) |t| try t.clone(b.allocator) else null,
             });
             b.clearLocalDeclType(p.name.name);
-            if (derived_clone) |dc| try b.setLocalDeclTypeOwned(p.name.name, dc);
+            if (derived_clone) |dc| {
+                try b.setLocalDeclTypeOwned(p.name.name, dc);
+            } else if (b.typeParamBound(dh) != null) {
+                // Nothing derivable from the argument, but the callee DECLARED
+                // this parameter by one of its own bounded type parameters
+                // (`destination: C where C : MutableCollection<in T>`). Record
+                // that head: the receiver walk resolves a type parameter
+                // through its bound, which is how Kotlin resolves a member on
+                // such a value — leaving it blank made every member call in
+                // the spliced body dynamic.
+                try b.setLocalDeclTypeOwned(p.name.name, .{
+                    .name = try b.allocator.dupe(u8, dh),
+                    .nullable = p.ty.nullable,
+                    .args = &.{},
+                });
+            }
         }
         // `noinline` parameters opt out of the inline-lambda splicing
         // path. Their argument value still flows through the binding
