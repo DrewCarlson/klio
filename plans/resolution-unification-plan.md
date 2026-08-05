@@ -399,12 +399,19 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
 
   Where it stops: `mutableStateMapOf` is absent from `fns` (confirmed), its
   two overloads share the return head `SnapshotStateMap`, and that class is
-  among the published 1,370 — yet the site still does not record. So the
-  remaining gap is inside the consumption path, not the publication: either
-  the IR's `return_ty.name` for these functions is not the bare head the
-  match assumes (a mangle or an empty generic head), or the local's class
-  is taken from a channel other than `expr_class` for this shape. A probe
-  printing `f.return_ty.name` for those two FuncIds decides it in one run.
+  among the published 1,370 — yet the site still does not record.
+
+  The deciding probe RAN (`dump-ir` now prints each function's return type,
+  landed for this): both pack overloads read
+  `mutableStateMapOf() [kind=plain ret=SnapshotStateMap]`, and the user
+  factory reads `box2Of() [kind=plain ret=Box2]` — the bare head in both
+  cases, exactly what the publisher matched on. So neither a mangle nor an
+  empty generic head is responsible, and publication is sound.
+
+  The fault is therefore inside the CONSUMPTION branch in `checkCall`. Next
+  attempt: re-apply the slice and instrument that branch directly (print on
+  extern hit and on each of its three conditions — callee shape,
+  `fns` miss, `classes.contains`), rather than re-deriving the inputs.
 
   **P7's real precondition: the eager results must survive the image path.**
   Either compute them before the image short-circuit, or carry them in the
