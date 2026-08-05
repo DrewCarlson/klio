@@ -2763,3 +2763,27 @@ test alone first.
 
 The suite's real content is unchanged: `concurrentMixingWriteApply_clear`
 is the one test genuinely short of budget, at 5.5x.
+
+## Addendum 63 (2026-08-06): more typeck visibility does not move the census
+
+With the eager channels now carrying the image's declarations and the
+checker's class evidence, the obvious question is how much further that line
+of attack can go. Answer: not far. Running the corpus census with the image
+DISABLED — the configuration where typeck sees all 634 pack/stdlib files and
+resolves 45% of member-call receiver classes — gives
+
+    image ON :  no_receiver_type 5.62%   bound 92.7%   (total 9268 sites)
+    image OFF:  no_receiver_type 6.45%   bound 91.9%   (total 4944 sites)
+
+The totals differ because lowering re-derives the stdlib from source when
+the image is off, so the site POPULATION is not the same and the comparison
+is indicative rather than exact. But there is no sign that fuller typeck
+knowledge reduces `no_receiver_type`: the image-on configuration is the
+better of the two on every bucket.
+
+So the remaining 508 sites are not waiting on what typeck knows. They are
+shapes LOWERING cannot use — which is where the gains of this stretch
+actually came from (safe casts, `this` in a member, predicate operators,
+conditional agreement, numeric promotion, function-typed callees, spliced
+type-parameter heads: 591 -> 508). Further widening of the eager channel
+should not be expected to pay; the next units are lowering-side derivations.
