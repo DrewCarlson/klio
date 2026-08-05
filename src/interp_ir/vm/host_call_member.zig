@@ -4249,7 +4249,35 @@ fn routeTraceOn(name: []const u8) bool {
     return std.mem.eql(u8, w, name);
 }
 
+/// A resolution the intrinsic member dispatch already settled for a BUILTIN
+/// receiver, answered before the probe ladder runs.
+///
+/// `stdlibMemberDispatch` memoizes the winning intrinsic per (receiver type,
+/// name, arity-is-zero) — but it sits far down the ladder, so every
+/// `Array.copyInto` / `Int.coerceAtMost` in a loop re-walked the arms above it
+/// to reach an answer that was already known. An entry exists only for a pair
+/// whose earlier arms declined once and whose resolution was judged cacheable
+/// (no user extension shadows it), so replaying it changes nothing but the
+/// path taken. Instance receivers keep the full walk: their arms consult the
+/// class hierarchy, which the earlier method caches already cover.
+fn builtinIntrinsicReplay(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    const name_p = memberNameIdentity(self, name) orelse return null;
+    const key: root_mod.ProgramImage.MemberResolveKey = .{
+        .type_p = @intFromPtr(receiver.typeFqn().ptr),
+        .name_p = name_p,
+        .args_empty = args.len == 0,
+    };
+    const e = &tl_resolve_cache[tlResolveSlot(key)];
+    if (e.state == 2 and e.type_p == key.type_p and e.name_p == key.name_p and e.args_empty == key.args_empty) {
+        return try dispatchWithReceiver(self, allocator, e.fqn, e.func.?, receiver, args);
+    }
+    return null;
+}
+
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
+    if (receiver.* != .Instance and !strict_ext and !no_ext and static_recv == null and declared_recv == null) {
+        if (try builtinIntrinsicReplay(self, allocator, receiver, name, args)) |r| return r;
+    }
     // A property whose declared type is a RECEIVER function type
     // (`var handler: (suspend Scope.() -> Unit)?`) invoked as a call:
     // Kotlin runs the stored lambda with the owning instance as its
