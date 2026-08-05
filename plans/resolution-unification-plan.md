@@ -323,6 +323,16 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
   effect at all; P7's work is extending the channel to member calls, not
   relaxing gates.
 
+  A second probe (counting resolutions made through the NON-recording
+  entry, i.e. what the channel would gain by covering member/extension
+  calls) narrows it further: a small generic program yields 1, and the
+  COMPOSE program yields 0 on BOTH channels. The eager pass runs there
+  (`computeEagerCalls` -> `typecheckModule` is visible in its profile) yet
+  no call resolution of either kind is produced, so P7 over a pack-using
+  program needs the member-call entry AND whatever path those calls take
+  through the checker, which is not `checkOverloadedCall`. Sizing that path
+  is the first task of P7 proper.
+
 - **P8** — hatch deletion (RC-H catalog above).
 - **P9** — optional flat bytecode + pack serialization.
 
