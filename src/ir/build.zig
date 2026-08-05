@@ -1944,6 +1944,9 @@ pub const FuncBuilder = struct {
     pub fn localDeclType(self: *const FuncBuilder, name: []const u8) ?[]const u8 {
         return if (self.local_decl_types.get(name)) |ty| ty.name else null;
     }
+    pub fn localDeclTypeCount(self: *const FuncBuilder) usize {
+        return self.local_decl_types.count();
+    }
     pub fn localDeclTypeRef(self: *const FuncBuilder, name: []const u8) ?TypeRef {
         return self.local_decl_types.get(name);
     }

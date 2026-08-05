@@ -8381,7 +8381,7 @@ fn narrowNullCheck(
 fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (runtime.envOnce("KLIO_VALTY_TRACE")) |w| {
         if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
-            std.debug.print("[valty] READ {s} decl={s}\n", .{ w, if (b.localDeclTypeRef(w)) |t| t.name else "<unset>" });
+            std.debug.print("[valty] READ {s} decl={s} b={x} fn={s} ndecl={d}\n", .{ w, if (b.localDeclTypeRef(w)) |t| t.name else "<unset>", @intFromPtr(b) & 0xffff, build.currentRealFn() orelse "-", b.localDeclTypeCount() });
         }
     }
     // The E2.1 type-head channel exists (Module.eagerTypeOf) but does

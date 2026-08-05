@@ -2638,5 +2638,19 @@ snapshot path in `lowerLambda` (which already pre-derives lazily-typed
 outer locals — its comment names this exact `iterator` shape) is not the
 path taken, because `apply` splices rather than lowering a lambda body.
 
+Narrowed 2026-08-05 with `KLIO_VALTY_TRACE` extended to print the builder
+identity and its declared-type count: the successful reads are in builder
+`9a58` (`ndecl=2`, `decl=MutableListIterator`); the failing ones are in a
+DIFFERENT builder with `ndecl=0`, and a trace on
+`inheritLocalDeclTypes` shows that builder never enters the lambda-body
+inheritance path at all. So this is not a case of the snapshot being
+taken and dropped — the failing body is lowered through a construction
+path that does not deliver `pending_lambda_local_decl_types`.
+
+Next step: trace FuncBuilder construction to identify that path (the two
+known lambda-body callers — `lowerLambda` at expr.zig and the local-fn
+body at stmt.zig — both set the snapshot, and only the latter omits it,
+so a third path is producing this builder).
+
 This is the last named cluster in `local_no_decl_type`. The other residual
 names — `symbol`/`index`/`array`, and the `it` family — are separate.
