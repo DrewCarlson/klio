@@ -1917,3 +1917,12 @@ test "site_memo_null_field" {
         \\
     );
 }
+
+test "platform_collection_factories" {
+    try check("platform_collection_factories",
+        \\[1, 2, 3]
+        \\{1=a, 2=b}
+        \\{x=1}
+        \\
+    );
+}

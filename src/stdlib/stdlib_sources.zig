@@ -230,6 +230,7 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-coroutines/Actuals.kt",
     "kotlin-coroutines/Intrinsics.kt",
     "kotlin-collections/CollectionsActuals.kt",
+    "kotlin-collections/PlatformFactories.kt",
     "kotlin-collections/AbstractMutableCollection.kt",
     "kotlin-collections/AbstractMutableList.kt",
     "kotlin-collections/AbstractMutableSet.kt",

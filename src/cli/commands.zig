@@ -976,6 +976,7 @@ pub fn runBuiltModuleArgs(
     runtime.prof.maybeReport();
     ir.eval.callStatsDump();
     ir.eval.dispatchStatsDump();
+    if (runtime.envOnce("KLIO_DECL_AUDIT") != null) declAudit(gpa, &built);
     // The dispatch census is reported for `run` as well as for `test`. The two
     // answer different questions: the stdlib's own tests are generic
     // throughout, so a change that reads a CONCRETE element type measures as
@@ -999,6 +1000,77 @@ pub fn runBuiltModuleArgs(
             break :blk 1;
         },
     };
+}
+
+
+/// `KLIO_DECL_AUDIT=1` — the completeness audit for the no-holes symbol table:
+/// every FQN the intrinsic registry can serve, paired with whether the module
+/// carries a DECLARATION for it. A callable the runtime can dispatch but the
+/// resolver cannot see is a hole: resolution has to fall back to a name probe
+/// there, which is exactly what the unified table exists to remove. Prints the
+/// tally and the first missing entries per package.
+fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) void {
+    const mg = built.module.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    var total: usize = 0;
+    var missing: usize = 0;
+    var member_missing: usize = 0;
+    var toplevel_missing: usize = 0;
+    var unaligned: usize = 0;
+    var unaligned_samples: std.ArrayList([]const u8) = .empty;
+    defer unaligned_samples.deinit(gpa);
+    var by_pkg = std.StringHashMap(usize).init(gpa);
+    defer by_pkg.deinit();
+    var samples: std.ArrayList([]const u8) = .empty;
+    defer samples.deinit(gpa);
+    var it = stdlib.implementations.allFqns();
+    while (it.next()) |fqn| {
+        total += 1;
+        if (module.funcIdByFqn(fqn) != null) continue;
+        // A class (its constructor) and a top-level property are declared
+        // entities too; the registry serves both under an FQN key.
+        if (module.classIdByFqn(fqn) != null) continue;
+        {
+            const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+            if (module.registry.top_level_prop_pkgs.get(simple) != null) continue;
+        }
+        missing += 1;
+        const pkg = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[0..d] else "";
+        // A receiver-qualified form (`kotlin.Float.plus`) is a MEMBER of a
+        // builtin type, which has no Kotlin source declaration by design.
+        // The holes that matter for the scope walk are package-level
+        // callables: the owner segment starts lowercase.
+        const owner_simple = if (std.mem.lastIndexOfScalar(u8, pkg, '.')) |d2| pkg[d2 + 1 ..] else pkg;
+        if (owner_simple.len != 0 and std.ascii.isUpper(owner_simple[0])) {
+            member_missing += 1;
+            continue;
+        }
+        // A registry key that names the same callable under a different
+        // package (`kotlin.naturalOrder` for `kotlin.comparisons.naturalOrder`)
+        // is not a missing declaration — it is an UNALIGNED key, which the
+        // scope walk must reconcile separately.
+        {
+            const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+            if (module.funcsBySimpleName(simple).len != 0) {
+                unaligned += 1;
+                if (unaligned_samples.items.len < 20) unaligned_samples.append(gpa, fqn) catch {};
+                continue;
+            }
+        }
+        toplevel_missing += 1;
+        const gop = by_pkg.getOrPut(pkg) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+        if (samples.items.len < 40) samples.append(gpa, fqn) catch {};
+    }
+    io.printStdout(gpa, "[decl-audit] intrinsics={d} declared={d} missing={d} (builtin-type members {d}, unaligned keys {d}, package-level holes {d})\n", .{ total, total - missing, missing, member_missing, unaligned, toplevel_missing });
+    var pit = by_pkg.iterator();
+    while (pit.next()) |e| {
+        io.printStdout(gpa, "[decl-audit] {d:>5}  {s}\n", .{ e.value_ptr.*, e.key_ptr.* });
+    }
+    for (samples.items) |fq| io.printStdout(gpa, "[decl-audit] hole: {s}\n", .{fq});
+    for (unaligned_samples.items) |fq| io.printStdout(gpa, "[decl-audit] unaligned: {s}\n", .{fq});
 }
 
 /// Run `main` on a large-stack worker thread so deep-but-finite legitimate
