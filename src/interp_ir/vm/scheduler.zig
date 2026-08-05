@@ -145,7 +145,7 @@ pub const Pool = struct {
         const c = S.cached.load(.monotonic);
         if (c != std.math.maxInt(usize)) return c;
         var v: usize = 0;
-        if (runtime.getenvSlice("KLIO_MAX_WORKERS")) |raw| {
+        if (runtime.envOnce("KLIO_MAX_WORKERS")) |raw| {
             v = std.fmt.parseInt(usize, raw, 10) catch 0;
         }
         S.cached.store(v, .monotonic);

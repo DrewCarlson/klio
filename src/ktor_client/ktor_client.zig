@@ -802,7 +802,7 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
     // Diagnostic: serve a bounded number of requests then return cleanly, so a
     // leak-checking allocator (KLIO_GC_ALLOC=gpa) reaches its end-of-run report.
     const serve_max: usize = blk: {
-        const v = runtime.getenvSlice("KLIO_SERVE_MAX") orelse break :blk 0;
+        const v = runtime.envOnce("KLIO_SERVE_MAX") orelse break :blk 0;
         break :blk std.fmt.parseInt(usize, v, 10) catch 0;
     };
     var served: usize = 0;

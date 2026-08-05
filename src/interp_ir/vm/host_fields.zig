@@ -353,7 +353,7 @@ var miss_trace_want: []const u8 = "";
 /// runner, the field ladder), where a raw getenv is a spinlock + probe.
 fn missTraceEnvCached() ?[]const u8 {
     if (miss_trace_state == 0) {
-        if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+        if (runtime.envOnce("KLIO_MISS_TRACE")) |w| {
             miss_trace_want = w;
             miss_trace_state = 2;
         } else {

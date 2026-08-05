@@ -13,6 +13,7 @@
 const std = @import("std");
 const objcell = @import("objcell.zig");
 const getenvSlice = objcell.getenvSlice;
+const envOnce = objcell.envOnce;
 
 /// Bundled performance preset. `fast` turns on everything that speeds up a
 /// normal single-program run; `safe` keeps the interpreter; `off` also drops
@@ -70,7 +71,7 @@ fn envBool(name: [*:0]const u8) ?bool {
 }
 
 fn envReclaim() ?AllocChoice {
-    const v = getenvSlice("KLIO_RECLAIM") orelse return null;
+    const v = envOnce("KLIO_RECLAIM") orelse return null;
     if (v.len == 0 or std.mem.eql(u8, v, "gc")) return .gc;
     if (std.mem.eql(u8, v, "arena") or std.mem.eql(u8, v, "0")) return .arena;
     if (std.mem.eql(u8, v, "debug")) return .debug;
@@ -83,7 +84,7 @@ fn envReclaim() ?AllocChoice {
 pub fn get() Config {
     if (cached) |c| return c;
     const base = profile_override orelse blk: {
-        const v = getenvSlice("KLIO_OPT") orelse break :blk default_profile;
+        const v = envOnce("KLIO_OPT") orelse break :blk default_profile;
         break :blk parseProfile(v) orelse default_profile;
     };
     var c = forProfile(base);
@@ -120,7 +121,7 @@ pub fn resolveBinaryProfile(args: []const []const u8) Profile {
             if (parseProfile(a[2..])) |p| return p;
         }
     }
-    if (getenvSlice("KLIO_OPT")) |v| {
+    if (envOnce("KLIO_OPT")) |v| {
         if (parseProfile(v)) |p| return p;
     }
     // Default by subcommand. `test` runs many small programs whose hot loops

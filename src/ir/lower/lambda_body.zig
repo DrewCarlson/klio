@@ -639,3 +639,4 @@ test "literalReturnTy classifies single-literal lambda bodies" {
 test {
     std.testing.refAllDecls(@This());
 }
+

@@ -3615,7 +3615,7 @@ pub fn enabled() bool {
 
 fn debugEnabled() bool {
     if (jit_debug_cache) |d| return d;
-    const v = runtime.getenvSlice("KLIO_JIT_DEBUG");
+    const v = runtime.envOnce("KLIO_JIT_DEBUG");
     const on = v != null and v.?.len > 0 and !std.mem.eql(u8, v.?, "0");
     jit_debug_cache = on;
     return on;

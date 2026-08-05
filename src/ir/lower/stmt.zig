@@ -169,7 +169,7 @@ fn isSafeMemberTarget(target: *const Expr) bool {
 }
 
 fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?Reg {
-    if (runtime.getenvSlice("KLIO_VALTY_TRACE")) |w| {
+    if (runtime.envOnce("KLIO_VALTY_TRACE")) |w| {
         if (std.mem.eql(u8, w, p.name.name)) {
             std.debug.print("[valty] enter {s} annotated={} init_tag={s} nf={d} in_fn={s} recv={s} encl={s} owner={s} tower={d}:", .{
                 p.name.name,
@@ -314,7 +314,7 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             // destructuring arm already trusts. Argument shapes built from
             // the local then refute inapplicable members.
             .Call => {
-                const vt = runtime.getenvSlice("KLIO_VALTY_TRACE");
+                const vt = runtime.envOnce("KLIO_VALTY_TRACE");
                 if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
                     if (vt) |w| if (std.mem.eql(u8, w, p.name.name))
                         std.debug.print("[valty] {s} = {s} mod={x} classes={d}\n", .{ p.name.name, ct.name, @intFromPtr(b.module) & 0xffff, b.module.classes.items.len });
@@ -347,10 +347,10 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             .Call, .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate => try b.setLocalInitExprAt(p.name.name, e, p.name.span),
             // A property read and an INDEXED read both carry a static type of
             // their own: `val held = row[1]` is `Row.get`'s return type.
-            .Member, .Index, .Path => if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_MEMBER_INIT") orelse "1", "0"))
+            .Member, .Index, .Path => if (!std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_INIT") orelse "1", "0"))
                 try b.setLocalInitExprAt(p.name.name, e, p.name.span),
             .ObjectExpr => try b.markObjectInitLocal(p.name.name),
-            else => if (runtime.getenvSlice("KLIO_INIT_KINDS") != null) {
+            else => if (runtime.envOnce("KLIO_INIT_KINDS") != null) {
                 std.debug.print("[init-kind] {s}\n", .{@tagName(std.meta.activeTag(e.*))});
             },
         }

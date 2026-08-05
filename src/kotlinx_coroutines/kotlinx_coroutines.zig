@@ -443,10 +443,10 @@ fn selectTrySelect(ctx: *CallCtx, sel: ObjRef(InstanceData), clause_obj: Value, 
     const args = [_]Value{ clause_obj, internal };
     const r = ctx.host.invokeMethod(&recv, "trySelect", &args, ctx.out) catch return false;
     const res = r orelse {
-        if (runtime.getenvSlice("KLIO_SELDBG") != null) std.debug.print("[seldbg] trySelect: no result\n", .{});
+        if (runtime.envOnce("KLIO_SELDBG") != null) std.debug.print("[seldbg] trySelect: no result\n", .{});
         return false;
     };
-    if (runtime.getenvSlice("KLIO_SELDBG") != null) {
+    if (runtime.envOnce("KLIO_SELDBG") != null) {
         switch (res) {
             .ok => |v| std.debug.print("[seldbg] trySelect ok tag={s} val={}\n", .{ @tagName(std.meta.activeTag(v)), v == .Bool and v.Bool }),
             .err => |e| std.debug.print("[seldbg] trySelect ERR {s}\n", .{@tagName(std.meta.activeTag(e))}),
@@ -474,11 +474,11 @@ fn selectTrySelect(ctx: *CallCtx, sel: ObjRef(InstanceData), clause_obj: Value, 
 /// reuses the proven `suspendCancellableCoroutine` cancellation path.
 fn armChannelCancel(ctx: *CallCtx, chan: Value, slot: i64) void {
     const scope = ctx.host.activeCoroScope() orelse {
-        if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
+        if (runtime.envOnce("KLIO_CHAN_DIAG") != null)
             std.debug.print("[chan] arm slot={d}: NO ACTIVE SCOPE\n", .{slot});
         return;
     };
-    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null) {
+    if (runtime.envOnce("KLIO_CHAN_DIAG") != null) {
         const cls: []const u8 = if (scope == .Instance) blk: {
             const g = scope.Instance.borrow();
             defer g.deinit();
@@ -540,7 +540,7 @@ fn channelBindWatcher(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const already_delivered = blk: {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
-        if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
+        if (runtime.envOnce("KLIO_CHAN_DIAG") != null)
             std.debug.print("[chan] bindWatcher slot={d}\n", .{slot});
         if (coro_reg.chan_delivered.fetchRemove(slot) != null) break :blk true;
         cont.retain();
@@ -565,7 +565,7 @@ fn channelBindWatcher(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// record the slot as delivered so it completes immediately on bind. Runs
 /// outside `coro_reg_mutex` (the resume drives Kotlin).
 fn dropWatcher(ctx: *CallCtx, slot: i64) void {
-    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
+    if (runtime.envOnce("KLIO_CHAN_DIAG") != null)
         std.debug.print("[chan] dropWatcher slot={d}\n", .{slot});
     const cont: ?Value = blk: {
         coro_reg_mutex.lock();
@@ -635,7 +635,7 @@ fn resumeWaiterNormal(ctx: *CallCtx, slot: i64, value: Value, scope: Value) void
             },
             .err => 0,
         };
-        if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null)
+        if (runtime.envOnce("KLIO_CHAN_DIAG") != null)
             std.debug.print("[chan] resumeRoute slot={d} code={d}\n", .{ slot, code });
         switch (code) {
             1 => {
@@ -708,7 +708,7 @@ fn makeSuccessResult(allocator: std.mem.Allocator, payload: Value) std.mem.Alloc
 /// double-resume.
 fn channelCancelWaiter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 2) return .{ .ok = .Unit };
-    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null) {
+    if (runtime.envOnce("KLIO_CHAN_DIAG") != null) {
         const sl: i64 = switch (ctx.args[1]) {
             .Long => |l| l,
             .Int => |i| @as(i64, i),
@@ -869,7 +869,7 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
         const state = coro_reg.channels.getPtr(id) orelse return .{ .err = .{ .Type = "Channel.send: missing state" } };
-        if (runtime.getenvSlice("KLIO_SELDBG") != null) {
+        if (runtime.envOnce("KLIO_SELDBG") != null) {
             std.debug.print("[seldbg] send id={d} sel_recv={d} recv_waiters={d} rendezvous={}\n", .{ id, state.select_recv_waiters.len(), state.receive_waiters.len(), state.rendezvous });
         }
         if (state.closed) {
@@ -2088,7 +2088,7 @@ fn parkSlot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// `__kxco_chanDiag(slot, cancelled)` — KLIO_CHAN_DIAG print from the
 /// Kotlin arm handler: proves the handler ran and with what cause.
 fn chanDiag(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    if (runtime.getenvSlice("KLIO_CHAN_DIAG") != null and ctx.args.len >= 2) {
+    if (runtime.envOnce("KLIO_CHAN_DIAG") != null and ctx.args.len >= 2) {
         const slot: i64 = switch (ctx.args[0]) {
             .Long => |l| l,
             .Int => |i| @as(i64, i),

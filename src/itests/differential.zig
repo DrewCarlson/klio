@@ -25,7 +25,7 @@ const runtime = @import("runtime");
 /// must not write to stderr, or the build runner renders it as a failed
 /// command. Set `KLIO_ITEST_VERBOSE` to surface them when running directly.
 fn verbose() bool {
-    return runtime.getenvSlice("KLIO_ITEST_VERBOSE") != null;
+    return runtime.envOnce("KLIO_ITEST_VERBOSE") != null;
 }
 
 const EXAMPLES = "examples";

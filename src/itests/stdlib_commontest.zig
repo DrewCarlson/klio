@@ -256,7 +256,7 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
     // (with a small slack for uneven per-file pass counts) when sharded.
     var shard_k: usize = 0;
     var shard_n: usize = 1;
-    if (runtime.getenvSlice("KLIO_COMMONTEST_SHARD")) |s| {
+    if (runtime.envOnce("KLIO_COMMONTEST_SHARD")) |s| {
         if (std.mem.indexOfScalar(u8, s, '/')) |sep| {
             const k = std.fmt.parseInt(usize, s[0..sep], 10) catch 0;
             const n = std.fmt.parseInt(usize, s[sep + 1 ..], 10) catch 1;

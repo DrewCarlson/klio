@@ -2970,7 +2970,7 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     // `collect(action)` exactly as kotlinc binds it. A head naming no
     // registered class (a typealias of a function type) stays non-definite.
     if (isCallable(arg)) {
-        if (runtime.getenvSlice("KLIO_ADM_TRACE") != null) {
+        if (runtime.envOnce("KLIO_ADM_TRACE") != null) {
             const cg2 = self.classes.borrow();
             defer cg2.deinit();
             std.debug.print("[adm] callable-vs pn={s} orig={s} reg={}\n", .{ pn, orig, cg2.get().get(pn) != null });
@@ -3784,7 +3784,7 @@ fn recvFnPropsAny(self: *VmHost) bool {
             if (pn.len == 0) continue;
             lm |= @as(u64, 1) << @intCast(@min(pn.len, 63));
             bm |= @as(u64, 1) << @intCast(pn[0] & 63);
-            if (runtime.getenvSlice("KLIO_RFP_DUMP") != null) {
+            if (runtime.envOnce("KLIO_RFP_DUMP") != null) {
                 std.debug.print("[rfp] {s}.{s}\n", .{ e.key_ptr.a, pn });
             }
         }
@@ -4130,7 +4130,7 @@ fn prepareFlatFromFid(self: *VmHost, allocator: Allocator, receiver: *const Valu
 var vflat_trace_cached: ?bool = null;
 fn vflatTraceOn() bool {
     if (vflat_trace_cached) |b| return b;
-    const b = runtime.getenvSlice("KLIO_VFLAT_TRACE") != null;
+    const b = runtime.envOnce("KLIO_VFLAT_TRACE") != null;
     vflat_trace_cached = b;
     return b;
 }
@@ -5351,7 +5351,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 if (std.mem.eql(u8, name, "toTypedArray")) {
                     return try dispatchWithReceiver(self, allocator, matched, f, receiver, args);
                 }
-                if (std.c.getenv("KLIO_DRAIN_TRACE") != null) {
+                if (runtime.envSetOnce("KLIO_DRAIN_TRACE")) {
                     std.debug.print("[drain] {s} on {s} caller={s} span={?any}\n", .{
                         name,
                         receiver.typeFqn(),
@@ -5776,7 +5776,7 @@ var miss_trace_init: bool = false;
 var miss_trace_val: ?[]const u8 = null;
 fn missTraceEnv() ?[]const u8 {
     if (!miss_trace_init) {
-        miss_trace_val = runtime.getenvSlice("KLIO_MISS_TRACE");
+        miss_trace_val = runtime.envOnce("KLIO_MISS_TRACE");
         miss_trace_init = true;
     }
     return miss_trace_val;
@@ -5785,7 +5785,7 @@ var nu_trace_init: bool = false;
 var nu_trace_val: ?[]const u8 = null;
 fn nuTraceEnv() ?[]const u8 {
     if (!nu_trace_init) {
-        nu_trace_val = runtime.getenvSlice("KLIO_NU_TRACE");
+        nu_trace_val = runtime.envOnce("KLIO_NU_TRACE");
         nu_trace_init = true;
     }
     return nu_trace_val;
@@ -5793,7 +5793,7 @@ fn nuTraceEnv() ?[]const u8 {
 var sam_trace_cached: ?bool = null;
 fn samTraceOn() bool {
     if (sam_trace_cached) |b| return b;
-    const b = runtime.getenvSlice("KLIO_SAM_TRACE") != null;
+    const b = runtime.envOnce("KLIO_SAM_TRACE") != null;
     sam_trace_cached = b;
     return b;
 }
@@ -7828,7 +7828,7 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         pmg.get().pos = p + 1;
         pmg.deinit();
         iteratorSetLast(it, @intCast(p));
-        if (std.c.getenv("KLIO_ITER_TRACE") != null) {
+        if (runtime.envSetOnce("KLIO_ITER_TRACE")) {
             std.debug.print("[iter-next] kind={s}\n", .{@tagName(std.meta.activeTag(v))});
         }
         return .{ .ok = v };
@@ -9709,7 +9709,7 @@ fn virtualSlotUnlinkedDiag(
     nargs: usize,
     which: []const u8,
 ) void {
-    if (runtime.getenvSlice("KLIO_ERR_TRACE") == null) return;
+    if (runtime.envOnce("KLIO_ERR_TRACE") == null) return;
     const root = FuncId.from(slot.int());
     const mname: []const u8 = if (module.funcById(root)) |f| f.fqn else "?";
     std.debug.print(
@@ -9735,7 +9735,7 @@ fn noinstTraceOn() bool {
         var known: ?bool = null;
     };
     if (S.known) |k| return k;
-    const k = std.c.getenv("KLIO_NOINST_TRACE") != null;
+    const k = runtime.envSetOnce("KLIO_NOINST_TRACE");
     S.known = k;
     return k;
 }
@@ -9782,7 +9782,7 @@ pub fn invokeVirtualMember(
             const owner = sig.enclosing_class orelse
                 return .{ .err = .{ .Type = "virtual callable slot has no interface owner" } };
             if (sig.has_body or owner.int() >= module.classes.items.len or !module.classes.items[owner.int()].is_interface) {
-                if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+                if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
                     const mname: []const u8 = if (module.funcById(root)) |f| f.fqn else "?";
                     std.debug.print("[vcall-callable] slot={d} method={s} recv_ty={s} has_body={} nargs={d} caller={s}\n", .{
                         slot.int(),
@@ -9869,7 +9869,7 @@ pub fn invokeVirtualMember(
         if (noinst.name) |mname| {
             return callMemberNamed(self, allocator, receiver, mname, args, arg_names);
         }
-        if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+        if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
             const mg = self.module.borrow();
             defer mg.deinit();
             const module = mg.get();
@@ -10649,7 +10649,7 @@ fn instanceIntrinsicCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceM
 }
 
 fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8) Allocator.Error!?EvalResult {
-    if (std.c.getenv("KLIO_WALK_TRACE") != null) {
+    if (runtime.envSetOnce("KLIO_WALK_TRACE")) {
         std.debug.print("[ir-walk] {s} on {s} static={s}\n", .{ name, receiver.typeFqn(), static_recv orelse "-" });
     }
     runtime.prof.opRoute(9);
@@ -11462,7 +11462,7 @@ fn importedPackExtShadows(self: *VmHost, allocator: Allocator, receiver: *const 
             var cached: ?bool = null;
         };
         if (S.cached) |b| break :blk b;
-        const b = runtime.getenvSlice("KLIO_SHADOW_TRACE") != null;
+        const b = runtime.envOnce("KLIO_SHADOW_TRACE") != null;
         S.cached = b;
         break :blk b;
     };
@@ -11971,7 +11971,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
     }
     var saw_member_ext = false;
-    if (std.c.getenv("KLIO_WALK_TRACE") != null) {
+    if (runtime.envSetOnce("KLIO_WALK_TRACE")) {
         std.debug.print("[extfb-walk] {s} on {s} strict={} static={s} keyed={}\n", .{ name, receiver.typeFqn(), strict_ext, static_recv orelse "-", cache_key != null });
     }
     const r = try extensionFnFallbackWalk(self, allocator, receiver, name, args, strict_ext, static_recv, declared_recv, cache_key, chain_key, &saw_member_ext);
@@ -12598,7 +12598,7 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
 pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *const Value, owner: []const u8) Allocator.Error!?Value {
     const entries = try ir.eval.enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
-    if (runtime.getenvSlice("KLIO_MEOI_TRACE")) |w| {
+    if (runtime.envOnce("KLIO_MEOI_TRACE")) |w| {
         if (std.mem.eql(u8, owner, w)) {
             std.debug.print("[meoi] owner={s} nentries={d}:", .{ owner, entries.len });
             for (entries) |e| {
@@ -14860,7 +14860,7 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
         }
         return .{ .ok = receiver.* };
     }
-    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+    if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
         std.debug.print("[labeled-this] qualifier={s} recv={s} chain_len={d}\n", .{ qualifier, @tagName(std.meta.activeTag(receiver.*)), chain.len });
         for (chain, 0..) |cv, i| {
             const cname: []const u8 = if (cv == .Instance) blk: {

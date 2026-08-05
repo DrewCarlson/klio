@@ -697,7 +697,7 @@ pub fn invokeCallableWithThis(self: *VmIntrinsicHost, callable: *const Value, ar
     }
 
     const msg = try std.fmt.allocPrint(self.allocator, "Vm::invoke_callable_with_this on `{s}`", .{callable.typeFqn()});
-    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+    if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
         std.debug.print("[icwt] callable={s} this={s} nargs={d}\n", .{ callable.typeFqn(), this_value.typeFqn(), args.len });
         ir.eval.dumpCurrentFrameParamsForDiag();
         ir.eval.dumpFrameChainForDiagAlways();
@@ -715,7 +715,7 @@ pub fn invokeMethod(self: *VmIntrinsicHost, receiver: *const Value, name: []cons
         .err => |e| switch (e) {
             .Throw => |v| RuntimeEvalResult{ .err = .{ .Thrown = v } },
             else => blk: {
-                if (runtime.getenvSlice("KLIO_SELDBG") != null) {
+                if (runtime.envOnce("KLIO_SELDBG") != null) {
                     std.debug.print("[seldbg] invokeMethod {s}: err={s}", .{ name, @tagName(std.meta.activeTag(e)) });
                     switch (e) {
                         .Unimplemented, .Type, .CalleeFailed => |m| std.debug.print(" {s}", .{m}),

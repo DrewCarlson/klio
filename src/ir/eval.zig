@@ -775,7 +775,7 @@ var call_stats_mutex: runtime.SpinMutex = .{};
 var call_stats: ?std.StringHashMap(u64) = null;
 fn callStatsBump(fqn: []const u8) void {
     if (call_stats_state == 0)
-        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+        call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
@@ -789,7 +789,7 @@ fn callStatsBump(fqn: []const u8) void {
 /// call workload.
 fn gfStatsBump(recv: *const Value, name: []const u8) void {
     if (call_stats_state == 0)
-        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+        call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
     var buf: [256]u8 = undefined;
     const key = std.fmt.bufPrint(&buf, "<gf>{s}.{s}", .{ recv.typeFqn(), name }) catch return;
@@ -809,7 +809,7 @@ fn gfStatsBump(recv: *const Value, name: []const u8) void {
 /// member dispatches are still unbound at runtime on a given workload.
 fn ladderStatsBump(recv: *const Value, name: []const u8) void {
     if (call_stats_state == 0)
-        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+        call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
     var buf: [256]u8 = undefined;
     const key = std.fmt.bufPrint(&buf, "<ladder>{s}.{s}", .{ recv.typeFqn(), name }) catch return;
@@ -894,7 +894,7 @@ pub fn opProfDump() void {
 var probe_stats: ?std.StringHashMap(u64) = null;
 pub fn callStatsProbe(name: []const u8) void {
     if (call_stats_state == 0)
-        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+        call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
@@ -979,7 +979,7 @@ var dispatch_stats_state: u8 = 0;
 
 inline fn dispatchBump(comptime k: DispatchKind) void {
     if (dispatch_stats_state == 0) {
-        dispatch_stats_state = if (runtime.getenvSlice("KLIO_DISPATCH_STATS") != null) 2 else 1;
+        dispatch_stats_state = if (runtime.envOnce("KLIO_DISPATCH_STATS") != null) 2 else 1;
     }
     if (dispatch_stats_state != 2) return;
     _ = dispatch_counts[@intFromEnum(k)].fetchAdd(1, .monotonic);
@@ -1033,7 +1033,7 @@ pub fn callStatsDump() void {
 var err_trace_state: u8 = 0;
 pub fn errTraceOn() bool {
     if (err_trace_state == 0)
-        err_trace_state = if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) 2 else 1;
+        err_trace_state = if (runtime.envOnce("KLIO_ERR_TRACE") != null) 2 else 1;
     return err_trace_state == 2;
 }
 
@@ -1152,7 +1152,7 @@ fn diagValueClassName(v: *const Value) []const u8 {
 fn spinDumpMaybe() void {
     if (!spin_interval_read) {
         spin_interval_read = true;
-        if (runtime.getenvSlice("KLIO_SPIN_TRACE")) |v| {
+        if (runtime.envOnce("KLIO_SPIN_TRACE")) |v| {
             spin_interval_s = std.fmt.parseInt(i64, v, 10) catch 30;
         }
     }
@@ -1743,7 +1743,7 @@ const Activation = struct {
 var flat_enabled_cached: ?bool = null;
 fn flatEnabled() bool {
     if (flat_enabled_cached) |b| return b;
-    const raw = runtime.getenvSlice("KLIO_FLAT");
+    const raw = runtime.envOnce("KLIO_FLAT");
     const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
     flat_enabled_cached = b;
     return b;
@@ -1754,7 +1754,7 @@ fn flatEnabled() bool {
 var vcall_flat_cached: ?bool = null;
 fn vcallFlatEnabled() bool {
     if (vcall_flat_cached) |b| return b;
-    const raw = runtime.getenvSlice("KLIO_FLAT_VCALL");
+    const raw = runtime.envOnce("KLIO_FLAT_VCALL");
     const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
     vcall_flat_cached = b;
     return b;
@@ -1765,7 +1765,7 @@ fn vcallFlatEnabled() bool {
 var member_site_cached: ?bool = null;
 fn memberSiteEnabled() bool {
     if (member_site_cached) |b| return b;
-    const raw = runtime.getenvSlice("KLIO_MEMBER_SITE");
+    const raw = runtime.envOnce("KLIO_MEMBER_SITE");
     const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
     member_site_cached = b;
     return b;
@@ -1777,21 +1777,21 @@ fn memberSiteEnabled() bool {
 var cv_trace_cached: ?bool = null;
 fn cvTraceOn() bool {
     if (cv_trace_cached) |b| return b;
-    const b = runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null;
+    const b = runtime.envOnce("KLIO_CALLVALUE_TRACE") != null;
     cv_trace_cached = b;
     return b;
 }
 var lr_trace_cached: ?bool = null;
 fn lrTraceOn() bool {
     if (lr_trace_cached) |b| return b;
-    const b = runtime.getenvSlice("KLIO_LR_TRACE") != null;
+    const b = runtime.envOnce("KLIO_LR_TRACE") != null;
     lr_trace_cached = b;
     return b;
 }
 var resume_trace_cached: ?bool = null;
 fn resumeTraceOn() bool {
     if (resume_trace_cached) |b| return b;
-    const b = runtime.getenvSlice("KLIO_RESUME_TRACE") != null;
+    const b = runtime.envOnce("KLIO_RESUME_TRACE") != null;
     resume_trace_cached = b;
     return b;
 }
@@ -1799,7 +1799,7 @@ var miss_trace_init: bool = false;
 var miss_trace_val: ?[]const u8 = null;
 fn missTraceWant() ?[]const u8 {
     if (!miss_trace_init) {
-        miss_trace_val = runtime.getenvSlice("KLIO_MISS_TRACE");
+        miss_trace_val = runtime.envOnce("KLIO_MISS_TRACE");
         miss_trace_init = true;
     }
     return miss_trace_val;
@@ -1808,7 +1808,7 @@ var cmg_trace_init: bool = false;
 var cmg_trace_val: ?[]const u8 = null;
 fn cmgTraceWant() ?[]const u8 {
     if (!cmg_trace_init) {
-        cmg_trace_val = runtime.getenvSlice("KLIO_CMG_TRACE");
+        cmg_trace_val = runtime.envOnce("KLIO_CMG_TRACE");
         cmg_trace_init = true;
     }
     return cmg_trace_val;
@@ -1817,7 +1817,7 @@ var nu_trace_init: bool = false;
 var nu_trace_val: ?[]const u8 = null;
 fn nuTraceWant() ?[]const u8 {
     if (!nu_trace_init) {
-        nu_trace_val = runtime.getenvSlice("KLIO_NU_TRACE");
+        nu_trace_val = runtime.envOnce("KLIO_NU_TRACE");
         nu_trace_init = true;
     }
     return nu_trace_val;
@@ -2023,7 +2023,7 @@ threadlocal var suspend_stats_receivers: usize = 0;
 
 fn noteSuspendSnapshot(dense: bool, total: usize, saved: usize, params: usize, captures: usize, receivers: usize) void {
     const enabled = suspend_stats_enabled orelse blk: {
-        const on = runtime.getenvSlice("KLIO_SUSPEND_STATS") != null;
+        const on = runtime.envOnce("KLIO_SUSPEND_STATS") != null;
         suspend_stats_enabled = on;
         break :blk on;
     };
@@ -2571,7 +2571,7 @@ const Frame = struct {
             }
             if (func.flat_class == 1) dispatchBump(.frame_push_flattenable);
         }
-        if (runtime.getenvSlice("KLIO_TRACE_PATH") != null) {
+        if (runtime.envOnce("KLIO_TRACE_PATH") != null) {
             for (params.items, 0..) |*pv, pi| {
                 const payload: i64 = switch (pv.*) {
                     .Int => |x| @as(i64, x),
@@ -3086,7 +3086,7 @@ var leaf_trace_state: u8 = 0;
 var leaf_trace_want: []const u8 = "";
 fn leafTraceWant(func: *const Func) bool {
     if (leaf_trace_state == 0) {
-        leaf_trace_want = runtime.getenvSlice("KLIO_LEAF_TRACE") orelse "";
+        leaf_trace_want = runtime.envOnce("KLIO_LEAF_TRACE") orelse "";
         leaf_trace_state = 1;
     }
     if (leaf_trace_want.len == 0) return false;
@@ -3229,7 +3229,7 @@ var bool_this_trap_state: u8 = 0;
 pub fn boolThisTrap(func: *const Func, args: []const Value) void {
     // Consulted per flat-call open: cache the env verdict once.
     if (bool_this_trap_state == 0)
-        bool_this_trap_state = if (runtime.getenvSlice("KLIO_THIS_TRAP") != null) 2 else 1;
+        bool_this_trap_state = if (runtime.envOnce("KLIO_THIS_TRAP") != null) 2 else 1;
     if (bool_this_trap_state != 2) return;
     if (func.params.len == 0 or args.len == 0) return;
     if (!std.mem.eql(u8, func.params[0].name, "this")) return;
@@ -3257,7 +3257,7 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
         // Consulted per frame creation on the hot call path: even the
         // memoized env probe costs a spinlock + hashmap probe, so cache
         // the answer in a file-local once.
-        const w = runtime.getenvSlice("KLIO_DUMP_FN") orelse "";
+        const w = runtime.envOnce("KLIO_DUMP_FN") orelse "";
         dump_fn_want = w;
         break :blk w;
     };
@@ -3490,7 +3490,7 @@ fn frameBoundary(func: *const Func, result_in: EvalResult) EvalResult {
                 // is being re-tagged — the frames are gone by the time the
                 // error surfaces, so this is the only record of the failing
                 // function.
-                if (runtime.getenvSlice("KLIO_AMP_TRACE")) |w| {
+                if (runtime.envOnce("KLIO_AMP_TRACE")) |w| {
                     if (std.mem.indexOf(u8, m, w) != null) {
                         std.debug.print("[amp] body={s} fqn={s} err={s} msg={s}\n", .{ func.name, func.fqn, @tagName(std.meta.activeTag(result.err)), m });
                         dumpFrameChainForDiagAlways();
@@ -4869,7 +4869,7 @@ fn runFrameExec(
     // loop reads them. `TailCallFunc` is self-recursive (same func), so `func`
     // stays current for the whole loop.
     if (func.blocks.len == 0 and !frame.module.ensureFuncBody(@constCast(func))) {
-        if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+        if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
             std.debug.print("[empty-frame] fqn={s} params={d} caller={s}\n", .{
                 func.fqn, func.params.len,
                 if (currentFrameFunc()) |cf| cf.fqn else "<none>",
@@ -5618,7 +5618,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             const b = switch (v) {
                 .Bool => |bv| !bv,
                 else => {
-                    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+                    if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
                         std.debug.print("[not-miss] in={s} kind={s} span={?any}\n", .{
                             frame.func.name, @tagName(std.meta.activeTag(v)), frame.cur_span,
                         });
@@ -6675,7 +6675,7 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
 noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: *Frame, cv: anytype, host: *H) Allocator.Error!Step {
     dispatchBump(.call_value);
     const callee_v = frame.read(cv.callee);
-    if (runtime.getenvSlice("KLIO_TRACE_PATH") != null) {
+    if (runtime.envOnce("KLIO_TRACE_PATH") != null) {
         if (callee_v == .IrClosure) {
             std.debug.print("[cv-callee] in={s} kind=IrClosure id={d}\n", .{ frame.func.name, callee_v.IrClosure.id });
         } else {
@@ -6696,7 +6696,7 @@ noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: *Fra
         defer allocator.free(tmp);
         try names_list.appendSlice(allocator, tmp);
     }
-    if (runtime.getenvSlice("KLIO_TRACE_PATH") != null) {
+    if (runtime.envOnce("KLIO_TRACE_PATH") != null) {
         for (arg_values_list.items, 0..) |*av, ai| {
             std.debug.print("[cv-arg] in={s} #{d} kind={s}\n", .{ frame.func.name, ai, @tagName(std.meta.activeTag(av.*)) });
         }
@@ -8983,7 +8983,7 @@ fn samCandidateInvoke(
         }
     }
     var sam_recv = cands[ci].v;
-    if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) {
+    if (runtime.envOnce("KLIO_SAM_TRACE") != null) {
         std.debug.print("[sam-walk] name={s} nargs={d} ci={d} n={d} tags:", .{ name_str, arg_values.len, ci, cands.len });
         for (cands, 0..) |c, k| {
             const served = if (comptime @hasDecl(H, "valueCouldServeName")) host.valueCouldServeName(allocator, &c.v, name_str, arg_values.len) else false;

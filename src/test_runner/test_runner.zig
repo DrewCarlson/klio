@@ -356,7 +356,7 @@ fn describeThrow(gpa: Allocator, v: Value) []const u8 {
     // Full rendered throwable (type, message, frames, causes) under
     // KLIO_ERR_TRACE — a teardown-masked failure is undiagnosable from
     // the type+message line alone.
-    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+    if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(gpa);
         if (ir.eval.formatThrowable(gpa, &v, &buf, false, 0)) {
@@ -431,7 +431,7 @@ fn wallCapSeconds() i64 {
     };
     if (S.cached) |v| return v;
     const v: i64 = blk: {
-        const s = runtime.getenvSlice("KLIO_TEST_WALL_CAP") orelse break :blk 300;
+        const s = runtime.envOnce("KLIO_TEST_WALL_CAP") orelse break :blk 300;
         break :blk std.fmt.parseInt(i64, s, 10) catch 300;
     };
     S.cached = v;

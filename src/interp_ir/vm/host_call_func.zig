@@ -746,7 +746,7 @@ fn applicExactHeadCb(ctx: *anyopaque, param_head: []const u8, arg_head: []const 
 fn applicSubtypeCb(ctx: *anyopaque, value: *const anyopaque, target: []const u8) ?i32 {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     const arg: *const Value = @ptrCast(@alignCast(value));
-    const strace = if (runtime.getenvSlice("KLIO_SUBTYPE_TRACE")) |w| (std.mem.indexOf(u8, target, w) != null) else false;
+    const strace = if (runtime.envOnce("KLIO_SUBTYPE_TRACE")) |w| (std.mem.indexOf(u8, target, w) != null) else false;
     if (arg.* != .Instance) {
         if (strace) std.debug.print("[sub] target={s} arg-tag={s} -> null\n", .{ target, @tagName(std.meta.activeTag(arg.*)) });
         return null;
@@ -805,7 +805,7 @@ fn sigViewOfFunc(self: *VmHost, module: *const Module, cand: FuncId, argc: usize
 fn positionalPoints(self: *VmHost, module: *const Module, cand: FuncId, shapes: []const applicability.ArgShape, scope: applicability.ApplicabilityScope) ?i32 {
     const sig = sigViewOfFunc(self, module, cand, shapes.len) orelse return null;
     const sc = applicability.applicable(&sig, shapes, scope);
-    if (sc == null and runtime.getenvSlice("KLIO_APPLIC_TRACE") != null) {
+    if (sc == null and runtime.envOnce("KLIO_APPLIC_TRACE") != null) {
         std.debug.print("[pp-null] cand={d} named={} nshapes={d} shape0named={s} shape0class={s}\n", .{
             cand.int(),
             scope.named,
@@ -1485,7 +1485,7 @@ var hcf_miss_trace_state: u8 = 0;
 var hcf_miss_trace_want: []const u8 = "";
 fn hcfMissTraceEnv() ?[]const u8 {
     if (hcf_miss_trace_state == 0) {
-        if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+        if (runtime.envOnce("KLIO_MISS_TRACE")) |w| {
             hcf_miss_trace_want = w;
             hcf_miss_trace_state = 2;
         } else {
@@ -2234,7 +2234,7 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
             (std.mem.eql(u8, f.name, "enumValues") or std.mem.eql(u8, f.name, "enumValueOf") or
                 std.mem.eql(u8, f.name, "enumEntries") or std.mem.eql(u8, f.name, "enumEntriesIntrinsic")))
         {
-            if (runtime.getenvSlice("KLIO_NU_TRACE") != null) {
+            if (runtime.envOnce("KLIO_NU_TRACE") != null) {
                 std.debug.print("[eev] fn={s} nta={d} ta0={s}\n", .{ f.name, type_args.len, if (type_args.len > 0) type_args[0] else "-" });
             }
             if (type_args.len > 0 and type_args[0].len != 0) {
@@ -2488,7 +2488,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         break :blk own;
     };
     const eff = eff_resolved;
-    const ntrace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
+    const ntrace = if (runtime.envOnce("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     if (ntrace) {
         std.debug.print("[cno] {s} bounded={} cands={d} in_fn={s} nargs={d} names:", .{
             name,

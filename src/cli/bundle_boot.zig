@@ -210,7 +210,7 @@ pub fn run(gpa: Allocator, argv: []const []const u8) u8 {
         return 1;
     }
 
-    if (runtime.getenvSlice("KLIO_BUNDLE_INSPECT")) |v| {
+    if (runtime.envOnce("KLIO_BUNDLE_INSPECT")) |v| {
         if (v.len != 0 and !std.mem.eql(u8, v, "0")) {
             printInspect(gpa, &manifest, &table);
             return 0;

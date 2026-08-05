@@ -687,7 +687,7 @@ fn appendResource(
 fn findShimBytes(arena: Allocator, fio: std.Io, target: []const u8) ?[]const u8 {
     const cwd = std.Io.Dir.cwd();
     if (std.mem.eql(u8, target, hostTarget())) {
-        if (runtime.getenvSlice("KLIO_SKIA_LIB")) |p| {
+        if (runtime.envOnce("KLIO_SKIA_LIB")) |p| {
             if (cwd.readFileAlloc(fio, p, arena, .unlimited) catch null) |b| return b;
         }
         if (selfExePath(arena)) |exe| {
@@ -753,7 +753,7 @@ fn rebuildHint(target: []const u8) []const u8 {
 /// KLIO_BUNDLE_PROGRAM_IMAGE=0 forces the program-src boot, mainly so
 /// tests can gate both paths).
 fn programImageEnabled() bool {
-    const v = runtime.getenvSlice("KLIO_BUNDLE_PROGRAM_IMAGE") orelse return true;
+    const v = runtime.envOnce("KLIO_BUNDLE_PROGRAM_IMAGE") orelse return true;
     return v.len == 0 or !std.mem.eql(u8, v, "0");
 }
 

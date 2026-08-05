@@ -232,7 +232,7 @@ pub fn registerExprBodyMember(owner: []const u8, f: *const ast.Function) std.mem
         expr_body_members = std.StringHashMap(FnField).init(std.heap.page_allocator);
     }
     const key = try std.fmt.allocPrint(std.heap.page_allocator, "{s}\x1f{s}\x1f{d}", .{ owner, f.name.name, f.params.len });
-    if (std.c.getenv("KLIO_EBM_TRACE") != null and std.mem.eql(u8, f.name.name, "createOnCancellationAction"))
+    if (runtime.envSetOnce("KLIO_EBM_TRACE") and std.mem.eql(u8, f.name.name, "createOnCancellationAction"))
         std.debug.print("[ebm] register owner={s} arity={d}\n", .{ owner, f.params.len });
     try expr_body_members.?.put(key, FnField.fromPtr(f));
 }
@@ -240,7 +240,7 @@ pub fn registerExprBodyMember(owner: []const u8, f: *const ast.Function) std.mem
 /// The registered expression body for (owner, name, arity), or null.
 pub fn exprBodyMemberAst(owner: []const u8, name: []const u8, nparams: usize) ?*const ast.Function {
     var buf: [256]u8 = undefined;
-    if (std.c.getenv("KLIO_EBM_TRACE") != null and std.mem.eql(u8, name, "createOnCancellationAction"))
+    if (runtime.envSetOnce("KLIO_EBM_TRACE") and std.mem.eql(u8, name, "createOnCancellationAction"))
         std.debug.print("[ebm] lookup owner={s} arity={d} n={d}\n", .{ owner, nparams, if (expr_body_members) |m| m.count() else 0 });
     if (expr_body_members) |*m| {
         const key = std.fmt.bufPrint(&buf, "{s}\x1f{s}\x1f{d}", .{ owner, name, nparams }) catch return null;
@@ -467,7 +467,7 @@ pub fn inlineFnAstForRecvExt(
     require_receiver: bool,
 ) ?*const ast.Function {
     if (isShadowed(name)) return null;
-    const ptrace = if (runtime.getenvSlice("KLIO_INLINE_PICK")) |w| std.mem.eql(u8, w, name) else false;
+    const ptrace = if (runtime.envOnce("KLIO_INLINE_PICK")) |w| std.mem.eql(u8, w, name) else false;
     const all = candidatesFor(name) orelse return inlineFnAstFor(name, call);
     var vis_buf: [24]*const ast.Function = undefined;
     const cands = visibleCands(all, if (call) |c| c.call_file else null, &vis_buf);

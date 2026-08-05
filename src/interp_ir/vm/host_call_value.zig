@@ -181,7 +181,7 @@ const ThisOverride = struct { idx: usize, val: Value };
 var cvt_trace_cached: ?bool = null;
 fn callValueTraceOn() bool {
     if (cvt_trace_cached) |v| return v;
-    const on = runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null;
+    const on = runtime.envOnce("KLIO_CALLVALUE_TRACE") != null;
     cvt_trace_cached = on;
     return on;
 }
@@ -1170,7 +1170,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
             std.mem.eql(u8, func.params[func.params.len - 2].name, "$composer");
         if ((info.has_receiver or compose_recv_infer) and !last_vararg and args.len == info.n_params + 1) {
-            if (runtime.getenvSlice("KLIO_REBIND_AUDIT") != null) {
+            if (runtime.envOnce("KLIO_REBIND_AUDIT") != null) {
                 std.debug.print("[REBIND] fn={s} n_params={d}\n", .{ func.name, info.n_params });
             }
             // A receiver lambda need not read its receiver. Such a body has
@@ -1391,7 +1391,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
     if (callee.* == .Comparator and args.len == 2) {
         return self.callMember(allocator, callee, "compare", args);
     }
-    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null)
+    if (runtime.envOnce("KLIO_ERR_TRACE") != null)
         std.debug.print("[callvalue-miss] callee={s} args={d}\n", .{ callee.typeFqn(), args.len });
     ir.eval.dumpFrameChainForDiag();
     const msg = try std.fmt.allocPrint(allocator, "Vm::call_value on `{s}`", .{callee.typeFqn()});
@@ -1467,7 +1467,7 @@ pub fn callValueNamedRecvCtx(self: *VmHost, allocator: Allocator, callee: *const
                 break :blk f.lambda_receiver_ty != null;
             };
             if ((!has_this or receiver_lambda) and args.len == info.n_params) {
-                if (runtime.getenvSlice("KLIO_CVNRC") != null) {
+                if (runtime.envOnce("KLIO_CVNRC") != null) {
                     const tn = blk: {
                         const g = recv.Instance.borrow();
                         defer g.deinit();

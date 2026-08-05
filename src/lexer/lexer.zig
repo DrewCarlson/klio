@@ -2098,3 +2098,4 @@ test "raw string quote-run: leading quote joins the content" {
     try testing.expect(t[1].kind == .StringText and std.mem.eql(u8, t[1].kind.StringText, "\"v\""));
     try testing.expect(t[2].kind == .StringQuote and t[2].kind.StringQuote.triple);
 }
+

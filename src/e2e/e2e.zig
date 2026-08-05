@@ -69,7 +69,7 @@ fn runCorpus(jit_on: bool) !void {
             if (std.mem.indexOf(u8, stem, std.mem.span(f)) == null) continue;
         }
         if (shardSkip(stem)) continue;
-        if (std.c.getenv("KLIO_E2E_TRACE") != null) std.debug.print("e2e RUN {s} (jit={})\n", .{ stem, jit_on });
+        if (runtime.envSetOnce("KLIO_E2E_TRACE")) std.debug.print("e2e RUN {s} (jit={})\n", .{ stem, jit_on });
         const exp_path = try std.fmt.allocPrint(a, "{s}/{s}.out", .{ EXPECTED, stem });
 
         const expected = std.Io.Dir.cwd().readFileAlloc(io, exp_path, a, .unlimited) catch |e| {

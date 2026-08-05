@@ -85,7 +85,7 @@ const FILE_INIT_FAILED_MSG = "There was an error during file or class initializa
 /// the true root cause is visible even when later re-accesses (`.failed`)
 /// bury it under a cause-less `FileFailedToInitializeException`.
 fn initDebugLog(name: []const u8, e: EvalError) void {
-    if (runtime.getenvSlice("KLIO_INIT_DEBUG") == null) return;
+    if (runtime.envOnce("KLIO_INIT_DEBUG") == null) return;
     switch (e) {
         .Throw => |t| switch (t) {
             .Exception => |ex| {
@@ -152,7 +152,7 @@ fn claimObjectInit(self: *VmHost, key: []const u8) ClaimOutcome {
             .Failed => |*f| {
                 const c = f.cause;
                 f.cause = null;
-                if (runtime.getenvSlice("KLIO_INIT_DEBUG") != null)
+                if (runtime.envOnce("KLIO_INIT_DEBUG") != null)
                     std.debug.print("[init-debug] {s} failed-take cause={}\n", .{ key, c != null });
                 return .{ .failed = c };
             },
@@ -511,7 +511,7 @@ pub fn objectSingletonQuiet(self: *VmHost, name: []const u8) ?Value {
     return switch (r) {
         .ok => |v| v,
         .err => |e| blk: {
-            if (runtime.getenvSlice("KLIO_INIT_DEBUG") != null)
+            if (runtime.envOnce("KLIO_INIT_DEBUG") != null)
                 std.debug.print("[init-debug] {s} quiet-swallow err={s}\n", .{ name, @tagName(e) });
             if (e == .Throw and e.Throw == .Exception) {
                 if (e.Throw.Exception.cause) |cause_cell| {
@@ -542,7 +542,7 @@ fn restashObjectCause(self: *VmHost, raw_name: []const u8, cause: Value) void {
         if (entry.* == .Failed and entry.Failed.cause == null) {
             if (runtime.reclaimEnabled()) cause.retain();
             entry.Failed.cause = cause;
-            if (runtime.getenvSlice("KLIO_INIT_DEBUG") != null)
+            if (runtime.envOnce("KLIO_INIT_DEBUG") != null)
                 std.debug.print("[init-debug] {s} restash-cause\n", .{name});
         }
     }
@@ -1171,7 +1171,7 @@ pub fn lookupGlobal(self: *VmHost, name_in: []const u8) ?Value {
             var val: ?[]const u8 = null;
         };
         if (!S.init) {
-            S.val = runtime.getenvSlice("KLIO_GLOBAL_TRACE");
+            S.val = runtime.envOnce("KLIO_GLOBAL_TRACE");
             S.init = true;
         }
         const w = S.val orelse break :blk false;

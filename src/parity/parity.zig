@@ -1963,9 +1963,9 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
         runtime.gc.program_started = false;
         runtime.gc.alloc_perm = true;
         runtime.gc.release_to_os = runtime.slab.reclaimDormant;
-        if (runtime.getenvSlice("KLIO_GC_STRESS")) |v| runtime.gc.gc_stress = v.len != 0 and !std.mem.eql(u8, v, "0");
-        if (runtime.getenvSlice("KLIO_GC_POISON")) |v| runtime.gc.gc_poison = v.len != 0 and !std.mem.eql(u8, v, "0");
-        if (runtime.getenvSlice("KLIO_GC_EXT")) |v| runtime.gc.external_accounting = v.len != 0 and !std.mem.eql(u8, v, "0");
+        if (runtime.envOnce("KLIO_GC_STRESS")) |v| runtime.gc.gc_stress = v.len != 0 and !std.mem.eql(u8, v, "0");
+        if (runtime.envOnce("KLIO_GC_POISON")) |v| runtime.gc.gc_poison = v.len != 0 and !std.mem.eql(u8, v, "0");
+        if (runtime.envOnce("KLIO_GC_EXT")) |v| runtime.gc.external_accounting = v.len != 0 and !std.mem.eql(u8, v, "0");
     }
     defer {
         runtime.gc.external_accounting = prev_external_accounting;
@@ -2110,7 +2110,7 @@ fn runMainBigStack(vm: *interp_ir.Vm, main_id: interp_ir.FuncId, out: interp_ir.
 /// instead of hanging the binary for minutes. Default 60s (a legit in-process
 /// program runs in seconds); `KLIO_ITEST_WALL_CAP` overrides (seconds; 0 = off).
 fn itestWallCapMs() i64 {
-    const s = runtime.getenvSlice("KLIO_ITEST_WALL_CAP") orelse return 60_000;
+    const s = runtime.envOnce("KLIO_ITEST_WALL_CAP") orelse return 60_000;
     const secs = std.fmt.parseInt(i64, s, 10) catch return 60_000;
     return if (secs <= 0) 0 else secs * 1000;
 }

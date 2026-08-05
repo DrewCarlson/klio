@@ -2010,7 +2010,7 @@ fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cla
         const mg = module_ref.borrow();
         defer mg.deinit();
         const m = mg.get();
-        if (runtime.getenvSlice("KLIO_NU_TRACE") != null) {
+        if (runtime.envOnce("KLIO_NU_TRACE") != null) {
             std.debug.print("[ifact] {s} nargs={d} cands={d} tags:", .{ class_name, args.len, m.funcsBySimpleName(class_name).len });
             for (args) |*av| std.debug.print(" {s}", .{@tagName(av.*)});
             std.debug.print("\n", .{});
@@ -2467,7 +2467,7 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
                 }
             }
         }
-        if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+        if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
             std.debug.print("[ctor-arity-miss] class={s} fqn={s} n_primary={d} got={d}\n", .{ class_name, classDefFqn(class_def), n_primary, effective.items.len });
             ir.eval.dumpFrameChainForDiagAlways();
         }
@@ -2825,13 +2825,13 @@ fn outerWalkMatch(v: *const Value, want: []const u8) ?Value {
 ///    the enclosing class — matches the pre-class-keyed behavior).
 fn selectInnerOuter(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassDef), ir_name: []const u8, outer_hint: ?*const Value) Allocator.Error!?Value {
     const want = enclosingClassNameOf(self, class_def, ir_name) orelse {
-        if (runtime.getenvSlice("KLIO_OUTER_TRACE")) |w| {
+        if (runtime.envOnce("KLIO_OUTER_TRACE")) |w| {
             if (std.mem.indexOf(u8, ir_name, w) != null) std.debug.print("[outer] {s}: no enclosing-class record, hint={}\n", .{ ir_name, outer_hint != null });
         }
         if (outer_hint) |h| return h.*;
         return null;
     };
-    if (runtime.getenvSlice("KLIO_OUTER_TRACE")) |w| {
+    if (runtime.envOnce("KLIO_OUTER_TRACE")) |w| {
         if (std.mem.indexOf(u8, ir_name, w) != null) std.debug.print("[outer] {s}: want={s} hint={}\n", .{ ir_name, want, outer_hint != null });
     }
     if (outer_hint) |h| {
@@ -3839,7 +3839,7 @@ pub fn anonSiteModule(self: *VmHost, allocator: Allocator, cache: *?ObjRef(Modul
     // full-image resolution allocation out of the run arena, and a
     // compose suite (hundreds of sites) blew the 6GB RSS cap. Flip to
     // ON (=1) once runtime lowering gets scratch-arena discipline.
-    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_ANON_BASE") orelse "0", "1")) {
+    if (!std.mem.eql(u8, runtime.envOnce("KLIO_ANON_BASE") orelse "0", "1")) {
         return ObjRef(Module).init(allocator, Module.default(allocator));
     }
     if (shared_anon_module == null) {
@@ -3960,7 +3960,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         } else false;
         if (!names_extension or !captured_callable or own_members.contains(n)) try anon_cap_set.put(n, {});
     }
-    if (runtime.getenvSlice("KLIO_ANON_AUDIT") != null) {
+    if (runtime.envOnce("KLIO_ANON_AUDIT") != null) {
         std.debug.print("[ANON] site={s} captured=", .{synth_class_name});
         for (captured_names) |n| std.debug.print("{s},", .{n});
         std.debug.print("\n", .{});
@@ -3977,7 +3977,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     // reads and bind statically. `KLIO_ANON_PROP=0` disables.
     var prop_heads: std.ArrayList(ir.build.AnonPropHead) = .empty;
     defer prop_heads.deinit(allocator);
-    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_ANON_PROP") orelse "1", "0")) {
+    if (!std.mem.eql(u8, runtime.envOnce("KLIO_ANON_PROP") orelse "1", "0")) {
         for (members) |*m| {
             if (m.* != .Property) continue;
             const p = m.Property;
@@ -4034,7 +4034,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 if (module.classIdByFqn(h) == null and module.uniqueClassIdBySimpleName(h) == null) break :blk null;
                 break :blk h;
             };
-            if (runtime.getenvSlice("KLIO_ANON_AUDIT") != null) {
+            if (runtime.envOnce("KLIO_ANON_AUDIT") != null) {
                 std.debug.print("[ANON] prop {s}.{s} head={s}\n", .{ synth_class_name, p.name.name, head orelse "<none>" });
             }
             if (head) |h| {
@@ -4078,7 +4078,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                     const sub_ref = try anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
                     const fid = func.id;
-                    if (runtime.getenvSlice("KLIO_ANON_AUDIT") != null) {
+                    if (runtime.envOnce("KLIO_ANON_AUDIT") != null) {
                         std.debug.print("[ANON] getter {s}.{s} fid={d}\n", .{ synth_class_name, p.name.name, fid.int() });
                     }
                     const key = try std.fmt.allocPrint(allocator, "$get${s}", .{p.name.name});

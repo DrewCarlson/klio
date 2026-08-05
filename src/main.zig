@@ -108,10 +108,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     // attachSegfaultHandler pulls the `SelfInfo` symbolizer (unavailable on
     // mobile — see the panic override above); gate it out there at comptime.
     if (comptime !is_mobile_target) {
-        if (runtime.getenvSlice("KLIO_SEGV_TRACE")) |_| std.debug.attachSegfaultHandler();
+        if (runtime.envOnce("KLIO_SEGV_TRACE")) |_| std.debug.attachSegfaultHandler();
     }
-    if (runtime.getenvSlice("KLIO_PROF_ALL")) |_| runtime.prof.maybeStart();
-    defer if (runtime.getenvSlice("KLIO_PROF_ALL")) |_| runtime.prof.maybeReport();
+    if (runtime.envOnce("KLIO_PROF_ALL")) |_| runtime.prof.maybeStart();
+    defer if (runtime.envOnce("KLIO_PROF_ALL")) |_| runtime.prof.maybeReport();
     // In bundle mode argv belongs entirely to the embedded program, so the
     // performance profile comes from the environment (KLIO_OPT) alone.
     runtime.perf.setProfile(if (cli.bundleModeActive())
@@ -149,37 +149,37 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             // reclamation. Reference counting is neutralized (deinit/retain/
             // release no-op), so the collector alone frees, by reachability.
             runtime.gc.gc_enabled = true;
-            if (runtime.getenvSlice("KLIO_GC_STRESS")) |v| {
+            if (runtime.envOnce("KLIO_GC_STRESS")) |v| {
                 runtime.gc.gc_stress = v.len != 0 and !std.mem.eql(u8, v, "0");
             }
-            if (runtime.getenvSlice("KLIO_GC_DEBUG")) |v| {
+            if (runtime.envOnce("KLIO_GC_DEBUG")) |v| {
                 runtime.gc.gc_debug = v.len != 0 and !std.mem.eql(u8, v, "0");
             }
-            if (runtime.getenvSlice("KLIO_GC_HIST")) |v| {
+            if (runtime.envOnce("KLIO_GC_HIST")) |v| {
                 runtime.gc.gc_hist = v.len != 0 and !std.mem.eql(u8, v, "0");
             }
-            if (runtime.getenvSlice("KLIO_GC_NOFREE")) |v| {
+            if (runtime.envOnce("KLIO_GC_NOFREE")) |v| {
                 runtime.gc.gc_nofree = v.len != 0 and !std.mem.eql(u8, v, "0");
             }
-            if (runtime.getenvSlice("KLIO_GC_EXT")) |v| {
+            if (runtime.envOnce("KLIO_GC_EXT")) |v| {
                 runtime.gc.external_accounting = v.len != 0 and !std.mem.eql(u8, v, "0");
             }
-            if (runtime.getenvSlice("KLIO_GC_POISON")) |v| {
+            if (runtime.envOnce("KLIO_GC_POISON")) |v| {
                 runtime.gc.gc_poison = v.len != 0 and !std.mem.eql(u8, v, "0");
             }
-            if (runtime.getenvSlice("KLIO_GC_THRESHOLD_KB")) |v| {
+            if (runtime.envOnce("KLIO_GC_THRESHOLD_KB")) |v| {
                 if (std.fmt.parseInt(usize, v, 10) catch null) |kb| {
                     if (kb != 0) runtime.gc.setThresholdFloor(kb * 1024);
                 }
             }
-            if (runtime.getenvSlice("KLIO_GC_STRESS_EVERY")) |v| {
+            if (runtime.envOnce("KLIO_GC_STRESS_EVERY")) |v| {
                 runtime.gc.gc_stress_every = std.fmt.parseInt(usize, v, 10) catch 0;
             }
-            if (runtime.getenvSlice("KLIO_GC_GEN")) |v| {
+            if (runtime.envOnce("KLIO_GC_GEN")) |v| {
                 runtime.gc.generational = v.len != 0 and !std.mem.eql(u8, v, "0");
             }
             runtime.setReclaim(false);
-            if (runtime.getenvSlice("KLIO_GC_GUARD")) |v| {
+            if (runtime.envOnce("KLIO_GC_GUARD")) |v| {
                 // GUARD=dbg: route the GC's freeing backing through the checking
                 // allocator so a use-after-free of a swept cell is caught at the
                 // access with a stack trace, not as a far-away corruption.
@@ -202,7 +202,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             //   smp              — fastest; free-lists never return pages
             //   gpa              — page-returning general-purpose allocator (slow)
             //   calloc           — libc malloc + macOS pressure-relief trim
-            const alloc_mode = runtime.getenvSlice("KLIO_GC_ALLOC") orelse "slab";
+            const alloc_mode = runtime.envOnce("KLIO_GC_ALLOC") orelse "slab";
             // The slab backend returns the pages of stably-sparse regions to the OS
             // after each sweep; the non-slab backends below either override this or
             // do not touch the slab (the hook then no-ops over empty class lists).
@@ -220,7 +220,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 return cli.run(std.heap.c_allocator, init.args);
             }
             if (std.mem.eql(u8, alloc_mode, "leaktrack")) {
-                if (runtime.getenvSlice("KLIO_LEAK_BY_FQN")) |_| runtime.leaktrack.by_fqn_only = true;
+                if (runtime.envOnce("KLIO_LEAK_BY_FQN")) |_| runtime.leaktrack.by_fqn_only = true;
                 const a = runtime.leaktrack.wrap(runtime.slab.allocator);
                 runtime.leaktrack.installSignalDump();
                 const rc = cli.run(a, init.args);
@@ -228,27 +228,27 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 // uncollected (not leaked) are freed before the report; what
                 // remains outstanding is the genuine raw host-temporary leak.
                 runtime.gc.collect();
-                if (runtime.getenvSlice("KLIO_LEAK_BY_FQN")) |_|
+                if (runtime.envOnce("KLIO_LEAK_BY_FQN")) |_|
                     runtime.leaktrack.reportByFqn()
                 else
                     runtime.leaktrack.report();
                 return rc;
             }
-            if (runtime.getenvSlice("KLIO_SLAB_TRACE")) |_| {
+            if (runtime.envOnce("KLIO_SLAB_TRACE")) |_| {
                 runtime.slab.trace_enabled = true;
                 runtime.slab.installTraceSignalDump();
                 const rc = cli.run(runtime.slab.allocator, init.args);
                 runtime.slab.traceReport();
                 return rc;
             }
-            if (runtime.getenvSlice("KLIO_CELL_TRACE")) |_| {
+            if (runtime.envOnce("KLIO_CELL_TRACE")) |_| {
                 runtime.slab.cell_trace_enabled = true;
                 runtime.slab.installTraceSignalDump();
                 const rc = cli.run(runtime.slab.allocator, init.args);
                 runtime.slab.traceReport();
                 return rc;
             }
-            if (runtime.getenvSlice("KLIO_SLAB_STAT")) |_| {
+            if (runtime.envOnce("KLIO_SLAB_STAT")) |_| {
                 const rc = cli.run(runtime.slab.allocator, init.args);
                 std.debug.print(
                     "[slab] mapped_bytes={d} ({d} MB)\n",

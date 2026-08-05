@@ -3098,3 +3098,4 @@ test "finish carries tailrec and inline flags" {
     try testing.expect(func.is_tailrec);
     try testing.expect(func.is_inline);
 }
+

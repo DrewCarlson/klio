@@ -29,7 +29,7 @@ fn ok(v: Value) EvalResult {
 var rss_log_gate: enum { unknown, on, off } = .unknown;
 fn rssLog() void {
     if (rss_log_gate == .unknown) {
-        rss_log_gate = if (runtime.getenvSlice("KLIO_RSS_LOG") != null) .on else .off;
+        rss_log_gate = if (runtime.envOnce("KLIO_RSS_LOG") != null) .on else .off;
     }
     if (rss_log_gate != .on) return;
     const kb = runtime.currentRssKb() orelse return;
@@ -501,7 +501,7 @@ fn openSkiaLib() ?std.DynLib {
     if (skia_lib_override) |p| {
         if (std.DynLib.open(p)) |l| return l else |_| {}
     }
-    if (runtime.getenvSlice("KLIO_SKIA_LIB")) |p| {
+    if (runtime.envOnce("KLIO_SKIA_LIB")) |p| {
         if (std.DynLib.open(p)) |l| return l else |_| {}
     }
     if (std.DynLib.open(skia_lib_name)) |l| return l else |_| {}
@@ -573,7 +573,7 @@ fn skiaRender(ctx: *CallCtx) Error!EvalResult {
     const height: c_int = @intCast(@max(1, argInt(ctx.args[2])));
     // Opt-in GPU (Ganesh+EGL) surface when KLIO_SKIA_GPU is set and the backend was
     // built with it; otherwise (or on GPU init failure) fall back to raster.
-    const gpu = runtime.getenvSlice("KLIO_SKIA_GPU") != null;
+    const gpu = runtime.envOnce("KLIO_SKIA_GPU") != null;
     const surface = (if (gpu) skia.newGpu(width, height) else null) orelse
         skia.new(width, height) orelse return ok(Value.newLong(0));
     defer skia.free(surface);
@@ -1521,7 +1521,7 @@ fn canvasSetShader(ctx: *CallCtx) Error!EvalResult {
 
 /// The trailing paint args are (argb, style, strokeWidth, cap, join, aa).
 fn canvasDrawRect(ctx: *CallCtx) Error!EvalResult {
-    if (runtime.getenvSlice("KLIO_DRAW_TRACE") != null and ctx.args.len >= 11) {
+    if (runtime.envOnce("KLIO_DRAW_TRACE") != null and ctx.args.len >= 11) {
         std.debug.print("[draw] rect surf={d} x={d:.1} y={d:.1} w={d:.1} h={d:.1} color={x:0>8}\n", .{
             argInt(ctx.args[0]), argFloat(ctx.args[1]), argFloat(ctx.args[2]),
             argFloat(ctx.args[3]), argFloat(ctx.args[4]), argU32(ctx.args[5]),
