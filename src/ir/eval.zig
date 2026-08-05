@@ -3248,6 +3248,7 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
                 .LoadCapture => |x| std.debug.print(" idx={d} dst=r{d}", .{ x.idx, x.dst.int() }),
                 .Move => |x| std.debug.print(" dst=r{d} src=r{d}", .{ x.dst.int(), x.src.int() }),
                 .AstLambda => |x| std.debug.print(" dst=r{d} body=#{?d}", .{ x.dst.int(), if (x.body_func) |bf| bf.int() else null }),
+                .Call => |x| std.debug.print(" func=#{d} dst=r{d} args=r{d}+{d} exact={}", .{ x.func.int(), x.dst.int(), x.args.int(), x.n_args, x.exact }),
                 .BinOp => |x| std.debug.print(" op={s} dst=r{d} lhs=r{d} rhs=r{d}", .{ @tagName(x.op), x.dst.int(), x.lhs.int(), x.rhs.int() }),
                 .CallVirtual => |x| std.debug.print(" slot={d} recv=r{d} dst=r{d}", .{ x.slot.int(), x.receiver.int(), x.dst.int() }),
                 else => {},
@@ -9400,7 +9401,11 @@ fn valueTruthy(allocator: Allocator, v: *const Value) Allocator.Error!union(enum
             // WHICH branch mis-wired.
             const fname: []const u8 = if (currentFrameFunc()) |cf| cf.fqn else "?";
             const fid: u32 = if (currentFrameFunc()) |cf| cf.id.int() else 0;
-            const msg = try std.fmt.allocPrint(allocator, "non-bool in branch: {s} (in {s}#{d})", .{ s, fname, fid });
+            const sp: ?span.Span = if (evtls.frame_chain) |fr| fr.cur_span else null;
+            const msg = if (sp) |p2|
+                try std.fmt.allocPrint(allocator, "non-bool in branch: {s} (in {s}#{d} at f{d}:{d})", .{ s, fname, fid, p2.file.int(), p2.start })
+            else
+                try std.fmt.allocPrint(allocator, "non-bool in branch: {s} (in {s}#{d})", .{ s, fname, fid });
             return .{ .err = .{ .Type = msg } };
         },
     }

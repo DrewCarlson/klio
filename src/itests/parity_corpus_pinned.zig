@@ -1602,6 +1602,15 @@ test "bound_args_lambda_replay" {
     );
 }
 
+test "trailing_callable_gap_defaults" {
+    try check("trailing_callable_gap_defaults",
+        \\ext:fn
+        \\ext:null
+        \\member3
+        \\
+    );
+}
+
 test "type_overload_runtime_pick" {
     try check("type_overload_runtime_pick",
         \\meta:7 d:2

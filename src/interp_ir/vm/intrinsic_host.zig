@@ -718,7 +718,7 @@ pub fn invokeMethod(self: *VmIntrinsicHost, receiver: *const Value, name: []cons
                 if (runtime.getenvSlice("KLIO_SELDBG") != null) {
                     std.debug.print("[seldbg] invokeMethod {s}: err={s}", .{ name, @tagName(std.meta.activeTag(e)) });
                     switch (e) {
-                        .Unimplemented, .Type => |m| std.debug.print(" {s}", .{m}),
+                        .Unimplemented, .Type, .CalleeFailed => |m| std.debug.print(" {s}", .{m}),
                         else => {},
                     }
                     std.debug.print("\n", .{});

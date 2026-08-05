@@ -3755,6 +3755,16 @@ pub const Module = struct {
                     if (std.mem.eql(u8, staticTypeHead(ty.name), declared)) {
                         return .compatible;
                     }
+                    // An integer literal IS a Long in a Long slot (kotlinc
+                    // literal typing): `onTimeout(1000) { }` binds the
+                    // `timeMillis: Long` overload outright — leaving it
+                    // unknown withheld the sole survivor and deferred a
+                    // call kotlinc resolves statically.
+                    if (std.mem.eql(u8, staticTypeHead(ty.name), "Int") and
+                        std.mem.eql(u8, declared, "Long"))
+                    {
+                        return .compatible;
+                    }
                 }
                 // Integer literal coercion and floating/integral literal
                 // distinctions need value-aware evidence. A different
@@ -3840,6 +3850,19 @@ pub const Module = struct {
         return .unknown;
     }
 
+    /// Whether the params a trailing-callable mapping would SKIP — those
+    /// between the last positional arg and the final parameter — all carry
+    /// defaults. Kotlin fills that gap from defaults only; mapping across
+    /// an undefaulted middle fabricates an applicability kotlinc rejects.
+    fn trailingGapDefaulted(params: []const Param, n_args: usize) bool {
+        if (n_args == 0 or n_args > params.len) return true;
+        var i = n_args - 1;
+        while (i + 1 < params.len) : (i += 1) {
+            if (!params[i].has_default) return false;
+        }
+        return true;
+    }
+
     /// Builtin classifier heads no function value can convert to: the
     /// definite-refutation set for a callable argument.
     fn nonCallableBuiltinHead(head: []const u8) bool {
@@ -3920,11 +3943,17 @@ pub const Module = struct {
             }
         };
         var result: StaticCompatibility = .compatible;
-        // A trailing lambda maps to the LAST parameter across defaulted
+        // A trailing lambda maps to the LAST parameter across DEFAULTED
         // middles, exactly as the extension ranker and arity mapping do.
+        // Kotlin fills the gap from defaults only: without the default
+        // check the single callable of `cont.tryResume(onCancellation)`
+        // mapped past the member's undefaulted `(value, idempotent)` and
+        // the token-returning member outranked the Boolean extension —
+        // a Symbol reached a branch and every `select` rendezvous hung.
         const trailing_lambda_arg = args.len != 0 and
             (args[args.len - 1].is_lambda or args[args.len - 1].lambda_arity != null or
-                args[args.len - 1].func_typed);
+                args[args.len - 1].func_typed) and
+            trailingGapDefaulted(params, args.len);
         for (args, 0..) |arg, ai| {
             const param = if (trailing_lambda_arg and ai + 1 == args.len and
                 args.len <= params.len)
@@ -4585,12 +4614,16 @@ pub const Module = struct {
                 compatibility = .unknown;
             } else {
                 // A trailing lambda fills the LAST parameter even when
-                // defaulted parameters are omitted between (`windowed(2, 3)
+                // DEFAULTED parameters are omitted between (`windowed(2, 3)
                 // { transform }` maps the lambda past `partialWindows`);
-                // judging it positionally refuted the overload kotlinc binds.
+                // judging it positionally refuted the overload kotlinc
+                // binds. The skipped middle must be all-defaulted (Kotlin
+                // fills the gap from defaults only) — see the member-side
+                // mapping's tryResume note.
                 const trailing_lambda_arg = args.len != 0 and
                     (args[args.len - 1].is_lambda or args[args.len - 1].lambda_arity != null or
-                        args[args.len - 1].func_typed);
+                        args[args.len - 1].func_typed) and
+                    trailingGapDefaulted(f.params[1..], args.len);
                 for (args, 0..) |arg, ai| {
                     const pi = if (trailing_lambda_arg and ai + 1 == args.len and
                         1 + args.len <= f.params.len)
@@ -11972,14 +12005,16 @@ test "extension resolver proves receiver, scope, and overload identity" {
         .ty = .{ .name = "Int", .nullable = false, .args = &.{} },
         .literal_kind = .numeric,
     }};
-    try testing.expect(m.resolveExtensionCall("literalPick", .{
+    // kotlinc: an integer literal materializes as Long in a Long slot, and
+    // the Long overload is more specific than Any — the pick is static.
+    try testing.expectEqual(long_literal.int(), m.resolveExtensionCall("literalPick", .{
         .name = "String",
         .nullable = false,
         .args = &.{},
     }, &numeric_literal, .{
         .caller_file = FileId.from(0),
         .caller_package = "app",
-    }).target == null);
+    }).target.?.int());
 
     try testing.expect(m.resolveExtensionCall("aliasPick", .{
         .name = "String",
