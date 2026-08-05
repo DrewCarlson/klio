@@ -2581,3 +2581,35 @@ Method note: run one test with `KLIO_CALL_STATS=1`, read the
 `SnapshotState{Map,List}.mutate` / `.addAll` counter, and compare against
 the loop bounds in the test source. Wall time is only usable for a test
 that PASSES.
+
+## Addendum 58 (2026-08-05): the no-receiver-type tail, four rules in
+
+The 591-site `no_receiver_type` bucket is the largest remaining static-
+dispatch hole. `KLIO_INIT_KINDS=1` names which initializer shapes reach a
+local with no type at all; over the examples corpus: Binary 685, If 111,
+This 39, As 34, Unary 25, When 17. Four rules landed against them:
+
+- `x as? T` — the safe cast was skipped outright because it can yield
+  null. The head is exact; the local is typed `T` and marked nullable.
+- `this` in an ordinary member — only an extension receiver in scope could
+  supply the type, so a plain `val self = this` stayed untyped.
+- predicate operators and `!x` — Boolean; `-x` keeps its operand's type.
+- `if`/`when` — the branches' type when they AGREE (Kotlin's answer is
+  their least upper bound; the exact case is what a member call needs and
+  is never a widening).
+
+Plus one call-shape rule: a call whose callee names a function-typed local
+or parameter takes that type's declared return
+(`assertIterableContentEquals(…, iterator: T.() -> Iterator<*>)` invokes
+its own parameter, and the whole kotlin.test iterator-comparison family
+was reaching `hasNext`/`next` with an untyped receiver).
+
+Census: no_receiver_type 591 -> 539, statically bound 91.8% -> 92.3%.
+
+Residual, by name (`KLIO_NORECV_NAMES=local_no_decl_type`): `destination`
+and `it` dominate. `destination: C` where `C : MutableCollection<in T>` is
+NOT a missing bound rule — the bound substitution already exists and
+answers `MutableCollection` — it is a SPLICED inline body whose parameter
+types reach the caller through `spliceParamTy` without filling the local
+declared-type channel. That is the next unit, together with the `it`
+family (lambda parameters typed from the resolved callee).
