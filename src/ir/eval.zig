@@ -804,6 +804,26 @@ fn gfStatsBump(recv: *const Value, name: []const u8) void {
     gop.value_ptr.* += 1;
 }
 
+/// KLIO_CALL_STATS census tap for member calls that reached the slow name
+/// ladder: keys are `<ladder>Type.name`, so the dump names exactly which
+/// member dispatches are still unbound at runtime on a given workload.
+fn ladderStatsBump(recv: *const Value, name: []const u8) void {
+    if (call_stats_state == 0)
+        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+    if (call_stats_state != 2) return;
+    var buf: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "<ladder>{s}.{s}", .{ recv.typeFqn(), name }) catch return;
+    call_stats_mutex.lock();
+    defer call_stats_mutex.unlock();
+    if (call_stats == null) call_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
+    const gop = call_stats.?.getOrPut(key) catch return;
+    if (!gop.found_existing) {
+        gop.key_ptr.* = std.heap.page_allocator.dupe(u8, key) catch key;
+        gop.value_ptr.* = 0;
+    }
+    gop.value_ptr.* += 1;
+}
+
 /// Host-route sub-tag names for the op profiler (see `runtime.prof.opRoute`).
 /// Order is the route index contract shared with the host dispatch stages.
 pub const op_route_names = [_][]const u8{
@@ -930,6 +950,7 @@ pub const DispatchKind = enum(u8) {
     served_extension,
     /// Sub-tails of the name-based member arm, in the order it tries them.
     member_fast_subscript,
+    member_prim_op,
     member_range_iter,
     member_flat_prepare,
     member_ladder,
@@ -3007,13 +3028,32 @@ fn leafRunInsts(
                 };
                 if (!leafWrite(allocator, regs, ix.dst, v, reclaim, false)) return error.LeafAbandon;
             },
+            .LoadGlobal => |lg| {
+                // Only a plain-name scalar read is servable: an identity-
+                // resolved binding is a function/class value, and anything
+                // non-scalar may need the singleton/init/delegate machinery.
+                if (comptime !@hasDecl(H, "leafGlobalGet")) return error.LeafAbandon;
+                if (lg.func != null or lg.class != null or lg.ctor_ref) return error.LeafAbandon;
+                const gname = constStr(module, lg.name) orelse return error.LeafAbandon;
+                const v = host.leafGlobalGet(gname) orelse {
+                    if (trace) std.debug.print("[leaf] {s}: global {s} not servable\n", .{ func.name, gname });
+                    return error.LeafAbandon;
+                };
+                if (!leafWrite(allocator, regs, lg.dst, v, reclaim, false)) return error.LeafAbandon;
+            },
             .Call => |c| {
                 if (depth == 0) return error.LeafAbandon;
                 if (comptime !@hasDecl(H, "funcRunsItsBody")) return error.LeafAbandon;
                 if (c.arg_names.len != 0 or c.type_args.len != 0) return error.LeafAbandon;
                 const callee = module.funcById(c.func) orelse return error.LeafAbandon;
                 if (!callee.leafExprBody()) {
-                    if (trace) std.debug.print("[leaf] {s}: callee {s} is not a leaf\n", .{ func.name, callee.name });
+                    if (trace) {
+                        var ninsts: usize = 0;
+                        for (callee.blocks) |*cb| ninsts += cb.insts.len;
+                        std.debug.print("[leaf] {s}: callee {s}#{d} is not a leaf (blocks={d} locals={d} insts={d} lambda={} suspend={})\n", .{
+                            func.name, callee.name, callee.id.int(), callee.blocks.len, callee.n_locals, ninsts, callee.is_lambda, callee.is_suspend,
+                        });
+                    }
                     return error.LeafAbandon;
                 }
                 // A symbol the link step settled onto a native binding, or one
@@ -6979,6 +7019,11 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
         try frame.write(cm.dst, rv);
         return .cont;
     }
+    if (primitiveMemberFast(frame, cm)) |rv| {
+        dispatchBump(.member_prim_op);
+        try frame.write(cm.dst, rv);
+        return .cont;
+    }
     // Fast path: a range iterator's `hasNext()`/`next()`. The universal
     // `for (x in range)` desugaring calls these once per element; the
     // inline handler avoids the member-dispatch hashmap probes that
@@ -7106,6 +7151,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
         }
     }
     dispatchBump(.member_ladder);
+    ladderStatsBump(&recv, name_str);
     runtime.prof.opRoute(2);
     const prev_tl = if (cm.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
         H.setTrailingMemberCall(true)
@@ -9337,6 +9383,84 @@ inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *const V
 /// every array element dominates the cost of any loop-heavy program, so the
 /// common case is served by the indexed-load/store primitives above. Returns
 /// the value to write to `dst`, or `null` when not handled.
+/// The bitwise and conversion MEMBERS of `Int` / `Long`, served inline.
+///
+/// `a shl b`, `a and b` and friends are ordinary infix member functions, not
+/// operators, so they lower to a member call and — with no static receiver
+/// type at the site — reach the name ladder on every execution. Bit math is
+/// the inner loop of the snapshot id sets and the persistent-map trie, where
+/// this was four out of every five slow-ladder dispatches.
+///
+/// A member always wins over an extension in Kotlin, so an `Int` receiver
+/// with an `Int` argument and one of these names can only mean the builtin;
+/// any other receiver/argument shape declines to the ladder unchanged.
+inline fn primitiveMemberFast(frame: *const Frame, cm: anytype) ?Value {
+    if (cm.arg_names.len != 0 or cm.n_args > 1) return null;
+    const recv = frame.read(cm.receiver);
+    if (recv != .Int and recv != .Long) return null;
+    const nm = constStr(frame.module, cm.name) orelse return null;
+    if (cm.n_args == 0) {
+        const wide: i64 = switch (recv) {
+            .Int => |i| i,
+            .Long => |l| l,
+            else => unreachable,
+        };
+        if (std.mem.eql(u8, nm, "toInt")) return Value.newInt(@truncate(wide));
+        if (std.mem.eql(u8, nm, "toLong")) return .{ .Long = wide };
+        if (std.mem.eql(u8, nm, "inv")) return switch (recv) {
+            .Int => |i| Value.newInt(~i),
+            .Long => |l| .{ .Long = ~l },
+            else => unreachable,
+        };
+        return null;
+    }
+    const arg = frame.read(Reg.from(cm.args.int()));
+    // Shifts take an `Int` count on both receivers; the logical operations
+    // take the receiver's own width.
+    const shift: ?u6 = switch (arg) {
+        .Int => |i| blk: {
+            const width: i64 = if (recv == .Int) 32 else 64;
+            break :blk @intCast(@mod(i, width));
+        },
+        else => null,
+    };
+    if (shift) |s| {
+        if (std.mem.eql(u8, nm, "shl")) return switch (recv) {
+            .Int => |i| Value.newInt(@as(i32, @bitCast(@as(u32, @bitCast(i)) << @truncate(s)))),
+            .Long => |l| .{ .Long = @bitCast(@as(u64, @bitCast(l)) << s) },
+            else => unreachable,
+        };
+        if (std.mem.eql(u8, nm, "shr")) return switch (recv) {
+            .Int => |i| Value.newInt(i >> @truncate(s)),
+            .Long => |l| .{ .Long = l >> s },
+            else => unreachable,
+        };
+        if (std.mem.eql(u8, nm, "ushr")) return switch (recv) {
+            .Int => |i| Value.newInt(@as(i32, @bitCast(@as(u32, @bitCast(i)) >> @truncate(s)))),
+            .Long => |l| .{ .Long = @bitCast(@as(u64, @bitCast(l)) >> s) },
+            else => unreachable,
+        };
+    }
+    // `and` / `or` / `xor` are same-width members: `Int.and(Int)` and
+    // `Long.and(Long)`. A mixed pair is some other declaration.
+    const pair: ?struct { a: i64, b: i64 } = switch (recv) {
+        .Int => |i| if (arg == .Int) .{ .a = i, .b = arg.Int } else null,
+        .Long => |l| if (arg == .Long) .{ .a = l, .b = arg.Long } else null,
+        else => null,
+    };
+    const p = pair orelse return null;
+    const wrap = struct {
+        fn f(is_int: bool, v: i64) Value {
+            return if (is_int) Value.newInt(@truncate(v)) else .{ .Long = v };
+        }
+    }.f;
+    const is_int = recv == .Int;
+    if (std.mem.eql(u8, nm, "and")) return wrap(is_int, p.a & p.b);
+    if (std.mem.eql(u8, nm, "or")) return wrap(is_int, p.a | p.b);
+    if (std.mem.eql(u8, nm, "xor")) return wrap(is_int, p.a ^ p.b);
+    return null;
+}
+
 inline fn fastSubscript(allocator: Allocator, frame: *const Frame, cm: anytype) ?Value {
     if (cm.arg_names.len != 0 or cm.n_args == 0) return null;
     const nm = constStr(frame.module, cm.name) orelse return null;
