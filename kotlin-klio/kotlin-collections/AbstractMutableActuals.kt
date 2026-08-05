@@ -109,18 +109,16 @@ public actual abstract class AbstractMutableList<E> protected actual constructor
     /**
      * Removes `[fromIndex, toIndex)` from this list.
      *
-     * Each element leaves through `removeAt`, the same public mutation this
-     * class is defined in terms of, so a subclass sees exactly the operations
-     * it would from the iterator form — without an iterator object and its
-     * per-element comodification bookkeeping, which on a persistent backing
-     * doubled the cost of clearing a range.
+     * Through the list's own iterator: a subclass that overrides
+     * `listIterator` does so because walking its backing is cheaper than
+     * re-entering it per index, and a persistent-vector builder's cursor is
+     * exactly that — repeated `removeAt` re-descends its trie every time.
      */
     protected actual open fun removeRange(fromIndex: Int, toIndex: Int) {
-        AbstractList.checkRangeIndexes(fromIndex, toIndex, size)
-        var remaining = toIndex - fromIndex
-        while (remaining > 0) {
-            val _ = removeAt(fromIndex)
-            remaining--
+        val iterator = listIterator(fromIndex)
+        repeat(toIndex - fromIndex) {
+            val _ = iterator.next()
+            iterator.remove()
         }
     }
 
