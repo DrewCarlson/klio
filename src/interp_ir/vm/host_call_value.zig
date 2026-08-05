@@ -205,8 +205,10 @@ fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, cap
         host_call_func.linkAuditCheck(self, module, func.id, func, args);
         if (host_call_func.resolvedNativeForm(self, func.id)) |_| return null;
     }
-    var call_args: std.ArrayList(Value) = .empty;
-    try call_args.appendSlice(allocator, args);
+    // Pooled carrier: the closure's params and captures are frame buffers
+    // like any other, released through the frame's teardown.
+    var call_args = try ir.eval.acquireArgsCap(allocator, args.len);
+    if (call_args.capacity >= args.len) call_args.appendSliceAssumeCapacity(args) else try call_args.appendSlice(allocator, args);
     if (callValueTraceOn()) {
         for (call_args.items, 0..) |*av, ai| {
             std.debug.print("[flat-prep] body=#{d} #{d} kind={s}\n", .{ info.body_func.int(), ai, @tagName(std.meta.activeTag(av.*)) });
@@ -216,7 +218,9 @@ fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, cap
     {
         const g = captures.borrow();
         defer g.deinit();
-        try capture_values.appendSlice(allocator, g.get().*);
+        const src = g.get().*;
+        capture_values = try ir.eval.acquireArgsCap(allocator, src.len);
+        if (capture_values.capacity >= src.len) capture_values.appendSliceAssumeCapacity(src) else try capture_values.appendSlice(allocator, src);
     }
     if (this_override) |ov| {
         if (ov.idx >= capture_values.items.len) {
