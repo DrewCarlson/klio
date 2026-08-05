@@ -2387,3 +2387,29 @@ Process: the drift script now refreshes its harness copy automatically;
 the trap is recorded in the session memory. Two bisects this cycle were
 initially misread from a stale binary and gates defaulting ON during
 "revert" tests — both verdicts only accepted after 3x-stable reruns.
+
+## Addendum 52 (2026-08-05): the masked cluster CLOSED — drift 267/267
+
+All three regressions surfaced by the fresh drift binary are fixed at
+their mechanisms, each with a parity pin:
+
+1. `unresolved global remember` — generic-tail route narrowed to
+   args-carrying params; `Any` is the universal supertype in the
+   prover (ed946b6b, pin generic_arg_vs_any_param).
+2. compose_uitext wrong overload — a type-overload deferral now emits
+   the runtime-rankable CallMemberOrGlobal form instead of falling to
+   the first-wins bare-name value read (925859c3, pin
+   type_overload_runtime_pick). Plus the shape-aware expect-redirect
+   hardening (7e33b73f).
+3. select_on_timeout_loses hang — the trailing-callable mapping
+   (c54d5e7e) skipped UNDEFAULTED middles, so tryResume's callable
+   mapped past (value, idempotent), the token-returning member beat
+   the Boolean extension, and a swallowed Symbol-in-branch parked
+   every rendezvous. Both judgment loops now require the gap
+   all-defaulted; integer literals bind Long statically
+   (ef073798, pin trailing_callable_gap_defaults).
+
+State: drift 267/267 (WHOLE corpus green, compose UI + select
+included), sweep 117/0, litmus 43/43, units green. Compose snapshot
+suites 62/65 + 57/59 in the gate profile — the remaining five are the
+known throughput-bound concurrent tests (2 remain under KLIO_JIT=1).
