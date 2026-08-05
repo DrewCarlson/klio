@@ -2706,3 +2706,27 @@ rows. Next attempt should key on the signature.
 
 Current: 521 no_receiver_type / 9,268 sites; 92.6% statically bound
 (bound_static 1,561 + bound_virtual 7,021).
+
+## Addendum 61 (2026-08-06): class evidence must be name-resolved before it helps
+
+With the image's declarations now reaching the checker (see the resolution
+plan's P7 entry), the obvious next move is to hand lowering the checker's
+CLASS evidence: `expr_class` is where a receiver's class identity actually
+lives, since a plain user class is `Type.Unresolved` in the checker and
+`tc.types` therefore cannot carry it.
+
+MEASURED NEGATIVE, reverted. Folding `expr_class` into the existing
+`pending_eager_types` channel moved the corpus census:
+
+    no_receiver_type   521 -> 487   (better)
+    no_class_id          4 -> 554   (much worse)
+    bound_virtual     7021 -> 6491
+    bound share      92.6% -> 87.0%
+
+The evidence supplies head names that lowering cannot resolve to a class
+id — file-scoped mangles and simple names the module knows under another
+spelling — so sites that previously bound virtually now land in
+`no_class_id`. Feeding a name channel is not enough: the class evidence has
+to travel through the SAME rename/scope resolution lowering applies
+(`fileOrPkgTypeRename` and the simple-name class index), or be published as
+class IDS rather than names. That is the next attempt's shape.
