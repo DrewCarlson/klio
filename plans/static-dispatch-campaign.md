@@ -2413,3 +2413,31 @@ State: drift 267/267 (WHOLE corpus green, compose UI + select
 included), sweep 117/0, litmus 43/43, units green. Compose snapshot
 suites 62/65 + 57/59 in the gate profile — the remaining five are the
 known throughput-bound concurrent tests (2 remain under KLIO_JIT=1).
+
+## Addendum 53 (2026-08-05): the last two reds are one function family
+
+The two remaining over-budget concurrent snapshot tests
+(SnapshotStateListTests.concurrentMixingWriteApply_addAll_removeRange,
+SnapshotStateMapTests.concurrentMixingWriteApply_clear) are wall-
+invariant (~36.6s vs their 30s runTest budgets) under: safe vs fast
+profiles, a 32x GC threshold, extra workers, and a wider monitor spin
+(44758da5). Test-window profiling shows <10% busy across threads —
+the mutator's ~1.1M snapshot writes queue behind the CONSUMER
+coroutine's interpreted `advanceGlobalSnapshot`/apply-observer walks,
+which hold the global snapshot sync for long interpreted stretches
+per `notifyObjectsInitialized`. kotlinc absorbs the same lock
+protocol because its advance is compiled.
+
+Next leg, in order of expected leverage:
+1. Profile the advance path's own body (KLIO_CALL_STATS on the
+   consumer) and flat/leaf-serve its hot members.
+2. The advance's record walks are container iterations over modified
+   state records — the same persistent-iterator chain already fused;
+   measure whether the loop JIT can take the walk once the calls
+   inline (KLIO_FUNC_JIT covers whole bodies).
+3. If interpretation cannot close it, a klio-authored native serve
+   for the snapshot-advance hot members (FQN-keyed intrinsics over
+   interpreted instance state) is the remaining lever.
+
+Everything else is green: drift 267/267, sweep 117/0, litmus 43/43,
+units green, stdlib census 591 (91.8% bound), compose bound 73.7%.
