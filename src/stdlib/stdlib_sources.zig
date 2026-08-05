@@ -249,6 +249,7 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-util/LazyActuals.kt",
     "kotlin-random/RandomActuals.kt",
     "kotlin-text/TextActuals.kt",
+    "kotlin-text/StringFormat.kt",
     "kotlin-collections/MapActuals.kt",
     "kotlin-uuid/UuidActuals.kt",
     "kotlin-reflect/ReflectActuals.kt",

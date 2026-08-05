@@ -1938,3 +1938,11 @@ test "numeric_promotion_receiver" {
         \\
     );
 }
+
+test "string_companion_format" {
+    try check("string_companion_format",
+        \\a/3/1.50
+        \\x=7
+        \\
+    );
+}
