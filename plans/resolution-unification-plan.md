@@ -192,6 +192,30 @@ dispatch campaign's ladder retirement — no timeout can be raised
 
 ### P10 — remaining steps
 
+**The invariant is now measured, not asserted.** `KLIO_DECL_AUDIT=1` (any
+`klio run`) walks every FQN the intrinsic registry can serve and reports
+whether the module carries a declaration for it. Baseline 2026-08-05:
+
+    intrinsics=1484 declared=187 missing=1297
+      builtin-type members 1281  — `kotlin.Float.plus` and kin; no source
+                                   declaration in Kotlin either, not holes
+      unaligned keys 4           — a registry key naming a callable the
+                                   module declares under another package
+                                   (`kotlin.naturalOrder` vs
+                                   `kotlin.comparisons.naturalOrder`)
+      package-level holes 12     — the real remainder
+
+Use it as the ratchet for step 2: the hole count only goes down. The 12
+are 6 klio-internal `__klio_*` helpers (deliberately undeclared),
+`kotlin.concurrent.thread` and `kotlin.io.readLine` (blocked on declaring
+their host RETURN types — `Thread` has no class declaration), and the
+`kotlin.math.absoluteValue` / `kotlin.text.format` / `kotlin.StringBuilder`
+shapes, which are receiver-form or companion-form keys.
+
+Closed 2026-08-05: `sortedSetOf`, `sortedMapOf`, `linkedStringMapOf` now
+have klio-authored declarations (pinned).
+
+
 Steps 2 and 3 of the no-holes symbol table (step 1 and its whole stdlib grind are
 landed — see the ledger):
 
