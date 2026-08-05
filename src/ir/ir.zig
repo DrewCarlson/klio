@@ -300,6 +300,10 @@ pub const Inst = union(enum) {
         /// re-resolution must NOT override it by the argument's runtime
         /// value type — the cast is the source's deliberate selection.
         exact: bool = false,
+        /// Site verdict for a callee whose plan carries `FAST_CALL_AMBIG_FLAG`:
+        /// 0 = unasked, 1 = the fusion must not take this call, 2 = the baked
+        /// target is what scope resolution picks here. Single-fill.
+        fuse_site: u8 = 0,
         /// The source supplied the final argument as a trailing lambda
         /// (`f(x) { … }`). Kotlin binds that lambda to the LAST
         /// parameter; a positional lambda (`f(x, { … })`) binds its own
@@ -1031,6 +1035,12 @@ pub const FuncKind = enum {
 /// leading `"this"` param, so the fast dispatch seeds the caller's instance
 /// `this` as an enclosing receiver exactly as the full path does.
 pub const FAST_CALL_EXT_FLAG: u16 = 0x4000;
+
+/// `Func.fast_call` flag: the callee's simple name has same-arity peers, so
+/// only the CALL SITE can say whether the baked target is the one scope
+/// resolution picks. Eligible in every other respect; the site resolves the
+/// question once and caches the verdict on its own instruction.
+pub const FAST_CALL_AMBIG_FLAG: u16 = 0x2000;
 
 /// Whether the declaration currently LOWERING carries
 /// `@Suppress("DEPRECATION_ERROR")`: under it kotlinc restores

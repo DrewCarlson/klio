@@ -1067,8 +1067,13 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
             if (cf.params.len != f.params.len and peerSpansArity(self, c, cf, f.params.len)) arity_peers += 1;
         }
         if (arity_peers != 1) {
-            if (fp_trace) std.debug.print("[fastplan] {s}: {d} same-arity peers of {d} candidates\n", .{ f.name, arity_peers, same_name.len });
-            return 1;
+            // Same name, same arity, different declarations: which one wins is
+            // a question of the CALL SITE's scope, which this per-callee plan
+            // cannot see. Stay eligible and let the site decide once.
+            if (fp_trace) std.debug.print("[fastplan] {s}: {d} same-arity peers of {d} candidates -> site decides\n", .{ f.name, arity_peers, same_name.len });
+            const b = @as(u16, @intCast(f.params.len)) + 2;
+            const ext: u16 = if (paramIsThis(f.params) or f.has_receiver_param) ir.FAST_CALL_EXT_FLAG else 0;
+            return b | ext | ir.FAST_CALL_AMBIG_FLAG;
         }
     }
     // Type-parameterized non-inline functions carry no reified binding
@@ -1082,6 +1087,28 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
     if (paramIsThis(f.params) or f.has_receiver_param)
         return base | ir.FAST_CALL_EXT_FLAG;
     return base;
+}
+
+/// Whether the baked target of an ambiguous-by-arity call is the declaration
+/// scope resolution picks from `caller_pkg`/`caller_file`. Same-name peers of
+/// the same arity are separated by scope alone (the compose runtime bundles a
+/// per-implementation `indexSegment`/`assert` in sibling packages), so the
+/// site's own tier ranking answers it — and answers it identically to the
+/// re-resolution the fused path skips.
+pub fn fuseSiteBinds(self: *VmHost, module: *const Module, func: FuncId, caller_pkg: []const u8, caller_file: ?ir.FileId) bool {
+    _ = self;
+    const f = funcAt(module, func) orelse return false;
+    const file = caller_file orelse ir.FileId.from(std.math.maxInt(u32));
+    const own = module.scopeTier(f.fqn, f.package, f.name, caller_pkg, file);
+    if (own == ir.Module.other_package_tier) return false;
+    for (module.funcsBySimpleName(f.name)) |c| {
+        if (c.int() == func.int()) continue;
+        const cf = funcAt(module, c) orelse continue;
+        if (cf.params.len != f.params.len) continue;
+        // A peer at the same or better tier means scope does not settle it.
+        if (module.scopeTier(cf.fqn, cf.package, cf.name, caller_pkg, file) <= own) return false;
+    }
+    return true;
 }
 
 /// Whether a same-named candidate can accept `n_args` despite declaring a

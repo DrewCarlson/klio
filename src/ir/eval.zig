@@ -3113,6 +3113,25 @@ fn leafRunInsts(
                 };
                 if (!leafWrite(allocator, regs, gf.dst, v, reclaim, false)) return error.LeafAbandon;
             },
+            .CallMember => |cm| {
+                // The value-level fast serves only: a primitive bit/conversion
+                // member is a pure function of its receiver and argument, so
+                // the frameless walk can run it. The gap-buffer and trie
+                // helpers this exists for (`indexSegment`, the mask/shift
+                // predicates) are otherwise a full activation per bit twiddle.
+                if (cm.arg_names.len != 0 or cm.n_args > 1) return error.LeafAbandon;
+                const recv = leafRead(regs, cm.receiver) orelse return error.LeafAbandon;
+                const nm = constStr(module, cm.name) orelse return error.LeafAbandon;
+                const marg: ?Value = if (cm.n_args == 1)
+                    (leafRead(regs, Reg.from(cm.args.int())) orelse return error.LeafAbandon)
+                else
+                    null;
+                const mv = primitiveMemberOp(&recv, nm, marg) orelse {
+                    if (trace) std.debug.print("[leaf] {s}: member {s} is not a primitive op\n", .{ func.name, nm });
+                    return error.LeafAbandon;
+                };
+                if (!leafWrite(allocator, regs, cm.dst, mv, reclaim, false)) return error.LeafAbandon;
+            },
             .Index => |ix| {
                 const recv = leafRead(regs, ix.receiver) orelse return error.LeafAbandon;
                 const idx = leafRead(regs, ix.index) orelse return error.LeafAbandon;
@@ -5761,7 +5780,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         .GetField => |*gf| return execArmGetField(H, allocator, frame, gf, host),
         .SetField => |sf| return execArmSetField(H, allocator, frame, sf, host),
         .CompoundField => |cf| return execArmCompoundField(H, allocator, frame, cf, host),
-        .Call => |call| return execArmCall(H, allocator, frame, call, host),
+        .Call => |*call| return execArmCall(H, allocator, frame, call, host),
         .CallValue => |cv| return execArmCallValue(H, allocator, frame, cv, host),
         .CallValueWithThis => |cvt| {
             const callee_v = frame.read(cvt.callee);
@@ -6574,8 +6593,25 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
                 }
                 // The low bits carry the eligible arity + 2; a positional,
                 // exact-arity call dispatches straight to the body.
-                const plan_arity = plan & 0x3FFF;
-                if (plan_arity >= 2 and plan_arity - 2 == call.n_args) {
+                const plan_arity = plan & 0x1FFF;
+                // Same-name, same-arity peers: only this SITE's scope can say
+                // whether the baked target is the one resolution picks, so ask
+                // once and keep the verdict on the instruction.
+                var ambig_ok = true;
+                if (plan & ir.FAST_CALL_AMBIG_FLAG != 0) {
+                    if (comptime @hasDecl(H, "fuseSiteBinds")) {
+                        var verdict = @atomicLoad(u8, @constCast(&call.fuse_site), .acquire);
+                        if (verdict == 0) {
+                            const cfile: ?ir.FileId = if (frame.cur_span) |sp| sp.file else null;
+                            verdict = if (host.fuseSiteBinds(frame.module, call.func, frame.func.package, cfile)) 2 else 1;
+                            @atomicStore(u8, @constCast(&call.fuse_site), verdict, .release);
+                        }
+                        ambig_ok = verdict == 2;
+                    } else {
+                        ambig_ok = false;
+                    }
+                }
+                if (ambig_ok and plan_arity >= 2 and plan_arity - 2 == call.n_args) {
                     const args_list = try readArgList(allocator, frame, call.args, call.n_args);
                     // A receiver-carrying body: seed the caller's instance
                     // `this` as the enclosing receiver exactly as the full
@@ -9546,9 +9582,18 @@ inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *const V
 inline fn primitiveMemberFast(frame: *const Frame, cm: anytype) ?Value {
     if (cm.arg_names.len != 0 or cm.n_args > 1) return null;
     const recv = frame.read(cm.receiver);
-    if (recv != .Int and recv != .Long) return null;
     const nm = constStr(frame.module, cm.name) orelse return null;
-    if (cm.n_args == 0) {
+    const arg: ?Value = if (cm.n_args == 1) frame.read(Reg.from(cm.args.int())) else null;
+    return primitiveMemberOp(&recv, nm, arg);
+}
+
+/// The value-level core of `primitiveMemberFast`, shared with the frameless
+/// leaf walk: a pure function of the receiver, the member name and at most one
+/// argument, so it needs no frame at all.
+fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) ?Value {
+    const recv = recv_in.*;
+    if (recv != .Int and recv != .Long) return null;
+    if (arg_in == null) {
         const wide: i64 = switch (recv) {
             .Int => |i| i,
             .Long => |l| l,
@@ -9563,7 +9608,7 @@ inline fn primitiveMemberFast(frame: *const Frame, cm: anytype) ?Value {
         };
         return null;
     }
-    const arg = frame.read(Reg.from(cm.args.int()));
+    const arg = arg_in.?;
     // Shifts take an `Int` count on both receivers; the logical operations
     // take the receiver's own width.
     const shift: ?u6 = switch (arg) {
