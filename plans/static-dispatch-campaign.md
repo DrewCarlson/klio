@@ -2647,10 +2647,22 @@ inheritance path at all. So this is not a case of the snapshot being
 taken and dropped — the failing body is lowered through a construction
 path that does not deliver `pending_lambda_local_decl_types`.
 
-Next step: trace FuncBuilder construction to identify that path (the two
-known lambda-body callers — `lowerLambda` at expr.zig and the local-fn
-body at stmt.zig — both set the snapshot, and only the latter omits it,
-so a third path is producing this builder).
+Identified 2026-08-05 by tagging every non-test `FuncBuilder.init` site:
+the failing builder IS constructed by `lambda_body.zig` — the same path
+that inherits — and the construction happens BEFORE the enclosing
+statement finishes (the trace order is `WRITE iterator = ListIterator`,
+then the lambda-body builder, then `WRITE iterator = MutableListIterator`
+and the successful reads). So the body is lowered while the caller's
+record is still being refined, and it receives an EMPTY snapshot
+(`ndecl=0`) rather than a stale one.
+
+Next step: print `module.pending_lambda_local_decl_types` unconditionally
+at the top of the lambda-body lower for this repro and distinguish
+"channel was null" (a producer that never set it — the `apply` receiver
+lambda reaches `lowerLambdaBody*` through a caller other than the two in
+`expr.zig`) from "snapshot taken too early". The fix differs: the first
+needs the missing producer to set the channel, the second needs the
+lambda lowered after the enclosing declaration settles.
 
 This is the last named cluster in `local_no_decl_type`. The other residual
 names — `symbol`/`index`/`array`, and the `it` family — are separate.
