@@ -386,7 +386,11 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         // switch already handles.
         if (runtime.envOnce("KLIO_INIT_KINDS") != null) {
             if (b.localDeclTypeRef(p.name.name) == null) {
-                std.debug.print("[init-kind] {s}\n", .{@tagName(std.meta.activeTag(e.*))});
+                if (e.* == .Call) {
+                    std.debug.print("[init-kind] Call {s}\n", .{@tagName(expr_mod.classifyCallReturnPub(b, e))});
+                } else {
+                    std.debug.print("[init-kind] {s}\n", .{@tagName(std.meta.activeTag(e.*))});
+                }
             }
         }
         // A literal init is definite NON-callable evidence that must also

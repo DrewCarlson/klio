@@ -14438,6 +14438,10 @@ pub fn lowerDeclineDump() void {
 /// Classify a `Call` expression against the strict condition a return-type
 /// channel would need: the name must identify one function whose declared
 /// return type is not one of its own type parameters.
+pub fn classifyCallReturnPub(b: *FuncBuilder, e: *const ast.Expr) NoRecvCall {
+    return classifyCallReturn(b, e);
+}
+
 fn classifyCallReturn(b: *FuncBuilder, e: *const ast.Expr) NoRecvCall {
     if (e.* != .Call) return .not_simple_callee;
     const callee = e.Call.callee;
