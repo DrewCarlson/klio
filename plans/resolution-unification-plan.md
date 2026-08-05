@@ -251,6 +251,23 @@ landed — see the ledger):
    keyed by class simple name), decided eagerly at lowering; the deferred
    runtime arms shrink to genuinely runtime-polymorphic receivers.
 
+**Hatch-deletion probe (2026-08-05): `stdlib.isToplevelFunction` is still
+load-bearing.** Removing it from the member-dispatch guard fails the sweep
+with three distinct symptoms, which name what must replace it:
+
+- `StringTest.scanIndexed` - `Expected <[+]>, actual <[test.text.StringTest@a52, +]>`:
+  a bare top-level call bound as a MEMBER of the implicit receiver, so the
+  receiver was passed as the first argument.
+- `DurationTest.subtraction` - `get_field 'nanoseconds' on test.time.DurationTest`:
+  a top-level extension property read against the enclosing test class.
+- `TODOTest.usage` - a control intrinsic (`TODO`) losing to a member probe.
+
+All three are the same shape: a package-level callable must outrank an
+implicit-receiver member probe, and today only the hardcoded alias list
+conveys that ranking. That is exactly what step 3's scope walk over the one
+table would decide from declarations instead of from a name list - so this
+hatch's deletion is BLOCKED ON step 3, not on more declarations.
+
 **Acceptance (the completeness invariant):** DELETE `ir.host_bare_global_check`
 + `installHostBareGlobals`, the alias arms, `shadowedByClass`'s literal-kind
 mini-resolver and the `class_competes` interim gate, and CMG's `is_ctor_name` —
