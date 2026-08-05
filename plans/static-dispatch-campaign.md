@@ -2813,3 +2813,33 @@ So `unique_concrete` is not latent value; it is a count of sites where the
 declared return is present but is not the right answer. Reverted. The probe
 that reports the causes is kept — the remaining blocks are `no_func` 9,858
 and `not_simple_callee` 3,828, both larger and neither yet characterized.
+
+## Addendum 65 (2026-08-06): `KLIO_INIT_KINDS` was an invalid instrument
+
+The probe asked `localDeclTypeRef(name) == null` right after the typing
+switch and reported everything it found as an untyped local. That is not
+what an untyped local is. A `.Call` initializer is never written into the
+declared-type table: `setLocalInitExprAt` RECORDS the expression, and
+`localInitTypeRef` derives the type on demand at each use site, consulting
+`ctorInitTypeRef` first. So the probe was counting locals that are typed —
+just not yet.
+
+Three measurements confirm it, each contradicting the probe:
+
+  * `ctorInitTypeRef` never once declines for `ArrayList`, `StringBuilder`,
+    `LinkedHashMap`, `HashSet` or `CharArray` across the corpus, though the
+    probe named those as its second-largest block (~2,100 sites).
+  * A direct repro — `val xs = ArrayList<E>()` in a generic function, then
+    `xs.add`, plus `StringBuilder` beside it — censuses 3/3 bound.
+  * Erasing incomplete constructor type ARGUMENTS instead of declining
+    (a fix aimed at the probe's story) moved the census by exactly zero.
+
+The probe is removed rather than repaired: rewriting it to consult the lazy
+channel does not work either, since at the declaration statement the local
+is not yet in scope for `b.resolve`, so the lazy answer is unconditionally
+null there. Its by-name entry point `localInitTypeRefNamed` is kept.
+
+Standing rule this produced: **the census is the only authority on what is
+unbound.** An instrument that counts a lowering-internal table's misses
+measures the table, not dispatch. Addenda 61-64 each spent a unit on a
+channel this probe pointed at; all three measured flat or negative.

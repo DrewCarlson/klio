@@ -379,20 +379,6 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             .ObjectExpr => try b.markObjectInitLocal(p.name.name),
             else => {},
         }
-        // `KLIO_INIT_KINDS=1` — initializer shapes that leave the local with
-        // NO declared type after every channel above has run. Reports the
-        // real residue: an earlier version instrumented the initializer-
-        // RECORDING switch instead, which kept naming shapes the typing
-        // switch already handles.
-        if (runtime.envOnce("KLIO_INIT_KINDS") != null) {
-            if (b.localDeclTypeRef(p.name.name) == null) {
-                if (e.* == .Call) {
-                    std.debug.print("[init-kind] Call {s}\n", .{@tagName(expr_mod.classifyCallReturnPub(b, e))});
-                } else {
-                    std.debug.print("[init-kind] {s}\n", .{@tagName(std.meta.activeTag(e.*))});
-                }
-            }
-        }
         // A literal init is definite NON-callable evidence that must also
         // survive into nested lambda bodies: a captured `var key = 0` does
         // not shadow the `key(...) {}` composable for a CALL.

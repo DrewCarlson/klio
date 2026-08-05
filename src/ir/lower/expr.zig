@@ -9335,7 +9335,14 @@ var init_self_name: ?[]const u8 = null;
 
 fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.TypeRef {
     if (receiver.* != .Path or receiver.Path.segments.len != 1) return null;
-    const name = receiver.Path.segments[0].name;
+    return localInitTypeRefNamed(b, receiver.Path.segments[0].name);
+}
+
+/// The by-name entry: a local's type derived from its RECORDED initializer.
+/// A call initializer is never written into the local's declared type — it is
+/// resolved here, on demand, at each use site. Anything asking "is this local
+/// typed?" must come through here, not through the declared-type table alone.
+pub fn localInitTypeRefNamed(b: *FuncBuilder, name: []const u8) Allocator.Error!?ir.TypeRef {
     if (b.resolve(name) == null) return null;
     const init_expr = b.localInitExpr(name) orelse {
         if (norecvCensusOn()) lm_localinit[0] += 1;
@@ -14437,10 +14444,6 @@ pub fn lowerDeclineDump() void {
 
 /// Classify a `Call` expression against the strict condition a return-type
 /// channel would need: the name must identify one function whose declared
-/// return type is not one of its own type parameters.
-pub fn classifyCallReturnPub(b: *FuncBuilder, e: *const ast.Expr) NoRecvCall {
-    return classifyCallReturn(b, e);
-}
 
 fn classifyCallReturn(b: *FuncBuilder, e: *const ast.Expr) NoRecvCall {
     if (e.* != .Call) return .not_simple_callee;
