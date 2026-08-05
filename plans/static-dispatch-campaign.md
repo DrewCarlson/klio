@@ -2441,3 +2441,29 @@ Next leg, in order of expected leverage:
 
 Everything else is green: drift 267/267, sweep 117/0, litmus 43/43,
 units green, stdlib census 591 (91.8% bound), compose bound 73.7%.
+
+## Addendum 54 (2026-08-05): advance-path census — the branchy-leaf frontier
+
+KLIO_CALL_STATS on concurrentMixingWriteApply_clear (partial run to the
+30s kill; proportions stable): snapshots.valid 1.71M calls,
+SnapshotIdSet.get 856K, readable 640K, record `.next` reads 430K,
+ThreadMap.find 430K, Snapshot.current companion reads 430K — ~17
+interpreted calls per snapshot write, all through THREE small
+functions plus field reads. Each is a few instructions with a BRANCH
+(valid: three-clause predicate; SnapshotIdSet.get: bit probe with a
+bounds branch), which excludes them from the leaf evaluator's
+straight-line subset — so every one of those millions of calls pays a
+full activation.
+
+NEXT UNIT — branchy leaf serve: extend `leafExprServeAt` to walk
+Branch/Goto over a bounded block set (<=8 blocks, same register bank,
+no calls beyond the existing leaf-chain rule, no throws/catches).
+That collapses valid/get/readable AND the earlier iterator family
+(elementAtCurrentIndex, isWhitespace shapes) to frameless serves —
+the single highest-leverage interpreter change left for the two
+remaining reds, and it compounds across every workload.
+
+Alternative if insufficient: FQN-keyed native serves for the three
+functions (they only read instance fields + bit math), which needs
+the static-Call path to honor intrinsic shadowing for BODIED pack
+functions (today only bodyless decls link to native forms).
