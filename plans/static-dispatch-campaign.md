@@ -2500,3 +2500,52 @@ Remaining interpreted-throughput profile of a member call after the fix:
 ~20% carrier alloc/free (the reverted pool's target), 8% threadlocal
 address lookups (`evtls`), 7% leaf-serve attempts that decline on the
 field-getter path.
+
+## Addendum 56 (2026-08-05): the throughput leg, and what it cost per unit
+
+The compose snapshot suites are the last red. Where they stand after this
+leg: SnapshotStateMapTests 58/59 (was 57/59), SnapshotStateListTests
+62/65, with the remaining five failures at 30.4s / 30.4s / 34.0s / 40.3s
+against 30s in-test budgets — two of them within 2%.
+
+Landed, each measured on the concurrent workload:
+
+- The static-call fusion never covered MEMBER calls: it required the
+  callee's simple name to have exactly one entry in the function-name
+  index, and an instance method has none. 1.12us -> 0.89us per member
+  call.
+- Size-classed pooling for the frame argument/capture carriers, extended
+  to the host's own producers (`argsFromSlice`, the closure prepare, the
+  constructor thunk). The pool must drain at depth 0, BEFORE the pooled
+  register early return, or buffers cross run boundaries.
+- Primitive bit members served inline, and the frameless leaf walk now
+  runs them, so the persistent collections' index helpers cost no frame.
+- A guard's throwing arm no longer disqualifies its whole body from the
+  leaf serve.
+- Same-arity overload sets are settled by the CALL SITE's scope tier
+  rather than declining the fusion outright.
+- A member-or-global site replays its resolved global target.
+- The klio-authored skeletal mutable collections (see below).
+
+MEASURED NEUTRAL, reverted: caching the intrinsic host per thread
+(twice), keeping the carrier pool warm across depth 0.
+
+Two traps this leg, both worth remembering:
+
+- A single-threaded repro of `SnapshotStateList.removeRange` said
+  per-index removal beat the iterator form by 39%. The concurrent test
+  said the opposite (49s vs 40s), because the persistent-vector builder
+  overrides `listIterator` with a trie cursor. The TEST is the authority
+  for a test's budget.
+- `zig build klio-harness` must be re-run after any manifest edit before
+  timing anything: two 56s-vs-30s readings that looked like a 2x
+  regression were the previous binary still sitting in `zig-out`.
+
+The klio-authored `AbstractMutable*` actuals replaced upstream's
+native-wasm platform sources (which this project does not consume) and
+took the concurrent snapshot-map clear test from 56s to 30.4s on their
+own. Splitting them one-class-per-file matters: a dangling annotation at
+a file boundary was tolerated by the stdlib load path instead of
+rejected, and the anonymous key set silently lost its base class. A
+stdlib source that does not parse should fail the build loudly — the
+next unit.
