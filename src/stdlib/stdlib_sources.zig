@@ -238,6 +238,7 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-collections/SequencesActuals.kt",
     "kotlin-comparisons/ComparisonsActuals.kt",
     "kotlin-io/Closeable.kt",
+    "kotlin-io/Console.kt",
     "kotlin-io/Serializable.kt",
     "kotlin-io/encoding/Base64Actuals.kt",
     "kotlin-internal/SerializationActuals.kt",
