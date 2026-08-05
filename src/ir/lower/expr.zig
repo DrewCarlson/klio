@@ -9372,10 +9372,35 @@ fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.
     return derived;
 }
 
+/// The declared RETURN type of a call whose callee is a function-typed local
+/// or parameter. `assertIterableContentEquals(… , iterator: T.() -> Iterator<*>)`
+/// calls the parameter as `expected.iterator()`, and without this the result
+/// local carries no type at all, so every `hasNext`/`next` on it resolves by
+/// name. A lowered function type keeps its return as the LAST entry of `args`
+/// (after the optional `#suspend` marker, the optional receiver, and the
+/// parameters), which is the shape `loweredTypeRef` writes.
+fn fnTypedCalleeReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (call_expr.* != .Call) return null;
+    const callee = call_expr.Call.callee;
+    const name: []const u8 = switch (callee.*) {
+        .Path => |p| if (p.segments.len == 1) p.segments[0].name else return null,
+        .Member => |m| m.name.name,
+        else => return null,
+    };
+    if (b.resolve(name) == null) return null;
+    const ty = b.localDeclTypeRef(name) orelse return null;
+    if (!std.mem.startsWith(u8, ty.name, "Function")) return null;
+    if (ty.args.len == 0) return null;
+    const ret = ty.args[ty.args.len - 1];
+    if (ret.name.len == 0 or ret.name[0] == '#') return null;
+    return try ret.clone(b.allocator);
+}
+
 fn staticCallReturnTypeRef(
     b: *FuncBuilder,
     call_expr: *const Expr,
 ) Allocator.Error!?ir.TypeRef {
+    if (try fnTypedCalleeReturnTypeRef(b, call_expr)) |t| return t;
     if (call_expr.* == .Binary) {
         const bin = call_expr.Binary;
         const method: []const u8 = switch (bin.op) {
