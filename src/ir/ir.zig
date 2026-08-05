@@ -243,6 +243,10 @@ pub const Inst = union(enum) {
         /// site just stays on the slow path.
         site_cls: u64 = 0,
         site_route: u64 = 0,
+        /// Site verdict for serving a NULL stored slot: 0 = unasked, 1 = the
+        /// property is an unset-`lateinit` shape the ladder must adjudicate,
+        /// 2 = a plain null this site may serve.
+        null_ok: u8 = 0,
     },
     /// Write a local property of a class instance.
     SetField: struct {

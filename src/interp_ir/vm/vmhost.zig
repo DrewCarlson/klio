@@ -350,6 +350,7 @@ pub const VmHost = struct {
     pub const getField = host_fields.getField;
     pub const getMemberField = host_fields.getMemberField;
     pub const fieldSiteRoute = host_fields.fieldSiteRoute;
+    pub const storedNullServable = host_fields.storedNullServable;
     pub const runFieldGetter = host_fields.runFieldGetter;
     pub const fieldGetterIsLeaf = host_fields.fieldGetterIsLeaf;
     pub const funcRunsItsBody = host_fields.funcRunsItsBody;

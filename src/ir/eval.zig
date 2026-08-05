@@ -6388,7 +6388,16 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                                 std.mem.endsWith(u8, name, f.name) and
                                 name[name.len - f.name.len - 1] == '\u{1f}')) break :fast;
                         const v = f.value;
-                        if (v == .Null or v == .Delegate) break :fast;
+                        if (v == .Delegate) break :fast;
+                        // A stored slot holding NULL is a plain null unless the
+                        // property is an unset `lateinit`, whose read must
+                        // throw. Declining every null sent the commonest field
+                        // shape there is — an optional link (`next`) — down the
+                        // slow ladder on every read.
+                        if (v == .Null) {
+                            if (comptime !@hasDecl(H, "storedNullServable")) break :fast;
+                            if (!nullSiteOk(H, host, &recv, name, @constCast(&gf.null_ok))) break :fast;
+                        }
                         v.retain();
                         if (pushed_enclosing) popEnclosing();
                         try frame.write(gf.dst, v);
@@ -9709,6 +9718,17 @@ fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) ?Val
     if (std.mem.eql(u8, nm, "or")) return wrap(is_int, p.a | p.b);
     if (std.mem.eql(u8, nm, "xor")) return wrap(is_int, p.a ^ p.b);
     return null;
+}
+
+/// Whether this site may serve a NULL stored slot. Asked of the host once and
+/// kept on the instruction: it is a property of the claiming class, which the
+/// site memo has already pinned.
+inline fn nullSiteOk(comptime H: type, host: *H, recv: *const Value, name: []const u8, slot: *u8) bool {
+    const cached = @atomicLoad(u8, slot, .acquire);
+    if (cached != 0) return cached == 2;
+    const ok_now = host.storedNullServable(recv, name);
+    @atomicStore(u8, slot, if (ok_now) @as(u8, 2) else 1, .release);
+    return ok_now;
 }
 
 inline fn fastSubscript(allocator: Allocator, frame: *const Frame, cm: anytype) ?Value {

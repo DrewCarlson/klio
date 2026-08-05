@@ -442,6 +442,15 @@ pub fn accessorFastGet(self: *VmHost, mod: *const Module, f: *const ir.Func, rec
 /// claim exists only for reads that resolved as a plain stored slot or a
 /// class getter, with every earlier ladder arm already declined. Null when
 /// the memo has no entry for the pair.
+/// Whether a stored slot's NULL value is a plain null rather than an unset
+/// `lateinit` (whose read must throw) — decided from the class, so a site memo
+/// can serve nulls instead of declining every one of them to the ladder.
+pub fn storedNullServable(self: *VmHost, receiver: *const Value, name: []const u8) bool {
+    _ = self;
+    if (receiver.* != .Instance) return false;
+    return !storedNullIsLateinit(receiver.Instance, name);
+}
+
 pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?FieldSiteClaim {
     if (receiver.* != .Instance) return null;
     if (std.mem.eql(u8, name, "coroutineContext")) return null;
