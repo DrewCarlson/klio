@@ -2681,3 +2681,28 @@ a pointer match at the two `FuncBuilder.init` sites in `decl.zig` /
 
 This is the last named cluster in `local_no_decl_type`. The other residual
 names — `symbol`/`index`/`array`, and the `it` family — are separate.
+
+## Addendum 60 (2026-08-05): part of the residual is the language, not the resolver
+
+Chasing the `enclosing_member` bucket (46 sites) reached
+`class CompareContext<out T>(val expected: T, val actual: T)`, where
+`expected.getter()` has a receiver typed by an UNBOUNDED type parameter.
+There is nothing for a static pick to name: Kotlin erases `T`, and the
+reference compiler dispatches that call virtually too. The same holds for
+the `it`/`e`/`removed` names in `local_no_decl_type` — parameters typed by
+their function's own type parameters.
+
+So `no_receiver_type` will not reach zero, and 100% static binding is not
+the right target for a language with generics and open classes. The
+meaningful target is: every site that CAN bind statically does.
+
+An attempt to MEASURE the irreducible share was reverted (it counted 0):
+the classifier keyed on `localDeclTypeRef`, but these sites have no
+declared-type record at all — that is precisely why they are in the
+bucket. Measuring it properly needs the FUNCTION's parameter types (the
+declaration), not the local-declaration channel, and the
+`KLIO_NORECV_NAMES` output already shows `param=true` on exactly these
+rows. Next attempt should key on the signature.
+
+Current: 521 no_receiver_type / 9,268 sites; 92.6% statically bound
+(bound_static 1,561 + bound_virtual 7,021).
