@@ -668,11 +668,22 @@ fn sigMentionsTypeParam(sig: *const FnSig) bool {
     return typeMentionsTypeParam(&sig.return_ty);
 }
 
+/// `KLIO_EAGER_GATES=1` — which gate drops each candidate resolution, so the
+/// channel's yield can be attributed instead of guessed at.
+pub var eager_gate_counts: [7]u64 = @splat(0);
+fn eagerGate(i: usize) void {
+    eager_gate_counts[i] += 1;
+}
+
 fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record_name: []const u8) void {
+    eagerGate(0);
     // A vararg overload family needs the engine's packing logic to pick
     // (typeck's MSC can prefer a fixed-arity sibling for a vararg call);
     // vararg picks stay out of the channel.
-    for (sig.is_vararg) |v| if (v) return;
+    for (sig.is_vararg) |v| if (v) {
+        eagerGate(1);
+        return;
+    };
     // A pick made against a TYPE PARAMETER is a guess, not a resolution.
     // `listOf(a, b).minOrNull()` where `a: T` (`T : Comparable<T>`) has two
     // live candidates — the total-order `Iterable<T>.minOrNull()` and the
@@ -681,7 +692,10 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
     // wrong choice silently changes the answer (NaN instead of 0.0). The
     // runtime's own dispatch gets these right, so the channel stays out of
     // it, exactly as it does for an ambiguous simple class name.
-    if (sigMentionsTypeParam(sig)) return;
+    if (sigMentionsTypeParam(sig)) {
+        eagerGate(2);
+        return;
+    }
     // Extension-shadow gate. A bare call inside an extension body has that
     // extension's receiver in scope, so a same-named EXTENSION on it
     // out-ranks the top-level declaration this registry would answer with.
@@ -690,7 +704,10 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
     // binding the composable there reaches the composer with no applier.
     // The member-shadow walk below covers members only, and an extension is
     // not a member, so the name is declined outright.
-    if (self.extension_fn_names.contains(record_name)) return;
+    if (self.extension_fn_names.contains(record_name)) {
+        eagerGate(3);
+        return;
+    }
     // Package-visibility gate: the flat name registry is package-blind, so
     // a same-name declaration from an unrelated package can win here that
     // Kotlin scoping would never see (a packageless `apply` shadowing
@@ -707,7 +724,10 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
         var ci: usize = self.class_stack.items.len;
         while (ci > 0) {
             ci -= 1;
-            if (classChainHasMember(self, self.class_stack.items[ci], record_name)) return;
+            if (classChainHasMember(self, self.class_stack.items[ci], record_name)) {
+                eagerGate(4);
+                return;
+            }
         }
     }
     if (sig.decl_span) |ds| {
@@ -716,7 +736,10 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
         const same = std.mem.eql(u8, decl_pkg, call_pkg);
         const default_imported = std.mem.eql(u8, decl_pkg, "kotlin") or
             std.mem.startsWith(u8, decl_pkg, "kotlin.");
-        if (!same and !default_imported) return;
+        if (!same and !default_imported) {
+            eagerGate(5);
+            return;
+        }
     }
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(self.allocator);
@@ -726,6 +749,7 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
     }
     buf.print(self.allocator, ";ret={f}", .{sig.return_ty}) catch return;
     const rendered = self.allocator.dupe(u8, buf.items) catch return;
+    eagerGate(6);
     self.resolved_calls.put(call_span, .{ .decl_span = sig.decl_span, .render = rendered }) catch {
         self.allocator.free(rendered);
     };

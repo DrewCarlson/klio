@@ -806,16 +806,30 @@ pub fn computeEagerCalls(
     var out = std.AutoHashMap(span_mod.Span, span_mod.Span).init(gpa);
     var it = tc.resolved_calls.iterator();
     var n: usize = 0;
+    var seen_total: usize = 0;
+    var no_decl_span: usize = 0;
+    var not_declared: usize = 0;
     while (it.next()) |e| {
-        const decl = e.value_ptr.decl_span orelse continue;
-        if (!declared.contains(decl)) continue;
+        seen_total += 1;
+        const decl = e.value_ptr.decl_span orelse {
+            no_decl_span += 1;
+            continue;
+        };
+        if (!declared.contains(decl)) {
+            not_declared += 1;
+            continue;
+        }
         out.put(e.key_ptr.*, decl) catch continue;
         n += 1;
         if (runtime.envOnce("KLIO_EAGER_HITS") != null) {
             std.debug.print("[EAGER-REC] call f{d}:{d}-{d} -> decl f{d}:{d}-{d}\n", .{ e.key_ptr.file.int(), e.key_ptr.start, e.key_ptr.end, decl.file.int(), decl.start, decl.end });
         }
     }
-    if (audit) std.debug.print("[EAGER] {d} call resolutions recorded\n", .{n});
+    if (audit) {
+        const g = typeck.check.expr_calls.eager_gate_counts;
+        std.debug.print("[EAGER-GATES] entered={d} vararg={d} type_param={d} ext_name={d} member_shadow={d} pkg_visibility={d} recorded={d}\n", .{ g[0], g[1], g[2], g[3], g[4], g[5], g[6] });
+    }
+    if (audit) std.debug.print("[EAGER] {d} call resolutions recorded (typeck resolved {d}; {d} carried no decl span, {d} named a decl outside the checked sources)\n", .{ n, seen_total, no_decl_span, not_declared });
     // The companion evidence channel: per-expression type heads. Only
     // decisive heads enter (scalars, String, named classes, nullable
     // wrappers of those) — a Function/TypeParam/Unresolved answer would
