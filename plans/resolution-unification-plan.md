@@ -373,11 +373,26 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
   function is in `fns`, no pack class can be named, and every member call
   on a pack-typed value stops before member resolution begins.
 
-  **P7's precondition is therefore: typeck must see pack declarations** —
-  by shipping declaration headers in the pack format, or by reconstructing
-  signatures from pack IR at load. Nothing inside the checker reaches it,
-  and neither does more work on the eager channel. That is the next build
-  task, and it is a pack-format change, not a resolver change.
+  CORRECTION (same day) — the "packs ship no declarations" reading above is
+  WRONG, and so was the pack-format conclusion drawn from it. The suppressor
+  is the stdlib IMAGE fast path: `stdlib_image.zig` is the only caller that
+  passes `asts_needed = false`, and the pack loader then returns after
+  bindings with `out_asts` empty. Disable the image and the same compose
+  program gives:
+
+      KLIO_STDLIB_IMAGE=0:  634 files / 8208 decls handed to the checker
+                            calls=34677 member=12214 member_with_class=5532
+                            entered=4852 recorded=2159
+
+  versus 1 file / 1 decl and 0 recorded with the image. So typeck DOES see
+  pack declarations, resolves 45% of member calls' receiver classes, and the
+  channel records 2,159 resolutions — when the image is not used.
+
+  **P7's real precondition: the eager results must survive the image path.**
+  Either compute them before the image short-circuit, or carry them in the
+  image beside the IR it already caches. That is a caching change, not a
+  pack-format change and not a resolver change — and it is the next build
+  task. The gate histogram above is its baseline.
 
   So P7's precondition was not "extend the channel to member calls" nor
   "typeck can name pack classes". Until that holds, a member-call channel
