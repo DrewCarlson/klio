@@ -10,49 +10,7 @@
  */
 package kotlin.collections
 
-public actual abstract class AbstractMutableCollection<E> protected actual constructor() :
-    MutableCollection<E>, AbstractCollection<E>() {
-
-    @IgnorableReturnValue
-    actual override public fun addAll(elements: Collection<E>): Boolean {
-        var changed = false
-        for (v in elements) {
-            if (add(v)) changed = true
-        }
-        return changed
-    }
-
-    @IgnorableReturnValue
-    actual override fun remove(element: E): Boolean {
-        val it = iterator()
-        while (it.hasNext()) {
-            if (it.next() == element) {
-                it.remove()
-                return true
-            }
-        }
-        return false
-    }
-
-    @IgnorableReturnValue
-    actual override public fun removeAll(elements: Collection<E>): Boolean =
-        (this as MutableIterable<E>).removeAll { it in elements }
-
-    @IgnorableReturnValue
-    actual override public fun retainAll(elements: Collection<E>): Boolean =
-        (this as MutableIterable<E>).retainAll { it in elements }
-
-    actual override fun clear(): Unit {
-        val it = iterator()
-        while (it.hasNext()) {
-            val _ = it.next()
-            it.remove()
-        }
-    }
-}
-
-public actual abstract class AbstractMutableList<E> protected actual constructor() :
-    AbstractMutableCollection<E>(), MutableList<E> {
+public actual abstract class AbstractMutableList<E> protected actual constructor() : AbstractMutableCollection<E>(), MutableList<E> {
 
     /**
      * The number of times this list is structurally modified. Iterators
@@ -203,8 +161,7 @@ public actual abstract class AbstractMutableList<E> protected actual constructor
         }
     }
 
-    private class SubList<E>(private val list: AbstractMutableList<E>, private val fromIndex: Int, toIndex: Int) :
-        AbstractMutableList<E>() {
+    private class SubList<E>(private val list: AbstractMutableList<E>, private val fromIndex: Int, toIndex: Int) : AbstractMutableList<E>() {
         private var _size: Int = 0
 
         init {
@@ -274,118 +231,4 @@ public actual abstract class AbstractMutableList<E> protected actual constructor
                 throw ConcurrentModificationException()
         }
     }
-}
-
-@SinceKotlin("1.1")
-public actual abstract class AbstractMutableSet<E> protected actual constructor() :
-    AbstractMutableCollection<E>(), MutableSet<E> {
-
-    @IgnorableReturnValue
-    actual abstract override fun add(element: E): Boolean
-
-    override fun equals(other: Any?): Boolean {
-        if (other === this) return true
-        if (other !is Set<*>) return false
-        return AbstractSet.setEquals(this, other)
-    }
-
-    override fun hashCode(): Int = AbstractSet.unorderedHashCode(this)
-}
-
-@SinceKotlin("1.1")
-@SinceKotlin("1.1")
-public actual abstract class AbstractMutableMap<K, V> protected actual constructor() : AbstractMap<K, V>(), MutableMap<K, V> {
-    /**
-     * Associates the specified [value] with the specified [key] in the map.
-     *
-     * @return the previous value associated with the key, or `null` if the key was not present in the map.
-     */
-    @IgnorableReturnValue
-    actual abstract override fun put(key: K, value: V): V?
-
-
-    actual override fun putAll(from: Map<out K, V>) {
-        for ((key, value) in from) {
-            put(key, value)
-        }
-    }
-
-    @IgnorableReturnValue
-    actual override fun remove(key: K): V? {
-        val iter = entries.iterator()
-        while (iter.hasNext()) {
-            val entry = iter.next()
-            val k = entry.key
-            if (key == k) {
-                val value = entry.value
-                iter.remove()
-                return value
-            }
-        }
-        return null
-    }
-
-    actual override fun clear() {
-        entries.clear()
-    }
-
-    private var _keys: MutableSet<K>? = null
-    actual override val keys: MutableSet<K>
-        get() {
-            if (_keys == null) {
-                _keys = object : AbstractMutableSet<K>() {
-                    override fun add(element: K): Boolean = throw UnsupportedOperationException("Add is not supported on keys")
-                    override fun clear() {
-                        this@AbstractMutableMap.clear()
-                    }
-
-                    override operator fun contains(element: K): Boolean = containsKey(element)
-
-                    override operator fun iterator(): MutableIterator<K> {
-                        val entryIterator = entries.iterator()
-                        return object : MutableIterator<K> {
-                            override fun hasNext(): Boolean = entryIterator.hasNext()
-                            override fun next(): K = entryIterator.next().key
-                            override fun remove() = entryIterator.remove()
-                        }
-                    }
-
-                    override fun remove(element: K): Boolean {
-                        if (containsKey(element)) {
-                            this@AbstractMutableMap.remove(element)
-                            return true
-                        }
-                        return false
-                    }
-
-                    override val size: Int get() = this@AbstractMutableMap.size
-                }
-            }
-            return _keys!!
-        }
-
-    private var _values: MutableCollection<V>? = null
-    actual override val values: MutableCollection<V>
-        get() {
-            if (_values == null) {
-                _values = object : AbstractMutableCollection<V>() {
-                    override fun add(element: V): Boolean = throw UnsupportedOperationException("Add is not supported on values")
-                    override fun clear() = this@AbstractMutableMap.clear()
-
-                    override operator fun contains(element: V): Boolean = containsValue(element)
-
-                    override operator fun iterator(): MutableIterator<V> {
-                        val entryIterator = entries.iterator()
-                        return object : MutableIterator<V> {
-                            override fun hasNext(): Boolean = entryIterator.hasNext()
-                            override fun next(): V = entryIterator.next().value
-                            override fun remove() = entryIterator.remove()
-                        }
-                    }
-
-                    override val size: Int get() = this@AbstractMutableMap.size
-                }
-            }
-            return _values!!
-        }
 }
