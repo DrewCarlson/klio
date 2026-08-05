@@ -809,7 +809,7 @@ pub fn extKeyTraceEnabled() bool {
 /// that source name, which is what you want when comparing the overloads that
 /// compete at one site.
 fn extKeyTraceWanted(fid: ?FuncId) bool {
-    const want = std.mem.span(std.c.getenv("KLIO_EXTKEY_TRACE") orelse return false);
+    const want = std.mem.span(std.c.getenv("KLIO_EXTKEY_TRACE") != null orelse return false);
     var it = std.mem.tokenizeScalar(u8, want, ',');
     while (it.next()) |tok| {
         if (std.fmt.parseInt(u32, tok, 10)) |n| {
@@ -2230,3 +2230,4 @@ test "applicable named: defaulted trailing param stays fillable for named Int ar
     };
     try testing.expect(applicable(&.{ .params = &factory }, &args, .{ .named = true }) != null);
 }
+

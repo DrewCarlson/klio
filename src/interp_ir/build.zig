@@ -545,10 +545,10 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     // plus the baked base (pack composables the user calls, e.g. `Text`).
     if (composePluginEnabled()) {
         // A/B gate for the skip emission (pace/correctness bisection).
-        if (runtime.getenvSlice("KLIO_COMPOSE_SKIP")) |v| {
+        if (runtime.envOnce("KLIO_COMPOSE_SKIP")) |v| {
             compose_pass.emit_skip_calculus = v.len != 0 and !std.mem.eql(u8, v, "0");
         }
-        if (runtime.getenvSlice("KLIO_COMPOSE_MEMO")) |v| {
+        if (runtime.envOnce("KLIO_COMPOSE_MEMO")) |v| {
             compose_pass.emit_lambda_memo = v.len != 0 and !std.mem.eql(u8, v, "0");
         }
         var names = try compose_pass.collectComposableNames(allocator, decls.items);
@@ -568,7 +568,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
             try composeBaseComposableGetterProps(&comp_getter_props, base_decls);
             try composeBaseInlineFns(&inline_fns, base_decls);
         }
-        if (runtime.getenvSlice("KLIO_COMPOSE_DBG") != null) {
+        if (runtime.envOnce("KLIO_COMPOSE_DBG") != null) {
             compose_pass.dbg_groups = true;
             std.debug.print("[compose-pass] enabled, {d} composable names, {d} lambda sinks, {d} decls\n", .{ names.count(), sinks.count(), decls.items.len });
         }
@@ -1276,7 +1276,7 @@ fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl) ?[]c
     // A FACTORY call names its type just as a constructor does, as long as
     // exactly one declaration answers to the name and it declares a return
     // type: `val cache = newCache()` is whatever `newCache` returns.
-    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_FACTORY_PROP") orelse "1", "0")) return null;
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_FACTORY_PROP") orelse "1", "0")) return null;
     var found: ?[]const u8 = null;
     for (decls) |*d| {
         if (d.* != .Function) continue;
@@ -1800,7 +1800,7 @@ fn buildModuleWithOverrides(
                 for (emembers) |*em| {
                     if (em.* != .Function) continue;
                     const matched = transplantExpectMemberDefaults(&am.Function, &em.Function);
-                    if (runtime.getenvSlice("KLIO_NU_TRACE")) |want| {
+                    if (runtime.envOnce("KLIO_NU_TRACE")) |want| {
                         if (std.mem.eql(u8, want, am.Function.name.name)) {
                             std.debug.print("[expect-default] class={s} actual={s}/{d} expect={s}/{d} matched={}\n", .{
                                 ac.name.name,
@@ -1952,7 +1952,7 @@ fn buildModuleWithOverrides(
                     // are written this way, and it was the whole of the
                     // enclosing-member bucket.
                     if (src.* == .Path and src.Path.segments.len == 1 and
-                        !std.mem.eql(u8, runtime.getenvSlice("KLIO_FACTORY_PROP") orelse "1", "0"))
+                        !std.mem.eql(u8, runtime.envOnce("KLIO_FACTORY_PROP") orelse "1", "0"))
                     {
                         const pname = src.Path.segments[0].name;
                         for (c.primary_params) |*pp| {
@@ -2611,7 +2611,7 @@ fn buildModuleWithOverrides(
                     break :blk !std.mem.eql(u8, std.mem.span(w), "0");
                 };
                 if (hdr_on and hdr_bounds.items.len != 0 and !hdr_skip) {
-                    if (std.c.getenv("KLIO_HDR_BOUNDS_LIST") != null) {
+                    if (runtime.envSetOnce("KLIO_HDR_BOUNDS_LIST")) {
                         std.debug.print("[hdrb] {s}", .{f.name.name});
                         for (hdr_bounds.items) |bd| std.debug.print(" {s}<:{s}", .{ bd.param, bd.bound });
                         std.debug.print("\n", .{});
@@ -3695,7 +3695,7 @@ fn buildModuleWithOverrides(
                 .Expr => |body| try ir.lower.lowerAccessorExprWithExpected(module, recv_name, &empty_members, &.{"this"}, &body, nm, p.ty),
                 .Block => |blk| try ir.lower.lowerAccessorBlockRet(module, recv_name, &empty_members, &.{"this"}, &blk, nm, p.ty),
             };
-            if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+            if (runtime.envOnce("KLIO_MISS_TRACE")) |w| {
                 if (std.mem.eql(u8, w, p.name.name))
                     std.debug.print("[extprop-reg] key=({s},{s}) fid={d}\n", .{ recv_key, p.name.name, fid.int() });
             }

@@ -1906,3 +1906,14 @@ test "primitive_bit_members" {
         \\
     );
 }
+
+test "site_memo_null_field" {
+    try check("site_memo_null_field",
+        \\null
+        \\null
+        \\threw: lateinit property late has not been initialized
+        \\set
+        \\true
+        \\
+    );
+}

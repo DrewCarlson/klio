@@ -119,6 +119,46 @@ pub fn getenvSlice(name: [*:0]const u8) ?[]const u8 {
     return value;
 }
 
+/// A single environment variable read, answered from a per-call-site static
+/// after the first ask. `getenvSlice` still takes the shared cache's mutex and
+/// hashes the name on every call, which the dispatch and frame-entry gates pay
+/// once per interpreted call across every thread; a comptime-keyed name gets
+/// its own static, so the shared cache is consulted exactly once per site.
+/// Racing first asks compute the same answer.
+/// One variable's slot. A `struct` declared inside `envOnce` would NOT be
+/// per-name: a comptime pointer parameter does not re-instantiate the body,
+/// so every call site would share one static and answer with whichever
+/// variable was read first. Keying a TYPE on the name gives each variable its
+/// own statics, which is what the memoization needs to be correct.
+fn EnvSlot(comptime name: [:0]const u8) type {
+    return struct {
+        const key: [:0]const u8 = name;
+        var state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+        var value: ?[]const u8 = null;
+    };
+}
+
+pub fn envOnce(comptime name: [:0]const u8) ?[]const u8 {
+    const S = EnvSlot(name);
+    if (S.state.load(.acquire) == 0) {
+        S.value = getenvSlice(S.key.ptr);
+        S.state.store(1, .release);
+    }
+    return S.value;
+}
+
+/// `envOnce` as a plain presence test.
+pub fn envSetOnce(comptime name: [:0]const u8) bool {
+    return envOnce(name) != null;
+}
+
+test "envOnce answers per variable, not per first read" {
+    // The shared-static bug this guards: two names must not alias.
+    try std.testing.expect(envOnce("KLIO_ENVONCE_SELFTEST_A") == null);
+    try std.testing.expect(envOnce("KLIO_ENVONCE_SELFTEST_B") == null);
+    try std.testing.expect(EnvSlot("KLIO_ENVONCE_SELFTEST_A") != EnvSlot("KLIO_ENVONCE_SELFTEST_B"));
+}
+
 /// Diagnostic: when `KLIO_RC_DETECT` is set, `ObjRef.deinit` leaks freed cells
 /// and dumps a stack trace on a second decrement (a double-free). Off by
 /// default; only used to pinpoint reclamation double-frees during the host
@@ -131,7 +171,7 @@ fn detectDoubleFree() bool {
         else => {},
     }
     const on = blk: {
-        const v = getenvSlice("KLIO_RC_DETECT") orelse break :blk false;
+        const v = envOnce("KLIO_RC_DETECT") orelse break :blk false;
         break :blk v.len != 0 and !std.mem.eql(u8, v, "0");
     };
     detect_df_state.store(if (on) 2 else 1, .monotonic);
@@ -147,7 +187,7 @@ pub fn reclaimRequested() bool {
     const on = blk: {
         // Unset is the tracing GC (the collector reclaims by reachability;
         // refcount teardown stays off — `main.zig` forces `setReclaim(false)`).
-        const v = getenvSlice("KLIO_RECLAIM") orelse break :blk false;
+        const v = envOnce("KLIO_RECLAIM") orelse break :blk false;
         // `free` selects a freeing allocator (see `main.zig`) while leaving
         // the refcount reclamation path OFF: it reclaims the host scratch and
         // container temporaries the run path explicitly frees, without

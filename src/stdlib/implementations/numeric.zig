@@ -559,7 +559,7 @@ pub fn ctor_ushort(ctx: *CallCtx) Allocator.Error!EvalResult {
 }
 pub fn ctor_uint(ctx: *CallCtx) Allocator.Error!EvalResult {
     const v = unsignedCtorArg(ctx.args) orelse {
-        if (runtime.getenvSlice("KLIO_UCTOR_TRACE") != null) {
+        if (runtime.envOnce("KLIO_UCTOR_TRACE") != null) {
             std.debug.print("[uctor] nargs={d} tags=", .{ctx.args.len});
             for (ctx.args) |a| std.debug.print("{s},", .{@tagName(std.meta.activeTag(a))});
             std.debug.print("\n", .{});

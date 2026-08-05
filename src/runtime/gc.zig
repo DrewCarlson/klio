@@ -72,7 +72,16 @@ pub const Marker = struct {
             trace.dumpCurrent(.{});
             @panic("KGC: root shaded a swept cell (incomplete root)");
         }
-        if (self.minor and h.gc_gen != 0) return; // tenured: not swept by a minor
+        // Tenured cells are not swept by a minor, so stopping the walk at
+        // them is safe ONLY if every tenured->nursery edge is in the
+        // remembered set. The boxed Value payloads broke that assumption
+        // somewhere (a live nursery box behind an un-remembered tenured cell
+        // was swept — StringTest.zipWithNext GPF), so minors keep the cheap
+        // nursery-only SWEEP but trace THROUGH tenured cells; the mark can
+        // stop only at tenured cells it has already visited this epoch.
+        // KLIO_GC_MINOR_STOP=1 restores the old early stop for bisecting the
+        // missing barrier.
+        if (self.minor and h.gc_gen != 0 and minor_stops_at_tenured) return;
         if (h.gc_mark == self.epoch) return; // already grey or black this epoch
         h.gc_mark = self.epoch;
         self.grey.append(self.arena, h) catch {
@@ -268,9 +277,9 @@ pub fn noteExternalBytes(bytes: usize) void {
     if (!gc_enabled) return;
     _ = external_live.fetchAdd(bytes, .monotonic);
     const mprev = bytes_since_major.fetchAdd(bytes, .monotonic);
-    if (mprev + bytes >= major_threshold) major_pending.store(true, .monotonic);
+    if (mprev +| bytes >= major_threshold) major_pending.store(true, .monotonic);
     const prev = bytes_since_gc.fetchAdd(bytes, .monotonic);
-    if (prev + bytes >= threshold) gc_pending.store(true, .monotonic);
+    if (prev +| bytes >= threshold) gc_pending.store(true, .monotonic);
 }
 
 /// External (non-registry) bytes released back — keeps `external_live`
@@ -285,9 +294,23 @@ pub fn noteExternalBytes(bytes: usize) void {
 /// registry cells keep gross accounting (their garbage does accumulate).
 pub fn noteExternalFreed(bytes: usize) void {
     if (!gc_enabled) return;
-    _ = external_live.fetchSub(@min(bytes, external_live.load(.monotonic)), .monotonic);
-    _ = bytes_since_gc.fetchSub(@min(bytes, bytes_since_gc.load(.monotonic)), .monotonic);
-    _ = bytes_since_major.fetchSub(@min(bytes, bytes_since_major.load(.monotonic)), .monotonic);
+    subSaturating(&external_live, bytes);
+    subSaturating(&bytes_since_gc, bytes);
+    subSaturating(&bytes_since_major, bytes);
+}
+
+/// Subtract without ever going below zero. The clamp has to be part of the
+/// same atomic step: a load-then-`fetchSub(@min(...))` pair lets two threads
+/// each read a value that covers their own subtraction and then both subtract,
+/// wrapping the counter to near `maxInt`. A wrapped counter then made the next
+/// `noteExternalBytes` addition overflow, which aborted the interpreter under
+/// the concurrent snapshot tests.
+fn subSaturating(c: *std.atomic.Value(usize), bytes: usize) void {
+    var cur = c.load(.monotonic);
+    while (true) {
+        const next = cur -| bytes;
+        cur = c.cmpxchgWeak(cur, next, .monotonic, .monotonic) orelse return;
+    }
 }
 
 var external_live: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
@@ -565,6 +588,10 @@ pub var gc_nofree: bool = false;
 /// collection re-shades + traces it, firing the trap with the cell's type and a
 /// stack trace: the exact swept-while-live cell that an incomplete root missed.
 pub var gc_poison: bool = false;
+/// Whether a MINOR mark stops at tenured cells (the classic generational
+/// shortcut). Off by default until the boxed-payload remembered-set hole is
+/// found; `KLIO_GC_MINOR_STOP=1` turns the shortcut back on.
+pub var minor_stops_at_tenured: bool = false;
 
 /// Tracer installed on a quarantined (poisoned) cell. Reaching it means a live
 /// value referenced a cell the prior collection swept — a missing-root UAF.

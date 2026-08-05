@@ -874,7 +874,7 @@ pub const ProgramImage = struct {
     /// declaration-order pick fed a TextOverflow into `ellipsis` and a
     /// paragraph rendered a value class as its branch condition.
     pub fn resolvedRedirectTargetShaped(self: *const ProgramImage, module: *const Module, func: FuncId, args: []const runtime.Value) ?FuncId {
-        if (std.c.getenv("KLIO_REDIR_TRACE") != null) {
+        if (runtime.envSetOnce("KLIO_REDIR_TRACE")) {
             if (module.funcById(func)) |hf| {
                 std.debug.print("[redir] {s}#{d} nargs={d} nredirects={d}\n", .{ hf.fqn, func.int(), args.len, self.resolvedRedirects(func).len });
             }

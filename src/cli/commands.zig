@@ -507,7 +507,7 @@ pub fn runTestFiles(
                     if (std.mem.eql(u8, path, of) or std.mem.endsWith(u8, path, of)) {
                         if (i >= prep.user_asts.len) return 1;
                         const fid = prep.user_asts[i].span.file.int();
-                        if (runtime.getenvSlice("KLIO_TEST_FILE_TRACE") != null) {
+                        if (runtime.envOnce("KLIO_TEST_FILE_TRACE") != null) {
                             io.printStderr(gpa, "[test-file] {s} -> {d}\n", .{ path, fid });
                         }
                         image_fids.append(gpa, fid) catch return 1;
@@ -695,10 +695,10 @@ fn runTestsOnBuilt(
     io.printStdout(gpa, "\n{d} tests, {d} passed, {d} failed, {d} skipped\n", .{
         report.results.len, report.passed, report.failed, report.skipped,
     });
-    if (runtime.getenvSlice("KLIO_PUMP_DIAG") != null) interp_ir.coroutines_diag.dumpSleepCounts();
+    if (runtime.envOnce("KLIO_PUMP_DIAG") != null) interp_ir.coroutines_diag.dumpSleepCounts();
     ir.eval.callStatsDump();
     ir.eval.dispatchStatsDump();
-    if (runtime.getenvSlice("KLIO_DISPATCH_STATS") != null) {
+    if (runtime.envOnce("KLIO_DISPATCH_STATS") != null) {
         ir.lower.expr.lowerSitesDump();
         ir.lower.expr.lowerNoRecvDump();
         ir.lower.expr.lowerDeclineDump();
@@ -776,7 +776,7 @@ pub fn computeEagerCalls(
     combined: []const KotlinFile,
     native_fqns: []const []const u8,
 ) ?std.AutoHashMap(span_mod.Span, span_mod.Span) {
-    const audit = runtime.getenvSlice("KLIO_EAGER_AUDIT") != null;
+    const audit = runtime.envOnce("KLIO_EAGER_AUDIT") != null;
     const r = resolver.resolveModuleWithNatives(gpa, combined, native_fqns) catch {
         if (audit) std.debug.print("[EAGER] resolver failed; staying lazy\n", .{});
         return null;
@@ -811,7 +811,7 @@ pub fn computeEagerCalls(
         if (!declared.contains(decl)) continue;
         out.put(e.key_ptr.*, decl) catch continue;
         n += 1;
-        if (runtime.getenvSlice("KLIO_EAGER_HITS") != null) {
+        if (runtime.envOnce("KLIO_EAGER_HITS") != null) {
             std.debug.print("[EAGER-REC] call f{d}:{d}-{d} -> decl f{d}:{d}-{d}\n", .{ e.key_ptr.file.int(), e.key_ptr.start, e.key_ptr.end, decl.file.int(), decl.start, decl.end });
         }
     }
@@ -981,7 +981,7 @@ pub fn runBuiltModuleArgs(
     // throughout, so a change that reads a CONCRETE element type measures as
     // zero there and is not worthless — ordinary application code is where it
     // shows.
-    if (runtime.getenvSlice("KLIO_DISPATCH_STATS") != null) {
+    if (runtime.envOnce("KLIO_DISPATCH_STATS") != null) {
         ir.lower.expr.lowerSitesDump();
         ir.lower.expr.lowerNoRecvDump();
         ir.lower.expr.lowerDeclineDump();

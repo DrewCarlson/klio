@@ -58,7 +58,7 @@ var pump_nosleep_state: u8 = 0;
 /// sleep round.
 fn pumpNoSleep() bool {
     if (pump_nosleep_state == 0)
-        pump_nosleep_state = if (runtime.getenvSlice("KLIO_PUMP_NOSLEEP") != null) 2 else 1;
+        pump_nosleep_state = if (runtime.envOnce("KLIO_PUMP_NOSLEEP") != null) 2 else 1;
     return pump_nosleep_state == 2;
 }
 
@@ -77,7 +77,7 @@ fn countSleep(site: SleepSite) void {
 var wall_streak: u64 = 0;
 var streak_diag: ?bool = null;
 fn streakDiagOn() bool {
-    if (streak_diag == null) streak_diag = runtime.getenvSlice("KLIO_PUMP_DIAG") != null;
+    if (streak_diag == null) streak_diag = runtime.envOnce("KLIO_PUMP_DIAG") != null;
     return streak_diag.?;
 }
 fn endStreak(source: []const u8) void {
@@ -1576,7 +1576,7 @@ fn activeScopeDepth() usize {
 /// keeps the live stack reflecting only running activations. Caller owns
 /// the returned slice (page-allocator). Empty when nothing was pushed.
 fn scopeDiagOn() bool {
-    return runtime.getenvSlice("KLIO_SCOPE_DIAG") != null;
+    return runtime.envOnce("KLIO_SCOPE_DIAG") != null;
 }
 fn scopeIdent(v: *const Value) usize {
     return if (v.* == .Instance) v.Instance.identity() else 0;
@@ -2904,7 +2904,7 @@ fn parkedFuncName(self: *VmIntrinsicHost, st: *const SuspendState) []const u8 {
 /// Escape hatch: queue every continuation resume on the pump instead of running
 /// it on the caller's stack (the pre-dispatch-aware behaviour). Diagnostics only.
 fn inlineResumeEnabled() bool {
-    return runtime.getenvSlice("KLIO_NO_INLINE_RESUME") == null;
+    return runtime.envOnce("KLIO_NO_INLINE_RESUME") == null;
 }
 
 /// The persisted inline-resume path (`resumePersistedOnTop`) lets the Compose
@@ -3127,7 +3127,7 @@ var sync_resume_on: bool = false;
 fn syncResumeDelivery() bool {
     if (!sync_resume_checked) {
         sync_resume_checked = true;
-        sync_resume_on = std.mem.eql(u8, runtime.getenvSlice("KLIO_SYNC_RESUME") orelse "0", "1");
+        sync_resume_on = std.mem.eql(u8, runtime.envOnce("KLIO_SYNC_RESUME") orelse "0", "1");
     }
     return sync_resume_on;
 }
@@ -3136,7 +3136,7 @@ pub fn coroutineResumeContinuation(self: *VmIntrinsicHost, slot: i64, value: Val
     // KLIO_RESUME_TRACE: name the RESUMER — the route prints below show the
     // frames a delivery re-runs, but a double-delivery diagnosis needs to know
     // which Kotlin code performed each `Continuation.resumeWith`.
-    if (runtime.getenvSlice("KLIO_RESUME_TRACE") != null) {
+    if (runtime.envOnce("KLIO_RESUME_TRACE") != null) {
         std.debug.print("[resume-call] slot={d} resumer:\n", .{slot});
         ir.eval.dumpFrameChainForDiagAlways();
     }

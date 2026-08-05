@@ -811,7 +811,7 @@ fn materialiseSequenceBounded(
                 while (true) {
                     if (takeCapReached(seq.ops, st.taken)) break;
                     const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse {
-                        if (std.c.getenv("KLIO_SEQ_DIAG") != null) {
+                        if (runtime.envSetOnce("KLIO_SEQ_DIAG")) {
                             std.debug.print("[seq-diag] iterator lacks hasNext: iter kind={s} fqn={s}\n", .{ @tagName(std.meta.activeTag(iter)), iter.typeFqn() });
                         }
                         return .{ .err = .{ .Type = "Sequence: iterator lacks hasNext" } };
@@ -957,7 +957,7 @@ fn materialiseSequenceBounded(
             };
             while (true) {
                 const hn = (try host.invokeMethod(&iter, "hasNext", &.{}, out)) orelse {
-                    if (std.c.getenv("KLIO_SEQ_DIAG") != null) {
+                    if (runtime.envSetOnce("KLIO_SEQ_DIAG")) {
                         std.debug.print("[seq-diag] iterator lacks hasNext: iter kind={s} fqn={s}\n", .{ @tagName(std.meta.activeTag(iter)), iter.typeFqn() });
                     }
                     return .{ .err = .{ .Type = "Sequence: iterator lacks hasNext" } };

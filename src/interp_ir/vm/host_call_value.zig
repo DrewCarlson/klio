@@ -181,7 +181,7 @@ const ThisOverride = struct { idx: usize, val: Value };
 var cvt_trace_cached: ?bool = null;
 fn callValueTraceOn() bool {
     if (cvt_trace_cached) |v| return v;
-    const on = runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null;
+    const on = runtime.envOnce("KLIO_CALLVALUE_TRACE") != null;
     cvt_trace_cached = on;
     return on;
 }
@@ -205,8 +205,10 @@ fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, cap
         host_call_func.linkAuditCheck(self, module, func.id, func, args);
         if (host_call_func.resolvedNativeForm(self, func.id)) |_| return null;
     }
-    var call_args: std.ArrayList(Value) = .empty;
-    try call_args.appendSlice(allocator, args);
+    // Pooled carrier: the closure's params and captures are frame buffers
+    // like any other, released through the frame's teardown.
+    var call_args = try ir.eval.acquireArgsCap(allocator, args.len);
+    if (call_args.capacity >= args.len) call_args.appendSliceAssumeCapacity(args) else try call_args.appendSlice(allocator, args);
     if (callValueTraceOn()) {
         for (call_args.items, 0..) |*av, ai| {
             std.debug.print("[flat-prep] body=#{d} #{d} kind={s}\n", .{ info.body_func.int(), ai, @tagName(std.meta.activeTag(av.*)) });
@@ -216,7 +218,9 @@ fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, cap
     {
         const g = captures.borrow();
         defer g.deinit();
-        try capture_values.appendSlice(allocator, g.get().*);
+        const src = g.get().*;
+        capture_values = try ir.eval.acquireArgsCap(allocator, src.len);
+        if (capture_values.capacity >= src.len) capture_values.appendSliceAssumeCapacity(src) else try capture_values.appendSlice(allocator, src);
     }
     if (this_override) |ov| {
         if (ov.idx >= capture_values.items.len) {
@@ -1170,7 +1174,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
             std.mem.eql(u8, func.params[func.params.len - 2].name, "$composer");
         if ((info.has_receiver or compose_recv_infer) and !last_vararg and args.len == info.n_params + 1) {
-            if (runtime.getenvSlice("KLIO_REBIND_AUDIT") != null) {
+            if (runtime.envOnce("KLIO_REBIND_AUDIT") != null) {
                 std.debug.print("[REBIND] fn={s} n_params={d}\n", .{ func.name, info.n_params });
             }
             // A receiver lambda need not read its receiver. Such a body has
@@ -1391,7 +1395,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
     if (callee.* == .Comparator and args.len == 2) {
         return self.callMember(allocator, callee, "compare", args);
     }
-    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null)
+    if (runtime.envOnce("KLIO_ERR_TRACE") != null)
         std.debug.print("[callvalue-miss] callee={s} args={d}\n", .{ callee.typeFqn(), args.len });
     ir.eval.dumpFrameChainForDiag();
     const msg = try std.fmt.allocPrint(allocator, "Vm::call_value on `{s}`", .{callee.typeFqn()});
@@ -1467,7 +1471,7 @@ pub fn callValueNamedRecvCtx(self: *VmHost, allocator: Allocator, callee: *const
                 break :blk f.lambda_receiver_ty != null;
             };
             if ((!has_this or receiver_lambda) and args.len == info.n_params) {
-                if (runtime.getenvSlice("KLIO_CVNRC") != null) {
+                if (runtime.envOnce("KLIO_CVNRC") != null) {
                     const tn = blk: {
                         const g = recv.Instance.borrow();
                         defer g.deinit();
@@ -2086,6 +2090,16 @@ pub fn callValueWithThisExact(self: *VmHost, allocator: Allocator, callee: *cons
                 defer if (runtime.freeScratch()) allocator.free(with_recv);
                 with_recv[0] = this_value.*;
                 @memcpy(with_recv[1..], args);
+                // The receiver rides positionally, but it is still the
+                // block's innermost IMPLICIT receiver: publish it on the
+                // enclosing chain so member-extension dispatch inside the
+                // body sees its owner (`placeable.place(x, y)` inside a
+                // `Placeable.PlacementScope.() -> Unit` placement block —
+                // the owner-visibility set was missing the scope and every
+                // window placement pass died on it).
+                const push_subject = this_value.* == .Instance or this_value.* == .Null;
+                if (push_subject) host_call_member.pushAccessEnclosingSubject(self, this_value);
+                defer if (push_subject) host_call_member.popAccessEnclosing(self);
                 return callValue(self, allocator, callee, with_recv);
             }
         }

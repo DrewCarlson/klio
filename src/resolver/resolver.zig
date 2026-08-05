@@ -495,6 +495,12 @@ const Resolver = struct {
             try key_buf.print(self.strs(), "{s}#{d}", .{ name, f.params.len });
             for (f.params) |p| {
                 try key_buf.append(self.strs(), '|');
+                // A vararg parameter's type is the ARRAY of its element type
+                // (Kotlin: `vararg v: Int` is `IntArray`-typed), so it never
+                // collides with a fixed parameter of the element type —
+                // `select(vararg values: Int)` and `select(value: Int)` are
+                // distinct overloads.
+                if (p.is_vararg) try key_buf.append(self.strs(), '*');
                 try key_buf.appendSlice(self.strs(), p.ty.name.name);
             }
             // Context parameters are part of the signature: two overloads that

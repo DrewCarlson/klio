@@ -1907,7 +1907,7 @@ pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
         return null;
     }
 
-    decode_stats_on = if (@import("builtin").link_libc) (std.c.getenv("KLIO_DECODE_STATS") != null) else false;
+    decode_stats_on = if (@import("builtin").link_libc) (runtime.envSetOnce("KLIO_DECODE_STATS")) else false;
     // Reserve this image's forest slot before decoding: every `ForestRef`
     // in the payload is image-local and rebases onto the slot as it
     // decodes, so bases from several images coexist in one process.

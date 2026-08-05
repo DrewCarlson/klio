@@ -58,8 +58,16 @@ fn typeErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) EvalEr
 /// shallow-copied (their `ObjRef` handles stay shared), matching the Vm's
 /// `Vec<Value>` hand-off discipline.
 fn argsFromSlice(allocator: Allocator, items: []const Value) Allocator.Error!std.ArrayList(Value) {
-    var out: std.ArrayList(Value) = .empty;
-    try out.appendSlice(allocator, items);
+    // Through the size-classed carrier pool: this is the arg buffer of an
+    // ordinary host-dispatched call, released by the frame's teardown like
+    // every other carrier, and a fresh allocation per call was the largest
+    // single allocator caller on the interpreted dispatch path.
+    var out = try ir.eval.acquireArgsCap(allocator, items.len);
+    if (out.capacity >= items.len) {
+        out.appendSliceAssumeCapacity(items);
+    } else {
+        try out.appendSlice(allocator, items);
+    }
     return out;
 }
 
@@ -746,7 +754,7 @@ fn applicExactHeadCb(ctx: *anyopaque, param_head: []const u8, arg_head: []const 
 fn applicSubtypeCb(ctx: *anyopaque, value: *const anyopaque, target: []const u8) ?i32 {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     const arg: *const Value = @ptrCast(@alignCast(value));
-    const strace = if (runtime.getenvSlice("KLIO_SUBTYPE_TRACE")) |w| (std.mem.indexOf(u8, target, w) != null) else false;
+    const strace = if (runtime.envOnce("KLIO_SUBTYPE_TRACE")) |w| (std.mem.indexOf(u8, target, w) != null) else false;
     if (arg.* != .Instance) {
         if (strace) std.debug.print("[sub] target={s} arg-tag={s} -> null\n", .{ target, @tagName(std.meta.activeTag(arg.*)) });
         return null;
@@ -805,7 +813,7 @@ fn sigViewOfFunc(self: *VmHost, module: *const Module, cand: FuncId, argc: usize
 fn positionalPoints(self: *VmHost, module: *const Module, cand: FuncId, shapes: []const applicability.ArgShape, scope: applicability.ApplicabilityScope) ?i32 {
     const sig = sigViewOfFunc(self, module, cand, shapes.len) orelse return null;
     const sc = applicability.applicable(&sig, shapes, scope);
-    if (sc == null and runtime.getenvSlice("KLIO_APPLIC_TRACE") != null) {
+    if (sc == null and runtime.envOnce("KLIO_APPLIC_TRACE") != null) {
         std.debug.print("[pp-null] cand={d} named={} nshapes={d} shape0named={s} shape0class={s}\n", .{
             cand.int(),
             scope.named,
@@ -1004,22 +1012,78 @@ const valueIsBuiltin = root.valueIsBuiltin;
 /// overloads (which need runtime re-resolution). The evaluator caches the result
 /// on the `Func` and consults the host only once per function.
 pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
+    const fp_trace = if (runtime.envOnce("KLIO_FASTPLAN_TRACE")) |w| blk: {
+        const f0 = funcAt(module, func) orelse break :blk false;
+        break :blk std.mem.indexOf(u8, f0.name, w) != null;
+    } else false;
     const f = funcAt(module, func) orelse return 1;
-    if (!f.hasBody()) return 1;
+    if (!f.hasBody()) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: no body\n", .{f.name});
+        return 1;
+    }
     // Inline bodies splice; a runtime call to one keeps the full path. A
     // plain suspend function needs nothing extra — its suspension
     // propagates identically on the direct path.
-    if (f.is_inline) return 1;
+    if (f.is_inline) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: inline\n", .{f.name});
+        return 1;
+    }
     // A `@Composable` function is plugin-lowered: composition is already in
     // the body, and the only per-call work is publishing the threaded
     // `$composer` as ambient — which the flat path does via
     // `flatPlainCallOpen`. No exclusion needed.
-    if (f.params.len > 253) return 1;
-    if (lastIsVararg(f.params)) return 1;
-    if (hasNonFinalVararg(f.params)) return 1;
-    if (funcDefaults(self, func) != null) return 1;
-    if (resolvedNativeForm(self, func) != null) return 1;
-    if (module.funcsBySimpleName(f.name).len != 1) return 1;
+    if (f.params.len > 253) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: too many params\n", .{f.name});
+        return 1;
+    }
+    if (lastIsVararg(f.params)) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: trailing vararg\n", .{f.name});
+        return 1;
+    }
+    if (hasNonFinalVararg(f.params)) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: non-final vararg\n", .{f.name});
+        return 1;
+    }
+    if (funcDefaults(self, func) != null) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: has defaults\n", .{f.name});
+        return 1;
+    }
+    if (resolvedNativeForm(self, func) != null) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: native form\n", .{f.name});
+        return 1;
+    }
+    // A same-simple-name overload set is what the slow path exists to
+    // re-resolve, so a competing candidate normally declines. NONE is the
+    // common case for an instance method — the simple-name index carries
+    // top-level and extension functions, not members — and is the most
+    // certain shape there is: the site baked an exact declaration and
+    // nothing competes for the name.
+    //
+    // A set whose other members take a DIFFERENT number of parameters is not
+    // a real competitor either: the runtime re-resolution the fast path skips
+    // ranks candidates for the call's argument count, and only this one
+    // accepts it. That covers the compose snapshot vocabulary (`valid`,
+    // `readable`, `get`), where same-named helpers differ in arity.
+    const same_name = module.funcsBySimpleName(f.name);
+    if (same_name.len > 1) {
+        var arity_peers: usize = 0;
+        for (same_name) |c| {
+            const cf = funcAt(module, c) orelse continue;
+            if (cf.params.len == f.params.len) arity_peers += 1;
+            // A defaulted or variadic peer accepts a range of counts, so it
+            // competes for this arity whatever its declared length is.
+            if (cf.params.len != f.params.len and peerSpansArity(self, c, cf, f.params.len)) arity_peers += 1;
+        }
+        if (arity_peers != 1) {
+            // Same name, same arity, different declarations: which one wins is
+            // a question of the CALL SITE's scope, which this per-callee plan
+            // cannot see. Stay eligible and let the site decide once.
+            if (fp_trace) std.debug.print("[fastplan] {s}: {d} same-arity peers of {d} candidates -> site decides\n", .{ f.name, arity_peers, same_name.len });
+            const b = @as(u16, @intCast(f.params.len)) + 2;
+            const ext: u16 = if (paramIsThis(f.params) or f.has_receiver_param) ir.FAST_CALL_EXT_FLAG else 0;
+            return b | ext | ir.FAST_CALL_AMBIG_FLAG;
+        }
+    }
     // Type-parameterized non-inline functions carry no reified binding
     // (reified requires inline), and the fast path already requires the
     // call site to bake zero type arguments, so nothing needs the typed
@@ -1031,6 +1095,40 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
     if (paramIsThis(f.params) or f.has_receiver_param)
         return base | ir.FAST_CALL_EXT_FLAG;
     return base;
+}
+
+/// Whether the baked target of an ambiguous-by-arity call is the declaration
+/// scope resolution picks from `caller_pkg`/`caller_file`. Same-name peers of
+/// the same arity are separated by scope alone (the compose runtime bundles a
+/// per-implementation `indexSegment`/`assert` in sibling packages), so the
+/// site's own tier ranking answers it — and answers it identically to the
+/// re-resolution the fused path skips.
+pub fn fuseSiteBinds(self: *VmHost, module: *const Module, func: FuncId, caller_pkg: []const u8, caller_file: ?ir.FileId) bool {
+    _ = self;
+    const f = funcAt(module, func) orelse return false;
+    const file = caller_file orelse ir.FileId.from(std.math.maxInt(u32));
+    const own = module.scopeTier(f.fqn, f.package, f.name, caller_pkg, file);
+    if (own == ir.Module.other_package_tier) return false;
+    for (module.funcsBySimpleName(f.name)) |c| {
+        if (c.int() == func.int()) continue;
+        const cf = funcAt(module, c) orelse continue;
+        if (cf.params.len != f.params.len) continue;
+        // A peer at the same or better tier means scope does not settle it.
+        if (module.scopeTier(cf.fqn, cf.package, cf.name, caller_pkg, file) <= own) return false;
+    }
+    return true;
+}
+
+/// Whether a same-named candidate can accept `n_args` despite declaring a
+/// different parameter count — a vararg tail or any defaulted parameter makes
+/// its accepted arity a range, so it still competes for the call.
+fn peerSpansArity(self: *VmHost, id: FuncId, cf: *const ir.Func, n_args: usize) bool {
+    if (lastIsVararg(cf.params) and n_args >= cf.params.len -| 1) return true;
+    if (funcDefaults(self, id) != null and n_args <= cf.params.len) return true;
+    for (cf.params) |*p| {
+        if (p.has_default and n_args <= cf.params.len) return true;
+    }
+    return false;
 }
 
 /// Lean dispatch for a fast-path call: run the body directly with `args_list`
@@ -1485,7 +1583,7 @@ var hcf_miss_trace_state: u8 = 0;
 var hcf_miss_trace_want: []const u8 = "";
 fn hcfMissTraceEnv() ?[]const u8 {
     if (hcf_miss_trace_state == 0) {
-        if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| {
+        if (runtime.envOnce("KLIO_MISS_TRACE")) |w| {
             hcf_miss_trace_want = w;
             hcf_miss_trace_state = 2;
         } else {
@@ -2234,7 +2332,7 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
             (std.mem.eql(u8, f.name, "enumValues") or std.mem.eql(u8, f.name, "enumValueOf") or
                 std.mem.eql(u8, f.name, "enumEntries") or std.mem.eql(u8, f.name, "enumEntriesIntrinsic")))
         {
-            if (runtime.getenvSlice("KLIO_NU_TRACE") != null) {
+            if (runtime.envOnce("KLIO_NU_TRACE") != null) {
                 std.debug.print("[eev] fn={s} nta={d} ta0={s}\n", .{ f.name, type_args.len, if (type_args.len > 0) type_args[0] else "-" });
             }
             if (type_args.len > 0 and type_args[0].len != 0) {
@@ -2488,7 +2586,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         break :blk own;
     };
     const eff = eff_resolved;
-    const ntrace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
+    const ntrace = if (runtime.envOnce("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     if (ntrace) {
         std.debug.print("[cno] {s} bounded={} cands={d} in_fn={s} nargs={d} names:", .{
             name,

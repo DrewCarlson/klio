@@ -96,7 +96,7 @@ pub fn currentComposer() ?Value {
 /// KLIO_COMPOSER_BIND_TRACE diagnostic.
 pub fn threadedComposerArgFor(fqn: []const u8, params: []const ir.Param, args: []const Value) ?Value {
     const got = threadedComposerArg(params, args);
-    if (got != null and runtime.getenvSlice("KLIO_COMPOSER_BIND_TRACE") != null) {
+    if (got != null and runtime.envOnce("KLIO_COMPOSER_BIND_TRACE") != null) {
         std.debug.print("[composer-bind-fn] {s}\n", .{fqn});
     }
     return got;
@@ -109,7 +109,7 @@ pub fn threadedComposerArg(params: []const ir.Param, args: []const Value) ?Value
     if (!std.mem.eql(u8, params[params.len - 1].name, "$changed")) return null;
     const composer = args[args.len - 2];
     if (composer != .Instance) return null;
-    if (runtime.getenvSlice("KLIO_COMPOSER_BIND_TRACE") != null) {
+    if (runtime.envOnce("KLIO_COMPOSER_BIND_TRACE") != null) {
         const ig = composer.Instance.borrow();
         const cg = ig.get().class.borrow();
         const cls_name = cg.get().name;

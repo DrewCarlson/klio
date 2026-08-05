@@ -166,6 +166,9 @@ const EvalTls = struct {
     regs_pool: std.ArrayListUnmanaged([]Value) = .empty,
     /// Free-list of frame ARG/CAPTURE carrier buffers (see `acquireArgsCap`).
     args_pool: std.ArrayListUnmanaged([]Value) = .empty,
+    /// Size-classed free-lists of arg/capture carriers, one bucket per entry
+    /// of `ARGS_CLASS_CAPS` (see `acquireArgsCap`).
+    args_class_pool: [ARGS_CLASS_CAPS.len]ArgsBucket = @splat(.{}),
     /// Lexical-origin override for file-private visibility (see
     /// `RefSiteOverride`).
     ref_site_override: ?RefSiteOverride = null,
@@ -448,6 +451,13 @@ fn classifyFlattenable(f: *const Func) u8 {
     return 1;
 }
 
+/// Every buffer pool belongs to the RUNNING thread: a frame captures its
+/// `EvalTls` pointer when it is built, but a suspended coroutine resumes on
+/// whatever thread the dispatcher hands it, and reaching the origin thread's
+/// free list races its length (an intermittent `integer overflow` when a
+/// guarded decrement went negative). Callers therefore pass `&evtls` read
+/// fresh at the call, never a stored pointer — which also keeps the thread
+/// pointer to one lookup per frame operation instead of one per pool.
 fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value) {
     const ra = regsAlloc(allocator);
     if (ev.regs_pool.items.len > 0) {
@@ -479,6 +489,14 @@ fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32) Allocator.Error!std.A
 /// the arena never frees, so neither pools.
 fn releaseRegs(ev: *EvalTls, allocator: Allocator, regs: *std.ArrayList(Value)) void {
     const ra = regsAlloc(allocator);
+    // The size-classed arg carriers come from the RUN allocator (frames and
+    // hosts both produce them), so none may outlive the outermost evaluation
+    // that produced it — a pooled buffer surviving into the next run, or into
+    // a worker thread's teardown, is a dangling free. Draining at depth 0
+    // bounds the pool's lifetime to one evaluation, where the allocator is
+    // fixed, and still recycles across every nested call within it. This must
+    // run BEFORE the pooled-register early return below.
+    if (ev.eval_depth == 0 and argsClassPooled(ev)) drainArgsClassPool(ev, allocator);
     const gc_pool = !runtime.reclaimEnabled() and runtime.gc.gc_enabled;
     const pool_ok = (gc_pool or (runtime.reclaimEnabled() and ev.eval_depth > 0)) and
         regs.capacity > 0 and ev.regs_pool.items.len < REGS_POOL_MAX;
@@ -495,7 +513,7 @@ fn releaseRegs(ev: *EvalTls, allocator: Allocator, regs: *std.ArrayList(Value)) 
     }
     regs.deinit(ra);
     if (!gc_pool and ev.eval_depth == 0 and
-        (ev.regs_pool.items.len > 0 or ev.args_pool.items.len > 0)) drainRegsPool(ev, allocator);
+        (ev.regs_pool.items.len > 0 or ev.args_pool.items.len > 0 or argsClassPooled(ev))) drainRegsPool(ev, allocator);
 }
 
 /// Free every pooled register buffer. Called when the outermost frame unwinds
@@ -507,6 +525,26 @@ fn drainRegsPool(ev: *EvalTls, allocator: Allocator) void {
     for (ev.args_pool.items) |buf| allocator.free(buf);
     ev.args_pool.deinit(allocator);
     ev.args_pool = .empty;
+    drainArgsClassPool(ev, allocator);
+}
+
+/// Free every pooled size-classed arg carrier. The bytes left the collector's
+/// external-live estimate when they entered the pool (see `releaseArgs`).
+fn drainArgsClassPool(ev: *EvalTls, allocator: Allocator) void {
+    for (&ev.args_class_pool) |*bucket| {
+        for (bucket.bufs[0..bucket.len]) |buf| allocator.free(buf);
+        bucket.len = 0;
+    }
+}
+
+/// Whether any size-classed carrier is currently pooled. A pooled buffer
+/// belongs to the run's allocator, so the outermost unwind must drain them
+/// before that allocator goes away.
+fn argsClassPooled(ev: *const EvalTls) bool {
+    for (ev.args_class_pool) |bucket| {
+        if (bucket.len != 0) return true;
+    }
+    return false;
 }
 
 /// Per-thread free-list of frame ARG-carrier buffers. Every interpreted
@@ -520,16 +558,56 @@ fn drainRegsPool(ev: *EvalTls, allocator: Allocator) void {
 /// frees; pooling is pointless there.
 const ARGS_POOL_MAX: usize = 64;
 
+/// One size class's buffers. A fixed array: the pool is per-thread, bounded,
+/// and must never allocate to recycle.
+const ArgsBucket = struct {
+    bufs: [ARGS_CLASS_MAX][]Value = undefined,
+    len: usize = 0,
+};
+
+/// Size classes for the arg/capture carriers. The earlier pool was one
+/// top-of-stack slot whose fit check thrashed on mixed carrier sizes, which
+/// is why it was worth having only under the refcount backend. Bucketing by
+/// an exact capacity makes every acquire either an exact-size pop or a fresh
+/// allocation, so the pool serves the tracing GC — the default backend, where
+/// the alloc/free pair was a quarter of the interpreted call's cost.
+const ARGS_CLASS_CAPS = [_]usize{ 4, 8, 16, 32 };
+const ARGS_CLASS_MAX: usize = 32;
+
+fn argsClassOf(cap: usize) ?usize {
+    for (ARGS_CLASS_CAPS, 0..) |c, i| {
+        if (cap <= c) return i;
+    }
+    return null;
+}
+
+fn argsClassOfExact(len: usize) ?usize {
+    for (ARGS_CLASS_CAPS, 0..) |c, i| {
+        if (len == c) return i;
+    }
+    return null;
+}
+
 pub fn acquireArgsCap(allocator: Allocator, cap: usize) Allocator.Error!std.ArrayList(Value) {
-    if (runtime.reclaimEnabled()) {
-        const ev = &evtls;
-        if (ev.args_pool.items.len > 0) {
-            const buf = ev.args_pool.items[ev.args_pool.items.len - 1];
-            if (buf.len >= cap) {
-                ev.args_pool.items.len -= 1;
-                return .{ .items = buf[0..0], .capacity = buf.len };
-            }
+    const ev = &evtls;
+    if (argsClassOf(cap)) |ci| {
+        const bucket = &ev.args_class_pool[ci];
+        if (bucket.len > 0) {
+            bucket.len -= 1;
+            const buf = bucket.bufs[bucket.len];
+            // Re-enters the traced set (see releaseArgs).
+            if (runtime.gc.gc_enabled and !runtime.reclaimEnabled() and runtime.gc.external_accounting)
+                runtime.gc.noteExternalBytes(buf.len * @sizeOf(Value));
+            return .{ .items = buf[0..0], .capacity = buf.len };
         }
+        var list: std.ArrayList(Value) = .empty;
+        try list.ensureTotalCapacityPrecise(allocator, ARGS_CLASS_CAPS[ci]);
+        // A fresh carrier enters the traced set here, exactly as a pooled one
+        // does above: its release un-notes the same bytes, and an unbalanced
+        // pair drives the collector's external-live estimate negative.
+        if (runtime.gc.gc_enabled and !runtime.reclaimEnabled() and runtime.gc.external_accounting)
+            runtime.gc.noteExternalBytes(list.capacity * @sizeOf(Value));
+        return list;
     }
     var list: std.ArrayList(Value) = .empty;
     try list.ensureTotalCapacityPrecise(allocator, @max(cap, 4));
@@ -540,13 +618,26 @@ pub fn acquireArgsCap(allocator: Allocator, cap: usize) Allocator.Error!std.Arra
 /// The values inside are the caller's responsibility; only the buffer is
 /// recycled.
 pub fn releaseArgs(allocator: Allocator, list: *std.ArrayList(Value)) void {
-    if (runtime.reclaimEnabled() and list.capacity != 0) {
-        const ev = &evtls;
-        if (ev.args_pool.items.len < ARGS_POOL_MAX) {
-            const buf = list.allocatedSlice();
-            list.* = .empty;
-            ev.args_pool.append(allocator, buf) catch allocator.free(buf);
-            return;
+    releaseArgsIn(&evtls, allocator, list);
+}
+
+/// `releaseArgs` with the running thread's state already resolved, so a frame
+/// teardown pays one thread-pointer lookup for all of its buffers.
+pub fn releaseArgsIn(ev: *EvalTls, allocator: Allocator, list: *std.ArrayList(Value)) void {
+    if (list.capacity != 0) {
+        if (argsClassOfExact(list.capacity)) |ci| {
+            const bucket = &ev.args_class_pool[ci];
+            if (bucket.len < ARGS_CLASS_MAX) {
+                const buf = list.allocatedSlice();
+                list.* = .empty;
+                // Leaves the traced set (pooled, no live values) — shrink the
+                // collector's external-live estimate to match.
+                if (runtime.gc.gc_enabled and !runtime.reclaimEnabled() and runtime.gc.external_accounting)
+                    runtime.gc.noteExternalFreed(buf.len * @sizeOf(Value));
+                bucket.bufs[bucket.len] = buf;
+                bucket.len += 1;
+                return;
+            }
         }
     }
     list.deinit(allocator);
@@ -775,7 +866,7 @@ var call_stats_mutex: runtime.SpinMutex = .{};
 var call_stats: ?std.StringHashMap(u64) = null;
 fn callStatsBump(fqn: []const u8) void {
     if (call_stats_state == 0)
-        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+        call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
@@ -789,7 +880,7 @@ fn callStatsBump(fqn: []const u8) void {
 /// call workload.
 fn gfStatsBump(recv: *const Value, name: []const u8) void {
     if (call_stats_state == 0)
-        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+        call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
     var buf: [256]u8 = undefined;
     const key = std.fmt.bufPrint(&buf, "<gf>{s}.{s}", .{ recv.typeFqn(), name }) catch return;
@@ -809,7 +900,7 @@ fn gfStatsBump(recv: *const Value, name: []const u8) void {
 /// member dispatches are still unbound at runtime on a given workload.
 fn ladderStatsBump(recv: *const Value, name: []const u8) void {
     if (call_stats_state == 0)
-        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+        call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
     var buf: [256]u8 = undefined;
     const key = std.fmt.bufPrint(&buf, "<ladder>{s}.{s}", .{ recv.typeFqn(), name }) catch return;
@@ -894,7 +985,7 @@ pub fn opProfDump() void {
 var probe_stats: ?std.StringHashMap(u64) = null;
 pub fn callStatsProbe(name: []const u8) void {
     if (call_stats_state == 0)
-        call_stats_state = if (runtime.getenvSlice("KLIO_CALL_STATS") != null) 2 else 1;
+        call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
@@ -979,7 +1070,7 @@ var dispatch_stats_state: u8 = 0;
 
 inline fn dispatchBump(comptime k: DispatchKind) void {
     if (dispatch_stats_state == 0) {
-        dispatch_stats_state = if (runtime.getenvSlice("KLIO_DISPATCH_STATS") != null) 2 else 1;
+        dispatch_stats_state = if (runtime.envOnce("KLIO_DISPATCH_STATS") != null) 2 else 1;
     }
     if (dispatch_stats_state != 2) return;
     _ = dispatch_counts[@intFromEnum(k)].fetchAdd(1, .monotonic);
@@ -1033,7 +1124,7 @@ pub fn callStatsDump() void {
 var err_trace_state: u8 = 0;
 pub fn errTraceOn() bool {
     if (err_trace_state == 0)
-        err_trace_state = if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) 2 else 1;
+        err_trace_state = if (runtime.envOnce("KLIO_ERR_TRACE") != null) 2 else 1;
     return err_trace_state == 2;
 }
 
@@ -1152,7 +1243,7 @@ fn diagValueClassName(v: *const Value) []const u8 {
 fn spinDumpMaybe() void {
     if (!spin_interval_read) {
         spin_interval_read = true;
-        if (runtime.getenvSlice("KLIO_SPIN_TRACE")) |v| {
+        if (runtime.envOnce("KLIO_SPIN_TRACE")) |v| {
             spin_interval_s = std.fmt.parseInt(i64, v, 10) catch 30;
         }
     }
@@ -1743,7 +1834,7 @@ const Activation = struct {
 var flat_enabled_cached: ?bool = null;
 fn flatEnabled() bool {
     if (flat_enabled_cached) |b| return b;
-    const raw = runtime.getenvSlice("KLIO_FLAT");
+    const raw = runtime.envOnce("KLIO_FLAT");
     const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
     flat_enabled_cached = b;
     return b;
@@ -1754,7 +1845,7 @@ fn flatEnabled() bool {
 var vcall_flat_cached: ?bool = null;
 fn vcallFlatEnabled() bool {
     if (vcall_flat_cached) |b| return b;
-    const raw = runtime.getenvSlice("KLIO_FLAT_VCALL");
+    const raw = runtime.envOnce("KLIO_FLAT_VCALL");
     const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
     vcall_flat_cached = b;
     return b;
@@ -1765,7 +1856,7 @@ fn vcallFlatEnabled() bool {
 var member_site_cached: ?bool = null;
 fn memberSiteEnabled() bool {
     if (member_site_cached) |b| return b;
-    const raw = runtime.getenvSlice("KLIO_MEMBER_SITE");
+    const raw = runtime.envOnce("KLIO_MEMBER_SITE");
     const b = !(raw != null and std.mem.eql(u8, raw.?, "0"));
     member_site_cached = b;
     return b;
@@ -1777,21 +1868,21 @@ fn memberSiteEnabled() bool {
 var cv_trace_cached: ?bool = null;
 fn cvTraceOn() bool {
     if (cv_trace_cached) |b| return b;
-    const b = runtime.getenvSlice("KLIO_CALLVALUE_TRACE") != null;
+    const b = runtime.envOnce("KLIO_CALLVALUE_TRACE") != null;
     cv_trace_cached = b;
     return b;
 }
 var lr_trace_cached: ?bool = null;
 fn lrTraceOn() bool {
     if (lr_trace_cached) |b| return b;
-    const b = runtime.getenvSlice("KLIO_LR_TRACE") != null;
+    const b = runtime.envOnce("KLIO_LR_TRACE") != null;
     lr_trace_cached = b;
     return b;
 }
 var resume_trace_cached: ?bool = null;
 fn resumeTraceOn() bool {
     if (resume_trace_cached) |b| return b;
-    const b = runtime.getenvSlice("KLIO_RESUME_TRACE") != null;
+    const b = runtime.envOnce("KLIO_RESUME_TRACE") != null;
     resume_trace_cached = b;
     return b;
 }
@@ -1799,7 +1890,7 @@ var miss_trace_init: bool = false;
 var miss_trace_val: ?[]const u8 = null;
 fn missTraceWant() ?[]const u8 {
     if (!miss_trace_init) {
-        miss_trace_val = runtime.getenvSlice("KLIO_MISS_TRACE");
+        miss_trace_val = runtime.envOnce("KLIO_MISS_TRACE");
         miss_trace_init = true;
     }
     return miss_trace_val;
@@ -1808,7 +1899,7 @@ var cmg_trace_init: bool = false;
 var cmg_trace_val: ?[]const u8 = null;
 fn cmgTraceWant() ?[]const u8 {
     if (!cmg_trace_init) {
-        cmg_trace_val = runtime.getenvSlice("KLIO_CMG_TRACE");
+        cmg_trace_val = runtime.envOnce("KLIO_CMG_TRACE");
         cmg_trace_init = true;
     }
     return cmg_trace_val;
@@ -1817,7 +1908,7 @@ var nu_trace_init: bool = false;
 var nu_trace_val: ?[]const u8 = null;
 fn nuTraceWant() ?[]const u8 {
     if (!nu_trace_init) {
-        nu_trace_val = runtime.getenvSlice("KLIO_NU_TRACE");
+        nu_trace_val = runtime.envOnce("KLIO_NU_TRACE");
         nu_trace_init = true;
     }
     return nu_trace_val;
@@ -2023,7 +2114,7 @@ threadlocal var suspend_stats_receivers: usize = 0;
 
 fn noteSuspendSnapshot(dense: bool, total: usize, saved: usize, params: usize, captures: usize, receivers: usize) void {
     const enabled = suspend_stats_enabled orelse blk: {
-        const on = runtime.getenvSlice("KLIO_SUSPEND_STATS") != null;
+        const on = runtime.envOnce("KLIO_SUSPEND_STATS") != null;
         suspend_stats_enabled = on;
         break :blk on;
     };
@@ -2571,7 +2662,7 @@ const Frame = struct {
             }
             if (func.flat_class == 1) dispatchBump(.frame_push_flattenable);
         }
-        if (runtime.getenvSlice("KLIO_TRACE_PATH") != null) {
+        if (runtime.envOnce("KLIO_TRACE_PATH") != null) {
             for (params.items, 0..) |*pv, pi| {
                 const payload: i64 = switch (pv.*) {
                     .Int => |x| @as(i64, x),
@@ -2672,10 +2763,14 @@ const Frame = struct {
         // Args before regs: `releaseRegs` runs the depth-0 pool drain, so
         // the outermost frame's own carriers must already be pooled (or
         // they leak past the drain).
-        releaseArgs(self.allocator, &self.params);
-        releaseArgs(self.allocator, &self.captures);
-        releaseRegs(self.tls, self.allocator, &self.regs);
-        chainRelease(self.tls, &self.enclosing_this);
+        // The pools belong to the thread tearing the frame down, not to the
+        // one that built it (see `acquireRegs`): read the running thread once
+        // and hand it to each pool.
+        const ev: *EvalTls = &evtls;
+        releaseArgsIn(ev, self.allocator, &self.params);
+        releaseArgsIn(ev, self.allocator, &self.captures);
+        releaseRegs(ev, self.allocator, &self.regs);
+        chainRelease(ev, &self.enclosing_this);
     }
 
     fn read(self: *const Frame, r: Reg) Value {
@@ -2844,6 +2939,26 @@ const LeafAbandon = error{LeafAbandon};
 /// closure captures, no seeded receiver chain, no coroutine boundary, no
 /// type arguments, nothing the activation's open/teardown would have to
 /// carry. Anything the prepare pushed for the callee stays on the frame path.
+/// A flat request that carries nothing beyond its callee and arguments — no
+/// captures, receiver chain, closure identity, type arguments, keepalive,
+/// context mark, scope guard, composer push or coroutine boundary. Such a
+/// request is reproducible from the call site alone.
+fn leafPlainReq(req: FlatCallReq) bool {
+    return req.captures.items.len == 0 and
+        req.chain.len == 0 and
+        req.closure_id == null and
+        req.type_args.len == 0 and
+        req.keepalive == null and
+        req.typed_saved == null and
+        req.ctx_mark_override == null and
+        req.pop_enclosing_n == 0 and
+        req.scope_guard_ident == 0 and
+        !req.composer_pushed and
+        !req.suspend_barrier and
+        !req.root_pump and
+        req.owning == null;
+}
+
 fn leafReqServable(req: FlatCallReq) bool {
     return req.captures.items.len == 0 and
         req.chain.len == 0 and
@@ -2948,6 +3063,8 @@ fn leafWalk(
                 }
                 block_idx = if (c.Bool) br.t.int() else br.f.int();
             },
+            // A guard's throwing arm is admitted structurally but never
+            // executed here: raising needs the frame path's unwind machinery.
             // `leafExprBody` admits no other terminator.
             else => return error.LeafAbandon,
         }
@@ -3019,6 +3136,25 @@ fn leafRunInsts(
                 };
                 if (!leafWrite(allocator, regs, gf.dst, v, reclaim, false)) return error.LeafAbandon;
             },
+            .CallMember => |cm| {
+                // The value-level fast serves only: a primitive bit/conversion
+                // member is a pure function of its receiver and argument, so
+                // the frameless walk can run it. The gap-buffer and trie
+                // helpers this exists for (`indexSegment`, the mask/shift
+                // predicates) are otherwise a full activation per bit twiddle.
+                if (cm.arg_names.len != 0 or cm.n_args > 1) return error.LeafAbandon;
+                const recv = leafRead(regs, cm.receiver) orelse return error.LeafAbandon;
+                const nm = constStr(module, cm.name) orelse return error.LeafAbandon;
+                const marg: ?Value = if (cm.n_args == 1)
+                    (leafRead(regs, Reg.from(cm.args.int())) orelse return error.LeafAbandon)
+                else
+                    null;
+                const mv = primitiveMemberOp(&recv, nm, marg) orelse {
+                    if (trace) std.debug.print("[leaf] {s}: member {s} is not a primitive op\n", .{ func.name, nm });
+                    return error.LeafAbandon;
+                };
+                if (!leafWrite(allocator, regs, cm.dst, mv, reclaim, false)) return error.LeafAbandon;
+            },
             .Index => |ix| {
                 const recv = leafRead(regs, ix.receiver) orelse return error.LeafAbandon;
                 const idx = leafRead(regs, ix.index) orelse return error.LeafAbandon;
@@ -3086,7 +3222,7 @@ var leaf_trace_state: u8 = 0;
 var leaf_trace_want: []const u8 = "";
 fn leafTraceWant(func: *const Func) bool {
     if (leaf_trace_state == 0) {
-        leaf_trace_want = runtime.getenvSlice("KLIO_LEAF_TRACE") orelse "";
+        leaf_trace_want = runtime.envOnce("KLIO_LEAF_TRACE") orelse "";
         leaf_trace_state = 1;
     }
     if (leaf_trace_want.len == 0) return false;
@@ -3229,7 +3365,7 @@ var bool_this_trap_state: u8 = 0;
 pub fn boolThisTrap(func: *const Func, args: []const Value) void {
     // Consulted per flat-call open: cache the env verdict once.
     if (bool_this_trap_state == 0)
-        bool_this_trap_state = if (runtime.getenvSlice("KLIO_THIS_TRAP") != null) 2 else 1;
+        bool_this_trap_state = if (runtime.envOnce("KLIO_THIS_TRAP") != null) 2 else 1;
     if (bool_this_trap_state != 2) return;
     if (func.params.len == 0 or args.len == 0) return;
     if (!std.mem.eql(u8, func.params[0].name, "this")) return;
@@ -3257,7 +3393,7 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
         // Consulted per frame creation on the hot call path: even the
         // memoized env probe costs a spinlock + hashmap probe, so cache
         // the answer in a file-local once.
-        const w = runtime.getenvSlice("KLIO_DUMP_FN") orelse "";
+        const w = runtime.envOnce("KLIO_DUMP_FN") orelse "";
         dump_fn_want = w;
         break :blk w;
     };
@@ -3490,7 +3626,7 @@ fn frameBoundary(func: *const Func, result_in: EvalResult) EvalResult {
                 // is being re-tagged — the frames are gone by the time the
                 // error surfaces, so this is the only record of the failing
                 // function.
-                if (runtime.getenvSlice("KLIO_AMP_TRACE")) |w| {
+                if (runtime.envOnce("KLIO_AMP_TRACE")) |w| {
                     if (std.mem.indexOf(u8, m, w) != null) {
                         std.debug.print("[amp] body={s} fqn={s} err={s} msg={s}\n", .{ func.name, func.fqn, @tagName(std.meta.activeTag(result.err)), m });
                         dumpFrameChainForDiagAlways();
@@ -4856,6 +4992,15 @@ fn runFrameExec(
     // Resolved once: the per-instruction gates below would otherwise pay a
     // dynamic thread-local lookup each, which the compiler cannot hoist past
     // the dispatch calls between them.
+    //
+    // Re-bound to the RUNNING thread first. A frame's `tls` is captured when
+    // it is built, but a suspended coroutine resumes on whatever thread the
+    // dispatcher hands it, and the state behind this pointer — the register
+    // free-list, the receiver chain, the frame chain — is per-thread and
+    // unsynchronized. A migrated frame that kept its origin thread's pointer
+    // raced that thread's pool (an intermittent `integer overflow` from the
+    // free list's length going negative under concurrent snapshot tests).
+    frame.tls = &evtls;
     const ftls: *EvalTls = frame.tls;
     var cur = cur_in;
     var resume_idx = resume_idx_in;
@@ -4869,7 +5014,7 @@ fn runFrameExec(
     // loop reads them. `TailCallFunc` is self-recursive (same func), so `func`
     // stays current for the whole loop.
     if (func.blocks.len == 0 and !frame.module.ensureFuncBody(@constCast(func))) {
-        if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+        if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
             std.debug.print("[empty-frame] fqn={s} params={d} caller={s}\n", .{
                 func.fqn, func.params.len,
                 if (currentFrameFunc()) |cf| cf.fqn else "<none>",
@@ -5618,7 +5763,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             const b = switch (v) {
                 .Bool => |bv| !bv,
                 else => {
-                    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+                    if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
                         std.debug.print("[not-miss] in={s} kind={s} span={?any}\n", .{
                             frame.func.name, @tagName(std.meta.activeTag(v)), frame.cur_span,
                         });
@@ -5654,7 +5799,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         .GetField => |*gf| return execArmGetField(H, allocator, frame, gf, host),
         .SetField => |sf| return execArmSetField(H, allocator, frame, sf, host),
         .CompoundField => |cf| return execArmCompoundField(H, allocator, frame, cf, host),
-        .Call => |call| return execArmCall(H, allocator, frame, call, host),
+        .Call => |*call| return execArmCall(H, allocator, frame, call, host),
         .CallValue => |cv| return execArmCallValue(H, allocator, frame, cv, host),
         .CallValueWithThis => |cvt| {
             const callee_v = frame.read(cvt.callee);
@@ -5662,7 +5807,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             const arg_values = try readArgRun(allocator, frame, cvt.args, cvt.n_args);
             defer allocator.free(arg_values);
             const names = try resolveArgNames(allocator, frame.module, cvt.arg_names);
-            defer allocator.free(names);
+            defer freeArgNames(allocator, names);
             if (cvTraceOn()) {
                 std.debug.print("[cvt-instr] exact={} recv={s} n_args={d} caller={s}", .{
                     cvt.receiver_shape_exact, @tagName(std.meta.activeTag(recv)), arg_values.len, frame.func.name,
@@ -5698,7 +5843,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         },
         .CallSpread => |cs| return execArmCallSpread(H, allocator, frame, cs, host),
         .CallSuper => |csup| return execArmCallSuper(H, allocator, frame, csup, host),
-        .CallMemberOrGlobal => |cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
+        .CallMemberOrGlobal => |*cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
         .CallMember => |*cm| return execArmCallMember(H, allocator, frame, cm, host),
         .CallVirtual => |cv| return execArmCallVirtual(H, allocator, frame, cv, host),
         .CallMemberOrValue => |cmv| return execArmCallMemberOrValue(H, allocator, frame, cmv, host),
@@ -6243,7 +6388,16 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                                 std.mem.endsWith(u8, name, f.name) and
                                 name[name.len - f.name.len - 1] == '\u{1f}')) break :fast;
                         const v = f.value;
-                        if (v == .Null or v == .Delegate) break :fast;
+                        if (v == .Delegate) break :fast;
+                        // A stored slot holding NULL is a plain null unless the
+                        // property is an unset `lateinit`, whose read must
+                        // throw. Declining every null sent the commonest field
+                        // shape there is — an optional link (`next`) — down the
+                        // slow ladder on every read.
+                        if (v == .Null) {
+                            if (comptime !@hasDecl(H, "storedNullServable")) break :fast;
+                            if (!nullSiteOk(H, host, &recv, name, @constCast(&gf.null_ok))) break :fast;
+                        }
                         v.retain();
                         if (pushed_enclosing) popEnclosing();
                         try frame.write(gf.dst, v);
@@ -6467,10 +6621,26 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
                 }
                 // The low bits carry the eligible arity + 2; a positional,
                 // exact-arity call dispatches straight to the body.
-                const plan_arity = plan & 0x3FFF;
-                if (plan_arity >= 2 and plan_arity - 2 == call.n_args) {
-                    const buf = try readArgRun(allocator, frame, call.args, call.n_args);
-                    const args_list: std.ArrayList(Value) = .{ .items = buf, .capacity = buf.len };
+                const plan_arity = plan & 0x1FFF;
+                // Same-name, same-arity peers: only this SITE's scope can say
+                // whether the baked target is the one resolution picks, so ask
+                // once and keep the verdict on the instruction.
+                var ambig_ok = true;
+                if (plan & ir.FAST_CALL_AMBIG_FLAG != 0) {
+                    if (comptime @hasDecl(H, "fuseSiteBinds")) {
+                        var verdict = @atomicLoad(u8, @constCast(&call.fuse_site), .acquire);
+                        if (verdict == 0) {
+                            const cfile: ?ir.FileId = if (frame.cur_span) |sp| sp.file else null;
+                            verdict = if (host.fuseSiteBinds(frame.module, call.func, frame.func.package, cfile)) 2 else 1;
+                            @atomicStore(u8, @constCast(&call.fuse_site), verdict, .release);
+                        }
+                        ambig_ok = verdict == 2;
+                    } else {
+                        ambig_ok = false;
+                    }
+                }
+                if (ambig_ok and plan_arity >= 2 and plan_arity - 2 == call.n_args) {
+                    const args_list = try readArgList(allocator, frame, call.args, call.n_args);
                     // A receiver-carrying body: seed the caller's instance
                     // `this` as the enclosing receiver exactly as the full
                     // path below does (lexical scope for a member extension,
@@ -6524,7 +6694,7 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
     var arg_values = try readArgRun(allocator, frame, call.args, call.n_args);
     defer allocator.free(arg_values);
     var names = try resolveArgNames(allocator, frame.module, call.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     var ta: std.ArrayList([]const u8) = .empty;
     defer ta.deinit(allocator);
     for (call.type_args) |c| {
@@ -6603,7 +6773,7 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
                         const nn = try allocator.alloc(?[]const u8, names.len + 1);
                         nn[0] = null;
                         @memcpy(nn[1..], names);
-                        allocator.free(names);
+                        freeArgNames(allocator, names);
                         names = nn;
                     }
                 }
@@ -6675,7 +6845,7 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
 noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: *Frame, cv: anytype, host: *H) Allocator.Error!Step {
     dispatchBump(.call_value);
     const callee_v = frame.read(cv.callee);
-    if (runtime.getenvSlice("KLIO_TRACE_PATH") != null) {
+    if (runtime.envOnce("KLIO_TRACE_PATH") != null) {
         if (callee_v == .IrClosure) {
             std.debug.print("[cv-callee] in={s} kind=IrClosure id={d}\n", .{ frame.func.name, callee_v.IrClosure.id });
         } else {
@@ -6693,10 +6863,10 @@ noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: *Fra
     defer names_list.deinit(allocator);
     {
         const tmp = try resolveArgNames(allocator, frame.module, cv.arg_names);
-        defer allocator.free(tmp);
+        defer freeArgNames(allocator, tmp);
         try names_list.appendSlice(allocator, tmp);
     }
-    if (runtime.getenvSlice("KLIO_TRACE_PATH") != null) {
+    if (runtime.envOnce("KLIO_TRACE_PATH") != null) {
         for (arg_values_list.items, 0..) |*av, ai| {
             std.debug.print("[cv-arg] in={s} #{d} kind={s}\n", .{ frame.func.name, ai, @tagName(std.meta.activeTag(av.*)) });
         }
@@ -6785,7 +6955,7 @@ noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame: *Fr
     var effective_params: std.ArrayList(u32) = .empty;
     defer effective_params.deinit(allocator);
     const in_names = try resolveArgNames(allocator, frame.module, cs.arg_names);
-    defer allocator.free(in_names);
+    defer freeArgNames(allocator, in_names);
     for (cs.parts, 0..) |part, i| {
         const v = frame.read(part.reg);
         const name: ?[]const u8 = if (i < in_names.len) in_names[i] else null;
@@ -6905,7 +7075,7 @@ noinline fn execArmCallSuper(comptime H: type, allocator: Allocator, frame: *Fra
     const arg_values = try readArgRun(allocator, frame, csup.args, csup.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, csup.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     switch (try host.callSuper(allocator, &recv, owner_str, qual_str, name_str, arg_values, names)) {
         .ok => |rv| try frame.write(csup.dst, rv),
         .err => |e| return raiseStep(frame, e),
@@ -6942,7 +7112,7 @@ noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *F
         }
     }
     const names = try resolveArgNames(allocator, frame.module, cv.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     const prev_tl = if (cv.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
         H.setTrailingMemberCall(true)
     else
@@ -7056,7 +7226,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     const arg_values = try readArgRun(allocator, frame, cm.args, cm.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cm.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     // Keep the caller's instance `this` reachable while the
     // `recv.member(...)` dispatch resolves (the member-extension
     // visibility filter consults the chain); the callee's own
@@ -7184,7 +7354,7 @@ noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, fra
     const user_args = try readArgRun(allocator, frame, cmv.args, cmv.n_args);
     defer allocator.free(user_args);
     const names = try resolveArgNames(allocator, frame.module, cmv.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     const name_str = constStr(frame.module, cmv.name) orelse
         return raiseStep(frame, .{ .Type = "CallMemberOrValue: name not a string const" });
     var fb = frame.read(cmv.fallback);
@@ -7379,7 +7549,7 @@ noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator, fra
     const arg_values = try readArgRun(allocator, frame, cvm.args, cvm.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cvm.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     const invocable = valueInvocable(frame.module, callee_v);
     // A callable whose DECLARED params definitely refute the runtime
     // args is not the target — Kotlin resolved the call to the
@@ -7434,7 +7604,7 @@ noinline fn execArmNewInstance(comptime H: type, allocator: Allocator, frame: *F
     const arg_values = try readArgRun(allocator, frame, ni.args, ni.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, ni.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     // A bare `Inner(args)` inside a member of the enclosing
     // class is `this@Outer.Inner(args)`: pass the frame's own
     // `this` — a method's `this` param or a lambda's `this`
@@ -7991,7 +8161,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     const arg_values = try readArgRun(allocator, frame, cmg.args, cmg.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cmg.arg_names);
-    defer allocator.free(names);
+    defer freeArgNames(allocator, names);
     // A direct splice receiver (a bound `this` register) is the innermost
     // implicit receiver when present; otherwise the lambda capture slot, or —
     // when that is empty — the enclosing function's `this` *parameter*.
@@ -8114,8 +8284,52 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     // global (single candidate, no member/extension): skip the member passes.
     const func_p = @intFromPtr(frame.func);
     const cmg_skip = comptime @hasDecl(H, "cmgGlobalSkip");
-    const skip_member = cmg_skip and !is_ctor_name and !shadow_capture and
-        host.cmgGlobalSkip(func_p, &this_val, name_str, arg_values);
+    // The site's own memo answers first: a u64 compare against the receiver's
+    // class identity, with no receiver borrow and no hash of the key. The
+    // host's map stays the general answer (it survives across sites).
+    const site_key: ?struct { cls: u64, sig: u64 } = blk: {
+        if (!cmg_skip or is_ctor_name or shadow_capture) break :blk null;
+        if (this_val != .Instance) break :blk null;
+        if (comptime !@hasDecl(H, "memberSiteSig")) break :blk null;
+        const sig = host.memberSiteSig(arg_values) orelse break :blk null;
+        const cls: u64 = c: {
+            const g = this_val.Instance.borrow();
+            defer g.deinit();
+            break :c @intCast(g.get().class.identity());
+        };
+        if (cls == 0) break :blk null;
+        break :blk .{ .cls = cls, .sig = sig };
+    };
+    const site_skip = if (site_key) |k|
+        @atomicLoad(u64, @constCast(&cmg.skip_cls), .acquire) == k.cls and
+            @atomicLoad(u64, @constCast(&cmg.skip_sig), .monotonic) == k.sig
+    else
+        false;
+    const skip_member = site_skip or (cmg_skip and !is_ctor_name and !shadow_capture and
+        host.cmgGlobalSkip(func_p, &this_val, name_str, arg_values));
+    // Full replay: this site already resolved, for this receiver class and
+    // argument shape, to a plain global whose dispatch was a fused
+    // activation. Rebuild that activation and skip both the member walk and
+    // the overload ranking.
+    if (site_skip and cmg.type_args.len == 0 and argNamesAllNull(cmg.arg_names)) {
+        const claimed = @atomicLoad(u32, @constCast(&cmg.global_fid), .acquire);
+        if (claimed != 0 and flatEnabled()) {
+            const fid = FuncId.from(claimed - 1);
+            if (frame.module.funcById(fid)) |gf| {
+                if (gf.params.len == arg_values.len) {
+                    var args_list = try acquireArgsCap(allocator, arg_values.len);
+                    args_list.appendSliceAssumeCapacity(arg_values);
+                    frame.flat_call = .{
+                        .func = gf,
+                        .args = args_list,
+                        .dst = cmg.dst,
+                    };
+                    orAudit("CallMemberOrGlobal", name_str, "site_global_replay", -1, null);
+                    return .flat_call;
+                }
+            }
+        }
+    }
     var single_cand = false;
 
     if (routeTraceOn(name_str)) std.debug.print("[cmgsec] member-gate ctor={} shadow={} skip={}\n", .{ is_ctor_name, shadow_capture, skip_member });
@@ -8465,8 +8679,18 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // forever, so after one wall-capped test every later
         // `removeKnownCompositionLocked` in the same process resolved as
         // an unresolved global (the contamination cluster).
-        if (cmg_skip and single_cand and !is_ctor_name and !shadow_capture and first_real_err == null)
+        if (cmg_skip and single_cand and !is_ctor_name and !shadow_capture and first_real_err == null) {
             host.cmgGlobalRecord(func_p, &this_val, name_str, arg_values);
+            // Claim the site's own shortcut for the same verdict, under the
+            // same stability gate the host cache uses.
+            if (site_key) |k| {
+                if (dispatchCacheStable() and
+                    @cmpxchgStrong(u64, @constCast(&cmg.skip_cls), 0, k.cls, .acq_rel, .monotonic) == null)
+                {
+                    @atomicStore(u64, @constCast(&cmg.skip_sig), k.sig, .release);
+                }
+            }
+        }
         // Overloaded top-level function: select by runtime arg types
         // before falling back to the single global value baked in at
         // lower time.
@@ -8507,6 +8731,20 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         if (takeHostFlatReq()) |req0| {
             var prep = req0;
             prep.dst = cmg.dst;
+            // Claim the site's global target when this dispatch was a plain
+            // one: nothing pushed, nothing rebound, no receiver prepended.
+            if (site_key) |k| {
+                if (!is_ctor_name and !shadow_capture and first_real_err == null and
+                    cmg.type_args.len == 0 and mit_saved.items.len == 0 and
+                    prep.args.items.len == arg_values.len and
+                    prep.run_module == null and leafPlainReq(prep) and
+                    dispatchCacheStable() and
+                    @atomicLoad(u64, @constCast(&cmg.skip_cls), .acquire) == k.cls and
+                    @atomicLoad(u64, @constCast(&cmg.skip_sig), .monotonic) == k.sig)
+                {
+                    _ = @cmpxchgStrong(u32, @constCast(&cmg.global_fid), 0, prep.func.id.int() + 1, .acq_rel, .monotonic);
+                }
+            }
             frame.flat_call = prep;
             return .flat_call;
         }
@@ -8983,7 +9221,7 @@ fn samCandidateInvoke(
         }
     }
     var sam_recv = cands[ci].v;
-    if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) {
+    if (runtime.envOnce("KLIO_SAM_TRACE") != null) {
         std.debug.print("[sam-walk] name={s} nargs={d} ci={d} n={d} tags:", .{ name_str, arg_values.len, ci, cands.len });
         for (cands, 0..) |c, k| {
             const served = if (comptime @hasDecl(H, "valueCouldServeName")) host.valueCouldServeName(allocator, &c.v, name_str, arg_values.len) else false;
@@ -9225,6 +9463,18 @@ fn argNamesAllNull(names: []const ?ConstId) bool {
     return true;
 }
 
+/// A call's argument run in a carrier list. The fused static-call site hands
+/// the list straight to the activation as its params, so the carrier follows
+/// the same acquire/release discipline as every other frame buffer.
+fn readArgList(allocator: Allocator, frame: *const Frame, args_start: Reg, n: u32) Allocator.Error!std.ArrayList(Value) {
+    var list = try acquireArgsCap(allocator, n);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        list.appendAssumeCapacity(frame.read(Reg.from(args_start.int() + i)));
+    }
+    return list;
+}
+
 fn readArgRun(allocator: Allocator, frame: *const Frame, args_start: Reg, n: u32) Allocator.Error![]Value {
     const out = try allocator.alloc(Value, n);
     var i: u32 = 0;
@@ -9397,9 +9647,18 @@ inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *const V
 inline fn primitiveMemberFast(frame: *const Frame, cm: anytype) ?Value {
     if (cm.arg_names.len != 0 or cm.n_args > 1) return null;
     const recv = frame.read(cm.receiver);
-    if (recv != .Int and recv != .Long) return null;
     const nm = constStr(frame.module, cm.name) orelse return null;
-    if (cm.n_args == 0) {
+    const arg: ?Value = if (cm.n_args == 1) frame.read(Reg.from(cm.args.int())) else null;
+    return primitiveMemberOp(&recv, nm, arg);
+}
+
+/// The value-level core of `primitiveMemberFast`, shared with the frameless
+/// leaf walk: a pure function of the receiver, the member name and at most one
+/// argument, so it needs no frame at all.
+fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) ?Value {
+    const recv = recv_in.*;
+    if (recv != .Int and recv != .Long) return null;
+    if (arg_in == null) {
         const wide: i64 = switch (recv) {
             .Int => |i| i,
             .Long => |l| l,
@@ -9414,7 +9673,7 @@ inline fn primitiveMemberFast(frame: *const Frame, cm: anytype) ?Value {
         };
         return null;
     }
-    const arg = frame.read(Reg.from(cm.args.int()));
+    const arg = arg_in.?;
     // Shifts take an `Int` count on both receivers; the logical operations
     // take the receiver's own width.
     const shift: ?u6 = switch (arg) {
@@ -9459,6 +9718,17 @@ inline fn primitiveMemberFast(frame: *const Frame, cm: anytype) ?Value {
     if (std.mem.eql(u8, nm, "or")) return wrap(is_int, p.a | p.b);
     if (std.mem.eql(u8, nm, "xor")) return wrap(is_int, p.a ^ p.b);
     return null;
+}
+
+/// Whether this site may serve a NULL stored slot. Asked of the host once and
+/// kept on the instruction: it is a property of the claiming class, which the
+/// site memo has already pinned.
+inline fn nullSiteOk(comptime H: type, host: *H, recv: *const Value, name: []const u8, slot: *u8) bool {
+    const cached = @atomicLoad(u8, slot, .acquire);
+    if (cached != 0) return cached == 2;
+    const ok_now = host.storedNullServable(recv, name);
+    @atomicStore(u8, slot, if (ok_now) @as(u8, 2) else 1, .release);
+    return ok_now;
 }
 
 inline fn fastSubscript(allocator: Allocator, frame: *const Frame, cm: anytype) ?Value {
@@ -9507,12 +9777,28 @@ fn spreadItems(allocator: Allocator, v: *const Value) Allocator.Error!union(enum
 
 /// Resolve a per-call `arg_names: []?ConstId` into a parallel
 /// `[]?[]const u8`. Empty input yields an empty output. Caller frees.
+/// All-null name runs for the positional shape, which is the overwhelming
+/// majority of calls: they carry no information beyond their length, so one
+/// shared constant run serves every arity up to the bound and the per-call
+/// allocation disappears. `freeArgNames` recognizes it and frees nothing.
+const ARG_NAMES_NULL_MAX: usize = 32;
+const arg_names_null: [ARG_NAMES_NULL_MAX]?[]const u8 = @splat(null);
+
 fn resolveArgNames(allocator: Allocator, module: *const Module, names: []const ?ConstId) Allocator.Error![]?[]const u8 {
+    if (names.len <= ARG_NAMES_NULL_MAX and argNamesAllNull(names)) {
+        return @constCast(arg_names_null[0..names.len]);
+    }
     const out = try allocator.alloc(?[]const u8, names.len);
     for (names, out) |opt, *dst| {
         dst.* = if (opt) |id| constStr(module, id) else null;
     }
     return out;
+}
+
+/// Release a run from `resolveArgNames`. The shared all-null run is static.
+fn freeArgNames(allocator: Allocator, names: []?[]const u8) void {
+    if (names.len != 0 and names.ptr == @constCast(&arg_names_null).ptr) return;
+    allocator.free(names);
 }
 
 fn valueTruthy(allocator: Allocator, v: *const Value) Allocator.Error!union(enum) { ok: bool, err: EvalError } {

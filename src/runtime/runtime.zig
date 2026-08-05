@@ -33,6 +33,8 @@ pub const reclaimEnabled = objcell.reclaimEnabled;
 pub const freeScratch = objcell.freeScratch;
 pub const reclaimRequested = objcell.reclaimRequested;
 pub const getenvSlice = objcell.getenvSlice;
+pub const envOnce = objcell.envOnce;
+pub const envSetOnce = objcell.envSetOnce;
 
 /// Consolidated runtime performance configuration (`--opt` / `KLIO_OPT`): the
 /// JIT tiers and the memory backend, resolved once from a single profile.

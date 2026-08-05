@@ -968,7 +968,7 @@ fn lowerResolvedBinaryOperator(
     if (lhs.* == .Call or lhs.* == .Binary) {
         inferred_lhs_ty = try staticCallReturnTypeRef(b, lhs);
     }
-    if (runtime.getenvSlice("KLIO_HOP_TRACE") != null) {
+    if (runtime.envOnce("KLIO_HOP_TRACE") != null) {
         const lazy = argDeclTypeRefLazy(b, lhs);
         const bare: ?[]const u8 = if (lhs.* == .Path and lhs.Path.segments.len == 1)
             staticBareReceiverType(b, lhs.Path.segments[0].name)
@@ -1000,7 +1000,7 @@ fn lowerResolvedBinaryOperator(
         declared_lhs_ty,
         .{},
     );
-    if (runtime.getenvSlice("KLIO_HOP_TRACE") != null) {
+    if (runtime.envOnce("KLIO_HOP_TRACE") != null) {
         std.debug.print("[binop] {s} lhs_ty={s} member={s}\n", .{
             method,
             declared_lhs_ty.name,
@@ -1924,7 +1924,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
         }
-        if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+        if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
             if (std.mem.eql(u8, w, name0)) {
                 std.debug.print("[bare-read-pre] {s} this={} splice_recv={s} window={} in={s} own={} encl={} owner={s}\n", .{
                     name0,
@@ -1975,7 +1975,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // resolving against the runtime receiver walk (the
             // `setSpliceRecvTy` contract).
             const splice_receiver_first = b.lambda_splice_resolve == null and b.spliceRecvTy() != null;
-            if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+            if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
                 if (std.mem.eql(u8, w, name0)) {
                     std.debug.print("[bare-read] {s} in={s} known_global={} own={} encl={} splice_recv={s} owner={s}\n", .{
                         name0,
@@ -2484,9 +2484,9 @@ fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const
     // The enclosing class, else the EXTENSION RECEIVER — a bare name inside
     // `fun UByteArray.indices()` is a member of the receiver, and a top-level
     // extension has no enclosing class at all, so the search stopped there.
-    const tr = if (runtime.getenvSlice("KLIO_EXT_TRACE")) |w| std.mem.eql(u8, w, recv_name) else false;
+    const tr = if (runtime.envOnce("KLIO_EXT_TRACE")) |w| std.mem.eql(u8, w, recv_name) else false;
     const owner = b.ownerClass() orelse blk: {
-        if (std.mem.eql(u8, runtime.getenvSlice("KLIO_EXT_RECV_PROP") orelse "1", "0")) return null;
+        if (std.mem.eql(u8, runtime.envOnce("KLIO_EXT_RECV_PROP") orelse "1", "0")) return null;
         // The splice-receiver hint serves the same role inside an inline
         // extension splice, where the body's builder has no recvTy of its
         // own.
@@ -2541,7 +2541,7 @@ fn extPropDeclHead(b: *const FuncBuilder, head: []const u8, name: []const u8) ?[
 }
 
 fn extPropGetterReturn(b: *const FuncBuilder, head: []const u8, name: []const u8) ?[]const u8 {
-    const tr = if (runtime.getenvSlice("KLIO_EXT_TRACE")) |w| std.mem.eql(u8, w, name) else false;
+    const tr = if (runtime.envOnce("KLIO_EXT_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     var buf: [160]u8 = undefined;
     const gname = std.fmt.bufPrint(&buf, "__ext_get_{s}_{s}", .{ head, name }) catch return null;
     const fids = b.module.funcsBySimpleName(gname);
@@ -3006,6 +3006,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // builder's set already includes what it inherited).
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
     b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
+    if (std.c.getenv("KLIO_LAMINH") != null) std.debug.print("[laminh] produce lambda b={x} n={d}\n", .{ @intFromPtr(b) & 0xffff, b.localDeclTypeCount() });
     // Fold ACTIVE inline-splice param types into the snapshot: a nested
     // closure inside a spliced body captures the callee's parameter by
     // name (`destination.add(it)` inside `transform(element)?.let { ... }`
@@ -3142,6 +3143,7 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     }
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
     b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
+    if (std.c.getenv("KLIO_LAMINH") != null) std.debug.print("[laminh] produce anonfun b={x} n={d}\n", .{ @intFromPtr(b) & 0xffff, b.localDeclTypeCount() });
     const lowered = try lowerLambdaBodyCapturingKind(
         b.module,
         param_idents,
@@ -3299,7 +3301,7 @@ fn extensionCandidateFitsArity(b: *FuncBuilder, name: []const u8, user_arg_count
 /// receiver, each walked up its supertype chain — the member may be declared on
 /// a supertype of the receiver we are lowering against.
 fn memberHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
-    const mhtl_trace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
+    const mhtl_trace = if (runtime.envOnce("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     var roots: [2]?[]const u8 = .{ b.ownerClass(), null };
     if (b.recvTy()) |rt| roots[1] = rsplitLast(rt, '.');
     if (mhtl_trace) std.debug.print("[mhtl] {s}: owner={?s} recv_root={?s} argc={d}\n", .{ name, roots[0], roots[1], user_arg_count });
@@ -3424,7 +3426,7 @@ fn retHeadEql(a: ?[]const u8, b_in: ?[]const u8) bool {
 }
 
 fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
-    const ohtl_trace = if (runtime.getenvSlice("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
+    const ohtl_trace = if (runtime.envOnce("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     const list = b.module.func_name_index.get(name) orelse {
         if (ohtl_trace) std.debug.print("[ohtl] {s}: no func_name_index entry\n", .{name});
         return memberHostingTrailingLambda(b, name, user_arg_count);
@@ -3997,7 +3999,7 @@ fn instantiatedLambdaValueParams(
         // substitute the lambda's declared fn type through it. The bare-tp
         // guard below refuses whatever stays unsubstituted.
         engine: {
-            if (std.mem.eql(u8, runtime.getenvSlice("KLIO_ENGINE_LAMBDA") orelse "1", "0")) break :engine;
+            if (std.mem.eql(u8, runtime.envOnce("KLIO_ENGINE_LAMBDA") orelse "1", "0")) break :engine;
             const sh = shapes orelse break :engine;
             var scratch = std.heap.ArenaAllocator.init(b.allocator);
             defer scratch.deinit();
@@ -4130,7 +4132,7 @@ fn substitutionRecv(b: *FuncBuilder, declared: ?*const ir.TypeRef) ?*const ir.Ty
     if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (b.typeParamBoundRef(typeHead(head))) |ref| return ref;
     if (d.args.len != 0) return d;
-    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_SUBST_NONGEN") orelse "1", "0")) return null;
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_SUBST_NONGEN") orelse "1", "0")) return null;
     // A head-only receiver naming a NON-GENERIC class is complete: the head
     // is the whole type, so `SlotWriter.let { writer -> }` binds
     // `T := SlotWriter` exactly. Only a generic class's bare head (a `List`
@@ -4166,7 +4168,7 @@ fn argLambdaParamTypesRecv(
     recv_offset: usize,
     recv: ?*const ir.TypeRef,
 ) Allocator.Error!?[]?[]ir.TypeRef {
-    if (runtime.getenvSlice("KLIO_ALPT")) |want| {
+    if (runtime.envOnce("KLIO_ALPT")) |want| {
         if (std.mem.eql(u8, want, func.name)) {
             std.debug.print("[alpt] {s}#{d} nargs={d} nparams={d} off={d} p_last={s} p_last_args={d}\n", .{
                 func.fqn,
@@ -4370,7 +4372,7 @@ fn resolveExtensionRefTarget(
         if (ref_shapes.shapes.len == 0) return null;
         break :blk ref_shapes.shapes[1..];
     } else ref_shapes.shapes;
-    const trace_ref = if (runtime.getenvSlice("KLIO_BARE_TRACE")) |wanted|
+    const trace_ref = if (runtime.envOnce("KLIO_BARE_TRACE")) |wanted|
         std.mem.eql(u8, wanted, name.name)
     else
         false;
@@ -5081,7 +5083,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         break :gate b.module.registry.companion_singletons.contains(n);
     }) {
         const mname = callee.Member.name.name;
-        if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s} cands={d}\n", .{ mname, if (inline_state.candidatesForName(mname)) |c| c.len else 0 });
+        if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s} cands={d}\n", .{ mname, if (inline_state.candidatesForName(mname)) |c| c.len else 0 });
         const reified_ext = blk: {
             if (inlineFnAst(mname)) |f| {
                 if (f.receiver_type != null and anyReified(f.type_params)) break :blk true;
@@ -5137,7 +5139,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     if (!anyReified(cf.type_params)) continue;
                     if (!try memberOwnerOnReceiverChain(b, receiver, cf)) continue;
                     const names = inline_call.inferReifiedNamesForCall(b, cf, args, ast_arg_names, callee.Member.name.span.file.int()) orelse {
-                        if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: names=null\n", .{mname});
+                        if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: names=null\n", .{mname});
                         continue;
                     };
                     const fid = blk: {
@@ -5170,7 +5172,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         }
                         break :blk null;
                     } orelse {
-                        if (runtime.getenvSlice("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid=null\n", .{mname});
+                        if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid=null\n", .{mname});
                         continue;
                     };
                     const recv = try lowerReceiver(b, receiver);
@@ -5723,7 +5725,7 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
             }
         }
     }
-    const nlr_dbg = if (runtime.getenvSlice("KLIO_EF_TRACE")) |efw| std.mem.eql(u8, efw, nm) else false;
+    const nlr_dbg = if (runtime.envOnce("KLIO_EF_TRACE")) |efw| std.mem.eql(u8, efw, nm) else false;
     if (try inlineTargetForBareCall(b, &callee.Path.segments[0], args, inline_call_shape)) |f| {
         if (nlr_dbg) {
             const last_stmts: usize = if (args.len > 0 and args[args.len - 1] == .Lambda) args[args.len - 1].Lambda.body.stmts.len else 999;
@@ -5790,7 +5792,7 @@ fn eagerAuditOn() bool {
         var cached: ?bool = null;
     };
     if (S.cached) |v| return v;
-    const on = runtime.getenvSlice("KLIO_EAGER_AUDIT") != null;
+    const on = runtime.envOnce("KLIO_EAGER_AUDIT") != null;
     S.cached = on;
     return on;
 }
@@ -5948,7 +5950,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // its own deferral remains the fallback when the shapes cannot
             // prove a pick.
             const binds_this = !is_scoped_class and (b.hasOwnMember(nm) or member_of_recv);
-            if (runtime.getenvSlice("KLIO_BINDS_TRACE")) |w| {
+            if (runtime.envOnce("KLIO_BINDS_TRACE")) |w| {
                 if (std.mem.eql(u8, w, nm)) {
                     const c0: []const u8 = if (recv_chain) |ch| (if (ch.len != 0) ch[0] else "<empty>") else "<null>";
                     const hs_state: []const u8 = if (recv_chain) |ch| blk: {
@@ -6207,15 +6209,15 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         const bare = callee.Path.segments[0].name;
         var local_fn_inapplicable = false;
         if (b.localFnOverloads(bare)) |ovs| {
-            if (runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+            if (runtime.envOnce("KLIO_LFN_TRACE") != null)
                 std.debug.print("[lfn] {s} ovs={d}\n", .{ bare, ovs.len });
             if (try selectLocalFnOverload(b, ovs, args, ast_arg_names)) |m| {
-                if (runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+                if (runtime.envOnce("KLIO_LFN_TRACE") != null)
                     std.debug.print("[lfn] {s} selected={s} cell={} outer={}\n", .{ bare, m, b.resolve(m) != null, b.knowsOuter(m) });
                 if (try lowerSelectedLocalOverloadCall(b, bare, m, args, ast_arg_names)) |r| return r;
-            } else if (runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+            } else if (runtime.envOnce("KLIO_LFN_TRACE") != null)
                 std.debug.print("[lfn] {s} no-select\n", .{bare});
-        } else if (b.resolve(bare) != null and runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+        } else if (b.resolve(bare) != null and runtime.envOnce("KLIO_LFN_TRACE") != null)
             std.debug.print("[lfn] {s} no-registry\n", .{bare});
         // SELF-reference: a bare call to the enclosing local fn's own name
         // from inside its body — including generated nested lambdas (the
@@ -6238,7 +6240,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 args,
                 ast_arg_names,
             ));
-            if (runtime.getenvSlice("KLIO_LFN_TRACE") != null)
+            if (runtime.envOnce("KLIO_LFN_TRACE") != null)
                 std.debug.print("[lfn] {s} decls={d} inapplicable={} plain={} mangled_cell={} mangled_outer={} splice_win={}\n", .{
                     bare,
                     decls.len,
@@ -6805,7 +6807,7 @@ fn inlineTargetForBareCall(
         args.len,
         shape.last_is_lambda,
     );
-    if (runtime.getenvSlice("KLIO_EF_TRACE")) |efw| {
+    if (runtime.envOnce("KLIO_EF_TRACE")) |efw| {
         if (std.mem.eql(u8, efw, nm)) {
             const rid: i64 = switch (ires.outcome) {
                 .resolved => |fid| @intCast(fid.int()),
@@ -7010,7 +7012,7 @@ fn inlineTargetForBareCall(
     // chain keeps the splice — the innermost receiver's extension is
     // Kotlin's pick there.
     if (pick) |pf| {
-        if (runtime.getenvSlice("KLIO_INLINE_PICK")) |w| {
+        if (runtime.envOnce("KLIO_INLINE_PICK")) |w| {
             if (std.mem.eql(u8, w, nm)) std.debug.print("[ipick-tail] {s} recv={s} hasOwn={} applicable={}\n", .{ nm, if (pf.receiver_type) |rt| rt.name.name else "-", b.hasOwnMember(nm), b.ownMemberApplicable(nm, args.len) });
         }
         if (pf.receiver_type != null and b.hasOwnMember(nm) and
@@ -7277,7 +7279,7 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
         b.lambda_splice_resolve == null and b.spliceRecvTy() == null and
         b.recvTy() == null and b.ownerClass() != null and
         !anyReceiverFormedFnParam(f) and !bodyLambdaBindsThis(f) and
-        !std.mem.eql(u8, runtime.getenvSlice("KLIO_MEMBER_EXT_SPLICE") orelse "1", "0");
+        !std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_EXT_SPLICE") orelse "1", "0");
     return !recv_mismatch and
         (f.is_suspend or argLambdaHasNonlocalReturn(args) or
             inline_call.argsForwardInlineLambda(b, args) or has_reified or shadowed_by_member or
@@ -8346,7 +8348,7 @@ pub fn narrowNullCheckAll(
     out: *std.ArrayList(build.FuncBuilder.NarrowedLocal),
 ) Allocator.Error!void {
     if (cond.* == .Binary and
-        !std.mem.eql(u8, runtime.getenvSlice("KLIO_NULL_CHAIN") orelse "1", "0"))
+        !std.mem.eql(u8, runtime.envOnce("KLIO_NULL_CHAIN") orelse "1", "0"))
     {
         const op = cond.Binary.op;
         if ((truthy and op == .And) or (!truthy and op == .Or)) {
@@ -8379,9 +8381,9 @@ fn narrowNullCheck(
 }
 
 fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
-    if (runtime.getenvSlice("KLIO_VALTY_TRACE")) |w| {
+    if (runtime.envOnce("KLIO_VALTY_TRACE")) |w| {
         if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
-            std.debug.print("[valty] READ {s} decl={s}\n", .{ w, if (b.localDeclTypeRef(w)) |t| t.name else "<unset>" });
+            std.debug.print("[valty] READ {s} decl={s} b={x} fn={s} ndecl={d}\n", .{ w, if (b.localDeclTypeRef(w)) |t| t.name else "<unset>", @intFromPtr(b) & 0xffff, build.currentRealFn() orelse "-", b.localDeclTypeCount() });
         }
     }
     // The E2.1 type-head channel exists (Module.eagerTypeOf) but does
@@ -8427,7 +8429,7 @@ fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     // splice's declared parameter type. This is what separates "lowering has
     // no type" from "lowering has the wrong type", which look identical from
     // a failing test.
-    if (runtime.getenvSlice("KLIO_ARGTY_TRACE")) |w| {
+    if (runtime.envOnce("KLIO_ARGTY_TRACE")) |w| {
         if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
             if (lazy_ans) |la| {
                 std.debug.print("[argty] {s} -> {s} args={d} splice_ty={}\n", .{ w, la.name, la.args.len, b.spliceParamTy(w) != null });
@@ -8456,7 +8458,7 @@ fn typeheadAuditOn() bool {
         var cached: ?bool = null;
     };
     if (S.cached) |v| return v;
-    const on = runtime.getenvSlice("KLIO_TYPEHEAD_AUDIT") != null;
+    const on = runtime.envOnce("KLIO_TYPEHEAD_AUDIT") != null;
     S.cached = on;
     return on;
 }
@@ -8489,7 +8491,7 @@ fn headDeclaresTypeParams(b: *FuncBuilder, head: []const u8) bool {
 }
 
 pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
-    if (runtime.getenvSlice("KLIO_VALTY_TRACE")) |w| {
+    if (runtime.envOnce("KLIO_VALTY_TRACE")) |w| {
         if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
             std.debug.print("[valty] LAZY {s} decl={s} splice={} lsr={}\n", .{ w, if (b.localDeclTypeRef(w)) |t| t.name else "<unset>", b.spliceParamTy(w) != null, b.lambda_splice_resolve != null });
         }
@@ -8771,7 +8773,7 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             // the local itself.
             const prev_self = init_self_name;
             if (b.localInitNameFree(p.segments[0].name) and
-                !std.mem.eql(u8, runtime.getenvSlice("KLIO_INIT_SELF") orelse "1", "0"))
+                !std.mem.eql(u8, runtime.envOnce("KLIO_INIT_SELF") orelse "1", "0"))
                 init_self_name = p.segments[0].name;
             defer init_self_name = prev_self;
             if (argDeclTypeRefLazy(b, init)) |inferred| return inferred;
@@ -9035,7 +9037,7 @@ fn bareExtensionTarget(
     shapes: []applicability.ArgShape,
     bounds: ?[]const ir.ModuleRegistry.TypeParamBound,
 ) Allocator.Error!?ir.FuncId {
-    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_BARE_EXT") orelse "1", "0")) return null;
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_BARE_EXT") orelse "1", "0")) return null;
     const implicit_owners = try b.collectImplicitReceiverTower(
         b.allocator,
         eagerLambdaRecvHead(b),
@@ -9060,7 +9062,7 @@ fn bareExtensionTarget(
     // OUTER tower entries are the remaining candidates (`collect {}`
     // inside an operator's flow-lambda belongs to `this@drop : Flow`).
     // Derivation-side only; gated for single-binary A/B.
-    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_TOWER_EXT") orelse "1", "0")) {
+    if (!std.mem.eql(u8, runtime.envOnce("KLIO_TOWER_EXT") orelse "1", "0")) {
         const recv_head = typeHead(std.mem.trimEnd(u8, recv.name, "?"));
         for (b.implicit_receiver_tower.items) |entry| {
             if (std.mem.eql(u8, entry.head, recv_head)) continue;
@@ -9094,7 +9096,7 @@ fn stripUseSiteProjections(a: Allocator, ty: *ir.TypeRef) Allocator.Error!void {
 /// The receiver-type chain used by the `Member` and `Index` arms. Gated so the
 /// widening can be measured against the narrower answer it replaced.
 fn recvChainTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
-    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_RECV_CHAIN") orelse "1", "0")) {
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_RECV_CHAIN") orelse "1", "0")) {
         if (argDeclTypeRefLazy(b, e)) |known| return try known.clone(b.allocator);
         return staticCallReturnTypeRef(b, e);
     }
@@ -9132,6 +9134,76 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
             return out;
         }
     }
+    // Shapes that name their own type outright. Each one is exact — the cast
+    // states the type, `this` is the enclosing class, a predicate operator
+    // yields Boolean — and each was reaching the call sites below with no
+    // receiver type at all, which is what forces a runtime name walk.
+    switch (e.*) {
+        // `x as T` / `x as? T` — the cast IS the answer; `as?` carries the
+        // null the safe form can produce.
+        .As => |cast| {
+            var out = try decl_mod.loweredTypeRef(b.allocator, &cast.ty, true);
+            if (cast.safe) out.nullable = true;
+            return out;
+        },
+        // `this` (or `this@Outer`) inside a class body.
+        .This => |this_e| {
+            if (this_e.qualifier) |q| {
+                if (b.module.uniqueClassIdBySimpleName(q.name) != null) {
+                    return .{ .name = try b.allocator.dupe(u8, q.name), .nullable = false, .args = &.{} };
+                }
+                return null;
+            }
+            if (b.ownerClass()) |owner| {
+                return .{ .name = try b.allocator.dupe(u8, owner), .nullable = false, .args = &.{} };
+            }
+            return null;
+        },
+        // A conditional's type is the type its branches AGREE on. Kotlin's
+        // answer is their least upper bound, which needs the full hierarchy;
+        // this takes the exact case — every branch derives the same head —
+        // which is what a member call on the local needs and is never a
+        // widening. A branch whose type is unknown declines the whole shape.
+        .If => |iff| {
+            const else_e = iff.else_branch orelse return null;
+            const t_then = (try staticExprTypeRef(b, iff.then_branch)) orelse return null;
+            const t_else = (try staticExprTypeRef(b, else_e)) orelse return null;
+            if (!std.mem.eql(u8, t_then.name, t_else.name)) return null;
+            var out = t_then;
+            out.nullable = t_then.nullable or t_else.nullable;
+            return out;
+        },
+        .When => |whn| {
+            if (whn.branches.len == 0) return null;
+            var agreed: ?ir.TypeRef = null;
+            var nullable = false;
+            for (whn.branches) |*br| {
+                const t = (try staticExprTypeRef(b, &br.body)) orelse return null;
+                nullable = nullable or t.nullable;
+                if (agreed) |a| {
+                    if (!std.mem.eql(u8, a.name, t.name)) return null;
+                } else {
+                    agreed = t;
+                }
+            }
+            var out = agreed orelse return null;
+            out.nullable = nullable;
+            return out;
+        },
+        .Binary => |bin| switch (bin.op) {
+            .Eq, .Neq, .IdentEq, .IdentNeq, .Lt, .Le, .Gt, .Ge, .In, .NotIn, .And, .Or => {
+                return .{ .name = try b.allocator.dupe(u8, "Boolean"), .nullable = false, .args = &.{} };
+            },
+            else => {},
+        },
+        .Unary => |un| switch (un.op) {
+            .Not => return .{ .name = try b.allocator.dupe(u8, "Boolean"), .nullable = false, .args = &.{} },
+            // `-x` / `+x` keep the operand's type.
+            .Neg, .Pos => return try staticExprTypeRef(b, un.expr),
+            else => {},
+        },
+        else => {},
+    }
     return try localInitTypeRef(b, e);
 }
 
@@ -9145,7 +9217,7 @@ pub fn nullaryMemberReturnTypeRef(
     name: []const u8,
     file: span.FileId,
 ) Allocator.Error!?ir.TypeRef {
-    const trace = runtime.getenvSlice("KLIO_COMP_TRACE") != null;
+    const trace = runtime.envOnce("KLIO_COMP_TRACE") != null;
     var identity = std.mem.trimEnd(u8, recv.name, "?");
     if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
     if (identity.len == 0) return null;
@@ -9277,12 +9349,12 @@ fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.
     // the shape, and the local shadowing the call is what stopped 10,088 of
     // these from lending a type.
     const prev_self = init_self_name;
-    if (b.localInitNameFree(name) and !std.mem.eql(u8, runtime.getenvSlice("KLIO_INIT_SELF") orelse "1", "0")) init_self_name = name;
+    if (b.localInitNameFree(name) and !std.mem.eql(u8, runtime.envOnce("KLIO_INIT_SELF") orelse "1", "0")) init_self_name = name;
     defer init_self_name = prev_self;
     var derived = (try staticCallReturnTypeRef(b, init_expr)) orelse {
         if (norecvCensusOn()) {
             lm_localinit[2] += 1;
-            if (runtime.getenvSlice("KLIO_LI_NAMES") != null and init_expr.* == .Call) {
+            if (runtime.envOnce("KLIO_LI_NAMES") != null and init_expr.* == .Call) {
                 const c = init_expr.Call.callee;
                 if (c.* == .Path and c.Path.segments.len == 1) {
                     std.debug.print("[li-null] {s}\n", .{c.Path.segments[0].name});
@@ -9302,17 +9374,42 @@ fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.
     return derived;
 }
 
+/// The declared RETURN type of a call whose callee is a function-typed local
+/// or parameter. `assertIterableContentEquals(… , iterator: T.() -> Iterator<*>)`
+/// calls the parameter as `expected.iterator()`, and without this the result
+/// local carries no type at all, so every `hasNext`/`next` on it resolves by
+/// name. A lowered function type keeps its return as the LAST entry of `args`
+/// (after the optional `#suspend` marker, the optional receiver, and the
+/// parameters), which is the shape `loweredTypeRef` writes.
+fn fnTypedCalleeReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (call_expr.* != .Call) return null;
+    const callee = call_expr.Call.callee;
+    const name: []const u8 = switch (callee.*) {
+        .Path => |p| if (p.segments.len == 1) p.segments[0].name else return null,
+        .Member => |m| m.name.name,
+        else => return null,
+    };
+    if (b.resolve(name) == null) return null;
+    const ty = b.localDeclTypeRef(name) orelse return null;
+    if (!std.mem.startsWith(u8, ty.name, "Function")) return null;
+    if (ty.args.len == 0) return null;
+    const ret = ty.args[ty.args.len - 1];
+    if (ret.name.len == 0 or ret.name[0] == '#') return null;
+    return try ret.clone(b.allocator);
+}
+
 fn staticCallReturnTypeRef(
     b: *FuncBuilder,
     call_expr: *const Expr,
 ) Allocator.Error!?ir.TypeRef {
+    if (try fnTypedCalleeReturnTypeRef(b, call_expr)) |t| return t;
     if (call_expr.* == .Binary) {
         const bin = call_expr.Binary;
         const method: []const u8 = switch (bin.op) {
             .Add => "plus",
             .Sub => "minus",
             .Mul, .Div, .Rem, .Range, .RangeUntil => blk: {
-                if (std.mem.eql(u8, runtime.getenvSlice("KLIO_OPERATOR_TY") orelse "1", "0")) return null;
+                if (std.mem.eql(u8, runtime.envOnce("KLIO_OPERATOR_TY") orelse "1", "0")) return null;
                 break :blk switch (bin.op) {
                     .Mul => "times",
                     .Div => "div",
@@ -9422,7 +9519,7 @@ fn staticCallReturnTypeRef(
     // type on the container. Lowering emits it as an Index instruction, but the
     // TYPE question is the ordinary member one.
     if (call_expr.* == .Index and
-        !std.mem.eql(u8, runtime.getenvSlice("KLIO_OPERATOR_TY") orelse "1", "0"))
+        !std.mem.eql(u8, runtime.envOnce("KLIO_OPERATOR_TY") orelse "1", "0"))
     {
         const idx = call_expr.Index;
         var recv_owned = (try recvChainTypeRef(b, idx.receiver)) orelse return null;
@@ -9459,7 +9556,7 @@ fn staticCallReturnTypeRef(
     // A DIRECT constructor expression names its own type
     // (`SlotTable().also { it.write { … } }` types `it` without a local
     // in between); the guards inside decline shadowing locals/functions.
-    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_CTOR_RET") orelse "1", "0")) {
+    if (!std.mem.eql(u8, runtime.envOnce("KLIO_CTOR_RET") orelse "1", "0")) {
         if (try ctorInitTypeRef(b, call_expr)) |ctor_ty| return ctor_ty;
     }
     const call = call_expr.Call;
@@ -9548,7 +9645,7 @@ fn staticCallReturnTypeRef(
             // it could resolve to, whatever the receiver context is. Used only
             // where the receiver walk below finds nothing.
             const sole_global: ?FuncId = blk_sole: {
-                if (std.mem.eql(u8, runtime.getenvSlice("KLIO_SOLE_GLOBAL") orelse "1", "0")) break :blk_sole null;
+                if (std.mem.eql(u8, runtime.envOnce("KLIO_SOLE_GLOBAL") orelse "1", "0")) break :blk_sole null;
                 if (top_level_usable) break :blk_sole null;
                 const t = res.target orelse break :blk_sole null;
                 if (b.module.funcsBySimpleName(name.name).len != 1) break :blk_sole null;
@@ -9569,7 +9666,7 @@ fn staticCallReturnTypeRef(
             // trailing-lambda blindness) — KLIO_AGREED_RET=0 re-parks it
             // for A/B.
             const agreed_return: ?ir.TypeRef = blk_agree: {
-                if (std.mem.eql(u8, runtime.getenvSlice("KLIO_AGREED_RET") orelse "1", "0")) break :blk_agree null;
+                if (std.mem.eql(u8, runtime.envOnce("KLIO_AGREED_RET") orelse "1", "0")) break :blk_agree null;
                 if (top_level_usable) break :blk_agree null;
                 if (enclosingHasMemberNamed(b, name.name)) break :blk_agree null;
                 // A name ANY class declares as a member may be a receiver
@@ -9649,7 +9746,7 @@ fn staticCallReturnTypeRef(
                 // carries the bound's type arguments — the same substitution
                 // the `.Member` arm applies. Head-only heads keep today's
                 // path.
-                if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_TP_RECV") orelse "1", "0")) {
+                if (!std.mem.eql(u8, runtime.envOnce("KLIO_TP_RECV") orelse "1", "0")) {
                     const cur_head = typeHead(std.mem.trimEnd(u8, bare_recv.name, "?"));
                     const head_names_class = (if (std.mem.indexOfScalar(u8, cur_head, '.') != null)
                         b.module.classIdByFqn(cur_head)
@@ -9860,7 +9957,7 @@ fn staticCallReturnTypeRef(
             // needs: `M : MutableMap<in K, MutableList<T>>` makes `getOrPut`
             // return `MutableList<T>`.
             if (owner_id == null and
-                !std.mem.eql(u8, runtime.getenvSlice("KLIO_TP_RECV") orelse "1", "0"))
+                !std.mem.eql(u8, runtime.envOnce("KLIO_TP_RECV") orelse "1", "0"))
             {
                 if (b.typeParamBoundRef(head)) |bref| {
                     receiver.?.deinit(b.allocator);
@@ -10017,7 +10114,7 @@ fn staticCallReturnTypeRef(
         explicit,
         ownerParamsInScope(b, target),
     );
-    if (runtime.getenvSlice("KLIO_LAMRET_TRACE") != null and call.callee.* == .Path) {
+    if (runtime.envOnce("KLIO_LAMRET_TRACE") != null and call.callee.* == .Path) {
         std.debug.print("[lamret-inst] callee={s} inferred={s}\n", .{
             call.callee.Path.segments[0].name,
             if (inferred) |t| t.name else "<null>",
@@ -10118,7 +10215,7 @@ fn staticCallReturnTypeRef(
 /// its return type to the local it initializes.
 fn bareRetTraceFor(b: *const FuncBuilder, name: []const u8) bool {
     _ = b;
-    const want = runtime.getenvSlice("KLIO_BARERET") orelse return false;
+    const want = runtime.envOnce("KLIO_BARERET") orelse return false;
     return std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, name);
 }
 
@@ -10213,7 +10310,7 @@ fn enrichLambdaArgShapes(
     shape_set: *StaticReturnArgShapes,
 ) Allocator.Error!void {
     if (od_depth >= 3) return;
-    if (std.mem.eql(u8, runtime.getenvSlice("KLIO_LAMBDA_RET") orelse "1", "0")) return;
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_LAMBDA_RET") orelse "1", "0")) return;
     const tf = b.module.funcById(target) orelse return;
     const has_this = tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this");
     const first = @intFromBool(has_this);
@@ -10265,7 +10362,7 @@ fn enrichLambdaArgShapes(
         od_depth += 1;
         const derived = staticExprTypeRef(&nb, tail) catch null;
         od_depth -= 1;
-        if (runtime.getenvSlice("KLIO_LAMRET_TRACE") != null) {
+        if (runtime.envOnce("KLIO_LAMRET_TRACE") != null) {
             std.debug.print("[lamret] target={s} arg#{d} pty={s} tail={s} p0={s} derived={s}\n", .{
                 tf.name,                              i,                pty.name,
                 @tagName(std.meta.activeTag(tail.*)), pty.args[0].name, if (derived) |d| d.name else "<null>",
@@ -10351,7 +10448,7 @@ fn buildStaticArgShapes(
     const shapes = try buildArgShapes(b, args, arg_names);
     for (args, shapes) |*arg, *shape| {
         shape.ty = argDeclTypeRefLazy(b, arg);
-        if (runtime.getenvSlice("KLIO_VALTY_TRACE")) |w| {
+        if (runtime.envOnce("KLIO_VALTY_TRACE")) |w| {
             if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
                 std.debug.print("[valty] SHAPE {s} ty={s} in={s}\n", .{ w, if (shape.ty) |t| t.name else "<null>", build.currentRealFn() orelse "-" });
             }
@@ -10415,7 +10512,7 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
     // `kotlinx.io.Segment` at its own construction site), inverting the
     // ctor-vs-factory decision.
     const cid = b.module.classIdIndexed(name, b.self_package, callee.Path.segments[0].span.file) orelse return false;
-    if (runtime.getenvSlice("KLIO_NU_TRACE") != null and std.mem.eql(u8, name, "Density")) {
+    if (runtime.envOnce("KLIO_NU_TRACE") != null and std.mem.eql(u8, name, "Density")) {
         const abs = cid.int() < b.module.classes.items.len and b.module.classes.items[cid.int()].is_abstract;
         std.debug.print("[sbc] Density cid={d} abstract={} owner={s}\n", .{ cid.int(), abs, b.ownerClass() orelse "-" });
     }
@@ -10472,7 +10569,7 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
     // the member set, but a capitalized call to it is a constructor. Deciding
     // `false` here routes the call through `CallMemberOrGlobal`, whose runtime
     // scoring still reaches the constructor when no member actually binds.
-    if (runtime.getenvSlice("KLIO_SBC_TRACE") != null) {
+    if (runtime.envOnce("KLIO_SBC_TRACE") != null) {
         std.debug.print("[sbc] {s} owner={s} own={} encl={} nested={}\n", .{ name, b.ownerClass() orelse "-", b.hasOwnMember(name), b.hasEnclosingMember(name), classNestedInEnclosing(b, cid) });
     }
     if (enclosingHasMemberNamed(b, name) and !classNestedInEnclosing(b, cid)) return false;
@@ -10763,7 +10860,7 @@ fn lowerPathCall(
         segments[0].span.file,
     );
     defer b.allocator.free(cands);
-    if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
         if (std.mem.eql(u8, w, name0)) {
             std.debug.print("[bare-candidates] {s} file={d} count={d}\n", .{
                 name0,
@@ -10846,7 +10943,7 @@ fn lowerPathCall(
         }
         break :blk false;
     };
-    if (runtime.getenvSlice("KLIO_EF_TRACE")) |efw| {
+    if (runtime.envOnce("KLIO_EF_TRACE")) |efw| {
         if (std.mem.eql(u8, efw, name0)) std.debug.print("[efset] nlr={} nargs={d} last_lambda={} file={d}\n", .{ ctx.nonlocal_return_lambda, args.len, lastArgIsLambda(args), segments[0].span.file.int() });
     }
     const res = try resolveCallWithComposerAbi(
@@ -10861,7 +10958,7 @@ fn lowerPathCall(
     // Eager audit: where typeck recorded a pick for this call site,
     // compare it against the engine's answer. Audit-only — behavior
     // flips seam by seam once disagreement is at zero.
-    if (eagerAuditOn() and runtime.getenvSlice("KLIO_EAGER_HITS") != null) {
+    if (eagerAuditOn() and runtime.envOnce("KLIO_EAGER_HITS") != null) {
         std.debug.print("[EAGER-PROBE] '{s}' f{d}:{d}-{d} map={}\n", .{ name0, segments[0].span.file.int(), segments[0].span.start, segments[0].span.end, b.module.eager_calls != null });
     }
     var res_final = res;
@@ -10891,7 +10988,7 @@ fn lowerPathCall(
         }
         if (eagerAuditOn()) {
             const lazy: ?FuncId = res.target;
-            if (runtime.getenvSlice("KLIO_EAGER_HITS") != null) {
+            if (runtime.envOnce("KLIO_EAGER_HITS") != null) {
                 std.debug.print("[EAGER-HIT] '{s}'\n", .{name0});
             }
             if (lazy == null or lazy.?.int() != eager_fid.int()) {
@@ -10922,7 +11019,7 @@ fn lowerPathCall(
     // which overload bound (or that none did), the emit form, and the
     // receiver context the decision saw. The static complement of
     // KLIO_MISS_TRACE.
-    if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
         if (std.mem.eql(u8, w, name0) and res_final.target == null) {
             std.debug.print("[bare] {s} -> NONE recv_ty={s} encl_recv={s} pkg={s} shadowed={}\n", .{
                 name0,
@@ -10948,7 +11045,7 @@ fn lowerPathCall(
         }
     }
     if (res_final.target) |target| {
-        if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+        if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
             if (std.mem.eql(u8, w, name0)) {
                 const tfn = b.module.funcById(target);
                 const tf = if (tfn) |f| f.fqn else "?";
@@ -11123,7 +11220,7 @@ const ScopeCompleteness = enum { no, plain, tower };
 
 fn receiverScopeKind(b: *FuncBuilder) ScopeCompleteness {
     if (b.capturesThisSlot() or b.isParamThunk()) {
-        if (std.mem.eql(u8, runtime.getenvSlice("KLIO_TOWER_SCOPE") orelse "1", "0")) return .no;
+        if (std.mem.eql(u8, runtime.envOnce("KLIO_TOWER_SCOPE") orelse "1", "0")) return .no;
         return if (towerScopeComplete(b)) .tower else .no;
     }
     return if (receiverScopeCompletePlain(b)) .plain else .no;
@@ -11582,7 +11679,7 @@ fn recvheadAuditOn() bool {
         var cached: ?bool = null;
     };
     if (S.cached) |v| return v;
-    const on = runtime.getenvSlice("KLIO_RECVHEAD_AUDIT") != null;
+    const on = runtime.envOnce("KLIO_RECVHEAD_AUDIT") != null;
     S.cached = on;
     return on;
 }
@@ -11841,7 +11938,7 @@ fn selectedCallArgsForBuilder(
     if (!hasComposerArgPair(selected.names)) {
         const has_abi = selectedCallHasComposerAbi(b.module, func_id, f);
         const composer = b.resolve("$composer");
-        if (runtime.getenvSlice("KLIO_BARE_TRACE")) |w| {
+        if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
             if (std.mem.eql(u8, w, f.name)) {
                 std.debug.print(
                     "[compose-abi] {s}#{d} caller={s} has_abi={} composer={} args={d}\n",
@@ -11933,7 +12030,7 @@ fn transformSelectedComposableArgs(
         const pi = param_index orelse continue;
         occupied[pi] = true;
         const expected = f.params[pi].composable_arity orelse {
-            if (runtime.getenvSlice("KLIO_BARE_TRACE")) |want| {
+            if (runtime.envOnce("KLIO_BARE_TRACE")) |want| {
                 if (std.mem.eql(u8, want, f.name)) {
                     std.debug.print(
                         "[compose-param] {s}#{d} arg={d} param={s} composable=false\n",
@@ -11943,7 +12040,7 @@ fn transformSelectedComposableArgs(
             }
             continue;
         };
-        if (runtime.getenvSlice("KLIO_BARE_TRACE")) |want| {
+        if (runtime.envOnce("KLIO_BARE_TRACE")) |want| {
             if (std.mem.eql(u8, want, f.name)) {
                 std.debug.print(
                     "[compose-param] {s}#{d} arg={d} param={s} composable=true arity={d}\n",
@@ -11976,7 +12073,7 @@ fn transformSelectedComposableArgs(
 /// the member-vs-global walk lives in `emitMemberOrGlobal`, not here.
 fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
-    if (runtime.getenvSlice("KLIO_EMIT_TRACE") != null) {
+    if (runtime.envOnce("KLIO_EMIT_TRACE") != null) {
         const c0 = call.callee;
         if (c0.* == .Path and c0.Path.segments.len == 1 and std.mem.eql(u8, c0.Path.segments[0].name, "remember") and @intFromEnum(c0.Path.segments[0].span.file) == 0) {
             std.debug.print("[emitCall] remember -> #{d} nargs={d}\n", .{ func_id.int(), call.args.len });
@@ -12434,7 +12531,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
     defer if (lambda_param_types) |types|
         deinitArgLambdaParamTypes(b.allocator, types);
     b.pending_arg_lambda_param_types = lambda_param_types;
-    if (runtime.getenvSlice("KLIO_ADM_TRACE") != null) {
+    if (runtime.envOnce("KLIO_ADM_TRACE") != null) {
         const f0 = b.module.funcById(func_id);
         std.debug.print("[cmg-lpt] {s} fid={d} lpt={} p_last={s} p_last_args={d}\n", .{
             name0,
@@ -12557,7 +12654,7 @@ fn bareStaticRecvHead(b: *const FuncBuilder) ?[]const u8 {
     // slowdown and the ArrayDeque mis-bind were both the UNGATED consult
     // trusting an enclosing method's `this` decl through receiver-less
     // lambdas. `KLIO_THIS_NARROW=0` disables for single-binary A/B.
-    if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_THIS_NARROW") orelse "1", "0")) {
+    if (!std.mem.eql(u8, runtime.envOnce("KLIO_THIS_NARROW") orelse "1", "0")) {
         // Only a genuine NARROW counts: the entry must differ from this
         // frame's own declared receiver. A lambda with no receiver of its
         // own sees the ENCLOSING method's `this` decl through the shared
@@ -13009,7 +13106,7 @@ fn lowerImplicitThisCall(
     // Only an UNPROVEN member keeps the OrGlobal fallback below (a
     // non-callable property, an arity miss the runtime resolves to the
     // global). `KLIO_ITC_MEMBER=0` disables for single-binary A/B.
-    const itc_gate = runtime.getenvSlice("KLIO_ITC_MEMBER") orelse "1";
+    const itc_gate = runtime.envOnce("KLIO_ITC_MEMBER") orelse "1";
     const itc_on = blk: {
         if (std.mem.eql(u8, itc_gate, "0")) break :blk false;
         if (std.mem.eql(u8, itc_gate, "1")) break :blk true;
@@ -13365,7 +13462,7 @@ fn lowerUnresolvedBareCall(
     // explicit-receiver path computes. The receiver itself may be a CAPTURE
     // rather than a bound parameter, which is the case at most of these sites,
     // so materialise it through the closure's slot before asking.
-    if (runtime.getenvSlice("KLIO_CHAN")) |w| {
+    if (runtime.envOnce("KLIO_CHAN")) |w| {
         if (std.mem.eql(u8, w, name0)) {
             std.debug.print("[chan] {s} narrow={?s} hint_active={} hint={?s} splice_recv={?s} recv_ty={?s} owner={?s} lam_splice={} this_decl={?s} head={?s}\n", .{
                 name0,
@@ -13386,7 +13483,7 @@ fn lowerUnresolvedBareCall(
             if (std.mem.indexOfScalar(u8, head_name, '.') != null) break :blk head_name;
             const cid = b.module.classIdIndexed(head_name, b.self_package, callee.Path.segments[0].span.file) orelse
                 b.module.classId(head_name) orelse {
-                if (runtime.getenvSlice("KLIO_BAREARM") != null)
+                if (runtime.envOnce("KLIO_BAREARM") != null)
                     std.debug.print("[barearm-break] {s} no class id for {s}\n", .{ name0, head_name });
                 break :bare_member;
             };
@@ -13440,7 +13537,7 @@ fn lowerUnresolvedBareCall(
         else if (b.capturesThisSlot() or b.knowsOuter("this"))
             try lambda_body.resolveCapture(b, "this")
         else {
-            if (runtime.getenvSlice("KLIO_BAREARM") != null)
+            if (runtime.envOnce("KLIO_BAREARM") != null)
                 std.debug.print("[barearm-break] {s} no this reg\n", .{name0});
             break :bare_member;
         };
@@ -13493,7 +13590,7 @@ fn lowerUnresolvedBareCall(
         // through — so the call needs no runtime receiver walk. Entries
         // without a reachable label stay dynamic.
         if (bare_member != .deferred and
-            !std.mem.eql(u8, runtime.getenvSlice("KLIO_TOWER_EMIT") orelse "1", "0"))
+            !std.mem.eql(u8, runtime.envOnce("KLIO_TOWER_EMIT") orelse "1", "0"))
         {
             const inner_tail = if (std.mem.lastIndexOfScalar(u8, head_name, '.')) |i|
                 head_name[i + 1 ..]
@@ -13549,7 +13646,7 @@ fn lowerUnresolvedBareCall(
                 }
             }
         }
-        if (runtime.getenvSlice("KLIO_BAREARM") != null) {
+        if (runtime.envOnce("KLIO_BAREARM") != null) {
             var loc_buf: [256]u8 = undefined;
             const cs = callee.Path.segments[0].span;
             const loc: []const u8 = blk2: {
@@ -13648,7 +13745,7 @@ fn lowerUnresolvedBareCall(
     defer if (bare_lambda_param_types) |types|
         deinitArgLambdaParamTypes(b.allocator, types);
     b.pending_arg_lambda_param_types = bare_lambda_param_types;
-    if (runtime.getenvSlice("KLIO_ADM_TRACE") != null) {
+    if (runtime.envOnce("KLIO_ADM_TRACE") != null) {
         const f0 = if (ext_hint) |h| b.module.funcById(h) else null;
         std.debug.print("[ubc-lpt] {s} hint={?d} lpt={} p_last={s} p_last_args={d}\n", .{
             name0,
@@ -14118,7 +14215,7 @@ pub var lm_norecv: [@typeInfo(@typeInfo(ast.Expr).@"union".tag_type.?).@"enum".f
 var norecv_census: ?bool = null;
 fn norecvCensusOn() bool {
     if (norecv_census) |v| return v;
-    const v = runtime.getenvSlice("KLIO_DISPATCH_STATS") != null;
+    const v = runtime.envOnce("KLIO_DISPATCH_STATS") != null;
     norecv_census = v;
     return v;
 }
@@ -14371,7 +14468,7 @@ fn lowerResolvedMemberCall(
     if (ast_type_args.len != 0 or receiver.* == .Super) return .none;
     last_member_refuted = false;
     const ty = declared_ty orelse {
-        if (runtime.getenvSlice("KLIO_EXT_TRACE")) |wanted| {
+        if (runtime.envOnce("KLIO_EXT_TRACE")) |wanted| {
             if (std.mem.eql(u8, wanted, name.name)) {
                 std.debug.print("[member-static] {s} recv=<unknown>\n", .{name.name});
             }
@@ -14382,7 +14479,7 @@ fn lowerResolvedMemberCall(
         lm_norecv_eager[if (b.module.eagerTypeOf(receiver.span()) != null) 0 else 1] += 1;
         if (receiver.* == .Call) {
             lm_norecv_call[@intFromEnum(classifyCallReturn(b, receiver))] += 1;
-            if (runtime.getenvSlice("KLIO_NORECV_NAMES") != null) {
+            if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
                 const callee = receiver.Call.callee;
                 const cn = switch (callee.*) {
                     .Path => |cp| if (cp.segments.len != 0) cp.segments[cp.segments.len - 1].name else "?",
@@ -14398,7 +14495,7 @@ fn lowerResolvedMemberCall(
             }
         }
         if (receiver.* == .Binary) {
-            if (runtime.getenvSlice("KLIO_NORECV_NAMES") != null) {
+            if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
                 std.debug.print("[no-recv-binary] op={s} call={s} fn={s}\n", .{
                     @tagName(receiver.Binary.op),
                     name.name,
@@ -14407,7 +14504,7 @@ fn lowerResolvedMemberCall(
             }
         }
         if (receiver.* == .Member) {
-            if (runtime.getenvSlice("KLIO_NORECV_NAMES") != null) {
+            if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
                 std.debug.print("[no-recv-member] .{s} call={s} fn={s}\n", .{
                     receiver.Member.name.name,
                     name.name,
@@ -14426,7 +14523,7 @@ fn lowerResolvedMemberCall(
             else
                 .unknown;
             lm_norecv_path[@intFromEnum(which)] += 1;
-            if (runtime.getenvSlice("KLIO_NORECV_NAMES")) |want| {
+            if (runtime.envOnce("KLIO_NORECV_NAMES")) |want| {
                 if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, @tagName(which))) {
                     std.debug.print("[no-recv-name] {s} {s} owner={s} recv={s} call={s} fn={s} param={} splice={s} lam_recv={s}\n", .{
                         @tagName(which),
@@ -14450,7 +14547,7 @@ fn lowerResolvedMemberCall(
                     // terminal, so the failing channel is named instead of
                     // guessed (the self-shadow fix measured census-neutral;
                     // this finds where these sites actually die).
-                    if (runtime.getenvSlice("KLIO_NORECV_WHY")) |want| {
+                    if (runtime.envOnce("KLIO_NORECV_WHY")) |want| {
                         if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, rn)) {
                             const redo = argDeclTypeRefLazy(b, receiver);
                             const prev_self = init_self_name;
@@ -14519,7 +14616,7 @@ fn lowerResolvedMemberCall(
             // `MutableCollection<in T>` answers `MutableCollection`. Those two
             // parameters were 6,590 of the 8,702 sites in this bucket.
             if (tpb.complete or (tpb.head_only and
-                !std.mem.eql(u8, runtime.getenvSlice("KLIO_TP_HEAD") orelse "1", "0")))
+                !std.mem.eql(u8, runtime.envOnce("KLIO_TP_HEAD") orelse "1", "0")))
             {
                 var bound_identity = std.mem.trimEnd(u8, tpb.bound, "?");
                 if (std.mem.indexOfScalar(u8, bound_identity, '<')) |lt| bound_identity = bound_identity[0..lt];
@@ -14554,7 +14651,7 @@ fn lowerResolvedMemberCall(
             else
                 .simple_unknown;
             lm_noclass[@intFromEnum(k)] += 1;
-            if (runtime.getenvSlice("KLIO_NOCLASS_HEADS") != null) {
+            if (runtime.envOnce("KLIO_NOCLASS_HEADS") != null) {
                 if (b.typeParamBound(head)) |tpb| {
                     std.debug.print("[no-class-head] {s} bound={s} complete={} head_only={}\n", .{ head, tpb.bound, tpb.complete, tpb.head_only });
                 } else {
@@ -14608,7 +14705,7 @@ fn lowerResolvedMemberCall(
         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
         .receiver_type = recv_ty,
     });
-    if (runtime.getenvSlice("KLIO_EXT_TRACE")) |wanted| {
+    if (runtime.envOnce("KLIO_EXT_TRACE")) |wanted| {
         if (std.mem.eql(u8, wanted, name.name)) {
             std.debug.print(
                 "[member-static] {s} recv={s} target={?d} dispatch={s} applicable={}\n",
@@ -14663,7 +14760,7 @@ fn lowerResolvedMemberCall(
         else
             .none;
     if (norecvCensusOn() and resolved.dispatch == .deferred and resolved.target != null) {
-        if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null and promo_ext_why != .none) {
+        if (runtime.envOnce("KLIO_PROMO_NAMES") != null and promo_ext_why != .none) {
             var typed_args: usize = 0;
             for (shapes) |sh| {
                 if (sh.ty != null or sh.literal_kind != null or sh.is_lambda) typed_args += 1;
@@ -14674,7 +14771,7 @@ fn lowerResolvedMemberCall(
         }
         if (promo_blocked_by_class) {
             lm_promo[@intFromEnum(PromoBlock.receiver_not_instance)] += 1;
-            if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null) {
+            if (runtime.envOnce("KLIO_PROMO_NAMES") != null) {
                 std.debug.print("[promo-class] {s}.{s} nargs={d} why={s}\n", .{ head, name.name, args.len, @tagName(promo_ext_why) });
             }
         } else switch (promo_ext_why) {
@@ -14692,7 +14789,7 @@ fn lowerResolvedMemberCall(
     // disables for A/B).
     if (promo_ext_why != .none and !promo_blocked_by_class and
         resolved.dispatch == .deferred and resolved.target != null and
-        !std.mem.eql(u8, runtime.getenvSlice("KLIO_MEMBER_PROMO") orelse "1", "0"))
+        !std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_PROMO") orelse "1", "0"))
     {
         const owned_bounds_promo = try b.typeParamBoundsSlice();
         defer if (owned_bounds_promo) |bnd| b.allocator.free(bnd);
@@ -14704,14 +14801,14 @@ fn lowerResolvedMemberCall(
             shapes,
             owned_bounds_promo orelse &.{},
         )) {
-            if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null) {
+            if (runtime.envOnce("KLIO_PROMO_NAMES") != null) {
                 std.debug.print("[promo-proof] {s}.{s} nargs={d} PROMOTED\n", .{ head, name.name, args.len });
             }
             if (b.module.dispatchForTarget(static_owner, resolved.target.?)) |d| {
                 resolved.dispatch = d;
             }
         } else {
-            if (runtime.getenvSlice("KLIO_PROMO_NAMES") != null) {
+            if (runtime.envOnce("KLIO_PROMO_NAMES") != null) {
                 std.debug.print("[promo-proof] {s}.{s} nargs={d} HELD why={s}\n", .{ head, name.name, args.len, ir.Module.mpp_why });
             }
             // A member REFUTED by an authoritative argument is not the
@@ -14803,7 +14900,7 @@ fn lowerResolvedMemberCall(
         // member (`Result.exceptionOrNull`) rode a slot its value
         // representation could not serve.
         const vown_hold = (owner.is_value or owner.is_stub) and
-            std.mem.eql(u8, runtime.getenvSlice("KLIO_VOWN") orelse "1", "0");
+            std.mem.eql(u8, runtime.envOnce("KLIO_VOWN") orelse "1", "0");
         if (vown_hold or ast_type_args.len != 0) {
             declineNote(if (owner.is_value)
                 .virtual_owner_value
@@ -14811,7 +14908,7 @@ fn lowerResolvedMemberCall(
                 .virtual_owner_stub
             else
                 .virtual_type_args);
-            if (runtime.getenvSlice("KLIO_VABI_NAMES") != null) {
+            if (runtime.envOnce("KLIO_VABI_NAMES") != null) {
                 const t = b.module.funcById(func_id);
                 const sig = b.module.decl_sigs.get(func_id.int());
                 std.debug.print("[vabi] {s}.{s} abi={s} has_body={} nblocks={d}\n", .{
@@ -15265,7 +15362,7 @@ fn resolveExtensionCallForArgs(
             resolve_ctx,
         ).applicable;
     }
-    if (runtime.getenvSlice("KLIO_EXT_TRACE")) |wanted| {
+    if (runtime.envOnce("KLIO_EXT_TRACE")) |wanted| {
         if (std.mem.eql(u8, wanted, name.name)) {
             std.debug.print(
                 "[ext-static] {s} recv={s} owners=",
@@ -15372,7 +15469,7 @@ fn localExtensionReceiverCouldApply(
 ) Allocator.Error!bool {
     const actual = receiver_ty orelse return true;
     const overloads = b.localFnDecls(name) orelse {
-        if (runtime.getenvSlice("KLIO_ADM_TRACE") != null)
+        if (runtime.envOnce("KLIO_ADM_TRACE") != null)
             std.debug.print("[lerca] {s} no-decls actual={s} -> true\n", .{ name, actual.name });
         return true;
     };
@@ -15381,12 +15478,12 @@ fn localExtensionReceiverCouldApply(
         if (!overload.is_ext) continue;
         saw_extension = true;
         if (try localOverloadReceiverCouldApply(b, &overload, actual)) {
-            if (runtime.getenvSlice("KLIO_ADM_TRACE") != null)
+            if (runtime.envOnce("KLIO_ADM_TRACE") != null)
                 std.debug.print("[lerca] {s} ext-applies actual={s} -> true\n", .{ name, actual.name });
             return true;
         }
     }
-    if (runtime.getenvSlice("KLIO_ADM_TRACE") != null)
+    if (runtime.envOnce("KLIO_ADM_TRACE") != null)
         std.debug.print("[lerca] {s} actual={s} saw_ext={} -> {}\n", .{ name, actual.name, saw_extension, !saw_extension });
     return !saw_extension;
 }

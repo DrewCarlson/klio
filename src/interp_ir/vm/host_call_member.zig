@@ -2970,7 +2970,7 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     // `collect(action)` exactly as kotlinc binds it. A head naming no
     // registered class (a typealias of a function type) stays non-definite.
     if (isCallable(arg)) {
-        if (runtime.getenvSlice("KLIO_ADM_TRACE") != null) {
+        if (runtime.envOnce("KLIO_ADM_TRACE") != null) {
             const cg2 = self.classes.borrow();
             defer cg2.deinit();
             std.debug.print("[adm] callable-vs pn={s} orig={s} reg={}\n", .{ pn, orig, cg2.get().get(pn) != null });
@@ -3784,7 +3784,7 @@ fn recvFnPropsAny(self: *VmHost) bool {
             if (pn.len == 0) continue;
             lm |= @as(u64, 1) << @intCast(@min(pn.len, 63));
             bm |= @as(u64, 1) << @intCast(pn[0] & 63);
-            if (runtime.getenvSlice("KLIO_RFP_DUMP") != null) {
+            if (runtime.envOnce("KLIO_RFP_DUMP") != null) {
                 std.debug.print("[rfp] {s}.{s}\n", .{ e.key_ptr.a, pn });
             }
         }
@@ -4130,7 +4130,7 @@ fn prepareFlatFromFid(self: *VmHost, allocator: Allocator, receiver: *const Valu
 var vflat_trace_cached: ?bool = null;
 fn vflatTraceOn() bool {
     if (vflat_trace_cached) |b| return b;
-    const b = runtime.getenvSlice("KLIO_VFLAT_TRACE") != null;
+    const b = runtime.envOnce("KLIO_VFLAT_TRACE") != null;
     vflat_trace_cached = b;
     return b;
 }
@@ -4249,7 +4249,35 @@ fn routeTraceOn(name: []const u8) bool {
     return std.mem.eql(u8, w, name);
 }
 
+/// A resolution the intrinsic member dispatch already settled for a BUILTIN
+/// receiver, answered before the probe ladder runs.
+///
+/// `stdlibMemberDispatch` memoizes the winning intrinsic per (receiver type,
+/// name, arity-is-zero) — but it sits far down the ladder, so every
+/// `Array.copyInto` / `Int.coerceAtMost` in a loop re-walked the arms above it
+/// to reach an answer that was already known. An entry exists only for a pair
+/// whose earlier arms declined once and whose resolution was judged cacheable
+/// (no user extension shadows it), so replaying it changes nothing but the
+/// path taken. Instance receivers keep the full walk: their arms consult the
+/// class hierarchy, which the earlier method caches already cover.
+fn builtinIntrinsicReplay(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    const name_p = memberNameIdentity(self, name) orelse return null;
+    const key: root_mod.ProgramImage.MemberResolveKey = .{
+        .type_p = @intFromPtr(receiver.typeFqn().ptr),
+        .name_p = name_p,
+        .args_empty = args.len == 0,
+    };
+    const e = &tl_resolve_cache[tlResolveSlot(key)];
+    if (e.state == 2 and e.type_p == key.type_p and e.name_p == key.name_p and e.args_empty == key.args_empty) {
+        return try dispatchWithReceiver(self, allocator, e.fqn, e.func.?, receiver, args);
+    }
+    return null;
+}
+
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
+    if (receiver.* != .Instance and !strict_ext and !no_ext and static_recv == null and declared_recv == null) {
+        if (try builtinIntrinsicReplay(self, allocator, receiver, name, args)) |r| return r;
+    }
     // A property whose declared type is a RECEIVER function type
     // (`var handler: (suspend Scope.() -> Unit)?`) invoked as a call:
     // Kotlin runs the stored lambda with the owning instance as its
@@ -5351,7 +5379,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 if (std.mem.eql(u8, name, "toTypedArray")) {
                     return try dispatchWithReceiver(self, allocator, matched, f, receiver, args);
                 }
-                if (std.c.getenv("KLIO_DRAIN_TRACE") != null) {
+                if (runtime.envSetOnce("KLIO_DRAIN_TRACE")) {
                     std.debug.print("[drain] {s} on {s} caller={s} span={?any}\n", .{
                         name,
                         receiver.typeFqn(),
@@ -5776,7 +5804,7 @@ var miss_trace_init: bool = false;
 var miss_trace_val: ?[]const u8 = null;
 fn missTraceEnv() ?[]const u8 {
     if (!miss_trace_init) {
-        miss_trace_val = runtime.getenvSlice("KLIO_MISS_TRACE");
+        miss_trace_val = runtime.envOnce("KLIO_MISS_TRACE");
         miss_trace_init = true;
     }
     return miss_trace_val;
@@ -5785,7 +5813,7 @@ var nu_trace_init: bool = false;
 var nu_trace_val: ?[]const u8 = null;
 fn nuTraceEnv() ?[]const u8 {
     if (!nu_trace_init) {
-        nu_trace_val = runtime.getenvSlice("KLIO_NU_TRACE");
+        nu_trace_val = runtime.envOnce("KLIO_NU_TRACE");
         nu_trace_init = true;
     }
     return nu_trace_val;
@@ -5793,7 +5821,7 @@ fn nuTraceEnv() ?[]const u8 {
 var sam_trace_cached: ?bool = null;
 fn samTraceOn() bool {
     if (sam_trace_cached) |b| return b;
-    const b = runtime.getenvSlice("KLIO_SAM_TRACE") != null;
+    const b = runtime.envOnce("KLIO_SAM_TRACE") != null;
     sam_trace_cached = b;
     return b;
 }
@@ -7828,7 +7856,7 @@ fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
         pmg.get().pos = p + 1;
         pmg.deinit();
         iteratorSetLast(it, @intCast(p));
-        if (std.c.getenv("KLIO_ITER_TRACE") != null) {
+        if (runtime.envSetOnce("KLIO_ITER_TRACE")) {
             std.debug.print("[iter-next] kind={s}\n", .{@tagName(std.meta.activeTag(v))});
         }
         return .{ .ok = v };
@@ -9709,7 +9737,7 @@ fn virtualSlotUnlinkedDiag(
     nargs: usize,
     which: []const u8,
 ) void {
-    if (runtime.getenvSlice("KLIO_ERR_TRACE") == null) return;
+    if (runtime.envOnce("KLIO_ERR_TRACE") == null) return;
     const root = FuncId.from(slot.int());
     const mname: []const u8 = if (module.funcById(root)) |f| f.fqn else "?";
     std.debug.print(
@@ -9735,7 +9763,7 @@ fn noinstTraceOn() bool {
         var known: ?bool = null;
     };
     if (S.known) |k| return k;
-    const k = std.c.getenv("KLIO_NOINST_TRACE") != null;
+    const k = runtime.envSetOnce("KLIO_NOINST_TRACE");
     S.known = k;
     return k;
 }
@@ -9782,7 +9810,7 @@ pub fn invokeVirtualMember(
             const owner = sig.enclosing_class orelse
                 return .{ .err = .{ .Type = "virtual callable slot has no interface owner" } };
             if (sig.has_body or owner.int() >= module.classes.items.len or !module.classes.items[owner.int()].is_interface) {
-                if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+                if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
                     const mname: []const u8 = if (module.funcById(root)) |f| f.fqn else "?";
                     std.debug.print("[vcall-callable] slot={d} method={s} recv_ty={s} has_body={} nargs={d} caller={s}\n", .{
                         slot.int(),
@@ -9869,7 +9897,7 @@ pub fn invokeVirtualMember(
         if (noinst.name) |mname| {
             return callMemberNamed(self, allocator, receiver, mname, args, arg_names);
         }
-        if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+        if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
             const mg = self.module.borrow();
             defer mg.deinit();
             const module = mg.get();
@@ -10649,7 +10677,7 @@ fn instanceIntrinsicCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceM
 }
 
 fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8) Allocator.Error!?EvalResult {
-    if (std.c.getenv("KLIO_WALK_TRACE") != null) {
+    if (runtime.envSetOnce("KLIO_WALK_TRACE")) {
         std.debug.print("[ir-walk] {s} on {s} static={s}\n", .{ name, receiver.typeFqn(), static_recv orelse "-" });
     }
     runtime.prof.opRoute(9);
@@ -10952,11 +10980,16 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
     // consults for an Instance (hostHasMember, the shadow probes) is a
     // function of the class, not the individual instance. Array builders use
     // a different (no-prepend) dispatch and are excluded.
-    const cacheable = !stdlib.isArrayBuilder(name) and
-        !(try userToplevelExtNamedExists(self, allocator, receiver, name));
-    if (cacheable) {
-        const name_p = memberNameIdentity(self, name) orelse
-            return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, null);
+    // The resolution cache is keyed by exactly what decides the answer — the
+    // receiver's class (or its static type-fqn), the name, and whether the
+    // call has arguments — so it is probed FIRST. Everything that decides
+    // whether an entry may be STORED (`isArrayBuilder`, and the top-level
+    // extension probe, which borrows the module and hashes the name) is a
+    // pure function of the same inputs, so a hit already proves it; computing
+    // it ahead of the probe put a module borrow and a name-index lookup on
+    // every intrinsic member dispatch.
+    const name_p_opt = memberNameIdentity(self, name);
+    if (name_p_opt) |name_p| {
         const type_p: usize = if (receiver.* == .Instance) blk: {
             const g = receiver.Instance.borrow();
             defer g.deinit();
@@ -10993,7 +11026,9 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
             const func = entry.func orelse return null;
             return try dispatchWithReceiver(self, allocator, entry.fqn, func, receiver, args);
         }
-        return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, key);
+        const cacheable = !stdlib.isArrayBuilder(name) and
+            !(try userToplevelExtNamedExists(self, allocator, receiver, name));
+        return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, if (cacheable) key else null);
     }
     return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, null);
 }
@@ -11462,7 +11497,7 @@ fn importedPackExtShadows(self: *VmHost, allocator: Allocator, receiver: *const 
             var cached: ?bool = null;
         };
         if (S.cached) |b| break :blk b;
-        const b = runtime.getenvSlice("KLIO_SHADOW_TRACE") != null;
+        const b = runtime.envOnce("KLIO_SHADOW_TRACE") != null;
         S.cached = b;
         break :blk b;
     };
@@ -11971,7 +12006,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         }
     }
     var saw_member_ext = false;
-    if (std.c.getenv("KLIO_WALK_TRACE") != null) {
+    if (runtime.envSetOnce("KLIO_WALK_TRACE")) {
         std.debug.print("[extfb-walk] {s} on {s} strict={} static={s} keyed={}\n", .{ name, receiver.typeFqn(), strict_ext, static_recv orelse "-", cache_key != null });
     }
     const r = try extensionFnFallbackWalk(self, allocator, receiver, name, args, strict_ext, static_recv, declared_recv, cache_key, chain_key, &saw_member_ext);
@@ -12598,7 +12633,7 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
 pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *const Value, owner: []const u8) Allocator.Error!?Value {
     const entries = try ir.eval.enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
-    if (runtime.getenvSlice("KLIO_MEOI_TRACE")) |w| {
+    if (runtime.envOnce("KLIO_MEOI_TRACE")) |w| {
         if (std.mem.eql(u8, owner, w)) {
             std.debug.print("[meoi] owner={s} nentries={d}:", .{ owner, entries.len });
             for (entries) |e| {
@@ -14860,7 +14895,7 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
         }
         return .{ .ok = receiver.* };
     }
-    if (runtime.getenvSlice("KLIO_ERR_TRACE") != null) {
+    if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
         std.debug.print("[labeled-this] qualifier={s} recv={s} chain_len={d}\n", .{ qualifier, @tagName(std.meta.activeTag(receiver.*)), chain.len });
         for (chain, 0..) |cv, i| {
             const cname: []const u8 = if (cv == .Instance) blk: {

@@ -616,7 +616,7 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
         }
     }
 
-    if (runtime.getenvSlice("KLIO_DUMP_FN")) |w| {
+    if (runtime.envOnce("KLIO_DUMP_FN")) |w| {
         const dmg = self.module.borrow();
         defer dmg.deinit();
         // Accepts a numeric FuncId or a function simple name (dumps every
@@ -747,7 +747,7 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                 // means the bake dropped a field — name it, because the
                 // shared image instance cannot grow a per-VM buffer.
                 if (g.get().get(param_names.items[idx]) == null and
-                    runtime.getenvSlice("KLIO_ENUM_INIT_TRACE") != null)
+                    runtime.envOnce("KLIO_ENUM_INIT_TRACE") != null)
                 {
                     std.debug.print("[enum-init-append] class={s} entry={s} field={s}\n", .{
                         entry.class_name, entry.entry_name, param_names.items[idx],

@@ -243,6 +243,10 @@ pub const Inst = union(enum) {
         /// site just stays on the slow path.
         site_cls: u64 = 0,
         site_route: u64 = 0,
+        /// Site verdict for serving a NULL stored slot: 0 = unasked, 1 = the
+        /// property is an unset-`lateinit` shape the ladder must adjudicate,
+        /// 2 = a plain null this site may serve.
+        null_ok: u8 = 0,
     },
     /// Write a local property of a class instance.
     SetField: struct {
@@ -300,6 +304,10 @@ pub const Inst = union(enum) {
         /// re-resolution must NOT override it by the argument's runtime
         /// value type — the cast is the source's deliberate selection.
         exact: bool = false,
+        /// Site verdict for a callee whose plan carries `FAST_CALL_AMBIG_FLAG`:
+        /// 0 = unasked, 1 = the fusion must not take this call, 2 = the baked
+        /// target is what scope resolution picks here. Single-fill.
+        fuse_site: u8 = 0,
         /// The source supplied the final argument as a trailing lambda
         /// (`f(x) { … }`). Kotlin binds that lambda to the LAST
         /// parameter; a positional lambda (`f(x, { … })`) binds its own
@@ -690,6 +698,23 @@ pub const Inst = union(enum) {
         /// preserved through the deferred form so the global leg can
         /// type its dispatch (unsigned literal coercion, reified serving).
         type_args: []ConstId = &.{},
+        /// Site memo for the member-probe skip: the receiver class identity
+        /// (and argument signature) for which a previous execution of THIS
+        /// instruction found no member or extension and settled on the global
+        /// leg. A match skips the implicit-receiver walk. Single-fill under
+        /// the same benign-race convention as `CallMember`'s site route; the
+        /// host keeps an equivalent hash-keyed memo, which this shortcut
+        /// answers ahead of, without a borrow or a hash.
+        skip_cls: u64 = 0,
+        skip_sig: u64 = 0,
+        /// The global-leg target a previous execution of this instruction
+        /// resolved for `skip_cls`/`skip_sig`, stored as `FuncId + 1` (0 =
+        /// unclaimed). Claimed only for a plain positional call the overload
+        /// terminal answered with a fused activation and nothing else — no
+        /// constructor, no type arguments, no scoped rebinding, no receiver
+        /// prepended — so replaying it reproduces that dispatch exactly while
+        /// skipping the ranking.
+        global_fid: u32 = 0,
     },
     /// Write a global / top-level binding. Mirrors `LoadGlobal` for
     /// the write side: routed through `Host.store_global` so a
@@ -1023,6 +1048,12 @@ pub const FuncKind = enum {
 /// `this` as an enclosing receiver exactly as the full path does.
 pub const FAST_CALL_EXT_FLAG: u16 = 0x4000;
 
+/// `Func.fast_call` flag: the callee's simple name has same-arity peers, so
+/// only the CALL SITE can say whether the baked target is the one scope
+/// resolution picks. Eligible in every other respect; the site resolves the
+/// question once and caches the verdict on its own instruction.
+pub const FAST_CALL_AMBIG_FLAG: u16 = 0x2000;
+
 /// Whether the declaration currently LOWERING carries
 /// `@Suppress("DEPRECATION_ERROR")`: under it kotlinc restores
 /// `@Deprecated(level = ERROR)` candidates to ordinary overload ranking,
@@ -1289,6 +1320,12 @@ pub const Func = struct {
                 // A `Return` with no register is a `Unit` return — the shape
                 // of every guard helper, which is exactly what this admits.
                 .Return, .Goto, .Branch => {},
+                // A guard's FAILING arm (`if (!ok) throw ...`) never runs on
+                // the path this exists to serve. Admit it structurally and let
+                // the walk abandon if it ever lands there, the same rule the
+                // instruction set follows — otherwise every `assert`/`require`
+                // helper builds an activation to evaluate one comparison.
+                .Throw, .Unreachable => {},
                 else => return false,
             }
         }
@@ -2541,7 +2578,7 @@ pub const Module = struct {
             switch (self.staticArgCompatibility(member_fid, sh, param_ty, actual_bounds)) {
                 .incompatible => {
                     mpp_why = "member-arg-refuted";
-                    if (std.c.getenv("KLIO_PROMO_NAMES") != null) {
+                    if (runtime.envSetOnce("KLIO_PROMO_NAMES")) {
                         std.debug.print("[promo-pair] {s}.{s} param={s}<{d}> arg={s}<{d}>\n", .{
                             head,
                             name,
@@ -2608,7 +2645,7 @@ pub const Module = struct {
             }
             if (!refuted) {
                 mpp_why = "ext-unrefuted";
-                if (std.c.getenv("KLIO_PROMO_NAMES") != null) {
+                if (runtime.envSetOnce("KLIO_PROMO_NAMES")) {
                     std.debug.print("[promo-ext-alive] {s}.{s} ext={s} recv={s}\n", .{
                         head,
                         name,
@@ -2627,7 +2664,7 @@ pub const Module = struct {
             var cached: ?bool = null;
         };
         if (S.cached) |v| return v;
-        const on = std.c.getenv("KLIO_RECV_REFUTE") != null;
+        const on = runtime.envSetOnce("KLIO_RECV_REFUTE");
         S.cached = on;
         return on;
     }
@@ -4276,7 +4313,7 @@ pub const Module = struct {
         // applicable, and the wrong overload can outrank the bound's own.
         if (scoped_receiver.args.len == 0) {
             const rhead = staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?"));
-            if (std.c.getenv("KLIO_HOP_TRACE") != null) {
+            if (runtime.envSetOnce("KLIO_HOP_TRACE")) {
                 std.debug.print("[hop] {s} recv={s} nbounds={d}\n", .{ name, rhead, ctx.actual_type_param_bounds.len });
                 for (ctx.actual_type_param_bounds) |b0| {
                     std.debug.print("[hop]   {s} : {s} args={d}\n", .{ b0.param, b0.bound, b0.args.len });
@@ -4304,7 +4341,7 @@ pub const Module = struct {
         var unknown_best_tier: u8 = 255;
         // The per-call window delimiter for the rex trace: every candidate
         // row until the next rex-call row belongs to this resolution.
-        if (std.c.getenv("KLIO_REX_TRACE") != null) {
+        if (runtime.envSetOnce("KLIO_REX_TRACE")) {
             if (applicability.trace_call_span) |sp| {
                 std.debug.print("[rex-call] {s} recv={s} rargs={d} at=f{d}:{d}\n", .{ name, scoped_receiver.name, scoped_receiver.args.len, sp.file.int(), sp.start });
             } else {
@@ -4318,7 +4355,7 @@ pub const Module = struct {
             const ds = self.decl_sigs.get(fid.int());
             const kind = if (ds) |decl| decl.kind else f.kind;
             const is_member_extension = kind == .member_extension;
-            const rex_trace = std.c.getenv("KLIO_REX_TRACE") != null;
+            const rex_trace = runtime.envSetOnce("KLIO_REX_TRACE");
             if (rex_trace) std.debug.print("[rex] {s} fid={d} kind={s} enter recv={s} rargs={d}\n", .{ name, fid.int(), @tagName(kind), scoped_receiver.name, scoped_receiver.args.len });
             if ((kind != .top_level_extension and !is_member_extension) or
                 f.params.len == 0 or
@@ -4601,7 +4638,7 @@ pub const Module = struct {
                         scoped_recv_param,
                         ctx.actual_type_param_bounds,
                     ) catch return .{};
-                    if (std.c.getenv("KLIO_DISPROOF_TRACE") != null) {
+                    if (runtime.envSetOnce("KLIO_DISPROOF_TRACE")) {
                         std.debug.print("[disproof] {s} fid={d} recv={s}<{d}> param={s}<{d}> subtype={} recv_dis={} param_dis={}\n", .{
                             name,
                             fid.int(),
@@ -4779,7 +4816,7 @@ pub const Module = struct {
             if (score.ext_key.?[0] != 0 and tier < best_tier) best_tier = tier;
         }
         if (best_tier == 255) {
-            if (std.c.getenv("KLIO_REX_TRACE") != null) {
+            if (runtime.envSetOnce("KLIO_REX_TRACE")) {
                 if (applicability.trace_call_span) |sp| std.debug.print("[rex-exit] {s} no-applicable-tier at=f{d}:{d}\n", .{ name, sp.file.int(), sp.start });
             }
             return .{};
@@ -4787,7 +4824,7 @@ pub const Module = struct {
         // A same-or-inner-tier declaration whose visibility metadata is not
         // complete cannot be compared safely with the ranked set.
         if (unknown_best_tier <= best_tier) {
-            if (std.c.getenv("KLIO_REX_TRACE") != null) {
+            if (runtime.envSetOnce("KLIO_REX_TRACE")) {
                 if (applicability.trace_call_span) |sp| std.debug.print("[rex-exit] {s} unknown-tier {d}<={d} at=f{d}:{d}\n", .{ name, unknown_best_tier, best_tier, sp.file.int(), sp.start });
             }
             return .{ .applicable = true };
@@ -4818,12 +4855,12 @@ pub const Module = struct {
         var tied = false;
         for (ranked_sigs.items, ranked_ids.items, ranked_unknowns.items) |*sig, fid, unknown| {
             const maybe_score = applicability.applicable(sig, proof_args, ranked_scope);
-            if (maybe_score == null and std.c.getenv("KLIO_REX_TRACE") != null) {
+            if (maybe_score == null and runtime.envSetOnce("KLIO_REX_TRACE")) {
                 if (applicability.trace_call_span) |sp| std.debug.print("[rex-key] {s} fid={d} DISQUALIFIED at=f{d}:{d}\n", .{ name, fid.int(), sp.file.int(), sp.start });
             }
             const score = maybe_score orelse continue;
             const key = score.ext_key.?;
-            if (std.c.getenv("KLIO_REX_TRACE") != null) {
+            if (runtime.envSetOnce("KLIO_REX_TRACE")) {
                 if (applicability.trace_call_span) |sp| {
                     std.debug.print("[rex-key] {s} fid={d} key={any} low={} unknown={} at=f{d}:{d}\n", .{ name, fid.int(), key, score.low_priority, unknown, sp.file.int(), sp.start });
                 } else {
@@ -5659,7 +5696,7 @@ pub const Module = struct {
                         break :blk_m false;
                     };
     if (mentions) {
-                        if (std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0")) return null;
+                        if (std.mem.eql(u8, runtime.envOnce("KLIO_STAR_RET") orelse "1", "0")) return null;
                         for (owner_class.type_params) |param| {
                             try bindings.append(a, .{
                                 .name = try classTypeParamIdentity(a, owner, param),
@@ -5673,7 +5710,7 @@ pub const Module = struct {
                 }
             }
         }
-        if (std.c.getenv("KLIO_ICRT") != null) {
+        if (runtime.envSetOnce("KLIO_ICRT")) {
             std.debug.print("[icrt] fn={s} ret={s} ret_args={d} decl_sig={} kind={s} owner={} owner_tps={d} fn_tps={d} bindings={d}\n", .{
                 f.fqn,
                 f.return_ty.name,
@@ -5686,7 +5723,7 @@ pub const Module = struct {
                 bindings.items.len,
             });
         }
-        if (std.c.getenv("KLIO_ICRT") != null) {
+        if (runtime.envSetOnce("KLIO_ICRT")) {
             if (f.return_ty.args.len != 0) std.debug.print("[icrt2] {s} arg0={s}\n", .{ f.fqn, f.return_ty.args[0].name });
             if (owner_id) |o| {
                 if (o.int() < self.classes.items.len) {
@@ -5721,7 +5758,7 @@ pub const Module = struct {
                     0,
                 )) {
                     if (actual_receiver.args.len != 0 or
-                        std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0"))
+                        std.mem.eql(u8, runtime.envOnce("KLIO_STAR_RET") orelse "1", "0"))
                         return null;
                 }
             }
@@ -5814,7 +5851,7 @@ pub const Module = struct {
         // is applicability-neutral downstream. A hard bind CONFLICT still
         // refused above; this only covers absence. A result erased to a bare
         // `*` head is refused below as before.
-        if (!std.mem.eql(u8, runtime.getenvSlice("KLIO_STAR_RET") orelse "1", "0")) {
+        if (!std.mem.eql(u8, runtime.envOnce("KLIO_STAR_RET") orelse "1", "0")) {
             for (function_type_params) |tp| {
                 var bound = false;
                 for (bindings.items) |bd| {
@@ -5865,17 +5902,17 @@ pub const Module = struct {
         const bindings_items = solved.bindings;
         const type_params = solved.type_params;
         if (!returnTypeBindingsComplete(f.return_ty, type_params, bindings_items)) {
-            if (std.c.getenv("KLIO_ICRT") != null) std.debug.print("[icrt] {s}: bindings incomplete\n", .{f.fqn});
+            if (runtime.envSetOnce("KLIO_ICRT")) std.debug.print("[icrt] {s}: bindings incomplete\n", .{f.fqn});
             return null;
         }
         const substituted = try substituteType(a, f.return_ty, bindings_items);
         // A return erased to a bare `*` head names nothing a caller can bind
         // against; it would only pollute the local's declared-type record.
         if (std.mem.eql(u8, staticTypeHead(substituted.name), "*")) {
-            if (std.c.getenv("KLIO_ICRT") != null) std.debug.print("[icrt] {s}: star head\n", .{f.fqn});
+            if (runtime.envSetOnce("KLIO_ICRT")) std.debug.print("[icrt] {s}: star head\n", .{f.fqn});
             return null;
         }
-        if (std.c.getenv("KLIO_ICRT") != null) std.debug.print("[icrt] {s}: OK -> {s}\n", .{ f.fqn, substituted.name });
+        if (runtime.envSetOnce("KLIO_ICRT")) std.debug.print("[icrt] {s}: OK -> {s}\n", .{ f.fqn, substituted.name });
         return try substituted.clone(allocator);
     }
 
@@ -6041,7 +6078,7 @@ pub const Module = struct {
             var known: ?bool = null;
         };
         if (S.known) |k| return k;
-        const k = std.c.getenv("KLIO_OVERRIDES_TRACE") != null;
+        const k = runtime.envSetOnce("KLIO_OVERRIDES_TRACE");
         S.known = k;
         return k;
     }
@@ -6931,7 +6968,7 @@ pub const Module = struct {
         const ec = &(self.eager_calls orelse return null);
         const decl = ec.get(callee_span) orelse return null;
         const got = self.funcByDeclSpan(decl);
-        if (got == null and std.c.getenv("KLIO_EAGER_HITS") != null) {
+        if (got == null and runtime.envSetOnce("KLIO_EAGER_HITS")) {
             const n: usize = if (self.func_by_decl_span) |m| m.count() else 0;
             std.debug.print("[EAGER-MISS2] decl f{d}:{d}-{d} not lowered (map n={d})\n", .{ decl.file.int(), decl.start, decl.end, n });
         }
@@ -8219,7 +8256,7 @@ pub const Module = struct {
     /// type-parameter, function-type, or unresolvable receiver head keeps
     /// the candidate.
     fn extReceiverPlausible(self: *const Module, id: FuncId, f: *const Func, owner: ?[]const u8) bool {
-        const dbg = if (runtime.getenvSlice("KLIO_EXT_TRACE")) |w| std.mem.eql(u8, w, f.name) else false;
+        const dbg = if (runtime.envOnce("KLIO_EXT_TRACE")) |w| std.mem.eql(u8, w, f.name) else false;
         if (dbg) std.debug.print("[extplaus] fid={d} fqn={s} recv_ty={s} owner={?s}\n", .{ id.int(), f.fqn, if (f.params.len != 0) f.params[0].ty.name else "-", owner });
         if (f.params.len == 0) return true;
         var head = applicability.simpleName(f.params[0].ty.name);
@@ -8497,7 +8534,7 @@ pub const Module = struct {
             var known: ?bool = null;
         };
         if (S.known) |k| return k;
-        const k = std.c.getenv("KLIO_BCC_WHY") != null;
+        const k = runtime.envSetOnce("KLIO_BCC_WHY");
         S.known = k;
         return k;
     }
@@ -8831,7 +8868,7 @@ pub const Module = struct {
             else
                 self.lowestVisibleTier(name, candidates, caller_pkg, caller_file);
         }
-        if (runtime.getenvSlice("KLIO_EXT_TRACE")) |w| {
+        if (runtime.envOnce("KLIO_EXT_TRACE")) |w| {
             if (std.mem.eql(u8, w, name)) std.debug.print(
                 "[rescall] {s} target={?d} recv_match={} recv_applicable={} tier={d} owner={?s}\n",
                 .{
@@ -9249,7 +9286,7 @@ pub const Module = struct {
             const static_ok = cast_static or ctx.has_type_args or
                 (ctx.nonlocal_return_lambda and self.funcIsInline(t));
             const shadow = ctx.in_receiver_context and member_shadowable and !static_ok;
-            if (runtime.getenvSlice("KLIO_EF_TRACE")) |w| {
+            if (runtime.envOnce("KLIO_EF_TRACE")) |w| {
                 if (std.mem.eql(u8, w, name)) std.debug.print("[ef] {s} t={d} inline={} nlr={} recvctx={} shadowable={} shadow={} file={d}\n", .{ name, t.int(), self.funcIsInline(t), ctx.nonlocal_return_lambda, ctx.in_receiver_context, member_shadowable, shadow, caller_file.int() });
             }
             if (!shadow) {
