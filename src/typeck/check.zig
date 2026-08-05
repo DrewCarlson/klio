@@ -94,6 +94,10 @@ pub const TypeCheck = struct {
     resolved_calls: std.AutoHashMap(Span, ResolvedCall),
     lambda_recv_heads: std.AutoHashMap(Span, []const u8),
     lambda_param_shapes: std.AutoHashMap(Span, ParamShape),
+    /// Expression span -> the user-class name the checker determined. A plain
+    /// user class is `Type.Unresolved` here, so this is where a receiver's
+    /// class identity actually lives.
+    expr_class: std.AutoHashMap(Span, []const u8),
 
     /// Look up the type assigned to an expression by span.
     pub fn typeOf(self: *const TypeCheck, sp: Span) ?*const Type {
@@ -140,6 +144,7 @@ pub fn typecheck(
         .resolved_calls = tc.resolved_calls,
         .lambda_recv_heads = tc.lambda_recv_heads,
         .lambda_param_shapes = tc.lambda_param_shapes,
+        .expr_class = tc.expr_class,
     };
 }
 
@@ -263,6 +268,7 @@ pub fn typecheckModule(
         .resolved_calls = tc.resolved_calls,
         .lambda_recv_heads = tc.lambda_recv_heads,
         .lambda_param_shapes = tc.lambda_param_shapes,
+        .expr_class = tc.expr_class,
     };
 }
 

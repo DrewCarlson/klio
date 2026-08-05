@@ -855,7 +855,22 @@ pub fn computeEagerCalls(
         tout.put(e.key_ptr.*, head) catch continue;
         tn += 1;
     }
-    if (audit) std.debug.print("[EAGER] {d} type heads recorded ({d} excluded as instantiation-dependent)\n", .{ tn, tc.types_instantiation_dependent.count() });
+    // The checker's CLASS evidence, folded into the same channel: a plain
+    // user class is `Type.Unresolved` there, so `tc.types` cannot carry it,
+    // and `expr_class` is where a receiver's class identity lives. Heads the
+    // lowering module cannot resolve are dropped on READ (`eagerTypeOf`), so
+    // an unresolvable name costs nothing rather than displacing a virtual
+    // bind.
+    var cn_added: usize = 0;
+    {
+        var cit = tc.expr_class.iterator();
+        while (cit.next()) |e| {
+            if (tout.contains(e.key_ptr.*)) continue;
+            tout.put(e.key_ptr.*, .{ .name = e.value_ptr.*, .nullable = false }) catch continue;
+            cn_added += 1;
+        }
+    }
+    if (audit) std.debug.print("[EAGER] {d} type heads recorded ({d} excluded as instantiation-dependent, {d} from class evidence)\n", .{ tn + cn_added, tc.types_instantiation_dependent.count(), cn_added });
     ir.pending_eager_types = tout;
     var rout = std.AutoHashMap(span_mod.Span, []const u8).init(gpa);
     var rit = tc.lambda_recv_heads.iterator();

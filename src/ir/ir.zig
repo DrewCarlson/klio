@@ -12,6 +12,7 @@ const span = @import("span");
 const ast = @import("ast");
 const runtime = @import("runtime");
 const applicability = @import("applicability");
+const types_mod = @import("types");
 const FF = runtime.forest.ForestField;
 
 const Allocator = std.mem.Allocator;
@@ -6791,10 +6792,28 @@ pub const Module = struct {
         if (self.eager_calls) |*old_m| old_m.deinit();
         self.eager_calls = m;
     }
-    /// Typeck's static type head for the expression at `sp`, if recorded.
+    /// Typeck's static type head for the expression at `sp`, if recorded AND
+    /// resolvable here.
+    ///
+    /// The checker names classes by their SOURCE simple name; lowering knows
+    /// them under file-scoped mangles and package-qualified spellings. A head
+    /// this module cannot resolve is worse than no head at all — it displaces
+    /// a virtual bind that would have succeeded and lands the site in
+    /// `no_class_id` (measured: 550 sites, campaign addendum 61). Builtin
+    /// heads carry no class id by design and pass through.
     pub fn eagerTypeOf(self: *const Module, sp: span.Span) ?EagerTypeHead {
         const et = &(self.eager_types orelse return null);
-        return et.get(sp);
+        const head = et.get(sp) orelse return null;
+        var h = std.mem.trimEnd(u8, head.name, "?");
+        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+        if (h.len == 0) return null;
+        if (types_mod.builtinByName(h) != null or applicability.builtinSupersOf(h).len != 0) return head;
+        if (std.mem.indexOfScalar(u8, h, '.') != null) {
+            if (self.classIdByFqn(h) != null) return head;
+            return null;
+        }
+        if (self.uniqueClassIdBySimpleName(h) != null) return head;
+        return null;
     }
     /// The declared shape of the fn-typed lambda param declared at `sp`.
     /// RETIRED as a consumer, deliberately. The recording side is kept for
