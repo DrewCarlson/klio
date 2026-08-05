@@ -355,7 +355,7 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             // enclosing class, `!x` is Boolean and `-x` keeps its operand's
             // type. Each of these left the local untyped, so every member call
             // on it had to resolve by name at run time.
-            .Unary => {
+            .Unary, .If, .When => {
                 if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
                     const was_nullable = ct.nullable;
                     try b.setLocalDeclTypeOwned(p.name.name, ct);

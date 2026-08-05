@@ -9157,6 +9157,37 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
             }
             return null;
         },
+        // A conditional's type is the type its branches AGREE on. Kotlin's
+        // answer is their least upper bound, which needs the full hierarchy;
+        // this takes the exact case — every branch derives the same head —
+        // which is what a member call on the local needs and is never a
+        // widening. A branch whose type is unknown declines the whole shape.
+        .If => |iff| {
+            const else_e = iff.else_branch orelse return null;
+            const t_then = (try staticExprTypeRef(b, iff.then_branch)) orelse return null;
+            const t_else = (try staticExprTypeRef(b, else_e)) orelse return null;
+            if (!std.mem.eql(u8, t_then.name, t_else.name)) return null;
+            var out = t_then;
+            out.nullable = t_then.nullable or t_else.nullable;
+            return out;
+        },
+        .When => |whn| {
+            if (whn.branches.len == 0) return null;
+            var agreed: ?ir.TypeRef = null;
+            var nullable = false;
+            for (whn.branches) |*br| {
+                const t = (try staticExprTypeRef(b, &br.body)) orelse return null;
+                nullable = nullable or t.nullable;
+                if (agreed) |a| {
+                    if (!std.mem.eql(u8, a.name, t.name)) return null;
+                } else {
+                    agreed = t;
+                }
+            }
+            var out = agreed orelse return null;
+            out.nullable = nullable;
+            return out;
+        },
         .Binary => |bin| switch (bin.op) {
             .Eq, .Neq, .IdentEq, .IdentNeq, .Lt, .Le, .Gt, .Ge, .In, .NotIn, .And, .Or => {
                 return .{ .name = try b.allocator.dupe(u8, "Boolean"), .nullable = false, .args = &.{} };
