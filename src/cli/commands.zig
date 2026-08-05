@@ -974,6 +974,8 @@ pub fn runBuiltModuleArgs(
     runtime.prof.maybeStart();
     const res = runMainBigStack(&vm, main, stdout.output());
     runtime.prof.maybeReport();
+    ir.eval.callStatsDump();
+    ir.eval.dispatchStatsDump();
     // The dispatch census is reported for `run` as well as for `test`. The two
     // answer different questions: the stdlib's own tests are generic
     // throughout, so a change that reads a CONCRETE element type measures as

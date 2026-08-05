@@ -1086,6 +1086,26 @@ fn topPropReadKey(self: *VmHost, name: []const u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "__klio_topfield__{s}", .{name}) catch name;
 }
 
+/// A leaf serve's global read: the already-bound value under the effective
+/// storage key, immediate scalars only. No initializer, singleton gate, or
+/// delegate is driven — any name whose read would need one misses here and
+/// the serve abandons to the frame path, which drives it exactly once.
+/// A custom-getter property has no plain binding, so it misses naturally.
+pub fn leafGlobalGet(self: *VmHost, name_in: []const u8) ?Value {
+    var buf: [256]u8 = undefined;
+    const name = topPropReadKey(self, name_in, &buf);
+    const cached: ?Value = blk: {
+        const g = self.globals.borrow();
+        defer g.deinit();
+        break :blk g.get().lookup(name);
+    };
+    const v = cached orelse return null;
+    return switch (v) {
+        .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Bool, .Char => v,
+        else => null,
+    };
+}
+
 /// Whether a bare simple-name global-fn pick is visible from the
 /// executing reference site (frame package + current statement's file).
 /// No frame context, or a candidate without package metadata, keeps the

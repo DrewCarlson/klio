@@ -1303,10 +1303,10 @@ pub const Func = struct {
 /// stack array, so both the register count and the body length are capped;
 /// the block bound keeps a guard-shaped body admissible without admitting
 /// real control flow, and `LEAF_MAX_STEPS` bounds the walk itself.
-pub const LEAF_MAX_REGS: u32 = 16;
-pub const LEAF_MAX_INSTS: usize = 32;
-pub const LEAF_MAX_BLOCKS: usize = 8;
-pub const LEAF_MAX_STEPS: usize = 64;
+pub const LEAF_MAX_REGS: u32 = 64;
+pub const LEAF_MAX_INSTS: usize = 96;
+pub const LEAF_MAX_BLOCKS: usize = 32;
+pub const LEAF_MAX_STEPS: usize = 160;
 
 pub const Param = struct {
     name: []const u8,
