@@ -485,9 +485,9 @@ fn evalThunk(self: *VmHost, func: *const ir.Func, args: []const Value) Allocator
     defer module_ref.deinit();
     const mg = module_ref.borrow();
     defer mg.deinit();
-    var args_list: std.ArrayList(Value) = .empty;
-    errdefer args_list.deinit(self.allocator);
-    try args_list.appendSlice(self.allocator, args);
+    var args_list = try ir.eval.acquireArgsCap(self.allocator, args.len);
+    errdefer ir.eval.releaseArgs(self.allocator, &args_list);
+    if (args_list.capacity >= args.len) args_list.appendSliceAssumeCapacity(args) else try args_list.appendSlice(self.allocator, args);
     vmhost.emitPath(self.allocator, "ctor_thunk", func.fqn, func.id, null, args);
     // Ownership of `args_list` transfers into `evalWith`: the frame adopts
     // it as its `params` backing and frees it on `frame.deinit()`.
