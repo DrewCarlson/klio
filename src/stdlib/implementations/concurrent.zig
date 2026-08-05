@@ -93,15 +93,18 @@ pub fn monitorEnter(key: usize) std.mem.Allocator.Error!bool {
             mon.mutex.unlock();
             if (runtime.shouldAbandon()) return false;
             rounds +|= 1;
-            if (rounds <= 64) {
+            if (rounds <= 512) {
+                // A snapshot-write critical section runs a few microseconds
+                // of interpreted code; 64 hints (~sub-µs) never bridged one,
+                // so every contended handoff fell to the 100µs park — the
+                // concurrent snapshot tests spent >90% of their wall in
+                // exactly that dead time. ~512 hints spans the common
+                // section; the sleep tail still guards long holds from
+                // saturating cores.
                 std.atomic.spinLoopHint();
-            } else if (rounds <= 256) {
+            } else if (rounds <= 4096) {
                 std.Thread.yield() catch {};
-            } else if (rounds <= 2048) {
-                // Short monitor sections release within microseconds; a
-                // 100µs park keeps the handoff latency an order of
-                // magnitude under the old 1ms cadence without the pure
-                // spin/yield saturation the long tail below guards.
+            } else if (rounds <= 8192) {
                 runtime.clockSleepMicros(100);
             } else {
                 runtime.clockSleepMillis(1);

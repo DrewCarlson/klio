@@ -1195,6 +1195,19 @@ const SuperRef = struct { name: []const u8, fqn: ?[]const u8 };
 fn firstNonInterfaceSuper(self: *VmHost, def: ObjRef(ClassDef)) ?SuperRef {
     const dg = def.borrow();
     defer dg.deinit();
+    // Single-fill memo: the answer is a pure function of the (immutable)
+    // class graph, and this runs on every instance construction.
+    switch (@atomicLoad(u8, @constCast(&dg.get().first_super_state), .acquire)) {
+        1 => return null,
+        2 => {
+            const idx = dg.get().first_super_index;
+            return .{
+                .name = dg.get().supertype_names[idx],
+                .fqn = dg.get().first_super_fqn,
+            };
+        },
+        else => {},
+    }
     const child_fqn = dg.get().fqn;
     const child_name = dg.get().name;
     const paths = dg.get().supertype_paths;
@@ -1206,10 +1219,20 @@ fn firstNonInterfaceSuper(self: *VmHost, def: ObjRef(ClassDef)) ?SuperRef {
             const sfqn = classDefFqn(s);
             s.deinit();
             if (is_iface) continue;
+            if (i <= 255) {
+                const d = @constCast(dg.get());
+                d.first_super_index = @intCast(i);
+                d.first_super_fqn = sfqn;
+                @atomicStore(u8, &d.first_super_state, 2, .release);
+            }
             return .{ .name = n, .fqn = sfqn };
         }
+        // NOT memoized: the runtime class table can still grow, and a
+        // parent that registers later must be found by the next call.
         return .{ .name = n, .fqn = null };
     }
+    // Every supertype resolved and none was a class: stable — memoize.
+    @atomicStore(u8, &@constCast(dg.get()).first_super_state, 1, .release);
     return null;
 }
 

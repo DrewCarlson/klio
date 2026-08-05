@@ -759,7 +759,7 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
             if (cb(scope.ctx.?, fid, param_ty)) return 5;
         }
     }
-    if (std.c.getenv("KLIO_SCORE_TRACE") != null) {
+    if (scoreTraceOn()) {
         std.debug.print("[score-null] param={s} v_ty={s} arg_ty={s} fid={?d}\n", .{
             nm,
             v_ty,
@@ -768,6 +768,14 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
         });
     }
     return null;
+}
+
+var score_trace_cached: ?bool = null;
+fn scoreTraceOn() bool {
+    if (score_trace_cached) |b| return b;
+    const b = std.c.getenv("KLIO_SCORE_TRACE") != null;
+    score_trace_cached = b;
+    return b;
 }
 
 /// Source position of the extension call currently being scored. DIAGNOSTIC
@@ -844,7 +852,7 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
     if (scope.member) return applicableMember(sig, args, scope);
 
     const params = sig.params;
-    const strace = std.c.getenv("KLIO_SCORE_TRACE") != null;
+    const strace = scoreTraceOn();
 
     // A bodyless `expect` / native / abstract stub is never selectable.
     if (!sig.has_body) {

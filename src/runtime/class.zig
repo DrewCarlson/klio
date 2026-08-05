@@ -114,6 +114,17 @@ pub const ClassDef = struct {
     /// same-simple-name class (a nested class of another owner) can shadow it.
     is_local_runtime: bool = false,
 
+    /// Single-fill memo for the ctor chain's first non-interface supertype
+    /// (`host_instances.firstNonInterfaceSuper`): the per-call string
+    /// resolution of every supertype name priced every instance
+    /// construction. 0 = uncomputed, 1 = none, 2 = filled with
+    /// `first_super_index` (into `supertype_names`) and `first_super_fqn`
+    /// (the resolved def's fqn, null for a builtin parent with no runtime
+    /// def). Benign-race: concurrent fillers compute identical values.
+    first_super_state: u8 = 0,
+    first_super_index: u8 = 0,
+    first_super_fqn: ?[]const u8 = null,
+
     /// One eager enum entry: its name and the `Value::Instance` for it.
     pub const EnumEntry = struct { name: []const u8, value: Value };
     /// One nested class binding: simple name -> resolved `ClassDef`.

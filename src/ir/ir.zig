@@ -3854,6 +3854,30 @@ pub const Module = struct {
     /// between the last positional arg and the final parameter — all carry
     /// defaults. Kotlin fills that gap from defaults only; mapping across
     /// an undefaulted middle fabricates an applicability kotlinc rejects.
+    fn bargTraceEnv() ?[]const u8 {
+        const S = struct {
+            var cached: bool = false;
+            var val: ?[]const u8 = null;
+        };
+        if (!S.cached) {
+            S.val = if (std.c.getenv("KLIO_BARG_TRACE")) |w| std.mem.span(w) else null;
+            S.cached = true;
+        }
+        return S.val;
+    }
+
+    fn dropTraceEnv() ?[]const u8 {
+        const S = struct {
+            var cached: bool = false;
+            var val: ?[]const u8 = null;
+        };
+        if (!S.cached) {
+            S.val = if (std.c.getenv("KLIO_DROP_TRACE")) |w| std.mem.span(w) else null;
+            S.cached = true;
+        }
+        return S.val;
+    }
+
     fn trailingGapDefaulted(params: []const Param, n_args: usize) bool {
         if (n_args == 0 or n_args > params.len) return true;
         var i = n_args - 1;
@@ -8326,9 +8350,9 @@ pub const Module = struct {
                 param_ty,
                 actual_bounds,
             );
-            if (std.c.getenv("KLIO_BARG_TRACE")) |w| {
+            if (bargTraceEnv()) |w| {
                 if (self.funcById(fid)) |bf| {
-                    if (std.mem.eql(u8, std.mem.span(w), bf.name)) {
+                    if (std.mem.eql(u8, w, bf.name)) {
                         std.debug.print("[barg] {s}#{d} arg{d} param={s} arg_ty={s} lam={} -> {s} route={s}\n", .{
                             bf.name,
                             fid.int(),
@@ -8375,8 +8399,8 @@ pub const Module = struct {
         };
         var best = ApplicableBarePick{};
         const drop_trace = blk: {
-            const w = std.c.getenv("KLIO_DROP_TRACE") orelse break :blk false;
-            break :blk std.mem.eql(u8, std.mem.span(w), name);
+            const w = dropTraceEnv() orelse break :blk false;
+            break :blk std.mem.eql(u8, w, name);
         };
         for (candidates) |id| {
             const f = self.funcById(id) orelse continue;
