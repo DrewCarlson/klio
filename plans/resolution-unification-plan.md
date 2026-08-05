@@ -388,6 +388,24 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
   pack declarations, resolves 45% of member calls' receiver classes, and the
   channel records 2,159 resolutions — when the image is not used.
 
+  BUILD ATTEMPT (2026-08-06), measured NEUTRAL and reverted. The slice: a
+  `types.ExternDecls` channel the image loader publishes from the module it
+  already carries (every class simple name; every unambiguous top-level
+  function's return-class head), consumed once by `typecheckModule` into
+  `classes` + a new `extern_fn_return_class`, and read by `checkCall` when
+  `fns` misses. It published 1,370 classes and 523 return classes, and moved
+  `member_with_class` by ZERO on every probe (`iter2` 4->4, `numprom` 5->5,
+  the pack factory still 0).
+
+  Where it stops: `mutableStateMapOf` is absent from `fns` (confirmed), its
+  two overloads share the return head `SnapshotStateMap`, and that class is
+  among the published 1,370 — yet the site still does not record. So the
+  remaining gap is inside the consumption path, not the publication: either
+  the IR's `return_ty.name` for these functions is not the bare head the
+  match assumes (a mangle or an empty generic head), or the local's class
+  is taken from a channel other than `expr_class` for this shape. A probe
+  printing `f.return_ty.name` for those two FuncIds decides it in one run.
+
   **P7's real precondition: the eager results must survive the image path.**
   Either compute them before the image short-circuit, or carry them in the
   image beside the IR it already caches. That is a caching change, not a
