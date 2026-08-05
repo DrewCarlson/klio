@@ -777,6 +777,11 @@ pub fn computeEagerCalls(
     native_fqns: []const []const u8,
 ) ?std.AutoHashMap(span_mod.Span, span_mod.Span) {
     const audit = runtime.envOnce("KLIO_EAGER_AUDIT") != null;
+    if (audit) {
+        var ndecl: usize = 0;
+        for (combined) |*kf| ndecl += kf.decls.len;
+        std.debug.print("[EAGER] {d} files / {d} top-level decls handed to the checker\n", .{ combined.len, ndecl });
+    }
     const r = resolver.resolveModuleWithNatives(gpa, combined, native_fqns) catch {
         if (audit) std.debug.print("[EAGER] resolver failed; staying lazy\n", .{});
         return null;
