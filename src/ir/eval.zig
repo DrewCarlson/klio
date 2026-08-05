@@ -3042,6 +3042,8 @@ fn leafWalk(
                 }
                 block_idx = if (c.Bool) br.t.int() else br.f.int();
             },
+            // A guard's throwing arm is admitted structurally but never
+            // executed here: raising needs the frame path's unwind machinery.
             // `leafExprBody` admits no other terminator.
             else => return error.LeafAbandon,
         }

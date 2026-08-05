@@ -1308,6 +1308,12 @@ pub const Func = struct {
                 // A `Return` with no register is a `Unit` return — the shape
                 // of every guard helper, which is exactly what this admits.
                 .Return, .Goto, .Branch => {},
+                // A guard's FAILING arm (`if (!ok) throw ...`) never runs on
+                // the path this exists to serve. Admit it structurally and let
+                // the walk abandon if it ever lands there, the same rule the
+                // instruction set follows — otherwise every `assert`/`require`
+                // helper builds an activation to evaluate one comparison.
+                .Throw, .Unreachable => {},
                 else => return false,
             }
         }
