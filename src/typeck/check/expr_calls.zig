@@ -46,6 +46,7 @@ pub fn checkCall(
     type_args: []const TypeRef,
     call_span: Span,
 ) Allocator.Error!Type {
+    call_shape_counts[0] += 1;
     // Direct named-callable case: `foo(args)` where `foo` is a known
     // user fn or class. Otherwise fall back to tolerant typing.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
@@ -221,6 +222,7 @@ pub fn checkCall(
     // `fold` / `forEach` so the lambdas they take get a concrete expected
     // parameter type.
     if (callee.* == .Member) {
+        call_shape_counts[1] += 1;
         const m = callee.Member;
         const mname = m.name.name;
         if (isScopeFn(mname)) {
@@ -331,7 +333,9 @@ pub fn checkCall(
             var cands: std.ArrayList(expr_mod.ExtensionCandidate) = .empty;
             defer cands.deinit(self.allocator);
             try expr_mod.lookupExtensionCandidates(self, cn, mname, args.len, &cands);
+            call_shape_counts[2] += 1;
             if (cands.items.len != 0) {
+                call_shape_counts[3] += 1;
                 // Run full overload selection over every reachable
                 // extension with this name, so `sb.append("x")` picks
                 // `append(String)` over an arity-matching sibling.
@@ -671,6 +675,13 @@ fn sigMentionsTypeParam(sig: *const FnSig) bool {
 /// `KLIO_EAGER_GATES=1` — which gate drops each candidate resolution, so the
 /// channel's yield can be attributed instead of guessed at.
 pub var eager_gate_counts: [7]u64 = @splat(0);
+/// P7 sizing (`KLIO_EAGER_AUDIT`): how `checkCall` disposes of each call.
+/// [0] every call seen, [1] member-callee calls, [2] those whose RECEIVER
+/// CLASS the checker could name, [3] those that then found extension
+/// candidates. A member call that cannot reach [2] never starts member
+/// resolution at all, so no eager record of it is possible — which is the
+/// state pack-typed receivers are in today.
+pub var call_shape_counts: [5]u64 = @splat(0);
 fn eagerGate(i: usize) void {
     eager_gate_counts[i] += 1;
 }

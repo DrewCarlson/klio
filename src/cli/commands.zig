@@ -827,6 +827,8 @@ pub fn computeEagerCalls(
     }
     if (audit) {
         const g = typeck.check.expr_calls.eager_gate_counts;
+        const cs = typeck.check.expr_calls.call_shape_counts;
+        std.debug.print("[EAGER-SHAPE] calls={d} member={d} member_with_class={d} member_ext_cands={d}\n", .{ cs[0], cs[1], cs[2], cs[3] });
         std.debug.print("[EAGER-GATES] entered={d} vararg={d} type_param={d} ext_name={d} member_shadow={d} pkg_visibility={d} recorded={d}\n", .{ g[0], g[1], g[2], g[3], g[4], g[5], g[6] });
     }
     if (audit) std.debug.print("[EAGER] {d} call resolutions recorded (typeck resolved {d}; {d} carried no decl span, {d} named a decl outside the checked sources)\n", .{ n, seen_total, no_decl_span, not_declared });
