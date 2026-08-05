@@ -58,8 +58,16 @@ fn typeErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) EvalEr
 /// shallow-copied (their `ObjRef` handles stay shared), matching the Vm's
 /// `Vec<Value>` hand-off discipline.
 fn argsFromSlice(allocator: Allocator, items: []const Value) Allocator.Error!std.ArrayList(Value) {
-    var out: std.ArrayList(Value) = .empty;
-    try out.appendSlice(allocator, items);
+    // Through the size-classed carrier pool: this is the arg buffer of an
+    // ordinary host-dispatched call, released by the frame's teardown like
+    // every other carrier, and a fresh allocation per call was the largest
+    // single allocator caller on the interpreted dispatch path.
+    var out = try ir.eval.acquireArgsCap(allocator, items.len);
+    if (out.capacity >= items.len) {
+        out.appendSliceAssumeCapacity(items);
+    } else {
+        try out.appendSlice(allocator, items);
+    }
     return out;
 }
 
