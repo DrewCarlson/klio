@@ -1045,15 +1045,31 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
         return 1;
     }
     // A same-simple-name overload set is what the slow path exists to
-    // re-resolve, so more than one candidate declines. NONE is the common
-    // case for an instance method — the simple-name index carries top-level
-    // and extension functions, not members — and is the most certain shape
-    // there is: the site baked an exact declaration and nothing competes for
-    // the name. Requiring exactly one candidate excluded every member call
-    // from the fusion.
-    if (module.funcsBySimpleName(f.name).len > 1) {
-        if (fp_trace) std.debug.print("[fastplan] {s}: name not unique ({d})\n", .{ f.name, module.funcsBySimpleName(f.name).len });
-        return 1;
+    // re-resolve, so a competing candidate normally declines. NONE is the
+    // common case for an instance method — the simple-name index carries
+    // top-level and extension functions, not members — and is the most
+    // certain shape there is: the site baked an exact declaration and
+    // nothing competes for the name.
+    //
+    // A set whose other members take a DIFFERENT number of parameters is not
+    // a real competitor either: the runtime re-resolution the fast path skips
+    // ranks candidates for the call's argument count, and only this one
+    // accepts it. That covers the compose snapshot vocabulary (`valid`,
+    // `readable`, `get`), where same-named helpers differ in arity.
+    const same_name = module.funcsBySimpleName(f.name);
+    if (same_name.len > 1) {
+        var arity_peers: usize = 0;
+        for (same_name) |c| {
+            const cf = funcAt(module, c) orelse continue;
+            if (cf.params.len == f.params.len) arity_peers += 1;
+            // A defaulted or variadic peer accepts a range of counts, so it
+            // competes for this arity whatever its declared length is.
+            if (cf.params.len != f.params.len and peerSpansArity(self, c, cf, f.params.len)) arity_peers += 1;
+        }
+        if (arity_peers != 1) {
+            if (fp_trace) std.debug.print("[fastplan] {s}: {d} same-arity peers of {d} candidates\n", .{ f.name, arity_peers, same_name.len });
+            return 1;
+        }
     }
     // Type-parameterized non-inline functions carry no reified binding
     // (reified requires inline), and the fast path already requires the
@@ -1066,6 +1082,18 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
     if (paramIsThis(f.params) or f.has_receiver_param)
         return base | ir.FAST_CALL_EXT_FLAG;
     return base;
+}
+
+/// Whether a same-named candidate can accept `n_args` despite declaring a
+/// different parameter count — a vararg tail or any defaulted parameter makes
+/// its accepted arity a range, so it still competes for the call.
+fn peerSpansArity(self: *VmHost, id: FuncId, cf: *const ir.Func, n_args: usize) bool {
+    if (lastIsVararg(cf.params) and n_args >= cf.params.len -| 1) return true;
+    if (funcDefaults(self, id) != null and n_args <= cf.params.len) return true;
+    for (cf.params) |*p| {
+        if (p.has_default and n_args <= cf.params.len) return true;
+    }
+    return false;
 }
 
 /// Lean dispatch for a fast-path call: run the body directly with `args_list`
