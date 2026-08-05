@@ -2787,3 +2787,29 @@ actually came from (safe casts, `this` in a member, predicate operators,
 conditional agreement, numeric promotion, function-typed callees, spliced
 type-parameter heads: 591 -> 508). Further widening of the eager channel
 should not be expected to pay; the next units are lowering-side derivations.
+
+## Addendum 64 (2026-08-06): the `unique_concrete` channel measures NEGATIVE
+
+`classifyCallReturn` exists (its doc says so) to measure what a module-level
+return-type channel would be worth: it reports `unique_concrete` — one
+candidate, a return naming a resolvable class — for 1,645 initializers per
+corpus run, each leaving its local untyped.
+
+Built it. The answer is that the channel is worth less than nothing:
+
+    matching the classifier's rule (candidates agree on the return):
+        no_receiver_type 508 -> 562, bound 92.7% -> 92.2%
+    requiring a single index entry (stricter):
+        no_receiver_type 508 -> 509, bound flat, residue unchanged at 1,645
+
+The strict form never fires (the index holds several entries per
+declaration — a header stub beside its body — the same `len != 1` trap the
+call fusion hit). The correct form fires and REGRESSES: typing the local
+from the callee's declared return displaces better evidence already in
+place (the constructor and alias channels), and a generic return head types
+the local with something lowering then cannot use for the member call.
+
+So `unique_concrete` is not latent value; it is a count of sites where the
+declared return is present but is not the right answer. Reverted. The probe
+that reports the causes is kept — the remaining blocks are `no_func` 9,858
+and `not_simple_callee` 3,828, both larger and neither yet characterized.
