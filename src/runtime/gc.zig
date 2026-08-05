@@ -268,9 +268,9 @@ pub fn noteExternalBytes(bytes: usize) void {
     if (!gc_enabled) return;
     _ = external_live.fetchAdd(bytes, .monotonic);
     const mprev = bytes_since_major.fetchAdd(bytes, .monotonic);
-    if (mprev + bytes >= major_threshold) major_pending.store(true, .monotonic);
+    if (mprev +| bytes >= major_threshold) major_pending.store(true, .monotonic);
     const prev = bytes_since_gc.fetchAdd(bytes, .monotonic);
-    if (prev + bytes >= threshold) gc_pending.store(true, .monotonic);
+    if (prev +| bytes >= threshold) gc_pending.store(true, .monotonic);
 }
 
 /// External (non-registry) bytes released back — keeps `external_live`
@@ -285,9 +285,23 @@ pub fn noteExternalBytes(bytes: usize) void {
 /// registry cells keep gross accounting (their garbage does accumulate).
 pub fn noteExternalFreed(bytes: usize) void {
     if (!gc_enabled) return;
-    _ = external_live.fetchSub(@min(bytes, external_live.load(.monotonic)), .monotonic);
-    _ = bytes_since_gc.fetchSub(@min(bytes, bytes_since_gc.load(.monotonic)), .monotonic);
-    _ = bytes_since_major.fetchSub(@min(bytes, bytes_since_major.load(.monotonic)), .monotonic);
+    subSaturating(&external_live, bytes);
+    subSaturating(&bytes_since_gc, bytes);
+    subSaturating(&bytes_since_major, bytes);
+}
+
+/// Subtract without ever going below zero. The clamp has to be part of the
+/// same atomic step: a load-then-`fetchSub(@min(...))` pair lets two threads
+/// each read a value that covers their own subtraction and then both subtract,
+/// wrapping the counter to near `maxInt`. A wrapped counter then made the next
+/// `noteExternalBytes` addition overflow, which aborted the interpreter under
+/// the concurrent snapshot tests.
+fn subSaturating(c: *std.atomic.Value(usize), bytes: usize) void {
+    var cur = c.load(.monotonic);
+    while (true) {
+        const next = cur -| bytes;
+        cur = c.cmpxchgWeak(cur, next, .monotonic, .monotonic) orelse return;
+    }
 }
 
 var external_live: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);

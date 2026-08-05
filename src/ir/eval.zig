@@ -451,7 +451,14 @@ fn classifyFlattenable(f: *const Func) u8 {
     return 1;
 }
 
-fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value) {
+fn acquireRegs(ev_in: *EvalTls, allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value) {
+    // Buffer pools belong to the RUNNING thread. A caller may hold a pointer
+    // to the EvalTls of the thread that built a frame, and a resumed
+    // coroutine runs on whatever thread the dispatcher hands it; reaching
+    // another thread's free list races its length (an intermittent
+    // `integer overflow` when a guarded decrement went negative).
+    _ = ev_in;
+    const ev: *EvalTls = &evtls;
     const ra = regsAlloc(allocator);
     if (ev.regs_pool.items.len > 0) {
         const buf = ev.regs_pool.items[ev.regs_pool.items.len - 1];
@@ -480,7 +487,9 @@ fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32) Allocator.Error!std.A
 /// buffer ever outlives the top-level evaluation that produced it (or crosses an
 /// allocator). Only under a freeing backend — the tracing GC owns this memory and
 /// the arena never frees, so neither pools.
-fn releaseRegs(ev: *EvalTls, allocator: Allocator, regs: *std.ArrayList(Value)) void {
+fn releaseRegs(ev_in: *EvalTls, allocator: Allocator, regs: *std.ArrayList(Value)) void {
+    _ = ev_in;
+    const ev: *EvalTls = &evtls;
     const ra = regsAlloc(allocator);
     // The size-classed arg carriers come from the RUN allocator (frames and
     // hosts both produce them), so none may outlive the outermost evaluation
@@ -1650,7 +1659,9 @@ fn chainAllocator() Allocator {
 /// on this thread.
 const CHAIN_POOL_MAX: usize = 128;
 
-fn chainAcquire(ev: *EvalTls) std.ArrayList(EnclosingEntry) {
+fn chainAcquire(ev_in: *EvalTls) std.ArrayList(EnclosingEntry) {
+    _ = ev_in;
+    const ev: *EvalTls = &evtls;
     if (ev.chain_pool_len > 0) {
         ev.chain_pool_len -= 1;
         const buf = ev.chain_pool[ev.chain_pool_len];
@@ -1659,7 +1670,9 @@ fn chainAcquire(ev: *EvalTls) std.ArrayList(EnclosingEntry) {
     return .empty;
 }
 
-fn chainRelease(ev: *EvalTls, list: *std.ArrayList(EnclosingEntry)) void {
+fn chainRelease(ev_in: *EvalTls, list: *std.ArrayList(EnclosingEntry)) void {
+    _ = ev_in;
+    const ev: *EvalTls = &evtls;
     if (list.capacity > 0 and ev.chain_pool_len < CHAIN_POOL_MAX) {
         ev.chain_pool[ev.chain_pool_len] = list.allocatedSlice();
         ev.chain_pool_len += 1;
@@ -2753,8 +2766,10 @@ const Frame = struct {
         // they leak past the drain).
         releaseArgs(self.allocator, &self.params);
         releaseArgs(self.allocator, &self.captures);
-        releaseRegs(self.tls, self.allocator, &self.regs);
-        chainRelease(self.tls, &self.enclosing_this);
+        // The pools belong to the thread that is tearing the frame down, not
+        // to the one that built it (see the re-bind in `runFlatLoop`).
+        releaseRegs(&evtls, self.allocator, &self.regs);
+        chainRelease(&evtls, &self.enclosing_this);
     }
 
     fn read(self: *const Frame, r: Reg) Value {
@@ -3970,7 +3985,9 @@ inline fn actPoolOn() bool {
     return !runtime.reclaimEnabled() and runtime.gc.gc_enabled;
 }
 
-fn actAlloc(ev: *EvalTls, allocator: Allocator) Allocator.Error!*Activation {
+fn actAlloc(ev_in: *EvalTls, allocator: Allocator) Allocator.Error!*Activation {
+    _ = ev_in;
+    const ev: *EvalTls = &evtls;
     if (actPoolOn()) {
         if (ev.act_pool_len > 0) {
             ev.act_pool_len -= 1;
@@ -3981,7 +3998,9 @@ fn actAlloc(ev: *EvalTls, allocator: Allocator) Allocator.Error!*Activation {
     return allocator.create(Activation);
 }
 
-fn actFree(ev: *EvalTls, allocator: Allocator, act: *Activation) void {
+fn actFree(ev_in: *EvalTls, allocator: Allocator, act: *Activation) void {
+    _ = ev_in;
+    const ev: *EvalTls = &evtls;
     if (actPoolOn()) {
         if (ev.act_pool_len < ACT_POOL_MAX) {
             ev.act_pool[ev.act_pool_len] = act;
@@ -4935,6 +4954,15 @@ fn runFrameExec(
     // Resolved once: the per-instruction gates below would otherwise pay a
     // dynamic thread-local lookup each, which the compiler cannot hoist past
     // the dispatch calls between them.
+    //
+    // Re-bound to the RUNNING thread first. A frame's `tls` is captured when
+    // it is built, but a suspended coroutine resumes on whatever thread the
+    // dispatcher hands it, and the state behind this pointer — the register
+    // free-list, the receiver chain, the frame chain — is per-thread and
+    // unsynchronized. A migrated frame that kept its origin thread's pointer
+    // raced that thread's pool (an intermittent `integer overflow` from the
+    // free list's length going negative under concurrent snapshot tests).
+    frame.tls = &evtls;
     const ftls: *EvalTls = frame.tls;
     var cur = cur_in;
     var resume_idx = resume_idx_in;
