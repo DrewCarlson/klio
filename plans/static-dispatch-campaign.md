@@ -2730,3 +2730,19 @@ spelling — so sites that previously bound virtually now land in
 to travel through the SAME rename/scope resolution lowering applies
 (`fileOrPkgTypeRename` and the simple-name class index), or be published as
 class IDS rather than names. That is the next attempt's shape.
+
+RESOLVED (same day) by guarding the READ instead of the write. `eagerTypeOf`
+now drops a head this module cannot resolve — builtins pass through, since
+they carry no class id by design — so an unresolvable name costs nothing
+rather than displacing a virtual bind. With that guard the same class
+evidence is a net gain:
+
+    no_receiver_type   521 -> 508
+    no_class_id           4 -> 4     (was 554 unguarded)
+    bound share       92.6% -> 92.7%
+
+Worth keeping as a rule: a static-evidence channel needs a resolvability
+guard at its CONSUMER, not just correctness at its producer. The two name
+universes (checker source names, lowering mangled/qualified names) do not
+have to be reconciled for the channel to be safe — the consumer only has to
+decline what it cannot use.
