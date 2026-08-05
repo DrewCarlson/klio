@@ -333,6 +333,23 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
   through the checker, which is not `checkOverloadedCall`. Sizing that path
   is the first task of P7 proper.
 
+  DONE 2026-08-06 — and it bottoms out one level lower than expected. The
+  same audit now reports `checkCall`'s disposition:
+
+      three user bare calls:         calls=6   member=0  with_class=0
+      compose snapshot-map program:  calls=12  member=5  with_class=0
+
+  Member resolution never STARTS for those five. `class_from_ty` is taken
+  from the expression-class map or from a scalar/generic receiver head, and
+  a PACK-TYPED receiver yields neither, so the checker falls through to
+  tolerant typing with nothing to resolve and nothing to record.
+
+  So P7's precondition is not "extend the channel to member calls" but
+  "typeck can name pack classes". Until that holds, a member-call channel
+  yields zero on every pack-using program — which is every program the
+  compose and dispatch work cares about. That is the first build task, and
+  the counters above are its progress measure.
+
 - **P8** — hatch deletion (RC-H catalog above).
 - **P9** — optional flat bytecode + pack serialization.
 
