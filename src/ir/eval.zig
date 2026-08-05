@@ -6469,8 +6469,7 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
                 // exact-arity call dispatches straight to the body.
                 const plan_arity = plan & 0x3FFF;
                 if (plan_arity >= 2 and plan_arity - 2 == call.n_args) {
-                    const buf = try readArgRun(allocator, frame, call.args, call.n_args);
-                    const args_list: std.ArrayList(Value) = .{ .items = buf, .capacity = buf.len };
+                    const args_list = try readArgList(allocator, frame, call.args, call.n_args);
                     // A receiver-carrying body: seed the caller's instance
                     // `this` as the enclosing receiver exactly as the full
                     // path below does (lexical scope for a member extension,
@@ -9223,6 +9222,18 @@ fn stripScopeGetter(name: []const u8) []const u8 {
 fn argNamesAllNull(names: []const ?ConstId) bool {
     for (names) |n| if (n != null) return false;
     return true;
+}
+
+/// A call's argument run in a carrier list. The fused static-call site hands
+/// the list straight to the activation as its params, so the carrier follows
+/// the same acquire/release discipline as every other frame buffer.
+fn readArgList(allocator: Allocator, frame: *const Frame, args_start: Reg, n: u32) Allocator.Error!std.ArrayList(Value) {
+    var list = try acquireArgsCap(allocator, n);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        list.appendAssumeCapacity(frame.read(Reg.from(args_start.int() + i)));
+    }
+    return list;
 }
 
 fn readArgRun(allocator: Allocator, frame: *const Frame, args_start: Reg, n: u32) Allocator.Error![]Value {

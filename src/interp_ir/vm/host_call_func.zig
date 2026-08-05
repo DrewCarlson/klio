@@ -1004,22 +1004,57 @@ const valueIsBuiltin = root.valueIsBuiltin;
 /// overloads (which need runtime re-resolution). The evaluator caches the result
 /// on the `Func` and consults the host only once per function.
 pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
+    const fp_trace = if (runtime.envOnce("KLIO_FASTPLAN_TRACE")) |w| blk: {
+        const f0 = funcAt(module, func) orelse break :blk false;
+        break :blk std.mem.indexOf(u8, f0.name, w) != null;
+    } else false;
     const f = funcAt(module, func) orelse return 1;
-    if (!f.hasBody()) return 1;
+    if (!f.hasBody()) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: no body\n", .{f.name});
+        return 1;
+    }
     // Inline bodies splice; a runtime call to one keeps the full path. A
     // plain suspend function needs nothing extra — its suspension
     // propagates identically on the direct path.
-    if (f.is_inline) return 1;
+    if (f.is_inline) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: inline\n", .{f.name});
+        return 1;
+    }
     // A `@Composable` function is plugin-lowered: composition is already in
     // the body, and the only per-call work is publishing the threaded
     // `$composer` as ambient — which the flat path does via
     // `flatPlainCallOpen`. No exclusion needed.
-    if (f.params.len > 253) return 1;
-    if (lastIsVararg(f.params)) return 1;
-    if (hasNonFinalVararg(f.params)) return 1;
-    if (funcDefaults(self, func) != null) return 1;
-    if (resolvedNativeForm(self, func) != null) return 1;
-    if (module.funcsBySimpleName(f.name).len != 1) return 1;
+    if (f.params.len > 253) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: too many params\n", .{f.name});
+        return 1;
+    }
+    if (lastIsVararg(f.params)) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: trailing vararg\n", .{f.name});
+        return 1;
+    }
+    if (hasNonFinalVararg(f.params)) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: non-final vararg\n", .{f.name});
+        return 1;
+    }
+    if (funcDefaults(self, func) != null) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: has defaults\n", .{f.name});
+        return 1;
+    }
+    if (resolvedNativeForm(self, func) != null) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: native form\n", .{f.name});
+        return 1;
+    }
+    // A same-simple-name overload set is what the slow path exists to
+    // re-resolve, so more than one candidate declines. NONE is the common
+    // case for an instance method — the simple-name index carries top-level
+    // and extension functions, not members — and is the most certain shape
+    // there is: the site baked an exact declaration and nothing competes for
+    // the name. Requiring exactly one candidate excluded every member call
+    // from the fusion.
+    if (module.funcsBySimpleName(f.name).len > 1) {
+        if (fp_trace) std.debug.print("[fastplan] {s}: name not unique ({d})\n", .{ f.name, module.funcsBySimpleName(f.name).len });
+        return 1;
+    }
     // Type-parameterized non-inline functions carry no reified binding
     // (reified requires inline), and the fast path already requires the
     // call site to bake zero type arguments, so nothing needs the typed
