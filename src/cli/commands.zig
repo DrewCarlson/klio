@@ -777,6 +777,11 @@ pub fn computeEagerCalls(
     native_fqns: []const []const u8,
 ) ?std.AutoHashMap(span_mod.Span, span_mod.Span) {
     const audit = runtime.envOnce("KLIO_EAGER_AUDIT") != null;
+    if (audit) {
+        var ndecl: usize = 0;
+        for (combined) |*kf| ndecl += kf.decls.len;
+        std.debug.print("[EAGER] {d} files / {d} top-level decls handed to the checker\n", .{ combined.len, ndecl });
+    }
     const r = resolver.resolveModuleWithNatives(gpa, combined, native_fqns) catch {
         if (audit) std.debug.print("[EAGER] resolver failed; staying lazy\n", .{});
         return null;
@@ -806,16 +811,32 @@ pub fn computeEagerCalls(
     var out = std.AutoHashMap(span_mod.Span, span_mod.Span).init(gpa);
     var it = tc.resolved_calls.iterator();
     var n: usize = 0;
+    var seen_total: usize = 0;
+    var no_decl_span: usize = 0;
+    var not_declared: usize = 0;
     while (it.next()) |e| {
-        const decl = e.value_ptr.decl_span orelse continue;
-        if (!declared.contains(decl)) continue;
+        seen_total += 1;
+        const decl = e.value_ptr.decl_span orelse {
+            no_decl_span += 1;
+            continue;
+        };
+        if (!declared.contains(decl)) {
+            not_declared += 1;
+            continue;
+        }
         out.put(e.key_ptr.*, decl) catch continue;
         n += 1;
         if (runtime.envOnce("KLIO_EAGER_HITS") != null) {
             std.debug.print("[EAGER-REC] call f{d}:{d}-{d} -> decl f{d}:{d}-{d}\n", .{ e.key_ptr.file.int(), e.key_ptr.start, e.key_ptr.end, decl.file.int(), decl.start, decl.end });
         }
     }
-    if (audit) std.debug.print("[EAGER] {d} call resolutions recorded\n", .{n});
+    if (audit) {
+        const g = typeck.check.expr_calls.eager_gate_counts;
+        const cs = typeck.check.expr_calls.call_shape_counts;
+        std.debug.print("[EAGER-SHAPE] calls={d} member={d} member_with_class={d} member_ext_cands={d}\n", .{ cs[0], cs[1], cs[2], cs[3] });
+        std.debug.print("[EAGER-GATES] entered={d} vararg={d} type_param={d} ext_name={d} member_shadow={d} pkg_visibility={d} recorded={d}\n", .{ g[0], g[1], g[2], g[3], g[4], g[5], g[6] });
+    }
+    if (audit) std.debug.print("[EAGER] {d} call resolutions recorded (typeck resolved {d}; {d} carried no decl span, {d} named a decl outside the checked sources)\n", .{ n, seen_total, no_decl_span, not_declared });
     // The companion evidence channel: per-expression type heads. Only
     // decisive heads enter (scalars, String, named classes, nullable
     // wrappers of those) — a Function/TypeParam/Unresolved answer would
@@ -834,7 +855,22 @@ pub fn computeEagerCalls(
         tout.put(e.key_ptr.*, head) catch continue;
         tn += 1;
     }
-    if (audit) std.debug.print("[EAGER] {d} type heads recorded ({d} excluded as instantiation-dependent)\n", .{ tn, tc.types_instantiation_dependent.count() });
+    // The checker's CLASS evidence, folded into the same channel: a plain
+    // user class is `Type.Unresolved` there, so `tc.types` cannot carry it,
+    // and `expr_class` is where a receiver's class identity lives. Heads the
+    // lowering module cannot resolve are dropped on READ (`eagerTypeOf`), so
+    // an unresolvable name costs nothing rather than displacing a virtual
+    // bind.
+    var cn_added: usize = 0;
+    {
+        var cit = tc.expr_class.iterator();
+        while (cit.next()) |e| {
+            if (tout.contains(e.key_ptr.*)) continue;
+            tout.put(e.key_ptr.*, .{ .name = e.value_ptr.*, .nullable = false }) catch continue;
+            cn_added += 1;
+        }
+    }
+    if (audit) std.debug.print("[EAGER] {d} type heads recorded ({d} excluded as instantiation-dependent, {d} from class evidence)\n", .{ tn + cn_added, tc.types_instantiation_dependent.count(), cn_added });
     ir.pending_eager_types = tout;
     var rout = std.AutoHashMap(span_mod.Span, []const u8).init(gpa);
     var rit = tc.lambda_recv_heads.iterator();
@@ -976,6 +1012,7 @@ pub fn runBuiltModuleArgs(
     runtime.prof.maybeReport();
     ir.eval.callStatsDump();
     ir.eval.dispatchStatsDump();
+    if (runtime.envOnce("KLIO_DECL_AUDIT") != null) declAudit(gpa, &built);
     // The dispatch census is reported for `run` as well as for `test`. The two
     // answer different questions: the stdlib's own tests are generic
     // throughout, so a change that reads a CONCRETE element type measures as
@@ -999,6 +1036,102 @@ pub fn runBuiltModuleArgs(
             break :blk 1;
         },
     };
+}
+
+
+/// `KLIO_DECL_AUDIT=1` — the completeness audit for the no-holes symbol table.
+///
+/// PROGRAM-SCOPED: the IR is lazy, so a declaration only enters the module
+/// when the program under audit reaches its package. Run it on a program that
+/// exercises the surface being measured — the same audit reports 9 holes for
+/// a `println`-only program and 6 for one that also imports `kotlin.system`.
+/// The number is a lower bound on what is declared, never an upper bound on
+/// what is missing.
+///
+/// every FQN the intrinsic registry can serve, paired with whether the module
+/// carries a DECLARATION for it. A callable the runtime can dispatch but the
+/// resolver cannot see is a hole: resolution has to fall back to a name probe
+/// there, which is exactly what the unified table exists to remove. Prints the
+/// tally and the first missing entries per package.
+fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) void {
+    const mg = built.module.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    var total: usize = 0;
+    var missing: usize = 0;
+    var member_missing: usize = 0;
+    var toplevel_missing: usize = 0;
+    var unaligned: usize = 0;
+    var unaligned_samples: std.ArrayList([]const u8) = .empty;
+    defer unaligned_samples.deinit(gpa);
+    var by_pkg = std.StringHashMap(usize).init(gpa);
+    defer by_pkg.deinit();
+    var samples: std.ArrayList([]const u8) = .empty;
+    defer samples.deinit(gpa);
+    var it = stdlib.implementations.allFqns();
+    while (it.next()) |fqn| {
+        total += 1;
+        if (module.funcIdByFqn(fqn) != null) continue;
+        // A class (its constructor) and a top-level property are declared
+        // entities too; the registry serves both under an FQN key.
+        if (module.classIdByFqn(fqn) != null) continue;
+        {
+            const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+            if (module.registry.top_level_prop_pkgs.get(simple) != null) continue;
+        }
+        missing += 1;
+        const pkg = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[0..d] else "";
+        // A receiver-qualified form (`kotlin.Float.plus`) is a MEMBER of a
+        // builtin type, which has no Kotlin source declaration by design.
+        // The holes that matter for the scope walk are package-level
+        // callables: the owner segment starts lowercase.
+        const owner_simple = if (std.mem.lastIndexOfScalar(u8, pkg, '.')) |d2| pkg[d2 + 1 ..] else pkg;
+        if (owner_simple.len != 0 and std.ascii.isUpper(owner_simple[0])) {
+            member_missing += 1;
+            continue;
+        }
+        // A registry key that names the same callable under a different
+        // package (`kotlin.naturalOrder` for `kotlin.comparisons.naturalOrder`)
+        // is not a missing declaration — it is an UNALIGNED key, which the
+        // scope walk must reconcile separately.
+        {
+            const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+            var aligned_elsewhere = module.funcsBySimpleName(simple).len != 0;
+            // A CLASS the module declares under another package
+            // (`kotlin.StringBuilder` for `kotlin.text.StringBuilder`) is the
+            // same shape of mismatch as a function's.
+            if (!aligned_elsewhere and module.uniqueClassIdBySimpleName(simple) != null) aligned_elsewhere = true;
+            // An extension property's getter carries the
+            // `__ext_get_<Head>_<name>` naming contract, so its declaration
+            // never appears under the registry's own key.
+            if (!aligned_elsewhere) {
+                var it2 = module.registry.ext_prop_type_heads.iterator();
+                while (it2.next()) |e2| {
+                    if (std.mem.eql(u8, e2.key_ptr.b, simple)) {
+                        aligned_elsewhere = true;
+                        break;
+                    }
+                }
+            }
+            if (aligned_elsewhere) {
+                unaligned += 1;
+                if (unaligned_samples.items.len < 20) unaligned_samples.append(gpa, fqn) catch {};
+                continue;
+            }
+        }
+        toplevel_missing += 1;
+        const gop = by_pkg.getOrPut(pkg) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+        if (samples.items.len < 40) samples.append(gpa, fqn) catch {};
+    }
+    io.printStdout(gpa, "[decl-audit] intrinsics={d} declared={d} missing={d} (builtin-type members {d}, unaligned keys {d}, package-level holes {d})\n", .{ total, total - missing, missing, member_missing, unaligned, toplevel_missing });
+    var pit = by_pkg.iterator();
+    while (pit.next()) |e| {
+        io.printStdout(gpa, "[decl-audit] {d:>5}  {s}\n", .{ e.value_ptr.*, e.key_ptr.* });
+    }
+    for (samples.items) |fq| io.printStdout(gpa, "[decl-audit] hole: {s}\n", .{fq});
+    for (unaligned_samples.items) |fq| io.printStdout(gpa, "[decl-audit] unaligned: {s}\n", .{fq});
 }
 
 /// Run `main` on a large-stack worker thread so deep-but-finite legitimate

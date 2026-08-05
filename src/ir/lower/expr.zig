@@ -9138,9 +9138,10 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
     // states the type, `this` is the enclosing class, a predicate operator
     // yields Boolean — and each was reaching the call sites below with no
     // receiver type at all, which is what forces a runtime name walk.
-    switch (e.*) {
-        // `x as T` / `x as? T` — the cast IS the answer; `as?` carries the
-        // null the safe form can produce.
+    self_named: {
+        switch (e.*) {
+            // `x as T` / `x as? T` — the cast IS the answer; `as?` carries the
+            // null the safe form can produce.
         .As => |cast| {
             var out = try decl_mod.loweredTypeRef(b.allocator, &cast.ty, true);
             if (cast.safe) out.nullable = true;
@@ -9194,6 +9195,22 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
             .Eq, .Neq, .IdentEq, .IdentNeq, .Lt, .Le, .Gt, .Ge, .In, .NotIn, .And, .Or => {
                 return .{ .name = try b.allocator.dupe(u8, "Boolean"), .nullable = false, .args = &.{} };
             },
+            // Arithmetic over the BUILT-IN numeric types has a type Kotlin
+            // fixes by promotion, so `(hi - lo).toLong()` reaches its member
+            // call with a known receiver instead of none. Only both-sides-
+            // known, non-nullable primitives qualify; anything else falls
+            // through to the operator-method derivation below.
+            .Add, .Sub, .Mul, .Div, .Rem => {
+                var lhs_owned = try staticExprTypeRef(b, bin.lhs);
+                defer if (lhs_owned) |*t| t.deinit(b.allocator);
+                var rhs_owned = try staticExprTypeRef(b, bin.rhs);
+                defer if (rhs_owned) |*t| t.deinit(b.allocator);
+                const lt = lhs_owned orelse break :self_named;
+                const rt = rhs_owned orelse break :self_named;
+                if (lt.nullable or rt.nullable) break :self_named;
+                const promoted = numericPromotion(lt.name, rt.name) orelse break :self_named;
+                return .{ .name = try b.allocator.dupe(u8, promoted), .nullable = false, .args = &.{} };
+            },
             else => {},
         },
         .Unary => |un| switch (un.op) {
@@ -9202,9 +9219,41 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
             .Neg, .Pos => return try staticExprTypeRef(b, un.expr),
             else => {},
         },
-        else => {},
+            else => {},
+        }
     }
     return try localInitTypeRef(b, e);
+}
+
+/// Kotlin's promotion for arithmetic over the built-in numeric types: the
+/// wider operand wins, with the unsigned family kept separate (mixing signed
+/// and unsigned is not an operator Kotlin defines).
+fn numericPromotion(a: []const u8, c: []const u8) ?[]const u8 {
+    const order = [_][]const u8{ "Double", "Float", "Long", "Int", "Short", "Byte" };
+    const uorder = [_][]const u8{ "ULong", "UInt", "UShort", "UByte" };
+    const rank = struct {
+        fn f(set: []const []const u8, n: []const u8) ?usize {
+            for (set, 0..) |s2, i| {
+                if (std.mem.eql(u8, s2, n)) return i;
+            }
+            return null;
+        }
+    }.f;
+    if (rank(&order, a)) |ra| {
+        const rc = rank(&order, c) orelse return null;
+        // Byte/Short arithmetic yields Int in Kotlin — there is no
+        // `Byte.plus(Byte): Byte`.
+        const winner = order[@min(ra, rc)];
+        if (std.mem.eql(u8, winner, "Short") or std.mem.eql(u8, winner, "Byte")) return "Int";
+        return winner;
+    }
+    if (rank(&uorder, a)) |ra| {
+        const rc = rank(&uorder, c) orelse return null;
+        const winner = uorder[@min(ra, rc)];
+        if (std.mem.eql(u8, winner, "UShort") or std.mem.eql(u8, winner, "UByte")) return "UInt";
+        return winner;
+    }
+    return null;
 }
 
 /// The declared return type of a nullary member on a known receiver type, with
@@ -9286,7 +9335,14 @@ var init_self_name: ?[]const u8 = null;
 
 fn localInitTypeRef(b: *FuncBuilder, receiver: *const Expr) Allocator.Error!?ir.TypeRef {
     if (receiver.* != .Path or receiver.Path.segments.len != 1) return null;
-    const name = receiver.Path.segments[0].name;
+    return localInitTypeRefNamed(b, receiver.Path.segments[0].name);
+}
+
+/// The by-name entry: a local's type derived from its RECORDED initializer.
+/// A call initializer is never written into the local's declared type — it is
+/// resolved here, on demand, at each use site. Anything asking "is this local
+/// typed?" must come through here, not through the declared-type table alone.
+pub fn localInitTypeRefNamed(b: *FuncBuilder, name: []const u8) Allocator.Error!?ir.TypeRef {
     if (b.resolve(name) == null) return null;
     const init_expr = b.localInitExpr(name) orelse {
         if (norecvCensusOn()) lm_localinit[0] += 1;
@@ -14388,7 +14444,7 @@ pub fn lowerDeclineDump() void {
 
 /// Classify a `Call` expression against the strict condition a return-type
 /// channel would need: the name must identify one function whose declared
-/// return type is not one of its own type parameters.
+
 fn classifyCallReturn(b: *FuncBuilder, e: *const ast.Expr) NoRecvCall {
     if (e.* != .Call) return .not_simple_callee;
     const callee = e.Call.callee;

@@ -57,7 +57,7 @@ pub const Lowered = cfa.lower.Lowered;
 const phases = @import("check/phases.zig");
 const decl = @import("check/decl.zig");
 const expr = @import("check/expr.zig");
-const expr_calls = @import("check/expr_calls.zig");
+pub const expr_calls = @import("check/expr_calls.zig");
 const annotations = @import("check/annotations.zig");
 const visibility = @import("check/visibility.zig");
 const narrowing = @import("check/narrowing.zig");
@@ -94,6 +94,10 @@ pub const TypeCheck = struct {
     resolved_calls: std.AutoHashMap(Span, ResolvedCall),
     lambda_recv_heads: std.AutoHashMap(Span, []const u8),
     lambda_param_shapes: std.AutoHashMap(Span, ParamShape),
+    /// Expression span -> the user-class name the checker determined. A plain
+    /// user class is `Type.Unresolved` here, so this is where a receiver's
+    /// class identity actually lives.
+    expr_class: std.AutoHashMap(Span, []const u8),
 
     /// Look up the type assigned to an expression by span.
     pub fn typeOf(self: *const TypeCheck, sp: Span) ?*const Type {
@@ -140,6 +144,7 @@ pub fn typecheck(
         .resolved_calls = tc.resolved_calls,
         .lambda_recv_heads = tc.lambda_recv_heads,
         .lambda_param_shapes = tc.lambda_param_shapes,
+        .expr_class = tc.expr_class,
     };
 }
 
@@ -232,6 +237,15 @@ pub fn typecheckModule(
     cfa.analyses.contracts.setUserInlineContracts(user_contracts);
     var tc = try Checker.new(allocator, resolution);
     defer destroyQueryScratch(allocator, tc.query_scratch);
+    if (types.pending_extern_decls) |ed| {
+        var cit = ed.classes.keyIterator();
+        while (cit.next()) |k| {
+            if (tc.classes.contains(k.*)) continue;
+            try tc.classes.put(k.*, ClassInfo.init(allocator));
+        }
+        tc.extern_fn_return_class = ed.fn_return_class;
+        types.pending_extern_decls = null;
+    }
     for (files) |*f| {
         const pkg = f.package orelse continue;
         var dotted: std.ArrayList(u8) = .empty;
@@ -254,6 +268,7 @@ pub fn typecheckModule(
         .resolved_calls = tc.resolved_calls,
         .lambda_recv_heads = tc.lambda_recv_heads,
         .lambda_param_shapes = tc.lambda_param_shapes,
+        .expr_class = tc.expr_class,
     };
 }
 
@@ -525,6 +540,12 @@ pub const FnSig = struct {
     /// Per-type-parameter upper bounds. Each inner slice is the bound list
     /// for the corresponding type parameter, in declaration order.
     type_param_bounds: [][]Type,
+    /// User-class simple name this function's declared RETURN type names,
+    /// `null` for a primitive / function / unresolved return. A plain user
+    /// class is `Type.Unresolved` in this checker (only generic
+    /// INSTANTIATIONS are `Type.Generic`), so the class identity has to
+    /// travel beside the type — the same reason `param_class_names` exists.
+    return_class: ?[]const u8 = null,
     /// User-class simple name for each parameter whose declared type names
     /// a known class. `null` for primitive / function / unresolved slots.
     param_class_names: []?[]const u8,
@@ -778,6 +799,8 @@ pub const Checker = struct {
     extension_properties: std.StringHashMap(std.ArrayList(ExtensionPropSig)),
     /// File-level user classes.
     classes: std.StringHashMap(ClassInfo),
+    /// Return classes for functions known only from a prebuilt image.
+    extern_fn_return_class: ?std.StringHashMap([]const u8) = null,
     /// Simple names declared by MORE THAN ONE class. `classes` is keyed by
     /// simple name, so two same-named classes in different packages would
     /// otherwise silently overwrite each other and every lookup would answer

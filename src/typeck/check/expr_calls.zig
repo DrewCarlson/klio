@@ -38,6 +38,14 @@ const Variance = types.Variance;
 
 /// Single call-dispatch decision tree. `arg_names`/`type_args` are parallel
 /// to the parsed `Call` payload. Returns the callee's result type.
+/// A call's result type, with its CLASS recorded for the call span when the
+/// result names one.
+///
+/// A local takes its `class_name` from its initializer's `expr_class` entry
+/// when it has no annotation, and a plain function call never wrote one — so
+/// `val m = makeThing()` left `m` classless and every member call on it
+/// stopped before member resolution began. Only the extension-candidate path
+/// recorded a return class before this.
 pub fn checkCall(
     self: *Checker,
     callee: *const Expr,
@@ -46,6 +54,53 @@ pub fn checkCall(
     type_args: []const TypeRef,
     call_span: Span,
 ) Allocator.Error!Type {
+    const ty = try checkCallInner(self, callee, args, arg_names, type_args, call_span);
+    if (!self.expr_class.contains(call_span)) {
+        if (returnClassName(self, &ty)) |cn| {
+            self.expr_class.put(call_span, cn) catch {};
+        } else if (callee.* == .Path and callee.Path.segments.len == 1) {
+            // A plain user class is `Unresolved` in this checker, so the
+            // class travels on the SIGNATURE. One unambiguous declaration
+            // for the name settles it; an overload set does not.
+            const nm0 = callee.Path.segments[0].name;
+            if (self.fns.get(nm0)) |sigs| {
+                if (sigs.items.len == 1) {
+                    if (sigs.items[0].return_class) |cn| {
+                        if (self.classes.contains(cn)) self.expr_class.put(call_span, cn) catch {};
+                    }
+                }
+            } else if (self.extern_fn_return_class) |ext| {
+                // Known only from a prebuilt image: same rule, sourced from
+                // the module the image carries instead of from source.
+                if (ext.get(nm0)) |cn| {
+                    if (self.classes.contains(cn)) self.expr_class.put(call_span, cn) catch {};
+                }
+            }
+        }
+    }
+    return ty;
+}
+
+/// The user-class name a call result names, or null. A generic head counts
+/// only when the module declares that class; a builtin or function type never
+/// does.
+fn returnClassName(self: *Checker, t: *const Type) ?[]const u8 {
+    return switch (t.*) {
+        .Generic => |g| if (self.classes.contains(g.name)) g.name else null,
+        .Nullable => |inner| returnClassName(self, inner),
+        else => null,
+    };
+}
+
+fn checkCallInner(
+    self: *Checker,
+    callee: *const Expr,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    type_args: []const TypeRef,
+    call_span: Span,
+) Allocator.Error!Type {
+    call_shape_counts[0] += 1;
     // Direct named-callable case: `foo(args)` where `foo` is a known
     // user fn or class. Otherwise fall back to tolerant typing.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
@@ -221,6 +276,7 @@ pub fn checkCall(
     // `fold` / `forEach` so the lambdas they take get a concrete expected
     // parameter type.
     if (callee.* == .Member) {
+        call_shape_counts[1] += 1;
         const m = callee.Member;
         const mname = m.name.name;
         if (isScopeFn(mname)) {
@@ -331,7 +387,9 @@ pub fn checkCall(
             var cands: std.ArrayList(expr_mod.ExtensionCandidate) = .empty;
             defer cands.deinit(self.allocator);
             try expr_mod.lookupExtensionCandidates(self, cn, mname, args.len, &cands);
+            call_shape_counts[2] += 1;
             if (cands.items.len != 0) {
+                call_shape_counts[3] += 1;
                 // Run full overload selection over every reachable
                 // extension with this name, so `sb.append("x")` picks
                 // `append(String)` over an arity-matching sibling.
@@ -668,11 +726,29 @@ fn sigMentionsTypeParam(sig: *const FnSig) bool {
     return typeMentionsTypeParam(&sig.return_ty);
 }
 
+/// `KLIO_EAGER_GATES=1` — which gate drops each candidate resolution, so the
+/// channel's yield can be attributed instead of guessed at.
+pub var eager_gate_counts: [7]u64 = @splat(0);
+/// P7 sizing (`KLIO_EAGER_AUDIT`): how `checkCall` disposes of each call.
+/// [0] every call seen, [1] member-callee calls, [2] those whose RECEIVER
+/// CLASS the checker could name, [3] those that then found extension
+/// candidates. A member call that cannot reach [2] never starts member
+/// resolution at all, so no eager record of it is possible — which is the
+/// state pack-typed receivers are in today.
+pub var call_shape_counts: [5]u64 = @splat(0);
+fn eagerGate(i: usize) void {
+    eager_gate_counts[i] += 1;
+}
+
 fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record_name: []const u8) void {
+    eagerGate(0);
     // A vararg overload family needs the engine's packing logic to pick
     // (typeck's MSC can prefer a fixed-arity sibling for a vararg call);
     // vararg picks stay out of the channel.
-    for (sig.is_vararg) |v| if (v) return;
+    for (sig.is_vararg) |v| if (v) {
+        eagerGate(1);
+        return;
+    };
     // A pick made against a TYPE PARAMETER is a guess, not a resolution.
     // `listOf(a, b).minOrNull()` where `a: T` (`T : Comparable<T>`) has two
     // live candidates — the total-order `Iterable<T>.minOrNull()` and the
@@ -681,7 +757,10 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
     // wrong choice silently changes the answer (NaN instead of 0.0). The
     // runtime's own dispatch gets these right, so the channel stays out of
     // it, exactly as it does for an ambiguous simple class name.
-    if (sigMentionsTypeParam(sig)) return;
+    if (sigMentionsTypeParam(sig)) {
+        eagerGate(2);
+        return;
+    }
     // Extension-shadow gate. A bare call inside an extension body has that
     // extension's receiver in scope, so a same-named EXTENSION on it
     // out-ranks the top-level declaration this registry would answer with.
@@ -690,7 +769,10 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
     // binding the composable there reaches the composer with no applier.
     // The member-shadow walk below covers members only, and an extension is
     // not a member, so the name is declined outright.
-    if (self.extension_fn_names.contains(record_name)) return;
+    if (self.extension_fn_names.contains(record_name)) {
+        eagerGate(3);
+        return;
+    }
     // Package-visibility gate: the flat name registry is package-blind, so
     // a same-name declaration from an unrelated package can win here that
     // Kotlin scoping would never see (a packageless `apply` shadowing
@@ -707,7 +789,10 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
         var ci: usize = self.class_stack.items.len;
         while (ci > 0) {
             ci -= 1;
-            if (classChainHasMember(self, self.class_stack.items[ci], record_name)) return;
+            if (classChainHasMember(self, self.class_stack.items[ci], record_name)) {
+                eagerGate(4);
+                return;
+            }
         }
     }
     if (sig.decl_span) |ds| {
@@ -716,7 +801,10 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
         const same = std.mem.eql(u8, decl_pkg, call_pkg);
         const default_imported = std.mem.eql(u8, decl_pkg, "kotlin") or
             std.mem.startsWith(u8, decl_pkg, "kotlin.");
-        if (!same and !default_imported) return;
+        if (!same and !default_imported) {
+            eagerGate(5);
+            return;
+        }
     }
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(self.allocator);
@@ -726,6 +814,7 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
     }
     buf.print(self.allocator, ";ret={f}", .{sig.return_ty}) catch return;
     const rendered = self.allocator.dupe(u8, buf.items) catch return;
+    eagerGate(6);
     self.resolved_calls.put(call_span, .{ .decl_span = sig.decl_span, .render = rendered }) catch {
         self.allocator.free(rendered);
     };

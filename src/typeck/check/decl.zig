@@ -331,6 +331,7 @@ pub fn signatureOf(self: *Checker, f: *const Function) Allocator.Error!FnSig {
         .type_param_names = bounds.names,
         .type_param_bounds = bounds.bounds,
         .param_class_names = param_class_names,
+        .return_class = if (f.return_type) |*rt| classNameFromTyperef(rt) else null,
         .decl_span = f.name.span,
         .is_suspend = f.is_suspend,
         .is_extension = f.receiver_type != null,

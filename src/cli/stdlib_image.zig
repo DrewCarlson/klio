@@ -43,6 +43,7 @@ const parser = @import("parser");
 
 const pack = @import("pack");
 const interp_ir = @import("interp_ir");
+const types_mod = @import("types");
 const ir_mod = @import("ir");
 const image = interp_ir.image;
 const StdlibBase = interp_ir.build.StdlibBase;
@@ -404,6 +405,37 @@ pub fn parseUserFiles(gpa: Allocator, map: *SourceMap, paths: []const []const u8
 /// image. Null means "take the legacy whole-program path" — because the
 /// cache is disabled or unavailable, the user program fails to parse, the
 /// program needs the fallback build, or the base is not bakeable.
+
+/// Publish the image's own declarations for the checker (see
+/// `types.ExternDecls`): every class simple name, and the return class of
+/// every top-level function whose simple name resolves unambiguously.
+fn publishExternDecls(gpa: std.mem.Allocator, base: *const interp_ir.build.BuiltModule) void {
+    const mg = base.module.borrow();
+    defer mg.deinit();
+    const m = mg.get();
+    var classes = std.StringHashMap(void).init(gpa);
+    for (m.classes.items) |*c| classes.put(c.name, {}) catch {};
+    var rets = std.StringHashMap([]const u8).init(gpa);
+    var ambiguous = std.StringHashMap(void).init(gpa);
+    defer ambiguous.deinit();
+    for (m.funcs.items) |*f| {
+        if (f.kind != .plain) continue;
+        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
+        var head = std.mem.trimEnd(u8, f.return_ty.name, "?");
+        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        if (head.len == 0 or !classes.contains(head)) continue;
+        if (ambiguous.contains(f.name)) continue;
+        const gop = rets.getOrPut(f.name) catch continue;
+        if (gop.found_existing) {
+            if (!std.mem.eql(u8, gop.value_ptr.*, head)) {
+                _ = rets.remove(f.name);
+                ambiguous.put(f.name, {}) catch {};
+            }
+        } else gop.value_ptr.* = head;
+    }
+    types_mod.pending_extern_decls = .{ .classes = classes, .fn_return_class = rets };
+}
+
 pub fn tryPrepare(
     gpa: Allocator,
     paths: []const []const u8,
@@ -608,6 +640,7 @@ fn finishFromLoaded(
     map.files.appendSlice(map.arena.allocator(), loaded.map.files.items) catch return null;
     const user2 = parseUserFiles(gpa, map, paths, user.texts) orelse return null;
 
+    publishExternDecls(gpa, &loaded.base.built);
     if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
     const built = interp_ir.build.buildModuleFilesExtend(gpa, loaded.base, user2.asts) catch return null;
 
@@ -700,6 +733,7 @@ fn bakeAndPrepare(
     map.* = SourceMap.init(gpa);
     map.files.appendSlice(map.arena.allocator(), dep_map.files.items) catch return null;
     const user2 = parseUserFiles(gpa, map, paths, user.texts) orelse return null;
+    publishExternDecls(gpa, &base.built);
     if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
     const built = interp_ir.build.buildModuleFilesExtend(gpa, base, user2.asts) catch return null;
     return .{ .built = built, .map = map, .bindings = deps.bindings, .user_asts = user2.asts };

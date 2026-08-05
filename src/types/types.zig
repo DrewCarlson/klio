@@ -971,3 +971,15 @@ test "as nullable is idempotent" {
 test {
     testing.refAllDecls(constraints);
 }
+
+
+/// Declarations the checker cannot see in source because they arrived as a
+/// prebuilt image (the stdlib-image path hands over a built module and never
+/// parses pack sources). Published by the image loader before the eager pass,
+/// consumed once by `typecheckModule`.
+pub const ExternDecls = struct {
+    classes: std.StringHashMap(void),
+    fn_return_class: std.StringHashMap([]const u8),
+};
+
+pub var pending_extern_decls: ?ExternDecls = null;
