@@ -451,14 +451,14 @@ fn classifyFlattenable(f: *const Func) u8 {
     return 1;
 }
 
-fn acquireRegs(ev_in: *EvalTls, allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value) {
-    // Buffer pools belong to the RUNNING thread. A caller may hold a pointer
-    // to the EvalTls of the thread that built a frame, and a resumed
-    // coroutine runs on whatever thread the dispatcher hands it; reaching
-    // another thread's free list races its length (an intermittent
-    // `integer overflow` when a guarded decrement went negative).
-    _ = ev_in;
-    const ev: *EvalTls = &evtls;
+/// Every buffer pool belongs to the RUNNING thread: a frame captures its
+/// `EvalTls` pointer when it is built, but a suspended coroutine resumes on
+/// whatever thread the dispatcher hands it, and reaching the origin thread's
+/// free list races its length (an intermittent `integer overflow` when a
+/// guarded decrement went negative). Callers therefore pass `&evtls` read
+/// fresh at the call, never a stored pointer — which also keeps the thread
+/// pointer to one lookup per frame operation instead of one per pool.
+fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32) Allocator.Error!std.ArrayList(Value) {
     const ra = regsAlloc(allocator);
     if (ev.regs_pool.items.len > 0) {
         const buf = ev.regs_pool.items[ev.regs_pool.items.len - 1];
@@ -487,9 +487,7 @@ fn acquireRegs(ev_in: *EvalTls, allocator: Allocator, n: u32) Allocator.Error!st
 /// buffer ever outlives the top-level evaluation that produced it (or crosses an
 /// allocator). Only under a freeing backend — the tracing GC owns this memory and
 /// the arena never frees, so neither pools.
-fn releaseRegs(ev_in: *EvalTls, allocator: Allocator, regs: *std.ArrayList(Value)) void {
-    _ = ev_in;
-    const ev: *EvalTls = &evtls;
+fn releaseRegs(ev: *EvalTls, allocator: Allocator, regs: *std.ArrayList(Value)) void {
     const ra = regsAlloc(allocator);
     // The size-classed arg carriers come from the RUN allocator (frames and
     // hosts both produce them), so none may outlive the outermost evaluation
@@ -620,9 +618,14 @@ pub fn acquireArgsCap(allocator: Allocator, cap: usize) Allocator.Error!std.Arra
 /// The values inside are the caller's responsibility; only the buffer is
 /// recycled.
 pub fn releaseArgs(allocator: Allocator, list: *std.ArrayList(Value)) void {
+    releaseArgsIn(&evtls, allocator, list);
+}
+
+/// `releaseArgs` with the running thread's state already resolved, so a frame
+/// teardown pays one thread-pointer lookup for all of its buffers.
+pub fn releaseArgsIn(ev: *EvalTls, allocator: Allocator, list: *std.ArrayList(Value)) void {
     if (list.capacity != 0) {
         if (argsClassOfExact(list.capacity)) |ci| {
-            const ev = &evtls;
             const bucket = &ev.args_class_pool[ci];
             if (bucket.len < ARGS_CLASS_MAX) {
                 const buf = list.allocatedSlice();
@@ -1659,9 +1662,7 @@ fn chainAllocator() Allocator {
 /// on this thread.
 const CHAIN_POOL_MAX: usize = 128;
 
-fn chainAcquire(ev_in: *EvalTls) std.ArrayList(EnclosingEntry) {
-    _ = ev_in;
-    const ev: *EvalTls = &evtls;
+fn chainAcquire(ev: *EvalTls) std.ArrayList(EnclosingEntry) {
     if (ev.chain_pool_len > 0) {
         ev.chain_pool_len -= 1;
         const buf = ev.chain_pool[ev.chain_pool_len];
@@ -1670,9 +1671,7 @@ fn chainAcquire(ev_in: *EvalTls) std.ArrayList(EnclosingEntry) {
     return .empty;
 }
 
-fn chainRelease(ev_in: *EvalTls, list: *std.ArrayList(EnclosingEntry)) void {
-    _ = ev_in;
-    const ev: *EvalTls = &evtls;
+fn chainRelease(ev: *EvalTls, list: *std.ArrayList(EnclosingEntry)) void {
     if (list.capacity > 0 and ev.chain_pool_len < CHAIN_POOL_MAX) {
         ev.chain_pool[ev.chain_pool_len] = list.allocatedSlice();
         ev.chain_pool_len += 1;
@@ -2764,12 +2763,14 @@ const Frame = struct {
         // Args before regs: `releaseRegs` runs the depth-0 pool drain, so
         // the outermost frame's own carriers must already be pooled (or
         // they leak past the drain).
-        releaseArgs(self.allocator, &self.params);
-        releaseArgs(self.allocator, &self.captures);
-        // The pools belong to the thread that is tearing the frame down, not
-        // to the one that built it (see the re-bind in `runFlatLoop`).
-        releaseRegs(&evtls, self.allocator, &self.regs);
-        chainRelease(&evtls, &self.enclosing_this);
+        // The pools belong to the thread tearing the frame down, not to the
+        // one that built it (see `acquireRegs`): read the running thread once
+        // and hand it to each pool.
+        const ev: *EvalTls = &evtls;
+        releaseArgsIn(ev, self.allocator, &self.params);
+        releaseArgsIn(ev, self.allocator, &self.captures);
+        releaseRegs(ev, self.allocator, &self.regs);
+        chainRelease(ev, &self.enclosing_this);
     }
 
     fn read(self: *const Frame, r: Reg) Value {
@@ -4026,9 +4027,7 @@ inline fn actPoolOn() bool {
     return !runtime.reclaimEnabled() and runtime.gc.gc_enabled;
 }
 
-fn actAlloc(ev_in: *EvalTls, allocator: Allocator) Allocator.Error!*Activation {
-    _ = ev_in;
-    const ev: *EvalTls = &evtls;
+fn actAlloc(ev: *EvalTls, allocator: Allocator) Allocator.Error!*Activation {
     if (actPoolOn()) {
         if (ev.act_pool_len > 0) {
             ev.act_pool_len -= 1;
@@ -4039,9 +4038,7 @@ fn actAlloc(ev_in: *EvalTls, allocator: Allocator) Allocator.Error!*Activation {
     return allocator.create(Activation);
 }
 
-fn actFree(ev_in: *EvalTls, allocator: Allocator, act: *Activation) void {
-    _ = ev_in;
-    const ev: *EvalTls = &evtls;
+fn actFree(ev: *EvalTls, allocator: Allocator, act: *Activation) void {
     if (actPoolOn()) {
         if (ev.act_pool_len < ACT_POOL_MAX) {
             ev.act_pool[ev.act_pool_len] = act;
