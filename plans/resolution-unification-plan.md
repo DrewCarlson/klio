@@ -212,8 +212,28 @@ their host RETURN types — `Thread` has no class declaration), and the
 `kotlin.math.absoluteValue` / `kotlin.text.format` / `kotlin.StringBuilder`
 shapes, which are receiver-form or companion-form keys.
 
-Closed 2026-08-05: `sortedSetOf`, `sortedMapOf`, `linkedStringMapOf` now
-have klio-authored declarations (pinned).
+Closed 2026-08-05: `sortedSetOf`, `sortedMapOf`, `linkedStringMapOf`
+(pinned), `readLine`, `exitProcess` (with its `Nothing` return, so a call
+in a `when` branch or an elvis tail type-checks as Kotlin's does).
+
+Two corrections to the instrument itself, both material to the ratchet:
+
+- The alignment check now recognizes a CLASS declared under another
+  package (`kotlin.StringBuilder` for `kotlin.text.StringBuilder`) and an
+  extension property's `__ext_get_<Head>_<name>` getter. Those were being
+  counted as holes they never were.
+- The audit is PROGRAM-SCOPED. The IR is lazy, so a declaration enters the
+  module only when the program under audit reaches its package: the same
+  audit reports 9 holes for a `println`-only program and 6 for one that
+  imports `kotlin.system`. Run it on a program that exercises the surface
+  being measured; the number is a lower bound on what is declared, never
+  an upper bound on what is missing.
+
+At the widest scope reached so far the residue is exactly the six
+klio-internal `__klio_*` host helpers (deliberately undeclared) plus
+`kotlin.concurrent.thread` and `kotlin.text.format`, which are blocked on
+declaring a host RETURN type (`Thread`) and a companion extension
+(`String.Companion.format`) respectively.
 
 
 Steps 2 and 3 of the no-holes symbol table (step 1 and its whole stdlib grind are
