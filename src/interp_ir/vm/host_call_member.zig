@@ -10952,11 +10952,16 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
     // consults for an Instance (hostHasMember, the shadow probes) is a
     // function of the class, not the individual instance. Array builders use
     // a different (no-prepend) dispatch and are excluded.
-    const cacheable = !stdlib.isArrayBuilder(name) and
-        !(try userToplevelExtNamedExists(self, allocator, receiver, name));
-    if (cacheable) {
-        const name_p = memberNameIdentity(self, name) orelse
-            return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, null);
+    // The resolution cache is keyed by exactly what decides the answer — the
+    // receiver's class (or its static type-fqn), the name, and whether the
+    // call has arguments — so it is probed FIRST. Everything that decides
+    // whether an entry may be STORED (`isArrayBuilder`, and the top-level
+    // extension probe, which borrows the module and hashes the name) is a
+    // pure function of the same inputs, so a hit already proves it; computing
+    // it ahead of the probe put a module borrow and a name-index lookup on
+    // every intrinsic member dispatch.
+    const name_p_opt = memberNameIdentity(self, name);
+    if (name_p_opt) |name_p| {
         const type_p: usize = if (receiver.* == .Instance) blk: {
             const g = receiver.Instance.borrow();
             defer g.deinit();
@@ -10993,7 +10998,9 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
             const func = entry.func orelse return null;
             return try dispatchWithReceiver(self, allocator, entry.fqn, func, receiver, args);
         }
-        return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, key);
+        const cacheable = !stdlib.isArrayBuilder(name) and
+            !(try userToplevelExtNamedExists(self, allocator, receiver, name));
+        return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, if (cacheable) key else null);
     }
     return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, null);
 }
