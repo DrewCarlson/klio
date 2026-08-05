@@ -344,7 +344,27 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
   a PACK-TYPED receiver yields neither, so the checker falls through to
   tolerant typing with nothing to resolve and nothing to record.
 
-  So P7's precondition is not "extend the channel to member calls" but
+  REFINED (same day, by probe): it is not pack classes either. A user class
+  behaves identically —
+
+      val m: Box2 = box2Of() ; m.clear()   with_class=1   (annotated)
+      val m = Box2()         ; m.clear()   with_class=1   (constructor)
+      val m = box2Of()       ; m.clear()   with_class=0   (plain factory)
+
+  A local with no annotation takes its class from its initializer's
+  `expr_class` entry, and only the extension-candidate path ever wrote one.
+  FIXED: `FnSig` now carries the class its declared RETURN type names (a
+  plain user class is `Type.Unresolved` here — only generic INSTANTIATIONS
+  are `Type.Generic` — so the identity must travel with the signature), and
+  `checkCall` records it when one unambiguous declaration owns the name.
+  The plain factory now reaches `with_class=1`.
+
+  Still open for the compose case: a pack factory whose return is a GENERIC
+  instantiation (`mutableStateMapOf(): SnapshotStateMap<K, V>`). The
+  generic head is the next case, and `member_with_class` is its acceptance
+  test.
+
+  So P7's precondition was not "extend the channel to member calls" nor
   "typeck can name pack classes". Until that holds, a member-call channel
   yields zero on every pack-using program — which is every program the
   compose and dispatch work cares about. That is the first build task, and
