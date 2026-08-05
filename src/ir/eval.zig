@@ -2938,6 +2938,26 @@ const LeafAbandon = error{LeafAbandon};
 /// closure captures, no seeded receiver chain, no coroutine boundary, no
 /// type arguments, nothing the activation's open/teardown would have to
 /// carry. Anything the prepare pushed for the callee stays on the frame path.
+/// A flat request that carries nothing beyond its callee and arguments — no
+/// captures, receiver chain, closure identity, type arguments, keepalive,
+/// context mark, scope guard, composer push or coroutine boundary. Such a
+/// request is reproducible from the call site alone.
+fn leafPlainReq(req: FlatCallReq) bool {
+    return req.captures.items.len == 0 and
+        req.chain.len == 0 and
+        req.closure_id == null and
+        req.type_args.len == 0 and
+        req.keepalive == null and
+        req.typed_saved == null and
+        req.ctx_mark_override == null and
+        req.pop_enclosing_n == 0 and
+        req.scope_guard_ident == 0 and
+        !req.composer_pushed and
+        !req.suspend_barrier and
+        !req.root_pump and
+        req.owning == null;
+}
+
 fn leafReqServable(req: FlatCallReq) bool {
     return req.captures.items.len == 0 and
         req.chain.len == 0 and
@@ -8281,6 +8301,29 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         false;
     const skip_member = site_skip or (cmg_skip and !is_ctor_name and !shadow_capture and
         host.cmgGlobalSkip(func_p, &this_val, name_str, arg_values));
+    // Full replay: this site already resolved, for this receiver class and
+    // argument shape, to a plain global whose dispatch was a fused
+    // activation. Rebuild that activation and skip both the member walk and
+    // the overload ranking.
+    if (site_skip and cmg.type_args.len == 0 and argNamesAllNull(cmg.arg_names)) {
+        const claimed = @atomicLoad(u32, @constCast(&cmg.global_fid), .acquire);
+        if (claimed != 0 and flatEnabled()) {
+            const fid = FuncId.from(claimed - 1);
+            if (frame.module.funcById(fid)) |gf| {
+                if (gf.params.len == arg_values.len) {
+                    var args_list = try acquireArgsCap(allocator, arg_values.len);
+                    args_list.appendSliceAssumeCapacity(arg_values);
+                    frame.flat_call = .{
+                        .func = gf,
+                        .args = args_list,
+                        .dst = cmg.dst,
+                    };
+                    orAudit("CallMemberOrGlobal", name_str, "site_global_replay", -1, null);
+                    return .flat_call;
+                }
+            }
+        }
+    }
     var single_cand = false;
 
     if (routeTraceOn(name_str)) std.debug.print("[cmgsec] member-gate ctor={} shadow={} skip={}\n", .{ is_ctor_name, shadow_capture, skip_member });
@@ -8682,6 +8725,20 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         if (takeHostFlatReq()) |req0| {
             var prep = req0;
             prep.dst = cmg.dst;
+            // Claim the site's global target when this dispatch was a plain
+            // one: nothing pushed, nothing rebound, no receiver prepended.
+            if (site_key) |k| {
+                if (!is_ctor_name and !shadow_capture and first_real_err == null and
+                    cmg.type_args.len == 0 and mit_saved.items.len == 0 and
+                    prep.args.items.len == arg_values.len and
+                    prep.run_module == null and leafPlainReq(prep) and
+                    dispatchCacheStable() and
+                    @atomicLoad(u64, @constCast(&cmg.skip_cls), .acquire) == k.cls and
+                    @atomicLoad(u64, @constCast(&cmg.skip_sig), .monotonic) == k.sig)
+                {
+                    _ = @cmpxchgStrong(u32, @constCast(&cmg.global_fid), 0, prep.func.id.int() + 1, .acq_rel, .monotonic);
+                }
+            }
             frame.flat_call = prep;
             return .flat_call;
         }

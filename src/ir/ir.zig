@@ -703,6 +703,14 @@ pub const Inst = union(enum) {
         /// answers ahead of, without a borrow or a hash.
         skip_cls: u64 = 0,
         skip_sig: u64 = 0,
+        /// The global-leg target a previous execution of this instruction
+        /// resolved for `skip_cls`/`skip_sig`, stored as `FuncId + 1` (0 =
+        /// unclaimed). Claimed only for a plain positional call the overload
+        /// terminal answered with a fused activation and nothing else — no
+        /// constructor, no type arguments, no scoped rebinding, no receiver
+        /// prepended — so replaying it reproduces that dispatch exactly while
+        /// skipping the ranking.
+        global_fid: u32 = 0,
     },
     /// Write a global / top-level binding. Mirrors `LoadGlobal` for
     /// the write side: routed through `Host.store_global` so a
