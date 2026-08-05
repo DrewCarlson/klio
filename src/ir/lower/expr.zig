@@ -9132,6 +9132,45 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
             return out;
         }
     }
+    // Shapes that name their own type outright. Each one is exact — the cast
+    // states the type, `this` is the enclosing class, a predicate operator
+    // yields Boolean — and each was reaching the call sites below with no
+    // receiver type at all, which is what forces a runtime name walk.
+    switch (e.*) {
+        // `x as T` / `x as? T` — the cast IS the answer; `as?` carries the
+        // null the safe form can produce.
+        .As => |cast| {
+            var out = try decl_mod.loweredTypeRef(b.allocator, &cast.ty, true);
+            if (cast.safe) out.nullable = true;
+            return out;
+        },
+        // `this` (or `this@Outer`) inside a class body.
+        .This => |this_e| {
+            if (this_e.qualifier) |q| {
+                if (b.module.uniqueClassIdBySimpleName(q.name) != null) {
+                    return .{ .name = try b.allocator.dupe(u8, q.name), .nullable = false, .args = &.{} };
+                }
+                return null;
+            }
+            if (b.ownerClass()) |owner| {
+                return .{ .name = try b.allocator.dupe(u8, owner), .nullable = false, .args = &.{} };
+            }
+            return null;
+        },
+        .Binary => |bin| switch (bin.op) {
+            .Eq, .Neq, .IdentEq, .IdentNeq, .Lt, .Le, .Gt, .Ge, .In, .NotIn, .And, .Or => {
+                return .{ .name = try b.allocator.dupe(u8, "Boolean"), .nullable = false, .args = &.{} };
+            },
+            else => {},
+        },
+        .Unary => |un| switch (un.op) {
+            .Not => return .{ .name = try b.allocator.dupe(u8, "Boolean"), .nullable = false, .args = &.{} },
+            // `-x` / `+x` keep the operand's type.
+            .Neg, .Pos => return try staticExprTypeRef(b, un.expr),
+            else => {},
+        },
+        else => {},
+    }
     return try localInitTypeRef(b, e);
 }
 

@@ -289,7 +289,14 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         // (notably to type a trailing receiver lambda correctly).
         switch (e.*) {
             .This => |t| if (t.qualifier == null) {
-                if (b.enclosingRecvTy()) |ty| try b.setLocalDeclType(p.name.name, ty);
+                if (b.enclosingRecvTy()) |ty| {
+                    try b.setLocalDeclType(p.name.name, ty);
+                } else if (b.ownerClass()) |owner| {
+                    // Inside an ordinary member, `val self = this` is the
+                    // declaring class — no extension receiver is in scope to
+                    // supply it, and without this the local stayed untyped.
+                    try b.setLocalDeclType(p.name.name, owner);
+                }
             },
             .Path => |path| if (path.segments.len == 1) {
                 if (b.localDeclType(path.segments[0].name)) |ty| {
@@ -301,12 +308,15 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             // curState as CancellableContinuation<Unit>` types `cont` with
             // the full generic reference, so a member call on it reaches
             // resolution with the type arguments applicability needs.
-            .As => |cast| if (!cast.safe) {
+            .As => |cast| {
                 try b.setLocalDeclTypeOwned(
                     p.name.name,
                     try expr_mod.loweredOwnedLocalTypeRef(b, &cast.ty),
                 );
-                if (cast.ty.nullable) try b.setLocalDeclNullable(p.name.name);
+                // `as?` yields the cast type OR null, so the local is
+                // nullable; the type head is still exact, which is what a
+                // member call on it needs.
+                if (cast.ty.nullable or cast.safe) try b.setLocalDeclNullable(p.name.name);
             },
             // A call initializer's declared RETURN type is the local's
             // static type (`val onCancellation = clause
@@ -329,6 +339,23 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             // `val clause = findClause(x) ?: continue` — the elvis arm of
             // staticExprTypeRef strips the null.
             .Binary => |bin| if (bin.op == .Elvis) {
+                if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
+                    const was_nullable = ct.nullable;
+                    try b.setLocalDeclTypeOwned(p.name.name, ct);
+                    if (was_nullable) try b.setLocalDeclNullable(p.name.name);
+                }
+            } else {
+                // A predicate operator (`a == b`, `a in xs`, `a && b`) types
+                // the local `Boolean` outright.
+                if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
+                    try b.setLocalDeclTypeOwned(p.name.name, ct);
+                }
+            },
+            // Shapes that name their own type: a cast states it, `this` is the
+            // enclosing class, `!x` is Boolean and `-x` keeps its operand's
+            // type. Each of these left the local untyped, so every member call
+            // on it had to resolve by name at run time.
+            .Unary => {
                 if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
                     const was_nullable = ct.nullable;
                     try b.setLocalDeclTypeOwned(p.name.name, ct);
