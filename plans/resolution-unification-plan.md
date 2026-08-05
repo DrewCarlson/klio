@@ -306,6 +306,23 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
   index-primary resolveCall and the NaN-style static-overload class). The
   `class_member_names` fallback pair (the two helpers' unknown-receiver arms +
   Phase C's `!receiver_known` arm) is P7's deletion precondition.
+- **P7 measurement (2026-08-06): the channel is inert today.**
+  `KLIO_EAGER_AUDIT` now attributes its yield per gate. On real programs
+  it records NOTHING:
+
+      compose snapshot-map program:  entered=0  recorded=0
+      numeric arithmetic program:    entered=0  recorded=0
+      three user bare calls:         entered=3  recorded=3
+
+  The six gates (vararg, type-param, extension-name, member-shadow,
+  package-visibility, decl-span filter) are NOT the constraint — the ENTRY
+  is. `recordResolvedCall` is reached only for a BARE call whose simple
+  name is in the top-level function map (`self.fns`), so a MEMBER call
+  never enters, and member calls are where the overload decisions that
+  matter live. So "typeck records and lowering reuses resolution" is not in
+  effect at all; P7's work is extending the channel to member calls, not
+  relaxing gates.
+
 - **P8** — hatch deletion (RC-H catalog above).
 - **P9** — optional flat bytecode + pack serialization.
 
