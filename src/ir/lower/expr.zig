@@ -3006,6 +3006,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // builder's set already includes what it inherited).
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
     b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
+    if (std.c.getenv("KLIO_LAMINH") != null) std.debug.print("[laminh] produce lambda b={x} n={d}\n", .{ @intFromPtr(b) & 0xffff, b.localDeclTypeCount() });
     // Fold ACTIVE inline-splice param types into the snapshot: a nested
     // closure inside a spliced body captures the callee's parameter by
     // name (`destination.add(it)` inside `transform(element)?.let { ... }`
@@ -3142,6 +3143,7 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     }
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
     b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
+    if (std.c.getenv("KLIO_LAMINH") != null) std.debug.print("[laminh] produce anonfun b={x} n={d}\n", .{ @intFromPtr(b) & 0xffff, b.localDeclTypeCount() });
     const lowered = try lowerLambdaBodyCapturingKind(
         b.module,
         param_idents,

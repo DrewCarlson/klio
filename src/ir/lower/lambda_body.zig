@@ -287,6 +287,18 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         nf_own.deinit();
         module.pending_lambda_nonfn_locals = null;
     }
+    // `KLIO_LAMINH=1` — the declared-type inheritance channel, producer and
+    // consumer. A lambda body that inherits an EMPTY snapshot while its
+    // enclosing function's builder holds records means the body was lowered
+    // from a builder that is not the one holding the enclosing locals, which
+    // costs every member call in that body its receiver type.
+    if (std.c.getenv("KLIO_LAMINH") != null) {
+        std.debug.print("[laminh] consume pending={?d} nonfn={} params={?d}\n", .{
+            if (module.pending_lambda_local_decl_types) |l| l.types.count() else null,
+            module.pending_lambda_nonfn_locals != null,
+            if (module.pending_lambda_param_types) |pt| pt.len else null,
+        });
+    }
     if (module.pending_lambda_local_decl_types) |*locals| {
         try b.inheritLocalDeclTypes(locals);
         var owned = locals.*;

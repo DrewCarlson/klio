@@ -2656,13 +2656,28 @@ and the successful reads). So the body is lowered while the caller's
 record is still being refined, and it receives an EMPTY snapshot
 (`ndecl=0`) rather than a stale one.
 
-Next step: print `module.pending_lambda_local_decl_types` unconditionally
-at the top of the lambda-body lower for this repro and distinguish
-"channel was null" (a producer that never set it — the `apply` receiver
-lambda reaches `lowerLambdaBody*` through a caller other than the two in
-`expr.zig`) from "snapshot taken too early". The fix differs: the first
-needs the missing producer to set the channel, the second needs the
-lambda lowered after the enclosing declaration settles.
+ANSWERED 2026-08-05 (`KLIO_LAMINH=1`, now a permanent diagnostic that
+prints both ends of the channel). The trace for the repro:
+
+    WRITE iterator = ListIterator          caller records the type
+    [laminh] produce lambda b=eb78 n=0     producer holds ZERO records
+    [laminh] consume pending=1             body inherits 1 unrelated entry
+    WRITE iterator = MutableListIterator
+    READ iterator decl=MutableListIterator b=92a8 ndecl=2   (outside)
+    READ iterator decl=<unset>             b=…   ndecl=0    (inside)
+
+Neither branch: the channel was SET, and set by a builder (`eb78`) that is
+not the enclosing function's (`92a8`, 2 records) and holds nothing. So the
+`apply` lambda body is lowered from a THIRD builder that never held the
+enclosing locals — the snapshot is faithful to the wrong scope.
+
+That is a pipeline-shape bug, not a missing-call bug: the fix is to lower
+the lambda from the builder that owns the enclosing scope (or to give the
+producing builder that scope), and a patch at either end of the channel
+would only paper over it. Finding which construction produces `eb78` is
+the remaining step; `KLIO_LAMINH` prints its identity, so a breakpoint or
+a pointer match at the two `FuncBuilder.init` sites in `decl.zig` /
+`thunks.zig` settles it.
 
 This is the last named cluster in `local_no_decl_type`. The other residual
 names — `symbol`/`index`/`array`, and the `it` family — are separate.
