@@ -1003,7 +1003,15 @@ pub fn runBuiltModuleArgs(
 }
 
 
-/// `KLIO_DECL_AUDIT=1` — the completeness audit for the no-holes symbol table:
+/// `KLIO_DECL_AUDIT=1` — the completeness audit for the no-holes symbol table.
+///
+/// PROGRAM-SCOPED: the IR is lazy, so a declaration only enters the module
+/// when the program under audit reaches its package. Run it on a program that
+/// exercises the surface being measured — the same audit reports 9 holes for
+/// a `println`-only program and 6 for one that also imports `kotlin.system`.
+/// The number is a lower bound on what is declared, never an upper bound on
+/// what is missing.
+///
 /// every FQN the intrinsic registry can serve, paired with whether the module
 /// carries a DECLARATION for it. A callable the runtime can dispatch but the
 /// resolver cannot see is a hole: resolution has to fall back to a name probe
@@ -1052,7 +1060,24 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
         // scope walk must reconcile separately.
         {
             const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
-            if (module.funcsBySimpleName(simple).len != 0) {
+            var aligned_elsewhere = module.funcsBySimpleName(simple).len != 0;
+            // A CLASS the module declares under another package
+            // (`kotlin.StringBuilder` for `kotlin.text.StringBuilder`) is the
+            // same shape of mismatch as a function's.
+            if (!aligned_elsewhere and module.uniqueClassIdBySimpleName(simple) != null) aligned_elsewhere = true;
+            // An extension property's getter carries the
+            // `__ext_get_<Head>_<name>` naming contract, so its declaration
+            // never appears under the registry's own key.
+            if (!aligned_elsewhere) {
+                var it2 = module.registry.ext_prop_type_heads.iterator();
+                while (it2.next()) |e2| {
+                    if (std.mem.eql(u8, e2.key_ptr.b, simple)) {
+                        aligned_elsewhere = true;
+                        break;
+                    }
+                }
+            }
+            if (aligned_elsewhere) {
                 unaligned += 1;
                 if (unaligned_samples.items.len < 20) unaligned_samples.append(gpa, fqn) catch {};
                 continue;
