@@ -359,10 +359,25 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
   `checkCall` records it when one unambiguous declaration owns the name.
   The plain factory now reaches `with_class=1`.
 
-  Still open for the compose case: a pack factory whose return is a GENERIC
-  instantiation (`mutableStateMapOf(): SnapshotStateMap<K, V>`). The
-  generic head is the next case, and `member_with_class` is its acceptance
-  test.
+  ANSWERED for the compose case, and it is architectural. The generic head
+  was a red herring — `classNameFromTyperef` returns generic heads fine.
+  The probe says `mutableStateMapOf: not in fns`, and the reason is that
+  typeck never sees the declaration:
+
+      plain user program:            1 files / 2 decls handed to the checker
+      compose snapshot-map program:  1 files / 1 decls handed to the checker
+
+  Installed packs (and the stdlib) supply compiled IR, not source, so their
+  declarations never reach `typecheckModule` at all. The checker types the
+  user's own file against an otherwise empty universe. That is why no pack
+  function is in `fns`, no pack class can be named, and every member call
+  on a pack-typed value stops before member resolution begins.
+
+  **P7's precondition is therefore: typeck must see pack declarations** —
+  by shipping declaration headers in the pack format, or by reconstructing
+  signatures from pack IR at load. Nothing inside the checker reaches it,
+  and neither does more work on the eager channel. That is the next build
+  task, and it is a pack-format change, not a resolver change.
 
   So P7's precondition was not "extend the channel to member calls" nor
   "typeck can name pack classes". Until that holds, a member-call channel
