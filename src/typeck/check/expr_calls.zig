@@ -62,11 +62,18 @@ pub fn checkCall(
             // A plain user class is `Unresolved` in this checker, so the
             // class travels on the SIGNATURE. One unambiguous declaration
             // for the name settles it; an overload set does not.
-            if (self.fns.get(callee.Path.segments[0].name)) |sigs| {
+            const nm0 = callee.Path.segments[0].name;
+            if (self.fns.get(nm0)) |sigs| {
                 if (sigs.items.len == 1) {
                     if (sigs.items[0].return_class) |cn| {
                         if (self.classes.contains(cn)) self.expr_class.put(call_span, cn) catch {};
                     }
+                }
+            } else if (self.extern_fn_return_class) |ext| {
+                // Known only from a prebuilt image: same rule, sourced from
+                // the module the image carries instead of from source.
+                if (ext.get(nm0)) |cn| {
+                    if (self.classes.contains(cn)) self.expr_class.put(call_span, cn) catch {};
                 }
             }
         }

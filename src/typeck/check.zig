@@ -232,6 +232,15 @@ pub fn typecheckModule(
     cfa.analyses.contracts.setUserInlineContracts(user_contracts);
     var tc = try Checker.new(allocator, resolution);
     defer destroyQueryScratch(allocator, tc.query_scratch);
+    if (types.pending_extern_decls) |ed| {
+        var cit = ed.classes.keyIterator();
+        while (cit.next()) |k| {
+            if (tc.classes.contains(k.*)) continue;
+            try tc.classes.put(k.*, ClassInfo.init(allocator));
+        }
+        tc.extern_fn_return_class = ed.fn_return_class;
+        types.pending_extern_decls = null;
+    }
     for (files) |*f| {
         const pkg = f.package orelse continue;
         var dotted: std.ArrayList(u8) = .empty;
@@ -784,6 +793,8 @@ pub const Checker = struct {
     extension_properties: std.StringHashMap(std.ArrayList(ExtensionPropSig)),
     /// File-level user classes.
     classes: std.StringHashMap(ClassInfo),
+    /// Return classes for functions known only from a prebuilt image.
+    extern_fn_return_class: ?std.StringHashMap([]const u8) = null,
     /// Simple names declared by MORE THAN ONE class. `classes` is keyed by
     /// simple name, so two same-named classes in different packages would
     /// otherwise silently overwrite each other and every lookup would answer
