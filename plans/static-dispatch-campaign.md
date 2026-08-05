@@ -2549,3 +2549,35 @@ a file boundary was tolerated by the stdlib load path instead of
 rejected, and the anonymous key set silently lost its base class. A
 stdlib source that does not parse should fail the build loudly — the
 next unit.
+
+## Addendum 57 (2026-08-05): measure WORK COMPLETED, not wall time
+
+The remaining compose reds all report ~30s wall, which reads as "1% over
+budget". That reading is wrong and it misdirected a whole leg of tuning.
+These tests declare `runTest(timeout = 30.seconds)`, so a test that
+cannot finish reports ~30s no matter how far behind it is (a 56s reading
+is the 30s budget plus a teardown drain, not slower work).
+
+The real metric is how much of the test's own loop completed, which
+`KLIO_CALL_STATS` gives directly — every one of these tests is a fixed
+count of `mutate` calls:
+
+| test | completed / total | factor needed |
+|---|---|---|
+| SnapshotStateMapTests.concurrentMixingWriteApply_set | 100k / 100k | PASSES (28.9s) |
+| SnapshotStateMapTests.concurrentMixingWriteApply_clear | 200k / 1,100k | 5.5x |
+| SnapshotStateListTests.concurrentMixingWriteApply_addAll_clear | 50k / 100k addAll | 2x |
+
+So the reds are 2x-5.5x away, not 1%. Nothing in the 5-10%-per-unit
+class closes that; the levers that can are the flattened engine
+(`frame_push_flattenable` is 100% of frames on these workloads), native
+persistent collections, or whole-function JIT coverage of these bodies.
+
+`concurrentMixingWriteApply_set` passing at 28.9s for its full 100k is
+the calibration point: ~3.4k snapshot mutations/second through the
+interpreted snapshot machinery.
+
+Method note: run one test with `KLIO_CALL_STATS=1`, read the
+`SnapshotState{Map,List}.mutate` / `.addAll` counter, and compare against
+the loop bounds in the test source. Wall time is only usable for a test
+that PASSES.
