@@ -166,6 +166,9 @@ const EvalTls = struct {
     regs_pool: std.ArrayListUnmanaged([]Value) = .empty,
     /// Free-list of frame ARG/CAPTURE carrier buffers (see `acquireArgsCap`).
     args_pool: std.ArrayListUnmanaged([]Value) = .empty,
+    /// Size-classed free-lists of arg/capture carriers, one bucket per entry
+    /// of `ARGS_CLASS_CAPS` (see `acquireArgsCap`).
+    args_class_pool: [ARGS_CLASS_CAPS.len]ArgsBucket = @splat(.{}),
     /// Lexical-origin override for file-private visibility (see
     /// `RefSiteOverride`).
     ref_site_override: ?RefSiteOverride = null,
@@ -479,6 +482,14 @@ fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32) Allocator.Error!std.A
 /// the arena never frees, so neither pools.
 fn releaseRegs(ev: *EvalTls, allocator: Allocator, regs: *std.ArrayList(Value)) void {
     const ra = regsAlloc(allocator);
+    // The size-classed arg carriers come from the RUN allocator (frames and
+    // hosts both produce them), so none may outlive the outermost evaluation
+    // that produced it — a pooled buffer surviving into the next run, or into
+    // a worker thread's teardown, is a dangling free. Draining at depth 0
+    // bounds the pool's lifetime to one evaluation, where the allocator is
+    // fixed, and still recycles across every nested call within it. This must
+    // run BEFORE the pooled-register early return below.
+    if (ev.eval_depth == 0 and argsClassPooled(ev)) drainArgsClassPool(ev, allocator);
     const gc_pool = !runtime.reclaimEnabled() and runtime.gc.gc_enabled;
     const pool_ok = (gc_pool or (runtime.reclaimEnabled() and ev.eval_depth > 0)) and
         regs.capacity > 0 and ev.regs_pool.items.len < REGS_POOL_MAX;
@@ -495,7 +506,7 @@ fn releaseRegs(ev: *EvalTls, allocator: Allocator, regs: *std.ArrayList(Value)) 
     }
     regs.deinit(ra);
     if (!gc_pool and ev.eval_depth == 0 and
-        (ev.regs_pool.items.len > 0 or ev.args_pool.items.len > 0)) drainRegsPool(ev, allocator);
+        (ev.regs_pool.items.len > 0 or ev.args_pool.items.len > 0 or argsClassPooled(ev))) drainRegsPool(ev, allocator);
 }
 
 /// Free every pooled register buffer. Called when the outermost frame unwinds
@@ -507,6 +518,26 @@ fn drainRegsPool(ev: *EvalTls, allocator: Allocator) void {
     for (ev.args_pool.items) |buf| allocator.free(buf);
     ev.args_pool.deinit(allocator);
     ev.args_pool = .empty;
+    drainArgsClassPool(ev, allocator);
+}
+
+/// Free every pooled size-classed arg carrier. The bytes left the collector's
+/// external-live estimate when they entered the pool (see `releaseArgs`).
+fn drainArgsClassPool(ev: *EvalTls, allocator: Allocator) void {
+    for (&ev.args_class_pool) |*bucket| {
+        for (bucket.bufs[0..bucket.len]) |buf| allocator.free(buf);
+        bucket.len = 0;
+    }
+}
+
+/// Whether any size-classed carrier is currently pooled. A pooled buffer
+/// belongs to the run's allocator, so the outermost unwind must drain them
+/// before that allocator goes away.
+fn argsClassPooled(ev: *const EvalTls) bool {
+    for (ev.args_class_pool) |bucket| {
+        if (bucket.len != 0) return true;
+    }
+    return false;
 }
 
 /// Per-thread free-list of frame ARG-carrier buffers. Every interpreted
@@ -520,16 +551,56 @@ fn drainRegsPool(ev: *EvalTls, allocator: Allocator) void {
 /// frees; pooling is pointless there.
 const ARGS_POOL_MAX: usize = 64;
 
+/// One size class's buffers. A fixed array: the pool is per-thread, bounded,
+/// and must never allocate to recycle.
+const ArgsBucket = struct {
+    bufs: [ARGS_CLASS_MAX][]Value = undefined,
+    len: usize = 0,
+};
+
+/// Size classes for the arg/capture carriers. The earlier pool was one
+/// top-of-stack slot whose fit check thrashed on mixed carrier sizes, which
+/// is why it was worth having only under the refcount backend. Bucketing by
+/// an exact capacity makes every acquire either an exact-size pop or a fresh
+/// allocation, so the pool serves the tracing GC — the default backend, where
+/// the alloc/free pair was a quarter of the interpreted call's cost.
+const ARGS_CLASS_CAPS = [_]usize{ 4, 8, 16, 32 };
+const ARGS_CLASS_MAX: usize = 32;
+
+fn argsClassOf(cap: usize) ?usize {
+    for (ARGS_CLASS_CAPS, 0..) |c, i| {
+        if (cap <= c) return i;
+    }
+    return null;
+}
+
+fn argsClassOfExact(len: usize) ?usize {
+    for (ARGS_CLASS_CAPS, 0..) |c, i| {
+        if (len == c) return i;
+    }
+    return null;
+}
+
 pub fn acquireArgsCap(allocator: Allocator, cap: usize) Allocator.Error!std.ArrayList(Value) {
-    if (runtime.reclaimEnabled()) {
-        const ev = &evtls;
-        if (ev.args_pool.items.len > 0) {
-            const buf = ev.args_pool.items[ev.args_pool.items.len - 1];
-            if (buf.len >= cap) {
-                ev.args_pool.items.len -= 1;
-                return .{ .items = buf[0..0], .capacity = buf.len };
-            }
+    const ev = &evtls;
+    if (argsClassOf(cap)) |ci| {
+        const bucket = &ev.args_class_pool[ci];
+        if (bucket.len > 0) {
+            bucket.len -= 1;
+            const buf = bucket.bufs[bucket.len];
+            // Re-enters the traced set (see releaseArgs).
+            if (runtime.gc.gc_enabled and !runtime.reclaimEnabled() and runtime.gc.external_accounting)
+                runtime.gc.noteExternalBytes(buf.len * @sizeOf(Value));
+            return .{ .items = buf[0..0], .capacity = buf.len };
         }
+        var list: std.ArrayList(Value) = .empty;
+        try list.ensureTotalCapacityPrecise(allocator, ARGS_CLASS_CAPS[ci]);
+        // A fresh carrier enters the traced set here, exactly as a pooled one
+        // does above: its release un-notes the same bytes, and an unbalanced
+        // pair drives the collector's external-live estimate negative.
+        if (runtime.gc.gc_enabled and !runtime.reclaimEnabled() and runtime.gc.external_accounting)
+            runtime.gc.noteExternalBytes(list.capacity * @sizeOf(Value));
+        return list;
     }
     var list: std.ArrayList(Value) = .empty;
     try list.ensureTotalCapacityPrecise(allocator, @max(cap, 4));
@@ -540,13 +611,21 @@ pub fn acquireArgsCap(allocator: Allocator, cap: usize) Allocator.Error!std.Arra
 /// The values inside are the caller's responsibility; only the buffer is
 /// recycled.
 pub fn releaseArgs(allocator: Allocator, list: *std.ArrayList(Value)) void {
-    if (runtime.reclaimEnabled() and list.capacity != 0) {
-        const ev = &evtls;
-        if (ev.args_pool.items.len < ARGS_POOL_MAX) {
-            const buf = list.allocatedSlice();
-            list.* = .empty;
-            ev.args_pool.append(allocator, buf) catch allocator.free(buf);
-            return;
+    if (list.capacity != 0) {
+        if (argsClassOfExact(list.capacity)) |ci| {
+            const ev = &evtls;
+            const bucket = &ev.args_class_pool[ci];
+            if (bucket.len < ARGS_CLASS_MAX) {
+                const buf = list.allocatedSlice();
+                list.* = .empty;
+                // Leaves the traced set (pooled, no live values) — shrink the
+                // collector's external-live estimate to match.
+                if (runtime.gc.gc_enabled and !runtime.reclaimEnabled() and runtime.gc.external_accounting)
+                    runtime.gc.noteExternalFreed(buf.len * @sizeOf(Value));
+                bucket.bufs[bucket.len] = buf;
+                bucket.len += 1;
+                return;
+            }
         }
     }
     list.deinit(allocator);
