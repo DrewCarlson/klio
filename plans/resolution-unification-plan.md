@@ -268,6 +268,29 @@ conveys that ranking. That is exactly what step 3's scope walk over the one
 table would decide from declarations instead of from a name list - so this
 hatch's deletion is BLOCKED ON step 3, not on more declarations.
 
+**Step 3 probe (2026-08-05): a table-driven ranking needs P7 first.**
+Three iterations replacing `isToplevelFunction` with a query over the symbol
+table, each fixing the previous symptom and exposing the next rule the alias
+list encodes implicitly:
+
+1. "declared package-level function with no receiver param" — broke
+   `xs.min()`: `min` is both `kotlin.math.min` and a List member, and the
+   member must win.
+2. \+ "unless the receiver declares the name" (`hostHasMember`) — no change:
+   a builtin receiver (List/String/Int) is not an Instance, so the
+   class-member probe cannot answer it.
+3. \+ "unless the registry serves `<receiver type>.<name>`" — fixed `min`,
+   then surfaced `minOf` NaN propagation
+   (`NaNPropagationTest.listMinOf`, `sequenceMinOf`): the generic and
+   numeric overloads of the same name rank by ARGUMENT TYPE, which no
+   name-or-receiver test can decide.
+
+That third symptom is the NaN-style static-overload class this plan already
+assigns to **P7** (eager typeck records + reuses resolution). So the
+dependency is empirical, not just architectural: step 3's scope walk cannot
+replace the alias list until P7 supplies argument-type-aware ranking, and
+the hatch deletion sits behind both. Reverted; the sweep is green again.
+
 **Acceptance (the completeness invariant):** DELETE `ir.host_bare_global_check`
 + `installHostBareGlobals`, the alias arms, `shadowedByClass`'s literal-kind
 mini-resolver and the `class_competes` interim gate, and CMG's `is_ctor_name` —
