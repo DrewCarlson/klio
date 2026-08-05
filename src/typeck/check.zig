@@ -525,6 +525,12 @@ pub const FnSig = struct {
     /// Per-type-parameter upper bounds. Each inner slice is the bound list
     /// for the corresponding type parameter, in declaration order.
     type_param_bounds: [][]Type,
+    /// User-class simple name this function's declared RETURN type names,
+    /// `null` for a primitive / function / unresolved return. A plain user
+    /// class is `Type.Unresolved` in this checker (only generic
+    /// INSTANTIATIONS are `Type.Generic`), so the class identity has to
+    /// travel beside the type — the same reason `param_class_names` exists.
+    return_class: ?[]const u8 = null,
     /// User-class simple name for each parameter whose declared type names
     /// a known class. `null` for primitive / function / unresolved slots.
     param_class_names: []?[]const u8,

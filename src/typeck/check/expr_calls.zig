@@ -38,7 +38,54 @@ const Variance = types.Variance;
 
 /// Single call-dispatch decision tree. `arg_names`/`type_args` are parallel
 /// to the parsed `Call` payload. Returns the callee's result type.
+/// A call's result type, with its CLASS recorded for the call span when the
+/// result names one.
+///
+/// A local takes its `class_name` from its initializer's `expr_class` entry
+/// when it has no annotation, and a plain function call never wrote one — so
+/// `val m = makeThing()` left `m` classless and every member call on it
+/// stopped before member resolution began. Only the extension-candidate path
+/// recorded a return class before this.
 pub fn checkCall(
+    self: *Checker,
+    callee: *const Expr,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    type_args: []const TypeRef,
+    call_span: Span,
+) Allocator.Error!Type {
+    const ty = try checkCallInner(self, callee, args, arg_names, type_args, call_span);
+    if (!self.expr_class.contains(call_span)) {
+        if (returnClassName(self, &ty)) |cn| {
+            self.expr_class.put(call_span, cn) catch {};
+        } else if (callee.* == .Path and callee.Path.segments.len == 1) {
+            // A plain user class is `Unresolved` in this checker, so the
+            // class travels on the SIGNATURE. One unambiguous declaration
+            // for the name settles it; an overload set does not.
+            if (self.fns.get(callee.Path.segments[0].name)) |sigs| {
+                if (sigs.items.len == 1) {
+                    if (sigs.items[0].return_class) |cn| {
+                        if (self.classes.contains(cn)) self.expr_class.put(call_span, cn) catch {};
+                    }
+                }
+            }
+        }
+    }
+    return ty;
+}
+
+/// The user-class name a call result names, or null. A generic head counts
+/// only when the module declares that class; a builtin or function type never
+/// does.
+fn returnClassName(self: *Checker, t: *const Type) ?[]const u8 {
+    return switch (t.*) {
+        .Generic => |g| if (self.classes.contains(g.name)) g.name else null,
+        .Nullable => |inner| returnClassName(self, inner),
+        else => null,
+    };
+}
+
+fn checkCallInner(
     self: *Checker,
     callee: *const Expr,
     args: []const Expr,
