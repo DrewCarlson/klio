@@ -1938,3 +1938,63 @@ test "numeric_promotion_receiver" {
         \\
     );
 }
+
+test "bare_member_call_return" {
+    try check("bare_member_call_return",
+        \\AB,CD|2
+        \\[3, 4]
+        \\
+    );
+}
+
+test "receiver_lambda_member_read" {
+    try check("receiver_lambda_member_read",
+        \\cell7
+        \\1,2,3|6
+        \\
+    );
+}
+
+test "top_level_prop_literal_type" {
+    try check("top_level_prop_literal_type",
+        \\10000000000
+        \\2
+        \\KLIO:
+        \\4
+        \\
+    );
+}
+
+test "chained_member_return" {
+    try check("chained_member_return",
+        \\abcd
+        \\5
+        \\18
+        \\134
+        \\box6
+        \\3
+        \\a-b-c
+        \\
+    );
+}
+
+test "indexed_splice_lambda_param" {
+    try check("indexed_splice_lambda_param",
+        \\1
+        \\1
+        \\1
+        \\1
+        \\1
+        \\1
+        \\0
+        \\
+    );
+}
+
+test "string_companion_format" {
+    try check("string_companion_format",
+        \\a/3/1.50
+        \\x=7
+        \\
+    );
+}
