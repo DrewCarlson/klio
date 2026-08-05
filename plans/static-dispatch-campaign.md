@@ -2467,3 +2467,36 @@ Alternative if insufficient: FQN-keyed native serves for the three
 functions (they only read instance fields + bit math), which needs
 the static-Call path to honor intrinsic shadowing for BODIED pack
 functions (today only bodyless decls link to native forms).
+
+## Addendum 55 (2026-08-05): the fusion never covered member calls
+
+Calibrating the interpreter against a plain member call
+(`class Box { fun bump(n: Int) }`, 5M iterations) showed 1.12us per call
+— thousands of cycles for a two-instruction body. The census said every
+one was `call_static` with ZERO `static_flat_fuse`: `fastCallPlan`
+required the callee's simple name to have exactly one entry in the
+module function-name index, and an instance method has NO entry there
+(the index carries top-level and extension functions). The clause meant
+to reject same-name overload sets was rejecting every member. Fixed to
+reject only genuine ambiguity (`len > 1`); 1.12us -> 0.89us, and
+`KLIO_FASTPLAN_TRACE=<name>` now reports which clause declined a callee.
+
+Landed alongside: primitive bit members served inline (addendum 54,
+ladder 494k -> 93k on the map-write workload) and per-site environment
+gate memos (`envOnce`).
+
+MEASURED NEGATIVE, reverted: a size-classed pool for the frame ARG/
+CAPTURE carriers. It is worth ~20% on the call microbenchmark (3.55s vs
+4.45s for 5M calls) but is not sound as written — carriers reach
+`releaseArgs` from several producers, and under the tracing GC the
+register buffers come from `c_allocator` while the arg carriers come
+from the run allocator, so pooled buffers cross allocator lifetimes and
+abort at teardown (reproducible on the stdlib time/unsigned/uuid
+suites). Making it sound means routing EVERY carrier producer through
+one acquire/release pair with one allocator choice — a real refactor,
+recorded here as the next throughput unit.
+
+Remaining interpreted-throughput profile of a member call after the fix:
+~20% carrier alloc/free (the reverted pool's target), 8% threadlocal
+address lookups (`evtls`), 7% leaf-serve attempts that decline on the
+field-getter path.
