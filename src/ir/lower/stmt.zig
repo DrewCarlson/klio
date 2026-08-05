@@ -377,9 +377,17 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             .Member, .Index, .Path => if (!std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_INIT") orelse "1", "0"))
                 try b.setLocalInitExprAt(p.name.name, e, p.name.span),
             .ObjectExpr => try b.markObjectInitLocal(p.name.name),
-            else => if (runtime.envOnce("KLIO_INIT_KINDS") != null) {
+            else => {},
+        }
+        // `KLIO_INIT_KINDS=1` — initializer shapes that leave the local with
+        // NO declared type after every channel above has run. Reports the
+        // real residue: an earlier version instrumented the initializer-
+        // RECORDING switch instead, which kept naming shapes the typing
+        // switch already handles.
+        if (runtime.envOnce("KLIO_INIT_KINDS") != null) {
+            if (b.localDeclTypeRef(p.name.name) == null) {
                 std.debug.print("[init-kind] {s}\n", .{@tagName(std.meta.activeTag(e.*))});
-            },
+            }
         }
         // A literal init is definite NON-callable evidence that must also
         // survive into nested lambda bodies: a captured `var key = 0` does
