@@ -3345,3 +3345,32 @@ that cannot answer must FALL THROUGH, not answer null; the two are the same
 value and opposite meanings when arms are chained.
 
 Session: **508 -> 347 unbound, 92.73% -> 94.35% bound.**
+
+## Addendum 81 (2026-08-06): the shape worklist is exhausted; the tail is intrinsics
+
+Four arms landed off the census shape histogram (Postfix, Unary, Range,
+Binary). The next three attempts all measured exactly flat, and each names
+the same wall:
+
+  * **Builtin properties** (`.length`, `.size`, `.indices`, `.lastIndex`) —
+    flat because the RECEIVERS of those reads are themselves untyped. The
+    chain's head, not its links, is what is missing.
+  * **Fully-qualified calls** — `val roundedScaled = kotlin.math.floor(x)`
+    in the Duration formatter has no return channel at all, since every one
+    of them wants a bare simple name. Adding an FQN lookup changed nothing:
+    `funcIdByFqn("kotlin.math.floor")` is null, because `floor` is a HOST
+    INTRINSIC with no `Func` in the module to read a return type from.
+
+That last point is the shape of what remains. The declared-type channels can
+only read declarations, and the tail of the census is calls whose callee has
+none — the same 1,281 "builtin-type members" the P10 audit classified as
+"no source declaration in Kotlin either, not holes".
+
+To bind those, the interpreter would need a table of intrinsic SIGNATURES
+(name -> return head) as data, the way `primitiveMemberFast` already encodes
+their behaviour. That is a real and bounded piece of work — it is the same
+list, read for its types instead of its semantics — and it is the next thing
+that would move this number materially.
+
+Session: **508 -> 347 unbound, 92.73% -> 94.35% bound**, nine channels
+landed, ten measured-flat or negative attempts reverted with their reasons.
