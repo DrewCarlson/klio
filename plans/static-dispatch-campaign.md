@@ -3221,6 +3221,8 @@ lesson:
 Each reading was consistent with the evidence in hand and wrong. The one
 that held was the one where the fix moved the census.
 
-This also explains addenda 73 and 76's flat rules — they computed correct
-types into a record that was then deleted. Those rules are worth re-testing
-now that the record survives.
+It does NOT explain addenda 73 and 76's flat rules. Re-applied on top of the
+fix, the primitive conversions and the integer bit operators still measure
+exactly flat — so those sites are typed by another channel already, or are
+not reached at all. Reverted again. The erasure was a real bug worth its own
+fix; it was not the reason those particular rules paid nothing.
