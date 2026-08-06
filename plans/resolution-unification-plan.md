@@ -1175,5 +1175,27 @@ Two honest consequences:
     value is in USER programs, where it now decides.
   * Closing stdlib-internal sites needs the declared-type channels in
     lowering — which is what every addendum in the dispatch campaign has
-    been building — or checking the stdlib too, which trades the image's
-    whole reason for existing.
+    been building — or checking the stdlib too.
+
+**Direction set (2026-08-06, user): check the stdlib.** It covers a
+significant part of the interpreter's functionality, and the census is to
+keep counting everything required for fully static dispatch — the goal
+includes deleting the dynamic-dispatch fallbacks, so narrowing what the
+census counts is off the table.
+
+The cost objection has an answer: the stdlib is checked ONCE, at image BAKE
+time, where its ASTs already exist (`deps.asts` in `bakeAndPrepare`). A
+cached run still parses nothing. First measurement, under
+`KLIO_STDLIB_CHECK=1`:
+
+    [EAGER] 196 files / 4965 top-level decls handed to the checker
+
+against the 1 file / 1 decl a user program gives it. The checker runs over
+the whole base; the mechanism is there.
+
+The remaining build is the bake-and-replay this session has already done
+twice (`fn_returns`, `ext_returns`): collect the base's resolved calls at
+bake time, serialise them beside the IR, and republish at load into
+`pending_eager_call_fids`, which `eagerCallTarget` already consults. Base
+file ids are stable across bake and load (`user_file_start` partitions
+them), so call spans key correctly on both sides.

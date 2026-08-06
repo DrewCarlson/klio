@@ -847,6 +847,19 @@ fn bakeAndPrepare(
     };
     base.user_file_start = @intCast(dep_map.files.items.len);
 
+    // The BASE's own sources are checked here, where they exist. This is the
+    // only place they do: a cached run loads IR and never parses them, so a
+    // call site inside a stdlib body could never receive an eager pick — and
+    // the dispatch census is mostly such sites. The results ride the image.
+    if (runtime.envOnce("KLIO_STDLIB_CHECK") != null) {
+        publishExternDecls(gpa, base);
+        if (@import("commands.zig").computeEagerCalls(gpa, deps.asts, &.{})) |ec| {
+            std.debug.print("[stdlib-check] {d} base call resolutions\n", .{ec.count()});
+            var owned = ec;
+            owned.deinit();
+        } else std.debug.print("[stdlib-check] none\n", .{});
+    }
+
     const tb_lower = runtime.clockMonotonicNanos();
     const bytes = (image.bake(gpa, base, dep_map, .{
         .known_packages = report.known_packages.items,
