@@ -2166,3 +2166,13 @@ test "safe_chain_and_nullable_extension" {
         \\
     );
 }
+
+test "identity_extension_return" {
+    try check("identity_extension_return",
+        \\ab1
+        \\n=7
+        \\n=2
+        \\n=3
+        \\
+    );
+}

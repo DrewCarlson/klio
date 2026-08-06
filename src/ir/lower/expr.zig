@@ -14628,6 +14628,24 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             if (!b.module.classIsOrExtends(lexical_owner, owner)) continue;
         }
         const candidate_head = typeHead(f.params[0].ty.name);
+        // An IDENTITY extension returns its own receiver: `fun <T> T.apply(
+        // block: T.() -> Unit): T`. Its declared receiver is a bare type
+        // PARAMETER, so the head filter below never admits it, and its
+        // declared return names nothing on its own — but the receiver
+        // instantiates both. `StringBuilder().apply(builderAction).toString()`
+        // inside `buildString` is the shape: a forwarded lambda argument the
+        // splice cannot take, leaving the chain untyped.
+        if (f.return_ty_declared and bareTypeParamHead(candidate_head) and
+            bareTypeParamHead(f.return_ty.name) and
+            std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, f.return_ty.name, "?")), candidate_head))
+        {
+            const tier_i = b.module.scopeTier(f.fqn, f.package, mname, caller_pkg, caller_file);
+            if (tier_i > 3) continue;
+            if (agreed) |*old| old.deinit(b.allocator);
+            var ident = try recv_ty.clone(b.allocator);
+            ident.nullable = recv_ty.nullable or f.return_ty.nullable;
+            return ident;
+        }
         if (!b.module.classIsOrExtends(recv_head, candidate_head)) continue;
         const tier = b.module.scopeTier(f.fqn, f.package, mname, caller_pkg, caller_file);
         if (tier > 3 or tier > best_tier) continue;
