@@ -1148,3 +1148,32 @@ Compressed record:
 - Non-resolution stdlib residuals (windowed/RingBuffer, orEmpty static dispatch,
   local-fn overload-by-type, entry-CME, sequence streaming) are tracked in the
   stdlib-grind memory notes, out of scope here.
+
+## The eager channel's structural ceiling (2026-08-06)
+
+Worth stating plainly, because it bounds what P7 can ever contribute to the
+dispatch census.
+
+`[EAGER] 1 files / 1 top-level decls handed to the checker` — typeck runs on
+the USER's sources. Stdlib and pack bodies are lowered without being
+checked, since their IR comes from the image. So a call site INSIDE a stdlib
+body can never receive an eager pick, however good the ranking gets.
+
+The dispatch census counts those sites. `Arrays.kt`'s
+
+    val totalSizeLong = sumOf { it.size.toLong() }
+
+is one: `sumOf` is an overload set whose Int- and Long-returning members are
+distinguished only by the lambda's return type, which is exactly what
+argument-type ranking decides and exactly what lowering alone cannot. The
+checker could answer it; the checker will never see it.
+
+Two honest consequences:
+
+  * P7's yield is bounded by user-code call sites, not by the census. The
+    ranking is real (72 of 97 member calls on an image program) and its
+    value is in USER programs, where it now decides.
+  * Closing stdlib-internal sites needs the declared-type channels in
+    lowering — which is what every addendum in the dispatch campaign has
+    been building — or checking the stdlib too, which trades the image's
+    whole reason for existing.
