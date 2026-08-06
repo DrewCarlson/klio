@@ -2128,3 +2128,16 @@ test "splice_param_shadows_its_own_source" {
         \\
     );
 }
+
+test "safe_call_scope_function_typing" {
+    try check("safe_call_scope_function_typing",
+        \\[cq]2
+        \\none
+        \\[d]
+        \\none
+        \\[e]
+        \\none
+        \\BC
+        \\
+    );
+}

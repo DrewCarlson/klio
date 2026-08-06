@@ -5338,6 +5338,42 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             },
             .deferred, .none => {},
         }
+        // The member resolver could not commit, but the ORDINARY call path
+        // has more to try — an inline splice above all. `x?.let { it.f() }`
+        // gives `it` the non-null receiver type in Kotlin; dispatching the
+        // whole thing as a runtime member call gives it none, and every
+        // member call inside the lambda then resolves by name. Rewrite the
+        // proven-non-null branch as a plain call on a temporary that HOLDS
+        // the already-lowered receiver, so nothing is evaluated twice.
+        if (declared_from_expr orelse inferred_ty) |rty| non_null_rewrite: {
+            const nn_name = std.mem.trimEnd(u8, rty.name, "?");
+            if (nn_name.len == 0) break :non_null_rewrite;
+            const tmp_name = try std.fmt.allocPrint(b.allocator, "$nn{d}", .{recv});
+            var tmp_ty = try rty.clone(b.allocator);
+            tmp_ty.nullable = false;
+            b.allocator.free(tmp_ty.name);
+            tmp_ty.name = try b.allocator.dupe(u8, nn_name);
+            try b.pushScope();
+            try b.bind(tmp_name, recv);
+            try b.setLocalDeclTypeOwned(tmp_name, tmp_ty);
+            var segs = [_]ast.Ident{.{ .name = tmp_name, .span = receiver.span() }};
+            var recv_expr = Expr{ .Path = .{ .segments = segs[0..], .span = receiver.span() } };
+            var plain_callee = Expr{ .Member = .{
+                .receiver = &recv_expr,
+                .name = name,
+                .safe = false,
+                .span = callee.span(),
+            } };
+            var plain = expr.Call;
+            plain.callee = &plain_callee;
+            const rewritten = Expr{ .Call = plain };
+            const rv = try lowerCall(b, &rewritten);
+            try b.popScope();
+            try b.push(.{ .Move = .{ .dst = dst, .src = rv } });
+            b.terminate(.{ .Goto = join });
+            b.switchTo(join);
+            return dst;
+        }
         const run = try lowerArgRun(b, args);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
