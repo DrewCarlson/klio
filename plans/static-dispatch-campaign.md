@@ -3130,5 +3130,12 @@ bound share 92.73% -> 94.02%.
     // runtime error: unresolved global `kotlin.time.Duration.parse`
 
 The package-qualified spelling of a companion member call does not resolve.
-Not chased here; recorded with its repro so it is not lost. The fixture uses
-the import form because it is testing operator returns, not this.
+The fixture uses the import form because it is testing operator returns, not
+this.
+
+One wrong guess ruled out and reverted: `emitFqnWithClassPrefix` declines a
+prefix whose simple name is unambiguous, which DOES drop the remaining
+segments — but restricting that decline to `end == fqn.len` changed nothing,
+because a qualified CALL never reaches that function. Its callee is lowered
+by the call path, which joins the segments into one global name. That is
+where to look next.
