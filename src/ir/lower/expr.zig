@@ -8640,6 +8640,44 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             }
         }
     }
+    // `a / b` on a CLASS is an operator member, and its declared return is
+    // the answer: `val half = duration / 2` in the saturating-math helpers
+    // types `half` as Duration. The arithmetic arm beside this one promotes
+    // NUMERIC operands and declines everything else, so a class receiver
+    // reached no channel at all.
+    if (arg.* == .Binary) {
+        const opname: ?[]const u8 = switch (arg.Binary.op) {
+            .Add => "plus",
+            .Sub => "minus",
+            .Mul => "times",
+            .Div => "div",
+            .Rem => "rem",
+            else => null,
+        };
+        if (opname) |on| {
+            if (argDeclTypeRefLazy(b, arg.Binary.lhs)) |lt| {
+                if (!lt.nullable) {
+                    const lh = typeHead(std.mem.trimEnd(u8, lt.name, "?"));
+                    if (lh.len != 0 and !isPrimitiveTypeName(lh)) {
+                        var kb: [160]u8 = undefined;
+                        if (std.fmt.bufPrint(&kb, "{s}\x00{s}\x001", .{ lh, on }) catch null) |key| {
+                            if (b.module.registry.member_method_fids.get(key)) |fid| {
+                                if (b.module.funcById(fid)) |f| {
+                                    if (f.return_ty_declared and f.return_ty.name.len != 0) {
+                                        return .{
+                                            .name = f.return_ty.name,
+                                            .nullable = f.return_ty.nullable,
+                                            .args = &.{},
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     // `xs[i]` — the element of what `xs` indexes. Stated for the shapes that
     // have no declaration to read (a CharSequence's Char, a primitive
     // array's scalar) and taken from the sole type argument otherwise.

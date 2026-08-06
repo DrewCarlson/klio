@@ -3101,3 +3101,34 @@ consults. That placement matters: addendum 73 put an equivalent rule in
 Two sites. Recorded not for the size but for the method: the tail is made of
 chains where ONE link has no declaration, and each is found by reading the
 source at a site, never by grouping the census by name.
+
+## Addendum 75 (2026-08-06): an operator on a class is a member call
+
+Same method as addendum 74, next site. `kotlin.time.longSaturatedMath` has:
+
+    val half = duration / 2
+
+and `half.toLong(unit)` was unbound. The arithmetic arm beside the fix
+promotes NUMERIC operands and declines everything else, so a class receiver
+reached no channel at all — though `Duration.div(Int): Duration` is an
+ordinary member with a declared return sitting in the registry.
+
+`+ - * / %` on a non-primitive left operand now read that member's declared
+return (`plus`/`minus`/`times`/`div`/`rem`, arity 1).
+
+    no_receiver_type 392 -> 384, bound_static +4
+
+Running total for the session: **508 -> 384**, a quarter of the residue,
+bound share 92.73% -> 94.02%.
+
+### Found while writing the fixture: a fully-qualified companion call
+
+    import kotlin.time.Duration
+    Duration.parse("10s")            // works
+
+    kotlin.time.Duration.parse("10s")
+    // runtime error: unresolved global `kotlin.time.Duration.parse`
+
+The package-qualified spelling of a companion member call does not resolve.
+Not chased here; recorded with its repro so it is not lost. The fixture uses
+the import form because it is testing operator returns, not this.
