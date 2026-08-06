@@ -3385,3 +3385,48 @@ and each one is its own reason.
 
 Session: **508 -> 347 unbound, 92.73% -> 94.35% bound**, nine channels
 landed, ten measured-flat or negative attempts reverted with their reasons.
+
+## Addendum 82 (2026-08-06): the same instrument mistake, twice in one session
+
+Tracing the `byteSeparator` family (`bytesFormat.byteSeparator.length`) I
+reduced it to
+
+    class Inner(val sep: String)
+    class Outer { val inner: Inner = Inner("-") }
+    val i = o.inner        // KLIO_VALTY_TRACE=i -> decl=<unset>
+
+and read `<unset>` as "the property chain does not type". It does not mean
+that. A `.Member` initializer is RECORDED, not written into the declared-type
+table, and typed on demand at each use — which is exactly what addendum 65
+established when it retired `KLIO_INIT_KINDS` for the same misreading.
+`<unset>` is the expected state for such a local; the question the trace does
+not answer is whether the lazy derivation succeeds at the USE site.
+
+So the byteSeparator lead is unresolved, not disproved, and the repro above
+is not evidence either way. Recorded because the failure mode is now
+two-for-two in one session: **a lowering-internal table's miss is not a
+dispatch miss, and only the census can say which is which.**
+
+The instrument that would answer it is a trace at the USE site — what
+`argDeclTypeRefLazy` returns for the receiver of `i.sep` — not at the
+declaration.
+
+## Addendum 82 (2026-08-06): the same instrument mistake, twice in one session
+
+Tracing the `byteSeparator` family (`bytesFormat.byteSeparator.length`) I
+reduced it to a two-class property chain and read `KLIO_VALTY_TRACE`'s
+`decl=<unset>` on the local as "the property chain does not type".
+
+It does not mean that. A `.Member` initializer is RECORDED, not written into
+the declared-type table, and typed on demand at each use — exactly what
+addendum 65 established when it retired `KLIO_INIT_KINDS` for the same
+misreading. `<unset>` is the expected state for such a local; what the trace
+does NOT answer is whether the lazy derivation succeeds at the USE site.
+
+So the byteSeparator lead is unresolved, not disproved, and that repro is not
+evidence either way. Recorded because the failure mode is now two-for-two in
+one session: **a lowering-internal table's miss is not a dispatch miss, and
+only the census can say which is which.**
+
+The instrument that would answer it traces what `argDeclTypeRefLazy` returns
+for the RECEIVER at the use site, not what the declaration table holds.
