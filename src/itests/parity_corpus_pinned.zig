@@ -2176,3 +2176,11 @@ test "identity_extension_return" {
         \\
     );
 }
+
+test "local_fun_return_type" {
+    try check("local_fun_return_type",
+        \\4
+        \\[q]
+        \\
+    );
+}

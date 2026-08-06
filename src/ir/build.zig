@@ -580,6 +580,10 @@ pub const FuncBuilder = struct {
     /// local `val`/`var` of the same name must NOT hijack member-call
     /// syntax.
     local_fns: StringSet,
+    /// A local `fun`'s DECLARED return type, keyed by its mangled binding
+    /// name. A local function is a closure in a cell, not a module function,
+    /// so nothing else can answer what a call to it returns. Owned.
+    local_fn_return_tys: std.StringHashMap(TypeRef),
     /// Per local function: the declared parameter type-name per positional
     /// parameter (an extension's leading `this` is dropped), so a numeric
     /// literal argument can coerce to a Byte/Short/Long/Float/Double parameter
@@ -846,6 +850,7 @@ pub const FuncBuilder = struct {
             .enclosing_members = StringSet.init(allocator),
             .param_names = StringSet.init(allocator),
             .local_fns = StringSet.init(allocator),
+            .local_fn_return_tys = std.StringHashMap(TypeRef).init(allocator),
             .local_fn_param_tys = std.StringHashMap([]const ?[]const u8).init(allocator),
             .local_decl_types = std.StringHashMap(TypeRef).init(allocator),
             .local_decl_nullable = std.StringHashMap(void).init(allocator),
@@ -935,6 +940,11 @@ pub const FuncBuilder = struct {
             self.local_fn_param_tys.deinit();
         }
         self.local_fns.deinit();
+        {
+            var it = self.local_fn_return_tys.valueIterator();
+            while (it.next()) |t| t.deinit(a);
+            self.local_fn_return_tys.deinit();
+        }
         {
             // `mangled` is module-lifetime (it ships in AstLambda
             // captured-name lists); only the builder-owned slices free.
@@ -2019,6 +2029,16 @@ pub const FuncBuilder = struct {
     }
     pub fn isLocalFn(self: *const FuncBuilder, name: []const u8) bool {
         return self.local_fns.contains(name);
+    }
+    /// Takes ownership of `ty`.
+    pub fn setLocalFnReturnTy(self: *FuncBuilder, mangled: []const u8, ty: TypeRef) Allocator.Error!void {
+        if (try self.local_fn_return_tys.fetchPut(mangled, ty)) |old| {
+            var prev = old.value;
+            prev.deinit(self.allocator);
+        }
+    }
+    pub fn localFnReturnTy(self: *const FuncBuilder, mangled: []const u8) ?TypeRef {
+        return self.local_fn_return_tys.get(mangled);
     }
     /// Register one same-named local-fn declaration. Takes ownership of
     /// `ov`'s slices (they must come from this builder's allocator).

@@ -9765,12 +9765,40 @@ fn fqnCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error
     return null;
 }
 
+/// The declared return of a bare call to a LOCAL `fun`. A local function is
+/// lifted under a mangled module name, so the simple-name index cannot answer
+/// for it — `expect("'-'", i) { it == '-' }?.let { ... }` inside `parseIso`
+/// left the whole chain untyped. Only an unambiguous answer is taken: same
+/// return type across every same-named declaration in scope.
+fn localFnReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (call_expr.* != .Call) return null;
+    const callee = call_expr.Call.callee;
+    if (callee.* != .Path or callee.Path.segments.len != 1) return null;
+    const nm = callee.Path.segments[0].name;
+    // A local `fun` is ALSO bound to a register holding its closure, so a
+    // non-null `resolve` says nothing here — the name is the function.
+    if (!b.isLocalFn(nm)) return null;
+    const decls = b.localFnDecls(nm) orelse return null;
+    var agreed: ?ir.TypeRef = null;
+    for (decls) |ov| {
+        const rt = b.localFnReturnTy(ov.mangled) orelse return null;
+        if (rt.name.len == 0 or bareTypeParamHead(rt.name)) return null;
+        if (agreed) |prev| {
+            if (!std.mem.eql(u8, prev.name, rt.name) or prev.nullable != rt.nullable) return null;
+        } else agreed = rt;
+    }
+    const ret = agreed orelse return null;
+    if (staticTypeClassId(b, ret) == null) return null;
+    return try ret.clone(b.allocator);
+}
+
 fn staticCallReturnTypeRef(
     b: *FuncBuilder,
     call_expr: *const Expr,
 ) Allocator.Error!?ir.TypeRef {
     if (try fnTypedCalleeReturnTypeRef(b, call_expr)) |t| return t;
     if (try fqnCallReturnTypeRef(b, call_expr)) |t| return t;
+    if (try localFnReturnTypeRef(b, call_expr)) |t| return t;
     if (try memberCallReturnTypeRef(b, call_expr)) |t| return t;
     if (try bareMemberReturnTypeRef(b, call_expr)) |t| return t;
     if (call_expr.* == .Binary) {
