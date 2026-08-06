@@ -1939,6 +1939,18 @@ test "numeric_promotion_receiver" {
     );
 }
 
+test "nullable_receiver_member" {
+    try check("nullable_receiver_member",
+        \\node:a
+        \\none
+        \\4
+        \\-1
+        \\XY
+        \\-
+        \\
+    );
+}
+
 test "binary_arg_promotion" {
     try check("binary_arg_promotion",
         \\2,3,4

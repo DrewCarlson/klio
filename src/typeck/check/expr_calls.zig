@@ -897,6 +897,13 @@ pub fn checkOverloadedCallRecordedAt(
 /// Set for the duration of one `checkOverloadedCallRecordedAt`.
 var record_span_override: ?Span = null;
 
+/// True while the checker is running over a COMPLETE universe — the base's
+/// own sources at image bake time, where every declaration those sources can
+/// reach is in front of it. A source extension pick is refused outside this
+/// because a program that loads packs sees only part of the surface; inside
+/// it there is no other part.
+pub var complete_universe: bool = false;
+
 fn checkOverloadedCallRec(
     self: *Checker,
     sigs: []const FnSig,
@@ -1201,7 +1208,7 @@ fn checkOverloadedCallRecImpl(
     // saw, and picking against that partial view bound compose's
     // `SlotTable.groupsSize` to a declaration its receiver never had.
     if (record and chosen != null and args_decisive and
-        (!sig.is_extension or sig.extern_fid != null))
+        (!sig.is_extension or sig.extern_fid != null or complete_universe))
     {
         if (std.c.getenv("KLIO_EAGER_HITS") != null) {
             std.debug.print("[REC-MSC] '{s}' args:", .{record_name});

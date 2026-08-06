@@ -14572,6 +14572,12 @@ const ResolvedMemberLowering = union(enum) {
 /// Per-site census of the static member-call gate (`KLIO_DISPATCH_STATS`),
 /// so the coverage of static binding is a number rather than an impression.
 pub var lm_sites: [6]u64 = @splat(0);
+/// `KLIO_DISPATCH_STATS`: unbound member sites the checker DID resolve, and
+/// why each was refused. [0] map hit, [1] no such func, [2] not an
+/// extension, [3] arity mismatch. A zero at [0] means the two sets — what
+/// the checker answered and what lowering could not bind — do not intersect
+/// at all, which is a different problem from a guard being too strict.
+pub var lm_eager_norecv: [4]u64 = @splat(0);
 pub const LmReason = enum(u8) { no_receiver_type, nullable_or_generic, no_class_id, resolver_declined, bound_static, bound_virtual };
 fn lmNote(comptime r: LmReason) void {
     lm_sites[@intFromEnum(r)] += 1;
@@ -14818,6 +14824,10 @@ pub fn lowerSitesDump() void {
         const n = lm_sites[f.value];
         if (n != 0) std.debug.print("[lower-sites] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
     }
+    {
+        const e = lm_eager_norecv;
+        std.debug.print("[eager-norecv] hits={d} nofunc={d} not_ext={d} arity={d}\n", .{ e[0], e[1], e[2], e[3] });
+    }
 }
 
 /// How a caller has already constrained the receiver of a member call.
@@ -14842,6 +14852,47 @@ fn lowerResolvedMemberCall(
 ) Allocator.Error!ResolvedMemberLowering {
     if (ast_type_args.len != 0 or receiver.* == .Super) return .none;
     last_member_refuted = false;
+    // The checker's own pick needs NO receiver type: it resolved the call
+    // from the declarations, which is the whole point of running it. Asked
+    // before the receiver-type requirement, because that requirement is a
+    // property of the LAZY engine and this answer did not come from it.
+    // Restricted to an image-declared extension for the same reasons the
+    // later consumer is: an extension's ABI is receiver-in-the-leading-slot
+    // whatever the receiver turns out to be, so the emit is decided.
+    if (declared_ty == null and !std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_MEMBER") orelse "1", "0")) {
+        if (b.module.eagerExternCallTarget(name.span)) |ep| ez: {
+            lm_eager_norecv[0] += 1;
+            const ef = b.module.funcById(ep) orelse {
+                lm_eager_norecv[1] += 1;
+                break :ez;
+            };
+            if (ef.params.len == 0 or !std.mem.eql(u8, ef.params[0].name, "this")) {
+                lm_eager_norecv[2] += 1;
+                break :ez;
+            }
+            if (ef.params.len != args.len + 1) {
+                lm_eager_norecv[3] += 1;
+                break :ez;
+            }
+            const recv_reg = try lowerExpr(b, receiver);
+            const args_start = b.allocReg();
+            const run = try lowerArgRun(b, args);
+            try b.push(.{ .Move = .{ .dst = args_start, .src = recv_reg } });
+            const dst = b.allocReg();
+            lmNote(.bound_static);
+            try b.push(.{ .Call = .{
+                .dst = dst,
+                .func = ep,
+                .trailing_lambda = b.callTrailingLambda(),
+                .args = args_start,
+                .n_args = run[1] + 1,
+                .arg_names = &.{},
+                .type_args = &.{},
+                .exact = true,
+            } });
+            return .{ .lowered = dst };
+        }
+    }
     const ty = declared_ty orelse {
         if (runtime.envOnce("KLIO_EXT_TRACE")) |wanted| {
             if (std.mem.eql(u8, wanted, name.name)) {
@@ -14964,8 +15015,30 @@ fn lowerResolvedMemberCall(
     // different: its member runs on the non-null branch, which is exactly the
     // receiver a member declaration expects.
     if (ty.nullable and !recv_state.non_null) {
-        lmNote(.nullable_or_generic);
-        return .none;
+        // ...unless no such extension EXISTS. The rule above is about an
+        // extension on `T?` outranking the member; where the name declares
+        // none, Kotlin has only one legal target for `x.f()` on a nullable
+        // `x` — the member — and the call binds to it. Checked across the
+        // whole module, so a later-loaded pack cannot introduce one behind
+        // this decision.
+        const nn_head = typeHead(std.mem.trimEnd(u8, ty.name, "?"));
+        var any_nullable_ext = false;
+        for (b.module.funcsBySimpleName(name.name)) |fid| {
+            const f = b.module.funcById(fid) orelse continue;
+            if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+            if (!f.params[0].ty.nullable) continue;
+            const eh = typeHead(std.mem.trimEnd(u8, f.params[0].ty.name, "?"));
+            if (eh.len == 0 or std.mem.eql(u8, eh, nn_head) or
+                b.module.classIsOrExtends(nn_head, eh))
+            {
+                any_nullable_ext = true;
+                break;
+            }
+        }
+        if (any_nullable_ext) {
+            lmNote(.nullable_or_generic);
+            return .none;
+        }
     }
     const recv_ty = if (ty.nullable)
         TypeRef{ .name = std.mem.trimEnd(u8, ty.name, "?"), .nullable = false, .args = ty.args }

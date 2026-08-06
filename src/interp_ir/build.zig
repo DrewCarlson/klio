@@ -1047,6 +1047,12 @@ fn notePropScope(
         // this, every member call on such a read resolved by name.
         if (literalTypeHead(init)) |head| {
             try module.registry.top_level_prop_type_heads.put(fqn, head);
+        } else if (initCalleeName(init)) |callee| {
+            // A factory or constructor call states the type as definitely as
+            // an annotation, but the name has to be RESOLVED to say what it
+            // returns, and nothing is registered yet. Record the name; the
+            // module answers when the whole declaration set is in.
+            try module.registry.top_level_prop_init_callees.put(fqn, callee);
         }
     }
     // A `const val` with a literal initializer records its value so the
@@ -1082,6 +1088,28 @@ fn literalTypeHead(e: *const ast.Expr) ?[]const u8 {
         .StringTemplate => "String",
         else => null,
     };
+}
+
+/// The simple name an unannotated property initializer CALLS, seeing through
+/// the scope functions that return their own receiver
+/// (`IntArray(256).apply { … }` is an `IntArray`).
+fn initCalleeName(e: *const ast.Expr) ?[]const u8 {
+    if (e.* != .Call) return null;
+    const callee = e.Call.callee;
+    switch (callee.*) {
+        .Path => |p| {
+            if (p.segments.len == 0) return null;
+            return p.segments[p.segments.len - 1].name;
+        },
+        .Member => |m| {
+            const identity = [_][]const u8{ "apply", "also" };
+            for (identity) |id| {
+                if (std.mem.eql(u8, m.name.name, id)) return initCalleeName(m.receiver);
+            }
+            return null;
+        },
+        else => return null,
+    }
 }
 
 fn constLiteralOf(e: *const ast.Expr) ?ir.Const {
@@ -4629,6 +4657,8 @@ pub const StdlibBase = struct {
     fn_returns: []const FnReturn = &.{},
     /// Baked extension return class heads (see `ExtReturn`).
     ext_returns: []const ExtReturn = &.{},
+    /// Baked eager call resolutions inside the base (see `EagerCall`).
+    eager_calls: []const EagerCall = &.{},
     /// Base SourceMap files occupy ids [0..user_file_start).
     user_file_start: u32,
     /// Next enum-entry identity, continuing the base build's sequence so
@@ -4667,6 +4697,10 @@ pub const StdlibBase = struct {
     /// Declaration signatures keep parameters and no return type, so without
     /// this a chained call loses its receiver class at the first link.
     pub const ExtReturn = struct { key: []const u8, head: []const u8 };
+    /// A call site inside the BASE and the declaration the checker picked
+    /// for it. Collected while the base's sources exist (image bake) and
+    /// replayed at load, because a cached run never parses them.
+    pub const EagerCall = struct { call: span.Span, fid: u32 };
 };
 
 /// Build the dependency snapshot from already-parsed base files. The
