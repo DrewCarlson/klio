@@ -1211,12 +1211,26 @@ Two further pieces went in with it:
     made from declarations does not need one, and the `no_receiver_type`
     early return was refusing them unread.
 
-**The census does not move: still 347.** So none of the 244 lands on an
-unbound site yet. What has NOT been verified is the bake path itself under a
-cleared cache — the probe runs kept loading a previously baked image rather
-than re-entering `bakeAndPrepare`, so the 244 predates `complete_universe`
-and the relaxation is unmeasured. That is the next thing to settle, and it
-is a test-harness question (how to force a cold bake), not a design one.
+**The cold bake is now verified.** The harness question had a plain answer:
+a `klio run` never enters `bakeAndPrepare` at all — it takes the embedded
+pack. `bake-image` bakes, through a SECOND path (`bundleBaseImage`) that had
+no check. Both now call one `checkBaseSources`, and a cold bake reports:
+
+    [EAGER] 196 files / 4965 top-level decls handed to the checker
+    [EAGER] 207 lambda receiver heads recorded
+    [EAGER] 385 param shapes recorded
+    [stdlib-check] 390 base call resolutions, 244 keyed to a FuncId
+
+So `complete_universe` is measured after all: 390 resolutions, of which 244
+resolve to a FuncId lowering can use. The remaining 146 name declarations
+with no lowered identity (bodyless expects, intrinsic-backed headers).
+
+**The census does not move: still 347.** The resolutions are real and they
+travel; none of them lands on a site the census counts as unbound. Which
+narrows the question sharply — it is no longer "can the checker reach the
+stdlib" (it can, and does) but "why do its 244 answers and the 347 unbound
+sites not intersect". Both sets are now enumerable, so that is a comparison,
+not an investigation.
 
 All batteries green with the machinery in: commontest 117/0, corpus
 267/267, litmus 43/43, units, compose 1317.

@@ -410,6 +410,51 @@ pub fn parseUserFiles(gpa: Allocator, map: *SourceMap, paths: []const []const u8
 /// Publish the image's own declarations for the checker (see
 /// `types.ExternDecls`): every class simple name, and the return class of
 /// every top-level function whose simple name resolves unambiguously.
+/// Check the base's OWN sources and stage the resolutions on it. Runs only
+/// where those sources exist — while an image is being built — so a cached
+/// run pays nothing and still gets the answers.
+fn checkBaseSources(gpa: Allocator, base: *interp_ir.build.StdlibBase, asts: []const KotlinFile) void {
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_STDLIB_CHECK") orelse "1", "0")) return;
+
+        publishExternDecls(gpa, base);
+        // The base's own sources ARE the whole universe for calls inside
+        // them, so a source extension pick is trustworthy here in a way it
+        // never is for a user program that also loads packs.
+        typeck_mod.check.expr_calls.complete_universe = true;
+        defer typeck_mod.check.expr_calls.complete_universe = false;
+        if (@import("commands.zig").computeEagerCalls(gpa, asts, &.{})) |ec| {
+            var owned = ec;
+            defer owned.deinit();
+            // The base is already lowered, so each declaration span the
+            // checker named resolves to the FuncId lowering will ask for.
+            var out: std.ArrayList(interp_ir.build.StdlibBase.EagerCall) = .empty;
+            {
+                const mg = base.built.module.borrow();
+                defer mg.deinit();
+                const m = mg.get();
+                var it = owned.iterator();
+                while (it.next()) |e| {
+                    const fid = m.funcByDeclSpan(e.value_ptr.*) orelse continue;
+                    out.append(gpa, .{ .call = e.key_ptr.*, .fid = fid.int() }) catch continue;
+                }
+            }
+            base.eager_calls = out.toOwnedSlice(gpa) catch &.{};
+            if (runtime.envOnce("KLIO_EAGER_AUDIT") != null) {
+                std.debug.print("[stdlib-check] {d} base call resolutions, {d} keyed to a FuncId\n", .{ owned.count(), base.eager_calls.len });
+            }
+        }
+        // The checker's per-run channels are the USER program's to fill;
+        // clear anything this base pass staged so they do not leak into it.
+        if (ir_mod.pending_eager_calls) |*m| {
+            m.deinit();
+            ir_mod.pending_eager_calls = null;
+        }
+        if (ir_mod.pending_eager_call_fids) |*m| {
+            m.deinit();
+            ir_mod.pending_eager_call_fids = null;
+        }
+    }
+
 /// Republish the base's own eager call resolutions, baked when its sources
 /// were last available. Merged UNDER the user program's, which is computed
 /// after this and must win on any span they share (they cannot: base and
@@ -867,45 +912,7 @@ fn bakeAndPrepare(
     // only place they do: a cached run loads IR and never parses them, so a
     // call site inside a stdlib body could never receive an eager pick — and
     // the dispatch census is mostly such sites. The results ride the image.
-    if (!std.mem.eql(u8, runtime.envOnce("KLIO_STDLIB_CHECK") orelse "1", "0")) {
-        publishExternDecls(gpa, base);
-        // The base's own sources ARE the whole universe for calls inside
-        // them, so a source extension pick is trustworthy here in a way it
-        // never is for a user program that also loads packs.
-        typeck_mod.check.expr_calls.complete_universe = true;
-        defer typeck_mod.check.expr_calls.complete_universe = false;
-        if (@import("commands.zig").computeEagerCalls(gpa, deps.asts, &.{})) |ec| {
-            var owned = ec;
-            defer owned.deinit();
-            // The base is already lowered, so each declaration span the
-            // checker named resolves to the FuncId lowering will ask for.
-            var out: std.ArrayList(interp_ir.build.StdlibBase.EagerCall) = .empty;
-            {
-                const mg = base.built.module.borrow();
-                defer mg.deinit();
-                const m = mg.get();
-                var it = owned.iterator();
-                while (it.next()) |e| {
-                    const fid = m.funcByDeclSpan(e.value_ptr.*) orelse continue;
-                    out.append(gpa, .{ .call = e.key_ptr.*, .fid = fid.int() }) catch continue;
-                }
-            }
-            base.eager_calls = out.toOwnedSlice(gpa) catch &.{};
-            if (runtime.envOnce("KLIO_EAGER_AUDIT") != null) {
-                std.debug.print("[stdlib-check] {d} base call resolutions, {d} keyed to a FuncId\n", .{ owned.count(), base.eager_calls.len });
-            }
-        }
-        // The checker's per-run channels are the USER program's to fill;
-        // clear anything this base pass staged so they do not leak into it.
-        if (ir_mod.pending_eager_calls) |*m| {
-            m.deinit();
-            ir_mod.pending_eager_calls = null;
-        }
-        if (ir_mod.pending_eager_call_fids) |*m| {
-            m.deinit();
-            ir_mod.pending_eager_call_fids = null;
-        }
-    }
+    checkBaseSources(gpa, base, deps.asts);
 
     const tb_lower = runtime.clockMonotonicNanos();
     const bytes = (image.bake(gpa, base, dep_map, .{
@@ -1012,6 +1019,10 @@ pub fn bundleBaseImage(
 
     const base = (interp_ir.build.buildStdlibBase(gpa, deps.asts) catch return null) orelse return null;
     base.user_file_start = @intCast(deps.map.files.items.len);
+    // Same bake-time check as `bakeAndPrepare`: this is the OTHER path that
+    // builds a base from source (`bake-image`, and any bundle), and the
+    // resolutions have to ride whichever image the run ends up with.
+    checkBaseSources(gpa, base, deps.asts);
     const bytes = (image.bake(gpa, base, deps.map, .{
         .known_packages = report.known_packages.items,
         .binding_fqns = report.binding_fqns.items,
