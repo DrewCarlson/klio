@@ -3226,3 +3226,52 @@ fix, the primitive conversions and the integer bit operators still measure
 exactly flat — so those sites are typed by another channel already, or are
 not reached at all. Reverted again. The erasure was a real bug worth its own
 fix; it was not the reason those particular rules paid nothing.
+
+## Addendum 78 (2026-08-06): what the 379 are, counted rather than characterised
+
+Session close: **508 -> 379 unbound, bound share 92.73% -> 94.09%.** Every
+channel below was measured on the full census and pinned by a fixture:
+
+    indexed argument types a spliced lambda parameter
+    a member call's declared return types the chain
+    unannotated top-level property, literal init
+    receiver-lambda member read (plus the resolution bug under it)
+    a bare call is a member call on the implicit receiver
+    unannotated class property, literal init
+    an indexed read and a builtin property keep the chain typed
+    an arithmetic operator on a class types from its member's return
+    a local's derived type survives the recording of its initializer
+
+Reverted after measuring flat or negative, each recorded with its reason:
+the `unique_concrete` module-level return channel; the infix bit operators
+(three placements); the primitive conversions; the infix arm on the member
+return channel (re-tested after the erasure fix — still flat); extension
+return heads into `expr_class` (fixed by the ranking/typing split instead).
+
+**The residue, by name.** 193 of the 379 sites are reachable by the by-name
+census; the six names of eight sites or more account for 89 of them:
+
+    it        40   lambda parameter, type is a bare type PARAMETER
+    expected  13   `CompareContext<out T>.expected: T`
+    value     11   `Lazy<T>.value: T` and kin
+    actual     9   `CompareContext<out T>.actual: T`
+    symbol     8   mid-chain builtin conversions
+    index      8   loop variable over an infix-produced range
+
+Four of those six — 73 sites, 19% of the whole residue — are declarations
+whose type IS a type parameter. No channel can bind them, because there is
+no class to name; typing them would mean inventing an answer, and this
+session's two worst regressions came from exactly that.
+
+The other two names resisted six separate rules across three addenda. Each
+rule was correct Kotlin and each measured exactly flat, which says the sites
+are typed elsewhere or not reached from where the rule sits.
+
+Beside them, `nullable_or_generic` (78) and `resolver_declined` (81) are by
+design in the same sense.
+
+So of 9,204 call sites: 8,655 bind. Of the 379 that do not, at least 73 name
+a type parameter, and 159 more sit in buckets that exist to refuse a guess.
+The remaining ~147 are individual chains, and the method that reaches them
+is the one that found the erasure bug — trace a single site to its end, and
+disbelieve the first two explanations.
