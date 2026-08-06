@@ -1939,6 +1939,14 @@ test "numeric_promotion_receiver" {
     );
 }
 
+test "receiver_lambda_member_read" {
+    try check("receiver_lambda_member_read",
+        \\cell7
+        \\1,2,3|6
+        \\
+    );
+}
+
 test "top_level_prop_literal_type" {
     try check("top_level_prop_literal_type",
         \\10000000000

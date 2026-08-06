@@ -2934,3 +2934,33 @@ already measured what a wrong head costs.
 
 Cumulative for the session's three landed channels: 508 -> 426, a fifth of
 the residue, with bound share 92.73% -> 93.52%.
+
+## Addendum 69 (2026-08-06): a receiver lambda in a companion could not read its receiver
+
+Two faults in one shape, found by writing the fixture for the type channel
+and running it:
+
+    class C(val raw: Long) {
+        companion object { fun mk(r: Long) = C(r).apply { check(raw >= 0) } }
+    }
+    // runtime error: IR eval: unresolved global `raw`
+
+**Resolution.** A bare name whose declaring class is not the LEXICAL owner is
+deliberately deferred to the runtime implicit-receiver walk, which rides the
+CAPTURE chain. Inside a companion function that chain holds no `C` at all,
+so the read missed to a global that does not exist — a receiver lambda in a
+companion could not read its own receiver's members. It now takes the field
+read when the innermost receiver's static class IS the class the scoped
+getter names, which is decidable at lowering.
+
+**Typing.** `staticBareReceiverType` searched the enclosing class and
+stopped. `Duration(raw).apply { … value … }` sits in Duration's companion,
+whose surface has no `value`, so the receiver stayed untyped. It now falls
+back to the receiver hint after the enclosing class declines — after, so no
+answer the walk already gave can change.
+
+    no_receiver_type 426 -> 418
+
+The resolution fault was live in the stdlib the whole time and no test
+reached it. It is the second time this session that writing the fixture for
+a typing change surfaced a correctness bug underneath it.

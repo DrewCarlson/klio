@@ -1988,7 +1988,25 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     });
                 }
             }
-            if ((!is_known_global or splice_receiver_first) and !enclosing_only_member) {
+            // ...unless the innermost receiver is statically the very class
+            // the scoped getter names. A receiver lambda inside a COMPANION
+            // binds `this` to the scope-function receiver
+            // (`C(r).apply { raw }` in `C.Companion.mk`), and the deferred
+            // walk cannot reach it: it rides the CAPTURE chain, which in a
+            // companion function holds no `C` at all, so the read missed to
+            // a global that does not exist. Where the receiver's class is
+            // the declaring one, the field read on it is the answer.
+            const receiver_is_owner = blk: {
+                if (!enclosing_only_member) break :blk false;
+                const rh = b.spliceRecvTy() orelse b.recvTy() orelse break :blk false;
+                const decl_owner = sgetterOwner(b, name0) orelse break :blk false;
+                const rhh = typeHead(std.mem.trimEnd(u8, rh, "?"));
+                if (rhh.len == 0) break :blk false;
+                break :blk b.module.classIsOrExtends(rhh, decl_owner);
+            };
+            if ((!is_known_global or splice_receiver_first) and
+                (!enclosing_only_member or receiver_is_owner))
+            {
                 const dst = b.allocReg();
                 const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
                 try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = nm } });
@@ -2498,7 +2516,17 @@ fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const
     };
     if (tr) std.debug.print("[sbrt] {s}: owner={s}\n", .{ recv_name, owner });
     if (propTypeHeadOn(b, owner, recv_name)) |h| return h;
-    return extPropReturnHead(b, owner, recv_name);
+    if (extPropReturnHead(b, owner, recv_name)) |h| return h;
+    // A receiver lambda rebinds `this`, so a bare name inside it can be the
+    // RECEIVER's member rather than the enclosing class's:
+    // `Duration(raw).apply { … value … }` sits in Duration's companion, whose
+    // own surface has no `value` at all. Consulted only after the enclosing
+    // class declines, so no answer this walk already gives can change.
+    const recv_head = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse return null;
+    const rh = typeHead(std.mem.trimEnd(u8, recv_head, "?"));
+    if (rh.len == 0 or std.mem.eql(u8, rh, owner)) return null;
+    if (propTypeHeadOn(b, rh, recv_name)) |h| return h;
+    return extPropReturnHead(b, rh, recv_name);
 }
 
 /// The declared return head of an EXTENSION PROPERTY named `name` on
