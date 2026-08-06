@@ -464,9 +464,25 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
 
   Cost: none measurable — startup holds at 102ms.
 
-  Next unit: the recording gate is still never entered (`entered=0`), so no
-  call resolution is written yet. With ranking live that is now a question
-  about the gate, not about missing declarations.
+  With ranking live the gate opens too. Two guards were written for the
+  world where the candidate set was partial, and both are now wrong:
+
+  - the member path called the NON-recording overload entry, on the stated
+    grounds that "qualified member/extension calls see a partial set here";
+  - the recorder refused any pick whose signature `is_extension`, for the
+    same reason.
+
+  Both relaxed, and the gate fires: `entered=1 recorded=1`.
+
+  **What still blocks the channel is identity, not resolution.** The record
+  is keyed by the DECLARATION's source span, which lowering maps to a
+  FuncId. An image-published declaration has no span in the program's source
+  map, so every one of these picks lands in `carried no decl span` and is
+  dropped. The next unit is a FuncId-keyed companion channel: the publisher
+  already holds the fid (it walks `func_name_index`), so it needs carrying
+  through `ExternExt` -> `FnSig` -> `ResolvedCall` -> a
+  `Span -> FuncId` map that lowering consumes as a direct static bind. That
+  is a plumbing task with no unknowns left in it.
 
 - **P8** — hatch deletion (RC-H catalog above).
 - **P9** — optional flat bytecode + pack serialization.
