@@ -4625,6 +4625,8 @@ pub const StdlibBase = struct {
     /// re-running `notePropScope` over `lifted_decls` at load. Empty for a
     /// freshly-built base. Strings only (no AST).
     top_props: []const TopProp = &.{},
+    /// Baked top-level function return class heads (see `FnReturn`).
+    fn_returns: []const FnReturn = &.{},
     /// Base SourceMap files occupy ids [0..user_file_start).
     user_file_start: u32,
     /// Next enum-entry identity, continuing the base build's sequence so
@@ -4654,6 +4656,11 @@ pub const StdlibBase = struct {
     pub const ClassRef = struct { k: []const u8, v: runtime.forest.ForestRef };
     /// One base top-level property's scope identity.
     pub const TopProp = struct { name: []const u8, fqn: []const u8, package: []const u8, type_head: []const u8 = "" };
+    /// A top-level function's simple name paired with the class head it
+    /// returns. Baked because the funcs themselves are lazy in an image:
+    /// nothing else can answer "what class does `listOf` return" without
+    /// decoding the whole stdlib.
+    pub const FnReturn = struct { name: []const u8, head: []const u8 };
 };
 
 /// Build the dependency snapshot from already-parsed base files. The

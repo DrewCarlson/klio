@@ -437,6 +437,37 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
   compose and dispatch work cares about. That is the first build task, and
   the counters above are its progress measure.
 
+- **P7 precondition MET (2026-08-06).** The checker now ranks stdlib member
+  calls on the image path, both warm and cold:
+
+        [EAGER-EXTERN] classes=392 fn_returns=312 ext_recvs=81 exts=4063
+        [EAGER-MEMBER] recv_class=List name=min cands=3
+        [EAGER-SHAPE]  member=1 member_with_class=1 member_ext_cands=1
+
+  Three faults had to be found, each hidden behind the previous one:
+
+  1. **Only class names were published.** The image handed the checker 392
+     class names and 135 top-level return heads, and nothing else — so a
+     member call could name its receiver's class and then find zero
+     candidates to rank. 4,063 extension declarations across 81 receiver
+     heads now cross the boundary too.
+  2. **The extern classes had no supertypes.** `xs.min()` on a `List` is
+     declared on `Iterable`; a class with no supertypes recorded reaches
+     none of its inherited extensions, so the walk found the key and still
+     returned nothing. Publishing supertypes turned 0 candidates into 3.
+  3. **The publisher walked decoded functions.** Since lazy func headers
+     landed, `m.funcs.items` is EMPTY on a cached image — the exact runs
+     that matter. It publishes from `func_name_index` + `decl_sigs`
+     instead, both eager because lowering resolves names against them.
+     Return heads have no eager source at all, so they are baked into the
+     image beside `top_props` (format 40) and replayed at load.
+
+  Cost: none measurable — startup holds at 102ms.
+
+  Next unit: the recording gate is still never entered (`entered=0`), so no
+  call resolution is written yet. With ranking live that is now a question
+  about the gate, not about missing declarations.
+
 - **P8** — hatch deletion (RC-H catalog above).
 - **P9** — optional flat bytecode + pack serialization.
 

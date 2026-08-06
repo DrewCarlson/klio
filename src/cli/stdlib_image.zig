@@ -409,31 +409,123 @@ pub fn parseUserFiles(gpa: Allocator, map: *SourceMap, paths: []const []const u8
 /// Publish the image's own declarations for the checker (see
 /// `types.ExternDecls`): every class simple name, and the return class of
 /// every top-level function whose simple name resolves unambiguously.
-fn publishExternDecls(gpa: std.mem.Allocator, base: *const interp_ir.build.BuiltModule) void {
-    const mg = base.module.borrow();
+/// The bare class head of a lowered type name: no nullability marker, no
+/// type arguments, no package qualification.
+fn headOf(name: []const u8) []const u8 {
+    var h = std.mem.trimEnd(u8, name, "?");
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (std.mem.lastIndexOfScalar(u8, h, '.')) |d| h = h[d + 1 ..];
+    return h;
+}
+
+fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibBase) void {
+    const mg = sb.built.module.borrow();
     defer mg.deinit();
     const m = mg.get();
     var classes = std.StringHashMap(void).init(gpa);
     for (m.classes.items) |*c| classes.put(c.name, {}) catch {};
+    // Return heads ride the image's baked index: on a cached load the funcs
+    // are lazy, so walking them here answered nothing at all. On the run
+    // that BUILDS the base there is no baked index yet and the funcs are
+    // right there, so derive it — the two paths must publish the same thing
+    // or the checker's answers depend on whether the cache was warm.
     var rets = std.StringHashMap([]const u8).init(gpa);
-    var ambiguous = std.StringHashMap(void).init(gpa);
-    defer ambiguous.deinit();
-    for (m.funcs.items) |*f| {
-        if (f.kind != .plain) continue;
-        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
-        var head = std.mem.trimEnd(u8, f.return_ty.name, "?");
-        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
-        if (head.len == 0 or !classes.contains(head)) continue;
-        if (ambiguous.contains(f.name)) continue;
-        const gop = rets.getOrPut(f.name) catch continue;
-        if (gop.found_existing) {
-            if (!std.mem.eql(u8, gop.value_ptr.*, head)) {
-                _ = rets.remove(f.name);
-                ambiguous.put(f.name, {}) catch {};
-            }
-        } else gop.value_ptr.* = head;
+    if (sb.fn_returns.len != 0) {
+        for (sb.fn_returns) |fr| rets.put(fr.name, fr.head) catch {};
+    } else {
+        var ambiguous = std.StringHashMap(void).init(gpa);
+        defer ambiguous.deinit();
+        for (m.funcs.items) |*f| {
+            if (f.kind != .plain) continue;
+            if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
+            const head = headOf(f.return_ty.name);
+            if (head.len == 0 or !classes.contains(head)) continue;
+            if (ambiguous.contains(f.name)) continue;
+            const gop = rets.getOrPut(f.name) catch continue;
+            if (gop.found_existing) {
+                if (!std.mem.eql(u8, gop.value_ptr.*, head)) {
+                    _ = rets.remove(f.name);
+                    ambiguous.put(f.name, {}) catch {};
+                }
+            } else gop.value_ptr.* = head;
+        }
     }
-    types_mod.pending_extern_decls = .{ .classes = classes, .fn_return_class = rets };
+    // Extensions, keyed by the receiver's class head.
+    //
+    // Built from the NAME INDEX and the declaration signatures, never from
+    // decoded function bodies: on a cached image the funcs are lazy and
+    // `m.funcs.items` is empty, so a walk over them published nothing at all
+    // — which is why the checker had zero candidates for every member call
+    // on exactly the runs that matter. Both of these are eager in the image,
+    // because lowering resolves names against them.
+    var exts = std.StringHashMap(std.ArrayList(types_mod.ExternExt)).init(gpa);
+    var nit = m.func_name_index.iterator();
+    while (nit.next()) |entry| {
+        const fname = entry.key_ptr.*;
+        if (fname.len == 0) continue;
+        for (entry.value_ptr.items) |fid| {
+            const sig = m.decl_sigs.get(fid.int()) orelse continue;
+            const recv = sig.receiver_ty orelse continue;
+            const recv_head = headOf(recv.name);
+            if (recv_head.len == 0) continue;
+            const n = sig.sig.len;
+            const heads = gpa.alloc([]const u8, n) catch continue;
+            const nulls = gpa.alloc(bool, n) catch {
+                gpa.free(heads);
+                continue;
+            };
+            for (sig.sig, heads, nulls) |*p, *h, *nl| {
+                h.* = headOf(p.name);
+                nl.* = p.nullable;
+            }
+            const gop = exts.getOrPut(recv_head) catch {
+                gpa.free(heads);
+                gpa.free(nulls);
+                continue;
+            };
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            gop.value_ptr.append(gpa, .{
+                .name = fname,
+                .param_heads = heads,
+                .param_nullable = nulls,
+                // The declaration signature carries no return type; the
+                // ranking compares ARGUMENTS, and a null return class is
+                // exactly what an unknown one must look like.
+                .return_head = "",
+                .return_nullable = false,
+                .is_infix = false,
+            }) catch {};
+        }
+    }
+    if (runtime.envOnce("KLIO_EAGER_AUDIT") != null) {
+        var n_ext: usize = 0;
+        var eit = exts.valueIterator();
+        while (eit.next()) |l| n_ext += l.items.len;
+        std.debug.print("[EAGER-EXTERN] published classes={d} fn_returns={d} ext_recvs={d} exts={d} (module funcs={d})\n", .{ classes.count(), rets.count(), exts.count(), n_ext, m.funcs.items.len });
+    }
+    var supers = std.StringHashMap([][]const u8).init(gpa);
+    for (m.classes.items) |*c| {
+        if (c.supertypes.len == 0) continue;
+        const names = gpa.alloc([]const u8, c.supertypes.len) catch continue;
+        var n: usize = 0;
+        for (c.supertypes) |sid| {
+            if (sid.int() >= m.classes.items.len) continue;
+            names[n] = m.classes.items[sid.int()].name;
+            n += 1;
+        }
+        if (n == 0) {
+            gpa.free(names);
+            continue;
+        }
+        supers.put(c.name, names[0..n]) catch gpa.free(names);
+    }
+    types_mod.pending_extern_decls = .{
+        .classes = classes,
+        .fn_return_class = rets,
+        .extensions = exts,
+        .supertypes = supers,
+        .has_extensions = true,
+    };
 }
 
 pub fn tryPrepare(
@@ -640,7 +732,7 @@ fn finishFromLoaded(
     map.files.appendSlice(map.arena.allocator(), loaded.map.files.items) catch return null;
     const user2 = parseUserFiles(gpa, map, paths, user.texts) orelse return null;
 
-    publishExternDecls(gpa, &loaded.base.built);
+    publishExternDecls(gpa, loaded.base);
     if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
     const built = interp_ir.build.buildModuleFilesExtend(gpa, loaded.base, user2.asts) catch return null;
 
@@ -733,7 +825,7 @@ fn bakeAndPrepare(
     map.* = SourceMap.init(gpa);
     map.files.appendSlice(map.arena.allocator(), dep_map.files.items) catch return null;
     const user2 = parseUserFiles(gpa, map, paths, user.texts) orelse return null;
-    publishExternDecls(gpa, &base.built);
+    publishExternDecls(gpa, base);
     if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
     const built = interp_ir.build.buildModuleFilesExtend(gpa, base, user2.asts) catch return null;
     return .{ .built = built, .map = map, .bindings = deps.bindings, .user_asts = user2.asts };

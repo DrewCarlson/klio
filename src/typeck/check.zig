@@ -241,9 +241,66 @@ pub fn typecheckModule(
         var cit = ed.classes.keyIterator();
         while (cit.next()) |k| {
             if (tc.classes.contains(k.*)) continue;
-            try tc.classes.put(k.*, ClassInfo.init(allocator));
+            var info = ClassInfo.init(allocator);
+            // The candidate walk climbs supertypes: `xs.min()` on a `List`
+            // is declared on `Iterable`, so a class with no supertypes
+            // recorded reaches none of its inherited extensions.
+            if (ed.has_extensions) {
+                if (ed.supertypes.get(k.*)) |sups| {
+                    for (sups) |s| try info.supertypes.append(allocator, s);
+                }
+            }
+            try tc.classes.put(k.*, info);
         }
         tc.extern_fn_return_class = ed.fn_return_class;
+        // Extensions the IMAGE carries. Without these an image run found
+        // zero candidates for every member call, so no overload ranking ran
+        // at all — the checker was ranking against an empty stdlib.
+        if (ed.has_extensions) {
+            var eit = ed.extensions.iterator();
+            while (eit.next()) |entry| {
+                const gop = try tc.extensions.getOrPut(entry.key_ptr.*);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                for (entry.value_ptr.items) |*x| {
+                    const params = try allocator.alloc(Type, x.param_heads.len);
+                    for (x.param_heads, x.param_nullable, params) |h, nl, *out| {
+                        out.* = try externHeadType(allocator, h, nl);
+                    }
+                    const defaults = try allocator.alloc(bool, x.param_heads.len);
+                    @memset(defaults, false);
+                    const varargs = try allocator.alloc(bool, x.param_heads.len);
+                    @memset(varargs, false);
+                    const pnames = try allocator.alloc([]const u8, x.param_heads.len);
+                    @memset(pnames, "");
+                    const crossinline = try allocator.alloc(bool, x.param_heads.len);
+                    @memset(crossinline, false);
+                    const pclasses = try allocator.alloc(?[]const u8, x.param_heads.len);
+                    for (x.param_heads, pclasses) |h, *pc| {
+                        pc.* = if (ed.classes.contains(h)) h else null;
+                    }
+                    try gop.value_ptr.append(allocator, .{
+                        .name = x.name,
+                        .sig = .{
+                            .params = params,
+                            .has_default = defaults,
+                            .param_names = pnames,
+                            .is_vararg = varargs,
+                            .return_ty = try externHeadType(allocator, x.return_head, x.return_nullable),
+                            .is_infix = x.is_infix,
+                            .type_param_count = 0,
+                            .type_param_names = &.{},
+                            .type_param_bounds = &.{},
+                            .param_class_names = pclasses,
+                            .decl_span = null,
+                            .is_suspend = false,
+                            .is_extension = true,
+                            .is_crossinline_param = crossinline,
+                        },
+                        .return_class = if (ed.classes.contains(x.return_head)) x.return_head else null,
+                    });
+                }
+            }
+        }
         types.pending_extern_decls = null;
     }
     for (files) |*f| {
@@ -500,6 +557,56 @@ pub const EbfOutside = struct {
 };
 
 /// One extension declaration on a given receiver type.
+/// A `Type` for a declaration head recovered from an image. Primitive and
+/// builtin heads become their exact type; anything else becomes a `Generic`
+/// with no arguments, which is what the ranking compares by name. A short
+/// all-caps head is a type PARAMETER spelling and stays one, so a generic
+/// declaration never ranks as if it named a class.
+fn externHeadType(allocator: Allocator, head: []const u8, nullable: bool) Allocator.Error!Type {
+    const base: Type = if (std.mem.eql(u8, head, "Unit"))
+        .Unit
+    else if (std.mem.eql(u8, head, "Boolean"))
+        .Boolean
+    else if (std.mem.eql(u8, head, "Byte"))
+        .Byte
+    else if (std.mem.eql(u8, head, "Short"))
+        .Short
+    else if (std.mem.eql(u8, head, "Int"))
+        .Int
+    else if (std.mem.eql(u8, head, "Long"))
+        .Long
+    else if (std.mem.eql(u8, head, "UByte"))
+        .UByte
+    else if (std.mem.eql(u8, head, "UShort"))
+        .UShort
+    else if (std.mem.eql(u8, head, "UInt"))
+        .UInt
+    else if (std.mem.eql(u8, head, "ULong"))
+        .ULong
+    else if (std.mem.eql(u8, head, "Float"))
+        .Float
+    else if (std.mem.eql(u8, head, "Double"))
+        .Double
+    else if (std.mem.eql(u8, head, "Char"))
+        .Char
+    else if (std.mem.eql(u8, head, "String"))
+        .String
+    else if (std.mem.eql(u8, head, "Any"))
+        .Any
+    else if (std.mem.eql(u8, head, "Nothing"))
+        .Nothing
+    else if (head.len == 0)
+        .Unresolved
+    else if (head.len <= 2 and std.ascii.isUpper(head[0]))
+        Type{ .TypeParam = head }
+    else
+        Type{ .Generic = .{ .name = head, .args = &.{} } };
+    if (!nullable) return base;
+    const inner = try allocator.create(Type);
+    inner.* = base;
+    return Type{ .Nullable = inner };
+}
+
 pub const ExtensionSig = struct {
     name: []const u8,
     sig: FnSig,

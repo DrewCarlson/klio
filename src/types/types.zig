@@ -977,9 +977,29 @@ test {
 /// prebuilt image (the stdlib-image path hands over a built module and never
 /// parses pack sources). Published by the image loader before the eager pass,
 /// consumed once by `typecheckModule`.
+/// One extension declaration recovered from a prebuilt image, in the flat
+/// form the image can supply: type HEADS, not full types. The checker
+/// rebuilds a `FnSig` from these — enough for overload ranking to compare
+/// argument types, which is all the ranking needs.
+pub const ExternExt = struct {
+    name: []const u8,
+    param_heads: [][]const u8,
+    param_nullable: []bool,
+    return_head: []const u8,
+    return_nullable: bool,
+    is_infix: bool,
+};
+
 pub const ExternDecls = struct {
     classes: std.StringHashMap(void),
     fn_return_class: std.StringHashMap([]const u8),
+    /// Receiver class simple name -> the extensions declared on it. Empty
+    /// when no image supplied any.
+    extensions: std.StringHashMap(std.ArrayList(ExternExt)) = undefined,
+    /// Class simple name -> its declared supertype simple names. The
+    /// candidate walk climbs this: `List.min` is declared on `Iterable`.
+    supertypes: std.StringHashMap([][]const u8) = undefined,
+    has_extensions: bool = false,
 };
 
 pub var pending_extern_decls: ?ExternDecls = null;

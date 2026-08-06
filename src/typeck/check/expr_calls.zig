@@ -388,6 +388,9 @@ fn checkCallInner(
             defer cands.deinit(self.allocator);
             try expr_mod.lookupExtensionCandidates(self, cn, mname, args.len, &cands);
             call_shape_counts[2] += 1;
+            if (std.c.getenv("KLIO_EAGER_AUDIT") != null) {
+                std.debug.print("[EAGER-MEMBER] recv_class={s} name={s} cands={d} ext_key={}\n", .{ cn, mname, cands.items.len, self.extensions.contains(cn) });
+            }
             if (cands.items.len != 0) {
                 call_shape_counts[3] += 1;
                 // Run full overload selection over every reachable

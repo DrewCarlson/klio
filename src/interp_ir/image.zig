@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 39;
+pub const FORMAT_VERSION: u32 = 40;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -827,6 +827,7 @@ const ImageRoot = struct {
     file_classes: []ClassRefImage = &.{},
     /// Base top-level property scope data (lazy `notePropScope` replay).
     top_props: []TopPropImage = &.{},
+    fn_returns: []FnReturnImage = &.{},
     enum_id_next: u64,
     /// CLI replay data: packages registered while loading the dependency
     /// sources and the host-binding FQNs installed alongside them.
@@ -965,6 +966,11 @@ const InlineIdImage = struct { id: u32, f: FF(ast.Function) };
 const InlineNamesImage = struct { k: []const u8, v: []const runtime.forest.ForestRef };
 const ClassRefImage = struct { k: []const u8, v: runtime.forest.ForestRef };
 const TopPropImage = struct { name: []const u8, fqn: []const u8, package: []const u8, type_head: []const u8 = "" };
+
+/// A top-level function's simple name and the class head it returns, baked
+/// while the funcs are still decoded. The checker needs it to type a call's
+/// result on a cached image, where the funcs themselves never materialise.
+const FnReturnImage = struct { name: []const u8, head: []const u8 };
 
 // -------------------------------------------------------------------------
 // Bake: StdlibBase -> bytes
@@ -1163,6 +1169,42 @@ pub fn bake(
             }
         }
         root.top_props = try list.toOwnedSlice(a);
+    }
+
+    // Bake top-level function return heads. Only an unambiguous answer is
+    // kept: a name with two declarations returning different classes tells
+    // the checker nothing, and a wrong head is worse than none.
+    {
+        const mg = base.built.module.borrow();
+        defer mg.deinit();
+        const m = mg.get();
+        var classes = std.StringHashMap(void).init(gpa);
+        defer classes.deinit();
+        for (m.classes.items) |*c| classes.put(c.name, {}) catch {};
+        var rets = std.StringHashMap([]const u8).init(gpa);
+        defer rets.deinit();
+        var ambiguous = std.StringHashMap(void).init(gpa);
+        defer ambiguous.deinit();
+        for (m.funcs.items) |*f| {
+            if (f.kind != .plain) continue;
+            if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
+            var head = std.mem.trimEnd(u8, f.return_ty.name, "?");
+            if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+            if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
+            if (head.len == 0 or !classes.contains(head)) continue;
+            if (ambiguous.contains(f.name)) continue;
+            const gop = rets.getOrPut(f.name) catch continue;
+            if (gop.found_existing) {
+                if (!std.mem.eql(u8, gop.value_ptr.*, head)) {
+                    _ = rets.remove(f.name);
+                    ambiguous.put(f.name, {}) catch {};
+                }
+            } else gop.value_ptr.* = head;
+        }
+        var out: std.ArrayList(FnReturnImage) = .empty;
+        var rit = rets.iterator();
+        while (rit.next()) |e| try out.append(a, .{ .name = e.key_ptr.*, .head = e.value_ptr.* });
+        root.fn_returns = try out.toOwnedSlice(a);
     }
 
     // Drop the eager forest from the payload: the per-decl sections (lazy
@@ -2012,6 +2054,13 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot, slot: u32) Allocator.Error
             const out = try a.alloc(StdlibBase.TopProp, root.top_props.len);
             for (root.top_props, 0..) |entry, i| {
                 out[i] = .{ .name = entry.name, .fqn = entry.fqn, .package = entry.package, .type_head = entry.type_head };
+            }
+            break :blk out;
+        },
+        .fn_returns = blk: {
+            const out = try a.alloc(StdlibBase.FnReturn, root.fn_returns.len);
+            for (root.fn_returns, 0..) |entry, i| {
+                out[i] = .{ .name = entry.name, .head = entry.head };
             }
             break :blk out;
         },
