@@ -3695,3 +3695,26 @@ was aimed at (`a?.self()?.b?.twice()`) still types nothing, because the link
 that fails is the safe member READ in the middle, not the call. Correct and
 unused is still unused: reverted, and recorded here so the next reading of
 that chain starts at the read.
+
+## The thunks that knew only names
+
+Three kinds of expression lower in a builder of their own over a
+constructor's parameters: a delegation argument (`: this(...)`), a default
+value, and a superclass argument. All three were handed the parameter NAMES
+and nothing else, so `seed1.inv()` in `XorWowRandom`'s
+`: this(seed1, seed2, 0, 0, seed1.inv(), ...)` had no receiver type at all.
+The declaration lowering now stashes the declared types beside the names and
+the thunk records them; function-typed and bare type-parameter slots are
+skipped, since neither names a class.
+
+    stdlib census    309 -> 307 no_receiver_type
+    examples census 2271 -> 2245 no_receiver_type
+
+The gap between the two counts is the whole reason both are kept: this is
+one site in the stdlib source and twenty-six in the examples set, because
+every example re-lowers it.
+
+## Standing
+
+    stdlib census    8768 / 9139   95.94% bound
+    examples census 98768 /102005  96.83% bound
