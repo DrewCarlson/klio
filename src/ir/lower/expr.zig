@@ -14842,6 +14842,37 @@ fn lowerResolvedMemberCall(
 ) Allocator.Error!ResolvedMemberLowering {
     if (ast_type_args.len != 0 or receiver.* == .Super) return .none;
     last_member_refuted = false;
+    // The checker's own pick needs NO receiver type: it resolved the call
+    // from the declarations, which is the whole point of running it. Asked
+    // before the receiver-type requirement, because that requirement is a
+    // property of the LAZY engine and this answer did not come from it.
+    // Restricted to an image-declared extension for the same reasons the
+    // later consumer is: an extension's ABI is receiver-in-the-leading-slot
+    // whatever the receiver turns out to be, so the emit is decided.
+    if (declared_ty == null and !std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_MEMBER") orelse "1", "0")) {
+        if (b.module.eagerExternCallTarget(name.span)) |ep| ez: {
+            const ef = b.module.funcById(ep) orelse break :ez;
+            if (ef.params.len == 0 or !std.mem.eql(u8, ef.params[0].name, "this")) break :ez;
+            if (ef.params.len != args.len + 1) break :ez;
+            const recv_reg = try lowerExpr(b, receiver);
+            const args_start = b.allocReg();
+            const run = try lowerArgRun(b, args);
+            try b.push(.{ .Move = .{ .dst = args_start, .src = recv_reg } });
+            const dst = b.allocReg();
+            lmNote(.bound_static);
+            try b.push(.{ .Call = .{
+                .dst = dst,
+                .func = ep,
+                .trailing_lambda = b.callTrailingLambda(),
+                .args = args_start,
+                .n_args = run[1] + 1,
+                .arg_names = &.{},
+                .type_args = &.{},
+                .exact = true,
+            } });
+            return .{ .lowered = dst };
+        }
+    }
     const ty = declared_ty orelse {
         if (runtime.envOnce("KLIO_EXT_TRACE")) |wanted| {
             if (std.mem.eql(u8, wanted, name.name)) {

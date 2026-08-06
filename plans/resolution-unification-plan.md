@@ -1193,9 +1193,30 @@ cached run still parses nothing. First measurement, under
 against the 1 file / 1 decl a user program gives it. The checker runs over
 the whole base; the mechanism is there.
 
-The remaining build is the bake-and-replay this session has already done
-twice (`fn_returns`, `ext_returns`): collect the base's resolved calls at
-bake time, serialise them beside the IR, and republish at load into
-`pending_eager_call_fids`, which `eagerCallTarget` already consults. Base
-file ids are stable across bake and load (`user_file_start` partitions
-them), so call spans key correctly on both sides.
+**The bake-and-replay is built (format 42).** The base's resolved calls are
+collected at bake time, keyed to FuncIds through the already-lowered base
+(`funcByDeclSpan`), serialised beside the IR, and republished at load into
+`pending_eager_call_fids`. Measured end to end:
+
+    [stdlib-check] republished 244 base call resolutions   (cached run)
+
+Two further pieces went in with it:
+
+  * `complete_universe` — the checker refuses a SOURCE extension pick,
+    because a user program that loads packs sees only part of the surface.
+    Checking the base, there is no other part, so the flag relaxes that
+    guard for exactly that pass.
+  * The member lowering asks for an eager pick BEFORE requiring a receiver
+    type. That requirement belongs to the lazy engine; a pick the checker
+    made from declarations does not need one, and the `no_receiver_type`
+    early return was refusing them unread.
+
+**The census does not move: still 347.** So none of the 244 lands on an
+unbound site yet. What has NOT been verified is the bake path itself under a
+cleared cache — the probe runs kept loading a previously baked image rather
+than re-entering `bakeAndPrepare`, so the 244 predates `complete_universe`
+and the relaxation is unmeasured. That is the next thing to settle, and it
+is a test-harness question (how to force a cold bake), not a design one.
+
+All batteries green with the machinery in: commontest 117/0, corpus
+267/267, litmus 43/43, units, compose 1317.

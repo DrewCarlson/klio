@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 41;
+pub const FORMAT_VERSION: u32 = 42;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -829,6 +829,7 @@ const ImageRoot = struct {
     top_props: []TopPropImage = &.{},
     fn_returns: []FnReturnImage = &.{},
     ext_returns: []ExtReturnImage = &.{},
+    eager_calls: []EagerCallImage = &.{},
     enum_id_next: u64,
     /// CLI replay data: packages registered while loading the dependency
     /// sources and the host-binding FQNs installed alongside them.
@@ -975,6 +976,10 @@ const FnReturnImage = struct { name: []const u8, head: []const u8 };
 
 /// An extension's return class head under `<receiver head>\x00<name>`.
 const ExtReturnImage = struct { key: []const u8, head: []const u8 };
+
+/// A base call site and the FuncId the checker resolved it to, baked so a
+/// cached run has the answer without re-parsing the base.
+const EagerCallImage = struct { call: Span, fid: u32 };
 
 // -------------------------------------------------------------------------
 // Bake: StdlibBase -> bytes
@@ -1238,6 +1243,14 @@ pub fn bake(
         var eit2 = ekeys.iterator();
         while (eit2.next()) |e| try eout.append(a, .{ .key = e.key_ptr.*, .head = e.value_ptr.* });
         root.ext_returns = try eout.toOwnedSlice(a);
+    }
+
+    // Eager call resolutions the caller collected from the base's own
+    // sources, which exist only here.
+    {
+        var out: std.ArrayList(EagerCallImage) = .empty;
+        for (base.eager_calls) |ec| try out.append(a, .{ .call = ec.call, .fid = ec.fid });
+        root.eager_calls = try out.toOwnedSlice(a);
     }
 
     // Drop the eager forest from the payload: the per-decl sections (lazy
@@ -2101,6 +2114,13 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot, slot: u32) Allocator.Error
             const out = try a.alloc(StdlibBase.ExtReturn, root.ext_returns.len);
             for (root.ext_returns, 0..) |entry, i| {
                 out[i] = .{ .key = entry.key, .head = entry.head };
+            }
+            break :blk out;
+        },
+        .eager_calls = blk: {
+            const out = try a.alloc(StdlibBase.EagerCall, root.eager_calls.len);
+            for (root.eager_calls, 0..) |entry, i| {
+                out[i] = .{ .call = entry.call, .fid = entry.fid };
             }
             break :blk out;
         },

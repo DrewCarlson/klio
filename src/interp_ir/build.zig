@@ -4629,6 +4629,8 @@ pub const StdlibBase = struct {
     fn_returns: []const FnReturn = &.{},
     /// Baked extension return class heads (see `ExtReturn`).
     ext_returns: []const ExtReturn = &.{},
+    /// Baked eager call resolutions inside the base (see `EagerCall`).
+    eager_calls: []const EagerCall = &.{},
     /// Base SourceMap files occupy ids [0..user_file_start).
     user_file_start: u32,
     /// Next enum-entry identity, continuing the base build's sequence so
@@ -4667,6 +4669,10 @@ pub const StdlibBase = struct {
     /// Declaration signatures keep parameters and no return type, so without
     /// this a chained call loses its receiver class at the first link.
     pub const ExtReturn = struct { key: []const u8, head: []const u8 };
+    /// A call site inside the BASE and the declaration the checker picked
+    /// for it. Collected while the base's sources exist (image bake) and
+    /// replayed at load, because a cached run never parses them.
+    pub const EagerCall = struct { call: span.Span, fid: u32 };
 };
 
 /// Build the dependency snapshot from already-parsed base files. The
