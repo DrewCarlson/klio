@@ -15330,7 +15330,11 @@ fn lowerResolvedMemberCall(
     // PROOF when every argument is authoritative — the member compatible,
     // every reachable same-name extension refuted (`KLIO_MEMBER_PROMO=0`
     // disables for A/B).
-    if (promo_ext_why != .none and !promo_blocked_by_class and
+    // The stub/value receiver no longer blocks the proof: the runtime
+    // resolves a virtual slot against the receiver's runtime class and
+    // prefers the FQN-keyed intrinsic for host values, which is the same
+    // rule the no-extension branch below already relies on.
+    if (promo_ext_why != .none and
         resolved.dispatch == .deferred and resolved.target != null and
         !std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_PROMO") orelse "1", "0"))
     {
