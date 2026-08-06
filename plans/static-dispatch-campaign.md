@@ -3718,3 +3718,42 @@ every example re-lowers it.
 
     stdlib census    8768 / 9139   95.94% bound
     examples census 98768 /102005  96.83% bound
+
+## The safe chain, and what typing it exposed
+
+`a?.self()?.leaf?.twice()` typed nothing past the first link. Two separate
+causes, both in the same arm:
+
+  - the safe member READ was excluded by the arm's own guard, though it is
+    the only legal form for reading through a nullable receiver. It now
+    looks the property up on the non-null owner and hands the `?` back.
+  - a receiver that is itself a CALL has no declared type to read, so the
+    walk stopped there. Its resolved return is the same fact one step along.
+
+Typing them measured as zero bound and looked like a wash:
+
+    no_receiver_type      307 ->  291   (stdlib)
+    nullable_or_generic     2 ->   18
+    no_receiver_type     2245 -> 2036   (examples)
+    nullable_or_generic    30 ->  238
+
+Every site moved from having NO receiver type to having a nullable one,
+where the rule is that a `T?` extension outranks the member — so the call
+was handed to the runtime. Naming the residue (`KLIO_NULLEXT_NAMES`) showed
+what it was: `ByteArray?.contentEquals`, `ShortArray?.contentHashCode`,
+`Any?.toString`. Those are declarations like any other, and Kotlin binds an
+extension statically with the receiver in the leading slot. Resolving it
+there instead of deferring closed the whole bucket:
+
+    stdlib   nullable_or_generic  18 ->   2, bound_static 1539 -> 1555
+    examples nullable_or_generic 238 ->  26, bound_static 16018 -> 16230
+
+The sequence is the point. The typing change alone measures nothing and
+would have been reverted under the flat-means-revert rule; what it did was
+move a population from a bucket with no name to a bucket whose name said
+exactly what to do next.
+
+## Standing
+
+    stdlib census    8784 / 9139   96.12% bound
+    examples census 98980 /102006  97.03% bound
