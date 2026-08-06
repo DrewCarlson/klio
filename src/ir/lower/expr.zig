@@ -6528,6 +6528,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     .args = run[0],
                     .n_args = run[1],
                     .arg_names = arg_names,
+                    .arg_static_heads = try ctorArgStaticHeads(b, args),
                 } });
             } else {
                 const this_idx = try b.recordCapture("this");
@@ -14269,6 +14270,7 @@ fn lowerFqnCtorCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg {
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
+        .arg_static_heads = try ctorArgStaticHeads(b, args),
     } });
     return dst;
 }
@@ -15811,6 +15813,32 @@ fn lowerMemberExtensionDispatchReceiver(
         .qualifier = qualifier,
     } });
     return dst;
+}
+
+/// The DECLARED type head of each argument, interned, for a construction
+/// site. Kotlin picks a constructor overload from the STATIC types; an
+/// interpreted instance carries no class name the runtime ranking can read,
+/// so without this a subtype argument could not outrank a supertype slot.
+/// Null where lowering has no declared type — the runtime keeps its own
+/// value-shaped ranking for those slots.
+fn ctorArgStaticHeads(b: *FuncBuilder, args: []const Expr) Allocator.Error![]?ir.ConstId {
+    const out = try b.allocator.alloc(?ir.ConstId, args.len);
+    errdefer b.allocator.free(out);
+    var any = false;
+    for (args, 0..) |*a, i| {
+        out[i] = null;
+        const ty = argDeclTypeRef(b, a) orelse continue;
+        var h = typeHead(std.mem.trimEnd(u8, ty.name, "?"));
+        if (std.mem.lastIndexOfScalar(u8, h, '.')) |d| h = h[d + 1 ..];
+        if (h.len == 0 or bareTypeParamHead(h)) continue;
+        out[i] = try b.module.internConst(b.allocator, .{ .String = h });
+        any = true;
+    }
+    if (!any) {
+        b.allocator.free(out);
+        return &.{};
+    }
+    return out;
 }
 
 fn lowerResolvedExtensionCall(

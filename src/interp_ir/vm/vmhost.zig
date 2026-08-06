@@ -343,6 +343,7 @@ pub const VmHost = struct {
     pub const memberRefExact = host_call_member.memberRefExact;
     pub const callSuper = host_call_member.callSuper;
     pub const qualifiedThis = host_call_member.qualifiedThis;
+    pub const setCtorArgStaticHeads = host_instances.setCtorArgStaticHeads;
     pub const newInstance = host_instances.newInstance;
     pub const newInstanceNamed = host_instances.newInstanceNamed;
     pub const classSecondaryCtorCanBind = host_instances.classSecondaryCtorCanBind;

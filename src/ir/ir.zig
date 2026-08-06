@@ -512,6 +512,12 @@ pub const Inst = union(enum) {
         args: Reg,
         n_args: u32,
         arg_names: []?ConstId = &.{},
+        /// The DECLARED type head of each argument, where lowering knows one.
+        /// Kotlin selects a constructor overload from the static types, and
+        /// an interpreted instance reports no class of its own at run time —
+        /// `Box(circle)` and `Box(shapeTypedCircle)` are indistinguishable to
+        /// a value-only ranking, which then took the first declaration.
+        arg_static_heads: []?ConstId = &.{},
     },
     /// Build a `List` from a range of registers.
     NewList: struct { dst: Reg, args: Reg, n_args: u32 },

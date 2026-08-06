@@ -2184,3 +2184,11 @@ test "local_fun_return_type" {
         \\
     );
 }
+
+test "ctor_overload_specificity" {
+    try check("ctor_overload_specificity",
+        \\i1,sx,circle,shape,shape
+        \\circle,shape,shape
+        \\
+    );
+}

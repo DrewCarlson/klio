@@ -7614,6 +7614,15 @@ noinline fn execArmNewInstance(comptime H: type, allocator: Allocator, frame: *F
     // subject falls through to the enclosing-receiver chain.
     var outer_hint: ?Value = callerThisValue(frame);
     const hint_ptr: ?*const Value = if (outer_hint) |*h| h else null;
+    // Kotlin selects the constructor overload from the arguments' STATIC
+    // types. Hand them to the host for this construction only; it consumes
+    // them once, so a delegation or default thunk that constructs further
+    // instances underneath ranks on its own terms.
+    const static_heads = try resolveArgNames(allocator, frame.module, ni.arg_static_heads);
+    defer freeArgNames(allocator, static_heads);
+    if (comptime @hasDecl(H, "setCtorArgStaticHeads")) {
+        host.setCtorArgStaticHeads(static_heads);
+    }
     const result = switch (try host.newInstanceNamed(allocator, ni.class, arg_values, names, hint_ptr)) {
         .ok => |v| v,
         .err => |e| return raiseStep(frame, e),
