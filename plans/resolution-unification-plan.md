@@ -1261,3 +1261,40 @@ is a different project from either plan.
 
 All batteries green with the machinery in: commontest 117/0, corpus
 267/267, litmus 43/43, units, compose 1317.
+
+## Implementation-order item 1, measured (2026-08-07)
+
+The checkpoint's canary — a class with two private same-name same-arity
+overloads — PASSES, including forward references between them. Member
+overload selection ranks correctly. The half of that item that was still
+open is the one it names second: CONSTRUCTORS.
+
+    class Box {
+        constructor(a: Shape)  { tag = "shape" }
+        constructor(a: Circle) { tag = "circle" }
+    }
+    Box(Circle())   // "shape"
+
+Reordering the two declarations changed the answer, which is the tell: the
+ranking was declaration-order-first-wins. The cause was not the overload
+index at all. Kotlin selects a constructor from the arguments' STATIC
+types; the ranking ran at run time on the VALUES, and an interpreted
+instance reports `<instance>` through `typeFqn` — no class name — so the
+exact-head bonus could never fire and both candidates scored equal on the
+subtype rule.
+
+Fixing it inside the runtime alone is not possible and the attempt showed
+why: reading the concrete class off the instance makes `Box(circle)` right
+and `Box(shapeTypedCircle)` wrong, and it makes
+`constructor(a: Circle) : this(a as Shape)` re-select ITSELF, since the
+cast is erased by then — an unbounded recursion. The static type is the
+only evidence that distinguishes those three cases.
+
+So `NewInstance` carries the declared head of each argument where lowering
+knows one, and the existing score prefers an exact match on it. The heads
+are consumed ONCE per construction: a delegation or a default expression
+that builds further instances underneath must rank on its own terms.
+Format version 43.
+
+Pinned as `ctor_overload_specificity`. All batteries green: commontest
+117/0, corpus 267/267, litmus 43/43, units, compose 1315 (baseline 1275).
