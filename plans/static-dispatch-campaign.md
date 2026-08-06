@@ -3684,3 +3684,14 @@ splice, the stale host-backed-receiver gate, unannotated top-level property
 heads from their initializer's callee, package-qualified call return types,
 argument types read before the splice binds, and the safe-call non-null
 rewrite.
+
+### Measured flat and reverted: the safe call's own return type
+
+`memberCallReturnTypeRef` refuses a nullable receiver outright. Kotlin
+allows one — through a safe call, whose result is nullable in turn — so the
+lookup was changed to use the non-null head and carry the `?` back, which is
+the rule as written. It measures exactly zero on BOTH censuses. The chain it
+was aimed at (`a?.self()?.b?.twice()`) still types nothing, because the link
+that fails is the safe member READ in the middle, not the call. Correct and
+unused is still unused: reverted, and recorded here so the next reading of
+that chain starts at the read.
