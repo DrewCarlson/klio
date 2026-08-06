@@ -3428,5 +3428,21 @@ evidence either way. Recorded because the failure mode is now two-for-two in
 one session: **a lowering-internal table's miss is not a dispatch miss, and
 only the census can say which is which.**
 
-The instrument that would answer it traces what `argDeclTypeRefLazy` returns
-for the RECEIVER at the use site, not what the declaration table holds.
+The instrument that answers it is the census itself, restricted to the
+repro's own function: `KLIO_NORECV_NAMES='*'` filtered to `fn=render`. Run
+that way, both shapes BIND — the plain two-class chain and the nested
+qualified-parameter form that matches `HexExtensions.kt` exactly:
+
+    class HexFmt { class BytesFmt(val byteSeparator: String, …)
+                   val bytes: BytesFmt = … }
+    fun render(bytesFormat: HexFmt.BytesFmt): Int {
+        val sep = bytesFormat.byteSeparator      // binds
+        return sep.length + bytesFormat.bytePrefix.length
+    }
+
+So the general shape is not broken, and the four real `byteSeparator` sites
+fail for something particular to their file — most likely the inline splice
+they sit inside. A synthetic repro that BINDS is real evidence: it rules the
+shape out and moves the question to the context.
+
+That is where this lead stands. It is the honest state, not a conclusion.
