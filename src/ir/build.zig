@@ -1878,10 +1878,6 @@ pub const FuncBuilder = struct {
         }
         if (decl_span) |sp| try self.local_init_decl_spans.put(name, sp);
         try self.local_init_exprs.put(name, e);
-        if (self.local_decl_types.fetchRemove(name)) |old| {
-            var cleanup = old.value;
-            cleanup.deinit(self.allocator);
-        }
     }
     /// A smart cast narrows the SUBJECT's static type for the guarded branch,
     /// and Kotlin resolves extensions against the static type: inside

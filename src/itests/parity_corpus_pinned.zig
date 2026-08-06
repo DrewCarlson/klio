@@ -1939,6 +1939,16 @@ test "numeric_promotion_receiver" {
     );
 }
 
+test "local_type_survives_init_record" {
+    try check("local_type_survives_init_record",
+        \\66
+        \\6
+        \\BC
+        \\3
+        \\
+    );
+}
+
 test "operator_member_return" {
     try check("operator_member_return",
         \\500

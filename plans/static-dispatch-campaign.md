@@ -3186,3 +3186,41 @@ splice path, and this function is neither — comes before any further rule.
 
 The rules that DID land (74, 75) moved the census, so they reach a reader.
 What distinguishes them from the flat ones is the next thing to learn.
+
+## Addendum 77 (2026-08-06): the derived type was deleted two lines after it was written
+
+Root cause of addendum 76, found by following the trace to the end instead
+of stopping at the first plausible reading. `setLocalInitExprAt` ended with:
+
+    try self.local_init_exprs.put(name, e);
+    if (self.local_decl_types.fetchRemove(name)) |old| { … }   // <- removed
+
+and `lowerLocalDecl` calls it in the recording switch that runs immediately
+AFTER the typing switch. So for every `.Call`, `.Index`, `.Member` and
+`.Path` initializer the sequence was: derive the type, write it, then erase
+it — the record the whole declared-type channel exists to produce, deleted
+by the next statement.
+
+Deleting the erasure:
+
+    no_receiver_type 384 -> 379, resolver_declined 83 -> 81
+
+**Two wrong readings of the same trace, both recorded above, both disproved
+by the next probe.** They are left in place because the sequence is the
+lesson:
+
+  1. "a producer/consumer split across two builders" — the WRITE line
+     carried no builder pointer, and the READ's differed between runs
+     (ASLR). Printing the pointer on both showed one builder.
+  2. "something clears it between" — `clearLocalDeclType` is the obvious
+     remover and its call sites are all in lambda/inline paths. Instrumenting
+     it showed no CLEAR fires at all.
+  3. The remover was a `fetchRemove` inline in an unrelated setter, which
+     only a grep for the MAP rather than for the clear function finds.
+
+Each reading was consistent with the evidence in hand and wrong. The one
+that held was the one where the fix moved the census.
+
+This also explains addenda 73 and 76's flat rules — they computed correct
+types into a record that was then deleted. Those rules are worth re-testing
+now that the record survives.
