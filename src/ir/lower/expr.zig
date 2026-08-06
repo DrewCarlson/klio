@@ -9689,11 +9689,37 @@ fn fnTypedCalleeReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator
     return try ret.clone(b.allocator);
 }
 
+/// The return type of a call whose callee spells a dotted FQN
+/// (`kotlin.math.floor(x)`). The declaration is picked the same way the
+/// emission picks it — exact FQN, matching arity — so the answer is the one
+/// declaration the call runs, never a same-tail namesake in another package.
+fn fqnCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (call_expr.* != .Call) return null;
+    const callee = call_expr.Call.callee;
+    if (callee.* != .Member) return null;
+    const fqn = (try collectDottedFqn(b.allocator, callee)) orelse return null;
+    defer b.allocator.free(fqn);
+    const tail = rsplitLast(fqn, '.');
+    if (std.mem.eql(u8, tail, fqn)) return null;
+    const want = call_expr.Call.args.len;
+    for (b.module.funcsBySimpleName(tail)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (!std.mem.eql(u8, f.fqn, fqn) or f.params.len != want) continue;
+        if (f.return_ty.name.len == 0) return null;
+        const h = typeHead(std.mem.trimEnd(u8, f.return_ty.name, "?"));
+        if (h.len <= 2 and h.len > 0 and std.ascii.isUpper(h[0])) return null;
+        if (staticTypeClassId(b, f.return_ty) == null) return null;
+        return try f.return_ty.clone(b.allocator);
+    }
+    return null;
+}
+
 fn staticCallReturnTypeRef(
     b: *FuncBuilder,
     call_expr: *const Expr,
 ) Allocator.Error!?ir.TypeRef {
     if (try fnTypedCalleeReturnTypeRef(b, call_expr)) |t| return t;
+    if (try fqnCallReturnTypeRef(b, call_expr)) |t| return t;
     if (try memberCallReturnTypeRef(b, call_expr)) |t| return t;
     if (try bareMemberReturnTypeRef(b, call_expr)) |t| return t;
     if (call_expr.* == .Binary) {
