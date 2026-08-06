@@ -515,11 +515,29 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
 
   With both guards the consumer yields zero on the census corpus today,
   because the checker can name the receiver class for very few member calls
-  on an image program. That is now the single measurable input to this
-  channel: `call_shape_counts[2]` (member calls whose receiver class the
-  checker could name). Raising it — more `fn_return_class` coverage, local
-  type propagation in the checker — is what turns the complete chain into
-  binds. It is not another channel to build.
+  on an image program — 2 of 41 on `deep_call_chain`. That count,
+  `call_shape_counts[2]`, is the single measurable input to this channel.
+
+  **Raising it is measured NEGATIVE, and the reason is instructive.** The
+  cause of the low count is exact: a published extension carries no return
+  head (declaration signatures keep parameters, never returns), so a chained
+  call loses its receiver class at the first link. Baking extension return
+  heads into the image alongside the top-level ones fixes the count outright
+  — `member_with_class` 2 -> 41, every member call ranked, 3,679 heads
+  published.
+
+  It also breaks 31 of 267 corpus programs and aborts a litmus test.
+  `expr_class` does not only feed this channel: it feeds the type-head
+  channel that LOWERING consumes, and a head that is right for the checker's
+  view is not automatically right for the receiver lowering sees. This is
+  addendum 61's rule again — a name channel needs a resolvability guard at
+  its CONSUMER — and the guard that exists there was calibrated against the
+  much smaller set of heads the checker used to produce.
+
+  So the next unit is not "publish more heads". It is: separate the evidence
+  the checker uses to RANK from the evidence lowering consumes to TYPE, so
+  the ranking input can grow without moving the typing input. Reverted; the
+  census, corpus, and litmus all return to their committed values.
 
 - **P8** — hatch deletion (RC-H catalog above).
 - **P9** — optional flat bytecode + pack serialization.
