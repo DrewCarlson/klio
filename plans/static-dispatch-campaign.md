@@ -3641,3 +3641,46 @@ a bare TYPE PARAMETER — `CompareContext<out T>.actual`, `UnsafeLazyImpl.value`
 `TestCollection<T>.data`. Those name nothing in the receiving scope; kotlinc
 resolves them from the instantiation, which lowering does not carry. That is
 a floor, not a channel, and it is now measured rather than assumed.
+
+## Two censuses, and the one that could see the safe call
+
+The stdlib commontest census is generic containers throughout, so a change
+that reads CONCRETE types measures near zero there by construction. The
+examples census is ordinary application code. Read together they separated a
+floor from a channel twice in a row.
+
+`transform` is the floor. It is the single most common untyped call receiver
+in the examples set (156 sites), and it is an inline lambda PARAMETER whose
+declared return is a bare type parameter — `mapNotNullTo` writes
+`transform(element)?.let { destination.add(it) }` with `transform: (T) -> R?`.
+There is no type to read. Counting it was still worth it: it is the largest
+single entry in that census and it is not work.
+
+The safe call was the channel. `x?.let { it.f() }` lowered its
+proven-non-null branch straight to a runtime member call — the inline splice
+never ran, so `it` got no type, so every member call inside the lambda
+resolved by name. Those sites did not even APPEAR in the census, because a
+raw `CallMember` is not a lowering decision the census records. Rewriting the
+branch as a plain call on a temporary bound to the already-lowered receiver
+put 832 examples-set dispatches and 64 stdlib-set dispatches on the ordinary
+path, where they bind.
+
+    examples total    101165 -> 102005 sites, all of the difference bound
+    stdlib   total      9075 -> 9139
+
+The ratio barely moves and the change is one of the larger ones in the
+campaign. A census that only counts what the lowering decided cannot see
+work the lowering never attempted; the fix is to compare the two file sets
+and to watch the TOTAL, not only the percentage.
+
+## Standing
+
+    stdlib census    8766 / 9139   95.92% bound
+    examples census 98742 /102005  96.80% bound
+
+Landed since the last standing: range/progression loop-variable element
+types, the four-part inline-splice frame correction and the `this.f(x)`
+splice, the stale host-backed-receiver gate, unannotated top-level property
+heads from their initializer's callee, package-qualified call return types,
+argument types read before the splice binds, and the safe-call non-null
+rewrite.
