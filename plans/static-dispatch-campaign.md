@@ -2964,3 +2964,22 @@ answer the walk already gave can change.
 The resolution fault was live in the stdlib the whole time and no test
 reached it. It is the second time this session that writing the fixture for
 a typing change surfaced a correctness bug underneath it.
+
+## Addendum 70 (2026-08-06): a bare call is a member call on the implicit receiver
+
+A spliced inline body writes its receiver's members bare —
+`val iterator = listIterator(size)` inside `List.takeLastWhile` — and every
+return channel wanted the receiver spelled out, so the local carried no type
+and both `hasNext` and `next` on it resolved by name.
+
+The bare form resolves against the splice receiver, then the extension
+receiver, then the enclosing class, and only when nothing else can claim the
+name: no local, no local `fun`, and NO top-level function of that simple
+name anywhere. That last guard is what keeps it from re-running addendum
+64's mistake — where a top-level namesake exists, the bare call may not be
+the member at all.
+
+    no_receiver_type 418 -> 402, all sixteen into bound_virtual
+
+Session total so far: 508 -> 402, a fifth of the residue gone, bound share
+92.73% -> 93.76%.

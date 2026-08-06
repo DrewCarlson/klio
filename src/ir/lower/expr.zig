@@ -9488,6 +9488,7 @@ fn staticCallReturnTypeRef(
 ) Allocator.Error!?ir.TypeRef {
     if (try fnTypedCalleeReturnTypeRef(b, call_expr)) |t| return t;
     if (try memberCallReturnTypeRef(b, call_expr)) |t| return t;
+    if (try bareMemberReturnTypeRef(b, call_expr)) |t| return t;
     if (call_expr.* == .Binary) {
         const bin = call_expr.Binary;
         const method: []const u8 = switch (bin.op) {
@@ -14367,6 +14368,38 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             return null;
         }
         return ret.*;
+    }
+    return null;
+}
+
+/// The declared return of a BARE call that is really a member call on the
+/// implicit receiver — the shape a spliced inline body is written in:
+/// `val iterator = listIterator(size)` inside `List.takeLastWhile` reads
+/// `List`'s own member, and the local it initializes carried no type at all
+/// because every return channel expects a spelled-out receiver.
+fn bareMemberReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (call_expr.* != .Call) return null;
+    const call = call_expr.Call;
+    if (call.callee.* != .Path or call.callee.Path.segments.len != 1) return null;
+    const nm = call.callee.Path.segments[0].name;
+    // A local binding, a local `fun`, or a top-level namesake resolves the
+    // call some other way; only a name the receiver's class declares and
+    // nothing else shadows is unambiguously the member.
+    if (b.resolve(nm) != null or b.knowsOuter(nm) or b.isLocalFn(nm)) return null;
+    if (b.module.funcsBySimpleName(nm).len != 0) return null;
+    const recv_head = b.spliceRecvTy() orelse b.recvTy() orelse b.ownerClass() orelse return null;
+    const rh = typeHead(std.mem.trimEnd(u8, recv_head, "?"));
+    if (rh.len == 0) return null;
+    var probe: usize = call.args.len;
+    while (probe <= call.args.len + 3) : (probe += 1) {
+        const key = std.fmt.allocPrint(b.allocator, "{s}\x00{s}\x00{d}", .{ rh, nm, probe }) catch return null;
+        defer b.allocator.free(key);
+        const fid = b.module.registry.member_method_fids.get(key) orelse continue;
+        const f = b.module.funcById(fid) orelse continue;
+        if (!f.return_ty_declared or f.return_ty.name.len == 0) return null;
+        if (bareTypeParamHead(f.return_ty.name)) return null;
+        if (staticTypeClassId(b, f.return_ty) == null) return null;
+        return try f.return_ty.clone(b.allocator);
     }
     return null;
 }
