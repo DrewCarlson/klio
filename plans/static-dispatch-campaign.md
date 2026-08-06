@@ -2882,3 +2882,31 @@ channel a probe named instead of the one the code path calls:
     receivers for a `ShortArray` call. A clean re-run showed one line,
     `recv=ShortArray a0=Short` — resolution was right all along, and the
     loss was strictly downstream in the splice.
+
+## Addendum 67 (2026-08-06): a member call's declared return types the chain
+
+`not_simple_callee` became the largest leaf of the residue once the `it`
+family cleared — 110 sites whose receiver is a CALL with a member callee:
+
+    sb.append(x).deleteAt(0)      (v shr 8).toByte()
+    joinTo(sb, …).toString()      rangesDelimitedBy(…).map { … }
+
+Every channel that read a call's return handled a bare simple name only, so
+a chain lost its type at the first link. `memberCallReturnTypeRef` resolves
+the link the way `memberCallArgArities` resolves arities: the receiver's own
+static type selects candidates whose declared receiver it extends, ranked by
+scope tier, and the return counts only when every best-tier candidate
+agrees. A declared member of the receiver's class is taken outright, as
+Kotlin resolves it.
+
+    no_receiver_type 488 -> 454     bound 92.93% -> 93.22%
+
+Two guards make the difference between this and the bare-function version
+that measured negative in addendum 64:
+
+  * `return_ty_declared`. An expression body with no annotation records
+    `Unit` as a PLACEHOLDER; without this check the channel types chains
+    off half the stdlib as Unit.
+  * A resolvable, non-type-parameter head. `no_class_id` moved 4 -> 11,
+    which is the visible price of the heads that slip past — small next to
+    the 34 sites gained, and each one is a site that was unbound anyway.

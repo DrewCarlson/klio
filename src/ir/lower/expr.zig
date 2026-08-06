@@ -9459,6 +9459,7 @@ fn staticCallReturnTypeRef(
     call_expr: *const Expr,
 ) Allocator.Error!?ir.TypeRef {
     if (try fnTypedCalleeReturnTypeRef(b, call_expr)) |t| return t;
+    if (try memberCallReturnTypeRef(b, call_expr)) |t| return t;
     if (call_expr.* == .Binary) {
         const bin = call_expr.Binary;
         const method: []const u8 = switch (bin.op) {
@@ -14239,6 +14240,114 @@ fn memberCallArgArities(b: *FuncBuilder, receiver: *const Expr, mname: []const u
         }
     }
     return agreed;
+}
+
+/// The declared return type of a MEMBER call, so a chained call
+/// (`sb.append(x).deleteAt(0)`, `(a shr 8).toByte()`) types its receiver.
+///
+/// `not_simple_callee` is the largest leaf of the unbound residue: the
+/// receiver is itself a call, and every channel that reads a call's return
+/// handles only a bare simple name. Resolution here mirrors
+/// `memberCallArgArities` — the receiver's own static type picks candidates
+/// whose declared receiver it extends, ranked by scope tier, and the answer
+/// counts only when every best-tier candidate agrees.
+///
+/// A declared return is evidence only when it NAMES something: a bare type
+/// parameter (`fun <R> map(...): R`) resolves to no class, and committing to
+/// it disproves candidates a null type leaves open.
+fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (call_expr.* != .Call) return null;
+    const call = call_expr.Call;
+    if (call.callee.* != .Member) return null;
+    const mname = call.callee.Member.name.name;
+    const recv = call.callee.Member.receiver;
+
+    var recv_owned: ?ir.TypeRef = null;
+    defer if (recv_owned) |*t| t.deinit(b.allocator);
+    const recv_ty: ir.TypeRef = blk: {
+        if (argDeclTypeRefLazy(b, recv)) |known| break :blk known;
+        recv_owned = try staticExprTypeRef(b, recv);
+        break :blk recv_owned orelse return null;
+    };
+    // A nullable receiver reaches its member through a safe call, which
+    // makes the result nullable too; leave that to the null-aware paths.
+    if (recv_ty.nullable) return null;
+    const recv_head = typeHead(recv_ty.name);
+    if (recv_head.len == 0) return null;
+
+    const caller_file = exprSpan(recv).file;
+    const caller_pkg = b.module.packageOfFile(caller_file) orelse b.self_package;
+    var best_tier: u8 = 255;
+    var agreed: ?ir.TypeRef = null;
+
+    // A declared member of the receiver's own class outranks every
+    // extension, exactly as Kotlin resolves it.
+    {
+        var probe: usize = call.args.len;
+        while (probe <= call.args.len + 3) : (probe += 1) {
+            const key = std.fmt.allocPrint(b.allocator, "{s}\x00{s}\x00{d}", .{ recv_head, mname, probe }) catch break;
+            defer b.allocator.free(key);
+            const fid = b.module.registry.member_method_fids.get(key) orelse continue;
+            const f = b.module.funcById(fid) orelse continue;
+            // An expression body with no annotation records `Unit` as a
+            // PLACEHOLDER, so an undeclared return is not a fact.
+            if (!f.return_ty_declared or f.return_ty.name.len == 0) return null;
+            if (bareTypeParamHead(f.return_ty.name)) return null;
+            if (staticTypeClassId(b, f.return_ty) == null) return null;
+            return try f.return_ty.clone(b.allocator);
+        }
+    }
+
+    for (b.module.funcsBySimpleName(mname)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.kind == .instance_method or f.params.len == 0 or
+            !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        if (f.kind == .member_extension) {
+            const owner = b.module.registry.member_ext_owner_class.get(fid) orelse continue;
+            const lexical_owner = b.ownerClass() orelse continue;
+            if (!b.module.classIsOrExtends(lexical_owner, owner)) continue;
+        }
+        const candidate_head = typeHead(f.params[0].ty.name);
+        if (!b.module.classIsOrExtends(recv_head, candidate_head)) continue;
+        const tier = b.module.scopeTier(f.fqn, f.package, mname, caller_pkg, caller_file);
+        if (tier > 3 or tier > best_tier) continue;
+        if (!f.return_ty_declared or f.return_ty.name.len == 0 or
+            bareTypeParamHead(f.return_ty.name))
+        {
+            if (agreed) |*old| old.deinit(b.allocator);
+            return null;
+        }
+        if (tier < best_tier) {
+            if (agreed) |*old| old.deinit(b.allocator);
+            agreed = try f.return_ty.clone(b.allocator);
+            best_tier = tier;
+            continue;
+        }
+        if (agreed) |*old| {
+            if (!std.mem.eql(u8, old.name, f.return_ty.name)) {
+                old.deinit(b.allocator);
+                agreed = null;
+                return null;
+            }
+        } else {
+            agreed = try f.return_ty.clone(b.allocator);
+        }
+    }
+    if (agreed) |*ret| {
+        if (staticTypeClassId(b, ret.*) == null) {
+            ret.deinit(b.allocator);
+            return null;
+        }
+        return ret.*;
+    }
+    return null;
+}
+
+/// A short all-caps head (`T`, `R`, `K1`) is a type PARAMETER spelling, not
+/// a class name. `staticTypeClassId` rejects it too, but only after a lookup.
+fn bareTypeParamHead(name: []const u8) bool {
+    const h = typeHead(std.mem.trimEnd(u8, name, "?"));
+    return h.len != 0 and h.len <= 2 and std.ascii.isUpper(h[0]);
 }
 
 /// Lower a member call once the shared resolver identifies its declaration.
