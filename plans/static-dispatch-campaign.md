@@ -3275,3 +3275,29 @@ a type parameter, and 159 more sit in buckets that exist to refuse a guess.
 The remaining ~147 are individual chains, and the method that reaches them
 is the one that found the erasure bug — trace a single site to its end, and
 disbelieve the first two explanations.
+
+## Addendum 79 (2026-08-06): `index` was a postfix increment, not a range
+
+`index` (8 sites) survived six rules across three addenda because every one
+of them guessed at the wrong shape — a loop variable over `a until b`. The
+source says otherwise:
+
+    LOWER_CASE_HEX_DIGITS.forEachIndexed { index, char -> … index.toLong() }
+
+`CharSequence.forEachIndexed` splices as
+
+    var index = 0
+    for (item in this) action(index++, item)
+
+so the lambda's `index` parameter is bound from the ARGUMENT `index++`, and
+`argDeclTypeRefLazy` had no `.Postfix` arm at all. `x++` evaluates to the
+operand's prior value and carries its type; one line adds it.
+
+    no_receiver_type 379 -> 375, all four into bound
+
+Third time the spliced-lambda argument position has been the answer
+(addendum 66's indexed argument, addendum 77's erased record, this). The
+inline splice types a lambda parameter from whatever expression the callee
+passes, so every expression SHAPE the stdlib uses at an invocation site is a
+channel that must exist. The census's `Postfix` bucket — six sites — was
+naming this the whole time.

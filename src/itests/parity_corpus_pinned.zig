@@ -1939,6 +1939,16 @@ test "numeric_promotion_receiver" {
     );
 }
 
+test "postfix_arg_lambda_param" {
+    try check("postfix_arg_lambda_param",
+        \\7
+        \\48
+        \\5/6
+        \\9/1
+        \\
+    );
+}
+
 test "local_type_survives_init_record" {
     try check("local_type_survives_init_record",
         \\66

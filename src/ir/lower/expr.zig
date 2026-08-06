@@ -8640,6 +8640,13 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             }
         }
     }
+    // `x++` / `x--` evaluates to the operand's PRIOR value, so it carries the
+    // operand's type. The inline splice types a lambda parameter from the
+    // argument expression, and half the indexed stdlib family invokes its
+    // lambda that way — `action(index++, item)` inside
+    // `CharSequence.forEachIndexed` — so the parameter arrived untyped and
+    // every call on it resolved by name.
+    if (arg.* == .Postfix) return argDeclTypeRefLazy(b, arg.Postfix.expr);
     // `a / b` on a CLASS is an operator member, and its declared return is
     // the answer: `val half = duration / 2` in the saturating-math helpers
     // types `half` as Duration. The arithmetic arm beside this one promotes
