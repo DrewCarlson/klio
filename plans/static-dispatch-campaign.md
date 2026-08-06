@@ -3445,4 +3445,21 @@ fail for something particular to their file — most likely the inline splice
 they sit inside. A synthetic repro that BINDS is real evidence: it rules the
 shape out and moves the question to the context.
 
+Extended to the real declaration's exact context — the four sites live in
+
+    private fun ByteArray.toHexStringNoLineAndGroupSeparatorSlowPath(
+        …, bytesFormat: HexFormat.BytesHexFormat, …
+    ) { val byteSeparator = bytesFormat.byteSeparator … }
+
+so the repro was rebuilt with an EXTENSION receiver as well as the nested
+qualified parameter type. It binds too. Three synthetic forms, all binding.
+
+What that leaves is the file's own context rather than any shape: the
+function is `private` and reached only through two `internal` callers, and
+`HexFormat.BytesHexFormat` is nested inside a class declared in another
+file. One of those is the difference. Narrowing it needs the trace run
+against `HexExtensions.kt` itself, not a reconstruction — a synthetic repro
+has now cost three attempts and ruled out three hypotheses, which is what it
+is good for, and it cannot rule in the fourth.
+
 That is where this lead stands. It is the honest state, not a conclusion.
