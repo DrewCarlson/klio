@@ -2120,3 +2120,11 @@ test "for_over_progression_element_type" {
         \\
     );
 }
+
+test "splice_param_shadows_its_own_source" {
+    try check("splice_param_shadows_its_own_source",
+        \\0a1b2c
+        \\x0y1
+        \\
+    );
+}

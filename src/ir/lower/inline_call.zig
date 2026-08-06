@@ -502,6 +502,34 @@ pub fn spliceInlineLambdaOn(
         @min(@as(usize, 1), arg_regs.len)
     else
         @min(params.len, arg_regs.len);
+    // Every argument's type is read BEFORE any parameter binds. The
+    // argument expressions belong to the callee's body scope, and a lambda
+    // parameter that shares a name with something that scope declares
+    // (`forEachIndexed`'s own `index` counter and the user's `index`
+    // parameter) would otherwise have its own source erased by the binding
+    // that consumes it.
+    const arg_tys = try b.allocator.alloc(?ir.TypeRef, bind_n);
+    defer {
+        for (arg_tys) |*t| if (t.*) |*ty| ty.deinit(b.allocator);
+        b.allocator.free(arg_tys);
+    }
+    for (arg_tys, 0..) |*slot, ai| {
+        // An INDEXED argument carries the same element fact the loop
+        // variable does, and half the generated array family invokes its
+        // lambda that way: `ShortArray.indexOfFirst` splices its predicate
+        // at `predicate(this[index])` while `ShortArray.any` splices at
+        // `predicate(element)`. Only the second one bound a type, so every
+        // member call on `it` inside the user's lambda resolved by name for
+        // the indexed half of the family.
+        if (expr_lower.argDeclTypeRefLazy(b, &arg_exprs[ai])) |ty| {
+            slot.* = try ty.clone(b.allocator);
+            continue;
+        }
+        const ae = &arg_exprs[ai];
+        if (ae.* == .Index and ae.Index.args.len == 1) {
+            slot.* = try expr_lower.iterableElementTypeRef(b, ae.Index.receiver);
+        } else slot.* = null;
+    }
     var bi: usize = 0;
     while (bi < bind_n) : (bi += 1) {
         const pname = if (params.len == 0) "it" else params[bi].name;
@@ -512,21 +540,7 @@ pub fn spliceInlineLambdaOn(
         });
         try b.bind(pname, arg_regs[bi]);
         b.clearLocalDeclType(pname);
-        // An INDEXED argument carries the same element fact the loop
-        // variable does, and half the generated array family invokes its
-        // lambda that way: `ShortArray.indexOfFirst` splices its predicate
-        // at `predicate(this[index])` while `ShortArray.any` splices at
-        // `predicate(element)`. Only the second one bound a type, so every
-        // member call on `it` inside the user's lambda resolved by name for
-        // the indexed half of the family.
-        var indexed: ?ir.TypeRef = null;
-        defer if (indexed) |*t| t.deinit(b.allocator);
-        const arg_ty: ?ir.TypeRef = expr_lower.argDeclTypeRefLazy(b, &arg_exprs[bi]) orelse blk: {
-            const ae = &arg_exprs[bi];
-            if (ae.* != .Index or ae.Index.args.len != 1) break :blk null;
-            indexed = try expr_lower.iterableElementTypeRef(b, ae.Index.receiver);
-            break :blk indexed;
-        };
+        const arg_ty: ?ir.TypeRef = arg_tys[bi];
         if (arg_ty) |ty| {
             // A head that is still a bare TYPE PARAMETER names nothing in
             // the receiving scope; committing it only feeds the
