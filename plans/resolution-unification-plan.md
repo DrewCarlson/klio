@@ -1225,12 +1225,39 @@ So `complete_universe` is measured after all: 390 resolutions, of which 244
 resolve to a FuncId lowering can use. The remaining 146 name declarations
 with no lowered identity (bodyless expects, intrinsic-backed headers).
 
-**The census does not move: still 347.** The resolutions are real and they
-travel; none of them lands on a site the census counts as unbound. Which
-narrows the question sharply — it is no longer "can the checker reach the
-stdlib" (it can, and does) but "why do its 244 answers and the 347 unbound
-sites not intersect". Both sets are now enumerable, so that is a comparison,
-not an investigation.
+**The census does not move: still 347**, and the set comparison says why.
+`[eager-norecv]` counts, at every unbound member site, whether the baked map
+has an answer for it:
+
+    [eager-norecv] hits=0 nofunc=0 not_ext=0 arity=0
+
+Zero. Not a guard refusing them — the map holds no entry for a single one of
+the 347. The checker never resolved those calls either.
+
+**That is the answer to this whole line of work, and it is not a resolution
+answer.** The checker classes a receiver by the same evidence lowering uses:
+declarations. Where a receiver cannot be named — a type parameter, a
+nullable, a chain whose head has no declaration — BOTH engines fail, on the
+same sites, for the same reason. Checking the stdlib gave the checker 4,965
+declarations to reason from and it still produced nothing for those 347,
+because the missing thing was never a declaration it lacked.
+
+So the two plans converge, but not on 100%:
+
+  * **Resolution IS unified.** One table, one ranking, shared evidence; the
+    checker's answers travel into lowering by FuncId, for user code and now
+    for the base. Where the two engines disagree, argument-type ranking
+    decides. That was the plan's goal and it is met.
+  * **The dispatch residue is a TYPING problem, not a resolution one.** The
+    347 are sites where no engine can name the receiver. Every channel that
+    moved the number this session typed a receiver; every one that measured
+    flat tried to resolve a call instead.
+
+Deleting the dynamic-dispatch fallbacks — the stated end goal — therefore
+needs receivers to be typed at sites where Kotlin itself only knows the type
+at run time (a type parameter's instantiation, a nullable's narrowing). That
+is monomorphisation or a runtime type feed, not more resolution work, and it
+is a different project from either plan.
 
 All batteries green with the machinery in: commontest 117/0, corpus
 267/267, litmus 43/43, units, compose 1317.

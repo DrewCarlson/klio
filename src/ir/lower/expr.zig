@@ -14572,6 +14572,12 @@ const ResolvedMemberLowering = union(enum) {
 /// Per-site census of the static member-call gate (`KLIO_DISPATCH_STATS`),
 /// so the coverage of static binding is a number rather than an impression.
 pub var lm_sites: [6]u64 = @splat(0);
+/// `KLIO_DISPATCH_STATS`: unbound member sites the checker DID resolve, and
+/// why each was refused. [0] map hit, [1] no such func, [2] not an
+/// extension, [3] arity mismatch. A zero at [0] means the two sets — what
+/// the checker answered and what lowering could not bind — do not intersect
+/// at all, which is a different problem from a guard being too strict.
+pub var lm_eager_norecv: [4]u64 = @splat(0);
 pub const LmReason = enum(u8) { no_receiver_type, nullable_or_generic, no_class_id, resolver_declined, bound_static, bound_virtual };
 fn lmNote(comptime r: LmReason) void {
     lm_sites[@intFromEnum(r)] += 1;
@@ -14818,6 +14824,10 @@ pub fn lowerSitesDump() void {
         const n = lm_sites[f.value];
         if (n != 0) std.debug.print("[lower-sites] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
     }
+    {
+        const e = lm_eager_norecv;
+        std.debug.print("[eager-norecv] hits={d} nofunc={d} not_ext={d} arity={d}\n", .{ e[0], e[1], e[2], e[3] });
+    }
 }
 
 /// How a caller has already constrained the receiver of a member call.
@@ -14851,9 +14861,19 @@ fn lowerResolvedMemberCall(
     // whatever the receiver turns out to be, so the emit is decided.
     if (declared_ty == null and !std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_MEMBER") orelse "1", "0")) {
         if (b.module.eagerExternCallTarget(name.span)) |ep| ez: {
-            const ef = b.module.funcById(ep) orelse break :ez;
-            if (ef.params.len == 0 or !std.mem.eql(u8, ef.params[0].name, "this")) break :ez;
-            if (ef.params.len != args.len + 1) break :ez;
+            lm_eager_norecv[0] += 1;
+            const ef = b.module.funcById(ep) orelse {
+                lm_eager_norecv[1] += 1;
+                break :ez;
+            };
+            if (ef.params.len == 0 or !std.mem.eql(u8, ef.params[0].name, "this")) {
+                lm_eager_norecv[2] += 1;
+                break :ez;
+            }
+            if (ef.params.len != args.len + 1) {
+                lm_eager_norecv[3] += 1;
+                break :ez;
+            }
             const recv_reg = try lowerExpr(b, receiver);
             const args_start = b.allocReg();
             const run = try lowerArgRun(b, args);
