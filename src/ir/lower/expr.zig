@@ -8656,6 +8656,47 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             else => {},
         }
     }
+    // Arithmetic on PRIMITIVES promotes to the wider operand, and comparison
+    // and logic are Boolean. Both rules already exist for the eager walk;
+    // the splice consults this function instead and had neither.
+    if (arg.* == .Binary) {
+        switch (arg.Binary.op) {
+            .Eq, .Neq, .IdentEq, .IdentNeq, .Lt, .Le, .Gt, .Ge, .In, .NotIn, .And, .Or => {
+                return .{ .name = "Boolean", .nullable = false, .args = &.{} };
+            },
+            .Add, .Sub, .Mul, .Div, .Rem => arith: {
+                // Falls THROUGH on anything it cannot answer: the class
+                // operator-member arm below handles a non-primitive left
+                // operand, and returning null here would skip it.
+                const lt = argDeclTypeRefLazy(b, arg.Binary.lhs) orelse
+                    break :arith;
+                const rt = argDeclTypeRefLazy(b, arg.Binary.rhs) orelse
+                    break :arith;
+                if (lt.nullable or rt.nullable) break :arith;
+                const lh = typeHead(std.mem.trimEnd(u8, lt.name, "?"));
+                const rh = typeHead(std.mem.trimEnd(u8, rt.name, "?"));
+                if (!isPrimitiveTypeName(lh) or !isPrimitiveTypeName(rh)) break :arith;
+                // Kotlin's numeric promotion order. A String on either side
+                // is concatenation, and `Char + Int` is a Char; neither is
+                // in this table, so both decline.
+                const order = [_][]const u8{ "Double", "Float", "Long", "Int" };
+                for (order) |w| {
+                    if (std.mem.eql(u8, lh, w) or std.mem.eql(u8, rh, w)) {
+                        // Byte/Short arithmetic is Int in Kotlin, which the
+                        // Int entry already produces.
+                        return .{ .name = w, .nullable = false, .args = &.{} };
+                    }
+                }
+                const small = [_][]const u8{ "Byte", "Short" };
+                for (small) |sm| {
+                    if (std.mem.eql(u8, lh, sm) and std.mem.eql(u8, rh, sm)) {
+                        return .{ .name = "Int", .nullable = false, .args = &.{} };
+                    }
+                }
+            },
+            else => {},
+        }
+    }
     // `a..b` is a range whose class follows from its endpoints. Named here
     // because the range CLASSES exist (`IntRange`, `CharRange`, …) while the
     // operator producing them is builtin with no declaration to read.

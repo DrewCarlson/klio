@@ -3331,4 +3331,17 @@ producing them is builtin with no declaration, so the mapping is stated.
 Fourteen sites — the largest single arm of the three, because a range is
 both an argument shape AND the thing a `for` draws its element from.
 
-Session: **508 -> 351 unbound, 92.73% -> 94.24% bound.**
+    Binary  -> arms added                    351 -> 347
+
+Arithmetic promotion and the Boolean predicates existed for the EAGER walk
+(`staticExprTypeRef`) and not for the one the splice consults. Adding them
+also removed 34 sites from the census outright: with both operands typed the
+call resolves to a primitive path that registers no dispatch at all.
+
+One mistake worth keeping: the first version `return null`ed on a
+non-primitive operand, which skipped the class-operator arm below it and
+regressed `duration / 2` — 351 -> 355 with 38 static binds lost. A channel
+that cannot answer must FALL THROUGH, not answer null; the two are the same
+value and opposite meanings when arms are chained.
+
+Session: **508 -> 347 unbound, 92.73% -> 94.35% bound.**

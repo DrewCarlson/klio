@@ -1939,6 +1939,18 @@ test "numeric_promotion_receiver" {
     );
 }
 
+test "binary_arg_promotion" {
+    try check("binary_arg_promotion",
+        \\2,3,4
+        \\2,4,6
+        \\false,true,true
+        \\5
+        \\1
+        \\4
+        \\
+    );
+}
+
 test "range_arg_element_type" {
     try check("range_arg_element_type",
         \\5
