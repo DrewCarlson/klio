@@ -3757,3 +3757,33 @@ exactly what to do next.
 
     stdlib census    8784 / 9139   96.12% bound
     examples census 98980 /102006  97.03% bound
+
+## Two shapes the indexes could not answer for
+
+Both were the largest single entry in one of the censuses, and both were
+invisible to the simple-name index for the same reason: the declaration is
+not a module function.
+
+An IDENTITY extension — `fun <T> T.apply(block: T.() -> Unit): T` — declares
+a bare type parameter on both ends, so the receiver-head filter never
+admitted it and its return named nothing. The receiver instantiates both.
+`buildString` writes `StringBuilder().apply(builderAction).toString()`, where
+the argument is a FORWARDED parameter rather than a literal lambda, so the
+splice that normally carries the type cannot take it and the chain stopped
+at `apply`.
+
+A LOCAL `fun` is a closure in a cell, keyed by a mangled binding name.
+`funcId` misses it, so the return-type channels all declined — including for
+`expect("'-'", i) { it == '-' }?.let { return it }` in `Instant.parseIso`,
+which was the biggest `unique_concrete` group in the stdlib census (the
+classifier could see an answer the typing path could not reach). The
+declaration now records its declared return beside the parameter types it
+already recorded.
+
+    stdlib   no_receiver_type  291 -> 275
+    examples no_receiver_type 2036 -> 1957
+
+## Standing
+
+    stdlib census    8784 / 9123   96.28% bound
+    examples census 98983 /101930  97.11% bound
