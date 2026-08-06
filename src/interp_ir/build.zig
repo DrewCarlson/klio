@@ -2017,6 +2017,14 @@ fn buildModuleWithOverrides(
                     }
                 } else if (propCtorHeadEvidence(prop, decls)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
+                } else if (prop.init) |*init| {
+                    // An unannotated property states its type through a
+                    // literal initializer — `private var index = 0` in the
+                    // array iterators — and a bare read of one was the whole
+                    // enclosing-member block of the unbound census.
+                    if (literalTypeHead(init)) |head| {
+                        try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
+                    }
                 }
             }
             // COMPANION property heads register under the companion's
@@ -2032,6 +2040,10 @@ fn buildModuleWithOverrides(
                     const cprop = om.Property;
                     if (cprop.ty) |*ty| {
                         try module.registry.class_prop_type_heads.put(.{ .a = ckey, .b = cprop.name.name }, ty.qualified_path orelse ty.name.name);
+                    } else if (cprop.init) |*init| {
+                        if (literalTypeHead(init)) |head| {
+                            try module.registry.class_prop_type_heads.put(.{ .a = ckey, .b = cprop.name.name }, head);
+                        }
                     }
                 }
             }

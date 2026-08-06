@@ -1939,6 +1939,15 @@ test "numeric_promotion_receiver" {
     );
 }
 
+test "class_prop_literal_type" {
+    try check("class_prop_literal_type",
+        \\ROW114
+        \\ROW214
+        \\3
+        \\
+    );
+}
+
 test "thread_declared_handle" {
     try check("thread_declared_handle",
         \\worker

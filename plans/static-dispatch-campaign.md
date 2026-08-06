@@ -2983,3 +2983,28 @@ the member at all.
 
 Session total so far: 508 -> 402, a fifth of the residue gone, bound share
 92.73% -> 93.76%.
+
+## Addendum 71 (2026-08-06): the same literal-init gap, one level down
+
+Addendum 68 recorded a head for an unannotated TOP-LEVEL property. The
+identical gap sat one level down: an unannotated CLASS property had no
+recorded head either, so `private var index = 0` in the unsigned-array
+iterators left every bare read of `index` untyped — the whole
+`enclosing_member` block those iterators contributed.
+
+Same rule, both forms (class and companion): a literal initializer states
+the type, nothing else is read.
+
+    no_receiver_type 402 -> 394, all eight into bound
+
+Session ledger for the receiver-typing channels:
+
+    508  start
+    488  indexed argument types a spliced lambda parameter
+    454  a member call's declared return types the chain
+    426  unannotated top-level property, literal init
+    418  receiver-lambda member read (plus the resolution bug under it)
+    402  a bare call is a member call on the implicit receiver
+    394  unannotated class property, literal init
+
+    bound 92.73% -> 93.85%
