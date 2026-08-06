@@ -1039,6 +1039,15 @@ fn notePropScope(
         if (ty.function == null and ty.name.name.len != 0) {
             try module.registry.top_level_prop_type_heads.put(fqn, ty.name.name);
         }
+    } else if (p.init) |*init| {
+        // An UNANNOTATED property states its type through a literal
+        // initializer just as definitely as an annotation would, and the
+        // stdlib writes its file-level constants that way
+        // (`private const val NANOS_PER_SECOND = 1_000_000_000`). Without
+        // this, every member call on such a read resolved by name.
+        if (literalTypeHead(init)) |head| {
+            try module.registry.top_level_prop_type_heads.put(fqn, head);
+        }
     }
     // A `const val` with a literal initializer records its value so the
     // lowering can inline the constant at reference sites, exactly as
@@ -1056,6 +1065,25 @@ fn notePropScope(
 /// plain literal, optionally under unary minus. Anything else (arithmetic,
 /// references, string templates with interpolation) returns null and the
 /// property keeps the ordinary global-read path.
+/// The type a literal initializer states outright. Deliberately literals
+/// only: a call or a name would need resolution this early pass does not
+/// have, and a wrong head is worse than none.
+fn literalTypeHead(e: *const ast.Expr) ?[]const u8 {
+    return switch (e.*) {
+        .IntLit => |lit| switch (lit.kind) {
+            .Int => if (lit.value >= std.math.minInt(i32) and lit.value <= std.math.maxInt(i32)) "Int" else "Long",
+            .Long => "Long",
+            .UInt => "UInt",
+            .ULong => "ULong",
+        },
+        .FloatLit => |lit| if (lit.kind == .Float) "Float" else "Double",
+        .BoolLit => "Boolean",
+        .CharLit => "Char",
+        .StringTemplate => "String",
+        else => null,
+    };
+}
+
 fn constLiteralOf(e: *const ast.Expr) ?ir.Const {
     switch (e.*) {
         .IntLit => |il| {

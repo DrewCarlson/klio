@@ -1939,6 +1939,16 @@ test "numeric_promotion_receiver" {
     );
 }
 
+test "top_level_prop_literal_type" {
+    try check("top_level_prop_literal_type",
+        \\10000000000
+        \\2
+        \\KLIO:
+        \\4
+        \\
+    );
+}
+
 test "chained_member_return" {
     try check("chained_member_return",
         \\abcd

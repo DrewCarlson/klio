@@ -2910,3 +2910,27 @@ that measured negative in addendum 64:
   * A resolvable, non-type-parameter head. `no_class_id` moved 4 -> 11,
     which is the visible price of the heads that slip past — small next to
     the 34 sites gained, and each one is a site that was unbound anyway.
+
+## Addendum 68 (2026-08-06): an unannotated top-level constant states its type
+
+The `unknown` leaf of the residue — a receiver path that is neither a local,
+a capture, nor an enclosing member — turned out to be almost entirely
+file-level constants: `NANOS_PER_SECOND`, `MILLIS_PER_SECOND`,
+`UPPER_CASE_HEX_DIGITS`, `base64EncodeMap`.
+
+The consumer was already there. `argDeclTypeRefLazy` ends with a top-level
+property arm reading `topLevelPropTypeHead`, and the registry it reads was
+written only from a DECLARED `: T`. The stdlib writes its file constants
+without one, so the head was absent and every member call on such a read
+resolved by name.
+
+Recording a head derived from a literal initializer closes it:
+
+    no_receiver_type 454 -> 426     bound 93.22% -> 93.52%
+
+Literals only, deliberately. A call or a name initializer would need
+resolution this early declaration pass does not have, and addendum 64
+already measured what a wrong head costs.
+
+Cumulative for the session's three landed channels: 508 -> 426, a fifth of
+the residue, with bound share 92.73% -> 93.52%.
