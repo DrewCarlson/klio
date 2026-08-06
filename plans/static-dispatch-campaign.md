@@ -3525,3 +3525,22 @@ because here the receiver is already typed and only the callee's identity is
 missing.
 
 Both are now named and counted rather than labelled by-design.
+
+The promotion PROOF itself reports why it holds, which splits the 81 again:
+
+    arg-unauthoritative   40   an argument's type is not authoritative
+    ext-unrefuted         23   an extension of that name could not be refuted
+    member-arg-refuted    12   an argument REFUTES the member — correctly held
+
+One hypothesis checked and refused: that `ext-unrefuted` was the precedence
+rule being missed, since Kotlin gives a member precedence over an extension
+unconditionally. It is not. `memberPromotionProven` already short-circuits
+on `if (member_fully_proven) return true` BEFORE it looks at any extension,
+so that path is reached only when the member is not proven — where both
+sides are genuinely uncertain and holding is right.
+
+So all 63 promotable declines reduce to one thing: argument types that are
+not authoritative. There is no shortcut past it, and it is the same
+receiver-typing front the 347 need. That is now measured from three
+independent directions — the census's own buckets, the eager channel's
+`hits=0`, and this proof's own reasons — and they agree.
