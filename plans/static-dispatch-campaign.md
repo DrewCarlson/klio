@@ -3158,25 +3158,31 @@ Repro, `tests/fixtures/lowering_repros/local_type_write_read_builder_split.kt`:
 `KLIO_VALTY_TRACE=symbol` on an UNMODIFIED build:
 
     [valty] symbol = Int mod=b078 classes=393
-    [valty] WRITE symbol = Int
+    [valty] WRITE symbol = Int  b=ea58 n=2
     [valty] READ  symbol decl=<unset> b=ea58 fn=decode ndecl=2
 
-The derivation is not missing. `symbol` IS typed `Int`, and the write
-succeeds. The READ happens in a DIFFERENT FuncBuilder — the reading builder
-holds two declaration records and `symbol` is not among them — so every
-member call on it sees no receiver type and resolves by name.
+The derivation is not missing. `symbol` IS typed `Int` and the write
+succeeds. The read then misses.
 
-This is the same shape as the `KLIO_LAMINH` producer/consumer split, one
-level out: a local's declared type is recorded into one builder and asked
-for from another, in a plain top-level function with no lambda involved.
+**Correction to the first reading of this trace.** Without the builder
+pointer on the WRITE line it looked like a producer/consumer split across
+two builders. It is not: printing the pointer shows the SAME builder
+(`b=ea58`) on both lines, the same `local_decl_types` map, and the same
+plain-name key — `fetchPut(name)` against `get(name)`. The record count is 2
+at both points.
+
+So the write lands and something REMOVES it before the read.
+`clearLocalDeclType` is the only remover, and every call site of it is in
+`lambda_body` or `inline_call` — paths that should not touch a plain
+top-level function's local at all. That is the thread to pull.
 
 **It reframes the whole remaining tail.** The rules that measured flat were
 not wrong; they computed the right type into a builder the reader never
 consults. Every "chain with one dead link" reading in addenda 73-75 has to be
 re-checked against this: some number of the 384 are not missing derivations
-at all, they are derivations whose answer is discarded. Finding why `decode`
-lowers through two builders — and whether the second pass re-runs the typing
-switch — comes before any further rule.
+at all, they are derivations whose answer is discarded. Finding which clear removes
+`symbol` — every `clearLocalDeclType` call site is in a lambda or inline
+splice path, and this function is neither — comes before any further rule.
 
 The rules that DID land (74, 75) moved the census, so they reach a reader.
 What distinguishes them from the flat ones is the next thing to learn.
