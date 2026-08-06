@@ -118,6 +118,9 @@ pub const ParamShape = struct { has_receiver: bool, arity: u16 };
 pub const ResolvedCall = struct {
     decl_span: ?Span,
     render: []const u8,
+    /// Set when the chosen declaration came from a prebuilt image, which
+    /// carries FuncIds and no spans.
+    extern_fid: ?u32 = null,
 };
 
 /// Public entry point. `resolution` is the resolver's output for the same
@@ -295,6 +298,7 @@ pub fn typecheckModule(
                             .is_suspend = false,
                             .is_extension = true,
                             .is_crossinline_param = crossinline,
+                            .extern_fid = x.fid,
                         },
                         .return_class = if (ed.classes.contains(x.return_head)) x.return_head else null,
                     });
@@ -653,6 +657,9 @@ pub const FnSig = struct {
     /// INSTANTIATIONS are `Type.Generic`), so the class identity has to
     /// travel beside the type — the same reason `param_class_names` exists.
     return_class: ?[]const u8 = null,
+    /// FuncId of an IMAGE-published declaration. Source declarations carry
+    /// identity in `decl_span`; an image one has no span at all.
+    extern_fid: ?u32 = null,
     /// User-class simple name for each parameter whose declared type names
     /// a known class. `null` for primitive / function / unresolved slots.
     param_class_names: []?[]const u8,

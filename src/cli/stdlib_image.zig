@@ -486,6 +486,7 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             gop.value_ptr.append(gpa, .{
                 .name = fname,
+                .fid = fid.int(),
                 .param_heads = heads,
                 .param_nullable = nulls,
                 // The declaration signature carries no return type; the

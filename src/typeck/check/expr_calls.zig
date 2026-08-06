@@ -826,7 +826,7 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
     buf.print(self.allocator, ";ret={f}", .{sig.return_ty}) catch return;
     const rendered = self.allocator.dupe(u8, buf.items) catch return;
     eagerGate(6);
-    self.resolved_calls.put(call_span, .{ .decl_span = sig.decl_span, .render = rendered }) catch {
+    self.resolved_calls.put(call_span, .{ .decl_span = sig.decl_span, .render = rendered, .extern_fid = sig.extern_fid }) catch {
         self.allocator.free(rendered);
     };
 }

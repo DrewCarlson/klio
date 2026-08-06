@@ -983,6 +983,10 @@ test {
 /// argument types, which is all the ranking needs.
 pub const ExternExt = struct {
     name: []const u8,
+    /// The declaration's FuncId in the loaded module. An image declaration
+    /// has no source span, so this is the only identity a recorded pick can
+    /// carry back to lowering.
+    fid: u32,
     param_heads: [][]const u8,
     param_nullable: []bool,
     return_head: []const u8,
