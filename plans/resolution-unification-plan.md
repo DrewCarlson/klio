@@ -490,12 +490,36 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
 
         [EAGER] 0 call resolutions recorded (1 by image FuncId; typeck resolved 1)
 
-  What remains is one lookup, not one channel. The record is keyed by the
-  CALL span, and both lowering consumers look up a bare callee's NAME span,
-  so a member call's record is carried and never asked for. The next unit is
-  a member-call consumer keyed on the call expression's span — with that,
-  `xs.min()` binds from the checker's own argument-type ranking, which is
-  what step 3 needed.
+  What remained was one lookup, and it is built: a member call records under
+  its member NAME span, which is the identity `lowerResolvedMemberCall` holds
+  when it decides that call's target, and the consumer takes the pick where
+  the resolver reached none. `xs.min()` binds statically to
+  `kotlin.collections.min` on a site the resolver deferred — the checker's
+  argument-type ranking deciding a call, which is what step 3 needed.
+
+  **The chain is complete; the SUPPLY is the limiter — and the obvious way
+  to raise it is unsound.** Two guards make the difference between a channel
+  and a regression, and both were found by breaking compose:
+
+  - *Only picks the checker made over the IMAGE's declarations may be
+    recorded.* Relaxing this to source extensions produced 145 extra static
+    binds on the census — and broke 35 compose tests. A program that loads
+    packs has extensions the checker never saw, so a "decided" pick over the
+    source view alone binds calls to declarations the receiver never had
+    (`SlotTable.groupsSize`). Those 145 were not a win; they were 145
+    unverified bindings.
+  - *The member consumer reads the FuncId map ONLY, never the span map
+    beside it.* The span map holds source-declaration records, which reach it
+    through the same key. Reading both re-introduced the same fault by a
+    different door.
+
+  With both guards the consumer yields zero on the census corpus today,
+  because the checker can name the receiver class for very few member calls
+  on an image program. That is now the single measurable input to this
+  channel: `call_shape_counts[2]` (member calls whose receiver class the
+  checker could name). Raising it — more `fn_return_class` coverage, local
+  type propagation in the checker — is what turns the complete chain into
+  binds. It is not another channel to build.
 
 - **P8** — hatch deletion (RC-H catalog above).
 - **P9** — optional flat bytecode + pack serialization.

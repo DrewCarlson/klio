@@ -14951,10 +14951,36 @@ fn lowerResolvedMemberCall(
             }
         }
     }
-    const func_id = resolved.target orelse {
+    // The checker's own pick, when it made one. Its candidate set for a
+    // member call on a known receiver class is complete (the image publishes
+    // every extension on the class and its supertype chain) and it ranks by
+    // ARGUMENT TYPE, which is the one thing the lazy engine's shape-based
+    // ranking cannot do. It is preferred exactly where the bare-call arm
+    // prefers it — and where the resolver reached no target at all, it is the
+    // only answer, so a deferral becomes a static bind.
+    // Only where the resolver reached NO target: everything downstream of
+    // this point reads `resolved` for dispatch kind, owner, and arity, so a
+    // pick that disagrees with it would be spliced into a resolution
+    // describing something else. Where the resolver has no target there is
+    // nothing to disagree with, and the checker's answer is the only one.
+    const eager_pick: ?FuncId = if (resolved.target == null and
+        !std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_MEMBER") orelse "1", "0")) blk: {
+        const ep = b.module.eagerExternCallTarget(name.span) orelse break :blk null;
+        const ef = b.module.funcById(ep) orelse break :blk null;
+        if (ef.params.len == 0 or !std.mem.eql(u8, ef.params[0].name, "this")) break :blk null;
+        break :blk ep;
+    } else null;
+    const func_id = eager_pick orelse resolved.target orelse {
         last_member_refuted = !resolved.applicable;
         return if (resolved.applicable) .deferred else .none;
     };
+    if (eagerAuditOn()) {
+        if (eager_pick) |ep| {
+            const lazy_str: i64 = if (resolved.target) |l| @intCast(l.int()) else -1;
+            const efqn: []const u8 = if (b.module.funcById(ep)) |f| f.fqn else "?";
+            std.debug.print("[EAGER-MEMBER-HIT] '{s}': eager={d}({s}) lazy={d}\n", .{ name.name, ep.int(), efqn, lazy_str });
+        }
+    }
     // The resolver identifies a single candidate but withholds dispatch when an
     // argument's type is unknown, so its applicability is unproven. Measured,
     // that is EVERY deferral reaching this point — sites with a fully proven
@@ -15066,6 +15092,25 @@ fn lowerResolvedMemberCall(
         // `MutableList.add`) and unsigned-array member dynamic.
         if (b.module.dispatchForTarget(static_owner, resolved.target.?)) |d| {
             resolved.dispatch = d;
+        }
+    }
+    if (eager_pick) |ep| {
+        // The resolver reached no target, so its `deferred` says nothing
+        // about THIS declaration — it says the resolver could not name one.
+        // The checker named one by argument type, and how that declaration
+        // dispatches follows from the declaration: an extension carries its
+        // receiver as a leading `this` parameter and is statically bound in
+        // Kotlin; anything else goes through the receiver's slot.
+        // EXTENSIONS only. An extension carries its receiver as a leading
+        // `this` parameter and Kotlin binds it statically, so the call form
+        // follows from the declaration alone. A class MEMBER does not: it
+        // needs a method slot on the receiver's runtime class, and asserting
+        // one the resolver never proved broke `d += x` on Duration — the
+        // slot was not there to call.
+        if (b.module.funcById(ep)) |ef| {
+            if (ef.params.len != 0 and std.mem.eql(u8, ef.params[0].name, "this")) {
+                resolved.dispatch = .direct;
+            }
         }
     }
     if (resolved.dispatch == .deferred) {

@@ -406,7 +406,7 @@ fn checkCallInner(
                 // in the same table. It was partial only while the image
                 // handed over class names alone, which is why this form did
                 // not record.
-                const ret = try checkOverloadedCallRecorded(
+                const ret = try checkOverloadedCallRecordedAt(
                     self,
                     sigs_buf.items,
                     args,
@@ -414,6 +414,7 @@ fn checkCallInner(
                     type_args,
                     call_span,
                     mname,
+                    m.name.span,
                 );
                 if (cands.items[0].return_class) |rcn| {
                     try self.expr_class.put(call_span, rcn);
@@ -826,7 +827,7 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
     buf.print(self.allocator, ";ret={f}", .{sig.return_ty}) catch return;
     const rendered = self.allocator.dupe(u8, buf.items) catch return;
     eagerGate(6);
-    self.resolved_calls.put(call_span, .{ .decl_span = sig.decl_span, .render = rendered, .extern_fid = sig.extern_fid }) catch {
+    self.resolved_calls.put(record_span_override orelse call_span, .{ .decl_span = sig.decl_span, .render = rendered, .extern_fid = sig.extern_fid }) catch {
         self.allocator.free(rendered);
     };
 }
@@ -857,6 +858,30 @@ pub fn checkOverloadedCallRecorded(
 ) Allocator.Error!Type {
     return checkOverloadedCallRecImpl(self, sigs, args, arg_names, type_args, call_span, true, record_name);
 }
+
+/// As `checkOverloadedCallRecorded`, but the record is keyed by a span of
+/// the caller's choosing. A member call records under its member NAME span,
+/// which is the identity lowering has in hand when it decides that call's
+/// target; the call span it would otherwise use names no node lowering asks
+/// about.
+pub fn checkOverloadedCallRecordedAt(
+    self: *Checker,
+    sigs: []const FnSig,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    type_args: []const TypeRef,
+    call_span: Span,
+    record_name: []const u8,
+    record_span: Span,
+) Allocator.Error!Type {
+    const prev = record_span_override;
+    record_span_override = record_span;
+    defer record_span_override = prev;
+    return checkOverloadedCallRecImpl(self, sigs, args, arg_names, type_args, call_span, true, record_name);
+}
+
+/// Set for the duration of one `checkOverloadedCallRecordedAt`.
+var record_span_override: ?Span = null;
 
 fn checkOverloadedCallRec(
     self: *Checker,
@@ -1154,12 +1179,16 @@ fn checkOverloadedCallRecImpl(
         }
         break :blk true;
     };
-    // An EXTENSION pick used to be refused outright, because the only
-    // candidate sets that reached here were partial. `record` now marks a
-    // set the checker sees in full — a bare top-level overload family, or a
-    // member call whose receiver class and whole supertype chain published
-    // their extensions — so the pick is as decided as a member's.
-    if (record and chosen != null and args_decisive) {
+    // An EXTENSION pick is recorded only when the chosen declaration came
+    // from the IMAGE. That is the set the checker sees in full: the image
+    // publishes every extension on a class and its supertype chain. A
+    // SOURCE extension does not qualify, however complete its own file
+    // looks — a program that loads packs has extensions the checker never
+    // saw, and picking against that partial view bound compose's
+    // `SlotTable.groupsSize` to a declaration its receiver never had.
+    if (record and chosen != null and args_decisive and
+        (!sig.is_extension or sig.extern_fid != null))
+    {
         if (std.c.getenv("KLIO_EAGER_HITS") != null) {
             std.debug.print("[REC-MSC] '{s}' args:", .{record_name});
             for (arg_tys.items) |*t| switch (t.*) {

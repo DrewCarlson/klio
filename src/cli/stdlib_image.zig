@@ -422,8 +422,23 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
     const mg = sb.built.module.borrow();
     defer mg.deinit();
     const m = mg.get();
+    // Simple names, because that is the only spelling the checker's class
+    // table uses. Where two classes share one — compose declares a
+    // `SlotTable` in both its gapbuffer and linkbuffer implementations — the
+    // name identifies nothing, and offering one's extensions for the other
+    // binds calls to a declaration the receiver never had. Such a name is
+    // dropped from every published map.
     var classes = std.StringHashMap(void).init(gpa);
-    for (m.classes.items) |*c| classes.put(c.name, {}) catch {};
+    var ambiguous_names = std.StringHashMap(void).init(gpa);
+    defer ambiguous_names.deinit();
+    for (m.classes.items) |*c| {
+        const gop = classes.getOrPut(c.name) catch continue;
+        if (gop.found_existing) ambiguous_names.put(c.name, {}) catch {};
+    }
+    {
+        var ait = ambiguous_names.keyIterator();
+        while (ait.next()) |k| _ = classes.remove(k.*);
+    }
     // Return heads ride the image's baked index: on a cached load the funcs
     // are lazy, so walking them here answered nothing at all. On the run
     // that BUILDS the base there is no baked index yet and the funcs are
@@ -431,7 +446,10 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
     // or the checker's answers depend on whether the cache was warm.
     var rets = std.StringHashMap([]const u8).init(gpa);
     if (sb.fn_returns.len != 0) {
-        for (sb.fn_returns) |fr| rets.put(fr.name, fr.head) catch {};
+        for (sb.fn_returns) |fr| {
+            if (ambiguous_names.contains(fr.head)) continue;
+            rets.put(fr.name, fr.head) catch {};
+        }
     } else {
         var ambiguous = std.StringHashMap(void).init(gpa);
         defer ambiguous.deinit();
@@ -467,7 +485,7 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
             const sig = m.decl_sigs.get(fid.int()) orelse continue;
             const recv = sig.receiver_ty orelse continue;
             const recv_head = headOf(recv.name);
-            if (recv_head.len == 0) continue;
+            if (recv_head.len == 0 or ambiguous_names.contains(recv_head)) continue;
             const n = sig.sig.len;
             const heads = gpa.alloc([]const u8, n) catch continue;
             const nulls = gpa.alloc(bool, n) catch {
@@ -506,7 +524,7 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
     }
     var supers = std.StringHashMap([][]const u8).init(gpa);
     for (m.classes.items) |*c| {
-        if (c.supertypes.len == 0) continue;
+        if (c.supertypes.len == 0 or ambiguous_names.contains(c.name)) continue;
         const names = gpa.alloc([]const u8, c.supertypes.len) catch continue;
         var n: usize = 0;
         for (c.supertypes) |sid| {
