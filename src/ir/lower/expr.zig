@@ -8632,6 +8632,40 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             {
                 return .{ .name = ph, .nullable = false, .args = &.{} };
             }
+            // Builtin properties with no Kotlin declaration to read.
+            // `source[index].code` in Base64's decoder is the live case: the
+            // receiver types as Char and the read stopped there.
+            if (std.mem.eql(u8, head, "Char") and std.mem.eql(u8, m.name.name, "code")) {
+                return .{ .name = "Int", .nullable = false, .args = &.{} };
+            }
+        }
+    }
+    // `xs[i]` — the element of what `xs` indexes. Stated for the shapes that
+    // have no declaration to read (a CharSequence's Char, a primitive
+    // array's scalar) and taken from the sole type argument otherwise.
+    if (arg.* == .Index and arg.Index.args.len == 1) {
+        if (argDeclTypeRefLazy(b, arg.Index.receiver)) |rt| {
+            if (!rt.nullable) {
+                const h = typeHead(std.mem.trimEnd(u8, rt.name, "?"));
+                if (std.mem.eql(u8, h, "CharSequence") or std.mem.eql(u8, h, "String") or
+                    std.mem.eql(u8, h, "StringBuilder"))
+                {
+                    return .{ .name = "Char", .nullable = false, .args = &.{} };
+                }
+                const prim = [_]struct { a: []const u8, e: []const u8 }{
+                    .{ .a = "BooleanArray", .e = "Boolean" }, .{ .a = "ByteArray", .e = "Byte" },
+                    .{ .a = "ShortArray", .e = "Short" },     .{ .a = "IntArray", .e = "Int" },
+                    .{ .a = "LongArray", .e = "Long" },       .{ .a = "CharArray", .e = "Char" },
+                    .{ .a = "FloatArray", .e = "Float" },     .{ .a = "DoubleArray", .e = "Double" },
+                    .{ .a = "UByteArray", .e = "UByte" },     .{ .a = "UShortArray", .e = "UShort" },
+                    .{ .a = "UIntArray", .e = "UInt" },       .{ .a = "ULongArray", .e = "ULong" },
+                };
+                for (prim) |pa| {
+                    if (std.mem.eql(u8, h, pa.a)) {
+                        return .{ .name = pa.e, .nullable = false, .args = &.{} };
+                    }
+                }
+            }
         }
     }
     if (arg.* == .Call and arg.Call.callee.* == .Path and arg.Call.callee.Path.segments.len == 1) {

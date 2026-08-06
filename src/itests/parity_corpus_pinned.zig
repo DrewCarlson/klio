@@ -1939,6 +1939,16 @@ test "numeric_promotion_receiver" {
     );
 }
 
+test "indexed_read_builtin_prop" {
+    try check("indexed_read_builtin_prop",
+        \\294
+        \\2
+        \\120
+        \\105
+        \\
+    );
+}
+
 test "class_prop_literal_type" {
     try check("class_prop_literal_type",
         \\ROW114

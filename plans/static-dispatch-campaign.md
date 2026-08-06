@@ -3074,3 +3074,30 @@ where a probe showed the derivation stopping at a specific function
 (`argDeclTypeRefLazy` for the indexed splice, `topLevelPropTypeHead` for the
 literal constants); the ones that measured flat were the ones reasoned about
 from the census name alone.
+
+## Addendum 74 (2026-08-06): the per-site method finds the two dead links
+
+Addendum 73's failures came from reasoning about a census NAME. Applied to
+the same tail the other way — take one site, read its source, follow the
+derivation — the answer is immediate. `Base64.charsToBytesImpl` has:
+
+    val symbol = source[index].code
+
+and `symbol.toByte()` was unbound. Two links, each a builtin with no Kotlin
+declaration anywhere to read:
+
+  * `source[index]` — an indexed read of a CharSequence is a Char. Stated for
+    the shapes that HAVE no declaration (CharSequence/String/StringBuilder,
+    the twelve primitive arrays); anything else still comes from the type
+    argument.
+  * `.code` — a Char's code point is an Int.
+
+Both in `argDeclTypeRefLazy`, which is the function the member lowering
+consults. That placement matters: addendum 73 put an equivalent rule in
+`staticExprTypeRef` and measured flat, because the lowering never asks it.
+
+    no_receiver_type 394 -> 392
+
+Two sites. Recorded not for the size but for the method: the tail is made of
+chains where ONE link has no declaration, and each is found by reading the
+source at a site, never by grouping the census by name.
