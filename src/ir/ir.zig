@@ -9533,6 +9533,37 @@ pub const Module = struct {
     /// `name` resolves to under Kotlin scoping — the best-tier declaration,
     /// and only when every declaration AT that tier agrees on the head (a
     /// cross-package name clash types nothing).
+    /// The type head of one top-level property declaration: what its
+    /// annotation or literal initializer stated, else what the function its
+    /// initializer CALLS returns. The call is resolved here rather than at
+    /// registration because only now is the whole declaration set visible.
+    pub fn topLevelPropHeadFor(self: *const Module, fqn: []const u8) ?[]const u8 {
+        if (self.registry.top_level_prop_type_heads.get(fqn)) |h| return h;
+        const callee = self.registry.top_level_prop_init_callees.get(fqn) orelse return null;
+        var head: ?[]const u8 = null;
+        for (self.funcsBySimpleName(callee)) |fid| {
+            const f = self.funcById(fid) orelse continue;
+            if (f.kind != .plain) continue;
+            if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
+            var h = staticTypeHead(std.mem.trimEnd(u8, f.return_ty.name, "?"));
+            if (h.len == 0) return null;
+            if (std.mem.lastIndexOfScalar(u8, h, '.')) |d| h = h[d + 1 ..];
+            if (head) |prev| {
+                if (!std.mem.eql(u8, prev, h)) return null;
+            } else head = h;
+        }
+        if (head) |h| {
+            // Only a head that names a class the module knows: a type
+            // parameter or an unresolvable name disproves candidates a null
+            // would have left open.
+            if (self.uniqueClassIdBySimpleName(h) == null and self.classIdByFqn(h) == null) return null;
+            return h;
+        }
+        // A constructor call states the class outright.
+        if (self.uniqueClassIdBySimpleName(callee) != null) return callee;
+        return null;
+    }
+
     pub fn topLevelPropTypeHead(
         self: *const Module,
         name: []const u8,
@@ -9545,7 +9576,7 @@ pub const Module = struct {
         for (list.items) |pd| {
             const t = self.scopeTier(pd.fqn, pd.package, name, caller_pkg, caller_file);
             if (t == 255) continue;
-            const h = self.registry.top_level_prop_type_heads.get(pd.fqn);
+            const h = self.topLevelPropHeadFor(pd.fqn);
             if (t < best_tier) {
                 best_tier = t;
                 head = h;
@@ -10314,6 +10345,13 @@ pub const ModuleRegistry = struct {
     /// a RECEIVER (`asserter.assertEquals(...)`) types statically. Only
     /// annotated declarations record; the head is the annotation as written.
     top_level_prop_type_heads: std.StringHashMap([]const u8),
+    /// Top-level property FQN -> the simple name its UNANNOTATED initializer
+    /// calls (`private val base64EncodeMap = byteArrayOf(...)`). Resolved to
+    /// a head only at query time, when every declaration is registered: a
+    /// user function of the same name is then visible and either agrees or
+    /// makes the answer ambiguous, so a shadowed factory cannot mistype the
+    /// property.
+    top_level_prop_init_callees: std.StringHashMap([]const u8),
     /// Top-level extension properties whose values are directly callable.
     /// Registered before body lowering so `receiver.property(args)` can be
     /// classified as a property read followed by `invoke`.
@@ -10429,6 +10467,7 @@ pub const ModuleRegistry = struct {
             .class_const_inits = StrPairMap(Const).init(allocator),
             .top_level_prop_pkgs = std.StringHashMap(std.ArrayList(PropDecl)).init(allocator),
             .top_level_prop_type_heads = std.StringHashMap([]const u8).init(allocator),
+            .top_level_prop_init_callees = std.StringHashMap([]const u8).init(allocator),
             .callable_extension_props = std.StringHashMap(std.ArrayList(CallableExtensionProp)).init(allocator),
             .top_level_prop_getters = std.StringHashMap(FuncId).init(allocator),
             .top_level_prop_setters = std.StringHashMap(FuncId).init(allocator),
@@ -10546,6 +10585,7 @@ pub const ModuleRegistry = struct {
             self.top_level_prop_pkgs.deinit();
         }
         self.top_level_prop_type_heads.deinit();
+        self.top_level_prop_init_callees.deinit();
         {
             var it = self.callable_extension_props.valueIterator();
             while (it.next()) |list| list.deinit(a);
@@ -10720,6 +10760,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.top_level_prop_type_heads.iterator();
             while (it.next()) |e| try out.top_level_prop_type_heads.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.top_level_prop_init_callees.iterator();
+            while (it.next()) |e| try out.top_level_prop_init_callees.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.callable_extension_props.iterator();

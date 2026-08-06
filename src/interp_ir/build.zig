@@ -1047,6 +1047,12 @@ fn notePropScope(
         // this, every member call on such a read resolved by name.
         if (literalTypeHead(init)) |head| {
             try module.registry.top_level_prop_type_heads.put(fqn, head);
+        } else if (initCalleeName(init)) |callee| {
+            // A factory or constructor call states the type as definitely as
+            // an annotation, but the name has to be RESOLVED to say what it
+            // returns, and nothing is registered yet. Record the name; the
+            // module answers when the whole declaration set is in.
+            try module.registry.top_level_prop_init_callees.put(fqn, callee);
         }
     }
     // A `const val` with a literal initializer records its value so the
@@ -1082,6 +1088,28 @@ fn literalTypeHead(e: *const ast.Expr) ?[]const u8 {
         .StringTemplate => "String",
         else => null,
     };
+}
+
+/// The simple name an unannotated property initializer CALLS, seeing through
+/// the scope functions that return their own receiver
+/// (`IntArray(256).apply { … }` is an `IntArray`).
+fn initCalleeName(e: *const ast.Expr) ?[]const u8 {
+    if (e.* != .Call) return null;
+    const callee = e.Call.callee;
+    switch (callee.*) {
+        .Path => |p| {
+            if (p.segments.len == 0) return null;
+            return p.segments[p.segments.len - 1].name;
+        },
+        .Member => |m| {
+            const identity = [_][]const u8{ "apply", "also" };
+            for (identity) |id| {
+                if (std.mem.eql(u8, m.name.name, id)) return initCalleeName(m.receiver);
+            }
+            return null;
+        },
+        else => return null,
+    }
 }
 
 fn constLiteralOf(e: *const ast.Expr) ?ir.Const {

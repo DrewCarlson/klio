@@ -1173,7 +1173,7 @@ pub fn bake(
                     .name = e.key_ptr.*,
                     .fqn = pd.fqn,
                     .package = pd.package,
-                    .type_head = mg.get().registry.top_level_prop_type_heads.get(pd.fqn) orelse "",
+                    .type_head = mg.get().topLevelPropHeadFor(pd.fqn) orelse "",
                 });
             }
         }
