@@ -3544,3 +3544,100 @@ not authoritative. There is no shortcut past it, and it is the same
 receiver-typing front the 347 need. That is now measured from three
 independent directions — the census's own buckets, the eager channel's
 `hits=0`, and this proof's own reasons — and they agree.
+
+## The argument-type front, opened
+
+The `arg-unauthoritative` reason names a shape, not a site, so the shapes
+themselves were counted. `KLIO_ARGSHAPE_UNK` reports every argument whose
+applicability shape carries no type, no literal kind and no callable form;
+under `KLIO_PROMO_NAMES` the same report is emitted only for the arguments
+that actually made the proof hold. That second, filtered, report was 40
+lines and 28 of them were one shape: a `Binary Add` inside
+`random.nextInt(i + 1)`, where `i` is a for-loop variable. The loop variable
+had no type because the iterated expression is a PROGRESSION, and a range or
+progression carries its element in the class NAME (`IntProgression`), not in
+a type argument — the only path `iterableElementTypeRef` had. Naming the ten
+range/progression classes typed the loop variable, and the 28 declines went
+to bound.
+
+    resolver_declined   81 -> 53
+
+That is the whole lesson of the census reading backwards: `arg-unauthoritative`
+sounded like a deep inference problem and was, in the majority, one missing
+table.
+
+### The bug the loop-variable type exposed
+
+Typing the loop variable made `parseHexToLong`'s body reach a splice it had
+been falling short of, and the splice was wrong. A lambda ARGUMENT spliced
+into an inline body is caller code: the inline lambda parameters it can
+invoke, the scope depth its free names resolve against, the call-site hint,
+and the localize target for an unlabeled `return` all belong to the frame
+the lambda was WRITTEN in. Every one of those was read from the INNERMOST
+frame instead. With one inline level that is the same frame, which is why it
+held for so long; with two levels that both name a parameter `onError` — the
+exact shape of `HexExtensions.parseHexToLong` under `Uuid.parseHexDash` — the
+body bound the callee's closure instead of the caller's.
+
+Three separate corrections, each measured on its own:
+
+  - the substitution map carries over the caller's entries, but only for
+    names the skipped frames RE-BIND. Carrying everything hands unrelated
+    calls to a splice and broke `select { }`; carrying nothing is what lost
+    the collision in the first place.
+  - the caller scope depth and the call-site hint come from the substituting
+    frame.
+  - so does the return-localize snapshot, without which
+    `uuidParseHexDashOrNullCommonImpl`'s `{ _, _, _ -> return null }`
+    returned a value into the arithmetic instead of leaving the function.
+
+A fourth correction is independent: `this.onError(index)`, an inline lambda
+parameter with a receiver type invoked through an explicit `this`, was
+emitting a member dispatch no class declares. The qualifier names the
+lambda's receiver, so the call is the same splice the bare form takes — with
+the receiver supplied by the call rather than inferred from the parameter's
+mark, which an enclosing splice of the same name suspends.
+
+## Two gates measured, one stale
+
+`promo_blocked_by_class` withheld the promotion proof whenever the receiver's
+class was a stub or a value class, reasoning that a host-backed receiver has
+no vtable. The branch beside it already emits a virtual answer for exactly
+those classes — the runtime resolves the slot against the receiver's runtime
+class and prefers the FQN-keyed intrinsic. The guard described a rule the
+interpreter had stopped following. Removing it is +2 sites, which is small,
+but it deletes a fallback rather than adding a channel.
+
+## A property states its type by what builds it
+
+`private val base64EncodeMap = byteArrayOf(...)` is as definite as an
+annotation, and the stdlib writes its tables that way. The registration pass
+that records top-level property heads runs before anything is resolved, so
+it could only read LITERAL initializers. It now records the initializer's
+callee NAME instead, and the module answers at query time when every
+declaration is visible: a user function of that name is in the candidate set
+and either agrees or makes the answer ambiguous, so a shadowed factory
+cannot mistype the property. `apply`/`also` are seen through, so
+`IntArray(256).apply { ... }` is an `IntArray`.
+
+    no_receiver_type   347 -> 321
+
+The downstream effect is larger than the property reads themselves: the
+untyped `base64EncodeMap` left `forEachIndexed`'s lambda parameters untyped,
+and every call on those was unbound too.
+
+## Where the census stands
+
+    total            9075
+    no_receiver_type  321   3.54%
+    resolver_declined  51   0.56%
+    no_class_id        11
+    nullable_or_generic 2
+    bound            8690  95.76%
+
+The remaining `no_receiver_type` was read the same way. Its largest named
+sub-bucket, `enclosing_member` (30), is a class member whose declared type is
+a bare TYPE PARAMETER — `CompareContext<out T>.actual`, `UnsafeLazyImpl.value`,
+`TestCollection<T>.data`. Those name nothing in the receiving scope; kotlinc
+resolves them from the instantiation, which lowering does not carry. That is
+a floor, not a channel, and it is now measured rather than assumed.

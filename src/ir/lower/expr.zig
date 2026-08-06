@@ -14970,9 +14970,10 @@ fn lowerResolvedMemberCall(
                     .Member => |cm2| cm2.name.name,
                     else => @tagName(std.meta.activeTag(callee.*)),
                 };
-                std.debug.print("[no-recv-callrecv] callee={s} kind={s} call={s} fn={s}\n", .{
+                std.debug.print("[no-recv-callrecv] callee={s} kind={s} why={s} call={s} fn={s}\n", .{
                     cn,
                     @tagName(std.meta.activeTag(callee.*)),
+                    @tagName(classifyCallReturn(b, receiver)),
                     name.name,
                     build.currentRealFn() orelse "-",
                 });
