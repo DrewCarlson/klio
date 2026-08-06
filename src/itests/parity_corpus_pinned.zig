@@ -1939,6 +1939,16 @@ test "numeric_promotion_receiver" {
     );
 }
 
+test "thread_declared_handle" {
+    try check("thread_declared_handle",
+        \\worker
+        \\false
+        \\true
+        \\5
+        \\
+    );
+}
+
 test "bare_member_call_return" {
     try check("bare_member_call_return",
         \\AB,CD|2

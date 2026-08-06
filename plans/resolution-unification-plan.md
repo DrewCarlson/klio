@@ -229,11 +229,23 @@ Two corrections to the instrument itself, both material to the ratchet:
   being measured; the number is a lower bound on what is declared, never
   an upper bound on what is missing.
 
-At the widest scope reached so far the residue is exactly the six
-klio-internal `__klio_*` host helpers (deliberately undeclared) plus
-`kotlin.concurrent.thread` and `kotlin.text.format`, which are blocked on
-declaring a host RETURN type (`Thread`) and a companion extension
-(`String.Companion.format`) respectively.
+**Closed 2026-08-06: `kotlin.concurrent.thread`, the last non-deliberate
+hole.** It was described as blocked on declaring its host RETURN type. It
+was not: the type needs a HEADER, not an implementation. `Thread.kt` declares
+`external class Thread` with the surface the host already answers
+(`name`, `isAlive`, `join`, `start`, `interrupt`) and `external fun thread`
+returning it, and the host keeps every body.
+
+Declaring it exposed a second fault. With a real declaration the handle's
+member calls lower as virtual slots, and the virtual path refused a
+CALLABLE-shaped receiver outright — the thread handle is a bound-method
+sentinel, so `t.join()` failed with "virtual call receiver is not an
+instance" even though the by-name host dispatch right beside it serves that
+exact handle. The callable arm now falls back to that dispatch, which is
+what the non-callable arm beside it already did.
+
+At the widest scope reached the residue is now exactly the klio-internal
+`__klio_*` host helpers, which are deliberately undeclared.
 
 
 Steps 2 and 3 of the no-holes symbol table (step 1 and its whole stdlib grind are
