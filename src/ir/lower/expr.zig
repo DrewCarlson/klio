@@ -8656,6 +8656,26 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             else => {},
         }
     }
+    // `a..b` is a range whose class follows from its endpoints. Named here
+    // because the range CLASSES exist (`IntRange`, `CharRange`, …) while the
+    // operator producing them is builtin with no declaration to read.
+    if (arg.* == .Binary and arg.Binary.op == .Range) {
+        if (argDeclTypeRefLazy(b, arg.Binary.lhs)) |lt| {
+            if (!lt.nullable) {
+                const lh = typeHead(std.mem.trimEnd(u8, lt.name, "?"));
+                const ranges = [_]struct { e: []const u8, r: []const u8 }{
+                    .{ .e = "Int", .r = "IntRange" },     .{ .e = "Long", .r = "LongRange" },
+                    .{ .e = "Char", .r = "CharRange" },   .{ .e = "UInt", .r = "UIntRange" },
+                    .{ .e = "ULong", .r = "ULongRange" },
+                };
+                for (ranges) |rr| {
+                    if (std.mem.eql(u8, lh, rr.e)) {
+                        return .{ .name = rr.r, .nullable = false, .args = &.{} };
+                    }
+                }
+            }
+        }
+    }
     // `a / b` on a CLASS is an operator member, and its declared return is
     // the answer: `val half = duration / 2` in the saturating-math helpers
     // types `half` as Duration. The arithmetic arm beside this one promotes

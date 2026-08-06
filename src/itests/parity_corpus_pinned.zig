@@ -1939,6 +1939,17 @@ test "numeric_promotion_receiver" {
     );
 }
 
+test "range_arg_element_type" {
+    try check("range_arg_element_type",
+        \\5
+        \\101
+        \\1
+        \\6
+        \\xyz
+        \\
+    );
+}
+
 test "unary_arg_lambda_param" {
     try check("unary_arg_lambda_param",
         \\false,true,false

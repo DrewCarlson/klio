@@ -3323,4 +3323,12 @@ tracing a site — because the shape histogram names the gap directly. The
 remaining buckets are `Path` 197, `Call` 88, `Member` 36, `Binary` 34, all
 of which HAVE arms; their misses are inside those arms, not absences.
 
-Session: **508 -> 365 unbound, 92.73% -> 94.15% bound.**
+    Range   -> arm added                     365 -> 351
+
+`a..b` names a range CLASS from its endpoints (`IntRange`, `CharRange`,
+`LongRange`, `UIntRange`, `ULongRange`). The classes exist; the operator
+producing them is builtin with no declaration, so the mapping is stated.
+Fourteen sites — the largest single arm of the three, because a range is
+both an argument shape AND the thing a `for` draws its element from.
+
+Session: **508 -> 351 unbound, 92.73% -> 94.24% bound.**
