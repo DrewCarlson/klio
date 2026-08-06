@@ -47,7 +47,11 @@ const runtime = @import("runtime");
 // fix: the plugin's base collectors now see an image-loaded base's
 // composables, a deterministic gain on the pack path the suite always
 // uses). Kept below the 1252 peak by the ~±40 DNC-variance margin.
-const BASELINE: usize = 1210;
+// RAISED 1210 -> 1275 after four consecutive runs at 1315-1318: the
+// GC-stress step no longer times out inside the compiler, and the static
+// receiver-typing channels bound work that previously resolved by name.
+// Same ~±40 margin below the observed floor.
+const BASELINE: usize = 1275;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
@@ -254,7 +258,12 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     try stress_argv.append(a, "test");
     try stress_argv.appendSlice(a, sources.items);
     try stress_argv.append(a, "--filter=SnapshotStateMapTests.validateEntriesRemoveAll");
-    const stress = try runKlio(a, &env, stress_argv.items, 30_000);
+    // 240s, matching the order of the per-class budget below: this step
+    // hands `klio test` the SAME 68-file source set every job compiles, and
+    // that compile alone is ~50s under load. The filtered test itself runs
+    // in under a second — the old 30s cap timed out in the compiler, before
+    // the GC contract it exists to check was ever exercised.
+    const stress = try runKlio(a, &env, stress_argv.items, 240_000);
     // `Environ.Map` owns its keys and values and exposes no `remove`; the flag
     // is value-gated (`!= "0"`), so clearing it is a `put`.
     try env.put("KLIO_GC_STRESS", "0");
