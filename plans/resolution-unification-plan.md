@@ -559,14 +559,27 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
   argument type — the uniform resolution this plan is named for, over one
   table, for the first time.
 
-  The lowering consumer's yield is still zero, and the reason is now precise
-  and small: it fires only where the resolver reached NO target (83 sites of
-  9,216), and the checker's picks land on the other 9,133. Those two sets are
-  disjoint today. Widening the consumer past `resolved.target == null` means
-  reconciling a pick with a resolution computed for a different declaration —
-  the mixing hazard that broke `d += x` on Duration — so it needs the
-  resolution to be REBUILT around the pick, not patched. That is the next
-  unit, and it is the last one between here and step 3.
+  The consumer is widened past `resolved.target == null` on the one condition
+  that makes the mixing hazard vanish: the pick and the resolver's target
+  must be the SAME CALL FORM — both extensions, receiver in the leading slot,
+  direct dispatch. Everything downstream reads `resolved` for the shape of
+  the call, so where the shape agrees the swap is only which declaration the
+  identical emit names. Where it does not agree the pick is refused, which is
+  what keeps `d += x` on Duration working.
+
+  Green on every battery: corpus 267/267, commontest 117/0, litmus 43/43,
+  units, compose 1315.
+
+  Yield today is 2 sites across 25 example programs, and the census does not
+  move — the checker and the resolver agree almost everywhere, which is the
+  result one wants from two engines over one table. The value is that they
+  now agree BY CONSTRUCTION rather than by coincidence: where they differ, the
+  argument-type ranking decides, and that is the uniform resolution this plan
+  is named for.
+
+  What is left for step 3 is the scope walk itself (locals -> receiver chain
+  -> extensions -> package -> default imports) replacing `isToplevelFunction`
+  in the member-dispatch guard. The ranking it was waiting on now exists.
 
 - **P8** — hatch deletion (RC-H catalog above).
 - **P9** — optional flat bytecode + pack serialization.

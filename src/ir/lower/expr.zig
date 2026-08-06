@@ -14963,11 +14963,22 @@ fn lowerResolvedMemberCall(
     // pick that disagrees with it would be spliced into a resolution
     // describing something else. Where the resolver has no target there is
     // nothing to disagree with, and the checker's answer is the only one.
-    const eager_pick: ?FuncId = if (resolved.target == null and
-        !std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_MEMBER") orelse "1", "0")) blk: {
+    const eager_pick: ?FuncId = if (!std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_MEMBER") orelse "1", "0")) blk: {
         const ep = b.module.eagerExternCallTarget(name.span) orelse break :blk null;
         const ef = b.module.funcById(ep) orelse break :blk null;
         if (ef.params.len == 0 or !std.mem.eql(u8, ef.params[0].name, "this")) break :blk null;
+        // Where the resolver DID name a declaration, the pick may replace it
+        // only if both are the same call form — an extension, receiver in the
+        // leading slot. Everything downstream reads `resolved` for the shape
+        // of the call, and swapping a declaration of one shape for another is
+        // what broke `d += x` on Duration. Same shape, and the swap is just
+        // which declaration the identical emit names.
+        if (resolved.target) |rt| {
+            if (rt.int() == ep.int()) break :blk null;
+            const rf = b.module.funcById(rt) orelse break :blk null;
+            if (rf.params.len == 0 or !std.mem.eql(u8, rf.params[0].name, "this")) break :blk null;
+            if (resolved.dispatch != .direct) break :blk null;
+        }
         break :blk ep;
     } else null;
     const func_id = eager_pick orelse resolved.target orelse {
