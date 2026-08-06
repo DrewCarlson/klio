@@ -1474,6 +1474,9 @@ const FuncIdMap = std.AutoHashMap;
 /// resolution BEFORE the module exists (lowering starts inside the build),
 /// parks it here, and the next module created on this thread adopts it.
 pub threadlocal var pending_eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null;
+/// Companion to `pending_eager_calls` for picks whose declaration came from
+/// a prebuilt image: those carry a FuncId, never a span.
+pub threadlocal var pending_eager_call_fids: ?std.AutoHashMap(span.Span, u32) = null;
 /// Companion channel: per-expression static TYPE HEADS from typeck
 /// (`Span(expr) -> {head, nullable}`), the declared-type evidence the
 /// applicability engine otherwise reconstructs from AST string probes.
@@ -1731,6 +1734,7 @@ pub const Module = struct {
     /// Lowering composes it with `func_by_decl_span`;
     /// absent spans keep the lazy path.
     eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null,
+    eager_call_fids: ?std.AutoHashMap(span.Span, u32) = null,
     /// Typeck's per-expression type heads (the E2.1 evidence seam).
     eager_types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null,
     eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null,
@@ -2030,6 +2034,10 @@ pub const Module = struct {
             .member_name_index = StrPairMap(std.ArrayList(FuncId)).init(allocator),
             .method_dispatch = std.AutoHashMap(u64, FuncId).init(allocator),
         };
+        if (pending_eager_call_fids) |pf| {
+            out__.eager_call_fids = pf;
+            pending_eager_call_fids = null;
+        }
         if (pending_eager_calls) |pec| {
             out__.eager_calls = pec;
             pending_eager_calls = null;
@@ -6449,6 +6457,7 @@ pub const Module = struct {
         if (self.class_parent) |*m| m.deinit();
         if (self.func_by_decl_span) |*m| m.deinit();
         if (self.eager_calls) |*m| m.deinit();
+        if (self.eager_call_fids) |*m| m.deinit();
         if (self.eager_types) |*m| m.deinit();
         if (self.eager_recv_heads) |*m| m.deinit();
         if (self.ext_names_by_recv_head) |*m| {
@@ -6984,6 +6993,13 @@ pub const Module = struct {
     /// The typeck-resolved target FuncId for the call at `callee_span`:
     /// eager record composed with the lowered-declaration identity map.
     pub fn eagerCallTarget(self: *const Module, callee_span: span.Span) ?FuncId {
+        if (self.eager_call_fids) |*fm| {
+            if (fm.get(callee_span)) |fid| {
+                if (fid < self.funcs.items.len or self.funcById(FuncId.from(fid)) != null) {
+                    return FuncId.from(fid);
+                }
+            }
+        }
         const ec = &(self.eager_calls orelse return null);
         const decl = ec.get(callee_span) orelse return null;
         const got = self.funcByDeclSpan(decl);

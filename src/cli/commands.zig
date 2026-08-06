@@ -809,15 +809,22 @@ pub fn computeEagerCalls(
         }
     }
     var out = std.AutoHashMap(span_mod.Span, span_mod.Span).init(gpa);
+    // Picks whose declaration lives in a prebuilt image: no source span
+    // exists for them anywhere, so they travel by FuncId instead.
+    var out_fids = std.AutoHashMap(span_mod.Span, u32).init(gpa);
     var it = tc.resolved_calls.iterator();
     var n: usize = 0;
+    var n_fid: usize = 0;
     var seen_total: usize = 0;
     var no_decl_span: usize = 0;
     var not_declared: usize = 0;
     while (it.next()) |e| {
         seen_total += 1;
         const decl = e.value_ptr.decl_span orelse {
-            no_decl_span += 1;
+            if (e.value_ptr.extern_fid) |fid| {
+                out_fids.put(e.key_ptr.*, fid) catch {};
+                n_fid += 1;
+            } else no_decl_span += 1;
             continue;
         };
         if (!declared.contains(decl)) {
@@ -836,7 +843,11 @@ pub fn computeEagerCalls(
         std.debug.print("[EAGER-SHAPE] calls={d} member={d} member_with_class={d} member_ext_cands={d}\n", .{ cs[0], cs[1], cs[2], cs[3] });
         std.debug.print("[EAGER-GATES] entered={d} vararg={d} type_param={d} ext_name={d} member_shadow={d} pkg_visibility={d} recorded={d}\n", .{ g[0], g[1], g[2], g[3], g[4], g[5], g[6] });
     }
-    if (audit) std.debug.print("[EAGER] {d} call resolutions recorded (typeck resolved {d}; {d} carried no decl span, {d} named a decl outside the checked sources)\n", .{ n, seen_total, no_decl_span, not_declared });
+    if (audit) std.debug.print("[EAGER] {d} call resolutions recorded ({d} by image FuncId; typeck resolved {d}; {d} carried no decl span, {d} named a decl outside the checked sources)\n", .{ n, n_fid, seen_total, no_decl_span, not_declared });
+    if (out_fids.count() != 0) {
+        if (ir.pending_eager_call_fids) |*old_m| old_m.deinit();
+        ir.pending_eager_call_fids = out_fids;
+    } else out_fids.deinit();
     // The companion evidence channel: per-expression type heads. Only
     // decisive heads enter (scalars, String, named classes, nullable
     // wrappers of those) — a Function/TypeParam/Unresolved answer would

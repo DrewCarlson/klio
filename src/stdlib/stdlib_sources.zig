@@ -244,6 +244,7 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-io/encoding/Base64Actuals.kt",
     "kotlin-internal/SerializationActuals.kt",
     "kotlin-internal/ConcurrentActuals.kt",
+    "kotlin-concurrent/Thread.kt",
     "kotlin-concurrent/AtomicsActuals.kt",
     "kotlin-concurrent/AtomicArraysActuals.kt",
     "kotlin-util/LazyActuals.kt",

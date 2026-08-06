@@ -9801,31 +9801,58 @@ pub fn invokeVirtualMember(
     };
     if (receiver.* != .Instance) {
         if (isCallable(receiver)) {
+            const root = FuncId.from(slot.int());
+            // A CALLABLE-shaped receiver on a non-interface slot is not an
+            // interpreted instance, but it can still be a host value that
+            // serves the member natively — `kotlin.concurrent.thread` hands
+            // back a handle whose `join`/`isAlive`/`name` the host answers,
+            // and once that type carries a real declaration its member calls
+            // arrive here as virtual slots. The by-name dispatch is the one
+            // that knows those handles, and it re-borrows the module, so the
+            // decision is made under the borrow and acted on outside it.
+            const decided: union(enum) { by_name: []const u8, err: []const u8, call_iface } = blk_c: {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                const module = mg.get();
+                const sig = module.decl_sigs.get(root.int()) orelse
+                    break :blk_c .{ .err = "virtual callable slot has no declaration" };
+                const owner = sig.enclosing_class orelse
+                    break :blk_c .{ .err = "virtual callable slot has no interface owner" };
+                if (sig.has_body or owner.int() >= module.classes.items.len or
+                    !module.classes.items[owner.int()].is_interface)
+                {
+                    if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
+                        const mname: []const u8 = if (module.funcById(root)) |f| f.fqn else "?";
+                        std.debug.print("[vcall-callable] slot={d} method={s} recv_ty={s} has_body={} nargs={d} caller={s}\n", .{
+                            slot.int(),
+                            mname,
+                            receiver.typeFqn(),
+                            sig.has_body,
+                            args.len,
+                            if (ir.eval.currentFrameFunc()) |f| f.fqn else "<none>",
+                        });
+                        ir.eval.dumpFrameChainForDiagAlways();
+                    }
+                    if (module.funcById(root)) |rf| break :blk_c .{ .by_name = rf.name };
+                    break :blk_c .{ .err = "virtual call receiver is not an instance" };
+                }
+                break :blk_c .call_iface;
+            };
+            switch (decided) {
+                .err => |msg| return .{ .err = .{ .Type = msg } },
+                .by_name => |mname| {
+                    const named = try callMemberNamed(self, allocator, receiver, mname, args, arg_names);
+                    switch (named) {
+                        .ok => return named,
+                        .err => return .{ .err = .{ .Type = "virtual call receiver is not an instance" } },
+                    }
+                },
+                .call_iface => {},
+            }
             const mg = self.module.borrow();
             defer mg.deinit();
-            const module = mg.get();
-            const root = FuncId.from(slot.int());
-            const sig = module.decl_sigs.get(root.int()) orelse
-                return .{ .err = .{ .Type = "virtual callable slot has no declaration" } };
-            const owner = sig.enclosing_class orelse
-                return .{ .err = .{ .Type = "virtual callable slot has no interface owner" } };
-            if (sig.has_body or owner.int() >= module.classes.items.len or !module.classes.items[owner.int()].is_interface) {
-                if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
-                    const mname: []const u8 = if (module.funcById(root)) |f| f.fqn else "?";
-                    std.debug.print("[vcall-callable] slot={d} method={s} recv_ty={s} has_body={} nargs={d} caller={s}\n", .{
-                        slot.int(),
-                        mname,
-                        receiver.typeFqn(),
-                        sig.has_body,
-                        args.len,
-                        if (ir.eval.currentFrameFunc()) |f| f.fqn else "<none>",
-                    });
-                    ir.eval.dumpFrameChainForDiagAlways();
-                }
-                return .{ .err = .{ .Type = "virtual call receiver is not an instance" } };
-            }
             if (arg_params) |params| {
-                return callCallableIndexed(self, allocator, module, root, receiver, receiver, args, params);
+                return callCallableIndexed(self, allocator, mg.get(), root, receiver, receiver, args, params);
             }
             return host_call_value.callValue(self, allocator, receiver, args);
         }

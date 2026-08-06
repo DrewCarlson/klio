@@ -388,6 +388,9 @@ fn checkCallInner(
             defer cands.deinit(self.allocator);
             try expr_mod.lookupExtensionCandidates(self, cn, mname, args.len, &cands);
             call_shape_counts[2] += 1;
+            if (std.c.getenv("KLIO_EAGER_AUDIT") != null) {
+                std.debug.print("[EAGER-MEMBER] recv_class={s} name={s} cands={d} ext_key={}\n", .{ cn, mname, cands.items.len, self.extensions.contains(cn) });
+            }
             if (cands.items.len != 0) {
                 call_shape_counts[3] += 1;
                 // Run full overload selection over every reachable
@@ -396,13 +399,21 @@ fn checkCallInner(
                 var sigs_buf: std.ArrayList(FnSig) = .empty;
                 defer sigs_buf.deinit(self.allocator);
                 for (cands.items) |c| try sigs_buf.append(self.allocator, c.sig);
-                const ret = try checkOverloadedCall(
+                // The candidate set for a member call on a KNOWN receiver
+                // class is now complete from the checker's view: the image
+                // publishes every extension declared on that class and its
+                // supertype chain, and the program's own sources are already
+                // in the same table. It was partial only while the image
+                // handed over class names alone, which is why this form did
+                // not record.
+                const ret = try checkOverloadedCallRecorded(
                     self,
                     sigs_buf.items,
                     args,
                     arg_names,
                     type_args,
                     call_span,
+                    mname,
                 );
                 if (cands.items[0].return_class) |rcn| {
                     try self.expr_class.put(call_span, rcn);
@@ -815,7 +826,7 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
     buf.print(self.allocator, ";ret={f}", .{sig.return_ty}) catch return;
     const rendered = self.allocator.dupe(u8, buf.items) catch return;
     eagerGate(6);
-    self.resolved_calls.put(call_span, .{ .decl_span = sig.decl_span, .render = rendered }) catch {
+    self.resolved_calls.put(call_span, .{ .decl_span = sig.decl_span, .render = rendered, .extern_fid = sig.extern_fid }) catch {
         self.allocator.free(rendered);
     };
 }
@@ -1143,7 +1154,12 @@ fn checkOverloadedCallRecImpl(
         }
         break :blk true;
     };
-    if (record and chosen != null and args_decisive and !sig.is_extension) {
+    // An EXTENSION pick used to be refused outright, because the only
+    // candidate sets that reached here were partial. `record` now marks a
+    // set the checker sees in full — a bare top-level overload family, or a
+    // member call whose receiver class and whole supertype chain published
+    // their extensions — so the pick is as decided as a member's.
+    if (record and chosen != null and args_decisive) {
         if (std.c.getenv("KLIO_EAGER_HITS") != null) {
             std.debug.print("[REC-MSC] '{s}' args:", .{record_name});
             for (arg_tys.items) |*t| switch (t.*) {
