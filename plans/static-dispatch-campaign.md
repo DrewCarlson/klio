@@ -3008,3 +3008,42 @@ Session ledger for the receiver-typing channels:
     394  unannotated class property, literal init
 
     bound 92.73% -> 93.85%
+
+## Addendum 72 (2026-08-06): where the residue actually is
+
+Session ledger, receiver-typing channels, each measured on the full census
+and pinned:
+
+    508  start                                   92.73% bound
+    488  indexed argument types a spliced lambda parameter
+    454  a member call's declared return types the chain
+    426  unannotated top-level property, literal init
+    418  receiver-lambda member read (+ the resolution bug under it)
+    402  a bare call is a member call on the implicit receiver
+    394  unannotated class property, literal init   93.85% bound
+
+Two channels measured NEGATIVE and were reverted with the reason recorded:
+the `unique_concrete` module-level return channel (addendum 64) and routing
+image extension return heads into `expr_class` (addendum 71, fixed by the
+ranking/typing split rather than abandoned).
+
+**The residue is no longer a set of families.** At 394 sites nothing is
+larger than ~10 except `it` at 37, and those are lambda parameters whose
+type is a bare type PARAMETER — they name no class, so no channel can type
+them without inventing an answer. The leaves:
+
+    local_no_decl_type 135   (no_init_recorded 86, init_yields_no_type 49)
+    not_simple_callee   73
+    no_func             38
+    enclosing_member    38
+    unknown             25
+    captured            15
+
+`init_yields_no_type` is the honest tail: 2-4 sites per name across ~20
+distinct names, each a different derivation that stops one step short.
+
+Alongside it: `nullable_or_generic` 78 and `resolver_declined` 83 are by
+design — a nullable or type-parameter receiver has no single class, and a
+declined resolution is the resolver refusing to guess. 100% static dispatch
+is not the target those two describe; binding everything that NAMES a class
+is, and that is what the 394 measures.

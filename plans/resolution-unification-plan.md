@@ -577,9 +577,26 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
   argument-type ranking decides, and that is the uniform resolution this plan
   is named for.
 
-  What is left for step 3 is the scope walk itself (locals -> receiver chain
-  -> extensions -> package -> default imports) replacing `isToplevelFunction`
-  in the member-dispatch guard. The ranking it was waiting on now exists.
+  **Step 3 is mis-stated in this plan, and the ranking work shows why.**
+  `isToplevelFunction` guards a RUNTIME member-dispatch probe in
+  `host_call_member`. The three probe iterations recorded above ended at
+  "the generic and numeric overloads of the same name rank by ARGUMENT TYPE,
+  which no name-or-receiver test can decide", and treated that as a
+  precondition to be supplied.
+
+  It cannot be supplied there. The argument-type ranking is the checker's,
+  and it decides at LOWERING; a call that reaches this guard at run time is
+  precisely one lowering did NOT bind. Handing the ranking to the guard would
+  mean re-running overload selection against runtime values, which is a
+  different engine, not a unified one.
+
+  So the hatch does not retire by becoming a better runtime query. It retires
+  when the calls that reach it are bound statically instead — which makes
+  step 3 a consequence of the static-dispatch campaign, not a separate build.
+  Restated: **delete `isToplevelFunction` when the member-dispatch probe is
+  no longer reached for the names it protects.** The three symptoms it was
+  measured against (`StringTest.scanIndexed`, `DurationTest.subtraction`,
+  `TODOTest.usage`) are the acceptance test for that, unchanged.
 
 - **P8** — hatch deletion (RC-H catalog above).
 - **P9** — optional flat bytecode + pack serialization.
