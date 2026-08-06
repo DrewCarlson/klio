@@ -3366,11 +3366,22 @@ only read declarations, and the tail of the census is calls whose callee has
 none — the same 1,281 "builtin-type members" the P10 audit classified as
 "no source declaration in Kotlin either, not holes".
 
-To bind those, the interpreter would need a table of intrinsic SIGNATURES
-(name -> return head) as data, the way `primitiveMemberFast` already encodes
-their behaviour. That is a real and bounded piece of work — it is the same
-list, read for its types instead of its semantics — and it is the next thing
-that would move this number materially.
+The obvious next step was a table of intrinsic SIGNATURES (name -> return
+head) as data, the way `primitiveMemberFast` already encodes their
+behaviour. **Built it; it measures flat.** Three forms, all exactly zero:
+the conversion members (`toInt`, `toLong`, …), the integer bit operators,
+and the math functions (`floor`, `sqrt`, `abs`, `min`, `max`, keyed so the
+bare and qualified spellings both reach it).
+
+Four consecutive flat results retire the theory. Knowing an intrinsic's
+return type is not what these sites are missing — their RECEIVERS are
+untyped, and a rule that types the result of an operation on an untyped
+value has nothing to stand on. The `symbol` chain proves the shape: once
+addendum 77's erasure fix let its head keep a type, the whole chain bound
+with no intrinsic table at all (`decode`'s two sites, 2/2 bound).
+
+So the tail is not "unknown intrinsic returns". It is untyped chain HEADS,
+and each one is its own reason.
 
 Session: **508 -> 347 unbound, 92.73% -> 94.35% bound**, nine channels
 landed, ten measured-flat or negative attempts reverted with their reasons.
