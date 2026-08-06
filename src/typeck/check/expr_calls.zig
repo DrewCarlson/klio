@@ -362,6 +362,10 @@ fn checkCallInner(
         var class_from_ty: ?[]const u8 = null;
         if (self.expr_class.get(m.receiver.span())) |cn| {
             class_from_ty = cn;
+        } else if (self.rank_class.get(m.receiver.span())) |cn| {
+            // The ranking-only channel: enough to choose this call's
+            // candidates, never exported as a type.
+            class_from_ty = cn;
         } else {
             // Reuse `recv_ty` typed once above (a second checkExpr here would
             // re-recurse the receiver, making deep call chains 2^depth).
@@ -417,7 +421,17 @@ fn checkCallInner(
                     m.name.span,
                 );
                 if (cands.items[0].return_class) |rcn| {
-                    try self.expr_class.put(call_span, rcn);
+                    // An IMAGE extension's return head is RANKING evidence
+                    // only. `expr_class` is exported to lowering as type
+                    // evidence, and a head that is right for choosing the
+                    // next receiver here is not automatically one lowering
+                    // can bind against — routing these into `expr_class`
+                    // broke 31 corpus programs.
+                    if (cands.items[0].sig.extern_fid != null) {
+                        try self.rank_class.put(call_span, rcn);
+                    } else {
+                        try self.expr_class.put(call_span, rcn);
+                    }
                 }
                 return ret;
             }

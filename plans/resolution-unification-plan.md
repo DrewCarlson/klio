@@ -536,8 +536,37 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
 
   So the next unit is not "publish more heads". It is: separate the evidence
   the checker uses to RANK from the evidence lowering consumes to TYPE, so
-  the ranking input can grow without moving the typing input. Reverted; the
-  census, corpus, and litmus all return to their committed values.
+  the ranking input can grow without moving the typing input.
+
+- **The split is built, and the heads are published (2026-08-06).**
+  `Checker.rank_class` carries a receiver class that is good enough to choose
+  a call's candidates and is never exported; `expr_class` keeps exactly the
+  heads it had, so lowering's type evidence does not move. An IMAGE
+  extension's return head goes to the first, a source declaration's to the
+  second.
+
+  With extension return heads baked into the image (format 41, beside the
+  top-level ones) and routed through the split:
+
+        member calls          97
+        receiver class known  72   (was 5)
+        extension candidates  23
+
+        corpus 267/267, commontest 117/0, litmus 43/43, units green
+
+  So the ranking half of P7 is DONE: on an image program the checker can
+  name the receiver for three quarters of all member calls and ranks them by
+  argument type — the uniform resolution this plan is named for, over one
+  table, for the first time.
+
+  The lowering consumer's yield is still zero, and the reason is now precise
+  and small: it fires only where the resolver reached NO target (83 sites of
+  9,216), and the checker's picks land on the other 9,133. Those two sets are
+  disjoint today. Widening the consumer past `resolved.target == null` means
+  reconciling a pick with a resolution computed for a different declaration —
+  the mixing hazard that broke `d += x` on Duration — so it needs the
+  resolution to be REBUILT around the pick, not patched. That is the next
+  unit, and it is the last one between here and step 3.
 
 - **P8** — hatch deletion (RC-H catalog above).
 - **P9** — optional flat bytecode + pack serialization.

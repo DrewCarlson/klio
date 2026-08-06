@@ -476,6 +476,32 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
     // — which is why the checker had zero candidates for every member call
     // on exactly the runs that matter. Both of these are eager in the image,
     // because lowering resolves names against them.
+    // The baked index on a load, derived from the decoded funcs on the run
+    // that builds the base, so a warm cache and a cold one publish the same.
+    var ext_rets = std.StringHashMap([]const u8).init(gpa);
+    defer ext_rets.deinit();
+    if (sb.ext_returns.len != 0) {
+        for (sb.ext_returns) |er| ext_rets.put(er.key, er.head) catch {};
+    } else {
+        var eamb = std.StringHashMap(void).init(gpa);
+        defer eamb.deinit();
+        for (m.funcs.items) |*f| {
+            if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+            if (f.name.len == 0) continue;
+            const rh = headOf(f.params[0].ty.name);
+            const h = headOf(f.return_ty.name);
+            if (rh.len == 0 or h.len == 0 or !classes.contains(h)) continue;
+            const key = std.fmt.allocPrint(gpa, "{s}\x00{s}", .{ rh, f.name }) catch continue;
+            if (eamb.contains(key)) continue;
+            const gop = ext_rets.getOrPut(key) catch continue;
+            if (gop.found_existing) {
+                if (!std.mem.eql(u8, gop.value_ptr.*, h)) {
+                    _ = ext_rets.remove(key);
+                    eamb.put(key, {}) catch {};
+                }
+            } else gop.value_ptr.* = h;
+        }
+    }
     var exts = std.StringHashMap(std.ArrayList(types_mod.ExternExt)).init(gpa);
     var nit = m.func_name_index.iterator();
     while (nit.next()) |entry| {
@@ -507,10 +533,16 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
                 .fid = fid.int(),
                 .param_heads = heads,
                 .param_nullable = nulls,
-                // The declaration signature carries no return type; the
-                // ranking compares ARGUMENTS, and a null return class is
-                // exactly what an unknown one must look like.
-                .return_head = "",
+                // From the baked index; the declaration signature has no
+                // return type of its own. This head is RANKING evidence
+                // only — see the split at its consumer.
+                .return_head = blk_r: {
+                    const key = std.fmt.allocPrint(gpa, "{s}\x00{s}", .{ recv_head, fname }) catch break :blk_r "";
+                    defer gpa.free(key);
+                    const h = ext_rets.get(key) orelse break :blk_r "";
+                    if (ambiguous_names.contains(h)) break :blk_r "";
+                    break :blk_r h;
+                },
                 .return_nullable = false,
                 .is_infix = false,
             }) catch {};

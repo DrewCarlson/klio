@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 40;
+pub const FORMAT_VERSION: u32 = 41;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -828,6 +828,7 @@ const ImageRoot = struct {
     /// Base top-level property scope data (lazy `notePropScope` replay).
     top_props: []TopPropImage = &.{},
     fn_returns: []FnReturnImage = &.{},
+    ext_returns: []ExtReturnImage = &.{},
     enum_id_next: u64,
     /// CLI replay data: packages registered while loading the dependency
     /// sources and the host-binding FQNs installed alongside them.
@@ -971,6 +972,9 @@ const TopPropImage = struct { name: []const u8, fqn: []const u8, package: []cons
 /// while the funcs are still decoded. The checker needs it to type a call's
 /// result on a cached image, where the funcs themselves never materialise.
 const FnReturnImage = struct { name: []const u8, head: []const u8 };
+
+/// An extension's return class head under `<receiver head>\x00<name>`.
+const ExtReturnImage = struct { key: []const u8, head: []const u8 };
 
 // -------------------------------------------------------------------------
 // Bake: StdlibBase -> bytes
@@ -1205,6 +1209,35 @@ pub fn bake(
         var rit = rets.iterator();
         while (rit.next()) |e| try out.append(a, .{ .name = e.key_ptr.*, .head = e.value_ptr.* });
         root.fn_returns = try out.toOwnedSlice(a);
+
+        var ekeys = std.StringHashMap([]const u8).init(gpa);
+        defer ekeys.deinit();
+        var eamb = std.StringHashMap(void).init(gpa);
+        defer eamb.deinit();
+        for (m.funcs.items) |*f| {
+            if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+            if (f.name.len == 0) continue;
+            var rh = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
+            if (std.mem.indexOfScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
+            if (std.mem.lastIndexOfScalar(u8, rh, '.')) |d| rh = rh[d + 1 ..];
+            var head = std.mem.trimEnd(u8, f.return_ty.name, "?");
+            if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+            if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
+            if (rh.len == 0 or head.len == 0 or !classes.contains(head)) continue;
+            const key = std.fmt.allocPrint(a, "{s}\x00{s}", .{ rh, f.name }) catch continue;
+            if (eamb.contains(key)) continue;
+            const gop = ekeys.getOrPut(key) catch continue;
+            if (gop.found_existing) {
+                if (!std.mem.eql(u8, gop.value_ptr.*, head)) {
+                    _ = ekeys.remove(key);
+                    eamb.put(key, {}) catch {};
+                }
+            } else gop.value_ptr.* = head;
+        }
+        var eout: std.ArrayList(ExtReturnImage) = .empty;
+        var eit2 = ekeys.iterator();
+        while (eit2.next()) |e| try eout.append(a, .{ .key = e.key_ptr.*, .head = e.value_ptr.* });
+        root.ext_returns = try eout.toOwnedSlice(a);
     }
 
     // Drop the eager forest from the payload: the per-decl sections (lazy
@@ -2061,6 +2094,13 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot, slot: u32) Allocator.Error
             const out = try a.alloc(StdlibBase.FnReturn, root.fn_returns.len);
             for (root.fn_returns, 0..) |entry, i| {
                 out[i] = .{ .name = entry.name, .head = entry.head };
+            }
+            break :blk out;
+        },
+        .ext_returns = blk: {
+            const out = try a.alloc(StdlibBase.ExtReturn, root.ext_returns.len);
+            for (root.ext_returns, 0..) |entry, i| {
+                out[i] = .{ .key = entry.key, .head = entry.head };
             }
             break :blk out;
         },

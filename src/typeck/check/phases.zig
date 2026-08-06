@@ -65,6 +65,7 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
         .nothing_epoch = 0,
         .reach_cache = root.ReachCache.init(allocator),
         .expr_class = std.AutoHashMap(root.Span, []const u8).init(allocator),
+        .rank_class = std.AutoHashMap(root.Span, []const u8).init(allocator),
         .list_elem = std.AutoHashMap(root.Span, root.Type).init(allocator),
         .diagnostics = root.DiagnosticSink.init(),
         .frames = frames,
