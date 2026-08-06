@@ -417,12 +417,26 @@ pub fn spliceInlineLambda(
     lam: *const Expr,
     arg_exprs: []const Expr,
 ) Allocator.Error!Reg {
+    return spliceInlineLambdaOn(b, lambda_name, lam, arg_exprs, null);
+}
+
+/// As `spliceInlineLambda`, with the lambda's receiver supplied by the call
+/// rather than inferred from the parameter's mark. A `this.f(x)` call names
+/// the receiver explicitly, and the mark is name-keyed — an enclosing splice
+/// of a same-named parameter suspends it, leaving the body without a `this`.
+pub fn spliceInlineLambdaOn(
+    b: *FuncBuilder,
+    lambda_name: []const u8,
+    lam: *const Expr,
+    arg_exprs: []const Expr,
+    explicit_receiver: ?Reg,
+) Allocator.Error!Reg {
     if (lam.* != .Lambda) {
         return lowerExpr(b, lam);
     }
     const params = lam.Lambda.params;
     const body = lam.Lambda.body;
-    const receiver = if (b.isReceiverLambdaParam(lambda_name))
+    const receiver = explicit_receiver orelse if (b.isReceiverLambdaParam(lambda_name))
         b.resolve("this")
     else
         null;
@@ -437,8 +451,21 @@ pub fn spliceInlineLambda(
     // inline fn's parameter scope, whose names would shadow a same-named
     // caller variable the lambda body references. The caller depth was
     // recorded on the current inline-lambda frame at the call site.
-    const splice_caller_depth = b.inlineLambdaCallerDepth();
-    const site_hint = b.inlineLambdaCallerHint();
+    // Located on the frame that SUBSTITUTES this lambda, not the innermost
+    // one: a lambda spliced from inside another spliced lambda body belongs
+    // to the scope it was written in, several inline levels out. Reading the
+    // innermost frame made the window admit the callee's parameter scopes,
+    // so a same-named caller binding (`onError` at two inline levels)
+    // resolved to the wrong closure.
+    const defining_frame = b.definingInlineLambdaFrame(lambda_name, lam);
+    const splice_caller_depth = if (defining_frame) |di|
+        b.inlineLambdaFrameCallerDepth(di)
+    else
+        b.inlineLambdaCallerDepth();
+    const site_hint = if (defining_frame) |di|
+        b.inlineLambdaFrameHint(di)
+    else
+        b.inlineLambdaCallerHint();
     // Collect the enclosing inline fn's param names BEFORE this splice
     // pushes its own (empty-subst) frame — these are the marks to suspend
     // while the caller's body lowers.
@@ -475,6 +502,34 @@ pub fn spliceInlineLambda(
         @min(@as(usize, 1), arg_regs.len)
     else
         @min(params.len, arg_regs.len);
+    // Every argument's type is read BEFORE any parameter binds. The
+    // argument expressions belong to the callee's body scope, and a lambda
+    // parameter that shares a name with something that scope declares
+    // (`forEachIndexed`'s own `index` counter and the user's `index`
+    // parameter) would otherwise have its own source erased by the binding
+    // that consumes it.
+    const arg_tys = try b.allocator.alloc(?ir.TypeRef, bind_n);
+    defer {
+        for (arg_tys) |*t| if (t.*) |*ty| ty.deinit(b.allocator);
+        b.allocator.free(arg_tys);
+    }
+    for (arg_tys, 0..) |*slot, ai| {
+        // An INDEXED argument carries the same element fact the loop
+        // variable does, and half the generated array family invokes its
+        // lambda that way: `ShortArray.indexOfFirst` splices its predicate
+        // at `predicate(this[index])` while `ShortArray.any` splices at
+        // `predicate(element)`. Only the second one bound a type, so every
+        // member call on `it` inside the user's lambda resolved by name for
+        // the indexed half of the family.
+        if (expr_lower.argDeclTypeRefLazy(b, &arg_exprs[ai])) |ty| {
+            slot.* = try ty.clone(b.allocator);
+            continue;
+        }
+        const ae = &arg_exprs[ai];
+        if (ae.* == .Index and ae.Index.args.len == 1) {
+            slot.* = try expr_lower.iterableElementTypeRef(b, ae.Index.receiver);
+        } else slot.* = null;
+    }
     var bi: usize = 0;
     while (bi < bind_n) : (bi += 1) {
         const pname = if (params.len == 0) "it" else params[bi].name;
@@ -485,21 +540,7 @@ pub fn spliceInlineLambda(
         });
         try b.bind(pname, arg_regs[bi]);
         b.clearLocalDeclType(pname);
-        // An INDEXED argument carries the same element fact the loop
-        // variable does, and half the generated array family invokes its
-        // lambda that way: `ShortArray.indexOfFirst` splices its predicate
-        // at `predicate(this[index])` while `ShortArray.any` splices at
-        // `predicate(element)`. Only the second one bound a type, so every
-        // member call on `it` inside the user's lambda resolved by name for
-        // the indexed half of the family.
-        var indexed: ?ir.TypeRef = null;
-        defer if (indexed) |*t| t.deinit(b.allocator);
-        const arg_ty: ?ir.TypeRef = expr_lower.argDeclTypeRefLazy(b, &arg_exprs[bi]) orelse blk: {
-            const ae = &arg_exprs[bi];
-            if (ae.* != .Index or ae.Index.args.len != 1) break :blk null;
-            indexed = try expr_lower.iterableElementTypeRef(b, ae.Index.receiver);
-            break :blk indexed;
-        };
+        const arg_ty: ?ir.TypeRef = arg_tys[bi];
         if (arg_ty) |ty| {
             // A head that is still a bare TYPE PARAMETER names nothing in
             // the receiving scope; committing it only feeds the
@@ -517,11 +558,49 @@ pub fn spliceInlineLambda(
     // Capture the owner splice's localize target *before* pushing the new
     // frame, then duplicate it so restoring does not alias the frame's
     // own snapshot (which the frame frees on pop).
-    const owner_ret: ?[]InlineReturn = if (b.inlineLambdaOwnerReturn()) |o|
+    // The localize target for an unlabeled `return` in this lambda belongs to
+    // the frame the lambda was DEFINED under, for the same reason its free
+    // names do: a `{ _, _, _ -> return null }` spliced several inline levels
+    // in returns from the function that wrote it.
+    const owner_ret: ?[]InlineReturn = if (defining_frame) |di|
+        try b.allocator.dupe(InlineReturn, b.inlineLambdaFrameOwnerReturn(di))
+    else if (b.inlineLambdaOwnerReturn()) |o|
         try b.allocator.dupe(InlineReturn, o)
     else
         null;
-    try b.pushInlineLambdaFrame(std.StringHashMap(*const ast.Expr).init(b.allocator), b.scopeDepth());
+    // The lambda body is CALLER code, so the inline lambda parameters it can
+    // invoke are the CALLER's, inherited from the frame the lambda was
+    // defined under. The inline function's own frame — the one being spliced
+    // into — is skipped, and a name this lambda binds itself shadows the
+    // inherited entry. An empty frame here left a body's call to its own
+    // enclosing inline parameter with no splice, dispatching it by name.
+    var inherited_subst = std.StringHashMap(*const ast.Expr).init(b.allocator);
+    if (defining_frame) |di| {
+        if (di > 0) {
+            var dit = b.inline_lambda_subst.items[di - 1].subst.iterator();
+            inherit: while (dit.next()) |e| {
+                const key = e.key_ptr.*;
+                for (params) |p| {
+                    if (std.mem.eql(u8, p.name, key)) continue :inherit;
+                }
+                if (params.len == 0 and std.mem.eql(u8, key, "it")) continue;
+                // Only a name the skipped frames RE-BIND needs carrying: that
+                // is the collision the empty frame lost. Every other caller
+                // name already resolves through the register window, and
+                // exposing it here would hand an unrelated call to a splice.
+                var shadowed = false;
+                for (b.inline_lambda_subst.items[di..]) |*fr2| {
+                    if (fr2.subst.contains(key)) {
+                        shadowed = true;
+                        break;
+                    }
+                }
+                if (!shadowed) continue;
+                try inherited_subst.put(key, e.value_ptr.*);
+            }
+        }
+    }
+    try b.pushInlineLambdaFrame(inherited_subst, b.scopeDepth());
     const saved = try b.takeInlineReturn();
     if (owner_ret) |o| {
         try b.restoreInlineReturn(o);

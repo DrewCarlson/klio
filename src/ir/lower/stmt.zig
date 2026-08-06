@@ -493,6 +493,9 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             try b.markLocalFn(mangled);
             if (f.receiver_type != null) try b.markLocalExtFn(mangled);
             if (f.params.len != 0) try b.setLocalFnParamTys(mangled, ov_tys);
+            if (f.return_type) |*rt| {
+                try b.setLocalFnReturnTy(mangled, try expr_mod.loweredOwnedLocalTypeRef(b, rt));
+            }
             const receiver_ty = if (f.receiver_type) |*source_receiver|
                 try expr_mod.loweredOwnedLocalTypeRef(b, source_receiver)
             else

@@ -1551,6 +1551,13 @@ pub const Module = struct {
     /// lambda-body path and consumed there to emit the context-load
     /// prologue. Not serialized.
     pending_ctx: ?PendingCtx = null,
+    /// Lowering-only scratch: the DECLARED types of the parameters a
+    /// synthesized parameter thunk is about to bind, parallel to its name
+    /// list. A constructor-delegation argument or a default-value
+    /// expression is lowered in its own builder, which knew the parameter
+    /// NAMES only, so `seed1.inv()` inside `: this(..., seed1.inv(), ...)`
+    /// had no receiver type at all. Not serialized.
+    pending_param_types: ?[]const ?ast.TypeRef = null,
     /// Lowering-only scratch: the implicit label of the argument lambda whose
     /// body is about to lower (`runTest { … }` → "runTest"). The body binds
     /// `this@<label>` to its receiver so a reference from a nested scope — an

@@ -2102,3 +2102,85 @@ test "string_companion_format" {
         \\
     );
 }
+
+test "nested_inline_lambda_same_param_name" {
+    try check("nested_inline_lambda_same_param_name",
+        \\190
+        \\600
+        \\
+    );
+}
+
+test "for_over_progression_element_type" {
+    try check("for_over_progression_element_type",
+        \\15
+        \\abcde
+        \\4
+        \\6420
+        \\
+    );
+}
+
+test "splice_param_shadows_its_own_source" {
+    try check("splice_param_shadows_its_own_source",
+        \\0a1b2c
+        \\x0y1
+        \\
+    );
+}
+
+test "safe_call_scope_function_typing" {
+    try check("safe_call_scope_function_typing",
+        \\[cq]2
+        \\none
+        \\[d]
+        \\none
+        \\[e]
+        \\none
+        \\BC
+        \\
+    );
+}
+
+test "ctor_thunk_param_types" {
+    try check("ctor_thunk_param_types",
+        \\-6
+        \\-111
+        \\ab/AB
+        \\
+    );
+}
+
+test "safe_chain_and_nullable_extension" {
+    try check("safe_chain_and_nullable_extension",
+        \\8
+        \\-1
+        \\-1
+        \\16
+        \\true
+        \\false
+        \\true
+        \\true
+        \\x
+        \\null
+        \\
+    );
+}
+
+test "identity_extension_return" {
+    try check("identity_extension_return",
+        \\ab1
+        \\n=7
+        \\n=2
+        \\n=3
+        \\
+    );
+}
+
+test "local_fun_return_type" {
+    try check("local_fun_return_type",
+        \\4
+        \\[q]
+        \\
+    );
+}

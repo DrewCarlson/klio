@@ -580,6 +580,10 @@ pub const FuncBuilder = struct {
     /// local `val`/`var` of the same name must NOT hijack member-call
     /// syntax.
     local_fns: StringSet,
+    /// A local `fun`'s DECLARED return type, keyed by its mangled binding
+    /// name. A local function is a closure in a cell, not a module function,
+    /// so nothing else can answer what a call to it returns. Owned.
+    local_fn_return_tys: std.StringHashMap(TypeRef),
     /// Per local function: the declared parameter type-name per positional
     /// parameter (an extension's leading `this` is dropped), so a numeric
     /// literal argument can coerce to a Byte/Short/Long/Float/Double parameter
@@ -846,6 +850,7 @@ pub const FuncBuilder = struct {
             .enclosing_members = StringSet.init(allocator),
             .param_names = StringSet.init(allocator),
             .local_fns = StringSet.init(allocator),
+            .local_fn_return_tys = std.StringHashMap(TypeRef).init(allocator),
             .local_fn_param_tys = std.StringHashMap([]const ?[]const u8).init(allocator),
             .local_decl_types = std.StringHashMap(TypeRef).init(allocator),
             .local_decl_nullable = std.StringHashMap(void).init(allocator),
@@ -935,6 +940,11 @@ pub const FuncBuilder = struct {
             self.local_fn_param_tys.deinit();
         }
         self.local_fns.deinit();
+        {
+            var it = self.local_fn_return_tys.valueIterator();
+            while (it.next()) |t| t.deinit(a);
+            self.local_fn_return_tys.deinit();
+        }
         {
             // `mangled` is module-lifetime (it ships in AstLambda
             // captured-name lists); only the builder-owned slices free.
@@ -1085,7 +1095,8 @@ pub const FuncBuilder = struct {
 
     /// The call-site bare-call hint recorded on the innermost inline-lambda
     /// frame, for restoring while a caller lambda's body is spliced.
-    pub fn inlineLambdaCallerHint(self: *const FuncBuilder) ?struct { active: bool, recv: ?[]const u8, this_narrow: ?[]const u8 } {
+    pub const CallerHint = struct { active: bool, recv: ?[]const u8, this_narrow: ?[]const u8 };
+    pub fn inlineLambdaCallerHint(self: *const FuncBuilder) ?CallerHint {
         if (self.inline_lambda_subst.items.len == 0) return null;
         const f = self.inline_lambda_subst.items[self.inline_lambda_subst.items.len - 1];
         return .{ .active = f.caller_hint_active, .recv = f.caller_hint_recv, .this_narrow = f.caller_this_narrow };
@@ -1096,6 +1107,36 @@ pub const FuncBuilder = struct {
     pub fn inlineLambdaCallerDepth(self: *const FuncBuilder) ?usize {
         if (self.inline_lambda_subst.items.len == 0) return null;
         return self.inline_lambda_subst.items[self.inline_lambda_subst.items.len - 1].caller_scope_depth;
+    }
+
+    /// The index of the frame that SUBSTITUTES this exact lambda — the
+    /// outermost holder, since a nested lambda body inherits the same
+    /// binding into the frames above it. That frame's records (caller scope
+    /// depth, call-site hint, substitution map) describe the scope the
+    /// lambda was written in, which is where its free names belong.
+    pub fn definingInlineLambdaFrame(
+        self: *const FuncBuilder,
+        name: []const u8,
+        lam: *const ast.Expr,
+    ) ?usize {
+        for (self.inline_lambda_subst.items, 0..) |*fr, i| {
+            const got = fr.subst.get(name) orelse continue;
+            if (got == lam) return i;
+        }
+        return null;
+    }
+
+    pub fn inlineLambdaFrameCallerDepth(self: *const FuncBuilder, idx: usize) usize {
+        return self.inline_lambda_subst.items[idx].caller_scope_depth;
+    }
+
+    pub fn inlineLambdaFrameOwnerReturn(self: *const FuncBuilder, idx: usize) []const InlineReturn {
+        return self.inline_lambda_subst.items[idx].snapshot;
+    }
+
+    pub fn inlineLambdaFrameHint(self: *const FuncBuilder, idx: usize) CallerHint {
+        const f = self.inline_lambda_subst.items[idx];
+        return .{ .active = f.caller_hint_active, .recv = f.caller_hint_recv, .this_narrow = f.caller_this_narrow };
     }
 
     /// Resolve `name` only in scopes ABOVE `base` — the bindings the
@@ -1128,6 +1169,23 @@ pub const FuncBuilder = struct {
         if (self.inline_lambda_subst.items.len == 0) return null;
         const top = &self.inline_lambda_subst.items[self.inline_lambda_subst.items.len - 1];
         return top.subst.get(name);
+    }
+    /// The substitution frame a spliced lambda was DEFINED under: the frame
+    /// beneath the one that substitutes it. The lambda body is caller code,
+    /// so a call to an inline lambda parameter inside it names the CALLER's
+    /// parameter — `digitAt(index) { this.onError(it) }` invokes the
+    /// enclosing inline function's `onError`, not `digitAt`'s same-named one.
+    /// Located at the OUTERMOST frame holding this exact lambda: the copies
+    /// above it are the same binding carried into nested lambda bodies, and
+    /// taking one of those would hand the lambda back to its own body.
+    pub fn definingInlineLambdaSubst(
+        self: *const FuncBuilder,
+        name: []const u8,
+        lam: *const ast.Expr,
+    ) ?*const std.StringHashMap(*const ast.Expr) {
+        const i = self.definingInlineLambdaFrame(name, lam) orelse return null;
+        if (i == 0) return null;
+        return &self.inline_lambda_subst.items[i - 1].subst;
     }
     /// The `inline_return` snapshot captured when the innermost
     /// inline-lambda frame was pushed — the owner splice's localize
@@ -1971,6 +2029,16 @@ pub const FuncBuilder = struct {
     }
     pub fn isLocalFn(self: *const FuncBuilder, name: []const u8) bool {
         return self.local_fns.contains(name);
+    }
+    /// Takes ownership of `ty`.
+    pub fn setLocalFnReturnTy(self: *FuncBuilder, mangled: []const u8, ty: TypeRef) Allocator.Error!void {
+        if (try self.local_fn_return_tys.fetchPut(mangled, ty)) |old| {
+            var prev = old.value;
+            prev.deinit(self.allocator);
+        }
+    }
+    pub fn localFnReturnTy(self: *const FuncBuilder, mangled: []const u8) ?TypeRef {
+        return self.local_fn_return_tys.get(mangled);
     }
     /// Register one same-named local-fn declaration. Takes ownership of
     /// `ov`'s slices (they must come from this builder's allocator).

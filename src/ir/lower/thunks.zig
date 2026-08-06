@@ -75,6 +75,27 @@ fn cloneOwnMembers(allocator: Allocator, src: *const StringSet) Allocator.Error!
 /// `eval_with` against `module.funcs[id]`.
 /// Emit a contextual property accessor's context-load prologue when the
 /// declaration lowering stashed its context parameters. A no-op otherwise.
+/// Record the declared type of each bound parameter when the declaration
+/// lowering stashed them. A no-op otherwise, so a thunk whose caller knows
+/// no types behaves exactly as before.
+fn consumePendingParamTypes(b: *FuncBuilder, params: []const []const u8) Allocator.Error!void {
+    const types = b.module.pending_param_types orelse return;
+    b.module.pending_param_types = null;
+    for (params, 0..) |name, i| {
+        if (i >= types.len) break;
+        const ty = &(types[i] orelse continue);
+        if (ty.function != null or ty.name.name.len == 0) continue;
+        var lowered = try decl.loweredTypeRef(b.allocator, ty, true);
+        var head = std.mem.trimEnd(u8, lowered.name, "?");
+        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        if (head.len != 0 and head.len <= 2 and std.ascii.isUpper(head[0])) {
+            lowered.deinit(b.allocator);
+            continue;
+        }
+        try b.setLocalDeclTypeOwned(name, lowered);
+    }
+}
+
 fn consumePendingCtx(b: *FuncBuilder) Allocator.Error!void {
     if (b.module.pending_ctx) |pc| {
         b.module.pending_ctx = null;
@@ -190,6 +211,7 @@ pub fn lowerExprAsParamThunkScopedEnclosing(
     var b = try FuncBuilder.init(allocator, module);
     defer b.deinit();
     try bindParams(&b, params);
+    try consumePendingParamTypes(&b, params);
     try consumePendingCtx(&b);
     b.setParamThunk(true);
     if (owner_class) |owner| {

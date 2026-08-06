@@ -5338,6 +5338,42 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             },
             .deferred, .none => {},
         }
+        // The member resolver could not commit, but the ORDINARY call path
+        // has more to try — an inline splice above all. `x?.let { it.f() }`
+        // gives `it` the non-null receiver type in Kotlin; dispatching the
+        // whole thing as a runtime member call gives it none, and every
+        // member call inside the lambda then resolves by name. Rewrite the
+        // proven-non-null branch as a plain call on a temporary that HOLDS
+        // the already-lowered receiver, so nothing is evaluated twice.
+        if (declared_from_expr orelse inferred_ty) |rty| non_null_rewrite: {
+            const nn_name = std.mem.trimEnd(u8, rty.name, "?");
+            if (nn_name.len == 0) break :non_null_rewrite;
+            const tmp_name = try std.fmt.allocPrint(b.allocator, "$nn{d}", .{recv});
+            var tmp_ty = try rty.clone(b.allocator);
+            tmp_ty.nullable = false;
+            b.allocator.free(tmp_ty.name);
+            tmp_ty.name = try b.allocator.dupe(u8, nn_name);
+            try b.pushScope();
+            try b.bind(tmp_name, recv);
+            try b.setLocalDeclTypeOwned(tmp_name, tmp_ty);
+            var segs = [_]ast.Ident{.{ .name = tmp_name, .span = receiver.span() }};
+            var recv_expr = Expr{ .Path = .{ .segments = segs[0..], .span = receiver.span() } };
+            var plain_callee = Expr{ .Member = .{
+                .receiver = &recv_expr,
+                .name = name,
+                .safe = false,
+                .span = callee.span(),
+            } };
+            var plain = expr.Call;
+            plain.callee = &plain_callee;
+            const rewritten = Expr{ .Call = plain };
+            const rv = try lowerCall(b, &rewritten);
+            try b.popScope();
+            try b.push(.{ .Move = .{ .dst = dst, .src = rv } });
+            b.terminate(.{ .Goto = join });
+            b.switchTo(join);
+            return dst;
+        }
         const run = try lowerArgRun(b, args);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
@@ -5865,6 +5901,23 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     return lowerCallGeneral(b, &rewritten);
                 }
                 b.allocator.free(cand);
+            }
+        }
+    }
+
+    // `this.onError(index)` — an inline lambda PARAMETER with a receiver type
+    // (`String.(Int) -> Nothing`) invoked through an explicit `this`. The
+    // qualifier names the lambda's receiver, not a member of it, so this is
+    // the same splice the bare form takes; without the arm the call emitted
+    // a member dispatch that no class declares.
+    if (!is_infix and callee.* == .Member and !callee.Member.safe and
+        callee.Member.receiver.* == .This and callee.Member.receiver.This.qualifier == null)
+    {
+        const lam_name = callee.Member.name.name;
+        if (b.inlineLambdaFor(lam_name)) |lam| {
+            if (!b.hasEnclosingMember(lam_name)) {
+                const recv_reg = try lowerExpr(b, callee.Member.receiver);
+                return try inline_call.spliceInlineLambdaOn(b, lam_name, lam, args, recv_reg);
             }
         }
     }
@@ -8281,7 +8334,7 @@ fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicabi
     // overload selection — the wrap is transparent to the shape.
     const literal_callable = arg.* == .Lambda or arg.* == .AnonFun or
         compose_pass.memoWrappedLambda(@constCast(arg)) != null;
-    return .{
+    const sh: applicability.ArgShape = .{
         .named = name,
         .is_spread = arg.* == .Spread,
         .is_null = arg.* == .NullLit,
@@ -8298,6 +8351,27 @@ fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicabi
         .ty = ty,
         .ty_authoritative = lazy_ty != null,
     };
+    if (runtime.envSetOnce("KLIO_ARGSHAPE_UNK") and
+        sh.ty == null and sh.literal_kind == null and !sh.is_lambda)
+    {
+        noteUnknownArgShape("argshape-unk", arg);
+    }
+    return sh;
+}
+
+/// Diagnostic: which argument SHAPES stay unknown to the applicability
+/// scorer (no type, no literal kind, not callable). Those are the shapes
+/// that make `memberPromotionProven` answer `arg-unauthoritative`, so the
+/// tag histogram names the expression forms worth typing next.
+fn noteUnknownArgShape(tag: []const u8, arg: *const Expr) void {
+    const detail: []const u8 = switch (arg.*) {
+        .Path => |p| if (p.segments.len != 0) p.segments[p.segments.len - 1].name else "-",
+        .Member => |m| m.name.name,
+        .Call => |c| if (c.callee.* == .Member) c.callee.Member.name.name else if (c.callee.* == .Path and c.callee.Path.segments.len != 0) c.callee.Path.segments[c.callee.Path.segments.len - 1].name else "-",
+        .Binary => |bin| @tagName(bin.op),
+        else => "-",
+    };
+    std.debug.print("[{s}] {s} {s}\n", .{ tag, @tagName(arg.*), detail });
 }
 
 /// Literal-kind evidence for an argument: the argument itself is a literal,
@@ -8838,31 +8912,46 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     // per-class property type head is the argument's static type —
     // `visitAncestors(Nodes.Traversable) { }` must resolve against
     // `NodeKind`, not bind the sibling `(mask: Int, ...)` overload.
-    if (arg.* == .Member and !arg.Member.safe) {
+    if (arg.* == .Member) {
         const recv = arg.Member.receiver;
+        // A SAFE read reaches its property through a nullable receiver and
+        // yields a nullable result: look the property up on the non-null
+        // owner and hand the `?` back. A plain read of a nullable receiver
+        // does not type-check at all, so it keeps declining.
+        const safe_read = arg.Member.safe;
         if (recv.* == .Path and recv.Path.segments.len == 1) {
             const owner = recv.Path.segments[0].name;
             if (owner.len != 0 and std.ascii.isUpper(owner[0]) and
                 b.resolve(owner) == null and b.module.classId(owner) != null)
             {
                 if (b.module.registry.class_prop_type_heads.get(.{ .a = owner, .b = arg.Member.name.name })) |head| {
-                    return .{ .name = head, .nullable = false, .args = &.{} };
+                    return .{ .name = head, .nullable = safe_read, .args = &.{} };
                 }
             }
         }
         // Resolve each property segment from its receiver's declared type so
-        // the final member call can use the shared declaration resolver.
-        if (argDeclTypeRefLazy(b, recv)) |receiver_ty| {
-            const owner = typeHead(receiver_ty.name);
+        // the final member call can use the shared declaration resolver. A
+        // receiver that is itself a CALL has no declared type to read; its
+        // resolved return is the same fact one step further along the chain.
+        var owned_recv: ?ir.TypeRef = null;
+        defer if (owned_recv) |*t| t.deinit(b.allocator);
+        const recv_ty_opt: ?ir.TypeRef = argDeclTypeRefLazy(b, recv) orelse blk: {
+            if (recv.* != .Call) break :blk null;
+            owned_recv = (staticCallReturnTypeRef(b, recv) catch null) orelse break :blk null;
+            break :blk owned_recv;
+        };
+        if (recv_ty_opt) |receiver_ty| {
+            if (receiver_ty.nullable and !safe_read) return null;
+            const owner = typeHead(std.mem.trimEnd(u8, receiver_ty.name, "?"));
             const heads = b.module.registry.class_prop_type_heads;
             if (heads.get(.{ .a = owner, .b = arg.Member.name.name })) |head| {
-                return .{ .name = head, .nullable = false, .args = &.{} };
+                return .{ .name = head, .nullable = safe_read, .args = &.{} };
             }
             const chain: []const []const u8 =
                 b.module.registry.class_super_names.get(owner) orelse &.{};
             for (chain) |super_name| {
                 if (heads.get(.{ .a = super_name, .b = arg.Member.name.name })) |head| {
-                    return .{ .name = head, .nullable = false, .args = &.{} };
+                    return .{ .name = head, .nullable = safe_read, .args = &.{} };
                 }
             }
         }
@@ -9181,6 +9270,26 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
             if (std.mem.eql(u8, h, pa.a)) {
                 return try (ir.TypeRef{
                     .name = pa.e,
+                    .nullable = false,
+                    .args = &.{},
+                }).clone(b.allocator);
+            }
+        }
+        // Ranges and progressions carry their element in the CLASS NAME, not
+        // in a type argument, so the `args.len == 1` path below cannot reach
+        // them: `for (i in lastIndex downTo 1)` left `i` untyped and every
+        // call taking `i` unproven.
+        const progressions = [_]struct { p: []const u8, e: []const u8 }{
+            .{ .p = "IntRange", .e = "Int" },               .{ .p = "LongRange", .e = "Long" },
+            .{ .p = "CharRange", .e = "Char" },             .{ .p = "UIntRange", .e = "UInt" },
+            .{ .p = "ULongRange", .e = "ULong" },           .{ .p = "IntProgression", .e = "Int" },
+            .{ .p = "LongProgression", .e = "Long" },       .{ .p = "CharProgression", .e = "Char" },
+            .{ .p = "UIntProgression", .e = "UInt" },       .{ .p = "ULongProgression", .e = "ULong" },
+        };
+        for (progressions) |pr| {
+            if (std.mem.eql(u8, h, pr.p)) {
+                return try (ir.TypeRef{
+                    .name = pr.e,
                     .nullable = false,
                     .args = &.{},
                 }).clone(b.allocator);
@@ -9631,11 +9740,65 @@ fn fnTypedCalleeReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator
     return try ret.clone(b.allocator);
 }
 
+/// The return type of a call whose callee spells a dotted FQN
+/// (`kotlin.math.floor(x)`). The declaration is picked the same way the
+/// emission picks it — exact FQN, matching arity — so the answer is the one
+/// declaration the call runs, never a same-tail namesake in another package.
+fn fqnCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (call_expr.* != .Call) return null;
+    const callee = call_expr.Call.callee;
+    if (callee.* != .Member) return null;
+    const fqn = (try collectDottedFqn(b.allocator, callee)) orelse return null;
+    defer b.allocator.free(fqn);
+    const tail = rsplitLast(fqn, '.');
+    if (std.mem.eql(u8, tail, fqn)) return null;
+    const want = call_expr.Call.args.len;
+    for (b.module.funcsBySimpleName(tail)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (!std.mem.eql(u8, f.fqn, fqn) or f.params.len != want) continue;
+        if (f.return_ty.name.len == 0) return null;
+        const h = typeHead(std.mem.trimEnd(u8, f.return_ty.name, "?"));
+        if (h.len <= 2 and h.len > 0 and std.ascii.isUpper(h[0])) return null;
+        if (staticTypeClassId(b, f.return_ty) == null) return null;
+        return try f.return_ty.clone(b.allocator);
+    }
+    return null;
+}
+
+/// The declared return of a bare call to a LOCAL `fun`. A local function is
+/// lifted under a mangled module name, so the simple-name index cannot answer
+/// for it — `expect("'-'", i) { it == '-' }?.let { ... }` inside `parseIso`
+/// left the whole chain untyped. Only an unambiguous answer is taken: same
+/// return type across every same-named declaration in scope.
+fn localFnReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (call_expr.* != .Call) return null;
+    const callee = call_expr.Call.callee;
+    if (callee.* != .Path or callee.Path.segments.len != 1) return null;
+    const nm = callee.Path.segments[0].name;
+    // A local `fun` is ALSO bound to a register holding its closure, so a
+    // non-null `resolve` says nothing here — the name is the function.
+    if (!b.isLocalFn(nm)) return null;
+    const decls = b.localFnDecls(nm) orelse return null;
+    var agreed: ?ir.TypeRef = null;
+    for (decls) |ov| {
+        const rt = b.localFnReturnTy(ov.mangled) orelse return null;
+        if (rt.name.len == 0 or bareTypeParamHead(rt.name)) return null;
+        if (agreed) |prev| {
+            if (!std.mem.eql(u8, prev.name, rt.name) or prev.nullable != rt.nullable) return null;
+        } else agreed = rt;
+    }
+    const ret = agreed orelse return null;
+    if (staticTypeClassId(b, ret) == null) return null;
+    return try ret.clone(b.allocator);
+}
+
 fn staticCallReturnTypeRef(
     b: *FuncBuilder,
     call_expr: *const Expr,
 ) Allocator.Error!?ir.TypeRef {
     if (try fnTypedCalleeReturnTypeRef(b, call_expr)) |t| return t;
+    if (try fqnCallReturnTypeRef(b, call_expr)) |t| return t;
+    if (try localFnReturnTypeRef(b, call_expr)) |t| return t;
     if (try memberCallReturnTypeRef(b, call_expr)) |t| return t;
     if (try bareMemberReturnTypeRef(b, call_expr)) |t| return t;
     if (call_expr.* == .Binary) {
@@ -14447,10 +14610,15 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
         recv_owned = try staticExprTypeRef(b, recv);
         break :blk recv_owned orelse return null;
     };
-    // A nullable receiver reaches its member through a safe call, which
-    // makes the result nullable too; leave that to the null-aware paths.
-    if (recv_ty.nullable) return null;
-    const recv_head = typeHead(recv_ty.name);
+    // A nullable receiver reaches its member only through a SAFE call, and
+    // then the result is nullable in turn. Written as one, the member is
+    // looked up on the non-null type and the answer carries the `?` back;
+    // written without it the expression does not type-check at all. Without
+    // this the middle of an `a?.self()?.b?.twice()` chain had no type, so
+    // every link after the first resolved by name.
+    const safe_call = call.callee.Member.safe;
+    if (recv_ty.nullable and !safe_call) return null;
+    const recv_head = typeHead(std.mem.trimEnd(u8, recv_ty.name, "?"));
     if (recv_head.len == 0) return null;
 
     const caller_file = exprSpan(recv).file;
@@ -14472,7 +14640,9 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             if (!f.return_ty_declared or f.return_ty.name.len == 0) return null;
             if (bareTypeParamHead(f.return_ty.name)) return null;
             if (staticTypeClassId(b, f.return_ty) == null) return null;
-            return try f.return_ty.clone(b.allocator);
+            var out = try f.return_ty.clone(b.allocator);
+            if (safe_call) out.nullable = true;
+            return out;
         }
     }
 
@@ -14486,6 +14656,24 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             if (!b.module.classIsOrExtends(lexical_owner, owner)) continue;
         }
         const candidate_head = typeHead(f.params[0].ty.name);
+        // An IDENTITY extension returns its own receiver: `fun <T> T.apply(
+        // block: T.() -> Unit): T`. Its declared receiver is a bare type
+        // PARAMETER, so the head filter below never admits it, and its
+        // declared return names nothing on its own — but the receiver
+        // instantiates both. `StringBuilder().apply(builderAction).toString()`
+        // inside `buildString` is the shape: a forwarded lambda argument the
+        // splice cannot take, leaving the chain untyped.
+        if (f.return_ty_declared and bareTypeParamHead(candidate_head) and
+            bareTypeParamHead(f.return_ty.name) and
+            std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, f.return_ty.name, "?")), candidate_head))
+        {
+            const tier_i = b.module.scopeTier(f.fqn, f.package, mname, caller_pkg, caller_file);
+            if (tier_i > 3) continue;
+            if (agreed) |*old| old.deinit(b.allocator);
+            var ident = try recv_ty.clone(b.allocator);
+            ident.nullable = recv_ty.nullable or f.return_ty.nullable;
+            return ident;
+        }
         if (!b.module.classIsOrExtends(recv_head, candidate_head)) continue;
         const tier = b.module.scopeTier(f.fqn, f.package, mname, caller_pkg, caller_file);
         if (tier > 3 or tier > best_tier) continue;
@@ -14516,6 +14704,7 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             ret.deinit(b.allocator);
             return null;
         }
+        if (safe_call) ret.nullable = true;
         return ret.*;
     }
     return null;
@@ -14912,9 +15101,10 @@ fn lowerResolvedMemberCall(
                     .Member => |cm2| cm2.name.name,
                     else => @tagName(std.meta.activeTag(callee.*)),
                 };
-                std.debug.print("[no-recv-callrecv] callee={s} kind={s} call={s} fn={s}\n", .{
+                std.debug.print("[no-recv-callrecv] callee={s} kind={s} why={s} call={s} fn={s}\n", .{
                     cn,
                     @tagName(std.meta.activeTag(callee.*)),
+                    @tagName(classifyCallReturn(b, receiver)),
                     name.name,
                     build.currentRealFn() orelse "-",
                 });
@@ -15036,6 +15226,29 @@ fn lowerResolvedMemberCall(
             }
         }
         if (any_nullable_ext) {
+            // The extension that outranks the member is a DECLARATION like
+            // any other, and Kotlin binds an extension statically — its
+            // receiver rides the leading `this` slot. Resolve it here rather
+            // than handing the whole call to the runtime. Only when the
+            // receiver has not already been lowered, since this path lowers
+            // it itself and a second evaluation would be visible.
+            if (recv_state.reg == null and ast_type_args.len == 0) {
+                if (try lowerResolvedExtensionCall(
+                    b,
+                    receiver,
+                    name,
+                    args,
+                    ast_arg_names,
+                    ast_type_args,
+                    ty,
+                )) |reg| {
+                    lmNote(.bound_static);
+                    return .{ .lowered = reg };
+                }
+            }
+            if (runtime.envOnce("KLIO_NULLEXT_NAMES") != null) {
+                std.debug.print("[nullext] {s}.{s} nargs={d} fn={s}\n", .{ nn_head, name.name, args.len, build.currentRealFn() orelse "-" });
+            }
             lmNote(.nullable_or_generic);
             return .none;
         }
@@ -15272,7 +15485,11 @@ fn lowerResolvedMemberCall(
     // PROOF when every argument is authoritative — the member compatible,
     // every reachable same-name extension refuted (`KLIO_MEMBER_PROMO=0`
     // disables for A/B).
-    if (promo_ext_why != .none and !promo_blocked_by_class and
+    // The stub/value receiver no longer blocks the proof: the runtime
+    // resolves a virtual slot against the receiver's runtime class and
+    // prefers the FQN-keyed intrinsic for host values, which is the same
+    // rule the no-extension branch below already relies on.
+    if (promo_ext_why != .none and
         resolved.dispatch == .deferred and resolved.target != null and
         !std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_PROMO") orelse "1", "0"))
     {
@@ -15295,6 +15512,12 @@ fn lowerResolvedMemberCall(
         } else {
             if (runtime.envOnce("KLIO_PROMO_NAMES") != null) {
                 std.debug.print("[promo-proof] {s}.{s} nargs={d} HELD why={s}\n", .{ head, name.name, args.len, ir.Module.mpp_why });
+                if (std.mem.eql(u8, ir.Module.mpp_why, "arg-unauthoritative")) {
+                    for (shapes, 0..) |sh, i| {
+                        if (sh.ty != null or sh.literal_kind != null or sh.is_lambda) continue;
+                        if (i < args.len) noteUnknownArgShape("promo-unauth", &args[i]);
+                    }
+                }
             }
             // A member REFUTED by an authoritative argument is not the
             // binding at all: fall to the extension path with the
