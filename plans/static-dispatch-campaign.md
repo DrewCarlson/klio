@@ -3463,3 +3463,29 @@ has now cost three attempts and ruled out three hypotheses, which is what it
 is good for, and it cannot rule in the fourth.
 
 That is where this lead stands. It is the honest state, not a conclusion.
+
+## Addendum 83 (2026-08-06): a nullable receiver is not automatically dynamic
+
+`nullable_or_generic` was described as by-design — a receiver with no single
+class. Half of that is right and half was a rule applied too widely.
+
+The rule: an extension declared on `T?` outranks the member, so `x.f()` on a
+nullable `x` cannot bind the member. True — WHERE SUCH AN EXTENSION EXISTS.
+Where the name declares none anywhere in the module, Kotlin has exactly one
+legal target for that call, and it is the member. The gate refused all of
+them.
+
+Checked across the whole module, so a later-loaded pack cannot introduce a
+`T?` extension behind the decision:
+
+    nullable_or_generic  78 -> 2
+    bound                94.35% -> 95.14%
+
+Seventy-six sites, the largest single move since the early channels, and it
+came from re-reading a bucket this plan had written off as by-design rather
+than from finding a new channel. The two that remain are names that DO
+declare a nullable extension, which is the rule working as intended.
+
+Worth stating for the rest of the residue: "by design" was a claim about
+Kotlin's semantics, and it deserves the same measurement as everything else.
+`resolver_declined` (81) is the next bucket carrying that label.

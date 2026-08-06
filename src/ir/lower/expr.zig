@@ -15015,8 +15015,30 @@ fn lowerResolvedMemberCall(
     // different: its member runs on the non-null branch, which is exactly the
     // receiver a member declaration expects.
     if (ty.nullable and !recv_state.non_null) {
-        lmNote(.nullable_or_generic);
-        return .none;
+        // ...unless no such extension EXISTS. The rule above is about an
+        // extension on `T?` outranking the member; where the name declares
+        // none, Kotlin has only one legal target for `x.f()` on a nullable
+        // `x` — the member — and the call binds to it. Checked across the
+        // whole module, so a later-loaded pack cannot introduce one behind
+        // this decision.
+        const nn_head = typeHead(std.mem.trimEnd(u8, ty.name, "?"));
+        var any_nullable_ext = false;
+        for (b.module.funcsBySimpleName(name.name)) |fid| {
+            const f = b.module.funcById(fid) orelse continue;
+            if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+            if (!f.params[0].ty.nullable) continue;
+            const eh = typeHead(std.mem.trimEnd(u8, f.params[0].ty.name, "?"));
+            if (eh.len == 0 or std.mem.eql(u8, eh, nn_head) or
+                b.module.classIsOrExtends(nn_head, eh))
+            {
+                any_nullable_ext = true;
+                break;
+            }
+        }
+        if (any_nullable_ext) {
+            lmNote(.nullable_or_generic);
+            return .none;
+        }
     }
     const recv_ty = if (ty.nullable)
         TypeRef{ .name = std.mem.trimEnd(u8, ty.name, "?"), .nullable = false, .args = ty.args }
