@@ -1939,6 +1939,19 @@ test "numeric_promotion_receiver" {
     );
 }
 
+test "indexed_splice_lambda_param" {
+    try check("indexed_splice_lambda_param",
+        \\1
+        \\1
+        \\1
+        \\1
+        \\1
+        \\1
+        \\0
+        \\
+    );
+}
+
 test "string_companion_format" {
     try check("string_companion_format",
         \\a/3/1.50

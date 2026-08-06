@@ -2843,3 +2843,42 @@ Standing rule this produced: **the census is the only authority on what is
 unbound.** An instrument that counts a lowering-internal table's misses
 measures the table, not dispatch. Addenda 61-64 each spent a unit on a
 channel this probe pointed at; all three measured flat or negative.
+
+## Addendum 66 (2026-08-06): the indexed half of the array family lost its `it`
+
+`it` is the single largest name in the whole unbound residue — 57 of 508
+sites, 11%. The cause is one line in the inline-lambda splice.
+
+An inline function invokes its lambda parameter in one of two ways, and the
+generated array family is split almost evenly between them:
+
+    ShortArray.any        →  predicate(element)        // a loop variable
+    ShortArray.indexOfFirst →  predicate(this[index])  // an indexed read
+
+`spliceInlineLambda` types the spliced lambda's parameter from the ARGUMENT
+expression, through `argDeclTypeRefLazy`. That handles the loop variable and
+nothing else, so `any { it.toInt() }` bound its member call and
+`indexOfFirst { it.toInt() }` did not — a difference with no reason behind
+it, visible in the census as the whole unsigned-array block
+(`toUShort`/`toULong`/`toUInt`/`toUByte` under indexOfFirst/indexOfLast),
+which reaches the same code through `storage.indexOfFirst { … }`.
+
+The fix gives an indexed argument the element type its receiver iterates,
+reusing `iterableElementTypeRef` — so `Map` declines on its own, wanting one
+type argument where a map has two.
+
+    no_receiver_type 508 -> 488     bound 92.73% -> 92.93%
+
+The 20 sites do not move to a bound bucket, they leave the census entirely:
+with the receiver typed, those calls resolve to primitive/intrinsic paths
+that never register a dispatch site at all.
+
+Two false starts worth recording, both from the same mistake — patching the
+channel a probe named instead of the one the code path calls:
+
+  * A `.Index` arm on `staticExprTypeRef` measured EXACTLY flat. The splice
+    site does not call it; it calls `argDeclTypeRefLazy`.
+  * `KLIO_ALPT` appeared to show the call resolving to `IntArray`/`LongArray`
+    receivers for a `ShortArray` call. A clean re-run showed one line,
+    `recv=ShortArray a0=Short` — resolution was right all along, and the
+    loss was strictly downstream in the splice.

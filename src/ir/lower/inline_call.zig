@@ -485,7 +485,22 @@ pub fn spliceInlineLambda(
         });
         try b.bind(pname, arg_regs[bi]);
         b.clearLocalDeclType(pname);
-        if (expr_lower.argDeclTypeRefLazy(b, &arg_exprs[bi])) |ty| {
+        // An INDEXED argument carries the same element fact the loop
+        // variable does, and half the generated array family invokes its
+        // lambda that way: `ShortArray.indexOfFirst` splices its predicate
+        // at `predicate(this[index])` while `ShortArray.any` splices at
+        // `predicate(element)`. Only the second one bound a type, so every
+        // member call on `it` inside the user's lambda resolved by name for
+        // the indexed half of the family.
+        var indexed: ?ir.TypeRef = null;
+        defer if (indexed) |*t| t.deinit(b.allocator);
+        const arg_ty: ?ir.TypeRef = expr_lower.argDeclTypeRefLazy(b, &arg_exprs[bi]) orelse blk: {
+            const ae = &arg_exprs[bi];
+            if (ae.* != .Index or ae.Index.args.len != 1) break :blk null;
+            indexed = try expr_lower.iterableElementTypeRef(b, ae.Index.receiver);
+            break :blk indexed;
+        };
+        if (arg_ty) |ty| {
             // A head that is still a bare TYPE PARAMETER names nothing in
             // the receiving scope; committing it only feeds the
             // no_class_id bucket and disproves candidates a null leaves
