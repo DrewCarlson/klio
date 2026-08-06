@@ -2150,3 +2150,19 @@ test "ctor_thunk_param_types" {
         \\
     );
 }
+
+test "safe_chain_and_nullable_extension" {
+    try check("safe_chain_and_nullable_extension",
+        \\8
+        \\-1
+        \\-1
+        \\16
+        \\true
+        \\false
+        \\true
+        \\true
+        \\x
+        \\null
+        \\
+    );
+}

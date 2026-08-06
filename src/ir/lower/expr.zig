@@ -8912,31 +8912,46 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     // per-class property type head is the argument's static type —
     // `visitAncestors(Nodes.Traversable) { }` must resolve against
     // `NodeKind`, not bind the sibling `(mask: Int, ...)` overload.
-    if (arg.* == .Member and !arg.Member.safe) {
+    if (arg.* == .Member) {
         const recv = arg.Member.receiver;
+        // A SAFE read reaches its property through a nullable receiver and
+        // yields a nullable result: look the property up on the non-null
+        // owner and hand the `?` back. A plain read of a nullable receiver
+        // does not type-check at all, so it keeps declining.
+        const safe_read = arg.Member.safe;
         if (recv.* == .Path and recv.Path.segments.len == 1) {
             const owner = recv.Path.segments[0].name;
             if (owner.len != 0 and std.ascii.isUpper(owner[0]) and
                 b.resolve(owner) == null and b.module.classId(owner) != null)
             {
                 if (b.module.registry.class_prop_type_heads.get(.{ .a = owner, .b = arg.Member.name.name })) |head| {
-                    return .{ .name = head, .nullable = false, .args = &.{} };
+                    return .{ .name = head, .nullable = safe_read, .args = &.{} };
                 }
             }
         }
         // Resolve each property segment from its receiver's declared type so
-        // the final member call can use the shared declaration resolver.
-        if (argDeclTypeRefLazy(b, recv)) |receiver_ty| {
-            const owner = typeHead(receiver_ty.name);
+        // the final member call can use the shared declaration resolver. A
+        // receiver that is itself a CALL has no declared type to read; its
+        // resolved return is the same fact one step further along the chain.
+        var owned_recv: ?ir.TypeRef = null;
+        defer if (owned_recv) |*t| t.deinit(b.allocator);
+        const recv_ty_opt: ?ir.TypeRef = argDeclTypeRefLazy(b, recv) orelse blk: {
+            if (recv.* != .Call) break :blk null;
+            owned_recv = (staticCallReturnTypeRef(b, recv) catch null) orelse break :blk null;
+            break :blk owned_recv;
+        };
+        if (recv_ty_opt) |receiver_ty| {
+            if (receiver_ty.nullable and !safe_read) return null;
+            const owner = typeHead(std.mem.trimEnd(u8, receiver_ty.name, "?"));
             const heads = b.module.registry.class_prop_type_heads;
             if (heads.get(.{ .a = owner, .b = arg.Member.name.name })) |head| {
-                return .{ .name = head, .nullable = false, .args = &.{} };
+                return .{ .name = head, .nullable = safe_read, .args = &.{} };
             }
             const chain: []const []const u8 =
                 b.module.registry.class_super_names.get(owner) orelse &.{};
             for (chain) |super_name| {
                 if (heads.get(.{ .a = super_name, .b = arg.Member.name.name })) |head| {
-                    return .{ .name = head, .nullable = false, .args = &.{} };
+                    return .{ .name = head, .nullable = safe_read, .args = &.{} };
                 }
             }
         }
@@ -14567,10 +14582,15 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
         recv_owned = try staticExprTypeRef(b, recv);
         break :blk recv_owned orelse return null;
     };
-    // A nullable receiver reaches its member through a safe call, which
-    // makes the result nullable too; leave that to the null-aware paths.
-    if (recv_ty.nullable) return null;
-    const recv_head = typeHead(recv_ty.name);
+    // A nullable receiver reaches its member only through a SAFE call, and
+    // then the result is nullable in turn. Written as one, the member is
+    // looked up on the non-null type and the answer carries the `?` back;
+    // written without it the expression does not type-check at all. Without
+    // this the middle of an `a?.self()?.b?.twice()` chain had no type, so
+    // every link after the first resolved by name.
+    const safe_call = call.callee.Member.safe;
+    if (recv_ty.nullable and !safe_call) return null;
+    const recv_head = typeHead(std.mem.trimEnd(u8, recv_ty.name, "?"));
     if (recv_head.len == 0) return null;
 
     const caller_file = exprSpan(recv).file;
@@ -14592,7 +14612,9 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             if (!f.return_ty_declared or f.return_ty.name.len == 0) return null;
             if (bareTypeParamHead(f.return_ty.name)) return null;
             if (staticTypeClassId(b, f.return_ty) == null) return null;
-            return try f.return_ty.clone(b.allocator);
+            var out = try f.return_ty.clone(b.allocator);
+            if (safe_call) out.nullable = true;
+            return out;
         }
     }
 
@@ -14636,6 +14658,7 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             ret.deinit(b.allocator);
             return null;
         }
+        if (safe_call) ret.nullable = true;
         return ret.*;
     }
     return null;
@@ -15157,6 +15180,29 @@ fn lowerResolvedMemberCall(
             }
         }
         if (any_nullable_ext) {
+            // The extension that outranks the member is a DECLARATION like
+            // any other, and Kotlin binds an extension statically — its
+            // receiver rides the leading `this` slot. Resolve it here rather
+            // than handing the whole call to the runtime. Only when the
+            // receiver has not already been lowered, since this path lowers
+            // it itself and a second evaluation would be visible.
+            if (recv_state.reg == null and ast_type_args.len == 0) {
+                if (try lowerResolvedExtensionCall(
+                    b,
+                    receiver,
+                    name,
+                    args,
+                    ast_arg_names,
+                    ast_type_args,
+                    ty,
+                )) |reg| {
+                    lmNote(.bound_static);
+                    return .{ .lowered = reg };
+                }
+            }
+            if (runtime.envOnce("KLIO_NULLEXT_NAMES") != null) {
+                std.debug.print("[nullext] {s}.{s} nargs={d} fn={s}\n", .{ nn_head, name.name, args.len, build.currentRealFn() orelse "-" });
+            }
             lmNote(.nullable_or_generic);
             return .none;
         }
