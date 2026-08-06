@@ -138,6 +138,22 @@ fn sideTableKey(fqn: ?[]const u8, name: []const u8) []const u8 {
     return if (f.len != 0) f else name;
 }
 
+/// The static argument heads the current construction site supplied, set by
+/// the eval arm and consumed ONCE: a delegation or a default thunk builds
+/// further instances underneath and must rank on its own terms.
+threadlocal var ctor_static_heads: ?[]const ?[]const u8 = null;
+
+pub fn setCtorArgStaticHeads(self: *VmHost, heads: []const ?[]const u8) void {
+    _ = self;
+    ctor_static_heads = if (heads.len == 0) null else heads;
+}
+
+fn takeCtorStaticHeads() ?[]const ?[]const u8 {
+    const v = ctor_static_heads;
+    ctor_static_heads = null;
+    return v;
+}
+
 fn secondaryCtors(self: *VmHost, fqn: ?[]const u8, name: []const u8) []const root.build.SecondaryCtorEntry {
     const g = self.prog.borrow();
     defer g.deinit();
@@ -254,9 +270,24 @@ fn builtinTypeKind(head: []const u8) u8 {
 fn scoreCtorHeads(self: *VmHost, heads: []const []const u8, args: []const Value) ?i32 {
     var score: i32 = 0;
     var i: usize = 0;
+    const static_heads = ctor_static_heads;
     while (i < args.len and i < heads.len) : (i += 1) {
         const declared = heads[i];
         const got = valueTypeHead(args[i]);
+        // The argument's DECLARED head, where the call site knew one. An
+        // interpreted instance reports no class of its own at run time, so
+        // this is the only evidence that can tell a subtype argument from a
+        // supertype-typed one — which is what Kotlin selects on.
+        if (static_heads) |sh| {
+            if (i < sh.len) {
+                if (sh[i]) |declared_arg| {
+                    if (std.mem.eql(u8, declared, declared_arg)) {
+                        score += 2;
+                        continue;
+                    }
+                }
+            }
+        }
         if (std.mem.eql(u8, declared, got)) {
             score += 2;
             continue;
@@ -1848,7 +1879,13 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
         }
     }
 
-    // Secondary-ctor dispatch.
+    // Secondary-ctor dispatch. The construction site's static argument heads
+    // are consumed here and re-installed only across the two ranking regions
+    // below, so nothing evaluated underneath (a delegation, a default) ranks
+    // against this site's types.
+    const site_heads = takeCtorStaticHeads();
+    ctor_static_heads = site_heads;
+    defer ctor_static_heads = null;
     const zero_primary_secondary = n_primary_initial == 0 and blk: {
         for (secondaryCtors(self, classDefFqn(class_def), class_name)) |e| {
             if (e.param_count == args.len) break :blk true;
@@ -1885,6 +1922,7 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
     };
     const shell_guarded = ctorGuardContains(class_name);
     if (!shell_guarded and (args.len != n_primary_initial or zero_primary_secondary or same_arity_secondary_better)) {
+        ctor_static_heads = site_heads;
         if (try dispatchSecondaryCtor(self, allocator, class, class_def, args, outer_hint)) |res| {
             return res;
         }
@@ -2050,6 +2088,9 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
     const class_name = classDefName(class_def);
     const entries = secondaryCtors(self, classDefFqn(class_def), class_name);
     var chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(self, entries, args);
+    // Everything below constructs further values; the site's static heads
+    // describe THIS call's arguments only.
+    ctor_static_heads = null;
     if (chosen == null) {
         for (entries) |e| {
             // A hidden binary-compat constructor must not swallow an

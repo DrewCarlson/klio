@@ -2489,6 +2489,79 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 /// parameter property) walked over the owner's supertype chain. Null when the
 /// name has no statically known type here (an untyped local, an outer
 /// capture, or a name the enclosing class does not declare as a typed member).
+/// The full declared TYPE of a bare name that reads a property of the
+/// enclosing class or the extension receiver — the argument-carrying half of
+/// `staticBareReceiverType`. Only recorded for a property whose declared
+/// type has arguments that name real classes, so a `null` here simply means
+/// the head-only answer stands.
+/// A class property's FULL declared type, following the supertype chain the
+/// head lookup follows.
+fn propTypeRefOn(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?ir.TypeRef {
+    if (b.module.registry.class_prop_type_refs.get(.{ .a = owner, .b = name })) |t| return t;
+    const chain: []const []const u8 = b.module.registry.class_super_names.get(owner) orelse &.{};
+    for (chain) |cls| {
+        if (b.module.registry.class_prop_type_refs.get(.{ .a = cls, .b = name })) |t| return t;
+    }
+    return null;
+}
+
+/// A declared property type with the OWNER's type parameters replaced by the
+/// receiver's own type arguments. Null when any argument stays a parameter —
+/// a partial answer says nothing the head does not already say.
+fn substitutedPropType(
+    b: *FuncBuilder,
+    owner: []const u8,
+    recv_ty: ir.TypeRef,
+    declared: ir.TypeRef,
+) ?ir.TypeRef {
+    if (declared.args.len == 0) return declared;
+    if (recv_ty.args.len == 0) return null;
+    const cid = b.module.uniqueClassIdBySimpleName(owner) orelse
+        b.module.classIdByFqn(owner) orelse return null;
+    if (cid.int() >= b.module.classes.items.len) return null;
+    const tps = b.module.classes.items[cid.int()].type_params;
+    if (tps.len == 0 or tps.len != recv_ty.args.len) return null;
+    var buf: [4]ir.TypeRef = undefined;
+    if (declared.args.len > buf.len) return null;
+    for (declared.args, 0..) |darg, i| {
+        const dh = typeHead(std.mem.trimEnd(u8, darg.name, "?"));
+        var found = false;
+        for (tps, 0..) |tp, j| {
+            if (!std.mem.eql(u8, tp, dh)) continue;
+            const sub = recv_ty.args[j];
+            if (sub.name.len == 0 or std.mem.eql(u8, sub.name, "*")) return null;
+            if (bareTypeParamHead(sub.name)) return null;
+            buf[i] = sub;
+            found = true;
+            break;
+        }
+        if (!found) {
+            if (bareTypeParamHead(darg.name)) return null;
+            buf[i] = darg;
+        }
+    }
+    const owned = b.allocator.dupe(ir.TypeRef, buf[0..declared.args.len]) catch return null;
+    return ir.TypeRef{ .name = declared.name, .nullable = declared.nullable, .args = owned };
+}
+
+fn staticBareReceiverTypeRef(b: *const FuncBuilder, recv_name: []const u8) ?ir.TypeRef {
+    const self_shadowed = init_self_name != null and std.mem.eql(u8, init_self_name.?, recv_name);
+    if (!self_shadowed) {
+        if (b.resolve(recv_name) != null) return null;
+        if (b.knowsOuter(recv_name)) return null;
+    }
+    const owner = b.ownerClass() orelse blk: {
+        const head = b.recvTy() orelse b.spliceRecvTy() orelse return null;
+        break :blk typeHead(std.mem.trimEnd(u8, head, "?"));
+    };
+    if (b.module.registry.class_prop_type_refs.get(.{ .a = owner, .b = recv_name })) |t| return t;
+    const chain: []const []const u8 = b.module.registry.class_super_names.get(owner) orelse &.{};
+    for (chain) |cls| {
+        if (b.module.registry.class_prop_type_refs.get(.{ .a = cls, .b = recv_name })) |t| return t;
+    }
+    return null;
+}
+
 fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const u8 {
     // Inside `val writer = writer`'s initializer the local's own name is
     // free (recorded at the decl), so the reference is the enclosing
@@ -6528,6 +6601,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     .args = run[0],
                     .n_args = run[1],
                     .arg_names = arg_names,
+                    .arg_static_heads = try ctorArgStaticHeads(b, args),
                 } });
             } else {
                 const this_idx = try b.recordCapture("this");
@@ -8701,6 +8775,13 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             var h = std.mem.trimEnd(u8, rt.name, "?");
             if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
             const head = typeHead(h);
+            // The property's FULL declared type, with the owner's type
+            // parameters substituted from the receiver's own arguments:
+            // `Map<K, V>.values` read off a `Map<String, Named>` is a
+            // `Collection<Named>`, and iterating it needs the element.
+            if (propTypeRefOn(b, head, m.name.name)) |declared| {
+                if (substitutedPropType(b, head, rt, declared)) |full| return full;
+            }
             if (propTypeHeadOn(b, head, m.name.name) orelse
                 extPropReturnHead(b, head, m.name.name)) |ph|
             {
@@ -9055,6 +9136,9 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             }
         }
     }
+    // The full declared type wins over its head: `items[0].tag()` and
+    // `for (i in items)` need the ARGUMENTS the head throws away.
+    if (staticBareReceiverTypeRef(b, p.segments[0].name)) |full| return full;
     if (staticBareReceiverType(b, p.segments[0].name)) |head| {
         return .{ .name = head, .nullable = false, .args = &.{} };
     }
@@ -9071,6 +9155,7 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (b.resolve(nm) == null and !b.knowsOuter(nm) and !enclosingHasMemberNamed(b, nm)) {
         const file = p.segments[0].span.file;
         const pkg = b.module.packageOfFile(file) orelse b.self_package;
+        if (b.module.topLevelPropTypeRef(nm, pkg, file)) |full| return full;
         if (b.module.topLevelPropTypeHead(nm, pkg, file)) |head| {
             return .{ .name = head, .nullable = false, .args = &.{} };
         }
@@ -9298,8 +9383,25 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
     }
     if (ty.args.len != 1) return null;
     const elem = ty.args[0].name;
-    if (elem.len == 0 or ty.args[0].nullable) return null;
-    if (elem.len <= 2 and std.ascii.isUpper(elem[0])) return null;
+    if (elem.len == 0) return null;
+    // A STAR projection's element is `Any?` — the projection's own upper
+    // bound, which is what Kotlin resolves a call on it against.
+    // `Collection<*>` is how the stdlib's own `orderedHashCode` and
+    // `unorderedHashCode` take their argument, and their loop variables had
+    // no type at all.
+    if (std.mem.eql(u8, elem, "*")) {
+        return try (ir.TypeRef{ .name = "Any", .nullable = true, .args = &.{} }).clone(b.allocator);
+    }
+    if (ty.args[0].nullable) return null;
+    // A bare type-PARAMETER element is carried, not discarded, when the
+    // scope records a bound for it: a generic body is lowered once with no
+    // call site to read an instantiation from, and its parameter's declared
+    // upper bound is what Kotlin resolves such a call against. Without a
+    // bound record the head still names nothing and the old answer stands.
+    if (elem.len <= 2 and std.ascii.isUpper(elem[0])) {
+        if (b.typeParamBound(elem) == null) return null;
+        return try ty.args[0].clone(b.allocator);
+    }
     var head = elem;
     if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (b.module.classIdByFqn(head) == null and
@@ -14269,6 +14371,7 @@ fn lowerFqnCtorCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg {
         .args = run[0],
         .n_args = run[1],
         .arg_names = arg_names,
+        .arg_static_heads = try ctorArgStaticHeads(b, args),
     } });
     return dst;
 }
@@ -14596,6 +14699,35 @@ fn memberCallArgArities(b: *FuncBuilder, receiver: *const Expr, mname: []const u
 /// A declared return is evidence only when it NAMES something: a bare type
 /// parameter (`fun <R> map(...): R`) resolves to no class, and committing to
 /// it disproves candidates a null type leaves open.
+/// The type the RECEIVER gives one of the owner class's type parameters.
+/// `List<E>.get` on a `List<Named>` receiver substitutes `E` := Named. Only
+/// the direct-instantiation case is taken — the receiver's head IS the
+/// declaring class, so the arguments line up positionally.
+fn ownerTypeParamSubstitution(
+    b: *FuncBuilder,
+    member_fid: FuncId,
+    recv_ty: ir.TypeRef,
+    ret_name: []const u8,
+) ?ir.TypeRef {
+    if (recv_ty.args.len == 0) return null;
+    const ds = b.module.decl_sigs.get(member_fid.int()) orelse return null;
+    const oid = ds.enclosing_class orelse return null;
+    if (oid.int() >= b.module.classes.items.len) return null;
+    const ocls = &b.module.classes.items[oid.int()];
+    const recv_head = typeHead(std.mem.trimEnd(u8, recv_ty.name, "?"));
+    if (!std.mem.eql(u8, ocls.name, recv_head)) return null;
+    if (ocls.type_params.len != recv_ty.args.len) return null;
+    const rh = typeHead(std.mem.trimEnd(u8, ret_name, "?"));
+    for (ocls.type_params, 0..) |tp, i| {
+        if (!std.mem.eql(u8, tp, rh)) continue;
+        const arg = recv_ty.args[i];
+        if (arg.name.len == 0 or std.mem.eql(u8, arg.name, "*")) return null;
+        if (bareTypeParamHead(arg.name)) return null;
+        return arg;
+    }
+    return null;
+}
+
 fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
     if (call_expr.* != .Call) return null;
     const call = call_expr.Call;
@@ -14638,7 +14770,21 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             // An expression body with no annotation records `Unit` as a
             // PLACEHOLDER, so an undeclared return is not a fact.
             if (!f.return_ty_declared or f.return_ty.name.len == 0) return null;
-            if (bareTypeParamHead(f.return_ty.name)) return null;
+            // A generic member returns one of its OWNER's type parameters:
+            // `List<E>.get(index): E` on a `List<Named>` receiver returns
+            // Named, and the receiver now carries the arguments that say so.
+            // The member stays the declaration — Kotlin picks it over any
+            // extension — this only names what it returns.
+            if (bareTypeParamHead(f.return_ty.name)) {
+                const sub = ownerTypeParamSubstitution(b, fid, recv_ty, f.return_ty.name) orelse return null;
+                var out_sub = try sub.clone(b.allocator);
+                if (safe_call or f.return_ty.nullable) out_sub.nullable = true;
+                if (staticTypeClassId(b, out_sub) == null) {
+                    out_sub.deinit(b.allocator);
+                    return null;
+                }
+                return out_sub;
+            }
             if (staticTypeClassId(b, f.return_ty) == null) return null;
             var out = try f.return_ty.clone(b.allocator);
             if (safe_call) out.nullable = true;
@@ -14875,12 +15021,12 @@ fn declineNote(k: DeclineKind) void {
     if (norecvCensusOn()) lm_decline[@intFromEnum(k)] += 1;
 }
 
-/// Why a `target_known_deferred` site did NOT get promoted to a real dispatch.
-/// The identity is proven at every one of these; each variant names the
-/// conservatism that still holds it back.
+/// Why a `target_known_deferred` site had to ASK the extension question at
+/// all — the identity is proven at every one of these. Most go on to be
+/// promoted by the proof; the variant names which reachable extension the
+/// proof then has to refute. Counted before the proof runs, so this total
+/// is larger than `resolver_declined`.
 pub const PromoBlock = enum(u8) {
-    /// A stub or value receiver class: host-backed, with no vtable to index.
-    receiver_not_instance,
     /// An extension whose receiver is a TYPE PARAMETER declares this name, so
     /// the index cannot say which receivers it serves. The blunt one.
     ext_generic_receiver,
@@ -15087,6 +15233,46 @@ fn lowerResolvedMemberCall(
             if (std.mem.eql(u8, wanted, name.name)) {
                 std.debug.print("[member-static] {s} recv=<unknown>\n", .{name.name});
             }
+        }
+        // A call every value answers, on a receiver nothing could name.
+        // `toString()` and `hashCode()` are declared as `Any?` EXTENSIONS in
+        // the stdlib, and those are what Kotlin binds when the receiver may
+        // be null; for a non-null receiver they delegate to the member, so
+        // the observable result is the same either way. Only a UNIQUE `Any?`
+        // extension of that name and arity is taken, so a same-named
+        // declaration on a real type can never be reached through here.
+        if (recv_state.reg == null and ast_type_args.len == 0) {
+            if (args.len == 0 and allNull(ast_arg_names)) {
+                if (uniqueAnyNullableExtension(b, name.name, args.len)) |fid| {
+                    const recv_slot = b.allocReg();
+                    const rv = try lowerExpr(b, receiver);
+                    try b.push(.{ .Move = .{ .dst = recv_slot, .src = rv } });
+                    const dst = b.allocReg();
+                    try b.push(.{ .Call = .{
+                        .dst = dst,
+                        .func = fid,
+                        .trailing_lambda = false,
+                        .args = recv_slot,
+                        .n_args = 1,
+                        .arg_names = &.{},
+                        .type_args = &.{},
+                        .exact = true,
+                    } });
+                    lmNote(.bound_static);
+                    return .{ .lowered = dst };
+                }
+            }
+        }
+        // A call whose only declaration is a UNIVERSAL INLINE extension —
+        // `fun <T, R> T.let(block: (T) -> R): R` and its family — is not a
+        // dispatch at all: the body is spliced at this site whatever the
+        // receiver turns out to be. Verified with `KLIO_MISS_TRACE=let`,
+        // which reports no runtime miss for an untyped receiver. Counting
+        // it against the receiver-typing residue measured work that does
+        // not exist.
+        if (uniqueUniversalInlineExtension(b, name.name, args.len) != null) {
+            lmNote(.bound_static);
+            return .none;
         }
         lmNote(.no_receiver_type);
         if (!norecvCensusOn()) return .none;
@@ -15302,6 +15488,18 @@ fn lowerResolvedMemberCall(
             owner_id = nestedClassIdAtLexicalSite(b, head);
         }
     }
+    // A head shaped like a type PARAMETER that names no class and carries no
+    // bound record in this scope is still a type parameter — one declared by
+    // an enclosing generic the body does not have in scope (`Map.Entry<K, V>`
+    // read inside `AbstractMap.Companion.entryHashCode`). Kotlin's floor for
+    // any type parameter is `Any?`, and a call on it can only target a member
+    // of that floor, so resolve there rather than giving up on the receiver.
+    if (owner_id == null and head.len != 0 and head.len <= 2 and
+        std.ascii.isUpper(head[0]) and b.module.classId(head) == null)
+    {
+        owner_id = b.module.uniqueClassIdBySimpleName("Any") orelse
+            b.module.classIdByFqn("kotlin.Any");
+    }
     var static_owner = owner_id orelse {
         lmNote(.no_class_id);
         if (norecvCensusOn()) {
@@ -15438,17 +15636,6 @@ fn lowerResolvedMemberCall(
     // conservative — a generic-receiver extension, a supertype's extension, or a
     // stale index all answer yes — so a `false` means nothing else could bind
     // and the member's identity is sufficient.
-    //
-    // Restricted to a receiver whose values are real interpreted instances. A
-    // stub or value class is host-backed and has no vtable to index. An
-    // INTERFACE receiver is allowed: it can hold a host-backed value (a
-    // `Sequence` is a generator, not an `Instance`), and `invokeVirtualMember`
-    // resolves the slot against such a value's runtime class instead of
-    // requiring an `Instance`.
-    const promo_blocked_by_class = resolved.dispatch == .deferred and resolved.target != null and
-        (static_owner.int() >= b.module.classes.items.len or
-            b.module.classes.items[static_owner.int()].is_stub or
-            b.module.classes.items[static_owner.int()].is_value);
     // Computed for stub/value receivers too: their direct-dispatch escape
     // below still requires the extension-shadow question answered — String
     // and the unsigned shells carry extension families everywhere.
@@ -15467,12 +15654,7 @@ fn lowerResolvedMemberCall(
                 head, name.name, args.len, typed_args, @tagName(promo_ext_why),
             });
         }
-        if (promo_blocked_by_class) {
-            lm_promo[@intFromEnum(PromoBlock.receiver_not_instance)] += 1;
-            if (runtime.envOnce("KLIO_PROMO_NAMES") != null) {
-                std.debug.print("[promo-class] {s}.{s} nargs={d} why={s}\n", .{ head, name.name, args.len, @tagName(promo_ext_why) });
-            }
-        } else switch (promo_ext_why) {
+        switch (promo_ext_why) {
             .none => {},
             .index_stale => lm_promo[@intFromEnum(PromoBlock.ext_index_stale)] += 1,
             .generic_receiver => lm_promo[@intFromEnum(PromoBlock.ext_generic_receiver)] += 1,
@@ -15811,6 +15993,81 @@ fn lowerMemberExtensionDispatchReceiver(
         .qualifier = qualifier,
     } });
     return dst;
+}
+
+/// The DECLARED type head of each argument, interned, for a construction
+/// site. Kotlin picks a constructor overload from the STATIC types; an
+/// interpreted instance carries no class name the runtime ranking can read,
+/// so without this a subtype argument could not outrank a supertype slot.
+/// Null where lowering has no declared type — the runtime keeps its own
+/// value-shaped ranking for those slots.
+fn ctorArgStaticHeads(b: *FuncBuilder, args: []const Expr) Allocator.Error![]?ir.ConstId {
+    const out = try b.allocator.alloc(?ir.ConstId, args.len);
+    errdefer b.allocator.free(out);
+    var any = false;
+    for (args, 0..) |*a, i| {
+        out[i] = null;
+        const ty = argDeclTypeRef(b, a) orelse continue;
+        var h = typeHead(std.mem.trimEnd(u8, ty.name, "?"));
+        if (std.mem.lastIndexOfScalar(u8, h, '.')) |d| h = h[d + 1 ..];
+        if (h.len == 0 or bareTypeParamHead(h)) continue;
+        out[i] = try b.module.internConst(b.allocator, .{ .String = h });
+        any = true;
+    }
+    if (!any) {
+        b.allocator.free(out);
+        return &.{};
+    }
+    return out;
+}
+
+/// The one extension of this name and arity whose declared receiver is
+/// `Any?` — the universal surface every value has (`toString`, `hashCode`).
+/// Null unless exactly one such declaration exists and no other declaration
+/// of the name could compete, so an untyped receiver can never be handed to
+/// a namesake meant for a real type.
+/// The one extension of this name and arity that is INLINE and declares an
+/// unbounded type PARAMETER as its receiver — the scope-function family,
+/// which applies to every value and is spliced rather than dispatched.
+/// Null unless exactly one such declaration exists and no other extension
+/// of the name could compete.
+fn uniqueUniversalInlineExtension(b: *FuncBuilder, name: []const u8, nargs: usize) ?FuncId {
+    var found: ?FuncId = null;
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        const is_ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+        if (!is_ext) continue;
+        if (f.params.len != nargs + 1) continue;
+        if (!f.is_inline) return null;
+        const rt = f.params[0].ty;
+        if (rt.nullable or rt.args.len != 0) return null;
+        if (!bareTypeParamHead(rt.name)) return null;
+        if (found != null) return null;
+        found = fid;
+    }
+    return found;
+}
+
+fn uniqueAnyNullableExtension(b: *FuncBuilder, name: []const u8, nargs: usize) ?FuncId {
+    var found: ?FuncId = null;
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        // A MEMBER of the same name is not competition: `Any?.toString()`
+        // delegates to it, so the two agree wherever both apply.
+        const is_ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+        if (!is_ext) continue;
+        if (f.params.len != nargs + 1) continue;
+        // An INLINE extension must reach its splice: a non-local `return`
+        // inside its lambda argument depends on the body being expanded
+        // here, and a real call would strand it.
+        if (f.is_inline) return null;
+        const rt = f.params[0].ty;
+        if (!rt.nullable) return null;
+        if (!std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, rt.name, "?")), "Any")) return null;
+        if (found != null) return null;
+        found = fid;
+    }
+    return found;
 }
 
 fn lowerResolvedExtensionCall(

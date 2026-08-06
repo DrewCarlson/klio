@@ -512,6 +512,12 @@ pub const Inst = union(enum) {
         args: Reg,
         n_args: u32,
         arg_names: []?ConstId = &.{},
+        /// The DECLARED type head of each argument, where lowering knows one.
+        /// Kotlin selects a constructor overload from the static types, and
+        /// an interpreted instance reports no class of its own at run time —
+        /// `Box(circle)` and `Box(shapeTypedCircle)` are indistinguishable to
+        /// a value-only ranking, which then took the first declaration.
+        arg_static_heads: []?ConstId = &.{},
     },
     /// Build a `List` from a range of registers.
     NewList: struct { dst: Reg, args: Reg, n_args: u32 },
@@ -2491,6 +2497,53 @@ pub const Module = struct {
     /// the deferral.
     pub threadlocal var mpp_why: []const u8 = "-";
 
+    /// Whether a STAR-ERASED parameter is satisfied by this argument on the
+    /// head alone. The erasure convention says the arguments neither prove
+    /// nor refute, so a `Collection<*>` slot is decided entirely by whether
+    /// the argument's class is a `Collection` — which is exactly what
+    /// Kotlin checks when it gives `set.addAll(collection)` to the member
+    /// rather than the `Iterable` extension beside it.
+    /// The mirror of `erasedHeadProves`: a star-erased slot the argument's
+    /// head does NOT satisfy is a definite mismatch, so the member is not
+    /// the target and the same-named extension beside it is. Restricted to
+    /// heads the module KNOWS, so an unresolved or host-only name — whose
+    /// hierarchy this module cannot see — never refutes.
+    fn erasedHeadRefutes(
+        self: *const Module,
+        erased: bool,
+        param_ty: TypeRef,
+        sh: applicability.ArgShape,
+    ) bool {
+        if (!erased) return false;
+        const arg_ty = sh.ty orelse return false;
+        if (sh.is_lambda or sh.is_null or sh.is_spread) return false;
+        const ah = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, arg_ty.name, "?")));
+        const ph = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, param_ty.name, "?")));
+        if (ah.len == 0 or ph.len == 0) return false;
+        if (ah.len <= 2 and std.ascii.isUpper(ah[0])) return false;
+        if (ph.len <= 2 and std.ascii.isUpper(ph[0])) return false;
+        if (std.mem.eql(u8, ah, ph)) return false;
+        if (self.uniqueClassIdBySimpleName(ah) == null and self.classIdByFqn(ah) == null) return false;
+        if (self.uniqueClassIdBySimpleName(ph) == null and self.classIdByFqn(ph) == null) return false;
+        return !self.classIsOrExtends(ah, ph);
+    }
+
+    fn erasedHeadProves(
+        self: *const Module,
+        erased: bool,
+        param_ty: TypeRef,
+        sh: applicability.ArgShape,
+    ) bool {
+        if (!erased) return false;
+        const arg_ty = sh.ty orelse return false;
+        if (arg_ty.nullable and !param_ty.nullable) return false;
+        const ah = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, arg_ty.name, "?")));
+        const ph = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, param_ty.name, "?")));
+        if (ah.len == 0 or ph.len == 0) return false;
+        if (ah.len <= 2 and std.ascii.isUpper(ah[0])) return false;
+        return std.mem.eql(u8, ah, ph) or self.classIsOrExtends(ah, ph);
+    }
+
     pub fn memberPromotionProven(
         self: *const Module,
         member_fid: FuncId,
@@ -2554,6 +2607,7 @@ pub const Module = struct {
             // what lifts removeAll/addAll/putAll members to the
             // scope-order tier.
             var star_buf: [8]TypeRef = undefined;
+            var param_args_erased = false;
             if (param_ty.args.len != 0 and param_ty.args.len <= star_buf.len) {
                 var all_tp = true;
                 for (param_ty.args) |pa| {
@@ -2574,6 +2628,7 @@ pub const Module = struct {
                     }
                 }
                 if (all_tp) {
+                    param_args_erased = true;
                     for (0..param_ty.args.len) |i| {
                         star_buf[i] = .{ .name = "*", .nullable = false, .args = &.{} };
                     }
@@ -2591,8 +2646,27 @@ pub const Module = struct {
             // `Collection<E>` params stay unknown without a receiver
             // instantiation) still commits, but only when every reachable
             // extension is refuted below.
+            // A parameter that is STILL a bare type parameter after the
+            // receiver substitution accepts whatever the source passed: the
+            // program compiled, so the argument conforms to whatever the
+            // instantiation makes it. It is the same star-erasure convention
+            // applied one level up — the head adjudicates, the parameter
+            // neither proves nor refutes — except that an unprovable
+            // parameter must not cost the member its PROOF, or a
+            // `map.get(key)` loses to any same-named extension in scope.
+            const param_still_tp = blk_tp: {
+                var ph2 = staticTypeHead(std.mem.trimEnd(u8, param_ty.name, "?"));
+                if (parseClassTypeParamIdentity(ph2)) |ident| ph2 = ident.param;
+                if (ph2.len == 0) break :blk_tp false;
+                if (self.funcTypeParamIndex(member_fid, ph2) != null) break :blk_tp true;
+                for (owner_tps) |tp| {
+                    if (std.mem.eql(u8, tp, ph2)) break :blk_tp true;
+                }
+                break :blk_tp ph2.len <= 2 and std.ascii.isUpper(ph2[0]);
+            };
             switch (self.staticArgCompatibility(member_fid, sh, param_ty, actual_bounds)) {
                 .incompatible => {
+                    if (param_still_tp) continue;
                     mpp_why = "member-arg-refuted";
                     if (runtime.envSetOnce("KLIO_PROMO_NAMES")) {
                         std.debug.print("[promo-pair] {s}.{s} param={s}<{d}> arg={s}<{d}>\n", .{
@@ -2606,7 +2680,24 @@ pub const Module = struct {
                     }
                     return false;
                 },
-                .unknown => member_fully_proven = false,
+                .unknown => if (erasedHeadRefutes(self, param_args_erased, param_ty, sh)) {
+                    mpp_why = "member-arg-refuted";
+                    return false;
+                } else if (!param_still_tp and !erasedHeadProves(self, param_args_erased, param_ty, sh)) {
+                    if (runtime.envSetOnce("KLIO_PROMO_NAMES")) {
+                        std.debug.print("[promo-unknown] {s}.{s} param={s}<{d}> arg={s}<{d}> lit={} lam={}\n", .{
+                            head,
+                            name,
+                            param_ty.name,
+                            param_ty.args.len,
+                            if (sh.ty) |t| t.name else "?",
+                            if (sh.ty) |t| t.args.len else 0,
+                            sh.literal_kind != null,
+                            sh.is_lambda,
+                        });
+                    }
+                    member_fully_proven = false;
+                },
                 .compatible => {},
             }
         }
@@ -9544,6 +9635,33 @@ pub const Module = struct {
     /// annotation or literal initializer stated, else what the function its
     /// initializer CALLS returns. The call is resolved here rather than at
     /// registration because only now is the whole declaration set visible.
+    /// The full declared type of one top-level property declaration, where
+    /// its arguments were recorded. Null leaves the head-only answer.
+    pub fn topLevelPropTypeRef(
+        self: *const Module,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+    ) ?TypeRef {
+        const list = self.registry.top_level_prop_pkgs.get(name) orelse return null;
+        var best_tier: u8 = 255;
+        var found: ?TypeRef = null;
+        for (list.items) |pd| {
+            const t = self.scopeTier(pd.fqn, pd.package, name, caller_pkg, caller_file);
+            if (t == 255) continue;
+            const r = self.registry.top_level_prop_type_refs.get(pd.fqn);
+            if (t < best_tier) {
+                best_tier = t;
+                found = r;
+            } else if (t == best_tier) {
+                const cur = found orelse return null;
+                const new = r orelse return null;
+                if (!std.mem.eql(u8, cur.name, new.name)) return null;
+            }
+        }
+        return found;
+    }
+
     pub fn topLevelPropHeadFor(self: *const Module, fqn: []const u8) ?[]const u8 {
         if (self.registry.top_level_prop_type_heads.get(fqn)) |h| return h;
         const callee = self.registry.top_level_prop_init_callees.get(fqn) orelse return null;
@@ -10263,6 +10381,13 @@ pub const ModuleRegistry = struct {
     /// call on the property resolves against the static type, as
     /// kotlinc does.
     class_prop_type_heads: StrPairMap([]const u8),
+    /// The same key, carrying the property's FULL declared type rather than
+    /// its head — `val items: List<Named>` records `List<Named>`, not `List`.
+    /// A head alone cannot answer what iterating or indexing the property
+    /// yields, which left `items[0].tag()`, `for (i in items)` and
+    /// `items.map { it.tag() }` with no receiver type in ordinary code.
+    /// Borrowed from the lowering arena, like every other registry string.
+    class_prop_type_refs: StrPairMap(TypeRef),
     /// `(extension-receiver head, property name)` -> declared type head for
     /// TOP-LEVEL extension properties (`val IntArray.indices: IntRange`
     /// records `(IntArray, indices) -> IntRange`). Recorded in the decl
@@ -10352,6 +10477,10 @@ pub const ModuleRegistry = struct {
     /// a RECEIVER (`asserter.assertEquals(...)`) types statically. Only
     /// annotated declarations record; the head is the annotation as written.
     top_level_prop_type_heads: std.StringHashMap([]const u8),
+    /// The same key, carrying the FULL declared type where it has arguments
+    /// (`val topItems: List<Named>`). The head alone cannot say what
+    /// iterating or indexing the property yields.
+    top_level_prop_type_refs: std.StringHashMap(TypeRef),
     /// Top-level property FQN -> the simple name its UNANNOTATED initializer
     /// calls (`private val base64EncodeMap = byteArrayOf(...)`). Resolved to
     /// a head only at query time, when every declaration is registered: a
@@ -10455,6 +10584,7 @@ pub const ModuleRegistry = struct {
             .delegated_body_props = StrPairSet.init(allocator),
             .recv_fn_props = StrPairMap([]const u8).init(allocator),
             .class_prop_type_heads = StrPairMap([]const u8).init(allocator),
+            .class_prop_type_refs = StrPairMap(TypeRef).init(allocator),
             .ext_prop_type_heads = StrPairMap([]const u8).init(allocator),
             .member_ext_owner_class = std.AutoHashMap(FuncId, []const u8).init(allocator),
             .private_fn_files = std.AutoHashMap(FuncId, FileId).init(allocator),
@@ -10474,6 +10604,7 @@ pub const ModuleRegistry = struct {
             .class_const_inits = StrPairMap(Const).init(allocator),
             .top_level_prop_pkgs = std.StringHashMap(std.ArrayList(PropDecl)).init(allocator),
             .top_level_prop_type_heads = std.StringHashMap([]const u8).init(allocator),
+            .top_level_prop_type_refs = std.StringHashMap(TypeRef).init(allocator),
             .top_level_prop_init_callees = std.StringHashMap([]const u8).init(allocator),
             .callable_extension_props = std.StringHashMap(std.ArrayList(CallableExtensionProp)).init(allocator),
             .top_level_prop_getters = std.StringHashMap(FuncId).init(allocator),
@@ -10536,6 +10667,7 @@ pub const ModuleRegistry = struct {
         self.delegated_body_props.deinit();
         self.recv_fn_props.deinit();
         self.class_prop_type_heads.deinit();
+        self.class_prop_type_refs.deinit();
         self.ext_prop_type_heads.deinit();
         self.member_ext_owner_class.deinit();
         self.private_fn_files.deinit();
@@ -10592,6 +10724,7 @@ pub const ModuleRegistry = struct {
             self.top_level_prop_pkgs.deinit();
         }
         self.top_level_prop_type_heads.deinit();
+        self.top_level_prop_type_refs.deinit();
         self.top_level_prop_init_callees.deinit();
         {
             var it = self.callable_extension_props.valueIterator();
@@ -10685,6 +10818,10 @@ pub const ModuleRegistry = struct {
             while (it.next()) |e| try out.class_prop_type_heads.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
+            var it = self.class_prop_type_refs.iterator();
+            while (it.next()) |e| try out.class_prop_type_refs.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
             var it = self.ext_prop_type_heads.iterator();
             while (it.next()) |e| try out.ext_prop_type_heads.put(e.key_ptr.*, e.value_ptr.*);
         }
@@ -10767,6 +10904,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.top_level_prop_type_heads.iterator();
             while (it.next()) |e| try out.top_level_prop_type_heads.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.top_level_prop_type_refs.iterator();
+            while (it.next()) |e| try out.top_level_prop_type_refs.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.top_level_prop_init_callees.iterator();

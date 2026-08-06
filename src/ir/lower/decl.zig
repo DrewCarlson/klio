@@ -1637,7 +1637,22 @@ fn registerFuncTypeParams(module: *Module, f: *const ast.Function, id: FuncId) A
                 .head_only = boundTypeRecordHeadOnly(&wb.bound),
             });
         }
-        if (bounds.items.len - first > 1) {
+        if (bounds.items.len == first) {
+            // Kotlin gives an unbounded type parameter the implicit upper
+            // bound `Any?`, and a call on such a value can only target a
+            // member of that bound. Recording it is what lets a generic
+            // body — lowered ONCE, with no call site to read an
+            // instantiation from — still name the declaration it calls.
+            // The class-parameter builder has always recorded this; the
+            // function one did not, so every `fun <T> Iterable<T>.…` body
+            // had a receiver that named nothing.
+            try bounds.append(a, .{
+                .param = tp.name.name,
+                .bound = "kotlin.Any",
+                .complete = false,
+                .head_only = true,
+            });
+        } else if (bounds.items.len - first > 1) {
             for (bounds.items[first..]) |*bd| bd.complete = false;
         }
     }

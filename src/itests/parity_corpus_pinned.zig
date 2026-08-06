@@ -2184,3 +2184,95 @@ test "local_fun_return_type" {
         \\
     );
 }
+
+test "ctor_overload_specificity" {
+    try check("ctor_overload_specificity",
+        \\i1,sx,circle,shape,shape
+        \\circle,shape,shape
+        \\
+    );
+}
+
+test "member_type_param_beats_extension" {
+    try check("member_type_param_beats_extension",
+        \\1/-1/2
+        \\2,true,2
+        \\
+    );
+}
+
+test "member_collection_beats_iterable_extension" {
+    try check("member_collection_beats_iterable_extension",
+        \\1,2,3,4
+        \\true
+        \\
+        \\a,b,c,d,e
+        \\
+    );
+}
+
+test "universal_any_extension_binding" {
+    try check("universal_any_extension_binding",
+        \\N(a),N(b)
+        \\x,null
+        \\N(q)
+        \\null
+        \\true
+        \\
+    );
+}
+
+test "type_parameter_erases_to_bound" {
+    try check("type_parameter_erases_to_bound",
+        \\1/2
+        \\true
+        \\3,4
+        \\x,null
+        \\true
+        \\3
+        \\k=9
+        \\
+    );
+}
+
+test "star_projection_element_type" {
+    try check("star_projection_element_type",
+        \\true
+        \\1;a;null;
+        \\2
+        \\
+    );
+}
+
+test "generic_property_type_arguments" {
+    try check("generic_property_type_arguments",
+        \\<a>
+        \\<a><b>
+        \\<a>,<b>
+        \\<c>
+        \\<t>
+        \\
+    );
+}
+
+test "generic_property_read_substitution" {
+    try check("generic_property_read_substitution",
+        \\<c><d>
+        \\<c>,<d>
+        \\1,2
+        \\<x><y>
+        \\
+    );
+}
+
+test "generic_member_return_substitution" {
+    try check("generic_member_return_substitution",
+        \\<a>
+        \\<c>
+        \\<a>
+        \\<c>
+        \\<b>
+        \\-
+        \\
+    );
+}

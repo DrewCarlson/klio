@@ -903,7 +903,17 @@ fn ladderStatsBump(recv: *const Value, name: []const u8) void {
         call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
     var buf: [256]u8 = undefined;
-    const key = std.fmt.bufPrint(&buf, "<ladder>{s}.{s}", .{ recv.typeFqn(), name }) catch return;
+    // An interpreted instance reports `<instance>` through `typeFqn`, which
+    // names nothing — and the class is the whole point of a ladder split.
+    const recv_name: []const u8 = if (recv.* == .Instance) blk: {
+        const g = recv.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        const nm = cg.get().name;
+        break :blk if (nm.len != 0) nm else recv.typeFqn();
+    } else recv.typeFqn();
+    const key = std.fmt.bufPrint(&buf, "<ladder>{s}.{s}", .{ recv_name, name }) catch return;
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
     if (call_stats == null) call_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
@@ -7614,6 +7624,15 @@ noinline fn execArmNewInstance(comptime H: type, allocator: Allocator, frame: *F
     // subject falls through to the enclosing-receiver chain.
     var outer_hint: ?Value = callerThisValue(frame);
     const hint_ptr: ?*const Value = if (outer_hint) |*h| h else null;
+    // Kotlin selects the constructor overload from the arguments' STATIC
+    // types. Hand them to the host for this construction only; it consumes
+    // them once, so a delegation or default thunk that constructs further
+    // instances underneath ranks on its own terms.
+    const static_heads = try resolveArgNames(allocator, frame.module, ni.arg_static_heads);
+    defer freeArgNames(allocator, static_heads);
+    if (comptime @hasDecl(H, "setCtorArgStaticHeads")) {
+        host.setCtorArgStaticHeads(static_heads);
+    }
     const result = switch (try host.newInstanceNamed(allocator, ni.class, arg_values, names, hint_ptr)) {
         .ok => |v| v,
         .err => |e| return raiseStep(frame, e),
@@ -9657,6 +9676,31 @@ inline fn primitiveMemberFast(frame: *const Frame, cm: anytype) ?Value {
 /// argument, so it needs no frame at all.
 fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) ?Value {
     const recv = recv_in.*;
+    // `compareTo` on two same-kind primitives is a pure comparison, and it
+    // was the single hottest entry in the runtime member LADDER
+    // (`Char.compareTo` alone, 84,595 of 113,980) — a primitive has no
+    // vtable slot, so a `Comparable` receiver dispatched by name every time.
+    // Returns the same -1/0/1 the host intrinsic does.
+    if (arg_in) |cmp_arg| {
+        if (std.mem.eql(u8, nm, "compareTo")) {
+            const ord: ?i64 = switch (recv) {
+                .Char => |c| if (cmp_arg == .Char)
+                    (if (c < cmp_arg.Char) @as(i64, -1) else if (c > cmp_arg.Char) @as(i64, 1) else 0)
+                else
+                    null,
+                .Int => |i| if (cmp_arg == .Int)
+                    (if (i < cmp_arg.Int) @as(i64, -1) else if (i > cmp_arg.Int) @as(i64, 1) else 0)
+                else
+                    null,
+                .Long => |l| if (cmp_arg == .Long)
+                    (if (l < cmp_arg.Long) @as(i64, -1) else if (l > cmp_arg.Long) @as(i64, 1) else 0)
+                else
+                    null,
+                else => null,
+            };
+            if (ord) |o| return Value.newInt(o);
+        }
+    }
     if (recv != .Int and recv != .Long) return null;
     if (arg_in == null) {
         const wide: i64 = switch (recv) {
