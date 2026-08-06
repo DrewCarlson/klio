@@ -1939,6 +1939,79 @@ test "numeric_promotion_receiver" {
     );
 }
 
+test "binary_arg_promotion" {
+    try check("binary_arg_promotion",
+        \\2,3,4
+        \\2,4,6
+        \\false,true,true
+        \\5
+        \\1
+        \\4
+        \\
+    );
+}
+
+test "range_arg_element_type" {
+    try check("range_arg_element_type",
+        \\5
+        \\101
+        \\1
+        \\6
+        \\xyz
+        \\
+    );
+}
+
+test "unary_arg_lambda_param" {
+    try check("unary_arg_lambda_param",
+        \\false,true,false
+        \\-3,4,-5
+        \\-7
+        \\5
+        \\
+    );
+}
+
+test "postfix_arg_lambda_param" {
+    try check("postfix_arg_lambda_param",
+        \\7
+        \\48
+        \\5/6
+        \\9/1
+        \\
+    );
+}
+
+test "local_type_survives_init_record" {
+    try check("local_type_survives_init_record",
+        \\66
+        \\6
+        \\BC
+        \\3
+        \\
+    );
+}
+
+test "operator_member_return" {
+    try check("operator_member_return",
+        \\500
+        \\1000
+        \\1500
+        \\5
+        \\
+    );
+}
+
+test "indexed_read_builtin_prop" {
+    try check("indexed_read_builtin_prop",
+        \\294
+        \\2
+        \\120
+        \\105
+        \\
+    );
+}
+
 test "class_prop_literal_type" {
     try check("class_prop_literal_type",
         \\ROW114

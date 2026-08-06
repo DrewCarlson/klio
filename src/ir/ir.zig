@@ -6992,6 +6992,17 @@ pub const Module = struct {
     }
     /// The typeck-resolved target FuncId for the call at `callee_span`:
     /// eager record composed with the lowered-declaration identity map.
+    /// The IMAGE-declared target the checker picked for a call, and only
+    /// that. A member call must not read the span map beside it: those
+    /// records name SOURCE declarations, whose candidate set the checker
+    /// sees only in part on any program that loads packs.
+    pub fn eagerExternCallTarget(self: *const Module, callee_span: span.Span) ?FuncId {
+        const fm = &(self.eager_call_fids orelse return null);
+        const fid = fm.get(callee_span) orelse return null;
+        if (self.funcById(FuncId.from(fid)) == null) return null;
+        return FuncId.from(fid);
+    }
+
     pub fn eagerCallTarget(self: *const Module, callee_span: span.Span) ?FuncId {
         if (self.eager_call_fids) |*fm| {
             if (fm.get(callee_span)) |fid| {

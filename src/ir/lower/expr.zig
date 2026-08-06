@@ -8632,6 +8632,155 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             {
                 return .{ .name = ph, .nullable = false, .args = &.{} };
             }
+            // Builtin properties with no Kotlin declaration to read.
+            // `source[index].code` in Base64's decoder is the live case: the
+            // receiver types as Char and the read stopped there.
+            if (std.mem.eql(u8, head, "Char") and std.mem.eql(u8, m.name.name, "code")) {
+                return .{ .name = "Int", .nullable = false, .args = &.{} };
+            }
+        }
+    }
+    // `x++` / `x--` evaluates to the operand's PRIOR value, so it carries the
+    // operand's type. The inline splice types a lambda parameter from the
+    // argument expression, and half the indexed stdlib family invokes its
+    // lambda that way — `action(index++, item)` inside
+    // `CharSequence.forEachIndexed` — so the parameter arrived untyped and
+    // every call on it resolved by name.
+    if (arg.* == .Postfix) return argDeclTypeRefLazy(b, arg.Postfix.expr);
+    // `!x` is Boolean; `-x` / `+x` keep their operand's type. Same reason as
+    // the postfix arm: these are argument shapes the splice must type.
+    if (arg.* == .Unary) {
+        switch (arg.Unary.op) {
+            .Not => return .{ .name = "Boolean", .nullable = false, .args = &.{} },
+            .Neg, .Pos => return argDeclTypeRefLazy(b, arg.Unary.expr),
+            else => {},
+        }
+    }
+    // Arithmetic on PRIMITIVES promotes to the wider operand, and comparison
+    // and logic are Boolean. Both rules already exist for the eager walk;
+    // the splice consults this function instead and had neither.
+    if (arg.* == .Binary) {
+        switch (arg.Binary.op) {
+            .Eq, .Neq, .IdentEq, .IdentNeq, .Lt, .Le, .Gt, .Ge, .In, .NotIn, .And, .Or => {
+                return .{ .name = "Boolean", .nullable = false, .args = &.{} };
+            },
+            .Add, .Sub, .Mul, .Div, .Rem => arith: {
+                // Falls THROUGH on anything it cannot answer: the class
+                // operator-member arm below handles a non-primitive left
+                // operand, and returning null here would skip it.
+                const lt = argDeclTypeRefLazy(b, arg.Binary.lhs) orelse
+                    break :arith;
+                const rt = argDeclTypeRefLazy(b, arg.Binary.rhs) orelse
+                    break :arith;
+                if (lt.nullable or rt.nullable) break :arith;
+                const lh = typeHead(std.mem.trimEnd(u8, lt.name, "?"));
+                const rh = typeHead(std.mem.trimEnd(u8, rt.name, "?"));
+                if (!isPrimitiveTypeName(lh) or !isPrimitiveTypeName(rh)) break :arith;
+                // Kotlin's numeric promotion order. A String on either side
+                // is concatenation, and `Char + Int` is a Char; neither is
+                // in this table, so both decline.
+                const order = [_][]const u8{ "Double", "Float", "Long", "Int" };
+                for (order) |w| {
+                    if (std.mem.eql(u8, lh, w) or std.mem.eql(u8, rh, w)) {
+                        // Byte/Short arithmetic is Int in Kotlin, which the
+                        // Int entry already produces.
+                        return .{ .name = w, .nullable = false, .args = &.{} };
+                    }
+                }
+                const small = [_][]const u8{ "Byte", "Short" };
+                for (small) |sm| {
+                    if (std.mem.eql(u8, lh, sm) and std.mem.eql(u8, rh, sm)) {
+                        return .{ .name = "Int", .nullable = false, .args = &.{} };
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    // `a..b` is a range whose class follows from its endpoints. Named here
+    // because the range CLASSES exist (`IntRange`, `CharRange`, …) while the
+    // operator producing them is builtin with no declaration to read.
+    if (arg.* == .Binary and arg.Binary.op == .Range) {
+        if (argDeclTypeRefLazy(b, arg.Binary.lhs)) |lt| {
+            if (!lt.nullable) {
+                const lh = typeHead(std.mem.trimEnd(u8, lt.name, "?"));
+                const ranges = [_]struct { e: []const u8, r: []const u8 }{
+                    .{ .e = "Int", .r = "IntRange" },     .{ .e = "Long", .r = "LongRange" },
+                    .{ .e = "Char", .r = "CharRange" },   .{ .e = "UInt", .r = "UIntRange" },
+                    .{ .e = "ULong", .r = "ULongRange" },
+                };
+                for (ranges) |rr| {
+                    if (std.mem.eql(u8, lh, rr.e)) {
+                        return .{ .name = rr.r, .nullable = false, .args = &.{} };
+                    }
+                }
+            }
+        }
+    }
+    // `a / b` on a CLASS is an operator member, and its declared return is
+    // the answer: `val half = duration / 2` in the saturating-math helpers
+    // types `half` as Duration. The arithmetic arm beside this one promotes
+    // NUMERIC operands and declines everything else, so a class receiver
+    // reached no channel at all.
+    if (arg.* == .Binary) {
+        const opname: ?[]const u8 = switch (arg.Binary.op) {
+            .Add => "plus",
+            .Sub => "minus",
+            .Mul => "times",
+            .Div => "div",
+            .Rem => "rem",
+            else => null,
+        };
+        if (opname) |on| {
+            if (argDeclTypeRefLazy(b, arg.Binary.lhs)) |lt| {
+                if (!lt.nullable) {
+                    const lh = typeHead(std.mem.trimEnd(u8, lt.name, "?"));
+                    if (lh.len != 0 and !isPrimitiveTypeName(lh)) {
+                        var kb: [160]u8 = undefined;
+                        if (std.fmt.bufPrint(&kb, "{s}\x00{s}\x001", .{ lh, on }) catch null) |key| {
+                            if (b.module.registry.member_method_fids.get(key)) |fid| {
+                                if (b.module.funcById(fid)) |f| {
+                                    if (f.return_ty_declared and f.return_ty.name.len != 0) {
+                                        return .{
+                                            .name = f.return_ty.name,
+                                            .nullable = f.return_ty.nullable,
+                                            .args = &.{},
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // `xs[i]` — the element of what `xs` indexes. Stated for the shapes that
+    // have no declaration to read (a CharSequence's Char, a primitive
+    // array's scalar) and taken from the sole type argument otherwise.
+    if (arg.* == .Index and arg.Index.args.len == 1) {
+        if (argDeclTypeRefLazy(b, arg.Index.receiver)) |rt| {
+            if (!rt.nullable) {
+                const h = typeHead(std.mem.trimEnd(u8, rt.name, "?"));
+                if (std.mem.eql(u8, h, "CharSequence") or std.mem.eql(u8, h, "String") or
+                    std.mem.eql(u8, h, "StringBuilder"))
+                {
+                    return .{ .name = "Char", .nullable = false, .args = &.{} };
+                }
+                const prim = [_]struct { a: []const u8, e: []const u8 }{
+                    .{ .a = "BooleanArray", .e = "Boolean" }, .{ .a = "ByteArray", .e = "Byte" },
+                    .{ .a = "ShortArray", .e = "Short" },     .{ .a = "IntArray", .e = "Int" },
+                    .{ .a = "LongArray", .e = "Long" },       .{ .a = "CharArray", .e = "Char" },
+                    .{ .a = "FloatArray", .e = "Float" },     .{ .a = "DoubleArray", .e = "Double" },
+                    .{ .a = "UByteArray", .e = "UByte" },     .{ .a = "UShortArray", .e = "UShort" },
+                    .{ .a = "UIntArray", .e = "UInt" },       .{ .a = "ULongArray", .e = "ULong" },
+                };
+                for (prim) |pa| {
+                    if (std.mem.eql(u8, h, pa.a)) {
+                        return .{ .name = pa.e, .nullable = false, .args = &.{} };
+                    }
+                }
+            }
         }
     }
     if (arg.* == .Call and arg.Call.callee.* == .Path and arg.Call.callee.Path.segments.len == 1) {
@@ -14951,10 +15100,47 @@ fn lowerResolvedMemberCall(
             }
         }
     }
-    const func_id = resolved.target orelse {
+    // The checker's own pick, when it made one. Its candidate set for a
+    // member call on a known receiver class is complete (the image publishes
+    // every extension on the class and its supertype chain) and it ranks by
+    // ARGUMENT TYPE, which is the one thing the lazy engine's shape-based
+    // ranking cannot do. It is preferred exactly where the bare-call arm
+    // prefers it — and where the resolver reached no target at all, it is the
+    // only answer, so a deferral becomes a static bind.
+    // Only where the resolver reached NO target: everything downstream of
+    // this point reads `resolved` for dispatch kind, owner, and arity, so a
+    // pick that disagrees with it would be spliced into a resolution
+    // describing something else. Where the resolver has no target there is
+    // nothing to disagree with, and the checker's answer is the only one.
+    const eager_pick: ?FuncId = if (!std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_MEMBER") orelse "1", "0")) blk: {
+        const ep = b.module.eagerExternCallTarget(name.span) orelse break :blk null;
+        const ef = b.module.funcById(ep) orelse break :blk null;
+        if (ef.params.len == 0 or !std.mem.eql(u8, ef.params[0].name, "this")) break :blk null;
+        // Where the resolver DID name a declaration, the pick may replace it
+        // only if both are the same call form — an extension, receiver in the
+        // leading slot. Everything downstream reads `resolved` for the shape
+        // of the call, and swapping a declaration of one shape for another is
+        // what broke `d += x` on Duration. Same shape, and the swap is just
+        // which declaration the identical emit names.
+        if (resolved.target) |rt| {
+            if (rt.int() == ep.int()) break :blk null;
+            const rf = b.module.funcById(rt) orelse break :blk null;
+            if (rf.params.len == 0 or !std.mem.eql(u8, rf.params[0].name, "this")) break :blk null;
+            if (resolved.dispatch != .direct) break :blk null;
+        }
+        break :blk ep;
+    } else null;
+    const func_id = eager_pick orelse resolved.target orelse {
         last_member_refuted = !resolved.applicable;
         return if (resolved.applicable) .deferred else .none;
     };
+    if (eagerAuditOn()) {
+        if (eager_pick) |ep| {
+            const lazy_str: i64 = if (resolved.target) |l| @intCast(l.int()) else -1;
+            const efqn: []const u8 = if (b.module.funcById(ep)) |f| f.fqn else "?";
+            std.debug.print("[EAGER-MEMBER-HIT] '{s}': eager={d}({s}) lazy={d}\n", .{ name.name, ep.int(), efqn, lazy_str });
+        }
+    }
     // The resolver identifies a single candidate but withholds dispatch when an
     // argument's type is unknown, so its applicability is unproven. Measured,
     // that is EVERY deferral reaching this point — sites with a fully proven
@@ -15066,6 +15252,25 @@ fn lowerResolvedMemberCall(
         // `MutableList.add`) and unsigned-array member dynamic.
         if (b.module.dispatchForTarget(static_owner, resolved.target.?)) |d| {
             resolved.dispatch = d;
+        }
+    }
+    if (eager_pick) |ep| {
+        // The resolver reached no target, so its `deferred` says nothing
+        // about THIS declaration — it says the resolver could not name one.
+        // The checker named one by argument type, and how that declaration
+        // dispatches follows from the declaration: an extension carries its
+        // receiver as a leading `this` parameter and is statically bound in
+        // Kotlin; anything else goes through the receiver's slot.
+        // EXTENSIONS only. An extension carries its receiver as a leading
+        // `this` parameter and Kotlin binds it statically, so the call form
+        // follows from the declaration alone. A class MEMBER does not: it
+        // needs a method slot on the receiver's runtime class, and asserting
+        // one the resolver never proved broke `d += x` on Duration — the
+        // slot was not there to call.
+        if (b.module.funcById(ep)) |ef| {
+            if (ef.params.len != 0 and std.mem.eql(u8, ef.params[0].name, "this")) {
+                resolved.dispatch = .direct;
+            }
         }
     }
     if (resolved.dispatch == .deferred) {

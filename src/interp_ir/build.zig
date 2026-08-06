@@ -4627,6 +4627,8 @@ pub const StdlibBase = struct {
     top_props: []const TopProp = &.{},
     /// Baked top-level function return class heads (see `FnReturn`).
     fn_returns: []const FnReturn = &.{},
+    /// Baked extension return class heads (see `ExtReturn`).
+    ext_returns: []const ExtReturn = &.{},
     /// Base SourceMap files occupy ids [0..user_file_start).
     user_file_start: u32,
     /// Next enum-entry identity, continuing the base build's sequence so
@@ -4661,6 +4663,10 @@ pub const StdlibBase = struct {
     /// nothing else can answer "what class does `listOf` return" without
     /// decoding the whole stdlib.
     pub const FnReturn = struct { name: []const u8, head: []const u8 };
+    /// An EXTENSION's return class head, keyed `<receiver head>\x00<name>`.
+    /// Declaration signatures keep parameters and no return type, so without
+    /// this a chained call loses its receiver class at the first link.
+    pub const ExtReturn = struct { key: []const u8, head: []const u8 };
 };
 
 /// Build the dependency snapshot from already-parsed base files. The

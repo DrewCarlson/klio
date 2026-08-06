@@ -98,6 +98,12 @@ pub const TypeCheck = struct {
     /// user class is `Type.Unresolved` here, so this is where a receiver's
     /// class identity actually lives.
     expr_class: std.AutoHashMap(Span, []const u8),
+    /// Class identity used ONLY to pick the next receiver while checking.
+    /// Kept apart from `expr_class` because that map is exported as TYPE
+    /// evidence for lowering, and a head good enough to rank candidates is
+    /// not automatically a head lowering can bind against — publishing
+    /// extension return heads into `expr_class` broke 31 corpus programs.
+    rank_class: std.AutoHashMap(Span, []const u8),
 
     /// Look up the type assigned to an expression by span.
     pub fn typeOf(self: *const TypeCheck, sp: Span) ?*const Type {
@@ -148,6 +154,7 @@ pub fn typecheck(
         .lambda_recv_heads = tc.lambda_recv_heads,
         .lambda_param_shapes = tc.lambda_param_shapes,
         .expr_class = tc.expr_class,
+        .rank_class = tc.rank_class,
     };
 }
 
@@ -330,6 +337,7 @@ pub fn typecheckModule(
         .lambda_recv_heads = tc.lambda_recv_heads,
         .lambda_param_shapes = tc.lambda_param_shapes,
         .expr_class = tc.expr_class,
+        .rank_class = tc.rank_class,
     };
 }
 
@@ -887,6 +895,9 @@ pub const Checker = struct {
     /// path / `this` / constructor-call sites whose static type is a
     /// user-declared class.
     expr_class: std.AutoHashMap(Span, []const u8),
+    /// Ranking-only receiver classes; see the field of the same name on
+    /// the result struct.
+    rank_class: std.AutoHashMap(Span, []const u8),
     /// Inferred element type for an expression whose runtime value is a
     /// `List<T>`.
     list_elem: std.AutoHashMap(Span, Type),

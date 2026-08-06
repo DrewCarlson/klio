@@ -422,8 +422,23 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
     const mg = sb.built.module.borrow();
     defer mg.deinit();
     const m = mg.get();
+    // Simple names, because that is the only spelling the checker's class
+    // table uses. Where two classes share one — compose declares a
+    // `SlotTable` in both its gapbuffer and linkbuffer implementations — the
+    // name identifies nothing, and offering one's extensions for the other
+    // binds calls to a declaration the receiver never had. Such a name is
+    // dropped from every published map.
     var classes = std.StringHashMap(void).init(gpa);
-    for (m.classes.items) |*c| classes.put(c.name, {}) catch {};
+    var ambiguous_names = std.StringHashMap(void).init(gpa);
+    defer ambiguous_names.deinit();
+    for (m.classes.items) |*c| {
+        const gop = classes.getOrPut(c.name) catch continue;
+        if (gop.found_existing) ambiguous_names.put(c.name, {}) catch {};
+    }
+    {
+        var ait = ambiguous_names.keyIterator();
+        while (ait.next()) |k| _ = classes.remove(k.*);
+    }
     // Return heads ride the image's baked index: on a cached load the funcs
     // are lazy, so walking them here answered nothing at all. On the run
     // that BUILDS the base there is no baked index yet and the funcs are
@@ -431,7 +446,10 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
     // or the checker's answers depend on whether the cache was warm.
     var rets = std.StringHashMap([]const u8).init(gpa);
     if (sb.fn_returns.len != 0) {
-        for (sb.fn_returns) |fr| rets.put(fr.name, fr.head) catch {};
+        for (sb.fn_returns) |fr| {
+            if (ambiguous_names.contains(fr.head)) continue;
+            rets.put(fr.name, fr.head) catch {};
+        }
     } else {
         var ambiguous = std.StringHashMap(void).init(gpa);
         defer ambiguous.deinit();
@@ -458,6 +476,32 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
     // — which is why the checker had zero candidates for every member call
     // on exactly the runs that matter. Both of these are eager in the image,
     // because lowering resolves names against them.
+    // The baked index on a load, derived from the decoded funcs on the run
+    // that builds the base, so a warm cache and a cold one publish the same.
+    var ext_rets = std.StringHashMap([]const u8).init(gpa);
+    defer ext_rets.deinit();
+    if (sb.ext_returns.len != 0) {
+        for (sb.ext_returns) |er| ext_rets.put(er.key, er.head) catch {};
+    } else {
+        var eamb = std.StringHashMap(void).init(gpa);
+        defer eamb.deinit();
+        for (m.funcs.items) |*f| {
+            if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+            if (f.name.len == 0) continue;
+            const rh = headOf(f.params[0].ty.name);
+            const h = headOf(f.return_ty.name);
+            if (rh.len == 0 or h.len == 0 or !classes.contains(h)) continue;
+            const key = std.fmt.allocPrint(gpa, "{s}\x00{s}", .{ rh, f.name }) catch continue;
+            if (eamb.contains(key)) continue;
+            const gop = ext_rets.getOrPut(key) catch continue;
+            if (gop.found_existing) {
+                if (!std.mem.eql(u8, gop.value_ptr.*, h)) {
+                    _ = ext_rets.remove(key);
+                    eamb.put(key, {}) catch {};
+                }
+            } else gop.value_ptr.* = h;
+        }
+    }
     var exts = std.StringHashMap(std.ArrayList(types_mod.ExternExt)).init(gpa);
     var nit = m.func_name_index.iterator();
     while (nit.next()) |entry| {
@@ -467,7 +511,7 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
             const sig = m.decl_sigs.get(fid.int()) orelse continue;
             const recv = sig.receiver_ty orelse continue;
             const recv_head = headOf(recv.name);
-            if (recv_head.len == 0) continue;
+            if (recv_head.len == 0 or ambiguous_names.contains(recv_head)) continue;
             const n = sig.sig.len;
             const heads = gpa.alloc([]const u8, n) catch continue;
             const nulls = gpa.alloc(bool, n) catch {
@@ -489,10 +533,16 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
                 .fid = fid.int(),
                 .param_heads = heads,
                 .param_nullable = nulls,
-                // The declaration signature carries no return type; the
-                // ranking compares ARGUMENTS, and a null return class is
-                // exactly what an unknown one must look like.
-                .return_head = "",
+                // From the baked index; the declaration signature has no
+                // return type of its own. This head is RANKING evidence
+                // only — see the split at its consumer.
+                .return_head = blk_r: {
+                    const key = std.fmt.allocPrint(gpa, "{s}\x00{s}", .{ recv_head, fname }) catch break :blk_r "";
+                    defer gpa.free(key);
+                    const h = ext_rets.get(key) orelse break :blk_r "";
+                    if (ambiguous_names.contains(h)) break :blk_r "";
+                    break :blk_r h;
+                },
                 .return_nullable = false,
                 .is_infix = false,
             }) catch {};
@@ -506,7 +556,7 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
     }
     var supers = std.StringHashMap([][]const u8).init(gpa);
     for (m.classes.items) |*c| {
-        if (c.supertypes.len == 0) continue;
+        if (c.supertypes.len == 0 or ambiguous_names.contains(c.name)) continue;
         const names = gpa.alloc([]const u8, c.supertypes.len) catch continue;
         var n: usize = 0;
         for (c.supertypes) |sid| {
@@ -796,6 +846,19 @@ fn bakeAndPrepare(
         return null;
     };
     base.user_file_start = @intCast(dep_map.files.items.len);
+
+    // The BASE's own sources are checked here, where they exist. This is the
+    // only place they do: a cached run loads IR and never parses them, so a
+    // call site inside a stdlib body could never receive an eager pick — and
+    // the dispatch census is mostly such sites. The results ride the image.
+    if (runtime.envOnce("KLIO_STDLIB_CHECK") != null) {
+        publishExternDecls(gpa, base);
+        if (@import("commands.zig").computeEagerCalls(gpa, deps.asts, &.{})) |ec| {
+            std.debug.print("[stdlib-check] {d} base call resolutions\n", .{ec.count()});
+            var owned = ec;
+            owned.deinit();
+        } else std.debug.print("[stdlib-check] none\n", .{});
+    }
 
     const tb_lower = runtime.clockMonotonicNanos();
     const bytes = (image.bake(gpa, base, dep_map, .{
