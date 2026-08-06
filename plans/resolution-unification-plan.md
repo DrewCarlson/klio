@@ -484,6 +484,19 @@ be deleted pins the next fix. Also open: the remaining expect-with-impl drops in
   `Span -> FuncId` map that lowering consumes as a direct static bind. That
   is a plumbing task with no unknowns left in it.
 
+- **The FuncId channel carries (2026-08-06).** `ExternExt` -> `FnSig` ->
+  `ResolvedCall` -> `Module.eager_call_fids`, and `eagerCallTarget` consults
+  it ahead of the span map, so both identities reach one consumer:
+
+        [EAGER] 0 call resolutions recorded (1 by image FuncId; typeck resolved 1)
+
+  What remains is one lookup, not one channel. The record is keyed by the
+  CALL span, and both lowering consumers look up a bare callee's NAME span,
+  so a member call's record is carried and never asked for. The next unit is
+  a member-call consumer keyed on the call expression's span — with that,
+  `xs.min()` binds from the checker's own argument-type ranking, which is
+  what step 3 needed.
+
 - **P8** — hatch deletion (RC-H catalog above).
 - **P9** — optional flat bytecode + pack serialization.
 
