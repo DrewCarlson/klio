@@ -8647,6 +8647,15 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     // `CharSequence.forEachIndexed` — so the parameter arrived untyped and
     // every call on it resolved by name.
     if (arg.* == .Postfix) return argDeclTypeRefLazy(b, arg.Postfix.expr);
+    // `!x` is Boolean; `-x` / `+x` keep their operand's type. Same reason as
+    // the postfix arm: these are argument shapes the splice must type.
+    if (arg.* == .Unary) {
+        switch (arg.Unary.op) {
+            .Not => return .{ .name = "Boolean", .nullable = false, .args = &.{} },
+            .Neg, .Pos => return argDeclTypeRefLazy(b, arg.Unary.expr),
+            else => {},
+        }
+    }
     // `a / b` on a CLASS is an operator member, and its declared return is
     // the answer: `val half = duration / 2` in the saturating-math helpers
     // types `half` as Duration. The arithmetic arm beside this one promotes

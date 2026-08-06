@@ -3301,3 +3301,26 @@ inline splice types a lambda parameter from whatever expression the callee
 passes, so every expression SHAPE the stdlib uses at an invocation site is a
 channel that must exist. The census's `Postfix` bucket — six sites — was
 naming this the whole time.
+
+## Addendum 80 (2026-08-06): the argument-shape rule, stated
+
+Addendum 79's finding generalises, and the census's own shape histogram is
+the worklist. The inline splice types a lambda parameter from whatever
+expression the callee passes at the invocation site, so EVERY expression
+shape the stdlib writes there needs an arm in `argDeclTypeRefLazy` — the
+function the splice consults. Missing arms show up in the census as the
+shape buckets themselves:
+
+    Postfix  6 -> arm added (addendum 79)    379 -> 375
+    Unary   10 -> arm added                  375 -> 365
+
+`!x` is Boolean; `-x` / `+x` keep their operand's type. Ten sites, all into
+bound, no battery moved.
+
+This is the fourth time the spliced-argument position has been the answer
+(66, 77, 79, 80) and the first time it was reached by rule rather than by
+tracing a site — because the shape histogram names the gap directly. The
+remaining buckets are `Path` 197, `Call` 88, `Member` 36, `Binary` 34, all
+of which HAVE arms; their misses are inside those arms, not absences.
+
+Session: **508 -> 365 unbound, 92.73% -> 94.15% bound.**

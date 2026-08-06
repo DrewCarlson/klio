@@ -1939,6 +1939,16 @@ test "numeric_promotion_receiver" {
     );
 }
 
+test "unary_arg_lambda_param" {
+    try check("unary_arg_lambda_param",
+        \\false,true,false
+        \\-3,4,-5
+        \\-7
+        \\5
+        \\
+    );
+}
+
 test "postfix_arg_lambda_param" {
     try check("postfix_arg_lambda_param",
         \\7
