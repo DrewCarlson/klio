@@ -3489,3 +3489,39 @@ declare a nullable extension, which is the rule working as intended.
 Worth stating for the rest of the residue: "by design" was a claim about
 Kotlin's semantics, and it deserves the same measurement as everything else.
 `resolver_declined` (81) is the next bucket carrying that label.
+
+## Addendum 84 (2026-08-06): `resolver_declined` measured, not assumed
+
+Applying addendum 83's lesson to the next bucket carrying a "by design"
+label. All 81 sites are one kind:
+
+    [decline] 81 100.00% target_known_deferred
+
+The resolver PROVED a single declaration and withheld dispatch anyway,
+because an argument's type is unknown so the member's applicability is not
+proven. The promotion gate that exists to rescue those reports why it
+refuses (181 events over the 81 sites — a site can be blocked more than
+once):
+
+    ext_own_head            58   an extension of that name on the receiver's own head
+    receiver_not_instance   52   a stub or value class: host-backed, no vtable
+    ext_declared_super      36   an extension on a declared supertype
+    ext_generic_receiver    22   an extension with a generic receiver
+    ext_builtin_super       13   an extension on a builtin supertype
+
+The four `ext_*` kinds are one question: could an extension take this call
+if the member turns out not to apply? Kotlin gives a MEMBER precedence over
+an extension on the same type, so where the member IS applicable the
+extension never wins — the block is entirely about the unproven
+applicability, not about precedence. Proving the argument types would
+collapse all four, which is the same receiver-typing work the rest of this
+plan needs.
+
+`receiver_not_instance` is different in kind: a value or stub class is
+host-backed and has no vtable to index, so binding it statically needs the
+HOST member's identity, not a better type. That is the intrinsic-identity
+work — distinct from the intrinsic-SIGNATURE table addendum 81 retired,
+because here the receiver is already typed and only the callee's identity is
+missing.
+
+Both are now named and counted rather than labelled by-design.
