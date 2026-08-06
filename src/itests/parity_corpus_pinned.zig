@@ -2141,3 +2141,12 @@ test "safe_call_scope_function_typing" {
         \\
     );
 }
+
+test "ctor_thunk_param_types" {
+    try check("ctor_thunk_param_types",
+        \\-6
+        \\-111
+        \\ab/AB
+        \\
+    );
+}

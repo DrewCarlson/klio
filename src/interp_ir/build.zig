@@ -2958,10 +2958,16 @@ fn buildModuleWithOverrides(
             try ctor_default_params.append(a, if (c.is_inner) "this" else "$ctor_default_recv");
             for (c.primary_params) |*p| try ctor_default_params.append(a, p.name.name);
             var slots = try a.alloc(?FuncId, c.primary_params.len);
+            // Parallel to `ctor_default_params`, whose first slot is the
+            // synthesized receiver and has no declared type.
+            const ctor_default_types = try a.alloc(?ast.TypeRef, c.primary_params.len + 1);
+            ctor_default_types[0] = null;
+            for (c.primary_params, 0..) |*p, i| ctor_default_types[i + 1] = p.ty;
             const ctor_enclosing: ?*const StringSet = nested_outer_members.getPtr(c.name.name);
             for (c.primary_params, 0..) |*p, i| {
                 if (p.default) |*e| {
                     const nm = try std.fmt.allocPrint(a, "__ctor_default_{s}_{s}", .{ c.name.name, p.name.name });
+                    module.pending_param_types = ctor_default_types;
                     slots[i] = try ir.lower.lowerExprAsParamThunkScopedEnclosing(module, ctor_default_params.items, e, nm, c.name.name, &own_members, ctor_enclosing);
                 } else {
                     slots[i] = null;
@@ -3338,11 +3344,21 @@ fn buildModuleWithOverrides(
         try collectCompanionOwnMembers(c, &own);
         const parent_enclosing: ?*const StringSet = nested_outer_members.getPtr(c.name.name);
         var fids = try a.alloc(FuncId, parent_args.len);
+        // Parallel to `param_refs`, which leads with `this` for an inner class.
+        const parent_arg_types = try a.alloc(?ast.TypeRef, param_refs.items.len);
+        {
+            const off: usize = if (c.is_inner) 1 else 0;
+            if (c.is_inner) parent_arg_types[0] = null;
+            for (c.primary_params, 0..) |*p, i| {
+                if (off + i < parent_arg_types.len) parent_arg_types[off + i] = p.ty;
+            }
+        }
         const pca_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
         const prev_pca_pkg = ir.lower.decl.setLowerSelfPackage(pca_pkg);
         defer _ = ir.lower.decl.setLowerSelfPackage(prev_pca_pkg);
         for (parent_args, 0..) |*e, idx| {
             const nm = try std.fmt.allocPrint(a, "__parent_ctor_arg_{s}_{d}", .{ c.name.name, idx });
+            module.pending_param_types = parent_arg_types;
             fids[idx] = try ir.lower.lowerExprAsParamThunkScopedEnclosing(
                 module,
                 param_refs.items,
@@ -3518,15 +3534,22 @@ fn buildModuleWithOverrides(
                 },
                 .None => {},
             }
+            // The delegation arguments and the defaults are expressions over
+            // the secondary constructor's OWN parameters, so they lower with
+            // the declared types those parameters carry.
+            const sc_param_types = try a.alloc(?ast.TypeRef, sc.params.len);
+            for (sc.params, 0..) |*p, i| sc_param_types[i] = p.ty;
             var arg_fids = try a.alloc(FuncId, delegation_args.len);
             for (delegation_args, 0..) |*e, arg_idx| {
                 const nm = try std.fmt.allocPrint(a, "__sec_ctor_{s}_{d}_arg{d}", .{ c.name.name, sc_idx, arg_idx });
+                module.pending_param_types = sc_param_types;
                 arg_fids[arg_idx] = try ir.lower.lowerExprAsParamThunkScoped(module, param_names, e, nm, c.name.name, &own_members);
             }
             var default_arg_thunks = try a.alloc(?FuncId, sc.params.len);
             for (sc.params, 0..) |*p, p_idx| {
                 if (p.default) |e| {
                     const nm = try std.fmt.allocPrint(a, "__sec_ctor_{s}_{d}_def{d}", .{ c.name.name, sc_idx, p_idx });
+                    module.pending_param_types = sc_param_types;
                     default_arg_thunks[p_idx] = try ir.lower.lowerExprAsParamThunkScoped(module, param_names, e, nm, c.name.name, &own_members);
                 } else {
                     default_arg_thunks[p_idx] = null;
