@@ -2102,3 +2102,21 @@ test "string_companion_format" {
         \\
     );
 }
+
+test "nested_inline_lambda_same_param_name" {
+    try check("nested_inline_lambda_same_param_name",
+        \\190
+        \\600
+        \\
+    );
+}
+
+test "for_over_progression_element_type" {
+    try check("for_over_progression_element_type",
+        \\15
+        \\abcde
+        \\4
+        \\6420
+        \\
+    );
+}

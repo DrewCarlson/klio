@@ -5869,6 +5869,23 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
+    // `this.onError(index)` — an inline lambda PARAMETER with a receiver type
+    // (`String.(Int) -> Nothing`) invoked through an explicit `this`. The
+    // qualifier names the lambda's receiver, not a member of it, so this is
+    // the same splice the bare form takes; without the arm the call emitted
+    // a member dispatch that no class declares.
+    if (!is_infix and callee.* == .Member and !callee.Member.safe and
+        callee.Member.receiver.* == .This and callee.Member.receiver.This.qualifier == null)
+    {
+        const lam_name = callee.Member.name.name;
+        if (b.inlineLambdaFor(lam_name)) |lam| {
+            if (!b.hasEnclosingMember(lam_name)) {
+                const recv_reg = try lowerExpr(b, callee.Member.receiver);
+                return try inline_call.spliceInlineLambdaOn(b, lam_name, lam, args, recv_reg);
+            }
+        }
+    }
+
     // Inline expansion (suspend-inline only).
     if (try tryBareInlineExpansion(b, expr)) |r| {
         return r;
@@ -8281,7 +8298,7 @@ fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicabi
     // overload selection — the wrap is transparent to the shape.
     const literal_callable = arg.* == .Lambda or arg.* == .AnonFun or
         compose_pass.memoWrappedLambda(@constCast(arg)) != null;
-    return .{
+    const sh: applicability.ArgShape = .{
         .named = name,
         .is_spread = arg.* == .Spread,
         .is_null = arg.* == .NullLit,
@@ -8298,6 +8315,27 @@ fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicabi
         .ty = ty,
         .ty_authoritative = lazy_ty != null,
     };
+    if (runtime.envSetOnce("KLIO_ARGSHAPE_UNK") and
+        sh.ty == null and sh.literal_kind == null and !sh.is_lambda)
+    {
+        noteUnknownArgShape("argshape-unk", arg);
+    }
+    return sh;
+}
+
+/// Diagnostic: which argument SHAPES stay unknown to the applicability
+/// scorer (no type, no literal kind, not callable). Those are the shapes
+/// that make `memberPromotionProven` answer `arg-unauthoritative`, so the
+/// tag histogram names the expression forms worth typing next.
+fn noteUnknownArgShape(tag: []const u8, arg: *const Expr) void {
+    const detail: []const u8 = switch (arg.*) {
+        .Path => |p| if (p.segments.len != 0) p.segments[p.segments.len - 1].name else "-",
+        .Member => |m| m.name.name,
+        .Call => |c| if (c.callee.* == .Member) c.callee.Member.name.name else if (c.callee.* == .Path and c.callee.Path.segments.len != 0) c.callee.Path.segments[c.callee.Path.segments.len - 1].name else "-",
+        .Binary => |bin| @tagName(bin.op),
+        else => "-",
+    };
+    std.debug.print("[{s}] {s} {s}\n", .{ tag, @tagName(arg.*), detail });
 }
 
 /// Literal-kind evidence for an argument: the argument itself is a literal,
@@ -9181,6 +9219,26 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
             if (std.mem.eql(u8, h, pa.a)) {
                 return try (ir.TypeRef{
                     .name = pa.e,
+                    .nullable = false,
+                    .args = &.{},
+                }).clone(b.allocator);
+            }
+        }
+        // Ranges and progressions carry their element in the CLASS NAME, not
+        // in a type argument, so the `args.len == 1` path below cannot reach
+        // them: `for (i in lastIndex downTo 1)` left `i` untyped and every
+        // call taking `i` unproven.
+        const progressions = [_]struct { p: []const u8, e: []const u8 }{
+            .{ .p = "IntRange", .e = "Int" },               .{ .p = "LongRange", .e = "Long" },
+            .{ .p = "CharRange", .e = "Char" },             .{ .p = "UIntRange", .e = "UInt" },
+            .{ .p = "ULongRange", .e = "ULong" },           .{ .p = "IntProgression", .e = "Int" },
+            .{ .p = "LongProgression", .e = "Long" },       .{ .p = "CharProgression", .e = "Char" },
+            .{ .p = "UIntProgression", .e = "UInt" },       .{ .p = "ULongProgression", .e = "ULong" },
+        };
+        for (progressions) |pr| {
+            if (std.mem.eql(u8, h, pr.p)) {
+                return try (ir.TypeRef{
+                    .name = pr.e,
                     .nullable = false,
                     .args = &.{},
                 }).clone(b.allocator);
@@ -15295,6 +15353,12 @@ fn lowerResolvedMemberCall(
         } else {
             if (runtime.envOnce("KLIO_PROMO_NAMES") != null) {
                 std.debug.print("[promo-proof] {s}.{s} nargs={d} HELD why={s}\n", .{ head, name.name, args.len, ir.Module.mpp_why });
+                if (std.mem.eql(u8, ir.Module.mpp_why, "arg-unauthoritative")) {
+                    for (shapes, 0..) |sh, i| {
+                        if (sh.ty != null or sh.literal_kind != null or sh.is_lambda) continue;
+                        if (i < args.len) noteUnknownArgShape("promo-unauth", &args[i]);
+                    }
+                }
             }
             // A member REFUTED by an authoritative argument is not the
             // binding at all: fall to the extension path with the

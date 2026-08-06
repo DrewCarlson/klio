@@ -417,12 +417,26 @@ pub fn spliceInlineLambda(
     lam: *const Expr,
     arg_exprs: []const Expr,
 ) Allocator.Error!Reg {
+    return spliceInlineLambdaOn(b, lambda_name, lam, arg_exprs, null);
+}
+
+/// As `spliceInlineLambda`, with the lambda's receiver supplied by the call
+/// rather than inferred from the parameter's mark. A `this.f(x)` call names
+/// the receiver explicitly, and the mark is name-keyed — an enclosing splice
+/// of a same-named parameter suspends it, leaving the body without a `this`.
+pub fn spliceInlineLambdaOn(
+    b: *FuncBuilder,
+    lambda_name: []const u8,
+    lam: *const Expr,
+    arg_exprs: []const Expr,
+    explicit_receiver: ?Reg,
+) Allocator.Error!Reg {
     if (lam.* != .Lambda) {
         return lowerExpr(b, lam);
     }
     const params = lam.Lambda.params;
     const body = lam.Lambda.body;
-    const receiver = if (b.isReceiverLambdaParam(lambda_name))
+    const receiver = explicit_receiver orelse if (b.isReceiverLambdaParam(lambda_name))
         b.resolve("this")
     else
         null;
@@ -437,8 +451,21 @@ pub fn spliceInlineLambda(
     // inline fn's parameter scope, whose names would shadow a same-named
     // caller variable the lambda body references. The caller depth was
     // recorded on the current inline-lambda frame at the call site.
-    const splice_caller_depth = b.inlineLambdaCallerDepth();
-    const site_hint = b.inlineLambdaCallerHint();
+    // Located on the frame that SUBSTITUTES this lambda, not the innermost
+    // one: a lambda spliced from inside another spliced lambda body belongs
+    // to the scope it was written in, several inline levels out. Reading the
+    // innermost frame made the window admit the callee's parameter scopes,
+    // so a same-named caller binding (`onError` at two inline levels)
+    // resolved to the wrong closure.
+    const defining_frame = b.definingInlineLambdaFrame(lambda_name, lam);
+    const splice_caller_depth = if (defining_frame) |di|
+        b.inlineLambdaFrameCallerDepth(di)
+    else
+        b.inlineLambdaCallerDepth();
+    const site_hint = if (defining_frame) |di|
+        b.inlineLambdaFrameHint(di)
+    else
+        b.inlineLambdaCallerHint();
     // Collect the enclosing inline fn's param names BEFORE this splice
     // pushes its own (empty-subst) frame — these are the marks to suspend
     // while the caller's body lowers.
@@ -517,11 +544,49 @@ pub fn spliceInlineLambda(
     // Capture the owner splice's localize target *before* pushing the new
     // frame, then duplicate it so restoring does not alias the frame's
     // own snapshot (which the frame frees on pop).
-    const owner_ret: ?[]InlineReturn = if (b.inlineLambdaOwnerReturn()) |o|
+    // The localize target for an unlabeled `return` in this lambda belongs to
+    // the frame the lambda was DEFINED under, for the same reason its free
+    // names do: a `{ _, _, _ -> return null }` spliced several inline levels
+    // in returns from the function that wrote it.
+    const owner_ret: ?[]InlineReturn = if (defining_frame) |di|
+        try b.allocator.dupe(InlineReturn, b.inlineLambdaFrameOwnerReturn(di))
+    else if (b.inlineLambdaOwnerReturn()) |o|
         try b.allocator.dupe(InlineReturn, o)
     else
         null;
-    try b.pushInlineLambdaFrame(std.StringHashMap(*const ast.Expr).init(b.allocator), b.scopeDepth());
+    // The lambda body is CALLER code, so the inline lambda parameters it can
+    // invoke are the CALLER's, inherited from the frame the lambda was
+    // defined under. The inline function's own frame — the one being spliced
+    // into — is skipped, and a name this lambda binds itself shadows the
+    // inherited entry. An empty frame here left a body's call to its own
+    // enclosing inline parameter with no splice, dispatching it by name.
+    var inherited_subst = std.StringHashMap(*const ast.Expr).init(b.allocator);
+    if (defining_frame) |di| {
+        if (di > 0) {
+            var dit = b.inline_lambda_subst.items[di - 1].subst.iterator();
+            inherit: while (dit.next()) |e| {
+                const key = e.key_ptr.*;
+                for (params) |p| {
+                    if (std.mem.eql(u8, p.name, key)) continue :inherit;
+                }
+                if (params.len == 0 and std.mem.eql(u8, key, "it")) continue;
+                // Only a name the skipped frames RE-BIND needs carrying: that
+                // is the collision the empty frame lost. Every other caller
+                // name already resolves through the register window, and
+                // exposing it here would hand an unrelated call to a splice.
+                var shadowed = false;
+                for (b.inline_lambda_subst.items[di..]) |*fr2| {
+                    if (fr2.subst.contains(key)) {
+                        shadowed = true;
+                        break;
+                    }
+                }
+                if (!shadowed) continue;
+                try inherited_subst.put(key, e.value_ptr.*);
+            }
+        }
+    }
+    try b.pushInlineLambdaFrame(inherited_subst, b.scopeDepth());
     const saved = try b.takeInlineReturn();
     if (owner_ret) |o| {
         try b.restoreInlineReturn(o);
