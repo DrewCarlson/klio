@@ -3047,3 +3047,30 @@ design — a nullable or type-parameter receiver has no single class, and a
 declined resolution is the resolver refusing to guess. 100% static dispatch
 is not the target those two describe; binding everything that NAMES a class
 is, and that is what the 394 measures.
+
+## Addendum 73 (2026-08-06): the infix family does not move the census
+
+`(v shr 8).toByte()` looked like a live family — the by-name census reports
+`callee=shr call=toByte` six times, plus `and`/`or` pairs. Three separate
+placements of the rule all measured EXACTLY flat:
+
+  * an infix arm on `memberCallReturnTypeRef` (a member call written without
+    the dot: the receiver is `args[0]`, the callee a bare Path);
+  * a stated rule for the integer bit operators, since `Int.shr` has no
+    Kotlin declaration anywhere to read a return type from;
+  * the same rule in `argDeclTypeRefLazy`, which is the function the member
+    lowering actually consults for a receiver's type.
+
+Flat in all three. Whatever types those receivers, it is not reached from
+the site the census counts — the `shr` receiver is itself untyped, so the
+rule has nothing to build on and typing the outer call would need the whole
+chain first.
+
+All three reverted. Recorded because the family LOOKS like the ones that
+worked (a named shape, a countable size, an obvious rule) and is not: a
+by-name census entry is a symptom, and the site it names is not always where
+the derivation fails. The channels that paid this session were the ones
+where a probe showed the derivation stopping at a specific function
+(`argDeclTypeRefLazy` for the indexed splice, `topLevelPropTypeHead` for the
+literal constants); the ones that measured flat were the ones reasoned about
+from the census name alone.
