@@ -1341,3 +1341,37 @@ from an instantiation lowering does not carry.
 5. P10's host declaration manifest — the declaration holes are closed; the
    remaining `intrinsics=1484 declared=187` gap is builtin-type members with
    no source, which is a manifest question, not a resolution one.
+
+## P10's package-level holes are per-program, not missing (2026-08-08)
+
+`KLIO_DECL_AUDIT` reports eight package-level holes on a plain program:
+
+    kotlin.concurrent.thread
+    kotlin.system.exitProcess
+    kotlin.time.__klio_time_systemMillis / __klio_time_monotonicNanos
+    klio.bundle.__klio_bundle_readBytes / readText / exists / list
+
+None of them is a missing declaration. Run a program that IMPORTS
+`kotlin.concurrent.thread` and the count drops from eight to four — the
+first four close because their declaring source is now in the program. The
+remaining four are declared in
+`kotlin-klio/klio-bundle/klioMain/klio/bundle/Resources.kt` as inert stubs,
+in a pack (`klio-bundle/klio.toml`) that loads only for bundled programs.
+
+So the audit's "hole" means "no declaration in THIS program", not "no
+declaration exists". Read as a project-wide number it is zero, and P10's
+package-level list is closed.
+
+What remains in that audit is the other line: **1,281 builtin-type
+members** — `kotlin.Char.toInt`, `kotlin.Int.shr` and kin — which have no
+Kotlin source anywhere. That is the real remaining item, and the
+static-dispatch campaign reached it independently from the runtime side:
+`KLIO_SLOT_BYNAME` counts 68,987 statically bound slot calls degrading to a
+name walk, and its top entries are exactly those members.
+
+The two plans meet there. A declaration for a builtin member is what lets a
+call on a `Char`-typed receiver lower to `Call{func}` against a bodyless
+FuncId with a native form — which is a direct intrinsic call, needing no new
+instruction. That is what "fully static" requires for a bytecode VM or a C
+backend, and it is now a single well-defined piece of work with a measured
+size on both sides.
