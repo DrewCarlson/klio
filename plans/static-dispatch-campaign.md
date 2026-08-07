@@ -4497,3 +4497,29 @@ A trailing lambda keeps the old path deliberately. A unit test —
 — caught the first version of this: that path does more than dispatch, it
 shapes the lambda's arity, receiver and composable broad masks from the
 committed candidate. The test earned its keep.
+
+### The splice-receiver walk is not a missed bind
+
+`inline_splice_recv_walk` is 396 of the remaining dynamic emissions, and
+its `member_of_recv` leg looked sound: the name is in the receiver chain's
+COMPLETE hierarchy set, so the bound `this` is the owner and the member is
+decided. Resolving it there instead of walking cuts the dynamic population
+hard — 2077 -> 1748 — and breaks three commontest files and a compose
+corpus program:
+
+    ArrayDequeTest.clear         unresolved global `generateArrayDeque`
+    UnsignedArraysTest.sort      stack overflow
+    UnsignedArraysTest.sortDescending
+    compose_uitext               DIFF
+
+`sort()` inside `sort`'s own body binding to itself is the tell. Membership
+in the hierarchy set says the NAME is a member somewhere on the chain; it
+does not say the bound `this` is the class that declares the one this call
+means, and it does not distinguish a self-recursive spliced body from a
+call to the same name one level out. The walk's member-first behaviour is
+doing real work there, not deferring for lack of information.
+
+Reverted. Recorded because the leg reads sound and the number is the
+largest single one left — the next reader should know it was tried, what it
+cost, and that the missing evidence is WHICH class on the chain declares
+the target, not whether the name is on it.
