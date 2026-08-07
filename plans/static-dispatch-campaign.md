@@ -4438,3 +4438,23 @@ that.
 ## Standing
 
     stdlib census    8879 / 9048   98.13% bound
+
+## The qualified nested constructor
+
+`Inner.Deep(2)` reached no class at all. The BARE form `Inner(1)` already
+resolves through the lexical nested-class walk; only the qualified spelling
+was missing, and `HexFormat.Builder` builds `BytesHexFormat.Builder`
+exactly that way. Resolved through `classIdByQualifiedSuffix` — the same
+type-position convention `Outer.Inner` uses as an annotation — and
+declining for an object, stub, value or abstract class.
+
+    no_receiver_type 157 -> 155
+
+A three-line repro proved it before the rule was written, which is the loop
+that has produced every landed channel in the last stretch: name the shape,
+build the smallest program that shows it unbound, THEN write the rule and
+watch that program bind.
+
+## Standing
+
+    stdlib census    8881 / 9046   98.18% bound
