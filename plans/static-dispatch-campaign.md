@@ -4065,3 +4065,11 @@ remaining local receivers are all in generic library bodies: `sum`,
 
     stdlib census    8839 / 9083   97.31% bound
     examples census 99551 /101667  98.20% bound
+
+### Two more measured flat, in the same family
+
+Carrying a NULLABLE named element (`List<String?>`) and stripping a
+USE-SITE projection prefix (`Array<out String>`) off the element head both
+measure exactly zero. Recorded so they are not retried: the projection
+prefix is not what blocks those sites, and the nullable element already
+reaches the nullable receiver rule by another route.
