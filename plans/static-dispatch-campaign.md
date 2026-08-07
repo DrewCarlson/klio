@@ -4802,3 +4802,40 @@ The second is the real fix and it is the same missing piece as task #15:
 the interpreted body and the host implementation are two representations of
 one declaration, and only the by-name path currently knows how to choose
 between them.
+
+### The convergence point, refuted three ways
+
+"Teach the static call path to prefer the intrinsic the way the member walk
+does" was the fix the previous two findings pointed at. It does not work
+either, and the failure names the root.
+
+`callFunc` already consults `lookupIntrinsic(f.fqn)` — but only on an
+arity-MISMATCH path, never as a preference. Making it a preference for a
+body-carrying declaration at exact arity:
+
+    commontest  2 failures
+      OrderingTest.maxOfWith   Vm::get_field `name` on `kotlin.Array`
+      OrderingTest.minOfWith
+    wall clock  28.97 s (baseline 28.8 s — no gain either)
+
+`get_field name on kotlin.Array` is the tell: the intrinsic and the body
+take DIFFERENT ARGUMENT SHAPES for the same declaration FQN — the vararg is
+packed for one and spread for the other. They are not interchangeable. The
+member walk can prefer the intrinsic only because the walk ALSO normalises
+the receiver and arguments on the way in.
+
+So three attempts at this one point, each refuted with its own evidence:
+
+  1. dispatch the slot's target by FuncId when it links to the same host
+     symbol — breaks `Result` (host representation vs source representation);
+  2. bind a global whose receiver provably cannot shadow it — 18 % slower
+     (body instead of intrinsic);
+  3. make the static path prefer the intrinsic — wrong arguments, no gain.
+
+The root is one thing said three ways: **a declaration has two
+implementations with different calling conventions, and only the by-name
+path knows how to convert between them.** Fully static dispatch requires
+unifying that convention — a shared entry shape for the interpreted body
+and the host symbol — not a smarter choice at the call site. That is a real
+project with a clear definition, and it is the honest end of this campaign's
+reach.
