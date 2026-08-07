@@ -4261,3 +4261,31 @@ correct and complete answer for every non-generic receiver.
 The probe's value is the PAIR: a receiver that did carry arguments one
 frame out and null one frame in, which is what `map`/`mapTo` showed. Read
 the transitions, not the totals.
+
+## An instrument counting work that does not exist
+
+`let` was the largest single entry in the residue by CALL NAME (19 of 215),
+and it is not a dispatch at all. `fun <T, R> T.let(block: (T) -> R): R`
+declares an unbounded type parameter as its receiver, so it applies to every
+value and its body is SPLICED at the call site whatever the receiver turns
+out to be. `KLIO_MISS_TRACE=let` on an untyped receiver reports zero runtime
+misses — there is nothing there to be static or dynamic about.
+
+The census noted `no_receiver_type` at the member path's decline, before the
+splice that actually serves the call. That is the second instrument in this
+campaign found to be measuring something other than its name
+(`receiver_not_instance` was the first), and both were sitting on top of the
+residue where they read as work.
+
+    stdlib   no_receiver_type  215 ->  189, bound_static  1569 ->  1595
+    examples no_receiver_type 1650 -> 1417, bound_static 16350 -> 16583
+
+The emitted code is byte-identical — this is a measurement correction, not
+new binding, and it is recorded as one. Taken only when EXACTLY one
+extension of the name and arity exists, it is inline, and its declared
+receiver is a bare unbounded type parameter.
+
+## Standing
+
+    stdlib census    8857 / 9064   97.72% bound
+    examples census 99759 /101589  98.20% bound
