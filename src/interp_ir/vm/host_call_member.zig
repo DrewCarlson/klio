@@ -9758,6 +9758,30 @@ fn virtualSlotUnlinkedDiag(
 /// `KLIO_NOINST_TRACE=1`: report each virtual slot resolved against the runtime
 /// class of a host-backed (non-`Instance`) receiver. Resolved once — this sits
 /// on the member-dispatch path, where the env cache's mutex would show up.
+/// Counts every time a STATICALLY BOUND virtual slot call degrades to a
+/// by-name member walk. `execArmCallVirtual` documents that arm as having no
+/// name-based fallback — "a missing slot is a link error in the program
+/// image" — and this host has one. Both cannot be true, and a bytecode VM or
+/// a C backend needs the unlinked slot to be a build error rather than a
+/// walk. Counting it is the prerequisite for making that so.
+var slot_by_name_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+pub fn slotByNameFallbacks() u64 {
+    return slot_by_name_count.load(.monotonic);
+}
+
+fn noteSlotByName(self: *VmHost, slot: MethodSlotId, name: []const u8) void {
+    _ = slot_by_name_count.fetchAdd(1, .monotonic);
+    if (!runtime.envSetOnce("KLIO_SLOT_BYNAME")) return;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const root = FuncId.from(slot.int());
+    std.debug.print("[slot-byname] {s} root={s}\n", .{
+        name,
+        if (mg.get().funcById(root)) |f| f.fqn else "?",
+    });
+}
+
 fn noinstTraceOn() bool {
     const S = struct {
         var known: ?bool = null;
@@ -9922,6 +9946,7 @@ pub fn invokeVirtualMember(
             if (try invokeMethodFuncId(self, allocator, receiver, target, args)) |r| return r;
         }
         if (noinst.name) |mname| {
+            noteSlotByName(self, slot, mname);
             return callMemberNamed(self, allocator, receiver, mname, args, arg_names);
         }
         if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
