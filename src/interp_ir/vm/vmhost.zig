@@ -355,6 +355,7 @@ pub const VmHost = struct {
     pub const runFieldGetter = host_fields.runFieldGetter;
     pub const fieldGetterIsLeaf = host_fields.fieldGetterIsLeaf;
     pub const funcRunsItsBody = host_fields.funcRunsItsBody;
+    pub const ownerModuleForFunc = host_fields.ownerModuleForFunc;
     pub const leafGlobalGet = host_globals.leafGlobalGet;
     pub const fastCallPlan = host_call_func.fastCallPlan;
     pub const fuseSiteBinds = host_call_func.fuseSiteBinds;

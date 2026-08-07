@@ -2276,3 +2276,30 @@ test "generic_member_return_substitution" {
         \\
     );
 }
+
+test "splice_receiver_survives_delegation" {
+    try check("splice_receiver_survives_delegation",
+        \\<c>,<d>
+        \\<a>,<b>
+        \\1,2
+        \\<c>,<d>
+        \\
+    );
+}
+
+test "unsigned_arithmetic_promotion" {
+    try check("unsigned_arithmetic_promotion",
+        \\9,99,103,8,10,30,5
+        \\0..3
+        \\4294967295..0
+        \\
+    );
+}
+
+test "nested_class_property_type" {
+    try check("nested_class_property_type",
+        \\-/2/4/mun/t
+        \\:/1/2/mun/f
+        \\
+    );
+}

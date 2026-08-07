@@ -8834,6 +8834,24 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
                 // Kotlin's numeric promotion order. A String on either side
                 // is concatenation, and `Char + Int` is a Char; neither is
                 // in this table, so both decline.
+                // Kotlin's UNSIGNED arithmetic is a closed family: it never
+                // mixes with the signed types, `UByte`/`UShort` widen to
+                // `UInt`, and a `ULong` operand makes the result `ULong`.
+                // Absent from the signed table below, `(to - 1u).toUInt()`
+                // inside `UInt.until` had no receiver at all.
+                const unsigned = [_][]const u8{ "UByte", "UShort", "UInt", "ULong" };
+                var l_unsigned = false;
+                var r_unsigned = false;
+                for (unsigned) |un| {
+                    if (std.mem.eql(u8, lh, un)) l_unsigned = true;
+                    if (std.mem.eql(u8, rh, un)) r_unsigned = true;
+                }
+                if (l_unsigned != r_unsigned) break :arith;
+                if (l_unsigned) {
+                    const w: []const u8 = if (std.mem.eql(u8, lh, "ULong") or
+                        std.mem.eql(u8, rh, "ULong")) "ULong" else "UInt";
+                    return .{ .name = w, .nullable = false, .args = &.{} };
+                }
                 const order = [_][]const u8{ "Double", "Float", "Long", "Int" };
                 for (order) |w| {
                     if (std.mem.eql(u8, lh, w) or std.mem.eql(u8, rh, w)) {

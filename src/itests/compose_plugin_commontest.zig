@@ -51,7 +51,11 @@ const runtime = @import("runtime");
 // GC-stress step no longer times out inside the compiler, and the static
 // receiver-typing channels bound work that previously resolved by name.
 // Same ~±40 margin below the observed floor.
-const BASELINE: usize = 1275;
+// RAISED 1275 -> 1305 once the flat-call seam stopped reading a callee's
+// body against the caller's module: `CompositionTests`, `PausableComposition-
+// Tests` and `SnapshotStateMapTests` no longer abort part-way, so all 46
+// classes complete and the observed count moved to 1345. Same ~±40 margin.
+const BASELINE: usize = 1305;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
@@ -86,8 +90,21 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
     // Cap runTest's default 60s real-time timeout: a test that will time out
-    // should fail in 10s, not hold its class's child (and the pump's job
-    // tree) for a minute per occurrence.
+    // should fail fast, not hold its class's child (and the pump's job tree)
+    // for a minute per occurrence.
+    //
+    // Two background-thread tests in `PausableCompositionTests` need more
+    // than this and so fail here: `markInvalidFromBackgroundThread` runs
+    // ~11,000 launches across 1000 recomposition passes (12s), and
+    // `resumeOnBackgroundThread` spins `while (running) { ...; yield() }`
+    // on `Dispatchers.Default` until another coroutine finishes, so its
+    // duration IS the yield round-trip cost (55s). Both PASS when run with
+    // a 90s cap. Raising it here is still the wrong trade: at 90s a slow
+    // test eats 90s of its class's 480s budget, and the measured result was
+    // 1336 passed with `SnapshotStateMapTests` and `SnapshotStateListTests`
+    // no longer completing, against 1345 and zero incomplete at 10s. The
+    // 55s yield cost is worth its own investigation; it is not a property
+    // of the test, and it is not paid for by a looser cap.
     try map.put("kotlinx_coroutines_test_default_timeout", "10s");
     try map.put("KLIO_COMPOSE_PLUGIN", "1");
     // Per-test wall cap: a test that genuinely deadlocks (the Recomposer
@@ -291,6 +308,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     const Pool = struct {
         fn worker(
             queue: []const []const []const u8,
+            names: []const []const u8,
             penv: *std.process.Environ.Map,
             pnext: *std.atomic.Value(usize),
             ppassed: *std.atomic.Value(usize),
@@ -311,6 +329,10 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                 // not correctness.
                 const r = runKlio(arena.allocator(), penv, queue[i], 480_000) catch {
                     _ = phung.fetchAdd(1, .monotonic);
+                    // Name it. "2 did not complete" is not actionable; the
+                    // class is what tells you whether it is the known
+                    // throughput-bound pair or something new.
+                    std.debug.print("compose_plugin_commontest: {s} did not complete (spawn/cap)\n", .{names[i]});
                     continue;
                 };
                 // A completed run counts its end-of-run summary; a killed
@@ -319,14 +341,22 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                 const summary_count = passedLineCount(r.stdout);
                 const n_passed = if (summary_count != 0) summary_count else streamedPassedCount(r.stderr);
                 _ = ppassed.fetchAdd(n_passed, .monotonic);
-                if (std.mem.indexOf(u8, r.stdout, " passed,") == null) _ = phung.fetchAdd(1, .monotonic);
+                if (std.mem.indexOf(u8, r.stdout, " passed,") == null) {
+                    _ = phung.fetchAdd(1, .monotonic);
+                    std.debug.print("compose_plugin_commontest: {s} did not complete ({d} streamed passes kept)\n", .{ names[i], n_passed });
+                }
             }
         }
     };
     var threads: std.ArrayList(std.Thread) = .empty;
     for (0..workerCount()) |_| {
         try threads.append(a, try std.Thread.spawn(.{}, Pool.worker, .{
-            @as([]const []const []const u8, jobs.items), &env, &next, &total_passed, &hung,
+            @as([]const []const []const u8, jobs.items),
+            @as([]const []const u8, classes.items),
+            &env,
+            &next,
+            &total_passed,
+            &hung,
         }));
     }
     for (threads.items) |t| t.join();

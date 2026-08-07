@@ -3086,6 +3086,15 @@ fn enclosingCompanionDeclares(self: *VmHost, allocator: Allocator, class_name: [
 /// anonymous classes (fresh fqn each time) cannot grow it unboundedly.
 fn fieldReadCachePut(self: *VmHost, fqn: []const u8, name: []const u8, hit: root.ProgramImage.FieldReadHit) void {
     if (!ir.eval.dispatchCacheStable()) return;
+    // Main-module classes only, exactly like the WRITE memo below: a
+    // runtime / anonymous class's fqn key does not outlive the class def,
+    // and under the shared anon side module the dangling key corrupted the
+    // cache map (Allocator.grow reached unreachable growing it).
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().classIdByFqn(fqn) == null) return;
+    }
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     if (pg.get().field_read_cache.count() >= 65536) return;
@@ -4334,4 +4343,17 @@ test "discarded field probes release their owned miss message" {
     const msg = try testing.allocator.dupe(u8, "Vm::get_field `x` on `T`");
     freeFieldMiss(testing.allocator, .{ .Unimplemented = msg });
     freeFieldMiss(testing.allocator, .{ .Unimplemented = "nested: Vm::get_field is static" });
+}
+
+/// The module whose tables `func`'s body indexes against, when that is the
+/// program's own module. A flat request built without one is normally read
+/// against the CALLER's module, which is wrong whenever the callee was
+/// resolved elsewhere: an anonymous object's runtime module delegates base
+/// funcs through the shared lazy header section but carries only its own
+/// const pool, so the callee's const ids land outside it.
+pub fn ownerModuleForFunc(self: *VmHost, func: *const ir.Func) ?*const ir.Module {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const m = mg.get();
+    return if (m.funcById(func.id) == func) m else null;
 }
