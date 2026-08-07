@@ -2303,3 +2303,11 @@ test "nested_class_property_type" {
         \\
     );
 }
+
+test "constructor_scope_param_types" {
+    try check("constructor_scope_param_types",
+        \\3<a>|
+        \\1<b>|<c>7
+        \\
+    );
+}

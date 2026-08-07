@@ -3494,8 +3494,15 @@ fn buildModuleWithOverrides(
         const ib_pkg = try declPackage(a, decl_pkg, fqn_overrides, c.span, package_prefix, c.name.name);
         const prev_ib_pkg = ir.lower.decl.setLowerSelfPackage(ib_pkg);
         defer _ = ir.lower.decl.setLowerSelfPackage(prev_ib_pkg);
+        // Parallel to `local_params`, whose first slot is the receiver.
+        const ib_types = try a.alloc(?ast.TypeRef, local_params.items.len);
+        ib_types[0] = null;
+        for (c.primary_params, 0..) |*p, i| {
+            if (i + 1 < ib_types.len) ib_types[i + 1] = p.ty;
+        }
         for (c.init_blocks, 0..) |*blk, idx| {
             const nm = try std.fmt.allocPrint(a, "__init_block_{s}_{d}", .{ c.name.name, idx });
+            module.pending_param_types = ib_types;
             fids[idx] = try ir.lower.lowerInitBlockWithParams(module, c.name.name, &own_members, local_params.items, blk, nm);
         }
         try init_blocks.put(c.name.name, fids);
@@ -3635,6 +3642,12 @@ fn buildModuleWithOverrides(
                 try locals.append(a, "this");
                 for (param_names) |pn| try locals.append(a, pn);
                 const nm = try std.fmt.allocPrint(a, "__sec_ctor_body_{s}_{d}", .{ c.name.name, sc_idx });
+                const body_types = try a.alloc(?ast.TypeRef, locals.items.len);
+                body_types[0] = null;
+                for (sc.params, 0..) |*p, i| {
+                    if (i + 1 < body_types.len) body_types[i + 1] = p.ty;
+                }
+                module.pending_param_types = body_types;
                 body_fid = try ir.lower.lowerAccessorBlock(module, c.name.name, &own_members, locals.items, blk, nm);
             }
             entries[sc_idx] = .{
