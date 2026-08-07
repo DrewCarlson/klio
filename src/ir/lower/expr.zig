@@ -15263,6 +15263,17 @@ fn lowerResolvedMemberCall(
                 }
             }
         }
+        // A call whose only declaration is a UNIVERSAL INLINE extension —
+        // `fun <T, R> T.let(block: (T) -> R): R` and its family — is not a
+        // dispatch at all: the body is spliced at this site whatever the
+        // receiver turns out to be. Verified with `KLIO_MISS_TRACE=let`,
+        // which reports no runtime miss for an untyped receiver. Counting
+        // it against the receiver-typing residue measured work that does
+        // not exist.
+        if (uniqueUniversalInlineExtension(b, name.name, args.len) != null) {
+            lmNote(.bound_static);
+            return .none;
+        }
         lmNote(.no_receiver_type);
         if (!norecvCensusOn()) return .none;
         lm_norecv[@intFromEnum(std.meta.activeTag(receiver.*))] += 1;
@@ -16015,6 +16026,28 @@ fn ctorArgStaticHeads(b: *FuncBuilder, args: []const Expr) Allocator.Error![]?ir
 /// Null unless exactly one such declaration exists and no other declaration
 /// of the name could compete, so an untyped receiver can never be handed to
 /// a namesake meant for a real type.
+/// The one extension of this name and arity that is INLINE and declares an
+/// unbounded type PARAMETER as its receiver — the scope-function family,
+/// which applies to every value and is spliced rather than dispatched.
+/// Null unless exactly one such declaration exists and no other extension
+/// of the name could compete.
+fn uniqueUniversalInlineExtension(b: *FuncBuilder, name: []const u8, nargs: usize) ?FuncId {
+    var found: ?FuncId = null;
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        const is_ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+        if (!is_ext) continue;
+        if (f.params.len != nargs + 1) continue;
+        if (!f.is_inline) return null;
+        const rt = f.params[0].ty;
+        if (rt.nullable or rt.args.len != 0) return null;
+        if (!bareTypeParamHead(rt.name)) return null;
+        if (found != null) return null;
+        found = fid;
+    }
+    return found;
+}
+
 fn uniqueAnyNullableExtension(b: *FuncBuilder, name: []const u8, nargs: usize) ?FuncId {
     var found: ?FuncId = null;
     for (b.module.funcsBySimpleName(name)) |fid| {
