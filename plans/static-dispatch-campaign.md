@@ -4010,3 +4010,58 @@ a deoptimisation path for the second — and neither is resolution work. The
 campaign's own instruments now say so from five directions: the census
 buckets, the eager channel's `hits=0`, the promotion proof's reasons, the
 call-name split, and this probe.
+
+## Erasure to the bound — the fourth option, and where it stops
+
+Monomorphisation and a runtime type feed both fail the constraints this
+project works under: the first grows packs and memory, the second IS a
+runtime decision and puts a guard on every call. The fourth option is what
+kotlinc, the JVM and a C backend all use — erase each type parameter to its
+declared upper bound and resolve the member there. In valid Kotlin a call on
+a `T`-typed value can only target a member of `T`'s bound, so this is
+complete rather than approximate: one shared body, a slot named at lowering,
+no guard, no cache, no extra IR.
+
+The machinery to consume a bound already existed. What was missing was
+DECLARING one and then not throwing the parameter away:
+
+  - a function type parameter with no explicit upper bound recorded no bound
+    at all, though Kotlin gives it `Any?` (the CLASS builder had always
+    recorded that);
+  - a class property declared with an unbounded class type parameter
+    recorded no head;
+  - a bare type-parameter ELEMENT of an iterated receiver was discarded;
+  - a head shaped like a type parameter with no record in THIS scope — one
+    declared by an enclosing generic — reached no owner, though `Any?` is
+    the floor for every type parameter.
+
+Each of those filters was choosing "no type" over "the bound", which is
+strictly worse: a bound resolves and an absent type does not.
+
+    stdlib   no_receiver_type 249 -> 226, resolver_declined 14 -> 6
+    examples no_receiver_type 1755 -> 1703, resolver_declined 184 -> 80
+
+### Where erasure stops, measured
+
+Two follow-ons in the same direction measure exactly flat, on both censuses,
+and both say the same thing:
+
+  * substituting the RECEIVER's type arguments into a generic member's
+    return (`List<String>.get` returns String) has no input, because the
+    receiver types lowering derives are largely HEAD-ONLY — `List`, not
+    `List<String>`. Nothing to substitute.
+  * carrying a bare type-parameter SPLICE parameter when a bound exists
+    moves nothing, because the sites are inside generic bodies whose own
+    parameters have only the `Any?` floor.
+
+So erasure closed the receivers whose bound is a real classifier, and the
+residue is the receivers whose bound is `Any?` — where a call can only be
+`toString`/`hashCode`/`equals` (already taken by the universal-extension
+channel) or an extension selected from an instantiation nobody has. The 91
+remaining local receivers are all in generic library bodies: `sum`,
+`minOfWith`, `flatMap`, `flatten`, `sortedByNullable`.
+
+## Standing
+
+    stdlib census    8839 / 9083   97.31% bound
+    examples census 99551 /101667  98.20% bound
