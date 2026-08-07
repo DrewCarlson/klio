@@ -4205,3 +4205,46 @@ calls `transform(item)`, and the user lambda's `it` takes its type from
 `item`. `items.map { it.tag() }` binds, so the receiver being a property
 READ rather than a directly-recorded property is what differs. That is a
 splice-window question, not a substitution one, and it is the next thread.
+
+## The delegation that dropped the receiver
+
+`lookup.values.map { it.tag() }` was the last user-code shape left, and the
+answer came from tracing rather than guessing. `KLIO_SPLICE_REF` reports
+what every inline splice installs in its window:
+
+    [splice-ref] fn=map   this_arg=Member ref=Collection<1>
+    [splice-ref] fn=mapTo this_arg=-      ref=null<0>
+
+`Iterable<T>.map` is one line — `return mapTo(ArrayList(…), transform)` —
+and that delegation is a BARE call on the implicit receiver. With no
+receiver EXPRESSION to read a type from, the nested splice installed
+nothing, and the `Collection<Named>` the outer splice had just established
+was gone one level in. Every lambda parameter derived from the element went
+untyped from there.
+
+The window already held the answer. Carrying it forward across a bare
+delegation — only when the callee's declared receiver is the same
+classifier or a supertype, so an unrelated extension cannot inherit these
+arguments — closes it.
+
+    stdlib no_receiver_type 222 -> 215
+
+### Every user-code shape now binds
+
+Measured per repro against a warm home, so each file reports only its own
+sites:
+
+    mapvals   9 sites  0 unbound   lookup.values.map { }, keys.map { }
+    chainext  7 sites  0 unbound   lookup.values.first().tag(), and via a local
+    opform    9 sites  0 unbound   items[0], lookup["k"]?, last(), firstOrNull()
+    getsub   10 sites  0 unbound   items.get(0), lookup.get("k")?
+    collrecv  5 sites  0 unbound   first() on List / Collection / Iterable / Set
+    headonly 12 sites  0 unbound   the six-receiver program that opened this thread
+
+That program was 0/6 bound when the head-only representation was found. It
+is now fully bound, and so is every shape derived from it.
+
+## Standing
+
+    stdlib census    8831 / 9064   97.43% bound
+    examples census 99526 /101589  97.97% bound
