@@ -14699,6 +14699,35 @@ fn memberCallArgArities(b: *FuncBuilder, receiver: *const Expr, mname: []const u
 /// A declared return is evidence only when it NAMES something: a bare type
 /// parameter (`fun <R> map(...): R`) resolves to no class, and committing to
 /// it disproves candidates a null type leaves open.
+/// The type the RECEIVER gives one of the owner class's type parameters.
+/// `List<E>.get` on a `List<Named>` receiver substitutes `E` := Named. Only
+/// the direct-instantiation case is taken — the receiver's head IS the
+/// declaring class, so the arguments line up positionally.
+fn ownerTypeParamSubstitution(
+    b: *FuncBuilder,
+    member_fid: FuncId,
+    recv_ty: ir.TypeRef,
+    ret_name: []const u8,
+) ?ir.TypeRef {
+    if (recv_ty.args.len == 0) return null;
+    const ds = b.module.decl_sigs.get(member_fid.int()) orelse return null;
+    const oid = ds.enclosing_class orelse return null;
+    if (oid.int() >= b.module.classes.items.len) return null;
+    const ocls = &b.module.classes.items[oid.int()];
+    const recv_head = typeHead(std.mem.trimEnd(u8, recv_ty.name, "?"));
+    if (!std.mem.eql(u8, ocls.name, recv_head)) return null;
+    if (ocls.type_params.len != recv_ty.args.len) return null;
+    const rh = typeHead(std.mem.trimEnd(u8, ret_name, "?"));
+    for (ocls.type_params, 0..) |tp, i| {
+        if (!std.mem.eql(u8, tp, rh)) continue;
+        const arg = recv_ty.args[i];
+        if (arg.name.len == 0 or std.mem.eql(u8, arg.name, "*")) return null;
+        if (bareTypeParamHead(arg.name)) return null;
+        return arg;
+    }
+    return null;
+}
+
 fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
     if (call_expr.* != .Call) return null;
     const call = call_expr.Call;
@@ -14741,7 +14770,21 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             // An expression body with no annotation records `Unit` as a
             // PLACEHOLDER, so an undeclared return is not a fact.
             if (!f.return_ty_declared or f.return_ty.name.len == 0) return null;
-            if (bareTypeParamHead(f.return_ty.name)) return null;
+            // A generic member returns one of its OWNER's type parameters:
+            // `List<E>.get(index): E` on a `List<Named>` receiver returns
+            // Named, and the receiver now carries the arguments that say so.
+            // The member stays the declaration — Kotlin picks it over any
+            // extension — this only names what it returns.
+            if (bareTypeParamHead(f.return_ty.name)) {
+                const sub = ownerTypeParamSubstitution(b, fid, recv_ty, f.return_ty.name) orelse return null;
+                var out_sub = try sub.clone(b.allocator);
+                if (safe_call or f.return_ty.nullable) out_sub.nullable = true;
+                if (staticTypeClassId(b, out_sub) == null) {
+                    out_sub.deinit(b.allocator);
+                    return null;
+                }
+                return out_sub;
+            }
             if (staticTypeClassId(b, f.return_ty) == null) return null;
             var out = try f.return_ty.clone(b.allocator);
             if (safe_call) out.nullable = true;

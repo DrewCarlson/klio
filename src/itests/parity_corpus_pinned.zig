@@ -2264,3 +2264,15 @@ test "generic_property_read_substitution" {
         \\
     );
 }
+
+test "generic_member_return_substitution" {
+    try check("generic_member_return_substitution",
+        \\<a>
+        \\<c>
+        \\<a>
+        \\<c>
+        \\<b>
+        \\-
+        \\
+    );
+}
