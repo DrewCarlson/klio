@@ -3921,3 +3921,51 @@ parameter's return through the splice window.
 
     stdlib census    8831 / 9107   96.97% bound
     examples census 99447 /101722  97.76% bound
+
+## Where the campaign stands, and what the residue is made of
+
+    stdlib census    8831 / 9107   96.97% bound
+    examples census 99447 /101722  97.76% bound
+
+Opened at 92.73%. Every bucket that named a MECHANISM has been closed:
+
+    nullable_or_generic   78 ->   2   (the nullable receiver binds its member,
+                                       and where a `T?` extension outranks it,
+                                       that extension binds statically too)
+    resolver_declined     81 ->  14   (a type-parameter or star-erased
+                                       parameter proves the member; the same
+                                       rule read backwards refutes it, and the
+                                       extension then binds)
+    no_class_id          915 ->  11   (a type-parameter receiver resolves
+                                       through its bound; what remains is one
+                                       function-type typealias)
+
+What is left does not name a mechanism. Read by receiver, `no_receiver_type`
+is 249 sites: 91 locals with no derivable type, 22 members whose declared
+type is a bare type PARAMETER (`CompareContext<out T>.actual`,
+`UnsafeLazyImpl.value`), 17 unresolved names, 9 captures, and 110 receivers
+that are themselves calls, reads or arithmetic over those same leaves. Read
+by CALL NAME, after the universal-extension channel took `toString`, the
+largest entries are `let` (19, an inline extension that must reach its
+splice), `getter` (18, all on `CompareContext<out T>`), and the numeric
+conversions `toInt`/`toLong`/`toUInt` (33) on receivers that are arithmetic
+over untyped leaves.
+
+The 14 remaining declines are `arg-unauthoritative`: `Collection.contains(e)`
+and `AbstractMap.get(key)` where the argument is a lambda parameter with no
+type. That is the same floor reached from the argument side.
+
+So the residue is one thing said three ways: a value whose type Kotlin knows
+only from an INSTANTIATION that lowering does not carry. Closing it needs
+monomorphisation, or a runtime type feed that specialises a call site after
+its first dispatch. Both are real projects and neither is a resolution
+change — which is what the resolution plan concluded independently, from the
+checker's side, before this campaign reached the same wall.
+
+### Channels that measured flat and were reverted
+
+Recorded so they are not retried: the safe call's own return type; a
+TYPEALIAS receiver expanded to the class it stands for (the one that remains
+is a function type, which names no class); a spliced function-typed
+parameter's return read through the splice window; the intrinsic signature
+table (addendum 81).
