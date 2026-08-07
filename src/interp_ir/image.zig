@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 43;
+pub const FORMAT_VERSION: u32 = 44;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -576,6 +576,8 @@ const StrKV = KV([]const u8, []const u8);
 const PairKey = struct { a: []const u8, b: []const u8 };
 const PairFuncEntry = struct { a: []const u8, b: []const u8, func: FuncId };
 const PairStrEntry = struct { a: []const u8, b: []const u8, v: []const u8 };
+const PairTypeEntry = struct { a: []const u8, b: []const u8, v: ir.TypeRef };
+const NameTypeEntry = struct { name: []const u8, v: ir.TypeRef };
 const NameFuncs = struct { name: []const u8, funcs: []const FuncId };
 const NameOptFuncs = struct { name: []const u8, slots: []const ?FuncId };
 /// A class name paired with the argument labels of its super-constructor call
@@ -615,6 +617,8 @@ const RegistryImage = struct {
     mangled_nested: []StrKV,
     class_const_inits: []struct { a: []const u8, b: []const u8, v: ir.Const },
     class_prop_type_heads: []PairStrEntry,
+    class_prop_type_refs: []PairTypeEntry = &.{},
+    top_level_prop_type_refs: []NameTypeEntry = &.{},
     ext_prop_type_heads: []PairStrEntry,
     iface_member_ext_recv: []PairStrEntry,
     private_fn_files: []KV(FuncId, FileId),
@@ -1496,6 +1500,24 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
             break :blk list;
         },
         .class_prop_type_heads = try pairMapToSlice(a, &r.class_prop_type_heads),
+        .class_prop_type_refs = blk_cptr: {
+            var rows = try a.alloc(PairTypeEntry, r.class_prop_type_refs.count());
+            var it = r.class_prop_type_refs.iterator();
+            var i: usize = 0;
+            while (it.next()) |e| : (i += 1) {
+                rows[i] = .{ .a = e.key_ptr.a, .b = e.key_ptr.b, .v = e.value_ptr.* };
+            }
+            break :blk_cptr rows;
+        },
+        .top_level_prop_type_refs = blk_tptr: {
+            var rows = try a.alloc(NameTypeEntry, r.top_level_prop_type_refs.count());
+            var it = r.top_level_prop_type_refs.iterator();
+            var i: usize = 0;
+            while (it.next()) |e| : (i += 1) {
+                rows[i] = .{ .name = e.key_ptr.*, .v = e.value_ptr.* };
+            }
+            break :blk_tptr rows;
+        },
         .ext_prop_type_heads = try pairMapToSlice(a, &r.ext_prop_type_heads),
         .iface_member_ext_recv = try pairMapToSlice(a, &r.iface_member_ext_recv),
         .private_fn_files = try autoMapToSlice(FuncId, FileId, a, &r.private_fn_files),
@@ -2247,6 +2269,8 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     for (ri.mangled_nested) |kv| try r.mangled_nested.put(kv.k, kv.v);
     for (ri.class_const_inits) |entry| try r.class_const_inits.put(.{ .a = entry.a, .b = entry.b }, entry.v);
     for (ri.class_prop_type_heads) |entry| try r.class_prop_type_heads.put(.{ .a = entry.a, .b = entry.b }, entry.v);
+    for (ri.class_prop_type_refs) |entry| try r.class_prop_type_refs.put(.{ .a = entry.a, .b = entry.b }, entry.v);
+    for (ri.top_level_prop_type_refs) |entry| try r.top_level_prop_type_refs.put(entry.name, entry.v);
     for (ri.ext_prop_type_heads) |entry| try r.ext_prop_type_heads.put(.{ .a = entry.a, .b = entry.b }, entry.v);
     for (ri.iface_member_ext_recv) |entry| try r.iface_member_ext_recv.put(.{ .a = entry.a, .b = entry.b }, entry.v);
     for (ri.private_fn_files) |kv| try r.private_fn_files.put(kv.k, kv.v);

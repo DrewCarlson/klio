@@ -9635,6 +9635,33 @@ pub const Module = struct {
     /// annotation or literal initializer stated, else what the function its
     /// initializer CALLS returns. The call is resolved here rather than at
     /// registration because only now is the whole declaration set visible.
+    /// The full declared type of one top-level property declaration, where
+    /// its arguments were recorded. Null leaves the head-only answer.
+    pub fn topLevelPropTypeRef(
+        self: *const Module,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+    ) ?TypeRef {
+        const list = self.registry.top_level_prop_pkgs.get(name) orelse return null;
+        var best_tier: u8 = 255;
+        var found: ?TypeRef = null;
+        for (list.items) |pd| {
+            const t = self.scopeTier(pd.fqn, pd.package, name, caller_pkg, caller_file);
+            if (t == 255) continue;
+            const r = self.registry.top_level_prop_type_refs.get(pd.fqn);
+            if (t < best_tier) {
+                best_tier = t;
+                found = r;
+            } else if (t == best_tier) {
+                const cur = found orelse return null;
+                const new = r orelse return null;
+                if (!std.mem.eql(u8, cur.name, new.name)) return null;
+            }
+        }
+        return found;
+    }
+
     pub fn topLevelPropHeadFor(self: *const Module, fqn: []const u8) ?[]const u8 {
         if (self.registry.top_level_prop_type_heads.get(fqn)) |h| return h;
         const callee = self.registry.top_level_prop_init_callees.get(fqn) orelse return null;
@@ -10354,6 +10381,13 @@ pub const ModuleRegistry = struct {
     /// call on the property resolves against the static type, as
     /// kotlinc does.
     class_prop_type_heads: StrPairMap([]const u8),
+    /// The same key, carrying the property's FULL declared type rather than
+    /// its head — `val items: List<Named>` records `List<Named>`, not `List`.
+    /// A head alone cannot answer what iterating or indexing the property
+    /// yields, which left `items[0].tag()`, `for (i in items)` and
+    /// `items.map { it.tag() }` with no receiver type in ordinary code.
+    /// Borrowed from the lowering arena, like every other registry string.
+    class_prop_type_refs: StrPairMap(TypeRef),
     /// `(extension-receiver head, property name)` -> declared type head for
     /// TOP-LEVEL extension properties (`val IntArray.indices: IntRange`
     /// records `(IntArray, indices) -> IntRange`). Recorded in the decl
@@ -10443,6 +10477,10 @@ pub const ModuleRegistry = struct {
     /// a RECEIVER (`asserter.assertEquals(...)`) types statically. Only
     /// annotated declarations record; the head is the annotation as written.
     top_level_prop_type_heads: std.StringHashMap([]const u8),
+    /// The same key, carrying the FULL declared type where it has arguments
+    /// (`val topItems: List<Named>`). The head alone cannot say what
+    /// iterating or indexing the property yields.
+    top_level_prop_type_refs: std.StringHashMap(TypeRef),
     /// Top-level property FQN -> the simple name its UNANNOTATED initializer
     /// calls (`private val base64EncodeMap = byteArrayOf(...)`). Resolved to
     /// a head only at query time, when every declaration is registered: a
@@ -10546,6 +10584,7 @@ pub const ModuleRegistry = struct {
             .delegated_body_props = StrPairSet.init(allocator),
             .recv_fn_props = StrPairMap([]const u8).init(allocator),
             .class_prop_type_heads = StrPairMap([]const u8).init(allocator),
+            .class_prop_type_refs = StrPairMap(TypeRef).init(allocator),
             .ext_prop_type_heads = StrPairMap([]const u8).init(allocator),
             .member_ext_owner_class = std.AutoHashMap(FuncId, []const u8).init(allocator),
             .private_fn_files = std.AutoHashMap(FuncId, FileId).init(allocator),
@@ -10565,6 +10604,7 @@ pub const ModuleRegistry = struct {
             .class_const_inits = StrPairMap(Const).init(allocator),
             .top_level_prop_pkgs = std.StringHashMap(std.ArrayList(PropDecl)).init(allocator),
             .top_level_prop_type_heads = std.StringHashMap([]const u8).init(allocator),
+            .top_level_prop_type_refs = std.StringHashMap(TypeRef).init(allocator),
             .top_level_prop_init_callees = std.StringHashMap([]const u8).init(allocator),
             .callable_extension_props = std.StringHashMap(std.ArrayList(CallableExtensionProp)).init(allocator),
             .top_level_prop_getters = std.StringHashMap(FuncId).init(allocator),
@@ -10627,6 +10667,7 @@ pub const ModuleRegistry = struct {
         self.delegated_body_props.deinit();
         self.recv_fn_props.deinit();
         self.class_prop_type_heads.deinit();
+        self.class_prop_type_refs.deinit();
         self.ext_prop_type_heads.deinit();
         self.member_ext_owner_class.deinit();
         self.private_fn_files.deinit();
@@ -10683,6 +10724,7 @@ pub const ModuleRegistry = struct {
             self.top_level_prop_pkgs.deinit();
         }
         self.top_level_prop_type_heads.deinit();
+        self.top_level_prop_type_refs.deinit();
         self.top_level_prop_init_callees.deinit();
         {
             var it = self.callable_extension_props.valueIterator();
@@ -10776,6 +10818,10 @@ pub const ModuleRegistry = struct {
             while (it.next()) |e| try out.class_prop_type_heads.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
+            var it = self.class_prop_type_refs.iterator();
+            while (it.next()) |e| try out.class_prop_type_refs.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
             var it = self.ext_prop_type_heads.iterator();
             while (it.next()) |e| try out.ext_prop_type_heads.put(e.key_ptr.*, e.value_ptr.*);
         }
@@ -10858,6 +10904,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.top_level_prop_type_heads.iterator();
             while (it.next()) |e| try out.top_level_prop_type_heads.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.top_level_prop_type_refs.iterator();
+            while (it.next()) |e| try out.top_level_prop_type_refs.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.top_level_prop_init_callees.iterator();

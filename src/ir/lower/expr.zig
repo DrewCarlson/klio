@@ -2489,6 +2489,29 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 /// parameter property) walked over the owner's supertype chain. Null when the
 /// name has no statically known type here (an untyped local, an outer
 /// capture, or a name the enclosing class does not declare as a typed member).
+/// The full declared TYPE of a bare name that reads a property of the
+/// enclosing class or the extension receiver — the argument-carrying half of
+/// `staticBareReceiverType`. Only recorded for a property whose declared
+/// type has arguments that name real classes, so a `null` here simply means
+/// the head-only answer stands.
+fn staticBareReceiverTypeRef(b: *const FuncBuilder, recv_name: []const u8) ?ir.TypeRef {
+    const self_shadowed = init_self_name != null and std.mem.eql(u8, init_self_name.?, recv_name);
+    if (!self_shadowed) {
+        if (b.resolve(recv_name) != null) return null;
+        if (b.knowsOuter(recv_name)) return null;
+    }
+    const owner = b.ownerClass() orelse blk: {
+        const head = b.recvTy() orelse b.spliceRecvTy() orelse return null;
+        break :blk typeHead(std.mem.trimEnd(u8, head, "?"));
+    };
+    if (b.module.registry.class_prop_type_refs.get(.{ .a = owner, .b = recv_name })) |t| return t;
+    const chain: []const []const u8 = b.module.registry.class_super_names.get(owner) orelse &.{};
+    for (chain) |cls| {
+        if (b.module.registry.class_prop_type_refs.get(.{ .a = cls, .b = recv_name })) |t| return t;
+    }
+    return null;
+}
+
 fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const u8 {
     // Inside `val writer = writer`'s initializer the local's own name is
     // free (recorded at the decl), so the reference is the enclosing
@@ -9056,6 +9079,9 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             }
         }
     }
+    // The full declared type wins over its head: `items[0].tag()` and
+    // `for (i in items)` need the ARGUMENTS the head throws away.
+    if (staticBareReceiverTypeRef(b, p.segments[0].name)) |full| return full;
     if (staticBareReceiverType(b, p.segments[0].name)) |head| {
         return .{ .name = head, .nullable = false, .args = &.{} };
     }
@@ -9072,6 +9098,7 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (b.resolve(nm) == null and !b.knowsOuter(nm) and !enclosingHasMemberNamed(b, nm)) {
         const file = p.segments[0].span.file;
         const pkg = b.module.packageOfFile(file) orelse b.self_package;
+        if (b.module.topLevelPropTypeRef(nm, pkg, file)) |full| return full;
         if (b.module.topLevelPropTypeHead(nm, pkg, file)) |head| {
             return .{ .name = head, .nullable = false, .args = &.{} };
         }

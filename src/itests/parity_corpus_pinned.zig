@@ -2243,3 +2243,14 @@ test "star_projection_element_type" {
         \\
     );
 }
+
+test "generic_property_type_arguments" {
+    try check("generic_property_type_arguments",
+        \\<a>
+        \\<a><b>
+        \\<a>,<b>
+        \\<c>
+        \\<t>
+        \\
+    );
+}

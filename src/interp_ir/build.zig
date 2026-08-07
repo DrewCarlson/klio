@@ -1038,6 +1038,18 @@ fn notePropScope(
     if (p.ty) |*ty| {
         if (ty.function == null and ty.name.name.len != 0) {
             try module.registry.top_level_prop_type_heads.put(fqn, ty.name.name);
+            if (ty.type_args.len != 0) {
+                var concrete = true;
+                for (ty.type_args) |*ta| {
+                    if (ta.is_star or ta.ty.name.name.len == 0) concrete = false;
+                }
+                if (concrete) {
+                    try module.registry.top_level_prop_type_refs.put(
+                        fqn,
+                        try ir.lower.decl.loweredTypeRef(a, ty, true),
+                    );
+                }
+            }
         }
     } else if (p.init) |*init| {
         // An UNANNOTATED property states its type through a literal
@@ -1363,6 +1375,31 @@ fn varargPropArrayHead(elem: []const u8) []const u8 {
     if (eq(u8, elem, "UInt")) return "UIntArray";
     if (eq(u8, elem, "ULong")) return "ULongArray";
     return "Array";
+}
+
+/// Record a class property's FULL declared type beside its head. Only a
+/// type with ARGUMENTS is worth storing — a head-only entry already answers
+/// through `class_prop_type_heads`, and the argument list is the whole point
+/// (`val items: List<Named>` says what iterating or indexing it yields).
+/// A type ARGUMENT that is one of the class's own parameters is dropped: it
+/// names nothing outside an instantiation, and a partial list is worse than
+/// none.
+fn notePropTypeRef(
+    a: Allocator,
+    module: *Module,
+    c: *const ast.Class,
+    prop_name: []const u8,
+    ty: *const ast.TypeRef,
+) Allocator.Error!void {
+    if (ty.function != null or ty.type_args.len == 0) return;
+    for (ty.type_args) |*ta| {
+        if (ta.is_star) return;
+        for (c.type_params) |*tp| {
+            if (std.mem.eql(u8, tp.name.name, ta.ty.name.name)) return;
+        }
+    }
+    const lowered = try ir.lower.decl.loweredTypeRef(a, ty, true);
+    try module.registry.class_prop_type_refs.put(.{ .a = c.name.name, .b = prop_name }, lowered);
 }
 
 fn classPropHead(c: *const ast.Class, ty: *const ast.TypeRef) ?[]const u8 {
@@ -1998,6 +2035,7 @@ fn buildModuleWithOverrides(
                     );
                 } else if (classPropHead(c, &pp.ty)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = pp.name.name }, head);
+                    try notePropTypeRef(a, module, c, pp.name.name, &pp.ty);
                 }
             }
             for (c.members) |*m| {
@@ -2044,6 +2082,7 @@ fn buildModuleWithOverrides(
                 if (ty_opt) |ty| {
                     if (classPropHead(c, ty)) |head| {
                         try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
+                        try notePropTypeRef(a, module, c, prop.name.name, ty);
                     }
                 } else if (propCtorHeadEvidence(prop, decls)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
