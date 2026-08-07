@@ -4578,3 +4578,19 @@ receiver-typing channel combined, in both dispatch count and wall clock.
 The lesson for the next front: rank by `[dispatch-stats]` totals, confirm
 with wall clock, and use `[lower-sites]` to find the mechanism once the cost
 is known.
+
+## Standing (both instruments)
+
+    RUNTIME, census program
+      call_member_or_global   3,788,055 -> 10,552    8.88% -> 0.04%
+      wall clock                  73.5s -> 28.6s     2.6x
+
+    LOWERING, explicit-receiver call sites
+      stdlib census    8881 / 9046    98.18% bound   (from 92.73%)
+      examples census 99901 /101377   98.54% bound
+
+    LOWERING, bare calls (KLIO_OR_AUDIT, by emitted instruction)
+      Call/bare-extension  3338   static
+      Call/implicit-member 2136   static
+      Call/bare-member      413   static
+      CallMemberOrGlobal   2077   resolves by name
