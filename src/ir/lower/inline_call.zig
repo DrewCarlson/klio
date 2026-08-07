@@ -1531,7 +1531,7 @@ pub fn tryInlineCallWithTypeArgs(
     if (build.FuncBuilder.spliceRefDebug()) {
         std.debug.print("[splice-ref] fn={s} this_arg={s} ref={?s}<{d}>\n", .{
             f.name.name,
-            if (this_arg) |ra| @tagName(std.meta.activeTag(ra.*)) else "-",
+            if (this_arg) |ra| (if (ra.* == .Path and ra.Path.segments.len != 0) ra.Path.segments[ra.Path.segments.len - 1].name else @tagName(std.meta.activeTag(ra.*))) else "-",
             if (recv_ref_owned) |r| r.name else null,
             if (recv_ref_owned) |r| r.args.len else 0,
         });
