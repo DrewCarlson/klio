@@ -4980,3 +4980,54 @@ preserving — `remove` is deliberately NOT in the set, since
 
 Green: commontest 117/0, drift 267/267, litmus 42/43 (the known
 `tl_atomic_update_contended` timeout), units, compose exit 0 / 1316 vs 1275.
+
+### An overload set never cached its pick
+
+The ladder census was two entries, not a long tail:
+
+    16,873  <ladder>DefaultAsserter.assertTrue
+     8,466  <ladder>kotlin.collections.MutableList.set
+     ~1,000 and below, everything else
+
+`DefaultAsserter.assertTrue` is an interface DEFAULT — `DefaultAsserter`
+declares only `fail`. That was the first hypothesis and it is wrong: a
+repro with an inherited default flat-dispatches on the first call and
+memoizes. What reproduces is the OVERLOAD SET:
+
+    interface I {
+        fun f(msg: () -> String?, actual: Boolean): Int = ...
+        fun f(msg: String?, actual: Boolean): Int = ...
+    }
+
+200 calls, 200 ladder entries. The resolution walk ends at
+
+    if (resolved.unambiguous) instanceMethodCachePutRaw(...)
+
+with `unambiguous = candidates.items.len == 1`, so a name with two
+declarations was re-walked on EVERY call forever — and because
+`prepareMemberFlatCall` serves from that same cache, it also never flattened
+and never claimed a site memo.
+
+The guard is stronger than it needs to be. The STRICT key already folds every
+discriminator the pick consults: the receiver class and name that fix the
+candidate set, and per argument a tag plus its class identity, closure body +
+module, function decl pointer, or primitive array kind. For a fixed strict key
+the pick is a pure function of the key, so storing it cannot serve an overload
+the walk would not have chosen. Only the RELAXED key (container kind tags, no
+identity) still needs the single-candidate guarantee, since two overloads can
+share its coarser signature.
+
+    ladder      29,380 -> 12,505
+    site memo    ~0    -> 17,000
+
+Wall clock is again FLAT (28.52s / 28.55s against 28.6s). Both channels
+closed this session moved work off the dynamic paths without moving the
+clock, which is worth stating plainly: the remaining dispatch cost of this
+program is not in name resolution.
+
+`overload_set_lambda_discriminated` pins the semantics that matter — the
+lambda/String? pair, a Base/Derived pair, and an Int/String pair each keep
+resolving to the right member on repeat calls.
+
+Green: commontest 117/0, drift 267/267, litmus 42/43 (known timeout), units,
+compose exit 0 / 1314 vs 1275.

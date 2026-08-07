@@ -2343,3 +2343,12 @@ test "unsigned_scalar_intrinsic_dispatch" {
         \\
     );
 }
+
+test "overload_set_lambda_discriminated" {
+    try check("overload_set_lambda_discriminated",
+        \\10 12
+        \\base/derived/base/derived
+        \\int/string/int/string
+        \\
+    );
+}

@@ -10822,7 +10822,16 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         if (key) |k| instanceMethodCachePutRaw(self, k, METHOD_MISS);
         return null;
     };
-    if (resolved.unambiguous) {
+    // The STRICT key folds every discriminator the overload pick consults:
+    // each argument's tag plus its class identity, closure body, or function
+    // decl pointer, alongside the receiver class and name that fix the
+    // candidate set. For a fixed strict key the pick is therefore a pure
+    // function of the key, and storing it cannot serve an overload the walk
+    // would not have chosen — so a resolution that had SEVERAL candidates is
+    // still cacheable. Only the RELAXED key (container kind tags, no
+    // identity) needs the single-candidate guarantee, since two overloads can
+    // share its coarser signature.
+    if (resolved.unambiguous or strict_key != null) {
         if (key) |k| instanceMethodCachePutRaw(self, k, @intFromEnum(resolved.fid));
     }
     return try invokeMethodFuncId(self, allocator, receiver, resolved.fid, args);
