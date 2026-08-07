@@ -4143,3 +4143,24 @@ give 97.92% and 97.97%. Corrected in place. The stdlib figures were right.
 
     stdlib census    8837 / 9077   97.36% bound
     examples census 99528 /101591  97.97% bound
+
+### The extension-return substitution: traced, not guessed, and still open
+
+Following the lesson above, the extension-call receiver was TRACED before
+any rule was written. `memberCallReturnTypeRef` does reach
+`recv=Collection<1>` for `first` — the receiver types correctly, and 38
+declarations carry the name — but a probe placed inside the extension loop
+never fires. Something between the two returns first, and the suspect is the
+MEMBER probe loop above it: it answers `return null` on an undeclared return
+rather than falling through to the extensions.
+
+Recorded rather than patched: the fix is to make that loop fall through
+instead of returning, which changes every consumer of the member branch, and
+that deserves its own measurement rather than being folded into a
+substitution change. The probe belongs in the plan so the next attempt starts
+from the traced fact instead of re-deriving it.
+
+## Standing
+
+    stdlib census    8837 / 9077   97.36% bound
+    examples census 99528 /101591  97.97% bound
