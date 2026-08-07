@@ -2286,3 +2286,12 @@ test "splice_receiver_survives_delegation" {
         \\
     );
 }
+
+test "unsigned_arithmetic_promotion" {
+    try check("unsigned_arithmetic_promotion",
+        \\9,99,103,8,10,30,5
+        \\0..3
+        \\4294967295..0
+        \\
+    );
+}
