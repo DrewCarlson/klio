@@ -2503,6 +2503,31 @@ pub const Module = struct {
     /// the argument's class is a `Collection` — which is exactly what
     /// Kotlin checks when it gives `set.addAll(collection)` to the member
     /// rather than the `Iterable` extension beside it.
+    /// The mirror of `erasedHeadProves`: a star-erased slot the argument's
+    /// head does NOT satisfy is a definite mismatch, so the member is not
+    /// the target and the same-named extension beside it is. Restricted to
+    /// heads the module KNOWS, so an unresolved or host-only name — whose
+    /// hierarchy this module cannot see — never refutes.
+    fn erasedHeadRefutes(
+        self: *const Module,
+        erased: bool,
+        param_ty: TypeRef,
+        sh: applicability.ArgShape,
+    ) bool {
+        if (!erased) return false;
+        const arg_ty = sh.ty orelse return false;
+        if (sh.is_lambda or sh.is_null or sh.is_spread) return false;
+        const ah = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, arg_ty.name, "?")));
+        const ph = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, param_ty.name, "?")));
+        if (ah.len == 0 or ph.len == 0) return false;
+        if (ah.len <= 2 and std.ascii.isUpper(ah[0])) return false;
+        if (ph.len <= 2 and std.ascii.isUpper(ph[0])) return false;
+        if (std.mem.eql(u8, ah, ph)) return false;
+        if (self.uniqueClassIdBySimpleName(ah) == null and self.classIdByFqn(ah) == null) return false;
+        if (self.uniqueClassIdBySimpleName(ph) == null and self.classIdByFqn(ph) == null) return false;
+        return !self.classIsOrExtends(ah, ph);
+    }
+
     fn erasedHeadProves(
         self: *const Module,
         erased: bool,
@@ -2655,7 +2680,10 @@ pub const Module = struct {
                     }
                     return false;
                 },
-                .unknown => if (!param_still_tp and !erasedHeadProves(self, param_args_erased, param_ty, sh)) {
+                .unknown => if (erasedHeadRefutes(self, param_args_erased, param_ty, sh)) {
+                    mpp_why = "member-arg-refuted";
+                    return false;
+                } else if (!param_still_tp and !erasedHeadProves(self, param_args_erased, param_ty, sh)) {
                     if (runtime.envSetOnce("KLIO_PROMO_NAMES")) {
                         std.debug.print("[promo-unknown] {s}.{s} param={s}<{d}> arg={s}<{d}> lit={} lam={}\n", .{
                             head,
