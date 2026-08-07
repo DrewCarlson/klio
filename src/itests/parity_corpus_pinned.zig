@@ -2329,3 +2329,17 @@ test "char_intrinsic_direct_dispatch" {
         \\
     );
 }
+
+test "unsigned_scalar_intrinsic_dispatch" {
+    try check("unsigned_scalar_intrinsic_dispatch",
+        \\1
+        \\{1=1, 2=2}
+        \\255
+        \\7
+        \\97
+        \\3
+        \\true
+        \\9223372036854775807
+        \\
+    );
+}

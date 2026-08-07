@@ -9786,14 +9786,11 @@ fn noteSlotByName(self: *VmHost, slot: MethodSlotId, name: []const u8) void {
 /// walk to unpack on the way in.
 fn isScalarValue(v: *const Value) bool {
     return switch (v.*) {
-        // Restricted to `Char` by measurement: the unsigned variants abort
-        // `UnsignedArraysTest` / `UComparisonsTest` through this path, so
-        // whatever the by-name walk does for them is load-bearing and is not
-        // captured by "the receiver is a scalar".
-        .Char => true,
+        .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Bool, .Char => true,
         else => false,
     };
 }
+
 
 fn noinstTraceOn() bool {
     const S = struct {
@@ -9927,11 +9924,20 @@ pub fn invokeVirtualMember(
                         // an `Iterator` is a host generator) keep the walk —
                         // that is where the conversion lives, and binding
                         // them by id returned `Success` for a `Failure`.
+                        // Only where the native IS the whole implementation.
+                        // A declaration that also carries a BODY is written
+                        // against the boxed representation — `UInt.toString()`
+                        // is `uintToString(data)`, and `data` does not exist on
+                        // a scalar — so reaching it by FuncId runs a body the
+                        // receiver cannot satisfy. The by-name walk is what
+                        // lands on the intrinsic for those.
                         if (isScalarValue(receiver)) {
                             if (module.methodSlotTarget(runtime_class, slot)) |slot_target| {
-                                if (host_call_func.resolvedNativeForm(self, slot_target)) |target_native| {
-                                    if (target_native == native)
-                                        break :blk .{ .target = slot_target, .name = n };
+                                if (!host_call_func.funcHasBody(self, module, slot_target)) {
+                                    if (host_call_func.resolvedNativeForm(self, slot_target)) |target_native| {
+                                        if (target_native == native)
+                                            break :blk .{ .target = slot_target, .name = n };
+                                    }
                                 }
                             }
                         }

@@ -2918,3 +2918,11 @@ test "abstract classes do not compete with same-named factory functions" {
 test {
     testing.refAllDecls(@This());
 }
+
+/// Whether a declaration carries a body of its own, as opposed to being a
+/// bodyless declaration whose native form is the entire implementation.
+pub fn funcHasBody(self: *VmHost, module: *const Module, func: FuncId) bool {
+    _ = self;
+    const f = funcAt(module, func) orelse return false;
+    return f.hasBody();
+}

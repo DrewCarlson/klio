@@ -4906,3 +4906,38 @@ currently records it. `Char`'s conversions are leaf functions; the unsigned
 formatting path is not. Whoever takes this next should look for that
 property rather than widen the type list — widening is what the measurement
 already refuted.
+
+### The gate is a body, not a receiver kind
+
+The re-entrance theory above is wrong and the guard built for it measured no
+change — `1u.toString()` alone still exhausted RSS with a per-slot recursion
+guard in place, so the growth was never a cycle through one slot.
+
+The actual gate is visible in the declaration:
+
+    public override fun toString(): String = uintToString(data)
+
+`UInt.toString()` carries a BODY, and that body is written against the boxed
+representation — it reads `data`, a field a scalar `.UInt` does not have.
+Reaching it by FuncId runs a body the receiver cannot satisfy. `Char`'s
+conversions have no body at all: the native form IS the implementation, which
+is why `Char` alone survived the earlier sweep and looked like a fact about
+scalars.
+
+So the condition is `!hasBody()` on the slot target, and with it every scalar
+variant is safe:
+
+    Char only, no body test        68,987 -> 59,457
+    all scalars, bodyless target   68,987 -> 46,421
+
+which is exactly the number the unrestricted all-scalars attempt reached
+before it aborted. The restriction cost nothing; it was in the wrong place.
+
+Green at 46,421: commontest 117/0, drift 267/267, litmus 42/43 (the known
+`tl_atomic_update_contended` timeout), units, compose exit 0 / 1314 vs 1275.
+Pinned by `unsigned_scalar_intrinsic_dispatch`.
+
+This also answers task #15 in the narrow case: a declaration's body and its
+host symbol have DIFFERENT calling conventions whenever the body assumes a
+boxed receiver, and `hasBody()` is a cheap, sound way to tell the two apart
+without unifying them.
