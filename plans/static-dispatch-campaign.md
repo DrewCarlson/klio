@@ -4717,6 +4717,36 @@ Which makes this the shape of the remaining work, stated exactly:
     must name the intrinsic directly, because there is no name walk to fall
     back on in generated C.
 
+### "Degrade" was the wrong word, and the code said so first
+
+The obvious fix was tried: where the slot's own target links to the SAME
+host symbol the name walk would find, dispatch it by FuncId instead —
+identical implementation, no lookup, guarded on exact symbol equality.
+
+    slot by-name walks  68,987 -> 45,643
+
+and four stdlib tests fail:
+
+    ResultTest.testRunCatchingFailure  Expected <Failure(...)>, actual <Success(...)>
+    ResultTest.testConstructedSuccess
+    ResultTest.testConstructedFailure
+    UComparisonsTest                    exit=-6
+
+The comment sitting directly above that branch had already said why:
+"the interpreted source body reads a source-level representation the host
+value never materializes (`Result.toString` matches on the `Failure`
+wrapper; the host Result stores a discriminant and the raw payload)".
+Symbol equality is not enough — the two paths differ in how the RECEIVER
+arrives, and the by-name walk performs the representation conversion that
+the FuncId entry does not.
+
+So for a host-backed receiver the name walk is not a degrade at all. It is
+the host-value conversion boundary, and counting it as "static dispatch we
+failed to achieve" was wrong. The counter stays — it is the right measure of
+the boundary's size — but 68,987 is the cost of the host-value model, not a
+defect, and closing it means giving those members a REPRESENTATION as well
+as a declaration.
+
 So the target is not "bind the slot" but "emit the intrinsic". That is
 P10's host-declaration manifest reaching its conclusion: once a host member
 carries a declaration, a receiver whose static type is that host class can
