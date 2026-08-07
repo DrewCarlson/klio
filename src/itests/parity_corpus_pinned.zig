@@ -2254,3 +2254,13 @@ test "generic_property_type_arguments" {
         \\
     );
 }
+
+test "generic_property_read_substitution" {
+    try check("generic_property_read_substitution",
+        \\<c><d>
+        \\<c>,<d>
+        \\1,2
+        \\<x><y>
+        \\
+    );
+}

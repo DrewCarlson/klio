@@ -1381,9 +1381,11 @@ fn varargPropArrayHead(elem: []const u8) []const u8 {
 /// type with ARGUMENTS is worth storing — a head-only entry already answers
 /// through `class_prop_type_heads`, and the argument list is the whole point
 /// (`val items: List<Named>` says what iterating or indexing it yields).
-/// A type ARGUMENT that is one of the class's own parameters is dropped: it
-/// names nothing outside an instantiation, and a partial list is worse than
-/// none.
+/// A type ARGUMENT that is one of the class's own parameters is KEPT: the
+/// read site substitutes it from the receiver's own arguments
+/// (`Map<K, V>.values: Collection<V>` on a `Map<String, Named>` receiver is
+/// a `Collection<Named>`). Where the receiver carries no arguments the
+/// substitution declines and the head-only answer stands.
 fn notePropTypeRef(
     a: Allocator,
     module: *Module,
@@ -1394,9 +1396,6 @@ fn notePropTypeRef(
     if (ty.function != null or ty.type_args.len == 0) return;
     for (ty.type_args) |*ta| {
         if (ta.is_star) return;
-        for (c.type_params) |*tp| {
-            if (std.mem.eql(u8, tp.name.name, ta.ty.name.name)) return;
-        }
     }
     const lowered = try ir.lower.decl.loweredTypeRef(a, ty, true);
     try module.registry.class_prop_type_refs.put(.{ .a = c.name.name, .b = prop_name }, lowered);

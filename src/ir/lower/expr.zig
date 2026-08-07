@@ -2494,6 +2494,56 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 /// `staticBareReceiverType`. Only recorded for a property whose declared
 /// type has arguments that name real classes, so a `null` here simply means
 /// the head-only answer stands.
+/// A class property's FULL declared type, following the supertype chain the
+/// head lookup follows.
+fn propTypeRefOn(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?ir.TypeRef {
+    if (b.module.registry.class_prop_type_refs.get(.{ .a = owner, .b = name })) |t| return t;
+    const chain: []const []const u8 = b.module.registry.class_super_names.get(owner) orelse &.{};
+    for (chain) |cls| {
+        if (b.module.registry.class_prop_type_refs.get(.{ .a = cls, .b = name })) |t| return t;
+    }
+    return null;
+}
+
+/// A declared property type with the OWNER's type parameters replaced by the
+/// receiver's own type arguments. Null when any argument stays a parameter —
+/// a partial answer says nothing the head does not already say.
+fn substitutedPropType(
+    b: *FuncBuilder,
+    owner: []const u8,
+    recv_ty: ir.TypeRef,
+    declared: ir.TypeRef,
+) ?ir.TypeRef {
+    if (declared.args.len == 0) return declared;
+    if (recv_ty.args.len == 0) return null;
+    const cid = b.module.uniqueClassIdBySimpleName(owner) orelse
+        b.module.classIdByFqn(owner) orelse return null;
+    if (cid.int() >= b.module.classes.items.len) return null;
+    const tps = b.module.classes.items[cid.int()].type_params;
+    if (tps.len == 0 or tps.len != recv_ty.args.len) return null;
+    var buf: [4]ir.TypeRef = undefined;
+    if (declared.args.len > buf.len) return null;
+    for (declared.args, 0..) |darg, i| {
+        const dh = typeHead(std.mem.trimEnd(u8, darg.name, "?"));
+        var found = false;
+        for (tps, 0..) |tp, j| {
+            if (!std.mem.eql(u8, tp, dh)) continue;
+            const sub = recv_ty.args[j];
+            if (sub.name.len == 0 or std.mem.eql(u8, sub.name, "*")) return null;
+            if (bareTypeParamHead(sub.name)) return null;
+            buf[i] = sub;
+            found = true;
+            break;
+        }
+        if (!found) {
+            if (bareTypeParamHead(darg.name)) return null;
+            buf[i] = darg;
+        }
+    }
+    const owned = b.allocator.dupe(ir.TypeRef, buf[0..declared.args.len]) catch return null;
+    return ir.TypeRef{ .name = declared.name, .nullable = declared.nullable, .args = owned };
+}
+
 fn staticBareReceiverTypeRef(b: *const FuncBuilder, recv_name: []const u8) ?ir.TypeRef {
     const self_shadowed = init_self_name != null and std.mem.eql(u8, init_self_name.?, recv_name);
     if (!self_shadowed) {
@@ -8725,6 +8775,13 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             var h = std.mem.trimEnd(u8, rt.name, "?");
             if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
             const head = typeHead(h);
+            // The property's FULL declared type, with the owner's type
+            // parameters substituted from the receiver's own arguments:
+            // `Map<K, V>.values` read off a `Map<String, Named>` is a
+            // `Collection<Named>`, and iterating it needs the element.
+            if (propTypeRefOn(b, head, m.name.name)) |declared| {
+                if (substitutedPropType(b, head, rt, declared)) |full| return full;
+            }
             if (propTypeHeadOn(b, head, m.name.name) orelse
                 extPropReturnHead(b, head, m.name.name)) |ph|
             {
