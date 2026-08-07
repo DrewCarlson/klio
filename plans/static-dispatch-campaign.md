@@ -4839,3 +4839,36 @@ unifying that convention — a shared entry shape for the interpreted body
 and the host symbol — not a smarter choice at the call site. That is a real
 project with a clear definition, and it is the honest end of this campaign's
 reach.
+
+### The design already encodes the rule, and it separates the two subsets
+
+The link that settles a declaration's native form declines a body-bearing
+one deliberately, and the comment states why: "the native representation may
+cover only builtin receiver values, while Kotlin's declaration also accepts
+user-defined subtypes". There is a curated escape hatch,
+`intrinsicOverridesBody`, with exactly one entry.
+
+That reasoning has a sound extension: a FINAL class has no user-defined
+subtype, so the native form covers every receiver its declaration can ever
+see. Allowing the link to settle those:
+
+    slot by-name walks  68,987 -> 68,987   (no change at all)
+
+and the reason is the useful part. The loop iterates `decl_sigs` looking for
+a `host_symbol`, and the builtin-type members HAVE NO DECLARATION — that is
+the audit's other 1,281. The rule could not fire because there was nothing
+to fire on.
+
+So the remaining dynamic dispatch is two disjoint problems, not one:
+
+  * **builtin-type members** (`Iterator.hasNext`, `Char.toInt`, `Int.shr`) —
+    1,281 with no Kotlin declaration anywhere. The by-name walk is the only
+    thing that can find them. Needs declarations; the calling convention is
+    not the obstacle because there is no body to disagree with.
+  * **body-carrying stdlib declarations that also have an intrinsic**
+    (`maxOf`, `Result.toString`) — the declaration exists and the two
+    implementations differ in argument shape and receiver representation.
+    Needs the shared entry shape.
+
+The earlier note collapsed these into one root. They are separate, they have
+different fixes, and only the second one is blocked on convention.
