@@ -2303,3 +2303,160 @@ test "nested_class_property_type" {
         \\
     );
 }
+
+test "constructor_scope_param_types" {
+    try check("constructor_scope_param_types",
+        \\3<a>|
+        \\1<b>|<c>7
+        \\
+    );
+}
+
+test "nested_qualified_constructor" {
+    try check("nested_qualified_constructor",
+        \\i1/d2
+        \\
+    );
+}
+
+test "char_intrinsic_direct_dispatch" {
+    try check("char_intrinsic_direct_dispatch",
+        \\1194
+        \\120/121/122
+        \\Ab
+        \\535
+        \\-1,1,0
+        \\
+    );
+}
+
+test "unsigned_scalar_intrinsic_dispatch" {
+    try check("unsigned_scalar_intrinsic_dispatch",
+        \\1
+        \\{1=1, 2=2}
+        \\255
+        \\7
+        \\97
+        \\3
+        \\true
+        \\9223372036854775807
+        \\
+    );
+}
+
+test "overload_set_lambda_discriminated" {
+    try check("overload_set_lambda_discriminated",
+        \\10 12
+        \\base/derived/base/derived
+        \\int/string/int/string
+        \\
+    );
+}
+
+test "char_compare_to_code_difference" {
+    try check("char_compare_to_code_difference",
+        \\-2
+        \\2
+        \\0
+        \\-32
+        \\-1
+        \\1
+        \\-1
+        \\[a, b, c]
+        \\true
+        \\true
+        \\
+    );
+}
+
+test "string_compare_to_difference" {
+    try check("string_compare_to_difference",
+        \\-2
+        \\2
+        \\0
+        \\-2
+        \\2
+        \\-3
+        \\-32
+        \\0
+        \\0
+        \\[apple, fig, pear]
+        \\true
+        \\
+    );
+}
+
+test "collection_slot_direct_intrinsic" {
+    try check("collection_slot_direct_intrinsic",
+        \\[7, 1, 2, 4]
+        \\4
+        \\false
+        \\true
+        \\2
+        \\[7, 1]
+        \\[7, 1, 2, 4, 5, 6]
+        \\[7, 1, 2, 4, 6]
+        \\[a, c]
+        \\false
+        \\2
+        \\{y=2}
+        \\1
+        \\false
+        \\true
+        \\6
+        \\1
+        \\1
+        \\false
+        \\
+    );
+}
+
+test "null_literal_widens_type_argument" {
+    try check("null_literal_widens_type_argument",
+        \\[f, o, o, b, a, r]
+        \\[foo, bar]
+        \\3
+        \\[a]
+        \\2
+        \\[b]
+        \\[1]
+        \\2
+        \\2
+        \\
+    );
+}
+
+test "overload_tied_on_lambda_return" {
+    try check("overload_tied_on_lambda_return",
+        \\[f, o, b, a, r]
+        \\[f, o, b, a, r]
+        \\[f, o, o, b, a, r]
+        \\[f, o, o, b, a, r]
+        \\
+    );
+}
+
+test "splice_window_receiver_typing" {
+    try check("splice_window_receiver_typing",
+        \\bca
+        \\abc
+        \\x
+        \\
+    );
+}
+
+test "vararg_forward_named_skip" {
+    try check("vararg_forward_named_skip",
+        \\strings:2:0:true:0
+        \\chars:1:0:false:7
+        \\
+    );
+}
+
+test "type_param_bounded_by_type_param" {
+    try check("type_param_bounded_by_type_param",
+        \\foobar/foo/2/list-typed
+        \\[1, 3, 6]
+        \\
+    );
+}

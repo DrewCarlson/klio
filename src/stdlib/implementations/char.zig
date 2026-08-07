@@ -341,7 +341,11 @@ pub fn char_compare_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("Char.compareTo requires a Char");
     }
     const b = ctx.args[1].Char;
-    const result: i32 = if (a < b) -1 else @intFromBool(a > b);
+    // kotlinc compiles `Char.compareTo` to `Character.compare`, which is the
+    // CODE DIFFERENCE, not a sign: `'a'.compareTo('c')` is -2 on the JVM.
+    // `Comparable` only requires the sign, but a program that prints the
+    // result sees the difference, so klio matches it.
+    const result: i32 = @as(i32, @intCast(a)) - @as(i32, @intCast(b));
     return ok(.{ .Int = result });
 }
 

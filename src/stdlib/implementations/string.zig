@@ -1309,6 +1309,28 @@ fn compareIgnoreCaseUtf8(a: []const u8, b: []const u8) std.math.Order {
     }
 }
 
+/// `compareIgnoreCaseUtf8` returning kotlinc's VALUE: `compareToIgnoreCase`
+/// is the difference of the case-folded units at the first mismatch, and the
+/// length difference when one string is a prefix of the other.
+fn compareIgnoreCaseUtf8Difference(a: []const u8, b: []const u8) i32 {
+    var ia = (std.unicode.Utf8View.init(a) catch return text.compareUtf16Difference(a, b)).iterator();
+    var ib = (std.unicode.Utf8View.init(b) catch return text.compareUtf16Difference(a, b)).iterator();
+    while (true) {
+        const ca = ia.nextCodepoint();
+        const cb = ib.nextCodepoint();
+        if (ca == null and cb == null) return 0;
+        if (ca == null or cb == null) return text.utf16Len(a) - text.utf16Len(b);
+        if (ca.? == cb.?) continue;
+        const ua = scalarToUpper(ca.?);
+        const ub = scalarToUpper(cb.?);
+        if (ua != ub) {
+            const la = scalarToLower(ua);
+            const lb = scalarToLower(ub);
+            if (la != lb) return @as(i32, @intCast(la)) - @as(i32, @intCast(lb));
+        }
+    }
+}
+
 pub fn string_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     const r = try recvString(ctx.allocator, ctx.args, "String.compareTo");
     const s = switch (r) {
@@ -1321,15 +1343,10 @@ pub fn string_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = ctx.args[1].String.borrow();
     defer g.deinit();
     const ignore_case = ctx.args.len > 2 and ctx.args[2] == .Bool and ctx.args[2].Bool;
-    const order = if (ignore_case)
-        compareIgnoreCaseUtf8(s, g.get().bytes)
+    const v: i32 = if (ignore_case)
+        compareIgnoreCaseUtf8Difference(s, g.get().bytes)
     else
-        text.compareUtf16(s, g.get().bytes);
-    const v: i32 = switch (order) {
-        .lt => -1,
-        .eq => 0,
-        .gt => 1,
-    };
+        text.compareUtf16Difference(s, g.get().bytes);
     return .{ .ok = .{ .Int = v } };
 }
 
@@ -3472,10 +3489,12 @@ test "repeat and reversed" {
     }
 }
 
-test "compareTo orders lexicographically" {
+test "compareTo yields the code-unit difference kotlinc yields" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    // `'c' - 'd'` is -1, so this pair passes under a sign-only result too;
+    // the cases below are the ones that distinguish them.
     {
         var ctx = ctxFor(a, &.{ try strVal(a, "abc"), try strVal(a, "abd") });
         try testing.expectEqual(@as(i32, -1), (try string_compare_to(&ctx)).ok.Int);
@@ -3483,6 +3502,33 @@ test "compareTo orders lexicographically" {
     {
         var ctx = ctxFor(a, &.{ try strVal(a, "abc"), try strVal(a, "abc") });
         try testing.expectEqual(@as(i32, 0), (try string_compare_to(&ctx)).ok.Int);
+    }
+    // First mismatch: the difference of the code units, not its sign.
+    {
+        var ctx = ctxFor(a, &.{ try strVal(a, "a"), try strVal(a, "c") });
+        try testing.expectEqual(@as(i32, -2), (try string_compare_to(&ctx)).ok.Int);
+    }
+    {
+        var ctx = ctxFor(a, &.{ try strVal(a, "A"), try strVal(a, "a") });
+        try testing.expectEqual(@as(i32, -32), (try string_compare_to(&ctx)).ok.Int);
+    }
+    // A prefix: the LENGTH difference in UTF-16 code units.
+    {
+        var ctx = ctxFor(a, &.{ try strVal(a, "ab"), try strVal(a, "abcd") });
+        try testing.expectEqual(@as(i32, -2), (try string_compare_to(&ctx)).ok.Int);
+    }
+    {
+        var ctx = ctxFor(a, &.{ try strVal(a, ""), try strVal(a, "abc") });
+        try testing.expectEqual(@as(i32, -3), (try string_compare_to(&ctx)).ok.Int);
+    }
+    // `ignoreCase` folds first, then takes the same difference.
+    {
+        var ctx = ctxFor(a, &.{ try strVal(a, "A"), try strVal(a, "a"), .{ .Bool = true } });
+        try testing.expectEqual(@as(i32, 0), (try string_compare_to(&ctx)).ok.Int);
+    }
+    {
+        var ctx = ctxFor(a, &.{ try strVal(a, "a"), try strVal(a, "C"), .{ .Bool = true } });
+        try testing.expectEqual(@as(i32, -2), (try string_compare_to(&ctx)).ok.Int);
     }
 }
 

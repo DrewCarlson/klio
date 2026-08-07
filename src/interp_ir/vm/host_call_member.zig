@@ -4274,9 +4274,21 @@ fn builtinIntrinsicReplay(self: *VmHost, allocator: Allocator, receiver: *const 
     return null;
 }
 
+/// How many named member calls the builtin intrinsic REPLAY serves outright,
+/// versus reaching the probe ladder proper. `member_ladder` counts the route,
+/// not the work, so the two are not the same number.
+var replay_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+pub fn replayHits() u64 {
+    return replay_hits.load(.monotonic);
+}
+
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
     if (receiver.* != .Instance and !strict_ext and !no_ext and static_recv == null and declared_recv == null) {
-        if (try builtinIntrinsicReplay(self, allocator, receiver, name, args)) |r| return r;
+        if (try builtinIntrinsicReplay(self, allocator, receiver, name, args)) |r| {
+            _ = replay_hits.fetchAdd(1, .monotonic);
+            return r;
+        }
     }
     // A property whose declared type is a RECEIVER function type
     // (`var handler: (suspend Scope.() -> Unit)?`) invoked as a call:
@@ -9770,9 +9782,141 @@ pub fn slotByNameFallbacks() u64 {
     return slot_by_name_count.load(.monotonic);
 }
 
-fn noteSlotByName(self: *VmHost, slot: MethodSlotId, name: []const u8) void {
+/// A builtin member whose implementation is a host function reached by
+/// RECEIVER VARIANT rather than by FQN, so `linkBodyless` finds no native for
+/// it and a statically bound slot call declines to a member-name walk
+/// (`KLIO_NOINST_WHY` reports `target-not-executable`). Binding the target
+/// `FuncId` to the handler settles the call by id instead.
+///
+/// The FQN comparison happens ONCE per `FuncId` per thread; every later call
+/// on that slot is an integer probe. The handlers are the existing ones — a
+/// second implementation here is exactly the duplication this avoids.
+const HostSlotOp = enum {
+    iterator_protocol,
+    collection_iterator,
+    kclass_is_instance,
+    comparator_member,
+    array_get,
+    sequence_iterator,
+};
+
+threadlocal var host_slot_ops: ?std.AutoHashMapUnmanaged(u32, ?HostSlotOp) = null;
+
+fn hostSlotOpFor(module: *const Module, target: FuncId) ?HostSlotOp {
+    if (host_slot_ops == null) host_slot_ops = .{};
+    const map = &host_slot_ops.?;
+    if (map.get(target.int())) |cached| return cached;
+    const fqn = if (module.funcById(target)) |f| f.fqn else return null;
+    const op: ?HostSlotOp = blk: {
+        const owner = fqn[0 .. std.mem.lastIndexOfScalar(u8, fqn, '.') orelse break :blk null];
+        const name = fqn[owner.len + 1 ..];
+        const iter_owner = std.mem.eql(u8, owner, "kotlin.collections.Iterator") or
+            std.mem.eql(u8, owner, "kotlin.collections.MutableIterator") or
+            std.mem.eql(u8, owner, "kotlin.collections.ListIterator") or
+            std.mem.eql(u8, owner, "kotlin.collections.MutableListIterator");
+        if (iter_owner and isIteratorProtocol(name)) break :blk .iterator_protocol;
+        // `iterator()` on a collection: the host builds the iterator from the
+        // receiver's own representation, and no native is registered under
+        // the interface's FQN either.
+        if (std.mem.eql(u8, name, "iterator") and
+            (std.mem.eql(u8, owner, "kotlin.collections.Iterable") or
+                std.mem.eql(u8, owner, "kotlin.collections.MutableIterable") or
+                std.mem.eql(u8, owner, "kotlin.collections.Collection") or
+                std.mem.eql(u8, owner, "kotlin.collections.MutableCollection") or
+                std.mem.eql(u8, owner, "kotlin.collections.List") or
+                std.mem.eql(u8, owner, "kotlin.collections.MutableList") or
+                std.mem.eql(u8, owner, "kotlin.collections.Set") or
+                std.mem.eql(u8, owner, "kotlin.collections.MutableSet") or
+                std.mem.eql(u8, owner, "kotlin.collections.ArrayList") or
+                std.mem.eql(u8, owner, "kotlin.collections.HashSet") or
+                std.mem.eql(u8, owner, "kotlin.collections.LinkedHashSet")))
+            break :blk .collection_iterator;
+        // The remaining interface members the host serves from the value's
+        // own representation, measured off the noinst-why decline tally:
+        // KClass.isInstance, Comparator.compare, indexed array get, and a
+        // Sequence's lazy iterator.
+        if (std.mem.eql(u8, owner, "kotlin.reflect.KClass") and
+            std.mem.eql(u8, name, "isInstance")) break :blk .kclass_is_instance;
+        if (std.mem.eql(u8, owner, "kotlin.Comparator") and
+            std.mem.eql(u8, name, "compare")) break :blk .comparator_member;
+        if (std.mem.eql(u8, name, "get") and
+            std.mem.startsWith(u8, owner, "kotlin.") and
+            std.mem.endsWith(u8, owner, "Array") and
+            std.mem.indexOfScalar(u8, owner["kotlin.".len..], '.') == null)
+            break :blk .array_get;
+        if (std.mem.eql(u8, owner, "kotlin.sequences.Sequence") and
+            std.mem.eql(u8, name, "iterator")) break :blk .sequence_iterator;
+        break :blk null;
+    };
+    map.put(std.heap.page_allocator, target.int(), op) catch return op;
+    return op;
+}
+
+fn runHostSlotOp(self: *VmHost, allocator: Allocator, op: HostSlotOp, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    switch (op) {
+        .iterator_protocol => switch (receiver.*) {
+            .Iterator => return iteratorMember(self, allocator, receiver, name, args),
+            .RangeIter => return rangeIterMember(self, allocator, receiver, name, args),
+            .SeqIter => return seqIterMember(self, allocator, receiver, name, args),
+            else => return null,
+        },
+        .collection_iterator => {
+            if (args.len != 0) return null;
+            // The self-iterator convention first, exactly as the named path
+            // applies it, then the builtin collection/range iterator.
+            switch (receiver.*) {
+                .Iterator, .RangeIter, .SeqIter => return .{ .ok = receiver.* },
+                else => {},
+            }
+            return builtinIterator(self, allocator, receiver);
+        },
+        .kclass_is_instance => {
+            if (receiver.* != .Class or args.len != 1) return null;
+            const cg = receiver.Class.borrow();
+            const cname = cg.get().name;
+            const r = boolVal(args[0].isRuntimeType(cname));
+            cg.deinit();
+            return .{ .ok = r };
+        },
+        .comparator_member => switch (receiver.*) {
+            .Comparator => return comparatorMember(self, allocator, receiver, name, args),
+            else => return null,
+        },
+        .array_get => {
+            if (receiver.* != .Array or args.len != 1) return null;
+            const idx = args[0].asI64() orelse return null;
+            const arr = receiver.Array;
+            const n = arr.len();
+            if (idx >= 0 and @as(usize, @intCast(idx)) < n) {
+                const elem = arr.get(@intCast(idx));
+                elem.retain();
+                return .{ .ok = elem };
+            }
+            const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, n });
+            defer if (runtime.freeScratch()) allocator.free(msg);
+            return .{ .err = try throwExc(allocator, "kotlin.ArrayIndexOutOfBoundsException", msg) };
+        },
+        .sequence_iterator => switch (receiver.*) {
+            .Sequence => return sequenceMember(self, allocator, receiver, name, args),
+            else => return null,
+        },
+    }
+}
+
+/// Names the builtin iterator variants own outright.
+fn isIteratorProtocol(name: []const u8) bool {
+    return std.mem.eql(u8, name, "hasNext") or std.mem.eql(u8, name, "next") or
+        std.mem.eql(u8, name, "hasPrevious") or std.mem.eql(u8, name, "previous") or
+        std.mem.eql(u8, name, "nextIndex") or std.mem.eql(u8, name, "previousIndex");
+}
+
+fn noteSlotByName2(self: *VmHost, slot: MethodSlotId, name: []const u8, receiver: *const Value) void {
     _ = slot_by_name_count.fetchAdd(1, .monotonic);
     if (!runtime.envSetOnce("KLIO_SLOT_BYNAME")) return;
+    if (runtime.envOnce("KLIO_SLOT_RECV") != null) {
+        std.debug.print("[slot-recv] {s} recv_ty={s}\n", .{ name, receiver.typeFqn() });
+        return;
+    }
     const mg = self.module.borrow();
     defer mg.deinit();
     const root = FuncId.from(slot.int());
@@ -9781,6 +9925,16 @@ fn noteSlotByName(self: *VmHost, slot: MethodSlotId, name: []const u8) void {
         if (mg.get().funcById(root)) |f| f.fqn else "?",
     });
 }
+
+/// A value that IS its own representation — no host wrapper for the by-name
+/// walk to unpack on the way in.
+fn isScalarValue(v: *const Value) bool {
+    return switch (v.*) {
+        .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Bool, .Char => true,
+        else => false,
+    };
+}
+
 
 fn noinstTraceOn() bool {
     const S = struct {
@@ -9905,19 +10059,85 @@ pub fn invokeVirtualMember(
             if (mname) |n| {
                 var fqn_buf: [192]u8 = undefined;
                 if (std.fmt.bufPrint(&fqn_buf, "{s}.{s}", .{ receiver.typeFqn(), n })) |member_fqn| {
-                    if (lookupIntrinsic(self, member_fqn) != null)
+                    if (lookupIntrinsic(self, member_fqn)) |native| {
+                        // A SCALAR receiver is its own representation: there
+                        // is no wrapper for the by-name walk to unpack, so
+                        // reaching the identical host symbol by FuncId is the
+                        // same call without the lookup. Wrapper-backed values
+                        // (`Result` stores a discriminant and a raw payload,
+                        // an `Iterator` is a host generator) keep the walk —
+                        // that is where the conversion lives, and binding
+                        // them by id returned `Success` for a `Failure`.
+                        // Only where the native IS the whole implementation.
+                        // A declaration that also carries a BODY is written
+                        // against the boxed representation — `UInt.toString()`
+                        // is `uintToString(data)`, and `data` does not exist on
+                        // a scalar — so reaching it by FuncId runs a body the
+                        // receiver cannot satisfy. The by-name walk is what
+                        // lands on the intrinsic for those.
+                        if (isScalarValue(receiver)) {
+                            if (module.methodSlotTarget(runtime_class, slot)) |slot_target| {
+                                if (!host_call_func.funcHasBody(self, module, slot_target)) {
+                                    if (host_call_func.resolvedNativeForm(self, slot_target)) |target_native| {
+                                        if (target_native == native)
+                                            break :blk .{ .target = slot_target, .name = n };
+                                    }
+                                }
+                            }
+                        }
+                        // A host COLLECTION is not a wrapper: `add`/`set`/
+                        // `get` take the value as it stands, so the intrinsic
+                        // already in hand IS what the walk would land on and
+                        // calling it here skips a name search that changes
+                        // nothing. Restricted to the container variants —
+                        // `Result` and the iterator generators are the shapes
+                        // whose conversion lives on the named path.
+                        switch (receiver.*) {
+                            // `Array` holds its elements inline, a
+                            // `StringBuilder` its bytes, a `Comparator` its
+                            // comparison — none of them a discriminant over a
+                            // payload the intrinsic would have to unpack.
+                            .List, .Set, .Map, .Array, .StringBuilder, .Comparator => {
+                                var argbuf = try allocator.alloc(Value, args.len + 1);
+                                defer allocator.free(argbuf);
+                                argbuf[0] = receiver.*;
+                                @memcpy(argbuf[1..], args);
+                                return dispatchIntrinsic(self, allocator, member_fqn, native, argbuf);
+                            },
+                            else => {},
+                        }
                         break :blk .{ .target = null, .name = n };
+                    }
                 } else |_| {}
             }
-            const target = module.methodSlotTarget(runtime_class, slot) orelse
+            const target = module.methodSlotTarget(runtime_class, slot) orelse {
+                // No entry for this class, but the ROOT still names the
+                // declaration the call was bound to, and for a builtin whose
+                // implementation is a host handler that is enough to settle
+                // it by id (`ListIterator.hasPrevious` on a host iterator).
+                if (hostSlotOpFor(module, root)) |op| {
+                    const nm2: []const u8 = if (module.funcById(root)) |f| f.name else (mname orelse "");
+                    if (try runHostSlotOp(self, allocator, op, receiver, nm2, args)) |r| return r;
+                }
+                if (runtime.envOnce("KLIO_NOINST_WHY") != null)
+                    std.debug.print("[noinst-why] no-slot-entry recv={s} root={s}\n", .{ receiver.typeFqn(), if (module.funcById(root)) |f| f.fqn else "?" });
                 break :blk .{ .target = null, .name = mname };
+            };
             // A bodyless declaration linked to a host symbol is executable —
             // as that symbol. Dispatching through it is the whole point of
             // binding the slot: it reaches the implementation by FuncId
             // instead of matching the member by string.
             if (!virtualTargetExecutable(module, target) and
                 host_call_func.resolvedNativeForm(self, target) == null)
+            {
+                if (hostSlotOpFor(module, target)) |op| {
+                    const nm2: []const u8 = if (module.funcById(target)) |f| f.name else (mname orelse "");
+                    if (try runHostSlotOp(self, allocator, op, receiver, nm2, args)) |r| return r;
+                }
+                if (runtime.envOnce("KLIO_NOINST_WHY") != null)
+                    std.debug.print("[noinst-why] target-not-executable recv={s} root={s} target={s}\n", .{ receiver.typeFqn(), if (module.funcById(root)) |f| f.fqn else "?", if (module.funcById(target)) |f| f.fqn else "?" });
                 break :blk .{ .target = null, .name = mname };
+            }
             if (noinstTraceOn()) {
                 std.debug.print("[noinst] recv_ty={s} slot={d} root={s} -> target={s}\n", .{
                     receiver.typeFqn(),
@@ -9946,7 +10166,7 @@ pub fn invokeVirtualMember(
             if (try invokeMethodFuncId(self, allocator, receiver, target, args)) |r| return r;
         }
         if (noinst.name) |mname| {
-            noteSlotByName(self, slot, mname);
+            noteSlotByName2(self, slot, mname, receiver);
             return callMemberNamed(self, allocator, receiver, mname, args, arg_names);
         }
         if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
@@ -10763,7 +10983,16 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         if (key) |k| instanceMethodCachePutRaw(self, k, METHOD_MISS);
         return null;
     };
-    if (resolved.unambiguous) {
+    // The STRICT key folds every discriminator the overload pick consults:
+    // each argument's tag plus its class identity, closure body, or function
+    // decl pointer, alongside the receiver class and name that fix the
+    // candidate set. For a fixed strict key the pick is therefore a pure
+    // function of the key, and storing it cannot serve an overload the walk
+    // would not have chosen — so a resolution that had SEVERAL candidates is
+    // still cacheable. Only the RELAXED key (container kind tags, no
+    // identity) needs the single-candidate guarantee, since two overloads can
+    // share its coarser signature.
+    if (resolved.unambiguous or strict_key != null) {
         if (key) |k| instanceMethodCachePutRaw(self, k, @intFromEnum(resolved.fid));
     }
     return try invokeMethodFuncId(self, allocator, receiver, resolved.fid, args);

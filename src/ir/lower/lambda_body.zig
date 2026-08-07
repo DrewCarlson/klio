@@ -468,7 +468,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
             break :blk false;
         };
         if (is_vararg) {
-            try b.setLocalDeclType(p.name, decl.varargArrayHead(ty.name.name));
+            try b.setLocalDeclTypeOwned(p.name, try decl.varargArrayTypeRef(b.allocator, &ty));
             continue;
         }
         // A source-annotated (or pass-stamped) lambda parameter type is

@@ -149,6 +149,12 @@ pub const ProgramImage = struct {
     /// dispatch paths consult this directly instead of re-deciding the
     /// form per call against `installed_bindings`.
     resolved_native: std.AutoHashMap(u32, StdlibFn),
+    /// Adapter classification for `resolved_native` entries whose Kotlin
+    /// declaration takes a trailing `vararg`: today's intrinsics expect the
+    /// SPREAD convention, so a call arriving in the SHARED SHAPE (vararg
+    /// PACKED at its slot) unpacks at the dispatch boundary. This table is
+    /// the vararg row of the C-transpiler's shim list.
+    vararg_spread_adapters: std.AutoHashMap(u32, u32),
     /// Link-settled redirect for bodyless top-level decls (`expect` /
     /// header-only): the same-simple-name body-bearing siblings in
     /// declaration order. Dispatch picks the first sibling whose arity
@@ -384,6 +390,7 @@ pub const ProgramImage = struct {
             .func_defaults = std.AutoHashMap(u32, []?FuncId).init(allocator),
             .installed_bindings = try ObjRef(HostBindings).init(allocator, HostBindings.init(allocator)),
             .resolved_native = std.AutoHashMap(u32, StdlibFn).init(allocator),
+            .vararg_spread_adapters = std.AutoHashMap(u32, u32).init(allocator),
             .resolved_redirect = std.AutoHashMap(u32, []FuncId).init(allocator),
             .default_import_globals = std.StringHashMap([]const u8).init(allocator),
             .pack_bare_aliases = std.StringHashMap([]const u8).init(allocator),
@@ -428,6 +435,7 @@ pub const ProgramImage = struct {
         self.func_defaults.deinit();
         self.installed_bindings.deinit();
         self.resolved_native.deinit();
+        self.vararg_spread_adapters.deinit();
         self.clearResolvedRedirects();
         self.resolved_redirect.deinit();
         self.default_import_globals.deinit();
@@ -505,6 +513,7 @@ pub const ProgramImage = struct {
     /// rebuilds the table.
     pub fn linkResolvedForms(self: *ProgramImage, module: *const Module) Allocator.Error!void {
         self.resolved_native.clearRetainingCapacity();
+        self.vararg_spread_adapters.clearRetainingCapacity();
         self.clearResolvedRedirects();
         self.default_import_globals.clearRetainingCapacity();
         self.pack_bare_aliases.clearRetainingCapacity();
@@ -527,6 +536,15 @@ pub const ProgramImage = struct {
                 const intrinsic = bindings.resolve(symbol) orelse
                     stdlib.implementation(symbol) orelse continue;
                 try self.resolved_native.put(entry.key_ptr.*, intrinsic);
+                // The vararg adapter row: the declared slot position of a
+                // trailing vararg, so the boundary can unpack a
+                // shared-shape (packed) frame for a spread-expecting
+                // intrinsic.
+                if (module.funcById(FuncId.from(entry.key_ptr.*))) |vf| {
+                    if (vf.params.len != 0 and vf.params[vf.params.len - 1].is_vararg) {
+                        try self.vararg_spread_adapters.put(entry.key_ptr.*, @intCast(vf.params.len - 1));
+                    }
+                }
             }
         }
 
@@ -1543,11 +1561,16 @@ pub fn extDeclRecvIsUserClass(ty_name: []const u8) bool {
     if (s.len == 0) return false;
     if (s.len <= 2 and allAsciiUpper(s)) return false;
     const builtins = [_][]const u8{
-        "String",   "StringBuilder", "CharSequence", "Appendable",  "Int",        "Long",
-        "Short",    "Byte",          "Double",       "Float",       "Char",       "Boolean",
-        "Number",   "Array",         "List",         "MutableList", "Collection", "Iterable",
-        "Map",      "MutableMap",    "Set",          "MutableSet",  "Sequence",   "Comparable",
-        "Any",      "Unit",
+        "String",       "StringBuilder",     "CharSequence",  "Appendable",   "Int",          "Long",
+        "Short",        "Byte",              "Double",        "Float",        "Char",         "Boolean",
+        "Number",       "Array",             "List",          "MutableList",  "Collection",   "Iterable",
+        "Map",          "MutableMap",        "Set",           "MutableSet",   "Sequence",     "Comparable",
+        "Any",          "Unit",              "UInt",          "ULong",        "UShort",       "UByte",
+        "ByteArray",    "ShortArray",        "IntArray",      "LongArray",    "CharArray",    "BooleanArray",
+        "FloatArray",   "DoubleArray",       "UByteArray",    "UShortArray",  "UIntArray",    "ULongArray",
+        "Iterator",     "MutableIterator",   "ListIterator",  "MutableListIterator",          "MutableIterable",
+        "MutableCollection",                 "Comparator",    "Enum",         "Throwable",    "Nothing",
+        "IntRange",     "LongRange",         "CharRange",     "ClosedRange",  "Pair",         "Triple",
     };
     for (builtins) |b| {
         if (std.mem.eql(u8, s, b)) return false;
@@ -1670,6 +1693,15 @@ test "ext_decl_recv_is_user_class rejects builtins and type params" {
     try testing.expect(!extDeclRecvIsUserClass("String"));
     try testing.expect(!extDeclRecvIsUserClass("T"));
     try testing.expect(extDeclRecvIsUserClass("com.example.Widget"));
+    // The primitive-array and unsigned families are builtins too: classifying
+    // ByteArray as a user class made the incompatible-receiver guard strip
+    // the names off `decodeToString(throwOnInvalidSequence = true)`.
+    try testing.expect(!extDeclRecvIsUserClass("ByteArray"));
+    try testing.expect(!extDeclRecvIsUserClass("kotlin.ByteArray"));
+    try testing.expect(!extDeclRecvIsUserClass("UIntArray"));
+    try testing.expect(!extDeclRecvIsUserClass("ULong"));
+    try testing.expect(!extDeclRecvIsUserClass("Iterator"));
+    try testing.expect(!extDeclRecvIsUserClass("Comparator"));
 }
 
 fn linkTestNativeFn(ctx: *runtime.CallCtx) std.mem.Allocator.Error!runtime.EvalResult {

@@ -528,7 +528,13 @@ pub fn spliceInlineLambdaOn(
         const ae = &arg_exprs[ai];
         if (ae.* == .Index and ae.Index.args.len == 1) {
             slot.* = try expr_lower.iterableElementTypeRef(b, ae.Index.receiver);
-        } else slot.* = null;
+        } else {
+            // A CALL argument (`selector(iterator.next())`) carries the same
+            // element fact the loop-variable and indexed forms do — the
+            // static deriver answers it, exactly as the value-param path
+            // above does for tp-declared params.
+            slot.* = try expr_lower.staticExprTypeRef(b, ae);
+        }
     }
     var bi: usize = 0;
     while (bi < bind_n) : (bi += 1) {
@@ -548,8 +554,12 @@ pub fn spliceInlineLambdaOn(
             // open.
             var h = std.mem.trimEnd(u8, ty.name, "?");
             if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            // A class-param IDENTITY mangle names nothing lowering can
+            // resolve either — committing `$class$ N i:E` heads only fed
+            // the no_class_id bucket.
             const bare_tp = (h.len > 0 and h.len <= 2 and
-                std.ascii.isUpper(h[0])) or b.isTypeParam(h);
+                std.ascii.isUpper(h[0])) or b.isTypeParam(h) or
+                ir.parseClassTypeParamIdentity(h) != null;
             if (!bare_tp) {
                 try b.setLocalDeclTypeOwned(pname, try ty.clone(b.allocator));
             }
@@ -1743,7 +1753,7 @@ pub fn tryInlineCallWithTypeArgs(
                 var h = std.mem.trimEnd(u8, dv.name, "?");
                 if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
                 const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
-                    b.isTypeParam(h);
+                    b.isTypeParam(h) or ir.parseClassTypeParamIdentity(h) != null;
                 if (!bare) derived_clone = try dv.clone(b.allocator);
             }
             // ALWAYS shadow the caller's same-named record for a

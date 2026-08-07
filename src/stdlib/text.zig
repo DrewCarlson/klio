@@ -30,6 +30,40 @@ pub fn compareUtf16(a: []const u8, b: []const u8) std.math.Order {
     }
 }
 
+/// The number of UTF-16 code units a UTF-8 string encodes to — the value
+/// Kotlin's `String.length` reports.
+pub fn utf16Len(a: []const u8) i32 {
+    var it = Utf16Iter{ .bytes = a };
+    var n: i32 = 0;
+    while (it.next() != null) n += 1;
+    return n;
+}
+
+/// `compareUtf16` returning the VALUE kotlinc produces rather than an
+/// ordering: the JVM's `String.compareTo` is the code-unit difference at the
+/// first mismatch, and the length difference when one string is a prefix of
+/// the other. `Comparable` contracts only for the sign, but a program that
+/// prints the result sees this number.
+pub fn compareUtf16Difference(a: []const u8, b: []const u8) i32 {
+    var ai = Utf16Iter{ .bytes = a };
+    var bi = Utf16Iter{ .bytes = b };
+    while (true) {
+        const x = ai.next();
+        const y = bi.next();
+        if (x != null and y != null) {
+            if (x.? != y.?) return @as(i32, x.?) - @as(i32, y.?);
+        } else if (x != null and y == null) {
+            var n: i32 = 1;
+            while (ai.next() != null) n += 1;
+            return n;
+        } else if (x == null and y != null) {
+            var n: i32 = 1;
+            while (bi.next() != null) n += 1;
+            return -n;
+        } else return 0;
+    }
+}
+
 /// Streams the UTF-16 code units of a UTF-8 string one at a time. A
 /// supplementary code point yields its high surrogate, then its low
 /// surrogate on the following call.

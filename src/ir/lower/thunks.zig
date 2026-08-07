@@ -268,6 +268,10 @@ pub fn lowerInitBlockWithParams(
     // mutates from inside a lambda captures a copy and the write is lost.
     try setInitBlockBoxedVars(&b, allocator, params, block);
     try bindParams(&b, params);
+    // An init block reads the constructor's parameters, and its builder knew
+    // their NAMES alone — the same gap the delegation and default thunks had.
+    // `array.copyOf()` inside `AtomicIntArray`'s init had no receiver type.
+    try consumePendingParamTypes(&b, params);
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
@@ -507,6 +511,9 @@ pub fn lowerAccessorBlockRet(
     // a copy and lose the write.
     try setInitBlockBoxedVars(&b, allocator, params, block);
     try bindParams(&b, params);
+    // A secondary constructor's BODY reads that constructor's parameters,
+    // and this builder knew their names alone.
+    try consumePendingParamTypes(&b, params);
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, try accessorReturnTy(allocator, expected));

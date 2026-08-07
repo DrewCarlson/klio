@@ -108,6 +108,27 @@ pub fn varargArrayHead(elem: []const u8) []const u8 {
     return "Array";
 }
 
+/// The full materialized type of a `vararg x: T` parameter inside the body:
+/// the primitive-specialized array for primitive elements, `Array<out T>`
+/// with the ELEMENT carried otherwise — a head-only `Array` record made
+/// `rangesDelimitedBy(delimiters, ...)` unbindable against its
+/// `Array<out String>` parameter (one side had an argument, the other none).
+/// Caller owns the result.
+pub fn varargArrayTypeRef(allocator: std.mem.Allocator, elem: *const ast.TypeRef) Allocator.Error!ir.TypeRef {
+    const head = varargArrayHead(elem.name.name);
+    if (!std.mem.eql(u8, head, "Array")) {
+        return .{ .name = try allocator.dupe(u8, head), .nullable = false, .args = &.{} };
+    }
+    var element = try loweredTypeRef(allocator, elem, true);
+    errdefer element.deinit(allocator);
+    const projected = try std.fmt.allocPrint(allocator, "out#{s}", .{element.name});
+    allocator.free(@constCast(element.name));
+    element.name = projected;
+    const args = try allocator.alloc(ir.TypeRef, 1);
+    args[0] = element;
+    return .{ .name = try allocator.dupe(u8, "Array"), .nullable = false, .args = args };
+}
+
 pub fn bindParams(b: *FuncBuilder, names: []const []const u8) Allocator.Error!void {
     for (names, 0..) |name, i| {
         const dst = b.allocReg();
@@ -1017,6 +1038,21 @@ pub fn lowerClassWithExtras(
                 if (f.receiver_type) |*rt| {
                     try module.registry.iface_member_ext_recv.put(.{ .a = c.name.name, .b = f.name.name }, rt.name.name);
                 }
+                // A bodyless EXPECT-class member IS the declaration of a
+                // host-backed API (`expect class StringBuilder { fun
+                // toString(): String }`): retain it as a HEADER row whose
+                // decl sig names its member fqn as the host symbol. The
+                // link step joins the intrinsic where one exists (the one
+                // calling convention: the native form IS the
+                // implementation for a bodyless declaration), and member
+                // resolution binds the call statically instead of walking.
+                if (c.is_expect and f.receiver_type == null) {
+                    if (runtime.envOnce("KLIO_EXPECT_HDR_TRACE") != null)
+                        std.debug.print("[expect-hdr] {s}.{s} class_fqn={s}\n", .{ c.name.name, f.name.name, lower_class_fqn orelse "-" });
+                    if (try retainExpectMemberHeader(module, c, f, class_id)) |hid| {
+                        try methods.append(a, hid);
+                    }
+                }
                 continue;
             }
             // Use the method's own FuncId, not `funcs.len() - 1`:
@@ -1463,6 +1499,90 @@ pub fn recordMethodParamDefaults(
         }
     }
     try module.registry.local_fn_defaults.put(body_func, slots);
+}
+
+/// Retain a bodyless EXPECT-class member as a HEADER row: a Func with the
+/// declared signature and no body, its decl sig carrying the member fqn as
+/// the host symbol. The link step joins the intrinsic where one exists;
+/// member resolution binds the call statically either way (the declaration
+/// exists in the Kotlin source — kotlinc sees it too).
+fn retainExpectMemberHeader(
+    module: *Module,
+    c: *const ast.Class,
+    f: *const ast.Function,
+    class_id: ir.ClassId,
+) Allocator.Error!?FuncId {
+    const a = module.registry.allocator;
+    const class_fqn = lower_class_fqn orelse return null;
+    const member_fqn = try std.fmt.allocPrint(a, "{s}.{s}", .{ class_fqn, f.name.name });
+    // One header per (class, name, arity); a prior declaration wins.
+    const ukey = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}", .{ c.name.name, f.name.name, f.params.len });
+    if (module.registry.member_method_fids.contains(ukey)) {
+        a.free(ukey);
+        a.free(member_fqn);
+        return null;
+    }
+    const id = module.nextFuncId();
+    const params = try a.alloc(ir.Param, f.params.len + 1);
+    params[0] = .{
+        .name = "this",
+        .ty = .{ .name = c.name.name, .nullable = false, .args = &.{} },
+        .default = null,
+        .is_property = false,
+        .is_vararg = false,
+        .has_default = false,
+    };
+    var has_vararg = false;
+    var required: u32 = 0;
+    for (f.params, 0..) |*p, i| {
+        if (p.is_vararg) has_vararg = true;
+        if (p.default == null and !p.is_vararg) required += 1;
+        params[i + 1] = .{
+            .name = p.name.name,
+            .ty = try loweredTypeRef(a, &p.ty, true),
+            .default = null,
+            .is_property = false,
+            .is_vararg = p.is_vararg,
+            .has_default = p.default != null,
+        };
+    }
+    const ret: ir.TypeRef = if (f.return_type) |*rt|
+        try loweredTypeRef(a, rt, true)
+    else
+        .{ .name = "Unit", .nullable = false, .args = &.{} };
+    try module.funcs.append(a, .{
+        .id = id,
+        .name = f.name.name,
+        .fqn = member_fqn,
+        .package = ir.packageOfFqn(class_fqn, c.name.name),
+        .params = params,
+        .return_ty = ret,
+        .return_ty_declared = f.return_type != null,
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = @enumFromInt(0),
+        .is_suspend = f.is_suspend,
+        .kind = .instance_method,
+    });
+    const msig = try a.alloc(ir.TypeRef, f.params.len);
+    for (f.params, 0..) |*p, i| {
+        msig[i] = try loweredTypeRef(a, &p.ty, true);
+    }
+    try module.decl_sigs.put(id.int(), .{
+        .enclosing_class = class_id,
+        .receiver_ty = null,
+        .arity = .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg },
+        .sig = msig,
+        .kind = .instance_method,
+        .visibility = f.visibility,
+        .is_inline = false,
+        .is_suspend = f.is_suspend,
+        .has_body = false,
+        .host_symbol = member_fqn,
+    });
+    try module.registry.member_method_fids.put(ukey, id);
+    try funcNameIndexPush(module, f.name.name, id);
+    return id;
 }
 
 pub fn lowerMethod(
@@ -2004,7 +2124,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     // carry `declared_recv=String` and bind CharSequence extensions.
     for (f.params) |*p| {
         if (p.is_vararg) {
-            try b.setLocalDeclType(p.name.name, varargArrayHead(p.ty.name.name));
+            try b.setLocalDeclTypeOwned(p.name.name, try varargArrayTypeRef(b.allocator, &p.ty));
         } else {
             try b.setLocalDeclTypeOwned(
                 p.name.name,

@@ -1955,6 +1955,13 @@ pub const Module = struct {
         /// must NOT, dispatch commitment still requires proof (the
         /// trimIndent hazard is precisely about emission).
         sole_unknown: ?FuncId = null,
+        /// A TIED set whose candidates all declare the same parameter list
+        /// except each function-typed parameter's RETURN position — the
+        /// `flatMapIndexed` shape, overloaded on the lambda's return alone.
+        /// Only LAMBDA-PARAMETER typing may read this candidate: the tie is
+        /// real (return types and dispatch identity stay unresolved), but
+        /// every candidate hands the closure the same parameter types.
+        param_rep: ?FuncId = null,
     };
 
     /// One ambiguous bare-call diagnostic: the call-site name and span
@@ -2213,6 +2220,39 @@ pub const Module = struct {
     pub fn classIdIsOrExtends(self: *const Module, sub: ClassId, super: ClassId) bool {
         if (super.int() >= self.classes.items.len) return false;
         return self.classIdIsOrExtendsDepth(sub, super, 0);
+    }
+
+    /// Whether `cls` or any supertype declares a member named `name`,
+    /// arity-blind. The declaration-completeness audit's member probe: it
+    /// answers "can resolution see SOME declaration for this name on this
+    /// receiver", which an empty-shape resolveMemberCall cannot (a member
+    /// with required parameters refuses a zero-arg probe).
+    pub fn classHierarchyDeclaresMember(self: *const Module, cls: ClassId, name: []const u8) bool {
+        return self.classHierarchyDeclaresMemberDepth(cls, name, 0);
+    }
+
+    fn classHierarchyDeclaresMemberDepth(self: *const Module, cls: ClassId, name: []const u8, depth: u8) bool {
+        if (depth >= 64 or cls.int() >= self.classes.items.len) return false;
+        const c = &self.classes.items[cls.int()];
+        for (c.methods) |mid| {
+            if (self.funcById(mid)) |mf| {
+                if (std.mem.eql(u8, mf.name, name)) return true;
+            }
+        }
+        // The builtin headers' rows often carry NO method FuncIds — their
+        // member declarations live in decl_sigs and reach dispatch through
+        // the member-name index instead.
+        if (self.memberDecls(c.fqn, name).len != 0) return true;
+        // PROPERTY members (`size`, `length`, `entries`) appear in neither
+        // list; the hierarchy shadow-name set is the registry's transitive
+        // member-name record and carries them.
+        if (self.registry.hierarchy_shadow_names.get(c.name)) |hs| {
+            if (hs.names.contains(name)) return true;
+        }
+        for (c.supertypes) |p| {
+            if (self.classHierarchyDeclaresMemberDepth(p, name, depth + 1)) return true;
+        }
+        return false;
     }
 
     fn enclosingClassId(self: *const Module, child: ClassId) ?ClassId {
@@ -3759,9 +3799,16 @@ pub const Module = struct {
             {
                 continue;
             }
+            // A dependent bound whose referenced parameter has NO receiver
+            // binding constrains nothing here: in `<S, T : S>` on an
+            // `Iterable<T>` receiver, `S` appears only in value-parameter
+            // and return positions, so inference chooses it at the call
+            // (`S := T` always satisfies `T : S`), and kotlinc keeps the
+            // candidate — `runningReduce` on an `Iterable<String>` receiver
+            // must not vanish. `S`'s own bounds get their own loop entry.
             const required_bound = if (dependent_bound)
                 bindingType(bindings.items, staticTypeHead(param.bound)) orelse
-                    return false
+                    continue
             else
                 TypeRef{ .name = param.bound, .nullable = false, .args = &.{} };
             if (!try self.staticTypeIsSubtypeInner(
@@ -4180,6 +4227,40 @@ pub const Module = struct {
         return std.mem.eql(i32, a[0..7], b[0..7]);
     }
 
+    /// True when two function-typed parameter refs agree on everything a
+    /// closure body can observe: same arity head and same argument types in
+    /// every position but the LAST (the function's return).
+    fn functionParamArgsAgree(a: TypeRef, b: TypeRef) bool {
+        if (!std.mem.eql(u8, staticTypeHead(a.name), staticTypeHead(b.name))) return false;
+        if (a.args.len != b.args.len or a.args.len == 0) return false;
+        for (a.args[0 .. a.args.len - 1], b.args[0 .. b.args.len - 1]) |aa, ba| {
+            if (!aa.eql(ba)) return false;
+        }
+        return true;
+    }
+
+    /// A representative for LAMBDA-PARAMETER typing out of a tied candidate
+    /// set: non-null only when every candidate declares the same parameter
+    /// list up to function-return positions, so whichever overload the tie
+    /// eventually resolves to hands the closures the same parameter types.
+    fn tiedLambdaParamRep(self: *const Module, fids: []const FuncId) ?FuncId {
+        if (fids.len < 2) return null;
+        const first = self.funcById(fids[0]) orelse return null;
+        for (fids[1..]) |fid| {
+            const other = self.funcById(fid) orelse return null;
+            if (other.params.len != first.params.len) return null;
+            for (first.params, other.params) |fp, op| {
+                if (fp.ty.eql(op.ty)) continue;
+                const fh = staticTypeHead(fp.ty.name);
+                const is_fn = std.mem.startsWith(u8, fh, "Function") or
+                    std.mem.startsWith(u8, fh, "SuspendFunction") or
+                    std.mem.startsWith(u8, fh, "KFunction");
+                if (!is_fn or !functionParamArgsAgree(fp.ty, op.ty)) return null;
+            }
+        }
+        return fids[0];
+    }
+
     fn staticReceiverCouldAccept(self: *const Module, fid: FuncId, receiver: TypeRef, param: TypeRef) bool {
         return self.staticReceiverCompatibility(fid, receiver, param) != .incompatible;
     }
@@ -4456,6 +4537,8 @@ pub const Module = struct {
         var ids: std.ArrayList(FuncId) = .empty;
         var tiers: std.ArrayList(u8) = .empty;
         var unknowns: std.ArrayList(bool) = .empty;
+        var named_maps: std.ArrayList(?[]const usize) = .empty;
+        var named_skips: std.ArrayList(bool) = .empty;
         var unknown_best_tier: u8 = 255;
         // The per-call window delimiter for the rex trace: every candidate
         // row until the next rex-call row belongs to this resolution.
@@ -4478,22 +4561,99 @@ pub const Module = struct {
             if ((kind != .top_level_extension and !is_member_extension) or
                 f.params.len == 0 or
                 !std.mem.eql(u8, f.params[0].name, "this")) continue;
-            // Ordered named arguments carry the same positional binding as
-            // their source order, but still constrain the declaration by
-            // parameter identity. Normalize them for the extension scorer
-            // only after proving every supplied name matches that position.
-            // Reordered named calls remain deferred until the shared binding
-            // result is threaded through extension ranking.
-            for (args, 0..) |arg, i| {
-                const arg_name = arg.named orelse continue;
-                const param_index = i + 1;
-                if (param_index >= f.params.len or
-                    !applicability.paramNameMatchesArg(
-                        f.params[param_index].name,
-                        arg_name,
-                    ))
-                {
-                    continue :candidate_loop;
+            // Ordered named arguments bind by parameter IDENTITY, and may
+            // skip parameters Kotlin fills from defaults: `rangesDelimitedBy(
+            // delimiters, ignoreCase = x, limit = y)` skips the defaulted
+            // `startIndex`, and kotlinc still resolves the call statically.
+            // Build the arg -> param mapping monotonically (each named
+            // argument binds the next parameter carrying its name; every
+            // parameter it skips must default); the scorer then judges each
+            // argument against ITS parameter instead of the raw position.
+            // Backwards-reordered named calls and vararg declarations keep
+            // the strict in-position rule and stay deferred.
+            var named_map: ?[]const usize = null;
+            var named_map_skips = false;
+            {
+                var any_named = false;
+                for (args) |arg0| {
+                    if (arg0.named != null) {
+                        any_named = true;
+                        break;
+                    }
+                }
+                var vararg_decl = false;
+                for (f.params[1..]) |param| {
+                    if (param.is_vararg) {
+                        vararg_decl = true;
+                        break;
+                    }
+                }
+                if (any_named and vararg_decl) {
+                    for (args, 0..) |arg, i| {
+                        const arg_name = arg.named orelse continue;
+                        const param_index = i + 1;
+                        if (param_index >= f.params.len or
+                            !applicability.paramNameMatchesArg(
+                                f.params[param_index].name,
+                                arg_name,
+                            ))
+                        {
+                            continue :candidate_loop;
+                        }
+                    }
+                } else if (any_named) {
+                    const map_buf = sa.alloc(usize, args.len) catch return .{};
+                    var next: usize = 1;
+                    for (args, 0..) |arg, i| {
+                        if (arg.named) |arg_name| {
+                            var j = next;
+                            var gap_defaulted = true;
+                            const found: ?usize = while (j < f.params.len) : (j += 1) {
+                                if (applicability.paramNameMatchesArg(f.params[j].name, arg_name)) break j;
+                                if (!f.params[j].has_default and f.params[j].default == null)
+                                    gap_defaulted = false;
+                            } else null;
+                            const pj = found orelse continue :candidate_loop;
+                            if (!gap_defaulted) continue :candidate_loop;
+                            map_buf[i] = pj;
+                            next = pj + 1;
+                        } else {
+                            // The trailing-callable rule applies inside the
+                            // mapping too: a last positional lambda fills the
+                            // LAST parameter across a defaulted gap.
+                            if (i + 1 == args.len and
+                                (arg.is_lambda or arg.lambda_arity != null or arg.func_typed) and
+                                next < f.params.len - 1 and
+                                applicability.isFunctionTypeRef(&f.params[f.params.len - 1].ty))
+                            {
+                                const gap_defaulted = for (f.params[next .. f.params.len - 1]) |param| {
+                                    if (!param.has_default and param.default == null) break false;
+                                } else true;
+                                if (gap_defaulted) {
+                                    map_buf[i] = f.params.len - 1;
+                                    next = f.params.len;
+                                    continue;
+                                }
+                            }
+                            if (next >= f.params.len) continue :candidate_loop;
+                            map_buf[i] = next;
+                            next += 1;
+                        }
+                    }
+                    // Everything left unbound past the last binding must
+                    // default; skipped middles were checked as they were
+                    // crossed.
+                    for (f.params[next..]) |param| {
+                        if (!param.has_default and param.default == null)
+                            continue :candidate_loop;
+                    }
+                    named_map = map_buf;
+                    for (map_buf, 0..) |pj, i| {
+                        if (pj != i + 1) {
+                            named_map_skips = true;
+                            break;
+                        }
+                    }
                 }
             }
             if (is_member_extension and
@@ -4583,7 +4743,7 @@ pub const Module = struct {
                     break :blk count;
                 };
                 if (args.len < required) continue;
-            } else {
+            } else if (named_map == null) {
                 if (args.len > f.params.len - 1) continue;
                 // Trailing-callable rule at the ARITY gate: the last arg
                 // fills the LAST param when that param is function-typed,
@@ -4592,6 +4752,8 @@ pub const Module = struct {
                 // overload with `partialWindows` defaulted; the
                 // positional walk instead demanded `transform` itself
                 // default and dropped the overload kotlinc picks.
+                // A named-mapped candidate already proved its skipped and
+                // trailing parameters default while the map was built.
                 const trailing_call = args.len > 0 and args.len < f.params.len - 1 and
                     (args[args.len - 1].is_lambda or
                         args[args.len - 1].lambda_arity != null or
@@ -4804,7 +4966,9 @@ pub const Module = struct {
                         args[args.len - 1].func_typed) and
                     trailingGapDefaulted(f.params[1..], args.len);
                 for (args, 0..) |arg, ai| {
-                    const pi = if (trailing_lambda_arg and ai + 1 == args.len and
+                    const pi = if (named_map) |mp|
+                        mp[ai]
+                    else if (trailing_lambda_arg and ai + 1 == args.len and
                         1 + args.len <= f.params.len)
                         f.params.len - 1
                     else
@@ -4866,6 +5030,8 @@ pub const Module = struct {
             ids.append(sa, fid) catch return .{};
             tiers.append(sa, tier) catch return .{};
             unknowns.append(sa, compatibility == .unknown) catch return .{};
+            named_maps.append(sa, named_map) catch return .{};
+            named_skips.append(sa, named_map_skips) catch return .{};
         }
         if (ids.items.len == 0) {
             return .{ .applicable = unknown_best_tier != 255 };
@@ -4887,7 +5053,15 @@ pub const Module = struct {
         const sigs = sa.alloc(applicability.SigView, ids.items.len) catch return .{};
         for (ids.items, 0..) |fid, i| {
             const f = self.funcById(fid).?;
-            const params = sa.dupe(Param, f.params) catch return .{};
+            // A named-mapped candidate presents COMPACTED parameters: the
+            // scorer judges positionally, so each argument's slot must hold
+            // the parameter its name bound, not the raw declaration order.
+            const params = if (named_maps.items[i]) |mp| blk_cp: {
+                const cp = sa.alloc(Param, mp.len + 1) catch return .{};
+                cp[0] = f.params[0];
+                for (mp, cp[1..]) |pj, *dst| dst.* = f.params[pj];
+                break :blk_cp cp;
+            } else sa.dupe(Param, f.params) catch return .{};
             if (params.len != 0) {
                 const declared_receiver = if (self.decl_sigs.get(fid.int())) |decl|
                     decl.receiver_ty orelse params[0].ty
@@ -4971,6 +5145,7 @@ pub const Module = struct {
         var best_recv_param: ?TypeRef = null;
         var best_fid_for_recv: ?FuncId = null;
         var tied = false;
+        var tied_ids: std.ArrayList(FuncId) = .empty;
         for (ranked_sigs.items, ranked_ids.items, ranked_unknowns.items) |*sig, fid, unknown| {
             const maybe_score = applicability.applicable(sig, proof_args, ranked_scope);
             if (maybe_score == null and runtime.envSetOnce("KLIO_REX_TRACE")) {
@@ -4993,8 +5168,11 @@ pub const Module = struct {
                 best_recv_param = if (sig.params.len != 0) sig.params[0].ty else null;
                 best_fid_for_recv = fid;
                 tied = false;
+                tied_ids.clearRetainingCapacity();
+                tied_ids.append(sa, fid) catch return .{};
             } else if (extensionKeyEquivalent(key, best_key)) {
                 tied = true;
+                tied_ids.append(sa, fid) catch return .{};
             }
         }
         const renamed_best = if (best) |target|
@@ -5080,7 +5258,30 @@ pub const Module = struct {
         if (tied or
             (best_unknown and !receiver_supplies_lambda and !renamed_best and
                 !sole_survivor and !refuted_member_strict_winner))
-            return .{ .applicable = true, .sole_unknown = if (!tied) best else null };
+            return .{
+                .applicable = true,
+                .sole_unknown = if (!tied) best else null,
+                .param_rep = if (tied) self.tiedLambdaParamRep(tied_ids.items) else null,
+            };
+        // A winner whose named arguments SKIPPED defaulted parameters COMMITS:
+        // the emitted Call carries the argument names, and the host boundary
+        // binds them by declaration parameter — callFuncNamed fills a
+        // defaultless hole before a bound slot with Null (the convention the
+        // natives read as "defaulted") instead of dropping the bound tail,
+        // and the incompatible-receiver guard knows the full builtin family
+        // (`ByteArray` was classified a user class, which stripped the names
+        // off `decodeToString(throwOnInvalidSequence = true)` on re-dispatch).
+        // `KLIO_NAMED_COMMIT=0` demotes back to the typing-only channel for
+        // single-binary A/B.
+        if (best) |target| {
+            for (ids.items, named_skips.items) |fid, skipped| {
+                if (fid != target) continue;
+                if (skipped and
+                    std.mem.eql(u8, runtime.envOnce("KLIO_NAMED_COMMIT") orelse "1", "0"))
+                    return .{ .applicable = true, .sole_unknown = target };
+                break;
+            }
+        }
         const dispatch_owner = if (best) |target|
             (if (self.registry.member_ext_owner_class.get(target)) |owner|
                 self.classIdByFqn(owner)
@@ -5302,10 +5503,19 @@ pub const Module = struct {
         if (class.is_stub or class.is_value) {
             // A host-backed shell has no vtable to index, so `.virtual` for
             // one is exactly the emission that cannot run. A FINAL method on
-            // a closed stub/value class needs no slot: the direct fid call
-            // runs the Kotlin body — or its resolved-native form — whatever
-            // the receiver's host representation.
-            if (!class.is_interface and !class.is_open and !class.is_abstract and methodIsFinal(f)) {
+            // a closed stub/value class goes direct only when a HOST SYMBOL
+            // serves it: a SOURCE body is written against the boxed
+            // representation (`ValueTimeMark.minus` reads `this.reading`),
+            // and a value-class receiver arrives ERASED to its payload, so
+            // running the body by fid read fields the value never
+            // materializes. The slot path's miss-to-walk serves those with
+            // the erased class's own member, which is the semantics the
+            // walk has always provided for erased receivers.
+            // Stubs keep the direct rule as measured; only VALUE classes
+            // erase their receiver.
+            if (!class.is_interface and !class.is_open and !class.is_abstract and
+                methodIsFinal(f) and (class.is_stub or ds.host_symbol != null))
+            {
                 return .direct;
             }
             return .virtual;
@@ -5480,7 +5690,7 @@ pub const Module = struct {
         return callTypeParam(params, ty.name);
     }
 
-    fn projectTypeToClass(
+    pub fn projectTypeToClass(
         self: *const Module,
         allocator: Allocator,
         actual: TypeRef,
@@ -5559,6 +5769,26 @@ pub const Module = struct {
                     std.mem.eql(u8, std.mem.span(v), "0")
                 else
                     false;
+                // `Nothing?` is the null literal's type and the bottom of the
+                // lattice, so it constrains nothing but nullability: Kotlin
+                // reads `listOf(null, "foo")` as `List<String?>`. Widen to the
+                // other constraint and carry the nullability across, in either
+                // order. Without this the pair binds nothing, the call has no
+                // return type, and every use of the result is left untyped.
+                if (std.mem.eql(u8, staticTypeHead(bound.name), "Nothing")) {
+                    var widened = actual;
+                    widened.nullable = widened.nullable or bound.nullable;
+                    widenBinding(bindings.items, pattern_head, widened);
+                    return true;
+                }
+                if (std.mem.eql(u8, staticTypeHead(actual.name), "Nothing")) {
+                    if (actual.nullable and !bound.nullable) {
+                        var widened = bound;
+                        widened.nullable = true;
+                        widenBinding(bindings.items, pattern_head, widened);
+                    }
+                    return true;
+                }
                 const bound_plain = overrideArgs(bound).len == 0;
                 const actual_plain = overrideArgs(actual).len == 0;
                 if (!lub_off and bound_plain and actual_plain) {
@@ -5900,7 +6130,10 @@ pub const Module = struct {
                     inference_type_params,
                     &bindings,
                     0,
-                )) return null;
+                )) {
+                    if (runtime.envSetOnce("KLIO_ICRT")) std.debug.print("[icrt] {s}: named bind refused param={s}({s} nargs={d}) actual={s} nargs={d}\n", .{ f.fqn, param.name, param.ty.name, overrideArgs(param.ty).len, actual.name, overrideArgs(actual).len });
+                    return null;
+                }
                 filled[pi] = true;
                 break;
             }
@@ -5952,7 +6185,10 @@ pub const Module = struct {
                 inference_type_params,
                 &bindings,
                 0,
-            )) return null;
+            )) {
+                if (runtime.envSetOnce("KLIO_ICRT")) std.debug.print("[icrt] {s}: positional bind refused param={s}({s} nargs={d}) actual={s} nargs={d}\n", .{ f.fqn, params[pi].name, params[pi].ty.name, overrideArgs(params[pi].ty).len, actual_ty.name, overrideArgs(actual_ty).len });
+                return null;
+            }
             if (!params[pi].is_vararg) {
                 filled[pi] = true;
                 next_param = pi + 1;
@@ -13325,6 +13561,211 @@ test "extension resolver substitutes bounded caller type parameters" {
         .caller_package = "app",
     });
     try testing.expectEqual(generic, concrete.target.?);
+}
+
+test "a tie on the lambda return alone still lends the lambda param types" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    // Two `Iterable<T>.flatMapX(transform)` overloads whose lambdas differ
+    // only in RETURN type (`Iterable<R>` vs `Sequence<R>`) — the
+    // `flatMapIndexed` shape. The tie is genuine, but both candidates hand
+    // the closure the same parameter types, so param_rep names one of them.
+    const fids = [_]FuncId{
+        try pushTestFuncOpts(&m, a, "flatMapX", "kotlin.collections.flatMapX", "kotlin.collections", 1, .{ .extension = true }),
+        try pushTestFuncOpts(&m, a, "flatMapX", "kotlin.collections.flatMapX", "kotlin.collections", 1, .{ .extension = true }),
+    };
+    const lambda_return_heads = [_][]const u8{ "Iterable", "Sequence" };
+    for (fids, lambda_return_heads) |fid, ret_head| {
+        m.funcs.items[fid.int()].kind = .top_level_extension;
+        const recv_args = try a.alloc(TypeRef, 1);
+        recv_args[0] = .{ .name = "T", .nullable = false, .args = &.{} };
+        m.funcs.items[fid.int()].params[0].ty = .{ .name = "Iterable", .nullable = false, .args = recv_args };
+        const ret_args = try a.alloc(TypeRef, 1);
+        ret_args[0] = .{ .name = "R", .nullable = false, .args = &.{} };
+        const lam_args = try a.alloc(TypeRef, 3);
+        lam_args[0] = .{ .name = "Int", .nullable = false, .args = &.{} };
+        lam_args[1] = .{ .name = "T", .nullable = false, .args = &.{} };
+        lam_args[2] = .{ .name = ret_head, .nullable = false, .args = ret_args };
+        m.funcs.items[fid.int()].params[1].ty = .{ .name = "Function2", .nullable = false, .args = lam_args };
+        var tps: std.ArrayList([]const u8) = .empty;
+        try tps.append(a, "T");
+        try tps.append(a, "R");
+        try m.registry.func_type_params.put(fid, tps);
+    }
+    try m.rebuildFuncNameIndex(a);
+
+    const recv_string = try a.alloc(TypeRef, 1);
+    recv_string[0] = .{ .name = "String", .nullable = false, .args = &.{} };
+    var shapes = [_]applicability.ArgShape{
+        .{ .is_lambda = true, .lambda_arity = 2 },
+    };
+    const res = m.resolveExtensionCall(
+        "flatMapX",
+        .{ .name = "Iterable", .nullable = false, .args = recv_string },
+        &shapes,
+        .{ .caller_file = FileId.from(0), .caller_package = "app" },
+    );
+    try testing.expect(res.target == null);
+    try testing.expect(res.applicable);
+    try testing.expectEqual(fids[0], res.param_rep.?);
+
+    // Overloads that also differ in a lambda PARAMETER position lend
+    // nothing: whichever wins changes what the closure body sees.
+    const third = try pushTestFuncOpts(&m, a, "flatMapY", "kotlin.collections.flatMapY", "kotlin.collections", 1, .{ .extension = true });
+    const fourth = try pushTestFuncOpts(&m, a, "flatMapY", "kotlin.collections.flatMapY", "kotlin.collections", 1, .{ .extension = true });
+    const param_heads = [_][]const u8{ "Int", "Long" };
+    for ([_]FuncId{ third, fourth }, param_heads) |fid, param_head| {
+        m.funcs.items[fid.int()].kind = .top_level_extension;
+        const recv_args = try a.alloc(TypeRef, 1);
+        recv_args[0] = .{ .name = "T", .nullable = false, .args = &.{} };
+        m.funcs.items[fid.int()].params[0].ty = .{ .name = "Iterable", .nullable = false, .args = recv_args };
+        const lam_args = try a.alloc(TypeRef, 3);
+        lam_args[0] = .{ .name = param_head, .nullable = false, .args = &.{} };
+        lam_args[1] = .{ .name = "T", .nullable = false, .args = &.{} };
+        lam_args[2] = .{ .name = "Any", .nullable = false, .args = &.{} };
+        m.funcs.items[fid.int()].params[1].ty = .{ .name = "Function2", .nullable = false, .args = lam_args };
+        var tps: std.ArrayList([]const u8) = .empty;
+        try tps.append(a, "T");
+        try m.registry.func_type_params.put(fid, tps);
+    }
+    try m.rebuildFuncNameIndex(a);
+    const res2 = m.resolveExtensionCall(
+        "flatMapY",
+        .{ .name = "Iterable", .nullable = false, .args = recv_string },
+        &shapes,
+        .{ .caller_file = FileId.from(0), .caller_package = "app" },
+    );
+    try testing.expect(res2.target == null);
+    try testing.expect(res2.param_rep == null);
+}
+
+test "named arguments may skip defaulted parameters and still resolve" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    // The rangesDelimitedBy shape: `f(x, ignoreCase = ..., limit = ...)`
+    // skips the defaulted `startIndex`, and the CharArray/Array overload
+    // pair is discriminated by the first positional argument.
+    const heads = [_][]const u8{ "CharArray", "IntArray" };
+    var fids: [2]FuncId = undefined;
+    for (heads, 0..) |head, idx| {
+        const fid = try pushTestFuncOpts(&m, a, "myRanges", "app.myRanges", "app", 4, .{ .extension = true });
+        m.funcs.items[fid.int()].kind = .top_level_extension;
+        m.funcs.items[fid.int()].params[0].ty = .{ .name = "CharSequence", .nullable = false, .args = &.{} };
+        m.funcs.items[fid.int()].params[1] = .{ .name = "delims", .ty = .{ .name = head, .nullable = false, .args = &.{} }, .default = null };
+        m.funcs.items[fid.int()].params[2] = .{ .name = "startIndex", .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .default = null, .has_default = true };
+        m.funcs.items[fid.int()].params[3] = .{ .name = "ignoreCase", .ty = .{ .name = "Boolean", .nullable = false, .args = &.{} }, .default = null, .has_default = true };
+        m.funcs.items[fid.int()].params[4] = .{ .name = "limit", .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .default = null, .has_default = true };
+        fids[idx] = fid;
+    }
+    try m.rebuildFuncNameIndex(a);
+
+    var shapes = [_]applicability.ArgShape{
+        .{ .ty = .{ .name = "CharArray", .nullable = false, .args = &.{} } },
+        .{ .ty = .{ .name = "Boolean", .nullable = false, .args = &.{} }, .named = "ignoreCase" },
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .named = "limit" },
+    };
+    const res = m.resolveExtensionCall(
+        "myRanges",
+        .{ .name = "CharSequence", .nullable = false, .args = &.{} },
+        &shapes,
+        .{ .caller_file = FileId.from(0), .caller_package = "app" },
+    );
+    // The skip COMMITS: the emitted call carries the names and the host
+    // boundary binds them by declaration parameter.
+    try testing.expectEqual(fids[0], res.target.?);
+
+    // A named argument no parameter carries still drops the candidate.
+    var wrong = [_]applicability.ArgShape{
+        .{ .ty = .{ .name = "CharArray", .nullable = false, .args = &.{} } },
+        .{ .ty = .{ .name = "Boolean", .nullable = false, .args = &.{} }, .named = "nope" },
+    };
+    const res2 = m.resolveExtensionCall(
+        "myRanges",
+        .{ .name = "CharSequence", .nullable = false, .args = &.{} },
+        &wrong,
+        .{ .caller_file = FileId.from(0), .caller_package = "app" },
+    );
+    try testing.expect(res2.target == null);
+
+    // A skipped parameter WITHOUT a default keeps the strict rule: naming
+    // `limit` past a required `mustGive` defers rather than committing.
+    const strict = try pushTestFuncOpts(&m, a, "strictRanges", "app.strictRanges", "app", 3, .{ .extension = true });
+    m.funcs.items[strict.int()].kind = .top_level_extension;
+    m.funcs.items[strict.int()].params[0].ty = .{ .name = "CharSequence", .nullable = false, .args = &.{} };
+    m.funcs.items[strict.int()].params[1] = .{ .name = "delims", .ty = .{ .name = "CharArray", .nullable = false, .args = &.{} }, .default = null };
+    m.funcs.items[strict.int()].params[2] = .{ .name = "mustGive", .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .default = null };
+    m.funcs.items[strict.int()].params[3] = .{ .name = "limit", .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .default = null, .has_default = true };
+    try m.rebuildFuncNameIndex(a);
+    var skip_required = [_]applicability.ArgShape{
+        .{ .ty = .{ .name = "CharArray", .nullable = false, .args = &.{} } },
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .named = "limit" },
+    };
+    const res3 = m.resolveExtensionCall(
+        "strictRanges",
+        .{ .name = "CharSequence", .nullable = false, .args = &.{} },
+        &skip_required,
+        .{ .caller_file = FileId.from(0), .caller_package = "app" },
+    );
+    try testing.expect(res3.target == null);
+}
+
+test "dependent bound with unbound referenced parameter does not refute" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    // `fun <S, T : S> Iterable<T>.reduce(op: (S, T) -> S)` against an
+    // `Iterable<String>` receiver: binding produces only `T := String`, and
+    // `S` (value-parameter and return positions only) stays free for the
+    // call's inference, so `T <: S` cannot refute the candidate.
+    const type_vars = [_]TypeRef{.{ .name = "T", .nullable = false, .args = &.{} }};
+    const strings = [_]TypeRef{.{ .name = "String", .nullable = false, .args = &.{} }};
+    const pattern = TypeRef{ .name = "Iterable", .nullable = false, .args = @constCast(&type_vars) };
+    const actual = TypeRef{ .name = "Iterable", .nullable = false, .args = @constCast(&strings) };
+    const declared = [_]ModuleRegistry.TypeParamBound{
+        .{ .param = "S", .bound = "kotlin.Any" },
+        .{ .param = "T", .bound = "S" },
+    };
+    try testing.expect(try m.staticGenericReceiverApplicable(
+        a,
+        actual,
+        pattern,
+        &declared,
+        &.{},
+    ));
+    // A dependent bound whose referenced parameter IS bound still proves:
+    // `Map<K, V>.getRid(k: K)` shapes bind both sides from the receiver.
+    const bound_both = [_]ModuleRegistry.TypeParamBound{
+        .{ .param = "T", .bound = "V" },
+        .{ .param = "V", .bound = "kotlin.Any" },
+    };
+    const pair_vars = [_]TypeRef{
+        .{ .name = "T", .nullable = false, .args = &.{} },
+        .{ .name = "V", .nullable = false, .args = &.{} },
+    };
+    const int_string = [_]TypeRef{
+        .{ .name = "Int", .nullable = false, .args = &.{} },
+        .{ .name = "String", .nullable = false, .args = &.{} },
+    };
+    const pair_pattern = TypeRef{ .name = "Pair", .nullable = false, .args = @constCast(&pair_vars) };
+    const pair_actual = TypeRef{ .name = "Pair", .nullable = false, .args = @constCast(&int_string) };
+    try testing.expect(!(try m.staticGenericReceiverApplicable(
+        a,
+        pair_actual,
+        pair_pattern,
+        &bound_both,
+        &.{},
+    )));
 }
 
 test "static subtype proof respects variance, bottom, stars, and aliases" {

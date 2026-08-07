@@ -1564,6 +1564,13 @@ pub const FuncBuilder = struct {
             const label: ?[]const u8 = if (self.recv_ty != null) self.own_this_label else null;
             try appendTowerEntry(&out, allocator, .{ .head = head, .label = label });
         }
+        // An inline SPLICE window's receiver is an implicit receiver too,
+        // labeled by the spliced function: a SAM lambda built inside
+        // `thenBy`'s spliced body reads `this@thenBy`, and without this
+        // entry the closure's tower never carried it.
+        if (self.spliceRecvTy() orelse self.spliceHintRecv()) |head| {
+            try appendTowerEntry(&out, allocator, .{ .head = head, .label = self.currentInlineFn() });
+        }
         for (self.implicit_receiver_tower.items) |entry| {
             try appendTowerEntry(&out, allocator, entry);
         }
