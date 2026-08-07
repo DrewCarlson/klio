@@ -4381,3 +4381,24 @@ re-diagnosed.
 ## Standing
 
     stdlib census    8873 / 9054   98.00% bound
+
+### Nested objects: reverted, and the reason is the key
+
+`TimeSource.Monotonic`, `DateTimeComponents.Formats.ISO` — a nested OBJECT
+read through its enclosing class name is an instance of that object, and
+nothing recorded it, so eight receivers had no type. Recording
+`class_prop_type_heads[{Outer, Nested}] = Nested` moves those eight and
+BREAKS `TimeMarkTest.defaultTimeMarkAdjustmentBig`
+(`get_field reading on kotlin.time.Duration`).
+
+The head is the problem. A nested declaration is not registered under its
+bare simple name, so `Monotonic` either names nothing or names the wrong
+class, and a wrong head mis-resolves where an absent one merely declined.
+Halving the change (dropping the nested object's own property heads, keeping
+only the object-name read) does not help — the object-name entry alone is
+what breaks it.
+
+Doing this correctly needs the nested declaration's REGISTERED name, which
+is the same qualified-suffix machinery `classIdByQualifiedSuffix` uses.
+Eight sites did not justify guessing at it; recorded so the next attempt
+starts from the registered name rather than the simple one.
