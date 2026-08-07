@@ -4941,3 +4941,42 @@ This also answers task #15 in the narrow case: a declaration's body and its
 host symbol have DIFFERENT calling conventions whenever the body assumes a
 boxed receiver, and `hasBody()` is a cheap, sound way to tell the two apart
 without unifying them.
+
+### The iterator protocol: 87% of the remaining walks, and no wall clock
+
+With the scalar channel landed, the residue was concentrated rather than
+spread out:
+
+    20,243  hasNext   root=kotlin.collections.Iterator.hasNext
+    20,117  next      root=kotlin.collections.Iterator.next
+     4,834  add       root=kotlin.collections.ArrayList.add
+    ......  the rest is a long tail under 500 each
+
+The receiver type at each of those sites is the INTERFACE — `recv_ty=
+kotlin.collections.Iterator`, not a concrete class. Host iterators are a
+`Value` variant implemented in Zig with no Kotlin declaration behind them, so
+`methodSlotTarget(runtime_class, slot)` has nothing to return and the slot
+degrades to the named ladder. The ladder reaches `iteratorMember` only after
+`collectionMutators`, `componentMembers` and everything above them, so each
+of those 40,360 calls paid for the whole prefix.
+
+Dispatching the six names the iterator variants own outright (`hasNext`,
+`next`, `hasPrevious`, `previous`, `nextIndex`, `previousIndex`) straight to
+the variant handler:
+
+    46,421 -> 5,887 slot walks
+
+and the wall clock is FLAT: 28.37s / 28.43s against a 28.6s baseline, inside
+noise. That is the honest result. This channel is not a performance win — the
+walks were cheap, because the names hit early string comparisons and the
+receiver test is a tag check. It is worth keeping for the other reason: a
+statically bound slot that resolves a NAME at run time is exactly what a
+bytecode VM and the C backend cannot express, and 87% of the remaining
+violations of that contract are now gone.
+
+Restricting to names no earlier ladder step claims keeps the fix behavior-
+preserving — `remove` is deliberately NOT in the set, since
+`collectionMutators` answers it first for a mutable iterator.
+
+Green: commontest 117/0, drift 267/267, litmus 42/43 (the known
+`tl_atomic_update_contended` timeout), units, compose exit 0 / 1316 vs 1275.

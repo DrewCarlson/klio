@@ -9770,9 +9770,20 @@ pub fn slotByNameFallbacks() u64 {
     return slot_by_name_count.load(.monotonic);
 }
 
-fn noteSlotByName(self: *VmHost, slot: MethodSlotId, name: []const u8) void {
+/// Names the builtin iterator variants own outright.
+fn isIteratorProtocol(name: []const u8) bool {
+    return std.mem.eql(u8, name, "hasNext") or std.mem.eql(u8, name, "next") or
+        std.mem.eql(u8, name, "hasPrevious") or std.mem.eql(u8, name, "previous") or
+        std.mem.eql(u8, name, "nextIndex") or std.mem.eql(u8, name, "previousIndex");
+}
+
+fn noteSlotByName2(self: *VmHost, slot: MethodSlotId, name: []const u8, receiver: *const Value) void {
     _ = slot_by_name_count.fetchAdd(1, .monotonic);
     if (!runtime.envSetOnce("KLIO_SLOT_BYNAME")) return;
+    if (runtime.envOnce("KLIO_SLOT_RECV") != null) {
+        std.debug.print("[slot-recv] {s} recv_ty={s}\n", .{ name, receiver.typeFqn() });
+        return;
+    }
     const mg = self.module.borrow();
     defer mg.deinit();
     const root = FuncId.from(slot.int());
@@ -9982,7 +9993,19 @@ pub fn invokeVirtualMember(
             if (try invokeMethodFuncId(self, allocator, receiver, target, args)) |r| return r;
         }
         if (noinst.name) |mname| {
-            noteSlotByName(self, slot, mname);
+            // The iterator protocol is implemented by the host variants and by
+            // nothing ahead of them in the named ladder, so a statically bound
+            // slot for one of these names can reach its implementation without
+            // walking every earlier member handler first.
+            if (isIteratorProtocol(mname)) {
+                switch (receiver.*) {
+                    .Iterator => if (try iteratorMember(self, allocator, receiver, mname, args)) |r| return r,
+                    .RangeIter => if (try rangeIterMember(self, allocator, receiver, mname, args)) |r| return r,
+                    .SeqIter => if (try seqIterMember(self, allocator, receiver, mname, args)) |r| return r,
+                    else => {},
+                }
+            }
+            noteSlotByName2(self, slot, mname, receiver);
             return callMemberNamed(self, allocator, receiver, mname, args, arg_names);
         }
         if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
