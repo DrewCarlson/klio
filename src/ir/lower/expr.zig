@@ -15868,6 +15868,10 @@ fn uniqueAnyNullableExtension(b: *FuncBuilder, name: []const u8, nargs: usize) ?
         const is_ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
         if (!is_ext) continue;
         if (f.params.len != nargs + 1) continue;
+        // An INLINE extension must reach its splice: a non-local `return`
+        // inside its lambda argument depends on the body being expanded
+        // here, and a real call would strand it.
+        if (f.is_inline) return null;
         const rt = f.params[0].ty;
         if (!rt.nullable) return null;
         if (!std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, rt.name, "?")), "Any")) return null;
