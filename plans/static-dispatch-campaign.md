@@ -4114,3 +4114,23 @@ find next, and it is not this one.
 
     stdlib census    8841 / 9081   97.36% bound
     examples census 99577 /101641  98.28% bound
+
+### The arm that answers, found by elimination
+
+The property-read substitution measured flat twice before it worked, and
+both times for the same reason: it was wired into the member-read arm that
+`lookup.values` never reaches. There are two `.Member` arms in
+`argDeclTypeRefLazy`, 200 lines apart; the one that answers a property read
+used AS A RECEIVER is the first, and it returned the declared HEAD.
+
+Wired there — with generic-argument property types recorded rather than
+dropped, so the substitution has an input — `for (v in lookup.values)`,
+`lookup.values.map { }` and a nested `List<List<Named>>` walk all type.
+
+A flat measurement is not always a dead channel. Twice here it meant the
+consumer was in the wrong place, and the probe that named the reached arm
+was worth more than either retry.
+
+Substituting an EXTENSION's own type parameter from the receiver
+(`fun <T> Iterable<T>.first(): T` on a `Collection<Named>`) measures flat
+and is reverted; `first()` never reaches that loop.
