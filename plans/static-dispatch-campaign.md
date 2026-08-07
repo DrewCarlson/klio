@@ -4248,3 +4248,16 @@ is now fully bound, and so is every shape derived from it.
 
     stdlib census    8831 / 9064   97.43% bound
     examples census 99526 /101589  97.97% bound
+
+### `ref=null` is not a defect count
+
+Following the delegation fix, `KLIO_SPLICE_REF` reports 2,404 splices whose
+receiver expression is a Path and whose installed ref is null. That number
+invites a chase and should not have one: a receiver with no TYPE ARGUMENTS
+installs no ref because there is nothing to install. `CharSequence.zip`
+called on a `String`, `isEmpty` on a concrete class — `ref=null` is the
+correct and complete answer for every non-generic receiver.
+
+The probe's value is the PAIR: a receiver that did carry arguments one
+frame out and null one frame in, which is what `map`/`mapTo` showed. Read
+the transitions, not the totals.
