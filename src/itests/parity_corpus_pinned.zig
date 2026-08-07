@@ -2200,3 +2200,13 @@ test "member_type_param_beats_extension" {
         \\
     );
 }
+
+test "member_collection_beats_iterable_extension" {
+    try check("member_collection_beats_iterable_extension",
+        \\1,2,3,4
+        \\true
+        \\
+        \\a,b,c,d,e
+        \\
+    );
+}

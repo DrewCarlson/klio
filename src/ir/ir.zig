@@ -2497,6 +2497,28 @@ pub const Module = struct {
     /// the deferral.
     pub threadlocal var mpp_why: []const u8 = "-";
 
+    /// Whether a STAR-ERASED parameter is satisfied by this argument on the
+    /// head alone. The erasure convention says the arguments neither prove
+    /// nor refute, so a `Collection<*>` slot is decided entirely by whether
+    /// the argument's class is a `Collection` — which is exactly what
+    /// Kotlin checks when it gives `set.addAll(collection)` to the member
+    /// rather than the `Iterable` extension beside it.
+    fn erasedHeadProves(
+        self: *const Module,
+        erased: bool,
+        param_ty: TypeRef,
+        sh: applicability.ArgShape,
+    ) bool {
+        if (!erased) return false;
+        const arg_ty = sh.ty orelse return false;
+        if (arg_ty.nullable and !param_ty.nullable) return false;
+        const ah = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, arg_ty.name, "?")));
+        const ph = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, param_ty.name, "?")));
+        if (ah.len == 0 or ph.len == 0) return false;
+        if (ah.len <= 2 and std.ascii.isUpper(ah[0])) return false;
+        return std.mem.eql(u8, ah, ph) or self.classIsOrExtends(ah, ph);
+    }
+
     pub fn memberPromotionProven(
         self: *const Module,
         member_fid: FuncId,
@@ -2560,6 +2582,7 @@ pub const Module = struct {
             // what lifts removeAll/addAll/putAll members to the
             // scope-order tier.
             var star_buf: [8]TypeRef = undefined;
+            var param_args_erased = false;
             if (param_ty.args.len != 0 and param_ty.args.len <= star_buf.len) {
                 var all_tp = true;
                 for (param_ty.args) |pa| {
@@ -2580,6 +2603,7 @@ pub const Module = struct {
                     }
                 }
                 if (all_tp) {
+                    param_args_erased = true;
                     for (0..param_ty.args.len) |i| {
                         star_buf[i] = .{ .name = "*", .nullable = false, .args = &.{} };
                     }
@@ -2631,7 +2655,19 @@ pub const Module = struct {
                     }
                     return false;
                 },
-                .unknown => if (!param_still_tp) {
+                .unknown => if (!param_still_tp and !erasedHeadProves(self, param_args_erased, param_ty, sh)) {
+                    if (runtime.envSetOnce("KLIO_PROMO_NAMES")) {
+                        std.debug.print("[promo-unknown] {s}.{s} param={s}<{d}> arg={s}<{d}> lit={} lam={}\n", .{
+                            head,
+                            name,
+                            param_ty.name,
+                            param_ty.args.len,
+                            if (sh.ty) |t| t.name else "?",
+                            if (sh.ty) |t| t.args.len else 0,
+                            sh.literal_kind != null,
+                            sh.is_lambda,
+                        });
+                    }
                     member_fully_proven = false;
                 },
                 .compatible => {},
