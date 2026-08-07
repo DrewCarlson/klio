@@ -9299,7 +9299,16 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
     }
     if (ty.args.len != 1) return null;
     const elem = ty.args[0].name;
-    if (elem.len == 0 or ty.args[0].nullable) return null;
+    if (elem.len == 0) return null;
+    // A STAR projection's element is `Any?` — the projection's own upper
+    // bound, which is what Kotlin resolves a call on it against.
+    // `Collection<*>` is how the stdlib's own `orderedHashCode` and
+    // `unorderedHashCode` take their argument, and their loop variables had
+    // no type at all.
+    if (std.mem.eql(u8, elem, "*")) {
+        return try (ir.TypeRef{ .name = "Any", .nullable = true, .args = &.{} }).clone(b.allocator);
+    }
+    if (ty.args[0].nullable) return null;
     // A bare type-PARAMETER element is carried, not discarded, when the
     // scope records a bound for it: a generic body is lowered once with no
     // call site to read an instantiation from, and its parameter's declared

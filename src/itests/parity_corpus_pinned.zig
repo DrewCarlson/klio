@@ -2234,3 +2234,12 @@ test "type_parameter_erases_to_bound" {
         \\
     );
 }
+
+test "star_projection_element_type" {
+    try check("star_projection_element_type",
+        \\true
+        \\1;a;null;
+        \\2
+        \\
+    );
+}
