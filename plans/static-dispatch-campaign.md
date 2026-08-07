@@ -4398,7 +4398,21 @@ Halving the change (dropping the nested object's own property heads, keeping
 only the object-name read) does not help — the object-name entry alone is
 what breaks it.
 
-Doing this correctly needs the nested declaration's REGISTERED name, which
-is the same qualified-suffix machinery `classIdByQualifiedSuffix` uses.
-Eight sites did not justify guessing at it; recorded so the next attempt
-starts from the registered name rather than the simple one.
+Two hypotheses were then tested and both are WRONG, which is the useful
+part. First: that the property map also drives the read FORM
+(`staticTypeDeclaresProp` consults it), so recording a nested object there
+changes how the read lowers. A separate type-only map — kept out of the
+property map entirely — fails identically. Second: that the head simply
+does not resolve. It does; the census shows the receivers typing and
+`no_class_id` unchanged.
+
+So the breakage is in what the resolver does with a CORRECTLY typed
+`Monotonic` receiver: `markNow()` returns `Monotonic.ValueTimeMark`, a
+`@JvmInline value class` over a Long, and binding that call by declaration
+changes which representation the chain sees — the failure is
+`get_field reading on kotlin.time.Duration`, an unwrapped value where the
+wrapper was expected. That is value-class representation, not receiver
+typing, and four to eight sites do not justify opening it.
+
+Recorded with both refuted hypotheses so the next attempt does not spend
+its budget re-testing them.
