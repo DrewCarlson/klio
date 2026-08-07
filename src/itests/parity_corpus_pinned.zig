@@ -2318,3 +2318,14 @@ test "nested_qualified_constructor" {
         \\
     );
 }
+
+test "char_intrinsic_direct_dispatch" {
+    try check("char_intrinsic_direct_dispatch",
+        \\1194
+        \\120/121/122
+        \\Ab
+        \\535
+        \\-1,1,0
+        \\
+    );
+}

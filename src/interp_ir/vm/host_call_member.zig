@@ -9782,6 +9782,19 @@ fn noteSlotByName(self: *VmHost, slot: MethodSlotId, name: []const u8) void {
     });
 }
 
+/// A value that IS its own representation — no host wrapper for the by-name
+/// walk to unpack on the way in.
+fn isScalarValue(v: *const Value) bool {
+    return switch (v.*) {
+        // Restricted to `Char` by measurement: the unsigned variants abort
+        // `UnsignedArraysTest` / `UComparisonsTest` through this path, so
+        // whatever the by-name walk does for them is load-bearing and is not
+        // captured by "the receiver is a scalar".
+        .Char => true,
+        else => false,
+    };
+}
+
 fn noinstTraceOn() bool {
     const S = struct {
         var known: ?bool = null;
@@ -9905,8 +9918,25 @@ pub fn invokeVirtualMember(
             if (mname) |n| {
                 var fqn_buf: [192]u8 = undefined;
                 if (std.fmt.bufPrint(&fqn_buf, "{s}.{s}", .{ receiver.typeFqn(), n })) |member_fqn| {
-                    if (lookupIntrinsic(self, member_fqn) != null)
+                    if (lookupIntrinsic(self, member_fqn)) |native| {
+                        // A SCALAR receiver is its own representation: there
+                        // is no wrapper for the by-name walk to unpack, so
+                        // reaching the identical host symbol by FuncId is the
+                        // same call without the lookup. Wrapper-backed values
+                        // (`Result` stores a discriminant and a raw payload,
+                        // an `Iterator` is a host generator) keep the walk —
+                        // that is where the conversion lives, and binding
+                        // them by id returned `Success` for a `Failure`.
+                        if (isScalarValue(receiver)) {
+                            if (module.methodSlotTarget(runtime_class, slot)) |slot_target| {
+                                if (host_call_func.resolvedNativeForm(self, slot_target)) |target_native| {
+                                    if (target_native == native)
+                                        break :blk .{ .target = slot_target, .name = n };
+                                }
+                            }
+                        }
                         break :blk .{ .target = null, .name = n };
+                    }
                 } else |_| {}
             }
             const target = module.methodSlotTarget(runtime_class, slot) orelse
