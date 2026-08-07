@@ -4416,3 +4416,25 @@ typing, and four to eight sites do not justify opening it.
 
 Recorded with both refuted hypotheses so the next attempt does not spend
 its budget re-testing them.
+
+## Every constructor scope, not just three of five
+
+The delegation, default and superclass thunks were given their parameters'
+declared types earlier in this campaign. Two more constructor-scoped
+lowerings were not: the INIT BLOCK and the secondary constructor's BODY.
+Both read the constructor's parameters, both were handed the names alone.
+
+    no_receiver_type 163 -> 157
+
+The init-block half measures flat on its own and is kept anyway. That is a
+deliberate exception to the revert-if-flat rule and the reason is
+structural rather than statistical: it is the same rule as the half that
+pays, one fixture exercises both, and leaving one constructor scope typed
+while its sibling is not is exactly the asymmetry that costs an afternoon
+to rediscover. The rule this campaign follows is "do not accumulate
+UNPROVEN machinery" — a proven rule applied to its remaining site is not
+that.
+
+## Standing
+
+    stdlib census    8879 / 9048   98.13% bound
