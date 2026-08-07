@@ -2210,3 +2210,14 @@ test "member_collection_beats_iterable_extension" {
         \\
     );
 }
+
+test "universal_any_extension_binding" {
+    try check("universal_any_extension_binding",
+        \\N(a),N(b)
+        \\x,null
+        \\N(q)
+        \\null
+        \\true
+        \\
+    );
+}

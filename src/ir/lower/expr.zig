@@ -15090,6 +15090,35 @@ fn lowerResolvedMemberCall(
                 std.debug.print("[member-static] {s} recv=<unknown>\n", .{name.name});
             }
         }
+        // A call every value answers, on a receiver nothing could name.
+        // `toString()` and `hashCode()` are declared as `Any?` EXTENSIONS in
+        // the stdlib, and those are what Kotlin binds when the receiver may
+        // be null; for a non-null receiver they delegate to the member, so
+        // the observable result is the same either way. Only a UNIQUE `Any?`
+        // extension of that name and arity is taken, so a same-named
+        // declaration on a real type can never be reached through here.
+        if (recv_state.reg == null and ast_type_args.len == 0) {
+            if (args.len == 0 and allNull(ast_arg_names)) {
+                if (uniqueAnyNullableExtension(b, name.name, args.len)) |fid| {
+                    const recv_slot = b.allocReg();
+                    const rv = try lowerExpr(b, receiver);
+                    try b.push(.{ .Move = .{ .dst = recv_slot, .src = rv } });
+                    const dst = b.allocReg();
+                    try b.push(.{ .Call = .{
+                        .dst = dst,
+                        .func = fid,
+                        .trailing_lambda = false,
+                        .args = recv_slot,
+                        .n_args = 1,
+                        .arg_names = &.{},
+                        .type_args = &.{},
+                        .exact = true,
+                    } });
+                    lmNote(.bound_static);
+                    return .{ .lowered = dst };
+                }
+            }
+        }
         lmNote(.no_receiver_type);
         if (!norecvCensusOn()) return .none;
         lm_norecv[@intFromEnum(std.meta.activeTag(receiver.*))] += 1;
@@ -15823,6 +15852,29 @@ fn ctorArgStaticHeads(b: *FuncBuilder, args: []const Expr) Allocator.Error![]?ir
         return &.{};
     }
     return out;
+}
+
+/// The one extension of this name and arity whose declared receiver is
+/// `Any?` — the universal surface every value has (`toString`, `hashCode`).
+/// Null unless exactly one such declaration exists and no other declaration
+/// of the name could compete, so an untyped receiver can never be handed to
+/// a namesake meant for a real type.
+fn uniqueAnyNullableExtension(b: *FuncBuilder, name: []const u8, nargs: usize) ?FuncId {
+    var found: ?FuncId = null;
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        // A MEMBER of the same name is not competition: `Any?.toString()`
+        // delegates to it, so the two agree wherever both apply.
+        const is_ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+        if (!is_ext) continue;
+        if (f.params.len != nargs + 1) continue;
+        const rt = f.params[0].ty;
+        if (!rt.nullable) return null;
+        if (!std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, rt.name, "?")), "Any")) return null;
+        if (found != null) return null;
+        found = fid;
+    }
+    return found;
 }
 
 fn lowerResolvedExtensionCall(
