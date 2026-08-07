@@ -4523,3 +4523,34 @@ Reverted. Recorded because the leg reads sound and the number is the
 largest single one left — the next reader should know it was tried, what it
 cost, and that the missing evidence is WHICH class on the chain declares
 the target, not whether the name is on it.
+
+## What the emission count did not show
+
+The "nothing to shadow" cut moved 100 emission SITES. At run time it moved
+this:
+
+                              early session      now
+    call_member_or_global      3,788,055        10,552
+    call_static                   59,388     3,836,895
+    total dispatches          42,635,738    27,524,472
+
+Name resolution for bare calls goes from 8.88 % of all dispatches to
+0.04 %. The hundred sites it touched are in the hot paths — a site count is
+a measure of SOURCE, and the goal is about EXECUTION.
+
+That is the strongest single result in this campaign and it came from
+changing the question, not from a new channel. The `[lower-sites]` census
+had been the instrument all along; it counts explicit-receiver calls and
+weights every site equally, so a fix worth 3.8 M runtime resolutions
+registered as "100 sites" and a fix worth 20 cold sites registered the same
+way. `KLIO_DISPATCH_STATS`'s own totals were the measure that mattered and
+were never read as the headline.
+
+Both instruments are worth keeping and they answer different questions:
+
+  * `[lower-sites]` — did lowering decide this call site, weighted by source
+    site. Good for finding UNTYPED RECEIVERS, which is what it found.
+  * `[dispatch-stats]` — what the interpreter actually executed. Good for
+    ranking work by what it costs at run time.
+
+Read the second one first when the goal is "no runtime resolution".
