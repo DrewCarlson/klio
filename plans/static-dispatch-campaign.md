@@ -4186,3 +4186,22 @@ repro that goes from unbound to bound is proof; a census that does not
 contain the shape is not a refutation. Both halves of that matter, and the
 distinction is what the earlier flat reverts were missing when they were
 right and what this one turns on when it is not.
+
+### The user-code shapes, verified one by one
+
+With the property-type and substitution work in, every ordinary shape that
+motivated it now binds. Measured per repro against a warm home, so each file
+reports only its OWN sites:
+
+    chainext   7 sites   0 unbound   lookup.values.first().tag(), and via a local
+    opform     9 sites   0 unbound   items[0], lookup["k"]?, items.last(), firstOrNull()
+    getsub    10 sites   0 unbound   items.get(0), lookup.get("k")?
+    collrecv   5 sites   0 unbound   first() on List / Collection / Iterable / Set
+    mapvals    9 sites   1 unbound
+
+The one that remains is `lookup.values.map { it.tag() }`: the lambda
+parameter is bound through TWO splices — `map`'s body iterates `this` and
+calls `transform(item)`, and the user lambda's `it` takes its type from
+`item`. `items.map { it.tag() }` binds, so the receiver being a property
+READ rather than a directly-recorded property is what differs. That is a
+splice-window question, not a substitution one, and it is the next thread.
