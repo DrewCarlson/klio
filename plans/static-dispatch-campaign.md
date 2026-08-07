@@ -4646,12 +4646,41 @@ not only speed, and this removes 84,595 of them. But it is not a
 performance result and must not be reported as one.
 
 By the same measure the rest of the ladder is cold. `DefaultAsserter.assertTrue`
-is 16,873 executions, 0.06 % of dispatches. It is statically bound at
-lowering — `[member-static] assertTrue recv=kotlin.test.Asserter target=2
-dispatch=virtual applicable=true` — and still reaches the ladder at run
-time, which means the interface slot is not linked for the implementing
-class. That is VM slot-linking, a different subsystem, and 0.06 % does not
-buy the surgery.
+is 16,873 executions, 0.06 % of dispatches.
+
+The first diagnosis of it was WRONG and is worth keeping as a correction.
+"The interface slot is not linked" — `KLIO_SLOT_DUMP=assertTrue` says it is:
+
+    [slot-dump] class=kotlin.test.DefaultAsserter slot=2 -> fid=2 owner=kotlin.test.Asserter
+
+and that target is right, because `DefaultAsserter` overrides only `fail`;
+`assertTrue(message: String?, actual: Boolean)` is an interface DEFAULT with
+a body. The slot call lands correctly. What ladders is INSIDE that body:
+
+    public fun assertTrue(message: String?, actual: Boolean): Unit {
+        assertTrue({ message }, actual)
+    }
+
+a bare call to the OTHER overload of its own name on the implicit receiver.
+So it is not slot linking at all — it is the bare-call population again, in
+its hardest form: a self-named overload set where static selection has to
+pick `(() -> String?, Boolean)` over `(String?, Boolean)` from argument
+shape alone.
+
+That is precisely the shape whose binding was refuted above — `sort()`
+inside `sort` bound to itself. The difference here is that correct
+shape-based overload selection would pick the sibling rather than itself,
+which is the evidence the earlier attempt lacked. Left open with that stated,
+because 0.06 % does not justify re-entering a change that broke four suites.
+
+One contract error found on the way and worth fixing whenever this is taken
+up: `execArmCallVirtual` documents itself as having "no name-based fallback:
+a missing slot is a link error", and the host it calls opens with "Named
+arguments folded into `arg_params` at lowering must survive a BY-NAME
+FALLBACK (an unlinked slot, a bodyless target)". Both cannot be true. A
+statically bound virtual call can silently degrade to name resolution, which
+is exactly what a bytecode VM or a C backend cannot allow — there the
+unlinked slot must be a build error, not a walk.
 
 So the execution-ranked front has one large result (the bare-call bind,
 2.6x) and a tail that is already cold. What remains dynamic is worth
