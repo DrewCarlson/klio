@@ -4594,3 +4594,38 @@ is known.
       Call/implicit-member 2136   static
       Call/bare-member      413   static
       CallMemberOrGlobal   2077   resolves by name
+
+## Ranking by execution, second pass
+
+With the bare-call form closed, `member_ladder` became the largest dynamic
+resolution path at 113,980 executions. `KLIO_CALL_STATS` splits it by
+receiver and name, and it is not spread out:
+
+    84,595  <ladder>kotlin.Char.compareTo
+    16,873  <ladder><instance>.assertTrue
+     8,466  <ladder>kotlin.collections.MutableList.set
+      1,029  <ladder>kotlin.String.get
+
+Three quarters of it is one shape. `NaturalOrderComparator.compare(a:
+Comparable<Any>, b)` holds a Char at run time, a primitive has no vtable
+slot to bind, so every comparison in every sort resolved the name. The
+primitive fast path handled `Int` and `Long` receivers and no comparison at
+all.
+
+    member_ladder  113,980 -> 29,380
+    member_prim_op  11,610 -> 28,474
+
+The instrument existed the whole time (`KLIO_CALL_STATS`), already split by
+receiver and name, and was never read. That is the same failure as the
+headline metric: the data to rank by execution was there before the work
+started.
+
+### Noted, not changed: Char.compareTo returns -1/0/1
+
+klio returns the SIGN; kotlinc on the JVM compiles `Char.compareTo` to
+integer subtraction, so `'z'.compareTo('a')` is 25 there and 1 here. The
+documented contract is sign-only, so nothing in the suites catches it, and
+the fast path added above deliberately reproduces the existing value rather
+than changing behaviour inside a performance change. It is a real divergence
+from kotlinc's observable output and belongs to whoever takes the
+value-semantics pass.
