@@ -4872,3 +4872,37 @@ So the remaining dynamic dispatch is two disjoint problems, not one:
 
 The earlier note collapsed these into one root. They are separate, they have
 different fixes, and only the second one is blocked on convention.
+
+## Crossing the boundary per type: Char lands, and the unsigned types say why
+
+The host short-circuits to a by-name walk whenever a member of a
+host-backed receiver is an intrinsic, so a statically bound slot call
+resolves a name at run time. Where the slot's own target links to the
+IDENTICAL host symbol, dispatching by FuncId is the same call without the
+lookup.
+
+    all scalar variants   68,987 -> 46,421   UnsignedArraysTest / UComparisonsTest abort
+    Char only             68,987 -> 59,457   every suite green
+
+`Char` is committed. The abort was then reduced rather than left as a
+restriction, and the reason is not what the first guess said:
+
+    uintArrayOf(1u, 2u).associateWith { it.toString() }
+    [klio] RSS 6480912KB exceeded cap — aborting
+
+Unbounded recursion, not a wrong value. The intrinsic for an unsigned type
+RE-ENTERS member dispatch, so binding the declaration to it by FuncId
+closes a cycle; the by-name walk breaks the cycle because it re-resolves
+against the runtime class each time and lands elsewhere.
+
+So the rule is not "the receiver is a scalar" — `UInt` is as scalar as
+`Char` in this runtime. It is:
+
+    dispatch the intrinsic by FuncId only where the intrinsic is
+    SELF-CONTAINED — it does not call back through member dispatch.
+
+That is a property of the implementation, not of the receiver, and nothing
+currently records it. `Char`'s conversions are leaf functions; the unsigned
+formatting path is not. Whoever takes this next should look for that
+property rather than widen the type list — widening is what the measurement
+already refuted.
