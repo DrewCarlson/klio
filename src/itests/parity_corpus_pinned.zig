@@ -2295,3 +2295,11 @@ test "unsigned_arithmetic_promotion" {
         \\
     );
 }
+
+test "nested_class_property_type" {
+    try check("nested_class_property_type",
+        \\-/2/4/mun/t
+        \\:/1/2/mun/f
+        \\
+    );
+}

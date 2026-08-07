@@ -2095,6 +2095,39 @@ fn buildModuleWithOverrides(
                     }
                 }
             }
+            // A NESTED class's own properties register under its simple
+            // name, which is the head a receiver typed `HexFormat.BytesHexFormat`
+            // resolves to. The walk above only reaches top-level classes, so
+            // every nested declaration's properties were unknown — and the
+            // stdlib puts its option records there
+            // (`bytesFormat.byteSeparator`).
+            for (c.members) |*nm| {
+                if (nm.* != .Class) continue;
+                const nested = &nm.Class;
+                if (nested.is_companion) continue;
+                for (nested.primary_params) |*pp| {
+                    if (pp.property == null) continue;
+                    if (pp.is_vararg) continue;
+                    if (classPropHead(nested, &pp.ty)) |head| {
+                        try module.registry.class_prop_type_heads.put(.{ .a = nested.name.name, .b = pp.name.name }, head);
+                        try notePropTypeRef(a, module, nested, pp.name.name, &pp.ty);
+                    }
+                }
+                for (nested.members) |*nmem| {
+                    if (nmem.* != .Property) continue;
+                    const nprop = nmem.Property;
+                    if (nprop.ty) |*ty| {
+                        if (classPropHead(nested, ty)) |head| {
+                            try module.registry.class_prop_type_heads.put(.{ .a = nested.name.name, .b = nprop.name.name }, head);
+                            try notePropTypeRef(a, module, nested, nprop.name.name, ty);
+                        }
+                    } else if (nprop.init) |*init| {
+                        if (literalTypeHead(init)) |head| {
+                            try module.registry.class_prop_type_heads.put(.{ .a = nested.name.name, .b = nprop.name.name }, head);
+                        }
+                    }
+                }
+            }
             // COMPANION property heads register under the companion's
             // lifted name (`Byte$Companion`) — the key a class-named read
             // (`Byte.MAX_VALUE.toLong()`) consults.

@@ -291,6 +291,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     const Pool = struct {
         fn worker(
             queue: []const []const []const u8,
+            names: []const []const u8,
             penv: *std.process.Environ.Map,
             pnext: *std.atomic.Value(usize),
             ppassed: *std.atomic.Value(usize),
@@ -311,6 +312,10 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                 // not correctness.
                 const r = runKlio(arena.allocator(), penv, queue[i], 480_000) catch {
                     _ = phung.fetchAdd(1, .monotonic);
+                    // Name it. "2 did not complete" is not actionable; the
+                    // class is what tells you whether it is the known
+                    // throughput-bound pair or something new.
+                    std.debug.print("compose_plugin_commontest: {s} did not complete (spawn/cap)\n", .{names[i]});
                     continue;
                 };
                 // A completed run counts its end-of-run summary; a killed
@@ -319,14 +324,22 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                 const summary_count = passedLineCount(r.stdout);
                 const n_passed = if (summary_count != 0) summary_count else streamedPassedCount(r.stderr);
                 _ = ppassed.fetchAdd(n_passed, .monotonic);
-                if (std.mem.indexOf(u8, r.stdout, " passed,") == null) _ = phung.fetchAdd(1, .monotonic);
+                if (std.mem.indexOf(u8, r.stdout, " passed,") == null) {
+                    _ = phung.fetchAdd(1, .monotonic);
+                    std.debug.print("compose_plugin_commontest: {s} did not complete ({d} streamed passes kept)\n", .{ names[i], n_passed });
+                }
             }
         }
     };
     var threads: std.ArrayList(std.Thread) = .empty;
     for (0..workerCount()) |_| {
         try threads.append(a, try std.Thread.spawn(.{}, Pool.worker, .{
-            @as([]const []const []const u8, jobs.items), &env, &next, &total_passed, &hung,
+            @as([]const []const []const u8, jobs.items),
+            @as([]const []const u8, classes.items),
+            &env,
+            &next,
+            &total_passed,
+            &hung,
         }));
     }
     for (threads.items) |t| t.join();
