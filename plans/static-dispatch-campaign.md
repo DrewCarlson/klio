@@ -4761,3 +4761,44 @@ Three populations, three instruments, all now measured:
     bare-call emissions     2,077 name-resolving  KLIO_OR_AUDIT
     slot degrades          68,987 name-walking    KLIO_SLOT_BYNAME
     member ladder          29,380 name-resolving  [dispatch-stats]
+
+## More static can be slower, and here is the mechanism
+
+The "nothing to shadow" win has an obvious sibling: a receiver IS in scope
+but its hierarchy provably does not declare the name, so nothing can shadow
+the global either. `ownerChainShadowContains` answers only from a COMPLETE
+shadow set, so a `false` is proof. Binding those:
+
+    CallMemberOrGlobal   2,077 -> 1,582
+    call_member_or_global (runtime) 10,552 -> 1,865
+
+All suites pass. And the census program gets 18 % SLOWER:
+
+    before   28.5 s        after   33.6 s
+    call_virtual_slot     99,802 -> 2,371,690
+    served_user_body      85,023 -> 2,325,884
+    frame_push          11.5 M   -> 13.7 M
+
+The member-first walk was not merely resolving a name — it was SELECTING
+THE HOST IMPLEMENTATION. `CallMemberOrGlobal` finds an intrinsic keyed by
+the receiver's runtime class and serves it natively; the static `Call`
+binds the DECLARATION and enters the interpreted Kotlin body instead. Two
+million calls changed from an intrinsic to a source body.
+
+That is the same mechanism as the FuncId experiment above, from the other
+side, and together they explain why the one bare-call change that worked
+was worth 2.6x: `assertEquals` and its kin have no intrinsic, so binding
+the declaration reached the same body the walk would have — pure win. Where
+an intrinsic exists, binding the declaration is a pessimisation.
+
+So the rule for the remaining bare-call population is not "bind what can be
+proven". It is:
+
+    bind statically only where the target has no faster host form,
+    OR teach the static call path to prefer the intrinsic the way the
+    member walk already does.
+
+The second is the real fix and it is the same missing piece as task #15:
+the interpreted body and the host implementation are two representations of
+one declaration, and only the by-name path currently knows how to choose
+between them.
