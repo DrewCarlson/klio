@@ -3787,3 +3787,41 @@ already recorded.
 
     stdlib census    8784 / 9123   96.28% bound
     examples census 98983 /101930  97.11% bound
+
+## The container family, and reading the OTHER census's residue
+
+`resolver_declined` was 51 on the stdlib census and 654 on the examples one
+— the only bucket where the two sets disagreed by more than a factor of
+three. Splitting the examples residue by the proof's own reason showed why:
+
+    ext-unrefuted        496
+    member-arg-refuted   158
+    arg-unauthoritative  158
+
+and the `ext-unrefuted` sites were one family, every one of them a container
+member: `Map.get`, `containsKey`, `containsValue`, `remove`, `putAll`,
+`addAll`, `removeAll`, `containsAll`, `flatten`.
+
+Addendum 84 had already refused the hypothesis that these were Kotlin's
+member-over-extension precedence being missed, on the grounds that
+`memberPromotionProven` short-circuits on `member_fully_proven` before it
+looks at any extension. That was correct and the conclusion drawn from it
+was not: the question was never whether the short-circuit exists, it was
+why the member is not PROVEN. The answer is that its parameter is a bare
+type parameter — `get(key: K)` under a head-only receiver — and an
+unsubstitutable parameter was scored UNKNOWN, which costs the proof.
+
+A parameter that is still a type parameter after the receiver's
+substitution accepts whatever the source passed: the program compiled, so
+the argument conforms to whatever the instantiation makes it. That is the
+star-erasure convention one level up — the head adjudicates, the parameter
+neither proves nor refutes — and applying it to the parameter itself is
+what the family needed.
+
+    stdlib   resolver_declined  51 ->  37
+    examples resolver_declined 654 -> 472
+
+## Standing
+
+    stdlib census    8798 / 9123   96.44% bound
+    examples census 99165 /101930  97.29% bound
