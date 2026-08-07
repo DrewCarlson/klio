@@ -4686,3 +4686,48 @@ So the execution-ranked front has one large result (the bare-call bind,
 2.6x) and a tail that is already cold. What remains dynamic is worth
 removing for the STATED goal — no runtime resolution, which a bytecode VM
 and a C backend both need — not for speed.
+
+## The third population: slot calls that walk anyway
+
+Chasing the contract mismatch above produced a number that neither existing
+instrument reported. `KLIO_SLOT_BYNAME` counts every statically bound
+virtual slot call that degrades to a by-name member walk:
+
+    68,987 on the census program
+      20,243  Iterator.hasNext
+      20,117  Iterator.next
+       9,530  Char.toInt
+       4,834  ArrayList.add
+      12,831  Int.ushr / Int.shr / Int.toChar
+
+That is larger than the ladder (29,380) and larger than the bare-call form
+(10,552), and it was invisible: the site is `bound_virtual` in the census
+and `call_virtual_slot` in the runtime stats. By both of this campaign's
+measures those calls are STATIC. They resolve a name.
+
+They are not broken links. Every top entry is the HOST-VALUE boundary — a
+host generator serving `Iterator`, a primitive serving `Char.toInt`. There
+is no interpreted body for the slot to reach, and the intrinsic is the
+implementation; the walk is how the host finds it.
+
+Which makes this the shape of the remaining work, stated exactly:
+
+  * for the INTERPRETER it is by design and costs a name lookup;
+  * for a bytecode VM or a C backend it is not acceptable at all — the call
+    must name the intrinsic directly, because there is no name walk to fall
+    back on in generated C.
+
+So the target is not "bind the slot" but "emit the intrinsic". That is
+P10's host-declaration manifest reaching its conclusion: once a host member
+carries a declaration, a receiver whose static type is that host class can
+be lowered to a direct intrinsic call instead of a virtual slot that
+degrades. The census already says those receivers ARE typed — `Char`,
+`Int`, `ArrayList` are exactly the heads the campaign spent its length
+proving.
+
+Three populations, three instruments, all now measured:
+
+    explicit-receiver sites   155 unbound        [lower-sites]
+    bare-call emissions     2,077 name-resolving  KLIO_OR_AUDIT
+    slot degrades          68,987 name-walking    KLIO_SLOT_BYNAME
+    member ladder          29,380 name-resolving  [dispatch-stats]
