@@ -4554,3 +4554,27 @@ Both instruments are worth keeping and they answer different questions:
     ranking work by what it costs at run time.
 
 Read the second one first when the goal is "no runtime resolution".
+
+### And it is 2.6x faster
+
+The same change, A/B'd on otherwise-identical HEAD by removing only its
+guard block and rebuilding:
+
+    without the bare-call bind    73.48 s
+    with it                       28.61 s
+
+on the census program. So the 15.1 M `served_intrinsic` that vanished
+alongside the 3.79 M `call_member_or_global` was real work, not changed
+accounting: each name resolution was serving an intrinsic through the
+member ladder, and binding the declaration at lowering removes the whole
+chain.
+
+This is worth stating plainly because the campaign spent most of its length
+optimising a metric that could not see it. Ninety-eight per cent of
+explicit-receiver call SITES were bound while 8.9 % of executed dispatches
+still resolved a name — and closing that one was worth more than every
+receiver-typing channel combined, in both dispatch count and wall clock.
+
+The lesson for the next front: rank by `[dispatch-stats]` totals, confirm
+with wall clock, and use `[lower-sites]` to find the mechanism once the cost
+is known.
