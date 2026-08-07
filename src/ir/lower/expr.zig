@@ -14877,12 +14877,12 @@ fn declineNote(k: DeclineKind) void {
     if (norecvCensusOn()) lm_decline[@intFromEnum(k)] += 1;
 }
 
-/// Why a `target_known_deferred` site did NOT get promoted to a real dispatch.
-/// The identity is proven at every one of these; each variant names the
-/// conservatism that still holds it back.
+/// Why a `target_known_deferred` site had to ASK the extension question at
+/// all — the identity is proven at every one of these. Most go on to be
+/// promoted by the proof; the variant names which reachable extension the
+/// proof then has to refute. Counted before the proof runs, so this total
+/// is larger than `resolver_declined`.
 pub const PromoBlock = enum(u8) {
-    /// A stub or value receiver class: host-backed, with no vtable to index.
-    receiver_not_instance,
     /// An extension whose receiver is a TYPE PARAMETER declares this name, so
     /// the index cannot say which receivers it serves. The blunt one.
     ext_generic_receiver,
@@ -15440,17 +15440,6 @@ fn lowerResolvedMemberCall(
     // conservative — a generic-receiver extension, a supertype's extension, or a
     // stale index all answer yes — so a `false` means nothing else could bind
     // and the member's identity is sufficient.
-    //
-    // Restricted to a receiver whose values are real interpreted instances. A
-    // stub or value class is host-backed and has no vtable to index. An
-    // INTERFACE receiver is allowed: it can hold a host-backed value (a
-    // `Sequence` is a generator, not an `Instance`), and `invokeVirtualMember`
-    // resolves the slot against such a value's runtime class instead of
-    // requiring an `Instance`.
-    const promo_blocked_by_class = resolved.dispatch == .deferred and resolved.target != null and
-        (static_owner.int() >= b.module.classes.items.len or
-            b.module.classes.items[static_owner.int()].is_stub or
-            b.module.classes.items[static_owner.int()].is_value);
     // Computed for stub/value receivers too: their direct-dispatch escape
     // below still requires the extension-shadow question answered — String
     // and the unsigned shells carry extension families everywhere.
@@ -15469,12 +15458,7 @@ fn lowerResolvedMemberCall(
                 head, name.name, args.len, typed_args, @tagName(promo_ext_why),
             });
         }
-        if (promo_blocked_by_class) {
-            lm_promo[@intFromEnum(PromoBlock.receiver_not_instance)] += 1;
-            if (runtime.envOnce("KLIO_PROMO_NAMES") != null) {
-                std.debug.print("[promo-class] {s}.{s} nargs={d} why={s}\n", .{ head, name.name, args.len, @tagName(promo_ext_why) });
-            }
-        } else switch (promo_ext_why) {
+        switch (promo_ext_why) {
             .none => {},
             .index_stale => lm_promo[@intFromEnum(PromoBlock.ext_index_stale)] += 1,
             .generic_receiver => lm_promo[@intFromEnum(PromoBlock.ext_generic_receiver)] += 1,
