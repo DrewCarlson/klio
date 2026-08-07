@@ -4334,3 +4334,17 @@ Completing a table for its own sake is machinery without measured value.
 ## Standing
 
     stdlib census    8863 / 9064   97.78% bound
+
+### The unsigned promotion, measured on the other census
+
+    examples no_receiver_type 1417 -> 1339, bound_static 16583 -> 16661
+
+Seventy-eight sites against the stdlib census's six — the same asymmetry the
+head-only property type showed, and for the same reason: the example
+programs are ordinary code, where an unsigned expression's result is
+actually used as a receiver.
+
+## Standing
+
+    stdlib census    8863 / 9064   97.78% bound
+    examples census 99837 /101589  98.28% bound
