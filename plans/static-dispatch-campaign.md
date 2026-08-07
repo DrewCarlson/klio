@@ -4289,3 +4289,25 @@ receiver is a bare unbounded type parameter.
 
     stdlib census    8857 / 9064   97.72% bound
     examples census 99759 /101589  98.20% bound
+
+### The census program is not clean, and the gate does not see it
+
+Reading the census's full output rather than grepping it for `[lower-sites]`
+turned up two failing tests inside the very program every measurement in
+this campaign is taken on:
+
+    [test] CollectionTest.minWithOrNull FAILED
+    [test] CollectionTest.maxWithOrNull FAILED
+
+A/B'd against a binary built early in this session: both fail there too, so
+they are PRE-EXISTING, not a regression from any of this work. They are also
+invisible to the gate — `commontest-sweep --filter CollectionTest` reports
+0 failures, because the sweep compiles the whole directory while the census
+passes a reduced `--only-file` set. Same source, different file set,
+different answer.
+
+That is the cross-file interference workstream the resolution plan already
+tracks ("~53 failures when the corpus runs as ONE module"), reached from a
+new direction. Recorded here because it bears on this campaign's own
+integrity: the numbers are taken on a program that does not fully pass, and
+a future reader should know that before trusting a small delta.
