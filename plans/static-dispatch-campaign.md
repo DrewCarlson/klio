@@ -3825,3 +3825,32 @@ what the family needed.
 
     stdlib census    8798 / 9123   96.44% bound
     examples census 99165 /101930  97.29% bound
+
+### The rest of the container family: the head decides an erased slot
+
+Naming the (parameter, argument) pairs behind every remaining
+`ext-unrefuted` hold split them cleanly in two:
+
+    MutableMap.putAll     param=Map<*,*>       arg=Sequence   hold is RIGHT
+    MutableSet.removeAll  param=Collection<*>  arg=Sequence   hold is RIGHT
+    Set.containsAll       param=Collection<*>  arg=Set        hold is WRONG
+    MutableCollection.addAll param=Collection<*> arg=Collection  hold is WRONG
+
+The first two are calls whose argument does NOT fit the member's parameter,
+so the extension beside it genuinely is the binding kotlinc picks. The
+second two are the member's own call, held because a star-erased parameter
+scored UNKNOWN.
+
+The erasure convention already says an unsubstitutable type ARGUMENT
+neither proves nor refutes; the missing half is that the argument's HEAD
+then decides the slot outright. Applying it keeps both right answers: a
+`Sequence` does not extend `Map`, so `map.putAll(sequence)` still declines
+and takes the extension.
+
+    stdlib   resolver_declined  37 -> 30
+    examples resolver_declined 472 -> 392
+
+## Standing
+
+    stdlib census    8805 / 9123   96.51% bound
+    examples census 99245 /101930  97.37% bound
