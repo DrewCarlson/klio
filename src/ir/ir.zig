@@ -11,6 +11,7 @@ const std = @import("std");
 const span = @import("span");
 const ast = @import("ast");
 const runtime = @import("runtime");
+pub fn runtimeEnvSetOnce(comptime n: [:0]const u8) bool { return runtime.envSetOnce(n); }
 const applicability = @import("applicability");
 const types_mod = @import("types");
 const FF = runtime.forest.ForestField;

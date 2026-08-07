@@ -1429,6 +1429,9 @@ pub const FuncBuilder = struct {
         }
         self.recv_ty = name;
     }
+    pub fn spliceRefDebug() bool {
+        return ir.runtimeEnvSetOnce("KLIO_SPLICE_REF");
+    }
     pub fn setRecvTypeRefOwned(self: *FuncBuilder, receiver: TypeRef) void {
         if (self.recv_type_ref) |previous| {
             var owned_previous = previous;

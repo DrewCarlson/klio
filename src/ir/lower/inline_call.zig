@@ -1491,6 +1491,25 @@ pub fn tryInlineCallWithTypeArgs(
     // which the head-only channel above cannot carry. A bare
     // type-parameter head resolves through the caller's full bound ref.
     var recv_ref_owned: ?ir.TypeRef = null;
+    // An inline extension called as a BARE call on the implicit receiver —
+    // `map`'s body is `return mapTo(ArrayList(…), transform)` — has no
+    // receiver EXPRESSION to read a type from, but the window it is being
+    // spliced into already holds the caller's own receiver. Carrying it
+    // forward is what keeps `lookup.values.map { it.tag() }` typed: without
+    // it the delegation drops `Collection<Named>` and every lambda parameter
+    // derived from the element goes untyped one level in.
+    if (f.receiver_type != null and this_arg == null) fwd: {
+        const cur = b.spliceRecvTyRef() orelse break :fwd;
+        if (cur.args.len == 0) break :fwd;
+        const declared_head = expr_lower.typeHead(std.mem.trimEnd(u8, f.receiver_type.?.name.name, "?"));
+        const cur_head = expr_lower.typeHead(std.mem.trimEnd(u8, cur.name, "?"));
+        // Only when the callee's declared receiver is the same classifier or
+        // a supertype of the one in hand: a delegation to an unrelated
+        // extension must not inherit this receiver's arguments.
+        if (!std.mem.eql(u8, declared_head, cur_head) and
+            !b.module.classIsOrExtends(cur_head, declared_head)) break :fwd;
+        recv_ref_owned = cur.clone(b.allocator) catch break :fwd;
+    }
     if (f.receiver_type != null) if (this_arg) |ra| blk: {
         var inferred: ?ir.TypeRef = null;
         defer if (inferred) |*t| t.deinit(b.allocator);
@@ -1509,6 +1528,14 @@ pub fn tryInlineCallWithTypeArgs(
         if (got.args.len == 0) break :blk;
         recv_ref_owned = got.clone(b.allocator) catch break :blk;
     };
+    if (build.FuncBuilder.spliceRefDebug()) {
+        std.debug.print("[splice-ref] fn={s} this_arg={s} ref={?s}<{d}>\n", .{
+            f.name.name,
+            if (this_arg) |ra| @tagName(std.meta.activeTag(ra.*)) else "-",
+            if (recv_ref_owned) |r| r.name else null,
+            if (recv_ref_owned) |r| r.args.len else 0,
+        });
+    }
     const prev_recv_ref = b.setSpliceRecvTyRef(recv_ref_owned);
     defer if (b.setSpliceRecvTyRef(prev_recv_ref)) |owned| {
         var t = owned;

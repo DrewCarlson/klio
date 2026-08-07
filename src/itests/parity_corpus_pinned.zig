@@ -2276,3 +2276,13 @@ test "generic_member_return_substitution" {
         \\
     );
 }
+
+test "splice_receiver_survives_delegation" {
+    try check("splice_receiver_survives_delegation",
+        \\<c>,<d>
+        \\<a>,<b>
+        \\1,2
+        \\<c>,<d>
+        \\
+    );
+}
