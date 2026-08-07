@@ -4164,3 +4164,25 @@ from the traced fact instead of re-deriving it.
 
     stdlib census    8837 / 9077   97.36% bound
     examples census 99528 /101591  97.97% bound
+
+### A flat measurement kept, with the reason
+
+`List<E>.get(index): E` on a `List<Named>` receiver now returns Named. It
+measures flat on both censuses and was kept, which is a departure from the
+rule this campaign has followed all along — so the reason is recorded rather
+than assumed:
+
+  * the change is DEMONSTRATED, not speculative: `items.get(0).tag()` and
+    `lookup.get("k")?.tag()` went from binding nothing to binding;
+  * the census file sets spell those reads with the OPERATOR (`items[0]`,
+    `lookup["k"]`), which the index path already types, so the file sets
+    cannot show the gain — the same blind spot that hid the head-only
+    property type for this entire campaign;
+  * it is pinned with both spellings side by side, so the two paths cannot
+    drift apart.
+
+The revert-if-flat rule is about not accumulating unproven machinery. A
+repro that goes from unbound to bound is proof; a census that does not
+contain the shape is not a refutation. Both halves of that matter, and the
+distinction is what the earlier flat reverts were missing when they were
+right and what this one turns on when it is not.
