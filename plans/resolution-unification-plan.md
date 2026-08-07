@@ -1298,3 +1298,46 @@ Format version 43.
 
 Pinned as `ctor_overload_specificity`. All batteries green: commontest
 117/0, corpus 267/267, litmus 43/43, units, compose 1315 (baseline 1275).
+
+## The two plans, re-measured (2026-08-07)
+
+The 2026-08-06 entry above concluded that resolution is unified and the
+dispatch residue is a TYPING problem, on a census that was then 95.14%
+bound with 347 untyped receivers. That conclusion has since been tested by
+closing every bucket in the campaign that named a mechanism, and it holds —
+but the numbers it was drawn from were pessimistic, because three of those
+buckets turned out to be resolution work after all:
+
+  * `nullable_or_generic` (78 -> 2). A nullable receiver binds its member
+    where no `T?` extension exists, and where one DOES, that extension is a
+    declaration like any other and binds statically.
+  * `resolver_declined` (81 -> 14 stdlib, 654 -> 184 examples). A parameter
+    that is still a type parameter after the receiver's substitution, or
+    whose type arguments were star-erased, PROVES the member rather than
+    merely failing to refute it — and the same rule read backwards refutes
+    the member, after which the extension beside it binds.
+  * `no_receiver_type`'s `toString` group. `Any?` extensions are a target
+    that needs no receiver type at all.
+
+    stdlib census   95.14% -> 96.97% bound
+    examples census          97.76% bound
+
+What remains is what the earlier entry named, now measured from four
+directions rather than one: the census's own buckets, the eager channel's
+`hits=0`, the promotion proof's own reasons, and a call-name split of the
+residue. All four say the same thing — a value whose type Kotlin knows only
+from an instantiation lowering does not carry.
+
+### Implementation order, current state
+
+1. **DeclSig for constructors and class-member headers.** The canary passes
+   for members. The constructor half was a real defect and is fixed: a
+   construction site now carries its arguments' declared type heads, because
+   Kotlin selects a constructor overload from the STATIC types and the
+   runtime ranking had only the values. See the entry above.
+2-3. landed.
+4. Explicit-receiver resolution in expression lowering — partially landed,
+   unchanged by this round.
+5. P10's host declaration manifest — the declaration holes are closed; the
+   remaining `intrinsics=1484 declared=187` gap is builtin-type members with
+   no source, which is a manifest question, not a resolution one.
