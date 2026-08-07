@@ -4348,3 +4348,36 @@ actually used as a receiver.
 
     stdlib census    8863 / 9064   97.78% bound
     examples census 99837 /101589  98.28% bound
+
+## The walk that stopped at the top level
+
+`toCharArrayIfNotEmpty` was the third-largest entry in the residue by call
+name, on receivers named `byteSeparator`, `groupSeparator`, `prefix`,
+`suffix` — all locals initialized from `bytesFormat.<prop>`. Tracing the
+local with `KLIO_VALTY_TRACE` showed `decl=<unset>`, and the reason was one
+level up: the property-head walk visits top-level classes and their
+COMPANIONS and stops. Every NESTED declaration's properties were unknown,
+and that is exactly where the stdlib keeps its option records
+(`HexFormat.BytesHexFormat`).
+
+    no_receiver_type 183 -> 163
+
+### The compose suite now names what does not complete
+
+"2 did not complete" is a number, not a fact. The suite now prints the
+class, and it reports `CompositionTests` and `PausableCompositionTests` —
+the known throughput-bound pair, not something new. That took a two-line
+change and turns an every-run mystery into a check.
+
+### tl_cancel_via_coroutine_context is a pre-existing flake
+
+It appeared twice running and looked like a regression. A/B'd against a
+binary from early in this session: the OLD binary produces the same
+truncated output, and sometimes none at all, where the current one at least
+prints `c1-cancelled` some runs. Same class as
+`tl_atomic_update_contended` — recorded so the next appearance is not
+re-diagnosed.
+
+## Standing
+
+    stdlib census    8873 / 9054   98.00% bound
