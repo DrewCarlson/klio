@@ -3891,3 +3891,33 @@ examples one — down from 81 and 654 when this front opened. What remains
 in it is `arg-unauthoritative`: `Collection.contains(e)` and
 `AbstractMap.get(key)` where the argument is a lambda parameter with no
 type. That is the receiver-typing floor again, reached from the other side.
+
+## A target that needs no receiver type at all
+
+The residue was read one more way: by CALL NAME rather than by receiver.
+The largest entry is `toString` (26 of 275 on the stdlib census), and it is
+not a typing problem — it is a call every value answers.
+
+`toString()` and `hashCode()` are declared in the stdlib as `Any?`
+EXTENSIONS, and those are what Kotlin binds when the receiver may be null.
+For a non-null receiver they delegate to the member, so the two agree
+wherever both apply. A receiver no channel could type therefore has a known
+target after all.
+
+Taken only when EXACTLY one extension of that name and arity exists and its
+declared receiver is `Any?`. A member of the same name is not competition —
+the extension delegates to it — but a same-named extension on a real type
+disqualifies the whole shortcut.
+
+    stdlib   no_receiver_type  275 ->  249, bound_static  1555 ->  1581
+    examples no_receiver_type 1957 -> 1755, bound_static 16230 -> 16432
+
+Two attempts alongside it measured flat and were reverted: expanding a
+TYPEALIAS receiver to the class it stands for (the alias that remains is a
+function type, which names no class), and typing a spliced function-typed
+parameter's return through the splice window.
+
+## Standing
+
+    stdlib census    8831 / 9107   96.97% bound
+    examples census 99447 /101722  97.76% bound
