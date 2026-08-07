@@ -4073,3 +4073,44 @@ USE-SITE projection prefix (`Array<out String>`) off the element head both
 measure exactly zero. Recorded so they are not retried: the projection
 prefix is not what blocks those sites, and the nullable element already
 reaches the nullable receiver rule by another route.
+
+## The head-only representation, and what it was costing
+
+The census file sets are generic-container-heavy, which hid a plain defect
+in ordinary code. This program had SIX unbound receivers:
+
+    class Holder(val items: List<Named>, val lookup: Map<String, Named>) {
+        fun firstTag() = items[0].tag()
+        fun loopTags() { for (i in items) … i.tag() }
+        fun mapped()   = items.map { it.tag() }
+        fun viaMap()   = lookup.values.first().tag()
+    }
+    val topItems: List<Named> = …
+
+Every property-type registry stored a HEAD — `List`, not `List<Named>` — and
+a head cannot say what iterating or indexing the property yields. Both
+registries now carry the full declared type beside the head, recorded when
+every type argument names a real class, and lowering prefers it.
+
+    examples no_receiver_type 1703 -> 1651
+    fixture                     0/6 -> 5/6 bound
+
+The stdlib census does not move by construction: its properties are generic,
+so their arguments are the owner's type parameters, which name nothing
+outside an instantiation.
+
+### The sixth case, and a substitution that still measures flat
+
+`lookup.values.first().tag()` needs `Map<K, V>.values: Collection<V>`
+substituted from the receiver — which now HAS arguments, so the input the
+earlier attempt lacked exists. Implemented (record generic-argument property
+types, substitute the owner's parameters positionally at the read) and it
+still measures exactly flat on both censuses: the probe shows the member-read
+arm is never reached for `lookup.values` at all, so the substitution has
+nothing to do. Reverted; the arm that DOES type that read is the thing to
+find next, and it is not this one.
+
+## Standing
+
+    stdlib census    8841 / 9081   97.36% bound
+    examples census 99577 /101641  98.28% bound
