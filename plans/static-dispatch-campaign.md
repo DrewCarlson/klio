@@ -3969,3 +3969,44 @@ TYPEALIAS receiver expanded to the class it stands for (the one that remains
 is a function type, which names no class); a spliced function-typed
 parameter's return read through the splice window; the intrinsic signature
 table (addendum 81).
+
+## Why the residue cannot be typed: the bodies are lowered ONCE
+
+The last attempt was the one both plans had been pointing at — substitute
+the call site's solved type arguments for a spliced declaration's own type
+parameters, so a loop variable over `Iterable<T>` gets the element type the
+caller supplied. The window already carries solved bindings
+(`typeParamBoundRef`), so the change was small: where the element is a bare
+type parameter, read the binding instead of declining.
+
+It measures exactly zero on BOTH censuses, and the probe says why. Every
+site reports no binding at all:
+
+    [elemsub] elem=R recv=Iterable bound=<none> fn=zip
+    [elemsub] elem=T recv=Sequence bound=<none> fn=sumOf
+    [elemsub] elem=T recv=Iterable bound=<none> fn=groupByTo
+    [elemsub] elem=T recv=List     bound=<none> fn=sortedMapOf
+
+Not "the binding is a type parameter again" — ABSENT. And the reason is
+structural rather than missing plumbing: `sumOf`, `zip`, `count`,
+`groupByTo` are generic library functions whose bodies are lowered ONCE,
+generically, and the census counts their sites there. At that moment there
+is no call site to read an instantiation from. The receiver in the probe is
+the function's OWN declared `Iterable<T>`, not any caller's `List<Duration>`.
+
+That is the residue, stated mechanically instead of by analogy:
+
+  * it is concentrated in generic bodies lowered once and shared by every
+    caller — which is also why the examples census shows the same figures
+    multiplied by the number of example programs;
+  * no call-site channel can reach it, because the lowering that produces
+    those sites does not happen at a call site;
+  * typing them requires lowering a COPY per instantiation
+    (monomorphisation) or feeding the runtime's observed receiver class back
+    into a specialised copy.
+
+Both are real projects with their own cost model — code size for the first,
+a deoptimisation path for the second — and neither is resolution work. The
+campaign's own instruments now say so from five directions: the census
+buckets, the eager channel's `hits=0`, the promotion proof's reasons, the
+call-name split, and this probe.
