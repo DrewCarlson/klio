@@ -903,7 +903,17 @@ fn ladderStatsBump(recv: *const Value, name: []const u8) void {
         call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
     var buf: [256]u8 = undefined;
-    const key = std.fmt.bufPrint(&buf, "<ladder>{s}.{s}", .{ recv.typeFqn(), name }) catch return;
+    // An interpreted instance reports `<instance>` through `typeFqn`, which
+    // names nothing — and the class is the whole point of a ladder split.
+    const recv_name: []const u8 = if (recv.* == .Instance) blk: {
+        const g = recv.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        const nm = cg.get().name;
+        break :blk if (nm.len != 0) nm else recv.typeFqn();
+    } else recv.typeFqn();
+    const key = std.fmt.bufPrint(&buf, "<ladder>{s}.{s}", .{ recv_name, name }) catch return;
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
     if (call_stats == null) call_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
