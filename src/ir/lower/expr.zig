@@ -12255,8 +12255,8 @@ fn orAuditOn() bool {
 pub fn orEmitAudit(b: *const FuncBuilder, site: []const u8, inst: []const u8, name: []const u8) void {
     if (!orAuditOn()) return;
     std.debug.print(
-        "[KLIO_OR_AUDIT] emit site={s} inst={s} name={s} recvctx={d} pkg={s}\n",
-        .{ site, inst, name, @intFromBool(inReceiverContext(b)), b.self_package },
+        "[KLIO_OR_AUDIT] emit site={s} inst={s} name={s} recvctx={d} pkg={s} fn={s} recv={s}\n",
+        .{ site, inst, name, @intFromBool(inReceiverContext(b)), b.self_package, build.currentRealFn() orelse "-", b.recvTy() orelse b.spliceRecvTy() orelse b.ownerClass() orelse "-" },
     );
 }
 
@@ -13030,6 +13030,21 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
 
     if (!isNonExt(b, func_id)) {
         if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, func_id)) |r| return r;
+        return emitCall(b, expr, func_id, was_cast);
+    }
+    // The whole reason for the member-first form is that a member of the
+    // implicit receiver could shadow the resolved global. With NO receiver
+    // in scope there is no member to find, and the runtime walk resolves the
+    // name only to arrive at the declaration already in hand.
+    // A TRAILING LAMBDA keeps the member-or-global path: it does more than
+    // dispatch there — the committed candidate shapes the lambda's arity,
+    // its receiver and the composable broad masks, and the static emit does
+    // not carry that.
+    if (!call.has_trailing_lambda and
+        b.resolve("this") == null and b.ownerClass() == null and
+        b.recvTy() == null and b.spliceRecvTy() == null)
+    {
+        orEmitAudit(b, "bare_call_no_receiver_to_shadow", "Call", name0);
         return emitCall(b, expr, func_id, was_cast);
     }
 
