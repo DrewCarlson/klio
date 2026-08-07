@@ -4064,7 +4064,7 @@ remaining local receivers are all in generic library bodies: `sum`,
 ## Standing
 
     stdlib census    8839 / 9083   97.31% bound
-    examples census 99551 /101667  98.20% bound
+    examples census 99551 /101667  97.92% bound
 
 ### Two more measured flat, in the same family
 
@@ -4113,7 +4113,7 @@ find next, and it is not this one.
 ## Standing
 
     stdlib census    8841 / 9081   97.36% bound
-    examples census 99577 /101641  98.28% bound
+    examples census 99577 /101641  97.97% bound
 
 ### The arm that answers, found by elimination
 
@@ -4134,3 +4134,12 @@ was worth more than either retry.
 Substituting an EXTENSION's own type parameter from the receiver
 (`fun <T> Iterable<T>.first(): T` on a `Collection<Named>`) measures flat
 and is reverted; `first()` never reaches that loop.
+
+## Standing (corrected arithmetic)
+
+Two earlier examples-census figures in this document were stated as 98.20%
+and 98.28%; the census's own printed shares (bound_static + bound_virtual)
+give 97.92% and 97.97%. Corrected in place. The stdlib figures were right.
+
+    stdlib census    8837 / 9077   97.36% bound
+    examples census 99528 /101591  97.97% bound
