@@ -9278,6 +9278,37 @@ fn staticDispatchReceiverTypeRef(
 fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.TypeRef {
     if (init_expr.* != .Call) return null;
     const call = init_expr.Call;
+    // `Inner.Deep(2)` — a nested class constructed through its OWN enclosing
+    // class name. The bare form (`Inner(1)`) resolves through the lexical
+    // nested-class walk; the qualified one reached no class at all, so the
+    // value it constructs had no type and every call on it resolved by name.
+    // `HexFormat.Builder` builds `BytesHexFormat.Builder` exactly this way.
+    if (call.callee.* == .Member and call.callee.Member.receiver.* == .Path and
+        call.callee.Member.receiver.Path.segments.len == 1)
+    {
+        const outer_name = call.callee.Member.receiver.Path.segments[0].name;
+        const inner_name = call.callee.Member.name.name;
+        if (outer_name.len != 0 and std.ascii.isUpper(outer_name[0]) and
+            inner_name.len != 0 and std.ascii.isUpper(inner_name[0]) and
+            b.resolve(outer_name) == null and !b.knowsOuter(outer_name))
+        {
+            var qb: [128]u8 = undefined;
+            if (std.fmt.bufPrint(&qb, "{s}.{s}", .{ outer_name, inner_name }) catch null) |qualified| {
+                if (b.module.classIdByQualifiedSuffix(qualified)) |ncid| {
+                    if (ncid.int() < b.module.classes.items.len) {
+                        const ncls = &b.module.classes.items[ncid.int()];
+                        if (!ncls.is_object and !ncls.is_stub and !ncls.is_value and !ncls.is_abstract) {
+                            return ir.TypeRef{
+                                .name = try b.allocator.dupe(u8, ncls.name),
+                                .nullable = false,
+                                .args = &.{},
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (call.callee.* != .Path or call.callee.Path.segments.len != 1) return null;
     const ident = call.callee.Path.segments[0];
     // A local or a function of the same name is not a constructor call.

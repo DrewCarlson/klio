@@ -2311,3 +2311,10 @@ test "constructor_scope_param_types" {
         \\
     );
 }
+
+test "nested_qualified_constructor" {
+    try check("nested_qualified_constructor",
+        \\i1/d2
+        \\
+    );
+}
