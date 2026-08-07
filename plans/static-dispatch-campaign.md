@@ -4311,3 +4311,26 @@ tracks ("~53 failures when the corpus runs as ONE module"), reached from a
 new direction. Recorded here because it bears on this campaign's own
 integrity: the numbers are taken on a program that does not fully pass, and
 a future reader should know that before trusting a small delta.
+
+## The arithmetic table, completed where it paid
+
+The unsigned types were in the primitive SET but absent from the promotion
+TABLE, so every arithmetic expression over them produced no type at all.
+`UInt.until` is written `(to - 1u).toUInt()` — exactly that shape.
+
+    no_receiver_type 189 -> 183
+
+Kotlin's unsigned arithmetic is a closed family: never mixed with the signed
+types, `UByte`/`UShort` widening to `UInt`, a `ULong` operand making the
+result `ULong`. A mixed signed/unsigned pair declines, as it must.
+
+Three more rules from the same table were written and REVERTED: `String +`
+concatenation, `Char + Int` / `Char - Int` / `Char - Char`, and a mixed
+`Byte`/`Short` pair. All three are exact Kotlin, all three measure flat on
+both censuses, and an A/B on a repro built specifically for them moved ONE
+site of five — the class operator-member arm below already answers the rest.
+Completing a table for its own sake is machinery without measured value.
+
+## Standing
+
+    stdlib census    8863 / 9064   97.78% bound
