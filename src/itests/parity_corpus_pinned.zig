@@ -2221,3 +2221,16 @@ test "universal_any_extension_binding" {
         \\
     );
 }
+
+test "type_parameter_erases_to_bound" {
+    try check("type_parameter_erases_to_bound",
+        \\1/2
+        \\true
+        \\3,4
+        \\x,null
+        \\true
+        \\3
+        \\k=9
+        \\
+    );
+}

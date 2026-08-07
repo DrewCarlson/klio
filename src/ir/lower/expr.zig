@@ -15341,6 +15341,18 @@ fn lowerResolvedMemberCall(
             owner_id = nestedClassIdAtLexicalSite(b, head);
         }
     }
+    // A head shaped like a type PARAMETER that names no class and carries no
+    // bound record in this scope is still a type parameter — one declared by
+    // an enclosing generic the body does not have in scope (`Map.Entry<K, V>`
+    // read inside `AbstractMap.Companion.entryHashCode`). Kotlin's floor for
+    // any type parameter is `Any?`, and a call on it can only target a member
+    // of that floor, so resolve there rather than giving up on the receiver.
+    if (owner_id == null and head.len != 0 and head.len <= 2 and
+        std.ascii.isUpper(head[0]) and b.module.classId(head) == null)
+    {
+        owner_id = b.module.uniqueClassIdBySimpleName("Any") orelse
+            b.module.classIdByFqn("kotlin.Any");
+    }
     var static_owner = owner_id orelse {
         lmNote(.no_class_id);
         if (norecvCensusOn()) {

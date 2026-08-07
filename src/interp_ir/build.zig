@@ -1373,10 +1373,12 @@ fn classPropHead(c: *const ast.Class, ty: *const ast.TypeRef) ?[]const u8 {
     if (ty.qualified_path) |qp| return qp;
     const head = ty.name.name;
     for (c.type_params) |*tp| {
-        if (std.mem.eql(u8, tp.name.name, head)) {
-            if (tp.upper_bound == null) return null;
-            return tp.name.name;
-        }
+        // An UNBOUNDED class type parameter is still the property's type,
+        // and the bound record carries the `Any?` Kotlin gives it — so the
+        // head resolves through the bound rather than naming nothing.
+        // Dropping it left every `CompareContext<out T>.actual`-shaped
+        // receiver untyped inside a body that is lowered once.
+        if (std.mem.eql(u8, tp.name.name, head)) return tp.name.name;
     }
     return head;
 }
