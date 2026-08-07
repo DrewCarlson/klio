@@ -2597,8 +2597,27 @@ pub const Module = struct {
             // `Collection<E>` params stay unknown without a receiver
             // instantiation) still commits, but only when every reachable
             // extension is refuted below.
+            // A parameter that is STILL a bare type parameter after the
+            // receiver substitution accepts whatever the source passed: the
+            // program compiled, so the argument conforms to whatever the
+            // instantiation makes it. It is the same star-erasure convention
+            // applied one level up — the head adjudicates, the parameter
+            // neither proves nor refutes — except that an unprovable
+            // parameter must not cost the member its PROOF, or a
+            // `map.get(key)` loses to any same-named extension in scope.
+            const param_still_tp = blk_tp: {
+                var ph2 = staticTypeHead(std.mem.trimEnd(u8, param_ty.name, "?"));
+                if (parseClassTypeParamIdentity(ph2)) |ident| ph2 = ident.param;
+                if (ph2.len == 0) break :blk_tp false;
+                if (self.funcTypeParamIndex(member_fid, ph2) != null) break :blk_tp true;
+                for (owner_tps) |tp| {
+                    if (std.mem.eql(u8, tp, ph2)) break :blk_tp true;
+                }
+                break :blk_tp ph2.len <= 2 and std.ascii.isUpper(ph2[0]);
+            };
             switch (self.staticArgCompatibility(member_fid, sh, param_ty, actual_bounds)) {
                 .incompatible => {
+                    if (param_still_tp) continue;
                     mpp_why = "member-arg-refuted";
                     if (runtime.envSetOnce("KLIO_PROMO_NAMES")) {
                         std.debug.print("[promo-pair] {s}.{s} param={s}<{d}> arg={s}<{d}>\n", .{
@@ -2612,7 +2631,9 @@ pub const Module = struct {
                     }
                     return false;
                 },
-                .unknown => member_fully_proven = false,
+                .unknown => if (!param_still_tp) {
+                    member_fully_proven = false;
+                },
                 .compatible => {},
             }
         }

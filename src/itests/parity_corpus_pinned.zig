@@ -2192,3 +2192,11 @@ test "ctor_overload_specificity" {
         \\
     );
 }
+
+test "member_type_param_beats_extension" {
+    try check("member_type_param_beats_extension",
+        \\1/-1/2
+        \\2,true,2
+        \\
+    );
+}
