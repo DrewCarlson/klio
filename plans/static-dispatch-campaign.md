@@ -4629,3 +4629,31 @@ the fast path added above deliberately reproduces the existing value rather
 than changing behaviour inside a performance change. It is a real divergence
 from kotlinc's observable output and belongs to whoever takes the
 value-semantics pass.
+
+### The confirmation step matters as much as the ranking
+
+The rule recorded above is "rank by `[dispatch-stats]`, CONFIRM with wall
+clock". The `compareTo` fast path is what makes the second half of that
+sentence earn its place:
+
+    before  28.61 s
+    after   28.53 / 28.53 / 28.57 s
+
+It removed 84,595 ladder executions — three quarters of that path — and
+cost nothing measurable, because 84,595 out of 27.5 M total dispatches is
+0.3 %. It is still worth having: the goal is no runtime NAME RESOLUTION,
+not only speed, and this removes 84,595 of them. But it is not a
+performance result and must not be reported as one.
+
+By the same measure the rest of the ladder is cold. `DefaultAsserter.assertTrue`
+is 16,873 executions, 0.06 % of dispatches. It is statically bound at
+lowering — `[member-static] assertTrue recv=kotlin.test.Asserter target=2
+dispatch=virtual applicable=true` — and still reaches the ladder at run
+time, which means the interface slot is not linked for the implementing
+class. That is VM slot-linking, a different subsystem, and 0.06 % does not
+buy the surgery.
+
+So the execution-ranked front has one large result (the bare-call bind,
+2.6x) and a tail that is already cold. What remains dynamic is worth
+removing for the STATED goal — no runtime resolution, which a bytecode VM
+and a C backend both need — not for speed.
