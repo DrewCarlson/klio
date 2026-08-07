@@ -3854,3 +3854,40 @@ and takes the extension.
 
     stdlib census    8805 / 9123   96.51% bound
     examples census 99245 /101930  97.37% bound
+
+### The same rule read backwards
+
+If the argument's head decides a star-erased slot, a head that does NOT
+satisfy it is a definite mismatch. That is the refutation half, and it is
+worth as much as the proof half: a refuted member is not the target at all,
+so the same-named extension the resolver was already holding for takes the
+call statically instead of being left to the runtime's value ranking.
+
+    stdlib   resolver_declined  30 ->  14
+    examples resolver_declined 392 -> 184
+
+Restricted to heads the module KNOWS. An unresolved or host-only name is
+one whose hierarchy this module cannot see, and a false refutation binds
+the WRONG declaration — the one failure mode this campaign cannot trade
+for a number. Lambdas, nulls and spreads keep the conservative answer.
+
+### An instrument that had stopped measuring anything
+
+`receiver_not_instance` was the largest entry in the promotion census (52
+of 153) and named a gate that no longer exists — a host-backed receiver
+stopped blocking the proof several commits earlier. It was recording a
+PROPERTY of the receiver class, not a reason anything was held, and it sat
+on top of the residue where it was read as work. Retired; those sites now
+attribute to the reachable extension the proof has to refute, like every
+other site.
+
+## Standing
+
+    stdlib census    8805 / 9107   96.68% bound
+    examples census 99245 /101722  97.57% bound
+
+`resolver_declined` is now 14 sites on the stdlib census and 184 on the
+examples one — down from 81 and 654 when this front opened. What remains
+in it is `arg-unauthoritative`: `Collection.contains(e)` and
+`AbstractMap.get(key)` where the argument is a lambda parameter with no
+type. That is the receiver-typing floor again, reached from the other side.
