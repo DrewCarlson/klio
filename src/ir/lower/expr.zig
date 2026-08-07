@@ -9300,7 +9300,15 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
     if (ty.args.len != 1) return null;
     const elem = ty.args[0].name;
     if (elem.len == 0 or ty.args[0].nullable) return null;
-    if (elem.len <= 2 and std.ascii.isUpper(elem[0])) return null;
+    // A bare type-PARAMETER element is carried, not discarded, when the
+    // scope records a bound for it: a generic body is lowered once with no
+    // call site to read an instantiation from, and its parameter's declared
+    // upper bound is what Kotlin resolves such a call against. Without a
+    // bound record the head still names nothing and the old answer stands.
+    if (elem.len <= 2 and std.ascii.isUpper(elem[0])) {
+        if (b.typeParamBound(elem) == null) return null;
+        return try ty.args[0].clone(b.allocator);
+    }
     var head = elem;
     if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (b.module.classIdByFqn(head) == null and
