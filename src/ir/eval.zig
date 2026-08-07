@@ -9666,6 +9666,31 @@ inline fn primitiveMemberFast(frame: *const Frame, cm: anytype) ?Value {
 /// argument, so it needs no frame at all.
 fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) ?Value {
     const recv = recv_in.*;
+    // `compareTo` on two same-kind primitives is a pure comparison, and it
+    // was the single hottest entry in the runtime member LADDER
+    // (`Char.compareTo` alone, 84,595 of 113,980) — a primitive has no
+    // vtable slot, so a `Comparable` receiver dispatched by name every time.
+    // Returns the same -1/0/1 the host intrinsic does.
+    if (arg_in) |cmp_arg| {
+        if (std.mem.eql(u8, nm, "compareTo")) {
+            const ord: ?i64 = switch (recv) {
+                .Char => |c| if (cmp_arg == .Char)
+                    (if (c < cmp_arg.Char) @as(i64, -1) else if (c > cmp_arg.Char) @as(i64, 1) else 0)
+                else
+                    null,
+                .Int => |i| if (cmp_arg == .Int)
+                    (if (i < cmp_arg.Int) @as(i64, -1) else if (i > cmp_arg.Int) @as(i64, 1) else 0)
+                else
+                    null,
+                .Long => |l| if (cmp_arg == .Long)
+                    (if (l < cmp_arg.Long) @as(i64, -1) else if (l > cmp_arg.Long) @as(i64, 1) else 0)
+                else
+                    null,
+                else => null,
+            };
+            if (ord) |o| return Value.newInt(o);
+        }
+    }
     if (recv != .Int and recv != .Long) return null;
     if (arg_in == null) {
         const wide: i64 = switch (recv) {
