@@ -4458,3 +4458,42 @@ watch that program bind.
 ## Standing
 
     stdlib census    8881 / 9046   98.18% bound
+
+## The population the census never counted
+
+The `[lower-sites]` census measures EXPLICIT-receiver member calls. Bare
+calls — no receiver written — are a separate population it does not see,
+and `KLIO_OR_AUDIT` counts them by the instruction actually emitted:
+
+    3939  NewInstance
+    3338  Call/bare-extension      static
+    2177  CallMemberOrGlobal       resolves by NAME at run time
+    2136  Call/implicit-member     static
+     451  LoadGlobal
+     413  Call/bare-member         static
+
+That third line is the one the goal cares about: 2,177 emission sites that
+resolve a name at run time, against the ~155 the census had been reporting.
+At run time it is `call_member_or_global` = 3.8 M executions, 8.9 % of all
+dispatches. The campaign's headline number was measuring a real thing and
+not the biggest thing.
+
+Read carefully, too: the audit's SITE label and its INST are different
+questions. `site=unresolved_bare_call` mostly emits `Call/bare-extension`,
+which is static — counting sites by label overstates the dynamic population
+by roughly half. Only `inst=CallMemberOrGlobal` is name resolution.
+
+### First cut: nothing to shadow
+
+`bare_call_member_shadowable` exists because a member of the implicit
+receiver could shadow the resolved global. Where there is NO receiver in
+scope there is no member to find, and the runtime walk resolves a name only
+to arrive at the declaration already in hand. Binding those:
+
+    CallMemberOrGlobal 2177 -> 2077
+
+A trailing lambda keeps the old path deliberately. A unit test —
+"member-or-global emission binds a composable trailing lambda by parameter"
+— caught the first version of this: that path does more than dispatch, it
+shapes the lambda's arity, receiver and composable broad masks from the
+committed candidate. The test earned its keep.
