@@ -2428,7 +2428,7 @@ test "null_literal_widens_type_argument" {
 
 test "type_param_bounded_by_type_param" {
     try check("type_param_bounded_by_type_param",
-        \\foobar/foo/2
+        \\foobar/foo/2/list-typed
         \\[1, 3, 6]
         \\
     );

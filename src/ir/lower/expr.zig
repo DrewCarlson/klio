@@ -10476,7 +10476,21 @@ fn staticCallReturnTypeRef(
             // lazy answer, and `val xs = listOf<Base>(...)` is that shape.
             receiver = try recvChainTypeRef(b, member.receiver);
             if (receiver == null) {
-                if (mt) std.debug.print("[bareret] .{s} no receiver type\n", .{member.name.name});
+                if (mt) {
+                    var loc_buf: [256]u8 = undefined;
+                    const cs = member.name.span;
+                    const loc: []const u8 = lblk: {
+                        if (span.active_map) |m| {
+                            if (m.getChecked(cs.file)) |sf| {
+                                const lc = sf.lineCol(cs.start);
+                                const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
+                                break :lblk std.fmt.bufPrint(&loc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
+                            }
+                        }
+                        break :lblk "?";
+                    };
+                    std.debug.print("[bareret] .{s} no receiver type at={s} fn={s}\n", .{ member.name.name, loc, build.currentRealFn() orelse "-" });
+                }
                 return null;
             }
             var identity = std.mem.trimEnd(u8, receiver.?.name, "?");

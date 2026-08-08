@@ -5595,3 +5595,49 @@ rejected at the type-parameter bound — but the guard added there is not what
 unblocks it, and the real cause is further in. `inline` is NOT the
 distinguishing factor either: a plain, an `inline`, and the real
 `runningReduce` all reproduce identically at one declaration.
+
+FOUND AND FIXED. The rejection was never in `staticGenericArgCompatibility`
+(the argument path) — `KLIO_REX_TRACE` on the one-declaration repro showed
+the candidate dying at `generic_applies=false`, and `KLIO_GRA_TRACE` walked
+it to `staticGenericReceiverApplicableMode`: binding the receiver pattern
+`Iterable<T>` against `Iterable<String>` produces exactly one binding
+(`T := String`), and the bound check for `T <: S` then looks up a binding
+for `S` — which never exists, because `S` appears only in value-parameter
+and return positions — and the `orelse return false` rejected the
+candidate. The fix: a dependent bound whose referenced parameter has no
+receiver binding constrains nothing at receiver-applicability time
+(`S := T` always satisfies `T : S`, and `S`'s own bounds get their own loop
+entry), so it continues instead of refuting.
+
+The stash A/B, one variable per file, all at ONE declaration:
+
+    bounded <S, T : S>       without fix: no target ×9    with fix: target ok
+    unbounded <S, T>         without fix: target ok       with fix: target ok
+
+The earlier "two declarations pass" control was re-run against every
+second-declaration shape (same-name overload of different arity, same-shape
+different name, trivial non-generic) — NONE of them unblock the bounded
+candidate today, so that control's pass came from the call binding the
+OTHER (unbounded) overload, not from any order or set-size effect.
+
+Census A/B by stashing: unbound `no_receiver_type` 154 -> 150 and total
+9053 -> 9049 — the four vanished sites are the lambda bodies' `acc + e`,
+which lower as builtin string concat once `acc`/`e` type, so they leave the
+census rather than moving columns. Bound counts unchanged.
+
+The behavioural fixture CANNOT discriminate this fix — measured, not
+assumed: `type_param_bounded_by_type_param` gained a `List<String>.tag()` /
+`Any?.tag()` overload probe, and the stash A/B printed `list-typed` on BOTH
+binaries, because the dynamic fallback walk picks the same extension by
+runtime receiver type that static resolution picks by static type. That
+parity is the design goal, so the regression pin is a unit test instead:
+`ir.test.dependent bound with unbound referenced parameter does not refute`
+calls `staticGenericReceiverApplicable` directly with `<S, T : S>` against
+an `Iterable<String>` receiver (must apply) and a both-sides-bound
+dependent case `Pair<Int, String>` against `<T : V, V>` (must refute). The
+fixture keeps the tag() probe as behaviour coverage of the fallback walk.
+
+Residue, deliberately not chased: with BOTH `<S, T : S>` and `<S, T>`
+overloads of the same name and arity declared, the call still resolves no
+target (ranking between two applicable generic candidates). The stdlib
+declares no such twin pair; noted here so it is not rediscovered as new.

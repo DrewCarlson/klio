@@ -13,12 +13,18 @@ fun <S, T : S> Iterable<T>.boundReduce(op: (acc: S, e: T) -> S): List<S> {
     return out
 }
 
+// Extension overloads resolve by STATIC receiver type, so `tag()` observes
+// whether the `boundReduce` call site typed: a `List<String>` result binds
+// the specific extension, and losing the static type falls to `Any?`.
+fun List<String>.tag(): String = "list-typed"
+fun Any?.tag(): String = "untyped"
+
 abstract class Holder<E : Iterable<String>>(val make: (Array<out String>) -> E) {
     fun make(vararg items: String): E = make(items)
     val data = make("foo", "bar")
     fun report(): String {
         val v = data.boundReduce { a, e -> a + e }
-        return v.last() + "/" + v.first() + "/" + v.size
+        return v.last() + "/" + v.first() + "/" + v.size + "/" + v.tag()
     }
 }
 class Impl : Holder<List<String>>({ it.toList() })

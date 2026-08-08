@@ -3759,9 +3759,16 @@ pub const Module = struct {
             {
                 continue;
             }
+            // A dependent bound whose referenced parameter has NO receiver
+            // binding constrains nothing here: in `<S, T : S>` on an
+            // `Iterable<T>` receiver, `S` appears only in value-parameter
+            // and return positions, so inference chooses it at the call
+            // (`S := T` always satisfies `T : S`), and kotlinc keeps the
+            // candidate — `runningReduce` on an `Iterable<String>` receiver
+            // must not vanish. `S`'s own bounds get their own loop entry.
             const required_bound = if (dependent_bound)
                 bindingType(bindings.items, staticTypeHead(param.bound)) orelse
-                    return false
+                    continue
             else
                 TypeRef{ .name = param.bound, .nullable = false, .args = &.{} };
             if (!try self.staticTypeIsSubtypeInner(
@@ -13345,6 +13352,57 @@ test "extension resolver substitutes bounded caller type parameters" {
         .caller_package = "app",
     });
     try testing.expectEqual(generic, concrete.target.?);
+}
+
+test "dependent bound with unbound referenced parameter does not refute" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    // `fun <S, T : S> Iterable<T>.reduce(op: (S, T) -> S)` against an
+    // `Iterable<String>` receiver: binding produces only `T := String`, and
+    // `S` (value-parameter and return positions only) stays free for the
+    // call's inference, so `T <: S` cannot refute the candidate.
+    const type_vars = [_]TypeRef{.{ .name = "T", .nullable = false, .args = &.{} }};
+    const strings = [_]TypeRef{.{ .name = "String", .nullable = false, .args = &.{} }};
+    const pattern = TypeRef{ .name = "Iterable", .nullable = false, .args = @constCast(&type_vars) };
+    const actual = TypeRef{ .name = "Iterable", .nullable = false, .args = @constCast(&strings) };
+    const declared = [_]ModuleRegistry.TypeParamBound{
+        .{ .param = "S", .bound = "kotlin.Any" },
+        .{ .param = "T", .bound = "S" },
+    };
+    try testing.expect(try m.staticGenericReceiverApplicable(
+        a,
+        actual,
+        pattern,
+        &declared,
+        &.{},
+    ));
+    // A dependent bound whose referenced parameter IS bound still proves:
+    // `Map<K, V>.getRid(k: K)` shapes bind both sides from the receiver.
+    const bound_both = [_]ModuleRegistry.TypeParamBound{
+        .{ .param = "T", .bound = "V" },
+        .{ .param = "V", .bound = "kotlin.Any" },
+    };
+    const pair_vars = [_]TypeRef{
+        .{ .name = "T", .nullable = false, .args = &.{} },
+        .{ .name = "V", .nullable = false, .args = &.{} },
+    };
+    const int_string = [_]TypeRef{
+        .{ .name = "Int", .nullable = false, .args = &.{} },
+        .{ .name = "String", .nullable = false, .args = &.{} },
+    };
+    const pair_pattern = TypeRef{ .name = "Pair", .nullable = false, .args = @constCast(&pair_vars) };
+    const pair_actual = TypeRef{ .name = "Pair", .nullable = false, .args = @constCast(&int_string) };
+    try testing.expect(!(try m.staticGenericReceiverApplicable(
+        a,
+        pair_actual,
+        pair_pattern,
+        &bound_both,
+        &.{},
+    )));
 }
 
 test "static subtype proof respects variance, bottom, stars, and aliases" {
