@@ -5387,3 +5387,53 @@ leading and trailing nulls, an all-null list, a mixed-type list, a nested
 list, `mapOf` and `arrayOf`.
 
 Green: commontest 117/0, drift 267/267, litmus 42/43 (known timeout), units.
+
+## Session state
+
+Measured on `scripts/dispatch-census.sh` (the file set now includes
+`OrderingTest.kt`; counts before that change are not comparable).
+
+    slot by-name walks        68,987 -> 60
+    runtime name resolution     8.88% -> 0.04%
+    census bound share         92.73% -> 98.30%
+    member_ladder             29,380 -> 12,517   (a ROUTE label — see the
+                                                  replay-hits section)
+    compose commontest         1,275 baseline, 2-3 classes lost
+                            -> 1,346 passed, 0 classes lost
+
+Wall clock across every one of these changes: 28.4-29.0s against a 28.6s
+baseline. The work buys contract conformance, not speed, and the plan says
+so at each step rather than letting the counters imply otherwise.
+
+Interpreter bugs fixed along the way, each pinned:
+
+    flat call read its callee against the caller's module  (compose crash)
+    Char.compareTo returned the sign, not the code difference
+    String.compareTo the same
+    a null literal vetoed its own call's return type
+    constructor overload specificity, inline-splice frames, bare-delegation
+      receiver loss, `this.f(x)` splice, splice arg-type erasure  (earlier)
+
+Refuted and recorded so they are not retried: monomorphisation and a runtime
+type feed (both fail the stated requirements); FuncId-by-symbol-equality;
+bind-what-cannot-be-shadowed (18% slower); static-path-prefers-intrinsic;
+scalar-receiver-without-a-body-test; null-argument APPLICABILITY as the cause
+of the untyped-local tail; `expect`/`actual` interface merging as the cause of
+the builtin slot gap; raising the compose runTest cap (cost two whole classes).
+
+### What is left, precisely
+
+- 60 slot walks, each a different cause: `KClass.isInstance` (25),
+  `Comparator.compare` (13), `IntArray.get`/`Array.get` (10),
+  `ArrayList.iterator` (4), `Any.toString` (3).
+- 154 census sites. 63 are `local_no_decl_type`; the named ones are
+  `IterableTests.kt:475`/`483` (receiver is a type parameter erased to
+  `Iterable<String>`), `CollectionTest.kt:1306`/`1308` (a local generic
+  class constructor), and one each in `Strings.kt:1428`,
+  `Intrinsics.kt:50`, `Instant.kt:629`, `HexExtensions.kt:312`,
+  `CollectionTest.kt:39`. NONE of them reproduces standalone — they need the
+  census file set — so the next attempt should bisect the file set rather
+  than write a small repro, which is what cost two false starts here.
+- `member_ladder`'s remaining 12,517 are mostly cached intrinsic probes;
+  closing them is a representational change (a `CallMember` carrying a
+  resolved target for a host receiver), not a hot-path win.
