@@ -15421,7 +15421,20 @@ fn lowerResolvedMemberCall(
                             const full = staticCallReturnTypeRef(b, ini) catch null;
                             init_self_name = prev_self;
                             const why_head = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse "-";
-                            std.debug.print("[norecv-why] {s} init_tag={s} free={} redo={s} full={s} in_fn={s} head={s} head_cid={} it_cid={} anon={} nfuncs={d}\n", .{
+                            var wloc_buf: [256]u8 = undefined;
+                            const wcs = ini.span();
+                            const wloc: []const u8 = wblk: {
+                                if (span.active_map) |m| {
+                                    if (m.getChecked(wcs.file)) |sf| {
+                                        const lc = sf.lineCol(wcs.start);
+                                        const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
+                                        break :wblk std.fmt.bufPrint(&wloc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
+                                    }
+                                }
+                                break :wblk "?";
+                            };
+                            std.debug.print("[norecv-why] at={s} {s} init_tag={s} free={} redo={s} full={s} in_fn={s} head={s} head_cid={} it_cid={} anon={} nfuncs={d}\n", .{
+                                wloc,
                                 rn,
                                 @tagName(std.meta.activeTag(ini.*)),
                                 b.localInitNameFree(rn),

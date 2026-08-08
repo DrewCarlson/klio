@@ -5059,3 +5059,40 @@ NEW BASELINE is:
 
 Bound share 97.99%. Counts taken before this change are not comparable to
 counts taken after it.
+
+### The untyped-local tail, and one refutation inside it
+
+`no_receiver_type` is 163 sites, and 66 of the 92 PATH cases are
+`local_no_decl_type`: a local with no declared type whose initializer is a
+`Call` the return-type deriver cannot answer. `KLIO_NORECV_WHY` now prints
+`at=file:line` for each, which turns a guessing exercise into a list:
+
+    CollectionTest.kt:39   val mixed  = listOf('a', "b", StringBuilder("c"), null, ...)
+    CollectionTest.kt:45   val data   = listOf(null, "foo", null, "bar")
+    CollectionTest.kt:56   val source = listOf(null, "foo", "bar")
+    CollectionTest.kt:612  val hasNulls = listOf("foo", null, "bar")
+    IterableTests.kt:475   val accumulators = data.runningReduce { acc, e -> acc + e }
+    Arrays.kt / Instant.kt / HexExtensions.kt / Strings.kt — one each
+
+The shape is visible: a generic call with a NULL argument. Reduced,
+`listOf("zzz", "foo")` derives `List` and `listOf(null, "foo")` derives
+nothing. (Two earlier repros appeared to refute this; both were run without
+`KLIO_DISPATCH_STATS=1`, which is what enables the counting, so they printed
+nothing for the wrong reason. Worth remembering: the census sets that
+variable, a bare `klio run` does not.)
+
+The obvious cause is that applicability rejects a null argument against a
+bare type parameter — `arg.is_null and param_ty.nullable` fails for `T`,
+though an unbounded `T` has `Any?` for a bound and Kotlin admits the null.
+Scoring it applicable (below `Any?`, preserving Kotlin's preference for the
+non-generic overload) DID fix one derivation, `optimizeReadOnlyList`. It did
+NOT fix the sites above, left the census exactly at 9,063 / 163, and A/B on
+`only(null)`, `pick(null)`, `pick("s")` and `listOf(null, "foo")` produced
+byte-identical output with and without it — the runtime path already handles
+null against `T` by another route. Flat and unobservable, so it is reverted
+rather than carried.
+
+That leaves the real cause elsewhere: at the failing sites `listOf` resolves
+to no target at all (no `[bare]` line), while the same call in a different
+function resolves to `kotlin.collections.listOf#2349`. The next step is why
+resolution declines there, NOT the applicability score.
