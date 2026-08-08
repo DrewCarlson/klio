@@ -1543,11 +1543,16 @@ pub fn extDeclRecvIsUserClass(ty_name: []const u8) bool {
     if (s.len == 0) return false;
     if (s.len <= 2 and allAsciiUpper(s)) return false;
     const builtins = [_][]const u8{
-        "String",   "StringBuilder", "CharSequence", "Appendable",  "Int",        "Long",
-        "Short",    "Byte",          "Double",       "Float",       "Char",       "Boolean",
-        "Number",   "Array",         "List",         "MutableList", "Collection", "Iterable",
-        "Map",      "MutableMap",    "Set",          "MutableSet",  "Sequence",   "Comparable",
-        "Any",      "Unit",
+        "String",       "StringBuilder",     "CharSequence",  "Appendable",   "Int",          "Long",
+        "Short",        "Byte",              "Double",        "Float",        "Char",         "Boolean",
+        "Number",       "Array",             "List",          "MutableList",  "Collection",   "Iterable",
+        "Map",          "MutableMap",        "Set",           "MutableSet",   "Sequence",     "Comparable",
+        "Any",          "Unit",              "UInt",          "ULong",        "UShort",       "UByte",
+        "ByteArray",    "ShortArray",        "IntArray",      "LongArray",    "CharArray",    "BooleanArray",
+        "FloatArray",   "DoubleArray",       "UByteArray",    "UShortArray",  "UIntArray",    "ULongArray",
+        "Iterator",     "MutableIterator",   "ListIterator",  "MutableListIterator",          "MutableIterable",
+        "MutableCollection",                 "Comparator",    "Enum",         "Throwable",    "Nothing",
+        "IntRange",     "LongRange",         "CharRange",     "ClosedRange",  "Pair",         "Triple",
     };
     for (builtins) |b| {
         if (std.mem.eql(u8, s, b)) return false;
@@ -1670,6 +1675,15 @@ test "ext_decl_recv_is_user_class rejects builtins and type params" {
     try testing.expect(!extDeclRecvIsUserClass("String"));
     try testing.expect(!extDeclRecvIsUserClass("T"));
     try testing.expect(extDeclRecvIsUserClass("com.example.Widget"));
+    // The primitive-array and unsigned families are builtins too: classifying
+    // ByteArray as a user class made the incompatible-receiver guard strip
+    // the names off `decodeToString(throwOnInvalidSequence = true)`.
+    try testing.expect(!extDeclRecvIsUserClass("ByteArray"));
+    try testing.expect(!extDeclRecvIsUserClass("kotlin.ByteArray"));
+    try testing.expect(!extDeclRecvIsUserClass("UIntArray"));
+    try testing.expect(!extDeclRecvIsUserClass("ULong"));
+    try testing.expect(!extDeclRecvIsUserClass("Iterator"));
+    try testing.expect(!extDeclRecvIsUserClass("Comparator"));
 }
 
 fn linkTestNativeFn(ctx: *runtime.CallCtx) std.mem.Allocator.Error!runtime.EvalResult {

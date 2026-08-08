@@ -1921,6 +1921,15 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
     // receiver, so bind against `func_in` as given.
     const func = func_in;
     if (funcAt(module, func)) |f| {
+        if (runtime.envOnce("KLIO_CFN_TRACE")) |w| {
+            if (std.mem.indexOf(u8, f.name, w) != null) {
+                std.debug.print("[cfn] {s}#{d} any_named={} nargs={d} params:", .{ f.fqn, func.int(), any_named, args.len });
+                for (f.params) |p| std.debug.print(" {s}", .{p.name});
+                std.debug.print(" names:", .{});
+                for (arg_names) |n| std.debug.print(" {s}", .{n orelse "<pos>"});
+                std.debug.print("\n", .{});
+            }
+        }
         if (any_named or hasNonFinalVararg(f.params)) {
             const params = f.params;
             // Reorder named args against the declared parameter list.
@@ -2100,12 +2109,27 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                         .err => |e| return .{ .err = e },
                     }
                 } else {
-                    // No value and no default: a trailing omitted param.
-                    // Hand the prefix to call_func, whose own padding
-                    // finishes the job. An explicitly supplied trailing
-                    // `null` stays in place — `f(cause = null)` must bind
-                    // Null, not re-default or pad as Unit.
-                    break;
+                    // No value and no default THUNK. With nothing bound past
+                    // this slot it is a trailing omission: hand the prefix to
+                    // call_func, whose own padding finishes the job. An
+                    // explicitly supplied trailing `null` stays in place —
+                    // `f(cause = null)` must bind Null, not re-default or pad
+                    // as Unit. But a slot BOUND past the hole must not be
+                    // dropped (`decodeToString(throwOnInvalidSequence =
+                    // true)` skipping startIndex/endIndex on a host-backed
+                    // declaration whose defaults live in the NATIVE, not in
+                    // thunks): fill the hole with Null — the convention
+                    // stdlibNamedDispatch already uses, which the natives
+                    // read as "defaulted".
+                    var later_bound = false;
+                    for (slots[i + 1 ..]) |later| {
+                        if (later != null) {
+                            later_bound = true;
+                            break;
+                        }
+                    }
+                    if (!later_bound) break;
+                    try reordered.append(allocator, Value.Null);
                 }
             }
             return callFunc(self, allocator, module, func, reordered.items);
@@ -2115,6 +2139,15 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
 }
 
 pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult {
+    if (runtime.envOnce("KLIO_CFN_TRACE")) |w0| {
+        if (funcAt(module, func)) |f0| {
+            if (std.mem.indexOf(u8, f0.name, w0) != null) {
+                std.debug.print("[cft] {s}#{d} nargs={d} names:", .{ f0.fqn, func.int(), args.len });
+                for (arg_names) |n| std.debug.print(" {s}", .{n orelse "<pos>"});
+                std.debug.print(" exact={}\n", .{exact});
+            }
+        }
+    }
     // `arrayOf<ULong>(1u, 2u)` — an unsigned literal carries its DEFAULT
     // tag (UInt) and the explicit element-type argument must coerce it,
     // exactly as kotlinc types the literal by its expected type. Retag

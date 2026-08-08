@@ -5230,17 +5230,22 @@ pub const Module = struct {
                 .sole_unknown = if (!tied) best else null,
                 .param_rep = if (tied) self.tiedLambdaParamRep(tied_ids.items) else null,
             };
-        // A winner whose named arguments SKIPPED defaulted parameters lends
-        // its types but does not commit: the emit and host boundaries bind
-        // arguments positionally, and a static commit routed
-        // `decodeToString(throwOnInvalidSequence = true)`'s flag into
-        // `startIndex`. The runtime's named binding already dispatches these
-        // correctly; typing (return and lambda params) is what the static
-        // side needs.
+        // A winner whose named arguments SKIPPED defaulted parameters COMMITS:
+        // the emitted Call carries the argument names, and the host boundary
+        // binds them by declaration parameter — callFuncNamed fills a
+        // defaultless hole before a bound slot with Null (the convention the
+        // natives read as "defaulted") instead of dropping the bound tail,
+        // and the incompatible-receiver guard knows the full builtin family
+        // (`ByteArray` was classified a user class, which stripped the names
+        // off `decodeToString(throwOnInvalidSequence = true)` on re-dispatch).
+        // `KLIO_NAMED_COMMIT=0` demotes back to the typing-only channel for
+        // single-binary A/B.
         if (best) |target| {
             for (ids.items, named_skips.items) |fid, skipped| {
                 if (fid != target) continue;
-                if (skipped) return .{ .applicable = true, .sole_unknown = target };
+                if (skipped and
+                    std.mem.eql(u8, runtime.envOnce("KLIO_NAMED_COMMIT") orelse "1", "0"))
+                    return .{ .applicable = true, .sole_unknown = target };
                 break;
             }
         }
@@ -13631,10 +13636,9 @@ test "named arguments may skip defaulted parameters and still resolve" {
         &shapes,
         .{ .caller_file = FileId.from(0), .caller_package = "app" },
     );
-    // The skip resolves the IDENTITY for typing, but does not commit
-    // emission: the emit and host boundaries still bind positionally.
-    try testing.expect(res.target == null);
-    try testing.expectEqual(fids[0], res.sole_unknown.?);
+    // The skip COMMITS: the emitted call carries the names and the host
+    // boundary binds them by declaration parameter.
+    try testing.expectEqual(fids[0], res.target.?);
 
     // A named argument no parameter carries still drops the candidate.
     var wrong = [_]applicability.ArgShape{
