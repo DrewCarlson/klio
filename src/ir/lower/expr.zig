@@ -9591,6 +9591,17 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
                 if (b.module.uniqueClassIdBySimpleName(q.name) != null) {
                     return .{ .name = try b.allocator.dupe(u8, q.name), .nullable = false, .args = &.{} };
                 }
+                // A FUNCTION-labeled `this@thenBy` names an enclosing
+                // receiver the tower records with its label — including
+                // the inline-splice window's receiver, which the tower
+                // collection now carries into closure bodies.
+                for (b.implicit_receiver_tower.items) |entry| {
+                    if (entry.label) |lbl| {
+                        if (std.mem.eql(u8, lbl, q.name)) {
+                            return .{ .name = try b.allocator.dupe(u8, entry.head), .nullable = false, .args = &.{} };
+                        }
+                    }
+                }
                 return null;
             }
             // The declared extension receiver, then the splice window's
@@ -9689,6 +9700,32 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
             if (std.fmt.bufPrint(&ckey_buf, "{s}$Companion", .{owner})) |ckey| {
                 if (propTypeRefOn(b, ckey, nm)) |t| return try t.clone(b.allocator);
                 if (b.module.registry.class_prop_type_heads.get(.{ .a = ckey, .b = nm })) |head| {
+                    return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
+                }
+            } else |_| {}
+            break :self_named;
+        },
+        // A CLASS-NAMED member read: `TimeSource.Monotonic` (a nested
+        // OBJECT, whose type is its own qualified class) or a companion
+        // property (`Formats.iso`), which the class-prop head tables
+        // record under the lifted companion key.
+        .Member => |m| {
+            if (m.safe) break :self_named;
+            const recv_p = m.receiver;
+            if (recv_p.* != .Path or recv_p.Path.segments.len != 1) break :self_named;
+            const cls = recv_p.Path.segments[0].name;
+            if (b.resolve(cls) != null or b.knowsOuter(cls)) break :self_named;
+            if (b.module.uniqueClassIdBySimpleName(cls) == null) break :self_named;
+            var qbuf: [192]u8 = undefined;
+            if (std.fmt.bufPrint(&qbuf, "{s}.{s}", .{ cls, m.name.name })) |qual| {
+                if (b.module.classIdByQualifiedSuffix(qual) != null) {
+                    return .{ .name = try b.allocator.dupe(u8, qual), .nullable = false, .args = &.{} };
+                }
+            } else |_| {}
+            var ckbuf: [192]u8 = undefined;
+            if (std.fmt.bufPrint(&ckbuf, "{s}$Companion", .{cls})) |ckey| {
+                if (propTypeRefOn(b, ckey, m.name.name)) |t| return try t.clone(b.allocator);
+                if (b.module.registry.class_prop_type_heads.get(.{ .a = ckey, .b = m.name.name })) |head| {
                     return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
                 }
             } else |_| {}
@@ -15066,14 +15103,14 @@ const ResolvedMemberLowering = union(enum) {
 
 /// Per-site census of the static member-call gate (`KLIO_DISPATCH_STATS`),
 /// so the coverage of static binding is a number rather than an impression.
-pub var lm_sites: [6]u64 = @splat(0);
+pub var lm_sites: [7]u64 = @splat(0);
 /// `KLIO_DISPATCH_STATS`: unbound member sites the checker DID resolve, and
 /// why each was refused. [0] map hit, [1] no such func, [2] not an
 /// extension, [3] arity mismatch. A zero at [0] means the two sets — what
 /// the checker answered and what lowering could not bind — do not intersect
 /// at all, which is a different problem from a guard being too strict.
 pub var lm_eager_norecv: [4]u64 = @splat(0);
-pub const LmReason = enum(u8) { no_receiver_type, nullable_or_generic, no_class_id, resolver_declined, bound_static, bound_virtual };
+pub const LmReason = enum(u8) { no_receiver_type, nullable_or_generic, no_class_id, resolver_declined, bound_static, bound_virtual, dynamic_by_design };
 fn lmNote(comptime r: LmReason) void {
     lm_sites[@intFromEnum(r)] += 1;
 }
@@ -15703,11 +15740,44 @@ fn lowerResolvedMemberCall(
     // read inside `AbstractMap.Companion.entryHashCode`). Kotlin's floor for
     // any type parameter is `Any?`, and a call on it can only target a member
     // of that floor, so resolve there rather than giving up on the receiver.
-    if (owner_id == null and head.len != 0 and head.len <= 2 and
-        std.ascii.isUpper(head[0]) and b.module.classId(head) == null)
+    // A class-param IDENTITY MANGLE (`$class$ N i:E`) is the same shape
+    // under a stable spelling.
+    if (owner_id == null and head.len != 0 and
+        (((head.len <= 2) and std.ascii.isUpper(head[0]) and b.module.classId(head) == null) or
+            ir.parseClassTypeParamIdentity(head) != null))
     {
         owner_id = b.module.uniqueClassIdBySimpleName("Any") orelse
             b.module.classIdByFqn("kotlin.Any");
+    }
+    // A FUNCTION-typed receiver dispatches by the invoke convention, not a
+    // class slot: `startCoroutineUninterceptedOrReturn` on a
+    // `DeepRecursiveFunctionBlock` (a typealias to a suspend fn type) has no
+    // class row to bind BY DESIGN. The backends compile these to the value
+    // (invoke) protocol; the census counts them as their own category so
+    // the bindable share reads honestly.
+    if (owner_id == null) {
+        const fhead = blk_f: {
+            if (std.mem.startsWith(u8, head, "Function") or
+                std.mem.startsWith(u8, head, "SuspendFunction") or
+                std.mem.startsWith(u8, head, "KFunction")) break :blk_f true;
+            var alias_scratch = std.heap.ArenaAllocator.init(b.allocator);
+            defer alias_scratch.deinit();
+            const expanded = b.module.resolveTypeAliasAt(
+                alias_scratch.allocator(),
+                .{ .name = identity, .nullable = false, .args = &.{} },
+                name.span.file,
+                b.module.packageOfFile(name.span.file) orelse b.self_package,
+            ) catch break :blk_f false;
+            const eh = typeHead(std.mem.trimEnd(u8, expanded.name, "?"));
+            break :blk_f std.mem.startsWith(u8, eh, "Function") or
+                std.mem.startsWith(u8, eh, "SuspendFunction") or
+                std.mem.startsWith(u8, eh, "KFunction") or
+                std.mem.eql(u8, eh, "<function>");
+        };
+        if (fhead) {
+            lmNote(.dynamic_by_design);
+            return .none;
+        }
     }
     var static_owner = owner_id orelse {
         lmNote(.no_class_id);

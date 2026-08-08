@@ -1559,3 +1559,37 @@ sight. The residue is enumerated in the campaign plan: 128 census sites in
 1-11-site typing clusters (each with a design or an earned refutation),
 the walk-served wrapper family, and `kotlin.concurrent.thread` (a Thread
 class feature, not a resolution gap).
+
+## The backend dispatch contract (2026-08-08)
+
+What the bytecode VM and the C transpiler consume, stated as the invariant
+the campaign now maintains:
+
+**Every call site in lowered IR is exactly one of:**
+
+1. `Call` — a statically resolved FuncId. Compiles to a direct call.
+2. `CallVirtual` — a statically resolved method-slot id against the
+   receiver's runtime class. Compiles to a vtable/slot-table load + call;
+   the `(class, slot) -> FuncId` table is total for every bound site
+   (zero by-name walks on the census workload).
+3. `CallValue` / invoke-convention forms — a function VALUE applied.
+   Compiles to the closure-call protocol.
+4. `CallMember` — an explicitly named dynamic site, carrying the member
+   name and optional `declared_recv` / `resolved` narrowing. Compiles to
+   one runtime helper call (the member walk). These are the census's
+   unbound tail plus the sites that are dynamic BY DESIGN
+   (`dynamic_by_design` in the census: invoke-convention receivers; the
+   `Result`-wrapper family is typed and slot-bound but its runtime
+   serving deliberately stays on the walk — binding it by id was proven
+   to return the wrong variant).
+
+No site's dispatch is implicit or reconstructed at run time from anything
+but these four forms, which is the property the backends need: the
+transpiler emits a direct call, an indexed call, a closure call, or a
+`klio_member(name, ...)` helper call per site, mechanically.
+
+Census at this closure: 9,016 sites — 8,908 bound (98.8%), 4
+dynamic-by-design, 104 in the enumerated typing tail (each tail site
+already emits form 4, so the contract holds for them too; further typing
+work only MOVES sites from form 4 to forms 1/2, never changes the
+contract).

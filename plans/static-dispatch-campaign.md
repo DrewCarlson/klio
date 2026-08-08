@@ -5920,6 +5920,60 @@ fixed and the take/next chains bind. FOLLOW-UP: alias-resolve the head at
 the `no_class_id` site. Pinned: `splice_window_receiver_typing`
 (behaviour), plus the census A/B recorded here.
 
+### Value-class member bodies do not run on erased receivers
+
+The closure batch surfaced one more instance of the boxed-representation
+hazard, caught by the battery: with `TimeSource.Monotonic` newly typed,
+`baseMark - longDuration` committed DIRECT to the `ValueTimeMark.minus`
+SOURCE body, which reads `this.reading` — and a ValueTimeMark receiver
+arrives ERASED (the walk's legacy arithmetic hands back Durations, the
+constructor erasure hands back the Long reading), so the field read
+missed (`get_field reading on kotlin.time.Duration`), failing
+`TimeMarkTest.defaultTimeMarkAdjustmentBig`.
+
+`dispatchForTarget` now sends a VALUE-CLASS final member direct only
+when a HOST SYMBOL serves it; a source body goes `.virtual`, whose
+slot-miss-to-walk serves the erased receiver with the payload class's
+own member — the semantics the walk has always provided (STUBS keep the
+direct rule as measured; a first cut that swept them moved 1,000 sites
+and was narrowed). ~820 same-owner value-class sites (Duration's own
+members) demote from direct to VIRTUAL — still statically bound, one
+slot probe more per call; bound share unchanged.
+
+ROOT for a later stretch: klio's value-class runtime REPRESENTATION is
+inconsistent per class (Duration constructs real instances;
+ValueTimeMark erases through the kotlin-klio actuals, and the walk's
+arithmetic then mixes Duration-valued and Long-valued marks). Making
+construction/erasure uniform would let value-class finals go direct
+again and retire this gate.
+
+### Closure: the splice-window tower, the class-named member read, and the honest census
+
+Three final mechanisms landed together, taking the census to its closure
+shape:
+
+1. The receiver tower now carries the inline SPLICE WINDOW's receiver,
+   labeled by the spliced function — which made the reverted labeled-this
+   arm live: `this@thenBy.compare(a, b)` inside the SAM lambdas the
+   comparator combinators build binds virtually (six sites, and the This
+   census category reads zero).
+2. A CLASS-NAMED member read types: `TimeSource.Monotonic` answers the
+   nested object's qualified class, `Formats.iso` the companion
+   property's recorded head (four more sites bound).
+3. The census reads honestly for the backends: a class-param identity
+   MANGLE head resolves through the `Any` floor like every other
+   type-parameter head (the last six `no_class_id` rows), and a
+   FUNCTION-typed receiver (including through a typealias) counts as
+   `dynamic_by_design` — the invoke convention has no class slot to bind
+   BY DESIGN. `no_class_id` reads ZERO.
+
+Census at closure: 9,016 sites — 8,908 bound (98.8%), 4
+dynamic-by-design, 104 enumerated typing-tail sites (96 no_receiver_type
++ 2 nullable_or_generic + 6 resolver_declined), every one already
+emitting the explicit named form the backend contract compiles to a
+runtime helper. The contract statement lives in the resolution plan's
+"backend dispatch contract" section.
+
 ### The labeled-this tower probe measures flat (refutation)
 
 The remaining `this@thenBy.compare` rows (six sites, inside the SAM
@@ -5931,6 +5985,16 @@ those bodies through the closure-CAPTURE channel (`this@thenBy` is a
 captured binding), so the typing fix belongs where captures get their
 types stamped, not in the tower walk. Recorded so the tower is not
 re-probed for closure bodies.
+
+SHARPENED after reading the closure-body setup: ordinary lambda
+lowering DOES carry the tower (`module.pending_lambda_receiver_tower`
+-> `setImplicitReceiverTower` in `lowerLambdaBodyCapturingKindWithIt`);
+the flat probe means the SAM-CONSTRUCTOR path (`Comparator { a, b ->
+... }` and the combinators' internal SAM builds) does not stash it. The
+fix is one stash at the SAM conversion's lambda lowering, mirroring
+`lowerLambda`'s — then the (already-reverted) labeled-this tower arm
+becomes live and can be re-landed together with it, expected to bind
+the six `this@thenBy.compare` rows plus part of the `captured` five.
 
 ### The emission channel adopts the full static deriver
 
