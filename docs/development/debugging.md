@@ -69,6 +69,7 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_SHADOW_TRACE` | set | Whether an imported pack extension shadows a member call (probe plus each candidate) | `[shadow]` |
 | `KLIO_BARERET` | `<name>` or `*` | Why a bare call does or does not lend its return type to the local it initializes: the receiver head it resolved against, the target, the final type, and each refusal | `[bareret]` |
 | `KLIO_LI_NAMES` | set | Names the callee of every local initializer that yields no static type. Pair with `KLIO_BARERET` on whichever name dominates | `[li-null]` |
+| `KLIO_NOINST_WHY` | `1` | Why a statically bound slot on a host-backed receiver declined to a member-name walk: `no-slot-entry` (no `(class, slot)` mapping) or `target-not-executable` (the target is bodyless and no native is registered under its FQN) | `[noinst-why]` |
 | `KLIO_NORECV_NAMES` | a `[no-recv-path]` bucket name, or `*` | Names the receiver identifier behind each untyped bare-path receiver, split by why it is untyped (`local_no_decl_type`, `captured`, `enclosing_member`, `unknown`) | `[no-recv-name]` |
 | `KLIO_ARGSHAPE_UNK` | set | Every argument whose applicability shape carries no type, no literal kind and no callable form — the expression forms that leave a member call unproven. Histogram the tags to pick the next typing channel | `[argshape-unk]` |
 | `KLIO_NULLEXT_NAMES` | set | Every member call held off the static path because a `T?` extension of that name exists and the extension itself did not resolve — the residue of the nullable-receiver rule | `[nullext]` |

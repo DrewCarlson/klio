@@ -1481,8 +1481,44 @@ BOTH survive and klio prefers the one with members. That is a duplicate FQN
 declaration, not valid Kotlin, and shipping it would be working around this
 bug rather than fixing it — so the pilot is reverted rather than landed.
 
-The next step is therefore not "write 1,281 signatures". It is: find why an
-`actual` interface's members produce no `(class, slot)` entry when the same
-members in a plain interface do. That is a contained question with a
-one-file repro, and -704 walks are waiting behind it in the collections
-alone.
+CORRECTION (same day). The framing above is wrong, and the new
+`KLIO_NOINST_WHY` knob shows why. The `(class, slot)` entries ALREADY EXIST
+for the builtin interfaces — `KLIO_SLOT_DUMP=isEmpty` prints
+
+    class=kotlin.collections.Collection  slot=345 -> fid=345
+    class=kotlin.collections.MutableList slot=345 -> fid=356
+    class=kotlin.collections.Set         slot=379 -> fid=379
+
+so the `expect` interfaces' members do have `FuncId`s and the slot resolves.
+Counting the DECLINE reason instead of guessing at it:
+
+    20,255  target-not-executable  root=kotlin.collections.Iterator.hasNext
+    20,125  target-not-executable  root=kotlin.collections.Iterator.next
+        84  target-not-executable  root=kotlin.collections.Iterable.iterator
+        78  no-slot-entry          root=kotlin.collections.ListIterator.hasPrevious
+
+The dominant reason is not a missing slot entry and not a missing
+declaration. It is the guard right after the lookup:
+
+    if (!virtualTargetExecutable(module, target) and
+        resolvedNativeForm(self, target) == null) -> walk by name
+
+The target is a bodyless interface member, and NO native is registered under
+its FQN. `implementations.zig` has `kotlin.collections.List.isEmpty`,
+`MutableList.add`, `Set.isEmpty` — but nothing for
+`kotlin.collections.Iterator.hasNext`, `Iterator.next`, or
+`Iterable.iterator`. Those implementations live VM-side in `iteratorMember`,
+reached by RECEIVER VARIANT rather than by FQN, so the link step has nothing
+to find.
+
+So the remaining work is smaller and better shaped than "1,281 signatures":
+**register the missing FQN natives for the builtin members whose
+implementation already exists**, so `linkBodyless` can settle them. The
+constraint is that the implementations sit behind a variant-dispatched host
+function, and a stdlib-side reimplementation would be exactly the code
+duplication this design is supposed to avoid — so the work is exposing the
+existing ones under their FQNs, not rewriting them.
+
+That also retires the iterator-protocol shortcut earlier in the campaign
+plan: with the natives registered, those 40,380 calls dispatch by FuncId,
+which is the mechanism the shortcut was standing in for.

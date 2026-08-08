@@ -9956,15 +9956,22 @@ pub fn invokeVirtualMember(
                     }
                 } else |_| {}
             }
-            const target = module.methodSlotTarget(runtime_class, slot) orelse
+            const target = module.methodSlotTarget(runtime_class, slot) orelse {
+                if (runtime.envOnce("KLIO_NOINST_WHY") != null)
+                    std.debug.print("[noinst-why] no-slot-entry recv={s} root={s}\n", .{ receiver.typeFqn(), if (module.funcById(root)) |f| f.fqn else "?" });
                 break :blk .{ .target = null, .name = mname };
+            };
             // A bodyless declaration linked to a host symbol is executable —
             // as that symbol. Dispatching through it is the whole point of
             // binding the slot: it reaches the implementation by FuncId
             // instead of matching the member by string.
             if (!virtualTargetExecutable(module, target) and
                 host_call_func.resolvedNativeForm(self, target) == null)
+            {
+                if (runtime.envOnce("KLIO_NOINST_WHY") != null)
+                    std.debug.print("[noinst-why] target-not-executable recv={s} root={s} target={s}\n", .{ receiver.typeFqn(), if (module.funcById(root)) |f| f.fqn else "?", if (module.funcById(target)) |f| f.fqn else "?" });
                 break :blk .{ .target = null, .name = mname };
+            }
             if (noinstTraceOn()) {
                 std.debug.print("[noinst] recv_ty={s} slot={d} root={s} -> target={s}\n", .{
                     receiver.typeFqn(),
