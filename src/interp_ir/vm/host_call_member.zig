@@ -10095,19 +10095,25 @@ pub fn invokeVirtualMember(
                         // nothing. Restricted to the container variants —
                         // `Result` and the iterator generators are the shapes
                         // whose conversion lives on the named path.
-                        switch (receiver.*) {
+                        const direct = switch (receiver.*) {
                             // `Array` holds its elements inline, a
                             // `StringBuilder` its bytes, a `Comparator` its
                             // comparison — none of them a discriminant over a
-                            // payload the intrinsic would have to unpack.
-                            .List, .Set, .Map, .Array, .StringBuilder, .Comparator => {
-                                var argbuf = try allocator.alloc(Value, args.len + 1);
-                                defer allocator.free(argbuf);
-                                argbuf[0] = receiver.*;
-                                @memcpy(argbuf[1..], args);
-                                return dispatchIntrinsic(self, allocator, member_fqn, native, argbuf);
-                            },
-                            else => {},
+                            // payload the intrinsic would have to unpack. A
+                            // `String` and every scalar are likewise their own
+                            // representation (the walk lands on this very
+                            // native; the FuncId hazard was running a BODY
+                            // written against the boxed form, which a direct
+                            // NATIVE dispatch never does).
+                            .List, .Set, .Map, .Array, .StringBuilder, .Comparator, .String => true,
+                            else => isScalarValue(receiver),
+                        };
+                        if (direct) {
+                            var argbuf = try allocator.alloc(Value, args.len + 1);
+                            defer allocator.free(argbuf);
+                            argbuf[0] = receiver.*;
+                            @memcpy(argbuf[1..], args);
+                            return dispatchIntrinsic(self, allocator, member_fqn, native, argbuf);
                         }
                         break :blk .{ .target = null, .name = n };
                     }

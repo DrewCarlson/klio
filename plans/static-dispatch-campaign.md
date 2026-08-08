@@ -5393,10 +5393,8 @@ Green: commontest 117/0, drift 267/267, litmus 42/43 (known timeout), units.
 Measured on `scripts/dispatch-census.sh` (the file set now includes
 `OrderingTest.kt`; counts before that change are not comparable).
 
-    slot by-name walks        68,987 -> 5       (Any.toString x3,
-                                                 Byte.toInt x2 — the
-                                                 scalar floor; zero
-                                                 noinst declines)
+    slot by-name walks        68,987 -> 0       (zero noinst declines;
+                                                 see "What is left")
     runtime name resolution     8.88% -> ~0.00%
     census bound share         92.73% -> 98.58%  (9,022 total, 128
                                                   unbound: 110
@@ -5442,7 +5440,15 @@ the builtin slot gap; raising the compose runTest cap (cost two whole classes).
 
 ### What is left, precisely
 
-- 5 slot walks: `Any.toString` (3), `Byte.toInt` (2) — the scalar floor.
+- **0 slot walks.** The "scalar floor" was not a floor: the last five
+  were a `String` receiver behind the `Any.toString` root and an `Int`
+  behind `Byte.toInt`, both with the receiver-FQN native already in
+  hand — the direct-dispatch variant list just excluded strings and
+  scalars. Both are their own representation (the FuncId hazard was
+  running a BODY written against the boxed form, which a direct NATIVE
+  dispatch never does), so the list now admits them. Every statically
+  bound virtual slot call on the census workload dispatches by FuncId
+  or direct native — no by-name resolution remains on the slot path.
 - 128 unbound census sites, every cluster now 1-11 sites: ~40
   `local_no_decl_type` spread thin (the `compareBy { it.reversed() }`
   parameter needs CROSS-ARGUMENT inference of `R`; sum/toUInt x4; date
