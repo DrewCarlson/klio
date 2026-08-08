@@ -5393,17 +5393,36 @@ Green: commontest 117/0, drift 267/267, litmus 42/43 (known timeout), units.
 Measured on `scripts/dispatch-census.sh` (the file set now includes
 `OrderingTest.kt`; counts before that change are not comparable).
 
-    slot by-name walks        68,987 -> 60
-    runtime name resolution     8.88% -> 0.04%
-    census bound share         92.73% -> 98.30%
-    member_ladder             29,380 -> 12,517   (a ROUTE label — see the
+    slot by-name walks        68,987 -> 5       (Any.toString x3,
+                                                 Byte.toInt x2 — the
+                                                 scalar floor; zero
+                                                 noinst declines)
+    runtime name resolution     8.88% -> ~0.00%
+    census bound share         92.73% -> 98.58%  (9,022 total, 128
+                                                  unbound: 110
+                                                  no_receiver_type, 10
+                                                  no_class_id, 6
+                                                  resolver_declined, 2
+                                                  nullable_or_generic)
+    member_ladder             29,380 -> 12,421   (a ROUTE label — see the
                                                   replay-hits section)
     compose commontest         1,275 baseline, 2-3 classes lost
-                            -> 1,346 passed, 0 classes lost
+                            -> 1,344-1,346 passed, 0 classes lost
 
 Wall clock across every one of these changes: 28.4-29.0s against a 28.6s
 baseline. The work buys contract conformance, not speed, and the plan says
 so at each step rather than letting the counters imply otherwise.
+
+Seven resolution/typing commits this stretch, each fully gated and its
+mechanism written up in the sections above: the dependent bound with an
+unbound referenced parameter; the tie on the lambda return lending
+param_rep; named arguments skipping defaulted parameters (typing-only —
+the skip-committed emission regressed six programs and was demoted to
+sole_unknown; committing waits on the calling-convention unification);
+the vararg parameter's element-carrying body type; the splice window as
+a receiver context (three stacked fixes, plus the emission-vs-derivation
+channel trap); the class-param mangle filter; and the HostSlotOp FuncId
+bindings that took the slot walks to the scalar floor.
 
 Interpreter bugs fixed along the way, each pinned:
 
@@ -5423,20 +5442,27 @@ the builtin slot gap; raising the compose runTest cap (cost two whole classes).
 
 ### What is left, precisely
 
-- 60 slot walks, each a different cause: `KClass.isInstance` (25),
-  `Comparator.compare` (13), `IntArray.get`/`Array.get` (10),
-  `ArrayList.iterator` (4), `Any.toString` (3).
-- 154 census sites. 63 are `local_no_decl_type`; the named ones are
-  `IterableTests.kt:475`/`483` (receiver is a type parameter erased to
-  `Iterable<String>`), `CollectionTest.kt:1306`/`1308` (a local generic
-  class constructor), and one each in `Strings.kt:1428`,
-  `Intrinsics.kt:50`, `Instant.kt:629`, `HexExtensions.kt:312`,
-  `CollectionTest.kt:39`. NONE of them reproduces standalone — they need the
-  census file set — so the next attempt should bisect the file set rather
-  than write a small repro, which is what cost two false starts here.
-- `member_ladder`'s remaining 12,517 are mostly cached intrinsic probes;
+- 5 slot walks: `Any.toString` (3), `Byte.toInt` (2) — the scalar floor.
+- 128 unbound census sites, every cluster now 1-11 sites: ~40
+  `local_no_decl_type` spread thin (the `compareBy { it.reversed() }`
+  parameter needs CROSS-ARGUMENT inference of `R`; sum/toUInt x4; date
+  internals doyEst/month; formattedStringLength separators), Call
+  `not_simple_callee` 11 (chains whose receiver-call typing dies
+  mid-link: toString/orEmpty/chunked receivers), Member 11
+  (`.size`/`.Monotonic`/`.iso`/`.default`/`.length` property reads),
+  This 8, Binary 8 (companion-property reads like `bitsPerSymbol` not
+  typing the operand).
+- `member_ladder`'s remaining 12,421 are mostly cached intrinsic probes;
   closing them is a representational change (a `CallMember` carrying a
   resolved target for a host receiver), not a hot-path win.
+- Task 15 (unify a declaration's body and host-symbol calling
+  convention) now also gates: committing named-skip winners (the
+  demotion note above), and the `Char.titlecase`-family audit rows —
+  many of the 1,281 "missing member declarations" are EXTENSIONS in
+  Kotlin whose native registry key is member-shaped; declaring them as
+  members would be wrong, aligning the convention is the real fix.
+- Task 16's audit knob: `KLIO_DECL_AUDIT=members` (1,281 member rows,
+  8 package holes, 6 unaligned keys as of this stretch).
 
 ### The untyped-local tail now has a five-file repro
 
