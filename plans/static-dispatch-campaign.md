@@ -5510,12 +5510,40 @@ property, in `package test.collections`, `demo.collections` and
 `demo.widgets` — types correctly in all three. The real six-line file does
 not.
 
-So something the reconstruction does not carry is doing it, and after nine
-refuted hypotheses (null-argument applicability, `expect`/`actual` merging,
-bound-erasure argument loss, the `T : S` bound, the enclosing-class shape,
-the same-named enclosing member, multiple instantiations of the type
-parameter, a subclass of an undeclared base, and the package name) guessing
-is no longer the right instrument. The next attempt should DIFF the two files
-mechanically — the minimal real one against the reconstruction that works —
-rather than form another hypothesis about them. Both are small enough to read
-side by side, which is the one thing none of these nine attempts did.
+CORRECTION — most of those "refutations" were VACUOUS, and the fault is in
+how they were measured. `no_receiver_type` counts CALL sites. Every
+reconstruction above ended in `println(accumulators.size)`, and `.size` is a
+property READ, not a call — so those files had no counted site whatever the
+local's type was. They reported "0 sites" and proved nothing.
+
+Re-testing the same reconstruction with an actual call on the local:
+
+    fun runIt() {
+        val v = data.runningReduce { acc, e -> acc + e }
+        println(v.last())          // a CALL, therefore counted
+    }
+
+reproduces. So the hand-written reconstruction was correct all along, and the
+hypotheses "eliminated" against it were never tested. Anything above that was
+refuted using a `.size` probe should be treated as unmeasured, not disproven.
+
+With a probe that actually measures, the shape is narrow and reproducible in
+nine lines. Both halves are required:
+
+    data.runningReduce { acc, e -> acc + e }        v untyped
+    data.map { it }                                 v typed
+    data.toList()                                   v typed
+    listOf("a","b").runningReduce { acc, e -> ... }  v typed
+
+The receiver alone is fine (`map`/`toList` type on it), and the extension
+alone is fine (it types on a literal list). Only the pair fails: a receiver
+whose type came from erasing a type parameter to `Iterable<String>`, called
+with `<S, T : S> Iterable<T>.runningReduce(operation: (acc: S, T) -> S)`,
+whose receiver parameter is bounded by ANOTHER type parameter that appears
+only in the lambda and the return.
+
+Renaming the class's type parameter (`T` -> `E` -> `Q`) changes nothing, so
+it is not a collision with the callee's `T`. The live hypothesis is that `S`
+cannot be solved from an unannotated lambda when the receiver's `T` came from
+a bound rather than a written type — and that one should be checked with the
+nine-line file, not reasoned about.
