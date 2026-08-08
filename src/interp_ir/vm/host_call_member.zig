@@ -851,8 +851,11 @@ pub fn kotlinHashCode(v: *const Value) i32 {
         .Byte => |x| @as(i32, x),
         .Short => |x| @as(i32, x),
         .Int => |x| x,
-        .UByte => |x| @as(i32, x),
-        .UShort => |x| @as(i32, x),
+        // An unsigned value class synthesizes hashCode from its SIGNED
+        // storage (`UShort.data: Short`), so kotlinc hashes 65535u as -1 —
+        // the sign-extended data, never the magnitude.
+        .UByte => |x| @as(i32, @as(i8, @bitCast(x))),
+        .UShort => |x| @as(i32, @as(i16, @bitCast(x))),
         .UInt => |x| @bitCast(x),
         .Long => |l| @truncate(l ^ @as(i64, @bitCast(@as(u64, @bitCast(l)) >> 32))),
         .ULong => |u| @truncate(@as(i64, @bitCast(u ^ (u >> 32)))),
@@ -15229,6 +15232,10 @@ test "kotlinHashCode matches Kotlin for builtins" {
     try testing.expectEqual(@as(i32, 0), kotlinHashCode(&.Null));
     try testing.expectEqual(@as(i32, 1231), kotlinHashCode(&.{ .Bool = true }));
     try testing.expectEqual(@as(i32, 1237), kotlinHashCode(&.{ .Bool = false }));
+    // The unsigned value classes hash their SIGNED storage: 65535u is -1.
+    try testing.expectEqual(@as(i32, -1), kotlinHashCode(&.{ .UShort = 65535 }));
+    try testing.expectEqual(@as(i32, -1), kotlinHashCode(&.{ .UByte = 255 }));
+    try testing.expectEqual(@as(i32, 1), kotlinHashCode(&.{ .UShort = 1 }));
     try testing.expectEqual(@as(i32, 65), kotlinHashCode(&.{ .Char = 'A' }));
     try testing.expectEqual(@as(i32, 42), kotlinHashCode(&.{ .Int = 42 }));
 }

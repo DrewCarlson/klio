@@ -2436,6 +2436,28 @@ test "overload_tied_on_lambda_return" {
     );
 }
 
+test "unsigned_value_class_hash" {
+    try check("unsigned_value_class_hash",
+        \\-1
+        \\-1
+        \\30721
+        \\30721
+        \\30721
+        \\30721
+        \\
+    );
+}
+
+test "named_skip_commit_host_boundary" {
+    try check("named_skip_commit_host_boundary",
+        \\threw
+        \\a
+        \\1
+        \\2
+        \\
+    );
+}
+
 test "splice_window_receiver_typing" {
     try check("splice_window_receiver_typing",
         \\bca

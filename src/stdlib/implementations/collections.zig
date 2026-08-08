@@ -7190,8 +7190,10 @@ fn kotlinValueHash(v: Value) i32 {
         .Bool => |b| if (b) @as(i32, 1231) else @as(i32, 1237),
         .Long => |x| longHash(x),
         .UInt => |x| @bitCast(x),
-        .UShort => |x| @as(i32, x),
-        .UByte => |x| @as(i32, x),
+        // An unsigned value class synthesizes hashCode from its SIGNED
+        // storage (`UShort.data: Short`), so kotlinc hashes 65535u as -1.
+        .UShort => |x| @as(i32, @as(i16, @bitCast(x))),
+        .UByte => |x| @as(i32, @as(i8, @bitCast(x))),
         .ULong => |x| longHash(@bitCast(x)),
         .Float => |f| if (std.math.isNan(f)) @as(i32, @bitCast(@as(u32, 0x7fc0_0000))) else @as(i32, @bitCast(f)),
         .Double => |d| blk: {

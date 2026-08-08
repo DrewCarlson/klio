@@ -5721,21 +5721,49 @@ rejection rather than guessing:
 
    COMMITTING the skip-mapped winner regressed six programs in one
    sweep (StringEncodingTest decodeToString x2, UuidTest fromByteArray
-   x2, compose_ui_geometry, compose_uitext): the emit and host
-   boundaries bind arguments POSITIONALLY, so a static commit routed
-   `decodeToString(throwOnInvalidSequence = true)`'s flag into
-   `startIndex`. The winner is therefore DEMOTED to the sole_unknown
-   typing channel — identity resolved, return and lambda-param types
-   flow, emission stays on the runtime's named binding (which was
-   already correct) — and the census result is IDENTICAL to the commit
-   version (118, 98.49%): these sites needed types, not commitment.
-   Committing skip-mapped winners becomes possible when the emit path
-   fills named/default slots itself (see task 15's calling-convention
-   unification).
-   Unit pin: `ir.test.named arguments may skip defaulted parameters and
-   still resolve` (the skip yields sole_unknown, not target; a name no
-   parameter carries still drops; skipping a REQUIRED parameter still
-   defers).
+   x2, compose_ui_geometry, compose_uitext), and the winner was
+   temporarily DEMOTED to the sole_unknown typing channel while the
+   convention gap was root-caused. THE DEMOTION IS NOW RETIRED — the
+   task-15 walk found the commit's emission was correct all along (the
+   Call carries its argument names and `callFuncTyped` receives them);
+   TWO host-boundary bugs ate the names downstream:
+
+   a. `extDeclRecvIsUserClass` did not know the primitive-array /
+      unsigned / iterator / Comparator families, so the
+      incompatible-receiver guard classified `ByteArray` as a USER
+      class and re-dispatched the call through the by-name member walk
+      WITH THE NAMES STRIPPED — the flag then bound positionally into
+      `startIndex`. The builtin table now covers the family (unit-
+      pinned in interp_ir).
+
+   b. `callFuncNamed`'s default fill hit a defaultless hole (a
+      host-backed declaration's defaults live in the NATIVE, not in
+      thunks) and BROKE out, silently dropping every bound slot past
+      the hole. A hole before a bound slot now fills with Null — the
+      convention `stdlibNamedDispatch` already used and the natives
+      read as "defaulted"; a trailing hole keeps the prefix-padding
+      contract, so `f(cause = null)` semantics are untouched.
+
+   Skip-mapped winners now COMMIT by default (a deferred CallMember
+   becomes a DIRECT Call; census-neutral because both states counted
+   bound, but the runtime name walk is gone). `KLIO_NAMED_COMMIT=0`
+   demotes for single-binary A/B. Pins: the ir unit test now expects
+   the COMMIT; `named_skip_commit_host_boundary` discriminates the
+   whole chain behaviourally (threw/no-throw); the six formerly
+   regressed programs re-verified green under the commit before the
+   default flipped.
+
+   The classifier fix then SURFACED a third interpreter bug the old
+   misroute had been masking: `UShortArray.contentHashCode()` (whose
+   body delegates to the SIGNED storage array, per upstream) began
+   running its real declaration and disagreed with klio's
+   `List<UShort>.hashCode` — both sides had been consistently WRONG,
+   hashing unsigned scalars by magnitude. kotlinc's unsigned value
+   classes synthesize `hashCode` from the SIGNED `data` field, so
+   `65535u.hashCode() == -1`. Both scalar-hash sites
+   (`kotlinHashCode`, `kotlinValueHash`) now sign-extend UByte/UShort;
+   UInt/ULong were already bit-identical. Pinned:
+   `unsigned_value_class_hash` and the kotlinHashCode unit rows.
 
 2. **A vararg parameter's body-side type was recorded head-only.** With
    the named skip fixed, the String-vararg `split` still failed while the
