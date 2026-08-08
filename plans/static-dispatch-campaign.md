@@ -5920,6 +5920,32 @@ fixed and the take/next chains bind. FOLLOW-UP: alias-resolve the head at
 the `no_class_id` site. Pinned: `splice_window_receiver_typing`
 (behaviour), plus the census A/B recorded here.
 
+### The emission channel adopts the full static deriver
+
+The two-channel trap closed at its ROOT this time instead of per-site.
+The member-call EMISSION paths (`lowerMemberCallFallback` and the
+safe-call arm) derived their receiver type through
+`staticCallReturnTypeRef orelse localInitTypeRef` only — a strict
+SUBSET of `staticExprTypeRef`, which additionally answers Binary
+numeric promotion, `as`/`this`/`if`, unary, and (new this stretch) a
+bare Path reading an enclosing class or companion property. So a
+receiver the DERIVATION side typed happily lowered as DYN at emission:
+`((symbols.toLong() * bitsPerSymbol) / bitsPerByte).toInt()` in
+Base64.decodeSize, and every `(a * b).toInt()` shape inside class
+bodies. Both paths now call `staticExprTypeRef`.
+
+Two supporting pieces landed with it: the `staticExprTypeRef` Path arm
+(a bare name that is NOT a local reads the enclosing class's or the
+lifted `{Owner}$Companion`'s property type — refs table first, HEAD
+table for scalar properties, since the refs table deliberately records
+only arg-carrying types), keyed directly by the lifted companion name
+because the class-row companion link is not reliable during body
+lowering. Census: no_receiver_type 110 -> 108 on the census set (the
+set's own Binary rows were two shapes; the rest of the win lands in
+ordinary class-body code the census does not sample, visible as the
+mfb-trace flood of newly typed This/Path/Binary/Member receivers
+during stdlib lowering).
+
 ### The slot walks fall to the scalar floor
 
 The 60 remaining by-name slot walks were SIX shapes, named exactly by the

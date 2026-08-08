@@ -5387,9 +5387,9 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // the declaration is provable; the receiver is already in a register,
         // so hand it over rather than let it be evaluated a second time.
         const declared_from_expr = argDeclTypeRef(b, receiver);
+        // The full static deriver, matching the plain member path.
         var inferred_ty: ?ir.TypeRef = if (declared_from_expr == null)
-            (try staticCallReturnTypeRef(b, receiver)) orelse
-                try localInitTypeRef(b, receiver)
+            try staticExprTypeRef(b, receiver)
         else
             null;
         defer if (inferred_ty) |*t| t.deinit(b.allocator);
@@ -9655,6 +9655,35 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
             // `-x` / `+x` keep the operand's type.
             .Neg, .Pos => return try staticExprTypeRef(b, un.expr),
             else => {},
+        },
+        // A bare name that reads an ENCLOSING class or companion property
+        // lends its declared type: `payload shl bitsPerSymbol` inside a
+        // Base64 member needs the companion const to answer Int before the
+        // Binary promotion above can type the operation. Locals were
+        // consulted first (argDeclTypeRef), and a same-named local WITHOUT
+        // a type must keep shadowing — Kotlin resolves the local.
+        .Path => |p| {
+            if (p.segments.len != 1) break :self_named;
+            const nm = p.segments[0].name;
+            if (b.resolve(nm) != null or b.isLocalFn(nm) or b.knowsOuter(nm)) break :self_named;
+            const owner = b.ownerClass() orelse break :self_named;
+            // The full-ref table records only arg-carrying declared types;
+            // a scalar property (`const val bitsPerSymbol: Int`) lives in
+            // the HEAD table.
+            if (propTypeRefOn(b, owner, nm)) |t| return try t.clone(b.allocator);
+            if (b.module.registry.class_prop_type_heads.get(.{ .a = owner, .b = nm })) |head| {
+                return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
+            }
+            // The companion's properties are in scope in the class body;
+            // they record under the lifted `{Owner}$Companion` key.
+            var ckey_buf: [160]u8 = undefined;
+            if (std.fmt.bufPrint(&ckey_buf, "{s}$Companion", .{owner})) |ckey| {
+                if (propTypeRefOn(b, ckey, nm)) |t| return try t.clone(b.allocator);
+                if (b.module.registry.class_prop_type_heads.get(.{ .a = ckey, .b = nm })) |head| {
+                    return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
+                }
+            } else |_| {}
+            break :self_named;
         },
             else => {},
         }
@@ -16678,9 +16707,13 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     const receiver = callee.Member.receiver;
     const name = callee.Member.name;
     const declared_from_expr = argDeclTypeRef(b, receiver);
+    // The FULL static deriver, not just the call-return channel: a BINARY
+    // receiver (`(a * bitsPerSymbol) / bitsPerByte).toInt()`) types by the
+    // numeric-promotion arm, a bare companion-const read by the Path arm —
+    // channels the emission never consulted while the derivation side did,
+    // which is the two-channel trap recorded twice already.
     var inferred_declared_ty: ?ir.TypeRef = if (declared_from_expr == null)
-        (try staticCallReturnTypeRef(b, receiver)) orelse
-            try localInitTypeRef(b, receiver)
+        try staticExprTypeRef(b, receiver)
     else
         null;
     defer if (inferred_declared_ty) |*ty| ty.deinit(b.allocator);
