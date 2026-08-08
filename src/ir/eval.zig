@@ -9706,12 +9706,14 @@ fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) ?Val
     // was the single hottest entry in the runtime member LADDER
     // (`Char.compareTo` alone, 84,595 of 113,980) — a primitive has no
     // vtable slot, so a `Comparable` receiver dispatched by name every time.
-    // Returns the same -1/0/1 the host intrinsic does.
+    // Returns exactly what the host intrinsic does: the CODE DIFFERENCE for
+    // `Char` (kotlinc emits `Character.compare`), and -1/0/1 for `Int`/`Long`
+    // (`Integer.compare` / `Long.compare`).
     if (arg_in) |cmp_arg| {
         if (std.mem.eql(u8, nm, "compareTo")) {
             const ord: ?i64 = switch (recv) {
                 .Char => |c| if (cmp_arg == .Char)
-                    (if (c < cmp_arg.Char) @as(i64, -1) else if (c > cmp_arg.Char) @as(i64, 1) else 0)
+                    @as(i64, @intCast(c)) - @as(i64, @intCast(cmp_arg.Char))
                 else
                     null,
                 .Int => |i| if (cmp_arg == .Int)

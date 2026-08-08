@@ -2352,3 +2352,19 @@ test "overload_set_lambda_discriminated" {
         \\
     );
 }
+
+test "char_compare_to_code_difference" {
+    try check("char_compare_to_code_difference",
+        \\-2
+        \\2
+        \\0
+        \\-32
+        \\-1
+        \\1
+        \\-1
+        \\[a, b, c]
+        \\true
+        \\true
+        \\
+    );
+}

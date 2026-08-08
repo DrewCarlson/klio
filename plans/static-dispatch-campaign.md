@@ -5139,3 +5139,28 @@ are now VISIBLE for the first time — the class used to be discarded whole.
 
 Green: commontest 117/0, drift 267/267, litmus 42/43 (known timeout), units,
 census unmoved at 9,063.
+
+### Char.compareTo returned the sign, kotlinc returns the difference
+
+    'a'.compareTo('c')   klio -1    kotlinc -2
+
+kotlinc compiles `Char.compareTo` to `Character.compare`, which is the code
+difference. `Comparable` only contracts for the SIGN, so -1 was not a
+contract violation — but a program that prints the result sees a different
+number than it does under kotlinc, and matching kotlinc is the rule.
+
+Both paths returned the sign and both are fixed: the `kotlin.Char.compareTo`
+intrinsic, and the `primitiveMemberOp` fast path added earlier in this
+campaign (which was written to return "the same -1/0/1 the host intrinsic
+does" — it did, and both were wrong together). `Int` and `Long` correctly
+stay -1/0/1: kotlinc compiles those to `Integer.compare` / `Long.compare`.
+
+`kotlin.String.compareTo` has the SAME divergence — kotlinc returns the char
+difference, klio returns the sign — and is NOT fixed here. It routes through
+`compareUtf16`, which yields a three-way ordering used for sorting elsewhere;
+returning a difference means changing that comparator's result type, which is
+a wider change than this one and wants its own measurement.
+
+Pinned by `char_compare_to_code_difference`. Green: commontest 117/0, drift
+267/267, litmus 42/43 (known timeout), units, compose exit 0 / 1342 passed,
+0 did not complete (baseline 1305).
