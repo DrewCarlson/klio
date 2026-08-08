@@ -5568,18 +5568,30 @@ as the cause. What fails is the candidate check itself, in
     }
 
 `<S, T : S>` says only that `S` is solved at or above `T`, and `S` is itself
-inferred from this call. Handing it to the receiver-compatibility check asks
-whether a concrete `String` "is an S", which no concrete type can answer, so
-the candidate is rejected and the call gets no return type. A bound naming
-another parameter of the same function is now treated as unconstraining.
+inferred from this call, so handing it to receiver-compatibility asks whether
+a concrete `String` "is an S" — unanswerable.
 
-`type_param_bounded_by_type_param` pins it, on both a type-parameter receiver
-and a plain `List<Int>`.
+A change treating such a bound as unconstraining was written, measured, and
+REVERTED. It fixes nothing. The A/B is unambiguous:
 
-HONEST LIMIT: this fixes the hand-written shape but the census is UNMOVED at
-154 — the real `IterableTests.kt:475`/`483` sites are still untyped. The
-remaining difference is that `kotlin.collections.runningReduce` is `inline`
-and mine is not, so the real call presumably reaches the same rejection
-through the inline-splice path rather than this one. The fix is kept because
-it is correct and pinned, not because it moved the number; the inline path is
-the next place to look.
+                     two extensions declared   one extension declared
+    without the fix          0                          1
+    with the fix             0                          1
+
+The apparent success came from the probe file happening to declare a SECOND
+extension (`freeReduce` beside `boundReduce`); with two candidates the call
+takes a different resolution path and types either way. With a single
+declaration it stays untyped with and without the change. The pinned fixture
+`type_param_bounded_by_type_param` passes in both states too, so it does not
+cover the mechanism either — it is kept only as behaviour coverage.
+
+That is the SECOND measurement artifact on this tail, after the `.size`
+probe. Both had the same shape: a control that was not a control. The rule
+this earns: on this tail, A/B every claimed fix by stashing it, and vary ONE
+thing between the two files.
+
+The mechanism above is still where the failure happens — the candidate is
+rejected at the type-parameter bound — but the guard added there is not what
+unblocks it, and the real cause is further in. `inline` is NOT the
+distinguishing factor either: a plain, an `inline`, and the real
+`runningReduce` all reproduce identically at one declaration.
