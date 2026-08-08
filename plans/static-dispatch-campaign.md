@@ -5469,6 +5469,23 @@ the builtin slot gap; raising the compose runTest cap (cost two whole classes).
   then `compareBy`'s own resolution sees `Comparator<in String>`,
   binds its `T`, and its lambda's `it` types. Verify with the
   minOfWith/maxOfWith census rows (12 sites) and A/B by stashing.
+
+  IMPLEMENTED AND REVERTED — measured flat. The chain breaks one link
+  earlier than the design assumed: `R` must be SOLVED before the
+  expected type can instantiate, and `R` appears only in the trailing
+  lambda's RETURN position. The step-four solve was fed
+  enrichLambdaArgShapes, but the enricher restricts derivable tails to
+  Path/Binary/literal — Call/Member tails are a RECORDED NET-NEGATIVE
+  refutation (no_receiver_type 1,353 -> 1,403 when they were tried) —
+  and both real lambdas here (`{ it.take(3) }`, `{ it.reversed() }`)
+  are member tails. With `R` unsolved the substitution no-ops, and the
+  census read identical (110/2/10/6). Reverted per the flat-revert
+  rule. The compareBy rows need a mechanism that types the member-tail
+  lambda return WITHOUT the general member-tail derivation the
+  refutation forbids — e.g. deriving under the receiver-instantiated
+  param types only for the COMMITTED-callee case, which the refutation
+  never isolated. Left for a stretch with room to re-measure that
+  distinction.
 - `member_ladder` 12,421 -> 2,944. The ladder key now carries the
   ENCLOSING FUNCTION (`<ladder>Type.name@fn`), which named the total as
   a few hot sites times execution counts: `this[index] = v` inside the
