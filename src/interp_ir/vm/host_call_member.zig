@@ -9770,6 +9770,49 @@ pub fn slotByNameFallbacks() u64 {
     return slot_by_name_count.load(.monotonic);
 }
 
+/// A builtin member whose implementation is a host function reached by
+/// RECEIVER VARIANT rather than by FQN, so `linkBodyless` finds no native for
+/// it and a statically bound slot call declines to a member-name walk
+/// (`KLIO_NOINST_WHY` reports `target-not-executable`). Binding the target
+/// `FuncId` to the handler settles the call by id instead.
+///
+/// The FQN comparison happens ONCE per `FuncId` per thread; every later call
+/// on that slot is an integer probe. The handlers are the existing ones — a
+/// second implementation here is exactly the duplication this avoids.
+const HostSlotOp = enum { iterator_protocol };
+
+threadlocal var host_slot_ops: ?std.AutoHashMapUnmanaged(u32, ?HostSlotOp) = null;
+
+fn hostSlotOpFor(module: *const Module, target: FuncId) ?HostSlotOp {
+    if (host_slot_ops == null) host_slot_ops = .{};
+    const map = &host_slot_ops.?;
+    if (map.get(target.int())) |cached| return cached;
+    const fqn = if (module.funcById(target)) |f| f.fqn else return null;
+    const op: ?HostSlotOp = blk: {
+        const owner = fqn[0 .. std.mem.lastIndexOfScalar(u8, fqn, '.') orelse break :blk null];
+        const name = fqn[owner.len + 1 ..];
+        const iter_owner = std.mem.eql(u8, owner, "kotlin.collections.Iterator") or
+            std.mem.eql(u8, owner, "kotlin.collections.MutableIterator") or
+            std.mem.eql(u8, owner, "kotlin.collections.ListIterator") or
+            std.mem.eql(u8, owner, "kotlin.collections.MutableListIterator");
+        if (iter_owner and isIteratorProtocol(name)) break :blk .iterator_protocol;
+        break :blk null;
+    };
+    map.put(std.heap.page_allocator, target.int(), op) catch return op;
+    return op;
+}
+
+fn runHostSlotOp(self: *VmHost, allocator: Allocator, op: HostSlotOp, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    switch (op) {
+        .iterator_protocol => switch (receiver.*) {
+            .Iterator => return iteratorMember(self, allocator, receiver, name, args),
+            .RangeIter => return rangeIterMember(self, allocator, receiver, name, args),
+            .SeqIter => return seqIterMember(self, allocator, receiver, name, args),
+            else => return null,
+        },
+    }
+}
+
 /// Names the builtin iterator variants own outright.
 fn isIteratorProtocol(name: []const u8) bool {
     return std.mem.eql(u8, name, "hasNext") or std.mem.eql(u8, name, "next") or
@@ -9957,6 +10000,14 @@ pub fn invokeVirtualMember(
                 } else |_| {}
             }
             const target = module.methodSlotTarget(runtime_class, slot) orelse {
+                // No entry for this class, but the ROOT still names the
+                // declaration the call was bound to, and for a builtin whose
+                // implementation is a host handler that is enough to settle
+                // it by id (`ListIterator.hasPrevious` on a host iterator).
+                if (hostSlotOpFor(module, root)) |op| {
+                    const nm2: []const u8 = if (module.funcById(root)) |f| f.name else (mname orelse "");
+                    if (try runHostSlotOp(self, allocator, op, receiver, nm2, args)) |r| return r;
+                }
                 if (runtime.envOnce("KLIO_NOINST_WHY") != null)
                     std.debug.print("[noinst-why] no-slot-entry recv={s} root={s}\n", .{ receiver.typeFqn(), if (module.funcById(root)) |f| f.fqn else "?" });
                 break :blk .{ .target = null, .name = mname };
@@ -9968,6 +10019,10 @@ pub fn invokeVirtualMember(
             if (!virtualTargetExecutable(module, target) and
                 host_call_func.resolvedNativeForm(self, target) == null)
             {
+                if (hostSlotOpFor(module, target)) |op| {
+                    const nm2: []const u8 = if (module.funcById(target)) |f| f.name else (mname orelse "");
+                    if (try runHostSlotOp(self, allocator, op, receiver, nm2, args)) |r| return r;
+                }
                 if (runtime.envOnce("KLIO_NOINST_WHY") != null)
                     std.debug.print("[noinst-why] target-not-executable recv={s} root={s} target={s}\n", .{ receiver.typeFqn(), if (module.funcById(root)) |f| f.fqn else "?", if (module.funcById(target)) |f| f.fqn else "?" });
                 break :blk .{ .target = null, .name = mname };
@@ -10000,18 +10055,6 @@ pub fn invokeVirtualMember(
             if (try invokeMethodFuncId(self, allocator, receiver, target, args)) |r| return r;
         }
         if (noinst.name) |mname| {
-            // The iterator protocol is implemented by the host variants and by
-            // nothing ahead of them in the named ladder, so a statically bound
-            // slot for one of these names can reach its implementation without
-            // walking every earlier member handler first.
-            if (isIteratorProtocol(mname)) {
-                switch (receiver.*) {
-                    .Iterator => if (try iteratorMember(self, allocator, receiver, mname, args)) |r| return r,
-                    .RangeIter => if (try rangeIterMember(self, allocator, receiver, mname, args)) |r| return r,
-                    .SeqIter => if (try seqIterMember(self, allocator, receiver, mname, args)) |r| return r,
-                    else => {},
-                }
-            }
             noteSlotByName2(self, slot, mname, receiver);
             return callMemberNamed(self, allocator, receiver, mname, args, arg_names);
         }

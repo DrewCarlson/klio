@@ -5208,3 +5208,34 @@ the remaining gap is. The claim gets restored when the declarations land.
 The iterator-protocol shortcut earlier in this plan is deliberately NOT the
 model to copy here: it removed a ladder prefix, not the name search, so
 repeating it for `add` would move the count without changing the contract.
+
+### The iterator protocol dispatches by FuncId, and the shortcut is retired
+
+`KLIO_NOINST_WHY` said the iterator calls declined with
+`target-not-executable`: the slot resolved, but the target was a bodyless
+interface member with no native registered under its FQN, because the
+implementation lives VM-side in `iteratorMember` and is reached by RECEIVER
+VARIANT, not by name.
+
+So the target `FuncId` is now bound to that handler directly. `hostSlotOpFor`
+matches the declaration's owner and name ONCE per `FuncId` per thread and
+caches the answer, so every later call on that slot is an integer probe; the
+handlers are the existing ones, since a second implementation is exactly the
+duplication this is meant to avoid. Where the class has no slot entry at all,
+the slot ROOT still names the declaration, which settles
+`ListIterator.hasPrevious`/`previous` the same way.
+
+    target-not-executable  Iterator.hasNext   20,255 -> 0
+    target-not-executable  Iterator.next      20,125 -> 0
+
+That retires the name-keyed shortcut added earlier in this campaign. Removing
+it alone cost 174 walks (5,893 -> 6,067); binding the root as well brings it
+back to 5,893 with NO name matching left on the path. Same count, different
+mechanism — and the mechanism is the point: 40,380 calls that reached their
+implementation by comparing a string now reach it by id, which is what a
+bytecode VM and the C backend can express.
+
+Wall clock 28.98s / 28.94s against 28.6s — flat to slightly noisy, consistent
+with every other channel in this campaign.
+
+Green: commontest 117/0, drift 267/267, litmus 42/43 (known timeout), units.
