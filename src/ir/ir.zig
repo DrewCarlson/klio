@@ -5559,6 +5559,26 @@ pub const Module = struct {
                     std.mem.eql(u8, std.mem.span(v), "0")
                 else
                     false;
+                // `Nothing?` is the null literal's type and the bottom of the
+                // lattice, so it constrains nothing but nullability: Kotlin
+                // reads `listOf(null, "foo")` as `List<String?>`. Widen to the
+                // other constraint and carry the nullability across, in either
+                // order. Without this the pair binds nothing, the call has no
+                // return type, and every use of the result is left untyped.
+                if (std.mem.eql(u8, staticTypeHead(bound.name), "Nothing")) {
+                    var widened = actual;
+                    widened.nullable = widened.nullable or bound.nullable;
+                    widenBinding(bindings.items, pattern_head, widened);
+                    return true;
+                }
+                if (std.mem.eql(u8, staticTypeHead(actual.name), "Nothing")) {
+                    if (actual.nullable and !bound.nullable) {
+                        var widened = bound;
+                        widened.nullable = true;
+                        widenBinding(bindings.items, pattern_head, widened);
+                    }
+                    return true;
+                }
                 const bound_plain = overrideArgs(bound).len == 0;
                 const actual_plain = overrideArgs(actual).len == 0;
                 if (!lub_off and bound_plain and actual_plain) {

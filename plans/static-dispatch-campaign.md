@@ -5349,3 +5349,41 @@ re-walking the full candidate set every call. It does mean the remaining
 further is a representational change (a `CallMember` carrying a resolved
 target for a host receiver), not a hot-path win. Wall clock with the counter
 installed: 28.67s / 28.71s, unchanged.
+
+### The null literal vetoed its own call's return type
+
+The `local_no_decl_type` tail — 68 of the 92 untyped-receiver PATH sites —
+is one bug, and it is NOT where two earlier attempts looked.
+
+`val source = listOf(null, "foo", "bar")` derives no type for `source`, so
+every member call on it is unbound. The first hypothesis was overload
+APPLICABILITY (a null argument rejected against a bare type parameter);
+scoring it applicable fixed one unrelated site, measured flat on the census,
+and was reverted. The second was `expect`/`actual` interface merging, also
+wrong.
+
+`KLIO_AGREED_TRACE` names the branch: `top_level_usable` is true, so the
+call HAS a committed target and the agreed-return channel correctly steps
+aside. The failure is one step further on, in type-argument BINDING:
+
+    bindCallType(pattern T, actual Nothing?)   binds T = Nothing?
+    bindCallType(pattern T, actual String)     bound=Nothing? actual=String
+                                               -> returns false
+
+`Nothing?` is the null literal's type and the bottom of the lattice, so it
+constrains nothing but nullability — Kotlin reads `listOf(null, "foo")` as
+`List<String?>`. The subsumption rule below it never fires because the
+nullability guard (`!bound.nullable or actual.nullable`) rejects the pair,
+so the whole instantiation fails and the call has no return type.
+
+Widening `Nothing` in either position, carrying nullability across:
+
+    census   9,063 total, 163 unbound  ->  9,053 total, 154 unbound
+    bound share            97.99%      ->  98.30%
+
+The total moved because a typed local lowers differently, not because sites
+disappeared. Pinned by `null_literal_widens_type_argument`, which covers
+leading and trailing nulls, an all-null list, a mixed-type list, a nested
+list, `mapOf` and `arrayOf`.
+
+Green: commontest 117/0, drift 267/267, litmus 42/43 (known timeout), units.

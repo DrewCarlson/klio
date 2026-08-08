@@ -10215,16 +10215,32 @@ fn staticCallReturnTypeRef(
             // trailing-lambda blindness) — KLIO_AGREED_RET=0 re-parks it
             // for A/B.
             const agreed_return: ?ir.TypeRef = blk_agree: {
+                const atrace = if (runtime.envOnce("KLIO_AGREED_TRACE")) |w|
+                    (std.mem.eql(u8, w, "*") or std.mem.eql(u8, w, name.name))
+                else
+                    false;
                 if (std.mem.eql(u8, runtime.envOnce("KLIO_AGREED_RET") orelse "1", "0")) break :blk_agree null;
-                if (top_level_usable) break :blk_agree null;
-                if (enclosingHasMemberNamed(b, name.name)) break :blk_agree null;
+                if (top_level_usable) {
+                    if (atrace) std.debug.print("[agreed] {s}: top_level_usable\n", .{name.name});
+                    break :blk_agree null;
+                }
+                if (enclosingHasMemberNamed(b, name.name)) {
+                    if (atrace) std.debug.print("[agreed] {s}: enclosing has member\n", .{name.name});
+                    break :blk_agree null;
+                }
                 // A name ANY class declares as a member may be a receiver
                 // member here (`iterator()` inside a Sequence extension is
                 // `this.iterator()`) — the agreed top-level return would
                 // type it from the wrong declarations entirely.
-                if (b.module.registry.class_member_names.contains(name.name)) break :blk_agree null;
+                if (b.module.registry.class_member_names.contains(name.name)) {
+                    if (atrace) std.debug.print("[agreed] {s}: some class declares this member name\n", .{name.name});
+                    break :blk_agree null;
+                }
                 const fids = b.module.funcsBySimpleName(name.name);
-                if (fids.len < 2) break :blk_agree null;
+                if (fids.len < 2) {
+                    if (atrace) std.debug.print("[agreed] {s}: {d} declaration(s)\n", .{ name.name, fids.len });
+                    break :blk_agree null;
+                }
                 var seen: ?ir.TypeRef = null;
                 var args_agree = true;
                 for (fids) |fid2| {

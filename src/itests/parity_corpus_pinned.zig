@@ -2410,3 +2410,18 @@ test "collection_slot_direct_intrinsic" {
         \\
     );
 }
+
+test "null_literal_widens_type_argument" {
+    try check("null_literal_widens_type_argument",
+        \\[f, o, o, b, a, r]
+        \\[foo, bar]
+        \\3
+        \\[a]
+        \\2
+        \\[b]
+        \\[1]
+        \\2
+        \\2
+        \\
+    );
+}
