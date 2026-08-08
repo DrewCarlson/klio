@@ -554,8 +554,12 @@ pub fn spliceInlineLambdaOn(
             // open.
             var h = std.mem.trimEnd(u8, ty.name, "?");
             if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            // A class-param IDENTITY mangle names nothing lowering can
+            // resolve either — committing `$class$ N i:E` heads only fed
+            // the no_class_id bucket.
             const bare_tp = (h.len > 0 and h.len <= 2 and
-                std.ascii.isUpper(h[0])) or b.isTypeParam(h);
+                std.ascii.isUpper(h[0])) or b.isTypeParam(h) or
+                ir.parseClassTypeParamIdentity(h) != null;
             if (!bare_tp) {
                 try b.setLocalDeclTypeOwned(pname, try ty.clone(b.allocator));
             }
@@ -1749,7 +1753,7 @@ pub fn tryInlineCallWithTypeArgs(
                 var h = std.mem.trimEnd(u8, dv.name, "?");
                 if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
                 const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
-                    b.isTypeParam(h);
+                    b.isTypeParam(h) or ir.parseClassTypeParamIdentity(h) != null;
                 if (!bare) derived_clone = try dv.clone(b.allocator);
             }
             // ALWAYS shadow the caller's same-named record for a

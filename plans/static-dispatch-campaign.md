@@ -5769,3 +5769,19 @@ bound; net unbound 136 -> 138 while the Entry-poisoning typing bug is
 fixed and the take/next chains bind. FOLLOW-UP: alias-resolve the head at
 the `no_class_id` site. Pinned: `splice_window_receiver_typing`
 (behaviour), plus the census A/B recorded here.
+
+The follow-up resolved same-session, and the typealias guess above was
+mostly WRONG — the `[no-class]` dump now captures its heads into a fixed
+buffer at the count site and names them with the summary (the per-site
+env-gated print loses rows nondeterministically; a count with no names
+had already sent one scoping pass guessing). The 22 were:
+`$class$ 198 1:E` x12, `$class$ 200 1:E` x6, `DeepRecursiveFunctionBlock`
+x2, `Function0` x2 — the dominant heads are class-param IDENTITY MANGLES
+that the new splice fallbacks were committing into local records: the
+bare-type-parameter filters checked `len <= 2 or isTypeParam` and a
+`$class$ N i:E` head passes both. Both filters (the splice
+lambda-parameter binding and the tp-declared value-param path) now also
+reject `parseClassTypeParamIdentity` hits. Census after:
+`no_class_id` 22 -> 10 (baseline), `no_receiver_type` 108 -> 110, total
+9022 — net unbound 128, bound share 98.58%, the best measured. The two
+typealias/Function heads remain, too small to chase now.

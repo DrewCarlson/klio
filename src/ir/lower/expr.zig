@@ -15202,6 +15202,30 @@ pub const NoClassKind = enum(u8) {
 };
 pub var lm_noclass: [3]u64 = @splat(0);
 
+/// The heads behind the `no_class_id` count, captured at the site into a
+/// fixed buffer so the dump can name them — the per-site env trace loses
+/// rows that fire before diagnostics settle, and a count with no names sent
+/// a whole scoping pass guessing.
+var lm_noclass_heads: [32][64]u8 = undefined;
+var lm_noclass_head_lens: [32]u8 = @splat(0);
+var lm_noclass_head_counts: [32]u32 = @splat(0);
+var lm_noclass_head_n: usize = 0;
+
+fn noteNoClassHead(head: []const u8) void {
+    const n = @min(head.len, 64);
+    for (lm_noclass_heads[0..lm_noclass_head_n], lm_noclass_head_lens[0..lm_noclass_head_n], 0..) |*buf, len, i| {
+        if (std.mem.eql(u8, buf[0..len], head[0..n])) {
+            lm_noclass_head_counts[i] += 1;
+            return;
+        }
+    }
+    if (lm_noclass_head_n >= lm_noclass_heads.len) return;
+    @memcpy(lm_noclass_heads[lm_noclass_head_n][0..n], head[0..n]);
+    lm_noclass_head_lens[lm_noclass_head_n] = @intCast(n);
+    lm_noclass_head_counts[lm_noclass_head_n] = 1;
+    lm_noclass_head_n += 1;
+}
+
 pub fn lowerNoClassDump() void {
     var total: u64 = 0;
     for (lm_noclass) |n| total += n;
@@ -15210,6 +15234,9 @@ pub fn lowerNoClassDump() void {
     inline for (@typeInfo(NoClassKind).@"enum".fields) |f| {
         const n = lm_noclass[f.value];
         if (n != 0) std.debug.print("[no-class] {d:>10} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });
+    }
+    for (lm_noclass_heads[0..lm_noclass_head_n], lm_noclass_head_lens[0..lm_noclass_head_n], lm_noclass_head_counts[0..lm_noclass_head_n]) |*buf, len, count| {
+        std.debug.print("[no-class-head] {d:>10}  {s}\n", .{ count, buf[0..len] });
     }
 }
 
@@ -15637,6 +15664,7 @@ fn lowerResolvedMemberCall(
     }
     var static_owner = owner_id orelse {
         lmNote(.no_class_id);
+        noteNoClassHead(head);
         if (norecvCensusOn()) {
             const k: NoClassKind = if (std.mem.indexOfScalar(u8, identity, '.') != null)
                 .fqn_unknown
