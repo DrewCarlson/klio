@@ -2450,6 +2450,19 @@ test "index_set_fast_path" {
     );
 }
 
+test "type_safe_bridge_barrier" {
+    try check("type_safe_bridge_barrier",
+        \\-1
+        \\-1
+        \\false
+        \\-1
+        \\1
+        \\0
+        \\true
+        \\
+    );
+}
+
 test "callable_ref_inline_arg" {
     try check("callable_ref_inline_arg",
         \\[3, 4, 5]
