@@ -5503,10 +5503,19 @@ pub const Module = struct {
         if (class.is_stub or class.is_value) {
             // A host-backed shell has no vtable to index, so `.virtual` for
             // one is exactly the emission that cannot run. A FINAL method on
-            // a closed stub/value class needs no slot: the direct fid call
-            // runs the Kotlin body — or its resolved-native form — whatever
-            // the receiver's host representation.
-            if (!class.is_interface and !class.is_open and !class.is_abstract and methodIsFinal(f)) {
+            // a closed stub/value class goes direct only when a HOST SYMBOL
+            // serves it: a SOURCE body is written against the boxed
+            // representation (`ValueTimeMark.minus` reads `this.reading`),
+            // and a value-class receiver arrives ERASED to its payload, so
+            // running the body by fid read fields the value never
+            // materializes. The slot path's miss-to-walk serves those with
+            // the erased class's own member, which is the semantics the
+            // walk has always provided for erased receivers.
+            // Stubs keep the direct rule as measured; only VALUE classes
+            // erase their receiver.
+            if (!class.is_interface and !class.is_open and !class.is_abstract and
+                methodIsFinal(f) and (class.is_stub or ds.host_symbol != null))
+            {
                 return .direct;
             }
             return .virtual;
