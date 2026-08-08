@@ -9779,7 +9779,7 @@ pub fn slotByNameFallbacks() u64 {
 /// The FQN comparison happens ONCE per `FuncId` per thread; every later call
 /// on that slot is an integer probe. The handlers are the existing ones — a
 /// second implementation here is exactly the duplication this avoids.
-const HostSlotOp = enum { iterator_protocol };
+const HostSlotOp = enum { iterator_protocol, collection_iterator };
 
 threadlocal var host_slot_ops: ?std.AutoHashMapUnmanaged(u32, ?HostSlotOp) = null;
 
@@ -9796,6 +9796,19 @@ fn hostSlotOpFor(module: *const Module, target: FuncId) ?HostSlotOp {
             std.mem.eql(u8, owner, "kotlin.collections.ListIterator") or
             std.mem.eql(u8, owner, "kotlin.collections.MutableListIterator");
         if (iter_owner and isIteratorProtocol(name)) break :blk .iterator_protocol;
+        // `iterator()` on a collection: the host builds the iterator from the
+        // receiver's own representation, and no native is registered under
+        // the interface's FQN either.
+        if (std.mem.eql(u8, name, "iterator") and
+            (std.mem.eql(u8, owner, "kotlin.collections.Iterable") or
+                std.mem.eql(u8, owner, "kotlin.collections.MutableIterable") or
+                std.mem.eql(u8, owner, "kotlin.collections.Collection") or
+                std.mem.eql(u8, owner, "kotlin.collections.MutableCollection") or
+                std.mem.eql(u8, owner, "kotlin.collections.List") or
+                std.mem.eql(u8, owner, "kotlin.collections.MutableList") or
+                std.mem.eql(u8, owner, "kotlin.collections.Set") or
+                std.mem.eql(u8, owner, "kotlin.collections.MutableSet")))
+            break :blk .collection_iterator;
         break :blk null;
     };
     map.put(std.heap.page_allocator, target.int(), op) catch return op;
@@ -9809,6 +9822,16 @@ fn runHostSlotOp(self: *VmHost, allocator: Allocator, op: HostSlotOp, receiver: 
             .RangeIter => return rangeIterMember(self, allocator, receiver, name, args),
             .SeqIter => return seqIterMember(self, allocator, receiver, name, args),
             else => return null,
+        },
+        .collection_iterator => {
+            if (args.len != 0) return null;
+            // The self-iterator convention first, exactly as the named path
+            // applies it, then the builtin collection/range iterator.
+            switch (receiver.*) {
+                .Iterator, .RangeIter, .SeqIter => return .{ .ok = receiver.* },
+                else => {},
+            }
+            return builtinIterator(self, allocator, receiver);
         },
     }
 }

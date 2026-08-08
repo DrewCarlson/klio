@@ -5239,3 +5239,20 @@ Wall clock 28.98s / 28.94s against 28.6s — flat to slightly noisy, consistent
 with every other channel in this campaign.
 
 Green: commontest 117/0, drift 267/267, litmus 42/43 (known timeout), units.
+
+### Collection `iterator()` joins it
+
+Same shape, same fix: `Iterable.iterator` resolved to `List.iterator` /
+`MutableSet.iterator` / `Set.iterator`, all bodyless with no native under
+their FQN, because the host builds the iterator from the receiver's own
+representation. Adding a `collection_iterator` op — self-iterator convention
+first, then `builtinIterator`, exactly the order the named path applies —
+settles them by id too.
+
+    decline reasons   ~350 -> 55
+    slot walks      5,893 -> 5,691
+
+`hostSlotOpFor` is the extension point for the rest of this class of member:
+a builtin whose implementation exists host-side but is reached by receiver
+variant rather than by FQN. The remaining 55 declines are `KClass.isInstance`
+and a short tail.
