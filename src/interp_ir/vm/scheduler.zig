@@ -170,14 +170,22 @@ pub const Pool = struct {
         const n = cpuCountCached();
         const cap = envWorkerCap();
         if (cap != 0) return @max(2, @min(cap, n));
-        return @max(2, n);
+        // HALF the cores by default: several harness instances routinely run
+        // side by side (sweeps, gates, editors), and a full-width compute
+        // pool per instance starves the machine. `KLIO_MAX_WORKERS` widens
+        // a single instance when it owns the box.
+        return @max(2, (n + 1) / 2);
     }
 
     pub fn maxWorkers(self: *Pool) usize {
         if (self.max_workers_override != 0) return self.max_workers_override;
         const cap = envWorkerCap();
         if (cap != 0) return @max(2, cap);
-        return @max(64, cpuCountCached());
+        // The elastic IO ceiling: parked workers cost address space and
+        // scheduler noise, not compute, but a 64-thread floor made every
+        // instance a ~67-thread process. 16 keeps IO bursts overlapped;
+        // `KLIO_MAX_WORKERS` raises it for genuinely wide IO workloads.
+        return @max(16, cpuCountCached());
     }
 
     /// Post a task. Spawns a worker when none is idle and the pool is

@@ -204,6 +204,11 @@ def run_one(binary, target, support, targets, provider, texts, eager):
     argv.append(target)
     argv = ["nice", "-n", "10"] + argv
     env = dict(os.environ, HOME=CHILD_HOME)
+    # Divide the CPU budget across children: each child is itself a
+    # multi-threaded interpreter, and jobs x full-width pools saturated the
+    # machine. Two compute workers per child keeps the whole sweep near half
+    # the cores; a caller-set KLIO_MAX_WORKERS wins.
+    env.setdefault("KLIO_MAX_WORKERS", "2")
     if os.environ.get("KLIO_SWEEP_DEBUG"):
         print("ARGV", "\n".join(argv), file=sys.stderr)
     try:
@@ -276,6 +281,9 @@ def run_dir(binary, tdir, dir_targets, support, all_targets, provider, texts, ea
     if TEST_FILTER:
         argv.append(f"--filter={TEST_FILTER}")
     env = dict(os.environ, HOME=CHILD_HOME)
+    # Same per-child budget as run_one: the sweep's width times a full
+    # interpreter pool per child is what saturated the machine.
+    env.setdefault("KLIO_MAX_WORKERS", "2")
     if os.environ.get("KLIO_SWEEP_DEBUG"):
         print("ARGV", "\n".join(argv), file=sys.stderr)
     t0 = time.monotonic()

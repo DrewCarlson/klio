@@ -50,7 +50,9 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
 /// keeps the cores busy while the slowest files run.
 fn workerCount() usize {
     const cores = std.Thread.getCpuCount() catch 4;
-    return std.math.clamp(cores, 1, 8);
+    // Half the cores, capped low: suites run beside sweeps and editors,
+    // and each child is itself a multi-threaded interpreter.
+    return std.math.clamp(cores / 2, 1, 4);
 }
 
 fn runKlio(
