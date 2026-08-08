@@ -10646,7 +10646,7 @@ fn staticCallReturnTypeRef(
                 ).target;
             }
             target = resolved_target orelse {
-                if (mt) std.debug.print("[bareret] .{s} on {s} no target\n", .{ member.name.name, head });
+                if (mt) std.debug.print("[bareret] .{s} on {s} no target (recv_ty={s} args={d} nshapes={d})\n", .{ member.name.name, head, recv_ty.name, recv_ty.args.len, shape_set.shapes.len });
                 return null;
             };
             if (mt) std.debug.print("[bareret] .{s} on {s} target ok\n", .{ member.name.name, head });

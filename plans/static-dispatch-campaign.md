@@ -5437,3 +5437,40 @@ the builtin slot gap; raising the compose runTest cap (cost two whole classes).
 - `member_ladder`'s remaining 12,517 are mostly cached intrinsic probes;
   closing them is a representational change (a `CallMember` carrying a
   resolved target for a host receiver), not a hot-path win.
+
+### The untyped-local tail now has a five-file repro
+
+Following this plan's own note — bisect the file set, do not write a small
+repro — the `accumulators` sites reproduce in seconds:
+
+    rm -rf /tmp/klio_bisect_home/.klio/cache
+    env HOME=/tmp/klio_bisect_home KLIO_DISPATCH_STATS=1 KLIO_NORECV_WHY='*' \
+      ./zig-out/bin/klio-harness test \
+      tests/stdlib_commontest_actuals/{PlatformActuals,EncodingActuals,JsCollectionFactories}.kt \
+      kotlin/libraries/stdlib/test/testUtils.kt \
+      kotlin/libraries/stdlib/test/collections/IterableTests.kt
+
+Four sites, no CollectionTest, no OrderingTest. With that in hand two more
+hypotheses are refuted:
+
+- NOT bound erasure losing the receiver's type arguments. The trace now
+  prints the full receiver: `recv_ty=Iterable args=1`, i.e.
+  `Iterable<String>` — the bound's argument survives.
+- NOT the receiver being a type parameter as such. `runningReduce` on a
+  concrete `List<String>` types fine.
+
+What actually declines is `resolveExtensionCall("runningReduce",
+Iterable<String>, 1 shape)`, which returns no target. The declaration is
+
+    public inline fun <S, T : S> Iterable<T>.runningReduce(
+        operation: (acc: S, T) -> S): List<S>
+
+whose bound `T : S` names ANOTHER type parameter rather than a class. That
+is the one structural feature separating it from the extensions that do
+resolve here, and it is where the next attempt should look — not at erasure,
+and not at the receiver.
+
+That is three refuted hypotheses on this tail (null-argument applicability,
+`expect`/`actual` merging, bound-erasure argument loss). Each was plausible
+from the outside and wrong; each cost a build-and-measure cycle. The repro
+above makes the next one cost seconds instead.
