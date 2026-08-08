@@ -5476,6 +5476,19 @@ the builtin slot gap; raising the compose runTest cap (cost two whole classes).
   methods-only walk misses. Close those two blindness classes and the
   audit becomes a real zero-target completeness gauge.
 
+  Both blindness classes closed next stretch: the hierarchy walk now
+  also consults `memberDecls` (the builtin headers' rows carry no
+  method FuncIds — their members live in decl_sigs; this recovered
+  `Int.and/shl/toByte`) and the per-class `hierarchy_shadow_names` set
+  (the registry's transitive member-name record, which carries
+  PROPERTIES — `size`/`length`/`entries`). Audit on the hello probe:
+  1,281 -> **142** member rows (839 extension-aligned, 300
+  member-aligned). The sampled 142 are dominated by PROGRAM-SCOPING —
+  lazy extensions (`UInt.takeHighestOneBit`, `String.toUByte`) that a
+  println-only program never lowers — which the audit doc already
+  frames as the lower-bound contract, plus a handful of JVM-surface
+  natives klio serves (`MutableMap.merge/putIfAbsent`).
+
 ### The untyped-local tail now has a five-file repro
 
 Following this plan's own note — bisect the file set, do not write a small

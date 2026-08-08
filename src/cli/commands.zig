@@ -1167,9 +1167,21 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
             member_missing += 1;
             // `KLIO_DECL_AUDIT=members` lists them: the builtin-type members
             // are the last declaration hole, and grouping them by owner is
-            // what sizes the work per type.
-            if (std.mem.eql(u8, runtime.envOnce("KLIO_DECL_AUDIT") orelse "", "members"))
-                io.printStdout(gpa, "[decl-audit] member: {s}\n", .{fqn});
+            // what sizes the work per type. The owner's class-row state is
+            // printed with each row — a hole whose owner has NO row (or an
+            // empty method list) is audit blindness, not a resolution gap.
+            if (std.mem.eql(u8, runtime.envOnce("KLIO_DECL_AUDIT") orelse "", "members")) {
+                const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+                const owner_cid2: ?ir.ClassId = module.classIdByFqn(pkg) orelse
+                    module.uniqueClassIdBySimpleName(owner_simple);
+                _ = simple;
+                if (owner_cid2) |oc| {
+                    const nm = if (oc.int() < module.classes.items.len) module.classes.items[oc.int()].methods.len else 0;
+                    io.printStdout(gpa, "[decl-audit] member: {s} (owner row, {d} methods)\n", .{ fqn, nm });
+                } else {
+                    io.printStdout(gpa, "[decl-audit] member: {s} (no owner row)\n", .{fqn});
+                }
+            }
             continue;
         }
         // A registry key that names the same callable under a different

@@ -2239,6 +2239,16 @@ pub const Module = struct {
                 if (std.mem.eql(u8, mf.name, name)) return true;
             }
         }
+        // The builtin headers' rows often carry NO method FuncIds — their
+        // member declarations live in decl_sigs and reach dispatch through
+        // the member-name index instead.
+        if (self.memberDecls(c.fqn, name).len != 0) return true;
+        // PROPERTY members (`size`, `length`, `entries`) appear in neither
+        // list; the hierarchy shadow-name set is the registry's transitive
+        // member-name record and carries them.
+        if (self.registry.hierarchy_shadow_names.get(c.name)) |hs| {
+            if (hs.names.contains(name)) return true;
+        }
         for (c.supertypes) |p| {
             if (self.classHierarchyDeclaresMemberDepth(p, name, depth + 1)) return true;
         }
