@@ -5292,3 +5292,30 @@ disturb — `add`/`add(index)`/`set`/`removeAt`/`addAll`/`remove`/`subList` on a
 list, the set and map forms, and a `listIterator` walking backwards.
 
 Green: commontest 117/0, drift 267/267, litmus 42/43 (known timeout), units.
+
+### The other non-wrapper variants, and where the channel ends
+
+`Array` holds its elements inline, a `StringBuilder` its bytes, a
+`Comparator` its comparison — none is a discriminant over a payload the
+intrinsic would have to unpack, so they take the same direct call:
+
+    slot walks   80 -> 60
+
+That is where this channel ends for now. What is left is a real tail, and
+each entry is a DIFFERENT reason rather than one more variant:
+
+    25  KClass.isInstance          reflection receiver, not a host container
+    13  Comparator.compare         reached without a class-keyed intrinsic
+     5  IntArray.get / Array.get   a `get` whose FQN probe misses
+     4  ArrayList.iterator
+     3  Any.toString
+
+Session total on this channel: 68,987 -> 60, and the mechanism changed
+rather than being special-cased — the name-keyed shortcut added early in the
+campaign was deleted once the FuncId binding covered its cases.
+
+Every step measured FLAT on wall clock (28.4-29.0s across six independent
+changes against a 28.6s baseline). That is the honest summary: this work
+buys contract conformance — a call reaching its implementation by id rather
+than by string, which is what a bytecode VM and the C backend can express —
+and not speed.

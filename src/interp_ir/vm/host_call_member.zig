@@ -10026,7 +10026,11 @@ pub fn invokeVirtualMember(
                         // `Result` and the iterator generators are the shapes
                         // whose conversion lives on the named path.
                         switch (receiver.*) {
-                            .List, .Set, .Map => {
+                            // `Array` holds its elements inline, a
+                            // `StringBuilder` its bytes, a `Comparator` its
+                            // comparison — none of them a discriminant over a
+                            // payload the intrinsic would have to unpack.
+                            .List, .Set, .Map, .Array, .StringBuilder, .Comparator => {
                                 var argbuf = try allocator.alloc(Value, args.len + 1);
                                 defer allocator.free(argbuf);
                                 argbuf[0] = receiver.*;
