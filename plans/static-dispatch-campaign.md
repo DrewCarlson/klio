@@ -5641,3 +5641,37 @@ Residue, deliberately not chased: with BOTH `<S, T : S>` and `<S, T>`
 overloads of the same name and arity declared, the call still resolves no
 target (ranking between two applicable generic candidates). The stdlib
 declares no such twin pair; noted here so it is not rediscovered as new.
+
+### A tie on the lambda return alone still lends the lambda param types
+
+The next cluster in the remaining 150 `no_receiver_type` sites named
+itself once the bareret no-receiver row gained `at=file:line`: the
+`take`/`orEmpty` chains inside `flatMap` / `flatMapIndexed` lambdas
+(CollectionTest.kt:57-58, 67-68). The mechanism, walked with
+`KLIO_REX_TRACE`: the two stdlib overloads differ ONLY in the lambda's
+declared RETURN (`(Int, T) -> Iterable<R>` vs `-> Sequence<R>`), both
+survive ranking with EQUIVALENT keys (`extensionKeyEquivalent` compares 7
+of 8 components; the 8th is the fid tiebreaker), and the tied exit
+returned `.applicable = true` with no target — correct for dispatch, but
+the lowering path at the deferred CallMember emit only seeded lambda
+param types from `ext.target orelse ext.sole_unknown`, so `index`/`it`
+lowered untyped and every chained call off them left the census.
+
+The deferral itself is right (kotlinc needs the lambda body's return to
+pick), so the fix widens the TYPING channel, not the commitment:
+`resolveExtensionCall` now collects the tied fids and, when every tied
+candidate declares the same parameter list up to function-RETURN
+positions, exports one of them as `param_rep` — a field only
+lambda-parameter typing may read (`sole_unknown` was not widened because
+`bareExtensionTarget` reads it for RETURN types, and tied returns
+genuinely differ). The deferred emit consumes `target orelse sole_unknown
+orelse param_rep`.
+
+Pins: `ir.test.a tie on the lambda return alone still lends the lambda
+param types` (agreeing pair yields `param_rep`, a pair differing in a
+lambda PARAMETER position yields null), and the behaviour fixture
+`overload_tied_on_lambda_return` (nullable source through both
+flatMap/flatMapIndexed variants).
+
+Census: `no_receiver_type` 150 -> 132, total 9049 -> 9040, bound share
+98.34% (bound_static 1607 -> 1611, bound_virtual 7274 -> 7279).

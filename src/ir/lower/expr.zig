@@ -16892,8 +16892,12 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         if (!any_lambda) break :blk;
         const ext = try resolveExtensionCallForArgs(b, recv_ty, name, args, ast_arg_names);
         // Typing-only consumer: the withheld strict-key winner's param
-        // types are as good as a committed target's for the closures.
-        const target_id = ext.target orelse ext.sole_unknown orelse break :blk;
+        // types are as good as a committed target's for the closures, and
+        // so are a TIED set's when every candidate declares the same
+        // parameter list up to function-return positions (`flatMapIndexed`
+        // overloads on the lambda's return alone).
+        const target_id = ext.target orelse ext.sole_unknown orelse
+            ext.param_rep orelse break :blk;
         const target = b.module.funcById(target_id) orelse break :blk;
         var rt = recv_ty;
         deferred_lambda_param_types = try argLambdaParamTypesRecv(

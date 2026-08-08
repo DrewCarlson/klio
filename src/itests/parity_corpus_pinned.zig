@@ -2426,6 +2426,16 @@ test "null_literal_widens_type_argument" {
     );
 }
 
+test "overload_tied_on_lambda_return" {
+    try check("overload_tied_on_lambda_return",
+        \\[f, o, b, a, r]
+        \\[f, o, b, a, r]
+        \\[f, o, o, b, a, r]
+        \\[f, o, o, b, a, r]
+        \\
+    );
+}
+
 test "type_param_bounded_by_type_param" {
     try check("type_param_bounded_by_type_param",
         \\foobar/foo/2/list-typed

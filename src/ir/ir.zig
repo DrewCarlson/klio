@@ -1955,6 +1955,13 @@ pub const Module = struct {
         /// must NOT, dispatch commitment still requires proof (the
         /// trimIndent hazard is precisely about emission).
         sole_unknown: ?FuncId = null,
+        /// A TIED set whose candidates all declare the same parameter list
+        /// except each function-typed parameter's RETURN position — the
+        /// `flatMapIndexed` shape, overloaded on the lambda's return alone.
+        /// Only LAMBDA-PARAMETER typing may read this candidate: the tie is
+        /// real (return types and dispatch identity stay unresolved), but
+        /// every candidate hands the closure the same parameter types.
+        param_rep: ?FuncId = null,
     };
 
     /// One ambiguous bare-call diagnostic: the call-site name and span
@@ -4187,6 +4194,40 @@ pub const Module = struct {
         return std.mem.eql(i32, a[0..7], b[0..7]);
     }
 
+    /// True when two function-typed parameter refs agree on everything a
+    /// closure body can observe: same arity head and same argument types in
+    /// every position but the LAST (the function's return).
+    fn functionParamArgsAgree(a: TypeRef, b: TypeRef) bool {
+        if (!std.mem.eql(u8, staticTypeHead(a.name), staticTypeHead(b.name))) return false;
+        if (a.args.len != b.args.len or a.args.len == 0) return false;
+        for (a.args[0 .. a.args.len - 1], b.args[0 .. b.args.len - 1]) |aa, ba| {
+            if (!aa.eql(ba)) return false;
+        }
+        return true;
+    }
+
+    /// A representative for LAMBDA-PARAMETER typing out of a tied candidate
+    /// set: non-null only when every candidate declares the same parameter
+    /// list up to function-return positions, so whichever overload the tie
+    /// eventually resolves to hands the closures the same parameter types.
+    fn tiedLambdaParamRep(self: *const Module, fids: []const FuncId) ?FuncId {
+        if (fids.len < 2) return null;
+        const first = self.funcById(fids[0]) orelse return null;
+        for (fids[1..]) |fid| {
+            const other = self.funcById(fid) orelse return null;
+            if (other.params.len != first.params.len) return null;
+            for (first.params, other.params) |fp, op| {
+                if (fp.ty.eql(op.ty)) continue;
+                const fh = staticTypeHead(fp.ty.name);
+                const is_fn = std.mem.startsWith(u8, fh, "Function") or
+                    std.mem.startsWith(u8, fh, "SuspendFunction") or
+                    std.mem.startsWith(u8, fh, "KFunction");
+                if (!is_fn or !functionParamArgsAgree(fp.ty, op.ty)) return null;
+            }
+        }
+        return fids[0];
+    }
+
     fn staticReceiverCouldAccept(self: *const Module, fid: FuncId, receiver: TypeRef, param: TypeRef) bool {
         return self.staticReceiverCompatibility(fid, receiver, param) != .incompatible;
     }
@@ -4978,6 +5019,7 @@ pub const Module = struct {
         var best_recv_param: ?TypeRef = null;
         var best_fid_for_recv: ?FuncId = null;
         var tied = false;
+        var tied_ids: std.ArrayList(FuncId) = .empty;
         for (ranked_sigs.items, ranked_ids.items, ranked_unknowns.items) |*sig, fid, unknown| {
             const maybe_score = applicability.applicable(sig, proof_args, ranked_scope);
             if (maybe_score == null and runtime.envSetOnce("KLIO_REX_TRACE")) {
@@ -5000,8 +5042,11 @@ pub const Module = struct {
                 best_recv_param = if (sig.params.len != 0) sig.params[0].ty else null;
                 best_fid_for_recv = fid;
                 tied = false;
+                tied_ids.clearRetainingCapacity();
+                tied_ids.append(sa, fid) catch return .{};
             } else if (extensionKeyEquivalent(key, best_key)) {
                 tied = true;
+                tied_ids.append(sa, fid) catch return .{};
             }
         }
         const renamed_best = if (best) |target|
@@ -5087,7 +5132,11 @@ pub const Module = struct {
         if (tied or
             (best_unknown and !receiver_supplies_lambda and !renamed_best and
                 !sole_survivor and !refuted_member_strict_winner))
-            return .{ .applicable = true, .sole_unknown = if (!tied) best else null };
+            return .{
+                .applicable = true,
+                .sole_unknown = if (!tied) best else null,
+                .param_rep = if (tied) self.tiedLambdaParamRep(tied_ids.items) else null,
+            };
         const dispatch_owner = if (best) |target|
             (if (self.registry.member_ext_owner_class.get(target)) |owner|
                 self.classIdByFqn(owner)
@@ -13352,6 +13401,86 @@ test "extension resolver substitutes bounded caller type parameters" {
         .caller_package = "app",
     });
     try testing.expectEqual(generic, concrete.target.?);
+}
+
+test "a tie on the lambda return alone still lends the lambda param types" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    // Two `Iterable<T>.flatMapX(transform)` overloads whose lambdas differ
+    // only in RETURN type (`Iterable<R>` vs `Sequence<R>`) — the
+    // `flatMapIndexed` shape. The tie is genuine, but both candidates hand
+    // the closure the same parameter types, so param_rep names one of them.
+    const fids = [_]FuncId{
+        try pushTestFuncOpts(&m, a, "flatMapX", "kotlin.collections.flatMapX", "kotlin.collections", 1, .{ .extension = true }),
+        try pushTestFuncOpts(&m, a, "flatMapX", "kotlin.collections.flatMapX", "kotlin.collections", 1, .{ .extension = true }),
+    };
+    const lambda_return_heads = [_][]const u8{ "Iterable", "Sequence" };
+    for (fids, lambda_return_heads) |fid, ret_head| {
+        m.funcs.items[fid.int()].kind = .top_level_extension;
+        const recv_args = try a.alloc(TypeRef, 1);
+        recv_args[0] = .{ .name = "T", .nullable = false, .args = &.{} };
+        m.funcs.items[fid.int()].params[0].ty = .{ .name = "Iterable", .nullable = false, .args = recv_args };
+        const ret_args = try a.alloc(TypeRef, 1);
+        ret_args[0] = .{ .name = "R", .nullable = false, .args = &.{} };
+        const lam_args = try a.alloc(TypeRef, 3);
+        lam_args[0] = .{ .name = "Int", .nullable = false, .args = &.{} };
+        lam_args[1] = .{ .name = "T", .nullable = false, .args = &.{} };
+        lam_args[2] = .{ .name = ret_head, .nullable = false, .args = ret_args };
+        m.funcs.items[fid.int()].params[1].ty = .{ .name = "Function2", .nullable = false, .args = lam_args };
+        var tps: std.ArrayList([]const u8) = .empty;
+        try tps.append(a, "T");
+        try tps.append(a, "R");
+        try m.registry.func_type_params.put(fid, tps);
+    }
+    try m.rebuildFuncNameIndex(a);
+
+    const recv_string = try a.alloc(TypeRef, 1);
+    recv_string[0] = .{ .name = "String", .nullable = false, .args = &.{} };
+    var shapes = [_]applicability.ArgShape{
+        .{ .is_lambda = true, .lambda_arity = 2 },
+    };
+    const res = m.resolveExtensionCall(
+        "flatMapX",
+        .{ .name = "Iterable", .nullable = false, .args = recv_string },
+        &shapes,
+        .{ .caller_file = FileId.from(0), .caller_package = "app" },
+    );
+    try testing.expect(res.target == null);
+    try testing.expect(res.applicable);
+    try testing.expectEqual(fids[0], res.param_rep.?);
+
+    // Overloads that also differ in a lambda PARAMETER position lend
+    // nothing: whichever wins changes what the closure body sees.
+    const third = try pushTestFuncOpts(&m, a, "flatMapY", "kotlin.collections.flatMapY", "kotlin.collections", 1, .{ .extension = true });
+    const fourth = try pushTestFuncOpts(&m, a, "flatMapY", "kotlin.collections.flatMapY", "kotlin.collections", 1, .{ .extension = true });
+    const param_heads = [_][]const u8{ "Int", "Long" };
+    for ([_]FuncId{ third, fourth }, param_heads) |fid, param_head| {
+        m.funcs.items[fid.int()].kind = .top_level_extension;
+        const recv_args = try a.alloc(TypeRef, 1);
+        recv_args[0] = .{ .name = "T", .nullable = false, .args = &.{} };
+        m.funcs.items[fid.int()].params[0].ty = .{ .name = "Iterable", .nullable = false, .args = recv_args };
+        const lam_args = try a.alloc(TypeRef, 3);
+        lam_args[0] = .{ .name = param_head, .nullable = false, .args = &.{} };
+        lam_args[1] = .{ .name = "T", .nullable = false, .args = &.{} };
+        lam_args[2] = .{ .name = "Any", .nullable = false, .args = &.{} };
+        m.funcs.items[fid.int()].params[1].ty = .{ .name = "Function2", .nullable = false, .args = lam_args };
+        var tps: std.ArrayList([]const u8) = .empty;
+        try tps.append(a, "T");
+        try m.registry.func_type_params.put(fid, tps);
+    }
+    try m.rebuildFuncNameIndex(a);
+    const res2 = m.resolveExtensionCall(
+        "flatMapY",
+        .{ .name = "Iterable", .nullable = false, .args = recv_string },
+        &shapes,
+        .{ .caller_file = FileId.from(0), .caller_package = "app" },
+    );
+    try testing.expect(res2.target == null);
+    try testing.expect(res2.param_rep == null);
 }
 
 test "dependent bound with unbound referenced parameter does not refute" {
