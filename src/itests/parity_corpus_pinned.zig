@@ -2450,6 +2450,14 @@ test "index_set_fast_path" {
     );
 }
 
+test "bare_call_return_typing" {
+    try check("bare_call_return_typing",
+        \\3
+        \\S4
+        \\
+    );
+}
+
 test "lambda_return_overload_pick" {
     try check("lambda_return_overload_pick",
         \\6

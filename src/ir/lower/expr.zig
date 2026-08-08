@@ -10270,6 +10270,56 @@ fn localFnReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error
     return try ret.clone(b.allocator);
 }
 
+/// The declared return of a BARE top-level / extension call, when the
+/// call-site evidence commits one candidate: an `as`-cast pick, the trailing
+/// lambda's derived return (the sumOf family), or a sole arity-matching
+/// body-carrying candidate. `val totalSizeLong = sumOf { it.size.toLong() }`
+/// types Long here; an unresolvable set stays untyped.
+fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (call_expr.* != .Call) return null;
+    const call = call_expr.Call;
+    if (call.callee.* != .Path or call.callee.Path.segments.len != 1) return null;
+    const seg = call.callee.Path.segments[0];
+    const nm = seg.name;
+    if (b.resolve(nm) != null or b.knowsOuter(nm) or b.isLocalFn(nm)) return null;
+    const cands = try b.module.bareCallCandidates(b.allocator, nm, seg.span.file);
+    defer b.allocator.free(cands);
+    if (cands.len == 0) return null;
+    const want = call.args.len;
+    var pick: ?FuncId = (try overloadPickByCast(b, cands, call.args, want)) orelse
+        try overloadPickByLambdaReturn(b, cands, call.args, want);
+    if (pick == null) {
+        var sole: ?FuncId = null;
+        for (cands) |fid| {
+            const f = b.module.funcById(fid) orelse continue;
+            if (!f.hasBody()) continue;
+            const base: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+            if (f.params.len -| base != want) continue;
+            if (sole != null) return null;
+            sole = fid;
+        }
+        pick = sole;
+    }
+    const fid = pick orelse return null;
+    const f = b.module.funcById(fid) orelse return null;
+    if (!f.return_ty_declared or f.return_ty.name.len == 0) return null;
+    if (bareTypeParamHead(f.return_ty.name) or
+        ir.parseClassTypeParamIdentity(f.return_ty.name) != null) return null;
+    if (staticTypeClassId(b, f.return_ty) == null) return null;
+    // A generic return keeps only its head unless every argument is
+    // concrete — a poisoned `List<T>` record disproves more than it types.
+    for (f.return_ty.args) |arg| {
+        if (bareTypeParamHead(arg.name) or ir.parseClassTypeParamIdentity(arg.name) != null) {
+            return .{
+                .name = try b.allocator.dupe(u8, f.return_ty.name),
+                .nullable = f.return_ty.nullable,
+                .args = &.{},
+            };
+        }
+    }
+    return try f.return_ty.clone(b.allocator);
+}
+
 fn staticCallReturnTypeRef(
     b: *FuncBuilder,
     call_expr: *const Expr,
@@ -10277,6 +10327,7 @@ fn staticCallReturnTypeRef(
     if (try fnTypedCalleeReturnTypeRef(b, call_expr)) |t| return t;
     if (try fqnCallReturnTypeRef(b, call_expr)) |t| return t;
     if (try localFnReturnTypeRef(b, call_expr)) |t| return t;
+    if (try bareCallReturnTypeRef(b, call_expr)) |t| return t;
     if (try memberCallReturnTypeRef(b, call_expr)) |t| return t;
     if (try bareMemberReturnTypeRef(b, call_expr)) |t| return t;
     if (call_expr.* == .Binary) {

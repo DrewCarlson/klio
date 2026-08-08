@@ -6247,3 +6247,19 @@ body, recorded here as its own follow-up. no_receiver_type stays 89.
 
 Pinned: `lambda_return_overload_pick`. Battery: 117/0, corpus 267/267,
 litmus 42/43 (known flake), unit green, compose 1349/0.
+
+### The derivation channel gains its bare-call return arm
+
+`staticCallReturnTypeRef` had no arm for a BARE top-level / extension
+call at all — `val totalSizeLong = sumOf { it.size.toLong() }` inside
+`flatten` derived nothing (the whole `local_no_decl_type` dying-init
+family shares this hole). The new `bareCallReturnTypeRef` commits by
+the same call-site evidence the emission uses — the `as`-cast pick, the
+lambda-return pick, or a SOLE arity-matching body-carrying candidate —
+and answers the winner's declared return, head-only when the return's
+type arguments are not concrete (a poisoned `List<T>` record disproves
+more than it types). no_receiver_type 89 -> 87; the month/doyEst rows
+remain (their inits resolve names with overloads and no receiver
+context for the pick's filter). Pinned: `bare_call_return_typing`.
+Battery: 117/0, corpus 267/267, litmus 42/43 (known flake), unit green,
+compose 1350/0.
