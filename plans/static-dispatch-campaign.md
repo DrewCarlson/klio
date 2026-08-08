@@ -5470,7 +5470,27 @@ is the one structural feature separating it from the extensions that do
 resolve here, and it is where the next attempt should look — not at erasure,
 and not at the receiver.
 
-That is three refuted hypotheses on this tail (null-argument applicability,
-`expect`/`actual` merging, bound-erasure argument loss). Each was plausible
-from the outside and wrong; each cost a build-and-measure cycle. The repro
-above makes the next one cost seconds instead.
+Two further hypotheses were then tested against the five-file repro and BOTH
+are wrong:
+
+- NOT the `T : S` bound. A hand-written
+  `fun <S, T : S> Iterable<T>.myReduce(op: (S, T) -> S): List<S>` called on an
+  `Iterable<String>` local types its result correctly, and so does the
+  plain-bound sibling beside it.
+- NOT the enclosing class shape. A standalone
+  `abstract class B<T : Iterable<String>>(val createFrom: (Array<out String>) -> T)`
+  with `fun createFrom(vararg items: String): T`, `val data = createFrom(...)`,
+  and even an enclosing `@Test fun runningReduce()` colliding with the
+  extension's own name, types `data.runningReduce { ... }` fine.
+
+So five hypotheses are now refuted on this tail: null-argument
+applicability, `expect`/`actual` merging, bound-erasure argument loss, the
+`T : S` bound, and the enclosing-class/member-collision shape. The
+distinguishing feature is still somewhere in `IterableTests.kt` that a
+faithful reconstruction of its class header does NOT carry.
+
+The next attempt should bisect WITHIN the file — delete members of
+`IterableTests` until `runningReduce`'s site types — rather than reconstruct
+the class from the outside, which is what these two attempts did and what
+made them cost a cycle each. The five-file harness makes each bisection step
+a few seconds.
