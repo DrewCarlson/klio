@@ -5492,6 +5492,27 @@ the builtin slot gap; raising the compose runTest cap (cost two whole classes).
   param types only for the COMMITTED-callee case, which the refutation
   never isolated. Left for a stretch with room to re-measure that
   distinction.
+- `member_ladder` 2,944 -> **1,268**, and the walks stay at zero. The
+  for-loop DESUGAR was the representational gap: it always emitted bare
+  DYN `CallMember` for `iterator`/`hasNext`/`next`. When the iterable's
+  `iterator()` return resolves to the `Iterator` interface or a
+  primitive-iterator abstract class, `hasNext`/`next` now emit
+  SLOT-BOUND against the interface roots (preferring the head class's
+  own overrides); convention-based custom iterators keep the by-name
+  form. The first cut surfaced a downstream hole — the abstract
+  `next()` source body delegates to `nextInt()`-family members whose
+  slots the host op did not cover — closed by admitting the
+  `kotlin.collections.*Iterator` owners and the `nextX` names to the
+  `iterator_protocol` op (`isIteratorNext` already served them). The
+  family widening then broke `compose_path` in the corpus: the
+  name-suffix gate (`endsWith "Iterator"`) matched a PACK class
+  (compose's path iterators) whose dispatch story is its own — the
+  gate now also requires the class fqn to start `kotlin.collections.`.
+  A suffix is not a family; the fqn is.
+  The remaining 1,268: `Result.fold` (a wrapper — deliberately on the
+  walk per the recorded hazard), test-fixture user classes, and small
+  `Int.until`/`IntRange.iterator` rows.
+
 - `member_ladder` 12,421 -> 2,944. The ladder key now carries the
   ENCLOSING FUNCTION (`<ladder>Type.name@fn`), which named the total as
   a few hot sites times execution counts: `this[index] = v` inside the

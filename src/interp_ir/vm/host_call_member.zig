@@ -9816,8 +9816,14 @@ fn hostSlotOpFor(module: *const Module, target: FuncId) ?HostSlotOp {
         const iter_owner = std.mem.eql(u8, owner, "kotlin.collections.Iterator") or
             std.mem.eql(u8, owner, "kotlin.collections.MutableIterator") or
             std.mem.eql(u8, owner, "kotlin.collections.ListIterator") or
-            std.mem.eql(u8, owner, "kotlin.collections.MutableListIterator");
-        if (iter_owner and isIteratorProtocol(name)) break :blk .iterator_protocol;
+            std.mem.eql(u8, owner, "kotlin.collections.MutableListIterator") or
+            // The primitive-iterator abstract classes: their `next()` source
+            // body delegates to `nextInt()`-family members the host serves
+            // through the same protocol handler.
+            (std.mem.startsWith(u8, owner, "kotlin.collections.") and
+                std.mem.endsWith(u8, owner, "Iterator"));
+        if (iter_owner and (isIteratorProtocol(name) or isIteratorNext(name)))
+            break :blk .iterator_protocol;
         // `iterator()` on a collection: the host builds the iterator from the
         // receiver's own representation, and no native is registered under
         // the interface's FQN either.
