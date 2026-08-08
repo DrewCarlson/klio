@@ -1443,3 +1443,46 @@ work off the dynamic paths with the wall clock FLAT (28.4-28.6s across four
 independent changes). The case for this item is contract conformance for a
 bytecode VM and the C backend — which is what the goal asks for — and not
 speed. Sizing it honestly is part of deciding it.
+
+### The builtin-member mechanism is proven, and blocked on `actual` interfaces
+
+The pilot for task #16 answers the question the sizing note left open: a
+declaration DOES produce the slot entries, and the payoff is measurable.
+
+Declaring the collection interfaces in a klio-authored source
+(`kotlin-collections/CollectionBuiltins.kt`, added to
+`KLIO_STDLIB_ACTUAL_FILES`) — `Collection`, `MutableCollection`, `List`,
+`MutableList`, `Set`, `MutableSet`, signatures only — moved the slot walks:
+
+    baseline                       5,893
+    plain `interface` declarations 5,189      (-704)
+
+`Collection.isEmpty` 192 -> 0, `MutableCollection.add` 456 -> 0,
+`List.get` 96 -> 0. Commontest stayed 117/0. So the mechanism is right: a
+member with a `FuncId` gives `methodSlotTarget` an entry, and the call
+dispatches by slot instead of walking a name.
+
+The blocker is the FORM. Upstream declares these as `expect interface` in
+`kotlin/Collections.kt`, which klio already compiles, so the correct klio
+declaration is an `actual`. With `actual`:
+
+    actual interface declarations  5,893      (no change at all)
+    and `Collection.isEmpty` goes to 192 — ABOVE the 146 baseline
+
+So the `actual` form does not merely fail to help, it leaves a state that
+resolves WORSE than no declaration. `retainDecl` drops the superseded
+`expect` (`!(c.is_expect and actual_class_names_set.contains(...))`), and
+`is_actual` is recorded for interfaces (`parser/class.zig`), so the
+suppression fires — but the surviving `actual` interface's members do not
+end up with the slot entries the plain declaration produces.
+
+The plain form works only because the `expect` and the klio declaration
+BOTH survive and klio prefers the one with members. That is a duplicate FQN
+declaration, not valid Kotlin, and shipping it would be working around this
+bug rather than fixing it — so the pilot is reverted rather than landed.
+
+The next step is therefore not "write 1,281 signatures". It is: find why an
+`actual` interface's members produce no `(class, slot)` entry when the same
+members in a plain interface do. That is a contained question with a
+one-file repro, and -704 walks are waiting behind it in the collections
+alone.
