@@ -5947,6 +5947,47 @@ arithmetic then mixes Duration-valued and Long-valued marks). Making
 construction/erasure uniform would let value-class finals go direct
 again and retire this gate.
 
+### The erased-receiver ROOT was a misdiagnosis; the gate retires
+
+Reopened with the erased-form probe (`KLIO_VC_DIRECT=1` at both demotion
+sites, then the full failure anatomy under `KLIO_ERR_TRACE`): the
+receiver was NEVER erased. Both Duration and ValueTimeMark box as
+ordinary Instances (`ValueTimeMark(reading=23000)` straight from
+`markNow()`), and the frame dump for the TimeMarkTest failure shows
+`ValueTimeMark.minus(other)` entered with `this = Instance Duration,
+other = Instance Duration` — a mis-typed SITE, not a mis-represented
+value. TimeMarkTest.kt:397 `elapsedMark - baseMark` is mark-minus-mark
+(returns Duration), but the LAZY deriver's Binary class-operator arm
+picked the member by the `{class}\x00{name}\x00{arity}` registry key —
+FIRST-registered `minus/1` wins, argument type never consulted — and
+ValueTimeMark declares three `minus/1` overloads whose returns diverge
+(`minus(Duration): ValueTimeMark` is declared first). The locals typed
+ValueTimeMark, so line 399's Duration-minus-Duration committed into the
+mark's own `minus(ValueTimeMark)` body, which read `.reading` off
+Durations. The walk had always absorbed the same wrong commit by
+re-dispatching on the runtime class.
+
+Fix at the root: the lazy arm now resolves the operator member through
+`resolveMemberCall` with the rhs's own lazy type as argument evidence
+(mirroring the `staticCallReturnTypeRef` Binary arm — the two-channel
+trap's last member), and an unresolvable overload set stays untyped
+instead of guessing. Census unchanged (96/2/6 unbound, 98.85% bound):
+the registry shortcut's answers were either right or silently wrong,
+never load-bearing.
+
+With the site fixed, the full commontest sweep runs 117/0 under
+`KLIO_VC_DIRECT=1`, so the demotion guarded nothing: BOTH gates retire
+(`resolveMemberCall`'s day-one `is_value -> virtual` and
+`dispatchForTarget`'s host-symbol carve-out). Value-class finals take
+the ordinary direct rule again (~820 sites back to direct); the
+emission-side `dispatchForTarget` upgrade for stub/value owners keeps
+serving the Result/Uuid host-variant family exactly as before. No
+representation-uniformity work is needed for dispatch: Instance-boxed
+families (Duration, ValueTimeMark) and host-variant families (Result,
+unsigned scalars) are each internally consistent, and the direct rule
+is correct for both because a final's fid never depends on which
+representation arrives.
+
 ### Closure: the splice-window tower, the class-named member read, and the honest census
 
 Three final mechanisms landed together, taking the census to its closure

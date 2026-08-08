@@ -1593,3 +1593,10 @@ dynamic-by-design, 104 in the enumerated typing tail (each tail site
 already emits form 4, so the contract holds for them too; further typing
 work only MOVES sites from form 4 to forms 1/2, never changes the
 contract).
+
+Value-class finals take form 1 like any final class: the demotion that
+held them on form 2 retired once the TimeMarkTest failure it served was
+root-fixed as a deriver overload-selection bug (the campaign plan's
+"erased-receiver ROOT was a misdiagnosis" section). The retirement moved
+1,200 census sites from form 2 to form 1 (bound_static 791 -> 1,991)
+with the unbound tail unchanged.

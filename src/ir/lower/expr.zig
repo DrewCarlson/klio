@@ -19548,8 +19548,10 @@ test "shared member resolution selects overloads and dispatch forms" {
     try testing.expectEqual(final_pick, stub_result.target.?);
     m.classes.items[owner.int()].is_stub = false;
     m.classes.items[owner.int()].is_value = true;
+    // A value-class receiver arrives boxed like any instance, so its final
+    // members take the ordinary direct rule.
     const value_result = m.resolveMemberCall(owner, "finalPick", int_shapes, .{});
-    try testing.expectEqual(ir.Module.MemberDispatch.virtual, value_result.dispatch);
+    try testing.expectEqual(ir.Module.MemberDispatch.direct, value_result.dispatch);
     try testing.expectEqual(final_pick, value_result.target.?);
     m.classes.items[owner.int()].is_value = false;
     m.decl_sigs.getPtr(final_pick.int()).?.has_body = false;
