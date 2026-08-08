@@ -5175,3 +5175,36 @@ length difference, and the `ignoreCase` fold) so the coverage is real.
 Pinned by `char_compare_to_code_difference`. Green: commontest 117/0, drift
 267/267, litmus 42/43 (known timeout), units, compose exit 0 / 1342 passed,
 0 did not complete (baseline 1305).
+
+### The slot contract, stated accurately
+
+`CallVirtual`'s definition claimed:
+
+    runtime work is one `(receiver ClassId, slot) -> FuncId` lookup,
+    never a method-name search
+
+and `invokeVirtualMember` performs that search. Both could not be true; the
+comment was the aspiration, and `KLIO_SLOT_BYNAME` exists because of it.
+
+After this session's channels the residue is 5,893, and it is one shape:
+
+    4,834  add       root=kotlin.collections.ArrayList.add
+      450  add       root=kotlin.collections.MutableCollection.add
+      184  iterator  root=kotlin.collections.Iterable.iterator
+      146  isEmpty   root=kotlin.collections.Collection.isEmpty
+      ...  everything else under 100
+
+Every one is a HOST-BACKED collection receiver. The value reports a
+collection interface as its type; that interface has no Kotlin declaration in
+any source klio reads (the same `js/builtins` gap task #16 names), so
+`methodSlotTarget` has nothing to return.
+
+So the contract cannot be made true by a change to the instruction or to the
+host — it is blocked on declaring the builtin members, and pretending
+otherwise in the IR definition is what makes the next reader chase the wrong
+mechanism. The comment now states what holds, for which receivers, and what
+the remaining gap is. The claim gets restored when the declarations land.
+
+The iterator-protocol shortcut earlier in this plan is deliberately NOT the
+model to copy here: it removed a ladder prefix, not the name search, so
+repeating it for `add` would move the count without changing the contract.

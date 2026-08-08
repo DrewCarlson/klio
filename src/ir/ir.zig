@@ -489,8 +489,18 @@ pub const Inst = union(enum) {
         dispatch_receiver: ?Reg = null,
     },
     /// Virtual member call whose overload was resolved statically. `slot`
-    /// names the selected declaration's override family; runtime work is one
-    /// `(receiver ClassId, slot) -> FuncId` lookup, never a method-name search.
+    /// names the selected declaration's override family.
+    ///
+    /// The intended runtime work is one `(receiver ClassId, slot) -> FuncId`
+    /// lookup. That holds for every receiver whose class carries slot entries,
+    /// which is every user-declared class. It does NOT yet hold for a
+    /// HOST-BACKED receiver: a `.List`/`.Set`/`.Map` value reports a
+    /// collection interface as its type, that interface has no Kotlin
+    /// declaration in any source klio reads, so `methodSlotTarget` has nothing
+    /// to return and `invokeVirtualMember` falls back to a member-name walk.
+    /// `KLIO_SLOT_BYNAME` counts those; they are the gap between this comment
+    /// and the implementation, and closing it is the builtin-member
+    /// declaration work, not a change to this instruction.
     CallVirtual: struct {
         dst: Reg,
         receiver: Reg,
