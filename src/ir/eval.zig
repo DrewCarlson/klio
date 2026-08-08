@@ -1091,12 +1091,18 @@ pub fn dispatchNote(comptime k: DispatchKind) void {
     dispatchBump(k);
 }
 
+/// Installed by the VM host so the stats dump can report how many named
+/// member calls the builtin intrinsic replay served outright. `member_ladder`
+/// counts the ROUTE a call took, not the work it did, so the two differ.
+pub var dispatch_replay_hits: ?*const fn () u64 = null;
+
 pub fn dispatchStatsDump() void {
     if (dispatch_stats_state != 2) return;
     var total: u64 = 0;
     for (&dispatch_counts) |*c| total += c.load(.monotonic);
     if (total == 0) return;
     std.debug.print("[dispatch-stats] total={d}\n", .{total});
+    if (dispatch_replay_hits) |f| std.debug.print("[dispatch-stats] replay-hits={d}\n", .{f()});
     inline for (@typeInfo(DispatchKind).@"enum".fields) |f| {
         const n = dispatch_counts[f.value].load(.monotonic);
         if (n != 0) std.debug.print("[dispatch-stats] {d:>12} {d:>6.2}%  {s}\n", .{ n, @as(f64, @floatFromInt(n)) * 100.0 / @as(f64, @floatFromInt(total)), f.name });

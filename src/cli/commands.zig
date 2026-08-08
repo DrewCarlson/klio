@@ -697,6 +697,7 @@ fn runTestsOnBuilt(
     });
     if (runtime.envOnce("KLIO_PUMP_DIAG") != null) interp_ir.coroutines_diag.dumpSleepCounts();
     ir.eval.callStatsDump();
+    ir.eval.dispatch_replay_hits = &interp_ir.VmHost.replayHits;
     ir.eval.dispatchStatsDump();
     if (runtime.envOnce("KLIO_DISPATCH_STATS") != null) {
         ir.lower.expr.lowerSitesDump();
@@ -1022,6 +1023,7 @@ pub fn runBuiltModuleArgs(
     const res = runMainBigStack(&vm, main, stdout.output());
     runtime.prof.maybeReport();
     ir.eval.callStatsDump();
+    ir.eval.dispatch_replay_hits = &interp_ir.VmHost.replayHits;
     ir.eval.dispatchStatsDump();
     if (runtime.envOnce("KLIO_DECL_AUDIT") != null) declAudit(gpa, &built);
     // The dispatch census is reported for `run` as well as for `test`. The two

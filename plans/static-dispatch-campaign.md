@@ -5319,3 +5319,33 @@ changes against a 28.6s baseline). That is the honest summary: this work
 buys contract conformance — a call reaching its implementation by id rather
 than by string, which is what a bytecode VM and the C backend can express —
 and not speed.
+
+### `member_ladder` counts the route, not the work
+
+The ladder number has been quoted all through this campaign as a
+dynamic-dispatch channel, including in the summary above. That reading is
+too strong, and the new `replay-hits` line in the stats dump shows why:
+
+    member_ladder   12,517
+    replay-hits     20,738
+
+`callMemberInnerStatic`'s FIRST step, for any non-`Instance` receiver, is
+`builtinIntrinsicReplay` — a cached (class, name) -> intrinsic lookup. A
+call routed to the "ladder" and served there never walks an arm; it takes one
+hash probe. The replay count EXCEEDS the ladder count because
+`callMemberInnerStatic` is reached from several routes, not only that arm.
+
+So `member_ladder` is the name of a ROUTE, not a measure of name-resolution
+work, and the honest form of the campaign's headline is:
+
+    slot by-name walks   68,987 -> 60     (a real name search, removed)
+    member_ladder        29,380 -> 12,517 (a route label; most are one
+                                           cached probe, not a walk)
+
+This does not make the ladder work worthless — the overload-set caching
+earlier in this plan removed 16,873 genuine re-resolutions, and those were
+re-walking the full candidate set every call. It does mean the remaining
+12,517 should not be counted as 12,517 name searches, and that closing them
+further is a representational change (a `CallMember` carrying a resolved
+target for a host receiver), not a hot-path win. Wall clock with the counter
+installed: 28.67s / 28.71s, unchanged.

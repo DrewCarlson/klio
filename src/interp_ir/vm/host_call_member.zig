@@ -4274,9 +4274,21 @@ fn builtinIntrinsicReplay(self: *VmHost, allocator: Allocator, receiver: *const 
     return null;
 }
 
+/// How many named member calls the builtin intrinsic REPLAY serves outright,
+/// versus reaching the probe ladder proper. `member_ladder` counts the route,
+/// not the work, so the two are not the same number.
+var replay_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+pub fn replayHits() u64 {
+    return replay_hits.load(.monotonic);
+}
+
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
     if (receiver.* != .Instance and !strict_ext and !no_ext and static_recv == null and declared_recv == null) {
-        if (try builtinIntrinsicReplay(self, allocator, receiver, name, args)) |r| return r;
+        if (try builtinIntrinsicReplay(self, allocator, receiver, name, args)) |r| {
+            _ = replay_hits.fetchAdd(1, .monotonic);
+            return r;
+        }
     }
     // A property whose declared type is a RECEIVER function type
     // (`var handler: (suspend Scope.() -> Unit)?`) invoked as a call:
