@@ -2917,6 +2917,12 @@ fn leafPrimitive(v: *const Value) bool {
 /// non-primitive — abandons the serve and returns null, and the caller runs
 /// the ordinary body. Nothing is mutated before that point, so abandoning is
 /// always safe.
+/// Whether `module` is the one `func`'s body indexes against: its ids must
+/// name this very `Func`, not merely be in range.
+fn funcOwnedBy(module: *const Module, func: *const Func) bool {
+    return module.funcById(func.id) == func;
+}
+
 pub fn leafExprServe(
     comptime H: type,
     allocator: Allocator,
@@ -4340,9 +4346,29 @@ fn runFlatLoop(
             // here and deliver its value straight into the caller's register.
             // This is the seam every direct call passes through, so it covers
             // plain calls the member and getter entries never see.
+            // The module the callee's body must be READ against. A request
+            // that names one is authoritative; otherwise the caller's module
+            // is right only when it actually owns this `Func`. An anonymous
+            // object's runtime module delegates base funcs through the shared
+            // lazy header section but carries only its own const pool, so a
+            // callee reached from there would read const ids outside it.
+            const callee_mod: *const Module = site.req.run_module orelse blk_cm: {
+                if (funcOwnedBy(f.module, site.req.func)) break :blk_cm f.module;
+                if (comptime @hasDecl(H, "ownerModuleForFunc")) {
+                    if (host.ownerModuleForFunc(site.req.func)) |m| break :blk_cm m;
+                }
+                break :blk_cm f.module;
+            };
             if (leafReqServable(site.req)) {
-                const lmod = site.req.run_module orelse f.module;
-                if (try leafExprServe(H, allocator, lmod, site.req.func, site.req.args.items, host)) |lr| {
+                // A flat request carries the callee's `Func` directly, but the
+                // module its body must be READ against is only known when the
+                // request names one. Falling back to the caller's module is
+                // wrong whenever the callee was resolved in a different one:
+                // its const and func ids index that module's tables, and an
+                // anonymous object's one-function runtime module has neither
+                // (`androidx.compose.runtime.report`, id 15036, served against
+                // a module of 1 func and 6 consts, read const 9028).
+                if (try leafExprServe(H, allocator, callee_mod, site.req.func, site.req.args.items, host)) |lr| {
                     const dst = site.req.dst;
                     discardFlatReq(H, allocator, site.req, host);
                     try f.write(dst, lr.ok);
@@ -4362,7 +4388,7 @@ fn runFlatLoop(
                 continue;
             }
             ev.eval_depth += 1;
-            const act = openActivation(H, allocator, f.module, site.req, host) catch |e| {
+            const act = openActivation(H, allocator, callee_mod, site.req, host) catch |e| {
                 ev.eval_depth -= 1;
                 return e;
             };

@@ -5096,3 +5096,46 @@ That leaves the real cause elsewhere: at the failing sites `listOf` resolves
 to no target at all (no `[bare]` line), while the same call in a different
 function resolves to `kotlin.collections.listOf#2349`. The next step is why
 resolution declines there, NOT the applicability score.
+
+### The compose non-completers were a crash, not throughput
+
+`CompositionTests` and `PausableCompositionTests` were carried as
+throughput-bound — classes too slow for the 480s per-child cap. They are not.
+Run directly, `PausableCompositionTests` dies after 8 tests in 76s:
+
+    panic: index out of bounds: index 9028, len 6
+      constStr  -> module.consts.items[id.int()]
+      leafExprServe
+      runFrameInner
+
+A const id from one module indexing another module's const table. The func is
+`androidx.compose.runtime.report`, id 15036, served against a module holding
+ONE func and SIX consts.
+
+The mechanism is at the flat-call seam:
+
+    const lmod = site.req.run_module orelse f.module;
+
+A flat request carries the callee's `Func` directly, but the module its body
+must be read against is only known when the request names one. Falling back
+to the CALLER's module is right only when that module owns the callee. An
+anonymous object's runtime module delegates base funcs through the shared
+lazy header section — so `funcById` succeeds for id 15036 — while carrying
+only its own const pool, so every const id in that body lands outside it.
+
+Guarding just the leaf serve moved the panic rather than fixing it:
+`openActivation(H, allocator, f.module, site.req, host)` makes the identical
+assumption one line down, and the next crash was a register read at the same
+9028/6. The fix resolves the callee's module ONCE at the seam — the request's
+own, else the caller's when it truly owns the `Func`, else the program module
+that does — and uses it for both the leaf serve and the activation.
+
+    before   1314-1317 passed, 2-3 classes did not complete
+    after    1345 passed across 46 test classes, 0 did not complete
+
+Baseline raised 1275 -> 1305 on the same ~±40 margin. Two real test failures
+inside `PausableCompositionTests` (`resumeOnBackgroundThread` and one other)
+are now VISIBLE for the first time — the class used to be discarded whole.
+
+Green: commontest 117/0, drift 267/267, litmus 42/43 (known timeout), units,
+census unmoved at 9,063.

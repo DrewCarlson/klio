@@ -51,7 +51,11 @@ const runtime = @import("runtime");
 // GC-stress step no longer times out inside the compiler, and the static
 // receiver-typing channels bound work that previously resolved by name.
 // Same ~±40 margin below the observed floor.
-const BASELINE: usize = 1275;
+// RAISED 1275 -> 1305 once the flat-call seam stopped reading a callee's
+// body against the caller's module: `CompositionTests`, `PausableComposition-
+// Tests` and `SnapshotStateMapTests` no longer abort part-way, so all 46
+// classes complete and the observed count moved to 1345. Same ~±40 margin.
+const BASELINE: usize = 1305;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{

@@ -4335,3 +4335,16 @@ test "discarded field probes release their owned miss message" {
     freeFieldMiss(testing.allocator, .{ .Unimplemented = msg });
     freeFieldMiss(testing.allocator, .{ .Unimplemented = "nested: Vm::get_field is static" });
 }
+
+/// The module whose tables `func`'s body indexes against, when that is the
+/// program's own module. A flat request built without one is normally read
+/// against the CALLER's module, which is wrong whenever the callee was
+/// resolved elsewhere: an anonymous object's runtime module delegates base
+/// funcs through the shared lazy header section but carries only its own
+/// const pool, so the callee's const ids land outside it.
+pub fn ownerModuleForFunc(self: *VmHost, func: *const ir.Func) ?*const ir.Module {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const m = mg.get();
+    return if (m.funcById(func.id) == func) m else null;
+}
