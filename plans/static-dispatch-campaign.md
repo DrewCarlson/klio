@@ -5920,6 +5920,18 @@ fixed and the take/next chains bind. FOLLOW-UP: alias-resolve the head at
 the `no_class_id` site. Pinned: `splice_window_receiver_typing`
 (behaviour), plus the census A/B recorded here.
 
+### The labeled-this tower probe measures flat (refutation)
+
+The remaining `this@thenBy.compare` rows (six sites, inside the SAM
+lambdas the comparator combinators build) were probed with a This-arm
+extension answering a function-labeled qualifier from the implicit
+receiver TOWER — flat, reverted. The SAM closure body lowers with a
+FRESH FuncBuilder whose tower is empty; the labeled receiver reaches
+those bodies through the closure-CAPTURE channel (`this@thenBy` is a
+captured binding), so the typing fix belongs where captures get their
+types stamped, not in the tower walk. Recorded so the tower is not
+re-probed for closure bodies.
+
 ### The emission channel adopts the full static deriver
 
 The two-channel trap closed at its ROOT this time instead of per-site.
