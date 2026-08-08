@@ -4,6 +4,13 @@
 # compared a count against a baseline taken on a different file set and read a
 # gain that was never there.
 #
+# `OrderingTest.kt` is in the set because `CollectionTest.kt` imports
+# `STRING_CASE_INSENSITIVE_ORDER` from it. Without it `minWithOrNull` and
+# `maxWithOrNull` fail on an unresolved global and their bodies never run, so
+# the census was counting a program two tests short of the one it claimed to
+# measure. Adding it moves the site total; baselines taken before it are not
+# comparable to ones taken after.
+#
 #   scripts/dispatch-census.sh [binary]
 #
 # Prints the `[lower-sites]` census and the `[decline]` / `[no-recv]` splits.
@@ -27,4 +34,5 @@ exec env HOME=/tmp/klio_itest_stdlibtest_home KLIO_DISPATCH_STATS=1 \
   kotlin/libraries/stdlib/test/collections/CollectionBehaviors.kt \
   kotlin/libraries/stdlib/test/collections/ComparisonDSL.kt \
   kotlin/libraries/stdlib/test/collections/IterableTests.kt \
+  kotlin/libraries/stdlib/test/comparisons/OrderingTest.kt \
   kotlin/libraries/stdlib/test/collections/CollectionTest.kt

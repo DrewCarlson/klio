@@ -5031,3 +5031,31 @@ resolving to the right member on repeat calls.
 
 Green: commontest 117/0, drift 267/267, litmus 42/43 (known timeout), units,
 compose exit 0 / 1314 vs 1275.
+
+### The census program was two tests short of the one it measured
+
+`CollectionTest.minWithOrNull` and `maxWithOrNull` failed under
+`scripts/dispatch-census.sh` while passing under the commontest sweep, and
+that was carried for a while as a suspected cross-file interference bug in
+the interpreter. It is not a bug. The failure is
+
+    unresolved global `STRING_CASE_INSENSITIVE_ORDER`
+
+and `CollectionTest.kt:15` imports that symbol from `test.comparisons`,
+declared in `OrderingTest.kt` — a file the census set did not include.
+Adding it makes both tests pass with no interpreter change.
+
+Two consequences worth stating. The measurement was wrong in a small way the
+whole time: two test bodies never ran, so their sites were never lowered and
+never counted. And the "cross-file interference" framing pointed at a
+mechanism that does not exist, which is worse than the miscount.
+
+The file is now in the set. The site total moved 9,046 -> 9,063, so the
+NEW BASELINE is:
+
+    total=9063   bound_virtual 7,274 (80.26%)  bound_static 1,608 (17.74%)
+                 no_receiver_type 163 (1.80%)  no_class_id 10
+                 resolver_declined 6           nullable_or_generic 2
+
+Bound share 97.99%. Counts taken before this change are not comparable to
+counts taken after it.
