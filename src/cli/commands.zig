@@ -1075,6 +1075,7 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
     var member_missing: usize = 0;
     var member_ext_aligned: usize = 0;
     var member_decl_aligned: usize = 0;
+    var pkg_unloaded: usize = 0;
     var toplevel_missing: usize = 0;
     var unaligned: usize = 0;
     var unaligned_samples: std.ArrayList([]const u8) = .empty;
@@ -1213,13 +1214,31 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
                 continue;
             }
         }
+        // A hole in a package with NO loaded declaration at all is the
+        // audit's own program-scoping, not a symbol-table gap: the IR is
+        // lazy, and `klio.bundle.__klio_bundle_readBytes` HAS a source
+        // declaration a bundle-using program loads. Only a hole in a
+        // LOADED package is actionable.
+        {
+            var pkg_loaded = false;
+            for (module.funcs.items) |*mf| {
+                if (std.mem.eql(u8, mf.package, pkg)) {
+                    pkg_loaded = true;
+                    break;
+                }
+            }
+            if (!pkg_loaded) {
+                pkg_unloaded += 1;
+                continue;
+            }
+        }
         toplevel_missing += 1;
         const gop = by_pkg.getOrPut(pkg) catch continue;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* += 1;
         if (samples.items.len < 40) samples.append(gpa, fqn) catch {};
     }
-    io.printStdout(gpa, "[decl-audit] intrinsics={d} declared={d} missing={d} (builtin-type members {d}, extension-aligned {d}, member-aligned {d}, unaligned keys {d}, package-level holes {d})\n", .{ total, total - missing, missing, member_missing, member_ext_aligned, member_decl_aligned, unaligned, toplevel_missing });
+    io.printStdout(gpa, "[decl-audit] intrinsics={d} declared={d} missing={d} (builtin-type members {d}, extension-aligned {d}, member-aligned {d}, unaligned keys {d}, package-level holes {d}, package-unloaded {d})\n", .{ total, total - missing, missing, member_missing, member_ext_aligned, member_decl_aligned, unaligned, toplevel_missing, pkg_unloaded });
     var pit = by_pkg.iterator();
     while (pit.next()) |e| {
         io.printStdout(gpa, "[decl-audit] {d:>5}  {s}\n", .{ e.value_ptr.*, e.key_ptr.* });
