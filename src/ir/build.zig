@@ -1791,6 +1791,9 @@ pub const FuncBuilder = struct {
         sp: span_mod.Span,
         receiver: TypeRef,
     ) Allocator.Error!void {
+        if (std.c.getenv("KLIO_LAR_TRACE") != null) {
+            std.debug.print("[lar-put] f={d} s={d}..{d} ty={s}\n", .{ sp.file.int(), sp.start, sp.end, receiver.name });
+        }
         var owned = receiver;
         errdefer owned.deinit(self.allocator);
         if (try self.lambda_arg_recv.fetchPut(sp, owned)) |old| {
@@ -1801,6 +1804,9 @@ pub const FuncBuilder = struct {
 
     /// The declared receiver type for the receiver-lambda argument at `sp`.
     pub fn lambdaArgRecv(self: *const FuncBuilder, sp: span_mod.Span) ?TypeRef {
+        if (std.c.getenv("KLIO_LAR_TRACE") != null) {
+            std.debug.print("[lar-get] f={d} s={d}..{d} hit={}\n", .{ sp.file.int(), sp.start, sp.end, self.lambda_arg_recv.get(sp) != null });
+        }
         return self.lambda_arg_recv.get(sp);
     }
 

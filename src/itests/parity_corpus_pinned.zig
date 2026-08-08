@@ -2450,6 +2450,45 @@ test "index_set_fast_path" {
     );
 }
 
+test "bare_call_return_typing" {
+    try check("bare_call_return_typing",
+        \\3
+        \\S4
+        \\
+    );
+}
+
+test "comparator_sibling_expected" {
+    try check("comparator_sibling_expected",
+        \\bca
+        \\abc
+        \\bca
+        \\
+    );
+}
+
+test "lambda_return_overload_pick" {
+    try check("lambda_return_overload_pick",
+        \\6
+        \\6
+        \\3
+        \\6.0
+        \\6
+        \\6
+        \\6
+        \\
+    );
+}
+
+test "nested_class_qualified_ctor" {
+    try check("nested_class_qualified_ctor",
+        \\built:7
+        \\3
+        \\companion-lives
+        \\
+    );
+}
+
 test "type_safe_bridge_barrier" {
     try check("type_safe_bridge_barrier",
         \\-1
@@ -2458,6 +2497,13 @@ test "type_safe_bridge_barrier" {
         \\-1
         \\1
         \\0
+        \\true
+        \\
+    );
+}
+
+test "class_param_lambda_receiver" {
+    try check("class_param_lambda_receiver",
         \\true
         \\
     );

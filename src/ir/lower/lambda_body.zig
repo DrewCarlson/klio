@@ -264,6 +264,9 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     // (stashed by `lowerLocalFnDecl`): the same standing a top-level
     // extension body gets from `setRecvTy`, so bare-call resolution prefers
     // extensions on the receiver over same-named plain top-level functions.
+    if (std.c.getenv("KLIO_LAR_TRACE") != null) {
+        std.debug.print("[lar-body] s={d} own_ty={s} own={s}\n", .{ body.span.start, if (module.pending_lambda_own_recv_type) |r| r.name else "-", module.pending_lambda_own_recv orelse "-" });
+    }
     if (module.pending_lambda_own_recv_type) |receiver| {
         module.pending_lambda_own_recv_type = null;
         module.pending_lambda_own_recv = null;
