@@ -5547,3 +5547,39 @@ it is not a collision with the callee's `T`. The live hypothesis is that `S`
 cannot be solved from an unannotated lambda when the receiver's `T` came from
 a bound rather than a written type — and that one should be checked with the
 nine-line file, not reasoned about.
+
+### A type parameter bounded by another type parameter
+
+With a probe that measures, the untyped-local tail reduces to nine lines and
+one mechanism. Both halves are needed and each alone is fine:
+
+    data.boundReduce { a, e -> a + e }    // <S, T : S>   v UNTYPED
+    data.freeReduce  { a, e -> a + e }    // <S, T>       v typed
+
+Explicit lambda parameter types do NOT help, and neither do explicit type
+arguments (`runningReduce<String, String>`), which rules out inference of `S`
+as the cause. What fails is the candidate check itself, in
+`staticGenericArgCompatibility`:
+
+    if (self.staticFuncTypeParamBound(fid, param_head)) |bound| {
+        ...
+        return self.staticReceiverCompatibility(null, actual,
+            .{ .name = bound, ... });   // bound is "S" — a TYPE PARAMETER
+    }
+
+`<S, T : S>` says only that `S` is solved at or above `T`, and `S` is itself
+inferred from this call. Handing it to the receiver-compatibility check asks
+whether a concrete `String` "is an S", which no concrete type can answer, so
+the candidate is rejected and the call gets no return type. A bound naming
+another parameter of the same function is now treated as unconstraining.
+
+`type_param_bounded_by_type_param` pins it, on both a type-parameter receiver
+and a plain `List<Int>`.
+
+HONEST LIMIT: this fixes the hand-written shape but the census is UNMOVED at
+154 — the real `IterableTests.kt:475`/`483` sites are still untyped. The
+remaining difference is that `kotlin.collections.runningReduce` is `inline`
+and mine is not, so the real call presumably reaches the same rejection
+through the inline-splice path rather than this one. The fix is kept because
+it is correct and pinned, not because it moved the number; the inline path is
+the next place to look.

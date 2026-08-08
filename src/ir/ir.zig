@@ -2407,6 +2407,14 @@ pub const Module = struct {
         if (overrideQualifiedPath(param) == null) {
             if (self.staticFuncTypeParamBound(fid, param_head)) |bound| {
                 if (std.mem.eql(u8, applicability.simpleName(staticTypeHead(bound)), "Any")) return .compatible;
+                // A bound that names ANOTHER TYPE PARAMETER of the same
+                // function constrains nothing here: `<S, T : S>` on
+                // `Iterable<T>.runningReduce` says only that `S` is solved at
+                // or above `T`, and `S` is itself inferred from this call.
+                // Treating it as a class made the check ask whether the actual
+                // argument is an `S`, which no concrete type can answer, so
+                // the candidate was rejected and the call got no return type.
+                if (self.funcTypeParamIndex(fid, staticTypeHead(bound)) != null) return .compatible;
                 return self.staticReceiverCompatibility(
                     null,
                     actual,
