@@ -5489,8 +5489,33 @@ applicability, `expect`/`actual` merging, bound-erasure argument loss, the
 distinguishing feature is still somewhere in `IterableTests.kt` that a
 faithful reconstruction of its class header does NOT carry.
 
-The next attempt should bisect WITHIN the file — delete members of
-`IterableTests` until `runningReduce`'s site types — rather than reconstruct
-the class from the outside, which is what these two attempts did and what
-made them cost a cycle each. The five-file harness makes each bisection step
-a few seconds.
+Bisecting WITHIN the file (rather than reconstructing it) found the minimum
+that still reproduces. Build it with:
+
+    python3 - <<'EOF'
+    src = open('kotlin/libraries/stdlib/test/collections/IterableTests.kt').read().split('\n')
+    out = src[0:6] + src[226:230] + src[472:479] + ['}']
+    open('/tmp/min.kt','w').write('\n'.join(out))
+    EOF
+
+That is SIX lines of head (the licence comment and `package test.collections`
+— no imports at all), the class header, `createFrom`, `data`, and the
+`runningReduce` test. Two sites, seconds to run.
+
+What the bisection establishes: the trigger is NOT any member of the class,
+NOT the subclass declarations, NOT the imports, and NOT the class's own
+shape. A faithful hand-written reconstruction of exactly that header — same
+type parameter and bound, same `createFrom` overload pair, same `data`
+property, in `package test.collections`, `demo.collections` and
+`demo.widgets` — types correctly in all three. The real six-line file does
+not.
+
+So something the reconstruction does not carry is doing it, and after nine
+refuted hypotheses (null-argument applicability, `expect`/`actual` merging,
+bound-erasure argument loss, the `T : S` bound, the enclosing-class shape,
+the same-named enclosing member, multiple instantiations of the type
+parameter, a subclass of an undeclared base, and the package name) guessing
+is no longer the right instrument. The next attempt should DIFF the two files
+mechanically — the minimal real one against the reconstruction that works —
+rather than form another hypothesis about them. Both are small enough to read
+side by side, which is the one thing none of these nine attempts did.
