@@ -2222,6 +2222,29 @@ pub const Module = struct {
         return self.classIdIsOrExtendsDepth(sub, super, 0);
     }
 
+    /// Whether `cls` or any supertype declares a member named `name`,
+    /// arity-blind. The declaration-completeness audit's member probe: it
+    /// answers "can resolution see SOME declaration for this name on this
+    /// receiver", which an empty-shape resolveMemberCall cannot (a member
+    /// with required parameters refuses a zero-arg probe).
+    pub fn classHierarchyDeclaresMember(self: *const Module, cls: ClassId, name: []const u8) bool {
+        return self.classHierarchyDeclaresMemberDepth(cls, name, 0);
+    }
+
+    fn classHierarchyDeclaresMemberDepth(self: *const Module, cls: ClassId, name: []const u8, depth: u8) bool {
+        if (depth >= 64 or cls.int() >= self.classes.items.len) return false;
+        const c = &self.classes.items[cls.int()];
+        for (c.methods) |mid| {
+            if (self.funcById(mid)) |mf| {
+                if (std.mem.eql(u8, mf.name, name)) return true;
+            }
+        }
+        for (c.supertypes) |p| {
+            if (self.classHierarchyDeclaresMemberDepth(p, name, depth + 1)) return true;
+        }
+        return false;
+    }
+
     fn enclosingClassId(self: *const Module, child: ClassId) ?ClassId {
         if (child.int() >= self.classes.items.len) return null;
         const class = &self.classes.items[child.int()];

@@ -1073,6 +1073,8 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
     var total: usize = 0;
     var missing: usize = 0;
     var member_missing: usize = 0;
+    var member_ext_aligned: usize = 0;
+    var member_decl_aligned: usize = 0;
     var toplevel_missing: usize = 0;
     var unaligned: usize = 0;
     var unaligned_samples: std.ArrayList([]const u8) = .empty;
@@ -1100,6 +1102,68 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
         // callables: the owner segment starts lowercase.
         const owner_simple = if (std.mem.lastIndexOfScalar(u8, pkg, '.')) |d2| pkg[d2 + 1 ..] else pkg;
         if (owner_simple.len != 0 and std.ascii.isUpper(owner_simple[0])) {
+            // A member-shaped registry key is usually a DISPATCH key for an
+            // EXTENSION the module does declare (`kotlin.Char.titlecase`
+            // serves `kotlin.text.titlecase(Char)`): resolution reaches it
+            // through the extension declaration, so it is ALIGNED, not
+            // missing. A key with no extension of that simple name whose
+            // declared receiver head names the owner (or a builtin the
+            // owner satisfies) is a genuine member hole.
+            {
+                const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+                const owner_cid: ?ir.ClassId = module.classIdByFqn(pkg) orelse
+                    module.uniqueClassIdBySimpleName(owner_simple);
+                var ext_aligned = false;
+                for (module.funcsBySimpleName(simple)) |fid2| {
+                    const f2 = module.funcById(fid2) orelse continue;
+                    if (f2.params.len == 0 or !std.mem.eql(u8, f2.params[0].name, "this")) continue;
+                    var rh = f2.params[0].ty.name;
+                    if (std.mem.lastIndexOfScalar(u8, rh, '.')) |rd| rh = rh[rd + 1 ..];
+                    rh = std.mem.trimEnd(u8, rh, "?");
+                    if (std.mem.indexOfScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
+                    if (std.mem.eql(u8, rh, owner_simple)) {
+                        ext_aligned = true;
+                        break;
+                    }
+                    // A one-or-two-letter receiver is a TYPE PARAMETER —
+                    // a generic extension (`fun <T> T.also`) serves any
+                    // owner-qualified key of its name.
+                    if (rh.len != 0 and rh.len <= 2 and std.ascii.isUpper(rh[0])) {
+                        ext_aligned = true;
+                        break;
+                    }
+                    // An extension on a SUPERTYPE serves the subtype's key:
+                    // `Iterable.indexOfFirst` answers the
+                    // `MutableList.indexOfFirst` dispatch key.
+                    if (owner_cid) |ocid| {
+                        if (module.uniqueClassIdBySimpleName(rh)) |rcid| {
+                            if (module.classIdIsOrExtends(ocid, rcid)) {
+                                ext_aligned = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (ext_aligned) {
+                    // The callable IS declared — as the extension the key
+                    // dispatches for — so it does not count as missing.
+                    member_ext_aligned += 1;
+                    missing -= 1;
+                    continue;
+                }
+                // A MEMBER the owner class (or a supertype it inherits
+                // from) declares: `List.isEmpty` lives on the Collection
+                // header. Arity-blind on purpose — an empty-shape
+                // resolution probe refuses members with required
+                // parameters (`MutableList.add`).
+                if (owner_cid) |ocid| {
+                    if (module.classHierarchyDeclaresMember(ocid, simple)) {
+                        member_decl_aligned += 1;
+                        missing -= 1;
+                        continue;
+                    }
+                }
+            }
             member_missing += 1;
             // `KLIO_DECL_AUDIT=members` lists them: the builtin-type members
             // are the last declaration hole, and grouping them by owner is
@@ -1143,7 +1207,7 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
         gop.value_ptr.* += 1;
         if (samples.items.len < 40) samples.append(gpa, fqn) catch {};
     }
-    io.printStdout(gpa, "[decl-audit] intrinsics={d} declared={d} missing={d} (builtin-type members {d}, unaligned keys {d}, package-level holes {d})\n", .{ total, total - missing, missing, member_missing, unaligned, toplevel_missing });
+    io.printStdout(gpa, "[decl-audit] intrinsics={d} declared={d} missing={d} (builtin-type members {d}, extension-aligned {d}, member-aligned {d}, unaligned keys {d}, package-level holes {d})\n", .{ total, total - missing, missing, member_missing, member_ext_aligned, member_decl_aligned, unaligned, toplevel_missing });
     var pit = by_pkg.iterator();
     while (pit.next()) |e| {
         io.printStdout(gpa, "[decl-audit] {d:>5}  {s}\n", .{ e.value_ptr.*, e.key_ptr.* });

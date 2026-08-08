@@ -5461,8 +5461,20 @@ the builtin slot gap; raising the compose runTest cap (cost two whole classes).
   many of the 1,281 "missing member declarations" are EXTENSIONS in
   Kotlin whose native registry key is member-shaped; declaring them as
   members would be wrong, aligning the convention is the real fix.
-- Task 16's audit knob: `KLIO_DECL_AUDIT=members` (1,281 member rows,
-  8 package holes, 6 unaligned keys as of this stretch).
+- Task 16's audit knob: `KLIO_DECL_AUDIT=members`. The member rows were
+  REALIGNED this stretch: of the 1,281, 839 are EXTENSION-aligned (the
+  member-shaped registry key dispatches for an extension declaration the
+  module carries — same head, generic receiver, or a supertype's
+  extension serving the subtype key) and 109 are MEMBER-aligned (the
+  owner class or a supertype declares the member;
+  `classHierarchyDeclaresMember`, arity-blind because an empty-shape
+  resolution probe refuses members with required parameters). 333
+  remain, and the sampled residue is two audit-blindness classes, not
+  resolution holes: scalar owners without queryable class rows
+  (`kotlin.Int.and/shl/toByte` — declared in Primitives.kt, served by
+  primitiveMemberOp) and PROPERTY members (`Regex.pattern`) the
+  methods-only walk misses. Close those two blindness classes and the
+  audit becomes a real zero-target completeness gauge.
 
 ### The untyped-local tail now has a five-file repro
 
