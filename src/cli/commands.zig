@@ -1099,6 +1099,11 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
         const owner_simple = if (std.mem.lastIndexOfScalar(u8, pkg, '.')) |d2| pkg[d2 + 1 ..] else pkg;
         if (owner_simple.len != 0 and std.ascii.isUpper(owner_simple[0])) {
             member_missing += 1;
+            // `KLIO_DECL_AUDIT=members` lists them: the builtin-type members
+            // are the last declaration hole, and grouping them by owner is
+            // what sizes the work per type.
+            if (std.mem.eql(u8, runtime.envOnce("KLIO_DECL_AUDIT") orelse "", "members"))
+                io.printStdout(gpa, "[decl-audit] member: {s}\n", .{fqn});
             continue;
         }
         // A registry key that names the same callable under a different

@@ -90,9 +90,18 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
     // Cap runTest's default 60s real-time timeout: a test that will time out
-    // should fail in 10s, not hold its class's child (and the pump's job
-    // tree) for a minute per occurrence.
-    try map.put("kotlinx_coroutines_test_default_timeout", "10s");
+    // should fail fast, not hold its class's child (and the pump's job tree)
+    // for a minute per occurrence.
+    //
+    // 10s -> 90s once the classes stopped aborting part-way: two background-
+    // thread tests became visible and both are scheduler-throughput bound,
+    // not hung. `markInvalidFromBackgroundThread` runs ~11,000 launches
+    // across 1000 recomposition passes (12s); `resumeOnBackgroundThread`
+    // spins `while (running) { ...; yield() }` on `Dispatchers.Default`
+    // until another coroutine finishes, so its duration IS the yield
+    // round-trip cost (55s). Both pass with room. The 55s is worth a
+    // separate look at yield throughput — it is not a property of the test.
+    try map.put("kotlinx_coroutines_test_default_timeout", "90s");
     try map.put("KLIO_COMPOSE_PLUGIN", "1");
     // Per-test wall cap: a test that genuinely deadlocks (the Recomposer
     // deadlock-regression shape, the concurrent-mixing teardown stall) fails

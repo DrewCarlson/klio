@@ -1375,3 +1375,30 @@ FuncId with a native form — which is a direct intrinsic call, needing no new
 instruction. That is what "fully static" requires for a bytecode VM or a C
 backend, and it is now a single well-defined piece of work with a measured
 size on both sides.
+
+## The builtin-member hole, sized per owner (2026-08-08)
+
+`KLIO_DECL_AUDIT=members` now lists the 1,281 builtin-type members rather
+than only counting them, which turns the last declaration hole into an
+ordered work list:
+
+     85  kotlin.collections.MutableList      33  kotlin.Char
+     77  kotlin.String                       31  kotlin.ULong / UInt / Float
+     74  kotlin.collections.List             26  kotlin.collections.Iterable
+     47  kotlin.collections.Set              25  kotlin.UShort / UByte
+     40  kotlin.Array                        21  kotlin.collections.Map
+     36  kotlin.Int, kotlin.collections.MutableSet
+     35  kotlin.text.StringBuilder, kotlin.Long, kotlin.Double
+     34  kotlin.collections.MutableMap       20  kotlin.LongArray
+
+The collection interfaces and `String` carry over a quarter of it between
+them, and they are the same owners the runtime side kept surfacing
+(`Iterator.hasNext`/`next`, `MutableList.set`, `String.get`). The two plans
+were measuring one hole from opposite ends.
+
+Note the ordering constraint the scalar channel already established: a
+declaration only helps if it is BODYLESS. A declaration that carries a body
+is written against the boxed representation, and binding a scalar receiver
+to it runs a body the receiver cannot satisfy (see the campaign plan's
+`UInt.toString()` case). So these must be declared as bodyless signatures
+linked to their existing natives, not as Kotlin implementations.
