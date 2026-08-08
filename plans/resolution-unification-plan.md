@@ -1522,3 +1522,40 @@ existing ones under their FQNs, not rewriting them.
 That also retires the iterator-protocol shortcut earlier in the campaign
 plan: with the natives registered, those 40,380 calls dispatch by FuncId,
 which is the mechanism the shortcut was standing in for.
+
+## Closure: the slot path resolves fully static (2026-08-08)
+
+The "register the missing FQN natives" work above landed as a better
+mechanism than FQN registration: the `HostSlotOp` table in
+`host_call_member.zig` binds the bodyless builtin roots to their existing
+variant-dispatched handlers BY FUNCID — `iterator_protocol` (including the
+primitive-iterator owners and the `nextInt` family), `collection_iterator`
+(interfaces plus the concrete `ArrayList`/`HashSet`/`LinkedHashSet` roots),
+`kclass_is_instance`, `comparator_member`, `array_get`,
+`sequence_iterator` — and the direct-native dispatch list admits every
+non-wrapper receiver (containers, `String`, scalars). No stdlib-side
+reimplementation, no FQN duplication: the existing handlers are reached by
+id.
+
+Measured end state on the census workload:
+
+    slot by-name walks   68,987 -> 0   (zero noinst declines)
+    member_ladder        29,380 -> 1,268  (the for-loop desugar now emits
+                                           slot-bound protocol calls; the
+                                           remainder is Result.fold — a
+                                           wrapper deliberately on the walk
+                                           — and test-fixture classes)
+    census bound share   92.73% -> 98.58%
+    decl audit           1,281 member rows -> 142 program-scoped, 0
+                         package-level holes (8 were the audit's own
+                         scoping), 6 deliberate alias keys
+
+Resolution is uniform: one candidate/ranking path (`resolveExtensionCall` /
+`resolveMemberCall`) serves lowering, the typing channels
+(`sole_unknown`/`param_rep`), and runtime dispatch; named arguments bind by
+declaration parameter identically for body-backed and host-backed targets;
+and the completeness audit separates genuine gaps from its own scoping on
+sight. The residue is enumerated in the campaign plan: 128 census sites in
+1-11-site typing clusters (each with a design or an earned refutation),
+the walk-served wrapper family, and `kotlin.concurrent.thread` (a Thread
+class feature, not a resolution gap).
