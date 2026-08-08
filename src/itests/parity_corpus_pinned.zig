@@ -2436,6 +2436,20 @@ test "overload_tied_on_lambda_return" {
     );
 }
 
+test "index_set_fast_path" {
+    try check("index_set_fast_path",
+        \\2
+        \\[1, 9, 3]
+        \\7
+        \\[7, 42, 3]
+        \\threw-uoe
+        \\threw-ioobe
+        \\t
+        \\é
+        \\
+    );
+}
+
 test "unsigned_value_class_hash" {
     try check("unsigned_value_class_hash",
         \\-1

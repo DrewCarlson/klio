@@ -5452,9 +5452,19 @@ the builtin slot gap; raising the compose runTest cap (cost two whole classes).
   (`.size`/`.Monotonic`/`.iso`/`.default`/`.length` property reads),
   This 8, Binary 8 (companion-property reads like `bitsPerSymbol` not
   typing the operand).
-- `member_ladder`'s remaining 12,421 are mostly cached intrinsic probes;
-  closing them is a representational change (a `CallMember` carrying a
-  resolved target for a host receiver), not a hot-path win.
+- `member_ladder` 12,421 -> 2,944. The ladder key now carries the
+  ENCLOSING FUNCTION (`<ladder>Type.name@fn`), which named the total as
+  a few hot sites times execution counts: `this[index] = v` inside the
+  `sortWith`/`sort` actuals (8,455 — `fastIndexSet` only took Arrays;
+  it now serves a plain mutable List, returning the PREVIOUS element
+  per the member contract while the assignment arm releases it, and
+  declines views/read-only/out-of-bounds to the guarded native) and
+  `s[i]` in a lambda (1,024 — `fastIndexGet` gained the ASCII String
+  arm; multi-byte declines to the UTF-16 walk). Pinned:
+  `index_set_fast_path`. The remaining ~2,900 are the iterator
+  protocol on deferred sites (mod-count/re-stamp semantics too rich to
+  mirror without duplicating `iteratorMember`) plus test-fixture user
+  classes — the same deferred-typing tail as the census 128.
 - Task 15 (unify a declaration's body and host-symbol calling
   convention) now also gates: committing named-skip winners (the
   demotion note above), and the `Char.titlecase`-family audit rows —

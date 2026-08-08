@@ -898,7 +898,7 @@ fn gfStatsBump(recv: *const Value, name: []const u8) void {
 /// KLIO_CALL_STATS census tap for member calls that reached the slow name
 /// ladder: keys are `<ladder>Type.name`, so the dump names exactly which
 /// member dispatches are still unbound at runtime on a given workload.
-fn ladderStatsBump(recv: *const Value, name: []const u8) void {
+fn ladderStatsBump(recv: *const Value, name: []const u8, in_fn: []const u8) void {
     if (call_stats_state == 0)
         call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
@@ -913,7 +913,10 @@ fn ladderStatsBump(recv: *const Value, name: []const u8) void {
         const nm = cg.get().name;
         break :blk if (nm.len != 0) nm else recv.typeFqn();
     } else recv.typeFqn();
-    const key = std.fmt.bufPrint(&buf, "<ladder>{s}.{s}", .{ recv_name, name }) catch return;
+    // The enclosing function names the SITE: the ladder total is a few hot
+    // unbound sites times their execution counts, and per-name rows alone
+    // sent the analysis toward the wrong shape.
+    const key = std.fmt.bufPrint(&buf, "<ladder>{s}.{s}@{s}", .{ recv_name, name, in_fn }) catch return;
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
     if (call_stats == null) call_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
@@ -7363,7 +7366,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
         }
     }
     dispatchBump(.member_ladder);
-    ladderStatsBump(&recv, name_str);
+    ladderStatsBump(&recv, name_str, frame.func.name);
     runtime.prof.opRoute(2);
     const prev_tl = if (cm.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
         H.setTrailingMemberCall(true)
@@ -8098,7 +8101,10 @@ noinline fn execArmIndexSet(comptime H: type, allocator: Allocator, frame: *Fram
     const recv = frame.read(ixs.receiver);
     const i = frame.read(ixs.index);
     const v = frame.read(ixs.value);
-    if (fastIndexSet(allocator, &recv, &i, v)) {
+    if (fastIndexSet(allocator, &recv, &i, v)) |expr_val| {
+        // The assignment form discards the expression value; a List's
+        // returned PREVIOUS element carries ownership and must release.
+        if (runtime.reclaimEnabled()) expr_val.release(allocator);
         return .cont;
     }
     switch (try host.callMember(allocator, &recv, "set", &.{ i, v })) {
@@ -9640,42 +9646,69 @@ inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
             elem.retain();
             return elem;
         },
+        .String => |s| {
+            const g = s.borrow();
+            defer g.deinit();
+            const sd = g.get();
+            // ASCII in-bounds only: the UTF-16 unit at `ui` is byte `ui`.
+            // Multi-byte strings and out-of-bounds decline to the native,
+            // whose UTF-16 walk and IndexOutOfBoundsException are the
+            // contract.
+            if (!sd.ascii or ui >= sd.bytes.len) return null;
+            return .{ .Char = sd.bytes[ui] };
+        },
         else => return null,
     }
 }
 
-/// Indexed-store fast path for `a[i] = v` on an `Array` (mirrors the
-/// `coll_array_set` intrinsic: release the overwritten element, retain the
-/// incoming one under a reclaiming backend). `List.set` returns the previous
-/// element, so it is left to the slow path. Returns `true` when handled.
-inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *const Value, new_val: Value) bool {
-    if (idx_v.* != .Int) return false;
+/// Indexed-store fast path for `a[i] = v` on an `Array` or a plain mutable
+/// `List` (mirrors the `coll_array_set` / `coll_mut_list_set` intrinsics:
+/// release the overwritten element, retain the incoming one under a
+/// reclaiming backend). Returns the SET-EXPRESSION's value — `Unit` for an
+/// array, the PREVIOUS element for a list (Kotlin's `MutableList.set`
+/// contract; the assignment arm discards it, the member-call arm writes it).
+/// Null when not handled: out-of-bounds, an immutable receiver, and a live
+/// view (subList / map-values / asList backing) all decline to the full
+/// member path, whose guards throw the right exceptions and write through.
+inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *const Value, new_val: Value) ?Value {
+    if (idx_v.* != .Int) return null;
     const idx = idx_v.Int;
-    if (idx < 0) return false;
+    if (idx < 0) return null;
     const ui: usize = @intCast(idx);
     switch (recv.*) {
         .Array => |arr| switch (arr.storage) {
             .scalars => |pb| {
                 const g = pb.borrowMut();
                 defer g.deinit();
-                if (ui >= g.get().len()) return false;
+                if (ui >= g.get().len()) return null;
                 g.get().setAs(ui, new_val, arr.prim orelse g.get().kind);
-                return true;
+                return Value.Unit;
             },
             .boxed => |vl| {
                 const g = vl.borrowMut();
                 defer g.deinit();
                 const items = g.get().items;
-                if (ui >= items.len) return false;
+                if (ui >= items.len) return null;
                 if (runtime.reclaimEnabled()) {
                     items[ui].release(allocator);
                     new_val.retain();
                 }
                 items[ui] = new_val;
-                return true;
+                return Value.Unit;
             },
         },
-        else => return false,
+        .List => |l| {
+            if (!l.mutable or l.backing != null) return null;
+            const g = l.items.borrowMut();
+            defer g.deinit();
+            const items = g.get().items;
+            if (ui >= items.len) return null;
+            if (runtime.reclaimEnabled()) new_val.retain();
+            const prev = items[ui];
+            items[ui] = new_val;
+            return prev;
+        },
+        else => return null,
     }
 }
 
@@ -9819,8 +9852,9 @@ inline fn fastSubscript(allocator: Allocator, frame: *const Frame, cm: anytype) 
     const recv = frame.read(cm.receiver);
     if (is_get) return fastIndexGet(&recv, &idx_v);
     const new_val = frame.read(Reg.from(cm.args.int() + 1));
-    if (fastIndexSet(allocator, &recv, &idx_v, new_val)) return Value.Unit;
-    return null;
+    // The member-call form USES the expression value: Unit for an array,
+    // the previous element for a list.
+    return fastIndexSet(allocator, &recv, &idx_v, new_val);
 }
 
 /// Snapshot the live values of a `[]Reg`. Caller frees.
