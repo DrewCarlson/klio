@@ -6222,3 +6222,28 @@ resolution's decline tail), plus the same refinement in the derivation
 channel so both channels see one answer. Verify: the `it toUInt fn=sum`
 x4 rows, then the minOfWith/maxOfWith rows with the sibling-expected
 push on top.
+
+### The lambda-return pick lands (partial for the sum rows)
+
+Implemented per the design as a call-site PRE-PICK beside the cast pick
+(`overloadPickByLambdaReturn` feeding the same `cast_pick` channel the
+`as`-cast evidence uses): candidates filter by the implicit receiver's
+head against declared-receiver supertypes, the survivors must agree on
+the lambda-slot's parameter types and differ in return, a sole
+bare-type-parameter param binds as the receiver's ELEMENT
+(`iterableElementTypeRef` over a synthetic `this`), and the literal's
+tail derives under that binding with NO tail-kind restriction (the pick
+is among a fixed set — nothing instantiates). A unique return match
+commits; anything else leaves the tie.
+
+Measured: the `sumOf { it.length.toLong() }`-style calls in the census
+files commit statically ([lamret-pick] derived=Long), and the fixture's
+five variants each pick their overload. The `it toUInt fn=sum` census
+rows (x4) did NOT clear: that lowering pass runs with NO receiver
+context at all (recv=<none>, splice=-), so the receiver filter keeps
+zero extension candidates — the blocker is the missing splice-window /
+decl receiver in whatever pass lowers the @InlineOnly UByteArray.sum
+body, recorded here as its own follow-up. no_receiver_type stays 89.
+
+Pinned: `lambda_return_overload_pick`. Battery: 117/0, corpus 267/267,
+litmus 42/43 (known flake), unit green, compose 1349/0.

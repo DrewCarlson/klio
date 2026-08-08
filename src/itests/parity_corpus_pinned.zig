@@ -2450,6 +2450,17 @@ test "index_set_fast_path" {
     );
 }
 
+test "lambda_return_overload_pick" {
+    try check("lambda_return_overload_pick",
+        \\6
+        \\6
+        \\3
+        \\6.0
+        \\6
+        \\
+    );
+}
+
 test "nested_class_qualified_ctor" {
     try check("nested_class_qualified_ctor",
         \\built:7

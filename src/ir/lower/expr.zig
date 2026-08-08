@@ -262,6 +262,142 @@ fn overloadPickByCast(
     return best;
 }
 
+/// Candidates that agree on a trailing lambda parameter's PARAMETER types
+/// but differ only in its declared RETURN (`sumOf`'s `(T) -> Int / Long /
+/// UInt / ULong / Double` variants) discriminate by the literal's derived
+/// return under the agreed binding, exactly as kotlinc infers. The
+/// derivation feeds only this pick among a FIXED set — it never
+/// instantiates a type variable, which is the hazard the member-tail
+/// enrichment refutation recorded. No unique match leaves the tie.
+/// Whether a declared receiver head can serve a value whose static head is
+/// `actual` — the head itself, a builtin supertype, or a declared supertype
+/// by simple name.
+fn receiverHeadServes(b: *const FuncBuilder, actual: []const u8, declared: []const u8) bool {
+    if (std.mem.eql(u8, actual, declared)) return true;
+    for (applicability.builtinSupersOf(actual)) |sup| {
+        if (std.mem.eql(u8, applicability.simpleName(sup), declared)) return true;
+    }
+    if (b.module.registry.class_super_names.get(actual)) |chain| {
+        for (chain) |sup| {
+            if (std.mem.eql(u8, applicability.simpleName(sup), declared)) return true;
+        }
+    }
+    return false;
+}
+
+fn overloadPickByLambdaReturn(
+    b: *FuncBuilder,
+    cands: []const FuncId,
+    args: []const Expr,
+    want: usize,
+) Allocator.Error!?FuncId {
+    if (args.len == 0) return null;
+    const li = args.len - 1;
+    if (args[li] != .Lambda) return null;
+    const lam = args[li].Lambda;
+    const stmts = lam.body.stmts;
+    if (stmts.len == 0 or stmts[stmts.len - 1] != .Expr) return null;
+    const Entry = struct { fid: FuncId, ret: []const u8 };
+    var family: std.ArrayList(Entry) = .empty;
+    defer family.deinit(b.allocator);
+    var agreed_params: ?[]const ir.TypeRef = null;
+    var distinct_returns: usize = 0;
+    // The implicit receiver's head filters extension candidates before the
+    // agreement check — the CharSequence variants' `(Char) -> R` params must
+    // not disagree a UByteArray family into a bail.
+    const actual_recv_head: ?[]const u8 = blk: {
+        const h = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse break :blk null;
+        break :blk typeHead(std.mem.trimEnd(u8, h, "?"));
+    };
+    for (cands) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (!f.hasBody()) continue;
+        const base: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        if (f.params.len -| base != want) continue;
+        if (base == 1) {
+            const ah = actual_recv_head orelse continue;
+            var dr = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
+            if (std.mem.indexOfScalar(u8, dr, '<')) |lt| dr = dr[0..lt];
+            const dh = typeHead(dr);
+            if (!(dh.len <= 2 or ir.parseClassTypeParamIdentity(f.params[0].ty.name) != null or
+                receiverHeadServes(b, ah, dh))) continue;
+        }
+        const pty = f.params[f.params.len - 1].ty;
+        if (!std.mem.startsWith(u8, typeHead(pty.name), "Function") or pty.args.len < 1) continue;
+        const params = pty.args[0 .. pty.args.len - 1];
+        const ret_head = typeHead(std.mem.trimEnd(u8, pty.args[pty.args.len - 1].name, "?"));
+        if (ret_head.len == 0) continue;
+        if (agreed_params) |prev| {
+            if (prev.len != params.len) return null;
+            for (prev, params) |pa, pb2| {
+                if (!std.mem.eql(u8, pa.name, pb2.name)) return null;
+            }
+        } else {
+            agreed_params = params;
+        }
+        var seen = false;
+        for (family.items) |e| {
+            if (std.mem.eql(u8, e.ret, ret_head)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) distinct_returns += 1;
+        try family.append(b.allocator, .{ .fid = fid, .ret = ret_head });
+    }
+    if (family.items.len < 2 or distinct_returns < 2) return null;
+    const fparams = agreed_params orelse return null;
+    // Bind the lambda's value parameters from the agreed declared types; a
+    // sole bare-type-parameter param is the receiver's ELEMENT (the
+    // collection-selector family this pick exists for).
+    var nb = try FuncBuilder.init(b.allocator, b.module);
+    defer nb.deinit();
+    var elem_owned: ?ir.TypeRef = null;
+    defer if (elem_owned) |*t| t.deinit(b.allocator);
+    var i: usize = 0;
+    while (i < fparams.len) : (i += 1) {
+        const pname = if (lam.params.len == 0 and fparams.len == 1)
+            "it"
+        else if (i < lam.params.len)
+            lam.params[i].name
+        else
+            return null;
+        const declared = fparams[i];
+        const dh = typeHead(std.mem.trimEnd(u8, declared.name, "?"));
+        if (staticTypeClassId(b, declared) != null) {
+            try nb.setLocalDeclTypeOwned(pname, try declared.clone(b.allocator));
+        } else if (dh.len <= 2 or ir.parseClassTypeParamIdentity(declared.name) != null) {
+            if (fparams.len != 1) return null;
+            if (elem_owned == null) {
+                const this_expr: Expr = .{ .This = .{ .qualifier = null, .span = args[li].span() } };
+                elem_owned = try iterableElementTypeRef(b, &this_expr);
+            }
+            const elem = elem_owned orelse return null;
+            try nb.setLocalDeclTypeOwned(pname, try elem.clone(b.allocator));
+        } else {
+            return null;
+        }
+    }
+    od_depth += 1;
+    const derived = staticExprTypeRef(&nb, &stmts[stmts.len - 1].Expr) catch null;
+    od_depth -= 1;
+    var derived_ty = derived orelse return null;
+    defer derived_ty.deinit(b.allocator);
+    const derived_head = typeHead(std.mem.trimEnd(u8, derived_ty.name, "?"));
+    var pick: ?FuncId = null;
+    for (family.items) |e| {
+        if (std.mem.eql(u8, e.ret, derived_head)) {
+            if (pick != null) return null;
+            pick = e.fid;
+        }
+    }
+    if (runtime.envOnce("KLIO_LAMRET_TRACE") != null and pick != null) {
+        const pf = b.module.funcById(pick.?);
+        std.debug.print("[lamret-pick] derived={s} -> {s}\n", .{ derived_head, if (pf) |f2| f2.fqn else "?" });
+    }
+    return pick;
+}
+
 /// Lower one expression into the current block, returning the register
 /// holding its value. Value-less forms (assignments, declarations) return a
 /// synthetic `Unit` register so downstream code stays uniform.
@@ -11830,7 +11966,11 @@ fn lowerPathCall(
         b.ownMemberApplicable(name0, args.len) and
         b.resolve(name0) == null and !b.isLocalFn(name0) and !b.isLocalExtFn(name0);
 
-    const cast_pick: ?FuncId = try overloadPickByCast(b, cands, args, want);
+    // Call-site evidence pre-picks a same-tier overload: an `as` cast names
+    // the parameter type outright, and a trailing lambda's derived return
+    // discriminates a return-variant family (the sumOf shape).
+    const cast_pick: ?FuncId = (try overloadPickByCast(b, cands, args, want)) orelse
+        try overloadPickByLambdaReturn(b, cands, args, want);
 
     // The index classification, for the ambiguity / out-of-scope diagnostics.
     // A cast at the call site pre-picks a same-tier overload, so an ambiguity
