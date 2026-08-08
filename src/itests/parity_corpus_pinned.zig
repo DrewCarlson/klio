@@ -2385,3 +2385,28 @@ test "string_compare_to_difference" {
         \\
     );
 }
+
+test "collection_slot_direct_intrinsic" {
+    try check("collection_slot_direct_intrinsic",
+        \\[7, 1, 2, 4]
+        \\4
+        \\false
+        \\true
+        \\2
+        \\[7, 1]
+        \\[7, 1, 2, 4, 5, 6]
+        \\[7, 1, 2, 4, 6]
+        \\[a, c]
+        \\false
+        \\2
+        \\{y=2}
+        \\1
+        \\false
+        \\true
+        \\6
+        \\1
+        \\1
+        \\false
+        \\
+    );
+}

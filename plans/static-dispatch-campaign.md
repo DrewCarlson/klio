@@ -5256,3 +5256,39 @@ settles them by id too.
 a builtin whose implementation exists host-side but is reached by receiver
 variant rather than by FQN. The remaining 55 declines are `KClass.isInstance`
 and a short tail.
+
+### A host collection reaches its intrinsic directly
+
+The decline counter and the walk counter disagreed — 55 declines against
+5,691 walks — because most walks never reach the block `KLIO_NOINST_WHY`
+instruments. They exit earlier, at the host-intrinsic probe:
+
+    if (lookupIntrinsic(self, member_fqn)) |native| {
+        if (isScalarValue(receiver)) { ...bind by FuncId... }
+        break :blk .{ .target = null, .name = n };   // <- here
+    }
+
+The native is ALREADY IN HAND at that point. The code finds
+`kotlin.collections.MutableList.add`, then declines so the named ladder can
+find the same symbol again by string.
+
+The scalar carve-out was justified by wrapper-backed values: `Result` stores
+a discriminant and a raw payload, an iterator is a host generator, and the
+conversion for those lives on the named path (binding them by id returned
+`Success` for a `Failure`). That reasoning does not extend to the CONTAINER
+variants. A host `.List`/`.Set`/`.Map` is not a wrapper — `add`, `set`, `get`
+take the value as it stands — so calling the intrinsic in hand is the same
+call the walk would make.
+
+    slot walks   5,691 -> 80
+
+and the wall clock is 28.71s / 28.74s against 28.6s, flat as every other
+channel here. What remains is a 25-entry tail: `KClass.isInstance`,
+`StringBuilder.reverse`, `Comparator.compare`, `Array.get`.
+
+Pinned by `collection_slot_direct_intrinsic`, which exercises the rebound
+members together with the mutation and iteration order a wrong binding would
+disturb — `add`/`add(index)`/`set`/`removeAt`/`addAll`/`remove`/`subList` on a
+list, the set and map forms, and a `listIterator` walking backwards.
+
+Green: commontest 117/0, drift 267/267, litmus 42/43 (known timeout), units.

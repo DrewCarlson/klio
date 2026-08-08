@@ -10018,6 +10018,23 @@ pub fn invokeVirtualMember(
                                 }
                             }
                         }
+                        // A host COLLECTION is not a wrapper: `add`/`set`/
+                        // `get` take the value as it stands, so the intrinsic
+                        // already in hand IS what the walk would land on and
+                        // calling it here skips a name search that changes
+                        // nothing. Restricted to the container variants —
+                        // `Result` and the iterator generators are the shapes
+                        // whose conversion lives on the named path.
+                        switch (receiver.*) {
+                            .List, .Set, .Map => {
+                                var argbuf = try allocator.alloc(Value, args.len + 1);
+                                defer allocator.free(argbuf);
+                                argbuf[0] = receiver.*;
+                                @memcpy(argbuf[1..], args);
+                                return dispatchIntrinsic(self, allocator, member_fqn, native, argbuf);
+                            },
+                            else => {},
+                        }
                         break :blk .{ .target = null, .name = n };
                     }
                 } else |_| {}
