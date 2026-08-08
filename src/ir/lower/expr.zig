@@ -10184,10 +10184,15 @@ fn staticCallReturnTypeRef(
             // RECEIVER may still prove one. Measured, a bare `iterator()`
             // inside a stdlib extension body lands here with a non-exact
             // top-level pick, and it is 908 of the 1,346 initializers that
-            // yield no type.
+            // yield no type. An inline SPLICE window is a receiver context
+            // too: its receiver lives in the window hint, not recvTy, and a
+            // non-exact `iterator` pick there handed a Map-family
+            // declaration's `Iterator<Entry>` to a List splice, poisoning
+            // every `next()` after it.
             const top_level_usable = res.target != null and
                 (res.confidence == .exact or
-                    (b.recvTy() == null and !b.isParamThunk()));
+                    (b.recvTy() == null and b.spliceRecvTy() == null and
+                        !b.isParamThunk()));
             // A refused top-level pick is still the ONLY answer when the name
             // has exactly one declaration program-wide and no enclosing
             // receiver declares a member of that name: there is nothing else
@@ -10298,8 +10303,28 @@ fn staticCallReturnTypeRef(
                     .args = &.{},
                 };
                 if (!std.mem.eql(u8, typeHead(bare_recv.name), head_name)) {
+                    // A window receiver whose head differs from the declared
+                    // one is usually its SUBTYPE (`List<String>` under an
+                    // `Iterable`-declared splice): project it so the type
+                    // arguments survive — dropping to a bare head star-filled
+                    // `iterator()` to `Iterator<*>` and untyped every
+                    // spliced selector's parameter after it.
+                    const projected: ?ir.TypeRef = blk_pj: {
+                        const head_cid = (if (std.mem.indexOfScalar(u8, head_name, '.') != null)
+                            b.module.classIdByFqn(head_name)
+                        else
+                            b.module.uniqueClassIdBySimpleName(typeHead(head_name))) orelse break :blk_pj null;
+                        // projectTypeToClass borrows from its input (arena
+                        // semantics — it may return the input itself), so
+                        // project in a scratch arena and clone out before the
+                        // input dies.
+                        var pj_scratch = std.heap.ArenaAllocator.init(b.allocator);
+                        defer pj_scratch.deinit();
+                        const p = (try b.module.projectTypeToClass(pj_scratch.allocator(), bare_recv, head_cid)) orelse break :blk_pj null;
+                        break :blk_pj try p.clone(b.allocator);
+                    };
                     bare_recv.deinit(b.allocator);
-                    bare_recv = ir.TypeRef{
+                    bare_recv = projected orelse ir.TypeRef{
                         .name = try b.allocator.dupe(u8, head_name),
                         .nullable = false,
                         .args = &.{},
@@ -10663,7 +10688,7 @@ fn staticCallReturnTypeRef(
                 if (mt) std.debug.print("[bareret] .{s} on {s} no target (recv_ty={s} args={d} nshapes={d})\n", .{ member.name.name, head, recv_ty.name, recv_ty.args.len, shape_set.shapes.len });
                 return null;
             };
-            if (mt) std.debug.print("[bareret] .{s} on {s} target ok\n", .{ member.name.name, head });
+            if (mt) std.debug.print("[bareret] .{s} on {s} target ok fqn={s}\n", .{ member.name.name, head, if (b.module.funcById(target)) |tf| tf.fqn else "?" });
         },
         else => return null,
     }
@@ -10774,17 +10799,20 @@ fn staticCallReturnTypeRef(
     if (call.callee.* == .Path and call.callee.Path.segments.len == 1 and
         bareRetTraceFor(b, call.callee.Path.segments[0].name))
     {
-        std.debug.print("[bareret] {s} return={s} args={d} fn={s}\n", .{
+        std.debug.print("[bareret] {s} return={s} args={d} arg0={s} fn={s}\n", .{
             call.callee.Path.segments[0].name,
             if (inferred) |i| i.name else "<null>",
             if (inferred) |i| i.args.len else 0,
+            if (inferred) |i| (if (i.args.len != 0) i.args[0].name else "-") else "-",
             build.currentRealFn() orelse "-",
         });
     }
     if (call.callee.* == .Member and bareRetTraceFor(b, call.callee.Member.name.name)) {
-        std.debug.print("[bareret] .{s} return={s}\n", .{
+        std.debug.print("[bareret] .{s} return={s} rargs={d} fn={s}\n", .{
             call.callee.Member.name.name,
             if (inferred) |i| i.name else "<null>",
+            if (inferred) |i| i.args.len else 0,
+            build.currentRealFn() orelse "-",
         });
     }
     return inferred;

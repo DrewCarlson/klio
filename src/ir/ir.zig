@@ -5643,7 +5643,7 @@ pub const Module = struct {
         return callTypeParam(params, ty.name);
     }
 
-    fn projectTypeToClass(
+    pub fn projectTypeToClass(
         self: *const Module,
         allocator: Allocator,
         actual: TypeRef,

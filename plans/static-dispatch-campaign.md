@@ -5726,3 +5726,46 @@ rejection rather than guessing:
 
 Census: `no_receiver_type` 132 -> 118, total 9040 -> 9030, bound share
 98.49% (bound_virtual 7279 -> 7283).
+
+### The splice window is a receiver context, and its receiver projects
+
+The `it`-in-minOfWith/maxOfWith cluster (12 sites) was THREE stacked
+mechanisms, found by following one wrong type backwards. NOTE the trap
+that hid this for a whole scoping pass: the earlier "standalone repro
+types fine" checks were reading the RETURN-DERIVATION channel
+(`KLIO_BARERET` rows) while the census counts the EMISSION channel — the
+standalone repro reproduced all along.
+
+1. **A bare call inside an inline splice took a non-exact top-level
+   pick.** `top_level_usable` treated `recvTy() == null` as "no receiver
+   context", but a splice window's receiver lives in the window hint —
+   so bare `iterator()` inside minOfWith's spliced body resolved to a
+   top-level Map-family declaration and typed `Iterator<Entry>` on a
+   List splice, poisoning every `next()` after it (all fourteen `.next`
+   derivations in the probe printed Entry). The guard now also requires
+   `spliceRecvTy() == null`.
+
+2. **The head-consistency check dropped the window receiver's
+   arguments.** With the pick vetoed, the walk built its receiver from
+   the DECLARED head: the window's actual `List<String>` failed the
+   `List != Iterable` head comparison and was rebuilt as bare
+   `Iterable`, star-filling `iterator()` to `Iterator<*>`. The mismatch
+   case now PROJECTS the window receiver onto the declared head's class
+   (`projectTypeToClass`, in a scratch arena — it borrows from its
+   input, and cloning out after deinit was a use-after-free the first
+   attempt hit as `@memcpy arguments alias`).
+
+3. **The splice's lambda-parameter binding never derived CALL-shaped
+   arguments.** `spliceInlineLambdaOn` typed parameters from declared
+   locals and Index expressions only; `selector(iterator.next())` left
+   `it` untyped even once `next()` typed String. The binding now falls
+   back to `staticExprTypeRef`, the same pattern the value-param path
+   already used.
+
+Census: `no_receiver_type` 118 -> 108, but `no_class_id` 10 -> 22 — the
+newly-typed receivers include TYPEALIAS heads (`DeepRecursiveFunctionBlock`)
+that the class lookup cannot map, so ~12 sites reclassified rather than
+bound; net unbound 136 -> 138 while the Entry-poisoning typing bug is
+fixed and the take/next chains bind. FOLLOW-UP: alias-resolve the head at
+the `no_class_id` site. Pinned: `splice_window_receiver_typing`
+(behaviour), plus the census A/B recorded here.

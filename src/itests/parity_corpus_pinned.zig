@@ -2436,6 +2436,15 @@ test "overload_tied_on_lambda_return" {
     );
 }
 
+test "splice_window_receiver_typing" {
+    try check("splice_window_receiver_typing",
+        \\bca
+        \\abc
+        \\x
+        \\
+    );
+}
+
 test "vararg_forward_named_skip" {
     try check("vararg_forward_named_skip",
         \\strings:2:0:true:0

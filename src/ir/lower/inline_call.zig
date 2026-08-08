@@ -528,7 +528,13 @@ pub fn spliceInlineLambdaOn(
         const ae = &arg_exprs[ai];
         if (ae.* == .Index and ae.Index.args.len == 1) {
             slot.* = try expr_lower.iterableElementTypeRef(b, ae.Index.receiver);
-        } else slot.* = null;
+        } else {
+            // A CALL argument (`selector(iterator.next())`) carries the same
+            // element fact the loop-variable and indexed forms do — the
+            // static deriver answers it, exactly as the value-param path
+            // above does for tp-declared params.
+            slot.* = try expr_lower.staticExprTypeRef(b, ae);
+        }
     }
     var bi: usize = 0;
     while (bi < bind_n) : (bi += 1) {
