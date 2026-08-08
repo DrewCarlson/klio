@@ -2436,6 +2436,14 @@ test "overload_tied_on_lambda_return" {
     );
 }
 
+test "vararg_forward_named_skip" {
+    try check("vararg_forward_named_skip",
+        \\strings:2:0:true:0
+        \\chars:1:0:false:7
+        \\
+    );
+}
+
 test "type_param_bounded_by_type_param" {
     try check("type_param_bounded_by_type_param",
         \\foobar/foo/2/list-typed

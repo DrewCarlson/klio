@@ -108,6 +108,27 @@ pub fn varargArrayHead(elem: []const u8) []const u8 {
     return "Array";
 }
 
+/// The full materialized type of a `vararg x: T` parameter inside the body:
+/// the primitive-specialized array for primitive elements, `Array<out T>`
+/// with the ELEMENT carried otherwise — a head-only `Array` record made
+/// `rangesDelimitedBy(delimiters, ...)` unbindable against its
+/// `Array<out String>` parameter (one side had an argument, the other none).
+/// Caller owns the result.
+pub fn varargArrayTypeRef(allocator: std.mem.Allocator, elem: *const ast.TypeRef) Allocator.Error!ir.TypeRef {
+    const head = varargArrayHead(elem.name.name);
+    if (!std.mem.eql(u8, head, "Array")) {
+        return .{ .name = try allocator.dupe(u8, head), .nullable = false, .args = &.{} };
+    }
+    var element = try loweredTypeRef(allocator, elem, true);
+    errdefer element.deinit(allocator);
+    const projected = try std.fmt.allocPrint(allocator, "out#{s}", .{element.name});
+    allocator.free(@constCast(element.name));
+    element.name = projected;
+    const args = try allocator.alloc(ir.TypeRef, 1);
+    args[0] = element;
+    return .{ .name = try allocator.dupe(u8, "Array"), .nullable = false, .args = args };
+}
+
 pub fn bindParams(b: *FuncBuilder, names: []const []const u8) Allocator.Error!void {
     for (names, 0..) |name, i| {
         const dst = b.allocReg();
@@ -2004,7 +2025,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     // carry `declared_recv=String` and bind CharSequence extensions.
     for (f.params) |*p| {
         if (p.is_vararg) {
-            try b.setLocalDeclType(p.name.name, varargArrayHead(p.ty.name.name));
+            try b.setLocalDeclTypeOwned(p.name.name, try varargArrayTypeRef(b.allocator, &p.ty));
         } else {
             try b.setLocalDeclTypeOwned(
                 p.name.name,
