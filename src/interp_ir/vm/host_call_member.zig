@@ -9791,7 +9791,14 @@ pub fn slotByNameFallbacks() u64 {
 /// The FQN comparison happens ONCE per `FuncId` per thread; every later call
 /// on that slot is an integer probe. The handlers are the existing ones — a
 /// second implementation here is exactly the duplication this avoids.
-const HostSlotOp = enum { iterator_protocol, collection_iterator };
+const HostSlotOp = enum {
+    iterator_protocol,
+    collection_iterator,
+    kclass_is_instance,
+    comparator_member,
+    array_get,
+    sequence_iterator,
+};
 
 threadlocal var host_slot_ops: ?std.AutoHashMapUnmanaged(u32, ?HostSlotOp) = null;
 
@@ -9819,8 +9826,26 @@ fn hostSlotOpFor(module: *const Module, target: FuncId) ?HostSlotOp {
                 std.mem.eql(u8, owner, "kotlin.collections.List") or
                 std.mem.eql(u8, owner, "kotlin.collections.MutableList") or
                 std.mem.eql(u8, owner, "kotlin.collections.Set") or
-                std.mem.eql(u8, owner, "kotlin.collections.MutableSet")))
+                std.mem.eql(u8, owner, "kotlin.collections.MutableSet") or
+                std.mem.eql(u8, owner, "kotlin.collections.ArrayList") or
+                std.mem.eql(u8, owner, "kotlin.collections.HashSet") or
+                std.mem.eql(u8, owner, "kotlin.collections.LinkedHashSet")))
             break :blk .collection_iterator;
+        // The remaining interface members the host serves from the value's
+        // own representation, measured off the noinst-why decline tally:
+        // KClass.isInstance, Comparator.compare, indexed array get, and a
+        // Sequence's lazy iterator.
+        if (std.mem.eql(u8, owner, "kotlin.reflect.KClass") and
+            std.mem.eql(u8, name, "isInstance")) break :blk .kclass_is_instance;
+        if (std.mem.eql(u8, owner, "kotlin.Comparator") and
+            std.mem.eql(u8, name, "compare")) break :blk .comparator_member;
+        if (std.mem.eql(u8, name, "get") and
+            std.mem.startsWith(u8, owner, "kotlin.") and
+            std.mem.endsWith(u8, owner, "Array") and
+            std.mem.indexOfScalar(u8, owner["kotlin.".len..], '.') == null)
+            break :blk .array_get;
+        if (std.mem.eql(u8, owner, "kotlin.sequences.Sequence") and
+            std.mem.eql(u8, name, "iterator")) break :blk .sequence_iterator;
         break :blk null;
     };
     map.put(std.heap.page_allocator, target.int(), op) catch return op;
@@ -9844,6 +9869,36 @@ fn runHostSlotOp(self: *VmHost, allocator: Allocator, op: HostSlotOp, receiver: 
                 else => {},
             }
             return builtinIterator(self, allocator, receiver);
+        },
+        .kclass_is_instance => {
+            if (receiver.* != .Class or args.len != 1) return null;
+            const cg = receiver.Class.borrow();
+            const cname = cg.get().name;
+            const r = boolVal(args[0].isRuntimeType(cname));
+            cg.deinit();
+            return .{ .ok = r };
+        },
+        .comparator_member => switch (receiver.*) {
+            .Comparator => return comparatorMember(self, allocator, receiver, name, args),
+            else => return null,
+        },
+        .array_get => {
+            if (receiver.* != .Array or args.len != 1) return null;
+            const idx = args[0].asI64() orelse return null;
+            const arr = receiver.Array;
+            const n = arr.len();
+            if (idx >= 0 and @as(usize, @intCast(idx)) < n) {
+                const elem = arr.get(@intCast(idx));
+                elem.retain();
+                return .{ .ok = elem };
+            }
+            const msg = try std.fmt.allocPrint(allocator, "Index {d} out of bounds for length {d}", .{ idx, n });
+            defer if (runtime.freeScratch()) allocator.free(msg);
+            return .{ .err = try throwExc(allocator, "kotlin.ArrayIndexOutOfBoundsException", msg) };
+        },
+        .sequence_iterator => switch (receiver.*) {
+            .Sequence => return sequenceMember(self, allocator, receiver, name, args),
+            else => return null,
         },
     }
 }

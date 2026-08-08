@@ -5770,6 +5770,26 @@ fixed and the take/next chains bind. FOLLOW-UP: alias-resolve the head at
 the `no_class_id` site. Pinned: `splice_window_receiver_typing`
 (behaviour), plus the census A/B recorded here.
 
+### The slot walks fall to the scalar floor
+
+The 60 remaining by-name slot walks were SIX shapes, named exactly by the
+`KLIO_NOINST_WHY` tally: `KClass.isInstance` x25, `Comparator.compare`
+x13, `IntArray.get`/`Array.get` x10, `ArrayList.iterator` x4
+(no-slot-entry — a concrete-class slot root), `Sequence.iterator` x3.
+All are interface members the host serves from the value's own
+representation, so the `HostSlotOp` FuncId table gained
+`kclass_is_instance`, `comparator_member`, `array_get`, and
+`sequence_iterator` (each routing to the exact handler the by-name walk
+used), and the collection-iterator owner list gained the concrete
+`ArrayList`/`HashSet`/`LinkedHashSet` roots. After: **5 walks**
+(`Any.toString` x3, `Byte.toInt` x2 — the scalar floor), zero
+`noinst-why` declines, `member_ladder` 12,517 -> 12,421.
+
+Instrument note that unblocked several stuck greps this session: the
+`$class$` identity mangle embeds NUL bytes, so any log carrying those
+rows is BINARY to grep — filter with `grep -a` or the rows silently
+vanish and the dump looks nondeterministic.
+
 The follow-up resolved same-session, and the typealias guess above was
 mostly WRONG — the `[no-class]` dump now captures its heads into a fixed
 buffer at the count site and names them with the summary (the per-site

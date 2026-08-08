@@ -78,6 +78,7 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_NULLEXT_NAMES` | set | Every member call held off the static path because a `T?` extension of that name exists and the extension itself did not resolve — the residue of the nullable-receiver rule | `[nullext]` |
 | `KLIO_SPLICE_REF` | set | The full receiver type each inline splice installs in its window, and the argument it came from. Names the link where a chain loses its type arguments | `[splice-ref]` |
 | `KLIO_SLOT_BYNAME` | set | Every statically bound virtual slot call that degraded to a by-name member walk, with the slot root. The host boundary made visible | `[slot-byname]` |
+| — | — | NOTE: any captured log carrying `$class$` identity-mangle rows embeds NUL bytes and is BINARY to grep — filter with `grep -a`, or matching rows silently vanish and a dump looks nondeterministic | — |
 | `KLIO_COMP_TRACE` | set | The type a destructured name takes from its `componentN()` accessor, or why none was available | `[comp]` |
 | `KLIO_INIT_SELF` | `0` to disable | Off, a local's own name shadows its initializer's bare call again (`val iterator = iterator()`). For A/B measurement of that channel from one binary | — |
 | `KLIO_TP_HEAD` | `0` to disable | Off, a type-parameter receiver resolves only through a bound that carries no type arguments, so `C : MutableCollection<in T>` names no owner again | — |
