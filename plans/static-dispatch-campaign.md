@@ -6189,3 +6189,36 @@ nested-construction tail already perform — and emits the statically
 bound NewInstance directly. no_receiver_type 93 -> 89. Pinned:
 `nested_class_qualified_ctor`. Battery: 117/0, corpus 267/267, litmus
 42/43 (known flake), unit green, compose 1349/0.
+
+### DESIGN: overload disambiguation by lambda return (the sumOf family)
+
+`UByteArray.sum() = sumOf { it.toUInt() }` cannot commit: after the
+receiver filters the candidate set, FIVE `Iterable<T>.sumOf` variants
+remain, identical except the selector's declared RETURN ((T) -> Int /
+Long / UInt / ULong / Double). kotlinc discriminates by the lambda's
+inferred return; klio's lambda shape carries only arity, so the tie
+stands and `it` never types (x4 census rows; the minOfWith R rows are
+the same solve reached through a sibling argument).
+
+The mechanism, argued against the recorded member-tail refutation: when
+the applicable candidates at a trailing-lambda call agree on the
+lambda-slot's PARAMETER types after receiver instantiation (T := UByte
+from the receiver match) and differ only in the declared return, derive
+the lambda literal's tail under that agreed concrete binding — ANY tail
+kind, including member tails, because the derivation's only consumer is
+the pick among a FIXED overload set. The getOrPut net-negative came
+from feeding a derived call-tail binding into GENERIC INSTANTIATION
+(V := ArrayList narrowing what the callee's own commitment then
+disproved); a fixed-set pick cannot narrow a type variable, so the
+hazard does not apply. The derived return refines the lambda's arg
+shape to FunctionN<agreed params..., derived R> and resolution re-asks;
+no match (a Byte-returning lambda against the Int/Long/UInt/ULong/
+Double set — kotlinc reports ambiguity there too) leaves the tie and
+the site stays dynamic.
+
+Implementation point: the candidate-collection paths that already walk
+the applicable set (the overload-agreement recorder and the extension
+resolution's decline tail), plus the same refinement in the derivation
+channel so both channels see one answer. Verify: the `it toUInt fn=sum`
+x4 rows, then the minOfWith/maxOfWith rows with the sibling-expected
+push on top.
