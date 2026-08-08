@@ -17065,6 +17065,48 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     const ast_type_args = call.type_args;
     const receiver = callee.Member.receiver;
     const name = callee.Member.name;
+    // `BytesHexFormat.Builder()` — a class-named receiver whose member names
+    // a NESTED CONSTRUCTIBLE CLASS is a constructor call. Emit the
+    // statically bound NewInstance the bare form gets (the same resolution
+    // the derivation arm and the runtime walk's nested-construction tail
+    // perform), instead of a member walk on the companion value.
+    if (receiver.* == .Path and receiver.Path.segments.len == 1) {
+        const outer_name = receiver.Path.segments[0].name;
+        if (outer_name.len != 0 and std.ascii.isUpper(outer_name[0]) and
+            name.name.len != 0 and std.ascii.isUpper(name.name[0]) and
+            b.resolve(outer_name) == null and !b.knowsOuter(outer_name) and
+            !enclosingHasMemberNamed(b, outer_name))
+        {
+            var qb: [128]u8 = undefined;
+            if (std.fmt.bufPrint(&qb, "{s}.{s}", .{ outer_name, name.name }) catch null) |qualified| {
+                if (b.module.classIdByQualifiedSuffix(qualified)) |ncid| {
+                    if (ncid.int() < b.module.classes.items.len) {
+                        const ncls = &b.module.classes.items[ncid.int()];
+                        if (!ncls.is_object and !ncls.is_stub and !ncls.is_value and
+                            !ncls.is_abstract and !ncls.is_interface)
+                        {
+                            const ctor_arity = try ctorArgFnArities(b, ncid, args, ast_arg_names);
+                            defer if (ctor_arity) |ca| b.allocator.free(ca);
+                            const run = try lowerArgRunFull(b, args, ctor_arity, null);
+                            const realigned = try ctorRealignedArgNames(b, ncid, args, ast_arg_names);
+                            defer if (realigned) |r| b.allocator.free(r);
+                            const arg_names = try internArgNames(b.allocator, b.module, realigned orelse ast_arg_names);
+                            const dst = b.allocReg();
+                            try b.push(.{ .NewInstance = .{
+                                .dst = dst,
+                                .class = ncid,
+                                .args = run[0],
+                                .n_args = run[1],
+                                .arg_names = arg_names,
+                                .arg_static_heads = try ctorArgStaticHeads(b, args),
+                            } });
+                            return dst;
+                        }
+                    }
+                }
+            }
+        }
+    }
     const declared_from_expr = argDeclTypeRef(b, receiver);
     // The FULL static deriver, not just the call-return channel: a BINARY
     // receiver (`(a * bitsPerSymbol) / bitsPerByte).toInt()`) types by the

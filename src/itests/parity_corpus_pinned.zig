@@ -2450,6 +2450,15 @@ test "index_set_fast_path" {
     );
 }
 
+test "nested_class_qualified_ctor" {
+    try check("nested_class_qualified_ctor",
+        \\built:7
+        \\3
+        \\companion-lives
+        \\
+    );
+}
+
 test "type_safe_bridge_barrier" {
     try check("type_safe_bridge_barrier",
         \\-1

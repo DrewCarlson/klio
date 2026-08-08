@@ -6176,3 +6176,16 @@ newly-typed receivers into argument-authority declines):
 Pinned: `class_param_lambda_receiver`, `type_safe_bridge_barrier`.
 Battery: 117/0, corpus 267/267, litmus 42/43 (known flake), unit green,
 compose 1349/0.
+
+### A qualified nested-class constructor emits its NewInstance
+
+`BytesHexFormat.Builder()` / `NumberHexFormat.Builder()` inside
+HexFormat's builder getters lowered as a member walk on the companion
+value (the receiver name typed as nothing, four census rows). The
+emission now recognizes a class-named receiver whose member names a
+NESTED CONSTRUCTIBLE CLASS — the same `classIdByQualifiedSuffix`
+resolution the derivation arm and the runtime walk's
+nested-construction tail already perform — and emits the statically
+bound NewInstance directly. no_receiver_type 93 -> 89. Pinned:
+`nested_class_qualified_ctor`. Battery: 117/0, corpus 267/267, litmus
+42/43 (known flake), unit green, compose 1349/0.
