@@ -5452,6 +5452,23 @@ the builtin slot gap; raising the compose runTest cap (cost two whole classes).
   (`.size`/`.Monotonic`/`.iso`/`.default`/`.length` property reads),
   This 8, Binary 8 (companion-property reads like `bitsPerSymbol` not
   typing the operand).
+
+  DESIGN for the compareBy mechanism (the largest single one): at
+  `minOfWith(compareBy { it.reversed() }) { it.take(3) }` the first
+  argument's `T` comes from the EXPECTED type `Comparator<in R>` whose
+  `R` is solved by the TRAILING lambda's return — an argument-order
+  problem, since args lower left to right. The pieces already exist:
+  `buildStaticReturnArgShapes` walks all args before emission,
+  `enrichLambdaArgShapes` derives the trailing lambda's return under
+  the receiver binding (`it.take(3)` types String once `T := String`),
+  `solveCallBindings` computes the full binding set, and an
+  expected-type stack (`b.peekExpected`) already threads expected
+  types into nested lowering. The change: after the callee commits and
+  bindings solve, push each parameter's INSTANTIATED type as the
+  expected type while lowering the corresponding ARGUMENT expression —
+  then `compareBy`'s own resolution sees `Comparator<in String>`,
+  binds its `T`, and its lambda's `it` types. Verify with the
+  minOfWith/maxOfWith census rows (12 sites) and A/B by stashing.
 - `member_ladder` 12,421 -> 2,944. The ladder key now carries the
   ENCLOSING FUNCTION (`<ladder>Type.name@fn`), which named the total as
   a few hot sites times execution counts: `this[index] = v` inside the
