@@ -10791,6 +10791,7 @@ fn staticCallReturnTypeRef(
     }
 
     try enrichLambdaArgShapes(b, target, call.args, &shape_set);
+    try enrichCallableRefArgShapes(b, target, call.args, &shape_set);
     const explicit = try b.allocator.alloc(ir.TypeRef, call.type_args.len);
     defer {
         for (explicit) |*ty| ty.deinit(b.allocator);
@@ -11103,6 +11104,133 @@ fn enrichLambdaArgShapes(
     }
 }
 
+/// A callable-reference argument's function type, read from the referenced
+/// declaration — `map(Int::toUInt)` carries `Function1<Int, UInt>` so the
+/// callee's `R` binds from the reference's declared return exactly as kotlinc
+/// sees it. Declaration-read, never derived from a body, so it is
+/// authoritative evidence. An unbound class reference contributes its
+/// receiver as the leading parameter; a bound reference contributes the
+/// member's own parameters only. With no expected arity (pre-resolution,
+/// where the shape itself disambiguates the outer overload set), the member
+/// is probed at arities 0..2 and the first commitment wins; a member the
+/// probe cannot commit stays unshaped.
+fn callableRefDeclTypeRef(
+    b: *FuncBuilder,
+    mr: anytype,
+    want_arity: ?usize,
+) Allocator.Error!?ir.TypeRef {
+    var unbound = false;
+    var recv_ty: ir.TypeRef = .{ .name = "", .nullable = false, .args = &.{} };
+    if (mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1 and
+        b.resolve(mr.receiver.Path.segments[0].name) == null and
+        !b.knowsOuter(mr.receiver.Path.segments[0].name))
+    {
+        const rn = mr.receiver.Path.segments[0].name;
+        if (b.module.classIdIndexed(rn, b.self_package, mr.name.span.file) != null) {
+            unbound = true;
+            recv_ty = .{ .name = rn, .nullable = false, .args = &.{} };
+        }
+    }
+    if (!unbound) {
+        recv_ty = argDeclTypeRefLazy(b, mr.receiver) orelse return null;
+    }
+    const owner = staticTypeClassId(b, recv_ty) orelse return null;
+    var mf: ?*const ir.Func = null;
+    var member_arity: usize = 0;
+    if (want_arity) |wa| {
+        if (wa < @intFromBool(unbound)) return null;
+        member_arity = wa - @intFromBool(unbound);
+        mf = resolveRefMemberAtArity(b, owner, mr.name, recv_ty, member_arity);
+    } else {
+        while (member_arity <= 2) : (member_arity += 1) {
+            mf = resolveRefMemberAtArity(b, owner, mr.name, recv_ty, member_arity);
+            if (mf != null) break;
+        }
+    }
+    const f = mf orelse return null;
+    if (!f.return_ty_declared or f.return_ty.name.len == 0) return null;
+    // A bare type-parameter return says nothing the solver can bind.
+    if (staticTypeClassId(b, f.return_ty) == null) return null;
+    const m_has_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+    const m_params = f.params[@intFromBool(m_has_this)..];
+    if (m_params.len != member_arity) return null;
+    const fn_arity = member_arity + @intFromBool(unbound);
+    const fn_args = try b.allocator.alloc(ir.TypeRef, fn_arity + 1);
+    var filled: usize = 0;
+    errdefer {
+        for (fn_args[0..filled]) |*t| t.deinit(b.allocator);
+        b.allocator.free(fn_args);
+    }
+    if (unbound) {
+        fn_args[0] = try recv_ty.clone(b.allocator);
+        filled = 1;
+    }
+    for (m_params) |*mp| {
+        fn_args[filled] = try mp.ty.clone(b.allocator);
+        filled += 1;
+    }
+    fn_args[filled] = try f.return_ty.clone(b.allocator);
+    filled += 1;
+    const fn_name = try std.fmt.allocPrint(b.allocator, "Function{d}", .{fn_arity});
+    if (runtime.envOnce("KLIO_LAMRET_TRACE") != null) {
+        std.debug.print("[refshape] {s}::{s} -> {s} ret={s} unbound={}\n", .{
+            recv_ty.name, mr.name.name, fn_name, f.return_ty.name, unbound,
+        });
+    }
+    return .{ .name = fn_name, .nullable = false, .args = fn_args };
+}
+
+fn resolveRefMemberAtArity(
+    b: *FuncBuilder,
+    owner: ir.ClassId,
+    name: ast.Ident,
+    recv_ty: ir.TypeRef,
+    arity: usize,
+) ?*const ir.Func {
+    var shape_buf: [3]applicability.ArgShape = @splat(.{ .ty_authoritative = false });
+    if (arity > shape_buf.len) return null;
+    const resolved = b.module.resolveMemberCall(owner, name.name, shape_buf[0..arity], .{
+        .caller_file = name.span.file,
+        .lexical_owner = null,
+        .receiver_type = recv_ty,
+    });
+    if (resolved.target) |fid| return b.module.funcById(fid);
+    // `Int::toUInt` names an EXTENSION — the reference resolves through the
+    // same extension engine its call form uses.
+    const ext = b.module.resolveExtensionCall(name.name, recv_ty, shape_buf[0..arity], .{
+        .caller_file = name.span.file,
+        .caller_package = b.module.packageOfFile(name.span.file) orelse b.self_package,
+        .lexical_owner = b.ownerClass(),
+        .call_name = name.name,
+    });
+    const fid = ext.target orelse return null;
+    return b.module.funcById(fid);
+}
+
+fn enrichCallableRefArgShapes(
+    b: *FuncBuilder,
+    target: FuncId,
+    args: []const Expr,
+    shape_set: *StaticReturnArgShapes,
+) Allocator.Error!void {
+    const tf = b.module.funcById(target) orelse return;
+    const has_this = tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this");
+    const first = @intFromBool(has_this);
+    for (args, 0..) |*arg, i| {
+        if (arg.* != .MemberRef) continue;
+        if (shape_set.shapes[i].ty != null or shape_set.inferred[i] != null) continue;
+        const pi = first + i;
+        if (pi >= tf.params.len) break;
+        const pty = tf.params[pi].ty;
+        if (!std.mem.startsWith(u8, typeHead(pty.name), "Function") or pty.args.len == 0) continue;
+        shape_set.inferred[i] = try callableRefDeclTypeRef(b, &arg.MemberRef, pty.args.len - 1);
+        if (shape_set.inferred[i] != null) {
+            shape_set.shapes[i].ty = shape_set.inferred[i].?;
+            shape_set.shapes[i].ty_authoritative = true;
+        }
+    }
+}
+
 pub fn buildStaticReturnArgShapes(
     b: *FuncBuilder,
     args: []const Expr,
@@ -11120,7 +11248,15 @@ pub fn buildStaticReturnArgShapes(
     }
     for (args, shapes, inferred) |*arg, *shape, *owned| {
         if (shape.ty != null) continue;
-        owned.* = try staticCallReturnTypeRef(b, arg);
+        // A callable reference's function type is declaration-read and can
+        // disambiguate the outer overload set, so it is shaped BEFORE any
+        // resolution commits (the expected-arity refinement in
+        // enrichCallableRefArgShapes serves the cases the probe declines).
+        if (arg.* == .MemberRef and !std.mem.eql(u8, runtime.envOnce("KLIO_REFSHAPE") orelse "1", "0")) {
+            owned.* = try callableRefDeclTypeRef(b, &arg.MemberRef, null);
+        } else {
+            owned.* = try staticCallReturnTypeRef(b, arg);
+        }
         if (owned.*) |ty| {
             shape.ty = ty;
             shape.ty_authoritative = true;
@@ -15582,9 +15718,21 @@ fn lowerResolvedMemberCall(
             lm_norecv_path[@intFromEnum(which)] += 1;
             if (runtime.envOnce("KLIO_NORECV_NAMES")) |want| {
                 if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, @tagName(which))) {
-                    std.debug.print("[no-recv-name] {s} {s} owner={s} recv={s} call={s} fn={s} param={} splice={s} lam_recv={s}\n", .{
+                    var nloc_buf: [256]u8 = undefined;
+                    const nloc: []const u8 = nblk: {
+                        if (span.active_map) |m| {
+                            if (m.getChecked(name.span.file)) |sf| {
+                                const lc = sf.lineCol(name.span.start);
+                                const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |si| sf.path[si + 1 ..] else sf.path;
+                                break :nblk std.fmt.bufPrint(&nloc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
+                            }
+                        }
+                        break :nblk "?";
+                    };
+                    std.debug.print("[no-recv-name] {s} {s} at={s} owner={s} recv={s} call={s} fn={s} param={} splice={s} lam_recv={s}\n", .{
                         @tagName(which),
                         rn,
+                        nloc,
                         b.ownerClass() orelse "<none>",
                         bareStaticRecvHead(b) orelse "<none>",
                         name.name,

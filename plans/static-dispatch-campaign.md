@@ -6098,3 +6098,35 @@ reject `parseClassTypeParamIdentity` hits. Census after:
 `no_class_id` 22 -> 10 (baseline), `no_receiver_type` 108 -> 110, total
 9022 — net unbound 128, bound share 98.58%, the best measured. The two
 typealias/Function heads remain, too small to chase now.
+
+### A callable-reference argument carries its declared function type
+
+The typing-tail attack resumed with the name-level census dump
+(`KLIO_NORECV_NAMES='*'` now prints `at=file:line` per row): the 96
+`no_receiver_type` split 68 Path (42 local_no_decl_type, 13 unknown, 5
+captured, 4 enclosing_member), 12 Call, 7 Member, 6 Binary, 2 Postfix,
+1 Index. First mechanism landed from it: a `MemberRef` argument
+(`map(Int::toUInt)`) now contributes `Function1<Int, UInt>` as its
+static shape, read from the referenced DECLARATION (member first, then
+the extension engine at probed arities 0..2 pre-resolution;
+expected-arity refinement after the callee commits). Declaration-read
+evidence, never body-derived — outside the recorded member-tail
+enrichment refutation. `KLIO_REFSHAPE=0` bisects.
+
+The sweep caught the downstream half: with the shape, `filter`/`map`
+chains COMMIT and inline-splice where they used to emit the dynamic
+walk, and the spliced `transform(item)` invokes the reference VALUE —
+which lowered NAME-carrying (the inline arg path stashed expected arity
+only for Lambda/AnonFun args), and a name-carrying reference cannot
+reach a private extension at run time (`String::indentWidth` in
+Indent.kt broke trimIndent/appendLine/BytesHexFormat). The fix binds
+the fid at LOWERING, where the reference resolves in its own file's
+visibility scope, by stashing the declared arity for MemberRef args
+too. That is the contract's own rule: resolution happens at lowering,
+the runtime executes ids.
+
+Census: tail unchanged (96/2/6; the pinned set has no ref chains — the
+win is visible as CallMember -> inline splice in the replaceIndent
+dump and the newly-typed UArrays chains). Battery green, corpus
+267/267. Pinned: `callable_ref_inline_arg` (private-extension ref
+through inline map, unbound ref chain typing end to end).

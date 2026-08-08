@@ -2450,6 +2450,16 @@ test "index_set_fast_path" {
     );
 }
 
+test "callable_ref_inline_arg" {
+    try check("callable_ref_inline_arg",
+        \\[3, 4, 5]
+        \\12
+        \\6
+        \\<x><y>
+        \\
+    );
+}
+
 test "binary_operator_overload_return" {
     try check("binary_operator_overload_return",
         \\-2
