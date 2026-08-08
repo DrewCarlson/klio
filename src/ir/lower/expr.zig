@@ -9584,13 +9584,22 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
             if (cast.safe) out.nullable = true;
             return out;
         },
-        // `this` (or `this@Outer`) inside a class body.
+        // `this` (or `this@Outer`) inside a class body, an extension body,
+        // or an inline splice window.
         .This => |this_e| {
             if (this_e.qualifier) |q| {
                 if (b.module.uniqueClassIdBySimpleName(q.name) != null) {
                     return .{ .name = try b.allocator.dupe(u8, q.name), .nullable = false, .args = &.{} };
                 }
                 return null;
+            }
+            // The declared extension receiver, then the splice window's
+            // ACTUAL receiver (`this.fill(...)` inside an IntArray splice),
+            // then the enclosing class.
+            if (b.recvTypeRef()) |declared| return try declared.clone(b.allocator);
+            if (b.spliceRecvTyRef()) |art| return try art.clone(b.allocator);
+            if (b.spliceRecvTy()) |head| {
+                return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
             }
             if (b.ownerClass()) |owner| {
                 return .{ .name = try b.allocator.dupe(u8, owner), .nullable = false, .args = &.{} };
@@ -15455,6 +15464,15 @@ fn lowerResolvedMemberCall(
         lmNote(.no_receiver_type);
         if (!norecvCensusOn()) return .none;
         lm_norecv[@intFromEnum(std.meta.activeTag(receiver.*))] += 1;
+        if (receiver.* == .This and runtime.envOnce("KLIO_NORECV_NAMES") != null) {
+            std.debug.print("[no-recv-this] call={s} fn={s} owner={s} recv={s} splice={s}\n", .{
+                name.name,
+                build.currentRealFn() orelse "-",
+                b.ownerClass() orelse "-",
+                b.recvTy() orelse "-",
+                b.spliceRecvTy() orelse "-",
+            });
+        }
         lm_norecv_eager[if (b.module.eagerTypeOf(receiver.span()) != null) 0 else 1] += 1;
         if (receiver.* == .Call) {
             lm_norecv_call[@intFromEnum(classifyCallReturn(b, receiver))] += 1;
