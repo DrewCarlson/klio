@@ -2436,6 +2436,75 @@ test "overload_tied_on_lambda_return" {
     );
 }
 
+test "index_set_fast_path" {
+    try check("index_set_fast_path",
+        \\2
+        \\[1, 9, 3]
+        \\7
+        \\[7, 42, 3]
+        \\threw-uoe
+        \\threw-ioobe
+        \\t
+        \\é
+        \\
+    );
+}
+
+test "type_safe_bridge_barrier" {
+    try check("type_safe_bridge_barrier",
+        \\-1
+        \\-1
+        \\false
+        \\-1
+        \\1
+        \\0
+        \\true
+        \\
+    );
+}
+
+test "callable_ref_inline_arg" {
+    try check("callable_ref_inline_arg",
+        \\[3, 4, 5]
+        \\12
+        \\6
+        \\<x><y>
+        \\
+    );
+}
+
+test "binary_operator_overload_return" {
+    try check("binary_operator_overload_return",
+        \\-2
+        \\8
+        \\40
+        \\70
+        \\
+    );
+}
+
+test "unsigned_value_class_hash" {
+    try check("unsigned_value_class_hash",
+        \\-1
+        \\-1
+        \\30721
+        \\30721
+        \\30721
+        \\30721
+        \\
+    );
+}
+
+test "named_skip_commit_host_boundary" {
+    try check("named_skip_commit_host_boundary",
+        \\threw
+        \\a
+        \\1
+        \\2
+        \\
+    );
+}
+
 test "splice_window_receiver_typing" {
     try check("splice_window_receiver_typing",
         \\bca

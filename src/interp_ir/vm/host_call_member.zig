@@ -851,8 +851,11 @@ pub fn kotlinHashCode(v: *const Value) i32 {
         .Byte => |x| @as(i32, x),
         .Short => |x| @as(i32, x),
         .Int => |x| x,
-        .UByte => |x| @as(i32, x),
-        .UShort => |x| @as(i32, x),
+        // An unsigned value class synthesizes hashCode from its SIGNED
+        // storage (`UShort.data: Short`), so kotlinc hashes 65535u as -1 —
+        // the sign-extended data, never the magnitude.
+        .UByte => |x| @as(i32, @as(i8, @bitCast(x))),
+        .UShort => |x| @as(i32, @as(i16, @bitCast(x))),
         .UInt => |x| @bitCast(x),
         .Long => |l| @truncate(l ^ @as(i64, @bitCast(@as(u64, @bitCast(l)) >> 32))),
         .ULong => |u| @truncate(@as(i64, @bitCast(u ^ (u >> 32)))),
@@ -4209,6 +4212,17 @@ pub fn prepareVirtualFlatCall(
         if (!virtualTargetExecutable(module, t)) {
             if (vtrace) std.debug.print("[vflat] decline not-executable {s}\n", .{class.get().fqn});
             return null;
+        }
+        // A barrier member whose argument fails the type-safe bridge check
+        // must not flat-enter the body; the recursive path answers the
+        // bridge default.
+        if (module.funcById(FuncId.from(slot.int()))) |rootf| {
+            if (barrierSpec(rootf.name)) |kind| {
+                if (typeSafeBarrierAnswer(self, module, t, kind, args) != null) {
+                    if (vtrace) std.debug.print("[vflat] decline barrier {s}\n", .{rootf.name});
+                    return null;
+                }
+            }
         }
         break :blk t;
     };
@@ -9813,8 +9827,14 @@ fn hostSlotOpFor(module: *const Module, target: FuncId) ?HostSlotOp {
         const iter_owner = std.mem.eql(u8, owner, "kotlin.collections.Iterator") or
             std.mem.eql(u8, owner, "kotlin.collections.MutableIterator") or
             std.mem.eql(u8, owner, "kotlin.collections.ListIterator") or
-            std.mem.eql(u8, owner, "kotlin.collections.MutableListIterator");
-        if (iter_owner and isIteratorProtocol(name)) break :blk .iterator_protocol;
+            std.mem.eql(u8, owner, "kotlin.collections.MutableListIterator") or
+            // The primitive-iterator abstract classes: their `next()` source
+            // body delegates to `nextInt()`-family members the host serves
+            // through the same protocol handler.
+            (std.mem.startsWith(u8, owner, "kotlin.collections.") and
+                std.mem.endsWith(u8, owner, "Iterator"));
+        if (iter_owner and (isIteratorProtocol(name) or isIteratorNext(name)))
+            break :blk .iterator_protocol;
         // `iterator()` on a collection: the host builds the iterator from the
         // receiver's own representation, and no native is registered under
         // the interface's FQN either.
@@ -9949,6 +9969,103 @@ fn noinstTraceOn() bool {
 /// Invoke a statically resolved virtual family by numeric slot. The runtime
 /// receiver contributes its exact class identity; named and runtime-defined
 /// classes both resolve to an O(1) `(class, slot)` target.
+/// kotlinc's type-safe collection bridges, by member name. A generic
+/// collection member called through an erased signature (`indexOf(Object)`)
+/// checks the argument against the class type parameter's bound and answers
+/// a fixed default for a foreign value instead of running the body against a
+/// representation the value does not have. The member set and defaults are
+/// kotlinc's BuiltinSpecialBridges.
+const BarrierKind = enum { bool_false, int_neg1, null_or_false, second_arg };
+
+fn barrierSpec(name: []const u8) ?BarrierKind {
+    const eql = std.mem.eql;
+    if (eql(u8, name, "contains") or eql(u8, name, "containsKey") or
+        eql(u8, name, "containsValue")) return .bool_false;
+    if (eql(u8, name, "indexOf") or eql(u8, name, "lastIndexOf")) return .int_neg1;
+    if (eql(u8, name, "get") or eql(u8, name, "remove")) return .null_or_false;
+    if (eql(u8, name, "getOrDefault")) return .second_arg;
+    return null;
+}
+
+/// The bridge's answer when the first argument fails the class type
+/// parameter's erased-bound check, or null when the bridge admits the call
+/// (no tp-typed param, no bound, or the value passes `is Bound`).
+fn typeSafeBarrierAnswer(
+    self: *VmHost,
+    module: *const ir.Module,
+    target: FuncId,
+    kind: BarrierKind,
+    args: []const Value,
+) ?Value {
+    const btr = runtime.envOnce("KLIO_BARRIER_TRACE") != null;
+    if (args.len == 0) return null;
+    const f = module.funcById(target) orelse return null;
+    const sig = module.decl_sigs.get(target.int()) orelse return null;
+    if (!sig.has_body) return null;
+    const owner = sig.enclosing_class orelse {
+        if (btr) std.debug.print("[barrier] {s}: no owner\n", .{f.name});
+        return null;
+    };
+    if (owner.int() >= module.classes.items.len) return null;
+    const cls = &module.classes.items[owner.int()];
+    const has_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+    const pi: usize = @intFromBool(has_this);
+    if (pi >= f.params.len) return null;
+    const pty_name = f.params[pi].ty.name;
+    var tp_name: []const u8 = undefined;
+    if (ir.parseClassTypeParamIdentity(pty_name)) |identity| {
+        if (identity.owner.int() != owner.int()) {
+            if (btr) std.debug.print("[barrier] {s}: mangle owner {d} != {d}\n", .{ f.name, identity.owner.int(), owner.int() });
+            return null;
+        }
+        tp_name = identity.param;
+    } else {
+        var declared = false;
+        for (cls.type_params) |tp| {
+            if (std.mem.eql(u8, tp, pty_name)) {
+                declared = true;
+                break;
+            }
+        }
+        if (!declared) {
+            if (btr) std.debug.print("[barrier] {s}: param ty {s} not a tp of {s} (n={d})\n", .{ f.name, pty_name, cls.name, cls.type_params.len });
+            return null;
+        }
+        tp_name = pty_name;
+    }
+    const bounds = module.registry.class_type_param_bounds.get(cls.fqn) orelse {
+        if (btr) std.debug.print("[barrier] {s}: no bounds for {s}\n", .{ f.name, cls.fqn });
+        return null;
+    };
+    var bound_head: ?[]const u8 = null;
+    for (bounds) |bd| {
+        if (std.mem.eql(u8, bd.param, tp_name)) {
+            var h = std.mem.trimEnd(u8, bd.bound, "?");
+            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            bound_head = h;
+            break;
+        }
+    }
+    // Bounds may be recorded fqn-qualified; the instance check and the
+    // Any-universal test both speak simple heads.
+    const bh_raw = bound_head orelse return null;
+    const bh = simpleName(bh_raw);
+    if (bh.len == 0 or std.mem.eql(u8, bh, "Any")) return null;
+    // A bound that is itself a type parameter proves nothing about values.
+    if (bh.len <= 2 or ir.parseClassTypeParamIdentity(bh) != null) return null;
+    if (self.instanceOf(&args[0], .{ .name = bh, .nullable = false, .args = &.{} })) return null;
+    if (btr) std.debug.print("[barrier] TRIP {s} on {s}: arg={s} !is {s}\n", .{ f.name, cls.fqn, args[0].typeFqn(), bh });
+    return switch (kind) {
+        .bool_false => .{ .Bool = false },
+        .int_neg1 => .{ .Int = -1 },
+        .null_or_false => if (std.mem.eql(u8, f.return_ty.name, "Boolean"))
+            .{ .Bool = false }
+        else
+            .Null,
+        .second_arg => if (args.len > 1) args[1] else .Null,
+    };
+}
+
 pub fn invokeVirtualMember(
     self: *VmHost,
     allocator: Allocator,
@@ -10092,19 +10209,25 @@ pub fn invokeVirtualMember(
                         // nothing. Restricted to the container variants —
                         // `Result` and the iterator generators are the shapes
                         // whose conversion lives on the named path.
-                        switch (receiver.*) {
+                        const direct = switch (receiver.*) {
                             // `Array` holds its elements inline, a
                             // `StringBuilder` its bytes, a `Comparator` its
                             // comparison — none of them a discriminant over a
-                            // payload the intrinsic would have to unpack.
-                            .List, .Set, .Map, .Array, .StringBuilder, .Comparator => {
-                                var argbuf = try allocator.alloc(Value, args.len + 1);
-                                defer allocator.free(argbuf);
-                                argbuf[0] = receiver.*;
-                                @memcpy(argbuf[1..], args);
-                                return dispatchIntrinsic(self, allocator, member_fqn, native, argbuf);
-                            },
-                            else => {},
+                            // payload the intrinsic would have to unpack. A
+                            // `String` and every scalar are likewise their own
+                            // representation (the walk lands on this very
+                            // native; the FuncId hazard was running a BODY
+                            // written against the boxed form, which a direct
+                            // NATIVE dispatch never does).
+                            .List, .Set, .Map, .Array, .StringBuilder, .Comparator, .String => true,
+                            else => isScalarValue(receiver),
+                        };
+                        if (direct) {
+                            var argbuf = try allocator.alloc(Value, args.len + 1);
+                            defer allocator.free(argbuf);
+                            argbuf[0] = receiver.*;
+                            @memcpy(argbuf[1..], args);
+                            return dispatchIntrinsic(self, allocator, member_fqn, native, argbuf);
                         }
                         break :blk .{ .target = null, .name = n };
                     }
@@ -10291,6 +10414,15 @@ pub fn invokeVirtualMember(
         }
     }
     const target = FuncId.from(linked.main_func);
+    // The type-safe bridge check runs only for the fixed barrier-member
+    // names, before the resolved source body binds a foreign argument.
+    if (slot_name) |bn| {
+        if (barrierSpec(bn)) |kind| {
+            if (typeSafeBarrierAnswer(self, module, target, kind, args)) |answer| {
+                return .{ .ok = answer };
+            }
+        }
+    }
 
     // The slot resolved, but to a declaration with nothing behind it: no
     // body, no linked host symbol, and no SAM callable on the instance.
@@ -15229,6 +15361,10 @@ test "kotlinHashCode matches Kotlin for builtins" {
     try testing.expectEqual(@as(i32, 0), kotlinHashCode(&.Null));
     try testing.expectEqual(@as(i32, 1231), kotlinHashCode(&.{ .Bool = true }));
     try testing.expectEqual(@as(i32, 1237), kotlinHashCode(&.{ .Bool = false }));
+    // The unsigned value classes hash their SIGNED storage: 65535u is -1.
+    try testing.expectEqual(@as(i32, -1), kotlinHashCode(&.{ .UShort = 65535 }));
+    try testing.expectEqual(@as(i32, -1), kotlinHashCode(&.{ .UByte = 255 }));
+    try testing.expectEqual(@as(i32, 1), kotlinHashCode(&.{ .UShort = 1 }));
     try testing.expectEqual(@as(i32, 65), kotlinHashCode(&.{ .Char = 'A' }));
     try testing.expectEqual(@as(i32, 42), kotlinHashCode(&.{ .Int = 42 }));
 }

@@ -5474,7 +5474,6 @@ pub const Module = struct {
         // interface modifiers. Its declaration identity can still resolve the
         // overload, but dispatch must remain virtual until the class is filled.
         if (class.is_stub) return .{ .target = target, .dispatch = .virtual, .applicable = true };
-        if (class.is_value) return .{ .target = target, .dispatch = .virtual, .applicable = true };
         const declaring_class = if (ds.enclosing_class) |decl_owner|
             (if (decl_owner.int() < self.classes.items.len) &self.classes.items[decl_owner.int()] else null)
         else
@@ -5500,21 +5499,17 @@ pub const Module = struct {
         if (!ds.has_body) return .virtual;
         if (ds.visibility == .Private) return .direct;
         const f = self.funcById(target) orelse return null;
-        if (class.is_stub or class.is_value) {
-            // A host-backed shell has no vtable to index, so `.virtual` for
-            // one is exactly the emission that cannot run. A FINAL method on
-            // a closed stub/value class goes direct only when a HOST SYMBOL
-            // serves it: a SOURCE body is written against the boxed
-            // representation (`ValueTimeMark.minus` reads `this.reading`),
-            // and a value-class receiver arrives ERASED to its payload, so
-            // running the body by fid read fields the value never
-            // materializes. The slot path's miss-to-walk serves those with
-            // the erased class's own member, which is the semantics the
-            // walk has always provided for erased receivers.
-            // Stubs keep the direct rule as measured; only VALUE classes
-            // erase their receiver.
+        if (class.is_stub) {
+            // An unclaimed classifier header carries no trustworthy
+            // final/open/interface modifiers, but a FINAL method on a closed
+            // stub is safe to call by fid. Value classes are NOT held here:
+            // their receivers arrive boxed like any instance (the one
+            // "erased receiver" failure this gate once served was a
+            // mis-typed Binary site committing Duration arithmetic into
+            // ValueTimeMark's body, fixed at the deriver), so they take the
+            // ordinary final-class rule below.
             if (!class.is_interface and !class.is_open and !class.is_abstract and
-                methodIsFinal(f) and (class.is_stub or ds.host_symbol != null))
+                methodIsFinal(f))
             {
                 return .direct;
             }

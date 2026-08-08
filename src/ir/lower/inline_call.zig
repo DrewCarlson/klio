@@ -1666,6 +1666,14 @@ pub fn tryInlineCallWithTypeArgs(
             try helpers.coerceNumericLiteralArg(b, a, p.ty.name.name)
         else
             null;
+        // A callable-REFERENCE argument (`map(String::indentWidth)`) needs
+        // the declared arity too: the MemberRef lowering binds the target
+        // fid only when it knows the expected function shape, and a
+        // name-carrying reference invoked later cannot reach a private or
+        // file-scoped extension the LOWERING site resolves legally.
+        if (a.* == .MemberRef and p.ty.function != null) {
+            b.pending_lambda_arity = @intCast(p.ty.function.?.params.len);
+        }
         // A lambda argument bound to a declared function-typed param
         // takes its arity from the declaration — a zero-`->` lambda for
         // a `() -> R` param must NOT keep the parser's implicit `it`
