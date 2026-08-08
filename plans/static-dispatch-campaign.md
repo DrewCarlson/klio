@@ -6130,3 +6130,49 @@ win is visible as CallMember -> inline splice in the replaceIndent
 dump and the newly-typed UArrays chains). Battery green, corpus
 267/267. Pinned: `callable_ref_inline_arg` (private-extension ref
 through inline map, unbound ref chain typing end to end).
+
+### The class-param lambda receiver and the type-safe bridge
+
+Two mechanisms landed together, 96 -> 93 `no_receiver_type` (net unbound
+104 -> 103; resolver_declined 6 -> 8, the usual conversion of
+newly-typed receivers into argument-authority declines):
+
+1. A member's receiver-lambda parameter typed by the ENCLOSING CLASS's
+   type parameter (`getter: T.() -> P` on `CompareContext<out T>`)
+   instantiates from the call receiver's own type arguments — the
+   declared head arrives as the class param's identity MANGLE, which
+   names its owner and parameter directly. Two OVERWRITE hazards
+   surfaced by the lar-trace: a later uninstantiated resolution pass
+   (the bare-member shape channel, and the guard in
+   recordCallBoundLambdaReceiver that only knew FN-level type params)
+   clobbered the instantiated record with the raw mangle. Both writers
+   now refuse to replace an existing record with an uninstantiated
+   head. The bare-receiver property channels also chase a type-param
+   head to its declared BOUND (`entries` inside
+   `<K, V, M : Map<out K, V>> M.onEachIndexed`), which serves part of
+   the family; the onEachIndexed rows themselves remain (the apply-T
+   chain needs a transitive fn-tp binding).
+
+2. The newly-typed receivers made `listBehavior`'s
+   `indexOf(object {} as Any?)` commit into EnumEntriesList.indexOf's
+   SOURCE body, which reads `element.ordinal` — crashing where kotlinc
+   returns -1. The missing semantic is kotlinc's TYPE-SAFE BRIDGE
+   (BuiltinSpecialBridges): a generic collection member called through
+   an erased signature checks the argument against the class type
+   parameter's erased bound and answers a fixed default (contains ->
+   false, indexOf/lastIndexOf -> -1, Map get/remove -> null or false by
+   declared return, getOrDefault -> the default argument) for a foreign
+   value. Implemented at BOTH virtual entries — the flat-dispatch
+   prepare declines so the recursive path answers, and
+   invokeVirtualMember answers directly. The walk had been masking this
+   gap by serving such calls from the host representation; every future
+   typing win in the collection family now lands on the bridge instead
+   of a field-read crash. The first cut answered the barrier for an
+   `Any`-bounded param because bounds are recorded FQN-qualified
+   ("kotlin.Any") — cost seven corpus programs (AbstractMap.get behind
+   user map equality) before the head normalized. `KLIO_BARRIER_TRACE`
+   names every bail and trip.
+
+Pinned: `class_param_lambda_receiver`, `type_safe_bridge_barrier`.
+Battery: 117/0, corpus 267/267, litmus 42/43 (known flake), unit green,
+compose 1349/0.

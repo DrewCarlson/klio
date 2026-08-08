@@ -2463,6 +2463,13 @@ test "type_safe_bridge_barrier" {
     );
 }
 
+test "class_param_lambda_receiver" {
+    try check("class_param_lambda_receiver",
+        \\true
+        \\
+    );
+}
+
 test "callable_ref_inline_arg" {
     try check("callable_ref_inline_arg",
         \\[3, 4, 5]

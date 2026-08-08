@@ -2544,6 +2544,18 @@ fn substitutedPropType(
     return ir.TypeRef{ .name = declared.name, .nullable = declared.nullable, .args = owned };
 }
 
+/// A bare type-parameter head is not a property owner; its declared BOUND
+/// is. `entries` inside `<K, V, M : Map<out K, V>> M.onEachIndexed` reads a
+/// Map property, so the owner lookups chase `M -> Map`.
+fn boundOwnerHead(b: *const FuncBuilder, head: []const u8) []const u8 {
+    if (b.typeParamBoundRef(head)) |bref| {
+        var h = std.mem.trimEnd(u8, bref.name, "?");
+        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+        if (h.len != 0) return typeHead(h);
+    }
+    return head;
+}
+
 fn staticBareReceiverTypeRef(b: *const FuncBuilder, recv_name: []const u8) ?ir.TypeRef {
     const self_shadowed = init_self_name != null and std.mem.eql(u8, init_self_name.?, recv_name);
     if (!self_shadowed) {
@@ -2552,7 +2564,7 @@ fn staticBareReceiverTypeRef(b: *const FuncBuilder, recv_name: []const u8) ?ir.T
     }
     const owner = b.ownerClass() orelse blk: {
         const head = b.recvTy() orelse b.spliceRecvTy() orelse return null;
-        break :blk typeHead(std.mem.trimEnd(u8, head, "?"));
+        break :blk boundOwnerHead(b, typeHead(std.mem.trimEnd(u8, head, "?")));
     };
     if (b.module.registry.class_prop_type_refs.get(.{ .a = owner, .b = recv_name })) |t| return t;
     const chain: []const []const u8 = b.module.registry.class_super_names.get(owner) orelse &.{};
@@ -2585,7 +2597,7 @@ fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const
             if (tr) std.debug.print("[sbrt] {s}: no owner, no recvTy\n", .{recv_name});
             return null;
         };
-        break :blk typeHead(std.mem.trimEnd(u8, head, "?"));
+        break :blk boundOwnerHead(b, typeHead(std.mem.trimEnd(u8, head, "?")));
     };
     if (tr) std.debug.print("[sbrt] {s}: owner={s}\n", .{ recv_name, owner });
     if (propTypeHeadOn(b, owner, recv_name)) |h| return h;
@@ -2596,7 +2608,7 @@ fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const
     // own surface has no `value` at all. Consulted only after the enclosing
     // class declines, so no answer this walk already gives can change.
     const recv_head = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse return null;
-    const rh = typeHead(std.mem.trimEnd(u8, recv_head, "?"));
+    const rh = boundOwnerHead(b, typeHead(std.mem.trimEnd(u8, recv_head, "?")));
     if (rh.len == 0 or std.mem.eql(u8, rh, owner)) return null;
     if (propTypeHeadOn(b, rh, recv_name)) |h| return h;
     return extPropReturnHead(b, rh, recv_name);
@@ -3073,6 +3085,9 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // there prefers an extension on it over a same-file plain namesake —
     // `validate { contact(c) }` binds `MockViewValidator.contact`, not the
     // same-file `@Composable contact`.
+    if (std.c.getenv("KLIO_LAR_TRACE") != null) {
+        std.debug.print("[lar-stash] s={d}..{d} head={s} ty={s}\n", .{ expr.span().start, expr.span().end, receiver_head orelse "-", if (receiver_type) |r| r.name else "-" });
+    }
     if (receiver_head) |rr| b.module.pending_lambda_own_recv = rr;
     if (receiver_type) |receiver| {
         b.module.pending_lambda_own_recv_type = try receiver.clone(b.allocator);
@@ -3781,6 +3796,13 @@ fn callBoundLambdaReceiverType(
 ) Allocator.Error!ir.TypeRef {
     const head = declared_receiver.name;
     if (!funcDeclaresTypeParam(b, func, head)) {
+        // The head can be the ENCLOSING CLASS's type parameter, whose
+        // instantiation the call receiver's own type arguments carry:
+        // `propertyEquals { }` on a `CompareContext<Map<K, V>>` receiver
+        // binds its `T.() -> P` lambda's receiver to `Map<K, V>`.
+        if (classParamReceiverInstantiation(b, func, head, call_receiver)) |inst| {
+            return inst.clone(b.allocator);
+        }
         return declared_receiver.clone(b.allocator);
     }
     if (b.module.registry.func_type_params.get(func.id)) |declared_params| {
@@ -3840,6 +3862,74 @@ fn callBoundLambdaReceiverType(
         declared_receiver.clone(b.allocator);
 }
 
+/// `head` as a type parameter of `func`'s ENCLOSING CLASS, instantiated by
+/// the call receiver's own type arguments. Answers a borrowed ref into the
+/// receiver's arg list; the caller clones. The receiver must name the
+/// declaring class itself so its argument list aligns with the class's
+/// parameter list, and the instantiation must be concrete.
+fn classParamReceiverInstantiation(
+    b: *FuncBuilder,
+    func: *const Func,
+    head: []const u8,
+    call_receiver: ?ir.TypeRef,
+) ?*const ir.TypeRef {
+    const cpt = runtime.envOnce("KLIO_CPT_TRACE") != null;
+    // The declared receiver's head is usually the class param's IDENTITY
+    // MANGLE, which names its owning class and parameter directly; a plain
+    // param name falls back to the declaration's enclosing class.
+    var owner: ir.ClassId = undefined;
+    var param_name: []const u8 = head;
+    if (ir.parseClassTypeParamIdentity(head)) |identity| {
+        owner = identity.owner;
+        param_name = identity.param;
+    } else {
+        const sig = b.module.decl_sigs.get(func.id.int()) orelse {
+            if (cpt) std.debug.print("[cpt] {s}: no sig\n", .{func.name});
+            return null;
+        };
+        owner = sig.enclosing_class orelse {
+            if (cpt) std.debug.print("[cpt] {s}: no enclosing class\n", .{func.name});
+            return null;
+        };
+    }
+    if (owner.int() >= b.module.classes.items.len) return null;
+    const cls = &b.module.classes.items[owner.int()];
+    var index: ?usize = null;
+    for (cls.type_params, 0..) |tp, i| {
+        if (std.mem.eql(u8, tp, param_name)) {
+            index = i;
+            break;
+        }
+    }
+    const ti = index orelse {
+        if (cpt) std.debug.print("[cpt] {s} param={s}: not in {s} params (n={d})\n", .{ func.name, param_name, cls.name, cls.type_params.len });
+        return null;
+    };
+    const own_recv: ?ir.TypeRef = if (call_receiver == null) b.recvTypeRef() else null;
+    const recv: *const ir.TypeRef = if (call_receiver) |*cr| cr else if (own_recv) |*orr| orr else {
+        if (cpt) std.debug.print("[cpt] {s} head={s}: no receiver ref\n", .{ func.name, head });
+        return null;
+    };
+    var rhead = std.mem.trimEnd(u8, recv.name, "?");
+    if (std.mem.indexOfScalar(u8, rhead, '<')) |lt| rhead = rhead[0..lt];
+    rhead = typeHead(rhead);
+    if (!std.mem.eql(u8, rhead, cls.name) and !std.mem.eql(u8, rhead, applicability.simpleName(cls.fqn))) {
+        if (cpt) std.debug.print("[cpt] {s} head={s}: recv {s} != cls {s}\n", .{ func.name, head, rhead, cls.name });
+        return null;
+    }
+    if (ti >= recv.args.len) {
+        if (cpt) std.debug.print("[cpt] {s} head={s}: recv {s} args={d} ti={d}\n", .{ func.name, head, recv.name, recv.args.len, ti });
+        return null;
+    }
+    const inst = &recv.args[ti];
+    if (inst.name.len == 0 or b.isTypeParam(inst.name)) {
+        if (cpt) std.debug.print("[cpt] {s} head={s}: inst {s} not concrete\n", .{ func.name, head, inst.name });
+        return null;
+    }
+    if (cpt) std.debug.print("[cpt] {s} head={s}: -> {s}\n", .{ func.name, head, inst.name });
+    return inst;
+}
+
 fn recordCallBoundLambdaReceiver(
     b: *FuncBuilder,
     func: *const Func,
@@ -3861,8 +3951,12 @@ fn recordCallBoundLambdaReceiver(
         type_args,
         call_receiver,
     );
+    // An answer that is still the UNINSTANTIATED declared parameter — the
+    // function's own type param or a class param's identity mangle — must
+    // never clobber an instantiated record another resolution pass made.
     if (resolved.eql(declared_receiver) and
-        funcDeclaresTypeParam(b, func, declared_receiver.name) and
+        (funcDeclaresTypeParam(b, func, declared_receiver.name) or
+            ir.parseClassTypeParamIdentity(declared_receiver.name) != null) and
         b.lambdaArgRecv(call_span) != null)
     {
         var cleanup = resolved;
@@ -14075,14 +14169,21 @@ fn lowerImplicitThisCall(
         const trailing = &args[args.len - 1];
         b.recordLambdaArgArity(trailing.span(), shape.value_arity);
         if (shape.receiver_head) |recv| {
-            try b.recordLambdaArgRecvOwned(
-                trailing.span(),
-                try (ir.TypeRef{
-                    .name = recv,
-                    .nullable = false,
-                    .args = &.{},
-                }).clone(b.allocator),
-            );
+            // An UNINSTANTIATED declared head (a type param or a class
+            // param's identity mangle) must not clobber an instantiated
+            // record another resolution pass already made for this slot.
+            const uninstantiated = bareTypeParamHead(recv) or
+                ir.parseClassTypeParamIdentity(recv) != null;
+            if (!(uninstantiated and b.lambdaArgRecv(trailing.span()) != null)) {
+                try b.recordLambdaArgRecvOwned(
+                    trailing.span(),
+                    try (ir.TypeRef{
+                        .name = recv,
+                        .nullable = false,
+                        .args = &.{},
+                    }).clone(b.allocator),
+                );
+            }
         }
     }
     defer if (member_arity) |arities| b.allocator.free(arities);
