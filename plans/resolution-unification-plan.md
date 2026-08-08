@@ -1402,3 +1402,44 @@ is written against the boxed representation, and binding a scalar receiver
 to it runs a body the receiver cannot satisfy (see the campaign plan's
 `UInt.toString()` case). So these must be declared as bodyless signatures
 linked to their existing natives, not as Kotlin implementations.
+
+### What "declare the builtin members" actually requires (2026-08-08)
+
+Two shapes suggest themselves for the last hole. Both were checked; neither
+is a small change, and the reason is the same missing input.
+
+**Kotlin source.** The builtin types' member declarations exist upstream only
+in the platform builtins — `interface List<out E>` and kin live in
+`kotlin/libraries/stdlib/js/builtins/Collections.kt`, and klio does not
+consume js/wasm sources (a standing constraint, not an oversight). So the
+members have no declaration in any source klio reads, which is exactly why
+the audit reports them. Adding them means klio authoring its own builtins
+declarations for `String`, `Int`, `Array`, the collection interfaces — and
+those declarations must be BODYLESS and native-linked, since a body would be
+written against the boxed representation (the `UInt.toString()` case in the
+campaign plan). Not impossible, but it is a new source layer for types the
+interpreter currently models entirely host-side.
+
+**Synthesis from the intrinsic table.** This looked better: the table already
+pairs an FQN with its native, so a bodyless `Func` per entry would give
+lowering a FuncId with a resolved native form, no Kotlin source, no body IR,
+and nothing added per call site. It does not work as-is:
+
+    const Entry = struct { fqn: []const u8, f: StdlibFn, applicable: ?ApplicableFn = null };
+
+There is no signature — no parameter types, no arity, not even a name list.
+A separate `ParamEntry` table carries parameter NAMES for 121 of the 1,484
+entries. Without types, a synthesized declaration cannot participate in
+arity checks or overload selection, which is most of what a static binding
+is for.
+
+So the remaining work is not "write the declarations" — it is **produce 1,281
+signatures**, and only then choose where they live. That is the real size of
+the last item, and it should be recorded as such rather than as a listing
+exercise.
+
+Worth weighing against it: every dispatch channel closed this session moved
+work off the dynamic paths with the wall clock FLAT (28.4-28.6s across four
+independent changes). The case for this item is contract conformance for a
+bytecode VM and the C backend — which is what the goal asks for — and not
+speed. Sizing it honestly is part of deciding it.

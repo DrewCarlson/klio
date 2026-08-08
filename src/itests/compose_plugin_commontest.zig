@@ -93,15 +93,19 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     // should fail fast, not hold its class's child (and the pump's job tree)
     // for a minute per occurrence.
     //
-    // 10s -> 90s once the classes stopped aborting part-way: two background-
-    // thread tests became visible and both are scheduler-throughput bound,
-    // not hung. `markInvalidFromBackgroundThread` runs ~11,000 launches
-    // across 1000 recomposition passes (12s); `resumeOnBackgroundThread`
-    // spins `while (running) { ...; yield() }` on `Dispatchers.Default`
-    // until another coroutine finishes, so its duration IS the yield
-    // round-trip cost (55s). Both pass with room. The 55s is worth a
-    // separate look at yield throughput — it is not a property of the test.
-    try map.put("kotlinx_coroutines_test_default_timeout", "90s");
+    // Two background-thread tests in `PausableCompositionTests` need more
+    // than this and so fail here: `markInvalidFromBackgroundThread` runs
+    // ~11,000 launches across 1000 recomposition passes (12s), and
+    // `resumeOnBackgroundThread` spins `while (running) { ...; yield() }`
+    // on `Dispatchers.Default` until another coroutine finishes, so its
+    // duration IS the yield round-trip cost (55s). Both PASS when run with
+    // a 90s cap. Raising it here is still the wrong trade: at 90s a slow
+    // test eats 90s of its class's 480s budget, and the measured result was
+    // 1336 passed with `SnapshotStateMapTests` and `SnapshotStateListTests`
+    // no longer completing, against 1345 and zero incomplete at 10s. The
+    // 55s yield cost is worth its own investigation; it is not a property
+    // of the test, and it is not paid for by a looser cap.
+    try map.put("kotlinx_coroutines_test_default_timeout", "10s");
     try map.put("KLIO_COMPOSE_PLUGIN", "1");
     // Per-test wall cap: a test that genuinely deadlocks (the Recomposer
     // deadlock-regression shape, the concurrent-mixing teardown stall) fails
