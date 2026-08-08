@@ -5675,3 +5675,54 @@ flatMap/flatMapIndexed variants).
 
 Census: `no_receiver_type` 150 -> 132, total 9049 -> 9040, bound share
 98.34% (bound_static 1607 -> 1611, bound_virtual 7274 -> 7279).
+
+### Named arguments may skip defaulted parameters
+
+The `rangesDelimitedBy` cluster (8 sites, the biggest named one in the
+Call category) was TWO stacked mechanisms, found by instrumenting each
+rejection rather than guessing:
+
+1. **The extension candidate check demanded named arguments sit at their
+   exact source position.** `rangesDelimitedBy(delimiters, ignoreCase =
+   x, limit = y)` skips the defaulted `startIndex`, so BOTH overloads
+   were dropped before scoring. The check now builds a MONOTONIC
+   arg -> param map (a named argument binds the next parameter carrying
+   its name; every parameter it crosses must default; the trailing-
+   callable rule applies inside the map), the in-loop argument judgment
+   reads the mapped parameter, and the ranking SigViews present
+   COMPACTED parameter lists so positional scoring stays aligned.
+   Backwards reordering and vararg declarations keep the strict rule.
+
+   COMMITTING the skip-mapped winner regressed six programs in one
+   sweep (StringEncodingTest decodeToString x2, UuidTest fromByteArray
+   x2, compose_ui_geometry, compose_uitext): the emit and host
+   boundaries bind arguments POSITIONALLY, so a static commit routed
+   `decodeToString(throwOnInvalidSequence = true)`'s flag into
+   `startIndex`. The winner is therefore DEMOTED to the sole_unknown
+   typing channel — identity resolved, return and lambda-param types
+   flow, emission stays on the runtime's named binding (which was
+   already correct) — and the census result is IDENTICAL to the commit
+   version (118, 98.49%): these sites needed types, not commitment.
+   Committing skip-mapped winners becomes possible when the emit path
+   fills named/default slots itself (see task 15's calling-convention
+   unification).
+   Unit pin: `ir.test.named arguments may skip defaulted parameters and
+   still resolve` (the skip yields sole_unknown, not target; a name no
+   parameter carries still drops; skipping a REQUIRED parameter still
+   defers).
+
+2. **A vararg parameter's body-side type was recorded head-only.** With
+   the named skip fixed, the String-vararg `split` still failed while the
+   Char-vararg one typed: `KLIO_ICRT` (which gained refusal prints at
+   solveCallBindings' two bind exits) showed `positional bind refused
+   param=delimiters(Array nargs=1) actual=Array nargs=0` — `vararg
+   delimiters: String` was recorded as bare `Array` (primitives got their
+   complete specialized heads, which is exactly why Char worked), and
+   `bindCallType` refuses on argument-count mismatch. `varargArrayTypeRef`
+   now records the full materialized type (`Array<out String>`) at both
+   declaration and local-fn lowering sites. Behaviour pin:
+   `vararg_forward_named_skip` (array-kind overload discrimination plus
+   default filling across the skip, observable in output).
+
+Census: `no_receiver_type` 132 -> 118, total 9040 -> 9030, bound share
+98.49% (bound_virtual 7279 -> 7283).

@@ -4504,6 +4504,8 @@ pub const Module = struct {
         var ids: std.ArrayList(FuncId) = .empty;
         var tiers: std.ArrayList(u8) = .empty;
         var unknowns: std.ArrayList(bool) = .empty;
+        var named_maps: std.ArrayList(?[]const usize) = .empty;
+        var named_skips: std.ArrayList(bool) = .empty;
         var unknown_best_tier: u8 = 255;
         // The per-call window delimiter for the rex trace: every candidate
         // row until the next rex-call row belongs to this resolution.
@@ -4526,22 +4528,99 @@ pub const Module = struct {
             if ((kind != .top_level_extension and !is_member_extension) or
                 f.params.len == 0 or
                 !std.mem.eql(u8, f.params[0].name, "this")) continue;
-            // Ordered named arguments carry the same positional binding as
-            // their source order, but still constrain the declaration by
-            // parameter identity. Normalize them for the extension scorer
-            // only after proving every supplied name matches that position.
-            // Reordered named calls remain deferred until the shared binding
-            // result is threaded through extension ranking.
-            for (args, 0..) |arg, i| {
-                const arg_name = arg.named orelse continue;
-                const param_index = i + 1;
-                if (param_index >= f.params.len or
-                    !applicability.paramNameMatchesArg(
-                        f.params[param_index].name,
-                        arg_name,
-                    ))
-                {
-                    continue :candidate_loop;
+            // Ordered named arguments bind by parameter IDENTITY, and may
+            // skip parameters Kotlin fills from defaults: `rangesDelimitedBy(
+            // delimiters, ignoreCase = x, limit = y)` skips the defaulted
+            // `startIndex`, and kotlinc still resolves the call statically.
+            // Build the arg -> param mapping monotonically (each named
+            // argument binds the next parameter carrying its name; every
+            // parameter it skips must default); the scorer then judges each
+            // argument against ITS parameter instead of the raw position.
+            // Backwards-reordered named calls and vararg declarations keep
+            // the strict in-position rule and stay deferred.
+            var named_map: ?[]const usize = null;
+            var named_map_skips = false;
+            {
+                var any_named = false;
+                for (args) |arg0| {
+                    if (arg0.named != null) {
+                        any_named = true;
+                        break;
+                    }
+                }
+                var vararg_decl = false;
+                for (f.params[1..]) |param| {
+                    if (param.is_vararg) {
+                        vararg_decl = true;
+                        break;
+                    }
+                }
+                if (any_named and vararg_decl) {
+                    for (args, 0..) |arg, i| {
+                        const arg_name = arg.named orelse continue;
+                        const param_index = i + 1;
+                        if (param_index >= f.params.len or
+                            !applicability.paramNameMatchesArg(
+                                f.params[param_index].name,
+                                arg_name,
+                            ))
+                        {
+                            continue :candidate_loop;
+                        }
+                    }
+                } else if (any_named) {
+                    const map_buf = sa.alloc(usize, args.len) catch return .{};
+                    var next: usize = 1;
+                    for (args, 0..) |arg, i| {
+                        if (arg.named) |arg_name| {
+                            var j = next;
+                            var gap_defaulted = true;
+                            const found: ?usize = while (j < f.params.len) : (j += 1) {
+                                if (applicability.paramNameMatchesArg(f.params[j].name, arg_name)) break j;
+                                if (!f.params[j].has_default and f.params[j].default == null)
+                                    gap_defaulted = false;
+                            } else null;
+                            const pj = found orelse continue :candidate_loop;
+                            if (!gap_defaulted) continue :candidate_loop;
+                            map_buf[i] = pj;
+                            next = pj + 1;
+                        } else {
+                            // The trailing-callable rule applies inside the
+                            // mapping too: a last positional lambda fills the
+                            // LAST parameter across a defaulted gap.
+                            if (i + 1 == args.len and
+                                (arg.is_lambda or arg.lambda_arity != null or arg.func_typed) and
+                                next < f.params.len - 1 and
+                                applicability.isFunctionTypeRef(&f.params[f.params.len - 1].ty))
+                            {
+                                const gap_defaulted = for (f.params[next .. f.params.len - 1]) |param| {
+                                    if (!param.has_default and param.default == null) break false;
+                                } else true;
+                                if (gap_defaulted) {
+                                    map_buf[i] = f.params.len - 1;
+                                    next = f.params.len;
+                                    continue;
+                                }
+                            }
+                            if (next >= f.params.len) continue :candidate_loop;
+                            map_buf[i] = next;
+                            next += 1;
+                        }
+                    }
+                    // Everything left unbound past the last binding must
+                    // default; skipped middles were checked as they were
+                    // crossed.
+                    for (f.params[next..]) |param| {
+                        if (!param.has_default and param.default == null)
+                            continue :candidate_loop;
+                    }
+                    named_map = map_buf;
+                    for (map_buf, 0..) |pj, i| {
+                        if (pj != i + 1) {
+                            named_map_skips = true;
+                            break;
+                        }
+                    }
                 }
             }
             if (is_member_extension and
@@ -4631,7 +4710,7 @@ pub const Module = struct {
                     break :blk count;
                 };
                 if (args.len < required) continue;
-            } else {
+            } else if (named_map == null) {
                 if (args.len > f.params.len - 1) continue;
                 // Trailing-callable rule at the ARITY gate: the last arg
                 // fills the LAST param when that param is function-typed,
@@ -4640,6 +4719,8 @@ pub const Module = struct {
                 // overload with `partialWindows` defaulted; the
                 // positional walk instead demanded `transform` itself
                 // default and dropped the overload kotlinc picks.
+                // A named-mapped candidate already proved its skipped and
+                // trailing parameters default while the map was built.
                 const trailing_call = args.len > 0 and args.len < f.params.len - 1 and
                     (args[args.len - 1].is_lambda or
                         args[args.len - 1].lambda_arity != null or
@@ -4852,7 +4933,9 @@ pub const Module = struct {
                         args[args.len - 1].func_typed) and
                     trailingGapDefaulted(f.params[1..], args.len);
                 for (args, 0..) |arg, ai| {
-                    const pi = if (trailing_lambda_arg and ai + 1 == args.len and
+                    const pi = if (named_map) |mp|
+                        mp[ai]
+                    else if (trailing_lambda_arg and ai + 1 == args.len and
                         1 + args.len <= f.params.len)
                         f.params.len - 1
                     else
@@ -4914,6 +4997,8 @@ pub const Module = struct {
             ids.append(sa, fid) catch return .{};
             tiers.append(sa, tier) catch return .{};
             unknowns.append(sa, compatibility == .unknown) catch return .{};
+            named_maps.append(sa, named_map) catch return .{};
+            named_skips.append(sa, named_map_skips) catch return .{};
         }
         if (ids.items.len == 0) {
             return .{ .applicable = unknown_best_tier != 255 };
@@ -4935,7 +5020,15 @@ pub const Module = struct {
         const sigs = sa.alloc(applicability.SigView, ids.items.len) catch return .{};
         for (ids.items, 0..) |fid, i| {
             const f = self.funcById(fid).?;
-            const params = sa.dupe(Param, f.params) catch return .{};
+            // A named-mapped candidate presents COMPACTED parameters: the
+            // scorer judges positionally, so each argument's slot must hold
+            // the parameter its name bound, not the raw declaration order.
+            const params = if (named_maps.items[i]) |mp| blk_cp: {
+                const cp = sa.alloc(Param, mp.len + 1) catch return .{};
+                cp[0] = f.params[0];
+                for (mp, cp[1..]) |pj, *dst| dst.* = f.params[pj];
+                break :blk_cp cp;
+            } else sa.dupe(Param, f.params) catch return .{};
             if (params.len != 0) {
                 const declared_receiver = if (self.decl_sigs.get(fid.int())) |decl|
                     decl.receiver_ty orelse params[0].ty
@@ -5137,6 +5230,20 @@ pub const Module = struct {
                 .sole_unknown = if (!tied) best else null,
                 .param_rep = if (tied) self.tiedLambdaParamRep(tied_ids.items) else null,
             };
+        // A winner whose named arguments SKIPPED defaulted parameters lends
+        // its types but does not commit: the emit and host boundaries bind
+        // arguments positionally, and a static commit routed
+        // `decodeToString(throwOnInvalidSequence = true)`'s flag into
+        // `startIndex`. The runtime's named binding already dispatches these
+        // correctly; typing (return and lambda params) is what the static
+        // side needs.
+        if (best) |target| {
+            for (ids.items, named_skips.items) |fid, skipped| {
+                if (fid != target) continue;
+                if (skipped) return .{ .applicable = true, .sole_unknown = target };
+                break;
+            }
+        }
         const dispatch_owner = if (best) |target|
             (if (self.registry.member_ext_owner_class.get(target)) |owner|
                 self.classIdByFqn(owner)
@@ -5976,7 +6083,10 @@ pub const Module = struct {
                     inference_type_params,
                     &bindings,
                     0,
-                )) return null;
+                )) {
+                    if (runtime.envSetOnce("KLIO_ICRT")) std.debug.print("[icrt] {s}: named bind refused param={s}({s} nargs={d}) actual={s} nargs={d}\n", .{ f.fqn, param.name, param.ty.name, overrideArgs(param.ty).len, actual.name, overrideArgs(actual).len });
+                    return null;
+                }
                 filled[pi] = true;
                 break;
             }
@@ -6028,7 +6138,10 @@ pub const Module = struct {
                 inference_type_params,
                 &bindings,
                 0,
-            )) return null;
+            )) {
+                if (runtime.envSetOnce("KLIO_ICRT")) std.debug.print("[icrt] {s}: positional bind refused param={s}({s} nargs={d}) actual={s} nargs={d}\n", .{ f.fqn, params[pi].name, params[pi].ty.name, overrideArgs(params[pi].ty).len, actual_ty.name, overrideArgs(actual_ty).len });
+                return null;
+            }
             if (!params[pi].is_vararg) {
                 filled[pi] = true;
                 next_param = pi + 1;
@@ -13481,6 +13594,81 @@ test "a tie on the lambda return alone still lends the lambda param types" {
     );
     try testing.expect(res2.target == null);
     try testing.expect(res2.param_rep == null);
+}
+
+test "named arguments may skip defaulted parameters and still resolve" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    // The rangesDelimitedBy shape: `f(x, ignoreCase = ..., limit = ...)`
+    // skips the defaulted `startIndex`, and the CharArray/Array overload
+    // pair is discriminated by the first positional argument.
+    const heads = [_][]const u8{ "CharArray", "IntArray" };
+    var fids: [2]FuncId = undefined;
+    for (heads, 0..) |head, idx| {
+        const fid = try pushTestFuncOpts(&m, a, "myRanges", "app.myRanges", "app", 4, .{ .extension = true });
+        m.funcs.items[fid.int()].kind = .top_level_extension;
+        m.funcs.items[fid.int()].params[0].ty = .{ .name = "CharSequence", .nullable = false, .args = &.{} };
+        m.funcs.items[fid.int()].params[1] = .{ .name = "delims", .ty = .{ .name = head, .nullable = false, .args = &.{} }, .default = null };
+        m.funcs.items[fid.int()].params[2] = .{ .name = "startIndex", .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .default = null, .has_default = true };
+        m.funcs.items[fid.int()].params[3] = .{ .name = "ignoreCase", .ty = .{ .name = "Boolean", .nullable = false, .args = &.{} }, .default = null, .has_default = true };
+        m.funcs.items[fid.int()].params[4] = .{ .name = "limit", .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .default = null, .has_default = true };
+        fids[idx] = fid;
+    }
+    try m.rebuildFuncNameIndex(a);
+
+    var shapes = [_]applicability.ArgShape{
+        .{ .ty = .{ .name = "CharArray", .nullable = false, .args = &.{} } },
+        .{ .ty = .{ .name = "Boolean", .nullable = false, .args = &.{} }, .named = "ignoreCase" },
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .named = "limit" },
+    };
+    const res = m.resolveExtensionCall(
+        "myRanges",
+        .{ .name = "CharSequence", .nullable = false, .args = &.{} },
+        &shapes,
+        .{ .caller_file = FileId.from(0), .caller_package = "app" },
+    );
+    // The skip resolves the IDENTITY for typing, but does not commit
+    // emission: the emit and host boundaries still bind positionally.
+    try testing.expect(res.target == null);
+    try testing.expectEqual(fids[0], res.sole_unknown.?);
+
+    // A named argument no parameter carries still drops the candidate.
+    var wrong = [_]applicability.ArgShape{
+        .{ .ty = .{ .name = "CharArray", .nullable = false, .args = &.{} } },
+        .{ .ty = .{ .name = "Boolean", .nullable = false, .args = &.{} }, .named = "nope" },
+    };
+    const res2 = m.resolveExtensionCall(
+        "myRanges",
+        .{ .name = "CharSequence", .nullable = false, .args = &.{} },
+        &wrong,
+        .{ .caller_file = FileId.from(0), .caller_package = "app" },
+    );
+    try testing.expect(res2.target == null);
+
+    // A skipped parameter WITHOUT a default keeps the strict rule: naming
+    // `limit` past a required `mustGive` defers rather than committing.
+    const strict = try pushTestFuncOpts(&m, a, "strictRanges", "app.strictRanges", "app", 3, .{ .extension = true });
+    m.funcs.items[strict.int()].kind = .top_level_extension;
+    m.funcs.items[strict.int()].params[0].ty = .{ .name = "CharSequence", .nullable = false, .args = &.{} };
+    m.funcs.items[strict.int()].params[1] = .{ .name = "delims", .ty = .{ .name = "CharArray", .nullable = false, .args = &.{} }, .default = null };
+    m.funcs.items[strict.int()].params[2] = .{ .name = "mustGive", .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .default = null };
+    m.funcs.items[strict.int()].params[3] = .{ .name = "limit", .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .default = null, .has_default = true };
+    try m.rebuildFuncNameIndex(a);
+    var skip_required = [_]applicability.ArgShape{
+        .{ .ty = .{ .name = "CharArray", .nullable = false, .args = &.{} } },
+        .{ .ty = .{ .name = "Int", .nullable = false, .args = &.{} }, .named = "limit" },
+    };
+    const res3 = m.resolveExtensionCall(
+        "strictRanges",
+        .{ .name = "CharSequence", .nullable = false, .args = &.{} },
+        &skip_required,
+        .{ .caller_file = FileId.from(0), .caller_package = "app" },
+    );
+    try testing.expect(res3.target == null);
 }
 
 test "dependent bound with unbound referenced parameter does not refute" {
