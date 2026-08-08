@@ -8907,11 +8907,33 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         if (opname) |on| {
             if (argDeclTypeRefLazy(b, arg.Binary.lhs)) |lt| {
                 if (!lt.nullable) {
-                    const lh = typeHead(std.mem.trimEnd(u8, lt.name, "?"));
+                    var identity = std.mem.trimEnd(u8, lt.name, "?");
+                    if (std.mem.indexOfScalar(u8, identity, '<')) |ltp| identity = identity[0..ltp];
+                    const lh = typeHead(identity);
                     if (lh.len != 0 and !isPrimitiveTypeName(lh)) {
-                        var kb: [160]u8 = undefined;
-                        if (std.fmt.bufPrint(&kb, "{s}\x00{s}\x001", .{ lh, on }) catch null) |key| {
-                            if (b.module.registry.member_method_fids.get(key)) |fid| {
+                        // The operator member is chosen by the SAME engine that
+                        // dispatches it, with the rhs's own static type as the
+                        // argument evidence. A name+arity shortcut is wrong the
+                        // moment overloads diverge on return type
+                        // (`ValueTimeMark.minus(Duration): ValueTimeMark` vs
+                        // `minus(ValueTimeMark): Duration`); an unresolvable
+                        // overload set stays untyped rather than guessing.
+                        const owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+                            b.module.classIdByFqn(identity)
+                        else
+                            b.module.uniqueClassIdBySimpleName(lh);
+                        if (owner_id) |owner| {
+                            const rhs_ty = argDeclTypeRefLazy(b, arg.Binary.rhs);
+                            const shape = applicability.ArgShape{
+                                .ty = rhs_ty,
+                                .ty_authoritative = rhs_ty != null,
+                            };
+                            const resolved = b.module.resolveMemberCall(owner, on, &.{shape}, .{
+                                .caller_file = arg.Binary.span.file,
+                                .lexical_owner = null,
+                                .receiver_type = lt,
+                            });
+                            if (resolved.target) |fid| {
                                 if (b.module.funcById(fid)) |f| {
                                     if (f.return_ty_declared and f.return_ty.name.len != 0) {
                                         return .{

@@ -2450,6 +2450,16 @@ test "index_set_fast_path" {
     );
 }
 
+test "binary_operator_overload_return" {
+    try check("binary_operator_overload_return",
+        \\-2
+        \\8
+        \\40
+        \\70
+        \\
+    );
+}
+
 test "unsigned_value_class_hash" {
     try check("unsigned_value_class_hash",
         \\-1
