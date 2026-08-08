@@ -2368,3 +2368,20 @@ test "char_compare_to_code_difference" {
         \\
     );
 }
+
+test "string_compare_to_difference" {
+    try check("string_compare_to_difference",
+        \\-2
+        \\2
+        \\0
+        \\-2
+        \\2
+        \\-3
+        \\-32
+        \\0
+        \\0
+        \\[apple, fig, pear]
+        \\true
+        \\
+    );
+}

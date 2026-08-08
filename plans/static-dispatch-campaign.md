@@ -5155,11 +5155,22 @@ campaign (which was written to return "the same -1/0/1 the host intrinsic
 does" — it did, and both were wrong together). `Int` and `Long` correctly
 stay -1/0/1: kotlinc compiles those to `Integer.compare` / `Long.compare`.
 
-`kotlin.String.compareTo` has the SAME divergence — kotlinc returns the char
-difference, klio returns the sign — and is NOT fixed here. It routes through
-`compareUtf16`, which yields a three-way ordering used for sorting elsewhere;
-returning a difference means changing that comparator's result type, which is
-a wider change than this one and wants its own measurement.
+`kotlin.String.compareTo` had the SAME divergence and is fixed too, in a
+follow-up. It routes through `compareUtf16`, whose three-way ordering is used
+for sorting elsewhere, so the fix is a SIBLING — `compareUtf16Difference`,
+plus `compareIgnoreCaseUtf8Difference` for the folded form — rather than a
+change to the existing comparator:
+
+    "a".compareTo("c")            -1  ->  -2   (code-unit difference)
+    "ab".compareTo("abcd")        -1  ->  -2   (length difference)
+    "".compareTo("abc")           -1  ->  -3
+    "A".compareTo("a")            -1  -> -32
+    "A".compareTo("a", true)       0  ->   0   (folds first, then differs)
+
+The existing unit test was `"abc"` vs `"abd"` asserting -1 — which passes
+under BOTH behaviours, since `'c' - 'd'` is -1. It was extended with the
+cases that actually distinguish them (first-mismatch difference, prefix
+length difference, and the `ignoreCase` fold) so the coverage is real.
 
 Pinned by `char_compare_to_code_difference`. Green: commontest 117/0, drift
 267/267, litmus 42/43 (known timeout), units, compose exit 0 / 1342 passed,
