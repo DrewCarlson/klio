@@ -677,6 +677,33 @@ fn lowerAndRegisterMethods(
 ) Allocator.Error!void {
     var site_mod: ?ObjRef(Module) = null;
     defer if (site_mod) |m| m.deinit();
+    // The class's DECLARED property types (ctor `val data: Collection<E>`,
+    // annotated body properties) carry into the member lowerings through
+    // the same channel the anonymous-object path uses, so a body's
+    // `data.iterator()` types its receiver instead of walking by name.
+    var prop_heads: std.ArrayList(ir.build.AnonPropHead) = .empty;
+    defer prop_heads.deinit(allocator);
+    for (class.primary_params) |*pp| {
+        if (pp.property == null) continue;
+        try prop_heads.append(allocator, .{
+            .owner = class.name.name,
+            .name = pp.name.name,
+            .head = pp.ty.name.name,
+        });
+    }
+    for (class.members) |*m| {
+        if (m.* != .Property) continue;
+        const p = m.Property;
+        if (p.ty) |*ty| {
+            try prop_heads.append(allocator, .{
+                .owner = class.name.name,
+                .name = p.name.name,
+                .head = ty.name.name,
+            });
+        }
+    }
+    const prev_prop_heads = ir.build.setLowerAnonPropHeads(prop_heads.items);
+    defer _ = ir.build.setLowerAnonPropHeads(prev_prop_heads);
     host_instances.anonLowerEnter();
     defer host_instances.anonLowerExit();
     for (class.members) |*m| {

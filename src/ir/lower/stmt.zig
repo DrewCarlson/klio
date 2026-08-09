@@ -351,6 +351,17 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
                     try b.setLocalDeclTypeOwned(p.name.name, ct);
                 }
             },
+            // An INDEX initializer is an operator `get` call: its resolved
+            // return types the local (`val interceptor =
+            // context[ContinuationInterceptor]`), including the key-solved
+            // type parameter the operator arm derives.
+            .Index => {
+                if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
+                    const was_nullable = ct.nullable;
+                    try b.setLocalDeclTypeOwned(p.name.name, ct);
+                    if (was_nullable) try b.setLocalDeclNullable(p.name.name);
+                }
+            },
             // Shapes that name their own type: a cast states it, `this` is the
             // enclosing class, `!x` is Boolean and `-x` keeps its operand's
             // type. Each of these left the local untyped, so every member call

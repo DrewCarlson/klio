@@ -26,6 +26,19 @@ pub fn lowerFor(
     return lowerForLabeled(b, vars, iter, body, null);
 }
 
+var counted_checked: bool = false;
+var counted_on: bool = true;
+
+fn countedEnabled() bool {
+    if (!counted_checked) {
+        counted_checked = true;
+        if (std.c.getenv("KLIO_COUNTED")) |v| {
+            counted_on = !std.mem.eql(u8, std.mem.span(v), "0");
+        }
+    }
+    return counted_on;
+}
+
 pub fn lowerForLabeled(
     b: *FuncBuilder,
     vars: []const ast.Ident,
@@ -33,20 +46,171 @@ pub fn lowerForLabeled(
     body: *const Expr,
     label: ?[]const u8,
 ) Allocator.Error!Reg {
+    // COUNTED-RANGE strength reduction: `for (i in a until b)` and
+    // `for (i in a..b)` over same-typed Int/Long operands lower to a plain
+    // register loop — no Range object, no iterator, no virtual protocol
+    // calls per iteration. The iterator form dominated the interpreter's
+    // loop profile (two CallVirtuals per iteration plus the range fields).
+    // `KLIO_COUNTED=0` restores the iterator lowering for bisection.
+    if (vars.len == 1 and countedEnabled()) counted: {
+        var lo_e: ?*const Expr = null;
+        var hi_e: ?*const Expr = null;
+        var inclusive = false;
+        // `a downTo b`: start at `a`, step -1, inclusive `b` — the same
+        // equality-exit loop with the compare and step reversed.
+        var descending = false;
+        switch (iter.*) {
+            .Binary => |bin| switch (bin.op) {
+                .Range => {
+                    inclusive = true;
+                    lo_e = bin.lhs;
+                    hi_e = bin.rhs;
+                },
+                .RangeUntil => {
+                    lo_e = bin.lhs;
+                    hi_e = bin.rhs;
+                },
+                else => break :counted,
+            },
+            .Call => |c| blk: {
+                if (c.is_infix and c.args.len == 2 and c.callee.* == .Path and
+                    c.callee.Path.segments.len == 1)
+                {
+                    const nm = c.callee.Path.segments[0].name;
+                    if (std.mem.eql(u8, nm, "until")) {
+                        lo_e = &c.args[0];
+                        hi_e = &c.args[1];
+                        break :blk;
+                    }
+                    if (std.mem.eql(u8, nm, "downTo")) {
+                        descending = true;
+                        inclusive = true;
+                        lo_e = &c.args[0];
+                        hi_e = &c.args[1];
+                        break :blk;
+                    }
+                }
+                // A call whose STATIC type is a range still counts (below).
+            },
+            else => {},
+        }
+        var is_int = false;
+        var is_long = false;
+        if (lo_e != null) {
+            var lo_ty = (expr.staticExprTypeRef(b, lo_e.?) catch null) orelse break :counted;
+            defer lo_ty.deinit(b.allocator);
+            var hi_ty = (expr.staticExprTypeRef(b, hi_e.?) catch null) orelse break :counted;
+            defer hi_ty.deinit(b.allocator);
+            is_int = std.mem.eql(u8, lo_ty.name, "Int") and std.mem.eql(u8, hi_ty.name, "Int");
+            is_long = std.mem.eql(u8, lo_ty.name, "Long") and std.mem.eql(u8, hi_ty.name, "Long");
+            if ((!is_int and !is_long) or lo_ty.nullable or hi_ty.nullable) break :counted;
+        } else {
+            // TYPE-DRIVEN prong: any iterable whose static type is a
+            // non-nullable IntRange/LongRange (a hoisted `val`, a
+            // range-returning call, `list.indices`) iterates
+            // `[first, last]` step 1 by construction — read the two
+            // bounds once and run the same register loop. Progressions
+            // (`downTo`, `step`, `reversed`) type as IntProgression and
+            // keep the iterator lowering.
+            var ity = (expr.staticExprTypeRef(b, iter) catch null) orelse break :counted;
+            defer ity.deinit(b.allocator);
+            if (ity.nullable) break :counted;
+            var head = ity.name;
+            if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
+            is_int = std.mem.eql(u8, head, "IntRange");
+            is_long = std.mem.eql(u8, head, "LongRange");
+            if (!is_int and !is_long) break :counted;
+            inclusive = true;
+        }
+
+        // Bounds evaluate once, in source order, before the loop.
+        var lo: Reg = undefined;
+        var hi: Reg = undefined;
+        if (lo_e) |le| {
+            lo = try lowerExpr(b, le);
+            const hi_raw = try lowerExpr(b, hi_e.?);
+            hi = b.allocReg();
+            try b.push(.{ .Move = .{ .dst = hi, .src = hi_raw } });
+        } else {
+            const rng = try lowerExpr(b, iter);
+            const first_name = try b.module.internConst(b.allocator, .{ .String = "first" });
+            const last_name = try b.module.internConst(b.allocator, .{ .String = "last" });
+            lo = b.allocReg();
+            try b.push(.{ .GetField = .{ .dst = lo, .receiver = rng, .field = first_name } });
+            hi = b.allocReg();
+            try b.push(.{ .GetField = .{ .dst = hi, .receiver = rng, .field = last_name } });
+        }
+        const i_reg = b.allocReg();
+        try b.push(.{ .Move = .{ .dst = i_reg, .src = lo } });
+        const one = if (is_long)
+            try b.emitConst(.{ .Long = 1 })
+        else
+            try b.emitConst(.{ .Int = 1 });
+
+        const header = try b.allocBlock();
+        const body_blk = try b.allocBlock();
+        const tail_blk = try b.allocBlock();
+        const incr = try b.allocBlock();
+        const exit = try b.allocBlock();
+        b.terminate(.{ .Goto = header });
+
+        // ENTRY check once. The INCLUSIVE form must terminate at
+        // `hi == MAX_VALUE`, where increment-then-compare would wrap and
+        // spin — so its per-iteration exit is an EQUALITY check before the
+        // increment (`i == hi` → done, else `i < hi` so `i + 1` cannot
+        // overflow). The exclusive form's `i < hi` compare is
+        // overflow-free as is.
+        b.switchTo(header);
+        const cond = b.allocReg();
+        try b.push(.{ .BinOp = .{
+            .dst = cond,
+            .op = if (descending) .GreaterEq else if (inclusive) .LessEq else .Less,
+            .lhs = i_reg,
+            .rhs = hi,
+        } });
+        b.terminate(.{ .Branch = .{ .cond = cond, .t = body_blk, .f = exit } });
+
+        b.switchTo(body_blk);
+        try b.pushScope();
+        try b.bind(vars[0].name, i_reg);
+        try b.setLocalDeclTypeOwned(vars[0].name, .{
+            .name = try b.allocator.dupe(u8, if (is_long) "Long" else "Int"),
+            .nullable = false,
+            .args = &.{},
+        });
+        // `continue` re-enters at the per-iteration EXIT CHECK, never the
+        // body or the increment.
+        try b.pushLoop(label, tail_blk, exit);
+        _ = try lowerExpr(b, body);
+        b.popLoop();
+        try b.popScope();
+        b.terminate(.{ .Goto = tail_blk });
+
+        b.switchTo(tail_blk);
+        if (inclusive) {
+            const done = b.allocReg();
+            try b.push(.{ .BinOp = .{ .dst = done, .op = .Eq, .lhs = i_reg, .rhs = hi } });
+            b.terminate(.{ .Branch = .{ .cond = done, .t = exit, .f = incr } });
+        } else {
+            b.terminate(.{ .Goto = incr });
+        }
+
+        b.switchTo(incr);
+        try b.push(.{ .BinOp = .{
+            .dst = i_reg,
+            .op = if (descending) .Sub else .Add,
+            .lhs = i_reg,
+            .rhs = one,
+        } });
+        b.terminate(.{ .Goto = if (inclusive) body_blk else header });
+
+        b.switchTo(exit);
+        return b.emitConst(.Unit);
+    }
     const recv = try lowerExpr(b, iter);
     const it_reg = b.allocReg();
     const zero = b.allocReg();
     try b.push(.{ .Move = .{ .dst = zero, .src = recv } });
-    const name = try b.module.internConst(b.allocator, .{ .String = "iterator" });
-    const args_start = b.allocReg();
-    try b.push(.{ .CallMember = .{
-        .dst = it_reg,
-        .receiver = zero,
-        .name = name,
-        .args = args_start,
-        .n_args = 0,
-        .arg_names = &.{},
-    } });
     // Static protocol binding: when the iterable's `iterator()` return
     // resolves to the `Iterator` INTERFACE itself, `hasNext`/`next` emit
     // slot-bound against its roots — the runtime serves those by FuncId
@@ -56,11 +220,48 @@ pub fn lowerForLabeled(
     // form, exactly as before.
     var hn_root: ?ir.FuncId = null;
     var next_root: ?ir.FuncId = null;
+    var iter_ext_fid: ?ir.FuncId = null;
+    var iter_root: ?ir.FuncId = null;
     if (try expr.staticExprTypeRef(b, iter)) |ity0| {
         var ity = ity0;
         defer ity.deinit(b.allocator);
         const file = vars[0].span.file;
-        if (try expr.nullaryMemberReturnTypeRef(b, ity, "iterator", file)) |irt0| {
+        // The receiver's own MEMBER `iterator()` binds through its virtual
+        // slot (an IntRange for-loop no longer walks the name each entry).
+        {
+            var rhead = std.mem.trimEnd(u8, ity.name, "?");
+            if (std.mem.indexOfScalar(u8, rhead, '<')) |lt| rhead = rhead[0..lt];
+            const rcid = (if (std.mem.indexOfScalar(u8, rhead, '.') != null)
+                b.module.classIdByFqn(rhead)
+            else
+                b.module.uniqueClassIdBySimpleName(rhead));
+            if (rcid) |cid| {
+                if (cid.int() < b.module.classes.items.len) {
+                    const rfqn = b.module.classes.items[cid.int()].fqn;
+                    const it_decls = b.module.memberDecls(rfqn, "iterator");
+                    if (it_decls.len != 0) {
+                        iter_root = it_decls[0];
+                    } else {
+                        // Inherited member (IntRange's iterator lives on
+                        // IntProgression): the resolver chases supers.
+                        const resolved = b.module.resolveMemberCall(cid, "iterator", &.{}, .{
+                            .caller_file = file,
+                            .lexical_owner = null,
+                            .actual_type_param_bounds = &.{},
+                            .receiver_type = ity,
+                        });
+                        iter_root = resolved.target;
+                    }
+                }
+            }
+        }
+        // A member `iterator()` first; a receiver served only by the
+        // UNIQUE top-level extension (`CharSequence.iterator():
+        // CharIterator`) binds through its declared return the same way,
+        // and the `iterator()` invocation itself binds to that extension.
+        if ((try expr.nullaryMemberReturnTypeRef(b, ity, "iterator", file)) orelse
+            (try expr.extensionNullaryReturnTypeRef(b, ity, "iterator", &iter_ext_fid))) |irt0|
+        {
             var irt = irt0;
             defer irt.deinit(b.allocator);
             var head = std.mem.trimEnd(u8, irt.name, "?");
@@ -103,6 +304,38 @@ pub fn lowerForLabeled(
                 }
             }
         }
+    }
+    if (iter_root) |root| {
+        const vargs = b.allocReg();
+        try b.push(.{ .CallVirtual = .{
+            .dst = it_reg,
+            .receiver = zero,
+            .slot = ir.MethodSlotId.fromFunc(root),
+            .args = vargs,
+            .n_args = 0,
+        } });
+    } else if (iter_ext_fid) |ext_fid| {
+        try b.push(.{ .Call = .{
+            .dst = it_reg,
+            .func = ext_fid,
+            .trailing_lambda = false,
+            .args = zero,
+            .n_args = 1,
+            .arg_names = &.{},
+            .type_args = &.{},
+            .exact = true,
+        } });
+    } else {
+        const name = try b.module.internConst(b.allocator, .{ .String = "iterator" });
+        const args_start = b.allocReg();
+        try b.push(.{ .CallMember = .{
+            .dst = it_reg,
+            .receiver = zero,
+            .name = name,
+            .args = args_start,
+            .n_args = 0,
+            .arg_names = &.{},
+        } });
     }
     const header = try b.allocBlock();
     const body_blk = try b.allocBlock();
@@ -165,7 +398,7 @@ pub fn lowerForLabeled(
                 .args = &.{},
             });
         } else if (std.c.getenv("KLIO_FORVAR_TRACE") != null) {
-            std.debug.print("[forvar] {s} elem=null iter_tag={s}\n", .{ vars[0].name, @tagName(std.meta.activeTag(iter.*)) });
+            std.debug.print("[forvar] {s} elem=null iter_tag={s} fn={s} splice={s}\n", .{ vars[0].name, @tagName(std.meta.activeTag(iter.*)), build.currentRealFn() orelse "-", b.spliceRecvTy() orelse "-" });
         }
     } else {
         // Each destructured name is bound to the element's `componentN()`, so

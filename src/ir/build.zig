@@ -412,6 +412,10 @@ pub const ContextFnShape = struct { n_ctx: usize, n_regular: usize };
 pub const FuncBuilder = struct {
     allocator: Allocator,
     module: *Module,
+    /// A scratch/probe builder (an overload pick lowering a lambda body to
+    /// read its types): its sites are not real emissions and stay out of
+    /// the dispatch census.
+    census_quiet: bool = false,
     blocks: std.ArrayList(Block) = .empty,
     cur: BlockId,
     next_reg: u32,
