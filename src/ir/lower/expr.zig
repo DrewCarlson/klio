@@ -10593,7 +10593,13 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
             const f = b.module.funcById(fid) orelse continue;
             if (!f.hasBody()) continue;
             const base: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-            if (f.params.len -| base != want) continue;
+            const nparams = f.params.len -| base;
+            // A trailing VARARG accepts any arity from nparams-1 up:
+            // `listOf(list, set)` fits only the vararg overload, whose
+            // head-only List return types the receiver of `.forEach`.
+            const has_vararg = f.params.len != 0 and f.params[f.params.len - 1].is_vararg;
+            const fits = if (has_vararg) want + 1 >= nparams else nparams == want;
+            if (!fits) continue;
             if (sole != null) return null;
             sole = fid;
         }
