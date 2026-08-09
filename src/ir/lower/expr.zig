@@ -10643,6 +10643,53 @@ fn staticCallReturnTypeRef(
             }
         }
     }
+    // The universal scope functions have fixed semantics (the emission
+    // already treats them as no-dispatch splices): `.also`/`.apply` return
+    // their RECEIVER, `.let`/`.run` return their lambda's tail, derived
+    // under the receiver-bound parameter. Depth-guarded like every other
+    // recursive derivation.
+    if (call_expr.* == .Call and od_depth < 3) scope_fns: {
+        const c = call_expr.Call;
+        if (c.callee.* != .Member) break :scope_fns;
+        const m = c.callee.Member;
+        if (m.safe) break :scope_fns;
+        const nm2 = m.name.name;
+        const is_echo = std.mem.eql(u8, nm2, "also") or std.mem.eql(u8, nm2, "apply");
+        const is_tail = std.mem.eql(u8, nm2, "let") or std.mem.eql(u8, nm2, "run");
+        if (!is_echo and !is_tail) break :scope_fns;
+        if (c.args.len != 1 or c.args[0] != .Lambda) break :scope_fns;
+        // Only when no competing declaration could own the name for this
+        // call: a user class's own `let(block)` member must keep its
+        // declared return. The universal stdlib extension is the sole
+        // candidate exactly when the emission's no-dispatch rule applies.
+        if (uniqueUniversalInlineExtension(b, nm2, c.args.len) == null) break :scope_fns;
+        od_depth += 1;
+        defer od_depth -= 1;
+        var recv_owned = (staticExprTypeRef(b, m.receiver) catch null) orelse break :scope_fns;
+        if (is_echo) return recv_owned;
+        defer recv_owned.deinit(b.allocator);
+        const lam = c.args[0].Lambda;
+        const stmts2 = lam.body.stmts;
+        if (stmts2.len == 0 or stmts2[stmts2.len - 1] != .Expr) break :scope_fns;
+        var nb2 = FuncBuilder.init(b.allocator, b.module) catch break :scope_fns;
+        defer nb2.deinit();
+        if (std.mem.eql(u8, nm2, "let")) {
+            const pname = if (lam.params.len != 0) lam.params[0].name else "it";
+            nb2.setLocalDeclTypeOwned(pname, recv_owned.clone(b.allocator) catch break :scope_fns) catch break :scope_fns;
+        } else {
+            nb2.setRecvTypeRefOwned(recv_owned.clone(b.allocator) catch break :scope_fns);
+        }
+        if (staticExprTypeRef(&nb2, &stmts2[stmts2.len - 1].Expr) catch null) |derived| {
+            var dt = derived;
+            var h = std.mem.trimEnd(u8, dt.name, "?");
+            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
+                ir.parseClassTypeParamIdentity(h) != null;
+            if (h.len != 0 and !bare) return dt;
+            dt.deinit(b.allocator);
+        }
+        break :scope_fns;
+    }
     if (try fnTypedCalleeReturnTypeRef(b, call_expr)) |t| return t;
     if (try fqnCallReturnTypeRef(b, call_expr)) |t| return t;
     if (try localFnReturnTypeRef(b, call_expr)) |t| return t;
@@ -11666,6 +11713,17 @@ fn enrichLambdaArgShapes(
         const value_params = pty.args.len - 1;
         var nb = try FuncBuilder.init(b.allocator, b.module);
         defer nb.deinit();
+        // The block's decls and tail read the ENCLOSING scope's names too
+        // (`(bytesPerLine - 1) / bytesPerGroup` inside the run block reads
+        // the fn's params): seed the probe builder with the enclosing
+        // builder's declared types first — the lambda's own params and
+        // block decls shadow them below, the same order the source scopes.
+        {
+            var dit = b.local_decl_types.iterator();
+            while (dit.next()) |e| {
+                nb.setLocalDeclTypeOwned(e.key_ptr.*, e.value_ptr.clone(b.allocator) catch continue) catch {};
+            }
+        }
         if (lam.params.len == 0 and value_params == 1) {
             try nb.setLocalDeclTypeOwned("it", try pty.args[0].clone(b.allocator));
         } else {
