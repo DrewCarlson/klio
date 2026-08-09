@@ -429,6 +429,7 @@ fn overloadPickByLambdaReturnFull(
     // sole bare-type-parameter param is the receiver's ELEMENT (the
     // collection-selector family this pick exists for).
     var nb = try FuncBuilder.init(b.allocator, b.module);
+    nb.census_quiet = true;
     defer nb.deinit();
     var elem_owned: ?ir.TypeRef = null;
     defer if (elem_owned) |*t| t.deinit(b.allocator);
@@ -7062,12 +7063,29 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // (`MovableContent({ content() })`, arity 1) needs the same
             // repair here, or the content invokes with every slot shifted.
             try transformCtorComposableArgs(b, class_id, args, ast_arg_names);
+            const cls = &b.module.classes.items[class_id.int()];
+            // A fun-interface conversion types its lambda's params from the
+            // interface's single abstract method, instantiated by the
+            // explicit type args or the EXPECTED type (`val C:
+            // Comparator<String> get() = Comparator { a, b -> ... }` binds
+            // T := String, so `a` dispatches statically).
+            var sam_lpt: ?[]?[]ir.TypeRef = null;
+            defer if (sam_lpt) |types| deinitArgLambdaParamTypes(b.allocator, types);
+            if (cls.is_fun_interface and args.len == 1 and args[0] == .Lambda and
+                cls.type_params.len != 0)
+            {
+                sam_lpt = try samLambdaParamTypes(b, class_id, call.type_args);
+            }
+            if (runtime.envOnce("KLIO_SAM_TRACE") != null and cls.is_fun_interface) {
+                std.debug.print("[sam] {s} tps={d} lam={} lpt={} exp={}\n", .{ cls.name, cls.type_params.len, args.len == 1 and args[0] == .Lambda, sam_lpt != null, b.peekExpected() != null });
+            }
+            b.pending_arg_lambda_param_types = sam_lpt;
             const run = try lowerArgRunFull(b, args, ctor_arity, null);
+            b.pending_arg_lambda_param_types = null;
             const realigned = try ctorRealignedArgNames(b, class_id, args, ast_arg_names);
             defer if (realigned) |r| b.allocator.free(r);
             const arg_names = try internArgNames(b.allocator, b.module, realigned orelse ast_arg_names);
             const dst = b.allocReg();
-            const cls = &b.module.classes.items[class_id.int()];
             const static_sam = cls.is_fun_interface and args.len == 1 and !anyNamedArg(ast_arg_names);
             if (shadowed_by_class or force_static_class or static_sam) {
                 // A bare `Inner()` uses the enclosing `this` as the new
@@ -11104,6 +11122,7 @@ fn staticCallReturnTypeRef(
         const stmts2 = lam.body.stmts;
         if (stmts2.len == 0 or stmts2[stmts2.len - 1] != .Expr) break :scope_fns;
         var nb2 = FuncBuilder.init(b.allocator, b.module) catch break :scope_fns;
+        nb2.census_quiet = true;
         defer nb2.deinit();
         // The lambda's free names resolve in the ENCLOSING scope
         // (`if (it == 0) perLine else it` reads the fn's param): seed the
@@ -11832,6 +11851,7 @@ fn staticCallReturnTypeRef(
                             od_depth += 1;
                             defer od_depth -= 1;
                             var nb = try FuncBuilder.init(b.allocator, b.module);
+    nb.census_quiet = true;
                             defer nb.deinit();
                             nb.setOwnerClass(head);
                             nb.setRecvTy(head);
@@ -11964,6 +11984,7 @@ fn staticCallReturnTypeRef(
                             if (fa.body) |*fbody| {
                                 if (fbody.* == .Expr) {
                                     var nb = try FuncBuilder.init(b.allocator, b.module);
+    nb.census_quiet = true;
                                     defer nb.deinit();
                                     nb.setOwnerClass(oc.name);
                                     nb.setRecvTy(oc.name);
@@ -12164,6 +12185,7 @@ fn enrichLambdaArgShapes(
         }
         const value_params = pty.args.len - 1;
         var nb = try FuncBuilder.init(b.allocator, b.module);
+    nb.census_quiet = true;
         defer nb.deinit();
         // The block's decls and tail read the ENCLOSING scope's names too
         // (`(bytesPerLine - 1) / bytesPerGroup` inside the run block reads
@@ -12401,6 +12423,92 @@ fn enrichCallableRefArgShapes(
             shape_set.shapes[i].ty_authoritative = true;
         }
     }
+}
+
+/// The lambda-param types a fun-interface SAM conversion hands its sole
+/// lambda argument: the interface's single abstract method's value-param
+/// types, substituted under the class's type params as bound by the call's
+/// explicit type arguments or the site's EXPECTED type. Null when neither
+/// binds, when the interface has no sole abstract method, or when the
+/// method takes no value params.
+fn samLambdaParamTypes(
+    b: *FuncBuilder,
+    class_id: ir.ClassId,
+    ast_type_args: []const ast.TypeRef,
+) Allocator.Error!?[]?[]ir.TypeRef {
+    if (class_id.int() >= b.module.classes.items.len) return null;
+    const cls = &b.module.classes.items[class_id.int()];
+    const st = runtime.envOnce("KLIO_SAM_TRACE") != null;
+    var sam_fid: ?FuncId = null;
+    for (cls.methods) |mfid| {
+        const mf0 = b.module.funcById(mfid) orelse continue;
+        if (mf0.hasBody()) continue;
+        if (sam_fid != null) {
+            if (st) std.debug.print("[sam-in] multi-abstract {s} + {s}\n", .{ b.module.funcById(sam_fid.?).?.name, mf0.name });
+            return null;
+        }
+        sam_fid = mfid;
+    }
+    // An image class row can carry no method list (lazy header); the
+    // member registry still records the interface's declared methods.
+    if (sam_fid == null) {
+        var prefix_buf: [160]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&prefix_buf, "{s}\x00", .{cls.name}) catch return null;
+        var it = b.module.registry.member_method_fids.iterator();
+        while (it.next()) |e| {
+            if (!std.mem.startsWith(u8, e.key_ptr.*, prefix)) continue;
+            const mf0 = b.module.funcById(e.value_ptr.*) orelse continue;
+            if (mf0.hasBody()) continue;
+            if (sam_fid != null and sam_fid.?.int() != e.value_ptr.int()) {
+                if (st) std.debug.print("[sam-in] registry multi-abstract\n", .{});
+                return null;
+            }
+            sam_fid = e.value_ptr.*;
+        }
+    }
+    if (st) std.debug.print("[sam-in] methods={d} sam={}\n", .{ cls.methods.len, sam_fid != null });
+    const mf = b.module.funcById(sam_fid orelse return null) orelse return null;
+    const base: usize = if (mf.params.len != 0 and std.mem.eql(u8, mf.params[0].name, "this")) 1 else 0;
+    if (mf.params.len == base) return null;
+    var scratch = std.heap.ArenaAllocator.init(b.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var binds: std.ArrayList(ir.Module.TypeBinding) = .empty;
+    if (ast_type_args.len == cls.type_params.len and ast_type_args.len != 0) {
+        for (cls.type_params, ast_type_args) |tp, *ta| {
+            try binds.append(a, .{ .name = tp, .ty = try decl_mod.loweredTypeRef(a, ta, true) });
+        }
+    } else if (b.peekExpected()) |exp| {
+        if (exp.function == null and exp.type_args.len == cls.type_params.len and
+            exp.type_args.len != 0 and std.mem.eql(u8, exp.name.name, cls.name))
+        {
+            for (cls.type_params, exp.type_args) |tp, ta| {
+                if (ta.is_star) return null;
+                try binds.append(a, .{ .name = tp, .ty = try decl_mod.loweredTypeRef(a, &ta.ty, true) });
+            }
+        }
+    }
+    if (st and binds.items.len == 0) {
+        if (b.peekExpected()) |exp| std.debug.print("[sam-in] nobind exp_name={s} exp_targs={d} exp_fn={}\n", .{ exp.name.name, exp.type_args.len, exp.function != null })
+        else std.debug.print("[sam-in] nobind noexp\n", .{});
+    }
+    if (binds.items.len == 0) return null;
+    const out = try b.allocator.alloc(?[]ir.TypeRef, 1);
+    out[0] = null;
+    errdefer b.allocator.free(out);
+    const tys = try b.allocator.alloc(ir.TypeRef, mf.params.len - base);
+    var filled: usize = 0;
+    errdefer {
+        for (tys[0..filled]) |*t| t.deinit(b.allocator);
+        b.allocator.free(tys);
+    }
+    for (mf.params[base..]) |*p2| {
+        const sub = try ir.Module.substituteBoundType(a, p2.ty, binds.items);
+        tys[filled] = try sub.clone(b.allocator);
+        filled += 1;
+    }
+    out[0] = tys;
+    return out;
 }
 
 /// The companion object's own class type for a bare class-name reference in
@@ -14493,6 +14601,7 @@ fn solveComparatorSibling(
     if (head.len == 0 or head.len <= 2) return null;
     const inputs = sel_ty.args[0 .. sel_ty.args.len - 1];
     var nb = FuncBuilder.init(b.allocator, b.module) catch return null;
+    nb.census_quiet = true;
     defer nb.deinit();
     var elem_owned: ?ir.TypeRef = null;
     defer if (elem_owned) |*t| t.deinit(b.allocator);
@@ -17408,6 +17517,7 @@ fn lowerResolvedMemberCall(
             lmNote(.dynamic_by_design);
             return .none;
         }
+        if (b.census_quiet) return .none;
         lmNote(.no_receiver_type);
         if (!norecvCensusOn()) return .none;
         lm_norecv[@intFromEnum(std.meta.activeTag(receiver.*))] += 1;
