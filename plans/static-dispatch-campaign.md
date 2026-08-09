@@ -6732,3 +6732,25 @@ the compose suite's RSS. That single flip serves the local-class family
 (data/coll/arr1), the @Test relowering context (ComparisonDSL,
 sortedByNullable, the propertyEquals ladder family), and the init-thunk
 iterator rows — four residual families with one root.
+
+### KLIO_ANON_BASE, measured: the RSS note is stale, the real blocker is a lifetime bug
+
+Measured on the full compose plugin suite (harness invocation, 3
+workers, scratch home): default mode's historical >=6GB blowup does NOT
+reproduce as the binding constraint anymore — ANON_BASE=1 peaks at
+3.3GB (well under the 8GB cap) and on single classes is mode-neutral or
+BETTER (CompositionTests.testComposeAModifiedTree: 750MB/28s vs
+1187MB/36s default; MovableContentTests whole class: identical failure
+sets, RSS within 4%). The REAL blocker: the full suite ABORTS under
+ANON_BASE=1 — `panic: reached unreachable code` in `Allocator.grow` ->
+`hash_map.growIfNeeded` -> `host_fields.instanceField:2891` -> 
+`getFieldInner:1553`, after RecomposerTests completes — an instance
+FIELD MAP growing against a dead allocator: the shared side-module
+clone's arena/refcount lifetime lets an Instance outlive the allocator
+its field map was built from. The work item sharpens from "scratch-arena
+discipline for RSS" to: pin the allocator ownership of instance data
+created during shared-clone anon lowering (the instance's map must
+allocate from the RUN-lifetime allocator, never the side module's), then
+flip the default. The four residual families still hang off this one
+root; the seeding re-land is NOT needed in shared mode (the clone
+carries the class graph, so normal resolution serves data/coll/arr1).
