@@ -1086,6 +1086,34 @@ fn notePropScope(
 /// The type a literal initializer states outright. Deliberately literals
 /// only: a call or a name would need resolution this early pass does not
 /// have, and a wrong head is worse than none.
+/// `private val capacity = buffer.size` — a member-read initializer whose
+/// receiver is a primary param of a builtin SIZED container states Int as
+/// definitely as an annotation.
+fn memberSizedInitHead(c: *const ast.Class, init: *const ast.Expr) ?[]const u8 {
+    if (init.* != .Member) return null;
+    const m = init.Member;
+    const nm = m.name.name;
+    if (!std.mem.eql(u8, nm, "size") and !std.mem.eql(u8, nm, "length")) return null;
+    if (m.receiver.* != .Path or m.receiver.Path.segments.len != 1) return null;
+    const rn = m.receiver.Path.segments[0].name;
+    for (c.primary_params) |*pp| {
+        if (!std.mem.eql(u8, pp.name.name, rn)) continue;
+        const h = pp.ty.name.name;
+        const sized = [_][]const u8{
+            "Array",         "ByteArray",  "ShortArray",   "IntArray",     "LongArray",
+            "FloatArray",    "DoubleArray", "BooleanArray", "CharArray",    "UByteArray",
+            "UShortArray",   "UIntArray",  "ULongArray",   "List",         "MutableList",
+            "Set",           "MutableSet", "Map",          "MutableMap",   "Collection",
+            "MutableCollection", "String", "CharSequence", "StringBuilder",
+        };
+        for (sized) |s| {
+            if (std.mem.eql(u8, h, s)) return "Int";
+        }
+        return null;
+    }
+    return null;
+}
+
 fn promoteConstHeads(l: []const u8, r: []const u8) ?[]const u8 {
     const eq = std.mem.eql;
     if (eq(u8, l, r)) {
@@ -2137,6 +2165,11 @@ fn buildModuleWithOverrides(
                     }
                 } else if (propCtorHeadEvidence(prop, decls)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
+                } else if (prop.init != null and memberSizedInitHead(c, &prop.init.?) != null) {
+                    try module.registry.class_prop_type_heads.put(
+                        .{ .a = c.name.name, .b = prop.name.name },
+                        memberSizedInitHead(c, &prop.init.?).?,
+                    );
                 } else if (prop.init) |*init| {
                     // An unannotated property states its type through a
                     // literal initializer — `private var index = 0` in the
