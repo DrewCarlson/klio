@@ -6635,3 +6635,26 @@ probe builder has no receiver record for the implicit-this element
 binding). Fix = receiver-filter the param_rep collection exactly as the
 lambda-return pick now filters, or thread the pick's explicit
 receiver/element into the bare-form path.
+
+### The third emission channel, and the runtime pin
+
+The re-pick hazard's third instance closed end to end: flat.kt's
+bare-in-receiver-context `sumOf { it.size.toLong() }` printed 3.0 (the
+first-declared Double variant) through the UNRESOLVED-bare CMG — no
+committed target at all, the runtime's 80-candidate walk re-ranking by
+value. Three pieces landed: the unresolved-bare emission runs the
+lambda-return pick and rides the CMG with the picked fid as a PINNED
+global leg (`func_final`, FORMAT 45); `emitExtBareCall` picks too; and
+the runtime honors the pin — skip_member covers the pinned case (a
+genuine member of the receiver still shadows) and a pinned EXTENSION
+dispatches directly with the receiver prepended, because the global leg
+cannot prepend one. Every return-variant family now commits statically
+on all three emission channels wherever the pick can derive; ties that
+STILL reach the runtime remain latent parity sites only where the
+derivation itself has no answer.
+
+Residents now FOUR: the flatten `.size` variant whose pick-elem derives
+the wrong Iterator record (the param_rep instantiation link), the
+onEachIndexed tower variant, the interceptor KEY solve, and one
+a-compareTo variant. The census 31 is census-set-dominated
+(TestCollection seven, takeLastWhile pair, Index, the chains).
