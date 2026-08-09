@@ -10475,8 +10475,16 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
                             hh = typeHead(std.mem.trimEnd(u8, tpb2.bound, "?"));
                         } else if (!(b.isTypeParam(hh2) or (hh2.len > 0 and hh2.len <= 2 and std.ascii.isUpper(hh2[0])))) {
                             hh = hh2;
-                        } else break :impl;
-                    } else break :impl;
+                        } else {
+                            hh = implBoundScan(b, nm) orelse break :impl;
+                        }
+                    } else {
+                        // The window's head names a param with no recorded
+                        // bound at all: the UNIQUE in-scope bound whose
+                        // class declares the property is the receiver
+                        // (`entries` under `M : Map<out K, V>`).
+                        hh = implBoundScan(b, nm) orelse break :impl;
+                    }
                 }
                 if (propTypeRefOn(b, hh, nm)) |declared| {
                     if (bound_full) |br| {
@@ -12561,6 +12569,26 @@ pub fn extensionNullaryReturnTypeRef(
     }
     if (out_fid) |slot| slot.* = agreed_fid;
     return agreed;
+}
+
+/// The UNIQUE in-scope type-param bound whose class declares property `nm`
+/// — the implicit-receiver chase's answer when the splice window's head is
+/// a bare param with no bound record of its own.
+fn implBoundScan(b: *FuncBuilder, nm: []const u8) ?[]const u8 {
+    const bounds = (b.typeParamBoundsSlice() catch null) orelse return null;
+    defer b.allocator.free(bounds);
+    var hit: ?[]const u8 = null;
+    for (bounds) |tb| {
+        const bh = typeHead(std.mem.trimEnd(u8, tb.bound, "?"));
+        if (bh.len == 0 or bh.len <= 2) continue;
+        if (propTypeRefOn(b, bh, nm) != null or
+            b.module.registry.class_prop_type_heads.get(.{ .a = bh, .b = nm }) != null)
+        {
+            if (hit != null) return null;
+            hit = bh;
+        }
+    }
+    return hit;
 }
 
 /// Lambda-param types for a CONSTRUCTOR call's lambda arguments, read from
