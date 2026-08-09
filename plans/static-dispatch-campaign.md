@@ -6914,3 +6914,30 @@ groupBy orEmpty-Index 1, mapBehavior isEmpty().not() 1.
 Gates at cb2231a1: suite 119/119, sweep 117/0, units green, corpus
 280/291 + 4 verified chained-run flakes, litmus 42/43 (known flake),
 compose plugin canonical 1344/46/0 >= ratchet 1305 under ANON_BASE ON.
+
+## Continuation pin (post 98bdf227): the object-let splice decline
+
+The propertyEquals walk family (~200/run) reduced to THREE lowering
+sites: `(object {}).let { propertyEquals { ... } }` in
+CollectionBehaviors.kt lines 89/116/119. Mechanism confirmed by repro
+(scratchpad objlet.kt): a member-form `.let` whose receiver is an
+OBJECT EXPRESSION does not splice, so its lambda lowers as a closure
+with UNKNOWN receiver shape; bare calls inside emit unresolved-bare CMG
+(runtime member arm resolves per call = the walks). Two candidate
+fixes, in preference order: (1) make the member-form scope-fn splice
+accept an ObjectExpr receiver (the body inlines into the enclosing
+extension's builder, whose recvTy=CompareContext binds propertyEquals
+through the EXISTING implicit-member path); (2) set
+pending_lambda_no_receiver when the callee's declared param is a
+non-receiver function type (plumbing exists in lambda_body's local-fn
+param classification), which lets the new enclosing-receiver tier serve
+it. The enclosing tier itself is LANDED and gated on declared-shape
+knowledge (98bdf227).
+
+Also open, in priority order: flatten .size x2 (Array-sumOf fn-generic
+receiver projection), onEachIndexed tower x2, local-class BUILD-TIME
+typing row (coll/arr1 x3 — reserved-fid design pinned two sections up;
+CompareContext turned out to be top-level, NOT local-class),
+sortComparator .name, groupBy orEmpty-Index, mapBehavior
+isEmpty().not(), 4 unprinted rows; walk tail = Result.fold (by
+design) + builtin-intrinsic ladder routes (task-15's adapter table).
