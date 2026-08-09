@@ -6626,6 +6626,42 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 // bound receiver's members first (identical to the pin when
                 // `this` IS the owner), then each enclosing receiver.
                 if (b.resolve("this")) |bound_this| {
+                    // The PROVEN leg resolves statically: the chain's head
+                    // class declares the member, so the call binds its
+                    // virtual slot instead of walking per invocation
+                    // (`propertyEquals { ... }` inside a spliced
+                    // `(object {}).let` ran the walk 200 times per suite).
+                    if (member_of_recv and ast_type_args.len == 0 and
+                        allNull(ast_arg_names)) pin: {
+                        const chain0 = recv_chain.?[0];
+                        const pin_cid = (if (std.mem.indexOfScalar(u8, chain0, '.') != null)
+                            b.module.classIdByFqn(chain0)
+                        else
+                            b.module.uniqueClassIdBySimpleName(chain0)) orelse break :pin;
+                        var shape_set = try buildStaticReturnArgShapes(b, args, ast_arg_names);
+                        defer shape_set.deinit(b.allocator);
+                        const pin_recv_ref: ir.TypeRef = .{ .name = chain0, .nullable = false, .args = &.{} };
+                        const resolved = b.module.resolveMemberCall(pin_cid, nm, shape_set.shapes, .{
+                            .caller_file = callee.Path.segments[0].span.file,
+                            .lexical_owner = null,
+                            .actual_type_param_bounds = &.{},
+                            .receiver_type = pin_recv_ref,
+                        });
+                        const target = resolved.target orelse break :pin;
+                        const tf = b.module.funcById(target) orelse break :pin;
+                        if (!tf.hasBody()) break :pin;
+                        const run = try lowerArgRun(b, args);
+                        const dst = b.allocReg();
+                        orEmitAudit(b, "inline_splice_recv_pin", "CallVirtual", nm);
+                        try b.push(.{ .CallVirtual = .{
+                            .dst = dst,
+                            .receiver = bound_this,
+                            .slot = ir.MethodSlotId.fromFunc(target),
+                            .args = run[0],
+                            .n_args = run[1],
+                        } });
+                        return dst;
+                    }
                     const run = try lowerArgRun(b, args);
                     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
                     const dst = b.allocReg();
@@ -10237,6 +10273,12 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
         // coll {}` is a List<String> everywhere outside the literal). More
         // than one supertype is the anonymous intersection — refused.
         .ObjectExpr => |obj| {
+            // A bare `object {}` with no supertype: its denotable type
+            // outside the literal is `Any` (the marker-object idiom —
+            // `(object {}).let { ... }` must splice like any receiver).
+            if (obj.supertypes.len == 0) {
+                return .{ .name = try b.allocator.dupe(u8, "Any"), .nullable = false, .args = &.{} };
+            }
             if (obj.supertypes.len != 1) break :self_named;
             var out = try decl_mod.loweredTypeRef(b.allocator, &obj.supertypes[0], true);
             var h = std.mem.trimEnd(u8, out.name, "?");

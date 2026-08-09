@@ -4125,6 +4125,17 @@ pub const Module = struct {
             // argument and the file-private Boolean extension binds. User
             // classes stay unknown (a fun-interface SAM target).
             if (nonCallableBuiltinHead(head)) return .incompatible;
+            // A resolvable NON-fun-interface class param is a definite
+            // refutation too: a lambda converts only to a function type or
+            // a fun interface (`propertyEquals(property: KProperty1<..>)`
+            // drops for a lambda argument; its getter sibling binds).
+            if (self.staticTypeClassId(.{ .name = head, .nullable = false, .args = &.{} })) |pcid| {
+                if (pcid.int() < self.classes.items.len and
+                    !self.classes.items[pcid.int()].is_fun_interface)
+                {
+                    return .incompatible;
+                }
+            }
             return .unknown;
         }
         return .unknown;
