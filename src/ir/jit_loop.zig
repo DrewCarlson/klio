@@ -3581,7 +3581,10 @@ pub const FuncJit = struct {
     blocks_fp: usize,
     counts: []u32,
     attempts: []u8,
-    loops: std.AutoHashMapUnmanaged(u32, ?CompiledLoop) = .empty,
+    /// Per-block compiled unit / permanent-bail flag: plain arrays so the
+    /// per-block-entry hot probe is two indexed loads, not map lookups.
+    slots: []?*CompiledLoop,
+    dead: []bool,
     /// Whole-function JIT (function-mode): a separate hot counter and compiled
     /// unit for the function entry. `func_tried` latches once the compile has
     /// been attempted (success leaves `func_jit` set, failure leaves it null).
@@ -3593,9 +3596,12 @@ pub const FuncJit = struct {
     pub fn deinit(self: *FuncJit) void {
         self.a.free(self.counts);
         self.a.free(self.attempts);
-        var it = self.loops.valueIterator();
-        while (it.next()) |v| if (v.*) |*cl| cl.deinit();
-        self.loops.deinit(self.a);
+        for (self.slots) |maybe| if (maybe) |cl| {
+            cl.deinit();
+            self.a.destroy(cl);
+        };
+        self.a.free(self.slots);
+        self.a.free(self.dead);
         if (self.func_jit) |*cl| cl.deinit();
     }
 };
@@ -3705,7 +3711,7 @@ pub fn resetForTest() void {
     clearStates();
 }
 
-fn forFunc(func: *const Func) ?*FuncJit {
+pub fn forFunc(func: *const Func) ?*FuncJit {
     const a = metadata_allocator;
     const key = @intFromPtr(func);
     if (func.blocks.len == 0) return null;
@@ -3728,9 +3734,24 @@ fn forFunc(func: *const Func) ?*FuncJit {
         a.destroy(s);
         return null;
     };
-    s.* = .{ .blocks_fp = fp, .counts = counts, .attempts = attempts, .a = a };
+    const slots = a.alloc(?*CompiledLoop, func.blocks.len) catch {
+        a.free(attempts);
+        a.free(counts);
+        a.destroy(s);
+        return null;
+    };
+    const dead = a.alloc(bool, func.blocks.len) catch {
+        a.free(slots);
+        a.free(attempts);
+        a.free(counts);
+        a.destroy(s);
+        return null;
+    };
+    s.* = .{ .blocks_fp = fp, .counts = counts, .attempts = attempts, .slots = slots, .dead = dead, .a = a };
     @memset(s.counts, 0);
     @memset(s.attempts, 0);
+    @memset(s.slots, null);
+    @memset(s.dead, false);
     states.put(a, key, s) catch {
         a.free(counts);
         a.free(attempts);
@@ -4035,7 +4056,10 @@ pub const FuncOutcome = struct { code: Resume, value: Value };
 /// Run a compiled function body. Fills the param slots from `params` (deopting if
 /// a kind no longer matches), runs the native code, and returns its outcome.
 pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, slots: []i64, tags: []u8, tramp: ?TrampFn, user: ?*anyopaque) ?FuncOutcome {
-    @memset(slots[0..self.n_slots], 0);
+    // No blanket slot zeroing: Kotlin's definite-assignment rule means the
+    // compiled body never reads a register before writing it, and the param
+    // / trampoline slots are seeded explicitly below. (The zero fill was
+    // 70%+ of a native fib's per-call cost.)
     @memcpy(tags[0..self.n_regs], self.box_tags[0..self.n_regs]);
     var i: u32 = 0;
     while (i < self.n_params) : (i += 1) {
@@ -4087,7 +4111,7 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
         fj.func_tried = true;
         const compiled = tryCompileFunc(metadata_allocator, module, func, params, resolver, field_resolver, field_nn_resolver, user) catch null;
         if (compiled == null) return null;
-        if (debugEnabled()) std.debug.print("[jit] compiled function {s}\n", .{func.name});
+        if (debugEnabled()) std.debug.print("[jit] compiled function {s} n_slots={d} n_regs={d}\n", .{ func.name, compiled.?.n_slots, compiled.?.n_regs });
         fj.func_jit = compiled;
         noteCompiled();
     }
@@ -4123,10 +4147,18 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
 /// point (registers reboxed) when a compiled loop ran, else null. KLIO_JIT only.
 pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?Resume {
     const fj = forFunc(func) orelse return null;
+    return maybeRunHotPre(fj, module, func, regs, allocator, cur, tramp, user, resolver, field_resolver, field_nn_resolver);
+}
+
+/// The per-block-entry probe with the per-FUNCTION state already resolved
+/// (the frame loop hoists `forFunc` to once per activation). The fast
+/// paths — already compiled, or known-dead — are two array loads.
+pub fn maybeRunHotPre(fj: *FuncJit, module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?Resume {
     const bi = cur.int();
     if (bi >= fj.counts.len) return null;
 
-    if (!fj.loops.contains(bi)) {
+    if (fj.slots[bi] == null) {
+        if (fj.dead[bi]) return null;
         fj.counts[bi] += 1;
         if (fj.counts[bi] < HOT_THRESHOLD) return null;
         var transient = false;
@@ -4139,17 +4171,17 @@ pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayLis
                 fj.counts[bi] = HOT_THRESHOLD - RETRY_GAP;
                 return null;
             }
-            fj.loops.put(fj.a, bi, null) catch return null;
+            fj.dead[bi] = true;
             return null;
         }
         if (debugEnabled()) std.debug.print("[jit] compiled {s} block {d}\n", .{ func.name, bi });
-        fj.loops.put(fj.a, bi, compiled) catch return null;
+        const clp = fj.a.create(CompiledLoop) catch return null;
+        clp.* = compiled.?;
+        fj.slots[bi] = clp;
         noteCompiled();
     }
 
-    const entry = fj.loops.get(bi).?;
-    if (entry == null) return null;
-    const cl = &entry.?;
+    const cl = fj.slots[bi].?;
 
     if (regs.items.len < cl.n_regs) {
         regs.appendNTimes(regsGrowAlloc(allocator), .Unit, cl.n_regs - regs.items.len) catch return null;

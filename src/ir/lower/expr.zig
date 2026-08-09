@@ -9941,8 +9941,13 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
     defer if (owned) |*t| t.deinit(b.allocator);
     var ty: ir.TypeRef = blk: {
         if (argDeclTypeRef(b, iter)) |known| break :blk known;
+        // The LAZY channel serves `this` (the splice window's full
+        // receiver) — `for (element in this)` inside the associateWithTo
+        // splice iterates List<String>, and the ladder below never
+        // reached it. Borrowed, like argDeclTypeRef's answer.
+        if (argDeclTypeRefLazy(b, iter)) |lazy_known| break :blk lazy_known;
         owned = (try staticCallReturnTypeRef(b, iter)) orelse
-            (try localInitTypeRef(b, iter)) orelse return null;
+            (try staticExprTypeRef(b, iter)) orelse return null;
         break :blk owned.?;
     };
     // A type-parameter head resolves through its full bound ref: iterating
@@ -10820,6 +10825,74 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
             match = fid;
         }
         pick = match;
+    }
+    if (pick == null and want != 0 and want <= 8 and od_depth < 3) vararg_full: {
+        // A SOLE trailing-vararg candidate whose EVERY argument derives one
+        // concrete head yields its return FULLY instantiated —
+        // `listOf("foo", "bar")` is a `List<String>`. The reverted
+        // head-only variant broke user extensions precisely because it
+        // dropped the arguments; a complete record is what kotlinc infers.
+        var sole_v: ?FuncId = null;
+        for (cands) |fid| {
+            const f2 = b.module.funcById(fid) orelse continue;
+            if (!f2.hasBody()) continue;
+            const base: usize = if (f2.params.len != 0 and std.mem.eql(u8, f2.params[0].name, "this")) 1 else 0;
+            const has_va = f2.params.len != 0 and f2.params[f2.params.len - 1].is_vararg;
+            if (!has_va or f2.params.len -| base != 1) continue;
+            if (sole_v != null) break :vararg_full;
+            sole_v = fid;
+        }
+        const vf = sole_v orelse break :vararg_full;
+        const f2 = b.module.funcById(vf) orelse break :vararg_full;
+        const tps2 = b.module.registry.func_type_params.get(vf) orelse break :vararg_full;
+        if (tps2.items.len != 1) break :vararg_full;
+        if (!f2.return_ty_declared or f2.return_ty.args.len != 1) break :vararg_full;
+        var ra2 = std.mem.trimEnd(u8, f2.return_ty.args[0].name, "?");
+        if (std.mem.startsWith(u8, ra2, "in#")) ra2 = ra2[3..];
+        if (std.mem.startsWith(u8, ra2, "out#")) ra2 = ra2[4..];
+        if (!std.mem.eql(u8, ra2, tps2.items[0])) break :vararg_full;
+        var elem_owned: ?ir.TypeRef = null;
+        var elem_ok = true;
+        od_depth += 1;
+        for (call.args[0..want]) |*a2| {
+            var t2 = (staticExprTypeRef(b, a2) catch null) orelse {
+                elem_ok = false;
+                break;
+            };
+            if (t2.nullable or std.mem.endsWith(u8, t2.name, "?")) {
+                t2.deinit(b.allocator);
+                elem_ok = false;
+                break;
+            }
+            const th = typeHead(t2.name);
+            const bare2 = (th.len > 0 and th.len <= 2 and std.ascii.isUpper(th[0])) or
+                b.isTypeParam(th) or ir.parseClassTypeParamIdentity(th) != null;
+            if (th.len == 0 or bare2) {
+                t2.deinit(b.allocator);
+                elem_ok = false;
+                break;
+            }
+            if (elem_owned) |prev| {
+                const same = std.mem.eql(u8, prev.name, t2.name);
+                t2.deinit(b.allocator);
+                if (!same) {
+                    elem_ok = false;
+                    break;
+                }
+            } else {
+                elem_owned = t2;
+            }
+        }
+        od_depth -= 1;
+        if (!elem_ok or elem_owned == null) {
+            if (elem_owned) |*t| t.deinit(b.allocator);
+            break :vararg_full;
+        }
+        const ret_head = try b.allocator.dupe(u8, std.mem.trimEnd(u8, f2.return_ty.name, "?"));
+        errdefer b.allocator.free(ret_head);
+        const out_args = try b.allocator.alloc(ir.TypeRef, 1);
+        out_args[0] = elem_owned.?;
+        return .{ .name = ret_head, .nullable = f2.return_ty.nullable, .args = out_args };
     }
     if (pick == null) {
         var sole: ?FuncId = null;
@@ -14082,17 +14155,32 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
     };
     defer if (fn_generic) |m| b.allocator.free(m);
     b.pending_arg_fn_generic = fn_generic;
+    var lpt_recv_owned: ?ir.TypeRef = null;
+    defer if (lpt_recv_owned) |*t| t.deinit(b.allocator);
     const lambda_param_types: ?[]?[]ir.TypeRef = blk: {
         const f = b.module.funcById(func_id) orelse break :blk null;
         const recv_off: usize = if (f.params.len != 0 and
             std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-        break :blk try argLambdaParamTypes(
+        // A MEMBER-form call to an extension carries its receiver in the
+        // callee: derive it so the lambda's params instantiate
+        // (`dropped.associateWith { name -> ... }` on a DERIVED local left
+        // the slot at bare `T`; the annotated form already bound String).
+        const recv_ptr: ?*const ir.TypeRef = rp: {
+            if (recv_off != 1) break :rp null;
+            const ce = expr.Call.callee;
+            if (ce.* != .Member) break :rp null;
+            lpt_recv_owned = staticExprTypeRef(b, ce.Member.receiver) catch null;
+            break :rp if (lpt_recv_owned) |*t| t else null;
+        };
+        if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] emitCall fn={s} recv={s} callee={s} roff={d}\n", .{ f.name, if (recv_ptr) |r| r.name else "<null>", @tagName(std.meta.activeTag(expr.Call.callee.*)), recv_off });
+        break :blk try argLambdaParamTypesRecv(
             b,
             f,
             args,
             ast_arg_names,
             ast_type_args,
             recv_off,
+            recv_ptr,
         );
     };
     defer if (lambda_param_types) |types|
@@ -14790,6 +14878,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
         const f = b.module.funcById(func_id) orelse break :blk null;
         const recv_off: usize = if (f.params.len != 0 and
             std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] stubDeferred fn={s}\n", .{f.name});
         break :blk try argLambdaParamTypes(
             b,
             f,
@@ -15086,9 +15175,27 @@ fn threadedTrailingLambdaParam(
 
 /// The extension-fn bare-call path: prepend `this`, with trailing-lambda
 /// arg-name synthesis and the member-precedence routing.
-fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg: Reg, was_cast: bool) Allocator.Error!Reg {
+fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id_in: FuncId, this_reg: Reg, was_cast_in: bool) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
+    // The THIRD emission channel for a return-variant family: a bare
+    // extension call on the implicit receiver reached here with the
+    // heuristic sibling committed, and the member-precedence CallMember
+    // below would hand the runtime walk a first-declared re-pick (the
+    // Double sumOf, 3.0 where kotlinc prints 3). The trailing lambda's
+    // derived return discriminates here exactly as on the other two paths.
+    var func_id = func_id_in;
+    var was_cast = was_cast_in;
+    if (!was_cast and lastArgIsLambda(call.args) and allNull(call.arg_names) and
+        callee.* == .Path and callee.Path.segments.len == 1)
+    {
+        const pcands = try b.module.bareCallCandidates(b.allocator, callee.Path.segments[0].name, callee.Path.segments[0].span.file);
+        defer b.allocator.free(pcands);
+        if (try overloadPickByLambdaReturn(b, pcands, call.args, call.args.len)) |picked| {
+            func_id = picked;
+            was_cast = true;
+        }
+    }
     var selected_args = try selectedCallArgsForBuilder(b, func_id, call.args, call.arg_names, exprSpan(callee), call.has_trailing_lambda);
     defer selected_args.deinit(b.allocator);
     const args = selected_args.args;
@@ -15338,7 +15445,9 @@ fn lowerImplicitThisCall(
         defer if (priv_fn_generic) |m| b.allocator.free(m);
         b.pending_arg_fn_generic = priv_fn_generic;
         const priv_lambda_param_types: ?[]?[]ir.TypeRef = if (b.module.funcById(fid)) |pf|
-            (try argLambdaParamTypes(
+            blk_priv: {
+                if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] privBare fn={s}\n", .{pf.name});
+                break :blk_priv try argLambdaParamTypes(
                 b,
                 pf,
                 args,
@@ -15346,7 +15455,8 @@ fn lowerImplicitThisCall(
                 ast_type_args,
                 if (pf.params.len != 0 and
                     std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0,
-            ))
+            );
+            }
         else
             null;
         defer if (priv_lambda_param_types) |types|
@@ -15472,7 +15582,8 @@ fn lowerImplicitThisCall(
                 ast_arg_names,
                 recv_off,
             );
-            member_lambda_param_types = try argLambdaParamTypes(
+            if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] memberDeferred fn={s}\n", .{f.name});
+        member_lambda_param_types = try argLambdaParamTypes(
                 b,
                 f,
                 args,
@@ -16014,11 +16125,26 @@ fn lowerUnresolvedBareCall(
     // static path. Only the resolved hint is trusted — the
     // trailing-lambda namesake pick above stays arity/receiver-only (a
     // wrong namesake type stamp is worse than none).
+    // A return-variant family discriminates by the trailing lambda's
+    // derived return even when the resolution declined outright: the
+    // picked fid rides the deferred CMG as a PINNED global leg — the
+    // runtime re-rank runs the first-declared variant otherwise (the
+    // Double sumOf, 3.0 where kotlinc prints 3).
+    var ext_hint_final = false;
+    if (allNull(ast_arg_names) and lastArgIsLambda(args)) {
+        const pcands = try b.module.bareCallCandidates(b.allocator, name0, callee.Path.segments[0].span.file);
+        defer b.allocator.free(pcands);
+        if (try overloadPickByLambdaReturn(b, pcands, args, args.len)) |picked| {
+            ext_hint = picked;
+            ext_hint_final = true;
+        }
+    }
     const bare_lambda_param_types: ?[]?[]ir.TypeRef = blk: {
         const hint = ext_hint orelse break :blk null;
         const f = b.module.funcById(hint) orelse break :blk null;
         const off: usize = if (f.params.len != 0 and
             std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] unresolvedBare fn={s}\n", .{f.name});
         break :blk try argLambdaParamTypes(b, f, args, ast_arg_names, ast_type_args, off);
     };
     defer if (bare_lambda_param_types) |types|
@@ -16047,6 +16173,7 @@ fn lowerUnresolvedBareCall(
             .arg_names = arg_names,
             .recv = this_reg,
             .func = ext_hint,
+            .func_final = ext_hint_final,
             .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
             .static_recv = try cmgStaticRecv(b),
             .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
@@ -16065,6 +16192,7 @@ fn lowerUnresolvedBareCall(
         .n_args = run[1],
         .arg_names = arg_names,
         .func = ext_hint,
+        .func_final = ext_hint_final,
         .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
         .static_recv = try cmgStaticRecv(b),
         .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
@@ -16536,6 +16664,7 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
     const caller_pkg = b.module.packageOfFile(caller_file) orelse b.self_package;
     var best_tier: u8 = 255;
     var agreed: ?ir.TypeRef = null;
+    var agreed_fid: ?FuncId = null;
 
     // A declared member of the receiver's own class outranks every
     // extension, exactly as Kotlin resolves it.
@@ -16611,6 +16740,7 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
         if (tier < best_tier) {
             if (agreed) |*old| old.deinit(b.allocator);
             agreed = try f.return_ty.clone(b.allocator);
+            agreed_fid = fid;
             best_tier = tier;
             continue;
         }
@@ -16622,6 +16752,7 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             }
         } else {
             agreed = try f.return_ty.clone(b.allocator);
+            agreed_fid = fid;
         }
     }
     if (agreed) |*ret| {
@@ -16629,10 +16760,49 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             ret.deinit(b.allocator);
             return null;
         }
+        // The winning extension's return can mention its own fn type params
+        // in ARGUMENT position (`Iterable<T>.drop(n): List<T>`); the receiver
+        // instantiates them, and a raw `T` in the record poisons every
+        // downstream binding built from the local. Solve the receiver
+        // bindings and substitute; an unsolvable param keeps the raw record.
+        if (agreed_fid != null and tyMentionsBareTp(ret.*)) sub_ret: {
+            const wf = b.module.funcById(agreed_fid.?) orelse break :sub_ret;
+            var sc = std.heap.ArenaAllocator.init(b.allocator);
+            defer sc.deinit();
+            const a2 = sc.allocator();
+            const solved = (b.module.solveCallBindings(
+                a2,
+                agreed_fid.?,
+                wf,
+                recv_ty,
+                null,
+                &.{},
+                &.{},
+                false,
+            ) catch null) orelse break :sub_ret;
+            const substituted = ir.Module.substituteBoundType(a2, ret.*, solved.bindings) catch break :sub_ret;
+            if (tyMentionsBareTp(substituted)) break :sub_ret;
+            const out2 = try substituted.clone(b.allocator);
+            ret.deinit(b.allocator);
+            ret.* = out2;
+        }
         if (safe_call) ret.nullable = true;
         return ret.*;
     }
     return null;
+}
+
+/// Whether any head in the type (itself or a nested argument) is a bare
+/// function/class type parameter rather than a nameable class.
+fn tyMentionsBareTp(ty: ir.TypeRef) bool {
+    var h = std.mem.trimEnd(u8, ty.name, "?");
+    if (std.mem.startsWith(u8, h, "in#")) h = h[3..];
+    if (std.mem.startsWith(u8, h, "out#")) h = h[4..];
+    if (bareTypeParamHead(h) or ir.parseClassTypeParamIdentity(h) != null) return true;
+    for (ty.args) |a2| {
+        if (tyMentionsBareTp(a2)) return true;
+    }
+    return false;
 }
 
 /// The declared return of a BARE call that is really a member call on the
@@ -16649,7 +16819,9 @@ fn bareMemberReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
     // call some other way; only a name the receiver's class declares and
     // nothing else shadows is unambiguously the member.
     if (b.resolve(nm) != null or b.knowsOuter(nm) or b.isLocalFn(nm)) return null;
-    if (b.module.funcsBySimpleName(nm).len != 0) return null;
+    // No top-level-namesake bail: when the implicit receiver's own class
+    // DECLARES the member (the key lookup below), Kotlin's receiver scope
+    // resolves the member over any top-level namesake.
     const recv_head = b.spliceRecvTy() orelse b.recvTy() orelse b.ownerClass() orelse return null;
     const rh = typeHead(std.mem.trimEnd(u8, recv_head, "?"));
     if (rh.len == 0) return null;
@@ -16660,6 +16832,24 @@ fn bareMemberReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
         const fid = b.module.registry.member_method_fids.get(key) orelse continue;
         const f = b.module.funcById(fid) orelse continue;
         if (!f.return_ty_declared or f.return_ty.name.len == 0) return null;
+        // Instantiate through the FULL implicit receiver when it carries
+        // arguments: `listIterator(size)` inside the dropLastWhile splice
+        // returns ListIterator<String>, never ListIterator<T>.
+        const full_recv: ?ir.TypeRef = if (b.spliceRecvTyRef()) |r| r.* else b.recvTypeRef();
+        if (full_recv) |fr| {
+            if (fr.args.len != 0) {
+                var shape_set0 = try buildStaticReturnArgShapes(b, call.args, &.{});
+                defer shape_set0.deinit(b.allocator);
+                if (try b.module.instantiatedCallReturnType(b.allocator, fid, fr, null, shape_set0.shapes, &.{})) |inst| {
+                    var out2 = inst;
+                    const oh = typeHead(std.mem.trimEnd(u8, out2.name, "?"));
+                    if (oh.len > 2 and !b.isTypeParam(oh) and ir.parseClassTypeParamIdentity(oh) == null) {
+                        return out2;
+                    }
+                    out2.deinit(b.allocator);
+                }
+            }
+        }
         if (bareTypeParamHead(f.return_ty.name)) return null;
         if (staticTypeClassId(b, f.return_ty) == null) return null;
         return try f.return_ty.clone(b.allocator);
@@ -17732,6 +17922,7 @@ fn lowerResolvedMemberCall(
     const arg_generic = try argFnGenericFlags(b, target, args, ast_arg_names, 1);
     defer if (arg_generic) |flags| b.allocator.free(flags);
     b.pending_arg_fn_generic = arg_generic;
+    if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] extMember fn={s}\n", .{target.name});
     const lambda_param_types = try argLambdaParamTypesRecv(
         b,
         target,
@@ -18026,6 +18217,7 @@ fn lowerResolvedExtensionCall(
         // lowers a closure body eagerly at emit. Compute the instantiated
         // expected param types here so those bodies type their params; the
         // spliced copy gets the same facts through the window channels.
+        if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] inlineSplice fn={s}\n", .{target.name});
         const inline_lambda_param_types = try argLambdaParamTypesRecv(
             b,
             target,
@@ -18101,6 +18293,7 @@ fn lowerResolvedExtensionCall(
     const arg_generic = try argFnGenericFlags(b, target, selected_values, selected_names, 1);
     defer if (arg_generic) |flags| b.allocator.free(flags);
     b.pending_arg_fn_generic = arg_generic;
+    if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] extNamed fn={s}\n", .{target.name});
     const lambda_param_types = try argLambdaParamTypesRecv(
         b,
         target,
@@ -18316,6 +18509,12 @@ fn localOverloadReceiverCouldApply(
     // overload; the runtime receiver decides.
     {
         const head = typeHead(actual.name);
+        // A derived `Any` head is the deriver's own erasure product (a
+        // generic return the channel could not instantiate), not a proof
+        // the receiver is unrelated: dropping the local extension on it
+        // emitted a member walk that misses at runtime. The runtime
+        // receiver arbitrates instead.
+        if (std.mem.eql(u8, head, "Any")) return true;
         var bound_known = false;
         for (actual_bounds) |tb| {
             if (std.mem.eql(u8, tb.param, head)) bound_known = true;
@@ -18745,6 +18944,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             ext.param_rep orelse break :blk;
         const target = b.module.funcById(target_id) orelse break :blk;
         var rt = recv_ty;
+        if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] deferredExt fn={s}\n", .{target.name});
         deferred_lambda_param_types = try argLambdaParamTypesRecv(
             b,
             target,

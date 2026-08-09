@@ -17,6 +17,7 @@ const runtime = @import("runtime");
 const ir = @import("ir.zig");
 const span = @import("span");
 const jit_loop = @import("jit_loop.zig");
+const bc = @import("bc.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -148,7 +149,7 @@ const EvalTls = struct {
     /// host call-back boundary).
     eval_depth: usize = 0,
     /// Native-recursion depth for the whole-function JIT (see
-    /// JIT_NATIVE_DEPTH_LIMIT).
+    /// NATIVE_SLOT_BANK_DEPTH).
     jit_native_depth: usize = 0,
     /// Resolved depth cap; `0` = not yet read from the env.
     eval_depth_cap: usize = 0,
@@ -192,7 +193,14 @@ const EvalTls = struct {
 /// costs a few C-stack frames. Bounded so deep recursion falls back to the
 /// frame-based path (whose `evtls.eval_depth` bound raises a catchable StackOverflow)
 /// before the native stack faults.
-const JIT_NATIVE_DEPTH_LIMIT: usize = 1500;
+/// Static per-thread slot/tag rows for native-to-native JIT recursion, one
+/// row per nesting level (rows are disjoint, so re-entrancy is safe).
+/// Thread-local statics are zero-initialized once — a per-call stack
+/// `undefined` buffer is 0xaa-filled by the safe build on every call.
+/// Recursion deeper than the bank falls back to the frame path.
+const NATIVE_SLOT_BANK_DEPTH: usize = 192;
+threadlocal var native_slot_bank: [NATIVE_SLOT_BANK_DEPTH][192]i64 = @splat(@splat(0));
+threadlocal var native_tag_bank: [NATIVE_SLOT_BANK_DEPTH][192]u8 = @splat(@splat(0));
 
 /// Resolved depth cap for the current thread. `0` means "not yet read"; the
 /// first `runFrame` reads the env once and caches the result.
@@ -2954,7 +2962,7 @@ threadlocal var leaf_bank: [LEAF_BANK_DEPTH][ir.LEAF_MAX_REGS]Value = undefined;
 /// How far a leaf serve chains into other leaf callees. A gap-buffer read is
 /// typically three levels (`groupSize` -> `groupIndexToAddress` -> the array
 /// index helper); the bound keeps the native recursion trivially finite.
-const LEAF_MAX_DEPTH: u8 = 4;
+const LEAF_MAX_DEPTH: u8 = 8;
 
 /// Raised by the walk when an instruction needs the frame path. Caught at the
 /// serve boundary, where it becomes a plain "declined".
@@ -3135,6 +3143,10 @@ fn leafRunInsts(
             .BinOp => |bo| {
                 const l = leafRead(regs, bo.lhs) orelse return error.LeafAbandon;
                 const r = leafRead(regs, bo.rhs) orelse return error.LeafAbandon;
+                if (scalarBin(bo.op, l, r)) |v| {
+                    if (!leafWrite(allocator, regs, bo.dst, v, reclaim, false)) return error.LeafAbandon;
+                    continue;
+                }
                 if (!leafPrimitive(&l) or !leafPrimitive(&r)) return error.LeafAbandon;
                 const res = try applyBinop(allocator, bo.op, &l, &r);
                 if (res != .ok) return error.LeafAbandon;
@@ -4844,9 +4856,13 @@ fn LoopTramp(comptime H: type) type {
             if (!site.is_member and !runtime.shouldAbandon()) {
                 if (lc.module.funcById(site.func)) |callee| {
                     if (jit_loop.compiledFunc(callee)) |callee_cl| {
-                        if (evtls.jit_native_depth < JIT_NATIVE_DEPTH_LIMIT and callee_cl.n_slots <= 192) {
-                            var fslots: [192]i64 = undefined;
-                            var ftags: [192]u8 = undefined;
+                        if (evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and callee_cl.n_slots <= 192) {
+                            // Per-depth rows from the thread's static bank: a
+                            // stack `undefined` array here is 0xaa-filled per
+                            // CALL under the safe build — it was 70% of a
+                            // native fib's wall.
+                            const fslots: []i64 = &native_slot_bank[evtls.jit_native_depth];
+                            const ftags: []u8 = &native_tag_bank[evtls.jit_native_depth];
                             evtls.jit_native_depth += 1;
                             const fo = jit_loop.runFunc(callee_cl, &.{}, argbuf[0..site.n_args], fslots[0..callee_cl.n_slots], ftags[0..callee_cl.n_regs], &call, tctx.user);
                             evtls.jit_native_depth -= 1;
@@ -5078,6 +5094,15 @@ fn runFrameExec(
     const tramp_user: ?*anyopaque = if (comptime tramp_ok) @ptrCast(&loop_ctx) else null;
     const member_resolver: ?jit_loop.MemberResolver =
         if (comptime tramp_ok and @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).resolveMember else null;
+    // The bytecode tier's per-func stream table, hoisted to one lookup per
+    // activation; per block entry it is a plain array index.
+    // Fused terminator ops only when the loop JIT is off: the JIT's
+    // compile trigger lives at this loop's block entry, and fused edges
+    // would starve it.
+    const bc_streams: ?*const bc.FuncStreams = if (bc.enabled()) bc.funcStreams(func, !jit_on, module.consts.items) else null;
+    // The loop JIT's per-function state, hoisted to one lookup per
+    // activation; the per-block-entry probe is then two array loads.
+    const jit_fj: ?*jit_loop.FuncJit = if (jit_on) jit_loop.forFunc(func) else null;
     const field_resolver: ?jit_loop.FieldResolver =
         if (comptime tramp_ok and @hasDecl(H, "plainStoredFieldIndex")) &LoopTramp(H).resolveField else null;
     const field_nn_resolver: ?jit_loop.FieldResolver =
@@ -5119,8 +5144,8 @@ fn runFrameExec(
         // Loop JIT (KLIO_JIT): a hot loop header compiles to native code; on
         // success the loop runs natively and we resume at its exit block with
         // registers reboxed. Only at a fresh, non-resumed block entry.
-        if (jit_on and resume_idx == 0 and resume_throw == null and resume_unwind == null) {
-            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver, field_resolver, field_nn_resolver)) |res| {
+        if (jit_fj != null and resume_idx == 0 and resume_throw == null and resume_unwind == null) {
+            if (jit_loop.maybeRunHotPre(jit_fj.?, frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver, field_resolver, field_nn_resolver)) |res| {
                 if (res.inst == jit_loop.THROW_INST) {
                     // A trampolined call left an error pending: re-raise it. A
                     // throw resumes through the try-stack at the call's block;
@@ -5235,77 +5260,245 @@ fn runFrameExec(
             start_idx = insts.len;
         }
         var idx: usize = 0;
-        while (idx < insts.len) : (idx += 1) {
-            if (idx < start_idx) continue;
-            const inst = &insts[idx];
-            const r = try execInst(H, allocator, frame, inst, host);
-            if (r == .flat_call) {
-                // Hand the resolved direct call to the flat driver: it pushes
-                // the callee as a new activation and re-enters this frame at
-                // the next instruction once the result is in `req.dst`.
-                const req = frame.flat_call.?;
-                frame.flat_call = null;
-                flat_out.* = .{ .req = req, .ret_block = cur, .ret_idx = idx + 1 };
-                return ok(.Unit);
+        var ret_v: EvalResult = ok(.Unit);
+        var ran_bc = false;
+        // Fused-flow exits back to the frame loop: run this block from its
+        // top / run only this block's terminator.
+        var bc_goto: ?BlockId = null;
+        var bc_term: ?BlockId = null;
+        // The bytecode tier: the dense per-block stream replaces this
+        // instruction loop's union dispatch; every non-simple op escapes
+        // to `execInst`, and all control flow funnels through the same
+        // `afterStep` the walker uses. In a FUSED function (no try
+        // machinery, JIT off) the streams carry jump/br/ret terminator
+        // ops, so straight-line control flow never surfaces to the frame
+        // loop's per-block bookkeeping; each taken edge runs the same
+        // abandon/spin/GC guards the frame loop runs per block entry.
+        if (bc_streams) |bs| bc_run: {
+            // A resume that arrived carrying a throw/unwind skips the
+            // instruction surface entirely — for an EMPTY block its
+            // `start_idx = insts.len` is 0, indistinguishable from a
+            // fresh entry, and a fused terminator op must not run
+            // before the routing below.
+            if (thrown != null or unwound != null) break :bc_run;
+            // The one bounds check the stream ops rely on: build-time
+            // validation proved every operand `< n_locals`.
+            if (frame.regs.items.len < func.n_locals) break :bc_run;
+            var bcur = cur;
+            var binsts = insts;
+            const stream0 = bs.streams[bcur.int()] orelse break :bc_run;
+            ran_bc = true;
+            var code = stream0.code;
+            var pc: usize = if (start_idx == 0)
+                0
+            else if (start_idx >= binsts.len)
+                code.len
+            else
+                stream0.idx_pc[start_idx];
+            bc_loop: while (pc < code.len) {
+                const op: bc.Op = @enumFromInt(code[pc]);
+                switch (op) {
+                    .const_load => {
+                        const v = try constToValue(allocator, &frame.module.consts.items[code[pc + 2]]);
+                        writeFastU(frame, @enumFromInt(code[pc + 1]), v, allocator);
+                        pc += 3;
+                    },
+                    .const_int => {
+                        const v: Value = .{ .Int = @bitCast(code[pc + 2]) };
+                        writeFastU(frame, @enumFromInt(code[pc + 1]), v, allocator);
+                        pc += 3;
+                    },
+                    .move => {
+                        const v = frame.regs.items.ptr[code[pc + 2]];
+                        v.retain();
+                        writeFastU(frame, @enumFromInt(code[pc + 1]), v, allocator);
+                        pc += 3;
+                    },
+                    .load_param => {
+                        const pidx: usize = code[pc + 2];
+                        const v = if (pidx < frame.params.items.len) frame.params.items[pidx] else Value.Unit;
+                        v.retain();
+                        writeFastU(frame, @enumFromInt(code[pc + 1]), v, allocator);
+                        pc += 3;
+                    },
+                    .cell_get => {
+                        const v = switch (frame.regs.items.ptr[code[pc + 2]]) {
+                            .Cell => |c| vblk: {
+                                const g = c.borrow();
+                                defer g.deinit();
+                                break :vblk g.get().*;
+                            },
+                            else => |other| other,
+                        };
+                        v.retain();
+                        writeFastU(frame, @enumFromInt(code[pc + 1]), v, allocator);
+                        pc += 3;
+                    },
+                    .trace => {
+                        frame.cur_span = .{
+                            .file = @enumFromInt(code[pc + 1]),
+                            .start = code[pc + 2],
+                            .end = code[pc + 3],
+                        };
+                        pc += 4;
+                    },
+                    .bin => {
+                        // Same-tag scalar operands take an inline path with
+                        // the exact `applyBinop` semantics (wrap arithmetic,
+                        // truncated div/rem, numeric compare); anything else
+                        // — including a zero divisor, whose exception the
+                        // generic arm constructs — falls through. The
+                        // operands ride in the stream, so the fast path
+                        // never loads the Inst union.
+                        if (binFast(
+                            frame,
+                            @enumFromInt(code[pc + 2]),
+                            @enumFromInt(code[pc + 3]),
+                            @enumFromInt(code[pc + 4]),
+                            @enumFromInt(code[pc + 5]),
+                            allocator,
+                        )) {
+                            pc += 6;
+                            continue :bc_loop;
+                        }
+                        idx = code[pc + 1];
+                        const inst = &binsts[idx];
+                        const r = try execArmBinOp(H, allocator, frame, inst.BinOp, host);
+                        switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
+                            .cont => pc += 6,
+                            .brk => break :bc_loop,
+                            .ret => return ret_v,
+                        }
+                    },
+                    .escape => {
+                        idx = code[pc + 1];
+                        const inst = &binsts[idx];
+                        const r = try execInst(H, allocator, frame, inst, host);
+                        switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
+                            .cont => pc += 2,
+                            .brk => break :bc_loop,
+                            .ret => return ret_v,
+                        }
+                    },
+                    .jump, .br => {
+                        var target: u32 = undefined;
+                        if (op == .jump) {
+                            target = code[pc + 1];
+                        } else {
+                            const cv = frame.regs.items.ptr[code[pc + 1]];
+                            if (cv != .Bool) {
+                                // Cell-carried or coercing condition: the
+                                // frame loop's Branch runs `valueTruthy`.
+                                bc_term = bcur;
+                                break :bc_loop;
+                            }
+                            target = if (cv.Bool) code[pc + 2] else code[pc + 3];
+                        }
+                        if (fusedEdgeGuard(ftls)) |er| {
+                            cur = bcur;
+                            return er;
+                        }
+                        const nb: BlockId = @enumFromInt(target);
+                        if (bs.streams[nb.int()]) |ns| {
+                            bcur = nb;
+                            binsts = frame.func.blocks[nb.int()].insts;
+                            code = ns.code;
+                            pc = 0;
+                        } else {
+                            bc_goto = nb;
+                            break :bc_loop;
+                        }
+                    },
+                    .cmp_br => {
+                        // The block's last BinOp fused with its Branch: the
+                        // scalar compare computes inline, still writes dst
+                        // (register state matches the unfused form), and
+                        // branches without another fetch. Non-scalar
+                        // operands run the generic arm, then branch on dst.
+                        var taken: ?bool = null;
+                        {
+                            const regs = frame.regs.items.ptr;
+                            const di = code[pc + 3];
+                            if (scalarBin(@enumFromInt(code[pc + 2]), regs[code[pc + 4]], regs[code[pc + 5]])) |out| {
+                                if (out == .Bool) {
+                                    const old = regs[di];
+                                    regs[di] = out;
+                                    if (runtime.reclaimEnabled()) old.release(allocator);
+                                    taken = out.Bool;
+                                }
+                            }
+                        }
+                        if (taken == null) {
+                            idx = code[pc + 1];
+                            const inst = &binsts[idx];
+                            const r = try execArmBinOp(H, allocator, frame, inst.BinOp, host);
+                            switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
+                                .cont => {},
+                                .brk => break :bc_loop,
+                                .ret => return ret_v,
+                            }
+                            const cv = frame.read(@enumFromInt(code[pc + 3]));
+                            if (cv != .Bool) {
+                                bc_term = bcur;
+                                break :bc_loop;
+                            }
+                            taken = cv.Bool;
+                        }
+                        if (fusedEdgeGuard(ftls)) |er| {
+                            cur = bcur;
+                            return er;
+                        }
+                        const nb: BlockId = @enumFromInt(if (taken.?) code[pc + 6] else code[pc + 7]);
+                        if (bs.streams[nb.int()]) |ns| {
+                            bcur = nb;
+                            binsts = frame.func.blocks[nb.int()].insts;
+                            code = ns.code;
+                            pc = 0;
+                        } else {
+                            bc_goto = nb;
+                            break :bc_loop;
+                        }
+                    },
+                    .ret => {
+                        const v: Value = if (code[pc + 1] != 0)
+                            frame.regs.items.ptr[code[pc + 2]]
+                        else
+                            .Unit;
+                        v.retain();
+                        return ok(v);
+                    },
+                    .term_exit => {
+                        bc_term = bcur;
+                        break :bc_loop;
+                    },
+                }
             }
-            if (r == .raised) {
-                const e = frame.step_err.?;
-                frame.step_err = null;
-                switch (e) {
-                    .Throw => |v| {
-                        // Capture the call stack at the throw seam: the
-                        // innermost frame to surface this value records the
-                        // full chain (evtls.frame_chain is intact and innermost-first
-                        // here); the attach is once-only, so the outward unwind
-                        // through enclosing frames leaves it untouched.
-                        var tv = v;
-                        try attachStackTrace(allocator, &tv);
-                        thrown = tv;
-                        break;
-                    },
-                    .NonLocalReturn, .LabeledReturn => {
-                        // A non-local return (labeled or untargeted) unwinds
-                        // through the lambda frame *and* through any
-                        // inline-function frames it was passed into, landing
-                        // in the function that wrote the lambda (Kotlin allows
-                        // non-local return only via inline functions). Like a
-                        // throw, it runs the finally blocks of every armed try
-                        // region it crosses -- but no catch clause takes it.
-                        unwound = e;
-                        break;
-                    },
-                    .CalleeFailed, .StackOverflow => {
-                        // An interpreter-level failure from a body that RAN
-                        // (the callee boundary re-tags resolution-class
-                        // escapes to `CalleeFailed` exactly so walkers never
-                        // retry it) unwinds like a throw for `finally`
-                        // purposes: Kotlin guarantees finally on every
-                        // unwind, and skipping it left global state behind
-                        // (a dying compose test's un-run `finally` leaked a
-                        // stale recomposer flag/scope into later tests — the
-                        // cross-test no-changes contamination family). No
-                        // catch clause takes it: it is not a Kotlin
-                        // Throwable. Probe-class misses (`Unimplemented`)
-                        // stay on the immediate path below — they are
-                        // dispatch control flow, and running user finallys
-                        // per candidate probe would corrupt state.
-                        unwound = e;
-                        break;
-                    },
-                    .Suspended => |state| {
-                        // Report the suspension point so the driver can park
-                        // this frame — live for a flat activation, snapshot
-                        // for a native root. The resume value lands in the
-                        // suspending call's destination register (or one a
-                        // binding set explicitly via `pending_resume_reg`).
-                        const resume_reg = if (state.pending_resume_reg) |rr| blk: {
-                            state.pending_resume_reg = null;
-                            break :blk rr;
-                        } else instDst(inst);
-                        park_out.* = .{ .block = cur, .inst_idx = idx + 1, .resume_reg = resume_reg };
-                        return errResult(.{ .Suspended = state });
-                    },
-                    else => return errResult(e),
+            // Fused flow may have advanced blocks; the walker fallback and
+            // the mid-block throw/unwind routing below key on `cur`.
+            cur = bcur;
+        }
+        if (bc_goto) |nb| {
+            cur = nb;
+            continue;
+        }
+        if (bc_term) |nb| {
+            // Re-enter the frame loop to run ONLY this block's real
+            // terminator: the sentinel skips the instruction loop and the
+            // stream (including its fused terminator ops — an empty block
+            // entered at index 0 would otherwise replay them).
+            cur = nb;
+            resume_idx = std.math.maxInt(usize);
+            continue;
+        }
+        if (!ran_bc) {
+            while (idx < insts.len) : (idx += 1) {
+                if (idx < start_idx) continue;
+                const inst = &insts[idx];
+                const r = try execInst(H, allocator, frame, inst, host);
+                switch (try afterStep(allocator, frame, r, inst, idx, cur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
+                    .cont => {},
+                    .brk => break,
+                    .ret => return ret_v,
                 }
             }
         }
@@ -5758,6 +5951,194 @@ fn isBoundRefInstance(v: *const Value) bool {
 /// This does nothing for the JIT'd path — once a function is hot the recursive
 /// call runs native code -> `LoopTramp.call` -> `callFunc` and never reaches
 /// here. That path is served by outlining the trampoline's bulky sites.
+/// The shared post-step control-flow handling for both instruction loops
+/// (the tree walker's and the bytecode tier's): flat-call handoff, throw /
+/// non-local-return capture, suspension parking. `.brk` breaks to the
+/// block's unwind handling with `thrown`/`unwound` set; `.ret` returns
+/// `ret.*` from the frame.
+const AfterStep = enum { cont, brk, ret };
+
+fn afterStep(
+    allocator: Allocator,
+    frame: *Frame,
+    r: Step,
+    inst: *const Inst,
+    idx: usize,
+    cur: BlockId,
+    flat_out: *?FlatCallSite,
+    park_out: *?ParkPoint,
+    thrown: *?Value,
+    unwound: *?EvalError,
+    ret: *EvalResult,
+) Allocator.Error!AfterStep {
+    if (r == .flat_call) {
+        const req = frame.flat_call.?;
+        frame.flat_call = null;
+        flat_out.* = .{ .req = req, .ret_block = cur, .ret_idx = idx + 1 };
+        ret.* = ok(.Unit);
+        return .ret;
+    }
+    if (r == .raised) {
+        const e = frame.step_err.?;
+        frame.step_err = null;
+        switch (e) {
+            .Throw => |v| {
+                var tv = v;
+                try attachStackTrace(allocator, &tv);
+                thrown.* = tv;
+                return .brk;
+            },
+            .NonLocalReturn, .LabeledReturn => {
+                unwound.* = e;
+                return .brk;
+            },
+            .CalleeFailed, .StackOverflow => {
+                unwound.* = e;
+                return .brk;
+            },
+            .Suspended => |state| {
+                const resume_reg = if (state.pending_resume_reg) |rr| blk: {
+                    state.pending_resume_reg = null;
+                    break :blk rr;
+                } else instDst(inst);
+                park_out.* = .{ .block = cur, .inst_idx = idx + 1, .resume_reg = resume_reg };
+                ret.* = errResult(.{ .Suspended = state });
+                return .ret;
+            },
+            else => {
+                ret.* = errResult(e);
+                return .ret;
+            },
+        }
+    }
+    return .cont;
+}
+
+/// The bytecode tier's inline BinOp path: same-tag Int/Long scalar
+/// arithmetic and comparison (and Bool And/Or) with results written
+/// straight into the register file. Semantics mirror `applyBinop`'s
+/// same-tag cases exactly — wrap arithmetic, `divTruncI32/64` /
+/// `remTruncI32/64`, numeric equality — and every other shape
+/// (mixed tags, zero divisors, Cells, user operators) returns false
+/// so the generic arm runs.
+inline fn binFast(frame: *Frame, op: BinOp, dst: Reg, lhs: Reg, rhs: Reg, allocator: Allocator) bool {
+    // Register indices are PROVEN in bounds: validated `< n_locals` at
+    // stream build, and the bytecode section checked
+    // `regs.len >= n_locals` once at entry.
+    const regs = frame.regs.items.ptr;
+    const lv = regs[lhs.int()];
+    const rv = regs[rhs.int()];
+    const out: Value = scalarBin(op, lv, rv) orelse return false;
+    const old = regs[dst.int()];
+    regs[dst.int()] = out;
+    if (runtime.reclaimEnabled()) old.release(allocator);
+    return true;
+}
+
+/// The shared same-tag scalar BinOp core: Int/Int, Long/Long, Bool/Bool
+/// and mixed Int/Long pairs with `applyBinop`'s exact semantics. Null
+/// for every shape the generic arm must handle (mixed non-integer tags,
+/// zero divisors, boxed equality on mixed widths, Cells, ===).
+inline fn scalarBin(op: BinOp, lv: Value, rv: Value) ?Value {
+    return if (lv == .Int and rv == .Int) blk: {
+        const a = lv.Int;
+        const b = rv.Int;
+        break :blk switch (op) {
+            .Add => .{ .Int = a +% b },
+            .Sub => .{ .Int = a -% b },
+            .Mul => .{ .Int = a *% b },
+            .Div => if (b == 0) break :blk null else .{ .Int = divTruncI32(a, b) },
+            .Mod => if (b == 0) break :blk null else .{ .Int = remTruncI32(a, b) },
+            .Less => .{ .Bool = a < b },
+            .LessEq => .{ .Bool = a <= b },
+            .Greater => .{ .Bool = a > b },
+            .GreaterEq => .{ .Bool = a >= b },
+            .Eq, .BoxedEq => .{ .Bool = a == b },
+            .NotEq, .BoxedNotEq => .{ .Bool = a != b },
+            else => break :blk null,
+        };
+    } else if (lv == .Long and rv == .Long) blk: {
+        const a = lv.Long;
+        const b = rv.Long;
+        break :blk switch (op) {
+            .Add => .{ .Long = a +% b },
+            .Sub => .{ .Long = a -% b },
+            .Mul => .{ .Long = a *% b },
+            .Div => if (b == 0) break :blk null else .{ .Long = divTruncI64(a, b) },
+            .Mod => if (b == 0) break :blk null else .{ .Long = remTruncI64(a, b) },
+            .Less => .{ .Bool = a < b },
+            .LessEq => .{ .Bool = a <= b },
+            .Greater => .{ .Bool = a > b },
+            .GreaterEq => .{ .Bool = a >= b },
+            .Eq, .BoxedEq => .{ .Bool = a == b },
+            .NotEq, .BoxedNotEq => .{ .Bool = a != b },
+            else => break :blk null,
+        };
+    } else if (lv == .Bool and rv == .Bool) blk: {
+        break :blk switch (op) {
+            .And => .{ .Bool = lv.Bool and rv.Bool },
+            .Or => .{ .Bool = lv.Bool or rv.Bool },
+            .Eq, .BoxedEq => .{ .Bool = lv.Bool == rv.Bool },
+            .NotEq, .BoxedNotEq => .{ .Bool = lv.Bool != rv.Bool },
+            else => break :blk null,
+        };
+    } else if ((lv == .Int or lv == .Long) and (rv == .Int or rv == .Long)) blk: {
+        // Mixed widths promote to Long, as `applyBinop` does. Boxed
+        // equality stays tag-sensitive (`(1 as Any) != (1L as Any)`)
+        // and falls through.
+        const a: i64 = if (lv == .Int) lv.Int else lv.Long;
+        const b: i64 = if (rv == .Int) rv.Int else rv.Long;
+        break :blk switch (op) {
+            .Add => .{ .Long = a +% b },
+            .Sub => .{ .Long = a -% b },
+            .Mul => .{ .Long = a *% b },
+            .Div => if (b == 0) break :blk null else .{ .Long = divTruncI64(a, b) },
+            .Mod => if (b == 0) break :blk null else .{ .Long = remTruncI64(a, b) },
+            .Less => .{ .Bool = a < b },
+            .LessEq => .{ .Bool = a <= b },
+            .Greater => .{ .Bool = a > b },
+            .GreaterEq => .{ .Bool = a >= b },
+            .Eq => .{ .Bool = a == b },
+            .NotEq => .{ .Bool = a != b },
+            else => break :blk null,
+        };
+    } else null;
+}
+
+/// The frame loop's per-block-entry guards, run on every taken FUSED
+/// edge: daemon abandonment, the spin/wall diagnostic, and the GC safe
+/// point. Non-null = abort the frame with this result.
+inline fn fusedEdgeGuard(ftls: *EvalTls) ?EvalResult {
+    if (runtime.shouldAbandon()) {
+        return errResult(.{ .Type = "daemon task abandoned at run boundary" });
+    }
+    ftls.spin_check_counter +%= 1;
+    if (ftls.spin_check_counter & 0xFFFF == 0) {
+        spinDumpMaybe();
+        const wall_dl = test_wall_deadline_ms.load(.monotonic);
+        if (wall_dl != 0 and nowMonotonicMs() > wall_dl) {
+            std.debug.print("[wall-cap] test wall-clock deadline exceeded — hang location follows:\n", .{});
+            dumpFrameChainForDiagAlways();
+            wallCapAbandon();
+            return errResult(.{ .Type = "test wall-clock deadline exceeded" });
+        }
+    }
+    if (runtime.gc.gc_enabled and runtime.gc.pending()) {
+        runtime.gc.safePoint();
+    }
+    return null;
+}
+
+/// Unchecked register store for the bytecode loop's simple ops: the
+/// index was validated `< n_locals` at stream build and the section
+/// checked `regs.len >= n_locals` once at entry. Takes ownership of `v`.
+inline fn writeFastU(frame: *Frame, r: Reg, v: Value, allocator: Allocator) void {
+    const idx = r.int();
+    const old = frame.regs.items.ptr[idx];
+    frame.regs.items.ptr[idx] = v;
+    if (runtime.reclaimEnabled()) old.release(allocator);
+}
+
 noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!Step {
     if (runtime.prof.op_prof_active) runtime.prof.current_op = @intFromEnum(inst.*);
     switch (inst.*) {
@@ -6376,6 +6757,21 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Frame, gf: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(gf.receiver);
+    if (std.c.getenv("KLIO_GF_TRACE")) |w0| {
+        if (constStr(frame.module, gf.field)) |fname| {
+            if (std.mem.indexOf(u8, fname, std.mem.span(w0)) != null) {
+                const rn: []const u8 = if (recv == .Instance) blk: {
+                    const g = recv.Instance.borrow();
+                    const cg = g.get().class.borrow();
+                    const n = cg.get().name;
+                    cg.deinit();
+                    g.deinit();
+                    break :blk n;
+                } else @tagName(recv);
+                std.debug.print("[gfarm] field={s} recv={s} in={s}\n", .{ fname, rn, frame.func.name });
+            }
+        }
+    }
     const name = constStr(frame.module, gf.field) orelse
         return raiseStep(frame, .{ .Type = "GetField: name not a string const" });
     if (builtinFieldFast(&recv, name)) |bv| {
@@ -7176,6 +7572,34 @@ noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *F
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Frame, cm: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(cm.receiver);
+    if (std.c.getenv("KLIO_CM_TRACE")) |w0| {
+        const want = std.mem.span(w0);
+        if (constStr(frame.module, cm.name)) |nm| {
+            if (std.mem.eql(u8, nm, want)) {
+                const chain = evtls.active_chain;
+                std.debug.print("[cmarm] name={s} in={s} resolved={} chain_len={d} chain_base={d}\n", .{
+                    nm,
+                    frame.func.name,
+                    cm.resolved != null,
+                    if (chain) |c| c.items.len else 0,
+                    evtls.active_chain_base,
+                });
+                if (chain) |c| {
+                    for (c.items, 0..) |e, i| {
+                        const tn: []const u8 = if (e.v == .Instance) blk: {
+                            const g = e.v.Instance.borrow();
+                            const cg = g.get().class.borrow();
+                            const n = cg.get().name;
+                            cg.deinit();
+                            g.deinit();
+                            break :blk n;
+                        } else @tagName(e.v);
+                        std.debug.print("[cmarm]   [{d}] kind={s} {s}\n", .{ i, @tagName(e.kind), tn });
+                    }
+                }
+            }
+        }
+    }
     // Complete lowering evidence selected this declaration. Execute that
     // identity before representation-specific member fast paths; an invalid
     // identity is an image/link error, never permission to reinterpret the
@@ -8363,7 +8787,40 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     else
         false;
     const skip_member = site_skip or (cmg_skip and !is_ctor_name and !shadow_capture and
-        host.cmgGlobalSkip(func_p, &this_val, name_str, arg_values));
+        host.cmgGlobalSkip(func_p, &this_val, name_str, arg_values)) or
+        // Call-site evidence PINNED the overload (`func_final`): a genuine
+        // member of the receiver still shadows, but the member leg's
+        // extension-fallback re-rank must not run the first-declared
+        // variant past the pin.
+        (cmg.func_final and !is_ctor_name and
+            ((this_val == .Null or this_val == .Unit) or !host.hostHasMember(&this_val, name_str)));
+    // A pinned EXTENSION dispatches directly with the receiver prepended:
+    // the global leg cannot prepend a receiver, and the member leg's
+    // fallback would re-rank past the pin (the genuine-member shadow was
+    // judged just above).
+    if (cmg.func_final and skip_member and !is_ctor_name and
+        this_val != .Null and this_val != .Unit)
+    direct: {
+        const pf = cmg.func orelse break :direct;
+        const pfd = frame.module.funcById(pf) orelse break :direct;
+        if (pfd.params.len == 0 or !std.mem.eql(u8, pfd.params[0].name, "this")) break :direct;
+        const all_args = try allocator.alloc(Value, arg_values.len + 1);
+        defer allocator.free(all_args);
+        all_args[0] = this_val;
+        for (arg_values, 0..) |v, i| all_args[i + 1] = v;
+        const padded_names = try allocator.alloc(?[]const u8, names.len + 1);
+        defer allocator.free(padded_names);
+        padded_names[0] = null;
+        for (names, 0..) |n2, i| padded_names[i + 1] = n2;
+        orAudit("CallMemberOrGlobal", name_str, "pinned_ext_direct", -1, null);
+        switch (try host.callFuncNamed(allocator, frame.module, pf, all_args, padded_names)) {
+            .ok => |result| {
+                try frame.write(cmg.dst, result);
+                return .cont;
+            },
+            .err => |e| return raiseStep(frame, e),
+        }
+    }
     // Full replay: this site already resolved, for this receiver class and
     // argument shape, to a plain global whose dispatch was a fused
     // activation. Rebuild that activation and skip both the member walk and
@@ -10345,8 +10802,14 @@ pub fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Va
                 if (r.Int == 0) return errResult(try arithExc(allocator, "/ by zero"));
                 return ok(.{ .Int = divTruncI32(l.Int, r.Int) });
             }
-            if (l.* == .Long and r.* == .Int) return ok(.{ .Long = divTruncI64(l.Long, @as(i64, r.Int)) });
-            if (l.* == .Int and r.* == .Long) return ok(.{ .Long = divTruncI64(@as(i64, l.Int), r.Long) });
+            if (l.* == .Long and r.* == .Int) {
+                if (r.Int == 0) return errResult(try arithExc(allocator, "/ by zero"));
+                return ok(.{ .Long = divTruncI64(l.Long, @as(i64, r.Int)) });
+            }
+            if (l.* == .Int and r.* == .Long) {
+                if (r.Long == 0) return errResult(try arithExc(allocator, "/ by zero"));
+                return ok(.{ .Long = divTruncI64(@as(i64, l.Int), r.Long) });
+            }
             if (l.* == .Double and r.* == .Int) return ok(.{ .Double = l.Double / @as(f64, @floatFromInt(r.Int)) });
             if (l.* == .Int and r.* == .Double) return ok(.{ .Double = @as(f64, @floatFromInt(l.Int)) / r.Double });
             if (l.* == .Double and r.* == .Long) return ok(.{ .Double = l.Double / @as(f64, @floatFromInt(r.Long)) });
@@ -10377,8 +10840,14 @@ pub fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Va
                 if (r.Int == 0) return errResult(try arithExc(allocator, "/ by zero"));
                 return ok(.{ .Int = remTruncI32(l.Int, r.Int) });
             }
-            if (l.* == .Long and r.* == .Int) return ok(.{ .Long = remTruncI64(l.Long, @as(i64, r.Int)) });
-            if (l.* == .Int and r.* == .Long) return ok(.{ .Long = remTruncI64(@as(i64, l.Int), r.Long) });
+            if (l.* == .Long and r.* == .Int) {
+                if (r.Int == 0) return errResult(try arithExc(allocator, "/ by zero"));
+                return ok(.{ .Long = remTruncI64(l.Long, @as(i64, r.Int)) });
+            }
+            if (l.* == .Int and r.* == .Long) {
+                if (r.Long == 0) return errResult(try arithExc(allocator, "/ by zero"));
+                return ok(.{ .Long = remTruncI64(@as(i64, l.Int), r.Long) });
+            }
             if (l.* == .UInt and r.* == .UInt) {
                 if (r.UInt == 0) return errResult(try arithExc(allocator, "/ by zero"));
                 return ok(.{ .UInt = l.UInt % r.UInt });

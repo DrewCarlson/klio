@@ -2511,6 +2511,7 @@ test "lambda_return_overload_pick" {
         \\6
         \\6
         \\3
+        \\3
         \\
     );
 }
@@ -2607,6 +2608,33 @@ test "type_param_bounded_by_type_param" {
     try check("type_param_bounded_by_type_param",
         \\foobar/foo/2/list-typed
         \\[1, 3, 6]
+        \\
+    );
+}
+
+// The derived-receiver static-binding mechanisms in one program: extension
+// returns instantiated from receivers (associateWith on a derived local),
+// heterogeneous-vararg LUB records, SAM lambda typing (expected-type,
+// explicit-args, and chained forms), bare-tp property substitution
+// (isEmpty().not() on Ctx<Map<K, V>>), the object-let marker splice, the
+// local-class supertype typing record, Array flatten, the repeat protocol,
+// and a qualified value-class ctor. Every row is kotlinc's output.
+// The `[ab]` row pins the NEW fixture lines (`byLength[2].orEmpty()` on a
+// groupBy result — the recorder-level star patch derives K from the
+// trailing lambda; kotlinc prints [ab]). The prior rows are unchanged.
+test "derived_receiver_static_binds" {
+    try check("derived_receiver_static_binds",
+        \\{beta=2}
+        \\a, b, c, *
+        \\[A, b]
+        \\true
+        \\true
+        \\7
+        \\[x, y]
+        \\[a, b, c]
+        \\[ab]
+        \\3
+        \\true
         \\
     );
 }

@@ -164,6 +164,8 @@ pub fn lowerForLabeled(
                 .nullable = false,
                 .args = &.{},
             });
+        } else if (std.c.getenv("KLIO_FORVAR_TRACE") != null) {
+            std.debug.print("[forvar] {s} elem=null iter_tag={s}\n", .{ vars[0].name, @tagName(std.meta.activeTag(iter.*)) });
         }
     } else {
         // Each destructured name is bound to the element's `componentN()`, so
