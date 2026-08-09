@@ -6557,3 +6557,22 @@ a-compareTo (TextActuals lambda param), entries/onEachIndexed
 (transitive fn-tp binding); census-set: the TestCollection local-class
 7 (KLIO_ANON_BASE affordability), takeLastWhile/dropLastWhile pair,
 Postfix 2, Index 1, the chunked/minOf/maxOf/lowercase/isEmpty chains.
+
+### 40 -> 34: literals enter the deriver
+
+The deriver had NO literal arm at all, and the capture snapshot's
+pre-derive ran only the call-return channel — `var result = 0` read
+inside the repeat lambda (FractionalParser), the KlioStartContinuation
+comp row, the TextActuals compareTo pair and three more bound at once
+when literals began naming their own type and the pre-derive adopted
+the full deriver. Core-deriver change, examples-gated green.
+
+The six remaining residents, each now diagnosed one level deeper:
+`interceptor` needs the CoroutineContext `get` KEY solve (E binds
+through the companion object's `Key<ContinuationInterceptor>` supertype
+projection); `isoString` is a fn param (annotated!) captured into a
+LOCAL FN whose body lowering does not consume the decl-type snapshot
+the lambda path does; `step` (SequenceBuilder resume chain);
+`entries`/onEachIndexed (the transitive fn-tp binding);
+`.size` in the stdlib flatten (the pick's implicit-this element binding
+in the bare form); `a`-compareTo persists only in one module variant.
