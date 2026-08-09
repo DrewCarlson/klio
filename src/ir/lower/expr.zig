@@ -14172,6 +14172,7 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
             lpt_recv_owned = staticExprTypeRef(b, ce.Member.receiver) catch null;
             break :rp if (lpt_recv_owned) |*t| t else null;
         };
+        if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] emitCall fn={s} recv={s} callee={s} roff={d}\n", .{ f.name, if (recv_ptr) |r| r.name else "<null>", @tagName(std.meta.activeTag(expr.Call.callee.*)), recv_off });
         break :blk try argLambdaParamTypesRecv(
             b,
             f,
@@ -14877,6 +14878,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
         const f = b.module.funcById(func_id) orelse break :blk null;
         const recv_off: usize = if (f.params.len != 0 and
             std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] stubDeferred fn={s}\n", .{f.name});
         break :blk try argLambdaParamTypes(
             b,
             f,
@@ -15443,7 +15445,9 @@ fn lowerImplicitThisCall(
         defer if (priv_fn_generic) |m| b.allocator.free(m);
         b.pending_arg_fn_generic = priv_fn_generic;
         const priv_lambda_param_types: ?[]?[]ir.TypeRef = if (b.module.funcById(fid)) |pf|
-            (try argLambdaParamTypes(
+            blk_priv: {
+                if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] privBare fn={s}\n", .{pf.name});
+                break :blk_priv try argLambdaParamTypes(
                 b,
                 pf,
                 args,
@@ -15451,7 +15455,8 @@ fn lowerImplicitThisCall(
                 ast_type_args,
                 if (pf.params.len != 0 and
                     std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0,
-            ))
+            );
+            }
         else
             null;
         defer if (priv_lambda_param_types) |types|
@@ -15577,7 +15582,8 @@ fn lowerImplicitThisCall(
                 ast_arg_names,
                 recv_off,
             );
-            member_lambda_param_types = try argLambdaParamTypes(
+            if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] memberDeferred fn={s}\n", .{f.name});
+        member_lambda_param_types = try argLambdaParamTypes(
                 b,
                 f,
                 args,
@@ -16138,6 +16144,7 @@ fn lowerUnresolvedBareCall(
         const f = b.module.funcById(hint) orelse break :blk null;
         const off: usize = if (f.params.len != 0 and
             std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] unresolvedBare fn={s}\n", .{f.name});
         break :blk try argLambdaParamTypes(b, f, args, ast_arg_names, ast_type_args, off);
     };
     defer if (bare_lambda_param_types) |types|
@@ -16657,6 +16664,7 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
     const caller_pkg = b.module.packageOfFile(caller_file) orelse b.self_package;
     var best_tier: u8 = 255;
     var agreed: ?ir.TypeRef = null;
+    var agreed_fid: ?FuncId = null;
 
     // A declared member of the receiver's own class outranks every
     // extension, exactly as Kotlin resolves it.
@@ -16732,6 +16740,7 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
         if (tier < best_tier) {
             if (agreed) |*old| old.deinit(b.allocator);
             agreed = try f.return_ty.clone(b.allocator);
+            agreed_fid = fid;
             best_tier = tier;
             continue;
         }
@@ -16743,6 +16752,7 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             }
         } else {
             agreed = try f.return_ty.clone(b.allocator);
+            agreed_fid = fid;
         }
     }
     if (agreed) |*ret| {
@@ -16750,10 +16760,49 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             ret.deinit(b.allocator);
             return null;
         }
+        // The winning extension's return can mention its own fn type params
+        // in ARGUMENT position (`Iterable<T>.drop(n): List<T>`); the receiver
+        // instantiates them, and a raw `T` in the record poisons every
+        // downstream binding built from the local. Solve the receiver
+        // bindings and substitute; an unsolvable param keeps the raw record.
+        if (agreed_fid != null and tyMentionsBareTp(ret.*)) sub_ret: {
+            const wf = b.module.funcById(agreed_fid.?) orelse break :sub_ret;
+            var sc = std.heap.ArenaAllocator.init(b.allocator);
+            defer sc.deinit();
+            const a2 = sc.allocator();
+            const solved = (b.module.solveCallBindings(
+                a2,
+                agreed_fid.?,
+                wf,
+                recv_ty,
+                null,
+                &.{},
+                &.{},
+                false,
+            ) catch null) orelse break :sub_ret;
+            const substituted = ir.Module.substituteBoundType(a2, ret.*, solved.bindings) catch break :sub_ret;
+            if (tyMentionsBareTp(substituted)) break :sub_ret;
+            const out2 = try substituted.clone(b.allocator);
+            ret.deinit(b.allocator);
+            ret.* = out2;
+        }
         if (safe_call) ret.nullable = true;
         return ret.*;
     }
     return null;
+}
+
+/// Whether any head in the type (itself or a nested argument) is a bare
+/// function/class type parameter rather than a nameable class.
+fn tyMentionsBareTp(ty: ir.TypeRef) bool {
+    var h = std.mem.trimEnd(u8, ty.name, "?");
+    if (std.mem.startsWith(u8, h, "in#")) h = h[3..];
+    if (std.mem.startsWith(u8, h, "out#")) h = h[4..];
+    if (bareTypeParamHead(h) or ir.parseClassTypeParamIdentity(h) != null) return true;
+    for (ty.args) |a2| {
+        if (tyMentionsBareTp(a2)) return true;
+    }
+    return false;
 }
 
 /// The declared return of a BARE call that is really a member call on the
@@ -17873,6 +17922,7 @@ fn lowerResolvedMemberCall(
     const arg_generic = try argFnGenericFlags(b, target, args, ast_arg_names, 1);
     defer if (arg_generic) |flags| b.allocator.free(flags);
     b.pending_arg_fn_generic = arg_generic;
+    if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] extMember fn={s}\n", .{target.name});
     const lambda_param_types = try argLambdaParamTypesRecv(
         b,
         target,
@@ -18167,6 +18217,7 @@ fn lowerResolvedExtensionCall(
         // lowers a closure body eagerly at emit. Compute the instantiated
         // expected param types here so those bodies type their params; the
         // spliced copy gets the same facts through the window channels.
+        if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] inlineSplice fn={s}\n", .{target.name});
         const inline_lambda_param_types = try argLambdaParamTypesRecv(
             b,
             target,
@@ -18242,6 +18293,7 @@ fn lowerResolvedExtensionCall(
     const arg_generic = try argFnGenericFlags(b, target, selected_values, selected_names, 1);
     defer if (arg_generic) |flags| b.allocator.free(flags);
     b.pending_arg_fn_generic = arg_generic;
+    if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] extNamed fn={s}\n", .{target.name});
     const lambda_param_types = try argLambdaParamTypesRecv(
         b,
         target,
@@ -18457,6 +18509,12 @@ fn localOverloadReceiverCouldApply(
     // overload; the runtime receiver decides.
     {
         const head = typeHead(actual.name);
+        // A derived `Any` head is the deriver's own erasure product (a
+        // generic return the channel could not instantiate), not a proof
+        // the receiver is unrelated: dropping the local extension on it
+        // emitted a member walk that misses at runtime. The runtime
+        // receiver arbitrates instead.
+        if (std.mem.eql(u8, head, "Any")) return true;
         var bound_known = false;
         for (actual_bounds) |tb| {
             if (std.mem.eql(u8, tb.param, head)) bound_known = true;
@@ -18886,6 +18944,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
             ext.param_rep orelse break :blk;
         const target = b.module.funcById(target_id) orelse break :blk;
         var rt = recv_ty;
+        if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] deferredExt fn={s}\n", .{target.name});
         deferred_lambda_param_types = try argLambdaParamTypesRecv(
             b,
             target,

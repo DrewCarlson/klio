@@ -3762,6 +3762,18 @@ pub const Module = struct {
                 }
             }
         }
+        // A bare actual HEAD whose class relates to the pattern carries no
+        // arguments to bind the pattern's parameters against. It cannot
+        // DISPROVE the candidate — the head relation already held above —
+        // so the lenient mode keeps it and the runtime receiver decides.
+        // Refusing here turned a derived-but-argless receiver record into a
+        // dropped local extension and a runtime member miss.
+        if (mode == .could_apply and actual.args.len == 0 and
+            overrideArgs(actual).len == 0 and pattern.args.len != 0)
+        {
+            if (gra_trace) std.debug.print("[gra] {s} vs {s}: bare actual head, could apply\n", .{ actual.name, pattern.name });
+            return true;
+        }
         if (!try self.bindReceiverTypeParams(
             a,
             actual,
@@ -3770,7 +3782,13 @@ pub const Module = struct {
             &bindings,
             0,
         )) {
-            if (gra_trace) std.debug.print("[gra] {s} vs {s}: bind FAILED\n", .{ actual.name, pattern.name });
+            if (gra_trace) {
+                std.debug.print("[gra] {s} vs {s}: bind FAILED act_args=", .{ actual.name, pattern.name });
+                for (actual.args) |aa| std.debug.print("{s},", .{aa.name});
+                std.debug.print(" pat_args=", .{});
+                for (pattern.args) |pa| std.debug.print("{s},", .{pa.name});
+                std.debug.print("\n", .{});
+            }
             return false;
         }
         if (gra_trace) {
@@ -6099,10 +6117,21 @@ pub const Module = struct {
             (decl_sig == null or decl_sig.?.kind != .instance_method))
         {
             if (receiver) |actual_receiver| {
+                // Project the actual receiver onto the DECLARED head first:
+                // a List<String> receiver binds an Iterable<K> pattern
+                // (K := String) instead of head-mismatching into a refusal —
+                // the same rule the splice window and the sibling-expected
+                // solve already apply.
+                var recv_eff = actual_receiver;
+                if (self.staticTypeClassId(f.params[0].ty)) |dcid| {
+                    if (try self.projectTypeToClass(a, actual_receiver, dcid)) |projected| {
+                        recv_eff = projected;
+                    }
+                }
                 if (!try self.bindCallType(
                     a,
                     f.params[0].ty,
-                    actual_receiver,
+                    recv_eff,
                     function_type_params,
                     &bindings,
                     0,
