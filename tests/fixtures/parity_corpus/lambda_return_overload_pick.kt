@@ -9,4 +9,9 @@ fun main() {
     println(items.sumOf { it.length.toDouble() })
     val bytes = ubyteArrayOf(1u, 2u, 3u)
     println(bytes.sum())
+    // The exact-receiver family narrows before the return pick: UByteArray
+    // also satisfies Iterable<UByte>, whose sumOf variants spell the
+    // selector param `T` — receiver specificity keeps the UByteArray five.
+    println(ushortArrayOf(1u, 2u, 3u).sum())
+    println(bytes.sumOf { it.toInt() })
 }

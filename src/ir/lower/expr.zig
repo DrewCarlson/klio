@@ -297,11 +297,9 @@ fn overloadPickByLambdaReturn(
     const lam = args[li].Lambda;
     const stmts = lam.body.stmts;
     if (stmts.len == 0 or stmts[stmts.len - 1] != .Expr) return null;
-    const Entry = struct { fid: FuncId, ret: []const u8 };
+    const Entry = struct { fid: FuncId, ret: []const u8, params: []const ir.TypeRef, exact_recv: bool };
     var family: std.ArrayList(Entry) = .empty;
     defer family.deinit(b.allocator);
-    var agreed_params: ?[]const ir.TypeRef = null;
-    var distinct_returns: usize = 0;
     // The implicit receiver's head filters extension candidates before the
     // agreement check — the CharSequence variants' `(Char) -> R` params must
     // not disagree a UByteArray family into a bail.
@@ -309,43 +307,101 @@ fn overloadPickByLambdaReturn(
         const h = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse break :blk null;
         break :blk typeHead(std.mem.trimEnd(u8, h, "?"));
     };
+    const lamret_why = runtime.envOnce("KLIO_LAMRET_WHY");
     for (cands) |fid| {
-        const f = b.module.funcById(fid) orelse continue;
-        if (!f.hasBody()) continue;
+        const f = b.module.funcById(fid) orelse {
+            if (lamret_why != null) std.debug.print("[lamret-why] #{d} skip=null_func\n", .{fid.int()});
+            continue;
+        };
+        const why = lamret_why != null and std.mem.indexOf(u8, f.fqn, lamret_why.?) != null;
+        if (!f.hasBody()) {
+            if (why) std.debug.print("[lamret-why] {s}#{d} skip=no_body\n", .{ f.fqn, fid.int() });
+            continue;
+        }
         const base: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-        if (f.params.len -| base != want) continue;
+        if (f.params.len -| base != want) {
+            if (why) std.debug.print("[lamret-why] {s}#{d} skip=arity params={d} want={d}\n", .{ f.fqn, fid.int(), f.params.len, want });
+            continue;
+        }
+        var exact_recv = false;
         if (base == 1) {
-            const ah = actual_recv_head orelse continue;
+            const ah = actual_recv_head orelse {
+                if (why) std.debug.print("[lamret-why] {s}#{d} skip=no_recv_head\n", .{ f.fqn, fid.int() });
+                continue;
+            };
             var dr = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
             if (std.mem.indexOfScalar(u8, dr, '<')) |lt| dr = dr[0..lt];
             const dh = typeHead(dr);
-            if (!(dh.len <= 2 or ir.parseClassTypeParamIdentity(f.params[0].ty.name) != null or
-                receiverHeadServes(b, ah, dh))) continue;
+            exact_recv = std.mem.eql(u8, ah, dh);
+            if (!(exact_recv or dh.len <= 2 or ir.parseClassTypeParamIdentity(f.params[0].ty.name) != null or
+                receiverHeadServes(b, ah, dh)))
+            {
+                if (why) std.debug.print("[lamret-why] {s}#{d} skip=recv ah={s} dh={s}\n", .{ f.fqn, fid.int(), ah, dh });
+                continue;
+            }
         }
         const pty = f.params[f.params.len - 1].ty;
-        if (!std.mem.startsWith(u8, typeHead(pty.name), "Function") or pty.args.len < 1) continue;
+        if (!std.mem.startsWith(u8, typeHead(pty.name), "Function") or pty.args.len < 1) {
+            if (why) std.debug.print("[lamret-why] {s}#{d} skip=fn_ty pty={s} args={d}\n", .{ f.fqn, fid.int(), pty.name, pty.args.len });
+            continue;
+        }
         const params = pty.args[0 .. pty.args.len - 1];
         const ret_head = typeHead(std.mem.trimEnd(u8, pty.args[pty.args.len - 1].name, "?"));
         if (ret_head.len == 0) continue;
+        try family.append(b.allocator, .{ .fid = fid, .ret = ret_head, .params = params, .exact_recv = exact_recv });
+    }
+    const lamret_trace = runtime.envOnce("KLIO_LAMRET_TRACE") != null;
+    // Receiver specificity narrows before the return pick, exactly as
+    // kotlinc ranks: an exact-receiver family (`UByteArray.sumOf`) beats
+    // supertype-receiver applicables (`Iterable<T>.sumOf` through
+    // `UByteArray : Collection<UByte>`), whose different param spelling
+    // must not disagree the pick into a bail.
+    var any_exact = false;
+    for (family.items) |e| any_exact = any_exact or e.exact_recv;
+    if (any_exact) {
+        var w: usize = 0;
+        for (family.items) |e| {
+            if (e.exact_recv) {
+                family.items[w] = e;
+                w += 1;
+            }
+        }
+        family.items.len = w;
+    }
+    // The surviving set must agree on the lambda-slot's parameter types;
+    // return variety is what the pick discriminates.
+    var agreed_params: ?[]const ir.TypeRef = null;
+    var distinct_returns: usize = 0;
+    for (family.items) |e| {
         if (agreed_params) |prev| {
-            if (prev.len != params.len) return null;
-            for (prev, params) |pa, pb2| {
+            if (prev.len != e.params.len) return null;
+            for (prev, e.params) |pa, pb2| {
                 if (!std.mem.eql(u8, pa.name, pb2.name)) return null;
             }
         } else {
-            agreed_params = params;
+            agreed_params = e.params;
         }
+    }
+    for (family.items, 0..) |e, ei| {
         var seen = false;
-        for (family.items) |e| {
-            if (std.mem.eql(u8, e.ret, ret_head)) {
+        for (family.items[0..ei]) |prior| {
+            if (std.mem.eql(u8, prior.ret, e.ret)) {
                 seen = true;
                 break;
             }
         }
         if (!seen) distinct_returns += 1;
-        try family.append(b.allocator, .{ .fid = fid, .ret = ret_head });
     }
-    if (family.items.len < 2 or distinct_returns < 2) return null;
+    if (family.items.len < 2 or distinct_returns < 2) {
+        if (lamret_trace and family.items.len != 0) {
+            std.debug.print("[lamret-bail] family={d} distinct={d} first={s}\n", .{
+                family.items.len,
+                distinct_returns,
+                if (b.module.funcById(family.items[0].fid)) |f| f.fqn else "?",
+            });
+        }
+        return null;
+    }
     const fparams = agreed_params orelse return null;
     // Bind the lambda's value parameters from the agreed declared types; a
     // sole bare-type-parameter param is the receiver's ELEMENT (the
@@ -364,7 +420,10 @@ fn overloadPickByLambdaReturn(
             return null;
         const declared = fparams[i];
         const dh = typeHead(std.mem.trimEnd(u8, declared.name, "?"));
-        if (staticTypeClassId(b, declared) != null) {
+        // A scalar head (the unsigned types among them) has no class row but
+        // the deriver types its members from the declaration tables, so the
+        // declared param type still binds.
+        if (staticTypeClassId(b, declared) != null or isPrimitiveTypeName(dh)) {
             try nb.setLocalDeclTypeOwned(pname, try declared.clone(b.allocator));
         } else if (dh.len <= 2 or ir.parseClassTypeParamIdentity(declared.name) != null) {
             if (fparams.len != 1) return null;
@@ -381,6 +440,12 @@ fn overloadPickByLambdaReturn(
     od_depth += 1;
     const derived = staticExprTypeRef(&nb, &stmts[stmts.len - 1].Expr) catch null;
     od_depth -= 1;
+    if (lamret_trace and derived == null) {
+        std.debug.print("[lamret-bail] derive=null family={d} first={s}\n", .{
+            family.items.len,
+            if (b.module.funcById(family.items[0].fid)) |f| f.fqn else "?",
+        });
+    }
     var derived_ty = derived orelse return null;
     defer derived_ty.deinit(b.allocator);
     const derived_head = typeHead(std.mem.trimEnd(u8, derived_ty.name, "?"));
