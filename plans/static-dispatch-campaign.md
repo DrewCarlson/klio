@@ -6576,3 +6576,15 @@ the lambda path does; `step` (SequenceBuilder resume chain);
 `entries`/onEachIndexed (the transitive fn-tp binding);
 `.size` in the stdlib flatten (the pick's implicit-this element binding
 in the bare form); `a`-compareTo persists only in one module variant.
+
+### 34 -> 31: the local-fn snapshot, and `!!`
+
+A local fn's body now inherits the enclosing decl-type snapshot (the
+lambda path's producer, stashed nowhere on the local-fn path —
+`isoString` read inside `parseFailure`); `x!!` derives its operand's
+type made non-null and Postfix initializers record (`val step =
+nextStep!!` — the SequenceBuilder resume chain and both Postfix census
+rows). Standing 31: interceptor (the CoroutineContext `get` KEY solve),
+entries/onEachIndexed, `.size` flatten, one a-compareTo variant, the
+TestCollection seven, takeLastWhile/dropLastWhile, Index 1, and the
+chunked/minOf/maxOf/lowercase/isEmpty chains.
