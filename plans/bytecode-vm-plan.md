@@ -206,3 +206,42 @@ dominant remaining cost is the persistent-list iterator chain (contains
 -> iterator walk: ~2.5M element steps x 6 interpreted calls in the
 addAll variant) plus the name-based ladder's intrinsic tail
 (member_ladder 1.89M, served_intrinsic 3.2M).
+
+## Task 15 — the one calling convention (the opening prerequisite)
+
+The static-dispatch campaign's honest end-of-reach, restated here as
+this plan's FIRST work item because a VM with no name-resolution helper
+cannot ship without it.
+
+The defect: a declaration can carry TWO implementations with different
+calling conventions — an interpreted BODY written against the boxed
+source representation (`UInt.toString()` reads `data`), and a host
+INTRINSIC written against the native value representation — and today
+only the by-name walk knows how to convert between them (it normalises
+the receiver and arguments on the way in; `kotlin.Array`'s vararg is
+packed for one and spread for the other). Three refuted non-fixes are
+recorded in the campaign: FuncId-by-symbol-equality (broke `Result`),
+bind-what-cannot-be-shadowed (18% slower), static-path-prefers-intrinsic
+(wrong arguments). The narrow answers that DID land and must be kept:
+`!hasBody()` gates direct native dispatch (a bodyless declaration's
+native form IS the implementation — every scalar variant is safe under
+it), and the single curated `intrinsicOverridesBody` escape hatch.
+
+The work item, concretely:
+
+1. Define the SHARED ENTRY SHAPE: one argument frame layout both the
+   interpreted body and the host symbol accept — receiver slot 0
+   always, varargs always PACKED, unsigned scalars in their runtime
+   representation with the boxed view constructed lazily by the body
+   prologue (not by the caller).
+2. Convert the host registry to the shape: each of the ~1,578
+   `resolved_native` entries either already conforms (most scalar ops)
+   or gains a thin adapter; the adapter table is exactly what the
+   Kotlin-to-C transpiler will emit as C shims.
+3. Re-audit `KLIO_DECL_AUDIT=members` under the shape: the 839
+   extension-aligned rows (member-shaped registry keys serving
+   extension declarations — the `Char.titlecase` family) become
+   key-spelling conformance work items, not resolution holes.
+4. Only then retire the walk's conversion role; the remaining walk
+   families are enumerated in the campaign plan (five site families,
+   `Result.fold` by design among them).
