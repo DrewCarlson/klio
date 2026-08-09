@@ -1505,6 +1505,16 @@ pub fn tryInlineCallWithTypeArgs(
         // (`inner.walkInner(...)` inside a spliced `Walker.walk` reads
         // Walker's `inner` property).
         if (inline_state.inlineMemberOwner(f)) |ow| b.setSpliceRecvTy(ow);
+    } else if (this_arg == null) {
+        // A BARE inline-member call through the implicit receiver
+        // (`propertyFailsWith { ... }` inside an extension declared ON the
+        // owner) splices with the owner window too — without it the body's
+        // own property reads (`expected.getter()`) lower ownerless.
+        if (inline_state.inlineMemberOwner(f)) |ow| {
+            b.setSpliceRecvTy(ow);
+        } else if (build.FuncBuilder.spliceRefDebug()) {
+            std.debug.print("[splice-ref] fn={s} bare-member-owner=NULL\n", .{f.name.name});
+        }
     }
     defer b.setSpliceRecvTy(prev_splice_recv);
     // The ACTUAL receiver's full static type enters the window when the

@@ -11992,13 +11992,12 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
 /// `CompareContext<out T>`). Such a receiver's member surface is the
 /// parameter's bound; an in-scope receiver-taking callable of the called
 /// name is what kotlinc commits.
-fn enclosingPropertyBareTp(b: *FuncBuilder, rn: []const u8) bool {
-    const owner = b.ownerClass() orelse return false;
-    const cid = (if (std.mem.indexOfScalar(u8, owner, '.') != null)
-        b.module.classIdByFqn(owner)
+fn classPropertyIsBareTp(b: *FuncBuilder, class_name: []const u8, rn: []const u8) ?bool {
+    const cid = (if (std.mem.indexOfScalar(u8, class_name, '.') != null)
+        b.module.classIdByFqn(class_name)
     else
-        b.module.classId(owner)) orelse return false;
-    if (cid.int() >= b.module.classes.items.len) return false;
+        b.module.classId(class_name)) orelse return null;
+    if (cid.int() >= b.module.classes.items.len) return null;
     const class = &b.module.classes.items[cid.int()];
     for (class.primary_params) |*p| {
         if (!std.mem.eql(u8, p.name, rn)) continue;
@@ -12009,6 +12008,20 @@ fn enclosingPropertyBareTp(b: *FuncBuilder, rn: []const u8) bool {
             if (std.mem.eql(u8, h, tp)) return true;
         }
         return false;
+    }
+    return null;
+}
+
+/// The enclosing class — or any implicit receiver on the TOWER (a closure
+/// body inside a member-inline splice reaches the owner only through it) —
+/// declares primary-ctor property `rn` with a declared type that is a BARE
+/// class type parameter (`val expected: T` on `CompareContext<out T>`).
+fn enclosingPropertyBareTp(b: *FuncBuilder, rn: []const u8) bool {
+    if (b.ownerClass()) |owner| {
+        if (classPropertyIsBareTp(b, owner, rn)) |ans| return ans;
+    }
+    for (b.implicit_receiver_tower.items) |entry| {
+        if (classPropertyIsBareTp(b, entry.head, rn)) |ans| return ans;
     }
     return false;
 }
