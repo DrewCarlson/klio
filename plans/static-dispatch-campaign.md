@@ -6686,3 +6686,32 @@ splice (`valueSelector(element)` — the lambda_map's two-level forward);
 the annotated-receiver form binds, the derived-local form does not. The
 isEmpty().not() row is the CompareContext bare-tp family (the tower
 variant's kin).
+
+### The walk residue, decomposed by site (KLIO_CALL_STATS on the census set)
+
+The ~1,209 member_ladder route hits are FIVE named families, not a fog:
+
+    110  Result.fold@checkResultIsFailure      — BY DESIGN (the recorded
+                                                 wrapper hazard: host vs
+                                                 source representation)
+   ~194  CompareContext.propertyEquals@*       — the @Test/DSL member call
+                                                 from extension bodies (the
+                                                 ownerless-context family;
+                                                 same root as the getter
+                                                 rows, partially served)
+    132  Iterator.hasNext/next@__top_prop_init_* — for-loops inside TOP-LEVEL
+                                                 PROPERTY INITIALIZER thunks:
+                                                 the init-thunk lowering
+                                                 context never bound the
+                                                 iterator protocol
+    122  IntRange.iterator / Int.until@repeat  — the repeat-loop range
+                                                 protocol rows the plan
+                                                 already names
+     32  StringBuilder.toString@<lambda>       — closure-context toString
+                                                 (the Any-return arm typed
+                                                 the VALUE; the dispatch
+                                                 still walks)
+
+Each is an enumerable CONTEXT, not a resolution hole: the init-thunk and
+closure contexts are the same snapshot/window work this stretch landed
+for lambdas and local fns, applied to two more builder-creation sites.
