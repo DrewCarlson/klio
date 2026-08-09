@@ -1943,10 +1943,70 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td><code>[li-null]</code></td>
 </tr>
 <tr>
+<td><code>KLIO_DISPATCH_STATS</code></td>
+<td><code>1</code></td>
+<td>Route counts per dispatch kind, plus <code>replay-hits</code>: how many named member calls the builtin intrinsic replay served outright. <code>member_ladder</code> names a route, not a walk — compare the two before reading it as name-resolution work</td>
+<td><code>[dispatch-stats]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_NOINST_WHY</code></td>
+<td><code>1</code></td>
+<td>Why a statically bound slot on a host-backed receiver declined to a member-name walk: <code>no-slot-entry</code> (no <code>(class, slot)</code> mapping) or <code>target-not-executable</code> (the target is bodyless and no native is registered under its FQN)</td>
+<td><code>[noinst-why]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_NORECV_WHY</code></td>
+<td>a local name, or <code>*</code></td>
+<td>Why an untyped-receiver site's local has no type: <code>at=file:line</code>, the initializer's AST tag, and the deriver's terminal. NOTE: the census counts CALL sites — probe with <code>x.first()</code>, never <code>x.size</code>, or the file has no counted site at all and the measurement is vacuous</td>
+<td><code>[norecv-why]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_ICRT</code></td>
+<td><code>1</code></td>
+<td>Each return-type instantiation's pre-solve state and terminal (<code>OK</code>, <code>bindings incomplete</code>, <code>star head</code>), plus which parameter refused the bind and both sides' argument counts — a <code>param=x(Array nargs=1) actual=Array nargs=0</code> row means the ARGUMENT's recorded type dropped its arguments, not a real mismatch</td>
+<td><code>[icrt]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_MAX_WORKERS</code></td>
+<td><code>&lt;n&gt;</code></td>
+<td>Caps BOTH the dispatcher pool's compute width (default: half the cores) and its elastic IO ceiling (default: max(16, cores)). Raise it when a single instance owns the machine; the commontest sweep sets <code>2</code> for its children so a full sweep stays near half the cores</td>
+<td>—</td>
+</tr>
+<tr>
 <td><code>KLIO_NORECV_NAMES</code></td>
 <td>a <code>[no-recv-path]</code> bucket name, or <code>*</code></td>
 <td>Names the receiver identifier behind each untyped bare-path receiver, split by why it is untyped (<code>local_no_decl_type</code>, <code>captured</code>, <code>enclosing_member</code>, <code>unknown</code>)</td>
 <td><code>[no-recv-name]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_ARGSHAPE_UNK</code></td>
+<td>set</td>
+<td>Every argument whose applicability shape carries no type, no literal kind and no callable form — the expression forms that leave a member call unproven. Histogram the tags to pick the next typing channel</td>
+<td><code>[argshape-unk]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_NULLEXT_NAMES</code></td>
+<td>set</td>
+<td>Every member call held off the static path because a <code>T?</code> extension of that name exists and the extension itself did not resolve — the residue of the nullable-receiver rule</td>
+<td><code>[nullext]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_SPLICE_REF</code></td>
+<td>set</td>
+<td>The full receiver type each inline splice installs in its window, and the argument it came from. Names the link where a chain loses its type arguments</td>
+<td><code>[splice-ref]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_SLOT_BYNAME</code></td>
+<td>set</td>
+<td>Every statically bound virtual slot call that degraded to a by-name member walk, with the slot root. The host boundary made visible</td>
+<td><code>[slot-byname]</code></td>
+</tr>
+<tr>
+<td>—</td>
+<td>—</td>
+<td>NOTE: any captured log carrying <code>$class$</code> identity-mangle rows embeds NUL bytes and is BINARY to grep — filter with <code>grep -a</code>, or matching rows silently vanish and a dump looks nondeterministic</td>
+<td>—</td>
 </tr>
 <tr>
 <td><code>KLIO_COMP_TRACE</code></td>
