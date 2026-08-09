@@ -6813,3 +6813,72 @@ Standing named families (14 [no-recv-name] rows over module variants):
 TestCollection/CollectionTest local-class 8 (ANON_BASE-gated),
 entries/onEachIndexed tower 2, interceptor CoroutineContext KEY 2,
 TextActuals a-compareTo 2, CollectionTest:40 joinToString 1.
+
+## The 13->96->14 stretch: honest infix counting, and the big families
+
+Commits e858a14d..9b2b998a. The census's apparent regression to 96 was
+the honesty correction of the session: an infix call's emission pushed
+a RAW CallMember with no resolution attempt and no census accounting —
+every infix site was always dynamic and simply invisible. Routing infix
+through the member lowering (they ARE `a.f(b)`) both binds them and
+counts the residue. What the newly-visible rows decomposed into, and
+what served them:
+
+- `t1 to t2` / `shl`/`shr`/`and` (~40 rows): the unique-Any-extension
+  channel extended to any arity and to UNBOUNDED bare-tp receivers
+  (`fun <A, B> A.to(that: B)` applies to every receiver by
+  declaration; a same-named class member anywhere refuses).
+- `IntArray(256) { it shr 4 }` (8 rows): ctor lambda-param threading
+  from concrete fn-typed primary params + the array-ctor index rule
+  (the (size, init) form is an intrinsic, absent from the class row).
+- `context[ContinuationInterceptor]` (2): Index-init recording,
+  companion-object shapes for bare class names in value position, and
+  declaring-scope resolution of nested param heads (Key<E> inside
+  CoroutineContext) with the class graph overriding the name-level
+  classifier.
+- `maxOf { }.toDouble()` / `minOrNull()!!` (4): the member-return
+  deriver's disagree arm now discriminates like the emission — lambda
+  return (body-lenient: expect headers carry signatures) and
+  exactly-instantiated receiver variants.
+- SAM conversions (2): the fun-interface classifier call types its
+  lambda from the abstract method under explicit/expected
+  instantiation; probe builders are census-quiet.
+- local-class bodies (4): declared property types ride the anon
+  prop-head channel in lowerAndRegisterMethods.
+- heterogeneous varargs (1): LUB element (`Any`, null adds
+  nullability), candidate agreement by return head, bodyless
+  lazy-header candidates accepted for TYPE records.
+
+Regressions caught by the gates and root-fixed on the way:
+GroupingTest's local `toPair` (bare/`Any` actual heads must not
+DISPROVE a generic-receiver local ext — lossy records are not proofs);
+plusCollectionInference (an early ids-related return WEAKENED verdicts
+the full flow judged — reverted to param-scope resolution only);
+StringTest.contentEquals (a direct local-ext commitment on an UNTYPED
+receiver recursed - now requires a derived receiver, and `x?.let { }`
+derives its tail type through captured fn-typed values' declared
+returns in either fn-type spelling).
+
+WALK RESIDUE progress: the init-thunk iterator family (132/run) is
+DEAD — a for-loop over an extension-iterated receiver (CharSequence)
+binds hasNext/next through the extension's declared return AND binds
+the iterator() call itself to the extension. `Int.until@repeat` is
+dead with the infix routing. Remaining: Result.fold 110 (by design),
+CompareContext.propertyEquals ~170 (local-class member family),
+IntRange.iterator@repeat 61 (the iterator MEMBER call — needs the
+member-form static bind), StringBuilder.toString@<lambda> 32.
+
+ANON_BASE: DEFAULT ON (662944de). The shared side module owns a real
+allocator (std.heap.smp_allocator) — the historical blowup was renting
+the run arena for scratch that frees into a no-op. Full-suite
+single-process A/B: 6,286,224 (ON) vs 6,293,816 KB (OFF) — neutral,
+both bounded by the arena profile's own accumulation. The freed-for-real
+scratch exposed the second memo-lifetime bug: the field read/write
+caches stored BORROWED keys; they intern their key strings now. The
+canonical compose plugin gate holds: 1344/46/0 vs ratchet 1305.
+
+Standing after 9b2b998a: census 14 (10 printed: flatten .size x2
+[Array-sumOf projection through the fn-generic receiver], onEachIndexed
+tower x2, local-class build-time ctor x3, sortComparator .name 1,
+groupBy orEmpty-Index 1, mapBehavior isEmpty().not() 1; 4 unprinted
+multi-segment-path receivers). All gates green at every commit.
