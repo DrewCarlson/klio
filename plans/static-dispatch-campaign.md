@@ -6483,3 +6483,32 @@ examples 279/291 (baseline set) at every kept commit. The strict goal's
 remaining owners: this tail, the local-class family above, the
 iterator-protocol / member_ladder walk residue, and task-15's
 calling-convention unification (bytecode-vm plan).
+
+### The strict-goal stretch continues: 61 -> 57, each remaining row's next link named
+
+- The Any members' returns are fixed by their signatures: 0-arg
+  `toString` derives String, 0-arg `hashCode` Int, 1-arg `equals`
+  Boolean on ANY receiver (every override keeps the signature; a safe
+  call carries the `?`). The formatIso substring chains bound, 61 -> 59.
+- The lambda-return enricher sees the block's OWN earlier declarations
+  (`val pow = run { var p = 1.0; ...; p }` — the tail Path named a
+  block-local the probe builder never held), in declaration order so a
+  later decl reads an earlier one. The formatToExactDecimals Sub-toLong
+  chain bound, 59 -> 57.
+- Census-neutral but kept (sound, gated): the deriver's scope-function
+  arm (`.also`/`.apply` echo the receiver, `.let`/`.run` derive the
+  lambda tail — admitted only when the universal inline extension is the
+  sole candidate) and the enricher's enclosing-scope seed (the block's
+  decls read the fn's params). The groupSeparators pair still stands:
+  its tail reads `lineSeparators`, a DERIVED-init enclosing local that
+  never enters `local_decl_types` — threading the init-chain records
+  into the enricher's seed is that pair's named next link.
+
+Standing: 57 no_receiver_type + 2 nullable_or_generic + 8 declines (by
+design) + 8 dynamic_by_design; zero slot walks; sweep 117/0, units,
+examples 279/291 (baseline set) green at every kept commit. Remaining
+strict-goal owners unchanged: this tail (each row's next link recorded),
+the local-class family (KLIO_ANON_BASE affordability — runtime lowering
+needs scratch-arena discipline first), the iterator-protocol /
+member_ladder walk residue, and task-15's calling-convention
+unification (the bytecode-vm plan's opening prerequisite).
