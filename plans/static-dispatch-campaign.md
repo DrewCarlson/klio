@@ -6972,3 +6972,29 @@ Census 14, all printed and named now:
 Gates at 0c6edffe: suite 119/119, sweep 117/0, units green, corpus
 280/291 + verified flakes, litmus 42/43 (known flake; the mutex test
 3/3 standalone after the pin restriction).
+
+## Continuation pin (post star-neutral): the last 6
+
+Census 6: flatten .size x2, local-class ctor x3, groupBy orEmpty x1.
+Chains solved this stretch: isEmpty().not() (bare-tp property answers
+now substitute the declared receiver — head-position params mapped by
+position, head-table scalars included, and the lazy/eager bare-tp
+answers no longer preempt the substituting deriver);
+sortComparatorThenComparator (SAM bindings carry the class-identity
+spelling); TimeSource x4 (value-class NewInstance); onEachIndexed x2
+(implBoundScan: the unique in-scope bound whose class declares the
+property).
+
+The groupBy orEmpty row's remaining root: `byLength = Map<*, List<T>>`
+— K erased to star because solveCallBindings has no lambda-RETURN
+evidence (`groupBy(keySelector: (T) -> K)` binds K only from the
+lambda's derived return). The star no longer refutes (get resolves,
+sole-unknown), but instantiatedCallReturnType still nulls on the star
+record. Honest fix: augment the candidate-aware solve in
+memberCallReturnTypeRef's substitution with a lambda-return probe
+(the overloadPickByLambdaReturn machinery already derives a lambda's
+return under candidate-seeded params — reuse it to synthesize the
+Function shape for solveCallBindings). Same machinery likely serves
+flatten .size (Array-sumOf projection under the enclosing fn's T).
+
+Local-class ctor x3 stays on the build-time typing row design.
