@@ -16751,7 +16751,9 @@ fn bareMemberReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
     // call some other way; only a name the receiver's class declares and
     // nothing else shadows is unambiguously the member.
     if (b.resolve(nm) != null or b.knowsOuter(nm) or b.isLocalFn(nm)) return null;
-    if (b.module.funcsBySimpleName(nm).len != 0) return null;
+    // No top-level-namesake bail: when the implicit receiver's own class
+    // DECLARES the member (the key lookup below), Kotlin's receiver scope
+    // resolves the member over any top-level namesake.
     const recv_head = b.spliceRecvTy() orelse b.recvTy() orelse b.ownerClass() orelse return null;
     const rh = typeHead(std.mem.trimEnd(u8, recv_head, "?"));
     if (rh.len == 0) return null;
@@ -16762,6 +16764,24 @@ fn bareMemberReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
         const fid = b.module.registry.member_method_fids.get(key) orelse continue;
         const f = b.module.funcById(fid) orelse continue;
         if (!f.return_ty_declared or f.return_ty.name.len == 0) return null;
+        // Instantiate through the FULL implicit receiver when it carries
+        // arguments: `listIterator(size)` inside the dropLastWhile splice
+        // returns ListIterator<String>, never ListIterator<T>.
+        const full_recv: ?ir.TypeRef = if (b.spliceRecvTyRef()) |r| r.* else b.recvTypeRef();
+        if (full_recv) |fr| {
+            if (fr.args.len != 0) {
+                var shape_set0 = try buildStaticReturnArgShapes(b, call.args, &.{});
+                defer shape_set0.deinit(b.allocator);
+                if (try b.module.instantiatedCallReturnType(b.allocator, fid, fr, null, shape_set0.shapes, &.{})) |inst| {
+                    var out2 = inst;
+                    const oh = typeHead(std.mem.trimEnd(u8, out2.name, "?"));
+                    if (oh.len > 2 and !b.isTypeParam(oh) and ir.parseClassTypeParamIdentity(oh) == null) {
+                        return out2;
+                    }
+                    out2.deinit(b.allocator);
+                }
+            }
+        }
         if (bareTypeParamHead(f.return_ty.name)) return null;
         if (staticTypeClassId(b, f.return_ty) == null) return null;
         return try f.return_ty.clone(b.allocator);
