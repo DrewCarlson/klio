@@ -6754,3 +6754,18 @@ allocate from the RUN-lifetime allocator, never the side module's), then
 flip the default. The four residual families still hang off this one
 root; the seeding re-land is NOT needed in shared mode (the clone
 carries the class graph, so normal resolution serves data/coll/arr1).
+
+CORRECTION to the previous entry, measured past the crash: with the
+field-read-memo UAF fixed (the guard below), the full suite under
+ANON_BASE=1 runs the heavy tail and hits the 8GB RSS cap EXACTLY
+(peak 8,388,560KB, RC 134 = the cap abort, 569s) — the ORIGINAL blowup
+note stands; the earlier 3.3GB reading aborted at the UAF before the
+tail. Two outcomes: (1) the UAF fix is real and lands regardless — the
+field-READ memo now takes the write memo's main-module guard (a runtime
+class's fqn key does not outlive its def; the dangling key corrupted
+the cache map under the shared side module); (2) the flip stays gated
+on the scratch-arena discipline exactly as the anonSiteModule comment
+always said. The single-class numbers remain true (mode-neutral or
+better) — the blowup is the FULL suite's accumulation, consistent with
+per-registration image-resolution allocation renting from the run
+arena.
