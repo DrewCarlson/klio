@@ -6715,3 +6715,20 @@ The ~1,209 member_ladder route hits are FIVE named families, not a fog:
 Each is an enumerable CONTEXT, not a resolution hole: the init-thunk and
 closure contexts are the same snapshot/window work this stretch landed
 for lambdas and local fns, applied to two more builder-creation sites.
+
+### KLIO_ANON_BASE affordability — the local-class family's gate, scoped
+
+The anonSiteModule comment already names the deal: the image-clone side
+module makes runtime-lowered anon/local-class bodies resolve and bind
+statically, but each runtime lowering then pays full-image resolution
+allocation out of the RUN ARENA, and a compose suite (hundreds of
+sites) blew the 6GB RSS cap — so the default stayed the fresh empty
+module, which is why the TestCollection seven cannot bind (no class
+graph to resolve against; the seeding attempt was reverted as a bucket
+shuffle). The work item: scratch-arena discipline for runtime lowering
+— a per-registration arena that frees on completion instead of renting
+from the run arena — then flip KLIO_ANON_BASE default ON and re-measure
+the compose suite's RSS. That single flip serves the local-class family
+(data/coll/arr1), the @Test relowering context (ComparisonDSL,
+sortedByNullable, the propertyEquals ladder family), and the init-thunk
+iterator rows — four residual families with one root.
