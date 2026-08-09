@@ -6432,3 +6432,54 @@ compose suite against the itest scratch home showed 26 failures that the
 SESSION-START binary reproduces identically on the same invocation — a
 stale-pack-home artifact, not a regression; the canonical gate wires its
 own images and is the measurement.
+
+### The continuation session: 67 -> 61, and two honest reverts
+
+Post-closure work against the STRICT goal (the runtime never resolves a
+member by name), resumed on the enumerated tail:
+
+- The ownerless relowering context was named exactly: a BARE inline-member
+  call through the implicit receiver (`propertyFailsWith { ... }` inside an
+  extension declared on the owner) spliced without the owner window, and
+  the body's assertFailsWith LAMBDA lowers in a fresh closure builder where
+  the owner reaches only through the receiver TOWER — the bare-tp property
+  gate consulted ownerClass alone. Both fixed: the this_arg-less member
+  splice sets the owner window, and enclosingPropertyBareTp walks the
+  tower heads. The four ComparisonDSL getter sites classify
+  dynamic_by_design (the invoke protocol, 8 total), 67 -> 63.
+- The two-arg `compareBy(comparator, selector)` row needed PARTIAL
+  expected bindings: the `Comparator<T>` return binds only T of [T, K] —
+  exactly the parameter the selector's `it` needs — so
+  `expectedReturnPartialBindings` substitutes what the return position
+  proves and the per-slot bare-tp guard keeps refusing K. 63 -> 61. The
+  chain fixture gained the row. Also observed and recorded: running a
+  single @Test via --filter can hit `unresolved global assertEquals`
+  where the unfiltered run resolves it — runtime global-materialization
+  order, not lowering.
+- REVERTED after measurement (bucket shuffle): seeding a registering
+  local class's property types into its anon site modules moved the
+  `data` rows no_receiver_type -> no_class_id and bound NOTHING — the
+  fresh `Module.default` site module has no class graph, so the seeded
+  `Collection` head resolves no row: the committed-unresolvable-head
+  hazard the plan records. The ROOT fix for the whole local-class family
+  (data x4 + coll/arr1 x3) is the one the anonSiteModule comment already
+  names: make the image-clone side module (KLIO_ANON_BASE=1) affordable —
+  runtime lowering needs scratch-arena discipline before the clone stops
+  blowing the RSS cap. Until then the family stays enumerated.
+- REVERTED after the examples caught it (the vararg-sole rule): admitting
+  a trailing vararg into the sole-candidate return rule typed
+  `listOf(list, set)` receivers head-only List — and the new records
+  misrouted USER List extensions at two examples (`zipWith`,
+  `medianish` — `Vm::call_member` misses where the null record's walk
+  had served them). Census-neutral value, real cost: the head-only
+  record disproves what a null leaves open, exactly the recorded rule.
+  Do not re-admit varargs there without an emission-side guarantee that
+  a head-only receiver record cannot displace the runtime walk for
+  user extensions.
+
+Standing count: 61 no_receiver_type + 2 nullable_or_generic + 8 declines
+(by design) + 8 dynamic_by_design, zero slot walks, tests 119/0 and
+examples 279/291 (baseline set) at every kept commit. The strict goal's
+remaining owners: this tail, the local-class family above, the
+iterator-protocol / member_ladder walk residue, and task-15's
+calling-convention unification (bytecode-vm plan).
