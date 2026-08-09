@@ -37,16 +37,6 @@ pub fn lowerForLabeled(
     const it_reg = b.allocReg();
     const zero = b.allocReg();
     try b.push(.{ .Move = .{ .dst = zero, .src = recv } });
-    const name = try b.module.internConst(b.allocator, .{ .String = "iterator" });
-    const args_start = b.allocReg();
-    try b.push(.{ .CallMember = .{
-        .dst = it_reg,
-        .receiver = zero,
-        .name = name,
-        .args = args_start,
-        .n_args = 0,
-        .arg_names = &.{},
-    } });
     // Static protocol binding: when the iterable's `iterator()` return
     // resolves to the `Iterator` INTERFACE itself, `hasNext`/`next` emit
     // slot-bound against its roots — the runtime serves those by FuncId
@@ -56,11 +46,18 @@ pub fn lowerForLabeled(
     // form, exactly as before.
     var hn_root: ?ir.FuncId = null;
     var next_root: ?ir.FuncId = null;
+    var iter_ext_fid: ?ir.FuncId = null;
     if (try expr.staticExprTypeRef(b, iter)) |ity0| {
         var ity = ity0;
         defer ity.deinit(b.allocator);
         const file = vars[0].span.file;
-        if (try expr.nullaryMemberReturnTypeRef(b, ity, "iterator", file)) |irt0| {
+        // A member `iterator()` first; a receiver served only by the
+        // UNIQUE top-level extension (`CharSequence.iterator():
+        // CharIterator`) binds through its declared return the same way,
+        // and the `iterator()` invocation itself binds to that extension.
+        if ((try expr.nullaryMemberReturnTypeRef(b, ity, "iterator", file)) orelse
+            (try expr.extensionNullaryReturnTypeRef(b, ity, "iterator", &iter_ext_fid))) |irt0|
+        {
             var irt = irt0;
             defer irt.deinit(b.allocator);
             var head = std.mem.trimEnd(u8, irt.name, "?");
@@ -103,6 +100,29 @@ pub fn lowerForLabeled(
                 }
             }
         }
+    }
+    if (iter_ext_fid) |ext_fid| {
+        try b.push(.{ .Call = .{
+            .dst = it_reg,
+            .func = ext_fid,
+            .trailing_lambda = false,
+            .args = zero,
+            .n_args = 1,
+            .arg_names = &.{},
+            .type_args = &.{},
+            .exact = true,
+        } });
+    } else {
+        const name = try b.module.internConst(b.allocator, .{ .String = "iterator" });
+        const args_start = b.allocReg();
+        try b.push(.{ .CallMember = .{
+            .dst = it_reg,
+            .receiver = zero,
+            .name = name,
+            .args = args_start,
+            .n_args = 0,
+            .arg_names = &.{},
+        } });
     }
     const header = try b.allocBlock();
     const body_blk = try b.allocBlock();
@@ -165,7 +185,7 @@ pub fn lowerForLabeled(
                 .args = &.{},
             });
         } else if (std.c.getenv("KLIO_FORVAR_TRACE") != null) {
-            std.debug.print("[forvar] {s} elem=null iter_tag={s}\n", .{ vars[0].name, @tagName(std.meta.activeTag(iter.*)) });
+            std.debug.print("[forvar] {s} elem=null iter_tag={s} fn={s} splice={s}\n", .{ vars[0].name, @tagName(std.meta.activeTag(iter.*)), build.currentRealFn() orelse "-", b.spliceRecvTy() orelse "-" });
         }
     } else {
         // Each destructured name is bound to the element's `componentN()`, so

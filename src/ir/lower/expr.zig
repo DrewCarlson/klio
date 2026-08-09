@@ -12429,6 +12429,53 @@ fn enrichCallableRefArgShapes(
     }
 }
 
+/// The declared return of the UNIQUE nullary top-level extension of `mname`
+/// applicable to the receiver head — the for-loop protocol's answer for a
+/// receiver whose `iterator()` is an extension, not a member
+/// (`CharSequence.iterator(): CharIterator`). Disagreeing or generic
+/// returns refuse.
+pub fn extensionNullaryReturnTypeRef(
+    b: *FuncBuilder,
+    recv_ty: ir.TypeRef,
+    mname: []const u8,
+    out_fid: ?*?ir.FuncId,
+) Allocator.Error!?ir.TypeRef {
+    const recv_head = typeHead(std.mem.trimEnd(u8, recv_ty.name, "?"));
+    if (recv_head.len == 0) return null;
+    var agreed: ?ir.TypeRef = null;
+    var agreed_fid: ?ir.FuncId = null;
+    for (b.module.funcsBySimpleName(mname)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.kind == .instance_method or f.kind == .member_extension) continue;
+        if (f.params.len != 1 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        if (!b.module.classIsOrExtends(recv_head, typeHead(f.params[0].ty.name))) continue;
+        if (!f.return_ty_declared or f.return_ty.name.len == 0 or
+            bareTypeParamHead(f.return_ty.name))
+        {
+            if (agreed) |*prev| prev.deinit(b.allocator);
+            return null;
+        }
+        if (agreed) |prev| {
+            if (!std.mem.eql(u8, prev.name, f.return_ty.name)) {
+                var p = prev;
+                p.deinit(b.allocator);
+                return null;
+            }
+            // Same return on a MORE SPECIFIC receiver keeps the more
+            // specific declaration (String over CharSequence).
+            if (b.module.funcById(agreed_fid.?)) |pf| {
+                if (b.module.classIsOrExtends(typeHead(f.params[0].ty.name), typeHead(pf.params[0].ty.name)))
+                    agreed_fid = fid;
+            }
+        } else {
+            agreed = try f.return_ty.clone(b.allocator);
+            agreed_fid = fid;
+        }
+    }
+    if (out_fid) |slot| slot.* = agreed_fid;
+    return agreed;
+}
+
 /// The lambda-param types a fun-interface SAM conversion hands its sole
 /// lambda argument: the interface's single abstract method's value-param
 /// types, substituted under the class's type params as bound by the call's
