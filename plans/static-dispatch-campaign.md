@@ -6882,3 +6882,35 @@ Standing after 9b2b998a: census 14 (10 printed: flatten .size x2
 tower x2, local-class build-time ctor x3, sortComparator .name 1,
 groupBy orEmpty-Index 1, mapBehavior isEmpty().not() 1; 4 unprinted
 multi-segment-path receivers). All gates green at every commit.
+
+## Continuation pin (post cb2231a1): the two remaining structures
+
+Walk residue after the repeat/init-thunk kills: Result.fold 110 (BY
+DESIGN — wrapper hazard), StringBuilder.toString@<lambda> 32 +
+Iterator.hasNext@iteratorBehavior 24 (builtin-intrinsic member_ladder
+ROUTE, not a name walk — the conversion role task-15's adapter table
+retires; see debugging.md's member_ladder caveat), and
+CompareContext.propertyEquals ~200 — the ONE remaining real family,
+same root as the census's local-class ctor rows (coll/arr1 x3):
+
+LOCAL CLASSES have no lowering-time class row. The design (kept from
+the closure section, now the sole blocker for both families): a
+BUILD-TIME TYPING ROW for each local class — lower the class's
+SIGNATURES under a function-scoped mangle (never the simple-name
+index; the local-class scope stack guards shadowing), reserving fids
+for its methods via the existing reserveClass/backpatch machinery so
+receiver-typed member calls bind virtual slots at build lowering; the
+runtime RegisterClass keeps binding captures to the SAME reserved ids
+(anon_methods entries land on the reserved fids instead of fresh ones).
+Then `val coll = TestCollection(data)` records the mangled head via
+ctorInitTypeRef's local-class arm (isLocalClassInScope exists), and
+`coll.toTypedArray()` / `propertyEquals { size }` bind statically.
+
+Census standing 14 (9 printed + flatten .size x2 parked on Array-sumOf
+fn-generic projection + 4 unprinted). Remaining named rows besides the
+local-class three: onEachIndexed tower x2, sortComparator .name 1,
+groupBy orEmpty-Index 1, mapBehavior isEmpty().not() 1.
+
+Gates at cb2231a1: suite 119/119, sweep 117/0, units green, corpus
+280/291 + 4 verified chained-run flakes, litmus 42/43 (known flake),
+compose plugin canonical 1344/46/0 >= ratchet 1305 under ANON_BASE ON.
