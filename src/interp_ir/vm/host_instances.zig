@@ -3875,20 +3875,29 @@ pub fn anonLowerExit() void {
 /// `lowerMethod` into the returned module.
 pub fn anonSiteModule(self: *VmHost, allocator: Allocator, cache: *?ObjRef(Module)) Allocator.Error!ObjRef(Module) {
     if (cache.*) |m| return m.clone();
-    // Default OFF: the image-clone side module makes anon bodies resolve
-    // and bind statically, but each runtime lowering then pays
-    // full-image resolution allocation out of the run arena, and a
-    // compose suite (hundreds of sites) blew the 6GB RSS cap. Flip to
-    // ON (=1) once runtime lowering gets scratch-arena discipline.
-    if (!std.mem.eql(u8, runtime.envOnce("KLIO_ANON_BASE") orelse "0", "1")) {
+    // Default ON: the image-clone side module makes anon bodies resolve
+    // and bind statically. The historical RSS blowup was the shared
+    // clone renting the RUN ARENA — with the side module on its own real
+    // allocator (below), a full compose suite measures RSS-neutral
+    // against the empty-module mode, and single classes measure neutral
+    // or better. `KLIO_ANON_BASE=0` restores the empty side module.
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_ANON_BASE") orelse "1", "0")) {
         return ObjRef(Module).init(allocator, Module.default(allocator));
     }
     if (shared_anon_module == null) {
         const mg = self.module.borrow();
         defer mg.deinit();
-        var cloned = try mg.get().cloneForExtend(allocator);
+        // The shared side module owns a REAL allocator, never the run
+        // arena: every lowering's scratch (candidate lists, type clones,
+        // solved bindings) rents from `module.registry.allocator` and
+        // frees on the way out — frees that were no-ops against the
+        // harness arena, which is what accumulated an entire suite's
+        // lowering scratch into the RSS cap. Persistent appends (the
+        // lowered funcs themselves) stay bounded and live for the
+        // process, matching the module's own lifetime.
+        var cloned = try mg.get().cloneForExtend(std.heap.smp_allocator);
         cloned.anon_side = true;
-        shared_anon_module = try ObjRef(Module).init(allocator, cloned);
+        shared_anon_module = try ObjRef(Module).init(std.heap.smp_allocator, cloned);
     }
     const ref = shared_anon_module.?.clone();
     cache.* = ref.clone();

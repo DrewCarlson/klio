@@ -11194,7 +11194,11 @@ fn staticCallReturnTypeRef(
         !std.mem.eql(u8, runtime.envOnce("KLIO_OPERATOR_TY") orelse "1", "0"))
     {
         const idx = call_expr.Index;
-        var recv_owned = (try recvChainTypeRef(b, idx.receiver)) orelse return null;
+        const opty_trace = runtime.envOnce("KLIO_OPTY_TRACE") != null;
+        var recv_owned = (try recvChainTypeRef(b, idx.receiver)) orelse {
+            if (opty_trace) std.debug.print("[opty] recv untyped\n", .{});
+            return null;
+        };
         defer recv_owned.deinit(b.allocator);
         var shape_set = try buildStaticReturnArgShapes(b, idx.args, &.{});
         defer shape_set.deinit(b.allocator);
@@ -11205,14 +11209,20 @@ fn staticCallReturnTypeRef(
         const owner = (if (std.mem.indexOfScalar(u8, identity, '.') != null)
             b.module.classIdByFqn(identity)
         else
-            b.module.uniqueClassIdBySimpleName(typeHead(identity))) orelse return null;
+            b.module.uniqueClassIdBySimpleName(typeHead(identity))) orelse {
+            if (opty_trace) std.debug.print("[opty] recv={s} owner unresolved\n", .{identity});
+            return null;
+        };
         const resolved = b.module.resolveMemberCall(owner, "get", shape_set.shapes, .{
             .caller_file = idx.span.file,
             .lexical_owner = null,
             .actual_type_param_bounds = owned_bounds orelse &.{},
             .receiver_type = recv_owned,
         });
-        const target = resolved.target orelse return null;
+        const target = resolved.target orelse {
+            if (opty_trace) std.debug.print("[opty] recv={s} get unresolved n_shapes={d} shape0_ty={s}\n", .{ identity, shape_set.shapes.len, if (shape_set.shapes.len != 0 and shape_set.shapes[0].ty != null) shape_set.shapes[0].ty.?.name else "-" });
+            return null;
+        };
         var dispatch_receiver = try staticDispatchReceiverTypeRef(b, target, recv_owned, idx.span.file);
         defer if (dispatch_receiver) |*ty| ty.deinit(b.allocator);
         return try b.module.instantiatedCallReturnType(
@@ -12328,6 +12338,29 @@ fn enrichCallableRefArgShapes(
     }
 }
 
+/// The companion object's own class type for a bare class-name reference in
+/// value position, or null when the name is shadowed by a value binding or
+/// names no class with a companion.
+fn companionObjectTypeRef(b: *FuncBuilder, seg: ast.Ident) Allocator.Error!?ir.TypeRef {
+    const nm = seg.name;
+    if (nm.len == 0 or !std.ascii.isUpper(nm[0])) return null;
+    if (b.resolve(nm) != null or b.knowsOuter(nm) or b.isLocalFn(nm) or b.isParam(nm)) return null;
+    const cid = b.module.classIdIndexed(nm, b.self_package, seg.span.file) orelse
+        b.module.uniqueClassIdBySimpleName(nm) orelse return null;
+    if (cid.int() >= b.module.classes.items.len) return null;
+    const cls = &b.module.classes.items[cid.int()];
+    const comp = b.module.registry.companion_singletons.get(cls.fqn) orelse
+        b.module.registry.companion_singletons.get(cls.name) orelse return null;
+    const ccid = b.module.classIdByFqn(comp) orelse
+        b.module.uniqueClassIdBySimpleName(comp) orelse return null;
+    if (ccid.int() >= b.module.classes.items.len) return null;
+    return .{
+        .name = try b.allocator.dupe(u8, b.module.classes.items[ccid.int()].fqn),
+        .nullable = false,
+        .args = &.{},
+    };
+}
+
 pub fn buildStaticReturnArgShapes(
     b: *FuncBuilder,
     args: []const Expr,
@@ -12344,13 +12377,36 @@ pub fn buildStaticReturnArgShapes(
         b.allocator.free(inferred);
     }
     for (args, shapes, inferred) |*arg, *shape, *owned| {
-        if (shape.ty != null) continue;
+        if (shape.ty != null) {
+            // A bare class-name Path pre-typed as the class ITSELF is really
+            // the companion value (Kotlin: a class name in value position IS
+            // its companion). The companion's class record — which carries
+            // its supertypes — is what a key-parameter solve projects from
+            // (`context[ContinuationInterceptor]` binds E through the
+            // companion's `CoroutineContext.Key<ContinuationInterceptor>`).
+            if (arg.* == .Path and arg.Path.segments.len == 1 and
+                std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, shape.ty.?.name, "?")), arg.Path.segments[0].name))
+            {
+                if (try companionObjectTypeRef(b, arg.Path.segments[0])) |ct| {
+                    owned.* = ct;
+                    shape.ty = ct;
+                    shape.ty_authoritative = true;
+                }
+            }
+            continue;
+        }
         // A callable reference's function type is declaration-read and can
         // disambiguate the outer overload set, so it is shaped BEFORE any
         // resolution commits (the expected-arity refinement in
         // enrichCallableRefArgShapes serves the cases the probe declines).
         if (arg.* == .MemberRef and !std.mem.eql(u8, runtime.envOnce("KLIO_REFSHAPE") orelse "1", "0")) {
             owned.* = try callableRefDeclTypeRef(b, &arg.MemberRef, null);
+        } else if (arg.* == .Path and arg.Path.segments.len == 1) {
+            // A bare class name in VALUE position is its companion object
+            // (`context[ContinuationInterceptor]` passes the companion,
+            // whose class extends `CoroutineContext.Key<ContinuationInterceptor>`
+            // — the record the key-parameter solve projects E from).
+            owned.* = try companionObjectTypeRef(b, arg.Path.segments[0]);
         } else {
             owned.* = try staticCallReturnTypeRef(b, arg);
         }

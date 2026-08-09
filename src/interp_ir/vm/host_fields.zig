@@ -3095,10 +3095,27 @@ fn fieldReadCachePut(self: *VmHost, fqn: []const u8, name: []const u8, hit: root
         defer mg.deinit();
         if (mg.get().classIdByFqn(fqn) == null) return;
     }
+    // The memo OWNS its key strings: the caller's slices can be
+    // side-module or scratch memory whose reuse after a real free mutates
+    // the stored key under the map (rehash then reaches unreachable on
+    // the duplicate). Image-interned copies are identity-stable.
+    const a_owned = ownedMemoStr(self, fqn) orelse return;
+    const b_owned = ownedMemoStr(self, name) orelse return;
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     if (pg.get().field_read_cache.count() >= 65536) return;
-    pg.get().field_read_cache.put(.{ .a = fqn, .b = name }, hit) catch {};
+    pg.get().field_read_cache.put(.{ .a = a_owned, .b = b_owned }, hit) catch {};
+}
+
+/// Intern a memo key string on the program image so its bytes live (and
+/// keep their content) for the image's lifetime whatever allocator the
+/// caller's slice came from.
+fn ownedMemoStr(self: *VmHost, s: []const u8) ?[]const u8 {
+    const pg = self.prog.borrowMut();
+    defer pg.deinit();
+    const identity = pg.get().memberNameIdentity(s) orelse return null;
+    const p: [*]const u8 = @ptrFromInt(identity);
+    return p[0..s.len];
 }
 
 /// Insert into the field-WRITE memo. Main-module classes only: a runtime /
@@ -3111,10 +3128,12 @@ fn fieldWriteCachePut(self: *VmHost, fqn: []const u8, name: []const u8, hit: roo
         defer mg.deinit();
         if (mg.get().classIdByFqn(fqn) == null) return;
     }
+    const a_owned = ownedMemoStr(self, fqn) orelse return;
+    const b_owned = ownedMemoStr(self, name) orelse return;
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     if (pg.get().field_write_cache.count() >= 65536) return;
-    pg.get().field_write_cache.put(.{ .a = fqn, .b = name }, hit) catch {};
+    pg.get().field_write_cache.put(.{ .a = a_owned, .b = b_owned }, hit) catch {};
 }
 
 /// The terminal plain store: write through a boxed-capture Cell when the

@@ -2474,7 +2474,28 @@ pub const Module = struct {
             // it, and the class table records no edges to it.
             if (std.mem.eql(u8, applicability.simpleName(param_erased_head), "Any")) return .compatible;
             const actual_id = self.staticTypeClassId(actual_erased);
-            const param_id = self.staticTypeClassId(param_erased);
+            var param_id = self.staticTypeClassId(param_erased);
+            // A param head written inside its declaring class resolves in
+            // that class's scope first: `get(key: Key<E>)` inside
+            // `CoroutineContext` means the NESTED `CoroutineContext.Key`,
+            // which a bare simple-name lookup misses (every companion is
+            // named `Key`) — and the missed resolution judged the actual's
+            // companion INCOMPATIBLE against the interface's own member.
+            if (param_id == null) {
+                if (self.decl_sigs.get(fid.int())) |ds| {
+                    if (ds.enclosing_class) |ec| {
+                        if (ec.int() < self.classes.items.len) {
+                            var qb: [160]u8 = undefined;
+                            if (std.fmt.bufPrint(&qb, "{s}.{s}", .{
+                                self.classes.items[ec.int()].name,
+                                param_erased_head,
+                            }) catch null) |q| {
+                                param_id = self.classIdByQualifiedSuffix(q);
+                            }
+                        }
+                    }
+                }
+            }
             if (actual_id != null and param_id != null and
                 !self.classIdIsOrExtends(actual_id.?, param_id.?))
             {
@@ -2500,11 +2521,38 @@ pub const Module = struct {
                 return .incompatible;
             }
         }
-        const classifier = self.staticReceiverCompatibility(
-            null,
-            actual_erased,
-            param_erased,
-        );
+        // A param head that resolves in its DECLARING class's scope can be
+        // proven by the class graph where the name-level classifier fails:
+        // `get(key: Key<E>)` inside CoroutineContext means the nested
+        // `CoroutineContext.Key`, and the actual's companion
+        // `ContinuationInterceptor.Key` extends it — same SIMPLE name, so
+        // the erased-head walk above never adjudicated them.
+        var scoped_related = false;
+        if (self.staticTypeClassId(actual_erased)) |aid| {
+            if (self.decl_sigs.get(fid.int())) |ds| {
+                if (ds.enclosing_class) |ec| {
+                    if (ec.int() < self.classes.items.len) {
+                        var qb: [160]u8 = undefined;
+                        if (std.fmt.bufPrint(&qb, "{s}.{s}", .{
+                            self.classes.items[ec.int()].name,
+                            param_erased_head,
+                        }) catch null) |q| {
+                            if (self.classIdByQualifiedSuffix(q)) |pid| {
+                                scoped_related = self.classIdIsOrExtends(aid, pid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        const classifier: StaticCompatibility = if (scoped_related)
+            .compatible
+        else
+            self.staticReceiverCompatibility(
+                null,
+                actual_erased,
+                param_erased,
+            );
         if (classifier != .compatible) return classifier;
 
         const param_args = overrideArgs(param);
@@ -4227,10 +4275,13 @@ pub const Module = struct {
             );
             if (std.c.getenv("KLIO_SMAC_TRACE")) |w| {
                 if (std.mem.eql(u8, std.mem.span(w), f.name)) {
-                    std.debug.print("[smac-arg] param={s} inst={s} arg_ty={s} -> {s}\n", .{
+                    std.debug.print("[smac-arg] param={s}<{d}> inst={s}<{d}> arg_ty={s} route={s} -> {s}\n", .{
                         param.ty.name,
+                        param.ty.args.len,
                         instantiated_param.name,
+                        instantiated_param.args.len,
                         if (arg.ty) |t| t.name else "-",
+                        sac_route,
                         @tagName(arg_result),
                     });
                 }
@@ -5409,14 +5460,19 @@ pub const Module = struct {
                     continue;
                 }
             }
-            switch (self.staticMemberArgsCompatibility(
+            const rmc_verdict = self.staticMemberArgsCompatibility(
                 sa,
                 fid,
                 f,
                 args,
                 ctx.actual_type_param_bounds,
                 ctx.receiver_type,
-            )) {
+            );
+            if (runtime.envOnce("KLIO_RMC_TRACE")) |w| {
+                if (std.mem.eql(u8, w, name))
+                    std.debug.print("[rmc] {s} cand={s} verdict={s}\n", .{ name, f.fqn, @tagName(rmc_verdict) });
+            }
+            switch (rmc_verdict) {
                 .incompatible => continue,
                 .unknown => {
                     any_applicable = true;
