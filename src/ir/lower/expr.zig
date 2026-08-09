@@ -9157,7 +9157,13 @@ fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             // `minOrNull` on Array/List/Sequence resolves to target=null and
             // falls to runtime dispatch, which picks the IEEE overload and
             // returns NaN where 0.0 is correct.
-            if (headDeclaresTypeParams(b, th.name)) {
+            const th_head = typeHead(std.mem.trimEnd(u8, th.name, "?"));
+            const bare_tp_head = (th_head.len > 0 and th_head.len <= 2 and std.ascii.isUpper(th_head[0])) or
+                b.isTypeParam(th_head) or ir.parseClassTypeParamIdentity(th_head) != null;
+            if (headDeclaresTypeParams(b, th.name) or bare_tp_head) {
+                // A bare TYPE-PARAMETER answer (`expected: T` read on a
+                // typed receiver) blocks the substituting deriver behind
+                // it, which would answer the instantiated type.
                 if (typeheadAuditOn()) {
                     const sp = arg.span();
                     std.debug.print("[TYPEHEAD-SKIP] f{d}:{d} generic head {s} has no args\n", .{ sp.file.int(), sp.start, th.name });
@@ -10255,7 +10261,53 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
         .StringTemplate => return .{ .name = try b.allocator.dupe(u8, "String"), .nullable = false, .args = &.{} },
         else => {},
     }
-    if (argDeclTypeRef(b, e)) |known| return try known.clone(b.allocator);
+    if (argDeclTypeRef(b, e)) |known| {
+        // A bare TYPE-PARAMETER answer for an implicit property read
+        // (`expected: T` on a `Ctx<Map<K, V>>` receiver) substitutes the
+        // receiver's instantiation instead of stopping at `T`.
+        const kh = typeHead(std.mem.trimEnd(u8, known.name, "?"));
+        const bare_k = (kh.len > 0 and kh.len <= 2 and std.ascii.isUpper(kh[0])) or
+            b.isTypeParam(kh) or ir.parseClassTypeParamIdentity(kh) != null;
+        if (bare_k and e.* == .Path and e.Path.segments.len == 1) {
+            const nm2 = e.Path.segments[0].name;
+            if (runtime.envOnce("KLIO_IMPLPROP_TRACE")) |w| {
+                if (std.mem.eql(u8, w, nm2))
+                    std.debug.print("[implprop-bare] {s} known={s} rtref={} rt_args={d}\n", .{ nm2, known.name, b.recvTypeRef() != null, if (b.recvTypeRef()) |r| r.args.len else 0 });
+            }
+            if (b.recvTypeRef()) |rt| sub_head: {
+                const rh = typeHead(std.mem.trimEnd(u8, rt.name, "?"));
+                const declared: ir.TypeRef = propTypeRefOn(b, rh, nm2) orelse blk2: {
+                    const head = b.module.registry.class_prop_type_heads.get(.{ .a = rh, .b = nm2 }) orelse break :sub_head;
+                    break :blk2 .{ .name = head, .nullable = false, .args = &.{} };
+                };
+                const dh = typeHead(std.mem.trimEnd(u8, declared.name, "?"));
+                // The declared type IS the owner's parameter: map it by
+                // position under the receiver's instantiation.
+                if (bareTypeParamHead(dh) and declared.args.len == 0) {
+                    const cid = (b.module.uniqueClassIdBySimpleName(rh) orelse
+                        b.module.classIdByFqn(rh)) orelse break :sub_head;
+                    if (cid.int() >= b.module.classes.items.len) break :sub_head;
+                    const tps = b.module.classes.items[cid.int()].type_params;
+                    if (tps.len != rt.args.len) break :sub_head;
+                    for (tps, 0..) |tp, j| {
+                        if (!std.mem.eql(u8, tp, dh)) continue;
+                        const sub = rt.args[j];
+                        const sh = typeHead(std.mem.trimEnd(u8, sub.name, "?"));
+                        if (sh.len == 0 or std.mem.eql(u8, sh, "*") or
+                            bareTypeParamHead(sh)) break :sub_head;
+                        var out = try sub.clone(b.allocator);
+                        out.nullable = out.nullable or declared.nullable;
+                        return out;
+                    }
+                    break :sub_head;
+                }
+                if (substitutedPropType(b, rh, rt, declared)) |sub| {
+                    return try sub.clone(b.allocator);
+                }
+            }
+        }
+        return try known.clone(b.allocator);
+    }
     if (try ctorInitTypeRef(b, e)) |t| return t;
     if (try staticCallReturnTypeRef(b, e)) |t| return t;
     // `lhs ?: <jump>` carries the lhs type made NON-null: `val clause =
@@ -10421,6 +10473,10 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
         .Path => |p| {
             if (p.segments.len != 1) break :self_named;
             const nm = p.segments[0].name;
+            if (runtime.envOnce("KLIO_IMPLPROP_TRACE")) |w| {
+                if (std.mem.eql(u8, w, nm))
+                    std.debug.print("[implprop-guard] {s} resolve={} localfn={} outer={}\n", .{ nm, b.resolve(nm) != null, b.isLocalFn(nm), b.knowsOuter(nm) });
+            }
             if (b.resolve(nm) != null or b.isLocalFn(nm) or b.knowsOuter(nm)) break :self_named;
             if (b.ownerClass()) |owner| {
                 // The full-ref table records only arg-carrying declared
@@ -17127,12 +17183,24 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
     const call = call_expr.Call;
     if (call.callee.* != .Member) return null;
     const mname = call.callee.Member.name.name;
+    if (runtime.envOnce("KLIO_MCRT_TRACE")) |w| {
+        if (std.mem.eql(u8, w, mname))
+            std.debug.print("[mcrt] {s} recv_tag={s}\n", .{ mname, @tagName(std.meta.activeTag(call.callee.Member.receiver.*)) });
+    }
     const recv = call.callee.Member.receiver;
 
     var recv_owned: ?ir.TypeRef = null;
     defer if (recv_owned) |*t| t.deinit(b.allocator);
     const recv_ty: ir.TypeRef = blk: {
-        if (argDeclTypeRefLazy(b, recv)) |known| break :blk known;
+        if (argDeclTypeRefLazy(b, recv)) |known| {
+            // A bare TYPE-PARAMETER lazy answer (`expected: T` on a typed
+            // receiver) blocks the full deriver, whose implicit-property
+            // channel substitutes the receiver's instantiation.
+            const kh = typeHead(std.mem.trimEnd(u8, known.name, "?"));
+            const bare_k = (kh.len > 0 and kh.len <= 2 and std.ascii.isUpper(kh[0])) or
+                b.isTypeParam(kh) or ir.parseClassTypeParamIdentity(kh) != null;
+            if (!bare_k) break :blk known;
+        }
         recv_owned = try staticExprTypeRef(b, recv);
         break :blk recv_owned orelse return null;
     };
@@ -17143,6 +17211,10 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
     // this the middle of an `a?.self()?.b?.twice()` chain had no type, so
     // every link after the first resolved by name.
     const safe_call = call.callee.Member.safe;
+    if (runtime.envOnce("KLIO_MCRT_TRACE")) |w| {
+        if (std.mem.eql(u8, w, mname))
+            std.debug.print("[mcrt] {s} recv_ty={s} args={d} owned={}\n", .{ mname, recv_ty.name, recv_ty.args.len, recv_owned != null });
+    }
     if (recv_ty.nullable and !safe_call) return null;
     const recv_head = typeHead(std.mem.trimEnd(u8, recv_ty.name, "?"));
     if (recv_head.len == 0) return null;
@@ -17896,11 +17968,14 @@ fn lowerResolvedMemberCall(
                     .Postfix => @tagName(receiver.Postfix.op),
                     else => "?",
                 };
-                std.debug.print("[no-recv-{s}] {s}() call={s} fn={s}\n", .{
+                std.debug.print("[no-recv-{s}] {s}() call={s} fn={s} recvty={s} splice={s} owner={s}\n", .{
                     @tagName(std.meta.activeTag(receiver.*)),
                     inner_nm,
                     name.name,
                     build.currentRealFn() orelse "-",
+                    b.recvTy() orelse "-",
+                    b.spliceRecvTy() orelse "-",
+                    b.ownerClass() orelse "-",
                 });
             }
         }
