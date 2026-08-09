@@ -10426,6 +10426,15 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
                 if (std.mem.indexOfScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
                 const head = typeHead(rh);
                 if (head.len == 0) break :self_named;
+                if (runtime.envOnce("KLIO_IMPLPROP_TRACE")) |w| {
+                    if (std.mem.eql(u8, w, m.name.name)) {
+                        std.debug.print("[implprop-mem] {s} head={s} refs={} heads={}\n", .{
+                            m.name.name, head,
+                            propTypeRefOn(b, head, m.name.name) != null,
+                            b.module.registry.class_prop_type_heads.get(.{ .a = head, .b = m.name.name }) != null,
+                        });
+                    }
+                }
                 if (propTypeRefOn(b, head, m.name.name)) |declared| {
                     if (substitutedPropType(b, head, rt, declared)) |sub| {
                         return try sub.clone(b.allocator);
@@ -10849,6 +10858,37 @@ fn staticCallReturnTypeRef(
             }
             if (c.args.len == 1 and std.mem.eql(u8, nm2, "equals")) {
                 return .{ .name = try b.allocator.dupe(u8, "Boolean"), .nullable = m.safe, .args = &.{} };
+            }
+            // The scalar CONVERSIONS have fixed returns on a primitive
+            // receiver (`it.size.toLong()` in the pick's probe builder -
+            // the builtin class rows carry no method ids for the member
+            // resolution to answer through).
+            if (c.args.len == 0 and !m.safe and od_depth < 4) conv: {
+                const table = [_]struct { n: []const u8, t: []const u8 }{
+                    .{ .n = "toInt", .t = "Int" },       .{ .n = "toLong", .t = "Long" },
+                    .{ .n = "toDouble", .t = "Double" }, .{ .n = "toFloat", .t = "Float" },
+                    .{ .n = "toShort", .t = "Short" },   .{ .n = "toByte", .t = "Byte" },
+                    .{ .n = "toChar", .t = "Char" },     .{ .n = "toUInt", .t = "UInt" },
+                    .{ .n = "toULong", .t = "ULong" },   .{ .n = "toUShort", .t = "UShort" },
+                    .{ .n = "toUByte", .t = "UByte" },
+                };
+                var hit: ?[]const u8 = null;
+                for (table) |cv| {
+                    if (std.mem.eql(u8, nm2, cv.n)) {
+                        hit = cv.t;
+                        break;
+                    }
+                }
+                const out_head = hit orelse break :conv;
+                od_depth += 1;
+                const rt0 = staticExprTypeRef(b, m.receiver) catch null;
+                od_depth -= 1;
+                var rt = rt0 orelse break :conv;
+                defer rt.deinit(b.allocator);
+                if (rt.nullable) break :conv;
+                const rh0 = typeHead(std.mem.trimEnd(u8, rt.name, "?"));
+                if (!isPrimitiveTypeName(rh0)) break :conv;
+                return .{ .name = try b.allocator.dupe(u8, out_head), .nullable = false, .args = &.{} };
             }
         }
     }
