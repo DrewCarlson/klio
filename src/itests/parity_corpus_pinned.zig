@@ -2458,6 +2458,15 @@ test "bare_call_return_typing" {
     );
 }
 
+test "comparator_sibling_expected" {
+    try check("comparator_sibling_expected",
+        \\bca
+        \\abc
+        \\bca
+        \\
+    );
+}
+
 test "lambda_return_overload_pick" {
     try check("lambda_return_overload_pick",
         \\6

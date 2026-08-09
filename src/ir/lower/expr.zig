@@ -4368,6 +4368,53 @@ fn argFnGenericFlags(b: *FuncBuilder, func: *const Func, args: []const Expr, arg
     return out;
 }
 
+/// Pseudo-explicit type args solved from the call site's EXPECTED type: when
+/// the declared return's head matches the expected head, its argument count
+/// matches, and EVERY one of the callee's type parameters appears as a
+/// direct return type argument, each binds to the expected's argument at
+/// that position. `compareBy`'s `Comparator<T>` against an expected
+/// `Comparator<String>` yields `[String]`; a partial or mismatched shape
+/// yields nothing.
+fn expectedReturnTypeArgsFor(b: *FuncBuilder, func: *const Func) Allocator.Error!?[]ir.TypeRef {
+    const exp = b.peekExpected() orelse return null;
+    if (exp.function != null or exp.type_args.len == 0) return null;
+    const tps = b.module.registry.func_type_params.get(func.id) orelse return null;
+    if (tps.items.len == 0) return null;
+    const ret = func.return_ty;
+    if (ret.name.len == 0 or ret.args.len == 0) return null;
+    if (!std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, ret.name, "?")), exp.name.name)) return null;
+    if (exp.type_args.len != ret.args.len) return null;
+    const out = try b.allocator.alloc(ir.TypeRef, tps.items.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |*t| t.deinit(b.allocator);
+        b.allocator.free(out);
+    }
+    for (tps.items) |tp| {
+        var found: ?usize = null;
+        for (ret.args, 0..) |ra, ri| {
+            if (std.mem.eql(u8, std.mem.trimEnd(u8, ra.name, "?"), tp)) {
+                found = ri;
+                break;
+            }
+        }
+        const ri = found orelse {
+            for (out[0..filled]) |*t| t.deinit(b.allocator);
+            b.allocator.free(out);
+            return null;
+        };
+        const ta = exp.type_args[ri];
+        if (ta.is_star) {
+            for (out[0..filled]) |*t| t.deinit(b.allocator);
+            b.allocator.free(out);
+            return null;
+        }
+        out[filled] = try loweredOwnedLocalTypeRef(b, &ta.ty);
+        filled += 1;
+    }
+    return out;
+}
+
 fn instantiatedLambdaValueParams(
     b: *FuncBuilder,
     func: *const Func,
@@ -4389,6 +4436,22 @@ fn instantiatedLambdaValueParams(
     for (type_args, explicit) |*src, *dst| {
         dst.* = try loweredOwnedLocalTypeRef(b, src);
     }
+    // An expected type at the call site binds like explicit type args:
+    // compareBy's declared `Comparator<T>` against an expected
+    // `Comparator<String>` binds T := String, instantiating the selector's
+    // `(T) -> ...` so the literal's parameter types.
+    var expected_explicit: ?[]ir.TypeRef = null;
+    defer if (expected_explicit) |ea| {
+        for (ea) |*t| t.deinit(b.allocator);
+        b.allocator.free(ea);
+    };
+    if (type_args.len == 0) {
+        expected_explicit = try expectedReturnTypeArgsFor(b, func);
+    }
+    const explicit_eff: []const ir.TypeRef = if (explicit.len != 0)
+        explicit
+    else
+        (expected_explicit orelse explicit);
     var instantiated = blk: {
         // The ENGINE: solve every binding the call site offers — receiver,
         // typed value arguments, explicit type args — in one pass and
@@ -4407,7 +4470,7 @@ fn instantiatedLambdaValueParams(
                 if (recv) |r| r.* else null,
                 null,
                 sh,
-                explicit,
+                explicit_eff,
                 false,
             ) catch break :engine) orelse break :engine;
             if (solved.bindings.len == 0) break :engine;
@@ -4434,7 +4497,7 @@ fn instantiatedLambdaValueParams(
             b.allocator,
             func.id,
             fn_ty,
-            explicit,
+            explicit_eff,
         )) orelse try fn_ty.clone(b.allocator);
     };
     defer instantiated.deinit(b.allocator);
@@ -13452,10 +13515,184 @@ fn reifiedRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Allocator.
 
 const SibSolved = struct { site: *const Expr, ty: ast.TypeRef };
 
+/// Candidate walk for the comparator-sibling solve: same-simple-name
+/// functions filtered by ARITY fit and by whether the declared receiver can
+/// SERVE the call's actual receiver head — first-fit by arity alone handed
+/// `List<String>.minOfWith` to the CharSequence variant, whose `(Char) -> R`
+/// selector poisons the element binding.
+fn solveComparatorSiblingByName(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    name: []const u8,
+    args: []const Expr,
+) ?SibSolved {
+    var actual_owned: ?ir.TypeRef = switch (callee.*) {
+        .Member => |m| (staticExprTypeRef(b, m.receiver) catch null),
+        else => null,
+    };
+    defer if (actual_owned) |*t| t.deinit(b.allocator);
+    const actual_head: ?[]const u8 = blk: {
+        if (actual_owned) |t| break :blk typeHead(std.mem.trimEnd(u8, t.name, "?"));
+        const h = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse break :blk null;
+        break :blk typeHead(std.mem.trimEnd(u8, h, "?"));
+    };
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (!(f.params.len == args.len or (f.params.len > args.len and f.params.len - args.len <= 1))) continue;
+        const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        if (recv_off == 1) {
+            const ah = actual_head orelse continue;
+            var dr = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
+            if (std.mem.indexOfScalar(u8, dr, '<')) |lt| dr = dr[0..lt];
+            const dh = typeHead(dr);
+            if (!(std.mem.eql(u8, ah, dh) or dh.len <= 2 or
+                ir.parseClassTypeParamIdentity(f.params[0].ty.name) != null or
+                receiverHeadServes(b, ah, dh))) continue;
+        }
+        if (solveComparatorSibling(b, callee, f, recv_off, args)) |solved| return solved;
+    }
+    return null;
+}
+
+/// `minOfWith(compareBy { it.reversed() }) { it.take(3) }`: the outer call's
+/// `R` lives only in the trailing selector's RETURN, so it solves by
+/// deriving that literal's tail under the receiver-element binding — any
+/// tail kind, because the result feeds one sibling argument's EXPECTED type
+/// and never instantiates a type variable of the outer callee (the recorded
+/// member-tail hazard). The sibling declared `Comparator<in R>` then lowers
+/// with `Comparator<derived>` expected, which binds compareBy's own type
+/// parameter and types its lambda.
+fn solveComparatorSibling(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    f: *const ir.Func,
+    recv_off: usize,
+    args: []const Expr,
+) ?SibSolved {
+    const sib_trace = runtime.envOnce("KLIO_SIBEXP_TRACE") != null;
+    if (args[args.len - 1] != .Lambda) return null;
+    const lam = args[args.len - 1].Lambda;
+    const stmts = lam.body.stmts;
+    if (stmts.len == 0 or stmts[stmts.len - 1] != .Expr) return null;
+    const pk = recv_off + args.len - 1;
+    if (pk >= f.params.len) return null;
+    const sel_ty = f.params[pk].ty;
+    if (!std.mem.startsWith(u8, typeHead(sel_ty.name), "Function") or sel_ty.args.len < 2) {
+        if (sib_trace) std.debug.print("[sibexp-bail] outer={s} sel_head={s} sel_args={d}\n", .{ f.fqn, sel_ty.name, sel_ty.args.len });
+        return null;
+    }
+    const r_name = std.mem.trimEnd(u8, sel_ty.args[sel_ty.args.len - 1].name, "?");
+    if (r_name.len == 0 or r_name.len > 2 or !std.ascii.isUpper(r_name[0])) {
+        if (sib_trace) std.debug.print("[sibexp-bail] outer={s} r_name={s}\n", .{ f.fqn, r_name });
+        return null;
+    }
+    var site: ?*const Expr = null;
+    var head: []const u8 = "";
+    for (args[0 .. args.len - 1], 0..) |*arg, j| {
+        const pj = recv_off + j;
+        if (pj >= f.params.len) continue;
+        const pt = f.params[pj].ty;
+        if (pt.args.len != 1) continue;
+        var a0 = std.mem.trimEnd(u8, pt.args[0].name, "?");
+        if (std.mem.startsWith(u8, a0, "in#")) a0 = a0[3..];
+        if (std.mem.startsWith(u8, a0, "out#")) a0 = a0[4..];
+        if (!std.mem.eql(u8, a0, r_name)) continue;
+        if (arg.* != .Call) continue;
+        site = arg;
+        head = typeHead(std.mem.trimEnd(u8, pt.name, "?"));
+        break;
+    }
+    const s = site orelse {
+        if (sib_trace) {
+            std.debug.print("[sibexp-bail] outer={s} no_sibling_site r={s}\n", .{ f.fqn, r_name });
+            for (args[0 .. args.len - 1], 0..) |*arg, j| {
+                const pj = recv_off + j;
+                if (pj >= f.params.len) continue;
+                const pt = f.params[pj].ty;
+                std.debug.print("[sibexp-bail]   arg{d} tag={s} p_name={s} p_args={d} p_arg0={s}\n", .{
+                    j,
+                    @tagName(arg.*),
+                    pt.name,
+                    pt.args.len,
+                    if (pt.args.len != 0) pt.args[0].name else "-",
+                });
+            }
+        }
+        return null;
+    };
+    if (head.len == 0 or head.len <= 2) return null;
+    const inputs = sel_ty.args[0 .. sel_ty.args.len - 1];
+    var nb = FuncBuilder.init(b.allocator, b.module) catch return null;
+    defer nb.deinit();
+    var elem_owned: ?ir.TypeRef = null;
+    defer if (elem_owned) |*t| t.deinit(b.allocator);
+    var i: usize = 0;
+    while (i < inputs.len) : (i += 1) {
+        const pname = if (lam.params.len == 0 and inputs.len == 1)
+            "it"
+        else if (i < lam.params.len)
+            lam.params[i].name
+        else
+            return null;
+        const declared = inputs[i];
+        const dh = typeHead(std.mem.trimEnd(u8, declared.name, "?"));
+        if (staticTypeClassId(b, declared) != null or isPrimitiveTypeName(dh)) {
+            nb.setLocalDeclTypeOwned(pname, declared.clone(b.allocator) catch return null) catch return null;
+        } else if (dh.len <= 2 or ir.parseClassTypeParamIdentity(declared.name) != null) {
+            if (inputs.len != 1) return null;
+            if (elem_owned == null) {
+                elem_owned = switch (callee.*) {
+                    .Member => |m| iterableElementTypeRef(b, m.receiver) catch null,
+                    else => blk: {
+                        const this_expr: Expr = .{ .This = .{ .qualifier = null, .span = exprSpan(s) } };
+                        break :blk iterableElementTypeRef(b, &this_expr) catch null;
+                    },
+                };
+            }
+            const elem = elem_owned orelse return null;
+            nb.setLocalDeclTypeOwned(pname, elem.clone(b.allocator) catch return null) catch return null;
+        } else return null;
+    }
+    od_depth += 1;
+    const derived = staticExprTypeRef(&nb, &stmts[stmts.len - 1].Expr) catch null;
+    od_depth -= 1;
+    var derived_ty = derived orelse {
+        if (sib_trace) std.debug.print("[sibexp-bail] outer={s} derive=null\n", .{f.fqn});
+        return null;
+    };
+    defer derived_ty.deinit(b.allocator);
+    const derived_head = typeHead(std.mem.trimEnd(u8, derived_ty.name, "?"));
+    if (derived_head.len <= 2) return null;
+    if (staticTypeClassId(b, derived_ty) == null and !isPrimitiveTypeName(derived_head)) {
+        if (sib_trace) std.debug.print("[sibexp-bail] outer={s} derived_no_class={s}\n", .{ f.fqn, derived_head });
+        return null;
+    }
+    const sp = exprSpan(s);
+    const head_owned = b.allocator.dupe(u8, head) catch return null;
+    const derived_owned = b.allocator.dupe(u8, derived_head) catch return null;
+    const ta = b.allocator.alloc(ast.TypeArg, 1) catch return null;
+    ta[0] = .{
+        .variance = .Invariant,
+        .is_star = false,
+        .ty = .{ .name = .{ .name = derived_owned, .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null },
+        .span = sp,
+    };
+    if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) {
+        std.debug.print("[sibexp] outer={s} head={s} derived={s}\n", .{ f.fqn, head_owned, derived_owned });
+    }
+    return .{ .site = s, .ty = .{ .name = .{ .name = head_owned, .span = sp }, .nullable = false, .span = sp, .type_args = ta, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null } };
+}
+
 fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr) ?SibSolved {
-    if (callee.* != .Path or callee.Path.segments.len != 1) return null;
     if (args.len < 2) return null;
-    const outer_name = callee.Path.segments[0].name;
+    const outer_name: []const u8 = switch (callee.*) {
+        .Path => |p| blk: {
+            if (p.segments.len != 1) return null;
+            break :blk p.segments[0].name;
+        },
+        .Member => |m| m.name.name,
+        else => return null,
+    };
     var outer: ?*const ir.Func = null;
     for (b.module.funcsBySimpleName(outer_name)) |fid| {
         const f = b.module.funcById(fid) orelse continue;
@@ -13464,6 +13701,8 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
             break;
         }
     }
+    if (solveComparatorSiblingByName(b, callee, outer_name, args)) |solved| return solved;
+    if (callee.* == .Member) return null;
     const f = outer orelse return null;
     const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
     for (args, 0..) |*arg, j| {

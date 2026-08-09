@@ -1700,6 +1700,13 @@ pub fn tryInlineCallWithTypeArgs(
         // `endIndex: Int = length` on `CharSequence.substring` reads the
         // receiver's `length`. Caller-supplied arguments keep the call
         // site's scope (no callee `this`).
+        // The splice bypasses `lowerArgRun`'s transfer, so the sibling-solved
+        // expected type for exactly this argument node applies here too.
+        const sib_push = if (b.sib_expected_site) |site|
+            site == @as(*const anyopaque, @ptrCast(a))
+        else
+            false;
+        const sib_prev = if (sib_push) b.pushExpected(b.sib_expected_ty) else null;
         const r = if (slot_is_default[i] and explicit_receiver != null) blk: {
             try b.pushScope();
             try b.bind("this", explicit_receiver.?);
@@ -1707,6 +1714,7 @@ pub fn tryInlineCallWithTypeArgs(
             try b.popScope();
             break :blk rr;
         } else coerced orelse try lowerExpr(b, a);
+        if (sib_push) b.restoreExpected(sib_prev);
         b.pending_lambda_arity = -1;
         b.pending_ref_lambda_param_types = null;
         arg_regs[i] = r;
