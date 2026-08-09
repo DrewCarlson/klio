@@ -6588,3 +6588,40 @@ rows). Standing 31: interceptor (the CoroutineContext `get` KEY solve),
 entries/onEachIndexed, `.size` flatten, one a-compareTo variant, the
 TestCollection seven, takeLastWhile/dropLastWhile, Index 1, and the
 chunked/minOf/maxOf/lowercase/isEmpty chains.
+
+### Standing 31 — the stretch's wrap, every remaining row's next link
+
+The continuation drove 67 -> 31 (session total 87 -> 31), with three
+kotlinc-parity WRONG ANSWERS fixed on the way (the member-form sumOf
+Double-variant pick chief among them), two honest reverts, and a
+mechanism per stretch entry above. All gates green at every kept commit:
+sweep 117/0, unit suite, examples 279/291 (the baseline 12: 11 windowed
+compose + serial_names pack gating), each flaked chain run re-verified
+standalone before judging.
+
+The 31, each with its named next link:
+
+- `.size` in the stdlib flatten: the pick's element binding derives
+  head=Iterator — a wrong upstream receiver record in the This chain
+  (`KLIO_IMPLPROP_TRACE=size`); find the writer of that record.
+- `entries`/onEachIndexed, one module variant: the closure carries the
+  spliced callee's literal `T` in BOTH the own-recv and enclosing-recv
+  channels; the receiver TOWER is the remaining carrier.
+- `interceptor`: the CoroutineContext `get` KEY solve — E binds through
+  the companion object's `Key<ContinuationInterceptor>` supertype
+  projection.
+- One `a`-compareTo module variant (TextActuals lambda param).
+- The TestCollection local-class seven: KLIO_ANON_BASE affordability
+  (runtime lowering needs scratch-arena discipline first).
+- takeLastWhile/dropLastWhile pair (splice=List contexts), Index 1, and
+  the chunked/minOf/maxOf/lowercase/isEmpty not_simple_callee chains.
+
+Beyond the census tail, the strict goal's owners stand: the walk
+residue (`member_ladder` ~1,209 route hits — Result.fold by design,
+fixtures, Int.until rows — plus the deferred iterator-protocol sites),
+and task-15's calling-convention unification, the bytecode-vm plan's
+opening prerequisite. The runtime overload re-pick hazard is recorded:
+a return-variant tie reaching the runtime resolves first-declared (a
+closure value carries no return type), so every remaining dynamic
+sumOf-shaped site is a latent parity site — the static picks are the
+sound fix.
