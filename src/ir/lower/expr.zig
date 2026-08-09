@@ -285,6 +285,10 @@ fn receiverHeadServes(b: *const FuncBuilder, actual: []const u8, declared: []con
     return false;
 }
 
+/// Deriver-only leniency: a TYPE record can pick among bodyless expect
+/// headers whose signatures discriminate; an emission pick never can.
+threadlocal var lamret_allow_bodyless: bool = false;
+
 fn overloadPickByLambdaReturn(
     b: *FuncBuilder,
     cands: []const FuncId,
@@ -336,7 +340,7 @@ fn overloadPickByLambdaReturnFull(
             continue;
         };
         const why = lamret_why != null and std.mem.indexOf(u8, f.fqn, lamret_why.?) != null;
-        if (!f.hasBody()) {
+        if (!f.hasBody() and !lamret_allow_bodyless) {
             if (why) std.debug.print("[lamret-why] {s}#{d} skip=no_body\n", .{ f.fqn, fid.int() });
             continue;
         }
@@ -16976,8 +16980,67 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
         }
         if (agreed) |*old| {
             if (!std.mem.eql(u8, old.name, f.return_ty.name)) {
+                // A return-variant family (`maxOf { }`'s Double/Float/R
+                // overloads) discriminates by the trailing lambda's derived
+                // return, exactly as the emission's pick does; without a
+                // pick the disagreement stands and the record refuses.
                 old.deinit(b.allocator);
                 agreed = null;
+                agreed_fid = null;
+                // No lambda to discriminate: an exactly-instantiated
+                // receiver variant (`Iterable<Float>.minOrNull()` for a
+                // List<Float> receiver) outranks the generic sibling —
+                // kotlinc's most-specific rule.
+                if (recv_ty.args.len == 1 and allNull(call.arg_names)) {
+                    const actual_arg_head = typeHead(std.mem.trimEnd(u8, recv_ty.args[0].name, "?"));
+                    var exact_fid: ?FuncId = null;
+                    var exact_dup = false;
+                    for (b.module.funcsBySimpleName(mname)) |fid2| {
+                        const f2 = b.module.funcById(fid2) orelse continue;
+                        if (f2.kind == .instance_method or f2.params.len == 0 or
+                            !std.mem.eql(u8, f2.params[0].name, "this")) continue;
+                        if (!b.module.classIsOrExtends(recv_head, typeHead(f2.params[0].ty.name))) continue;
+                        if (f2.params.len - 1 != call.args.len) continue;
+                        if (f2.params[0].ty.args.len != 1) continue;
+                        var dah = std.mem.trimEnd(u8, f2.params[0].ty.args[0].name, "?");
+                        if (std.mem.startsWith(u8, dah, "in#")) dah = dah[3..];
+                        if (std.mem.startsWith(u8, dah, "out#")) dah = dah[4..];
+                        const dh2 = typeHead(dah);
+                        if (dh2.len == 0 or (dh2.len <= 2 and std.ascii.isUpper(dh2[0])) or
+                            b.isTypeParam(dh2) or ir.parseClassTypeParamIdentity(dh2) != null) continue;
+                        if (!std.mem.eql(u8, dh2, actual_arg_head)) continue;
+                        if (exact_fid != null) {
+                            exact_dup = true;
+                            break;
+                        }
+                        exact_fid = fid2;
+                    }
+                    if (!exact_dup) if (exact_fid) |efid| {
+                        if (b.module.funcById(efid)) |ef| {
+                            if (ef.return_ty_declared and ef.return_ty.name.len != 0 and
+                                !bareTypeParamHead(ef.return_ty.name))
+                            {
+                                agreed = try ef.return_ty.clone(b.allocator);
+                                agreed_fid = efid;
+                                break;
+                            }
+                        }
+                    };
+                }
+                if (call.args.len != 0 and allNull(call.arg_names)) {
+                    const pcands = try b.module.bareCallCandidates(b.allocator, mname, caller_file);
+                    defer b.allocator.free(pcands);
+                    lamret_allow_bodyless = true;
+                    defer lamret_allow_bodyless = false;
+                    if (try overloadPickByLambdaReturnFull(b, pcands, call.args, call.args.len, recv_head, recv)) |picked| {
+                        const pf = b.module.funcById(picked) orelse return null;
+                        if (!pf.return_ty_declared or pf.return_ty.name.len == 0 or
+                            bareTypeParamHead(pf.return_ty.name)) return null;
+                        agreed = try pf.return_ty.clone(b.allocator);
+                        agreed_fid = picked;
+                        break;
+                    }
+                }
                 return null;
             }
         } else {
@@ -17562,6 +17625,22 @@ fn lowerResolvedMemberCall(
             if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
                 std.debug.print("[no-recv-member] .{s} call={s} fn={s}\n", .{
                     receiver.Member.name.name,
+                    name.name,
+                    build.currentRealFn() orelse "-",
+                });
+            }
+        }
+        if (receiver.* == .Call or receiver.* == .Index or receiver.* == .Postfix) {
+            if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
+                const inner_nm: []const u8 = switch (receiver.*) {
+                    .Call => |c2| if (c2.callee.* == .Member) c2.callee.Member.name.name else if (c2.callee.* == .Path and c2.callee.Path.segments.len != 0) c2.callee.Path.segments[c2.callee.Path.segments.len - 1].name else "?",
+                    .Index => "[]",
+                    .Postfix => @tagName(receiver.Postfix.op),
+                    else => "?",
+                };
+                std.debug.print("[no-recv-{s}] {s}() call={s} fn={s}\n", .{
+                    @tagName(std.meta.activeTag(receiver.*)),
+                    inner_nm,
                     name.name,
                     build.currentRealFn() orelse "-",
                 });
