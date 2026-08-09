@@ -2378,7 +2378,7 @@ pub const Module = struct {
         return false;
     }
 
-    fn staticFuncTypeParamBound(
+    pub fn staticFuncTypeParamBound(
         self: *const Module,
         fid: FuncId,
         name: []const u8,

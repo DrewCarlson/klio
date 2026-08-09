@@ -6724,21 +6724,26 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
     // Infix call `a fn b` → `a.fn(b)`.
     if (is_infix and args.len == 2 and callee.* == .Path and callee.Path.segments.len == 1) {
-        const recv = try lowerExpr(b, &args[0]);
-        const run = try lowerArgRun(b, args[1..]);
-        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names[1..]);
-        const dst = b.allocReg();
-        const nm = try b.module.internConst(b.allocator, .{ .String = callee.Path.segments[0].name });
-        try b.push(.{ .CallMember = .{
-            .dst = dst,
-            .receiver = recv,
-            .name = nm,
-            .trailing_lambda = b.callTrailingLambda(),
-            .args = run[0],
-            .n_args = run[1],
-            .arg_names = arg_names,
-        } });
-        return dst;
+        // An infix call IS `a.f(b)`: route it through the member lowering
+        // so it binds statically like the written-out form. The plain
+        // CallMember emitted here left every infix extension walking by
+        // name (`0 until times` inside `repeat`'s body, once per run).
+        var member_callee = Expr{ .Member = .{
+            .receiver = &args[0],
+            .name = callee.Path.segments[0],
+            .safe = false,
+            .span = call.span,
+        } };
+        const member_call = Expr{ .Call = .{
+            .callee = &member_callee,
+            .args = args[1..],
+            .arg_names = call.arg_names[1..],
+            .type_args = call.type_args,
+            .is_infix = false,
+            .has_trailing_lambda = call.has_trailing_lambda,
+            .span = call.span,
+        } };
+        return try lowerMemberCallFallback(b, &member_call);
     }
 
     // `suspend { … }` builder: the value is the lambda itself, with its
@@ -10733,9 +10738,15 @@ fn fnTypedCalleeReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator
         .Member => |m| m.name.name,
         else => return null,
     };
-    if (b.resolve(name) == null) return null;
+    // A recorded declared type is evidence on its own: a PROBE builder
+    // (the scope-fn tail derive) carries the enclosing scope's decl types
+    // without its registers, and a captured `arg1: (String) -> CharSequence`
+    // must still answer through its declared return.
     const ty = b.localDeclTypeRef(name) orelse return null;
-    if (!std.mem.startsWith(u8, ty.name, "Function")) return null;
+    // Both fn-type spellings: the registry's `FunctionN` and the local
+    // channel's `<function>` head.
+    if (!std.mem.startsWith(u8, ty.name, "Function") and
+        !std.mem.eql(u8, ty.name, "<function>")) return null;
     if (ty.args.len == 0) return null;
     const ret = ty.args[ty.args.len - 1];
     if (ret.name.len == 0 or ret.name[0] == '#') return null;
@@ -11077,7 +11088,6 @@ fn staticCallReturnTypeRef(
         const c = call_expr.Call;
         if (c.callee.* != .Member) break :scope_fns;
         const m = c.callee.Member;
-        if (m.safe) break :scope_fns;
         const nm2 = m.name.name;
         const is_echo = std.mem.eql(u8, nm2, "also") or std.mem.eql(u8, nm2, "apply");
         const is_tail = std.mem.eql(u8, nm2, "let") or std.mem.eql(u8, nm2, "run");
@@ -11120,7 +11130,11 @@ fn staticCallReturnTypeRef(
         // records list the scope functions as reachable on every builtin
         // head, and a USER class's member of the name registers in the
         // simple-name index the candidate gate above already walks.
-        if (is_echo) return recv_owned;
+        if (is_echo) {
+            var echo = recv_owned;
+            if (m.safe) echo.nullable = true;
+            return echo;
+        }
         defer recv_owned.deinit(b.allocator);
         const lam = c.args[0].Lambda;
         const stmts2 = lam.body.stmts;
@@ -11140,7 +11154,11 @@ fn staticCallReturnTypeRef(
         }
         if (std.mem.eql(u8, nm2, "let")) {
             const pname = if (lam.params.len != 0) lam.params[0].name else "it";
-            nb2.setLocalDeclTypeOwned(pname, recv_owned.clone(b.allocator) catch break :scope_fns) catch break :scope_fns;
+            var seed = recv_owned.clone(b.allocator) catch break :scope_fns;
+            // A safe call unwraps: the parameter inside `x?.let { }` is
+            // non-null.
+            if (m.safe) seed.nullable = false;
+            nb2.setLocalDeclTypeOwned(pname, seed) catch break :scope_fns;
         } else {
             nb2.setRecvTypeRefOwned(recv_owned.clone(b.allocator) catch break :scope_fns);
         }
@@ -11150,9 +11168,15 @@ fn staticCallReturnTypeRef(
             if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
             const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
                 ir.parseClassTypeParamIdentity(h) != null;
-            if (h.len != 0 and !bare) return dt;
+            if (h.len != 0 and !bare) {
+                // `x?.let { ... }` yields the tail type OR null.
+                if (m.safe) dt.nullable = true;
+                if (sfx_trace) std.debug.print("[scopefn] {s} ret={s}\n", .{ nm2, dt.name });
+                return dt;
+            }
+            if (sfx_trace) std.debug.print("[scopefn] {s} bail=bare_tail {s}\n", .{ nm2, dt.name });
             dt.deinit(b.allocator);
-        }
+        } else if (sfx_trace) std.debug.print("[scopefn] {s} bail=tail_underived\n", .{nm2});
         break :scope_fns;
     }
     if (try fnTypedCalleeReturnTypeRef(b, call_expr)) |t| return t;
@@ -17578,18 +17602,23 @@ fn lowerResolvedMemberCall(
         // extension of that name and arity is taken, so a same-named
         // declaration on a real type can never be reached through here.
         if (recv_state.reg == null and ast_type_args.len == 0) {
-            if (args.len == 0 and allNull(ast_arg_names)) {
+            if (allNull(ast_arg_names)) {
                 if (uniqueAnyNullableExtension(b, name.name, args.len)) |fid| {
-                    const recv_slot = b.allocReg();
+                    const vals = try b.allocator.alloc(Reg, args.len + 1);
+                    defer b.allocator.free(vals);
                     const rv = try lowerExpr(b, receiver);
+                    const recv_slot = b.allocReg();
                     try b.push(.{ .Move = .{ .dst = recv_slot, .src = rv } });
+                    vals[0] = recv_slot;
+                    for (args, 0..) |*arg, i| vals[i + 1] = try lowerExpr(b, arg);
+                    const args_start = try packContiguous(b, vals);
                     const dst = b.allocReg();
                     try b.push(.{ .Call = .{
                         .dst = dst,
                         .func = fid,
                         .trailing_lambda = false,
-                        .args = recv_slot,
-                        .n_args = 1,
+                        .args = args_start,
+                        .n_args = @intCast(vals.len),
                         .arg_names = &.{},
                         .type_args = &.{},
                         .exact = true,
@@ -18501,8 +18530,22 @@ fn uniqueAnyNullableExtension(b: *FuncBuilder, name: []const u8, nargs: usize) ?
         // here, and a real call would strand it.
         if (f.is_inline) return null;
         const rt = f.params[0].ty;
-        if (!rt.nullable) return null;
-        if (!std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, rt.name, "?")), "Any")) return null;
+        const rt_head = typeHead(std.mem.trimEnd(u8, rt.name, "?"));
+        // `Any?` receivers, and UNBOUNDED bare-type-param receivers
+        // (`fun <A, B> A.to(that: B)`) — the same universal shape: the
+        // declaration applies to every receiver, so no receiver typing is
+        // needed to commit it. A same-named class MEMBER anywhere refuses
+        // (the member would win on its receiver at run time).
+        const universal_tp = rt.args.len == 0 and bareTypeParamHead(rt_head) and blk: {
+            const bound = b.module.staticFuncTypeParamBound(fid, rt_head) orelse break :blk true;
+            break :blk std.mem.eql(u8, applicability.simpleName(typeHead(std.mem.trimEnd(u8, bound, "?"))), "Any");
+        };
+        if (!universal_tp) {
+            if (!rt.nullable) return null;
+            if (!std.mem.eql(u8, rt_head, "Any")) return null;
+        } else {
+            if (b.module.registry.class_member_names.contains(name)) return null;
+        }
         if (found != null) return null;
         found = fid;
     }
@@ -19078,9 +19121,16 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         // mangled cell — the plain slot misbound `this.Test(showThree)` to
         // an uninitialized cell whenever composable and extension `Test`
         // overloads coexisted.
-        if (b.localFnOverloads(name.name)) |ovs| {
-            if (try selectLocalExtOverload(b, ovs, declared_ty, args, ast_arg_names)) |mangled| {
-                if (try lowerSelectedLocalExtCallWithReceiver(b, mangled, receiver, args, ast_arg_names)) |r| return r;
+        // The DIRECT local-ext commitment needs a derived receiver: with the
+        // receiver untyped, a same-named global extension may be the Kotlin
+        // target (the test-local `String?.contentEquals` recursed into
+        // itself over the stdlib `CharSequence?.contentEquals`), so the
+        // arbitrated emission below decides at run time instead.
+        if (declared_ty != null) {
+            if (b.localFnOverloads(name.name)) |ovs| {
+                if (try selectLocalExtOverload(b, ovs, declared_ty, args, ast_arg_names)) |mangled| {
+                    if (try lowerSelectedLocalExtCallWithReceiver(b, mangled, receiver, args, ast_arg_names)) |r| return r;
+                }
             }
         }
         const local_reg = blk: {
