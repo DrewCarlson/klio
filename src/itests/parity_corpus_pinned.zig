@@ -2458,6 +2458,15 @@ test "bare_call_return_typing" {
     );
 }
 
+test "nested_expected_comparator_chain" {
+    try check("nested_expected_comparator_chain",
+        \\[null, , a]
+        \\[a, , null]
+        \\[null, a, ]
+        \\
+    );
+}
+
 test "bare_tp_receiver_lambda_invoke" {
     // `item.getter()` on a bare-tp property with `getter: T.() -> P` in
     // scope commits the VALUE (invoke) protocol as kotlinc resolves it —

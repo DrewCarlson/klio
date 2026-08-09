@@ -4392,9 +4392,15 @@ fn expectedReturnTypeArgsFor(b: *FuncBuilder, func: *const Func) Allocator.Error
     }
     for (tps.items) |tp| {
         var found: ?usize = null;
+        var declared_nullable = false;
         for (ret.args, 0..) |ra, ri| {
-            if (std.mem.eql(u8, std.mem.trimEnd(u8, ra.name, "?"), tp)) {
+            var rn = std.mem.trimEnd(u8, ra.name, "?");
+            if (std.mem.startsWith(u8, rn, "in#")) rn = rn[3..];
+            if (std.mem.startsWith(u8, rn, "out#")) rn = rn[4..];
+            if (std.mem.eql(u8, rn, tp)) {
                 found = ri;
+                declared_nullable = ra.nullable or rn.len != std.mem.trimEnd(u8, ra.name, "?").len or
+                    std.mem.endsWith(u8, ra.name, "?");
                 break;
             }
         }
@@ -4410,6 +4416,11 @@ fn expectedReturnTypeArgsFor(b: *FuncBuilder, func: *const Func) Allocator.Error
             return null;
         }
         out[filled] = try loweredOwnedLocalTypeRef(b, &ta.ty);
+        // A declared `T?` return position already carries the `?`: the
+        // binding is the expected argument WITHOUT it (`Comparator<T?>`
+        // against `Comparator<String?>` binds T := String, satisfying
+        // `T : Any` exactly as kotlinc solves nullsFirst).
+        if (declared_nullable) out[filled].nullable = false;
         filled += 1;
     }
     return out;
@@ -13806,8 +13817,170 @@ fn solveComparatorSibling(
     return .{ .site = s, .ty = .{ .name = .{ .name = head_owned, .span = sp }, .nullable = false, .span = sp, .type_args = ta, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null } };
 }
 
+/// Whether every head in `ty` (through its arguments) names something the
+/// receiving scope can resolve — no bare type parameters, no class-param
+/// identity mangles. Variance prefixes are spelling, not structure.
+fn irTypeFullyConcrete(b: *const FuncBuilder, ty: ir.TypeRef) bool {
+    var h = std.mem.trimEnd(u8, ty.name, "?");
+    if (std.mem.startsWith(u8, h, "in#")) h = h[3..];
+    if (std.mem.startsWith(u8, h, "out#")) h = h[4..];
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    const head = typeHead(h);
+    if (head.len == 0) return false;
+    if ((head.len <= 2 and std.ascii.isUpper(head[0])) or b.isTypeParam(head) or
+        ir.parseClassTypeParamIdentity(head) != null) return false;
+    for (ty.args) |a| {
+        if (!irTypeFullyConcrete(b, a)) return false;
+    }
+    return true;
+}
+
+/// A lowered type as source-shaped AST, for the expected-type stack.
+/// Variance mangles strip; a trailing-`?` spelling folds into `nullable`.
+fn astTypeRefFromIr(b: *FuncBuilder, ty: ir.TypeRef, sp: ast.Span) ?ast.TypeRef {
+    var nm = std.mem.trimEnd(u8, ty.name, "?");
+    const spelled_nullable = nm.len != ty.name.len;
+    if (std.mem.startsWith(u8, nm, "in#")) nm = nm[3..];
+    if (std.mem.startsWith(u8, nm, "out#")) nm = nm[4..];
+    if (std.mem.indexOfScalar(u8, nm, '<')) |lt| nm = nm[0..lt];
+    if (nm.len == 0) return null;
+    const owned = b.allocator.dupe(u8, nm) catch return null;
+    const tas = b.allocator.alloc(ast.TypeArg, ty.args.len) catch return null;
+    for (ty.args, tas) |a, *out| {
+        const inner = astTypeRefFromIr(b, a, sp) orelse return null;
+        out.* = .{ .variance = .Invariant, .is_star = false, .ty = inner, .span = sp };
+    }
+    return .{
+        .name = .{ .name = owned, .span = sp },
+        .nullable = ty.nullable or spelled_nullable,
+        .span = sp,
+        .type_args = tas,
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+}
+
+/// The general arm: a committed-shape callee's RECEIVER (plus the call
+/// site's own expected type) instantiates a call-shaped argument's declared
+/// parameter type, which becomes that argument's expected type —
+/// `it.sortedWith(nullsFirst(...))` on a `List<String?>` hands `nullsFirst`
+/// `Comparator<in String?>`; `nullsFirst`'s own lowering then repeats the
+/// same solve one level down for `compareByDescending`. Only a fully
+/// concrete instantiation is pushed: a partial one disproves more than it
+/// types.
+fn solveInstantiatedArgExpected(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    name: []const u8,
+    args: []const Expr,
+) ?SibSolved {
+    var site: ?*const Expr = null;
+    var arg_idx: usize = 0;
+    for (args, 0..) |*a, i| {
+        if (a.* == .Call) {
+            site = a;
+            arg_idx = i;
+            break;
+        }
+    }
+    const s = site orelse return null;
+    const sib_why = if (runtime.envOnce("KLIO_SIBEXP_WHY")) |w| std.mem.eql(u8, w, name) else false;
+    var actual_owned: ?ir.TypeRef = switch (callee.*) {
+        .Member => |m| (staticExprTypeRef(b, m.receiver) catch null),
+        else => null,
+    };
+    defer if (actual_owned) |*t| t.deinit(b.allocator);
+    if (callee.* == .Member and actual_owned == null) {
+        if (sib_why) std.debug.print("[sibexp-why] {s} bail=recv_untyped\n", .{name});
+        return null;
+    }
+    const actual_head: ?[]const u8 = blk: {
+        if (actual_owned) |t| break :blk typeHead(std.mem.trimEnd(u8, t.name, "?"));
+        break :blk null;
+    };
+    var scratch = std.heap.ArenaAllocator.init(b.allocator);
+    defer scratch.deinit();
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (!(f.params.len == args.len or (f.params.len > args.len and f.params.len - args.len <= 1))) continue;
+        const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        if (recv_off == 1) {
+            const ah = actual_head orelse continue;
+            var dr = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
+            if (std.mem.indexOfScalar(u8, dr, '<')) |lt| dr = dr[0..lt];
+            const dh = typeHead(dr);
+            if (!(std.mem.eql(u8, ah, dh) or dh.len <= 2 or
+                ir.parseClassTypeParamIdentity(f.params[0].ty.name) != null or
+                receiverHeadServes(b, ah, dh))) continue;
+        } else if (callee.* == .Member) continue;
+        const pi = recv_off + arg_idx;
+        if (pi >= f.params.len) continue;
+        const pt = f.params[pi].ty;
+        // Only a GENERIC class type is worth pushing, and only when it is
+        // not already concrete (a concrete param adds no information).
+        if (pt.args.len == 0 or irTypeFullyConcrete(b, pt)) {
+            if (sib_why) std.debug.print("[sibexp-why] {s}#{d} skip=param_shape pt={s} args={d}\n", .{ f.fqn, fid.int(), pt.name, pt.args.len });
+            continue;
+        }
+        const expected_explicit: ?[]ir.TypeRef = expectedReturnTypeArgsFor(b, f) catch null;
+        defer if (expected_explicit) |ea| {
+            for (ea) |*t| t.deinit(b.allocator);
+            b.allocator.free(ea);
+        };
+        // Project the actual receiver onto the DECLARED head first, so a
+        // List<String?> binds an Iterable<T> receiver pattern (the same
+        // head-consistency rule the splice window applies).
+        var solve_recv: ?ir.TypeRef = if (actual_owned) |t| t else null;
+        if (recv_off == 1 and actual_owned != null) {
+            if (staticTypeClassId(b, f.params[0].ty)) |dcid| {
+                if (b.module.projectTypeToClass(scratch.allocator(), actual_owned.?, dcid) catch null) |p| {
+                    solve_recv = p;
+                    if (sib_why) std.debug.print("[sibexp-why] {s}#{d} projected={s} args={d}\n", .{ f.fqn, fid.int(), p.name, p.args.len });
+                } else if (sib_why) {
+                    std.debug.print("[sibexp-why] {s}#{d} project_failed actual={s} dh={s}\n", .{ f.fqn, fid.int(), actual_owned.?.name, f.params[0].ty.name });
+                }
+            } else if (sib_why) {
+                std.debug.print("[sibexp-why] {s}#{d} no_decl_cid dh={s}\n", .{ f.fqn, fid.int(), f.params[0].ty.name });
+            }
+        }
+        // Receiver + expected-type evidence only: the value arguments are
+        // exactly the still-untyped nested calls this push exists to type,
+        // and their head-only shapes would refuse the bind.
+        const solved = (b.module.solveCallBindings(
+            scratch.allocator(),
+            fid,
+            f,
+            solve_recv,
+            null,
+            &.{},
+            expected_explicit orelse &.{},
+            false,
+        ) catch continue) orelse {
+            if (sib_why) std.debug.print("[sibexp-why] {s}#{d} skip=no_solve\n", .{ f.fqn, fid.int() });
+            continue;
+        };
+        if (solved.bindings.len == 0) {
+            if (sib_why) std.debug.print("[sibexp-why] {s}#{d} skip=no_bindings\n", .{ f.fqn, fid.int() });
+            continue;
+        }
+        const substituted = ir.Module.substituteBoundType(scratch.allocator(), pt, solved.bindings) catch continue;
+        if (!irTypeFullyConcrete(b, substituted)) {
+            if (sib_why) std.debug.print("[sibexp-why] {s}#{d} skip=not_concrete sub={s}\n", .{ f.fqn, fid.int(), substituted.name });
+            continue;
+        }
+        const converted = astTypeRefFromIr(b, substituted, exprSpan(s)) orelse continue;
+        if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) {
+            std.debug.print("[sibexp-inst] outer={s} arg={d} pushed={s} args={d}\n", .{ f.fqn, arg_idx, converted.name.name, converted.type_args.len });
+        }
+        return .{ .site = s, .ty = converted };
+    }
+    return null;
+}
+
 fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr) ?SibSolved {
-    if (args.len < 2) return null;
+    if (args.len == 0) return null;
     const outer_name: []const u8 = switch (callee.*) {
         .Path => |p| blk: {
             if (p.segments.len != 1) return null;
@@ -13824,8 +13997,12 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
             break;
         }
     }
-    if (solveComparatorSiblingByName(b, callee, outer_name, args)) |solved| return solved;
+    if (args.len >= 2) {
+        if (solveComparatorSiblingByName(b, callee, outer_name, args)) |solved| return solved;
+    }
+    if (solveInstantiatedArgExpected(b, callee, outer_name, args)) |solved| return solved;
     if (callee.* == .Member) return null;
+    if (args.len < 2) return null;
     const f = outer orelse return null;
     const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
     for (args, 0..) |*arg, j| {
