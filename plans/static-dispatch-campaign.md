@@ -6675,3 +6675,14 @@ Standing 29. Census-set remainder: the TestCollection seven
 (KLIO_ANON_BASE), Index 1, the chunked/minOf/maxOf/lowercase/isEmpty
 chains, and the four residents (flatten param_rep variant, entries
 tower variant, interceptor KEY solve, one a-compareTo variant).
+
+Chain-row triage: the minOrNull/maxOrNull toDouble chains now derive end
+to end (the full-record listOf + conversions arm — their census rows
+clear on the next count). The associateWith `name` row narrowed to its
+last link: the window is FULL at BOTH splice levels ([splice-ref]
+associateWith ref=List<1>, associateWithTo forwarded ref=List<1>), so
+the dead link is the FORWARDED literal's parameter binding at the inner
+splice (`valueSelector(element)` — the lambda_map's two-level forward);
+the annotated-receiver form binds, the derived-local form does not. The
+isEmpty().not() row is the CompareContext bare-tp family (the tower
+variant's kin).
