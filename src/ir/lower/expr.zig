@@ -3373,7 +3373,10 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (locals.types.contains(e.key_ptr.*)) continue;
             const prev_self = init_self_name;
             if (b.localInitNameFree(e.key_ptr.*)) init_self_name = e.key_ptr.*;
-            const derived = staticCallReturnTypeRef(b, e.value_ptr.*) catch null;
+            // The FULL deriver, not just the call-return channel: a literal
+            // or member-read init crosses the capture boundary too
+            // (`var result = 0` read inside the repeat lambda).
+            const derived = staticExprTypeRef(b, e.value_ptr.*) catch null;
             init_self_name = prev_self;
             if (derived) |ty| try locals.types.put(e.key_ptr.*, ty);
         }
@@ -10132,6 +10135,21 @@ fn memberArgCount(call_expr: *const Expr) usize {
 }
 
 pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
+    // Literals name their own type (`var result = 0` is an Int wherever
+    // the var is read, including across a capture boundary).
+    switch (e.*) {
+        .IntLit => |lit| return .{ .name = try b.allocator.dupe(u8, switch (lit.kind) {
+            .Long => "Long",
+            .UInt => "UInt",
+            .ULong => "ULong",
+            .Int => if (lit.value >= std.math.minInt(i32) and lit.value <= std.math.maxInt(i32)) "Int" else "Long",
+        }), .nullable = false, .args = &.{} },
+        .FloatLit => |lit| return .{ .name = try b.allocator.dupe(u8, if (lit.kind == .Float) "Float" else "Double"), .nullable = false, .args = &.{} },
+        .BoolLit => return .{ .name = try b.allocator.dupe(u8, "Boolean"), .nullable = false, .args = &.{} },
+        .CharLit => return .{ .name = try b.allocator.dupe(u8, "Char"), .nullable = false, .args = &.{} },
+        .StringTemplate => return .{ .name = try b.allocator.dupe(u8, "String"), .nullable = false, .args = &.{} },
+        else => {},
+    }
     if (argDeclTypeRef(b, e)) |known| return try known.clone(b.allocator);
     if (try ctorInitTypeRef(b, e)) |t| return t;
     if (try staticCallReturnTypeRef(b, e)) |t| return t;
