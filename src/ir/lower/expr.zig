@@ -6631,7 +6631,13 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     // virtual slot instead of walking per invocation
                     // (`propertyEquals { ... }` inside a spliced
                     // `(object {}).let` ran the walk 200 times per suite).
+                    // Sound only when NO enclosing receiver could shadow:
+                    // the chain must be exactly the bound receiver. With
+                    // outer receivers in scope the walking form arbitrates
+                    // (the atomicfu mutex splice livelocked when pinned).
                     if (member_of_recv and ast_type_args.len == 0 and
+                        recv_chain.?.len == 1 and
+                        runtime.envOnce("KLIO_SPLICE_PIN") == null and
                         allNull(ast_arg_names)) pin: {
                         const chain0 = recv_chain.?[0];
                         const pin_cid = (if (std.mem.indexOfScalar(u8, chain0, '.') != null)
@@ -6650,6 +6656,17 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         const target = resolved.target orelse break :pin;
                         const tf = b.module.funcById(target) orelse break :pin;
                         if (!tf.hasBody()) break :pin;
+                        // A member in a stdlib/pack package may be shadowed
+                        // by a HOST binding the lowering cannot see
+                        // (atomicfu's ReentrantLock.unlock stub deadlocked
+                        // when its interpreted body was pinned). Pin only
+                        // program-owned declarations.
+                        const shipped_pkg = std.mem.eql(u8, tf.package, "kotlin") or
+                            std.mem.startsWith(u8, tf.package, "kotlin.") or
+                            std.mem.startsWith(u8, tf.package, "kotlinx.") or
+                            std.mem.startsWith(u8, tf.package, "androidx.") or
+                            std.mem.startsWith(u8, tf.package, "io.ktor");
+                        if (shipped_pkg) break :pin;
                         const run = try lowerArgRun(b, args);
                         const dst = b.allocReg();
                         orEmitAudit(b, "inline_splice_recv_pin", "CallVirtual", nm);

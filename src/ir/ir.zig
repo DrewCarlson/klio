@@ -4129,11 +4129,15 @@ pub const Module = struct {
             // refutation too: a lambda converts only to a function type or
             // a fun interface (`propertyEquals(property: KProperty1<..>)`
             // drops for a lambda argument; its getter sibling binds).
-            if (self.staticTypeClassId(.{ .name = head, .nullable = false, .args = &.{} })) |pcid| {
-                if (pcid.int() < self.classes.items.len and
-                    !self.classes.items[pcid.int()].is_fun_interface)
-                {
-                    return .incompatible;
+            if (std.c.getenv("KLIO_LAMBDA_REFUTE") == null or
+                !std.mem.eql(u8, std.mem.span(std.c.getenv("KLIO_LAMBDA_REFUTE").?), "0"))
+            {
+                if (self.staticTypeClassId(.{ .name = head, .nullable = false, .args = &.{} })) |pcid| {
+                    if (pcid.int() < self.classes.items.len and
+                        !self.classes.items[pcid.int()].is_fun_interface)
+                    {
+                        return .incompatible;
+                    }
                 }
             }
             return .unknown;
