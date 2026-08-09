@@ -19,4 +19,14 @@ fun main() {
     // printing 3.0 where kotlinc prints 3).
     fun <T> outer(a: Array<out Array<out T>>): Long = a.sumOf { it.size.toLong() }
     println(outer(arrayOf(arrayOf(1, 2), arrayOf(3))))
+    println(flatLike(arrayOf(arrayOf(1, 2), arrayOf(3))))
 }
+
+// The BARE form inside an extension body (the third emission channel): the
+// deferred call's global leg runs the PINNED Long variant, not the
+// first-declared Double (which printed 3.0 where kotlinc prints 3).
+fun <T> Array<out Array<out T>>.sumSizes(): Long {
+    val totalSizeLong = sumOf { it.size.toLong() }
+    return totalSizeLong
+}
+fun <T> flatLike(a: Array<out Array<out T>>): Long = a.sumSizes()

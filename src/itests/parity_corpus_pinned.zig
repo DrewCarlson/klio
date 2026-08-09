@@ -2511,6 +2511,7 @@ test "lambda_return_overload_pick" {
         \\6
         \\6
         \\3
+        \\3
         \\
     );
 }

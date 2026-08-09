@@ -8363,7 +8363,40 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
     else
         false;
     const skip_member = site_skip or (cmg_skip and !is_ctor_name and !shadow_capture and
-        host.cmgGlobalSkip(func_p, &this_val, name_str, arg_values));
+        host.cmgGlobalSkip(func_p, &this_val, name_str, arg_values)) or
+        // Call-site evidence PINNED the overload (`func_final`): a genuine
+        // member of the receiver still shadows, but the member leg's
+        // extension-fallback re-rank must not run the first-declared
+        // variant past the pin.
+        (cmg.func_final and !is_ctor_name and
+            ((this_val == .Null or this_val == .Unit) or !host.hostHasMember(&this_val, name_str)));
+    // A pinned EXTENSION dispatches directly with the receiver prepended:
+    // the global leg cannot prepend a receiver, and the member leg's
+    // fallback would re-rank past the pin (the genuine-member shadow was
+    // judged just above).
+    if (cmg.func_final and skip_member and !is_ctor_name and
+        this_val != .Null and this_val != .Unit)
+    direct: {
+        const pf = cmg.func orelse break :direct;
+        const pfd = frame.module.funcById(pf) orelse break :direct;
+        if (pfd.params.len == 0 or !std.mem.eql(u8, pfd.params[0].name, "this")) break :direct;
+        const all_args = try allocator.alloc(Value, arg_values.len + 1);
+        defer allocator.free(all_args);
+        all_args[0] = this_val;
+        for (arg_values, 0..) |v, i| all_args[i + 1] = v;
+        const padded_names = try allocator.alloc(?[]const u8, names.len + 1);
+        defer allocator.free(padded_names);
+        padded_names[0] = null;
+        for (names, 0..) |n2, i| padded_names[i + 1] = n2;
+        orAudit("CallMemberOrGlobal", name_str, "pinned_ext_direct", -1, null);
+        switch (try host.callFuncNamed(allocator, frame.module, pf, all_args, padded_names)) {
+            .ok => |result| {
+                try frame.write(cmg.dst, result);
+                return .cont;
+            },
+            .err => |e| return raiseStep(frame, e),
+        }
+    }
     // Full replay: this site already resolved, for this receiver class and
     // argument shape, to a plain global whose dispatch was a fused
     // activation. Rebuild that activation and skip both the member walk and

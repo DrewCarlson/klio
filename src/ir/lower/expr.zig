@@ -15086,9 +15086,27 @@ fn threadedTrailingLambdaParam(
 
 /// The extension-fn bare-call path: prepend `this`, with trailing-lambda
 /// arg-name synthesis and the member-precedence routing.
-fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, this_reg: Reg, was_cast: bool) Allocator.Error!Reg {
+fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id_in: FuncId, this_reg: Reg, was_cast_in: bool) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
+    // The THIRD emission channel for a return-variant family: a bare
+    // extension call on the implicit receiver reached here with the
+    // heuristic sibling committed, and the member-precedence CallMember
+    // below would hand the runtime walk a first-declared re-pick (the
+    // Double sumOf, 3.0 where kotlinc prints 3). The trailing lambda's
+    // derived return discriminates here exactly as on the other two paths.
+    var func_id = func_id_in;
+    var was_cast = was_cast_in;
+    if (!was_cast and lastArgIsLambda(call.args) and allNull(call.arg_names) and
+        callee.* == .Path and callee.Path.segments.len == 1)
+    {
+        const pcands = try b.module.bareCallCandidates(b.allocator, callee.Path.segments[0].name, callee.Path.segments[0].span.file);
+        defer b.allocator.free(pcands);
+        if (try overloadPickByLambdaReturn(b, pcands, call.args, call.args.len)) |picked| {
+            func_id = picked;
+            was_cast = true;
+        }
+    }
     var selected_args = try selectedCallArgsForBuilder(b, func_id, call.args, call.arg_names, exprSpan(callee), call.has_trailing_lambda);
     defer selected_args.deinit(b.allocator);
     const args = selected_args.args;
@@ -16014,6 +16032,20 @@ fn lowerUnresolvedBareCall(
     // static path. Only the resolved hint is trusted — the
     // trailing-lambda namesake pick above stays arity/receiver-only (a
     // wrong namesake type stamp is worse than none).
+    // A return-variant family discriminates by the trailing lambda's
+    // derived return even when the resolution declined outright: the
+    // picked fid rides the deferred CMG as a PINNED global leg — the
+    // runtime re-rank runs the first-declared variant otherwise (the
+    // Double sumOf, 3.0 where kotlinc prints 3).
+    var ext_hint_final = false;
+    if (allNull(ast_arg_names) and lastArgIsLambda(args)) {
+        const pcands = try b.module.bareCallCandidates(b.allocator, name0, callee.Path.segments[0].span.file);
+        defer b.allocator.free(pcands);
+        if (try overloadPickByLambdaReturn(b, pcands, args, args.len)) |picked| {
+            ext_hint = picked;
+            ext_hint_final = true;
+        }
+    }
     const bare_lambda_param_types: ?[]?[]ir.TypeRef = blk: {
         const hint = ext_hint orelse break :blk null;
         const f = b.module.funcById(hint) orelse break :blk null;
@@ -16047,6 +16079,7 @@ fn lowerUnresolvedBareCall(
             .arg_names = arg_names,
             .recv = this_reg,
             .func = ext_hint,
+            .func_final = ext_hint_final,
             .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
             .static_recv = try cmgStaticRecv(b),
             .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
@@ -16065,6 +16098,7 @@ fn lowerUnresolvedBareCall(
         .n_args = run[1],
         .arg_names = arg_names,
         .func = ext_hint,
+        .func_final = ext_hint_final,
         .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
         .static_recv = try cmgStaticRecv(b),
         .type_args = try helpers.internTypeArgsScoped(b, ast_type_args),
