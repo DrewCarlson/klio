@@ -291,6 +291,27 @@ fn overloadPickByLambdaReturn(
     args: []const Expr,
     want: usize,
 ) Allocator.Error!?FuncId {
+    return overloadPickByLambdaReturnRecv(b, cands, args, want, null);
+}
+
+fn overloadPickByLambdaReturnRecv(
+    b: *FuncBuilder,
+    cands: []const FuncId,
+    args: []const Expr,
+    want: usize,
+    explicit_recv_head: ?[]const u8,
+) Allocator.Error!?FuncId {
+    return overloadPickByLambdaReturnFull(b, cands, args, want, explicit_recv_head, null);
+}
+
+fn overloadPickByLambdaReturnFull(
+    b: *FuncBuilder,
+    cands: []const FuncId,
+    args: []const Expr,
+    want: usize,
+    explicit_recv_head: ?[]const u8,
+    recv_expr: ?*const Expr,
+) Allocator.Error!?FuncId {
     if (args.len == 0) return null;
     const li = args.len - 1;
     if (args[li] != .Lambda) return null;
@@ -304,6 +325,7 @@ fn overloadPickByLambdaReturn(
     // agreement check — the CharSequence variants' `(Char) -> R` params must
     // not disagree a UByteArray family into a bail.
     const actual_recv_head: ?[]const u8 = blk: {
+        if (explicit_recv_head) |h| break :blk h;
         const h = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse break :blk null;
         break :blk typeHead(std.mem.trimEnd(u8, h, "?"));
     };
@@ -428,8 +450,12 @@ fn overloadPickByLambdaReturn(
         } else if (dh.len <= 2 or ir.parseClassTypeParamIdentity(declared.name) != null) {
             if (fparams.len != 1) return null;
             if (elem_owned == null) {
-                const this_expr: Expr = .{ .This = .{ .qualifier = null, .span = args[li].span() } };
-                elem_owned = try iterableElementTypeRef(b, &this_expr);
+                if (recv_expr) |re| {
+                    elem_owned = try iterableElementTypeRef(b, re);
+                } else {
+                    const this_expr: Expr = .{ .This = .{ .qualifier = null, .span = args[li].span() } };
+                    elem_owned = try iterableElementTypeRef(b, &this_expr);
+                }
             }
             const elem = elem_owned orelse return null;
             try nb.setLocalDeclTypeOwned(pname, try elem.clone(b.allocator));
@@ -9965,7 +9991,12 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
         }
     }
     if (ty.args.len != 1) return null;
-    const elem = ty.args[0].name;
+    var elem = ty.args[0].name;
+    // Declaration-site variance is spelling, not structure: the element of
+    // `Array<out Array<out T>>` is the inner Array, not a name the head
+    // tables could ever hold.
+    if (std.mem.startsWith(u8, elem, "in#")) elem = elem[3..];
+    if (std.mem.startsWith(u8, elem, "out#")) elem = elem[4..];
     if (elem.len == 0) return null;
     // A STAR projection's element is `Any?` — the projection's own upper
     // bound, which is what Kotlin resolves a call on it against.
@@ -9983,13 +10014,26 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
     // bound record the head still names nothing and the old answer stands.
     if (elem.len <= 2 and std.ascii.isUpper(elem[0])) {
         if (b.typeParamBound(elem) == null) return null;
-        return try ty.args[0].clone(b.allocator);
+        return try cloneElemStripped(b, &ty.args[0], elem);
     }
     var head = elem;
     if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (b.module.classIdByFqn(head) == null and
         b.module.uniqueClassIdBySimpleName(typeHead(head)) == null) return null;
-    return try ty.args[0].clone(b.allocator);
+    return try cloneElemStripped(b, &ty.args[0], elem);
+}
+
+/// Clone the element type with the variance mangle stripped from its NAME —
+/// the checks above judged the stripped spelling, and every consumer keys
+/// heads by it.
+fn cloneElemStripped(b: *FuncBuilder, arg: *const ir.TypeRef, stripped: []const u8) Allocator.Error!ir.TypeRef {
+    var out = try arg.clone(b.allocator);
+    if (!std.mem.eql(u8, out.name, stripped)) {
+        const owned = try b.allocator.dupe(u8, stripped);
+        b.allocator.free(out.name);
+        out.name = owned;
+    }
+    return out;
 }
 
 pub fn iterableElementTypeName(b: *FuncBuilder, iter: *const Expr) Allocator.Error!?[]const u8 {
@@ -17752,7 +17796,21 @@ fn lowerResolvedExtensionCall(
         args,
         ast_arg_names,
     );
-    const func_id = resolution.target orelse return null;
+    const func_id = resolution.target orelse blk: {
+        // A return-variant tie on the MEMBER form discriminates by the
+        // trailing lambda's derived return exactly as the bare form does
+        // (`a.sumOf { it.size.toLong() }` on a typed receiver ran the
+        // Double variant through the runtime re-pick).
+        if (allNull(ast_arg_names)) {
+            const cands = try b.module.bareCallCandidates(b.allocator, name.name, name.span.file);
+            defer b.allocator.free(cands);
+            const rh = typeHead(std.mem.trimEnd(u8, recv_ty.name, "?"));
+            if (try overloadPickByLambdaReturnFull(b, cands, args, args.len, rh, receiver)) |picked| {
+                break :blk picked;
+            }
+        }
+        return null;
+    };
     const target = b.module.funcById(func_id) orelse return null;
     var selected_args = try selectedCallArgsForBuilder(
         b,

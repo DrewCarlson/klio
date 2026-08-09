@@ -2497,6 +2497,10 @@ test "comparator_sibling_expected" {
     );
 }
 
+// The trailing `3` row pins the NEW fixture line (`outer(arrayOf(...))` —
+// the member-form lambda-return pick committing the Long sumOf variant;
+// kotlinc prints 3 where the runtime re-pick had printed 3.0). The prior
+// rows are unchanged.
 test "lambda_return_overload_pick" {
     try check("lambda_return_overload_pick",
         \\6
@@ -2506,6 +2510,7 @@ test "lambda_return_overload_pick" {
         \\6
         \\6
         \\6
+        \\3
         \\
     );
 }
