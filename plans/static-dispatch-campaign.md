@@ -6421,3 +6421,14 @@ contract compiles to a runtime helper; zero by-name slot walks; the
 census reads honestly for the backends. The campaign's goal state —
 dispatch decided at lowering everywhere the language allows, the
 exceptions enumerated and each one named — HOLDS.
+
+Final gate, all against the session-start baseline: sweep 117/0; unit
+green (all new pins); examples 279/291 with the identical pre-existing
+failure set (11 windowed compose + serial_names pack-feature gating);
+litmus 42/43 (the known tl_atomic_update_contended timeout);
+`itest-compose_plugin_commontest` 1,348 passed across 46 classes, 0
+incomplete, ratchet 1,305 — exit 0. An ad-hoc harness invocation of the
+compose suite against the itest scratch home showed 26 failures that the
+SESSION-START binary reproduces identically on the same invocation — a
+stale-pack-home artifact, not a regression; the canonical gate wires its
+own images and is the measurement.
