@@ -668,20 +668,6 @@ fn classByQualifiedSuffix(classes: *const ClassTable, qualified: []const u8) ?Ob
 /// `anon_methods` under both the arity-qualified and bare keys, with
 /// `capture_pairs` bound. `own_members` scopes bare-name resolution inside
 /// the bodies.
-/// The anon site module never passed the build walk: seed its registry with
-/// the registering class's property types so the method bodies' bare
-/// property reads (`data.size` inside a local class's overrides) type. The
-/// default path hands each call a FRESH module, so every lowering site
-/// seeds its own; the shared-base mode (KLIO_ANON_BASE=1) is skipped -
-/// simple-name keys written to the shared root clone would leak scopes.
-fn seededSiteModule(self: *VmHost, allocator: Allocator, cache: *?ObjRef(Module), class: *const ast.Class) Allocator.Error!ObjRef(Module) {
-    const ref = try host_instances.anonSiteModule(self, allocator, cache);
-    if (!ref.cell.data.anon_side) {
-        try build.noteLocalClassPropTypes(allocator, &ref.cell.data, class);
-    }
-    return ref;
-}
-
 fn lowerAndRegisterMethods(
     self: *VmHost,
     allocator: Allocator,
@@ -697,7 +683,7 @@ fn lowerAndRegisterMethods(
         switch (m.*) {
             .Function => |*f| {
                 if (f.body == null) continue;
-                const sub_ref = try seededSiteModule(self, allocator, &site_mod, class);
+                const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
                 const func = try ir.lower.lowerMethod(&sub_ref.cell.data, f, class.name.name, own_members);
                 const fid = func.id;
                 const caps = try allocator.dupe(NameValue, capture_pairs);
@@ -718,7 +704,7 @@ fn lowerAndRegisterMethods(
                     // accessor dispatch exactly like a module class's.
                     const gbody = try rewriteAccessorFieldRefs(allocator, getter.body, p.name.name);
                     const thunk = host_instances.synthThunk(p.name, gbody, getter.return_type, p.is_override);
-                    const sub_ref = try seededSiteModule(self, allocator, &site_mod, class);
+                    const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
                     const fid = func.id;
                     const caps = try allocator.dupe(NameValue, capture_pairs);
@@ -734,7 +720,7 @@ fn lowerAndRegisterMethods(
                     const vp: ast.Ident = if (setter.params.len != 0) setter.params[0] else .{ .name = "value", .span = p.name.span };
                     const sbody = try rewriteAccessorFieldRefs(allocator, setter.body, p.name.name);
                     const thunk = try host_instances.synthSetterThunk(allocator, p.name, vp, sbody, p.is_override);
-                    const sub_ref = try seededSiteModule(self, allocator, &site_mod, class);
+                    const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
                     const fid = func.id;
                     const caps = try allocator.dupe(NameValue, capture_pairs);
@@ -770,7 +756,7 @@ fn lowerAndRegisterMethods(
                         };
                     }
                     thunk.params = tparams;
-                    const sub_ref = try seededSiteModule(self, allocator, &site_mod, class);
+                    const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
                     const fid = func.id;
                     const caps = try allocator.dupe(NameValue, capture_pairs);
@@ -801,7 +787,7 @@ fn lowerAndRegisterMethods(
                         };
                     }
                     thunk.params = tparams;
-                    const sub_ref = try seededSiteModule(self, allocator, &site_mod, class);
+                    const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
                     const fid = func.id;
                     const caps = try allocator.dupe(NameValue, capture_pairs);
@@ -824,7 +810,7 @@ fn lowerAndRegisterMethods(
             .span = blk.span,
         };
         const thunk = host_instances.synthThunk(thunk_name, .{ .Block = blk.* }, null, false);
-        const sub_ref = try seededSiteModule(self, allocator, &site_mod, class);
+        const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
         const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
         const caps = try allocator.dupe(NameValue, capture_pairs);
         const tbl = self.anon_methods.borrowMut();
@@ -893,7 +879,7 @@ pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Clas
                 };
             }
             thunk.params = tparams;
-            const sub_ref = try seededSiteModule(self, allocator, &site_mod, class);
+            const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
             const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, &own_members);
             const tbl = self.anon_methods.borrowMut();
             defer tbl.deinit();

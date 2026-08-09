@@ -1401,40 +1401,6 @@ fn notePropTypeRef(
     try module.registry.class_prop_type_refs.put(.{ .a = c.name.name, .b = prop_name }, lowered);
 }
 
-/// The prop-type table rows for ONE class, callable outside the build walk:
-/// a LOCAL class registers at runtime and never passes the decl walk, so
-/// its method relowering read `data` untyped. Populates the given module's
-/// registry (an anon site module — fresh per registration, so the
-/// simple-name keys cannot pollute another scope).
-pub fn noteLocalClassPropTypes(a: Allocator, module: *Module, c: *const ast.Class) Allocator.Error!void {
-    for (c.primary_params) |*pp| {
-        if (pp.property == null) continue;
-        if (pp.is_vararg) {
-            try module.registry.class_prop_type_heads.put(
-                .{ .a = c.name.name, .b = pp.name.name },
-                varargPropArrayHead(pp.ty.name.name),
-            );
-        } else if (classPropHead(c, &pp.ty)) |head| {
-            try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = pp.name.name }, head);
-            try notePropTypeRef(a, module, c, pp.name.name, &pp.ty);
-        }
-    }
-    for (c.members) |*m| {
-        if (m.* != .Property) continue;
-        const prop = m.Property;
-        if (prop.ty) |*ty| {
-            if (classPropHead(c, ty)) |head| {
-                try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
-                try notePropTypeRef(a, module, c, prop.name.name, ty);
-            }
-        } else if (prop.init) |*init| {
-            if (literalTypeHead(init)) |head| {
-                try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
-            }
-        }
-    }
-}
-
 fn classPropHead(c: *const ast.Class, ty: *const ast.TypeRef) ?[]const u8 {
     // A type written qualified (`BytesHexFormat.Builder`) keeps its dotted
     // path: `name` alone is the last segment, and recording just `Builder`
