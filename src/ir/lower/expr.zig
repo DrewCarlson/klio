@@ -19235,7 +19235,7 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
                 if (b.module.classIdByQualifiedSuffix(qualified)) |ncid| {
                     if (ncid.int() < b.module.classes.items.len) {
                         const ncls = &b.module.classes.items[ncid.int()];
-                        if (!ncls.is_object and !ncls.is_stub and !ncls.is_value and
+                        if (!ncls.is_object and !ncls.is_stub and
                             !ncls.is_abstract and !ncls.is_interface)
                         {
                             const ctor_arity = try ctorArgFnArities(b, ncid, args, ast_arg_names);
