@@ -376,7 +376,13 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             // their own: `val held = row[1]` is `Row.get`'s return type.
             .Member, .Index, .Path => if (!std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_INIT") orelse "1", "0"))
                 try b.setLocalInitExprAt(p.name.name, e, p.name.span),
-            .ObjectExpr => try b.markObjectInitLocal(p.name.name),
+            // Recorded as an init too: a single-supertype literal's denotable
+            // type is that supertype, which the deriver's ObjectExpr arm
+            // answers for the local's reads.
+            .ObjectExpr => {
+                try b.markObjectInitLocal(p.name.name);
+                try b.setLocalInitExprAt(p.name.name, e, p.name.span);
+            },
             else => {},
         }
         // A literal init is definite NON-callable evidence that must also
@@ -495,6 +501,55 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             if (f.params.len != 0) try b.setLocalFnParamTys(mangled, ov_tys);
             if (f.return_type) |*rt| {
                 try b.setLocalFnReturnTy(mangled, try expr_mod.loweredOwnedLocalTypeRef(b, rt));
+            } else if (f.body != null and f.body.? == .Expr) {
+                // An unannotated EXPRESSION body's return derives at the
+                // declaration under the params' declared types, so a
+                // val-init calling the local fn types
+                // (`fun twoDigitNumber(index: Int) = (s[index]-'0')*10+...`
+                // records Int for `val month = twoDigitNumber(i + 1)`).
+                const PSave = struct { name: []const u8, ty: ?ir.TypeRef };
+                var psaves: std.ArrayList(PSave) = .empty;
+                defer {
+                    for (psaves.items) |*sv| {
+                        b.clearLocalDeclType(sv.name);
+                        if (sv.ty) |t| b.setLocalDeclTypeOwned(sv.name, t) catch {};
+                    }
+                    psaves.deinit(b.allocator);
+                }
+                var shadow_ok = true;
+                for (f.params) |*p| {
+                    const prev: ?ir.TypeRef = if (b.localDeclTypeRef(p.name.name)) |t|
+                        t.clone(b.allocator) catch null
+                    else
+                        null;
+                    psaves.append(b.allocator, .{ .name = p.name.name, .ty = prev }) catch {
+                        shadow_ok = false;
+                        break;
+                    };
+                    b.clearLocalDeclType(p.name.name);
+                    const lowered = expr_mod.loweredOwnedLocalTypeRef(b, &p.ty) catch {
+                        shadow_ok = false;
+                        break;
+                    };
+                    b.setLocalDeclTypeOwned(p.name.name, lowered) catch {
+                        shadow_ok = false;
+                        break;
+                    };
+                }
+                if (shadow_ok) {
+                    if (expr_mod.staticExprTypeRef(b, &f.body.?.Expr) catch null) |derived0| {
+                        var derived = derived0;
+                        var h = std.mem.trimEnd(u8, derived.name, "?");
+                        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+                        const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
+                            ir.parseClassTypeParamIdentity(h) != null;
+                        if (h.len != 0 and !bare) {
+                            try b.setLocalFnReturnTy(mangled, derived);
+                        } else {
+                            derived.deinit(b.allocator);
+                        }
+                    }
+                }
             }
             const receiver_ty = if (f.receiver_type) |*source_receiver|
                 try expr_mod.loweredOwnedLocalTypeRef(b, source_receiver)

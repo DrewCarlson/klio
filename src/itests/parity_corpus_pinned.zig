@@ -2458,6 +2458,26 @@ test "bare_call_return_typing" {
     );
 }
 
+test "bare_tp_receiver_lambda_invoke" {
+    // `item.getter()` on a bare-tp property with `getter: T.() -> P` in
+    // scope commits the VALUE (invoke) protocol as kotlinc resolves it —
+    // a runtime class's same-named member must not win the arbitration.
+    try check("bare_tp_receiver_lambda_invoke",
+        \\2
+        \\value
+        \\
+    );
+}
+
+test "ctor_generic_arg_inference" {
+    try check("ctor_generic_arg_inference",
+        \\[a, b]
+        \\1
+        \\4
+        \\
+    );
+}
+
 test "comparator_sibling_expected" {
     try check("comparator_sibling_expected",
         \\bca

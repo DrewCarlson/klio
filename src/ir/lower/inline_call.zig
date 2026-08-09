@@ -546,6 +546,19 @@ pub fn spliceInlineLambdaOn(
         });
         try b.bind(pname, arg_regs[bi]);
         b.clearLocalDeclType(pname);
+        // The literal's OWN annotation is the parameter's type
+        // (`{ index, acc: Number, e -> ... }`): it outranks whatever the
+        // callee's argument expression derives, exactly as kotlinc types an
+        // annotated lambda parameter.
+        if (params.len != 0 and bi < lam.Lambda.param_tys.len) {
+            if (lam.Lambda.param_tys[bi]) |*annotated| {
+                try b.setLocalDeclTypeOwned(
+                    pname,
+                    try expr_lower.loweredOwnedLocalTypeRef(b, annotated),
+                );
+                continue;
+            }
+        }
         const arg_ty: ?ir.TypeRef = arg_tys[bi];
         if (arg_ty) |ty| {
             // A head that is still a bare TYPE PARAMETER names nothing in

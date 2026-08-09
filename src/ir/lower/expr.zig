@@ -9691,16 +9691,31 @@ fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.
     }
     if (call.callee.* != .Path or call.callee.Path.segments.len != 1) return null;
     const ident = call.callee.Path.segments[0];
+    const citr_trace = if (runtime.envOnce("KLIO_CITR_TRACE")) |w| std.mem.eql(u8, w, ident.name) else false;
+    // A LOCAL class registers only at runtime (`RegisterClass` with its
+    // captures): no lowering-time row exists, and the module index would
+    // answer an unrelated same-named class — the resolve() bail below
+    // already catches it (the declaration binds the name), noted here so
+    // the local-class tail is not re-probed as a missed lookup.
     // A local or a function of the same name is not a constructor call.
-    if (b.resolve(ident.name) != null or b.knowsOuter(ident.name)) return null;
-    if (b.module.funcId(ident.name) != null) return null;
+    if (b.resolve(ident.name) != null or b.knowsOuter(ident.name)) {
+        if (citr_trace) std.debug.print("[citr] {s} bail=local_or_outer\n", .{ident.name});
+        return null;
+    }
+    if (b.module.funcId(ident.name) != null) {
+        if (citr_trace) std.debug.print("[citr] {s} bail=func_namesake\n", .{ident.name});
+        return null;
+    }
     // A collision-mangled internal class (`SlotTable$fN`) is absent from the
     // simple-name index. A same-file/package reference reaches it through
     // the scope rename ladder; a cross-package one through its exact import,
     // which still resolves by FQN.
     const ref_name = scopeTypeRename(b, ident.name, ident.span.file.int()) orelse ident.name;
     const cid = b.module.classIdIndexed(ref_name, b.self_package, ident.span.file) orelse
-        b.module.classIdExactImport(ident.name, ident.span.file) orelse return null;
+        b.module.classIdExactImport(ident.name, ident.span.file) orelse {
+        if (citr_trace) std.debug.print("[citr] {s} bail=no_class ref_name={s}\n", .{ ident.name, ref_name });
+        return null;
+    };
     // A MEMBER of the enclosing receiver shadows the constructor, exactly as
     // the emission router decides it (`fun Foo(): Bar` inside Host makes a
     // bare `Foo()` the member call). Typing the local as the class here bound
@@ -9711,10 +9726,65 @@ fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.
     // An object is not constructed; a stub or value class has no instance
     // identity for a member call to bind against.
     if (class.is_object or class.is_stub or class.is_value) return null;
-    const args = try b.allocator.alloc(ir.TypeRef, call.type_args.len);
+    var args = try b.allocator.alloc(ir.TypeRef, call.type_args.len);
     errdefer b.allocator.free(args);
     for (call.type_args, args) |*ty, *out| {
         out.* = try decl_mod.loweredTypeRef(b.allocator, ty, true);
+    }
+    // With no explicit `<...>`, a generic class's arguments infer from the
+    // CONSTRUCTOR arguments (kotlinc's inference): a primary param declared
+    // bare `E` takes its argument's own type; one declared `X<..., E, ...>`
+    // takes the argument's type argument at that position when the arities
+    // line up. Every class parameter must bind or the head-only refusal
+    // below stands.
+    if (args.len == 0 and class.type_params.len != 0 and call.args.len != 0) infer: {
+        const inferred = try b.allocator.alloc(ir.TypeRef, class.type_params.len);
+        var got: usize = 0;
+        var ok = true;
+        defer if (!ok) {
+            for (inferred[0..got]) |*t| t.deinit(b.allocator);
+            b.allocator.free(inferred);
+        };
+        for (class.type_params) |tp| {
+            var bound: ?ir.TypeRef = null;
+            params: for (class.primary_params, 0..) |*p, pi| {
+                if (pi >= call.args.len) break;
+                const pt = p.ty;
+                if (std.mem.eql(u8, std.mem.trimEnd(u8, pt.name, "?"), tp)) {
+                    bound = try staticExprTypeRef(b, &call.args[pi]);
+                    break :params;
+                }
+                for (pt.args, 0..) |pa, ai| {
+                    var an = std.mem.trimEnd(u8, pa.name, "?");
+                    if (std.mem.startsWith(u8, an, "in#")) an = an[3..];
+                    if (std.mem.startsWith(u8, an, "out#")) an = an[4..];
+                    if (!std.mem.eql(u8, an, tp)) continue;
+                    var at = (try staticExprTypeRef(b, &call.args[pi])) orelse continue :params;
+                    defer at.deinit(b.allocator);
+                    if (at.args.len == pt.args.len and ai < at.args.len) {
+                        bound = try at.args[ai].clone(b.allocator);
+                    }
+                    break :params;
+                }
+            }
+            var bt = bound orelse {
+                ok = false;
+                break :infer;
+            };
+            var bh = std.mem.trimEnd(u8, bt.name, "?");
+            if (std.mem.indexOfScalar(u8, bh, '<')) |lt| bh = bh[0..lt];
+            const bare_tp = (bh.len > 0 and bh.len <= 2 and std.ascii.isUpper(bh[0])) or
+                b.isTypeParam(bh) or ir.parseClassTypeParamIdentity(bh) != null;
+            if (bh.len == 0 or bare_tp) {
+                bt.deinit(b.allocator);
+                ok = false;
+                break :infer;
+            }
+            inferred[got] = bt;
+            got += 1;
+        }
+        b.allocator.free(args);
+        args = inferred;
     }
     var derived = ir.TypeRef{
         .name = try b.allocator.dupe(u8, class.fqn),
@@ -9962,6 +10032,23 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
         .As => |cast| {
             var out = try decl_mod.loweredTypeRef(b.allocator, &cast.ty, true);
             if (cast.safe) out.nullable = true;
+            return out;
+        },
+        // An object EXPRESSION with a single supertype has that supertype
+        // as its denotable static type (kotlinc: `object : List<String> by
+        // coll {}` is a List<String> everywhere outside the literal). More
+        // than one supertype is the anonymous intersection — refused.
+        .ObjectExpr => |obj| {
+            if (obj.supertypes.len != 1) break :self_named;
+            var out = try decl_mod.loweredTypeRef(b.allocator, &obj.supertypes[0], true);
+            var h = std.mem.trimEnd(u8, out.name, "?");
+            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
+                ir.parseClassTypeParamIdentity(h) != null;
+            if (h.len == 0 or bare) {
+                out.deinit(b.allocator);
+                break :self_named;
+            }
             return out;
         },
         // `this` (or `this@Outer`) inside a class body, an extension body,
@@ -10478,7 +10565,9 @@ fn staticCallReturnTypeRef(
         var inferred_receiver: ?ir.TypeRef = null;
         defer if (inferred_receiver) |*ty| ty.deinit(b.allocator);
         const receiver = argDeclTypeRefLazy(b, bin.lhs) orelse blk: {
-            inferred_receiver = try staticCallReturnTypeRef(b, bin.lhs);
+            // The FULL deriver, not the call-return subset: an Index lhs
+            // (`s[index] - '0'`) types through the element arm only there.
+            inferred_receiver = try staticExprTypeRef(b, bin.lhs);
             break :blk inferred_receiver orelse return null;
         };
         if (isPrimitiveTypeName(typeHead(receiver.name))) {
@@ -11369,12 +11458,20 @@ fn primitiveBinResultHead(b: *FuncBuilder, lhs_head: []const u8, bin: anytype) ?
     }
     if (std.mem.eql(u8, lhs_head, "String"))
         return if (bin.op == .Add) "String" else null;
+    if (std.mem.eql(u8, lhs_head, "Char")) {
+        const rh = binOperandHead(b, bin.rhs) orelse return null;
+        // kotlinc's Char arithmetic: Char - Char = Int; Char +/- Int = Char.
+        if (bin.op == .Sub and std.mem.eql(u8, rh, "Char")) return "Int";
+        if ((bin.op == .Add or bin.op == .Sub) and std.mem.eql(u8, rh, "Int")) return "Char";
+        return null;
+    }
     const rhs_head = binOperandHead(b, bin.rhs) orelse return null;
     return numericPromoteHead(lhs_head, rhs_head);
 }
 
 fn binOperandHead(b: *FuncBuilder, e: *const Expr) ?[]const u8 {
     switch (e.*) {
+        .CharLit => return "Char",
         .IntLit => |il| return switch (il.kind) {
             .Long => "Long",
             .UInt => "UInt",
@@ -11879,6 +11976,32 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
 
 /// Whether the enclosing class scope (own members, outer-class members, or
 /// the supertype hierarchy) declares a member named `name`.
+/// Whether the enclosing class declares primary-ctor property `rn` with a
+/// declared type that is a BARE class type parameter (`val expected: T` on
+/// `CompareContext<out T>`). Such a receiver's member surface is the
+/// parameter's bound; an in-scope receiver-taking callable of the called
+/// name is what kotlinc commits.
+fn enclosingPropertyBareTp(b: *FuncBuilder, rn: []const u8) bool {
+    const owner = b.ownerClass() orelse return false;
+    const cid = (if (std.mem.indexOfScalar(u8, owner, '.') != null)
+        b.module.classIdByFqn(owner)
+    else
+        b.module.classId(owner)) orelse return false;
+    if (cid.int() >= b.module.classes.items.len) return false;
+    const class = &b.module.classes.items[cid.int()];
+    for (class.primary_params) |*p| {
+        if (!std.mem.eql(u8, p.name, rn)) continue;
+        var h = std.mem.trimEnd(u8, p.ty.name, "?");
+        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+        if (ir.parseClassTypeParamIdentity(h) != null) return true;
+        for (class.type_params) |tp| {
+            if (std.mem.eql(u8, h, tp)) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 fn enclosingHasMemberNamed(b: *FuncBuilder, name: []const u8) bool {
     if (b.hasOwnMember(name) or b.hasEnclosingMember(name)) return true;
     const oc = b.ownerClass() orelse return false;
@@ -16252,6 +16375,23 @@ fn lowerResolvedMemberCall(
             lmNote(.bound_static);
             return .none;
         }
+        // `expected.getter()` — the callee is a RECEIVER-TAKING callable
+        // VALUE in scope (`getter: T.() -> P`) and the receiver's declared
+        // type is a bare type parameter: kotlinc resolves against the
+        // parameter's bound, finds no member, and commits the value
+        // (invoke) protocol. There is no class slot to bind BY DESIGN —
+        // the same census category as a function-typed receiver; the
+        // member-emission arm below commits `CallValueWithThis`.
+        if ((b.resolve(name.name) != null or b.knowsOuter(name.name)) and
+            (b.isReceiverLambdaParam(name.name) or b.isLocalExtFn(name.name) or
+                b.localDeclRecvFn(name.name)) and
+            receiver.* == .Path and receiver.Path.segments.len == 1 and
+            (b.isErasedRecvParam(receiver.Path.segments[0].name) or
+                enclosingPropertyBareTp(b, receiver.Path.segments[0].name)))
+        {
+            lmNote(.dynamic_by_design);
+            return .none;
+        }
         lmNote(.no_receiver_type);
         if (!norecvCensusOn()) return .none;
         lm_norecv[@intFromEnum(std.meta.activeTag(receiver.*))] += 1;
@@ -17699,7 +17839,8 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         // in-scope callable is the only candidate Kotlin ever had.
         const recv_erased = receiver.* == .Path and
             receiver.Path.segments.len == 1 and
-            b.isErasedRecvParam(receiver.Path.segments[0].name);
+            (b.isErasedRecvParam(receiver.Path.segments[0].name) or
+                enclosingPropertyBareTp(b, receiver.Path.segments[0].name));
         const callable_takes_receiver = b.isReceiverLambdaParam(name.name) or
             b.isLocalExtFn(name.name) or b.localDeclRecvFn(name.name);
         const callable_shape_known = callable_takes_receiver or
