@@ -6658,3 +6658,20 @@ the wrong Iterator record (the param_rep instantiation link), the
 onEachIndexed tower variant, the interceptor KEY solve, and one
 a-compareTo variant. The census 31 is census-set-dominated
 (TestCollection seven, takeLastWhile pair, Index, the chains).
+
+### 31 -> 29: the pair, and the full-record listOf
+
+`listOf("foo", "bar")` derives `List<String>` (the sole-vararg arm
+re-landed SAFELY: every argument must derive one concrete non-null
+head, so the record is complete — the reverted head-only variant broke
+user extensions by dropping the arguments; both canaries verified
+green). On top of it, a bare member call on the implicit window
+instantiates through the FULL receiver (`listIterator(size)` ->
+`ListIterator<String>` inside the dropLastWhile splice) and the
+top-level-namesake bail drops where the receiver's class declares the
+member. The takeLastWhile/dropLastWhile pair binds end to end.
+
+Standing 29. Census-set remainder: the TestCollection seven
+(KLIO_ANON_BASE), Index 1, the chunked/minOf/maxOf/lowercase/isEmpty
+chains, and the four residents (flatten param_rep variant, entries
+tower variant, interceptor KEY solve, one a-compareTo variant).
