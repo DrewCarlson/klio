@@ -6512,3 +6512,48 @@ the local-class family (KLIO_ANON_BASE affordability — runtime lowering
 needs scratch-arena discipline first), the iterator-protocol /
 member_ladder walk residue, and task-15's calling-convention
 unification (the bytecode-vm plan's opening prerequisite).
+
+### The grind reaches 40, with one more parity bug fixed on the way
+
+67 -> 40 across the continuation, every commit gated (sweep 117/0,
+units, examples 279/291 baseline; flaked chain runs re-verified
+standalone before judging). Beyond the earlier entries:
+
+- The Any members' fixed returns; the enricher's block-local +
+  enclosing-scope + derived-init seeds; the scope-function deriver arm
+  (kotlin-package candidate gate, own depth bound) — the run-block and
+  .let chains (pow, bytesInLastLine, groupSeparators pair).
+- Const-expression top-level property heads + the deriver's top-level
+  property arm (DAYS_PER_CYCLE / DAYS_0000_TO_1970 -> the whole
+  fromInstant run-block).
+- Companion ctor-evidence heads (LongParser.iso/.default) and the
+  GENERAL property-read arm: a property read on ANY receiver the
+  deriver types answers the recorded declared type with owner params
+  substituted (this@Duration.absoluteValue).
+- PARITY FIX: the MEMBER form now discriminates a return-variant family
+  by the trailing lambda's derived return — `a.sumOf { it.size.toLong() }`
+  on a typed receiver had reached the runtime re-pick, which ran the
+  DOUBLE variant (3.0 where kotlinc prints 3; the Double overload sorts
+  first in declaration order and a closure value carries no return type
+  to re-rank by). The pick takes the declared receiver's head and the
+  member form's receiver EXPRESSION for the element binding; variance
+  mangles strip in the element channel. Pinned in
+  lambda_return_overload_pick. The residual hazard is recorded: ANY
+  return-variant tie that still reaches the runtime re-pick resolves
+  first-declared, not by return — the static picks are the only sound
+  fix, so every remaining dynamic sumOf-shaped site is also a latent
+  parity site.
+- Exact argument-head discrimination in the bare-call return channel
+  (getProgressionLastElement Int/Long triples).
+- A member-read initializer on a sized builtin container states Int
+  (RingBuffer.capacity = buffer.size).
+
+Remaining residents at 40, by name: `.size` in the stdlib flatten
+(implicit-this bare sumOf — the pick's implicit-this element binding),
+captured comp/result/isoString (the capture-boundary trio the snapshot
+pre-derive does not reach — likely var reassignment or class-body
+captures), step (SequenceBuilder), interceptor (Intrinsics),
+a-compareTo (TextActuals lambda param), entries/onEachIndexed
+(transitive fn-tp binding); census-set: the TestCollection local-class
+7 (KLIO_ANON_BASE affordability), takeLastWhile/dropLastWhile pair,
+Postfix 2, Index 1, the chunked/minOf/maxOf/lowercase/isEmpty chains.
