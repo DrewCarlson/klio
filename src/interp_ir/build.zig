@@ -2196,6 +2196,11 @@ fn buildModuleWithOverrides(
                     } else if (cprop.init) |*init| {
                         if (literalTypeHead(init)) |head| {
                             try module.registry.class_prop_type_heads.put(.{ .a = ckey, .b = cprop.name.name }, head);
+                        } else if (propCtorHeadEvidence(cprop, decls)) |head| {
+                            // `val iso = LongParser(MAX_MILLIS, allowSign = true)`
+                            // inside LongParser's own companion states the head
+                            // exactly as a top-level object's would.
+                            try module.registry.class_prop_type_heads.put(.{ .a = ckey, .b = cprop.name.name }, head);
                         }
                     }
                 }

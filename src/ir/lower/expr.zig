@@ -10276,10 +10276,40 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
         .Member => |m| {
             if (m.safe) break :self_named;
             const recv_p = m.receiver;
-            if (recv_p.* != .Path or recv_p.Path.segments.len != 1) break :self_named;
+            if (recv_p.* != .Path or recv_p.Path.segments.len != 1 or
+                b.resolve(recv_p.Path.segments[0].name) != null or
+                b.knowsOuter(recv_p.Path.segments[0].name) or
+                b.module.uniqueClassIdBySimpleName(recv_p.Path.segments[0].name) == null)
+            {
+                // Not a class-named read: a PROPERTY READ on any receiver
+                // the deriver can type answers the property's recorded
+                // declared type (`this@Duration.absoluteValue`), with the
+                // owner's parameters substituted from the receiver's own
+                // arguments where both sides carry them.
+                if (od_depth >= 3) break :self_named;
+                od_depth += 1;
+                const recv_owned = staticExprTypeRef(b, m.receiver) catch null;
+                od_depth -= 1;
+                var rt = recv_owned orelse break :self_named;
+                defer rt.deinit(b.allocator);
+                var rh = std.mem.trimEnd(u8, rt.name, "?");
+                if (std.mem.indexOfScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
+                const head = typeHead(rh);
+                if (head.len == 0) break :self_named;
+                if (propTypeRefOn(b, head, m.name.name)) |declared| {
+                    if (substitutedPropType(b, head, rt, declared)) |sub| {
+                        return try sub.clone(b.allocator);
+                    }
+                }
+                if (b.module.registry.class_prop_type_heads.get(.{ .a = head, .b = m.name.name })) |ph| {
+                    const phh = typeHead(std.mem.trimEnd(u8, ph, "?"));
+                    if (phh.len > 2 and ir.parseClassTypeParamIdentity(phh) == null and !b.isTypeParam(phh)) {
+                        return .{ .name = try b.allocator.dupe(u8, ph), .nullable = false, .args = &.{} };
+                    }
+                }
+                break :self_named;
+            }
             const cls = recv_p.Path.segments[0].name;
-            if (b.resolve(cls) != null or b.knowsOuter(cls)) break :self_named;
-            if (b.module.uniqueClassIdBySimpleName(cls) == null) break :self_named;
             var qbuf: [192]u8 = undefined;
             if (std.fmt.bufPrint(&qbuf, "{s}.{s}", .{ cls, m.name.name })) |qual| {
                 if (b.module.classIdByQualifiedSuffix(qual) != null) {
