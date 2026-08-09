@@ -302,6 +302,8 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
             if (module.pending_lambda_param_types) |pt| pt.len else null,
         });
     }
+    b.own_recv_known_none = module.pending_lambda_no_receiver;
+    module.pending_lambda_no_receiver = false;
     if (module.pending_lambda_local_decl_types) |*locals| {
         try b.inheritLocalDeclTypes(locals);
         var owned = locals.*;

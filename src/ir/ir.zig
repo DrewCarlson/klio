@@ -1646,6 +1646,11 @@ pub const Module = struct {
     /// (last bind wins), so a self re-invoke captured by name (the compose
     /// restart lambda) would run the SIBLING. Not serialized.
     pending_lambda_self_fn: ?SelfLocalFn = null,
+    /// The next lambda body's declared shape is KNOWN to take no receiver
+    /// (a plain `(T) -> R` slot): its bare calls may consult the enclosing
+    /// receiver tier, exactly Kotlin's implicit-receiver chain. A lambda
+    /// whose receiver is merely UNTYPED must not (the ArrayDeque hazard).
+    pending_lambda_no_receiver: bool = false,
     /// Names of enclosing-scope locals with definite NON-callable evidence
     /// (literal init / primitive declared type), carried into the lambda body
     /// about to lower so a bare CALL there does not route through the captured
@@ -3909,6 +3914,13 @@ pub const Module = struct {
     ) StaticCompatibility {
         sac_route = "-";
         const declared = staticTypeHead(param.name);
+        // A `*` in the PARAM position is the deriver's own erasure product
+        // (an unbound class param star-projected by the receiver record);
+        // it proves nothing and must not refute.
+        if (std.mem.eql(u8, declared, "*")) {
+            sac_route = "star-neutral";
+            return .unknown;
+        }
         if (overrideQualifiedPath(param) == null and
             self.funcTypeParamIndex(fid, declared) != null)
         {
@@ -4120,6 +4132,21 @@ pub const Module = struct {
             // argument and the file-private Boolean extension binds. User
             // classes stay unknown (a fun-interface SAM target).
             if (nonCallableBuiltinHead(head)) return .incompatible;
+            // A resolvable NON-fun-interface class param is a definite
+            // refutation too: a lambda converts only to a function type or
+            // a fun interface (`propertyEquals(property: KProperty1<..>)`
+            // drops for a lambda argument; its getter sibling binds).
+            if (std.c.getenv("KLIO_LAMBDA_REFUTE") == null or
+                !std.mem.eql(u8, std.mem.span(std.c.getenv("KLIO_LAMBDA_REFUTE").?), "0"))
+            {
+                if (self.staticTypeClassId(.{ .name = head, .nullable = false, .args = &.{} })) |pcid| {
+                    if (pcid.int() < self.classes.items.len and
+                        !self.classes.items[pcid.int()].is_fun_interface)
+                    {
+                        return .incompatible;
+                    }
+                }
+            }
             return .unknown;
         }
         return .unknown;
@@ -10006,11 +10033,21 @@ pub const Module = struct {
         caller_pkg: []const u8,
         caller_file: FileId,
     ) ?[]const u8 {
-        const list = self.registry.top_level_prop_pkgs.get(name) orelse return null;
+        const list = self.registry.top_level_prop_pkgs.get(name) orelse {
+            if (std.c.getenv("KLIO_TLP_TRACE")) |w| {
+                if (std.mem.eql(u8, std.mem.span(w), name))
+                    std.debug.print("[tlp] {s} NO-LIST caller_pkg={s}\n", .{ name, caller_pkg });
+            }
+            return null;
+        };
         var best_tier: u8 = 255;
         var found: ?[]const u8 = null;
         for (list.items) |pd| {
             const t = self.scopeTier(pd.fqn, pd.package, name, caller_pkg, caller_file);
+            if (std.c.getenv("KLIO_TLP_TRACE")) |w| {
+                if (std.mem.eql(u8, std.mem.span(w), name))
+                    std.debug.print("[tlp] {s} fqn={s} pkg={s} tier={d} head={s} caller_pkg={s}\n", .{ name, pd.fqn, pd.package, t, self.registry.top_level_prop_type_heads.get(pd.fqn) orelse "-", caller_pkg });
+            }
             if (t == 255) continue;
             const h = self.registry.top_level_prop_type_heads.get(pd.fqn);
             if (t < best_tier) {
@@ -10362,6 +10399,17 @@ pub const Module = struct {
             self.classIdByFqn(sub)
         else
             self.uniqueClassIdBySimpleName(staticTypeHead(sub));
+        // A ROW-LESS sub with a registered name chain (a local class's
+        // lowering-time typing record) answers through it even when the
+        // SUPER resolves a class id.
+        if (sub_id == null) {
+            if (self.registry.class_super_names.get(staticTypeHead(sub))) |supers| {
+                const sup_simple = applicability.simpleName(staticTypeHead(super_name));
+                for (supers) |s2| {
+                    if (std.mem.eql(u8, applicability.simpleName(staticTypeHead(s2)), sup_simple)) return true;
+                }
+            }
+        }
         const super_id = if (std.mem.indexOfScalar(u8, super_name, '.') != null)
             self.classIdByFqn(super_name)
         else
@@ -10652,6 +10700,12 @@ pub const ModuleRegistry = struct {
     /// `Foo.X` fall through to the companion instance when `X` is
     /// not a member of `Foo` itself.
     companion_singletons: std.StringHashMap([]const u8),
+    /// Fqns whose installed HOST BINDING is authoritative over any
+    /// interpreted body (a pack's stub declarations — atomicfu's atomics).
+    /// Populated at bindings install from the non-stdlib overlay keys; a
+    /// static member bind must not commit a BODY-BEARING target listed
+    /// here — the runtime walk's binding preference arbitrates instead.
+    host_shadowed_fqns: std.StringHashMap(void),
     /// Inner class → outer class name. Resolves `this@Outer` and
     /// outer-chain field reads for nested classes lifted to top level.
     enclosing_class: std.StringHashMap([]const u8),
@@ -10931,6 +10985,7 @@ pub const ModuleRegistry = struct {
     pub fn init(allocator: Allocator) ModuleRegistry {
         return .{
             .companion_singletons = std.StringHashMap([]const u8).init(allocator),
+            .host_shadowed_fqns = std.StringHashMap(void).init(allocator),
             .enclosing_class = std.StringHashMap([]const u8).init(allocator),
             .func_type_params = std.AutoHashMap(FuncId, std.ArrayList([]const u8)).init(allocator),
             .func_type_param_bounds = std.AutoHashMap(FuncId, []const TypeParamBound).init(allocator),
@@ -11022,6 +11077,7 @@ pub const ModuleRegistry = struct {
             self.member_method_fids.deinit();
         }
         self.class_member_names.deinit();
+        self.host_shadowed_fqns.deinit();
         {
             var it = self.class_super_names.valueIterator();
             while (it.next()) |names| a.free(names.*);
@@ -11111,6 +11167,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.companion_singletons.iterator();
             while (it.next()) |e| try out.companion_singletons.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.host_shadowed_fqns.iterator();
+            while (it.next()) |e| try out.host_shadowed_fqns.put(e.key_ptr.*, {});
         }
         {
             var it = self.enclosing_class.iterator();

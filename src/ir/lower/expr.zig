@@ -3192,6 +3192,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         recorded_recv != null or eager_shape != null;
     const lambda_has_receiver = receiver_head != null or
         (eager_shape != null and eager_shape.?.has_receiver);
+    b.module.pending_lambda_no_receiver = lambda_receiver_shape_known and !lambda_has_receiver;
     // Consume the per-argument expected lambda arity set by the call
     // lowering for this argument slot before the body recurses (which
     // re-arms it for the body's own nested calls).
@@ -6625,6 +6626,59 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 // bound receiver's members first (identical to the pin when
                 // `this` IS the owner), then each enclosing receiver.
                 if (b.resolve("this")) |bound_this| {
+                    // The PROVEN leg resolves statically: the chain's head
+                    // class declares the member, so the call binds its
+                    // virtual slot instead of walking per invocation
+                    // (`propertyEquals { ... }` inside a spliced
+                    // `(object {}).let` ran the walk 200 times per suite).
+                    // Sound only when NO enclosing receiver could shadow:
+                    // the chain must be exactly the bound receiver. With
+                    // outer receivers in scope the walking form arbitrates
+                    // (the atomicfu mutex splice livelocked when pinned).
+                    if (member_of_recv and ast_type_args.len == 0 and
+                        recv_chain.?.len == 1 and
+                        runtime.envOnce("KLIO_SPLICE_PIN") == null and
+                        allNull(ast_arg_names)) pin: {
+                        const chain0 = recv_chain.?[0];
+                        const pin_cid = (if (std.mem.indexOfScalar(u8, chain0, '.') != null)
+                            b.module.classIdByFqn(chain0)
+                        else
+                            b.module.uniqueClassIdBySimpleName(chain0)) orelse break :pin;
+                        var shape_set = try buildStaticReturnArgShapes(b, args, ast_arg_names);
+                        defer shape_set.deinit(b.allocator);
+                        const pin_recv_ref: ir.TypeRef = .{ .name = chain0, .nullable = false, .args = &.{} };
+                        const resolved = b.module.resolveMemberCall(pin_cid, nm, shape_set.shapes, .{
+                            .caller_file = callee.Path.segments[0].span.file,
+                            .lexical_owner = null,
+                            .actual_type_param_bounds = &.{},
+                            .receiver_type = pin_recv_ref,
+                        });
+                        const target = resolved.target orelse break :pin;
+                        const tf = b.module.funcById(target) orelse break :pin;
+                        if (!tf.hasBody()) break :pin;
+                        // A member in a stdlib/pack package may be shadowed
+                        // by a HOST binding the lowering cannot see
+                        // (atomicfu's ReentrantLock.unlock stub deadlocked
+                        // when its interpreted body was pinned). Pin only
+                        // program-owned declarations.
+                        const shipped_pkg = std.mem.eql(u8, tf.package, "kotlin") or
+                            std.mem.startsWith(u8, tf.package, "kotlin.") or
+                            std.mem.startsWith(u8, tf.package, "kotlinx.") or
+                            std.mem.startsWith(u8, tf.package, "androidx.") or
+                            std.mem.startsWith(u8, tf.package, "io.ktor");
+                        if (shipped_pkg) break :pin;
+                        const run = try lowerArgRun(b, args);
+                        const dst = b.allocReg();
+                        orEmitAudit(b, "inline_splice_recv_pin", "CallVirtual", nm);
+                        try b.push(.{ .CallVirtual = .{
+                            .dst = dst,
+                            .receiver = bound_this,
+                            .slot = ir.MethodSlotId.fromFunc(target),
+                            .args = run[0],
+                            .n_args = run[1],
+                        } });
+                        return dst;
+                    }
                     const run = try lowerArgRun(b, args);
                     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
                     const dst = b.allocReg();
@@ -9103,7 +9157,13 @@ fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             // `minOrNull` on Array/List/Sequence resolves to target=null and
             // falls to runtime dispatch, which picks the IEEE overload and
             // returns NaN where 0.0 is correct.
-            if (headDeclaresTypeParams(b, th.name)) {
+            const th_head = typeHead(std.mem.trimEnd(u8, th.name, "?"));
+            const bare_tp_head = (th_head.len > 0 and th_head.len <= 2 and std.ascii.isUpper(th_head[0])) or
+                b.isTypeParam(th_head) or ir.parseClassTypeParamIdentity(th_head) != null;
+            if (headDeclaresTypeParams(b, th.name) or bare_tp_head) {
+                // A bare TYPE-PARAMETER answer (`expected: T` read on a
+                // typed receiver) blocks the substituting deriver behind
+                // it, which would answer the instantiated type.
                 if (typeheadAuditOn()) {
                     const sp = arg.span();
                     std.debug.print("[TYPEHEAD-SKIP] f{d}:{d} generic head {s} has no args\n", .{ sp.file.int(), sp.start, th.name });
@@ -9856,6 +9916,18 @@ fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.
     // answer an unrelated same-named class — the resolve() bail below
     // already catches it (the declaration binds the name), noted here so
     // the local-class tail is not re-probed as a missed lookup.
+    // A LOCAL CLASS constructor call: the lowering-time typing record's
+    // mangled head (its registered supertype chain proves extension
+    // applicability; the runtime RegisterClass binding stays the ctor).
+    if (build.isLocalClassInScope(ident.name)) {
+        var lc_buf: [160]u8 = undefined;
+        if (std.fmt.bufPrint(&lc_buf, "{s}$lc{s}", .{ ident.name, build.currentRealFn() orelse "" }) catch null) |key| {
+            if (b.module.registry.class_super_names.get(key) != null) {
+                if (citr_trace) std.debug.print("[citr] {s} local-class head {s}\n", .{ ident.name, key });
+                return .{ .name = try b.allocator.dupe(u8, key), .nullable = false, .args = &.{} };
+            }
+        }
+    }
     // A local or a function of the same name is not a constructor call.
     if (b.resolve(ident.name) != null or b.knowsOuter(ident.name)) {
         if (citr_trace) std.debug.print("[citr] {s} bail=local_or_outer\n", .{ident.name});
@@ -10201,7 +10273,53 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
         .StringTemplate => return .{ .name = try b.allocator.dupe(u8, "String"), .nullable = false, .args = &.{} },
         else => {},
     }
-    if (argDeclTypeRef(b, e)) |known| return try known.clone(b.allocator);
+    if (argDeclTypeRef(b, e)) |known| {
+        // A bare TYPE-PARAMETER answer for an implicit property read
+        // (`expected: T` on a `Ctx<Map<K, V>>` receiver) substitutes the
+        // receiver's instantiation instead of stopping at `T`.
+        const kh = typeHead(std.mem.trimEnd(u8, known.name, "?"));
+        const bare_k = (kh.len > 0 and kh.len <= 2 and std.ascii.isUpper(kh[0])) or
+            b.isTypeParam(kh) or ir.parseClassTypeParamIdentity(kh) != null;
+        if (bare_k and e.* == .Path and e.Path.segments.len == 1) {
+            const nm2 = e.Path.segments[0].name;
+            if (runtime.envOnce("KLIO_IMPLPROP_TRACE")) |w| {
+                if (std.mem.eql(u8, w, nm2))
+                    std.debug.print("[implprop-bare] {s} known={s} rtref={} rt_args={d}\n", .{ nm2, known.name, b.recvTypeRef() != null, if (b.recvTypeRef()) |r| r.args.len else 0 });
+            }
+            if (b.recvTypeRef()) |rt| sub_head: {
+                const rh = typeHead(std.mem.trimEnd(u8, rt.name, "?"));
+                const declared: ir.TypeRef = propTypeRefOn(b, rh, nm2) orelse blk2: {
+                    const head = b.module.registry.class_prop_type_heads.get(.{ .a = rh, .b = nm2 }) orelse break :sub_head;
+                    break :blk2 .{ .name = head, .nullable = false, .args = &.{} };
+                };
+                const dh = typeHead(std.mem.trimEnd(u8, declared.name, "?"));
+                // The declared type IS the owner's parameter: map it by
+                // position under the receiver's instantiation.
+                if (bareTypeParamHead(dh) and declared.args.len == 0) {
+                    const cid = (b.module.uniqueClassIdBySimpleName(rh) orelse
+                        b.module.classIdByFqn(rh)) orelse break :sub_head;
+                    if (cid.int() >= b.module.classes.items.len) break :sub_head;
+                    const tps = b.module.classes.items[cid.int()].type_params;
+                    if (tps.len != rt.args.len) break :sub_head;
+                    for (tps, 0..) |tp, j| {
+                        if (!std.mem.eql(u8, tp, dh)) continue;
+                        const sub = rt.args[j];
+                        const sh = typeHead(std.mem.trimEnd(u8, sub.name, "?"));
+                        if (sh.len == 0 or std.mem.eql(u8, sh, "*") or
+                            bareTypeParamHead(sh)) break :sub_head;
+                        var out = try sub.clone(b.allocator);
+                        out.nullable = out.nullable or declared.nullable;
+                        return out;
+                    }
+                    break :sub_head;
+                }
+                if (substitutedPropType(b, rh, rt, declared)) |sub| {
+                    return try sub.clone(b.allocator);
+                }
+            }
+        }
+        return try known.clone(b.allocator);
+    }
     if (try ctorInitTypeRef(b, e)) |t| return t;
     if (try staticCallReturnTypeRef(b, e)) |t| return t;
     // `lhs ?: <jump>` carries the lhs type made NON-null: `val clause =
@@ -10236,6 +10354,12 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
         // coll {}` is a List<String> everywhere outside the literal). More
         // than one supertype is the anonymous intersection — refused.
         .ObjectExpr => |obj| {
+            // A bare `object {}` with no supertype: its denotable type
+            // outside the literal is `Any` (the marker-object idiom —
+            // `(object {}).let { ... }` must splice like any receiver).
+            if (obj.supertypes.len == 0) {
+                return .{ .name = try b.allocator.dupe(u8, "Any"), .nullable = false, .args = &.{} };
+            }
             if (obj.supertypes.len != 1) break :self_named;
             var out = try decl_mod.loweredTypeRef(b.allocator, &obj.supertypes[0], true);
             var h = std.mem.trimEnd(u8, out.name, "?");
@@ -10361,6 +10485,10 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
         .Path => |p| {
             if (p.segments.len != 1) break :self_named;
             const nm = p.segments[0].name;
+            if (runtime.envOnce("KLIO_IMPLPROP_TRACE")) |w| {
+                if (std.mem.eql(u8, w, nm))
+                    std.debug.print("[implprop-guard] {s} resolve={} localfn={} outer={}\n", .{ nm, b.resolve(nm) != null, b.isLocalFn(nm), b.knowsOuter(nm) });
+            }
             if (b.resolve(nm) != null or b.isLocalFn(nm) or b.knowsOuter(nm)) break :self_named;
             if (b.ownerClass()) |owner| {
                 // The full-ref table records only arg-carrying declared
@@ -10415,8 +10543,16 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
                             hh = typeHead(std.mem.trimEnd(u8, tpb2.bound, "?"));
                         } else if (!(b.isTypeParam(hh2) or (hh2.len > 0 and hh2.len <= 2 and std.ascii.isUpper(hh2[0])))) {
                             hh = hh2;
-                        } else break :impl;
-                    } else break :impl;
+                        } else {
+                            hh = implBoundScan(b, nm) orelse break :impl;
+                        }
+                    } else {
+                        // The window's head names a param with no recorded
+                        // bound at all: the UNIQUE in-scope bound whose
+                        // class declares the property is the receiver
+                        // (`entries` under `M : Map<out K, V>`).
+                        hh = implBoundScan(b, nm) orelse break :impl;
+                    }
                 }
                 if (propTypeRefOn(b, hh, nm)) |declared| {
                     if (bound_full) |br| {
@@ -11340,7 +11476,7 @@ fn staticCallReturnTypeRef(
         };
         var dispatch_receiver = try staticDispatchReceiverTypeRef(b, target, recv_owned, idx.span.file);
         defer if (dispatch_receiver) |*ty| ty.deinit(b.allocator);
-        return try b.module.instantiatedCallReturnType(
+        const idx_ret = try b.module.instantiatedCallReturnType(
             b.allocator,
             target,
             recv_owned,
@@ -11348,6 +11484,8 @@ fn staticCallReturnTypeRef(
             shape_set.shapes,
             &.{},
         );
+        if (opty_trace) std.debug.print("[opty] recv={s} get -> {s}\n", .{ identity, if (idx_ret) |r| r.name else "<null>" });
+        return idx_ret;
     }
     if (call_expr.* != .Call) return null;
     // A DIRECT constructor expression names its own type
@@ -12503,6 +12641,154 @@ pub fn extensionNullaryReturnTypeRef(
     return agreed;
 }
 
+/// The trailing lambda's derived RETURN under concrete input param types —
+/// a census-quiet probe. Serves the RECORDER-level star patch only: it
+/// never feeds overload shapes (the shape-level variant measured
+/// net-negative and is recorded as such in the plan).
+fn lambdaReturnUnderParams(
+    b: *FuncBuilder,
+    lam_expr: *const Expr,
+    in_tys: []const ir.TypeRef,
+) Allocator.Error!?ir.TypeRef {
+    if (lam_expr.* != .Lambda) return null;
+    const lam = lam_expr.Lambda;
+    const stmts = lam.body.stmts;
+    if (stmts.len == 0 or stmts[stmts.len - 1] != .Expr) return null;
+    if (od_depth >= 4) return null;
+    var nb = try FuncBuilder.init(b.allocator, b.module);
+    nb.census_quiet = true;
+    defer nb.deinit();
+    {
+        var dit = b.local_decl_types.iterator();
+        while (dit.next()) |e2| {
+            nb.setLocalDeclTypeOwned(e2.key_ptr.*, e2.value_ptr.clone(b.allocator) catch continue) catch {};
+        }
+    }
+    var i: usize = 0;
+    while (i < in_tys.len) : (i += 1) {
+        const pname = if (lam.params.len == 0 and in_tys.len == 1)
+            "it"
+        else if (i < lam.params.len)
+            lam.params[i].name
+        else
+            return null;
+        const dh = typeHead(std.mem.trimEnd(u8, in_tys[i].name, "?"));
+        if (dh.len == 0 or bareTypeParamHead(dh) or
+            ir.parseClassTypeParamIdentity(dh) != null) return null;
+        nb.setLocalDeclTypeOwned(pname, in_tys[i].clone(b.allocator) catch return null) catch return null;
+    }
+    od_depth += 1;
+    defer od_depth -= 1;
+    const t = staticExprTypeRef(&nb, &stmts[stmts.len - 1].Expr) catch null;
+    if (t) |ty| {
+        const th = typeHead(std.mem.trimEnd(u8, ty.name, "?"));
+        if (th.len == 0 or bareTypeParamHead(th) or
+            ir.parseClassTypeParamIdentity(th) != null)
+        {
+            var tt = ty;
+            tt.deinit(b.allocator);
+            return null;
+        }
+    }
+    return t;
+}
+
+/// RECORDER-level star patch: a recorded call-return whose args contain
+/// `*` (an unbound RETURN-position type parameter, star-erased by the
+/// solve) re-derives the star from the call's trailing lambda when the
+/// committed candidate's fn-typed last param returns exactly that
+/// parameter (`groupBy(keySelector: (T) -> K): Map<K, List<T>>`). The
+/// patch runs AFTER resolution — it improves the recorded local type and
+/// feeds no overload shape.
+pub fn patchStarredCallRecord(
+    b: *FuncBuilder,
+    recorded: *ir.TypeRef,
+    call_expr: *const Expr,
+) Allocator.Error!void {
+    if (call_expr.* != .Call) return;
+    const call = call_expr.Call;
+    if (call.args.len == 0 or call.args[call.args.len - 1] != .Lambda) return;
+    if (!allNull(call.arg_names)) return;
+    var has_star = false;
+    for (recorded.args) |ra| {
+        if (std.mem.eql(u8, ra.name, "*")) has_star = true;
+    }
+    if (!has_star) return;
+    if (call.callee.* != .Member) return;
+    const mname = call.callee.Member.name.name;
+    // The committed candidate: the receiver's unique lambda-hosting
+    // extension of the name and shape.
+    var recv_owned = (try staticExprTypeRef(b, call.callee.Member.receiver)) orelse return;
+    defer recv_owned.deinit(b.allocator);
+    const recv_head = typeHead(std.mem.trimEnd(u8, recv_owned.name, "?"));
+    var target: ?FuncId = null;
+    for (b.module.funcsBySimpleName(mname)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.kind == .instance_method or f.kind == .member_extension) continue;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        if (f.params.len - 1 != call.args.len) continue;
+        if (!b.module.classIsOrExtends(recv_head, typeHead(f.params[0].ty.name))) continue;
+        const lpt = f.params[f.params.len - 1].ty;
+        const lph = typeHead(std.mem.trimEnd(u8, lpt.name, "?"));
+        if (!std.mem.startsWith(u8, lph, "Function") and
+            !std.mem.eql(u8, lph, "<function>")) continue;
+        if (target != null) return;
+        target = fid;
+    }
+    const tfid = target orelse return;
+    const tf = b.module.funcById(tfid) orelse return;
+    const lpt = tf.params[tf.params.len - 1].ty;
+    if (lpt.args.len < 1) return;
+    var rname = std.mem.trimEnd(u8, lpt.args[lpt.args.len - 1].name, "?");
+    if (std.mem.startsWith(u8, rname, "in#")) rname = rname[3..];
+    if (std.mem.startsWith(u8, rname, "out#")) rname = rname[4..];
+    if (!bareTypeParamHead(rname)) return;
+    // The starred position in the record must be exactly where the
+    // declared return spells that parameter.
+    if (!tf.return_ty_declared or tf.return_ty.args.len != recorded.args.len) return;
+    var scratch = std.heap.ArenaAllocator.init(b.allocator);
+    defer scratch.deinit();
+    const a2 = scratch.allocator();
+    const solved = (b.module.solveCallBindings(a2, tfid, tf, recv_owned, null, &.{}, &.{}, false) catch null) orelse return;
+    const n_in = lpt.args.len - 1;
+    const in_tys = a2.alloc(ir.TypeRef, n_in) catch return;
+    for (lpt.args[0..n_in], in_tys) |raw, *slot| {
+        slot.* = ir.Module.substituteBoundType(a2, raw, solved.bindings) catch return;
+    }
+    var lr = (try lambdaReturnUnderParams(b, &call.args[call.args.len - 1], in_tys)) orelse return;
+    defer lr.deinit(b.allocator);
+    for (tf.return_ty.args, recorded.args) |decl_arg, *rec_arg| {
+        if (!std.mem.eql(u8, rec_arg.name, "*")) continue;
+        var dn = std.mem.trimEnd(u8, decl_arg.name, "?");
+        if (std.mem.startsWith(u8, dn, "in#")) dn = dn[3..];
+        if (std.mem.startsWith(u8, dn, "out#")) dn = dn[4..];
+        if (!std.mem.eql(u8, dn, rname)) continue;
+        const patched = lr.clone(b.allocator) catch return;
+        rec_arg.deinit(b.allocator);
+        rec_arg.* = patched;
+    }
+}
+
+/// The UNIQUE in-scope type-param bound whose class declares property `nm`
+/// — the implicit-receiver chase's answer when the splice window's head is
+/// a bare param with no bound record of its own.
+fn implBoundScan(b: *FuncBuilder, nm: []const u8) ?[]const u8 {
+    const bounds = (b.typeParamBoundsSlice() catch null) orelse return null;
+    defer b.allocator.free(bounds);
+    var hit: ?[]const u8 = null;
+    for (bounds) |tb| {
+        const bh = typeHead(std.mem.trimEnd(u8, tb.bound, "?"));
+        if (bh.len == 0 or bh.len <= 2) continue;
+        if (propTypeRefOn(b, bh, nm) != null or
+            b.module.registry.class_prop_type_heads.get(.{ .a = bh, .b = nm }) != null)
+        {
+            if (hit != null) return null;
+            hit = bh;
+        }
+    }
+    return hit;
+}
+
 /// Lambda-param types for a CONSTRUCTOR call's lambda arguments, read from
 /// the class's primary params whose declared types are CONCRETE function
 /// types. Positional args only; a param mentioning a type parameter or the
@@ -12631,7 +12917,11 @@ fn samLambdaParamTypes(
     var binds: std.ArrayList(ir.Module.TypeBinding) = .empty;
     if (ast_type_args.len == cls.type_params.len and ast_type_args.len != 0) {
         for (cls.type_params, ast_type_args) |tp, *ta| {
-            try binds.append(a, .{ .name = tp, .ty = try decl_mod.loweredTypeRef(a, ta, true) });
+            const ty = try decl_mod.loweredTypeRef(a, ta, true);
+            try binds.append(a, .{ .name = tp, .ty = ty });
+            // The registry may spell the method's params with the class
+            // identity mangle; bind that spelling too.
+            try binds.append(a, .{ .name = try ir.classTypeParamIdentity(a, class_id, tp), .ty = ty });
         }
     } else if (b.peekExpected()) |exp| {
         if (exp.function == null and exp.type_args.len == cls.type_params.len and
@@ -12639,7 +12929,9 @@ fn samLambdaParamTypes(
         {
             for (cls.type_params, exp.type_args) |tp, ta| {
                 if (ta.is_star) return null;
-                try binds.append(a, .{ .name = tp, .ty = try decl_mod.loweredTypeRef(a, &ta.ty, true) });
+                const ty = try decl_mod.loweredTypeRef(a, &ta.ty, true);
+                try binds.append(a, .{ .name = tp, .ty = ty });
+                try binds.append(a, .{ .name = try ir.classTypeParamIdentity(a, class_id, tp), .ty = ty });
             }
         }
     }
@@ -13385,12 +13677,15 @@ fn lowerPathCall(
     // KLIO_MISS_TRACE.
     if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
         if (std.mem.eql(u8, w, name0) and res_final.target == null) {
-            std.debug.print("[bare] {s} -> NONE recv_ty={s} encl_recv={s} pkg={s} shadowed={}\n", .{
+            std.debug.print("[bare] {s} -> NONE recv_ty={s} encl_recv={s} pkg={s} shadowed={} known_none={} at=f{d}:{d}\n", .{
                 name0,
                 b.recvTy() orelse "-",
                 b.enclosingRecvTy() orelse "-",
                 b.self_package,
                 shadowed_by_class,
+                b.own_recv_known_none,
+                segments[0].span.file.int(),
+                segments[0].span.start,
             });
         }
     }
@@ -15414,7 +15709,12 @@ fn bareStaticRecvHead(b: *const FuncBuilder) ?[]const u8 {
             }
         }
     }
-    return b.recvTy();
+    if (b.recvTy()) |own| return own;
+    // A lambda DECLARED receiverless (shape known) chains to the enclosing
+    // receiver, exactly Kotlin's implicit-receiver resolution; an untyped
+    // receiver-lambda must not (the ArrayDeque hazard above).
+    if (b.own_recv_known_none) return b.enclosingRecvTy();
+    return null;
 }
 
 /// Package/import-scoped declarations carried by a deferred bare call. The
@@ -16524,13 +16824,22 @@ fn lowerUnresolvedBareCall(
             ext_hint_final = true;
         }
     }
+    const bare_recv_ref = b.recvTypeRef();
     const bare_lambda_param_types: ?[]?[]ir.TypeRef = blk: {
         const hint = ext_hint orelse break :blk null;
         const f = b.module.funcById(hint) orelse break :blk null;
         const off: usize = if (f.params.len != 0 and
             std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] unresolvedBare fn={s}\n", .{f.name});
-        break :blk try argLambdaParamTypes(b, f, args, ast_arg_names, ast_type_args, off);
+        // The IMPLICIT receiver (the enclosing extension's declared
+        // receiver, args included) instantiates the slot — `sumOf
+        // { it.size.toLong() }` inside Array.flatten binds T2 :=
+        // Array<out T>, so `it` types and the body binds statically.
+        const recv_ptr: ?*const ir.TypeRef = if (off == 1)
+            (if (bare_recv_ref) |*r| substitutionRecv(b, r) else null)
+        else
+            null;
+        break :blk try argLambdaParamTypesRecv(b, f, args, ast_arg_names, ast_type_args, off, recv_ptr);
     };
     defer if (bare_lambda_param_types) |types|
         deinitArgLambdaParamTypes(b.allocator, types);
@@ -17025,12 +17334,24 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
     const call = call_expr.Call;
     if (call.callee.* != .Member) return null;
     const mname = call.callee.Member.name.name;
+    if (runtime.envOnce("KLIO_MCRT_TRACE")) |w| {
+        if (std.mem.eql(u8, w, mname))
+            std.debug.print("[mcrt] {s} recv_tag={s}\n", .{ mname, @tagName(std.meta.activeTag(call.callee.Member.receiver.*)) });
+    }
     const recv = call.callee.Member.receiver;
 
     var recv_owned: ?ir.TypeRef = null;
     defer if (recv_owned) |*t| t.deinit(b.allocator);
     const recv_ty: ir.TypeRef = blk: {
-        if (argDeclTypeRefLazy(b, recv)) |known| break :blk known;
+        if (argDeclTypeRefLazy(b, recv)) |known| {
+            // A bare TYPE-PARAMETER lazy answer (`expected: T` on a typed
+            // receiver) blocks the full deriver, whose implicit-property
+            // channel substitutes the receiver's instantiation.
+            const kh = typeHead(std.mem.trimEnd(u8, known.name, "?"));
+            const bare_k = (kh.len > 0 and kh.len <= 2 and std.ascii.isUpper(kh[0])) or
+                b.isTypeParam(kh) or ir.parseClassTypeParamIdentity(kh) != null;
+            if (!bare_k) break :blk known;
+        }
         recv_owned = try staticExprTypeRef(b, recv);
         break :blk recv_owned orelse return null;
     };
@@ -17041,6 +17362,10 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
     // this the middle of an `a?.self()?.b?.twice()` chain had no type, so
     // every link after the first resolved by name.
     const safe_call = call.callee.Member.safe;
+    if (runtime.envOnce("KLIO_MCRT_TRACE")) |w| {
+        if (std.mem.eql(u8, w, mname))
+            std.debug.print("[mcrt] {s} recv_ty={s} args={d} owned={}\n", .{ mname, recv_ty.name, recv_ty.args.len, recv_owned != null });
+    }
     if (recv_ty.nullable and !safe_call) return null;
     const recv_head = typeHead(std.mem.trimEnd(u8, recv_ty.name, "?"));
     if (recv_head.len == 0) return null;
@@ -17794,9 +18119,22 @@ fn lowerResolvedMemberCall(
                     .Postfix => @tagName(receiver.Postfix.op),
                     else => "?",
                 };
-                std.debug.print("[no-recv-{s}] {s}() call={s} fn={s}\n", .{
+                std.debug.print("[no-recv-{s}] {s}() call={s} fn={s} recvty={s} splice={s} owner={s}\n", .{
                     @tagName(std.meta.activeTag(receiver.*)),
                     inner_nm,
+                    name.name,
+                    build.currentRealFn() orelse "-",
+                    b.recvTy() orelse "-",
+                    b.spliceRecvTy() orelse "-",
+                    b.ownerClass() orelse "-",
+                });
+            }
+        }
+        if (receiver.* == .Path and receiver.Path.segments.len > 1) {
+            if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
+                std.debug.print("[no-recv-multipath] {s}.{s} call={s} fn={s}\n", .{
+                    receiver.Path.segments[0].name,
+                    receiver.Path.segments[receiver.Path.segments.len - 1].name,
                     name.name,
                     build.currentRealFn() orelse "-",
                 });
@@ -18046,6 +18384,38 @@ fn lowerResolvedMemberCall(
             return .none;
         }
     }
+    // A LOCAL-CLASS typing record: no class row, but the mangled head
+    // registered its methods as headers — probe the member table directly
+    // and bind the virtual slot (the runtime slot's by-name fallback
+    // executes the RegisterClass method).
+    if (owner_id == null and ast_type_args.len == 0 and allNull(ast_arg_names) and
+        // ONLY the local-class typing records (the `$lc` mangle):
+        // class_super_names is the GENERAL super registry, and probing it
+        // for any row-less head bound atomicfu's pack stubs over their
+        // host bindings (every CAS deadlocked).
+        std.mem.indexOf(u8, head, "$lc") != null and
+        b.module.registry.class_super_names.get(head) != null)
+    {
+        var probe: usize = args.len;
+        while (probe <= args.len + 3) : (probe += 1) {
+            var kb: [192]u8 = undefined;
+            const key = std.fmt.bufPrint(&kb, "{s}\x00{s}\x00{d}", .{ head, name.name, probe }) catch break;
+            const fid = b.module.registry.member_method_fids.get(key) orelse continue;
+            const recv_reg = try lowerExpr(b, receiver);
+            const run = try lowerArgRun(b, args);
+            const dst = b.allocReg();
+            orEmitAudit(b, "local_class_member_slot", "CallVirtual", name.name);
+            try b.push(.{ .CallVirtual = .{
+                .dst = dst,
+                .receiver = recv_reg,
+                .slot = ir.MethodSlotId.fromFunc(fid),
+                .args = run[0],
+                .n_args = run[1],
+            } });
+            lmNote(.bound_virtual);
+            return .{ .lowered = dst };
+        }
+    }
     var static_owner = owner_id orelse {
         lmNote(.no_class_id);
         noteNoClassHead(head);
@@ -18084,6 +18454,11 @@ fn lowerResolvedMemberCall(
         // silently dropped the whole resolution.
         if (b.resolve(receiver_name) == null and !b.knowsOuter(receiver_name) and
             !enclosingHasMemberNamed(b, receiver_name) and
+            // A TOP-LEVEL PROPERTY read is a VALUE receiver, never a
+            // classifier access: `asserter.assertEquals(...)` inside
+            // kotlin.test resolved to Asserter's (absent) companion and
+            // dropped the whole member resolution to the walk.
+            b.module.registry.top_level_prop_pkgs.get(receiver_name) == null and
             static_owner.int() < b.module.classes.items.len)
         {
             const classifier = &b.module.classes.items[static_owner.int()];
@@ -18165,6 +18540,14 @@ fn lowerResolvedMemberCall(
         last_member_refuted = !resolved.applicable;
         return if (resolved.applicable) .deferred else .none;
     };
+    // A HOST-SHADOWED declaration (a pack stub whose installed binding is
+    // authoritative — atomicfu's atomics) must never statically bind its
+    // interpreted body; the runtime walk's binding preference arbitrates.
+    if (b.module.funcById(func_id)) |cf| {
+        if (cf.hasBody() and b.module.registry.host_shadowed_fqns.contains(cf.fqn)) {
+            return .deferred;
+        }
+    }
     if (eagerAuditOn()) {
         if (eager_pick) |ep| {
             const lazy_str: i64 = if (resolved.target) |l| @intCast(l.int()) else -1;
@@ -19103,19 +19486,33 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     // statically bound NewInstance the bare form gets (the same resolution
     // the derivation arm and the runtime walk's nested-construction tail
     // perform), instead of a member walk on the companion value.
-    if (receiver.* == .Path and receiver.Path.segments.len == 1) {
+    if (receiver.* == .Path and receiver.Path.segments.len >= 1 and receiver.Path.segments.len <= 3) {
         const outer_name = receiver.Path.segments[0].name;
-        if (outer_name.len != 0 and std.ascii.isUpper(outer_name[0]) and
+        // Every path segment must look like a classifier reference
+        // (`TimeSource.Monotonic.ValueTimeMark(reading)` — three segments).
+        var all_class_like = true;
+        for (receiver.Path.segments) |seg| {
+            if (seg.name.len == 0 or !std.ascii.isUpper(seg.name[0])) {
+                all_class_like = false;
+                break;
+            }
+        }
+        if (all_class_like and
             name.name.len != 0 and std.ascii.isUpper(name.name[0]) and
             b.resolve(outer_name) == null and !b.knowsOuter(outer_name) and
             !enclosingHasMemberNamed(b, outer_name))
         {
-            var qb: [128]u8 = undefined;
-            if (std.fmt.bufPrint(&qb, "{s}.{s}", .{ outer_name, name.name }) catch null) |qualified| {
+            var qb: [192]u8 = undefined;
+            const qualified_opt: ?[]const u8 = switch (receiver.Path.segments.len) {
+                1 => std.fmt.bufPrint(&qb, "{s}.{s}", .{ outer_name, name.name }) catch null,
+                2 => std.fmt.bufPrint(&qb, "{s}.{s}.{s}", .{ outer_name, receiver.Path.segments[1].name, name.name }) catch null,
+                else => std.fmt.bufPrint(&qb, "{s}.{s}.{s}.{s}", .{ outer_name, receiver.Path.segments[1].name, receiver.Path.segments[2].name, name.name }) catch null,
+            };
+            if (qualified_opt) |qualified| {
                 if (b.module.classIdByQualifiedSuffix(qualified)) |ncid| {
                     if (ncid.int() < b.module.classes.items.len) {
                         const ncls = &b.module.classes.items[ncid.int()];
-                        if (!ncls.is_object and !ncls.is_stub and !ncls.is_value and
+                        if (!ncls.is_object and !ncls.is_stub and
                             !ncls.is_abstract and !ncls.is_interface)
                         {
                             const ctor_arity = try ctorArgFnArities(b, ncid, args, ast_arg_names);
@@ -19620,12 +20017,6 @@ fn hoistMutualLocalFns(b: *FuncBuilder, block: *const AstBlock) Allocator.Error!
 
 /// Index into a slice by a `u32` id, returning a const pointer or null.
 fn idGet(comptime T: type, items: []const T, idx: u32) ?*const T {
-    if (idx >= items.len) return null;
-    return &items[idx];
-}
-
-/// Mutable variant of `idGet`.
-fn idGetMut(comptime T: type, items: []T, idx: u32) ?*T {
     if (idx >= items.len) return null;
     return &items[idx];
 }

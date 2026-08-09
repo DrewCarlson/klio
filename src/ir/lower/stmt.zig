@@ -9,6 +9,7 @@ const FF = runtime.forest.ForestField;
 const build = @import("../build.zig");
 
 const expr_mod = @import("expr.zig");
+const decl_mod = @import("decl.zig");
 const helpers = @import("helpers.zig");
 const literals = @import("literals.zig");
 const ast_scan = @import("ast_scan.zig");
@@ -325,7 +326,12 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             // the local then refute inapplicable members.
             .Call => {
                 const vt = runtime.envOnce("KLIO_VALTY_TRACE");
-                if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
+                if (try expr_mod.staticExprTypeRef(b, e)) |ct0| {
+                    var ct = ct0;
+                    // A star-erased RETURN-position parameter re-derives
+                    // from the call's trailing lambda (recorder-level only;
+                    // resolution shapes are untouched).
+                    try expr_mod.patchStarredCallRecord(b, &ct, e);
                     if (vt) |w| if (std.mem.eql(u8, w, p.name.name))
                         std.debug.print("[valty] {s} = {s} nargs={d} a0={s} mod={x} classes={d}\n", .{ p.name.name, ct.name, ct.args.len, if (ct.args.len != 0) ct.args[0].name else "-", @intFromPtr(b.module) & 0xffff, b.module.classes.items.len });
                     const was_nullable = ct.nullable;
@@ -1461,6 +1467,60 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
     // A nested lambda's bare `C(args)` must construct this local class
     // through the captured binding, not a same-simple-name module class.
     build.pushLocalClassName(c.name.name);
+    // Lowering-time TYPING record: the local class's transitive supertype
+    // chain under a function-scoped mangle, so a local initialized from
+    // its constructor carries a head that proves Collection-ness to
+    // extension binding (`coll.toTypedArray()`); the runtime
+    // RegisterClass path stays the executor.
+    {
+        const ra = b.module.registry.allocator;
+        if (std.fmt.allocPrint(ra, "{s}$lc{s}", .{ c.name.name, build.currentRealFn() orelse "" }) catch null) |key| {
+            var chain: std.ArrayList([]const u8) = .empty;
+            var chain_ok = true;
+            for (c.supertypes) |*sup| {
+                const sn = sup.name.name;
+                chain.append(ra, ra.dupe(u8, sn) catch {
+                    chain_ok = false;
+                    break;
+                }) catch {
+                    chain_ok = false;
+                    break;
+                };
+                if (b.module.registry.class_super_names.get(sn)) |transitive| {
+                    for (transitive) |tn| {
+                        chain.append(ra, ra.dupe(u8, tn) catch {
+                            chain_ok = false;
+                            break;
+                        }) catch {
+                            chain_ok = false;
+                            break;
+                        };
+                    }
+                }
+                if (!chain_ok) break;
+            }
+            if (chain_ok) {
+                // An empty chain still registers: the KEY's presence is the
+                // typing record (a supertype-less local class's methods
+                // bind through it).
+                const owned = chain.toOwnedSlice(ra) catch null;
+                if (owned) |sl| b.module.registry.class_super_names.put(key, sl) catch {};
+            } else {
+                chain.deinit(ra);
+            }
+            // The RESERVED-FID METHOD HEADERS: each of the local class's own
+            // methods gets a bodyless header row under the mangled owner,
+            // so a member call on a local-class-typed receiver binds its
+            // virtual slot at lowering; the runtime resolves the slot's
+            // by-name fallback to the RegisterClass-registered method.
+            for (c.members) |*m| {
+                if (m.* != .Function) continue;
+                const mf = &m.Function;
+                if (mf.receiver_type != null) continue;
+                decl_mod.retainLocalClassMemberHeader(b.module, key, mf) catch {};
+            }
+        }
+    }
     return null;
 }
 
