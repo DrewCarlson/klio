@@ -47,10 +47,40 @@ pub fn lowerForLabeled(
     var hn_root: ?ir.FuncId = null;
     var next_root: ?ir.FuncId = null;
     var iter_ext_fid: ?ir.FuncId = null;
+    var iter_root: ?ir.FuncId = null;
     if (try expr.staticExprTypeRef(b, iter)) |ity0| {
         var ity = ity0;
         defer ity.deinit(b.allocator);
         const file = vars[0].span.file;
+        // The receiver's own MEMBER `iterator()` binds through its virtual
+        // slot (an IntRange for-loop no longer walks the name each entry).
+        {
+            var rhead = std.mem.trimEnd(u8, ity.name, "?");
+            if (std.mem.indexOfScalar(u8, rhead, '<')) |lt| rhead = rhead[0..lt];
+            const rcid = (if (std.mem.indexOfScalar(u8, rhead, '.') != null)
+                b.module.classIdByFqn(rhead)
+            else
+                b.module.uniqueClassIdBySimpleName(rhead));
+            if (rcid) |cid| {
+                if (cid.int() < b.module.classes.items.len) {
+                    const rfqn = b.module.classes.items[cid.int()].fqn;
+                    const it_decls = b.module.memberDecls(rfqn, "iterator");
+                    if (it_decls.len != 0) {
+                        iter_root = it_decls[0];
+                    } else {
+                        // Inherited member (IntRange's iterator lives on
+                        // IntProgression): the resolver chases supers.
+                        const resolved = b.module.resolveMemberCall(cid, "iterator", &.{}, .{
+                            .caller_file = file,
+                            .lexical_owner = null,
+                            .actual_type_param_bounds = &.{},
+                            .receiver_type = ity,
+                        });
+                        iter_root = resolved.target;
+                    }
+                }
+            }
+        }
         // A member `iterator()` first; a receiver served only by the
         // UNIQUE top-level extension (`CharSequence.iterator():
         // CharIterator`) binds through its declared return the same way,
@@ -101,7 +131,16 @@ pub fn lowerForLabeled(
             }
         }
     }
-    if (iter_ext_fid) |ext_fid| {
+    if (iter_root) |root| {
+        const vargs = b.allocReg();
+        try b.push(.{ .CallVirtual = .{
+            .dst = it_reg,
+            .receiver = zero,
+            .slot = ir.MethodSlotId.fromFunc(root),
+            .args = vargs,
+            .n_args = 0,
+        } });
+    } else if (iter_ext_fid) |ext_fid| {
         try b.push(.{ .Call = .{
             .dst = it_reg,
             .func = ext_fid,
