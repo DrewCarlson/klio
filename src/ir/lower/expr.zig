@@ -10329,6 +10329,62 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
                     }
                 } else |_| {}
             }
+            // A property of the IMPLICIT receiver — the declared receiver
+            // or the splice window — with a type-parameter head chased to
+            // its declared bound: `entries` inside the apply-spliced
+            // onEachIndexed body reads `Map<out K, V>.entries`.
+            impl: {
+                const h0 = b.recvTy() orelse b.spliceRecvTy() orelse break :impl;
+                var hh = typeHead(std.mem.trimEnd(u8, h0, "?"));
+                const impl_trace = if (runtime.envOnce("KLIO_IMPLPROP_TRACE")) |w| std.mem.eql(u8, w, nm) else false;
+                if (impl_trace) {
+                    std.debug.print("[implprop] {s} h0={s} tp={} bref={} tpb={}\n", .{
+                        nm, h0, b.isTypeParam(hh), b.typeParamBoundRef(hh) != null, b.typeParamBound(hh) != null,
+                    });
+                }
+                var bound_full: ?*const ir.TypeRef = null;
+                if (b.isTypeParam(hh) or (hh.len > 0 and hh.len <= 2 and std.ascii.isUpper(hh[0]))) {
+                    if (b.typeParamBoundRef(hh)) |bref| {
+                        bound_full = bref;
+                        hh = typeHead(std.mem.trimEnd(u8, bref.name, "?"));
+                    } else if (b.typeParamBound(hh)) |tpb| {
+                        // Head-only bound record: the head still names the
+                        // property's owner for the head-table answer.
+                        hh = typeHead(std.mem.trimEnd(u8, tpb.bound, "?"));
+                    } else if (b.enclosingRecvTy()) |eh2| {
+                        // The lambda's own receiver head may be the spliced
+                        // callee's literal param (apply's `T` inside
+                        // `M.onEachIndexed`); the ENCLOSING receiver's head
+                        // carries the real parameter and its bound.
+                        const hh2 = typeHead(std.mem.trimEnd(u8, eh2, "?"));
+                        if (b.typeParamBoundRef(hh2)) |bref2| {
+                            bound_full = bref2;
+                            hh = typeHead(std.mem.trimEnd(u8, bref2.name, "?"));
+                        } else if (b.typeParamBound(hh2)) |tpb2| {
+                            hh = typeHead(std.mem.trimEnd(u8, tpb2.bound, "?"));
+                        } else if (!(b.isTypeParam(hh2) or (hh2.len > 0 and hh2.len <= 2 and std.ascii.isUpper(hh2[0])))) {
+                            hh = hh2;
+                        } else break :impl;
+                    } else break :impl;
+                }
+                if (propTypeRefOn(b, hh, nm)) |declared| {
+                    if (bound_full) |br| {
+                        if (substitutedPropType(b, hh, br.*, declared)) |sub| {
+                            return try sub.clone(b.allocator);
+                        }
+                    } else if (b.recvTypeRef()) |rt| {
+                        if (substitutedPropType(b, hh, rt, declared)) |sub| {
+                            return try sub.clone(b.allocator);
+                        }
+                    }
+                }
+                if (b.module.registry.class_prop_type_heads.get(.{ .a = hh, .b = nm })) |ph| {
+                    const phh = typeHead(std.mem.trimEnd(u8, ph, "?"));
+                    if (phh.len > 2 and ir.parseClassTypeParamIdentity(phh) == null and !b.isTypeParam(phh)) {
+                        return .{ .name = try b.allocator.dupe(u8, ph), .nullable = false, .args = &.{} };
+                    }
+                }
+            }
             // A TOP-LEVEL property read lends its recorded declared type
             // under the caller's own scope tiers (`DAYS_PER_CYCLE` inside
             // the ofEpochDay run block).

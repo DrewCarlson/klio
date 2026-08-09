@@ -1497,6 +1497,12 @@ pub fn tryInlineCallWithTypeArgs(
                 defer owned.deinit(b.allocator);
                 recv_head = try b.allocator.dupe(u8, expr_lower.typeHead(std.mem.trimEnd(u8, owned.name, "?")));
             }
+        } else if (b.recvTy() orelse b.spliceRecvTy()) |eh| {
+            // A BARE call to the generic receiver splice (`apply { ... }`
+            // inside `M.onEachIndexed`) has no receiver expression; the
+            // window head is the ENCLOSING receiver's, not the callee's
+            // own literal `T`.
+            recv_head = try b.allocator.dupe(u8, expr_lower.typeHead(std.mem.trimEnd(u8, eh, "?")));
         };
         b.setSpliceRecvTy(recv_head);
     } else if (member_splice) {
