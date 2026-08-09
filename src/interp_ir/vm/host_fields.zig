@@ -3086,6 +3086,15 @@ fn enclosingCompanionDeclares(self: *VmHost, allocator: Allocator, class_name: [
 /// anonymous classes (fresh fqn each time) cannot grow it unboundedly.
 fn fieldReadCachePut(self: *VmHost, fqn: []const u8, name: []const u8, hit: root.ProgramImage.FieldReadHit) void {
     if (!ir.eval.dispatchCacheStable()) return;
+    // Main-module classes only, exactly like the WRITE memo below: a
+    // runtime / anonymous class's fqn key does not outlive the class def,
+    // and under the shared anon side module the dangling key corrupted the
+    // cache map (Allocator.grow reached unreachable growing it).
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().classIdByFqn(fqn) == null) return;
+    }
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     if (pg.get().field_read_cache.count() >= 65536) return;
