@@ -3914,6 +3914,13 @@ pub const Module = struct {
     ) StaticCompatibility {
         sac_route = "-";
         const declared = staticTypeHead(param.name);
+        // A `*` in the PARAM position is the deriver's own erasure product
+        // (an unbound class param star-projected by the receiver record);
+        // it proves nothing and must not refute.
+        if (std.mem.eql(u8, declared, "*")) {
+            sac_route = "star-neutral";
+            return .unknown;
+        }
         if (overrideQualifiedPath(param) == null and
             self.funcTypeParamIndex(fid, declared) != null)
         {

@@ -11464,7 +11464,7 @@ fn staticCallReturnTypeRef(
         };
         var dispatch_receiver = try staticDispatchReceiverTypeRef(b, target, recv_owned, idx.span.file);
         defer if (dispatch_receiver) |*ty| ty.deinit(b.allocator);
-        return try b.module.instantiatedCallReturnType(
+        const idx_ret = try b.module.instantiatedCallReturnType(
             b.allocator,
             target,
             recv_owned,
@@ -11472,6 +11472,8 @@ fn staticCallReturnTypeRef(
             shape_set.shapes,
             &.{},
         );
+        if (opty_trace) std.debug.print("[opty] recv={s} get -> {s}\n", .{ identity, if (idx_ret) |r| r.name else "<null>" });
+        return idx_ret;
     }
     if (call_expr.* != .Call) return null;
     // A DIRECT constructor expression names its own type
