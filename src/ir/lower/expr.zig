@@ -11674,7 +11674,34 @@ fn enrichLambdaArgShapes(
                 try nb.setLocalDeclTypeOwned(p.name, try pa.clone(b.allocator));
             }
         }
+        // The tail may read the block's OWN earlier declarations
+        // (`run { var p = 1.0; ...; p }`): record each preceding local
+        // whose annotated or derivable init type is concrete, in order,
+        // so a later decl can read an earlier one.
         od_depth += 1;
+        for (stmts[0 .. stmts.len - 1]) |*st| {
+            if (st.* != .Decl or st.Decl != .Property) continue;
+            const prop = st.Decl.Property;
+            if (prop.receiver_type != null or prop.delegate != null) continue;
+            var decl_owned: ?ir.TypeRef = null;
+            if (prop.ty) |*annotated| {
+                decl_owned = loweredOwnedLocalTypeRef(&nb, annotated) catch null;
+            } else if (prop.init) |*init| {
+                decl_owned = staticExprTypeRef(&nb, init) catch null;
+            }
+            var dt = decl_owned orelse continue;
+            var h = std.mem.trimEnd(u8, dt.name, "?");
+            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
+                ir.parseClassTypeParamIdentity(h) != null;
+            if (h.len == 0 or bare) {
+                dt.deinit(b.allocator);
+                continue;
+            }
+            nb.setLocalDeclTypeOwned(prop.name.name, dt) catch {
+                dt.deinit(b.allocator);
+            };
+        }
         const derived = staticExprTypeRef(&nb, tail) catch null;
         od_depth -= 1;
         if (runtime.envOnce("KLIO_LAMRET_TRACE") != null) {
