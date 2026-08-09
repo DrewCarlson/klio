@@ -10289,6 +10289,18 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
             .Neg, .Pos => return try staticExprTypeRef(b, un.expr),
             else => {},
         },
+        // `x!!` is the operand's type made NON-null (`val step =
+        // nextStep!!` on a `Continuation<Unit>?` property).
+        .Postfix => |pf| if (pf.op == .NotNull) {
+            var t = (try staticExprTypeRef(b, pf.expr)) orelse break :self_named;
+            t.nullable = false;
+            if (std.mem.endsWith(u8, t.name, "?")) {
+                const trimmed = try b.allocator.dupe(u8, std.mem.trimEnd(u8, t.name, "?"));
+                b.allocator.free(t.name);
+                t.name = trimmed;
+            }
+            return t;
+        },
         // A bare name that reads an ENCLOSING class or companion property
         // lends its declared type: `payload shl bitsPerSymbol` inside a
         // Base64 member needs the companion const to answer Int before the
