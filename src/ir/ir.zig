@@ -691,6 +691,13 @@ pub const Inst = union(enum) {
         /// shadow it; the global leg calls exactly this declaration
         /// instead of re-resolving the simple name.
         func: ?FuncId = null,
+        /// Call-site EVIDENCE committed `func` among a return-variant
+        /// family (an `as` cast or the trailing lambda's derived return):
+        /// the global leg must not value-re-rank past it - a closure
+        /// argument carries no return type, so the re-rank would run the
+        /// first-declared variant (the Double sumOf, printing 3.0 where
+        /// kotlinc prints 3). The member leg still runs first.
+        func_final: bool = false,
         /// The package/import-scoped callable set computed by the lowering
         /// resolver. `null` is the legacy/host-symbol boundary: no complete,
         /// rankable declaration set was available, so the runtime may consult

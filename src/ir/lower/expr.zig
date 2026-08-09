@@ -456,6 +456,13 @@ fn overloadPickByLambdaReturnFull(
                     const this_expr: Expr = .{ .This = .{ .qualifier = null, .span = args[li].span() } };
                     elem_owned = try iterableElementTypeRef(b, &this_expr);
                 }
+                if (lamret_trace) {
+                    std.debug.print("[lamret-elem] recv_expr={} recvTy={s} elem={s}\n", .{
+                        recv_expr != null,
+                        b.recvTy() orelse "-",
+                        if (elem_owned) |e2| e2.name else "<null>",
+                    });
+                }
             }
             const elem = elem_owned orelse return null;
             try nb.setLocalDeclTypeOwned(pname, try elem.clone(b.allocator));
@@ -4811,6 +4818,15 @@ fn argLambdaParamTypesRecv(
                     lam_shapes,
                 );
                 any = any or slot.* != null;
+            }
+        }
+    }
+    if (runtime.envOnce("KLIO_ALPT")) |want| {
+        if (std.mem.eql(u8, want, func.name)) {
+            for (out, 0..) |slot, i| {
+                if (slot) |tys| {
+                    for (tys) |t| std.debug.print("[alpt-slot] {s}#{d} arg{d} ty={s}\n", .{ func.fqn, func.id.int(), i, t.name });
+                }
             }
         }
     }
@@ -12942,6 +12958,13 @@ fn lowerPathCall(
                 const tf = if (tfn) |f| f.fqn else "?";
                 const np: usize = if (tfn) |f| f.params.len else 0;
                 const is_ext_t = if (tfn) |f| f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this") else false;
+                const sel_ret: []const u8 = if (tfn) |f| blk_sr: {
+                    if (f.params.len == 0) break :blk_sr "-";
+                    const lp = f.params[f.params.len - 1].ty;
+                    if (lp.args.len == 0) break :blk_sr "-";
+                    break :blk_sr lp.args[lp.args.len - 1].name;
+                } else "-";
+                std.debug.print("[bare] pick_was={?d} sel_ret={s}\n", .{ if (cast_pick) |cp| cp.int() else null, sel_ret });
                 std.debug.print("[bare] {s} -> {s}#{d} params={d} ext={} form={s} recv_ty={s} encl_recv={s} pkg={s} shadowed={} at=f{d}:{d}\n", .{
                     name0,
                     tf,
@@ -14811,6 +14834,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
         .n_args = run[1],
         .arg_names = arg_names,
         .func = func_id,
+        .func_final = was_cast,
         .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
         .static_recv = cmg_static_recv,
         .type_args = type_args,
