@@ -7088,6 +7088,9 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (runtime.envOnce("KLIO_SAM_TRACE") != null and cls.is_fun_interface) {
                 std.debug.print("[sam] {s} tps={d} lam={} lpt={} exp={}\n", .{ cls.name, cls.type_params.len, args.len == 1 and args[0] == .Lambda, sam_lpt != null, b.peekExpected() != null });
             }
+            // A ctor's CONCRETE fn-typed params type their lambda arguments
+            // (`IntArray(256) { it shr 4 }` types `it` Int).
+            if (sam_lpt == null) sam_lpt = try ctorLambdaParamTypes(b, class_id, args);
             b.pending_arg_lambda_param_types = sam_lpt;
             const run = try lowerArgRunFull(b, args, ctor_arity, null);
             b.pending_arg_lambda_param_types = null;
@@ -12498,6 +12501,83 @@ pub fn extensionNullaryReturnTypeRef(
     }
     if (out_fid) |slot| slot.* = agreed_fid;
     return agreed;
+}
+
+/// Lambda-param types for a CONSTRUCTOR call's lambda arguments, read from
+/// the class's primary params whose declared types are CONCRETE function
+/// types. Positional args only; a param mentioning a type parameter or the
+/// suspend marker contributes nothing.
+fn ctorLambdaParamTypes(
+    b: *FuncBuilder,
+    class_id: ir.ClassId,
+    args: []const Expr,
+) Allocator.Error!?[]?[]ir.TypeRef {
+    if (class_id.int() >= b.module.classes.items.len) return null;
+    const cls = &b.module.classes.items[class_id.int()];
+    if (args.len == 0) return null;
+    if (runtime.envOnce("KLIO_CTORLPT_TRACE") != null) {
+        std.debug.print("[ctorlpt] {s} nparams={d} p_last_ty={s}<{d}>\n", .{ cls.name, cls.primary_params.len, if (cls.primary_params.len != 0) cls.primary_params[cls.primary_params.len - 1].ty.name else "-", if (cls.primary_params.len != 0) cls.primary_params[cls.primary_params.len - 1].ty.args.len else 0 });
+    }
+    // The array ctors' trailing init lambda takes the element INDEX
+    // whatever the class row records (the (size, init) form is an
+    // intrinsic, not the row's primary constructor).
+    {
+        const n = cls.name;
+        const is_array_ctor = std.mem.eql(u8, n, "Array") or
+            (std.mem.endsWith(u8, n, "Array") and isPrimitiveTypeName(n[0 .. n.len - "Array".len]));
+        if (is_array_ctor and args.len == 2 and args[args.len - 1] == .Lambda) {
+            const out0 = try b.allocator.alloc(?[]ir.TypeRef, args.len);
+            @memset(out0, null);
+            errdefer deinitArgLambdaParamTypes(b.allocator, out0);
+            const tys0 = try b.allocator.alloc(ir.TypeRef, 1);
+            tys0[0] = .{ .name = try b.allocator.dupe(u8, "Int"), .nullable = false, .args = &.{} };
+            out0[args.len - 1] = tys0;
+            return out0;
+        }
+    }
+    if (cls.primary_params.len == 0) return null;
+    var any = false;
+    const out = try b.allocator.alloc(?[]ir.TypeRef, args.len);
+    @memset(out, null);
+    errdefer deinitArgLambdaParamTypes(b.allocator, out);
+    for (args, 0..) |*arg, i| {
+        if (arg.* != .Lambda) continue;
+        if (i >= cls.primary_params.len) break;
+        const pt = cls.primary_params[i].ty;
+        const head = typeHead(std.mem.trimEnd(u8, pt.name, "?"));
+        if (!std.mem.startsWith(u8, head, "Function") and
+            !std.mem.eql(u8, head, "<function>")) continue;
+        if (pt.args.len < 2) continue;
+        const value_ins = pt.args[0 .. pt.args.len - 1];
+        var ok = true;
+        for (value_ins) |vi| {
+            const h2 = typeHead(std.mem.trimEnd(u8, vi.name, "?"));
+            if (h2.len == 0 or h2[0] == '#' or bareTypeParamHead(h2) or
+                ir.parseClassTypeParamIdentity(h2) != null)
+            {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) continue;
+        const tys = try b.allocator.alloc(ir.TypeRef, value_ins.len);
+        var filled: usize = 0;
+        errdefer {
+            for (tys[0..filled]) |*t| t.deinit(b.allocator);
+            b.allocator.free(tys);
+        }
+        for (value_ins) |vi| {
+            tys[filled] = try vi.clone(b.allocator);
+            filled += 1;
+        }
+        out[i] = tys;
+        any = true;
+    }
+    if (!any) {
+        b.allocator.free(out);
+        return null;
+    }
+    return out;
 }
 
 /// The lambda-param types a fun-interface SAM conversion hands its sole
