@@ -12719,7 +12719,11 @@ fn samLambdaParamTypes(
     var binds: std.ArrayList(ir.Module.TypeBinding) = .empty;
     if (ast_type_args.len == cls.type_params.len and ast_type_args.len != 0) {
         for (cls.type_params, ast_type_args) |tp, *ta| {
-            try binds.append(a, .{ .name = tp, .ty = try decl_mod.loweredTypeRef(a, ta, true) });
+            const ty = try decl_mod.loweredTypeRef(a, ta, true);
+            try binds.append(a, .{ .name = tp, .ty = ty });
+            // The registry may spell the method's params with the class
+            // identity mangle; bind that spelling too.
+            try binds.append(a, .{ .name = try ir.classTypeParamIdentity(a, class_id, tp), .ty = ty });
         }
     } else if (b.peekExpected()) |exp| {
         if (exp.function == null and exp.type_args.len == cls.type_params.len and
@@ -12727,7 +12731,9 @@ fn samLambdaParamTypes(
         {
             for (cls.type_params, exp.type_args) |tp, ta| {
                 if (ta.is_star) return null;
-                try binds.append(a, .{ .name = tp, .ty = try decl_mod.loweredTypeRef(a, &ta.ty, true) });
+                const ty = try decl_mod.loweredTypeRef(a, &ta.ty, true);
+                try binds.append(a, .{ .name = tp, .ty = ty });
+                try binds.append(a, .{ .name = try ir.classTypeParamIdentity(a, class_id, tp), .ty = ty });
             }
         }
     }
