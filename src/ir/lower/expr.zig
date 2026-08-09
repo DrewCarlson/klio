@@ -10821,6 +10821,74 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
         }
         pick = match;
     }
+    if (pick == null and want != 0 and want <= 8 and od_depth < 3) vararg_full: {
+        // A SOLE trailing-vararg candidate whose EVERY argument derives one
+        // concrete head yields its return FULLY instantiated —
+        // `listOf("foo", "bar")` is a `List<String>`. The reverted
+        // head-only variant broke user extensions precisely because it
+        // dropped the arguments; a complete record is what kotlinc infers.
+        var sole_v: ?FuncId = null;
+        for (cands) |fid| {
+            const f2 = b.module.funcById(fid) orelse continue;
+            if (!f2.hasBody()) continue;
+            const base: usize = if (f2.params.len != 0 and std.mem.eql(u8, f2.params[0].name, "this")) 1 else 0;
+            const has_va = f2.params.len != 0 and f2.params[f2.params.len - 1].is_vararg;
+            if (!has_va or f2.params.len -| base != 1) continue;
+            if (sole_v != null) break :vararg_full;
+            sole_v = fid;
+        }
+        const vf = sole_v orelse break :vararg_full;
+        const f2 = b.module.funcById(vf) orelse break :vararg_full;
+        const tps2 = b.module.registry.func_type_params.get(vf) orelse break :vararg_full;
+        if (tps2.items.len != 1) break :vararg_full;
+        if (!f2.return_ty_declared or f2.return_ty.args.len != 1) break :vararg_full;
+        var ra2 = std.mem.trimEnd(u8, f2.return_ty.args[0].name, "?");
+        if (std.mem.startsWith(u8, ra2, "in#")) ra2 = ra2[3..];
+        if (std.mem.startsWith(u8, ra2, "out#")) ra2 = ra2[4..];
+        if (!std.mem.eql(u8, ra2, tps2.items[0])) break :vararg_full;
+        var elem_owned: ?ir.TypeRef = null;
+        var elem_ok = true;
+        od_depth += 1;
+        for (call.args[0..want]) |*a2| {
+            var t2 = (staticExprTypeRef(b, a2) catch null) orelse {
+                elem_ok = false;
+                break;
+            };
+            if (t2.nullable or std.mem.endsWith(u8, t2.name, "?")) {
+                t2.deinit(b.allocator);
+                elem_ok = false;
+                break;
+            }
+            const th = typeHead(t2.name);
+            const bare2 = (th.len > 0 and th.len <= 2 and std.ascii.isUpper(th[0])) or
+                b.isTypeParam(th) or ir.parseClassTypeParamIdentity(th) != null;
+            if (th.len == 0 or bare2) {
+                t2.deinit(b.allocator);
+                elem_ok = false;
+                break;
+            }
+            if (elem_owned) |prev| {
+                const same = std.mem.eql(u8, prev.name, t2.name);
+                t2.deinit(b.allocator);
+                if (!same) {
+                    elem_ok = false;
+                    break;
+                }
+            } else {
+                elem_owned = t2;
+            }
+        }
+        od_depth -= 1;
+        if (!elem_ok or elem_owned == null) {
+            if (elem_owned) |*t| t.deinit(b.allocator);
+            break :vararg_full;
+        }
+        const ret_head = try b.allocator.dupe(u8, std.mem.trimEnd(u8, f2.return_ty.name, "?"));
+        errdefer b.allocator.free(ret_head);
+        const out_args = try b.allocator.alloc(ir.TypeRef, 1);
+        out_args[0] = elem_owned.?;
+        return .{ .name = ret_head, .nullable = f2.return_ty.nullable, .args = out_args };
+    }
     if (pick == null) {
         var sole: ?FuncId = null;
         for (cands) |fid| {
