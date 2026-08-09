@@ -17870,6 +17870,16 @@ fn lowerResolvedMemberCall(
                 });
             }
         }
+        if (receiver.* == .Path and receiver.Path.segments.len > 1) {
+            if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
+                std.debug.print("[no-recv-multipath] {s}.{s} call={s} fn={s}\n", .{
+                    receiver.Path.segments[0].name,
+                    receiver.Path.segments[receiver.Path.segments.len - 1].name,
+                    name.name,
+                    build.currentRealFn() orelse "-",
+                });
+            }
+        }
         if (receiver.* == .Path and receiver.Path.segments.len == 1) {
             const rn = receiver.Path.segments[0].name;
             const which: NoRecvPath = if (b.resolve(rn) != null)
@@ -19171,15 +19181,29 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
     // statically bound NewInstance the bare form gets (the same resolution
     // the derivation arm and the runtime walk's nested-construction tail
     // perform), instead of a member walk on the companion value.
-    if (receiver.* == .Path and receiver.Path.segments.len == 1) {
+    if (receiver.* == .Path and receiver.Path.segments.len >= 1 and receiver.Path.segments.len <= 3) {
         const outer_name = receiver.Path.segments[0].name;
-        if (outer_name.len != 0 and std.ascii.isUpper(outer_name[0]) and
+        // Every path segment must look like a classifier reference
+        // (`TimeSource.Monotonic.ValueTimeMark(reading)` — three segments).
+        var all_class_like = true;
+        for (receiver.Path.segments) |seg| {
+            if (seg.name.len == 0 or !std.ascii.isUpper(seg.name[0])) {
+                all_class_like = false;
+                break;
+            }
+        }
+        if (all_class_like and
             name.name.len != 0 and std.ascii.isUpper(name.name[0]) and
             b.resolve(outer_name) == null and !b.knowsOuter(outer_name) and
             !enclosingHasMemberNamed(b, outer_name))
         {
-            var qb: [128]u8 = undefined;
-            if (std.fmt.bufPrint(&qb, "{s}.{s}", .{ outer_name, name.name }) catch null) |qualified| {
+            var qb: [192]u8 = undefined;
+            const qualified_opt: ?[]const u8 = switch (receiver.Path.segments.len) {
+                1 => std.fmt.bufPrint(&qb, "{s}.{s}", .{ outer_name, name.name }) catch null,
+                2 => std.fmt.bufPrint(&qb, "{s}.{s}.{s}", .{ outer_name, receiver.Path.segments[1].name, name.name }) catch null,
+                else => std.fmt.bufPrint(&qb, "{s}.{s}.{s}.{s}", .{ outer_name, receiver.Path.segments[1].name, receiver.Path.segments[2].name, name.name }) catch null,
+            };
+            if (qualified_opt) |qualified| {
                 if (b.module.classIdByQualifiedSuffix(qualified)) |ncid| {
                     if (ncid.int() < b.module.classes.items.len) {
                         const ncls = &b.module.classes.items[ncid.int()];
