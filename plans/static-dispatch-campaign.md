@@ -6263,3 +6263,161 @@ remain (their inits resolve names with overloads and no receiver
 context for the pick's filter). Pinned: `bare_call_return_typing`.
 Battery: 117/0, corpus 267/267, litmus 42/43 (known flake), unit green,
 compose 1350/0.
+
+### The receiver-specificity narrowing and the scalar-param binding
+
+The `it toUInt fn=sum` x4 rows were never a missing receiver context — the
+plan's own note was stale. `[bare] sumOf -> NONE recv_ty=UByteArray`
+showed the context present and resolution still empty, and
+`KLIO_LAMRET_WHY` (new, kept: per-candidate skip reasons for the
+lambda-return pick) named the real mechanism twice over:
+
+1. `UByteArray : Collection<UByte>`, so the `Iterable<T>.sumOf` five
+   genuinely apply through the class-super chain. The pick built its
+   family in candidate order, hit the `[T]`-vs-`[UByte]` param spelling
+   disagreement, and bailed the WHOLE pick mid-loop (23 candidates never
+   examined). kotlinc ranks receiver specificity BEFORE the return pick;
+   the pick now collects survivors first, narrows to the exact-receiver
+   subset when one exists, and judges agreement inside the kept set.
+2. A declared scalar param head (`UByte`) has no class row, so the
+   param binding refused it — but the deriver types scalar members from
+   the declaration tables, so a primitive head now binds regardless.
+
+no_receiver_type 87 -> 83, all four bound STATIC. Pinned: the
+`lambda_return_overload_pick` fixture gained the UShortArray.sum and
+direct `bytes.sumOf { it.toInt() }` rows.
+
+### The sibling-expected solve: R from the trailing selector
+
+The minOfWith/maxOfWith rows landed on the sibling-expected design with
+one correction to the earlier refutation's frame: the trailing
+selector's return derives under the RECEIVER-ELEMENT binding (any tail
+kind — the result feeds one argument's expected type and instantiates no
+type variable of the outer callee, which is the hazard the member-tail
+refutation recorded). `solveComparatorSibling` walks same-named
+candidates by declared-receiver SERVE (first-fit by arity had handed
+`List<String>` to the CharSequence variant, whose `(Char) -> R` selector
+poisons the element binding), strips the `in#R` variance mangle before
+the R match, and hands the compareBy argument `Comparator<derived>` as
+its expected type. Consumption is one channel: an expected type whose
+head matches the declared return binds like explicit type args in
+`instantiatedLambdaValueParams` (`expectedReturnTypeArgsFor`), and the
+inline splice's argument loop honors the sibling-solved site exactly as
+`lowerArgRun` does. no_receiver_type 83 -> 78. Pinned:
+`comparator_sibling_expected`.
+
+### Five mechanisms in one stretch: 78 -> 69
+
+- A spliced lambda literal's OWN param annotation outranks the derived
+  argument type (`{ index, acc: Number, e -> acc.toInt() + e }` — the
+  reduceIndexed family x4).
+- A generic class's type arguments infer from its CONSTRUCTOR arguments
+  (bare-`E` param takes the argument's type; `X<..., E, ...>` takes its
+  type argument at the aligned position); the head-only refusal stands
+  when any parameter stays unbound. Pinned:
+  `ctor_generic_arg_inference`. The LOCAL-class rows do NOT clear: a
+  local class registers only at runtime (`RegisterClass` with captures)
+  and has no lowering-time row, so its ctor call must stay untyped (the
+  module index would answer an unrelated namesake — the standing
+  constraint). Design for a successor: a lowering-time typing row under
+  a function-scoped mangle, mapped through the local-class scope stack,
+  never the simple-name index.
+- A receiver-taking callable value in scope (`getter: T.() -> P`)
+  invoked on a bare-tp property commits the value (invoke) protocol —
+  `CallValueWithThis`, dynamic_by_design, kotlinc's own resolution
+  against the parameter's bound. This fixed a real parity bug: the old
+  member-or-value arbitration let a runtime class's same-named MEMBER
+  win where kotlinc calls the value. Pinned:
+  `bare_tp_receiver_lambda_invoke`. The ComparisonDSL census rows
+  remain: that body lowers in a relowering pass with NO ownerClass, so
+  the property-type gate cannot see `val expected: T` (the same
+  ownerless context blocks the sortedByNullable pair, whose shape
+  types clean under direct lowering — both are the @Test method
+  relowering channel, recorded as the residual context to fix).
+- An unannotated EXPRESSION-bodied local fn derives its return at the
+  declaration under its params' declared types (`twoDigitNumber` ->
+  Int; the month row). Two deriver holes closed with it: the Binary
+  arm's receiver fallback now uses the FULL static deriver (an Index
+  lhs types), and the primitive table learned Char arithmetic
+  (`Char - Char = Int`, `Char +/- Int = Char`).
+- A single-supertype object EXPRESSION types as that supertype at its
+  local's reads (`object : List<String> by coll {}`), recorded as an
+  ordinary init.
+
+### Expected-type propagation through nested calls: 69 -> 67
+
+The sortedNullableBy family needed the general engine the compareBy arm
+special-cased: at any call whose candidates fit by receiver serve, a
+call-shaped argument whose declared parameter is a generic class type
+instantiates through the receiver (projected onto the DECLARED head
+first — `List<String?>` binds an `Iterable<T>` pattern) plus the call
+site's own expected type; a fully concrete instantiation becomes that
+argument's expected type, and the chain cascades level by level through
+each nested call's own lowering. `it.sortedWith(nullsFirst(
+compareByDescending { it.nullIfEmpty() }))` types the innermost `it`
+String: sortedWith hands nullsFirst `Comparator<in String?>`, nullsFirst
+hands the compareBy family `Comparator<in String>` (a declared `T?`
+return position strips the `?` when binding, satisfying `T : Any`
+exactly as kotlinc solves it). Value-argument shapes stay OUT of the
+solve — they are the still-untyped nested calls the push exists to
+type, and their head-only shapes refused the bind (`[icrt]` named it).
+`KLIO_SIBEXP_WHY` prints per-candidate skips. Pinned:
+`nested_expected_comparator_chain`.
+
+The SAM-constructor tower stash follow-up is CLOSED EMPTY: the probe
+(`this@thenByStr.compare` inside a hand-built `Comparator { }` SAM
+lambda) binds with zero unbound rows — the splice-window tower and
+capture channels landed since the note absorbed the population.
+
+### Session close: the enumerated tail at 67, and the audits
+
+Census: 9,037 sites — 8,960 bound (99.15%: bound_static 1,995 +
+bound_virtual 6,961), 4 dynamic_by_design, 8 resolver_declined (all
+`target_known_deferred` — identity proven, dispatch deferred to value
+authority BY DESIGN), 2 nullable_or_generic, 67 no_receiver_type.
+Battery at every step: sweep 117/0, unit green, examples 279/291 (the
+12 = 11 windowed compose + serial_names pack-feature gating, identical
+on the pre-session baseline).
+
+The 67, each named by `at=file:line` in the attribution dump:
+
+- 6 rows blocked ONLY by the @Test/ownerless relowering context
+  (ComparisonDSL getter x4, sortedByNullable x2) — the mechanisms are
+  landed and pinned; the residual is that pass not threading
+  ownerClass/scope, recorded above.
+- 7 rows are the LOCAL-CLASS family (TestCollection data/coll/arr1) —
+  no lowering-time class row by design today; successor design above.
+- ~26 singles across stdlib internals (step, interceptor, captured
+  result/comp, doyEst, groupSeparators/byteSeparators,
+  mixed-element-listOf LUB, takeLastWhile/dropLastWhile splice pair,
+  onEachIndexed transitive fn-tp binding, a-compareTo) — one mechanism
+  each, none load-bearing for the backend contract.
+- Member 7 (property reads on untyped receivers), Call 12
+  (`not_simple_callee` chains + 2 `unique_concrete` listOf +
+  `ambiguous_return`), Binary 6, Postfix 2, Index 1 — the same
+  deferred-typing tail through other expression shapes.
+
+Audits closed:
+
+- `KLIO_DECL_AUDIT=members` on the hello probe: intrinsics=1,484,
+  declared=1,328, missing=156 (builtin-type members 142 — the
+  program-scoping lower bound the audit doc frames; extension-aligned
+  839 — the task-15 registry-key spelling, aligning the convention
+  remains the honest fix; member-aligned 300; unaligned keys 6;
+  package-unloaded 8). A real zero-target gauge within its stated
+  lower-bound contract.
+- `member_ladder` 1,268 -> 1,209 from the intervening typing wins;
+  the residue is `Result.fold` (deliberately on the walk per the
+  recorded wrapper hazard), test-fixture user classes, and the small
+  `Int.until`/`IntRange.iterator` rows.
+- Task 15 (one calling convention for a declaration's body and host
+  symbol) stays what the campaign already concluded: answered narrowly
+  by the `!hasBody()` rule and the named-skip commit; the full shared
+  entry shape is the honest end of this campaign's reach and a
+  prerequisite the bytecode-VM plan owns.
+
+Every remaining unbound site emits the explicit named form the backend
+contract compiles to a runtime helper; zero by-name slot walks; the
+census reads honestly for the backends. The campaign's goal state —
+dispatch decided at lowering everywhere the language allows, the
+exceptions enumerated and each one named — HOLDS.
