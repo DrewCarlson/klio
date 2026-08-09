@@ -10674,6 +10674,42 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
     const want = call.args.len;
     var pick: ?FuncId = (try overloadPickByCast(b, cands, call.args, want)) orelse
         try overloadPickByLambdaReturn(b, cands, call.args, want);
+    if (pick == null and want != 0 and want <= 4) exact: {
+        // EXACT argument-head discrimination for a scalar overload family:
+        // `getProgressionLastElement(Int, Int, Int): Int` vs the
+        // `(Long, Long, Long): Long` sibling picks by the derived heads.
+        var heads: [4]?ir.TypeRef = .{ null, null, null, null };
+        defer for (heads[0..want]) |*h| if (h.*) |*t| t.deinit(b.allocator);
+        if (od_depth >= 3) break :exact;
+        od_depth += 1;
+        for (call.args[0..want], 0..) |*arg, i| {
+            heads[i] = staticExprTypeRef(b, arg) catch null;
+        }
+        od_depth -= 1;
+        for (heads[0..want]) |h| {
+            if (h == null) break :exact;
+        }
+        var match: ?FuncId = null;
+        for (cands) |fid| {
+            const f = b.module.funcById(fid) orelse continue;
+            if (!f.hasBody()) continue;
+            const base: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+            if (f.params.len -| base != want) continue;
+            var all_exact = true;
+            for (f.params[base..], 0..) |*p2, i| {
+                const ah = typeHead(std.mem.trimEnd(u8, heads[i].?.name, "?"));
+                const ph = typeHead(std.mem.trimEnd(u8, p2.ty.name, "?"));
+                if (!std.mem.eql(u8, ah, ph)) {
+                    all_exact = false;
+                    break;
+                }
+            }
+            if (!all_exact) continue;
+            if (match != null) break :exact;
+            match = fid;
+        }
+        pick = match;
+    }
     if (pick == null) {
         var sole: ?FuncId = null;
         for (cands) |fid| {
