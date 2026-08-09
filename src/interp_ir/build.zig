@@ -1057,7 +1057,7 @@ fn notePropScope(
         // stdlib writes its file-level constants that way
         // (`private const val NANOS_PER_SECOND = 1_000_000_000`). Without
         // this, every member call on such a read resolved by name.
-        if (literalTypeHead(init)) |head| {
+        if (constExprTypeHead(module, init)) |head| {
             try module.registry.top_level_prop_type_heads.put(fqn, head);
         } else if (initCalleeName(init)) |callee| {
             // A factory or constructor call states the type as definitely as
@@ -1086,6 +1086,58 @@ fn notePropScope(
 /// The type a literal initializer states outright. Deliberately literals
 /// only: a call or a name would need resolution this early pass does not
 /// have, and a wrong head is worse than none.
+fn promoteConstHeads(l: []const u8, r: []const u8) ?[]const u8 {
+    const eq = std.mem.eql;
+    if (eq(u8, l, r)) {
+        if (eq(u8, l, "Int") or eq(u8, l, "Long") or eq(u8, l, "Float") or
+            eq(u8, l, "Double") or eq(u8, l, "UInt") or eq(u8, l, "ULong")) return l;
+        return null;
+    }
+    const li = eq(u8, l, "Int");
+    const ri = eq(u8, r, "Int");
+    if ((li and eq(u8, r, "Long")) or (ri and eq(u8, l, "Long"))) return "Long";
+    if (eq(u8, l, "Double") or eq(u8, r, "Double")) {
+        if (li or ri or eq(u8, l, "Long") or eq(u8, r, "Long") or
+            eq(u8, l, "Float") or eq(u8, r, "Float")) return "Double";
+    }
+    return null;
+}
+
+/// The type head of a CONST-EXPRESSION initializer: literals, unary +/-,
+/// arithmetic over foldable operands, and a bare Path naming an
+/// already-recorded top-level property whose every declaration agrees on
+/// one head (`DAYS_0000_TO_1970 = DAYS_PER_CYCLE * 5 - (30 * 365 + 7)`).
+fn constExprTypeHead(module: *Module, e: *const ast.Expr) ?[]const u8 {
+    if (literalTypeHead(e)) |h| return h;
+    switch (e.*) {
+        .Unary => |u| return switch (u.op) {
+            .Neg, .Pos => constExprTypeHead(module, u.expr),
+            else => null,
+        },
+        .Binary => |bin| {
+            const l = constExprTypeHead(module, bin.lhs) orelse return null;
+            const r = constExprTypeHead(module, bin.rhs) orelse return null;
+            return switch (bin.op) {
+                .Add, .Sub, .Mul, .Div, .Rem => promoteConstHeads(l, r),
+                else => null,
+            };
+        },
+        .Path => |p| {
+            if (p.segments.len != 1) return null;
+            const list = module.registry.top_level_prop_pkgs.get(p.segments[0].name) orelse return null;
+            var head: ?[]const u8 = null;
+            for (list.items) |pd| {
+                const h = module.registry.top_level_prop_type_heads.get(pd.fqn) orelse return null;
+                if (head) |prev| {
+                    if (!std.mem.eql(u8, prev, h)) return null;
+                } else head = h;
+            }
+            return head;
+        },
+        else => return null,
+    }
+}
+
 fn literalTypeHead(e: *const ast.Expr) ?[]const u8 {
     return switch (e.*) {
         .IntLit => |lit| switch (lit.kind) {

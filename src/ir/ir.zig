@@ -9904,6 +9904,35 @@ pub const Module = struct {
         return found;
     }
 
+    /// The tiered HEAD twin of `topLevelPropTypeRef`: a scalar top-level
+    /// property (`private const val DAYS_PER_CYCLE = 146097L`) records only
+    /// its head, and the deriver's Path arm needs it under the same
+    /// caller-scope tiers.
+    pub fn topLevelPropTypeHeadTiered(
+        self: *const Module,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+    ) ?[]const u8 {
+        const list = self.registry.top_level_prop_pkgs.get(name) orelse return null;
+        var best_tier: u8 = 255;
+        var found: ?[]const u8 = null;
+        for (list.items) |pd| {
+            const t = self.scopeTier(pd.fqn, pd.package, name, caller_pkg, caller_file);
+            if (t == 255) continue;
+            const h = self.registry.top_level_prop_type_heads.get(pd.fqn);
+            if (t < best_tier) {
+                best_tier = t;
+                found = h;
+            } else if (t == best_tier) {
+                const cur = found orelse return null;
+                const new = h orelse return null;
+                if (!std.mem.eql(u8, cur, new)) return null;
+            }
+        }
+        return found;
+    }
+
     pub fn topLevelPropHeadFor(self: *const Module, fqn: []const u8) ?[]const u8 {
         if (self.registry.top_level_prop_type_heads.get(fqn)) |h| return h;
         const callee = self.registry.top_level_prop_init_callees.get(fqn) orelse return null;

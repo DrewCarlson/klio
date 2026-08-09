@@ -10237,23 +10237,36 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
             if (p.segments.len != 1) break :self_named;
             const nm = p.segments[0].name;
             if (b.resolve(nm) != null or b.isLocalFn(nm) or b.knowsOuter(nm)) break :self_named;
-            const owner = b.ownerClass() orelse break :self_named;
-            // The full-ref table records only arg-carrying declared types;
-            // a scalar property (`const val bitsPerSymbol: Int`) lives in
-            // the HEAD table.
-            if (propTypeRefOn(b, owner, nm)) |t| return try t.clone(b.allocator);
-            if (b.module.registry.class_prop_type_heads.get(.{ .a = owner, .b = nm })) |head| {
-                return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
-            }
-            // The companion's properties are in scope in the class body;
-            // they record under the lifted `{Owner}$Companion` key.
-            var ckey_buf: [160]u8 = undefined;
-            if (std.fmt.bufPrint(&ckey_buf, "{s}$Companion", .{owner})) |ckey| {
-                if (propTypeRefOn(b, ckey, nm)) |t| return try t.clone(b.allocator);
-                if (b.module.registry.class_prop_type_heads.get(.{ .a = ckey, .b = nm })) |head| {
+            if (b.ownerClass()) |owner| {
+                // The full-ref table records only arg-carrying declared
+                // types; a scalar property (`const val bitsPerSymbol: Int`)
+                // lives in the HEAD table.
+                if (propTypeRefOn(b, owner, nm)) |t| return try t.clone(b.allocator);
+                if (b.module.registry.class_prop_type_heads.get(.{ .a = owner, .b = nm })) |head| {
                     return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
                 }
-            } else |_| {}
+                // The companion's properties are in scope in the class body;
+                // they record under the lifted `{Owner}$Companion` key.
+                var ckey_buf: [160]u8 = undefined;
+                if (std.fmt.bufPrint(&ckey_buf, "{s}$Companion", .{owner})) |ckey| {
+                    if (propTypeRefOn(b, ckey, nm)) |t| return try t.clone(b.allocator);
+                    if (b.module.registry.class_prop_type_heads.get(.{ .a = ckey, .b = nm })) |head| {
+                        return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
+                    }
+                } else |_| {}
+            }
+            // A TOP-LEVEL property read lends its recorded declared type
+            // under the caller's own scope tiers (`DAYS_PER_CYCLE` inside
+            // the ofEpochDay run block).
+            if (b.module.topLevelPropTypeRef(nm, b.self_package, p.segments[0].span.file)) |t| {
+                return try t.clone(b.allocator);
+            }
+            if (b.module.topLevelPropTypeHeadTiered(nm, b.self_package, p.segments[0].span.file)) |head| {
+                const hh = typeHead(std.mem.trimEnd(u8, head, "?"));
+                if (hh.len > 2 and ir.parseClassTypeParamIdentity(hh) == null) {
+                    return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
+                }
+            }
             break :self_named;
         },
         // A CLASS-NAMED member read: `TimeSource.Monotonic` (a nested
