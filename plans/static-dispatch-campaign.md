@@ -6625,3 +6625,13 @@ a return-variant tie reaching the runtime resolves first-declared (a
 closure value carries no return type), so every remaining dynamic
 sumOf-shaped site is a latent parity site — the static picks are the
 sound fix.
+
+Sharpened same-session: the flatten `.size` row's Iterator record comes
+from `param_rep` — the tied-candidate representative is collected
+RECEIVER-BLIND at `resolveExtensionCall`'s tie exit, so the Sequence
+family's `(T) -> N` rep instantiated the literal's `it` as
+`Iterator<...>` on an Array receiver (the pick itself bails first: its
+probe builder has no receiver record for the implicit-this element
+binding). Fix = receiver-filter the param_rep collection exactly as the
+lambda-return pick now filters, or thread the pick's explicit
+receiver/element into the bare-form path.
