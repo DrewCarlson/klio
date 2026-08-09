@@ -371,7 +371,9 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             // A property read is recorded too: `val node = coord.layoutNode`
             // lends the property's registered type head to the local, which
             // the declared-type channel then reads back.
-            .Call, .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate => try b.setLocalInitExprAt(p.name.name, e, p.name.span),
+            // A BINARY init carries the numeric-promotion evidence the
+            // deriver's arm answers (`val lineSeparators = (n - 1) / perLine`).
+            .Call, .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate, .Binary => try b.setLocalInitExprAt(p.name.name, e, p.name.span),
             // A property read and an INDEXED read both carry a static type of
             // their own: `val held = row[1]` is `Row.get`'s return type.
             .Member, .Index, .Path => if (!std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_INIT") orelse "1", "0"))

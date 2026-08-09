@@ -10648,7 +10648,7 @@ fn staticCallReturnTypeRef(
     // their RECEIVER, `.let`/`.run` return their lambda's tail, derived
     // under the receiver-bound parameter. Depth-guarded like every other
     // recursive derivation.
-    if (call_expr.* == .Call and od_depth < 3) scope_fns: {
+    if (call_expr.* == .Call) scope_fns: {
         const c = call_expr.Call;
         if (c.callee.* != .Member) break :scope_fns;
         const m = c.callee.Member;
@@ -10657,15 +10657,44 @@ fn staticCallReturnTypeRef(
         const is_echo = std.mem.eql(u8, nm2, "also") or std.mem.eql(u8, nm2, "apply");
         const is_tail = std.mem.eql(u8, nm2, "let") or std.mem.eql(u8, nm2, "run");
         if (!is_echo and !is_tail) break :scope_fns;
-        if (c.args.len != 1 or c.args[0] != .Lambda) break :scope_fns;
-        // Only when no competing declaration could own the name for this
-        // call: a user class's own `let(block)` member must keep its
-        // declared return. The universal stdlib extension is the sole
-        // candidate exactly when the emission's no-dispatch rule applies.
-        if (uniqueUniversalInlineExtension(b, nm2, c.args.len) == null) break :scope_fns;
+        const sfx_trace = runtime.envOnce("KLIO_SCOPEFN_TRACE") != null;
+        if (sfx_trace) std.debug.print("[scopefn] {s} enter depth={d}\n", .{ nm2, od_depth });
+        // The ambient derivation chain often sits at depth 3 when a local's
+        // `.let` init derives (emission ladder -> init chain -> nested
+        // derivations); this arm does constant extra work per level, so it
+        // gets its own slightly higher constant bound.
+        if (od_depth >= 6) {
+            if (sfx_trace) std.debug.print("[scopefn] {s} bail=depth {d}\n", .{ nm2, od_depth });
+            break :scope_fns;
+        }
+        if (c.args.len != 1 or c.args[0] != .Lambda) {
+            if (sfx_trace) std.debug.print("[scopefn] {s} bail=args n={d}\n", .{ nm2, c.args.len });
+            break :scope_fns;
+        }
+        // Only when no competing declaration could own the name: every
+        // same-simple-name candidate must be a kotlin-package extension (a
+        // user's own `let` keeps its declared return), and the receiver's
+        // class hierarchy must not declare a member of the name.
+        for (b.module.funcsBySimpleName(nm2)) |fid2| {
+            const f2 = b.module.funcById(fid2) orelse continue;
+            const is_ext2 = f2.params.len != 0 and std.mem.eql(u8, f2.params[0].name, "this");
+            const kotlin_pkg = std.mem.eql(u8, f2.package, "kotlin") or
+                std.mem.startsWith(u8, f2.package, "kotlin.");
+            if (!is_ext2 or !kotlin_pkg) {
+                if (sfx_trace) std.debug.print("[scopefn] {s} bail=candidate {s} pkg={s}\n", .{ nm2, f2.fqn, f2.package });
+                break :scope_fns;
+            }
+        }
         od_depth += 1;
         defer od_depth -= 1;
-        var recv_owned = (staticExprTypeRef(b, m.receiver) catch null) orelse break :scope_fns;
+        var recv_owned = (staticExprTypeRef(b, m.receiver) catch null) orelse {
+            if (sfx_trace) std.debug.print("[scopefn] {s} bail=recv_untyped\n", .{nm2});
+            break :scope_fns;
+        };
+        // No hierarchy-name check here: the registry's transitive-name
+        // records list the scope functions as reachable on every builtin
+        // head, and a USER class's member of the name registers in the
+        // simple-name index the candidate gate above already walks.
         if (is_echo) return recv_owned;
         defer recv_owned.deinit(b.allocator);
         const lam = c.args[0].Lambda;
@@ -10673,6 +10702,16 @@ fn staticCallReturnTypeRef(
         if (stmts2.len == 0 or stmts2[stmts2.len - 1] != .Expr) break :scope_fns;
         var nb2 = FuncBuilder.init(b.allocator, b.module) catch break :scope_fns;
         defer nb2.deinit();
+        // The lambda's free names resolve in the ENCLOSING scope
+        // (`if (it == 0) perLine else it` reads the fn's param): seed the
+        // probe builder with its declared types; the receiver-bound
+        // parameter below shadows.
+        {
+            var dit2 = b.local_decl_types.iterator();
+            while (dit2.next()) |e2| {
+                nb2.setLocalDeclTypeOwned(e2.key_ptr.*, e2.value_ptr.clone(b.allocator) catch continue) catch {};
+            }
+        }
         if (std.mem.eql(u8, nm2, "let")) {
             const pname = if (lam.params.len != 0) lam.params[0].name else "it";
             nb2.setLocalDeclTypeOwned(pname, recv_owned.clone(b.allocator) catch break :scope_fns) catch break :scope_fns;
@@ -11723,6 +11762,31 @@ fn enrichLambdaArgShapes(
             while (dit.next()) |e| {
                 nb.setLocalDeclTypeOwned(e.key_ptr.*, e.value_ptr.clone(b.allocator) catch continue) catch {};
             }
+        }
+        // DERIVED-init enclosing locals never enter the declared-type map
+        // (`val lineSeparators = (n - 1) / perLine`): derive each recorded
+        // init IN THE ENCLOSING BUILDER (its own scope) and seed the
+        // result, so the block's tail can read them. Declared types above
+        // stay authoritative.
+        {
+            od_depth += 1;
+            var iit = b.localInitExprIterator();
+            while (iit.next()) |e| {
+                if (nb.localDeclTypeRef(e.key_ptr.*) != null) continue;
+                var dt = (staticExprTypeRef(b, e.value_ptr.*) catch null) orelse continue;
+                var h = std.mem.trimEnd(u8, dt.name, "?");
+                if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+                const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
+                    ir.parseClassTypeParamIdentity(h) != null;
+                if (h.len == 0 or bare) {
+                    dt.deinit(b.allocator);
+                    continue;
+                }
+                nb.setLocalDeclTypeOwned(e.key_ptr.*, dt) catch {
+                    dt.deinit(b.allocator);
+                };
+            }
+            od_depth -= 1;
         }
         if (lam.params.len == 0 and value_params == 1) {
             try nb.setLocalDeclTypeOwned("it", try pty.args[0].clone(b.allocator));
