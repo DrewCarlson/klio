@@ -9941,8 +9941,13 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
     defer if (owned) |*t| t.deinit(b.allocator);
     var ty: ir.TypeRef = blk: {
         if (argDeclTypeRef(b, iter)) |known| break :blk known;
+        // The LAZY channel serves `this` (the splice window's full
+        // receiver) — `for (element in this)` inside the associateWithTo
+        // splice iterates List<String>, and the ladder below never
+        // reached it. Borrowed, like argDeclTypeRef's answer.
+        if (argDeclTypeRefLazy(b, iter)) |lazy_known| break :blk lazy_known;
         owned = (try staticCallReturnTypeRef(b, iter)) orelse
-            (try localInitTypeRef(b, iter)) orelse return null;
+            (try staticExprTypeRef(b, iter)) orelse return null;
         break :blk owned.?;
     };
     // A type-parameter head resolves through its full bound ref: iterating
@@ -14150,17 +14155,31 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
     };
     defer if (fn_generic) |m| b.allocator.free(m);
     b.pending_arg_fn_generic = fn_generic;
+    var lpt_recv_owned: ?ir.TypeRef = null;
+    defer if (lpt_recv_owned) |*t| t.deinit(b.allocator);
     const lambda_param_types: ?[]?[]ir.TypeRef = blk: {
         const f = b.module.funcById(func_id) orelse break :blk null;
         const recv_off: usize = if (f.params.len != 0 and
             std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-        break :blk try argLambdaParamTypes(
+        // A MEMBER-form call to an extension carries its receiver in the
+        // callee: derive it so the lambda's params instantiate
+        // (`dropped.associateWith { name -> ... }` on a DERIVED local left
+        // the slot at bare `T`; the annotated form already bound String).
+        const recv_ptr: ?*const ir.TypeRef = rp: {
+            if (recv_off != 1) break :rp null;
+            const ce = expr.Call.callee;
+            if (ce.* != .Member) break :rp null;
+            lpt_recv_owned = staticExprTypeRef(b, ce.Member.receiver) catch null;
+            break :rp if (lpt_recv_owned) |*t| t else null;
+        };
+        break :blk try argLambdaParamTypesRecv(
             b,
             f,
             args,
             ast_arg_names,
             ast_type_args,
             recv_off,
+            recv_ptr,
         );
     };
     defer if (lambda_param_types) |types|
