@@ -6769,3 +6769,47 @@ always said. The single-class numbers remain true (mode-neutral or
 better) — the blowup is the FULL suite's accumulation, consistent with
 per-registration image-resolution allocation renting from the run
 arena.
+
+## 28: the derived-return instantiation (associateWith row family, e858a14d)
+
+The associateWith `name` producer hunt landed the real mechanism, and it
+was one level deeper than any producer call site: the member-call return
+deriver returned the winning extension's declared return RAW. So
+`val dropped = items.drop(1)` recorded `List<T>`, and every consumer of
+the local's record inherited a leaked type parameter — the inline-splice
+producer (`[alpt-site] inlineSplice`, the live producer per the tagged
+probe) instantiated the associateWith lambda slot against `List<T>` and
+left `name` at `T`. The fix is receiver substitution in
+memberCallReturnTypeRef: solve the winning candidate's bindings against
+the receiver (solveCallBindings now projects the actual receiver onto
+the declared head first — a List actual binds an Iterable<K> pattern)
+and substitute into the return clone; an unsolvable param keeps the raw
+record. tyMentionsBareTp (bare heads + identity forms, recursive)
+guards both entry and exit.
+
+Newly-typed receivers exposed two refusal bugs in the local-extension
+gate, both "lossy record treated as proof":
+- a bare actual head (args lost by a narrower channel) FAILED
+  bindReceiverTypeParams and disproved a generic-receiver local ext →
+  the emission dropped the local and the runtime member walk missed
+  (lext3 repro). could_apply mode now keeps a bare-head actual whose
+  head relates.
+- a derived `Any` head (the deriver's erasure product, fold's R) did
+  the same via head-unrelatedness (GroupingTest
+  foldWithComputedInitialValue's local `toPair`). An Any actual is now
+  non-refuting in localOverloadReceiverCouldApply.
+
+Diagnostics kept (env-gated): [alpt-site] tags at every
+argLambdaParamTypes producer, [valty] arg-arity, [gra] bind-FAILED args.
+
+Census 29 -> 28 with the whole blast radius dead: associateWith,
+flatten .size, Index, isEmpty().not() rows all gone. Gates: sweep
+117/0, units green, corpus 280/291 + 4 chained-run flakes verified
+exact standalone (captured_var_carrier, inner_outer_property,
+sam_conversion, runtest_channel_resume_order) — remainder is the
+pre-existing windowed-compose + serial_names set.
+
+Standing named families (14 [no-recv-name] rows over module variants):
+TestCollection/CollectionTest local-class 8 (ANON_BASE-gated),
+entries/onEachIndexed tower 2, interceptor CoroutineContext KEY 2,
+TextActuals a-compareTo 2, CollectionTest:40 joinToString 1.
