@@ -416,6 +416,10 @@ pub const FuncBuilder = struct {
     /// read its types): its sites are not real emissions and stay out of
     /// the dispatch census.
     census_quiet: bool = false,
+    /// This body is a lambda DECLARED receiverless (shape known): the
+    /// enclosing receiver tier is the next implicit-receiver link for its
+    /// bare calls.
+    own_recv_known_none: bool = false,
     blocks: std.ArrayList(Block) = .empty,
     cur: BlockId,
     next_reg: u32,

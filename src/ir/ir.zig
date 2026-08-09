@@ -1646,6 +1646,11 @@ pub const Module = struct {
     /// (last bind wins), so a self re-invoke captured by name (the compose
     /// restart lambda) would run the SIBLING. Not serialized.
     pending_lambda_self_fn: ?SelfLocalFn = null,
+    /// The next lambda body's declared shape is KNOWN to take no receiver
+    /// (a plain `(T) -> R` slot): its bare calls may consult the enclosing
+    /// receiver tier, exactly Kotlin's implicit-receiver chain. A lambda
+    /// whose receiver is merely UNTYPED must not (the ArrayDeque hazard).
+    pending_lambda_no_receiver: bool = false,
     /// Names of enclosing-scope locals with definite NON-callable evidence
     /// (literal init / primitive declared type), carried into the lambda body
     /// about to lower so a bare CALL there does not route through the captured

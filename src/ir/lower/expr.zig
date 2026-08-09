@@ -3192,6 +3192,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         recorded_recv != null or eager_shape != null;
     const lambda_has_receiver = receiver_head != null or
         (eager_shape != null and eager_shape.?.has_receiver);
+    b.module.pending_lambda_no_receiver = lambda_receiver_shape_known and !lambda_has_receiver;
     // Consume the per-argument expected lambda arity set by the call
     // lowering for this argument slot before the body recurses (which
     // re-arms it for the body's own nested calls).
@@ -13385,12 +13386,15 @@ fn lowerPathCall(
     // KLIO_MISS_TRACE.
     if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
         if (std.mem.eql(u8, w, name0) and res_final.target == null) {
-            std.debug.print("[bare] {s} -> NONE recv_ty={s} encl_recv={s} pkg={s} shadowed={}\n", .{
+            std.debug.print("[bare] {s} -> NONE recv_ty={s} encl_recv={s} pkg={s} shadowed={} known_none={} at=f{d}:{d}\n", .{
                 name0,
                 b.recvTy() orelse "-",
                 b.enclosingRecvTy() orelse "-",
                 b.self_package,
                 shadowed_by_class,
+                b.own_recv_known_none,
+                segments[0].span.file.int(),
+                segments[0].span.start,
             });
         }
     }
@@ -15414,7 +15418,12 @@ fn bareStaticRecvHead(b: *const FuncBuilder) ?[]const u8 {
             }
         }
     }
-    return b.recvTy();
+    if (b.recvTy()) |own| return own;
+    // A lambda DECLARED receiverless (shape known) chains to the enclosing
+    // receiver, exactly Kotlin's implicit-receiver resolution; an untyped
+    // receiver-lambda must not (the ArrayDeque hazard above).
+    if (b.own_recv_known_none) return b.enclosingRecvTy();
+    return null;
 }
 
 /// Package/import-scoped declarations carried by a deferred bare call. The
