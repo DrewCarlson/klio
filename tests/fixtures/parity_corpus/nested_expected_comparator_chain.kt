@@ -10,4 +10,9 @@ fun main() {
     println(data.sortedWith(nullsFirst(compareBy { it })))
     println(data.sortedWith(nullsLast(compareByDescending { it })))
     println(data.sortedWith(nullsFirst(compareByDescending { it.nullIfEmpty() })))
+    // Two-arg compareBy declares [T, K]; the expected Comparator<T> binds
+    // only T — a PARTIAL binding still instantiates the selector's input.
+    fun String.nonEmptyLength() = if (isEmpty()) null else length
+    val strs = listOf("", "sort", "abc")
+    println(strs.sortedWith(compareBy(nullsLast<Int>()) { it.nonEmptyLength() }))
 }

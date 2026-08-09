@@ -4426,6 +4426,55 @@ fn expectedReturnTypeArgsFor(b: *FuncBuilder, func: *const Func) Allocator.Error
     return out;
 }
 
+/// PARTIAL bindings solved from the call site's EXPECTED type: each of the
+/// callee's type parameters that appears as a direct return type argument
+/// binds to the expected's argument at that position; the rest stay unbound
+/// (unlike `expectedReturnTypeArgsFor`, which needs every one for the
+/// positional explicit-args slot). The caller owns the bindings' types.
+fn expectedReturnPartialBindings(b: *FuncBuilder, func: *const Func) Allocator.Error!?[]ir.Module.TypeBinding {
+    const exp = b.peekExpected() orelse return null;
+    if (exp.function != null or exp.type_args.len == 0) return null;
+    const tps = b.module.registry.func_type_params.get(func.id) orelse return null;
+    if (tps.items.len == 0) return null;
+    const ret = func.return_ty;
+    if (ret.name.len == 0 or ret.args.len == 0) return null;
+    if (!std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, ret.name, "?")), exp.name.name)) return null;
+    if (exp.type_args.len != ret.args.len) return null;
+    var out: std.ArrayList(ir.Module.TypeBinding) = .empty;
+    errdefer {
+        for (out.items) |*bd| {
+            var t = bd.ty;
+            t.deinit(b.allocator);
+        }
+        out.deinit(b.allocator);
+    }
+    for (tps.items) |tp| {
+        var found: ?usize = null;
+        var declared_nullable = false;
+        for (ret.args, 0..) |ra, ri| {
+            var rn = std.mem.trimEnd(u8, ra.name, "?");
+            if (std.mem.startsWith(u8, rn, "in#")) rn = rn[3..];
+            if (std.mem.startsWith(u8, rn, "out#")) rn = rn[4..];
+            if (std.mem.eql(u8, rn, tp)) {
+                found = ri;
+                declared_nullable = ra.nullable or std.mem.endsWith(u8, ra.name, "?");
+                break;
+            }
+        }
+        const ri = found orelse continue;
+        const ta = exp.type_args[ri];
+        if (ta.is_star) continue;
+        var ty = try loweredOwnedLocalTypeRef(b, &ta.ty);
+        if (declared_nullable) ty.nullable = false;
+        try out.append(b.allocator, .{ .name = tp, .ty = ty });
+    }
+    if (out.items.len == 0) {
+        out.deinit(b.allocator);
+        return null;
+    }
+    return try out.toOwnedSlice(b.allocator);
+}
+
 fn instantiatedLambdaValueParams(
     b: *FuncBuilder,
     func: *const Func,
@@ -4463,6 +4512,30 @@ fn instantiatedLambdaValueParams(
         explicit
     else
         (expected_explicit orelse explicit);
+    // A PARTIAL expected binding still instantiates the lambda slot's
+    // inputs: two-arg `compareBy(comparator, selector)` declares [T, K]
+    // and its `Comparator<T>` return binds only T from the expected type —
+    // exactly the parameter the selector's `it` needs; K stays bare and
+    // the per-slot guard below handles it.
+    var fn_ty_sub: ?ir.TypeRef = null;
+    defer if (fn_ty_sub) |*t| t.deinit(b.allocator);
+    if (type_args.len == 0 and expected_explicit == null) {
+        if (try expectedReturnPartialBindings(b, func)) |binds| {
+            defer {
+                for (binds) |*bd| {
+                    var t = bd.ty;
+                    t.deinit(b.allocator);
+                }
+                b.allocator.free(binds);
+            }
+            var scratch0 = std.heap.ArenaAllocator.init(b.allocator);
+            defer scratch0.deinit();
+            if (ir.Module.substituteBoundType(scratch0.allocator(), fn_ty, binds) catch null) |sub| {
+                fn_ty_sub = try sub.clone(b.allocator);
+            }
+        }
+    }
+    const fn_ty_eff: ir.TypeRef = fn_ty_sub orelse fn_ty;
     var instantiated = blk: {
         // The ENGINE: solve every binding the call site offers — receiver,
         // typed value arguments, explicit type args — in one pass and
@@ -4485,7 +4558,7 @@ fn instantiatedLambdaValueParams(
                 false,
             ) catch break :engine) orelse break :engine;
             if (solved.bindings.len == 0) break :engine;
-            const substituted = ir.Module.substituteBoundType(a, fn_ty, solved.bindings) catch break :engine;
+            const substituted = ir.Module.substituteBoundType(a, fn_ty_eff, solved.bindings) catch break :engine;
             break :blk try substituted.clone(b.allocator);
         }
         // With no explicit type args, the ACTUAL receiver may bind the
@@ -4499,7 +4572,7 @@ fn instantiatedLambdaValueParams(
                 if (try b.module.instantiatedTypeFromReceiverPartial(
                     b.allocator,
                     func.id,
-                    fn_ty,
+                    fn_ty_eff,
                     r.*,
                 )) |t| break :blk t;
             }
@@ -4507,9 +4580,9 @@ fn instantiatedLambdaValueParams(
         break :blk (try b.module.instantiatedDeclarationType(
             b.allocator,
             func.id,
-            fn_ty,
+            fn_ty_eff,
             explicit_eff,
-        )) orelse try fn_ty.clone(b.allocator);
+        )) orelse try fn_ty_eff.clone(b.allocator);
     };
     defer instantiated.deinit(b.allocator);
 

@@ -2463,6 +2463,7 @@ test "nested_expected_comparator_chain" {
         \\[null, , a]
         \\[a, , null]
         \\[null, a, ]
+        \\[abc, sort, ]
         \\
     );
 }
