@@ -682,6 +682,20 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         b.module.pending_lambda_self_fn = .{ .name = f.name.name, .mangled = mangled_name };
         // Non-callable-local evidence flows into the body.
         b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
+        // The enclosing locals' declared types cross into the local fn's
+        // body exactly as they cross into a lambda's — `isoString` (an
+        // annotated fn param) read inside a local `parseFailure` lowered
+        // untyped without this. Derived-init locals resolve HERE, the only
+        // scope their initializers were written in.
+        b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
+        if (b.module.pending_lambda_local_decl_types) |*locals| {
+            var init_it = b.localInitExprIterator();
+            while (init_it.next()) |e| {
+                if (locals.types.contains(e.key_ptr.*)) continue;
+                const derived = expr_mod.staticExprTypeRef(b, e.value_ptr.*) catch null;
+                if (derived) |ty| try locals.types.put(e.key_ptr.*, ty);
+            }
+        }
         // Vararg param names: the body registers those as the materialized
         // array head rather than the annotated element type.
         var vararg_names: std.ArrayList([]const u8) = .empty;
