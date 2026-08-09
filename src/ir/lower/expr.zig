@@ -10623,6 +10623,26 @@ fn staticCallReturnTypeRef(
     b: *FuncBuilder,
     call_expr: *const Expr,
 ) Allocator.Error!?ir.TypeRef {
+    // The Any members' returns are fixed by their signatures — every
+    // override keeps them — so a chain does not die at `.toString()` on a
+    // receiver nothing could type (`(...).toString().substring(1)`). A
+    // safe call carries the `?`.
+    if (call_expr.* == .Call) {
+        const c = call_expr.Call;
+        if (c.callee.* == .Member) {
+            const m = c.callee.Member;
+            const nm2 = m.name.name;
+            if (c.args.len == 0 and std.mem.eql(u8, nm2, "toString")) {
+                return .{ .name = try b.allocator.dupe(u8, "String"), .nullable = m.safe, .args = &.{} };
+            }
+            if (c.args.len == 0 and std.mem.eql(u8, nm2, "hashCode")) {
+                return .{ .name = try b.allocator.dupe(u8, "Int"), .nullable = m.safe, .args = &.{} };
+            }
+            if (c.args.len == 1 and std.mem.eql(u8, nm2, "equals")) {
+                return .{ .name = try b.allocator.dupe(u8, "Boolean"), .nullable = m.safe, .args = &.{} };
+            }
+        }
+    }
     if (try fnTypedCalleeReturnTypeRef(b, call_expr)) |t| return t;
     if (try fqnCallReturnTypeRef(b, call_expr)) |t| return t;
     if (try localFnReturnTypeRef(b, call_expr)) |t| return t;
