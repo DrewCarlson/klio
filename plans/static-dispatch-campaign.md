@@ -6941,3 +6941,34 @@ CompareContext turned out to be top-level, NOT local-class),
 sortComparator .name, groupBy orEmpty-Index, mapBehavior
 isEmpty().not(), 4 unprinted rows; walk tail = Result.fold (by
 design) + builtin-intrinsic ladder routes (task-15's adapter table).
+
+## Continuation pin (post 0c6edffe): the last 14, each named
+
+The propertyEquals walk family is DEAD (three mechanisms: object{}
+types Any so the marker-let splices; the PROVEN splice-receiver leg
+pins its member slot — restricted to program-owned packages after the
+atomicfu ReentrantLock.unlock stub deadlock, and to chains of exactly
+the bound receiver; a lambda argument refutes resolvable
+non-fun-interface class params, so the KProperty1 sibling drops).
+KLIO_SPLICE_PIN / KLIO_LAMBDA_REFUTE are single-binary A/B gates.
+Walk ladder now: Result.fold 110 (BY DESIGN) + builtin-intrinsic
+routes (StringBuilder.toString 32, Iterator.hasNext 24,
+DefaultAsserter.assertEquals 22) — task-15's adapter table's rows.
+
+Census 14, all printed and named now:
+- TimeSource.Monotonic.ValueTimeMark x4 — VALUE-class nested ctor;
+  the NewInstance arm refuses is_value by design; needs the
+  value-class construction path extended to qualified nested paths.
+- flatten .size x2 — Array-sumOf receiver projection through the
+  enclosing fn's own type param (Array<out Array<out T>> element).
+- onEachIndexed x2 — `entries` on a BARE-TP receiver (M : Map bound);
+  the tp-bound chase serves property READS but not this member-call
+  receiver context.
+- local-class ctor inits x3 (coll/arr1) — the build-time typing row
+  (reserved-fid design, pinned earlier).
+- sortComparatorThenComparator .name x1, groupBy orEmpty-Index x1,
+  mapBehavior isEmpty().not() x1 — singles.
+
+Gates at 0c6edffe: suite 119/119, sweep 117/0, units green, corpus
+280/291 + verified flakes, litmus 42/43 (known flake; the mutex test
+3/3 standalone after the pin restriction).
