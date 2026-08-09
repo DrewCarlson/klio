@@ -2458,6 +2458,36 @@ test "bare_call_return_typing" {
     );
 }
 
+test "nested_expected_comparator_chain" {
+    try check("nested_expected_comparator_chain",
+        \\[null, , a]
+        \\[a, , null]
+        \\[null, a, ]
+        \\[abc, sort, ]
+        \\
+    );
+}
+
+test "bare_tp_receiver_lambda_invoke" {
+    // `item.getter()` on a bare-tp property with `getter: T.() -> P` in
+    // scope commits the VALUE (invoke) protocol as kotlinc resolves it —
+    // a runtime class's same-named member must not win the arbitration.
+    try check("bare_tp_receiver_lambda_invoke",
+        \\2
+        \\value
+        \\
+    );
+}
+
+test "ctor_generic_arg_inference" {
+    try check("ctor_generic_arg_inference",
+        \\[a, b]
+        \\1
+        \\4
+        \\
+    );
+}
+
 test "comparator_sibling_expected" {
     try check("comparator_sibling_expected",
         \\bca
@@ -2467,6 +2497,10 @@ test "comparator_sibling_expected" {
     );
 }
 
+// The trailing `3` row pins the NEW fixture line (`outer(arrayOf(...))` —
+// the member-form lambda-return pick committing the Long sumOf variant;
+// kotlinc prints 3 where the runtime re-pick had printed 3.0). The prior
+// rows are unchanged.
 test "lambda_return_overload_pick" {
     try check("lambda_return_overload_pick",
         \\6
@@ -2476,6 +2510,7 @@ test "lambda_return_overload_pick" {
         \\6
         \\6
         \\6
+        \\3
         \\
     );
 }

@@ -8783,7 +8783,18 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
         // route, and an un-gated arm made the flat kill-switch a no-op for
         // exactly the calls it exists to bisect.
         if (flatEnabled()) armHostFlatReq();
-        const cno_res = try host.callNamedOverload(allocator, frame.module, cmg.candidates, name_str, arg_values, names, cmg.class, is_ctor_name, frame.func.package, cno_file, cno_anchor);
+        // A pinned overload family: call-site evidence committed cmg.func;
+        // the candidate slice narrows to it (the slice is authoritative by
+        // contract, so the value re-rank cannot widen back out).
+        var pin_buf: [1]FuncId = undefined;
+        const eff_candidates: ?[]const FuncId = blk: {
+            if (cmg.func_final) if (cmg.func) |pf| {
+                pin_buf[0] = pf;
+                break :blk pin_buf[0..1];
+            };
+            break :blk cmg.candidates;
+        };
+        const cno_res = try host.callNamedOverload(allocator, frame.module, eff_candidates, name_str, arg_values, names, cmg.class, is_ctor_name, frame.func.package, cno_file, cno_anchor);
         _ = takeHostFlatArm();
         if (takeHostFlatReq()) |req0| {
             var prep = req0;

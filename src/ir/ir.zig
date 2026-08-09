@@ -691,6 +691,13 @@ pub const Inst = union(enum) {
         /// shadow it; the global leg calls exactly this declaration
         /// instead of re-resolving the simple name.
         func: ?FuncId = null,
+        /// Call-site EVIDENCE committed `func` among a return-variant
+        /// family (an `as` cast or the trailing lambda's derived return):
+        /// the global leg must not value-re-rank past it - a closure
+        /// argument carries no return type, so the re-rank would run the
+        /// first-declared variant (the Double sumOf, printing 3.0 where
+        /// kotlinc prints 3). The member leg still runs first.
+        func_final: bool = false,
         /// The package/import-scoped callable set computed by the lowering
         /// resolver. `null` is the legacy/host-symbol boundary: no complete,
         /// rankable declaration set was available, so the runtime may consult
@@ -9899,6 +9906,35 @@ pub const Module = struct {
                 const cur = found orelse return null;
                 const new = r orelse return null;
                 if (!std.mem.eql(u8, cur.name, new.name)) return null;
+            }
+        }
+        return found;
+    }
+
+    /// The tiered HEAD twin of `topLevelPropTypeRef`: a scalar top-level
+    /// property (`private const val DAYS_PER_CYCLE = 146097L`) records only
+    /// its head, and the deriver's Path arm needs it under the same
+    /// caller-scope tiers.
+    pub fn topLevelPropTypeHeadTiered(
+        self: *const Module,
+        name: []const u8,
+        caller_pkg: []const u8,
+        caller_file: FileId,
+    ) ?[]const u8 {
+        const list = self.registry.top_level_prop_pkgs.get(name) orelse return null;
+        var best_tier: u8 = 255;
+        var found: ?[]const u8 = null;
+        for (list.items) |pd| {
+            const t = self.scopeTier(pd.fqn, pd.package, name, caller_pkg, caller_file);
+            if (t == 255) continue;
+            const h = self.registry.top_level_prop_type_heads.get(pd.fqn);
+            if (t < best_tier) {
+                best_tier = t;
+                found = h;
+            } else if (t == best_tier) {
+                const cur = found orelse return null;
+                const new = h orelse return null;
+                if (!std.mem.eql(u8, cur, new)) return null;
             }
         }
         return found;

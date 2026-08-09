@@ -546,6 +546,19 @@ pub fn spliceInlineLambdaOn(
         });
         try b.bind(pname, arg_regs[bi]);
         b.clearLocalDeclType(pname);
+        // The literal's OWN annotation is the parameter's type
+        // (`{ index, acc: Number, e -> ... }`): it outranks whatever the
+        // callee's argument expression derives, exactly as kotlinc types an
+        // annotated lambda parameter.
+        if (params.len != 0 and bi < lam.Lambda.param_tys.len) {
+            if (lam.Lambda.param_tys[bi]) |*annotated| {
+                try b.setLocalDeclTypeOwned(
+                    pname,
+                    try expr_lower.loweredOwnedLocalTypeRef(b, annotated),
+                );
+                continue;
+            }
+        }
         const arg_ty: ?ir.TypeRef = arg_tys[bi];
         if (arg_ty) |ty| {
             // A head that is still a bare TYPE PARAMETER names nothing in
@@ -1484,6 +1497,12 @@ pub fn tryInlineCallWithTypeArgs(
                 defer owned.deinit(b.allocator);
                 recv_head = try b.allocator.dupe(u8, expr_lower.typeHead(std.mem.trimEnd(u8, owned.name, "?")));
             }
+        } else if (b.recvTy() orelse b.spliceRecvTy()) |eh| {
+            // A BARE call to the generic receiver splice (`apply { ... }`
+            // inside `M.onEachIndexed`) has no receiver expression; the
+            // window head is the ENCLOSING receiver's, not the callee's
+            // own literal `T`.
+            recv_head = try b.allocator.dupe(u8, expr_lower.typeHead(std.mem.trimEnd(u8, eh, "?")));
         };
         b.setSpliceRecvTy(recv_head);
     } else if (member_splice) {
@@ -1492,6 +1511,16 @@ pub fn tryInlineCallWithTypeArgs(
         // (`inner.walkInner(...)` inside a spliced `Walker.walk` reads
         // Walker's `inner` property).
         if (inline_state.inlineMemberOwner(f)) |ow| b.setSpliceRecvTy(ow);
+    } else if (this_arg == null) {
+        // A BARE inline-member call through the implicit receiver
+        // (`propertyFailsWith { ... }` inside an extension declared ON the
+        // owner) splices with the owner window too — without it the body's
+        // own property reads (`expected.getter()`) lower ownerless.
+        if (inline_state.inlineMemberOwner(f)) |ow| {
+            b.setSpliceRecvTy(ow);
+        } else if (build.FuncBuilder.spliceRefDebug()) {
+            std.debug.print("[splice-ref] fn={s} bare-member-owner=NULL\n", .{f.name.name});
+        }
     }
     defer b.setSpliceRecvTy(prev_splice_recv);
     // The ACTUAL receiver's full static type enters the window when the

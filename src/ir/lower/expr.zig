@@ -291,6 +291,27 @@ fn overloadPickByLambdaReturn(
     args: []const Expr,
     want: usize,
 ) Allocator.Error!?FuncId {
+    return overloadPickByLambdaReturnRecv(b, cands, args, want, null);
+}
+
+fn overloadPickByLambdaReturnRecv(
+    b: *FuncBuilder,
+    cands: []const FuncId,
+    args: []const Expr,
+    want: usize,
+    explicit_recv_head: ?[]const u8,
+) Allocator.Error!?FuncId {
+    return overloadPickByLambdaReturnFull(b, cands, args, want, explicit_recv_head, null);
+}
+
+fn overloadPickByLambdaReturnFull(
+    b: *FuncBuilder,
+    cands: []const FuncId,
+    args: []const Expr,
+    want: usize,
+    explicit_recv_head: ?[]const u8,
+    recv_expr: ?*const Expr,
+) Allocator.Error!?FuncId {
     if (args.len == 0) return null;
     const li = args.len - 1;
     if (args[li] != .Lambda) return null;
@@ -304,6 +325,7 @@ fn overloadPickByLambdaReturn(
     // agreement check — the CharSequence variants' `(Char) -> R` params must
     // not disagree a UByteArray family into a bail.
     const actual_recv_head: ?[]const u8 = blk: {
+        if (explicit_recv_head) |h| break :blk h;
         const h = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse break :blk null;
         break :blk typeHead(std.mem.trimEnd(u8, h, "?"));
     };
@@ -428,8 +450,19 @@ fn overloadPickByLambdaReturn(
         } else if (dh.len <= 2 or ir.parseClassTypeParamIdentity(declared.name) != null) {
             if (fparams.len != 1) return null;
             if (elem_owned == null) {
-                const this_expr: Expr = .{ .This = .{ .qualifier = null, .span = args[li].span() } };
-                elem_owned = try iterableElementTypeRef(b, &this_expr);
+                if (recv_expr) |re| {
+                    elem_owned = try iterableElementTypeRef(b, re);
+                } else {
+                    const this_expr: Expr = .{ .This = .{ .qualifier = null, .span = args[li].span() } };
+                    elem_owned = try iterableElementTypeRef(b, &this_expr);
+                }
+                if (lamret_trace) {
+                    std.debug.print("[lamret-elem] recv_expr={} recvTy={s} elem={s}\n", .{
+                        recv_expr != null,
+                        b.recvTy() orelse "-",
+                        if (elem_owned) |e2| e2.name else "<null>",
+                    });
+                }
             }
             const elem = elem_owned orelse return null;
             try nb.setLocalDeclTypeOwned(pname, try elem.clone(b.allocator));
@@ -3347,7 +3380,10 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (locals.types.contains(e.key_ptr.*)) continue;
             const prev_self = init_self_name;
             if (b.localInitNameFree(e.key_ptr.*)) init_self_name = e.key_ptr.*;
-            const derived = staticCallReturnTypeRef(b, e.value_ptr.*) catch null;
+            // The FULL deriver, not just the call-return channel: a literal
+            // or member-read init crosses the capture boundary too
+            // (`var result = 0` read inside the repeat lambda).
+            const derived = staticExprTypeRef(b, e.value_ptr.*) catch null;
             init_self_name = prev_self;
             if (derived) |ty| try locals.types.put(e.key_ptr.*, ty);
         }
@@ -4392,9 +4428,15 @@ fn expectedReturnTypeArgsFor(b: *FuncBuilder, func: *const Func) Allocator.Error
     }
     for (tps.items) |tp| {
         var found: ?usize = null;
+        var declared_nullable = false;
         for (ret.args, 0..) |ra, ri| {
-            if (std.mem.eql(u8, std.mem.trimEnd(u8, ra.name, "?"), tp)) {
+            var rn = std.mem.trimEnd(u8, ra.name, "?");
+            if (std.mem.startsWith(u8, rn, "in#")) rn = rn[3..];
+            if (std.mem.startsWith(u8, rn, "out#")) rn = rn[4..];
+            if (std.mem.eql(u8, rn, tp)) {
                 found = ri;
+                declared_nullable = ra.nullable or rn.len != std.mem.trimEnd(u8, ra.name, "?").len or
+                    std.mem.endsWith(u8, ra.name, "?");
                 break;
             }
         }
@@ -4410,9 +4452,63 @@ fn expectedReturnTypeArgsFor(b: *FuncBuilder, func: *const Func) Allocator.Error
             return null;
         }
         out[filled] = try loweredOwnedLocalTypeRef(b, &ta.ty);
+        // A declared `T?` return position already carries the `?`: the
+        // binding is the expected argument WITHOUT it (`Comparator<T?>`
+        // against `Comparator<String?>` binds T := String, satisfying
+        // `T : Any` exactly as kotlinc solves nullsFirst).
+        if (declared_nullable) out[filled].nullable = false;
         filled += 1;
     }
     return out;
+}
+
+/// PARTIAL bindings solved from the call site's EXPECTED type: each of the
+/// callee's type parameters that appears as a direct return type argument
+/// binds to the expected's argument at that position; the rest stay unbound
+/// (unlike `expectedReturnTypeArgsFor`, which needs every one for the
+/// positional explicit-args slot). The caller owns the bindings' types.
+fn expectedReturnPartialBindings(b: *FuncBuilder, func: *const Func) Allocator.Error!?[]ir.Module.TypeBinding {
+    const exp = b.peekExpected() orelse return null;
+    if (exp.function != null or exp.type_args.len == 0) return null;
+    const tps = b.module.registry.func_type_params.get(func.id) orelse return null;
+    if (tps.items.len == 0) return null;
+    const ret = func.return_ty;
+    if (ret.name.len == 0 or ret.args.len == 0) return null;
+    if (!std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, ret.name, "?")), exp.name.name)) return null;
+    if (exp.type_args.len != ret.args.len) return null;
+    var out: std.ArrayList(ir.Module.TypeBinding) = .empty;
+    errdefer {
+        for (out.items) |*bd| {
+            var t = bd.ty;
+            t.deinit(b.allocator);
+        }
+        out.deinit(b.allocator);
+    }
+    for (tps.items) |tp| {
+        var found: ?usize = null;
+        var declared_nullable = false;
+        for (ret.args, 0..) |ra, ri| {
+            var rn = std.mem.trimEnd(u8, ra.name, "?");
+            if (std.mem.startsWith(u8, rn, "in#")) rn = rn[3..];
+            if (std.mem.startsWith(u8, rn, "out#")) rn = rn[4..];
+            if (std.mem.eql(u8, rn, tp)) {
+                found = ri;
+                declared_nullable = ra.nullable or std.mem.endsWith(u8, ra.name, "?");
+                break;
+            }
+        }
+        const ri = found orelse continue;
+        const ta = exp.type_args[ri];
+        if (ta.is_star) continue;
+        var ty = try loweredOwnedLocalTypeRef(b, &ta.ty);
+        if (declared_nullable) ty.nullable = false;
+        try out.append(b.allocator, .{ .name = tp, .ty = ty });
+    }
+    if (out.items.len == 0) {
+        out.deinit(b.allocator);
+        return null;
+    }
+    return try out.toOwnedSlice(b.allocator);
 }
 
 fn instantiatedLambdaValueParams(
@@ -4452,6 +4548,30 @@ fn instantiatedLambdaValueParams(
         explicit
     else
         (expected_explicit orelse explicit);
+    // A PARTIAL expected binding still instantiates the lambda slot's
+    // inputs: two-arg `compareBy(comparator, selector)` declares [T, K]
+    // and its `Comparator<T>` return binds only T from the expected type —
+    // exactly the parameter the selector's `it` needs; K stays bare and
+    // the per-slot guard below handles it.
+    var fn_ty_sub: ?ir.TypeRef = null;
+    defer if (fn_ty_sub) |*t| t.deinit(b.allocator);
+    if (type_args.len == 0 and expected_explicit == null) {
+        if (try expectedReturnPartialBindings(b, func)) |binds| {
+            defer {
+                for (binds) |*bd| {
+                    var t = bd.ty;
+                    t.deinit(b.allocator);
+                }
+                b.allocator.free(binds);
+            }
+            var scratch0 = std.heap.ArenaAllocator.init(b.allocator);
+            defer scratch0.deinit();
+            if (ir.Module.substituteBoundType(scratch0.allocator(), fn_ty, binds) catch null) |sub| {
+                fn_ty_sub = try sub.clone(b.allocator);
+            }
+        }
+    }
+    const fn_ty_eff: ir.TypeRef = fn_ty_sub orelse fn_ty;
     var instantiated = blk: {
         // The ENGINE: solve every binding the call site offers — receiver,
         // typed value arguments, explicit type args — in one pass and
@@ -4474,7 +4594,7 @@ fn instantiatedLambdaValueParams(
                 false,
             ) catch break :engine) orelse break :engine;
             if (solved.bindings.len == 0) break :engine;
-            const substituted = ir.Module.substituteBoundType(a, fn_ty, solved.bindings) catch break :engine;
+            const substituted = ir.Module.substituteBoundType(a, fn_ty_eff, solved.bindings) catch break :engine;
             break :blk try substituted.clone(b.allocator);
         }
         // With no explicit type args, the ACTUAL receiver may bind the
@@ -4488,7 +4608,7 @@ fn instantiatedLambdaValueParams(
                 if (try b.module.instantiatedTypeFromReceiverPartial(
                     b.allocator,
                     func.id,
-                    fn_ty,
+                    fn_ty_eff,
                     r.*,
                 )) |t| break :blk t;
             }
@@ -4496,9 +4616,9 @@ fn instantiatedLambdaValueParams(
         break :blk (try b.module.instantiatedDeclarationType(
             b.allocator,
             func.id,
-            fn_ty,
+            fn_ty_eff,
             explicit_eff,
-        )) orelse try fn_ty.clone(b.allocator);
+        )) orelse try fn_ty_eff.clone(b.allocator);
     };
     defer instantiated.deinit(b.allocator);
 
@@ -4698,6 +4818,15 @@ fn argLambdaParamTypesRecv(
                     lam_shapes,
                 );
                 any = any or slot.* != null;
+            }
+        }
+    }
+    if (runtime.envOnce("KLIO_ALPT")) |want| {
+        if (std.mem.eql(u8, want, func.name)) {
+            for (out, 0..) |slot, i| {
+                if (slot) |tys| {
+                    for (tys) |t| std.debug.print("[alpt-slot] {s}#{d} arg{d} ty={s}\n", .{ func.fqn, func.id.int(), i, t.name });
+                }
             }
         }
     }
@@ -9691,16 +9820,31 @@ fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.
     }
     if (call.callee.* != .Path or call.callee.Path.segments.len != 1) return null;
     const ident = call.callee.Path.segments[0];
+    const citr_trace = if (runtime.envOnce("KLIO_CITR_TRACE")) |w| std.mem.eql(u8, w, ident.name) else false;
+    // A LOCAL class registers only at runtime (`RegisterClass` with its
+    // captures): no lowering-time row exists, and the module index would
+    // answer an unrelated same-named class — the resolve() bail below
+    // already catches it (the declaration binds the name), noted here so
+    // the local-class tail is not re-probed as a missed lookup.
     // A local or a function of the same name is not a constructor call.
-    if (b.resolve(ident.name) != null or b.knowsOuter(ident.name)) return null;
-    if (b.module.funcId(ident.name) != null) return null;
+    if (b.resolve(ident.name) != null or b.knowsOuter(ident.name)) {
+        if (citr_trace) std.debug.print("[citr] {s} bail=local_or_outer\n", .{ident.name});
+        return null;
+    }
+    if (b.module.funcId(ident.name) != null) {
+        if (citr_trace) std.debug.print("[citr] {s} bail=func_namesake\n", .{ident.name});
+        return null;
+    }
     // A collision-mangled internal class (`SlotTable$fN`) is absent from the
     // simple-name index. A same-file/package reference reaches it through
     // the scope rename ladder; a cross-package one through its exact import,
     // which still resolves by FQN.
     const ref_name = scopeTypeRename(b, ident.name, ident.span.file.int()) orelse ident.name;
     const cid = b.module.classIdIndexed(ref_name, b.self_package, ident.span.file) orelse
-        b.module.classIdExactImport(ident.name, ident.span.file) orelse return null;
+        b.module.classIdExactImport(ident.name, ident.span.file) orelse {
+        if (citr_trace) std.debug.print("[citr] {s} bail=no_class ref_name={s}\n", .{ ident.name, ref_name });
+        return null;
+    };
     // A MEMBER of the enclosing receiver shadows the constructor, exactly as
     // the emission router decides it (`fun Foo(): Bar` inside Host makes a
     // bare `Foo()` the member call). Typing the local as the class here bound
@@ -9711,10 +9855,65 @@ fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.
     // An object is not constructed; a stub or value class has no instance
     // identity for a member call to bind against.
     if (class.is_object or class.is_stub or class.is_value) return null;
-    const args = try b.allocator.alloc(ir.TypeRef, call.type_args.len);
+    var args = try b.allocator.alloc(ir.TypeRef, call.type_args.len);
     errdefer b.allocator.free(args);
     for (call.type_args, args) |*ty, *out| {
         out.* = try decl_mod.loweredTypeRef(b.allocator, ty, true);
+    }
+    // With no explicit `<...>`, a generic class's arguments infer from the
+    // CONSTRUCTOR arguments (kotlinc's inference): a primary param declared
+    // bare `E` takes its argument's own type; one declared `X<..., E, ...>`
+    // takes the argument's type argument at that position when the arities
+    // line up. Every class parameter must bind or the head-only refusal
+    // below stands.
+    if (args.len == 0 and class.type_params.len != 0 and call.args.len != 0) infer: {
+        const inferred = try b.allocator.alloc(ir.TypeRef, class.type_params.len);
+        var got: usize = 0;
+        var ok = true;
+        defer if (!ok) {
+            for (inferred[0..got]) |*t| t.deinit(b.allocator);
+            b.allocator.free(inferred);
+        };
+        for (class.type_params) |tp| {
+            var bound: ?ir.TypeRef = null;
+            params: for (class.primary_params, 0..) |*p, pi| {
+                if (pi >= call.args.len) break;
+                const pt = p.ty;
+                if (std.mem.eql(u8, std.mem.trimEnd(u8, pt.name, "?"), tp)) {
+                    bound = try staticExprTypeRef(b, &call.args[pi]);
+                    break :params;
+                }
+                for (pt.args, 0..) |pa, ai| {
+                    var an = std.mem.trimEnd(u8, pa.name, "?");
+                    if (std.mem.startsWith(u8, an, "in#")) an = an[3..];
+                    if (std.mem.startsWith(u8, an, "out#")) an = an[4..];
+                    if (!std.mem.eql(u8, an, tp)) continue;
+                    var at = (try staticExprTypeRef(b, &call.args[pi])) orelse continue :params;
+                    defer at.deinit(b.allocator);
+                    if (at.args.len == pt.args.len and ai < at.args.len) {
+                        bound = try at.args[ai].clone(b.allocator);
+                    }
+                    break :params;
+                }
+            }
+            var bt = bound orelse {
+                ok = false;
+                break :infer;
+            };
+            var bh = std.mem.trimEnd(u8, bt.name, "?");
+            if (std.mem.indexOfScalar(u8, bh, '<')) |lt| bh = bh[0..lt];
+            const bare_tp = (bh.len > 0 and bh.len <= 2 and std.ascii.isUpper(bh[0])) or
+                b.isTypeParam(bh) or ir.parseClassTypeParamIdentity(bh) != null;
+            if (bh.len == 0 or bare_tp) {
+                bt.deinit(b.allocator);
+                ok = false;
+                break :infer;
+            }
+            inferred[got] = bt;
+            got += 1;
+        }
+        b.allocator.free(args);
+        args = inferred;
     }
     var derived = ir.TypeRef{
         .name = try b.allocator.dupe(u8, class.fqn),
@@ -9811,7 +10010,12 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
         }
     }
     if (ty.args.len != 1) return null;
-    const elem = ty.args[0].name;
+    var elem = ty.args[0].name;
+    // Declaration-site variance is spelling, not structure: the element of
+    // `Array<out Array<out T>>` is the inner Array, not a name the head
+    // tables could ever hold.
+    if (std.mem.startsWith(u8, elem, "in#")) elem = elem[3..];
+    if (std.mem.startsWith(u8, elem, "out#")) elem = elem[4..];
     if (elem.len == 0) return null;
     // A STAR projection's element is `Any?` — the projection's own upper
     // bound, which is what Kotlin resolves a call on it against.
@@ -9829,13 +10033,26 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
     // bound record the head still names nothing and the old answer stands.
     if (elem.len <= 2 and std.ascii.isUpper(elem[0])) {
         if (b.typeParamBound(elem) == null) return null;
-        return try ty.args[0].clone(b.allocator);
+        return try cloneElemStripped(b, &ty.args[0], elem);
     }
     var head = elem;
     if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (b.module.classIdByFqn(head) == null and
         b.module.uniqueClassIdBySimpleName(typeHead(head)) == null) return null;
-    return try ty.args[0].clone(b.allocator);
+    return try cloneElemStripped(b, &ty.args[0], elem);
+}
+
+/// Clone the element type with the variance mangle stripped from its NAME —
+/// the checks above judged the stripped spelling, and every consumer keys
+/// heads by it.
+fn cloneElemStripped(b: *FuncBuilder, arg: *const ir.TypeRef, stripped: []const u8) Allocator.Error!ir.TypeRef {
+    var out = try arg.clone(b.allocator);
+    if (!std.mem.eql(u8, out.name, stripped)) {
+        const owned = try b.allocator.dupe(u8, stripped);
+        b.allocator.free(out.name);
+        out.name = owned;
+    }
+    return out;
 }
 
 pub fn iterableElementTypeName(b: *FuncBuilder, iter: *const Expr) Allocator.Error!?[]const u8 {
@@ -9934,6 +10151,21 @@ fn memberArgCount(call_expr: *const Expr) usize {
 }
 
 pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
+    // Literals name their own type (`var result = 0` is an Int wherever
+    // the var is read, including across a capture boundary).
+    switch (e.*) {
+        .IntLit => |lit| return .{ .name = try b.allocator.dupe(u8, switch (lit.kind) {
+            .Long => "Long",
+            .UInt => "UInt",
+            .ULong => "ULong",
+            .Int => if (lit.value >= std.math.minInt(i32) and lit.value <= std.math.maxInt(i32)) "Int" else "Long",
+        }), .nullable = false, .args = &.{} },
+        .FloatLit => |lit| return .{ .name = try b.allocator.dupe(u8, if (lit.kind == .Float) "Float" else "Double"), .nullable = false, .args = &.{} },
+        .BoolLit => return .{ .name = try b.allocator.dupe(u8, "Boolean"), .nullable = false, .args = &.{} },
+        .CharLit => return .{ .name = try b.allocator.dupe(u8, "Char"), .nullable = false, .args = &.{} },
+        .StringTemplate => return .{ .name = try b.allocator.dupe(u8, "String"), .nullable = false, .args = &.{} },
+        else => {},
+    }
     if (argDeclTypeRef(b, e)) |known| return try known.clone(b.allocator);
     if (try ctorInitTypeRef(b, e)) |t| return t;
     if (try staticCallReturnTypeRef(b, e)) |t| return t;
@@ -9962,6 +10194,23 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
         .As => |cast| {
             var out = try decl_mod.loweredTypeRef(b.allocator, &cast.ty, true);
             if (cast.safe) out.nullable = true;
+            return out;
+        },
+        // An object EXPRESSION with a single supertype has that supertype
+        // as its denotable static type (kotlinc: `object : List<String> by
+        // coll {}` is a List<String> everywhere outside the literal). More
+        // than one supertype is the anonymous intersection — refused.
+        .ObjectExpr => |obj| {
+            if (obj.supertypes.len != 1) break :self_named;
+            var out = try decl_mod.loweredTypeRef(b.allocator, &obj.supertypes[0], true);
+            var h = std.mem.trimEnd(u8, out.name, "?");
+            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
+                ir.parseClassTypeParamIdentity(h) != null;
+            if (h.len == 0 or bare) {
+                out.deinit(b.allocator);
+                break :self_named;
+            }
             return out;
         },
         // `this` (or `this@Outer`) inside a class body, an extension body,
@@ -10056,6 +10305,18 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
             .Neg, .Pos => return try staticExprTypeRef(b, un.expr),
             else => {},
         },
+        // `x!!` is the operand's type made NON-null (`val step =
+        // nextStep!!` on a `Continuation<Unit>?` property).
+        .Postfix => |pf| if (pf.op == .NotNull) {
+            var t = (try staticExprTypeRef(b, pf.expr)) orelse break :self_named;
+            t.nullable = false;
+            if (std.mem.endsWith(u8, t.name, "?")) {
+                const trimmed = try b.allocator.dupe(u8, std.mem.trimEnd(u8, t.name, "?"));
+                b.allocator.free(t.name);
+                t.name = trimmed;
+            }
+            return t;
+        },
         // A bare name that reads an ENCLOSING class or companion property
         // lends its declared type: `payload shl bitsPerSymbol` inside a
         // Base64 member needs the companion const to answer Int before the
@@ -10066,23 +10327,92 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
             if (p.segments.len != 1) break :self_named;
             const nm = p.segments[0].name;
             if (b.resolve(nm) != null or b.isLocalFn(nm) or b.knowsOuter(nm)) break :self_named;
-            const owner = b.ownerClass() orelse break :self_named;
-            // The full-ref table records only arg-carrying declared types;
-            // a scalar property (`const val bitsPerSymbol: Int`) lives in
-            // the HEAD table.
-            if (propTypeRefOn(b, owner, nm)) |t| return try t.clone(b.allocator);
-            if (b.module.registry.class_prop_type_heads.get(.{ .a = owner, .b = nm })) |head| {
-                return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
-            }
-            // The companion's properties are in scope in the class body;
-            // they record under the lifted `{Owner}$Companion` key.
-            var ckey_buf: [160]u8 = undefined;
-            if (std.fmt.bufPrint(&ckey_buf, "{s}$Companion", .{owner})) |ckey| {
-                if (propTypeRefOn(b, ckey, nm)) |t| return try t.clone(b.allocator);
-                if (b.module.registry.class_prop_type_heads.get(.{ .a = ckey, .b = nm })) |head| {
+            if (b.ownerClass()) |owner| {
+                // The full-ref table records only arg-carrying declared
+                // types; a scalar property (`const val bitsPerSymbol: Int`)
+                // lives in the HEAD table.
+                if (propTypeRefOn(b, owner, nm)) |t| return try t.clone(b.allocator);
+                if (b.module.registry.class_prop_type_heads.get(.{ .a = owner, .b = nm })) |head| {
                     return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
                 }
-            } else |_| {}
+                // The companion's properties are in scope in the class body;
+                // they record under the lifted `{Owner}$Companion` key.
+                var ckey_buf: [160]u8 = undefined;
+                if (std.fmt.bufPrint(&ckey_buf, "{s}$Companion", .{owner})) |ckey| {
+                    if (propTypeRefOn(b, ckey, nm)) |t| return try t.clone(b.allocator);
+                    if (b.module.registry.class_prop_type_heads.get(.{ .a = ckey, .b = nm })) |head| {
+                        return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
+                    }
+                } else |_| {}
+            }
+            // A property of the IMPLICIT receiver — the declared receiver
+            // or the splice window — with a type-parameter head chased to
+            // its declared bound: `entries` inside the apply-spliced
+            // onEachIndexed body reads `Map<out K, V>.entries`.
+            impl: {
+                const h0 = b.recvTy() orelse b.spliceRecvTy() orelse break :impl;
+                var hh = typeHead(std.mem.trimEnd(u8, h0, "?"));
+                const impl_trace = if (runtime.envOnce("KLIO_IMPLPROP_TRACE")) |w| std.mem.eql(u8, w, nm) else false;
+                if (impl_trace) {
+                    std.debug.print("[implprop] {s} h0={s} tp={} bref={} tpb={}\n", .{
+                        nm, h0, b.isTypeParam(hh), b.typeParamBoundRef(hh) != null, b.typeParamBound(hh) != null,
+                    });
+                }
+                var bound_full: ?*const ir.TypeRef = null;
+                if (b.isTypeParam(hh) or (hh.len > 0 and hh.len <= 2 and std.ascii.isUpper(hh[0]))) {
+                    if (b.typeParamBoundRef(hh)) |bref| {
+                        bound_full = bref;
+                        hh = typeHead(std.mem.trimEnd(u8, bref.name, "?"));
+                    } else if (b.typeParamBound(hh)) |tpb| {
+                        // Head-only bound record: the head still names the
+                        // property's owner for the head-table answer.
+                        hh = typeHead(std.mem.trimEnd(u8, tpb.bound, "?"));
+                    } else if (b.enclosingRecvTy()) |eh2| {
+                        // The lambda's own receiver head may be the spliced
+                        // callee's literal param (apply's `T` inside
+                        // `M.onEachIndexed`); the ENCLOSING receiver's head
+                        // carries the real parameter and its bound.
+                        const hh2 = typeHead(std.mem.trimEnd(u8, eh2, "?"));
+                        if (b.typeParamBoundRef(hh2)) |bref2| {
+                            bound_full = bref2;
+                            hh = typeHead(std.mem.trimEnd(u8, bref2.name, "?"));
+                        } else if (b.typeParamBound(hh2)) |tpb2| {
+                            hh = typeHead(std.mem.trimEnd(u8, tpb2.bound, "?"));
+                        } else if (!(b.isTypeParam(hh2) or (hh2.len > 0 and hh2.len <= 2 and std.ascii.isUpper(hh2[0])))) {
+                            hh = hh2;
+                        } else break :impl;
+                    } else break :impl;
+                }
+                if (propTypeRefOn(b, hh, nm)) |declared| {
+                    if (bound_full) |br| {
+                        if (substitutedPropType(b, hh, br.*, declared)) |sub| {
+                            return try sub.clone(b.allocator);
+                        }
+                    } else if (b.recvTypeRef()) |rt| {
+                        if (substitutedPropType(b, hh, rt, declared)) |sub| {
+                            return try sub.clone(b.allocator);
+                        }
+                    }
+                }
+                if (b.module.registry.class_prop_type_heads.get(.{ .a = hh, .b = nm })) |ph| {
+                    const phh = typeHead(std.mem.trimEnd(u8, ph, "?"));
+                    if (phh.len > 2 and ir.parseClassTypeParamIdentity(phh) == null and !b.isTypeParam(phh)) {
+                        return .{ .name = try b.allocator.dupe(u8, ph), .nullable = false, .args = &.{} };
+                    }
+                }
+            }
+            // A TOP-LEVEL property read lends its recorded declared type
+            // under the caller's own scope tiers (`DAYS_PER_CYCLE` inside
+            // the ofEpochDay run block).
+            if (b.module.topLevelPropTypeRef(nm, b.self_package, p.segments[0].span.file)) |t| {
+                return try t.clone(b.allocator);
+            }
+            if (b.module.topLevelPropTypeHeadTiered(nm, b.self_package, p.segments[0].span.file)) |head| {
+                const hh = typeHead(std.mem.trimEnd(u8, head, "?"));
+                if (hh.len > 2 and ir.parseClassTypeParamIdentity(hh) == null) {
+                    return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
+                }
+            }
             break :self_named;
         },
         // A CLASS-NAMED member read: `TimeSource.Monotonic` (a nested
@@ -10092,10 +10422,49 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
         .Member => |m| {
             if (m.safe) break :self_named;
             const recv_p = m.receiver;
-            if (recv_p.* != .Path or recv_p.Path.segments.len != 1) break :self_named;
+            if (recv_p.* != .Path or recv_p.Path.segments.len != 1 or
+                b.resolve(recv_p.Path.segments[0].name) != null or
+                b.knowsOuter(recv_p.Path.segments[0].name) or
+                b.module.uniqueClassIdBySimpleName(recv_p.Path.segments[0].name) == null)
+            {
+                // Not a class-named read: a PROPERTY READ on any receiver
+                // the deriver can type answers the property's recorded
+                // declared type (`this@Duration.absoluteValue`), with the
+                // owner's parameters substituted from the receiver's own
+                // arguments where both sides carry them.
+                if (od_depth >= 3) break :self_named;
+                od_depth += 1;
+                const recv_owned = staticExprTypeRef(b, m.receiver) catch null;
+                od_depth -= 1;
+                var rt = recv_owned orelse break :self_named;
+                defer rt.deinit(b.allocator);
+                var rh = std.mem.trimEnd(u8, rt.name, "?");
+                if (std.mem.indexOfScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
+                const head = typeHead(rh);
+                if (head.len == 0) break :self_named;
+                if (runtime.envOnce("KLIO_IMPLPROP_TRACE")) |w| {
+                    if (std.mem.eql(u8, w, m.name.name)) {
+                        std.debug.print("[implprop-mem] {s} head={s} refs={} heads={}\n", .{
+                            m.name.name, head,
+                            propTypeRefOn(b, head, m.name.name) != null,
+                            b.module.registry.class_prop_type_heads.get(.{ .a = head, .b = m.name.name }) != null,
+                        });
+                    }
+                }
+                if (propTypeRefOn(b, head, m.name.name)) |declared| {
+                    if (substitutedPropType(b, head, rt, declared)) |sub| {
+                        return try sub.clone(b.allocator);
+                    }
+                }
+                if (b.module.registry.class_prop_type_heads.get(.{ .a = head, .b = m.name.name })) |ph| {
+                    const phh = typeHead(std.mem.trimEnd(u8, ph, "?"));
+                    if (phh.len > 2 and ir.parseClassTypeParamIdentity(phh) == null and !b.isTypeParam(phh)) {
+                        return .{ .name = try b.allocator.dupe(u8, ph), .nullable = false, .args = &.{} };
+                    }
+                }
+                break :self_named;
+            }
             const cls = recv_p.Path.segments[0].name;
-            if (b.resolve(cls) != null or b.knowsOuter(cls)) break :self_named;
-            if (b.module.uniqueClassIdBySimpleName(cls) == null) break :self_named;
             var qbuf: [192]u8 = undefined;
             if (std.fmt.bufPrint(&qbuf, "{s}.{s}", .{ cls, m.name.name })) |qual| {
                 if (b.module.classIdByQualifiedSuffix(qual) != null) {
@@ -10416,6 +10785,42 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
     const want = call.args.len;
     var pick: ?FuncId = (try overloadPickByCast(b, cands, call.args, want)) orelse
         try overloadPickByLambdaReturn(b, cands, call.args, want);
+    if (pick == null and want != 0 and want <= 4) exact: {
+        // EXACT argument-head discrimination for a scalar overload family:
+        // `getProgressionLastElement(Int, Int, Int): Int` vs the
+        // `(Long, Long, Long): Long` sibling picks by the derived heads.
+        var heads: [4]?ir.TypeRef = .{ null, null, null, null };
+        defer for (heads[0..want]) |*h| if (h.*) |*t| t.deinit(b.allocator);
+        if (od_depth >= 3) break :exact;
+        od_depth += 1;
+        for (call.args[0..want], 0..) |*arg, i| {
+            heads[i] = staticExprTypeRef(b, arg) catch null;
+        }
+        od_depth -= 1;
+        for (heads[0..want]) |h| {
+            if (h == null) break :exact;
+        }
+        var match: ?FuncId = null;
+        for (cands) |fid| {
+            const f = b.module.funcById(fid) orelse continue;
+            if (!f.hasBody()) continue;
+            const base: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+            if (f.params.len -| base != want) continue;
+            var all_exact = true;
+            for (f.params[base..], 0..) |*p2, i| {
+                const ah = typeHead(std.mem.trimEnd(u8, heads[i].?.name, "?"));
+                const ph = typeHead(std.mem.trimEnd(u8, p2.ty.name, "?"));
+                if (!std.mem.eql(u8, ah, ph)) {
+                    all_exact = false;
+                    break;
+                }
+            }
+            if (!all_exact) continue;
+            if (match != null) break :exact;
+            match = fid;
+        }
+        pick = match;
+    }
     if (pick == null) {
         var sole: ?FuncId = null;
         for (cands) |fid| {
@@ -10452,6 +10857,143 @@ fn staticCallReturnTypeRef(
     b: *FuncBuilder,
     call_expr: *const Expr,
 ) Allocator.Error!?ir.TypeRef {
+    // The Any members' returns are fixed by their signatures — every
+    // override keeps them — so a chain does not die at `.toString()` on a
+    // receiver nothing could type (`(...).toString().substring(1)`). A
+    // safe call carries the `?`.
+    if (call_expr.* == .Call) {
+        const c = call_expr.Call;
+        if (c.callee.* == .Member) {
+            const m = c.callee.Member;
+            const nm2 = m.name.name;
+            if (c.args.len == 0 and std.mem.eql(u8, nm2, "toString")) {
+                return .{ .name = try b.allocator.dupe(u8, "String"), .nullable = m.safe, .args = &.{} };
+            }
+            if (c.args.len == 0 and std.mem.eql(u8, nm2, "hashCode")) {
+                return .{ .name = try b.allocator.dupe(u8, "Int"), .nullable = m.safe, .args = &.{} };
+            }
+            if (c.args.len == 1 and std.mem.eql(u8, nm2, "equals")) {
+                return .{ .name = try b.allocator.dupe(u8, "Boolean"), .nullable = m.safe, .args = &.{} };
+            }
+            // The scalar CONVERSIONS have fixed returns on a primitive
+            // receiver (`it.size.toLong()` in the pick's probe builder -
+            // the builtin class rows carry no method ids for the member
+            // resolution to answer through).
+            if (c.args.len == 0 and !m.safe and od_depth < 4) conv: {
+                const table = [_]struct { n: []const u8, t: []const u8 }{
+                    .{ .n = "toInt", .t = "Int" },       .{ .n = "toLong", .t = "Long" },
+                    .{ .n = "toDouble", .t = "Double" }, .{ .n = "toFloat", .t = "Float" },
+                    .{ .n = "toShort", .t = "Short" },   .{ .n = "toByte", .t = "Byte" },
+                    .{ .n = "toChar", .t = "Char" },     .{ .n = "toUInt", .t = "UInt" },
+                    .{ .n = "toULong", .t = "ULong" },   .{ .n = "toUShort", .t = "UShort" },
+                    .{ .n = "toUByte", .t = "UByte" },
+                };
+                var hit: ?[]const u8 = null;
+                for (table) |cv| {
+                    if (std.mem.eql(u8, nm2, cv.n)) {
+                        hit = cv.t;
+                        break;
+                    }
+                }
+                const out_head = hit orelse break :conv;
+                od_depth += 1;
+                const rt0 = staticExprTypeRef(b, m.receiver) catch null;
+                od_depth -= 1;
+                var rt = rt0 orelse break :conv;
+                defer rt.deinit(b.allocator);
+                if (rt.nullable) break :conv;
+                const rh0 = typeHead(std.mem.trimEnd(u8, rt.name, "?"));
+                if (!isPrimitiveTypeName(rh0)) break :conv;
+                return .{ .name = try b.allocator.dupe(u8, out_head), .nullable = false, .args = &.{} };
+            }
+        }
+    }
+    // The universal scope functions have fixed semantics (the emission
+    // already treats them as no-dispatch splices): `.also`/`.apply` return
+    // their RECEIVER, `.let`/`.run` return their lambda's tail, derived
+    // under the receiver-bound parameter. Depth-guarded like every other
+    // recursive derivation.
+    if (call_expr.* == .Call) scope_fns: {
+        const c = call_expr.Call;
+        if (c.callee.* != .Member) break :scope_fns;
+        const m = c.callee.Member;
+        if (m.safe) break :scope_fns;
+        const nm2 = m.name.name;
+        const is_echo = std.mem.eql(u8, nm2, "also") or std.mem.eql(u8, nm2, "apply");
+        const is_tail = std.mem.eql(u8, nm2, "let") or std.mem.eql(u8, nm2, "run");
+        if (!is_echo and !is_tail) break :scope_fns;
+        const sfx_trace = runtime.envOnce("KLIO_SCOPEFN_TRACE") != null;
+        if (sfx_trace) std.debug.print("[scopefn] {s} enter depth={d}\n", .{ nm2, od_depth });
+        // The ambient derivation chain often sits at depth 3 when a local's
+        // `.let` init derives (emission ladder -> init chain -> nested
+        // derivations); this arm does constant extra work per level, so it
+        // gets its own slightly higher constant bound.
+        if (od_depth >= 6) {
+            if (sfx_trace) std.debug.print("[scopefn] {s} bail=depth {d}\n", .{ nm2, od_depth });
+            break :scope_fns;
+        }
+        if (c.args.len != 1 or c.args[0] != .Lambda) {
+            if (sfx_trace) std.debug.print("[scopefn] {s} bail=args n={d}\n", .{ nm2, c.args.len });
+            break :scope_fns;
+        }
+        // Only when no competing declaration could own the name: every
+        // same-simple-name candidate must be a kotlin-package extension (a
+        // user's own `let` keeps its declared return), and the receiver's
+        // class hierarchy must not declare a member of the name.
+        for (b.module.funcsBySimpleName(nm2)) |fid2| {
+            const f2 = b.module.funcById(fid2) orelse continue;
+            const is_ext2 = f2.params.len != 0 and std.mem.eql(u8, f2.params[0].name, "this");
+            const kotlin_pkg = std.mem.eql(u8, f2.package, "kotlin") or
+                std.mem.startsWith(u8, f2.package, "kotlin.");
+            if (!is_ext2 or !kotlin_pkg) {
+                if (sfx_trace) std.debug.print("[scopefn] {s} bail=candidate {s} pkg={s}\n", .{ nm2, f2.fqn, f2.package });
+                break :scope_fns;
+            }
+        }
+        od_depth += 1;
+        defer od_depth -= 1;
+        var recv_owned = (staticExprTypeRef(b, m.receiver) catch null) orelse {
+            if (sfx_trace) std.debug.print("[scopefn] {s} bail=recv_untyped\n", .{nm2});
+            break :scope_fns;
+        };
+        // No hierarchy-name check here: the registry's transitive-name
+        // records list the scope functions as reachable on every builtin
+        // head, and a USER class's member of the name registers in the
+        // simple-name index the candidate gate above already walks.
+        if (is_echo) return recv_owned;
+        defer recv_owned.deinit(b.allocator);
+        const lam = c.args[0].Lambda;
+        const stmts2 = lam.body.stmts;
+        if (stmts2.len == 0 or stmts2[stmts2.len - 1] != .Expr) break :scope_fns;
+        var nb2 = FuncBuilder.init(b.allocator, b.module) catch break :scope_fns;
+        defer nb2.deinit();
+        // The lambda's free names resolve in the ENCLOSING scope
+        // (`if (it == 0) perLine else it` reads the fn's param): seed the
+        // probe builder with its declared types; the receiver-bound
+        // parameter below shadows.
+        {
+            var dit2 = b.local_decl_types.iterator();
+            while (dit2.next()) |e2| {
+                nb2.setLocalDeclTypeOwned(e2.key_ptr.*, e2.value_ptr.clone(b.allocator) catch continue) catch {};
+            }
+        }
+        if (std.mem.eql(u8, nm2, "let")) {
+            const pname = if (lam.params.len != 0) lam.params[0].name else "it";
+            nb2.setLocalDeclTypeOwned(pname, recv_owned.clone(b.allocator) catch break :scope_fns) catch break :scope_fns;
+        } else {
+            nb2.setRecvTypeRefOwned(recv_owned.clone(b.allocator) catch break :scope_fns);
+        }
+        if (staticExprTypeRef(&nb2, &stmts2[stmts2.len - 1].Expr) catch null) |derived| {
+            var dt = derived;
+            var h = std.mem.trimEnd(u8, dt.name, "?");
+            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
+                ir.parseClassTypeParamIdentity(h) != null;
+            if (h.len != 0 and !bare) return dt;
+            dt.deinit(b.allocator);
+        }
+        break :scope_fns;
+    }
     if (try fnTypedCalleeReturnTypeRef(b, call_expr)) |t| return t;
     if (try fqnCallReturnTypeRef(b, call_expr)) |t| return t;
     if (try localFnReturnTypeRef(b, call_expr)) |t| return t;
@@ -10478,7 +11020,9 @@ fn staticCallReturnTypeRef(
         var inferred_receiver: ?ir.TypeRef = null;
         defer if (inferred_receiver) |*ty| ty.deinit(b.allocator);
         const receiver = argDeclTypeRefLazy(b, bin.lhs) orelse blk: {
-            inferred_receiver = try staticCallReturnTypeRef(b, bin.lhs);
+            // The FULL deriver, not the call-return subset: an Index lhs
+            // (`s[index] - '0'`) types through the element arm only there.
+            inferred_receiver = try staticExprTypeRef(b, bin.lhs);
             break :blk inferred_receiver orelse return null;
         };
         if (isPrimitiveTypeName(typeHead(receiver.name))) {
@@ -11369,12 +11913,20 @@ fn primitiveBinResultHead(b: *FuncBuilder, lhs_head: []const u8, bin: anytype) ?
     }
     if (std.mem.eql(u8, lhs_head, "String"))
         return if (bin.op == .Add) "String" else null;
+    if (std.mem.eql(u8, lhs_head, "Char")) {
+        const rh = binOperandHead(b, bin.rhs) orelse return null;
+        // kotlinc's Char arithmetic: Char - Char = Int; Char +/- Int = Char.
+        if (bin.op == .Sub and std.mem.eql(u8, rh, "Char")) return "Int";
+        if ((bin.op == .Add or bin.op == .Sub) and std.mem.eql(u8, rh, "Int")) return "Char";
+        return null;
+    }
     const rhs_head = binOperandHead(b, bin.rhs) orelse return null;
     return numericPromoteHead(lhs_head, rhs_head);
 }
 
 fn binOperandHead(b: *FuncBuilder, e: *const Expr) ?[]const u8 {
     switch (e.*) {
+        .CharLit => return "Char",
         .IntLit => |il| return switch (il.kind) {
             .Long => "Long",
             .UInt => "UInt",
@@ -11465,6 +12017,42 @@ fn enrichLambdaArgShapes(
         const value_params = pty.args.len - 1;
         var nb = try FuncBuilder.init(b.allocator, b.module);
         defer nb.deinit();
+        // The block's decls and tail read the ENCLOSING scope's names too
+        // (`(bytesPerLine - 1) / bytesPerGroup` inside the run block reads
+        // the fn's params): seed the probe builder with the enclosing
+        // builder's declared types first — the lambda's own params and
+        // block decls shadow them below, the same order the source scopes.
+        {
+            var dit = b.local_decl_types.iterator();
+            while (dit.next()) |e| {
+                nb.setLocalDeclTypeOwned(e.key_ptr.*, e.value_ptr.clone(b.allocator) catch continue) catch {};
+            }
+        }
+        // DERIVED-init enclosing locals never enter the declared-type map
+        // (`val lineSeparators = (n - 1) / perLine`): derive each recorded
+        // init IN THE ENCLOSING BUILDER (its own scope) and seed the
+        // result, so the block's tail can read them. Declared types above
+        // stay authoritative.
+        {
+            od_depth += 1;
+            var iit = b.localInitExprIterator();
+            while (iit.next()) |e| {
+                if (nb.localDeclTypeRef(e.key_ptr.*) != null) continue;
+                var dt = (staticExprTypeRef(b, e.value_ptr.*) catch null) orelse continue;
+                var h = std.mem.trimEnd(u8, dt.name, "?");
+                if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+                const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
+                    ir.parseClassTypeParamIdentity(h) != null;
+                if (h.len == 0 or bare) {
+                    dt.deinit(b.allocator);
+                    continue;
+                }
+                nb.setLocalDeclTypeOwned(e.key_ptr.*, dt) catch {
+                    dt.deinit(b.allocator);
+                };
+            }
+            od_depth -= 1;
+        }
         if (lam.params.len == 0 and value_params == 1) {
             try nb.setLocalDeclTypeOwned("it", try pty.args[0].clone(b.allocator));
         } else {
@@ -11473,7 +12061,34 @@ fn enrichLambdaArgShapes(
                 try nb.setLocalDeclTypeOwned(p.name, try pa.clone(b.allocator));
             }
         }
+        // The tail may read the block's OWN earlier declarations
+        // (`run { var p = 1.0; ...; p }`): record each preceding local
+        // whose annotated or derivable init type is concrete, in order,
+        // so a later decl can read an earlier one.
         od_depth += 1;
+        for (stmts[0 .. stmts.len - 1]) |*st| {
+            if (st.* != .Decl or st.Decl != .Property) continue;
+            const prop = st.Decl.Property;
+            if (prop.receiver_type != null or prop.delegate != null) continue;
+            var decl_owned: ?ir.TypeRef = null;
+            if (prop.ty) |*annotated| {
+                decl_owned = loweredOwnedLocalTypeRef(&nb, annotated) catch null;
+            } else if (prop.init) |*init| {
+                decl_owned = staticExprTypeRef(&nb, init) catch null;
+            }
+            var dt = decl_owned orelse continue;
+            var h = std.mem.trimEnd(u8, dt.name, "?");
+            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
+                ir.parseClassTypeParamIdentity(h) != null;
+            if (h.len == 0 or bare) {
+                dt.deinit(b.allocator);
+                continue;
+            }
+            nb.setLocalDeclTypeOwned(prop.name.name, dt) catch {
+                dt.deinit(b.allocator);
+            };
+        }
         const derived = staticExprTypeRef(&nb, tail) catch null;
         od_depth -= 1;
         if (runtime.envOnce("KLIO_LAMRET_TRACE") != null) {
@@ -11879,6 +12494,45 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
 
 /// Whether the enclosing class scope (own members, outer-class members, or
 /// the supertype hierarchy) declares a member named `name`.
+/// Whether the enclosing class declares primary-ctor property `rn` with a
+/// declared type that is a BARE class type parameter (`val expected: T` on
+/// `CompareContext<out T>`). Such a receiver's member surface is the
+/// parameter's bound; an in-scope receiver-taking callable of the called
+/// name is what kotlinc commits.
+fn classPropertyIsBareTp(b: *FuncBuilder, class_name: []const u8, rn: []const u8) ?bool {
+    const cid = (if (std.mem.indexOfScalar(u8, class_name, '.') != null)
+        b.module.classIdByFqn(class_name)
+    else
+        b.module.classId(class_name)) orelse return null;
+    if (cid.int() >= b.module.classes.items.len) return null;
+    const class = &b.module.classes.items[cid.int()];
+    for (class.primary_params) |*p| {
+        if (!std.mem.eql(u8, p.name, rn)) continue;
+        var h = std.mem.trimEnd(u8, p.ty.name, "?");
+        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+        if (ir.parseClassTypeParamIdentity(h) != null) return true;
+        for (class.type_params) |tp| {
+            if (std.mem.eql(u8, h, tp)) return true;
+        }
+        return false;
+    }
+    return null;
+}
+
+/// The enclosing class — or any implicit receiver on the TOWER (a closure
+/// body inside a member-inline splice reaches the owner only through it) —
+/// declares primary-ctor property `rn` with a declared type that is a BARE
+/// class type parameter (`val expected: T` on `CompareContext<out T>`).
+fn enclosingPropertyBareTp(b: *FuncBuilder, rn: []const u8) bool {
+    if (b.ownerClass()) |owner| {
+        if (classPropertyIsBareTp(b, owner, rn)) |ans| return ans;
+    }
+    for (b.implicit_receiver_tower.items) |entry| {
+        if (classPropertyIsBareTp(b, entry.head, rn)) |ans| return ans;
+    }
+    return false;
+}
+
 fn enclosingHasMemberNamed(b: *FuncBuilder, name: []const u8) bool {
     if (b.hasOwnMember(name) or b.hasEnclosingMember(name)) return true;
     const oc = b.ownerClass() orelse return false;
@@ -12304,6 +12958,13 @@ fn lowerPathCall(
                 const tf = if (tfn) |f| f.fqn else "?";
                 const np: usize = if (tfn) |f| f.params.len else 0;
                 const is_ext_t = if (tfn) |f| f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this") else false;
+                const sel_ret: []const u8 = if (tfn) |f| blk_sr: {
+                    if (f.params.len == 0) break :blk_sr "-";
+                    const lp = f.params[f.params.len - 1].ty;
+                    if (lp.args.len == 0) break :blk_sr "-";
+                    break :blk_sr lp.args[lp.args.len - 1].name;
+                } else "-";
+                std.debug.print("[bare] pick_was={?d} sel_ret={s}\n", .{ if (cast_pick) |cp| cp.int() else null, sel_ret });
                 std.debug.print("[bare] {s} -> {s}#{d} params={d} ext={} form={s} recv_ty={s} encl_recv={s} pkg={s} shadowed={} at=f{d}:{d}\n", .{
                     name0,
                     tf,
@@ -13683,8 +14344,170 @@ fn solveComparatorSibling(
     return .{ .site = s, .ty = .{ .name = .{ .name = head_owned, .span = sp }, .nullable = false, .span = sp, .type_args = ta, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null } };
 }
 
+/// Whether every head in `ty` (through its arguments) names something the
+/// receiving scope can resolve — no bare type parameters, no class-param
+/// identity mangles. Variance prefixes are spelling, not structure.
+fn irTypeFullyConcrete(b: *const FuncBuilder, ty: ir.TypeRef) bool {
+    var h = std.mem.trimEnd(u8, ty.name, "?");
+    if (std.mem.startsWith(u8, h, "in#")) h = h[3..];
+    if (std.mem.startsWith(u8, h, "out#")) h = h[4..];
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    const head = typeHead(h);
+    if (head.len == 0) return false;
+    if ((head.len <= 2 and std.ascii.isUpper(head[0])) or b.isTypeParam(head) or
+        ir.parseClassTypeParamIdentity(head) != null) return false;
+    for (ty.args) |a| {
+        if (!irTypeFullyConcrete(b, a)) return false;
+    }
+    return true;
+}
+
+/// A lowered type as source-shaped AST, for the expected-type stack.
+/// Variance mangles strip; a trailing-`?` spelling folds into `nullable`.
+fn astTypeRefFromIr(b: *FuncBuilder, ty: ir.TypeRef, sp: ast.Span) ?ast.TypeRef {
+    var nm = std.mem.trimEnd(u8, ty.name, "?");
+    const spelled_nullable = nm.len != ty.name.len;
+    if (std.mem.startsWith(u8, nm, "in#")) nm = nm[3..];
+    if (std.mem.startsWith(u8, nm, "out#")) nm = nm[4..];
+    if (std.mem.indexOfScalar(u8, nm, '<')) |lt| nm = nm[0..lt];
+    if (nm.len == 0) return null;
+    const owned = b.allocator.dupe(u8, nm) catch return null;
+    const tas = b.allocator.alloc(ast.TypeArg, ty.args.len) catch return null;
+    for (ty.args, tas) |a, *out| {
+        const inner = astTypeRefFromIr(b, a, sp) orelse return null;
+        out.* = .{ .variance = .Invariant, .is_star = false, .ty = inner, .span = sp };
+    }
+    return .{
+        .name = .{ .name = owned, .span = sp },
+        .nullable = ty.nullable or spelled_nullable,
+        .span = sp,
+        .type_args = tas,
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+}
+
+/// The general arm: a committed-shape callee's RECEIVER (plus the call
+/// site's own expected type) instantiates a call-shaped argument's declared
+/// parameter type, which becomes that argument's expected type —
+/// `it.sortedWith(nullsFirst(...))` on a `List<String?>` hands `nullsFirst`
+/// `Comparator<in String?>`; `nullsFirst`'s own lowering then repeats the
+/// same solve one level down for `compareByDescending`. Only a fully
+/// concrete instantiation is pushed: a partial one disproves more than it
+/// types.
+fn solveInstantiatedArgExpected(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    name: []const u8,
+    args: []const Expr,
+) ?SibSolved {
+    var site: ?*const Expr = null;
+    var arg_idx: usize = 0;
+    for (args, 0..) |*a, i| {
+        if (a.* == .Call) {
+            site = a;
+            arg_idx = i;
+            break;
+        }
+    }
+    const s = site orelse return null;
+    const sib_why = if (runtime.envOnce("KLIO_SIBEXP_WHY")) |w| std.mem.eql(u8, w, name) else false;
+    var actual_owned: ?ir.TypeRef = switch (callee.*) {
+        .Member => |m| (staticExprTypeRef(b, m.receiver) catch null),
+        else => null,
+    };
+    defer if (actual_owned) |*t| t.deinit(b.allocator);
+    if (callee.* == .Member and actual_owned == null) {
+        if (sib_why) std.debug.print("[sibexp-why] {s} bail=recv_untyped\n", .{name});
+        return null;
+    }
+    const actual_head: ?[]const u8 = blk: {
+        if (actual_owned) |t| break :blk typeHead(std.mem.trimEnd(u8, t.name, "?"));
+        break :blk null;
+    };
+    var scratch = std.heap.ArenaAllocator.init(b.allocator);
+    defer scratch.deinit();
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (!(f.params.len == args.len or (f.params.len > args.len and f.params.len - args.len <= 1))) continue;
+        const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        if (recv_off == 1) {
+            const ah = actual_head orelse continue;
+            var dr = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
+            if (std.mem.indexOfScalar(u8, dr, '<')) |lt| dr = dr[0..lt];
+            const dh = typeHead(dr);
+            if (!(std.mem.eql(u8, ah, dh) or dh.len <= 2 or
+                ir.parseClassTypeParamIdentity(f.params[0].ty.name) != null or
+                receiverHeadServes(b, ah, dh))) continue;
+        } else if (callee.* == .Member) continue;
+        const pi = recv_off + arg_idx;
+        if (pi >= f.params.len) continue;
+        const pt = f.params[pi].ty;
+        // Only a GENERIC class type is worth pushing, and only when it is
+        // not already concrete (a concrete param adds no information).
+        if (pt.args.len == 0 or irTypeFullyConcrete(b, pt)) {
+            if (sib_why) std.debug.print("[sibexp-why] {s}#{d} skip=param_shape pt={s} args={d}\n", .{ f.fqn, fid.int(), pt.name, pt.args.len });
+            continue;
+        }
+        const expected_explicit: ?[]ir.TypeRef = expectedReturnTypeArgsFor(b, f) catch null;
+        defer if (expected_explicit) |ea| {
+            for (ea) |*t| t.deinit(b.allocator);
+            b.allocator.free(ea);
+        };
+        // Project the actual receiver onto the DECLARED head first, so a
+        // List<String?> binds an Iterable<T> receiver pattern (the same
+        // head-consistency rule the splice window applies).
+        var solve_recv: ?ir.TypeRef = if (actual_owned) |t| t else null;
+        if (recv_off == 1 and actual_owned != null) {
+            if (staticTypeClassId(b, f.params[0].ty)) |dcid| {
+                if (b.module.projectTypeToClass(scratch.allocator(), actual_owned.?, dcid) catch null) |p| {
+                    solve_recv = p;
+                    if (sib_why) std.debug.print("[sibexp-why] {s}#{d} projected={s} args={d}\n", .{ f.fqn, fid.int(), p.name, p.args.len });
+                } else if (sib_why) {
+                    std.debug.print("[sibexp-why] {s}#{d} project_failed actual={s} dh={s}\n", .{ f.fqn, fid.int(), actual_owned.?.name, f.params[0].ty.name });
+                }
+            } else if (sib_why) {
+                std.debug.print("[sibexp-why] {s}#{d} no_decl_cid dh={s}\n", .{ f.fqn, fid.int(), f.params[0].ty.name });
+            }
+        }
+        // Receiver + expected-type evidence only: the value arguments are
+        // exactly the still-untyped nested calls this push exists to type,
+        // and their head-only shapes would refuse the bind.
+        const solved = (b.module.solveCallBindings(
+            scratch.allocator(),
+            fid,
+            f,
+            solve_recv,
+            null,
+            &.{},
+            expected_explicit orelse &.{},
+            false,
+        ) catch continue) orelse {
+            if (sib_why) std.debug.print("[sibexp-why] {s}#{d} skip=no_solve\n", .{ f.fqn, fid.int() });
+            continue;
+        };
+        if (solved.bindings.len == 0) {
+            if (sib_why) std.debug.print("[sibexp-why] {s}#{d} skip=no_bindings\n", .{ f.fqn, fid.int() });
+            continue;
+        }
+        const substituted = ir.Module.substituteBoundType(scratch.allocator(), pt, solved.bindings) catch continue;
+        if (!irTypeFullyConcrete(b, substituted)) {
+            if (sib_why) std.debug.print("[sibexp-why] {s}#{d} skip=not_concrete sub={s}\n", .{ f.fqn, fid.int(), substituted.name });
+            continue;
+        }
+        const converted = astTypeRefFromIr(b, substituted, exprSpan(s)) orelse continue;
+        if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) {
+            std.debug.print("[sibexp-inst] outer={s} arg={d} pushed={s} args={d}\n", .{ f.fqn, arg_idx, converted.name.name, converted.type_args.len });
+        }
+        return .{ .site = s, .ty = converted };
+    }
+    return null;
+}
+
 fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr) ?SibSolved {
-    if (args.len < 2) return null;
+    if (args.len == 0) return null;
     const outer_name: []const u8 = switch (callee.*) {
         .Path => |p| blk: {
             if (p.segments.len != 1) return null;
@@ -13701,8 +14524,12 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
             break;
         }
     }
-    if (solveComparatorSiblingByName(b, callee, outer_name, args)) |solved| return solved;
+    if (args.len >= 2) {
+        if (solveComparatorSiblingByName(b, callee, outer_name, args)) |solved| return solved;
+    }
+    if (solveInstantiatedArgExpected(b, callee, outer_name, args)) |solved| return solved;
     if (callee.* == .Member) return null;
+    if (args.len < 2) return null;
     const f = outer orelse return null;
     const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
     for (args, 0..) |*arg, j| {
@@ -14007,6 +14834,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
         .n_args = run[1],
         .arg_names = arg_names,
         .func = func_id,
+        .func_final = was_cast,
         .candidates = try cmgCandidates(b, name0, callee.Path.segments[0].span.file, run[1]),
         .static_recv = cmg_static_recv,
         .type_args = type_args,
@@ -16252,6 +17080,23 @@ fn lowerResolvedMemberCall(
             lmNote(.bound_static);
             return .none;
         }
+        // `expected.getter()` — the callee is a RECEIVER-TAKING callable
+        // VALUE in scope (`getter: T.() -> P`) and the receiver's declared
+        // type is a bare type parameter: kotlinc resolves against the
+        // parameter's bound, finds no member, and commits the value
+        // (invoke) protocol. There is no class slot to bind BY DESIGN —
+        // the same census category as a function-typed receiver; the
+        // member-emission arm below commits `CallValueWithThis`.
+        if ((b.resolve(name.name) != null or b.knowsOuter(name.name)) and
+            (b.isReceiverLambdaParam(name.name) or b.isLocalExtFn(name.name) or
+                b.localDeclRecvFn(name.name)) and
+            receiver.* == .Path and receiver.Path.segments.len == 1 and
+            (b.isErasedRecvParam(receiver.Path.segments[0].name) or
+                enclosingPropertyBareTp(b, receiver.Path.segments[0].name)))
+        {
+            lmNote(.dynamic_by_design);
+            return .none;
+        }
         lmNote(.no_receiver_type);
         if (!norecvCensusOn()) return .none;
         lm_norecv[@intFromEnum(std.meta.activeTag(receiver.*))] += 1;
@@ -17137,7 +17982,21 @@ fn lowerResolvedExtensionCall(
         args,
         ast_arg_names,
     );
-    const func_id = resolution.target orelse return null;
+    const func_id = resolution.target orelse blk: {
+        // A return-variant tie on the MEMBER form discriminates by the
+        // trailing lambda's derived return exactly as the bare form does
+        // (`a.sumOf { it.size.toLong() }` on a typed receiver ran the
+        // Double variant through the runtime re-pick).
+        if (allNull(ast_arg_names)) {
+            const cands = try b.module.bareCallCandidates(b.allocator, name.name, name.span.file);
+            defer b.allocator.free(cands);
+            const rh = typeHead(std.mem.trimEnd(u8, recv_ty.name, "?"));
+            if (try overloadPickByLambdaReturnFull(b, cands, args, args.len, rh, receiver)) |picked| {
+                break :blk picked;
+            }
+        }
+        return null;
+    };
     const target = b.module.funcById(func_id) orelse return null;
     var selected_args = try selectedCallArgsForBuilder(
         b,
@@ -17699,7 +18558,8 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         // in-scope callable is the only candidate Kotlin ever had.
         const recv_erased = receiver.* == .Path and
             receiver.Path.segments.len == 1 and
-            b.isErasedRecvParam(receiver.Path.segments[0].name);
+            (b.isErasedRecvParam(receiver.Path.segments[0].name) or
+                enclosingPropertyBareTp(b, receiver.Path.segments[0].name));
         const callable_takes_receiver = b.isReceiverLambdaParam(name.name) or
             b.isLocalExtFn(name.name) or b.localDeclRecvFn(name.name);
         const callable_shape_known = callable_takes_receiver or
