@@ -426,3 +426,21 @@ direct fid (Call exact), virtual slot (CallVirtual), tagged slot
 sites), and the enumerated CMG named form for the walk's residue
 during bring-up. The bytecode instruction set can freeze against this
 list.
+
+## VM-prep batch gate (2026-08-10, at 190e94da)
+
+Compose plugin canonical over the batch (host-shadow set, vararg
+adapter table, CALL_TAGGED spec): 1323 passed / 46 classes / 2 did not
+complete vs ratchet 1305 — direct binary run, exit 0. The 2-DNC dip
+from the session's 1336-1344 range is the suite's recorded
+load-sensitivity (its own doc: a high-DNC run does not fail the
+ratchet spuriously); the host-shadow deferral changes WHICH emission
+form kotlinx/androidx members take (deferred to the walk's binding
+preference), never their semantics. Full battery otherwise: sweep
+117/0, litmus 42/43 with atomics output-verified, census suite
+119/119 with no_receiver_type ZERO, units green, corpus at baseline.
+
+The VM-prep goal state: dispatch decided at lowering everywhere the
+language allows; the walk's remaining roles are DATA (the host-shadow
+set, the adapter table) or SPECS (CALL_TAGGED); the instruction set
+can freeze against the closed dispatch-form list.
