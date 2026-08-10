@@ -10700,6 +10700,12 @@ pub const ModuleRegistry = struct {
     /// `Foo.X` fall through to the companion instance when `X` is
     /// not a member of `Foo` itself.
     companion_singletons: std.StringHashMap([]const u8),
+    /// Fqns whose installed HOST BINDING is authoritative over any
+    /// interpreted body (a pack's stub declarations — atomicfu's atomics).
+    /// Populated at bindings install from the non-stdlib overlay keys; a
+    /// static member bind must not commit a BODY-BEARING target listed
+    /// here — the runtime walk's binding preference arbitrates instead.
+    host_shadowed_fqns: std.StringHashMap(void),
     /// Inner class → outer class name. Resolves `this@Outer` and
     /// outer-chain field reads for nested classes lifted to top level.
     enclosing_class: std.StringHashMap([]const u8),
@@ -10979,6 +10985,7 @@ pub const ModuleRegistry = struct {
     pub fn init(allocator: Allocator) ModuleRegistry {
         return .{
             .companion_singletons = std.StringHashMap([]const u8).init(allocator),
+            .host_shadowed_fqns = std.StringHashMap(void).init(allocator),
             .enclosing_class = std.StringHashMap([]const u8).init(allocator),
             .func_type_params = std.AutoHashMap(FuncId, std.ArrayList([]const u8)).init(allocator),
             .func_type_param_bounds = std.AutoHashMap(FuncId, []const TypeParamBound).init(allocator),
@@ -11070,6 +11077,7 @@ pub const ModuleRegistry = struct {
             self.member_method_fids.deinit();
         }
         self.class_member_names.deinit();
+        self.host_shadowed_fqns.deinit();
         {
             var it = self.class_super_names.valueIterator();
             while (it.next()) |names| a.free(names.*);
@@ -11159,6 +11167,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.companion_singletons.iterator();
             while (it.next()) |e| try out.companion_singletons.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.host_shadowed_fqns.iterator();
+            while (it.next()) |e| try out.host_shadowed_fqns.put(e.key_ptr.*, {});
         }
         {
             var it = self.enclosing_class.iterator();

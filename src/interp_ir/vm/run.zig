@@ -239,6 +239,25 @@ fn linkProgramForms(self: *Vm) Allocator.Error!void {
         const mm = module_ref.borrowMut();
         defer mm.deinit();
         try mm.get().buildClassIdMap(self.allocator);
+        // The HOST-SHADOW set: every non-stdlib overlay fqn names a pack
+        // declaration whose host binding is authoritative over its
+        // interpreted body (auto_bindings marks them overrides). A static
+        // member bind consults this to leave those on the runtime walk's
+        // binding preference.
+        {
+            const reg = &mm.get().registry;
+            const bg = self.prog.borrow();
+            defer bg.deinit();
+            const ig = bg.get().installed_bindings.borrow();
+            defer ig.deinit();
+            var kit = ig.get().table.iterator();
+            while (kit.next()) |entry| {
+                const fqn = entry.key_ptr.*;
+                if (std.mem.startsWith(u8, fqn, "kotlin.")) continue;
+                const owned = reg.allocator.dupe(u8, fqn) catch continue;
+                reg.host_shadowed_fqns.put(owned, {}) catch reg.allocator.free(owned);
+            }
+        }
     }
     const mg = module_ref.borrow();
     defer mg.deinit();

@@ -18540,6 +18540,14 @@ fn lowerResolvedMemberCall(
         last_member_refuted = !resolved.applicable;
         return if (resolved.applicable) .deferred else .none;
     };
+    // A HOST-SHADOWED declaration (a pack stub whose installed binding is
+    // authoritative — atomicfu's atomics) must never statically bind its
+    // interpreted body; the runtime walk's binding preference arbitrates.
+    if (b.module.funcById(func_id)) |cf| {
+        if (cf.hasBody() and b.module.registry.host_shadowed_fqns.contains(cf.fqn)) {
+            return .deferred;
+        }
+    }
     if (eagerAuditOn()) {
         if (eager_pick) |ep| {
             const lazy_str: i64 = if (resolved.target) |l| @intCast(l.int()) else -1;
