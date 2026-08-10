@@ -267,3 +267,42 @@ sections):
   RegisterClass) for METHOD binding on local-class receivers; the
   supertype-chain record (2fc6f77c) already serves extension
   applicability.
+
+## Task-15 progress (2026-08-10, commit 834f8cde)
+
+Step 1+2's mechanism is LANDED and proven end to end: a bodyless
+expect-class member survives as a HEADER row (declared signature, no
+body, member fqn as the decl sig's host symbol); linkResolvedForms
+joins the intrinsic; member resolution binds the call to the fid; and
+callFunc's bodyless-native path dispatches the intrinsic — zero ladder
+rows for a StringBuilder append/toString program (sb3.kt probe), with
+bound Call/bare-member emissions visible inside stdlib bodies. The
+adapter surface is the existing dispatchIntrinsic boundary: args pass
+raw (receiver at slot 0), confirming the "most entries already
+conform" reading; the vararg pack/spread divergence remains for the
+vararg-taking intrinsics (packVarargArgs runs only for interpreted
+bodies) and is the remaining conversion the adapter table owns.
+
+Remaining ladder rows after the headers + a FRESH kotlin-test pack
+rebuild (the census home's packs must be reinstalled after wiping —
+the suite needs kotlin.test; 118 spurious failures otherwise):
+- Result.fold 110 — BY DESIGN.
+- StringBuilder.toString@<lambda> 32 — toString is Any-inherited (not
+  an expect member); the specific lambda context leaves the receiver
+  untyped. A typing gap, not a convention gap.
+- Iterator.hasNext@iteratorBehavior 24 — the test helper's dynamic
+  iterator handling; host iterator VALUES dispatch through the
+  receiver-typed intrinsic (the receiver-ABI conversion the walk still
+  owns for non-Instance values).
+- DefaultAsserter.assertEquals 22 — PACK-MODE ONLY: the same program
+  binds (zero ladder) in source mode. The kotlin-test pack's
+  `expect val asserter` loses its declared type in the pack-load
+  lowering context, so the member call on it walks. The pack-context
+  typing divergence is the named mechanism; a pack rebuild alone does
+  NOT fix it (verified with a fresh rebuild).
+
+The audit's five StringBuilder "missing" rows are keys with no source
+declaration at all (Any-inherited toString, JVM-only delete/setCharAt,
+extension-dispatch indices/lastIndex) — audit-classification rows, not
+resolution holes, exactly as the audit's own lower-bound contract
+states.
