@@ -10033,11 +10033,21 @@ pub const Module = struct {
         caller_pkg: []const u8,
         caller_file: FileId,
     ) ?[]const u8 {
-        const list = self.registry.top_level_prop_pkgs.get(name) orelse return null;
+        const list = self.registry.top_level_prop_pkgs.get(name) orelse {
+            if (std.c.getenv("KLIO_TLP_TRACE")) |w| {
+                if (std.mem.eql(u8, std.mem.span(w), name))
+                    std.debug.print("[tlp] {s} NO-LIST caller_pkg={s}\n", .{ name, caller_pkg });
+            }
+            return null;
+        };
         var best_tier: u8 = 255;
         var found: ?[]const u8 = null;
         for (list.items) |pd| {
             const t = self.scopeTier(pd.fqn, pd.package, name, caller_pkg, caller_file);
+            if (std.c.getenv("KLIO_TLP_TRACE")) |w| {
+                if (std.mem.eql(u8, std.mem.span(w), name))
+                    std.debug.print("[tlp] {s} fqn={s} pkg={s} tier={d} head={s} caller_pkg={s}\n", .{ name, pd.fqn, pd.package, t, self.registry.top_level_prop_type_heads.get(pd.fqn) orelse "-", caller_pkg });
+            }
             if (t == 255) continue;
             const h = self.registry.top_level_prop_type_heads.get(pd.fqn);
             if (t < best_tier) {

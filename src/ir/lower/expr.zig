@@ -18422,6 +18422,11 @@ fn lowerResolvedMemberCall(
         // silently dropped the whole resolution.
         if (b.resolve(receiver_name) == null and !b.knowsOuter(receiver_name) and
             !enclosingHasMemberNamed(b, receiver_name) and
+            // A TOP-LEVEL PROPERTY read is a VALUE receiver, never a
+            // classifier access: `asserter.assertEquals(...)` inside
+            // kotlin.test resolved to Asserter's (absent) companion and
+            // dropped the whole member resolution to the walk.
+            b.module.registry.top_level_prop_pkgs.get(receiver_name) == null and
             static_owner.int() < b.module.classes.items.len)
         {
             const classifier = &b.module.classes.items[static_owner.int()];
