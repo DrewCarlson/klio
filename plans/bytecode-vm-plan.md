@@ -245,3 +245,25 @@ The work item, concretely:
 4. Only then retire the walk's conversion role; the remaining walk
    families are enumerated in the campaign plan (five site families,
    `Result.fold` by design among them).
+
+## Inherited from the static-dispatch campaign's close (2026-08-10)
+
+The campaign ended at census 3 with these items assigned HERE (each
+with full diagnosis in plans/static-dispatch-campaign.md's closing
+sections):
+
+- The lambda-RETURN-position type-parameter family (groupBy orEmpty,
+  flatten .size x2): binding K from a lambda's derived return was twice
+  measured net-negative under lowering-side machinery (derived
+  call-tail bindings disprove more downstream than they buy). The
+  correct home is expected-type-directed inference in the resolver
+  engine — this plan's typing engine work, alongside task 15.
+- The builtin-intrinsic member_ladder routes (StringBuilder.toString,
+  Iterator.hasNext, DefaultAsserter.assertEquals, ~80 route-hits per
+  census run): the conversion role the task-15 adapter table retires.
+- Result.fold stays on the walk BY DESIGN (the recorded wrapper
+  hazard); revisit only if the fold wrapper contract changes.
+- The FULL local-class typing row (reserved fids linked by
+  RegisterClass) for METHOD binding on local-class receivers; the
+  supertype-chain record (2fc6f77c) already serves extension
+  applicability.
