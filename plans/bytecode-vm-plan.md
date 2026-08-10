@@ -385,3 +385,44 @@ Remaining open engineering under task-15: the vararg pack/spread
 adapter at the dispatchIntrinsic boundary, and module-side
 overrides_interpreter visibility. The ladder is otherwise confined to
 source-dynamic receivers + Result.fold (by design).
+
+## The typed dispatch op (the non-Instance receiver ABI) — SPEC
+
+The last name-carrying dispatch sites are receivers that are DYNAMIC in
+the source semantics themselves: `element.toString()` on a bare `T`
+(the runtime element is any value kind), `hasNext`/`next` on host
+iterator values, a closure-captured builder in an untypeable lambda.
+kotlinc dispatches these virtually; the VM needs an O(1) op, not name
+resolution. Acceptance = exactly the census ladder rows
+(StringBuilder.toString@<lambda> 32, Iterator.hasNext@iteratorBehavior
+24; Result.fold 110 stays on its wrapper contract by design).
+
+Op: `CALL_TAGGED slot, recv, args, n`
+- `slot` is a MethodSlotId root (an interface/Any member declaration),
+  exactly what CallVirtual carries today.
+- Dispatch key = the receiver's RUNTIME TAG: the Value union tag for
+  non-Instance kinds (Str, Int, ..., Array, Map, IrClosure, host
+  handles), the class identity for Instance. `Class.receiver_abi`
+  already classifies rows; the tag IS the abi.
+- Table: per (slot, tag) → executable form (intrinsic fn pointer or
+  body fid), built at LINK from the same joins resolved_native uses:
+  the receiver-typed intrinsic keys (`kotlin.text.StringBuilder.
+  toString`) keyed by the tag their receiver kind produces, plus the
+  interpreted overrides for Instance classes (the existing virtual
+  table). Misses are a LINK error, not a runtime probe — the table is
+  total over the tags a slot's receivers can produce, or the program
+  does not link.
+- The tree-walker already contains this op's dynamic profile: the
+  CallMember inline cache (`site_cls`/`site_route`, the CAS-claimed
+  monomorphic site cache in ir.zig) is the measured shape — the VM op
+  makes the cache's steady state the STATIC layout, with the tag
+  switch replacing the identity probe.
+- The C transpiler emits the same table as a switch over the value
+  tag per slot — the adapter table's receiver dimension.
+
+With CALL_TAGGED specced, every dispatch form the VM needs is closed:
+direct fid (Call exact), virtual slot (CallVirtual), tagged slot
+(CALL_TAGGED), value invoke (the 8 dynamic_by_design invoke-convention
+sites), and the enumerated CMG named form for the walk's residue
+during bring-up. The bytecode instruction set can freeze against this
+list.
