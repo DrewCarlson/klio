@@ -1585,6 +1585,82 @@ fn retainExpectMemberHeader(
     return id;
 }
 
+/// A LOCAL class's method as a bodyless header under its function-scoped
+/// MANGLED owner (`TestCollection$lc<fn>`): the member call on a
+/// local-class-typed receiver binds this virtual slot at lowering; the
+/// runtime slot's by-name fallback executes the RegisterClass method.
+pub fn retainLocalClassMemberHeader(
+    module: *Module,
+    mangled_owner: []const u8,
+    f: *const ast.Function,
+) Allocator.Error!void {
+    const a = module.registry.allocator;
+    const ukey = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}", .{ mangled_owner, f.name.name, f.params.len });
+    if (module.registry.member_method_fids.contains(ukey)) {
+        a.free(ukey);
+        return;
+    }
+    const id = module.nextFuncId();
+    const member_fqn = try std.fmt.allocPrint(a, "{s}.{s}", .{ mangled_owner, f.name.name });
+    const params = try a.alloc(ir.Param, f.params.len + 1);
+    params[0] = .{
+        .name = "this",
+        .ty = .{ .name = mangled_owner, .nullable = false, .args = &.{} },
+        .default = null,
+        .is_property = false,
+        .is_vararg = false,
+        .has_default = false,
+    };
+    var has_vararg = false;
+    var required: u32 = 0;
+    for (f.params, 0..) |*p, i| {
+        if (p.is_vararg) has_vararg = true;
+        if (p.default == null and !p.is_vararg) required += 1;
+        params[i + 1] = .{
+            .name = p.name.name,
+            .ty = try loweredTypeRef(a, &p.ty, true),
+            .default = null,
+            .is_property = false,
+            .is_vararg = p.is_vararg,
+            .has_default = p.default != null,
+        };
+    }
+    const ret: ir.TypeRef = if (f.return_type) |*rt|
+        try loweredTypeRef(a, rt, true)
+    else
+        .{ .name = "Unit", .nullable = false, .args = &.{} };
+    try module.funcs.append(a, .{
+        .id = id,
+        .name = f.name.name,
+        .fqn = member_fqn,
+        .package = "",
+        .params = params,
+        .return_ty = ret,
+        .return_ty_declared = f.return_type != null,
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = @enumFromInt(0),
+        .is_suspend = f.is_suspend,
+        .kind = .instance_method,
+    });
+    const msig = try a.alloc(ir.TypeRef, f.params.len);
+    for (f.params, 0..) |*p, i| {
+        msig[i] = try loweredTypeRef(a, &p.ty, true);
+    }
+    try module.decl_sigs.put(id.int(), .{
+        .enclosing_class = null,
+        .receiver_ty = null,
+        .arity = .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg },
+        .sig = msig,
+        .kind = .instance_method,
+        .visibility = f.visibility,
+        .is_inline = false,
+        .is_suspend = f.is_suspend,
+        .has_body = false,
+    });
+    try module.registry.member_method_fids.put(ukey, id);
+}
+
 pub fn lowerMethod(
     module: *Module,
     f: *const ast.Function,

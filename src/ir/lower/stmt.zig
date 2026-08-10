@@ -9,6 +9,7 @@ const FF = runtime.forest.ForestField;
 const build = @import("../build.zig");
 
 const expr_mod = @import("expr.zig");
+const decl_mod = @import("decl.zig");
 const helpers = @import("helpers.zig");
 const literals = @import("literals.zig");
 const ast_scan = @import("ast_scan.zig");
@@ -1498,11 +1499,25 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
                 }
                 if (!chain_ok) break;
             }
-            if (chain_ok and chain.items.len != 0) {
+            if (chain_ok) {
+                // An empty chain still registers: the KEY's presence is the
+                // typing record (a supertype-less local class's methods
+                // bind through it).
                 const owned = chain.toOwnedSlice(ra) catch null;
                 if (owned) |sl| b.module.registry.class_super_names.put(key, sl) catch {};
             } else {
                 chain.deinit(ra);
+            }
+            // The RESERVED-FID METHOD HEADERS: each of the local class's own
+            // methods gets a bodyless header row under the mangled owner,
+            // so a member call on a local-class-typed receiver binds its
+            // virtual slot at lowering; the runtime resolves the slot's
+            // by-name fallback to the RegisterClass-registered method.
+            for (c.members) |*m| {
+                if (m.* != .Function) continue;
+                const mf = &m.Function;
+                if (mf.receiver_type != null) continue;
+                decl_mod.retainLocalClassMemberHeader(b.module, key, mf) catch {};
             }
         }
     }

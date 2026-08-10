@@ -18384,6 +18384,33 @@ fn lowerResolvedMemberCall(
             return .none;
         }
     }
+    // A LOCAL-CLASS typing record: no class row, but the mangled head
+    // registered its methods as headers — probe the member table directly
+    // and bind the virtual slot (the runtime slot's by-name fallback
+    // executes the RegisterClass method).
+    if (owner_id == null and ast_type_args.len == 0 and allNull(ast_arg_names) and
+        b.module.registry.class_super_names.get(head) != null)
+    {
+        var probe: usize = args.len;
+        while (probe <= args.len + 3) : (probe += 1) {
+            var kb: [192]u8 = undefined;
+            const key = std.fmt.bufPrint(&kb, "{s}\x00{s}\x00{d}", .{ head, name.name, probe }) catch break;
+            const fid = b.module.registry.member_method_fids.get(key) orelse continue;
+            const recv_reg = try lowerExpr(b, receiver);
+            const run = try lowerArgRun(b, args);
+            const dst = b.allocReg();
+            orEmitAudit(b, "local_class_member_slot", "CallVirtual", name.name);
+            try b.push(.{ .CallVirtual = .{
+                .dst = dst,
+                .receiver = recv_reg,
+                .slot = ir.MethodSlotId.fromFunc(fid),
+                .args = run[0],
+                .n_args = run[1],
+            } });
+            lmNote(.bound_virtual);
+            return .{ .lowered = dst };
+        }
+    }
     var static_owner = owner_id orelse {
         lmNote(.no_class_id);
         noteNoClassHead(head);
