@@ -6998,3 +6998,52 @@ Function shape for solveCallBindings). Same machinery likely serves
 flatten .size (Array-sumOf projection under the enclosing fn's T).
 
 Local-class ctor x3 stays on the build-time typing row design.
+
+## The closing stretch: 14 -> 3
+
+Commits 1f938bc8..2fc6f77c, each gate-green (suite 119/119, sweep
+117/0, units, corpus, litmus at baseline):
+
+- TimeSource.Monotonic.ValueTimeMark x4: multi-segment nested-ctor
+  paths resolve, and the qualified arm constructs VALUE classes (the
+  bare form always had).
+- sortComparatorThenComparator: SAM bindings carry the class-identity
+  spelling (the registry spells abstract-method params `K#owner`).
+- onEachIndexed x2: implBoundScan — the unique in-scope type-param
+  bound whose class declares the property serves the apply-splice
+  window whose head is the callee's literal param.
+- isEmpty().not(): bare-tp property answers substitute the declared
+  receiver (head-position params by class-row position; head-table
+  scalars; the lazy/eager bare-tp answers no longer preempt).
+- A `*` param is applicability-neutral (the deriver's own erasure must
+  not refute; Map<*, V>.get resolves as sole-unknown).
+- local-class ctor x3: the lowering-time SUPERTYPE TYPING RECORD — the
+  transitive super chain under a function-scoped mangle
+  (`TestCollection$lc<fn>`), classIsOrExtends answering through a
+  row-less sub's chain even when the super resolves an id. This is the
+  lightweight slice of the typing-row design; the full reserved-fid
+  row remains the successor design for METHOD binding on local-class
+  receivers (the census rows needed only extension applicability).
+
+MEASURED NET-NEGATIVE (reverted, second confirmation of the recorded
+warning): extending enrichLambdaArgShapes with receiver-substituted
+inputs + relaxed tails to solve groupBy's K regressed the census 6->7
+without fixing the record — derived call-tail bindings narrow generic
+instantiations in ways that disprove more downstream than they buy.
+
+FINAL census: 3 rows — groupBy orEmpty x1, flatten .size x2 — the
+lambda-RETURN-position type-parameter family, twice measured harmful
+to force under current machinery; the honest successor is
+expected-type-directed K solving in the resolver engine (kotlinc's
+inference direction), which is bytecode-VM-plan-era work alongside
+task-15. Walk ladder: Result.fold 110 (BY DESIGN, wrapper hazard) +
+builtin-intrinsic member_ladder routes (StringBuilder.toString,
+Iterator.hasNext, DefaultAsserter.assertEquals) — the conversion role
+task-15's adapter table retires; task-15 is written as
+bytecode-vm-plan.md's opening item.
+
+Session total: census 29 -> 3 under STRICTER counting (the infix sites were
+never counted before), the walk residue reduced to by-design +
+task-15 rows, ANON_BASE default ON with the allocator discipline and
+two memo-lifetime bugs fixed, and every intermediate regression
+root-fixed (never worked around) with the gates green at every commit.
