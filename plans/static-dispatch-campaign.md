@@ -7097,3 +7097,11 @@ anywhere is owned by bytecode-vm-plan.md: task-15 (the shared calling
 convention + adapter table, which retires the builtin-intrinsic
 member_ladder conversion routes and the Result.fold by-design walk's
 last cousins) and the full reserved-fid local-class typing row.
+
+## Gate at the final commit (5dd6bd4a)
+
+Compose plugin canonical: 1336 passed / 46 classes / 0 incomplete vs
+ratchet 1305 (direct binary run, exit 0; the suite jitters 1336-1344
+across runs, all comfortably above the ratchet). With units, sweep
+117/0, corpus, and litmus already green on the same commit, the
+campaign closes verified end to end at ZERO no_receiver_type rows.
