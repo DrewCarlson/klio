@@ -7066,3 +7066,34 @@ census suite 119/119 (census 3, all residuals owned by
 bytecode-vm-plan.md with designs and measured evidence), sweep 117/0,
 units green, corpus 280/291 + verified standalone flakes, litmus 42/43
 (known flake), compose plugin 1342/46/0 >= 1305.
+
+## ZERO (2026-08-10, commits e33fa160 + 910d00c8)
+
+The no_receiver_type category is CLOSED — zero rows. The last three
+fell to two mechanisms the measured-negative road did NOT rule out:
+
+- The RECORDER-level star patch (e33fa160): a recorded call-return
+  whose args carry a star re-derives the starred RETURN-position
+  parameter from the trailing lambda's tail under receiver-substituted
+  inputs. Resolution shapes are untouched — this is the scoping that
+  makes the lambda-return evidence safe where the enricher-level
+  variant twice measured net-negative; groupBy's K binds and
+  byLength[3].orEmpty() chains.
+- The unresolved-bare implicit receiver (910d00c8): the bare-ext
+  lambda-slot producer now instantiates through the enclosing
+  extension's FULL declared receiver, so Array.flatten's
+  sumOf { it.size.toLong() } types its slot (T2 := Array<out T>).
+
+Census at close: 10,157 sites, 2,110 bound_static + 8,031
+bound_virtual = 99.84% bound; residue nullable_or_generic 2,
+no_class_id 2, resolver_declined 4 (target_known_deferred, by design),
+dynamic_by_design 8 (the invoke convention) — every category
+enumerated, none a name walk. Gates: suite 119/119, sweep 117/0,
+units green, corpus 280/291 + verified flakes, litmus 42/43 (known
+flake), compose plugin 1342/46/0 >= ratchet 1305.
+
+The campaign's lowering-side goal state is fully reached. What remains
+anywhere is owned by bytecode-vm-plan.md: task-15 (the shared calling
+convention + adapter table, which retires the builtin-intrinsic
+member_ladder conversion routes and the Result.fold by-design walk's
+last cousins) and the full reserved-fid local-class typing row.
