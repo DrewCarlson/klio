@@ -46,6 +46,9 @@ fun main() {
     val fl = arrayOf(arrayOf("a", "b"), arrayOf("c")).flatten()
     println(fl)
 
+    val byLength = listOf("a", "abc", "ab").groupBy { it.length }
+    println(byLength[2].orEmpty())
+
     var acc = 0
     repeat(3) { acc += it }
     println(acc)

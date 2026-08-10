@@ -2619,6 +2619,9 @@ test "type_param_bounded_by_type_param" {
 // (isEmpty().not() on Ctx<Map<K, V>>), the object-let marker splice, the
 // local-class supertype typing record, Array flatten, the repeat protocol,
 // and a qualified value-class ctor. Every row is kotlinc's output.
+// The `[ab]` row pins the NEW fixture lines (`byLength[2].orEmpty()` on a
+// groupBy result — the recorder-level star patch derives K from the
+// trailing lambda; kotlinc prints [ab]). The prior rows are unchanged.
 test "derived_receiver_static_binds" {
     try check("derived_receiver_static_binds",
         \\{beta=2}
@@ -2629,6 +2632,7 @@ test "derived_receiver_static_binds" {
         \\7
         \\[x, y]
         \\[a, b, c]
+        \\[ab]
         \\3
         \\true
         \\
