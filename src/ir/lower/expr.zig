@@ -16824,13 +16824,22 @@ fn lowerUnresolvedBareCall(
             ext_hint_final = true;
         }
     }
+    const bare_recv_ref = b.recvTypeRef();
     const bare_lambda_param_types: ?[]?[]ir.TypeRef = blk: {
         const hint = ext_hint orelse break :blk null;
         const f = b.module.funcById(hint) orelse break :blk null;
         const off: usize = if (f.params.len != 0 and
             std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] unresolvedBare fn={s}\n", .{f.name});
-        break :blk try argLambdaParamTypes(b, f, args, ast_arg_names, ast_type_args, off);
+        // The IMPLICIT receiver (the enclosing extension's declared
+        // receiver, args included) instantiates the slot — `sumOf
+        // { it.size.toLong() }` inside Array.flatten binds T2 :=
+        // Array<out T>, so `it` types and the body binds statically.
+        const recv_ptr: ?*const ir.TypeRef = if (off == 1)
+            (if (bare_recv_ref) |*r| substitutionRecv(b, r) else null)
+        else
+            null;
+        break :blk try argLambdaParamTypesRecv(b, f, args, ast_arg_names, ast_type_args, off, recv_ptr);
     };
     defer if (bare_lambda_param_types) |types|
         deinitArgLambdaParamTypes(b.allocator, types);
