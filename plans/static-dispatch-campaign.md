@@ -7047,3 +7047,22 @@ never counted before), the walk residue reduced to by-design +
 task-15 rows, ANON_BASE default ON with the allocator discipline and
 two memo-lifetime bugs fixed, and every intermediate regression
 root-fixed (never worked around) with the gates green at every commit.
+
+## Final gate confirmation (2026-08-10)
+
+The canonical compose plugin gate at the campaign's end state
+(9f1cb762): 1342 passed across 46 classes, 0 incomplete, ratchet 1305
+— confirmed by running the itest binary DIRECTLY (exit 0, "All 1 tests
+passed"). Note for future gate reads: the `zig build
+itest-compose_plugin_commontest` wrapper intermittently prints a
+"failed command:" line for the run-test step even when the build exits
+0 and the binary passes — a build-runner report artifact under
+`--listen=-`, not a suite failure; when in doubt run the cached test
+binary directly with the step's env (KLIO_ITEST_BIN,
+KLIO_RSS_CAP_KB, KLIO_PARITY_BASE_IMAGES).
+
+With this, every gate in the battery is green at the end state:
+census suite 119/119 (census 3, all residuals owned by
+bytecode-vm-plan.md with designs and measured evidence), sweep 117/0,
+units green, corpus 280/291 + verified standalone flakes, litmus 42/43
+(known flake), compose plugin 1342/46/0 >= 1305.
