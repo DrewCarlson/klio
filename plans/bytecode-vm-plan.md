@@ -306,3 +306,26 @@ declaration at all (Any-inherited toString, JVM-only delete/setCharAt,
 extension-dispatch indices/lastIndex) — audit-classification rows, not
 resolution holes, exactly as the audit's own lower-bound contract
 states.
+
+## Task-15 continuation queue (entry points pinned)
+
+1. Pack-context asserter typing: repro = `ae.kt` (import
+   kotlin.test.assertEquals; assertEquals(1,1)) under a home with the
+   kotlin.test pack — 1 ladder row; source mode 0. The property IS
+   annotated (`public val asserter: Asserter get() = ...`,
+   upstream/common Assertions.kt:26) and recordTopLevelProp records the
+   head; the consult side (topLevelPropTypeRef /
+   topLevelPropTypeHeadTiered, interp_ir/build.zig:1040 records,
+   ir.zig tier walk) declines under the pack file's package/file
+   identity. Fix the tier match for pack-owned files.
+2. StringBuilder.toString@<lambda> 32: find the lambda site
+   (KLIO_CALL_STATS names the frame `<lambda>`; the receiver is a
+   closure-captured StringBuilder), thread the capture's decl type.
+3. Iterator.hasNext non-Instance receiver ABI: the walk converts host
+   iterator VALUES to the receiver-typed intrinsic; the adapter table's
+   non-Instance leg (receiver_abi on Class) owns it.
+4. Vararg convention unification: packVarargArgs runs only for
+   interpreted bodies; vararg-taking intrinsics receive spread args.
+   Adapters pack at the dispatchIntrinsic boundary per entry.
+5. The reserved-fid local-class typing row (design in the campaign
+   plan's closing sections; the supertype-chain slice landed).
