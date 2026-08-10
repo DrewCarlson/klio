@@ -18389,6 +18389,11 @@ fn lowerResolvedMemberCall(
     // and bind the virtual slot (the runtime slot's by-name fallback
     // executes the RegisterClass method).
     if (owner_id == null and ast_type_args.len == 0 and allNull(ast_arg_names) and
+        // ONLY the local-class typing records (the `$lc` mangle):
+        // class_super_names is the GENERAL super registry, and probing it
+        // for any row-less head bound atomicfu's pack stubs over their
+        // host bindings (every CAS deadlocked).
+        std.mem.indexOf(u8, head, "$lc") != null and
         b.module.registry.class_super_names.get(head) != null)
     {
         var probe: usize = args.len;
