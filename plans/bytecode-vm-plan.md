@@ -355,3 +355,33 @@ source semantics themselves. The conversion boundary (dispatchIntrinsic,
 receiver at slot 0) is the C-shim surface; the vararg pack/spread
 unification and the reserved-fid local-class row remain the open
 engineering items.
+
+## The reserved-fid local-class row: LANDED (4b4ca585 + d20bc8b2)
+
+The full slice of the local-class typing-row design is in: each local
+class's own methods register as bodyless HEADER rows under the
+function-scoped mangle at declaration lowering (the supers record
+registers even for a supertype-less class — the key's presence IS the
+record), and the member emission probes the mangled member table
+directly when no class row exists, binding the call's virtual slot
+(`c.bump(5)` emits CallVirtual; census bound_virtual 8,031 -> 8,094).
+The runtime slot's by-name fallback executes the
+RegisterClass-registered method, so dispatch semantics are unchanged.
+
+The probe's gate MUST be the `$lc` mangle marker: gating on
+class_super_names presence alone bound atomicfu's pack STUBS over
+their host bindings for any row-less head with recorded supers —
+every CAS deadlocked (litmus 42 -> 36, caught by the battery and
+root-fixed the same day; the two speculative gates tried while
+bisecting are reverted, their parent commits each proven green
+standalone). The general lesson joins the plan's refuted-non-fixes
+list: a HOST-SHADOWED pack member must never bind its interpreted
+body — any new static-bind route needs either the `$lc`-style
+provenance marker or module-side visibility of the binding manifest's
+overrides_interpreter set (still unbuilt; the adapter-table follow-on
+that would retire this hazard class wholesale).
+
+Remaining open engineering under task-15: the vararg pack/spread
+adapter at the dispatchIntrinsic boundary, and module-side
+overrides_interpreter visibility. The ladder is otherwise confined to
+source-dynamic receivers + Result.fold (by design).
