@@ -12641,6 +12641,134 @@ pub fn extensionNullaryReturnTypeRef(
     return agreed;
 }
 
+/// The trailing lambda's derived RETURN under concrete input param types —
+/// a census-quiet probe. Serves the RECORDER-level star patch only: it
+/// never feeds overload shapes (the shape-level variant measured
+/// net-negative and is recorded as such in the plan).
+fn lambdaReturnUnderParams(
+    b: *FuncBuilder,
+    lam_expr: *const Expr,
+    in_tys: []const ir.TypeRef,
+) Allocator.Error!?ir.TypeRef {
+    if (lam_expr.* != .Lambda) return null;
+    const lam = lam_expr.Lambda;
+    const stmts = lam.body.stmts;
+    if (stmts.len == 0 or stmts[stmts.len - 1] != .Expr) return null;
+    if (od_depth >= 4) return null;
+    var nb = try FuncBuilder.init(b.allocator, b.module);
+    nb.census_quiet = true;
+    defer nb.deinit();
+    {
+        var dit = b.local_decl_types.iterator();
+        while (dit.next()) |e2| {
+            nb.setLocalDeclTypeOwned(e2.key_ptr.*, e2.value_ptr.clone(b.allocator) catch continue) catch {};
+        }
+    }
+    var i: usize = 0;
+    while (i < in_tys.len) : (i += 1) {
+        const pname = if (lam.params.len == 0 and in_tys.len == 1)
+            "it"
+        else if (i < lam.params.len)
+            lam.params[i].name
+        else
+            return null;
+        const dh = typeHead(std.mem.trimEnd(u8, in_tys[i].name, "?"));
+        if (dh.len == 0 or bareTypeParamHead(dh) or
+            ir.parseClassTypeParamIdentity(dh) != null) return null;
+        nb.setLocalDeclTypeOwned(pname, in_tys[i].clone(b.allocator) catch return null) catch return null;
+    }
+    od_depth += 1;
+    defer od_depth -= 1;
+    const t = staticExprTypeRef(&nb, &stmts[stmts.len - 1].Expr) catch null;
+    if (t) |ty| {
+        const th = typeHead(std.mem.trimEnd(u8, ty.name, "?"));
+        if (th.len == 0 or bareTypeParamHead(th) or
+            ir.parseClassTypeParamIdentity(th) != null)
+        {
+            var tt = ty;
+            tt.deinit(b.allocator);
+            return null;
+        }
+    }
+    return t;
+}
+
+/// RECORDER-level star patch: a recorded call-return whose args contain
+/// `*` (an unbound RETURN-position type parameter, star-erased by the
+/// solve) re-derives the star from the call's trailing lambda when the
+/// committed candidate's fn-typed last param returns exactly that
+/// parameter (`groupBy(keySelector: (T) -> K): Map<K, List<T>>`). The
+/// patch runs AFTER resolution — it improves the recorded local type and
+/// feeds no overload shape.
+pub fn patchStarredCallRecord(
+    b: *FuncBuilder,
+    recorded: *ir.TypeRef,
+    call_expr: *const Expr,
+) Allocator.Error!void {
+    if (call_expr.* != .Call) return;
+    const call = call_expr.Call;
+    if (call.args.len == 0 or call.args[call.args.len - 1] != .Lambda) return;
+    if (!allNull(call.arg_names)) return;
+    var has_star = false;
+    for (recorded.args) |ra| {
+        if (std.mem.eql(u8, ra.name, "*")) has_star = true;
+    }
+    if (!has_star) return;
+    if (call.callee.* != .Member) return;
+    const mname = call.callee.Member.name.name;
+    // The committed candidate: the receiver's unique lambda-hosting
+    // extension of the name and shape.
+    var recv_owned = (try staticExprTypeRef(b, call.callee.Member.receiver)) orelse return;
+    defer recv_owned.deinit(b.allocator);
+    const recv_head = typeHead(std.mem.trimEnd(u8, recv_owned.name, "?"));
+    var target: ?FuncId = null;
+    for (b.module.funcsBySimpleName(mname)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.kind == .instance_method or f.kind == .member_extension) continue;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        if (f.params.len - 1 != call.args.len) continue;
+        if (!b.module.classIsOrExtends(recv_head, typeHead(f.params[0].ty.name))) continue;
+        const lpt = f.params[f.params.len - 1].ty;
+        const lph = typeHead(std.mem.trimEnd(u8, lpt.name, "?"));
+        if (!std.mem.startsWith(u8, lph, "Function") and
+            !std.mem.eql(u8, lph, "<function>")) continue;
+        if (target != null) return;
+        target = fid;
+    }
+    const tfid = target orelse return;
+    const tf = b.module.funcById(tfid) orelse return;
+    const lpt = tf.params[tf.params.len - 1].ty;
+    if (lpt.args.len < 1) return;
+    var rname = std.mem.trimEnd(u8, lpt.args[lpt.args.len - 1].name, "?");
+    if (std.mem.startsWith(u8, rname, "in#")) rname = rname[3..];
+    if (std.mem.startsWith(u8, rname, "out#")) rname = rname[4..];
+    if (!bareTypeParamHead(rname)) return;
+    // The starred position in the record must be exactly where the
+    // declared return spells that parameter.
+    if (!tf.return_ty_declared or tf.return_ty.args.len != recorded.args.len) return;
+    var scratch = std.heap.ArenaAllocator.init(b.allocator);
+    defer scratch.deinit();
+    const a2 = scratch.allocator();
+    const solved = (b.module.solveCallBindings(a2, tfid, tf, recv_owned, null, &.{}, &.{}, false) catch null) orelse return;
+    const n_in = lpt.args.len - 1;
+    const in_tys = a2.alloc(ir.TypeRef, n_in) catch return;
+    for (lpt.args[0..n_in], in_tys) |raw, *slot| {
+        slot.* = ir.Module.substituteBoundType(a2, raw, solved.bindings) catch return;
+    }
+    var lr = (try lambdaReturnUnderParams(b, &call.args[call.args.len - 1], in_tys)) orelse return;
+    defer lr.deinit(b.allocator);
+    for (tf.return_ty.args, recorded.args) |decl_arg, *rec_arg| {
+        if (!std.mem.eql(u8, rec_arg.name, "*")) continue;
+        var dn = std.mem.trimEnd(u8, decl_arg.name, "?");
+        if (std.mem.startsWith(u8, dn, "in#")) dn = dn[3..];
+        if (std.mem.startsWith(u8, dn, "out#")) dn = dn[4..];
+        if (!std.mem.eql(u8, dn, rname)) continue;
+        const patched = lr.clone(b.allocator) catch return;
+        rec_arg.deinit(b.allocator);
+        rec_arg.* = patched;
+    }
+}
+
 /// The UNIQUE in-scope type-param bound whose class declares property `nm`
 /// — the implicit-receiver chase's answer when the splice window's head is
 /// a bare param with no bound record of its own.

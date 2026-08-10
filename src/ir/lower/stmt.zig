@@ -325,7 +325,12 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             // the local then refute inapplicable members.
             .Call => {
                 const vt = runtime.envOnce("KLIO_VALTY_TRACE");
-                if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
+                if (try expr_mod.staticExprTypeRef(b, e)) |ct0| {
+                    var ct = ct0;
+                    // A star-erased RETURN-position parameter re-derives
+                    // from the call's trailing lambda (recorder-level only;
+                    // resolution shapes are untouched).
+                    try expr_mod.patchStarredCallRecord(b, &ct, e);
                     if (vt) |w| if (std.mem.eql(u8, w, p.name.name))
                         std.debug.print("[valty] {s} = {s} nargs={d} a0={s} mod={x} classes={d}\n", .{ p.name.name, ct.name, ct.args.len, if (ct.args.len != 0) ct.args[0].name else "-", @intFromPtr(b.module) & 0xffff, b.module.classes.items.len });
                     const was_nullable = ct.nullable;
