@@ -1327,6 +1327,14 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
             if (trace.enabled(f.name)) {
                 trace.emit("map=bodyless_native_own name={s} fqn={s}", .{ f.name, f.fqn });
             }
+            // The vararg adapter TABLE (`vararg_spread_adapters`) records
+            // which entries expect the SPREAD convention — the transpiler's
+            // shim list. The runtime boundary must NOT unpack blindly: a
+            // slot-exact Array argument is ambiguous between a packed frame
+            // and an Array ELEMENT (`arrayOf(x as Array<out Any>)` means
+            // the element), so activation waits for the caller-side
+            // convention flip that arrives with the VM's explicit frame
+            // layout.
             return dispatchIntrinsic(self, allocator, f.fqn, intrinsic, args_in);
         }
     }
