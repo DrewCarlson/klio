@@ -329,3 +329,29 @@ states.
    Adapters pack at the dispatchIntrinsic boundary per entry.
 5. The reserved-fid local-class typing row (design in the campaign
    plan's closing sections; the supertype-chain slice landed).
+
+## Task-15 continuation results (2026-08-10, commits 834f8cde + 10f8aa35)
+
+Queue item 1 RESOLVED with a corrected diagnosis: the asserter family
+was NOT a pack-context divergence (both modes walked; the earlier
+source-mode observation was stale binary state). The root was the
+member lowering's CLASSIFIER PRESUMPTION: an unresolvable lowercase
+Path receiver was rebound to the classifier's companion, and a
+top-level PROPERTY read (kotlin.test's `asserter: Asserter`) dropped
+the whole resolution when the interface had no companion. Top-level
+property evidence now keeps the value receiver on ordinary member
+resolution — the 22-hit family is gone.
+
+Ladder standing after the headers + the fix: Result.fold 110 (BY
+DESIGN) + StringBuilder.toString@<lambda> 32 + Iterator.hasNext 24 —
+both remaining families are GENUINELY runtime-typed receivers
+(`element.toString()` on a bare `T` inside joinTo's appendElement,
+where the runtime element happens to be a StringBuilder; the test
+helper's dynamic iterator over host values). kotlinc dispatches these
+virtually through Any/Iterator; klio's walk resolves the
+receiver-typed intrinsic — this IS the adapter table's non-Instance
+conversion role, now confined to receivers that are dynamic in the
+source semantics themselves. The conversion boundary (dispatchIntrinsic,
+receiver at slot 0) is the C-shim surface; the vararg pack/spread
+unification and the reserved-fid local-class row remain the open
+engineering items.
