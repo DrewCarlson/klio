@@ -2611,3 +2611,26 @@ test "type_param_bounded_by_type_param" {
         \\
     );
 }
+
+// The derived-receiver static-binding mechanisms in one program: extension
+// returns instantiated from receivers (associateWith on a derived local),
+// heterogeneous-vararg LUB records, SAM lambda typing (expected-type,
+// explicit-args, and chained forms), bare-tp property substitution
+// (isEmpty().not() on Ctx<Map<K, V>>), the object-let marker splice, the
+// local-class supertype typing record, Array flatten, the repeat protocol,
+// and a qualified value-class ctor. Every row is kotlinc's output.
+test "derived_receiver_static_binds" {
+    try check("derived_receiver_static_binds",
+        \\{beta=2}
+        \\a, b, c, *
+        \\[A, b]
+        \\true
+        \\true
+        \\7
+        \\[x, y]
+        \\[a, b, c]
+        \\3
+        \\true
+        \\
+    );
+}
