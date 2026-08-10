@@ -9916,6 +9916,18 @@ fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.
     // answer an unrelated same-named class — the resolve() bail below
     // already catches it (the declaration binds the name), noted here so
     // the local-class tail is not re-probed as a missed lookup.
+    // A LOCAL CLASS constructor call: the lowering-time typing record's
+    // mangled head (its registered supertype chain proves extension
+    // applicability; the runtime RegisterClass binding stays the ctor).
+    if (build.isLocalClassInScope(ident.name)) {
+        var lc_buf: [160]u8 = undefined;
+        if (std.fmt.bufPrint(&lc_buf, "{s}$lc{s}", .{ ident.name, build.currentRealFn() orelse "" }) catch null) |key| {
+            if (b.module.registry.class_super_names.get(key) != null) {
+                if (citr_trace) std.debug.print("[citr] {s} local-class head {s}\n", .{ ident.name, key });
+                return .{ .name = try b.allocator.dupe(u8, key), .nullable = false, .args = &.{} };
+            }
+        }
+    }
     // A local or a function of the same name is not a constructor call.
     if (b.resolve(ident.name) != null or b.knowsOuter(ident.name)) {
         if (citr_trace) std.debug.print("[citr] {s} bail=local_or_outer\n", .{ident.name});

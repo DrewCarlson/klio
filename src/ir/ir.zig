@@ -10389,6 +10389,17 @@ pub const Module = struct {
             self.classIdByFqn(sub)
         else
             self.uniqueClassIdBySimpleName(staticTypeHead(sub));
+        // A ROW-LESS sub with a registered name chain (a local class's
+        // lowering-time typing record) answers through it even when the
+        // SUPER resolves a class id.
+        if (sub_id == null) {
+            if (self.registry.class_super_names.get(staticTypeHead(sub))) |supers| {
+                const sup_simple = applicability.simpleName(staticTypeHead(super_name));
+                for (supers) |s2| {
+                    if (std.mem.eql(u8, applicability.simpleName(staticTypeHead(s2)), sup_simple)) return true;
+                }
+            }
+        }
         const super_id = if (std.mem.indexOfScalar(u8, super_name, '.') != null)
             self.classIdByFqn(super_name)
         else

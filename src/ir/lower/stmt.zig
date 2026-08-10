@@ -1461,6 +1461,46 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
     // A nested lambda's bare `C(args)` must construct this local class
     // through the captured binding, not a same-simple-name module class.
     build.pushLocalClassName(c.name.name);
+    // Lowering-time TYPING record: the local class's transitive supertype
+    // chain under a function-scoped mangle, so a local initialized from
+    // its constructor carries a head that proves Collection-ness to
+    // extension binding (`coll.toTypedArray()`); the runtime
+    // RegisterClass path stays the executor.
+    {
+        const ra = b.module.registry.allocator;
+        if (std.fmt.allocPrint(ra, "{s}$lc{s}", .{ c.name.name, build.currentRealFn() orelse "" }) catch null) |key| {
+            var chain: std.ArrayList([]const u8) = .empty;
+            var chain_ok = true;
+            for (c.supertypes) |*sup| {
+                const sn = sup.name.name;
+                chain.append(ra, ra.dupe(u8, sn) catch {
+                    chain_ok = false;
+                    break;
+                }) catch {
+                    chain_ok = false;
+                    break;
+                };
+                if (b.module.registry.class_super_names.get(sn)) |transitive| {
+                    for (transitive) |tn| {
+                        chain.append(ra, ra.dupe(u8, tn) catch {
+                            chain_ok = false;
+                            break;
+                        }) catch {
+                            chain_ok = false;
+                            break;
+                        };
+                    }
+                }
+                if (!chain_ok) break;
+            }
+            if (chain_ok and chain.items.len != 0) {
+                const owned = chain.toOwnedSlice(ra) catch null;
+                if (owned) |sl| b.module.registry.class_super_names.put(key, sl) catch {};
+            } else {
+                chain.deinit(ra);
+            }
+        }
+    }
     return null;
 }
 
