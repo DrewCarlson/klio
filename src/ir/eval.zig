@@ -5302,20 +5302,29 @@ fn runFrameExec(
                         pc += 2;
                     },
                     .bin => {
-                        idx = code[pc + 1];
-                        const inst = &insts[idx];
                         // Same-tag scalar operands take an inline path with
                         // the exact `applyBinop` semantics (wrap arithmetic,
                         // truncated div/rem, numeric compare); anything else
                         // — including a zero divisor, whose exception the
-                        // generic arm constructs — falls through.
-                        if (binFast(frame, &inst.BinOp, allocator)) {
-                            pc += 2;
+                        // generic arm constructs — falls through. The
+                        // operands ride in the stream, so the fast path
+                        // never loads the Inst union.
+                        if (binFast(
+                            frame,
+                            @enumFromInt(code[pc + 2]),
+                            @enumFromInt(code[pc + 3]),
+                            @enumFromInt(code[pc + 4]),
+                            @enumFromInt(code[pc + 5]),
+                            allocator,
+                        )) {
+                            pc += 6;
                             continue :bc_loop;
                         }
+                        idx = code[pc + 1];
+                        const inst = &insts[idx];
                         const r = try execArmBinOp(H, allocator, frame, inst.BinOp, host);
                         switch (try afterStep(allocator, frame, r, inst, idx, cur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
-                            .cont => pc += 2,
+                            .cont => pc += 6,
                             .brk => break :bc_loop,
                             .ret => return ret_v,
                         }
@@ -5864,15 +5873,15 @@ fn afterStep(
 /// `remTruncI32/64`, numeric equality — and every other shape
 /// (mixed tags, zero divisors, Cells, user operators) returns false
 /// so the generic arm runs.
-inline fn binFast(frame: *Frame, bo: anytype, allocator: Allocator) bool {
+inline fn binFast(frame: *Frame, op: BinOp, dst: Reg, lhs: Reg, rhs: Reg, allocator: Allocator) bool {
     const regs = frame.regs.items;
-    const li = bo.lhs.int();
-    const ri = bo.rhs.int();
-    const di = bo.dst.int();
+    const li = lhs.int();
+    const ri = rhs.int();
+    const di = dst.int();
     if (li >= regs.len or ri >= regs.len or di >= regs.len) return false;
     const lv = regs[li];
     const rv = regs[ri];
-    const out: Value = scalarBin(bo.op, lv, rv) orelse return false;
+    const out: Value = scalarBin(op, lv, rv) orelse return false;
     const old = frame.regs.items[di];
     frame.regs.items[di] = out;
     if (runtime.reclaimEnabled()) old.release(allocator);

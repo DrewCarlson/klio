@@ -19,8 +19,9 @@ pub const Op = enum(u32) {
     cell_get,
     /// inst_idx — span bookkeeping (reads the original Trace inst).
     trace,
-    /// inst_idx — arithmetic/compare, routed to the walker's BinOp arm
-    /// directly (skips the union dispatch, keeps every semantic).
+    /// inst_idx, kind, dst, lhs, rhs — arithmetic/compare. The operands
+    /// ride in the stream so the hot path never touches the Inst union;
+    /// the generic fallback reaches the original inst via inst_idx.
     bin,
     /// inst_idx — every other instruction, via `execInst`.
     escape,
@@ -113,8 +114,15 @@ fn build(insts: []const ir.Inst) ?*const Stream {
             .Trace => {
                 code.appendSlice(a, &.{ @intFromEnum(Op.trace), @intCast(i) }) catch return null;
             },
-            .BinOp => {
-                code.appendSlice(a, &.{ @intFromEnum(Op.bin), @intCast(i) }) catch return null;
+            .BinOp => |bo| {
+                code.appendSlice(a, &.{
+                    @intFromEnum(Op.bin),
+                    @intCast(i),
+                    @intFromEnum(bo.op),
+                    bo.dst.int(),
+                    bo.lhs.int(),
+                    bo.rhs.int(),
+                }) catch return null;
             },
             else => {
                 code.appendSlice(a, &.{ @intFromEnum(Op.escape), @intCast(i) }) catch return null;
@@ -131,4 +139,29 @@ fn build(insts: []const ir.Inst) ?*const Stream {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "stream encoding: dedicated ops, operand words, idx_pc, escape" {
+    const insts = [_]ir.Inst{
+        .{ .Const = .{ .dst = ir.Reg.from(1), .value = ir.ConstId.from(7) } },
+        .{ .BinOp = .{ .dst = ir.Reg.from(2), .op = .Add, .lhs = ir.Reg.from(1), .rhs = ir.Reg.from(0), .compound = false } },
+        .{ .Move = .{ .dst = ir.Reg.from(3), .src = ir.Reg.from(2) } },
+        .{ .MakeCell = .{ .dst = ir.Reg.from(4), .src = ir.Reg.from(3) } },
+    };
+    const st = build(&insts) orelse return error.TestUnexpectedResult;
+    const want = [_]u32{
+        @intFromEnum(Op.const_load), 1, 7,
+        @intFromEnum(Op.bin),        1, @intFromEnum(ir.BinOp.Add), 2, 1, 0,
+        @intFromEnum(Op.move),       3, 2,
+        @intFromEnum(Op.escape),     3,
+    };
+    try std.testing.expectEqualSlices(u32, &want, st.code);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 3, 9, 12 }, st.idx_pc);
+}
+
+test "stream encoding: an all-escape block builds no stream" {
+    const insts = [_]ir.Inst{
+        .{ .MakeCell = .{ .dst = ir.Reg.from(1), .src = ir.Reg.from(0) } },
+    };
+    try std.testing.expect(build(&insts) == null);
 }
