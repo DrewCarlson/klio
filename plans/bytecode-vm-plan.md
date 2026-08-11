@@ -444,3 +444,50 @@ The VM-prep goal state: dispatch decided at lowering everywhere the
 language allows; the walk's remaining roles are DATA (the host-shadow
 set, the adapter table) or SPECS (CALL_TAGGED); the instruction set
 can freeze against the closed dispatch-form list.
+
+## The bytecode tier — FROZEN v1 spec (2026-08-11)
+
+Architecture: QUICKENING WITH AN ESCAPE HATCH, at the exact seam the
+tree-walker exposes — the inner instruction loop of `runFrameExec`.
+Everything outside that loop (the try stack, finally regions, resume
+at (block, idx), flat-call activations, the throw unwind) is the
+walker's proven machinery and stays UNTOUCHED; the bytecode replaces
+only the per-instruction union-tag dispatch over sparse `Inst` values
+with a dense per-block `u32` stream.
+
+Encoding (per block, built lazily on first execution, cached under the
+same benign-race convention as `Func.fast_call`):
+- One or more u32 words per instruction: `op:u8 | a:u8 | b:u8 | c:u8`,
+  wide operands (register numbers >= 256, const ids) in following
+  words. Registers are the existing frame slots — the frame layout IS
+  the shared entry shape already frozen (receiver slot 0, packed
+  varargs).
+- Dedicated ops v1 (the dynamically hot, semantics-simple set):
+  CONST dst,const_id · MOVE dst,src · LOAD_PARAM dst,idx ·
+  BIN op,dst,l,r (kind in the op byte's payload; executes the same
+  leaf helpers the walker's BinOp arm calls) · NOT dst,src ·
+  CELL_GET dst,cell · CELL_SET cell,src.
+- ESCAPE idx — everything else (all 46 variants: the calls, the
+  suspension point, field ops, closures) executes exactly as today via
+  `execInst(&insts[idx])`, preserving every Step outcome (cont /
+  raised / flat_call) and the suspension contract, because the stream
+  carries the ORIGINAL instruction index.
+- A per-block `idx -> pc` side table maps the resume machinery's
+  (block, idx) coordinates into the stream, so coroutine resumes enter
+  mid-block exactly as before.
+- Terminators are NOT encoded in v1 — the block-transition logic in
+  the walker runs unchanged after the stream ends.
+
+Gate: `KLIO_BC=1` enables the tier; default off until the battery has
+run green under the flag long enough to flip. Growth path: each
+release moves variants from ESCAPE to dedicated ops by measured
+frequency (KLIO_PROF's op mix), the calls first (CALL fid, VCALL slot,
+CALL_TAGGED when its table lands) — the op list may grow, the frame
+contract and the escape guarantee never change.
+
+Why this is the right v1: coverage is total on day one (no program is
+ineligible — the escape op IS the tree walker per instruction), the
+coroutine/exception semantics cannot drift (they share the walker's
+code), and the perf win lands where the profile says the time is
+(dense fetch + direct leaf calls for the hot simple ops, no union
+loads). The C transpiler consumes the same op stream.
