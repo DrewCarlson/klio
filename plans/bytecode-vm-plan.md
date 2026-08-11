@@ -516,3 +516,11 @@ Remaining under this plan: CALL_TAGGED's link-time table (spec'd), the
 vararg adapter activation (needs the explicit frame layout — natural
 once call ops are quickened into the stream), and the C transpiler
 consuming the same streams/tables.
+
+## Bytecode-tier batch gate (2026-08-11, at b5e10170)
+
+Compose plugin canonical over the tier commits: 1334 passed / 46
+classes / 1 did not complete vs ratchet 1305 — direct binary run,
+exit 0. With the flag-on sweep 117/0, litmus both modes, corpus,
+census 119/119 and units already green, the tier's batch is verified
+end to end.
