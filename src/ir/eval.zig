@@ -5088,7 +5088,7 @@ fn runFrameExec(
     // Fused terminator ops only when the loop JIT is off: the JIT's
     // compile trigger lives at this loop's block entry, and fused edges
     // would starve it.
-    const bc_streams: ?*const bc.FuncStreams = if (bc.enabled()) bc.funcStreams(func, !jit_on) else null;
+    const bc_streams: ?*const bc.FuncStreams = if (bc.enabled()) bc.funcStreams(func, !jit_on, module.consts.items) else null;
     const field_resolver: ?jit_loop.FieldResolver =
         if (comptime tramp_ok and @hasDecl(H, "plainStoredFieldIndex")) &LoopTramp(H).resolveField else null;
     const field_nn_resolver: ?jit_loop.FieldResolver =
@@ -5287,6 +5287,12 @@ fn runFrameExec(
                             try frame.write(@enumFromInt(code[pc + 1]), v);
                         pc += 3;
                     },
+                    .const_int => {
+                        const v: Value = .{ .Int = @bitCast(code[pc + 2]) };
+                        if (!writeFast(frame, @enumFromInt(code[pc + 1]), v, allocator))
+                            try frame.write(@enumFromInt(code[pc + 1]), v);
+                        pc += 3;
+                    },
                     .move => {
                         const v = frame.read(@enumFromInt(code[pc + 2]));
                         v.retain();
@@ -5376,27 +5382,65 @@ fn runFrameExec(
                             }
                             target = if (cv.Bool) code[pc + 2] else code[pc + 3];
                         }
-                        // The frame loop's per-block-entry guards, per edge.
-                        if (runtime.shouldAbandon()) {
+                        if (fusedEdgeGuard(ftls)) |er| {
                             cur = bcur;
-                            return errResult(.{ .Type = "daemon task abandoned at run boundary" });
-                        }
-                        ftls.spin_check_counter +%= 1;
-                        if (ftls.spin_check_counter & 0xFFFF == 0) {
-                            spinDumpMaybe();
-                            const wall_dl = test_wall_deadline_ms.load(.monotonic);
-                            if (wall_dl != 0 and nowMonotonicMs() > wall_dl) {
-                                std.debug.print("[wall-cap] test wall-clock deadline exceeded — hang location follows:\n", .{});
-                                cur = bcur;
-                                dumpFrameChainForDiagAlways();
-                                wallCapAbandon();
-                                return errResult(.{ .Type = "test wall-clock deadline exceeded" });
-                            }
-                        }
-                        if (runtime.gc.gc_enabled and runtime.gc.pending()) {
-                            runtime.gc.safePoint();
+                            return er;
                         }
                         const nb: BlockId = @enumFromInt(target);
+                        if (bs.streams[nb.int()]) |ns| {
+                            bcur = nb;
+                            binsts = frame.func.blocks[nb.int()].insts;
+                            code = ns.code;
+                            pc = 0;
+                        } else {
+                            bc_goto = nb;
+                            break :bc_loop;
+                        }
+                    },
+                    .cmp_br => {
+                        // The block's last BinOp fused with its Branch: the
+                        // scalar compare computes inline, still writes dst
+                        // (register state matches the unfused form), and
+                        // branches without another fetch. Non-scalar
+                        // operands run the generic arm, then branch on dst.
+                        var taken: ?bool = null;
+                        {
+                            const regs = frame.regs.items;
+                            const di = code[pc + 3];
+                            const li = code[pc + 4];
+                            const ri = code[pc + 5];
+                            if (li < regs.len and ri < regs.len and di < regs.len) {
+                                if (scalarBin(@enumFromInt(code[pc + 2]), regs[li], regs[ri])) |out| {
+                                    if (out == .Bool) {
+                                        const old = frame.regs.items[di];
+                                        frame.regs.items[di] = out;
+                                        if (runtime.reclaimEnabled()) old.release(allocator);
+                                        taken = out.Bool;
+                                    }
+                                }
+                            }
+                        }
+                        if (taken == null) {
+                            idx = code[pc + 1];
+                            const inst = &binsts[idx];
+                            const r = try execArmBinOp(H, allocator, frame, inst.BinOp, host);
+                            switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
+                                .cont => {},
+                                .brk => break :bc_loop,
+                                .ret => return ret_v,
+                            }
+                            const cv = frame.read(@enumFromInt(code[pc + 3]));
+                            if (cv != .Bool) {
+                                bc_term = bcur;
+                                break :bc_loop;
+                            }
+                            taken = cv.Bool;
+                        }
+                        if (fusedEdgeGuard(ftls)) |er| {
+                            cur = bcur;
+                            return er;
+                        }
+                        const nb: BlockId = @enumFromInt(if (taken.?) code[pc + 6] else code[pc + 7]);
                         if (bs.streams[nb.int()]) |ns| {
                             bcur = nb;
                             binsts = frame.func.blocks[nb.int()].insts;
@@ -6052,6 +6096,30 @@ inline fn scalarBin(op: BinOp, lv: Value, rv: Value) ?Value {
             else => break :blk null,
         };
     } else null;
+}
+
+/// The frame loop's per-block-entry guards, run on every taken FUSED
+/// edge: daemon abandonment, the spin/wall diagnostic, and the GC safe
+/// point. Non-null = abort the frame with this result.
+inline fn fusedEdgeGuard(ftls: *EvalTls) ?EvalResult {
+    if (runtime.shouldAbandon()) {
+        return errResult(.{ .Type = "daemon task abandoned at run boundary" });
+    }
+    ftls.spin_check_counter +%= 1;
+    if (ftls.spin_check_counter & 0xFFFF == 0) {
+        spinDumpMaybe();
+        const wall_dl = test_wall_deadline_ms.load(.monotonic);
+        if (wall_dl != 0 and nowMonotonicMs() > wall_dl) {
+            std.debug.print("[wall-cap] test wall-clock deadline exceeded — hang location follows:\n", .{});
+            dumpFrameChainForDiagAlways();
+            wallCapAbandon();
+            return errResult(.{ .Type = "test wall-clock deadline exceeded" });
+        }
+    }
+    if (runtime.gc.gc_enabled and runtime.gc.pending()) {
+        runtime.gc.safePoint();
+    }
+    return null;
 }
 
 /// Inline register store for the bytecode loop's simple ops: succeeds

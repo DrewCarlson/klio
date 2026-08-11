@@ -20,6 +20,9 @@ const ir = @import("ir.zig");
 pub const Op = enum(u32) {
     /// dst, const_id — load a constant.
     const_load,
+    /// dst, payload — load a small Int constant embedded in the stream
+    /// (no consts-table lookup, no conversion dispatch).
+    const_int,
     /// dst, src — copy with retain.
     move,
     /// dst, idx — parameter load.
@@ -45,6 +48,13 @@ pub const Op = enum(u32) {
     /// (no operands) — run this block's real terminator in the frame
     /// loop (Throw, TailJump, suspension forms, ...).
     term_exit,
+    /// inst_idx, kind, dst, lhs, rhs, t_block, f_block — a fused
+    /// compare-and-branch: the block's LAST instruction is a BinOp
+    /// whose dst is exactly the Branch condition. The compare's result
+    /// is still written to dst (so semantics and register state match
+    /// the unfused form); non-scalar operands fall back to the generic
+    /// arm and then branch on dst.
+    cmp_br,
 };
 
 pub const Stream = struct {
@@ -85,8 +95,9 @@ var cache_mutex: runtime.SpinMutex = .{};
 var cache: ?std.AutoHashMap(usize, *const FuncStreams) = null;
 
 /// `allow_fuse` is process-constant (the loop JIT's enablement); the
-/// first call decides what the cache holds.
-pub fn funcStreams(func: *const ir.Func, allow_fuse: bool) ?*const FuncStreams {
+/// first call decides what the cache holds. `consts` is the owning
+/// module's constant table (for embedding small Int payloads).
+pub fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Const) ?*const FuncStreams {
     if (func.blocks.len == 0) return null;
     const key = @intFromPtr(func.blocks.ptr);
     cache_mutex.lock();
@@ -99,7 +110,7 @@ pub fn funcStreams(func: *const ir.Func, allow_fuse: bool) ?*const FuncStreams {
     const fuse = allow_fuse and fusible(func);
     const streams = a.alloc(?*const Stream, func.blocks.len) catch return null;
     for (func.blocks, streams) |*blk, *slot| {
-        slot.* = build(blk, fuse);
+        slot.* = build(blk, fuse, consts);
     }
     const fs = a.create(FuncStreams) catch return null;
     fs.* = .{ .streams = streams, .fused = fuse };
@@ -123,7 +134,7 @@ fn fusible(func: *const ir.Func) bool {
     return true;
 }
 
-fn build(blk: *const ir.Block, fuse: bool) ?*const Stream {
+fn build(blk: *const ir.Block, fuse: bool, consts: []const ir.Const) ?*const Stream {
     const insts = blk.insts;
     // A block with no dedicated ops gains nothing from the stream —
     // running it as escapes would only add fetch+dispatch on top of
@@ -138,13 +149,51 @@ fn build(blk: *const ir.Block, fuse: bool) ?*const Stream {
         } else false;
         if (!dedicated) return null;
     }
+    // Fused compare-and-branch: the block's LAST inst is a BinOp whose
+    // dst is exactly the Branch condition register.
+    var fuse_cmp_idx: ?usize = null;
+    if (fuse and insts.len != 0) {
+        switch (blk.terminator) {
+            .Branch => |br| switch (insts[insts.len - 1]) {
+                .BinOp => |bo| {
+                    if (bo.dst.int() == br.cond.int()) fuse_cmp_idx = insts.len - 1;
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
     const a = std.heap.smp_allocator;
     var code: std.ArrayList(u32) = .empty;
     var idx_pc = a.alloc(u32, insts.len) catch return null;
     for (insts, 0..) |*inst, i| {
         idx_pc[i] = @intCast(code.items.len);
+        if (fuse_cmp_idx == i) {
+            const bo = insts[i].BinOp;
+            const br = blk.terminator.Branch;
+            code.appendSlice(a, &.{
+                @intFromEnum(Op.cmp_br),
+                @intCast(i),
+                @intFromEnum(bo.op),
+                bo.dst.int(),
+                bo.lhs.int(),
+                bo.rhs.int(),
+                br.t.int(),
+                br.f.int(),
+            }) catch return null;
+            continue;
+        }
         switch (inst.*) {
             .Const => |c| {
+                const cid = c.value.int();
+                if (cid < consts.len and consts[cid] == .Int) {
+                    code.appendSlice(a, &.{
+                        @intFromEnum(Op.const_int),
+                        c.dst.int(),
+                        @bitCast(consts[cid].Int),
+                    }) catch return null;
+                    continue;
+                }
                 code.appendSlice(a, &.{ @intFromEnum(Op.const_load), c.dst.int(), c.value.int() }) catch return null;
             },
             .Move => |mv| {
@@ -180,7 +229,10 @@ fn build(blk: *const ir.Block, fuse: bool) ?*const Stream {
                 code.appendSlice(a, &.{ @intFromEnum(Op.jump), g.int() }) catch return null;
             },
             .Branch => |br| {
-                code.appendSlice(a, &.{ @intFromEnum(Op.br), br.cond.int(), br.t.int(), br.f.int() }) catch return null;
+                // A cmp_br already carries the branch.
+                if (fuse_cmp_idx == null) {
+                    code.appendSlice(a, &.{ @intFromEnum(Op.br), br.cond.int(), br.t.int(), br.f.int() }) catch return null;
+                }
             },
             .Return => |maybe_r| {
                 code.appendSlice(a, &.{
@@ -218,7 +270,7 @@ test "stream encoding: dedicated ops, operand words, idx_pc, escape" {
         .insts = &insts,
         .terminator = .{ .Goto = ir.BlockId.from(2) },
     };
-    const st = build(&blk, false) orelse return error.TestUnexpectedResult;
+    const st = build(&blk, false, &.{}) orelse return error.TestUnexpectedResult;
     const want = [_]u32{
         @intFromEnum(Op.const_load), 1, 7,
         @intFromEnum(Op.bin),        1, @intFromEnum(ir.BinOp.Add), 2, 1, 0,
@@ -227,6 +279,20 @@ test "stream encoding: dedicated ops, operand words, idx_pc, escape" {
     };
     try std.testing.expectEqualSlices(u32, &want, st.code);
     try std.testing.expectEqualSlices(u32, &.{ 0, 3, 9, 12 }, st.idx_pc);
+
+    // An Int constant embeds its payload.
+    const consts = [_]ir.Const{ .{ .Int = -42 }, .{ .String = "s" } };
+    const st2 = build(&blk, false, &consts) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@intFromEnum(Op.const_load), st2.code[0]);
+    var iblk = blk;
+    var iconst = [_]ir.Inst{
+        .{ .Const = .{ .dst = ir.Reg.from(1), .value = ir.ConstId.from(0) } },
+    };
+    iblk.insts = &iconst;
+    const st3 = build(&iblk, false, &consts) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u32, &.{
+        @intFromEnum(Op.const_int), 1, @as(u32, @bitCast(@as(i32, -42))),
+    }, st3.code);
 }
 
 test "stream encoding: fused terminators" {
@@ -238,7 +304,7 @@ test "stream encoding: fused terminators" {
         .insts = &mv,
         .terminator = .{ .Goto = ir.BlockId.from(3) },
     };
-    const gs = build(&goto_blk, true) orelse return error.TestUnexpectedResult;
+    const gs = build(&goto_blk, true, &.{}) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u32, &.{
         @intFromEnum(Op.move), 1, 0,
         @intFromEnum(Op.jump), 3,
@@ -250,7 +316,7 @@ test "stream encoding: fused terminators" {
         .insts = &none,
         .terminator = .{ .Return = ir.Reg.from(5) },
     };
-    const rs = build(&ret_blk, true) orelse return error.TestUnexpectedResult;
+    const rs = build(&ret_blk, true, &.{}) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u32, &.{ @intFromEnum(Op.ret), 1, 5 }, rs.code);
 
     const br_blk: ir.Block = .{
@@ -258,7 +324,7 @@ test "stream encoding: fused terminators" {
         .insts = &none,
         .terminator = .{ .Branch = .{ .cond = ir.Reg.from(2), .t = ir.BlockId.from(1), .f = ir.BlockId.from(4) } },
     };
-    const bs = build(&br_blk, true) orelse return error.TestUnexpectedResult;
+    const bs = build(&br_blk, true, &.{}) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u32, &.{ @intFromEnum(Op.br), 2, 1, 4 }, bs.code);
 }
 
@@ -271,6 +337,6 @@ test "stream encoding: an all-escape block builds no stream unfused" {
         .insts = &mc,
         .terminator = .{ .Goto = ir.BlockId.from(0) },
     };
-    try std.testing.expect(build(&blk, false) == null);
-    try std.testing.expect(build(&blk, true) != null);
+    try std.testing.expect(build(&blk, false, &.{}) == null);
+    try std.testing.expect(build(&blk, true, &.{}) != null);
 }
