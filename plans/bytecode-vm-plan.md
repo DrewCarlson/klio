@@ -560,3 +560,22 @@ inclusive termination, MIN_VALUE exclusive, empty ranges,
 break/continue/labeled-continue targeting, Long, bounds-once
 evaluation order, lambda capture of the loop var, body mutation of
 the hi source variable).
+
+## Tier lever 1: inline scalar BinOp path (binFast)
+
+The `.bin` stream op now tries an inline same-tag scalar path before
+the outlined arm: Int/Int and Long/Long arithmetic/compare and
+Bool/Bool And/Or compute directly against the register file with
+`applyBinop`'s exact same-tag semantics (wrap arithmetic,
+divTrunc/remTrunc, numeric equality; zero divisors fall through so
+the generic arm constructs the exception). Everything else — mixed
+tags, Cells, user operators, ===, dst growth — falls through
+unchanged. Skipping `afterStep` is sound for the inline path: a pure
+value result routes .cont with no bookkeeping.
+
+Measured on the 20M-iteration counted loop (JIT off): tier 5.0s ->
+2.94s (-40%); walker unchanged. Verified: edge battery + binfast
+probe (MIN/-1 wrap, MIN%-1==0, truncated div/rem signs, /0 raises
+both widths, Int+Long promotion, boxed-Any tag inequality, ===)
+byte-identical across modes; flag-on sweep 117/0, litmus 42/43 (the
+known contended flake), corpus 280/291 (same 11), units green.

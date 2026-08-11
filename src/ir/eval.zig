@@ -5296,6 +5296,15 @@ fn runFrameExec(
                     .bin => {
                         idx = code[pc + 1];
                         const inst = &insts[idx];
+                        // Same-tag scalar operands take an inline path with
+                        // the exact `applyBinop` semantics (wrap arithmetic,
+                        // truncated div/rem, numeric compare); anything else
+                        // — including a zero divisor, whose exception the
+                        // generic arm constructs — falls through.
+                        if (binFast(frame, &inst.BinOp, allocator)) {
+                            pc += 2;
+                            continue :bc_loop;
+                        }
                         const r = try execArmBinOp(H, allocator, frame, inst.BinOp, host);
                         switch (try afterStep(allocator, frame, r, inst, idx, cur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
                             .cont => pc += 2,
@@ -5838,6 +5847,70 @@ fn afterStep(
         }
     }
     return .cont;
+}
+
+/// The bytecode tier's inline BinOp path: same-tag Int/Long scalar
+/// arithmetic and comparison (and Bool And/Or) with results written
+/// straight into the register file. Semantics mirror `applyBinop`'s
+/// same-tag cases exactly — wrap arithmetic, `divTruncI32/64` /
+/// `remTruncI32/64`, numeric equality — and every other shape
+/// (mixed tags, zero divisors, Cells, user operators) returns false
+/// so the generic arm runs.
+inline fn binFast(frame: *Frame, bo: anytype, allocator: Allocator) bool {
+    const regs = frame.regs.items;
+    const li = bo.lhs.int();
+    const ri = bo.rhs.int();
+    const di = bo.dst.int();
+    if (li >= regs.len or ri >= regs.len or di >= regs.len) return false;
+    const lv = regs[li];
+    const rv = regs[ri];
+    const out: Value = if (lv == .Int and rv == .Int) blk: {
+        const a = lv.Int;
+        const b = rv.Int;
+        break :blk switch (bo.op) {
+            .Add => .{ .Int = a +% b },
+            .Sub => .{ .Int = a -% b },
+            .Mul => .{ .Int = a *% b },
+            .Div => if (b == 0) return false else .{ .Int = divTruncI32(a, b) },
+            .Mod => if (b == 0) return false else .{ .Int = remTruncI32(a, b) },
+            .Less => .{ .Bool = a < b },
+            .LessEq => .{ .Bool = a <= b },
+            .Greater => .{ .Bool = a > b },
+            .GreaterEq => .{ .Bool = a >= b },
+            .Eq, .BoxedEq => .{ .Bool = a == b },
+            .NotEq, .BoxedNotEq => .{ .Bool = a != b },
+            else => return false,
+        };
+    } else if (lv == .Long and rv == .Long) blk: {
+        const a = lv.Long;
+        const b = rv.Long;
+        break :blk switch (bo.op) {
+            .Add => .{ .Long = a +% b },
+            .Sub => .{ .Long = a -% b },
+            .Mul => .{ .Long = a *% b },
+            .Div => if (b == 0) return false else .{ .Long = divTruncI64(a, b) },
+            .Mod => if (b == 0) return false else .{ .Long = remTruncI64(a, b) },
+            .Less => .{ .Bool = a < b },
+            .LessEq => .{ .Bool = a <= b },
+            .Greater => .{ .Bool = a > b },
+            .GreaterEq => .{ .Bool = a >= b },
+            .Eq, .BoxedEq => .{ .Bool = a == b },
+            .NotEq, .BoxedNotEq => .{ .Bool = a != b },
+            else => return false,
+        };
+    } else if (lv == .Bool and rv == .Bool) blk: {
+        break :blk switch (bo.op) {
+            .And => .{ .Bool = lv.Bool and rv.Bool },
+            .Or => .{ .Bool = lv.Bool or rv.Bool },
+            .Eq, .BoxedEq => .{ .Bool = lv.Bool == rv.Bool },
+            .NotEq, .BoxedNotEq => .{ .Bool = lv.Bool != rv.Bool },
+            else => return false,
+        };
+    } else return false;
+    const old = frame.regs.items[di];
+    frame.regs.items[di] = out;
+    if (runtime.reclaimEnabled()) old.release(allocator);
+    return true;
 }
 
 noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!Step {
