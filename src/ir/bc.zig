@@ -46,24 +46,37 @@ pub fn enabled() bool {
     return gate_on;
 }
 
-/// Process-lifetime stream cache, keyed by the block's instruction slice
-/// pointer (stable for a materialised block). Streams are code-cache data:
-/// built once, never freed.
-var cache_mutex: runtime.SpinMutex = .{};
-var cache: ?std.AutoHashMap(usize, *const Stream) = null;
+/// Per-FUNCTION stream tables (one entry per block, indexed by BlockId),
+/// so the frame loop pays one lookup per ACTIVATION and a plain array
+/// index per block entry. Process-lifetime code-cache data: built once,
+/// never freed. Keyed by the function's blocks pointer (stable once
+/// materialised; a lazily-decoded body gets a fresh table for its final
+/// blocks slice).
+pub const FuncStreams = struct {
+    streams: []const ?*const Stream,
+};
 
-pub fn blockStream(insts: []const ir.Inst) ?*const Stream {
-    if (insts.len == 0) return null;
-    const key = @intFromPtr(insts.ptr);
+var cache_mutex: runtime.SpinMutex = .{};
+var cache: ?std.AutoHashMap(usize, *const FuncStreams) = null;
+
+pub fn funcStreams(func: *const ir.Func) ?*const FuncStreams {
+    if (func.blocks.len == 0) return null;
+    const key = @intFromPtr(func.blocks.ptr);
     cache_mutex.lock();
     defer cache_mutex.unlock();
     if (cache == null) {
-        cache = std.AutoHashMap(usize, *const Stream).init(std.heap.smp_allocator);
+        cache = std.AutoHashMap(usize, *const FuncStreams).init(std.heap.smp_allocator);
     }
-    if (cache.?.get(key)) |st| return st;
-    const st = build(insts) orelse return null;
-    cache.?.put(key, st) catch return st;
-    return st;
+    if (cache.?.get(key)) |fs| return fs;
+    const a = std.heap.smp_allocator;
+    const streams = a.alloc(?*const Stream, func.blocks.len) catch return null;
+    for (func.blocks, streams) |*blk, *slot| {
+        slot.* = if (blk.insts.len == 0) null else build(blk.insts);
+    }
+    const fs = a.create(FuncStreams) catch return null;
+    fs.* = .{ .streams = streams };
+    cache.?.put(key, fs) catch return fs;
+    return fs;
 }
 
 fn build(insts: []const ir.Inst) ?*const Stream {

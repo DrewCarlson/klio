@@ -5079,6 +5079,9 @@ fn runFrameExec(
     const tramp_user: ?*anyopaque = if (comptime tramp_ok) @ptrCast(&loop_ctx) else null;
     const member_resolver: ?jit_loop.MemberResolver =
         if (comptime tramp_ok and @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).resolveMember else null;
+    // The bytecode tier's per-func stream table, hoisted to one lookup per
+    // activation; per block entry it is a plain array index.
+    const bc_streams: ?*const bc.FuncStreams = if (bc.enabled()) bc.funcStreams(func) else null;
     const field_resolver: ?jit_loop.FieldResolver =
         if (comptime tramp_ok and @hasDecl(H, "plainStoredFieldIndex")) &LoopTramp(H).resolveField else null;
     const field_nn_resolver: ?jit_loop.FieldResolver =
@@ -5242,8 +5245,8 @@ fn runFrameExec(
         // this instruction loop's union dispatch; every non-simple op
         // escapes to `execInst`, and all control flow funnels through the
         // same `afterStep` the walker uses.
-        if (bc.enabled()) bc_run: {
-            const stream = bc.blockStream(insts) orelse break :bc_run;
+        if (bc_streams) |bs| bc_run: {
+            const stream = bs.streams[cur.int()] orelse break :bc_run;
             ran_bc = true;
             const code = stream.code;
             var pc: usize = if (start_idx == 0)
