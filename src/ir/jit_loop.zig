@@ -1091,17 +1091,18 @@ fn inferTypes(a: Allocator, module: *const Module, func: *const Func, n_regs: u3
     for (member_ret, 0..) |rt, r| {
         if (rt != .unknown) types[r] = rt;
     }
-    // Seed parameter registers from their live scalar kind: a function whose hot
-    // loop only reads its parameters has no in-body instruction to infer their
-    // type from. This is sound because the entry unbox re-checks each read reg
-    // against its cached type and bails to the interpreter on any mismatch (e.g.
-    // a later activation of a generic function called with a different type). A
-    // param the loop writes is overridden by `setDefType`; a non-scalar param is
-    // left unknown (and bails if read).
+    // Seed every register from its live scalar kind: a loop that reads a
+    // parameter or any prologue-computed value (a field read, a member
+    // call's result — e.g. a hoisted range's `first`/`last`) has no
+    // in-body instruction to infer that register's type from. This is
+    // sound because the entry unbox re-checks each read reg against its
+    // cached type and bails to the interpreter on any mismatch (e.g. a
+    // later activation with a different type). A reg the loop writes is
+    // overridden by `setDefType`; a non-scalar reg is left unknown (and
+    // bails if read).
     {
-        const nparams = @min(func.params.len, n_regs);
         var p: usize = 0;
-        while (p < nparams and p < regs.len) : (p += 1) {
+        while (p < n_regs and p < regs.len) : (p += 1) {
             if (array_info[p] != null or cell_info[p] != null) continue;
             if (cellScalarType(regs[p])) |rt| types[p] = rt;
         }
