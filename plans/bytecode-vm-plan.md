@@ -689,3 +689,25 @@ serve dominates). Battery: quick-gate green (a first cut FAILED the
 resumed-labeled-return unit test — the empty-block resume ambiguity
 above — then green after the guard), compose 1338/46/0, walker-mode
 litmus 43/43, probes byte-identical.
+
+## Stream micro-levers: cmp_br, const_int, proven-bounds access
+
+Three levers on the fused tier, each A/B'd on the 20M counted loop
+(JIT off): (1) `cmp_br` — a block whose last BinOp feeds its Branch
+condition emits one fused compare-and-branch op (still writes dst;
+non-scalar operands run the generic arm then branch on dst); (2)
+`const_int` — Int constants embed their payload in the stream, no
+consts-table lookup or conversion dispatch; (3) proven-bounds
+register access — every stream operand is validated `< n_locals` at
+build (violations demote to escape/term_exit) and the section checks
+`regs.len >= n_locals` once at entry, so the hot helpers index
+unchecked. 2.14s -> 1.53s (1+2) -> 1.45s (3).
+
+Cumulative this campaign, same bench: iterator lowering 35s ->
+counted 6.4s walker -> tier today 1.45s JIT-off vs 0.117s JIT-on —
+the JIT-off gap is 12x, down from 300x pre-counted and 21x at the
+campaign's start. Measured NEXT lever (recorded, not executed):
+`@sizeOf(Value)` is ~40-48B because the inline Range payload (27B)
+pads the whole union — boxing Range would cut register-file traffic
+~20% but touches ~140 sites across 10 files. Battery + compose
+(1337/46/0) at baseline throughout.

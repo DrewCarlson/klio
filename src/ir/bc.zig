@@ -110,7 +110,7 @@ pub fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Co
     const fuse = allow_fuse and fusible(func);
     const streams = a.alloc(?*const Stream, func.blocks.len) catch return null;
     for (func.blocks, streams) |*blk, *slot| {
-        slot.* = build(blk, fuse, consts);
+        slot.* = build(blk, fuse, consts, func.n_locals);
     }
     const fs = a.create(FuncStreams) catch return null;
     fs.* = .{ .streams = streams, .fused = fuse };
@@ -134,7 +134,17 @@ fn fusible(func: *const ir.Func) bool {
     return true;
 }
 
-fn build(blk: *const ir.Block, fuse: bool, consts: []const ir.Const) ?*const Stream {
+/// Every register operand a dedicated op emits is validated `< n_locals`
+/// at build time; together with the frame loop's one entry check
+/// (`regs.len >= n_locals`, the frame-construction invariant) this
+/// PROVES the stream ops' register accesses in bounds, so the hot
+/// helpers index uncheck. An out-of-range operand demotes the
+/// instruction to an escape (the walker's checked path).
+fn regOk(n_locals: u32, r: u32) bool {
+    return r < n_locals;
+}
+
+fn build(blk: *const ir.Block, fuse: bool, consts: []const ir.Const, n_locals: u32) ?*const Stream {
     const insts = blk.insts;
     // A block with no dedicated ops gains nothing from the stream —
     // running it as escapes would only add fetch+dispatch on top of
@@ -168,7 +178,9 @@ fn build(blk: *const ir.Block, fuse: bool, consts: []const ir.Const) ?*const Str
     var idx_pc = a.alloc(u32, insts.len) catch return null;
     for (insts, 0..) |*inst, i| {
         idx_pc[i] = @intCast(code.items.len);
-        if (fuse_cmp_idx == i) {
+        if (fuse_cmp_idx == i and regOk(n_locals, insts[i].BinOp.dst.int()) and
+            regOk(n_locals, insts[i].BinOp.lhs.int()) and regOk(n_locals, insts[i].BinOp.rhs.int()))
+        {
             const bo = insts[i].BinOp;
             const br = blk.terminator.Branch;
             code.appendSlice(a, &.{
@@ -185,6 +197,10 @@ fn build(blk: *const ir.Block, fuse: bool, consts: []const ir.Const) ?*const Str
         }
         switch (inst.*) {
             .Const => |c| {
+                if (!regOk(n_locals, c.dst.int())) {
+                    code.appendSlice(a, &.{ @intFromEnum(Op.escape), @intCast(i) }) catch return null;
+                    continue;
+                }
                 const cid = c.value.int();
                 if (cid < consts.len and consts[cid] == .Int) {
                     code.appendSlice(a, &.{
@@ -197,18 +213,36 @@ fn build(blk: *const ir.Block, fuse: bool, consts: []const ir.Const) ?*const Str
                 code.appendSlice(a, &.{ @intFromEnum(Op.const_load), c.dst.int(), c.value.int() }) catch return null;
             },
             .Move => |mv| {
+                if (!regOk(n_locals, mv.dst.int()) or !regOk(n_locals, mv.src.int())) {
+                    code.appendSlice(a, &.{ @intFromEnum(Op.escape), @intCast(i) }) catch return null;
+                    continue;
+                }
                 code.appendSlice(a, &.{ @intFromEnum(Op.move), mv.dst.int(), mv.src.int() }) catch return null;
             },
             .LoadParam => |lp| {
+                if (!regOk(n_locals, lp.dst.int())) {
+                    code.appendSlice(a, &.{ @intFromEnum(Op.escape), @intCast(i) }) catch return null;
+                    continue;
+                }
                 code.appendSlice(a, &.{ @intFromEnum(Op.load_param), lp.dst.int(), @intCast(lp.idx) }) catch return null;
             },
             .CellGet => |cg| {
+                if (!regOk(n_locals, cg.dst.int()) or !regOk(n_locals, cg.cell.int())) {
+                    code.appendSlice(a, &.{ @intFromEnum(Op.escape), @intCast(i) }) catch return null;
+                    continue;
+                }
                 code.appendSlice(a, &.{ @intFromEnum(Op.cell_get), cg.dst.int(), cg.cell.int() }) catch return null;
             },
             .Trace => |t| {
                 code.appendSlice(a, &.{ @intFromEnum(Op.trace), t.span.file.int(), t.span.start, t.span.end }) catch return null;
             },
             .BinOp => |bo| {
+                if (!regOk(n_locals, bo.dst.int()) or !regOk(n_locals, bo.lhs.int()) or
+                    !regOk(n_locals, bo.rhs.int()))
+                {
+                    code.appendSlice(a, &.{ @intFromEnum(Op.escape), @intCast(i) }) catch return null;
+                    continue;
+                }
                 code.appendSlice(a, &.{
                     @intFromEnum(Op.bin),
                     @intCast(i),
@@ -231,15 +265,23 @@ fn build(blk: *const ir.Block, fuse: bool, consts: []const ir.Const) ?*const Str
             .Branch => |br| {
                 // A cmp_br already carries the branch.
                 if (fuse_cmp_idx == null) {
-                    code.appendSlice(a, &.{ @intFromEnum(Op.br), br.cond.int(), br.t.int(), br.f.int() }) catch return null;
+                    if (regOk(n_locals, br.cond.int())) {
+                        code.appendSlice(a, &.{ @intFromEnum(Op.br), br.cond.int(), br.t.int(), br.f.int() }) catch return null;
+                    } else {
+                        code.append(a, @intFromEnum(Op.term_exit)) catch return null;
+                    }
                 }
             },
             .Return => |maybe_r| {
-                code.appendSlice(a, &.{
-                    @intFromEnum(Op.ret),
-                    @intFromBool(maybe_r != null),
-                    if (maybe_r) |r| r.int() else 0,
-                }) catch return null;
+                if (maybe_r != null and !regOk(n_locals, maybe_r.?.int())) {
+                    code.append(a, @intFromEnum(Op.term_exit)) catch return null;
+                } else {
+                    code.appendSlice(a, &.{
+                        @intFromEnum(Op.ret),
+                        @intFromBool(maybe_r != null),
+                        if (maybe_r) |r| r.int() else 0,
+                    }) catch return null;
+                }
             },
             else => {
                 code.append(a, @intFromEnum(Op.term_exit)) catch return null;
@@ -270,7 +312,7 @@ test "stream encoding: dedicated ops, operand words, idx_pc, escape" {
         .insts = &insts,
         .terminator = .{ .Goto = ir.BlockId.from(2) },
     };
-    const st = build(&blk, false, &.{}) orelse return error.TestUnexpectedResult;
+    const st = build(&blk, false, &.{}, 8) orelse return error.TestUnexpectedResult;
     const want = [_]u32{
         @intFromEnum(Op.const_load), 1, 7,
         @intFromEnum(Op.bin),        1, @intFromEnum(ir.BinOp.Add), 2, 1, 0,
@@ -282,14 +324,14 @@ test "stream encoding: dedicated ops, operand words, idx_pc, escape" {
 
     // An Int constant embeds its payload.
     const consts = [_]ir.Const{ .{ .Int = -42 }, .{ .String = "s" } };
-    const st2 = build(&blk, false, &consts) orelse return error.TestUnexpectedResult;
+    const st2 = build(&blk, false, &consts, 8) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@intFromEnum(Op.const_load), st2.code[0]);
     var iblk = blk;
     var iconst = [_]ir.Inst{
         .{ .Const = .{ .dst = ir.Reg.from(1), .value = ir.ConstId.from(0) } },
     };
     iblk.insts = &iconst;
-    const st3 = build(&iblk, false, &consts) orelse return error.TestUnexpectedResult;
+    const st3 = build(&iblk, false, &consts, 8) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u32, &.{
         @intFromEnum(Op.const_int), 1, @as(u32, @bitCast(@as(i32, -42))),
     }, st3.code);
@@ -304,7 +346,7 @@ test "stream encoding: fused terminators" {
         .insts = &mv,
         .terminator = .{ .Goto = ir.BlockId.from(3) },
     };
-    const gs = build(&goto_blk, true, &.{}) orelse return error.TestUnexpectedResult;
+    const gs = build(&goto_blk, true, &.{}, 8) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u32, &.{
         @intFromEnum(Op.move), 1, 0,
         @intFromEnum(Op.jump), 3,
@@ -316,7 +358,7 @@ test "stream encoding: fused terminators" {
         .insts = &none,
         .terminator = .{ .Return = ir.Reg.from(5) },
     };
-    const rs = build(&ret_blk, true, &.{}) orelse return error.TestUnexpectedResult;
+    const rs = build(&ret_blk, true, &.{}, 8) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u32, &.{ @intFromEnum(Op.ret), 1, 5 }, rs.code);
 
     const br_blk: ir.Block = .{
@@ -324,7 +366,7 @@ test "stream encoding: fused terminators" {
         .insts = &none,
         .terminator = .{ .Branch = .{ .cond = ir.Reg.from(2), .t = ir.BlockId.from(1), .f = ir.BlockId.from(4) } },
     };
-    const bs = build(&br_blk, true, &.{}) orelse return error.TestUnexpectedResult;
+    const bs = build(&br_blk, true, &.{}, 8) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u32, &.{ @intFromEnum(Op.br), 2, 1, 4 }, bs.code);
 }
 
@@ -337,6 +379,6 @@ test "stream encoding: an all-escape block builds no stream unfused" {
         .insts = &mc,
         .terminator = .{ .Goto = ir.BlockId.from(0) },
     };
-    try std.testing.expect(build(&blk, false, &.{}) == null);
-    try std.testing.expect(build(&blk, true, &.{}) != null);
+    try std.testing.expect(build(&blk, false, &.{}, 8) == null);
+    try std.testing.expect(build(&blk, true, &.{}, 8) != null);
 }

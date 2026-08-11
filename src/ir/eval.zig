@@ -5267,6 +5267,9 @@ fn runFrameExec(
             // fresh entry, and a fused terminator op must not run
             // before the routing below.
             if (thrown != null or unwound != null) break :bc_run;
+            // The one bounds check the stream ops rely on: build-time
+            // validation proved every operand `< n_locals`.
+            if (frame.regs.items.len < func.n_locals) break :bc_run;
             var bcur = cur;
             var binsts = insts;
             const stream0 = bs.streams[bcur.int()] orelse break :bc_run;
@@ -5283,33 +5286,29 @@ fn runFrameExec(
                 switch (op) {
                     .const_load => {
                         const v = try constToValue(allocator, &frame.module.consts.items[code[pc + 2]]);
-                        if (!writeFast(frame, @enumFromInt(code[pc + 1]), v, allocator))
-                            try frame.write(@enumFromInt(code[pc + 1]), v);
+                        writeFastU(frame, @enumFromInt(code[pc + 1]), v, allocator);
                         pc += 3;
                     },
                     .const_int => {
                         const v: Value = .{ .Int = @bitCast(code[pc + 2]) };
-                        if (!writeFast(frame, @enumFromInt(code[pc + 1]), v, allocator))
-                            try frame.write(@enumFromInt(code[pc + 1]), v);
+                        writeFastU(frame, @enumFromInt(code[pc + 1]), v, allocator);
                         pc += 3;
                     },
                     .move => {
-                        const v = frame.read(@enumFromInt(code[pc + 2]));
+                        const v = frame.regs.items.ptr[code[pc + 2]];
                         v.retain();
-                        if (!writeFast(frame, @enumFromInt(code[pc + 1]), v, allocator))
-                            try frame.write(@enumFromInt(code[pc + 1]), v);
+                        writeFastU(frame, @enumFromInt(code[pc + 1]), v, allocator);
                         pc += 3;
                     },
                     .load_param => {
                         const pidx: usize = code[pc + 2];
                         const v = if (pidx < frame.params.items.len) frame.params.items[pidx] else Value.Unit;
                         v.retain();
-                        if (!writeFast(frame, @enumFromInt(code[pc + 1]), v, allocator))
-                            try frame.write(@enumFromInt(code[pc + 1]), v);
+                        writeFastU(frame, @enumFromInt(code[pc + 1]), v, allocator);
                         pc += 3;
                     },
                     .cell_get => {
-                        const v = switch (frame.read(@enumFromInt(code[pc + 2]))) {
+                        const v = switch (frame.regs.items.ptr[code[pc + 2]]) {
                             .Cell => |c| vblk: {
                                 const g = c.borrow();
                                 defer g.deinit();
@@ -5318,8 +5317,7 @@ fn runFrameExec(
                             else => |other| other,
                         };
                         v.retain();
-                        if (!writeFast(frame, @enumFromInt(code[pc + 1]), v, allocator))
-                            try frame.write(@enumFromInt(code[pc + 1]), v);
+                        writeFastU(frame, @enumFromInt(code[pc + 1]), v, allocator);
                         pc += 3;
                     },
                     .trace => {
@@ -5373,7 +5371,7 @@ fn runFrameExec(
                         if (op == .jump) {
                             target = code[pc + 1];
                         } else {
-                            const cv = frame.read(@enumFromInt(code[pc + 1]));
+                            const cv = frame.regs.items.ptr[code[pc + 1]];
                             if (cv != .Bool) {
                                 // Cell-carried or coercing condition: the
                                 // frame loop's Branch runs `valueTruthy`.
@@ -5405,18 +5403,14 @@ fn runFrameExec(
                         // operands run the generic arm, then branch on dst.
                         var taken: ?bool = null;
                         {
-                            const regs = frame.regs.items;
+                            const regs = frame.regs.items.ptr;
                             const di = code[pc + 3];
-                            const li = code[pc + 4];
-                            const ri = code[pc + 5];
-                            if (li < regs.len and ri < regs.len and di < regs.len) {
-                                if (scalarBin(@enumFromInt(code[pc + 2]), regs[li], regs[ri])) |out| {
-                                    if (out == .Bool) {
-                                        const old = frame.regs.items[di];
-                                        frame.regs.items[di] = out;
-                                        if (runtime.reclaimEnabled()) old.release(allocator);
-                                        taken = out.Bool;
-                                    }
+                            if (scalarBin(@enumFromInt(code[pc + 2]), regs[code[pc + 4]], regs[code[pc + 5]])) |out| {
+                                if (out == .Bool) {
+                                    const old = regs[di];
+                                    regs[di] = out;
+                                    if (runtime.reclaimEnabled()) old.release(allocator);
+                                    taken = out.Bool;
                                 }
                             }
                         }
@@ -5453,7 +5447,7 @@ fn runFrameExec(
                     },
                     .ret => {
                         const v: Value = if (code[pc + 1] != 0)
-                            frame.read(@enumFromInt(code[pc + 2]))
+                            frame.regs.items.ptr[code[pc + 2]]
                         else
                             .Unit;
                         v.retain();
@@ -6014,16 +6008,15 @@ fn afterStep(
 /// (mixed tags, zero divisors, Cells, user operators) returns false
 /// so the generic arm runs.
 inline fn binFast(frame: *Frame, op: BinOp, dst: Reg, lhs: Reg, rhs: Reg, allocator: Allocator) bool {
-    const regs = frame.regs.items;
-    const li = lhs.int();
-    const ri = rhs.int();
-    const di = dst.int();
-    if (li >= regs.len or ri >= regs.len or di >= regs.len) return false;
-    const lv = regs[li];
-    const rv = regs[ri];
+    // Register indices are PROVEN in bounds: validated `< n_locals` at
+    // stream build, and the bytecode section checked
+    // `regs.len >= n_locals` once at entry.
+    const regs = frame.regs.items.ptr;
+    const lv = regs[lhs.int()];
+    const rv = regs[rhs.int()];
     const out: Value = scalarBin(op, lv, rv) orelse return false;
-    const old = frame.regs.items[di];
-    frame.regs.items[di] = out;
+    const old = regs[dst.int()];
+    regs[dst.int()] = out;
     if (runtime.reclaimEnabled()) old.release(allocator);
     return true;
 }
@@ -6122,16 +6115,14 @@ inline fn fusedEdgeGuard(ftls: *EvalTls) ?EvalResult {
     return null;
 }
 
-/// Inline register store for the bytecode loop's simple ops: succeeds
-/// only when the register file already covers `r` (the cold growth
-/// path stays in `Frame.write`). Takes ownership of `v` on success.
-inline fn writeFast(frame: *Frame, r: Reg, v: Value, allocator: Allocator) bool {
+/// Unchecked register store for the bytecode loop's simple ops: the
+/// index was validated `< n_locals` at stream build and the section
+/// checked `regs.len >= n_locals` once at entry. Takes ownership of `v`.
+inline fn writeFastU(frame: *Frame, r: Reg, v: Value, allocator: Allocator) void {
     const idx = r.int();
-    if (idx >= frame.regs.items.len) return false;
-    const old = frame.regs.items[idx];
-    frame.regs.items[idx] = v;
+    const old = frame.regs.items.ptr[idx];
+    frame.regs.items.ptr[idx] = v;
     if (runtime.reclaimEnabled()) old.release(allocator);
-    return true;
 }
 
 noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!Step {
