@@ -61,7 +61,12 @@ const pack_cache = @import("pack_cache.zig");
 const RequestedFeatures = pack_cache.RequestedFeatures;
 
 /// Keep this many images; older ones (by mtime) are pruned after a bake.
-const KEEP_IMAGES = 6;
+/// The examples corpus alone spans ~10 distinct pack-set fingerprints
+/// (runtime, +ui, +material3, +foundation, +text, mosaic, ktor, ...); a
+/// cap below that count made every parallel corpus run evict the images
+/// its sibling processes were about to load, re-baking 30s+ images
+/// forever. Images run ~10-26MB, so this keeps the cache under ~500MB.
+const KEEP_IMAGES = 24;
 
 /// A program assembled against the image (or freshly baked) base: the
 /// extended module, the map its spans resolve through, and the bindings

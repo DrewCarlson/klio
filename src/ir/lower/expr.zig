@@ -17009,14 +17009,24 @@ fn lowerFqnFlattenCall(
         // FQN the call belongs to global/intrinsic resolution, so decline
         // the flatten and let `lowerFqnGlobalCall` load it by FQN.
         var pick: ?FuncId = null;
+        var fqn_arity_matches: usize = 0;
         for (cands) |fid| {
             const f = b.module.funcById(fid) orelse continue;
             if (std.mem.eql(u8, f.fqn, fqn) and f.params.len == want) {
-                pick = fid;
-                break;
+                if (pick == null) pick = fid;
+                fqn_arity_matches += 1;
             }
         }
-        if (pick) |func_id| {
+        // A UNIQUE FQN+arity match is THE target, so the call is EXACT —
+        // the runtime overload re-pick ranks across every same-simple-name
+        // candidate in the program, and a user fn with a more specific
+        // parameter type would hijack the qualified call (a user
+        // `synchronized(lock: Lock, block)` delegating to
+        // `kotlin.synchronized` re-picked back to ITSELF and recursed).
+        // Same-arity FQN overloads stay ambiguous here and fall to the
+        // shape-checked arm below.
+        if (fqn_arity_matches == 1) {
+            const func_id = pick.?;
             const run = try lowerArgRun(b, args);
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
             const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
@@ -17029,7 +17039,7 @@ fn lowerFqnFlattenCall(
                 .n_args = run[1],
                 .arg_names = arg_names,
                 .type_args = type_args,
-                .exact = false,
+                .exact = true,
             } });
             return dst;
         }

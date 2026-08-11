@@ -319,3 +319,5 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `captured_var_in_nested_local_fn.kt` | A `var` captured and mutated by a local `fun` declared inside a lambda still boxes; the increment is visible at the decl site and across the function's recursive calls. |
 | `map_subclass_value_get_dispatch.kt` | A `Map` subclass that adds its own value-returning `operator get` still compares structurally: `AbstractMap.equals` -> `containsEntry`'s bare `get(key)` binds `Map.get(K): V?` (the declaring class's static scope), never the subtype's `get(Key<T>): T`. |
 | `non_capturing_lambda_identity.kt` | A non-capturing lambda literal has stable singleton identity: two evaluations of the same `{ … }` (a defaulted `() -> Unit = {}` arg included) are `===` and `==`, while a capturing literal and distinct literals stay unequal. |
+- `qualified_namesake_delegation.kt` — a user fn sharing a stdlib fn's name delegates to it fully qualified; the qualified call must not re-pick the user fn
+- `receiver_lambda_reassign.kt` — receiver lambdas keep receiver context when reassigned to locals or assigned into typed fields

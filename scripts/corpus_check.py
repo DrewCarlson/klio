@@ -34,8 +34,12 @@ def main():
     ap.add_argument("--zig", default=os.path.join(ROOT, "zig-out/bin/klio"))
     ap.add_argument("--rust", default=os.path.join(ROOT, "target/release/klio"))
     ap.add_argument("--no-rust", action="store_true", help="just check Zig exits 0")
-    ap.add_argument("--timeout", type=float, default=30.0)
-    ap.add_argument("--jobs", type=int, default=min(24, os.cpu_count() or 1))
+    # 60s: several compose examples legitimately run 3-6s solo and the
+    # parallel wall inflates 3-8x under oversubscription; 30s sat exactly on
+    # the boundary and the failing SET churned run to run. Jobs capped at 12:
+    # the box advertises twice the usable cores (shared CPU budget).
+    ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument("--jobs", type=int, default=min(12, os.cpu_count() or 1))
     ap.add_argument("--list-fail", action="store_true")
     ap.add_argument("pattern", nargs="?", default="examples/*.kt")
     args = ap.parse_args()

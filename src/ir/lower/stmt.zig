@@ -413,6 +413,11 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             else => {},
         }
     }
+    // Keep the source annotation for later plain assignments to this name:
+    // the value of `h = { ... }` lowers under the declared type exactly as
+    // the initializer did (a `Ctx.() -> R` receiver lambda keeps its
+    // receiver context on reassignment).
+    if (p.ty) |*ty| b.setLocalAstTy(p.name.name, ty);
     if (b.isBoxed(p.name.name)) {
         // Captured `var` — box into a shared cell so writes
         // from a nested closure / coroutine are visible
@@ -1021,7 +1026,35 @@ fn lowerAssign(
     op: ast.AssignOp,
     value: *const Expr,
 ) Allocator.Error!?Reg {
+    // A plain assignment of a LAMBDA lowers under the TARGET's declared
+    // type, exactly as the declaration's initializer did — a receiver
+    // lambda (`h = { onDraw(...) }` into a `CacheDrawScope.() -> DrawResult`
+    // local or field) must keep its receiver context on reassignment.
+    // Restricted to lambda values: only they consume the receiver context,
+    // and the Member arm's receiver-type derivation is too costly to run
+    // on every member assignment in a re-lowering pack.
+    const value_is_lambda = value.* == .Lambda or value.* == .AnonFun;
+    const assign_expected: ?ast.TypeRef = if (op != .Assign or !value_is_lambda) null else switch (target.*) {
+        .Path => |pth| blk: {
+            if (pth.segments.len != 1) break :blk null;
+            if (b.localAstTy(pth.segments[0].name)) |t| break :blk t.*;
+            break :blk null;
+        },
+        .Member => |m| blk: {
+            var rty = (expr_mod.staticExprTypeRef(b, m.receiver) catch null) orelse break :blk null;
+            defer rty.deinit(b.allocator);
+            var head = std.mem.trimEnd(u8, rty.name, "?");
+            if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+            if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
+            const prop = @import("inline_state.zig").memberPropAst(head, m.name.name) orelse break :blk null;
+            if (prop.ty) |t| break :blk t;
+            break :blk null;
+        },
+        else => null,
+    };
+    const prev_expected = if (assign_expected != null) b.pushExpected(assign_expected) else null;
     const v = try lowerExpr(b, value);
+    if (assign_expected != null) b.restoreExpected(prev_expected);
     // Compound assigns first try `<op>Assign` as a member
     // call on the target — covers user types declaring
     // `operator fun plusAssign(...)` and built-in mutable

@@ -2275,7 +2275,10 @@ const Walker = struct {
         const rem_args = w.a.alloc(Expr, keys.items.len + 1) catch @panic("oom");
         @memcpy(rem_args[0..keys.items.len], keys.items);
         rem_args[keys.items.len] = calc;
-        arg.* = w.b.call(w.b.pathExpr("remember"), rem_args);
+        // Fully qualified: the synthesized call lands in USER-file import
+        // scope, which need not import `remember` (upstream
+        // BoxWithConstraints.kt uses no remember of its own).
+        arg.* = w.b.call(w.b.pathExprSegs(&.{ "androidx", "compose", "runtime", "remember" }), rem_args);
     }
 
     /// `{ $composer.startReplaceGroup(<span key>); $composer.endReplaceGroup() }`
@@ -4224,7 +4227,7 @@ test "remember propagates a composable result type into its calculation result" 
     } };
     const remember_args = try a.alloc(Expr, 1);
     remember_args[0] = calculation;
-    var value = b.call(b.pathExpr("remember"), remember_args);
+    var value = b.call(b.pathExprSegs(&.{ "androidx", "compose", "runtime", "remember" }), remember_args);
     value.Call.has_trailing_lambda = true;
 
     var ctx: u8 = 0;
