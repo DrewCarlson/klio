@@ -53,8 +53,8 @@ pub fn lowerForLabeled(
     // loop profile (two CallVirtuals per iteration plus the range fields).
     // `KLIO_COUNTED=0` restores the iterator lowering for bisection.
     if (vars.len == 1 and countedEnabled()) counted: {
-        var lo_e: *const Expr = undefined;
-        var hi_e: *const Expr = undefined;
+        var lo_e: ?*const Expr = null;
+        var hi_e: ?*const Expr = null;
         var inclusive = false;
         switch (iter.*) {
             .Binary => |bin| switch (bin.op) {
@@ -69,28 +69,65 @@ pub fn lowerForLabeled(
                 },
                 else => break :counted,
             },
-            .Call => |c| {
-                if (!c.is_infix or c.args.len != 2 or c.callee.* != .Path or
-                    c.callee.Path.segments.len != 1) break :counted;
-                if (!std.mem.eql(u8, c.callee.Path.segments[0].name, "until")) break :counted;
-                lo_e = &c.args[0];
-                hi_e = &c.args[1];
+            .Call => |c| blk: {
+                if (c.is_infix and c.args.len == 2 and c.callee.* == .Path and
+                    c.callee.Path.segments.len == 1 and
+                    std.mem.eql(u8, c.callee.Path.segments[0].name, "until"))
+                {
+                    lo_e = &c.args[0];
+                    hi_e = &c.args[1];
+                    break :blk;
+                }
+                // A call whose STATIC type is a range still counts (below).
             },
-            else => break :counted,
+            else => {},
         }
-        var lo_ty = (expr.staticExprTypeRef(b, lo_e) catch null) orelse break :counted;
-        defer lo_ty.deinit(b.allocator);
-        var hi_ty = (expr.staticExprTypeRef(b, hi_e) catch null) orelse break :counted;
-        defer hi_ty.deinit(b.allocator);
-        const is_int = std.mem.eql(u8, lo_ty.name, "Int") and std.mem.eql(u8, hi_ty.name, "Int");
-        const is_long = std.mem.eql(u8, lo_ty.name, "Long") and std.mem.eql(u8, hi_ty.name, "Long");
-        if ((!is_int and !is_long) or lo_ty.nullable or hi_ty.nullable) break :counted;
+        var is_int = false;
+        var is_long = false;
+        if (lo_e != null) {
+            var lo_ty = (expr.staticExprTypeRef(b, lo_e.?) catch null) orelse break :counted;
+            defer lo_ty.deinit(b.allocator);
+            var hi_ty = (expr.staticExprTypeRef(b, hi_e.?) catch null) orelse break :counted;
+            defer hi_ty.deinit(b.allocator);
+            is_int = std.mem.eql(u8, lo_ty.name, "Int") and std.mem.eql(u8, hi_ty.name, "Int");
+            is_long = std.mem.eql(u8, lo_ty.name, "Long") and std.mem.eql(u8, hi_ty.name, "Long");
+            if ((!is_int and !is_long) or lo_ty.nullable or hi_ty.nullable) break :counted;
+        } else {
+            // TYPE-DRIVEN prong: any iterable whose static type is a
+            // non-nullable IntRange/LongRange (a hoisted `val`, a
+            // range-returning call, `list.indices`) iterates
+            // `[first, last]` step 1 by construction — read the two
+            // bounds once and run the same register loop. Progressions
+            // (`downTo`, `step`, `reversed`) type as IntProgression and
+            // keep the iterator lowering.
+            var ity = (expr.staticExprTypeRef(b, iter) catch null) orelse break :counted;
+            defer ity.deinit(b.allocator);
+            if (ity.nullable) break :counted;
+            var head = ity.name;
+            if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
+            is_int = std.mem.eql(u8, head, "IntRange");
+            is_long = std.mem.eql(u8, head, "LongRange");
+            if (!is_int and !is_long) break :counted;
+            inclusive = true;
+        }
 
         // Bounds evaluate once, in source order, before the loop.
-        const lo = try lowerExpr(b, lo_e);
-        const hi_raw = try lowerExpr(b, hi_e);
-        const hi = b.allocReg();
-        try b.push(.{ .Move = .{ .dst = hi, .src = hi_raw } });
+        var lo: Reg = undefined;
+        var hi: Reg = undefined;
+        if (lo_e) |le| {
+            lo = try lowerExpr(b, le);
+            const hi_raw = try lowerExpr(b, hi_e.?);
+            hi = b.allocReg();
+            try b.push(.{ .Move = .{ .dst = hi, .src = hi_raw } });
+        } else {
+            const rng = try lowerExpr(b, iter);
+            const first_name = try b.module.internConst(b.allocator, .{ .String = "first" });
+            const last_name = try b.module.internConst(b.allocator, .{ .String = "last" });
+            lo = b.allocReg();
+            try b.push(.{ .GetField = .{ .dst = lo, .receiver = rng, .field = first_name } });
+            hi = b.allocReg();
+            try b.push(.{ .GetField = .{ .dst = hi, .receiver = rng, .field = last_name } });
+        }
         const i_reg = b.allocReg();
         try b.push(.{ .Move = .{ .dst = i_reg, .src = lo } });
         const one = if (is_long)
