@@ -2955,7 +2955,7 @@ threadlocal var leaf_bank: [LEAF_BANK_DEPTH][ir.LEAF_MAX_REGS]Value = undefined;
 /// How far a leaf serve chains into other leaf callees. A gap-buffer read is
 /// typically three levels (`groupSize` -> `groupIndexToAddress` -> the array
 /// index helper); the bound keeps the native recursion trivially finite.
-const LEAF_MAX_DEPTH: u8 = 4;
+const LEAF_MAX_DEPTH: u8 = 8;
 
 /// Raised by the walk when an instruction needs the frame path. Caught at the
 /// serve boundary, where it becomes a plain "declined".
@@ -3136,6 +3136,10 @@ fn leafRunInsts(
             .BinOp => |bo| {
                 const l = leafRead(regs, bo.lhs) orelse return error.LeafAbandon;
                 const r = leafRead(regs, bo.rhs) orelse return error.LeafAbandon;
+                if (scalarBin(bo.op, l, r)) |v| {
+                    if (!leafWrite(allocator, regs, bo.dst, v, reclaim, false)) return error.LeafAbandon;
+                    continue;
+                }
                 if (!leafPrimitive(&l) or !leafPrimitive(&r)) return error.LeafAbandon;
                 const res = try applyBinop(allocator, bo.op, &l, &r);
                 if (res != .ok) return error.LeafAbandon;
@@ -5868,47 +5872,59 @@ inline fn binFast(frame: *Frame, bo: anytype, allocator: Allocator) bool {
     if (li >= regs.len or ri >= regs.len or di >= regs.len) return false;
     const lv = regs[li];
     const rv = regs[ri];
-    const out: Value = if (lv == .Int and rv == .Int) blk: {
+    const out: Value = scalarBin(bo.op, lv, rv) orelse return false;
+    const old = frame.regs.items[di];
+    frame.regs.items[di] = out;
+    if (runtime.reclaimEnabled()) old.release(allocator);
+    return true;
+}
+
+/// The shared same-tag scalar BinOp core: Int/Int, Long/Long, Bool/Bool
+/// and mixed Int/Long pairs with `applyBinop`'s exact semantics. Null
+/// for every shape the generic arm must handle (mixed non-integer tags,
+/// zero divisors, boxed equality on mixed widths, Cells, ===).
+inline fn scalarBin(op: BinOp, lv: Value, rv: Value) ?Value {
+    return if (lv == .Int and rv == .Int) blk: {
         const a = lv.Int;
         const b = rv.Int;
-        break :blk switch (bo.op) {
+        break :blk switch (op) {
             .Add => .{ .Int = a +% b },
             .Sub => .{ .Int = a -% b },
             .Mul => .{ .Int = a *% b },
-            .Div => if (b == 0) return false else .{ .Int = divTruncI32(a, b) },
-            .Mod => if (b == 0) return false else .{ .Int = remTruncI32(a, b) },
+            .Div => if (b == 0) break :blk null else .{ .Int = divTruncI32(a, b) },
+            .Mod => if (b == 0) break :blk null else .{ .Int = remTruncI32(a, b) },
             .Less => .{ .Bool = a < b },
             .LessEq => .{ .Bool = a <= b },
             .Greater => .{ .Bool = a > b },
             .GreaterEq => .{ .Bool = a >= b },
             .Eq, .BoxedEq => .{ .Bool = a == b },
             .NotEq, .BoxedNotEq => .{ .Bool = a != b },
-            else => return false,
+            else => break :blk null,
         };
     } else if (lv == .Long and rv == .Long) blk: {
         const a = lv.Long;
         const b = rv.Long;
-        break :blk switch (bo.op) {
+        break :blk switch (op) {
             .Add => .{ .Long = a +% b },
             .Sub => .{ .Long = a -% b },
             .Mul => .{ .Long = a *% b },
-            .Div => if (b == 0) return false else .{ .Long = divTruncI64(a, b) },
-            .Mod => if (b == 0) return false else .{ .Long = remTruncI64(a, b) },
+            .Div => if (b == 0) break :blk null else .{ .Long = divTruncI64(a, b) },
+            .Mod => if (b == 0) break :blk null else .{ .Long = remTruncI64(a, b) },
             .Less => .{ .Bool = a < b },
             .LessEq => .{ .Bool = a <= b },
             .Greater => .{ .Bool = a > b },
             .GreaterEq => .{ .Bool = a >= b },
             .Eq, .BoxedEq => .{ .Bool = a == b },
             .NotEq, .BoxedNotEq => .{ .Bool = a != b },
-            else => return false,
+            else => break :blk null,
         };
     } else if (lv == .Bool and rv == .Bool) blk: {
-        break :blk switch (bo.op) {
+        break :blk switch (op) {
             .And => .{ .Bool = lv.Bool and rv.Bool },
             .Or => .{ .Bool = lv.Bool or rv.Bool },
             .Eq, .BoxedEq => .{ .Bool = lv.Bool == rv.Bool },
             .NotEq, .BoxedNotEq => .{ .Bool = lv.Bool != rv.Bool },
-            else => return false,
+            else => break :blk null,
         };
     } else if ((lv == .Int or lv == .Long) and (rv == .Int or rv == .Long)) blk: {
         // Mixed widths promote to Long, as `applyBinop` does. Boxed
@@ -5916,25 +5932,21 @@ inline fn binFast(frame: *Frame, bo: anytype, allocator: Allocator) bool {
         // and falls through.
         const a: i64 = if (lv == .Int) lv.Int else lv.Long;
         const b: i64 = if (rv == .Int) rv.Int else rv.Long;
-        break :blk switch (bo.op) {
+        break :blk switch (op) {
             .Add => .{ .Long = a +% b },
             .Sub => .{ .Long = a -% b },
             .Mul => .{ .Long = a *% b },
-            .Div => if (b == 0) return false else .{ .Long = divTruncI64(a, b) },
-            .Mod => if (b == 0) return false else .{ .Long = remTruncI64(a, b) },
+            .Div => if (b == 0) break :blk null else .{ .Long = divTruncI64(a, b) },
+            .Mod => if (b == 0) break :blk null else .{ .Long = remTruncI64(a, b) },
             .Less => .{ .Bool = a < b },
             .LessEq => .{ .Bool = a <= b },
             .Greater => .{ .Bool = a > b },
             .GreaterEq => .{ .Bool = a >= b },
             .Eq => .{ .Bool = a == b },
             .NotEq => .{ .Bool = a != b },
-            else => return false,
+            else => break :blk null,
         };
-    } else return false;
-    const old = frame.regs.items[di];
-    frame.regs.items[di] = out;
-    if (runtime.reclaimEnabled()) old.release(allocator);
-    return true;
+    } else null;
 }
 
 /// Inline register store for the bytecode loop's simple ops: succeeds

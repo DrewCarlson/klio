@@ -600,3 +600,19 @@ Profile is now fully inline: runFrameExec 41% / binFast 29% /
 writeFast 17%; execArmBinOp, applyBinop and Frame.write are gone
 from the loop shape. Battery: default-mode quick-gate at baseline;
 flag-on sweep 117/0, litmus 43/43, corpus 280/291 (same 11).
+
+## Call-shape levers: leaf depth 8, shared scalar core
+
+The frameless leaf serve now chains 8 levels deep (was 4; the
+per-thread bank always had 8 slots), so twice the recursion-tree
+depth runs without frame activations. The same-tag scalar BinOp core
+is factored to `scalarBin` and shared by the tier's `binFast` and the
+LEAF evaluator's BinOp arm (which previously paid the full
+`applyBinop` dispatch per operation; a zero divisor still nulls out
+to the generic path so exception semantics are untouched).
+
+fib(34), JIT off: 3.28s -> 2.02s under the tier, 3.42s -> 2.07s on
+the walker (-38%). Battery: default quick-gate at baseline; flag-on
+sweep 117/0, litmus 43/43, corpus same 11; compose plugin 1337/46
+with ZERO did-not-complete vs ratchet 1305 (best recorded run);
+probes byte-identical across modes.
