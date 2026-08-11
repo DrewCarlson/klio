@@ -2,7 +2,16 @@
 //! tree-walker's per-instruction union dispatch for the hot simple ops,
 //! with an ESCAPE op executing everything else through the walker's own
 //! `execInst` — total coverage, shared semantics (see the frozen v1 spec
-//! in plans/bytecode-vm-plan.md). Gated by `KLIO_BC=1`.
+//! in plans/bytecode-vm-plan.md). On by default; `KLIO_BC=0` restores
+//! the pure walker.
+//!
+//! FUSED terminators: a function with no try/catch/finally metadata
+//! anywhere gets `jump`/`br`/`ret`/`term_exit` ops appended to each
+//! block's stream, so Goto/Branch/Return flow block-to-block inside the
+//! bytecode loop without surfacing to the frame loop's per-block
+//! bookkeeping. Fusion is only built when the loop JIT is off for the
+//! process — the JIT's compile trigger lives at the frame loop's block
+//! entry, and fused edges would starve it.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -17,7 +26,7 @@ pub const Op = enum(u32) {
     load_param,
     /// dst, cell — cell read (plain value passthrough included).
     cell_get,
-    /// inst_idx — span bookkeeping (reads the original Trace inst).
+    /// file, start, end — span bookkeeping, embedded (no Inst load).
     trace,
     /// inst_idx, kind, dst, lhs, rhs — arithmetic/compare. The operands
     /// ride in the stream so the hot path never touches the Inst union;
@@ -25,6 +34,17 @@ pub const Op = enum(u32) {
     bin,
     /// inst_idx — every other instruction, via `execInst`.
     escape,
+    /// target_block — fused Goto: continue in the target block's stream.
+    jump,
+    /// cond_reg, t_block, f_block — fused Branch on a Bool register; a
+    /// non-Bool condition exits to the frame loop's terminator path.
+    br,
+    /// has_val, reg — fused Return (no finally can intercept it in a
+    /// fusible function).
+    ret,
+    /// (no operands) — run this block's real terminator in the frame
+    /// loop (Throw, TailJump, suspension forms, ...).
+    term_exit,
 };
 
 pub const Stream = struct {
@@ -57,12 +77,16 @@ pub fn enabled() bool {
 /// blocks slice).
 pub const FuncStreams = struct {
     streams: []const ?*const Stream,
+    /// Whether these streams carry fused terminator ops.
+    fused: bool,
 };
 
 var cache_mutex: runtime.SpinMutex = .{};
 var cache: ?std.AutoHashMap(usize, *const FuncStreams) = null;
 
-pub fn funcStreams(func: *const ir.Func) ?*const FuncStreams {
+/// `allow_fuse` is process-constant (the loop JIT's enablement); the
+/// first call decides what the cache holds.
+pub fn funcStreams(func: *const ir.Func, allow_fuse: bool) ?*const FuncStreams {
     if (func.blocks.len == 0) return null;
     const key = @intFromPtr(func.blocks.ptr);
     cache_mutex.lock();
@@ -72,27 +96,48 @@ pub fn funcStreams(func: *const ir.Func) ?*const FuncStreams {
     }
     if (cache.?.get(key)) |fs| return fs;
     const a = std.heap.smp_allocator;
+    const fuse = allow_fuse and fusible(func);
     const streams = a.alloc(?*const Stream, func.blocks.len) catch return null;
     for (func.blocks, streams) |*blk, *slot| {
-        slot.* = if (blk.insts.len == 0) null else build(blk.insts);
+        slot.* = build(blk, fuse);
     }
     const fs = a.create(FuncStreams) catch return null;
-    fs.* = .{ .streams = streams };
+    fs.* = .{ .streams = streams, .fused = fuse };
     cache.?.put(key, fs) catch return fs;
     return fs;
 }
 
-fn build(insts: []const ir.Inst) ?*const Stream {
+/// A function is fusible when NO block carries try machinery: with the
+/// try-stack provably empty and no pending-finally state possible, the
+/// frame loop's Goto/Branch/Return handling reduces to exactly what the
+/// fused ops do.
+fn fusible(func: *const ir.Func) bool {
+    for (func.blocks) |*blk| {
+        if (blk.catches.len != 0 or blk.finally != null or
+            blk.finally_done != null or blk.finally_done_for != null or
+            blk.catch_done_for != null or blk.pop_on_exit.len != 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn build(blk: *const ir.Block, fuse: bool) ?*const Stream {
+    const insts = blk.insts;
     // A block with no dedicated ops gains nothing from the stream —
     // running it as escapes would only add fetch+dispatch on top of
-    // the walker's own loop. Leave it to the walker.
-    const dedicated = for (insts) |*inst| {
-        switch (inst.*) {
-            .Const, .Move, .LoadParam, .CellGet, .BinOp => break true,
-            else => {},
-        }
-    } else false;
-    if (!dedicated) return null;
+    // the walker's own loop. Leave it to the walker. (A fused function
+    // keeps every block in-stream so jumps always land on a stream.)
+    if (!fuse) {
+        const dedicated = for (insts) |*inst| {
+            switch (inst.*) {
+                .Const, .Move, .LoadParam, .CellGet, .BinOp => break true,
+                else => {},
+            }
+        } else false;
+        if (!dedicated) return null;
+    }
     const a = std.heap.smp_allocator;
     var code: std.ArrayList(u32) = .empty;
     var idx_pc = a.alloc(u32, insts.len) catch return null;
@@ -111,8 +156,8 @@ fn build(insts: []const ir.Inst) ?*const Stream {
             .CellGet => |cg| {
                 code.appendSlice(a, &.{ @intFromEnum(Op.cell_get), cg.dst.int(), cg.cell.int() }) catch return null;
             },
-            .Trace => {
-                code.appendSlice(a, &.{ @intFromEnum(Op.trace), @intCast(i) }) catch return null;
+            .Trace => |t| {
+                code.appendSlice(a, &.{ @intFromEnum(Op.trace), t.span.file.int(), t.span.start, t.span.end }) catch return null;
             },
             .BinOp => |bo| {
                 code.appendSlice(a, &.{
@@ -129,6 +174,26 @@ fn build(insts: []const ir.Inst) ?*const Stream {
             },
         }
     }
+    if (fuse) {
+        switch (blk.terminator) {
+            .Goto => |g| {
+                code.appendSlice(a, &.{ @intFromEnum(Op.jump), g.int() }) catch return null;
+            },
+            .Branch => |br| {
+                code.appendSlice(a, &.{ @intFromEnum(Op.br), br.cond.int(), br.t.int(), br.f.int() }) catch return null;
+            },
+            .Return => |maybe_r| {
+                code.appendSlice(a, &.{
+                    @intFromEnum(Op.ret),
+                    @intFromBool(maybe_r != null),
+                    if (maybe_r) |r| r.int() else 0,
+                }) catch return null;
+            },
+            else => {
+                code.append(a, @intFromEnum(Op.term_exit)) catch return null;
+            },
+        }
+    }
     const st = a.create(Stream) catch return null;
     st.* = .{
         .code = code.toOwnedSlice(a) catch return null,
@@ -142,13 +207,18 @@ test {
 }
 
 test "stream encoding: dedicated ops, operand words, idx_pc, escape" {
-    const insts = [_]ir.Inst{
+    var insts = [_]ir.Inst{
         .{ .Const = .{ .dst = ir.Reg.from(1), .value = ir.ConstId.from(7) } },
         .{ .BinOp = .{ .dst = ir.Reg.from(2), .op = .Add, .lhs = ir.Reg.from(1), .rhs = ir.Reg.from(0), .compound = false } },
         .{ .Move = .{ .dst = ir.Reg.from(3), .src = ir.Reg.from(2) } },
         .{ .MakeCell = .{ .dst = ir.Reg.from(4), .src = ir.Reg.from(3) } },
     };
-    const st = build(&insts) orelse return error.TestUnexpectedResult;
+    const blk: ir.Block = .{
+        .id = ir.BlockId.from(0),
+        .insts = &insts,
+        .terminator = .{ .Goto = ir.BlockId.from(2) },
+    };
+    const st = build(&blk, false) orelse return error.TestUnexpectedResult;
     const want = [_]u32{
         @intFromEnum(Op.const_load), 1, 7,
         @intFromEnum(Op.bin),        1, @intFromEnum(ir.BinOp.Add), 2, 1, 0,
@@ -159,9 +229,48 @@ test "stream encoding: dedicated ops, operand words, idx_pc, escape" {
     try std.testing.expectEqualSlices(u32, &.{ 0, 3, 9, 12 }, st.idx_pc);
 }
 
-test "stream encoding: an all-escape block builds no stream" {
-    const insts = [_]ir.Inst{
+test "stream encoding: fused terminators" {
+    var mv = [_]ir.Inst{
+        .{ .Move = .{ .dst = ir.Reg.from(1), .src = ir.Reg.from(0) } },
+    };
+    const goto_blk: ir.Block = .{
+        .id = ir.BlockId.from(0),
+        .insts = &mv,
+        .terminator = .{ .Goto = ir.BlockId.from(3) },
+    };
+    const gs = build(&goto_blk, true) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u32, &.{
+        @intFromEnum(Op.move), 1, 0,
+        @intFromEnum(Op.jump), 3,
+    }, gs.code);
+
+    var none = [_]ir.Inst{};
+    const ret_blk: ir.Block = .{
+        .id = ir.BlockId.from(1),
+        .insts = &none,
+        .terminator = .{ .Return = ir.Reg.from(5) },
+    };
+    const rs = build(&ret_blk, true) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u32, &.{ @intFromEnum(Op.ret), 1, 5 }, rs.code);
+
+    const br_blk: ir.Block = .{
+        .id = ir.BlockId.from(2),
+        .insts = &none,
+        .terminator = .{ .Branch = .{ .cond = ir.Reg.from(2), .t = ir.BlockId.from(1), .f = ir.BlockId.from(4) } },
+    };
+    const bs = build(&br_blk, true) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u32, &.{ @intFromEnum(Op.br), 2, 1, 4 }, bs.code);
+}
+
+test "stream encoding: an all-escape block builds no stream unfused" {
+    var mc = [_]ir.Inst{
         .{ .MakeCell = .{ .dst = ir.Reg.from(1), .src = ir.Reg.from(0) } },
     };
-    try std.testing.expect(build(&insts) == null);
+    const blk: ir.Block = .{
+        .id = ir.BlockId.from(0),
+        .insts = &mc,
+        .terminator = .{ .Goto = ir.BlockId.from(0) },
+    };
+    try std.testing.expect(build(&blk, false) == null);
+    try std.testing.expect(build(&blk, true) != null);
 }

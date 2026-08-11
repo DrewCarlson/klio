@@ -664,3 +664,28 @@ the leaf serve, shared by both). With the default loop JIT the
 counted loop is 0.117s. Tier default ON. Final gates on the closing
 binary: quick-gate at baseline, compose plugin 1339/46/0 vs ratchet
 1305 (new best), walker-mode litmus 43/43.
+
+## Fused terminator ops (whole-function flow in the tier)
+
+A function with NO try machinery anywhere (no catches/finally/
+sentinel metadata on any block) gets jump/br/ret/term_exit ops
+appended to each block's stream: Goto/Branch/Return flow
+block-to-block inside the bytecode loop without surfacing to the
+frame loop's per-block bookkeeping. Each taken edge runs the same
+abandon/spin-diagnostic/GC-safe-point guards the frame loop runs per
+block entry, so hang tooling and collector semantics are unchanged.
+Non-Bool branch conditions, non-fused terminators, and jump targets
+without streams exit to the frame loop (bc_term re-enters with a
+skip-all sentinel — insts.len would replay an EMPTY fused block's
+terminator ops forever). A resume carrying a throw/unwind skips the
+stream entirely: an empty block's resume start index is 0,
+indistinguishable from a fresh entry (caught by the labeled-return
+unit test). Fusion builds only when the loop JIT is off — the JIT's
+compile trigger lives at the frame loop's block entry. Trace spans
+are embedded in the stream (no Inst load).
+
+20M counted loop JIT-off: 2.49s -> 2.14s. fib(34) unchanged (leaf
+serve dominates). Battery: quick-gate green (a first cut FAILED the
+resumed-labeled-return unit test — the empty-block resume ambiguity
+above — then green after the guard), compose 1338/46/0, walker-mode
+litmus 43/43, probes byte-identical.

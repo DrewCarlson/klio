@@ -5085,7 +5085,10 @@ fn runFrameExec(
         if (comptime tramp_ok and @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).resolveMember else null;
     // The bytecode tier's per-func stream table, hoisted to one lookup per
     // activation; per block entry it is a plain array index.
-    const bc_streams: ?*const bc.FuncStreams = if (bc.enabled()) bc.funcStreams(func) else null;
+    // Fused terminator ops only when the loop JIT is off: the JIT's
+    // compile trigger lives at this loop's block entry, and fused edges
+    // would starve it.
+    const bc_streams: ?*const bc.FuncStreams = if (bc.enabled()) bc.funcStreams(func, !jit_on) else null;
     const field_resolver: ?jit_loop.FieldResolver =
         if (comptime tramp_ok and @hasDecl(H, "plainStoredFieldIndex")) &LoopTramp(H).resolveField else null;
     const field_nn_resolver: ?jit_loop.FieldResolver =
@@ -5245,20 +5248,36 @@ fn runFrameExec(
         var idx: usize = 0;
         var ret_v: EvalResult = ok(.Unit);
         var ran_bc = false;
-        // The bytecode tier (KLIO_BC=1): the dense per-block stream replaces
-        // this instruction loop's union dispatch; every non-simple op
-        // escapes to `execInst`, and all control flow funnels through the
-        // same `afterStep` the walker uses.
+        // Fused-flow exits back to the frame loop: run this block from its
+        // top / run only this block's terminator.
+        var bc_goto: ?BlockId = null;
+        var bc_term: ?BlockId = null;
+        // The bytecode tier: the dense per-block stream replaces this
+        // instruction loop's union dispatch; every non-simple op escapes
+        // to `execInst`, and all control flow funnels through the same
+        // `afterStep` the walker uses. In a FUSED function (no try
+        // machinery, JIT off) the streams carry jump/br/ret terminator
+        // ops, so straight-line control flow never surfaces to the frame
+        // loop's per-block bookkeeping; each taken edge runs the same
+        // abandon/spin/GC guards the frame loop runs per block entry.
         if (bc_streams) |bs| bc_run: {
-            const stream = bs.streams[cur.int()] orelse break :bc_run;
+            // A resume that arrived carrying a throw/unwind skips the
+            // instruction surface entirely — for an EMPTY block its
+            // `start_idx = insts.len` is 0, indistinguishable from a
+            // fresh entry, and a fused terminator op must not run
+            // before the routing below.
+            if (thrown != null or unwound != null) break :bc_run;
+            var bcur = cur;
+            var binsts = insts;
+            const stream0 = bs.streams[bcur.int()] orelse break :bc_run;
             ran_bc = true;
-            const code = stream.code;
+            var code = stream0.code;
             var pc: usize = if (start_idx == 0)
                 0
-            else if (start_idx >= insts.len)
+            else if (start_idx >= binsts.len)
                 code.len
             else
-                stream.idx_pc[start_idx];
+                stream0.idx_pc[start_idx];
             bc_loop: while (pc < code.len) {
                 const op: bc.Op = @enumFromInt(code[pc]);
                 switch (op) {
@@ -5298,8 +5317,12 @@ fn runFrameExec(
                         pc += 3;
                     },
                     .trace => {
-                        frame.cur_span = insts[code[pc + 1]].Trace.span;
-                        pc += 2;
+                        frame.cur_span = .{
+                            .file = @enumFromInt(code[pc + 1]),
+                            .start = code[pc + 2],
+                            .end = code[pc + 3],
+                        };
+                        pc += 4;
                     },
                     .bin => {
                         // Same-tag scalar operands take an inline path with
@@ -5321,9 +5344,9 @@ fn runFrameExec(
                             continue :bc_loop;
                         }
                         idx = code[pc + 1];
-                        const inst = &insts[idx];
+                        const inst = &binsts[idx];
                         const r = try execArmBinOp(H, allocator, frame, inst.BinOp, host);
-                        switch (try afterStep(allocator, frame, r, inst, idx, cur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
+                        switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
                             .cont => pc += 6,
                             .brk => break :bc_loop,
                             .ret => return ret_v,
@@ -5331,16 +5354,89 @@ fn runFrameExec(
                     },
                     .escape => {
                         idx = code[pc + 1];
-                        const inst = &insts[idx];
+                        const inst = &binsts[idx];
                         const r = try execInst(H, allocator, frame, inst, host);
-                        switch (try afterStep(allocator, frame, r, inst, idx, cur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
+                        switch (try afterStep(allocator, frame, r, inst, idx, bcur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
                             .cont => pc += 2,
                             .brk => break :bc_loop,
                             .ret => return ret_v,
                         }
                     },
+                    .jump, .br => {
+                        var target: u32 = undefined;
+                        if (op == .jump) {
+                            target = code[pc + 1];
+                        } else {
+                            const cv = frame.read(@enumFromInt(code[pc + 1]));
+                            if (cv != .Bool) {
+                                // Cell-carried or coercing condition: the
+                                // frame loop's Branch runs `valueTruthy`.
+                                bc_term = bcur;
+                                break :bc_loop;
+                            }
+                            target = if (cv.Bool) code[pc + 2] else code[pc + 3];
+                        }
+                        // The frame loop's per-block-entry guards, per edge.
+                        if (runtime.shouldAbandon()) {
+                            cur = bcur;
+                            return errResult(.{ .Type = "daemon task abandoned at run boundary" });
+                        }
+                        ftls.spin_check_counter +%= 1;
+                        if (ftls.spin_check_counter & 0xFFFF == 0) {
+                            spinDumpMaybe();
+                            const wall_dl = test_wall_deadline_ms.load(.monotonic);
+                            if (wall_dl != 0 and nowMonotonicMs() > wall_dl) {
+                                std.debug.print("[wall-cap] test wall-clock deadline exceeded — hang location follows:\n", .{});
+                                cur = bcur;
+                                dumpFrameChainForDiagAlways();
+                                wallCapAbandon();
+                                return errResult(.{ .Type = "test wall-clock deadline exceeded" });
+                            }
+                        }
+                        if (runtime.gc.gc_enabled and runtime.gc.pending()) {
+                            runtime.gc.safePoint();
+                        }
+                        const nb: BlockId = @enumFromInt(target);
+                        if (bs.streams[nb.int()]) |ns| {
+                            bcur = nb;
+                            binsts = frame.func.blocks[nb.int()].insts;
+                            code = ns.code;
+                            pc = 0;
+                        } else {
+                            bc_goto = nb;
+                            break :bc_loop;
+                        }
+                    },
+                    .ret => {
+                        const v: Value = if (code[pc + 1] != 0)
+                            frame.read(@enumFromInt(code[pc + 2]))
+                        else
+                            .Unit;
+                        v.retain();
+                        return ok(v);
+                    },
+                    .term_exit => {
+                        bc_term = bcur;
+                        break :bc_loop;
+                    },
                 }
             }
+            // Fused flow may have advanced blocks; the walker fallback and
+            // the mid-block throw/unwind routing below key on `cur`.
+            cur = bcur;
+        }
+        if (bc_goto) |nb| {
+            cur = nb;
+            continue;
+        }
+        if (bc_term) |nb| {
+            // Re-enter the frame loop to run ONLY this block's real
+            // terminator: the sentinel skips the instruction loop and the
+            // stream (including its fused terminator ops — an empty block
+            // entered at index 0 would otherwise replay them).
+            cur = nb;
+            resume_idx = std.math.maxInt(usize);
+            continue;
         }
         if (!ran_bc) {
             while (idx < insts.len) : (idx += 1) {
