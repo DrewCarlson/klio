@@ -70,6 +70,8 @@ Run any program with:
 | `smart_cast_field.kt`, `as_cast.kt` | Smart casts and `as` / `as?`.                         |
 | `when_binding.kt`          | `when` with a bound subject.                                    |
 | `qualified_this.kt`        | Qualified `this@Label` through inner/outer chains.             |
+| `qualified_namesake_delegation.kt` | A user function sharing a stdlib function's name delegates to it fully qualified; the qualified call binds the FQN target exactly, never re-picking the user function. |
+| `receiver_lambda_reassign.kt` | A receiver lambda keeps its receiver context when reassigned to a typed local or assigned into a field declared `Scope.() -> R`. |
 
 ## Functions, lambdas, and generics
 

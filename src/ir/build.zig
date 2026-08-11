@@ -409,6 +409,8 @@ pub const LocalFnOverload = struct {
 /// into its context-parameter count and ordinary-parameter count.
 pub const ContextFnShape = struct { n_ctx: usize, n_regular: usize };
 
+pub const HiddenBinding = struct { frame: usize, reg: Reg };
+
 pub const FuncBuilder = struct {
     allocator: Allocator,
     module: *Module,
@@ -613,6 +615,12 @@ pub const FuncBuilder = struct {
     /// Declared type annotation per local (`val resp: HttpResponse`),
     /// used by inline-overload receiver narrowing.
     local_decl_types: std.StringHashMap(TypeRef),
+    /// Source-annotated AST types of locals (`var h: Ctx.() -> Unit`), so a
+    /// later plain ASSIGNMENT to the name lowers its value under the same
+    /// expected type the declaration used (a receiver-lambda reassigned to
+    /// the local must keep its receiver context). Pointers into the AST,
+    /// which outlives the build.
+    local_ast_tys: std.StringHashMap(*const ast.TypeRef),
     local_decl_nullable: std.StringHashMap(void),
     local_call_returns: std.StringHashMap(ir.EagerTypeHead),
     local_decl_recv_fn: std.StringHashMap(void),
@@ -861,6 +869,7 @@ pub const FuncBuilder = struct {
             .local_fn_return_tys = std.StringHashMap(TypeRef).init(allocator),
             .local_fn_param_tys = std.StringHashMap([]const ?[]const u8).init(allocator),
             .local_decl_types = std.StringHashMap(TypeRef).init(allocator),
+            .local_ast_tys = std.StringHashMap(*const ast.TypeRef).init(allocator),
             .local_decl_nullable = std.StringHashMap(void).init(allocator),
             .local_call_returns = std.StringHashMap(ir.EagerTypeHead).init(allocator),
             .local_decl_recv_fn = std.StringHashMap(void).init(allocator),
@@ -975,6 +984,7 @@ pub const FuncBuilder = struct {
             var it = self.local_decl_types.valueIterator();
             while (it.next()) |ty| ty.deinit(self.allocator);
             self.local_decl_types.deinit();
+            self.local_ast_tys.deinit();
         }
         self.local_decl_nullable.deinit();
         self.local_call_returns.deinit();
@@ -2025,6 +2035,13 @@ pub const FuncBuilder = struct {
     pub fn localDeclTypeCount(self: *const FuncBuilder) usize {
         return self.local_decl_types.count();
     }
+    pub fn setLocalAstTy(self: *FuncBuilder, name: []const u8, ty: *const ast.TypeRef) void {
+        self.local_ast_tys.put(name, ty) catch {};
+    }
+    pub fn localAstTy(self: *const FuncBuilder, name: []const u8) ?*const ast.TypeRef {
+        return self.local_ast_tys.get(name);
+    }
+
     pub fn localDeclTypeRef(self: *const FuncBuilder, name: []const u8) ?TypeRef {
         return self.local_decl_types.get(name);
     }
@@ -2662,6 +2679,26 @@ pub const FuncBuilder = struct {
         var oit = self.outer_names.keyIterator();
         while (oit.next()) |k| try out.put(k.*, {});
         return out;
+    }
+
+    /// Temporarily remove `name`'s innermost scope binding (an inline fn's
+    /// own parameter must not be visible to a spliced CALLER-lambda body:
+    /// `apply`'s `block` param shadowed a caller class's `block` member).
+    /// Returns what `restoreHiddenBinding` needs, or null when unbound.
+    pub fn hideBinding(self: *FuncBuilder, name: []const u8) ?HiddenBinding {
+        var i: usize = self.scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.scopes.items[i].fetchRemove(name)) |kv| {
+                return .{ .frame = i, .reg = kv.value };
+            }
+        }
+        return null;
+    }
+    pub fn restoreHiddenBinding(self: *FuncBuilder, name: []const u8, h: HiddenBinding) void {
+        if (h.frame < self.scopes.items.len) {
+            self.scopes.items[h.frame].put(name, h.reg) catch {};
+        }
     }
 
     /// Push a fresh scope.

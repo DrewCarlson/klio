@@ -661,6 +661,19 @@ pub fn spliceInlineLambdaOn(
             try suspended_rlp.append(b.allocator, k);
         }
     }
+    // The inline fn's own parameter BINDINGS are hidden for the caller
+    // body too, not just their marks: `apply`'s `block: T.() -> Unit`
+    // param otherwise shadows a caller class's same-named member inside
+    // the spliced lambda (and a nested closure then captures the
+    // out-of-scope binding — collapsed to Unit once the splice frame is
+    // gone).
+    var hidden_binds: std.ArrayList(struct { name: []const u8, h: build.HiddenBinding }) = .empty;
+    defer hidden_binds.deinit(b.allocator);
+    for (enclosing_subst_keys.items) |k| {
+        if (b.hideBinding(k)) |h| {
+            try hidden_binds.append(b.allocator, .{ .name = k, .h = h });
+        }
+    }
     const lam_prev_active = b.spliceHintActive();
     const lam_prev_recv = b.spliceHintRecv();
     if (receiver != null) {
@@ -699,6 +712,7 @@ pub fn spliceInlineLambdaOn(
     const v = try lowerBlock(b, &body);
     if (caller_scope) |cs| b.exitCallerMemberScope(cs);
     for (lam_boxed_here.items) |n| b.unmarkBoxed(n);
+    for (hidden_binds.items) |hb| b.restoreHiddenBinding(hb.name, hb.h);
     for (suspended_rlp.items) |k| try b.markReceiverLambdaParam(k);
     _ = b.setThisNarrow(lam_prev_narrow);
     b.setSpliceHint(lam_prev_active, lam_prev_recv);

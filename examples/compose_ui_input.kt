@@ -1,3 +1,4 @@
+// corpus: interactive — loops on a live window (maxFrames = -1) until the user closes it.
 // A live windowed Compose UI app exercising the full input surface: keyboard,
 // hover, and click. Click the text field and type (Backspace deletes); the ADD
 // button highlights on hover and increments a counter on click; resizing the
