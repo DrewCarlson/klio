@@ -5260,20 +5260,23 @@ fn runFrameExec(
                 switch (op) {
                     .const_load => {
                         const v = try constToValue(allocator, &frame.module.consts.items[code[pc + 2]]);
-                        try frame.write(@enumFromInt(code[pc + 1]), v);
+                        if (!writeFast(frame, @enumFromInt(code[pc + 1]), v, allocator))
+                            try frame.write(@enumFromInt(code[pc + 1]), v);
                         pc += 3;
                     },
                     .move => {
                         const v = frame.read(@enumFromInt(code[pc + 2]));
                         v.retain();
-                        try frame.write(@enumFromInt(code[pc + 1]), v);
+                        if (!writeFast(frame, @enumFromInt(code[pc + 1]), v, allocator))
+                            try frame.write(@enumFromInt(code[pc + 1]), v);
                         pc += 3;
                     },
                     .load_param => {
                         const pidx: usize = code[pc + 2];
                         const v = if (pidx < frame.params.items.len) frame.params.items[pidx] else Value.Unit;
                         v.retain();
-                        try frame.write(@enumFromInt(code[pc + 1]), v);
+                        if (!writeFast(frame, @enumFromInt(code[pc + 1]), v, allocator))
+                            try frame.write(@enumFromInt(code[pc + 1]), v);
                         pc += 3;
                     },
                     .cell_get => {
@@ -5286,7 +5289,8 @@ fn runFrameExec(
                             else => |other| other,
                         };
                         v.retain();
-                        try frame.write(@enumFromInt(code[pc + 1]), v);
+                        if (!writeFast(frame, @enumFromInt(code[pc + 1]), v, allocator))
+                            try frame.write(@enumFromInt(code[pc + 1]), v);
                         pc += 3;
                     },
                     .trace => {
@@ -5906,9 +5910,41 @@ inline fn binFast(frame: *Frame, bo: anytype, allocator: Allocator) bool {
             .NotEq, .BoxedNotEq => .{ .Bool = lv.Bool != rv.Bool },
             else => return false,
         };
+    } else if ((lv == .Int or lv == .Long) and (rv == .Int or rv == .Long)) blk: {
+        // Mixed widths promote to Long, as `applyBinop` does. Boxed
+        // equality stays tag-sensitive (`(1 as Any) != (1L as Any)`)
+        // and falls through.
+        const a: i64 = if (lv == .Int) lv.Int else lv.Long;
+        const b: i64 = if (rv == .Int) rv.Int else rv.Long;
+        break :blk switch (bo.op) {
+            .Add => .{ .Long = a +% b },
+            .Sub => .{ .Long = a -% b },
+            .Mul => .{ .Long = a *% b },
+            .Div => if (b == 0) return false else .{ .Long = divTruncI64(a, b) },
+            .Mod => if (b == 0) return false else .{ .Long = remTruncI64(a, b) },
+            .Less => .{ .Bool = a < b },
+            .LessEq => .{ .Bool = a <= b },
+            .Greater => .{ .Bool = a > b },
+            .GreaterEq => .{ .Bool = a >= b },
+            .Eq => .{ .Bool = a == b },
+            .NotEq => .{ .Bool = a != b },
+            else => return false,
+        };
     } else return false;
     const old = frame.regs.items[di];
     frame.regs.items[di] = out;
+    if (runtime.reclaimEnabled()) old.release(allocator);
+    return true;
+}
+
+/// Inline register store for the bytecode loop's simple ops: succeeds
+/// only when the register file already covers `r` (the cold growth
+/// path stays in `Frame.write`). Takes ownership of `v` on success.
+inline fn writeFast(frame: *Frame, r: Reg, v: Value, allocator: Allocator) bool {
+    const idx = r.int();
+    if (idx >= frame.regs.items.len) return false;
+    const old = frame.regs.items[idx];
+    frame.regs.items[idx] = v;
     if (runtime.reclaimEnabled()) old.release(allocator);
     return true;
 }
@@ -10533,8 +10569,14 @@ pub fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Va
                 if (r.Int == 0) return errResult(try arithExc(allocator, "/ by zero"));
                 return ok(.{ .Int = divTruncI32(l.Int, r.Int) });
             }
-            if (l.* == .Long and r.* == .Int) return ok(.{ .Long = divTruncI64(l.Long, @as(i64, r.Int)) });
-            if (l.* == .Int and r.* == .Long) return ok(.{ .Long = divTruncI64(@as(i64, l.Int), r.Long) });
+            if (l.* == .Long and r.* == .Int) {
+                if (r.Int == 0) return errResult(try arithExc(allocator, "/ by zero"));
+                return ok(.{ .Long = divTruncI64(l.Long, @as(i64, r.Int)) });
+            }
+            if (l.* == .Int and r.* == .Long) {
+                if (r.Long == 0) return errResult(try arithExc(allocator, "/ by zero"));
+                return ok(.{ .Long = divTruncI64(@as(i64, l.Int), r.Long) });
+            }
             if (l.* == .Double and r.* == .Int) return ok(.{ .Double = l.Double / @as(f64, @floatFromInt(r.Int)) });
             if (l.* == .Int and r.* == .Double) return ok(.{ .Double = @as(f64, @floatFromInt(l.Int)) / r.Double });
             if (l.* == .Double and r.* == .Long) return ok(.{ .Double = l.Double / @as(f64, @floatFromInt(r.Long)) });
@@ -10565,8 +10607,14 @@ pub fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Va
                 if (r.Int == 0) return errResult(try arithExc(allocator, "/ by zero"));
                 return ok(.{ .Int = remTruncI32(l.Int, r.Int) });
             }
-            if (l.* == .Long and r.* == .Int) return ok(.{ .Long = remTruncI64(l.Long, @as(i64, r.Int)) });
-            if (l.* == .Int and r.* == .Long) return ok(.{ .Long = remTruncI64(@as(i64, l.Int), r.Long) });
+            if (l.* == .Long and r.* == .Int) {
+                if (r.Int == 0) return errResult(try arithExc(allocator, "/ by zero"));
+                return ok(.{ .Long = remTruncI64(l.Long, @as(i64, r.Int)) });
+            }
+            if (l.* == .Int and r.* == .Long) {
+                if (r.Long == 0) return errResult(try arithExc(allocator, "/ by zero"));
+                return ok(.{ .Long = remTruncI64(@as(i64, l.Int), r.Long) });
+            }
             if (l.* == .UInt and r.* == .UInt) {
                 if (r.UInt == 0) return errResult(try arithExc(allocator, "/ by zero"));
                 return ok(.{ .UInt = l.UInt % r.UInt });

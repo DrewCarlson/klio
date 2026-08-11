@@ -579,3 +579,24 @@ probe (MIN/-1 wrap, MIN%-1==0, truncated div/rem signs, /0 raises
 both widths, Int+Long promotion, boxed-Any tag inequality, ===)
 byte-identical across modes; flag-on sweep 117/0, litmus 42/43 (the
 known contended flake), corpus 280/291 (same 11), units green.
+
+## Tier levers 2+3: mixed-width binFast, inline stream stores; div-zero fix
+
+`binFast` now also computes MIXED Int/Long pairs (promote to i64,
+Long results, numeric compare/equality) — boxed equality stays
+tag-sensitive and falls through. The simple stream ops (const_load /
+move / load_param / cell_get) store through an inline `writeFast`
+whose cold growth path stays in `Frame.write`.
+
+Root-cause fix surfaced by the work: `applyBinop`'s MIXED-width
+integer Div/Mod (`5L / 0`, `5 % 0L`) called `divTruncI64` with a zero
+divisor — an interpreter PANIC where Kotlin raises
+ArithmeticException. All four shapes now raise; probe covers them in
+both modes.
+
+20M-iteration loop, JIT off: tier 2.94s -> 2.49s (v1 was 5.0s, so
+the tier is now 2x its launch perf and ~2.6x the walker's 6.4s).
+Profile is now fully inline: runFrameExec 41% / binFast 29% /
+writeFast 17%; execArmBinOp, applyBinop and Frame.write are gone
+from the loop shape. Battery: default-mode quick-gate at baseline;
+flag-on sweep 117/0, litmus 43/43, corpus 280/291 (same 11).
