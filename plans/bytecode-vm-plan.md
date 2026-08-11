@@ -634,3 +634,33 @@ vararg adapter activation — are C-transpiler enablement (their
 measured runtime value is ~0: the census walk rows they serve are
 dozens of events per run), and land with the transpiler's explicit
 frame layout.
+
+## Tech-debt review (goal close)
+
+Audited before calling the tier complete:
+
+- **Stream cache**: process-lifetime code cache by design (SpinMutex +
+  map keyed by the func's blocks pointer, one uncontended acquire per
+  activation; stable once a body materialises). Never freed —
+  bounded by function count, exactly like the funcs themselves.
+- **Encoding**: pinned by unit tests (dedicated ops, operand words,
+  idx_pc, the all-escape skip). BinOp operands ride the stream; no
+  Inst-union load on the hot path.
+- **Escape density**: an all-escape block builds no stream and runs
+  the walker, so the tier can never be slower than the walker on
+  call-heavy blocks.
+- **The walker stays plain** deliberately: it is the bisection
+  reference (`KLIO_BC=0`), sharing afterStep/execInst so semantics
+  cannot drift.
+- **zigcheck ir**: fails on a libc-only allocator reference under the
+  module-isolated build — verified PRE-EXISTING before the tier
+  landed (worktree check at the pre-tier commit); tracked separately.
+- **CALL_TAGGED / vararg adapter activation**: C-transpiler
+  enablement, recorded above, not runtime debt.
+
+End state, measured JIT-off on the two shapes: counted 20M-iteration
+loop 2.5s tier vs 6.4s walker; fib(34) 2.02s vs 2.07s (call time is
+the leaf serve, shared by both). With the default loop JIT the
+counted loop is 0.117s. Tier default ON. Final gates on the closing
+binary: quick-gate at baseline, compose plugin 1339/46/0 vs ratchet
+1305 (new best), walker-mode litmus 43/43.
