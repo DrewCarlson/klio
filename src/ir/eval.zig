@@ -17,6 +17,7 @@ const runtime = @import("runtime");
 const ir = @import("ir.zig");
 const span = @import("span");
 const jit_loop = @import("jit_loop.zig");
+const bc = @import("bc.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -5235,77 +5236,92 @@ fn runFrameExec(
             start_idx = insts.len;
         }
         var idx: usize = 0;
-        while (idx < insts.len) : (idx += 1) {
-            if (idx < start_idx) continue;
-            const inst = &insts[idx];
-            const r = try execInst(H, allocator, frame, inst, host);
-            if (r == .flat_call) {
-                // Hand the resolved direct call to the flat driver: it pushes
-                // the callee as a new activation and re-enters this frame at
-                // the next instruction once the result is in `req.dst`.
-                const req = frame.flat_call.?;
-                frame.flat_call = null;
-                flat_out.* = .{ .req = req, .ret_block = cur, .ret_idx = idx + 1 };
-                return ok(.Unit);
+        var ret_v: EvalResult = ok(.Unit);
+        var ran_bc = false;
+        // The bytecode tier (KLIO_BC=1): the dense per-block stream replaces
+        // this instruction loop's union dispatch; every non-simple op
+        // escapes to `execInst`, and all control flow funnels through the
+        // same `afterStep` the walker uses.
+        if (bc.enabled()) bc_run: {
+            const stream = bc.blockStream(insts) orelse break :bc_run;
+            ran_bc = true;
+            const code = stream.code;
+            var pc: usize = if (start_idx == 0)
+                0
+            else if (start_idx >= insts.len)
+                code.len
+            else
+                stream.idx_pc[start_idx];
+            bc_loop: while (pc < code.len) {
+                const op: bc.Op = @enumFromInt(code[pc]);
+                switch (op) {
+                    .const_load => {
+                        const v = try constToValue(allocator, &frame.module.consts.items[code[pc + 2]]);
+                        try frame.write(@enumFromInt(code[pc + 1]), v);
+                        pc += 3;
+                    },
+                    .move => {
+                        const v = frame.read(@enumFromInt(code[pc + 2]));
+                        v.retain();
+                        try frame.write(@enumFromInt(code[pc + 1]), v);
+                        pc += 3;
+                    },
+                    .load_param => {
+                        const pidx: usize = code[pc + 2];
+                        const v = if (pidx < frame.params.items.len) frame.params.items[pidx] else Value.Unit;
+                        v.retain();
+                        try frame.write(@enumFromInt(code[pc + 1]), v);
+                        pc += 3;
+                    },
+                    .cell_get => {
+                        const v = switch (frame.read(@enumFromInt(code[pc + 2]))) {
+                            .Cell => |c| vblk: {
+                                const g = c.borrow();
+                                defer g.deinit();
+                                break :vblk g.get().*;
+                            },
+                            else => |other| other,
+                        };
+                        v.retain();
+                        try frame.write(@enumFromInt(code[pc + 1]), v);
+                        pc += 3;
+                    },
+                    .trace => {
+                        frame.cur_span = insts[code[pc + 1]].Trace.span;
+                        pc += 2;
+                    },
+                    .bin => {
+                        idx = code[pc + 1];
+                        const inst = &insts[idx];
+                        const r = try execArmBinOp(H, allocator, frame, inst.BinOp, host);
+                        switch (try afterStep(allocator, frame, r, inst, idx, cur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
+                            .cont => pc += 2,
+                            .brk => break :bc_loop,
+                            .ret => return ret_v,
+                        }
+                    },
+                    .escape => {
+                        idx = code[pc + 1];
+                        const inst = &insts[idx];
+                        const r = try execInst(H, allocator, frame, inst, host);
+                        switch (try afterStep(allocator, frame, r, inst, idx, cur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
+                            .cont => pc += 2,
+                            .brk => break :bc_loop,
+                            .ret => return ret_v,
+                        }
+                    },
+                }
             }
-            if (r == .raised) {
-                const e = frame.step_err.?;
-                frame.step_err = null;
-                switch (e) {
-                    .Throw => |v| {
-                        // Capture the call stack at the throw seam: the
-                        // innermost frame to surface this value records the
-                        // full chain (evtls.frame_chain is intact and innermost-first
-                        // here); the attach is once-only, so the outward unwind
-                        // through enclosing frames leaves it untouched.
-                        var tv = v;
-                        try attachStackTrace(allocator, &tv);
-                        thrown = tv;
-                        break;
-                    },
-                    .NonLocalReturn, .LabeledReturn => {
-                        // A non-local return (labeled or untargeted) unwinds
-                        // through the lambda frame *and* through any
-                        // inline-function frames it was passed into, landing
-                        // in the function that wrote the lambda (Kotlin allows
-                        // non-local return only via inline functions). Like a
-                        // throw, it runs the finally blocks of every armed try
-                        // region it crosses -- but no catch clause takes it.
-                        unwound = e;
-                        break;
-                    },
-                    .CalleeFailed, .StackOverflow => {
-                        // An interpreter-level failure from a body that RAN
-                        // (the callee boundary re-tags resolution-class
-                        // escapes to `CalleeFailed` exactly so walkers never
-                        // retry it) unwinds like a throw for `finally`
-                        // purposes: Kotlin guarantees finally on every
-                        // unwind, and skipping it left global state behind
-                        // (a dying compose test's un-run `finally` leaked a
-                        // stale recomposer flag/scope into later tests — the
-                        // cross-test no-changes contamination family). No
-                        // catch clause takes it: it is not a Kotlin
-                        // Throwable. Probe-class misses (`Unimplemented`)
-                        // stay on the immediate path below — they are
-                        // dispatch control flow, and running user finallys
-                        // per candidate probe would corrupt state.
-                        unwound = e;
-                        break;
-                    },
-                    .Suspended => |state| {
-                        // Report the suspension point so the driver can park
-                        // this frame — live for a flat activation, snapshot
-                        // for a native root. The resume value lands in the
-                        // suspending call's destination register (or one a
-                        // binding set explicitly via `pending_resume_reg`).
-                        const resume_reg = if (state.pending_resume_reg) |rr| blk: {
-                            state.pending_resume_reg = null;
-                            break :blk rr;
-                        } else instDst(inst);
-                        park_out.* = .{ .block = cur, .inst_idx = idx + 1, .resume_reg = resume_reg };
-                        return errResult(.{ .Suspended = state });
-                    },
-                    else => return errResult(e),
+        }
+        if (!ran_bc) {
+            while (idx < insts.len) : (idx += 1) {
+                if (idx < start_idx) continue;
+                const inst = &insts[idx];
+                const r = try execInst(H, allocator, frame, inst, host);
+                switch (try afterStep(allocator, frame, r, inst, idx, cur, flat_out, park_out, &thrown, &unwound, &ret_v)) {
+                    .cont => {},
+                    .brk => break,
+                    .ret => return ret_v,
                 }
             }
         }
@@ -5758,6 +5774,69 @@ fn isBoundRefInstance(v: *const Value) bool {
 /// This does nothing for the JIT'd path — once a function is hot the recursive
 /// call runs native code -> `LoopTramp.call` -> `callFunc` and never reaches
 /// here. That path is served by outlining the trampoline's bulky sites.
+/// The shared post-step control-flow handling for both instruction loops
+/// (the tree walker's and the bytecode tier's): flat-call handoff, throw /
+/// non-local-return capture, suspension parking. `.brk` breaks to the
+/// block's unwind handling with `thrown`/`unwound` set; `.ret` returns
+/// `ret.*` from the frame.
+const AfterStep = enum { cont, brk, ret };
+
+fn afterStep(
+    allocator: Allocator,
+    frame: *Frame,
+    r: Step,
+    inst: *const Inst,
+    idx: usize,
+    cur: BlockId,
+    flat_out: *?FlatCallSite,
+    park_out: *?ParkPoint,
+    thrown: *?Value,
+    unwound: *?EvalError,
+    ret: *EvalResult,
+) Allocator.Error!AfterStep {
+    if (r == .flat_call) {
+        const req = frame.flat_call.?;
+        frame.flat_call = null;
+        flat_out.* = .{ .req = req, .ret_block = cur, .ret_idx = idx + 1 };
+        ret.* = ok(.Unit);
+        return .ret;
+    }
+    if (r == .raised) {
+        const e = frame.step_err.?;
+        frame.step_err = null;
+        switch (e) {
+            .Throw => |v| {
+                var tv = v;
+                try attachStackTrace(allocator, &tv);
+                thrown.* = tv;
+                return .brk;
+            },
+            .NonLocalReturn, .LabeledReturn => {
+                unwound.* = e;
+                return .brk;
+            },
+            .CalleeFailed, .StackOverflow => {
+                unwound.* = e;
+                return .brk;
+            },
+            .Suspended => |state| {
+                const resume_reg = if (state.pending_resume_reg) |rr| blk: {
+                    state.pending_resume_reg = null;
+                    break :blk rr;
+                } else instDst(inst);
+                park_out.* = .{ .block = cur, .inst_idx = idx + 1, .resume_reg = resume_reg };
+                ret.* = errResult(.{ .Suspended = state });
+                return .ret;
+            },
+            else => {
+                ret.* = errResult(e);
+                return .ret;
+            },
+        }
+    }
+    return .cont;
+}
+
 noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!Step {
     if (runtime.prof.op_prof_active) runtime.prof.current_op = @intFromEnum(inst.*);
     switch (inst.*) {
