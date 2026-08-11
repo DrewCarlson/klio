@@ -3420,6 +3420,19 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (b.module.funcByIdMut(body_func)) |f| {
         f.lambda_receiver_shape_known = lambda_receiver_shape_known;
         f.lambda_has_receiver = lambda_has_receiver;
+        // The receiver HEAD is this lambda's OWN derivation — the body
+        // builder's recvTy can carry the ENCLOSING lambda's receiver (a
+        // placement block nested in a measure lambda recorded
+        // "MeasureScope"), and the runtime's compatibility receiver
+        // inference then re-selects a chain value satisfying the wrong
+        // head, silently swapping the invoke's real receiver (the
+        // coordinator displaced the PlacementScope and every placement
+        // pass lost its member-extension owner). When the shape is known,
+        // record exactly the derived head — or null for a plain lambda,
+        // which disables re-selection and keeps the passed receiver.
+        if (lambda_receiver_shape_known) {
+            f.lambda_receiver_ty = if (receiver_head) |h| try b.allocator.dupe(u8, h) else null;
+        }
     }
 
     // Record the implicit label.
@@ -3904,17 +3917,25 @@ fn mapArgsToParams(
     const used = try b.allocator.alloc(bool, params.len);
     defer b.allocator.free(used);
     for (used) |*u| u.* = false;
-    // 1. Named arguments bind their same-named parameter.
+    // 1. Named arguments bind their same-named parameter. A named argument
+    // that matches NO parameter makes the whole call inapplicable to this
+    // callee (Kotlin rejects the candidate outright), so the map must fail
+    // rather than silently drop the argument — otherwise an unnamed trailing
+    // lambda still "binds" the last parameter of a callee that cannot take
+    // this call, and downstream heuristics record that parameter's lambda
+    // shape (receiver head, arity) against the wrong lambda.
     for (args, 0..) |_, j| {
         const an = if (j < arg_names.len) arg_names[j] else null;
         if (an) |name| {
-            for (params, 0..) |p, idx| {
-                if (std.mem.eql(u8, p.name, name)) {
-                    out[j] = idx;
-                    used[idx] = true;
-                    break;
-                }
-            }
+            const idx_opt: ?usize = for (params, 0..) |p, idx| {
+                if (std.mem.eql(u8, p.name, name)) break idx;
+            } else null;
+            const idx = idx_opt orelse {
+                b.allocator.free(out);
+                return null;
+            };
+            out[j] = idx;
+            used[idx] = true;
         }
     }
     // 2. An unnamed trailing lambda binds the last (still-free) parameter.
@@ -4206,6 +4227,8 @@ fn recordCallBoundLambdaReceiver(
         cleanup.deinit(b.allocator);
         return;
     }
+    if (std.c.getenv("KLIO_LAR_TRACE") != null)
+        std.debug.print("[lar-site] site=cbr fn={s} declared={s} resolved={s} s={d}..{d}\n", .{ func.name, declared_receiver.name, resolved.name, call_span.start, call_span.end });
     try b.recordLambdaArgRecvOwned(call_span, resolved);
 }
 
@@ -5496,6 +5519,8 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 if (ok) {
                     if (common) |receiver| {
                         common = null;
+                        if (std.c.getenv("KLIO_LAR_TRACE") != null)
+                            std.debug.print("[lar-site] site=common name={s} recv={s} s={d}..{d}\n", .{ cnm, receiver.name, args[args.len - 1].span().start, args[args.len - 1].span().end });
                         try b.recordLambdaArgRecvOwned(args[args.len - 1].span(), receiver);
                     }
                 }
@@ -7323,6 +7348,51 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 return d0;
             }
         }
+    }
+    // A RECEIVER-function-typed property invoked bare (`block!!()` where
+    // `block: Scope.() -> R` and an implicit receiver is in scope — the
+    // cached-draw block invoked directly inside `scope.apply { … }`): the
+    // innermost implicit receiver rides the call, exactly as Kotlin binds
+    // it. Without this the closure body ran receiverless and its bare
+    // member calls fell to globals.
+    recv_fn: {
+        var core = callee;
+        var hops: usize = 0;
+        while (hops < 8) : (hops += 1) {
+            switch (core.*) {
+                .Unary => |u| core = u.expr,
+                .Postfix => |pf| core = pf.expr,
+                else => break,
+            }
+        }
+        if (core.* != .Path or core.Path.segments.len != 1) break :recv_fn;
+        const pname = core.Path.segments[0].name;
+        if (b.resolve(pname) != null or b.knowsOuter(pname)) break :recv_fn;
+        const this_reg = b.resolve("this") orelse break :recv_fn;
+        var owner: ?[]const u8 = b.ownerClass();
+        var ohops: usize = 0;
+        const is_recv_fn = blk: {
+            while (owner) |o| : (ohops += 1) {
+                if (ohops > 32) break;
+                if (b.module.registry.recv_fn_props.get(.{ .a = o, .b = pname }) != null) break :blk true;
+                owner = b.module.registry.enclosing_class.get(o);
+            }
+            break :blk false;
+        };
+        if (!is_recv_fn) break :recv_fn;
+        const callee_r = try lowerExpr(b, callee);
+        const run = try lowerArgRun(b, args);
+        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+        const dst = b.allocReg();
+        try b.push(.{ .CallValueWithThis = .{
+            .dst = dst,
+            .callee = callee_r,
+            .receiver = this_reg,
+            .args = run[0],
+            .n_args = run[1],
+            .arg_names = arg_names,
+        } });
+        return dst;
     }
     const callee_r = try lowerExpr(b, callee);
     const run = try lowerArgRun(b, args);
@@ -16294,6 +16364,8 @@ fn lowerImplicitThisCall(
             const uninstantiated = bareTypeParamHead(recv) or
                 ir.parseClassTypeParamIdentity(recv) != null;
             if (!(uninstantiated and b.lambdaArgRecv(trailing.span()) != null)) {
+                if (std.c.getenv("KLIO_LAR_TRACE") != null)
+                    std.debug.print("[lar-site] site=shape name={s} recv={s} s={d}..{d}\n", .{ name0, recv, trailing.span().start, trailing.span().end });
                 try b.recordLambdaArgRecvOwned(
                     trailing.span(),
                     try (ir.TypeRef{
