@@ -9255,6 +9255,14 @@ fn closureHasGenericMethod(self: *VmHost, allocator: Allocator, start_cid: ir.Cl
                 if (std.mem.eql(u8, f.name, name) and funcTypeParamCount(self, fid) == tvc) return true;
             }
         }
+        // An interface's ABSTRACT member lowers no method fid, but its
+        // declared header is registered — without this, a runtime override
+        // of `operator fun <T> get(key: Key<T>)` on an interface-typed
+        // receiver was excluded as a subtype-only generic and the walk fell
+        // through to a delegated `Map.get` (the CompositionLocalMap read).
+        for (mod.memberDecls(irc.fqn, name)) |fid| {
+            if (funcTypeParamCount(self, fid) == tvc) return true;
+        }
         for (irc.supertypes) |sid| try queue.append(allocator, sid);
     }
     return false;

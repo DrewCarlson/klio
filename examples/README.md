@@ -72,6 +72,8 @@ Run any program with:
 | `qualified_this.kt`        | Qualified `this@Label` through inner/outer chains.             |
 | `qualified_namesake_delegation.kt` | A user function sharing a stdlib function's name delegates to it fully qualified; the qualified call binds the FQN target exactly, never re-picking the user function. |
 | `receiver_lambda_reassign.kt` | A receiver lambda keeps its receiver context when reassigned to a typed local or assigned into a field declared `Scope.() -> R`. |
+| `interface_static_get_override.kt` | `m[k]` on an interface-typed receiver binds the runtime override of the interface's abstract generic `get`, never a delegated `Map.get`. |
+| `splice_receiver_member_write.kt` | A bare member write inside an inline-spliced receiver lambda lands on the enclosing class's property when the splice receiver does not declare it. |
 
 ## Functions, lambdas, and generics
 

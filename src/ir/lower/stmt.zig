@@ -1020,6 +1020,30 @@ fn lowerSafeMemberAssign(
     return null;
 }
 
+/// Whether the CURRENT `this` is an inline-splice receiver whose type is
+/// known, is not the enclosing member's owner class, and does not declare
+/// `name` as a property — i.e. a bare write here must NOT SetField on it.
+/// Unknown shapes answer false (the SetField arm keeps its behavior).
+fn spliceReceiverHidesMember(b: *FuncBuilder, name: []const u8) bool {
+    const recv = b.spliceRecvTy() orelse b.spliceHintRecv() orelse return false;
+    var head = std.mem.trimEnd(u8, recv, "?");
+    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
+    const owner = b.ownerClass() orelse return false;
+    if (std.mem.eql(u8, head, owner)) return false;
+    // The receiver type declares the property itself: the SetField is right.
+    if (@import("inline_state.zig").memberPropAst(head, name) != null) return false;
+    if (b.module.classId(head)) |cid| {
+        if (cid.int() < b.module.classes.items.len) {
+            const c = &b.module.classes.items[cid.int()];
+            for (c.primary_params) |*pp| {
+                if (std.mem.eql(u8, pp.name, name)) return false;
+            }
+        }
+    }
+    return true;
+}
+
 fn lowerAssign(
     b: *FuncBuilder,
     target: *const Expr,
@@ -1308,13 +1332,21 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                 try b.push(.{ .Move = .{ .dst = home, .src = combined } });
             } else if (b.resolve(seg) != null) {
                 try b.rebind(seg, combined);
-            } else if (b.hasOwnMember(seg) and b.resolve("this") != null) {
+            } else if (b.hasOwnMember(seg) and b.resolve("this") != null and
+                !spliceReceiverHidesMember(b, seg)) {
                 // Method-body `this.field` write — route
                 // SetField on the receiver so the bare-
                 // name assign reaches the instance, not
                 // a synthetic global. A private SHADOW of a
                 // supertype's same-name property writes ITS OWN
                 // owner-mangled cell, never the base class's.
+                // NOT taken inside an inline-spliced receiver lambda
+                // (`scope.apply { result = ... }`) whose receiver type
+                // does not declare the member: `this` is the SPLICE
+                // receiver there, and a SetField on it would invent a
+                // dynamic field on the wrong object while the enclosing
+                // class's property silently keeps its value. The
+                // walking store below finds the right owner.
                 const this_reg = b.resolve("this").?;
                 const store_name: []const u8 = blk: {
                     const oc = b.ownerClass() orelse break :blk seg;
