@@ -524,3 +524,39 @@ classes / 1 did not complete vs ratchet 1305 — direct binary run,
 exit 0. With the flag-on sweep 117/0, litmus both modes, corpus,
 census 119/119 and units already green, the tier's batch is verified
 end to end.
+
+## Counted-range strength reduction (for-loop lowering)
+
+`for (i in a until b)` / `for (i in a..b)` / `a..<b` over same-typed
+non-nullable Int/Long operands now lowers to a plain register loop —
+no Range object, no iterator, no per-iteration CallVirtual pair. The
+inclusive form exits on an EQUALITY check before the increment so
+`hi == MAX_VALUE` terminates instead of wrapping (the exclusive form's
+`i < hi` compare is overflow-free as is). Bounds evaluate once in
+source order to fresh registers, so body mutation of the bound
+expression's variables cannot change the trip count; `continue` (and
+labeled continue) re-enters at the per-iteration exit check. `downTo`
+/ `step` / hoisted-range-value loops keep the iterator lowering.
+`KLIO_COUNTED=0` restores the iterator lowering for bisection.
+
+Measured (single binary, env A/B, 20M-iteration Int loop, quiet
+machine, x2 agreeing reps):
+
+| config | iterator | counted | speedup |
+|--------|----------|---------|---------|
+| walker, JIT off | 35.8s | 5.97s | 6.0x |
+| KLIO_BC=1, JIT off | 33.2s | 4.97s | 6.7x |
+| default (loop JIT on) | 37.2s | 0.117s | 318x |
+
+The headline is the third row: the iterator form's per-iteration
+CallVirtuals BLOCKED the loop JIT entirely; the counted register loop
+is exactly the shape the JIT compiles. The tier keeps its own ~17%
+on the counted shape (BinOp/Const/Move stream ops).
+
+Batch: census 119/119, units, sweep 117/0, corpus 280/291 (same 11
+pre-existing), litmus 42/43 (tl_atomic_update_contended timeout — the
+known threaded flake), edge battery green both modes (MAX_VALUE
+inclusive termination, MIN_VALUE exclusive, empty ranges,
+break/continue/labeled-continue targeting, Long, bounds-once
+evaluation order, lambda capture of the loop var, body mutation of
+the hi source variable).

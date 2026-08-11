@@ -26,6 +26,19 @@ pub fn lowerFor(
     return lowerForLabeled(b, vars, iter, body, null);
 }
 
+var counted_checked: bool = false;
+var counted_on: bool = true;
+
+fn countedEnabled() bool {
+    if (!counted_checked) {
+        counted_checked = true;
+        if (std.c.getenv("KLIO_COUNTED")) |v| {
+            counted_on = !std.mem.eql(u8, std.mem.span(v), "0");
+        }
+    }
+    return counted_on;
+}
+
 pub fn lowerForLabeled(
     b: *FuncBuilder,
     vars: []const ast.Ident,
@@ -33,6 +46,113 @@ pub fn lowerForLabeled(
     body: *const Expr,
     label: ?[]const u8,
 ) Allocator.Error!Reg {
+    // COUNTED-RANGE strength reduction: `for (i in a until b)` and
+    // `for (i in a..b)` over same-typed Int/Long operands lower to a plain
+    // register loop — no Range object, no iterator, no virtual protocol
+    // calls per iteration. The iterator form dominated the interpreter's
+    // loop profile (two CallVirtuals per iteration plus the range fields).
+    // `KLIO_COUNTED=0` restores the iterator lowering for bisection.
+    if (vars.len == 1 and countedEnabled()) counted: {
+        var lo_e: *const Expr = undefined;
+        var hi_e: *const Expr = undefined;
+        var inclusive = false;
+        switch (iter.*) {
+            .Binary => |bin| switch (bin.op) {
+                .Range => {
+                    inclusive = true;
+                    lo_e = bin.lhs;
+                    hi_e = bin.rhs;
+                },
+                .RangeUntil => {
+                    lo_e = bin.lhs;
+                    hi_e = bin.rhs;
+                },
+                else => break :counted,
+            },
+            .Call => |c| {
+                if (!c.is_infix or c.args.len != 2 or c.callee.* != .Path or
+                    c.callee.Path.segments.len != 1) break :counted;
+                if (!std.mem.eql(u8, c.callee.Path.segments[0].name, "until")) break :counted;
+                lo_e = &c.args[0];
+                hi_e = &c.args[1];
+            },
+            else => break :counted,
+        }
+        var lo_ty = (expr.staticExprTypeRef(b, lo_e) catch null) orelse break :counted;
+        defer lo_ty.deinit(b.allocator);
+        var hi_ty = (expr.staticExprTypeRef(b, hi_e) catch null) orelse break :counted;
+        defer hi_ty.deinit(b.allocator);
+        const is_int = std.mem.eql(u8, lo_ty.name, "Int") and std.mem.eql(u8, hi_ty.name, "Int");
+        const is_long = std.mem.eql(u8, lo_ty.name, "Long") and std.mem.eql(u8, hi_ty.name, "Long");
+        if ((!is_int and !is_long) or lo_ty.nullable or hi_ty.nullable) break :counted;
+
+        // Bounds evaluate once, in source order, before the loop.
+        const lo = try lowerExpr(b, lo_e);
+        const hi_raw = try lowerExpr(b, hi_e);
+        const hi = b.allocReg();
+        try b.push(.{ .Move = .{ .dst = hi, .src = hi_raw } });
+        const i_reg = b.allocReg();
+        try b.push(.{ .Move = .{ .dst = i_reg, .src = lo } });
+        const one = if (is_long)
+            try b.emitConst(.{ .Long = 1 })
+        else
+            try b.emitConst(.{ .Int = 1 });
+
+        const header = try b.allocBlock();
+        const body_blk = try b.allocBlock();
+        const tail_blk = try b.allocBlock();
+        const incr = try b.allocBlock();
+        const exit = try b.allocBlock();
+        b.terminate(.{ .Goto = header });
+
+        // ENTRY check once. The INCLUSIVE form must terminate at
+        // `hi == MAX_VALUE`, where increment-then-compare would wrap and
+        // spin — so its per-iteration exit is an EQUALITY check before the
+        // increment (`i == hi` → done, else `i < hi` so `i + 1` cannot
+        // overflow). The exclusive form's `i < hi` compare is
+        // overflow-free as is.
+        b.switchTo(header);
+        const cond = b.allocReg();
+        try b.push(.{ .BinOp = .{
+            .dst = cond,
+            .op = if (inclusive) .LessEq else .Less,
+            .lhs = i_reg,
+            .rhs = hi,
+        } });
+        b.terminate(.{ .Branch = .{ .cond = cond, .t = body_blk, .f = exit } });
+
+        b.switchTo(body_blk);
+        try b.pushScope();
+        try b.bind(vars[0].name, i_reg);
+        try b.setLocalDeclTypeOwned(vars[0].name, .{
+            .name = try b.allocator.dupe(u8, if (is_long) "Long" else "Int"),
+            .nullable = false,
+            .args = &.{},
+        });
+        // `continue` re-enters at the per-iteration EXIT CHECK, never the
+        // body or the increment.
+        try b.pushLoop(label, tail_blk, exit);
+        _ = try lowerExpr(b, body);
+        b.popLoop();
+        try b.popScope();
+        b.terminate(.{ .Goto = tail_blk });
+
+        b.switchTo(tail_blk);
+        if (inclusive) {
+            const done = b.allocReg();
+            try b.push(.{ .BinOp = .{ .dst = done, .op = .Eq, .lhs = i_reg, .rhs = hi } });
+            b.terminate(.{ .Branch = .{ .cond = done, .t = exit, .f = incr } });
+        } else {
+            b.terminate(.{ .Goto = incr });
+        }
+
+        b.switchTo(incr);
+        try b.push(.{ .BinOp = .{ .dst = i_reg, .op = .Add, .lhs = i_reg, .rhs = one } });
+        b.terminate(.{ .Goto = if (inclusive) body_blk else header });
+
+        b.switchTo(exit);
+        return b.emitConst(.Unit);
+    }
     const recv = try lowerExpr(b, iter);
     const it_reg = b.allocReg();
     const zero = b.allocReg();
