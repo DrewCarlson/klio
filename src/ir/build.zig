@@ -409,6 +409,8 @@ pub const LocalFnOverload = struct {
 /// into its context-parameter count and ordinary-parameter count.
 pub const ContextFnShape = struct { n_ctx: usize, n_regular: usize };
 
+pub const HiddenBinding = struct { frame: usize, reg: Reg };
+
 pub const FuncBuilder = struct {
     allocator: Allocator,
     module: *Module,
@@ -2677,6 +2679,26 @@ pub const FuncBuilder = struct {
         var oit = self.outer_names.keyIterator();
         while (oit.next()) |k| try out.put(k.*, {});
         return out;
+    }
+
+    /// Temporarily remove `name`'s innermost scope binding (an inline fn's
+    /// own parameter must not be visible to a spliced CALLER-lambda body:
+    /// `apply`'s `block` param shadowed a caller class's `block` member).
+    /// Returns what `restoreHiddenBinding` needs, or null when unbound.
+    pub fn hideBinding(self: *FuncBuilder, name: []const u8) ?HiddenBinding {
+        var i: usize = self.scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.scopes.items[i].fetchRemove(name)) |kv| {
+                return .{ .frame = i, .reg = kv.value };
+            }
+        }
+        return null;
+    }
+    pub fn restoreHiddenBinding(self: *FuncBuilder, name: []const u8, h: HiddenBinding) void {
+        if (h.frame < self.scopes.items.len) {
+            self.scopes.items[h.frame].put(name, h.reg) catch {};
+        }
     }
 
     /// Push a fresh scope.
