@@ -491,3 +491,28 @@ coroutine/exception semantics cannot drift (they share the walker's
 code), and the perf win lands where the profile says the time is
 (dense fetch + direct leaf calls for the hot simple ops, no union
 loads). The C transpiler consumes the same op stream.
+
+## Bytecode tier v1: LANDED (6767b42c + the per-func tables)
+
+The frozen spec is implemented and green across the whole battery
+UNDER THE FLAG: stdlib sweep 117/0 with KLIO_BC=1 (the full commontest
+surface — coroutines, exceptions, threads — through the tier), litmus
+42-43/43 both modes, corpus at baseline, census suite 119/119, units
+green. Suspension, non-local returns, flat-call activations and the
+throw unwind all flow through the shared afterStep — the tier cannot
+drift from the walker semantically.
+
+PERF, honestly measured: NEUTRAL at v1 (walker 5.15s vs tier 5.25s on
+the compute bench, JIT off; an earlier 26% reading was machine-load
+skew and is retracted). The dispatch saving is real but small against
+the arm work; the levers, in measured order from the profile:
+memset 8% (frame register clearing), execArmBinOp 6.7% (the arm work
+itself — an int-fast-path dedicated op could skip its type dispatch),
+the call preparation path (~10% across prepareVirtualFlatCall /
+prepareFlatFromFid / frameBoundary). Growth = quicken those, measure
+each; the stream and escape contract never change.
+
+Remaining under this plan: CALL_TAGGED's link-time table (spec'd), the
+vararg adapter activation (needs the explicit frame layout — natural
+once call ops are quickened into the stream), and the C transpiler
+consuming the same streams/tables.
