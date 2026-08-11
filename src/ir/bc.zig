@@ -34,13 +34,15 @@ pub const Stream = struct {
 };
 
 var gate_checked: bool = false;
-var gate_on: bool = false;
+var gate_on: bool = true;
 
+/// The tier is ON by default; `KLIO_BC=0` restores the pure walker
+/// for bisection.
 pub fn enabled() bool {
     if (!gate_checked) {
         gate_checked = true;
         if (std.c.getenv("KLIO_BC")) |v| {
-            gate_on = std.mem.eql(u8, std.mem.span(v), "1");
+            gate_on = !std.mem.eql(u8, std.mem.span(v), "0");
         }
     }
     return gate_on;

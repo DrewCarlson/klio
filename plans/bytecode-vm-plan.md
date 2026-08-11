@@ -616,3 +616,21 @@ the walker (-38%). Battery: default quick-gate at baseline; flag-on
 sweep 117/0, litmus 43/43, corpus same 11; compose plugin 1337/46
 with ZERO did-not-complete vs ratchet 1305 (best recorded run);
 probes byte-identical across modes.
+
+## Tier default: ON
+
+The tier now runs by default (`KLIO_BC=0` restores the pure walker
+for bisection). Evidence: faster or neutral on every measured shape
+(counted loop 2.5s vs 6.4s walker; fib(34) 2.03s vs 2.07s; mixed
+bench better), and the full battery green in BOTH settings —
+default-on quick-gate (census/units/sweep 117/0/corpus/litmus) at
+baseline, compose plugin 1327/46/1 vs ratchet 1305, walker-mode
+(KLIO_BC=0) litmus 43/43. An all-escape block skips its stream, so
+call-heavy blocks keep walker behavior rather than paying stream
+overhead.
+
+The plan rows still open — CALL_TAGGED's link-time table and the
+vararg adapter activation — are C-transpiler enablement (their
+measured runtime value is ~0: the census walk rows they serve are
+dozens of events per run), and land with the transpiler's explicit
+frame layout.
