@@ -80,6 +80,16 @@ pub fn funcStreams(func: *const ir.Func) ?*const FuncStreams {
 }
 
 fn build(insts: []const ir.Inst) ?*const Stream {
+    // A block with no dedicated ops gains nothing from the stream —
+    // running it as escapes would only add fetch+dispatch on top of
+    // the walker's own loop. Leave it to the walker.
+    const dedicated = for (insts) |*inst| {
+        switch (inst.*) {
+            .Const, .Move, .LoadParam, .CellGet, .BinOp => break true,
+            else => {},
+        }
+    } else false;
+    if (!dedicated) return null;
     const a = std.heap.smp_allocator;
     var code: std.ArrayList(u32) = .empty;
     var idx_pc = a.alloc(u32, insts.len) catch return null;
