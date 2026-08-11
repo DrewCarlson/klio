@@ -149,7 +149,7 @@ const EvalTls = struct {
     /// host call-back boundary).
     eval_depth: usize = 0,
     /// Native-recursion depth for the whole-function JIT (see
-    /// JIT_NATIVE_DEPTH_LIMIT).
+    /// NATIVE_SLOT_BANK_DEPTH).
     jit_native_depth: usize = 0,
     /// Resolved depth cap; `0` = not yet read from the env.
     eval_depth_cap: usize = 0,
@@ -193,7 +193,14 @@ const EvalTls = struct {
 /// costs a few C-stack frames. Bounded so deep recursion falls back to the
 /// frame-based path (whose `evtls.eval_depth` bound raises a catchable StackOverflow)
 /// before the native stack faults.
-const JIT_NATIVE_DEPTH_LIMIT: usize = 1500;
+/// Static per-thread slot/tag rows for native-to-native JIT recursion, one
+/// row per nesting level (rows are disjoint, so re-entrancy is safe).
+/// Thread-local statics are zero-initialized once — a per-call stack
+/// `undefined` buffer is 0xaa-filled by the safe build on every call.
+/// Recursion deeper than the bank falls back to the frame path.
+const NATIVE_SLOT_BANK_DEPTH: usize = 192;
+threadlocal var native_slot_bank: [NATIVE_SLOT_BANK_DEPTH][192]i64 = @splat(@splat(0));
+threadlocal var native_tag_bank: [NATIVE_SLOT_BANK_DEPTH][192]u8 = @splat(@splat(0));
 
 /// Resolved depth cap for the current thread. `0` means "not yet read"; the
 /// first `runFrame` reads the env once and caches the result.
@@ -4849,9 +4856,13 @@ fn LoopTramp(comptime H: type) type {
             if (!site.is_member and !runtime.shouldAbandon()) {
                 if (lc.module.funcById(site.func)) |callee| {
                     if (jit_loop.compiledFunc(callee)) |callee_cl| {
-                        if (evtls.jit_native_depth < JIT_NATIVE_DEPTH_LIMIT and callee_cl.n_slots <= 192) {
-                            var fslots: [192]i64 = undefined;
-                            var ftags: [192]u8 = undefined;
+                        if (evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and callee_cl.n_slots <= 192) {
+                            // Per-depth rows from the thread's static bank: a
+                            // stack `undefined` array here is 0xaa-filled per
+                            // CALL under the safe build — it was 70% of a
+                            // native fib's wall.
+                            const fslots: []i64 = &native_slot_bank[evtls.jit_native_depth];
+                            const ftags: []u8 = &native_tag_bank[evtls.jit_native_depth];
                             evtls.jit_native_depth += 1;
                             const fo = jit_loop.runFunc(callee_cl, &.{}, argbuf[0..site.n_args], fslots[0..callee_cl.n_slots], ftags[0..callee_cl.n_regs], &call, tctx.user);
                             evtls.jit_native_depth -= 1;
@@ -5089,6 +5100,9 @@ fn runFrameExec(
     // compile trigger lives at this loop's block entry, and fused edges
     // would starve it.
     const bc_streams: ?*const bc.FuncStreams = if (bc.enabled()) bc.funcStreams(func, !jit_on, module.consts.items) else null;
+    // The loop JIT's per-function state, hoisted to one lookup per
+    // activation; the per-block-entry probe is then two array loads.
+    const jit_fj: ?*jit_loop.FuncJit = if (jit_on) jit_loop.forFunc(func) else null;
     const field_resolver: ?jit_loop.FieldResolver =
         if (comptime tramp_ok and @hasDecl(H, "plainStoredFieldIndex")) &LoopTramp(H).resolveField else null;
     const field_nn_resolver: ?jit_loop.FieldResolver =
@@ -5130,8 +5144,8 @@ fn runFrameExec(
         // Loop JIT (KLIO_JIT): a hot loop header compiles to native code; on
         // success the loop runs natively and we resume at its exit block with
         // registers reboxed. Only at a fresh, non-resumed block entry.
-        if (jit_on and resume_idx == 0 and resume_throw == null and resume_unwind == null) {
-            if (jit_loop.maybeRunHot(frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver, field_resolver, field_nn_resolver)) |res| {
+        if (jit_fj != null and resume_idx == 0 and resume_throw == null and resume_unwind == null) {
+            if (jit_loop.maybeRunHotPre(jit_fj.?, frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver, field_resolver, field_nn_resolver)) |res| {
                 if (res.inst == jit_loop.THROW_INST) {
                     // A trampolined call left an error pending: re-raise it. A
                     // throw resumes through the try-stack at the call's block;
