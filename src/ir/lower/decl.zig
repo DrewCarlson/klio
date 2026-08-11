@@ -633,17 +633,6 @@ pub fn reserveMemberHeaders(
     }
 }
 
-/// Compatibility entry point for callers that only need the earlier
-/// member-extension reservation behavior. All member headers are now reserved.
-pub fn reserveMemberExtensionHeaders(
-    module: *Module,
-    c: *const ast.Class,
-    class_fqn: []const u8,
-    class_pkg: []const u8,
-) Allocator.Error!void {
-    return reserveMemberHeaders(module, c, class_fqn, class_pkg);
-}
-
 /// Names captured by the anonymous object whose method is being lowered
 /// (`object : Flow { collect(c) { c.block() } }` where `block` is an
 /// enclosing inline fn's crossinline param). These reach the method

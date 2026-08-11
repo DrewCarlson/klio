@@ -20021,12 +20021,6 @@ fn idGet(comptime T: type, items: []const T, idx: u32) ?*const T {
     return &items[idx];
 }
 
-/// Mutable variant of `idGet`.
-fn idGetMut(comptime T: type, items: []T, idx: u32) ?*T {
-    if (idx >= items.len) return null;
-    return &items[idx];
-}
-
 /// Decide whether a dotted head `head` is a package-qualified global
 /// (flatten the dotted path to a `LoadGlobal`-of-FQN) rather than a member
 /// of an implicit receiver (walk `this`).
