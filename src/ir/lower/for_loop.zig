@@ -56,6 +56,9 @@ pub fn lowerForLabeled(
         var lo_e: ?*const Expr = null;
         var hi_e: ?*const Expr = null;
         var inclusive = false;
+        // `a downTo b`: start at `a`, step -1, inclusive `b` — the same
+        // equality-exit loop with the compare and step reversed.
+        var descending = false;
         switch (iter.*) {
             .Binary => |bin| switch (bin.op) {
                 .Range => {
@@ -71,12 +74,21 @@ pub fn lowerForLabeled(
             },
             .Call => |c| blk: {
                 if (c.is_infix and c.args.len == 2 and c.callee.* == .Path and
-                    c.callee.Path.segments.len == 1 and
-                    std.mem.eql(u8, c.callee.Path.segments[0].name, "until"))
+                    c.callee.Path.segments.len == 1)
                 {
-                    lo_e = &c.args[0];
-                    hi_e = &c.args[1];
-                    break :blk;
+                    const nm = c.callee.Path.segments[0].name;
+                    if (std.mem.eql(u8, nm, "until")) {
+                        lo_e = &c.args[0];
+                        hi_e = &c.args[1];
+                        break :blk;
+                    }
+                    if (std.mem.eql(u8, nm, "downTo")) {
+                        descending = true;
+                        inclusive = true;
+                        lo_e = &c.args[0];
+                        hi_e = &c.args[1];
+                        break :blk;
+                    }
                 }
                 // A call whose STATIC type is a range still counts (below).
             },
@@ -152,7 +164,7 @@ pub fn lowerForLabeled(
         const cond = b.allocReg();
         try b.push(.{ .BinOp = .{
             .dst = cond,
-            .op = if (inclusive) .LessEq else .Less,
+            .op = if (descending) .GreaterEq else if (inclusive) .LessEq else .Less,
             .lhs = i_reg,
             .rhs = hi,
         } });
@@ -184,7 +196,12 @@ pub fn lowerForLabeled(
         }
 
         b.switchTo(incr);
-        try b.push(.{ .BinOp = .{ .dst = i_reg, .op = .Add, .lhs = i_reg, .rhs = one } });
+        try b.push(.{ .BinOp = .{
+            .dst = i_reg,
+            .op = if (descending) .Sub else .Add,
+            .lhs = i_reg,
+            .rhs = one,
+        } });
         b.terminate(.{ .Goto = if (inclusive) body_blk else header });
 
         b.switchTo(exit);
