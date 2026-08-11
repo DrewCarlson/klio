@@ -711,3 +711,38 @@ campaign's start. Measured NEXT lever (recorded, not executed):
 pads the whole union — boxing Range would cut register-file traffic
 ~20% but touches ~140 sites across 10 files. Battery + compose
 (1337/46/0) at baseline throughout.
+
+## Campaign close: leftover sweep, suite evidence, the JIT-mode gap
+
+Sweep: an orphan scan across the lowering/interpreter modules found
+exactly two dead pre-static-dispatch remnants (a zero-caller compat
+wrapper, an unused helper) — removed; every census counter belongs
+to a live mechanism; bisect gates stay. zigcheck now links libc, so
+per-module verification works again (ir 244/244; it had been red
+since before the tier for want of -lc).
+
+Suite evidence: the tier is active under `klio test`'s safe profile
+(JIT is off there, so the tier is the accelerator). The compose
+suite runs 674s tier-on vs 690s tier-off — its wall floor is call
+dispatch and coroutine tails, not scalar loops.
+
+JIT-mode gap, measured end state (best-of, warm, quiet machine):
+
+| shape | JIT-off | JIT-on | gap |
+|-------|---------|--------|-----|
+| counted literal loop 20M | 1.58s | 0.115s | 13x |
+| hoisted-range loop 20M | 1.29s | 0.117s | 10x |
+| downTo loop 20M | 1.55s | 0.115s | 13x |
+| fib(34) | 2.02s | 1.08s | 1.9x |
+
+At the campaign's start the literal loop was 2.49s JIT-off (21x gap),
+the hoisted/downTo shapes ran 33s in BOTH modes, and fib(34) JIT-on
+LOST 2x to its own machinery (4.1s vs 2.0s): the hot probe paid three
+map lookups per block entry, and the native recursion path 0xaa-filled
+1.7KB of safe-build `undefined` stack buffers per call — the fix is a
+zero-initialized per-depth thread-local slot bank plus array-indexed
+per-block probe state. What remains between the modes on loop shapes
+is the boxed-Value interpreter floor: registers are 56B unions
+(Exception/List/Set/Map payloads are 48B inline), and boxing those to
+shrink Value toward 16B is the next measured lever — an
+interpreter-wide refactor, recorded, not started.
