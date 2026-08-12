@@ -1168,12 +1168,20 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // feeding an `R.()` block), so a pair-tailed closure with a `this`
         // capture infers the receiver there; padding the receiver into the
         // `$composer` slot is never right.
-        const compose_recv_infer = !info.receiver_shape_known and
-            host_call_func.composePluginEnabled() and
-            this_cap_idx != null and func.params.len >= 2 and
+        const pair_tailed = host_call_func.composePluginEnabled() and
+            func.params.len >= 2 and
             std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
             std.mem.eql(u8, func.params[func.params.len - 2].name, "$composer");
-        if ((info.has_receiver or compose_recv_infer) and !last_vararg and args.len == info.n_params + 1) {
+        const compose_recv_infer = !info.receiver_shape_known and
+            this_cap_idx != null and pair_tailed;
+        // Receiver-first shapes: the full one (`f(recv, a…)` with every
+        // declared param supplied) and the pair-less composable one
+        // (`content.item(itemScope, i)` against `(index, $composer,
+        // $changed)`) — the recursion below re-enters `callValue` on
+        // `args[1..]`, whose ambient-composer completion supplies the pair.
+        const recv_first_shape = args.len == info.n_params + 1 or
+            (pair_tailed and args.len + 2 == info.n_params + 1);
+        if ((info.has_receiver or compose_recv_infer) and !last_vararg and recv_first_shape) {
             if (runtime.envOnce("KLIO_REBIND_AUDIT") != null) {
                 std.debug.print("[REBIND] fn={s} n_params={d}\n", .{ func.name, info.n_params });
             }

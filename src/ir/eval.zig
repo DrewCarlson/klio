@@ -7596,10 +7596,23 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
         if (constStr(frame.module, cm.name)) |nm| {
             if (std.mem.eql(u8, nm, want)) {
                 const chain = evtls.active_chain;
-                std.debug.print("[cmarm] name={s} in={s} resolved={} chain_len={d} chain_base={d}\n", .{
+                const drecv_tn: []const u8 = if (cm.dispatch_receiver) |reg| blk: {
+                    const dv = frame.read(reg);
+                    if (dv == .Instance) {
+                        const g = dv.Instance.borrow();
+                        const cg = g.get().class.borrow();
+                        const n = cg.get().name;
+                        cg.deinit();
+                        g.deinit();
+                        break :blk n;
+                    }
+                    break :blk @tagName(dv);
+                } else "-";
+                std.debug.print("[cmarm] name={s} in={s} resolved={} dispatch={s} chain_len={d} chain_base={d}\n", .{
                     nm,
                     frame.func.name,
                     cm.resolved != null,
+                    drecv_tn,
                     if (chain) |c| c.items.len else 0,
                     evtls.active_chain_base,
                 });

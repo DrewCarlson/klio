@@ -1695,6 +1695,14 @@ pub fn tryInlineCallWithTypeArgs(
     };
     var any_forwarded_lambda = false;
     var any_literal_lambda = false;
+    // Params already bound by earlier iterations of this loop must not
+    // capture a LATER caller-supplied argument expression that happens to
+    // use the same name: `space.groupNext(0, address)` with a caller local
+    // `address` read 0 (the just-bound param) instead of the local. Kotlin
+    // evaluates supplied arguments in the CALLER's scope; only a
+    // default-filled slot is callee code that sees the earlier params.
+    var bound_param_names: std.ArrayList([]const u8) = .empty;
+    defer bound_param_names.deinit(b.allocator);
     for (f.params, 0..) |*p, i| {
         const a = if (p.is_vararg) vararg_value.? else ordered[i].?;
         const forwarded_lambda = forwardedInlineLambda(b, a);
@@ -1756,7 +1764,22 @@ pub fn tryInlineCallWithTypeArgs(
             const rr = coerced orelse try lowerExpr(b, a);
             try b.popScope();
             break :blk rr;
-        } else coerced orelse try lowerExpr(b, a);
+        } else if (slot_is_default[i]) coerced orelse try lowerExpr(b, a) else blk: {
+            var hidden_params: std.ArrayList(struct { name: []const u8, h: build.HiddenBinding }) = .empty;
+            defer hidden_params.deinit(b.allocator);
+            for (bound_param_names.items) |nm| {
+                if (b.hideBinding(nm)) |h| {
+                    hidden_params.append(b.allocator, .{ .name = nm, .h = h }) catch break;
+                }
+            }
+            const rr = coerced orelse try lowerExpr(b, a);
+            var hi = hidden_params.items.len;
+            while (hi > 0) {
+                hi -= 1;
+                b.restoreHiddenBinding(hidden_params.items[hi].name, hidden_params.items[hi].h);
+            }
+            break :blk rr;
+        };
         if (sib_push) b.restoreExpected(sib_prev);
         b.pending_lambda_arity = -1;
         b.pending_ref_lambda_param_types = null;
@@ -1780,6 +1803,7 @@ pub fn tryInlineCallWithTypeArgs(
         } else {
             try b.bind(p.name.name, r);
         }
+        try bound_param_names.append(b.allocator, p.name.name);
         // A parameter DECLARED by one of the callee's own type parameters
         // (`destination: M`) types nothing inside the body; the ARGUMENT's
         // static type is the instantiation (`LinkedHashMap<K,
