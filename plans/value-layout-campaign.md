@@ -84,7 +84,7 @@ until the last 48-byte payload boxes, so the wins land at stage ends:
 - [x] Stage 3: List — boxed, module tests green
 - [x] Stage 4: Exception — boxed; **Value = 48** (RangeIter at 40 is the new
       ceiling, not the expected 40 — it joins stage 5)
-- [ ] **Stage 4a (OPEN, blocking): GC minor-collection edge.** The full
+- [x] **Stage 4a (FIXED): the empty-singleton GC root marked inner cells, not the box.** The full
       commontest sweep crashes (`kotlin/libraries/stdlib/test/text/StringTest.kt`
       aborts at `zipWithNext` after ~86 earlier tests shape the heap; two
       RangeIteration overflow tests misfire; sweep wall 133s → 1801s under the
@@ -110,19 +110,22 @@ until the last 48-byte payload boxes, so the wins land at stage ends:
         real even if not this crash.
       **Negative result that re-aims the hunt:** minors tracing THROUGH
       tenured cells (`minor_stops_at_tenured=false`, now the default — the
-      `KLIO_GC_MINOR_STOP=1` knob restores the shortcut) still crash. The
-      box is unreachable from EVERY registered root at mark time, so this is
-      a ROOT HOLE, not a remembered-set miss. Safe points fire only at eval
-      block boundaries, so the missed holder is a host-side or runner-side
-      slot alive across a safe point: audit `host_keepalive` coverage
-      (an intrinsic that re-enters eval without `keepalivePush` on a
-      Value it holds in a Zig local), `frame.flat_call` prep state, and the
-      access/enclosing chains pushed by `pushAccessEnclosingSubject` during
-      member dispatch. Note pre-boxing the same hole would sweep the INNER
-      cells of the held Value (items) but the first field read stayed inside
-      the inline payload — boxing made the latent hole crash on the first
-      deref. Repro: 22s (`cp StringTest.kt` to scratch + the bisect argv in
-      scratchpad/bisect.py; crash needs the first ~86 tests' heap shaping,
-      dies in zipWithNext). `KLIO_GC_NOFREE=1` green-lights everything else.
+      `KLIO_GC_MINOR_STOP=1` knob restores the shortcut) still crashed —
+      the decisive negative that re-aimed the hunt at ROOT walkers.
+      `KLIO_GC_STRESS` on the full repro then crashed INSIDE
+      `gcMarkEmptySingletons`: the root shaded `v.List.items` /
+      `v.Set.items` / `v.Map.entries` — the pre-boxing inner cells — and
+      never the BOX, so the first collection swept the three shared-empty
+      singletons' boxes and every later `emptyList()`/`emptySet()`/
+      `emptyMap()` (e.g. `zipWithNext`'s empty early-return) dereferenced a
+      dead payload. Fix: the root marks through `Value.gcMark`. Sweep back
+      to 117/0 at 131s; the RangeIteration misfires and the wall explosion
+      were downstream of the same corruption. LESSON for stage 5: any
+      hand-rolled GC root/marker that reaches into a `Value`'s payload
+      fields must be converted to `v.gcMark(m)` in the same commit that
+      boxes the payload (grep `\.cell.hdr` shades near `Value` fields).
+      The full-trace minor stays the default until the generational
+      shortcut is re-validated under the boxed layout (perf follow-up;
+      sweep shows no regression at 131s).
 - [ ] Stage 5: RangeIter(40)/Range/BoundMethod/MapEntry(32), 24B tail
       (Value → 16)

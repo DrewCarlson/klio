@@ -2437,9 +2437,13 @@ var empty_map_singleton: ?Value = null;
 var empty_singleton_root_registered = std.atomic.Value(bool).init(false);
 
 fn gcMarkEmptySingletons(m: *runtime.gc.Marker) void {
-    if (empty_list_singleton) |v| m.shade(&v.List.items.cell.hdr);
-    if (empty_set_singleton) |v| m.shade(&v.Set.items.cell.hdr);
-    if (empty_map_singleton) |v| m.shade(&v.Map.entries.cell.hdr);
+    // Mark through the Value: the boxed payloads live in their own cells
+    // now, and shading only the items/entries left the BOX unmarked — the
+    // sweep freed it and every later emptyList()/emptySet()/emptyMap()
+    // dereferenced a dead payload pointer.
+    if (empty_list_singleton) |v| v.gcMark(m);
+    if (empty_set_singleton) |v| v.gcMark(m);
+    if (empty_map_singleton) |v| v.gcMark(m);
 }
 
 fn registerEmptySingletonRoot() void {

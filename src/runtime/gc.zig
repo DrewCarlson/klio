@@ -827,6 +827,11 @@ test "minor mark stops at tenured cells; major stamps them" {
         fn trace(_: *GcHeader, _: *Marker) void {}
         fn fin(_: *GcHeader) void {}
     };
+    // The early stop is opt-in while the boxed-payload root hole is hunted;
+    // this test pins the shortcut's behavior under the flag.
+    const prev_stop = minor_stops_at_tenured;
+    minor_stops_at_tenured = true;
+    defer minor_stops_at_tenured = prev_stop;
     var a: GcHeader = .{ .gc_trace = T.trace, .gc_finalize = T.fin, .gc_gen = 1 };
     var minor: Marker = .{ .epoch = 3, .arena = std.testing.allocator, .minor = true };
     defer minor.grey.deinit(std.testing.allocator);
