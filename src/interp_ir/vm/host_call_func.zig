@@ -283,12 +283,12 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
         if (cg.get().get(base)) |c| break :blk Value{ .Class = c.clone() };
         break :blk try host_call_member.syntheticClassFromFqn(allocator, base);
     };
-    const empty_args: Value = .{ .List = .{
+    const empty_args: Value = try Value.newList(allocator, .{
         .items = try ValueList.init(allocator, .empty),
         .mutable = false,
         .enum_entries = false,
         .backing = null,
-    } };
+    });
     var view = VmIntrinsicHost.borrowed(vmhost.SharedHandles.fromHost(self));
     const id = intrinsic_host.allocInstanceId(&view);
     const fields = [_]InstanceData.Field{
@@ -2424,12 +2424,12 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
                                     items.append(allocator, entry.value) catch {};
                                 }
                                 cd.deinit();
-                                return .{ .ok = .{ .List = .{
+                                return .{ .ok = try Value.newList(allocator, .{
                                     .items = try ValueList.init(allocator, items),
                                     .mutable = false,
                                     .enum_entries = true,
                                     .backing = null,
-                                } } };
+                                }) };
                             }
                             // enumValueOf<T>(name)
                             if (args.len > 0 and args[0] == .String) {
@@ -2450,7 +2450,7 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
                                 const msg = try runtime.strInitOwned(allocator, try std.fmt.allocPrint(allocator, "No enum constant {s}.{s}", .{ cd.get().fqn, want }));
                                 sg.deinit();
                                 cd.deinit();
-                                return .{ .err = .{ .Throw = .{ .Exception = .{ .fqn = fqn, .message = .from(msg), .cause = null } } } };
+                                return .{ .err = .{ .Throw = try Value.newException(allocator, .{ .fqn = fqn, .message = .from(msg), .cause = null }) } };
                             }
                         }
                         cd.deinit();

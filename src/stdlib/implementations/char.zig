@@ -421,11 +421,11 @@ fn charDigitRadix(allocator: std.mem.Allocator, args: []const Value) std.mem.All
     const radix: i64 = if (args.len > 1) (args[1].asI64() orelse 10) else 10;
     if (radix < 2 or radix > 36) {
         const msg = try std.fmt.allocPrint(allocator, "radix {d} is not in valid range 2..36", .{radix});
-        return .{ .err = .{ .Thrown = .{ .Exception = .{
+        return .{ .err = .{ .Thrown = try Value.newException(allocator, .{
             .fqn = try runtime.strInit(allocator, "kotlin.IllegalArgumentException"),
             .message = .from(try runtime.strInitOwned(allocator, msg)),
             .cause = null,
-        } } } };
+        }) } };
     }
     return .{ .radix = @intCast(radix) };
 }
@@ -469,11 +469,11 @@ pub fn char_digit_to_int(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         "Char {s} is not a digit in the given radix={d}",
         .{ debug, radix },
     );
-    return .{ .err = .{ .Thrown = .{ .Exception = .{
+    return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
         .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
         .cause = null,
-    } } } };
+    }) } };
 }
 
 pub fn char_digit_to_int_or_null(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -528,11 +528,11 @@ pub fn char_ctor(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             const code = ctx.args[0].asI64() orelse return typeErr("Char requires an Int or UShort code");
             if (code < 0 or code > 0xFFFF) {
                 const msg = try std.fmt.allocPrint(ctx.allocator, "Invalid Char code: {d}", .{code});
-                return .{ .err = .{ .Thrown = .{ .Exception = .{
+                return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
                     .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
                     .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
                     .cause = null,
-                } } } };
+                }) } };
             }
             return ok(.{ .Char = @intCast(code) });
         },
@@ -971,8 +971,7 @@ test "digitToInt throws for a non-digit" {
         defer fg.deinit();
         try testing.expectEqualStrings("kotlin.IllegalArgumentException", fg.get().bytes);
     }
-    exc.message.get().?.deinit();
-    exc.fqn.deinit();
+    runtime.exceptionRefOf(exc).deinit();
 }
 
 test "digitToInt throws for an out-of-range radix" {
@@ -992,8 +991,7 @@ test "digitToInt throws for an out-of-range radix" {
         defer fg.deinit();
         try testing.expectEqualStrings("kotlin.IllegalArgumentException", fg.get().bytes);
     }
-    exc.message.get().?.deinit();
-    exc.fqn.deinit();
+    runtime.exceptionRefOf(exc).deinit();
 }
 
 test "digitToIntOrNull returns null for a non-digit" {

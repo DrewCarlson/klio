@@ -60,11 +60,11 @@ fn makeException(allocator: std.mem.Allocator, fqn: []const u8, message: ?[]cons
         try runtime.strInitOwned(allocator, try allocator.dupe(u8, m))
     else
         null;
-    return .{ .Exception = .{
+    return try Value.newException(allocator, .{
         .fqn = try runtime.strInitOwned(allocator, owned_fqn),
         .message = .from(msg_ref),
         .cause = null,
-    } };
+    });
 }
 
 fn makeList(allocator: std.mem.Allocator, items: []const Value, mutable: bool) !Value {
@@ -74,7 +74,7 @@ fn makeList(allocator: std.mem.Allocator, items: []const Value, mutable: bool) !
         defer g.deinit();
         try g.get().appendSlice(allocator, items);
     }
-    return .{ .List = .{ .items = list, .mutable = mutable, .enum_entries = false, .backing = null } };
+    return try Value.newList(allocator, .{ .items = list, .mutable = mutable, .enum_entries = false, .backing = null });
 }
 
 fn makeSequence(allocator: std.mem.Allocator, items: []const Value) !Value {
@@ -1523,7 +1523,7 @@ pub fn regex_options(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             try items.append(ctx.allocator, v);
         }
     }
-    return ok(.{ .Set = .{ .items = try ValueList.init(ctx.allocator, items), .mutable = false, .backing = null } });
+    return ok(try Value.newSet(ctx.allocator, .{ .items = try ValueList.init(ctx.allocator, items), .mutable = false, .backing = null }));
 }
 
 pub fn regex_pattern(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {

@@ -700,27 +700,27 @@ fn simpleLiteral(allocator: Allocator, e: *const ast.Expr) Allocator.Error!?Valu
 }
 
 fn emptyList(allocator: Allocator, mutable: bool) Allocator.Error!Value {
-    return Value{ .List = .{
+    return try Value.newList(allocator, .{
         .items = try ObjRef(std.ArrayList(Value)).init(allocator, .empty),
         .mutable = mutable,
         .enum_entries = false,
         .backing = null,
-    } };
+    });
 }
 
 fn emptySet(allocator: Allocator, mutable: bool) Allocator.Error!Value {
-    return Value{ .Set = .{
+    return try Value.newSet(allocator, .{
         .items = try ObjRef(std.ArrayList(Value)).init(allocator, .empty),
         .mutable = mutable,
         .backing = null,
-    } };
+    });
 }
 
 fn emptyMap(allocator: Allocator, mutable: bool) Allocator.Error!Value {
-    return Value{ .Map = .{
+    return try Value.newMap(allocator, .{
         .entries = try runtime.MapEntries.init(allocator, .{}),
         .mutable = mutable,
-    } };
+    });
 }
 
 fn defaultValueForPrimary(allocator: Allocator, e: *const ast.Expr) Allocator.Error!?Value {
@@ -1985,11 +1985,11 @@ fn classDefPrimaryParamCount(d: ObjRef(ClassDef)) usize {
 fn throwInstantiation(self: *VmHost, allocator: Allocator, comptime fmt: []const u8, name: []const u8) Allocator.Error!EvalResult {
     _ = self;
     const msg = try std.fmt.allocPrint(allocator, fmt, .{name});
-    return .{ .err = .{ .Throw = .{ .Exception = .{
+    return .{ .err = .{ .Throw = try Value.newException(allocator, .{
         .fqn = try runtime.strInitOwned(allocator, try allocator.dupe(u8, "kotlin.InstantiationError")),
         .message = .from(try runtime.strInitOwned(allocator, msg)),
         .cause = null,
-    } } } };
+    }) } };
 }
 
 /// Interface "construction": `List(size){init}`, SAM conversion, or a
@@ -2010,12 +2010,12 @@ fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cla
                     .err => |e| return .{ .err = e },
                 }
             }
-            return .{ .ok = .{ .List = .{
+            return .{ .ok = try Value.newList(allocator, .{
                 .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
                 .mutable = std.mem.eql(u8, class_name, "MutableList"),
                 .enum_entries = false,
                 .backing = null,
-            } } };
+            }) };
         }
     }
     // SAM conversion: `FunInterface(lambda)`.

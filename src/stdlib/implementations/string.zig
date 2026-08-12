@@ -46,7 +46,7 @@ fn errArity(msg: []const u8) EvalResult {
 fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!Value {
     const fqn_ref = try runtime.strInitOwned(allocator, try allocator.dupe(u8, fqn));
     const msg_ref: ?StringRef = if (message) |m| try runtime.strInit(allocator, m) else null;
-    return .{ .Exception = .{ .fqn = fqn_ref, .message = .from(msg_ref), .cause = null } };
+    return try Value.newException(allocator, .{ .fqn = fqn_ref, .message = .from(msg_ref), .cause = null });
 }
 
 fn thrown(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!EvalResult {
@@ -67,7 +67,7 @@ fn thrownOwned(allocator: Allocator, fqn: []const u8, message: []const u8) Alloc
 fn makeList(allocator: Allocator, items: []Value, mutable: bool) Allocator.Error!Value {
     const list = std.ArrayList(Value).fromOwnedSlice(items);
     const items_ref = try ValueList.init(allocator, list);
-    return .{ .List = .{ .items = items_ref, .mutable = mutable, .enum_entries = false, .backing = null } };
+    return try Value.newList(allocator, .{ .items = items_ref, .mutable = mutable, .enum_entries = false, .backing = null });
 }
 
 /// Build an items-only `Sequence` from an owned slice. Mirrors

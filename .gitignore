@@ -16,3 +16,5 @@ scripts/__pycache__/
 .klio-census-home/
 .klio-census-home2/
 .klio-census-home3/
+.klio/
+.sweep-home/

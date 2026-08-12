@@ -27,7 +27,7 @@ fn ok(v: Value) EvalResult {
 fn makeException(allocator: Allocator, fqn: []const u8, message: []const u8) Allocator.Error!Value {
     const fqn_ref = try runtime.strInitOwned(allocator, try allocator.dupe(u8, fqn));
     const msg_ref: ?StringRef = try runtime.strInit(allocator, message);
-    return .{ .Exception = .{ .fqn = fqn_ref, .message = .from(msg_ref), .cause = null } };
+    return try Value.newException(allocator, .{ .fqn = fqn_ref, .message = .from(msg_ref), .cause = null });
 }
 
 fn thrown(allocator: Allocator, fqn: []const u8, message: []const u8) Allocator.Error!EvalResult {
@@ -95,7 +95,7 @@ pub fn bundle_list(ctx: *CallCtx) Allocator.Error!EvalResult {
         try items.append(a, .{ .String = try runtime.strInit(a, e.mount) });
     }
     const items_ref = try ValueList.init(a, items);
-    return ok(.{ .List = .{ .items = items_ref, .mutable = false, .enum_entries = false, .backing = null } });
+    return ok(try Value.newList(a, .{ .items = items_ref, .mutable = false, .enum_entries = false, .backing = null }));
 }
 
 /// `kotlin.system.exitProcess(status: Int): Nothing` — terminates the

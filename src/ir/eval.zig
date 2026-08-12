@@ -1536,7 +1536,7 @@ fn formatThrowableEnclosed(
 /// `Throwable`-subclass instance.
 pub fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
     switch (v.*) {
-        .Exception => |*e| {
+        .Exception => |e| {
             if (e.stack != null) return;
             if (try captureStack(allocator)) |s| e.stack = s.cell;
         },
@@ -2730,6 +2730,11 @@ const Frame = struct {
     /// member-extension owner). `access` entries are dispatch-transient and
     /// never cross the frame boundary.
     fn activateChain(self: *Frame, seed: []const EnclosingEntry) Allocator.Error!void {
+        if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
+            std.debug.print("[chain] enter tid={d} tls={*} frame={*} caller={*} base={d} fn={s}\n", .{
+                std.Thread.getCurrentId(), self.tls, self, self.tls.active_chain, self.tls.active_chain_base, self.func.name,
+            });
+        }
         for (seed) |e| {
             if (e.kind == .access) continue;
             try self.enclosing_this.append(chainAllocator(), e);
@@ -2762,6 +2767,11 @@ const Frame = struct {
     }
 
     fn activateAs(self: *Frame) void {
+        if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
+            std.debug.print("[chain] act tid={d} tls={*} frame={*} list={*} prev={*} base={d} fn={s}\n", .{
+                std.Thread.getCurrentId(), self.tls, self, &self.enclosing_this, self.tls.active_chain, self.tls.active_chain_base, self.func.name,
+            });
+        }
         self.prev_chain = self.tls.active_chain;
         self.prev_chain_base = self.tls.active_chain_base;
         self.tls.active_chain = &self.enclosing_this;
@@ -2769,6 +2779,11 @@ const Frame = struct {
     }
 
     fn deactivateChain(self: *Frame) void {
+        if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
+            std.debug.print("[chain] deact tid={d} tls={*} frame={*} restore={*} fn={s}\n", .{
+                std.Thread.getCurrentId(), self.tls, self, self.prev_chain, self.func.name,
+            });
+        }
         self.tls.active_chain = self.prev_chain;
         self.tls.active_chain_base = self.prev_chain_base;
     }
@@ -3690,6 +3705,19 @@ pub fn resumeContinuation(
     host: *H,
 ) Allocator.Error!EvalResult {
     var carry = resume_value;
+    // The replay activates and deactivates a rebuilt frame per snapshot;
+    // the per-frame prev-chain captures are only coherent while the replay
+    // runs, and a deactivation cascade could leave the thread's active
+    // chain pointing at a rebuilt frame's list AFTER that frame was torn
+    // down — the next fresh call on this thread then merged its enclosing
+    // chain from freed memory (the cross-thread yield GPF). Pin the
+    // pre-replay chain and restore it on every exit.
+    const saved_chain = evtls.active_chain;
+    const saved_chain_base = evtls.active_chain_base;
+    defer {
+        evtls.active_chain = saved_chain;
+        evtls.active_chain_base = saved_chain_base;
+    }
     // `frames` is innermost-first (the deepest activation snapshots
     // itself first as `Suspended` unwinds). Resume the innermost, then
     // feed its return value to the next-outer frame, and so on. When the
@@ -5061,7 +5089,23 @@ fn runFrameExec(
     // unsynchronized. A migrated frame that kept its origin thread's pointer
     // raced that thread's pool (an intermittent `integer overflow` from the
     // free list's length going negative under concurrent snapshot tests).
-    frame.tls = &evtls;
+    //
+    // A migrated frame's CHAIN activation also happened against the
+    // constructing thread's context: its prev_chain points into that
+    // thread's stack, and deactivating here would transplant the foreign
+    // pointer into THIS thread's active chain — which then outlives the
+    // frame it names, and the next fresh call on this thread merges its
+    // enclosing chain from freed memory (the cross-thread yield GPF).
+    // Re-home the activation: this frame's chain becomes the running
+    // thread's active chain, and its deactivate restores the running
+    // thread's own current chain.
+    if (frame.tls != &evtls) {
+        frame.tls = &evtls;
+        frame.prev_chain = evtls.active_chain;
+        frame.prev_chain_base = evtls.active_chain_base;
+        evtls.active_chain = &frame.enclosing_this;
+        evtls.active_chain_base = frame.enclosing_this.items.len;
+    }
     const ftls: *EvalTls = frame.tls;
     var cur = cur_in;
     var resume_idx = resume_idx_in;
@@ -6212,11 +6256,11 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         .NotNullAssert => |nn| {
             const v = frame.read(nn.src);
             if (v == .Null) {
-                const exc = Value{ .Exception = .{
+                const exc = try Value.newException(allocator, .{
                     .fqn = try runtime.strInit(allocator, "kotlin.NullPointerException"),
                     .message = .{},
                     .cause = null,
-                } };
+                });
                 return raiseStep(frame, .{ .Throw = exc });
             }
             v.retain();
@@ -8227,11 +8271,11 @@ noinline fn execArmCast(comptime H: type, allocator: Allocator, frame: *Frame, c
             std.debug.print("[throw-trace] from fn {s} (fqn={s}): ClassCastException cast to {s} (value tag {s})\n", .{ frame.func.name, frame.func.fqn, cast.ty.name, @tagName(v) });
         }
         const msg = try std.fmt.allocPrint(allocator, "cast to `{s}` failed", .{cast.ty.name});
-        const exc = Value{ .Exception = .{
+        const exc = try Value.newException(allocator, .{
             .fqn = try runtime.strInit(allocator, "kotlin.ClassCastException"),
             .message = .from(try runtime.strInitOwned(allocator, msg)),
             .cause = null,
-        } };
+        });
         return raiseStep(frame, .{ .Throw = exc });
     }
     return .cont;
@@ -8581,12 +8625,12 @@ noinline fn execArmNewList(comptime H: type, allocator: Allocator, frame: *Frame
     // releases them); `readArgRun` handed back borrows of the source
     // registers, so retain each. No-op under the arena fast path.
     if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
-    try frame.write(nl.dst, .{ .List = .{
+    try frame.write(nl.dst, try Value.newList(allocator, .{
         .items = try ValueList.init(allocator, list),
         .mutable = false,
         .enum_entries = false,
         .backing = null,
-    } });
+    }));
     return .cont;
 }
 
@@ -10070,37 +10114,31 @@ inline fn rangeIterFast(allocator: Allocator, recv: *const Value, name: []const 
     const is_next = std.mem.eql(u8, name, "next");
     if (!is_has_next and !is_next) return null;
     const ri = recv.RangeIter;
-    const done = blk: {
-        const dg = ri.done.borrow();
-        defer dg.deinit();
-        break :blk dg.get().*;
+    const snap = blk: {
+        const sg = ri.state.borrow();
+        defer sg.deinit();
+        break :blk sg.get().*;
     };
-    const cur = blk: {
-        const cg = ri.cur.borrow();
-        defer cg.deinit();
-        break :blk cg.get().*;
-    };
-    const more = !done and ri.step != 0 and ri.kind.inBounds(cur, ri.end, ri.step);
+    const cur = snap.cur;
+    const more = !snap.done and ri.step != 0 and ri.kind.inBounds(cur, ri.end, ri.step);
     if (is_has_next) return ok(.{ .Bool = more });
     // next()
     if (!more) {
-        const exc = Value{ .Exception = .{
+        const exc = Value.newException(allocator, .{
             .fqn = runtime.strInit(allocator, "kotlin.NoSuchElementException") catch return null,
-            .message = .from(runtime.strInit(allocator, "iterator exhausted") catch null),
+            .message = if (runtime.strInit(allocator, "iterator exhausted")) |m| .from(m) else |_| .{},
             .cause = null,
-        } };
+        }) catch return null;
         return errResult(.{ .Throw = exc });
     }
     const adv = cur +| ri.step;
+    const sg = ri.state.borrowMut();
     if (cur == ri.end or adv == cur) {
-        const dg = ri.done.borrowMut();
-        dg.get().* = true;
-        dg.deinit();
+        sg.get().done = true;
     } else {
-        const cg = ri.cur.borrowMut();
-        cg.get().* = adv;
-        cg.deinit();
+        sg.get().cur = adv;
     }
+    sg.deinit();
     return ok(rangeElemEval(cur, ri.kind));
 }
 
@@ -10706,11 +10744,11 @@ fn utf16Cmp(left: []const u8, right: []const u8) std.math.Order {
 }
 
 fn arithExc(allocator: Allocator, msg: []const u8) Allocator.Error!EvalError {
-    return .{ .Throw = .{ .Exception = .{
+    return .{ .Throw = try Value.newException(allocator, .{
         .fqn = try runtime.strInit(allocator, "kotlin.ArithmeticException"),
         .message = .from(try runtime.strInit(allocator, msg)),
         .cause = null,
-    } } };
+    }) };
 }
 
 /// Kotlin's defined numeric conversions and operator semantics.

@@ -143,12 +143,12 @@ fn utf16Len(s: []const u8) usize {
 /// Build a frozen `List` value over `items`. `enum_entries` marks the
 /// `EnumName.entries` list. Consumes `items` into the backing cell.
 fn frozenList(allocator: Allocator, items: std.ArrayList(Value), enum_entries: bool) Allocator.Error!Value {
-    return .{ .List = .{
+    return try Value.newList(allocator, .{
         .items = try ValueList.init(allocator, items),
         .mutable = false,
         .enum_entries = enum_entries,
         .backing = null,
-    } };
+    });
 }
 
 /// Run the IR-lowered function `fid` with the receiver bound as the
@@ -903,7 +903,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         if (!declared and vmhost.host_call_member.instanceIsThrowable(self, allocator, inst)) {
             if (vmhost.host_call_member.instanceSuppressedList(inst)) |l| return ok(l);
             const items = try runtime.ValueList.init(allocator, .empty);
-            return ok(.{ .List = .{ .items = items, .mutable = false, .backing = null } });
+            return ok(try Value.newList(allocator, .{ .items = items, .mutable = false, .backing = null }));
         }
     }
     // `e::class.simpleName`/`.qualifiedName` for a builtin exception.
@@ -1538,11 +1538,11 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             .Array => |a| return ok(Value.newInt(@intCast(a.len()))),
             .List => |l| {
                 if (stdlib.implementations.collections.sublistViewStale(receiver)) {
-                    return errRes(.{ .Throw = .{ .Exception = .{
+                    return errRes(.{ .Throw = try Value.newException(allocator, .{
                         .fqn = try runtime.strInit(allocator, "kotlin.ConcurrentModificationException"),
                         .message = .{},
                         .cause = null,
-                    } } });
+                    }) });
                 }
                 return ok(Value.newInt(@intCast(listLen(l.items))));
             },
@@ -3258,11 +3258,11 @@ fn storedNullIsLateinit(inst: ObjRef(InstanceData), name: []const u8) bool {
 
 fn lateinitReadError(allocator: Allocator, name: []const u8) Allocator.Error!EvalResult {
     const m = try std.fmt.allocPrint(allocator, "lateinit property {s} has not been initialized", .{name});
-    return errRes(.{ .Throw = .{ .Exception = .{
+    return errRes(.{ .Throw = try Value.newException(allocator, .{
         .fqn = try runtime.strInit(allocator, "kotlin.UninitializedPropertyAccessException"),
         .message = .from(try runtime.strInitOwned(allocator, m)),
         .cause = null,
-    } } });
+    }) });
 }
 
 fn resolveInstanceGetter(
@@ -3428,11 +3428,11 @@ fn unwrapDelegate(self: *VmHost, allocator: Allocator, d: ObjRef(runtime.Delegat
         .NotNull => |nn| {
             if (nn.value) |x| return ok(x);
             const m = try std.fmt.allocPrint(allocator, "Property {s} should be initialized before get.", .{name});
-            return errRes(.{ .Throw = .{ .Exception = .{
+            return errRes(.{ .Throw = try Value.newException(allocator, .{
                 .fqn = try runtime.strInit(allocator, "kotlin.IllegalStateException"),
                 .message = .from(try runtime.strInitOwned(allocator, m)),
                 .cause = null,
-            } } });
+            }) });
         },
     }
 }
@@ -4338,13 +4338,13 @@ test "collectionLen reports list and string lengths" {
     var list: std.ArrayList(Value) = .empty;
     try list.append(a, .{ .Int = 1 });
     try list.append(a, .{ .Int = 2 });
-    const lv = Value{ .List = .{
+    const lv = try Value.newList(a, .{
         .items = try ValueList.init(a, list),
         .mutable = false,
         .enum_entries = false,
         .backing = null,
-    } };
-    defer lv.List.items.deinit();
+    });
+    defer runtime.listRefOf(lv.List).deinit();
     try testing.expectEqual(@as(i64, 2), collectionLen(&lv).?);
 
     const s = try runtime.strInit(a, "hello");

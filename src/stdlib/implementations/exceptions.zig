@@ -31,14 +31,14 @@ fn typeErr(msg: []const u8) EvalResult {
 /// handles allocated from `allocator`. Re-exported for sibling intrinsic
 /// modules.
 pub fn makeException(allocator: std.mem.Allocator, fqn: []const u8, message: ?[]const u8) std.mem.Allocator.Error!Value {
-    return .{ .Exception = .{
+    return try Value.newException(allocator, .{
         .fqn = try runtime.strInit(allocator, fqn),
         .message = .from(if (message) |m| try runtime.strInit(allocator, m) else null),
         .cause = null,
         // A shared suppressed list so `addSuppressed` (e.g. from `use`'s
         // close-while-failing path) records onto this throwable.
         .suppressed = (try ValueList.init(allocator, .empty)).cell,
-    } };
+    });
 }
 
 /// Throwable accepts up to two arguments:
@@ -79,7 +79,7 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
         }
     }
 
-    return ok(.{ .Exception = .{
+    return ok(try Value.newException(ctx.allocator, .{
         .fqn = try runtime.strInit(ctx.allocator, fqn),
         .message = .from(message),
         .cause = if (cause) |c| c.cell else null,
@@ -87,7 +87,7 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
         // A shared list so `addSuppressed` on any value-copy is observed by
         // `suppressedExceptions` on every other copy of this throwable.
         .suppressed = (try ValueList.init(ctx.allocator, .empty)).cell,
-    } });
+    }));
 }
 
 /// `Value::Null => None`, `Value::String(s) => Some(text)`,
@@ -166,13 +166,13 @@ pub fn excn_cancellation(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
         cause.retain();
         const cbox = try Value.boxRef(a, cause);
-        return ok(.{ .Exception = .{
+        return ok(try Value.newException(ctx.allocator, .{
             .fqn = try runtime.strInit(a, fqn),
             .message = .from(message),
             .cause = cbox.cell,
             .identity = ctx.host.allocInstanceId(),
             .suppressed = (try ValueList.init(a, .empty)).cell,
-        } });
+        }));
     }
     return buildException(ctx, fqn);
 }
@@ -237,7 +237,7 @@ pub fn throwable_add_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResul
                 if (l == .List) break :blk l;
             }
             const items = try ValueList.init(ctx.allocator, .empty);
-            const fresh = Value{ .List = .{ .items = items, .mutable = true, .enum_entries = false, .backing = null } };
+            const fresh = try Value.newList(ctx.allocator, .{ .items = items, .mutable = true, .enum_entries = false, .backing = null });
             const g = inst.borrowMut();
             defer g.deinit();
             try g.get().define(ctx.allocator, "__suppressed__", fresh);
@@ -256,7 +256,7 @@ pub fn throwable_add_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResul
 pub fn throwable_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len >= 1 and ctx.args[0] == .Exception) {
         if (ctx.args[0].Exception.suppressed) |sl_cell| {
-            return ok(makeList((ValueList{ .cell = sl_cell }).clone(), false));
+            return ok(try makeList((ValueList{ .cell = sl_cell }).clone(), false));
         }
     }
     if (ctx.args.len >= 1 and ctx.args[0] == .Instance) {
@@ -264,11 +264,11 @@ pub fn throwable_suppressed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const g = inst.borrow();
         defer g.deinit();
         if (g.get().get("__suppressed__")) |l| {
-            if (l == .List) return ok(makeList(l.List.items.clone(), false));
+            if (l == .List) return ok(try makeList(l.List.items.clone(), false));
         }
     }
     const items = try ValueList.init(ctx.allocator, .empty);
-    return ok(makeList(items, false));
+    return ok(try makeList(items, false));
 }
 
 pub fn throwable_cause(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -284,13 +284,13 @@ pub fn throwable_cause(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.Null);
 }
 
-fn makeList(items: ValueList, mutable: bool) Value {
-    return .{ .List = .{
+fn makeList(items: ValueList, mutable: bool) std.mem.Allocator.Error!Value {
+    return try Value.newList(items.cell.allocator, .{
         .items = items,
         .mutable = mutable,
         .enum_entries = false,
         .backing = null,
-    } };
+    });
 }
 
 // ============================================================
@@ -314,18 +314,13 @@ fn noopCtx(args: []const Value) CallCtx {
 }
 
 fn freeException(exc: anytype) void {
-    exc.fqn.deinit();
-    if (exc.message.get()) |m| m.deinit();
-    if (exc.cause) |c| (ValueBox{ .cell = c }).deinit();
-    if (exc.suppressed) |s| (ValueList{ .cell = s }).deinit();
+    runtime.exceptionRefOf(exc).deinit();
 }
 
-/// Free the handles a `makeException` result owns in a test — its `fqn`,
-/// optional `message`, and the eagerly-allocated `suppressed` list.
+/// Drop a `makeException` result in a test: releasing the box tears down
+/// its `fqn`, optional `message`, cause, stack, and suppressed list.
 fn freeMade(v: Value) void {
-    v.Exception.fqn.deinit();
-    if (v.Exception.message.get()) |m| m.deinit();
-    if (v.Exception.suppressed) |s| (ValueList{ .cell = s }).deinit();
+    runtime.exceptionRefOf(v.Exception).deinit();
 }
 
 test "build exception with no arguments" {
@@ -537,7 +532,7 @@ test "suppressed returns an empty list" {
     try testing.expect(r == .ok);
     try testing.expect(r.ok == .List);
     // The ObjRef's last `deinit` frees the inner ArrayList.
-    defer r.ok.List.items.deinit();
+    defer runtime.listRefOf(r.ok.List).deinit();
     const g = r.ok.List.items.borrow();
     defer g.deinit();
     try testing.expectEqual(@as(usize, 0), g.get().items.len);
@@ -547,15 +542,12 @@ test "suppressed returns an empty list" {
 test "cause accessor returns the cause value" {
     const cause = try makeException(testing.allocator, "kotlin.IllegalStateException", null);
     const cause_box = try Value.boxRef(testing.allocator, cause);
-    const outer = Value{ .Exception = .{
+    const outer = try Value.newException(testing.allocator, .{
         .fqn = try runtime.strInit(testing.allocator, "kotlin.RuntimeException"),
         .message = .{},
         .cause = cause_box.cell,
-    } };
-    defer {
-        outer.Exception.fqn.deinit();
-        (ValueBox{ .cell = outer.Exception.cause.? }).deinit();
-    }
+    });
+    defer outer.release(testing.allocator);
     const args = [_]Value{outer};
     var ctx = noopCtx(&args);
     const r = try throwable_cause(&ctx);

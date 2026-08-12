@@ -352,12 +352,12 @@ fn decodeField(
                     .err => |er| return .{ .err = er },
                 }
             }
-            return .{ .ok = .{ .List = .{
+            return .{ .ok = try Value.newList(a, .{
                 .items = try ValueList.init(a, items),
                 .mutable = false,
                 .enum_entries = false,
                 .backing = null,
-            } } };
+            }) };
         },
         .object => |map| {
             if (ty) |t| {
@@ -399,10 +399,10 @@ fn decodeMap(map: JsonObjectMap, val_shape: ?*const TypeShape, ctx: *CallCtx) Er
             .value = v,
         });
     }
-    return .{ .ok = .{ .Map = .{
+    return .{ .ok = try Value.newMap(a, .{
         .entries = try MapEntries.init(a, .{ .pairs = entries }),
         .mutable = false,
-    } } };
+    }) };
 }
 
 /// Decode a JSON number into the klio kind named by `ty`, or the natural
@@ -561,12 +561,12 @@ fn ctorParamNames(ctx: *CallCtx) Error!EvalResult {
         if (p.property == null) continue;
         try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, p.name)) });
     }
-    return ok(.{ .List = .{
+    return ok(try Value.newList(a, .{
         .items = try ValueList.init(a, items),
         .mutable = false,
         .enum_entries = false,
         .backing = null,
-    } });
+    }));
 }
 
 /// Read property `name` off instance `obj`. Routes through
@@ -750,12 +750,12 @@ test "valueToJson encodes scalars and collections" {
         var items: std.ArrayList(Value) = .empty;
         try items.append(a, .{ .Int = 1 });
         try items.append(a, .{ .Int = 2 });
-        const v = Value{ .List = .{
+        const v = try Value.newList(a, .{
             .items = try ValueList.init(a, items),
             .mutable = false,
             .enum_entries = false,
             .backing = null,
-        } };
+        });
         const r = try valueToJson(&v, &ctx, a);
         try testing.expect(r.ok == .array);
         try testing.expectEqual(@as(usize, 2), r.ok.array.items.len);
@@ -776,10 +776,10 @@ test "jsonEncode emits compact and pretty JSON for a map" {
         .key = .{ .String = try runtime.strInit(a, "a") },
         .value = .{ .Int = 1 },
     });
-    const map = Value{ .Map = .{
+    const map = try Value.newMap(a, .{
         .entries = try MapEntries.init(a, .{ .pairs = entries }),
         .mutable = false,
-    } };
+    });
 
     {
         const args = [_]Value{map};

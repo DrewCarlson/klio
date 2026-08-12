@@ -48,11 +48,11 @@ fn errResult(e: RuntimeError) EvalResult {
 /// `make_exception(fqn, message)` — build a thrown Kotlin Throwable value.
 /// `fqn` is a static slice; `message`, when present, is owned by `allocator`.
 fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!Value {
-    return .{ .Exception = .{
+    return try Value.newException(allocator, .{
         .fqn = try runtime.strInit(allocator, fqn),
         .message = .from(if (message) |m| try runtime.strInit(allocator, m) else null),
         .cause = null,
-    } };
+    });
 }
 
 /// `RuntimeError::Thrown(make_exception(...))` as an `EvalResult` error.
@@ -1142,12 +1142,7 @@ fn freeSb(v: Value, a: Allocator) void {
         .String => |s| {
             s.deinit();
         },
-        .Exception => |e| {
-            e.fqn.deinit();
-            if (e.message.get()) |m| {
-                m.deinit();
-            }
-        },
+        .Exception => |e| runtime.exceptionRefOf(e).deinit(),
         else => {},
     }
 }

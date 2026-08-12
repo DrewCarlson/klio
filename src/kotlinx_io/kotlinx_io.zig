@@ -121,11 +121,11 @@ fn bytesValue(ctx: *CallCtx, bytes: []const u8) std.mem.Allocator.Error!Value {
 // A thrown `kotlinx.io.IOException` the Kotlin `try/catch` can catch.
 fn ioError(ctx: *CallCtx, comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error!EvalResult {
     const msg = try std.fmt.allocPrint(ctx.allocator, fmt, args);
-    return .{ .err = .{ .Thrown = .{ .Exception = .{
+    return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlinx.io.IOException"),
         .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
         .cause = null,
-    } } } };
+    }) } };
 }
 
 fn fsReadAllBytes(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -324,12 +324,12 @@ fn fsList(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const owned = try ctx.allocator.dupe(u8, entry.name);
         try names.append(ctx.allocator, .{ .String = try runtime.strInitOwned(ctx.allocator, owned) });
     }
-    return ok(.{ .List = .{
+    return ok(try Value.newList(ctx.allocator, .{
         .items = try ValueList.init(ctx.allocator, names),
         .mutable = false,
         .enum_entries = false,
         .backing = null,
-    } });
+    }));
 }
 
 fn fsTempDir(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -459,17 +459,9 @@ fn freeValue(v: Value) void {
     switch (v) {
         .String => |s| freeString(s),
         .Array => |a| a.deinitStorage(),
-        .List => |l| {
-            const g = l.items.borrow();
-            for (g.get().items) |e| freeValue(e);
-            g.deinit();
-            l.items.deinit();
-        },
-        .Exception => |e| {
-            // The fqn is a string literal (not heap); only the message is.
-            e.fqn.deinit();
-            if (e.message.get()) |m| freeString(m);
-        },
+        // Boxed payloads: the box teardown releases elements and handles.
+        .List => |l| runtime.listRefOf(l).deinit(),
+        .Exception => |e| runtime.exceptionRefOf(e).deinit(),
         else => {},
     }
 }

@@ -1773,12 +1773,12 @@ pub fn builderStep(self: *VmIntrinsicHost, state: runtime.BuilderStateRef, out: 
     // The block already threw out of an earlier pull; a failed iterator
     // rejects every later pull, matching `SequenceBuilderIterator`.
     if (failed) {
-        return .{ .err = .{ .Thrown = .{ .Exception = .{
+        return .{ .err = .{ .Thrown = try Value.newException(a, .{
             .fqn = try runtime.strInit(a, "kotlin.IllegalStateException"),
             .message = .from(try runtime.strInit(a, "Iterator has failed.")),
             .cause = null,
             .suppressed = (try runtime.ValueList.init(a, .empty)).cell,
-        } } } };
+        }) } };
     }
     if (done) return .done;
 

@@ -57,7 +57,7 @@ fn makeList(allocator: std.mem.Allocator, items: []Value, mutable: bool) std.mem
     var list: std.ArrayList(Value) = .empty;
     try list.appendSlice(allocator, items);
     const ref = try ValueList.init(allocator, list);
-    return .{ .List = .{ .items = ref, .mutable = mutable, .enum_entries = false, .backing = null } };
+    return try Value.newList(allocator, .{ .items = ref, .mutable = mutable, .enum_entries = false, .backing = null });
 }
 
 fn makeSet(allocator: std.mem.Allocator, items: []Value, mutable: bool) std.mem.Allocator.Error!Value {
@@ -73,7 +73,7 @@ fn makeSet(allocator: std.mem.Allocator, items: []Value, mutable: bool) std.mem.
         if (!seen) try deduped.append(allocator, v);
     }
     const ref = try ValueList.init(allocator, deduped);
-    return .{ .Set = .{ .items = ref, .mutable = mutable, .backing = null } };
+    return try Value.newSet(allocator, .{ .items = ref, .mutable = mutable, .backing = null });
 }
 
 fn recvListItems(args: []const Value, what: []const u8) union(enum) { items: ValueList, err: RuntimeError } {
@@ -1481,7 +1481,7 @@ fn cloneSlice(allocator: std.mem.Allocator, ref: ValueSlice) std.mem.Allocator.E
 fn noSuchElement(allocator: std.mem.Allocator, message: []const u8) std.mem.Allocator.Error!RuntimeError {
     const fqn = try runtime.strInit(allocator, "kotlin.NoSuchElementException");
     const msg = try runtime.strInit(allocator, message);
-    return .{ .Thrown = .{ .Exception = .{ .fqn = fqn, .message = .from(msg), .cause = null } } };
+    return .{ .Thrown = try Value.newException(allocator, .{ .fqn = fqn, .message = .from(msg), .cause = null }) };
 }
 
 // ----- comparison / sort (faithful `compare_values`) -----

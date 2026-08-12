@@ -93,11 +93,11 @@ fn arityErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Alloc
 /// `message`, when present, must be allocator-owned for the program
 /// lifetime (the arena).
 fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!Value {
-    return .{ .Exception = .{
+    return try Value.newException(allocator, .{
         .fqn = try runtime.strInit(allocator, fqn),
         .message = .from(if (message) |m| try runtime.strInit(allocator, m) else null),
         .cause = null,
-    } };
+    });
 }
 
 /// Kotlin's `compareTo` total order over floating values. NaN sorts as the

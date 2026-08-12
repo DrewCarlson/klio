@@ -1130,7 +1130,7 @@ test "decode_response accepts an Int status and a List backing" {
     try items.append(a, .{ .Int = 404 });
     try items.append(a, .{ .String = try runtime.strInit(a, "text/plain") });
     try items.append(a, .{ .String = try runtime.strInit(a, "nope") });
-    const list = Value{ .List = .{ .items = try ValueList.init(a, items), .mutable = false, .enum_entries = false, .backing = null } };
+    const list = try Value.newList(a, .{ .items = try ValueList.init(a, items), .mutable = false, .enum_entries = false, .backing = null });
     const d = try decode_response(a, &list);
     try testing.expectEqual(@as(i64, 404), d.status);
     try testing.expectEqualStrings("text/plain", d.content_type);

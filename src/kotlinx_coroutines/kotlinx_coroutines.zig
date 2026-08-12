@@ -299,19 +299,19 @@ const BUFFERED_CHANNEL_FQN = "kotlinx.coroutines.channels.KlioBufferedChannel";
 const CONFLATED_CHANNEL_FQN = "kotlinx.coroutines.channels.KlioConflatedBufferedChannel";
 
 fn channelIllegalArgument(ctx: *CallCtx, message: []const u8) std.mem.Allocator.Error!EvalResult {
-    return .{ .err = .{ .Thrown = .{ .Exception = .{
+    return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
         .message = .from(try runtime.strInit(ctx.allocator, message)),
         .cause = null,
-    } } } };
+    }) } };
 }
 
 fn channelIllegalState(ctx: *CallCtx, message: []const u8) std.mem.Allocator.Error!EvalResult {
-    return .{ .err = .{ .Thrown = .{ .Exception = .{
+    return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalStateException"),
         .message = .from(try runtime.strInit(ctx.allocator, message)),
         .cause = null,
-    } } } };
+    }) } };
 }
 
 fn channelCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -787,11 +787,11 @@ fn removeWaiterBySlot(state: *ChannelState, slot: i64) bool {
 }
 
 fn cancellationExc(allocator: std.mem.Allocator) std.mem.Allocator.Error!Value {
-    return .{ .Exception = .{
+    return try Value.newException(allocator, .{
         .fqn = try runtime.strInit(allocator, "kotlinx.coroutines.JobCancellationException"),
         .message = .from(try runtime.strInit(allocator, "Job was cancelled")),
         .cause = null,
-    } };
+    });
 }
 
 /// Offer `value` (a value the channel can deliver now) to the registered
@@ -1317,11 +1317,11 @@ fn channelCancel(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0) return .{ .err = .{ .Arity = "Channel.cancel expects a receiver" } };
     if (ctx.args.len > 1 and ctx.args[1] != .Null) return channelCloseImpl(ctx, true);
 
-    const cause = Value{ .Exception = .{
+    const cause = try Value.newException(ctx.allocator, .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlinx.coroutines.CancellationException"),
         .message = .from(try runtime.strInit(ctx.allocator, "Channel was cancelled")),
         .cause = null,
-    } };
+    });
     defer if (runtime.reclaimEnabled()) cause.release(ctx.allocator);
     const args = [_]Value{ ctx.args[0], cause };
     var forwarded = ctx.*;
@@ -1769,11 +1769,11 @@ fn channelIterNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         },
         .closed_ready => try setIteratorNextState(inst, .needs_has_next),
     }
-    return .{ .err = .{ .Thrown = .{ .Exception = .{
+    return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.NoSuchElementException"),
         .message = .from(try runtime.strInit(ctx.allocator, "ChannelIterator.next called before hasNext")),
         .cause = null,
-    } } } };
+    }) } };
 }
 
 fn channelIsEmpty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -1790,19 +1790,19 @@ fn channelIsEmpty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 fn closedReceiveExc(allocator: std.mem.Allocator) std.mem.Allocator.Error!Value {
-    return .{ .Exception = .{
+    return try Value.newException(allocator, .{
         .fqn = try runtime.strInit(allocator, "kotlinx.coroutines.channels.ClosedReceiveChannelException"),
         .message = .from(try runtime.strInit(allocator, "Channel was closed")),
         .cause = null,
-    } };
+    });
 }
 
 fn closedSendExc(allocator: std.mem.Allocator) std.mem.Allocator.Error!Value {
-    return .{ .Exception = .{
+    return try Value.newException(allocator, .{
         .fqn = try runtime.strInit(allocator, "kotlinx.coroutines.channels.ClosedSendChannelException"),
         .message = .from(try runtime.strInit(allocator, "Channel was closed")),
         .cause = null,
-    } };
+    });
 }
 
 fn channelCloseException(allocator: std.mem.Allocator, cause: Value, receive: bool) std.mem.Allocator.Error!Value {
@@ -2647,11 +2647,11 @@ test "native channel cancellation discards buffered values and preserves its cau
         var ctx = makeCtx(&host, &cap, &args);
         try testing.expect((try channelSend(&ctx)) == .ok);
     }
-    const cause = Value{ .Exception = .{
+    const cause = try Value.newException(a, .{
         .fqn = try runtime.strInit(a, "test.Cancellation"),
         .message = .{},
         .cause = null,
-    } };
+    });
     {
         const args = [_]Value{ recv, cause };
         var ctx = makeCtx(&host, &cap, &args);

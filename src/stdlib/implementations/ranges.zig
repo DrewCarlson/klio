@@ -77,11 +77,11 @@ pub fn ranges_step(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const n = ctx.args[1].asI64().?;
         if (n <= 0) {
             const msg = try std.fmt.allocPrint(ctx.allocator, "Step must be positive, was: {d}.", .{n});
-            return .{ .err = .{ .Thrown = .{ .Exception = .{
+            return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
                 .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
                 .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
                 .cause = null,
-            } } } };
+            }) } };
         }
         const signed = if (r.step < 0) -n else n;
         const normalized_end = normalizeProgressionEnd(r.start, r.end, signed, r.kind);
@@ -233,11 +233,11 @@ fn rangeViewEmpty(view: RangeView) bool {
 }
 
 fn throwNoSuchElement(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    return .{ .err = .{ .Thrown = .{ .Exception = .{
+    return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.NoSuchElementException"),
         .message = .{},
         .cause = null,
-    } } } };
+    }) } };
 }
 
 /// `IntProgression.first()` / `last()` (the iterable extensions, not the
@@ -297,11 +297,11 @@ fn rangeKindMax(kind: RangeKind) i64 {
 pub fn range_end_exclusive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "endExclusive") orelse return typeErr("endExclusive requires a Range receiver");
     if (view.end == rangeKindMax(view.kind)) {
-        return .{ .err = .{ .Thrown = .{ .Exception = .{
+        return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
             .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalStateException"),
             .message = .from(try runtime.strInitOwned(ctx.allocator, try ctx.allocator.dupe(u8, "Cannot return the exclusive upper bound of a range that includes MAX_VALUE."))),
             .cause = null,
-        } } } };
+        }) } };
     }
     return ok(rangeEndpoint(view.kind, view.end + 1));
 }
@@ -370,7 +370,7 @@ pub fn range_to_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             try g.get().append(ctx.allocator, rangeEndpoint(view.kind, v));
         }
     }
-    return ok(makeList(items, false));
+    return ok(try makeList(items, false));
 }
 
 // The element count is a Kotlin Int; range sizes never exceed i64::MAX.
@@ -404,13 +404,13 @@ pub fn range_sum(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 // Local helpers.
 // ============================================================
 
-fn makeList(items: ValueList, mutable: bool) Value {
-    return .{ .List = .{
+fn makeList(items: ValueList, mutable: bool) std.mem.Allocator.Error!Value {
+    return try Value.newList(items.cell.allocator, .{
         .items = items,
         .mutable = mutable,
         .enum_entries = false,
         .backing = null,
-    } };
+    });
 }
 
 /// Lazy iterator over an inclusive integer progression with a signed step.
@@ -562,8 +562,7 @@ test "step throws on non-positive step" {
         defer fg.deinit();
         try testing.expectEqualStrings("kotlin.IllegalArgumentException", fg.get().bytes);
     }
-    exc.message.get().?.deinit();
-    exc.fqn.deinit();
+    runtime.exceptionRefOf(exc).deinit();
 }
 
 test "first and last read range endpoints" {
@@ -645,7 +644,7 @@ test "to list enumerates elements" {
     const r = try range_to_list(&ctx);
     try testing.expect(r == .ok);
     // The ObjRef owns the backing ArrayList and frees it on the final drop.
-    defer r.ok.List.items.deinit();
+    defer runtime.listRefOf(r.ok.List).deinit();
     const g = r.ok.List.items.borrow();
     defer g.deinit();
     const items = g.get().items;
