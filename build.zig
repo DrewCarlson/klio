@@ -599,6 +599,27 @@ pub fn build(b: *std.Build) void {
     if (android_ndk) |ndk| wireAndroidNdk(b, exe.root_module, ndk);
     b.installArtifact(exe);
 
+    // The C-ABI runtime library the C transpiler's output links against
+    // (plans/c-transpiler-plan.md stage 1): `zig build klio-rt` installs
+    // lib/libklio_rt.a + include/klio_rt.h.
+    const rt_lib = b.addLibrary(.{
+        .name = "klio_rt",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/klio_rt/klio_rt.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "cli", .module = mods.get("cli").? },
+                .{ .name = "runtime", .module = mods.get("runtime").? },
+            },
+        }),
+    });
+    const rt_step = b.step("klio-rt", "Build + install the C-ABI runtime static library");
+    rt_step.dependOn(&b.addInstallArtifact(rt_lib, .{}).step);
+    rt_step.dependOn(&b.addInstallHeaderFile(b.path("include/klio_rt.h"), "klio_rt.h").step);
+
     // Build + install the Compose-UI Skia backend as a shared library the
     // compose_ui module dlopens at runtime. Built with system g++ (libstdc++
     // ABI); the resulting .so is self-contained (static Skia + deps linked in).

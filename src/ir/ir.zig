@@ -25,6 +25,7 @@ pub const FileId = span.FileId;
 /// alongside the type definitions in this file.
 pub const build = @import("build.zig");
 pub const eval = @import("eval.zig");
+pub const bc = @import("bc.zig");
 pub const lower = @import("lower.zig");
 pub const jit_loop = @import("jit_loop.zig");
 pub const disasm = @import("disasm.zig");
@@ -3204,6 +3205,20 @@ pub const Module = struct {
             return .unknown;
         }
         if (param.args.len != 0) {
+            // Builtin hierarchy with matching arguments: a
+            // `MutableList<Int>` receiver satisfies a `List<Int>` bound
+            // through the table below, and equal args need no variance
+            // reasoning. Without this the non-star fallthrough returned
+            // `.unknown`, which refuted lexical local extensions on
+            // declared builtin receivers (`val l = mutableListOf<Int>()`
+            // then `fun List<Int>.f()` never bound).
+            if (self.staticBuiltinIdentity(receiver, actual) == .yes and
+                staticBuiltinArgsNonRefuting(receiver.args, param.args))
+            {
+                for (applicability.builtinSupersOf(actual)) |candidate| {
+                    if (std.mem.eql(u8, candidate, declared)) return .compatible;
+                }
+            }
             // All-star arguments prove and refute nothing (the star-erasure
             // convention): `List<String>` against `Collection<*>`
             // adjudicates by HEAD alone below.
@@ -3448,6 +3463,13 @@ pub const Module = struct {
             const actual_args = overrideArgs(actual);
             const declared_args = overrideArgs(declared);
             if (declared_args.len == 0) return true;
+            // An argless actual on the SAME classifier is an erased
+            // derivation (`mutableListOf<Int>()` derives `MutableList`
+            // with the call-site argument dropped), not proof of a
+            // different instantiation — unknown arguments must not
+            // disprove, per this judgment's own convention for
+            // statically unresolvable evidence.
+            if (actual_args.len == 0) return true;
             if (actual_args.len != declared_args.len) return false;
             const class = if (declared_id) |id|
                 (if (id.int() < self.classes.items.len) &self.classes.items[id.int()] else null)
@@ -3494,6 +3516,22 @@ pub const Module = struct {
                 if (!fits) return false;
             }
             return true;
+        }
+
+        // The builtin collection hierarchy adjudicates before the module
+        // class walk: the stdlib pack's List/MutableList classes carry
+        // ids whose `classIdIsOrExtends` rows do not encode the builtin
+        // subinterface edges, so the walk below refuted
+        // `MutableList <: List<Int>` and dropped lexical local
+        // extensions on declared builtin receivers. Equal arguments need
+        // no variance reasoning; an argless actual is an erased
+        // derivation and must not disprove.
+        if (self.staticBuiltinIdentity(actual, actual_head) == .yes and
+            staticBuiltinArgsNonRefuting(overrideArgs(actual), overrideArgs(declared)))
+        {
+            for (applicability.builtinSupersOf(actual_head)) |candidate| {
+                if (std.mem.eql(u8, candidate, declared_head)) return true;
+            }
         }
 
         if (actual_id) |sub_id| {
@@ -3557,6 +3595,26 @@ pub const Module = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         return self.staticTypeIsSubtypeInner(arena.allocator(), actual, declared, &.{}, 0);
+    }
+
+    /// Whether the builtin-hierarchy escapes may adjudicate by HEAD:
+    /// every actual argument equals its declared counterpart, or is a
+    /// bare unresolved type parameter (`MutableList<T>` — a factory
+    /// return the deriver did not substitute; per the judgment's
+    /// convention, statically unresolvable evidence must not disprove),
+    /// or the actual is an erased argless derivation.
+    fn staticBuiltinArgsNonRefuting(actual_args: []const TypeRef, declared_args: []const TypeRef) bool {
+        if (actual_args.len == 0) return true;
+        if (actual_args.len != declared_args.len) return false;
+        for (actual_args, declared_args) |a, d| {
+            if (a.eql(d)) continue;
+            const h = staticTypeHead(a.name);
+            const bare_param = h.len >= 1 and h.len <= 2 and
+                std.ascii.isUpper(h[0]) and a.args.len == 0 and
+                std.mem.indexOfScalar(u8, a.name, '.') == null;
+            if (!bare_param) return false;
+        }
+        return true;
     }
 
     pub fn staticTypeIsSubtypeWithBounds(

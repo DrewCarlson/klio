@@ -19479,20 +19479,26 @@ fn localOverloadReceiverCouldApply(
         }
     }
     if (overload.receiver_has_type_params) {
-        return b.module.staticGenericReceiverCouldApply(
+        const r = try b.module.staticGenericReceiverCouldApply(
             b.allocator,
             actual,
             declared,
             overload.type_params,
             actual_bounds,
         );
+        if (runtime.envOnce("KLIO_ADM_TRACE") != null)
+            std.debug.print("[lorca-g] actual={s}({d}) declared={s}({d}) tps={d} -> {}\n", .{ actual.name, actual.args.len, declared.name, declared.args.len, overload.type_params.len, r });
+        return r;
     }
-    return b.module.staticTypeIsSubtypeWithBounds(
+    const r = try b.module.staticTypeIsSubtypeWithBounds(
         b.allocator,
         actual,
         declared,
         actual_bounds,
     );
+    if (runtime.envOnce("KLIO_ADM_TRACE") != null)
+        std.debug.print("[lorca-s] actual={s}({d}) n={} declared={s}({d}) n={} bounds={d} -> {}\n", .{ actual.name, actual.args.len, actual.nullable, declared.name, declared.args.len, declared.nullable, actual_bounds.len, r });
+    return r;
 }
 
 fn localExtensionReceiverCouldApply(
