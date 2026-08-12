@@ -232,6 +232,7 @@ variables override individual fields on top of it.
 | `KLIO_JIT` | `1` on, `0` off | Loop-tier JIT override on top of the profile (on by default under `fast`) | none |
 | `KLIO_BC` | `0` off (default on) | The bytecode tier: dense per-block u32 op streams replacing the walker's union dispatch for the hot simple ops; `0` restores the pure tree walker for bisection | none |
 | `KLIO_COUNTED` | `0` off (default on) | Counted-range for-loop strength reduction (`for (i in a until b)` as a register loop); `0` restores the iterator lowering for bisection | none |
+| `KLIO_CM_TRACE` | `<member name>` | At every CallMember execution of that name: the executing frame, whether lowering resolved it, and the full enclosing-`this` chain with entry kinds — the receiver-visibility debugger for member-extension dispatch | `[cmarm]` |
 | `KLIO_FUNC_JIT` | `1` on, `0` off | Whole-function JIT override; turning it on also forces the loop tier on | none |
 | `KLIO_JIT_DEBUG` | set; `0`/empty off | Per-decision JIT tracing: compile, bail, inline, evict | `[jit]` |
 | `KLIO_RECLAIM` | `gc`, `arena`, `smp`/`free`/`1`, `debug`, `0` | Memory backend override (and whether refcount teardown is active); the profile default is the tracing GC | none |

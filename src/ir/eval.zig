@@ -7557,6 +7557,34 @@ noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *F
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Frame, cm: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(cm.receiver);
+    if (std.c.getenv("KLIO_CM_TRACE")) |w0| {
+        const want = std.mem.span(w0);
+        if (constStr(frame.module, cm.name)) |nm| {
+            if (std.mem.eql(u8, nm, want)) {
+                const chain = evtls.active_chain;
+                std.debug.print("[cmarm] name={s} in={s} resolved={} chain_len={d} chain_base={d}\n", .{
+                    nm,
+                    frame.func.name,
+                    cm.resolved != null,
+                    if (chain) |c| c.items.len else 0,
+                    evtls.active_chain_base,
+                });
+                if (chain) |c| {
+                    for (c.items, 0..) |e, i| {
+                        const tn: []const u8 = if (e.v == .Instance) blk: {
+                            const g = e.v.Instance.borrow();
+                            const cg = g.get().class.borrow();
+                            const n = cg.get().name;
+                            cg.deinit();
+                            g.deinit();
+                            break :blk n;
+                        } else @tagName(e.v);
+                        std.debug.print("[cmarm]   [{d}] kind={s} {s}\n", .{ i, @tagName(e.kind), tn });
+                    }
+                }
+            }
+        }
+    }
     // Complete lowering evidence selected this declaration. Execute that
     // identity before representation-specific member fast paths; an invalid
     // identity is an image/link error, never permission to reinterpret the
