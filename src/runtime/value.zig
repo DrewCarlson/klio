@@ -386,6 +386,9 @@ pub const MapStore = struct {
     }
 };
 
+/// The mutable state of a `Value.RangeIter`: cursor + yielded-last flag.
+pub const RangeIterState = struct { cur: i64, done: bool = false };
+
 /// `ObjRef<MapStore>` — shared, growable map entry storage with a hash index.
 pub const MapEntries = ObjRef(MapStore);
 
@@ -1813,16 +1816,16 @@ pub const Value = union(enum) {
     },
     /// Lazy O(1)-memory iterator over a `Range`/progression.
     RangeIter: struct {
-        cur: ObjRef(i64),
+        /// The advancing cursor and the yielded-last flag, ONE shared cell so
+        /// they survive the iterator value being copied between reads and cost
+        /// a single lock per step. `done` exists because the cursor saturates
+        /// at the integer boundary (`MaxL +| 1 == MaxL`), so a `cur <= end`
+        /// test alone would loop forever on a range ending at
+        /// `Long.MAX_VALUE`/`MIN_VALUE`.
+        state: ObjRef(RangeIterState),
         end: i64,
         step: i64,
         kind: RangeKind,
-        /// Set once the last element has been yielded. Needed because the
-        /// cursor saturates at the integer boundary (`MaxL +| 1 == MaxL`), so a
-        /// `cur <= end` test alone would loop forever on a range ending at
-        /// `Long.MAX_VALUE`/`MIN_VALUE`. Shared (ObjRef) so it survives the
-        /// iterator value being copied between cursor reads.
-        done: ObjRef(bool),
     },
     /// Lazy iterator over a `Sequence` (the `Sequence.iterator()` / lazy
     /// `iterator { }` result), pulling one element at a time.
@@ -1910,10 +1913,7 @@ pub const Value = union(enum) {
                 visitor.visit(x.cursor);
                 if (x.mod_count.get()) |mc| visitor.visit(mc);
             },
-            .RangeIter => |x| {
-                visitor.visit(x.cur);
-                visitor.visit(x.done);
-            },
+            .RangeIter => |x| visitor.visit(x.state),
             .SeqIter => |s| visitor.visit(s),
             .PropertyRef => |p| visitor.visit(p.name),
             .MatchGroup => |g| visitor.visit(g.value),
@@ -2079,10 +2079,7 @@ pub const Value = union(enum) {
                 x.cursor.deinit();
                 if (x.mod_count.get()) |mc| mc.deinit();
             },
-            .RangeIter => |x| {
-                x.cur.deinit();
-                x.done.deinit();
-            },
+            .RangeIter => |x| x.state.deinit(),
             .SeqIter => |s| s.deinit(),
             .PropertyRef => |p| p.name.deinit(),
             .MatchGroup => |g| g.value.deinit(),

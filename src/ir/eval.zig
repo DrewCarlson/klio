@@ -10070,17 +10070,13 @@ inline fn rangeIterFast(allocator: Allocator, recv: *const Value, name: []const 
     const is_next = std.mem.eql(u8, name, "next");
     if (!is_has_next and !is_next) return null;
     const ri = recv.RangeIter;
-    const done = blk: {
-        const dg = ri.done.borrow();
-        defer dg.deinit();
-        break :blk dg.get().*;
+    const snap = blk: {
+        const sg = ri.state.borrow();
+        defer sg.deinit();
+        break :blk sg.get().*;
     };
-    const cur = blk: {
-        const cg = ri.cur.borrow();
-        defer cg.deinit();
-        break :blk cg.get().*;
-    };
-    const more = !done and ri.step != 0 and ri.kind.inBounds(cur, ri.end, ri.step);
+    const cur = snap.cur;
+    const more = !snap.done and ri.step != 0 and ri.kind.inBounds(cur, ri.end, ri.step);
     if (is_has_next) return ok(.{ .Bool = more });
     // next()
     if (!more) {
@@ -10092,15 +10088,13 @@ inline fn rangeIterFast(allocator: Allocator, recv: *const Value, name: []const 
         return errResult(.{ .Throw = exc });
     }
     const adv = cur +| ri.step;
+    const sg = ri.state.borrowMut();
     if (cur == ri.end or adv == cur) {
-        const dg = ri.done.borrowMut();
-        dg.get().* = true;
-        dg.deinit();
+        sg.get().done = true;
     } else {
-        const cg = ri.cur.borrowMut();
-        cg.get().* = adv;
-        cg.deinit();
+        sg.get().cur = adv;
     }
+    sg.deinit();
     return ok(rangeElemEval(cur, ri.kind));
 }
 

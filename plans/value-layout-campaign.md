@@ -127,5 +127,11 @@ until the last 48-byte payload boxes, so the wins land at stage ends:
       The full-trace minor stays the default until the generational
       shortcut is re-validated under the boxed layout (perf follow-up;
       sweep shows no regression at 131s).
-- [ ] Stage 5: RangeIter(40)/Range/BoundMethod/MapEntry(32), 24B tail
-      (Value → 16)
+- [x] Stage 5a: RangeIter 40 → 32 — the cursor and the yielded-last flag
+      merged into ONE shared `RangeIterState` cell (one allocation and one
+      lock per step instead of two). **Value = 40.** Sweep wall unchanged
+      (130s).
+- [ ] Stage 5b: the 32-byte payloads (Range, Iterator, RangeIter,
+      BoundMethod, MapEntry), then the 24B tail (Value → 16). Range and the
+      iterators are LOOP-HOT: measure in-place packing against boxing per
+      type before landing each.

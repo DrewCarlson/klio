@@ -133,6 +133,7 @@ pub const ListData = value_mod.ListData;
 pub const ListRef = value_mod.ListRef;
 pub const listRefOf = value_mod.listRefOf;
 pub const MapData = value_mod.MapData;
+pub const RangeIterState = value_mod.RangeIterState;
 pub const MapRef = value_mod.MapRef;
 pub const mapRefOf = value_mod.mapRefOf;
 pub const SetData = value_mod.SetData;
