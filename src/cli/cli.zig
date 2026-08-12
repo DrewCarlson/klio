@@ -143,6 +143,14 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
         return runParseCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "dump-ir")) {
         return runDumpIrCmd(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "transpile-dump")) {
+        if (rest.len != 1) {
+            printErr(gpa, "usage: klio transpile-dump <file.kt>\n", .{});
+            return 2;
+        }
+        var features = commands.RequestedFeatures.init(gpa);
+        defer features.deinit();
+        return commands.runTranspileDump(gpa, rest[0], &features);
     } else if (std.mem.eql(u8, cmd, "run")) {
         return runRunCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "test")) {

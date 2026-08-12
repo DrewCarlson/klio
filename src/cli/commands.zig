@@ -335,6 +335,71 @@ pub fn runDumpIr(
     return 0;
 }
 
+/// `klio transpile-dump <file>` — lower the file exactly as `run` does and
+/// print each function's decoded bytecode stream (the transpiler emitter's
+/// input tuples; plans/c-transpiler-plan.md stage 2). No execution.
+pub fn runTranspileDump(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    features: *const RequestedFeatures,
+) u8 {
+    var map = SourceMap.init(gpa);
+    defer map.deinit();
+    const id = load(gpa, &map, path) orelse return 1;
+    const src = map.get(id).source;
+    var lx = Lexer.init(gpa, id, src) catch return 1;
+    var lexed = lx.tokenize() catch return 1;
+    defer lexed.deinit(gpa);
+    renderToStderr(gpa, &lexed.diagnostics, &map);
+    if (lexed.diagnostics.hasErrors()) return 1;
+    const p = Parser.new(gpa, id, src, lexed.tokens);
+    const file_ast = p.parseFile();
+    renderToStderr(gpa, &p.diagnostics, &map);
+    if (p.diagnostics.hasErrors()) return 1;
+
+    var user_asts: std.ArrayList(KotlinFile) = .empty;
+    defer user_asts.deinit(gpa);
+    user_asts.append(gpa, file_ast) catch return 1;
+
+    const loaded = loadInstalledPacks(gpa, user_asts.items, &map, features);
+    var all_asts: std.ArrayList(KotlinFile) = .empty;
+    defer all_asts.deinit(gpa);
+    all_asts.appendSlice(gpa, loaded.asts) catch return 1;
+    all_asts.appendSlice(gpa, user_asts.items) catch return 1;
+
+    var built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch {
+        io.printStderr(gpa, "error: lowering failed\n", .{});
+        return 1;
+    };
+    defer built.deinit();
+
+    const mg = built.module.borrow();
+    defer mg.deinit();
+    const m = mg.get();
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const w = &aw.writer;
+    for (m.funcs.items) |*f| {
+        // The user script's functions only (empty package): pack/stdlib
+        // bodies would drown the dump — the emitter consumes them lazily
+        // through the same funcStreams call.
+        if (f.blocks.len == 0) continue;
+        if (f.package.len != 0) continue;
+        const fs = ir.bc.funcStreams(f, false, m.consts.items) orelse continue;
+        w.print("fn {s} (fid {d}, {d} blocks)\n", .{ f.name, f.id.int(), f.blocks.len }) catch return 1;
+        for (fs.streams, 0..) |sopt, bi| {
+            const st = sopt orelse continue;
+            w.print(" block b{d}:\n", .{bi}) catch return 1;
+            ir.bc.dumpStream(w, st) catch return 1;
+        }
+    }
+    const text = aw.toOwnedSlice() catch return 1;
+    defer gpa.free(text);
+    io.printStdout(gpa, "{s}", .{text});
+    return 0;
+}
+
 const TestRunCtx = struct {
     gpa: std.mem.Allocator,
     vm: *Vm,

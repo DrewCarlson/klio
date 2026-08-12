@@ -382,3 +382,69 @@ test "stream encoding: an all-escape block builds no stream unfused" {
     try std.testing.expect(build(&blk, false, &.{}, 8) == null);
     try std.testing.expect(build(&blk, true, &.{}, 8) != null);
 }
+
+/// Human-readable decode of one block's stream — the decoder half of the C
+/// transpiler's emitter (`plans/c-transpiler-plan.md` stage 2): the emitter
+/// walks exactly these (op, operands) tuples and emits C statements instead
+/// of text lines.
+pub fn dumpStream(w: anytype, s: *const Stream) !void {
+    var pc: usize = 0;
+    const code = s.code;
+    while (pc < code.len) {
+        const op: Op = @enumFromInt(code[pc]);
+        switch (op) {
+            .const_load => {
+                try w.print("  {d:>4}: const_load r{d} <- const#{d}\n", .{ pc, code[pc + 1], code[pc + 2] });
+                pc += 3;
+            },
+            .const_int => {
+                try w.print("  {d:>4}: const_int  r{d} <- {d}\n", .{ pc, code[pc + 1], @as(i32, @bitCast(code[pc + 2])) });
+                pc += 3;
+            },
+            .move => {
+                try w.print("  {d:>4}: move       r{d} <- r{d}\n", .{ pc, code[pc + 1], code[pc + 2] });
+                pc += 3;
+            },
+            .load_param => {
+                try w.print("  {d:>4}: load_param r{d} <- p{d}\n", .{ pc, code[pc + 1], code[pc + 2] });
+                pc += 3;
+            },
+            .cell_get => {
+                try w.print("  {d:>4}: cell_get   r{d} <- cell r{d}\n", .{ pc, code[pc + 1], code[pc + 2] });
+                pc += 3;
+            },
+            .trace => {
+                try w.print("  {d:>4}: trace      f{d}:{d}..{d}\n", .{ pc, code[pc + 1], code[pc + 2], code[pc + 3] });
+                pc += 4;
+            },
+            .bin => {
+                try w.print("  {d:>4}: bin        i{d} kind={d} r{d} <- r{d} op r{d}\n", .{ pc, code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4], code[pc + 5] });
+                pc += 6;
+            },
+            .escape => {
+                try w.print("  {d:>4}: escape     i{d}\n", .{ pc, code[pc + 1] });
+                pc += 2;
+            },
+            .jump => {
+                try w.print("  {d:>4}: jump       b{d}\n", .{ pc, code[pc + 1] });
+                pc += 2;
+            },
+            .br => {
+                try w.print("  {d:>4}: br         r{d} ? b{d} : b{d}\n", .{ pc, code[pc + 1], code[pc + 2], code[pc + 3] });
+                pc += 4;
+            },
+            .ret => {
+                try w.print("  {d:>4}: ret        has_val={d} r{d}\n", .{ pc, code[pc + 1], code[pc + 2] });
+                pc += 3;
+            },
+            .term_exit => {
+                try w.print("  {d:>4}: term_exit\n", .{pc});
+                pc += 1;
+            },
+            .cmp_br => {
+                try w.print("  {d:>4}: cmp_br     i{d} kind={d} r{d} <- r{d} op r{d} ? b{d} : b{d}\n", .{ pc, code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4], code[pc + 5], code[pc + 6], code[pc + 7] });
+                pc += 8;
+            },
+        }
+    }
+}

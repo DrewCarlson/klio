@@ -65,7 +65,13 @@ standalone binary.
       `tests/transpiler/boot.c` runs `examples/hello.kt` end to end
       (`scripts/transpiler-boot-check.sh`, link with `zig cc` + `-lzstd` —
       the Debug zstd objects carry UBSan references a system cc lacks)
-- [ ] Stage 2: block emitter, hello.kt parity. Design pinned:
+- [ ] Stage 2: block emitter, hello.kt parity. IN PROGRESS — the decoder
+      half is landed: `bc.dumpStream` decodes a block's (op, operands)
+      tuples and `klio transpile-dump <file>` prints every user-script
+      function's streams (hello.kt: trace / const_int x2 / bin / escape —
+      the emitter's exact input). Remaining: the per-op C ABI helpers, the
+      C printer over these tuples, and the per-fid native entry hook.
+      Design pinned:
       - The stream to consume is `src/ir/bc.zig` (`Op`: const_load,
         const_int, move, load_param, cell_get, trace, bin, escape, jump,
         br, ret, term_exit, cmp_br; `FuncStreams` per block with the

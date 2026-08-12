@@ -25,6 +25,7 @@ pub const FileId = span.FileId;
 /// alongside the type definitions in this file.
 pub const build = @import("build.zig");
 pub const eval = @import("eval.zig");
+pub const bc = @import("bc.zig");
 pub const lower = @import("lower.zig");
 pub const jit_loop = @import("jit_loop.zig");
 pub const disasm = @import("disasm.zig");
