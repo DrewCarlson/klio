@@ -6757,6 +6757,21 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Frame, gf: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(gf.receiver);
+    if (std.c.getenv("KLIO_GF_TRACE")) |w0| {
+        if (constStr(frame.module, gf.field)) |fname| {
+            if (std.mem.indexOf(u8, fname, std.mem.span(w0)) != null) {
+                const rn: []const u8 = if (recv == .Instance) blk: {
+                    const g = recv.Instance.borrow();
+                    const cg = g.get().class.borrow();
+                    const n = cg.get().name;
+                    cg.deinit();
+                    g.deinit();
+                    break :blk n;
+                } else @tagName(recv);
+                std.debug.print("[gfarm] field={s} recv={s} in={s}\n", .{ fname, rn, frame.func.name });
+            }
+        }
+    }
     const name = constStr(frame.module, gf.field) orelse
         return raiseStep(frame, .{ .Type = "GetField: name not a string const" });
     if (builtinFieldFast(&recv, name)) |bv| {
