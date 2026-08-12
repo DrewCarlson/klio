@@ -2090,6 +2090,16 @@ pub fn callValueWithThisExact(self: *VmHost, allocator: Allocator, callee: *cons
                 defer if (runtime.freeScratch()) allocator.free(with_recv);
                 with_recv[0] = this_value.*;
                 @memcpy(with_recv[1..], args);
+                // The receiver rides positionally, but it is still the
+                // block's innermost IMPLICIT receiver: publish it on the
+                // enclosing chain so member-extension dispatch inside the
+                // body sees its owner (`placeable.place(x, y)` inside a
+                // `Placeable.PlacementScope.() -> Unit` placement block —
+                // the owner-visibility set was missing the scope and every
+                // window placement pass died on it).
+                const push_subject = this_value.* == .Instance or this_value.* == .Null;
+                if (push_subject) host_call_member.pushAccessEnclosingSubject(self, this_value);
+                defer if (push_subject) host_call_member.popAccessEnclosing(self);
                 return callValue(self, allocator, callee, with_recv);
             }
         }
