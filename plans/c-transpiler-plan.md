@@ -65,6 +65,26 @@ standalone binary.
       `tests/transpiler/boot.c` runs `examples/hello.kt` end to end
       (`scripts/transpiler-boot-check.sh`, link with `zig cc` + `-lzstd` —
       the Debug zstd objects carry UBSan references a system cc lacks)
-- [ ] Stage 2: block emitter, hello.kt parity
+- [ ] Stage 2: block emitter, hello.kt parity. Design pinned:
+      - The stream to consume is `src/ir/bc.zig` (`Op`: const_load,
+        const_int, move, load_param, cell_get, trace, bin, escape, jump,
+        br, ret, term_exit, cmp_br; `FuncStreams` per block with the
+        `idx_pc` resume table).
+      - C never touches the frame struct: every op emits a call to an
+        exported per-op helper (`klio_op_move(f, dst, src)`,
+        `klio_op_bin(f, inst_idx, kind, dst, l, r)`, ...) — the helpers ARE
+        the interpreter's arm bodies behind a C ABI, so semantics are
+        shared by construction. `klio_escape(f, inst_idx)` returns a step
+        code; any non-`cont` step makes the emitted function return to the
+        interpreter (stage 2 transpiles only functions whose escapes stay
+        `cont` in practice — a raised/suspend step falls back to full
+        interpretation of the activation).
+      - Native entry: the eval loop needs a per-fid native table checked
+        before interpretation — the KLIO_FUNC_JIT hook family already cut
+        this seam once (it is gated off, see klio-exec-perf memory); reuse
+        or rebuild that registration (`klio_rt_register_native(fid, ptr)`).
+      - Gate: `klio transpile examples/hello.kt -o hello.c`, then
+        `zig cc hello.c -lklio_rt -lzstd`, output parity with
+        `klio run`.
 - [ ] Stage 3: call quickening, CALL_TAGGED table, vararg prologue
 - [ ] Stage 4: corpus parity + measured speedup
