@@ -3705,6 +3705,19 @@ pub fn resumeContinuation(
     host: *H,
 ) Allocator.Error!EvalResult {
     var carry = resume_value;
+    // The replay activates and deactivates a rebuilt frame per snapshot;
+    // the per-frame prev-chain captures are only coherent while the replay
+    // runs, and a deactivation cascade could leave the thread's active
+    // chain pointing at a rebuilt frame's list AFTER that frame was torn
+    // down — the next fresh call on this thread then merged its enclosing
+    // chain from freed memory (the cross-thread yield GPF). Pin the
+    // pre-replay chain and restore it on every exit.
+    const saved_chain = evtls.active_chain;
+    const saved_chain_base = evtls.active_chain_base;
+    defer {
+        evtls.active_chain = saved_chain;
+        evtls.active_chain_base = saved_chain_base;
+    }
     // `frames` is innermost-first (the deepest activation snapshots
     // itself first as `Suspended` unwinds). Resume the innermost, then
     // feed its return value to the next-outer frame, and so on. When the
