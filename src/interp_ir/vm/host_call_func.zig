@@ -2717,8 +2717,15 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
                 if (caller_file) |cfile| {
                     candidate_tier = eff.scopeTier(cf.fqn, cf.package, name, scope_pkg, cfile);
                     if (candidate_tier >= ir.Module.other_package_tier) {
-                        if (ntrace) std.debug.print("[cno] {s} cand={d} tier-skip tier={d} scope_pkg={s} cfile={d}\n", .{ name, cand.int(), candidate_tier, scope_pkg, cfile.int() });
-                        continue;
+                        // The frame's file need not be the CALL SITE's file
+                        // either (a secondary-ctor delegation thunk executes
+                        // under the CALLING frame — RowColumnImpl's
+                        // `Constraints(minWidth = ...)` re-derived against
+                        // UnspecifiedConstraintsNode's file and lost its
+                        // import). The bounded set is bake-proven: rank such
+                        // a candidate LAST, never exclude it.
+                        if (ntrace) std.debug.print("[cno] {s} cand={d} tier-clamp tier={d} scope_pkg={s} cfile={d}\n", .{ name, cand.int(), candidate_tier, scope_pkg, cfile.int() });
+                        candidate_tier = ir.Module.other_package_tier;
                     }
                 }
             }
