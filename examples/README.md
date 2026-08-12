@@ -74,6 +74,7 @@ Run any program with:
 | `receiver_lambda_reassign.kt` | A receiver lambda keeps its receiver context when reassigned to a typed local or assigned into a field declared `Scope.() -> R`. |
 | `interface_static_get_override.kt` | `m[k]` on an interface-typed receiver binds the runtime override of the interface's abstract generic `get`, never a delegated `Map.get`. |
 | `splice_receiver_member_write.kt` | A bare member write inside an inline-spliced receiver lambda lands on the enclosing class's property when the splice receiver does not declare it. |
+| `receiver_fn_field_direct_invoke.kt` | A receiver-function-typed property invoked bare inside `scope.apply{}` binds the implicit receiver as the lambda's `this`. |
 
 ## Functions, lambdas, and generics
 

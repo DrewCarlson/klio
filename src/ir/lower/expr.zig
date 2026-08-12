@@ -7324,6 +7324,51 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
         }
     }
+    // A RECEIVER-function-typed property invoked bare (`block!!()` where
+    // `block: Scope.() -> R` and an implicit receiver is in scope — the
+    // cached-draw block invoked directly inside `scope.apply { … }`): the
+    // innermost implicit receiver rides the call, exactly as Kotlin binds
+    // it. Without this the closure body ran receiverless and its bare
+    // member calls fell to globals.
+    recv_fn: {
+        var core = callee;
+        var hops: usize = 0;
+        while (hops < 8) : (hops += 1) {
+            switch (core.*) {
+                .Unary => |u| core = u.expr,
+                .Postfix => |pf| core = pf.expr,
+                else => break,
+            }
+        }
+        if (core.* != .Path or core.Path.segments.len != 1) break :recv_fn;
+        const pname = core.Path.segments[0].name;
+        if (b.resolve(pname) != null or b.knowsOuter(pname)) break :recv_fn;
+        const this_reg = b.resolve("this") orelse break :recv_fn;
+        var owner: ?[]const u8 = b.ownerClass();
+        var ohops: usize = 0;
+        const is_recv_fn = blk: {
+            while (owner) |o| : (ohops += 1) {
+                if (ohops > 32) break;
+                if (b.module.registry.recv_fn_props.get(.{ .a = o, .b = pname }) != null) break :blk true;
+                owner = b.module.registry.enclosing_class.get(o);
+            }
+            break :blk false;
+        };
+        if (!is_recv_fn) break :recv_fn;
+        const callee_r = try lowerExpr(b, callee);
+        const run = try lowerArgRun(b, args);
+        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+        const dst = b.allocReg();
+        try b.push(.{ .CallValueWithThis = .{
+            .dst = dst,
+            .callee = callee_r,
+            .receiver = this_reg,
+            .args = run[0],
+            .n_args = run[1],
+            .arg_names = arg_names,
+        } });
+        return dst;
+    }
     const callee_r = try lowerExpr(b, callee);
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
