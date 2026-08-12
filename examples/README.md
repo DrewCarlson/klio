@@ -147,6 +147,7 @@ Run any program with:
 | `bounded_typeparam_receiver.kt` | A `where`-bounded generic extension never binds a receiver outside its bounds, even when the static receiver hint says otherwise. |
 | `delegated_member_named_args.kt` | Class delegation serving a member invoked with named arguments binds parameters by name through the forward. |
 | `named_arg_member_overload_lambda.kt` | A bare call with named arguments and a trailing receiver lambda binds the implicit receiver's member overload; a same-named global that cannot take the named arguments never stamps its lambda shape. |
+| `anon_subclass_base_private_field.kt` | A member extension on an abstract base reads the base's private field through an anonymous-object dispatch receiver, at any subclass depth. |
 | `positional_lambda_binding.kt` | Two positional lambdas with a defaulted third lambda parameter bind positionally; the trailing-lambda shift fires only when the callable does not fit its positional slot. |
 | `companion_import_identity.kt` | A named companion-member import aliases the same value as the qualified read and outranks a same-named class in expression position. |
 | `member_shadows_imported_class.kt` | A member function named like an imported class wins the bare call from the method body, lambdas, nested lambdas, and coroutine blocks — never the imported constructor. |

@@ -2358,6 +2358,10 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
                         const names2 = try allocator.alloc(?[]const u8, buf.len);
                         defer if (runtime.freeScratch()) allocator.free(names2);
                         for (names2, 0..) |*n2, i| n2.* = if (i < arg_names.len) arg_names[i] else null;
+                        // Bind the pair by name: with a named arg elsewhere in
+                        // the call the positional walk would misplace it.
+                        names2[args.len] = "$composer";
+                        names2[args.len + 1] = "$changed";
                         return callFuncTypedInner(self, allocator, module, func, buf, names2, type_args, exact);
                     }
                 }
@@ -2914,6 +2918,11 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         const names2 = try allocator.alloc(?[]const u8, buf.len);
         defer if (runtime.freeScratch()) allocator.free(names2);
         for (names2, 0..) |*n2, i| n2.* = if (i < arg_names.len) arg_names[i] else null;
+        // The pair binds BY NAME: appended positionally it walks into the
+        // first free defaulted slot when the call skips defaults
+        // (`BasicText(text, style = …)` put the composer in `modifier`).
+        names2[args.len] = "$composer";
+        names2[args.len + 1] = "$changed";
         const rp = try callFuncTyped(self, allocator, eff, func, buf, names2, &.{}, exact_dispatch);
         return switch (rp) {
             .ok => |v| .{ .ok = v },

@@ -1,5 +1,7 @@
 package androidx.compose.runtime
 
+import kotlin.text.toString as longToString
+
 // Non-JVM platforms back CompositeKeyHashCode with a 64-bit Long. The compound
 // arithmetic follows the standard implementation documented on the expects:
 // compoundWith is `(this rol shift) xor segment`, its inverse unCompoundWith is
@@ -10,7 +12,10 @@ public actual typealias CompositeKeyHashCode = Long
 
 public actual fun CompositeKeyHashCode.toLong(): Long = this
 
-public actual fun CompositeKeyHashCode.toString(radix: Int): String = this.toString(radix)
+// The bare form `this.toString(radix)` resolves to this declaration itself
+// (the same-file extension outranks the default-imported kotlin.text one),
+// which is infinite recursion; the alias import reaches the stdlib conversion.
+public actual fun CompositeKeyHashCode.toString(radix: Int): String = this.longToString(radix)
 
 internal actual fun CompositeKeyHashCode(initial: Int): CompositeKeyHashCode = initial.toLong()
 

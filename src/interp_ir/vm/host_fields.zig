@@ -940,11 +940,17 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             // provide it (for example, a `with` subject).
             if (member_probe and receiver.* == .Instance) {
                 const rcn = className(receiver.Instance);
+                // The module walk answers from registered class rows; an
+                // anonymous object's row (`$anon$N`) may carry no name-keyed
+                // supertype edge there, so the value-level runtime chain is
+                // an equal authority on ownership — without it a bare private
+                // read inside a member extension rejected the very instance
+                // that stores the field.
                 const owns = std.mem.eql(u8, rcn, owner) or blk: {
                     const mg = self.module.borrow();
                     defer mg.deinit();
                     break :blk mg.get().classIsOrExtends(rcn, owner);
-                };
+                } or host_call_member.receiverImplementsType(self, receiver, owner);
                 const owner_declares = classDeclaresStoredProp(self, owner, prop) or blk: {
                     const pg = self.prog.borrow();
                     defer pg.deinit();
@@ -1105,7 +1111,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                                 const mg2 = self.module.borrow();
                                 defer mg2.deinit();
                                 break :blk mg2.get().classIsOrExtends(rcn2, owner);
-                            };
+                            } or host_call_member.receiverImplementsType(self, receiver, owner);
                             if (!recv_owns) {
                                 var recv_probe = receiver.*;
                                 if (try host_call_member.memberExtOwnerInstance(self, allocator, &recv_probe, owner)) |inst| {

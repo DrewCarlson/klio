@@ -447,6 +447,19 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
     }
 }
 
+/// Whether a closure's body is compose-pass threaded: its declared params
+/// end with the synthetic `($composer, $changed)` pair. Such a closure
+/// invoked without the pair completes it from the ambient composer inside
+/// `callValue`, so arity checks must accept the pair-less shape too.
+fn closurePairTailed(self: *VmHost, info: anytype) bool {
+    if (!host_call_func.composePluginEnabled()) return false;
+    const module: *const Module = info.module orelse self.module.asPtr();
+    const func = module.funcById(info.body_func) orelse return false;
+    return func.params.len >= 2 and
+        std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
+        std.mem.eql(u8, func.params[func.params.len - 2].name, "$composer");
+}
+
 fn callValueRec(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
     // A receiver-typed callable invoked function-style with the receiver
     // as its first argument (`content.item(itemScope, localIndex)` where
@@ -455,7 +468,9 @@ fn callValueRec(self: *VmHost, allocator: Allocator, callee: *const Value, args:
     // args[0] as the receiver, not as the first parameter.
     if (callee.* == .IrClosure and args.len >= 1) {
         if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
-            if (args.len == info.n_params + 1) {
+            if (args.len == info.n_params + 1 or
+                (args.len + 2 == info.n_params + 1 and closurePairTailed(self, info)))
+            {
                 var has_this = false;
                 for (info.capture_names) |n| {
                     if (std.mem.eql(u8, n, "this")) {
@@ -1903,7 +1918,7 @@ pub fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const
 }
 
 /// Does the receiver's actual runtime type satisfy `ty_name`?
-fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []const u8) bool {
+pub fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []const u8) bool {
     var pn = simpleName(ty_name);
     pn = std.mem.trimEnd(u8, pn, "?");
     // Expand typealiases: a member extension declared on `TestResult`
@@ -5211,13 +5226,39 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             }
             break :blk null;
         };
+        if (field == null and missTraceWant(name)) {
+            const g = receiver.Instance.borrow();
+            defer g.deinit();
+            std.debug.print("[fnprop] no own field `{s}`; fields:", .{name});
+            for (g.get().fields.items) |f| std.debug.print(" {s}", .{f.name});
+            std.debug.print("\n", .{});
+        }
         if (field) |v| {
-            if (missTraceWant(name)) std.debug.print("[fnprop] own-field hit tag={s} callable={}\n", .{ @tagName(v), isCallable(&v) });
+            if (missTraceWant(name)) {
+                const np: i64 = if (v == .IrClosure)
+                    if (self.closures.get(@intCast(v.IrClosure.id))) |info| @intCast(info.n_params) else -1
+                else
+                    -2;
+                std.debug.print("[fnprop] own-field hit tag={s} callable={} n_params={d} args={d}\n", .{ @tagName(v), isCallable(&v), np, args.len });
+            }
             if (isCallable(&v) or v == .Instance) {
                 // A RECEIVER-function-typed property binds an implicit
                 // receiver of its declared head at invocation; with none
                 // in scope the property does not apply — skip the arm.
                 if (recvFnPropHeadOf(self, receiver, name)) |head| {
+                    // One arg more than the stored lambda's declared params
+                    // is the function-style invoke with the receiver passed
+                    // first (`content.item(itemScope, localIndex)` where
+                    // `item: LazyItemScope.(Int) -> Unit`). Kotlin selects
+                    // that shape by arity, ahead of any implicit scope
+                    // receiver — callValueRec binds args[0] as the receiver.
+                    const first_arg_recv = blk: {
+                        if (v != .IrClosure or args.len == 0) break :blk false;
+                        const info = self.closures.get(@intCast(v.IrClosure.id)) orelse break :blk false;
+                        break :blk args.len == info.n_params + 1 or
+                            (args.len + 2 == info.n_params + 1 and closurePairTailed(self, info));
+                    };
+                    if (first_arg_recv) return callValueRec(self, allocator, &v, args);
                     if (try recvFnReceiverFor(self, allocator, receiver, head)) |rv| {
                         return try host_call_value.callValueWithThis(self, allocator, &v, &rv, args, &.{});
                     }
@@ -15154,13 +15195,16 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
 }
 
 pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value, qualifier: []const u8) Allocator.Error!EvalResult {
+    const qt_trace = if (std.c.getenv("KLIO_QT_TRACE")) |w0| std.mem.indexOf(u8, qualifier, std.mem.span(w0)) != null else false;
     if (std.mem.indexOfScalar(u8, qualifier, '.') != null) {
         var walk: ?Value = receiver.*;
         var steps: usize = 0;
         while (walk) |value| {
             if (steps > 128 or value != .Instance) break;
             steps += 1;
+            if (qt_trace) std.debug.print("[qt] cand={s} qual={s}\n", .{ debugClassNameOf(self, &value), qualifier });
             if (receiverImplementsOwnerIdentity(self, &value, qualifier)) {
+                if (qt_trace) std.debug.print("[qt]   -> matched receiver walk\n", .{});
                 return .{ .ok = value };
             }
             walk = instanceOuterLink(&value);
@@ -15173,12 +15217,15 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
             while (walk) |value| {
                 if (steps > 128 or value != .Instance) break;
                 steps += 1;
+                if (qt_trace) std.debug.print("[qt] encl-cand={s}\n", .{debugClassNameOf(self, &value)});
                 if (receiverImplementsOwnerIdentity(self, &value, qualifier)) {
+                    if (qt_trace) std.debug.print("[qt]   -> matched enclosing chain\n", .{});
                     return .{ .ok = value };
                 }
                 walk = instanceOuterLink(&value);
             }
         }
+        if (qt_trace) std.debug.print("[qt] NO MATCH for {s}\n", .{qualifier});
         return .{ .err = try typeErr(
             allocator,
             "qualified this `{s}` is not in the implicit receiver scope",
