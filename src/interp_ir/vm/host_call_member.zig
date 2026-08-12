@@ -13408,7 +13408,40 @@ pub fn callMemberNamedStatic(self: *VmHost, allocator: Allocator, receiver: *con
 /// `fun I.helper()` a bare `describe()` binds `I.describe` even when the
 /// runtime value is a subtype with its own `describe` extension.
 pub fn callMemberStrictExt(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8, static_recv: ?[]const u8) Allocator.Error!EvalResult {
-    const r = try callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true, static_recv, false, null);
+    var r = try callMemberNamedInner(self, allocator, receiver, name, args, arg_names, true, static_recv, false, null);
+    // An ARG-BEARING call that got back its own CLASSIFIER (the class
+    // value, or the companion instance, under the call's own name) did
+    // not run anything — the dispatch fetched a reference. Kotlin never
+    // calls a classifier reference: either a constructor applies (the
+    // NewInstance path) or an outer candidate (the top-level factory
+    // fn) wins. Refuse so the bare-name walk falls through — a KClass
+    // tower candidate was swallowing `Constraints(minWidth = ...)`
+    // (private-ctor value class + top-level factory) this way.
+    if (r == .ok and args.len != 0) {
+        const classifier_echo = switch (r.ok) {
+            .Class => |c| blk: {
+                const cg = c.borrow();
+                defer cg.deinit();
+                break :blk std.mem.eql(u8, cg.get().name, name);
+            },
+            .Instance => |inst| blk: {
+                const g = inst.borrow();
+                defer g.deinit();
+                const cg = g.get().class.borrow();
+                defer cg.deinit();
+                const fqn = cg.get().fqn;
+                if (!std.mem.endsWith(u8, fqn, ".Companion")) break :blk false;
+                const owner = fqn[0 .. fqn.len - ".Companion".len];
+                const simple = if (std.mem.lastIndexOfScalar(u8, owner, '.')) |d| owner[d + 1 ..] else owner;
+                break :blk std.mem.eql(u8, simple, name);
+            },
+            else => false,
+        };
+        if (classifier_echo) {
+            r.ok.release(allocator);
+            r = try unimplemented(allocator, "Vm::call_member `{s}` classifier echo refused", .{name});
+        }
+    }
     if (nuTraceEnv()) |w| {
         if (std.mem.eql(u8, w, name)) {
             const tag: []const u8 = switch (r) {
