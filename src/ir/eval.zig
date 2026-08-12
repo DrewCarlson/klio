@@ -2762,6 +2762,11 @@ const Frame = struct {
     }
 
     fn activateAs(self: *Frame) void {
+        if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
+            std.debug.print("[chain] act tid={d} frame={*} list={*} prev={*} base={d} fn={s}\n", .{
+                std.Thread.getCurrentId(), self, &self.enclosing_this, self.tls.active_chain, self.tls.active_chain_base, self.func.name,
+            });
+        }
         self.prev_chain = self.tls.active_chain;
         self.prev_chain_base = self.tls.active_chain_base;
         self.tls.active_chain = &self.enclosing_this;
@@ -2769,6 +2774,11 @@ const Frame = struct {
     }
 
     fn deactivateChain(self: *Frame) void {
+        if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
+            std.debug.print("[chain] deact tid={d} frame={*} restore={*} fn={s}\n", .{
+                std.Thread.getCurrentId(), self, self.prev_chain, self.func.name,
+            });
+        }
         self.tls.active_chain = self.prev_chain;
         self.tls.active_chain_base = self.prev_chain_base;
     }
