@@ -2731,8 +2731,8 @@ const Frame = struct {
     /// never cross the frame boundary.
     fn activateChain(self: *Frame, seed: []const EnclosingEntry) Allocator.Error!void {
         if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
-            std.debug.print("[chain] enter tid={d} frame={*} caller={*} base={d} fn={s}\n", .{
-                std.Thread.getCurrentId(), self, self.tls.active_chain, self.tls.active_chain_base, self.func.name,
+            std.debug.print("[chain] enter tid={d} tls={*} frame={*} caller={*} base={d} fn={s}\n", .{
+                std.Thread.getCurrentId(), self.tls, self, self.tls.active_chain, self.tls.active_chain_base, self.func.name,
             });
         }
         for (seed) |e| {
@@ -2768,8 +2768,8 @@ const Frame = struct {
 
     fn activateAs(self: *Frame) void {
         if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
-            std.debug.print("[chain] act tid={d} frame={*} list={*} prev={*} base={d} fn={s}\n", .{
-                std.Thread.getCurrentId(), self, &self.enclosing_this, self.tls.active_chain, self.tls.active_chain_base, self.func.name,
+            std.debug.print("[chain] act tid={d} tls={*} frame={*} list={*} prev={*} base={d} fn={s}\n", .{
+                std.Thread.getCurrentId(), self.tls, self, &self.enclosing_this, self.tls.active_chain, self.tls.active_chain_base, self.func.name,
             });
         }
         self.prev_chain = self.tls.active_chain;
@@ -2780,8 +2780,8 @@ const Frame = struct {
 
     fn deactivateChain(self: *Frame) void {
         if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
-            std.debug.print("[chain] deact tid={d} frame={*} restore={*} fn={s}\n", .{
-                std.Thread.getCurrentId(), self, self.prev_chain, self.func.name,
+            std.debug.print("[chain] deact tid={d} tls={*} frame={*} restore={*} fn={s}\n", .{
+                std.Thread.getCurrentId(), self.tls, self, self.prev_chain, self.func.name,
             });
         }
         self.tls.active_chain = self.prev_chain;
