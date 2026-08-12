@@ -2457,6 +2457,8 @@ pub fn checkLambdaInPlace(
             }
             try self.dsl_receiver_stack.append(self.allocator, .{ .name = cn, .markers = markers });
             try self.class_stack.append(self.allocator, cn);
+            if (std.c.getenv("KLIO_RH_TRACE") != null)
+                std.debug.print("[rh-put] site=inplace f={d} s={d}..{d} head={s}\n", .{ body.span.file.int(), body.span.start, body.span.end, cn });
             self.lambda_recv_heads.put(body.span, cn) catch {};
             const actual_ret = try expr_mod.checkBlock(self, body, null);
             _ = self.class_stack.pop();
@@ -2518,6 +2520,8 @@ pub fn checkLambdaShaped(
             // eager channel (member-vs-global inside the body answers
             // from this head).
             if (f.receiver_head) |h| {
+                if (std.c.getenv("KLIO_RH_TRACE") != null)
+                    std.debug.print("[rh-put] site=shaped f={d} s={d}..{d} head={s}\n", .{ body.span.file.int(), body.span.start, body.span.end, h });
                 self.lambda_recv_heads.put(body.span, h) catch {};
             }
             // The lambda's OWN expected shape, keyed by its body span. The

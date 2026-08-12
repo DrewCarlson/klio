@@ -3917,17 +3917,25 @@ fn mapArgsToParams(
     const used = try b.allocator.alloc(bool, params.len);
     defer b.allocator.free(used);
     for (used) |*u| u.* = false;
-    // 1. Named arguments bind their same-named parameter.
+    // 1. Named arguments bind their same-named parameter. A named argument
+    // that matches NO parameter makes the whole call inapplicable to this
+    // callee (Kotlin rejects the candidate outright), so the map must fail
+    // rather than silently drop the argument — otherwise an unnamed trailing
+    // lambda still "binds" the last parameter of a callee that cannot take
+    // this call, and downstream heuristics record that parameter's lambda
+    // shape (receiver head, arity) against the wrong lambda.
     for (args, 0..) |_, j| {
         const an = if (j < arg_names.len) arg_names[j] else null;
         if (an) |name| {
-            for (params, 0..) |p, idx| {
-                if (std.mem.eql(u8, p.name, name)) {
-                    out[j] = idx;
-                    used[idx] = true;
-                    break;
-                }
-            }
+            const idx_opt: ?usize = for (params, 0..) |p, idx| {
+                if (std.mem.eql(u8, p.name, name)) break idx;
+            } else null;
+            const idx = idx_opt orelse {
+                b.allocator.free(out);
+                return null;
+            };
+            out[j] = idx;
+            used[idx] = true;
         }
     }
     // 2. An unnamed trailing lambda binds the last (still-free) parameter.
@@ -4219,6 +4227,8 @@ fn recordCallBoundLambdaReceiver(
         cleanup.deinit(b.allocator);
         return;
     }
+    if (std.c.getenv("KLIO_LAR_TRACE") != null)
+        std.debug.print("[lar-site] site=cbr fn={s} declared={s} resolved={s} s={d}..{d}\n", .{ func.name, declared_receiver.name, resolved.name, call_span.start, call_span.end });
     try b.recordLambdaArgRecvOwned(call_span, resolved);
 }
 
@@ -5509,6 +5519,8 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 if (ok) {
                     if (common) |receiver| {
                         common = null;
+                        if (std.c.getenv("KLIO_LAR_TRACE") != null)
+                            std.debug.print("[lar-site] site=common name={s} recv={s} s={d}..{d}\n", .{ cnm, receiver.name, args[args.len - 1].span().start, args[args.len - 1].span().end });
                         try b.recordLambdaArgRecvOwned(args[args.len - 1].span(), receiver);
                     }
                 }
@@ -16352,6 +16364,8 @@ fn lowerImplicitThisCall(
             const uninstantiated = bareTypeParamHead(recv) or
                 ir.parseClassTypeParamIdentity(recv) != null;
             if (!(uninstantiated and b.lambdaArgRecv(trailing.span()) != null)) {
+                if (std.c.getenv("KLIO_LAR_TRACE") != null)
+                    std.debug.print("[lar-site] site=shape name={s} recv={s} s={d}..{d}\n", .{ name0, recv, trailing.span().start, trailing.span().end });
                 try b.recordLambdaArgRecvOwned(
                     trailing.span(),
                     try (ir.TypeRef{
