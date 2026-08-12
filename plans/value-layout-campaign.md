@@ -134,4 +134,8 @@ until the last 48-byte payload boxes, so the wins land at stage ends:
 - [ ] Stage 5b: the 32-byte payloads (Range, Iterator, RangeIter,
       BoundMethod, MapEntry), then the 24B tail (Value → 16). Range and the
       iterators are LOOP-HOT: measure in-place packing against boxing per
-      type before landing each.
+      type before landing each. Measurement gate: `tests/bench/rangebench.kt`
+      (20 reps of 1M-up + 333k-step-down + 2600 char-range iterations);
+      baseline at Value=40 is **80.4s** on the default CLI (`time
+      ./zig-out/bin/klio run tests/bench/rangebench.kt`, box idle). A Range
+      boxing candidate must stay within noise of that number to land.
