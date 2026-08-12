@@ -2730,6 +2730,11 @@ const Frame = struct {
     /// member-extension owner). `access` entries are dispatch-transient and
     /// never cross the frame boundary.
     fn activateChain(self: *Frame, seed: []const EnclosingEntry) Allocator.Error!void {
+        if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
+            std.debug.print("[chain] enter tid={d} frame={*} caller={*} base={d} fn={s}\n", .{
+                std.Thread.getCurrentId(), self, self.tls.active_chain, self.tls.active_chain_base, self.func.name,
+            });
+        }
         for (seed) |e| {
             if (e.kind == .access) continue;
             try self.enclosing_this.append(chainAllocator(), e);
