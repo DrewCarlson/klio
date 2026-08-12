@@ -15,7 +15,9 @@ const runtime = @import("runtime");
 
 const io = @import("io.zig");
 
-const commands = @import("commands.zig");
+/// Exported for the `klio_rt` C-ABI library (the C transpiler's bootstrap
+/// drives `runFileIrVm` directly).
+pub const commands = @import("commands.zig");
 const DiagFormat = commands.DiagFormat;
 
 const pack_cache = @import("pack_cache.zig");

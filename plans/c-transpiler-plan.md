@@ -59,7 +59,12 @@ standalone binary.
 
 ## Status
 
-- [ ] Stage 1: runtime C ABI + bootstrap proof
+- [x] Stage 1: runtime C ABI + bootstrap proof — `zig build klio-rt`
+      installs `lib/libklio_rt.a` + `include/klio_rt.h`
+      (`klio_rt_run_file` / `klio_rt_abi_version`); the hand-written C host
+      `tests/transpiler/boot.c` runs `examples/hello.kt` end to end
+      (`scripts/transpiler-boot-check.sh`, link with `zig cc` + `-lzstd` —
+      the Debug zstd objects carry UBSan references a system cc lacks)
 - [ ] Stage 2: block emitter, hello.kt parity
 - [ ] Stage 3: call quickening, CALL_TAGGED table, vararg prologue
 - [ ] Stage 4: corpus parity + measured speedup

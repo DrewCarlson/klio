@@ -43,7 +43,7 @@ const HostBindings = stdlib.HostBindings;
 const io = @import("io.zig");
 
 const pack_cache = @import("pack_cache.zig");
-const RequestedFeatures = pack_cache.RequestedFeatures;
+pub const RequestedFeatures = pack_cache.RequestedFeatures;
 const loadInstalledPacks = pack_cache.loadInstalledPacks;
 
 const stdlib_image = @import("stdlib_image.zig");
