@@ -165,11 +165,11 @@ const ArrayStep = struct { next: Value, out: Value };
 
 fn throwAtomicIoob(ctx: *CallCtx, idx: i64, len: usize) std.mem.Allocator.Error!EvalResult {
     const msg = try std.fmt.allocPrint(ctx.allocator, "index: {d}, size: {d}", .{ idx, len });
-    const r: EvalResult = .{ .err = .{ .Thrown = .{ .Exception = .{
+    const r: EvalResult = .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.IndexOutOfBoundsException"),
         .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
         .cause = null,
-    } } } };
+    }) } };
     return r;
 }
 

@@ -126,6 +126,18 @@ pub const strMeta = value_mod.strMeta;
 pub const ValueList = value_mod.ValueList;
 pub const ValueBox = value_mod.ValueBox;
 pub const ValueSlice = value_mod.ValueSlice;
+pub const ExceptionData = value_mod.ExceptionData;
+pub const ExceptionRef = value_mod.ExceptionRef;
+pub const exceptionRefOf = value_mod.exceptionRefOf;
+pub const ListData = value_mod.ListData;
+pub const ListRef = value_mod.ListRef;
+pub const listRefOf = value_mod.listRefOf;
+pub const MapData = value_mod.MapData;
+pub const MapRef = value_mod.MapRef;
+pub const mapRefOf = value_mod.mapRefOf;
+pub const SetData = value_mod.SetData;
+pub const SetRef = value_mod.SetRef;
+pub const setRefOf = value_mod.setRefOf;
 
 // class
 pub const ClassDef = class_mod.ClassDef;
@@ -331,12 +343,12 @@ test "enum entries is_runtime_type matches both" {
         defer g.deinit();
         try g.get().append(a, .{ .Int = 1 });
     }
-    const entries = Value{ .List = .{
+    const entries = try Value.newList(a, .{
         .items = entry_items,
         .mutable = false,
         .enum_entries = true,
         .backing = null,
-    } };
+    });
     try testing.expect(entries.isRuntimeType("List"));
     try testing.expect(entries.isRuntimeType("EnumEntries"));
     try testing.expect(entries.isRuntimeType("Collection"));
@@ -347,12 +359,12 @@ test "enum entries is_runtime_type matches both" {
         defer g.deinit();
         try g.get().append(a, .{ .Int = 1 });
     }
-    const plain = Value{ .List = .{
+    const plain = try Value.newList(a, .{
         .items = plain_items,
         .mutable = false,
         .enum_entries = false,
         .backing = null,
-    } };
+    });
     try testing.expect(plain.isRuntimeType("List"));
     try testing.expect(!plain.isRuntimeType("EnumEntries"));
 }
@@ -368,11 +380,11 @@ test "enum entries keeps list type fqn for dispatch" {
         defer g.deinit();
         try g.get().append(a, .{ .Int = 1 });
     }
-    const entries = Value{ .List = .{
+    const entries = try Value.newList(a, .{
         .items = items,
         .mutable = false,
         .enum_entries = true,
         .backing = null,
-    } };
+    });
     try testing.expectEqualStrings("kotlin.collections.List", entries.typeFqn());
 }

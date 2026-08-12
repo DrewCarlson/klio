@@ -144,11 +144,11 @@ pub fn io_readln(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     switch (r) {
         .ok => |v| {
             if (v == .Null) {
-                return .{ .err = .{ .Thrown = .{ .Exception = .{
+                return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
                     .fqn = try runtime.strInit(ctx.allocator, "kotlin.RuntimeException"),
                     .message = .from(try runtime.strInit(ctx.allocator, "EOF has been reached")),
                     .cause = null,
-                } } } };
+                }) } };
             }
             return r;
         },

@@ -33,12 +33,12 @@ fn negativeCapacity(ctx: *CallCtx) std.mem.Allocator.Error!?EvalResult {
     const cap = ctx.args[0].asI64() orelse return null;
     if (cap >= 0) return null;
     const msg = try std.fmt.allocPrint(ctx.allocator, "capacity must be non-negative, but was {d}.", .{cap});
-    return EvalResult{ .err = .{ .Thrown = .{ .Exception = .{
+    return EvalResult{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
         .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
         .cause = null,
         .suppressed = (try runtime.ValueList.init(ctx.allocator, .empty)).cell,
-    } } } };
+    }) } };
 }
 
 pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -47,7 +47,7 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     if (try negativeCapacity(ctx)) |e| return e;
     const block = ctx.args[ctx.args.len - 1];
-    const buildable = Value{ .List = .{
+    const buildable = try Value.newList(ctx.allocator, .{
         .items = try ValueList.init(ctx.allocator, .empty),
         .mutable = true,
         .enum_entries = false,
@@ -55,12 +55,11 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         // The builder is a live `MutableList` the block iterates + mutates;
         // give it a structural counter so a concurrent iterator fails-fast.
         .mod_count = .from(try ObjRef(u64).init(ctx.allocator, 0)),
-    } };
+    });
     {
         const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
         if (r == .err) {
-            buildable.List.items.deinit();
-            if (buildable.List.mod_count.get()) |mc| mc.deinit();
+            buildable.release(ctx.allocator);
             return r;
         }
     }
@@ -70,7 +69,6 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const g = mc.borrowMut();
         g.get().* |= collections.FROZEN_MOD_BIT;
         g.deinit();
-        mc.deinit();
     }
     // An empty build result IS the shared empty singleton (Kotlin's
     // buildList returns EmptyList for size 0; assertSame holds).
@@ -80,15 +78,12 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         break :blk g.get().items.len == 0;
     };
     if (list_empty) {
-        buildable.List.items.deinit();
+        buildable.release(ctx.allocator);
         return ok(try collections.sharedEmptyList(ctx.allocator));
     }
-    return ok(.{ .List = .{
-        .items = buildable.List.items,
-        .mutable = false,
-        .enum_entries = false,
-        .backing = null,
-    } });
+    // Reuse the builder's box as the result, flipped read-only.
+    buildable.List.mutable = false;
+    return ok(buildable);
 }
 
 pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -101,17 +96,16 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // the block, so a builder iterator observes `add(existing)` as a no-op
     // (Kotlin's `buildSet` exposes a `MutableSet`). A shared counter lets a
     // concurrent iterator fail-fast.
-    const buildable = Value{ .Set = .{
+    const buildable = try Value.newSet(ctx.allocator, .{
         .items = try ValueList.init(ctx.allocator, .empty),
         .mutable = true,
         .backing = null,
         .mod_count = .from(try ObjRef(u64).init(ctx.allocator, 0)),
-    } };
+    });
     {
         const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
         if (r == .err) {
-            buildable.Set.items.deinit();
-            if (buildable.Set.mod_count.get()) |mc| mc.deinit();
+            buildable.release(ctx.allocator);
             return r;
         }
     }
@@ -119,7 +113,6 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const g = mc.borrowMut();
         g.get().* |= collections.FROZEN_MOD_BIT;
         g.deinit();
-        mc.deinit();
     }
     const set_empty = blk: {
         const g = buildable.Set.items.borrow();
@@ -127,14 +120,14 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         break :blk g.get().items.len == 0;
     };
     if (set_empty) {
-        buildable.Set.items.deinit();
+        buildable.release(ctx.allocator);
         return ok(try collections.sharedEmptySet(ctx.allocator));
     }
-    return ok(.{ .Set = .{
-        .items = buildable.Set.items,
-        .mutable = false,
-        .backing = null,
-    } });
+    // Reuse the builder's box as the result: flip it read-only (the frozen
+    // counter already rejects mutation through leaked views) and hand the
+    // creation reference to the caller.
+    buildable.Set.mutable = false;
+    return ok(buildable);
 }
 
 pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -145,14 +138,14 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const block = ctx.args[ctx.args.len - 1];
     // The builder is a live `MutableMap` the block can iterate (via keys/values/
     // entries) and mutate; give it a structural counter for fail-fast iteration.
-    const buildable = Value{ .Map = .{
+    const buildable = try Value.newMap(ctx.allocator, .{
         .entries = try MapEntries.init(ctx.allocator, .{ .mod_count = .from(try ObjRef(u64).init(ctx.allocator, 0)) }),
         .mutable = true,
-    } };
+    });
     {
         const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
         if (r == .err) {
-            buildable.Map.entries.deinit();
+            buildable.release(ctx.allocator);
             return r;
         }
     }
@@ -174,13 +167,12 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         break :blk g.get().pairs.items.len == 0;
     };
     if (map_empty) {
-        buildable.Map.entries.deinit();
+        buildable.release(ctx.allocator);
         return ok(try collections.sharedEmptyMap(ctx.allocator));
     }
-    return ok(.{ .Map = .{
-        .entries = buildable.Map.entries,
-        .mutable = false,
-    } });
+    // Reuse the builder's box as the result, flipped read-only.
+    buildable.Map.mutable = false;
+    return ok(buildable);
 }
 
 pub fn builders_build_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -219,12 +211,12 @@ pub fn contract_error(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         },
         else => try v.display(ctx.allocator),
     };
-    return .{ .err = .{ .Thrown = .{ .Exception = .{
+    return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalStateException"),
         .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
         .cause = null,
         .suppressed = (try runtime.ValueList.init(ctx.allocator, .empty)).cell,
-    } } } };
+    }) } };
 }
 
 pub fn contract_todo(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -240,12 +232,12 @@ pub fn contract_todo(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             break :blk try std.fmt.allocPrint(ctx.allocator, "An operation is not implemented: {s}", .{rendered});
         },
     } else try ctx.allocator.dupe(u8, "An operation is not implemented.");
-    return .{ .err = .{ .Thrown = .{ .Exception = .{
+    return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.NotImplementedError"),
         .message = .from(try runtime.strInitOwned(ctx.allocator, msg)),
         .cause = null,
         .suppressed = (try runtime.ValueList.init(ctx.allocator, .empty)).cell,
-    } } } };
+    }) } };
 }
 
 // ============================================================
@@ -343,23 +335,20 @@ const RecordingHost = struct {
 fn freeListResult(v: Value) void {
     // The element/entry storage is an `ObjRef` over an `ArrayList`; releasing
     // the final handle runs the list's own `deinit`, so no manual clear here.
+    // A boxed payload (Set/Map) drops its box, whose teardown releases what
+    // the collection owns — including the mod_count the inline form had no
+    // handle for here.
     switch (v) {
-        .List => |l| l.items.deinit(),
-        .Set => |s| s.items.deinit(),
-        .Map => |m| m.entries.deinit(),
+        .List => |l| runtime.listRefOf(l).deinit(),
+        .Set => |s| runtime.setRefOf(s).deinit(),
+        .Map => |m| runtime.mapRefOf(m).deinit(),
         else => {},
     }
 }
 
 fn freeException(e: anytype) void {
-    e.fqn.deinit();
-    if (e.message.get()) |m| {
-        // The message cell owns its bytes (built via `initOwned`/`init`) and
-        // frees them on the final `deinit`; do not free the bytes manually.
-        m.deinit();
-    }
-    if (e.cause) |c| (runtime.ValueBox{ .cell = c }).deinit();
-    if (e.suppressed) |s| (runtime.ValueList{ .cell = s }).deinit();
+    // Boxed payload: dropping the box releases everything it owns.
+    runtime.exceptionRefOf(e).deinit();
 }
 
 test "buildList freezes a populated list" {

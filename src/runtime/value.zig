@@ -10,6 +10,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const objcell = @import("objcell.zig");
+const trace_mod = @import("trace.zig");
 const float_fmt = @import("float_fmt.zig");
 const class_mod = @import("class.zig");
 const env_mod = @import("env.zig");
@@ -387,6 +388,179 @@ pub const MapStore = struct {
 
 /// `ObjRef<MapStore>` — shared, growable map entry storage with a hash index.
 pub const MapEntries = ObjRef(MapStore);
+
+/// The boxed payload of `Value.Map` (see the union field). One control block
+/// per map VALUE; copies of the `Value` share it by pointer, and the box's
+/// refcount teardown releases what the map owns.
+pub const MapData = struct {
+    entries: MapEntries,
+    mutable: bool,
+    /// Declared key/value type heads from explicit call-site type
+    /// arguments on the creating stdlib function; see `List`.
+    declared_key: ?[]const u8 = null,
+    declared_value: ?[]const u8 = null,
+
+    /// Refcount teardown (the box's last handle): release each entry's key
+    /// and value when this box was the entries' last owner, then the
+    /// entries handle itself. Mirrors what `Value.release` did in-line
+    /// before the payload was boxed.
+    pub fn deinit(self: *MapData, allocator: std.mem.Allocator) void {
+        if (self.entries.strongCount() == 1) {
+            const g = self.entries.borrow();
+            for (g.get().pairs.items) |pair| {
+                pair.key.release(allocator);
+                pair.value.release(allocator);
+            }
+            g.deinit();
+        }
+        self.entries.deinit();
+    }
+
+    /// GC out-edge: the entries cell (its own trace reaches the pairs).
+    pub fn gcTrace(self: *const MapData, m: *objcell.gc.Marker) void {
+        m.shade(&self.entries.cell.hdr);
+    }
+};
+
+/// The control-block handle behind a boxed `Value.Map` payload.
+pub const MapRef = ObjRef(MapData);
+
+/// Recover the owning control block from a boxed map payload pointer.
+pub inline fn mapRefOf(m: *MapData) MapRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", m)) };
+}
+
+/// The boxed payload of `Value.Exception` (see `MapData` for the scheme).
+/// Copies of the `Value` share one record, so `fillInStackTrace`,
+/// `addSuppressed`, and cause writes are visible through every copy — the
+/// JVM's reference semantics.
+pub const ExceptionData = struct {
+    fqn: StringRef,
+    message: objcell.OptRef(StringData) = .{},
+    /// Stored as a bare nullable cell pointer (`?*ValueBox.Cell`, 8 bytes —
+    /// `?ObjRef` is not null-optimized) and reconstructed as `ValueBox` at
+    /// each use. Mirrors `ListData.backing`.
+    cause: ?*ValueBox.Cell,
+    /// The call stack captured when this throwable was first thrown
+    /// (`fillInStackTrace`). Null until thrown. Borrows program-lifetime
+    /// frame labels; the frame slice is owned by the `StackRef` cell.
+    /// Stored as `?*StackRef.Cell`; reconstructed as `StackRef` at use.
+    stack: ?*StackRef.Cell = null,
+    /// Reference identity for `===` / `assertSame`. Assigned fresh at the
+    /// throwable construction site (`host.allocInstanceId()`); 0 for
+    /// exceptions built outside that path, which then compare structurally.
+    identity: u64 = 0,
+    /// Suppressed throwables (`addSuppressed`/`suppressedExceptions`). A
+    /// shared list allocated at the constructor site so every value-copy
+    /// of the exception observes the same suppressed set; null for
+    /// exceptions built outside that path. Stored as `?*ValueList.Cell`;
+    /// reconstructed as `ValueList` at use.
+    suppressed: ?*ValueList.Cell = null,
+
+    pub fn deinit(self: *ExceptionData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.fqn.deinit();
+        if (self.message.get()) |m| m.deinit();
+        if (self.cause) |c| (ValueBox{ .cell = c }).deinit();
+        if (self.stack) |st| (StackRef{ .cell = st }).deinit();
+        if (self.suppressed) |sl| (ValueList{ .cell = sl }).deinit();
+    }
+
+    pub fn gcTrace(self: *const ExceptionData, m: *objcell.gc.Marker) void {
+        m.shade(&self.fqn.cell.hdr);
+        if (self.message.get()) |msg| m.shade(&msg.cell.hdr);
+        if (self.cause) |c| m.shade(&c.hdr);
+        if (self.stack) |st| m.shade(&st.hdr);
+        if (self.suppressed) |sl| m.shade(&sl.hdr);
+    }
+};
+
+/// The control-block handle behind a boxed `Value.Exception` payload.
+pub const ExceptionRef = ObjRef(ExceptionData);
+
+/// Recover the owning control block from a boxed exception payload pointer.
+pub inline fn exceptionRefOf(e: *ExceptionData) ExceptionRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", e)) };
+}
+
+/// The boxed payload of `Value.List` (see `MapData` for the scheme).
+pub const ListData = struct {
+    items: ValueList,
+    mutable: bool,
+    /// Set for `EnumName.entries` / `.values()` lists. Only ever queried as
+    /// a boolean ("is this the enum-entries list"), so a flag suffices — no
+    /// StringRef allocation.
+    enum_entries: bool = false,
+    /// Set for a live view: a `MutableMap.values` view, a `subList` window,
+    /// or a primitive-array `.asList()` (see `CollBacking`).
+    backing: ?*CollBackingCell,
+    /// Declared element-type head from an explicit call-site type
+    /// argument on the creating stdlib function (`listOf<String>()`).
+    /// Head name only; borrows the module's interned consts, which
+    /// outlive every value. Dispatch reads it to type an empty list;
+    /// `null` everywhere the creation site carried no annotation.
+    declared_elem: ?[]const u8 = null,
+    /// Structural-modification counter for fail-fast iteration. Allocated
+    /// when a mutable list is created; shared (by ObjRef handle) across
+    /// every value-copy of the list and the iterators it spawns. A
+    /// structural mutation (add/remove/clear/…) bumps it; an iterator
+    /// captures it and throws `ConcurrentModificationException` when it
+    /// changes underneath. Null for read-only lists / views.
+    mod_count: objcell.OptRef(u64) = .{},
+
+    pub fn deinit(self: *ListData, allocator: std.mem.Allocator) void {
+        Value.releaseValueList(self.items, allocator);
+        if (self.backing) |b| (CollBackingRef{ .cell = b }).deinit();
+        if (self.mod_count.get()) |mc| mc.deinit();
+    }
+
+    pub fn gcTrace(self: *const ListData, m: *objcell.gc.Marker) void {
+        m.shade(&self.items.cell.hdr);
+        if (self.backing) |b| m.shade(&b.hdr);
+        if (self.mod_count.get()) |mc| m.shade(&mc.cell.hdr);
+    }
+};
+
+/// The control-block handle behind a boxed `Value.List` payload.
+pub const ListRef = ObjRef(ListData);
+
+/// Recover the owning control block from a boxed list payload pointer.
+pub inline fn listRefOf(l: *ListData) ListRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", l)) };
+}
+
+/// The boxed payload of `Value.Set` (see `MapData` for the scheme).
+pub const SetData = struct {
+    items: ValueList,
+    mutable: bool,
+    /// Set when this is a live `MutableMap.keys`/`.entries` view.
+    backing: ?*CollBackingCell,
+    /// Declared element-type head from an explicit call-site type
+    /// argument on the creating stdlib function; see `List`.
+    declared_elem: ?[]const u8 = null,
+    /// Structural-modification counter for fail-fast iteration; see `List`.
+    mod_count: objcell.OptRef(u64) = .{},
+
+    pub fn deinit(self: *SetData, allocator: std.mem.Allocator) void {
+        Value.releaseValueList(self.items, allocator);
+        if (self.backing) |b| (CollBackingRef{ .cell = b }).deinit();
+        if (self.mod_count.get()) |mc| mc.deinit();
+    }
+
+    pub fn gcTrace(self: *const SetData, m: *objcell.gc.Marker) void {
+        m.shade(&self.items.cell.hdr);
+        if (self.backing) |b| m.shade(&b.hdr);
+        if (self.mod_count.get()) |mc| m.shade(&mc.cell.hdr);
+    }
+};
+
+/// The control-block handle behind a boxed `Value.Set` payload.
+pub const SetRef = ObjRef(SetData);
+
+/// Recover the owning control block from a boxed set payload pointer.
+pub inline fn setRefOf(s: *SetData) SetRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", s)) };
+}
 /// A refcounted box holding a single `Value`, shared by handle. Used for
 /// the component slots of `Pair`/`Triple`/`MapEntry`/
 /// `Result`/`Exception.cause`/`BoundMethod.receiver`/`Sequence` generators so a
@@ -1560,78 +1734,22 @@ pub const Value = union(enum) {
         receiver: ObjRef(InstanceData),
         method: *const MethodDef,
     },
-    /// A thrown value, modeled as a Kotlin Throwable.
-    Exception: struct {
-        fqn: StringRef,
-        message: objcell.OptRef(StringData) = .{},
-        /// Stored as a bare nullable cell pointer (`?*ValueBox.Cell`, 8 bytes —
-        /// `?ObjRef` is not null-optimized) and reconstructed as `ValueBox` at
-        /// each use, keeping `Value` pinned at 64. Mirrors `List.backing`.
-        cause: ?*ValueBox.Cell,
-        /// The call stack captured when this throwable was first thrown
-        /// (`fillInStackTrace`). Null until thrown. Borrows program-lifetime
-        /// frame labels; the frame slice is owned by the `StackRef` cell.
-        /// Stored as `?*StackRef.Cell`; reconstructed as `StackRef` at use.
-        stack: ?*StackRef.Cell = null,
-        /// Reference identity for `===` / `assertSame`. Assigned fresh at the
-        /// throwable construction site (`host.allocInstanceId()`); 0 for
-        /// exceptions built outside that path, which then compare structurally.
-        identity: u64 = 0,
-        /// Suppressed throwables (`addSuppressed`/`suppressedExceptions`). A
-        /// shared list allocated at the constructor site so every value-copy
-        /// of the exception observes the same suppressed set; null for
-        /// exceptions built outside that path. Stored as `?*ValueList.Cell`;
-        /// reconstructed as `ValueList` at use.
-        suppressed: ?*ValueList.Cell = null,
-    },
-    /// `kotlin.collections.List` / `MutableList`.
-    List: struct {
-        items: ValueList,
-        mutable: bool,
-        /// Set for `EnumName.entries` / `.values()` lists. Only ever queried as
-        /// a boolean ("is this the enum-entries list"), so a flag suffices — no
-        /// StringRef allocation, and it keeps the `List` payload small.
-        enum_entries: bool = false,
-        /// Set for a live view: a `MutableMap.values` view, a `subList` window,
-        /// or a primitive-array `.asList()` (see `CollBacking`).
-        backing: ?*CollBackingCell,
-        /// Declared element-type head from an explicit call-site type
-        /// argument on the creating stdlib function (`listOf<String>()`).
-        /// Head name only; borrows the module's interned consts, which
-        /// outlive every value. Dispatch reads it to type an empty list;
-        /// `null` everywhere the creation site carried no annotation.
-        declared_elem: ?[]const u8 = null,
-        /// Structural-modification counter for fail-fast iteration. Allocated
-        /// when a mutable list is created; shared (by ObjRef handle) across
-        /// every value-copy of the list and the iterators it spawns. A
-        /// structural mutation (add/remove/clear/…) bumps it; an iterator
-        /// captures it and throws `ConcurrentModificationException` when it
-        /// changes underneath. Null for read-only lists / views.
-        mod_count: objcell.OptRef(u64) = .{},
-    },
+    /// A thrown value, modeled as a Kotlin Throwable. Boxed like `Map` (see
+    /// `ExceptionData`); construct with `Value.newException`.
+    Exception: *ExceptionData,
+    /// `kotlin.collections.List` / `MutableList`. Boxed like `Map` (see
+    /// `ListData`); construct with `Value.newList`.
+    List: *ListData,
     /// `kotlin.Array<T>` and primitive-array siblings.
     Array: ArrayData,
-    /// `kotlin.collections.Set` / `MutableSet`.
-    Set: struct {
-        items: ValueList,
-        mutable: bool,
-        /// Set when this is a live `MutableMap.keys`/`.entries` view.
-        backing: ?*CollBackingCell,
-        /// Declared element-type head from an explicit call-site type
-        /// argument on the creating stdlib function; see `List`.
-        declared_elem: ?[]const u8 = null,
-        /// Structural-modification counter for fail-fast iteration; see `List`.
-        mod_count: objcell.OptRef(u64) = .{},
-    },
-    /// `kotlin.collections.Map` / `MutableMap`.
-    Map: struct {
-        entries: MapEntries,
-        mutable: bool,
-        /// Declared key/value type heads from explicit call-site type
-        /// arguments on the creating stdlib function; see `List`.
-        declared_key: ?[]const u8 = null,
-        declared_value: ?[]const u8 = null,
-    },
+    /// `kotlin.collections.Set` / `MutableSet`. Boxed like `Map` (see
+    /// `SetData`); construct with `Value.newSet`.
+    Set: *SetData,
+    /// `kotlin.collections.Map` / `MutableMap`. Boxed: the pointer targets
+    /// the `data` field of an `ObjRef(MapData)` control block (recovered
+    /// with `mapRefOf`), so a `Value` copy moves 8 bytes and shares the
+    /// payload. Construct with `Value.newMap`.
+    Map: *MapData,
     /// `kotlin.Pair`.
     Pair: struct { first: ValueBox, second: ValueBox },
     /// `kotlin.Triple`.
@@ -1778,21 +1896,15 @@ pub const Value = union(enum) {
             .Function => |f| visitor.visit(f.env),
             .IrClosure => |c| visitor.visit(c.captures),
             .Comparator => |c| visitor.visit(c.steps),
-            .List => |x| {
-                visitor.visit(x.items);
-                if (x.backing) |b| visitor.visit(CollBackingRef{ .cell = b });
-                if (x.mod_count.get()) |mc| visitor.visit(mc);
-            },
-            .Set => |x| {
-                visitor.visit(x.items);
-                if (x.backing) |b| visitor.visit(CollBackingRef{ .cell = b });
-                if (x.mod_count.get()) |mc| visitor.visit(mc);
-            },
+            .List => |x| visitor.visit(listRefOf(x)),
+            .Set => |x| visitor.visit(setRefOf(x)),
             .Array => |x| switch (x.storage) {
                 .boxed => |vl| visitor.visit(vl),
                 .scalars => |pb| visitor.visit(pb),
             },
-            .Map => |x| visitor.visit(x.entries),
+            // Boxed payload: the BOX cell is the one owned edge (its own
+            // trace/teardown reaches the entries).
+            .Map => |x| visitor.visit(mapRefOf(x)),
             .Iterator => |x| {
                 visitor.visit(x.items);
                 visitor.visit(x.cursor);
@@ -1805,13 +1917,7 @@ pub const Value = union(enum) {
             .SeqIter => |s| visitor.visit(s),
             .PropertyRef => |p| visitor.visit(p.name),
             .MatchGroup => |g| visitor.visit(g.value),
-            .Exception => |e| {
-                visitor.visit(e.fqn);
-                if (e.message.get()) |m| visitor.visit(m);
-                if (e.cause) |c| visitor.visit(ValueBox{ .cell = c });
-                if (e.stack) |s| visitor.visit(StackRef{ .cell = s });
-                if (e.suppressed) |sl| visitor.visit(ValueList{ .cell = sl });
-            },
+            .Exception => |e| visitor.visit(exceptionRefOf(e)),
             .Pair => |p| {
                 visitor.visit(p.first);
                 visitor.visit(p.second);
@@ -1845,6 +1951,32 @@ pub const Value = union(enum) {
             .Unit, .CoroutineSuspended, .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Bool, .Char, .Null => true,
             else => false,
         };
+    }
+
+    /// Allocate the boxed `Map` payload (one control block, refcount 1) and
+    /// return the `Value` holding it. The only way to construct a `.Map`.
+    pub fn newMap(allocator: std.mem.Allocator, data: MapData) std.mem.Allocator.Error!Value {
+        const ref = try MapRef.initOwned(allocator, data);
+        return .{ .Map = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `Set` payload; the only way to construct a `.Set`.
+    pub fn newSet(allocator: std.mem.Allocator, data: SetData) std.mem.Allocator.Error!Value {
+        const ref = try SetRef.initOwned(allocator, data);
+        return .{ .Set = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `List` payload; the only way to construct a `.List`.
+    pub fn newList(allocator: std.mem.Allocator, data: ListData) std.mem.Allocator.Error!Value {
+        const ref = try ListRef.initOwned(allocator, data);
+        return .{ .List = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `Exception` payload; the only way to construct a
+    /// `.Exception`.
+    pub fn newException(allocator: std.mem.Allocator, data: ExceptionData) std.mem.Allocator.Error!Value {
+        const ref = try ExceptionRef.initOwned(allocator, data);
+        return .{ .Exception = &ref.cell.data };
     }
 
     pub fn retain(self: Value) void {
@@ -1926,33 +2058,22 @@ pub const Value = union(enum) {
             .IrClosure => |c| releaseSliceElems(c.captures, allocator),
             .Comparator => |c| c.steps.deinit(),
             .List => |x| {
-                releaseValueList(x.items, allocator);
-                // Drop the view's owned `CollBacking` cell (the borrowed source
-                // it points at is owned elsewhere, not released here).
-                if (x.backing) |b| (CollBackingRef{ .cell = b }).deinit();
-                if (x.mod_count.get()) |mc| mc.deinit();
+                if (std.c.getenv("KLIO_BOXDIE_TRACE") != null and x.backing != null and
+                    listRefOf(x).cell.refcount.load(.monotonic) == 1)
+                {
+                    std.debug.print("\n[boxdie] view List box dying (backing={s})\n", .{@tagName(x.backing.?.data)});
+                    trace_mod.dumpCurrent(.{});
+                }
+                listRefOf(x).deinit();
             },
-            .Set => |x| {
-                releaseValueList(x.items, allocator);
-                if (x.backing) |b| (CollBackingRef{ .cell = b }).deinit();
-                if (x.mod_count.get()) |mc| mc.deinit();
-            },
+            .Set => |x| setRefOf(x).deinit(),
             .Array => |x| switch (x.storage) {
                 .boxed => |vl| releaseValueList(vl, allocator),
                 .scalars => |pb| pb.deinit(),
             },
-            .Map => |x| {
-                // Last owner: release each entry's key and value.
-                if (x.entries.strongCount() == 1) {
-                    const g = x.entries.borrow();
-                    for (g.get().pairs.items) |pair| {
-                        pair.key.release(allocator);
-                        pair.value.release(allocator);
-                    }
-                    g.deinit();
-                }
-                x.entries.deinit();
-            },
+            // Boxed payload: drop the box handle; its last-owner teardown
+            // (`MapData.deinit`) releases the entries and their pairs.
+            .Map => |x| mapRefOf(x).deinit(),
             .Iterator => |x| {
                 releaseValueList(x.items, allocator);
                 x.cursor.deinit();
@@ -1965,12 +2086,7 @@ pub const Value = union(enum) {
             .SeqIter => |s| s.deinit(),
             .PropertyRef => |p| p.name.deinit(),
             .MatchGroup => |g| g.value.deinit(),
-            .Exception => |e| {
-                e.fqn.deinit();
-                if (e.message.get()) |m| m.deinit();
-                if (e.cause) |c| (ValueBox{ .cell = c }).deinit();
-                if (e.suppressed) |sl| (ValueList{ .cell = sl }).deinit();
-            },
+            .Exception => |e| exceptionRefOf(e).deinit(),
             .Pair => |p| {
                 p.first.deinit();
                 p.second.deinit();
@@ -3334,11 +3450,11 @@ pub fn attachDeclaredElemTypes(fqn: []const u8, type_args: []const []const u8, v
     for (elem_typed_creators) |c| {
         if (!std.mem.eql(u8, c, name)) continue;
         switch (v.*) {
-            .List => |*l| {
+            .List => |l| {
                 if (l.declared_elem == null) l.declared_elem = elem_arg;
                 coerceListElems(l.items, elem_arg);
             },
-            .Set => |*s| {
+            .Set => |s| {
                 if (s.declared_elem == null) s.declared_elem = elem_arg;
                 coerceListElems(s.items, elem_arg);
             },
@@ -3429,4 +3545,11 @@ test "display produces an owned string" {
     const s = try v.display(testing.allocator);
     defer testing.allocator.free(s);
     try testing.expectEqualStrings("42", s);
+}
+
+test "value layout census" {
+    std.debug.print("\nValue size={d} align={d}\n", .{ @sizeOf(Value), @alignOf(Value) });
+    inline for (@typeInfo(Value).@"union".fields) |f| {
+        if (@sizeOf(f.type) >= 24) std.debug.print("  {s}: {d}\n", .{ f.name, @sizeOf(f.type) });
+    }
 }

@@ -1536,7 +1536,7 @@ fn formatThrowableEnclosed(
 /// `Throwable`-subclass instance.
 pub fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
     switch (v.*) {
-        .Exception => |*e| {
+        .Exception => |e| {
             if (e.stack != null) return;
             if (try captureStack(allocator)) |s| e.stack = s.cell;
         },
@@ -6212,11 +6212,11 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         .NotNullAssert => |nn| {
             const v = frame.read(nn.src);
             if (v == .Null) {
-                const exc = Value{ .Exception = .{
+                const exc = try Value.newException(allocator, .{
                     .fqn = try runtime.strInit(allocator, "kotlin.NullPointerException"),
                     .message = .{},
                     .cause = null,
-                } };
+                });
                 return raiseStep(frame, .{ .Throw = exc });
             }
             v.retain();
@@ -8227,11 +8227,11 @@ noinline fn execArmCast(comptime H: type, allocator: Allocator, frame: *Frame, c
             std.debug.print("[throw-trace] from fn {s} (fqn={s}): ClassCastException cast to {s} (value tag {s})\n", .{ frame.func.name, frame.func.fqn, cast.ty.name, @tagName(v) });
         }
         const msg = try std.fmt.allocPrint(allocator, "cast to `{s}` failed", .{cast.ty.name});
-        const exc = Value{ .Exception = .{
+        const exc = try Value.newException(allocator, .{
             .fqn = try runtime.strInit(allocator, "kotlin.ClassCastException"),
             .message = .from(try runtime.strInitOwned(allocator, msg)),
             .cause = null,
-        } };
+        });
         return raiseStep(frame, .{ .Throw = exc });
     }
     return .cont;
@@ -8581,12 +8581,12 @@ noinline fn execArmNewList(comptime H: type, allocator: Allocator, frame: *Frame
     // releases them); `readArgRun` handed back borrows of the source
     // registers, so retain each. No-op under the arena fast path.
     if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
-    try frame.write(nl.dst, .{ .List = .{
+    try frame.write(nl.dst, try Value.newList(allocator, .{
         .items = try ValueList.init(allocator, list),
         .mutable = false,
         .enum_entries = false,
         .backing = null,
-    } });
+    }));
     return .cont;
 }
 
@@ -10084,11 +10084,11 @@ inline fn rangeIterFast(allocator: Allocator, recv: *const Value, name: []const 
     if (is_has_next) return ok(.{ .Bool = more });
     // next()
     if (!more) {
-        const exc = Value{ .Exception = .{
+        const exc = Value.newException(allocator, .{
             .fqn = runtime.strInit(allocator, "kotlin.NoSuchElementException") catch return null,
-            .message = .from(runtime.strInit(allocator, "iterator exhausted") catch null),
+            .message = if (runtime.strInit(allocator, "iterator exhausted")) |m| .from(m) else |_| .{},
             .cause = null,
-        } };
+        }) catch return null;
         return errResult(.{ .Throw = exc });
     }
     const adv = cur +| ri.step;
@@ -10706,11 +10706,11 @@ fn utf16Cmp(left: []const u8, right: []const u8) std.math.Order {
 }
 
 fn arithExc(allocator: Allocator, msg: []const u8) Allocator.Error!EvalError {
-    return .{ .Throw = .{ .Exception = .{
+    return .{ .Throw = try Value.newException(allocator, .{
         .fqn = try runtime.strInit(allocator, "kotlin.ArithmeticException"),
         .message = .from(try runtime.strInit(allocator, msg)),
         .cause = null,
-    } } };
+    }) };
 }
 
 /// Kotlin's defined numeric conversions and operator semantics.

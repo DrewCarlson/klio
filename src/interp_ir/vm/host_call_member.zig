@@ -84,11 +84,11 @@ fn typeErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Alloca
 }
 
 fn throwExc(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!EvalError {
-    return .{ .Throw = .{ .Exception = .{
+    return .{ .Throw = try Value.newException(allocator, .{
         .fqn = try runtime.strInit(allocator, fqn),
         .message = .from(if (message) |m| try runtime.strInit(allocator, m) else null),
         .cause = null,
-    } } };
+    }) };
 }
 
 fn strVal(allocator: Allocator, s: []const u8) Allocator.Error!Value {
@@ -1189,7 +1189,7 @@ fn materializeUserMap(self: *VmHost, allocator: Allocator, recv: *const Value) A
             },
         }
     }
-    return .{ .ok = .{ .Map = .{ .entries = try runtime.MapEntries.init(allocator, .{ .pairs = pairs }), .mutable = false } } };
+    return .{ .ok = try Value.newMap(allocator, .{ .entries = try runtime.MapEntries.init(allocator, .{ .pairs = pairs }), .mutable = false }) };
 }
 
 /// Extract `(key, value)` from a map-entry value.
@@ -2384,12 +2384,12 @@ fn drainIterableToList(self: *VmHost, allocator: Allocator, receiver: *const Val
             },
         }
     }
-    return .{ .ok = .{ .List = .{
+    return .{ .ok = try Value.newList(allocator, .{
         .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
         .mutable = false,
         .enum_entries = false,
         .backing = null,
-    } } };
+    }) };
 }
 
 // -------------------------------------------------------------------------
@@ -3457,12 +3457,12 @@ fn materialiseSequence(self: *VmHost, allocator: Allocator, seq_val: *const Valu
 // -------------------------------------------------------------------------
 
 fn listOf(allocator: Allocator, items: std.ArrayList(Value), mutable: bool) Allocator.Error!Value {
-    return .{ .List = .{
+    return try Value.newList(allocator, .{
         .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
         .mutable = mutable,
         .enum_entries = false,
         .backing = null,
-    } };
+    });
 }
 
 fn cloneItemsList(allocator: Allocator, src: runtime.ValueList) Allocator.Error!std.ArrayList(Value) {
@@ -4538,11 +4538,11 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         // `List.listIterator(index)` throws when `index !in 0..size`.
         if (idx < 0 or idx > size) {
             const msg = try std.fmt.allocPrint(allocator, "index: {d}, size: {d}", .{ idx, size });
-            return .{ .err = .{ .Throw = .{ .Exception = .{
+            return .{ .err = .{ .Throw = try Value.newException(allocator, .{
                 .fqn = try runtime.strInit(allocator, "kotlin.IndexOutOfBoundsException"),
                 .message = .from(try runtime.strInitOwned(allocator, msg)),
                 .cause = null,
-            } } } };
+            }) } };
         }
         const start: usize = @intCast(idx);
         if (stdlib.implementations.collections.sublistViewStale(receiver)) {
@@ -6661,12 +6661,12 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
             try items.append(allocator, e.value);
         }
         cg.deinit();
-        return .{ .ok = .{ .List = .{
+        return .{ .ok = try Value.newList(allocator, .{
             .items = try ObjRef(std.ArrayList(Value)).init(allocator, items),
             .mutable = false,
             .enum_entries = true,
             .backing = null,
-        } } };
+        }) };
     }
     // Enum.valueOf("X")
     if (is_enum and std.mem.eql(u8, name, "valueOf") and args.len == 1 and args[0] == .String) {
@@ -7451,7 +7451,7 @@ fn arrayShapeOps(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     }
     if (std.mem.eql(u8, name, "toSet") and args.len == 0) {
         const items = try cloneArrayItems(allocator, arr);
-        return .{ .ok = .{ .Set = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .mutable = false, .backing = null } } };
+        return .{ .ok = try Value.newSet(allocator, .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .mutable = false, .backing = null }) };
     }
     if (std.mem.eql(u8, name, "concatToString") and (args.len == 0 or args.len == 2)) {
         const chars = try arr.snapshot(allocator);
@@ -11702,7 +11702,7 @@ fn throwableSuppressedMember(self: *VmHost, allocator: Allocator, receiver: *con
         const cur = instanceSuppressedList(inst);
         if (cur) |l| return .{ .ok = l };
         const items = try runtime.ValueList.init(allocator, .empty);
-        return .{ .ok = .{ .List = .{ .items = items, .mutable = false, .backing = null } } };
+        return .{ .ok = try Value.newList(allocator, .{ .items = items, .mutable = false, .backing = null }) };
     }
     try appendInstanceSuppressed(inst, allocator, args[0]);
     return .{ .ok = .Unit };
@@ -11722,7 +11722,7 @@ pub fn appendInstanceSuppressed(inst: ObjRef(InstanceData), allocator: Allocator
     const list: Value = blk: {
         if (instanceSuppressedList(inst)) |l| break :blk l;
         const items = try runtime.ValueList.init(allocator, .empty);
-        const fresh = Value{ .List = .{ .items = items, .mutable = true, .backing = null } };
+        const fresh = try Value.newList(allocator, .{ .items = items, .mutable = true, .backing = null });
         const g = inst.borrowMut();
         defer g.deinit();
         try g.get().define(allocator, "__suppressed__", fresh);

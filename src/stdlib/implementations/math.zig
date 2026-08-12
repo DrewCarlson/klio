@@ -943,7 +943,7 @@ fn recv_double(ctx: *CallCtx, what: []const u8) std.mem.Allocator.Error!DoubleRe
 fn make_exception(ctx: *CallCtx, fqn: []const u8, message: ?[]const u8) std.mem.Allocator.Error!Value {
     const fqn_ref = try runtime.strInit(ctx.allocator, fqn);
     const msg_ref: ?StringRef = if (message) |m| try runtime.strInit(ctx.allocator, m) else null;
-    return .{ .Exception = .{ .fqn = fqn_ref, .message = .from(msg_ref), .cause = null } };
+    return try Value.newException(ctx.allocator, .{ .fqn = fqn_ref, .message = .from(msg_ref), .cause = null });
 }
 
 /// `collections::kotlin_float_total_cmp` — total order over f64 with NaN
@@ -1280,12 +1280,9 @@ test "roundToInt and roundToLong clamp and reject NaN" {
     try testing.expectEqual(@as(i64, 5), (try num_round_to_long(&c5)).ok.Long);
 }
 
-/// Free the refcounted strings backing a freshly-built `Exception` value.
+/// Drop a freshly-built `Exception` value (its box owns the strings).
 fn freeException(v: Value) void {
-    if (v == .Exception) {
-        v.Exception.fqn.deinit();
-        if (v.Exception.message.get()) |m| m.deinit();
-    }
+    if (v == .Exception) runtime.exceptionRefOf(v.Exception).deinit();
 }
 
 test "bit operations" {

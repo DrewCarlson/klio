@@ -174,24 +174,24 @@ fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     // `items` is a borrowed slice (call args, or a `snapshotItems`/`dupe` copy
     // that did not bump counts); the list owns one ref per element, so retain.
     if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
-    return .{ .List = .{
+    return try Value.newList(a, .{
         .items = try ValueList.init(a, list),
         .mutable = mutable,
         .enum_entries = false,
         .backing = null,
         .mod_count = try modCountFor(a, mutable),
-    } };
+    });
 }
 
 /// `make_list` consuming an already-built ArrayList (no copy).
 fn makeListFromArrayList(a: Allocator, list: std.ArrayList(Value), mutable: bool) Error!Value {
-    return .{ .List = .{
+    return try Value.newList(a, .{
         .items = try ValueList.init(a, list),
         .mutable = mutable,
         .enum_entries = false,
         .backing = null,
         .mod_count = try modCountFor(a, mutable),
-    } };
+    });
 }
 
 /// Like `makeListFromArrayList`, but for a backing whose elements are *borrowed*
@@ -250,12 +250,12 @@ fn makeSet(a: Allocator, items: []const Value, mutable: bool) Error!Value {
             try deduped.append(a, v);
         }
     }
-    return .{ .Set = .{
+    return try Value.newSet(a, .{
         .items = try ValueList.init(a, deduped),
         .mutable = mutable,
         .backing = null,
         .mod_count = try modCountFor(a, mutable),
-    } };
+    });
 }
 
 fn makeArray(a: Allocator, items: []const Value, prim: ?PrimitiveArrayKind) Error!Value {
@@ -308,11 +308,11 @@ fn makeMap(a: Allocator, entries: []const MapPair, mutable: bool) Error!Value {
             try out.append(a, kv);
         }
     }
-    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = out, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable } };
+    return try Value.newMap(a, .{ .entries = try MapEntries.init(a, .{ .pairs = out, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable });
 }
 
 fn makeMapFromArrayList(a: Allocator, entries: std.ArrayList(MapPair), mutable: bool) Error!Value {
-    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = entries, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable } };
+    return try Value.newMap(a, .{ .entries = try MapEntries.init(a, .{ .pairs = entries, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable });
 }
 
 /// `makeMapFromArrayList` for entries whose key+value are *borrowed*: the new
@@ -342,7 +342,7 @@ fn makeTriple(a: Allocator, first: Value, second: Value, third: Value) Error!Val
 fn makeException(a: Allocator, fqn: []const u8, message: ?[]const u8) Error!Value {
     const fqn_ref = try runtime.strInit(a, fqn);
     const msg_ref: ?StringRef = if (message) |m| try runtime.strInit(a, m) else null;
-    return .{ .Exception = .{ .fqn = fqn_ref, .message = .from(msg_ref), .cause = null } };
+    return try Value.newException(a, .{ .fqn = fqn_ref, .message = .from(msg_ref), .cause = null });
 }
 
 /// `Err(RuntimeError::Thrown(make_exception(...)))` as an EvalResult.
@@ -501,7 +501,7 @@ fn makeMapH(host: IntrinsicHost, out: Output, a: Allocator, entries: []const Map
             try o.append(a, kv);
         }
     }
-    return .{ .Map = .{ .entries = try MapEntries.init(a, .{ .pairs = o, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable } };
+    return try Value.newMap(a, .{ .entries = try MapEntries.init(a, .{ .pairs = o, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable });
 }
 
 /// Dedup `items` honouring user `equals` (for setOf/toSet over user objects).
@@ -513,12 +513,12 @@ fn makeSetH(host: IntrinsicHost, out: Output, a: Allocator, items: []const Value
             try deduped.append(a, v);
         }
     }
-    return .{ .Set = .{
+    return try Value.newSet(a, .{
         .items = try ValueList.init(a, deduped),
         .mutable = mutable,
         .backing = null,
         .mod_count = try modCountFor(a, mutable),
-    } };
+    });
 }
 
 /// Reinterpret a numeric `needle` into the element kind of a primitive
@@ -2380,13 +2380,13 @@ pub fn coll_array_as_array_list(ctx: *CallCtx) Error!EvalResult {
 /// `array` backing so each read re-reads the packed scalars.
 pub fn arrayAsListView(a: Allocator, arr: runtime.ArrayData) Error!Value {
     switch (arr.storage) {
-        .boxed => |vl| return .{ .List = .{
+        .boxed => |vl| return try Value.newList(a, .{
             .items = vl.clone(),
             .mutable = false,
             .enum_entries = false,
             .backing = null,
             .mod_count = .{},
-        } },
+        }),
         .scalars => |buf| {
             const view_kind = arr.prim orelse blk: {
                 const g = buf.borrow();
@@ -2402,13 +2402,13 @@ pub fn arrayAsListView(a: Allocator, arr: runtime.ArrayData) Error!Value {
                 while (i < n) : (i += 1) try snap.append(a, g.get().getAs(i, view_kind));
             }
             const backing = try CollBackingRef.init(a, .{ .array = .{ .buf = buf, .view_kind = view_kind } });
-            return .{ .List = .{
+            return try Value.newList(a, .{
                 .items = try ValueList.init(a, snap),
                 .mutable = false,
                 .enum_entries = false,
                 .backing = backing.cell,
                 .mod_count = .{},
-            } };
+            });
         },
     }
 }
@@ -5086,13 +5086,13 @@ pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
     // (not through this view) is observed as a ConcurrentModification by this
     // subList's iterators — matching Kotlin's SubList, which tracks root.modCount.
     const shared_mc = if (recv.List.mod_count.get()) |mc| runtime.OptRef(u64).from(mc.clone()) else try modCountFor(a, mutable);
-    return ok(.{ .List = .{
+    return ok(try Value.newList(a, .{
         .items = try ValueList.init(a, window),
         .mutable = mutable,
         .enum_entries = false,
         .backing = backing.cell,
         .mod_count = shared_mc,
-    } });
+    }));
 }
 
 pub fn coll_list_plus(ctx: *CallCtx) Error!EvalResult {
@@ -5416,7 +5416,7 @@ fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     // `out` holds borrowed elements (snapshot/args); the new set owns one ref
     // per element, so retain each before adopting the backing.
     if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
-    return ok(.{ .Set = .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null } });
+    return ok(try Value.newSet(a, .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null }));
 }
 
 pub fn coll_set_plus(ctx: *CallCtx) Error!EvalResult {
@@ -5458,7 +5458,7 @@ pub fn coll_set_minus(ctx: *CallCtx) Error!EvalResult {
     // `out` holds borrowed elements (snapshot/args); the new set owns one ref
     // per element, so retain each before adopting the backing.
     if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
-    return ok(.{ .Set = .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null } });
+    return ok(try Value.newSet(a, .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null }));
 }
 pub fn coll_set_subtract(ctx: *CallCtx) Error!EvalResult {
     return coll_set_minus(ctx);
@@ -5488,7 +5488,7 @@ pub fn coll_set_intersect(ctx: *CallCtx) Error!EvalResult {
     // `out` holds borrowed elements (snapshot/args); the new set owns one ref
     // per element, so retain each before adopting the backing.
     if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
-    return ok(.{ .Set = .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null } });
+    return ok(try Value.newSet(a, .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null }));
 }
 
 pub fn coll_set_size(ctx: *CallCtx) Error!EvalResult {
@@ -5991,7 +5991,7 @@ pub fn coll_map_keys(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try CollBackingRef.init(a, .{ .map = .{ .entries = entries, .kind = .Keys } });
-    return ok(.{ .Set = .{ .items = try ValueList.init(a, keys), .mutable = writable, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
+    return ok(try Value.newSet(a, .{ .items = try ValueList.init(a, keys), .mutable = writable, .backing = backing.cell, .mod_count = entriesModCountClone(entries) }));
 }
 pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -6012,7 +6012,7 @@ pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try CollBackingRef.init(a, .{ .map = .{ .entries = entries, .kind = .Values } });
-    return ok(.{ .List = .{ .items = try ValueList.init(a, values), .mutable = writable, .enum_entries = false, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
+    return ok(try Value.newList(a, .{ .items = try ValueList.init(a, values), .mutable = writable, .enum_entries = false, .backing = backing.cell, .mod_count = entriesModCountClone(entries) }));
 }
 pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -6040,7 +6040,7 @@ pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
         }
     }
     const backing = try CollBackingRef.init(a, .{ .map = .{ .entries = entries, .kind = .Entries } });
-    return ok(.{ .Set = .{ .items = try ValueList.init(a, map_entries), .mutable = writable, .backing = backing.cell, .mod_count = entriesModCountClone(entries) } });
+    return ok(try Value.newSet(a, .{ .items = try ValueList.init(a, map_entries), .mutable = writable, .backing = backing.cell, .mod_count = entriesModCountClone(entries) }));
 }
 pub fn coll_map_to_string(ctx: *CallCtx) Error!EvalResult {
     return collToString(ctx, "Map.toString");
