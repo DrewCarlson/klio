@@ -124,9 +124,10 @@ until the last 48-byte payload boxes, so the wins land at stage ends:
       hand-rolled GC root/marker that reaches into a `Value`'s payload
       fields must be converted to `v.gcMark(m)` in the same commit that
       boxes the payload (grep `\.cell.hdr` shades near `Value` fields).
-      The full-trace minor stays the default until the generational
-      shortcut is re-validated under the boxed layout (perf follow-up;
-      sweep shows no regression at 131s).
+      The generational shortcut was re-validated after the fix (the
+      StringTest repro and the full sweep pass with the early stop on) and
+      is the DEFAULT again; `KLIO_GC_MINOR_STOP=0` gives the full-trace
+      minor for bisecting any future missed-barrier suspicion.
 - [x] Stage 5a: RangeIter 40 → 32 — the cursor and the yielded-last flag
       merged into ONE shared `RangeIterState` cell (one allocation and one
       lock per step instead of two). **Value = 40.** Sweep wall unchanged

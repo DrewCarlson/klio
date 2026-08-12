@@ -72,15 +72,9 @@ pub const Marker = struct {
             trace.dumpCurrent(.{});
             @panic("KGC: root shaded a swept cell (incomplete root)");
         }
-        // Tenured cells are not swept by a minor, so stopping the walk at
-        // them is safe ONLY if every tenured->nursery edge is in the
-        // remembered set. The boxed Value payloads broke that assumption
-        // somewhere (a live nursery box behind an un-remembered tenured cell
-        // was swept — StringTest.zipWithNext GPF), so minors keep the cheap
-        // nursery-only SWEEP but trace THROUGH tenured cells; the mark can
-        // stop only at tenured cells it has already visited this epoch.
-        // KLIO_GC_MINOR_STOP=1 restores the old early stop for bisecting the
-        // missing barrier.
+        // Tenured: not swept by a minor. Sound while every tenured->nursery
+        // edge is remembered — see `minor_stops_at_tenured` for the
+        // bisection flag that makes minors trace through tenured cells.
         if (self.minor and h.gc_gen != 0 and minor_stops_at_tenured) return;
         if (h.gc_mark == self.epoch) return; // already grey or black this epoch
         h.gc_mark = self.epoch;
@@ -589,9 +583,12 @@ pub var gc_nofree: bool = false;
 /// stack trace: the exact swept-while-live cell that an incomplete root missed.
 pub var gc_poison: bool = false;
 /// Whether a MINOR mark stops at tenured cells (the classic generational
-/// shortcut). Off by default until the boxed-payload remembered-set hole is
-/// found; `KLIO_GC_MINOR_STOP=1` turns the shortcut back on.
-pub var minor_stops_at_tenured: bool = false;
+/// shortcut). Re-validated after the empty-singleton root fix (the boxed
+/// payloads' one root hole): the StringTest heap-shaping repro and the full
+/// commontest sweep pass with the shortcut on, so it is the default again.
+/// `KLIO_GC_MINOR_STOP=0` turns it off to bisect a future missed-barrier
+/// suspicion (a full-trace minor still sweeps only the nursery).
+pub var minor_stops_at_tenured: bool = true;
 
 /// Tracer installed on a quarantined (poisoned) cell. Reaching it means a live
 /// value referenced a cell the prior collection swept — a missing-root UAF.
