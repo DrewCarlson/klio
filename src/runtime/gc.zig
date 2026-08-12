@@ -72,7 +72,16 @@ pub const Marker = struct {
             trace.dumpCurrent(.{});
             @panic("KGC: root shaded a swept cell (incomplete root)");
         }
-        if (self.minor and h.gc_gen != 0) return; // tenured: not swept by a minor
+        // Tenured cells are not swept by a minor, so stopping the walk at
+        // them is safe ONLY if every tenured->nursery edge is in the
+        // remembered set. The boxed Value payloads broke that assumption
+        // somewhere (a live nursery box behind an un-remembered tenured cell
+        // was swept — StringTest.zipWithNext GPF), so minors keep the cheap
+        // nursery-only SWEEP but trace THROUGH tenured cells; the mark can
+        // stop only at tenured cells it has already visited this epoch.
+        // KLIO_GC_MINOR_STOP=1 restores the old early stop for bisecting the
+        // missing barrier.
+        if (self.minor and h.gc_gen != 0 and minor_stops_at_tenured) return;
         if (h.gc_mark == self.epoch) return; // already grey or black this epoch
         h.gc_mark = self.epoch;
         self.grey.append(self.arena, h) catch {
@@ -579,6 +588,10 @@ pub var gc_nofree: bool = false;
 /// collection re-shades + traces it, firing the trap with the cell's type and a
 /// stack trace: the exact swept-while-live cell that an incomplete root missed.
 pub var gc_poison: bool = false;
+/// Whether a MINOR mark stops at tenured cells (the classic generational
+/// shortcut). Off by default until the boxed-payload remembered-set hole is
+/// found; `KLIO_GC_MINOR_STOP=1` turns the shortcut back on.
+pub var minor_stops_at_tenured: bool = false;
 
 /// Tracer installed on a quarantined (poisoned) cell. Reaching it means a live
 /// value referenced a cell the prior collection swept — a missing-root UAF.

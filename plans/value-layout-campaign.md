@@ -108,9 +108,21 @@ until the last 48-byte payload boxes, so the wins land at stage ends:
         fields lived inside the `Value` itself and were re-traced as roots.
         Child-store hazard (nursery StackRef into tenured Exception box) is
         real even if not this crash.
-      Fix direction: (a) a `boxWriteBarrier` on every raw payload mutation
-      site, and (b) find the un-remembered tenured owner of the dying box —
-      instrument `gcFinalizeThunk` under poison to print finalized box
-      addresses and match against the crash receiver.
+      **Negative result that re-aims the hunt:** minors tracing THROUGH
+      tenured cells (`minor_stops_at_tenured=false`, now the default — the
+      `KLIO_GC_MINOR_STOP=1` knob restores the shortcut) still crash. The
+      box is unreachable from EVERY registered root at mark time, so this is
+      a ROOT HOLE, not a remembered-set miss. Safe points fire only at eval
+      block boundaries, so the missed holder is a host-side or runner-side
+      slot alive across a safe point: audit `host_keepalive` coverage
+      (an intrinsic that re-enters eval without `keepalivePush` on a
+      Value it holds in a Zig local), `frame.flat_call` prep state, and the
+      access/enclosing chains pushed by `pushAccessEnclosingSubject` during
+      member dispatch. Note pre-boxing the same hole would sweep the INNER
+      cells of the held Value (items) but the first field read stayed inside
+      the inline payload — boxing made the latent hole crash on the first
+      deref. Repro: 22s (`cp StringTest.kt` to scratch + the bisect argv in
+      scratchpad/bisect.py; crash needs the first ~86 tests' heap shaping,
+      dies in zipWithNext). `KLIO_GC_NOFREE=1` green-lights everything else.
 - [ ] Stage 5: RangeIter(40)/Range/BoundMethod/MapEntry(32), 24B tail
       (Value → 16)
