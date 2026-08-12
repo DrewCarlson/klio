@@ -7,6 +7,7 @@ Exit 0 iff every example's Zig stdout matches the Rust reference (or, with
 --no-rust, iff every example exits 0).
 """
 import argparse
+import re
 import concurrent.futures
 import glob
 import os
@@ -16,10 +17,27 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def extra_args(path):
+    """An example may document required flags in a header comment:
+    `// Run with: klio run --feature X/Y examples/foo.kt`. Honor them."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for _ in range(12):
+                line = f.readline()
+                if not line:
+                    break
+                m = re.search(r"Run with:\s*klio run\s+(.*)", line)
+                if m:
+                    return [a for a in m.group(1).split() if not a.endswith(".kt")]
+    except OSError:
+        pass
+    return []
+
+
 def run(binary, path, timeout):
     try:
         p = subprocess.run(
-            [binary, "run", path],
+            [binary, "run", path] + extra_args(path),
             cwd=ROOT, capture_output=True, timeout=timeout,
         )
         return p.returncode, p.stdout.decode("utf-8", "replace")
