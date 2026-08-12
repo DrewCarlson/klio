@@ -3420,6 +3420,19 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (b.module.funcByIdMut(body_func)) |f| {
         f.lambda_receiver_shape_known = lambda_receiver_shape_known;
         f.lambda_has_receiver = lambda_has_receiver;
+        // The receiver HEAD is this lambda's OWN derivation — the body
+        // builder's recvTy can carry the ENCLOSING lambda's receiver (a
+        // placement block nested in a measure lambda recorded
+        // "MeasureScope"), and the runtime's compatibility receiver
+        // inference then re-selects a chain value satisfying the wrong
+        // head, silently swapping the invoke's real receiver (the
+        // coordinator displaced the PlacementScope and every placement
+        // pass lost its member-extension owner). When the shape is known,
+        // record exactly the derived head — or null for a plain lambda,
+        // which disables re-selection and keeps the passed receiver.
+        if (lambda_receiver_shape_known) {
+            f.lambda_receiver_ty = if (receiver_head) |h| try b.allocator.dupe(u8, h) else null;
+        }
     }
 
     // Record the implicit label.

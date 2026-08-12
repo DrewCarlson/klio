@@ -1758,9 +1758,20 @@ pub fn closureParamsDisproven(self: *VmHost, callee: *const Value, args: []const
 }
 
 pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Value, this_value_in: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
+    return callValueWithThisSel(self, allocator, callee, this_value_in, args, arg_names, true);
+}
+
+/// `callValueWithThis` with the compatibility receiver RE-SELECTION gated:
+/// a caller that PROVED the receiver (the lowering's
+/// fallback_takes_receiver contract) passes `allow_resel = false` — the
+/// recorded receiver head can be WRONG (a placement block nested in a
+/// measure lambda carried the enclosing "MeasureScope" head, and
+/// re-selection swapped the real PlacementScope for the coordinator), and
+/// an explicitly supplied receiver is authoritative.
+pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const Value, this_value_in: *const Value, args: []const Value, arg_names: []const ?[]const u8, allow_resel: bool) Allocator.Error!EvalResult {
     _ = arg_names;
     var selected_this = this_value_in.*;
-    if (callee.* == .IrClosure) {
+    if (allow_resel and callee.* == .IrClosure) {
         const id = callee.IrClosure.id;
         if (self.closures.get(@intCast(id))) |info| {
             const module_g = self.module.borrow();
@@ -1770,6 +1781,9 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
                 if (f.lambda_receiver_ty) |head| {
                     if (try host_call_member.implicitReceiverForHead(self, allocator, this_value_in, head)) |matched| {
                         selected_this = matched;
+                    }
+                    if (std.c.getenv("KLIO_RSEL_TRACE") != null) {
+                        std.debug.print("[rsel] head={s} passed={s} selected={s}\n", .{ head, this_value_in.typeFqn(), selected_this.typeFqn() });
                     }
                 }
             }
@@ -2104,7 +2118,7 @@ pub fn callValueWithThisExact(self: *VmHost, allocator: Allocator, callee: *cons
             }
         }
     }
-    return callValueWithThis(self, allocator, callee, this_value, args, arg_names);
+    return callValueWithThisSel(self, allocator, callee, this_value, args, arg_names, false);
 }
 
 pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, body_func: FuncId, captures: []const Value) Allocator.Error!EvalResult {

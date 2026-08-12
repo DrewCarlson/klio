@@ -6222,7 +6222,26 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             v.retain();
             try frame.write(nn.dst, v);
         },
-        .GetField => |*gf| return execArmGetField(H, allocator, frame, gf, host),
+        .GetField => |*gf| {
+            const gf_step = try execArmGetField(H, allocator, frame, gf, host);
+            if (std.c.getenv("KLIO_GF_TRACE")) |w0| {
+                if (constStr(frame.module, gf.field)) |fname| {
+                    if (std.mem.indexOf(u8, fname, std.mem.span(w0)) != null and gf_step == .cont) {
+                        const rv = frame.read(gf.dst);
+                        const rn: []const u8 = if (rv == .Instance) blk: {
+                            const g = rv.Instance.borrow();
+                            const cg = g.get().class.borrow();
+                            const n = cg.get().name;
+                            cg.deinit();
+                            g.deinit();
+                            break :blk n;
+                        } else @tagName(rv);
+                        std.debug.print("[gfarm]   -> result={s}\n", .{rn});
+                    }
+                }
+            }
+            return gf_step;
+        },
         .SetField => |sf| return execArmSetField(H, allocator, frame, sf, host),
         .CompoundField => |cf| return execArmCompoundField(H, allocator, frame, cf, host),
         .Call => |*call| return execArmCall(H, allocator, frame, call, host),

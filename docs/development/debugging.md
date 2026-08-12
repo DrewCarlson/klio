@@ -234,6 +234,7 @@ variables override individual fields on top of it.
 | `KLIO_COUNTED` | `0` off (default on) | Counted-range for-loop strength reduction (`for (i in a until b)` as a register loop); `0` restores the iterator lowering for bisection | none |
 | `KLIO_CM_TRACE` | `<member name>` | At every CallMember execution of that name: the executing frame, whether lowering resolved it, and the full enclosing-`this` chain with entry kinds — the receiver-visibility debugger for member-extension dispatch | `[cmarm]` |
 | `KLIO_GF_TRACE` | `<substr of a field name>` | Every GetField execution whose field name matches: field, receiver class, executing frame — pairs with `KLIO_CM_TRACE` to separate a wrong read from a wrong dispatch | `[gfarm]` |
+| `KLIO_RSEL_TRACE` | set | Every compatibility receiver re-selection at a receiver-lambda invoke: the recorded head, the passed receiver, and what was selected | `[rsel]` |
 | `KLIO_FUNC_JIT` | `1` on, `0` off | Whole-function JIT override; turning it on also forces the loop tier on | none |
 | `KLIO_JIT_DEBUG` | set; `0`/empty off | Per-decision JIT tracing: compile, bail, inline, evict | `[jit]` |
 | `KLIO_RECLAIM` | `gc`, `arena`, `smp`/`free`/`1`, `debug`, `0` | Memory backend override (and whether refcount teardown is active); the profile default is the tracing GC | none |
