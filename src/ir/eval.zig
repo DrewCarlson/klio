@@ -5089,7 +5089,23 @@ fn runFrameExec(
     // unsynchronized. A migrated frame that kept its origin thread's pointer
     // raced that thread's pool (an intermittent `integer overflow` from the
     // free list's length going negative under concurrent snapshot tests).
-    frame.tls = &evtls;
+    //
+    // A migrated frame's CHAIN activation also happened against the
+    // constructing thread's context: its prev_chain points into that
+    // thread's stack, and deactivating here would transplant the foreign
+    // pointer into THIS thread's active chain — which then outlives the
+    // frame it names, and the next fresh call on this thread merges its
+    // enclosing chain from freed memory (the cross-thread yield GPF).
+    // Re-home the activation: this frame's chain becomes the running
+    // thread's active chain, and its deactivate restores the running
+    // thread's own current chain.
+    if (frame.tls != &evtls) {
+        frame.tls = &evtls;
+        frame.prev_chain = evtls.active_chain;
+        frame.prev_chain_base = evtls.active_chain_base;
+        evtls.active_chain = &frame.enclosing_this;
+        evtls.active_chain_base = frame.enclosing_this.items.len;
+    }
     const ftls: *EvalTls = frame.tls;
     var cur = cur_in;
     var resume_idx = resume_idx_in;
