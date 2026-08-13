@@ -472,7 +472,7 @@ pub const BoundMethodData = struct {
     }
 
     pub fn gcTrace(self: *const BoundMethodData, m: *objcell.gc.Marker) void {
-        self.receiver.asPtr().gcMark(m);
+        m.shade(&self.receiver.cell.hdr);
     }
 };
 
@@ -497,8 +497,11 @@ pub const MapEntryData = struct {
     }
 
     pub fn gcTrace(self: *const MapEntryData, m: *objcell.gc.Marker) void {
-        self.key.asPtr().gcMark(m);
-        self.value.asPtr().gcMark(m);
+        // Shade the value-box CELLS (whose own tracers mark the inner
+        // values) — dereferencing the interior here would leave the box
+        // cells unmarked and swept while the entry lives.
+        m.shade(&self.key.cell.hdr);
+        m.shade(&self.value.cell.hdr);
         if (self.backing.get()) |b| m.shade(&b.cell.hdr);
     }
 };
