@@ -696,6 +696,10 @@ const TestRunCtx = struct {
 fn testRunEntry(ctx: TestRunCtx) test_runner.Report {
     interp_ir.setCoroutineTimeMode(ctx.time_mode);
     runtime.setReclaim(ctx.reclaim);
+    // KLIO_PROF profiles `klio test` exactly as it does `klio run` (the
+    // sampler is per-thread; this worker thread executes the tests).
+    runtime.prof.maybeStart();
+    defer runtime.prof.maybeReport();
     return test_runner.runTests(ctx.gpa, ctx.vm, ctx.user_asts, ctx.out, ctx.only_fids, ctx.filter) catch |err| {
         io.printStderr(ctx.gpa, "error: test runner: {s}\n", .{@errorName(err)});
         return test_runner.Report{ .results = &.{}, .passed = 0, .failed = 1, .skipped = 0 };

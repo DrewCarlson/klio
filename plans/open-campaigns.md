@@ -67,7 +67,14 @@ SlotTableBuilder's buildSubTable an O(n^2) pathology or genuine compute?
 Reference: memory klio-compose-suite-perf; `BENCHMARKS.md` for harness
 practice.
 
-- [ ] Profile buildSubTable under KLIO_PROF
-- [ ] Fix the pathology if it is one; record the floor if it is not
+- [x] Profile buildSubTable under KLIO_PROF (`klio test` now honors
+      KLIO_PROF like `run` does)
+- [x] Verdict: NOT a pathology. oneRectBenchmarkSimulation solo = 56.7s,
+      57k samples with NO dominant user frame — time spreads across
+      generic dispatch (runFrameExec/execInst/member dispatch), ~8.6%
+      memset (regs/array-init churn), ~8% name-keyed hashmap equality.
+      Genuine interpreted compute; the floor stands until a generic
+      interpreter-speed lever (the JIT is off under `klio test` by
+      design, and the loop JIT measured unhelpful on this workload).
 
-State: not started.
+State: DONE — floor recorded here and in memory.
