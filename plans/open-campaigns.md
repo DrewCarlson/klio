@@ -85,23 +85,18 @@ practice.
 
 State: DONE — floor recorded here and in memory.
 
-## HANDOVER NOTE (REGRESSION OPEN — fix before any next wave)
+## HANDOVER NOTE (Value=32 VERIFIED — next: the 24B tier)
 
-The compose plugin ITEST fails at 2a6e72f3 with `FAIL
-(GcStressMapCopyFailed)` + a libc-frame crash trace (the suite's
-GC-stress map-copy step); the compose corpus slice still passes (same 5
-knowns) and sweep/units/rangebench are green — so this is a GC-STRESS-
-ONLY hole from the boxing wave, the exact trap class the value-layout
-campaign recorded (a gcTrace/deinit hole in one of the new boxed
-payloads: MapEntryData, BoundMethodData, IterCursor, RangeData).
-Reproduce: grep the itest for GcStressMapCopy to get the scenario, run
-it with KLIO_GC_STRESS=1; bisect with KLIO_GC_NOFREE=1 (sweep kills) and
-KLIO_GC_STRESS crash-inside-the-culprit per the campaign's recorded
-sequence. Suspects in order: MapEntryData.gcTrace (asPtr on the key or
-value of an entry whose ValueBox was defaulted), the MapEntry restamp
-write-through under a stressed copy, IterCursor.gcTrace vs its deinit
-racing a sweep. FIX THIS FIRST, re-run the ratchet to 1337, then the
-Value=32 milestone is actually verified.
+The GcStressMapCopyFailed regression is FIXED (boxed-payload gcTrace
+shaded box interiors instead of the box cells — the campaign's recorded
+root lesson, repeated and now guarded by the suite's GC-stress step) and
+the plugin ratchet is back at 1337. Value=32 stands fully verified:
+units zero-leak, sweep 117/0, corpus + compose slice at baseline,
+rangebench neutral, ratchet 1337.
+Next in item 1: box the 24B tier (Intrinsic, Array, Triple, MatchGroup,
+then Pair/IrClosure/Function/...) for Value=16, paired with the
+transpiler hot-view sub-ABI so scalar offsets freeze once; then the
+rangebench speedup number. Items 2-4 follow per their sections.
 
 ## previous note (Value=32 landed, superseded above)
 
