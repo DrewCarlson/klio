@@ -1724,7 +1724,9 @@ test "asSequence from a range enumerates the progression" {
     var h = Harness.init();
     defer h.deinit();
 
-    var args = [_]Value{.{ .Range = .{ .start = 1, .end = 5, .step = 2, .kind = .Int } }};
+    const range = try Value.newRange(testing.allocator, .{ .start = 1, .end = 5, .step = 2, .kind = .Int });
+    defer runtime.rangeRefOf(range.Range).deinit();
+    var args = [_]Value{range};
     var ctx = h.ctx(&args);
     const r = try seq_from_range(&ctx);
     const g = r.ok.Sequence.borrow();

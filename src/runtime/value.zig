@@ -386,8 +386,18 @@ pub const MapStore = struct {
     }
 };
 
-/// The mutable state of a `Value.RangeIter`: cursor + yielded-last flag.
-pub const RangeIterState = struct { cur: i64, done: bool = false };
+/// The whole state of a `Value.RangeIter`: the advancing cursor and
+/// yielded-last flag PLUS the fixed end/step/kind. The fixed fields ride
+/// in the same shared cell because every `hasNext`/`next` already takes
+/// one snapshot borrow of it — folding them here costs nothing per step
+/// and shrinks the `Value` payload to the one handle.
+pub const RangeIterState = struct {
+    cur: i64,
+    end: i64,
+    step: i64,
+    kind: RangeKind,
+    done: bool = false,
+};
 
 /// `ObjRef<MapStore>` — shared, growable map entry storage with a hash index.
 pub const MapEntries = ObjRef(MapStore);
@@ -431,6 +441,28 @@ pub const MapRef = ObjRef(MapData);
 /// Recover the owning control block from a boxed map payload pointer.
 pub inline fn mapRefOf(m: *MapData) MapRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", m)) };
+}
+
+/// The boxed payload of `Value.Range` (see `MapData` for the scheme).
+/// Immutable after construction.
+pub const RangeData = struct {
+    start: i64,
+    end: i64,
+    step: i64,
+    kind: RangeKind,
+    /// True when built as a progression (`step`, `downTo`, `reversed`)
+    /// rather than a `..` / `until` range. A step-1 progression is NOT
+    /// an `IntRange`: it renders as `1..10 step 1`, hashes with the
+    /// progression formula, and fails `is IntRange`.
+    progression: bool = false,
+};
+
+/// The control-block handle behind a boxed `Value.Range` payload.
+pub const RangeRef = ObjRef(RangeData);
+
+/// Recover the owning control block from a boxed range payload pointer.
+pub inline fn rangeRefOf(r: *RangeData) RangeRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", r)) };
 }
 
 /// The boxed payload of `Value.Exception` (see `MapData` for the scheme).
@@ -1701,18 +1733,10 @@ pub const Value = union(enum) {
     /// Kotlin `Char` is a single UTF-16 code unit (may be a lone surrogate).
     Char: u16,
     Null,
-    /// Inclusive integer progression with a signed step.
-    Range: struct {
-        start: i64,
-        end: i64,
-        step: i64,
-        kind: RangeKind,
-        /// True when built as a progression (`step`, `downTo`, `reversed`)
-        /// rather than a `..` / `until` range. A step-1 progression is NOT
-        /// an `IntRange`: it renders as `1..10 step 1`, hashes with the
-        /// progression formula, and fails `is IntRange`.
-        progression: bool = false,
-    },
+    /// Inclusive integer progression with a signed step. Boxed like `Map`
+    /// (see `RangeData`); construct with `Value.newRange`. Immutable after
+    /// construction, so copies sharing the record is invisible.
+    Range: *RangeData,
     Function: struct {
         decl: *const ast.Function,
         env: ObjRef(Env),
@@ -1814,19 +1838,15 @@ pub const Value = union(enum) {
         /// `UnsupportedOperationException`, matching Kotlin.
         mutable: bool = false,
     },
-    /// Lazy O(1)-memory iterator over a `Range`/progression.
-    RangeIter: struct {
-        /// The advancing cursor and the yielded-last flag, ONE shared cell so
-        /// they survive the iterator value being copied between reads and cost
-        /// a single lock per step. `done` exists because the cursor saturates
-        /// at the integer boundary (`MaxL +| 1 == MaxL`), so a `cur <= end`
-        /// test alone would loop forever on a range ending at
-        /// `Long.MAX_VALUE`/`MIN_VALUE`.
-        state: ObjRef(RangeIterState),
-        end: i64,
-        step: i64,
-        kind: RangeKind,
-    },
+    /// Lazy O(1)-memory iterator over a `Range`/progression. The whole
+    /// state — cursor, yielded-last flag, and the fixed end/step/kind —
+    /// lives in ONE shared cell (`RangeIterState`) so it survives the
+    /// iterator value being copied between reads and costs a single lock
+    /// per step. `done` exists because the cursor saturates at the
+    /// integer boundary (`MaxL +| 1 == MaxL`), so a `cur <= end` test
+    /// alone would loop forever on a range ending at
+    /// `Long.MAX_VALUE`/`MIN_VALUE`.
+    RangeIter: ObjRef(RangeIterState),
     /// Lazy iterator over a `Sequence` (the `Sequence.iterator()` / lazy
     /// `iterator { }` result), pulling one element at a time.
     SeqIter: SeqIterStateRef,
@@ -1908,12 +1928,13 @@ pub const Value = union(enum) {
             // Boxed payload: the BOX cell is the one owned edge (its own
             // trace/teardown reaches the entries).
             .Map => |x| visitor.visit(mapRefOf(x)),
+            .Range => |x| visitor.visit(rangeRefOf(x)),
             .Iterator => |x| {
                 visitor.visit(x.items);
                 visitor.visit(x.cursor);
                 if (x.mod_count.get()) |mc| visitor.visit(mc);
             },
-            .RangeIter => |x| visitor.visit(x.state),
+            .RangeIter => |x| visitor.visit(x),
             .SeqIter => |s| visitor.visit(s),
             .PropertyRef => |p| visitor.visit(p.name),
             .MatchGroup => |g| visitor.visit(g.value),
@@ -1958,6 +1979,13 @@ pub const Value = union(enum) {
     pub fn newMap(allocator: std.mem.Allocator, data: MapData) std.mem.Allocator.Error!Value {
         const ref = try MapRef.initOwned(allocator, data);
         return .{ .Map = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `Range` payload; the only way to construct a
+    /// `.Range`.
+    pub fn newRange(allocator: std.mem.Allocator, data: RangeData) std.mem.Allocator.Error!Value {
+        const ref = try RangeRef.initOwned(allocator, data);
+        return .{ .Range = &ref.cell.data };
     }
 
     /// Allocate the boxed `Set` payload; the only way to construct a `.Set`.
@@ -2074,12 +2102,13 @@ pub const Value = union(enum) {
             // Boxed payload: drop the box handle; its last-owner teardown
             // (`MapData.deinit`) releases the entries and their pairs.
             .Map => |x| mapRefOf(x).deinit(),
+            .Range => |x| rangeRefOf(x).deinit(),
             .Iterator => |x| {
                 releaseValueList(x.items, allocator);
                 x.cursor.deinit();
                 if (x.mod_count.get()) |mc| mc.deinit();
             },
-            .RangeIter => |x| x.state.deinit(),
+            .RangeIter => |x| x.deinit(),
             .SeqIter => |s| s.deinit(),
             .PropertyRef => |p| p.name.deinit(),
             .MatchGroup => |g| g.value.deinit(),
@@ -2354,7 +2383,11 @@ pub const Value = union(enum) {
                 .UShort => "kotlin.collections.UShortIterator",
                 .UByte => "kotlin.collections.UByteIterator",
             } else "kotlin.collections.Iterator",
-            .RangeIter => |ri| switch (ri.kind) {
+            .RangeIter => |ri| switch (blk: {
+                const g = ri.borrow();
+                defer g.deinit();
+                break :blk g.get().kind;
+            }) {
                 .Int => "kotlin.collections.IntIterator",
                 .Long => "kotlin.collections.LongIterator",
                 .Char => "kotlin.collections.CharIterator",
@@ -2493,7 +2526,12 @@ pub const Value = union(enum) {
             },
             .RangeIter => |ri| blk: {
                 if (matchesAny(name, &.{ "Iterator", "Any" })) break :blk true;
-                break :blk switch (ri.kind) {
+                const rkind = kblk: {
+                    const g = ri.borrow();
+                    defer g.deinit();
+                    break :kblk g.get().kind;
+                };
+                break :blk switch (rkind) {
                     .Int => std.mem.eql(u8, name, "IntIterator"),
                     .Long => std.mem.eql(u8, name, "LongIterator"),
                     .Char => std.mem.eql(u8, name, "CharIterator"),
@@ -2921,7 +2959,11 @@ pub const Value = union(enum) {
                 try writer.print("{s}Iterator", .{p.simpleName()})
             else
                 try writer.writeAll("kotlin.collections.Iterator"),
-            .RangeIter => |ri| switch (ri.kind) {
+            .RangeIter => |ri| switch (blk: {
+                const g = ri.borrow();
+                defer g.deinit();
+                break :blk g.get().kind;
+            }) {
                 .Int => try writer.writeAll("kotlin.ranges.IntProgressionIterator"),
                 .Long => try writer.writeAll("kotlin.ranges.LongProgressionIterator"),
                 .Char => try writer.writeAll("kotlin.ranges.CharProgressionIterator"),
@@ -3516,12 +3558,16 @@ test "range display forms" {
     var buf: [64]u8 = undefined;
     {
         var w = std.Io.Writer.fixed(&buf);
-        try (Value{ .Range = .{ .start = 1, .end = 10, .step = 1, .kind = .Int } }).writeTo(&w);
+        const r1 = try Value.newRange(testing.allocator, .{ .start = 1, .end = 10, .step = 1, .kind = .Int });
+        defer rangeRefOf(r1.Range).deinit();
+        try r1.writeTo(&w);
         try testing.expectEqualStrings("1..10", w.buffered());
     }
     {
         var w = std.Io.Writer.fixed(&buf);
-        try (Value{ .Range = .{ .start = 10, .end = 1, .step = -2, .kind = .Int } }).writeTo(&w);
+        const r2 = try Value.newRange(testing.allocator, .{ .start = 10, .end = 1, .step = -2, .kind = .Int });
+        defer rangeRefOf(r2.Range).deinit();
+        try r2.writeTo(&w);
         try testing.expectEqualStrings("10 downTo 1 step 2", w.buffered());
     }
 }

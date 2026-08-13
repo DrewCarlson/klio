@@ -6315,7 +6315,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
             return .{ .ok = .{ .Iterator = .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .cursor = try newCursor(allocator, 0, cap.exp_mod), .prim = null, .mod_count = .from(cap.mod_count), .mutable = live } } };
         },
         .Range => |r| {
-            return .{ .ok = .{ .RangeIter = .{ .state = try ObjRef(runtime.RangeIterState).init(allocator, .{ .cur = r.start }), .end = r.end, .step = r.step, .kind = r.kind } } };
+            return .{ .ok = .{ .RangeIter = try ObjRef(runtime.RangeIterState).init(allocator, .{ .cur = r.start, .end = r.end, .step = r.step, .kind = r.kind }) } };
         },
         .Array => |arr| {
             const items = try cloneArrayItems(allocator, arr);
@@ -8081,30 +8081,30 @@ fn rangeIterMember(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     _ = self;
     const ri = receiver.RangeIter;
     const snap = blk: {
-        const sg = ri.state.borrow();
+        const sg = ri.borrow();
         defer sg.deinit();
         break :blk sg.get().*;
     };
-    const more = !snap.done and ri.step != 0 and ri.kind.inBounds(snap.cur, ri.end, ri.step);
+    const more = !snap.done and snap.step != 0 and snap.kind.inBounds(snap.cur, snap.end, snap.step);
     if (std.mem.eql(u8, name, "hasNext") and args.len == 0) {
         return .{ .ok = boolVal(more) };
     }
     if (isIteratorNext(name) and args.len == 0) {
         if (!more) return .{ .err = try throwExc(allocator, "kotlin.NoSuchElementException", "iterator exhausted") };
         const c = snap.cur;
-        const adv = c +| ri.step;
+        const adv = c +| snap.step;
         // `end` is the exact final element; once it is yielded, stop. Also stop
         // if the cursor saturates (`adv == c`). Both avoid advancing past the
         // end — a Long.MAX overflow or a ULong wrap past MaxUL that `more`
         // (unsigned for ULong) would otherwise read as still in-bounds.
-        const sg = ri.state.borrowMut();
-        if (c == ri.end or adv == c) {
+        const sg = ri.borrowMut();
+        if (c == snap.end or adv == c) {
             sg.get().done = true;
         } else {
             sg.get().cur = adv;
         }
         sg.deinit();
-        return .{ .ok = rangeElem(c, ri.kind) };
+        return .{ .ok = rangeElem(c, snap.kind) };
     }
     return null;
 }

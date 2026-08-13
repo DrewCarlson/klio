@@ -10554,12 +10554,12 @@ inline fn rangeIterFast(allocator: Allocator, recv: *const Value, name: []const 
     if (!is_has_next and !is_next) return null;
     const ri = recv.RangeIter;
     const snap = blk: {
-        const sg = ri.state.borrow();
+        const sg = ri.borrow();
         defer sg.deinit();
         break :blk sg.get().*;
     };
     const cur = snap.cur;
-    const more = !snap.done and ri.step != 0 and ri.kind.inBounds(cur, ri.end, ri.step);
+    const more = !snap.done and snap.step != 0 and snap.kind.inBounds(cur, snap.end, snap.step);
     if (is_has_next) return ok(.{ .Bool = more });
     // next()
     if (!more) {
@@ -10570,15 +10570,15 @@ inline fn rangeIterFast(allocator: Allocator, recv: *const Value, name: []const 
         }) catch return null;
         return errResult(.{ .Throw = exc });
     }
-    const adv = cur +| ri.step;
-    const sg = ri.state.borrowMut();
-    if (cur == ri.end or adv == cur) {
+    const adv = cur +| snap.step;
+    const sg = ri.borrowMut();
+    if (cur == snap.end or adv == cur) {
         sg.get().done = true;
     } else {
         sg.get().cur = adv;
     }
     sg.deinit();
-    return ok(rangeElemEval(cur, ri.kind));
+    return ok(rangeElemEval(cur, snap.kind));
 }
 
 inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
@@ -11438,7 +11438,7 @@ pub fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Va
             if (l.* == .Bool and r.* == .Bool) return ok(.{ .Bool = l.Bool or r.Bool });
         },
         .RangeTo, .RangeUntil => {
-            if (rangeValue(op, l, r)) |v| return ok(v);
+            if (try rangeValue(allocator, op, l, r)) |v| return ok(v);
         },
         .StringConcat => {
             const ls = try renderValue(allocator, l);
@@ -11559,7 +11559,7 @@ fn compareValues(op: BinOp, l: *const Value, r: *const Value) Allocator.Error!?b
 
 /// Build a `Range` value for `..` / `..<`. Returns `null` for unhandled
 /// operand pairings.
-fn rangeValue(op: BinOp, l: *const Value, r: *const Value) ?Value {
+fn rangeValue(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value) Allocator.Error!?Value {
     // Resolve the operand pairing to (start, end-bound, kind). UByte/UShort
     // promote to a UInt range, mirroring Kotlin's `UByte.rangeTo` etc.
     var start: i64 = undefined;
@@ -11601,11 +11601,11 @@ fn rangeValue(op: BinOp, l: *const Value, r: *const Value) ?Value {
         // inclusive end is one before the exclusive bound.
         if (kind.untilEmpty(bound)) {
             const e = kind.emptyBounds();
-            return .{ .Range = .{ .start = e[0], .end = e[1], .step = 1, .kind = kind } };
+            return try Value.newRange(allocator, .{ .start = e[0], .end = e[1], .step = 1, .kind = kind });
         }
         bound -= 1;
     }
-    return .{ .Range = .{ .start = start, .end = bound, .step = 1, .kind = kind } };
+    return try Value.newRange(allocator, .{ .start = start, .end = bound, .step = 1, .kind = kind });
 }
 
 /// A UByte/UShort/UInt value as an i64 (for forming a UInt range), else null.

@@ -40,13 +40,13 @@ fn rangeKindForArgs(a: Value, b: Value) RangeKind {
 
 pub fn ranges_down_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const pair = pairIntArgs(ctx, "downTo") orelse return typeErr("downTo requires two Int operands");
-    return ok(.{ .Range = .{
+    return ok(try Value.newRange(ctx.allocator, .{
         .start = pair[0],
         .end = pair[1],
         .step = -1,
         .kind = rangeKindForArgs(ctx.args[0], ctx.args[1]),
         .progression = true,
-    } });
+    }));
 }
 
 pub fn ranges_until(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -61,14 +61,14 @@ pub fn ranges_until(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // than wrapping `to - 1` below MIN.
     if (kind.untilEmpty(pair[1])) {
         const e = kind.emptyBounds();
-        return ok(.{ .Range = .{ .start = e[0], .end = e[1], .step = 1, .kind = kind } });
+        return ok(try Value.newRange(ctx.allocator, .{ .start = e[0], .end = e[1], .step = 1, .kind = kind }));
     }
-    return ok(.{ .Range = .{
+    return ok(try Value.newRange(ctx.allocator, .{
         .start = pair[0],
         .end = saturatingSub(pair[1], 1),
         .step = 1,
         .kind = kind,
-    } });
+    }));
 }
 
 pub fn ranges_step(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -85,13 +85,13 @@ pub fn ranges_step(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
         const signed = if (r.step < 0) -n else n;
         const normalized_end = normalizeProgressionEnd(r.start, r.end, signed, r.kind);
-        return ok(.{ .Range = .{
+        return ok(try Value.newRange(ctx.allocator, .{
             .start = r.start,
             .end = normalized_end,
             .step = signed,
             .kind = r.kind,
             .progression = true,
-        } });
+        }));
     }
     return typeErr("step requires IntRange . step(Int)");
 }
@@ -308,13 +308,14 @@ pub fn range_end_exclusive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 pub fn range_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "toString") orelse return typeErr("toString requires a Range receiver");
-    const r = Value{ .Range = .{
+    const r = try Value.newRange(ctx.allocator, .{
         .start = view.start,
         .end = view.end,
         .step = view.step,
         .kind = view.kind,
         .progression = view.progression,
-    } };
+    });
+    defer runtime.rangeRefOf(r.Range).deinit();
     const s = try r.display(ctx.allocator);
     return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, s) });
 }
@@ -350,13 +351,13 @@ pub fn range_is_empty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 pub fn range_reversed(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "reversed") orelse return typeErr("reversed requires a Range receiver");
-    return ok(.{ .Range = .{
+    return ok(try Value.newRange(ctx.allocator, .{
         .start = view.end,
         .end = view.start,
         .step = -view.step,
         .kind = view.kind,
         .progression = true,
-    } });
+    }));
 }
 
 pub fn range_to_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -497,6 +498,7 @@ test "downTo builds a descending range" {
     var ctx = noopCtx(&args);
     const r = try ranges_down_to(&ctx);
     try testing.expect(r == .ok);
+    defer runtime.rangeRefOf(r.ok.Range).deinit();
     try testing.expectEqual(@as(i64, 10), r.ok.Range.start);
     try testing.expectEqual(@as(i64, 1), r.ok.Range.end);
     try testing.expectEqual(@as(i64, -1), r.ok.Range.step);
@@ -515,35 +517,41 @@ test "until shrinks the inclusive end by one" {
     var ctx = noopCtx(&args);
     const r = try ranges_until(&ctx);
     try testing.expect(r == .ok);
+    defer runtime.rangeRefOf(r.ok.Range).deinit();
     try testing.expectEqual(@as(i64, 0), r.ok.Range.start);
     try testing.expectEqual(@as(i64, 4), r.ok.Range.end);
     try testing.expectEqual(@as(i64, 1), r.ok.Range.step);
 }
 
 test "step normalizes a range progression" {
-    const range = Value{ .Range = .{ .start = 1, .end = 10, .step = 1, .kind = .Int } };
+    const range = try Value.newRange(testing.allocator, .{ .start = 1, .end = 10, .step = 1, .kind = .Int });
+    defer runtime.rangeRefOf(range.Range).deinit();
     const args = [_]Value{ range, .{ .Int = 2 } };
     var ctx = noopCtx(&args);
     const r = try ranges_step(&ctx);
     try testing.expect(r == .ok);
+    defer runtime.rangeRefOf(r.ok.Range).deinit();
     try testing.expectEqual(@as(i64, 1), r.ok.Range.start);
     try testing.expectEqual(@as(i64, 9), r.ok.Range.end);
     try testing.expectEqual(@as(i64, 2), r.ok.Range.step);
 }
 
 test "step preserves descending direction" {
-    const range = Value{ .Range = .{ .start = 10, .end = 1, .step = -1, .kind = .Int } };
+    const range = try Value.newRange(testing.allocator, .{ .start = 10, .end = 1, .step = -1, .kind = .Int });
+    defer runtime.rangeRefOf(range.Range).deinit();
     const args = [_]Value{ range, .{ .Int = 2 } };
     var ctx = noopCtx(&args);
     const r = try ranges_step(&ctx);
     try testing.expect(r == .ok);
+    defer runtime.rangeRefOf(r.ok.Range).deinit();
     try testing.expectEqual(@as(i64, 10), r.ok.Range.start);
     try testing.expectEqual(@as(i64, 2), r.ok.Range.end);
     try testing.expectEqual(@as(i64, -2), r.ok.Range.step);
 }
 
 test "step throws on non-positive step" {
-    const range = Value{ .Range = .{ .start = 1, .end = 10, .step = 1, .kind = .Int } };
+    const range = try Value.newRange(testing.allocator, .{ .start = 1, .end = 10, .step = 1, .kind = .Int });
+    defer runtime.rangeRefOf(range.Range).deinit();
     const args = [_]Value{ range, .{ .Int = 0 } };
     var ctx = noopCtx(&args);
     const r = try ranges_step(&ctx);
@@ -566,7 +574,8 @@ test "step throws on non-positive step" {
 }
 
 test "first and last read range endpoints" {
-    const range = Value{ .Range = .{ .start = 3, .end = 7, .step = 1, .kind = .Int } };
+    const range = try Value.newRange(testing.allocator, .{ .start = 3, .end = 7, .step = 1, .kind = .Int });
+    defer runtime.rangeRefOf(range.Range).deinit();
     const args = [_]Value{range};
     var ctx = noopCtx(&args);
     const f = try range_first(&ctx);
@@ -577,7 +586,8 @@ test "first and last read range endpoints" {
 
 test "step field returns the signed step" {
     // `10 downTo 1 step 2` -> IntProgression.step is -2 (Kotlin keeps the sign).
-    const range = Value{ .Range = .{ .start = 10, .end = 1, .step = -2, .kind = .Int } };
+    const range = try Value.newRange(testing.allocator, .{ .start = 10, .end = 1, .step = -2, .kind = .Int });
+    defer runtime.rangeRefOf(range.Range).deinit();
     const args = [_]Value{range};
     var ctx = noopCtx(&args);
     const s = try range_step_field(&ctx);
@@ -585,7 +595,8 @@ test "step field returns the signed step" {
 }
 
 test "char range endpoints reinterpret as code units" {
-    const range = Value{ .Range = .{ .start = 'a', .end = 'e', .step = 1, .kind = .Char } };
+    const range = try Value.newRange(testing.allocator, .{ .start = 'a', .end = 'e', .step = 1, .kind = .Char });
+    defer runtime.rangeRefOf(range.Range).deinit();
     const args = [_]Value{range};
     var ctx = noopCtx(&args);
     const f = try range_first(&ctx);
@@ -595,7 +606,8 @@ test "char range endpoints reinterpret as code units" {
 }
 
 test "contains respects bounds and step" {
-    const range = Value{ .Range = .{ .start = 0, .end = 10, .step = 2, .kind = .Int } };
+    const range = try Value.newRange(testing.allocator, .{ .start = 0, .end = 10, .step = 2, .kind = .Int });
+    defer runtime.rangeRefOf(range.Range).deinit();
     var args = [_]Value{ range, .{ .Int = 4 } };
     var ctx = noopCtx(&args);
     try testing.expect((try range_contains(&ctx)).ok.Bool);
@@ -606,39 +618,46 @@ test "contains respects bounds and step" {
 }
 
 test "contains with unit step ignores remainder" {
-    const range = Value{ .Range = .{ .start = 1, .end = 5, .step = 1, .kind = .Int } };
+    const range = try Value.newRange(testing.allocator, .{ .start = 1, .end = 5, .step = 1, .kind = .Int });
+    defer runtime.rangeRefOf(range.Range).deinit();
     var args = [_]Value{ range, .{ .Int = 3 } };
     var ctx = noopCtx(&args);
     try testing.expect((try range_contains(&ctx)).ok.Bool);
 }
 
 test "is empty reflects direction" {
-    const fwd = Value{ .Range = .{ .start = 5, .end = 1, .step = 1, .kind = .Int } };
+    const fwd = try Value.newRange(testing.allocator, .{ .start = 5, .end = 1, .step = 1, .kind = .Int });
+    defer runtime.rangeRefOf(fwd.Range).deinit();
     var a1 = [_]Value{fwd};
     var c1 = noopCtx(&a1);
     try testing.expect((try range_is_empty(&c1)).ok.Bool);
-    const bwd = Value{ .Range = .{ .start = 1, .end = 5, .step = -1, .kind = .Int } };
+    const bwd = try Value.newRange(testing.allocator, .{ .start = 1, .end = 5, .step = -1, .kind = .Int });
+    defer runtime.rangeRefOf(bwd.Range).deinit();
     var a2 = [_]Value{bwd};
     var c2 = noopCtx(&a2);
     try testing.expect((try range_is_empty(&c2)).ok.Bool);
-    const nonempty = Value{ .Range = .{ .start = 1, .end = 5, .step = 1, .kind = .Int } };
+    const nonempty = try Value.newRange(testing.allocator, .{ .start = 1, .end = 5, .step = 1, .kind = .Int });
+    defer runtime.rangeRefOf(nonempty.Range).deinit();
     var a3 = [_]Value{nonempty};
     var c3 = noopCtx(&a3);
     try testing.expect(!(try range_is_empty(&c3)).ok.Bool);
 }
 
 test "reversed flips bounds and step sign" {
-    const range = Value{ .Range = .{ .start = 1, .end = 10, .step = 2, .kind = .Int } };
+    const range = try Value.newRange(testing.allocator, .{ .start = 1, .end = 10, .step = 2, .kind = .Int });
+    defer runtime.rangeRefOf(range.Range).deinit();
     const args = [_]Value{range};
     var ctx = noopCtx(&args);
     const r = try range_reversed(&ctx);
+    defer runtime.rangeRefOf(r.ok.Range).deinit();
     try testing.expectEqual(@as(i64, 10), r.ok.Range.start);
     try testing.expectEqual(@as(i64, 1), r.ok.Range.end);
     try testing.expectEqual(@as(i64, -2), r.ok.Range.step);
 }
 
 test "to list enumerates elements" {
-    const range = Value{ .Range = .{ .start = 1, .end = 5, .step = 2, .kind = .Int } };
+    const range = try Value.newRange(testing.allocator, .{ .start = 1, .end = 5, .step = 2, .kind = .Int });
+    defer runtime.rangeRefOf(range.Range).deinit();
     const args = [_]Value{range};
     var ctx = noopCtx(&args);
     const r = try range_to_list(&ctx);
@@ -655,7 +674,8 @@ test "to list enumerates elements" {
 }
 
 test "count totals reachable elements" {
-    const range = Value{ .Range = .{ .start = 0, .end = 9, .step = 3, .kind = .Int } };
+    const range = try Value.newRange(testing.allocator, .{ .start = 0, .end = 9, .step = 3, .kind = .Int });
+    defer runtime.rangeRefOf(range.Range).deinit();
     const args = [_]Value{range};
     var ctx = noopCtx(&args);
     const r = try range_count(&ctx);
@@ -663,13 +683,15 @@ test "count totals reachable elements" {
 }
 
 test "sum adds elements with kind-aware result" {
-    const range = Value{ .Range = .{ .start = 1, .end = 5, .step = 1, .kind = .Int } };
+    const range = try Value.newRange(testing.allocator, .{ .start = 1, .end = 5, .step = 1, .kind = .Int });
+    defer runtime.rangeRefOf(range.Range).deinit();
     var a1 = [_]Value{range};
     var c1 = noopCtx(&a1);
     const r1 = try range_sum(&c1);
     try testing.expectEqual(@as(i32, 15), r1.ok.Int);
 
-    const lrange = Value{ .Range = .{ .start = 1, .end = 3, .step = 1, .kind = .Long } };
+    const lrange = try Value.newRange(testing.allocator, .{ .start = 1, .end = 3, .step = 1, .kind = .Long });
+    defer runtime.rangeRefOf(lrange.Range).deinit();
     var a2 = [_]Value{lrange};
     var c2 = noopCtx(&a2);
     const r2 = try range_sum(&c2);
@@ -677,7 +699,8 @@ test "sum adds elements with kind-aware result" {
 }
 
 test "to string renders the range form" {
-    const range = Value{ .Range = .{ .start = 1, .end = 10, .step = 2, .kind = .Int } };
+    const range = try Value.newRange(testing.allocator, .{ .start = 1, .end = 10, .step = 2, .kind = .Int });
+    defer runtime.rangeRefOf(range.Range).deinit();
     const args = [_]Value{range};
     var ctx = noopCtx(&args);
     const r = try range_to_string(&ctx);

@@ -1500,7 +1500,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     }
     if (std.mem.eql(u8, name, "indices")) {
         if (collectionLen(receiver)) |len| {
-            return ok(.{ .Range = .{ .start = 0, .end = len - 1, .step = 1, .kind = .Int } });
+            return ok(try Value.newRange(allocator, .{ .start = 0, .end = len - 1, .step = 1, .kind = .Int }));
         }
     }
     // The underlying-storage accessor of an unsigned inline type:
