@@ -12,7 +12,13 @@ native), paired with Value 40B → 16B since both freeze scalar layout.
 Full plans: `c-transpiler-plan.md` ("Next: the speedup campaign"),
 `value-layout-campaign.md` (stage 5b).
 
-- [ ] Value stage 5b: 32B payloads → 16, measure-first (rangebench gate)
+- [ ] Value stage 5b IN PROGRESS: RangeIter folded into its state cell;
+      Range/BoundMethod/MapEntry boxed (rangebench A/B neutral: 83.6s vs
+      83.7s). REMAINING: the Iterator fold (merge items/prim/mod_count/
+      mutable into the IterCursor cell — one alloc either way; ~28 access
+      sites, concentrated in host_call_member's iteratorMember which
+      already borrows the cursor) → Value 40 → 32; then the 24B tier
+      (Intrinsic/Array/Triple/MatchGroup + Pair/IrClosure/Function) → 16
 - [ ] Hot-view sub-ABI: static-inline C ops over frozen Value scalar
       offsets, comptime-checked at klio_rt build
 - [ ] Light-frame C-to-C calls (tagged-table / vararg ideas land here if
