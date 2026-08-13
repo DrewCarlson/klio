@@ -3595,9 +3595,13 @@ pub fn evalWithCapturesChained(
     boolThisTrap(func, args.items);
     // The recursive call seam. A leaf-expression callee reached here needs
     // none of the frame below it, and this is the one point every
-    // interpreted call passes through, whatever route resolved it.
+    // interpreted call passes through, whatever route resolved it. A
+    // callee with a registered transpiled body takes the frame path
+    // instead so its emitted C runs (free everywhere else: the native
+    // table is empty in a non-transpiled process).
     if (owning == null and closure_id == null and chain_seed.len == 0 and
-        captures.items.len == 0 and func.leafExprBody())
+        captures.items.len == 0 and func.leafExprBody() and
+        nativeFor(func.id.int(), func.fqn) == null)
     {
         if (try leafExprServe(H, allocator, module, func, args.items, host)) |lr| {
             var a = args;
@@ -5351,6 +5355,7 @@ fn runFrameExec(
                 .ret_v = &ret_v,
                 .arm_bin = &NativeGlue(H).armBin,
                 .escape = &NativeGlue(H).escape,
+                .call = &NativeGlue(H).call,
             };
             nf(@ptrCast(&nctx), cur.int());
             if (runtime.envOnce("KLIO_NATIVE_TRACE") != null) {
@@ -6294,10 +6299,11 @@ pub const NativeCtx = struct {
     unwound: *?EvalError,
     ret_v: *EvalResult,
     /// Host-typed glue (the frame loop instantiates these for its `H`):
-    /// run `execArmBinOp`/`execInst` + `afterStep` for the inst at
-    /// (block, idx).
+    /// run `execArmBinOp`/`execInst`/`execArmCall` + `afterStep` for the
+    /// inst at (block, idx).
     arm_bin: *const fn (*NativeCtx, u32, u32) NativeStep,
     escape: *const fn (*NativeCtx, u32, u32) NativeStep,
+    call: *const fn (*NativeCtx, u32, u32) NativeStep,
     outcome: NativeOutcome = .none,
     out_block: u32 = 0,
 };
@@ -6316,6 +6322,13 @@ fn NativeGlue(comptime H: type) type {
             const frame = ctx.frame;
             const inst = &frame.func.blocks[block].insts[idx];
             const r = execInst(H, ctx.allocator, frame, inst, host) catch return .oom;
+            return glueAfter(ctx, r, inst, idx, block);
+        }
+        fn call(ctx: *NativeCtx, block: u32, idx: u32) NativeStep {
+            const host: *H = @ptrCast(@alignCast(ctx.host));
+            const frame = ctx.frame;
+            const inst = &frame.func.blocks[block].insts[idx];
+            const r = execArmCall(H, ctx.allocator, frame, &inst.Call, host, false) catch return .oom;
             return glueAfter(ctx, r, inst, idx, block);
         }
     };
@@ -6390,6 +6403,32 @@ pub fn nativeOpCellGet(ctx: *NativeCtx, dst: u32, cell: u32) void {
 pub fn nativeOpBin(ctx: *NativeCtx, block: u32, inst_idx: u32, kind: u32, dst: u32, lhs: u32, rhs: u32) i32 {
     if (binFast(ctx.frame, @enumFromInt(kind), @enumFromInt(dst), @enumFromInt(lhs), @enumFromInt(rhs), ctx.allocator)) return 0;
     switch (ctx.arm_bin(ctx, block, inst_idx)) {
+        .cont => return 0,
+        .brk => {
+            ctx.outcome = .brk;
+            ctx.out_block = block;
+            return 1;
+        },
+        .ret => {
+            ctx.outcome = .ret;
+            return 1;
+        },
+        .oom => {
+            ctx.outcome = .oom;
+            return 1;
+        },
+    }
+}
+
+/// A statically-bound `.Call` escape, served recursively so the emitted
+/// caller stays on the C stack (the callee's own emitted body engages
+/// inside the recursive activation). Same return contract as
+/// `nativeOpEscape`.
+pub fn nativeOpCall(ctx: *NativeCtx, block: u32, inst_idx: u32) i32 {
+    if (runtime.envOnce("KLIO_NATIVE_TRACE") != null) {
+        std.debug.print("[native-call] from={s} b{d} i{d}\n", .{ ctx.frame.func.fqn, block, inst_idx });
+    }
+    switch (ctx.call(ctx, block, inst_idx)) {
         .cont => return 0,
         .brk => {
             ctx.outcome = .brk;
@@ -6624,7 +6663,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         },
         .SetField => |sf| return execArmSetField(H, allocator, frame, sf, host),
         .CompoundField => |cf| return execArmCompoundField(H, allocator, frame, cf, host),
-        .Call => |*call| return execArmCall(H, allocator, frame, call, host),
+        .Call => |*call| return execArmCall(H, allocator, frame, call, host, true),
         .CallValue => |cv| return execArmCallValue(H, allocator, frame, cv, host),
         .CallValueWithThis => |cvt| {
             const callee_v = frame.read(cvt.callee);
@@ -7443,7 +7482,14 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
 }
 
 /// Outlined `execInst` arm — see `execInst`.
-noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H) Allocator.Error!Step {
+/// `allow_flat = false` masks the three flat-driver parks, forcing the
+/// recursive serving path (`KLIO_FLAT=0` semantics) for that site. A flat
+/// park is CORRECT from a transpiled native body — `afterStep` routes it
+/// and the driver serves the callee — but it unwinds the native function
+/// off the C stack on every call and resumes it through the stream; the
+/// transpiler's call op serves recursively instead so the native caller
+/// stays put.
+noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H, comptime allow_flat: bool) Allocator.Error!Step {
     dispatchBump(.call_static);
     // Monomorphic fast path: a plain top-level user function (single
     // overload, has body, non-extension, no varargs / defaults / type
@@ -7506,7 +7552,7 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
                     if (plan & ir.FAST_CALL_EXT_FLAG != 0) dispatchBump(.static_flat_fuse_ext) else dispatchBump(.static_flat_fuse);
                     // The flat driver runs the body as a pushed activation in
                     // the same dispatch loop — no native recursion per call.
-                    if (flatEnabled()) {
+                    if (allow_flat and flatEnabled()) {
                         const composer_pushed = if (comptime @hasDecl(H, "flatPlainCallOpen"))
                             host.flatPlainCallOpen(cf, args_list.items)
                         else
@@ -7547,7 +7593,7 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
     // continues with COROUTINE_SUSPENDED, with no native pump entry and no
     // frame snapshots per call.
     if (comptime @hasDecl(H, "prepareUndispatchedStartFlatCall")) {
-        if (flatEnabled() and argNamesAllNull(call.arg_names)) {
+        if (allow_flat and flatEnabled() and argNamesAllNull(call.arg_names)) {
             if (try host.prepareUndispatchedStartFlatCall(allocator, frame.module, call.func, arg_values)) |prep0| {
                 var prep = prep0;
                 prep.dst = call.dst;
@@ -7656,7 +7702,7 @@ noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, c
     // teardown/park) and the call's type args for the boundary
     // transform. Special shapes decline to the recursive path.
     if (comptime @hasDecl(H, "prepareTypedFlatCall")) {
-        if (flatEnabled() and ta.items.len > 0 and argNamesAllNull(call.arg_names)) {
+        if (allow_flat and flatEnabled() and ta.items.len > 0 and argNamesAllNull(call.arg_names)) {
             if (try host.prepareTypedFlatCall(allocator, frame.module, eff_func, arg_values, ta.items, call.exact)) |prep0| {
                 var prep = prep0;
                 prep.dst = call.dst;

@@ -74,6 +74,10 @@ export fn klio_op_escape(ctx: *anyopaque, block: u32, inst_idx: u32) i32 {
     return eval.nativeOpEscape(ctxOf(ctx), block, inst_idx);
 }
 
+export fn klio_op_call(ctx: *anyopaque, block: u32, inst_idx: u32) i32 {
+    return eval.nativeOpCall(ctxOf(ctx), block, inst_idx);
+}
+
 export fn klio_op_edge(ctx: *anyopaque) i32 {
     return eval.nativeOpEdge(ctxOf(ctx));
 }

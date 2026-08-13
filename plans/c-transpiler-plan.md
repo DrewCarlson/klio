@@ -104,17 +104,34 @@ standalone binary.
       (only ~63 of ~22k fib activations went native in the stage-2 gate
       program). Direct C-to-C calls between emitted functions replace that
       seam, which is where the real win is.
-      Design pinned (v1): a `.Call` escape emits `klio_op_call(ctx, block,
-      idx)` instead of `klio_op_escape`. The helper is `execArmCall` with
-      its three flat parks masked (a new `comptime allow_flat` parameter;
-      the interpreter's sites pass true) — i.e. exactly the maintained
+      v1 LANDED: a `.Call` escape emits `klio_op_call(ctx, block, idx)`
+      instead of `klio_op_escape`. The helper is `execArmCall` with its
+      three flat parks masked (a new `comptime allow_flat` parameter; the
+      interpreter's sites pass true) — i.e. exactly the maintained
       `KLIO_FLAT=0` recursive semantics for this one site: the native
       caller STAYS on the C stack, the callee runs through
       `callFuncFast`/`callFuncTyped`, and a native callee engages its own
-      emitted body inside that call's `runFrameExec`. Suspension is
-      unchanged: the callee's park surfaces as the Suspended err result,
-      `raiseStep` + `afterStep` park the caller at (block, idx+1), resume
-      is interpreted via idx_pc. What this v1 does NOT yet do: a
-      light-frame C-to-C ABI that skips `openActivation` entirely
-      (measure first — leafExprServe already serves the pure-leaf tier).
+      emitted body inside that call's `runFrameExec` (the recursive call
+      seam's leaf short-circuit defers to a registered native body — free
+      in non-transpiled processes, where the table is empty). Suspension
+      is unchanged: the callee's park surfaces as the Suspended err
+      result, `raiseStep` + `afterStep` park the caller at (block, idx+1),
+      resume is interpreted via idx_pc. Verified: fib recursion runs
+      native-to-native (`[native-call]` per site under KLIO_NATIVE_TRACE);
+      coroutine/loop/try parity holds.
+      Facts the first measurements established:
+      - Under the default `fast` profile the LOOP JIT (enabled in
+        `klio_rt_run_file`'s profile) still outruns and absorbs hot scalar
+        functions before the native tier matters — the JIT probe sits
+        above the native check, deliberately.
+      - JIT-off benchmark (tight loop + fib(25)): Debug build native
+        33.4s vs interpreter 25.2s; ReleaseFast native 2.78s vs
+        interpreter 2.71s — a wash. The call-per-op OPAQUE ABI trades the
+        stream's inlined switch dispatch for an exported call per op and
+        quickened calls pay full frames where the interpreter leaf-serves,
+        so the tier is currently perf-NEUTRAL, not a win. The stage-4 road
+        to the actual speedup is a frozen scalar "hot view" sub-ABI
+        (static-inline header ops over tag + Int/Long/Bool payload
+        offsets, constants comptime-checked against `runtime.Value`) so
+        the emitted C inlines the hot ops instead of calling them.
 - [ ] Stage 4: corpus parity + measured speedup

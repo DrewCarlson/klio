@@ -46,6 +46,7 @@ void    klio_op_load_param(void *ctx, uint32_t dst, uint32_t idx);
 void    klio_op_cell_get(void *ctx, uint32_t dst, uint32_t cell);
 int32_t klio_op_bin(void *ctx, uint32_t block, uint32_t inst_idx, uint32_t kind, uint32_t dst, uint32_t lhs, uint32_t rhs);
 int32_t klio_op_escape(void *ctx, uint32_t block, uint32_t inst_idx);
+int32_t klio_op_call(void *ctx, uint32_t block, uint32_t inst_idx);
 int32_t klio_op_edge(void *ctx);
 int32_t klio_op_br(void *ctx, uint32_t block, uint32_t cond);
 int32_t klio_op_cmp_br(void *ctx, uint32_t block, uint32_t inst_idx, uint32_t kind, uint32_t dst, uint32_t lhs, uint32_t rhs);

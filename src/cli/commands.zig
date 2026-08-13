@@ -549,7 +549,7 @@ fn emitNativeFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams) !
     try w.print("  default: return;\n  }}\n", .{});
     for (fs.streams, 0..) |sopt, bi| {
         const st = sopt orelse continue;
-        try emitNativeBlock(w, st, @intCast(bi), fs);
+        try emitNativeBlock(w, f, st, @intCast(bi), fs);
     }
     try w.print("}}\n\n", .{});
 }
@@ -565,7 +565,7 @@ fn emitEdgeTo(w: anytype, fs: *const ir.bc.FuncStreams, target: u32) !void {
     }
 }
 
-fn emitNativeBlock(w: anytype, st: *const ir.bc.Stream, block: u32, fs: *const ir.bc.FuncStreams) !void {
+fn emitNativeBlock(w: anytype, f: *const ir.Func, st: *const ir.bc.Stream, block: u32, fs: *const ir.bc.FuncStreams) !void {
     try w.print("B{d}:\n", .{block});
     const code = st.code;
     var pc: usize = 0;
@@ -602,7 +602,15 @@ fn emitNativeBlock(w: anytype, st: *const ir.bc.Stream, block: u32, fs: *const i
                 pc += 6;
             },
             .escape => {
-                try w.print("  if (klio_op_escape(ctx, {d}u, {d}u)) return;\n", .{ block, code[pc + 1] });
+                // A statically-bound call quickens to the call op: the
+                // native caller stays on the C stack and the callee's own
+                // emitted body engages inside the recursive activation.
+                const inst_idx = code[pc + 1];
+                const op_name = switch (f.blocks[block].insts[inst_idx]) {
+                    .Call => "klio_op_call",
+                    else => "klio_op_escape",
+                };
+                try w.print("  if ({s}(ctx, {d}u, {d}u)) return;\n", .{ op_name, block, inst_idx });
                 pc += 2;
             },
             .jump => {
