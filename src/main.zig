@@ -104,6 +104,23 @@ fn resolveProfile(args: std.process.Args) runtime.perf.Profile {
     return runtime.perf.resolveBinaryProfile(list.items);
 }
 
+/// Every command runs on a dedicated thread with a large stack reserve
+/// (virtual until touched): lowering a dependency base whose sources carry
+/// deeply-chained expressions recurses far past what a default main-thread
+/// stack holds, and the fault appears only on a cold bake — the warm-cache
+/// paths never re-lower.
+fn cliBody(a: std.mem.Allocator, args: std.process.Args, out: *u8) void {
+    out.* = cli.run(a, args) catch 1;
+}
+
+fn runCli(a: std.mem.Allocator, args: std.process.Args) u8 {
+    var code: u8 = 1;
+    const t = std.Thread.spawn(.{ .stack_size = 256 << 20 }, cliBody, .{ a, args, &code }) catch
+        return cli.run(a, args) catch 1;
+    t.join();
+    return code;
+}
+
 pub fn main(init: std.process.Init.Minimal) !u8 {
     // attachSegfaultHandler pulls the `SelfInfo` symbolizer (unavailable on
     // mobile — see the panic override above); gate it out there at comptime.
@@ -129,7 +146,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         defer arena.deinit();
         const a = runtime.allocTrackWrap(arena.allocator());
         defer runtime.allocTrackReportStderr();
-        return cli.run(a, init.args);
+        return runCli(a, init.args);
     }
 
     const mode = runtime.allocChoice();
@@ -139,10 +156,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             defer arena.deinit();
             const a = runtime.allocTrackWrap(arena.allocator());
             defer runtime.allocTrackReportStderr();
-            return cli.run(a, init.args);
+            return runCli(a, init.args);
         },
         .smp => {
-            return cli.run(std.heap.smp_allocator, init.args);
+            return runCli(std.heap.smp_allocator, init.args);
         },
         .gc => {
             // Tracing GC (KGC): a freeing backing allocator + reachability-based
@@ -189,9 +206,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 if (std.mem.eql(u8, v, "dbg")) {
                     var dbg: std.heap.DebugAllocator(.{ .thread_safe = true, .safety = true }) = .init;
                     defer _ = dbg.deinit();
-                    return cli.run(dbg.allocator(), init.args);
+                    return runCli(dbg.allocator(), init.args);
                 }
-                return cli.run(guardAllocator(std.heap.smp_allocator), init.args);
+                return runCli(guardAllocator(std.heap.smp_allocator), init.args);
             }
             // Backing allocator. The collector frees by reachability, but the
             // backend decides whether reclaimed pages return to the OS. The
@@ -211,22 +228,22 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             // do not touch the slab (the hook then no-ops over empty class lists).
             runtime.gc.release_to_os = runtime.slab.reclaimDormant;
             if (std.mem.eql(u8, alloc_mode, "smp")) {
-                return cli.run(std.heap.smp_allocator, init.args);
+                return runCli(std.heap.smp_allocator, init.args);
             }
             if (std.mem.eql(u8, alloc_mode, "gpa")) {
                 var gpa: std.heap.DebugAllocator(.{ .thread_safe = true, .safety = false, .stack_trace_frames = 10 }) = .init;
                 defer _ = gpa.deinit();
-                return cli.run(gpa.allocator(), init.args);
+                return runCli(gpa.allocator(), init.args);
             }
             if (std.mem.eql(u8, alloc_mode, "calloc")) {
                 runtime.gc.release_to_os = gcReleaseToOs;
-                return cli.run(std.heap.c_allocator, init.args);
+                return runCli(std.heap.c_allocator, init.args);
             }
             if (std.mem.eql(u8, alloc_mode, "leaktrack")) {
                 if (runtime.envOnce("KLIO_LEAK_BY_FQN")) |_| runtime.leaktrack.by_fqn_only = true;
                 const a = runtime.leaktrack.wrap(runtime.slab.allocator);
                 runtime.leaktrack.installSignalDump();
-                const rc = cli.run(a, init.args);
+                const rc = runCli(a, init.args);
                 // Force a final collection so GC-managed cells that were merely
                 // uncollected (not leaked) are freed before the report; what
                 // remains outstanding is the genuine raw host-temporary leak.
@@ -240,31 +257,31 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             if (runtime.envOnce("KLIO_SLAB_TRACE")) |_| {
                 runtime.slab.trace_enabled = true;
                 runtime.slab.installTraceSignalDump();
-                const rc = cli.run(runtime.slab.allocator, init.args);
+                const rc = runCli(runtime.slab.allocator, init.args);
                 runtime.slab.traceReport();
                 return rc;
             }
             if (runtime.envOnce("KLIO_CELL_TRACE")) |_| {
                 runtime.slab.cell_trace_enabled = true;
                 runtime.slab.installTraceSignalDump();
-                const rc = cli.run(runtime.slab.allocator, init.args);
+                const rc = runCli(runtime.slab.allocator, init.args);
                 runtime.slab.traceReport();
                 return rc;
             }
             if (runtime.envOnce("KLIO_SLAB_STAT")) |_| {
-                const rc = cli.run(runtime.slab.allocator, init.args);
+                const rc = runCli(runtime.slab.allocator, init.args);
                 std.debug.print(
                     "[slab] mapped_bytes={d} ({d} MB)\n",
                     .{ runtime.slab.mapped_bytes.load(.monotonic), runtime.slab.mapped_bytes.load(.monotonic) / (1024 * 1024) },
                 );
                 return rc;
             }
-            return cli.run(runtime.slab.allocator, init.args);
+            return runCli(runtime.slab.allocator, init.args);
         },
         .debug => {
             var dbg: std.heap.DebugAllocator(.{ .thread_safe = true, .safety = true }) = .init;
             defer _ = dbg.deinit();
-            return cli.run(dbg.allocator(), init.args);
+            return runCli(dbg.allocator(), init.args);
         },
     }
 }

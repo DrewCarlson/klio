@@ -15,6 +15,12 @@ extern "C" {
  * runtime error). */
 int klio_rt_run_file(const char *path);
 
+/* Runs the Kotlin program at `path` against the pre-baked dependency base
+ * at `base_image`, exactly as `klio run-image` would. Transpiled programs
+ * use this entry: their emitted ids are only meaningful against the module
+ * assembled from that exact artifact. */
+int klio_rt_run_image(const char *base_image, const char *path);
+
 /* The library's ABI version (this header describes version 2). */
 int klio_rt_abi_version(void);
 
@@ -30,6 +36,12 @@ typedef void (*klio_native_fn)(void *ctx, uint32_t entry_block);
  * ignored, falling back to interpretation rather than running the wrong
  * body. */
 void klio_rt_register_native(uint32_t fid, klio_native_fn f, const char *fqn);
+
+/* Declares the func/const table sizes of the module the emitter walked;
+ * a frame whose module disagrees runs interpreted (the emitted ids index
+ * these tables and mean nothing against any other module). Generated
+ * code calls this before registering function bodies. */
+void klio_rt_register_module_check(uint64_t n_funcs, uint64_t n_consts);
 
 /* Per-op helpers — the interpreter's own op bodies behind the C ABI.
  * `ctx` is the opaque activation context a native fn was invoked with.

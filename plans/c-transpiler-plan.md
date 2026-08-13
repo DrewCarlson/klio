@@ -134,4 +134,39 @@ standalone binary.
         (static-inline header ops over tag + Int/Long/Bool payload
         offsets, constants comptime-checked against `runtime.Value`) so
         the emitted C inlines the hot ops instead of calling them.
-- [ ] Stage 4: corpus parity + measured speedup
+- [ ] Stage 4: corpus parity + measured speedup. PARITY HALF DONE —
+      `scripts/transpiler-corpus-check.sh` (parallel, JOBS=8): 293/293
+      examples transpile, compile, and match the interpreter byte-for-byte
+      (the same interactive/heavy exclusions as the corpus baseline). What
+      it took, in order of discovery:
+      - **The module must be pinned by artifact, not re-derived.** A fresh
+        in-process bake is NOT id-stable across processes (two bakes of
+        identical sources order consts differently), so the first cut —
+        native binary re-bakes its own image — produced shifted const ids:
+        garbage output when in range, index-out-of-bounds when not.
+        `klio transpile` now bakes the program's base to `out.klio-image`,
+        assembles the emission module from that artifact exactly as
+        `run-image` does, and the emitted `main` calls
+        `klio_rt_run_image(image, program)`. Programs the image path
+        cannot serve (base-name shadows `canExtendBase` rejects) fall back
+        to legacy whole-program emission + `klio_rt_run_file` — the
+        runtime declines the image path for them the same way.
+      - **Guards for whatever still drifts:** registration carries the
+        walked module's table sizes (`klio_rt_register_module_check`, a
+        PREFIX bound — execution appends synthesized funcs/consts) on top
+        of the per-fid fqn guard; a frame on a delegating anonymous-object
+        module (its own tiny const pool) or any drifted module runs
+        interpreted, never wrong.
+      - **Stack headroom.** Lowering deeply-chained sources recurses past
+        a default thread stack: the CLI now runs every command on a
+        256MB-reserve thread (`main.zig` `runCli`) and both `klio_rt_run_*`
+        entries spawn the same — a transpiled binary's C `main` gets only
+        the rlimit stack (the kernel ignores GNU_STACK size), and the
+        fault only appeared on cold bakes, which warm caches had hidden.
+      - Native recursion depth: recursive call serving reverts to the
+        flat park past `NATIVE_RECURSE_MAX_DEPTH` (200), and the native
+        entry itself declines past that eval depth, so deep chains bound
+        the C stack.
+      Remaining: the measured-speedup half (rangebench, ReleaseFast; the
+      opaque ABI measured perf-neutral — see stage 3 notes — so the win
+      needs the inline hot-view sub-ABI).

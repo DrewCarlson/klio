@@ -47,6 +47,7 @@ pub const RequestedFeatures = pack_cache.RequestedFeatures;
 const loadInstalledPacks = pack_cache.loadInstalledPacks;
 
 const stdlib_image = @import("stdlib_image.zig");
+const bundle = @import("bundle.zig");
 
 const test_runner = @import("test_runner");
 const compose_ui = @import("compose_ui");
@@ -410,19 +411,38 @@ pub fn runTranspile(
     gpa: std.mem.Allocator,
     path: []const u8,
     out_path: ?[]const u8,
-    features: *const RequestedFeatures,
+    features: *RequestedFeatures,
 ) u8 {
-    // fids and trace file ids are only stable when the emitter walks the
-    // EXACT module shape the transpiled binary rebuilds at run time, so
-    // this mirrors runFileIrVm's assembly order: the baked-image path
-    // first, the legacy whole-program lowering as its fallback. (A
-    // mismatch is safe — registration is fqn-guarded — but every guarded
-    // fid falls back to interpretation.)
-    if (stdlib_image.tryPrepare(gpa, &.{path}, features)) |prepared| {
-        var built = prepared.built;
-        defer built.deinit();
-        return transpileEmit(gpa, &built, path, out_path);
+    // The emitted ids (fids, const ids, trace file ids) are only
+    // meaningful against ONE exact module, and an in-process bake is not
+    // id-stable across processes — so the deliverable pins the module:
+    // the program's dependency base bakes to a `.klio-image` artifact
+    // beside the C file, the emitter assembles the module from THAT
+    // artifact exactly as `run-image` does, and the emitted `main` runs
+    // the program against the same artifact.
+    const c_out = out_path orelse blk: {
+        const base = std.fs.path.basename(path);
+        const stem = if (std.mem.endsWith(u8, base, ".kt")) base[0 .. base.len - 3] else base;
+        break :blk std.fmt.allocPrint(gpa, "{s}.c", .{stem}) catch return 1;
+    };
+    const image_path = blk: {
+        const stem = if (std.mem.endsWith(u8, c_out, ".c")) c_out[0 .. c_out.len - 2] else c_out;
+        break :blk std.fmt.allocPrint(gpa, "{s}.klio-image", .{stem}) catch return 1;
+    };
+    const bake_rc = bundle.bakeImage(gpa, &.{path}, features, image_path);
+    if (bake_rc == 0) {
+        if (bundle.assembleImageBuild(gpa, image_path, &.{path})) |asm_r| {
+            var built = asm_r.built;
+            return transpileEmit(gpa, &built, path, c_out, image_path);
+        }
     }
+    // A program the image path cannot serve (an unbakeable base, or a
+    // base-name shadow `canExtendBase` rejects) runs the legacy
+    // whole-program lowering — in the CLI, AND in the transpiled binary,
+    // whose `klio_rt_run_file` declines the image path the same way. Emit
+    // from the same legacy module; the fqn/fingerprint guards keep a
+    // drifted binary interpreted rather than wrong.
+    io.printStderr(gpa, "note: image path unavailable; emitting against the whole-program lowering\n", .{});
     var map = SourceMap.init(gpa);
     defer map.deinit();
     const id = load(gpa, &map, path) orelse return 1;
@@ -454,14 +474,15 @@ pub fn runTranspile(
         return 1;
     };
     defer built.deinit();
-    return transpileEmit(gpa, &built, path, out_path);
+    return transpileEmit(gpa, &built, path, c_out, null);
 }
 
 fn transpileEmit(
     gpa: std.mem.Allocator,
     built: *interp_ir.build.BuiltModule,
     path: []const u8,
-    out_path: ?[]const u8,
+    out_path: []const u8,
+    image_path: ?[]const u8,
 ) u8 {
     const mg = built.module.borrow();
     defer mg.deinit();
@@ -495,27 +516,31 @@ fn transpileEmit(
     }
 
     w.print("void klio_transpiled_register(void) {{\n", .{}) catch return 1;
+    w.print("  klio_rt_register_module_check({d}u, {d}u);\n", .{ m.funcs.items.len, m.consts.items.len }) catch return 1;
     for (emitted.items) |e| {
         w.print("  klio_rt_register_native({d}u, kf_{d}, ", .{ e.fid, e.fid }) catch return 1;
         emitCString(w, e.fqn) catch return 1;
         w.print(");\n", .{}) catch return 1;
     }
-    w.print("}}\n\n#ifndef KLIO_TRANSPILED_NO_MAIN\nint main(void) {{\n  klio_transpiled_register();\n  return klio_rt_run_file(", .{}) catch return 1;
-    emitCString(w, path) catch return 1;
+    if (image_path) |ip| {
+        w.print("}}\n\n#ifndef KLIO_TRANSPILED_NO_MAIN\nint main(void) {{\n  klio_transpiled_register();\n  return klio_rt_run_image(", .{}) catch return 1;
+        emitCString(w, ip) catch return 1;
+        w.print(", ", .{}) catch return 1;
+        emitCString(w, path) catch return 1;
+    } else {
+        w.print("}}\n\n#ifndef KLIO_TRANSPILED_NO_MAIN\nint main(void) {{\n  klio_transpiled_register();\n  return klio_rt_run_file(", .{}) catch return 1;
+        emitCString(w, path) catch return 1;
+    }
     w.print(");\n}}\n#endif\n", .{}) catch return 1;
 
     const text = aw.toOwnedSlice() catch return 1;
     defer gpa.free(text);
-    if (out_path) |op| {
-        var threaded: std.Io.Threaded = .init(gpa, .{});
-        defer threaded.deinit();
-        std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = op, .data = text }) catch {
-            io.printStderr(gpa, "error: cannot write `{s}`\n", .{op});
-            return 1;
-        };
-    } else {
-        io.printStdout(gpa, "{s}", .{text});
-    }
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = out_path, .data = text }) catch {
+        io.printStderr(gpa, "error: cannot write `{s}`\n", .{out_path});
+        return 1;
+    };
     return 0;
 }
 

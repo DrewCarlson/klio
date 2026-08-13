@@ -31,7 +31,7 @@ const stdlib_image = @import("stdlib_image.zig");
 
 const unimplemented = @import("unimplemented.zig");
 
-const bundle = @import("bundle.zig");
+pub const bundle = @import("bundle.zig");
 const bundle_boot = @import("bundle_boot.zig");
 
 pub const VERSION = "0.1.0";
@@ -66,7 +66,9 @@ const USAGE =
     \\                             program's packs) to a standalone .klio-image.
     \\  run-image <base> <file>    Run a program against a pre-baked base image.
     \\  transpile <file> [-o out]  Emit the program as C over the klio_rt per-op
-    \\                             ABI (compile with zig cc + libklio_rt.a).
+    \\                             ABI plus its pinned base image (out.c +
+    \\                             out.klio-image; compile with zig cc +
+    \\                             libklio_rt.a).
     \\  repl                       Start an interactive REPL.
     \\  pack <subcommand>          Build or inspect a `.klio-pack` artifact.
     \\
