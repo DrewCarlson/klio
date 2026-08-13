@@ -84,3 +84,24 @@ practice.
       design, and the loop JIT measured unhelpful on this workload).
 
 State: DONE — floor recorded here and in memory.
+
+## HANDOVER NOTE (Iterator fold in flight, tree DIRTY)
+
+The Value-16B Iterator fold is mid-edit (uncommitted in value.zig):
+IterCursor extended with items/prim/mod_count/mutable + deinit/gcTrace;
+payload swapped to `Iterator: ObjRef(IterCursor)`; `Value.newIterator`
+added; visitor/deinit arms folded. THREE build errors remain:
+1. `releaseValueList` (value.zig:2201) is nested in a container —
+   hoist it to file scope (or inline its body in IterCursor.deinit).
+2. Two `it.prim` reads (typeName ~2433, writeTo ~3019) and the `is`
+   matcher (~2579, reads it.mutable + it.prim) need a borrow snapshot:
+   `const g = it.borrow(); defer g.deinit();` then read `g.get().prim`.
+Then: convert the 9 constructions in host_call_member (all call
+`newCursor(...)` — replace with `Value.newIterator(allocator, .{ .items
+= ..., .prim = ..., .mod_count = ..., .mutable = ..., .exp_mod = ... })`
+and DELETE newCursor), and rewrite `iteratorMember` (~7889) + line 5022
+guard to borrow the one cell (it already borrows the cursor per call —
+fold the field reads into that borrow). Then: zigcheck runtime +
+interp_ir, zig build test (watch for leaks in iterator tests → add
+refOf-deinit teardowns), census expects Value=32, rangebench A/B gate,
+quick-gate battery, commit.
