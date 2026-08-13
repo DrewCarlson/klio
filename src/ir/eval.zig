@@ -5144,6 +5144,15 @@ fn runFrameExec(
     // compile trigger lives at this loop's block entry, and fused edges
     // would starve it.
     const bc_streams: ?*const bc.FuncStreams = if (bc.enabled()) bc.funcStreams(func, !jit_on, module.consts.items) else null;
+    // The C transpiler's native table: a registered function's blocks run
+    // as emitted C instead of the stream (one lookup per activation; the
+    // table is empty in every non-transpiled process).
+    const native_fn: ?NativeFn = nativeFor(func.id.int(), func.fqn);
+    if (native_fn == null and native_any.load(.acquire) and
+        func.package.len == 0 and runtime.envOnce("KLIO_NATIVE_TRACE") != null)
+    {
+        std.debug.print("[native-miss] fn={s} fid={d}\n", .{ func.fqn, func.id.int() });
+    }
     // The loop JIT's per-function state, hoisted to one lookup per
     // activation; the per-block-entry probe is then two array loads.
     const jit_fj: ?*jit_loop.FuncJit = if (jit_on) jit_loop.forFunc(func) else null;
@@ -5318,7 +5327,50 @@ fn runFrameExec(
         // ops, so straight-line control flow never surfaces to the frame
         // loop's per-block bookkeeping; each taken edge runs the same
         // abandon/spin/GC guards the frame loop runs per block entry.
-        if (bc_streams) |bs| bc_run: {
+        // A registered native function runs its emitted C for this block
+        // (and, fused, every block it flows into) with the exact exits the
+        // stream loop has. Fresh block entries only: a resume mid-block
+        // (start_idx != 0) or one carrying a throw/unwind goes through the
+        // stream's idx_pc machinery — the coordinates are shared, so a
+        // parked transpiled function resumes exactly like an interpreted
+        // one.
+        var native_ran = false;
+        if (native_fn) |nf| native_run: {
+            if (thrown != null or unwound != null) break :native_run;
+            if (start_idx != 0) break :native_run;
+            if (frame.regs.items.len < func.n_locals) break :native_run;
+            var nctx: NativeCtx = .{
+                .frame = frame,
+                .allocator = allocator,
+                .ftls = ftls,
+                .host = @ptrCast(host),
+                .flat_out = flat_out,
+                .park_out = park_out,
+                .thrown = &thrown,
+                .unwound = &unwound,
+                .ret_v = &ret_v,
+                .arm_bin = &NativeGlue(H).armBin,
+                .escape = &NativeGlue(H).escape,
+            };
+            nf(@ptrCast(&nctx), cur.int());
+            if (runtime.envOnce("KLIO_NATIVE_TRACE") != null) {
+                std.debug.print("[native] fn={s} entry=b{d} outcome={s}\n", .{
+                    func.fqn, cur.int(), @tagName(nctx.outcome),
+                });
+            }
+            switch (nctx.outcome) {
+                .none => break :native_run,
+                .term => bc_term = @enumFromInt(nctx.out_block),
+                .goto => bc_goto = @enumFromInt(nctx.out_block),
+                .brk => cur = @enumFromInt(nctx.out_block),
+                .ret => return ret_v,
+                .oom => return error.OutOfMemory,
+            }
+            ran_bc = true;
+            native_ran = true;
+        }
+        if (!native_ran and bc_streams != null) bc_run: {
+            const bs = bc_streams.?;
             // A resume that arrived carrying a throw/unwind skips the
             // instruction surface entirely — for an EMPTY block its
             // `start_idx = insts.len` is 0, indistinguishable from a
@@ -6181,6 +6233,290 @@ inline fn writeFastU(frame: *Frame, r: Reg, v: Value, allocator: Allocator) void
     const old = frame.regs.items.ptr[idx];
     frame.regs.items.ptr[idx] = v;
     if (runtime.reclaimEnabled()) old.release(allocator);
+}
+
+/// The C transpiler's native-function surface (plans/c-transpiler-plan.md
+/// stage 2). A transpiled program registers per-fid C functions before the
+/// run starts; the frame loop then executes a registered function's blocks
+/// through the emitted C instead of the bytecode stream. The C code never
+/// touches interpreter state: every op is a call back into one of the
+/// `nativeOp*` helpers below (exported behind a C ABI by klio_rt), which
+/// are the stream loop's own arm bodies over a `NativeCtx` that carries
+/// the frame-loop locals for one activation.
+pub const NativeFn = *const fn (ctx: ?*anyopaque, entry_block: u32) callconv(.c) void;
+
+var native_mutex: runtime.SpinMutex = .{};
+const NativeEntry = struct { f: NativeFn, fqn: []const u8 };
+var native_table: std.AutoHashMapUnmanaged(u32, NativeEntry) = .empty;
+var native_any: std.atomic.Value(bool) = .init(false);
+
+/// Registration happens from the transpiled binary's `main` before the
+/// program runs; the table is read-only afterwards. `fqn` is the emitted
+/// function's fully qualified name: fids are only stable when the running
+/// binary lowers the same program to the same module shape the emitter
+/// walked, so the lookup refuses an entry whose name does not match —
+/// a mismatched table silently falls back to full interpretation rather
+/// than ever running the wrong body.
+pub fn registerNative(fid: u32, f: NativeFn, fqn: []const u8) void {
+    native_mutex.lock();
+    defer native_mutex.unlock();
+    const owned = std.heap.smp_allocator.dupe(u8, fqn) catch return;
+    native_table.put(std.heap.smp_allocator, fid, .{ .f = f, .fqn = owned }) catch return;
+    native_any.store(true, .release);
+}
+
+fn nativeFor(fid: u32, fqn: []const u8) ?NativeFn {
+    if (!native_any.load(.acquire)) return null;
+    native_mutex.lock();
+    defer native_mutex.unlock();
+    const e = native_table.get(fid) orelse return null;
+    if (!std.mem.eql(u8, e.fqn, fqn)) return null;
+    return e.f;
+}
+
+/// What a native run left for the frame loop: the same exits the stream
+/// loop has. `term`/`goto` mirror `bc_term`/`bc_goto`, `brk` is the
+/// unwind break with `thrown`/`unwound` set, `ret` returns `ret_v`,
+/// `none` means the entry block was not compiled (fall back to the
+/// stream/walker for this block).
+pub const NativeOutcome = enum(u8) { none, term, goto, brk, ret, oom };
+
+const NativeStep = enum { cont, brk, ret, oom };
+
+pub const NativeCtx = struct {
+    frame: *Frame,
+    allocator: Allocator,
+    ftls: *EvalTls,
+    host: *anyopaque,
+    flat_out: *?FlatCallSite,
+    park_out: *?ParkPoint,
+    thrown: *?Value,
+    unwound: *?EvalError,
+    ret_v: *EvalResult,
+    /// Host-typed glue (the frame loop instantiates these for its `H`):
+    /// run `execArmBinOp`/`execInst` + `afterStep` for the inst at
+    /// (block, idx).
+    arm_bin: *const fn (*NativeCtx, u32, u32) NativeStep,
+    escape: *const fn (*NativeCtx, u32, u32) NativeStep,
+    outcome: NativeOutcome = .none,
+    out_block: u32 = 0,
+};
+
+fn NativeGlue(comptime H: type) type {
+    return struct {
+        fn armBin(ctx: *NativeCtx, block: u32, idx: u32) NativeStep {
+            const host: *H = @ptrCast(@alignCast(ctx.host));
+            const frame = ctx.frame;
+            const inst = &frame.func.blocks[block].insts[idx];
+            const r = execArmBinOp(H, ctx.allocator, frame, inst.BinOp, host) catch return .oom;
+            return glueAfter(ctx, r, inst, idx, block);
+        }
+        fn escape(ctx: *NativeCtx, block: u32, idx: u32) NativeStep {
+            const host: *H = @ptrCast(@alignCast(ctx.host));
+            const frame = ctx.frame;
+            const inst = &frame.func.blocks[block].insts[idx];
+            const r = execInst(H, ctx.allocator, frame, inst, host) catch return .oom;
+            return glueAfter(ctx, r, inst, idx, block);
+        }
+    };
+}
+
+fn glueAfter(ctx: *NativeCtx, r: Step, inst: *const Inst, idx: u32, block: u32) NativeStep {
+    const a = afterStep(
+        ctx.allocator,
+        ctx.frame,
+        r,
+        inst,
+        idx,
+        @enumFromInt(block),
+        ctx.flat_out,
+        ctx.park_out,
+        ctx.thrown,
+        ctx.unwound,
+        ctx.ret_v,
+    ) catch return .oom;
+    return switch (a) {
+        .cont => .cont,
+        .brk => .brk,
+        .ret => .ret,
+    };
+}
+
+pub fn nativeOpTrace(ctx: *NativeCtx, file: u32, start: u32, end: u32) void {
+    ctx.frame.cur_span = .{ .file = @enumFromInt(file), .start = start, .end = end };
+}
+
+pub fn nativeOpConstLoad(ctx: *NativeCtx, dst: u32, const_id: u32) i32 {
+    const v = constToValue(ctx.allocator, &ctx.frame.module.consts.items[const_id]) catch {
+        ctx.outcome = .oom;
+        return 1;
+    };
+    writeFastU(ctx.frame, @enumFromInt(dst), v, ctx.allocator);
+    return 0;
+}
+
+pub fn nativeOpConstInt(ctx: *NativeCtx, dst: u32, payload: i32) void {
+    writeFastU(ctx.frame, @enumFromInt(dst), .{ .Int = payload }, ctx.allocator);
+}
+
+pub fn nativeOpMove(ctx: *NativeCtx, dst: u32, src: u32) void {
+    const v = ctx.frame.regs.items.ptr[src];
+    v.retain();
+    writeFastU(ctx.frame, @enumFromInt(dst), v, ctx.allocator);
+}
+
+pub fn nativeOpLoadParam(ctx: *NativeCtx, dst: u32, pidx: u32) void {
+    const frame = ctx.frame;
+    const v = if (pidx < frame.params.items.len) frame.params.items[pidx] else Value.Unit;
+    v.retain();
+    writeFastU(frame, @enumFromInt(dst), v, ctx.allocator);
+}
+
+pub fn nativeOpCellGet(ctx: *NativeCtx, dst: u32, cell: u32) void {
+    const frame = ctx.frame;
+    const v = switch (frame.regs.items.ptr[cell]) {
+        .Cell => |c| vblk: {
+            const g = c.borrow();
+            defer g.deinit();
+            break :vblk g.get().*;
+        },
+        else => |other| other,
+    };
+    v.retain();
+    writeFastU(frame, @enumFromInt(dst), v, ctx.allocator);
+}
+
+/// Nonzero = the emitted function must return (outcome set on the ctx).
+pub fn nativeOpBin(ctx: *NativeCtx, block: u32, inst_idx: u32, kind: u32, dst: u32, lhs: u32, rhs: u32) i32 {
+    if (binFast(ctx.frame, @enumFromInt(kind), @enumFromInt(dst), @enumFromInt(lhs), @enumFromInt(rhs), ctx.allocator)) return 0;
+    switch (ctx.arm_bin(ctx, block, inst_idx)) {
+        .cont => return 0,
+        .brk => {
+            ctx.outcome = .brk;
+            ctx.out_block = block;
+            return 1;
+        },
+        .ret => {
+            ctx.outcome = .ret;
+            return 1;
+        },
+        .oom => {
+            ctx.outcome = .oom;
+            return 1;
+        },
+    }
+}
+
+/// Nonzero = the emitted function must return (outcome set on the ctx).
+pub fn nativeOpEscape(ctx: *NativeCtx, block: u32, inst_idx: u32) i32 {
+    switch (ctx.escape(ctx, block, inst_idx)) {
+        .cont => return 0,
+        .brk => {
+            ctx.outcome = .brk;
+            ctx.out_block = block;
+            return 1;
+        },
+        .ret => {
+            ctx.outcome = .ret;
+            return 1;
+        },
+        .oom => {
+            ctx.outcome = .oom;
+            return 1;
+        },
+    }
+}
+
+/// The per-taken-edge guards on a fused `goto`. Nonzero = return.
+pub fn nativeOpEdge(ctx: *NativeCtx) i32 {
+    if (fusedEdgeGuard(ctx.ftls)) |er| {
+        ctx.ret_v.* = er;
+        ctx.outcome = .ret;
+        return 1;
+    }
+    return 0;
+}
+
+/// Fused Branch: 1 = take the true edge, 0 = the false edge, 2 = return
+/// (non-Bool condition exits to the real terminator; edge-guard abort).
+pub fn nativeOpBr(ctx: *NativeCtx, block: u32, cond: u32) i32 {
+    const cv = ctx.frame.regs.items.ptr[cond];
+    if (cv != .Bool) {
+        ctx.outcome = .term;
+        ctx.out_block = block;
+        return 2;
+    }
+    if (fusedEdgeGuard(ctx.ftls)) |er| {
+        ctx.ret_v.* = er;
+        ctx.outcome = .ret;
+        return 2;
+    }
+    return @intFromBool(cv.Bool);
+}
+
+/// Fused compare-and-branch; same return contract as `nativeOpBr`.
+pub fn nativeOpCmpBr(ctx: *NativeCtx, block: u32, inst_idx: u32, kind: u32, dst: u32, lhs: u32, rhs: u32) i32 {
+    const frame = ctx.frame;
+    var taken: ?bool = null;
+    {
+        const regs = frame.regs.items.ptr;
+        if (scalarBin(@enumFromInt(kind), regs[lhs], regs[rhs])) |out| {
+            if (out == .Bool) {
+                const old = regs[dst];
+                regs[dst] = out;
+                if (runtime.reclaimEnabled()) old.release(ctx.allocator);
+                taken = out.Bool;
+            }
+        }
+    }
+    if (taken == null) {
+        switch (ctx.arm_bin(ctx, block, inst_idx)) {
+            .cont => {},
+            .brk => {
+                ctx.outcome = .brk;
+                ctx.out_block = block;
+                return 2;
+            },
+            .ret => {
+                ctx.outcome = .ret;
+                return 2;
+            },
+            .oom => {
+                ctx.outcome = .oom;
+                return 2;
+            },
+        }
+        const cv = frame.read(@enumFromInt(dst));
+        if (cv != .Bool) {
+            ctx.outcome = .term;
+            ctx.out_block = block;
+            return 2;
+        }
+        taken = cv.Bool;
+    }
+    if (fusedEdgeGuard(ctx.ftls)) |er| {
+        ctx.ret_v.* = er;
+        ctx.outcome = .ret;
+        return 2;
+    }
+    return @intFromBool(taken.?);
+}
+
+pub fn nativeOpRet(ctx: *NativeCtx, has_val: u32, reg: u32) void {
+    const v: Value = if (has_val != 0) ctx.frame.regs.items.ptr[reg] else .Unit;
+    v.retain();
+    ctx.ret_v.* = ok(v);
+    ctx.outcome = .ret;
+}
+
+pub fn nativeOpTerm(ctx: *NativeCtx, block: u32) void {
+    ctx.outcome = .term;
+    ctx.out_block = block;
+}
+
+pub fn nativeOpGotoExit(ctx: *NativeCtx, block: u32) void {
+    ctx.outcome = .goto;
+    ctx.out_block = block;
 }
 
 noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!Step {

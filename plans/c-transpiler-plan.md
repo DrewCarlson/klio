@@ -65,32 +65,56 @@ standalone binary.
       `tests/transpiler/boot.c` runs `examples/hello.kt` end to end
       (`scripts/transpiler-boot-check.sh`, link with `zig cc` + `-lzstd` —
       the Debug zstd objects carry UBSan references a system cc lacks)
-- [ ] Stage 2: block emitter, hello.kt parity. IN PROGRESS — the decoder
-      half is landed: `bc.dumpStream` decodes a block's (op, operands)
-      tuples and `klio transpile-dump <file>` prints every user-script
-      function's streams (hello.kt: trace / const_int x2 / bin / escape —
-      the emitter's exact input). Remaining: the per-op C ABI helpers, the
-      C printer over these tuples, and the per-fid native entry hook.
-      Design pinned:
-      - The stream to consume is `src/ir/bc.zig` (`Op`: const_load,
-        const_int, move, load_param, cell_get, trace, bin, escape, jump,
-        br, ret, term_exit, cmp_br; `FuncStreams` per block with the
-        `idx_pc` resume table).
-      - C never touches the frame struct: every op emits a call to an
-        exported per-op helper (`klio_op_move(f, dst, src)`,
-        `klio_op_bin(f, inst_idx, kind, dst, l, r)`, ...) — the helpers ARE
-        the interpreter's arm bodies behind a C ABI, so semantics are
-        shared by construction. `klio_escape(f, inst_idx)` returns a step
-        code; any non-`cont` step makes the emitted function return to the
-        interpreter (stage 2 transpiles only functions whose escapes stay
-        `cont` in practice — a raised/suspend step falls back to full
-        interpretation of the activation).
-      - Native entry: the eval loop needs a per-fid native table checked
-        before interpretation — the KLIO_FUNC_JIT hook family already cut
-        this seam once (it is gated off, see klio-exec-perf memory); reuse
-        or rebuild that registration (`klio_rt_register_native(fid, ptr)`).
-      - Gate: `klio transpile examples/hello.kt -o hello.c`, then
-        `zig cc hello.c -lklio_rt -lzstd`, output parity with
-        `klio run`.
-- [ ] Stage 3: call quickening, CALL_TAGGED table, vararg prologue
+- [x] Stage 2: block emitter, hello.kt parity — `klio transpile <file>
+      [-o out.c]` emits every user-script function's bytecode stream as C
+      over the `klio_op_*` helpers plus a registration hook and a `main`;
+      `zig cc out.c -Izig-out/include -Lzig-out/lib -lklio_rt -lzstd`
+      yields a binary with output parity (gate:
+      `scripts/transpiler-emit-check.sh`, covering straight-line code,
+      fused loops/branches, recursion, try/catch, stdlib escapes;
+      coroutine programs verified by hand — a suspend body runs native to
+      its park and resumes interpreted at the shared (block, idx)
+      coordinates). How it landed:
+      - The emitted shape: one `static void kf_<fid>(void *ctx, uint32_t
+        entry)` per function; a `switch (entry)` goto-dispatch over the
+        compiled blocks (an uncompiled entry returns with outcome `none`,
+        handing the block back to the interpreter); per-op calls exactly
+        mirroring the stream loop's arms, fused edges as `goto`.
+      - The runtime half lives in `ir/eval.zig`: `NativeCtx` carries one
+        activation's frame-loop locals plus host-typed glue fn pointers
+        (`NativeGlue(H)`) so `execInst`/`execArmBinOp` + `afterStep` run
+        with the exact routing the stream uses; `nativeOp*` are the arm
+        bodies; klio_rt exports them as `klio_op_*`. The frame loop checks
+        a per-fid table once per activation and maps the native outcome
+        onto its own exits (`bc_term`/`bc_goto`/unwind-break/return).
+      - fids are only meaningful against the module shape the runtime
+        rebuilds, so `klio transpile` assembles the module EXACTLY as
+        `runFileIrVm` does (the baked-image path first, legacy lowering as
+        the fallback) — the first cut emitted from the legacy path and
+        every fid missed the image-path runtime by ~1600. Registration is
+        fqn-guarded (`klio_rt_register_native(fid, fn, fqn)`): a mismatch
+        falls back to interpretation, never the wrong body.
+      - `KLIO_NATIVE_TRACE=1` prints `[native] fn=... entry=bN outcome=...`
+        per native activation and `[native-miss] fn=... fid=N` for
+        user-package functions with no (or a guarded) table entry.
+- [ ] Stage 3: call quickening, CALL_TAGGED table, vararg prologue.
+      Measured note from stage 2: most hot leaf calls (e.g. `fib`'s
+      recursion) are served by `leafExprServe` — a reduced executor that
+      bypasses `runFrameExec` and therefore the native table entirely
+      (only ~63 of ~22k fib activations went native in the stage-2 gate
+      program). Direct C-to-C calls between emitted functions replace that
+      seam, which is where the real win is.
+      Design pinned (v1): a `.Call` escape emits `klio_op_call(ctx, block,
+      idx)` instead of `klio_op_escape`. The helper is `execArmCall` with
+      its three flat parks masked (a new `comptime allow_flat` parameter;
+      the interpreter's sites pass true) — i.e. exactly the maintained
+      `KLIO_FLAT=0` recursive semantics for this one site: the native
+      caller STAYS on the C stack, the callee runs through
+      `callFuncFast`/`callFuncTyped`, and a native callee engages its own
+      emitted body inside that call's `runFrameExec`. Suspension is
+      unchanged: the callee's park surfaces as the Suspended err result,
+      `raiseStep` + `afterStep` park the caller at (block, idx+1), resume
+      is interpreted via idx_pc. What this v1 does NOT yet do: a
+      light-frame C-to-C ABI that skips `openActivation` entirely
+      (measure first — leafExprServe already serves the pure-leaf tier).
 - [ ] Stage 4: corpus parity + measured speedup

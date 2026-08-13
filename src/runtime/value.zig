@@ -2058,7 +2058,7 @@ pub const Value = union(enum) {
             .IrClosure => |c| releaseSliceElems(c.captures, allocator),
             .Comparator => |c| c.steps.deinit(),
             .List => |x| {
-                if (std.c.getenv("KLIO_BOXDIE_TRACE") != null and x.backing != null and
+                if (objcell.envSetOnce("KLIO_BOXDIE_TRACE") and x.backing != null and
                     listRefOf(x).cell.refcount.load(.monotonic) == 1)
                 {
                     std.debug.print("\n[boxdie] view List box dying (backing={s})\n", .{@tagName(x.backing.?.data)});
