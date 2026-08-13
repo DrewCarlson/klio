@@ -1360,6 +1360,39 @@ pub const IterCursor = struct {
     /// The source's `mod_count` as captured when the iterator was created.
     /// Meaningful only when the iterator carries a `mod_count` handle.
     exp_mod: u64 = 0,
+    /// The elements (shared with the mutable source, or a snapshot). The
+    /// fixed iterator fields ride in the cursor cell every step already
+    /// borrows, so `Value.Iterator` is the one handle.
+    items: ValueList,
+    prim: ?PrimitiveArrayKind = null,
+    /// The source collection's `mod_count`, shared with it. `next`/`hasNext`
+    /// throw `ConcurrentModificationException` when it no longer matches
+    /// `exp_mod`; the iterator's own `add`/`remove` resync it. Null when
+    /// the source had no `mod_count`.
+    mod_count: objcell.OptRef(u64) = .{},
+    /// True only when the iterator shares a *mutable* collection's backing,
+    /// so `MutableIterator.remove`/`MutableListIterator.set`/`.add` mutate
+    /// the source. A snapshot iterator over a read-only collection (or an
+    /// array/string) is false: those mutating ops throw
+    /// `UnsupportedOperationException`, matching Kotlin.
+    mutable: bool = false,
+
+    pub fn deinit(self: *IterCursor, allocator: std.mem.Allocator) void {
+        // Mirrors `Value.releaseValueList`: the last handle releases the
+        // contained elements before dropping the list itself.
+        if (self.items.strongCount() == 1) {
+            const g = self.items.borrow();
+            for (g.get().items) |e| e.release(allocator);
+            g.deinit();
+        }
+        self.items.deinit();
+        if (self.mod_count.get()) |mc| mc.deinit();
+    }
+
+    pub fn gcTrace(self: *const IterCursor, m: *objcell.gc.Marker) void {
+        m.shade(&self.items.cell.hdr);
+        if (self.mod_count.get()) |mc| m.shade(&mc.cell.hdr);
+    }
 };
 
 pub const SequenceData = struct {
@@ -1864,28 +1897,11 @@ pub const Value = union(enum) {
     /// `kotlin.sequences.Sequence<T>`.
     Sequence: ObjRef(SequenceData),
     /// `kotlin.collections.Iterator<T>` and primitive specializations.
-    Iterator: struct {
-        items: ValueList,
-        /// The iterator's own advancing state. A `Value` is copied by value, so
-        /// anything a `next()`/`remove()` must persist across those copies has
-        /// to sit behind a shared handle — but ONE handle for all of it, not one
-        /// each: `?ObjRef` costs two words (Zig's null-pointer optimization does
-        /// not reach through the wrapper struct), and three of them pushed every
-        /// `Value` in the program from 64 to 80 bytes.
-        cursor: ObjRef(IterCursor),
-        prim: ?PrimitiveArrayKind,
-        /// The source collection's `mod_count`, shared with it. `next`/`hasNext`
-        /// throw `ConcurrentModificationException` when it no longer matches the
-        /// `exp_mod` the cursor captured; the iterator's own `add`/`remove`
-        /// resync it. Null when the source had no `mod_count`.
-        mod_count: objcell.OptRef(u64) = .{},
-        /// True only when the iterator shares a *mutable* collection's backing,
-        /// so `MutableIterator.remove`/`MutableListIterator.set`/`.add` mutate
-        /// the source. A snapshot iterator over a read-only collection (or an
-        /// array/string) is false: those mutating ops throw
-        /// `UnsupportedOperationException`, matching Kotlin.
-        mutable: bool = false,
-    },
+    /// Snapshot/live iterator over materialised elements. The whole state
+    /// (elements, cursor, prim kind, mod-count handle, mutability) lives
+    /// in the ONE `IterCursor` cell every step already borrows; construct
+    /// with `Value.newIterator`.
+    Iterator: ObjRef(IterCursor),
     /// Lazy O(1)-memory iterator over a `Range`/progression. The whole
     /// state — cursor, yielded-last flag, and the fixed end/step/kind —
     /// lives in ONE shared cell (`RangeIterState`) so it survives the
@@ -1977,11 +1993,7 @@ pub const Value = union(enum) {
             // trace/teardown reaches the entries).
             .Map => |x| visitor.visit(mapRefOf(x)),
             .Range => |x| visitor.visit(rangeRefOf(x)),
-            .Iterator => |x| {
-                visitor.visit(x.items);
-                visitor.visit(x.cursor);
-                if (x.mod_count.get()) |mc| visitor.visit(mc);
-            },
+            .Iterator => |x| visitor.visit(x),
             .RangeIter => |x| visitor.visit(x),
             .SeqIter => |s| visitor.visit(s),
             .PropertyRef => |p| visitor.visit(p.name),
@@ -2031,6 +2043,12 @@ pub const Value = union(enum) {
     pub fn newRange(allocator: std.mem.Allocator, data: RangeData) std.mem.Allocator.Error!Value {
         const ref = try RangeRef.initOwned(allocator, data);
         return .{ .Range = &ref.cell.data };
+    }
+
+    /// Allocate the iterator's single state cell; the only way to
+    /// construct an `.Iterator`.
+    pub fn newIterator(allocator: std.mem.Allocator, data: IterCursor) std.mem.Allocator.Error!Value {
+        return .{ .Iterator = try ObjRef(IterCursor).init(allocator, data) };
     }
 
     /// Allocate the boxed `MapEntry` payload; the only way to construct a
@@ -2161,11 +2179,7 @@ pub const Value = union(enum) {
             // (`MapData.deinit`) releases the entries and their pairs.
             .Map => |x| mapRefOf(x).deinit(),
             .Range => |x| rangeRefOf(x).deinit(),
-            .Iterator => |x| {
-                releaseValueList(x.items, allocator);
-                x.cursor.deinit();
-                if (x.mod_count.get()) |mc| mc.deinit();
-            },
+            .Iterator => |x| x.deinit(),
             .RangeIter => |x| x.deinit(),
             .SeqIter => |s| s.deinit(),
             .PropertyRef => |p| p.name.deinit(),
@@ -2423,7 +2437,11 @@ pub const Value = union(enum) {
             .Comparator => "kotlin.Comparator",
             .Sequence => "kotlin.sequences.Sequence",
             .SeqIter => "kotlin.collections.Iterator",
-            .Iterator => |it| if (it.prim) |p| switch (p) {
+            .Iterator => |it| if (blk: {
+                const g = it.borrow();
+                defer g.deinit();
+                break :blk g.get().prim;
+            }) |p| switch (p) {
                 .Int => "kotlin.collections.IntIterator",
                 .Long => "kotlin.collections.LongIterator",
                 .Double => "kotlin.collections.DoubleIterator",
@@ -2571,9 +2589,14 @@ pub const Value = union(enum) {
             .SeqIter => matchesAny(name, &.{ "Iterator", "Any" }),
             .Iterator => |it| blk: {
                 if (matchesAny(name, &.{ "Iterator", "ListIterator", "Any" })) break :blk true;
+                const snap = sblk: {
+                    const g = it.borrow();
+                    defer g.deinit();
+                    break :sblk .{ .mutable = g.get().mutable, .prim = g.get().prim };
+                };
                 // Mutable-backed iterators satisfy the mutable interfaces.
-                if (it.mutable and matchesAny(name, &.{ "MutableIterator", "MutableListIterator" })) break :blk true;
-                if (it.prim) |p| {
+                if (snap.mutable and matchesAny(name, &.{ "MutableIterator", "MutableListIterator" })) break :blk true;
+                if (snap.prim) |p| {
                     break :blk simpleNameMatchesIterator(name, p.simpleName());
                 }
                 break :blk false;
@@ -3009,7 +3032,11 @@ pub const Value = union(enum) {
             .Comparator => try writer.writeAll("Comparator"),
             .Sequence => try writer.writeAll("kotlin.sequences.Sequence"),
             .SeqIter => try writer.writeAll("kotlin.collections.Iterator"),
-            .Iterator => |it| if (it.prim) |p|
+            .Iterator => |it| if (blk: {
+                const g = it.borrow();
+                defer g.deinit();
+                break :blk g.get().prim;
+            }) |p|
                 try writer.print("{s}Iterator", .{p.simpleName()})
             else
                 try writer.writeAll("kotlin.collections.Iterator"),
