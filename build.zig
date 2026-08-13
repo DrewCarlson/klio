@@ -613,6 +613,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "cli", .module = mods.get("cli").? },
                 .{ .name = "runtime", .module = mods.get("runtime").? },
+                .{ .name = "ir", .module = mods.get("ir").? },
             },
         }),
     });

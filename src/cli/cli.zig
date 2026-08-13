@@ -65,6 +65,8 @@ const USAGE =
     \\  bake-image <file> -o <p>   Bake the dependency base (stdlib + the
     \\                             program's packs) to a standalone .klio-image.
     \\  run-image <base> <file>    Run a program against a pre-baked base image.
+    \\  transpile <file> [-o out]  Emit the program as C over the klio_rt per-op
+    \\                             ABI (compile with zig cc + libklio_rt.a).
     \\  repl                       Start an interactive REPL.
     \\  pack <subcommand>          Build or inspect a `.klio-pack` artifact.
     \\
@@ -151,6 +153,33 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
         var features = commands.RequestedFeatures.init(gpa);
         defer features.deinit();
         return commands.runTranspileDump(gpa, rest[0], &features);
+    } else if (std.mem.eql(u8, cmd, "transpile")) {
+        var file: ?[]const u8 = null;
+        var out: ?[]const u8 = null;
+        var bad = false;
+        var i: usize = 0;
+        while (i < rest.len) : (i += 1) {
+            if (std.mem.eql(u8, rest[i], "-o")) {
+                if (i + 1 >= rest.len or out != null) {
+                    bad = true;
+                    break;
+                }
+                out = rest[i + 1];
+                i += 1;
+            } else if (file == null) {
+                file = rest[i];
+            } else {
+                bad = true;
+                break;
+            }
+        }
+        if (bad or file == null) {
+            printErr(gpa, "usage: klio transpile <file.kt> [-o out.c]\n", .{});
+            return 2;
+        }
+        var features = commands.RequestedFeatures.init(gpa);
+        defer features.deinit();
+        return commands.runTranspile(gpa, file.?, out, &features);
     } else if (std.mem.eql(u8, cmd, "run")) {
         return runRunCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "test")) {
