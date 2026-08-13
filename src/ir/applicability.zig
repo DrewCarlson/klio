@@ -1523,7 +1523,19 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
             }
         }
 
-        if (pidx >= params.len) { applicTraceReject("named-5"); return null; }
+        if (pidx >= params.len) {
+            if (comptime @import("builtin").link_libc) {
+                if (std.c.getenv("KLIO_APPLIC_TRACE") != null) {
+                    std.debug.print("[applic-reject] named-5 fid={?d} args:", .{if (sig.fid) |f| f.int() else null});
+                    for (args) |*aa| std.debug.print(" {s}{s}", .{ aa.named orelse "_", if (aa.is_lambda) "(lam)" else "" });
+                    std.debug.print(" params:", .{});
+                    for (params) |*pp| std.debug.print(" {s}", .{pp.name});
+                    std.debug.print("\n", .{});
+                }
+            }
+            applicTraceReject("named-5");
+            return null;
+        }
         total += scoreArg(sig, &params[pidx].ty, a, &scope) orelse 0;
         if (argIsProven(a)) proven += 1 else unknown += 1;
         if (bind) |bb| {

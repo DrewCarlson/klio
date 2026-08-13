@@ -53,16 +53,20 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | Variable | Values | What it shows/does | Output tag |
 |----------|--------|--------------------|------------|
 | `KLIO_BARE_TRACE` | `<name>` | How a bare call `name(...)` statically resolved during lowering: the chosen overload (fqn, params, ext, emit form) or `NONE` | `[bare]` |
-| `KLIO_EXT_TRACE` | `<name>` | How an explicit-receiver extension call resolved during lowering: receiver type, implicit dispatch owners, lexical owner, and exact target | `[ext-static]` |
+| `KLIO_EXT_TRACE` | `<name>` | How an explicit-receiver extension call resolved during lowering: receiver type, implicit dispatch owners, lexical owner, and exact target; also the static member-resolution verdict and self-recursive-bind arg shapes for `name` | `[ext-static]`, `[member-static]`, `[self-rec-shape]` |
 | `KLIO_MISS_TRACE` | `<name>` (two field-miss sites fire on any set value) | Runtime dispatch tails for `name` that miss or fall back, with frame-chain dumps at several sites | `[member-miss]`, `[miss]`, `[extfb]`, `[pno]`, `[cno]`, `[setfield-miss]`, `[lg-tail-a]`, `[lg-tail-b]`, `[ltg-tail]`, `[cmg-tail]`, `[sam-inv]` |
 | `KLIO_CMG_TRACE` | `<name>` | Snapshot of `CallMemberOrGlobal` preconditions for `name`: receiver tag, constructor-likeness, enclosing fn, this-index, capture count | `[cmg]` |
 | `KLIO_NU_TRACE` | `<name>`, or `1` for all at some sites | Candidate/visibility detail for hard dispatch cases: interface factories, member-extension visibility, strict extension member calls, enclosing-scope resolution | `[eev]`, `[ifact]`, `[mev]`, `[meoi]`, `[par-miss]`, `[strictext]`, `[sbc]` |
 | `KLIO_SAM_TRACE` | set | Implicit-receiver candidate walk and member-arm dispatch shapes | `[sam-walk]`, `[sam-direct]`, `[sam-arm]`, `[marm]` |
+| `KLIO_SELDBG` | set | Why an intrinsic-host `invokeMethod` probe declined (error tag + message for each swallowed non-Throw error — the recipe that separates "method missing" from "method ran and failed") | `[seldbg]` |
+| `KLIO_MCRT_TRACE` | `<name>` | Member-call return-type derivation for a chained arg (`recv.map { … }`): receiver tag/type and candidate agreement | `[mcrt]` |
+| `KLIO_ADM_TRACE` | set | Callable-vs-class adjudication detail inside `argDefinitelyNotParamType` | `[adm]` |
 | `KLIO_EF_TRACE` | `<name>` | Emit-form / member-shadowability decision for a named call (inline target chosen, shadowable routing, receiver-context flags) | `[ef]`, `[tbie]`, `[efset]` |
 | `KLIO_INLINE_PICK` | `<name>` | Inline-overload candidate set (receiver type, owner class, file) plus the receiver chain head | `[ipick]` |
 | `KLIO_EXTKEY_TRACE` | `<fid>[,<fid>]` | The eight-element extension ranking key for the named candidates, plus their parameter type heads. Ranking is lexicographic, so the first differing component is the one that decided | `[extkey]` |
 | `KLIO_ARGTY_TRACE` | `<identifier>` | The static type lowering actually used for that named expression, and whether it came from an inline splice's declared parameter type. Separates "no type" from "wrong type", which look identical from a failing test | `[argty]` |
-| `KLIO_SPLICE_TRACE` | `<function name>` | Whether a named `inline fun` reaches the splice path, and which parameter types the splice binds | `[splice]` |
+| `KLIO_SPLICE_TRACE` | `<function name>` | Whether a named `inline fun` reaches the splice path (with the declaration and call-site spans), whether the call-site splice landed or bailed to dispatch, and — matched against a lambda PARAMETER name — each caller-lambda splice with its receiver-mark state | `[splice]`, `[splice-ok]`, `[splice-bail]`, `[splice-lam]` |
+| `KLIO_THIS_TRACE` | set | Every bare-`this` lowering: the active splice window, each scope index holding a `this` binding, and the register `resolve` picked. The tool for "whose `this` did this lambda capture" | `[this-trace]`, `[splice-bind]` |
 | `KLIO_LEAF_TRACE` | `<substring of a function name>` | Why the frameless leaf-expression serve declined for a matching function (unsupported opcode, non-instance field receiver, unclaimed field route, callee that is not a leaf) | `[leaf]` |
 | `KLIO_SBC_TRACE` | set | Constructor-vs-member routing inputs for each capitalized bare call | `[sbc]` |
 | `KLIO_SUBTYPE_TRACE` | `<substr>` | Instance-supertype search during overload scoring, for target types containing the substring | `[sub]` |

@@ -440,6 +440,9 @@ pub fn spliceInlineLambdaOn(
         b.resolve("this")
     else
         null;
+    if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, lambda_name)) std.debug.print("[splice-lam] {s} owner={s} rlp={} explicit={} recv={} span={}:{}\n", .{ lambda_name, b.ownerClass() orelse "?", b.isReceiverLambdaParam(lambda_name), explicit_receiver != null, receiver != null, lam.Lambda.span.file, lam.Lambda.span.start });
+    }
 
     const arg_regs = try b.allocator.alloc(Reg, arg_exprs.len);
     defer b.allocator.free(arg_regs);
@@ -640,7 +643,19 @@ pub fn spliceInlineLambdaOn(
     // plus the lambda's own scopes, skipping the inline fn's parameter
     // scopes in between.
     const prev_splice = b.lambda_splice_resolve;
-    if (splice_caller_depth) |d| b.lambda_splice_resolve = .{ .caller_depth = d, .own_base = lambda_own_base };
+    var pushed_band = false;
+    if (splice_caller_depth) |d| {
+        b.lambda_splice_resolve = .{ .caller_depth = d, .own_base = lambda_own_base };
+        // Record this window's hidden region (the inline fn's scopes
+        // between the caller depth and the lambda's own scope) so a
+        // NESTED window whose caller region reaches above it keeps the
+        // region hidden — its `this`/locals belong to the inline fn, not
+        // the nested lambda's defining scope.
+        if (lambda_own_base > d) {
+            try b.splice_hidden_bands.append(b.allocator, .{ .lo = d, .hi = lambda_own_base - 1 });
+            pushed_band = true;
+        }
+    }
     // The lambda body is CALLER code: its bare calls resolve under the
     // hint that was active at the inline call site, not the spliced
     // body's own receiver hint.
@@ -716,6 +731,7 @@ pub fn spliceInlineLambdaOn(
     for (suspended_rlp.items) |k| try b.markReceiverLambdaParam(k);
     _ = b.setThisNarrow(lam_prev_narrow);
     b.setSpliceHint(lam_prev_active, lam_prev_recv);
+    if (pushed_band) _ = b.splice_hidden_bands.pop();
     b.lambda_splice_resolve = prev_splice;
     try b.push(.{ .Move = .{ .dst = result, .src = v } });
     b.terminate(.{ .Goto = end });
@@ -1350,7 +1366,10 @@ pub fn tryInlineCallWithTypeArgs(
     // pair answers "did it inline" and "does its body see declared types",
     // which is otherwise invisible from the outside.
     if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
-        if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} entered, params={d}\n", .{ fname, f.params.len });
+        if (std.mem.eql(u8, w, fname)) {
+            const site: ?u32 = if (this_arg) |r| helpers.exprSpan(r).start else null;
+            std.debug.print("[splice] {s} entered, params={d} decl={}:{} site={?}\n", .{ fname, f.params.len, f.name.span.file, f.name.span.start, site });
+        }
     }
     // Materialise the body if it is a deferred image marker before reading it.
     inline_state.ensureInlineBody(f);
@@ -2030,6 +2049,9 @@ pub fn tryInlineCallWithTypeArgs(
     }
     if (explicit_receiver) |receiver| {
         try b.bind("this", receiver);
+        if (inline_state.runtime.envOnce("KLIO_THIS_TRACE") != null) {
+            std.debug.print("[splice-bind] {s} this=r{d} scope={d}\n", .{ fname, receiver.int(), b.scopes.items.len - 1 });
+        }
         // `this@<fn>` inside the spliced body (including an anon object's
         // members, which capture it by this name) must reach the splice
         // receiver — a real call binds the label at function entry; the

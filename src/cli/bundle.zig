@@ -112,7 +112,16 @@ pub fn bakeImage(gpa: Allocator, paths: []const []const u8, requested: *Requeste
 /// parsed and lowered — the fast path a mobile host uses, and the hot-reload
 /// primitive (keep the base resident, re-extend a new program source). Mirrors
 /// the bundle base-image + program-src boot (see bundle_boot.bootRest).
-pub fn runImage(gpa: Allocator, base_path: []const u8, paths: []const []const u8, program_args: []const []const u8) u8 {
+/// A program assembled against an explicit base-image artifact: the exact
+/// module `run-image` executes, exposed so the transpiler can emit against
+/// the same fid/const space the runtime will rebuild from the same file.
+pub const ImageAssembly = struct {
+    built: interp_ir.build.BuiltModule,
+    map: *SourceMap,
+    binding_fqns: []const []const u8,
+};
+
+pub fn assembleImageBuild(gpa: Allocator, base_path: []const u8, paths: []const []const u8) ?ImageAssembly {
     // The image buffer must outlive the base (decoded slices borrow it), so it
     // is read into the process-lifetime allocator and never freed.
     const bytes = blk: {
@@ -120,34 +129,38 @@ pub fn runImage(gpa: Allocator, base_path: []const u8, paths: []const []const u8
         defer threaded.deinit();
         break :blk std.Io.Dir.cwd().readFileAlloc(threaded.io(), base_path, gpa, .unlimited) catch {
             io.printStderr(gpa, "error: cannot read base image {s}\n", .{base_path});
-            return 1;
+            return null;
         };
     };
     const loaded = (image.load(gpa, bytes) catch null) orelse {
         io.printStderr(gpa, "error: base image rejected ({s})\n", .{image.lastLoadFailure()});
-        return 1;
+        return null;
     };
     for (loaded.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
 
-    const map = gpa.create(SourceMap) catch return 1;
+    const map = gpa.create(SourceMap) catch return null;
     map.* = SourceMap.init(gpa);
-    map.files.appendSlice(map.arena.allocator(), loaded.map.files.items) catch return 1;
+    map.files.appendSlice(map.arena.allocator(), loaded.map.files.items) catch return null;
     const user = stdlib_image.parseUserFiles(gpa, map, paths, null) orelse {
         io.writeStderr("error: program fails to parse\n");
-        return 1;
+        return null;
     };
     if (!interp_ir.build.canExtendBase(loaded.base, user.asts)) {
         io.writeStderr("error: program cannot extend the base image (it redeclares a base name)\n");
-        return 1;
+        return null;
     }
     if (commands.computeEagerCalls(gpa, user.asts, &.{})) |ec| ir.pending_eager_calls = ec;
-    const built = interp_ir.build.buildModuleFilesExtend(gpa, loaded.base, user.asts) catch return 1;
+    const built = interp_ir.build.buildModuleFilesExtend(gpa, loaded.base, user.asts) catch return null;
+    return .{ .built = built, .map = map, .binding_fqns = loaded.binding_fqns };
+}
 
+pub fn runImage(gpa: Allocator, base_path: []const u8, paths: []const []const u8, program_args: []const []const u8) u8 {
+    const asm_r = assembleImageBuild(gpa, base_path, paths) orelse return 1;
     var bindings = pack_cache.mergedHostBindings(gpa);
-    for (loaded.binding_fqns) |fqn| {
+    for (asm_r.binding_fqns) |fqn| {
         if (bindings.resolve(fqn)) |f| bindings.register(fqn, f) catch {};
     }
-    return commands.runBuiltModuleArgs(gpa, built, bindings, map, "error: no main function found", program_args);
+    return commands.runBuiltModuleArgs(gpa, asm_r.built, bindings, asm_r.map, "error: no main function found", program_args);
 }
 
 pub fn runBundle(gpa: Allocator, args: []const []const u8) u8 {

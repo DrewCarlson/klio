@@ -734,6 +734,13 @@ pub const FuncBuilder = struct {
     /// would otherwise shadow a same-named caller variable the lambda
     /// body references. Null when no such splice is in progress.
     lambda_splice_resolve: ?struct { caller_depth: usize, own_base: usize } = null,
+    /// Scope-index bands hidden by ENCLOSING lambda-splice windows, one
+    /// `[lo, hi]` per window still on the splice stack. A nested window's
+    /// caller region (`[0, caller_depth)`) can reach past an outer splice's
+    /// parameter scopes (a `let` block inside a spliced `fastForEach`
+    /// lambda: its caller depth sits above the outer inline fn's `this`
+    /// bind), so the caller scan skips any index an enclosing band hides.
+    splice_hidden_bands: std.ArrayList(struct { lo: usize, hi: usize }) = .empty,
     /// See `MemberScopeSnapshot`: the caller member scope parked by an
     /// active top-level-extension splice, restored around spliced
     /// caller-lambda content.
@@ -995,6 +1002,7 @@ pub const FuncBuilder = struct {
         self.local_ext_fns.deinit();
         self.nonfn_locals.deinit();
         self.receiver_lambda_params.deinit();
+        self.splice_hidden_bands.deinit(a);
         self.receiver_lambda_recv_heads.deinit(self.allocator);
         self.receiver_lambda_arity.deinit();
         self.context_fn_params.deinit();
@@ -2591,6 +2599,17 @@ pub const FuncBuilder = struct {
             var j = @min(w.caller_depth, top);
             while (j > 0) {
                 j -= 1;
+                // An index an ENCLOSING splice window hides (an outer
+                // inline fn's parameter/receiver scopes) stays hidden for
+                // this nested window's caller region too.
+                var banded = false;
+                for (self.splice_hidden_bands.items) |band| {
+                    if (j >= band.lo and j <= band.hi) {
+                        banded = true;
+                        break;
+                    }
+                }
+                if (banded) continue;
                 if (self.scopes.items[j].get(name)) |r| return r;
             }
             return null;
@@ -3212,6 +3231,38 @@ test "an inner shadowing var restores the outer var's home on scope pop" {
     try testing.expect(b.isMutable("x"));
     try b.popScope();
     try testing.expect(b.mutableHome("x") == null);
+}
+
+test "a nested splice window keeps an enclosing window's band hidden" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    // Scope layout of a `let` block spliced inside a spliced `fastForEach`
+    // action lambda: s0 holds the function's `this`, s1 the outer inline
+    // fn's receiver bind (its window hid [1,1]), s2 the action lambda's
+    // params, s3 the inner inline fn's receiver bind, s4 the let block's
+    // own scope. The inner window's caller region reaches past s1; the
+    // outer band must keep it hidden so `this` resolves to s0.
+    const fn_this = b.allocReg();
+    try b.bind("this", fn_this); // s0
+    try b.pushScope(); // s1: outer inline fn's receiver bind
+    const outer_recv = b.allocReg();
+    try b.bind("this", outer_recv);
+    try b.splice_hidden_bands.append(testing.allocator, .{ .lo = 1, .hi = 1 });
+    try b.pushScope(); // s2: action lambda params
+    const scope_param = b.allocReg();
+    try b.bind("scope", scope_param);
+    try b.pushScope(); // s3: inner inline fn's receiver bind
+    const inner_recv = b.allocReg();
+    try b.bind("this", inner_recv);
+    try b.pushScope(); // s4: let block's own scope
+    b.lambda_splice_resolve = .{ .caller_depth = 3, .own_base = 4 };
+    try testing.expectEqual(fn_this, b.resolve("this").?);
+    try testing.expectEqual(scope_param, b.resolve("scope").?);
+    b.lambda_splice_resolve = null;
+    _ = b.splice_hidden_bands.pop();
+    try testing.expectEqual(inner_recv, b.resolve("this").?);
 }
 
 test "finish carries tailrec and inline flags" {

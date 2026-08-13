@@ -329,6 +329,9 @@ pub fn runOnBigStackMainThread(
     if (comptime builtin.cpu.arch != .aarch64 and builtin.cpu.arch != .x86_64) {
         return func(ctx);
     }
+    // Already switched (the CLI entry maps this stack, the interpreter run asks
+    // for it again): stay on it rather than mapping a second reserve.
+    if (on_big_stack) return func(ctx);
     const Runner = struct {
         ctx: Ctx,
         result: Ret = undefined,
@@ -348,9 +351,14 @@ pub fn runOnBigStackMainThread(
     ) catch return func(ctx);
     defer std.posix.munmap(stack);
     const sp_top = std.mem.alignBackward(usize, @intFromPtr(stack.ptr) + stack.len, 16);
+    on_big_stack = true;
+    defer on_big_stack = false;
     callOnStack(sp_top, Runner.entry, &runner);
     return runner.result;
 }
+
+/// True while this thread runs on a `runOnBigStackMainThread` stack.
+threadlocal var on_big_stack: bool = false;
 
 /// A process-lifetime interpreter stack for an OS-driven frame loop. The
 /// platform re-enters the VM on its own (small) UI-thread stack each vsync;

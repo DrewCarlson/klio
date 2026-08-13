@@ -1136,6 +1136,19 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
             // `this` bare resolves to the implicit first param, or the
             // captured `this` slot inside a lambda body.
+            // `KLIO_THIS_TRACE=1` — every bare-`this` lowering: the active
+            // splice window, each scope index holding a `this` binding, and
+            // the resolved register (`resolve` applies the window + the
+            // enclosing splice's hidden bands).
+            if (runtime.envOnce("KLIO_THIS_TRACE") != null) {
+                std.debug.print("[this-trace] span={}:{} depth={d}", .{ exprSpan(expr).file, exprSpan(expr).start, b.scopes.items.len });
+                if (b.lambda_splice_resolve) |w| std.debug.print(" window=caller<{d} own>={d}", .{ w.caller_depth, w.own_base });
+                var k: usize = 0;
+                while (k < b.scopes.items.len) : (k += 1) {
+                    if (b.scopes.items[k].get("this")) |r| std.debug.print(" s{d}=r{d}", .{ k, r.int() });
+                }
+                std.debug.print(" -> {?}\n", .{b.resolve("this")});
+            }
             const this_reg = b.resolve("this") orelse blk: {
                 break :blk try b.loadCaptureHoisted("this");
             };
@@ -5819,7 +5832,13 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
             if (try tryInlineCallWithTypeArgs(b, mname, member_target, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| {
+                if (runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+                    if (std.mem.eql(u8, w, mname)) std.debug.print("[splice-ok] {s} span={}:{}\n", .{ mname, exprSpan(callee).file, exprSpan(callee).start });
+                }
                 return r;
+            }
+            if (runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+                if (std.mem.eql(u8, w, mname)) std.debug.print("[splice-bail] {s} span={}:{}\n", .{ mname, exprSpan(callee).file, exprSpan(callee).start });
             }
             // Splice bailed: fall back to a plain member dispatch.
             const recv = try lowerReceiver(b, receiver);
@@ -7260,15 +7279,22 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // callee names a class, so construct it — before the function-FQN and
     // member-fallback paths, which would otherwise read the package head as a
     // field of the implicit receiver (`get_field app on this`).
+    // A multi-segment Path callee is the same dotted-FQN shape (the compose
+    // pass synthesizes `androidx.compose.runtime.remember(...)` that way);
+    // routing it here gives the qualified call the same overload-precise
+    // binding the parsed Member form gets, instead of a first-registered
+    // global value call.
+    const dotted_callee = callee.* == .Member or
+        (callee.* == .Path and callee.Path.segments.len >= 2);
     if (callee.* == .Member) {
         if (try lowerFqnCtorCall(b, expr)) |r| return r;
     }
     // Package-qualified call to a user / pack top-level function.
-    if (callee.* == .Member) {
+    if (dotted_callee) {
         if (try lowerFqnFlattenCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
     }
     // Fully-qualified callee resolved as a global, CallValue.
-    if (callee.* == .Member) {
+    if (dotted_callee) {
         if (try lowerFqnGlobalCall(b, callee, args, ast_arg_names)) |r| return r;
     }
 
@@ -14044,6 +14070,9 @@ fn resolveCallWithComposerAbi(
         false,
         ctx,
     );
+    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name)) std.debug.print("[abi-retry] {s} threaded_target={?d} reason={?s} tier={d} tier_count={d}\n", .{ name, if (threaded.target) |t| t.int() else null, if (threaded.reason) |r| @tagName(r) else null, threaded.tier, threaded.tier_count });
+    }
     if (threaded.target) |target| {
         if (b.module.funcById(target)) |f| {
             if (selectedCallHasComposerAbi(b.module, target, f)) {
@@ -17085,6 +17114,18 @@ fn lowerFqnFlattenCall(
         for (cands) |fid| {
             const f = b.module.funcById(fid) orelse continue;
             if (std.mem.eql(u8, f.fqn, fqn) and f.params.len == want) {
+                // A vararg declaration's param count is not an exact arity
+                // (`remember(vararg keys, calc)` at 4 params ties the
+                // 1-key fixed overload); Kotlin prefers the fixed-arity
+                // declaration, so only those count as exact here.
+                var has_vararg = false;
+                for (f.params) |p| {
+                    if (p.is_vararg) {
+                        has_vararg = true;
+                        break;
+                    }
+                }
+                if (has_vararg) continue;
                 if (pick == null) pick = fid;
                 fqn_arity_matches += 1;
             }
@@ -19218,7 +19259,7 @@ fn lowerResolvedExtensionCall(
         }
         const expected = b.peekExpected();
         const expected_ptr: ?*const ast.TypeRef = if (expected) |*ty| ty else null;
-        return try tryInlineCallWithTypeArgs(
+        const spliced = try tryInlineCallWithTypeArgs(
             b,
             name.name,
             inline_decl,
@@ -19228,6 +19269,10 @@ fn lowerResolvedExtensionCall(
             ast_type_args,
             expected_ptr,
         );
+        if (runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+            if (std.mem.eql(u8, w, name.name)) std.debug.print("[splice-{s}] {s} fid={d} span={}:{}\n", .{ if (spliced != null) @as([]const u8, "ok") else "bail", name.name, func_id.int(), name.span.file, name.span.start });
+        }
+        return spliced;
     }
 
     const broad_masks = try argLambdaBroadMasks(b, target, selected_values, selected_names, 1);

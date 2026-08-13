@@ -3601,7 +3601,7 @@ pub fn evalWithCapturesChained(
     // table is empty in a non-transpiled process).
     if (owning == null and closure_id == null and chain_seed.len == 0 and
         captures.items.len == 0 and func.leafExprBody() and
-        nativeFor(func.id.int(), func.fqn) == null)
+        (!nativeModuleOk(module) or nativeFor(func.id.int(), func.fqn) == null))
     {
         if (try leafExprServe(H, allocator, module, func, args.items, host)) |lr| {
             var a = args;
@@ -5151,7 +5151,7 @@ fn runFrameExec(
     // The C transpiler's native table: a registered function's blocks run
     // as emitted C instead of the stream (one lookup per activation; the
     // table is empty in every non-transpiled process).
-    const native_fn: ?NativeFn = nativeFor(func.id.int(), func.fqn);
+    const native_fn: ?NativeFn = if (nativeModuleOk(module)) nativeFor(func.id.int(), func.fqn) else null;
     if (native_fn == null and native_any.load(.acquire) and
         func.package.len == 0 and runtime.envOnce("KLIO_NATIVE_TRACE") != null)
     {
@@ -5343,6 +5343,13 @@ fn runFrameExec(
             if (thrown != null or unwound != null) break :native_run;
             if (start_idx != 0) break :native_run;
             if (frame.regs.items.len < func.n_locals) break :native_run;
+            // Every native level stacks kf + glue + serve frames for ANY
+            // call form (member escapes included, not just the quickened
+            // static op), far heavier than an interpreter frame — past
+            // this depth a deep chain runs the stream instead, so the C
+            // stack stays bounded and the eval-depth cap keeps raising
+            // its catchable StackOverflow first.
+            if (evtls.eval_depth > NATIVE_RECURSE_MAX_DEPTH) break :native_run;
             var nctx: NativeCtx = .{
                 .frame = frame,
                 .allocator = allocator,
@@ -6275,8 +6282,44 @@ fn nativeFor(fid: u32, fqn: []const u8) ?NativeFn {
     native_mutex.lock();
     defer native_mutex.unlock();
     const e = native_table.get(fid) orelse return null;
-    if (!std.mem.eql(u8, e.fqn, fqn)) return null;
+    if (!std.mem.eql(u8, e.fqn, fqn)) {
+        if (runtime.envOnce("KLIO_NATIVE_TRACE") != null) {
+            std.debug.print("[native-fqn] fid={d} table={s} frame={s}\n", .{ fid, e.fqn, fqn });
+        }
+        return null;
+    }
     return e.f;
+}
+
+var native_expect_funcs: usize = 0;
+var native_expect_consts: usize = 0;
+
+/// The emitted operands (const ids, fids, register numbers) index the
+/// tables of the module the emitter walked. The fqn guard catches a
+/// shifted fid, but a frame can carry a module whose CONST pool differs
+/// while the function itself matches — a delegating anonymous-object
+/// module, or a run that rebuilt a different module shape — and a
+/// mismatched const id then reads garbage (or out of bounds). The
+/// emitted C registers the walked module's table sizes; a frame whose
+/// module carries LESS runs interpreted. Prefix bound, not equality:
+/// execution appends runtime-synthesized functions and constants to the
+/// program module, which leaves every emitted id valid.
+pub fn setNativeModuleCheck(n_funcs: usize, n_consts: usize) void {
+    native_expect_funcs = n_funcs;
+    native_expect_consts = n_consts;
+}
+
+fn nativeModuleOk(module: *const Module) bool {
+    if (native_expect_funcs == 0 and native_expect_consts == 0) return true;
+    const match = module.funcs.items.len >= native_expect_funcs and
+        module.consts.items.len >= native_expect_consts;
+    if (!match and runtime.envOnce("KLIO_NATIVE_TRACE") != null) {
+        std.debug.print("[native-modcheck] funcs {d} (want {d}) consts {d} (want {d})\n", .{
+            module.funcs.items.len, native_expect_funcs,
+            module.consts.items.len, native_expect_consts,
+        });
+    }
+    return match;
 }
 
 /// What a native run left for the frame loop: the same exits the stream
@@ -6287,6 +6330,12 @@ fn nativeFor(fid: u32, fqn: []const u8) ?NativeFn {
 pub const NativeOutcome = enum(u8) { none, term, goto, brk, ret, oom };
 
 const NativeStep = enum { cont, brk, ret, oom };
+
+/// Recursive native call serving stops here and flat-parks instead; each
+/// recursive level stacks kf + glue + serve frames, so this must sit well
+/// under the C stack's capacity while staying above any realistic
+/// non-adversarial call chain.
+const NATIVE_RECURSE_MAX_DEPTH: usize = 200;
 
 pub const NativeCtx = struct {
     frame: *Frame,
@@ -6328,7 +6377,14 @@ fn NativeGlue(comptime H: type) type {
             const host: *H = @ptrCast(@alignCast(ctx.host));
             const frame = ctx.frame;
             const inst = &frame.func.blocks[block].insts[idx];
-            const r = execArmCall(H, ctx.allocator, frame, &inst.Call, host, false) catch return .oom;
+            // Recursive serving stacks a full native+glue+serve slice per
+            // level, far heavier than an interpreter frame — past this
+            // depth the C stack would fault long before the eval-depth
+            // cap raises its catchable StackOverflow. Deep chains hand
+            // the call to the flat driver instead (the caller unwinds and
+            // resumes through the stream: slower, bounded).
+            const recurse_ok = evtls.eval_depth < NATIVE_RECURSE_MAX_DEPTH;
+            const r = execArmCall(H, ctx.allocator, frame, &inst.Call, host, !recurse_ok) catch return .oom;
             return glueAfter(ctx, r, inst, idx, block);
         }
     };
@@ -7488,8 +7544,9 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
 /// and the driver serves the callee — but it unwinds the native function
 /// off the C stack on every call and resumes it through the stream; the
 /// transpiler's call op serves recursively instead so the native caller
-/// stays put.
-noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H, comptime allow_flat: bool) Allocator.Error!Step {
+/// stays put, until `NATIVE_RECURSE_MAX_DEPTH`, where it reverts to the
+/// flat park to bound the C stack.
+noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H, allow_flat: bool) Allocator.Error!Step {
     dispatchBump(.call_static);
     // Monomorphic fast path: a plain top-level user function (single
     // overload, has body, non-extension, no varargs / defaults / type
