@@ -85,23 +85,14 @@ practice.
 
 State: DONE — floor recorded here and in memory.
 
-## HANDOVER NOTE (Iterator fold in flight, tree DIRTY)
+## HANDOVER NOTE (Value=32 LANDED)
 
-The Value-16B Iterator fold is mid-edit (uncommitted in value.zig):
-IterCursor extended with items/prim/mod_count/mutable + deinit/gcTrace;
-payload swapped to `Iterator: ObjRef(IterCursor)`; `Value.newIterator`
-added; visitor/deinit arms folded. THREE build errors remain:
-1. `releaseValueList` (value.zig:2201) is nested in a container —
-   hoist it to file scope (or inline its body in IterCursor.deinit).
-2. Two `it.prim` reads (typeName ~2433, writeTo ~3019) and the `is`
-   matcher (~2579, reads it.mutable + it.prim) need a borrow snapshot:
-   `const g = it.borrow(); defer g.deinit();` then read `g.get().prim`.
-Then: convert the 9 constructions in host_call_member (all call
-`newCursor(...)` — replace with `Value.newIterator(allocator, .{ .items
-= ..., .prim = ..., .mod_count = ..., .mutable = ..., .exp_mod = ... })`
-and DELETE newCursor), and rewrite `iteratorMember` (~7889) + line 5022
-guard to borrow the one cell (it already borrows the cursor per call —
-fold the field reads into that borrow). Then: zigcheck runtime +
-interp_ir, zig build test (watch for leaks in iterator tests → add
-refOf-deinit teardowns), census expects Value=32, rangebench A/B gate,
-quick-gate battery, commit.
+The Iterator fold landed (2a6e72f3): census Value 40 -> 32, units green
+zero leaks, rangebench 83.0s (inside the pre-fold band), sweep 117/0,
+corpus/litmus at the known baseline. Before the NEXT wave: run the
+compose warm+slice and the plugin ratchet once against this commit.
+Next in item 1: the 24B tier (Intrinsic, Array, Triple, MatchGroup,
+then Pair/IrClosure/Function/...) boxes for Value=16, paired with the
+transpiler hot-view sub-ABI so scalar offsets freeze once; then the
+rangebench speedup number. Items 2-4 (compose triage, coroutine debt,
+ktor) follow per their sections above.
