@@ -331,11 +331,11 @@ fn makePair(a: Allocator, first: Value, second: Value) Error!Value {
 }
 
 fn makeTriple(a: Allocator, first: Value, second: Value, third: Value) Error!Value {
-    return .{ .Triple = .{
+    return try Value.newTriple(a, .{
         .first = try Value.boxRef(a, first),
         .second = try Value.boxRef(a, second),
         .third = try Value.boxRef(a, third),
-    } };
+    });
 }
 
 /// `make_exception(fqn, message)` -> a thrown-ready `Value::Exception`.
@@ -856,11 +856,11 @@ pub fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcom
             for (src, 0..) |kv, i| {
                 kv.key.retain();
                 kv.value.retain();
-                out[i] = .{ .MapEntry = .{
+                out[i] = try Value.newMapEntry(a, .{
                     .key = try Value.boxRef(a, kv.key),
                     .value = try Value.boxRef(a, kv.value),
                     .backing = .{},
-                } };
+                });
             }
             return .{ .items = out };
         },
@@ -3570,7 +3570,7 @@ pub fn sublistComodGuard(a: Allocator, v: *const Value) Error!?EvalResult {
 /// through.
 pub fn mapEntryViewGuard(a: Allocator, v: *const Value) Error!?EvalResult {
     if (v.* != .MapEntry) return null;
-    const me = &v.MapEntry;
+    const me = v.MapEntry;
     const entries = me.backing.get() orelse return null;
     var stale = false;
     {
@@ -6035,12 +6035,12 @@ pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
         for (g.get().pairs.items) |kv| {
             kv.key.retain();
             kv.value.retain();
-            try map_entries.append(a, .{ .MapEntry = .{
+            try map_entries.append(a, try Value.newMapEntry(a, .{
                 .key = try Value.boxRef(a, kv.key),
                 .value = try Value.boxRef(a, kv.value),
                 .backing = if (writable) .from(entries) else .{},
                 .exp_mod = stamp,
-            } });
+            }));
         }
     }
     const backing = try CollBackingRef.init(a, .{ .map = .{ .entries = entries, .kind = .Entries } });

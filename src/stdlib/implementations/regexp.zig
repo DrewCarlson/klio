@@ -2121,8 +2121,8 @@ pub fn match_result_groups(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(try ctx.host.newSynthInstance("kotlin.text.MatchNamedGroupCollection", id, &fields));
 }
 
-fn matchGroupValue(gd: ?MatchGroupData) Value {
-    if (gd) |d| return .{ .MatchGroup = .{ .value = d.value.clone(), .start = d.start, .end_inclusive = d.end_inclusive } };
+fn matchGroupValue(a: std.mem.Allocator, gd: ?MatchGroupData) std.mem.Allocator.Error!Value {
+    if (gd) |d| return try Value.newMatchGroup(a, .{ .value = d.value.clone(), .start = d.start, .end_inclusive = d.end_inclusive });
     return .Null;
 }
 
@@ -2160,7 +2160,7 @@ pub fn match_named_group_get(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.IllegalArgumentException", msg) } };
         }
     } else return typeErr("MatchNamedGroupCollection.get key must be Int or String");
-    if (idx) |i| return ok(matchGroupValue(md.groups[i]));
+    if (idx) |i| return ok(try matchGroupValue(ctx.allocator, md.groups[i]));
     return ok(.Null);
 }
 
@@ -2183,7 +2183,7 @@ pub fn match_named_group_iterator(ctx: *CallCtx) std.mem.Allocator.Error!EvalRes
         const mv = g.get().get("__mgc") orelse return typeErr("not a MatchNamedGroupCollection");
         if (mv != .Match) return typeErr("not a MatchNamedGroupCollection");
         for (mv.Match.asPtr().groups) |gd| {
-            try items.append(ctx.allocator, matchGroupValue(gd));
+            try items.append(ctx.allocator, try matchGroupValue(ctx.allocator, gd));
         }
     }
     const list = try makeList(ctx.allocator, items.items, false);

@@ -460,6 +460,116 @@ pub const RangeData = struct {
 /// The control-block handle behind a boxed `Value.Range` payload.
 pub const RangeRef = ObjRef(RangeData);
 
+/// The boxed payload of `Value.BoundMethod` (see `MapData` for the scheme).
+pub const BoundMethodData = struct {
+    fqn: []const u8,
+    func: StdlibFn,
+    receiver: ValueBox,
+
+    pub fn deinit(self: *BoundMethodData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.receiver.deinit();
+    }
+
+    pub fn gcTrace(self: *const BoundMethodData, m: *objcell.gc.Marker) void {
+        m.shade(&self.receiver.cell.hdr);
+    }
+};
+
+/// The boxed payload of `Value.MapEntry` (see `MapData` for the scheme).
+pub const MapEntryData = struct {
+    key: ValueBox,
+    value: ValueBox,
+    /// When set, the live map's entries: `setValue` writes through and
+    /// reads resolve the live pair by key.
+    backing: objcell.OptRef(MapStore) = .{},
+    /// The backing counter observed when this entry was handed out
+    /// (creation or iterator `next()`). A later structural change to
+    /// the map makes every member access throw
+    /// ConcurrentModificationException. Meaningful only with `backing`.
+    exp_mod: u64 = 0,
+
+    pub fn deinit(self: *MapEntryData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.key.deinit();
+        self.value.deinit();
+        // `backing` is a non-owning write-through reference; not released.
+    }
+
+    pub fn gcTrace(self: *const MapEntryData, m: *objcell.gc.Marker) void {
+        // Shade the value-box CELLS (whose own tracers mark the inner
+        // values) — dereferencing the interior here would leave the box
+        // cells unmarked and swept while the entry lives.
+        m.shade(&self.key.cell.hdr);
+        m.shade(&self.value.cell.hdr);
+        if (self.backing.get()) |b| m.shade(&b.cell.hdr);
+    }
+};
+
+/// The boxed payload of `Value.Triple` (see `MapData` for the scheme).
+pub const TripleData = struct {
+    first: ValueBox,
+    second: ValueBox,
+    third: ValueBox,
+
+    pub fn deinit(self: *TripleData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.first.deinit();
+        self.second.deinit();
+        self.third.deinit();
+    }
+
+    pub fn gcTrace(self: *const TripleData, m: *objcell.gc.Marker) void {
+        m.shade(&self.first.cell.hdr);
+        m.shade(&self.second.cell.hdr);
+        m.shade(&self.third.cell.hdr);
+    }
+};
+
+/// The interned payload of `Value.Intrinsic`: program-lifetime, never
+/// freed, invisible to the refcount and the collector.
+pub const IntrinsicData = struct {
+    fqn: []const u8,
+    func: StdlibFn,
+};
+
+var intrinsic_intern_mutex: objcell.SpinMutex = .{};
+var intrinsic_intern: ?std.StringHashMap(*const IntrinsicData) = null;
+
+/// The control-block handle behind a boxed `Value.MatchGroup` payload
+/// (the payload struct is `MatchGroupData`, shared with `MatchData`'s
+/// group descriptors).
+pub const MatchGroupRef = ObjRef(MatchGroupData);
+
+/// Recover the owning control block from a boxed payload pointer.
+pub inline fn matchGroupRefOf(g: *MatchGroupData) MatchGroupRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", g)) };
+}
+
+/// The control-block handle behind a boxed `Value.Triple` payload.
+pub const TripleRef = ObjRef(TripleData);
+
+/// Recover the owning control block from a boxed payload pointer.
+pub inline fn tripleRefOf(t: *TripleData) TripleRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", t)) };
+}
+
+/// The control-block handle behind a boxed `Value.MapEntry` payload.
+pub const MapEntryRef = ObjRef(MapEntryData);
+
+/// Recover the owning control block from a boxed payload pointer.
+pub inline fn mapEntryRefOf(e: *MapEntryData) MapEntryRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", e)) };
+}
+
+/// The control-block handle behind a boxed `Value.BoundMethod` payload.
+pub const BoundMethodRef = ObjRef(BoundMethodData);
+
+/// Recover the owning control block from a boxed payload pointer.
+pub inline fn boundMethodRefOf(b: *BoundMethodData) BoundMethodRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", b)) };
+}
+
 /// Recover the owning control block from a boxed range payload pointer.
 pub inline fn rangeRefOf(r: *RangeData) RangeRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", r)) };
@@ -1301,6 +1411,39 @@ pub const IterCursor = struct {
     /// The source's `mod_count` as captured when the iterator was created.
     /// Meaningful only when the iterator carries a `mod_count` handle.
     exp_mod: u64 = 0,
+    /// The elements (shared with the mutable source, or a snapshot). The
+    /// fixed iterator fields ride in the cursor cell every step already
+    /// borrows, so `Value.Iterator` is the one handle.
+    items: ValueList,
+    prim: ?PrimitiveArrayKind = null,
+    /// The source collection's `mod_count`, shared with it. `next`/`hasNext`
+    /// throw `ConcurrentModificationException` when it no longer matches
+    /// `exp_mod`; the iterator's own `add`/`remove` resync it. Null when
+    /// the source had no `mod_count`.
+    mod_count: objcell.OptRef(u64) = .{},
+    /// True only when the iterator shares a *mutable* collection's backing,
+    /// so `MutableIterator.remove`/`MutableListIterator.set`/`.add` mutate
+    /// the source. A snapshot iterator over a read-only collection (or an
+    /// array/string) is false: those mutating ops throw
+    /// `UnsupportedOperationException`, matching Kotlin.
+    mutable: bool = false,
+
+    pub fn deinit(self: *IterCursor, allocator: std.mem.Allocator) void {
+        // Mirrors `Value.releaseValueList`: the last handle releases the
+        // contained elements before dropping the list itself.
+        if (self.items.strongCount() == 1) {
+            const g = self.items.borrow();
+            for (g.get().items) |e| e.release(allocator);
+            g.deinit();
+        }
+        self.items.deinit();
+        if (self.mod_count.get()) |mc| mc.deinit();
+    }
+
+    pub fn gcTrace(self: *const IterCursor, m: *objcell.gc.Marker) void {
+        m.shade(&self.items.cell.hdr);
+        if (self.mod_count.get()) |mc| m.shade(&mc.cell.hdr);
+    }
 };
 
 pub const SequenceData = struct {
@@ -1429,6 +1572,15 @@ pub const MatchGroupData = struct {
     value: StringRef,
     start: i64,
     end_inclusive: i64,
+
+    pub fn deinit(self: *MatchGroupData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.value.deinit();
+    }
+
+    pub fn gcTrace(self: *const MatchGroupData, m: *objcell.gc.Marker) void {
+        m.shade(&self.value.cell.hdr);
+    }
 };
 
 /// A single regex match outcome — full match plus capture groups, with
@@ -1741,21 +1893,19 @@ pub const Value = union(enum) {
         decl: *const ast.Function,
         env: ObjRef(Env),
     },
-    Intrinsic: struct {
-        fqn: []const u8,
-        func: StdlibFn,
-    },
+    /// A stdlib function value. The payload is an INTERNED program-
+    /// lifetime record (`Value.internIntrinsic`): the fqn is a static
+    /// string and the pair never dies, so copies carry one pointer and
+    /// neither the refcount nor the collector ever touches it.
+    Intrinsic: *const IntrinsicData,
     /// IR-side closure handle.
     IrClosure: struct {
         id: u64,
         captures: ValueSlice,
     },
-    /// A method intrinsic bound to a specific receiver.
-    BoundMethod: struct {
-        fqn: []const u8,
-        func: StdlibFn,
-        receiver: ValueBox,
-    },
+    /// A method intrinsic bound to a specific receiver. Boxed like `Map`
+    /// (see `BoundMethodData`); construct with `Value.newBoundMethod`.
+    BoundMethod: *BoundMethodData,
     /// A user-method reference bound to a specific instance.
     BoundUserMethod: struct {
         receiver: ObjRef(InstanceData),
@@ -1780,20 +1930,14 @@ pub const Value = union(enum) {
     /// `kotlin.Pair`.
     Pair: struct { first: ValueBox, second: ValueBox },
     /// `kotlin.Triple`.
-    Triple: struct { first: ValueBox, second: ValueBox, third: ValueBox },
+    /// `kotlin.Triple`. Boxed like `Map` (see `TripleData`); construct
+    /// with `Value.newTriple`.
+    Triple: *TripleData,
     /// `kotlin.collections.Map.Entry`.
-    MapEntry: struct {
-        key: ValueBox,
-        value: ValueBox,
-        /// When set, the live map's entries: `setValue` writes through and
-        /// reads resolve the live pair by key.
-        backing: objcell.OptRef(MapStore) = .{},
-        /// The backing counter observed when this entry was handed out
-        /// (creation or iterator `next()`). A later structural change to
-        /// the map makes every member access throw
-        /// ConcurrentModificationException. Meaningful only with `backing`.
-        exp_mod: u64 = 0,
-    },
+    /// `kotlin.collections.Map.Entry`. Boxed like `Map` (see
+    /// `MapEntryData`); construct with `Value.newMapEntry`. Copies share
+    /// the record — the JVM's reference semantics for an entry.
+    MapEntry: *MapEntryData,
     /// `kotlin.Result<T>`.
     Result: struct {
         ok: bool,
@@ -1816,28 +1960,11 @@ pub const Value = union(enum) {
     /// `kotlin.sequences.Sequence<T>`.
     Sequence: ObjRef(SequenceData),
     /// `kotlin.collections.Iterator<T>` and primitive specializations.
-    Iterator: struct {
-        items: ValueList,
-        /// The iterator's own advancing state. A `Value` is copied by value, so
-        /// anything a `next()`/`remove()` must persist across those copies has
-        /// to sit behind a shared handle — but ONE handle for all of it, not one
-        /// each: `?ObjRef` costs two words (Zig's null-pointer optimization does
-        /// not reach through the wrapper struct), and three of them pushed every
-        /// `Value` in the program from 64 to 80 bytes.
-        cursor: ObjRef(IterCursor),
-        prim: ?PrimitiveArrayKind,
-        /// The source collection's `mod_count`, shared with it. `next`/`hasNext`
-        /// throw `ConcurrentModificationException` when it no longer matches the
-        /// `exp_mod` the cursor captured; the iterator's own `add`/`remove`
-        /// resync it. Null when the source had no `mod_count`.
-        mod_count: objcell.OptRef(u64) = .{},
-        /// True only when the iterator shares a *mutable* collection's backing,
-        /// so `MutableIterator.remove`/`MutableListIterator.set`/`.add` mutate
-        /// the source. A snapshot iterator over a read-only collection (or an
-        /// array/string) is false: those mutating ops throw
-        /// `UnsupportedOperationException`, matching Kotlin.
-        mutable: bool = false,
-    },
+    /// Snapshot/live iterator over materialised elements. The whole state
+    /// (elements, cursor, prim kind, mod-count handle, mutability) lives
+    /// in the ONE `IterCursor` cell every step already borrows; construct
+    /// with `Value.newIterator`.
+    Iterator: ObjRef(IterCursor),
     /// Lazy O(1)-memory iterator over a `Range`/progression. The whole
     /// state — cursor, yielded-last flag, and the fixed end/step/kind —
     /// lives in ONE shared cell (`RangeIterState`) so it survives the
@@ -1860,12 +1987,9 @@ pub const Value = union(enum) {
     Regex: ObjRef(RegexData),
     /// `kotlin.text.MatchResult`.
     Match: ObjRef(MatchData),
-    /// `kotlin.text.MatchGroup`.
-    MatchGroup: struct {
-        value: StringRef,
-        start: i64,
-        end_inclusive: i64,
-    },
+    /// `kotlin.text.MatchGroup`. Boxed like `Map` (see `MatchGroupData`);
+    /// construct with `Value.newMatchGroup`.
+    MatchGroup: *MatchGroupData,
     /// `kotlin.text.StringBuilder` — mutable string buffer.
     StringBuilder: ObjRef(std.ArrayList(u8)),
     /// Boxed local `var` captured by a closure (`Ref.ObjectRef`).
@@ -1929,31 +2053,20 @@ pub const Value = union(enum) {
             // trace/teardown reaches the entries).
             .Map => |x| visitor.visit(mapRefOf(x)),
             .Range => |x| visitor.visit(rangeRefOf(x)),
-            .Iterator => |x| {
-                visitor.visit(x.items);
-                visitor.visit(x.cursor);
-                if (x.mod_count.get()) |mc| visitor.visit(mc);
-            },
+            .Iterator => |x| visitor.visit(x),
             .RangeIter => |x| visitor.visit(x),
             .SeqIter => |s| visitor.visit(s),
             .PropertyRef => |p| visitor.visit(p.name),
-            .MatchGroup => |g| visitor.visit(g.value),
+            .MatchGroup => |g| visitor.visit(matchGroupRefOf(g)),
             .Exception => |e| visitor.visit(exceptionRefOf(e)),
             .Pair => |p| {
                 visitor.visit(p.first);
                 visitor.visit(p.second);
             },
-            .Triple => |t| {
-                visitor.visit(t.first);
-                visitor.visit(t.second);
-                visitor.visit(t.third);
-            },
-            .MapEntry => |e| {
-                visitor.visit(e.key);
-                visitor.visit(e.value);
-            },
+            .Triple => |t| visitor.visit(tripleRefOf(t)),
+            .MapEntry => |e| visitor.visit(mapEntryRefOf(e)),
             .Result => |r| visitor.visit(r.payload),
-            .BoundMethod => |m| visitor.visit(m.receiver),
+            .BoundMethod => |m| visitor.visit(boundMethodRefOf(m)),
             else => {},
         }
     }
@@ -1986,6 +2099,56 @@ pub const Value = union(enum) {
     pub fn newRange(allocator: std.mem.Allocator, data: RangeData) std.mem.Allocator.Error!Value {
         const ref = try RangeRef.initOwned(allocator, data);
         return .{ .Range = &ref.cell.data };
+    }
+
+    /// Allocate the iterator's single state cell; the only way to
+    /// construct an `.Iterator`.
+    pub fn newIterator(allocator: std.mem.Allocator, data: IterCursor) std.mem.Allocator.Error!Value {
+        return .{ .Iterator = try ObjRef(IterCursor).init(allocator, data) };
+    }
+
+    /// Intern the (fqn, func) pair; the only way to construct an
+    /// `.Intrinsic`. Immortal: allocation failure here is fatal.
+    pub fn internIntrinsic(fqn: []const u8, func: StdlibFn) Value {
+        intrinsic_intern_mutex.lock();
+        defer intrinsic_intern_mutex.unlock();
+        const a = std.heap.page_allocator;
+        if (intrinsic_intern == null) intrinsic_intern = std.StringHashMap(*const IntrinsicData).init(a);
+        const gop = intrinsic_intern.?.getOrPut(fqn) catch @panic("intrinsic intern");
+        if (!gop.found_existing) {
+            const d = a.create(IntrinsicData) catch @panic("intrinsic intern");
+            d.* = .{ .fqn = fqn, .func = func };
+            gop.value_ptr.* = d;
+        }
+        return .{ .Intrinsic = gop.value_ptr.* };
+    }
+
+    /// Allocate the boxed `MatchGroup` payload; the only way to construct
+    /// a `.MatchGroup`.
+    pub fn newMatchGroup(allocator: std.mem.Allocator, data: MatchGroupData) std.mem.Allocator.Error!Value {
+        const ref = try MatchGroupRef.initOwned(allocator, data);
+        return .{ .MatchGroup = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `Triple` payload; the only way to construct a
+    /// `.Triple`.
+    pub fn newTriple(allocator: std.mem.Allocator, data: TripleData) std.mem.Allocator.Error!Value {
+        const ref = try TripleRef.initOwned(allocator, data);
+        return .{ .Triple = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `MapEntry` payload; the only way to construct a
+    /// `.MapEntry`.
+    pub fn newMapEntry(allocator: std.mem.Allocator, data: MapEntryData) std.mem.Allocator.Error!Value {
+        const ref = try MapEntryRef.initOwned(allocator, data);
+        return .{ .MapEntry = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `BoundMethod` payload; the only way to construct
+    /// a `.BoundMethod`.
+    pub fn newBoundMethod(allocator: std.mem.Allocator, data: BoundMethodData) std.mem.Allocator.Error!Value {
+        const ref = try BoundMethodRef.initOwned(allocator, data);
+        return .{ .BoundMethod = &ref.cell.data };
     }
 
     /// Allocate the boxed `Set` payload; the only way to construct a `.Set`.
@@ -2047,7 +2210,6 @@ pub const Value = union(enum) {
             },
             // `List`/`Set` view `backing` is shaded by `forEachChildCell` above
             // (the `CollBacking` cell's own `gcTrace` reaches the source).
-            .MapEntry => |e| if (e.backing.get()) |b| m.shade(&b.cell.hdr),
             // Keep the side-table's canonical capture store + receiver chain for
             // this closure alive (the dup'd `captures` ValueSlice is already
             // shaded by `forEachChildCell` above). A closure no live value marks
@@ -2103,32 +2265,20 @@ pub const Value = union(enum) {
             // (`MapData.deinit`) releases the entries and their pairs.
             .Map => |x| mapRefOf(x).deinit(),
             .Range => |x| rangeRefOf(x).deinit(),
-            .Iterator => |x| {
-                releaseValueList(x.items, allocator);
-                x.cursor.deinit();
-                if (x.mod_count.get()) |mc| mc.deinit();
-            },
+            .Iterator => |x| x.deinit(),
             .RangeIter => |x| x.deinit(),
             .SeqIter => |s| s.deinit(),
             .PropertyRef => |p| p.name.deinit(),
-            .MatchGroup => |g| g.value.deinit(),
+            .MatchGroup => |g| matchGroupRefOf(g).deinit(),
             .Exception => |e| exceptionRefOf(e).deinit(),
             .Pair => |p| {
                 p.first.deinit();
                 p.second.deinit();
             },
-            .Triple => |t| {
-                t.first.deinit();
-                t.second.deinit();
-                t.third.deinit();
-            },
-            .MapEntry => |e| {
-                e.key.deinit();
-                e.value.deinit();
-                // `backing` is a non-owning write-through reference; not released.
-            },
+            .Triple => |t| tripleRefOf(t).deinit(),
+            .MapEntry => |e| mapEntryRefOf(e).deinit(),
             .Result => |r| r.payload.deinit(),
-            .BoundMethod => |m| m.receiver.deinit(),
+            .BoundMethod => |m| boundMethodRefOf(m).deinit(),
             else => {},
         }
     }
@@ -2369,7 +2519,11 @@ pub const Value = union(enum) {
             .Comparator => "kotlin.Comparator",
             .Sequence => "kotlin.sequences.Sequence",
             .SeqIter => "kotlin.collections.Iterator",
-            .Iterator => |it| if (it.prim) |p| switch (p) {
+            .Iterator => |it| if (blk: {
+                const g = it.borrow();
+                defer g.deinit();
+                break :blk g.get().prim;
+            }) |p| switch (p) {
                 .Int => "kotlin.collections.IntIterator",
                 .Long => "kotlin.collections.LongIterator",
                 .Double => "kotlin.collections.DoubleIterator",
@@ -2517,9 +2671,14 @@ pub const Value = union(enum) {
             .SeqIter => matchesAny(name, &.{ "Iterator", "Any" }),
             .Iterator => |it| blk: {
                 if (matchesAny(name, &.{ "Iterator", "ListIterator", "Any" })) break :blk true;
+                const snap = sblk: {
+                    const g = it.borrow();
+                    defer g.deinit();
+                    break :sblk .{ .mutable = g.get().mutable, .prim = g.get().prim };
+                };
                 // Mutable-backed iterators satisfy the mutable interfaces.
-                if (it.mutable and matchesAny(name, &.{ "MutableIterator", "MutableListIterator" })) break :blk true;
-                if (it.prim) |p| {
+                if (snap.mutable and matchesAny(name, &.{ "MutableIterator", "MutableListIterator" })) break :blk true;
+                if (snap.prim) |p| {
                     break :blk simpleNameMatchesIterator(name, p.simpleName());
                 }
                 break :blk false;
@@ -2955,7 +3114,11 @@ pub const Value = union(enum) {
             .Comparator => try writer.writeAll("Comparator"),
             .Sequence => try writer.writeAll("kotlin.sequences.Sequence"),
             .SeqIter => try writer.writeAll("kotlin.collections.Iterator"),
-            .Iterator => |it| if (it.prim) |p|
+            .Iterator => |it| if (blk: {
+                const g = it.borrow();
+                defer g.deinit();
+                break :blk g.get().prim;
+            }) |p|
                 try writer.print("{s}Iterator", .{p.simpleName()})
             else
                 try writer.writeAll("kotlin.collections.Iterator"),

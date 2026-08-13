@@ -871,7 +871,7 @@ fn funcValueById(self: *VmHost, allocator: Allocator, fid: FuncId) ?Value {
         break :blk pg.get().resolvedNativeForm(fid);
     };
     if (linked) |func_native| {
-        return .{ .Intrinsic = .{ .fqn = func.fqn, .func = func_native } };
+        return Value.internIntrinsic(func.fqn, func_native);
     }
     return null;
 }
@@ -1402,7 +1402,7 @@ pub fn lookupGlobal(self: *VmHost, name_in: []const u8) ?Value {
                     if (r == .ok) return r.ok;
                 }
                 if (gtrace) std.debug.print("[gtrace] {s} arm=intrinsic fqn={s}\n", .{ name, fqn });
-                return .{ .Intrinsic = .{ .fqn = fqn, .func = func } };
+                return Value.internIntrinsic(fqn, func);
             }
         }
     }
@@ -1410,13 +1410,13 @@ pub fn lookupGlobal(self: *VmHost, name_in: []const u8) ?Value {
     // `Thread` static surface — a synthetic intrinsic value exposing
     // `Thread.sleep(ms)` and `Thread.currentThread()`.
     if (std.mem.eql(u8, name, "Thread")) {
-        return .{ .Intrinsic = .{ .fqn = "kotlin.concurrent.Thread", .func = threadStaticStub } };
+        return Value.internIntrinsic("kotlin.concurrent.Thread", threadStaticStub);
     }
 
     // `Delegates` singleton — a synthetic intrinsic value exposing
     // `notNull`, `observable`, and `vetoable` member calls.
     if (std.mem.eql(u8, name, "Delegates")) {
-        return .{ .Intrinsic = .{ .fqn = "kotlin.properties.Delegates", .func = delegatesStub } };
+        return Value.internIntrinsic("kotlin.properties.Delegates", delegatesStub);
     }
 
     // Primitive type names — `Int`, `Long`, `String`, etc. — resolve to a

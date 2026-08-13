@@ -273,11 +273,11 @@ pub fn concurrent_thread(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     // The OS thread id is carried as a Kotlin Long via a bit reinterpretation.
     const receiver = try Value.boxRef(ctx.allocator, .{ .Long = @bitCast(id) });
-    return .{ .ok = .{ .BoundMethod = .{
+    return .{ .ok = try Value.newBoundMethod(ctx.allocator, .{
         .fqn = "kotlin.concurrent.Thread",
         .func = threadHandleStub,
         .receiver = receiver,
-    } } };
+    }) };
 }
 
 /// `Thread.sleep(millis: Long)` / `Thread.sleep(millis: Int)`.
@@ -326,11 +326,11 @@ pub fn concurrent_thread_current(ctx: *CallCtx) std.mem.Allocator.Error!EvalResu
     const id: u64 = std.Thread.getCurrentId();
     // The thread id is carried as a Kotlin Long via a bit reinterpretation.
     const receiver = try Value.boxRef(ctx.allocator, .{ .Long = @bitCast(id) });
-    return .{ .ok = .{ .BoundMethod = .{
+    return .{ .ok = try Value.newBoundMethod(ctx.allocator, .{
         .fqn = "kotlin.concurrent.Thread",
         .func = threadHandleStub,
         .receiver = receiver,
-    } } };
+    }) };
 }
 
 /// Placeholder dispatch for a bare `Thread` sentinel value. Member
@@ -530,7 +530,7 @@ test "currentThread yields a Thread BoundMethod handle" {
     try testing.expect(r == .ok);
     try testing.expect(r.ok == .BoundMethod);
     try testing.expectEqualStrings("kotlin.concurrent.Thread", r.ok.BoundMethod.fqn);
-    r.ok.BoundMethod.receiver.deinit();
+    runtime.boundMethodRefOf(r.ok.BoundMethod).deinit();
 }
 
 test "thread handle is not callable" {
