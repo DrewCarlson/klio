@@ -460,6 +460,65 @@ pub const RangeData = struct {
 /// The control-block handle behind a boxed `Value.Range` payload.
 pub const RangeRef = ObjRef(RangeData);
 
+/// The boxed payload of `Value.BoundMethod` (see `MapData` for the scheme).
+pub const BoundMethodData = struct {
+    fqn: []const u8,
+    func: StdlibFn,
+    receiver: ValueBox,
+
+    pub fn deinit(self: *BoundMethodData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.receiver.deinit();
+    }
+
+    pub fn gcTrace(self: *const BoundMethodData, m: *objcell.gc.Marker) void {
+        self.receiver.asPtr().gcMark(m);
+    }
+};
+
+/// The boxed payload of `Value.MapEntry` (see `MapData` for the scheme).
+pub const MapEntryData = struct {
+    key: ValueBox,
+    value: ValueBox,
+    /// When set, the live map's entries: `setValue` writes through and
+    /// reads resolve the live pair by key.
+    backing: objcell.OptRef(MapStore) = .{},
+    /// The backing counter observed when this entry was handed out
+    /// (creation or iterator `next()`). A later structural change to
+    /// the map makes every member access throw
+    /// ConcurrentModificationException. Meaningful only with `backing`.
+    exp_mod: u64 = 0,
+
+    pub fn deinit(self: *MapEntryData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.key.deinit();
+        self.value.deinit();
+        // `backing` is a non-owning write-through reference; not released.
+    }
+
+    pub fn gcTrace(self: *const MapEntryData, m: *objcell.gc.Marker) void {
+        self.key.asPtr().gcMark(m);
+        self.value.asPtr().gcMark(m);
+        if (self.backing.get()) |b| m.shade(&b.cell.hdr);
+    }
+};
+
+/// The control-block handle behind a boxed `Value.MapEntry` payload.
+pub const MapEntryRef = ObjRef(MapEntryData);
+
+/// Recover the owning control block from a boxed payload pointer.
+pub inline fn mapEntryRefOf(e: *MapEntryData) MapEntryRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", e)) };
+}
+
+/// The control-block handle behind a boxed `Value.BoundMethod` payload.
+pub const BoundMethodRef = ObjRef(BoundMethodData);
+
+/// Recover the owning control block from a boxed payload pointer.
+pub inline fn boundMethodRefOf(b: *BoundMethodData) BoundMethodRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", b)) };
+}
+
 /// Recover the owning control block from a boxed range payload pointer.
 pub inline fn rangeRefOf(r: *RangeData) RangeRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", r)) };
@@ -1750,12 +1809,9 @@ pub const Value = union(enum) {
         id: u64,
         captures: ValueSlice,
     },
-    /// A method intrinsic bound to a specific receiver.
-    BoundMethod: struct {
-        fqn: []const u8,
-        func: StdlibFn,
-        receiver: ValueBox,
-    },
+    /// A method intrinsic bound to a specific receiver. Boxed like `Map`
+    /// (see `BoundMethodData`); construct with `Value.newBoundMethod`.
+    BoundMethod: *BoundMethodData,
     /// A user-method reference bound to a specific instance.
     BoundUserMethod: struct {
         receiver: ObjRef(InstanceData),
@@ -1782,18 +1838,10 @@ pub const Value = union(enum) {
     /// `kotlin.Triple`.
     Triple: struct { first: ValueBox, second: ValueBox, third: ValueBox },
     /// `kotlin.collections.Map.Entry`.
-    MapEntry: struct {
-        key: ValueBox,
-        value: ValueBox,
-        /// When set, the live map's entries: `setValue` writes through and
-        /// reads resolve the live pair by key.
-        backing: objcell.OptRef(MapStore) = .{},
-        /// The backing counter observed when this entry was handed out
-        /// (creation or iterator `next()`). A later structural change to
-        /// the map makes every member access throw
-        /// ConcurrentModificationException. Meaningful only with `backing`.
-        exp_mod: u64 = 0,
-    },
+    /// `kotlin.collections.Map.Entry`. Boxed like `Map` (see
+    /// `MapEntryData`); construct with `Value.newMapEntry`. Copies share
+    /// the record — the JVM's reference semantics for an entry.
+    MapEntry: *MapEntryData,
     /// `kotlin.Result<T>`.
     Result: struct {
         ok: bool,
@@ -1948,12 +1996,9 @@ pub const Value = union(enum) {
                 visitor.visit(t.second);
                 visitor.visit(t.third);
             },
-            .MapEntry => |e| {
-                visitor.visit(e.key);
-                visitor.visit(e.value);
-            },
+            .MapEntry => |e| visitor.visit(mapEntryRefOf(e)),
             .Result => |r| visitor.visit(r.payload),
-            .BoundMethod => |m| visitor.visit(m.receiver),
+            .BoundMethod => |m| visitor.visit(boundMethodRefOf(m)),
             else => {},
         }
     }
@@ -1986,6 +2031,20 @@ pub const Value = union(enum) {
     pub fn newRange(allocator: std.mem.Allocator, data: RangeData) std.mem.Allocator.Error!Value {
         const ref = try RangeRef.initOwned(allocator, data);
         return .{ .Range = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `MapEntry` payload; the only way to construct a
+    /// `.MapEntry`.
+    pub fn newMapEntry(allocator: std.mem.Allocator, data: MapEntryData) std.mem.Allocator.Error!Value {
+        const ref = try MapEntryRef.initOwned(allocator, data);
+        return .{ .MapEntry = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `BoundMethod` payload; the only way to construct
+    /// a `.BoundMethod`.
+    pub fn newBoundMethod(allocator: std.mem.Allocator, data: BoundMethodData) std.mem.Allocator.Error!Value {
+        const ref = try BoundMethodRef.initOwned(allocator, data);
+        return .{ .BoundMethod = &ref.cell.data };
     }
 
     /// Allocate the boxed `Set` payload; the only way to construct a `.Set`.
@@ -2047,7 +2106,6 @@ pub const Value = union(enum) {
             },
             // `List`/`Set` view `backing` is shaded by `forEachChildCell` above
             // (the `CollBacking` cell's own `gcTrace` reaches the source).
-            .MapEntry => |e| if (e.backing.get()) |b| m.shade(&b.cell.hdr),
             // Keep the side-table's canonical capture store + receiver chain for
             // this closure alive (the dup'd `captures` ValueSlice is already
             // shaded by `forEachChildCell` above). A closure no live value marks
@@ -2122,13 +2180,9 @@ pub const Value = union(enum) {
                 t.second.deinit();
                 t.third.deinit();
             },
-            .MapEntry => |e| {
-                e.key.deinit();
-                e.value.deinit();
-                // `backing` is a non-owning write-through reference; not released.
-            },
+            .MapEntry => |e| mapEntryRefOf(e).deinit(),
             .Result => |r| r.payload.deinit(),
-            .BoundMethod => |m| m.receiver.deinit(),
+            .BoundMethod => |m| boundMethodRefOf(m).deinit(),
             else => {},
         }
     }

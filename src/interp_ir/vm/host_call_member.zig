@@ -6308,7 +6308,7 @@ fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) 
                 // A mutable map's iterator yields live entries: `setValue`
                 // writes through, and `MutableIterator.remove` deletes from the
                 // backing via this reference (the `items` list is a snapshot).
-                try items.append(allocator, .{ .MapEntry = .{ .key = k, .value = v, .backing = if (live) .from(m.entries) else .{}, .exp_mod = stamp } });
+                try items.append(allocator, try Value.newMapEntry(allocator, .{ .key = k, .value = v, .backing = if (live) .from(m.entries) else .{}, .exp_mod = stamp }));
             }
             g.deinit();
             const cap = try captureModCount(allocator, src_mc.get());

@@ -1894,11 +1894,11 @@ test "Map.Entry key and value accessors" {
 
     const key: Value = .{ .Int = 3 };
     const val: Value = .{ .Int = 9 };
-    const entry: Value = .{ .MapEntry = .{
+    const entry: Value = try Value.newMapEntry(h.allocator(), .{
         .key = try Value.boxRef(h.allocator(), key),
         .value = try Value.boxRef(h.allocator(), val),
         .backing = .{},
-    } };
+    });
     var args = [_]Value{entry};
     var ctx = h.ctx(&args);
     const k = try map_entry_key(&ctx);
