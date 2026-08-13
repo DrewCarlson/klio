@@ -775,7 +775,7 @@ pub fn string_builder_indices(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = sb.borrow();
     defer g.deinit();
     const len: i64 = @intCast(charCount(g.get().items));
-    return ok(.{ .Range = .{ .start = 0, .end = len - 1, .step = 1, .kind = .Int } });
+    return ok(try Value.newRange(ctx.allocator, .{ .start = 0, .end = len - 1, .step = 1, .kind = .Int }));
 }
 
 pub fn string_builder_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {

@@ -4619,7 +4619,7 @@ pub fn coll_list_indices(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     const len: i64 = @intCast(listLen(it));
-    return ok(.{ .Range = .{ .start = 0, .end = len - 1, .step = 1, .kind = .Int } });
+    return ok(try Value.newRange(ctx.allocator, .{ .start = 0, .end = len - 1, .step = 1, .kind = .Int }));
 }
 
 pub fn coll_list_last_index(ctx: *CallCtx) Error!EvalResult {

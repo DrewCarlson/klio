@@ -2061,7 +2061,7 @@ pub fn match_result_range(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return typeErr("MatchResult has no whole-match group");
     }
     const g0 = groups[0].?;
-    return ok(.{ .Range = .{ .start = g0.start, .end = g0.end_inclusive, .step = 1, .kind = RangeKind.Int } });
+    return ok(try Value.newRange(ctx.allocator, .{ .start = g0.start, .end = g0.end_inclusive, .step = 1, .kind = RangeKind.Int }));
 }
 
 pub fn match_result_group_values(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -2255,12 +2255,12 @@ pub fn match_group_value(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 pub fn match_group_range(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len > 0) {
         switch (ctx.args[0]) {
-            .MatchGroup => |g| return ok(.{ .Range = .{
+            .MatchGroup => |g| return ok(try Value.newRange(ctx.allocator, .{
                 .start = g.start,
                 .end = g.end_inclusive,
                 .step = 1,
                 .kind = RangeKind.Int,
-            } }),
+            })),
             else => {},
         }
     }
