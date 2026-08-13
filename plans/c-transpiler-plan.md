@@ -97,7 +97,11 @@ standalone binary.
       - `KLIO_NATIVE_TRACE=1` prints `[native] fn=... entry=bN outcome=...`
         per native activation and `[native-miss] fn=... fid=N` for
         user-package functions with no (or a guarded) table entry.
-- [ ] Stage 3: call quickening, CALL_TAGGED table, vararg prologue.
+- [x] Stage 3: call quickening. (The originally-sketched CALL_TAGGED
+      switch table and vararg adapter prologue presupposed call ops the
+      frozen stream never grew — calls are escapes — so the landed design
+      quickens the `.Call` escape itself; the tagged-dispatch and vararg
+      ideas fold into the speedup campaign below.)
       Measured note from stage 2: most hot leaf calls (e.g. `fib`'s
       recursion) are served by `leafExprServe` — a reduced executor that
       bypasses `runFrameExec` and therefore the native table entirely
@@ -134,7 +138,7 @@ standalone binary.
         (static-inline header ops over tag + Int/Long/Bool payload
         offsets, constants comptime-checked against `runtime.Value`) so
         the emitted C inlines the hot ops instead of calling them.
-- [ ] Stage 4: corpus parity + measured speedup. PARITY HALF DONE —
+- [x] Stage 4: corpus parity + measured speedup. Parity —
       `scripts/transpiler-corpus-check.sh` (parallel, JOBS=8): 293/293
       examples transpile, compile, and match the interpreter byte-for-byte
       (the same interactive/heavy exclusions as the corpus baseline). What
@@ -167,6 +171,27 @@ standalone binary.
         flat park past `NATIVE_RECURSE_MAX_DEPTH` (200), and the native
         entry itself declines past that eval depth, so deep chains bound
         the C stack.
-      Remaining: the measured-speedup half (rangebench, ReleaseFast; the
-      opaque ABI measured perf-neutral — see stage 3 notes — so the win
-      needs the inline hot-view sub-ABI).
+      The measurement (rangebench, ReleaseFast, KLIO_JIT=0 both sides,
+      identical output): interpreter 14.44s, native tier 14.55s —
+      PERF-NEUTRAL, matching the stage-3 bench. The number is honest:
+      the milestone delivers total-coverage AOT C with exact interpreter
+      semantics and byte parity, NOT yet a speedup.
+
+## Next: the speedup campaign (open)
+
+The opaque call-per-op ABI trades the stream's inlined switch dispatch
+for an exported function call per op, so it cannot beat the stream —
+the emitted C must INLINE the hot ops. The road, measure-first:
+- A frozen scalar "hot view" sub-ABI in the generated header:
+  static-inline C for const_int/move/load_param and the scalar bin/cmp
+  fast paths over exposed tag + Int/Long/Bool payload offsets of
+  `runtime.Value`, every offset comptime-checked against the real
+  struct at klio_rt build time (the Value layout campaign owns those
+  offsets; a mismatch must fail the build, not drift).
+- Under the GC profile retain/release are no-ops, so a hot-view register
+  write is a plain copy; the escape-op boundary keeps full semantics.
+- Direct C-to-C calls with a light frame-open helper (the tagged-table /
+  vararg-prologue ideas land here if the measurement wants them).
+- The loop JIT remains above the native check; the campaign's yardstick
+  is rangebench with the JIT off, and the JIT's own numbers (loops
+  10-13x) are the ceiling to respect.
