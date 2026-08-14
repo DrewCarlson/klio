@@ -106,20 +106,20 @@ IF the per-value dup'd captures snapshot is semantically redundant —
 verify against the closure invoke path before touching) and Array
 remain at 16, both hot, and 24 -> 16 pays only if BOTH shrink. Measure
 Value=24's own wins first (rangebench + suite wall vs the 40B-era
-records). HOT-VIEW SUB-ABI IN PROGRESS: klio_rt now exports
-klio_rt_hot_layout (runtime-measured Value offsets: size 24, tag@16+1,
-Int/Long/Bool payload@0, tags 2/3/12 — poisoned-padding-masked diff)
-and klio_rt_register_hot_layout (a slot the run entries fill AFTER
-profile selection so `usable` reflects the reclaim mode; GC default =
-usable). REMAINING: transpileEmit emits a static-inline prelude —
-kv_slot(regs,i)=regs+i*size; kv_const_int (write payload@int_off +
-tag byte; old-value release is a no-op precisely when usable);
-kv_bin int fast path (check both tags == tag_int, inline arithmetic,
-else call klio_op_bin) — guarded by `if (KV.usable)` else the existing
-klio_op_* calls; the emitted body needs the frame's regs base:
-add `klio_rt_frame_regs(ctx) -> uint8_t*` export (frame.regs.items.ptr;
-stable per activation). Then rangebench RF JIT-off remeasure = the
-campaign's speedup number. Then items 2-4.
+records). HOT-VIEW SUB-ABI LANDED (a14d89e2): the emitted C inlines
+const_int/move/bin/cmp_br over the runtime-measured layout slot —
+Int/Int + Long/Long + mixed-width promotion with applyBinop-exact
+semantics, per-op helper fallback everywhere, gated on KV.usable
+(computed from reclaimRequested; the live per-thread flag sampled too
+early left the path dark — found via the layout probe). MEASURED:
+rangebench RF JIT-off 13.38s native vs 13.82s interp = +3.2% at full
+293/293 corpus parity. Honest reading: the fused stream was already
+cheap, and the remaining per-iteration costs (edge guard, trace
+bookkeeping) are SHARED with the interpreter — next recorded levers are
+an inline trace store (frame.cur_span offset via the same probe
+mechanism) and wider op coverage. Item 1's Value+transpiler substance
+is landed-and-measured; the deeper speedup is an open recorded road
+alongside the 16B endgame. Items 2-4 are NOW the active front.
 
 ## previous note (Value=32 landed, superseded above)
 
