@@ -10,8 +10,22 @@ const runtime = @import("runtime");
 const ir = @import("ir");
 const eval = ir.eval;
 
+/// Generated code registers its layout globals here; the run entries
+/// fill them AFTER the performance profile (and so the reclaim mode) is
+/// chosen, which is what decides `usable`.
+var hot_layout_slot: ?*HotLayout = null;
+
+export fn klio_rt_register_hot_layout(slot: *HotLayout) void {
+    hot_layout_slot = slot;
+}
+
+fn fillHotLayoutSlot() void {
+    if (hot_layout_slot) |slot| klio_rt_hot_layout(slot);
+}
+
 fn runFileBody(path: [:0]const u8, code_out: *c_int) void {
     runtime.perf.setProfile(runtime.perf.resolveBinaryProfile(&.{}));
+    fillHotLayoutSlot();
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const gpa = runtime.allocTrackWrap(arena.allocator());
@@ -42,6 +56,7 @@ export fn klio_rt_run_file(path: [*:0]const u8) c_int {
 
 fn runImageBody(base: [:0]const u8, path: [:0]const u8, code_out: *c_int) void {
     runtime.perf.setProfile(runtime.perf.resolveBinaryProfile(&.{}));
+    fillHotLayoutSlot();
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const gpa = runtime.allocTrackWrap(arena.allocator());
@@ -62,6 +77,82 @@ export fn klio_rt_run_image(base_image: [*:0]const u8, path: [*:0]const u8) c_in
     ) catch return 1;
     t.join();
     return code;
+}
+
+/// The hot-view layout descriptor: byte offsets into `runtime.Value`
+/// measured against the SAME build the library runs, so the generated
+/// C's inline scalar ops (`klio_hot.h` section of the emitted file) are
+/// correct by construction rather than by a frozen contract. `usable`
+/// is false when the process runs a reclaim mode whose register writes
+/// must release the old value — the emitted code then falls back to the
+/// exported per-op helpers.
+pub const HotLayout = extern struct {
+    value_size: u32,
+    tag_off: u32,
+    tag_size: u32,
+    int_off: u32,
+    long_off: u32,
+    bool_off: u32,
+    tag_int: u64,
+    tag_long: u64,
+    tag_bool: u64,
+    usable: u8,
+};
+
+fn tagOffset() struct { off: u32, size: u32 } {
+    // The tag's location is compiler-chosen; find it by diffing values
+    // that differ only in tag (payload bytes zero in both). Undefined
+    // padding bytes are poisoned per-construction in safe builds, so a
+    // same-tag pair first yields the padding mask to ignore.
+    const N = @sizeOf(runtime.Value);
+    var z1: runtime.Value = .{ .Int = 0 };
+    var z2: runtime.Value = .{ .Int = 0 };
+    var a: runtime.Value = .{ .Int = 0 };
+    var b: runtime.Value = .{ .Long = 0 };
+    const p1: [*]const u8 = @ptrCast(&z1);
+    const p2: [*]const u8 = @ptrCast(&z2);
+    const pa: [*]const u8 = @ptrCast(&a);
+    const pb: [*]const u8 = @ptrCast(&b);
+    var first: ?u32 = null;
+    var last: u32 = 0;
+    var i: u32 = 0;
+    while (i < N) : (i += 1) {
+        if (p1[i] != p2[i]) continue; // padding: unstable even same-tag
+        if (pa[i] != pb[i]) {
+            if (first == null) first = i;
+            last = i;
+        }
+    }
+    const off = first orelse 0;
+    var size = last - off + 1;
+    if (size > 8) size = 8;
+    return .{ .off = off, .size = size };
+}
+
+fn readTag(v: *const runtime.Value, off: u32, size: u32) u64 {
+    const p: [*]const u8 = @ptrCast(v);
+    var out: u64 = 0;
+    @memcpy(std.mem.asBytes(&out)[0..size], p[off .. off + size]);
+    return out;
+}
+
+export fn klio_rt_hot_layout(out: *HotLayout) void {
+    const t = tagOffset();
+    var vi: runtime.Value = .{ .Int = 0 };
+    var vl: runtime.Value = .{ .Long = 0 };
+    var vb: runtime.Value = .{ .Bool = false };
+    out.* = .{
+        .value_size = @sizeOf(runtime.Value),
+        .tag_off = t.off,
+        .tag_size = t.size,
+        .int_off = @intCast(@intFromPtr(&vi.Int) - @intFromPtr(&vi)),
+        .long_off = @intCast(@intFromPtr(&vl.Long) - @intFromPtr(&vl)),
+        .bool_off = @intCast(@intFromPtr(&vb.Bool) - @intFromPtr(&vb)),
+        .tag_int = readTag(&vi, t.off, t.size),
+        .tag_long = readTag(&vl, t.off, t.size),
+        .tag_bool = readTag(&vb, t.off, t.size),
+        .usable = @intFromBool(!runtime.reclaimEnabled()),
+    };
 }
 
 /// Library version tag for the header/link handshake.

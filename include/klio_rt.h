@@ -21,6 +21,22 @@ int klio_rt_run_file(const char *path);
  * assembled from that exact artifact. */
 int klio_rt_run_image(const char *base_image, const char *path);
 
+/* The hot-view layout descriptor: Value byte offsets measured against
+ * the running library at startup, so generated inline scalar ops are
+ * correct by construction. `usable == 0` means the process reclaim mode
+ * requires the per-op helpers instead. */
+typedef struct {
+  uint32_t value_size, tag_off, tag_size, int_off, long_off, bool_off;
+  uint64_t tag_int, tag_long, tag_bool;
+  uint8_t usable;
+} klio_hot_layout;
+void klio_rt_hot_layout(klio_hot_layout *out);
+
+/* Registers the generated code's layout globals; the run entries fill
+ * them after the performance profile (hence the reclaim mode, hence
+ * `usable`) is chosen. Call before klio_rt_run_*. */
+void klio_rt_register_hot_layout(klio_hot_layout *slot);
+
 /* The library's ABI version (this header describes version 2). */
 int klio_rt_abi_version(void);
 
