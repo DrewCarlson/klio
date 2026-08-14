@@ -23,19 +23,30 @@ the plan docs and the handover note below.
 
 ## 2. Compose plugin triage residue
 
-The named correctness bugs left from the plugin cutover. Full plan:
-`compose-plugin-lowering.md` + the triage list in memory
-(klio-compose-plugin-triage).
+The doc's original checklist was stale: entries 43-47, the window
+family, foundation_lazy, and serial_names are ALL FIXED (triage memory
+54i/54j/54k + entry records; today's corpus = the 3 interactive
+permanents + lazy's Debug-CLI time cap + the animation load flake).
+The LIVE residue is two emission roots from the triage memory head,
+both suite-level (plugin conformance ratchet):
 
-- [ ] Corpus entry 43: qualified-exact dispatch
-- [ ] Corpus entry 45: assign-lambda-typed
-- [ ] Corpus entry 46: abstract-member static anchor + splice-write owner
-      + inline-param hidden from spliced caller lambda
-- [ ] Receiver-loss residue
-- [ ] serial_names
-- [ ] window family + foundation_lazy hang cluster
+- [ ] movableContentOf factory wrap: kotlinc wraps factory-returned
+      composable lambdas in composableLambdaInstance (key, tracked,
+      wrapper) so every content(n) call site gets a restart group
+      enclosing the movable group; klio leaves them RAW = a missing
+      bracket level. A drafted patch (wrap ret_composable lambdas ×3
+      arms) CORE-DUMPED with 10001-frame recursion — bisect plan:
+      gate the wrap to movableContent* factory names first, then find
+      which fn self-recurses (suspect engine fns whose returned lambda
+      self-references, or the CLI-invoke updateScope loop).
+- [ ] Group start/end imbalance: the ref-1 offset stream closes ONE
+      level too many (EndCurrentGroup lands parent=3 not parent=5), so
+      SkipToEndOfCurrentGroup runs to the PARENT end past the ref2
+      destination; single-ref tests tolerate it. Probe recipe in the
+      triage memory (Operations.kt [op] print with val op0=this.operation).
 
-State: not started this stretch; entries carried from the cutover.
+State: opened this stretch; both roots recorded with probes and bisect
+plans in memory klio-compose-plugin-triage.
 
 ## 3. Coroutine debt cluster
 
