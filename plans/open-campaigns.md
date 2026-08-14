@@ -6,26 +6,20 @@ detail lives in the linked plan docs. Update the checkboxes and the
 
 ## 1. Transpiler speedup + Value 16B
 
-Make the transpiled native tier faster than the stream interpreter
-(currently perf-neutral: rangebench RF JIT-off 14.44s interp vs 14.55s
-native), paired with Value 40B → 16B since both freeze scalar layout.
-Full plans: `c-transpiler-plan.md` ("Next: the speedup campaign"),
-`value-layout-campaign.md` (stage 5b).
+Full plans: `c-transpiler-plan.md`, `value-layout-campaign.md`.
 
-- [ ] Value stage 5b IN PROGRESS: RangeIter folded into its state cell;
-      Range/BoundMethod/MapEntry boxed (rangebench A/B neutral: 83.6s vs
-      83.7s). REMAINING: the Iterator fold (merge items/prim/mod_count/
-      mutable into the IterCursor cell — one alloc either way; ~28 access
-      sites, concentrated in host_call_member's iteratorMember which
-      already borrows the cursor) → Value 40 → 32; then the 24B tier
-      (Intrinsic/Array/Triple/MatchGroup + Pair/IrClosure/Function) → 16
-- [ ] Hot-view sub-ABI: static-inline C ops over frozen Value scalar
-      offsets, comptime-checked at klio_rt build
-- [ ] Light-frame C-to-C calls (tagged-table / vararg ideas land here if
-      measurement wants them)
-- [ ] The number: rangebench RF JIT-off, native meaningfully under interp
+- [x] Value 40 -> 24: RangeIter/Iterator folds; Range/BoundMethod/
+      MapEntry/Triple/MatchGroup/Pair/Comparator/Result boxed; Intrinsic
+      interned; Array repacked; dead AST-era variants deleted. Verified:
+      sweep 117/0, ratchet 1339, rangebench neutral.
+- [x] Hot-view sub-ABI landed + measured: +3.2% rangebench RF JIT-off at
+      293/293 corpus parity (a14d89e2).
+- [ ] RECORDED ROADS (measured-first, not the active front): the 16B
+      endgame (IrClosure via side-table id + Array), inline trace store,
+      wider hot-op coverage, light-frame C-to-C calls.
 
-State: not started; roads pinned in both plan docs.
+State: substance LANDED AND MEASURED; deeper speedup roads recorded in
+the plan docs and the handover note below.
 
 ## 2. Compose plugin triage residue
 
