@@ -62,7 +62,8 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_INLINE_PICK` | `<name>` | Inline-overload candidate set (receiver type, owner class, file) plus the receiver chain head | `[ipick]` |
 | `KLIO_EXTKEY_TRACE` | `<fid>[,<fid>]` | The eight-element extension ranking key for the named candidates, plus their parameter type heads. Ranking is lexicographic, so the first differing component is the one that decided | `[extkey]` |
 | `KLIO_ARGTY_TRACE` | `<identifier>` | The static type lowering actually used for that named expression, and whether it came from an inline splice's declared parameter type. Separates "no type" from "wrong type", which look identical from a failing test | `[argty]` |
-| `KLIO_SPLICE_TRACE` | `<function name>` | Whether a named `inline fun` reaches the splice path, and which parameter types the splice binds | `[splice]` |
+| `KLIO_SPLICE_TRACE` | `<function name>` | Whether a named `inline fun` reaches the splice path (with the declaration and call-site spans), whether the call-site splice landed or bailed to dispatch, and — matched against a lambda PARAMETER name — each caller-lambda splice with its receiver-mark state | `[splice]`, `[splice-ok]`, `[splice-bail]`, `[splice-lam]` |
+| `KLIO_THIS_TRACE` | set | Every bare-`this` lowering: the active splice window, each scope index holding a `this` binding, and the register `resolve` picked. The tool for "whose `this` did this lambda capture" | `[this-trace]`, `[splice-bind]` |
 | `KLIO_LEAF_TRACE` | `<substring of a function name>` | Why the frameless leaf-expression serve declined for a matching function (unsupported opcode, non-instance field receiver, unclaimed field route, callee that is not a leaf) | `[leaf]` |
 | `KLIO_SBC_TRACE` | set | Constructor-vs-member routing inputs for each capitalized bare call | `[sbc]` |
 | `KLIO_SUBTYPE_TRACE` | `<substr>` | Instance-supertype search during overload scoring, for target types containing the substring | `[sub]` |

@@ -37,10 +37,19 @@ both suite-level (plugin conformance ratchet):
       MovableContentTests 41 -> 42/44; ratchet 1338; guard example
       local_ext_declared_receiver.kt. Deeper channel recorded: the
       deriver should substitute call-site type args.
-- [ ] anchorIndex-on-MutableList (the 2 remaining MovableContent
-      fails): engine GapComposer movable-move path calls
-      slotTable.anchorIndex(anchor) with a MutableList receiver —
-      value confusion or another dispatch shape; error signature clean.
+- [x] anchorIndex-on-MutableList FIXED: nested splice-window hole —
+      a lambda spliced from inside another spliced lambda (let inside
+      fastForEach's action) records a caller window whose region
+      includes the OUTER inline fn's receiver bind, so bare `this`
+      resolved to the outer splice receiver (`scopes`) instead of the
+      class instance. Fix: `splice_hidden_bands` stack on FuncBuilder —
+      every active window registers its hidden `[caller_depth,
+      own_base)` band and the windowed caller scan skips enclosing
+      bands. MovableContentTests 42 -> 44/44. NOTE: the wrong spliced
+      code lowers in EVERY context but is live only via the pack-loaded
+      module (test-file lowering ran an alternate emission), so
+      standalone repros pass pre-fix — in-situ probe (println in
+      SlotTable.kt + pack rebuild) was the discriminator.
 - [ ] movableContentOf factory wrap: kotlinc wraps factory-returned
       composable lambdas in composableLambdaInstance (key, tracked,
       wrapper) so every content(n) call site gets a restart group
