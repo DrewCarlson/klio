@@ -1676,7 +1676,7 @@ pub fn string_chunked(ctx: *CallCtx) Allocator.Error!EvalResult {
 
 fn isCallableTransform(v: Value) bool {
     return switch (v) {
-        .IrClosure, .Function, .Intrinsic => true,
+        .IrClosure, .Intrinsic => true,
         else => false,
     };
 }

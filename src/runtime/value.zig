@@ -1932,10 +1932,6 @@ pub const Value = union(enum) {
     /// (see `RangeData`); construct with `Value.newRange`. Immutable after
     /// construction, so copies sharing the record is invisible.
     Range: *RangeData,
-    Function: struct {
-        decl: *const ast.Function,
-        env: ObjRef(Env),
-    },
     /// A stdlib function value. The payload is an INTERNED program-
     /// lifetime record (`Value.internIntrinsic`): the fqn is a static
     /// string and the pair never dies, so copies carry one pointer and
@@ -1949,11 +1945,6 @@ pub const Value = union(enum) {
     /// A method intrinsic bound to a specific receiver. Boxed like `Map`
     /// (see `BoundMethodData`); construct with `Value.newBoundMethod`.
     BoundMethod: *BoundMethodData,
-    /// A user-method reference bound to a specific instance.
-    BoundUserMethod: struct {
-        receiver: ObjRef(InstanceData),
-        method: *const MethodDef,
-    },
     /// A thrown value, modeled as a Kotlin Throwable. Boxed like `Map` (see
     /// `ExceptionData`); construct with `Value.newException`.
     Exception: *ExceptionData,
@@ -1994,11 +1985,6 @@ pub const Value = union(enum) {
     },
     /// A user-declared class.
     Class: ObjRef(ClassDef),
-    /// An `inner class` bound to a specific outer-instance.
-    BoundInnerClass: struct {
-        class: ObjRef(ClassDef),
-        outer: ObjRef(InstanceData),
-    },
     /// A live instance of a user-declared class.
     Instance: ObjRef(InstanceData),
     /// `kotlin.sequences.Sequence<T>`.
@@ -2077,14 +2063,12 @@ pub const Value = union(enum) {
         switch (self) {
             .String => |s| visitor.visit(s),
             .Instance => |i| visitor.visit(i),
-            .BoundUserMethod => |m| visitor.visit(m.receiver),
             .Sequence => |s| visitor.visit(s),
             .Delegate => |d| visitor.visit(d),
             .Regex => |r| visitor.visit(r),
             .Match => |m| visitor.visit(m),
             .StringBuilder => |s| visitor.visit(s),
             .Cell => |c| visitor.visit(c),
-            .Function => |f| visitor.visit(f.env),
             .IrClosure => |c| visitor.visit(c.captures),
             .Comparator => |c| visitor.visit(c.steps),
             .List => |x| visitor.visit(listRefOf(x)),
@@ -2252,10 +2236,6 @@ pub const Value = union(enum) {
             // either kind reachable. A bound inner-class constructor also
             // owns the outer instance it will pass to construction.
             .Class => |c| m.shade(&c.cell.hdr),
-            .BoundInnerClass => |b| {
-                m.shade(&b.class.cell.hdr);
-                m.shade(&b.outer.cell.hdr);
-            },
             // `List`/`Set` view `backing` is shaded by `forEachChildCell` above
             // (the `CollBacking` cell's own `gcTrace` reaches the source).
             // Keep the side-table's canonical capture store + receiver chain for
@@ -2283,14 +2263,12 @@ pub const Value = union(enum) {
         switch (self) {
             .String => |s| s.deinit(),
             .Instance => |i| i.deinit(),
-            .BoundUserMethod => |m| m.receiver.deinit(),
             .Sequence => |s| s.deinit(),
             .Delegate => |d| d.deinit(),
             .Regex => |r| r.deinit(),
             .Match => |m| m.deinit(),
             .StringBuilder => |s| s.deinit(),
             .Cell => |c| c.deinit(),
-            .Function => |f| f.env.deinit(),
             // `releaseSliceElems` already drops the slice handle (its tail
             // `slice.deinit()`); do not deinit it again.
             .IrClosure => |c| releaseSliceElems(c.captures, allocator),
@@ -2551,7 +2529,7 @@ pub const Value = union(enum) {
                 .UInt => if (r.step == 1 and !r.progression) "kotlin.ranges.UIntRange" else "kotlin.ranges.UIntProgression",
                 .ULong => if (r.step == 1 and !r.progression) "kotlin.ranges.ULongRange" else "kotlin.ranges.ULongProgression",
             },
-            .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => "kotlin.Function",
+            .IrClosure, .Intrinsic, .BoundMethod => "kotlin.Function",
             .Exception => "kotlin.Throwable",
             .List => |l| if (l.mutable) "kotlin.collections.MutableList" else "kotlin.collections.List",
             .Array => |a| if (a.prim) |k| k.typeFqn() else "kotlin.Array",
@@ -2593,7 +2571,7 @@ pub const Value = union(enum) {
                 .UInt => "kotlin.collections.UIntIterator",
                 .ULong => "kotlin.collections.ULongIterator",
             },
-            .Class, .BoundInnerClass => "kotlin.reflect.KClass",
+            .Class => "kotlin.reflect.KClass",
             .Instance => "<instance>",
             .Delegate => "<delegate>",
             .PropertyRef => "kotlin.reflect.KProperty",
@@ -2744,13 +2722,13 @@ pub const Value = union(enum) {
                 };
             },
             .Comparator => matchesAny(name, &.{ "Comparator", "Any" }),
-            .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => isFunctionType(self, name),
+            .IrClosure, .Intrinsic, .BoundMethod => isFunctionType(self, name),
             .Exception => |e| blk: {
                 const g = e.fqn.borrow();
                 defer g.deinit();
                 break :blk builtinThrowableIsA(g.get().bytes, name);
             },
-            .Class, .BoundInnerClass => matchesAny(name, &.{ "KClass", "kotlin.reflect.KClass", "KClassifier", "kotlin.reflect.KClassifier", "Any" }),
+            .Class => matchesAny(name, &.{ "KClass", "kotlin.reflect.KClass", "KClassifier", "kotlin.reflect.KClassifier", "Any" }),
             .Instance => |i| blk: {
                 if (std.mem.eql(u8, name, "Any")) break :blk true;
                 const g = i.borrow();
@@ -3078,17 +3056,9 @@ pub const Value = union(enum) {
                     try writer.print("{d} downTo {d} step {d}", .{ r.start, r.end, -r.step });
                 }
             },
-            .Function => |fnv| try writer.print("fun {s}(...)", .{fnv.decl.name.name}),
             .IrClosure => |c| try writer.print("{{ir-closure#{d}}}", .{c.id}),
             .Intrinsic => |i| try writer.print("fun {s}(...)", .{i.fqn}),
             .BoundMethod => |m| try writer.print("fun {s}(...)", .{m.fqn}),
-            .BoundUserMethod => |m| {
-                const g = m.receiver.borrow();
-                defer g.deinit();
-                const cg = g.get().class.borrow();
-                defer cg.deinit();
-                try writer.print("fun {s}.{s}(...)", .{ cg.get().name, m.method.name });
-            },
             .Exception => |e| {
                 const fg = e.fqn.borrow();
                 defer fg.deinit();
@@ -3180,11 +3150,6 @@ pub const Value = union(enum) {
             },
             .Class => |c| {
                 const g = c.borrow();
-                defer g.deinit();
-                try writer.print("class {s}", .{g.get().name});
-            },
-            .BoundInnerClass => |b| {
-                const g = b.class.borrow();
                 defer g.deinit();
                 try writer.print("class {s}", .{g.get().name});
             },
@@ -3454,6 +3419,7 @@ fn classDisplayName(name: []const u8) []const u8 {
 }
 
 fn isFunctionType(self: Value, name: []const u8) bool {
+    _ = self;
     if (matchesAny(name, &.{ "Function", "Any", "kotlin.Function", "KFunction", "KCallable", "kotlin.reflect.KFunction", "kotlin.reflect.KCallable" })) {
         return true;
     }
@@ -3464,11 +3430,11 @@ fn isFunctionType(self: Value, name: []const u8) bool {
     else
         null;
     if (stripped) |s| {
-        const n = std.fmt.parseInt(usize, s, 10) catch return false;
-        return switch (self) {
-            .Function => |f| f.decl.params.len == n,
-            else => false,
-        };
+        _ = std.fmt.parseInt(usize, s, 10) catch return false;
+        // Arity-suffixed FunctionN matching answered only for the retired
+        // AST-interpreter function value; live callables match through the
+        // un-aritied names above, exactly as before.
+        return false;
     }
     return false;
 }

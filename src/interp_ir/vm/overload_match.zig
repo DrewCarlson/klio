@@ -202,7 +202,7 @@ fn valueMatches(self: *VmHost, ty: *const TypeRef, v: *const Value, fuel: u8) Ma
 
     if (std.mem.startsWith(u8, head, "Function")) {
         switch (v.*) {
-            .IrClosure, .Function, .Intrinsic, .BoundMethod, .BoundUserMethod => {
+            .IrClosure, .Intrinsic, .BoundMethod => {
                 const delta = functionShapeDelta(self, head, realArgs(ty.args), v) orelse return .disproven;
                 return if (delta > 0) .proven else .unknown;
             },
@@ -280,7 +280,7 @@ fn valueMatches(self: *VmHost, ty: *const TypeRef, v: *const Value, fuel: u8) Ma
     // registered class (a typealias of a function type, an unseen import)
     // stays unknown.
     switch (v.*) {
-        .IrClosure, .Function, .Intrinsic, .BoundMethod, .BoundUserMethod => {
+        .IrClosure, .Intrinsic, .BoundMethod => {
             const cg = self.classes.borrow();
             defer cg.deinit();
             if (cg.get().get(head)) |d| {

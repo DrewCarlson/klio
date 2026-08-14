@@ -93,7 +93,7 @@ fn isNull(v: Value) bool {
 /// Mirrors `interp_ir.valueIsCallable`, which the stdlib layer cannot import.
 fn isCallable(v: Value) bool {
     return switch (v) {
-        .IrClosure, .Function, .Intrinsic, .BoundMethod, .PropertyRef => true,
+        .IrClosure, .Intrinsic, .BoundMethod, .PropertyRef => true,
         // `E::time` — an UNBOUND property reference — lowers to a synth instance
         // carrying `__bound_receiver__` (the owning class). It is the `KProperty1`
         // Kotlin passes as a `(T) -> R`, and `invokeCallable` dispatches it.

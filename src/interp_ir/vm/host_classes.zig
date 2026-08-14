@@ -164,7 +164,7 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
         // `::greet` for a top-level fn surfaces as a Value::IrClosure (or
         // Function). Treat those as KFunction / KCallable.
         switch (value.*) {
-            .IrClosure, .Function => {
+            .IrClosure => {
                 return std.mem.eql(u8, ty.name, "KFunction") or
                     std.mem.eql(u8, ty.name, "KCallable") or
                     std.mem.eql(u8, ty.name, "KFunction0") or
@@ -243,7 +243,7 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     // `Function1`, `Function2`, … (the arity-indexed `FunctionN`
     // hierarchy from kotlin.jvm.functions).
     switch (value.*) {
-        .IrClosure, .Function => {
+        .IrClosure => {
             if (std.mem.eql(u8, ty.name, "Function")) return true;
             if (std.mem.startsWith(u8, ty.name, "Function")) {
                 const rest = ty.name["Function".len..];

@@ -661,7 +661,7 @@ fn mapRuntimeError(allocator: Allocator, e: RuntimeError) Allocator.Error!EvalEr
 
 fn isCallable(v: *const Value) bool {
     return switch (v.*) {
-        .IrClosure, .Function, .Intrinsic, .BoundMethod => true,
+        .IrClosure, .Intrinsic, .BoundMethod => true,
         else => false,
     };
 }
@@ -1627,7 +1627,7 @@ fn extArityApplicable(self: *VmHost, f: *const Func, want: usize) bool {
 /// param count) and accepted otherwise (intrinsics, bound methods).
 fn receiverIsFunctionShaped(self: *VmHost, receiver: *const Value, pn: []const u8) bool {
     switch (receiver.*) {
-        .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => {},
+        .IrClosure, .Intrinsic, .BoundMethod => {},
         else => return false,
     }
     const digits = pn["Function".len..];
@@ -1636,7 +1636,6 @@ fn receiverIsFunctionShaped(self: *VmHost, receiver: *const Value, pn: []const u
     // A parameterless lambda lowers with the synthetic implicit `it`
     // slot, so a stored arity of 1 also proves `Function0`.
     return switch (receiver.*) {
-        .Function => |f| f.decl.params.len == n or (n == 0 and f.decl.params.len == 1),
         .IrClosure => |c| blk: {
             const info = self.closures.get(@intCast(c.id)) orelse break :blk true;
             break :blk info.n_params == n or (n == 0 and info.n_params == 1);
@@ -1739,7 +1738,7 @@ fn receiverViolatesTypeParamBound(self: *VmHost, fid: FuncId, param_ty: *const T
         // against a functional-interface bound stays undecided — SAM conversion
         // could satisfy it — so the strict prover owns those.
         const decidable = switch (receiver.*) {
-            .Null, .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => false,
+            .Null, .IrClosure, .Intrinsic, .BoundMethod => false,
             else => true,
         };
         if (decidable and !receiverImplementsHead(self, receiver, bn)) return true;
@@ -2828,7 +2827,7 @@ fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver:
     // member re-dispatch loops back to the same pick forever (two
     // lambdas compared through a pack's same-named member).
     switch (receiver.*) {
-        .Function, .IrClosure, .BoundMethod, .BoundUserMethod => {
+        .IrClosure, .BoundMethod => {
             const pn = simpleName(param_ty.name);
             if (param_ty.nullable) return false;
             if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return false;
@@ -3586,7 +3585,7 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     // resolver's candidate walks must keep their misses so outer receivers
     // and extensions still get their turn.
     if (r == .err and r.err == .Unimplemented and
-        (receiver.* == .Function or receiver.* == .IrClosure))
+        (receiver.* == .IrClosure))
     {
         // Interface-method reading is only plausible when the callable's
         // declared parameter count matches the call (except `invoke`,
@@ -3667,8 +3666,7 @@ pub fn callableFieldArity(self: *VmHost, v: *const Value) ?usize {
             const func = module.funcById(info.body_func) orelse return null;
             return func.params.len;
         },
-        .Function => |f| return f.decl.params.len,
-        else => return null,
+                else => return null,
     }
 }
 
@@ -4477,12 +4475,6 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // UByte; c.toString()` — the companion reference lowers to the
     // type's constructor/conversion FUNCTION in a class context):
     // identity string, never the conversion itself.
-    if (receiver.* == .Function and std.mem.eql(u8, name, "toString") and args.len == 0) {
-        const dn = receiver.Function.decl.name.name;
-        if (dn.len > 0 and std.ascii.isUpper(dn[0])) {
-            return .{ .ok = try strVal(allocator, dn) };
-        }
-    }
     if (receiver.* == .Intrinsic) {
         // Same surface for the intrinsic-valued form.
         if (std.mem.eql(u8, name, "toString") and args.len == 0) {
@@ -4847,7 +4839,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
 
     // KFunction reflection surface on a callable value.
-    if (receiver.* == .IrClosure or receiver.* == .Function) {
+    if (receiver.* == .IrClosure) {
         if (std.mem.eql(u8, name, "invoke") or std.mem.eql(u8, name, "call")) {
             return callValueRec(self, allocator, receiver, args);
         }
@@ -5180,7 +5172,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 
     // Reflective KSerializer synthesis.
     if (std.mem.eql(u8, name, "serializer") and args.len == 0 and
-        (receiver.* == .Class or receiver.* == .BoundInnerClass))
+        (receiver.* == .Class))
     {
         const factory = blk: {
             const cg = self.classes.borrow();
@@ -5478,7 +5470,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         };
         if (field) |f| {
             switch (f) {
-                .Function, .IrClosure, .Class => {
+                .IrClosure, .Class => {
                     // Same receiver-fn-typed applicability gate as the
                     // by-name arm above.
                     if (recvFnPropHeadOf(self, receiver, name)) |head| {
@@ -5498,7 +5490,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     if (receiver.* == .Instance and hostHasMember(self, receiver, name)) {
         if (lookupGlobalValue(self, name)) |g| {
             switch (g) {
-                .Function, .IrClosure => return callValueRec(self, allocator, &g, args),
+                .IrClosure => return callValueRec(self, allocator, &g, args),
                 else => {},
             }
         }
@@ -6365,7 +6357,7 @@ fn eqIgnoreCase(allocator: Allocator, a: StringRef, b: StringRef) bool {
 
 fn isCallableOrIntrinsic(v: *const Value) bool {
     return switch (v.*) {
-        .IrClosure, .Function, .Intrinsic => true,
+        .IrClosure, .Intrinsic => true,
         else => false,
     };
 }
@@ -7034,7 +7026,7 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
         // top-level functions.
         if (host_globals.lookupGlobal(self, n)) |callable| {
             switch (callable) {
-                .Function, .IrClosure => return try callValueRec(self, allocator, &callable, args),
+                .IrClosure => return try callValueRec(self, allocator, &callable, args),
                 else => {},
             }
         }
@@ -7092,7 +7084,7 @@ fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
         const has_fn = self.module.borrow().get().hasFuncNamed(pname);
         const callable = lookupGlobalValue(self, pname);
         const is_callable_global = callable != null and switch (callable.?) {
-            .Function, .IrClosure => true,
+            .IrClosure => true,
             else => false,
         };
         if ((has_fn or is_callable_global) and callable != null) {
@@ -9562,7 +9554,7 @@ fn classTypeParamRefutes(self: *VmHost, mod: *const Module, class_name: []const 
                 continue;
             }
             const decidable = switch (arg.*) {
-                .Null, .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => false,
+                .Null, .IrClosure, .Intrinsic, .BoundMethod => false,
                 else => true,
             };
             if (decidable and !receiverImplementsHead(self, arg, bn)) return true;
@@ -10794,10 +10786,6 @@ fn methodArgSigRelaxed(self: *VmHost, args: []const Value) u64 {
                     h.update(std.mem.asBytes(&info.body_func));
                 }
             },
-            .Function => |f| {
-                const dp: usize = @intFromPtr(f.decl);
-                h.update(std.mem.asBytes(&dp));
-            },
             .Array => |arr| {
                 const pk: u8 = if (arr.prim) |p| @as(u8, @intFromEnum(p)) + 1 else 0;
                 h.update((&pk)[0..1]);
@@ -10866,8 +10854,7 @@ fn methodArgSig(self: *VmHost, args: []const Value) ?u64 {
             // extension-heavy lambda-argument code re-ran the full
             // extension walk per call.
             .IrClosure => 16,
-            .Function => 17,
-            // A `Null` argument at a fixed position keys soundly: the walk
+                        // A `Null` argument at a fixed position keys soundly: the walk
             // scores an identical tag vector identically every time (its
             // null-compat check consults only the PARAM's declared
             // nullability), so the resolution is a pure function of the
@@ -10903,10 +10890,6 @@ fn methodArgSig(self: *VmHost, args: []const Value) ?u64 {
                 h.update(std.mem.asBytes(&info.body_func));
                 const mp: usize = @intFromPtr(info.module);
                 h.update(std.mem.asBytes(&mp));
-            },
-            .Function => |f| {
-                const dp: usize = @intFromPtr(f.decl);
-                h.update(std.mem.asBytes(&dp));
             },
             else => {},
         }
@@ -12583,7 +12566,7 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
                 // called as `launch { }` needs defaults on context/start
                 // only). Otherwise the gap is everything past the args.
                 const last_arg_callable = args.len > 0 and switch (args[args.len - 1]) {
-                    .IrClosure, .Function => true,
+                    .IrClosure => true,
                     else => false,
                 };
                 const last_param_fn = std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function") or
@@ -14073,7 +14056,7 @@ fn memberApplicableForWalk(self: *VmHost, f: *const Func, args: []const Value) b
     if (args.len == 0) return false;
     const last_arg = args[args.len - 1];
     const trailing_callable = switch (last_arg) {
-        .IrClosure, .Function, .BoundMethod, .BoundUserMethod, .Intrinsic => true,
+        .IrClosure, .BoundMethod, .Intrinsic => true,
         else => false,
     };
     if (!trailing_callable) return false;
@@ -14813,13 +14796,6 @@ fn memberRefResolved(
             const dot = std.mem.lastIndexOfScalar(u8, receiver.Intrinsic.fqn, '.');
             const simple = if (dot) |i| receiver.Intrinsic.fqn[i + 1 ..] else receiver.Intrinsic.fqn;
             if (isUnsignedArrayName(simple)) return .{ .ok = try syntheticClassFromFqn(allocator, receiver.Intrinsic.fqn) };
-            return .{ .ok = try syntheticClassFromFqn(allocator, receiver.typeFqn()) };
-        }
-        if (receiver.* == .Function) {
-            if (isUnsignedArrayName(receiver.Function.decl.name.name)) {
-                const fqn = try std.fmt.allocPrint(allocator, "kotlin.{s}", .{receiver.Function.decl.name.name});
-                return .{ .ok = try syntheticClassFromFqn(allocator, fqn) };
-            }
             return .{ .ok = try syntheticClassFromFqn(allocator, receiver.typeFqn()) };
         }
         // A builtin throwable carries its dynamic class in its `fqn` field;

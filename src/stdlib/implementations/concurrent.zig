@@ -230,7 +230,7 @@ pub fn concurrent_lock_exit(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// Whether a value is something we can invoke as a thread body.
 fn isCallable(v: Value) bool {
     return switch (v) {
-        .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => true,
+        .IrClosure, .Intrinsic, .BoundMethod => true,
         else => false,
     };
 }
