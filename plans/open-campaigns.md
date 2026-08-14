@@ -78,11 +78,52 @@ both suite-level (plugin conformance ratchet):
 - [ ] checkboxLike = the SLOT-EXACT emission anchor: klio emits 21
       slots memo-off / 24 memo-on vs kotlinc's 18 cap (groups fine at
       6 <= 8). The excess predates memoization — this is the measuring
-      stick for the group/slot emission-shape debt below. NOTE:
-      non-capturing lambdas already have singleton identity in klio
-      (guard example non_capturing_lambda_identity.kt), so the 0-capture
-      memo wrap can likely be dropped without breaking
-      funInterface_isMemoized — a slot-count lever to try first.
+      stick for the group/slot emission-shape debt below. MEASURED
+      NEGATIVE: skipping the 0-capture memo wrap BREAKS
+      funInterface_isMemoized (the VM builds a fresh closure per
+      execution — ir-closure#542 vs #904; the
+      non_capturing_lambda_identity guard exercises a different path)
+      and does NOT reduce checkboxLike's slots (still 24). ROOT NOW
+      FULLY CHARACTERIZED (slot dump via in-situ CompositionGroup.data
+      print in slotExpect): the +6 excess = memo KEY slots — klio's
+      `remember(k1,k2){lam}` stores each captured key, while kotlinc
+      keys the memo on per-param `$dirty` BIT-TRIPLES (zero key slots,
+      one cache slot). A coarse single-bit condition is NOT a shortcut:
+      it over-invalidates and breaks funInterface_isMemoized (identity
+      must survive recompositions where the captures did not change).
+      The fix is the skip-calculus upgrade to kotlinc's per-param
+      changed/dirty bit layout (3 bits per param + child-call masks) —
+      a campaign of its own; checkboxLike stays its ratchet test.
+      Closure interning at buildClosure is the companion road (UNSOUND
+      naively — closures capture the creation-time receiver chain).
+- [ ] CompositionTests remember-family (~8 solo fails:
+      testSimpleRemember, testRememberOneParameter..Five, keyChange,
+      testApplierBeginEndCallbacks) — ROOT DIAGNOSED, campaign-sized:
+      a LOCAL class declared in the compositionTest suspend lambda has
+      its `count++` init resolve `count` through the DYNAMIC runtime
+      receiver chain instead of its lexical scope — the walk finds a
+      REAL `count` member on a scheduler/machinery receiver (=100 after
+      100 virtual frames), and the write falls to the name-keyed global
+      (assert then reads 101). Repro family
+      scratchpad/reprosrc/LocalRememberReproTests.kt (zq-renamed
+      variants pass after the read-tier fix; `count`-named still hit
+      the dynamic-chain member). LANDED SO FAR: bare-name reads now
+      rank an active scoped-capture layer ABOVE implicit receivers'
+      EXTENSION properties (AwaiterQueue's `private inline val
+      Int.count` was hijacking any unresolved `count` via chain Ints).
+      REMAINING (the campaign): (1) receiver-PUBLICATION discipline —
+      seeding local-class instances with a RegisterClass-time chain
+      snapshot was MEASURED NEUTRAL (reverted): the captured chain is
+      itself dynamically over-wide because evtls.active_chain
+      accumulates every published receiver up the call stack; the chain
+      must carry only lexical implicit receivers; (2) scoped-capture
+      layer writes must
+      round-trip through the captured CELL (StoreToThisOrGlobal
+      currently clobbers via storeGlobal); (3) the private
+      member-extension-property visibility gate (plain (recv,name)
+      registration leaks program-wide; first gating attempt broke
+      JobSupport's `Any?.exceptionOrNull` — needs frame-owner-aware
+      visibility, not just the this-chain tower).
 - [ ] movableContentOf factory wrap: kotlinc wraps factory-returned
       composable lambdas in composableLambdaInstance (key, tracked,
       wrapper) so every content(n) call site gets a restart group

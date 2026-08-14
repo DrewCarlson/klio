@@ -1483,6 +1483,12 @@ pub fn lookupGlobal(self: *VmHost, name_in: []const u8) ?Value {
 }
 
 pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value: Value) Allocator.Error!UnitResult {
+    if (runtime.envOnce("KLIO_GLOBAL_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name)) {
+            std.debug.print("[gstore] {s} = {s}\n", .{ name, @tagName(value) });
+            ir.eval.dumpFrameChainForDiagAlways();
+        }
+    }
     if (!std.mem.startsWith(u8, name, "__klio_topfield__")) {
         // A top-level `var` with a custom setter: the plain-name write runs
         // the setter thunk. Its own `field =` write targets the raw
@@ -1727,6 +1733,18 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []cons
     }
 
     return .{ .ok = lookupGlobal(self, name) };
+}
+
+/// Whether an ACTIVE scoped-global layer (a runtime-lowered method body's
+/// captured enclosing locals) binds `name`. The layered lookup is the
+/// runtime materialization of a nearer lexical scope, so a hit here
+/// outranks any implicit receiver's EXTENSION property in bare-name
+/// resolution (real members stay nearer — the caller checks those first).
+pub fn scopedLocalBinds(self: *VmHost, name: []const u8) bool {
+    const g = self.globals.borrow();
+    defer g.deinit();
+    if (!g.get().hasParent()) return false;
+    return g.get().lookupLocal(name) != null;
 }
 
 pub fn isShadowingCapture(self: *VmHost, name: []const u8) bool {

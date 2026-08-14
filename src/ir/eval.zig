@@ -8879,11 +8879,35 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
         // shape the recorded misses still miss and only the recorded
         // winner (if any) needs its probe re-run.
         runtime.prof.opRoute(12);
+        // Kotlin lexical scoping: a captured enclosing local — materialized
+        // for a runtime-lowered method body as a scoped-global layer — is a
+        // NEARER binding than any implicit receiver's EXTENSION property.
+        // Real members stay nearer than the capture (the class-body scope
+        // encloses it), so the receiver walk is skipped only when every
+        // candidate is an Instance and none of their classes declares the
+        // name. Without this, AwaiterQueue's `private inline val Int.count`
+        // hijacked a captured `count` through any receiver chain holding an
+        // Int, and the read never reached the capture's cell.
+        var capture_shadows = false;
+        if (comptime @hasDecl(H, "scopedLocalBinds") and @hasDecl(H, "hostHasMember")) {
+            const bare0 = stripScopeGetter(name_str);
+            if (host.scopedLocalBinds(bare0)) {
+                capture_shadows = true;
+                for (cands) |c| {
+                    if (c.v != .Instance or host.hostHasMember(&c.v, bare0)) {
+                        capture_shadows = false;
+                        break;
+                    }
+                }
+            }
+        }
         const shape = implicitSiteShape(cands);
-        var full_walk = true;
+        var full_walk = !capture_shadows;
+        // The site memo may hold an extension-property winner recorded in a
+        // context without the capture layer; skip it when shadowed.
         if (shape) |sh| {
             const cached = @atomicLoad(u64, @constCast(&lt.site_cache), .monotonic);
-            if (cached != 0 and (cached ^ sh) & SITE_SHAPE_MASK == 0) {
+            if (cached != 0 and !capture_shadows and (cached ^ sh) & SITE_SHAPE_MASK == 0) {
                 const verdict = cached & 3;
                 if (verdict == SITE_MISS) {
                     full_walk = false;

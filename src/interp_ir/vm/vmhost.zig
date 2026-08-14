@@ -383,6 +383,7 @@ pub const VmHost = struct {
     pub const lookupGlobalThrowing = host_globals.lookupGlobalThrowing;
     pub const storeGlobal = host_globals.storeGlobal;
     pub const isShadowingCapture = host_globals.isShadowingCapture;
+    pub const scopedLocalBinds = host_globals.scopedLocalBinds;
     pub const buildClosure = host_call_value.buildClosure;
     pub const buildAstLambdaWithFlagFuncid = host_call_value.buildAstLambdaWithFlagFuncid;
     pub const callableReceiverShape = host_call_value.callableReceiverShape;
