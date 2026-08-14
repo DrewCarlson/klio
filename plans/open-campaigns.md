@@ -85,25 +85,23 @@ practice.
 
 State: DONE — floor recorded here and in memory.
 
-## HANDOVER NOTE (Value=32 VERIFIED — next: the 24B tier)
+## HANDOVER NOTE (Value=24 landed, verification IN FLIGHT)
 
-The GcStressMapCopyFailed regression is FIXED (boxed-payload gcTrace
-shaded box interiors instead of the box cells — the campaign's recorded
-root lesson, repeated and now guarded by the suite's GC-stress step) and
-the plugin ratchet is back at 1337. Value=32 stands fully verified:
-units zero-leak, sweep 117/0, corpus + compose slice at baseline,
-rangebench neutral, ratchet 1337.
-Triple + MatchGroup boxed (units green). Intrinsic INTERNED (immortal
-records, done). LAST ONE: Array — ArrayData {storage: ArrayStore
-(2-variant union of ObjRef handles, 16B), prim: ?PrimitiveArrayKind}.
-prim is PER-VALUE view state (views share the cell with different prim)
-so it cannot fold into the cell; repack instead to a 16B struct
-{ptr: *Cell, tag: u8, prim: u8-encoded-optional} rebuilding the typed
-handle at use — many arr.storage switch sites, loop-hot, measure-first
-on rangebench + an array-heavy example. Lands Value=24. Then (superseded:
-then Pair/IrClosure/Function/...) for Value=16, paired with the
-transpiler hot-view sub-ABI so scalar offsets freeze once; then the
-rangebench speedup number. Items 2-4 follow per their sections.
+The whole 24B tier is done: Triple boxed, MatchGroup boxed (shared
+descriptor struct), Intrinsic INTERNED (immortal records — no refcount,
+no GC), Array REPACKED (the boxed/scalars tag was derivable from
+`prim == null`, so the payload is (cell ptr, prim) with storage()
+rebuilding typed handles). Census: Value 32 -> 24, NO payload >= 24.
+rangebench 82.6s (band 83.0-83.7 — neutral/slightly better); units
+zero-leak; hello smoke green. IN FLIGHT: quick-gate + compose warm/
+slice + plugin ratchet for the four tier commits — read its result
+before the next wave (watch the GC-stress step; the box-cell-shading
+lesson is baked into every new gcTrace).
+NEXT for Value=16: the remaining >8B payloads (Pair 16, IrClosure 24?,
+Function 16, Instance?, String?, Result...) — re-run the census with
+the threshold at >8 to enumerate; pair the wave with the transpiler
+hot-view sub-ABI so scalar offsets freeze once; then the rangebench
+speedup number. Then items 2-4.
 
 ## previous note (Value=32 landed, superseded above)
 
