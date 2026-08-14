@@ -2371,7 +2371,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             // non-packed receiver (a `List`/reference `Array` of objects, or a
             // `Map`) is left for the object-subscript / map paths; a non-packed
             // `set` is compilable only for a `Map`.
-            const packed_ok = v == .Array and v.Array.prim != null and v.Array.storage == .scalars;
+            const packed_ok = v == .Array and v.Array.prim != null and v.Array.storage() == .scalars;
             if (!packed_ok) {
                 if (op.is_set and v != .Map) return null;
                 continue;
@@ -3387,8 +3387,8 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
     for (self.arrays) |au| {
         if (au.reg.int() >= regs.len) return .bail;
         const v = regs[au.reg.int()];
-        if (v != .Array or v.Array.prim != au.kind or v.Array.storage != .scalars) return .bail;
-        const g = v.Array.storage.scalars.borrow();
+        if (v != .Array or v.Array.prim != au.kind or v.Array.storage() != .scalars) return .bail;
+        const g = v.Array.storage().scalars.borrow();
         const pb = g.get();
         slots[au.ptr_slot] = @bitCast(@intFromPtr(pb.bytes.items.ptr));
         slots[au.len_slot] = @intCast(pb.len());

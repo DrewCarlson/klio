@@ -1454,7 +1454,7 @@ fn optionsToFlags(opt_arg: ?Value) Flags {
             defer g.deinit();
             for (g.get().items) |it| applyRegexOption(it, &flags);
         },
-        .Array => |a| switch (a.storage) {
+        .Array => |a| switch (a.storage()) {
             .boxed => |vl| {
                 const g = vl.borrow();
                 defer g.deinit();

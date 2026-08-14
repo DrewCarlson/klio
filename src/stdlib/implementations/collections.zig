@@ -2128,8 +2128,8 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
                 (prim.? == .ULong and src == .Long) or
                 // Same-kind wrap (`UIntArray(uintArray)`) passes through.
                 prim.? == src;
-            if (is_view) switch (arr.storage) {
-                .scalars => |pb| return ok(.{ .Array = .{ .storage = .{ .scalars = pb.clone() }, .prim = prim.? } }),
+            if (is_view) switch (arr.storage()) {
+                .scalars => |pb| return ok(.{ .Array = runtime.ArrayData.scalars(pb.clone(), prim.?) }),
                 // A boxed signed buffer (a `copyOf` that materialized
                 // Values) reinterprets element-wise: same bits, unsigned
                 // tags, packed storage so indexed reads come back tagged.
@@ -2143,7 +2143,7 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
                     for (buf, 0..) |v, i| {
                         pb.setAs(i, v, src);
                     }
-                    return ok(.{ .Array = .{ .storage = .{ .scalars = try ObjRef(runtime.PrimBuf).initOwned(a, pb) }, .prim = k } });
+                    return ok(.{ .Array = runtime.ArrayData.scalars(try ObjRef(runtime.PrimBuf).initOwned(a, pb), k) });
                 },
             };
         }
@@ -2173,10 +2173,7 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
                 pb.set(i, v);
             }
         }
-        return ok(.{ .Array = .{
-            .storage = .{ .scalars = try ObjRef(runtime.PrimBuf).initOwned(a, pb) },
-            .prim = k,
-        } });
+        return ok(.{ .Array = runtime.ArrayData.scalars(try ObjRef(runtime.PrimBuf).initOwned(a, pb), k) });
     }
 
     if (call_args.len == 1) {
@@ -2379,7 +2376,7 @@ pub fn coll_array_as_array_list(ctx: *CallCtx) Error!EvalResult {
 /// its boxed buffer outright (inherently live); a primitive array carries an
 /// `array` backing so each read re-reads the packed scalars.
 pub fn arrayAsListView(a: Allocator, arr: runtime.ArrayData) Error!Value {
-    switch (arr.storage) {
+    switch (arr.storage()) {
         .boxed => |vl| return try Value.newList(a, .{
             .items = vl.clone(),
             .mutable = false,
@@ -7582,8 +7579,8 @@ pub fn array_as_signed_view(ctx: *CallCtx) Error!EvalResult {
         .ULong => .Long,
         else => return typeErr("asArray: receiver is not an unsigned array"),
     };
-    switch (arr.storage) {
-        .scalars => |pb| return ok(.{ .Array = .{ .storage = .{ .scalars = pb.clone() }, .prim = dst } }),
+    switch (arr.storage()) {
+        .scalars => |pb| return ok(.{ .Array = runtime.ArrayData.scalars(pb.clone(), dst) }),
         .boxed => return typeErr("asArray: unsigned array is not packed"),
     }
 }
