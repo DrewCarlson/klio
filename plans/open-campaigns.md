@@ -98,8 +98,9 @@ baseline, litmus 43/44 (only the yield flake), plugin ratchet 1339
 (ABOVE the 1337 baseline; the GC-stress step green).
 16B wave state: Pair BOXED; dead AST-era variants (Function,
 BoundUserMethod, BoundInnerClass) DELETED (net -74 lines, sweep 117/0).
-REMAINING at 16B: Result (24 constructions — box), Comparator (few —
-box), IrClosure (11 constructions, LOOP-HOT lambda values — box +
+Comparator BOXED (units green; run the sweep + battery before the next
+wave — pending for this commit). REMAINING at 16B: Result (24
+constructions — box), IrClosure (11 constructions, LOOP-HOT lambda values — box +
 measure rangebench + a lambda-heavy bench), Array ((cell,prim) — to 8
 needs a side-table or boxing, HOT, measure-first; an honest stop at
 Value=24 is acceptable if the numbers say so). Then the transpiler
