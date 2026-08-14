@@ -124,20 +124,20 @@ both suite-level (plugin conformance ratchet):
       registration leaks program-wide; first gating attempt broke
       JobSupport's `Any?.exceptionOrNull` — needs frame-owner-aware
       visibility, not just the this-chain tower).
-- [ ] movableContentOf factory wrap: kotlinc wraps factory-returned
-      composable lambdas in composableLambdaInstance (key, tracked,
-      wrapper) so every content(n) call site gets a restart group
-      enclosing the movable group; klio leaves them RAW = a missing
-      bracket level. A drafted patch (wrap ret_composable lambdas ×3
-      arms) CORE-DUMPED with 10001-frame recursion — bisect plan:
-      gate the wrap to movableContent* factory names first, then find
-      which fn self-recurses (suspect engine fns whose returned lambda
-      self-references, or the CLI-invoke updateScope loop).
-- [ ] Group start/end imbalance: the ref-1 offset stream closes ONE
-      level too many (EndCurrentGroup lands parent=3 not parent=5), so
-      SkipToEndOfCurrentGroup runs to the PARENT end past the ref2
-      destination; single-ref tests tolerate it. Probe recipe in the
-      triage memory (Operations.kt [op] print with val op0=this.operation).
+- [x] movableContentOf factory wrap RECLASSIFIED latent: the gated
+      wrap (movableContent* factory names, compose_pass wrap_ret) is
+      in tree and MovableContentTests is 44/44 — no live test pins the
+      ungated arms. Widening to all composable-returning factories
+      stays recorded (the drafted ungated patch core-dumped with
+      10001-frame recursion; bisect plan in triage memory) and waits
+      for a failure that names it.
+- [x] Group start/end imbalance RECLASSIFIED latent: the tests that
+      exposed it (movable multi-ref family) are green after the window
+      band + judgment + dispatch fixes; no live failing test remains.
+      The op-trace probe recipe stays in the triage memory
+      (Operations.kt [op] print with val op0=this.operation) for when
+      a shape re-pins it. checkboxLike's SLOT count is the live
+      emission-shape anchor instead.
 
 State: opened this stretch; both roots recorded with probes and bisect
 plans in memory klio-compose-plugin-triage.
@@ -152,7 +152,13 @@ the campaign opens (`COROUTINE-MODEL.md` is the architecture reference).
 - [ ] Cancellation cluster (flow campaign residue)
 - [ ] Unconfined event loop (= createEventLoop debt)
 - [ ] tl_atomic_update_contended litmus flake (timeout under load)
+- [ ] tl_yield_cross_thread_teardown litmus flake (the every-battery
+      43/44; rc=0 with a missed teardown yield)
 - [ ] Background-yield 55s cost (suite-perf memory)
+- [ ] CompositionTests.testCompositionAndRecomposerDeadlock +
+      PausableCompositionTests.markInvalidFromBackgroundThread — both
+      eat the 300s wall cap solo (background-thread scheduling /
+      teardown deadlock family; from the compose DNC audit)
 
 State: not started.
 
