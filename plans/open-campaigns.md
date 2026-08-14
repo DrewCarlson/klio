@@ -30,6 +30,17 @@ permanents + lazy's Debug-CLI time cap + the animation load flake).
 The LIVE residue is two emission roots from the triage memory head,
 both suite-level (plugin conformance ratchet):
 
+- [x] Local-ext-on-declared-builtin family FIXED (c3f3fc38 + 75a92601):
+      the static subtype judgment learned the builtin collection
+      hierarchy + the bare-type-param non-refuting rule (the deriver
+      leaves factory type args unsubstituted — MutableList<T>).
+      MovableContentTests 41 -> 42/44; ratchet 1338; guard example
+      local_ext_declared_receiver.kt. Deeper channel recorded: the
+      deriver should substitute call-site type args.
+- [ ] anchorIndex-on-MutableList (the 2 remaining MovableContent
+      fails): engine GapComposer movable-move path calls
+      slotTable.anchorIndex(anchor) with a MutableList receiver —
+      value confusion or another dispatch shape; error signature clean.
 - [ ] movableContentOf factory wrap: kotlinc wraps factory-returned
       composable lambdas in composableLambdaInstance (key, tracked,
       wrapper) so every content(n) call site gets a restart group
