@@ -506,6 +506,31 @@ pub const MapEntryData = struct {
     }
 };
 
+/// The boxed payload of `Value.Pair` (see `MapData` for the scheme).
+pub const PairData = struct {
+    first: ValueBox,
+    second: ValueBox,
+
+    pub fn deinit(self: *PairData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.first.deinit();
+        self.second.deinit();
+    }
+
+    pub fn gcTrace(self: *const PairData, m: *objcell.gc.Marker) void {
+        m.shade(&self.first.cell.hdr);
+        m.shade(&self.second.cell.hdr);
+    }
+};
+
+/// The control-block handle behind a boxed `Value.Pair` payload.
+pub const PairRef = ObjRef(PairData);
+
+/// Recover the owning control block from a boxed payload pointer.
+pub inline fn pairRefOf(p: *PairData) PairRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", p)) };
+}
+
 /// The boxed payload of `Value.Triple` (see `MapData` for the scheme).
 pub const TripleData = struct {
     first: ValueBox,
@@ -1945,8 +1970,9 @@ pub const Value = union(enum) {
     /// with `mapRefOf`), so a `Value` copy moves 8 bytes and shares the
     /// payload. Construct with `Value.newMap`.
     Map: *MapData,
-    /// `kotlin.Pair`.
-    Pair: struct { first: ValueBox, second: ValueBox },
+    /// `kotlin.Pair`. Boxed like `Map` (see `PairData`); construct with
+    /// `Value.newPair`.
+    Pair: *PairData,
     /// `kotlin.Triple`.
     /// `kotlin.Triple`. Boxed like `Map` (see `TripleData`); construct
     /// with `Value.newTriple`.
@@ -2077,10 +2103,7 @@ pub const Value = union(enum) {
             .PropertyRef => |p| visitor.visit(p.name),
             .MatchGroup => |g| visitor.visit(matchGroupRefOf(g)),
             .Exception => |e| visitor.visit(exceptionRefOf(e)),
-            .Pair => |p| {
-                visitor.visit(p.first);
-                visitor.visit(p.second);
-            },
+            .Pair => |p| visitor.visit(pairRefOf(p)),
             .Triple => |t| visitor.visit(tripleRefOf(t)),
             .MapEntry => |e| visitor.visit(mapEntryRefOf(e)),
             .Result => |r| visitor.visit(r.payload),
@@ -2146,6 +2169,13 @@ pub const Value = union(enum) {
     pub fn newMatchGroup(allocator: std.mem.Allocator, data: MatchGroupData) std.mem.Allocator.Error!Value {
         const ref = try MatchGroupRef.initOwned(allocator, data);
         return .{ .MatchGroup = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `Pair` payload; the only way to construct a
+    /// `.Pair`.
+    pub fn newPair(allocator: std.mem.Allocator, data: PairData) std.mem.Allocator.Error!Value {
+        const ref = try PairRef.initOwned(allocator, data);
+        return .{ .Pair = &ref.cell.data };
     }
 
     /// Allocate the boxed `Triple` payload; the only way to construct a
@@ -2289,10 +2319,7 @@ pub const Value = union(enum) {
             .PropertyRef => |p| p.name.deinit(),
             .MatchGroup => |g| matchGroupRefOf(g).deinit(),
             .Exception => |e| exceptionRefOf(e).deinit(),
-            .Pair => |p| {
-                p.first.deinit();
-                p.second.deinit();
-            },
+            .Pair => |p| pairRefOf(p).deinit(),
             .Triple => |t| tripleRefOf(t).deinit(),
             .MapEntry => |e| mapEntryRefOf(e).deinit(),
             .Result => |r| r.payload.deinit(),

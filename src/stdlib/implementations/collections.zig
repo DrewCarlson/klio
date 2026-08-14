@@ -327,7 +327,7 @@ fn makeMapBorrowed(a: Allocator, entries: std.ArrayList(MapPair), mutable: bool)
 }
 
 fn makePair(a: Allocator, first: Value, second: Value) Error!Value {
-    return .{ .Pair = .{ .first = try Value.boxRef(a, first), .second = try Value.boxRef(a, second) } };
+    return try Value.newPair(a, .{ .first = try Value.boxRef(a, first), .second = try Value.boxRef(a, second) });
 }
 
 fn makeTriple(a: Allocator, first: Value, second: Value, third: Value) Error!Value {
