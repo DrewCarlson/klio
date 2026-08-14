@@ -526,6 +526,16 @@ pub const TripleData = struct {
     }
 };
 
+/// The control-block handle behind a boxed `Value.MatchGroup` payload
+/// (the payload struct is `MatchGroupData`, shared with `MatchData`'s
+/// group descriptors).
+pub const MatchGroupRef = ObjRef(MatchGroupData);
+
+/// Recover the owning control block from a boxed payload pointer.
+pub inline fn matchGroupRefOf(g: *MatchGroupData) MatchGroupRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", g)) };
+}
+
 /// The control-block handle behind a boxed `Value.Triple` payload.
 pub const TripleRef = ObjRef(TripleData);
 
@@ -1552,6 +1562,15 @@ pub const MatchGroupData = struct {
     value: StringRef,
     start: i64,
     end_inclusive: i64,
+
+    pub fn deinit(self: *MatchGroupData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.value.deinit();
+    }
+
+    pub fn gcTrace(self: *const MatchGroupData, m: *objcell.gc.Marker) void {
+        m.shade(&self.value.cell.hdr);
+    }
 };
 
 /// A single regex match outcome — full match plus capture groups, with
@@ -1957,12 +1976,9 @@ pub const Value = union(enum) {
     Regex: ObjRef(RegexData),
     /// `kotlin.text.MatchResult`.
     Match: ObjRef(MatchData),
-    /// `kotlin.text.MatchGroup`.
-    MatchGroup: struct {
-        value: StringRef,
-        start: i64,
-        end_inclusive: i64,
-    },
+    /// `kotlin.text.MatchGroup`. Boxed like `Map` (see `MatchGroupData`);
+    /// construct with `Value.newMatchGroup`.
+    MatchGroup: *MatchGroupData,
     /// `kotlin.text.StringBuilder` — mutable string buffer.
     StringBuilder: ObjRef(std.ArrayList(u8)),
     /// Boxed local `var` captured by a closure (`Ref.ObjectRef`).
@@ -2030,7 +2046,7 @@ pub const Value = union(enum) {
             .RangeIter => |x| visitor.visit(x),
             .SeqIter => |s| visitor.visit(s),
             .PropertyRef => |p| visitor.visit(p.name),
-            .MatchGroup => |g| visitor.visit(g.value),
+            .MatchGroup => |g| visitor.visit(matchGroupRefOf(g)),
             .Exception => |e| visitor.visit(exceptionRefOf(e)),
             .Pair => |p| {
                 visitor.visit(p.first);
@@ -2078,6 +2094,13 @@ pub const Value = union(enum) {
     /// construct an `.Iterator`.
     pub fn newIterator(allocator: std.mem.Allocator, data: IterCursor) std.mem.Allocator.Error!Value {
         return .{ .Iterator = try ObjRef(IterCursor).init(allocator, data) };
+    }
+
+    /// Allocate the boxed `MatchGroup` payload; the only way to construct
+    /// a `.MatchGroup`.
+    pub fn newMatchGroup(allocator: std.mem.Allocator, data: MatchGroupData) std.mem.Allocator.Error!Value {
+        const ref = try MatchGroupRef.initOwned(allocator, data);
+        return .{ .MatchGroup = &ref.cell.data };
     }
 
     /// Allocate the boxed `Triple` payload; the only way to construct a
@@ -2219,7 +2242,7 @@ pub const Value = union(enum) {
             .RangeIter => |x| x.deinit(),
             .SeqIter => |s| s.deinit(),
             .PropertyRef => |p| p.name.deinit(),
-            .MatchGroup => |g| g.value.deinit(),
+            .MatchGroup => |g| matchGroupRefOf(g).deinit(),
             .Exception => |e| exceptionRefOf(e).deinit(),
             .Pair => |p| {
                 p.first.deinit();

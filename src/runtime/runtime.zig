@@ -145,6 +145,7 @@ pub const MapEntryData = value_mod.MapEntryData;
 pub const mapEntryRefOf = value_mod.mapEntryRefOf;
 pub const TripleData = value_mod.TripleData;
 pub const tripleRefOf = value_mod.tripleRefOf;
+pub const matchGroupRefOf = value_mod.matchGroupRefOf;
 pub const SetData = value_mod.SetData;
 pub const SetRef = value_mod.SetRef;
 pub const setRefOf = value_mod.setRefOf;
