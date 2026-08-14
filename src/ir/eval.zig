@@ -6411,6 +6411,13 @@ fn glueAfter(ctx: *NativeCtx, r: Step, inst: *const Inst, idx: u32, block: u32) 
     };
 }
 
+/// The activation's register file as raw bytes for the emitted C's
+/// inline scalar ops (the hot view). Stable for the whole activation:
+/// regs are sized once at frame construction and never reallocated.
+pub fn nativeFrameRegs(ctx: *NativeCtx) [*]u8 {
+    return @ptrCast(ctx.frame.regs.items.ptr);
+}
+
 pub fn nativeOpTrace(ctx: *NativeCtx, file: u32, start: u32, end: u32) void {
     ctx.frame.cur_span = .{ .file = @enumFromInt(file), .start = start, .end = end };
 }
