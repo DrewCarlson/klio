@@ -3213,13 +3213,8 @@ pub const Module = struct {
             // declared builtin receivers (`val l = mutableListOf<Int>()`
             // then `fun List<Int>.f()` never bound).
             if (self.staticBuiltinIdentity(receiver, actual) == .yes and
-                (staticTypeArgsEqual(receiver.args, param.args) or
-                    receiver.args.len == 0))
+                staticBuiltinArgsNonRefuting(receiver.args, param.args))
             {
-                // An argless receiver is an erased derivation (see the
-                // same-classifier note in `staticTypeIsSubtypeInner`):
-                // the head relation decides and the unknown arguments
-                // must not disprove.
                 for (applicability.builtinSupersOf(actual)) |candidate| {
                     if (std.mem.eql(u8, candidate, declared)) return .compatible;
                 }
@@ -3532,8 +3527,7 @@ pub const Module = struct {
         // no variance reasoning; an argless actual is an erased
         // derivation and must not disprove.
         if (self.staticBuiltinIdentity(actual, actual_head) == .yes and
-            (staticTypeArgsEqual(overrideArgs(actual), overrideArgs(declared)) or
-                overrideArgs(actual).len == 0))
+            staticBuiltinArgsNonRefuting(overrideArgs(actual), overrideArgs(declared)))
         {
             for (applicability.builtinSupersOf(actual_head)) |candidate| {
                 if (std.mem.eql(u8, candidate, declared_head)) return true;
@@ -3601,6 +3595,26 @@ pub const Module = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         return self.staticTypeIsSubtypeInner(arena.allocator(), actual, declared, &.{}, 0);
+    }
+
+    /// Whether the builtin-hierarchy escapes may adjudicate by HEAD:
+    /// every actual argument equals its declared counterpart, or is a
+    /// bare unresolved type parameter (`MutableList<T>` — a factory
+    /// return the deriver did not substitute; per the judgment's
+    /// convention, statically unresolvable evidence must not disprove),
+    /// or the actual is an erased argless derivation.
+    fn staticBuiltinArgsNonRefuting(actual_args: []const TypeRef, declared_args: []const TypeRef) bool {
+        if (actual_args.len == 0) return true;
+        if (actual_args.len != declared_args.len) return false;
+        for (actual_args, declared_args) |a, d| {
+            if (a.eql(d)) continue;
+            const h = staticTypeHead(a.name);
+            const bare_param = h.len >= 1 and h.len <= 2 and
+                std.ascii.isUpper(h[0]) and a.args.len == 0 and
+                std.mem.indexOfScalar(u8, a.name, '.') == null;
+            if (!bare_param) return false;
+        }
+        return true;
     }
 
     pub fn staticTypeIsSubtypeWithBounds(
