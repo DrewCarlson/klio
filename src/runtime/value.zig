@@ -506,6 +506,29 @@ pub const MapEntryData = struct {
     }
 };
 
+/// The boxed payload of `Value.Result` (see `MapData` for the scheme).
+pub const ResultData = struct {
+    ok: bool,
+    payload: ValueBox,
+
+    pub fn deinit(self: *ResultData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.payload.deinit();
+    }
+
+    pub fn gcTrace(self: *const ResultData, m: *objcell.gc.Marker) void {
+        m.shade(&self.payload.cell.hdr);
+    }
+};
+
+/// The control-block handle behind a boxed `Value.Result` payload.
+pub const ResultRef = ObjRef(ResultData);
+
+/// Recover the owning control block from a boxed payload pointer.
+pub inline fn resultRefOf(r: *ResultData) ResultRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", r)) };
+}
+
 /// The boxed payload of `Value.Comparator` (see `MapData` for the scheme).
 pub const ComparatorData = struct {
     steps: ObjRef([]ComparatorStep),
@@ -1997,10 +2020,9 @@ pub const Value = union(enum) {
     /// the record — the JVM's reference semantics for an entry.
     MapEntry: *MapEntryData,
     /// `kotlin.Result<T>`.
-    Result: struct {
-        ok: bool,
-        payload: ValueBox,
-    },
+    /// `kotlin.Result<T>`. Boxed like `Map` (see `ResultData`); construct
+    /// with `Value.newResult`.
+    Result: *ResultData,
     /// `kotlin.Comparator<T>`. Boxed like `Map` (see `ComparatorData`);
     /// construct with `Value.newComparator`.
     Comparator: *ComparatorData,
@@ -2111,7 +2133,7 @@ pub const Value = union(enum) {
             .Pair => |p| visitor.visit(pairRefOf(p)),
             .Triple => |t| visitor.visit(tripleRefOf(t)),
             .MapEntry => |e| visitor.visit(mapEntryRefOf(e)),
-            .Result => |r| visitor.visit(r.payload),
+            .Result => |r| visitor.visit(resultRefOf(r)),
             .BoundMethod => |m| visitor.visit(boundMethodRefOf(m)),
             else => {},
         }
@@ -2174,6 +2196,13 @@ pub const Value = union(enum) {
     pub fn newMatchGroup(allocator: std.mem.Allocator, data: MatchGroupData) std.mem.Allocator.Error!Value {
         const ref = try MatchGroupRef.initOwned(allocator, data);
         return .{ .MatchGroup = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `Result` payload; the only way to construct a
+    /// `.Result`.
+    pub fn newResult(allocator: std.mem.Allocator, data: ResultData) std.mem.Allocator.Error!Value {
+        const ref = try ResultRef.initOwned(allocator, data);
+        return .{ .Result = &ref.cell.data };
     }
 
     /// Allocate the boxed `Comparator` payload; the only way to construct
@@ -2328,7 +2357,7 @@ pub const Value = union(enum) {
             .Pair => |p| pairRefOf(p).deinit(),
             .Triple => |t| tripleRefOf(t).deinit(),
             .MapEntry => |e| mapEntryRefOf(e).deinit(),
-            .Result => |r| r.payload.deinit(),
+            .Result => |r| resultRefOf(r).deinit(),
             .BoundMethod => |m| boundMethodRefOf(m).deinit(),
             else => {},
         }

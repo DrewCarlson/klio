@@ -36,7 +36,7 @@ fn recvResult(args: []const Value) ?Recv {
 
 /// Construct a `Value::Result { ok, payload }` with a heap-boxed payload.
 fn makeResult(allocator: std.mem.Allocator, ok: bool, payload: Value) std.mem.Allocator.Error!Value {
-    return .{ .Result = .{ .ok = ok, .payload = try Value.boxRef(allocator, payload) } };
+    return try Value.newResult(allocator, .{ .ok = ok, .payload = try Value.boxRef(allocator, payload) });
 }
 
 pub fn result_success(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -549,8 +549,8 @@ test "isSuccess / isFailure read the ok flag" {
     const a = arena.allocator();
 
     const payload: Value = .{ .Int = 1 };
-    const success = [_]Value{.{ .Result = .{ .ok = true, .payload = tbox(a, payload) } }};
-    const failure = [_]Value{.{ .Result = .{ .ok = false, .payload = tbox(a, payload) } }};
+    const success = [_]Value{try Value.newResult(a, .{ .ok = true, .payload = tbox(a, payload) })};
+    const failure = [_]Value{try Value.newResult(a, .{ .ok = false, .payload = tbox(a, payload) })};
 
     var c1 = ctxWith(&success, noop.host(), cap.output(), a);
     try testing.expect((try result_is_success(&c1)).ok.Bool);
@@ -573,8 +573,8 @@ test "getOrNull / exceptionOrNull pick the right branch" {
 
     const ok_payload: Value = .{ .Int = 5 };
     const err_payload: Value = .{ .Int = 9 };
-    const success = [_]Value{.{ .Result = .{ .ok = true, .payload = tbox(a, ok_payload) } }};
-    const failure = [_]Value{.{ .Result = .{ .ok = false, .payload = tbox(a, err_payload) } }};
+    const success = [_]Value{try Value.newResult(a, .{ .ok = true, .payload = tbox(a, ok_payload) })};
+    const failure = [_]Value{try Value.newResult(a, .{ .ok = false, .payload = tbox(a, err_payload) })};
 
     var c1 = ctxWith(&success, noop.host(), cap.output(), a);
     try testing.expectEqual(@as(i32, 5), (try result_get_or_null(&c1)).ok.Int);
@@ -597,8 +597,8 @@ test "getOrThrow returns success and rethrows failure" {
 
     const ok_payload: Value = .{ .Int = 3 };
     const err_payload: Value = .{ .Int = 4 };
-    const success = [_]Value{.{ .Result = .{ .ok = true, .payload = tbox(a, ok_payload) } }};
-    const failure = [_]Value{.{ .Result = .{ .ok = false, .payload = tbox(a, err_payload) } }};
+    const success = [_]Value{try Value.newResult(a, .{ .ok = true, .payload = tbox(a, ok_payload) })};
+    const failure = [_]Value{try Value.newResult(a, .{ .ok = false, .payload = tbox(a, err_payload) })};
 
     var c1 = ctxWith(&success, noop.host(), cap.output(), a);
     try testing.expectEqual(@as(i32, 3), (try result_get_or_throw(&c1)).ok.Int);
@@ -620,9 +620,9 @@ test "getOrDefault falls back on failure and requires a default" {
 
     const ok_payload: Value = .{ .Int = 1 };
     const err_payload: Value = .{ .Int = 2 };
-    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = tbox(a, ok_payload) } }, .{ .Int = 99 } };
-    const failure = [_]Value{ .{ .Result = .{ .ok = false, .payload = tbox(a, err_payload) } }, .{ .Int = 99 } };
-    const no_default = [_]Value{.{ .Result = .{ .ok = false, .payload = tbox(a, err_payload) } }};
+    const success = [_]Value{ try Value.newResult(a, .{ .ok = true, .payload = tbox(a, ok_payload) }), .{ .Int = 99 } };
+    const failure = [_]Value{ try Value.newResult(a, .{ .ok = false, .payload = tbox(a, err_payload) }), .{ .Int = 99 } };
+    const no_default = [_]Value{try Value.newResult(a, .{ .ok = false, .payload = tbox(a, err_payload) })};
 
     var c1 = ctxWith(&success, noop.host(), cap.output(), a);
     try testing.expectEqual(@as(i32, 1), (try result_get_or_default(&c1)).ok.Int);
@@ -657,8 +657,8 @@ test "result_to_string renders Success/Failure" {
     const a = arena.allocator();
 
     const payload: Value = .{ .Int = 42 };
-    const success = [_]Value{.{ .Result = .{ .ok = true, .payload = tbox(a, payload) } }};
-    const failure = [_]Value{.{ .Result = .{ .ok = false, .payload = tbox(a, payload) } }};
+    const success = [_]Value{try Value.newResult(a, .{ .ok = true, .payload = tbox(a, payload) })};
+    const failure = [_]Value{try Value.newResult(a, .{ .ok = false, .payload = tbox(a, payload) })};
 
     var c1 = ctxWith(&success, noop.host(), cap.output(), a);
     const s1 = (try result_to_string(&c1)).ok;
@@ -735,8 +735,8 @@ test "result_map maps success, passes failure through, mapCatching catches throw
 
     const ok_payload: Value = .{ .Int = 2 };
     const err_payload: Value = .{ .Int = 7 };
-    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = tbox(a, ok_payload) } }, Value.Unit };
-    const failure = [_]Value{ .{ .Result = .{ .ok = false, .payload = tbox(a, err_payload) } }, Value.Unit };
+    const success = [_]Value{ try Value.newResult(a, .{ .ok = true, .payload = tbox(a, ok_payload) }), Value.Unit };
+    const failure = [_]Value{ try Value.newResult(a, .{ .ok = false, .payload = tbox(a, err_payload) }), Value.Unit };
 
     stub.reply = .{ .ok = .{ .Int = 100 } };
     var c1 = ctxWith(&success, stub.host(), cap.output(), a);
@@ -773,8 +773,8 @@ test "result_fold dispatches to onSuccess or onFailure" {
     const ok_payload: Value = .{ .Int = 21 };
     const err_payload: Value = .{ .Int = 31 };
     // (receiver, onSuccess, onFailure)
-    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = tbox(a, ok_payload) } }, Value.Unit, Value.Unit };
-    const failure = [_]Value{ .{ .Result = .{ .ok = false, .payload = tbox(a, err_payload) } }, Value.Unit, Value.Unit };
+    const success = [_]Value{ try Value.newResult(a, .{ .ok = true, .payload = tbox(a, ok_payload) }), Value.Unit, Value.Unit };
+    const failure = [_]Value{ try Value.newResult(a, .{ .ok = false, .payload = tbox(a, err_payload) }), Value.Unit, Value.Unit };
 
     stub.reply = .{ .ok = .{ .Int = 0 } };
     var c1 = ctxWith(&success, stub.host(), cap.output(), a);
@@ -796,7 +796,7 @@ test "onSuccess / onFailure run the side effect then return the receiver" {
     const a = arena.allocator();
 
     const ok_payload: Value = .{ .Int = 8 };
-    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = tbox(a, ok_payload) } }, Value.Unit };
+    const success = [_]Value{ try Value.newResult(a, .{ .ok = true, .payload = tbox(a, ok_payload) }), Value.Unit };
 
     stub.reply = .{ .ok = Value.Unit };
     stub.invoked = 0;
@@ -824,8 +824,8 @@ test "getOrElse returns success or calls onFailure" {
 
     const ok_payload: Value = .{ .Int = 6 };
     const err_payload: Value = .{ .Int = 9 };
-    const success = [_]Value{ .{ .Result = .{ .ok = true, .payload = tbox(a, ok_payload) } }, Value.Unit };
-    const failure = [_]Value{ .{ .Result = .{ .ok = false, .payload = tbox(a, err_payload) } }, Value.Unit };
+    const success = [_]Value{ try Value.newResult(a, .{ .ok = true, .payload = tbox(a, ok_payload) }), Value.Unit };
+    const failure = [_]Value{ try Value.newResult(a, .{ .ok = false, .payload = tbox(a, err_payload) }), Value.Unit };
 
     var c1 = ctxWith(&success, stub.host(), cap.output(), a);
     try testing.expectEqual(@as(i32, 6), (try result_get_or_else(&c1)).ok.Int);

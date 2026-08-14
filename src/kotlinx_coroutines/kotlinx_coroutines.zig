@@ -695,7 +695,7 @@ fn chanResumeNow(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 fn makeSuccessResult(allocator: std.mem.Allocator, payload: Value) std.mem.Allocator.Error!Value {
-    return .{ .Result = .{ .ok = true, .payload = try Value.boxRef(allocator, payload) } };
+    return try Value.newResult(allocator, .{ .ok = true, .payload = try Value.boxRef(allocator, payload) });
 }
 
 /// `__kxco_chanCancelWaiter(channel, slot, cause)` — invoked from the
@@ -748,7 +748,7 @@ fn channelCancelWaiter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // A throw at the suspension point: `Result.failure(cause)` routed by
     // the resume engine as `pending_throw_from_inner` (see ir/eval.zig).
     const cancellation: Value = if (cause == .Null) try cancellationExc(ctx.allocator) else cause;
-    const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, cancellation) } };
+    const failure = try Value.newResult(ctx.allocator, .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, cancellation) });
     ctx.host.coroutineResumeExternal(slot, failure, ctx.out);
     return .{ .ok = .Unit };
 }
@@ -1258,7 +1258,7 @@ fn channelCloseImpl(ctx: *CallCtx, cancel_pending_sends: bool) std.mem.Allocator
         } else {
             const receive_exc = if (close_cause == .Null) exc else close_cause;
             receive_exc.retain();
-            const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, receive_exc) } };
+            const failure = try Value.newResult(ctx.allocator, .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, receive_exc) });
             resumeWaiterNormal(ctx, w.slot, failure, w.scope);
         }
     }
@@ -1270,13 +1270,13 @@ fn channelCloseImpl(ctx: *CallCtx, cancel_pending_sends: bool) std.mem.Allocator
             resumeWaiterNormal(ctx, w.slot, .{ .Bool = false }, w.scope);
         } else {
             close_cause.retain();
-            const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, close_cause) } };
+            const failure = try Value.newResult(ctx.allocator, .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, close_cause) });
             resumeWaiterNormal(ctx, w.slot, failure, w.scope);
         }
     }
     for (sends) |sw| {
         const send_exc = try channelCloseException(ctx.allocator, close_cause, false);
-        const failure = Value{ .Result = .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, send_exc) } };
+        const failure = try Value.newResult(ctx.allocator, .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, send_exc) });
         resumeWaiterNormal(ctx, sw.slot, failure, sw.scope);
     }
     // A close makes every registered receive/send clause resolvable

@@ -149,6 +149,7 @@ pub const matchGroupRefOf = value_mod.matchGroupRefOf;
 pub const PairData = value_mod.PairData;
 pub const pairRefOf = value_mod.pairRefOf;
 pub const comparatorRefOf = value_mod.comparatorRefOf;
+pub const resultRefOf = value_mod.resultRefOf;
 pub const SetData = value_mod.SetData;
 pub const SetRef = value_mod.SetRef;
 pub const setRefOf = value_mod.setRefOf;
