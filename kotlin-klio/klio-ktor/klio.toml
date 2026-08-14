@@ -44,6 +44,14 @@ include = [
     "io/ktor/utils/io/ByteChannelCtor.kt",
     "io/ktor/utils/io/ByteReadChannelOperations.kt",
     "io/ktor/utils/io/ByteWriteChannelOperations.kt",
+    "io/ktor/utils/io/LineEndingMode.kt",
+    "io/ktor/utils/io/LineEnding.kt",
+    "io/ktor/utils/io/SinkByteWriteChannel.kt",
+    "io/ktor/utils/io/ByteChannelScanner.kt",
+    "io/ktor/utils/io/ByteChannelUtils.kt",
+    "io/ktor/utils/io/CountedByteReadChannel.kt",
+    "io/ktor/utils/io/CountedByteWriteChannel.kt",
+    "io/ktor/utils/io/CloseHookByteWriteChannel.kt",
     "io/ktor/utils/io/locks/Synchronized.kt",
     # Engine I/O dispatcher expect (the engine base's default dispatcher).
     # klio supplies the `Unconfined` actual under `shim/core`.
@@ -73,6 +81,15 @@ include = [
 root = "upstream/ktor-utils/common/src"
 include = [
     "io/ktor/util/Text.kt",
+    "io/ktor/util/Base64.kt",
+    "io/ktor/util/Crypto.kt",
+    "io/ktor/util/Hash.kt",
+    "io/ktor/util/HashFunction.kt",
+    "io/ktor/util/NonceManager.kt",
+    "io/ktor/util/converters/ConversionService.kt",
+    "io/ktor/util/converters/DataConversion.kt",
+    "io/ktor/util/date/Date.kt",
+    "io/ktor/util/date/GMTDateParser.kt",
     "io/ktor/util/Ranges.kt",
     "io/ktor/util/Collections.kt",
     "io/ktor/util/DelegatingMutableSet.kt",
@@ -141,6 +158,13 @@ include = [
 root = "upstream/ktor-http/common/src"
 include = [
     "io/ktor/http/HttpStatusCode.kt",
+    "io/ktor/http/Cookie.kt",
+    "io/ktor/http/CookieUtils.kt",
+    "io/ktor/http/DateUtils.kt",
+    "io/ktor/http/FileContentType.kt",
+    "io/ktor/http/Mimes.kt",
+    "io/ktor/http/HttpUrlEncoded.kt",
+    "io/ktor/http/header/AcceptEncoding.kt",
     "io/ktor/http/HttpMethod.kt",
     "io/ktor/http/HttpProtocolVersion.kt",
     "io/ktor/http/HttpHeaders.kt",

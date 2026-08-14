@@ -217,12 +217,32 @@ State: not started.
 
 ## 4. ktor_commontest upstream fails
 
-292 upstream test failures, unmapped. Reference: `KTOR-SERVER-UPSTREAM.md`.
+Reference: `KTOR-SERVER-UPSTREAM.md`. The recorded "292" was stale AND
+inflated by a stale-pack census trap: the itest REBUILDS all five packs
+before running — a census against old installed packs fails 100%.
+Fresh-pack per-class census (43 files, ktor-io/utils/http common
+tests): 322/444 passing at the start of this stretch.
 
-- [ ] Triage the 292 into failure classes
-- [ ] Fix by class, ratchet the count
+- [x] Triage: the DOMINANT class was not interpreter bugs at all — the
+      io.ktor pack's curated `include` lists simply omit upstream files
+      the tests exercise (Base64, Crypto/Hash/Nonce, converters, date
+      parsing, Cookie/Mimes/FileContentType/AcceptEncoding,
+      LineEnding(Mode)/ByteChannelScanner/SinkByteWriteChannel...).
+      Recipe proven and applied in three batches: 322 -> 399/444
+      (Base64Test, AcceptEncoding, ContentType*, CommonHeaders,
+      RenderSetCookie, GMTDate*, ReadLine 22/25... whole classes to
+      green). One trap: a speculative include (IpParser.kt) pulled the
+      unconsumed parsing DSL and broke the whole bake — add only files
+      a failing test names, drop on bake error.
+- [ ] Remaining 44 real fails + 2 timeout classes, clustered:
+      ConcurrentSetTest 9, ChannelTest 7, CookieDateParser 3,
+      DataConversion 3, ReadLine tail 3, misc singles;
+      CoroutinesTest + PipelineTest hit the 180s census cap.
+- [ ] Risk note: the widened includes are validated by the commontest
+      census only; the ktor_server/client e2e itests gate them in CI.
 
-State: not started; least-known of the five.
+State: mapped and half-fixed; the remaining fails are real per-class
+interpreter/library bugs with logs under the census recipe.
 
 ## 5. Suite-wall profile
 
