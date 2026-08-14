@@ -3774,6 +3774,6 @@ test "display produces an owned string" {
 test "value layout census" {
     std.debug.print("\nValue size={d} align={d}\n", .{ @sizeOf(Value), @alignOf(Value) });
     inline for (@typeInfo(Value).@"union".fields) |f| {
-        if (@sizeOf(f.type) >= 24) std.debug.print("  {s}: {d}\n", .{ f.name, @sizeOf(f.type) });
+        if (@sizeOf(f.type) > 8) std.debug.print("  {s}: {d}\n", .{ f.name, @sizeOf(f.type) });
     }
 }
