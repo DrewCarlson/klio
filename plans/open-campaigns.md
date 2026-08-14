@@ -93,7 +93,10 @@ root lesson, repeated and now guarded by the suite's GC-stress step) and
 the plugin ratchet is back at 1337. Value=32 stands fully verified:
 units zero-leak, sweep 117/0, corpus + compose slice at baseline,
 rangebench neutral, ratchet 1337.
-Next in item 1: box the 24B tier (Intrinsic, Array, Triple, MatchGroup,
+Triple + MatchGroup boxed (units green). LAST TWO: Intrinsic — its fqn
+is a static program-lifetime string, so consider INTERNING (one immortal
+cell per (fqn,func) pair, no refcount) over plain boxing; and Array
+(ArrayData storage union — loop-hot, measure-first). Then (superseded:
 then Pair/IrClosure/Function/...) for Value=16, paired with the
 transpiler hot-view sub-ABI so scalar offsets freeze once; then the
 rangebench speedup number. Items 2-4 follow per their sections.
