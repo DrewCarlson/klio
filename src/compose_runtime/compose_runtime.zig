@@ -224,7 +224,7 @@ test "gap-buffer field accessors read and write the 5-int group layout" {
     try list.appendSlice(testing.allocator, &backing);
     const store = try runtime.ValueList.init(testing.allocator, list);
     defer store.deinit();
-    const arr: Value = .{ .Array = .{ .storage = .{ .boxed = store }, .prim = null } };
+    const arr: Value = .{ .Array = runtime.ArrayData.boxed(store) };
 
     var ctx1 = host.ctx(&.{ arr, Value.newInt(1) });
     try testing.expectEqual(@as(i32, 1), (try gapGroupSize(&ctx1)).ok.Int);

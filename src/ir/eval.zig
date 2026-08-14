@@ -10587,7 +10587,7 @@ inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
     if (idx < 0) return null;
     const ui: usize = @intCast(idx);
     switch (recv.*) {
-        .Array => |arr| switch (arr.storage) {
+        .Array => |arr| switch (arr.storage()) {
             .scalars => |pb| {
                 const g = pb.borrow();
                 defer g.deinit();
@@ -10653,7 +10653,7 @@ inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *const V
     if (idx < 0) return null;
     const ui: usize = @intCast(idx);
     switch (recv.*) {
-        .Array => |arr| switch (arr.storage) {
+        .Array => |arr| switch (arr.storage()) {
             .scalars => |pb| {
                 const g = pb.borrowMut();
                 defer g.deinit();

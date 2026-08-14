@@ -8255,10 +8255,10 @@ fn seqIterSourcePull(self: *VmHost, allocator: Allocator, st: *SeqIterState, out
                     .err => |re| .{ .err = try mapRuntimeError(allocator, re) },
                 };
             }
-            return .{ .value = .{ .Pair = .{
+            return .{ .value = try Value.newPair(allocator, .{
                 .first = try Value.boxRef(allocator, av),
                 .second = try Value.boxRef(allocator, bv),
-            } } };
+            }) };
         },
         .Generate => |gen| {
             if (st.done) return .done;

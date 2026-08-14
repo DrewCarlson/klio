@@ -506,6 +506,31 @@ pub const MapEntryData = struct {
     }
 };
 
+/// The boxed payload of `Value.Pair` (see `MapData` for the scheme).
+pub const PairData = struct {
+    first: ValueBox,
+    second: ValueBox,
+
+    pub fn deinit(self: *PairData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.first.deinit();
+        self.second.deinit();
+    }
+
+    pub fn gcTrace(self: *const PairData, m: *objcell.gc.Marker) void {
+        m.shade(&self.first.cell.hdr);
+        m.shade(&self.second.cell.hdr);
+    }
+};
+
+/// The control-block handle behind a boxed `Value.Pair` payload.
+pub const PairRef = ObjRef(PairData);
+
+/// Recover the owning control block from a boxed payload pointer.
+pub inline fn pairRefOf(p: *PairData) PairRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", p)) };
+}
+
 /// The boxed payload of `Value.Triple` (see `MapData` for the scheme).
 pub const TripleData = struct {
     first: ValueBox,
@@ -1022,11 +1047,29 @@ pub const ArrayStore = union(enum) {
 /// kind (`null` for a reference `Array<T>`) and matches `storage`: `.boxed`
 /// when `prim == null`, `.scalars` when `prim != null`.
 pub const ArrayData = struct {
-    storage: ArrayStore,
+    /// The storage cell: an `ObjRef(std.ArrayList(Value))` cell when
+    /// `prim == null` (a reference `Array<T>`), an `ObjRef(PrimBuf)` cell
+    /// otherwise — the invariant that lets the payload drop the union tag
+    /// and pack to (pointer, prim).
+    cell: *anyopaque,
     prim: ?PrimitiveArrayKind,
 
+    pub fn boxed(vl: ValueList) ArrayData {
+        return .{ .cell = vl.cell, .prim = null };
+    }
+
+    pub fn scalars(pb: ObjRef(PrimBuf), kind: PrimitiveArrayKind) ArrayData {
+        return .{ .cell = pb.cell, .prim = kind };
+    }
+
+    /// Rebuild the typed storage view from the packed cell pointer.
+    pub fn storage(self: ArrayData) ArrayStore {
+        if (self.prim == null) return .{ .boxed = .{ .cell = @ptrCast(@alignCast(self.cell)) } };
+        return .{ .scalars = .{ .cell = @ptrCast(@alignCast(self.cell)) } };
+    }
+
     pub fn len(self: ArrayData) usize {
-        switch (self.storage) {
+        switch (self.storage()) {
             .boxed => |vl| {
                 const g = vl.borrow();
                 defer g.deinit();
@@ -1044,7 +1087,7 @@ pub const ArrayData = struct {
     /// as stored (caller retains if it keeps a copy); packed elements are fresh
     /// scalars with no out-edges.
     pub fn get(self: ArrayData, i: usize) Value {
-        switch (self.storage) {
+        switch (self.storage()) {
             .boxed => |vl| {
                 const g = vl.borrow();
                 defer g.deinit();
@@ -1062,7 +1105,7 @@ pub const ArrayData = struct {
     /// element is released and the new one retained under a reclaiming backend;
     /// packed elements are plain scalars.
     pub fn set(self: ArrayData, allocator: std.mem.Allocator, i: usize, v: Value) void {
-        switch (self.storage) {
+        switch (self.storage()) {
             .boxed => |vl| {
                 const g = vl.borrowMut();
                 defer g.deinit();
@@ -1093,7 +1136,7 @@ pub const ArrayData = struct {
     /// copy (`copyInto` of a slice out of a large backing array) pays for the
     /// elements it moves rather than for the whole source.
     pub fn snapshotRange(self: ArrayData, allocator: std.mem.Allocator, start: usize, end: usize) std.mem.Allocator.Error![]Value {
-        switch (self.storage) {
+        switch (self.storage()) {
             .boxed => |vl| {
                 const g = vl.borrow();
                 defer g.deinit();
@@ -1121,7 +1164,7 @@ pub const ArrayData = struct {
     /// For sites that genuinely need to alias the backing list (iterators); a
     /// packed array has no such list (use `snapshot`).
     pub fn boxedList(self: ArrayData) ?ValueList {
-        return switch (self.storage) {
+        return switch (self.storage()) {
             .boxed => |vl| vl,
             .scalars => null,
         };
@@ -1129,7 +1172,7 @@ pub const ArrayData = struct {
 
     /// Drop one reference to the backing storage (boxed list or packed buffer).
     pub fn deinitStorage(self: ArrayData) void {
-        switch (self.storage) {
+        switch (self.storage()) {
             .boxed => |vl| vl.deinit(),
             .scalars => |pb| pb.deinit(),
         }
@@ -1137,7 +1180,7 @@ pub const ArrayData = struct {
 
     /// Identity (backing-cell address) for reference equality and `===`.
     pub fn identity(self: ArrayData) usize {
-        return switch (self.storage) {
+        return switch (self.storage()) {
             .boxed => |vl| vl.identity(),
             .scalars => |pb| pb.identity(),
         };
@@ -1149,19 +1192,19 @@ pub const ArrayData = struct {
         var pb = PrimBuf{ .kind = kind };
         try pb.bytes.appendNTimes(a, 0, items.len * kind.elemSize());
         for (items, 0..) |v, i| pb.set(i, v);
-        return .{ .Array = .{ .storage = .{ .scalars = try ObjRef(PrimBuf).initOwned(a, pb) }, .prim = kind } };
+        return .{ .Array = ArrayData.scalars(try ObjRef(PrimBuf).initOwned(a, pb), kind) };
     }
 
     /// Build a reference `Array<T>` Value from a boxed `ValueList`.
     pub fn fromBoxedList(vl: ValueList) Value {
-        return .{ .Array = .{ .storage = .{ .boxed = vl }, .prim = null } };
+        return .{ .Array = ArrayData.boxed(vl) };
     }
 
     /// Overwrite every element from `src` (length must equal `len()`). Mirrors a
     /// snapshot→reorder→write-back (no net refcount change for a permutation):
     /// boxed elements are replaced as-is, packed scalars are unboxed.
     pub fn writeBack(self: ArrayData, a: std.mem.Allocator, src: []const Value) std.mem.Allocator.Error!void {
-        switch (self.storage) {
+        switch (self.storage()) {
             .boxed => |vl| {
                 const g = vl.borrowMut();
                 defer g.deinit();
@@ -1927,8 +1970,9 @@ pub const Value = union(enum) {
     /// with `mapRefOf`), so a `Value` copy moves 8 bytes and shares the
     /// payload. Construct with `Value.newMap`.
     Map: *MapData,
-    /// `kotlin.Pair`.
-    Pair: struct { first: ValueBox, second: ValueBox },
+    /// `kotlin.Pair`. Boxed like `Map` (see `PairData`); construct with
+    /// `Value.newPair`.
+    Pair: *PairData,
     /// `kotlin.Triple`.
     /// `kotlin.Triple`. Boxed like `Map` (see `TripleData`); construct
     /// with `Value.newTriple`.
@@ -2045,7 +2089,7 @@ pub const Value = union(enum) {
             .Comparator => |c| visitor.visit(c.steps),
             .List => |x| visitor.visit(listRefOf(x)),
             .Set => |x| visitor.visit(setRefOf(x)),
-            .Array => |x| switch (x.storage) {
+            .Array => |x| switch (x.storage()) {
                 .boxed => |vl| visitor.visit(vl),
                 .scalars => |pb| visitor.visit(pb),
             },
@@ -2059,10 +2103,7 @@ pub const Value = union(enum) {
             .PropertyRef => |p| visitor.visit(p.name),
             .MatchGroup => |g| visitor.visit(matchGroupRefOf(g)),
             .Exception => |e| visitor.visit(exceptionRefOf(e)),
-            .Pair => |p| {
-                visitor.visit(p.first);
-                visitor.visit(p.second);
-            },
+            .Pair => |p| visitor.visit(pairRefOf(p)),
             .Triple => |t| visitor.visit(tripleRefOf(t)),
             .MapEntry => |e| visitor.visit(mapEntryRefOf(e)),
             .Result => |r| visitor.visit(r.payload),
@@ -2128,6 +2169,13 @@ pub const Value = union(enum) {
     pub fn newMatchGroup(allocator: std.mem.Allocator, data: MatchGroupData) std.mem.Allocator.Error!Value {
         const ref = try MatchGroupRef.initOwned(allocator, data);
         return .{ .MatchGroup = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `Pair` payload; the only way to construct a
+    /// `.Pair`.
+    pub fn newPair(allocator: std.mem.Allocator, data: PairData) std.mem.Allocator.Error!Value {
+        const ref = try PairRef.initOwned(allocator, data);
+        return .{ .Pair = &ref.cell.data };
     }
 
     /// Allocate the boxed `Triple` payload; the only way to construct a
@@ -2257,7 +2305,7 @@ pub const Value = union(enum) {
                 listRefOf(x).deinit();
             },
             .Set => |x| setRefOf(x).deinit(),
-            .Array => |x| switch (x.storage) {
+            .Array => |x| switch (x.storage()) {
                 .boxed => |vl| releaseValueList(vl, allocator),
                 .scalars => |pb| pb.deinit(),
             },
@@ -2271,10 +2319,7 @@ pub const Value = union(enum) {
             .PropertyRef => |p| p.name.deinit(),
             .MatchGroup => |g| matchGroupRefOf(g).deinit(),
             .Exception => |e| exceptionRefOf(e).deinit(),
-            .Pair => |p| {
-                p.first.deinit();
-                p.second.deinit();
-            },
+            .Pair => |p| pairRefOf(p).deinit(),
             .Triple => |t| tripleRefOf(t).deinit(),
             .MapEntry => |e| mapEntryRefOf(e).deinit(),
             .Result => |r| r.payload.deinit(),
@@ -3756,6 +3801,6 @@ test "display produces an owned string" {
 test "value layout census" {
     std.debug.print("\nValue size={d} align={d}\n", .{ @sizeOf(Value), @alignOf(Value) });
     inline for (@typeInfo(Value).@"union".fields) |f| {
-        if (@sizeOf(f.type) >= 24) std.debug.print("  {s}: {d}\n", .{ f.name, @sizeOf(f.type) });
+        if (@sizeOf(f.type) > 8) std.debug.print("  {s}: {d}\n", .{ f.name, @sizeOf(f.type) });
     }
 }

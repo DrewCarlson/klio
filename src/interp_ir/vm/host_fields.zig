@@ -1526,8 +1526,8 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         const a = receiver.Array;
         if (a.prim) |k| {
             if (k.signedCounterpart()) |signed| {
-                if (a.storage == .scalars) {
-                    return ok(.{ .Array = .{ .storage = .{ .scalars = a.storage.scalars.clone() }, .prim = signed } });
+                if (a.storage() == .scalars) {
+                    return ok(.{ .Array = runtime.ArrayData.scalars(a.storage().scalars.clone(), signed) });
                 }
             }
         }
