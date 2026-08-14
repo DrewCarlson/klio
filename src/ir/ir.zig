@@ -3205,6 +3205,25 @@ pub const Module = struct {
             return .unknown;
         }
         if (param.args.len != 0) {
+            // Builtin hierarchy with matching arguments: a
+            // `MutableList<Int>` receiver satisfies a `List<Int>` bound
+            // through the table below, and equal args need no variance
+            // reasoning. Without this the non-star fallthrough returned
+            // `.unknown`, which refuted lexical local extensions on
+            // declared builtin receivers (`val l = mutableListOf<Int>()`
+            // then `fun List<Int>.f()` never bound).
+            if (self.staticBuiltinIdentity(receiver, actual) == .yes and
+                (staticTypeArgsEqual(receiver.args, param.args) or
+                    receiver.args.len == 0))
+            {
+                // An argless receiver is an erased derivation (see the
+                // same-classifier note in `staticTypeIsSubtypeInner`):
+                // the head relation decides and the unknown arguments
+                // must not disprove.
+                for (applicability.builtinSupersOf(actual)) |candidate| {
+                    if (std.mem.eql(u8, candidate, declared)) return .compatible;
+                }
+            }
             // All-star arguments prove and refute nothing (the star-erasure
             // convention): `List<String>` against `Collection<*>`
             // adjudicates by HEAD alone below.
@@ -3449,6 +3468,13 @@ pub const Module = struct {
             const actual_args = overrideArgs(actual);
             const declared_args = overrideArgs(declared);
             if (declared_args.len == 0) return true;
+            // An argless actual on the SAME classifier is an erased
+            // derivation (`mutableListOf<Int>()` derives `MutableList`
+            // with the call-site argument dropped), not proof of a
+            // different instantiation — unknown arguments must not
+            // disprove, per this judgment's own convention for
+            // statically unresolvable evidence.
+            if (actual_args.len == 0) return true;
             if (actual_args.len != declared_args.len) return false;
             const class = if (declared_id) |id|
                 (if (id.int() < self.classes.items.len) &self.classes.items[id.int()] else null)
@@ -3495,6 +3521,23 @@ pub const Module = struct {
                 if (!fits) return false;
             }
             return true;
+        }
+
+        // The builtin collection hierarchy adjudicates before the module
+        // class walk: the stdlib pack's List/MutableList classes carry
+        // ids whose `classIdIsOrExtends` rows do not encode the builtin
+        // subinterface edges, so the walk below refuted
+        // `MutableList <: List<Int>` and dropped lexical local
+        // extensions on declared builtin receivers. Equal arguments need
+        // no variance reasoning; an argless actual is an erased
+        // derivation and must not disprove.
+        if (self.staticBuiltinIdentity(actual, actual_head) == .yes and
+            (staticTypeArgsEqual(overrideArgs(actual), overrideArgs(declared)) or
+                overrideArgs(actual).len == 0))
+        {
+            for (applicability.builtinSupersOf(actual_head)) |candidate| {
+                if (std.mem.eql(u8, candidate, declared_head)) return true;
+            }
         }
 
         if (actual_id) |sub_id| {
