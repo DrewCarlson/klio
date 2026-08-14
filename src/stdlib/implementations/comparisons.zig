@@ -160,10 +160,10 @@ pub fn cmp_comparator_sam(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     const steps = try ctx.allocator.alloc(ComparatorStep, 1);
     steps[0] = .{ .selector = lam, .descending = false };
-    return .{ .ok = .{ .Comparator = .{
+    return .{ .ok = try Value.newComparator(ctx.allocator, .{
         .steps = try ObjRef([]ComparatorStep).init(ctx.allocator, steps),
         .descending = false,
-    } } };
+    }) };
 }
 
 pub fn cmp_compare_by(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -189,19 +189,19 @@ fn makeComparator(ctx: *CallCtx, descending: bool) std.mem.Allocator.Error!EvalR
     {
         const steps = try ctx.allocator.alloc(ComparatorStep, 1);
         steps[0] = .{ .selector = ctx.args[1], .descending = descending, .key_comparator = ctx.args[0] };
-        return .{ .ok = .{ .Comparator = .{
+        return .{ .ok = try Value.newComparator(ctx.allocator, .{
             .steps = try ObjRef([]ComparatorStep).init(ctx.allocator, steps),
             .descending = false,
-        } } };
+        }) };
     }
     const steps = try ctx.allocator.alloc(ComparatorStep, ctx.args.len);
     for (ctx.args, 0..) |arg, i| {
         steps[i] = .{ .selector = arg, .descending = descending };
     }
-    return .{ .ok = .{ .Comparator = .{
+    return .{ .ok = try Value.newComparator(ctx.allocator, .{
         .steps = try ObjRef([]ComparatorStep).init(ctx.allocator, steps),
         .descending = false,
-    } } };
+    }) };
 }
 
 pub fn cmp_compare_values(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -232,19 +232,19 @@ pub fn cmp_compare_values(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// natural order".
 pub fn comparator_natural_order(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const steps = try ctx.allocator.alloc(ComparatorStep, 0);
-    return .{ .ok = .{ .Comparator = .{
+    return .{ .ok = try Value.newComparator(ctx.allocator, .{
         .steps = try ObjRef([]ComparatorStep).init(ctx.allocator, steps),
         .descending = false,
-    } } };
+    }) };
 }
 
 /// `reverseOrder()` — an empty-step `Comparator` flagged `descending`.
 pub fn comparator_reverse_order(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const steps = try ctx.allocator.alloc(ComparatorStep, 0);
-    return .{ .ok = .{ .Comparator = .{
+    return .{ .ok = try Value.newComparator(ctx.allocator, .{
         .steps = try ObjRef([]ComparatorStep).init(ctx.allocator, steps),
         .descending = true,
-    } } };
+    }) };
 }
 
 // -------------------------------------------------------------------------
@@ -429,7 +429,7 @@ test "Comparator SAM wraps one step" {
     const r = try cmp_comparator_sam(&ctx);
     try testing.expect(r == .ok);
     try testing.expect(r.ok == .Comparator);
-    defer r.ok.Comparator.steps.deinit();
+    defer runtime.comparatorRefOf(r.ok.Comparator).deinit();
     defer testing.allocator.free(r.ok.Comparator.steps.asPtr().*);
     try testing.expectEqual(@as(usize, 1), r.ok.Comparator.steps.asPtr().*.len);
     try testing.expect(!r.ok.Comparator.descending);
@@ -462,7 +462,7 @@ test "compareBy tags steps ascending" {
     var ctx = makeCtx(h.host(), cap.output(), &.{ a, b });
     const r = try cmp_compare_by(&ctx);
     try testing.expect(r.ok == .Comparator);
-    defer r.ok.Comparator.steps.deinit();
+    defer runtime.comparatorRefOf(r.ok.Comparator).deinit();
     defer testing.allocator.free(r.ok.Comparator.steps.asPtr().*);
     const steps = r.ok.Comparator.steps.asPtr().*;
     try testing.expectEqual(@as(usize, 2), steps.len);
@@ -480,7 +480,7 @@ test "compareByDescending tags steps descending" {
     var ctx = makeCtx(h.host(), cap.output(), &.{a});
     const r = try cmp_compare_by_descending(&ctx);
     try testing.expect(r.ok == .Comparator);
-    defer r.ok.Comparator.steps.deinit();
+    defer runtime.comparatorRefOf(r.ok.Comparator).deinit();
     defer testing.allocator.free(r.ok.Comparator.steps.asPtr().*);
     const steps = r.ok.Comparator.steps.asPtr().*;
     try testing.expectEqual(@as(usize, 1), steps.len);
@@ -496,6 +496,7 @@ test "naturalOrder and reverseOrder build empty-step comparators" {
 
     var ctx = makeCtx(h.host(), cap.output(), &.{});
     const nat = try comparator_natural_order(&ctx);
+    defer runtime.comparatorRefOf(nat.ok.Comparator).deinit();
     try testing.expect(nat.ok == .Comparator);
     defer nat.ok.Comparator.steps.deinit();
     defer testing.allocator.free(nat.ok.Comparator.steps.asPtr().*);
@@ -503,6 +504,7 @@ test "naturalOrder and reverseOrder build empty-step comparators" {
     try testing.expect(!nat.ok.Comparator.descending);
 
     const rev = try comparator_reverse_order(&ctx);
+    defer runtime.comparatorRefOf(rev.ok.Comparator).deinit();
     try testing.expect(rev.ok == .Comparator);
     defer rev.ok.Comparator.steps.deinit();
     defer testing.allocator.free(rev.ok.Comparator.steps.asPtr().*);

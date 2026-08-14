@@ -506,6 +506,29 @@ pub const MapEntryData = struct {
     }
 };
 
+/// The boxed payload of `Value.Comparator` (see `MapData` for the scheme).
+pub const ComparatorData = struct {
+    steps: ObjRef([]ComparatorStep),
+    descending: bool,
+
+    pub fn deinit(self: *ComparatorData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.steps.deinit();
+    }
+
+    pub fn gcTrace(self: *const ComparatorData, m: *objcell.gc.Marker) void {
+        m.shade(&self.steps.cell.hdr);
+    }
+};
+
+/// The control-block handle behind a boxed `Value.Comparator` payload.
+pub const ComparatorRef = ObjRef(ComparatorData);
+
+/// Recover the owning control block from a boxed payload pointer.
+pub inline fn comparatorRefOf(c: *ComparatorData) ComparatorRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", c)) };
+}
+
 /// The boxed payload of `Value.Pair` (see `MapData` for the scheme).
 pub const PairData = struct {
     first: ValueBox,
@@ -1978,11 +2001,9 @@ pub const Value = union(enum) {
         ok: bool,
         payload: ValueBox,
     },
-    /// `kotlin.Comparator<T>`.
-    Comparator: struct {
-        steps: ObjRef([]ComparatorStep),
-        descending: bool,
-    },
+    /// `kotlin.Comparator<T>`. Boxed like `Map` (see `ComparatorData`);
+    /// construct with `Value.newComparator`.
+    Comparator: *ComparatorData,
     /// A user-declared class.
     Class: ObjRef(ClassDef),
     /// A live instance of a user-declared class.
@@ -2070,7 +2091,7 @@ pub const Value = union(enum) {
             .StringBuilder => |s| visitor.visit(s),
             .Cell => |c| visitor.visit(c),
             .IrClosure => |c| visitor.visit(c.captures),
-            .Comparator => |c| visitor.visit(c.steps),
+            .Comparator => |c| visitor.visit(comparatorRefOf(c)),
             .List => |x| visitor.visit(listRefOf(x)),
             .Set => |x| visitor.visit(setRefOf(x)),
             .Array => |x| switch (x.storage()) {
@@ -2153,6 +2174,13 @@ pub const Value = union(enum) {
     pub fn newMatchGroup(allocator: std.mem.Allocator, data: MatchGroupData) std.mem.Allocator.Error!Value {
         const ref = try MatchGroupRef.initOwned(allocator, data);
         return .{ .MatchGroup = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `Comparator` payload; the only way to construct
+    /// a `.Comparator`.
+    pub fn newComparator(allocator: std.mem.Allocator, data: ComparatorData) std.mem.Allocator.Error!Value {
+        const ref = try ComparatorRef.initOwned(allocator, data);
+        return .{ .Comparator = &ref.cell.data };
     }
 
     /// Allocate the boxed `Pair` payload; the only way to construct a
@@ -2272,7 +2300,7 @@ pub const Value = union(enum) {
             // `releaseSliceElems` already drops the slice handle (its tail
             // `slice.deinit()`); do not deinit it again.
             .IrClosure => |c| releaseSliceElems(c.captures, allocator),
-            .Comparator => |c| c.steps.deinit(),
+            .Comparator => |c| comparatorRefOf(c).deinit(),
             .List => |x| {
                 if (objcell.envSetOnce("KLIO_BOXDIE_TRACE") and x.backing != null and
                     listRefOf(x).cell.refcount.load(.monotonic) == 1)

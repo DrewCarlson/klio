@@ -7383,7 +7383,7 @@ fn comparatorMember(self: *VmHost, allocator: Allocator, receiver: *const Value,
         @memcpy(chain[0..sg.get().len], sg.get().*);
         chain[sg.get().len] = .{ .selector = args[0], .descending = std.mem.eql(u8, name, "thenByDescending") };
         sg.deinit();
-        return .{ .ok = .{ .Comparator = .{ .steps = try ObjRef([]ComparatorStep).init(allocator, chain), .descending = cmp.descending } } };
+        return .{ .ok = try Value.newComparator(allocator, .{ .steps = try ObjRef([]ComparatorStep).init(allocator, chain), .descending = cmp.descending }) };
     }
     if ((std.mem.eql(u8, name, "then") or std.mem.eql(u8, name, "thenComparing") or
         std.mem.eql(u8, name, "thenDescending") or std.mem.eql(u8, name, "thenComparator")) and args.len == 1)
@@ -7400,7 +7400,7 @@ fn comparatorMember(self: *VmHost, allocator: Allocator, receiver: *const Value,
                 }
                 og.deinit();
                 sg.deinit();
-                return .{ .ok = .{ .Comparator = .{ .steps = try ObjRef([]ComparatorStep).init(allocator, chain), .descending = cmp.descending } } };
+                return .{ .ok = try Value.newComparator(allocator, .{ .steps = try ObjRef([]ComparatorStep).init(allocator, chain), .descending = cmp.descending }) };
             },
             .IrClosure => {
                 const sg = cmp.steps.borrow();
@@ -7408,13 +7408,13 @@ fn comparatorMember(self: *VmHost, allocator: Allocator, receiver: *const Value,
                 @memcpy(chain[0..sg.get().len], sg.get().*);
                 chain[sg.get().len] = .{ .selector = args[0], .descending = invert };
                 sg.deinit();
-                return .{ .ok = .{ .Comparator = .{ .steps = try ObjRef([]ComparatorStep).init(allocator, chain), .descending = cmp.descending } } };
+                return .{ .ok = try Value.newComparator(allocator, .{ .steps = try ObjRef([]ComparatorStep).init(allocator, chain), .descending = cmp.descending }) };
             },
             else => {},
         }
     }
     if (std.mem.eql(u8, name, "reversed") and args.len == 0) {
-        return .{ .ok = .{ .Comparator = .{ .steps = cmp.steps.clone(), .descending = !cmp.descending } } };
+        return .{ .ok = try Value.newComparator(allocator, .{ .steps = cmp.steps.clone(), .descending = !cmp.descending }) };
     }
     return null;
 }
