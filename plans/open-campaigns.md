@@ -187,14 +187,31 @@ the campaign opens (`COROUTINE-MODEL.md` is the architecture reference).
       is the same seating. Full trace anatomy in triage memory (62).
 - [ ] Cancellation cluster (flow campaign residue)
 - [ ] Unconfined event loop (= createEventLoop debt)
-- [ ] tl_atomic_update_contended litmus flake (timeout under load)
-- [ ] tl_yield_cross_thread_teardown litmus flake (the every-battery
-      43/44; rc=0 with a missed teardown yield)
+- [ ] tl_atomic_update_contended litmus flake (timeout under load;
+      the sweep now prints got-vs-expected tails, so the next natural
+      occurrence is postmortem-able)
+- [x] tl_yield_cross_thread_teardown "flake" was the litmus sweep's
+      expectation PARSER stopping at the first code line (bottom-of-
+      file //> lines read as empty). Fixed; litmus baseline is now
+      45/45 — any litmus failure is REAL.
+- [x] The recorded #10 five-actor channel deadlock was the LOOP JIT
+      dropping a suspended loop frame from the continuation (fixed;
+      litmus guard tl_channel_jit_send_loop.kt) and the park/resume
+      empty-TailSeg leak is fixed too (chains hold at one segment;
+      ratchet 1353 with DNC classes 3 -> 2).
+- [x] Stale-killed on re-verification: with_timeout preempt,
+      private_shadow val+var, atomicfu SupervisorJob CAS. Unconfined
+      yield ORDER needs a kotlinc oracle before it can be called a bug
+      (klio: U1 U2 L1 L2).
 - [ ] Background-yield 55s cost (suite-perf memory)
 - [ ] CompositionTests.testCompositionAndRecomposerDeadlock +
       PausableCompositionTests.markInvalidFromBackgroundThread — both
-      eat the 300s wall cap solo (background-thread scheduling /
-      teardown deadlock family; from the compose DNC audit)
+      eat the 300s wall cap solo. STALL SHAPE CAPTURED (straggler1):
+      the runTest watchdog parks on TestCoroutineScheduler.
+      receiveDispatchEvent while the test body's join never completes —
+      a REAL background-thread Recomposer's dispatch event never
+      reaches the virtual scheduler's channel. The cross-thread corner
+      of the receiver/dispatch campaign.
 
 State: not started.
 
