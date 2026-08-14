@@ -85,7 +85,7 @@ practice.
 
 State: DONE — floor recorded here and in memory.
 
-## HANDOVER NOTE (Value=24 landed, verification IN FLIGHT)
+## HANDOVER NOTE (Value=24 VERIFIED)
 
 The whole 24B tier is done: Triple boxed, MatchGroup boxed (shared
 descriptor struct), Intrinsic INTERNED (immortal records — no refcount,
@@ -93,10 +93,9 @@ no GC), Array REPACKED (the boxed/scalars tag was derivable from
 `prim == null`, so the payload is (cell ptr, prim) with storage()
 rebuilding typed handles). Census: Value 32 -> 24, NO payload >= 24.
 rangebench 82.6s (band 83.0-83.7 — neutral/slightly better); units
-zero-leak; hello smoke green. IN FLIGHT: quick-gate + compose warm/
-slice + plugin ratchet for the four tier commits — read its result
-before the next wave (watch the GC-stress step; the box-cell-shading
-lesson is baked into every new gcTrace).
+zero-leak; hello smoke green. VERIFIED: sweep 117/0, corpus + compose slice at
+baseline, litmus 43/44 (only the yield flake), plugin ratchet 1339
+(ABOVE the 1337 baseline; the GC-stress step green).
 NEXT for Value=16: the remaining >8B payloads (Pair 16, IrClosure 24?,
 Function 16, Instance?, String?, Result...) — re-run the census with
 the threshold at >8 to enumerate; pair the wave with the transpiler
