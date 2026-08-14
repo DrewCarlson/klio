@@ -93,10 +93,14 @@ root lesson, repeated and now guarded by the suite's GC-stress step) and
 the plugin ratchet is back at 1337. Value=32 stands fully verified:
 units zero-leak, sweep 117/0, corpus + compose slice at baseline,
 rangebench neutral, ratchet 1337.
-Triple + MatchGroup boxed (units green). LAST TWO: Intrinsic — its fqn
-is a static program-lifetime string, so consider INTERNING (one immortal
-cell per (fqn,func) pair, no refcount) over plain boxing; and Array
-(ArrayData storage union — loop-hot, measure-first). Then (superseded:
+Triple + MatchGroup boxed (units green). Intrinsic INTERNED (immortal
+records, done). LAST ONE: Array — ArrayData {storage: ArrayStore
+(2-variant union of ObjRef handles, 16B), prim: ?PrimitiveArrayKind}.
+prim is PER-VALUE view state (views share the cell with different prim)
+so it cannot fold into the cell; repack instead to a 16B struct
+{ptr: *Cell, tag: u8, prim: u8-encoded-optional} rebuilding the typed
+handle at use — many arr.storage switch sites, loop-hot, measure-first
+on rangebench + an array-heavy example. Lands Value=24. Then (superseded:
 then Pair/IrClosure/Function/...) for Value=16, paired with the
 transpiler hot-view sub-ABI so scalar offsets freeze once; then the
 rangebench speedup number. Items 2-4 follow per their sections.
