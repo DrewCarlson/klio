@@ -147,8 +147,29 @@ plans in memory klio-compose-plugin-triage.
 Scattered, each half-diagnosed. No single plan doc yet — write one when
 the campaign opens (`COROUTINE-MODEL.md` is the architecture reference).
 
-- [ ] with_timeout preempt
-- [ ] private_shadow cells
+- [x] with_timeout preempt — STALE: re-verified passing
+      (withTimeoutOrNull(5){delay(50)} = null, standalone and nested
+      under coroutineScope / withTimeout; fixed by intervening work).
+- [x] private_shadow cells — STALE: both val and var shapes print the
+      exact kotlinc outputs (distinct per-class cells).
+- [ ] CHANNEL SEGMENT-ROTATION BREAK (root of the recorded #10
+      deadlock; minimal repro plans/repros/
+      channel_segment_rotation_break.kt): plain runBlocking + launch +
+      Channel(4), NO threads — send/receive works for exactly 67
+      items, item 68+ never arrives (receive returns a bogus zero;
+      sum saturates at 2278; large N deadlocks both sides parked).
+      SEGMENT_SIZE=32, capacity 4: the 68th cell sits past the second
+      channel segment + expandBuffer offset — the BufferedChannel
+      segment-list rotation (findSegmentAndMoveForward CAS over the
+      atomicfu segment pointers) breaks under klio's shims even
+      single-threaded (a CAS comparing copied shim values never
+      advancing would strand the receiver on a stale segment). The
+      OLD 5-actor Dispatchers.Default deadlock story was a red
+      herring — cross-thread machinery (resumeExternal, mailboxes)
+      all worked in the traces. SIDE FIND: every park/resume cycle
+      leaks one EMPTY TailSeg onto the suspend-state chain
+      (routeResumedResult re-wraps; promotion never frees empties
+      eagerly) — benign-looking but unbounded.
 - [ ] Cancellation cluster (flow campaign residue)
 - [ ] Unconfined event loop (= createEventLoop debt)
 - [ ] tl_atomic_update_contended litmus flake (timeout under load)
