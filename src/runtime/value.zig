@@ -506,6 +506,34 @@ pub const MapEntryData = struct {
     }
 };
 
+/// The boxed payload of `Value.Triple` (see `MapData` for the scheme).
+pub const TripleData = struct {
+    first: ValueBox,
+    second: ValueBox,
+    third: ValueBox,
+
+    pub fn deinit(self: *TripleData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.first.deinit();
+        self.second.deinit();
+        self.third.deinit();
+    }
+
+    pub fn gcTrace(self: *const TripleData, m: *objcell.gc.Marker) void {
+        m.shade(&self.first.cell.hdr);
+        m.shade(&self.second.cell.hdr);
+        m.shade(&self.third.cell.hdr);
+    }
+};
+
+/// The control-block handle behind a boxed `Value.Triple` payload.
+pub const TripleRef = ObjRef(TripleData);
+
+/// Recover the owning control block from a boxed payload pointer.
+pub inline fn tripleRefOf(t: *TripleData) TripleRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", t)) };
+}
+
 /// The control-block handle behind a boxed `Value.MapEntry` payload.
 pub const MapEntryRef = ObjRef(MapEntryData);
 
@@ -1872,7 +1900,9 @@ pub const Value = union(enum) {
     /// `kotlin.Pair`.
     Pair: struct { first: ValueBox, second: ValueBox },
     /// `kotlin.Triple`.
-    Triple: struct { first: ValueBox, second: ValueBox, third: ValueBox },
+    /// `kotlin.Triple`. Boxed like `Map` (see `TripleData`); construct
+    /// with `Value.newTriple`.
+    Triple: *TripleData,
     /// `kotlin.collections.Map.Entry`.
     /// `kotlin.collections.Map.Entry`. Boxed like `Map` (see
     /// `MapEntryData`); construct with `Value.newMapEntry`. Copies share
@@ -2006,11 +2036,7 @@ pub const Value = union(enum) {
                 visitor.visit(p.first);
                 visitor.visit(p.second);
             },
-            .Triple => |t| {
-                visitor.visit(t.first);
-                visitor.visit(t.second);
-                visitor.visit(t.third);
-            },
+            .Triple => |t| visitor.visit(tripleRefOf(t)),
             .MapEntry => |e| visitor.visit(mapEntryRefOf(e)),
             .Result => |r| visitor.visit(r.payload),
             .BoundMethod => |m| visitor.visit(boundMethodRefOf(m)),
@@ -2052,6 +2078,13 @@ pub const Value = union(enum) {
     /// construct an `.Iterator`.
     pub fn newIterator(allocator: std.mem.Allocator, data: IterCursor) std.mem.Allocator.Error!Value {
         return .{ .Iterator = try ObjRef(IterCursor).init(allocator, data) };
+    }
+
+    /// Allocate the boxed `Triple` payload; the only way to construct a
+    /// `.Triple`.
+    pub fn newTriple(allocator: std.mem.Allocator, data: TripleData) std.mem.Allocator.Error!Value {
+        const ref = try TripleRef.initOwned(allocator, data);
+        return .{ .Triple = &ref.cell.data };
     }
 
     /// Allocate the boxed `MapEntry` payload; the only way to construct a
@@ -2192,11 +2225,7 @@ pub const Value = union(enum) {
                 p.first.deinit();
                 p.second.deinit();
             },
-            .Triple => |t| {
-                t.first.deinit();
-                t.second.deinit();
-                t.third.deinit();
-            },
+            .Triple => |t| tripleRefOf(t).deinit(),
             .MapEntry => |e| mapEntryRefOf(e).deinit(),
             .Result => |r| r.payload.deinit(),
             .BoundMethod => |m| boundMethodRefOf(m).deinit(),

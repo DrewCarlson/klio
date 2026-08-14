@@ -331,11 +331,11 @@ fn makePair(a: Allocator, first: Value, second: Value) Error!Value {
 }
 
 fn makeTriple(a: Allocator, first: Value, second: Value, third: Value) Error!Value {
-    return .{ .Triple = .{
+    return try Value.newTriple(a, .{
         .first = try Value.boxRef(a, first),
         .second = try Value.boxRef(a, second),
         .third = try Value.boxRef(a, third),
-    } };
+    });
 }
 
 /// `make_exception(fqn, message)` -> a thrown-ready `Value::Exception`.
