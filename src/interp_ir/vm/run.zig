@@ -50,7 +50,7 @@ pub fn vmNew(allocator: Allocator, module: ObjRef(Module)) Allocator.Error!Vm {
     var env = Env.init(allocator);
     for (stdlib.IMPLICIT_ALIASES) |alias| {
         if (stdlib.implementation(alias.fqn)) |func| {
-            try env.define(alias.name, .{ .Intrinsic = .{ .fqn = alias.fqn, .func = func } });
+            try env.define(alias.name, Value.internIntrinsic(alias.fqn, func));
         }
     }
     const globals = try ObjRef(Env).init(allocator, env);

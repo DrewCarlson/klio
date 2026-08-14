@@ -526,6 +526,16 @@ pub const TripleData = struct {
     }
 };
 
+/// The interned payload of `Value.Intrinsic`: program-lifetime, never
+/// freed, invisible to the refcount and the collector.
+pub const IntrinsicData = struct {
+    fqn: []const u8,
+    func: StdlibFn,
+};
+
+var intrinsic_intern_mutex: objcell.SpinMutex = .{};
+var intrinsic_intern: ?std.StringHashMap(*const IntrinsicData) = null;
+
 /// The control-block handle behind a boxed `Value.MatchGroup` payload
 /// (the payload struct is `MatchGroupData`, shared with `MatchData`'s
 /// group descriptors).
@@ -1883,10 +1893,11 @@ pub const Value = union(enum) {
         decl: *const ast.Function,
         env: ObjRef(Env),
     },
-    Intrinsic: struct {
-        fqn: []const u8,
-        func: StdlibFn,
-    },
+    /// A stdlib function value. The payload is an INTERNED program-
+    /// lifetime record (`Value.internIntrinsic`): the fqn is a static
+    /// string and the pair never dies, so copies carry one pointer and
+    /// neither the refcount nor the collector ever touches it.
+    Intrinsic: *const IntrinsicData,
     /// IR-side closure handle.
     IrClosure: struct {
         id: u64,
@@ -2094,6 +2105,22 @@ pub const Value = union(enum) {
     /// construct an `.Iterator`.
     pub fn newIterator(allocator: std.mem.Allocator, data: IterCursor) std.mem.Allocator.Error!Value {
         return .{ .Iterator = try ObjRef(IterCursor).init(allocator, data) };
+    }
+
+    /// Intern the (fqn, func) pair; the only way to construct an
+    /// `.Intrinsic`. Immortal: allocation failure here is fatal.
+    pub fn internIntrinsic(fqn: []const u8, func: StdlibFn) Value {
+        intrinsic_intern_mutex.lock();
+        defer intrinsic_intern_mutex.unlock();
+        const a = std.heap.page_allocator;
+        if (intrinsic_intern == null) intrinsic_intern = std.StringHashMap(*const IntrinsicData).init(a);
+        const gop = intrinsic_intern.?.getOrPut(fqn) catch @panic("intrinsic intern");
+        if (!gop.found_existing) {
+            const d = a.create(IntrinsicData) catch @panic("intrinsic intern");
+            d.* = .{ .fqn = fqn, .func = func };
+            gop.value_ptr.* = d;
+        }
+        return .{ .Intrinsic = gop.value_ptr.* };
     }
 
     /// Allocate the boxed `MatchGroup` payload; the only way to construct
