@@ -3947,7 +3947,7 @@ fn routeResumedResult(
         .ok => |v| carry.* = v,
         .err => |e| switch (e) {
             .Suspended => |inner| {
-                if (head < frames.items.len or tails.* != null) {
+                if (head < frames.items.len) {
                     const seg = try allocator.create(TailSeg);
                     seg.* = .{ .frames = frames.*, .head = head, .next = tails.* };
                     frames.* = .empty;
@@ -3958,6 +3958,15 @@ fn routeResumedResult(
                     var slot: *?*TailSeg = &inner.tails;
                     while (slot.*) |t| slot = &t.next;
                     slot.* = seg;
+                } else if (tails.* != null) {
+                    // This list is drained: hand the inherited chain through
+                    // WITHOUT wrapping an empty segment around it — every
+                    // park/resume cycle of a suspending loop otherwise grew
+                    // the parked state's chain by one dead segment, forever.
+                    var slot: *?*TailSeg = &inner.tails;
+                    while (slot.*) |t| slot = &t.next;
+                    slot.* = tails.*;
+                    tails.* = null;
                 }
                 return .{ .done = errResult(.{ .Suspended = inner }) };
             },
