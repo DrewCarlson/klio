@@ -2272,9 +2272,16 @@ const Walker = struct {
             .implicit_it = false,
             .span = lam.span,
         } };
-        const rem_args = w.a.alloc(Expr, keys.items.len + 1) catch @panic("oom");
+        const rem_args = w.a.alloc(Expr, keys.items.len + 3) catch @panic("oom");
         @memcpy(rem_args[0..keys.items.len], keys.items);
         rem_args[keys.items.len] = calc;
+        // Threaded with the composer pair, exactly like the
+        // rememberComposableLambda wrap: the emitted call then names the
+        // one `remember` overload whose arity matches (keys + calculation
+        // + pair), so qualified-call lowering binds it precisely instead
+        // of the first-registered overload.
+        rem_args[keys.items.len + 1] = w.composerRef();
+        rem_args[keys.items.len + 2] = w.b.intLit(0);
         // Fully qualified: the synthesized call lands in USER-file import
         // scope, which need not import `remember` (upstream
         // BoxWithConstraints.kt uses no remember of its own).

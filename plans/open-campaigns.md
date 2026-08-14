@@ -50,6 +50,24 @@ both suite-level (plugin conformance ratchet):
       module (test-file lowering ran an alternate emission), so
       standalone repros pass pre-fix — in-situ probe (println in
       SlotTable.kt + pack rebuild) was the discriminator.
+- [x] GroupSizeValidationTests 2 -> 4/5 (uncommitted stretch): two roots.
+      (a) file-private classifier refutation — staticReceiverCompatibility
+      resolved an unqualified declared head (`Modifier`) module-wide
+      (unique-name = null, or the wrong package's namesake), refuting the
+      right overload; now resolves in the DECLARATION's file scope
+      (exact import, then decl-package FQN — the mangled `$fN` class's
+      fqn stays clean — then classIdIndexed). (b) the plugin's
+      strong-skipping memo wrap emitted qualified-Path
+      `androidx.compose.runtime.remember(keys..., calc)` UNTHREADED,
+      which lowered through the arity-blind global-value route and
+      invoked the 0-key overload with junk args; the wrap now appends
+      the composer pair, multi-segment Path callees route through the
+      FQN flatten/global-fit lowering, and the flatten's exact-arity
+      match skips vararg decls (fixed-arity wins, Kotlin rule).
+- [ ] checkboxLike = the SLOT-EXACT emission anchor: klio emits 21
+      slots memo-off / 24 memo-on vs kotlinc's 18 cap (groups fine at
+      6 <= 8). The excess predates memoization — this is the measuring
+      stick for the group/slot emission-shape debt below.
 - [ ] movableContentOf factory wrap: kotlinc wraps factory-returned
       composable lambdas in composableLambdaInstance (key, tracked,
       wrapper) so every content(n) call site gets a restart group

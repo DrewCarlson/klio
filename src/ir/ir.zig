@@ -3232,8 +3232,38 @@ pub const Module = struct {
             if (!all_star) return .unknown;
         }
         if (self.staticTypeClassId(receiver)) |actual_id| {
-            if (self.staticTypeClassId(param)) |declared_id| {
-                if (self.classIdIsOrExtends(actual_id, declared_id)) return .compatible;
+            // An unqualified declared head means whatever the DECLARATION's
+            // own file scope says (a test file's private `Modifier` beside
+            // the shipped androidx one), so the decl-file resolution is the
+            // authoritative one; the module-unique lookup is the fallback
+            // for declarations with no recorded source.
+            const decl_scoped: ?ClassId = blk: {
+                if (std.mem.indexOfScalar(u8, param.name, '.') != null) break :blk null;
+                const decl_id = fid orelse break :blk null;
+                const decl_source = self.decl_span.get(decl_id.int()) orelse break :blk null;
+                const decl_pkg = if (self.funcById(decl_id)) |df| df.package else "";
+                // Kotlin scope order: an exact import outranks the
+                // declaring package. The same-package FQN probe is what
+                // reaches a collision-mangled file-private classifier —
+                // its `class_index` entry carries the `$fN` mangle, so the
+                // simple-name candidates `classIdIndexed` ranks never
+                // contain it, but its FQN stays clean.
+                if (self.classIdExactImport(declared, decl_source.file)) |cid| break :blk cid;
+                if (decl_pkg.len != 0 and declared.len < 200) {
+                    var fqn_buf: [256]u8 = undefined;
+                    if (std.fmt.bufPrint(&fqn_buf, "{s}.{s}", .{ decl_pkg, declared })) |fqn| {
+                        if (self.classIdByFqn(fqn)) |cid| break :blk cid;
+                    } else |_| {}
+                }
+                break :blk self.classIdIndexed(declared, decl_pkg, decl_source.file);
+            };
+            if (bargTraceEnv() != null) {
+                const afqn = if (idGet(Class, self.classes.items, actual_id.int())) |c| c.fqn else "?";
+                const dfqn = if (decl_scoped) |d| (if (idGet(Class, self.classes.items, d.int())) |c| c.fqn else "?") else "-";
+                std.debug.print("[barg-ids] actual={s}->{d}({s}) declared={s} decl_scoped={?d}({s}) unique={?d} fid={?d}\n", .{ receiver.name, actual_id.int(), afqn, param.name, if (decl_scoped) |d| d.int() else null, dfqn, if (self.staticTypeClassId(param)) |d| d.int() else null, if (fid) |f| f.int() else null });
+            }
+            if (decl_scoped orelse self.staticTypeClassId(param)) |did| {
+                if (self.classIdIsOrExtends(actual_id, did)) return .compatible;
             }
         }
         const actual_builtin = self.staticBuiltinIdentity(receiver, actual);
@@ -9033,7 +9063,10 @@ pub const Module = struct {
                     score,
                     ctx.actual_type_param_bounds,
                 );
-            if (static_compatibility == .incompatible) continue;
+            if (static_compatibility == .incompatible) {
+                if (drop_trace) std.debug.print("[drop] {s}#{d} static-incompatible\n", .{ name, id.int() });
+                continue;
+            }
             const tier: u8 = if (kind == .member_extension or kind == .instance_method)
                 0
             else

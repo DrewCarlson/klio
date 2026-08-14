@@ -7279,15 +7279,22 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // callee names a class, so construct it — before the function-FQN and
     // member-fallback paths, which would otherwise read the package head as a
     // field of the implicit receiver (`get_field app on this`).
+    // A multi-segment Path callee is the same dotted-FQN shape (the compose
+    // pass synthesizes `androidx.compose.runtime.remember(...)` that way);
+    // routing it here gives the qualified call the same overload-precise
+    // binding the parsed Member form gets, instead of a first-registered
+    // global value call.
+    const dotted_callee = callee.* == .Member or
+        (callee.* == .Path and callee.Path.segments.len >= 2);
     if (callee.* == .Member) {
         if (try lowerFqnCtorCall(b, expr)) |r| return r;
     }
     // Package-qualified call to a user / pack top-level function.
-    if (callee.* == .Member) {
+    if (dotted_callee) {
         if (try lowerFqnFlattenCall(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
     }
     // Fully-qualified callee resolved as a global, CallValue.
-    if (callee.* == .Member) {
+    if (dotted_callee) {
         if (try lowerFqnGlobalCall(b, callee, args, ast_arg_names)) |r| return r;
     }
 
@@ -14063,6 +14070,9 @@ fn resolveCallWithComposerAbi(
         false,
         ctx,
     );
+    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name)) std.debug.print("[abi-retry] {s} threaded_target={?d} reason={?s} tier={d} tier_count={d}\n", .{ name, if (threaded.target) |t| t.int() else null, if (threaded.reason) |r| @tagName(r) else null, threaded.tier, threaded.tier_count });
+    }
     if (threaded.target) |target| {
         if (b.module.funcById(target)) |f| {
             if (selectedCallHasComposerAbi(b.module, target, f)) {
@@ -17104,6 +17114,18 @@ fn lowerFqnFlattenCall(
         for (cands) |fid| {
             const f = b.module.funcById(fid) orelse continue;
             if (std.mem.eql(u8, f.fqn, fqn) and f.params.len == want) {
+                // A vararg declaration's param count is not an exact arity
+                // (`remember(vararg keys, calc)` at 4 params ties the
+                // 1-key fixed overload); Kotlin prefers the fixed-arity
+                // declaration, so only those count as exact here.
+                var has_vararg = false;
+                for (f.params) |p| {
+                    if (p.is_vararg) {
+                        has_vararg = true;
+                        break;
+                    }
+                }
+                if (has_vararg) continue;
                 if (pick == null) pick = fid;
                 fqn_arity_matches += 1;
             }
