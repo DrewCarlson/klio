@@ -600,8 +600,11 @@ pub const FuncBuilder = struct {
     /// at the call site, as it does for top-level functions.
     local_fn_param_tys: std.StringHashMap([]const ?[]const u8),
     /// Subset of `local_fns` declared as extensions (`fun R.f(...)`);
-    /// a bare call must prepend the implicit receiver as `this`.
-    local_ext_fns: StringSet,
+    /// a bare call must prepend the implicit receiver as `this`. The value
+    /// is the declared VALUE-parameter count (receiver excluded), carried
+    /// into nested lambda builders so a bare `::ref` to a captured local
+    /// ext fn can eta-expand at the right arity; -1 when unknown.
+    local_ext_fns: std.StringHashMap(i8),
     /// Locals (own or inherited from enclosing scopes) whose declared type
     /// or literal initializer proves the binding is NOT callable (`var key
     /// = 0`). A bare CALL of such a name never routes through the captured
@@ -883,7 +886,7 @@ pub const FuncBuilder = struct {
             .local_init_exprs = std.StringHashMap(*const ast.Expr).init(allocator),
             .local_init_name_free = std.StringHashMap(void).init(allocator),
             .local_init_decl_spans = std.StringHashMap(ast.Span).init(allocator),
-            .local_ext_fns = StringSet.init(allocator),
+            .local_ext_fns = std.StringHashMap(i8).init(allocator),
             .nonfn_locals = StringSet.init(allocator),
             .local_fn_overloads = std.StringHashMap(std.ArrayList(LocalFnOverload)).init(allocator),
             .receiver_lambda_params = StringSet.init(allocator),
@@ -2160,8 +2163,15 @@ pub const FuncBuilder = struct {
             }
         }
     }
-    pub fn markLocalExtFn(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
-        try self.local_ext_fns.put(name, {});
+    pub fn markLocalExtFn(self: *FuncBuilder, name: []const u8, arity: i8) Allocator.Error!void {
+        try self.local_ext_fns.put(name, arity);
+    }
+    /// Declared value-parameter count of a local extension fn (receiver
+    /// excluded); null when the name is not a local ext fn or the count
+    /// was not recorded.
+    pub fn localExtFnArity(self: *const FuncBuilder, name: []const u8) ?i8 {
+        const a = self.local_ext_fns.get(name) orelse return null;
+        return if (a >= 0) a else null;
     }
     pub fn isLocalExtFn(self: *const FuncBuilder, name: []const u8) bool {
         return self.local_ext_fns.contains(name);
@@ -2243,16 +2253,19 @@ pub const FuncBuilder = struct {
     }
     /// The local-extension-function names this builder knows. The caller
     /// owns the returned set.
-    pub fn localExtFnNames(self: *const FuncBuilder) Allocator.Error!StringSet {
-        return cloneStringSet(self.allocator, &self.local_ext_fns);
+    pub fn localExtFnNames(self: *const FuncBuilder) Allocator.Error!std.StringHashMap(i8) {
+        var out = std.StringHashMap(i8).init(self.allocator);
+        var it = self.local_ext_fns.iterator();
+        while (it.next()) |e| try out.put(e.key_ptr.*, e.value_ptr.*);
+        return out;
     }
     /// Seed this builder's local-extension-function set from an enclosing
     /// scope's, so a captured local ext fn called bare in a nested lambda
     /// still gets the enclosing receiver prepended. Copies the names; the
     /// caller keeps ownership of `names`.
-    pub fn inheritLocalExtFns(self: *FuncBuilder, names: *const StringSet) Allocator.Error!void {
-        var it = names.keyIterator();
-        while (it.next()) |k| try self.local_ext_fns.put(k.*, {});
+    pub fn inheritLocalExtFns(self: *FuncBuilder, names: *const std.StringHashMap(i8)) Allocator.Error!void {
+        var it = names.iterator();
+        while (it.next()) |e| try self.local_ext_fns.put(e.key_ptr.*, e.value_ptr.*);
     }
     pub fn markNonFnLocal(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.nonfn_locals.put(name, {});

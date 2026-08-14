@@ -521,7 +521,10 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             try b.bind(mangled, home);
             try b.markBoxed(mangled);
             try b.markLocalFn(mangled);
-            if (f.receiver_type != null) try b.markLocalExtFn(mangled);
+            if (f.receiver_type != null) {
+                const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name.name, "this")) 1 else 0;
+                try b.markLocalExtFn(mangled, @intCast(@min(f.params.len - recv_off, 127)));
+            }
             if (f.params.len != 0) try b.setLocalFnParamTys(mangled, ov_tys);
             if (f.return_type) |*rt| {
                 try b.setLocalFnReturnTy(mangled, try expr_mod.loweredOwnedLocalTypeRef(b, rt));
@@ -801,7 +804,8 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         }
         if (!name_is_property) try b.markLocalFn(f.name.name);
         if (is_ext and !name_is_property) {
-            try b.markLocalExtFn(f.name.name);
+            const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name.name, "this")) 1 else 0;
+            try b.markLocalExtFn(f.name.name, @intCast(@min(f.params.len - recv_off, 127)));
         }
         // Record positional parameter type names (drop a leading `this`
         // receiver) so a literal argument coerces to a numeric primitive

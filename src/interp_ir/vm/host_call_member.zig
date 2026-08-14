@@ -3051,6 +3051,13 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
         switch (arg.*) {
             .String, .Bool, .Char, .Byte, .Short, .Int, .Long, .Float, .Double, .UByte, .UShort, .UInt, .ULong => return true,
             .List, .Set, .Map, .Range => return overload_match.valueDefinitelyNot(self, param_ty, arg),
+            // An Array satisfies no non-array container head (an
+            // `Array<Pair>` is never a `Map`, so `putAll(pairs)` inside the
+            // stdlib `plusAssign` drops the builder's member `putAll(Map)`
+            // and the `Array<out Pair>` extension binds). The array-modeled
+            // interfaces (`Iterable`/`Collection`/...) and array-named
+            // params stay non-definite, same as the nominal arm below.
+            .Array => return std.mem.indexOf(u8, pn, "Array") == null and !isArrayRelatedIface(pn),
             // An Instance falls through to the hierarchy walk below: a
             // user class that never reaches the container head in its
             // supertype closure is definite (a `RangesSpecifier` is not a
@@ -9108,6 +9115,27 @@ pub fn resolveMemberFuncId(self: *VmHost, allocator: Allocator, receiver: *const
 /// `cont.tryResume(onCancellation)` must bind the `Boolean`-returning extension
 /// `CancellableContinuation<Unit>.tryResume(onCancellation)`, not the member
 /// `tryResume(value: T): Any?`.
+/// Kotlin drops a member overload whose declared value-parameter types
+/// PROVABLY reject the call's arguments, and a top-level extension
+/// namesake binds instead: `builder.putAll(pairsArray)` inside the
+/// stdlib `plusAssign` — the builder's member takes a `Map`, the stdlib
+/// extension takes the `Array<out Pair>`. Only a definite per-arg
+/// disproof WITH a surviving same-arity extension declines the member,
+/// so erased/unknown argument shapes keep the member-first order.
+fn memberArgsDisprovenExtensionApplies(self: *VmHost, mod: *const Module, name: []const u8, member: *const Func, args: []const Value) bool {
+    if (!candidateArgsDisproven(self, member, args)) return false;
+    for (mod.funcsBySimpleName(name)) |fid| {
+        const cand = funcAt(mod, fid) orelse continue;
+        if (cand.params.len != args.len + 1) continue;
+        if (cand.params.len == 0 or !std.mem.eql(u8, cand.params[0].name, "this")) continue;
+        if (isMemberExt(mod, fid)) continue;
+        if (cand.low_priority) continue;
+        if (candidateArgsDisproven(self, &cand, args)) continue;
+        return true;
+    }
+    return false;
+}
+
 fn callableArgPrefersFunctionExtension(self: *VmHost, mod: *const Module, name: []const u8, member: *const Func, receiver: *const Value, args: []const Value) bool {
     const mskip: usize = if (member.params.len > 0 and std.mem.eql(u8, member.params[0].name, "this")) 1 else 0;
     var fn_arg_pos: ?usize = null;
@@ -9486,7 +9514,8 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                     });
                 }
                 if (pickMethodOverload(self, mod, candidates.items, args)) |f| {
-                    if (!callableArgPrefersFunctionExtension(self, mod, name, &f, receiver, args))
+                    if (!callableArgPrefersFunctionExtension(self, mod, name, &f, receiver, args) and
+                        !memberArgsDisprovenExtensionApplies(self, mod, name, &f, args))
                         return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 };
                 }
                 // Enqueue the resolved supertypes by identity (their IR class

@@ -814,6 +814,24 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // value bound to a register. The reference loads that closure — it
             // is the referenced callable, not an unbound property of whatever
             // the use site later applies it to.
+            // A LOCAL EXTENSION fn's closure takes its receiver as the
+            // leading parameter, but a bare `::ref` to it is
+            // receiver-BOUND — kotlinc binds the enclosing implicit
+            // receiver, so `handles.forEach(::validateGroupState)` inside
+            // `table.edit { }` invokes with the edit receiver. Forward
+            // through a synthesized lambda whose bare call re-resolves the
+            // local ext against `this` (capture machinery included); the
+            // reference then has the value-parameter arity the use site
+            // expects. The mark set is inherited into nested lambda
+            // builders, where the closure itself is an outer capture.
+            if (runtime.envOnce("KLIO_REF_TRACE")) |w| {
+                if (std.mem.eql(u8, w, pr.name.name)) std.debug.print("[ref-trace] {s} lef={} recvctx={} resolve={} outer={} arity_tys={} pending={d} expected_fn={}\n", .{ pr.name.name, b.isLocalExtFn(pr.name.name), inReceiverContext(b), b.resolve(pr.name.name) != null, b.knowsOuter(pr.name.name), b.localFnParamTys(pr.name.name) != null, b.pending_lambda_arity, if (b.peekExpected()) |e| e.function != null else false });
+            }
+            if (b.isLocalExtFn(pr.name.name) and inReceiverContext(b) and
+                (b.resolve(pr.name.name) != null or b.knowsOuter(pr.name.name)))
+            {
+                if (try localExtRefClosure(b, pr.name.name, pr.name.span)) |r| return r;
+            }
             if (b.isLocalFn(pr.name.name)) {
                 if (b.resolve(pr.name.name)) |reg| {
                     try b.push(.{ .Move = .{ .dst = dst, .src = reg } });
@@ -15005,6 +15023,60 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
 /// carries no type args, so invoking it later would lose the reification.
 /// AST synthesized from the MODULE allocator (lambda bodies are
 /// runtime-read).
+/// Eta-expand a bare `::localExt` reference into
+/// `{ p0..pN -> localExt(p0..pN) }`: the synthesized bare call resolves
+/// the local extension through the ordinary local-ext machinery (its
+/// receiver supplied by the enclosing `this`), and the closure carries
+/// the value-parameter arity the reference's use site applies.
+fn localExtRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Allocator.Error!?Reg {
+    // Value-parameter count: the declaring builder recorded the local fn's
+    // positional params; inside a nested lambda builder that record is not
+    // inherited, so the use site's expected callable arity (the
+    // function-typed parameter slot the reference fills) supplies it.
+    const n: usize = blk: {
+        if (b.localExtFnArity(name)) |a| break :blk @intCast(a);
+        if (b.localFnParamTys(name)) |tys| break :blk tys.len;
+        if (b.pending_lambda_arity >= 0) break :blk @intCast(b.pending_lambda_arity);
+        if (b.peekExpected()) |exp| {
+            if (exp.function) |ft| break :blk ft.params.len;
+        }
+        return null;
+    };
+    const ma = b.module.func_name_index.allocator;
+    const params = try ma.alloc(ast.Ident, n);
+    const args = try ma.alloc(ast.Expr, n);
+    for (0..n) |i| {
+        const pn = try std.fmt.allocPrint(ma, "$ref$p{d}", .{i});
+        params[i] = .{ .name = pn, .span = sp };
+        const segs_i = try ma.alloc(ast.Ident, 1);
+        segs_i[0] = .{ .name = pn, .span = sp };
+        args[i] = .{ .Path = .{ .segments = segs_i, .span = sp } };
+    }
+    const anames = try ma.alloc(?[]const u8, n);
+    for (anames) |*a| a.* = null;
+    const segs = try ma.alloc(ast.Ident, 1);
+    segs[0] = .{ .name = try ma.dupe(u8, name), .span = sp };
+    const callee = try ma.create(ast.Expr);
+    callee.* = .{ .Path = .{ .segments = segs, .span = sp } };
+    const stmts = try ma.alloc(ast.Stmt, 1);
+    stmts[0] = .{ .Expr = .{ .Call = .{
+        .callee = callee,
+        .args = args,
+        .arg_names = anames,
+        .type_args = &.{},
+        .is_infix = false,
+        .span = sp,
+    } } };
+    const boxed = try ma.create(ast.Expr);
+    boxed.* = .{ .Lambda = .{
+        .params = params,
+        .body = .{ .stmts = stmts, .span = sp },
+        .span = sp,
+        .implicit_it = false,
+    } };
+    return try lowerExpr(b, boxed);
+}
+
 fn reifiedRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Allocator.Error!?Reg {
     const expected = b.peekExpected() orelse return null;
     const fnty = expected.function orelse return null;
@@ -21221,7 +21293,7 @@ test "local extension receiver applicability rejects nullable Nothing" {
     var b = try FuncBuilder.init(a, &m);
     defer b.deinit();
 
-    try b.markLocalExtFn("contentEquals");
+    try b.markLocalExtFn("contentEquals", 1);
     try b.addLocalFnOverload("contentEquals", .{
         .mangled = "contentEquals$ovl0",
         .receiver_ty = try (ir.TypeRef{

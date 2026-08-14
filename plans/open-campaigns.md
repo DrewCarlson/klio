@@ -64,10 +64,25 @@ both suite-level (plugin conformance ratchet):
       the composer pair, multi-segment Path callees route through the
       FQN flatten/global-fit lowering, and the flatten's exact-arity
       match skips vararg decls (fixed-arity wins, Kotlin rule).
+- [x] Per-class census (heavies excluded) surfaced two more roots, both
+      FIXED: CompositionLocalTests 31/31 — a member overload whose
+      declared param type provably rejects the arg now stands aside for
+      the same-named extension (`putAll(pairsArray)` inside the stdlib
+      `plusAssign` hit the builder's `putAll(Map)`; Array vs non-array
+      container heads is now a definite disproof + member walk consults
+      it when a surviving extension exists). SlotTableEditorTests
+      11/11 — a bare `::ref` to a LOCAL EXTENSION fn now eta-expands
+      binding the enclosing implicit receiver (arity carried in the
+      inherited local-ext mark). Guard examples
+      local_ext_fn_reference.kt, member_arg_disproof_extension.kt.
 - [ ] checkboxLike = the SLOT-EXACT emission anchor: klio emits 21
       slots memo-off / 24 memo-on vs kotlinc's 18 cap (groups fine at
       6 <= 8). The excess predates memoization — this is the measuring
-      stick for the group/slot emission-shape debt below.
+      stick for the group/slot emission-shape debt below. NOTE:
+      non-capturing lambdas already have singleton identity in klio
+      (guard example non_capturing_lambda_identity.kt), so the 0-capture
+      memo wrap can likely be dropped without breaking
+      funInterface_isMemoized — a slot-count lever to try first.
 - [ ] movableContentOf factory wrap: kotlinc wraps factory-returned
       composable lambdas in composableLambdaInstance (key, tracked,
       wrapper) so every content(n) call site gets a restart group
