@@ -96,11 +96,15 @@ rangebench 82.6s (band 83.0-83.7 — neutral/slightly better); units
 zero-leak; hello smoke green. VERIFIED: sweep 117/0, corpus + compose slice at
 baseline, litmus 43/44 (only the yield flake), plugin ratchet 1339
 (ABOVE the 1337 baseline; the GC-stress step green).
-NEXT for Value=16: the remaining >8B payloads (Pair 16, IrClosure 24?,
-Function 16, Instance?, String?, Result...) — re-run the census with
-the threshold at >8 to enumerate; pair the wave with the transpiler
-hot-view sub-ABI so scalar offsets freeze once; then the rangebench
-speedup number. Then items 2-4.
+16B wave state: Pair BOXED; dead AST-era variants (Function,
+BoundUserMethod, BoundInnerClass) DELETED (net -74 lines, sweep 117/0).
+REMAINING at 16B: Result (24 constructions — box), Comparator (few —
+box), IrClosure (11 constructions, LOOP-HOT lambda values — box +
+measure rangebench + a lambda-heavy bench), Array ((cell,prim) — to 8
+needs a side-table or boxing, HOT, measure-first; an honest stop at
+Value=24 is acceptable if the numbers say so). Then the transpiler
+hot-view sub-ABI pairing + the rangebench speedup number. Then items
+2-4.
 
 ## previous note (Value=32 landed, superseded above)
 
