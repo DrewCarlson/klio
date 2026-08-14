@@ -4603,7 +4603,24 @@ fn LoopTramp(comptime H: type) type {
             frame: *Frame,
             pending: ?EvalError = null,
             pending_deopt_inst: u32 = 0,
+            /// Set alongside `pending` when a trampolined callee SUSPENDED:
+            /// the call site's instruction index and result register, so the
+            /// interpreter can park this frame at the call exactly as the
+            /// interpreted path would (block, inst+1, resume reg). Without
+            /// it the suspension propagated as a plain error and the loop
+            /// frame fell out of the continuation — a JITted `for` sending
+            /// into a channel silently lost every element after the tier-up.
+            pending_suspend_inst: u32 = 0,
+            pending_suspend_dst: ?Reg = null,
         };
+
+        fn stashErr(lc: *Ctx, e: EvalError, inst: u32, dst: ?Reg) void {
+            lc.pending = e;
+            if (e == .Suspended) {
+                lc.pending_suspend_inst = inst;
+                lc.pending_suspend_dst = dst;
+            }
+        }
 
         /// The trampoline's BULKY non-call sites (field write, subscript, value call,
         /// map get/set). Zig does not reclaim block-scoped stack allocations
@@ -4695,7 +4712,7 @@ fn LoopTramp(comptime H: type) type {
                         if (fr) |r2| switch (r2) {
                             .ok => return 0,
                             .err => |e| {
-                                lc.pending = e;
+                                stashErr(lc, e, site.inst, Reg.from(site.dst_reg));
                                 return jit_loop.throwCode(site.block);
                             },
                         };
@@ -4708,7 +4725,7 @@ fn LoopTramp(comptime H: type) type {
                 switch (r) {
                     .ok => return 0,
                     .err => |e| {
-                        lc.pending = e;
+                        stashErr(lc, e, site.inst, Reg.from(site.dst_reg));
                         return jit_loop.throwCode(site.block);
                     },
                 }
@@ -4728,7 +4745,7 @@ fn LoopTramp(comptime H: type) type {
                 switch (r) {
                     .ok => return 0,
                     .err => |e| {
-                        lc.pending = e;
+                        stashErr(lc, e, site.inst, null);
                         return jit_loop.throwCode(site.block);
                     },
                 }
@@ -4760,7 +4777,7 @@ fn LoopTramp(comptime H: type) type {
                         return 0;
                     },
                     .err => |e| {
-                        lc.pending = e;
+                        stashErr(lc, e, site.inst, Reg.from(site.dst_reg));
                         return jit_loop.throwCode(site.block);
                     },
                 }
@@ -4802,7 +4819,7 @@ fn LoopTramp(comptime H: type) type {
                         return 0;
                     },
                     .err => |e| {
-                        lc.pending = e;
+                        stashErr(lc, e, site.inst, Reg.from(site.dst_reg));
                         return jit_loop.throwCode(site.block);
                     },
                 }
@@ -5019,7 +5036,7 @@ fn LoopTramp(comptime H: type) type {
                     return 0;
                 },
                 .err => |e| {
-                    lc.pending = e;
+                    stashErr(lc, e, site.inst, Reg.from(site.dst_reg));
                     return jit_loop.throwCode(site.block);
                 },
             }
@@ -5215,6 +5232,24 @@ fn runFrameExec(
                                 resume_throw = exc;
                                 cur = res.block;
                                 continue;
+                            },
+                            // A trampolined callee SUSPENDED mid-loop: park
+                            // this frame at the call site exactly as the
+                            // interpreted path would — the native exit has
+                            // already reboxed the loop registers, so the
+                            // snapshot resumes the loop right after the
+                            // call with the resume value in its dst.
+                            // Propagating it as a plain error dropped the
+                            // loop frame from the continuation (a JITted
+                            // `for` sending into a channel lost every
+                            // element after the tier-up).
+                            .Suspended => {
+                                park_out.* = .{
+                                    .block = res.block,
+                                    .inst_idx = @as(usize, loop_ctx.pending_suspend_inst) + 1,
+                                    .resume_reg = loop_ctx.pending_suspend_dst,
+                                };
+                                return errResult(e);
                             },
                             else => return errResult(e),
                         }

@@ -152,24 +152,22 @@ the campaign opens (`COROUTINE-MODEL.md` is the architecture reference).
       under coroutineScope / withTimeout; fixed by intervening work).
 - [x] private_shadow cells — STALE: both val and var shapes print the
       exact kotlinc outputs (distinct per-class cells).
-- [ ] CHANNEL SEGMENT-ROTATION BREAK (root of the recorded #10
-      deadlock; minimal repro plans/repros/
-      channel_segment_rotation_break.kt): plain runBlocking + launch +
-      Channel(4), NO threads — send/receive works for exactly 67
-      items, item 68+ never arrives (receive returns a bogus zero;
-      sum saturates at 2278; large N deadlocks both sides parked).
-      SEGMENT_SIZE=32, capacity 4: the 68th cell sits past the second
-      channel segment + expandBuffer offset — the BufferedChannel
-      segment-list rotation (findSegmentAndMoveForward CAS over the
-      atomicfu segment pointers) breaks under klio's shims even
-      single-threaded (a CAS comparing copied shim values never
-      advancing would strand the receiver on a stale segment). The
-      OLD 5-actor Dispatchers.Default deadlock story was a red
-      herring — cross-thread machinery (resumeExternal, mailboxes)
-      all worked in the traces. SIDE FIND: every park/resume cycle
-      leaks one EMPTY TailSeg onto the suspend-state chain
-      (routeResumedResult re-wraps; promotion never frees empties
-      eagerly) — benign-looking but unbounded.
+- [x] THE #10 "CHANNEL DEADLOCK" FIXED — it was the LOOP JIT, not
+      the channel: a trampolined callee's SUSPENSION propagated as a
+      plain error, dropping the JITted loop frame from the
+      continuation. A `for (i in 1..N) ch.send(i)` lost every element
+      after the ~64-iteration tier-up (KLIO_JIT=0 was the decisive
+      bisect; segment-size and capacity sweeps were red herrings, as
+      was the entire cross-thread machinery — resumeExternal and the
+      mailboxes traced clean). Fix: the trampoline stashes the call
+      site's inst+dst on a Suspended result and the interpreter parks
+      the frame at the call site (park_out), exactly the interpreted
+      protocol. Whole family green: 1..2000 items, 5-actor original,
+      worker/inline variants. Guard: litmus
+      tl_channel_jit_send_loop.kt (litmus now 45/45). SIDE FIND still
+      open: every park/resume cycle leaks one EMPTY TailSeg on the
+      suspend-state chain (routeResumedResult re-wraps; empties never
+      freed eagerly) — unbounded, benign-looking.
 - [ ] Cancellation cluster (flow campaign residue)
 - [ ] Unconfined event loop (= createEventLoop debt)
 - [ ] tl_atomic_update_contended litmus flake (timeout under load)
