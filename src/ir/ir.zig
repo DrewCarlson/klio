@@ -4407,15 +4407,15 @@ pub const Module = struct {
         return result;
     }
 
-    fn extensionKeyGreater(a: [8]i32, b: [8]i32) bool {
-        inline for (0..7) |i| {
+    fn extensionKeyGreater(a: [9]i32, b: [9]i32) bool {
+        inline for (0..8) |i| {
             if (a[i] != b[i]) return a[i] > b[i];
         }
         return false;
     }
 
-    fn extensionKeyEquivalent(a: [8]i32, b: [8]i32) bool {
-        return std.mem.eql(i32, a[0..7], b[0..7]);
+    fn extensionKeyEquivalent(a: [9]i32, b: [9]i32) bool {
+        return std.mem.eql(i32, a[0..8], b[0..8]);
     }
 
     /// True when two function-typed parameter refs agree on everything a
@@ -5331,7 +5331,7 @@ pub const Module = struct {
             if (score.ext_key.?[0] != 0 and !score.low_priority) any_ordinary = true;
         }
         var best: ?FuncId = null;
-        var best_key: [8]i32 = .{std.math.minInt(i32)} ** 8;
+        var best_key: [9]i32 = .{std.math.minInt(i32)} ** 9;
         var best_unknown = false;
         var best_recv_param: ?TypeRef = null;
         var best_fid_for_recv: ?FuncId = null;

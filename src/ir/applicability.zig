@@ -142,7 +142,7 @@ pub const Score = struct {
 
     /// Extension-only lexicographic ranking tuple, populated only when a later
     /// caller sets extension ranking. null here.
-    ext_key: ?[8]i32 = null,
+    ext_key: ?[9]i32 = null,
 
     /// P2 binding side-channel the caller consumes.
     binding: Binding = .{},
@@ -1292,7 +1292,13 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
         break :blk @intFromBool(!cb(sig.package));
     };
 
-    const key: [8]i32 = .{ applic, is_user, spec, recv_match, score, owner_rank, param_spec, neg_fid };
+    // Kotlin prefers the applicable overload that fills the FEWEST
+    // parameters from defaults (a bare `produce { }` binds the 3-param
+    // public overload, not its 5/6-param delegation targets); negated so
+    // the lexicographic compare ranks fewer-defaults higher, ahead of the
+    // identity component.
+    const neg_defaults: i32 = -@as(i32, @intCast(params.len -| want));
+    const key: [9]i32 = .{ applic, is_user, spec, recv_match, score, owner_rank, param_spec, neg_defaults, neg_fid };
     // `KLIO_EXTKEY_TRACE=<fid>,<fid>` — dump the eight-element ranking key for
     // the named candidates. Ranking is lexicographic, so the first component
     // that differs is the one that decides; reading it beats guessing which
@@ -1962,7 +1968,7 @@ test "applicable extension: ext_key mirrors ExtKey tuple" {
     };
     const sc = applicable(&sig, &args, scope).?;
     const key = sc.ext_key.?;
-    // { applicable, is_user, spec, recv_match, score, owner_rank, param_spec, neg_fid }
+    // { applicable, is_user, spec, recv_match, score, owner_rank, param_spec, neg_defaults, neg_fid }
     try testing.expectEqual(@as(i32, 1), key[0]); // applicable
     try testing.expectEqual(@as(i32, 1), key[1]); // is_user (empty package)
     try testing.expectEqual(@as(i32, 0), key[2]); // spec (no all_candidates)
@@ -1971,7 +1977,8 @@ test "applicable extension: ext_key mirrors ExtKey tuple" {
     try testing.expectEqual(@as(i32, 100105), key[4]);
     try testing.expectEqual(@as(i32, 0), key[5]); // owner_rank (no callback)
     try testing.expectEqual(@as(i32, 1), key[6]); // param_spec (Animal concrete)
-    try testing.expectEqual(@as(i32, -7), key[7]); // neg_fid
+    try testing.expectEqual(@as(i32, 0), key[7]); // neg_defaults (exact arity)
+    try testing.expectEqual(@as(i32, -7), key[8]); // neg_fid
     try testing.expect(sc.exact_arity);
 }
 

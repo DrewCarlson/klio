@@ -168,6 +168,23 @@ the campaign opens (`COROUTINE-MODEL.md` is the architecture reference).
       open: every park/resume cycle leaks one EMPTY TailSeg on the
       suspend-state chain (routeResumedResult re-wraps; empties never
       freed eagerly) — unbounded, benign-looking.
+- [ ] combine/zip STILL LIVE (the last of the flow-campaign #3
+      family; takeWhile/drop/produce-standalone all pass): zip fails
+      `cast to SendChannel` because `val second = produce<Any>{...}`
+      inside the pack-lowered zipImpl never binds — TWO stacked roots.
+      FIXED HALF: bare `produce {}` statically tied across the 3
+      CoroutineScope.produce overloads (all applicable via defaults);
+      the extension ranking key now carries Kotlin's
+      fewest-defaults-filled tiebreak (9th key slot before identity)
+      and the site statically pins produce#2771. REMAINING HALF (the
+      receiver-publication campaign again): at runtime the implicit
+      receiver chain inside unsafeFlow's anon collect is headed by the
+      RAW COLLECTOR CLOSURE (toCollection's `collect {}` lambda passes
+      as an IrClosure, `collector.block()` then seats it as the
+      block's receiver), so coroutineScope/produce/println all
+      member-dispatch against kotlin.Function first and the resolved
+      target gets the wrong `this`. combine's `emit` on FlowCoroutine
+      is the same seating. Full trace anatomy in triage memory (62).
 - [ ] Cancellation cluster (flow campaign residue)
 - [ ] Unconfined event loop (= createEventLoop debt)
 - [ ] tl_atomic_update_contended litmus flake (timeout under load)
