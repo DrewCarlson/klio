@@ -1737,7 +1737,7 @@ pub fn isShadowingCapture(self: *VmHost, name: []const u8) bool {
     }
     const v = g.get().lookupLocal(name) orelse return false;
     return switch (v) {
-        .IrClosure, .Function => true,
+        .IrClosure => true,
         else => false,
     };
 }

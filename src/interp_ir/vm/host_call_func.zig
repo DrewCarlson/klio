@@ -702,8 +702,7 @@ fn shapeOfValue(self: *VmHost, v: *const Value) applicability.ArgShape {
             arity_authoritative = up.stripped;
             break :blk std.math.cast(u8, up.n);
         },
-        .Function => |f| std.math.cast(u8, f.decl.params.len),
-        .Class => 0,
+                .Class => 0,
         .Instance => blk: {
             const cli = composableLambdaBlockArity(self, v) orelse break :blk null;
             arity_authoritative = cli.authoritative;
@@ -893,8 +892,7 @@ fn fnTypeArity(ty: *const TypeRef) ?usize {
 fn callableDeclaredArity(self: *VmHost, v: *const Value) ?usize {
     return switch (v.*) {
         .IrClosure => |c| if (self.closures.get(c.id)) |info| info.n_params else null,
-        .Function => |fv| fv.decl.params.len,
-        // A memo-wrapped composable lambda: its block's user arity.
+                // A memo-wrapped composable lambda: its block's user arity.
         .Instance => if (composableLambdaBlockArity(self, v)) |cli| cli.n else null,
         else => null,
     };

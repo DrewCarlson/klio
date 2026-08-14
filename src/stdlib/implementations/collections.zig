@@ -564,7 +564,7 @@ fn findKeyIndexBoxed(entries: []const MapPair, key: *const Value) ?usize {
 
 fn isCallable(v: Value) bool {
     return switch (v) {
-        .IrClosure, .Function, .Intrinsic, .Instance => true,
+        .IrClosure, .Intrinsic, .Instance => true,
         else => false,
     };
 }
@@ -5366,7 +5366,7 @@ fn isZipTransform(v: Value) bool {
         // Any callable third argument is the transform: a lambda, a bound or
         // user method, a function/intrinsic reference, a constructor reference
         // (`::SomeClass` evaluates to a `.Class`), or a functional Instance.
-        .IrClosure, .BoundMethod, .BoundUserMethod, .Instance, .Class, .Function, .Intrinsic => true,
+        .IrClosure, .BoundMethod, .Instance, .Class, .Intrinsic => true,
         else => false,
     };
 }
@@ -5636,7 +5636,7 @@ fn collectColl(a: Allocator, v: ?Value) Error!?[]Value {
 /// `removeAll { (T) -> Boolean }`.
 fn isPredicateArg(v: Value) bool {
     return switch (v) {
-        .IrClosure, .BoundMethod, .BoundUserMethod, .Function, .Intrinsic => true,
+        .IrClosure, .BoundMethod, .Intrinsic => true,
         else => false,
     };
 }

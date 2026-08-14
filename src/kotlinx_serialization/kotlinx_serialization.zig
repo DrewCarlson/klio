@@ -535,7 +535,6 @@ fn jsonDecode(ctx: *CallCtx) Error!EvalResult {
 fn classOf(v: *const Value) ?ObjRef(ClassDef) {
     return switch (v.*) {
         .Class => |c| c.clone(),
-        .BoundInnerClass => |bic| bic.class.clone(),
         .Instance => |inst| blk: {
             const g = inst.borrow();
             const c = g.get().class.clone();

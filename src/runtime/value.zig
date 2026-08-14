@@ -506,6 +506,52 @@ pub const MapEntryData = struct {
     }
 };
 
+/// The boxed payload of `Value.Result` (see `MapData` for the scheme).
+pub const ResultData = struct {
+    ok: bool,
+    payload: ValueBox,
+
+    pub fn deinit(self: *ResultData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.payload.deinit();
+    }
+
+    pub fn gcTrace(self: *const ResultData, m: *objcell.gc.Marker) void {
+        m.shade(&self.payload.cell.hdr);
+    }
+};
+
+/// The control-block handle behind a boxed `Value.Result` payload.
+pub const ResultRef = ObjRef(ResultData);
+
+/// Recover the owning control block from a boxed payload pointer.
+pub inline fn resultRefOf(r: *ResultData) ResultRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", r)) };
+}
+
+/// The boxed payload of `Value.Comparator` (see `MapData` for the scheme).
+pub const ComparatorData = struct {
+    steps: ObjRef([]ComparatorStep),
+    descending: bool,
+
+    pub fn deinit(self: *ComparatorData, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.steps.deinit();
+    }
+
+    pub fn gcTrace(self: *const ComparatorData, m: *objcell.gc.Marker) void {
+        m.shade(&self.steps.cell.hdr);
+    }
+};
+
+/// The control-block handle behind a boxed `Value.Comparator` payload.
+pub const ComparatorRef = ObjRef(ComparatorData);
+
+/// Recover the owning control block from a boxed payload pointer.
+pub inline fn comparatorRefOf(c: *ComparatorData) ComparatorRef {
+    return .{ .cell = @alignCast(@fieldParentPtr("data", c)) };
+}
+
 /// The boxed payload of `Value.Pair` (see `MapData` for the scheme).
 pub const PairData = struct {
     first: ValueBox,
@@ -1932,10 +1978,6 @@ pub const Value = union(enum) {
     /// (see `RangeData`); construct with `Value.newRange`. Immutable after
     /// construction, so copies sharing the record is invisible.
     Range: *RangeData,
-    Function: struct {
-        decl: *const ast.Function,
-        env: ObjRef(Env),
-    },
     /// A stdlib function value. The payload is an INTERNED program-
     /// lifetime record (`Value.internIntrinsic`): the fqn is a static
     /// string and the pair never dies, so copies carry one pointer and
@@ -1949,11 +1991,6 @@ pub const Value = union(enum) {
     /// A method intrinsic bound to a specific receiver. Boxed like `Map`
     /// (see `BoundMethodData`); construct with `Value.newBoundMethod`.
     BoundMethod: *BoundMethodData,
-    /// A user-method reference bound to a specific instance.
-    BoundUserMethod: struct {
-        receiver: ObjRef(InstanceData),
-        method: *const MethodDef,
-    },
     /// A thrown value, modeled as a Kotlin Throwable. Boxed like `Map` (see
     /// `ExceptionData`); construct with `Value.newException`.
     Exception: *ExceptionData,
@@ -1983,22 +2020,14 @@ pub const Value = union(enum) {
     /// the record — the JVM's reference semantics for an entry.
     MapEntry: *MapEntryData,
     /// `kotlin.Result<T>`.
-    Result: struct {
-        ok: bool,
-        payload: ValueBox,
-    },
-    /// `kotlin.Comparator<T>`.
-    Comparator: struct {
-        steps: ObjRef([]ComparatorStep),
-        descending: bool,
-    },
+    /// `kotlin.Result<T>`. Boxed like `Map` (see `ResultData`); construct
+    /// with `Value.newResult`.
+    Result: *ResultData,
+    /// `kotlin.Comparator<T>`. Boxed like `Map` (see `ComparatorData`);
+    /// construct with `Value.newComparator`.
+    Comparator: *ComparatorData,
     /// A user-declared class.
     Class: ObjRef(ClassDef),
-    /// An `inner class` bound to a specific outer-instance.
-    BoundInnerClass: struct {
-        class: ObjRef(ClassDef),
-        outer: ObjRef(InstanceData),
-    },
     /// A live instance of a user-declared class.
     Instance: ObjRef(InstanceData),
     /// `kotlin.sequences.Sequence<T>`.
@@ -2077,16 +2106,14 @@ pub const Value = union(enum) {
         switch (self) {
             .String => |s| visitor.visit(s),
             .Instance => |i| visitor.visit(i),
-            .BoundUserMethod => |m| visitor.visit(m.receiver),
             .Sequence => |s| visitor.visit(s),
             .Delegate => |d| visitor.visit(d),
             .Regex => |r| visitor.visit(r),
             .Match => |m| visitor.visit(m),
             .StringBuilder => |s| visitor.visit(s),
             .Cell => |c| visitor.visit(c),
-            .Function => |f| visitor.visit(f.env),
             .IrClosure => |c| visitor.visit(c.captures),
-            .Comparator => |c| visitor.visit(c.steps),
+            .Comparator => |c| visitor.visit(comparatorRefOf(c)),
             .List => |x| visitor.visit(listRefOf(x)),
             .Set => |x| visitor.visit(setRefOf(x)),
             .Array => |x| switch (x.storage()) {
@@ -2106,7 +2133,7 @@ pub const Value = union(enum) {
             .Pair => |p| visitor.visit(pairRefOf(p)),
             .Triple => |t| visitor.visit(tripleRefOf(t)),
             .MapEntry => |e| visitor.visit(mapEntryRefOf(e)),
-            .Result => |r| visitor.visit(r.payload),
+            .Result => |r| visitor.visit(resultRefOf(r)),
             .BoundMethod => |m| visitor.visit(boundMethodRefOf(m)),
             else => {},
         }
@@ -2157,8 +2184,15 @@ pub const Value = union(enum) {
         if (intrinsic_intern == null) intrinsic_intern = std.StringHashMap(*const IntrinsicData).init(a);
         const gop = intrinsic_intern.?.getOrPut(fqn) catch @panic("intrinsic intern");
         if (!gop.found_existing) {
+            // Own the key bytes: the caller's slice is typically a module's
+            // constant, which an in-process multi-program driver frees at
+            // that program's teardown — a borrowed key then dangles and the
+            // next program's probe compares against freed memory. The dup is
+            // immortal, matching the entry's own lifetime.
+            const owned = a.dupe(u8, fqn) catch @panic("intrinsic intern");
+            gop.key_ptr.* = owned;
             const d = a.create(IntrinsicData) catch @panic("intrinsic intern");
-            d.* = .{ .fqn = fqn, .func = func };
+            d.* = .{ .fqn = owned, .func = func };
             gop.value_ptr.* = d;
         }
         return .{ .Intrinsic = gop.value_ptr.* };
@@ -2169,6 +2203,20 @@ pub const Value = union(enum) {
     pub fn newMatchGroup(allocator: std.mem.Allocator, data: MatchGroupData) std.mem.Allocator.Error!Value {
         const ref = try MatchGroupRef.initOwned(allocator, data);
         return .{ .MatchGroup = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `Result` payload; the only way to construct a
+    /// `.Result`.
+    pub fn newResult(allocator: std.mem.Allocator, data: ResultData) std.mem.Allocator.Error!Value {
+        const ref = try ResultRef.initOwned(allocator, data);
+        return .{ .Result = &ref.cell.data };
+    }
+
+    /// Allocate the boxed `Comparator` payload; the only way to construct
+    /// a `.Comparator`.
+    pub fn newComparator(allocator: std.mem.Allocator, data: ComparatorData) std.mem.Allocator.Error!Value {
+        const ref = try ComparatorRef.initOwned(allocator, data);
+        return .{ .Comparator = &ref.cell.data };
     }
 
     /// Allocate the boxed `Pair` payload; the only way to construct a
@@ -2252,10 +2300,6 @@ pub const Value = union(enum) {
             // either kind reachable. A bound inner-class constructor also
             // owns the outer instance it will pass to construction.
             .Class => |c| m.shade(&c.cell.hdr),
-            .BoundInnerClass => |b| {
-                m.shade(&b.class.cell.hdr);
-                m.shade(&b.outer.cell.hdr);
-            },
             // `List`/`Set` view `backing` is shaded by `forEachChildCell` above
             // (the `CollBacking` cell's own `gcTrace` reaches the source).
             // Keep the side-table's canonical capture store + receiver chain for
@@ -2283,18 +2327,16 @@ pub const Value = union(enum) {
         switch (self) {
             .String => |s| s.deinit(),
             .Instance => |i| i.deinit(),
-            .BoundUserMethod => |m| m.receiver.deinit(),
             .Sequence => |s| s.deinit(),
             .Delegate => |d| d.deinit(),
             .Regex => |r| r.deinit(),
             .Match => |m| m.deinit(),
             .StringBuilder => |s| s.deinit(),
             .Cell => |c| c.deinit(),
-            .Function => |f| f.env.deinit(),
             // `releaseSliceElems` already drops the slice handle (its tail
             // `slice.deinit()`); do not deinit it again.
             .IrClosure => |c| releaseSliceElems(c.captures, allocator),
-            .Comparator => |c| c.steps.deinit(),
+            .Comparator => |c| comparatorRefOf(c).deinit(),
             .List => |x| {
                 if (objcell.envSetOnce("KLIO_BOXDIE_TRACE") and x.backing != null and
                     listRefOf(x).cell.refcount.load(.monotonic) == 1)
@@ -2322,7 +2364,7 @@ pub const Value = union(enum) {
             .Pair => |p| pairRefOf(p).deinit(),
             .Triple => |t| tripleRefOf(t).deinit(),
             .MapEntry => |e| mapEntryRefOf(e).deinit(),
-            .Result => |r| r.payload.deinit(),
+            .Result => |r| resultRefOf(r).deinit(),
             .BoundMethod => |m| boundMethodRefOf(m).deinit(),
             else => {},
         }
@@ -2551,7 +2593,7 @@ pub const Value = union(enum) {
                 .UInt => if (r.step == 1 and !r.progression) "kotlin.ranges.UIntRange" else "kotlin.ranges.UIntProgression",
                 .ULong => if (r.step == 1 and !r.progression) "kotlin.ranges.ULongRange" else "kotlin.ranges.ULongProgression",
             },
-            .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => "kotlin.Function",
+            .IrClosure, .Intrinsic, .BoundMethod => "kotlin.Function",
             .Exception => "kotlin.Throwable",
             .List => |l| if (l.mutable) "kotlin.collections.MutableList" else "kotlin.collections.List",
             .Array => |a| if (a.prim) |k| k.typeFqn() else "kotlin.Array",
@@ -2593,7 +2635,7 @@ pub const Value = union(enum) {
                 .UInt => "kotlin.collections.UIntIterator",
                 .ULong => "kotlin.collections.ULongIterator",
             },
-            .Class, .BoundInnerClass => "kotlin.reflect.KClass",
+            .Class => "kotlin.reflect.KClass",
             .Instance => "<instance>",
             .Delegate => "<delegate>",
             .PropertyRef => "kotlin.reflect.KProperty",
@@ -2744,13 +2786,13 @@ pub const Value = union(enum) {
                 };
             },
             .Comparator => matchesAny(name, &.{ "Comparator", "Any" }),
-            .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => isFunctionType(self, name),
+            .IrClosure, .Intrinsic, .BoundMethod => isFunctionType(self, name),
             .Exception => |e| blk: {
                 const g = e.fqn.borrow();
                 defer g.deinit();
                 break :blk builtinThrowableIsA(g.get().bytes, name);
             },
-            .Class, .BoundInnerClass => matchesAny(name, &.{ "KClass", "kotlin.reflect.KClass", "KClassifier", "kotlin.reflect.KClassifier", "Any" }),
+            .Class => matchesAny(name, &.{ "KClass", "kotlin.reflect.KClass", "KClassifier", "kotlin.reflect.KClassifier", "Any" }),
             .Instance => |i| blk: {
                 if (std.mem.eql(u8, name, "Any")) break :blk true;
                 const g = i.borrow();
@@ -3078,17 +3120,9 @@ pub const Value = union(enum) {
                     try writer.print("{d} downTo {d} step {d}", .{ r.start, r.end, -r.step });
                 }
             },
-            .Function => |fnv| try writer.print("fun {s}(...)", .{fnv.decl.name.name}),
             .IrClosure => |c| try writer.print("{{ir-closure#{d}}}", .{c.id}),
             .Intrinsic => |i| try writer.print("fun {s}(...)", .{i.fqn}),
             .BoundMethod => |m| try writer.print("fun {s}(...)", .{m.fqn}),
-            .BoundUserMethod => |m| {
-                const g = m.receiver.borrow();
-                defer g.deinit();
-                const cg = g.get().class.borrow();
-                defer cg.deinit();
-                try writer.print("fun {s}.{s}(...)", .{ cg.get().name, m.method.name });
-            },
             .Exception => |e| {
                 const fg = e.fqn.borrow();
                 defer fg.deinit();
@@ -3180,11 +3214,6 @@ pub const Value = union(enum) {
             },
             .Class => |c| {
                 const g = c.borrow();
-                defer g.deinit();
-                try writer.print("class {s}", .{g.get().name});
-            },
-            .BoundInnerClass => |b| {
-                const g = b.class.borrow();
                 defer g.deinit();
                 try writer.print("class {s}", .{g.get().name});
             },
@@ -3454,6 +3483,7 @@ fn classDisplayName(name: []const u8) []const u8 {
 }
 
 fn isFunctionType(self: Value, name: []const u8) bool {
+    _ = self;
     if (matchesAny(name, &.{ "Function", "Any", "kotlin.Function", "KFunction", "KCallable", "kotlin.reflect.KFunction", "kotlin.reflect.KCallable" })) {
         return true;
     }
@@ -3464,11 +3494,11 @@ fn isFunctionType(self: Value, name: []const u8) bool {
     else
         null;
     if (stripped) |s| {
-        const n = std.fmt.parseInt(usize, s, 10) catch return false;
-        return switch (self) {
-            .Function => |f| f.decl.params.len == n,
-            else => false,
-        };
+        _ = std.fmt.parseInt(usize, s, 10) catch return false;
+        // Arity-suffixed FunctionN matching answered only for the retired
+        // AST-interpreter function value; live callables match through the
+        // un-aritied names above, exactly as before.
+        return false;
     }
     return false;
 }

@@ -66,6 +66,9 @@ void klio_rt_register_module_check(uint64_t n_funcs, uint64_t n_consts);
  * (the outcome has been recorded on the context). The branch helpers
  * (klio_op_br / klio_op_cmp_br) instead return 1 = take the true edge,
  * 0 = take the false edge, 2 = return immediately. */
+/* The activation's register file for the generated inline scalar ops
+ * (stable for the whole activation). */
+uint8_t *klio_op_regs(void *ctx);
 void    klio_op_trace(void *ctx, uint32_t file, uint32_t start, uint32_t end);
 int32_t klio_op_const_load(void *ctx, uint32_t dst, uint32_t const_id);
 void    klio_op_const_int(void *ctx, uint32_t dst, int32_t payload);

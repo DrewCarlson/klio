@@ -1804,7 +1804,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         const gg = self.globals.borrow();
         defer gg.deinit();
         break :blk switch (gg.get().lookup(name) orelse Value.Null) {
-            .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => true,
+            .IrClosure, .Intrinsic, .BoundMethod => true,
             else => false,
         };
     };
@@ -1819,7 +1819,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             if (try withFieldResolvePair(self, allocator, oid, name, &outer, suppress_cc_redirect, false)) |r| {
                 if (r == .ok) {
                     switch (r.ok) {
-                        .Unit, .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => {},
+                        .Unit, .IrClosure, .Intrinsic, .BoundMethod => {},
                         else => return r,
                     }
                 }

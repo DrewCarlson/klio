@@ -216,7 +216,7 @@ fn paramAcceptsArg(self: *VmHost, declared: []const u8, arg: *const Value) bool 
     // (`SuspendingPointerInputModifierNodeImpl`'s deprecated handler ctor).
     if (std.mem.startsWith(u8, declared, "Function")) {
         return switch (arg.*) {
-            .IrClosure, .Function => true,
+            .IrClosure => true,
             .Instance => blk: {
                 const g = arg.Instance.borrow();
                 defer g.deinit();
@@ -324,7 +324,7 @@ fn scoreCtorHeads(self: *VmHost, heads: []const []const u8, args: []const Value)
 
 fn isCallableArg(v: *const Value) bool {
     return switch (v.*) {
-        .IrClosure, .Function => true,
+        .IrClosure => true,
         else => false,
     };
 }
@@ -2523,7 +2523,7 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
     // (`PointerInputEventHandler`'s `PointerInputScope.invoke()`) can
     // only bind its extension receiver through the instance's class.
     for (effective.items, 0..) |a, i| {
-        if (a != .IrClosure and a != .Function) continue;
+        if (a != .IrClosure) continue;
         const declared: ?[]const u8 = blk: {
             const dg = class_def.borrow();
             defer dg.deinit();
@@ -4005,7 +4005,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         }
         mg.deinit();
         const captured_callable = if (findCapture(capture_pairs, n)) |v| switch (v) {
-            .IrClosure, .Function, .Intrinsic, .BoundMethod, .PropertyRef => true,
+            .IrClosure, .Intrinsic, .BoundMethod, .PropertyRef => true,
             else => false,
         } else false;
         if (!names_extension or !captured_callable or own_members.contains(n)) try anon_cap_set.put(n, {});

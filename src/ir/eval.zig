@@ -6411,6 +6411,13 @@ fn glueAfter(ctx: *NativeCtx, r: Step, inst: *const Inst, idx: u32, block: u32) 
     };
 }
 
+/// The activation's register file as raw bytes for the emitted C's
+/// inline scalar ops (the hot view). Stable for the whole activation:
+/// regs are sized once at frame construction and never reallocated.
+pub fn nativeFrameRegs(ctx: *NativeCtx) [*]u8 {
+    return @ptrCast(ctx.frame.regs.items.ptr);
+}
+
 pub fn nativeOpTrace(ctx: *NativeCtx, file: u32, start: u32, end: u32) void {
     ctx.frame.cur_span = .{ .file = @enumFromInt(file), .start = start, .end = end };
 }
@@ -8369,7 +8376,7 @@ noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, fra
     // (e.g. a captured `info` next to `logger.info(...)`) must not
     // shadow the real member.
     const fb_invocable = switch (fb) {
-        .IrClosure, .Function, .Intrinsic, .BoundMethod, .BoundUserMethod, .PropertyRef => true,
+        .IrClosure, .Intrinsic, .BoundMethod, .PropertyRef => true,
         // A class value is its constructor (`::Char` bound to an
         // `Int.() -> Char` param): invocable, receiver becomes the
         // first positional argument below.
@@ -8494,9 +8501,9 @@ noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, fra
 /// instances whose class hierarchy declares `invoke`.
 fn valueInvocable(module: *const Module, callee_v: Value) bool {
     return switch (callee_v) {
-        .Function, .Intrinsic, .IrClosure, .BoundMethod, .BoundUserMethod => true,
+        .Intrinsic, .IrClosure, .BoundMethod => true,
         // A class value invoked bare is a constructor call.
-        .Class, .BoundInnerClass, .PropertyRef => true,
+        .Class, .PropertyRef => true,
         .Instance => |i| blk: {
             {
                 const g = i.borrow();
@@ -9499,7 +9506,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
             // plain invoke arm would run the lambda with no receiver at
             // all and strand its bare-member calls. Route it through the
             // receiver-carrying bridge below.
-            if ((c.v == .IrClosure or c.v == .Function) and std.mem.eql(u8, name_str, "invoke")) {
+            if ((c.v == .IrClosure) and std.mem.eql(u8, name_str, "invoke")) {
                 if (try samCandidateInvoke(H, allocator, frame, host, cands, ci, name_str, arg_values, names)) |sr| switch (sr) {
                     .done => |v| {
                         resolved = v;
@@ -9554,7 +9561,7 @@ fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame,
                         // before an outer receiver's same-name member (the
                         // coordinator's 1-arg `measure`) grabs the call. A
                         // closure has no real members, so nothing is shadowed.
-                        if (c.v == .IrClosure or c.v == .Function) {
+                        if (c.v == .IrClosure) {
                             if (try samCandidateInvoke(H, allocator, frame, host, cands, ci, name_str, arg_values, names)) |sr| switch (sr) {
                                 .done => |v| resolved = v,
                                 .raised => |re| return raiseStep(frame, re),

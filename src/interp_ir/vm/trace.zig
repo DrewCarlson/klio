@@ -142,7 +142,7 @@ pub fn recvLabel(allocator: std.mem.Allocator, v: Value) std.mem.Allocator.Error
             break :blk try std.fmt.allocPrint(allocator, "Class({s})", .{cg.get().fqn});
         },
         .Null => "Null",
-        .Function, .IrClosure, .Intrinsic, .BoundMethod, .BoundUserMethod => @tagName(v),
+        .IrClosure, .Intrinsic, .BoundMethod => @tagName(v),
         else => blk: {
             const fqn = v.typeFqn();
             break :blk if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;

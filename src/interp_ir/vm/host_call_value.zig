@@ -117,11 +117,6 @@ fn typeReferenceStaticReceiver(v: *const Value) ?[]const u8 {
         defer g.deinit();
         return g.get().fqn;
     }
-    if (v.* == .Function and v.Function.decl.name.name.len > 0 and
-        std.ascii.isUpper(v.Function.decl.name.name[0]))
-    {
-        return v.Function.decl.name.name;
-    }
     return null;
 }
 
@@ -556,10 +551,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 // shifted every argument (`map(Int::toUInt)` ran `toUInt`
                 // with the companion as `this`). Same predicate as the
                 // by-name path below.
-                const fid_fn_type_like = rv == .Function and
-                    rv.Function.decl.name.name.len > 0 and
-                    std.ascii.isUpper(rv.Function.decl.name.name[0]);
-                const fid_type_like = (rv == .Class) or fid_fn_type_like or
+                const fid_type_like = (rv == .Class) or
                     (rv == .Instance and isCompanionInstance(rv) and
                         !companionServesName(self, &rv, name));
                 if (fid_type_like) {
@@ -586,12 +578,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             // receiver when the named member is an instance method rather than a
             // companion member.
             // An unsigned-array type name in value position lowers to its
-            // constructor FUNCTION (`ULongArray::sortDescending`); treat
-            // an uppercase-named function receiver as the type itself.
-            const fn_type_like = rv == .Function and
-                rv.Function.decl.name.name.len > 0 and
-                std.ascii.isUpper(rv.Function.decl.name.name[0]);
-            const type_like = (rv == .Class) or fn_type_like or
+            const type_like = (rv == .Class) or
                 (rv == .Instance and isCompanionInstance(rv) and
                     !companionServesName(self, &rv, name));
             if (type_like and args.len != 0) {
@@ -624,7 +611,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             // a top-level fn) keeps dispatching the member.
             if (r == .err and r.err == .Unimplemented) {
                 if (host_globals.lookupGlobal(self, name)) |callable| {
-                    if (callable == .Function or callable == .IrClosure) {
+                    if (callable == .IrClosure) {
                         return callValue(self, allocator, &callable, args);
                     }
                 }
@@ -915,7 +902,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 if (mg.get().hasFuncNamed(name)) break :blk true;
             }
             if (host_globals.lookupGlobal(self, name)) |g| {
-                break :blk (g == .Function or g == .IrClosure);
+                break :blk (g == .IrClosure);
             }
             break :blk false;
         };
@@ -1321,7 +1308,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 const last_idx = func.params.len - 1;
                 const lambda_claim = std.mem.startsWith(u8, func.params[last_idx].ty.name, "Function") and
                     args.len > 0 and
-                    (args[args.len - 1] == .IrClosure or args[args.len - 1] == .Function or
+                    (args[args.len - 1] == .IrClosure or
                         args[args.len - 1] == .BoundMethod);
                 var n: usize = 0;
                 for (vi + 1..func.params.len) |j| {

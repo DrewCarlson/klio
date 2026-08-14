@@ -729,7 +729,7 @@ fn trampolinableGlobalOf(module: *const Module, inst: *const Inst) ?TrampGlobal 
 
 fn isCallableValue(v: Value) bool {
     return switch (v) {
-        .IrClosure, .Function, .Intrinsic, .BoundMethod, .BoundUserMethod => true,
+        .IrClosure, .Intrinsic, .BoundMethod => true,
         else => false,
     };
 }

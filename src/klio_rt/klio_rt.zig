@@ -151,7 +151,11 @@ export fn klio_rt_hot_layout(out: *HotLayout) void {
         .tag_int = readTag(&vi, t.off, t.size),
         .tag_long = readTag(&vl, t.off, t.size),
         .tag_bool = readTag(&vb, t.off, t.size),
-        .usable = @intFromBool(!runtime.reclaimEnabled()),
+        // The run path turns per-thread reclaim OFF unless the process
+        // explicitly requested a reclaim mode (KLIO_RECLAIM); the live
+        // flag is not yet set on this thread when the slot fills, so the
+        // request is the decision that matters.
+        .usable = @intFromBool(!runtime.reclaimRequested()),
     };
 }
 
@@ -178,6 +182,10 @@ export fn klio_rt_register_module_check(n_funcs: u64, n_consts: u64) void {
 
 inline fn ctxOf(p: *anyopaque) *eval.NativeCtx {
     return @ptrCast(@alignCast(p));
+}
+
+export fn klio_op_regs(ctx: *anyopaque) [*]u8 {
+    return eval.nativeFrameRegs(ctxOf(ctx));
 }
 
 export fn klio_op_trace(ctx: *anyopaque, file: u32, start: u32, end: u32) void {
