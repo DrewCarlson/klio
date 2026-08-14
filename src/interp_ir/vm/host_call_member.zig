@@ -13207,7 +13207,7 @@ fn instanceOuterLink(v: *const Value) ?Value {
 ///   4. parameter specificity — the most-specific declared parameter types
 ///      for the supplied value args;
 ///   5. a stable key (lowest `FuncId`) so the winner is always unique.
-const ExtKey = [8]i32;
+const ExtKey = [9]i32;
 
 fn extKeyGreater(a: ExtKey, b: ExtKey) bool {
     inline for (0..a.len) |i| {
@@ -13253,7 +13253,7 @@ fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Valu
     var tied: std.ArrayList(Func) = .empty;
     defer tied.deinit(self.allocator);
     var best: ?Candidate = null;
-    var best_key: ExtKey = .{std.math.minInt(i32)} ** 8;
+    var best_key: ExtKey = .{std.math.minInt(i32)} ** 9;
     for (candidates, 0..) |c, idx| {
         // The per-candidate ExtKey — applicability is Kotlin's hard gate
         // (`ext_key[0]`), then user-vs-shipped, subtype specificity, receiver

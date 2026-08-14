@@ -3947,7 +3947,7 @@ fn routeResumedResult(
         .ok => |v| carry.* = v,
         .err => |e| switch (e) {
             .Suspended => |inner| {
-                if (head < frames.items.len or tails.* != null) {
+                if (head < frames.items.len) {
                     const seg = try allocator.create(TailSeg);
                     seg.* = .{ .frames = frames.*, .head = head, .next = tails.* };
                     frames.* = .empty;
@@ -3958,6 +3958,15 @@ fn routeResumedResult(
                     var slot: *?*TailSeg = &inner.tails;
                     while (slot.*) |t| slot = &t.next;
                     slot.* = seg;
+                } else if (tails.* != null) {
+                    // This list is drained: hand the inherited chain through
+                    // WITHOUT wrapping an empty segment around it — every
+                    // park/resume cycle of a suspending loop otherwise grew
+                    // the parked state's chain by one dead segment, forever.
+                    var slot: *?*TailSeg = &inner.tails;
+                    while (slot.*) |t| slot = &t.next;
+                    slot.* = tails.*;
+                    tails.* = null;
                 }
                 return .{ .done = errResult(.{ .Suspended = inner }) };
             },
@@ -4603,7 +4612,24 @@ fn LoopTramp(comptime H: type) type {
             frame: *Frame,
             pending: ?EvalError = null,
             pending_deopt_inst: u32 = 0,
+            /// Set alongside `pending` when a trampolined callee SUSPENDED:
+            /// the call site's instruction index and result register, so the
+            /// interpreter can park this frame at the call exactly as the
+            /// interpreted path would (block, inst+1, resume reg). Without
+            /// it the suspension propagated as a plain error and the loop
+            /// frame fell out of the continuation — a JITted `for` sending
+            /// into a channel silently lost every element after the tier-up.
+            pending_suspend_inst: u32 = 0,
+            pending_suspend_dst: ?Reg = null,
         };
+
+        fn stashErr(lc: *Ctx, e: EvalError, inst: u32, dst: ?Reg) void {
+            lc.pending = e;
+            if (e == .Suspended) {
+                lc.pending_suspend_inst = inst;
+                lc.pending_suspend_dst = dst;
+            }
+        }
 
         /// The trampoline's BULKY non-call sites (field write, subscript, value call,
         /// map get/set). Zig does not reclaim block-scoped stack allocations
@@ -4695,7 +4721,7 @@ fn LoopTramp(comptime H: type) type {
                         if (fr) |r2| switch (r2) {
                             .ok => return 0,
                             .err => |e| {
-                                lc.pending = e;
+                                stashErr(lc, e, site.inst, Reg.from(site.dst_reg));
                                 return jit_loop.throwCode(site.block);
                             },
                         };
@@ -4708,7 +4734,7 @@ fn LoopTramp(comptime H: type) type {
                 switch (r) {
                     .ok => return 0,
                     .err => |e| {
-                        lc.pending = e;
+                        stashErr(lc, e, site.inst, Reg.from(site.dst_reg));
                         return jit_loop.throwCode(site.block);
                     },
                 }
@@ -4728,7 +4754,7 @@ fn LoopTramp(comptime H: type) type {
                 switch (r) {
                     .ok => return 0,
                     .err => |e| {
-                        lc.pending = e;
+                        stashErr(lc, e, site.inst, null);
                         return jit_loop.throwCode(site.block);
                     },
                 }
@@ -4760,7 +4786,7 @@ fn LoopTramp(comptime H: type) type {
                         return 0;
                     },
                     .err => |e| {
-                        lc.pending = e;
+                        stashErr(lc, e, site.inst, Reg.from(site.dst_reg));
                         return jit_loop.throwCode(site.block);
                     },
                 }
@@ -4802,7 +4828,7 @@ fn LoopTramp(comptime H: type) type {
                         return 0;
                     },
                     .err => |e| {
-                        lc.pending = e;
+                        stashErr(lc, e, site.inst, Reg.from(site.dst_reg));
                         return jit_loop.throwCode(site.block);
                     },
                 }
@@ -5019,7 +5045,7 @@ fn LoopTramp(comptime H: type) type {
                     return 0;
                 },
                 .err => |e| {
-                    lc.pending = e;
+                    stashErr(lc, e, site.inst, Reg.from(site.dst_reg));
                     return jit_loop.throwCode(site.block);
                 },
             }
@@ -5215,6 +5241,24 @@ fn runFrameExec(
                                 resume_throw = exc;
                                 cur = res.block;
                                 continue;
+                            },
+                            // A trampolined callee SUSPENDED mid-loop: park
+                            // this frame at the call site exactly as the
+                            // interpreted path would — the native exit has
+                            // already reboxed the loop registers, so the
+                            // snapshot resumes the loop right after the
+                            // call with the resume value in its dst.
+                            // Propagating it as a plain error dropped the
+                            // loop frame from the continuation (a JITted
+                            // `for` sending into a channel lost every
+                            // element after the tier-up).
+                            .Suspended => {
+                                park_out.* = .{
+                                    .block = res.block,
+                                    .inst_idx = @as(usize, loop_ctx.pending_suspend_inst) + 1,
+                                    .resume_reg = loop_ctx.pending_suspend_dst,
+                                };
+                                return errResult(e);
                             },
                             else => return errResult(e),
                         }
@@ -8879,11 +8923,35 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
         // shape the recorded misses still miss and only the recorded
         // winner (if any) needs its probe re-run.
         runtime.prof.opRoute(12);
+        // Kotlin lexical scoping: a captured enclosing local — materialized
+        // for a runtime-lowered method body as a scoped-global layer — is a
+        // NEARER binding than any implicit receiver's EXTENSION property.
+        // Real members stay nearer than the capture (the class-body scope
+        // encloses it), so the receiver walk is skipped only when every
+        // candidate is an Instance and none of their classes declares the
+        // name. Without this, AwaiterQueue's `private inline val Int.count`
+        // hijacked a captured `count` through any receiver chain holding an
+        // Int, and the read never reached the capture's cell.
+        var capture_shadows = false;
+        if (comptime @hasDecl(H, "scopedLocalBinds") and @hasDecl(H, "hostHasMember")) {
+            const bare0 = stripScopeGetter(name_str);
+            if (host.scopedLocalBinds(bare0)) {
+                capture_shadows = true;
+                for (cands) |c| {
+                    if (c.v != .Instance or host.hostHasMember(&c.v, bare0)) {
+                        capture_shadows = false;
+                        break;
+                    }
+                }
+            }
+        }
         const shape = implicitSiteShape(cands);
-        var full_walk = true;
+        var full_walk = !capture_shadows;
+        // The site memo may hold an extension-property winner recorded in a
+        // context without the capture layer; skip it when shadowed.
         if (shape) |sh| {
             const cached = @atomicLoad(u64, @constCast(&lt.site_cache), .monotonic);
-            if (cached != 0 and (cached ^ sh) & SITE_SHAPE_MASK == 0) {
+            if (cached != 0 and !capture_shadows and (cached ^ sh) & SITE_SHAPE_MASK == 0) {
                 const verdict = cached & 3;
                 if (verdict == SITE_MISS) {
                     full_walk = false;

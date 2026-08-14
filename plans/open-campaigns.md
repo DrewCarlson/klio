@@ -78,25 +78,66 @@ both suite-level (plugin conformance ratchet):
 - [ ] checkboxLike = the SLOT-EXACT emission anchor: klio emits 21
       slots memo-off / 24 memo-on vs kotlinc's 18 cap (groups fine at
       6 <= 8). The excess predates memoization — this is the measuring
-      stick for the group/slot emission-shape debt below. NOTE:
-      non-capturing lambdas already have singleton identity in klio
-      (guard example non_capturing_lambda_identity.kt), so the 0-capture
-      memo wrap can likely be dropped without breaking
-      funInterface_isMemoized — a slot-count lever to try first.
-- [ ] movableContentOf factory wrap: kotlinc wraps factory-returned
-      composable lambdas in composableLambdaInstance (key, tracked,
-      wrapper) so every content(n) call site gets a restart group
-      enclosing the movable group; klio leaves them RAW = a missing
-      bracket level. A drafted patch (wrap ret_composable lambdas ×3
-      arms) CORE-DUMPED with 10001-frame recursion — bisect plan:
-      gate the wrap to movableContent* factory names first, then find
-      which fn self-recurses (suspect engine fns whose returned lambda
-      self-references, or the CLI-invoke updateScope loop).
-- [ ] Group start/end imbalance: the ref-1 offset stream closes ONE
-      level too many (EndCurrentGroup lands parent=3 not parent=5), so
-      SkipToEndOfCurrentGroup runs to the PARENT end past the ref2
-      destination; single-ref tests tolerate it. Probe recipe in the
-      triage memory (Operations.kt [op] print with val op0=this.operation).
+      stick for the group/slot emission-shape debt below. MEASURED
+      NEGATIVE: skipping the 0-capture memo wrap BREAKS
+      funInterface_isMemoized (the VM builds a fresh closure per
+      execution — ir-closure#542 vs #904; the
+      non_capturing_lambda_identity guard exercises a different path)
+      and does NOT reduce checkboxLike's slots (still 24). ROOT NOW
+      FULLY CHARACTERIZED (slot dump via in-situ CompositionGroup.data
+      print in slotExpect): the +6 excess = memo KEY slots — klio's
+      `remember(k1,k2){lam}` stores each captured key, while kotlinc
+      keys the memo on per-param `$dirty` BIT-TRIPLES (zero key slots,
+      one cache slot). A coarse single-bit condition is NOT a shortcut:
+      it over-invalidates and breaks funInterface_isMemoized (identity
+      must survive recompositions where the captures did not change).
+      The fix is the skip-calculus upgrade to kotlinc's per-param
+      changed/dirty bit layout (3 bits per param + child-call masks) —
+      a campaign of its own; checkboxLike stays its ratchet test.
+      Closure interning at buildClosure is the companion road (UNSOUND
+      naively — closures capture the creation-time receiver chain).
+- [ ] CompositionTests remember-family (~8 solo fails:
+      testSimpleRemember, testRememberOneParameter..Five, keyChange,
+      testApplierBeginEndCallbacks) — ROOT DIAGNOSED, campaign-sized:
+      a LOCAL class declared in the compositionTest suspend lambda has
+      its `count++` init resolve `count` through the DYNAMIC runtime
+      receiver chain instead of its lexical scope — the walk finds a
+      REAL `count` member on a scheduler/machinery receiver (=100 after
+      100 virtual frames), and the write falls to the name-keyed global
+      (assert then reads 101). Repro family
+      scratchpad/reprosrc/LocalRememberReproTests.kt (zq-renamed
+      variants pass after the read-tier fix; `count`-named still hit
+      the dynamic-chain member). LANDED SO FAR: bare-name reads now
+      rank an active scoped-capture layer ABOVE implicit receivers'
+      EXTENSION properties (AwaiterQueue's `private inline val
+      Int.count` was hijacking any unresolved `count` via chain Ints).
+      REMAINING (the campaign): (1) receiver-PUBLICATION discipline —
+      seeding local-class instances with a RegisterClass-time chain
+      snapshot was MEASURED NEUTRAL (reverted): the captured chain is
+      itself dynamically over-wide because evtls.active_chain
+      accumulates every published receiver up the call stack; the chain
+      must carry only lexical implicit receivers; (2) scoped-capture
+      layer writes must
+      round-trip through the captured CELL (StoreToThisOrGlobal
+      currently clobbers via storeGlobal); (3) the private
+      member-extension-property visibility gate (plain (recv,name)
+      registration leaks program-wide; first gating attempt broke
+      JobSupport's `Any?.exceptionOrNull` — needs frame-owner-aware
+      visibility, not just the this-chain tower).
+- [x] movableContentOf factory wrap RECLASSIFIED latent: the gated
+      wrap (movableContent* factory names, compose_pass wrap_ret) is
+      in tree and MovableContentTests is 44/44 — no live test pins the
+      ungated arms. Widening to all composable-returning factories
+      stays recorded (the drafted ungated patch core-dumped with
+      10001-frame recursion; bisect plan in triage memory) and waits
+      for a failure that names it.
+- [x] Group start/end imbalance RECLASSIFIED latent: the tests that
+      exposed it (movable multi-ref family) are green after the window
+      band + judgment + dispatch fixes; no live failing test remains.
+      The op-trace probe recipe stays in the triage memory
+      (Operations.kt [op] print with val op0=this.operation) for when
+      a shape re-pins it. checkboxLike's SLOT count is the live
+      emission-shape anchor instead.
 
 State: opened this stretch; both roots recorded with probes and bisect
 plans in memory klio-compose-plugin-triage.
@@ -106,23 +147,102 @@ plans in memory klio-compose-plugin-triage.
 Scattered, each half-diagnosed. No single plan doc yet — write one when
 the campaign opens (`COROUTINE-MODEL.md` is the architecture reference).
 
-- [ ] with_timeout preempt
-- [ ] private_shadow cells
+- [x] with_timeout preempt — STALE: re-verified passing
+      (withTimeoutOrNull(5){delay(50)} = null, standalone and nested
+      under coroutineScope / withTimeout; fixed by intervening work).
+- [x] private_shadow cells — STALE: both val and var shapes print the
+      exact kotlinc outputs (distinct per-class cells).
+- [x] THE #10 "CHANNEL DEADLOCK" FIXED — it was the LOOP JIT, not
+      the channel: a trampolined callee's SUSPENSION propagated as a
+      plain error, dropping the JITted loop frame from the
+      continuation. A `for (i in 1..N) ch.send(i)` lost every element
+      after the ~64-iteration tier-up (KLIO_JIT=0 was the decisive
+      bisect; segment-size and capacity sweeps were red herrings, as
+      was the entire cross-thread machinery — resumeExternal and the
+      mailboxes traced clean). Fix: the trampoline stashes the call
+      site's inst+dst on a Suspended result and the interpreter parks
+      the frame at the call site (park_out), exactly the interpreted
+      protocol. Whole family green: 1..2000 items, 5-actor original,
+      worker/inline variants. Guard: litmus
+      tl_channel_jit_send_loop.kt (litmus now 45/45). SIDE FIND still
+      open: every park/resume cycle leaks one EMPTY TailSeg on the
+      suspend-state chain (routeResumedResult re-wraps; empties never
+      freed eagerly) — unbounded, benign-looking.
+- [ ] combine/zip STILL LIVE (the last of the flow-campaign #3
+      family; takeWhile/drop/produce-standalone all pass): zip fails
+      `cast to SendChannel` because `val second = produce<Any>{...}`
+      inside the pack-lowered zipImpl never binds — TWO stacked roots.
+      FIXED HALF: bare `produce {}` statically tied across the 3
+      CoroutineScope.produce overloads (all applicable via defaults);
+      the extension ranking key now carries Kotlin's
+      fewest-defaults-filled tiebreak (9th key slot before identity)
+      and the site statically pins produce#2771. REMAINING HALF (the
+      receiver-publication campaign again): at runtime the implicit
+      receiver chain inside unsafeFlow's anon collect is headed by the
+      RAW COLLECTOR CLOSURE (toCollection's `collect {}` lambda passes
+      as an IrClosure, `collector.block()` then seats it as the
+      block's receiver), so coroutineScope/produce/println all
+      member-dispatch against kotlin.Function first and the resolved
+      target gets the wrong `this`. combine's `emit` on FlowCoroutine
+      is the same seating. Full trace anatomy in triage memory (62).
 - [ ] Cancellation cluster (flow campaign residue)
 - [ ] Unconfined event loop (= createEventLoop debt)
-- [ ] tl_atomic_update_contended litmus flake (timeout under load)
+- [ ] tl_atomic_update_contended litmus flake (timeout under load;
+      the sweep now prints got-vs-expected tails, so the next natural
+      occurrence is postmortem-able)
+- [x] tl_yield_cross_thread_teardown "flake" was the litmus sweep's
+      expectation PARSER stopping at the first code line (bottom-of-
+      file //> lines read as empty). Fixed; litmus baseline is now
+      45/45 — any litmus failure is REAL.
+- [x] The recorded #10 five-actor channel deadlock was the LOOP JIT
+      dropping a suspended loop frame from the continuation (fixed;
+      litmus guard tl_channel_jit_send_loop.kt) and the park/resume
+      empty-TailSeg leak is fixed too (chains hold at one segment;
+      ratchet 1353 with DNC classes 3 -> 2).
+- [x] Stale-killed on re-verification: with_timeout preempt,
+      private_shadow val+var, atomicfu SupervisorJob CAS. Unconfined
+      yield ORDER needs a kotlinc oracle before it can be called a bug
+      (klio: U1 U2 L1 L2).
 - [ ] Background-yield 55s cost (suite-perf memory)
+- [ ] CompositionTests.testCompositionAndRecomposerDeadlock +
+      PausableCompositionTests.markInvalidFromBackgroundThread — both
+      eat the 300s wall cap solo. STALL SHAPE CAPTURED (straggler1):
+      the runTest watchdog parks on TestCoroutineScheduler.
+      receiveDispatchEvent while the test body's join never completes —
+      a REAL background-thread Recomposer's dispatch event never
+      reaches the virtual scheduler's channel. The cross-thread corner
+      of the receiver/dispatch campaign.
 
 State: not started.
 
 ## 4. ktor_commontest upstream fails
 
-292 upstream test failures, unmapped. Reference: `KTOR-SERVER-UPSTREAM.md`.
+Reference: `KTOR-SERVER-UPSTREAM.md`. The recorded "292" was stale AND
+inflated by a stale-pack census trap: the itest REBUILDS all five packs
+before running — a census against old installed packs fails 100%.
+Fresh-pack per-class census (43 files, ktor-io/utils/http common
+tests): 322/444 passing at the start of this stretch.
 
-- [ ] Triage the 292 into failure classes
-- [ ] Fix by class, ratchet the count
+- [x] Triage: the DOMINANT class was not interpreter bugs at all — the
+      io.ktor pack's curated `include` lists simply omit upstream files
+      the tests exercise (Base64, Crypto/Hash/Nonce, converters, date
+      parsing, Cookie/Mimes/FileContentType/AcceptEncoding,
+      LineEnding(Mode)/ByteChannelScanner/SinkByteWriteChannel...).
+      Recipe proven and applied in three batches: 322 -> 399/444
+      (Base64Test, AcceptEncoding, ContentType*, CommonHeaders,
+      RenderSetCookie, GMTDate*, ReadLine 22/25... whole classes to
+      green). One trap: a speculative include (IpParser.kt) pulled the
+      unconsumed parsing DSL and broke the whole bake — add only files
+      a failing test names, drop on bake error.
+- [ ] Remaining 44 real fails + 2 timeout classes, clustered:
+      ConcurrentSetTest 9, ChannelTest 7, CookieDateParser 3,
+      DataConversion 3, ReadLine tail 3, misc singles;
+      CoroutinesTest + PipelineTest hit the 180s census cap.
+- [ ] Risk note: the widened includes are validated by the commontest
+      census only; the ktor_server/client e2e itests gate them in CI.
 
-State: not started; least-known of the five.
+State: mapped and half-fixed; the remaining fails are real per-class
+interpreter/library bugs with logs under the census recipe.
 
 ## 5. Suite-wall profile
 
