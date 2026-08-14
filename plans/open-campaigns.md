@@ -106,9 +106,20 @@ IF the per-value dup'd captures snapshot is semantically redundant —
 verify against the closure invoke path before touching) and Array
 remain at 16, both hot, and 24 -> 16 pays only if BOTH shrink. Measure
 Value=24's own wins first (rangebench + suite wall vs the 40B-era
-records). NEXT ACTUAL STEP for item 1: the transpiler hot-view sub-ABI
-against the now-stable 24B layout + the rangebench speedup number.
-Then items 2-4.
+records). HOT-VIEW SUB-ABI IN PROGRESS: klio_rt now exports
+klio_rt_hot_layout (runtime-measured Value offsets: size 24, tag@16+1,
+Int/Long/Bool payload@0, tags 2/3/12 — poisoned-padding-masked diff)
+and klio_rt_register_hot_layout (a slot the run entries fill AFTER
+profile selection so `usable` reflects the reclaim mode; GC default =
+usable). REMAINING: transpileEmit emits a static-inline prelude —
+kv_slot(regs,i)=regs+i*size; kv_const_int (write payload@int_off +
+tag byte; old-value release is a no-op precisely when usable);
+kv_bin int fast path (check both tags == tag_int, inline arithmetic,
+else call klio_op_bin) — guarded by `if (KV.usable)` else the existing
+klio_op_* calls; the emitted body needs the frame's regs base:
+add `klio_rt_frame_regs(ctx) -> uint8_t*` export (frame.regs.items.ptr;
+stable per activation). Then rangebench RF JIT-off remeasure = the
+campaign's speedup number. Then items 2-4.
 
 ## previous note (Value=32 landed, superseded above)
 
