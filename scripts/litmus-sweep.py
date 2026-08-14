@@ -27,6 +27,12 @@ DIR = "tests/fixtures/threaded_litmus"
 
 
 def expected(path):
+    # `//>` expectation lines may sit at the top of the file or trail it
+    # (several litmus programs keep them after `main`); scan every line.
+    # The old head-only scan stopped at the first code line, so a
+    # bottom-annotated file compared against an empty expectation and
+    # failed on every run — tl_yield_cross_thread_teardown read as a
+    # permanent "flake".
     out_lines, errs = [], []
     for line in open(path):
         t = line.lstrip(" \t")
@@ -34,10 +40,6 @@ def expected(path):
             errs.append(t[4:].strip())
         elif t.startswith("//>"):
             out_lines.append(t[3:].lstrip(" ").rstrip("\n").rstrip("\r"))
-        elif t.startswith("//") or (not out_lines and not errs and not t.strip()):
-            continue
-        else:
-            break
     return "\n".join(out_lines), errs
 
 
@@ -60,6 +62,18 @@ for f in sorted(glob.glob(f"{DIR}/*.kt")):
         passed += 1
     else:
         failed.append((os.path.basename(f), f"rc={r.returncode}"))
+        # A flake postmortem needs the actual divergence, not just the
+        # verdict: print the got-vs-expected tail (and stderr when the
+        # exit code is the miss) at failure time.
+        print(f"  --- {os.path.basename(f)} got stdout tail:")
+        for line in got.splitlines()[-5:]:
+            print(f"      {line!r}")
+        if exp_errs or r.returncode != 0:
+            for line in r.stderr.splitlines()[-5:]:
+                print(f"      [stderr] {line!r}")
+        print(f"  --- expected:")
+        for line in exp_out.splitlines()[-5:]:
+            print(f"      {line!r}")
 
 print(f"litmus: {passed}/{passed+len(failed)}")
 for name, why in failed:
