@@ -221,8 +221,9 @@ const SpinRwLock = struct {
         const prev = self.state.fetchAdd(1, .acquire);
         if (prev >= 0) return;
         _ = self.state.fetchSub(1, .monotonic);
+        var b: Backoff = .{};
         while (true) {
-            backoff();
+            b.pause();
             const s = self.state.load(.monotonic);
             if (s >= 0) {
                 const again = self.state.fetchAdd(1, .acquire);
@@ -237,11 +238,12 @@ const SpinRwLock = struct {
     }
 
     fn lockExclusive(self: *SpinRwLock) void {
+        var b: Backoff = .{};
         while (true) {
             if (self.state.cmpxchgWeak(0, WRITER, .acquire, .monotonic) == null) {
                 return;
             }
-            backoff();
+            b.pause();
         }
     }
 
@@ -255,10 +257,21 @@ const SpinRwLock = struct {
         _ = self.state.fetchAnd(std.math.maxInt(i32), .release);
     }
 
-    inline fn backoff() void {
-        std.atomic.spinLoopHint();
-        std.Thread.yield() catch {};
-    }
+    /// Guarded-section waits are a handful of instructions, so the first
+    /// retries spin cheap CPU hints; only a wait that keeps losing pays the
+    /// `sched_yield` syscall (the old unconditional yield made every
+    /// contended borrow a syscall).
+    const Backoff = struct {
+        n: u32 = 0,
+        inline fn pause(self: *Backoff) void {
+            self.n +%= 1;
+            if (self.n < 16) {
+                std.atomic.spinLoopHint();
+            } else {
+                std.Thread.yield() catch {};
+            }
+        }
+    };
 };
 
 /// A zero-cost stand-in for `SpinRwLock` used by cells whose payload is
@@ -294,9 +307,9 @@ pub const SpinMutex = struct {
     locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn lock(self: *SpinMutex) void {
+        var b: SpinRwLock.Backoff = .{};
         while (self.locked.swap(true, .acquire)) {
-            std.atomic.spinLoopHint();
-            std.Thread.yield() catch {};
+            b.pause();
         }
     }
 
@@ -758,6 +771,14 @@ pub fn ObjRef(comptime T: type) type {
             // Unguarded mutable access: same write-barrier obligation as a
             // mutable borrow (several host paths store Values through this).
             if (comptime mayHoldRefs(T)) gc.writeBarrier(&self.cell.hdr);
+            return &self.cell.data;
+        }
+
+        /// Unguarded read-only access: no lock, no write barrier. Only for
+        /// payloads the caller can prove are not being mutated concurrently
+        /// (e.g. registry tables that are settled before worker threads run
+        /// and consulted read-only after, gated by their own published flag).
+        pub fn asPtrConst(self: Self) *const T {
             return &self.cell.data;
         }
 

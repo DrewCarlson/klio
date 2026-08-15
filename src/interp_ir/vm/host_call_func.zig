@@ -232,6 +232,16 @@ fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(
 /// `installed_bindings` overlay first so a loaded pack's binding shadows
 /// the stdlib's default implementation.
 fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
+    // Post-link the bindings table is read-only; consult it unguarded
+    // (gated on the published link flag) instead of taking two shared
+    // reader locks per lookup.
+    {
+        const img = self.prog.asPtrConst();
+        if (@atomicLoad(bool, &img.resolved_linked, .acquire)) {
+            if (img.installed_bindings.asPtrConst().resolve(fqn)) |f| return f;
+            return stdlib.implementation(fqn);
+        }
+    }
     {
         const g = self.prog.borrow();
         defer g.deinit();
@@ -442,6 +452,12 @@ fn runtimeErrorToEval(allocator: Allocator, e: RuntimeError) EvalError {
 /// settled once by `ProgramImage.linkResolvedForms` and consulted here by
 /// `FuncId` against the resolved table.
 pub fn resolvedNativeForm(self: *VmHost, func: FuncId) ?StdlibFn {
+    // Steady state (post-link) the table is read-only; skip the shared
+    // reader lock, which ping-pongs across worker threads on every dispatch.
+    const img = self.prog.asPtrConst();
+    if (@atomicLoad(bool, &img.resolved_linked, .acquire)) {
+        return img.resolvedNativeForm(func);
+    }
     const g = self.prog.borrow();
     defer g.deinit();
     return g.get().resolvedNativeForm(func);

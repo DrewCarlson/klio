@@ -561,6 +561,16 @@ fn callFuncIndexedRec(
 /// Resolve a stdlib intrinsic by FQN: a pack-installed binding shadows the
 /// shipped implementation.
 fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
+    // Post-link the bindings table is read-only; consult it unguarded
+    // (gated on the published link flag) instead of taking two shared
+    // reader locks per lookup.
+    {
+        const img = self.prog.asPtrConst();
+        if (@atomicLoad(bool, &img.resolved_linked, .acquire)) {
+            if (img.installed_bindings.asPtrConst().resolve(fqn)) |f| return f;
+            return stdlib.implementation(fqn);
+        }
+    }
     const pg = self.prog.borrow();
     defer pg.deinit();
     const bg = pg.get().installed_bindings.borrow();
@@ -4304,9 +4314,24 @@ pub fn prepareVirtualFlatCall(
         const mg = self.module.borrow();
         defer mg.deinit();
         const module = mg.get();
-        const runtime_class = module.classIdByFqn(class.get().fqn) orelse {
-            if (vtrace) std.debug.print("[vflat] decline no-classid {s}\n", .{class.get().fqn});
-            return null;
+        const runtime_class = cid: {
+            // Replay the class's resolved-id memo before the string-keyed
+            // registry probe (see `ClassDef.resolve_mod`).
+            const cdef = class.get();
+            const mod_key = @intFromPtr(module);
+            if (cdef.resolve_mod.load(.monotonic) == mod_key) {
+                const plus1 = cdef.resolve_cid.load(.acquire);
+                if (plus1 != 0) break :cid ir.ClassId.from(plus1 - 1);
+            }
+            const found = module.classIdByFqn(cdef.fqn) orelse {
+                if (vtrace) std.debug.print("[vflat] decline no-classid {s}\n", .{cdef.fqn});
+                return null;
+            };
+            const mut = @constCast(cdef);
+            if (mut.resolve_mod.cmpxchgStrong(0, mod_key, .acq_rel, .monotonic) == null) {
+                mut.resolve_cid.store(found.int() + 1, .release);
+            }
+            break :cid found;
         };
         const t = module.methodSlotTarget(runtime_class, slot) orelse {
             if (vtrace) std.debug.print("[vflat] decline no-slot-target {s} slot={d}\n", .{ class.get().fqn, slot.int() });
@@ -10275,6 +10300,23 @@ fn typeSafeBarrierAnswer(
     };
 }
 
+/// Claim and fill a CallVirtual host-receiver site memo (single-fill; the
+/// tagged `site_native` release store is the validity gate, so a concurrent
+/// replayer either sees the whole memo or takes the slow path). `name` must
+/// be module-owned so its pointer outlives every replay. Verdict encoding:
+/// low bits 00 = a direct StdlibFn pointer, tag 3 = (op << 2) with 0xFF
+/// meaning "no host op, member-name walk only".
+fn stampVirtSite(site: ?ir.VirtNativeSite, receiver: *const Value, encoded: u64, name: []const u8) void {
+    const st = site orelse return;
+    if (encoded == 0 or (encoded & 3 != 0 and encoded & 3 != 3)) return;
+    const key: u64 = @intFromPtr(receiver.typeFqn().ptr);
+    if (key == 0) return;
+    if (@cmpxchgStrong(u64, st.cls, 0, key, .acq_rel, .monotonic) != null) return;
+    st.name_ptr.* = @intFromPtr(name.ptr);
+    st.name_len.* = @intCast(name.len);
+    @atomicStore(u64, st.native, encoded, .release);
+}
+
 pub fn invokeVirtualMember(
     self: *VmHost,
     allocator: Allocator,
@@ -10283,7 +10325,40 @@ pub fn invokeVirtualMember(
     args: []const Value,
     arg_names_in: []const ?[]const u8,
     arg_params: ?[]const u32,
+    site: ?ir.VirtNativeSite,
 ) Allocator.Error!EvalResult {
+    // Replay a stamped host-receiver site: same interned type FQN means the
+    // walk below would reach the same verdict, so serve it without the
+    // registry probes. Verdicts are tagged in `site_native`'s low bits
+    // (see `stampVirtSite`).
+    if (site) |st| replay: {
+        if (receiver.* == .Instance or isCallable(receiver)) break :replay;
+        const key: u64 = @intFromPtr(receiver.typeFqn().ptr);
+        if (@atomicLoad(u64, st.cls, .monotonic) != key) break :replay;
+        const native_raw = @atomicLoad(u64, st.native, .acquire);
+        if (native_raw == 0) break :replay;
+        const np: [*]const u8 = @ptrFromInt(st.name_ptr.*);
+        const mname = np[0..st.name_len.*];
+        if (native_raw & 3 == 3) {
+            // Slot-op / by-name verdict: the host op first (a per-receiver
+            // decline falls through), then the member-name walk — the exact
+            // tail the probes below would have reached.
+            const opv = native_raw >> 2;
+            if (opv != 0xFF) {
+                const op: HostSlotOp = @enumFromInt(@as(u8, @intCast(opv)));
+                if (try runHostSlotOp(self, allocator, op, receiver, mname, args)) |r| return r;
+            }
+            return callMemberNamed(self, allocator, receiver, mname, args, arg_names_in);
+        }
+        const native: StdlibFn = @ptrFromInt(native_raw);
+        var fqn_buf: [192]u8 = undefined;
+        const member_fqn = std.fmt.bufPrint(&fqn_buf, "{s}.{s}", .{ receiver.typeFqn(), mname }) catch break :replay;
+        var argbuf = try allocator.alloc(Value, args.len + 1);
+        defer allocator.free(argbuf);
+        argbuf[0] = receiver.*;
+        @memcpy(argbuf[1..], args);
+        return dispatchIntrinsic(self, allocator, member_fqn, native, argbuf);
+    }
     // Named arguments folded into `arg_params` at lowering must survive a
     // BY-NAME fallback (an unlinked slot, a bodyless target): derive the
     // names back from the slot root's declared params, or a delegated
@@ -10373,7 +10448,9 @@ pub fn invokeVirtualMember(
             const module = mg.get();
             const root = FuncId.from(slot.int());
             const mname: ?[]const u8 = if (module.funcById(root)) |f| f.name else null;
-            const runtime_class = module.classIdByFqn(receiver.typeFqn()) orelse
+            // `typeFqn` on a non-Instance value is a comptime literal, so the
+            // pointer-identity memo applies.
+            const runtime_class = module.classIdByStaticFqn(receiver.typeFqn()) orelse
                 break :blk .{ .target = null, .name = mname };
             // A host-backed receiver executes its members as native
             // intrinsics keyed by its runtime class's FQN, and that binding
@@ -10432,12 +10509,14 @@ pub fn invokeVirtualMember(
                             else => isScalarValue(receiver),
                         };
                         if (direct) {
+                            stampVirtSite(site, receiver, @intFromPtr(native), n);
                             var argbuf = try allocator.alloc(Value, args.len + 1);
                             defer allocator.free(argbuf);
                             argbuf[0] = receiver.*;
                             @memcpy(argbuf[1..], args);
                             return dispatchIntrinsic(self, allocator, member_fqn, native, argbuf);
                         }
+                        stampVirtSite(site, receiver, (0xFF << 2) | 3, n);
                         break :blk .{ .target = null, .name = n };
                     }
                 } else |_| {}
@@ -10449,7 +10528,15 @@ pub fn invokeVirtualMember(
                 // it by id (`ListIterator.hasPrevious` on a host iterator).
                 if (hostSlotOpFor(module, root)) |op| {
                     const nm2: []const u8 = if (module.funcById(root)) |f| f.name else (mname orelse "");
+                    // Replay must mirror this exact tail (op, then the name
+                    // walk), so a null `mname` — whose fall-through errors
+                    // rather than walking — must not stamp, and the op name
+                    // must be the walk name.
+                    if (mname != null and std.mem.eql(u8, nm2, mname.?))
+                        stampVirtSite(site, receiver, (@as(u64, @intFromEnum(op)) << 2) | 3, mname.?);
                     if (try runHostSlotOp(self, allocator, op, receiver, nm2, args)) |r| return r;
+                } else if (mname) |n| {
+                    stampVirtSite(site, receiver, (0xFF << 2) | 3, n);
                 }
                 if (runtime.envOnce("KLIO_NOINST_WHY") != null)
                     std.debug.print("[noinst-why] no-slot-entry recv={s} root={s}\n", .{ receiver.typeFqn(), if (module.funcById(root)) |f| f.fqn else "?" });
@@ -10464,7 +10551,11 @@ pub fn invokeVirtualMember(
             {
                 if (hostSlotOpFor(module, target)) |op| {
                     const nm2: []const u8 = if (module.funcById(target)) |f| f.name else (mname orelse "");
+                    if (mname != null and std.mem.eql(u8, nm2, mname.?))
+                        stampVirtSite(site, receiver, (@as(u64, @intFromEnum(op)) << 2) | 3, mname.?);
                     if (try runHostSlotOp(self, allocator, op, receiver, nm2, args)) |r| return r;
+                } else if (mname) |n| {
+                    stampVirtSite(site, receiver, (0xFF << 2) | 3, n);
                 }
                 if (runtime.envOnce("KLIO_NOINST_WHY") != null)
                     std.debug.print("[noinst-why] target-not-executable recv={s} root={s} target={s}\n", .{ receiver.typeFqn(), if (module.funcById(root)) |f| f.fqn else "?", if (module.funcById(target)) |f| f.fqn else "?" });
@@ -10561,7 +10652,25 @@ pub fn invokeVirtualMember(
             } else |_| {}
         }
     }
-    var linked: root_mod.ProgramImage.RuntimeVirtualTarget = if (module.classIdByFqn(recv_fqn)) |runtime_class|
+    const memo_class_id: ?ir.ClassId = cid: {
+        // Replay the class's resolved-id memo before the string-keyed
+        // registry probe (see `ClassDef.resolve_mod`).
+        const class = runtime_def.borrow();
+        defer class.deinit();
+        const cdef = class.get();
+        const mod_key = @intFromPtr(module);
+        if (cdef.resolve_mod.load(.monotonic) == mod_key) {
+            const plus1 = cdef.resolve_cid.load(.acquire);
+            if (plus1 != 0) break :cid ir.ClassId.from(plus1 - 1);
+        }
+        const found = module.classIdByFqn(cdef.fqn) orelse break :cid null;
+        const mut = @constCast(cdef);
+        if (mut.resolve_mod.cmpxchgStrong(0, mod_key, .acq_rel, .monotonic) == null) {
+            mut.resolve_cid.store(found.int() + 1, .release);
+        }
+        break :cid found;
+    };
+    var linked: root_mod.ProgramImage.RuntimeVirtualTarget = if (memo_class_id) |runtime_class|
         .{ .main_func = (module.methodSlotTarget(runtime_class, slot) orelse {
             virtualSlotUnlinkedDiag(module, slot, recv_fqn, args.len, "receiver class");
             if (slot_name) |n| return callMemberNamed(self, allocator, receiver, n, args, arg_names);

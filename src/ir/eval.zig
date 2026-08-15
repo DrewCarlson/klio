@@ -7081,7 +7081,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         .CallSuper => |csup| return execArmCallSuper(H, allocator, frame, csup, host),
         .CallMemberOrGlobal => |*cmg| return execCallMemberOrGlobal(H, allocator, frame, cmg, host),
         .CallMember => |*cm| return execArmCallMember(H, allocator, frame, cm, host),
-        .CallVirtual => |cv| return execArmCallVirtual(H, allocator, frame, cv, host),
+        .CallVirtual => |*cv| return execArmCallVirtual(H, allocator, frame, cv, host),
         .CallMemberOrValue => |cmv| return execArmCallMemberOrValue(H, allocator, frame, cmv, host),
         .CallValueOrMember => |cvm| return execArmCallValueOrMember(H, allocator, frame, cvm, host),
         .NewInstance => |ni| return execArmNewInstance(H, allocator, frame, ni, host),
@@ -8265,6 +8265,7 @@ noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame: *Fr
             arg_values.items,
             &.{},
             effective_params.items,
+            null,
         );
         if (cs.trailing_lambda) {
             if (comptime @hasDecl(H, "setTrailingMemberCall")) _ = H.setTrailingMemberCall(prev_tl);
@@ -8381,7 +8382,18 @@ noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *F
         H.setTrailingMemberCall(true)
     else
         false;
-    const result = host.invokeVirtualMember(allocator, &recv, cv.slot, args, names, cv.arg_params);
+    // Host-receiver site memo handles: only a plain positional call may
+    // stamp or replay (the memoized direct dispatch binds positionally).
+    const site: ?ir.VirtNativeSite = if (cv.arg_params == null and argNamesAllNull(cv.arg_names))
+        .{
+            .cls = @constCast(&cv.site_cls),
+            .native = @constCast(&cv.site_native),
+            .name_ptr = @constCast(&cv.site_name_ptr),
+            .name_len = @constCast(&cv.site_name_len),
+        }
+    else
+        null;
+    const result = host.invokeVirtualMember(allocator, &recv, cv.slot, args, names, cv.arg_params, site);
     if (cv.trailing_lambda) {
         if (comptime @hasDecl(H, "setTrailingMemberCall")) _ = H.setTrailingMemberCall(prev_tl);
     }

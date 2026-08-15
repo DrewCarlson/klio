@@ -223,6 +223,16 @@ fn lookupPairFuncHop(self: *VmHost, map: anytype, cn: []const u8, b: []const u8)
 /// Look up an intrinsic by FQN: the pack-supplied bindings overlay
 /// first, then the stdlib default implementation.
 fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
+    // Post-link the bindings table is read-only; consult it unguarded
+    // (gated on the published link flag) instead of taking two shared
+    // reader locks per lookup.
+    {
+        const img = self.prog.asPtrConst();
+        if (@atomicLoad(bool, &img.resolved_linked, .acquire)) {
+            if (img.installed_bindings.asPtrConst().resolve(fqn)) |f| return f;
+            return stdlib.implementation(fqn);
+        }
+    }
     {
         const g = self.prog.borrow();
         defer g.deinit();

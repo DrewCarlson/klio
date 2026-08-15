@@ -233,6 +233,7 @@ pub fn maybeReport() void {
     var by_name = std.StringHashMap(u32).init(gpa);
     defer by_name.deinit();
 
+    const maps = MapRanges.read(arena);
     var it = addr_counts.iterator();
     while (it.next()) |entry| {
         const addr = entry.key_ptr.*;
@@ -240,13 +241,13 @@ pub fn maybeReport() void {
         var syms: std.ArrayList(std.debug.Symbol) = .empty;
         defer syms.deinit(gpa);
         di.getSymbols(io, gpa, arena, addr -| 1, false, &syms) catch {
-            accumulate(&by_name, arena, "<unknown>", c);
+            accumulate(&by_name, arena, maps.label(arena, addr), c);
             continue;
         };
         const nm: []const u8 = if (syms.items.len > 0 and syms.items[0].name != null)
             syms.items[0].name.?
         else
-            "<unknown>";
+            maps.label(arena, addr);
         accumulate(&by_name, arena, nm, c);
     }
 
@@ -345,6 +346,56 @@ pub fn maybeReport() void {
         }
     }
 }
+
+/// The process's /proc/self/maps regions, held so an address the debug-info
+/// symbolizer cannot resolve is at least attributed to its mapped module
+/// (`<unknown:libc.so.6>`) instead of one opaque bucket.
+const MapRanges = struct {
+    starts: []usize = &.{},
+    ends: []usize = &.{},
+    names: [][]const u8 = &.{},
+
+    fn read(arena: std.mem.Allocator) MapRanges {
+        var out: MapRanges = .{};
+        const f = std.fs.openFileAbsolute("/proc/self/maps", .{}) catch return out;
+        defer f.close();
+        const text = f.deprecatedReader().readAllAlloc(arena, 4 * 1024 * 1024) catch return out;
+        var starts: std.ArrayList(usize) = .empty;
+        var ends: std.ArrayList(usize) = .empty;
+        var names: std.ArrayList([]const u8) = .empty;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
+            const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            const s = std.fmt.parseInt(usize, line[0..dash], 16) catch continue;
+            const e = std.fmt.parseInt(usize, line[dash + 1 .. sp], 16) catch continue;
+            const base = if (std.mem.lastIndexOfScalar(u8, line, '/')) |i|
+                line[i + 1 ..]
+            else if (std.mem.lastIndexOfScalar(u8, line, ' ')) |i|
+                line[i + 1 ..]
+            else
+                "";
+            starts.append(arena, s) catch return out;
+            ends.append(arena, e) catch return out;
+            names.append(arena, base) catch return out;
+        }
+        out.starts = starts.items;
+        out.ends = ends.items;
+        out.names = names.items;
+        return out;
+    }
+
+    fn label(self: *const MapRanges, arena: std.mem.Allocator, addr: usize) []const u8 {
+        for (self.starts, self.ends, self.names) |s, e, nm| {
+            if (addr >= s and addr < e) {
+                if (nm.len == 0) return "<unknown:anon>";
+                return std.fmt.allocPrint(arena, "<unknown:{s}>", .{nm}) catch "<unknown>";
+            }
+        }
+        return "<unknown>";
+    }
+};
 
 fn accumulate(map: *std.StringHashMap(u32), arena: std.mem.Allocator, name: []const u8, c: u32) void {
     const e = map.getOrPut(name) catch return;

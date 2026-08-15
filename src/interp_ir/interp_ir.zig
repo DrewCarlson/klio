@@ -512,6 +512,11 @@ pub const ProgramImage = struct {
     /// Idempotent: re-running after an `installed_bindings` change
     /// rebuilds the table.
     pub fn linkResolvedForms(self: *ProgramImage, module: *const Module) Allocator.Error!void {
+        // Unpublish before touching the tables: the VM's steady-state fast
+        // paths read them unguarded gated on this flag, and a relink (run
+        // setup, overlay install) must push those readers back onto the
+        // locked path first.
+        @atomicStore(bool, &self.resolved_linked, false, .release);
         self.resolved_native.clearRetainingCapacity();
         self.vararg_spread_adapters.clearRetainingCapacity();
         self.clearResolvedRedirects();
@@ -637,7 +642,7 @@ pub const ProgramImage = struct {
             if (f.hasBody()) continue;
             try self.linkBodyless(module, bindings, FuncId.from(base_n + @as(u32, @intCast(j))));
         }
-        self.resolved_linked = true;
+        @atomicStore(bool, &self.resolved_linked, true, .release);
     }
 
     /// Settle one bodyless func's executable form: a same-simple-name body

@@ -125,6 +125,16 @@ pub const ClassDef = struct {
     first_super_index: u8 = 0,
     first_super_fqn: ?[]const u8 = null,
 
+    /// Single-fill memo: the ir-module `ClassId` this runtime class resolves
+    /// to, so the virtual-dispatch fast path skips the string-keyed
+    /// `classIdByFqn` probe it was paying per call. `resolve_mod` is claimed
+    /// by the first resolving module's pointer identity (CAS from 0);
+    /// `resolve_cid` (the id + 1, release-stored after the claim) is the
+    /// validity gate. A class consulted under a different module than the
+    /// one that claimed the memo just keeps the slow path.
+    resolve_mod: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    resolve_cid: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
     /// One eager enum entry: its name and the `Value::Instance` for it.
     pub const EnumEntry = struct { name: []const u8, value: Value };
     /// One nested class binding: simple name -> resolved `ClassDef`.

@@ -105,6 +105,37 @@ memory klio-compose-plugin-triage).
             registry read locks ~10%. The tests still exceed their
             declared runTest timeouts interpreted; next levers listed
             in the same profile order.
+      - [x] 3 of the 7 stress timeouts now PASS solo (concurrentMixing
+            WriteApply_add, concurrentModificationInGlobal_put_replace,
+            resumeOnBackgroundThread) after the second lever round:
+            lock-free steady-state registry reads (resolvedNativeForm /
+            lookupIntrinsic via `asPtrConst` gated on an atomic
+            `resolved_linked`), exponential lock backoff, ObjRef.clone
+            gated like deinit, CallVirtual host-receiver site memo
+            (native / host-slot-op / by-name verdicts), ClassDef
+            resolved-ClassId memo, Module.classIdByStaticFqn
+            pointer-identity memo. put_replace 24 -> 62 outer
+            iterations per 30s cumulative.
+      - [ ] The 4 remaining (SnapshotStateMapTests.concurrentMixing
+            WriteApply_clear + SnapshotStateListTests addAll_removeRange /
+            addAll_clear / concurrentGlobalModifications_addAll) fail
+            their own declared runTest(timeout=30s): ~5s per outer rep
+            interpreted, 10 reps. The residual profile is spread
+            (memset frame zeroing ~9%, string-eql walk internals ~9%,
+            shared-instance borrows ~5%, unattributed ~15%) — no single
+            lever left; needs the next measured campaign round (frame
+            pooling, walk-internal caches).
+      - [ ] RecomposerTests.validatePotentialDeadlock: NOT compute — the
+            test's `withContext(Dispatchers.Default)` loop re-posts an
+            immediate event at the same virtual timestamp forever, and
+            upstream `advanceTimeBy` only returns when a poll finds the
+            queue momentarily empty. That is a real-time race the
+            compiled JVM usually wins; klio's interpreted drain loop
+            always loses against a microsecond-fast worker, so advance
+            iteration 3 never returns and the 300s wall cap fires
+            ("daemon task abandoned at run boundary" is the abandon
+            diagnostic, not the cause). Needs a pump-fairness mechanism
+            for virtual-time drains racing real-thread reposts.
 - [ ] B3. The 3 DNC heavy classes: get them completing under caps that
       match their compute (the suite-wall profile says benchmark-shaped
       tests set the floor, not the tooling).
