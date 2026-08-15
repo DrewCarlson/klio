@@ -369,6 +369,30 @@ pub fn anonPropHead(owner: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Captured enclosing-local NAMES carried into a runtime anon-object /
+/// local-class member-body lowering. A captured local is the nearest
+/// binding for its bare name inside the body — nearer than any top-level
+/// property or const of the same simple name — but the side module has no
+/// local slot for it (the value arrives through the scoped capture layer
+/// at dispatch), so the lowering must keep such names DYNAMIC instead of
+/// const-inlining or LoadGlobal-binding a package-scope declaration.
+threadlocal var lower_anon_capture_names: []const []const u8 = &.{};
+
+pub fn setLowerAnonCaptureNames(ns: []const []const u8) []const []const u8 {
+    const prev = lower_anon_capture_names;
+    lower_anon_capture_names = ns;
+    return prev;
+}
+
+/// True when `name` is a captured enclosing local of the anon/local-class
+/// body currently being lowered.
+pub fn anonCaptureBinds(name: []const u8) bool {
+    for (lower_anon_capture_names) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
 /// Classifier identities carried into runtime anonymous-object lowering.
 threadlocal var lower_anon_scope_classes: []const ir.ScopeClassRef = &.{};
 
@@ -2614,6 +2638,52 @@ pub const FuncBuilder = struct {
     }
     pub fn isParam(self: *const FuncBuilder, name: []const u8) bool {
         return self.param_names.contains(name);
+    }
+
+    /// Whether a PLAIN binding of `name` shadows the delegated-local
+    /// binding `dname` (= `name$klio_delegate`): true when the walk, in
+    /// `resolve` order, meets a scope holding `name` WITHOUT `dname`
+    /// before any scope holding `dname`. The declaring scope holds both
+    /// (the eager decl-time cache beside the hidden delegate), so a tie
+    /// goes to the delegate; an inner lambda/splice parameter named like
+    /// an enclosing `var x by D` sits alone in its scope and wins —
+    /// `compareBy`'s `{ a, b -> … }` params must not read the caller's
+    /// `var a by mutableIntStateOf(…)` through the delegate.
+    pub fn plainShadowsDelegate(self: *const FuncBuilder, name: []const u8, dname: []const u8) bool {
+        if (self.lambda_splice_resolve) |w| {
+            const top = self.scopes.items.len;
+            var i = top;
+            while (i > w.own_base) {
+                i -= 1;
+                const m = &self.scopes.items[i];
+                if (m.get(dname) != null) return false;
+                if (m.get(name) != null) return true;
+            }
+            var j = @min(w.caller_depth, top);
+            while (j > 0) {
+                j -= 1;
+                var banded = false;
+                for (self.splice_hidden_bands.items) |band| {
+                    if (j >= band.lo and j <= band.hi) {
+                        banded = true;
+                        break;
+                    }
+                }
+                if (banded) continue;
+                const m = &self.scopes.items[j];
+                if (m.get(dname) != null) return false;
+                if (m.get(name) != null) return true;
+            }
+            return false;
+        }
+        var i = self.scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            const m = &self.scopes.items[i];
+            if (m.get(dname) != null) return false;
+            if (m.get(name) != null) return true;
+        }
+        return false;
     }
 
     pub fn resolve(self: *const FuncBuilder, name: []const u8) ?Reg {

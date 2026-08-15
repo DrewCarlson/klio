@@ -2027,7 +2027,8 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // Compare scope tiers and inline the literal when the constant wins
         // (Kotlin inlines const vals at every reference).
         if (b.resolve(name0) == null and !b.knowsOuter(name0) and
-            !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0))
+            !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
+            !build.anonCaptureBinds(name0))
         {
             if (b.module.topLevelConstLiteral(name0, b.self_package, segments[0].span.file)) |cv| {
                 const ptier = b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file) orelse 255;
@@ -2156,6 +2157,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // and a receiver is (or may be bound) in scope, the read decides
         // at runtime instead.
         if (isTopLevelProp(name0) and !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
+            !build.anonCaptureBinds(name0) and
             b.module.classIdExactImport(name0, segments[0].span.file) == null and
             !(inReceiverContext(b) and anyReceiverClassDeclares(b, name0)))
         {
@@ -13600,6 +13602,9 @@ fn lowerDelegateRead(b: *FuncBuilder, name: []const u8) Allocator.Error!?Reg {
     const in_scope = b.resolve(dname_stack) != null;
     const outer = b.knowsOuter(dname_stack);
     if (!in_scope and !outer) return null;
+    // An inner plain binding (a lambda/splice parameter, a shadowing
+    // local) named like the delegated var outranks the delegate read.
+    if (b.plainShadowsDelegate(name, dname_stack)) return null;
     const dname = try b.allocator.dupe(u8, dname_stack);
     const delegate = if (in_scope) b.resolve(dname).? else try resolveCapture(b, dname);
     const null_arg = try b.emitConst(.Null);
@@ -18904,6 +18909,51 @@ fn lowerResolvedMemberCall(
                     .{ bound.param, bound.bound, bound.complete },
                 );
             }
+        }
+    }
+    // A SELF-recursive member pick with a non-authoritative argument defers
+    // to the runtime walk: kotlinc rejects the member when an invariant
+    // generic argument mismatches (RangesTest's private
+    // `assertEquals(List<IntRange>, List<LongRange>)` delegates to
+    // kotlin.test's on `expected.map { it.toLong() }` — binding itself
+    // statically recursed forever), and only the runtime holds the argument
+    // values that decide it. A genuinely recursive call still binds through
+    // the walk; this trades the static commit for a deferred dispatch on
+    // exactly the shape that can self-capture.
+    if (resolved.target) |rt| self_rec: {
+        const cur = build.currentRealFn() orelse break :self_rec;
+        if (!std.mem.eql(u8, cur, name.name)) break :self_rec;
+        const rf = b.module.funcById(rt) orelse break :self_rec;
+        if (!std.mem.eql(u8, rf.name, name.name)) break :self_rec;
+        if (runtime.envOnce("KLIO_EXT_TRACE")) |w| {
+            if (std.mem.eql(u8, w, name.name)) {
+                for (shapes, 0..) |sh, i| {
+                    std.debug.print("[self-rec-shape] {s} #{d} ty={s} targs={d} targ0={s} lit={} lambda={}\n", .{
+                        name.name,
+                        i,
+                        if (sh.ty) |t| t.name else "<null>",
+                        if (sh.ty) |t| t.args.len else 0,
+                        if (sh.ty != null and sh.ty.?.args.len > 0) sh.ty.?.args[0].name else "-",
+                        sh.literal_kind != null,
+                        sh.is_lambda,
+                    });
+                }
+            }
+        }
+        for (shapes) |sh| {
+            const undecided = blk: {
+                const t = sh.ty orelse break :blk sh.literal_kind == null and !sh.is_lambda;
+                // A derived head whose generic CONTENT is unresolved
+                // (`List<*>`, a bare type variable) cannot prove the
+                // invariant argument the member declares.
+                for (t.args) |ta| {
+                    const an = std.mem.trimEnd(u8, ta.name, "?");
+                    if (std.mem.eql(u8, an, "*")) break :blk true;
+                    if (an.len > 0 and an.len <= 2 and std.ascii.isUpper(an[0])) break :blk true;
+                }
+                break :blk false;
+            };
+            if (undecided) return .none;
         }
     }
     // The checker's own pick, when it made one. Its candidate set for a

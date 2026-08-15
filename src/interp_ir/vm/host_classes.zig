@@ -932,6 +932,11 @@ fn rewriteAccessorFieldRefs(allocator: Allocator, body: ast.FunctionBody, prop: 
 pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const ast.Class, captured_names: []const []const u8, captures: []const Value) Allocator.Error!UnitResult {
     host_instances.anonLowerEnter();
     defer host_instances.anonLowerExit();
+    // The member lowerings below must know which bare names are captured
+    // enclosing locals: a captured `count` is nearer than any top-level
+    // prop/const of that name and must stay a dynamic read/write.
+    const prev_caps = ir.build.setLowerAnonCaptureNames(captured_names);
+    defer _ = ir.build.setLowerAnonCaptureNames(prev_caps);
     switch (try registerClass(self, allocator, class)) {
         .ok => {},
         .err => |e| return .{ .err = e },

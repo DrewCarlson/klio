@@ -3061,6 +3061,33 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
         if (argDefinitelyNotParamType(self, &param_ty.args[2], arg.Triple.third.asPtr())) return true;
         return false;
     }
+    // A List argument adjudicates its RANGE content against a concrete
+    // declared element range type: Kotlin generics are invariant, so a
+    // List of LongRanges never binds `List<IntRange>` — RangesTest's
+    // private `assertEquals(List<IntRange>, List<LongRange>)` delegates
+    // to kotlin.test's on its mapped args instead of recursing into
+    // itself. Progressions and non-range elements stay non-definite.
+    if (arg.* == .List and param_ty.args.len == 1 and
+        (std.mem.eql(u8, pn, "List") or std.mem.eql(u8, pn, "MutableList") or
+            std.mem.eql(u8, pn, "Collection") or std.mem.eql(u8, pn, "Iterable")))
+    {
+        const want: ?runtime.RangeKind = blk: {
+            const en = std.mem.trimEnd(u8, param_ty.args[0].name, "?");
+            if (std.mem.eql(u8, en, "IntRange")) break :blk .Int;
+            if (std.mem.eql(u8, en, "LongRange")) break :blk .Long;
+            if (std.mem.eql(u8, en, "CharRange")) break :blk .Char;
+            break :blk null;
+        };
+        if (want) |wk| {
+            const g = arg.List.items.borrow();
+            defer g.deinit();
+            for (g.get().items) |*e| {
+                if (e.* != .Range) break;
+                if (e.Range.progression) continue;
+                if (e.Range.kind != wk) return true;
+            }
+        }
+    }
     // A container/tuple value never satisfies a scalar or String parameter
     // head (an `Array` head stays out: vararg packing hands pre-packed
     // arrays through here).

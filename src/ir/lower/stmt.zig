@@ -1408,7 +1408,9 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
             // real match heap-dupes a stable name for resolveCapture.
             var namebuf: [512]u8 = undefined;
             if (std.fmt.bufPrint(&namebuf, "{s}$klio_delegate", .{seg})) |dname_stack| {
-                if (b.resolve(dname_stack) != null or b.knowsOuter(dname_stack)) {
+                if ((b.resolve(dname_stack) != null or b.knowsOuter(dname_stack)) and
+                    !b.plainShadowsDelegate(seg, dname_stack))
+                {
                     const dname = try b.allocator.dupe(u8, dname_stack);
                     try emitDelegateSetValue(b, dname, seg, combined);
                 }

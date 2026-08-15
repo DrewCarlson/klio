@@ -75,51 +75,45 @@ both suite-level (plugin conformance ratchet):
       binding the enclosing implicit receiver (arity carried in the
       inherited local-ext mark). Guard examples
       local_ext_fn_reference.kt, member_arg_disproof_extension.kt.
-- [ ] checkboxLike = the SLOT-EXACT emission anchor: klio emits 21
-      slots memo-off / 24 memo-on vs kotlinc's 18 cap (groups fine at
-      6 <= 8). The excess predates memoization — this is the measuring
-      stick for the group/slot emission-shape debt below. MEASURED
-      NEGATIVE: skipping the 0-capture memo wrap BREAKS
-      funInterface_isMemoized (the VM builds a fresh closure per
-      execution — ir-closure#542 vs #904; the
-      non_capturing_lambda_identity guard exercises a different path)
-      and does NOT reduce checkboxLike's slots (still 24). ROOT NOW
-      FULLY CHARACTERIZED (slot dump via in-situ CompositionGroup.data
-      print in slotExpect): the +6 excess = memo KEY slots — klio's
-      `remember(k1,k2){lam}` stores each captured key, while kotlinc
-      keys the memo on per-param `$dirty` BIT-TRIPLES (zero key slots,
-      one cache slot). A coarse single-bit condition is NOT a shortcut:
-      it over-invalidates and breaks funInterface_isMemoized (identity
-      must survive recompositions where the captures did not change).
-      The fix is the skip-calculus upgrade to kotlinc's per-param
-      changed/dirty bit layout (3 bits per param + child-call masks) —
-      a campaign of its own; checkboxLike stays its ratchet test.
-      Closure interning at buildClosure is the companion road (UNSOUND
-      naively — closures capture the creation-time receiver chain).
-- [ ] CompositionTests remember-family (~8 solo fails:
-      testSimpleRemember, testRememberOneParameter..Five, keyChange,
-      testApplierBeginEndCallbacks) — ROOT DIAGNOSED, campaign-sized:
-      a LOCAL class declared in the compositionTest suspend lambda has
-      its `count++` init resolve `count` through the DYNAMIC runtime
-      receiver chain instead of its lexical scope — the walk finds a
-      REAL `count` member on a scheduler/machinery receiver (=100 after
-      100 virtual frames), and the write falls to the name-keyed global
-      (assert then reads 101). Repro family
-      scratchpad/reprosrc/LocalRememberReproTests.kt (zq-renamed
-      variants pass after the read-tier fix; `count`-named still hit
-      the dynamic-chain member). LANDED SO FAR: bare-name reads now
-      rank an active scoped-capture layer ABOVE implicit receivers'
-      EXTENSION properties (AwaiterQueue's `private inline val
-      Int.count` was hijacking any unresolved `count` via chain Ints).
-      REMAINING (the campaign): (1) receiver-PUBLICATION discipline —
-      seeding local-class instances with a RegisterClass-time chain
-      snapshot was MEASURED NEUTRAL (reverted): the captured chain is
-      itself dynamically over-wide because evtls.active_chain
-      accumulates every published receiver up the call stack; the chain
-      must carry only lexical implicit receivers; (2) scoped-capture
-      layer writes must
-      round-trip through the captured CELL (StoreToThisOrGlobal
-      currently clobbers via storeGlobal); (3) the private
+- [x] checkboxLike anchor GREEN (f6bbd362 + 03e41d70): the dirty-bits
+      campaign landed — per-param `$dirty` triples, caller-certainty-
+      guarded probes, call-site `$changed` bits (lowering-side,
+      resolved-signature named-arg mapping, defaulted-param `$arg`
+      forwarding), zero-key-slot memo shapes (cache from `$dirty`,
+      lifted `{}` singletons, cache(false)). checkboxLike went 24
+      slots -> slot-exact PASS (<= 8 groups / <= 18 slots);
+      GroupSizeValidationTests 5/5; remember-family 26/26;
+      funInterface_isMemoized green; ratchet observed 1370-1372,
+      floor RAISED 1305 -> 1340. Full record in
+      plans/compose-dirty-bits-plan.md.
+- [x] CompositionTests remember-family FIXED — 26/26 solo (was ~8
+      fails), LocalRememberReproTests 4/4. Three stacked roots, all
+      landed:
+      (a) OWN-RUN capture shadow: ImplicitCandidate carries an `own`
+      bit (the frame's own dispatch receiver + its companion/nesting
+      tower); a scoped-capture binding now loses only to the OWN run's
+      members — a dispatch-published chain receiver's same-name member
+      no longer outranks a captured local, on the read AND write arms
+      (`count++` in a local-class init binds the captured `count`, and
+      storeGlobal writes through its Cell).
+      (b) runtime-lowered bodies know their CAPTURE NAMES:
+      registerClassCaptured/buildObject install captured_names via
+      build.setLowerAnonCaptureNames; the bare-name classifiers skip
+      top-level-const inline / LoadGlobal binding for captured names
+      (SlotTableEditorTests' file-private `const val count = 100` was
+      const-inlined into another test's local-class init).
+      (c) keyChange: delegated-local param shadow — inside compareBy's
+      spliced `{ a, b -> compareValuesBy(a, b, selector) }`, `a`/`b`
+      resolved to the TEST's `var a by mutableIntStateOf(0)` delegates
+      (getValue → Int) instead of the lambda params;
+      plainShadowsDelegate walks the scope chain in resolve order and
+      an inner plain binding now shadows the delegate read AND
+      setValue write-through. Guard examples:
+      delegated_var_param_shadow.kt, captured_local_shadows_const.kt.
+      Also: intrinsic_host.invokeMethod no longer swallows CalleeFailed
+      into a null dispatch-miss (it masked (c) as
+      "unresolved global sortWith").
+      STILL RECORDED (not blocking any live test here): the private
       member-extension-property visibility gate (plain (recv,name)
       registration leaks program-wide; first gating attempt broke
       JobSupport's `Any?.exceptionOrNull` — needs frame-owner-aware
@@ -139,8 +133,13 @@ both suite-level (plugin conformance ratchet):
       a shape re-pins it. checkboxLike's SLOT count is the live
       emission-shape anchor instead.
 
-State: opened this stretch; both roots recorded with probes and bisect
-plans in memory klio-compose-plugin-triage.
+State: CORPUS 315/315 GREEN (2026-08-15) — window, multiwindow,
+foundation_lazy, serial_names all pass on warm caches; the three
+maxFrames=-1 interactive demos are marked `// corpus: interactive` and
+skipped by corpus_check (an Xvfb display exists on this box, so their
+until-close loop is the app's specified behavior). Remaining fronts:
+the dirty-bits skip calculus (plans/compose-dirty-bits-plan.md), the
+two 300s cross-thread Recomposer tests, and the latent items above.
 
 ## 3. Coroutine debt cluster
 
@@ -185,8 +184,19 @@ the campaign opens (`COROUTINE-MODEL.md` is the architecture reference).
       member-dispatch against kotlin.Function first and the resolved
       target gets the wrong `this`. combine's `emit` on FlowCoroutine
       is the same seating. Full trace anatomy in triage memory (62).
-- [ ] Cancellation cluster (flow campaign residue)
-- [ ] Unconfined event loop (= createEventLoop debt)
+- [x] Cancellation cluster CLOSED BY RE-VERIFICATION (2026-08-15): the
+      flow campaign's recorded repros all pass on current main
+      (plans/repros/channel_segment_rotation_break sum=2415,
+      channel_worker_send_park_lost_wakeup sum=5050, both matching the
+      JVM oracle; combine_captured_param_typeparam_cast is a distilled
+      erasure probe the JVM itself CCEs on — not an oracle), and the
+      litmus tl_cancel_* family is green in the 45/45 baseline.
+- [x] Unconfined event loop: eager start (guard
+      unconfined_starts_eagerly.kt), yield order (oracle-verified, see
+      below), and the manual CancellableContinuation save/resume crash
+      (`get_field context on Unit`) all pass on current main — the
+      save/resume shape now matches the JVM byte-for-byte (guard
+      cancellable_continuation_save_resume.kt).
 - [ ] tl_atomic_update_contended litmus flake (timeout under load;
       the sweep now prints got-vs-expected tails, so the next natural
       occurrence is postmortem-able)
@@ -201,19 +211,30 @@ the campaign opens (`COROUTINE-MODEL.md` is the architecture reference).
       ratchet 1353 with DNC classes 3 -> 2).
 - [x] Stale-killed on re-verification: with_timeout preempt,
       private_shadow val+var, atomicfu SupervisorJob CAS. Unconfined
-      yield ORDER needs a kotlinc oracle before it can be called a bug
-      (klio: U1 U2 L1 L2).
-- [ ] Background-yield 55s cost (suite-perf memory)
-- [ ] CompositionTests.testCompositionAndRecomposerDeadlock +
-      PausableCompositionTests.markInvalidFromBackgroundThread — both
-      eat the 300s wall cap solo. STALL SHAPE CAPTURED (straggler1):
-      the runTest watchdog parks on TestCoroutineScheduler.
-      receiveDispatchEvent while the test body's join never completes —
-      a REAL background-thread Recomposer's dispatch event never
-      reaches the virtual scheduler's channel. The cross-thread corner
-      of the receiver/dispatch campaign.
+      yield ORDER: ORACLE RUN (kotlinc 2.2.20 + kotlinx-coroutines
+      1.9.0 on JVM, toolchain in the session scratchpad) — the JVM
+      prints U1 U2 L1 L2, exactly klio's order. NOT a bug; guard
+      example unconfined_yield_order.kt pins it.
+- [ ] Background-yield 55s cost (suite-perf memory) — PERF, not
+      correctness; parked with the suite-wall floor.
+- [x] CompositionTests.testCompositionAndRecomposerDeadlock +
+      PausableCompositionTests.markInvalidFromBackgroundThread —
+      RECLASSIFIED (2026-08-15): no stall remains. The deadlock test
+      PASSES solo under the census recipe (10s virtual cap); the
+      markInvalid test PASSES in 40s wall once the virtual timeout
+      admits it (kotlinx_coroutines_test_default_timeout=600s) — its
+      body runs 10,000 interpreted background invalidates (repeat(1000)
+      × 10 launches + joins), which is the compute-heavy category from
+      the suite-wall profile, not a cross-thread dispatch loss. Under
+      the census's 10s cap it reports UncompletedCoroutinesError by
+      design; it counts as wall-capped in the ratchet, not as a bug.
 
-State: not started.
+State: CORRECTNESS COMPLETE (2026-08-15). Every recorded coroutine bug
+is fixed, oracle-verified not-a-bug, or reclassified compute-heavy;
+what remains is one perf item (background-yield 55s, parked with the
+suite-wall floor) and the tl_atomic_update_contended flake watch
+(postmortem-able on next natural occurrence — the sweep prints
+got-vs-expected tails).
 
 ## 4. ktor_commontest upstream fails
 
@@ -270,7 +291,19 @@ tests): 322/444 passing at the start of this stretch.
       `parameters`-as-Function family); trailing-vararg element
       adjudication + Pair-component disproof (StringValues 9/9); range
       literal peer widening (list-of-ranges vs Long peer).
-- [ ] Census after all fixes: **464 passed / 3 failed / ZERO incomplete**
+- [x] FINAL census: **465 passed / 2 failed / ZERO incomplete** — the 2
+      = URLBuilder scheme-with-digits (klio MATCHES Kotlin; do not
+      "fix"). RangesTest.testResolveRanges CLOSED (27/27 solo): the
+      self-recursive member bind now defers to the runtime walk when an
+      argument's generic content is unresolved (`List<*>` from the
+      un-derived map), and argDefinitelyNotParamType refutes a List of
+      Long-kind Ranges against an invariant `List<IntRange>` param, so
+      the walk binds kotlin.test.assertEquals exactly as kotlinc does
+      (guard: examples/member_invariant_arg_delegation.kt). The
+      fast/flat `eq(0, 0L)` peer-widening gap is ALSO fixed
+      (leafExprServeAt applies coercePlanFor; guard:
+      examples/generic_literal_long_widening.kt).
+- [x] Census before those last fixes: 464 passed / 3 failed / 0 incomplete
       (was 322/444-ish at the stretch start; the deadlocked classes'
       tests now all count and PipelineTest is 18/18 in 10s). Latest
       landing (e2200304): CallValueOrMember's non-invocable arm walks the
@@ -311,25 +344,13 @@ tests): 322/444 passing at the start of this stretch.
         receiver (kotlinx's deprecated `Flow.flatMap` was the sole
         bodied 1-arg candidate in the pack universe and stamped
         `declared=Flow` on a Set-receiver chain).
-      * RangesTest.testResolveRanges — mechanism FULLY diagnosed, one
-        gap left: the test's `private fun assertEquals(List<IntRange>,
-        List<LongRange>)` delegates to kotlin.test's via
-        `assertEquals(expected.map { it.toLong() }, actual)`; kotlinc
-        rejects the member (invariant generic args), klio's static
-        member bind sees compat=unknown (the mapped arg's static type
-        does not derive because `IntRange.toLong` is an UN-ANNOTATED
-        private member-extension expression body) and binds the member
-        -> self-recursion to the depth cap. Standalone repro
-        scratchpad/ae1.kt (no packs needed). Fix roads: derive the
-        member-ext expression-body return on demand at that site, or
-        strengthen the member-bind compat's .incompatible gate for
-        same-head containers with concrete differing args.
+      * RangesTest.testResolveRanges — FIXED (27/27 solo; see the final
+        census entry above for the two-layer mechanism).
       * CoroutinesTest (GlobalScope.writer/reader deadlock — parks with
         ~2s user time over minutes; task #31 territory), PipelineTest,
         WriterReaderTest — INCOMPLETE at the census cap.
-      * Side find: the fast/flat call path skips the generic Int/Long
-        PEER widening entirely (`eq(0, 0L)` is false where kotlinc says
-        true) — small, recorded, unfixed.
+      * Side find: fast/flat `eq(0, 0L)` peer widening — FIXED
+        (leafExprServeAt applies the coerce plan).
 - [ ] Risk note: the widened includes are validated by the commontest
       census only; the ktor_server/client e2e itests gate them in CI.
 
