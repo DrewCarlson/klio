@@ -15007,16 +15007,28 @@ fn composeChangedBits(
                 }
                 if (!caller_dirty) break :fwd;
                 const nm = p.segments[0].name;
-                const j = for (b.compose_value_params, 0..) |*cp, k| {
-                    if (std.mem.eql(u8, cp.name.name, nm)) break k;
+                // A DEFAULTED caller param was renamed `p$arg` by the plugin
+                // and the body reads the prologue local `p` — its triple is
+                // still live (the probe reads the resolved value; a taken
+                // default sets the same-bit), so it forwards like any other.
+                var renamed_default = false;
+                const j = for (b.compose_value_params, 0..) |*cp2, k| {
+                    if (std.mem.eql(u8, cp2.name.name, nm)) break k;
+                    if (cp2.name.name.len == nm.len + 4 and
+                        std.mem.startsWith(u8, cp2.name.name, nm) and
+                        std.mem.endsWith(u8, cp2.name.name, "$arg"))
+                    {
+                        renamed_default = true;
+                        break k;
+                    }
                 } else break :fwd;
                 if (j >= 9) break :fwd;
                 const cp = &b.compose_value_params[j];
-                if (cp.is_vararg or cp.default != null) break :fwd;
+                if (cp.is_vararg) break :fwd;
                 // A body local shadowing the param name would misattribute
                 // the triple; only a binding that is still the parameter's
-                // own may recombine.
-                if (!b.isParam(nm)) break :fwd;
+                // own (or its defaults-prologue local) may recombine.
+                if (!renamed_default and !b.isParam(nm)) break :fwd;
                 const sp = call_span;
                 const dirty_ref = try composeBitsPath(b.allocator, "$dirty", sp);
                 var term: Expr = undefined;

@@ -55,7 +55,11 @@ const runtime = @import("runtime");
 // body against the caller's module: `CompositionTests`, `PausableComposition-
 // Tests` and `SnapshotStateMapTests` no longer abort part-way, so all 46
 // classes complete and the observed count moved to 1345. Same ~±40 margin.
-const BASELINE: usize = 1305;
+// RAISED 1305 -> 1340 after the remember-family scoping fixes (captured
+// locals as the nearest binding) and the dirty-bits skip calculus landed:
+// four consecutive runs at 1370-1372 with the GroupSize slot anchor green.
+// Same ~±30 margin below the observed floor.
+const BASELINE: usize = 1340;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
