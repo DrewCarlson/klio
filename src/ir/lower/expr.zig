@@ -14918,7 +14918,7 @@ fn selectedCallArgsForBuilder(
             errdefer b.allocator.free(composer_path);
             composer_path[0] = .{ .name = "$composer", .span = call_span };
             completed_args[selected.args.len] = .{ .Path = .{ .segments = composer_path, .span = call_span } };
-            completed_args[selected.args.len + 1] = .{ .IntLit = .{ .value = 0, .kind = .Int, .span = call_span } };
+            completed_args[selected.args.len + 1] = try composeChangedBits(b, f, selected.args, selected.names, trailing_lambda, call_span);
 
             const completed_names = try b.allocator.alloc(?[]const u8, selected.names.len + 2);
             errdefer b.allocator.free(completed_names);
@@ -14935,6 +14935,143 @@ fn selectedCallArgsForBuilder(
     }
     try transformSelectedComposableArgs(b, f, selected.args, selected.names, trailing_lambda);
     return selected;
+}
+
+/// The `$changed` value for a lowering-completed composable call: per-arg
+/// certainty bits at the RESOLVED callee's triple positions (3 bits per
+/// value param above the forced bit, kotlinc's layout). A literal argument
+/// is STATIC (`0b110 << 3i`, a compile-time constant of the site); a bare
+/// forward of one of the caller's own value params recombines the caller's
+/// live `$dirty` triple into the callee position, so the callee's guarded
+/// probe (`if ($changed and (0b110 << 3i) == 0)`) skips and its slot is
+/// never taken — the drop from klio's 22 slots to kotlinc's 18 on the
+/// checkboxLike anchor. Everything else claims nothing.
+fn composeChangedBits(
+    b: *FuncBuilder,
+    f: *const Func,
+    args: []const Expr,
+    names: []const ?[]const u8,
+    trailing_lambda: bool,
+    call_span: ast.Span,
+) Allocator.Error!Expr {
+    var const_bits: i64 = 0;
+    var dyn: ?Expr = null;
+    const caller_dirty = b.resolve("$dirty") != null;
+    const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    var user_param_end = f.params.len;
+    if (f.params.len >= 2 and std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer")) user_param_end -= 2;
+    var next_param: usize = recv_off;
+    for (args, 0..) |*arg, arg_index| {
+        var param_index: ?usize = null;
+        if (trailing_lambda and arg_index + 1 == args.len and user_param_end != 0) {
+            param_index = user_param_end - 1;
+        } else if (arg_index < names.len and names[arg_index] != null) {
+            for (f.params, 0..) |param, i| {
+                if (applicability.paramNameMatchesArg(param.name, names[arg_index].?)) {
+                    param_index = i;
+                    break;
+                }
+            }
+        } else {
+            param_index = next_param;
+        }
+        const pi = param_index orelse continue;
+        next_param = @max(next_param, pi + 1);
+        if (pi < recv_off or pi >= user_param_end) continue;
+        const triple = pi - recv_off;
+        if (triple >= 9) continue;
+        const callee_param = &f.params[pi];
+        if (callee_param.is_vararg) continue;
+        switch (arg.*) {
+            .IntLit, .BoolLit, .CharLit, .FloatLit, .NullLit => {
+                const_bits |= @as(i64, 6) << @intCast(3 * triple);
+            },
+            // `$composer.cache(false, { … })` — the plugin's memo of a
+            // ZERO-capture lambda: the cached instance never invalidates,
+            // so the argument is static exactly like kotlinc's lifted
+            // singleton lambda; the callee's changedInstance probe (and
+            // its slot) is unnecessary.
+            .Call => |cc| {
+                if (cc.callee.* == .Member and std.mem.eql(u8, cc.callee.Member.name.name, "cache") and
+                    cc.args.len >= 1 and cc.args[0] == .BoolLit and !cc.args[0].BoolLit.value)
+                {
+                    const_bits |= @as(i64, 6) << @intCast(3 * triple);
+                }
+            },
+            .Path => |p| fwd: {
+                if (p.segments.len != 1) break :fwd;
+                // A lifted memo singleton is a permanent instance — static.
+                if (std.mem.startsWith(u8, p.segments[0].name, "$klio$memo$")) {
+                    const_bits |= @as(i64, 6) << @intCast(3 * triple);
+                    break :fwd;
+                }
+                if (!caller_dirty) break :fwd;
+                const nm = p.segments[0].name;
+                const j = for (b.compose_value_params, 0..) |*cp, k| {
+                    if (std.mem.eql(u8, cp.name.name, nm)) break k;
+                } else break :fwd;
+                if (j >= 9) break :fwd;
+                const cp = &b.compose_value_params[j];
+                if (cp.is_vararg or cp.default != null) break :fwd;
+                // A body local shadowing the param name would misattribute
+                // the triple; only a binding that is still the parameter's
+                // own may recombine.
+                if (!b.isParam(nm)) break :fwd;
+                const sp = call_span;
+                const dirty_ref = try composeBitsPath(b.allocator, "$dirty", sp);
+                var term: Expr = undefined;
+                if (j == triple) {
+                    term = try composeBitsCall1(b.allocator, dirty_ref, "and", composeBitsInt(@as(i64, 6) << @intCast(3 * triple), sp), sp);
+                } else {
+                    const shifted = try composeBitsCall1(b.allocator, dirty_ref, "shr", composeBitsInt(3 * @as(i64, @intCast(j)), sp), sp);
+                    const masked = try composeBitsCall1(b.allocator, shifted, "and", composeBitsInt(6, sp), sp);
+                    term = try composeBitsCall1(b.allocator, masked, "shl", composeBitsInt(3 * @as(i64, @intCast(triple)), sp), sp);
+                }
+                dyn = if (dyn) |acc| try composeBitsCall1(b.allocator, acc, "or", term, sp) else term;
+            },
+            else => {},
+        }
+    }
+    if (dyn) |d| {
+        if (const_bits == 0) return d;
+        return try composeBitsCall1(b.allocator, d, "or", composeBitsInt(const_bits, call_span), call_span);
+    }
+    return composeBitsInt(const_bits, call_span);
+}
+
+fn composeBitsInt(v: i64, sp: ast.Span) Expr {
+    return .{ .IntLit = .{ .value = v, .kind = .Int, .span = sp } };
+}
+
+fn composeBitsPath(alloc: Allocator, nm: []const u8, sp: ast.Span) Allocator.Error!Expr {
+    const segs = try alloc.alloc(ast.Ident, 1);
+    segs[0] = .{ .name = nm, .span = sp };
+    return .{ .Path = .{ .segments = segs, .span = sp } };
+}
+
+fn composeBitsCall1(alloc: Allocator, recv: Expr, nm: []const u8, a0: Expr, sp: ast.Span) Allocator.Error!Expr {
+    const recv_p = try alloc.create(Expr);
+    recv_p.* = recv;
+    const cargs = try alloc.alloc(Expr, 1);
+    cargs[0] = a0;
+    const cnames = try alloc.alloc(?[]const u8, 1);
+    cnames[0] = null;
+    const callee = try alloc.create(Expr);
+    callee.* = .{ .Member = .{
+        .receiver = recv_p,
+        .name = .{ .name = nm, .span = sp },
+        .safe = false,
+        .span = sp,
+    } };
+    return .{ .Call = .{
+        .callee = callee,
+        .args = cargs,
+        .arg_names = cnames,
+        .type_args = &.{},
+        .is_infix = false,
+        .has_trailing_lambda = false,
+        .span = sp,
+    } };
 }
 
 fn transformSelectedComposableArgs(

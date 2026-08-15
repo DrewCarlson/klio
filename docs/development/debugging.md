@@ -61,6 +61,7 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_SELDBG` | set | Why an intrinsic-host `invokeMethod` probe declined (error tag + message for each swallowed non-Throw error — the recipe that separates "method missing" from "method ran and failed") | `[seldbg]` |
 | `KLIO_MCRT_TRACE` | `<name>` | Member-call return-type derivation for a chained arg (`recv.map { … }`): receiver tag/type and candidate agreement | `[mcrt]` |
 | `KLIO_ADM_TRACE` | set | Callable-vs-class adjudication detail inside `argDefinitelyNotParamType` | `[adm]` |
+| `KLIO_MEMO_TRACE` | set | Compose plugin memoization-path decisions per lambda arg (cache / lifted singleton / remember, with capture keys) and the value-invocation call-site `$changed` bits | `[memo]`, `[bits]` |
 | `KLIO_EF_TRACE` | `<name>` | Emit-form / member-shadowability decision for a named call (inline target chosen, shadowable routing, receiver-context flags) | `[ef]`, `[tbie]`, `[efset]` |
 | `KLIO_INLINE_PICK` | `<name>` | Inline-overload candidate set (receiver type, owner class, file) plus the receiver chain head | `[ipick]` |
 | `KLIO_EXTKEY_TRACE` | `<fid>[,<fid>]` | The eight-element extension ranking key for the named candidates, plus their parameter type heads. Ranking is lexicographic, so the first differing component is the one that decided | `[extkey]` |

@@ -89,6 +89,51 @@ javap -c of the emission:
 - **Restart lambda**: `endRestartGroup()?.updateScope { F(args,
   composer, $changed | 1) }`.
 
+## Landed (2026-08-15): checkboxLike 24 → 19 slots
+
+- Per-param 3-bit `$dirty` triples (dirtyOrProbe/dirtySame/dirtyChanged,
+  bit 0 = forced; receiver triple after the value params; index 9 =
+  shared overflow). `$dirty = $changed` full copy; gate
+  `($dirty and <forced+same-mask>) != <all-same> || !skipping` inside
+  shouldExecute.
+- Guarded probes: `if ($changed and (0b110 << 3i) == 0) { probe }` —
+  a caller that claims certainty (constantly, per site) suppresses the
+  callee's probe AND its slot.
+- Call-site `$changed` bits at the LOWERING pair-completion
+  (`composeChangedBits` in lower/expr.zig — P11 moved ordinary calls
+  there; the AST pass's threadCall only serves value invocations, its
+  `childChangedBits` covers those): literals → STATIC `0b110 << 3i`;
+  a bare forward of a caller value param recombines the caller's live
+  `$dirty` triple (`(($dirty shr 3j) and 6) shl 3i`), with exact
+  named-arg mapping via the resolved callee signature
+  (FuncBuilder.compose_value_params carries the caller's order);
+  `$composer.cache(false, …)` args and lifted singletons are STATIC.
+- Memo shapes by capture class: params-only captures →
+  `$composer.cache(<$dirty terms>, calc)` (ZERO key slots); zero
+  captures, empty body → LIFTED to a top-level singleton val
+  (`$klio$memo$<key>`, pending_memo_lifts appended by the driver —
+  kotlinc's static instance, zero slots); zero captures with a body →
+  `cache(false, calc)` (identity permanent, one slot); local captures
+  → the remember(keys) wrap (same slot count as changed-probes would
+  be). Shadowing guards: local decls and inline-lambda params retire a
+  param name from `$dirty` reuse (shadowed_triples).
+- Verified: remember-family 26/26, funInterface_isMemoized, litmus
+  45/45, sweep 117/0, module tests 21/21. checkboxLike counts 6 groups
+  / 19 slots vs kotlinc's 8 / 18.
+
+## Remaining
+
+- The LAST slot + the 2-group deficit: needs slot-level attribution,
+  and the nested CompositionGroup surface can't dump it — klio's
+  `CompositionGroup.compositionGroups`/`data` on non-root groups
+  return empty/raise (`virtual call receiver is not an instance`), and
+  SlotStorage.toDebugString trips the unimplemented `kotlin.toString`
+  expect. Fix the tooling surface first, then attribute.
+- Certainty propagation beyond one hop (a forwarded param whose caller
+  got it forwarded again — golden recombination verified only for one
+  level here).
+- checkboxLike stays the red ratchet anchor until slot-exact.
+
 ## Phases
 
 1. Golden measurement — DONE (result above).

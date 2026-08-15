@@ -615,6 +615,12 @@ pub const FuncBuilder = struct {
     /// `bind_params`). Used by call-site lowering to recognise
     /// when an identifier-as-callee is a function-typed param.
     param_names: StringSet,
+    /// The declaring function's ORDERED value params (compose-transformed
+    /// AST, threaded `$composer`/`$changed` pair excluded). Set only for
+    /// compose-ABI'd function lowerings; call-site `$changed` bit
+    /// emission maps a bare forwarded param to its `$dirty` triple index
+    /// through it.
+    compose_value_params: []const ast.Param = &.{},
     /// Names declared as *local functions* (`fun foo() …` inside a
     /// body). A `recv.foo()` call resolves to such a local — but a
     /// local `val`/`var` of the same name must NOT hijack member-call

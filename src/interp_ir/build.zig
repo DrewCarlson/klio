@@ -584,7 +584,21 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         defer stability.deinit();
         compose_pass.active_stability = &stability;
         defer compose_pass.active_stability = null;
+        var comp_params = try compose_pass.collectComposableParamNames(allocator, decls.items);
+        defer comp_params.deinit();
+        compose_pass.active_composable_params = &comp_params;
+        defer compose_pass.active_composable_params = null;
+        compose_pass.memo_trace_enabled = runtime.envOnce("KLIO_MEMO_TRACE") != null;
+        var memo_lifts: std.ArrayList(ast.Decl) = .empty;
+        defer memo_lifts.deinit(allocator);
+        compose_pass.pending_memo_lifts = &memo_lifts;
+        compose_pass.pending_lift_alloc = allocator;
+        defer {
+            compose_pass.pending_memo_lifts = null;
+            compose_pass.pending_lift_alloc = null;
+        }
         try compose_pass.transformDecls(allocator, decls.items, &names, &sinks);
+        try decls.appendSlice(allocator, memo_lifts.items);
         compose_maps = .{
             .names = names,
             .sinks = sinks,

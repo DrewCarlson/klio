@@ -306,6 +306,53 @@ fn collectInto(set: *std.StringHashMap(void), decls: []const ast.Decl) std.mem.A
     };
 }
 
+/// Declared value-param name order of this compilation's composable fns,
+/// for named-argument position mapping at threaded call sites. An
+/// overloaded simple name records EMPTY (ambiguous — claim nothing).
+/// A pack composable shadowing a module name is not visible here; the
+/// map only silences a callee probe when the module's own declaration is
+/// the one that binds, which same-file private composables (the
+/// dominant shape) guarantee.
+pub const ComposableParams = struct { names: []const []const u8 };
+
+pub var active_composable_params: ?*const std.StringHashMap(ComposableParams) = null;
+
+/// Fully-closed memoized lambdas lifted to top-level singleton vals during
+/// the transform; the driver appends them to the compilation's decls after
+/// `transformDecls` returns. Null disables lifting.
+pub var pending_memo_lifts: ?*std.ArrayList(ast.Decl) = null;
+pub var pending_lift_alloc: ?std.mem.Allocator = null;
+
+/// KLIO_MEMO_TRACE: log memoization-path decisions and call-site bits.
+pub var memo_trace_enabled: bool = false;
+
+pub fn collectComposableParamNames(
+    a: std.mem.Allocator,
+    decls: []const ast.Decl,
+) std.mem.Allocator.Error!std.StringHashMap(ComposableParams) {
+    var map = std.StringHashMap(ComposableParams).init(a);
+    try collectParamsInto(a, &map, decls);
+    return map;
+}
+
+fn collectParamsInto(a: std.mem.Allocator, map: *std.StringHashMap(ComposableParams), decls: []const ast.Decl) std.mem.Allocator.Error!void {
+    for (decls) |*d| switch (d.*) {
+        .Function => |*f| {
+            if (!isComposable(f.annotations)) continue;
+            if (map.contains(f.name.name)) {
+                try map.put(f.name.name, .{ .names = &.{} });
+                continue;
+            }
+            const names = try a.alloc([]const u8, f.params.len);
+            for (f.params, names) |*p, *n| n.* = p.name.name;
+            try map.put(f.name.name, .{ .names = names });
+        },
+        .Class => |*c| try collectParamsInto(a, map, c.members),
+        .Object => |*o| try collectParamsInto(a, map, o.members),
+        else => {},
+    };
+}
+
 
 /// Whether a parameter's type is a `@Composable`-annotated function type — a
 /// sink a lambda argument is transformed for.
@@ -985,7 +1032,7 @@ fn markerCall(b: B) Expr {
 /// skipping the probe does not lose recomposition. A defaulted param that the
 /// caller DID pass (`p$arg !== marker()`) is probed normally, matching the
 /// compiler's uncertain-bits path.
-fn dirtyProbeIfPassed(b: B, arg_name: []const u8, probe: Stmt) Stmt {
+fn dirtyProbeIfPassed(b: B, arg_name: []const u8, probe: Stmt, triple: u5) Stmt {
     const not_default = Expr{ .Binary = .{
         .op = .IdentNeq,
         .lhs = b.box(b.pathExpr(arg_name)),
@@ -994,20 +1041,83 @@ fn dirtyProbeIfPassed(b: B, arg_name: []const u8, probe: Stmt) Stmt {
     } };
     const then_stmts = b.a.alloc(Stmt, 1) catch @panic("oom");
     then_stmts[0] = probe;
+    // Default taken: the slot is CERTAIN-SAME for this composition — the
+    // triple's same-bit must set, or the `!= SAME` gate reads the empty
+    // triple as "unknown" and never skips a defaulted call.
+    const else_stmts = b.a.alloc(Stmt, 1) catch @panic("oom");
+    else_stmts[0] = dirtyOrConst(b, dirtySame(triple));
     return .{ .Expr = .{ .If = .{
         .cond = b.box(not_default),
+        .then_branch = b.box(.{ .Block = .{ .stmts = then_stmts, .span = b.gen_span } }),
+        .else_branch = b.box(.{ .Block = .{ .stmts = else_stmts, .span = b.gen_span } }),
+        .span = b.gen_span,
+    } } };
+}
+
+/// Triple index for probed slot `i`. Kotlin `Int` holds ten 3-bit
+/// triples above the forced bit; slots beyond that share the last
+/// triple (kotlinc adds a `$changed1` word there — a shared triple only
+/// widens invalidation, never misses one).
+fn tripleIdx(i: usize) u5 {
+    return @intCast(@min(i, 9));
+}
+
+/// The changed / same values of skip-calculus triple `i` (3 bits per
+/// probed slot starting at bit 1, kotlinc's `$dirty` layout: bit 0 is
+/// the restart-forced bit).
+fn dirtyChanged(triple: u5) i64 {
+    return @as(i64, 4) << (3 * @as(u6, triple));
+}
+fn dirtySame(triple: u5) i64 {
+    return @as(i64, 2) << (3 * @as(u6, triple));
+}
+/// The whole-triple mask for probe `i` (0b111 at its position).
+fn dirtyMask(triple: u5) i64 {
+    return @as(i64, 14) << (3 * @as(u6, triple));
+}
+
+/// `if ($changed and (0b110 << 3i) == 0) { <probe stmt> }` — the probe
+/// runs only when the CALLER claimed nothing for this slot. A site that
+/// passes certainty bits does so constantly (they are a static property
+/// of the call site's argument shape), so the probe's slot-table usage
+/// stays position-stable across recompositions.
+fn guardProbe(b: B, probe: Stmt, triple: u5) Stmt {
+    const guard = Expr{ .Binary = .{
+        .op = .Eq,
+        .lhs = b.box(b.callMember(b.pathExpr(changed_param), "and", b.slice1(b.intLit(@as(i64, 6) << (3 * @as(u6, triple)))))),
+        .rhs = b.box(b.intLit(0)),
+        .span = b.gen_span,
+    } };
+    const then_stmts = b.a.alloc(Stmt, 1) catch @panic("oom");
+    then_stmts[0] = probe;
+    return .{ .Expr = .{ .If = .{
+        .cond = b.box(guard),
         .then_branch = b.box(.{ .Block = .{ .stmts = then_stmts, .span = b.gen_span } }),
         .else_branch = null,
         .span = b.gen_span,
     } } };
 }
 
-/// `$dirty = $dirty or (if (<probe>) 2 else 0)` — one skip-calculus probe.
-fn dirtyOrProbe(b: B, probe: Expr) Stmt {
+/// `$dirty = $dirty or <v>`.
+fn dirtyOrConst(b: B, v: i64) Stmt {
+    return .{ .Assign = .{
+        .target = b.pathExpr(dirty_local),
+        .op = .Assign,
+        .value = b.callMember(b.pathExpr(dirty_local), "or", b.slice1(b.intLit(v))),
+        .span = b.gen_span,
+    } };
+}
+
+/// `$dirty = $dirty or (if (<probe>) <changed_i> else <same_i>)` — one
+/// skip-calculus probe writing triple `i`. The probe runs every
+/// invocation (call sites pass `$changed = 0`, claiming nothing), so
+/// each probed slot always lands on changed or same — the skip gate
+/// compares the triple region against all-same.
+fn dirtyOrProbe(b: B, probe: Expr, triple: u5) Stmt {
     const pick = Expr{ .If = .{
         .cond = b.box(probe),
-        .then_branch = b.box(b.intLit(2)),
-        .else_branch = b.box(b.intLit(0)),
+        .then_branch = b.box(b.intLit(dirtyChanged(triple))),
+        .else_branch = b.box(b.intLit(dirtySame(triple))),
         .span = b.gen_span,
     } };
     return .{ .Assign = .{
@@ -1140,6 +1250,23 @@ pub fn transformComposableFunction(
     lp.* = try composableLambdaParamNames(a, f);
     const w_ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
     var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0 };
+    // The per-param triples let a memoized lambda derive its validity from
+    // `$dirty` (the kotlinc zero-key-slot shape). Only NON-defaulted,
+    // non-vararg params participate: a defaulted param's triple can carry
+    // the default-taken same-bit while the body sees a re-evaluated value.
+    if (skippable) {
+        const triples = try a.create(std.StringHashMap(u5));
+        triples.* = std.StringHashMap(u5).init(a);
+        for (f.params, 0..) |p, pi| {
+            if (p.is_vararg or p.default != null) continue;
+            // Index 9 is the shared overflow triple; only exclusively-owned
+            // triples may drive a memo condition.
+            if (pi >= 9) continue;
+            try triples.put(p.name.name, tripleIdx(pi));
+        }
+        w.param_triples = triples;
+        w.dirty_in_scope = true;
+    }
     for (pp.prologue) |*s| {
         try w.walkStmt(s);
         try out.append(a, s.*);
@@ -1161,7 +1288,10 @@ pub fn transformComposableFunction(
             .name = b.ident(dirty_local),
             .receiver_type = null,
             .ty = null,
-            .init = b.callMember(b.pathExpr(changed_param), "and", b.slice1(b.intLit(1))),
+            // Full copy, kotlinc's `$dirty = $changed`: the caller's per-arg
+            // certainty bits carry through so a guarded-off probe still has
+            // its triple populated for the skip gate and memo conditions.
+            .init = b.pathExpr(changed_param),
             .delegate = null,
             .getter = null,
             .setter = null,
@@ -1179,42 +1309,46 @@ pub fn transformComposableFunction(
             .span = b.gen_span,
         };
         try out.append(a, .{ .Decl = .{ .Property = dirty_prop } });
-        if (f.receiver_type != null or in_class) {
-            const recv_probe: []const u8 = if (f.receiver_type) |*rt|
-                probeMethodFor(rt, f.type_params)
-            else
-                "changedInstance";
-            try out.append(a, dirtyOrProbe(b, b.callMember(
-                b.pathExpr(composer_param),
-                recv_probe,
-                b.slice1(.{ .This = .{ .qualifier = null, .span = b.gen_span } }),
-            )));
-        }
-        for (f.params) |p| {
+        for (f.params, 0..) |p, pi| {
+            const triple = tripleIdx(pi);
             if (p.is_vararg) {
                 // A vararg packs a FRESH array every call, so identity
                 // `changed(values)` never skips. Probe the CONTENTS —
                 // `changed(values.toList())` compares structurally against
                 // the remembered slot, matching the reference compiler's
                 // per-element dirty walk (b/286132194).
-                try out.append(a, dirtyOrProbe(b, b.callMember(
+                try out.append(a, guardProbe(b, dirtyOrProbe(b, b.callMember(
                     b.pathExpr(composer_param),
                     "changed",
                     b.slice1(b.callMember(b.pathExpr(p.name.name), "toList", try a.alloc(Expr, 0))),
-                )));
+                ), triple), triple));
                 continue;
             }
             const probe = dirtyOrProbe(b, b.callMember(
                 b.pathExpr(composer_param),
                 probeMethodFor(&p.ty, f.type_params),
                 b.slice1(b.pathExpr(p.name.name)),
-            ));
+            ), triple);
             if (p.default != null and f.body != null) {
                 const arg_name = try std.fmt.allocPrint(a, "{s}$arg", .{p.name.name});
-                try out.append(a, dirtyProbeIfPassed(b, arg_name, probe));
+                try out.append(a, guardProbe(b, dirtyProbeIfPassed(b, arg_name, probe, triple), triple));
             } else {
-                try out.append(a, probe);
+                try out.append(a, guardProbe(b, probe, triple));
             }
+        }
+        // The receiver's triple sits after the value params, kotlinc's slot
+        // order for a member/extension composable.
+        if (f.receiver_type != null or in_class) {
+            const recv_triple = tripleIdx(f.params.len);
+            const recv_probe: []const u8 = if (f.receiver_type) |*rt|
+                probeMethodFor(rt, f.type_params)
+            else
+                "changedInstance";
+            try out.append(a, guardProbe(b, dirtyOrProbe(b, b.callMember(
+                b.pathExpr(composer_param),
+                recv_probe,
+                b.slice1(.{ .This = .{ .qualifier = null, .span = b.gen_span } }),
+            ), recv_triple), recv_triple));
         }
     }
     // `if ($composer.shouldExecute($dirty != 0 || !$composer.skipping,
@@ -1242,15 +1376,28 @@ pub fn transformComposableFunction(
     }
     const skip_stmts = try a.alloc(Stmt, 1);
     skip_stmts[0] = .{ .Expr = b.callMember(b.pathExpr(composer_param), "skipToGroupEnd", try a.alloc(Expr, 0)) };
-    // Skippable: `$dirty != 0 || !$composer.skipping`. Non-skippable keeps the
-    // shouldExecute pause point but always executes (`true`), exactly as the
-    // plugin emits for a restartable-but-not-skippable composable.
+    // Skippable: `($dirty and <forced+same bits>) != <all same> ||
+    // !$composer.skipping` — kotlinc's gate: every probed triple landed on
+    // same and the restart-forced bit is clear, or the body runs.
+    // Non-skippable keeps the shouldExecute pause point but always
+    // executes (`true`), exactly as the plugin emits for a
+    // restartable-but-not-skippable composable.
+    var gate_same: i64 = 0;
+    if (skippable) {
+        var seen_triples: u16 = 0;
+        for (f.params, 0..) |_, pi| seen_triples |= @as(u16, 1) << @as(u4, @intCast(tripleIdx(pi)));
+        if (f.receiver_type != null or in_class) seen_triples |= @as(u16, 1) << @as(u4, @intCast(tripleIdx(f.params.len)));
+        var ti: u5 = 0;
+        while (ti < 10) : (ti += 1) {
+            if (seen_triples & (@as(u16, 1) << @as(u4, @intCast(ti))) != 0) gate_same += dirtySame(ti);
+        }
+    }
     const params_changed: Expr = if (skippable) .{ .Binary = .{
         .op = .Or,
         .lhs = b.box(.{ .Binary = .{
             .op = .Neq,
-            .lhs = b.box(b.pathExpr(dirty_local)),
-            .rhs = b.box(b.intLit(0)),
+            .lhs = b.box(b.callMember(b.pathExpr(dirty_local), "and", b.slice1(b.intLit(gate_same + 1)))),
+            .rhs = b.box(b.intLit(gate_same)),
             .span = b.gen_span,
         } }),
         .rhs = b.box(.{ .Unary = .{
@@ -1483,6 +1630,21 @@ const Walker = struct {
     nlr_scopes: ?*std.ArrayList(NlrScope) = null,
     /// Monotonic source of fresh marker-local names for this walk.
     nlr_counter: usize = 0,
+    /// Enclosing restartable fn's value-param name -> skip-calculus triple
+    /// index, present only when the transform emitted per-param probes.
+    /// Lets a memoized lambda whose captures are all params derive its
+    /// validity from `$dirty` with ZERO stored key slots (the kotlinc
+    /// shape).
+    param_triples: ?*const std.StringHashMap(u5) = null,
+    /// `$dirty` carries live per-param facts in the CURRENT scope: true in
+    /// the restartable body and through inline-callee lambda splices,
+    /// false inside a nested composable lambda (its recompositions run
+    /// without the enclosing frame's `$dirty`).
+    dirty_in_scope: bool = false,
+    /// Local declarations seen so far that SHADOW a tripled param name: a
+    /// bare reference to such a name is the local, whose change state the
+    /// param's `$dirty` triple does not describe. Lazily created.
+    shadowed_triples: ?*std.StringHashMap(void) = null,
 
     /// A `return@label` target: the enclosing composable lambda labelled
     /// `label`, the local `marker_var` holding its start marker, and whether a
@@ -1581,6 +1743,18 @@ const Walker = struct {
     fn walkDecl(w: *Walker, d: *Decl) std.mem.Allocator.Error!void {
         switch (d.*) {
             .Property => |p| {
+                // A local shadowing a tripled param name retires that name
+                // from `$dirty`-derived certainty for the rest of the walk.
+                if (w.param_triples) |triples| {
+                    if (triples.contains(p.name.name)) {
+                        if (w.shadowed_triples == null) {
+                            const set = w.a.create(std.StringHashMap(void)) catch @panic("oom");
+                            set.* = std.StringHashMap(void).init(w.a);
+                            w.shadowed_triples = set;
+                        }
+                        w.shadowed_triples.?.put(p.name.name, {}) catch @panic("oom");
+                    }
+                }
                 // `val content: @Composable () -> Unit = { … }` — the
                 // declared type makes the initializer lambda composable —
                 // or `val content = @Composable { … }`, where the literal
@@ -2272,6 +2446,100 @@ const Walker = struct {
             .implicit_it = false,
             .span = lam.span,
         } };
+        // kotlinc's zero-key-slot shape: when every capture is an enclosing
+        // restartable fn's value param whose change state `$dirty` already
+        // carries, the memo is `$composer.cache(<any capture changed>, calc)`
+        // — one stored slot (the cache), no keys. Falls through to the
+        // key-slot `remember` wrap when any capture is a local (whose probe
+        // would consume a slot anyway) or `$dirty` is out of scope.
+        const memo_trace = memo_trace_enabled;
+        if (memo_trace) {
+            std.debug.print("[memo] callee={s} dirty_in_scope={} triples={} keys:", .{ callee_name, w.dirty_in_scope, w.param_triples != null });
+            for (keys.items) |k| std.debug.print(" {s}", .{k.Path.segments[0].name});
+            std.debug.print("\n", .{});
+        }
+        // A fully CLOSED lambda (no captures, no bare names at all — `{}`)
+        // lifts to a top-level singleton val, kotlinc's static-instance
+        // shape: identity is permanent, the argument is static, and no
+        // slot is consumed anywhere. Only the empty body qualifies here —
+        // a body with calls still resolves bare names through the
+        // creation-time receiver chain and must stay site-created.
+        if (keys.items.len == 0 and lam.body.stmts.len == 0 and pending_memo_lifts != null) {
+            const key: u64 = @bitCast(@as(i64, positionalKey(lam.span)));
+            const nm = std.fmt.allocPrint(w.a, "$klio$memo${x}", .{key}) catch @panic("oom");
+            const prop = w.a.create(ast.Property) catch @panic("oom");
+            prop.* = .{
+                .mutable = false,
+                .name = w.b.ident(nm),
+                .receiver_type = null,
+                .ty = null,
+                .init = arg.*,
+                .delegate = null,
+                .getter = null,
+                .setter = null,
+                .is_abstract = false,
+                .is_open = false,
+                .is_override = false,
+                .is_lateinit = false,
+                .is_const = false,
+                .is_inline = false,
+                .is_expect = false,
+                .is_actual = false,
+                .setter_visibility = null,
+                .visibility = .Private,
+                .annotations = &.{},
+                .span = w.b.gen_span,
+            };
+            pending_memo_lifts.?.append(pending_lift_alloc.?, .{ .Property = prop }) catch @panic("oom");
+            arg.* = w.b.pathExpr(nm);
+            if (memo_trace) std.debug.print("[memo] -> lifted singleton {s}\n", .{nm});
+            return;
+        }
+        // A ZERO-capture lambda's memo never invalidates: `cache(false, calc)`
+        // needs no `$dirty` and holds one permanent slot in any scope —
+        // kotlinc's lifted-singleton shape, minus the lift.
+        if (keys.items.len == 0) {
+            const cache_args = w.a.alloc(Expr, 2) catch @panic("oom");
+            cache_args[0] = .{ .BoolLit = .{ .value = false, .span = w.b.gen_span } };
+            cache_args[1] = calc;
+            arg.* = w.b.callMember(w.composerRef(), "cache", cache_args);
+            if (memo_trace) std.debug.print("[memo] -> cache (0 keys)\n", .{});
+            return;
+        }
+        if (w.dirty_in_scope and w.param_triples != null) from_dirty: {
+            const triples = w.param_triples.?;
+            var invalid: ?Expr = null;
+            for (keys.items) |k| {
+                const nm = k.Path.segments[0].name;
+                if (w.shadowed_triples != null and w.shadowed_triples.?.contains(nm)) {
+                    if (memo_trace) std.debug.print("[memo] -> remember (shadowed key {s})\n", .{nm});
+                    break :from_dirty;
+                }
+                const triple = triples.get(nm) orelse {
+                    if (memo_trace) std.debug.print("[memo] -> remember (non-param key {s})\n", .{nm});
+                    break :from_dirty;
+                };
+                const term = Expr{ .Binary = .{
+                    .op = .Eq,
+                    .lhs = w.b.box(w.b.callMember(w.b.pathExpr(dirty_local), "and", w.b.slice1(w.b.intLit(dirtyMask(triple))))),
+                    .rhs = w.b.box(w.b.intLit(dirtyChanged(triple))),
+                    .span = w.b.gen_span,
+                } };
+                invalid = if (invalid) |acc| Expr{ .Binary = .{
+                    .op = .Or,
+                    .lhs = w.b.box(acc),
+                    .rhs = w.b.box(term),
+                    .span = w.b.gen_span,
+                } } else term;
+            }
+            const cache_args = w.a.alloc(Expr, 2) catch @panic("oom");
+            cache_args[0] = invalid orelse .{ .BoolLit = .{ .value = false, .span = w.b.gen_span } };
+            cache_args[1] = calc;
+            arg.* = w.b.callMember(w.composerRef(), "cache", cache_args);
+            if (memo_trace) std.debug.print("[memo] -> cache ({d} keys)\n", .{keys.items.len});
+            return;
+        }
+        if (memo_trace) std.debug.print("[memo] -> remember (dirty_in_scope={})\n", .{w.dirty_in_scope});
         const rem_args = w.a.alloc(Expr, keys.items.len + 3) catch @panic("oom");
         @memcpy(rem_args[0..keys.items.len], keys.items);
         rem_args[keys.items.len] = calc;
@@ -2583,7 +2851,24 @@ const Walker = struct {
                         // the enclosing composable: keep threading (the
                         // generic lambda walk below now RESETS it for plain
                         // value-position lambdas).
-                        if (!lambdaHasComposerParams(&arg.Lambda)) try w.walkBlock(&arg.Lambda.body);
+                        if (!lambdaHasComposerParams(&arg.Lambda)) {
+                            // An inline lambda's params shadow same-named
+                            // tripled fn params. Shadowing is retired for the
+                            // rest of the walk — conservative (a later
+                            // sibling loses the certainty), never unsound.
+                            if (w.param_triples) |triples| {
+                                for (arg.Lambda.params) |lp2| {
+                                    if (!triples.contains(lp2.name)) continue;
+                                    if (w.shadowed_triples == null) {
+                                        const set = w.a.create(std.StringHashMap(void)) catch @panic("oom");
+                                        set.* = std.StringHashMap(void).init(w.a);
+                                        w.shadowed_triples = set;
+                                    }
+                                    w.shadowed_triples.?.put(lp2.name, {}) catch @panic("oom");
+                                }
+                            }
+                            try w.walkBlock(&arg.Lambda.body);
+                        }
                     } else if (arg.* == .Lambda and w.thread and name != null and
                         !calleeInlinesLambda(name.?))
                     {
@@ -2918,8 +3203,12 @@ const Walker = struct {
         // function's — its branches take the automatic replace-groups again.
         const saved = w.thread;
         const saved_eg = w.explicit_groups;
+        const saved_dirty = w.dirty_in_scope;
         w.thread = true;
         w.explicit_groups = false;
+        // A composable lambda recomposes without the enclosing frame: its
+        // body must not read the outer `$dirty` for memo validity.
+        w.dirty_in_scope = false;
         // Register this lambda as a `return@label` target so a nested non-local
         // return can close the groups it opened. The marker capture is prepended
         // only if such a return is found while walking the body.
@@ -2938,6 +3227,7 @@ const Walker = struct {
         }
         w.thread = saved;
         w.explicit_groups = saved_eg;
+        w.dirty_in_scope = saved_dirty;
         // A labeled early return (`return@run`) crossing a wrapped branch
         // bracket must close the replace-groups it exits; the content
         // lambda's restart group belongs to ComposableLambdaImpl, so only
@@ -2985,6 +3275,74 @@ const Walker = struct {
         lam.body.stmts = stmts;
     }
 
+    /// The `$changed` value a threaded call passes: per-arg certainty bits
+    /// for the POSITIONAL argument prefix (named args stop the mapping —
+    /// the pass has no callee signature to reorder against, and a bit at
+    /// the wrong triple would silence the wrong probe). A literal argument
+    /// is STATIC (`0b110 << 3i`, constant); a bare forward of one of the
+    /// enclosing restartable fn's exclusively-tripled params recombines its
+    /// live `$dirty` triple into the callee's position, kotlinc's
+    /// propagation. Everything else claims nothing and the callee probes.
+    fn childChangedBits(w: *Walker, callee_name: ?[]const u8, args: []const Expr, arg_names: []const ?[]const u8, had_trailing: bool) Expr {
+        var const_bits: i64 = 0;
+        var dyn: ?Expr = null;
+        // A named argument maps to its callee param position through the
+        // compilation's composable-signature table; without a (unique)
+        // signature the mapping stops at the first named arg.
+        const callee_params: ?[]const []const u8 = blk: {
+            const nm = callee_name orelse break :blk null;
+            const map = active_composable_params orelse break :blk null;
+            const cp = map.get(nm) orelse break :blk null;
+            if (cp.names.len == 0) break :blk null;
+            break :blk cp.names;
+        };
+        const n = if (had_trailing and args.len > 0) args.len - 1 else args.len;
+        for (args[0..n], 0..) |*arg, i| {
+            var pos: usize = i;
+            if (i < arg_names.len and arg_names[i] != null) {
+                const params = callee_params orelse break;
+                const an = arg_names[i].?;
+                pos = for (params, 0..) |pn, k| {
+                    if (std.mem.eql(u8, pn, an)) break k;
+                } else break;
+            }
+            if (pos > 8) continue;
+            const triple: u5 = @intCast(pos);
+            switch (arg.*) {
+                .IntLit, .BoolLit, .CharLit, .FloatLit, .NullLit => {
+                    const_bits |= @as(i64, 6) << (3 * @as(u6, triple));
+                },
+                .Path => |p| {
+                    if (!w.dirty_in_scope) continue;
+                    const triples = w.param_triples orelse continue;
+                    if (p.segments.len != 1) continue;
+                    if (w.shadowed_triples != null and w.shadowed_triples.?.contains(p.segments[0].name)) continue;
+                    const j = triples.get(p.segments[0].name) orelse continue;
+                    const term: Expr = if (j == triple)
+                        w.b.callMember(w.b.pathExpr(dirty_local), "and", w.b.slice1(w.b.intLit(@as(i64, 6) << (3 * @as(u6, triple)))))
+                    else blk: {
+                        const extracted = w.b.callMember(
+                            w.b.callMember(w.b.pathExpr(dirty_local), "shr", w.b.slice1(w.b.intLit(3 * @as(i64, j)))),
+                            "and",
+                            w.b.slice1(w.b.intLit(6)),
+                        );
+                        break :blk w.b.callMember(extracted, "shl", w.b.slice1(w.b.intLit(3 * @as(i64, triple))));
+                    };
+                    dyn = if (dyn) |acc| w.b.callMember(acc, "or", w.b.slice1(term)) else term;
+                },
+                else => {},
+            }
+        }
+        if (memo_trace_enabled) {
+            std.debug.print("[bits] callee={s} const={d} dyn={} nargs={d} sig={}\n", .{ callee_name orelse "?", const_bits, dyn != null, args.len, callee_params != null });
+        }
+        if (dyn) |d| {
+            if (const_bits == 0) return d;
+            return w.b.callMember(d, "or", w.b.slice1(w.b.intLit(const_bits)));
+        }
+        return w.b.intLit(const_bits);
+    }
+
     /// Append `($composer = <composer>, $changed = <childChanged>)` to a
     /// resolved @Composable call. The pair is passed by NAME: the callee may
     /// declare defaulted params between the caller's positional args and the
@@ -3007,7 +3365,7 @@ const Walker = struct {
         var new_args = try w.a.alloc(Expr, c.args.len + 2);
         @memcpy(new_args[0..c.args.len], c.args);
         new_args[c.args.len] = w.composerRef();
-        new_args[c.args.len + 1] = w.b.intLit(0);
+        new_args[c.args.len + 1] = w.childChangedBits(calleeSimpleName(c.callee), c.args, c.arg_names, had_trailing);
         const new_names = try w.a.alloc(?[]const u8, new_args.len);
         for (new_names, 0..) |*n, i| n.* = if (i < c.arg_names.len) c.arg_names[i] else null;
         // A trailing lambda bound the callee's last function-typed parameter,
@@ -3031,7 +3389,6 @@ const Walker = struct {
         // the trailing lambda to bind `content` (non-defaulted params before it,
         // plus the lambda). A call with fewer args than that binds a smaller,
         // non-content overload, so leave its trailing lambda positional.
-        _ = had_trailing;
         if (!positional) {
             new_names[c.args.len] = composer_param;
             new_names[c.args.len + 1] = changed_param;
@@ -4051,7 +4408,11 @@ test "transform injects composer/changed params and brackets the body" {
     // Skip calculus: `var $dirty = $changed and 1`, then one probe per param.
     try testing.expectEqualStrings(dirty_local, stmts[1].Decl.Property.name.name);
     try testing.expect(stmts[1].Decl.Property.mutable);
-    const probe = stmts[2].Assign.value.Call;
+    // The probe is guarded by the caller-certainty check
+    // `if ($changed and 0b110 == 0)`.
+    const probe_guard = stmts[2].Expr.If;
+    try testing.expect(probe_guard.cond.Binary.op == .Eq);
+    const probe = probe_guard.then_branch.Block.stmts[0].Assign.value.Call;
     try testing.expectEqualStrings("or", probe.callee.Member.name.name);
     try testing.expectEqualStrings("changed", probe.args[0].If.cond.Call.callee.Member.name.name);
     try testing.expectEqualStrings("x", probe.args[0].If.cond.Call.args[0].Path.segments[0].name);
@@ -4114,9 +4475,12 @@ test "defaulted composable param becomes marker-guarded prologue" {
     try testing.expectEqual(@as(i64, 5), pick.then_branch.IntLit.value);
     try testing.expectEqualStrings("x$arg", pick.else_branch.?.Path.segments[0].name);
 
-    // A DEFAULTED param's probe is guarded by `if (x$arg !== marker())` so a
-    // param that fell back to its default stores no `changed` slot.
-    const guard = stmts[3].Expr.If;
+    // A DEFAULTED param's probe is guarded by the caller-certainty check
+    // and then by `if (x$arg !== marker())` so a param that fell back to
+    // its default stores no `changed` slot.
+    const cguard = stmts[3].Expr.If;
+    try testing.expect(cguard.cond.Binary.op == .Eq);
+    const guard = cguard.then_branch.Block.stmts[0].Expr.If;
     try testing.expect(guard.cond.Binary.op == .IdentNeq);
     try testing.expectEqualStrings("x$arg", guard.cond.Binary.lhs.Path.segments[0].name);
     const probe = guard.then_branch.Block.stmts[0];
@@ -4595,7 +4959,7 @@ test "stability: an unstable param drops the skip calculus, a stable one keeps i
     // endRestartGroup.
     try testing.expectEqual(@as(usize, 5), stmts.len);
     try testing.expectEqualStrings(dirty_local, stmts[1].Decl.Property.name.name);
-    const probe_call = stmts[2].Assign.value.Call.args[0].If.cond.Call;
+    const probe_call = stmts[2].Expr.If.then_branch.Block.stmts[0].Assign.value.Call.args[0].If.cond.Call;
     try testing.expectEqualStrings("changedInstance", probe_call.callee.Member.name.name);
     // The restart re-call is still emitted.
     try testing.expectEqualStrings("updateScope", stmts[4].Expr.Call.callee.Member.name.name);
