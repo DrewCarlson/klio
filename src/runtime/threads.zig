@@ -151,6 +151,20 @@ pub fn shouldAbandon() bool {
     return abandon_requested.load(.acquire);
 }
 
+/// Raw flag addresses for the transpiled hot path's inlined edge guard:
+/// the emitted C polls these bytes and calls the slow edge op only when
+/// a trigger fires. `thread_abandonable` is threadlocal — the pointer is
+/// only valid on the fetching thread, refreshed per activation entry.
+pub fn abandonablePtr() *const bool {
+    return &thread_abandonable;
+}
+pub fn runBoundaryAbandonPtr() *const bool {
+    return &run_boundary_abandon.raw;
+}
+pub fn abandonRequestedPtr() *const bool {
+    return &abandon_requested.raw;
+}
+
 // -------------------------------------------------------------------------
 // Run-boundary sweep hooks.
 // -------------------------------------------------------------------------

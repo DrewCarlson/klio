@@ -29,15 +29,41 @@ typedef struct {
   uint32_t value_size, tag_off, tag_size, int_off, long_off, bool_off;
   uint64_t tag_int, tag_long, tag_bool;
   uint8_t usable;
+  /* Frame cur_span (?Span) layout for the inlined trace store;
+   * span_usable == 0 keeps traces on the klio_op_trace helper. */
+  uint8_t span_usable;
+  uint32_t span_file_off, span_start_off, span_end_off, span_tag_off;
+  uint8_t span_tag_set;
 } klio_hot_layout;
 void klio_rt_hot_layout(klio_hot_layout *out);
+
+/* The frame flag/counter addresses the emitted C polls to inline the
+ * fused edge guard; fetched per activation entry (threadlocal state).
+ * klio_op_edge_rare runs the guard's slow work for the fired triggers:
+ * bit0 counter cadence, bit1 abandon, bit2 gc pending, bit3 stress,
+ * bit4 idle cadence. */
+typedef struct {
+  uint64_t *counter;
+  uint64_t *idle;
+  const uint8_t *abandonable;
+  const uint8_t *rb_abandon;
+  const uint8_t *abandon_req;
+  const uint8_t *gc_pending;
+  uint8_t gc_on;
+  uint8_t always;
+} klio_edge_view;
+void klio_op_edge_view(void *ctx, klio_edge_view *out);
+int32_t klio_op_edge_rare(void *ctx, uint32_t reasons);
+
+/* The frame's cur_span storage for the inlined trace store. */
+uint8_t *klio_op_span_slot(void *ctx);
 
 /* Registers the generated code's layout globals; the run entries fill
  * them after the performance profile (hence the reclaim mode, hence
  * `usable`) is chosen. Call before klio_rt_run_*. */
 void klio_rt_register_hot_layout(klio_hot_layout *slot);
 
-/* The library's ABI version (this header describes version 2). */
+/* The library's ABI version (this header describes version 3). */
 int klio_rt_abi_version(void);
 
 /* A transpiled function body: runs the function's blocks starting at

@@ -6564,7 +6564,64 @@ fn NativeGlue(comptime H: type) type {
             // the call to the flat driver instead (the caller unwinds and
             // resumes through the stream: slower, bounded).
             const recurse_ok = evtls.eval_depth < NATIVE_RECURSE_MAX_DEPTH;
+            // A monomorphic plain call whose callee LEAF-serves is
+            // answered in place — the same `leafExprServe` the
+            // interpreter's flat driver uses, without the full-frame
+            // recursive serve (which cost native calls 3x against the
+            // interpreter on fib). The gate mirrors execArmCall's fast
+            // path minus the shapes the leaf bank cannot take
+            // (extensions seed receivers; ambiguous fids re-resolve).
+            if (recurse_ok) direct: {
+                const c = &inst.Call;
+                if (c.type_args.len != 0 or !argNamesAllNull(c.arg_names)) break :direct;
+                const cf = frame.module.funcById(c.func) orelse break :direct;
+                if (!cf.leafExprBody()) break :direct;
+                var plan = cf.fast_call;
+                if (plan == 0) {
+                    if (comptime @hasDecl(H, "fastCallPlan")) {
+                        plan = host.fastCallPlan(frame.module, c.func);
+                        @constCast(cf).fast_call = plan;
+                    } else break :direct;
+                }
+                if (plan & ir.FAST_CALL_EXT_FLAG != 0) break :direct;
+                if (plan & ir.FAST_CALL_AMBIG_FLAG != 0) break :direct;
+                const plan_arity = plan & 0x1FFF;
+                if (plan_arity < 2 or plan_arity - 2 != c.n_args) break :direct;
+                const base = c.args.int();
+                if (base + c.n_args > frame.regs.items.len) break :direct;
+                const argv = frame.regs.items[base .. base + c.n_args];
+                const lr = leafExprServe(H, ctx.allocator, frame.module, cf, argv, host) catch return .oom;
+                if (lr) |served| {
+                    frame.write(c.dst, served.ok) catch return .oom;
+                    return .cont;
+                }
+            }
             const r = execArmCall(H, ctx.allocator, frame, &inst.Call, host, !recurse_ok) catch return .oom;
+            // A flat request whose callee LEAF-serves is answered in
+            // place: the flat driver would run the same
+            // `leafExprServe` after a full kf_ unwind + stream resume
+            // — the round trip cost native calls 3x against the
+            // interpreter on call-heavy code (fib). Identical serve,
+            // identical module choice, no unwind.
+            if (r == .flat_call) leaf: {
+                const req = frame.flat_call.?;
+                if (!leafReqServable(req)) break :leaf;
+                const callee_mod: *const Module = req.run_module orelse blk: {
+                    if (funcOwnedBy(frame.module, req.func)) break :blk frame.module;
+                    if (comptime @hasDecl(H, "ownerModuleForFunc")) {
+                        if (host.ownerModuleForFunc(req.func)) |m| break :blk m;
+                    }
+                    break :blk frame.module;
+                };
+                const lr = leafExprServe(H, ctx.allocator, callee_mod, req.func, req.args.items, host) catch return .oom;
+                if (lr) |served| {
+                    frame.flat_call = null;
+                    const dst = req.dst;
+                    discardFlatReq(H, ctx.allocator, req, host);
+                    frame.write(dst, served.ok) catch return .oom;
+                    return .cont;
+                }
+            }
             return glueAfter(ctx, r, inst, idx, block);
         }
     };
@@ -6600,6 +6657,78 @@ pub fn nativeFrameRegs(ctx: *NativeCtx) [*]u8 {
 
 pub fn nativeOpTrace(ctx: *NativeCtx, file: u32, start: u32, end: u32) void {
     ctx.frame.cur_span = .{ .file = @enumFromInt(file), .start = start, .end = end };
+}
+
+/// The frame's `cur_span` storage as raw bytes, so the emitted C can
+/// inline the per-statement trace store (a plain 3×u32 + presence-tag
+/// write; no ownership). Stable for the activation — the frame is a
+/// field of the heap activation.
+pub fn nativeFrameSpanSlot(ctx: *NativeCtx) [*]u8 {
+    return @ptrCast(&ctx.frame.cur_span);
+}
+
+/// The per-thread/global flag addresses the emitted C polls to inline
+/// the fused edge guard: the guard's slow work runs only when a trigger
+/// fires (`nativeOpEdgeRare`). Pointers are per-THREAD where the state
+/// is threadlocal, so the view is fetched at every activation entry —
+/// the same freshness rule as the register base.
+pub const NativeEdgeView = extern struct {
+    counter: *u64,
+    idle: *u64,
+    abandonable: *const bool,
+    rb_abandon: *const bool,
+    abandon_req: *const bool,
+    gc_pending: *const bool,
+    gc_on: u8,
+    always: u8,
+};
+
+pub fn nativeEdgeView(ctx: *NativeCtx, out: *NativeEdgeView) void {
+    out.* = .{
+        .counter = &ctx.ftls.spin_check_counter,
+        .idle = runtime.gc.idleTickPtr(),
+        .abandonable = runtime.abandonablePtr(),
+        .rb_abandon = runtime.runBoundaryAbandonPtr(),
+        .abandon_req = runtime.abandonRequestedPtr(),
+        .gc_pending = runtime.gc.pendingFlagPtr(),
+        .gc_on = @intFromBool(runtime.gc.gc_enabled),
+        .always = @intFromBool(runtime.gc.stressActive()),
+    };
+}
+
+/// Edge-guard slow path for the inlined edge: `reasons` says which
+/// trigger fired (bit 0 = counter cadence, bit 1 = abandon flags,
+/// bit 2 = gc pending, bit 3 = stress/always, bit 4 = idle cadence);
+/// the actions mirror `fusedEdgeGuard` exactly for those triggers.
+pub fn nativeOpEdgeRare(ctx: *NativeCtx, reasons: u32) i32 {
+    if (reasons & 0x2 != 0 and runtime.shouldAbandon()) {
+        ctx.ret_v.* = errResult(.{ .Type = "daemon task abandoned at run boundary" });
+        ctx.outcome = .ret;
+        return 1;
+    }
+    if (reasons & 0x1 != 0) {
+        spinDumpMaybe();
+        const wall_dl = test_wall_deadline_ms.load(.monotonic);
+        if (wall_dl != 0 and nowMonotonicMs() > wall_dl) {
+            std.debug.print("[wall-cap] test wall-clock deadline exceeded — hang location follows:\n", .{});
+            dumpFrameChainForDiagAlways();
+            wallCapAbandon();
+            ctx.ret_v.* = errResult(.{ .Type = "test wall-clock deadline exceeded" });
+            ctx.outcome = .ret;
+            return 1;
+        }
+    }
+    if (reasons & 0x8 != 0) {
+        // Stress mode: run the full guard's gc arm (pending() carries the
+        // stress counters).
+        if (runtime.gc.gc_enabled and runtime.gc.pending()) runtime.gc.safePoint();
+        return 0;
+    }
+    if (reasons & 0x10 != 0) runtime.gc.idleProbeNow();
+    if (reasons & 0x4 != 0) {
+        if (runtime.gc.gc_enabled) runtime.gc.safePoint();
+    }
+    return 0;
 }
 
 pub fn nativeOpConstLoad(ctx: *NativeCtx, dst: u32, const_id: u32) i32 {

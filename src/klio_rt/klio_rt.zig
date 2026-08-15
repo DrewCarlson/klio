@@ -97,6 +97,15 @@ pub const HotLayout = extern struct {
     tag_long: u64,
     tag_bool: u64,
     usable: u8,
+    /// Frame `cur_span` (`?Span`) layout for the inlined trace store:
+    /// three u32 field offsets plus the optional's presence byte and
+    /// its set value. `span_usable == 0` keeps traces on the helper.
+    span_usable: u8,
+    span_file_off: u32,
+    span_start_off: u32,
+    span_end_off: u32,
+    span_tag_off: u32,
+    span_tag_set: u8,
 };
 
 fn tagOffset() struct { off: u32, size: u32 } {
@@ -136,11 +145,74 @@ fn readTag(v: *const runtime.Value, off: u32, size: u32) u64 {
     return out;
 }
 
+/// Locate the fields of the frame's `?Span` slot by value probing:
+/// distinct u32 patterns find each field; the presence byte is the one
+/// that flips between null and set outside the payload (padding-masked
+/// by comparing two identical null values).
+const SpanProbe = struct {
+    usable: u8,
+    file_off: u32,
+    start_off: u32,
+    end_off: u32,
+    tag_off: u32,
+    tag_set: u8,
+};
+
+fn spanProbe() SpanProbe {
+    const OptSpan = ?ir.Span;
+    const N = @sizeOf(OptSpan);
+    var set: OptSpan = .{ .file = @enumFromInt(@as(u32, 0x01020304)), .start = 0x05060708, .end = 0x090A0B0C };
+    var null1: OptSpan = null;
+    var null2: OptSpan = null;
+    const ps: [*]const u8 = @ptrCast(&set);
+    const p1: [*]const u8 = @ptrCast(&null1);
+    const p2: [*]const u8 = @ptrCast(&null2);
+    var out: SpanProbe = .{ .usable = 0, .file_off = 0, .start_off = 0, .end_off = 0, .tag_off = 0, .tag_set = 1 };
+    var found_file: ?u32 = null;
+    var found_start: ?u32 = null;
+    var found_end: ?u32 = null;
+    var i: u32 = 0;
+    while (i + 4 <= N) : (i += 1) {
+        var w: u32 = 0;
+        @memcpy(std.mem.asBytes(&w), ps[i .. i + 4]);
+        switch (w) {
+            0x01020304 => found_file = i,
+            0x05060708 => found_start = i,
+            0x090A0B0C => found_end = i,
+            else => {},
+        }
+    }
+    const fo = found_file orelse return out;
+    const so = found_start orelse return out;
+    const eo = found_end orelse return out;
+    // Presence byte: differs between null and set, is stable across two
+    // nulls (excludes poisoned padding), and lies outside the payload.
+    var tag: ?u32 = null;
+    i = 0;
+    while (i < N) : (i += 1) {
+        if (p1[i] != p2[i]) continue;
+        if ((i >= fo and i < fo + 4) or (i >= so and i < so + 4) or (i >= eo and i < eo + 4)) continue;
+        if (p1[i] != ps[i]) {
+            if (tag != null) return out; // ambiguous: decline
+            tag = i;
+        }
+    }
+    const to = tag orelse return out;
+    out.file_off = fo;
+    out.start_off = so;
+    out.end_off = eo;
+    out.tag_off = to;
+    out.tag_set = ps[to];
+    out.usable = 1;
+    return out;
+}
+
 export fn klio_rt_hot_layout(out: *HotLayout) void {
     const t = tagOffset();
     var vi: runtime.Value = .{ .Int = 0 };
     var vl: runtime.Value = .{ .Long = 0 };
     var vb: runtime.Value = .{ .Bool = false };
+    const sp = spanProbe();
     out.* = .{
         .value_size = @sizeOf(runtime.Value),
         .tag_off = t.off,
@@ -156,12 +228,20 @@ export fn klio_rt_hot_layout(out: *HotLayout) void {
         // flag is not yet set on this thread when the slot fills, so the
         // request is the decision that matters.
         .usable = @intFromBool(!runtime.reclaimRequested()),
+        // The trace store has no ownership semantics, so span inlining
+        // only needs the probe to have succeeded — any reclaim mode.
+        .span_usable = sp.usable,
+        .span_file_off = sp.file_off,
+        .span_start_off = sp.start_off,
+        .span_end_off = sp.end_off,
+        .span_tag_off = sp.tag_off,
+        .span_tag_set = sp.tag_set,
     };
 }
 
 /// Library version tag for the header/link handshake.
 export fn klio_rt_abi_version() c_int {
-    return 2;
+    return 3;
 }
 
 /// Register a transpiled function for `fid`; the interpreter's frame loop
@@ -190,6 +270,18 @@ export fn klio_op_regs(ctx: *anyopaque) [*]u8 {
 
 export fn klio_op_trace(ctx: *anyopaque, file: u32, start: u32, end: u32) void {
     eval.nativeOpTrace(ctxOf(ctx), file, start, end);
+}
+
+export fn klio_op_span_slot(ctx: *anyopaque) [*]u8 {
+    return eval.nativeFrameSpanSlot(ctxOf(ctx));
+}
+
+export fn klio_op_edge_view(ctx: *anyopaque, out: *eval.NativeEdgeView) void {
+    eval.nativeEdgeView(ctxOf(ctx), out);
+}
+
+export fn klio_op_edge_rare(ctx: *anyopaque, reasons: u32) i32 {
+    return eval.nativeOpEdgeRare(ctxOf(ctx), reasons);
 }
 
 export fn klio_op_const_load(ctx: *anyopaque, dst: u32, const_id: u32) i32 {

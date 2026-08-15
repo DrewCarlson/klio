@@ -372,11 +372,8 @@ fn takeFrontier(cs: *ClassState, ci: usize) ?*SlabHeader {
     return s;
 }
 
-fn allocSmall(len: usize) ?[*]u8 {
-    const ci = classIndex(len);
-    const cs = &class_states[ci];
-    cs.lock.lock();
-    defer cs.lock.unlock();
+/// One cell off the class's partial list. Caller holds the class lock.
+fn allocLockedOne(cs: *ClassState, ci: usize) ?[*]u8 {
     var slab = cs.partial orelse takeFrontier(cs, ci) orelse return null;
     // The head may have had its free cells decommitted into dormant pages by a
     // reclaim pass. Re-commit one (reusing that slab) before mapping fresh memory
@@ -403,19 +400,11 @@ fn allocSmall(len: usize) ?[*]u8 {
         if (slab.next) |n| n.prev = null;
         slab.next = null;
     }
-    // Sample 1-in-256 by address (deterministic, so free's remove agrees) to
-    // keep the per-allocation stack capture from starving the collector on a
-    // heavily-churning workload. Reported bytes are ~1/256 of the true total.
-    if (cell_trace_enabled and gc.program_started and (@intFromPtr(cell) & 0xff) == 0) cellTraceNote(ci, @intFromPtr(cell), len);
     return @ptrCast(cell);
 }
 
-fn freeSmall(ptr: [*]u8) void {
-    const slab = slabOf(ptr);
-    const cs = &class_states[slab.class_idx];
-    cs.lock.lock();
-    defer cs.lock.unlock();
-    if (cell_trace_enabled and (@intFromPtr(ptr) & 0xff) == 0) _ = class_trace[slab.class_idx].map.remove(@intFromPtr(ptr));
+/// One cell back onto its slab's free list. Caller holds the class lock.
+fn freeLockedOne(ptr: [*]u8, slab: *SlabHeader, cs: *ClassState) void {
     // Off the partial list only when *truly* full — no free cell and no dormant
     // page. A reclaim pass can leave `free_count == 0` while the slab stays linked
     // (its capacity dormant, revived on demand); re-linking on `free_count` alone
@@ -446,6 +435,112 @@ fn freeSmall(ptr: [*]u8) void {
         } else {
             unmapRaw(@ptrCast(slab), SLAB);
         }
+    }
+}
+
+// --- per-thread magazines -----------------------------------------------------
+// Every alloc/free taking the class spinlock serializes the interpreter's
+// worker threads on a handful of hot size classes — a concurrent-stress
+// workload spent a third of its samples spinning here. Each thread instead
+// keeps a small per-class cache of free cells: pops and pushes touch only
+// thread-local state, and the class lock is taken once per BATCH (refill on
+// empty, flush of half on full) instead of once per cell. Magazine cells are
+// off their slab's free list, so the GC-time reclaim pass sees them as live
+// and never decommits their pages out from under a cache.
+
+/// Per-class magazine capacity: ~4KB of cached cells, at least 4, at most 64.
+const mag_caps: [class_sizes.len]u16 = blk: {
+    var c: [class_sizes.len]u16 = undefined;
+    for (class_sizes, 0..) |sz, i| c[i] = @intCast(@min(64, @max(4, 4096 / sz)));
+    break :blk c;
+};
+
+const Magazine = struct { head: ?*FreeCell = null, count: u16 = 0 };
+
+threadlocal var magazines: [class_sizes.len]Magazine = @splat(.{});
+
+/// Return every cached cell to the slabs. Called at worker-thread exit so a
+/// dead thread strands nothing; also keeps `KLIO_SLAB_STAT` runs exact.
+pub fn flushMagazines() void {
+    for (&magazines, 0..) |*mag, ci| {
+        if (mag.head == null) continue;
+        const cs = &class_states[ci];
+        cs.lock.lock();
+        defer cs.lock.unlock();
+        while (mag.head) |cell| {
+            mag.head = cell.next;
+            freeLockedOne(@ptrCast(cell), slabOf(@ptrCast(cell)), cs);
+        }
+        mag.count = 0;
+    }
+}
+
+fn allocSmall(len: usize) ?[*]u8 {
+    const ci = classIndex(len);
+    const cs = &class_states[ci];
+    // The cell tracer records per-address stacks; magazine round-trips would be
+    // invisible to it, so diagnostic runs take the exact locked path.
+    if (cell_trace_enabled) {
+        cs.lock.lock();
+        defer cs.lock.unlock();
+        const cell = allocLockedOne(cs, ci) orelse return null;
+        // Sample 1-in-256 by address (deterministic, so free's remove agrees) to
+        // keep the per-allocation stack capture from starving the collector on a
+        // heavily-churning workload. Reported bytes are ~1/256 of the true total.
+        if (gc.program_started and (@intFromPtr(cell) & 0xff) == 0) cellTraceNote(ci, @intFromPtr(cell), len);
+        return cell;
+    }
+    const mag = &magazines[ci];
+    if (mag.head) |cell| {
+        mag.head = cell.next;
+        mag.count -= 1;
+        return @ptrCast(cell);
+    }
+    // Empty: take one for the caller and refill half a magazine in the same
+    // critical section.
+    cs.lock.lock();
+    defer cs.lock.unlock();
+    const first = allocLockedOne(cs, ci) orelse return null;
+    var want: u16 = mag_caps[ci] / 2;
+    while (want > 0) : (want -= 1) {
+        const extra = allocLockedOne(cs, ci) orelse break;
+        const cell: *FreeCell = @ptrCast(@alignCast(extra));
+        cell.next = mag.head;
+        mag.head = cell;
+        mag.count += 1;
+    }
+    return first;
+}
+
+fn freeSmall(ptr: [*]u8) void {
+    const slab = slabOf(ptr);
+    const ci = slab.class_idx;
+    const cs = &class_states[ci];
+    if (cell_trace_enabled) {
+        cs.lock.lock();
+        defer cs.lock.unlock();
+        if ((@intFromPtr(ptr) & 0xff) == 0) _ = class_trace[ci].map.remove(@intFromPtr(ptr));
+        freeLockedOne(ptr, slab, cs);
+        return;
+    }
+    const mag = &magazines[ci];
+    if (mag.count < mag_caps[ci]) {
+        const cell: *FreeCell = @ptrCast(@alignCast(ptr));
+        cell.next = mag.head;
+        mag.head = cell;
+        mag.count += 1;
+        return;
+    }
+    // Full: return this cell and drain half the magazine under one lock.
+    cs.lock.lock();
+    defer cs.lock.unlock();
+    freeLockedOne(ptr, slab, cs);
+    var drain: u16 = mag_caps[ci] / 2;
+    while (drain > 0) : (drain -= 1) {
+        const cell = mag.head orelse break;
+        mag.head = cell.next;
+        mag.count -= 1;
+        freeLockedOne(@ptrCast(cell), slabOf(@ptrCast(cell)), cs);
     }
 }
 
@@ -708,6 +803,27 @@ test "slab reuses a freed cell (same address) within a class" {
     defer a.free(p2);
     // Same class, freed then re-allocated: the slab's free list returns it.
     try std.testing.expectEqual(addr1, @intFromPtr(p2.ptr));
+}
+
+test "slab magazine caches a freed cell and flush returns it" {
+    const a = allocator;
+    flushMagazines();
+    const p1 = try a.alloc(u8, 64);
+    const addr = @intFromPtr(p1.ptr);
+    a.free(p1);
+    // The freed cell sits in this thread's magazine; flushing pushes it (and
+    // the refill batch) back onto the slab free list, so it is among the next
+    // allocations rather than stranded in the cache.
+    flushMagazines();
+    var bufs: [40][]u8 = undefined;
+    var seen = false;
+    for (&bufs) |*b| {
+        b.* = try a.alloc(u8, 64);
+        if (@intFromPtr(b.ptr) == addr) seen = true;
+    }
+    try std.testing.expect(seen);
+    for (bufs) |b| a.free(b);
+    flushMagazines();
 }
 
 test "slab reclaim decommits sparse slabs, preserves stragglers, revives dormant" {

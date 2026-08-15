@@ -10481,8 +10481,40 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
         if (try staticExprTypeRef(b, bin.lhs)) |lhs_ty| {
             var out = lhs_ty;
             switch (bin.rhs.*) {
-                .Continue, .Break, .Return, .Throw => out.nullable = false,
+                .Continue, .Break, .Return, .Throw => {
+                    out.nullable = false;
+                    return out;
+                },
                 else => {},
+            }
+            // A value rhs makes the result the JOIN of both branches, not
+            // the lhs type: `pendingPausedComposition?.pausableApplier ?:
+            // applier` is an `Applier<*>`, and typing it as the final lhs
+            // class devirtualizes member calls to bodies the runtime
+            // receiver overrides. When one branch's type subsumes the
+            // other, the supertype side is the result; unrelated heads
+            // yield no static type (dynamic dispatch is always sound).
+            out.nullable = false;
+            const lhs_head = typeHead(std.mem.trimEnd(u8, out.name, "?"));
+            if (try staticExprTypeRef(b, bin.rhs)) |rhs_ty| {
+                const rhs_head = typeHead(std.mem.trimEnd(u8, rhs_ty.name, "?"));
+                if (std.mem.eql(u8, lhs_head, rhs_head)) {
+                    out.nullable = rhs_ty.nullable;
+                    return out;
+                }
+                var lhs_nn = out;
+                lhs_nn.name = lhs_head;
+                var rhs_nn = rhs_ty;
+                rhs_nn.name = rhs_head;
+                rhs_nn.nullable = false;
+                if (b.module.staticTypeCompatibility(lhs_nn, rhs_nn) == .compatible) {
+                    return try rhs_ty.clone(b.allocator);
+                }
+                if (b.module.staticTypeCompatibility(rhs_nn, lhs_nn) == .compatible) {
+                    out.nullable = rhs_ty.nullable;
+                    return out;
+                }
+                return null;
             }
             return out;
         }
@@ -23421,6 +23453,47 @@ test "declared member property chains retain static receiver types" {
     const chained = argDeclTypeRefLazy(&b, &nodes) orelse
         return error.TestUnexpectedResult;
     try testing.expectEqualStrings("NodeChain", chained.name);
+}
+
+test "elvis over distinct branch types joins to the common supertype" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    try m.registry.class_prop_type_heads.put(.{ .a = "Holder", .b = "pending" }, "R");
+    try m.registry.class_prop_type_heads.put(.{ .a = "Holder", .b = "base" }, "I");
+    const supers = try testing.allocator.dupe([]const u8, &.{"I"});
+    try m.registry.class_super_names.put("R", supers);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var b = try FuncBuilder.init(arena.allocator(), &m);
+    defer b.deinit();
+    b.setOwnerClass("Holder");
+
+    var pending_path = [_]ast.Ident{.{ .name = "pending", .span = dummySpan() }};
+    var pending = Expr{ .Path = .{ .segments = &pending_path, .span = dummySpan() } };
+    var base_path = [_]ast.Ident{.{ .name = "base", .span = dummySpan() }};
+    var base = Expr{ .Path = .{ .segments = &base_path, .span = dummySpan() } };
+
+    const joined = Expr{ .Binary = .{
+        .op = .Elvis,
+        .lhs = &pending,
+        .rhs = &base,
+        .span = dummySpan(),
+    } };
+    const t = (try staticExprTypeRef(&b, &joined)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("I", t.name);
+
+    // Same-head branches keep their type.
+    const same = Expr{ .Binary = .{
+        .op = .Elvis,
+        .lhs = &pending,
+        .rhs = &pending,
+        .span = dummySpan(),
+    } };
+    const st = (try staticExprTypeRef(&b, &same)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("R", st.name);
 }
 
 test "bare call commits an outer tower extension through its label slot" {
