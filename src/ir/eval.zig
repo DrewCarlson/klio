@@ -6564,7 +6564,64 @@ fn NativeGlue(comptime H: type) type {
             // the call to the flat driver instead (the caller unwinds and
             // resumes through the stream: slower, bounded).
             const recurse_ok = evtls.eval_depth < NATIVE_RECURSE_MAX_DEPTH;
+            // A monomorphic plain call whose callee LEAF-serves is
+            // answered in place — the same `leafExprServe` the
+            // interpreter's flat driver uses, without the full-frame
+            // recursive serve (which cost native calls 3x against the
+            // interpreter on fib). The gate mirrors execArmCall's fast
+            // path minus the shapes the leaf bank cannot take
+            // (extensions seed receivers; ambiguous fids re-resolve).
+            if (recurse_ok) direct: {
+                const c = &inst.Call;
+                if (c.type_args.len != 0 or !argNamesAllNull(c.arg_names)) break :direct;
+                const cf = frame.module.funcById(c.func) orelse break :direct;
+                if (!cf.leafExprBody()) break :direct;
+                var plan = cf.fast_call;
+                if (plan == 0) {
+                    if (comptime @hasDecl(H, "fastCallPlan")) {
+                        plan = host.fastCallPlan(frame.module, c.func);
+                        @constCast(cf).fast_call = plan;
+                    } else break :direct;
+                }
+                if (plan & ir.FAST_CALL_EXT_FLAG != 0) break :direct;
+                if (plan & ir.FAST_CALL_AMBIG_FLAG != 0) break :direct;
+                const plan_arity = plan & 0x1FFF;
+                if (plan_arity < 2 or plan_arity - 2 != c.n_args) break :direct;
+                const base = c.args.int();
+                if (base + c.n_args > frame.regs.items.len) break :direct;
+                const argv = frame.regs.items[base .. base + c.n_args];
+                const lr = leafExprServe(H, ctx.allocator, frame.module, cf, argv, host) catch return .oom;
+                if (lr) |served| {
+                    frame.write(c.dst, served.ok) catch return .oom;
+                    return .cont;
+                }
+            }
             const r = execArmCall(H, ctx.allocator, frame, &inst.Call, host, !recurse_ok) catch return .oom;
+            // A flat request whose callee LEAF-serves is answered in
+            // place: the flat driver would run the same
+            // `leafExprServe` after a full kf_ unwind + stream resume
+            // — the round trip cost native calls 3x against the
+            // interpreter on call-heavy code (fib). Identical serve,
+            // identical module choice, no unwind.
+            if (r == .flat_call) leaf: {
+                const req = frame.flat_call.?;
+                if (!leafReqServable(req)) break :leaf;
+                const callee_mod: *const Module = req.run_module orelse blk: {
+                    if (funcOwnedBy(frame.module, req.func)) break :blk frame.module;
+                    if (comptime @hasDecl(H, "ownerModuleForFunc")) {
+                        if (host.ownerModuleForFunc(req.func)) |m| break :blk m;
+                    }
+                    break :blk frame.module;
+                };
+                const lr = leafExprServe(H, ctx.allocator, callee_mod, req.func, req.args.items, host) catch return .oom;
+                if (lr) |served| {
+                    frame.flat_call = null;
+                    const dst = req.dst;
+                    discardFlatReq(H, ctx.allocator, req, host);
+                    frame.write(dst, served.ok) catch return .oom;
+                    return .cont;
+                }
+            }
             return glueAfter(ctx, r, inst, idx, block);
         }
     };
