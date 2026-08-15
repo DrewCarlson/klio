@@ -40,10 +40,17 @@ speedup, not neutrality-plus. The recorded levers, measure-first
       (non-leaf callees) remain a recorded road — measure-first, the
       remaining gap on call-heavy code is now against the JIT ceiling,
       not the interpreter.
-- [ ] A5. Value 16B endgame, stage 5b (`plans/value-layout-campaign.md`):
-      IrClosure via side-table id + Array — measure-first, AFTER A2-A4
-      (the hot-view layout descriptor is runtime-measured so it adapts,
-      but every layout change re-runs the A1 yardstick).
+- [ ] A5. Value 16B endgame DEFERRED BY ITS OWN DOCTRINE: stage 5b's
+      32B payloads already landed (Value = 24, hot-layout-confirmed);
+      the 24 -> 16 tail needs BOTH remaining 16B payloads under 8:
+      Array (clean: steal the cell pointer's low bit for the
+      boxed-vs-PrimBuf discriminator, kind lives in the PrimBuf
+      already) and IrClosure (every shape adds an allocation or an
+      id-table lifetime problem to the HOTTEST creation path — compose
+      builds closures per execution). The campaign doc marks these
+      "measured-first, NOT the active front"; correctness work (Phase
+      B's ~60 failing tests) outranks a speculative layout change with
+      regression risk. Re-open when a measurement motivates it.
 - [x] A6 CLOSED BY VERIFICATION: the yieldbench GPF family
       (activateChain chain-lifetime) is dead on current main — 15/15
       clean runs, ~230ms warm. resumeOnBackgroundThread PASSES in ~50s
