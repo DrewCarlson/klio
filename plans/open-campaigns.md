@@ -143,8 +143,13 @@ both suite-level (plugin conformance ratchet):
       a shape re-pins it. checkboxLike's SLOT count is the live
       emission-shape anchor instead.
 
-State: opened this stretch; both roots recorded with probes and bisect
-plans in memory klio-compose-plugin-triage.
+State: CORPUS 315/315 GREEN (2026-08-15) — window, multiwindow,
+foundation_lazy, serial_names all pass on warm caches; the three
+maxFrames=-1 interactive demos are marked `// corpus: interactive` and
+skipped by corpus_check (an Xvfb display exists on this box, so their
+until-close loop is the app's specified behavior). Remaining fronts:
+the dirty-bits skip calculus (plans/compose-dirty-bits-plan.md), the
+two 300s cross-thread Recomposer tests, and the latent items above.
 
 ## 3. Coroutine debt cluster
 
