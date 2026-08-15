@@ -9030,6 +9030,9 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
         if (full_walk and resolved == null) {
             var winner: ?usize = null;
             for (cands, 0..) |c, ci| {
+                if (missTraceWant()) |w| if (std.mem.eql(u8, w, name_str)) {
+                    std.debug.print("[ltg-cand] name={s} ci={d} depth={d} tag={s} in_fn={s}\n", .{ name_str, ci, c.depth, @tagName(std.meta.activeTag(c.v)), frame.func.name });
+                };
                 switch (try host.getMemberField(allocator, &c.v, name_str)) {
                     .ok => |v| {
                         orAudit("LoadFromThisOrGlobal", name_str, "member", c.depth, &c.v);

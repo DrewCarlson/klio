@@ -234,15 +234,49 @@ tests): 322/444 passing at the start of this stretch.
       green). One trap: a speculative include (IpParser.kt) pulled the
       unconsumed parsing DSL and broke the whole bake — add only files
       a failing test names, drop on bake error.
-- [ ] Remaining 44 real fails + 2 timeout classes, clustered:
-      ConcurrentSetTest 9, ChannelTest 7, CookieDateParser 3,
-      DataConversion 3, ReadLine tail 3, misc singles;
+- [x] Interpreter root-causes landed off the cluster list (each with a
+      guard example; commits 21186c6e, 44471f59, eac108fa):
+      * anon-object method params typed by the ENCLOSING declaration's
+        type params registered + consulted in the anon disproof, so an
+        unrelated class named `Key` no longer refutes `add(element: Key)`
+        (ConcurrentSetTest 1/10 -> 10/10).
+      * `return@inlineFn` across nested inline splices resolves at
+        lowering (InlineReturn carries the fn name), and a label crossing
+        a REAL frame inside a spliced body is absorbed by a runtime
+        `Block.lr_absorb` region at the splice join (CookieDateParser
+        4/4). Image FORMAT_VERSION 45 -> 46.
+      * companion members through the class name bind with a leading
+        defaulted param skipped (trailing-lambda pmo remap + named-ladder
+        companion forwarding): `StringValues.build { }`, `Parameters
+        .build { }` (UrlTest testEncoding included).
+      * intrinsic applicability predicates consulted unconditionally;
+        `String.repeat` declines non-(Int) calls — a bare `repeat(n){}`
+        against an in-scope String receiver silently NO-OPED (this also
+        produced the CookieDateParser NumberFormatException).
+      * `typeOf<T>()` carries generic ARGUMENTS end-to-end (full-spelling
+        reified stamps + KTypeProjection materialisation)
+        (DataConversion 4/4); tuple `contains` dispatches user equals
+        through Pair components (MimesTest 3/3).
+      * `object : Iface by <expr> {}` evaluates the delegate through a
+        site-cached thunk (SinkByteWriteChannel 4/4); KClass.isInstance
+        agrees with `is` via the registry walk (ByteChannel 13/13).
+      * `io/ktor/util/ByteChannels.kt` include (copyToBoth; ChannelTest
+        21/22 -> full class green).
+- [ ] Remaining (post-fix census pending): ReadLineTest 3-test tail =
+      suspend-resume local corruption family (`readBuffer.buffer` reads
+      a ByteArray / `.length` on Int AFTER an awaitContent resume in a
+      frame with local fns + local extension fns — repro
+      scratchpad/rl1.kt); StringValuesTest.appendAllExtensions (vararg
+      `Pair<String, String>` vs `Pair<String, Iterable<String>>` overload
+      pick ignores the Pair's second-component type); RangesTest
+      testResolveRanges eval-depth overflow; URLBuilder family bare
+      `parameters` resolution inside pack lambdas (pre-existing);
       CoroutinesTest + PipelineTest hit the 180s census cap.
 - [ ] Risk note: the widened includes are validated by the commontest
       census only; the ktor_server/client e2e itests gate them in CI.
 
-State: mapped and half-fixed; the remaining fails are real per-class
-interpreter/library bugs with logs under the census recipe.
+State: the big clusters are fixed at interpreter root-cause; the tail is
+enumerated above with repros.
 
 ## 5. Suite-wall profile
 

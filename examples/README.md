@@ -334,3 +334,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `anon_object_type_param.kt` | An object expression's members read the enclosing factory's type parameter (`Key`) as a type variable, never as an unrelated registered class of the same simple name. |
 | `reified_ktype_arguments.kt` | `typeOf<T>()` carries generic arguments (directly and through a reified inline chain), and list `contains`/`indexOf` over pairs dispatches a user `equals` through tuple components. |
 | `anon_object_interface_delegation.kt` | `object : Iface by <expr> {}` evaluates the delegate expression (a constructor call included) and forwards undeclared members to it; own overrides still win. |
+| `apply_property_shadows_global_fn.kt` | A bare name inside a spliced receiver lambda resolves the receiver's property even when a same-named top-level function exists; the function stays callable in call position. |

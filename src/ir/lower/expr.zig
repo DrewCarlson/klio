@@ -1896,6 +1896,9 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
         }
         if (b.resolve(name0)) |r| {
+            if (runtime.envOnce("KLIO_BARE_TRACE")) |w| if (std.mem.eql(u8, w, name0)) {
+                std.debug.print("[bare-read-local] {s} reg={d} in={s} window={}\n", .{ name0, r.int(), build.currentRealFn() orelse "-", b.lambda_splice_resolve != null });
+            };
             if (b.isBoxed(name0)) {
                 const dst = b.allocReg();
                 try b.push(.{ .CellGet = .{ .dst = dst, .cell = r } });
@@ -2244,7 +2247,22 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // lambda inside the splice is excluded — its bare names must keep
             // resolving against the runtime receiver walk (the
             // `setSpliceRecvTy` contract).
-            const splice_receiver_first = b.lambda_splice_resolve == null and b.spliceRecvTy() != null;
+            // A SPLICED receiver lambda has no runtime closure: its receiver
+            // exists only as the window's bound register, so the runtime
+            // receiver walk the nested-lambda contract defers to cannot see
+            // it. When the window head STATICALLY declares the name, the
+            // member read wins here — a bare `parameters` inside
+            // `URLBuilder(...).apply { … }` is the builder's property, never
+            // the top-level `parameters(builder)` function value.
+            const window_recv_declares = b.lambda_splice_resolve != null and blk: {
+                const rh = b.spliceRecvTy() orelse break :blk false;
+                const h = typeHead(std.mem.trimEnd(u8, rh, "?"));
+                const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk false;
+                if (!hs.complete) break :blk false;
+                break :blk hs.names.contains(name0);
+            };
+            const splice_receiver_first = (b.lambda_splice_resolve == null and b.spliceRecvTy() != null) or
+                window_recv_declares;
             if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
                 if (std.mem.eql(u8, w, name0)) {
                     std.debug.print("[bare-read] {s} in={s} known_global={} own={} encl={} splice_recv={s} owner={s}\n", .{
