@@ -2913,16 +2913,72 @@ fn coerceGenericIntPeersToLong(module: *const Module, func: *const Func, params:
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const iv = params[i];
-        if (iv != .Int) continue;
         const ti = func.params[i].ty;
         if (ti.nullable or !isFuncTypeParam(module, func, ti.name)) continue;
-        var j: usize = 0;
-        while (j < n) : (j += 1) {
-            if (j == i or params[j] != .Long) continue;
-            if (std.mem.eql(u8, func.params[j].ty.name, ti.name)) {
-                params[i] = .{ .Long = @as(i64, iv.Int) };
-                break;
+        if (iv == .Int) {
+            var j: usize = 0;
+            while (j < n) : (j += 1) {
+                if (j == i or params[j] != .Long) continue;
+                if (std.mem.eql(u8, func.params[j].ty.name, ti.name)) {
+                    params[i] = .{ .Long = @as(i64, iv.Int) };
+                    break;
+                }
             }
+            continue;
+        }
+        // The same literal-flow shape one level down: `assertEquals(
+        // listOf(0..10, ...), longRangesValue)` types the range literals
+        // as `LongRange` via the shared `T = List<LongRange>` — retag the
+        // Int-kind range/scalar elements of the literal list when the peer
+        // bound to the same `T` carries Long content.
+        if (iv == .Range or iv == .List) {
+            var j: usize = 0;
+            while (j < n) : (j += 1) {
+                if (j == i) continue;
+                if (!std.mem.eql(u8, func.params[j].ty.name, ti.name)) continue;
+                if (iv == .Range and params[j] == .Range) {
+                    if (iv.Range.kind == .Int and params[j].Range.kind == .Long and !iv.Range.progression) {
+                        iv.Range.kind = .Long;
+                    }
+                    break;
+                }
+                if (iv == .List and params[j] == .List) {
+                    if (peerListIsLongContent(&params[j])) widenIntListContentToLong(&params[i]);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Whether every element of the peer list is Long-kind content (a Long
+/// scalar or a Long-kind range) — the evidence the literal side's Ints
+/// were typed `Long` by inference.
+fn peerListIsLongContent(v: *const Value) bool {
+    const g = v.List.items.borrow();
+    defer g.deinit();
+    const items = g.get().items;
+    if (items.len == 0) return false;
+    for (items) |*e| {
+        switch (e.*) {
+            .Long => {},
+            .Range => |r| if (r.kind != .Long) return false,
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn widenIntListContentToLong(v: *Value) void {
+    const g = v.List.items.borrowMut();
+    defer g.deinit();
+    for (g.get().items) |*e| {
+        switch (e.*) {
+            .Int => |x| e.* = .{ .Long = @as(i64, x) },
+            .Range => |r| if (r.kind == .Int and !r.progression) {
+                r.kind = .Long;
+            },
+            else => {},
         }
     }
 }

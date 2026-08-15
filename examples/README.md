@@ -335,3 +335,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `reified_ktype_arguments.kt` | `typeOf<T>()` carries generic arguments (directly and through a reified inline chain), and list `contains`/`indexOf` over pairs dispatches a user `equals` through tuple components. |
 | `anon_object_interface_delegation.kt` | `object : Iface by <expr> {}` evaluates the delegate expression (a constructor call included) and forwards undeclared members to it; own overrides still win. |
 | `apply_property_shadows_global_fn.kt` | A bare name inside a spliced receiver lambda resolves the receiver's property even when a same-named top-level function exists; the function stays callable in call position. |
+| `vararg_pair_overload_pick.kt` | Sibling vararg overloads discriminate on the Pair's second component (`Pair<String, List<String>>` declines the `Pair<String, String>` overload), and generic Int/Long peers widen a range-literal list against a Long-range peer. |

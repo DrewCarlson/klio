@@ -1688,9 +1688,31 @@ fn valueNominalFqn(v: *const Value) []const u8 {
 
 fn candidateArgsDisproven(self: *VmHost, f: *const Func, args: []const Value) bool {
     if (f.params.len <= 1 or args.len == 0) return false;
-    // A vararg tail repositions everything after it; decline.
-    for (f.params) |*pp| {
-        if (pp.is_vararg) return false;
+    // A single TRAILING vararg adjudicates every remaining arg against its
+    // ELEMENT type — the `appendAll(vararg Pair<String, String>)` overload
+    // must decline a `Pair<String, List<String>>` argument so its
+    // `Pair<String, Iterable<String>>` sibling binds. A NON-final vararg
+    // repositions everything after it; decline as before.
+    var vararg_trailing = false;
+    for (f.params, 0..) |*pp, pi| {
+        if (pp.is_vararg) {
+            if (pi + 1 != f.params.len) return false;
+            vararg_trailing = true;
+        }
+    }
+    if (vararg_trailing) {
+        const lead = f.params.len - 2; // params[0] is `this`
+        for (args, 0..) |*a, ai| {
+            const pty = if (ai < lead) &f.params[ai + 1].ty else &f.params[f.params.len - 1].ty;
+            if (std.mem.startsWith(u8, pty.name, "Function") and instanceHierarchyHasInvoke(self, a)) continue;
+            if (argDefinitelyNotParamType(self, pty, a)) {
+                if (missTraceWant(f.name)) {
+                    std.debug.print("[extfb]  vararg arg#{d} {s} rejects {s}\n", .{ ai, pty.name, valueNominalFqn(a) });
+                }
+                return true;
+            }
+        }
+        return false;
     }
     var n = args.len;
     // Trailing-lambda binding: a callable last argument bound to the LAST
@@ -3021,6 +3043,31 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
             .List, .Map, .Set, .Array, .Range, .Sequence, .Pair, .Triple, .MapEntry => true,
             .Instance => !instanceHasInvokeSurface(self, arg),
             else => false,
+        };
+    }
+    // A Pair/Triple argument adjudicates its components against the declared
+    // generic arguments: `appendAll(vararg values: Pair<String, String>)`
+    // must decline a `Pair<String, List<String>>` so the sibling
+    // `Pair<String, Iterable<String>>` overload binds, exactly as kotlinc
+    // picks.
+    if (arg.* == .Pair and std.mem.eql(u8, pn, "Pair") and param_ty.args.len == 2) {
+        if (argDefinitelyNotParamType(self, &param_ty.args[0], arg.Pair.first.asPtr())) return true;
+        if (argDefinitelyNotParamType(self, &param_ty.args[1], arg.Pair.second.asPtr())) return true;
+        return false;
+    }
+    if (arg.* == .Triple and std.mem.eql(u8, pn, "Triple") and param_ty.args.len == 3) {
+        if (argDefinitelyNotParamType(self, &param_ty.args[0], arg.Triple.first.asPtr())) return true;
+        if (argDefinitelyNotParamType(self, &param_ty.args[1], arg.Triple.second.asPtr())) return true;
+        if (argDefinitelyNotParamType(self, &param_ty.args[2], arg.Triple.third.asPtr())) return true;
+        return false;
+    }
+    // A container/tuple value never satisfies a scalar or String parameter
+    // head (an `Array` head stays out: vararg packing hands pre-packed
+    // arrays through here).
+    if (overload_match.builtinParamKind(pn)) |pk| {
+        if (pk != .array) switch (arg.*) {
+            .List, .Map, .Set, .Sequence, .Pair, .Triple, .MapEntry => return true,
+            else => {},
         };
     }
     // Builtin value-kind disproof: a String argument can never bind an
