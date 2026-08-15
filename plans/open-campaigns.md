@@ -270,8 +270,13 @@ tests): 322/444 passing at the start of this stretch.
       `parameters`-as-Function family); trailing-vararg element
       adjudication + Pair-component disproof (StringValues 9/9); range
       literal peer widening (list-of-ranges vs Long peer).
-- [ ] Census after all fixes: **445 passed / 4 failed / 1 class census-cap
-      INCOMPLETE** (was 322 at the stretch start). LANDMARK (704597a0):
+- [ ] Census after all fixes: **463 passed / 4 failed / ZERO incomplete**
+      (was 322/444-ish at the stretch start; the deadlocked classes'
+      tests now all count and PipelineTest is 18/18 in 10s). Latest
+      landing (e2200304): CallValueOrMember's non-invocable arm walks the
+      outer implicit receivers on the canonical miss — a NON-callable
+      captured local (val pipeline = pipeline()) no longer strands the
+      enclosing member. LANDMARK (704597a0):
       the inline `synchronized` actual leaked its monitor on NON-LOCAL
       RETURN/exception exits; TestCoroutineScheduler.tryRunNextTaskUnless
       returns from inside synchronized(lock), so under runTest the root
