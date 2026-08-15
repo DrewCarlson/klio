@@ -262,16 +262,38 @@ tests): 322/444 passing at the start of this stretch.
         agrees with `is` via the registry walk (ByteChannel 13/13).
       * `io/ktor/util/ByteChannels.kt` include (copyToBoth; ChannelTest
         21/22 -> full class green).
-- [ ] Remaining (post-fix census pending): ReadLineTest 3-test tail =
-      suspend-resume local corruption family (`readBuffer.buffer` reads
-      a ByteArray / `.length` on Int AFTER an awaitContent resume in a
-      frame with local fns + local extension fns — repro
-      scratchpad/rl1.kt); StringValuesTest.appendAllExtensions (vararg
-      `Pair<String, String>` vs `Pair<String, Iterable<String>>` overload
-      pick ignores the Pair's second-component type); RangesTest
-      testResolveRanges eval-depth overflow; URLBuilder family bare
-      `parameters` resolution inside pack lambdas (pre-existing);
-      CoroutinesTest + PipelineTest hit the 180s census cap.
+- [x] Second interpreter batch (commits 44471f59, eac108fa, 036aa54a,
+      3776afc5): full-spelling reified stamps + KType arguments; tuple
+      contains via user equals; anon-object interface delegation thunks;
+      KClass.isInstance registry walk; spliced-receiver-lambda bare reads
+      prefer a window member the head declares (the whole URLBuilder
+      `parameters`-as-Function family); trailing-vararg element
+      adjudication + Pair-component disproof (StringValues 9/9); range
+      literal peer widening (list-of-ranges vs Long peer).
+- [ ] Census after all fixes: **435 passed / 8 failed / 3 classes
+      INCOMPLETE** (was 322 at the stretch start). The tail:
+      * ReadLineTest 3 + ReadUtf8LineTest 1 — suspend-resume local
+        corruption family (`readBuffer.buffer` reads a ByteArray /
+        `.length` on Int AFTER an awaitContent resume in a frame with
+        local fns + local extension fns — repro scratchpad/rl1.kt).
+      * URLBuilderTest 2 (scheme-with-digits) — matches Kotlin semantics:
+        upstream URLProtocol's own `require(name.all { it.isLowerCase() })`
+        rejects digit schemes on the JVM too (verified against
+        Character.isLowerCase); how upstream CI passes these is unclear —
+        do NOT "fix" klio to diverge.
+      * CodecTest.testFormUrlEncode + RangesTest.testResolveRanges —
+        BATCH-CONTEXT resolution pollution: both PASS single-file and
+        fail only when the utils tests (kotlinx.coroutines imports) are
+        compiled alongside; formUrlEncodeTo's inner chain then carries a
+        stale `declared=Flow` static-receiver stamp, and assertEquals
+        self-recurses ~39 deep (frame `RangesTest.assertEquals` at the
+        mapTo splice span) until the depth cap.
+      * CoroutinesTest (GlobalScope.writer/reader deadlock — parks with
+        ~2s user time over minutes; task #31 territory), PipelineTest,
+        WriterReaderTest — INCOMPLETE at the census cap.
+      * Side find: the fast/flat call path skips the generic Int/Long
+        PEER widening entirely (`eq(0, 0L)` is false where kotlinc says
+        true) — small, recorded, unfixed.
 - [ ] Risk note: the widened includes are validated by the commontest
       census only; the ktor_server/client e2e itests gate them in CI.
 
