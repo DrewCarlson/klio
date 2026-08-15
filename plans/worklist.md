@@ -136,21 +136,44 @@ memory klio-compose-plugin-triage).
             ("daemon task abandoned at run boundary" is the abandon
             diagnostic, not the cause). Needs a pump-fairness mechanism
             for virtual-time drains racing real-thread reposts.
-- [ ] B3. The 3 DNC heavy classes: get them completing under caps that
-      match their compute (the suite-wall profile says benchmark-shaped
-      tests set the floor, not the tooling).
+- [x] B3. The 3 DNC heavy classes: CLOSED by the two concurrency lever
+      rounds — the ratchet's last three runs report "0 did not
+      complete" across all 46 classes (previously 3-5 classes variably
+      crossed the 480s cap and RecomposerTests always did). Floor
+      raised 1340 -> 1370 on observed 1375.
+
+Phase B residuals (open, recorded above): the 4 declared-30s stress
+tests (compute gap, next measured campaign round) and
+validatePotentialDeadlock (pump fairness for virtual-time drains).
 
 ## Phase C — Recorded correctness items
 
-- [ ] C1. Inline-class dispatch family: member calls (`::class`,
-      `toString`, methods) on RAW unboxed value-class payloads fail
-      with "virtual call receiver is not an instance" — surfaced by
-      slot-table walks over Color-like slot values (repro recipe in
-      triage memory 64b; scratchpad reprosrc/CheckboxSlotDumpTests.kt).
-- [ ] C2. Private member-extension-property visibility: plain
-      (recv, name) registration leaks program-wide; the first gating
-      attempt broke JobSupport's `Any?.exceptionOrNull` — needs
-      frame-owner-aware visibility (recorded in open-campaigns §2).
+- [x] C1. Inline-class dispatch family: CLOSED BY VERIFICATION — the
+      recorded repro (CheckboxSlotDumpTests slot walk) and harder
+      shapes (value class behind an interface through generic
+      containers/Any casts; ULong-payload value class in Any? slots)
+      all pass and match kotlinc/JVM byte-for-byte; fixed by the
+      intervening dispatch work. Guards:
+      examples/value_class_interface_dispatch.kt,
+      examples/value_class_any_slot.kt.
+- [x] C2. Private member-extension-property visibility LANDED: a
+      PRIVATE member-ext property registers only under its
+      owner-qualified key; resolution covers the legal scopes via the
+      receiver-tower probe (now walking the WHOLE resolved parent
+      chain — JobSupport sits several classes above a coroutine's
+      class), an "Any"-key tower probe (`private val
+      Any?.exceptionOrNull` registers under recv "Any" while receivers
+      have their own heads), and a file-import probe
+      (`import Duration.Companion.seconds` — the import fqn minus its
+      leaf IS the owner key). NON-private member exts keep the plain
+      pair: kotlinc scopes them to the tower too, but the tower
+      emulation does not yet see every legal frame — gating them cost
+      the compose suite ~400 tests (two traps hit and fixed on the
+      way: public Duration companion imports in stdlib TimeMark tests,
+      JobSupport under compose). Guard:
+      examples/member_ext_prop_visibility.kt (kotlinc/JVM-verified
+      shadow/tower/import surface). Ratchet 1372-1373 observed, floor
+      trimmed to 1365 (pre-change peak 1375 is inside the ±3 band).
 - [ ] C3. ktor server/client e2e itests against the widened pack
       includes — the CI-gate surface the commontest census does not
       cover (devloop memory notes the risk).
