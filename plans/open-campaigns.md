@@ -270,8 +270,20 @@ tests): 322/444 passing at the start of this stretch.
       `parameters`-as-Function family); trailing-vararg element
       adjudication + Pair-component disproof (StringValues 9/9); range
       literal peer widening (list-of-ranges vs Long peer).
-- [ ] Census after all fixes: **439 passed / 4 failed / 3 classes
-      INCOMPLETE** (was 322 at the stretch start). Landed since the 435
+- [ ] Census after all fixes: **445 passed / 4 failed / 1 class census-cap
+      INCOMPLETE** (was 322 at the stretch start). LANDMARK (704597a0):
+      the inline `synchronized` actual leaked its monitor on NON-LOCAL
+      RETURN/exception exits; TestCoroutineScheduler.tryRunNextTaskUnless
+      returns from inside synchronized(lock), so under runTest the root
+      thread owned the scheduler lock forever and every cross-thread
+      resume spun in registerEvent's monitorEnter — the ENTIRE
+      GlobalScope.writer/reader deadlock family. try/finally fixed it:
+      CoroutinesTest 2/2, WriterReaderTest 4/4, PipelineTest completes
+      solo at 14/18 (census 180s cap still cuts it; its 3 `pipeline()`
+      member misses on DebugPipelineContext = the receiver-publication
+      campaign — the intercept lambda's dynamic chain lacks the lexical
+      test-class this; +1 asyncFork daemon-abandonment tail). Pack-baked
+      splices carry the old enter/exit sequence until rebuilt. Landed since the 435
       snapshot: named args on RESOLVED member calls bind by name
       (ReadLineTest 25/25 with the exact-limit pair), partial-index
       overload repick + eager unresolved-param gate
