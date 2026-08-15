@@ -8747,7 +8747,37 @@ noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator, fra
         const name_str = constStr(frame.module, cvm.name) orelse
             return raiseStep(frame, .{ .Type = "CallValueOrMember: name not a string const" });
         orAudit("CallValueOrMember", name_str, "member", 0, &recv);
-        switch (try host.callMemberNamed(allocator, &recv, name_str, arg_values, names)) {
+        var r = try host.callMemberNamed(allocator, &recv, name_str, arg_values, names);
+        // A NON-callable capture is not a resolution candidate at all in
+        // Kotlin: `val pipeline = pipeline()` captured by a receiver lambda
+        // must not stop `pipeline()` from binding the ENCLOSING class's
+        // member. On the canonical member miss for the innermost receiver,
+        // walk the outer implicit receivers before giving up.
+        if (r == .err and r.err == .Unimplemented and
+            std.mem.indexOf(u8, r.err.Unimplemented, "Vm::call_member") != null)
+        {
+            const entries = try enclosingEntriesAlloc(allocator);
+            defer allocator.free(entries);
+            var i = entries.len;
+            while (i > 0) {
+                i -= 1;
+                const e = &entries[i];
+                if (e.v != .Instance) continue;
+                if (e.v == .Instance and recv == .Instance and
+                    ObjRef(InstanceData).ptrEq(e.v.Instance, recv.Instance)) continue;
+                const r2 = try host.callMemberNamed(allocator, &e.v, name_str, arg_values, names);
+                if (r2 == .err and r2.err == .Unimplemented and
+                    std.mem.indexOf(u8, r2.err.Unimplemented, "Vm::call_member") != null)
+                {
+                    freeMissErr(allocator, r2.err);
+                    continue;
+                }
+                freeMissErr(allocator, r.err);
+                r = r2;
+                break;
+            }
+        }
+        switch (r) {
             .ok => |rv| try frame.write(cvm.dst, rv),
             .err => |e| return raiseStep(frame, e),
         }

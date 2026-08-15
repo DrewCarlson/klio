@@ -338,3 +338,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `vararg_pair_overload_pick.kt` | Sibling vararg overloads discriminate on the Pair's second component (`Pair<String, List<String>>` declines the `Pair<String, String>` overload), and generic Int/Long peers widen a range-literal list against a Long-range peer. |
 | `named_args_resolved_member_ext.kt` | Named arguments on a lowering-resolved member-extension call bind by parameter name; a named defaulted param after a vararg never lands in the vararg. |
 | `synchronized_nonlocal_return.kt` | `synchronized` releases its monitor on every exit — non-local return and exception included — so a second thread can take the lock afterwards. |
+| `noncallable_capture_member_fallback.kt` | A NON-callable captured local (`val pipeline = pipeline()`) never captures a same-named call inside a receiver lambda — the enclosing class's member binds, as kotlinc resolves. |
