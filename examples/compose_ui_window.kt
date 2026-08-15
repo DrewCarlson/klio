@@ -1,3 +1,4 @@
+// corpus: interactive — loops on a live window (maxFrames = -1) until the user closes it.
 // A live windowed Compose UI app, rendered by Skia into a real (SDL) window. A
 // clickable counter Button: clicking it writes state, recomposes, and redraws —
 // the full input -> state -> recompose -> draw loop, on screen. Run with the Skia

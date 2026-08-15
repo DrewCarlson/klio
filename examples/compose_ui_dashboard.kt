@@ -1,3 +1,4 @@
+// corpus: interactive — loops on a live window (maxFrames = -1) until the user closes it.
 // An advanced windowed Material 3 app: a themed dashboard with a light/dark
 // toggle, tab navigation, an interactive counter, a toggleable task list, and an
 // about pane — the full state -> recompose -> Skia draw loop, staying open until

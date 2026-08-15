@@ -17,6 +17,23 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def is_interactive(path):
+    """An example marked `// corpus: interactive` is a live windowed app
+    that loops until the user closes its window (maxFrames = -1); it has
+    no exit code to assert and is excluded from the corpus run."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for _ in range(12):
+                line = f.readline()
+                if not line:
+                    break
+                if re.search(r"//\s*corpus:\s*interactive", line):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def extra_args(path):
     """An example may document required flags in a header comment:
     `// Run with: klio run --feature X/Y examples/foo.kt`. Honor them."""
@@ -66,6 +83,11 @@ def main():
     if not files:
         print("no files matched", args.pattern, file=sys.stderr)
         return 2
+    skipped = [f for f in files if is_interactive(f)]
+    if skipped:
+        files = [f for f in files if f not in set(skipped)]
+        print(f"skipping {len(skipped)} interactive example(s): "
+              + " ".join(os.path.relpath(f, ROOT) for f in skipped))
 
     def check(f):
         rel = os.path.relpath(f, ROOT)
