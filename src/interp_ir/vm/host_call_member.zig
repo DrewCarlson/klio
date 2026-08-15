@@ -4648,11 +4648,17 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         }
     }
 
-    // `KClass.isInstance(value)`.
+    // `KClass.isInstance(value)`. The value-side predicate walks the
+    // captured-env supertype chain, which dead-ends when a parent class
+    // is not env-visible (a cross-pack ancestor like `ClosedByteChannel-
+    // Exception : kotlinx.io.IOException`); fall through to the host's
+    // registry-backed walk so `isInstance` agrees with `is`.
     if (receiver.* == .Class and std.mem.eql(u8, name, "isInstance") and args.len == 1) {
         const cg = receiver.Class.borrow();
         const cname = cg.get().name;
-        const r = boolVal(args[0].isRuntimeType(cname));
+        var hit = args[0].isRuntimeType(cname);
+        if (!hit and args[0] == .Instance) hit = receiverImplementsType(self, &args[0], cname);
+        const r = boolVal(hit);
         cg.deinit();
         return .{ .ok = r };
     }
@@ -4664,7 +4670,9 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     {
         const cg = receiver.Class.borrow();
         const cname = cg.get().name;
-        if (args[0].isRuntimeType(cname)) {
+        const casts = args[0].isRuntimeType(cname) or
+            (args[0] == .Instance and receiverImplementsType(self, &args[0], cname));
+        if (casts) {
             cg.deinit();
             var v = args[0];
             if (runtime.reclaimEnabled()) v.retain();
@@ -9988,7 +9996,9 @@ fn runHostSlotOp(self: *VmHost, allocator: Allocator, op: HostSlotOp, receiver: 
             if (receiver.* != .Class or args.len != 1) return null;
             const cg = receiver.Class.borrow();
             const cname = cg.get().name;
-            const r = boolVal(args[0].isRuntimeType(cname));
+            var hit = args[0].isRuntimeType(cname);
+            if (!hit and args[0] == .Instance) hit = receiverImplementsType(self, &args[0], cname);
+            const r = boolVal(hit);
             cg.deinit();
             return .{ .ok = r };
         },

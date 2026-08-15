@@ -333,3 +333,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `companion_defaulted_builder.kt` | A companion member reached through the class name binds with a leading defaulted parameter skipped — trailing lambda (inline and non-inline) and named-argument forms. |
 | `anon_object_type_param.kt` | An object expression's members read the enclosing factory's type parameter (`Key`) as a type variable, never as an unrelated registered class of the same simple name. |
 | `reified_ktype_arguments.kt` | `typeOf<T>()` carries generic arguments (directly and through a reified inline chain), and list `contains`/`indexOf` over pairs dispatches a user `equals` through tuple components. |
+| `anon_object_interface_delegation.kt` | `object : Iface by <expr> {}` evaluates the delegate expression (a constructor call included) and forwards undeclared members to it; own overrides still win. |
