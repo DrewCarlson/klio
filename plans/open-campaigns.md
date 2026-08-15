@@ -189,8 +189,19 @@ the campaign opens (`COROUTINE-MODEL.md` is the architecture reference).
       member-dispatch against kotlin.Function first and the resolved
       target gets the wrong `this`. combine's `emit` on FlowCoroutine
       is the same seating. Full trace anatomy in triage memory (62).
-- [ ] Cancellation cluster (flow campaign residue)
-- [ ] Unconfined event loop (= createEventLoop debt)
+- [x] Cancellation cluster CLOSED BY RE-VERIFICATION (2026-08-15): the
+      flow campaign's recorded repros all pass on current main
+      (plans/repros/channel_segment_rotation_break sum=2415,
+      channel_worker_send_park_lost_wakeup sum=5050, both matching the
+      JVM oracle; combine_captured_param_typeparam_cast is a distilled
+      erasure probe the JVM itself CCEs on — not an oracle), and the
+      litmus tl_cancel_* family is green in the 45/45 baseline.
+- [x] Unconfined event loop: eager start (guard
+      unconfined_starts_eagerly.kt), yield order (oracle-verified, see
+      below), and the manual CancellableContinuation save/resume crash
+      (`get_field context on Unit`) all pass on current main — the
+      save/resume shape now matches the JVM byte-for-byte (guard
+      cancellable_continuation_save_resume.kt).
 - [ ] tl_atomic_update_contended litmus flake (timeout under load;
       the sweep now prints got-vs-expected tails, so the next natural
       occurrence is postmortem-able)

@@ -344,3 +344,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `generic_literal_long_widening.kt` | An integer literal in a shared type-variable slot beside a `Long` peer is typed `Long` — `eq(0, 0L)` is true on the framed path and the leaf expression-body serve alike. |
 | `member_invariant_arg_delegation.kt` | A private member refuted by an invariant generic argument (`List<IntRange>` vs a mapped `List<LongRange>`) steps aside for the top-level function instead of recursing into itself. |
 | `unconfined_yield_order.kt` | Unconfined runs eagerly through `yield()` on an empty event loop before a default-dispatched sibling starts — U1 U2 L1 L2, verified against kotlinc/JVM. |
+| `cancellable_continuation_save_resume.kt` | A `CancellableContinuation` captured from `suspendCancellableCoroutine` and resumed from the outer body delivers its value intact — verified against kotlinc/JVM. |
