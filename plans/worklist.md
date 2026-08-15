@@ -68,10 +68,26 @@ census. No enumerated mechanisms yet — enumeration first, the way the
 ktor campaign started (`plans/compose-plugin-lowering.md`, triage
 memory klio-compose-plugin-triage).
 
-- [ ] B1. Census enumeration: per-class children at P=2, heavies solo
+- [x] B1. Census enumeration: per-class children at P=2, heavies solo
       uncapped; name every failing test; cluster by mechanism.
+      Result: 12 unique failing tests (not ~60 — the larger number was
+      contention duplication): 4 fast-real, 7 concurrent-stress
+      timeouts (verify solo before believing), validatePotentialDeadlock
+      (300s wall). "INCOMPLETE" census rows were "no tests found"
+      helper-class over-collection, not failures.
 - [ ] B2. Fix the clusters, largest mechanism first; guard example per
       fix; ratchet floor raised as observed counts stabilize.
+      - [x] validate_subList_remove + subList family (23/23): ERROR/HIDDEN
+            deprecated declarations excluded as extension candidates
+            (`deprecated_error` skip in resolveExtensionCall); guard
+            examples/deprecated_error_not_callable.kt.
+      - [x] restart_and_skip (RestartTests 6/6): restart lambda re-invoke
+            wraps $changed in updateChangedFlags; ratchet 1374 observed.
+      - [x] testApplierBeginEndCallbacks: elvis static type is the JOIN
+            of both branches, not the lhs type — lhs-typed elvis
+            devirtualized `applier.onBeginChanges()` to the interface
+            default through final RecordingApplier; guard
+            examples/elvis_join_dispatch.kt + lower.expr unit test.
 - [ ] B3. The 3 DNC heavy classes: get them completing under caps that
       match their compute (the suite-wall profile says benchmark-shaped
       tests set the floor, not the tooling).
