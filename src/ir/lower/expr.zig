@@ -11277,12 +11277,35 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
         return .{ .name = ret_head, .nullable = f2.return_ty.nullable, .args = out_args };
     }
     if (pick == null) {
+        // The sole-survivor rule must respect the EXTENSION RECEIVER: with
+        // the stdlib's declarations bodyless in a pack-loaded universe, the
+        // one BODIED same-arity candidate can be an unrelated-receiver
+        // extension (kotlinx's deprecated `Flow.flatMap` served a bare
+        // `flatMap { }` on a Set receiver and stamped `declared=Flow` on
+        // the chained call). A non-generic declared receiver the context
+        // receiver cannot serve is not a candidate at all.
+        const actual_head: ?[]const u8 = blk_ah: {
+            const h = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse break :blk_ah null;
+            break :blk_ah typeHead(std.mem.trimEnd(u8, h, "?"));
+        };
         var sole: ?FuncId = null;
         for (cands) |fid| {
             const f = b.module.funcById(fid) orelse continue;
             if (!f.hasBody()) continue;
+            if (f.low_priority) continue;
             const base: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
             if (f.params.len -| base != want) continue;
+            if (base == 1) {
+                var dr = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
+                if (std.mem.indexOfScalar(u8, dr, '<')) |lt| dr = dr[0..lt];
+                const dh = typeHead(dr);
+                const generic = dh.len <= 2 or
+                    ir.parseClassTypeParamIdentity(f.params[0].ty.name) != null;
+                if (!generic) {
+                    const ah = actual_head orelse continue;
+                    if (!(std.mem.eql(u8, ah, dh) or receiverHeadServes(b, ah, dh))) continue;
+                }
+            }
             if (sole != null) return null;
             sole = fid;
         }
@@ -11308,7 +11331,35 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
     return try f.return_ty.clone(b.allocator);
 }
 
+fn scrtVia(call_expr: *const Expr, via: []const u8, t: ir.TypeRef) ir.TypeRef {
+    if (runtime.envOnce("KLIO_SCRT_TRACE")) |w| {
+        if (call_expr.* == .Call and call_expr.Call.callee.* == .Path and
+            call_expr.Call.callee.Path.segments.len == 1 and
+            std.mem.eql(u8, w, call_expr.Call.callee.Path.segments[0].name))
+        {
+            std.debug.print("[scrt-via] {s} via={s} ty={s}\n", .{ w, via, t.name });
+        }
+    }
+    return t;
+}
+
 fn staticCallReturnTypeRef(
+    b: *FuncBuilder,
+    call_expr: *const Expr,
+) Allocator.Error!?ir.TypeRef {
+    const r = try staticCallReturnTypeRefInner(b, call_expr);
+    if (runtime.envOnce("KLIO_SCRT_TRACE")) |w| {
+        if (call_expr.* == .Call and call_expr.Call.callee.* == .Path and
+            call_expr.Call.callee.Path.segments.len == 1 and
+            std.mem.eql(u8, w, call_expr.Call.callee.Path.segments[0].name))
+        {
+            std.debug.print("[scrt-out] {s} ty={s}\n", .{ w, if (r) |t| t.name else "-" });
+        }
+    }
+    return r;
+}
+
+fn staticCallReturnTypeRefInner(
     b: *FuncBuilder,
     call_expr: *const Expr,
 ) Allocator.Error!?ir.TypeRef {
@@ -11463,12 +11514,19 @@ fn staticCallReturnTypeRef(
         } else if (sfx_trace) std.debug.print("[scopefn] {s} bail=tail_underived\n", .{nm2});
         break :scope_fns;
     }
-    if (try fnTypedCalleeReturnTypeRef(b, call_expr)) |t| return t;
-    if (try fqnCallReturnTypeRef(b, call_expr)) |t| return t;
-    if (try localFnReturnTypeRef(b, call_expr)) |t| return t;
-    if (try bareCallReturnTypeRef(b, call_expr)) |t| return t;
-    if (try memberCallReturnTypeRef(b, call_expr)) |t| return t;
-    if (try bareMemberReturnTypeRef(b, call_expr)) |t| return t;
+    if (try fnTypedCalleeReturnTypeRef(b, call_expr)) |t| return scrtVia(call_expr, "fnTyped", t);
+    if (try fqnCallReturnTypeRef(b, call_expr)) |t| return scrtVia(call_expr, "fqn", t);
+    if (try localFnReturnTypeRef(b, call_expr)) |t| return scrtVia(call_expr, "localFn", t);
+    if (try bareCallReturnTypeRef(b, call_expr)) |t| return scrtVia(call_expr, "bareCall", t);
+    if (try memberCallReturnTypeRef(b, call_expr)) |t| return scrtVia(call_expr, "memberCall", t);
+    if (try bareMemberReturnTypeRef(b, call_expr)) |t| {
+        if (runtime.envOnce("KLIO_SCRT_TRACE")) |w| {
+            if (call_expr.* == .Call and call_expr.Call.callee.* == .Path and call_expr.Call.callee.Path.segments.len == 1 and std.mem.eql(u8, w, call_expr.Call.callee.Path.segments[0].name)) {
+                std.debug.print("[scrt] {s} via=bareMember ty={s}\n", .{ w, t.name });
+            }
+        }
+        return t;
+    }
     if (call_expr.* == .Binary) {
         const bin = call_expr.Binary;
         const method: []const u8 = switch (bin.op) {
@@ -11796,6 +11854,11 @@ fn staticCallReturnTypeRef(
                 if (!args_agree) ret.args = &.{};
                 break :blk_agree ret;
             };
+            if (runtime.envOnce("KLIO_SCRT_TRACE")) |w3| {
+                if (std.mem.eql(u8, w3, name.name)) {
+                    std.debug.print("[scrt-path] {s} usable={} target={?} conf={s}\n", .{ name.name, top_level_usable, if (res.target) |t| t.int() else null, @tagName(res.confidence) });
+                }
+            }
             target = (if (top_level_usable) res.target else null) orelse blk: {
                 from_implicit_receiver = true;
                 // A BARE call in a receiver context is usually a member of the
@@ -11811,7 +11874,12 @@ fn staticCallReturnTypeRef(
                 const head_name = bareStaticRecvHead(b) orelse b.ownerClass() orelse {
                     if (bt) std.debug.print("[bareret] {s} no recv head\n", .{name.name});
                     break :blk sole_global orelse {
-                        if (agreed_return) |ar| return try ar.clone(b.allocator);
+                        if (agreed_return) |ar| {
+                            if (runtime.envOnce("KLIO_SCRT_TRACE")) |w2| {
+                                if (std.mem.eql(u8, w2, name.name)) std.debug.print("[scrt-agreed] {s} ty={s}\n", .{ name.name, ar.name });
+                            }
+                            return try ar.clone(b.allocator);
+                        }
                         return null;
                     };
                 };
@@ -11899,7 +11967,12 @@ fn staticCallReturnTypeRef(
                     }
                     if (bt) std.debug.print("[bareret] {s} no owner for {s}\n", .{ name.name, ident });
                     break :blk sole_global orelse {
-                        if (agreed_return) |ar| return try ar.clone(b.allocator);
+                        if (agreed_return) |ar| {
+                            if (runtime.envOnce("KLIO_SCRT_TRACE")) |w2| {
+                                if (std.mem.eql(u8, w2, name.name)) std.debug.print("[scrt-agreed] {s} ty={s}\n", .{ name.name, ar.name });
+                            }
+                            return try ar.clone(b.allocator);
+                        }
                         return null;
                     };
                 };
@@ -12256,6 +12329,19 @@ fn staticCallReturnTypeRef(
             call.callee.Path.segments[0].name,
             if (inferred) |t| t.name else "<null>",
         });
+    }
+    if (runtime.envOnce("KLIO_SCRT_TRACE")) |w| {
+        if (call.callee.* == .Path and call.callee.Path.segments.len == 1 and
+            std.mem.eql(u8, w, call.callee.Path.segments[0].name))
+        {
+            const tf0 = b.module.funcById(target);
+            std.debug.print("[scrt-target] {s} fid={d} fqn={s} inferred={s}\n", .{
+                w,
+                target.int(),
+                if (tf0) |tf| tf.fqn else "?",
+                if (inferred) |t| t.name else "-",
+            });
+        }
     }
     // Invoke convention: the pick is a fn-typed PROPERTY's accessor (zero
     // value params) while the call supplies arguments — `createFrom("a")`
@@ -19801,6 +19887,13 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
         try staticExprTypeRef(b, receiver)
     else
         null;
+    if (runtime.envOnce("KLIO_DECLTY_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name.name)) {
+            const src: []const u8 = if (declared_from_expr != null) "decl" else "inferred";
+            const tyn: []const u8 = if (declared_from_expr) |t| t.name else if (inferred_declared_ty) |t| t.name else "-";
+            std.debug.print("[declty] {s} recv_tag={s} src={s} ty={s} at={d}:{d}\n", .{ name.name, @tagName(std.meta.activeTag(receiver.*)), src, tyn, name.span.file.int(), name.span.start });
+        }
+    }
     defer if (inferred_declared_ty) |*ty| ty.deinit(b.allocator);
     const declared_ty = declared_from_expr orelse inferred_declared_ty;
 

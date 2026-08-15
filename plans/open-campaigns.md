@@ -306,13 +306,24 @@ tests): 322/444 passing at the start of this stretch.
         rejects digit schemes on the JVM too (verified against
         Character.isLowerCase); how upstream CI passes these is unclear —
         do NOT "fix" klio to diverge.
-      * CodecTest.testFormUrlEncode + RangesTest.testResolveRanges —
-        BATCH-CONTEXT resolution pollution: both PASS single-file and
-        fail only when the utils tests (kotlinx.coroutines imports) are
-        compiled alongside; formUrlEncodeTo's inner chain then carries a
-        stale `declared=Flow` static-receiver stamp, and assertEquals
-        self-recurses ~39 deep (frame `RangesTest.assertEquals` at the
-        mapTo splice span) until the depth cap.
+      * CodecTest.testFormUrlEncode — FIXED: bareCallReturnTypeRef's
+        sole-bodied-candidate fallback now respects the extension
+        receiver (kotlinx's deprecated `Flow.flatMap` was the sole
+        bodied 1-arg candidate in the pack universe and stamped
+        `declared=Flow` on a Set-receiver chain).
+      * RangesTest.testResolveRanges — mechanism FULLY diagnosed, one
+        gap left: the test's `private fun assertEquals(List<IntRange>,
+        List<LongRange>)` delegates to kotlin.test's via
+        `assertEquals(expected.map { it.toLong() }, actual)`; kotlinc
+        rejects the member (invariant generic args), klio's static
+        member bind sees compat=unknown (the mapped arg's static type
+        does not derive because `IntRange.toLong` is an UN-ANNOTATED
+        private member-extension expression body) and binds the member
+        -> self-recursion to the depth cap. Standalone repro
+        scratchpad/ae1.kt (no packs needed). Fix roads: derive the
+        member-ext expression-body return on demand at that site, or
+        strengthen the member-bind compat's .incompatible gate for
+        same-head containers with concrete differing args.
       * CoroutinesTest (GlobalScope.writer/reader deadlock — parks with
         ~2s user time over minutes; task #31 territory), PipelineTest,
         WriterReaderTest — INCOMPLETE at the census cap.
