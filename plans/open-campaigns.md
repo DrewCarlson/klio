@@ -75,18 +75,17 @@ both suite-level (plugin conformance ratchet):
       binding the enclosing implicit receiver (arity carried in the
       inherited local-ext mark). Guard examples
       local_ext_fn_reference.kt, member_arg_disproof_extension.kt.
-- [ ] checkboxLike anchor: 24 -> **19** slots (kotlinc 18) after the
-      dirty-bits campaign LANDED its core (f6bbd362): per-param
-      `$dirty` triples + caller-certainty-guarded probes + call-site
-      `$changed` bits (lowering-side, resolved-signature named-arg
-      mapping) + zero-key-slot memo shapes (cache from `$dirty`,
-      lifted `{}` singletons, cache(false)). Ratchet 1370 rc=0,
-      remember-family 26/26, funInterface_isMemoized green. REMAINING:
-      the last slot + the 2-group deficit need slot-level attribution,
-      blocked on the nested CompositionGroup tooling surface
-      (compositionGroups/data on non-root groups are empty/raise);
-      full record in plans/compose-dirty-bits-plan.md. checkboxLike
-      stays the red anchor until slot-exact.
+- [x] checkboxLike anchor GREEN (f6bbd362 + 03e41d70): the dirty-bits
+      campaign landed — per-param `$dirty` triples, caller-certainty-
+      guarded probes, call-site `$changed` bits (lowering-side,
+      resolved-signature named-arg mapping, defaulted-param `$arg`
+      forwarding), zero-key-slot memo shapes (cache from `$dirty`,
+      lifted `{}` singletons, cache(false)). checkboxLike went 24
+      slots -> slot-exact PASS (<= 8 groups / <= 18 slots);
+      GroupSizeValidationTests 5/5; remember-family 26/26;
+      funInterface_isMemoized green; ratchet observed 1370-1372,
+      floor RAISED 1305 -> 1340. Full record in
+      plans/compose-dirty-bits-plan.md.
 - [x] CompositionTests remember-family FIXED — 26/26 solo (was ~8
       fails), LocalRememberReproTests 4/4. Three stacked roots, all
       landed:

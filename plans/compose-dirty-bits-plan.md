@@ -121,18 +121,29 @@ javap -c of the emission:
   45/45, sweep 117/0, module tests 21/21. checkboxLike counts 6 groups
   / 19 slots vs kotlinc's 8 / 18.
 
-## Remaining
+## ANCHOR GREEN (2026-08-15, 03e41d70)
 
-- The LAST slot + the 2-group deficit: needs slot-level attribution,
-  and the nested CompositionGroup surface can't dump it — klio's
-  `CompositionGroup.compositionGroups`/`data` on non-root groups
-  return empty/raise (`virtual call receiver is not an instance`), and
-  SlotStorage.toDebugString trips the unimplemented `kotlin.toString`
-  expect. Fix the tooling surface first, then attribute.
-- Certainty propagation beyond one hop (a forwarded param whose caller
-  got it forwarded again — golden recombination verified only for one
-  level here).
-- checkboxLike stays the red ratchet anchor until slot-exact.
+checkboxLike PASSES slot-exact (<= 8 groups / <= 18 slots; campaign
+start was 24 slots): the final two slots were forwarded DEFAULTED
+params — the plugin renames them `p$arg` and the body reads the
+prologue local `p`, but the triple is live either way (a taken default
+sets the same-bit), so the forward recombination now matches by the
+`$arg` suffix. GroupSizeValidationTests 5/5. Multi-hop certainty works
+by construction (each hop recombines its own live `$dirty`).
+Correction to the earlier tooling note: the nested CompositionGroup
+surface is FINE (a scratch walk test traverses the full tree) — the
+earlier dump crash was calling methods on raw value-class slot VALUES,
+which is the separate known inline-class dispatch family. Slot-dump
+recipe that works: walk `g.data` with a per-item try/catch
+(scratchpad reprosrc/CheckboxSlotDumpTests.kt).
+
+## Remaining (post-anchor polish, not blocking)
+
+- `$default`-mask parity is approximated by the marker-default
+  prologue + same-bit; kotlinc's static-bits-for-defaults differ in
+  shape but not observed behavior.
+- Value-class slot values crash `::class`/`toString` in tooling walks
+  (the inline-class dispatch family) — recorded, separate.
 
 ## Phases
 
