@@ -3741,6 +3741,23 @@ pub fn synthThunk(name: ast.Ident, body: ast.FunctionBody, return_type: ?ast.Typ
 var anon_site_names: std.AutoHashMapUnmanaged(usize, []const u8) = .empty;
 var anon_site_lock: runtime.SpinMutex = .{};
 
+/// Record the enclosing declaration's type-parameter names for a lowered
+/// anon-object method, so `typeParamOf`-based adjudication sees `Key` in
+/// `add(element: Key)` as a type variable rather than a nominal class.
+fn inheritAnonTypeParams(self: *VmHost, tps: []const []const u8, fid: FuncId) void {
+    if (tps.len == 0) return;
+    const mg = self.module.borrowMut();
+    defer mg.deinit();
+    const reg = &mg.get().registry;
+    if (reg.func_type_params.contains(fid)) return;
+    var lst: std.ArrayList([]const u8) = .empty;
+    for (tps) |tp| {
+        const d = reg.allocator.dupe(u8, tp) catch return;
+        lst.append(reg.allocator, d) catch return;
+    }
+    reg.func_type_params.put(fid, lst) catch {};
+}
+
 fn anonSiteName(expr: *const ast.Expr) []const u8 {
     const key = @intFromPtr(expr);
     anon_site_lock.lock();
@@ -3942,6 +3959,9 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         defer g.deinit();
         break :blk g.get().contains(synth_class_name);
     };
+    if (runtime.envOnce("KLIO_ANON_AUDIT") != null) {
+        std.debug.print("[ANON] site name={s} built={} ptr=0x{x} members={d}\n", .{ synth_class_name, site_built, @intFromPtr(expr), members.len });
+    }
 
     // One image clone per synthesis call, shared by every lowering below.
     var site_mod: ?ObjRef(Module) = null;
@@ -4103,17 +4123,34 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     // (once per site, on the first instantiation). The shared side module's
     // appends serialize under the anon-lower lock, held for the lowering
     // sections only.
+    // Type parameters of the function whose body the `object` expression
+    // sits in: its members' declared types reference them as type VARIABLES
+    // (`ConcurrentSet<Key>()`'s `add(element: Key)`), so each lowered method
+    // registers them for the dispatch-side adjudicators — otherwise an
+    // unrelated registered class of the same simple name (`Key`) refutes
+    // perfectly valid arguments.
+    const inherited_tps: []const []const u8 =
+        if (site_built) &.{} else ir.eval.currentFrameTypeParams();
     anonLowerEnter();
     for (members) |*m| {
         switch (m.*) {
             .Function => |*f| {
-                if (f.body == null) continue;
+                if (f.body == null) {
+                    if (runtime.envOnce("KLIO_ANON_AUDIT") != null) {
+                        std.debug.print("[ANON] skip bodyless fn {s}.{s}\n", .{ synth_class_name, f.name.name });
+                    }
+                    continue;
+                }
                 if (site_built) continue; // methods already registered for this site
                 const sub_ref = try anonSiteModule(self, allocator, &site_mod);
                 const func = try ir.lower.lowerMethod(&sub_ref.cell.data, f, synth_class_name, &own_members);
                 const fid = func.id;
                 const tbl = self.anon_methods.borrowMut();
+                inheritAnonTypeParams(self, inherited_tps, fid);
                 const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ f.name.name, f.params.len });
+                if (runtime.envOnce("KLIO_ANON_AUDIT") != null) {
+                    std.debug.print("[ANON] method {s}.{s} fid={d}\n", .{ synth_class_name, arity_name, fid.int() });
+                }
                 // Captures are stored per-instance (`InstanceData.anon_captures`),
                 // not in this shared registry entry — the entry's method/module is
                 // site-stable, the captures vary per object, and holding them here

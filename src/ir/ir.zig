@@ -1002,6 +1002,19 @@ pub const CatchHandler = struct {
     exception_reg: Reg,
 };
 
+/// Runtime absorption point for a labeled return that targets an inline
+/// function SPLICED into the enclosing function. A `return@name` written in
+/// a closure that crosses a real frame (a lambda handed to a non-spliced
+/// inline call inside the spliced body) unwinds as a `LabeledReturn` error;
+/// the frame that ran the splice catches it here and control resumes at
+/// `handler` (the splice join) with the value in `value_reg` — exactly the
+/// early-exit the label means. Disarmed by `catch_done_for` on the join.
+pub const LrAbsorb = struct {
+    label: []const u8,
+    handler: BlockId,
+    value_reg: Reg,
+};
+
 /// A basic block: linear instruction stream + terminator. When
 /// `catches` is non-empty, a `Throw` reaching this block (or any
 /// block reached from it without first leaving the try scope)
@@ -1035,6 +1048,9 @@ pub const Block = struct {
     /// iterations for a long-lived frame like DeepRecursive's
     /// runCallLoop).
     catch_done_for: ?BlockId = null,
+    /// Entering this block arms a labeled-return absorption region for a
+    /// splice of the named inline function (see `LrAbsorb`).
+    lr_absorb: ?LrAbsorb = null,
     /// Try-region body-entry ids whose `TryFrame` this block pops when it
     /// exits via `Goto`. Set on the block that carries an inline `return`'s
     /// jump-to-join: the return replays its enclosing finallys inline and
@@ -1339,7 +1355,7 @@ pub const Func = struct {
             // A finally-carrying body needs the try-stack machinery: the
             // frameless walk would return straight out of the try region
             // and never run the finally.
-            if (b.catches.len != 0 or b.finally != null) return false;
+            if (b.catches.len != 0 or b.finally != null or b.lr_absorb != null) return false;
             total += b.insts.len;
             if (total > LEAF_MAX_INSTS) return false;
             switch (b.terminator) {

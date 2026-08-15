@@ -223,8 +223,13 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.String.plus", .f = string.string_plus },
     .{ .fqn = "kotlin.String.equals", .f = string.string_equals },
     .{ .fqn = "kotlin.text.equals", .f = string.string_equals },
-    .{ .fqn = "kotlin.String.repeat", .f = string.string_repeat },
-    .{ .fqn = "kotlin.CharSequence.repeat", .f = string.string_repeat },
+    // `repeat` also names the stdlib's top-level `repeat(times) { … }`: the
+    // member binding must decline any call that is not exactly `(Int)`, or a
+    // bare `repeat(2) { … }` reaching a String through the enclosing-receiver
+    // walk silently no-ops (the CookieDateParser year/day parse was the live
+    // case).
+    .{ .fqn = "kotlin.String.repeat", .f = string.string_repeat, .applicable = integerBinaryApplicable },
+    .{ .fqn = "kotlin.CharSequence.repeat", .f = string.string_repeat, .applicable = integerBinaryApplicable },
     .{ .fqn = "kotlin.String.replace", .f = string.string_replace },
     .{ .fqn = "kotlin.String.reversed", .f = string.string_reversed },
     .{ .fqn = "kotlin.String.startsWith", .f = string.string_starts_with },

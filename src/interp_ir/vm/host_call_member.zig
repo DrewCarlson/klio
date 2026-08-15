@@ -3358,9 +3358,18 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
         // By type: a definite argument-type mismatch must fall through so
         // the hierarchy walk continues to the real target. A param typed as
         // an in-scope type variable (the function's own, or the owning
-        // class's) is never adjudicated nominally.
+        // class's) is never adjudicated nominally. Under the trailing-lambda
+        // rule (undersupplied call whose final callable arg binds the LAST
+        // function-typed param), the final arg adjudicates against that last
+        // param, not the positional slot the defaulted gap left behind —
+        // `build { … }` on `build(flag: Boolean = false, builder: () -> T)`
+        // must judge the lambda against `builder`, not `flag`.
+        const tail_lambda_bind = eff_args.len > 0 and eff_args.len < effective.len and
+            isFunctionTypeRef(&effective[effective.len - 1].ty) and
+            isCallable(&eff_args[eff_args.len - 1]);
         var i: usize = 0;
         while (i < eff_args.len and i < effective.len) : (i += 1) {
+            const pi = if (tail_lambda_bind and i == eff_args.len - 1) effective.len - 1 else i;
             // A LONE member whose function-typed parameter meets an Instance
             // argument whose class chain declares `invoke` stays applicable:
             // a memo-wrapped ComposableLambdaImpl keeps its invoke overloads
@@ -3369,15 +3378,15 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
             // candidate. Answered from the caller's live module borrow; an
             // invoke-less instance (a JobNode against a CompletionHandler
             // parameter) still declines so the extension wins.
-            if (eff_args[i] == .Instance and std.mem.startsWith(u8, effective[i].ty.name, "Function")) {
+            if (eff_args[i] == .Instance and std.mem.startsWith(u8, effective[pi].ty.name, "Function")) {
                 if (mod_opt) |m| {
                     if (classChainHasInvokeIn(m, &eff_args[i])) continue;
                 }
             }
-            if (argDefinitelyNotParamType(self, &effective[i].ty, &eff_args[i]) and
-                !paramTypeIsTypeVar(self, &f, &effective[i].ty))
+            if (argDefinitelyNotParamType(self, &effective[pi].ty, &eff_args[i]) and
+                !paramTypeIsTypeVar(self, &f, &effective[pi].ty))
             {
-                if (missTraceWant(f.name)) std.debug.print("[pmo] `{s}` decline=arg-type param#{d} ty={s} arg={s}\n", .{ f.name, i, effective[i].ty.name, @tagName(std.meta.activeTag(eff_args[i])) });
+                if (missTraceWant(f.name)) std.debug.print("[pmo] `{s}` decline=arg-type param#{d} ty={s} arg={s}\n", .{ f.name, pi, effective[pi].ty.name, @tagName(std.meta.activeTag(eff_args[i])) });
                 return null;
             }
         }
@@ -8774,6 +8783,10 @@ fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const Valu
     const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ name, args.len });
     // Scratch lookup key (lookupAnonMethod dupes what it stores); free it.
     defer if (runtime.freeScratch()) allocator.free(arity_name);
+    if (missTraceEnv()) |want| if (std.mem.eql(u8, want, name)) {
+        const hit0 = lookupAnonMethod(self, allocator, class_name, arity_name, name);
+        std.debug.print("[anon-disp] name={s} class={s} tag={s} hit={} dis={}\n", .{ name, class_name, entry_tag orelse "-", hit0 != null, if (hit0) |h| anonMethodDisproven(self, h, args) else false });
+    };
 
     // Enum-entry override class first.
     if (entry_tag) |tag| {
@@ -8851,6 +8864,11 @@ fn anonMethodDisprovenFn(self: *VmHost, f: *const ir.Func, args: []const Value) 
         (effective.len == 0 or !effective[effective.len - 1].is_vararg)) return true;
     var i: usize = 0;
     while (i < args.len and i < effective.len) : (i += 1) {
+        // A type-variable-typed param (the method's own, or one inherited
+        // from the object expression's enclosing declaration) never names a
+        // nominal class; adjudicating it as one would let an unrelated
+        // registered class of the same simple name refute valid arguments.
+        if (fidTypeVar(self, f.id, &effective[i].ty)) continue;
         if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i])) return true;
     }
     return false;
@@ -11628,11 +11646,11 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
             // applicable. Intrinsics whose Kotlin declarations are pruned
             // from the runtime image carry this small predicate alongside
             // the binding, so `Int.or(Int)` cannot capture the distinct
-            // `Int.or(NodeKind)` overload.
-            if (user_ext_shadows and is_member) {
-                if (stdlib.implementationApplicable(probe, args)) |applies| {
-                    if (!applies) continue;
-                }
+            // `Int.or(NodeKind)` overload, and `String.repeat(Int)` cannot
+            // capture a bare `repeat(times) { … }` reaching a String through
+            // the enclosing-receiver walk.
+            if (stdlib.implementationApplicable(probe, args)) |applies| {
+                if (!applies) continue;
             }
             if (lookupIntrinsic(self, probe)) |func| {
                 if (effective_cache_key) |key| memberCachePut(self, key, func, probe);
@@ -13738,6 +13756,36 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
         mg.deinit();
         if (class_id) |cid| {
             return self.newInstanceNamed(allocator, cid, args, arg_names, null);
+        }
+    }
+
+    // Named companion-member forwarding for a class receiver
+    // (`StringValues.build(caseInsensitiveName = true) { … }`): resolve the
+    // companion singleton and re-enter the named ladder on it, so a named
+    // argument can skip a leading defaulted parameter. A miss on the
+    // singleton falls through to the positional ladder exactly as before.
+    if (any_named and receiver.* == .Class) {
+        const cg2 = receiver.Class.borrow();
+        const cls_name = cg2.get().name;
+        const cls_fqn = cg2.get().fqn;
+        cg2.deinit();
+        var comp_name: ?[]const u8 = null;
+        {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const comp = &mg.get().registry.companion_singletons;
+            comp_name = comp.get(cls_name) orelse comp.get(cls_fqn) orelse comp.get(simpleName(cls_fqn));
+        }
+        if (comp_name) |cn| {
+            const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
+                .ok => |maybe| maybe,
+                .err => |e| return .{ .err = e },
+            };
+            if (singleton) |s| if (s == .Instance) {
+                const r = try callMemberNamedInner(self, allocator, &s, name, args, arg_names, strict_ext, null, no_ext, null);
+                if (!(r == .err and r.err == .Unimplemented)) return r;
+                freeDispatchMiss(allocator, r);
+            };
         }
     }
 

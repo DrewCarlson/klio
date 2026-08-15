@@ -377,6 +377,16 @@ pub fn currentFrameFunc() ?*const ir.Func {
     return if (evtls.frame_chain) |fr| fr.func else null;
 }
 
+/// Type-parameter names declared by the innermost frame's function. An
+/// `object` expression lowered at run time inherits these as its members'
+/// type variables (`ConcurrentSet<Key>()`'s literal declares `add(element:
+/// Key)` against the factory's `Key`, not a nominal class of that name).
+pub fn currentFrameTypeParams() []const []const u8 {
+    const fr = evtls.frame_chain orelse return &.{};
+    const tps = fr.module.registry.func_type_params.get(fr.func.id) orelse return &.{};
+    return tps.items;
+}
+
 /// Per-thread free-list of register buffers, reused across calls so a freeing
 /// backend pays no per-call alloc/free for the `regs` array. Only used under the
 /// reference-counting (freeing) backends: under the tracing GC the buffer memory
@@ -406,7 +416,7 @@ inline fn regsAlloc(fallback: Allocator) Allocator {
 /// measurement first, engine second.
 fn classifyFlattenable(f: *const Func) u8 {
     for (f.blocks) |*blk| {
-        if (blk.catches.len != 0 or blk.finally != null) return 2;
+        if (blk.catches.len != 0 or blk.finally != null or blk.lr_absorb != null) return 2;
         for (blk.insts) |*inst| {
             switch (inst.*) {
                 // The COMMON population (the 0.09% lesson): everything the
@@ -1996,6 +2006,8 @@ pub const TryFrame = struct {
     /// pending-return / pending-rethrow checks against this rather
     /// than `finally_entry`.
     finally_done: ?BlockId,
+    /// Labeled-return absorption for a splice region (see `ir.LrAbsorb`).
+    lr_absorb: ?ir.LrAbsorb = null,
 };
 
 const PendingRethrow = struct { key: BlockId, exc: Value, depth: usize };
@@ -5332,12 +5344,13 @@ fn runFrameExec(
         const finally = block.finally;
         const finally_done = block.finally_done;
         const has_catches = block.catches.len != 0;
-        if (resume_idx == 0 and (has_catches or finally != null)) {
+        if (resume_idx == 0 and (has_catches or finally != null or block.lr_absorb != null)) {
             try try_stack.append(allocator, .{
                 .body = cur,
                 .catches = block.catches,
                 .finally_entry = finally,
                 .finally_done = finally_done,
+                .lr_absorb = block.lr_absorb,
             });
         }
         var thrown: ?Value = null;
@@ -5656,10 +5669,21 @@ fn runFrameExec(
         }
         if (unwound) |e| {
             // Mid-block non-local return -- route through the armed finally
-            // blocks only (never a catch), then keep unwinding.
+            // blocks only (never a catch), then keep unwinding. A splice
+            // region's labeled-return absorption catches a `LabeledReturn`
+            // whose label it owns: control resumes at the region's join with
+            // the value delivered, exactly the exit the label meant.
             frame.pending_finally.release(allocator);
             var routed = false;
             while (try_stack.pop()) |tf| {
+                if (e == .LabeledReturn) if (tf.lr_absorb) |ab| {
+                    if (std.mem.eql(u8, ab.label, e.LabeledReturn.label)) {
+                        try frame.write(ab.value_reg, e.LabeledReturn.value);
+                        cur = ab.handler;
+                        routed = true;
+                        break;
+                    }
+                };
                 if (tf.finally_entry) |fin| {
                     if (std.meta.eql(fin, cur)) continue;
                     const key = tf.finally_done orelse fin;
@@ -5819,6 +5843,14 @@ fn runFrameExec(
                 if (try_stack.items.len > pu.depth) try_stack.shrinkRetainingCapacity(pu.depth);
                 var routed = false;
                 while (try_stack.pop()) |tf| {
+                    if (e == .LabeledReturn) if (tf.lr_absorb) |ab| {
+                        if (std.mem.eql(u8, ab.label, e.LabeledReturn.label)) {
+                            try frame.write(ab.value_reg, e.LabeledReturn.value);
+                            cur = ab.handler;
+                            routed = true;
+                            break;
+                        }
+                    };
                     if (tf.finally_entry) |fin2| {
                         const key = tf.finally_done orelse fin2;
                         frame.pending_finally.unwind = .{ .key = key, .err = e, .depth = try_stack.items.len };
@@ -5898,12 +5930,31 @@ fn runFrameExec(
                 const v = if (lr.value) |r| frame.read(r) else Value.Unit;
                 v.retain();
                 const e = EvalError{ .LabeledReturn = .{ .label = lr.label, .value = v } };
-                if (nearestFinally(try_stack, cur)) |c| {
-                    frame.pending_finally.unwind = .{ .key = c.key, .err = e, .depth = try_stack.items.len };
-                    cur = c.jump;
-                    continue;
+                // Innermost-first: a splice region's absorption for this
+                // label ends the unwind at its join; armed finallys inside
+                // it still run first (they sit deeper on the stack).
+                var routed = false;
+                while (try_stack.pop()) |tf| {
+                    if (tf.lr_absorb) |ab| {
+                        if (std.mem.eql(u8, ab.label, lr.label)) {
+                            try frame.write(ab.value_reg, v);
+                            cur = ab.handler;
+                            routed = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    if (tf.finally_entry) |fin| {
+                        if (std.meta.eql(fin, cur)) continue;
+                        const key = tf.finally_done orelse fin;
+                        frame.pending_finally.unwind = .{ .key = key, .err = e, .depth = try_stack.items.len };
+                        cur = fin;
+                        routed = true;
+                        break;
+                    }
                 }
-                return unwindTerminal(frame, e);
+                if (!routed) return unwindTerminal(frame, e);
+                continue;
             },
             .Throw => |r| {
                 var exc = frame.read(r);

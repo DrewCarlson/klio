@@ -1103,3 +1103,156 @@ fn qthisExpr(e: *const Expr, label: []const u8) bool {
         else => false,
     };
 }
+
+/// Whether any `return@label` targeting `label` appears in this expression,
+/// including inside nested lambdas, anonymous functions, object-expression
+/// members, and local declarations. The splicer consults this to decide
+/// whether an inline body needs a runtime labeled-return absorption region
+/// (a closure created in the spliced body can carry the label across a real
+/// frame, where lowering-time resolution cannot reach).
+pub fn containsLabeledReturn(e: *const Expr, label: []const u8) bool {
+    switch (e.*) {
+        .Return => |r| {
+            if (r.label) |l| if (std.mem.eql(u8, l.name, label)) return true;
+            if (r.value) |v| return containsLabeledReturn(v, label);
+            return false;
+        },
+        .Member => |m| return containsLabeledReturn(m.receiver, label),
+        .MemberRef => |m| return containsLabeledReturn(m.receiver, label),
+        .Call => |c| {
+            if (containsLabeledReturn(c.callee, label)) return true;
+            for (c.args) |*a| if (containsLabeledReturn(a, label)) return true;
+            return false;
+        },
+        .Index => |idx| {
+            if (containsLabeledReturn(idx.receiver, label)) return true;
+            for (idx.args) |*a| if (containsLabeledReturn(a, label)) return true;
+            return false;
+        },
+        .Binary => |bin| return containsLabeledReturn(bin.lhs, label) or containsLabeledReturn(bin.rhs, label),
+        .Unary => |u| return containsLabeledReturn(u.expr, label),
+        .Postfix => |u| return containsLabeledReturn(u.expr, label),
+        .Spread => |u| return containsLabeledReturn(u.expr, label),
+        .Throw => |u| return containsLabeledReturn(u.value, label),
+        .Labeled => |u| return containsLabeledReturn(u.expr, label),
+        .As => |u| return containsLabeledReturn(u.expr, label),
+        .IsCheck => |u| return containsLabeledReturn(u.expr, label),
+        .If => |f| {
+            if (containsLabeledReturn(f.cond, label)) return true;
+            if (containsLabeledReturn(f.then_branch, label)) return true;
+            if (f.else_branch) |els| return containsLabeledReturn(els, label);
+            return false;
+        },
+        .While => |w| return containsLabeledReturn(w.cond, label) or containsLabeledReturn(w.body, label),
+        .DoWhile => |w| {
+            if (w.body) |b| if (containsLabeledReturn(b, label)) return true;
+            return containsLabeledReturn(w.cond, label);
+        },
+        .For => |f| return containsLabeledReturn(f.iter, label) or containsLabeledReturn(f.body, label),
+        .Block => |b| {
+            for (b.stmts) |*s| if (containsLabeledReturnStmt(s, label)) return true;
+            return false;
+        },
+        .Lambda => |l| {
+            for (l.body.stmts) |*s| if (containsLabeledReturnStmt(s, label)) return true;
+            return false;
+        },
+        .AnonFun => |af| {
+            if (af.body) |fb| switch (fb.*) {
+                .Block => |b| {
+                    for (b.stmts) |*s| if (containsLabeledReturnStmt(s, label)) return true;
+                },
+                .Expr => |*ex| return containsLabeledReturn(ex, label),
+            };
+            return false;
+        },
+        .ObjectExpr => |o| {
+            for (o.members) |*d| switch (d.*) {
+                .Function => |*f| {
+                    if (f.body) |fb| switch (fb) {
+                        .Block => |blk| {
+                            for (blk.stmts) |*st| if (containsLabeledReturnStmt(st, label)) return true;
+                        },
+                        .Expr => |ex| if (containsLabeledReturn(&ex, label)) return true,
+                    };
+                },
+                .Property => |p| {
+                    if (p.init) |*pi| if (containsLabeledReturn(pi, label)) return true;
+                },
+                else => {},
+            };
+            for (o.init_blocks) |*blk| {
+                for (blk.stmts) |*st| if (containsLabeledReturnStmt(st, label)) return true;
+            }
+            return false;
+        },
+        .When => |w| {
+            if (w.subject) |s| if (containsLabeledReturn(s, label)) return true;
+            for (w.branches) |*br| if (containsLabeledReturn(&br.body, label)) return true;
+            return false;
+        },
+        .Try => |t| {
+            for (t.body.stmts) |*s| if (containsLabeledReturnStmt(s, label)) return true;
+            for (t.catches) |*c| {
+                for (c.body.stmts) |*s| if (containsLabeledReturnStmt(s, label)) return true;
+            }
+            if (t.finally) |fb| {
+                for (fb.stmts) |*s| if (containsLabeledReturnStmt(s, label)) return true;
+            }
+            return false;
+        },
+        .StringTemplate => |st| {
+            for (st.parts) |*p| switch (p.*) {
+                .Interp => |ex| if (containsLabeledReturn(ex, label)) return true,
+                else => {},
+            };
+            return false;
+        },
+        else => return false,
+    }
+}
+
+pub fn containsLabeledReturnStmt(s: *const Stmt, label: []const u8) bool {
+    switch (s.*) {
+        .Expr => |*e| return containsLabeledReturn(e, label),
+        .Assign => |a| return containsLabeledReturn(&a.target, label) or containsLabeledReturn(&a.value, label),
+        .DestructuringDecl => |d| return containsLabeledReturn(&d.init, label),
+        .Decl => |d| switch (d) {
+            .Property => |p| {
+                if (p.init) |*e| if (containsLabeledReturn(e, label)) return true;
+                if (p.delegate) |e| if (containsLabeledReturn(e, label)) return true;
+                return false;
+            },
+            .Function => |f| {
+                if (f.body) |fb| switch (fb) {
+                    .Block => |blk| {
+                        for (blk.stmts) |*ss| if (containsLabeledReturnStmt(ss, label)) return true;
+                    },
+                    .Expr => |*ex| return containsLabeledReturn(ex, label),
+                };
+                return false;
+            },
+            .Class => |*c| {
+                for (c.members) |*m| switch (m.*) {
+                    .Function => |*f| {
+                        if (f.body) |fb| switch (fb) {
+                            .Block => |blk| {
+                                for (blk.stmts) |*st| if (containsLabeledReturnStmt(st, label)) return true;
+                            },
+                            .Expr => |ex| if (containsLabeledReturn(&ex, label)) return true,
+                        };
+                    },
+                    .Property => |p| {
+                        if (p.init) |*pi| if (containsLabeledReturn(pi, label)) return true;
+                    },
+                    else => {},
+                };
+                for (c.init_blocks) |*blk| {
+                    for (blk.stmts) |*st| if (containsLabeledReturnStmt(st, label)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        },
+    }
+}

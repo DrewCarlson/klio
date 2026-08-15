@@ -66,6 +66,12 @@ pub const InlineReturn = struct {
     /// not run here (else a nested inline `try/finally` inside another
     /// inline `try/finally` runs the outer finally twice).
     finally_base: usize = 0,
+    /// Name of the inline function whose body this frame splices, so a
+    /// `return@thatName` written in the body — including inside a lambda
+    /// spliced from a NESTED inline call (`accept { … }.otherwise {
+    /// return@tryParseTime }`) — resolves to this frame's join instead of
+    /// unwinding at runtime toward a frame that was never created.
+    label: ?[]const u8 = null,
 };
 
 /// One labeled-return target for a spliced inline-argument lambda:
@@ -1078,8 +1084,21 @@ pub const FuncBuilder = struct {
         if (self.inline_return.items.len == 0) return null;
         return self.inline_return.items[self.inline_return.items.len - 1];
     }
-    pub fn pushInlineReturn(self: *FuncBuilder, r: Reg, join: BlockId) Allocator.Error!void {
-        try self.inline_return.append(self.allocator, .{ .reg = r, .join = join, .finally_base = self.finally_stack.items.len });
+    pub fn pushInlineReturn(self: *FuncBuilder, r: Reg, join: BlockId, label: ?[]const u8) Allocator.Error!void {
+        try self.inline_return.append(self.allocator, .{ .reg = r, .join = join, .finally_base = self.finally_stack.items.len, .label = label });
+    }
+    /// Innermost active inline body-splice frame whose function name is
+    /// `label`. Consulted after `inlineLambdaRetFor` misses: a labeled
+    /// return crossing only inline boundaries must resolve at lowering —
+    /// the target function has no runtime frame.
+    pub fn inlineReturnFor(self: *const FuncBuilder, label: []const u8) ?InlineReturn {
+        var i = self.inline_return.items.len;
+        while (i > 0) {
+            i -= 1;
+            const f = self.inline_return.items[i];
+            if (f.label) |l| if (std.mem.eql(u8, l, label)) return f;
+        }
+        return null;
     }
     pub fn popInlineReturn(self: *FuncBuilder) void {
         _ = self.inline_return.pop();
@@ -2654,6 +2673,16 @@ pub const FuncBuilder = struct {
     /// `TryFrame` when control arrives there.
     pub fn setCatchDoneFor(self: *FuncBuilder, body_entry: BlockId, join: BlockId) void {
         self.blocks.items[join.int()].catch_done_for = body_entry;
+    }
+
+    /// Arm `region` as a labeled-return absorption region for a splice of
+    /// the inline function named `label`: a `LabeledReturn` for that label
+    /// unwinding through this frame while the region is armed jumps to
+    /// `handler` with the value in `value_reg`. Normal flow into `handler`
+    /// pops the region's frame via `catch_done_for`.
+    pub fn setLrAbsorb(self: *FuncBuilder, region: BlockId, label: []const u8, handler: BlockId, value_reg: Reg) void {
+        self.blocks.items[region.int()].lr_absorb = .{ .label = label, .handler = handler, .value_reg = value_reg };
+        self.blocks.items[handler.int()].catch_done_for = region;
     }
 
     /// Mark `done` as the post-finally sentinel for the try-region
