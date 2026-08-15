@@ -485,7 +485,9 @@ pub fn declaredElemProves(self: *VmHost, want: *const TypeRef, have_head: ?[]con
 /// creation-site type argument is recorded as the written head name, so
 /// nested generic arguments on the candidate side stay unknowable.
 fn declaredHeadMatch(self: *VmHost, want: *const TypeRef, have_head: ?[]const u8) Match {
-    const have = simpleName(have_head orelse return .unknown);
+    const have_full = simpleName(have_head orelse return .unknown);
+    // A recorded FULL generic spelling (`List<Int>`) compares by head.
+    const have = if (std.mem.indexOfScalar(u8, have_full, '<')) |lt| have_full[0..lt] else have_full;
     const want_head = bareHead(want.name);
     if (want_head.len == 0 or std.mem.eql(u8, want_head, "*")) return .proven;
     if (std.mem.eql(u8, want_head, "Any")) return .proven;

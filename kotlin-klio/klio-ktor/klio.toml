@@ -91,6 +91,7 @@ include = [
     "io/ktor/util/date/Date.kt",
     "io/ktor/util/date/GMTDateParser.kt",
     "io/ktor/util/Ranges.kt",
+    "io/ktor/util/ByteChannels.kt",
     "io/ktor/util/Collections.kt",
     "io/ktor/util/DelegatingMutableSet.kt",
     "io/ktor/util/CaseInsensitiveMap.kt",

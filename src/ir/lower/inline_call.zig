@@ -1222,6 +1222,33 @@ pub fn reifiedParamsUnusedInBody(allocator: Allocator, f: *const Function) Alloc
     return true;
 }
 
+/// Render a reified type argument's full spelling: the (already substituted)
+/// head plus its generic arguments, recursively — `List<Int>`, `Map<String,
+/// List<Int>>`, `*` for a star projection. A plain head renders as itself.
+fn renderReifiedTypeName(b: *FuncBuilder, head: []const u8, a: *const ast.TypeRef) Allocator.Error![]const u8 {
+    if (a.type_args.len == 0) {
+        if (!a.nullable) return head;
+        return std.fmt.allocPrint(b.allocator, "{s}?", .{head});
+    }
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(b.allocator, head);
+    try out.append(b.allocator, '<');
+    for (a.type_args, 0..) |*ta, i| {
+        if (i != 0) try out.appendSlice(b.allocator, ", ");
+        if (ta.is_star) {
+            try out.append(b.allocator, '*');
+            continue;
+        }
+        const inner_head = b.resolveReifiedTypeName(ta.ty.name.name) orelse
+            (expr_lower.scopeTypeRename(b, ta.ty.name.name, ta.ty.name.span.file.int()) orelse ta.ty.name.name);
+        const rendered = try renderReifiedTypeName(b, inner_head, &ta.ty);
+        try out.appendSlice(b.allocator, rendered);
+    }
+    try out.append(b.allocator, '>');
+    if (a.nullable) try out.append(b.allocator, '?');
+    return out.toOwnedSlice(b.allocator);
+}
+
 fn inlineVarargFactory(elem: []const u8) []const u8 {
     const eq = std.mem.eql;
     if (eq(u8, elem, "Byte")) return "byteArrayOf";
@@ -2105,9 +2132,14 @@ pub fn tryInlineCallWithTypeArgs(
             // mangled nested class (`enumEntries<Item>()` where `Item`
             // lifted as `A$Item`) must reach the runtime as the lifted
             // name the class table actually holds.
-            const substituted = b.resolveReifiedTypeName(a.name.name) orelse
+            const head_sub = b.resolveReifiedTypeName(a.name.name) orelse
                 reifiedQualifiedName(b, a) orelse
                 (expr_lower.scopeTypeRename(b, a.name.name, a.name.span.file.int()) orelse a.name.name);
+            // Carry the FULL generic spelling, not just the head: a nested
+            // reified consumer (`typeOf<T>()` inside a spliced
+            // `typeInfo<List<Int>>()`) reads the stamped name at runtime and
+            // must see `List<Int>` to materialise the KType's arguments.
+            const substituted = try renderReifiedTypeName(b, head_sub, &a);
             const nprev = try b.bindReifiedTypeName(tp.name.name, substituted);
             try reified_name_restores.append(b.allocator, .{ .name = tp.name.name, .prev = nprev });
         }

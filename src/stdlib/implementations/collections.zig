@@ -452,6 +452,22 @@ fn eqBoxedH(host: IntrinsicHost, out: Output, x: *const Value, y: *const Value) 
             if (m == .ok and m.ok == .Bool) return m.ok.Bool;
         }
     }
+    // Tuple shapes compare component-wise THROUGH the host so an Instance
+    // component's user `equals` dispatches — `mimes.contains("txt" to
+    // contentType)` compares Pair<String, ContentType> elements.
+    if (x.* == .Pair and y.* == .Pair) {
+        return (try eqBoxedH(host, out, x.Pair.first.asPtr(), y.Pair.first.asPtr())) and
+            (try eqBoxedH(host, out, x.Pair.second.asPtr(), y.Pair.second.asPtr()));
+    }
+    if (x.* == .Triple and y.* == .Triple) {
+        return (try eqBoxedH(host, out, x.Triple.first.asPtr(), y.Triple.first.asPtr())) and
+            (try eqBoxedH(host, out, x.Triple.second.asPtr(), y.Triple.second.asPtr())) and
+            (try eqBoxedH(host, out, x.Triple.third.asPtr(), y.Triple.third.asPtr()));
+    }
+    if (x.* == .MapEntry and y.* == .MapEntry) {
+        return (try eqBoxedH(host, out, x.MapEntry.key.asPtr(), y.MapEntry.key.asPtr())) and
+            (try eqBoxedH(host, out, x.MapEntry.value.asPtr(), y.MapEntry.value.asPtr()));
+    }
     return eqBoxed(x, y);
 }
 
