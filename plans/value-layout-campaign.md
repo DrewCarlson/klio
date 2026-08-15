@@ -132,11 +132,19 @@ until the last 48-byte payload boxes, so the wins land at stage ends:
       merged into ONE shared `RangeIterState` cell (one allocation and one
       lock per step instead of two). **Value = 40.** Sweep wall unchanged
       (130s).
-- [ ] Stage 5b: the 32-byte payloads (Range, Iterator, RangeIter,
-      BoundMethod, MapEntry), then the 24B tail (Value → 16). Range and the
-      iterators are LOOP-HOT: measure in-place packing against boxing per
-      type before landing each. Measurement gate: `tests/bench/rangebench.kt`
-      (20 reps of 1M-up + 333k-step-down + 2600 char-range iterations);
-      baseline at Value=40 is **80.4s** on the default CLI (`time
-      ./zig-out/bin/klio run tests/bench/rangebench.kt`, box idle). A Range
-      boxing candidate must stay within noise of that number to land.
+- [x] Stage 5b first half LANDED (see open-campaigns §1): the 32-byte
+      payloads are boxed/folded and **Value = 24**
+      (hot-layout-confirmed). STALE BASELINE NOTE: the old 80.4s
+      Debug-CLI rangebench number predates the 2026-08-15 perf levers
+      (template unboxing + counted step loops, commit 50754db8) — the
+      current gate numbers are 0.97s interpreted / 0.83s native
+      (ReleaseFast, JIT off) and 0.27s JIT-on.
+- [ ] Stage 5c: the 24 -> 16 tail. Both remaining 16B payloads must
+      drop under 8: Array (steal the cell pointer's low bit for the
+      boxed-vs-PrimBuf discriminator; the kind already lives in the
+      PrimBuf) and IrClosure (boxing adds an allocation to the hottest
+      creation path — compose builds closures per execution; an
+      id-side-table trades that for a lifetime problem). DEFERRED
+      measured-first: re-open when a measurement motivates it, and gate
+      any candidate on the compose plugin suite wall as well as
+      rangebench.
