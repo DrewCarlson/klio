@@ -126,7 +126,8 @@ fn fusible(func: *const ir.Func) bool {
     for (func.blocks) |*blk| {
         if (blk.catches.len != 0 or blk.finally != null or
             blk.finally_done != null or blk.finally_done_for != null or
-            blk.catch_done_for != null or blk.pop_on_exit.len != 0)
+            blk.catch_done_for != null or blk.pop_on_exit.len != 0 or
+            blk.lr_absorb != null)
         {
             return false;
         }

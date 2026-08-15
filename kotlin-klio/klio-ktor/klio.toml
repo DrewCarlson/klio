@@ -148,6 +148,8 @@ include = [
     "io/ktor/util/CollectionsNative.kt",
     "io/ktor/util/PlatformUtilsNative.kt",
     "io/ktor/util/collections/ConcurrentMapNative.kt",
+    # Default conversion terminals: pure-null on every non-JVM platform.
+    "io/ktor/util/converters/ConversionServiceNative.kt",
     # `Logger` actual interface + `LogLevel` enum (pure Kotlin; the cinterop-using
     # `KtorSimpleLoggerNative` is replaced by `shim/core/.../KtorSimpleLoggerKlio`).
     "io/ktor/util/logging/LoggerNative.kt",

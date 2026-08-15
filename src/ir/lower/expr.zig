@@ -3076,6 +3076,19 @@ fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.switchTo(dead);
             return b.emitConst(.Unit);
         }
+        // `return@<inlineFnName>` targeting an inline body currently being
+        // SPLICED — reached from inside a lambda spliced by a nested inline
+        // call (`accept { … }.otherwise { return@tryParseTime }`). The
+        // target has no runtime frame, so the return resolves here to the
+        // splice frame's join, replaying its own finallys first.
+        if (if (runtime.envOnce("KLIO_NO_LR_STATIC") == null) b.inlineReturnFor(lbl.name) else null) |ar| {
+            if (r) |rr| try b.push(.{ .Move = .{ .dst = ar.reg, .src = rr } });
+            try replayFinallysForJump(b, ar.finally_base);
+            b.terminate(.{ .Goto = ar.join });
+            const dead = try b.allocBlock();
+            b.switchTo(dead);
+            return b.emitConst(.Unit);
+        }
     }
     if (label) |lbl| {
         // A labeled return unwinds at runtime to the frame whose function /

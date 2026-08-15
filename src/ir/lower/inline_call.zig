@@ -2233,7 +2233,28 @@ pub fn tryInlineCallWithTypeArgs(
     const unit0 = try b.emitConst(Const.Unit);
     try b.push(.{ .Move = .{ .dst = result, .src = unit0 } });
     const join = try b.allocBlock();
-    try b.pushInlineReturn(result, join);
+    try b.pushInlineReturn(result, join, f.name.name);
+    // A body that mentions `return@<this fn>` may put that return inside a
+    // closure that crosses a real frame (a lambda handed to a nested inline
+    // call that runs unspliced), where it unwinds at runtime as a
+    // `LabeledReturn` toward a frame this splice never creates. Arm a
+    // runtime absorption region over the spliced body so such an unwind
+    // resolves to this splice's join.
+    const needs_lr_absorb = blk: {
+        switch (body.*) {
+            .Block => |bb| {
+                for (bb.stmts) |*st| if (ast_scan.containsLabeledReturnStmt(st, f.name.name)) break :blk true;
+            },
+            .Expr => |*ex| if (ast_scan.containsLabeledReturn(ex, f.name.name)) break :blk true,
+        }
+        break :blk false;
+    };
+    if (needs_lr_absorb and inline_state.runtime.envOnce("KLIO_NO_LR_ABSORB") == null) {
+        const region = try b.allocBlock();
+        b.terminate(.{ .Goto = region });
+        b.switchTo(region);
+        b.setLrAbsorb(region, f.name.name, join, result);
+    }
     const body_val = switch (body.*) {
         // Lower an expression body with the inline function's own declared
         // return type as the expected (tail-position) type — exactly as a
