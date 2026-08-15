@@ -32,15 +32,26 @@ speedup, not neutrality-plus. The recorded levers, measure-first
       * the emitted C inlines the per-statement trace store (span
         offsets in the hot layout) and the fused edge guard
         (klio_edge_view flag polling; ABI v3).
-- [ ] A4. Light-frame direct C-to-C calls (call-heavy yardstick: fib) —
-      the tagged-table / vararg-prologue ideas land here if the
-      measurement wants them.
+- [x] A4 first increment (fdded783): native calls LEAF-SERVE in place
+      (the glue answers monomorphic plain calls to leaf expression
+      bodies via leafExprServe, no recursive full-frame serve, no
+      unwind round trip). fib native 695ms -> 220ms, ahead of the
+      interpreter's 232ms; rangebench unchanged. Deeper C-to-C frames
+      (non-leaf callees) remain a recorded road — measure-first, the
+      remaining gap on call-heavy code is now against the JIT ceiling,
+      not the interpreter.
 - [ ] A5. Value 16B endgame, stage 5b (`plans/value-layout-campaign.md`):
       IrClosure via side-table id + Array — measure-first, AFTER A2-A4
       (the hot-view layout descriptor is runtime-measured so it adapts,
       but every layout change re-runs the A1 yardstick).
-- [ ] A6. Background-yield 55s suite cost (suite-perf memory): profile
-      the yield path under the plugin suite before touching anything.
+- [x] A6 CLOSED BY VERIFICATION: the yieldbench GPF family
+      (activateChain chain-lifetime) is dead on current main — 15/15
+      clean runs, ~230ms warm. resumeOnBackgroundThread PASSES in ~50s
+      and profiles as the compute-heavy category by design (1000
+      composables resumed incrementally under a background mutator
+      thrash loop; memset of frame register files 13%, no stall, no
+      single hot bug). Frame-pool/lazy-zero ideas belong to the CPU
+      campaign's recorded roads, not this worklist.
 
 ## Phase B — Compose plugin suite long tail
 
