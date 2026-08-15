@@ -121,6 +121,19 @@ pub const FuncId = enum(u32) {
 /// link step maps `(runtime ClassId, MethodSlotId)` to the concrete `FuncId`.
 /// Keeping this distinct from `FuncId` makes the bytecode contract explicit
 /// even though the initial stable numbering reuses the root declaration id.
+/// Handles into a `CallVirtual` instruction's host-receiver site memo
+/// (see the field docs there). Built by the exec arm from the live
+/// instruction and threaded into the host's virtual dispatch so the
+/// resolution can stamp the site; null when the call carries argument
+/// names or a parameter map (the memoized direct dispatch binds
+/// positionally).
+pub const VirtNativeSite = struct {
+    cls: *u64,
+    native: *u64,
+    name_ptr: *u64,
+    name_len: *u32,
+};
+
 pub const MethodSlotId = enum(u32) {
     _,
     pub fn from(v: u32) MethodSlotId {
@@ -516,6 +529,20 @@ pub const Inst = union(enum) {
         arg_params: ?[]u32 = null,
         arg_names: []?ConstId = &.{},
         trailing_lambda: bool = false,
+        /// Runtime site memo, single-fill (see `GetField.site_cls`), for the
+        /// HOST-BACKED receiver gap documented above: the first host-shape
+        /// receiver whose member the by-name walk dispatched DIRECTLY to a
+        /// native form claims the site. `site_cls` is the interned pointer of
+        /// the receiver's type FQN (CAS from 0), `site_name_*` the
+        /// module-owned member name, and `site_native` the native form —
+        /// stored LAST with release as the validity gate. Replays skip the
+        /// class-registry probe, the FQN composition, and the string-keyed
+        /// intrinsic lookup. A stale baked value mismatches every live
+        /// pointer identity and the site just stays on the slow path.
+        site_cls: u64 = 0,
+        site_native: u64 = 0,
+        site_name_ptr: u64 = 0,
+        site_name_len: u32 = 0,
     },
     /// Instantiate a class.
     NewInstance: struct {
@@ -1581,6 +1608,18 @@ pub const Module = struct {
     /// written through `@constCast` under their own single-fill/atomic
     /// discipline, deliberately outside the cell's borrow rules.
     pub const objref_immutable = true;
+
+    /// Direct-mapped pointer-identity memo for `classIdByFqn` probes whose
+    /// key is a STATIC string (the comptime `Value.typeFqn` literals the
+    /// virtual-dispatch fallback hashes per call). Keys claim a slot by
+    /// pointer CAS from 0; the value (0 = unset, 1 = no class, else
+    /// ClassId + 2) is release-stored after the claim as the validity gate.
+    /// Written through `@constCast` under the same single-fill discipline as
+    /// the per-`Func` dispatch memos (`classIdByStaticFqn`). Callers must
+    /// guarantee the key pointer's content can never change (a
+    /// stack-composed FQN must NOT use this).
+    cid_memo_keys: [cid_memo_slots]std.atomic.Value(usize) = @splat(std.atomic.Value(usize).init(0)),
+    cid_memo_vals: [cid_memo_slots]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
 
     funcs: std.ArrayList(Func) = .empty,
     /// True when any declaration in this module has a `context(...)`
@@ -10428,6 +10467,26 @@ pub const Module = struct {
     pub fn classFqnById(self: *const Module, id: ClassId) ?[]const u8 {
         const c = idGet(Class, self.classes.items, id.int()) orelse return null;
         return c.fqn;
+    }
+
+    pub const cid_memo_slots = 64;
+
+    /// `classIdByFqn` through the pointer-identity memo on `cid_memo_keys`
+    /// (see the field docs). ONLY for static, content-stable `fqn` slices.
+    pub fn classIdByStaticFqn(self: *const Module, fqn: []const u8) ?ClassId {
+        const key = @intFromPtr(fqn.ptr);
+        const h = (key >> 4) & (cid_memo_slots - 1);
+        if (self.cid_memo_keys[h].load(.monotonic) == key) {
+            const v = self.cid_memo_vals[h].load(.acquire);
+            if (v == 1) return null;
+            if (v >= 2) return ClassId.from(@intCast(v - 2));
+        }
+        const answer = self.classIdByFqn(fqn);
+        const mut = @constCast(self);
+        if (mut.cid_memo_keys[h].cmpxchgStrong(0, key, .acq_rel, .monotonic) == null) {
+            mut.cid_memo_vals[h].store(if (answer) |a| @as(u64, a.int()) + 2 else 1, .release);
+        }
+        return answer;
     }
 
     pub fn classIdByFqn(self: *const Module, fqn: []const u8) ?ClassId {
