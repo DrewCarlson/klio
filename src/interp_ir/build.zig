@@ -3978,18 +3978,29 @@ fn buildModuleWithOverrides(
             };
             if (runtime.envOnce("KLIO_MISS_TRACE")) |w| {
                 if (std.mem.eql(u8, w, p.name.name))
-                    std.debug.print("[extprop-reg] key=({s},{s}) fid={d}\n", .{ recv_key, p.name.name, fid.int() });
+                    std.debug.print("[extprop-reg] key=({s},{s}) fid={d} owner={s}\n", .{ recv_key, p.name.name, fid.int(), epd.owner orelse "<top>" });
             }
-            try extension_props.put(.{ .a = recv_key, .b = p.name.name }, fid);
-            // A PRIVATE member-extension property's (receiver, name) pair is
-            // not unique across classes (each lazy-layout item type declares
-            // `private val Placeable.mainAxisSize`); a second, owner-qualified
-            // key keeps every declaration reachable so dispatch can pick the
-            // one whose owner is on the lexical receiver tower.
+            // A PRIVATE member-extension property is visible only where its
+            // owner class is a dispatch receiver, so it registers ONLY under
+            // the owner-qualified key — the plain pair would resolve it
+            // program-wide (`private val String.decorated` in one class
+            // served a bystander's `s.decorated`, which kotlinc rejects).
+            // The owner-keyed resolvers cover the legal scopes: the lexical
+            // receiver tower and the importing file (companion members).
+            // A NON-private member extension keeps the plain pair as well:
+            // kotlinc scopes those to the tower too, but the interpreter's
+            // tower emulation does not yet see every legal frame (lambda and
+            // inline splices inside the owner) — gating them cost the
+            // compose suite ~400 tests. Tightening that is recorded work.
             if (epd.owner) |owner| {
                 const okey = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ owner, recv_key });
                 try extension_props.put(.{ .a = okey, .b = p.name.name }, fid);
                 try owner_keyed_ext_names.put(p.name.name, {});
+                if (p.visibility != .Private) {
+                    try extension_props.put(.{ .a = recv_key, .b = p.name.name }, fid);
+                }
+            } else {
+                try extension_props.put(.{ .a = recv_key, .b = p.name.name }, fid);
             }
             if (recv.nullable) {
                 const gop2 = try nullable_ext_props.getOrPut(p.name.name);
@@ -4058,12 +4069,17 @@ fn buildModuleWithOverrides(
                 .Expr => |body| try ir.lower.lowerAccessorExpr(module, recv_name, &recv_members, &.{ "this", setter_param_name }, &body, nm),
                 .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv_name, &recv_members, &.{ "this", setter_param_name }, &blk, nm),
             };
-            try extension_prop_setters.put(.{ .a = recv_key, .b = p.name.name }, fid);
+            // Same private-only gating as the getter above.
             if (epd.owner) |owner| {
                 const okey = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ owner, recv_key });
                 try extension_prop_setters.put(.{ .a = okey, .b = p.name.name }, fid);
                 try owner_keyed_ext_names.put(p.name.name, {});
                 try module.registry.member_ext_owner_class.put(fid, owner);
+                if (p.visibility != .Private) {
+                    try extension_prop_setters.put(.{ .a = recv_key, .b = p.name.name }, fid);
+                }
+            } else {
+                try extension_prop_setters.put(.{ .a = recv_key, .b = p.name.name }, fid);
             }
         }
     }

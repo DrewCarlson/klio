@@ -2545,14 +2545,35 @@ fn ownerKeyedSlotKey(cls_ident: usize, recv_key: []const u8, name: []const u8) u
 /// Probe the owner-qualified extension-prop keys (`"<Owner>\x00<recv>"`)
 /// for one class on the lexical receiver tower.
 fn ownerKeyedForClass(cls: ObjRef(runtime.ClassDef), map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
+    // Probe the WHOLE resolved parent chain, not one supertype level: a
+    // coroutine instance's class is several classes below JobSupport, and a
+    // member extension declared there is in scope for every subclass body.
     var kb: [512]u8 = undefined;
-    const cg = cls.borrow();
-    defer cg.deinit();
-    const cd = cg.get();
-    if (ownerKeyedProbeOne(cd.fqn, kb[0..], map, recv_key, name)) |fid| return fid;
-    if (ownerKeyedProbeOne(cd.name, kb[0..], map, recv_key, name)) |fid| return fid;
-    for (cd.supertype_names) |sn| {
-        if (ownerKeyedProbeOne(sn, kb[0..], map, recv_key, name)) |fid| return fid;
+    var cur: ObjRef(runtime.ClassDef) = cls;
+    var depth: usize = 0;
+    while (depth < runtime.ClassDef.MAX_WALK) : (depth += 1) {
+        const cg = cur.borrow();
+        const cd = cg.get();
+        if (ownerKeyedProbeOne(cd.fqn, kb[0..], map, recv_key, name)) |fid| {
+            cg.deinit();
+            return fid;
+        }
+        if (ownerKeyedProbeOne(cd.name, kb[0..], map, recv_key, name)) |fid| {
+            cg.deinit();
+            return fid;
+        }
+        for (cd.supertype_names) |sn| {
+            if (ownerKeyedProbeOne(sn, kb[0..], map, recv_key, name)) |fid| {
+                cg.deinit();
+                return fid;
+            }
+        }
+        const parent = cd.parent orelse {
+            cg.deinit();
+            return null;
+        };
+        cg.deinit();
+        cur = parent;
     }
     return null;
 }
@@ -2594,6 +2615,27 @@ fn ownerKeyedExtProp(comptime setters: bool, map: anytype, recv_key: []const u8,
         const found = ownerKeyedForClass(cls, map, recv_key, name);
         slot.* = .{ .key = k, .hit = found != null, .fid = if (found) |f| f.int() else NO_FID };
         if (found) |fid| return fid;
+    }
+    return null;
+}
+
+/// An IMPORTED companion/member extension property (`import
+/// kotlin.time.Duration.Companion.seconds`) is in scope in its importing
+/// file without the owner on the receiver tower. Probe the owner-keyed
+/// entries named by the executing frame's file imports: the import's fqn
+/// minus its leaf IS the declaring owner the registration keyed.
+fn importOwnedExtProp(self: *VmHost, map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
+    const f = ir.eval.currentFrameFunc() orelse return null;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    const file = (module.decl_span.get(f.id.int()) orelse return null).file;
+    for (module.importAliasPathsIn(file, name)) |path| {
+        if (path.fqn.len <= name.len + 1) continue;
+        const owner = path.fqn[0 .. path.fqn.len - name.len - 1];
+        var kb: [512]u8 = undefined;
+        if (ownerKeyedProbeOne(owner, kb[0..], map, recv_key, name)) |fid| return fid;
+        if (ownerKeyedProbeOne(owner, kb[0..], map, "Any", name)) |fid| return fid;
     }
     return null;
 }
@@ -2663,6 +2705,7 @@ fn resolveExtensionPropImpl(
         defer pg.deinit();
         if (pg.get().owner_keyed_ext_names.contains(name)) {
             if (ownerKeyedExtProp(setters, Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
+            if (importOwnedExtProp(self, Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
         }
         if (missTraceEnvCached()) |w| {
             if (std.mem.eql(u8, w, name))
@@ -2733,10 +2776,17 @@ fn resolveExtensionPropImpl(
             if (lookupPairFunc(Pick.map(pg.get().*), comp_key, name)) |fid| return fid;
         }
     }
-    // An `Any` extension property applies to every receiver.
+    // An `Any` extension property applies to every receiver — including an
+    // owner-gated member extension (`private val Any?.exceptionOrNull` in
+    // JobSupport) whose registration recv key is "Any" while the receiver's
+    // own head is anything at all; the tower probe above only tried that
+    // head.
     {
         const pg = self.prog.borrow();
         defer pg.deinit();
+        if (pg.get().owner_keyed_ext_names.contains(name)) {
+            if (ownerKeyedExtProp(setters, Pick.map(pg.get().*), "Any", name)) |fid| return fid;
+        }
         if (lookupPairFunc(Pick.map(pg.get().*), "Any", name)) |fid| return fid;
     }
     return null;

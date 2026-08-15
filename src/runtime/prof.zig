@@ -357,9 +357,24 @@ const MapRanges = struct {
 
     fn read(arena: std.mem.Allocator) MapRanges {
         var out: MapRanges = .{};
-        const f = std.fs.openFileAbsolute("/proc/self/maps", .{}) catch return out;
-        defer f.close();
-        const text = f.deprecatedReader().readAllAlloc(arena, 4 * 1024 * 1024) catch return out;
+        if (@import("builtin").os.tag != .linux) return out;
+        // Raw procfs read: Zig 0.16's std fs API moved behind `Io` (same
+        // no-`Io` pattern as objcell's `procEnvironHas`).
+        const fd_raw = std.os.linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
+        if (@as(isize, @bitCast(fd_raw)) < 0) return out;
+        const fd: i32 = @intCast(fd_raw);
+        defer _ = std.os.linux.close(fd);
+        var text_buf: std.ArrayList(u8) = .empty;
+        defer text_buf.deinit(arena);
+        var chunk: [16384]u8 = undefined;
+        while (true) {
+            const n_raw = std.os.linux.read(fd, &chunk, chunk.len);
+            if (@as(isize, @bitCast(n_raw)) <= 0) break;
+            const n: usize = n_raw;
+            text_buf.appendSlice(arena, chunk[0..n]) catch return out;
+            if (text_buf.items.len > 4 * 1024 * 1024) break;
+        }
+        const text = arena.dupe(u8, text_buf.items) catch return out;
         var starts: std.ArrayList(usize) = .empty;
         var ends: std.ArrayList(usize) = .empty;
         var names: std.ArrayList([]const u8) = .empty;
