@@ -270,7 +270,7 @@ tests): 322/444 passing at the start of this stretch.
       `parameters`-as-Function family); trailing-vararg element
       adjudication + Pair-component disproof (StringValues 9/9); range
       literal peer widening (list-of-ranges vs Long peer).
-- [ ] Census after all fixes: **463 passed / 4 failed / ZERO incomplete**
+- [ ] Census after all fixes: **464 passed / 3 failed / ZERO incomplete**
       (was 322/444-ish at the stretch start; the deadlocked classes'
       tests now all count and PipelineTest is 18/18 in 10s). Latest
       landing (e2200304): CallValueOrMember's non-invocable arm walks the
