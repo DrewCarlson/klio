@@ -75,27 +75,18 @@ both suite-level (plugin conformance ratchet):
       binding the enclosing implicit receiver (arity carried in the
       inherited local-ext mark). Guard examples
       local_ext_fn_reference.kt, member_arg_disproof_extension.kt.
-- [ ] checkboxLike = the SLOT-EXACT emission anchor: klio emits 21
-      slots memo-off / 24 memo-on vs kotlinc's 18 cap (groups fine at
-      6 <= 8). The excess predates memoization — this is the measuring
-      stick for the group/slot emission-shape debt below. MEASURED
-      NEGATIVE: skipping the 0-capture memo wrap BREAKS
-      funInterface_isMemoized (the VM builds a fresh closure per
-      execution — ir-closure#542 vs #904; the
-      non_capturing_lambda_identity guard exercises a different path)
-      and does NOT reduce checkboxLike's slots (still 24). ROOT NOW
-      FULLY CHARACTERIZED (slot dump via in-situ CompositionGroup.data
-      print in slotExpect): the +6 excess = memo KEY slots — klio's
-      `remember(k1,k2){lam}` stores each captured key, while kotlinc
-      keys the memo on per-param `$dirty` BIT-TRIPLES (zero key slots,
-      one cache slot). A coarse single-bit condition is NOT a shortcut:
-      it over-invalidates and breaks funInterface_isMemoized (identity
-      must survive recompositions where the captures did not change).
-      The fix is the skip-calculus upgrade to kotlinc's per-param
-      changed/dirty bit layout (3 bits per param + child-call masks) —
-      a campaign of its own; checkboxLike stays its ratchet test.
-      Closure interning at buildClosure is the companion road (UNSOUND
-      naively — closures capture the creation-time receiver chain).
+- [ ] checkboxLike anchor: 24 -> **19** slots (kotlinc 18) after the
+      dirty-bits campaign LANDED its core (f6bbd362): per-param
+      `$dirty` triples + caller-certainty-guarded probes + call-site
+      `$changed` bits (lowering-side, resolved-signature named-arg
+      mapping) + zero-key-slot memo shapes (cache from `$dirty`,
+      lifted `{}` singletons, cache(false)). Ratchet 1370 rc=0,
+      remember-family 26/26, funInterface_isMemoized green. REMAINING:
+      the last slot + the 2-group deficit need slot-level attribution,
+      blocked on the nested CompositionGroup tooling surface
+      (compositionGroups/data on non-root groups are empty/raise);
+      full record in plans/compose-dirty-bits-plan.md. checkboxLike
+      stays the red anchor until slot-exact.
 - [x] CompositionTests remember-family FIXED — 26/26 solo (was ~8
       fails), LocalRememberReproTests 4/4. Three stacked roots, all
       landed:
