@@ -435,6 +435,10 @@ fn overloadPickByLambdaReturnFull(
     var nb = try FuncBuilder.init(b.allocator, b.module);
     nb.census_quiet = true;
     defer nb.deinit();
+    // The lambda body's calls resolve in the CALLER's lexical class scope:
+    // `it.toLong()` inside `expected.map { it.toLong() }` binds the
+    // enclosing class's private member-extension.
+    if (b.ownerClass()) |oc0| nb.setOwnerClass(oc0);
     var elem_owned: ?ir.TypeRef = null;
     defer if (elem_owned) |*t| t.deinit(b.allocator);
     var i: usize = 0;
@@ -12226,7 +12230,30 @@ fn staticCallReturnTypeRefInner(
             // annotation as-is, an un-annotated expression body by on-demand
             // derivation.
             if (resolved_target == null) {
-                if (inline_state.exprBodyMemberAst(head, member.name.name, memberArgCount(call_expr))) |fa| {
+                // A member-EXTENSION registers under its DECLARING class,
+                // not its receiver head (`private fun IntRange.toLong()`
+                // inside RangesTest registers as (RangesTest, toLong));
+                // consult the lexical owner too so an un-annotated
+                // expression body still derives at its receiver-typed
+                // call sites.
+                const fa_hit = inline_state.exprBodyMemberAst(head, member.name.name, memberArgCount(call_expr)) orelse blk_fa: {
+                    const ow2 = b.ownerClass() orelse {
+                        if (mt) std.debug.print("[bareret] .{s} fa: no owner\n", .{member.name.name});
+                        break :blk_fa null;
+                    };
+                    const cand = inline_state.exprBodyMemberAst(ow2, member.name.name, memberArgCount(call_expr)) orelse {
+                        if (mt) std.debug.print("[bareret] .{s} fa: miss (owner={s} argc={d})\n", .{ member.name.name, ow2, memberArgCount(call_expr) });
+                        break :blk_fa null;
+                    };
+                    // Only a member-extension whose declared receiver serves
+                    // this receiver head qualifies; a plain same-named member
+                    // of the owner is a different callee entirely.
+                    const rt2 = cand.receiver_type orelse break :blk_fa null;
+                    const dh2 = typeHead(std.mem.trimEnd(u8, rt2.name.name, "?"));
+                    if (!(std.mem.eql(u8, dh2, head) or b.module.classIsOrExtends(head, dh2))) break :blk_fa null;
+                    break :blk_fa cand;
+                };
+                if (fa_hit) |fa| {
                     if (fa.return_type) |*rt| {
                         var out = try loweredOwnedLocalTypeRef(b, rt);
                         if (member.safe) out.nullable = true;
@@ -17774,6 +17801,49 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
         if (!f.return_ty_declared or f.return_ty.name.len == 0 or
             bareTypeParamHead(f.return_ty.name))
         {
+            // An UN-ANNOTATED member-extension expression body derives its
+            // return on demand from the registered AST — the same channel
+            // class members use for forward references. Without it, a
+            // private `IntRange.toLong() = start.toLong()..endInclusive
+            // .toLong()` left `expected.map { it.toLong() }` untyped, and
+            // the untyped list then failed to refute a same-name member's
+            // invariant generic parameter (the RangesTest assertEquals
+            // self-recursion).
+            if (!f.return_ty_declared) {
+                const owner: ?[]const u8 = blk_own: {
+                    break :blk_own b.module.registry.member_ext_owner_class.get(fid) orelse b.ownerClass();
+                };
+                if (owner) |ow| {
+                    if (inline_state.exprBodyMemberAst(ow, mname, call.args.len)) |fa| {
+                        if (fa.body) |*fbody| {
+                            if (fbody.* == .Expr and od_depth < 3) {
+                                od_depth += 1;
+                                defer od_depth -= 1;
+                                var nb3 = try FuncBuilder.init(b.allocator, b.module);
+                                nb3.census_quiet = true;
+                                defer nb3.deinit();
+                                if (fa.receiver_type) |*frt| {
+                                    nb3.setRecvTypeRefOwned(try loweredOwnedLocalTypeRef(&nb3, frt));
+                                }
+                                for (fa.params) |*ap| {
+                                    try nb3.setLocalDeclTypeOwned(ap.name.name, try loweredOwnedLocalTypeRef(&nb3, &ap.ty));
+                                }
+                                if (try staticExprTypeRef(&nb3, &fbody.Expr)) |derived| {
+                                    var out2 = derived;
+                                    const oh2 = typeHead(std.mem.trimEnd(u8, out2.name, "?"));
+                                    if (oh2.len > 2 and !b.isTypeParam(oh2) and
+                                        ir.parseClassTypeParamIdentity(oh2) == null)
+                                    {
+                                        if (agreed) |*old| old.deinit(b.allocator);
+                                        return out2;
+                                    }
+                                    out2.deinit(b.allocator);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if (agreed) |*old| old.deinit(b.allocator);
             return null;
         }
