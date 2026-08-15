@@ -225,17 +225,26 @@ the campaign opens (`COROUTINE-MODEL.md` is the architecture reference).
       1.9.0 on JVM, toolchain in the session scratchpad) — the JVM
       prints U1 U2 L1 L2, exactly klio's order. NOT a bug; guard
       example unconfined_yield_order.kt pins it.
-- [ ] Background-yield 55s cost (suite-perf memory)
-- [ ] CompositionTests.testCompositionAndRecomposerDeadlock +
-      PausableCompositionTests.markInvalidFromBackgroundThread — both
-      eat the 300s wall cap solo. STALL SHAPE CAPTURED (straggler1):
-      the runTest watchdog parks on TestCoroutineScheduler.
-      receiveDispatchEvent while the test body's join never completes —
-      a REAL background-thread Recomposer's dispatch event never
-      reaches the virtual scheduler's channel. The cross-thread corner
-      of the receiver/dispatch campaign.
+- [ ] Background-yield 55s cost (suite-perf memory) — PERF, not
+      correctness; parked with the suite-wall floor.
+- [x] CompositionTests.testCompositionAndRecomposerDeadlock +
+      PausableCompositionTests.markInvalidFromBackgroundThread —
+      RECLASSIFIED (2026-08-15): no stall remains. The deadlock test
+      PASSES solo under the census recipe (10s virtual cap); the
+      markInvalid test PASSES in 40s wall once the virtual timeout
+      admits it (kotlinx_coroutines_test_default_timeout=600s) — its
+      body runs 10,000 interpreted background invalidates (repeat(1000)
+      × 10 launches + joins), which is the compute-heavy category from
+      the suite-wall profile, not a cross-thread dispatch loss. Under
+      the census's 10s cap it reports UncompletedCoroutinesError by
+      design; it counts as wall-capped in the ratchet, not as a bug.
 
-State: not started.
+State: CORRECTNESS COMPLETE (2026-08-15). Every recorded coroutine bug
+is fixed, oracle-verified not-a-bug, or reclassified compute-heavy;
+what remains is one perf item (background-yield 55s, parked with the
+suite-wall floor) and the tl_atomic_update_contended flake watch
+(postmortem-able on next natural occurrence — the sweep prints
+got-vs-expected tails).
 
 ## 4. ktor_commontest upstream fails
 
