@@ -13,14 +13,25 @@ ReleaseFast JIT-off, a14d89e2) but the campaign's goal is a real
 speedup, not neutrality-plus. The recorded levers, measure-first
 (`plans/c-transpiler-plan.md` §speedup):
 
-- [ ] A1. Baseline re-measure on current main (rangebench RF, JIT off,
-      interpreter vs native tier) so every lever has a fresh yardstick.
-- [ ] A2. Inline trace store — the a14d89e2 commit names it "the next
-      recorded lever": the per-statement trace bookkeeping and edge
-      guard still call into the runtime from emitted C.
-- [ ] A3. Wider hot-op coverage: branch/jump/cmp_br shapes, the
-      range-loop ops, and whatever the measurement says dominates after
-      A2 (profile the native binary, not assumptions).
+- [x] A1. Baseline re-measured: interp 13.68s / native 13.89s (the
+      +3.2% did not hold on current main — native was ~1.5% BEHIND).
+- [x] A2+A3 LANDED TOGETHER (50754db8), measured 13.8s -> 0.97s
+      interp / 0.83s native (16.6x / 16.8x; native +17% over interp;
+      312/312 transpiler parity, corpus 316/316, ratchet 1370):
+      * KLIO_PROF on the native binary attributed the wall to
+        INTERPRETED machinery, which led to two interpreter-side roots
+        the emitted C merely inherited:
+      * computeBoxedVars falsely boxed every var a same-function
+        string template `$name`-mentioned (a template is not a
+        lambda) — rangebench's accumulator paid a locked cell op per
+        iteration. Unboxed; unit test pins it.
+      * literal-step progressions (`step k`) ran the virtual iterator
+        protocol per iteration; now counted register loops with
+        kotlinc's overflow-free last-element snapping (JVM-verified;
+        guard example step_progression_counted.kt).
+      * the emitted C inlines the per-statement trace store (span
+        offsets in the hot layout) and the fused edge guard
+        (klio_edge_view flag polling; ABI v3).
 - [ ] A4. Light-frame direct C-to-C calls (call-heavy yardstick: fib) —
       the tagged-table / vararg-prologue ideas land here if the
       measurement wants them.
