@@ -968,6 +968,28 @@ fn crossPackageNonCandidate(module: *const Module, f: *const Func, cand: FuncId)
 
 fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []const Value) ?FuncId {
     const f = funcAt(module, func) orelse return null;
+    // A pack side-module's simple-name index can be PARTIAL (it indexes its
+    // own funcs, while the overload set lives in the program-wide registry):
+    // re-enter through the host's main module so a non-exact baked pick
+    // (`ByteReadChannel(byteArray)` baked to the `(Source)` overload inside
+    // ktor-io) still re-resolves by value types.
+    if (module.funcsBySimpleName(f.name).len < 2) {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const main_mod = mg.get();
+        if (@intFromPtr(main_mod) != @intFromPtr(module) and
+            main_mod.funcsBySimpleName(f.name).len >= 2 and
+            main_mod.funcById(func) != null)
+        {
+            return pickOverloadInner(self, main_mod, func, args);
+        }
+        return null;
+    }
+    return pickOverloadInner(self, module, func, args);
+}
+
+fn pickOverloadInner(self: *VmHost, module: *const Module, func: FuncId, args: []const Value) ?FuncId {
+    const f = funcAt(module, func) orelse return null;
     // A statically-bound INSTANCE METHOD is not in the top-level overload
     // set: the lowering resolved it by scope (a private member wins over
     // every top-level namesake for a bare call in its class), and the
@@ -1019,10 +1041,17 @@ fn pickOverload(self: *VmHost, module: *const Module, func: FuncId, args: []cons
             best_ord_score = s;
         }
     }
+    if (runtime.envOnce("KLIO_PICK_TRACE")) |w| if (std.mem.eql(u8, w, name)) {
+        std.debug.print("[pick] {s} base=#{d} base_score={?} cands={d}\n", .{ name, func.int(), positionalPoints(self, module, func, shapes, scope), candidates.len });
+    };
     for (candidates) |cand| {
         if (cand.int() == func.int()) continue;
         if (crossPackageNonCandidate(module, f, cand)) continue;
-        const total = positionalPoints(self, module, cand, shapes, scope) orelse continue;
+        const total_dbg = positionalPoints(self, module, cand, shapes, scope);
+        if (runtime.envOnce("KLIO_PICK_TRACE")) |w| if (std.mem.eql(u8, w, name)) {
+            std.debug.print("[pick]   cand=#{d} score={?}\n", .{ cand.int(), total_dbg });
+        };
+        const total = total_dbg orelse continue;
         const is_low = if (funcAt(module, cand)) |cf| cf.low_priority else false;
         if (is_low) {
             if (best_low == null or total > best_low_score) {
@@ -1111,11 +1140,27 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
     // ranks candidates for the call's argument count, and only this one
     // accepts it. That covers the compose snapshot vocabulary (`valid`,
     // `readable`, `get`), where same-named helpers differ in arity.
-    const same_name = module.funcsBySimpleName(f.name);
+    // A pack side-module's simple-name index can be PARTIAL; the overload
+    // set lives program-wide. Consult the main module before declaring the
+    // name sibling-free, or a non-exact baked pick dispatches flat with no
+    // value-typed re-resolution (`ByteReadChannel(byteArray)` inside
+    // ktor-io ran the `(Source)` overload).
+    const same_name = blk: {
+        const local = module.funcsBySimpleName(f.name);
+        if (local.len >= 2) break :blk local;
+        const mg2 = self.module.borrow();
+        defer mg2.deinit();
+        const global = mg2.get().funcsBySimpleName(f.name);
+        break :blk if (global.len > local.len) global else local;
+    };
     if (same_name.len > 1) {
         var arity_peers: usize = 0;
         for (same_name) |c| {
-            const cf = funcAt(module, c) orelse continue;
+            const cf = funcAt(module, c) orelse blk2: {
+                const mg3 = self.module.borrow();
+                defer mg3.deinit();
+                break :blk2 mg3.get().funcById(c) orelse continue;
+            };
             if (cf.params.len == f.params.len) arity_peers += 1;
             // A defaulted or variadic peer accepts a range of counts, so it
             // competes for this arity whatever its declared length is.
@@ -1151,15 +1196,32 @@ pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
 /// site's own tier ranking answers it — and answers it identically to the
 /// re-resolution the fused path skips.
 pub fn fuseSiteBinds(self: *VmHost, module: *const Module, func: FuncId, caller_pkg: []const u8, caller_file: ?ir.FileId) bool {
-    _ = self;
     const f = funcAt(module, func) orelse return false;
     const file = caller_file orelse ir.FileId.from(std.math.maxInt(u32));
     const own = module.scopeTier(f.fqn, f.package, f.name, caller_pkg, file);
     if (own == ir.Module.other_package_tier) return false;
-    for (module.funcsBySimpleName(f.name)) |c| {
+    // The executing module's simple-name index can be PARTIAL (a pack
+    // side-module); judge the peer set against the widest index available,
+    // or an overload set collapses to "no peers" and the baked pick fuses
+    // without value-typed re-resolution.
+    const peers = blk: {
+        const local = module.funcsBySimpleName(f.name);
+        if (local.len >= 2) break :blk local;
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const global = mg.get().funcsBySimpleName(f.name);
+        break :blk if (global.len > local.len) global else local;
+    };
+    for (peers) |c| {
         if (c.int() == func.int()) continue;
-        const cf = funcAt(module, c) orelse continue;
-        if (cf.params.len != f.params.len) continue;
+        const cf = funcAt(module, c) orelse blk2: {
+            const mg2 = self.module.borrow();
+            defer mg2.deinit();
+            break :blk2 mg2.get().funcById(c) orelse continue;
+        };
+        // Same arity, or a defaulted/vararg peer spanning this arity, both
+        // compete for the call.
+        if (cf.params.len != f.params.len and !peerSpansArity(self, c, cf, f.params.len)) continue;
         // A peer at the same or better tier means scope does not settle it.
         if (module.scopeTier(cf.fqn, cf.package, cf.name, caller_pkg, file) <= own) return false;
     }
@@ -2369,6 +2431,13 @@ pub fn typedCallBoundary(self: *VmHost, module: *const Module, func: *const ir.F
 }
 
 fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult {
+    if (hcfMissTraceEnv()) |w| {
+        if (funcAt(module, func)) |tf| if (std.mem.eql(u8, w, tf.name)) {
+            std.debug.print("[cfti] {s}#{d} nargs={d} nnames={d} names:", .{ tf.name, func.int(), args.len, arg_names.len });
+            for (arg_names) |n| std.debug.print(" {s}", .{n orelse "-"});
+            std.debug.print("\n", .{});
+        };
+    }
     // Compose ABI completion: a composable's trailing ($composer, $changed)
     // pair is appended by the caller's pass, but a call reaching here from a
     // context the pass could not see as composable (a sub-composition's

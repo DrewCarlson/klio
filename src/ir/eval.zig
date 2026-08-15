@@ -5054,6 +5054,7 @@ fn LoopTramp(comptime H: type) type {
                         &recv,
                         fid,
                         argbuf[0..site.n_args],
+                        &.{},
                     ) catch {
                         lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
                         return jit_loop.throwCode(site.block);
@@ -6100,6 +6101,11 @@ fn runFrameExec(
                         break;
                     }
                 }
+                if (cmgTraceWant()) |w| if (std.mem.eql(u8, w, frame.func.name)) {
+                    std.debug.print("[switch] {s} v={s}", .{ frame.func.name, @tagName(std.meta.activeTag(v)) });
+                    if (v == .Int) std.debug.print(":{d}", .{v.Int});
+                    std.debug.print(" -> b{d} (default b{d}, {d} arms)\n", .{ next.int(), sw.default.int(), sw.arms.len });
+                };
                 cur = next;
             },
         }
@@ -7705,6 +7711,11 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
 /// stays put, until `NATIVE_RECURSE_MAX_DEPTH`, where it reverts to the
 /// flat park to bound the C stack.
 noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H, allow_flat: bool) Allocator.Error!Step {
+    if (cmgTraceWant()) |w| {
+        if (frame.module.funcById(call.func)) |cf| if (std.mem.eql(u8, w, cf.name)) {
+            std.debug.print("[call-inst] {s}#{d} n_args={d} n_names={d} exact={}\n", .{ cf.name, call.func.int(), call.n_args, call.arg_names.len, call.exact });
+        };
+    }
     dispatchBump(.call_static);
     // Monomorphic fast path: a plain top-level user function (single
     // overload, has body, non-extension, no varargs / defaults / type
@@ -8309,12 +8320,15 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 value
             else
                 null;
+            const names_resolved = try resolveArgNames(allocator, frame.module, cm.arg_names);
+            defer allocator.free(names_resolved);
             switch (try host.invokeResolvedMember(
                 allocator,
                 dispatch_ptr,
                 &recv,
                 fid,
                 ra,
+                names_resolved,
             )) {
                 .ok => |rv| {
                     try frame.write(cm.dst, rv);
@@ -8733,7 +8747,37 @@ noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator, fra
         const name_str = constStr(frame.module, cvm.name) orelse
             return raiseStep(frame, .{ .Type = "CallValueOrMember: name not a string const" });
         orAudit("CallValueOrMember", name_str, "member", 0, &recv);
-        switch (try host.callMemberNamed(allocator, &recv, name_str, arg_values, names)) {
+        var r = try host.callMemberNamed(allocator, &recv, name_str, arg_values, names);
+        // A NON-callable capture is not a resolution candidate at all in
+        // Kotlin: `val pipeline = pipeline()` captured by a receiver lambda
+        // must not stop `pipeline()` from binding the ENCLOSING class's
+        // member. On the canonical member miss for the innermost receiver,
+        // walk the outer implicit receivers before giving up.
+        if (r == .err and r.err == .Unimplemented and
+            std.mem.indexOf(u8, r.err.Unimplemented, "Vm::call_member") != null)
+        {
+            const entries = try enclosingEntriesAlloc(allocator);
+            defer allocator.free(entries);
+            var i = entries.len;
+            while (i > 0) {
+                i -= 1;
+                const e = &entries[i];
+                if (e.v != .Instance) continue;
+                if (e.v == .Instance and recv == .Instance and
+                    ObjRef(InstanceData).ptrEq(e.v.Instance, recv.Instance)) continue;
+                const r2 = try host.callMemberNamed(allocator, &e.v, name_str, arg_values, names);
+                if (r2 == .err and r2.err == .Unimplemented and
+                    std.mem.indexOf(u8, r2.err.Unimplemented, "Vm::call_member") != null)
+                {
+                    freeMissErr(allocator, r2.err);
+                    continue;
+                }
+                freeMissErr(allocator, r.err);
+                r = r2;
+                break;
+            }
+        }
+        switch (r) {
             .ok => |rv| try frame.write(cvm.dst, rv),
             .err => |e| return raiseStep(frame, e),
         }

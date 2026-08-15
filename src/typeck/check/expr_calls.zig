@@ -1200,6 +1200,21 @@ fn checkOverloadedCallRecImpl(
         }
         break :blk true;
     };
+    // The CHOSEN signature's own bound parameter types must be resolved
+    // too: a param the checker could not type (an interface from a pack it
+    // never saw, e.g. kotlinx.io's `Source`) fits every argument, so a pick
+    // reached through it is arity luck, not a typed decision — recording it
+    // pinned `ByteReadChannel(byteArray)` to the `(Source)` overload.
+    const sig_params_decisive = blk: {
+        const va2 = sigVarargIdx(sig);
+        var k2: usize = 0;
+        while (k2 < args.len) : (k2 += 1) {
+            const slot2 = if (va2 != null and k2 >= va2.?) va2.? else k2;
+            if (slot2 >= sig.params.len) break;
+            if (sig.params[slot2].nonNull().* == .Unresolved) break :blk false;
+        }
+        break :blk true;
+    };
     // An EXTENSION pick is recorded only when the chosen declaration came
     // from the IMAGE. That is the set the checker sees in full: the image
     // publishes every extension on a class and its supertype chain. A
@@ -1207,7 +1222,7 @@ fn checkOverloadedCallRecImpl(
     // looks — a program that loads packs has extensions the checker never
     // saw, and picking against that partial view bound compose's
     // `SlotTable.groupsSize` to a declaration its receiver never had.
-    if (record and chosen != null and args_decisive and
+    if (record and chosen != null and args_decisive and sig_params_decisive and
         (!sig.is_extension or sig.extern_fid != null or complete_universe))
     {
         if (std.c.getenv("KLIO_EAGER_HITS") != null) {
