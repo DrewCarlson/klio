@@ -270,8 +270,16 @@ tests): 322/444 passing at the start of this stretch.
       `parameters`-as-Function family); trailing-vararg element
       adjudication + Pair-component disproof (StringValues 9/9); range
       literal peer widening (list-of-ranges vs Long peer).
-- [ ] Census after all fixes: **435 passed / 8 failed / 3 classes
-      INCOMPLETE** (was 322 at the stretch start). The tail:
+- [ ] Census after all fixes: **439 passed / 4 failed / 3 classes
+      INCOMPLETE** (was 322 at the stretch start). Landed since the 435
+      snapshot: named args on RESOLVED member calls bind by name
+      (ReadLineTest 25/25 with the exact-limit pair), partial-index
+      overload repick + eager unresolved-param gate
+      (ByteReadChannel(byteArray) overload), and the pack-scale
+      String-factory scope fix (plans/repros/pack_scale_repeat_echo.md —
+      RESOLVED; shadowedByClass now tier-filters factory competitors,
+      fixing "A".repeat receiver-echo in fully-loaded homes and both
+      remaining ReadLine/Utf8 limit tests). The tail:
       * ReadLineTest 3 + ReadUtf8LineTest 1 — suspend-resume local
         corruption family (`readBuffer.buffer` reads a ByteArray /
         `.length` on Int AFTER an awaitContent resume in a frame with
