@@ -910,7 +910,22 @@ pub fn decodeLiftedDeclReg(a: Allocator, section: []const u8, offset: u32) ?runt
 /// blocks — allocated into the process-lifetime `deferred_func_arena` — pile up
 /// unfreed. Memoising by `(section, offset)` decodes each body exactly once ever:
 /// the cache is bounded by the reachable-func set, not by request count.
-const BlockCacheKey = struct { section: [*]const u8, offset: u32 };
+const BlockCacheKey = struct { section: [*]const u8, offset: u32, len: usize, sig: u64 };
+
+/// Content fingerprint for a cache key: the section length plus the raw
+/// bytes at the decode offset. A freed section's ADDRESS can be reused by a
+/// later pack image (six installed packs made `"A".repeat` run another
+/// pack's one-arg body via a stale (ptr, offset) hit); the fingerprint makes
+/// such a reuse miss instead.
+fn blockCacheSig(section: []const u8, offset: u32) u64 {
+    var sig: u64 = 0;
+    const avail = section.len -| offset;
+    const n: usize = @min(8, avail);
+    var buf = [_]u8{0} ** 8;
+    if (n != 0) @memcpy(buf[0..n], section[offset..][0..n]);
+    sig = std.mem.readInt(u64, &buf, .little);
+    return sig;
+}
 var block_cache: std.AutoHashMapUnmanaged(BlockCacheKey, []ir.Block) = .empty;
 var block_cache_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -935,7 +950,7 @@ pub fn decodeFuncHeader(a: Allocator, section: []const u8, offset: u32) ?ir.Func
 /// Memoised: a repeated `(section, offset)` returns the first decode's blocks
 /// rather than re-decoding into the never-freed `deferred_func_arena`.
 pub fn decodeFuncBlocks(a: Allocator, section: []const u8, offset: u32) ?[]ir.Block {
-    const key = BlockCacheKey{ .section = section.ptr, .offset = offset };
+    const key = BlockCacheKey{ .section = section.ptr, .offset = offset, .len = section.len, .sig = blockCacheSig(section, offset) };
     blockCacheLock();
     if (block_cache.get(key)) |cached| {
         blockCacheUnlock();

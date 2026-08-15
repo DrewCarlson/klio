@@ -13269,7 +13269,16 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
     // `kotlinx.coroutines.internal.Segment` shadowing the concrete
     // `kotlinx.io.Segment` at its own construction site), inverting the
     // ctor-vs-factory decision.
-    const cid = b.module.classIdIndexed(name, b.self_package, callee.Path.segments[0].span.file) orelse return false;
+    const cid = b.module.classIdIndexed(name, b.self_package, callee.Path.segments[0].span.file) orelse {
+        if (runtime.envOnce("KLIO_SBC_TRACE")) |w| if (std.mem.eql(u8, w, name)) {
+            std.debug.print("[sbc] {s} no-cid file={d}\n", .{ name, callee.Path.segments[0].span.file.int() });
+        };
+        return false;
+    };
+    if (runtime.envOnce("KLIO_SBC_TRACE")) |w| if (std.mem.eql(u8, w, name)) {
+        const abs = cid.int() < b.module.classes.items.len and b.module.classes.items[cid.int()].is_abstract;
+        std.debug.print("[sbc] {s} cid={d} abstract={} nargs={d} file={d}\n", .{ name, cid.int(), abs, args.len, callee.Path.segments[0].span.file.int() });
+    };
     if (runtime.envOnce("KLIO_NU_TRACE") != null and std.mem.eql(u8, name, "Density")) {
         const abs = cid.int() < b.module.classes.items.len and b.module.classes.items[cid.int()].is_abstract;
         std.debug.print("[sbc] Density cid={d} abstract={} owner={s}\n", .{ cid.int(), abs, b.ownerClass() orelse "-" });
@@ -13339,6 +13348,11 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
     // class-carrying form, whose runtime shadow gate lets the captured
     // callable win and still reaches the constructor when nothing binds.
     if (b.resolve(name) == null and (b.knowsOuter(name) or isLowerAnonCapture(name))) return false;
+    // Only IN-SCOPE factories compete with the constructor: kotlinc never
+    // considers an unimported cross-package `fun String(bytes, …)` (io.ktor's)
+    // against `String(chars)` written in kotlin.text — without the tier
+    // filter, pack load ORDER decided whether the builtin ctor won.
+    const call_file = callee.Path.segments[0].span.file;
     if (lastArgIsLambda(args)) {
         // A trailing lambda routes to a same-named factory with a
         // function-typed param to receive it; only when none fits is it a ctor.
@@ -13346,6 +13360,7 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
         for (b.module.func_index.items) |entry| {
             if (!std.mem.eql(u8, entry.name, name)) continue;
             const f = b.module.funcById(entry.id) orelse continue;
+            if (b.module.scopeTier(f.fqn, f.package, name, b.self_package, call_file) > 3) continue;
             const last_vararg = f.params.len != 0 and f.params[f.params.len - 1].is_vararg;
             const arity_ok = last_vararg or nargs <= f.params.len;
             if (arity_ok and anyFunctionParam(f.params)) {
@@ -13367,6 +13382,9 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
     var any_factory_applicable = false;
     for (b.module.func_index.items) |entry| {
         if (!std.mem.eql(u8, entry.name, name)) continue;
+        if (b.module.funcById(entry.id)) |ff| {
+            if (b.module.scopeTier(ff.fqn, ff.package, name, b.self_package, call_file) > 3) continue;
+        }
         if (b.module.decl_user_arity.get(entry.id.int())) |arity| {
             const n: u32 = @intCast(nargs);
             if (n >= arity.required and (arity.has_vararg or n <= arity.total)) {

@@ -6101,6 +6101,11 @@ fn runFrameExec(
                         break;
                     }
                 }
+                if (cmgTraceWant()) |w| if (std.mem.eql(u8, w, frame.func.name)) {
+                    std.debug.print("[switch] {s} v={s}", .{ frame.func.name, @tagName(std.meta.activeTag(v)) });
+                    if (v == .Int) std.debug.print(":{d}", .{v.Int});
+                    std.debug.print(" -> b{d} (default b{d}, {d} arms)\n", .{ next.int(), sw.default.int(), sw.arms.len });
+                };
                 cur = next;
             },
         }
