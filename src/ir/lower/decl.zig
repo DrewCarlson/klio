@@ -2129,6 +2129,14 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     defer build.popCurrentOwnerClass(prev_owner);
     var b = try FuncBuilder.init(a, module);
     defer b.deinit();
+    // A compose-ABI'd fn's ordered value params (pair excluded), for the
+    // call-site `$changed` forwarded-param bit emission.
+    if (f.params.len >= 2 and
+        std.mem.eql(u8, f.params[f.params.len - 2].name.name, "$composer") and
+        std.mem.eql(u8, f.params[f.params.len - 1].name.name, "$changed"))
+    {
+        b.compose_value_params = f.params[0 .. f.params.len - 2];
+    }
 
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(a);
