@@ -6602,6 +6602,78 @@ pub fn nativeOpTrace(ctx: *NativeCtx, file: u32, start: u32, end: u32) void {
     ctx.frame.cur_span = .{ .file = @enumFromInt(file), .start = start, .end = end };
 }
 
+/// The frame's `cur_span` storage as raw bytes, so the emitted C can
+/// inline the per-statement trace store (a plain 3×u32 + presence-tag
+/// write; no ownership). Stable for the activation — the frame is a
+/// field of the heap activation.
+pub fn nativeFrameSpanSlot(ctx: *NativeCtx) [*]u8 {
+    return @ptrCast(&ctx.frame.cur_span);
+}
+
+/// The per-thread/global flag addresses the emitted C polls to inline
+/// the fused edge guard: the guard's slow work runs only when a trigger
+/// fires (`nativeOpEdgeRare`). Pointers are per-THREAD where the state
+/// is threadlocal, so the view is fetched at every activation entry —
+/// the same freshness rule as the register base.
+pub const NativeEdgeView = extern struct {
+    counter: *u64,
+    idle: *u64,
+    abandonable: *const bool,
+    rb_abandon: *const bool,
+    abandon_req: *const bool,
+    gc_pending: *const bool,
+    gc_on: u8,
+    always: u8,
+};
+
+pub fn nativeEdgeView(ctx: *NativeCtx, out: *NativeEdgeView) void {
+    out.* = .{
+        .counter = &ctx.ftls.spin_check_counter,
+        .idle = runtime.gc.idleTickPtr(),
+        .abandonable = runtime.abandonablePtr(),
+        .rb_abandon = runtime.runBoundaryAbandonPtr(),
+        .abandon_req = runtime.abandonRequestedPtr(),
+        .gc_pending = runtime.gc.pendingFlagPtr(),
+        .gc_on = @intFromBool(runtime.gc.gc_enabled),
+        .always = @intFromBool(runtime.gc.stressActive()),
+    };
+}
+
+/// Edge-guard slow path for the inlined edge: `reasons` says which
+/// trigger fired (bit 0 = counter cadence, bit 1 = abandon flags,
+/// bit 2 = gc pending, bit 3 = stress/always, bit 4 = idle cadence);
+/// the actions mirror `fusedEdgeGuard` exactly for those triggers.
+pub fn nativeOpEdgeRare(ctx: *NativeCtx, reasons: u32) i32 {
+    if (reasons & 0x2 != 0 and runtime.shouldAbandon()) {
+        ctx.ret_v.* = errResult(.{ .Type = "daemon task abandoned at run boundary" });
+        ctx.outcome = .ret;
+        return 1;
+    }
+    if (reasons & 0x1 != 0) {
+        spinDumpMaybe();
+        const wall_dl = test_wall_deadline_ms.load(.monotonic);
+        if (wall_dl != 0 and nowMonotonicMs() > wall_dl) {
+            std.debug.print("[wall-cap] test wall-clock deadline exceeded — hang location follows:\n", .{});
+            dumpFrameChainForDiagAlways();
+            wallCapAbandon();
+            ctx.ret_v.* = errResult(.{ .Type = "test wall-clock deadline exceeded" });
+            ctx.outcome = .ret;
+            return 1;
+        }
+    }
+    if (reasons & 0x8 != 0) {
+        // Stress mode: run the full guard's gc arm (pending() carries the
+        // stress counters).
+        if (runtime.gc.gc_enabled and runtime.gc.pending()) runtime.gc.safePoint();
+        return 0;
+    }
+    if (reasons & 0x10 != 0) runtime.gc.idleProbeNow();
+    if (reasons & 0x4 != 0) {
+        if (runtime.gc.gc_enabled) runtime.gc.safePoint();
+    }
+    return 0;
+}
+
 pub fn nativeOpConstLoad(ctx: *NativeCtx, dst: u32, const_id: u32) i32 {
     const v = constToValue(ctx.allocator, &ctx.frame.module.consts.items[const_id]) catch {
         ctx.outcome = .oom;

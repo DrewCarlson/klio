@@ -59,7 +59,37 @@ pub fn lowerForLabeled(
         // `a downTo b`: start at `a`, step -1, inclusive `b` — the same
         // equality-exit loop with the compare and step reversed.
         var descending = false;
-        switch (iter.*) {
+        // `… step k` with a positive INT-LITERAL k: the same equality-exit
+        // register loop with the exit bound snapped to the progression's
+        // real last element (`lo ± ((span / k) * k)`). A non-literal step
+        // keeps the iterator lowering (the step-positive throw and the
+        // dynamic last belong to the progression object).
+        var step_lit: i64 = 1;
+        var iter_shape = iter;
+        if (iter.* == .Call) {
+            const c = &iter.Call;
+            if (c.is_infix and c.args.len == 2 and c.callee.* == .Path and
+                c.callee.Path.segments.len == 1 and
+                std.mem.eql(u8, c.callee.Path.segments[0].name, "step") and
+                c.args[1] == .IntLit and c.args[1].IntLit.value > 0)
+            {
+                const inner = &c.args[0];
+                const inner_counted = switch (inner.*) {
+                    .Binary => |bin| bin.op == .Range,
+                    .Call => |ic| ic.is_infix and ic.args.len == 2 and
+                        ic.callee.* == .Path and ic.callee.Path.segments.len == 1 and
+                        std.mem.eql(u8, ic.callee.Path.segments[0].name, "downTo"),
+                    else => false,
+                };
+                // The floorMod shift below adds k to a |x| < k value; cap
+                // the literal so that sum cannot wrap even in Int domain.
+                if (inner_counted and c.args[1].IntLit.value <= (1 << 30)) {
+                    step_lit = c.args[1].IntLit.value;
+                    iter_shape = inner;
+                }
+            }
+        }
+        switch (iter_shape.*) {
             .Binary => |bin| switch (bin.op) {
                 .Range => {
                     inclusive = true;
@@ -94,6 +124,7 @@ pub fn lowerForLabeled(
             },
             else => {},
         }
+        if (step_lit != 1 and lo_e == null) break :counted;
         var is_int = false;
         var is_long = false;
         if (lo_e != null) {
@@ -143,9 +174,44 @@ pub fn lowerForLabeled(
         const i_reg = b.allocReg();
         try b.push(.{ .Move = .{ .dst = i_reg, .src = lo } });
         const one = if (is_long)
-            try b.emitConst(.{ .Long = 1 })
+            try b.emitConst(.{ .Long = step_lit })
         else
-            try b.emitConst(.{ .Int = 1 });
+            try b.emitConst(.{ .Int = @intCast(step_lit) });
+        // With a step above 1, the equality exit must hit the
+        // progression's real LAST element. kotlinc's overflow-free form
+        // (getProgressionLastElement): the bounds only enter modulo-k
+        // arithmetic, never a wide subtraction —
+        //   asc:  last = hi - floorMod(hi % k - lo % k, k)
+        //   desc: last = hi + floorMod(lo % k - hi % k, k)
+        // floorMod(x, k) for |x| < k is ((x + k) % k); the step-literal
+        // cap above keeps x + k in range. The header's emptiness check
+        // keeps the ORIGINAL bound (the snapped last is meaningless when
+        // the range is empty).
+        var eq_bound = hi;
+        if (step_lit != 1) {
+            const hi_mod = b.allocReg();
+            try b.push(.{ .BinOp = .{ .dst = hi_mod, .op = .Mod, .lhs = hi, .rhs = one } });
+            const lo_mod = b.allocReg();
+            try b.push(.{ .BinOp = .{ .dst = lo_mod, .op = .Mod, .lhs = i_reg, .rhs = one } });
+            const diff = b.allocReg();
+            try b.push(.{ .BinOp = .{
+                .dst = diff,
+                .op = .Sub,
+                .lhs = if (descending) lo_mod else hi_mod,
+                .rhs = if (descending) hi_mod else lo_mod,
+            } });
+            const shifted = b.allocReg();
+            try b.push(.{ .BinOp = .{ .dst = shifted, .op = .Add, .lhs = diff, .rhs = one } });
+            const fmod = b.allocReg();
+            try b.push(.{ .BinOp = .{ .dst = fmod, .op = .Mod, .lhs = shifted, .rhs = one } });
+            eq_bound = b.allocReg();
+            try b.push(.{ .BinOp = .{
+                .dst = eq_bound,
+                .op = if (descending) .Add else .Sub,
+                .lhs = hi,
+                .rhs = fmod,
+            } });
+        }
 
         const header = try b.allocBlock();
         const body_blk = try b.allocBlock();
@@ -189,7 +255,7 @@ pub fn lowerForLabeled(
         b.switchTo(tail_blk);
         if (inclusive) {
             const done = b.allocReg();
-            try b.push(.{ .BinOp = .{ .dst = done, .op = .Eq, .lhs = i_reg, .rhs = hi } });
+            try b.push(.{ .BinOp = .{ .dst = done, .op = .Eq, .lhs = i_reg, .rhs = eq_bound } });
             b.terminate(.{ .Branch = .{ .cond = done, .t = exit, .f = incr } });
         } else {
             b.terminate(.{ .Goto = incr });

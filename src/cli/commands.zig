@@ -536,6 +536,34 @@ fn transpileEmit(
         \\  kv_set_tag(s, KV.tag_long);
         \\}}
         \\
+        \\/* Inlined per-statement trace store: a plain 3-field + presence
+        \\ * write into the frame's cur_span slot (no ownership). */
+        \\static inline void kv_trace(uint8_t *sp, uint32_t f, uint32_t s, uint32_t e) {{
+        \\  memcpy(sp + KV.span_file_off, &f, 4);
+        \\  memcpy(sp + KV.span_start_off, &s, 4);
+        \\  memcpy(sp + KV.span_end_off, &e, 4);
+        \\  sp[KV.span_tag_off] = KV.span_tag_set;
+        \\}}
+        \\
+        \\/* Inlined fused edge guard: poll the flag bytes and call the slow
+        \\ * op only when a trigger fires (bit0 counter cadence, bit1 abandon,
+        \\ * bit2 gc pending, bit3 stress, bit4 idle cadence). Mirrors the
+        \\ * interpreter's fusedEdgeGuard trigger-for-trigger. */
+        \\static inline int32_t kv_edge(void *ctx, klio_edge_view *ev) {{
+        \\  uint32_t r = 0;
+        \\  *ev->counter += 1;
+        \\  if ((*ev->counter & 0xFFFFu) == 0) r |= 1u;
+        \\  if (*ev->abandon_req && (*ev->abandonable || *ev->rb_abandon)) r |= 2u;
+        \\  if (ev->always) r |= 8u;
+        \\  else if (ev->gc_on) {{
+        \\    *ev->idle += 1;
+        \\    if ((*ev->idle & 0xFFFFu) == 0) r |= 16u;
+        \\    if (*ev->gc_pending) r |= 4u;
+        \\  }}
+        \\  if (r) return klio_op_edge_rare(ctx, r);
+        \\  return 0;
+        \\}}
+        \\
         \\
     , .{path}) catch return 1;
 
@@ -605,7 +633,7 @@ fn emitCString(w: anytype, s: []const u8) !void {
 
 fn emitNativeFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams) !void {
     try w.print("/* {s} (fid {d}) */\n", .{ f.fqn, f.id.int() });
-    try w.print("static void kf_{d}(void *ctx, uint32_t entry) {{\n  uint8_t *const regs = klio_op_regs(ctx);\n  (void)regs;\n  switch (entry) {{\n", .{f.id.int()});
+    try w.print("static void kf_{d}(void *ctx, uint32_t entry) {{\n  uint8_t *const regs = klio_op_regs(ctx);\n  (void)regs;\n  uint8_t *const span_slot = KV.span_usable ? klio_op_span_slot(ctx) : 0;\n  (void)span_slot;\n  klio_edge_view EV;\n  klio_op_edge_view(ctx, &EV);\n  switch (entry) {{\n", .{f.id.int()});
     for (fs.streams, 0..) |sopt, bi| {
         if (sopt == null) continue;
         try w.print("  case {d}u: goto B{d};\n", .{ bi, bi });
@@ -660,7 +688,7 @@ fn emitNativeBlock(w: anytype, f: *const ir.Func, st: *const ir.bc.Stream, block
                 pc += 3;
             },
             .trace => {
-                try w.print("  klio_op_trace(ctx, {d}u, {d}u, {d}u);\n", .{ code[pc + 1], code[pc + 2], code[pc + 3] });
+                try w.print("  if (span_slot) kv_trace(span_slot, {d}u, {d}u, {d}u); else klio_op_trace(ctx, {d}u, {d}u, {d}u);\n", .{ code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 1], code[pc + 2], code[pc + 3] });
                 pc += 4;
             },
             .bin => {
@@ -680,7 +708,7 @@ fn emitNativeBlock(w: anytype, f: *const ir.Func, st: *const ir.bc.Stream, block
                 pc += 2;
             },
             .jump => {
-                try w.print("  if (klio_op_edge(ctx)) return;\n  ", .{});
+                try w.print("  if (kv_edge(ctx, &EV)) return;\n  ", .{});
                 try emitEdgeTo(w, fs, code[pc + 1]);
                 try w.print("\n", .{});
                 closed = true;
@@ -821,7 +849,7 @@ fn emitCmpBrSite(w: anytype, fs: *const ir.bc.FuncStreams, block: u32, inst_idx:
         try w.print("        int64_t b = (tr == KV.tag_int) ? (int64_t)kv_int(br_) : kv_long(br_);\n", .{});
         try w.print("        int t = ({s});\n", .{hotLongExpr(kind)});
         try w.print("        kv_set_bool(kv_slot(regs, {d}u), (uint8_t)t);\n", .{dst});
-        try w.print("        if (klio_op_edge(ctx)) return;\n", .{});
+        try w.print("        if (kv_edge(ctx, &EV)) return;\n", .{});
         try w.print("        if (t) ", .{});
         try emitEdgeTo(w, fs, t_block);
         try w.print("\n        else ", .{});

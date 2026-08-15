@@ -345,3 +345,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `member_invariant_arg_delegation.kt` | A private member refuted by an invariant generic argument (`List<IntRange>` vs a mapped `List<LongRange>`) steps aside for the top-level function instead of recursing into itself. |
 | `unconfined_yield_order.kt` | Unconfined runs eagerly through `yield()` on an empty event loop before a default-dispatched sibling starts — U1 U2 L1 L2, verified against kotlinc/JVM. |
 | `cancellable_continuation_save_resume.kt` | A `CancellableContinuation` captured from `suspendCancellableCoroutine` and resumed from the outer body delivers its value intact — verified against kotlinc/JVM. |
+| `step_progression_counted.kt` | Literal-step `..`/`downTo` progressions run as counted register loops with kotlinc's overflow-free last-element snapping — outputs verified against kotlinc/JVM. |

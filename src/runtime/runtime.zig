@@ -231,6 +231,9 @@ pub const clearAbandon = threads_mod.clearAbandon;
 pub const setRunBoundaryAbandon = threads_mod.setRunBoundaryAbandon;
 pub const runBoundaryAbandonActive = threads_mod.runBoundaryAbandonActive;
 pub const shouldAbandon = threads_mod.shouldAbandon;
+pub const abandonablePtr = threads_mod.abandonablePtr;
+pub const runBoundaryAbandonPtr = threads_mod.runBoundaryAbandonPtr;
+pub const abandonRequestedPtr = threads_mod.abandonRequestedPtr;
 
 // safety (host-protection backstops)
 pub const startMemoryWatchdog = safety_mod.startMemoryWatchdog;

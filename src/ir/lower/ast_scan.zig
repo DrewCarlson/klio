@@ -335,10 +335,15 @@ fn scanLambdaRefsExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
             if (t.finally) |fb| try namesReferencedInLambdas(fb.stmts, out);
         },
         .StringTemplate => |st| {
+            // A template is not a lambda: only lambdas INSIDE an interp
+            // expression count. A bare `$name` must not mark the var as
+            // lambda-referenced — that boxed every `var` a same-function
+            // template mentioned, putting a CellGet/CellSet on each hot
+            // access (rangebench's `s` paid one per loop iteration for
+            // the final `println("sum=$s")`).
             for (st.parts) |*p| switch (p.*) {
                 .Interp => |ex| try scanLambdaRefsExpr(ex, out),
-                .ShortInterp => |id| try out.put(id.name, {}),
-                .Text => {},
+                .ShortInterp, .Text => {},
             };
         },
         else => {},
@@ -805,6 +810,47 @@ test "compute boxed vars keeps only captured var decls" {
     defer boxed.deinit();
     try testing.expect(boxed.contains("captured"));
     try testing.expect(!boxed.contains("untouched"));
+}
+
+test "compute boxed vars does not box a var a string template mentions" {
+    // var s = 0; println("sum=$s") — a template is not a lambda; `s`
+    // must stay a plain register (a false box put a CellGet/CellSet on
+    // every hot access of any var a same-function template printed).
+    const lit0 = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
+    var prop_s = ast.Property{
+        .mutable = true,
+        .name = .{ .name = "s", .span = dummySpan() },
+        .receiver_type = null,
+        .ty = null,
+        .init = lit0,
+        .delegate = null,
+        .getter = null,
+        .setter = null,
+        .is_abstract = false,
+        .is_open = false,
+        .is_override = false,
+        .is_lateinit = false,
+        .is_const = false,
+        .is_inline = false,
+        .is_expect = false,
+        .is_actual = false,
+        .setter_visibility = null,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = dummySpan(),
+    };
+    var parts = [_]ast.StringPart{
+        .{ .Text = "sum=" },
+        .{ .ShortInterp = .{ .name = "s", .span = dummySpan() } },
+    };
+    const tmpl = Expr{ .StringTemplate = .{ .parts = &parts, .span = dummySpan() } };
+    var stmts = [_]Stmt{
+        .{ .Decl = .{ .Property = &prop_s } },
+        .{ .Expr = tmpl },
+    };
+    var boxed = try computeBoxedVars(testing.allocator, &stmts);
+    defer boxed.deinit();
+    try testing.expect(!boxed.contains("s"));
 }
 
 test "compute boxed vars boxes a var captured in a by-delegate lambda" {

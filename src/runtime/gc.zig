@@ -332,6 +332,23 @@ pub inline fn pending() bool {
 }
 
 threadlocal var idle_tick: usize = 0;
+
+/// Accessors for the transpiled hot path's inlined edge guard: it
+/// increments `idle_tick` and polls `gc_pending` directly, calling back
+/// only on the probe cadence or a pending collection. Stress modes are
+/// reported so the emitted code takes the full slow path every edge.
+pub fn idleTickPtr() *usize {
+    return &idle_tick;
+}
+pub fn pendingFlagPtr() *const bool {
+    return &gc_pending.raw;
+}
+pub fn stressActive() bool {
+    return gc_stress or gc_stress_every != 0;
+}
+pub fn idleProbeNow() void {
+    idleProbe();
+}
 /// Wall-clock (ms) when the last collection finished; 0 before the first.
 var last_collect_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 /// Live bytes measured by the last collection.
