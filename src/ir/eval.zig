@@ -9021,8 +9021,19 @@ noinline fn execArmStoreToThisOrGlobal(comptime H: type, allocator: Allocator, f
         defer allocator.free(cands);
         const cands_keepalive = pinImplicitCandidates(cands);
         defer runtime.keepaliveRestore(cands_keepalive);
+        // Mirror the read side's capture shadow: a captured enclosing
+        // local (scoped-global layer) takes the write over any non-OWN
+        // receiver's property — `count++` inside a local class must
+        // mutate the captured `count`, not a same-named property on a
+        // dispatch-published chain receiver. `storeGlobal` then writes
+        // through the capture's Cell.
+        var w_capture_shadows = false;
+        if (comptime @hasDecl(H, "scopedLocalBinds")) {
+            w_capture_shadows = host.scopedLocalBinds(name_str);
+        }
         for (cands) |c| {
             if (c.v != .Instance) continue;
+            if (w_capture_shadows and !c.own) continue;
             if (!host.hostHasProperty(&c.v, name_str) and
                 !host.hostHasExtPropSetter(allocator, &c.v, name_str)) continue;
             orAudit("StoreToThisOrGlobal", name_str, "member", c.depth, &c.v);
@@ -9089,7 +9100,15 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
             if (host.scopedLocalBinds(bare0)) {
                 capture_shadows = true;
                 for (cands) |c| {
-                    if (c.v != .Instance or host.hostHasMember(&c.v, bare0)) {
+                    // Only the OWN receiver run's members outrank the
+                    // capture: the class body encloses the captured
+                    // local's scope, but a dispatch-published chain
+                    // receiver's members do not — the local was declared
+                    // lexically inside/after those receivers' scopes
+                    // (`var count = 0; class C { init { count++ } }`
+                    // binds the local even when a chain instance owns a
+                    // `count` member).
+                    if (c.v != .Instance or (c.own and host.hostHasMember(&c.v, bare0))) {
                         capture_shadows = false;
                         break;
                     }
@@ -10382,6 +10401,12 @@ fn implicitThisValue(frame: *const Frame, this_idx: usize, consult_param: bool) 
 const ImplicitCandidate = struct {
     v: Value,
     depth: u16,
+    /// True when this candidate belongs to the frame's OWN receiver run
+    /// (the dispatch `this`, its companion, its class-nesting tower):
+    /// the one run whose class-body scope lexically encloses the
+    /// executing body. Chain entries published by dispatch context are
+    /// not `own` — their members do not outrank a captured local.
+    own: bool = false,
 };
 
 /// Low bits of a `site_cache` word: 2-bit verdict + 8-bit winner index;
@@ -10564,7 +10589,7 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
                     .top_level_extension, .member_extension => true,
                     else => false,
                 };
-                try appendCandidateRun(H, allocator, &out, iv, own_is_subject, &depth, host, bare_name);
+                try appendCandidateRun(H, allocator, &out, iv, own_is_subject, true, &depth, host, bare_name);
             }
         }
     }
@@ -10592,11 +10617,17 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
                     .top_level_extension, .member_extension => true,
                     else => false,
                 };
-                try appendCandidateRun(H, allocator, &out, pv, own_subject, &depth, host, bare_name);
+                try appendCandidateRun(H, allocator, &out, pv, own_subject, true, &depth, host, bare_name);
             }
         }
     }
-    for (entries) |e| try appendCandidateRun(H, allocator, &out, e.v, e.isSubject(), &depth, host, bare_name);
+    for (entries, 0..) |e, ei| {
+        // The innermost chain entry is often the frame's own dispatch
+        // receiver seeded by the invoke path (the dup check above then
+        // skipped the frame-`this` run); it is still the OWN run.
+        const e_own = ei == 0 and inner != null and sameReceiver(e.v, inner.?);
+        try appendCandidateRun(H, allocator, &out, e.v, e.isSubject(), e_own, &depth, host, bare_name);
+    }
     return out.toOwnedSlice(allocator);
 }
 
@@ -10611,6 +10642,7 @@ fn appendCandidateRun(
     out: *std.ArrayList(ImplicitCandidate),
     v: Value,
     is_subject: bool,
+    own: bool,
     depth: *u16,
     host: *H,
     bare_name: []const u8,
@@ -10627,22 +10659,22 @@ fn appendCandidateRun(
     // receiver just means "nothing bound".
     if (v == .Null and !is_subject) return;
     if (v == .Null) {
-        try out.append(allocator, .{ .v = v, .depth = depth.* });
+        try out.append(allocator, .{ .v = v, .depth = depth.*, .own = own });
         depth.* +|= 1;
         return;
     }
     if (out.items.len == 0 or !sameReceiver(out.items[out.items.len - 1].v, v)) {
-        try out.append(allocator, .{ .v = v, .depth = depth.* });
+        try out.append(allocator, .{ .v = v, .depth = depth.*, .own = own });
     }
     depth.* +|= 1;
     if (is_subject) return;
-    try appendCompanionCandidate(H, allocator, out, &v, depth, host, bare_name);
+    try appendCompanionCandidate(H, allocator, out, &v, own, depth, host, bare_name);
     var cur: ?Value = instanceOuter(&v);
     while (cur) |o| {
         if (o == .Null or o == .Unit) break;
-        try out.append(allocator, .{ .v = o, .depth = depth.* });
+        try out.append(allocator, .{ .v = o, .depth = depth.*, .own = own });
         depth.* +|= 1;
-        try appendCompanionCandidate(H, allocator, out, &o, depth, host, bare_name);
+        try appendCompanionCandidate(H, allocator, out, &o, own, depth, host, bare_name);
         cur = instanceOuter(&o);
     }
 }
@@ -10655,13 +10687,14 @@ fn appendCompanionCandidate(
     allocator: Allocator,
     out: *std.ArrayList(ImplicitCandidate),
     v: *const Value,
+    own: bool,
     depth: *u16,
     host: *H,
     bare_name: []const u8,
 ) Allocator.Error!void {
     const comp = (try host.companionWithMember(allocator, v, bare_name)) orelse return;
     if (sameReceiver(comp, v.*)) return;
-    try out.append(allocator, .{ .v = comp, .depth = depth.* });
+    try out.append(allocator, .{ .v = comp, .depth = depth.*, .own = own });
     depth.* +|= 1;
 }
 

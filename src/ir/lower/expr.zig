@@ -2027,7 +2027,8 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // Compare scope tiers and inline the literal when the constant wins
         // (Kotlin inlines const vals at every reference).
         if (b.resolve(name0) == null and !b.knowsOuter(name0) and
-            !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0))
+            !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
+            !build.anonCaptureBinds(name0))
         {
             if (b.module.topLevelConstLiteral(name0, b.self_package, segments[0].span.file)) |cv| {
                 const ptier = b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file) orelse 255;
@@ -2156,6 +2157,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // and a receiver is (or may be bound) in scope, the read decides
         // at runtime instead.
         if (isTopLevelProp(name0) and !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
+            !build.anonCaptureBinds(name0) and
             b.module.classIdExactImport(name0, segments[0].span.file) == null and
             !(inReceiverContext(b) and anyReceiverClassDeclares(b, name0)))
         {
@@ -13600,6 +13602,9 @@ fn lowerDelegateRead(b: *FuncBuilder, name: []const u8) Allocator.Error!?Reg {
     const in_scope = b.resolve(dname_stack) != null;
     const outer = b.knowsOuter(dname_stack);
     if (!in_scope and !outer) return null;
+    // An inner plain binding (a lambda/splice parameter, a shadowing
+    // local) named like the delegated var outranks the delegate read.
+    if (b.plainShadowsDelegate(name, dname_stack)) return null;
     const dname = try b.allocator.dupe(u8, dname_stack);
     const delegate = if (in_scope) b.resolve(dname).? else try resolveCapture(b, dname);
     const null_arg = try b.emitConst(.Null);

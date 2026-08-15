@@ -96,30 +96,34 @@ both suite-level (plugin conformance ratchet):
       a campaign of its own; checkboxLike stays its ratchet test.
       Closure interning at buildClosure is the companion road (UNSOUND
       naively — closures capture the creation-time receiver chain).
-- [ ] CompositionTests remember-family (~8 solo fails:
-      testSimpleRemember, testRememberOneParameter..Five, keyChange,
-      testApplierBeginEndCallbacks) — ROOT DIAGNOSED, campaign-sized:
-      a LOCAL class declared in the compositionTest suspend lambda has
-      its `count++` init resolve `count` through the DYNAMIC runtime
-      receiver chain instead of its lexical scope — the walk finds a
-      REAL `count` member on a scheduler/machinery receiver (=100 after
-      100 virtual frames), and the write falls to the name-keyed global
-      (assert then reads 101). Repro family
-      scratchpad/reprosrc/LocalRememberReproTests.kt (zq-renamed
-      variants pass after the read-tier fix; `count`-named still hit
-      the dynamic-chain member). LANDED SO FAR: bare-name reads now
-      rank an active scoped-capture layer ABOVE implicit receivers'
-      EXTENSION properties (AwaiterQueue's `private inline val
-      Int.count` was hijacking any unresolved `count` via chain Ints).
-      REMAINING (the campaign): (1) receiver-PUBLICATION discipline —
-      seeding local-class instances with a RegisterClass-time chain
-      snapshot was MEASURED NEUTRAL (reverted): the captured chain is
-      itself dynamically over-wide because evtls.active_chain
-      accumulates every published receiver up the call stack; the chain
-      must carry only lexical implicit receivers; (2) scoped-capture
-      layer writes must
-      round-trip through the captured CELL (StoreToThisOrGlobal
-      currently clobbers via storeGlobal); (3) the private
+- [x] CompositionTests remember-family FIXED — 26/26 solo (was ~8
+      fails), LocalRememberReproTests 4/4. Three stacked roots, all
+      landed:
+      (a) OWN-RUN capture shadow: ImplicitCandidate carries an `own`
+      bit (the frame's own dispatch receiver + its companion/nesting
+      tower); a scoped-capture binding now loses only to the OWN run's
+      members — a dispatch-published chain receiver's same-name member
+      no longer outranks a captured local, on the read AND write arms
+      (`count++` in a local-class init binds the captured `count`, and
+      storeGlobal writes through its Cell).
+      (b) runtime-lowered bodies know their CAPTURE NAMES:
+      registerClassCaptured/buildObject install captured_names via
+      build.setLowerAnonCaptureNames; the bare-name classifiers skip
+      top-level-const inline / LoadGlobal binding for captured names
+      (SlotTableEditorTests' file-private `const val count = 100` was
+      const-inlined into another test's local-class init).
+      (c) keyChange: delegated-local param shadow — inside compareBy's
+      spliced `{ a, b -> compareValuesBy(a, b, selector) }`, `a`/`b`
+      resolved to the TEST's `var a by mutableIntStateOf(0)` delegates
+      (getValue → Int) instead of the lambda params;
+      plainShadowsDelegate walks the scope chain in resolve order and
+      an inner plain binding now shadows the delegate read AND
+      setValue write-through. Guard examples:
+      delegated_var_param_shadow.kt, captured_local_shadows_const.kt.
+      Also: intrinsic_host.invokeMethod no longer swallows CalleeFailed
+      into a null dispatch-miss (it masked (c) as
+      "unresolved global sortWith").
+      STILL RECORDED (not blocking any live test here): the private
       member-extension-property visibility gate (plain (recv,name)
       registration leaks program-wide; first gating attempt broke
       JobSupport's `Any?.exceptionOrNull` — needs frame-owner-aware

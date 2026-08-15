@@ -3943,6 +3943,8 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     defer _ = ir.build.setLowerAnonScopeRenames(prev_renames);
     const prev_classes = ir.build.setLowerAnonScopeClasses(scope_classes);
     defer _ = ir.build.setLowerAnonScopeClasses(prev_classes);
+    const prev_caps = ir.build.setLowerAnonCaptureNames(captured_names);
+    defer _ = ir.build.setLowerAnonCaptureNames(prev_caps);
     const obj = expr.ObjectExpr;
     const members = obj.members;
     const supertypes = obj.supertypes;

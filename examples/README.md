@@ -339,3 +339,5 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `named_args_resolved_member_ext.kt` | Named arguments on a lowering-resolved member-extension call bind by parameter name; a named defaulted param after a vararg never lands in the vararg. |
 | `synchronized_nonlocal_return.kt` | `synchronized` releases its monitor on every exit — non-local return and exception included — so a second thread can take the lock afterwards. |
 | `noncallable_capture_member_fallback.kt` | A NON-callable captured local (`val pipeline = pipeline()`) never captures a same-named call inside a receiver lambda — the enclosing class's member binds, as kotlinc resolves. |
+| `delegated_var_param_shadow.kt` | A lambda parameter named like an enclosing `var x by D` local shadows the delegate — `sortedBy`'s comparator params never read the caller's delegated vars through `getValue`. |
+| `captured_local_shadows_const.kt` | A local captured by an anonymous object is the nearest binding in its methods: no const-inline of a same-named top-level `const val`, no capture by a same-named member on a dispatch-published receiver. |

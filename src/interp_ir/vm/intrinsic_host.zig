@@ -714,6 +714,10 @@ pub fn invokeMethod(self: *VmIntrinsicHost, receiver: *const Value, name: []cons
         .ok => |v| RuntimeEvalResult{ .ok = v },
         .err => |e| switch (e) {
             .Throw => |v| RuntimeEvalResult{ .err = .{ .Thrown = v } },
+            // A body that RAN and failed must propagate — falling through
+            // to another dispatch (the SAM `invoke` arm) both hides the
+            // real failure and can re-run side effects.
+            .CalleeFailed => |m| RuntimeEvalResult{ .err = .{ .CalleeFailed = m } },
             else => blk: {
                 if (runtime.envOnce("KLIO_SELDBG") != null) {
                     std.debug.print("[seldbg] invokeMethod {s}: err={s}", .{ name, @tagName(std.meta.activeTag(e)) });
