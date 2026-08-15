@@ -629,9 +629,13 @@ pub fn ObjRef(comptime T: type) type {
         }
 
         /// Increment the strong count and return another handle to the
-        /// same cell.
+        /// same cell. Gated exactly like `deinit`: under reclaim-off (the
+        /// arena and the tracing GC) neither side of the count runs — the
+        /// teardown paths that consult `strongCount` are themselves skipped
+        /// there, so the increment was pure shared-cacheline traffic on
+        /// every handle copy.
         pub fn clone(self: Self) Self {
-            _ = self.cell.refcount.fetchAdd(1, .monotonic);
+            if (reclaim_shared.load(.monotonic)) _ = self.cell.refcount.fetchAdd(1, .monotonic);
             return .{ .cell = self.cell };
         }
 
