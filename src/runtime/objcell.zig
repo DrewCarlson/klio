@@ -214,14 +214,21 @@ const SpinRwLock = struct {
     const WRITER: i32 = std.math.minInt(i32);
 
     fn lockShared(self: *SpinRwLock) void {
+        // Readers enter with one wait-free `fetchAdd`: concurrent readers
+        // never fail each other, where a compare-exchange loop retries on
+        // every neighboring reader and storms exactly when a cell is hot.
+        // Only an active writer (negative state) forces the undo-and-spin.
+        const prev = self.state.fetchAdd(1, .acquire);
+        if (prev >= 0) return;
+        _ = self.state.fetchSub(1, .monotonic);
         while (true) {
+            backoff();
             const s = self.state.load(.monotonic);
             if (s >= 0) {
-                if (self.state.cmpxchgWeak(s, s + 1, .acquire, .monotonic) == null) {
-                    return;
-                }
+                const again = self.state.fetchAdd(1, .acquire);
+                if (again >= 0) return;
+                _ = self.state.fetchSub(1, .monotonic);
             }
-            backoff();
         }
     }
 
@@ -239,7 +246,13 @@ const SpinRwLock = struct {
     }
 
     fn unlockExclusive(self: *SpinRwLock) void {
-        self.state.store(0, .release);
+        // While the writer held the lock, entering readers may have bumped the
+        // state past `WRITER` before undoing (`lockShared`'s fetchAdd). A blind
+        // zero store would erase a bump whose undo is still pending and leave
+        // the state negative forever, so only the writer bit is cleared —
+        // `WRITER` is the sign bit, and the transient reader count rides in the
+        // low bits.
+        _ = self.state.fetchAnd(std.math.maxInt(i32), .release);
     }
 
     inline fn backoff() void {

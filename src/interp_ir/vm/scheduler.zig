@@ -331,6 +331,7 @@ pub const Pool = struct {
         defer runtime.clearThreadName(tid);
         coroutines.gcThreadEnter();
         defer coroutines.gcThreadExit();
+        defer runtime.slab.flushMagazines();
         while (true) {
             var task: Task = blk: {
                 while (true) {

@@ -88,6 +88,23 @@ memory klio-compose-plugin-triage).
             devirtualized `applier.onBeginChanges()` to the interface
             default through final RecordingApplier; guard
             examples/elvis_join_dispatch.kt + lower.expr unit test.
+      - [ ] The 7 concurrent-stress timeouts: verified REAL solo (not
+            census contention). Root mechanism profiled (put_replace as
+            proxy): the run was ATOMICS-BOUND, not interpretation-bound —
+            31% in the slab allocator's per-class spinlock (rawAlloc/
+            rawFree), then the SpinRwLock reader cmpxchg storm, then
+            three global GC external-bytes counters RMW'd on every frame.
+            Landed levers, each re-profiled: per-thread slab magazines
+            (batched refill/flush; flushed at worker exit), wait-free
+            reader entry (fetchAdd + undo; writer unlock clears only the
+            sign bit), per-thread buffered external-bytes deltas (flush
+            at ±256KB, thread exit, and collect start). put_replace
+            24→55 outer iterations per 30s (2.3x). Remaining profile:
+            memset (frame zeroing) ~9%, arg refcount fetchAdd ~9%,
+            shared-instance borrow (setFieldInner) ~10%, prog/classes
+            registry read locks ~10%. The tests still exceed their
+            declared runTest timeouts interpreted; next levers listed
+            in the same profile order.
 - [ ] B3. The 3 DNC heavy classes: get them completing under caps that
       match their compute (the suite-wall profile says benchmark-shaped
       tests set the floor, not the tooling).

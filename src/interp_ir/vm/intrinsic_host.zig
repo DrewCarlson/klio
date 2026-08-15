@@ -906,6 +906,7 @@ fn publishThreadResult(threads: root.ThreadTable, id: u64, result: ThreadResult)
 
 fn workerEntry(wargs: WorkerArgs) void {
     var args = wargs;
+    defer runtime.slab.flushMagazines();
     // The seed allocator is about to back every allocation this worker
     // makes and its `vm.deinit()`; the invariants it relies on are
     // documented on `assertSpawnAllocatorInvariant`.

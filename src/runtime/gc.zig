@@ -269,11 +269,8 @@ pub fn register(h: *GcHeader, bytes: usize) void {
 /// re-marks the whole chain quadratically).
 pub fn noteExternalBytes(bytes: usize) void {
     if (!gc_enabled) return;
-    _ = external_live.fetchAdd(bytes, .monotonic);
-    const mprev = bytes_since_major.fetchAdd(bytes, .monotonic);
-    if (mprev +| bytes >= major_threshold) major_pending.store(true, .monotonic);
-    const prev = bytes_since_gc.fetchAdd(bytes, .monotonic);
-    if (prev +| bytes >= threshold) gc_pending.store(true, .monotonic);
+    ext_delta += @as(isize, @intCast(@min(bytes, std.math.maxInt(isize))));
+    if (ext_delta >= EXT_FLUSH) flushExternalDelta();
 }
 
 /// External (non-registry) bytes released back — keeps `external_live`
@@ -288,9 +285,41 @@ pub fn noteExternalBytes(bytes: usize) void {
 /// registry cells keep gross accounting (their garbage does accumulate).
 pub fn noteExternalFreed(bytes: usize) void {
     if (!gc_enabled) return;
-    subSaturating(&external_live, bytes);
-    subSaturating(&bytes_since_gc, bytes);
-    subSaturating(&bytes_since_major, bytes);
+    ext_delta -= @as(isize, @intCast(@min(bytes, std.math.maxInt(isize))));
+    if (ext_delta <= -EXT_FLUSH) flushExternalDelta();
+}
+
+/// Per-thread NET unflushed external bytes. Frame buffers churn at call
+/// rate on every worker thread; paying three global atomic RMWs per note
+/// made the shared counters the hottest cachelines in a concurrent run.
+/// Deltas accumulate thread-locally and reach the shared counters in
+/// `EXT_FLUSH`-sized batches — a frame allocated and freed inside one
+/// window now costs the counters nothing, which is exactly the NET-growth
+/// accounting the trigger wants. Worst-case trigger lag is `EXT_FLUSH`
+/// per live thread, well under the Appel thresholds.
+threadlocal var ext_delta: isize = 0;
+const EXT_FLUSH: isize = 256 * 1024;
+
+/// Push this thread's buffered delta into the shared counters. Called on
+/// the flush cadence, at worker-thread exit, and by the collector for its
+/// own thread before it reads `external_live`.
+pub fn flushExternalDelta() void {
+    const d = ext_delta;
+    if (d == 0) return;
+    ext_delta = 0;
+    if (d > 0) {
+        const b: usize = @intCast(d);
+        _ = external_live.fetchAdd(b, .monotonic);
+        const mprev = bytes_since_major.fetchAdd(b, .monotonic);
+        if (mprev +| b >= major_threshold) major_pending.store(true, .monotonic);
+        const prev = bytes_since_gc.fetchAdd(b, .monotonic);
+        if (prev +| b >= threshold) gc_pending.store(true, .monotonic);
+    } else {
+        const b: usize = @intCast(-d);
+        subSaturating(&external_live, b);
+        subSaturating(&bytes_since_gc, b);
+        subSaturating(&bytes_since_major, b);
+    }
 }
 
 /// Subtract without ever going below zero. The clamp has to be part of the
@@ -628,6 +657,10 @@ fn collectImpl(force_major: bool) void {
         return;
     }
     defer gc_lock.unlock();
+    // The collector's own buffered external delta joins the shared counters
+    // before the threshold math reads them (other threads' buffers are
+    // unreachable threadlocals; their bounded lag is accepted).
+    flushExternalDelta();
 
     // Stop the world: signal every other registered mutator to park at its next
     // safe point, then wait until all of them are parked (or in a blocking-safe
