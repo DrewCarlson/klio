@@ -4768,6 +4768,15 @@ pub const Module = struct {
             if ((kind != .top_level_extension and !is_member_extension) or
                 f.params.len == 0 or
                 !std.mem.eql(u8, f.params[0].name, "this")) continue;
+            // `@Deprecated(level = ERROR|HIDDEN)` is UN-CALLABLE at any
+            // site that does not `@Suppress("DEPRECATION_ERROR")`: kotlinc
+            // reports an error rather than binding it, so it must never be
+            // a static commit — not even as a sole survivor after a member
+            // refutation (the stdlib's Java-compat
+            // `MutableList<T>.remove(index: Int) = removeAt(index)` bound
+            // `subList.remove(3)` to REMOVE-AT semantics through exactly
+            // that hole).
+            if (f.deprecated_error and !suppress_deprecation_error) continue;
             // Ordered named arguments bind by parameter IDENTITY, and may
             // skip parameters Kotlin fills from defaults: `rangesDelimitedBy(
             // delimiters, ignoreCase = x, limit = y)` skips the defaulted
