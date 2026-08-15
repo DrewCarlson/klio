@@ -1131,7 +1131,9 @@ fn bareGlobalFnVisible(self: *VmHost, m: *const Module, fid: FuncId, name: []con
 /// binding `callFuncTyped` installs, exposed for dispatch sites that must
 /// keep the normal member walk (its enclosing pushes) while a committed
 /// inline member's reified parameters stay live.
-pub fn bindTypeParamGlobal(self: *VmHost, tp_name: []const u8, arg_name: []const u8) ?Value {
+pub fn bindTypeParamGlobal(self: *VmHost, tp_name: []const u8, arg_name_in: []const u8) ?Value {
+    // A stamped generic spelling (`List<Int>`) resolves its class by head.
+    const arg_name = if (std.mem.indexOfScalar(u8, arg_name_in, '<')) |lt| arg_name_in[0..lt] else arg_name_in;
     const cls_value: ?Value = blk: {
         const cg = self.classes.borrow();
         defer cg.deinit();

@@ -234,15 +234,96 @@ tests): 322/444 passing at the start of this stretch.
       green). One trap: a speculative include (IpParser.kt) pulled the
       unconsumed parsing DSL and broke the whole bake — add only files
       a failing test names, drop on bake error.
-- [ ] Remaining 44 real fails + 2 timeout classes, clustered:
-      ConcurrentSetTest 9, ChannelTest 7, CookieDateParser 3,
-      DataConversion 3, ReadLine tail 3, misc singles;
-      CoroutinesTest + PipelineTest hit the 180s census cap.
+- [x] Interpreter root-causes landed off the cluster list (each with a
+      guard example; commits 21186c6e, 44471f59, eac108fa):
+      * anon-object method params typed by the ENCLOSING declaration's
+        type params registered + consulted in the anon disproof, so an
+        unrelated class named `Key` no longer refutes `add(element: Key)`
+        (ConcurrentSetTest 1/10 -> 10/10).
+      * `return@inlineFn` across nested inline splices resolves at
+        lowering (InlineReturn carries the fn name), and a label crossing
+        a REAL frame inside a spliced body is absorbed by a runtime
+        `Block.lr_absorb` region at the splice join (CookieDateParser
+        4/4). Image FORMAT_VERSION 45 -> 46.
+      * companion members through the class name bind with a leading
+        defaulted param skipped (trailing-lambda pmo remap + named-ladder
+        companion forwarding): `StringValues.build { }`, `Parameters
+        .build { }` (UrlTest testEncoding included).
+      * intrinsic applicability predicates consulted unconditionally;
+        `String.repeat` declines non-(Int) calls — a bare `repeat(n){}`
+        against an in-scope String receiver silently NO-OPED (this also
+        produced the CookieDateParser NumberFormatException).
+      * `typeOf<T>()` carries generic ARGUMENTS end-to-end (full-spelling
+        reified stamps + KTypeProjection materialisation)
+        (DataConversion 4/4); tuple `contains` dispatches user equals
+        through Pair components (MimesTest 3/3).
+      * `object : Iface by <expr> {}` evaluates the delegate through a
+        site-cached thunk (SinkByteWriteChannel 4/4); KClass.isInstance
+        agrees with `is` via the registry walk (ByteChannel 13/13).
+      * `io/ktor/util/ByteChannels.kt` include (copyToBoth; ChannelTest
+        21/22 -> full class green).
+- [x] Second interpreter batch (commits 44471f59, eac108fa, 036aa54a,
+      3776afc5): full-spelling reified stamps + KType arguments; tuple
+      contains via user equals; anon-object interface delegation thunks;
+      KClass.isInstance registry walk; spliced-receiver-lambda bare reads
+      prefer a window member the head declares (the whole URLBuilder
+      `parameters`-as-Function family); trailing-vararg element
+      adjudication + Pair-component disproof (StringValues 9/9); range
+      literal peer widening (list-of-ranges vs Long peer).
+- [ ] Census after all fixes: **463 passed / 4 failed / ZERO incomplete**
+      (was 322/444-ish at the stretch start; the deadlocked classes'
+      tests now all count and PipelineTest is 18/18 in 10s). Latest
+      landing (e2200304): CallValueOrMember's non-invocable arm walks the
+      outer implicit receivers on the canonical miss — a NON-callable
+      captured local (val pipeline = pipeline()) no longer strands the
+      enclosing member. LANDMARK (704597a0):
+      the inline `synchronized` actual leaked its monitor on NON-LOCAL
+      RETURN/exception exits; TestCoroutineScheduler.tryRunNextTaskUnless
+      returns from inside synchronized(lock), so under runTest the root
+      thread owned the scheduler lock forever and every cross-thread
+      resume spun in registerEvent's monitorEnter — the ENTIRE
+      GlobalScope.writer/reader deadlock family. try/finally fixed it:
+      CoroutinesTest 2/2, WriterReaderTest 4/4, PipelineTest completes
+      solo at 14/18 (census 180s cap still cuts it; its 3 `pipeline()`
+      member misses on DebugPipelineContext = the receiver-publication
+      campaign — the intercept lambda's dynamic chain lacks the lexical
+      test-class this; +1 asyncFork daemon-abandonment tail). Pack-baked
+      splices carry the old enter/exit sequence until rebuilt. Landed since the 435
+      snapshot: named args on RESOLVED member calls bind by name
+      (ReadLineTest 25/25 with the exact-limit pair), partial-index
+      overload repick + eager unresolved-param gate
+      (ByteReadChannel(byteArray) overload), and the pack-scale
+      String-factory scope fix (plans/repros/pack_scale_repeat_echo.md —
+      RESOLVED; shadowedByClass now tier-filters factory competitors,
+      fixing "A".repeat receiver-echo in fully-loaded homes and both
+      remaining ReadLine/Utf8 limit tests). The tail:
+      * ReadLineTest 3 + ReadUtf8LineTest 1 — suspend-resume local
+        corruption family (`readBuffer.buffer` reads a ByteArray /
+        `.length` on Int AFTER an awaitContent resume in a frame with
+        local fns + local extension fns — repro scratchpad/rl1.kt).
+      * URLBuilderTest 2 (scheme-with-digits) — matches Kotlin semantics:
+        upstream URLProtocol's own `require(name.all { it.isLowerCase() })`
+        rejects digit schemes on the JVM too (verified against
+        Character.isLowerCase); how upstream CI passes these is unclear —
+        do NOT "fix" klio to diverge.
+      * CodecTest.testFormUrlEncode + RangesTest.testResolveRanges —
+        BATCH-CONTEXT resolution pollution: both PASS single-file and
+        fail only when the utils tests (kotlinx.coroutines imports) are
+        compiled alongside; formUrlEncodeTo's inner chain then carries a
+        stale `declared=Flow` static-receiver stamp, and assertEquals
+        self-recurses ~39 deep (frame `RangesTest.assertEquals` at the
+        mapTo splice span) until the depth cap.
+      * CoroutinesTest (GlobalScope.writer/reader deadlock — parks with
+        ~2s user time over minutes; task #31 territory), PipelineTest,
+        WriterReaderTest — INCOMPLETE at the census cap.
+      * Side find: the fast/flat call path skips the generic Int/Long
+        PEER widening entirely (`eq(0, 0L)` is false where kotlinc says
+        true) — small, recorded, unfixed.
 - [ ] Risk note: the widened includes are validated by the commontest
       census only; the ktor_server/client e2e itests gate them in CI.
 
-State: mapped and half-fixed; the remaining fails are real per-class
-interpreter/library bugs with logs under the census recipe.
+State: the big clusters are fixed at interpreter root-cause; the tail is
+enumerated above with repros.
 
 ## 5. Suite-wall profile
 

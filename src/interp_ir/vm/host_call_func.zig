@@ -275,16 +275,65 @@ fn narrowIntListArg(param_ty: *const TypeRef, arg: *const Value) void {
 /// registered class when one exists (else a minimal KClass), `arguments` is
 /// the empty list, `isMarkedNullable` mirrors a trailing `?`.
 fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Allocator.Error!Value {
-    const nullable = std.mem.endsWith(u8, type_name, "?");
-    const base = if (nullable) type_name[0 .. type_name.len - 1] else type_name;
+    if (runtime.envOnce("KLIO_KTYPE_TRACE") != null) {
+        const in_fn = if (ir.eval.currentFrameFunc()) |f| f.name else "-";
+        std.debug.print("[ktype] raw='{s}' in_fn={s}\n", .{ type_name, in_fn });
+    }
+    const trimmed = std.mem.trim(u8, type_name, " ");
+    const nullable = std.mem.endsWith(u8, trimmed, "?");
+    const base = if (nullable) trimmed[0 .. trimmed.len - 1] else trimmed;
+    // Split `Head<A, B>` so the classifier resolves the head and the generic
+    // arguments materialise as `KTypeProjection`s — `typeInfo<List<Int>>()`
+    // consumers read `kotlinType.arguments.single().type.classifier`
+    // (ktor's DefaultConversionService list decode was the live case).
+    var head = base;
+    var generic_args: ?[]const u8 = null;
+    if (std.mem.indexOfScalar(u8, base, '<')) |lt| {
+        if (std.mem.lastIndexOfScalar(u8, base, '>')) |gt| {
+            if (gt > lt) {
+                head = base[0..lt];
+                generic_args = base[lt + 1 .. gt];
+            }
+        }
+    }
     const classifier: Value = blk: {
         const cg = self.classes.borrow();
         defer cg.deinit();
-        if (cg.get().get(base)) |c| break :blk Value{ .Class = c.clone() };
-        break :blk try host_call_member.syntheticClassFromFqn(allocator, base);
+        if (cg.get().get(head)) |c| break :blk Value{ .Class = c.clone() };
+        break :blk try host_call_member.syntheticClassFromFqn(allocator, head);
     };
-    const empty_args: Value = try Value.newList(allocator, .{
-        .items = try ValueList.init(allocator, .empty),
+    var args_accum: std.ArrayList(Value) = .empty;
+    if (generic_args) |ga| {
+        var depth: usize = 0;
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i <= ga.len) : (i += 1) {
+            const at_end = i == ga.len;
+            const c: u8 = if (at_end) ',' else ga[i];
+            if (c == '<') depth += 1;
+            if (c == '>' and depth > 0) depth -= 1;
+            if (c == ',' and depth == 0) {
+                const piece = std.mem.trim(u8, ga[start..i], " ");
+                start = i + 1;
+                if (piece.len == 0) continue;
+                var view0 = VmIntrinsicHost.borrowed(vmhost.SharedHandles.fromHost(self));
+                const pid = intrinsic_host.allocInstanceId(&view0);
+                // A star projection carries no type; anything else nests a
+                // full KType so consumers can recurse.
+                const proj_ty: Value = if (std.mem.eql(u8, piece, "*"))
+                    .Null
+                else
+                    try makeKTypeValue(self, allocator, piece);
+                const pfields = [_]InstanceData.Field{
+                    .{ .name = "type", .value = proj_ty },
+                };
+                const proj = try intrinsic_host.newSynthInstance(&view0, "kotlin.reflect.KTypeProjection", pid, &pfields);
+                try args_accum.append(allocator, proj);
+            }
+        }
+    }
+    const args_value: Value = try Value.newList(allocator, .{
+        .items = try ValueList.init(allocator, args_accum),
         .mutable = false,
         .enum_entries = false,
         .backing = null,
@@ -293,7 +342,7 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
     const id = intrinsic_host.allocInstanceId(&view);
     const fields = [_]InstanceData.Field{
         .{ .name = "classifier", .value = classifier },
-        .{ .name = "arguments", .value = empty_args },
+        .{ .name = "arguments", .value = args_value },
         .{ .name = "isMarkedNullable", .value = .{ .Bool = nullable } },
     };
     return intrinsic_host.newSynthInstance(&view, "kotlin.reflect.KType", id, &fields);
@@ -2528,8 +2577,11 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
     var saved: std.ArrayList(Saved) = .empty;
     defer saved.deinit(allocator);
     for (names, 0..) |type_name, idx| {
-        const arg_name: []const u8 = if (idx < type_args.len) type_args[idx] else "";
-        if (arg_name.len == 0) continue;
+        const arg_full: []const u8 = if (idx < type_args.len) type_args[idx] else "";
+        if (arg_full.len == 0) continue;
+        // A stamped generic spelling (`List<Int>`) resolves its CLASS by the
+        // head; the full spelling is for KType materialisation only.
+        const arg_name = if (std.mem.indexOfScalar(u8, arg_full, '<')) |lt| arg_full[0..lt] else arg_full;
         // Class table first: a type argument names a type, so it binds the
         // `.Class` value even when the bare name's global is a constructor
         // intrinsic (exception classes). This is the same identity the

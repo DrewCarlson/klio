@@ -3780,10 +3780,15 @@ fn anonSiteName(expr: *const ast.Expr) []const u8 {
 const AnonComplexInit = struct { name: []const u8, module: ObjRef(Module), func: FuncId };
 const AnonInitThunk = struct { module: ObjRef(Module), func: FuncId, prop_pos: usize };
 const AnonSuperArgThunk = struct { module: ObjRef(Module), func: FuncId };
+/// One `object : Iface by <expr> {}` delegate initializer, parallel to the
+/// site's supertype list; null when the slot has no delegate or a bare
+/// captured name serves it directly.
+const AnonDelegateThunk = struct { module: ObjRef(Module), func: FuncId };
 const AnonSiteThunks = struct {
     complex_prop_inits: []const AnonComplexInit,
     init_thunks: []const AnonInitThunk,
     super_arg_thunks: []const []const ?AnonSuperArgThunk,
+    delegate_thunks: []const ?AnonDelegateThunk = &.{},
 };
 var anon_site_thunks: std.AutoHashMapUnmanaged(usize, AnonSiteThunks) = .empty;
 var anon_site_thunks_root_registered = std.atomic.Value(bool).init(false);
@@ -3801,6 +3806,7 @@ fn gcMarkAnonSites(m: *runtime.gc.Marker) void {
         for (t.super_arg_thunks) |slots| {
             for (slots) |s| if (s) |th| m.shade(&th.module.cell.hdr);
         }
+        for (t.delegate_thunks) |s| if (s) |th| m.shade(&th.module.cell.hdr);
     }
 }
 
@@ -3833,6 +3839,7 @@ pub fn resetAnonSiteCache() void {
             if (t.init_thunks.len != 0) pa.free(t.init_thunks);
             for (t.super_arg_thunks) |slots| if (slots.len != 0) pa.free(slots);
             if (t.super_arg_thunks.len != 0) pa.free(t.super_arg_thunks);
+            if (t.delegate_thunks.len != 0) pa.free(t.delegate_thunks);
         }
         anon_site_thunks.clearAndFree(pa);
     }
@@ -4242,10 +4249,12 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     var complex_prop_inits: []const AnonComplexInit = &.{};
     var init_thunks: []const AnonInitThunk = &.{};
     var super_arg_thunks: []const []const ?AnonSuperArgThunk = &.{};
+    var delegate_thunks: []const ?AnonDelegateThunk = &.{};
     if (anonSiteThunksGet(site_key)) |cached| {
         complex_prop_inits = cached.complex_prop_inits;
         init_thunks = cached.init_thunks;
         super_arg_thunks = cached.super_arg_thunks;
+        delegate_thunks = cached.delegate_thunks;
         ir.lower.setLowerAnonCaptures(null);
     } else {
         anonLowerEnter();
@@ -4360,6 +4369,30 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 super_local[si] = slots;
             }
         }
+
+        // Supertype-delegate initializers (`object : Iface by <expr> {}`):
+        // anything past a bare captured name evaluates through a lowered
+        // thunk against the ENCLOSING scope, like a super-ctor arg. The
+        // result lands in the `__delegate__<Iface>` field below.
+        const del_local = try allocator.alloc(?AnonDelegateThunk, supertypes.len);
+        {
+            var no_members2 = StringSet.init(allocator);
+            defer no_members2.deinit();
+            for (supertypes, 0..) |_, si| {
+                del_local[si] = null;
+                if (si >= obj.supertype_delegates.len) continue;
+                const de = obj.supertype_delegates[si] orelse continue;
+                if (bareCaptureResolvable(&de, capture_pairs)) continue;
+                const thunk_name: ast.Ident = .{
+                    .name = try std.fmt.allocPrint(allocator, "$delegate${d}", .{si}),
+                    .span = obj.span,
+                };
+                const thunk = synthThunk(thunk_name, .{ .Expr = de }, null, false);
+                const sub_ref = try anonSiteModule(self, allocator, &site_mod);
+                const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &no_members2);
+                del_local[si] = .{ .module = sub_ref, .func = func.id };
+            }
+        }
         ir.lower.setLowerAnonCaptures(null);
 
         // Copy the spines into permanent storage so `gcMarkAnonSites` can read
@@ -4370,6 +4403,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         const it_perm = pa.dupe(AnonInitThunk, init_local.items) catch @panic("KGC: anon-site thunk cache alloc failed");
         const sat_perm = pa.alloc([]const ?AnonSuperArgThunk, super_local.len) catch @panic("KGC: anon-site thunk cache alloc failed");
         for (super_local, 0..) |slots, i| sat_perm[i] = pa.dupe(?AnonSuperArgThunk, slots) catch @panic("KGC: anon-site thunk cache alloc failed");
+        const del_perm = pa.dupe(?AnonDelegateThunk, del_local) catch @panic("KGC: anon-site thunk cache alloc failed");
         // The per-call spine arrays are dead now (the modules they referenced
         // live on, by value, in the permanent copies).
         if (runtime.freeScratch()) {
@@ -4377,15 +4411,18 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             init_local.deinit(allocator);
             for (super_local) |slots| allocator.free(slots);
             allocator.free(super_local);
+            allocator.free(del_local);
         }
         const winner = anonSiteThunksPut(site_key, .{
             .complex_prop_inits = cpi_perm,
             .init_thunks = it_perm,
             .super_arg_thunks = sat_perm,
+            .delegate_thunks = del_perm,
         });
         complex_prop_inits = winner.complex_prop_inits;
         init_thunks = winner.init_thunks;
         super_arg_thunks = winner.super_arg_thunks;
+        delegate_thunks = winner.delegate_thunks;
     }
 
     // The anon ClassDef is site-stable: on a hit, reuse the one a prior
@@ -4798,10 +4835,20 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         for (supertypes, 0..) |*sup, i| {
             if (i >= delegates.len) break;
             const de = delegates[i] orelse continue;
-            const dv: ?Value = switch (de) {
+            var dv: ?Value = switch (de) {
                 .Path => |p| if (p.segments.len == 1) findCapture(capture_pairs, p.segments[0].name) else null,
                 else => null,
             };
+            // Any other delegate expression (`object : RawSink by Buffer()
+            // {}`) evaluates through its site-cached thunk.
+            if (dv == null and i < delegate_thunks.len) {
+                if (delegate_thunks[i]) |th| {
+                    switch (try runAnonThunk(self, allocator, th.module, th.func, &inst_value, capture_pairs)) {
+                        .ok => |v2| dv = v2,
+                        .err => |e| return .{ .err = e },
+                    }
+                }
+            }
             const v = dv orelse continue;
             const key = try std.fmt.allocPrint(allocator, "__delegate__{s}", .{sup.name.name});
             v.retain();

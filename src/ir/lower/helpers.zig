@@ -437,10 +437,42 @@ pub fn internTypeArgsScoped(
     if (type_args.len == 0) return &.{};
     const out = try b.allocator.alloc(ConstId, type_args.len);
     for (type_args, out) |t, *slot| {
-        const nm = expr_mod.scopeTypeRename(b, t.name.name, t.name.span.file.int()) orelse t.name.name;
-        slot.* = try b.module.internConst(b.allocator, .{ .String = nm });
+        // A bare name matching an active splice's reified parameter means
+        // the bound ACTUAL (lexical substitution) — `typeOf<T>()` inside a
+        // spliced `typeInfo<List<Int>>()` stamps `List<Int>` even when the
+        // callee's type params are registered in another module's registry.
+        const nm = b.resolveReifiedTypeName(t.name.name) orelse
+            (expr_mod.scopeTypeRename(b, t.name.name, t.name.span.file.int()) orelse t.name.name);
+        // A nested-generic argument (`typeOf<List<Int>>()`) stamps its FULL
+        // spelling so runtime KType materialisation sees the arguments;
+        // class-resolving consumers strip at `<`. Plain heads stamp as-is.
+        const full = if (t.type_args.len == 0) nm else try renderFullTypeArg(b, nm, &t);
+        slot.* = try b.module.internConst(b.allocator, .{ .String = full });
     }
     return out;
+}
+
+fn renderFullTypeArg(b: *FuncBuilder, head: []const u8, t: *const ast.TypeRef) Allocator.Error![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(b.allocator, head);
+    try buf.append(b.allocator, '<');
+    for (t.type_args, 0..) |*ta, i| {
+        if (i != 0) try buf.appendSlice(b.allocator, ", ");
+        if (ta.is_star) {
+            try buf.append(b.allocator, '*');
+            continue;
+        }
+        const inner_head = b.resolveReifiedTypeName(ta.ty.name.name) orelse
+            (expr_mod.scopeTypeRename(b, ta.ty.name.name, ta.ty.name.span.file.int()) orelse ta.ty.name.name);
+        const inner = if (ta.ty.type_args.len == 0) blk: {
+            if (!ta.ty.nullable) break :blk inner_head;
+            break :blk try std.fmt.allocPrint(b.allocator, "{s}?", .{inner_head});
+        } else try renderFullTypeArg(b, inner_head, &ta.ty);
+        try buf.appendSlice(b.allocator, inner);
+    }
+    try buf.append(b.allocator, '>');
+    if (t.nullable) try buf.append(b.allocator, '?');
+    return buf.toOwnedSlice(b.allocator);
 }
 
 pub fn astBinop(op: AstBinOp) BinOp {
