@@ -274,7 +274,19 @@ tests): 322/444 passing at the start of this stretch.
       `parameters`-as-Function family); trailing-vararg element
       adjudication + Pair-component disproof (StringValues 9/9); range
       literal peer widening (list-of-ranges vs Long peer).
-- [ ] Census after all fixes: **464 passed / 3 failed / ZERO incomplete**
+- [x] FINAL census: **465 passed / 2 failed / ZERO incomplete** — the 2
+      = URLBuilder scheme-with-digits (klio MATCHES Kotlin; do not
+      "fix"). RangesTest.testResolveRanges CLOSED (27/27 solo): the
+      self-recursive member bind now defers to the runtime walk when an
+      argument's generic content is unresolved (`List<*>` from the
+      un-derived map), and argDefinitelyNotParamType refutes a List of
+      Long-kind Ranges against an invariant `List<IntRange>` param, so
+      the walk binds kotlin.test.assertEquals exactly as kotlinc does
+      (guard: examples/member_invariant_arg_delegation.kt). The
+      fast/flat `eq(0, 0L)` peer-widening gap is ALSO fixed
+      (leafExprServeAt applies coercePlanFor; guard:
+      examples/generic_literal_long_widening.kt).
+- [x] Census before those last fixes: 464 passed / 3 failed / 0 incomplete
       (was 322/444-ish at the stretch start; the deadlocked classes'
       tests now all count and PipelineTest is 18/18 in 10s). Latest
       landing (e2200304): CallValueOrMember's non-invocable arm walks the
@@ -315,25 +327,13 @@ tests): 322/444 passing at the start of this stretch.
         receiver (kotlinx's deprecated `Flow.flatMap` was the sole
         bodied 1-arg candidate in the pack universe and stamped
         `declared=Flow` on a Set-receiver chain).
-      * RangesTest.testResolveRanges — mechanism FULLY diagnosed, one
-        gap left: the test's `private fun assertEquals(List<IntRange>,
-        List<LongRange>)` delegates to kotlin.test's via
-        `assertEquals(expected.map { it.toLong() }, actual)`; kotlinc
-        rejects the member (invariant generic args), klio's static
-        member bind sees compat=unknown (the mapped arg's static type
-        does not derive because `IntRange.toLong` is an UN-ANNOTATED
-        private member-extension expression body) and binds the member
-        -> self-recursion to the depth cap. Standalone repro
-        scratchpad/ae1.kt (no packs needed). Fix roads: derive the
-        member-ext expression-body return on demand at that site, or
-        strengthen the member-bind compat's .incompatible gate for
-        same-head containers with concrete differing args.
+      * RangesTest.testResolveRanges — FIXED (27/27 solo; see the final
+        census entry above for the two-layer mechanism).
       * CoroutinesTest (GlobalScope.writer/reader deadlock — parks with
         ~2s user time over minutes; task #31 territory), PipelineTest,
         WriterReaderTest — INCOMPLETE at the census cap.
-      * Side find: the fast/flat call path skips the generic Int/Long
-        PEER widening entirely (`eq(0, 0L)` is false where kotlinc says
-        true) — small, recorded, unfixed.
+      * Side find: fast/flat `eq(0, 0L)` peer widening — FIXED
+        (leafExprServeAt applies the coerce plan).
 - [ ] Risk note: the widened includes are validated by the commontest
       census only; the ktor_server/client e2e itests gate them in CI.
 

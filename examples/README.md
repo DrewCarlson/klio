@@ -342,3 +342,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `delegated_var_param_shadow.kt` | A lambda parameter named like an enclosing `var x by D` local shadows the delegate — `sortedBy`'s comparator params never read the caller's delegated vars through `getValue`. |
 | `captured_local_shadows_const.kt` | A local captured by an anonymous object is the nearest binding in its methods: no const-inline of a same-named top-level `const val`, no capture by a same-named member on a dispatch-published receiver. |
 | `generic_literal_long_widening.kt` | An integer literal in a shared type-variable slot beside a `Long` peer is typed `Long` — `eq(0, 0L)` is true on the framed path and the leaf expression-body serve alike. |
+| `member_invariant_arg_delegation.kt` | A private member refuted by an invariant generic argument (`List<IntRange>` vs a mapped `List<LongRange>`) steps aside for the top-level function instead of recursing into itself. |
