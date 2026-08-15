@@ -341,3 +341,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `noncallable_capture_member_fallback.kt` | A NON-callable captured local (`val pipeline = pipeline()`) never captures a same-named call inside a receiver lambda — the enclosing class's member binds, as kotlinc resolves. |
 | `delegated_var_param_shadow.kt` | A lambda parameter named like an enclosing `var x by D` local shadows the delegate — `sortedBy`'s comparator params never read the caller's delegated vars through `getValue`. |
 | `captured_local_shadows_const.kt` | A local captured by an anonymous object is the nearest binding in its methods: no const-inline of a same-named top-level `const val`, no capture by a same-named member on a dispatch-published receiver. |
+| `generic_literal_long_widening.kt` | An integer literal in a shared type-variable slot beside a `Long` peer is typed `Long` — `eq(0, 0L)` is true on the framed path and the leaf expression-body serve alike. |

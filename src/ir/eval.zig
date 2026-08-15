@@ -2673,25 +2673,7 @@ const Frame = struct {
         // The coercion walks trigger only on specific declared param shapes;
         // compute once per func which can ever apply (filled in place under
         // the same benign-race convention as `fast_call`).
-        var plan = func.coerce_plan;
-        if (plan == 0) {
-            plan = 1;
-            for (func.params) |*p| {
-                if (!p.is_vararg and !p.ty.nullable and std.mem.eql(u8, p.ty.name, "Long")) {
-                    plan |= 2;
-                    break;
-                }
-            }
-            if (func.params.len >= 2) {
-                for (func.params) |*p| {
-                    if (!p.ty.nullable and isFuncTypeParam(module, func, p.ty.name)) {
-                        plan |= 4;
-                        break;
-                    }
-                }
-            }
-            @constCast(func).coerce_plan = plan;
-        }
+        const plan = coercePlanFor(module, func);
         if (plan & 2 != 0) coerceIntArgsToLong(func, params.items);
         if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, params.items);
         dispatchBump(.frame_push);
@@ -2899,6 +2881,31 @@ fn isFuncTypeParam(module: *const Module, func: *const Func, name: []const u8) b
 /// generic body's boxed `T == T` comparison sees two `Long`s. Only the
 /// literal-coercion shape this captures can produce an `Int`/`Long` mix in a
 /// shared type variable in valid Kotlin, so the widen is always safe.
+/// The cached literal-coercion plan for `func`: bit 1 = computed, bit 2 =
+/// a declared non-nullable `Long` param (coerceIntArgsToLong), bit 4 = a
+/// type-variable param beside a peer (coerceGenericIntPeersToLong).
+fn coercePlanFor(module: *const Module, func: *const Func) u8 {
+    var plan = func.coerce_plan;
+    if (plan != 0) return plan;
+    plan = 1;
+    for (func.params) |*p| {
+        if (!p.is_vararg and !p.ty.nullable and std.mem.eql(u8, p.ty.name, "Long")) {
+            plan |= 2;
+            break;
+        }
+    }
+    if (func.params.len >= 2) {
+        for (func.params) |*p| {
+            if (!p.ty.nullable and isFuncTypeParam(module, func, p.ty.name)) {
+                plan |= 4;
+                break;
+            }
+        }
+    }
+    @constCast(func).coerce_plan = plan;
+    return plan;
+}
+
 fn coerceGenericIntPeersToLong(module: *const Module, func: *const Func, params: []Value) void {
     const n = @min(params.len, func.params.len);
     if (n < 2) return;
@@ -3111,6 +3118,22 @@ fn leafExprServeAt(
         if (trace) std.debug.print("[leaf] {s}: arity {d} vs {d}\n", .{ func.name, args.len, func.params.len });
         return null;
     }
+    // The literal-typing coercions a real frame push applies
+    // (Frame.newWithCaptures) apply on this serve too: a bare Int flowing
+    // into a declared Long param, or into a shared type-variable slot
+    // beside a Long peer, is a Long-typed literal — `eq(0, 0L)` must
+    // compare two Longs here exactly as on the framed path.
+    var coerce_buf: [ir.LEAF_MAX_REGS]Value = undefined;
+    var eff_args = args;
+    {
+        const plan = coercePlanFor(module, func);
+        if (plan & 6 != 0 and args.len <= coerce_buf.len) {
+            @memcpy(coerce_buf[0..args.len], args);
+            if (plan & 2 != 0) coerceIntArgsToLong(func, coerce_buf[0..args.len]);
+            if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, coerce_buf[0..args.len]);
+            eff_args = coerce_buf[0..args.len];
+        }
+    }
     const reclaim = runtime.reclaimEnabled();
     const ev: *EvalTls = &evtls;
     if (ev.leaf_depth >= LEAF_BANK_DEPTH) return null;
@@ -3131,7 +3154,7 @@ fn leafExprServeAt(
     // shape this exists for — reaches no safe point and pays nothing.
     var pin: ?usize = null;
     defer if (pin) |m| runtime.keepaliveRestore(m);
-    const out = leafWalk(H, allocator, module, func, args, host, depth, regs, reclaim, trace, &pin) catch |e| switch (e) {
+    const out = leafWalk(H, allocator, module, func, eff_args, host, depth, regs, reclaim, trace, &pin) catch |e| switch (e) {
         error.LeafAbandon => return null,
         error.OutOfMemory => return error.OutOfMemory,
     };
