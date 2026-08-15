@@ -1242,6 +1242,11 @@ pub fn string_trim_end(ctx: *CallCtx) Allocator.Error!EvalResult {
 }
 
 pub fn string_repeat(ctx: *CallCtx) Allocator.Error!EvalResult {
+    if (std.c.getenv("KLIO_REPEAT_DBG") != null) {
+        std.debug.print("[srep] nargs={d}", .{ctx.args.len});
+        for (ctx.args) |a| std.debug.print(" {s}", .{@tagName(std.meta.activeTag(a))});
+        std.debug.print("\n", .{});
+    }
     const r = try recvString(ctx.allocator, ctx.args, "String.repeat");
     const s = switch (r) {
         .ok => |v| v,

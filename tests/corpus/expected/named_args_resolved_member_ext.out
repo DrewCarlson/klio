@@ -1,0 +1,4 @@
+ch>[5:12345] limit=5 strict=false
+ch>[1:a][2:bb] limit=-1 strict=true
+ch>[1:x] limit=-1 strict=false
+done

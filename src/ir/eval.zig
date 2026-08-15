@@ -5054,6 +5054,7 @@ fn LoopTramp(comptime H: type) type {
                         &recv,
                         fid,
                         argbuf[0..site.n_args],
+                        &.{},
                     ) catch {
                         lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
                         return jit_loop.throwCode(site.block);
@@ -7705,6 +7706,11 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
 /// stays put, until `NATIVE_RECURSE_MAX_DEPTH`, where it reverts to the
 /// flat park to bound the C stack.
 noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H, allow_flat: bool) Allocator.Error!Step {
+    if (cmgTraceWant()) |w| {
+        if (frame.module.funcById(call.func)) |cf| if (std.mem.eql(u8, w, cf.name)) {
+            std.debug.print("[call-inst] {s}#{d} n_args={d} n_names={d} exact={}\n", .{ cf.name, call.func.int(), call.n_args, call.arg_names.len, call.exact });
+        };
+    }
     dispatchBump(.call_static);
     // Monomorphic fast path: a plain top-level user function (single
     // overload, has body, non-extension, no varargs / defaults / type
@@ -8309,12 +8315,15 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 value
             else
                 null;
+            const names_resolved = try resolveArgNames(allocator, frame.module, cm.arg_names);
+            defer allocator.free(names_resolved);
             switch (try host.invokeResolvedMember(
                 allocator,
                 dispatch_ptr,
                 &recv,
                 fid,
                 ra,
+                names_resolved,
             )) {
                 .ok => |rv| {
                     try frame.write(cm.dst, rv);

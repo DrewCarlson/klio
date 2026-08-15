@@ -9686,6 +9686,7 @@ pub fn invokeResolvedMember(
     receiver: *const Value,
     fid: FuncId,
     args: []const Value,
+    arg_names: []const ?[]const u8,
 ) Allocator.Error!EvalResult {
     // A member-extension needs its declaring class's `this` seeded as an
     // enclosing receiver before the body runs; a plain member binds
@@ -9695,6 +9696,36 @@ pub fn invokeResolvedMember(
         defer mg.deinit();
         break :blk isMemberExt(mg.get(), fid);
     };
+    // NAMED arguments must bind by parameter name — the positional invokers
+    // below would walk them into a vararg (`assertLines("12345", limit = 5)`
+    // stringified the limit into the vararg and kept the default).
+    var any_named = false;
+    for (arg_names) |n| {
+        if (n != null) any_named = true;
+    }
+    if (any_named) {
+        const all = try prependReceiver(allocator, receiver, args);
+        defer if (runtime.freeScratch()) allocator.free(all);
+        const names = try allocator.alloc(?[]const u8, arg_names.len + 1);
+        defer if (runtime.freeScratch()) allocator.free(names);
+        names[0] = null;
+        @memcpy(names[1..], arg_names);
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const mod = mg.get();
+        if (funcAt(mod, fid) == null) {
+            return .{ .err = .{ .Type = "resolved member target is missing" } };
+        }
+        if (is_member_ext) {
+            const dispatch = dispatch_receiver orelse return .{
+                .err = .{ .Type = "resolved member extension is missing its dispatch receiver" },
+            };
+            ir.eval.pushEnclosing(dispatch);
+            defer ir.eval.popEnclosing();
+            return try callFuncNamedRec(self, allocator, mod, fid, all, names);
+        }
+        return try callFuncNamedRec(self, allocator, mod, fid, all, names);
+    }
     if (is_member_ext) {
         const dispatch = dispatch_receiver orelse return .{
             .err = .{ .Type = "resolved member extension is missing its dispatch receiver" },
@@ -14129,8 +14160,14 @@ fn resolveExtOverloadLocal(self: *VmHost, allocator: Allocator, name: []const u8
                 }
                 if (!has_vararg) continue;
             }
-            if (privateFnHiddenHere(self, mod, fid)) continue;
-            if (!memberExtVisible(self, mod, fid, &visible_owners)) continue;
+            if (privateFnHiddenHere(self, mod, fid)) {
+                if (missTraceWant(name)) std.debug.print("[extlocal] {s}#{d} drop=private-hidden\n", .{ name, fid.int() });
+                continue;
+            }
+            if (!memberExtVisible(self, mod, fid, &visible_owners)) {
+                if (missTraceWant(name)) std.debug.print("[extlocal] {s}#{d} drop=owner-invisible\n", .{ name, fid.int() });
+                continue;
+            }
             // A candidate whose declared receiver definitely excludes this
             // runtime receiver is not applicable at all (kotlinc drops it):
             // `UIntArray.fill` never binds a plain `Array` receiver even when
