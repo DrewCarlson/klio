@@ -51,12 +51,47 @@ may be 4 key slots + 2 group slots, not 6 key slots).
   that over-invalidates fails it (measured: coarse single-bit does).
 - Ratchet: compose_plugin_commontest baseline 1305, current ~1371.
 
+## Phase 1 result — golden emission MEASURED (2026-08-15)
+
+Toolchain (session scratchpad): kotlinc 2.2.20 +
+`kotlin-compose-compiler-plugin` 2.2.20 (the NON-embeddable artifact —
+the embeddable one NoClassDefFoundErrors against the CLI compiler) +
+`org.jetbrains.compose.runtime:runtime-desktop:1.8.2`. Probe gold1.kt:
+`Leaf(n: Int, onClick: () -> Unit)` called as
+`Leaf(1) { onCheckedChange(checked) }` from
+`Probe(checked: Boolean, onCheckedChange: (Boolean) -> Unit)`.
+javap -c of the emission:
+
+- **Function prologue** (both fns): `$dirty = $changed;
+  if ($changed & 0b110 == 0) $dirty |= changed(p0) ? 4 : 2;
+  if ($changed & 0b110000 == 0) $dirty |= changedInstance(p1) ? 32 : 16`
+  — 3 bits per param starting at bit 1; scalar params probe `changed`,
+  reference params `changedInstance`.
+- **Skip gate**: `composer.shouldExecute($dirty & 19 != 18, $dirty & 1)`
+  — the compose-1.8 pausable-aware gate, NOT bare
+  `skipping+skipToGroupEnd`; else-branch `skipToGroupEnd()`.
+- **Memoized capturing lambda argument — THE ANSWER: ZERO key slots,
+  ZERO groups.** The site emits
+  `invalid = ($dirty & 112) == 32 || ($dirty & 14) == 4;
+  v = rememberedValue();
+  if (invalid || v === Empty) { v = <closure>; updateRememberedValue(v) }`
+  — validity is READ OFF the enclosing `$dirty` for the captured
+  PARAMS; only non-param captures would add inline
+  `changedInstance(local)` probes (each consuming its own slot). One
+  stored slot (the cache), no `startReplaceGroup` around the memo.
+  klio's `remember(k1, k2) { lam }` wrap stores each key = the whole
+  +6 slot excess.
+- **Call-site certainty**: `Leaf(1, v, composer, 0b110)` — the literal
+  arg carries caller-certainty bits; the memoized lambda passes 0 and
+  the CALLEE's `changedInstance` (stable memo identity) resolves it to
+  certain-same. Caller-side certainty for forwarded lambdas is NOT
+  claimed by kotlinc — identity stability does the work.
+- **Restart lambda**: `endRestartGroup()?.updateScope { F(args,
+  composer, $changed | 1) }`.
+
 ## Phases
 
-1. **Golden measurement.** Decompile kotlinc's checkboxLike-shaped
-   output (Compose compiler plugin, strong skipping on) and write the
-   exact slot-by-slot table klio must produce. Decide whether the memo
-   wrap's key slots are the whole +6 or part group-shape.
+1. Golden measurement — DONE (result above).
 2. **Thread $changed.** The plugin already appends the composer pair
    ($rc/$changed exist — restart lambdas re-invoke with `$changed or
    1`). Extend the compose_pass to compute caller-side certainty bits
