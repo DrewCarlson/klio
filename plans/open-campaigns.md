@@ -205,8 +205,10 @@ the campaign opens (`COROUTINE-MODEL.md` is the architecture reference).
       ratchet 1353 with DNC classes 3 -> 2).
 - [x] Stale-killed on re-verification: with_timeout preempt,
       private_shadow val+var, atomicfu SupervisorJob CAS. Unconfined
-      yield ORDER needs a kotlinc oracle before it can be called a bug
-      (klio: U1 U2 L1 L2).
+      yield ORDER: ORACLE RUN (kotlinc 2.2.20 + kotlinx-coroutines
+      1.9.0 on JVM, toolchain in the session scratchpad) — the JVM
+      prints U1 U2 L1 L2, exactly klio's order. NOT a bug; guard
+      example unconfined_yield_order.kt pins it.
 - [ ] Background-yield 55s cost (suite-perf memory)
 - [ ] CompositionTests.testCompositionAndRecomposerDeadlock +
       PausableCompositionTests.markInvalidFromBackgroundThread — both

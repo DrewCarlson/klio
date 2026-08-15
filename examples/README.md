@@ -343,3 +343,4 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `captured_local_shadows_const.kt` | A local captured by an anonymous object is the nearest binding in its methods: no const-inline of a same-named top-level `const val`, no capture by a same-named member on a dispatch-published receiver. |
 | `generic_literal_long_widening.kt` | An integer literal in a shared type-variable slot beside a `Long` peer is typed `Long` — `eq(0, 0L)` is true on the framed path and the leaf expression-body serve alike. |
 | `member_invariant_arg_delegation.kt` | A private member refuted by an invariant generic argument (`List<IntRange>` vs a mapped `List<LongRange>`) steps aside for the top-level function instead of recursing into itself. |
+| `unconfined_yield_order.kt` | Unconfined runs eagerly through `yield()` on an empty event loop before a default-dispatched sibling starts — U1 U2 L1 L2, verified against kotlinc/JVM. |
