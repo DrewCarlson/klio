@@ -3948,14 +3948,25 @@ fn recomposeLambda(a: std.mem.Allocator, b: B, fn_name: []const u8, value_params
     var call_args = try a.alloc(Expr, value_params.len + 2);
     for (value_params, 0..) |p, i| call_args[i] = b.pathExpr(p.name.name);
     call_args[value_params.len] = b.pathExpr("$rc"); // recompose composer lambda param
-    // `$changed.or(1)` — Kotlin's bitwise `or` is an INFIX FUNCTION, not an
-    // operator: the AST `BinOp.Or` is logical `||`, whose short-circuit branch
-    // on an Int operand kills the restart invocation. Emit the member call the
-    // parser would produce for `$changed or 1`.
-    call_args[value_params.len + 1] = b.callMember(
+    // `updateChangedFlags($changed or 1)` — kotlinc's restart re-invoke.
+    // The wrap folds every DYNAMIC "changed" triple down to "same": the
+    // restart re-runs with the very values the scope captured, so a
+    // caller-recombined changed-bit frozen in `$changed` must not force
+    // the callee's whole downstream to re-execute forever (UseCount2 in
+    // RestartTests.restart_and_skip skipped on kotlinc, re-ran here).
+    // Static triples (both bits) survive the fold unchanged.
+    // (`or` is Kotlin's infix bitwise function — the AST BinOp.Or is
+    // logical `||`, whose short-circuit on an Int kills the invocation.)
+    const forced = b.callMember(
         b.pathExpr(changed_param),
         "or",
         b.slice1(b.intLit(1)),
+    );
+    const ucf_args = try a.alloc(Expr, 1);
+    ucf_args[0] = forced;
+    call_args[value_params.len + 1] = b.call(
+        b.pathExprSegs(&.{ "androidx", "compose", "runtime", "updateChangedFlags" }),
+        ucf_args,
     );
     const reinvoke = b.call(b.pathExpr(fn_name), call_args);
 
