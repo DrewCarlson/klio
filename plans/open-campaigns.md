@@ -167,23 +167,24 @@ the campaign opens (`COROUTINE-MODEL.md` is the architecture reference).
       open: every park/resume cycle leaks one EMPTY TailSeg on the
       suspend-state chain (routeResumedResult re-wraps; empties never
       freed eagerly) — unbounded, benign-looking.
-- [ ] combine/zip STILL LIVE (the last of the flow-campaign #3
-      family; takeWhile/drop/produce-standalone all pass): zip fails
-      `cast to SendChannel` because `val second = produce<Any>{...}`
-      inside the pack-lowered zipImpl never binds — TWO stacked roots.
-      FIXED HALF: bare `produce {}` statically tied across the 3
-      CoroutineScope.produce overloads (all applicable via defaults);
-      the extension ranking key now carries Kotlin's
-      fewest-defaults-filled tiebreak (9th key slot before identity)
-      and the site statically pins produce#2771. REMAINING HALF (the
-      receiver-publication campaign again): at runtime the implicit
-      receiver chain inside unsafeFlow's anon collect is headed by the
-      RAW COLLECTOR CLOSURE (toCollection's `collect {}` lambda passes
-      as an IrClosure, `collector.block()` then seats it as the
-      block's receiver), so coroutineScope/produce/println all
-      member-dispatch against kotlin.Function first and the resolved
-      target gets the wrong `this`. combine's `emit` on FlowCoroutine
-      is the same seating. Full trace anatomy in triage memory (62).
+- [x] combine/zip FIXED (the last of the flow-campaign #3 family).
+      zip: the runtime extension-arity check was trailing-lambda-blind
+      (`produce<Any> {}` against `produce(context=, capacity=, block)`
+      needs only the GAP defaulted when the last arg is callable and
+      the last param function-typed — extArityApplicableTL,
+      host_call_member.zig). combine: a receiver-lambda param invoked
+      bare from inside a coroutine lambda now binds the lexically
+      innermost implicit receiver of its declared head through the
+      receiver tower's `this@fn` slot, with the head riding
+      CallValueWithThis (`recv_head`) for VM re-selection; the dynamic
+      enclosing-this chain cannot serve this after a pump resume. The
+      "raw collector closure" seating that looked wrong is CORRECT by
+      design — FlowCollector is a fun interface and SAM lambdas stay
+      raw IrClosures; bare `emit` on one SAM-invokes it. Guards
+      examples/flow_zip.kt + examples/flow_combine.kt
+      (kotlinc/JVM-verified); traps recorded in memory
+      klio-flow-zip-combine-fixed (vmhost @hasDecl re-export, flat-call
+      preempt gate, clear the cache BEFORE `pack build`).
 - [x] Cancellation cluster CLOSED BY RE-VERIFICATION (2026-08-15): the
       flow campaign's recorded repros all pass on current main
       (plans/repros/channel_segment_rotation_break sum=2415,
@@ -229,12 +230,13 @@ the campaign opens (`COROUTINE-MODEL.md` is the architecture reference).
       the census's 10s cap it reports UncompletedCoroutinesError by
       design; it counts as wall-capped in the ratchet, not as a bug.
 
-State: CORRECTNESS COMPLETE (2026-08-15). Every recorded coroutine bug
-is fixed, oracle-verified not-a-bug, or reclassified compute-heavy;
-what remains is one perf item (background-yield 55s, parked with the
-suite-wall floor) and the tl_atomic_update_contended flake watch
-(postmortem-able on next natural occurrence — the sweep prints
-got-vs-expected tails).
+State: CORRECTNESS COMPLETE (2026-08-16, combine/zip included). Every
+recorded coroutine bug is fixed, oracle-verified not-a-bug, or
+reclassified compute-heavy; what remains is one perf item
+(background-yield 55s, parked with the suite-wall floor) and the
+tl_atomic_update_contended flake watch (postmortem-able on next
+natural occurrence — the sweep prints got-vs-expected tails). The
+follow-on work register is plans/simplify-validate-accelerate.md.
 
 ## 4. ktor_commontest upstream fails
 

@@ -501,6 +501,8 @@ test "bake/load round-trips the lowered base tables" {
             // an empty deferred marker (the fresh build defers bodies too).
             _ = m0.ensureFuncBody(@constCast(f0));
             _ = m1.ensureFuncBody(@constCast(f1));
+            if (f0.blocks.len != f1.blocks.len)
+                std.debug.print("round-trip block mismatch: {s}#{d} fresh={d} decoded={d}\n", .{ f0.fqn, f0.id.int(), f0.blocks.len, f1.blocks.len });
             try std.testing.expectEqual(f0.blocks.len, f1.blocks.len);
             try std.testing.expectEqual(f0.params.len, f1.params.len);
             for (f0.blocks, f1.blocks) |b0, b1| {
