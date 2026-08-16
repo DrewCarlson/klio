@@ -240,7 +240,9 @@ const SpinRwLock = struct {
     fn lockExclusive(self: *SpinRwLock) void {
         var b: Backoff = .{};
         while (true) {
-            if (self.state.cmpxchgWeak(0, WRITER, .acquire, .monotonic) == null) {
+            if (self.state.load(.monotonic) == 0 and
+                self.state.cmpxchgWeak(0, WRITER, .acquire, .monotonic) == null)
+            {
                 return;
             }
             b.pause();
@@ -308,7 +310,14 @@ pub const SpinMutex = struct {
 
     pub fn lock(self: *SpinMutex) void {
         var b: SpinRwLock.Backoff = .{};
-        while (self.locked.swap(true, .acquire)) {
+        // Test-and-test-and-set: spin on a plain load while the lock is
+        // held so waiters share the cache line instead of ping-ponging it
+        // with bus-locked swaps; only attempt the swap on an observed
+        // release.
+        while (true) {
+            if (!self.locked.load(.monotonic)) {
+                if (!self.locked.swap(true, .acquire)) return;
+            }
             b.pause();
         }
     }
@@ -615,7 +624,7 @@ pub fn ObjRef(comptime T: type) type {
         /// destroy the control block. Child cells are swept independently.
         fn gcFinalizeThunk(h: *gc.GcHeader) void {
             const cb: *Cell = @fieldParentPtr("hdr", h);
-            if (h.gc_remembered and std.c.getenv("KLIO_GC_REMEMBER_TRACE") != null) {
+            if (h.gc_remembered and getenvSlice("KLIO_GC_REMEMBER_TRACE") != null) {
                 std.debug.print("[gc-freed-remembered] SWEEP h={*} type={s}\n", .{ h, h.gc_type });
                 trace.dumpCurrent(.{});
             }
@@ -630,6 +639,22 @@ pub fn ObjRef(comptime T: type) type {
             }
             gcFinalizeData(T, &cb.data, cb.allocator);
             cb.allocator.destroy(cb);
+        }
+
+        /// Free the cell RIGHT NOW, regardless of refcount gating or memory
+        /// mode. For hand-managed process-global caches swapping their single
+        /// owner: the caller asserts no live handle dereferences the cell
+        /// afterwards, and the cell must not be on the sweep registry (mint
+        /// it under `alloc_perm`). Purges any remembered-set entry first.
+        pub fn destroyImmediately(self: Self) void {
+            if (gc.gc_enabled) gc.forgetCell(&self.cell.hdr);
+            const allocator = self.cell.allocator;
+            if (comptime owns_bytes) {
+                allocator.free(self.cell.data);
+            } else if (comptime hasDeinit(T)) {
+                deinitData(&self.cell.data, allocator);
+            }
+            allocator.destroy(self.cell);
         }
 
         pub fn initOwned(allocator: std.mem.Allocator, v: T) std.mem.Allocator.Error!Self {
@@ -694,7 +719,7 @@ pub fn ObjRef(comptime T: type) type {
                 // other handles so all their writes happen-before this
                 // free (Arc's drop ordering).
                 _ = self.cell.refcount.load(.acquire);
-                if (self.cell.hdr.gc_remembered and std.c.getenv("KLIO_GC_REMEMBER_TRACE") != null) {
+                if (self.cell.hdr.gc_remembered and getenvSlice("KLIO_GC_REMEMBER_TRACE") != null) {
                     std.debug.print("[gc-freed-remembered] RC h={*} type={s}\n", .{ &self.cell.hdr, @typeName(T) });
                     trace.dumpCurrent(.{});
                 }

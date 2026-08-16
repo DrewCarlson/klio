@@ -170,6 +170,12 @@ test "examples + coroutine smoke are byte-identical across load modes" {
         return error.SkipZigTest;
     }
 
+    // Group by dependency-base key so the 2-entry cache (one base per load
+    // mode of the CURRENT mask) stays hot across each group instead of
+    // thrashing per alphabetical mask switch — the coexistence + rebuild
+    // transient is what grazed the RSS watchdog cap.
+    parity.groupByBaseKey(la, io, corpus.items);
+
     const failures = try checkCorpus(io, corpus.items);
     if (failures != 0) {
         std.debug.print("differential: {d} program(s) diverged across load modes\n", .{failures});
@@ -225,6 +231,12 @@ test "corpus outputs are independent of program order" {
     }
     corpus.clearRetainingCapacity();
     try corpus.appendSlice(la, sampled.items);
+    // Grouped by base key: the forward pass runs mask-grouped ascending and
+    // the reverse pass descending — still two distinct orders for every
+    // program (its predecessor set differs between passes), while the base
+    // cache stays hot within each group instead of thrash-rebuilding per
+    // alphabetical mask switch into the RSS cap.
+    parity.groupByBaseKey(la, io, corpus.items);
 
     const Key = struct { file: []const u8, mode: parity.LoadMode };
     var recorded: std.ArrayList(struct { key: Key, kind: u8, text: []u8 }) = .empty;
@@ -235,7 +247,8 @@ test "corpus outputs are independent of program order" {
 
     // Forward pass: record every outcome (output or error text).
     for (corpus.items) |file| {
-        _ = run_arena.reset(.retain_capacity);
+        if (verbose()) std.debug.print("differential order FWD {s}\n", .{file});
+        _ = run_arena.reset(.{ .retain_with_limit = 64 * 1024 * 1024 });
         const ra = run_arena.allocator();
         const src = std.Io.Dir.cwd().readFileAlloc(io, file, ra, .unlimited) catch continue;
         for (applicableModes(src)) |mode| {
@@ -259,7 +272,8 @@ test "corpus outputs are independent of program order" {
     while (idx > 0) {
         idx -= 1;
         const rec = recorded.items[idx];
-        _ = run_arena.reset(.retain_capacity);
+        if (verbose()) std.debug.print("differential order REV {s} [{s}]\n", .{ rec.key.file, @tagName(rec.key.mode) });
+        _ = run_arena.reset(.{ .retain_with_limit = 64 * 1024 * 1024 });
         const ra = run_arena.allocator();
         const outcome = try runOne(ra, io, rec.key.file, rec.key.mode);
         const kind: u8 = if (outcome == .out) 0 else 1;

@@ -147,6 +147,13 @@ var major_threshold: usize = 8 * 1024 * 1024;
 /// The remembered set: tenured cells mutated since promotion. Re-traced at the
 /// start of every minor mark (a tenured cell's new children may be nursery
 /// cells); drained (flags cleared, list emptied) by every collection.
+/// Env probe for the remembered-set diagnostics, safe in libc-free builds
+/// (module test binaries never set the variable anyway).
+fn rememberTraceOn() bool {
+    if (comptime !@import("builtin").link_libc) return false;
+    return std.c.getenv("KLIO_GC_REMEMBER_TRACE") != null;
+}
+
 var remembered: std.ArrayListUnmanaged(*GcHeader) = .empty;
 var remembered_lock: SpinLock = .{};
 
@@ -166,11 +173,26 @@ fn writeBarrierSlow(h: *GcHeader) void {
     defer remembered_lock.unlock();
     if (h.gc_remembered) return;
     h.gc_remembered = true;
-    if (std.c.getenv("KLIO_GC_REMEMBER_TRACE") != null) {
+    if (rememberTraceOn()) {
         std.debug.print("[gc-remember] h={*} gen={d} type={s} program_started={}\n", .{ h, h.gc_gen, h.gc_type, program_started });
     }
     remembered.append(std.heap.page_allocator, h) catch
         @panic("KGC: remembered set allocation failed");
+}
+
+/// Remove ONE cell from the remembered set (flag + list entry), for a caller
+/// about to free it outside any sweep. No-op when the cell is not remembered.
+pub fn forgetCell(h: *GcHeader) void {
+    remembered_lock.lock();
+    defer remembered_lock.unlock();
+    if (!h.gc_remembered) return;
+    h.gc_remembered = false;
+    for (remembered.items, 0..) |e, i| {
+        if (e == h) {
+            _ = remembered.swapRemove(i);
+            break;
+        }
+    }
 }
 
 /// Drain the remembered set outside a collection: clear every flag and empty
@@ -189,7 +211,7 @@ pub fn drainRemembered() void {
 /// with msync and report entries whose backing is no longer mapped, tagged by
 /// call site. Finds the phase that freed a remembered cell's storage.
 pub fn validateRemembered(tag: []const u8) void {
-    if (std.c.getenv("KLIO_GC_REMEMBER_TRACE") == null) return;
+    if (!rememberTraceOn()) return;
     remembered_lock.lock();
     defer remembered_lock.unlock();
     const pg = std.heap.pageSize();
@@ -255,6 +277,33 @@ pub var gc_enabled: bool = false;
 /// startup reads (stdlib image) from its absurd-allocation tripwire.
 pub var program_started: bool = false;
 
+/// While true, `register` links every PERMANENT cell on the program-perm
+/// list for `freeProgramPerm` to release at the run boundary. Armed by the
+/// in-process drivers around exactly the per-program build window; the CLI
+/// (one program per process) never arms it.
+pub var program_perm_collect: bool = false;
+var program_perm: ?*GcHeader = null;
+var program_perm_lock: SpinLock = .{};
+
+/// Free every cell on the program-perm list. Run-boundary only, strictly
+/// after the final collect and `drainRemembered` — nothing may reference
+/// these cells anymore, and remembered entries into them must already be
+/// gone.
+pub fn freeProgramPerm() void {
+    program_perm_lock.lock();
+    var cur = program_perm;
+    program_perm = null;
+    program_perm_lock.unlock();
+    var freed: usize = 0;
+    while (cur) |h| {
+        cur = h.gc_next;
+        h.gc_next = null;
+        h.gc_finalize(h);
+        freed += 1;
+    }
+    if (gc_debug) std.debug.print("[kgc] program-perm freed={d}\n", .{freed});
+}
+
 /// Stress mode (`KLIO_GC_STRESS=1`): force a collection at every safe point,
 /// regardless of the byte threshold. A correctness oracle — if any root or
 /// tracer is incomplete, collecting on every opcode boundary surfaces the UAF
@@ -285,6 +334,20 @@ pub fn register(h: *GcHeader, bytes: usize) void {
         // mark stops at it instead of walking the stdlib image graph, and so
         // a runtime mutation of a permanent cell hits the write barrier.
         h.gc_gen = 1;
+        // An in-process driver arms `program_perm_collect` around the ONE
+        // program's build window (never around shared caches like the base
+        // entries): its permanent cells belong to the program, not the
+        // process, and the run boundary frees them wholesale — the ~30MB
+        // per-program class/global graph must not ratchet a multi-program
+        // process into the RSS cap. `gc_next` is unused for perm cells
+        // (only the sweep registry links through it), so it carries the
+        // program-perm list.
+        if (program_perm_collect) {
+            program_perm_lock.lock();
+            h.gc_next = program_perm;
+            program_perm = h;
+            program_perm_lock.unlock();
+        }
         return;
     }
     h.gc_bytes = std.math.lossyCast(u32, bytes);
@@ -739,7 +802,7 @@ fn collectImpl(force_major: bool) void {
     // is tenured (old→young edges became old→old); after a major the fresh
     // full mark subsumes it. Cleared before the sweep so no entry dangles.
     remembered_lock.lock();
-    if (std.c.getenv("KLIO_GC_REMEMBER_TRACE") != null) {
+    if (rememberTraceOn()) {
         std.debug.print("[gc-drain] n={d} major={} program_started={}\n", .{ remembered.items.len, major, program_started });
         for (remembered.items) |h| std.debug.print("[gc-drain]   h={*}\n", .{h});
     }

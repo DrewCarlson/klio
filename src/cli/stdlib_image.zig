@@ -418,47 +418,67 @@ pub fn parseUserFiles(gpa: Allocator, map: *SourceMap, paths: []const []const u8
 /// Check the base's OWN sources and stage the resolutions on it. Runs only
 /// where those sources exist — while an image is being built — so a cached
 /// run pays nothing and still gets the answers.
-fn checkBaseSources(gpa: Allocator, base: *interp_ir.build.StdlibBase, asts: []const KotlinFile) void {
+/// Compute the base sources' eager call resolutions and stage them on the
+/// pending channel so `buildStdlibBase`'s body lowering consumes them —
+/// the SAME ordering as the whole-program build, where `computeEagerCalls`
+/// runs before the build. Base bodies lower during the base build; a check
+/// that runs only afterwards can no longer influence them, and a composable
+/// call the shape resolver cannot prove (`default_param_shape`) then falls
+/// to the bare value read and loses its `($composer, $changed)` pair — the
+/// baked image carries the unthreaded call and the run dies with
+/// `startRestartGroup` on `kotlin.Nothing`.
+fn stageBaseEagerCalls(gpa: Allocator, asts: []const KotlinFile) void {
     if (std.mem.eql(u8, runtime.envOnce("KLIO_STDLIB_CHECK") orelse "1", "0")) return;
+    // The base's own sources ARE the whole universe for calls inside
+    // them, so a source extension pick is trustworthy here in a way it
+    // never is for a user program that also loads packs.
+    typeck_mod.check.expr_calls.complete_universe = true;
+    defer typeck_mod.check.expr_calls.complete_universe = false;
+    if (@import("commands.zig").computeEagerCalls(gpa, asts, &.{})) |ec| {
+        if (ir_mod.pending_eager_calls) |*old| old.deinit();
+        ir_mod.pending_eager_calls = ec;
+    }
+}
 
-        publishExternDecls(gpa, base);
-        // The base's own sources ARE the whole universe for calls inside
-        // them, so a source extension pick is trustworthy here in a way it
-        // never is for a user program that also loads packs.
-        typeck_mod.check.expr_calls.complete_universe = true;
-        defer typeck_mod.check.expr_calls.complete_universe = false;
-        if (@import("commands.zig").computeEagerCalls(gpa, asts, &.{})) |ec| {
-            var owned = ec;
-            defer owned.deinit();
-            // The base is already lowered, so each declaration span the
-            // checker named resolves to the FuncId lowering will ask for.
-            var out: std.ArrayList(interp_ir.build.StdlibBase.EagerCall) = .empty;
-            {
-                const mg = base.built.module.borrow();
-                defer mg.deinit();
-                const m = mg.get();
+fn checkBaseSources(gpa: Allocator, base: *interp_ir.build.StdlibBase, asts: []const KotlinFile) void {
+    _ = asts;
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_STDLIB_CHECK") orelse "1", "0")) return;
+    // The resolutions staged by `stageBaseEagerCalls` were consumed into the
+    // built module (call span -> declaration span). Key each to the FuncId
+    // lowering assigned so the answers ride the image and a cached run pays
+    // nothing.
+    {
+        var out: std.ArrayList(interp_ir.build.StdlibBase.EagerCall) = .empty;
+        var total: usize = 0;
+        {
+            const mg = base.built.module.borrow();
+            defer mg.deinit();
+            const m = mg.get();
+            if (m.eager_calls) |*owned| {
+                total = owned.count();
                 var it = owned.iterator();
                 while (it.next()) |e| {
                     const fid = m.funcByDeclSpan(e.value_ptr.*) orelse continue;
                     out.append(gpa, .{ .call = e.key_ptr.*, .fid = fid.int() }) catch continue;
                 }
             }
-            base.eager_calls = out.toOwnedSlice(gpa) catch &.{};
-            if (runtime.envOnce("KLIO_EAGER_AUDIT") != null) {
-                std.debug.print("[stdlib-check] {d} base call resolutions, {d} keyed to a FuncId\n", .{ owned.count(), base.eager_calls.len });
-            }
         }
-        // The checker's per-run channels are the USER program's to fill;
-        // clear anything this base pass staged so they do not leak into it.
-        if (ir_mod.pending_eager_calls) |*m| {
-            m.deinit();
-            ir_mod.pending_eager_calls = null;
-        }
-        if (ir_mod.pending_eager_call_fids) |*m| {
-            m.deinit();
-            ir_mod.pending_eager_call_fids = null;
+        base.eager_calls = out.toOwnedSlice(gpa) catch &.{};
+        if (runtime.envOnce("KLIO_EAGER_AUDIT") != null) {
+            std.debug.print("[stdlib-check] {d} base call resolutions, {d} keyed to a FuncId\n", .{ total, base.eager_calls.len });
         }
     }
+    // The checker's per-run channels are the USER program's to fill;
+    // clear anything the base pass staged so they do not leak into it.
+    if (ir_mod.pending_eager_calls) |*m| {
+        m.deinit();
+        ir_mod.pending_eager_calls = null;
+    }
+    if (ir_mod.pending_eager_call_fids) |*m| {
+        m.deinit();
+        ir_mod.pending_eager_call_fids = null;
+    }
+}
 
 /// Republish the base's own eager call resolutions, baked when its sources
 /// were last available. Merged UNDER the user program's, which is computed
@@ -744,7 +764,12 @@ pub fn tryPrepare(
         if (loadImageFile(gpa, image_path)) |loaded| {
             const t_load = runtime.clockMonotonicNanos();
             const out = finishFromLoaded(gpa, loaded, user, paths, pack_bindings);
-            trace(gpa, "hit {s} (key {d}ms, packs {d}ms, load {d}ms, extend {d}ms)", .{
+            // A null `out` means the loaded image could not serve this
+            // program (extend gate refused) and the caller re-lowers the
+            // whole dependency surface from source — name the outcome so
+            // the trace never reads as a served hit.
+            trace(gpa, "{s} {s} (key {d}ms, packs {d}ms, load {d}ms, extend {d}ms)", .{
+                if (out != null) @as([]const u8, "hit") else "hit-but-fallback",
                 hex,
                 (t_hash - t0) / 1_000_000,
                 (t_packs - t_hash) / 1_000_000,
@@ -906,6 +931,7 @@ fn bakeAndPrepare(
     }
 
     const tb_pre = runtime.clockMonotonicNanos();
+    stageBaseEagerCalls(gpa, deps.asts);
     const base = (interp_ir.build.buildStdlibBase(gpa, deps.asts) catch return null) orelse {
         writeTombstone(gpa, cache, hex);
         trace(gpa, "unbakeable {s} (base not snapshot-safe)", .{hex});
@@ -1022,11 +1048,12 @@ pub fn bundleBaseImage(
         return .{ .bytes = bytes, .base = loaded.base, .map = loaded.map };
     }
 
+    // Same bake-time staging + check as `bakeAndPrepare`: this is the OTHER
+    // path that builds a base from source (`bake-image`, and any bundle),
+    // and the resolutions have to ride whichever image the run ends up with.
+    stageBaseEagerCalls(gpa, deps.asts);
     const base = (interp_ir.build.buildStdlibBase(gpa, deps.asts) catch return null) orelse return null;
     base.user_file_start = @intCast(deps.map.files.items.len);
-    // Same bake-time check as `bakeAndPrepare`: this is the OTHER path that
-    // builds a base from source (`bake-image`, and any bundle), and the
-    // resolutions have to ride whichever image the run ends up with.
     checkBaseSources(gpa, base, deps.asts);
     const bytes = (image.bake(gpa, base, deps.map, .{
         .known_packages = report.known_packages.items,
