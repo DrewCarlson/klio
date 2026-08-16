@@ -116,6 +116,31 @@ Ground rules carried forward:
         one load-flaky unit binary (75/75 solo).
       Remaining census follow-through: gate.sh after the parity crash
       fix (its litmus phase includes the crashing suites).
+      CENSUS REPAIR LANDED (running record):
+      - The 44-crash family: FOUR roots, all fixed — the shared anon
+        side-module now rebuilds on run-module identity change; every
+        pointer-keyed dispatch cache carries a generation stamp bumped
+        per in-process program; the bytecode stream cache resets (and
+        FREES) per program; the intrinsic intern owns its key bytes.
+        12 of 17 affected suites fully green.
+      - parity_corpus_pinned 236 -> 249/251: the scope-conflation
+        bound-refutation fix, explicit-type-arg instantiation +
+        concrete-gated emission enrichment, receiver-instantiated
+        extension returns, least-upper-bound element joins, and the
+        vararg-before-defaulted trio. The 2 left are driver-context
+        (multi-file fixture read; in-suite base-image unresolved
+        global for operator_member_return).
+      - stdlib_image 7/7: compile break fixed; the round-trip fixture
+        now speaks dep-only (its printlns tripped the Aug-03
+        provably-unresolved rejection, correctly).
+      - atomicfu 4 fails: census-load flakes (solo green).
+      - differential 0/2: PRE-EXISTS the session (verified at the
+        prior baseline commit); current failure mode is the 6.5GB RSS
+        cap across corpus x load modes in one process — an A5 memory
+        acceptance target, not a quick fix.
+      - Still open singles: threaded_litmus 2 (suite-completeness +
+        eager parity), resolve_ambiguity 1+1, lambdas_and_dispatch 1
+        (member_prop_invoke shadow), ktor_server start(wait=false).
 - [ ] V2. Make the ratchets ratchet:
       - src/itests/ktor_commontest.zig has `.baseline = 0` — it can never
         fail. Set it to the census floor (last recorded 465 passed / 2
