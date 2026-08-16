@@ -343,10 +343,30 @@ validatePotentialDeadlock (pump fairness for virtual-time drains).
       cost and is now gone where provable). Next round candidates,
       in order: cross-thread refcount/borrow elision, snapshot
       global-lock sharding, core-loop dispatch micro-opts.
-- [ ] E5. Leniency diagnostic: klio accepts illegal Kotlin (unimported
-      extensions) and silently mistypes receiver lambdas. Either type
-      them correctly when the leniency engages or emit a real
-      "unresolved reference" diagnostic.
+- [x] E5. Leniency diagnostic LANDED as a loud once-per-declaration
+      runtime warning at the exact bind. Anatomy established first:
+      the mistyping is NOT fixable at lowering for the ktor shape —
+      the io.ktor.server pack's declarations are not in the lowering
+      module's func_name_index at user-file lower time (even the
+      IMPORTED `routing` lowers as unresolved_bare_call; the eager
+      lambda-receiver channel comes from TYPECK, which correctly
+      declines unimported calls), so the unimported handler lambda
+      keeps a synthetic `it`, the RoutingContext arrives positionally,
+      and bare `call` dies as an unresolved global. Correct-typing
+      would need speculative cross-pack candidate search at lowering;
+      a hard "unresolved reference" error would false-positive on
+      klio's import-tracking gaps. Instead the extension-fallback's
+      top-level winner path now warns (once per declaration):
+      "warning: `get` binds `io.ktor.server.routing.get` without an
+      import; add `import io.ktor.server.routing.get` — kotlinc
+      rejects the unimported call, and klio may type its lambda
+      arguments incorrectly". Gated tightly: shipped-pack packages
+      only (kotlin.* exempt as default imports), caller file outside
+      known packages (pack-internal cross-package binds stay quiet),
+      same-package exempt, wildcard/alias imports checked. Verified:
+      unimported produce + unimported routing get warn with the exact
+      import line; imported variants and zip/combine are silent.
+      Repros: scratchpad reprosrc/lenient1.kt, lenient_ktor.kt.
 - [ ] E6. Deferred measured-first roads, only when a measurement
       motivates: C-transpiler C-to-C frames (A4 continuation), Value
       24 -> 16 (A5), C2 completion (nullable member-ext gating; tower

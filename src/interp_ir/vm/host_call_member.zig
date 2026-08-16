@@ -13440,6 +13440,7 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
             mg.deinit();
             return r2;
         }
+        if (!pushed_owner) maybeWarnLenientExtBind(self, mod, c.fid);
         // Memoize an owner-independent pick: no member-extension competes for
         // this name and the winner is itself top-level, so the (receiver
         // class, name, arg types) key fully determines the target. When a
@@ -13460,6 +13461,44 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
         return r;
     }
     return null;
+}
+
+/// Once-per-declaration guard for `maybeWarnLenientExtBind`.
+var lenient_warned_mutex: runtime.SpinMutex = .{};
+var lenient_warned: ?std.AutoHashMap(u32, void) = null;
+
+/// The extension fallback bound a shipped pack's top-level extension for a
+/// call whose file never imports it. Kotlin rejects that call (an extension
+/// resolves only when imported or same-package), so the program runs on
+/// klio's leniency alone — and the trailing lambdas of such calls lower
+/// without their declared receiver, which surfaces later as baffling
+/// unresolved bare members inside the handler. Say so once, with the exact
+/// import to add. Quiet for pack-internal callers (their own resolution
+/// legitimately spans a pack's packages) and for `kotlin.*` (default
+/// imports).
+fn maybeWarnLenientExtBind(self: *VmHost, mod: *const Module, fid: FuncId) void {
+    _ = self;
+    const f = funcAt(mod, fid) orelse return;
+    if (f.package.len == 0) return;
+    if (std.mem.eql(u8, f.package, "kotlin") or std.mem.startsWith(u8, f.package, "kotlin.")) return;
+    if (!stdlib.isKnownPackage(f.package)) return;
+    const sp = ir.eval.currentCallSiteSpan() orelse return;
+    const caller_pkg = mod.packageOfFile(sp.file) orelse "";
+    if (std.mem.eql(u8, caller_pkg, f.package)) return;
+    if (caller_pkg.len != 0 and stdlib.isKnownPackage(caller_pkg)) return;
+    if (mod.importWildcardIn(sp.file, f.package)) return;
+    for (mod.importAliasPathsIn(sp.file, f.name)) |p| {
+        if (std.mem.eql(u8, p.fqn, f.fqn)) return;
+    }
+    lenient_warned_mutex.lock();
+    defer lenient_warned_mutex.unlock();
+    if (lenient_warned == null) lenient_warned = std.AutoHashMap(u32, void).init(std.heap.page_allocator);
+    const gop = lenient_warned.?.getOrPut(@intFromEnum(fid)) catch return;
+    if (gop.found_existing) return;
+    std.debug.print(
+        "warning: `{s}` binds `{s}` without an import; add `import {s}` — kotlinc rejects the unimported call, and klio may type its lambda arguments incorrectly\n",
+        .{ f.name, f.fqn, f.fqn },
+    );
 }
 
 /// The instance serving as a member-extension's dispatch receiver: the

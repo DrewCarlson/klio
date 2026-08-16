@@ -58,6 +58,9 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_CMG_TRACE` | `<name>` | Snapshot of `CallMemberOrGlobal` preconditions for `name`: receiver tag, constructor-likeness, enclosing fn, this-index, capture count | `[cmg]` |
 | `KLIO_NU_TRACE` | `<name>`, or `1` for all at some sites | Candidate/visibility detail for hard dispatch cases: interface factories, member-extension visibility, strict extension member calls, enclosing-scope resolution | `[eev]`, `[ifact]`, `[mev]`, `[meoi]`, `[par-miss]`, `[strictext]`, `[sbc]` |
 | `KLIO_SAM_TRACE` | set | Implicit-receiver candidate walk and member-arm dispatch shapes | `[sam-walk]`, `[sam-direct]`, `[sam-arm]`, `[marm]` |
+| `KLIO_RLP_TRACE` | `<name>` | Receiver-lambda-param lowering for bare calls of `name`: which arm engaged (marked/resolved/outer/head) and the receiver-tower `this@<label>` pick | `[rlp-arm]`, `[rlp-head]` |
+| `KLIO_HEAD_TRACE` | set | Runtime head-directed receiver re-selection for `CallValueWithThis` instructions carrying a declared receiver head | `[cvth]` |
+| `KLIO_SDU_TRACE` | set | Every stdlib member-dispatch call that missed both resolve-cache tiers and runs the uncached probe ladder (type, name, cacheability) | `[sdu]` |
 | `KLIO_SELDBG` | set | Why an intrinsic-host `invokeMethod` probe declined (error tag + message for each swallowed non-Throw error — the recipe that separates "method missing" from "method ran and failed") | `[seldbg]` |
 | `KLIO_MCRT_TRACE` | `<name>` | Member-call return-type derivation for a chained arg (`recv.map { … }`): receiver tag/type and candidate agreement | `[mcrt]` |
 | `KLIO_ADM_TRACE` | set | Callable-vs-class adjudication detail inside `argDefinitelyNotParamType` | `[adm]` |
