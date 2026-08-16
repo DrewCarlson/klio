@@ -1,0 +1,191 @@
+# Simplify / Validate / Accelerate
+
+The running plan for the next stretch of work. Three tracks — codebase
+simplification, test/validation repair, and whole-project performance
+(interpreter execution + memory management) — plus the carried-over open
+items from the previous round. Worked in the order given at the bottom;
+each landing runs the full battery (harness sweep, litmus, compose plugin
+ratchet, corpus, module unit tests) and commits directly to main.
+
+Ground rules carried forward:
+- Measured-first for every perf lever: baseline on the rig, land, re-measure,
+  record the number (including measured-negative results).
+- Measure on `zig-out/bin/klio-harness` (ReleaseSafe). The plain `zig build`
+  binary is Debug and its profile is fiction (hash/eql dominate there).
+- Simplification changes are behavior-frozen: the battery must hold
+  byte-identical corpus output and unchanged suite counts. A refactor that
+  moves a number is a bug in the refactor.
+- Big-changes-over-green still applies to the structural perf work: a
+  multi-commit red middle is fine when the plan is valid.
+
+## Carried-over open items (inherited state)
+
+- The concurrency perf campaign is mid-flight: round 3 landed
+  (member-resolve file-keyed caching ~11%, leaf no-fill, profiler
+  leaf-caller recovery). Standing solo on the ReleaseSafe harness:
+  addAll_clear 30.6s/30s, concurrentGlobalModifications_addAll 32.0s/30s
+  (both marginal), addAll_removeRange 69.7s/30s,
+  concurrentGlobalModification_add 10.2s/10s. Ranked next candidates and
+  the measurement rig are recorded in plans/worklist.md (E4 entry). This
+  plan's Accelerate track is that campaign's continuation.
+- Measured-first recorded roads (open only when a measurement motivates):
+  Value 24 -> 16 (value-layout-campaign.md), C-transpiler C-to-C frames +
+  inline hot-view sub-ABI (c-transpiler-plan.md), nullable member-ext
+  gating / tower strength (worklist C2).
+- tl_atomic_update_contended litmus flake: watch-state; the sweep prints
+  got-vs-expected tails, postmortem on next natural occurrence.
+- ktor widened pack includes are validated by the commontest census only;
+  the ktor e2e itests gate them in CI (risk note in open-campaigns.md §4).
+- plans/open-campaigns.md §3 still lists combine/zip as LIVE — both were
+  fixed since (extension-arity trailing-lambda rule + receiver-tower head
+  binding; guards examples/flow_zip.kt, examples/flow_combine.kt).
+  Reconciling that register is Simplify item S3.
+
+## Track S — Simplify
+
+- [ ] S1. Delete the dead compose-plugin gate. `composePluginEnabled()`
+      hard-returns `true` (the cutover flipped); ~8 files still branch on
+      it (host_call_func, host_call_member, host_call_value,
+      host_instances, interp_ir/build, compose_pass, stdlib_image hash,
+      itest env). Inline the true arms, delete the dead alternatives, drop
+      the KLIO_COMPOSE_PLUGIN env plumbing (itest env-set, pack-cache
+      image-hash tag, docs). This is the recorded final step of the
+      cutover ("flip default + DELETE implicit impl"); grep for any other
+      implicit-composer-era remnants while there. Battery must be
+      count-identical.
+- [ ] S2. Split the three giant modules, behavior-frozen:
+      - src/ir/lower/expr.zig (23.8k lines) — per-concern submodules
+        (bare-call resolution arms, lambda lowering, receiver/tower
+        machinery, call emission, static type derivation).
+      - src/interp_ir/vm/host_call_member.zig (16.0k) — dispatch tails by
+        route (member walk, extension fallback, stdlib ladder, caches,
+        overload scoring already partly in overload_match.zig).
+      - src/ir/eval.zig (12.8k) — exec arms by instruction family, frame
+        machinery, leaf serve, liveness.
+      One module per landing, imports rewired via build.zig, zigcheck +
+      battery after each. No logic edits ride along with a move.
+- [ ] S3. Plan-register hygiene: 44 docs under plans/. Reconcile
+      open-campaigns.md against current reality (zip/combine fixed, ktor
+      census 465/2/0, coroutine cluster closed), move finished campaign
+      logs into PLAN-archive.md, and make open-campaigns.md the single
+      live register that every other doc points into. worklist.md's closed
+      round folds in too.
+- [ ] S4. Trace-knob audit: ~240 env probes across the three big modules
+      alone. Inventory every KLIO_* knob (grep), delete the dead ones
+      (knobs whose print sites were removed), converge the remaining reads
+      on runtime.envOnce, and complete the docs/development/debugging.md
+      table so it IS the inventory. No knob exists undocumented.
+- [ ] S5. Itest inventory: 69 suites under src/itests. Identify
+      superseded/overlapping ones (anything targeting deleted paths, e.g.
+      implicit-composer-era coverage) and fold or delete. CI time is a
+      budget; every suite should earn its wall.
+
+## Track V — Validate
+
+- [ ] V1. Fresh red-set census FIRST: run `zig build test-all` and
+      `scripts/gate.sh` once on current main and enumerate the true
+      failure set (memory's failure lists have repeatedly gone stale in
+      both directions). Diff against the recorded baselines before
+      touching anything; everything below re-anchors on that census.
+- [ ] V2. Make the ratchets ratchet:
+      - src/itests/ktor_commontest.zig has `.baseline = 0` — it can never
+        fail. Set it to the census floor (last recorded 465 passed / 2
+        failed / 0 incomplete; margin for CI variance).
+      - compose_plugin_commontest BASELINE 1365 vs observed 1371-1374 this
+        week — raise to the observed floor.
+      - Audit the other suites for zero/soft baselines while there.
+- [ ] V3. The 2 remaining ktor_commontest fails (from the 465/2/0
+      census): identify, root-cause, fix. plans/open-campaigns.md §4 has
+      the census recipe and the per-class isolation notes.
+- [ ] V4. The 4 concurrency stress tests + validatePotentialDeadlock +
+      the 2 PausableCompositionTests background tests: all compute-bound
+      (measured, not mechanism bugs). They are the ACCEPTANCE METRIC for
+      Accelerate work, not independent fixes — each Accelerate round
+      re-runs them solo against their declared budgets and records the
+      new standing.
+- [ ] V5. Leniency follow-through: the unimported-extension warning landed
+      (once-per-declaration, exact import named). Consider the next
+      escalation once import tracking is trusted: a `klio check` /
+      diagnostic-mode error for the same evidence, keeping `klio run`
+      lenient-but-loud. Blocked on confidence in wildcard/alias/default
+      import coverage; not before.
+
+## Track A — Accelerate
+
+Interpreter execution (the campaign continuation; rig:
+scratchpad reprosrc/aacbench.kt on the harness, plus the ratchet wall and
+the V4 tests as acceptance):
+
+- [ ] A1. Cross-thread borrow/refcount cost (~4% solo, amplified under
+      the suite's 8-way contention; the ~6% futex bucket is the same
+      locks contended). Candidates in order of risk:
+      - NoopRwLock adoption for provably-immutable cell types (the opt-in
+        `objref_immutable` machinery exists; audit ClassDef and other
+        registry-frozen types for post-load immutability, freeze-point
+        them if needed).
+      - Read-mostly seqlock or RCU-style snapshot for class metadata reads
+        (the class.borrow() on every instance op).
+      - Per-cell thread-bias is recorded as the expensive last resort
+        (revocation needs safepoint coordination).
+- [ ] A2. Core-loop round: extend instruction fusion coverage (the
+      jump/br/cmp_br streams exist; measure getfield+call and
+      const+binop pair frequency first), and framed-register fill masking
+      (the leaf-serve def-before-use/no-fill landed; the framed path still
+      pays appendNTimes ~1% — needs a per-frame written mask that gcMark
+      and suspension snapshots respect, so it is a real change, not a
+      tweak).
+- [ ] A3. Name-keyed map pressure: getIndex ~2.8% + eqlBytes ~3.5% spread
+      across registry/dispatch maps. The structural direction is
+      intern-once: resolve names to integer ids at lowering/link time so
+      runtime probes are integer-keyed (the member-resolve name_p identity
+      cache is the pattern; extend it toward funcsBySimpleName,
+      field lookup, and the import-scope maps). Measure per-map first via
+      KLIO_PROF_CALLERS=getIndex before converting anything.
+- [ ] A4. Re-measure under CONTENTION, not just solo: the stress tests
+      fail in-suite worse than solo. Add an 8-way contention variant of
+      the rig (run 8 aacbench processes pinned) so lever measurements see
+      the cache-line and futex effects the suite sees.
+
+Memory management:
+
+- [ ] A5. Slab footprint and churn: one 4-rep bench maps 703MB
+      (KLIO_SLAB_STAT) and newSlab threading costs ~2.6% of wall; a
+      GC_GROWTH sweep moved memory (up to 1.25GB) but not wall. Questions
+      to answer with KLIO_GC_HIST + KLIO_SLAB_TRACE/KLIO_CELL_TRACE:
+      what class sizes dominate, why do slabs keep mapping instead of
+      reusing (spare/dormant policy), what is actually live at peak per
+      rep (~175MB — retention vs trigger lag). Then pick the lever:
+      trigger pacing, dormant-page revival policy, or per-class spare
+      tuning. Suite RSS is the acceptance number (KLIO_RSS_CAP_KB=6.5GB
+      exists in the ratchet — how close does it run?).
+- [ ] A6. Wall-clock outliers as memory/dispatch probes:
+      compose_foundation_lazy at 3m42 warm and the 55s background-yield
+      round-trip (a yield on Dispatchers.Default costs a cross-thread
+      dispatch cycle — profile the hop: gate wake, child-Vm materialize,
+      repost). Each gets one profiling pass and either a lever or a
+      recorded floor.
+- [ ] A7. Ship-mode numbers: record ReleaseFast (the ~3% ReleaseSafe
+      undefined-poison memset and safety checks vanish there) alongside
+      harness numbers when reporting user-facing performance;
+      ReleaseSafe stays the itest/battery build on purpose.
+
+Recorded measured-first roads (open only on a motivating measurement, per
+their own plans): Value 24 -> 16; C-transpiler C-to-C frames + inline
+hot-view sub-ABI; nullable member-ext gating / tower strength.
+
+## Order of work
+
+1. V1 fresh census (test-all + gate) — anchor everything on the true
+   current red set.
+2. S1 dead plugin-gate deletion — small, immediate clarity win, and it
+   de-noises every file the later splits touch.
+3. V2 baseline honesty (ktor floor, plugin floor) — cheap, makes every
+   later regression visible.
+4. V3 the 2 ktor fails.
+5. A1 + A4 (contention rig, then the borrow/lock round) — the highest-value
+   perf front; V4 tests re-measured after.
+6. S2 module splits, interleaved between perf rounds (they touch the same
+   files; split AFTER a round lands, never mid-round).
+7. A5 memory round (slab/GC), then A6 outliers.
+8. A2/A3 as the following interpreter rounds.
+9. S3/S4/S5 hygiene passes fill the gaps between rounds.

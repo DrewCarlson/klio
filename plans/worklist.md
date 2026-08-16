@@ -390,3 +390,11 @@ ktor commontest 465/468 zero-incomplete; compose remember-family 26/26;
 dirty-bits calculus + slot-exact checkboxLike; corpus 315/315 with the
 interactive-example contract; coroutine debt closed by JVM oracle;
 ratchet floor 1305 -> 1340. Details: `plans/open-campaigns.md`.
+
+## Next: Simplify / Validate / Accelerate
+
+The follow-on work — codebase simplification, test/validation repair
+(fresh red-set census, honest ratchet baselines, the 2 remaining ktor
+fails), and the performance campaign's continuation (interpreter
+execution rounds + memory management) with the E4 standing as its
+acceptance metric — is planned in `plans/simplify-validate-accelerate.md`.
