@@ -148,9 +148,13 @@ Ground rules carried forward:
       - compose_plugin_commontest BASELINE 1365 vs observed 1371-1374 this
         week — raise to the observed floor.
       - Audit the other suites for zero/soft baselines while there.
-- [ ] V3. The 2 remaining ktor_commontest fails (from the 465/2/0
-      census): identify, root-cause, fix. plans/open-campaigns.md §4 has
-      the census recipe and the per-class isolation notes.
+- [x] V3. The 2 remaining ktor_commontest fails: CLOSED BY RECORD —
+      both are URLBuilderTest scheme-with-digits, where klio MATCHES
+      real Kotlin semantics (upstream URLProtocol's own require
+      rejects digit schemes on the JVM; how upstream CI passes them is
+      unclear) and the recorded verdict is do-not-diverge. The raised
+      440 baseline absorbs them; open-campaigns.md §4 carries the full
+      anatomy.
 - [ ] V4. The 4 concurrency stress tests + validatePotentialDeadlock +
       the 2 PausableCompositionTests background tests: all compute-bound
       (measured, not mechanism bugs). They are the ACCEPTANCE METRIC for
