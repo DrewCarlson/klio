@@ -297,7 +297,11 @@ pub const ProgramImage = struct {
     func_owner_class_cache: std.AutoHashMap(FuncOwnerKey, ?[]const u8),
     allocator: Allocator,
 
-    pub const MemberResolveKey = struct { type_p: usize, name_p: usize, args_empty: bool };
+    /// `file`/`argc` are 0 for a file-agnostic resolution. When an imported
+    /// pack extension shadows the stdlib surface the answer depends on the
+    /// call site's import scope and the call's arity, so those entries key by
+    /// (file+1, argc) instead of standing down from the cache entirely.
+    pub const MemberResolveKey = struct { type_p: usize, name_p: usize, args_empty: bool, file: u32 = 0, argc: u32 = 0 };
     pub const MemberResolveEntry = struct { func: ?StdlibFn, fqn: []const u8 };
     pub const InstanceMethodKey = struct { class_p: usize, name_p: usize, n_args: u32, sig: u64 };
     pub const RuntimeVirtualKey = struct { class_p: usize, slot: u32 };

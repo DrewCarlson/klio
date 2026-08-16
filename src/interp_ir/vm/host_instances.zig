@@ -3882,6 +3882,14 @@ fn anonSiteThunksPut(key: usize, entry: AnonSiteThunks) AnonSiteThunks {
 /// `anonLowerEnter`/`anonLowerExit`, held by callers around LOWERING
 /// sections only (never around thunk execution).
 var shared_anon_module: ?ObjRef(Module) = null;
+/// Cell identity of the run module `shared_anon_module` was cloned from.
+/// An in-process driver that builds and frees a module PER PROGRAM (the
+/// parity itests) must not serve a later program from a side module whose
+/// shallow-shared tables point into the freed earlier module — the stale
+/// clone's appended-class method slices dangle and the first anon-method
+/// bare call segfaults. A base-identity mismatch drops the cache and
+/// re-clones from the live module.
+var shared_anon_base_identity: usize = 0;
 var anon_lower_mutex: runtime.SpinMutex = .{};
 var anon_lower_owner: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var anon_lower_depth: usize = 0;
@@ -3918,7 +3926,12 @@ pub fn anonSiteModule(self: *VmHost, allocator: Allocator, cache: *?ObjRef(Modul
     if (std.mem.eql(u8, runtime.envOnce("KLIO_ANON_BASE") orelse "1", "0")) {
         return ObjRef(Module).init(allocator, Module.default(allocator));
     }
+    if (shared_anon_module != null and shared_anon_base_identity != self.module.identity()) {
+        shared_anon_module.?.deinit();
+        shared_anon_module = null;
+    }
     if (shared_anon_module == null) {
+        shared_anon_base_identity = self.module.identity();
         const mg = self.module.borrow();
         defer mg.deinit();
         // The shared side module owns a REAL allocator, never the run

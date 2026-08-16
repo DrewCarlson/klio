@@ -2553,7 +2553,7 @@ fn runThunkValue(self: *VmHost, allocator: Allocator, fid: FuncId) Allocator.Err
 /// and the class graph are both fixed once the program is loaded, so a class
 /// that does not own `name` for `recv_key` never starts owning it — the
 /// negative answer is as cacheable as the positive one.
-const OwnerKeyedSlot = struct { key: u64 = 0, fid: u32 = NO_FID, hit: bool = false };
+const OwnerKeyedSlot = struct { key: u64 = 0, gen: u32 = 0, fid: u32 = NO_FID, hit: bool = false };
 const NO_FID: u32 = std.math.maxInt(u32);
 threadlocal var owner_keyed_memo: [1024]OwnerKeyedSlot = @splat(.{});
 threadlocal var owner_keyed_memo_set: [1024]OwnerKeyedSlot = @splat(.{});
@@ -2634,12 +2634,13 @@ fn ownerKeyedExtProp(comptime setters: bool, map: anytype, recv_key: []const u8,
         };
         const k = ownerKeyedSlotKey(cls.identity(), recv_key, name);
         const slot = &memo[(k >> 7) % memo.len];
-        if (slot.key == k) {
+        const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
+        if (slot.key == k and slot.gen == gen) {
             if (!slot.hit) continue;
             return FuncId.from(slot.fid);
         }
         const found = ownerKeyedForClass(cls, map, recv_key, name);
-        slot.* = .{ .key = k, .hit = found != null, .fid = if (found) |f| f.int() else NO_FID };
+        slot.* = .{ .key = k, .gen = gen, .hit = found != null, .fid = if (found) |f| f.int() else NO_FID };
         if (found) |fid| return fid;
     }
     return null;

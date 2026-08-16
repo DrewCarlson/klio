@@ -11532,6 +11532,51 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
     // concrete — a poisoned `List<T>` record disproves more than it types.
     for (f.return_ty.args) |arg| {
         if (bareTypeParamHead(arg.name) or ir.parseClassTypeParamIdentity(arg.name) != null) {
+            // An EXPLICIT type-argument list instantiates the generic
+            // return directly: `emptyList<Int>()` IS `List<Int>` — kotlinc
+            // resolves the overload set on it statically, and dropping it
+            // left an empty value's runtime pick to a value-shape memo
+            // that replays whichever caller ran first.
+            if (call.type_args.len != 0) explicit: {
+                const expl_trace = if (runtime.envOnce("KLIO_SCRT_TRACE")) |w| std.mem.eql(u8, w, nm) else false;
+                const tp = b.module.registry.func_type_params.get(fid) orelse {
+                    if (expl_trace) std.debug.print("[expl] {s} no func_type_params fid={d}\n", .{ nm, fid.int() });
+                    break :explicit;
+                };
+                if (expl_trace) std.debug.print("[expl] {s} tp={d} targs={d}\n", .{ nm, tp.items.len, call.type_args.len });
+                if (tp.items.len != call.type_args.len) break :explicit;
+                const out_args = try b.allocator.alloc(ir.TypeRef, f.return_ty.args.len);
+                var filled: usize = 0;
+                for (f.return_ty.args, out_args) |*ra, *oa| {
+                    const rah = typeHead(std.mem.trimEnd(u8, ra.name, "?"));
+                    var sub: ?*const ast.TypeRef = null;
+                    for (tp.items, 0..) |pn, pi| {
+                        if (std.mem.eql(u8, pn, rah)) {
+                            sub = &call.type_args[pi];
+                            break;
+                        }
+                    }
+                    const s = sub orelse break;
+                    if (s.name.name.len == 0 or b.isTypeParam(s.name.name)) break;
+                    oa.* = .{
+                        .name = try b.allocator.dupe(u8, loweredTypeName(b, s)),
+                        .nullable = s.nullable or ra.nullable,
+                        .args = &.{},
+                    };
+                    filled += 1;
+                }
+                if (filled != out_args.len) {
+                    if (expl_trace) std.debug.print("[expl] {s} filled={d}/{d} ra0={s} tp0={s}\n", .{ nm, filled, out_args.len, if (f.return_ty.args.len > 0) f.return_ty.args[0].name else "-", tp.items[0] });
+                    for (out_args[0..filled]) |*oa| oa.deinit(b.allocator);
+                    b.allocator.free(out_args);
+                    break :explicit;
+                }
+                return .{
+                    .name = try b.allocator.dupe(u8, std.mem.trimEnd(u8, f.return_ty.name, "?")),
+                    .nullable = f.return_ty.nullable,
+                    .args = out_args,
+                };
+            }
             return .{
                 .name = try b.allocator.dupe(u8, f.return_ty.name),
                 .nullable = f.return_ty.nullable,
@@ -11550,6 +11595,11 @@ fn scrtVia(call_expr: *const Expr, via: []const u8, t: ir.TypeRef) ir.TypeRef {
         {
             std.debug.print("[scrt-via] {s} via={s} ty={s}\n", .{ w, via, t.name });
         }
+        if (call_expr.* == .Call and call_expr.Call.callee.* == .Member and
+            std.mem.eql(u8, w, call_expr.Call.callee.Member.name.name))
+        {
+            std.debug.print("[scrt-via] member {s} via={s} ty={s}\n", .{ w, via, t.name });
+        }
     }
     return t;
 }
@@ -11565,6 +11615,11 @@ fn staticCallReturnTypeRef(
             std.mem.eql(u8, w, call_expr.Call.callee.Path.segments[0].name))
         {
             std.debug.print("[scrt-out] {s} ty={s}\n", .{ w, if (r) |t| t.name else "-" });
+        }
+        if (call_expr.* == .Call and call_expr.Call.callee.* == .Member and
+            std.mem.eql(u8, w, call_expr.Call.callee.Member.name.name))
+        {
+            std.debug.print("[scrt-out] member {s} ty={s}\n", .{ w, if (r) |t| t.name else "-" });
         }
     }
     return r;
@@ -13497,7 +13552,14 @@ pub fn buildStaticReturnArgShapes(
         }
         if (owned.*) |ty| {
             shape.ty = ty;
-            shape.ty_authoritative = true;
+            // A CALL-RETURN derivation whose head is a bare type parameter
+            // names the CALLEE's parameter, not the caller's: judging it
+            // against the caller's same-named bound conflates scopes (a
+            // method-level `T : CharSequence` shadowing the class's
+            // `T : Number` disproved the Number overload kotlinc picks).
+            // Keep it advisory — it types, but never disproves.
+            const th = typeHead(std.mem.trimEnd(u8, ty.name, "?"));
+            shape.ty_authoritative = !(bareTypeParamHead(th) or ir.parseClassTypeParamIdentity(th) != null);
         }
     }
     return .{ .shapes = shapes, .inferred = inferred };
@@ -14061,6 +14123,26 @@ fn lowerPathCall(
 
     const shapes = try buildArgShapes(b, args, ast_arg_names);
     defer b.allocator.free(shapes);
+    // An argument written with an EXPLICIT type-argument list carries
+    // programmer-stated types the raw shape pass cannot see
+    // (`pick(emptyList<Int>())` — the call-return record instantiates
+    // `List<Int>`). Derive exactly those args so the emission pick judges
+    // the same evidence the derivation passes did; anything else keeps the
+    // raw shape (cost and behavior unchanged).
+    var explicit_shape_owned: [8]?ir.TypeRef = @splat(null);
+    defer for (&explicit_shape_owned) |*t| {
+        if (t.*) |*owned| owned.deinit(b.allocator);
+    };
+    for (args, shapes, 0..) |*a, *sh, i| {
+        if (i >= explicit_shape_owned.len) break;
+        if (sh.ty != null) continue;
+        if (a.* != .Call or a.Call.type_args.len == 0) continue;
+        if (try staticCallReturnTypeRef(b, a)) |t| {
+            explicit_shape_owned[i] = t;
+            sh.ty = t;
+            sh.ty_authoritative = true;
+        }
+    }
     const owned_type_param_bounds = try b.typeParamBoundsSlice();
     defer if (owned_type_param_bounds) |bounds| b.allocator.free(bounds);
     var ctx = resolveCtxFor(
@@ -14281,10 +14363,22 @@ fn lowerPathCall(
                     }
                 }
             }
+            // An argument written with an EXPLICIT type-argument list
+            // (`pick(emptyList<Int>())`) is programmer-stated type evidence
+            // the runtime cannot reconstruct from the VALUE — an empty list
+            // is typeless at run time, and the value-typed re-pick replayed
+            // whichever overload a prior caller resolved. Such calls pin,
+            // exactly as a cast-disambiguated call does.
+            const explicit_targ_evidence = blk: {
+                for (args) |*a| {
+                    if (a.* == .Call and a.Call.type_args.len != 0) break :blk true;
+                }
+                break :blk false;
+            };
             return switch (res_final.emit_form) {
                 // A finalized pick is as definitive as a cast pick: the
                 // runtime's value-typed overload re-pick must not override it.
-                .Call => try emitCall(b, expr, target, was_cast or res_final.target_final),
+                .Call => try emitCall(b, expr, target, was_cast or res_final.target_final or explicit_targ_evidence),
                 .CallMember => try emitCallMember(b, expr, target, was_cast),
                 .CallMemberOrGlobal => try emitMemberOrGlobal(b, expr, target, was_cast),
                 // The resolver never emits a value call with a committed target.
@@ -19262,6 +19356,9 @@ fn lowerResolvedMemberCall(
                     "[member-static-bound] {s} <: {s} complete={}\n",
                     .{ bound.param, bound.bound, bound.complete },
                 );
+            }
+            for (shapes, 0..) |sh, i| {
+                std.debug.print("[member-static-shape] #{d} ty={s} auth={}\n", .{ i, if (sh.ty) |t| t.name else "<null>", sh.ty_authoritative });
             }
         }
     }
