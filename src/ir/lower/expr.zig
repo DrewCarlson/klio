@@ -11550,6 +11550,11 @@ fn scrtVia(call_expr: *const Expr, via: []const u8, t: ir.TypeRef) ir.TypeRef {
         {
             std.debug.print("[scrt-via] {s} via={s} ty={s}\n", .{ w, via, t.name });
         }
+        if (call_expr.* == .Call and call_expr.Call.callee.* == .Member and
+            std.mem.eql(u8, w, call_expr.Call.callee.Member.name.name))
+        {
+            std.debug.print("[scrt-via] member {s} via={s} ty={s}\n", .{ w, via, t.name });
+        }
     }
     return t;
 }
@@ -11565,6 +11570,11 @@ fn staticCallReturnTypeRef(
             std.mem.eql(u8, w, call_expr.Call.callee.Path.segments[0].name))
         {
             std.debug.print("[scrt-out] {s} ty={s}\n", .{ w, if (r) |t| t.name else "-" });
+        }
+        if (call_expr.* == .Call and call_expr.Call.callee.* == .Member and
+            std.mem.eql(u8, w, call_expr.Call.callee.Member.name.name))
+        {
+            std.debug.print("[scrt-out] member {s} ty={s}\n", .{ w, if (r) |t| t.name else "-" });
         }
     }
     return r;
@@ -13497,7 +13507,14 @@ pub fn buildStaticReturnArgShapes(
         }
         if (owned.*) |ty| {
             shape.ty = ty;
-            shape.ty_authoritative = true;
+            // A CALL-RETURN derivation whose head is a bare type parameter
+            // names the CALLEE's parameter, not the caller's: judging it
+            // against the caller's same-named bound conflates scopes (a
+            // method-level `T : CharSequence` shadowing the class's
+            // `T : Number` disproved the Number overload kotlinc picks).
+            // Keep it advisory — it types, but never disproves.
+            const th = typeHead(std.mem.trimEnd(u8, ty.name, "?"));
+            shape.ty_authoritative = !(bareTypeParamHead(th) or ir.parseClassTypeParamIdentity(th) != null);
         }
     }
     return .{ .shapes = shapes, .inferred = inferred };
@@ -19262,6 +19279,9 @@ fn lowerResolvedMemberCall(
                     "[member-static-bound] {s} <: {s} complete={}\n",
                     .{ bound.param, bound.bound, bound.complete },
                 );
+            }
+            for (shapes, 0..) |sh, i| {
+                std.debug.print("[member-static-shape] #{d} ty={s} auth={}\n", .{ i, if (sh.ty) |t| t.name else "<null>", sh.ty_authoritative });
             }
         }
     }

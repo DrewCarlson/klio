@@ -4204,7 +4204,16 @@ pub const Module = struct {
                                 required.?,
                                 actual_bounds,
                             ) catch false) return .compatible;
-                            if (self.staticReceiverCompatibility(null, bref, required.?) == .incompatible and
+                            // Refutation-by-bound needs a bare `T` that
+                            // provably names the CALLER's own parameter (an
+                            // authoritative shape). A call-return-derived
+                            // `T` names the CALLEE's parameter; a
+                            // same-named caller bound (`fun <T :
+                            // CharSequence>` shadowing the class's `T :
+                            // Number`) then refuted the overload kotlinc
+                            // picks. Advisory shapes never refute here.
+                            if (arg.ty_authoritative and
+                                self.staticReceiverCompatibility(null, bref, required.?) == .incompatible and
                                 self.staticReceiverCompatibility(null, required.?, bref) == .incompatible)
                             {
                                 return .incompatible;
@@ -4290,7 +4299,15 @@ pub const Module = struct {
                     param,
                     actual_bounds,
                 ) catch false) return .compatible;
-                if (self.staticTypeDisproofComplete(ty, actual_bounds) and
+                // Judging the arg's bare `T` THROUGH the caller's bound is
+                // only sound when the shape provably names the caller's own
+                // parameter (authoritative). A call-return-derived `T` is the
+                // CALLEE's parameter; a same-named caller bound (`fun <T :
+                // CharSequence>` shadowing the class's `T : Number`) then
+                // refuted the overload kotlinc picks. Advisory shapes never
+                // refute.
+                if (arg.ty_authoritative and
+                    self.staticTypeDisproofComplete(ty, actual_bounds) and
                     self.staticTypeDisproofComplete(param, actual_bounds))
                 {
                     return .incompatible;
