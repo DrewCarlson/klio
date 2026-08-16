@@ -11453,7 +11453,10 @@ pub fn declaringClassSimpleName(self: *VmHost, module: *const Module, fid: FuncI
         if (pg.get().func_owner_class_cache.get(key)) |hit| return hit;
     }
     var owner: ?[]const u8 = null;
-    for (module.classes.items) |*c| {
+    const dcs_trace = runtime.envOnce("KLIO_DCS_TRACE") != null;
+    if (dcs_trace) std.debug.print("[dcs] module={x} n_classes={d} fid={d}\n", .{ @intFromPtr(module), module.classes.items.len, @intFromEnum(fid) });
+    for (module.classes.items, 0..) |*c, ci| {
+        if (dcs_trace) std.debug.print("[dcs]   class[{d}] ptr={x} methods.ptr={x} methods.len={d}\n", .{ ci, @intFromPtr(c), @intFromPtr(c.methods.ptr), c.methods.len });
         for (c.methods) |mfid| {
             if (@intFromEnum(mfid) == @intFromEnum(fid)) {
                 owner = c.name;
