@@ -174,7 +174,7 @@ validatePotentialDeadlock (pump fairness for virtual-time drains).
       examples/member_ext_prop_visibility.kt (kotlinc/JVM-verified
       shadow/tower/import surface). Ratchet 1372-1373 observed, floor
       trimmed to 1365 (pre-change peak 1375 is inside the ±3 band).
-- [ ] C3. ktor server/client e2e itests: client GET works END-TO-END
+- [x] C3. ktor server/client e2e itests: client GET works END-TO-END
       (status=200) — itest-ktor_client_get 4/4 and channel_async PASS
       after peeling five pre-existing roots, each with a
       kotlinc-verified guard example:
@@ -200,13 +200,34 @@ validatePotentialDeadlock (pump fairness for virtual-time drains).
          examples/private_stored_no_override.kt.
       5. Pack include: ktor-client-core jvmAndPosix
          `checkContentLength` actual.
-      REMAINING: itest-ktor_server routing test — pre-existing at the
-      prior commit too — dies dispatching `status` on
-      RoutingPipelineResponse: the walk reaches the delegate
-      (KlioApplicationResponse) but misses the inherited
-      BaseApplicationResponse.status overloads. Also recorded:
-      hangbisect3 shape (foreign private stored + async in interface
-      default member) hangs pre-existing — parks both coroutines.
+      SERVER GATE ALSO GREEN after four more roots (each verified):
+      6. Hierarchy ascent by name evidence when a pack shim class's
+         cross-root supertype ids never resolved (KlioApplicationResponse
+         walked as a leaf, hiding BaseApplicationResponse.status).
+      7. Bodyless member declarations join overload ranking: the
+         registry records abstract member arities (rides pack images —
+         LAYOUT CHANGE, rebuild installed packs), and the inline-target
+         pick declines an extension/top-level candidate when an implicit
+         receiver's hierarchy declares an abstract member taking the
+         call (respond(message, typeInfo<T>()) spliced the reified 2-arg
+         respond(status, message), binding CONTENT to status).
+         Member-inline picks exempt (DebugPipelineContext.proceed).
+      8. Scope-qualified property reads whose lexical-owner premise
+         fails (a companion-fn lambda reading the RECEIVER's `call`
+         while the outer class declares an instance `call`) retry the
+         implicit-receiver candidates with the plain name before
+         failing. examples/companion_lambda_receiver_read.kt.
+      9. The gate fixtures themselves were ILLEGAL Kotlin (bare
+         get/post never imported — kotlinc rejects them); klio's
+         unimported-extension leniency resolved them but mistyped the
+         handler lambdas' receivers, unbinding `call`. The fixtures now
+         import routing.get/post. RECORDED klio-ism: that leniency
+         still mistypes receiver lambdas when it engages.
+      All three ktor e2e gates green: itest-ktor_server,
+      itest-ktor_client_get, itest-ktor_channel_async.
+      Also recorded: hangbisect3 shape (foreign private stored + async
+      in interface default member) hangs pre-existing — parks both
+      coroutines.
 
 ## Phase D — Watches (no active work; act when they fire)
 
