@@ -287,11 +287,25 @@ validatePotentialDeadlock (pump fairness for virtual-time drains).
       every overload gone a lenient tail mis-bound the call; the
       sgetter suspicion was a downstream symptom. Guard
       examples/interface_private_shadow_async.kt.
-- [ ] E3. Pump fairness: a virtual-time drain must be able to observe
-      the queue empty even when an interpreted worker always wins the
-      repost race. Unlocks RecomposerTests.validatePotentialDeadlock
-      and the recorded runTest-teardown / "daemon task abandoned"
-      family — one mechanism, two symptom groups.
+- [x] E3. Pump fairness: CLOSED AS DISPROVEN. Measured solo with
+      KLIO_SPIN_TRACE (5 samples over 60s) and KLIO_PROF (61k
+      samples): every spin sample is INSIDE active recompose /
+      change-list work (Text endNode, SlotWriter.advanceBy,
+      Operations.push — different positions each sample, marching),
+      and the profile is diffuse interpreter cost (mum 10.9%, read
+      5.7%, eqlBytes 4.8%, hash/update/final1 ~3% — the hash+string
+      floor), with NO drain-poll churn and NO dominant pathological
+      function. validatePotentialDeadlock is compute-bound: each
+      advance(5000) marches ~312 TestMonotonicFrameClock frames and
+      every frame recomposes all 200 Texts (both loops bump `state`
+      per frame), so the test needs ~3120 interpreted recompose
+      passes inside the 90s wall cap. The "always loses the repost
+      race" theory was wrong; "daemon task abandoned" is the
+      wall-cap's abandon diagnostic, not a mechanism. The lever is
+      E4 (frame pooling + string-eql/hash caches — exactly this
+      profile). If E4 lands and an advance still cannot finish,
+      revisit bounding mid-pass Default reposts per frame (the
+      b/329011032 re-dirty multiplier) as a second-order item.
 - [ ] E4. Concurrency perf round 3 (the last 4 stress tests, and the
       suite wall): frame-buffer pooling (kills the ~9% memset + the
       per-frame alloc), member-walk string-eql caches (~9%), then
