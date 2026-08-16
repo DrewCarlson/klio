@@ -229,7 +229,10 @@ validatePotentialDeadlock (pump fairness for virtual-time drains).
       in interface default member) hangs pre-existing — parks both
       coroutines.
 
-## Phase E — Next round (active; worked top to bottom)
+## Phase E — Next round (COMPLETE except the open E4 campaign;
+## worked top to bottom: E1/E2/E5 landed, E3 closed as disproven with
+## the measurement, E4's round landed with the next round's candidates
+## ranked in place, E6 stays measured-first by design)
 
 - [x] E1. Free-win harvest + pack hygiene. COMPLETE (both pack homes
       rebuilt again after the receiver-head lowering landed, since
