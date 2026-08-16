@@ -94,6 +94,19 @@ pub const FuncStreams = struct {
 var cache_mutex: runtime.SpinMutex = .{};
 var cache: ?std.AutoHashMap(usize, *const FuncStreams) = null;
 
+/// Drop every cached stream table. The cache keys on the function's BLOCKS
+/// POINTER, which is stable for one program's life — an in-process driver
+/// that frees a program's module and runs another reuses those addresses,
+/// and a stale hit executes the PREVIOUS program's compiled stream against
+/// the new instructions (a tag-mismatch panic at best). Called from the
+/// per-program cache reset; entries leak by design (code-cache data has no
+/// per-stream ownership records worth building for a test driver).
+pub fn resetCacheForTest() void {
+    cache_mutex.lock();
+    defer cache_mutex.unlock();
+    if (cache) |*c| c.clearRetainingCapacity();
+}
+
 /// `allow_fuse` is process-constant (the loop JIT's enablement); the
 /// first call decides what the cache holds. `consts` is the owning
 /// module's constant table (for embedding small Int payloads).

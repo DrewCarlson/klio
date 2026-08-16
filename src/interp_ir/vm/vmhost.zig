@@ -179,6 +179,10 @@ pub fn resetRunGlobalCaches() void {
     // running many programs replayed the previous program's resolutions off
     // reused cell addresses (wrong overloads, calls into freed IR).
     host_call_member.bumpDispatchCacheGen();
+    // The bytecode-tier stream cache keys on blocks-pointer identity;
+    // reused addresses across in-process programs must not replay a prior
+    // program's compiled stream.
+    ir.bc.resetCacheForTest();
     ir.eval.resetSuspendLivenessCache();
     stdlib.resetEmptyCollectionSingletons();
     stdlib.resetEmptySequenceSingleton();
