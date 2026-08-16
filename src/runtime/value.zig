@@ -2184,8 +2184,15 @@ pub const Value = union(enum) {
         if (intrinsic_intern == null) intrinsic_intern = std.StringHashMap(*const IntrinsicData).init(a);
         const gop = intrinsic_intern.?.getOrPut(fqn) catch @panic("intrinsic intern");
         if (!gop.found_existing) {
+            // Own the key bytes: the caller's slice is typically a module's
+            // constant, which an in-process multi-program driver frees at
+            // that program's teardown — a borrowed key then dangles and the
+            // next program's probe compares against freed memory. The dup is
+            // immortal, matching the entry's own lifetime.
+            const owned = a.dupe(u8, fqn) catch @panic("intrinsic intern");
+            gop.key_ptr.* = owned;
             const d = a.create(IntrinsicData) catch @panic("intrinsic intern");
-            d.* = .{ .fqn = fqn, .func = func };
+            d.* = .{ .fqn = owned, .func = func };
             gop.value_ptr.* = d;
         }
         return .{ .Intrinsic = gop.value_ptr.* };
