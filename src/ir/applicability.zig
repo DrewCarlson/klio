@@ -918,6 +918,55 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
         }
     }
 
+    // NON-FINAL vararg, purely positional: the leading args fill the prefix,
+    // the vararg absorbs every remaining positional, and every parameter
+    // after it must carry a default — Kotlin fills those only by name.
+    // `report("A", 1, 2, 3)` on `(title, vararg items, footer = "end")`
+    // binds items=[1,2,3]; without this arm the arity check below rejected
+    // the only candidate and the call fell to the value route.
+    if (mid_vararg) |vpos| {
+        if (args.len >= vpos and (args.len == 0 or !args[args.len - 1].is_lambda)) {
+            var tail_ok = true;
+            var gi = vpos + 1;
+            while (gi < params.len) : (gi += 1) {
+                if (!paramHasDefault(sig, gi)) {
+                    tail_ok = false;
+                    break;
+                }
+            }
+            if (tail_ok) {
+                var total: i32 = -1;
+                var proven: u16 = 0;
+                var unknown: u16 = 0;
+                var k: usize = 0;
+                while (k < vpos) : (k += 1) {
+                    const sc = scoreArg(sig, &params[k].ty, &args[k], &scope) orelse return null;
+                    total += sc;
+                    if (argIsProven(&args[k])) proven += 1 else unknown += 1;
+                }
+                const elem_ty = varargElementRef(&params[vpos].ty);
+                while (k < args.len) : (k += 1) {
+                    const sc = scoreArg(sig, &elem_ty, &args[k], &scope) orelse return null;
+                    total += sc;
+                    if (argIsProven(&args[k])) proven += 1 else unknown += 1;
+                }
+                return .{
+                    .points = total,
+                    .proven_args = proven,
+                    .unknown_args = unknown,
+                    .exact_arity = false,
+                    .low_priority = sig.low_priority,
+                    .is_member = sig.is_member,
+                    .binding = .{
+                        .vararg_param = @intCast(vpos),
+                        .vararg_lo = @intCast(vpos),
+                        .vararg_hi = @intCast(args.len),
+                    },
+                };
+            }
+        }
+    }
+
     if (params.len < args.len and !last_vararg) {
         if (strace) std.debug.print("[app-null] fid={?d} arity params={d} args={d}\n", .{ if (sig.fid) |f| f.int() else null, params.len, args.len });
         return null;

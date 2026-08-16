@@ -164,7 +164,14 @@ fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(
         }
     }
     const vp = vararg_pos orelse return args.*;
-    var tail_fixed = n_params - vp - 1;
+    // Only NON-DEFAULTED params after the vararg reserve trailing
+    // positionals: a defaulted parameter after a vararg is fillable only by
+    // name (Kotlin), so `report("A", 1, 2, 3)` on `(title, vararg items,
+    // footer = "end")` packs items=[1,2,3] and leaves footer to its default.
+    var tail_fixed: usize = 0;
+    for (func.params[vp + 1 ..]) |*tp| {
+        if (tp.default == null) tail_fixed += 1;
+    }
     // A pass-threaded composable's trailing ($composer, $changed) pair does
     // not consume the caller's positionals on a PAIRLESS call: the vararg
     // absorbs everything and the pair completes from the ambient composer
@@ -186,7 +193,7 @@ fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(
                 break :blk std.mem.indexOf(u8, cg.get().name, "Composer") != null;
             };
         if (!has_pair_tail) {
-            tail_fixed -= 2;
+            tail_fixed -|= 2;
             pairless_pair = true;
         }
     }

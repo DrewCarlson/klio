@@ -1140,7 +1140,17 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // over-supplies a non-receiver lambda, and receiver-ness is never
         // inferred from a `this` capture (which may instead be lexical).
         // Vararg targets (legitimately variadic) are excluded.
-        const last_vararg = func.params.len != 0 and func.params[func.params.len - 1].is_vararg;
+        // ANY vararg param (not only a final one): a variadic function
+        // legitimately takes more arguments than its parameter count, so the
+        // receiver-overflow inference below must never consume its first
+        // argument (`report("A", 1, 2, 3)` on `(title, vararg items,
+        // footer = …)` lost "A" to a phantom receiver).
+        const last_vararg = blk: {
+            for (func.params) |*p| {
+                if (p.is_vararg) break :blk true;
+            }
+            break :blk false;
+        };
         const this_cap_idx: ?usize = blk: {
             for (info.capture_names, 0..) |n, i| {
                 if (std.mem.eql(u8, n, "this")) break :blk i;

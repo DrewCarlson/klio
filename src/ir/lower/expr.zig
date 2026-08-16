@@ -11464,8 +11464,27 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
             }
             if (elem_owned) |prev| {
                 const same = std.mem.eql(u8, prev.name, t2.name);
-                t2.deinit(b.allocator);
-                if (!same) diverged = true;
+                if (!same) {
+                    // Kotlin joins heterogeneous elements at their least
+                    // upper bound, not at `Any`: `listOf(Derived(), Base())`
+                    // is a `List<Base>`, and the declared element is what
+                    // extensions bind against. A subtype pair joins at the
+                    // wider head; unrelated heads keep the Any degrade.
+                    const ph = typeHead(std.mem.trimEnd(u8, prev.name, "?"));
+                    const th2 = typeHead(std.mem.trimEnd(u8, t2.name, "?"));
+                    if (b.module.classIsOrExtends(th2, ph)) {
+                        t2.deinit(b.allocator);
+                    } else if (b.module.classIsOrExtends(ph, th2)) {
+                        var old = elem_owned.?;
+                        old.deinit(b.allocator);
+                        elem_owned = t2;
+                    } else {
+                        t2.deinit(b.allocator);
+                        diverged = true;
+                    }
+                } else {
+                    t2.deinit(b.allocator);
+                }
             } else {
                 elem_owned = t2;
             }
@@ -11480,6 +11499,21 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
             elem_owned = .{ .name = try b.allocator.dupe(u8, "Any"), .nullable = saw_null, .args = &.{} };
         } else if (saw_null) {
             elem_owned.?.nullable = true;
+        }
+        // An EXPLICIT type argument outranks argument-head inference —
+        // `listOf<Base>(Derived())` is a `List<Base>`, exactly as kotlinc
+        // instantiates it, and the static extension binding downstream
+        // depends on the declared element, not the runtime one.
+        if (call.type_args.len == 1) {
+            const ta = &call.type_args[0];
+            if (ta.name.name.len != 0 and !b.isTypeParam(ta.name.name)) {
+                elem_owned.?.deinit(b.allocator);
+                elem_owned = .{
+                    .name = try b.allocator.dupe(u8, loweredTypeName(b, ta)),
+                    .nullable = ta.nullable,
+                    .args = &.{},
+                };
+            }
         }
         const ret_head = try b.allocator.dupe(u8, std.mem.trimEnd(u8, f2.return_ty.name, "?"));
         errdefer b.allocator.free(ret_head);
@@ -11532,6 +11566,33 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
     // concrete — a poisoned `List<T>` record disproves more than it types.
     for (f.return_ty.args) |arg| {
         if (bareTypeParamHead(arg.name) or ir.parseClassTypeParamIdentity(arg.name) != null) {
+            // The IMPLICIT receiver instantiates an EXTENSION's generic
+            // return: bare `toMutableList()` inside `Iterable<Base>.f()`
+            // is `MutableList<Base>` — without the record, the local it
+            // initializes stays untyped and a value read from it binds
+            // extensions against its RUNTIME class instead of the
+            // declared element.
+            if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) recv_inst: {
+                const fr: ir.TypeRef = if (b.spliceRecvTyRef()) |r| r.* else (b.recvTypeRef() orelse break :recv_inst);
+                if (fr.args.len == 0) break :recv_inst;
+                var shape_set0 = try buildStaticReturnArgShapes(b, call.args, &.{});
+                defer shape_set0.deinit(b.allocator);
+                if (try b.module.instantiatedCallReturnType(b.allocator, fid, fr, null, shape_set0.shapes, &.{})) |inst| {
+                    var out2 = inst;
+                    const oh = typeHead(std.mem.trimEnd(u8, out2.name, "?"));
+                    var concrete = oh.len > 2 and !b.isTypeParam(oh) and
+                        ir.parseClassTypeParamIdentity(oh) == null;
+                    if (concrete) for (out2.args) |a2| {
+                        const ah = typeHead(std.mem.trimEnd(u8, a2.name, "?"));
+                        if (bareTypeParamHead(ah) or ir.parseClassTypeParamIdentity(ah) != null) {
+                            concrete = false;
+                            break;
+                        }
+                    };
+                    if (concrete) return out2;
+                    out2.deinit(b.allocator);
+                }
+            }
             // An EXPLICIT type-argument list instantiates the generic
             // return directly: `emptyList<Int>()` IS `List<Int>` — kotlinc
             // resolves the overload set on it statically, and dropping it
@@ -14138,9 +14199,28 @@ fn lowerPathCall(
         if (sh.ty != null) continue;
         if (a.* != .Call or a.Call.type_args.len == 0) continue;
         if (try staticCallReturnTypeRef(b, a)) |t| {
-            explicit_shape_owned[i] = t;
-            sh.ty = t;
-            sh.ty_authoritative = true;
+            // Only a FULLY CONCRETE record is disproof-grade: a derivation
+            // still carrying a bare type parameter anywhere (`Core<E>(...)`
+            // inside the declaring class) names the wrong scope's parameter
+            // and refuted every applicable overload of `atomic(...)`.
+            var concrete = blk: {
+                const th = typeHead(std.mem.trimEnd(u8, t.name, "?"));
+                if (bareTypeParamHead(th) or ir.parseClassTypeParamIdentity(th) != null) break :blk false;
+                for (t.args) |a2| {
+                    const ah = typeHead(std.mem.trimEnd(u8, a2.name, "?"));
+                    if (bareTypeParamHead(ah) or ir.parseClassTypeParamIdentity(ah) != null) break :blk false;
+                }
+                break :blk true;
+            };
+            if (b.isTypeParam(typeHead(std.mem.trimEnd(u8, t.name, "?")))) concrete = false;
+            if (concrete) {
+                explicit_shape_owned[i] = t;
+                sh.ty = t;
+                sh.ty_authoritative = true;
+            } else {
+                var owned = t;
+                owned.deinit(b.allocator);
+            }
         }
     }
     const owned_type_param_bounds = try b.typeParamBoundsSlice();
@@ -14363,22 +14443,10 @@ fn lowerPathCall(
                     }
                 }
             }
-            // An argument written with an EXPLICIT type-argument list
-            // (`pick(emptyList<Int>())`) is programmer-stated type evidence
-            // the runtime cannot reconstruct from the VALUE — an empty list
-            // is typeless at run time, and the value-typed re-pick replayed
-            // whichever overload a prior caller resolved. Such calls pin,
-            // exactly as a cast-disambiguated call does.
-            const explicit_targ_evidence = blk: {
-                for (args) |*a| {
-                    if (a.* == .Call and a.Call.type_args.len != 0) break :blk true;
-                }
-                break :blk false;
-            };
             return switch (res_final.emit_form) {
                 // A finalized pick is as definitive as a cast pick: the
                 // runtime's value-typed overload re-pick must not override it.
-                .Call => try emitCall(b, expr, target, was_cast or res_final.target_final or explicit_targ_evidence),
+                .Call => try emitCall(b, expr, target, was_cast or res_final.target_final),
                 .CallMember => try emitCallMember(b, expr, target, was_cast),
                 .CallMemberOrGlobal => try emitMemberOrGlobal(b, expr, target, was_cast),
                 // The resolver never emits a value call with a committed target.
