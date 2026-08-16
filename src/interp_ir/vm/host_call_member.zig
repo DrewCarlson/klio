@@ -452,7 +452,6 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
 /// invoked without the pair completes it from the ambient composer inside
 /// `callValue`, so arity checks must accept the pair-less shape too.
 fn closurePairTailed(self: *VmHost, info: anytype) bool {
-    if (!host_call_func.composePluginEnabled()) return false;
     const module: *const Module = info.module orelse self.module.asPtr();
     const func = module.funcById(info.body_func) orelse return false;
     return func.params.len >= 2 and
@@ -2059,7 +2058,7 @@ fn receiverImplementsOwnerIdentity(
 /// and every hit is confirmed by comparing bytes, which keeps the entry sound
 /// even if a transient string is freed and its address reused.
 const NameIdSlot = struct { src: usize = 0, gen: u32 = 0, canon: []const u8 = &.{} };
-threadlocal var name_id_cache: [2048]NameIdSlot = @splat(.{});
+threadlocal var name_id_cache: [8192]NameIdSlot = @splat(.{});
 
 /// Canonical pointer identity for a dispatch-cache method name. Runtime
 /// callable references carry collected String storage, so their raw byte
@@ -2067,15 +2066,24 @@ threadlocal var name_id_cache: [2048]NameIdSlot = @splat(.{});
 ///
 /// Almost every caller passes a name slice straight out of the IR, whose
 /// address is stable for the life of the program — so the mapping is
-/// remembered per source address and confirmed with a byte compare, which
-/// takes the interning hash + shared-map probe off the dispatch path.
-fn memberNameIdentity(self: *VmHost, name: []const u8) ?usize {
+/// remembered per source address (multiplicatively mixed: arena-allocated
+/// name storage repeats at fixed strides, which a modulo of the raw
+/// address turned into constant slot ping-pong) and confirmed with a byte
+/// compare, which takes the interning hash + shared-map probe off the
+/// dispatch path. A miss probes the intern under the SHARED borrow first;
+/// only a genuinely new spelling takes the exclusive insert path.
+pub fn memberNameIdentity(self: *VmHost, name: []const u8) ?usize {
     const src = @intFromPtr(name.ptr);
-    const slot = &name_id_cache[(src >> 3) % name_id_cache.len];
+    const slot = &name_id_cache[((src *% 0x9E3779B97F4A7C15) >> 32) % name_id_cache.len];
     if (slot.src == src and slot.gen == cacheGen() and slot.canon.len == name.len and std.mem.eql(u8, slot.canon, name)) {
         return @intFromPtr(slot.canon.ptr);
     }
     const id = blk: {
+        {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            if (pg.get().memberNameIdentityExisting(name)) |id| break :blk id;
+        }
         const pg = self.prog.borrowMut();
         defer pg.deinit();
         break :blk pg.get().memberNameIdentity(name) orelse return null;
@@ -3354,6 +3362,58 @@ fn classChainHasInvokeIn(mod: *const Module, v: *const Value) bool {
     return false;
 }
 
+/// Whether the call's ARG COUNT leaves exactly one of the collected
+/// same-name candidates able to bind: every other candidate has a plain
+/// (no-vararg) parameter list whose arity can never accept `n_args`. The
+/// arg count is folded into every method-cache key, so a pick forced this
+/// way is a pure function of the RELAXED key too — the single-candidate
+/// cacheability gate widens to it (`addAll(Collection)` beside
+/// `addAll(index, Collection)` re-walked on every call because the
+/// name-level candidate count read as ambiguous). A candidate with
+/// defaults or a vararg counts as viable at any arity (conservative), and
+/// a pass-threaded composable pair bails outright — its effective arity
+/// consults the ambient composer, which no key folds.
+fn pickArityForced(self: *VmHost, candidates: []const Func, n_args: usize) bool {
+    var viable: usize = 0;
+    for (candidates) |*f| {
+        const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        const effective = f.params[skip..];
+        if (effective.len >= 2 and
+            std.mem.eql(u8, effective[effective.len - 1].name, "$changed") and
+            std.mem.eql(u8, effective[effective.len - 2].name, "$composer")) return false;
+        var has_vararg = false;
+        for (effective) |*p| {
+            if (p.is_vararg) has_vararg = true;
+        }
+        const viable_c = has_vararg or effective.len == n_args or
+            (effective.len > n_args and funcDefaults(self, f) != null);
+        if (viable_c) {
+            viable += 1;
+            if (viable > 1) return false;
+        }
+    }
+    return viable == 1;
+}
+
+/// Whether every argument's shape is fully discriminated by the RELAXED
+/// signature fold at the level the applicability tests consult: value
+/// tags, Instance class identities, closure bodies, primitive array
+/// kinds, and container KINDS (the tests are nominal/kind-level — they
+/// never inspect elements). Object arrays and every other value shape
+/// stay out: the fold cannot tell them apart as finely as a test might.
+fn argsRelaxedAdjudicable(args: []const Value) bool {
+    for (args) |*a| {
+        switch (a.*) {
+            .Int, .Long, .Double, .Float, .Short, .Byte, .Char, .Bool, .UInt, .ULong, .UShort, .UByte, .Instance, .String, .Unit, .IrClosure, .Null, .Result, .List, .Set, .Map => {},
+            .Array => |arr| {
+                if (arr.prim == null) return false;
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
 fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []const Func, args_in: []const Value) ?Func {
     if (candidates.len == 0) return null;
     const args = args_in;
@@ -3377,7 +3437,7 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
         // pair-trimmed — the mid-vararg check otherwise refuses on the
         // undefaulted pair params. Only when the tail VALUES look like the
         // pair (a Composer instance + the changed Int).
-        if (host_call_func.composePluginEnabled() and effective.len >= 2 and
+        if (effective.len >= 2 and
             std.mem.eql(u8, effective[effective.len - 1].name, "$changed") and
             std.mem.eql(u8, effective[effective.len - 2].name, "$composer"))
         {
@@ -3757,7 +3817,7 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     // same completion for a wrapper CLASS whose only matching `invoke`
     // overload carries the trailing pair.
     if (r == .err and r.err == .Unimplemented and receiver.* == .Instance and
-        std.mem.eql(u8, name, "invoke") and host_call_func.composePluginEnabled())
+        std.mem.eql(u8, name, "invoke"))
     {
         if (missTraceWant(name)) std.debug.print("[inv-pair] reach recv={s} nargs={d} composer={} wants={}\n", .{ receiver.typeFqn(), args.len, compose.currentComposer() != null, instanceInvokeWantsPair(self, receiver, args.len) });
         if (compose.currentComposer()) |c| {
@@ -4261,10 +4321,7 @@ fn prepareFlatFromFid(self: *VmHost, allocator: Allocator, receiver: *const Valu
         checkReceiverChain(self, allocator, "irMethodWalk", receiver, null);
     }
     vmhost.emitPath(allocator, "member_ir_walk", f.fqn, f.id, receiver, args);
-    const threaded: ?Value = if (host_call_func.composePluginEnabled())
-        compose.threadedComposerArg(f.params, args)
-    else
-        null;
+    const threaded: ?Value = compose.threadedComposerArg(f.params, args);
     if (threaded) |c| compose.pushComposer(c);
     return .{
         .func = f,
@@ -5971,7 +6028,7 @@ fn composeMemberPairRetry(self: *VmHost, allocator: Allocator, receiver: *const 
     _ = static_recv;
     _ = no_ext;
     _ = declared_recv;
-    if (strict_ext or !host_call_func.composePluginEnabled()) return null;
+    if (strict_ext) return null;
     const comp = compose.currentComposer() orelse return null;
     // A retried dispatch already carries the pair this completion appended;
     // recognize it by the ambient composer's identity in the second-to-last
@@ -9272,6 +9329,11 @@ pub fn setTrailingMemberCall(on: bool) bool {
     return prev;
 }
 
+/// `unambiguous` = the pick is a pure function of the RELAXED method-cache
+/// key: the resolving class collected exactly one candidate, or the call's
+/// arg count forced the pick among several (see `pickArityForced`) with
+/// every argument relaxed-adjudicable. Gates whether a relaxed-key cache
+/// entry may be stored.
 const ResolvedMethod = struct { fid: FuncId, unambiguous: bool };
 
 /// Resolve `receiver.name(args)` to the user method `FuncId` it would dispatch,
@@ -9702,7 +9764,8 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                 if (pickMethodOverload(self, mod, candidates.items, args)) |f| {
                     if (!callableArgPrefersFunctionExtension(self, mod, name, &f, receiver, args) and
                         !memberArgsDisprovenExtensionApplies(self, mod, name, &f, args))
-                        return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 };
+                        return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 or
+                            (pickArityForced(self, candidates.items, args.len) and argsRelaxedAdjudicable(args)) };
                 }
                 // Enqueue the resolved supertypes by identity (their IR class
                 // ids) so the inherited-method walk follows the real class
@@ -10967,10 +11030,7 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     // stack. A member `f.params` carries the receiver as an explicit leading
     // `this` param, while `args` is receiver-excluded — `threadedComposerArg`
     // handles that alignment.
-    const threaded_composer: ?Value = if (host_call_func.composePluginEnabled())
-        compose.threadedComposerArg(f.params, args_in)
-    else
-        null;
+    const threaded_composer: ?Value = compose.threadedComposerArg(f.params, args_in);
     if (threaded_composer) |c| compose.pushComposer(c);
     defer if (threaded_composer != null) compose.popComposer();
 
@@ -10981,7 +11041,7 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     var pair_ext: ?[]Value = null;
     defer if (pair_ext) |pe| if (runtime.freeScratch()) allocator.free(pe);
     var args = args_in;
-    if (host_call_func.composePluginEnabled() and f.params.len >= 2 and
+    if (f.params.len >= 2 and
         std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed") and
         std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer") and
         args.len + 3 <= f.params.len and threaded_composer == null)
@@ -11453,10 +11513,29 @@ fn extMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey
     pg.get().ext_method_cache.put(key, fid) catch {};
 }
 
+/// Thread-local L1 for the pack-binding inline cache: a member call served
+/// by a native binding (or its cached "no intrinsic" miss) otherwise pays a
+/// program-cell borrow plus a shared-map probe on every single call. `state`:
+/// 0 empty, 1 mirrored. Same add-only/gen-stamp discipline as the method L1s.
+const TlIntrinsicEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, state: u8 = 0, gen: u32 = 0, entry: root_mod.ProgramImage.MemberResolveEntry = .{ .func = null, .fqn = "" } };
+threadlocal var tl_intrinsic_cache: [TL_METHOD_CACHE_SIZE]TlIntrinsicEntry = @splat(.{});
+
 fn instanceIntrinsicCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?root_mod.ProgramImage.MemberResolveEntry {
-    const pg = self.prog.borrow();
-    defer pg.deinit();
-    return pg.get().instance_intrinsic_cache.get(key);
+    const e = &tl_intrinsic_cache[tlSlot(key)];
+    if (e.state != 0 and e.gen == cacheGen() and e.class_p == key.class_p and e.name_p == key.name_p and
+        e.sig == key.sig and e.n_args == key.n_args)
+    {
+        return e.entry;
+    }
+    const hit: ?root_mod.ProgramImage.MemberResolveEntry = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().instance_intrinsic_cache.get(key);
+    };
+    if (hit) |h| {
+        e.* = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .state = 1, .gen = cacheGen(), .entry = h };
+    }
+    return hit;
 }
 
 /// Simple name of the class that DECLARES `fid` in `module`'s class table,
@@ -11551,6 +11630,9 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     // share its coarser signature.
     if (resolved.unambiguous or strict_key != null) {
         if (key) |k| instanceMethodCachePutRaw(self, k, @intFromEnum(resolved.fid));
+    }
+    if (runtime.envSetOnce("KLIO_WALK_TRACE")) {
+        std.debug.print("[ir-walk-fill] {s} strict={} key={} unamb={} -> cached={}\n", .{ name, strict_key != null, key != null, resolved.unambiguous, key != null and (resolved.unambiguous or strict_key != null) });
     }
     return try invokeMethodFuncId(self, allocator, receiver, resolved.fid, args);
 }
@@ -14252,9 +14334,7 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
     // Compose ABI completion on the explicit `.invoke()` route — same
     // completion `callMember` applies (the two entries do not share a
     // miss tail).
-    if (receiver.* == .Instance and std.mem.eql(u8, name, "invoke") and
-        host_call_func.composePluginEnabled())
-    {
+    if (receiver.* == .Instance and std.mem.eql(u8, name, "invoke")) {
         if (compose.currentComposer()) |c| {
             if (instanceInvokeWantsPair(self, receiver, args.len)) {
                 freeDispatchMiss(allocator, primary);

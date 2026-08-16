@@ -179,7 +179,7 @@ fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(
     // not surrender the last two to the pair slots). A call that already
     // carries the pair (a Composer instance + Int tail) keeps them fixed.
     var pairless_pair = false;
-    if (composePluginEnabled() and tail_fixed >= 2 and n_params >= 2 and
+    if (tail_fixed >= 2 and n_params >= 2 and
         std.mem.eql(u8, func.params[n_params - 1].name, "$changed") and
         std.mem.eql(u8, func.params[n_params - 2].name, "$composer"))
     {
@@ -1678,7 +1678,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
     // its ($composer, $changed) tail Null (the vararg member path —
     // `consumer.Varargs(0, 1, 2, 3)` — where the non-vararg exact-fit
     // completion never runs). Fill from the ambient composer.
-    if (composePluginEnabled() and f.params.len >= 2 and
+    if (f.params.len >= 2 and
         std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed") and
         std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer") and
         packed_args.items.len == f.params.len and
@@ -1712,11 +1712,6 @@ fn discardArgs(allocator: Allocator, packed_args: std.ArrayList(Value)) void {
 /// compose path; there is no implicit-composer fallback to switch to, so this
 /// is unconditionally true. Kept as a predicate because the compose threading
 /// sites read it and the image/pack cache key salts on it.
-pub fn composePluginEnabled() bool {
-    return true;
-}
-
-
 /// `KLIO_MISS_TRACE`, resolved once. `getenvSlice` takes a global mutex and
 /// the env store scans linearly — measurable per interpreted call.
 var hcf_miss_trace_state: u8 = 0;
@@ -2183,7 +2178,7 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                     // CARRIES the pair (a Composer instance + Int tail); a
                     // pairless `consumer.Varargs(0, 1, 2, 3)` packs every
                     // int and completes the pair from the ambient composer.
-                    const tail_is_pair = composePluginEnabled() and args.len >= 2 and
+                    const tail_is_pair = args.len >= 2 and
                         args[args.len - 1] == .Int and args[args.len - 2] == .Instance and blk: {
                         const ig = args[args.len - 2].Instance.borrow();
                         defer ig.deinit();
@@ -2470,7 +2465,7 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
     // — the same completion `callValue` applies for closures. Vararg shapes
     // are completed by the overload binder, which scored the reduced
     // signature and knows the pair is absent.
-    if (composePluginEnabled()) {
+    {
         if (funcAt(module, func)) |cf| {
             const p = cf.params;
             if (p.len >= 2 and args.len + 2 == p.len and
@@ -2901,7 +2896,7 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
         // body's re-entry) arrives WITHOUT the pair. With an ambient composer
         // available, score the user-visible params and complete the pair at
         // dispatch — the same completion callValue applies for closures.
-        if (composePluginEnabled()) {
+        {
             if (sigViewOfFunc(self, eff, cand, shapes.len)) |sv| {
                 const p = sv.params;
                 if (p.len >= 2 and std.mem.eql(u8, p[p.len - 1].name, "$changed") and

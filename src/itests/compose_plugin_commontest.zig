@@ -9,11 +9,11 @@
 //! conformance gate and the implicit-hook suite retires with the old
 //! implementation.
 //!
-//! Structure mirrors compose_runtime_commontest.zig: every `.kt` under the
-//! roots compiles into every child (cross-file fixtures), isolation is one
-//! child per test class via `--filter`, passes are counted from per-test
-//! `PASSED` lines, and the pass count is a ratchet — raise `BASELINE` as
-//! fixes land, never lower it.
+//! Structure: every `.kt` under the roots compiles into every child
+//! (cross-file fixtures), isolation is one child per test class via
+//! `--filter`, passes are counted from per-test `PASSED` lines, and the
+//! pass count is a ratchet — raise `BASELINE` as fixes land, never lower
+//! it.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -59,7 +59,7 @@ const runtime = @import("runtime");
 // locals as the nearest binding) and the dirty-bits skip calculus landed:
 // four consecutive runs at 1370-1372 with the GroupSize slot anchor green.
 // Same ~±30 margin below the observed floor.
-const BASELINE: usize = 1365;
+const BASELINE: usize = 1370;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
@@ -110,7 +110,6 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     // 55s yield cost is worth its own investigation; it is not a property
     // of the test, and it is not paid for by a looser cap.
     try map.put("kotlinx_coroutines_test_default_timeout", "10s");
-    try map.put("KLIO_COMPOSE_PLUGIN", "1");
     // Per-test wall cap: a test that genuinely deadlocks (the Recomposer
     // deadlock-regression shape, the concurrent-mixing teardown stall) fails
     // in place instead of eating the class's whole 480s budget — its
@@ -200,8 +199,7 @@ fn collectKt(a: std.mem.Allocator, io: std.Io, dir: []const u8, out: *std.ArrayL
     }
 }
 
-/// The test CLASS a file contributes, or null when it declares none (see
-/// compose_runtime_commontest.zig).
+/// The test CLASS a file contributes, or null when it declares none.
 fn testClassOf(a: std.mem.Allocator, io: std.Io, path: []const u8) ?[]const u8 {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return null;
     if (std.mem.indexOf(u8, bytes, "@Test") == null) return null;
