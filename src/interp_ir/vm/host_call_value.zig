@@ -1768,6 +1768,22 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
     return callValueWithThisSel(self, allocator, callee, this_value_in, args, arg_names, true);
 }
 
+/// `callValueWithThis` with the receiver re-selected by the DECLARED head
+/// the call site carried (a receiver-lambda param's declared receiver
+/// type). The passed register can be a coroutine that rebound the
+/// enclosing block's `this` capture; Kotlin binds the innermost implicit
+/// receiver OF THE DECLARED TYPE. Re-selection already applied, so the
+/// compatibility resel stays off.
+pub fn callValueWithThisHead(self: *VmHost, allocator: Allocator, callee: *const Value, this_value_in: *const Value, args: []const Value, arg_names: []const ?[]const u8, head: []const u8) Allocator.Error!EvalResult {
+    var selected = this_value_in.*;
+    if (head.len != 0) {
+        if (try host_call_member.implicitReceiverForHead(self, allocator, this_value_in, head)) |m| selected = m;
+    }
+    if (runtime.envOnce("KLIO_HEAD_TRACE") != null)
+        std.debug.print("[cvth] head={s} passed={s} selected={s}\n", .{ head, this_value_in.typeFqn(), selected.typeFqn() });
+    return callValueWithThisSel(self, allocator, callee, &selected, args, arg_names, false);
+}
+
 /// `callValueWithThis` with the compatibility receiver RE-SELECTION gated:
 /// a caller that PROVED the receiver (the lowering's
 /// fallback_takes_receiver contract) passes `allow_resel = false` — the

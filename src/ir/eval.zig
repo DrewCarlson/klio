@@ -7059,7 +7059,7 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             // receiver-fills-param, pass-threaded composable, explicit
             // receiver overflow) decline and keep the recursive path.
             if (comptime @hasDecl(H, "prepareClosureWithThisFlatCall")) {
-                if (flatEnabled() and callee_v == .IrClosure and argNamesAllNull(cvt.arg_names)) {
+                if (flatEnabled() and cvt.recv_head == null and callee_v == .IrClosure and argNamesAllNull(cvt.arg_names)) {
                     if (try host.prepareClosureWithThisFlatCall(allocator, &callee_v, &recv, arg_values)) |prep0| {
                         var prep = prep0;
                         prep.dst = cvt.dst;
@@ -7068,7 +7068,10 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
                     }
                 }
             }
-            const result = if (cvt.receiver_shape_exact)
+            const result = if (cvt.recv_head != null and comptime @hasDecl(H, "callValueWithThisHead")) blk: {
+                const head = constStr(frame.module, cvt.recv_head.?) orelse "";
+                break :blk try host.callValueWithThisHead(allocator, &callee_v, &recv, arg_values, names, head);
+            } else if (cvt.receiver_shape_exact)
                 try host.callValueWithThisExact(allocator, &callee_v, &recv, arg_values, names)
             else
                 try host.callValueWithThis(allocator, &callee_v, &recv, arg_values, names);

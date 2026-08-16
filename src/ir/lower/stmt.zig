@@ -607,6 +607,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         };
         const outer_names: StringSet = try b.visibleNames();
         const inherited_rlp: StringSet = try b.receiverLambdaParamNames();
+        try b.stashRecvHeadsForLambda();
         var outer_boxed = try b.boxedVarsSnapshot();
         defer outer_boxed.deinit();
         // A local *extension* function (`fun List<T>.mid() =

@@ -248,20 +248,32 @@ validatePotentialDeadlock (pump fairness for virtual-time drains).
             produce with the wrong binding, so zipImpl's `second`
             failed the SendChannel cast. Guard examples/flow_zip.kt
             (kotlinc/JVM-verified).
-      - [ ] flow COMBINE residue, anatomy sharpened: combineInternal's
-            `transform(latestValues)` is a bare call of a
-            RECEIVER-fn-typed PARAM captured into the flowScope lambda
-            — the recv_fn lowering arm only serves recv_fn_props
-            PROPERTIES (params/locals/captures break out at
-            `b.resolve(pname) != null or b.knowsOuter`), so it lowers
-            as plain CallValue, the Zip.kt:29 closure runs
-            receiverless, and its bare `emit` total-misses (the
-            flow{}-block collector is not on the closure's chain;
-            runtime subjects are FlowCoroutine/ScopeCoroutine only).
-            Fix candidates: extend the recv_fn arm to declared
-            receiver-fn-typed locals/params/captures (declared-type
-            plumbing), and/or seed receiver-lambda block receivers
-            onto created closures' chains.
+      - [x] flow COMBINE FIXED. Root cause was two-layered. (1) A
+            receiver-lambda param invoked bare from inside a coroutine
+            lambda must bind the lexically innermost implicit receiver
+            of its DECLARED head, and the dynamic enclosing-this chain
+            cannot recover it after a pump resume (the chain at the
+            call held only FlowCoroutine + SAM-collector closures).
+            The lowering now records the declared receiver head per
+            receiver-lambda param (decl.zig / lambda_body.zig), walks
+            the labeled receiver tower at the captured-RLP call site,
+            and lowers the matching `this@<label>` slot (the same slot
+            extension-fn entry binds) as the call receiver;
+            CallValueWithThis carries `recv_head` so the VM re-selects
+            by head (callValueWithThisHead, resel off) when the tower
+            gave nothing. (2) Two engagement traps cost most of the
+            session: the vmhost re-export for callValueWithThisHead
+            was missing so the eval arm's @hasDecl gate silently chose
+            the old path, and the flat-call fast path intercepted
+            CallValueWithThis before the head branch (now gated on
+            recv_head == null). Also: pack BUILD consumes the lowering
+            cache — clear `~/.klio/cache` BEFORE `pack build`, not
+            just before the run, or the pack bakes stale IR. The
+            "receiverless closure" theory was wrong: this@combineInternal
+            IS an IrClosure by design (FlowCollector is a fun
+            interface; SAM lambdas stay raw closures and bare `emit`
+            on one SAM-invokes it). Guard examples/flow_combine.kt
+            (kotlinc/JVM-verified).
       NOTE: the cached ratchet binary was pruned with the zig cache;
       ratchet now runs via `zig build itest-compose_plugin_commontest`
       (source floor 1365).

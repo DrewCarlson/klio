@@ -308,6 +308,7 @@ pub const VmHost = struct {
     pub const collectionsEqualHostAware = host_call_member.collectionsEqualHostAware;
     pub const deepValueEquals = host_call_member.deepValueEquals;
     pub const callValueWithThis = host_call_value.callValueWithThis;
+    pub const callValueWithThisHead = host_call_value.callValueWithThisHead;
     pub const callValueWithThisExact = host_call_value.callValueWithThisExact;
     pub const callableFieldArity = host_call_member.callableFieldArity;
     pub const valueCouldServeName = host_call_member.valueCouldServeName;
