@@ -11009,6 +11009,15 @@ pub const ModuleRegistry = struct {
     /// slot lowers no func, so the SAM dispatch reads the receiver type
     /// here to bind the lambda's implicit `this`.
     iface_member_ext_recv: StrPairMap([]const u8),
+    /// (class simple name, member name) → arity BITMASK (bit n = declared
+    /// with n params, capped at 63) for BODYLESS member declarations
+    /// (abstract interface/class members). The abstract slot lowers no
+    /// func and joins no class-row method list, so overload picks that
+    /// must rank members above extensions (a bare `respond(a, b)` inside
+    /// an `ApplicationCall` extension binding the interface's
+    /// `respond(message, typeInfo)` member, never a reified 2-arg
+    /// extension splice) consult this record.
+    abstract_member_arity: StrPairMap(u64),
     /// Top-level `const val` literal values keyed by declaration FQN.
     /// Kotlin inlines compile-time constants at every reference, so the
     /// lowering reads the value here and emits the literal directly — a
@@ -11189,6 +11198,7 @@ pub const ModuleRegistry = struct {
             .member_ext_owner_class = std.AutoHashMap(FuncId, []const u8).init(allocator),
             .private_fn_files = std.AutoHashMap(FuncId, FileId).init(allocator),
             .iface_member_ext_recv = StrPairMap([]const u8).init(allocator),
+            .abstract_member_arity = StrPairMap(u64).init(allocator),
             .top_level_const_vals = std.StringHashMap(Const).init(allocator),
             .local_fn_defaults = std.AutoHashMap(FuncId, std.ArrayList(?FuncId)).init(allocator),
             .abstract_member_defaults = StrPairMap(std.ArrayList(?FuncId)).init(allocator),
@@ -11273,6 +11283,7 @@ pub const ModuleRegistry = struct {
         self.member_ext_owner_class.deinit();
         self.private_fn_files.deinit();
         self.iface_member_ext_recv.deinit();
+        self.abstract_member_arity.deinit();
         self.top_level_const_vals.deinit();
         {
             var it = self.local_fn_defaults.valueIterator();

@@ -226,6 +226,14 @@ include = [
     "io/ktor/client/engine/Loader.kt",
 ]
 
+# ktor-client-core jvmAndPosix actuals that are pure Kotlin:
+# `checkContentLength`, the body-size guard the save-body transform reaches.
+[[source]]
+root = "upstream/ktor-client/ktor-client-core/jvmAndPosix/src"
+include = [
+    "io/ktor/client/call/utils.kt",
+]
+
 # Event bus (`io.ktor.events.Events`) — `HttpClient.monitor`. Gated under `events`.
 [[source]]
 root = "upstream/ktor-shared/ktor-events/common/src"

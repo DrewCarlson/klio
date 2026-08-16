@@ -9396,6 +9396,37 @@ noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, 
                             }
                         }
                     }
+                    // The scope-qualified read's lexical-owner premise can be
+                    // wrong for a lambda in a companion/static context (its
+                    // `$sgetter` owner names the OUTER class, which no live
+                    // subject owns — ktor's engine intercept lambda reading
+                    // `call`, a member of its own pipeline receiver). With
+                    // the lexical claim exhausted and the global tier empty,
+                    // an implicit receiver's own member is the only
+                    // Kotlin-legal binding left: retry the candidates with
+                    // the PLAIN property name before failing.
+                    if (!std.mem.eql(u8, bare_name, constStr(frame.module, lt.name) orelse bare_name)) {
+                        const cands2 = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, bare_name, null);
+                        defer allocator.free(cands2);
+                        const ka2 = pinImplicitCandidates(cands2);
+                        defer runtime.keepaliveRestore(ka2);
+                        for (cands2) |c2| {
+                            switch (try host.getMemberField(allocator, &c2.v, bare_name)) {
+                                .ok => |v2| {
+                                    orAudit("LoadFromThisOrGlobal", bare_name, "plain_retry", c2.depth, &c2.v);
+                                    try frame.write(lt.dst, v2);
+                                    return .cont;
+                                },
+                                .err => |e2| {
+                                    if (e2 == .Unimplemented) {
+                                        freeMissErr(allocator, e2);
+                                    } else {
+                                        return raiseStep(frame, e2);
+                                    }
+                                },
+                            }
+                        }
+                    }
                     const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{bare_name});
                     if (missTraceWant()) |w| {
                         if (std.mem.eql(u8, w, bare_name)) {

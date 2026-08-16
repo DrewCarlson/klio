@@ -1168,7 +1168,19 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // `args[1..]`, whose ambient-composer completion supplies the pair.
         const recv_first_shape = args.len == info.n_params + 1 or
             (pair_tailed and args.len + 2 == info.n_params + 1);
-        if ((info.has_receiver or compose_recv_infer) and !last_vararg and recv_first_shape) {
+        // Shape UNKNOWN (a handler stored through a generic hook slot —
+        // ktor's `on(Send)` block replayed as `handler(Sender(…), request)`)
+        // with one arg MORE than the declared params can only be the
+        // explicit-receiver form: Kotlin function types with and without
+        // receivers are interchangeable, and no legal call supplies a plain
+        // closure an extra argument. A HEADERLESS block is excluded — its
+        // lone param is the lowering's speculative `it`, and a suspend
+        // lambda's start supplies (receiver, completion), which this split
+        // would corrupt by feeding the completion into `it`.
+        const unknown_recv_infer = !info.receiver_shape_known and
+            args.len == info.n_params + 1 and
+            !(func.params.len != 0 and std.mem.eql(u8, func.params[0].name, "it"));
+        if ((info.has_receiver or compose_recv_infer or unknown_recv_infer) and !last_vararg and recv_first_shape) {
             if (runtime.envOnce("KLIO_REBIND_AUDIT") != null) {
                 std.debug.print("[REBIND] fn={s} n_params={d}\n", .{ func.name, info.n_params });
             }
@@ -1895,6 +1907,32 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                         if (pushed) host_call_member.popAccessEnclosing(self);
                         return r;
                     }
+                    // Shape UNKNOWN (a lambda stored through a generic-typed
+                    // slot — ktor's `plugins[key] = { scope -> … }` map keeps
+                    // no function shape) with one declared param MORE than
+                    // the supplied args, and no adapted receiver-`this`
+                    // leading param: the receiver rides positionally in that
+                    // slot, whichever way the source spelled the block. A
+                    // parameterless receiver lambda declares no extra param
+                    // and keeps the receiver-binding path below — and so does
+                    // a HEADERLESS block, whose lone param is the lowering's
+                    // speculative `it` (an `apply { }` body reads `this`, not
+                    // `it`; a source-written `{ it -> }` loses this call shape
+                    // but a named parameter keeps it).
+                    if (std.mem.eql(u8, bf.name, "<lambda>") and !takes_receiver and
+                        !info.receiver_shape_known and args.len + 1 == info.n_params and
+                        !(bf.params.len != 0 and std.mem.eql(u8, bf.params[0].name, "it")))
+                    {
+                        const with_recv = try allocator.alloc(Value, args.len + 1);
+                        defer if (runtime.freeScratch()) allocator.free(with_recv);
+                        with_recv[0] = this_value.*;
+                        @memcpy(with_recv[1..], args);
+                        const pushed = this_value.* == .Instance or this_value.* == .Null;
+                        if (pushed) host_call_member.pushAccessEnclosingSubject(self, this_value);
+                        const r = try callValue(self, allocator, callee, with_recv);
+                        if (pushed) host_call_member.popAccessEnclosing(self);
+                        return r;
+                    }
                 }
             }
             // Kotlin function types with and without receivers are
@@ -2094,7 +2132,27 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
 pub fn callValueWithThisExact(self: *VmHost, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     if (callee.* == .IrClosure) {
         if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
-            if (info.receiver_shape_known and !info.has_receiver and args.len + 1 == info.n_params) {
+            // Shape UNKNOWN (a lambda stored through a generic-typed slot —
+            // ktor's `plugins[key] = { scope -> … }` map keeps no function
+            // shape) falls back to the declared arity: a body declaring
+            // exactly one more parameter than the supplied arguments wants
+            // the receiver in that slot, whichever way the source spelled
+            // it. A parameterless receiver lambda declares no extra param,
+            // so it never matches — and a headerless block's lone
+            // speculative `it` param keeps the receiver-binding path (see
+            // callValueWithThisSel).
+            const speculative_it = blk: {
+                if (info.receiver_shape_known) break :blk false;
+                const module_g = self.module.borrow();
+                defer module_g.deinit();
+                const m = info.module orelse module_g.get();
+                const bf = m.funcById(info.body_func) orelse break :blk false;
+                break :blk bf.params.len != 0 and std.mem.eql(u8, bf.params[0].name, "it");
+            };
+            const positional_fit = args.len + 1 == info.n_params and
+                (info.receiver_shape_known and !info.has_receiver or
+                    (!info.receiver_shape_known and !speculative_it));
+            if (positional_fit) {
                 const with_recv = try allocator.alloc(Value, args.len + 1);
                 defer if (runtime.freeScratch()) allocator.free(with_recv);
                 with_recv[0] = this_value.*;
