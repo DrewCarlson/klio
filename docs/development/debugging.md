@@ -103,9 +103,82 @@ plus `KLIO_MISS_TRACE` (which runtime tail missed).
 | `KLIO_SOLE_GLOBAL` | `0` to disable | Off, a bare call under a receiver context stops lending its return type even when its name has exactly one declaration program-wide | — |
 | `KLIO_FACTORY_PROP` | `0` to disable | Off, only a CONSTRUCTOR call names an un-annotated property's type — a factory call (`val made = newBase()`) and a constructor PARAMETER (`private val held = start`) both stop registering a type head | — |
 | `KLIO_NULL_CHAIN` | `0` to disable | Off, only a condition that is itself the whole `!= null` check narrows — an `&&` chain and an early-return guard stop smart-casting | — |
-| `KLIO_INIT_KINDS` | set | Names the AST kind of every local initializer that is NOT recorded, so the next gap in that list is data rather than a guess | `[init-kind]` |
+| `KLIO_AGREED_RET` | `0` to disable | Off, a bare call whose every top-level declaration agrees on a return type stops lending that agreed return to the local it initializes | — |
+| `KLIO_CTOR_RET` | `0` to disable | Off, a direct constructor expression (`SlotTable().also { … }`) stops naming its own type for the value it produces | — |
+| `KLIO_EAGER_MEMBER` | `0` to disable | Off, the checker's eager extern-call pick stops serving member-call lowering where the lazy engine has no receiver type or no resolver target | — |
+| `KLIO_ENGINE_LAMBDA` | `0` to disable | Off, a lambda's declared fn type is no longer instantiated through the one-pass call-binding solve (receiver + typed args + explicit type args) | — |
+| `KLIO_ITC_MEMBER` | `0` off, `1` on (default), or `name1,name2` | Whether a member the receiver type provably declares commits statically over the `OrGlobal` fallback; a name list restricts the commit to those calls | — |
+| `KLIO_LAMBDA_REFUTE` | `0` to disable | Off, a lambda argument stops refuting candidates whose parameter names a resolvable non-fun-interface class | — |
+| `KLIO_LAMBDA_RET` | `0` to disable | Off, lambda argument shapes are no longer enriched from the target's declared `Function`-typed parameters | — |
+| `KLIO_MEMBER_EXT_SPLICE` | `0` to disable | Off, a member body's own extension call stops qualifying for the inline splice | — |
+| `KLIO_MEMBER_PROMO` | `0` to disable | Off, a deferred member call is never promoted to a static bind by the member-compatible / every-extension-refuted proof | — |
+| `KLIO_NAMED_COMMIT` | `0` to demote | `0`, a candidate that named-argument mapping skipped stays a typing-only answer instead of committing for emission | — |
+| `KLIO_RECV_REFUTE` | set to enable (default off) | On, a candidate whose declared receiver classifier is provably unrelated to the proven static receiver is dropped outright (kotlinc's static receiver semantics; the lazy default keeps runtime-polymorphic leniency) | — |
+| `KLIO_REFSHAPE` | `0` to disable | Off, a callable-reference argument (`::f`) stops contributing its declaration-read function type to the argument shapes | — |
+| `KLIO_STAR_RET` | `0` to disable | Off, a type parameter still unbound after the receiver and every argument had their chance refuses the whole return instantiation instead of erasing to `*` | — |
+| `KLIO_SUBST_NONGEN` | `0` to disable | Off, a head-only receiver naming a non-generic class stops counting as a complete substitution receiver (`SlotWriter.let { … }` no longer binds `T := SlotWriter`) | — |
+| `KLIO_THIS_NARROW` | `0` to disable | Off, an `is`-narrowed `this` stops serving as the innermost implicit receiver head for bare calls | — |
+| `KLIO_TOWER_EMIT` | `0` to disable | Off, a bare call stops committing statically to an OUTER tower entry's extension through its `this@<label>` slot | — |
+| `KLIO_TOWER_EXT` | `0` to disable | Off, typing-side bare-call extension resolution stops trying the outer implicit-receiver tower entries when the innermost head serves none | — |
+| `KLIO_TOWER_SCOPE` | `0` to disable | Off, a this-capturing lambda or parameter thunk never counts its receiver scope complete through the tower | — |
+| `KLIO_VOWN` | `0` to disable | Off, a stub or value-class owner stops emitting its virtual slot and declines to the member-name walk | — |
+| `KLIO_HDR_BOUNDS` | `0` to disable | Off, header-stub type-parameter bounds are not registered at image build, so bare-call resolution loses them | — |
+| `KLIO_HDR_BOUNDS_SKIP` | `<substr>` | Skips header-bound registration for functions whose name the value contains — the per-name bisect of `KLIO_HDR_BOUNDS` | — |
+| `KLIO_HDR_BOUNDS_LIST` | set | Prints each function's registered header bounds as they are put | `[hdrb]` |
+| `KLIO_NO_LR_ABSORB` | set disables | Set, an inline body containing `return@<fnName>` no longer gets the labeled-return absorb region | — |
+| `KLIO_NO_LR_STATIC` | set disables | Set, a `return@<inlineFnName>` inside a spliced lambda stops resolving statically to the splice frame's join | — |
+| `KLIO_SPLICE_HYG` | `0` to disable | Off, a top-level extension's spliced body resolves in the caller's member scope instead of its own declaration scope | — |
+| `KLIO_SPLICE_PIN` | set disables | Set, a bound-receiver member call inside a splice is no longer pinned to its virtual slot — the per-invocation walk arbitrates again | — |
 | `KLIO_SLOT_TRACE` | `<name>` or `*` | Each inherited-slot merge decision for methods of that simple name: the competing FuncIds and which one the class's table keeps | `[slot-merge]` |
 | `KLIO_SLOT_DUMP` | `<name>` | Every `(class, slot) -> implementation` entry whose target has that simple name, with the target's owner — what runtime virtual dispatch will actually reach | `[slot-dump]` |
+| `KLIO_ABSVETO_TRACE` | set | Each inline-overload pick vetoed because a member of the receiver chain takes the call instead | `[absveto]` |
+| `KLIO_AGREED_TRACE` | `<name>` or `*` | Why the agreed-top-level-return channel accepted or refused the name (top-level usable, enclosing member, class-member namesake, ...) | `[agreed]` |
+| `KLIO_ALPT` | `<fn name>` (`[alpt-site]` rows fire on any set value) | Argument-lambda parameter-type computation for calls of the named target: entry shape, each filled slot, and which emit site asked | `[alpt]`, `[alpt-slot]`, `[alpt-site]` |
+| `KLIO_APPLIC_TRACE` | set | Candidates the shared applicability scorer refuses: the runtime re-pick's null scores and the named-arm hard-reject site that declined | `[pp-null]`, `[applic-reject]` |
+| `KLIO_BAREARM` | set | The bare-member arm of unresolved bare-call lowering: why it broke (no class id, no `this` register) and each final miss with file:line | `[barearm-break]`, `[barearm-miss]` |
+| `KLIO_BARG_TRACE` | `<fn name>` (`[barg-ids]` rows fire on any set value) | Static bare-call argument compatibility: per-argument param-vs-arg verdict with route, plus the receiver class-id scoping rows | `[barg]`, `[barg-ids]` |
+| `KLIO_BCC_WHY` | set | Why the package/import-scoped bare-call candidate set came back empty (no candidates, no visible tier, other-package tier, no arity match) | `[bcc]` |
+| `KLIO_BINDS_TRACE` | `<name>` | Whether a bare name binds `this`: receiver-chain head, hierarchy-shadow completeness, own-member state, and the verdict | `[binds]` |
+| `KLIO_CHAN` | `<name>` | Snapshot of every receiver channel at a bare call in receiver context: `this`-narrow, splice hint and receiver, owner class, `this` decl, static head | `[chan]` |
+| `KLIO_CITR_TRACE` | `<name>` | Constructor-initializer type derivation for a bare ctor call: the local-class head or the bail reason (local/outer binding, function namesake, no class) | `[citr]` |
+| `KLIO_CIX_TRACE` | `<class name>` | Scoped class-by-simple-name resolution: each candidate's fqn, package, and tier | `[cix]` |
+| `KLIO_CPT_TRACE` | set | Why instantiating a declared receiver typed by a class type parameter declined | `[cpt]` |
+| `KLIO_CTORLPT_TRACE` | set | Constructor trailing-lambda parameter typing: the class row's parameter shapes at each ctor call carrying lambda args | `[ctorlpt]` |
+| `KLIO_DECLTY_TRACE` | `<name>` | The receiver static type a member call of that name resolved against, and whether it came from a declaration or the full deriver | `[declty]` |
+| `KLIO_DROP_TRACE` | `<name>` | Why each bare-call candidate dropped from the applicable set (form mismatch, low priority, no sig view, inapplicable shape, static-incompatible) | `[drop]` |
+| `KLIO_EBM_TRACE` | set | Expression-body member registry register/lookup rows (currently keyed to `createOnCancellationAction` only) | `[ebm]` |
+| `KLIO_EMIT_TRACE` | `<name>` or `*` | Every `Call`/`CallVirtual`/`CallMember`/`CallMemberOrGlobal` instruction pushed for that simple name, with the resolved target and emitting function | `[emit]` |
+| `KLIO_EMIT_STACK` | set (needs `KLIO_EMIT_TRACE`) | Adds a native stack trace naming the emitting arm at each traced `CallMember` push | native stack |
+| `KLIO_EXPECT_HDR_TRACE` | set | Each bodyless `expect`-class member retained as a header row binding its host symbol | `[expect-hdr]` |
+| `KLIO_FORVAR_TRACE` | set | Each for-loop variable whose iterable element type could not be derived, so the variable lowers untyped | `[forvar]` |
+| `KLIO_GRA_TRACE` | `<receiver head>` | The generic-receiver applicability walk for actual receivers with that head: head relation, binding failures, and per-param bound checks | `[gra]` |
+| `KLIO_HOP_TRACE` | set | The `+`/`-` operator's member-call lowering channels, and a type-parameter-headed receiver substituting its full bound before extension ranking | `[binop-in]`, `[binop]`, `[hop]` |
+| `KLIO_IMPLPROP_TRACE` | `<name>` | Implicit property-read typing for that name: the bare, guard, implicit-receiver, and member arms with their channel state | `[implprop]`, `[implprop-bare]`, `[implprop-guard]`, `[implprop-mem]` |
+| `KLIO_LAMINH` | set | The lambda-body declared-type inheritance channel: the pending snapshot each lambda body consumes (an empty pending while the enclosing builder holds records means the records were lost) | `[laminh]` |
+| `KLIO_LAMRET_TRACE` | set | The lambda-return-directed extension-family pick: the derived return head's winner and the instantiated callee return | `[lamret-pick]`, `[lamret-inst]` |
+| `KLIO_LAMRET_WHY` | `<substr of an fqn>` | Per-candidate skip reasons in the lambda-return family walk (no body, receiver mismatch, non-fn last param) | `[lamret-why]` |
+| `KLIO_LAR_TRACE` | set | The lambda-arg declared-receiver record: each put and get keyed by argument span | `[lar-put]`, `[lar-get]` |
+| `KLIO_LFN_TRACE` | set | Local-fn overload selection for bare calls: overload count, the selected mangled cell, applicability, and capture reachability | `[lfn]` |
+| `KLIO_NOCLASS_HEADS` | set (needs `KLIO_DISPATCH_STATS`) | Names each receiver head the census counted as having no class id, with its bound record where one exists | `[no-class-head]` |
+| `KLIO_OPTY_TRACE` | set | Indexed-read return typing (`a[i]` as `get` on the container): receiver typing and the answer | `[opty]` |
+| `KLIO_OVERRIDES_TRACE` | set | Why `overridesSlot` rejected each (own method, inherited slot) pair: missing sigs, kind/arity mismatch, no ancestor bindings, param-type mismatch | `[ovr]` |
+| `KLIO_PROMO_NAMES` | set | Member-promotion proof verdicts, each `PROMOTED`/`HELD` with the refusal reason (the per-candidate `[promo-ext]` rows also need `KLIO_DISPATCH_STATS`) | `[promo-ext]`, `[promo-proof]` |
+| `KLIO_REF_TRACE` | `<name>` | `::name` callable-reference lowering state: local-ext detection, receiver context, resolve/capture reachability, and the expected fn type | `[ref-trace]` |
+| `KLIO_RENAME_TRACE` | set | Each package-scope type-rename resolution (an `internal` classifier renamed for its whole package) | `[rnm-pkg]` |
+| `KLIO_REX_TRACE` | set | Extension-resolution ranking, one window per call: the call row, per-candidate state, each scored key or disqualification, and the exit reason | `[rex-call]`, `[rex]`, `[rex-key]`, `[rex-exit]` |
+| `KLIO_RH_TRACE` | set | Each receiver-lambda body head the type checker records for the eager channel | `[rh-put]` |
+| `KLIO_RMC_TRACE` | `<name>` | Per-candidate member-args-compatibility verdict during member resolution | `[rmc]` |
+| `KLIO_SCOPEFN_TRACE` | set | The scope-function (`let`/`run`/`also`/`apply`) return-derivation arm: enter and each bail reason | `[scopefn]` |
+| `KLIO_SCORE_TRACE` | set | The applicability scorer's per-argument refusals: parameter vs argument type at each null score | `[score-null]` |
+| `KLIO_SCRT_TRACE` | `<name>` | The static call-return-type derivation for calls of that name: which channel answered, the explicit-type-arg arm, the agreed-return handoff, and the final answer | `[scrt-via]`, `[scrt-out]`, `[scrt-path]`, `[scrt-agreed]`, `[scrt-target]`, `[expl]` |
+| `KLIO_SIBEXP_TRACE` | set | The sibling-argument expected-type solve: the pushed instantiation or the bail | `[sibexp]`, `[sibexp-inst]`, `[sibexp-bail]` |
+| `KLIO_SIBEXP_WHY` | `<outer fn name>` | Per-candidate skip reasons in the sibling-expected solve (receiver untyped, no bindings, result not concrete) | `[sibexp-why]` |
+| `KLIO_SMAC_TRACE` | `<fn name>` | Static member-args compatibility: entry state and each argument's instantiated-parameter verdict with route | `[smac]`, `[smac-arg]` |
+| `KLIO_TLP_TRACE` | `<prop name>` | The tiered top-level property type-head lookup: each declaration's package, tier, and head | `[tlp]` |
+| `KLIO_VABI_NAMES` | set | Each member call declined off the virtual-slot emit, with the owner's receiver ABI and body state | `[vabi]` |
+| `KLIO_VALTY_TRACE` | `<local name>` | Property-decl lowering entry state for that local, and every declared-type write recorded under the name | `[valty]` |
+| `KLIO_VALTY_STACK` | set (needs `KLIO_VALTY_TRACE`) | Adds a native stack trace at each declared-type write | native stack |
+| `KLIO_VARARG_TRACE` | set (most rows keyed to `listOf`) | The sole-trailing-vararg full-instantiation derivation (`listOf("a")` as `List<String>`): guards, candidate refusals, and element typing | `[vaf-guard]`, `[vaf-nocands]`, `[vaf-enter]`, `[vaf-cand]`, `[vaf-sole]`, `[vaf]` |
 
 The `0`-to-disable rows above exist so one binary can be compared against
 itself: `scripts/examples-ab.sh KLIO_SOME_GATE` runs the examples corpus both
@@ -127,6 +200,27 @@ comparison into a three-hour one.
 | `KLIO_TRACE_CAPTURE` | set | A lambda capture that fails to resolve and collapses to `Unit` | `[CAPTURE]` |
 | `KLIO_UNRESOLVED_TRACE` | set | The unresolved bare name, function, and span just before an `Unbound` error | `[unresolved]` |
 | `KLIO_INIT_DEBUG` | set | `object`/companion initializer first-failure and the cause take/swallow/restash steps | `[init-debug]` |
+| `KLIO_ANON_BASE` | `0` to disable | Off, anonymous-object synthesis lowers against the empty side module instead of the image-clone, leaving every call in anon bodies name-dynamic | — |
+| `KLIO_ANON_PROP` | `0` to disable | Off, an anon object's property type heads are not carried into its member lowerings, so sibling bodies lose their bare property-read types | — |
+| `KLIO_BARRIER_TRACE` | set | The type-safe collection bridge (erased-bound check on generic members called through an erased signature): each refusal reason | `[barrier]` |
+| `KLIO_CFN_TRACE` | `<substr of a fn name>` | Named-argument call binding: the declared parameter list vs the supplied names, on both the named and the typed entry | `[cfn]`, `[cft]` |
+| `KLIO_CHAIN_TRACE` | set | Enclosing-`this` chain activation per frame: enter/activate with thread id, frame pointers, and chain base (high volume) | `[chain]` |
+| `KLIO_DCS_TRACE` | set | The declaring-class scan for a FuncId — the per-class method walk feeding the owner cache (very high volume) | `[dcs]` |
+| `KLIO_DRAIN_TRACE` | set | Each Iterable receiver drained to a list by the collection fallback, with the caller and call-site span | `[drain]` |
+| `KLIO_FASTPLAN_TRACE` | `<substr of a fn name>` | Why a function is ineligible for the monomorphic fast call plan (no body, inline, extension, defaults, sibling overloads, ...) | `[fastplan]` |
+| `KLIO_ITER_TRACE` | set | The builtin iterator's `next()` element kind per call | `[iter-next]` |
+| `KLIO_KTYPE_TRACE` | set | Each synthetic `KType` materialized for a reified type name, with the enclosing function | `[ktype]` |
+| `KLIO_MEOI_TRACE` | `<owner class>` | Member-extension dispatch-receiver selection: the enclosing entries walked and each owner-identity verdict | `[meoi]` |
+| `KLIO_NOINST_TRACE` | set | Each virtual slot resolved by member name against the runtime class of a host-backed (non-`Instance`) receiver | `[noinst]` |
+| `KLIO_PICK_TRACE` | `<name>` | The runtime overload re-pick: the base candidate's applicability score and every sibling's | `[pick]` |
+| `KLIO_QT_TRACE` | `<substr of a qualifier>` | The qualified `this@Qualifier` receiver walk: each candidate class and the match | `[qt]` |
+| `KLIO_REDIR_TRACE` | set | Value-shaped redirect-target resolution among same-arity expect/actual siblings | `[redir]` |
+| `KLIO_RFP_DUMP` | set | Dumps every registered receiver-fn-property `(receiver, name)` pair when the gate masks build | `[rfp]` |
+| `KLIO_ROUTE` | `<name>` | Which runtime arm bound each `*OrGlobal` execution of that name (member@depth, overload, global-id, global, the fallback variants), plus dispatch-ladder route markers | `[route]` |
+| `KLIO_SLOT_RECV` | set (needs `KLIO_SLOT_BYNAME`) | The slot-byname note prints the receiver's runtime type instead of the slot root | `[slot-recv]` |
+| `KLIO_THIS_TRAP` | set | Every frame entry that binds a Bool or Int into a `this` parameter — the ext-receiver misbind signature — with the caller | `[this-trap]` |
+| `KLIO_VFLAT_TRACE` | set | One line per declined virtual flat prepare, with the reason a slot population stays recursive | `[vflat]` |
+| `KLIO_WALK_TRACE` | set | Each by-name IR method walk and extension-fallback walk entry, with the receiver and cache-key state | `[ir-walk]`, `[extfb-walk]` |
 
 ```sh
 KLIO_BARE_TRACE=format KLIO_MISS_TRACE=format ./zig-out/bin/klio run repro.kt
@@ -156,6 +250,7 @@ sweep scripts grep; see
 | `KLIO_LINK_AUDIT` | set (any value enables) | Re-derives what the deleted per-call dispatch ladder would have chosen and logs any disagreement with the link-settled tables | `[KLIO_LINK_AUDIT]` |
 | `KLIO_RECVHEAD_AUDIT` | set | Whether the type checker's recorded receiver-lambda head can answer the membership walk | `[RECVHEAD-AUDIT]` |
 | `KLIO_TYPEHEAD_AUDIT` | set | The type checker's per-argument type head vs the AST-derived declared type (fills and disagreements) | `[TYPEHEAD-FILL]`, `[TYPEHEAD-AUDIT]` |
+| `KLIO_DECL_AUDIT` | `1` | Completeness audit of the no-holes symbol table after the run: every intrinsic FQN paired with whether the module declares it, tallied per package with hole samples. Program-scoped — the lazy IR only declares what the program reached, so the number is a lower bound | `[decl-audit]` |
 
 `scripts/commontest-sweep.py` accepts `--eager` for compatibility and
 ignores it: there is only one pipeline, so `both` just runs the corpus
@@ -175,6 +270,7 @@ nondeterminism, not modes).
 | `KLIO_SEGV_TRACE` | set | Installs a segfault handler at startup so SIGSEGV/SIGBUS prints a native backtrace | native backtrace |
 | `KLIO_MAX_EVAL_DEPTH` | number (default 2000) | Caps interpreter recursion depth; on breach returns a catchable `StackOverflow` instead of faulting the native stack | none |
 | `KLIO_RUN_TIMEOUT_S` | seconds (`0`/unset off) | Wall-clock deadline for the whole run; a watchdog thread aborts the process when it expires | `[klio]` |
+| `KLIO_TEST_WALL_CAP` | seconds (default 300; `0` disables) | Per-test wall cap in `klio test`: a wedged test fails "test wall-clock deadline exceeded" instead of hanging the run | none |
 
 ```sh
 KLIO_ERR_TRACE=1 KLIO_THROW_TRACE=1 KLIO_THROW_STACK=1 ./zig-out/bin/klio run repro.kt
@@ -190,6 +286,8 @@ KLIO_ERR_TRACE=1 KLIO_THROW_TRACE=1 KLIO_THROW_STACK=1 ./zig-out/bin/klio run re
 | `KLIO_CHAN_DIAG` | set | The channel-waiter cancellation lifecycle: arming, watcher bind/drop, handler firing, waiter removal | `[chan]` |
 | `KLIO_NO_INLINE_RESUME` | set disables | Forces every continuation resume to queue on the pump instead of running inline on the caller's stack | none |
 | `KLIO_PUMP_NOSLEEP` | set | Skips the 1 ms sleep slice in the wall-clock timer drain (busy-loops instead) | none |
+| `KLIO_SYNC_RESUME` | `1` to enable (default off) | A cross-thread Kotlin `resumeWith` post waits (bounded) for the owner pump to run the routed step before the caller continues, instead of the fire-and-forget default | none |
+| `KLIO_SUSPEND_STATS` | set | Running counters of suspension snapshots (dense, slots, saved, params, captures, receivers), printed every 50k snapshots | `[suspend-stats]` |
 | `kotlinx_coroutines_test_default_timeout` | Duration, e.g. `10s` (default `60s`) | The `runTest` timeout. This is the env alias for the `kotlinx.coroutines.test.default_timeout` property: the property shim retries a dots-to-underscores form of any property name against the environment | none |
 | `KLIO_RACE_JITTER` | set | Widens object-cell lock acquisition windows (spin + yield) so genuine data races reproduce reliably under test | none |
 
@@ -208,6 +306,7 @@ path — it always runs. These knobs bisect its two emissions.
 | `KLIO_COMPOSE_MEMO` | `0` off (default on) | Whether composable-lambda arguments are wrapped in remembered `composableLambda` instances (matching kotlinc) | none |
 | `KLIO_COMPOSE_SKIP` | `0` off (default on) | Whether restartable composables emit the skip calculus (the `$dirty` probes and skip branch); an A/B bisection switch | none |
 | `KLIO_COMPOSE_DBG` | set | One activation summary line (oracle sizes) plus group-emission debug inside the pass | `[compose-pass]` |
+| `KLIO_COMPOSER_BIND_TRACE` | set | Each call that threads the `$composer, $changed` pair: the owning declaration and the composer's class (a non-Composer instance in the pair slot also dumps the frame chain) | `[composer-bind-fn]`, `[composer-bind]` |
 | `KLIO_RSS_LOG` | set | Prints process RSS on each rendered Compose UI frame | `[rss]` |
 
 ```sh
@@ -227,6 +326,7 @@ KLIO_COMPOSE_SKIP=0 ./zig-out/bin/klio run scene.kt   # bisect the skip calculus
 | `KLIO_SKIA_FONT` | path | Typeface override for text painting (checked before the bundled and system fonts) | none |
 | `KLIO_COMPOSE_DEBUG` | set | Traces the SDL+GL / Skia GPU-window bring-up path in the C++ shim | `[klio-compose]` |
 | `KLIO_PARA_TRACE` | set | Traces SkParagraph text-layout construction (font/unicode readiness, lengths) | `[para]` |
+| `KLIO_DRAW_TRACE` | set | Each canvas rect draw with its surface, geometry, and color | `[draw]` |
 
 ## Performance profile, JIT, and profiler
 
@@ -240,6 +340,9 @@ variables override individual fields on top of it.
 | `KLIO_JIT` | `1` on, `0` off | Loop-tier JIT override on top of the profile (on by default under `fast`) | none |
 | `KLIO_BC` | `0` off (default on) | The bytecode tier: dense per-block u32 op streams replacing the walker's union dispatch for the hot simple ops; `0` restores the pure tree walker for bisection | none |
 | `KLIO_COUNTED` | `0` off (default on) | Counted-range for-loop strength reduction (`for (i in a until b)` as a register loop); `0` restores the iterator lowering for bisection | none |
+| `KLIO_FLAT` | `0` off (default on) | The flat call driver; `0` falls back to native recursion for every call (bisect) | none |
+| `KLIO_FLAT_VCALL` | `0` off (default on) | The fused virtual flat path; `0` keeps slot-bound and lowering-resolved member calls on the recursive invoker (bisect) | none |
+| `KLIO_MEMBER_SITE` | `0` off (default on) | The `CallMember` instruction-site memo — the by-name replay path; `0` disables for bisection | none |
 | `KLIO_NATIVE_TRACE` | set | In a transpiled binary (`klio transpile` + libklio_rt): one line per native activation with its entry block and outcome, plus a miss line for user-package functions with no (or an fqn-guarded) native table entry — the engagement oracle: output parity alone cannot distinguish native execution from silent fallback to interpretation | `[native]`, `[native-miss]` |
 | `KLIO_CM_TRACE` | `<member name>` | At every CallMember execution of that name: the executing frame, whether lowering resolved it, and the full enclosing-`this` chain with entry kinds — the receiver-visibility debugger for member-extension dispatch | `[cmarm]` |
 | `KLIO_GF_TRACE` | `<substr of a field name>` | Every GetField execution whose field name matches: field, receiver class, executing frame — pairs with `KLIO_CM_TRACE` to separate a wrong read from a wrong dispatch | `[gfarm]` |
@@ -250,7 +353,10 @@ variables override individual fields on top of it.
 | `KLIO_PROF` | set; value = sampling interval in microseconds (default 1000, floor 100) | Statistical SIGPROF profiler; prints a by-function sample histogram to stderr at the end of the run (Linux) | `[prof]` |
 | `KLIO_PROF_ALL` | set (needs `KLIO_PROF`) | Widens profiling to the whole process, including startup and image decode | `[prof]` |
 | `KLIO_PROF_CALLERS` | `<substr>` | After the histogram, folds the callers of every sampled leaf whose name contains the substring | `[prof]` |
+| `KLIO_OP_PROF` | set; value = sampling interval in microseconds (default 1000, floor 100) | Opcode sampler: a SIGPROF histogram over the interpreter's currently executing opcode tag (with host-route sub-tags), printed at the end of the run as self-time by opcode | `[op-prof]` |
 | `KLIO_CALL_STATS` | set | Counts every interpreted function invocation by FQN over the whole run; `klio test` prints the top entries after the summary. The workload census that separates "slow per call" from "more calls than the reference would make" (missed skipping, repeated recompose, un-inlined accessors) | `[call-stats]` |
+| `KLIO_CALLVALUE_TRACE` | set | Flat closure-call preparation on the value-call path: per-argument kinds and under-application | `[flat-prep]`, `[cvt-flat]` |
+| `KLIO_DUMP_FN` | `<name>` or a numeric FuncId | Prints the named function's lowered instruction stream the first time it runs (and its block table at startup) — the only way to see what an emit path produced for a body inside a baked pack | `[dumpfn]` |
 
 ```sh
 KLIO_PROF=500 KLIO_PROF_CALLERS=append ./zig-out/bin/klio run bench.kt
@@ -266,6 +372,9 @@ backend (the default for `fast`/`safe`).
 |----------|--------|--------------------|------------|
 | `KLIO_GC_DEBUG` | set; `0`/empty off | One summary line per collection: epoch, kind (minor/major), marked, live bytes, freed | `[kgc]` |
 | `KLIO_GC_GEN` | `1` on (default), `0` off | Generational collection: minor (nursery-only) sweeps between Appel-scheduled majors; `0` forces every collection major | none |
+| `KLIO_GC_GROWTH` | integer, min 2 (default 2) | The Appel growth multiplier: the next collection fires after `live * factor` bytes | none |
+| `KLIO_GC_MINOR_STOP` | `1` on (default), `0` off | Whether a minor mark stops at tenured cells; `0` full-traces minors to bisect a missed-barrier suspicion | none |
+| `KLIO_GC_REMEMBER_TRACE` | set | Logs, with a native stack, any remembered-set cell as it is swept | `[gc-freed-remembered]` |
 | `KLIO_GC_HIST` | set; `0`/empty off | Top-16 live-cell payload types per collection | `[kgc-hist]` |
 | `KLIO_GC_STRESS` | set; `0`/empty off | Collects at every safe point; surfaces incomplete roots/tracers immediately | none |
 | `KLIO_GC_STRESS_EVERY` | number (`0` off) | Collects every N safe points (cheaper sampled stress) | none |
@@ -277,6 +386,7 @@ backend (the default for `fast`/`safe`).
 | `KLIO_GC_ALLOC` | `slab` (default), `smp`, `gpa`, `calloc`, `leaktrack` | The freeing backend the collector frees into; `leaktrack` wraps the slab in the leak locator and reports at exit | `[leaktrack]` |
 | `KLIO_LEAK_BY_FQN` | set (needs `KLIO_GC_ALLOC=leaktrack`) | Attributes outstanding allocations by intrinsic FQN instead of by stack (much cheaper) | `[leaktrack-by-fqn]` |
 | `KLIO_RC_DETECT` | set; `0`/empty off | Refcount double-free detector: leaks control blocks so a second decrement is observable, then dumps a stack trace | `[RC DOUBLE-FREE]` |
+| `KLIO_BOXDIE_TRACE` | set | Logs, with a native stack, a boxed List view whose box dies while a backing value is still attached | `[boxdie]` |
 | `KLIO_ALLOC_TRACK` | set; `0`/empty off | Global allocation counters, a size histogram, and named phase snapshots; whole-process report at exit | `[alloc-track]` |
 | `KLIO_PAGE_TRACE` | set; `0`/empty off | Histogram of direct page allocations, with stacks for the 96 KB to 160 KB window | `[page-trace]` |
 | `KLIO_SLAB_STAT` | set | Total bytes currently mapped from the OS, printed at exit | `[slab]` |
@@ -298,6 +408,7 @@ overrides and traces.
 
 | Variable | Values | What it shows/does | Output tag |
 |----------|--------|--------------------|------------|
+| `KLIO_HOME` | path | The klio data home (packs, cache, registry, stubs); overrides the `~/.klio` default | none |
 | `KLIO_STDLIB_PACK` | path | On-disk stdlib pack override, first in the resolution order (also folded into the image cache key) | none |
 | `KLIO_STDLIB_IMAGE` | `0` disables | The stdlib image cache; disabled, every run lowers the full dependency set | none |
 | `KLIO_TRACE_STDLIB_IMAGE` | set; `0`/empty off | One `hit`/`baked`/`fallback` line per run with the cache key and timing | `[stdlib-image]` |
@@ -306,6 +417,8 @@ overrides and traces.
 | `KLIO_BUNDLE_INSPECT` | `1` (`0` off) | A bundled executable prints its manifest and payload table, then exits without running | manifest listing |
 | `KLIO_BUNDLE_PROGRAM_IMAGE` | `0` disables (default on) | Whether bundling attempts the whole-program image bake; `0` forces the program-source boot path | none |
 | `KLIO_STUB_DIR` | directory | Local source for cross-target runtime stubs and Skia shims (`<dir>/<target>/<name>`), checked before the download cache | none |
+| `KLIO_STDLIB_CHECK` | `0` disables | Checking the stdlib base's own sources while an image is built (publishes extern decls and eager call resolutions for the checker) | none |
+| `KLIO_ENUM_INIT_TRACE` | set | Names any enum-instance field APPENDED rather than replaced in place during baked-enum init — the signature of a bake that dropped a field | `[enum-init-append]` |
 
 ## Libraries and the front end
 
@@ -314,6 +427,9 @@ overrides and traces.
 | `KLIO_TRACE_HTTP` | set | Logs each outbound ktor HTTP request (method + URL) before the transport runs | `[HTTP]` |
 | `KLIO_SERVE_MAX` | number (`0`/unset unlimited) | Caps the embedded ktor server to N requests so a leak-checking run reaches its exit report | none |
 | `KLIO_DOLLAR_TRACE` | set | Lexer trace for multi-dollar string-template arming (file, position, source window) | `[dollar-arm]` |
+| `KLIO_REPEAT_DBG` | set | The `String.repeat` intrinsic's argument tags per call | `[srep]` |
+| `KLIO_SEQ_DIAG` | set | A sequence drain whose iterator lacks `hasNext`, with the iterator's kind and FQN | `[seq-diag]` |
+| `KLIO_UCTOR_TRACE` | set | An unsigned constructor refusing its argument shape, with the argument tags and a frame dump | `[uctor]` |
 
 ## Test harness and dev tooling
 
@@ -324,6 +440,7 @@ the scripts, not by `klio run` itself.
 |----------|--------|--------------------|------------|
 | `KLIO_ITEST_BIN` | path (default `zig-out/bin/klio`) | The `klio` binary child-spawning itests run; `zig build` points it at the installed harness | none |
 | `KLIO_ITEST_VERBOSE` | set | Surfaces the differential itest's otherwise-suppressed progress lines | none |
+| `KLIO_TEST_FILE_TRACE` | set | `klio test` prints each selected file's path-to-FileId mapping | `[test-file]` |
 | `KLIO_COMMONTEST_SHARD` | `K/N` | Runs shard K of N of the commontest target list (weighted split; set by CI) | none |
 | `KLIO_E2E_SHARD` | `K/N` | Runs only corpus programs whose name hashes into shard K of N | none |
 | `KLIO_E2E_FILTER` | `<substr>` | Restricts the e2e corpus to programs whose file stem contains the substring | none |
@@ -343,6 +460,16 @@ the scripts, not by `klio run` itself.
 | `KLIO_SWEEP_DEBUG` | set | `scripts/commontest-sweep.py` prints each child's argv before spawning | `ARGV` |
 | `KLIO_BIN` | path | The binary `scripts/klio-smoke.sh` sweeps with | none |
 | `KLIO_SKIA_OS` / `KLIO_SKIA_ARCH` | `linux`/`macos`/`windows`, `x64`/`arm64` | Target selection for `scripts/fetch-skia.sh` | none |
+
+### Harness / test-infrastructure variables
+
+Plumbing read only by test code — not user debugging knobs.
+
+| Variable | Values | What it does |
+|----------|--------|--------------|
+| `KLIO_ITEST_WALL_CAP` | seconds (default 60; `0` off) | Per-program wall cap for the in-process itest harnesses; a spinning program fails "test wall-clock deadline exceeded" and names itself instead of hanging the binary |
+| `KLIO_ENVONCE_SELFTEST_A` / `KLIO_ENVONCE_SELFTEST_B` | never set | Sentinel names the `envOnce` unit tests probe to prove distinct cache slots and unset-miss behavior |
+| `KLIO_DEFINITELY_NOT_SET_XYZZY` | never set | Sentinel name the `proc_env` `isSet` unit test probes |
 
 ## Workflow recipes
 

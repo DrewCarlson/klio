@@ -1,6 +1,6 @@
-# Plan Archive (M0–M21)
+# Plan Archive
 
-Historical record of completed milestones. The active plan lives in `PLAN.md`. Entries here are append-only — newer milestones are summarized in as they retire from the active plan.
+Historical record of completed work. The live register is `open-campaigns.md`; the active plan is `simplify-validate-accelerate.md`. Entries here are append-only — records retire into this file as they close out of the live register.
 
 ## Target version & scope
 
@@ -635,3 +635,765 @@ Maintain a growing set of runnable `.kt` programs under `examples/` (indexed by 
 2. **Deterministic output.** Every example must print stable output so we can wire it into an end-to-end test harness later.
 3. **Examples never regress.** Once an example runs cleanly, future milestones must keep it running. If a milestone requires changing a program's expected output, update both the program and any harness in the same change.
 4. **Keep the index honest.** `examples/README.md` lists every example and the features it exercises.
+
+---
+
+## Campaign log archive (2026-08-16 register reconciliation)
+
+The 2026-08-16 plan-register reconciliation made `open-campaigns.md`
+the single live register. The finished campaign docs below stay in
+place as logs and are indexed here; the closed campaign records that
+lived inline in `open-campaigns.md` and `worklist.md` are moved here.
+
+### Finished campaign docs
+
+| doc | outcome | closed |
+|---|---|---|
+| `bytecode-vm-plan.md` | Bytecode tier complete and fused (jump/br/cmp_br streams, counted range loops); loop shapes 10-13x JIT-off vs JIT-on, fib 1.9x; the next lever it names became the Value-layout campaign | — |
+| `ci-green.md` | Shard serialization + wall-cap hang tooling landed; its in-flight items were all root-fixed by later work; the census duty continues in `simplify-validate-accelerate.md` Track V | — |
+| `compose-dirty-bits-plan.md` | Per-param $changed/$dirty calculus landed; checkboxLike slot-exact; plugin ratchet floor 1340 -> 1370 | 2026-08-15 |
+| `compose-plugin-lowering.md` | The plugin cutover LANDED — the lowering pass is the only compose path, the implicit-composer hook and its gate are deleted (8835dfc8); conformance ratchet floor 1370 | 2026-08-16 |
+| `CPU-EFFICIENCY-CAMPAIGN.md` | Loop JIT (60-79x hot loops), dispatch inline caches + member-resolve cache, packed numeric arrays; residual named as the boxed-value interpreter floor, taken up by the later campaigns | — |
+| `eager-resolution-plan.md` | Typeck-eager lowering landed; its goals were absorbed and completed by the resolution-unification and static-dispatch campaigns | — |
+| `feedback-loop-plan.md` | Development loop fixed: material3 bake 302s -> 12s, warm pack load ~0.5s | — |
+| `interpreter-perf-campaign.md` | Profile-guided perf rounds landed; the continuation is `simplify-validate-accelerate.md` Track A | — |
+| `interpreter-performance-plan.md` | Flat-eval analysis; verdict "the target needs an execution-strategy change, not more tuning" — delivered as the bytecode tier | — |
+| `klio-bundle-plan.md` | `klio bundle` landed and gated on Linux + macOS (signed Mach-O overlay, three itest suites); Windows remains a recorded drop-in extension point | — |
+| `LANGUAGE-GAPS.md` | All tracked language gaps closed; pack-actual residuals recorded in the doc | — |
+| `LAZY-IMAGE.md` | Per-decl lazy stdlib image flip landed (forest resolver, per-decl sections, empty baked forest); the RSS win is confirmed by the memory-parity targets | — |
+| `loadglobal-member-fallback-audit.md` | Audit closed: one classification path for bare-name call lowering; the separate writeback lowerers deleted | — |
+| `MEMORY-PARITY-CAMPAIGN.md` | All five memory-parity targets met (bare runtime 27MB, ktor start 49MB < node); deferred road: extend-model COPY -> DELEGATION rearchitecture | — |
+| `PACK-ROADMAP.md` | Container format, binding registry, embedded stdlib, pack workflow CLI shipped; residual mmap-backed reader + cache-index hygiene recorded in the doc | — |
+| `p2-applicability-design.md` | Shared applicability engine live in `src/ir/applicability.zig`; all four scoring callers flipped, legacy scorers removed | — |
+| `p3-resolvecall-design.md` | `Module.resolveCall` is the live bare-call resolver; the ad-hoc lowering helpers are gone | — |
+| `resolution-unification-plan.md` | Resolved-IR / one-engine build landed; trust KLIO_RESOLVE_AUDIT over the flaky canonical count | — |
+| `static-dispatch-campaign.md` | Closed verified end to end at ZERO no_receiver_type rows (gate at 5dd6bd4a; plugin canonical 1336/46/0 vs ratchet 1305) | — |
+| `worklist.md` (the ordered round) | Transpiler 16.6x rangebench round + native leaf-serve; compose suite long tail enumerated and mostly fixed; correctness items C1-C3 closed; concurrency perf round landed with the continuation open in the active plan. Full record below | 2026-08-16 |
+
+### Transpiler + Value layout record (moved from open-campaigns.md §1)
+
+- [x] Value 40 -> 24: RangeIter/Iterator folds; Range/BoundMethod/
+      MapEntry/Triple/MatchGroup/Pair/Comparator/Result boxed; Intrinsic
+      interned; Array repacked; dead AST-era variants deleted. Verified:
+      sweep 117/0, ratchet 1339, rangebench neutral.
+- [x] Hot-view sub-ABI landed + measured: +3.2% rangebench RF JIT-off at
+      293/293 corpus parity (a14d89e2).
+
+Handover note (Value=24 VERIFIED):
+
+The whole 24B tier is done: Triple boxed, MatchGroup boxed (shared
+descriptor struct), Intrinsic INTERNED (immortal records — no refcount,
+no GC), Array REPACKED (the boxed/scalars tag was derivable from
+`prim == null`, so the payload is (cell ptr, prim) with storage()
+rebuilding typed handles). Census: Value 32 -> 24, NO payload >= 24.
+rangebench 82.6s (band 83.0-83.7 — neutral/slightly better); units
+zero-leak; hello smoke green. VERIFIED: sweep 117/0, corpus + compose slice at
+baseline, litmus 43/44 (only the yield flake), plugin ratchet 1339
+(ABOVE the 1337 baseline; the GC-stress step green).
+16B wave state: Pair BOXED; dead AST-era variants (Function,
+BoundUserMethod, BoundInnerClass) DELETED (net -74 lines, sweep 117/0).
+Comparator BOXED (sweep 117/0), Result BOXED (units zero-leak). The
+16B ENDGAME is now a recorded measured-first road, NOT the next step:
+only IrClosure ({id u64, captures ValueSlice} — the side table already
+keys canonical captures by id, so the payload could become the bare id
+IF the per-value dup'd captures snapshot is semantically redundant —
+verify against the closure invoke path before touching) and Array
+remain at 16, both hot, and 24 -> 16 pays only if BOTH shrink. Measure
+Value=24's own wins first (rangebench + suite wall vs the 40B-era
+records). HOT-VIEW SUB-ABI LANDED (a14d89e2): the emitted C inlines
+const_int/move/bin/cmp_br over the runtime-measured layout slot —
+Int/Int + Long/Long + mixed-width promotion with applyBinop-exact
+semantics, per-op helper fallback everywhere, gated on KV.usable
+(computed from reclaimRequested; the live per-thread flag sampled too
+early left the path dark — found via the layout probe). MEASURED:
+rangebench RF JIT-off 13.38s native vs 13.82s interp = +3.2% at full
+293/293 corpus parity. Honest reading: the fused stream was already
+cheap, and the remaining per-iteration costs (edge guard, trace
+bookkeeping) are SHARED with the interpreter — next recorded levers are
+an inline trace store (frame.cur_span offset via the same probe
+mechanism) and wider op coverage.
+
+Earlier note (Value=32 landed, superseded above):
+
+The Iterator fold landed (2a6e72f3): census Value 40 -> 32, units green
+zero leaks, rangebench 83.0s (inside the pre-fold band), sweep 117/0,
+corpus/litmus at the known baseline.
+
+### Compose plugin triage record (moved from open-campaigns.md §2)
+
+The doc's original checklist was stale: entries 43-47, the window
+family, foundation_lazy, and serial_names are ALL FIXED (triage memory
+54i/54j/54k + entry records; the 2026-08-15 corpus = the 3 interactive
+permanents + lazy's Debug-CLI time cap + the animation load flake).
+
+- [x] Local-ext-on-declared-builtin family FIXED (c3f3fc38 + 75a92601):
+      the static subtype judgment learned the builtin collection
+      hierarchy + the bare-type-param non-refuting rule (the deriver
+      leaves factory type args unsubstituted — MutableList<T>).
+      MovableContentTests 41 -> 42/44; ratchet 1338; guard example
+      local_ext_declared_receiver.kt. Deeper channel recorded: the
+      deriver should substitute call-site type args.
+- [x] anchorIndex-on-MutableList FIXED: nested splice-window hole —
+      a lambda spliced from inside another spliced lambda (let inside
+      fastForEach's action) records a caller window whose region
+      includes the OUTER inline fn's receiver bind, so bare `this`
+      resolved to the outer splice receiver (`scopes`) instead of the
+      class instance. Fix: `splice_hidden_bands` stack on FuncBuilder —
+      every active window registers its hidden `[caller_depth,
+      own_base)` band and the windowed caller scan skips enclosing
+      bands. MovableContentTests 42 -> 44/44. NOTE: the wrong spliced
+      code lowers in EVERY context but is live only via the pack-loaded
+      module (test-file lowering ran an alternate emission), so
+      standalone repros pass pre-fix — in-situ probe (println in
+      SlotTable.kt + pack rebuild) was the discriminator.
+- [x] GroupSizeValidationTests 2 -> 4/5: two roots.
+      (a) file-private classifier refutation — staticReceiverCompatibility
+      resolved an unqualified declared head (`Modifier`) module-wide
+      (unique-name = null, or the wrong package's namesake), refuting the
+      right overload; now resolves in the DECLARATION's file scope
+      (exact import, then decl-package FQN — the mangled `$fN` class's
+      fqn stays clean — then classIdIndexed). (b) the plugin's
+      strong-skipping memo wrap emitted qualified-Path
+      `androidx.compose.runtime.remember(keys..., calc)` UNTHREADED,
+      which lowered through the arity-blind global-value route and
+      invoked the 0-key overload with junk args; the wrap now appends
+      the composer pair, multi-segment Path callees route through the
+      FQN flatten/global-fit lowering, and the flatten's exact-arity
+      match skips vararg decls (fixed-arity wins, Kotlin rule).
+- [x] Per-class census (heavies excluded) surfaced two more roots, both
+      FIXED: CompositionLocalTests 31/31 — a member overload whose
+      declared param type provably rejects the arg now stands aside for
+      the same-named extension (`putAll(pairsArray)` inside the stdlib
+      `plusAssign` hit the builder's `putAll(Map)`; Array vs non-array
+      container heads is now a definite disproof + member walk consults
+      it when a surviving extension exists). SlotTableEditorTests
+      11/11 — a bare `::ref` to a LOCAL EXTENSION fn now eta-expands
+      binding the enclosing implicit receiver (arity carried in the
+      inherited local-ext mark). Guard examples
+      local_ext_fn_reference.kt, member_arg_disproof_extension.kt.
+- [x] checkboxLike anchor GREEN (f6bbd362 + 03e41d70): the dirty-bits
+      campaign landed — per-param `$dirty` triples, caller-certainty-
+      guarded probes, call-site `$changed` bits (lowering-side,
+      resolved-signature named-arg mapping, defaulted-param `$arg`
+      forwarding), zero-key-slot memo shapes (cache from `$dirty`,
+      lifted `{}` singletons, cache(false)). checkboxLike went 24
+      slots -> slot-exact PASS (<= 8 groups / <= 18 slots);
+      GroupSizeValidationTests 5/5; remember-family 26/26;
+      funInterface_isMemoized green; ratchet observed 1370-1372,
+      floor RAISED 1305 -> 1340. Full record in
+      plans/compose-dirty-bits-plan.md.
+- [x] CompositionTests remember-family FIXED — 26/26 solo (was ~8
+      fails), LocalRememberReproTests 4/4. Three stacked roots, all
+      landed:
+      (a) OWN-RUN capture shadow: ImplicitCandidate carries an `own`
+      bit (the frame's own dispatch receiver + its companion/nesting
+      tower); a scoped-capture binding now loses only to the OWN run's
+      members — a dispatch-published chain receiver's same-name member
+      no longer outranks a captured local, on the read AND write arms
+      (`count++` in a local-class init binds the captured `count`, and
+      storeGlobal writes through its Cell).
+      (b) runtime-lowered bodies know their CAPTURE NAMES:
+      registerClassCaptured/buildObject install captured_names via
+      build.setLowerAnonCaptureNames; the bare-name classifiers skip
+      top-level-const inline / LoadGlobal binding for captured names
+      (SlotTableEditorTests' file-private `const val count = 100` was
+      const-inlined into another test's local-class init).
+      (c) keyChange: delegated-local param shadow — inside compareBy's
+      spliced `{ a, b -> compareValuesBy(a, b, selector) }`, `a`/`b`
+      resolved to the TEST's `var a by mutableIntStateOf(0)` delegates
+      (getValue → Int) instead of the lambda params;
+      plainShadowsDelegate walks the scope chain in resolve order and
+      an inner plain binding now shadows the delegate read AND
+      setValue write-through. Guard examples:
+      delegated_var_param_shadow.kt, captured_local_shadows_const.kt.
+      Also: intrinsic_host.invokeMethod no longer swallows CalleeFailed
+      into a null dispatch-miss (it masked (c) as
+      "unresolved global sortWith").
+      STILL RECORDED (not blocking any live test here): the private
+      member-extension-property visibility gate (plain (recv,name)
+      registration leaks program-wide; first gating attempt broke
+      JobSupport's `Any?.exceptionOrNull` — needs frame-owner-aware
+      visibility, not just the this-chain tower).
+- [x] movableContentOf factory wrap RECLASSIFIED latent: the gated
+      wrap (movableContent* factory names, compose_pass wrap_ret) is
+      in tree and MovableContentTests is 44/44 — no live test pins the
+      ungated arms. Widening to all composable-returning factories
+      stays recorded (the drafted ungated patch core-dumped with
+      10001-frame recursion; bisect plan in triage memory) and waits
+      for a failure that names it.
+- [x] Group start/end imbalance RECLASSIFIED latent: the tests that
+      exposed it (movable multi-ref family) are green after the window
+      band + judgment + dispatch fixes; no live failing test remains.
+      The op-trace probe recipe stays in the triage memory
+      (Operations.kt [op] print with val op0=this.operation) for when
+      a shape re-pins it. checkboxLike's SLOT count is the live
+      emission-shape anchor instead.
+
+### Coroutine debt cluster record (closed 2026-08-16; moved from open-campaigns.md §3)
+
+The two open remnants (tl_atomic_update_contended watch,
+background-yield perf) stay in the live register.
+
+- [x] with_timeout preempt — STALE: re-verified passing
+      (withTimeoutOrNull(5){delay(50)} = null, standalone and nested
+      under coroutineScope / withTimeout; fixed by intervening work).
+- [x] private_shadow cells — STALE: both val and var shapes print the
+      exact kotlinc outputs (distinct per-class cells).
+- [x] THE #10 "CHANNEL DEADLOCK" FIXED — it was the LOOP JIT, not
+      the channel: a trampolined callee's SUSPENSION propagated as a
+      plain error, dropping the JITted loop frame from the
+      continuation. A `for (i in 1..N) ch.send(i)` lost every element
+      after the ~64-iteration tier-up (KLIO_JIT=0 was the decisive
+      bisect; segment-size and capacity sweeps were red herrings, as
+      was the entire cross-thread machinery — resumeExternal and the
+      mailboxes traced clean). Fix: the trampoline stashes the call
+      site's inst+dst on a Suspended result and the interpreter parks
+      the frame at the call site (park_out), exactly the interpreted
+      protocol. Whole family green: 1..2000 items, 5-actor original,
+      worker/inline variants. Guard: litmus
+      tl_channel_jit_send_loop.kt (litmus now 45/45). The park/resume
+      empty-TailSeg leak is fixed too (chains hold at one segment;
+      ratchet 1353 with DNC classes 3 -> 2).
+- [x] combine/zip FIXED (the last of the flow-campaign #3 family).
+      zip: the runtime extension-arity check was trailing-lambda-blind
+      (`produce<Any> {}` against `produce(context=, capacity=, block)`
+      needs only the GAP defaulted when the last arg is callable and
+      the last param function-typed — extArityApplicableTL,
+      host_call_member.zig). combine: a receiver-lambda param invoked
+      bare from inside a coroutine lambda now binds the lexically
+      innermost implicit receiver of its declared head through the
+      receiver tower's `this@fn` slot, with the head riding
+      CallValueWithThis (`recv_head`) for VM re-selection; the dynamic
+      enclosing-this chain cannot serve this after a pump resume. The
+      "raw collector closure" seating that looked wrong is CORRECT by
+      design — FlowCollector is a fun interface and SAM lambdas stay
+      raw IrClosures; bare `emit` on one SAM-invokes it. Guards
+      examples/flow_zip.kt + examples/flow_combine.kt
+      (kotlinc/JVM-verified); traps recorded in memory
+      klio-flow-zip-combine-fixed (vmhost @hasDecl re-export, flat-call
+      preempt gate, clear the cache BEFORE `pack build`).
+- [x] Cancellation cluster CLOSED BY RE-VERIFICATION (2026-08-15): the
+      flow campaign's recorded repros all pass on current main
+      (plans/repros/channel_segment_rotation_break sum=2415,
+      channel_worker_send_park_lost_wakeup sum=5050, both matching the
+      JVM oracle; combine_captured_param_typeparam_cast is a distilled
+      erasure probe the JVM itself CCEs on — not an oracle), and the
+      litmus tl_cancel_* family is green in the 45/45 baseline.
+- [x] Unconfined event loop: eager start (guard
+      unconfined_starts_eagerly.kt), yield order (oracle-verified:
+      kotlinc 2.2.20 + kotlinx-coroutines 1.9.0 on JVM prints
+      U1 U2 L1 L2, exactly klio's order — NOT a bug; guard example
+      unconfined_yield_order.kt), and the manual
+      CancellableContinuation save/resume crash (`get_field context on
+      Unit`) all pass on current main — the save/resume shape matches
+      the JVM byte-for-byte (guard
+      cancellable_continuation_save_resume.kt).
+- [x] tl_yield_cross_thread_teardown "flake" was the litmus sweep's
+      expectation PARSER stopping at the first code line (bottom-of-
+      file //> lines read as empty). Fixed; litmus baseline is now
+      45/45 — any litmus failure is REAL.
+- [x] Stale-killed on re-verification: with_timeout preempt,
+      private_shadow val+var, atomicfu SupervisorJob CAS.
+- [x] CompositionTests.testCompositionAndRecomposerDeadlock +
+      PausableCompositionTests.markInvalidFromBackgroundThread —
+      RECLASSIFIED (2026-08-15): no stall remains. The deadlock test
+      PASSES solo under the census recipe (10s virtual cap); the
+      markInvalid test PASSES in 40s wall once the virtual timeout
+      admits it (kotlinx_coroutines_test_default_timeout=600s) — its
+      body runs 10,000 interpreted background invalidates (repeat(1000)
+      × 10 launches + joins), which is the compute-heavy category from
+      the suite-wall profile, not a cross-thread dispatch loss. Under
+      the census's 10s cap it reports UncompletedCoroutinesError by
+      design; it counts as wall-capped in the ratchet, not as a bug.
+
+### ktor commontest campaign record (closed by record; moved from open-campaigns.md §4)
+
+The recorded "292" was stale AND inflated by a stale-pack census trap:
+the itest REBUILDS all five packs before running — a census against
+old installed packs fails 100%. Fresh-pack per-class census (43 files,
+ktor-io/utils/http common tests): 322/444 passing at the start of the
+stretch.
+
+- [x] Triage: the DOMINANT class was not interpreter bugs at all — the
+      io.ktor pack's curated `include` lists simply omit upstream files
+      the tests exercise (Base64, Crypto/Hash/Nonce, converters, date
+      parsing, Cookie/Mimes/FileContentType/AcceptEncoding,
+      LineEnding(Mode)/ByteChannelScanner/SinkByteWriteChannel...).
+      Recipe proven and applied in three batches: 322 -> 399/444
+      (Base64Test, AcceptEncoding, ContentType*, CommonHeaders,
+      RenderSetCookie, GMTDate*, ReadLine 22/25... whole classes to
+      green). One trap: a speculative include (IpParser.kt) pulled the
+      unconsumed parsing DSL and broke the whole bake — add only files
+      a failing test names, drop on bake error.
+- [x] Interpreter root-causes landed off the cluster list (each with a
+      guard example; commits 21186c6e, 44471f59, eac108fa):
+      * anon-object method params typed by the ENCLOSING declaration's
+        type params registered + consulted in the anon disproof, so an
+        unrelated class named `Key` no longer refutes `add(element: Key)`
+        (ConcurrentSetTest 1/10 -> 10/10).
+      * `return@inlineFn` across nested inline splices resolves at
+        lowering (InlineReturn carries the fn name), and a label crossing
+        a REAL frame inside a spliced body is absorbed by a runtime
+        `Block.lr_absorb` region at the splice join (CookieDateParser
+        4/4). Image FORMAT_VERSION 45 -> 46.
+      * companion members through the class name bind with a leading
+        defaulted param skipped (trailing-lambda pmo remap + named-ladder
+        companion forwarding): `StringValues.build { }`, `Parameters
+        .build { }` (UrlTest testEncoding included).
+      * intrinsic applicability predicates consulted unconditionally;
+        `String.repeat` declines non-(Int) calls — a bare `repeat(n){}`
+        against an in-scope String receiver silently NO-OPED (this also
+        produced the CookieDateParser NumberFormatException).
+      * `typeOf<T>()` carries generic ARGUMENTS end-to-end (full-spelling
+        reified stamps + KTypeProjection materialisation)
+        (DataConversion 4/4); tuple `contains` dispatches user equals
+        through Pair components (MimesTest 3/3).
+      * `object : Iface by <expr> {}` evaluates the delegate through a
+        site-cached thunk (SinkByteWriteChannel 4/4); KClass.isInstance
+        agrees with `is` via the registry walk (ByteChannel 13/13).
+      * `io/ktor/util/ByteChannels.kt` include (copyToBoth; ChannelTest
+        21/22 -> full class green).
+- [x] Second interpreter batch (commits 44471f59, eac108fa, 036aa54a,
+      3776afc5): full-spelling reified stamps + KType arguments; tuple
+      contains via user equals; anon-object interface delegation thunks;
+      KClass.isInstance registry walk; spliced-receiver-lambda bare reads
+      prefer a window member the head declares (the whole URLBuilder
+      `parameters`-as-Function family); trailing-vararg element
+      adjudication + Pair-component disproof (StringValues 9/9); range
+      literal peer widening (list-of-ranges vs Long peer).
+- [x] Census at 464 passed / 3 failed / 0 incomplete (was 322/444-ish
+      at the stretch start; the deadlocked classes' tests now all
+      count and PipelineTest is 18/18 in 10s). Landing (e2200304):
+      CallValueOrMember's non-invocable arm walks the outer implicit
+      receivers on the canonical miss — a NON-callable captured local
+      (val pipeline = pipeline()) no longer strands the enclosing
+      member. LANDMARK (704597a0): the inline `synchronized` actual
+      leaked its monitor on NON-LOCAL RETURN/exception exits;
+      TestCoroutineScheduler.tryRunNextTaskUnless returns from inside
+      synchronized(lock), so under runTest the root thread owned the
+      scheduler lock forever and every cross-thread resume spun in
+      registerEvent's monitorEnter — the ENTIRE GlobalScope.writer/
+      reader deadlock family. try/finally fixed it: CoroutinesTest 2/2,
+      WriterReaderTest 4/4, PipelineTest completes solo. Pack-baked
+      splices carry the old enter/exit sequence until rebuilt. Landed
+      since the 435 snapshot: named args on RESOLVED member calls bind
+      by name (ReadLineTest 25/25 with the exact-limit pair),
+      partial-index overload repick + eager unresolved-param gate
+      (ByteReadChannel(byteArray) overload), and the pack-scale
+      String-factory scope fix (plans/repros/pack_scale_repeat_echo.md
+      — RESOLVED; shadowedByClass now tier-filters factory
+      competitors, fixing "A".repeat receiver-echo in fully-loaded
+      homes and both remaining ReadLine/Utf8 limit tests).
+      * CodecTest.testFormUrlEncode — FIXED: bareCallReturnTypeRef's
+        sole-bodied-candidate fallback now respects the extension
+        receiver (kotlinx's deprecated `Flow.flatMap` was the sole
+        bodied 1-arg candidate in the pack universe and stamped
+        `declared=Flow` on a Set-receiver chain).
+      * Side find: fast/flat `eq(0, 0L)` peer widening — FIXED
+        (leafExprServeAt applies the coerce plan; guard:
+        examples/generic_literal_long_widening.kt).
+- [x] FINAL census: **465 passed / 2 failed / ZERO incomplete** — the 2
+      = URLBuilder scheme-with-digits (klio MATCHES Kotlin; do not
+      "fix"; anatomy kept in the live register §4).
+      RangesTest.testResolveRanges CLOSED (27/27 solo): the
+      self-recursive member bind now defers to the runtime walk when an
+      argument's generic content is unresolved (`List<*>` from the
+      un-derived map), and argDefinitelyNotParamType refutes a List of
+      Long-kind Ranges against an invariant `List<IntRange>` param, so
+      the walk binds kotlin.test.assertEquals exactly as kotlinc does
+      (guard: examples/member_invariant_arg_delegation.kt).
+- [x] The last 2 CLOSED BY RECORD; the suite baseline is ratcheted at
+      440 in src/itests/ktor_commontest.zig (census floor 465 solo).
+
+### Suite-wall profile record (moved from open-campaigns.md §5)
+
+The pending question from the compose suite perf work: is
+SlotTableBuilder's buildSubTable an O(n^2) pathology or genuine
+compute? Reference: memory klio-compose-suite-perf; `BENCHMARKS.md`
+for harness practice.
+
+- [x] Profile buildSubTable under KLIO_PROF (`klio test` now honors
+      KLIO_PROF like `run` does)
+- [x] Verdict: NOT a pathology. oneRectBenchmarkSimulation solo = 56.7s,
+      57k samples with NO dominant user frame — time spreads across
+      generic dispatch (runFrameExec/execInst/member dispatch), ~8.6%
+      memset (regs/array-init churn), ~8% name-keyed hashmap equality.
+      Genuine interpreted compute; the floor stands until a generic
+      interpreter-speed lever (the JIT is off under `klio test` by
+      design, and the loop JIT measured unhelpful on this workload).
+
+### Master-worklist round (closed 2026-08-16; moved from worklist.md)
+
+The ordered execution round across everything then open, worked top to
+bottom. Open residue carried into `simplify-validate-accelerate.md`
+(the four stress tests + validatePotentialDeadlock as the accelerate
+acceptance metric; the E4 continuation as Track A; the deferred
+measured-first roads).
+
+Performance round:
+
+- [x] A1. Baseline re-measured: interp 13.68s / native 13.89s (the
+      +3.2% did not hold on then-current main — native was ~1.5%
+      BEHIND).
+- [x] A2+A3 LANDED TOGETHER (50754db8), measured 13.8s -> 0.97s
+      interp / 0.83s native (16.6x / 16.8x; native +17% over interp;
+      312/312 transpiler parity, corpus 316/316, ratchet 1370):
+      * KLIO_PROF on the native binary attributed the wall to
+        INTERPRETED machinery, which led to two interpreter-side roots
+        the emitted C merely inherited:
+      * computeBoxedVars falsely boxed every var a same-function
+        string template `$name`-mentioned (a template is not a
+        lambda) — rangebench's accumulator paid a locked cell op per
+        iteration. Unboxed; unit test pins it.
+      * literal-step progressions (`step k`) ran the virtual iterator
+        protocol per iteration; now counted register loops with
+        kotlinc's overflow-free last-element snapping (JVM-verified;
+        guard example step_progression_counted.kt).
+      * the emitted C inlines the per-statement trace store (span
+        offsets in the hot layout) and the fused edge guard
+        (klio_edge_view flag polling; ABI v3).
+- [x] A4 first increment (fdded783): native calls LEAF-SERVE in place
+      (the glue answers monomorphic plain calls to leaf expression
+      bodies via leafExprServe, no recursive full-frame serve, no
+      unwind round trip). fib native 695ms -> 220ms, ahead of the
+      interpreter's 232ms; rangebench unchanged. Deeper C-to-C frames
+      (non-leaf callees) remain a recorded road — measure-first, the
+      remaining gap on call-heavy code is now against the JIT ceiling,
+      not the interpreter.
+- [ ] A5. Value 16B endgame DEFERRED BY ITS OWN DOCTRINE: the 32B
+      payloads already landed (Value = 24, hot-layout-confirmed);
+      the 24 -> 16 tail needs BOTH remaining 16B payloads under 8:
+      Array (clean: steal the cell pointer's low bit for the
+      boxed-vs-PrimBuf discriminator, kind lives in the PrimBuf
+      already) and IrClosure (every shape adds an allocation or an
+      id-table lifetime problem to the HOTTEST creation path — compose
+      builds closures per execution). The campaign doc marks these
+      "measured-first, NOT the active front"; correctness work (the
+      compose-suite failing tests below) outranked a speculative
+      layout change with regression risk. Re-open when a measurement
+      motivates it.
+- [x] A6 CLOSED BY VERIFICATION: the yieldbench GPF family
+      (activateChain chain-lifetime) is dead on current main — 15/15
+      clean runs, ~230ms warm. resumeOnBackgroundThread PASSES in ~50s
+      and profiles as the compute-heavy category by design (1000
+      composables resumed incrementally under a background mutator
+      thrash loop; memset of frame register files 13%, no stall, no
+      single hot bug). Frame-pool/lazy-zero ideas belong to the CPU
+      campaign's recorded roads, not this worklist.
+
+Compose plugin suite long tail:
+
+- [x] B1. Census enumeration: per-class children at P=2, heavies solo
+      uncapped; name every failing test; cluster by mechanism.
+      Result: 12 unique failing tests (not ~60 — the larger number was
+      contention duplication): 4 fast-real, 7 concurrent-stress
+      timeouts (verify solo before believing), validatePotentialDeadlock
+      (300s wall). "INCOMPLETE" census rows were "no tests found"
+      helper-class over-collection, not failures.
+- [ ] B2. Fix the clusters, largest mechanism first; guard example per
+      fix; ratchet floor raised as observed counts stabilize.
+      - [x] validate_subList_remove + subList family (23/23): ERROR/HIDDEN
+            deprecated declarations excluded as extension candidates
+            (`deprecated_error` skip in resolveExtensionCall); guard
+            examples/deprecated_error_not_callable.kt.
+      - [x] restart_and_skip (RestartTests 6/6): restart lambda re-invoke
+            wraps $changed in updateChangedFlags; ratchet 1374 observed.
+      - [x] testApplierBeginEndCallbacks: elvis static type is the JOIN
+            of both branches, not the lhs type — lhs-typed elvis
+            devirtualized `applier.onBeginChanges()` to the interface
+            default through final RecordingApplier; guard
+            examples/elvis_join_dispatch.kt + lower.expr unit test.
+      - [ ] The 7 concurrent-stress timeouts: verified REAL solo (not
+            census contention). Root mechanism profiled (put_replace as
+            proxy): the run was ATOMICS-BOUND, not interpretation-bound —
+            31% in the slab allocator's per-class spinlock (rawAlloc/
+            rawFree), then the SpinRwLock reader cmpxchg storm, then
+            three global GC external-bytes counters RMW'd on every frame.
+            Landed levers, each re-profiled: per-thread slab magazines
+            (batched refill/flush; flushed at worker exit), wait-free
+            reader entry (fetchAdd + undo; writer unlock clears only the
+            sign bit), per-thread buffered external-bytes deltas (flush
+            at ±256KB, thread exit, and collect start). put_replace
+            24→55 outer iterations per 30s (2.3x). Remaining profile:
+            memset (frame zeroing) ~9%, arg refcount fetchAdd ~9%,
+            shared-instance borrow (setFieldInner) ~10%, prog/classes
+            registry read locks ~10%. The tests still exceed their
+            declared runTest timeouts interpreted; next levers listed
+            in the same profile order.
+      - [x] 3 of the 7 stress timeouts now PASS solo (concurrentMixing
+            WriteApply_add, concurrentModificationInGlobal_put_replace,
+            resumeOnBackgroundThread) after the second lever round:
+            lock-free steady-state registry reads (resolvedNativeForm /
+            lookupIntrinsic via `asPtrConst` gated on an atomic
+            `resolved_linked`), exponential lock backoff, ObjRef.clone
+            gated like deinit, CallVirtual host-receiver site memo
+            (native / host-slot-op / by-name verdicts), ClassDef
+            resolved-ClassId memo, Module.classIdByStaticFqn
+            pointer-identity memo. put_replace 24 -> 62 outer
+            iterations per 30s cumulative.
+      - [ ] The 4 remaining (SnapshotStateMapTests.concurrentMixing
+            WriteApply_clear + SnapshotStateListTests addAll_removeRange /
+            addAll_clear / concurrentGlobalModifications_addAll) fail
+            their own declared runTest(timeout=30s): ~5s per outer rep
+            interpreted, 10 reps. The residual profile is spread
+            (memset frame zeroing ~9%, string-eql walk internals ~9%,
+            shared-instance borrows ~5%, unattributed ~15%) — no single
+            lever left; needs the next measured campaign round (frame
+            pooling, walk-internal caches).
+      - [ ] RecomposerTests.validatePotentialDeadlock: see E3's
+            disproof — compute-bound, not a repost race; the lever is
+            the E4 profile (frame pooling + string-eql/hash caches).
+- [x] B3. The 3 DNC heavy classes: CLOSED by the two concurrency lever
+      rounds — the ratchet's last three runs report "0 did not
+      complete" across all 46 classes (previously 3-5 classes variably
+      crossed the 480s cap and RecomposerTests always did). Floor
+      raised 1340 -> 1370 on observed 1375.
+
+Open residuals from this block (carried into the active plan): the 4
+declared-30s stress tests and validatePotentialDeadlock — the
+accelerate acceptance metric.
+
+Recorded correctness items:
+
+- [x] C1. Inline-class dispatch family: CLOSED BY VERIFICATION — the
+      recorded repro (CheckboxSlotDumpTests slot walk) and harder
+      shapes (value class behind an interface through generic
+      containers/Any casts; ULong-payload value class in Any? slots)
+      all pass and match kotlinc/JVM byte-for-byte; fixed by the
+      intervening dispatch work. Guards:
+      examples/value_class_interface_dispatch.kt,
+      examples/value_class_any_slot.kt.
+- [x] C2. Private member-extension-property visibility LANDED: a
+      PRIVATE member-ext property registers only under its
+      owner-qualified key; resolution covers the legal scopes via the
+      receiver-tower probe (now walking the WHOLE resolved parent
+      chain — JobSupport sits several classes above a coroutine's
+      class), an "Any"-key tower probe (`private val
+      Any?.exceptionOrNull` registers under recv "Any" while receivers
+      have their own heads), and a file-import probe
+      (`import Duration.Companion.seconds` — the import fqn minus its
+      leaf IS the owner key). NON-private member exts keep the plain
+      pair: kotlinc scopes them to the tower too, but the tower
+      emulation does not yet see every legal frame — gating them cost
+      the compose suite ~400 tests (two traps hit and fixed on the
+      way: public Duration companion imports in stdlib TimeMark tests,
+      JobSupport under compose). Guard:
+      examples/member_ext_prop_visibility.kt (kotlinc/JVM-verified
+      shadow/tower/import surface). Ratchet 1372-1373 observed, floor
+      trimmed to 1365 (pre-change peak 1375 inside the ±3 band).
+- [x] C3. ktor server/client e2e itests: client GET works END-TO-END
+      (status=200) — itest-ktor_client_get 4/4 and channel_async PASS
+      after peeling five pre-existing roots, each with a
+      kotlinc-verified guard example:
+      1. Stored-lambda receiver seating: a `{ scope -> … }` lambda
+         stored through a generic slot (`plugins[key] = …`) and
+         replayed via `receiver.apply(it)` / `handler(recv, arg)` now
+         seats the receiver positionally when the declared arity says
+         so (unknown-shape closures; headerless speculative-`it`
+         blocks excluded — that exclusion also protects suspend-lambda
+         starts whose (receiver, completion) pair must not split).
+         examples/stored_lambda_receiver_seat.kt.
+      2. `::proceed` inside a receiver lambda binds the receiver's
+         member through the capture slot the runtime receiver-binding
+         fills (was a KProperty shell / a global miss).
+         examples/receiver_member_callable_ref.kt.
+      3. The innermost receiver's member outranks a top-level pick for
+         bare `::name` refs (stdlib alias intrinsics excluded).
+      4. A foreign class's PRIVATE stored field never answers another
+         class's private computed property: stored privates now
+         register in instance_prop_private, the sgetter virtual walk
+         skips them, and owner_applies uses the module-walk ownership
+         test (the value-level check misses pack-loaded chains).
+         examples/private_stored_no_override.kt.
+      5. Pack include: ktor-client-core jvmAndPosix
+         `checkContentLength` actual.
+      SERVER GATE ALSO GREEN after four more roots (each verified):
+      6. Hierarchy ascent by name evidence when a pack shim class's
+         cross-root supertype ids never resolved (KlioApplicationResponse
+         walked as a leaf, hiding BaseApplicationResponse.status).
+      7. Bodyless member declarations join overload ranking: the
+         registry records abstract member arities (rides pack images —
+         LAYOUT CHANGE, rebuild installed packs), and the inline-target
+         pick declines an extension/top-level candidate when an implicit
+         receiver's hierarchy declares an abstract member taking the
+         call (respond(message, typeInfo<T>()) spliced the reified 2-arg
+         respond(status, message), binding CONTENT to status).
+         Member-inline picks exempt (DebugPipelineContext.proceed).
+      8. Scope-qualified property reads whose lexical-owner premise
+         fails (a companion-fn lambda reading the RECEIVER's `call`
+         while the outer class declares an instance `call`) retry the
+         implicit-receiver candidates with the plain name before
+         failing. examples/companion_lambda_receiver_read.kt.
+      9. The gate fixtures themselves were ILLEGAL Kotlin (bare
+         get/post never imported — kotlinc rejects them); klio's
+         unimported-extension leniency resolved them but mistyped the
+         handler lambdas' receivers, unbinding `call`. The fixtures now
+         import routing.get/post. RECORDED klio-ism: that leniency
+         still mistypes receiver lambdas when it engages.
+      All three ktor e2e gates green: itest-ktor_server,
+      itest-ktor_client_get, itest-ktor_channel_async.
+      Also recorded: hangbisect3 shape (foreign private stored + async
+      in interface default member) hung pre-existing — resolved in E2
+      below.
+
+Next round (E items; E4's continuation is the active plan's
+accelerate track):
+
+- [x] E1. Free-win harvest + pack hygiene. COMPLETE (both pack homes
+      rebuilt again after the receiver-head lowering landed, since
+      baked pack IR carries lowering output):
+      - [x] Pack homes rebuilt on the new image layout (`~/.klio` all
+            26 shipped packs, `.klio-local` via install-local-packs;
+            caches cleared). Corpus re-warmed — the 17 "failures" were
+            cold-bake timeouts, all pass warm including the heavy four
+            (material3, m3_text, multiwindow, window).
+      - [x] flow ZIP FIXED (was the recorded receiver-publication
+            zip half): the runtime extension-arity check was
+            trailing-lambda-blind — `produce<Any> { }` against
+            `produce(context=, capacity=, block)` needs only the GAP
+            defaulted when the last arg is callable and the last param
+            function-typed (extArityApplicableTL). All three produce
+            overloads were silently dropped and a lenient tail ran
+            produce with the wrong binding, so zipImpl's `second`
+            failed the SendChannel cast. Guard examples/flow_zip.kt
+            (kotlinc/JVM-verified).
+      - [x] flow COMBINE FIXED. Root cause was two-layered. (1) A
+            receiver-lambda param invoked bare from inside a coroutine
+            lambda must bind the lexically innermost implicit receiver
+            of its DECLARED head, and the dynamic enclosing-this chain
+            cannot recover it after a pump resume (the chain at the
+            call held only FlowCoroutine + SAM-collector closures).
+            The lowering now records the declared receiver head per
+            receiver-lambda param (decl.zig / lambda_body.zig), walks
+            the labeled receiver tower at the captured-RLP call site,
+            and lowers the matching `this@<label>` slot (the same slot
+            extension-fn entry binds) as the call receiver;
+            CallValueWithThis carries `recv_head` so the VM re-selects
+            by head (callValueWithThisHead, resel off) when the tower
+            gave nothing. (2) Two engagement traps cost most of the
+            session: the vmhost re-export for callValueWithThisHead
+            was missing so the eval arm's @hasDecl gate silently chose
+            the old path, and the flat-call fast path intercepted
+            CallValueWithThis before the head branch (now gated on
+            recv_head == null). Also: pack BUILD consumes the lowering
+            cache — clear `~/.klio/cache` BEFORE `pack build`, not
+            just before the run, or the pack bakes stale IR. The
+            "receiverless closure" theory was wrong: this@combineInternal
+            IS an IrClosure by design (FlowCollector is a fun
+            interface; SAM lambdas stay raw closures and bare `emit`
+            on one SAM-invokes it). Guard examples/flow_combine.kt
+            (kotlinc/JVM-verified).
+      NOTE: the cached ratchet binary was pruned with the zig cache;
+      ratchet now runs via `zig build itest-compose_plugin_commontest`
+      (source floor 1365 then, 1370 now).
+- [x] E2. hangbisect3 hang RESOLVED: the repro (foreign private stored
+      field + async in an interface default member) now prints `open`,
+      stable across repeated runs. The fix rode the zip landing —
+      `async(context, start, block)` has exactly the produce shape the
+      trailing-lambda-blind extension-arity filter dropped, and with
+      every overload gone a lenient tail mis-bound the call; the
+      sgetter suspicion was a downstream symptom. Guard
+      examples/interface_private_shadow_async.kt.
+- [x] E3. Pump fairness: CLOSED AS DISPROVEN. Measured solo with
+      KLIO_SPIN_TRACE (5 samples over 60s) and KLIO_PROF (61k
+      samples): every spin sample is INSIDE active recompose /
+      change-list work (Text endNode, SlotWriter.advanceBy,
+      Operations.push — different positions each sample, marching),
+      and the profile is diffuse interpreter cost (mum 10.9%, read
+      5.7%, eqlBytes 4.8%, hash/update/final1 ~3% — the hash+string
+      floor), with NO drain-poll churn and NO dominant pathological
+      function. validatePotentialDeadlock is compute-bound: each
+      advance(5000) marches ~312 TestMonotonicFrameClock frames and
+      every frame recomposes all 200 Texts (both loops bump `state`
+      per frame), so the test needs ~3120 interpreted recompose
+      passes inside the 90s wall cap. The "always loses the repost
+      race" theory was wrong; "daemon task abandoned" is the
+      wall-cap's abandon diagnostic, not a mechanism. The lever is
+      E4 (frame pooling + string-eql/hash caches — exactly this
+      profile). If E4 lands and an advance still cannot finish,
+      revisit bounding mid-pass Default reposts per frame (the
+      b/329011032 re-dirty multiplier) as a second-order item.
+- [ ] E4. Concurrency perf round 3 — ROUND LANDED, item continues as
+      the active plan's accelerate track.
+      Measurement rig: standalone addAll_clear rep bench
+      (scratchpad reprosrc/aacbench.kt, one test rep per measure) on
+      the ReleaseSafe harness — MEASURE ON THE HARNESS BINARY, the
+      default `zig-out/bin/klio` is a Debug build with a completely
+      different profile (its hash/eql dominance sent this round down
+      a wrong path for an hour). Landed this round, measured:
+      1. Member-resolve cache stands UP under imported-pack-extension
+         shadowing instead of standing down: the resolve key gains
+         (file+1, argc) so file-scope-dependent resolutions memoize
+         per call-site file (`writable`/`withCurrent` on snapshot
+         records re-ran the full stdlib probe ladder + overload
+         scoring 40k times per rep; now 2). 4.17s -> ~3.7s/rep
+         (~11%).
+      2. Leaf serves skip the register-bank Unit fill when a
+         def-before-use pass over the body (entry-block-dominates
+         rule, ir.zig leafNoFill) proves no stale read; a lazy pin
+         zeroes not-yet-written slots first since the keepalive pins
+         the whole slice (leaf-fill memset samples 381 -> 0,
+         inside run variance on the wall).
+      3. TOOLING: the KLIO_PROF sampler recovers the caller of
+         FP-less leaves (compiler-rt memset, libc) by scanning the
+         SP..BP window for the first own-text return address — the
+         8% <no-fp> memset bucket is now attributable.
+      Standing (solo, ReleaseSafe, declared runTest budgets):
+      addAll_clear 30.6s/30s, concurrentGlobalModifications_addAll
+      32.0s/30s (both marginal), addAll_removeRange 69.7s/30s,
+      concurrentGlobalModification_add 10.2s/10s. Remaining profile
+      is FLAT: interpreter core loop ~7%, ReleaseSafe
+      undefined-poison memsets ~3% (build-mode constant, gone under
+      ReleaseFast), refcount/borrow atomics ~4%, futex/lock ~6%
+      (the test IS contention by design). Measured-negative this
+      round: KLIO_GC_GROWTH sweep (3/4/6 — wall flat, memory up);
+      frame-buffer pooling (already exists; the reg fill was the
+      cost and is now gone where provable). Next round candidates,
+      in order: cross-thread refcount/borrow elision, snapshot
+      global-lock sharding, core-loop dispatch micro-opts.
+- [x] E5. Leniency diagnostic LANDED as a loud once-per-declaration
+      runtime warning at the exact bind. Anatomy established first:
+      the mistyping is NOT fixable at lowering for the ktor shape —
+      the io.ktor.server pack's declarations are not in the lowering
+      module's func_name_index at user-file lower time (even the
+      IMPORTED `routing` lowers as unresolved_bare_call; the eager
+      lambda-receiver channel comes from TYPECK, which correctly
+      declines unimported calls), so the unimported handler lambda
+      keeps a synthetic `it`, the RoutingContext arrives positionally,
+      and bare `call` dies as an unresolved global. Correct-typing
+      would need speculative cross-pack candidate search at lowering;
+      a hard "unresolved reference" error would false-positive on
+      klio's import-tracking gaps. Instead the extension-fallback's
+      top-level winner path now warns (once per declaration):
+      "warning: `get` binds `io.ktor.server.routing.get` without an
+      import; add `import io.ktor.server.routing.get` — kotlinc
+      rejects the unimported call, and klio may type its lambda
+      arguments incorrectly". Gated tightly: shipped-pack packages
+      only (kotlin.* exempt as default imports), caller file outside
+      known packages (pack-internal cross-package binds stay quiet),
+      same-package exempt, wildcard/alias imports checked. Verified:
+      unimported produce + unimported routing get warn with the exact
+      import line; imported variants and zip/combine are silent.
+      Repros: scratchpad reprosrc/lenient1.kt, lenient_ktor.kt.
+- [ ] E6. Deferred measured-first roads, only when a measurement
+      motivates: C-transpiler C-to-C frames (A4 continuation), Value
+      24 -> 16 (A5), C2 completion (nullable member-ext gating; tower
+      strength for public member exts).
+
+Watches (carried into the live register):
+
+- tl_atomic_update_contended litmus flake: postmortem on next natural
+  occurrence (the sweep prints got-vs-expected tails now).
+- URLBuilder scheme-with-digits ×2: klio matches Kotlin, intentionally
+  red upstream — never "fix".
+- checkboxLike stays the slot-exact anchor; any emission work re-runs
+  GroupSizeValidationTests.
+
+Done this stretch (index): ktor commontest 465/468 zero-incomplete;
+compose remember-family 26/26; dirty-bits calculus + slot-exact
+checkboxLike; corpus 315/315 with the interactive-example contract;
+coroutine debt closed by JVM oracle; ratchet floor 1305 -> 1340 (then
+1370). The follow-on work — codebase simplification, test/validation
+repair, and the performance campaign's continuation with the E4
+standing as its acceptance metric — is
+`plans/simplify-validate-accelerate.md`.
