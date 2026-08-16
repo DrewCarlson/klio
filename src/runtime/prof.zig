@@ -89,6 +89,27 @@ fn callerPcsFromContext(ctx: ?*anyopaque) [2]usize {
         if (next <= bp) break;
         bp = next;
     }
+    // FP-less leaf (compiler-rt memset, libc): the frame pointer still holds
+    // the CALLER's frame, so the leaf's return address is on the stack between
+    // SP and BP. Scan that window for the first own-text address and report it
+    // as the caller — heuristic (a spilled stale return address can match),
+    // but it turns an unattributable <no-fp> bucket into the right caller for
+    // the overwhelmingly common case.
+    if (out[0] == 0) {
+        const anchor = @intFromPtr(&handler);
+        const lo = anchor -| (1 << 29);
+        const hi = anchor +| (1 << 29);
+        const cap: usize = if (bp > sp and bp - sp < (1 << 12)) bp else sp + (1 << 9);
+        var p = sp;
+        while (p + @sizeOf(usize) <= cap) : (p += @sizeOf(usize)) {
+            if (p % @alignOf(usize) != 0) break;
+            const v = @as(*const usize, @ptrFromInt(p)).*;
+            if (v > lo and v < hi and v != anchor) {
+                out[0] = v;
+                break;
+            }
+        }
+    }
     return out;
 }
 

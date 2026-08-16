@@ -11372,12 +11372,30 @@ threadlocal var tl_perm_cache: [TL_METHOD_CACHE_SIZE]TlPermEntry = @splat(.{});
 
 /// Thread-local L1 for the stdlib member-resolve cache. `state`: 0 empty,
 /// 1 confirmed-none, 2 resolved.
-const TlResolveEntry = struct { type_p: usize = 0, name_p: usize = 0, args_empty: bool = false, state: u8 = 0, func: ?StdlibFn = null, fqn: []const u8 = "" };
+const TlResolveEntry = struct { type_p: usize = 0, name_p: usize = 0, args_empty: bool = false, file: u32 = 0, argc: u32 = 0, state: u8 = 0, func: ?StdlibFn = null, fqn: []const u8 = "" };
 threadlocal var tl_resolve_cache: [TL_METHOD_CACHE_SIZE]TlResolveEntry = @splat(.{});
 
 inline fn tlResolveSlot(key: root_mod.ProgramImage.MemberResolveKey) usize {
-    const h = (@as(u64, @intCast(key.type_p)) *% 0x9E3779B97F4A7C15) ^ @as(u64, @intCast(key.name_p)) ^ @intFromBool(key.args_empty);
+    const h = (@as(u64, @intCast(key.type_p)) *% 0x9E3779B97F4A7C15) ^ @as(u64, @intCast(key.name_p)) ^ @intFromBool(key.args_empty) ^ (@as(u64, key.file) << 32) ^ (@as(u64, key.argc) << 20);
     return @intCast((h ^ (h >> 17)) & (TL_METHOD_CACHE_SIZE - 1));
+}
+
+inline fn tlResolveMatch(e: *const TlResolveEntry, key: root_mod.ProgramImage.MemberResolveKey) bool {
+    return e.state != 0 and e.type_p == key.type_p and e.name_p == key.name_p and
+        e.args_empty == key.args_empty and e.file == key.file and e.argc == key.argc;
+}
+
+fn tlResolveStore(key: root_mod.ProgramImage.MemberResolveKey, entry: root_mod.ProgramImage.MemberResolveEntry) void {
+    tl_resolve_cache[tlResolveSlot(key)] = .{
+        .type_p = key.type_p,
+        .name_p = key.name_p,
+        .args_empty = key.args_empty,
+        .file = key.file,
+        .argc = key.argc,
+        .state = if (entry.func == null) 1 else 2,
+        .func = entry.func,
+        .fqn = entry.fqn,
+    };
 }
 
 fn instanceMethodCacheGetRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?u32 {
@@ -11798,40 +11816,52 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
             .name_p = name_p,
             .args_empty = args.len == 0,
         };
+        // File-qualified sibling key: when an imported pack extension shadows
+        // the stdlib surface the answer is a function of the call site's
+        // import scope and the call's arity too, so those resolutions cache
+        // under (file+1, argc) rather than not at all (`writable` /
+        // `withCurrent` on a snapshot record re-ran the whole ladder tens of
+        // thousands of times per state-list stress rep).
+        const key_f: ?root_mod.ProgramImage.MemberResolveKey = blk: {
+            const sp = ir.eval.currentCallSiteSpan() orelse break :blk null;
+            var k = key;
+            k.file = @as(u32, @intFromEnum(sp.file)) + 1;
+            k.argc = @intCast(args.len);
+            break :blk k;
+        };
         // Thread-local L1 (see `tl_method_cache`): a hit avoids the shared
         // program cell's reader lock and its cross-core coherence traffic.
-        {
-            const e = &tl_resolve_cache[tlResolveSlot(key)];
-            if (e.state != 0 and e.type_p == key.type_p and e.name_p == key.name_p and e.args_empty == key.args_empty) {
+        for ([2]?root_mod.ProgramImage.MemberResolveKey{ key, key_f }) |k_opt| {
+            const k = k_opt orelse continue;
+            const e = &tl_resolve_cache[tlResolveSlot(k)];
+            if (tlResolveMatch(e, k)) {
                 if (e.state == 1) return null;
                 return try dispatchWithReceiver(self, allocator, e.fqn, e.func.?, receiver, args);
             }
         }
-        const hit: ?root_mod.ProgramImage.MemberResolveEntry = blk: {
-            const pg = self.prog.borrow();
-            defer pg.deinit();
-            break :blk pg.get().member_resolve_cache.get(key);
-        };
-        if (hit) |entry| {
-            tl_resolve_cache[tlResolveSlot(key)] = .{
-                .type_p = key.type_p,
-                .name_p = key.name_p,
-                .args_empty = key.args_empty,
-                .state = if (entry.func == null) 1 else 2,
-                .func = entry.func,
-                .fqn = entry.fqn,
+        for ([2]?root_mod.ProgramImage.MemberResolveKey{ key, key_f }) |k_opt| {
+            const k = k_opt orelse continue;
+            const hit: ?root_mod.ProgramImage.MemberResolveEntry = blk: {
+                const pg = self.prog.borrow();
+                defer pg.deinit();
+                break :blk pg.get().member_resolve_cache.get(k);
             };
-            const func = entry.func orelse return null;
-            return try dispatchWithReceiver(self, allocator, entry.fqn, func, receiver, args);
+            if (hit) |entry| {
+                tlResolveStore(k, entry);
+                const func = entry.func orelse return null;
+                return try dispatchWithReceiver(self, allocator, entry.fqn, func, receiver, args);
+            }
         }
         const cacheable = !stdlib.isArrayBuilder(name) and
             !(try userToplevelExtNamedExists(self, allocator, receiver, name));
-        return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, if (cacheable) key else null);
+        return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, if (cacheable) key else null, if (cacheable) key_f else null);
     }
-    return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, null);
+    return try stdlibMemberDispatchUncached(self, allocator, receiver, name, args, type_fqn, null, null);
 }
 
-fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, type_fqn: []const u8, cache_key: ?root_mod.ProgramImage.MemberResolveKey) Allocator.Error!?EvalResult {
+fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, type_fqn: []const u8, cache_key: ?root_mod.ProgramImage.MemberResolveKey, cache_key_file: ?root_mod.ProgramImage.MemberResolveKey) Allocator.Error!?EvalResult {
+    if (runtime.envOnce("KLIO_SDU_TRACE") != null)
+        std.debug.print("[sdu] type={s} name={s} cacheable={}\n", .{ type_fqn, name, cache_key != null });
     // A Sequence receiver with a DECLARED Sequence-receiver extension body
     // must run that lazy source implementation — the package probes below
     // would bind an eager collection intrinsic (`kotlin.collections.chunked`
@@ -11915,7 +11945,7 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
     // (type, name) memoization below must stand down.
     const pack_ext_shadow = try importedPackExtShadows(self, allocator, receiver, name, args.len);
     const effective_cache_key: ?root_mod.ProgramImage.MemberResolveKey =
-        if (pack_ext_shadow == .none) cache_key else null;
+        if (pack_ext_shadow == .none) cache_key else cache_key_file;
     // `range in range`: the builtin `Range.contains` intrinsic takes an
     // ELEMENT, so a Range argument is inapplicable to every probe the
     // ladder could hit — leave it for the extension fallback, where a

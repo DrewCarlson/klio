@@ -1367,12 +1367,62 @@ pub const Func = struct {
     pub fn leafExprBody(self: *const Func) bool {
         switch (self.leaf_state) {
             1 => return false,
-            2 => return true,
+            2, 3 => return true,
             else => {},
         }
         const verdict = self.classifyLeafExprBody();
-        @constCast(self).leaf_state = if (verdict) 2 else 1;
+        @constCast(self).leaf_state = if (!verdict)
+            1
+        else if (self.leafDefBeforeUse())
+            3
+        else
+            2;
         return verdict;
+    }
+
+    /// Whether every register read in the body is dominated by a write: a
+    /// read is admitted when an earlier instruction of the SAME block wrote
+    /// the register, or the ENTRY block wrote it (the entry runs before any
+    /// other block, so its writes dominate everything). When this holds the
+    /// leaf serve can skip zero-filling its register bank — no path can
+    /// observe a stale slot.
+    pub fn leafNoFill(self: *const Func) bool {
+        return self.leaf_state == 3;
+    }
+
+    fn leafDefBeforeUse(self: *const Func) bool {
+        const Ctx = struct {
+            uses: u64 = 0,
+            defs: u64 = 0,
+            oob: bool = false,
+            fn visit(c: *@This(), reg: Reg, is_def: bool) void {
+                const r = reg.int();
+                if (r >= 64) {
+                    c.oob = true;
+                    return;
+                }
+                const bit = @as(u64, 1) << @intCast(r);
+                if (is_def) c.defs |= bit else c.uses |= bit;
+            }
+        };
+        var entry_written: u64 = 0;
+        for (self.blocks, 0..) |*b, bi| {
+            var written: u64 = entry_written;
+            for (b.insts) |*inst| {
+                var c: Ctx = .{};
+                visitInstRegs(inst, &c, Ctx.visit);
+                if (c.oob) return false;
+                if (c.uses & ~written != 0) return false;
+                written |= c.defs;
+            }
+            var c: Ctx = .{};
+            visitTerminatorRegs(&b.terminator, &c, Ctx.visit);
+            if (c.oob) return false;
+            if (c.uses & ~written != 0) return false;
+            written |= c.defs;
+            if (bi == 0) entry_written = written;
+        }
+        return true;
     }
 
     /// Structural admission only. Which INSTRUCTIONS a leaf serve can

@@ -3143,7 +3143,17 @@ fn leafExprServeAt(
     const regs: []Value = leaf_bank[ev.leaf_depth][0..nlive];
     ev.leaf_depth += 1;
     defer ev.leaf_depth -= 1;
-    for (regs) |*v| v.* = .Unit;
+    // A def-before-use-proven body never reads a stale slot, so the bank
+    // keeps whatever the previous serve left; the fill stays for reclaim
+    // builds (each write releases the slot's prior value, which must be
+    // live) and unproven bodies. `wmask` tracks which slots the serve has
+    // written so a lazy pin can zero the rest first (the keepalive pins the
+    // whole slice, and a stale slot must not reach the collector).
+    var wmask: u64 = 0;
+    if (reclaim or !func.leafNoFill()) {
+        for (regs) |*v| v.* = .Unit;
+        wmask = ~@as(u64, 0);
+    }
     defer if (reclaim) {
         for (regs) |*v| v.release(allocator);
     };
@@ -3154,7 +3164,7 @@ fn leafExprServeAt(
     // shape this exists for — reaches no safe point and pays nothing.
     var pin: ?usize = null;
     defer if (pin) |m| runtime.keepaliveRestore(m);
-    const out = leafWalk(H, allocator, module, func, eff_args, host, depth, regs, reclaim, trace, &pin) catch |e| switch (e) {
+    const out = leafWalk(H, allocator, module, func, eff_args, host, depth, regs, reclaim, trace, &pin, &wmask) catch |e| switch (e) {
         error.LeafAbandon => return null,
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -3179,6 +3189,7 @@ fn leafWalk(
     reclaim: bool,
     trace: bool,
     pin: *?usize,
+    wmask: *u64,
 ) (Allocator.Error || LeafAbandon)!Value {
     var block_idx: usize = 0;
     var steps: usize = 0;
@@ -3187,7 +3198,7 @@ fn leafWalk(
         const b = &func.blocks[block_idx];
         steps += b.insts.len + 1;
         if (steps > ir.LEAF_MAX_STEPS) return error.LeafAbandon;
-        try leafRunInsts(H, allocator, module, func, args, host, depth, b, regs, reclaim, trace, pin);
+        try leafRunInsts(H, allocator, module, func, args, host, depth, b, regs, reclaim, trace, pin, wmask);
         switch (b.terminator) {
             .Return => |r| {
                 const rr = r orelse return .Unit;
@@ -3223,40 +3234,41 @@ fn leafRunInsts(
     reclaim: bool,
     trace: bool,
     pin: *?usize,
+    wmask: *u64,
 ) (Allocator.Error || LeafAbandon)!void {
     for (b.insts) |*inst| {
         switch (inst.*) {
             .Trace => {},
             .LoadParam => |lp| {
                 if (lp.idx >= args.len) return error.LeafAbandon;
-                if (!leafWrite(allocator, regs, lp.dst, args[lp.idx], reclaim, true)) return error.LeafAbandon;
+                if (!leafWrite(allocator, regs, lp.dst, args[lp.idx], reclaim, true, wmask)) return error.LeafAbandon;
             },
             .Const => |c| {
                 if (c.value.int() >= module.consts.items.len) return error.LeafAbandon;
-                if (module.consts.items[c.value.int()] == .String) leafPin(pin, regs);
+                if (module.consts.items[c.value.int()] == .String) leafPin(pin, regs, wmask);
                 const v = try constToValue(allocator, &module.consts.items[c.value.int()]);
-                if (!leafWrite(allocator, regs, c.dst, v, reclaim, false)) return error.LeafAbandon;
+                if (!leafWrite(allocator, regs, c.dst, v, reclaim, false, wmask)) return error.LeafAbandon;
             },
             .Move => |mv| {
                 const v = leafRead(regs, mv.src) orelse return error.LeafAbandon;
-                if (!leafWrite(allocator, regs, mv.dst, v, reclaim, true)) return error.LeafAbandon;
+                if (!leafWrite(allocator, regs, mv.dst, v, reclaim, true, wmask)) return error.LeafAbandon;
             },
             .Not => |n| {
                 const v = leafRead(regs, n.src) orelse return error.LeafAbandon;
                 if (v != .Bool) return error.LeafAbandon;
-                if (!leafWrite(allocator, regs, n.dst, .{ .Bool = !v.Bool }, reclaim, false)) return error.LeafAbandon;
+                if (!leafWrite(allocator, regs, n.dst, .{ .Bool = !v.Bool }, reclaim, false, wmask)) return error.LeafAbandon;
             },
             .BinOp => |bo| {
                 const l = leafRead(regs, bo.lhs) orelse return error.LeafAbandon;
                 const r = leafRead(regs, bo.rhs) orelse return error.LeafAbandon;
                 if (scalarBin(bo.op, l, r)) |v| {
-                    if (!leafWrite(allocator, regs, bo.dst, v, reclaim, false)) return error.LeafAbandon;
+                    if (!leafWrite(allocator, regs, bo.dst, v, reclaim, false, wmask)) return error.LeafAbandon;
                     continue;
                 }
                 if (!leafPrimitive(&l) or !leafPrimitive(&r)) return error.LeafAbandon;
                 const res = try applyBinop(allocator, bo.op, &l, &r);
                 if (res != .ok) return error.LeafAbandon;
-                if (!leafWrite(allocator, regs, bo.dst, res.ok, reclaim, false)) return error.LeafAbandon;
+                if (!leafWrite(allocator, regs, bo.dst, res.ok, reclaim, false, wmask)) return error.LeafAbandon;
             },
             .GetField => |gf| {
                 const recv = leafRead(regs, gf.receiver) orelse return error.LeafAbandon;
@@ -3266,18 +3278,18 @@ fn leafRunInsts(
                     else => return error.LeafAbandon,
                 };
                 if (builtinFieldFast(&recv, fname)) |bv| {
-                    if (!leafWrite(allocator, regs, gf.dst, bv, reclaim, false)) return error.LeafAbandon;
+                    if (!leafWrite(allocator, regs, gf.dst, bv, reclaim, false, wmask)) return error.LeafAbandon;
                     continue;
                 }
                 if (recv != .Instance) {
                     if (trace) std.debug.print("[leaf] {s}: field receiver is {s}\n", .{ func.name, @tagName(recv) });
                     return error.LeafAbandon;
                 }
-                const v = try leafStoredField(H, allocator, host, &inst.GetField, &recv, fname, pin, regs) orelse {
+                const v = try leafStoredField(H, allocator, host, &inst.GetField, &recv, fname, pin, regs, wmask) orelse {
                     if (trace) std.debug.print("[leaf] {s}: no stored-slot route for {s}\n", .{ func.name, fname });
                     return error.LeafAbandon;
                 };
-                if (!leafWrite(allocator, regs, gf.dst, v, reclaim, false)) return error.LeafAbandon;
+                if (!leafWrite(allocator, regs, gf.dst, v, reclaim, false, wmask)) return error.LeafAbandon;
             },
             .CallMember => |cm| {
                 // The value-level fast serves only: a primitive bit/conversion
@@ -3296,7 +3308,7 @@ fn leafRunInsts(
                     if (trace) std.debug.print("[leaf] {s}: member {s} is not a primitive op\n", .{ func.name, nm });
                     return error.LeafAbandon;
                 };
-                if (!leafWrite(allocator, regs, cm.dst, mv, reclaim, false)) return error.LeafAbandon;
+                if (!leafWrite(allocator, regs, cm.dst, mv, reclaim, false, wmask)) return error.LeafAbandon;
             },
             .Index => |ix| {
                 const recv = leafRead(regs, ix.receiver) orelse return error.LeafAbandon;
@@ -3305,7 +3317,7 @@ fn leafRunInsts(
                     if (trace) std.debug.print("[leaf] {s}: index needs the slow get\n", .{func.name});
                     return error.LeafAbandon;
                 };
-                if (!leafWrite(allocator, regs, ix.dst, v, reclaim, false)) return error.LeafAbandon;
+                if (!leafWrite(allocator, regs, ix.dst, v, reclaim, false, wmask)) return error.LeafAbandon;
             },
             .LoadGlobal => |lg| {
                 // Only a plain-name scalar read is servable: an identity-
@@ -3318,7 +3330,7 @@ fn leafRunInsts(
                     if (trace) std.debug.print("[leaf] {s}: global {s} not servable\n", .{ func.name, gname });
                     return error.LeafAbandon;
                 };
-                if (!leafWrite(allocator, regs, lg.dst, v, reclaim, false)) return error.LeafAbandon;
+                if (!leafWrite(allocator, regs, lg.dst, v, reclaim, false, wmask)) return error.LeafAbandon;
             },
             .Call => |c| {
                 if (depth == 0) return error.LeafAbandon;
@@ -3344,11 +3356,11 @@ fn leafRunInsts(
                 }
                 const base = c.args.int();
                 if (base + c.n_args > regs.len) return error.LeafAbandon;
-                leafPin(pin, regs);
+                leafPin(pin, regs, wmask);
                 const r = try leafExprServeAt(H, allocator, module, callee, regs[base .. base + c.n_args], host, depth - 1) orelse
                     return error.LeafAbandon;
                 if (r != .ok) return error.LeafAbandon;
-                if (!leafWrite(allocator, regs, c.dst, r.ok, reclaim, false)) return error.LeafAbandon;
+                if (!leafWrite(allocator, regs, c.dst, r.ok, reclaim, false, wmask)) return error.LeafAbandon;
             },
             else => |other| {
                 if (trace) std.debug.print("[leaf] {s}: unsupported {s}\n", .{ func.name, @tagName(other) });
@@ -3393,8 +3405,16 @@ fn builtinFieldFast(recv: *const Value, name: []const u8) ?Value {
 
 /// Pin the leaf register file as a collector root, once per serve. Called
 /// immediately before the first instruction that can reach a safe point.
-fn leafPin(pin: *?usize, regs: []Value) void {
+fn leafPin(pin: *?usize, regs: []Value, wmask: *u64) void {
     if (pin.* != null) return;
+    // The keepalive pins the SLICE (the collector reads its current
+    // contents), so every slot must hold a valid value before the pin: a
+    // no-fill serve zeroes the not-yet-written slots here, paying the fill
+    // only on the (rare) pinning path.
+    for (regs, 0..) |*v, i| {
+        if (i < 64 and wmask.* & (@as(u64, 1) << @intCast(i)) == 0) v.* = .Unit;
+    }
+    wmask.* = ~@as(u64, 0);
     pin.* = runtime.keepaliveMark();
     runtime.keepalivePushSlice(regs);
 }
@@ -3408,9 +3428,10 @@ fn leafRead(regs: []const Value, r: Reg) ?Value {
 /// Store into the leaf register file with the same ownership rule a frame
 /// uses: the register owns one reference, the previous occupant loses one.
 /// `borrowed` marks a value the leaf does not yet own a reference to.
-fn leafWrite(allocator: Allocator, regs: []Value, r: Reg, v: Value, reclaim: bool, borrowed: bool) bool {
+fn leafWrite(allocator: Allocator, regs: []Value, r: Reg, v: Value, reclaim: bool, borrowed: bool, wmask: *u64) bool {
     const i = r.int();
     if (i >= regs.len) return false;
+    if (i < 64) wmask.* |= @as(u64, 1) << @intCast(i);
     if (reclaim) {
         if (borrowed) v.retain();
         const old = regs[i];
@@ -3427,7 +3448,7 @@ fn leafWrite(allocator: Allocator, regs: []Value, r: Reg, v: Value, reclaim: boo
 /// memo the framed `GetField` arm fills and re-verifies by name. Null for a
 /// getter-routed, unclaimed, lateinit or delegated field, which the leaf
 /// cannot serve.
-fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype, recv: *const Value, fname: []const u8, pin: *?usize, regs: []Value) Allocator.Error!?Value {
+fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype, recv: *const Value, fname: []const u8, pin: *?usize, regs: []Value, wmask: *u64) Allocator.Error!?Value {
     const claimed = @atomicLoad(u64, @constCast(&gf.site_cls), .acquire);
     const cls: u64 = blk: {
         const g = recv.Instance.borrow();
@@ -3459,7 +3480,7 @@ fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype
     // later abandoned observes nothing.
     if (route & 3 == 2) {
         if (!host.fieldGetterIsLeaf(@enumFromInt(route >> 2))) return null;
-        leafPin(pin, regs);
+        leafPin(pin, regs, wmask);
         return switch (try host.runFieldGetter(allocator, @enumFromInt(route >> 2), recv.*)) {
             .ok => |v| v,
             .err => null,

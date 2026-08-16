@@ -306,11 +306,43 @@ validatePotentialDeadlock (pump fairness for virtual-time drains).
       profile). If E4 lands and an advance still cannot finish,
       revisit bounding mid-pass Default reposts per frame (the
       b/329011032 re-dirty multiplier) as a second-order item.
-- [ ] E4. Concurrency perf round 3 (the last 4 stress tests, and the
-      suite wall): frame-buffer pooling (kills the ~9% memset + the
-      per-frame alloc), member-walk string-eql caches (~9%), then
-      attribute the ~15% unknown PCs. Need ~1.7x more under
-      contention; each lever measured on the addAll_clear rep count.
+- [ ] E4. Concurrency perf round 3 — ROUND LANDED, item stays open.
+      Measurement rig: standalone addAll_clear rep bench
+      (scratchpad reprosrc/aacbench.kt, one test rep per measure) on
+      the ReleaseSafe harness — MEASURE ON THE HARNESS BINARY, the
+      default `zig-out/bin/klio` is a Debug build with a completely
+      different profile (its hash/eql dominance sent this round down
+      a wrong path for an hour). Landed this round, measured:
+      1. Member-resolve cache stands UP under imported-pack-extension
+         shadowing instead of standing down: the resolve key gains
+         (file+1, argc) so file-scope-dependent resolutions memoize
+         per call-site file (`writable`/`withCurrent` on snapshot
+         records re-ran the full stdlib probe ladder + overload
+         scoring 40k times per rep; now 2). 4.17s -> ~3.7s/rep
+         (~11%).
+      2. Leaf serves skip the register-bank Unit fill when a
+         def-before-use pass over the body (entry-block-dominates
+         rule, ir.zig leafNoFill) proves no stale read; a lazy pin
+         zeroes not-yet-written slots first since the keepalive pins
+         the whole slice (leaf-fill memset samples 381 -> 0,
+         inside run variance on the wall).
+      3. TOOLING: the KLIO_PROF sampler recovers the caller of
+         FP-less leaves (compiler-rt memset, libc) by scanning the
+         SP..BP window for the first own-text return address — the
+         8% <no-fp> memset bucket is now attributable.
+      Standing (solo, ReleaseSafe, declared runTest budgets):
+      addAll_clear 30.6s/30s, concurrentGlobalModifications_addAll
+      32.0s/30s (both marginal), addAll_removeRange 69.7s/30s,
+      concurrentGlobalModification_add 10.2s/10s. Remaining profile
+      is FLAT: interpreter core loop ~7%, ReleaseSafe
+      undefined-poison memsets ~3% (build-mode constant, gone under
+      ReleaseFast), refcount/borrow atomics ~4%, futex/lock ~6%
+      (the test IS contention by design). Measured-negative this
+      round: KLIO_GC_GROWTH sweep (3/4/6 — wall flat, memory up);
+      frame-buffer pooling (already exists; the reg fill was the
+      cost and is now gone where provable). Next round candidates,
+      in order: cross-thread refcount/borrow elision, snapshot
+      global-lock sharding, core-loop dispatch micro-opts.
 - [ ] E5. Leniency diagnostic: klio accepts illegal Kotlin (unimported
       extensions) and silently mistypes receiver lambdas. Either type
       them correctly when the leniency engages or emit a real
