@@ -1619,13 +1619,26 @@ fn declArityRefuses(self: *VmHost, fid: FuncId, n_args: usize) bool {
 /// Exact arity fits; extra declared params must each carry a default or
 /// be a vararg; extra args only fit a trailing vararg.
 fn extArityApplicable(self: *VmHost, f: *const Func, want: usize) bool {
+    return extArityApplicableTL(self, f, want, false);
+}
+
+/// `extArityApplicable` with Kotlin's trailing-lambda rule: when the call's
+/// LAST argument is a callable and the candidate's LAST parameter is
+/// function-typed, that argument binds the last parameter and only the GAP
+/// parameters between them need defaults — `produce<Any> { … }` is
+/// applicable to `produce(context = …, capacity = …, block)`.
+fn extArityApplicableTL(self: *VmHost, f: *const Func, want: usize, last_arg_callable: bool) bool {
     if (f.params.len == want) return true;
     if (f.params.len < want) {
         return f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
     }
     const defaults = funcDefaults(self, f);
-    var k: usize = want;
-    while (k < f.params.len) : (k += 1) {
+    const trailing_bind = last_arg_callable and want > 0 and
+        isFunctionTypeRef(&f.params[f.params.len - 1].ty);
+    const gap_from: usize = if (trailing_bind) want - 1 else want;
+    const gap_to: usize = if (trailing_bind) f.params.len - 1 else f.params.len;
+    var k: usize = gap_from;
+    while (k < gap_to) : (k += 1) {
         if (!(f.params[k].is_vararg or paramHasDefault(defaults, k))) return false;
     }
     return true;
@@ -13010,11 +13023,18 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
             // the bare head reads. The static-hint shortcut above cannot see
             // the bounds, so re-check them against the runtime receiver.
             if (receiverViolatesTypeParamBound(self, c.fid, &c.func.params[0].ty, receiver)) {
+                if (missTraceWant(name)) std.debug.print("[extfb]  fid={d} strict bound-thinned\n", .{c.fid.int()});
                 bound_thinned = true;
                 continue;
             }
-            if (!extArityApplicable(self, &c.func, want)) continue;
-            if (candidateArgsDisproven(self, &c.func, args)) continue;
+            if (!extArityApplicableTL(self, &c.func, want, args.len != 0 and isCallable(&args[args.len - 1]))) {
+                if (missTraceWant(name)) std.debug.print("[extfb]  fid={d} strict arity nparams={d} want={d}\n", .{ c.fid.int(), c.func.params.len, want });
+                continue;
+            }
+            if (candidateArgsDisproven(self, &c.func, args)) {
+                if (missTraceWant(name)) std.debug.print("[extfb]  fid={d} strict args-disproven\n", .{c.fid.int()});
+                continue;
+            }
             // Kotlin selects extensions against the receiver's DECLARED
             // type: a definite static mismatch drops the candidate. But a
             // COMPANION extension (`fun X.Companion.f`) invoked through the
@@ -13032,6 +13052,7 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
         }
         candidates.deinit(allocator);
         candidates = filtered;
+        if (missTraceWant(name)) std.debug.print("[extfb] strict survivors={d}\n", .{candidates.items.len});
         if (candidates.items.len == 0) return null;
     } else {
         // With a known static receiver type, drop candidates that are

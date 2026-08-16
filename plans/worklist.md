@@ -231,18 +231,40 @@ validatePotentialDeadlock (pump fairness for virtual-time drains).
 
 ## Phase E — Next round (active; worked top to bottom)
 
-- [ ] E1. Free-win harvest + pack hygiene. The Phase C seating fixes
-      are the recorded "receiver-publication campaign" family — re-run
-      its triage (zip/combine collector-closure seating, 59/62) and the
-      compose corpus; whatever passes now closes at zero cost. FIRST:
-      the pack image layout changed (abstract_member_arity) — every
-      pack home built before it decodes SHIFTED. Rebuild `~/.klio` and
-      `.klio-local` installed packs (the compose itest home and the
-      ktor scratch home are already current). NOTE: the cached ratchet
-      binary was pruned with the zig cache; the next ratchet run goes
-      through `zig build itest-compose_plugin_commontest` (source floor
-      1365) and its fresh binary path replaces the stale one in the
-      recall notes.
+- [ ] E1. Free-win harvest + pack hygiene. IN PROGRESS:
+      - [x] Pack homes rebuilt on the new image layout (`~/.klio` all
+            26 shipped packs, `.klio-local` via install-local-packs;
+            both with KLIO_COMPOSE_PLUGIN=1; caches cleared). Corpus
+            re-warmed — the 17 "failures" were cold-bake timeouts, all
+            pass warm including the heavy four (material3, m3_text,
+            multiwindow, window).
+      - [x] flow ZIP FIXED (was the recorded receiver-publication
+            zip half): the runtime extension-arity check was
+            trailing-lambda-blind — `produce<Any> { }` against
+            `produce(context=, capacity=, block)` needs only the GAP
+            defaulted when the last arg is callable and the last param
+            function-typed (extArityApplicableTL). All three produce
+            overloads were silently dropped and a lenient tail ran
+            produce with the wrong binding, so zipImpl's `second`
+            failed the SendChannel cast. Guard examples/flow_zip.kt
+            (kotlinc/JVM-verified).
+      - [ ] flow COMBINE residue, anatomy sharpened: combineInternal's
+            `transform(latestValues)` is a bare call of a
+            RECEIVER-fn-typed PARAM captured into the flowScope lambda
+            — the recv_fn lowering arm only serves recv_fn_props
+            PROPERTIES (params/locals/captures break out at
+            `b.resolve(pname) != null or b.knowsOuter`), so it lowers
+            as plain CallValue, the Zip.kt:29 closure runs
+            receiverless, and its bare `emit` total-misses (the
+            flow{}-block collector is not on the closure's chain;
+            runtime subjects are FlowCoroutine/ScopeCoroutine only).
+            Fix candidates: extend the recv_fn arm to declared
+            receiver-fn-typed locals/params/captures (declared-type
+            plumbing), and/or seed receiver-lambda block receivers
+            onto created closures' chains.
+      NOTE: the cached ratchet binary was pruned with the zig cache;
+      ratchet now runs via `zig build itest-compose_plugin_commontest`
+      (source floor 1365).
 - [ ] E2. hangbisect3 hang: foreign private stored field + async in an
       interface default member parks both coroutines forever
       (pre-existing; standalone repro in scratchpad
