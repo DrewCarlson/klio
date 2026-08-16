@@ -504,8 +504,12 @@ test "bake/load round-trips the lowered base tables" {
             if (f0.blocks.len != f1.blocks.len)
                 std.debug.print("round-trip block mismatch: {s}#{d} fresh={d} decoded={d}\n", .{ f0.fqn, f0.id.int(), f0.blocks.len, f1.blocks.len });
             try std.testing.expectEqual(f0.blocks.len, f1.blocks.len);
+            if (f0.params.len != f1.params.len)
+                std.debug.print("round-trip param mismatch: {s}#{d} fresh={d} decoded={d}\n", .{ f0.fqn, f0.id.int(), f0.params.len, f1.params.len });
             try std.testing.expectEqual(f0.params.len, f1.params.len);
             for (f0.blocks, f1.blocks) |b0, b1| {
+                if (b0.insts.len != b1.insts.len)
+                    std.debug.print("round-trip inst mismatch: {s}#{d} fresh={d} decoded={d} blocks={d}\n", .{ f0.fqn, f0.id.int(), b0.insts.len, b1.insts.len, f0.blocks.len });
                 try std.testing.expectEqual(b0.insts.len, b1.insts.len);
                 try std.testing.expectEqual(
                     @as(std.meta.Tag(@TypeOf(b0.terminator)), b0.terminator),
@@ -513,18 +517,24 @@ test "bake/load round-trips the lowered base tables" {
                 );
             }
         }
-        try std.testing.expectEqual(m0.consts.items.len, m1.consts.items.len);
+        const eqn = struct {
+            fn check(label: []const u8, av: usize, bv: usize) !void {
+                if (av != bv) std.debug.print("round-trip table mismatch: {s} fresh={d} decoded={d}\n", .{ label, av, bv });
+                try std.testing.expectEqual(av, bv);
+            }
+        }.check;
+        try eqn("consts", m0.consts.items.len, m1.consts.items.len);
         for (m0.consts.items, m1.consts.items) |c0, c1| {
             try std.testing.expect(c0.eql(c1));
         }
-        try std.testing.expectEqual(m0.classes.items.len, m1.classes.items.len);
-        try std.testing.expectEqual(m0.top_level.items.len, m1.top_level.items.len);
-        try std.testing.expectEqual(m0.func_index.items.len, m1.func_index.items.len);
-        try std.testing.expectEqual(m0.func_name_index.count(), m1.func_name_index.count());
-        try std.testing.expectEqual(m0.registry.class_member_names.count(), m1.registry.class_member_names.count());
-        try std.testing.expectEqual(m0.registry.hierarchy_methods.count(), m1.registry.hierarchy_methods.count());
-        try std.testing.expectEqual(m0.registry.class_const_inits.count(), m1.registry.class_const_inits.count());
-        try std.testing.expectEqual(m0.decl_user_arity.count(), m1.decl_user_arity.count());
+        try eqn("classes", m0.classes.items.len, m1.classes.items.len);
+        try eqn("top_level", m0.top_level.items.len, m1.top_level.items.len);
+        try eqn("func_index", m0.func_index.items.len, m1.func_index.items.len);
+        try eqn("func_name_index", m0.func_name_index.count(), m1.func_name_index.count());
+        try eqn("class_member_names", m0.registry.class_member_names.count(), m1.registry.class_member_names.count());
+        try eqn("hierarchy_methods", m0.registry.hierarchy_methods.count(), m1.registry.hierarchy_methods.count());
+        try eqn("class_const_inits", m0.registry.class_const_inits.count(), m1.registry.class_const_inits.count());
+        try eqn("decl_user_arity", m0.decl_user_arity.count(), m1.decl_user_arity.count());
     }
 
     // Runtime class table: same keys, linked parents, enum entries.
@@ -573,12 +583,19 @@ test "bake/load round-trips the lowered base tables" {
     try std.testing.expectEqualStrings(map.files.items[0].path, loaded.map.files.items[0].path);
 
     // Both bases accept and extend the same user program identically.
+    // The base here is DEP-ONLY (no stdlib), so the user program must stay
+    // within that surface: a bare `println` against a base with no candidate
+    // is now a recorded pre-run resolve diagnostic (correctly — see the
+    // provably-unresolved bare-call rejection), and this test asserts a
+    // diag-free lowering. The values still flow through every dep shape the
+    // table comparison exercises.
     const USER_SRC =
         \\import dep.lib.*
-        \\fun main() {
-        \\    println(depHelper(20) + depConst)
-        \\    println(BigBox(3).grow(2).size)
-        \\    println(Mode.SLOW.describe())
+        \\fun main(): Int {
+        \\    val a = depHelper(20) + depConst
+        \\    val b = BigBox(3).grow(2).size
+        \\    val c = Mode.SLOW.describe()
+        \\    return a + b + c.length
         \\}
         \\
     ;
@@ -605,6 +622,8 @@ test "bake/load round-trips the lowered base tables" {
         const bg1 = built1.module.borrow();
         defer bg1.deinit();
         try std.testing.expectEqual(bg0.get().funcCount(), bg1.get().funcCount());
+        for (bg0.get().resolve_diags.items) |d|
+            std.debug.print("round-trip resolve diag: {s} kind={s} file={d} at={d}\n", .{ d.name, @tagName(d.kind), d.span.file.int(), d.span.start });
         try std.testing.expectEqual(@as(usize, 0), bg0.get().resolve_diags.items.len);
         try std.testing.expectEqual(@as(usize, 0), bg1.get().resolve_diags.items.len);
     }
