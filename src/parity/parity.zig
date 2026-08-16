@@ -1020,6 +1020,33 @@ fn collectImportPrefixes(allocator: Allocator, file: *const KotlinFile, set: *st
     }
 }
 
+/// Qualified references reach stdlib/pack code without an import statement
+/// (`kotlin.time.Duration` is legal bare), so the import list alone
+/// under-opens the stdlib gate and the pack mask. Scan the raw source for
+/// `kotlin`/`kotlinx`-rooted dotted tokens and record their two-segment
+/// prefix. A match inside a comment or string over-opens the gate, which
+/// costs base-build time only — never correctness.
+fn collectQualifiedPrefixes(allocator: Allocator, text: []const u8, set: *std.StringHashMap(void)) Allocator.Error!void {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, text, i, "kotlin")) |at| {
+        i = at + "kotlin".len;
+        if (at > 0) {
+            const c = text[at - 1];
+            if (std.ascii.isAlphanumeric(c) or c == '_' or c == '.') continue;
+        }
+        var j = i;
+        if (j < text.len and text[j] == 'x') j += 1;
+        if (j >= text.len or text[j] != '.') continue;
+        const seg_start = j + 1;
+        var k = seg_start;
+        while (k < text.len and (std.ascii.isAlphanumeric(text[k]) or text[k] == '_')) k += 1;
+        if (k == seg_start or !std.ascii.isLower(text[seg_start])) continue;
+        const p = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ text[at..j], text[seg_start..k] });
+        const gop = try set.getOrPut(p);
+        if (gop.found_existing) allocator.free(p);
+    }
+}
+
 /// `outer.startsWith(inner ++ ".")`.
 fn startsWithDot(allocator: Allocator, outer: []const u8, inner: []const u8) bool {
     const dotted = std.fmt.allocPrint(allocator, "{s}.", .{inner}) catch return false;
@@ -1884,6 +1911,7 @@ fn prepareWithBase(arena: Allocator, io: Io, files: []const []const u8, mode: Lo
 
     var prefixes = std.StringHashMap(void).init(arena);
     for (scratch_asts) |*f| try collectImportPrefixes(arena, f, &prefixes);
+    for (texts) |t| try collectQualifiedPrefixes(arena, t, &prefixes);
     var imports_coroutines = false;
     {
         var it = prefixes.keyIterator();

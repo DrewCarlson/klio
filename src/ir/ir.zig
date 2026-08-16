@@ -3477,6 +3477,10 @@ pub const Module = struct {
             );
             defer allocator.free(own);
             if (self.registry.type_alias_types.getKey(own)) |key| return key;
+        } else if (self.registry.type_alias_types.getKey(name)) |key| {
+            // Default-package aliases register under their bare name — the
+            // dotted own-package probe above can never find them.
+            return key;
         }
         if (file) |source_file| {
             var wildcard: ?[]const u8 = null;

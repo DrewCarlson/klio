@@ -7234,10 +7234,21 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Path-callee with a registered class name. The indexed lookup binds
     // the class visible from the caller's package and imports, so a
     // cross-package simple-name collision constructs the right class.
+    // A typealias constructs its expansion (`typealias Node = ListNode;
+    // Node("a")` is a ListNode constructor call), so an unindexed name
+    // retries through the alias registry scoped at this reference site.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
-        if (b.module.classIdIndexed(callee.Path.segments[0].name, b.self_package, callee.Path.segments[0].span.file) orelse
-            b.module.classIdExactImport(callee.Path.segments[0].name, callee.Path.segments[0].span.file)) |class_id|
-        {
+        const ctor_seg = callee.Path.segments[0];
+        const ctor_cid: ?ir.ClassId = b.module.classIdIndexed(ctor_seg.name, b.self_package, ctor_seg.span.file) orelse
+            b.module.classIdExactImport(ctor_seg.name, ctor_seg.span.file) orelse blk_alias: {
+                const aref = ir.TypeRef{ .name = ctor_seg.name, .nullable = false, .args = &.{} };
+                const resolved = try b.module.resolveTypeAliasAt(b.allocator, aref, ctor_seg.span.file, b.self_package);
+                const rh = typeHead(std.mem.trimEnd(u8, resolved.name, "?"));
+                if (std.mem.eql(u8, rh, ctor_seg.name)) break :blk_alias null;
+                break :blk_alias b.module.classIdIndexed(rh, b.self_package, ctor_seg.span.file) orelse
+                    b.module.classId(rh);
+            };
+        if (ctor_cid) |class_id| {
             const ctor_arity = try ctorArgFnArities(b, class_id, args, ast_arg_names);
             defer if (ctor_arity) |ca| b.allocator.free(ca);
             // P12's shape-repair contract for constructor calls: the compose

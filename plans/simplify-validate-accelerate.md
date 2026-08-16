@@ -127,9 +127,22 @@ Ground rules carried forward:
         bound-refutation fix, explicit-type-arg instantiation +
         concrete-gated emission enrichment, receiver-instantiated
         extension returns, least-upper-bound element joins, and the
-        vararg-before-defaulted trio. The 2 left are driver-context
-        (multi-file fixture read; in-suite base-image unresolved
-        global for operator_member_return).
+        vararg-before-defaulted trio. The last 2 are CLOSED — both were
+        real bugs, not driver context:
+        - operator_member_return: the stdlib gate and pack mask counted
+          IMPORT prefixes only, so a bare-FQN reference
+          (`kotlin.time.Duration` with no import — legal Kotlin) was
+          served a gate0 base without kotlin.time. The driver now also
+          scans source for `kotlin`/`kotlinx`-rooted dotted tokens
+          (collectQualifiedPrefixes; comment/string matches over-open
+          the gate, costing base-build time only).
+        - file_private_types: two stacked interpreter bugs. A
+          default-package typealias registers under its BARE name, which
+          scopedTypeAliasFqn's dotted own-package probe could never find;
+          and the bare CONSTRUCTOR path (`Node("a")`) never consulted the
+          alias registry at all — it now retries the classifier lookup
+          through resolveTypeAliasAt at the reference site. Guard:
+          examples/typealias_ctor_default_package.kt. Suite 251/251.
       - stdlib_image 7/7: compile break fixed; the round-trip fixture
         now speaks dep-only (its printlns tripped the Aug-03
         provably-unresolved rejection, correctly).
