@@ -1697,6 +1697,7 @@ fn getOrBuildBase(io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error
     const holder = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
     holder.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const entry = buildBaseEntry(holder.allocator(), io, mode, mask, full) catch |e| {
+        runtime.gc.drainRemembered();
         holder.deinit();
         std.heap.page_allocator.destroy(holder);
         return e;
@@ -1704,6 +1705,7 @@ fn getOrBuildBase(io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error
     base_tick += 1;
     if (entry == null) {
         // Not snapshot-safe: keep no arena, just remember the miss.
+        runtime.gc.drainRemembered();
         holder.deinit();
         std.heap.page_allocator.destroy(holder);
         try base_entries.?.put(key, .{ .entry = null, .arena = null, .tick = base_tick });
@@ -1735,6 +1737,12 @@ fn evictBasesBeyondCap() void {
         if (owning <= base_cache_max) return;
         const removed = base_entries.?.fetchRemove(lru_key).?;
         const arena = removed.value.arena.?;
+        // The evicted base's cells may sit in the GC's remembered set (they
+        // were patched by past programs); drain while they are still mapped,
+        // or a later collection clears flags through unmapped pages. Safe to
+        // drain wholesale here: eviction runs during base resolution, before
+        // any nursery cell exists, so no old-to-young edge can be lost.
+        runtime.gc.drainRemembered();
         arena.deinit();
         std.heap.page_allocator.destroy(arena);
     }
@@ -1968,6 +1976,10 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
         if (runtime.envOnce("KLIO_GC_EXT")) |v| runtime.gc.external_accounting = v.len != 0 and !std.mem.eql(u8, v, "0");
     }
     defer {
+        // Every path out of a program — including a diagnostic failure that
+        // never constructed a Vm — releases `arena_inst` next; remembered
+        // entries pointing into it must not survive that.
+        if (gc_run) runtime.gc.drainRemembered();
         runtime.gc.external_accounting = prev_external_accounting;
         runtime.gc.gc_poison = prev_gc_poison;
         runtime.gc.gc_stress = prev_gc_stress;
@@ -2057,6 +2069,10 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
     vm.patch_allocator = prog_patch_alloc orelse arena;
     defer {
         if (gc_run) interp_ir.resetRunGlobalCaches();
+        // Before the VM frees its permanent cells: the remembered set may
+        // hold pointers into them, and the boundary collect below would
+        // otherwise clear flags through freed (possibly unmapped) memory.
+        if (gc_run) runtime.gc.drainRemembered();
         vm.deinit();
         if (gc_run) {
             // Nothing from the finished program may remain rooted while its

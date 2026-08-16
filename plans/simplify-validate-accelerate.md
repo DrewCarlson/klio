@@ -138,9 +138,42 @@ Ground rules carried forward:
         prior baseline commit); current failure mode is the 6.5GB RSS
         cap across corpus x load modes in one process — an A5 memory
         acceptance target, not a quick fix.
-      - Still open singles: threaded_litmus 2 (suite-completeness +
-        eager parity), resolve_ambiguity 1+1, lambdas_and_dispatch 1
-        (member_prop_invoke shadow), ktor_server start(wait=false).
+      - Singles, all closed:
+        - threaded_litmus 45/45: manifest additions committed; the eager
+          parity fail was the plus static commit lost to the advisory
+          rule — fixed by resolving a bare type-parameter return at its
+          DECLARING scope's upper bound (fn-level `<T : B>` first, then
+          the declaring class's `<T : B>`; fn-level unbounded stays
+          unknown), in the forward-reference AST arm and the
+          memberCallReturnTypeRef member-ext arm. Guard:
+          examples/class_bound_generic_return.kt.
+        - resolve_ambiguity: the default-param-twins test pinned the OLD
+          leniency (kotlinc rejects the pair; klio's conflicting-overloads
+          diagnostic now covers default-param shapes) — test updated to
+          expect the diagnostic in both declaration orders. The
+          same-arity ABRT was the FIFTH stale-state root of the census
+          contamination family: the GC remembered set held pointers into
+          arena-owned permanent cells (base-image ClassDefs) after their
+          arena died — base-cache EVICTION frees a base's whole arena
+          mid-process, and diagnostic-only programs release their compile
+          arena without ever reaching the run-boundary collect. The next
+          collection's drain then cleared flags through unmapped pages
+          (silent corruption when the page was still mapped; SEGV once
+          reclaimed). Fix: `gc.drainRemembered()` — drain while cells are
+          still mapped — called at base eviction, base-build error paths,
+          the program teardown before `vm.deinit`, and the driver's
+          gc-restore defer (covers diag failures); the collector now also
+          holds `remembered_lock` across its own re-trace and drain.
+          Suite 26/26 across three consecutive listen-mode runs.
+        - lambdas_and_dispatch member_prop_invoke: REAL miss — an
+          implicit receiver's function-typed property (invoke convention)
+          must outrank a top-level fn. Bare-call commit now re-routes a
+          plain top-level pick to CallMemberOrGlobal when a receiver in
+          the tower declares a same-named `FunctionN`/`<function>`-headed
+          property. Guard: examples/prop_invoke_shadows_top_level.kt.
+        - ktor_server start(wait=false): passes manually (rc=0, exact
+          output) — census-load flake on the Debug CLI under the 30s cap;
+          re-verified solo below.
 - [ ] V2. Make the ratchets ratchet:
       - src/itests/ktor_commontest.zig has `.baseline = 0` — it can never
         fail. Set it to the census floor (last recorded 465 passed / 2

@@ -334,12 +334,11 @@ test "an expect decl over an embedded intrinsic is dropped at build and the call
     try expectOutput("expect_native_backed", src, "3\n5\n");
 }
 
-test "default-param twins resolve the same in either declaration order" {
-    // A candidate with a default parameter is deferred by the stub gate
-    // AND the body gate, so the verdict cannot flip on whether the
-    // bodies lowered before the call site. (kotlinc rejects this pair
-    // as conflicting overloads; klio's diagnostic does not yet cover
-    // default-param shapes — both orders defer to the heuristic pick.)
+test "default-param twins conflict in either declaration order" {
+    // Parameter names and default values are not part of a signature,
+    // so this pair is identical — kotlinc rejects it as conflicting
+    // overloads, and so does klio, regardless of whether the bodies
+    // lowered before the call site.
     const decls_first =
         \\fun g(x: Int, y: Int = 0): Int = x + y
         \\fun g(a: Int, b: Int = 1): Int = a + b
@@ -352,8 +351,16 @@ test "default-param twins resolve the same in either declaration order" {
         \\fun g(a: Int, b: Int = 1): Int = a + b
         \\
     ;
-    try expectOutput("default_twins_decls_first", decls_first, "3\n");
-    try expectOutput("default_twins_decls_last", decls_last, "3\n");
+    try expectExactErr(
+        "default_twins_decls_first",
+        decls_first,
+        "%PATH%:3: error: conflicting overloads of `g`: identical signatures declared at %PATH%:1 and %PATH%:2 — rename or remove one of the declarations",
+    );
+    try expectExactErr(
+        "default_twins_decls_last",
+        decls_last,
+        "%PATH%:1: error: conflicting overloads of `g`: identical signatures declared at %PATH%:2 and %PATH%:3 — rename or remove one of the declarations",
+    );
 }
 
 test "expect-fn default parameter values transfer to the superseding actual" {

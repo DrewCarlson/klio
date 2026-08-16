@@ -362,3 +362,5 @@ valid" Kotlin a real program mixes — and are each byte-identical to
 | `unconfined_yield_order.kt` | Unconfined runs eagerly through `yield()` on an empty event loop before a default-dispatched sibling starts — U1 U2 L1 L2, verified against kotlinc/JVM. |
 | `cancellable_continuation_save_resume.kt` | A `CancellableContinuation` captured from `suspendCancellableCoroutine` and resumed from the outer body delivers its value intact — verified against kotlinc/JVM. |
 | `step_progression_counted.kt` | Literal-step `..`/`downTo` progressions run as counted register loops with kotlinc's overflow-free last-element snapping — outputs verified against kotlinc/JVM. |
+| `class_bound_generic_return.kt` | A member extension returning its declaring class's `T` types the call at the CLASS parameter's upper bound — a caller-scope `<T : CharSequence>` shadow cannot flip the overload pick on the returned value. Verified against kotlinc/JVM. |
+| `prop_invoke_shadows_top_level.kt` | An implicit receiver's function-typed property outranks a same-named top-level function through the invoke convention (`with(Host()) { handler() }`). Verified against kotlinc/JVM. |
