@@ -2623,7 +2623,10 @@ fn applicRefineCbM(ctx: *anyopaque, param_ty: *const TypeRef, value: *const anyo
 fn applicIdentityConflictCbM(ctx: *anyopaque, param_ty: *const TypeRef, value: *const anyopaque) bool {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     const v: *const Value = @ptrCast(@alignCast(value));
-    return overload_match.crossPackageIdentityConflict(self, param_ty, v);
+    const r = overload_match.crossPackageIdentityConflict(self, param_ty, v);
+    if (r and runtime.envOnce("KLIO_APPLIC_TRACE") != null)
+        std.debug.print("[applic-idconf] ty={s} arg={s}\n", .{ param_ty.name, v.typeFqn() });
+    return r;
 }
 
 fn applicExactHeadCbM(ctx: *anyopaque, param_head: []const u8, arg_head: []const u8) bool {
@@ -2638,7 +2641,18 @@ fn applicSubtypeCbM(ctx: *anyopaque, value: *const anyopaque, target: []const u8
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     const arg: *const Value = @ptrCast(@alignCast(value));
     if (arg.* != .Instance) return null;
-    const dist = instanceSubtypeDistance(self, arg, target) orelse return null;
+    const dist = instanceSubtypeDistance(self, arg, target) orelse {
+        if (runtime.envOnce("KLIO_APPLIC_TRACE") != null)
+            blk2: {
+                const g2 = arg.Instance.borrow();
+                defer g2.deinit();
+                const cg2 = g2.get().class.borrow();
+                defer cg2.deinit();
+                std.debug.print("[applic-subtype-miss] target={s} arg_cls={s}\n", .{ target, cg2.get().fqn });
+                break :blk2;
+            }
+        return null;
+    };
     return @intCast(@min(dist, @as(usize, std.math.maxInt(i32))));
 }
 
@@ -3509,7 +3523,14 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
     defer tied.deinit(self.allocator);
     for (candidates) |f| {
         var sig = sigViewOfMember(self, &f, false);
-        const applic = applicability.applicable(&sig, shapes, scope) orelse continue;
+        const applic = applicability.applicable(&sig, shapes, scope) orelse {
+            if (missTraceWant(f.name)) {
+                std.debug.print("[pmo-multi] `{s}`#{d} inapplicable params:", .{ f.name, f.id.int() });
+                for (f.params) |p| std.debug.print(" {s}:{s}", .{ p.name, p.ty.name });
+                std.debug.print("\n", .{});
+            }
+            continue;
+        };
         // The `+5` exact-arity bonus and `-1000` low-priority penalty are the
         // member caller's tiebreaks, applied from the returned `Score`.
         const score = appliedMemberScore(applic.points, applic.exact_arity, applic.low_priority);
@@ -5784,6 +5805,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         const cg = g.get().class.borrow();
         defer cg.deinit();
         missTraceMaybe(name);
+        if (missTraceWant(name)) missDumpClassChain(receiver);
         return unimplemented(allocator, "Vm::call_member `{s}` on `{s}`", .{ name, cg.get().fqn });
     }
     // Last resort for a primitive number whose named arithmetic operator
@@ -5976,6 +5998,32 @@ fn missTraceMaybe(name: []const u8) void {
     if (!missTraceWant(name)) return;
     std.debug.print("[miss] call_member `{s}` total miss\n", .{name});
     ir.eval.dumpFrameChainForDiagAlways();
+}
+
+/// `KLIO_MISS_TRACE` helper: dump the receiver's runtime class chain and
+/// each class's declared method names, so a total miss shows whether the
+/// name exists anywhere on the chain the walk should have covered.
+pub fn missDumpClassChain(receiver: *const Value) void {
+    if (receiver.* != .Instance) return;
+    var cur: ?ObjRef(runtime.ClassDef) = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        break :blk g.get().class;
+    };
+    var depth: usize = 0;
+    while (cur) |c| : (depth += 1) {
+        if (depth > 12) break;
+        const cg = c.borrow();
+        const cd = cg.get();
+        std.debug.print("[chain {d}] {s} methods:", .{ depth, cd.fqn });
+        for (cd.methods) |m| std.debug.print(" {s}", .{m.name});
+        std.debug.print(" supers:", .{});
+        for (cd.supertype_names) |sn| std.debug.print(" {s}", .{sn});
+        std.debug.print(" parent={}\n", .{cd.parent != null});
+        const nxt = cd.parent;
+        cg.deinit();
+        cur = nxt;
+    }
 }
 
 /// Cached hot-path trace gates: the memoized `getenvSlice` still takes a
@@ -9649,6 +9697,21 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                 for (irc.supertypes) |sid| {
                     if (@intFromEnum(sid) < mod.classes.items.len) {
                         try queue.append(allocator, .{ .cid = sid, .name = mod.classes.items[@intFromEnum(sid)].name });
+                    }
+                }
+                // A pack shim class's cross-root supertype ids can be
+                // unresolved at load (ktor's KlioApplicationResponse :
+                // BaseApplicationResponse walked as a leaf, so the inherited
+                // `status` overloads were invisible). The registry's
+                // name-chain evidence still records the declared parents —
+                // continue the walk by name when identity resolution
+                // recorded none.
+                if (irc.supertypes.len == 0) {
+                    const chain: []const []const u8 =
+                        mod.registry.class_super_names.get(irc.fqn) orelse
+                        mod.registry.class_super_names.get(irc.name) orelse &.{};
+                    for (chain) |sup| {
+                        try queue.append(allocator, .{ .cid = null, .name = sup });
                     }
                 }
             }

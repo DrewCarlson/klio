@@ -1020,6 +1020,26 @@ pub fn lowerClassWithExtras(
                 // (class, method) so the build pass can fold them onto
                 // the override's own (default-less) parameter slots.
                 try recordAbstractMemberDefaults(module, c, f);
+                // Record the declared arity so overload picks that must
+                // rank members above extensions can see the bodyless slot
+                // (see `ModuleRegistry.abstract_member_arity`). Defaulted
+                // params widen the mask down to the min arity.
+                {
+                    var defaults_n: usize = 0;
+                    for (f.params) |*fp| {
+                        if (fp.default != null) defaults_n += 1;
+                    }
+                    const hi: u6 = @intCast(@min(f.params.len, 63));
+                    const lo: u6 = @intCast(@min(f.params.len - defaults_n, 63));
+                    var mask: u64 = 0;
+                    var ar: u6 = lo;
+                    while (true) : (ar += 1) {
+                        mask |= @as(u64, 1) << ar;
+                        if (ar == hi) break;
+                    }
+                    const gop2 = try module.registry.abstract_member_arity.getOrPut(.{ .a = c.name.name, .b = f.name.name });
+                    if (gop2.found_existing) gop2.value_ptr.* |= mask else gop2.value_ptr.* = mask;
+                }
                 // An abstract MEMBER-EXTENSION declaration records its
                 // extension-receiver type head: a SAM conversion of the
                 // fun interface binds this receiver as the lambda's

@@ -7680,6 +7680,78 @@ fn retierPlainInlinePick(
     return best;
 }
 
+/// Whether an implicit receiver in the caller's context declares a MEMBER
+/// named `nm` that can take `argc` args — bodyless
+/// (`registry.abstract_member_arity`) or concrete (`member_method_fids`
+/// at the exact arity), walked over the recorded supertype name chains.
+/// Kotlin ranks such a member above any extension, so an inline-extension
+/// splice must yield to it (`respond(message, typeInfo<T>())` inside an
+/// `ApplicationCall` extension binds the interface's member, never the
+/// reified 2-arg `respond(status, message)` extension).
+fn receiverMemberTakesCall(b: *FuncBuilder, evid_chain: ?[]const []const u8, nm: []const u8, argc: usize) bool {
+    var heads_buf: [12][]const u8 = undefined;
+    var n: usize = 0;
+    if (b.recvTy()) |h| {
+        heads_buf[n] = h;
+        n += 1;
+    }
+    if (b.ownerClass()) |h| {
+        if (n < heads_buf.len) {
+            heads_buf[n] = h;
+            n += 1;
+        }
+    }
+    if (evid_chain) |chain| for (chain) |h| {
+        if (n < heads_buf.len) {
+            heads_buf[n] = h;
+            n += 1;
+        }
+    };
+    const bit: u64 = @as(u64, 1) << @intCast(@min(argc, 63));
+    var stack_buf: [48][]const u8 = undefined;
+    var stack_len: usize = 0;
+    for (heads_buf[0..n]) |h| {
+        if (stack_len < stack_buf.len) {
+            stack_buf[stack_len] = h;
+            stack_len += 1;
+        }
+    }
+    var seen_buf: [48][]const u8 = undefined;
+    var seen_len: usize = 0;
+    while (stack_len > 0) {
+        stack_len -= 1;
+        const cur = stack_buf[stack_len];
+        var dup = false;
+        for (seen_buf[0..seen_len]) |sn| {
+            if (std.mem.eql(u8, sn, cur)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        if (seen_len < seen_buf.len) {
+            seen_buf[seen_len] = cur;
+            seen_len += 1;
+        }
+        // Bodyless slots only: a CONCRETE member is already ranked by the
+        // existing ladders, and vetoing every concrete-member namesake here
+        // was measured too blunt (it broke `execute(context, Unit)` inside
+        // the pipeline extension). The abstract record is the information
+        // the ladders lack.
+        if (b.module.registry.abstract_member_arity.get(.{ .a = cur, .b = nm })) |mask| {
+            if (mask & bit != 0) return true;
+        }
+        const supers: []const []const u8 = b.module.registry.class_super_names.get(cur) orelse &.{};
+        for (supers) |sup| {
+            if (stack_len < stack_buf.len) {
+                stack_buf[stack_len] = sup;
+                stack_len += 1;
+            }
+        }
+    }
+    return false;
+}
+
 fn inlineTargetForBareCall(
     b: *FuncBuilder,
     seg: *const ast.Ident,
@@ -7691,6 +7763,7 @@ fn inlineTargetForBareCall(
     // caller context has none of its own (a bare reified call inside a
     // spliced extension body); it feeds only this pick, not binding.
     const evid_chain = try inlineBodyRecvChain(b);
+
     // Host-backed default imports suppress the simple-name candidate table,
     // but not an exact FuncId resolved by the scope-aware index below. The
     // source declaration remains the semantic target of an inline call and
@@ -7927,6 +8000,23 @@ fn inlineTargetForBareCall(
                 }
             }
             if (!evidenced) return null;
+        }
+    }
+    // An ABSTRACT member on the implicit-receiver tower that can take this
+    // call outranks an EXTENSION / top-level inline candidate in Kotlin's
+    // resolution order (`respond(message, typeInfo<T>())` inside an
+    // `ApplicationCall` extension binds the interface's bodyless member,
+    // never the reified 2-arg `respond(status, message)` extension).
+    // Member-inline picks are exempt: they are themselves tower members
+    // (DebugPipelineContext's own `proceed` must keep splicing over the
+    // base class's abstract slot).
+    if (pick) |pf| {
+        if (inline_state.inlineMemberOwner(pf) == null and
+            receiverMemberTakesCall(b, evid_chain, nm, args.len))
+        {
+            if (runtime.envOnce("KLIO_ABSVETO_TRACE") != null)
+                std.debug.print("[absveto] {s} argc={d} in={s}\n", .{ nm, args.len, build.currentRealFn() orelse "-" });
+            return null;
         }
     }
     inlineResolveAudit(b, nm, seg.span.file, narrowed, pick, args, shape.last_is_lambda, ires);

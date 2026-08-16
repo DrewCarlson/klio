@@ -576,6 +576,7 @@ const StrKV = KV([]const u8, []const u8);
 const PairKey = struct { a: []const u8, b: []const u8 };
 const PairFuncEntry = struct { a: []const u8, b: []const u8, func: FuncId };
 const PairStrEntry = struct { a: []const u8, b: []const u8, v: []const u8 };
+const PairU64Entry = struct { a: []const u8, b: []const u8, v: u64 };
 const PairTypeEntry = struct { a: []const u8, b: []const u8, v: ir.TypeRef };
 const NameTypeEntry = struct { name: []const u8, v: ir.TypeRef };
 const NameFuncs = struct { name: []const u8, funcs: []const FuncId };
@@ -621,6 +622,7 @@ const RegistryImage = struct {
     top_level_prop_type_refs: []NameTypeEntry = &.{},
     ext_prop_type_heads: []PairStrEntry,
     iface_member_ext_recv: []PairStrEntry,
+    abstract_member_arity: []PairU64Entry = &.{},
     private_fn_files: []KV(FuncId, FileId),
     file_packages: []KV(FileId, []const u8),
     file_modules: []KV(FileId, u32),
@@ -1535,6 +1537,15 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
         },
         .ext_prop_type_heads = try pairMapToSlice(a, &r.ext_prop_type_heads),
         .iface_member_ext_recv = try pairMapToSlice(a, &r.iface_member_ext_recv),
+        .abstract_member_arity = blk: {
+            var out2 = try a.alloc(PairU64Entry, r.abstract_member_arity.count());
+            var it2 = r.abstract_member_arity.iterator();
+            var idx2: usize = 0;
+            while (it2.next()) |entry| : (idx2 += 1) {
+                out2[idx2] = .{ .a = entry.key_ptr.a, .b = entry.key_ptr.b, .v = entry.value_ptr.* };
+            }
+            break :blk out2;
+        },
         .private_fn_files = try autoMapToSlice(FuncId, FileId, a, &r.private_fn_files),
         .file_packages = try autoMapToSlice(FileId, []const u8, a, &r.file_packages),
         .file_modules = try autoMapToSlice(FileId, u32, a, &r.file_modules),
@@ -2288,6 +2299,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     for (ri.top_level_prop_type_refs) |entry| try r.top_level_prop_type_refs.put(entry.name, entry.v);
     for (ri.ext_prop_type_heads) |entry| try r.ext_prop_type_heads.put(.{ .a = entry.a, .b = entry.b }, entry.v);
     for (ri.iface_member_ext_recv) |entry| try r.iface_member_ext_recv.put(.{ .a = entry.a, .b = entry.b }, entry.v);
+    for (ri.abstract_member_arity) |entry| try r.abstract_member_arity.put(.{ .a = entry.a, .b = entry.b }, entry.v);
     for (ri.private_fn_files) |kv| try r.private_fn_files.put(kv.k, kv.v);
     for (ri.file_packages) |kv| try r.file_packages.put(kv.k, kv.v);
     for (ri.file_modules) |kv| try r.file_modules.put(kv.k, kv.v);
