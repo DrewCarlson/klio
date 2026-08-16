@@ -346,6 +346,14 @@ pub const Inst = union(enum) {
         /// function. The VM may therefore adapt a plain underlying function
         /// positionally instead of using compatibility receiver inference.
         receiver_shape_exact: bool = false,
+        /// The DECLARED receiver head of a receiver-lambda param invoked
+        /// bare (`transform(x)` for `transform: FlowCollector.(A) -> R`).
+        /// The syntactic innermost `this` register can be a coroutine that
+        /// rebound the enclosing block's capture slot; Kotlin binds the
+        /// innermost implicit receiver OF THE DECLARED TYPE, so the VM
+        /// re-selects by this head before dispatch. Null keeps the passed
+        /// receiver.
+        recv_head: ?ConstId = null,
     },
     /// Call a callable value held in a register.
     CallValue: struct {
@@ -1582,6 +1590,8 @@ pub const SelfLocalFn = struct {
 
 /// One full type-parameter bound ref (with type arguments) carried into a
 /// pending lambda/local-fn body. Owned by the module allocator.
+pub const RecvHeadKV = struct { name: []const u8, head: ?[]const u8 };
+
 pub const PendingBoundRef = struct {
     param: []const u8,
     ref: TypeRef,
@@ -1686,6 +1696,12 @@ pub const Module = struct {
     /// (`data.any { it.startsWith("f") }` in a test method's expect-lambda).
     /// Owned pairs; the lambda body takes ownership. Not serialized.
     pending_lambda_type_param_bound_refs: ?[]PendingBoundRef = null,
+    /// Receiver-lambda param names -> declared receiver heads of the
+    /// ENCLOSING builder, carried into a nested lambda body so a captured
+    /// receiver-fn param invoked bare there re-selects by its declared
+    /// head. Registry/arena-stable slices; the lambda body copies the
+    /// entries and frees the slice. Not serialized.
+    pending_lambda_recv_heads: ?[]RecvHeadKV = null,
     /// Engine step four: the caller's SOLVED fn-tp bindings for an inline
     /// splice, registered as window bound refs at entry. Names are
     /// registry-stable fn-tp slices; tys owned by the lowering allocator

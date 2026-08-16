@@ -2297,6 +2297,11 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             if (ft.receiver != null) {
                 try b.markReceiverLambdaParam(p.name.name);
                 if (p.ty.function) |fnty| try b.markReceiverLambdaArity(p.name.name, fnty.params.len);
+                // Record the declared receiver HEAD so a bare invocation —
+                // here or in a nested lambda that captures the param —
+                // re-selects the implicit receiver of the declared type.
+                const rh = ft.receiver.?.name.name;
+                try b.setReceiverLambdaRecvHead(p.name.name, if (b.isTypeParam(rh)) null else rh);
             } else {
                 try b.markPlainFnParam(p.name.name);
                 // A trailing lambda binds the callee's LAST parameter, so a

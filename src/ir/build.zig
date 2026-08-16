@@ -2256,6 +2256,20 @@ pub const FuncBuilder = struct {
     pub fn receiverLambdaRecvHead(self: *const FuncBuilder, name: []const u8) ?[]const u8 {
         return self.receiver_lambda_recv_heads.get(name) orelse null;
     }
+    /// Stash this builder's receiver-lambda head table on the module's
+    /// pending slot so a nested lambda body inherits the declared heads
+    /// alongside the names (`inheritReceiverLambdaParams` carries names
+    /// only). No-op when empty.
+    pub fn stashRecvHeadsForLambda(self: *FuncBuilder) Allocator.Error!void {
+        if (self.receiver_lambda_recv_heads.count() == 0) return;
+        const out = try self.allocator.alloc(ir.RecvHeadKV, self.receiver_lambda_recv_heads.count());
+        var it = self.receiver_lambda_recv_heads.iterator();
+        var i: usize = 0;
+        while (it.next()) |e| : (i += 1) {
+            out[i] = .{ .name = e.key_ptr.*, .head = e.value_ptr.* };
+        }
+        self.module.pending_lambda_recv_heads = out;
+    }
     /// The declared NON-receiver arity of a receiver-lambda param
     /// (`f: T.(A) -> R` has arity 1). Disambiguates a call `f(x)`:
     /// with arity 0 the single arg is the RECEIVER (`x.f()`), with

@@ -374,6 +374,17 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     var inherited = inherited_rlp;
     defer inherited.deinit();
     try b.inheritReceiverLambdaParams(&inherited);
+    // The declared receiver HEADS ride the module's pending slot (the
+    // name set above carries no types): a captured `transform:
+    // FlowCollector.(A) -> R` invoked bare in this body re-selects its
+    // receiver by the declared head.
+    if (module.pending_lambda_recv_heads) |heads| {
+        module.pending_lambda_recv_heads = null;
+        defer moduleAllocator(module).free(heads);
+        for (heads) |kv| {
+            try b.setReceiverLambdaRecvHead(kv.name, kv.head);
+        }
+    }
     // Same carrier for local extension functions: a captured local ext fn
     // called bare in this body must still prepend the enclosing receiver.
     var inherited_ext = inherited_lef;
@@ -550,6 +561,8 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
             if (fnty.receiver != null) {
                 try b.markReceiverLambdaParam(pname.name);
                 try b.markReceiverLambdaArity(pname.name, fnty.params.len);
+                const rh = fnty.receiver.?.name.name;
+                try b.setReceiverLambdaRecvHead(pname.name, if (b.isTypeParam(rh)) null else rh);
             }
         } else if (b.module.registry.recv_fn_aliases.get(t.name.name)) |ar| {
             // Aliased receiver-fn type: the alias registry keeps the

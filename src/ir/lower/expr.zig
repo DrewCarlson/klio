@@ -3385,6 +3385,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // `outer_names` / `inherited_rlp` ownership passes into the lambda lower.
     const outer_names = try b.visibleNames();
     const inherited_rlp = try b.receiverLambdaParamNames();
+    try b.stashRecvHeadsForLambda();
     var outer_boxed = try b.boxedVarsSnapshot();
     defer outer_boxed.deinit();
     const enclosing_owner = try enclosingOwnerFor(b);
@@ -3588,6 +3589,7 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // `outer_names` / `inherited_rlp` ownership passes into the lambda lower.
     const outer_names = try b.visibleNames();
     const inherited_rlp = try b.receiverLambdaParamNames();
+    try b.stashRecvHeadsForLambda();
     var outer_boxed = try b.boxedVarsSnapshot();
     defer outer_boxed.deinit();
     const enclosing_owner = try enclosingOwnerFor(b);
@@ -7428,7 +7430,13 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // `redirect_to_member` applies inside a method body.
     if (callee.* == .Path and callee.Path.segments.len == 1 and call.type_args.len == 0) {
         const nm0 = callee.Path.segments[0].name;
+        // A RECEIVER-lambda param is Kotlin-unambiguous (the param wins and
+        // its receiver binds by declared type): let the ladder reach the
+        // RLP arms, which carry the declared head — this arbitration arm
+        // seated the syntactic `this` (flowScope's coroutine) and
+        // combineInternal's `transform(...)` lost its FlowCollector.
         if (!b.isLocalFn(nm0) and !b.isLocalExtFn(nm0) and
+            !b.isReceiverLambdaParam(nm0) and
             (b.knowsOuter(nm0) or b.resolve(nm0) != null))
         {
             if (try resolveThisForBareCallNoBind(b)) |this_reg| {
@@ -8878,9 +8886,46 @@ fn lowerValueInvocation(
 ) Allocator.Error!?Reg {
     const name0 = callee.Path.segments[0].name;
 
-    // A bare call to a receiver-lambda param reached as a capture.
+    // A bare call to a receiver-lambda param reached as a capture. The
+    // declared receiver HEAD rides the instruction: the captured `this`
+    // register can be a coroutine that rebound the enclosing block's slot,
+    // and the VM re-selects the innermost implicit receiver of the
+    // declared type (combineInternal's `transform(...)` binds
+    // this@combineInternal, the FlowCollector, not the flowScope
+    // coroutine).
+    if (runtime.envOnce("KLIO_RLP_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name0))
+            std.debug.print("[rlp-arm] {s} isRLP={} resolved={} outer={} head={s} in={s}\n", .{ name0, b.isReceiverLambdaParam(name0), b.resolve(name0) != null, b.knowsOuter(name0), b.receiverLambdaRecvHead(name0) orelse "-", build.currentRealFn() orelse "-" });
+    }
     if (b.isReceiverLambdaParam(name0) and b.resolve(name0) == null and b.knowsOuter(name0)) {
-        const this_reg: ?Reg = if (b.knowsOuter("this") or b.capturesThisSlot())
+        // The innermost implicit receiver OF THE DECLARED HEAD, resolved
+        // lexically: an enclosing extension fn's receiver reaches nested
+        // lambdas through its `this@<fn>` entry slot, which no coroutine
+        // receiver rebinding ever displaces (the flowScope block's `this`
+        // is the FlowCoroutine; `transform(...)` still binds
+        // this@combineInternal, the FlowCollector).
+        var head_receiver: ?Reg = null;
+        if (b.receiverLambdaRecvHead(name0)) |h| {
+            const tower = try b.collectReceiverTowerLabeled(b.allocator, null, null);
+            defer b.allocator.free(tower);
+            for (tower) |entry| {
+                if (!std.mem.eql(u8, entry.head, h)) continue;
+                if (entry.label) |lbl| {
+                    const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{lbl});
+                    if (b.resolve(label)) |r| {
+                        head_receiver = r;
+                    } else if (b.knowsOuter(label)) {
+                        const dst2 = try b.loadCaptureHoisted(label);
+                        try b.bind(label, dst2);
+                        head_receiver = dst2;
+                    }
+                    if (runtime.envOnce("KLIO_RLP_TRACE") != null)
+                        std.debug.print("[rlp-head] {s} label={s} hit={} in={s}\n", .{ name0, label, head_receiver != null, build.currentRealFn() orelse "-" });
+                }
+                break;
+            }
+        }
+        const this_reg: ?Reg = head_receiver orelse if (b.knowsOuter("this") or b.capturesThisSlot())
             try resolveCapture(b, "this")
         else
             b.resolve("this");
@@ -8888,6 +8933,10 @@ fn lowerValueInvocation(
             const callee_r = try resolveCapture(b, name0);
             const run = try lowerArgRun(b, args);
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const head_c: ?ir.ConstId = if (b.receiverLambdaRecvHead(name0)) |h|
+                try b.module.internConst(b.allocator, .{ .String = h })
+            else
+                null;
             const dst = b.allocReg();
             try b.push(.{ .CallValueWithThis = .{
                 .dst = dst,
@@ -8896,6 +8945,7 @@ fn lowerValueInvocation(
                 .args = run[0],
                 .n_args = run[1],
                 .arg_names = arg_names,
+                .recv_head = head_c,
             } });
             return dst;
         }
@@ -9061,6 +9111,17 @@ fn lowerValueInvocation(
             if (this_reg) |tr| {
                 const run = try lowerArgRun(b, args);
                 const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+                // The declared receiver HEAD rides the instruction: inside a
+                // spliced/nested receiver block the syntactic `this` can be
+                // the block's own receiver (flowScope's coroutine), while
+                // Kotlin binds the innermost implicit receiver of the
+                // DECLARED type (`transform(...)` for a
+                // `FlowCollector.(Array) -> Unit` param binds
+                // this@combineInternal).
+                const head_c: ?ir.ConstId = if (b.receiverLambdaRecvHead(name0)) |h|
+                    try b.module.internConst(b.allocator, .{ .String = h })
+                else
+                    null;
                 const dst = b.allocReg();
                 try b.push(.{ .CallValueWithThis = .{
                     .dst = dst,
@@ -9069,6 +9130,7 @@ fn lowerValueInvocation(
                     .args = run[0],
                     .n_args = run[1],
                     .arg_names = arg_names,
+                    .recv_head = head_c,
                 } });
                 return dst;
             }
