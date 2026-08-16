@@ -171,6 +171,14 @@ pub fn resetReceiverThreadLocals() void {
 pub fn resetRunGlobalCaches() void {
     host_instances.resetAnonSiteCache();
     host_call_member.resetStaticApplicabilityCache();
+    // Invalidate every pointer-keyed dispatch cache (the thread-local method /
+    // resolve / perm L1s, the name-identity slots, the owner-keyed ext-prop
+    // memo) in one stroke: entries carry a generation stamp, and stale
+    // generations never hit — including on still-parked pool worker threads a
+    // per-thread clear could not reach. Without this, an in-process driver
+    // running many programs replayed the previous program's resolutions off
+    // reused cell addresses (wrong overloads, calls into freed IR).
+    host_call_member.bumpDispatchCacheGen();
     ir.eval.resetSuspendLivenessCache();
     stdlib.resetEmptyCollectionSingletons();
     stdlib.resetEmptySequenceSingleton();

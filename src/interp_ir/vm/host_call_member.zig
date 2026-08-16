@@ -2058,7 +2058,7 @@ fn receiverImplementsOwnerIdentity(
 /// string is program-lifetime, so `canon` stays valid; `src` is only a hint
 /// and every hit is confirmed by comparing bytes, which keeps the entry sound
 /// even if a transient string is freed and its address reused.
-const NameIdSlot = struct { src: usize = 0, canon: []const u8 = &.{} };
+const NameIdSlot = struct { src: usize = 0, gen: u32 = 0, canon: []const u8 = &.{} };
 threadlocal var name_id_cache: [2048]NameIdSlot = @splat(.{});
 
 /// Canonical pointer identity for a dispatch-cache method name. Runtime
@@ -2072,7 +2072,7 @@ threadlocal var name_id_cache: [2048]NameIdSlot = @splat(.{});
 fn memberNameIdentity(self: *VmHost, name: []const u8) ?usize {
     const src = @intFromPtr(name.ptr);
     const slot = &name_id_cache[(src >> 3) % name_id_cache.len];
-    if (slot.src == src and slot.canon.len == name.len and std.mem.eql(u8, slot.canon, name)) {
+    if (slot.src == src and slot.gen == cacheGen() and slot.canon.len == name.len and std.mem.eql(u8, slot.canon, name)) {
         return @intFromPtr(slot.canon.ptr);
     }
     const id = blk: {
@@ -2080,7 +2080,7 @@ fn memberNameIdentity(self: *VmHost, name: []const u8) ?usize {
         defer pg.deinit();
         break :blk pg.get().memberNameIdentity(name) orelse return null;
     };
-    slot.* = .{ .src = src, .canon = @as([*]const u8, @ptrFromInt(id))[0..name.len] };
+    slot.* = .{ .src = src, .gen = cacheGen(), .canon = @as([*]const u8, @ptrFromInt(id))[0..name.len] };
     return id;
 }
 
@@ -4096,7 +4096,7 @@ pub fn prepareMemberFlatCallNamed(
     const k = namedOrderKey(self, receiver, name, args, arg_names) orelse return null;
     var perm: ?root_mod.ProgramImage.NamedPerm = null;
     const tslot = &tl_perm_cache[tlSlot(k)];
-    if (tslot.raw_plus != 0 and tslot.class_p == k.class_p and tslot.name_p == k.name_p and
+    if (tslot.raw_plus != 0 and tslot.gen == cacheGen() and tslot.class_p == k.class_p and tslot.name_p == k.name_p and
         tslot.sig == k.sig and tslot.n_args == k.n_args)
     {
         perm = tslot.perm;
@@ -4107,7 +4107,7 @@ pub fn prepareMemberFlatCallNamed(
             break :blk pg.get().named_perm_cache.get(k);
         };
         if (shared) |sp| {
-            tslot.* = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .perm = sp };
+            tslot.* = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .gen = cacheGen(), .perm = sp };
             perm = sp;
         }
     }
@@ -4444,7 +4444,7 @@ fn builtinIntrinsicReplay(self: *VmHost, allocator: Allocator, receiver: *const 
         .args_empty = args.len == 0,
     };
     const e = &tl_resolve_cache[tlResolveSlot(key)];
-    if (e.state == 2 and e.type_p == key.type_p and e.name_p == key.name_p and e.args_empty == key.args_empty) {
+    if (e.state == 2 and e.gen == cacheGen() and e.type_p == key.type_p and e.name_p == key.name_p and e.args_empty == key.args_empty) {
         return try dispatchWithReceiver(self, allocator, e.fqn, e.func.?, receiver, args);
     }
     return null;
@@ -6238,7 +6238,7 @@ fn instanceBindingNamedProbe(
                 defer pg.deinit();
                 pg.get().named_perm_cache.put(k, perm) catch {};
             }
-            tl_perm_cache[tlSlot(k)] = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .perm = perm };
+            tl_perm_cache[tlSlot(k)] = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .gen = cacheGen(), .perm = perm };
         }
     }
     return instanceBindingProbe(self, allocator, receiver, name, filled.items);
@@ -11343,7 +11343,25 @@ const METHOD_MISS: u32 = std.math.maxInt(u32);
 /// (which are add-only and never re-map a key to a different target), so a
 /// stale or evicted slot just falls through to the shared probe.
 const TL_METHOD_CACHE_SIZE = 2048;
-const TlMethodEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, raw_plus: u64 = 0 };
+
+/// Generation stamp for every process-global / thread-local dispatch cache.
+/// An in-process driver that runs MANY programs in one process (the parity
+/// itests, e2e, the fuzzer) frees each program's module and arena; pointer
+/// identities (class cells, name storage) are then reused by the next
+/// program, and a surviving cache entry keyed on them replays the PREVIOUS
+/// program's resolution — wrong overloads at best, calls into freed IR at
+/// worst (the census's cross-test contamination family). Such drivers bump
+/// the generation at each program boundary; entries from an older
+/// generation never hit.
+pub var dispatch_cache_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
+pub fn bumpDispatchCacheGen() void {
+    _ = dispatch_cache_gen.fetchAdd(1, .monotonic);
+}
+inline fn cacheGen() u32 {
+    return dispatch_cache_gen.load(.monotonic);
+}
+
+const TlMethodEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, raw_plus: u64 = 0, gen: u32 = 0 };
 threadlocal var tl_method_cache: [TL_METHOD_CACHE_SIZE]TlMethodEntry = @splat(.{});
 threadlocal var tl_ext_cache: [TL_METHOD_CACHE_SIZE]TlMethodEntry = @splat(.{});
 
@@ -11354,7 +11372,7 @@ inline fn tlSlot(key: root_mod.ProgramImage.InstanceMethodKey) usize {
 
 inline fn tlGet(cache: *[TL_METHOD_CACHE_SIZE]TlMethodEntry, key: root_mod.ProgramImage.InstanceMethodKey) ?u32 {
     const e = &cache[tlSlot(key)];
-    if (e.raw_plus != 0 and e.class_p == key.class_p and e.name_p == key.name_p and
+    if (e.raw_plus != 0 and e.gen == cacheGen() and e.class_p == key.class_p and e.name_p == key.name_p and
         e.sig == key.sig and e.n_args == key.n_args)
     {
         return @intCast(e.raw_plus - 1);
@@ -11363,16 +11381,16 @@ inline fn tlGet(cache: *[TL_METHOD_CACHE_SIZE]TlMethodEntry, key: root_mod.Progr
 }
 
 inline fn tlPut(cache: *[TL_METHOD_CACHE_SIZE]TlMethodEntry, key: root_mod.ProgramImage.InstanceMethodKey, raw: u32) void {
-    cache[tlSlot(key)] = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .raw_plus = @as(u64, raw) + 1 };
+    cache[tlSlot(key)] = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .raw_plus = @as(u64, raw) + 1, .gen = cacheGen() };
 }
 
 /// Thread-local L1 for the named-binding permutation map.
-const TlPermEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, raw_plus: u8 = 0, perm: root_mod.ProgramImage.NamedPerm = .{ .n = 0xFF, .src = @splat(0xFF) } };
+const TlPermEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, raw_plus: u8 = 0, gen: u32 = 0, perm: root_mod.ProgramImage.NamedPerm = .{ .n = 0xFF, .src = @splat(0xFF) } };
 threadlocal var tl_perm_cache: [TL_METHOD_CACHE_SIZE]TlPermEntry = @splat(.{});
 
 /// Thread-local L1 for the stdlib member-resolve cache. `state`: 0 empty,
 /// 1 confirmed-none, 2 resolved.
-const TlResolveEntry = struct { type_p: usize = 0, name_p: usize = 0, args_empty: bool = false, file: u32 = 0, argc: u32 = 0, state: u8 = 0, func: ?StdlibFn = null, fqn: []const u8 = "" };
+const TlResolveEntry = struct { type_p: usize = 0, name_p: usize = 0, args_empty: bool = false, file: u32 = 0, argc: u32 = 0, state: u8 = 0, gen: u32 = 0, func: ?StdlibFn = null, fqn: []const u8 = "" };
 threadlocal var tl_resolve_cache: [TL_METHOD_CACHE_SIZE]TlResolveEntry = @splat(.{});
 
 inline fn tlResolveSlot(key: root_mod.ProgramImage.MemberResolveKey) usize {
@@ -11381,7 +11399,7 @@ inline fn tlResolveSlot(key: root_mod.ProgramImage.MemberResolveKey) usize {
 }
 
 inline fn tlResolveMatch(e: *const TlResolveEntry, key: root_mod.ProgramImage.MemberResolveKey) bool {
-    return e.state != 0 and e.type_p == key.type_p and e.name_p == key.name_p and
+    return e.state != 0 and e.gen == cacheGen() and e.type_p == key.type_p and e.name_p == key.name_p and
         e.args_empty == key.args_empty and e.file == key.file and e.argc == key.argc;
 }
 
@@ -11393,6 +11411,7 @@ fn tlResolveStore(key: root_mod.ProgramImage.MemberResolveKey, entry: root_mod.P
         .file = key.file,
         .argc = key.argc,
         .state = if (entry.func == null) 1 else 2,
+        .gen = cacheGen(),
         .func = entry.func,
         .fqn = entry.fqn,
     };
@@ -14026,7 +14045,7 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
         if (namedOrderKey(self, receiver, name, args, arg_names)) |k| {
             const tslot = &tl_perm_cache[tlSlot(k)];
             var perm: ?root_mod.ProgramImage.NamedPerm = null;
-            if (tslot.raw_plus != 0 and tslot.class_p == k.class_p and tslot.name_p == k.name_p and
+            if (tslot.raw_plus != 0 and tslot.gen == cacheGen() and tslot.class_p == k.class_p and tslot.name_p == k.name_p and
                 tslot.sig == k.sig and tslot.n_args == k.n_args)
             {
                 perm = tslot.perm;
@@ -14037,7 +14056,7 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
                     break :blk pg.get().named_perm_cache.get(k);
                 };
                 if (shared) |p| {
-                    tslot.* = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .perm = p };
+                    tslot.* = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .gen = cacheGen(), .perm = p };
                     perm = p;
                 }
             }
@@ -14211,7 +14230,7 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
                     defer pg.deinit();
                     pg.get().named_perm_cache.put(k, perm) catch {};
                 }
-                tl_perm_cache[tlSlot(k)] = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .perm = perm };
+                tl_perm_cache[tlSlot(k)] = .{ .class_p = k.class_p, .name_p = k.name_p, .n_args = k.n_args, .sig = k.sig, .raw_plus = 1, .gen = cacheGen(), .perm = perm };
             }
         }
         return primary;
@@ -14887,7 +14906,7 @@ fn serveNamedFid(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // `tl_method_cache`: the shared reader lock's cache-line traffic).
     var perm: ?root_mod.ProgramImage.NamedPerm = null;
     const tslot = &tl_perm_cache[tlSlot(key)];
-    if (tslot.raw_plus != 0 and tslot.class_p == key.class_p and tslot.name_p == key.name_p and
+    if (tslot.raw_plus != 0 and tslot.gen == cacheGen() and tslot.class_p == key.class_p and tslot.name_p == key.name_p and
         tslot.sig == key.sig and tslot.n_args == key.n_args)
     {
         perm = tslot.perm;
@@ -14899,7 +14918,7 @@ fn serveNamedFid(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             break :blk pg.get().named_perm_cache.get(key);
         };
         if (perm) |p| {
-            tslot.* = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .raw_plus = 1, .perm = p };
+            tslot.* = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .raw_plus = 1, .gen = cacheGen(), .perm = p };
         }
     }
     if (perm == null) {
