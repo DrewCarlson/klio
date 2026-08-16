@@ -229,6 +229,45 @@ validatePotentialDeadlock (pump fairness for virtual-time drains).
       in interface default member) hangs pre-existing — parks both
       coroutines.
 
+## Phase E — Next round (active; worked top to bottom)
+
+- [ ] E1. Free-win harvest + pack hygiene. The Phase C seating fixes
+      are the recorded "receiver-publication campaign" family — re-run
+      its triage (zip/combine collector-closure seating, 59/62) and the
+      compose corpus; whatever passes now closes at zero cost. FIRST:
+      the pack image layout changed (abstract_member_arity) — every
+      pack home built before it decodes SHIFTED. Rebuild `~/.klio` and
+      `.klio-local` installed packs (the compose itest home and the
+      ktor scratch home are already current). NOTE: the cached ratchet
+      binary was pruned with the zig cache; the next ratchet run goes
+      through `zig build itest-compose_plugin_commontest` (source floor
+      1365) and its fresh binary path replaces the stale one in the
+      recall notes.
+- [ ] E2. hangbisect3 hang: foreign private stored field + async in an
+      interface default member parks both coroutines forever
+      (pre-existing; standalone repro in scratchpad
+      reprosrc/hangbisect3.kt). Suspect: the sgetter member-probe
+      rejection (an errRes) unwinding through a suspend frame without
+      completing the coroutine.
+- [ ] E3. Pump fairness: a virtual-time drain must be able to observe
+      the queue empty even when an interpreted worker always wins the
+      repost race. Unlocks RecomposerTests.validatePotentialDeadlock
+      and the recorded runTest-teardown / "daemon task abandoned"
+      family — one mechanism, two symptom groups.
+- [ ] E4. Concurrency perf round 3 (the last 4 stress tests, and the
+      suite wall): frame-buffer pooling (kills the ~9% memset + the
+      per-frame alloc), member-walk string-eql caches (~9%), then
+      attribute the ~15% unknown PCs. Need ~1.7x more under
+      contention; each lever measured on the addAll_clear rep count.
+- [ ] E5. Leniency diagnostic: klio accepts illegal Kotlin (unimported
+      extensions) and silently mistypes receiver lambdas. Either type
+      them correctly when the leniency engages or emit a real
+      "unresolved reference" diagnostic.
+- [ ] E6. Deferred measured-first roads, only when a measurement
+      motivates: C-transpiler C-to-C frames (A4 continuation), Value
+      24 -> 16 (A5), C2 completion (nullable member-ext gating; tower
+      strength for public member exts).
+
 ## Phase D — Watches (no active work; act when they fire)
 
 - tl_atomic_update_contended litmus flake: postmortem on next natural
