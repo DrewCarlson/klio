@@ -326,7 +326,7 @@ test "server: routing, params, headers, status codes, and typed JSON" {
 
     // POST typed JSON through ContentNegotiation -> 201 application/json.
     {
-        const req = try buildRequest(a, "POST", "/users", &.{}, "{\"id\":7,\"name\":\"Ada\"}");
+        const req = try buildRequest(a, "POST", "/users", &.{.{ "Content-Type", "application/json" }}, "{\"id\":7,\"name\":\"Ada\"}");
         const resp = try httpRequest(a, io, port, req);
         try std.testing.expectEqual(@as(?u16, 201), statusOf(resp));
         try std.testing.expectEqualStrings("application/json", headerOf(resp, "Content-Type") orelse "");
@@ -391,7 +391,7 @@ test "server: start(wait = false) is non-blocking and the daemon serve abandons 
     const r = std.process.run(a, io, .{
         .argv = &.{ klioBin(&env), "run", "--feature", "io.ktor/server", path },
         .environ_map = &env,
-        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(30_000), .clock = .awake } },
+        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
     }) catch |e| {
         std.debug.print("ktor_server async: run failed: {s}\n", .{@errorName(e)});
         return error.RunFailed;

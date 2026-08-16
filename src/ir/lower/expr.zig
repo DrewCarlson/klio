@@ -12580,6 +12580,50 @@ fn staticCallReturnTypeRefInner(
                     if (fa.return_type) |*rt| {
                         var out = try loweredOwnedLocalTypeRef(b, rt);
                         if (member.safe) out.nullable = true;
+                        // A bare type-parameter return resolves in the
+                        // DECLARING scope, not the caller's: a fn-level
+                        // `<T : Bound>` on the declaration itself, else the
+                        // declaring class's `<T : Bound>`. Kotlin types the
+                        // call at that upper bound — `EagerScope<T : Number>`
+                        // returning `T` is a Number to every caller, even one
+                        // whose own `T` shadows the name differently.
+                        if (bareTypeParamHead(out.name)) resolve_bound: {
+                            const h2 = typeHead(std.mem.trimEnd(u8, out.name, "?"));
+                            var bound: ?[]const u8 = null;
+                            var fn_level = false;
+                            for (fa.type_params) |*tp2| {
+                                if (!std.mem.eql(u8, tp2.name.name, h2)) continue;
+                                fn_level = true;
+                                if (tp2.upper_bound) |*ub| bound = ub.name.name;
+                                break;
+                            }
+                            if (fn_level and bound == null) break :resolve_bound;
+                            if (bound == null) {
+                                const declaring: []const u8 = if (inline_state.exprBodyMemberAst(head, member.name.name, memberArgCount(call_expr)) != null)
+                                    head
+                                else
+                                    (b.ownerClass() orelse break :resolve_bound);
+                                const cbs = b.module.registry.class_type_param_bounds.get(declaring) orelse break :resolve_bound;
+                                for (cbs) |cb| {
+                                    if (std.mem.eql(u8, cb.param, h2)) {
+                                        bound = cb.bound;
+                                        break;
+                                    }
+                                }
+                            }
+                            const bd = bound orelse break :resolve_bound;
+                            const bh = typeHead(std.mem.trimEnd(u8, bd, "?"));
+                            if (bh.len <= 2 or std.mem.eql(u8, bh, "Any") or
+                                std.mem.eql(u8, bh, "kotlin.Any") or b.isTypeParam(bh) or
+                                ir.parseClassTypeParamIdentity(bh) != null) break :resolve_bound;
+                            const keep_nullable = out.nullable;
+                            out.deinit(b.allocator);
+                            out = .{
+                                .name = try b.allocator.dupe(u8, std.mem.trimEnd(u8, bd, "?")),
+                                .nullable = keep_nullable,
+                                .args = &.{},
+                            };
+                        }
                         if (mt) std.debug.print("[bareret] .{s} on {s} ast-declared return={s}\n", .{ member.name.name, head, out.name });
                         return out;
                     }
@@ -14306,6 +14350,34 @@ fn lowerPathCall(
 
     defer b.allocator.free(res_final.candidate_set);
     const was_cast = cast_pick != null and res_final.target != null and cast_pick.?.int() == res_final.target.?.int();
+
+    // Kotlin ranks an implicit receiver's FUNCTION-TYPED property — the
+    // invoke convention — above an outer-scope top-level function:
+    // `with(Host()) { handler() }` calls the Host property's lambda even
+    // when a top-level `handler()` exists. The static engine ranks
+    // functions only, so a top-level pick with such a peer re-routes to
+    // the member-or-global walk, whose runtime tail prefers the member.
+    if (res_final.target != null and !was_cast) peer: {
+        const tgt = res_final.target.?;
+        const tf = b.module.funcById(tgt) orelse break :peer;
+        if (tf.kind != .plain) break :peer;
+        if (tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this")) break :peer;
+        if (b.resolve(name0) != null) break :peer;
+        const recv_heads = [_]?[]const u8{ bareStaticRecvHead(b), b.recvTy(), b.enclosingRecvTy() };
+        for (recv_heads) |mh| {
+            const h = mh orelse continue;
+            const ph = propTypeHeadOn(b, typeHead(std.mem.trimEnd(u8, h, "?")), name0) orelse continue;
+            // Function-typed property heads register as `FunctionN` from a
+            // lowered ref or the `<function>` placeholder from an AST
+            // function-type annotation; only the former proves an arity.
+            if (std.mem.startsWith(u8, ph, "Function")) {
+                const n = std.fmt.parseInt(usize, ph["Function".len..], 10) catch continue;
+                if (n != args.len) continue;
+            } else if (!std.mem.eql(u8, ph, "<function>")) continue;
+            orEmitAudit(b, "prop_invoke_peer", "CallMemberOrGlobal", name0);
+            return try emitMemberOrGlobal(b, expr, tgt, false);
+        }
+    }
 
     // A known stdlib host-intrinsic global (alias) whose user overloads do not
     // apply to this call still resolves to the intrinsic global. In a receiver
@@ -18362,6 +18434,46 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
                                 }
                             }
                         }
+                    }
+                }
+            }
+            // A DECLARED bare-parameter return resolves in the CALLEE's own
+            // scope: the owner class's `<T : Bound>`. Kotlin types the call
+            // at the parameter's upper bound, so the bound IS the static
+            // type — `EagerScope<T : Number>` returning `T` is a Number to
+            // every caller, even one whose own `T` shadows the name with a
+            // different bound. A fn-level `<T>` stays unknown (its default
+            // bound Any names nothing useful).
+            if (f.return_ty_declared and bareTypeParamHead(f.return_ty.name) and
+                b.module.staticFuncTypeParamBound(fid, typeHead(std.mem.trimEnd(u8, f.return_ty.name, "?"))) == null)
+            {
+                const head = typeHead(std.mem.trimEnd(u8, f.return_ty.name, "?"));
+                if (b.module.registry.member_ext_owner_class.get(fid)) |ow| {
+                    const cbs = b.module.registry.class_type_param_bounds.get(ow) orelse blk_cb: {
+                        if (b.module.classIdByFqn(ow)) |cid| {
+                            if (cid.int() < b.module.classes.items.len) {
+                                break :blk_cb b.module.registry.class_type_param_bounds.get(b.module.classes.items[cid.int()].fqn) orelse &.{};
+                            }
+                        }
+                        break :blk_cb &.{};
+                    };
+                    for (cbs) |cb| {
+                        if (!std.mem.eql(u8, cb.param, head)) continue;
+                        const bh = typeHead(std.mem.trimEnd(u8, cb.bound, "?"));
+                        if (bh.len <= 2 or std.mem.eql(u8, bh, "Any") or
+                            std.mem.eql(u8, bh, "kotlin.Any") or b.isTypeParam(bh) or
+                            ir.parseClassTypeParamIdentity(bh) != null) break;
+                        var out = ir.TypeRef{
+                            .name = try b.allocator.dupe(u8, std.mem.trimEnd(u8, cb.bound, "?")),
+                            .nullable = f.return_ty.nullable or safe_call,
+                            .args = &.{},
+                        };
+                        if (staticTypeClassId(b, out) == null) {
+                            out.deinit(b.allocator);
+                            break;
+                        }
+                        if (agreed) |*old| old.deinit(b.allocator);
+                        return out;
                     }
                 }
             }

@@ -166,8 +166,43 @@ fn writeBarrierSlow(h: *GcHeader) void {
     defer remembered_lock.unlock();
     if (h.gc_remembered) return;
     h.gc_remembered = true;
+    if (std.c.getenv("KLIO_GC_REMEMBER_TRACE") != null) {
+        std.debug.print("[gc-remember] h={*} gen={d} type={s} program_started={}\n", .{ h, h.gc_gen, h.gc_type, program_started });
+    }
     remembered.append(std.heap.page_allocator, h) catch
         @panic("KGC: remembered set allocation failed");
+}
+
+/// Drain the remembered set outside a collection: clear every flag and empty
+/// the list. A program boundary that frees permanent cells wholesale (the
+/// in-process drivers' `vm.deinit`) must call this FIRST — permanent cells
+/// are never swept, so entries pointing at them outlive the cells otherwise,
+/// and the next collection's drain writes through freed memory.
+pub fn drainRemembered() void {
+    remembered_lock.lock();
+    defer remembered_lock.unlock();
+    for (remembered.items) |h| h.gc_remembered = false;
+    remembered.clearRetainingCapacity();
+}
+
+/// Diagnostic (`KLIO_GC_REMEMBER_TRACE`): probe every remembered entry's page
+/// with msync and report entries whose backing is no longer mapped, tagged by
+/// call site. Finds the phase that freed a remembered cell's storage.
+pub fn validateRemembered(tag: []const u8) void {
+    if (std.c.getenv("KLIO_GC_REMEMBER_TRACE") == null) return;
+    remembered_lock.lock();
+    defer remembered_lock.unlock();
+    const pg = std.heap.pageSize();
+    var bad: usize = 0;
+    for (remembered.items) |h| {
+        const base = std.mem.alignBackward(usize, @intFromPtr(h), pg);
+        const rc = std.os.linux.msync(@ptrFromInt(base), pg, std.os.linux.MSF.ASYNC);
+        if (rc != 0) {
+            bad += 1;
+            std.debug.print("[gc-validate] {s}: UNMAPPED h={*}\n", .{ tag, h });
+        }
+    }
+    std.debug.print("[gc-validate] {s}: n={d} bad={d}\n", .{ tag, remembered.items.len, bad });
 }
 
 /// Collection-trigger floor in bytes. A collection is requested once this many
@@ -691,15 +726,26 @@ fn collectImpl(force_major: bool) void {
     // Minor: re-trace every tenured cell mutated since promotion — its
     // children may be nursery cells the root scan cannot otherwise reach.
     // Traced directly (not shaded): tenured cells are outside a minor sweep.
+    // Under the lock: a thread in a blocking-safe region is NOT parked by
+    // the stop-the-world handshake, and its write barrier may append (and
+    // resize) the list while the collector walks it.
     if (!major) {
+        remembered_lock.lock();
         for (remembered.items) |h| h.gc_trace(h, &marker);
+        remembered_lock.unlock();
     }
     const marked = marker.drainCounted();
     // Drain the remembered set under both kinds: after a minor every survivor
     // is tenured (old→young edges became old→old); after a major the fresh
     // full mark subsumes it. Cleared before the sweep so no entry dangles.
+    remembered_lock.lock();
+    if (std.c.getenv("KLIO_GC_REMEMBER_TRACE") != null) {
+        std.debug.print("[gc-drain] n={d} major={} program_started={}\n", .{ remembered.items.len, major, program_started });
+        for (remembered.items) |h| std.debug.print("[gc-drain]   h={*}\n", .{h});
+    }
     for (remembered.items) |h| h.gc_remembered = false;
     remembered.clearRetainingCapacity();
+    remembered_lock.unlock();
 
     const freed = if (major) sweepFull() else sweepMinor();
     // Reclaim closure side-table metadata for slots no live value marked this

@@ -615,6 +615,10 @@ pub fn ObjRef(comptime T: type) type {
         /// destroy the control block. Child cells are swept independently.
         fn gcFinalizeThunk(h: *gc.GcHeader) void {
             const cb: *Cell = @fieldParentPtr("hdr", h);
+            if (h.gc_remembered and std.c.getenv("KLIO_GC_REMEMBER_TRACE") != null) {
+                std.debug.print("[gc-freed-remembered] SWEEP h={*} type={s}\n", .{ h, h.gc_type });
+                trace.dumpCurrent(.{});
+            }
             if (gc.gc_poison) {
                 // Quarantine instead of free: keep the memory mapped, scribble
                 // the payload, and arm the trap so a later live reference is
@@ -690,6 +694,10 @@ pub fn ObjRef(comptime T: type) type {
                 // other handles so all their writes happen-before this
                 // free (Arc's drop ordering).
                 _ = self.cell.refcount.load(.acquire);
+                if (self.cell.hdr.gc_remembered and std.c.getenv("KLIO_GC_REMEMBER_TRACE") != null) {
+                    std.debug.print("[gc-freed-remembered] RC h={*} type={s}\n", .{ &self.cell.hdr, @typeName(T) });
+                    trace.dumpCurrent(.{});
+                }
                 const allocator = self.cell.allocator;
                 if (comptime owns_bytes) {
                     // The cell owns its string bytes (see `init`); free them.
