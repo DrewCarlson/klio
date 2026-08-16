@@ -277,12 +277,14 @@ validatePotentialDeadlock (pump fairness for virtual-time drains).
       NOTE: the cached ratchet binary was pruned with the zig cache;
       ratchet now runs via `zig build itest-compose_plugin_commontest`
       (source floor 1365).
-- [ ] E2. hangbisect3 hang: foreign private stored field + async in an
-      interface default member parks both coroutines forever
-      (pre-existing; standalone repro in scratchpad
-      reprosrc/hangbisect3.kt). Suspect: the sgetter member-probe
-      rejection (an errRes) unwinding through a suspend frame without
-      completing the coroutine.
+- [x] E2. hangbisect3 hang RESOLVED: the repro (foreign private stored
+      field + async in an interface default member) now prints `open`,
+      stable across repeated runs. The fix rode the zip landing —
+      `async(context, start, block)` has exactly the produce shape the
+      trailing-lambda-blind extension-arity filter dropped, and with
+      every overload gone a lenient tail mis-bound the call; the
+      sgetter suspicion was a downstream symptom. Guard
+      examples/interface_private_shadow_async.kt.
 - [ ] E3. Pump fairness: a virtual-time drain must be able to observe
       the queue empty even when an interpreted worker always wins the
       repost race. Unlocks RecomposerTests.validatePotentialDeadlock
