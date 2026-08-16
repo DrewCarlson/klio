@@ -862,6 +862,23 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     }
                 }
             }
+            // The innermost implicit receiver declaring `name` as a member
+            // outranks every top-level pick: kotlinc binds `::proceed`
+            // inside `intercept { handler(context, ::proceed) }` to the
+            // pipeline context, not a same-named global. Stdlib alias
+            // intrinsics keep their global form (a receiver class does not
+            // shadow `::minOf`-style refs it never declares).
+            if (!ir.isAliasName(pr.name.name)) receiver_member: {
+                const rh = b.recvTy() orelse break :receiver_member;
+                const cid = (b.module.uniqueClassIdBySimpleName(rh) orelse
+                    b.module.classIdByFqn(rh)) orelse break :receiver_member;
+                if (!b.module.classHierarchyDeclaresMember(cid, pr.name.name))
+                    break :receiver_member;
+                if (try resolveThisRegKind(b, true, false)) |this_reg| {
+                    try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = this_reg, .name = nm } });
+                    return dst;
+                }
+            }
             const is_tracked = b.resolve(pr.name.name) != null or isTopLevelProp(pr.name.name);
             // A same-named enclosing member only shadows the global for `::name`
             // when it could actually be the referenced callable: if the use
@@ -946,7 +963,11 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 // `@Test`, which `::minOf` here can never refer to.
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
             } else if (!is_tracked) {
-                if (try resolveThisReg(b)) |this_reg| {
+                // Lambda-aware: a receiver lambda's `this` lives in the
+                // capture slot the runtime receiver-binding fills, so a bare
+                // `::proceed` inside `intercept { handler(context, ::proceed) }`
+                // binds the pipeline context, not a KProperty shell.
+                if (try resolveThisRegKind(b, true, false)) |this_reg| {
                     // Inside a MEMBER EXTENSION the frame's `this` is the
                     // extension receiver; a `::name` referencing an OWNER
                     // member must bind the dispatch receiver instead

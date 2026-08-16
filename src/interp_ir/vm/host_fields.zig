@@ -1046,8 +1046,23 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     // A concrete stored override is itself the virtual
                     // implementation of the property. Stop before an inherited
                     // computed getter and let the ordinary field path select
-                    // the override's backing cell.
-                    if (stored_here) {
+                    // the override's backing cell — UNLESS the stored field is
+                    // a foreign class's PRIVATE property, which never
+                    // participates in override dispatch (ktor:
+                    // HttpClientEngineBase's private `closed = atomic(false)`
+                    // must not answer the HttpClientEngine interface's own
+                    // private computed `closed`).
+                    const stored_foreign_private = stored_here and
+                        !std.mem.eql(u8, cn, owner) and blk: {
+                        const pg = self.prog.borrow();
+                        defer pg.deinit();
+                        break :blk lookupPairFunc(pg.get().instance_prop_private, cn, prop) != null;
+                    };
+                    if (missTraceEnvCached()) |w| {
+                        if (std.mem.eql(u8, w, prop))
+                            std.debug.print("[sgw] cn={s} stored={} foreign_priv={}\n", .{ cn, stored_here, stored_foreign_private });
+                    }
+                    if (stored_here and !stored_foreign_private) {
                         const r = try getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
                         if (r == .ok and sgetterMemoSafe(self, className(receiver.Instance), rest, owner, prop)) {
                             sgetterCopyMemo(self, receiver, prop, name);
@@ -1094,7 +1109,18 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             // genuinely owns (a scope receiver's own member) and otherwise
             // reports a probe miss so the resolver continues to the enclosing
             // `owner` receiver further out.
-            const owner_applies = !member_probe or receiver.isRuntimeType(owner);
+            const owner_applies = !member_probe or receiver.isRuntimeType(owner) or
+                (receiver.* == .Instance and blk: {
+                    // The value-level runtime-type check misses native-backed
+                    // and pack-loaded subtype chains (KlioClientEngine IS an
+                    // HttpClientEngine only through the module walk); without
+                    // this the owner's getter was skipped and the plain field
+                    // fallback below read a base class's PRIVATE stored field.
+                    const rcn0 = className(receiver.Instance);
+                    const mg0 = self.module.borrow();
+                    defer mg0.deinit();
+                    break :blk mg0.get().classIsOrExtends(rcn0, owner);
+                } or host_call_member.receiverImplementsType(self, receiver, owner));
             if (owner_applies) {
                 const fid_opt = blk: {
                     const pg = self.prog.borrow();

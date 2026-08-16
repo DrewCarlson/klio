@@ -3210,6 +3210,20 @@ fn buildModuleWithOverrides(
                 (ef.ty orelse p.ty)
             else
                 p.ty;
+            // A PRIVATE stored property never participates in override
+            // dispatch (same rule as private accessors below): record it so
+            // the virtual property walk can skip a foreign class's private
+            // field — ktor's `HttpClientEngineBase.closed = atomic(false)`
+            // must never answer the HttpClientEngine interface's own
+            // private computed `closed`.
+            if (p.visibility == .Private and p.getter == null) {
+                const priv_fid = FuncId.from(0);
+                try instance_prop_private.put(.{ .a = c.name.name, .b = p.name.name }, priv_fid);
+                const cfqn_priv = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
+                if (!std.mem.eql(u8, cfqn_priv, c.name.name)) {
+                    try instance_prop_private.put(.{ .a = cfqn_priv, .b = p.name.name }, priv_fid);
+                }
+            }
             if (storage_init) |init| {
                 const nm = try std.fmt.allocPrint(a, "__init_prop_{s}_{s}", .{ c.name.name, p.name.name });
                 const fid = try ir.lower.lowerPropertyInitExpr(module, c.name.name, &own_members, body_enclosing, prop_init_params.items, body_prop_param_types, init, nm, storage_init_ty);

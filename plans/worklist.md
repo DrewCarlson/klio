@@ -174,9 +174,39 @@ validatePotentialDeadlock (pump fairness for virtual-time drains).
       examples/member_ext_prop_visibility.kt (kotlinc/JVM-verified
       shadow/tower/import surface). Ratchet 1372-1373 observed, floor
       trimmed to 1365 (pre-change peak 1375 is inside the ±3 band).
-- [ ] C3. ktor server/client e2e itests against the widened pack
-      includes — the CI-gate surface the commontest census does not
-      cover (devloop memory notes the risk).
+- [ ] C3. ktor server/client e2e itests: client GET works END-TO-END
+      (status=200) — itest-ktor_client_get 4/4 and channel_async PASS
+      after peeling five pre-existing roots, each with a
+      kotlinc-verified guard example:
+      1. Stored-lambda receiver seating: a `{ scope -> … }` lambda
+         stored through a generic slot (`plugins[key] = …`) and
+         replayed via `receiver.apply(it)` / `handler(recv, arg)` now
+         seats the receiver positionally when the declared arity says
+         so (unknown-shape closures; headerless speculative-`it`
+         blocks excluded — that exclusion also protects suspend-lambda
+         starts whose (receiver, completion) pair must not split).
+         examples/stored_lambda_receiver_seat.kt.
+      2. `::proceed` inside a receiver lambda binds the receiver's
+         member through the capture slot the runtime receiver-binding
+         fills (was a KProperty shell / a global miss).
+         examples/receiver_member_callable_ref.kt.
+      3. The innermost receiver's member outranks a top-level pick for
+         bare `::name` refs (stdlib alias intrinsics excluded).
+      4. A foreign class's PRIVATE stored field never answers another
+         class's private computed property: stored privates now
+         register in instance_prop_private, the sgetter virtual walk
+         skips them, and owner_applies uses the module-walk ownership
+         test (the value-level check misses pack-loaded chains).
+         examples/private_stored_no_override.kt.
+      5. Pack include: ktor-client-core jvmAndPosix
+         `checkContentLength` actual.
+      REMAINING: itest-ktor_server routing test — pre-existing at the
+      prior commit too — dies dispatching `status` on
+      RoutingPipelineResponse: the walk reaches the delegate
+      (KlioApplicationResponse) but misses the inherited
+      BaseApplicationResponse.status overloads. Also recorded:
+      hangbisect3 shape (foreign private stored + async in interface
+      default member) hangs pre-existing — parks both coroutines.
 
 ## Phase D — Watches (no active work; act when they fire)
 
