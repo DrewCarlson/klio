@@ -15,6 +15,6 @@ test "kotlinx.io commonTest pass count holds at or above the ratchet baseline" {
             .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
             .{ .dir = "kotlin-klio/klio-kotlinx-io", .artifact = "target/packs/kotlinx.io.klio-pack" },
         },
-        .baseline = 1050,
+        .baseline = 1140,
     });
 }

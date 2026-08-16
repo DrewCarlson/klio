@@ -16,6 +16,6 @@ test "kotlinx.datetime commonTest pass count holds at or above the ratchet basel
             .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
             .{ .dir = "kotlin-klio/klio-kotlinx-datetime", .artifact = "target/packs/kotlinx.datetime.klio-pack" },
         },
-        .baseline = 70,
+        .baseline = 205,
     });
 }

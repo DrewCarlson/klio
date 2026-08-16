@@ -2483,7 +2483,7 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
         // internal `class Stack`) carries the pass-appended ($composer,
         // $changed) pair the ctor-shaped call site never wrote. With a
         // composer ambient, complete the pair and re-pick.
-        if (host_call_func.composePluginEnabled()) {
+        {
             if (@import("compose.zig").currentComposer()) |c| {
                 var ext: std.ArrayList(Value) = .empty;
                 defer ext.deinit(allocator);

@@ -15,6 +15,6 @@ test "kotlinx.serialization commonTest pass count holds at or above the ratchet 
             .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
             .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
         },
-        .baseline = 6,
+        .baseline = 9,
     });
 }

@@ -543,7 +543,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     // composer per the Compose plugin ABI, so upstream's real Composer/SlotTable
     // runs. This is the only compose path. The oracle spans this module's decls
     // plus the baked base (pack composables the user calls, e.g. `Text`).
-    if (composePluginEnabled()) {
+    {
         // A/B gate for the skip emission (pace/correctness bisection).
         if (runtime.envOnce("KLIO_COMPOSE_SKIP")) |v| {
             compose_pass.emit_skip_calculus = v.len != 0 and !std.mem.eql(u8, v, "0");
@@ -920,7 +920,7 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         base,
         out_lifted,
     );
-    if (composePluginEnabled() and compose_pass.composeAuditOn()) {
+    if (compose_pass.composeAuditOn()) {
         const ca = &compose_pass.compose_audit;
         std.debug.print(
             "[KLIO_RESOLVE_AUDIT] compose summary (cumulative): agree={d} pair-stripped={d} pair-completed={d} lambda-arity={d} disagreements={d}\n",
@@ -5040,15 +5040,9 @@ fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, allow_main: b
     // A non-inline base function never runs from its AST body (its lowered IR
     // does); strip those bodies so the baked image and the resident forest drop
     // the dead statement trees while keeping the metadata dispatch reads.
-    prune.stripDeadBodies(@constCast(base.lifted_decls), composePluginEnabled());
+    prune.stripDeadBodies(@constCast(base.lifted_decls), true);
 
     return base;
-}
-
-/// The `@Composable` lowering plugin is the only compose path (no implicit
-/// fallback), so it always runs.
-fn composePluginEnabled() bool {
-    return true;
 }
 
 /// Add the simple names of every `@Composable` function in the baked base

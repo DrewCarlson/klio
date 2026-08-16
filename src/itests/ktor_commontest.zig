@@ -20,6 +20,6 @@ test "ktor commonTest pass count holds at or above the ratchet baseline" {
             .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
             .{ .dir = "kotlin-klio/klio-ktor", .artifact = "target/packs/io.ktor.klio-pack" },
         },
-        .baseline = 0,
+        .baseline = 440,
     });
 }

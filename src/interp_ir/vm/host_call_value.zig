@@ -225,7 +225,7 @@ fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, cap
     }
     vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
     var composer_pushed = false;
-    if (host_call_func.composePluginEnabled()) {
+    {
         if (compose.threadedComposerArgFor(func.fqn, func.params, call_args.items)) |c| {
             compose.pushComposer(c);
             composer_pushed = true;
@@ -634,9 +634,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // overloads declare. With a composer ambient, complete the pair
         // and retry — the type-directed emission kotlinc performs from the
         // value's declared `@Composable` fn type.
-        if (inv == .err and inv.err == .Unimplemented and callee_is_cli and
-            host_call_func.composePluginEnabled())
-        {
+        if (inv == .err and inv.err == .Unimplemented and callee_is_cli) {
             if (compose.currentComposer()) |comp| {
                 if (runtime.freeScratch()) {
                     const m = inv.err.Unimplemented;
@@ -980,7 +978,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // the registered local-fn default thunks — positional Null-padding
         // shoved the composer into `a` and the changed flags into
         // `$composer`.
-        if (host_call_func.composePluginEnabled() and func.params.len >= 2 and
+        if (func.params.len >= 2 and
             args.len >= 2 and args.len < info.n_params and
             std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
             std.mem.eql(u8, func.params[func.params.len - 2].name, "$composer") and
@@ -1023,7 +1021,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             try re.append(allocator, args[args.len - 1]);
             return callValue(self, allocator, callee, re.items);
         }
-        if (host_call_func.composePluginEnabled() and func.params.len >= 2 and
+        if (func.params.len >= 2 and
             args.len + 2 == info.n_params and
             std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
             std.mem.eql(u8, func.params[func.params.len - 2].name, "$composer"))
@@ -1165,7 +1163,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // feeding an `R.()` block), so a pair-tailed closure with a `this`
         // capture infers the receiver there; padding the receiver into the
         // `$composer` slot is never right.
-        const pair_tailed = host_call_func.composePluginEnabled() and
+        const pair_tailed =
             func.params.len >= 2 and
             std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
             std.mem.eql(u8, func.params[func.params.len - 2].name, "$composer");
@@ -1398,7 +1396,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // `$composer` argument as the ambient composer, exactly like the
         // named-call path: a `@Composable` property getter reached from the
         // body reads it via `__compose_currentComposer`.
-        if (host_call_func.composePluginEnabled()) {
+        {
             if (compose.threadedComposerArgFor(func.fqn, func.params, call_args.items)) |c| {
                 compose.pushComposer(c);
                 defer compose.popComposer();

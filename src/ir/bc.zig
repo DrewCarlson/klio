@@ -99,12 +99,28 @@ var cache: ?std.AutoHashMap(usize, *const FuncStreams) = null;
 /// that frees a program's module and runs another reuses those addresses,
 /// and a stale hit executes the PREVIOUS program's compiled stream against
 /// the new instructions (a tag-mismatch panic at best). Called from the
-/// per-program cache reset; entries leak by design (code-cache data has no
-/// per-stream ownership records worth building for a test driver).
+/// per-program cache reset. Entries free their streams outright — the
+/// differential driver runs the whole corpus in one process, and leaked
+/// tables walked it into the RSS cap.
 pub fn resetCacheForTest() void {
     cache_mutex.lock();
     defer cache_mutex.unlock();
-    if (cache) |*c| c.clearRetainingCapacity();
+    const c = if (cache) |*cc| cc else return;
+    const a = std.heap.smp_allocator;
+    var it = c.valueIterator();
+    while (it.next()) |fs_p| {
+        const fs = fs_p.*;
+        for (fs.streams) |slot| {
+            if (slot) |st| {
+                a.free(st.code);
+                a.free(st.idx_pc);
+                a.destroy(st);
+            }
+        }
+        a.free(fs.streams);
+        a.destroy(fs);
+    }
+    c.clearRetainingCapacity();
 }
 
 /// `allow_fuse` is process-constant (the loop JIT's enablement); the

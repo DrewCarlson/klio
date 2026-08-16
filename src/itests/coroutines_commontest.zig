@@ -17,6 +17,6 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         },
         // 237 pass when the suite runs alone (was 118 before `yield` reached its
         // dispatcher); the ratchet leaves headroom for the loaded `test-all`.
-        .baseline = 220,
+        .baseline = 340,
     });
 }

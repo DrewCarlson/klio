@@ -452,7 +452,6 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
 /// invoked without the pair completes it from the ambient composer inside
 /// `callValue`, so arity checks must accept the pair-less shape too.
 fn closurePairTailed(self: *VmHost, info: anytype) bool {
-    if (!host_call_func.composePluginEnabled()) return false;
     const module: *const Module = info.module orelse self.module.asPtr();
     const func = module.funcById(info.body_func) orelse return false;
     return func.params.len >= 2 and
@@ -3377,7 +3376,7 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
         // pair-trimmed — the mid-vararg check otherwise refuses on the
         // undefaulted pair params. Only when the tail VALUES look like the
         // pair (a Composer instance + the changed Int).
-        if (host_call_func.composePluginEnabled() and effective.len >= 2 and
+        if (effective.len >= 2 and
             std.mem.eql(u8, effective[effective.len - 1].name, "$changed") and
             std.mem.eql(u8, effective[effective.len - 2].name, "$composer"))
         {
@@ -3757,7 +3756,7 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
     // same completion for a wrapper CLASS whose only matching `invoke`
     // overload carries the trailing pair.
     if (r == .err and r.err == .Unimplemented and receiver.* == .Instance and
-        std.mem.eql(u8, name, "invoke") and host_call_func.composePluginEnabled())
+        std.mem.eql(u8, name, "invoke"))
     {
         if (missTraceWant(name)) std.debug.print("[inv-pair] reach recv={s} nargs={d} composer={} wants={}\n", .{ receiver.typeFqn(), args.len, compose.currentComposer() != null, instanceInvokeWantsPair(self, receiver, args.len) });
         if (compose.currentComposer()) |c| {
@@ -4261,10 +4260,7 @@ fn prepareFlatFromFid(self: *VmHost, allocator: Allocator, receiver: *const Valu
         checkReceiverChain(self, allocator, "irMethodWalk", receiver, null);
     }
     vmhost.emitPath(allocator, "member_ir_walk", f.fqn, f.id, receiver, args);
-    const threaded: ?Value = if (host_call_func.composePluginEnabled())
-        compose.threadedComposerArg(f.params, args)
-    else
-        null;
+    const threaded: ?Value = compose.threadedComposerArg(f.params, args);
     if (threaded) |c| compose.pushComposer(c);
     return .{
         .func = f,
@@ -5971,7 +5967,7 @@ fn composeMemberPairRetry(self: *VmHost, allocator: Allocator, receiver: *const 
     _ = static_recv;
     _ = no_ext;
     _ = declared_recv;
-    if (strict_ext or !host_call_func.composePluginEnabled()) return null;
+    if (strict_ext) return null;
     const comp = compose.currentComposer() orelse return null;
     // A retried dispatch already carries the pair this completion appended;
     // recognize it by the ambient composer's identity in the second-to-last
@@ -10967,10 +10963,7 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     // stack. A member `f.params` carries the receiver as an explicit leading
     // `this` param, while `args` is receiver-excluded — `threadedComposerArg`
     // handles that alignment.
-    const threaded_composer: ?Value = if (host_call_func.composePluginEnabled())
-        compose.threadedComposerArg(f.params, args_in)
-    else
-        null;
+    const threaded_composer: ?Value = compose.threadedComposerArg(f.params, args_in);
     if (threaded_composer) |c| compose.pushComposer(c);
     defer if (threaded_composer != null) compose.popComposer();
 
@@ -10981,7 +10974,7 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     var pair_ext: ?[]Value = null;
     defer if (pair_ext) |pe| if (runtime.freeScratch()) allocator.free(pe);
     var args = args_in;
-    if (host_call_func.composePluginEnabled() and f.params.len >= 2 and
+    if (f.params.len >= 2 and
         std.mem.eql(u8, f.params[f.params.len - 1].name, "$changed") and
         std.mem.eql(u8, f.params[f.params.len - 2].name, "$composer") and
         args.len + 3 <= f.params.len and threaded_composer == null)
@@ -14252,9 +14245,7 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
     // Compose ABI completion on the explicit `.invoke()` route — same
     // completion `callMember` applies (the two entries do not share a
     // miss tail).
-    if (receiver.* == .Instance and std.mem.eql(u8, name, "invoke") and
-        host_call_func.composePluginEnabled())
-    {
+    if (receiver.* == .Instance and std.mem.eql(u8, name, "invoke")) {
         if (compose.currentComposer()) |c| {
             if (instanceInvokeWantsPair(self, receiver, args.len)) {
                 freeDispatchMiss(allocator, primary);
