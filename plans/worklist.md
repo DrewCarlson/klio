@@ -231,7 +231,9 @@ validatePotentialDeadlock (pump fairness for virtual-time drains).
 
 ## Phase E — Next round (active; worked top to bottom)
 
-- [ ] E1. Free-win harvest + pack hygiene. IN PROGRESS:
+- [x] E1. Free-win harvest + pack hygiene. COMPLETE (both pack homes
+      rebuilt again after the receiver-head lowering landed, since
+      baked pack IR carries lowering output):
       - [x] Pack homes rebuilt on the new image layout (`~/.klio` all
             26 shipped packs, `.klio-local` via install-local-packs;
             both with KLIO_COMPOSE_PLUGIN=1; caches cleared). Corpus
