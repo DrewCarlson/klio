@@ -82,11 +82,40 @@ Ground rules carried forward:
 
 ## Track V — Validate
 
-- [ ] V1. Fresh red-set census FIRST: run `zig build test-all` and
-      `scripts/gate.sh` once on current main and enumerate the true
-      failure set (memory's failure lists have repeatedly gone stale in
-      both directions). Diff against the recorded baselines before
-      touching anything; everything below re-anchors on that census.
+- [x] V1. Fresh red-set census RUN (test-all, full log in session
+      scratchpad census_testall.log; red set distilled to redset.txt).
+      Result: 2452/2527 tests — 15 fail + 44 crash across 23 failed
+      steps, and the recorded assumptions were stale in BOTH directions:
+      - TWO itests did not even compile (e2e.zig missing runtime import
+        on a trace line; stdlib_image bool-result ignored) — nobody had
+        run test-all in a long while. Both fixed.
+      - check_examples: the resolver's REDECLARATION check keyed
+        signatures without vararg-ness, so `select(vararg values: Int)`
+        vs `select(value: Int)` — legal overloads — flagged as
+        duplicates. Fixed (vararg marker in the sig key); suite green.
+      - THE BIG ONE: a deterministic SEGFAULT family across the parity
+        itest drivers — 44 crashes (parity_inner_classes 12/24,
+        parity_corpus_pinned ~19, data_class_features 3, generics,
+        inheritance, fuzz, differential...). All crash in
+        `declaringClassSimpleName` iterating `module.classes.items`
+        with a garbage Class entry, from a bare call inside an anon
+        method (`frame.module` = the anon registry's module ref).
+        PRE-EXISTS this work (bisect worktree at the previous session
+        start crashes identically 12/24). The same programs pass via
+        `klio run` — the crash is specific to the parity in-process
+        driver + base-image path. ONE root, ~40 reds.
+      - Suites ABOVE their baselines (raise in V2): coroutines 350 vs
+        220, io 1157 vs 1050, serialization 9 vs 6, datetime 212 vs 70,
+        atomicfu 63 (4 fails under census load), ktor 448/2 under load
+        (465/2 recorded solo), compose plugin 1373 vs 1365.
+      - Singles to triage: ktor_server start(wait=false) daemon-abandon
+        test, resolve_ambiguity default-param twins (2),
+        parity_threaded_litmus suite-completeness + eager parity,
+        parity_lambdas_and_dispatch member_prop_invoke shadow,
+        atomicfu locks_run_uncontended, explicit_backing_fields 1,
+        one load-flaky unit binary (75/75 solo).
+      Remaining census follow-through: gate.sh after the parity crash
+      fix (its litmus phase includes the crashing suites).
 - [ ] V2. Make the ratchets ratchet:
       - src/itests/ktor_commontest.zig has `.baseline = 0` — it can never
         fail. Set it to the census floor (last recorded 465 passed / 2
