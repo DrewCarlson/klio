@@ -973,11 +973,16 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
     }
 
     // Trailing-lambda rule: the last arg binds out of sequence to the last
-    // function-typed parameter, provided the gap is all-defaulted.
+    // function-typed parameter, provided the gap is all-defaulted. A shape
+    // this convention cannot bind — a non-defaulted gap, or a lambda the
+    // last parameter's type refuses — FALLS THROUGH to the plain positional
+    // fill below rather than rejecting the candidate: `render({..}, {..})`
+    // against `(leading, trailing, plain = null)` binds positionally with
+    // the tail defaulted, and only the out-of-sequence reading fails.
     if (params.len > args.len and args.len > 0 and
         isFunctionTypeRef(&params[params.len - 1].ty) and
         args[args.len - 1].is_lambda)
-    {
+    trailing: {
         const lead = args.len - 1;
         const last_param = params.len - 1;
         if (lead <= last_param) {
@@ -989,17 +994,17 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
                     break;
                 }
             }
-            if (!gap_defaulted) return null;
+            if (!gap_defaulted) break :trailing;
             var total: i32 = -1;
             var proven: u16 = 0;
             var unknown: u16 = 0;
             var k: usize = 0;
             while (k < lead) : (k += 1) {
-                const sc = scoreArg(sig, &params[k].ty, &args[k], &scope) orelse return null;
+                const sc = scoreArg(sig, &params[k].ty, &args[k], &scope) orelse break :trailing;
                 total += sc;
                 if (argIsProven(&args[k])) proven += 1 else unknown += 1;
             }
-            const ls = scoreArg(sig, &params[last_param].ty, &args[lead], &scope) orelse return null;
+            const ls = scoreArg(sig, &params[last_param].ty, &args[lead], &scope) orelse break :trailing;
             total += ls;
             if (argIsProven(&args[lead])) proven += 1 else unknown += 1;
             return .{
@@ -2299,3 +2304,23 @@ test "applicable named: defaulted trailing param stays fillable for named Int ar
     try testing.expect(applicable(&.{ .params = &factory }, &args, .{ .named = true }) != null);
 }
 
+
+test "applicable: unbindable trailing-lambda reading falls through to the positional fill" {
+    // `render({..}, {..})` against `(leading: (Int) -> Unit,
+    // trailing: (Int, String) -> Unit, plain: ((Int) -> Int)? = null)`:
+    // the out-of-sequence trailing reading needs the gap param `trailing`
+    // defaulted (it is not), so the positional fill must still bind —
+    // leading and trailing positionally, `plain` from its default.
+    const p = [_]Param{
+        .{ .name = "leading", .ty = tref("Function1"), .default = null },
+        .{ .name = "trailing", .ty = tref("Function2"), .default = null },
+        .{ .name = "plain", .ty = tref("Function1"), .default = null, .has_default = true },
+    };
+    const sig = SigView{ .params = &p };
+    const args = [_]ArgShape{
+        .{ .is_lambda = true, .lambda_arity = 1, .lambda_is_literal = true },
+        .{ .is_lambda = true, .lambda_arity = 2, .lambda_is_literal = true },
+    };
+    const sc = applicable(&sig, &args, .{}).?;
+    try testing.expect(sc.binding.trailing_lambda_param == null);
+}

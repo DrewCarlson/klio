@@ -151,6 +151,31 @@ Ground rules carried forward:
         prior baseline commit); current failure mode is the 6.5GB RSS
         cap across corpus x load modes in one process — an A5 memory
         acceptance target, not a quick fix.
+      - e2e (post-gate follow-through; all three roots pre-existing —
+        the suite had not compiled since before the session start):
+        - GP faults across the corpus: the parity driver flipped
+          `alloc_perm = false` BEFORE `Vm.fromBuilt`, minting
+          VM-structural cells (closure spine, output sink) as NURSERY
+          while `gcMarkAllVms` deliberately does not shade them — the
+          first mid-run major swept them and later borrows read freed
+          memory (`reclaimDead` GP, `Output.writeln` GP). Fixed by
+          restoring the perm invariant: `vmRun` closes the permanent
+          generation itself, same as the CLI.
+        - positional_lambda_binding mismatch: the scorer's
+          trailing-lambda arm REJECTED the whole candidate when the
+          out-of-sequence reading could not bind (non-defaulted gap),
+          instead of falling through to the plain positional fill.
+          The CLI masked it via the eager typeck map; the base-backed
+          driver has no eager map and fell to the value route, whose
+          binder gapped `trailing` with Null. Scorer arm now falls
+          through (unit test added; examples/positional_lambda_binding
+          is the e2e guard). Known residual mis-ordering recorded: with
+          a fully-defaulted gap the arm still prefers the trailing
+          reading over positional for parenthesized args.
+        - Residual RSS creep: full corpus in one process peaks ~35MB
+          over the 6.5GB cap — the A5 target; per-program VM-structural
+          cells now leak by design (perm) until an explicit boundary
+          release exists.
       - Singles, all closed:
         - threaded_litmus 45/45: manifest additions committed; the eager
           parity fail was the plus static commit lost to the advisory

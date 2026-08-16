@@ -2083,9 +2083,13 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
         built.deinit();
         return .{ .err = try allocator.dupe(u8, "no main function in module") };
     };
-    // VM-owned cells are nursery allocations. No GC safe point runs between
-    // construction and `Vm.run`, where the VM is registered as a root.
-    if (gc_run) runtime.gc.alloc_perm = false;
+    // VM-structural cells (the class graph, globals table, closure spine,
+    // output sink) must be PERMANENT: `gcMarkAllVms` deliberately does not
+    // shade the closure spine (a strong root there leaked every capture), and
+    // it never shades the output sink at all — a nursery-minted spine or sink
+    // is swept by the first mid-run major and every later borrow reads freed
+    // memory. `vmRun` closes the permanent generation itself right before the
+    // program body, exactly like the CLI path.
     const vm_allocator = if (gc_run) runtime.slab.allocator else arena;
     const pair = try interp_ir.Vm.fromBuilt(vm_allocator, &built);
     built.deinit();
