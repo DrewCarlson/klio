@@ -3853,6 +3853,20 @@ pub fn resetAnonSiteCache() void {
         }
         anon_site_thunks.clearAndFree(pa);
     }
+    // The shared side-module clone must not cross a program boundary: its
+    // identity gate compares run-module CELL ADDRESSES, and an arena-reusing
+    // driver hands the next program's module the same address — the stale
+    // clone then serves classes whose shallow-shared method slices point
+    // into the finished program's freed storage.
+    if (shared_anon_module != null) {
+        runtime.gc.forgetCell(&shared_anon_module.?.cell.hdr);
+        shared_anon_module = null;
+        if (shared_anon_arena) |holder| {
+            holder.deinit();
+            std.heap.page_allocator.destroy(holder);
+            shared_anon_arena = null;
+        }
+    }
 }
 
 /// Publish a site's thunks (first publisher wins). A racing second build of the
