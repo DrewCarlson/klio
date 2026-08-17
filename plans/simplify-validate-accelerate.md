@@ -118,6 +118,57 @@ Ground rules carried forward:
       + 31 out), the stdlib ladder (468 lines, cost 20) and the cache tier
       (175 lines, cost 15 — and `tl_perm_cache`/`tl_resolve_cache` are read
       from outside it, so it cannot move without splitting state).
+      LANDING 3: eval.zig 12893 -> 9628. The call-shaped exec arms and the
+      member/global dispatch route (77 decls: the call arms — plain, value,
+      spread, super, virtual, member-or-value, context — the
+      instance/lambda/class arms that build a receiver, the implicit-`this`
+      and global load/store arms, `execCallMemberOrGlobal` and the
+      implicit-receiver candidate walk that feeds it with its SAM-invoke
+      and companion tiers, the argument readers, and the index / subscript
+      / primitive-member fast paths) moved verbatim into
+      `src/ir/exec_call.zig` (3373 lines). 3310 lines move in six blocks;
+      the cut costs 42 exported entry points and 11 parent internals plus
+      `Frame.read`/`Frame.write` `pub` for the alias block back — 53 newly
+      `pub` decls, ~61 lines per `pub` added — and the parent re-aliases
+      every entry point so its call sites and its ten test blocks are
+      untouched. Zero module-level state crosses the boundary: the file's
+      two audit/trace gates (`or_audit_*`, `route_trace_*`) move whole, and
+      every other counter, cache and threadlocal — `evtls` above all —
+      stays single-copy in eval.zig. `execArmCallMember` is the one decl in
+      the moved region that reads `evtls`, so it stays in the parent; the
+      A2 no-fill register work (`Func.frameNoFill`, the written mask,
+      `materializeRegs`) and the activation/resume path are untouched on
+      both sides.
+      Verbatimness proved mechanically: with the scaffolding (child doc
+      header + import preamble + alias block, parent import + entry alias
+      block) and the added `pub` keywords stripped, each side is an
+      order-preserving subsequence of HEAD's file (diff opcodes are
+      equal/delete only) and the two line multisets partition it exactly —
+      9584 kept + 3310 moved = 12894, no collapsed separators.
+      Wall time is unchanged — the split is inside one Zig module, so the
+      compiler still sees one compilation unit. A/B on the ReleaseSafe
+      harness over the state-list + channel benchmark: 3510 / 3328 / 3366
+      ms per rep before, 3492 / 3336 / 3330 after.
+      MEASURED CEILING for eval.zig: a call graph over its 444 top-level
+      decls — 54 of them module-level mutable state, including the
+      threadlocal `evtls`, the frame roots, the regs/args pools, the
+      native table, the suspend-liveness caches and the profiling counters
+      — scored by closure and by lines moved per newly-added `pub`, with
+      any cluster that leaves a state reference crossing the boundary
+      rejected outright. Best zero-state contiguous window anywhere tops
+      out at ~110 lines per `pub` but only 878 lines wide; growing by
+      closure is what buys volume. Rejected with numbers (moved lines /
+      newly-`pub` / state crossings): the whole `execArm*` family
+      (2343 / 80 / 1 — `evtls`), the whole back half from `runFrameExec`
+      down (7151 / 45 / 2), the diagnostics-trace-format band (713 / 8 / 4
+      — `dispatch_stats_state`, `evtls`, `resume_route`,
+      `test_wall_deadline_ms`), the native glue (471 / 25 / 3), the leaf
+      serve (493 / 13 / 1), the regs/args pools (265 / 9 / 1) and the
+      activation pool (246 / 17 / 1). Two zero-state clusters were left
+      standing for a later landing: suspend snapshot + liveness (climbs to
+      442 lines for 5 `pub`s) and the value-operation band — arithmetic,
+      comparison, rendering, const materialisation — which climbs to 1486
+      lines for 10 `pub`s, the cheapest cut left in the file.
       Landed so far: `src/ir/lower/static_call_type.zig` (2.5k lines) holds
       the static call return-type ladder lifted out of expr.zig, which is
       now 21.5k, for three `pub` entry points out and nineteen shared
@@ -125,8 +176,11 @@ Ground rules carried forward:
       `src/interp_ir/vm/builtin_members.zig` (2.5k lines) holds the
       builtin-receiver member surface lifted out of host_call_member.zig,
       now 13.6k, for twenty-five entry points out and sixteen internals
-      `pub` back. A sibling file in an existing module needs no build.zig
-      entry.
+      `pub` back; `src/ir/exec_call.zig` (3.4k lines) holds the call-shaped
+      exec arms and the member/global dispatch route lifted out of
+      eval.zig, now 9.6k, for forty-two entry points out and thirteen
+      internals `pub` back. A sibling file in an existing module needs no
+      build.zig entry.
 - [x] S3. Plan-register hygiene: 44 docs under plans/. Reconcile
       open-campaigns.md against current reality (zip/combine fixed, ktor
       census 465/2/0, coroutine cluster closed), move finished campaign
