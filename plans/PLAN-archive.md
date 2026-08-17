@@ -1397,3 +1397,44 @@ coroutine debt closed by JVM oracle; ratchet floor 1305 -> 1340 (then
 repair, and the performance campaign's continuation with the E4
 standing as its acceptance metric — is
 `plans/simplify-validate-accelerate.md`.
+
+
+## simplify-validate-accelerate (closed 2026-08-17)
+
+Three tracks, every item landed, `scripts/gate.sh` GREEN at close.
+
+Simplify: dead compose-plugin gate deleted; the three giant modules each
+split once, behavior-frozen (expr.zig 24070->21554, host_call_member.zig
+16057->13628, eval.zig 12893->9628, with three new siblings) and the
+measured per-file extraction ceilings recorded so later cuts are a
+judgment, not a guess; plan register reduced to one live file; 122
+undocumented trace knobs catalogued; itest suites 69 -> 57 with 15
+verified-duplicate tests dropped and every unique pin moved first.
+
+Validate: a fresh red-set census exposed 15 failures + 44 crashes; the
+crashes were ONE family — in-process multi-program stale state — with
+seven distinct roots (shared anon side-module, generation-stamped
+dispatch caches, bytecode stream cache, intrinsic intern keys, the GC
+remembered set, the expr-body member AST registry, and the anon clone
+crossing a program boundary). Ratchet baselines made honest; ktor tail
+closed by record. Interpreter correctness roots fixed along the way:
+declaring-scope bounds for bare type-parameter returns, invoke-convention
+scope rank, typealias constructors and default-package aliases,
+FQN-opened stdlib gate, trailing-lambda scorer fall-through, cross-thread
+activation TLS rebind, deterministic ui-text paragraph measure, missing
+kotlin.system timing helpers, and dispatched-task failures ending the run
+instead of hanging it.
+
+Accelerate: A2 core loop -10.2% on the rig (framed no-fill register files
+behind a def-before-use proof; arity-forced member picks cached), with
+const+binop fusion built, measured negative, and reverted. A3 integer-keyed
+field memos + TLS L1s (wall-neutral, cleaner mechanics). A6 turned
+compose_foundation_lazy 42.6s -> 1.07s (40x) and retired the "55s yield
+round-trip" attribution as wrong — the hop is ~100us; the wall was
+upstream's own quadratic resume protocol. A5 disproved the slab premise
+(slab holds ~60MB at a 6GB peak) and met its acceptance number by
+retiring the per-program anon-module clone, adding a program-perm
+generation, boundary trims, and grouping the corpus by dependency-base
+key; e2e and differential now run under the 6.5GB cap, differential green
+for the first time on record. A7: ReleaseFast is at parity with
+ReleaseSafe now that the no-fill lever removed the poison-memset gap.

@@ -10,14 +10,11 @@ bottom and are not campaigns.
 
 ## The active plan
 
-`plans/simplify-validate-accelerate.md` — the running work plan across
-three tracks: Simplify (dead compose-plugin gate deleted, giant-module
-splits, plan-register hygiene, trace-knob audit, itest inventory),
-Validate (fresh red-set census landed and repaired, honest ratchet
-baselines, closed-by-record ktor tail), Accelerate (interpreter
-execution rounds + memory management, continuing the concurrency perf
-campaign). Order of work and completion state live there; the items
-below are the standing fronts it draws from.
+None. `plans/simplify-validate-accelerate.md` CLOSED 2026-08-17 with
+every item landed and `scripts/gate.sh` GREEN — its full record (three
+tracks: Simplify, Validate, Accelerate) is summarised in
+`PLAN-archive.md`. The items below are the standing fronts any next
+campaign draws from.
 
 ## 1. Transpiler speedup + Value 16B
 
@@ -146,9 +143,11 @@ klio-compose-suite-perf; harness practice in `BENCHMARKS.md`.
 
 ## Doc register
 
-LIVE (open work tracked): `simplify-validate-accelerate.md` (the
-active plan), `c-transpiler-plan.md`, `value-layout-campaign.md`,
-`KTOR-SERVER-UPSTREAM.md`, and this file. `worklist.md` is a pointer:
+LIVE (open work tracked): `c-transpiler-plan.md`,
+`value-layout-campaign.md`, `KTOR-SERVER-UPSTREAM.md`, and this file.
+`simplify-validate-accelerate.md` is FINISHED (closed 2026-08-17) and
+is kept as a log — it is still cited above for the V4 acceptance
+standing and the A6 yield-hop record. `worklist.md` is a pointer:
 its round closed 2026-08-16 and the full record (including the E4
 concurrency rig and C2 visibility records the active plan cites) moved
 to `PLAN-archive.md`.
