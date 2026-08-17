@@ -2420,6 +2420,19 @@ fn pumpLoop(
                     return .{ .err = .{ .Type = "test wall-clock deadline exceeded" } };
                 }
             }
+            // A dispatched task that died with an internal error (an eval
+            // failure escaping the coroutine machinery, not a Kotlin
+            // throwable) can never complete its coroutine: no resume will
+            // ever arrive for the parked root, so without this the run
+            // idles here forever while the failure sits in the pool's
+            // `first_error` waiting for a run boundary this thread never
+            // reaches. Surface the task's terminal failure as the root's
+            // outcome, exactly as the same error raised on the main
+            // thread would end the run.
+            if (vmhost.scheduler.takeFirstError()) |pool_err| {
+                try pumpExit(self, out, persist);
+                return .{ .err = pool_err };
+            }
             // Deadlock breaker: an activation belonging to an OUTER pump that
             // failed during an inline resume leaves its error stashed on that
             // pump (`resumeInlineOnce`), whose own loop is frozen beneath this
