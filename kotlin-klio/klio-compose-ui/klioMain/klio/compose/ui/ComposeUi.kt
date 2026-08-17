@@ -116,12 +116,14 @@ private fun clamp(value: Int, lo: Int, hi: Int): Int {
 private const val GLYPH_H = 5
 private const val GLYPH_ADVANCE = 4 // per-character width incl. gap
 
-// The wrapped height (layout units) of [s] word-wrapped to [width]. Uses the Skia
-// backend's real font metrics when available; otherwise estimates from the nominal
-// mono advance so headless layout (no backend) still sizes paragraphs.
+// The wrapped height (layout units) of [s] word-wrapped to [width], estimated
+// from the nominal mono advance. Layout never consults the backend's font
+// metrics: the display list is a deterministic, backend-independent artifact,
+// so box sizes must not change with whether the Skia library is loadable.
+// The backend re-wraps with real font metrics at paint time, inside this box
+// (the nominal advance is wider than the bundled font's, so the box is tall
+// enough for the real wrap).
 private fun paragraphHeight(s: String, width: Int): Int {
-    val measured = __composeui_measureText(s, width, GLYPH_H).toInt()
-    if (measured > 0) return measured
     val perLine = if (width / GLYPH_ADVANCE > 0) width / GLYPH_ADVANCE else 1
     val lines = (s.length + perLine - 1) / perLine
     return (if (lines < 1) 1 else lines) * ((GLYPH_H * 13 + 9) / 10)
