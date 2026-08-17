@@ -36,7 +36,8 @@ test {
     _ = @import("parity_properties_accessors.zig");
     _ = @import("parity_ranges_arrays.zig");
     _ = @import("parity_sealed_when_patterns.zig");
-    _ = @import("parity_string_processing.zig");
+    // parity_string_processing folded into parity_strings_numbers (all its
+    // tests run there now; the donor file is deleted).
     _ = @import("parity_strings_numbers.zig");
     _ = @import("parity_suspend_shapes.zig");
     _ = @import("parity_threaded_litmus.zig");

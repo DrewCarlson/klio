@@ -1,4 +1,6 @@
-//! String manipulation, number parsing, regex, char operations.
+//! String manipulation, number parsing, regex, char operations; string
+//! processing (padStart/padEnd, lines, take/drop, Char conversions,
+//! filter/count, StringBuilder chaining, repeat).
 
 const std = @import("std");
 const parity = @import("parity");
@@ -177,4 +179,135 @@ test "string_to_list_chars" {
         \\
     ;
     try assertKlio("str_to_chars", src, "5|olleh\n");
+}
+
+test "string_pad_start_end" {
+    const src =
+        \\
+        \\fun main() {
+        \\    println("${"3".padStart(5, '0')}|${"3".padEnd(5, '.')}")
+        \\}
+        \\
+    ;
+    try assertKlio("pad", src, "00003|3....\n");
+}
+
+test "string_lines_and_take" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val s = "alpha\nbeta\ngamma\ndelta"
+        \\    val xs = s.lines()
+        \\    println("${xs.size}|${xs.take(2).joinToString(",")}|${xs.drop(2).joinToString("|")}")
+        \\}
+        \\
+    ;
+    try assertKlio("lines", src, "4|alpha,beta|gamma|delta\n");
+}
+
+test "string_uppercase_lowercase" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val s = "Hello, World!"
+        \\    println("${s.uppercase()}|${s.lowercase()}")
+        \\}
+        \\
+    ;
+    try assertKlio("case", src, "HELLO, WORLD!|hello, world!\n");
+}
+
+test "char_is_digit_letter" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val xs = "a1!Z9 ".toCharArray()
+        \\    val r = xs.map { "${it.isLetter()}/${it.isDigit()}" }
+        \\    println(r.joinToString(","))
+        \\}
+        \\
+    ;
+    try assertKlio(
+        "char_isX",
+        src,
+        "true/false,false/true,false/false,true/false,false/true,false/false\n",
+    );
+}
+
+test "string_filter_count" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val s = "Hello, World! 123"
+        \\    val digits = s.filter { it.isDigit() }
+        \\    val n_letters = s.count { it.isLetter() }
+        \\    println("$digits|$n_letters")
+        \\}
+        \\
+    ;
+    try assertKlio("filter_count", src, "123|10\n");
+}
+
+test "string_reverse_split" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val s = "abcdef"
+        \\    val r = s.reversed()
+        \\    val xs = "a,b,c,d".split(",")
+        \\    println("$r|$xs")
+        \\}
+        \\
+    ;
+    try assertKlio("reverse_split", src, "fedcba|[a, b, c, d]\n");
+}
+
+test "string_concat_mixed_types" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val n = 42
+        \\    val pi = 3.14
+        \\    val ok = true
+        \\    println("n=$n pi=$pi ok=$ok ${1+2}")
+        \\}
+        \\
+    ;
+    try assertKlio("concat_mixed", src, "n=42 pi=3.14 ok=true 3\n");
+}
+
+test "string_code_points_via_chars" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val s = "ABC"
+        \\    println(s.map { it.code }.joinToString(","))
+        \\}
+        \\
+    ;
+    try assertKlio("codepoints", src, "65,66,67\n");
+}
+
+test "stringbuilder_chaining" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val sb = StringBuilder()
+        \\    sb.append("hello").append(", ").append("world").append("!")
+        \\    println(sb)
+        \\}
+        \\
+    ;
+    try assertKlio("sb_chain", src, "hello, world!\n");
+}
+
+test "string_repeat_zero" {
+    const src =
+        \\
+        \\fun main() {
+        \\    println("[${"x".repeat(0)}]|[${"y".repeat(3)}]")
+        \\}
+        \\
+    ;
+    try assertKlio("repeat_zero", src, "[]|[yyy]\n");
 }

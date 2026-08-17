@@ -131,7 +131,6 @@ const itests_files = [_]Itest{
     .{ .name = "parity_properties_accessors" },
     .{ .name = "parity_ranges_arrays" },
     .{ .name = "parity_sealed_when_patterns" },
-    .{ .name = "parity_string_processing" },
     .{ .name = "parity_strings_numbers" },
     .{ .name = "parity_stdlib_isolation", .weight = 25 },
     .{ .name = "parity_suspend_shapes" },
