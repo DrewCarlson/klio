@@ -550,16 +550,34 @@ Memory management:
         the aggregate lambda bucket carries the n^2 (0.74 n^2 calls).
         The itest comment's "duration IS the yield round-trip cost" is
         retired by this record.
-      - Side findings from the yield rig, recorded as OPEN bugs (not the
-        A6 wall, distinct mechanisms; repro scratchpad
-        reprosrc/yieldhop.kt): (1) an imported top-level fn
-        (kotlin.system.measureTimeMillis) is `unresolved global` when
-        called inside a Dispatchers.Default-dispatched block — the
-        pool child-Vm loses the file's import scope; (2) the resulting
-        CalleeFailed is recorded as the pool's first_error but the
-        runBlocking root stays parked FOREVER (silent hang instead of a
-        failed run) — upstream surfaces dispatched-continuation
-        failures.
+      - Side findings from the yield rig, both CLOSED (repro scratchpad
+        reprosrc/yieldhop.kt now runs end-to-end):
+        (1) CLOSED — the recorded "pool child-Vm loses the import
+        scope" diagnosis was WRONG: import scope is intact on the pool
+        path (an imported fn that exists, e.g. kotlin.time.measureTime,
+        resolves fine inside a dispatched block). The real mechanism:
+        kotlin.system.measureTimeMillis/measureNanoTime did not exist
+        in the shipped stdlib surface at all (upstream declares them in
+        the JVM-only jvm/src/kotlin/system/Timing.kt, outside the
+        curated include list), so the call was unresolved on the main
+        thread too. Fixed by the klio-authored
+        kotlin-klio/kotlin-system/Timing.kt actual over the kotlin.time
+        host clock bindings (wall ms / monotonic ns, the same clocks
+        the JVM bodies read); guard examples/system_measure_timing.kt
+        (kotlinc-verified).
+        (2) CLOSED — nothing woke the parked root: an internal task
+        error records into the pool's first_error, which only the
+        run-boundary read (run.zig joinAllThreads), and the boundary is
+        reached only after the main thread returns — which it never did,
+        because the failed task's coroutine never completes and no
+        resume can arrive for the parked runBlocking root. The
+        parked-root idle arm of pumpLoop (coroutines.zig) now polls
+        scheduler.takeFirstError() and exits the pump with the task's
+        terminal failure, so the run ends with the error exactly as the
+        same failure on the main thread would. (User throwables were
+        never affected: they complete the Job as failed through the
+        upstream machinery, pinned by tl_dispatched_failure_*.) Guard:
+        threaded-litmus tl_dispatched_internal_error_fails_run.
 - [ ] A7. Ship-mode numbers: record ReleaseFast (the ~3% ReleaseSafe
       undefined-poison memset and safety checks vanish there) alongside
       harness numbers when reporting user-facing performance;
