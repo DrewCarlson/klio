@@ -75,7 +75,7 @@ Ground rules carried forward:
       (knobs whose print sites were removed), converge the remaining reads
       on runtime.envOnce, and complete the docs/development/debugging.md
       table so it IS the inventory. No knob exists undocumented.
-- [ ] S5. Itest inventory: 69 suites under src/itests. Identify
+- [x] S5. Itest inventory: 69 suites under src/itests. Identify
       superseded/overlapping ones (anything targeting deleted paths, e.g.
       implicit-composer-era coverage) and fold or delete. CI time is a
       budget; every suite should earn its wall.
@@ -96,6 +96,24 @@ Ground rules carried forward:
       atomicfu_arrays'/kotlinx_io_read's resolution pins move into
       resolve_ambiguity; conformance+threaded_litmus co-binary). Net
       69 → ~57 binaries, ~12 fewer whole-program links per cold shard.
+      EXECUTED (2026-08-17, ten commits 283ebd23..0e57c93b): suite files
+      69 -> 57, registry entries 55, dangling references 0 (every
+      itests.zig import resolves; the deleted suites survive only as
+      comments naming where their tests went). Test declarations
+      1044 -> 1029: 15 dropped, each named in its commit with the
+      surviving duplicate that covers it; every other test moved
+      VERBATIM. Actions: coroutine_smoke -> coroutines_realistic
+      (fixture dir kept, differential reads it); iterables_special +
+      maps_intensive -> collections_intensive; string_processing ->
+      strings_numbers; ranges_arrays -> array_bulk_ops (sliceArray kept,
+      not covered by the copy family); closures_advanced ->
+      closures_deep; functional_patterns + advanced_idioms redistributed
+      across eleven owning suites; interfaces_visibility -> the
+      inheritance/visibility pair; the atomicfu-array and kotlinx-io
+      RESOLUTION pins -> resolve_ambiguity (library behavior stays with
+      the commontest census); conformance -> threaded_litmus as one
+      binary over both fixture dirs, both completeness guards intact;
+      stale compose_runtime_commontest comments dropped.
 
 ## Track V — Validate
 
