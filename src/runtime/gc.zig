@@ -147,6 +147,13 @@ var major_threshold: usize = 8 * 1024 * 1024;
 /// The remembered set: tenured cells mutated since promotion. Re-traced at the
 /// start of every minor mark (a tenured cell's new children may be nursery
 /// cells); drained (flags cleared, list emptied) by every collection.
+/// Env probe for the remembered-set diagnostics, safe in libc-free builds
+/// (module test binaries never set the variable anyway).
+fn rememberTraceOn() bool {
+    if (comptime !@import("builtin").link_libc) return false;
+    return std.c.getenv("KLIO_GC_REMEMBER_TRACE") != null;
+}
+
 var remembered: std.ArrayListUnmanaged(*GcHeader) = .empty;
 var remembered_lock: SpinLock = .{};
 
@@ -166,7 +173,7 @@ fn writeBarrierSlow(h: *GcHeader) void {
     defer remembered_lock.unlock();
     if (h.gc_remembered) return;
     h.gc_remembered = true;
-    if (std.c.getenv("KLIO_GC_REMEMBER_TRACE") != null) {
+    if (rememberTraceOn()) {
         std.debug.print("[gc-remember] h={*} gen={d} type={s} program_started={}\n", .{ h, h.gc_gen, h.gc_type, program_started });
     }
     remembered.append(std.heap.page_allocator, h) catch
@@ -204,7 +211,7 @@ pub fn drainRemembered() void {
 /// with msync and report entries whose backing is no longer mapped, tagged by
 /// call site. Finds the phase that freed a remembered cell's storage.
 pub fn validateRemembered(tag: []const u8) void {
-    if (std.c.getenv("KLIO_GC_REMEMBER_TRACE") == null) return;
+    if (!rememberTraceOn()) return;
     remembered_lock.lock();
     defer remembered_lock.unlock();
     const pg = std.heap.pageSize();
@@ -795,7 +802,7 @@ fn collectImpl(force_major: bool) void {
     // is tenured (old→young edges became old→old); after a major the fresh
     // full mark subsumes it. Cleared before the sweep so no entry dangles.
     remembered_lock.lock();
-    if (std.c.getenv("KLIO_GC_REMEMBER_TRACE") != null) {
+    if (rememberTraceOn()) {
         std.debug.print("[gc-drain] n={d} major={} program_started={}\n", .{ remembered.items.len, major, program_started });
         for (remembered.items) |h| std.debug.print("[gc-drain]   h={*}\n", .{h});
     }

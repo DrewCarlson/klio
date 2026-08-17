@@ -449,17 +449,23 @@ test "eager pipeline output parity" {
 
     const eager_ir = try S.runRetry(al, io, &.{ bin, "dump-ir", "/tmp/klio_eager_itest/e1.kt", "--func", "shadowedIdentityPick" }, &env);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, eager_ir.term);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        eager_ir.stdout,
-        "[DIRECT member-ext dispatch=r",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        eager_ir.stdout,
-        " -> scopedIdentityValue#",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, eager_ir.stdout, "Call plus#") != null);
-    try std.testing.expect(std.mem.indexOf(u8, eager_ir.stdout, "[DYN") == null);
-    try std.testing.expect(std.mem.indexOf(u8, eager_ir.stdout, "0 dynamic") != null);
+    // Each pin names itself and dumps the IR on failure — a bare `expect`
+    // reported "failed without output" from the gate batch, unactionably.
+    const pins = [_]struct { needle: []const u8, expect_present: bool }{
+        .{ .needle = "[DIRECT member-ext dispatch=r", .expect_present = true },
+        .{ .needle = " -> scopedIdentityValue#", .expect_present = true },
+        .{ .needle = "Call plus#", .expect_present = true },
+        .{ .needle = "[DYN", .expect_present = false },
+        .{ .needle = "0 dynamic", .expect_present = true },
+    };
+    for (pins) |pin| {
+        const found = std.mem.indexOf(u8, eager_ir.stdout, pin.needle) != null;
+        if (found != pin.expect_present) {
+            std.debug.print(
+                "eager parity: `{s}` {s} in dump-ir output\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n",
+                .{ pin.needle, if (pin.expect_present) "missing" else "unexpectedly present", eager_ir.stdout, eager_ir.stderr },
+            );
+            return error.EagerIrPinMismatch;
+        }
+    }
 }

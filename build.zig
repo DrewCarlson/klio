@@ -138,7 +138,10 @@ const itests_files = [_]Itest{
     .{ .name = "parity_strings_numbers" },
     .{ .name = "parity_stdlib_isolation", .weight = 25 },
     .{ .name = "parity_suspend_shapes" },
-    .{ .name = "parity_threaded_litmus", .dirs = &.{"tests/fixtures/threaded_litmus"}, .weight = 15 },
+    // needs_exe: the eager-parity test spawns the harness (`run` + `dump-ir`)
+    // — without it the child fell back to a stale `zig-out/bin/klio` and the
+    // pins tested weeks-old lowering.
+    .{ .name = "parity_threaded_litmus", .dirs = &.{"tests/fixtures/threaded_litmus"}, .weight = 15, .needs_exe = true },
     .{ .name = "parity_type_system_shapes" },
     .{ .name = "parity_visibility_modifiers" },
     .{ .name = "explicit_backing_fields" },
