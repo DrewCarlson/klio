@@ -27,6 +27,14 @@ fn shardSkip(stem: []const u8) bool {
     return (h.final() % n) != k;
 }
 
+/// Per-program SKIP notices are silent by default: a PASSING `zig build`
+/// run step that writes to stderr is rendered as a failed command by the
+/// build runner, which has repeatedly been misread as an e2e flake. Set
+/// `KLIO_ITEST_VERBOSE` to surface them (same convention as differential).
+fn verbose() bool {
+    return std.c.getenv("KLIO_ITEST_VERBOSE") != null;
+}
+
 fn runCorpus(jit_on: bool) !void {
     jit.setEnabledForTest(jit_on);
     defer jit.setEnabledForTest(false);
@@ -75,7 +83,7 @@ fn runCorpus(jit_on: bool) !void {
         const exp_path = try std.fmt.allocPrint(a, "{s}/{s}.out", .{ EXPECTED, stem });
 
         const expected = std.Io.Dir.cwd().readFileAlloc(io, exp_path, a, .unlimited) catch |e| {
-            std.debug.print("e2e SKIP {s}: no expected ({s})\n", .{ stem, @errorName(e) });
+            if (verbose()) std.debug.print("e2e SKIP {s}: no expected ({s})\n", .{ stem, @errorName(e) });
             continue;
         };
 
@@ -136,7 +144,7 @@ test "function-JIT recursion matches the interpreter" {
         const kt = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ EXAMPLES, stem });
         const exp_path = try std.fmt.allocPrint(a, "{s}/{s}.out", .{ EXPECTED, stem });
         const expected = std.Io.Dir.cwd().readFileAlloc(io, exp_path, a, .unlimited) catch |e| {
-            std.debug.print("func-jit SKIP {s}: no expected ({s})\n", .{ stem, @errorName(e) });
+            if (verbose()) std.debug.print("func-jit SKIP {s}: no expected ({s})\n", .{ stem, @errorName(e) });
             continue;
         };
         const res = parity.runWithPacks(a, io, kt) catch |e| {
