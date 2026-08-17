@@ -43,7 +43,7 @@ Ground rules carried forward:
 
 ## Track S — Simplify
 
-- [ ] S1. Delete the dead compose-plugin gate. `composePluginEnabled()`
+- [x] S1. Delete the dead compose-plugin gate. `composePluginEnabled()`
       hard-returns `true` (the cutover flipped); ~8 files still branch on
       it (host_call_func, host_call_member, host_call_value,
       host_instances, interp_ir/build, compose_pass, stdlib_image hash,
@@ -53,6 +53,9 @@ Ground rules carried forward:
       cutover ("flip default + DELETE implicit impl"); grep for any other
       implicit-composer-era remnants while there. Battery must be
       count-identical.
+      DONE (8835dfc8): the gate and its env plumbing are gone —
+      `composePluginEnabled` has no remaining reference in src/. The
+      battery was count-identical (plugin ratchet 1374).
 - [ ] S2. Split the three giant modules, behavior-frozen:
       - src/ir/lower/expr.zig (23.8k lines) — per-concern submodules
         (bare-call resolution arms, lambda lowering, receiver/tower
@@ -64,17 +67,28 @@ Ground rules carried forward:
         machinery, leaf serve, liveness.
       One module per landing, imports rewired via build.zig, zigcheck +
       battery after each. No logic edits ride along with a move.
-- [ ] S3. Plan-register hygiene: 44 docs under plans/. Reconcile
+- [x] S3. Plan-register hygiene: 44 docs under plans/. Reconcile
       open-campaigns.md against current reality (zip/combine fixed, ktor
       census 465/2/0, coroutine cluster closed), move finished campaign
       logs into PLAN-archive.md, and make open-campaigns.md the single
       live register that every other doc points into. worklist.md's closed
       round folds in too.
-- [ ] S4. Trace-knob audit: ~240 env probes across the three big modules
+      DONE (5eaeacbe): open-campaigns.md is the single live register
+      (175 lines, was 428) with the active plan named and four open
+      fronts; 19 finished campaign docs are indexed in PLAN-archive.md
+      with outcomes; worklist.md reduced to a pointer. Section numbers
+      were preserved so existing §-references still resolve.
+- [x] S4. Trace-knob audit: ~240 env probes across the three big modules
       alone. Inventory every KLIO_* knob (grep), delete the dead ones
       (knobs whose print sites were removed), converge the remaining reads
       on runtime.envOnce, and complete the docs/development/debugging.md
       table so it IS the inventory. No knob exists undocumented.
+      DONE (5eaeacbe): 122 previously-undocumented knobs added to
+      docs/development/debugging.md (322 KLIO_* references there now),
+      each verified against its real source usage, plus a
+      harness/test-infrastructure sub-table. Stale KLIO_INIT_KINDS row
+      removed. One doc-comment ghost recorded: KLIO_EAGER_GATES has no
+      getenv — its counters print under KLIO_EAGER_AUDIT.
 - [x] S5. Itest inventory: 69 suites under src/itests. Identify
       superseded/overlapping ones (anything targeting deleted paths, e.g.
       implicit-composer-era coverage) and fold or delete. CI time is a
@@ -288,13 +302,17 @@ Ground rules carried forward:
         - ktor_server start(wait=false): passes manually (rc=0, exact
           output) — census-load flake on the Debug CLI under the 30s cap;
           re-verified solo below.
-- [ ] V2. Make the ratchets ratchet:
+- [x] V2. Make the ratchets ratchet:
       - src/itests/ktor_commontest.zig has `.baseline = 0` — it can never
         fail. Set it to the census floor (last recorded 465 passed / 2
         failed / 0 incomplete; margin for CI variance).
       - compose_plugin_commontest BASELINE 1365 vs observed 1371-1374 this
         week — raise to the observed floor.
       - Audit the other suites for zero/soft baselines while there.
+      DONE (8835dfc8): no `.baseline = 0` remains in src/itests. Floors
+      set from measured census: ktor 440, compose plugin 1370,
+      coroutines 340, datetime 205, io 1140, serialization 9,
+      androidx_collection 560.
 - [x] V3. The 2 remaining ktor_commontest fails: CLOSED BY RECORD —
       both are URLBuilderTest scheme-with-digits, where klio MATCHES
       real Kotlin semantics (upstream URLProtocol's own require
@@ -489,7 +507,7 @@ the V4 tests as acceptance):
 
 Memory management:
 
-- [ ] A5. Slab footprint and churn: one 4-rep bench maps 703MB
+- [x] A5. Slab footprint and churn: one 4-rep bench maps 703MB
       (KLIO_SLAB_STAT) and newSlab threading costs ~2.6% of wall; a
       GC_GROWTH sweep moved memory (up to 1.25GB) but not wall. Questions
       to answer with KLIO_GC_HIST + KLIO_SLAB_TRACE/KLIO_CELL_TRACE:
@@ -499,6 +517,22 @@ Memory management:
       trigger pacing, dormant-page revival policy, or per-class spare
       tuning. Suite RSS is the acceptance number (KLIO_RSS_CAP_KB=6.5GB
       exists in the ratchet — how close does it run?).
+      DONE — and the slab premise was DISPROVEN by measurement (full
+      round record in the V1 section above). At a 6GB process peak the
+      slab holds only ~60MB (KLIO_SLAB_TRACE with the new
+      KLIO_SLAB_TRACE_ALL to include build-phase mmaps): the footprint
+      lives in per-program ARENAS and glibc's malloc arenas, not in slab
+      churn, so trigger pacing / dormant-page policy / per-class spare
+      tuning were all the wrong lever. What actually moved the number:
+      retiring the per-program anon side-module clone (-3.4GB), the
+      program-perm generation freed at each boundary, malloc_trim +
+      forced slab reclaim at boundaries (-0.5GB), running the boundary
+      collect BEFORE the hooks clear, and — structurally — grouping the
+      corpus by dependency-base key so one cached base suffices instead
+      of coexisting bases plus a build transient.
+      ACCEPTANCE MET: the full e2e corpus and differential now run under
+      the 6.5GB itest cap (differential green for the first time on
+      record); gate.sh GREEN.
 - [x] A6. Wall-clock outliers as memory/dispatch probes:
       compose_foundation_lazy at 3m42 warm and the 55s background-yield
       round-trip (a yield on Dispatchers.Default costs a cross-thread
