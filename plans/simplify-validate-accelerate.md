@@ -56,7 +56,7 @@ Ground rules carried forward:
       DONE (8835dfc8): the gate and its env plumbing are gone —
       `composePluginEnabled` has no remaining reference in src/. The
       battery was count-identical (plugin ratchet 1374).
-- [ ] S2. Split the three giant modules, behavior-frozen:
+- [x] S2. Split the three giant modules, behavior-frozen:
       - src/ir/lower/expr.zig (23.8k lines) — per-concern submodules
         (bare-call resolution arms, lambda lowering, receiver/tower
         machinery, call emission, static type derivation).
@@ -93,6 +93,32 @@ Ground rules carried forward:
       read the "Build Summary: N/N steps succeeded" line and the test
       counts instead (that artifact was misdiagnosed as an e2e flake
       three times before 39d37ef5 silenced its source).
+      FIRST PASS COMPLETE — one landing per module, all behavior-frozen:
+        expr.zig            24070 -> 21554  (static_call_type.zig 2576)
+        host_call_member.zig 16057 -> 13628 (builtin_members.zig 2515)
+        eval.zig            12893 ->  9628  (exec_call.zig 3373)
+      LANDING 3 (4bd3b207): the call-shaped exec arms and the
+      member/global dispatch route — 77 decls in six blocks, 3310 lines,
+      53 new `pub` (~61 lines/pub), ZERO state crossings. The one decl
+      in the region that reads `evtls` (execArmCallMember) deliberately
+      stays in the parent — that exclusion is what makes the cut
+      state-free. The A2 no-fill register work and the activation/TLS
+      resume path are untouched in the parent. Verbatimness: diff
+      opcodes equal/delete only on both sides, 9584 kept + 3310 moved =
+      12894 exact. Verified: ir units 247/247, zig build test 481/481,
+      six parity/differential/e2e suites, sweep 117/0, and the two
+      ratchets SOLO (compose 1375, ktor 448/2). Perf rig A/B neutral
+      (3510/3328/3366 before, 3492/3336/3330 after) — expected, since
+      the split stays inside one Zig compilation unit.
+      CHEAPEST CUTS LEFT (measured, for a future round): in eval.zig the
+      value-operation band (arithmetic/comparison/rendering/const
+      materialisation) at 1486 lines for 10 pubs, and suspend
+      snapshot+liveness at 442/5 — both zero-state. In expr.zig and
+      host_call_member.zig every remaining candidate either crosses
+      module state or pays worse than the landings above; further cuts
+      there are deliberate churn, not cleanup.
+      MECHANICAL NOTE: the execArm* functions are `noinline`, so any
+      scripted pub-adder must handle that keyword.
       LANDING 2: host_call_member.zig 16057 -> 13628. The member surface
       the host serves for builtin value shapes (53 decls: structural
       equality/hash/render, natural ordering and the comparator ops, the
