@@ -4417,6 +4417,12 @@ fn resumeLiveActivation(
     resume_unwind: ?EvalError,
     host: *H,
 ) Allocator.Error!EvalResult {
+    // A live-parked activation may resume on a DIFFERENT worker thread than
+    // the one that parked it (the pool rotates, and the parker may already
+    // have exited — the daemon-abandon teardown races exactly this way).
+    // Rebind the frame to the RESUMING thread's eval TLS first; the parked
+    // pointer otherwise dereferences a dead thread's storage.
+    act.frame.tls = &evtls;
     gcPushFrame(&act.frame);
     act.frame.activateAs();
     if (resume_throw == null) {

@@ -418,26 +418,36 @@ test "eager pipeline output parity" {
     var env = std.process.Environ.Map.init(al);
     runtime.procEnvPutAllInto(al, &env);
     const bin = env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
-    const lazy = std.process.run(al, io, .{
-        .argv = &.{ bin, "run", "/tmp/klio_eager_itest/e1.kt" },
-        .environ_map = &env,
-        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
-    }) catch return error.SpawnFailed;
+    // Fork can transiently fail (EAGAIN) when the whole gate batch spawns
+    // children at once; a failed SPAWN is machine pressure, not a verdict —
+    // retry briefly and NAME the error when it sticks.
+    const S = struct {
+        fn runRetry(a2: std.mem.Allocator, io2: std.Io, argv: []const []const u8, env2: *const std.process.Environ.Map) !std.process.RunResult {
+            var attempt: usize = 0;
+            while (true) : (attempt += 1) {
+                return std.process.run(a2, io2, .{
+                    .argv = argv,
+                    .environ_map = env2,
+                    .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
+                }) catch |err| {
+                    if (attempt >= 3) {
+                        std.debug.print("eager parity: spawn failed after retries: {s}\n", .{@errorName(err)});
+                        return err;
+                    }
+                    std.Io.sleep(io2, std.Io.Duration.fromMilliseconds(2000), .awake) catch {};
+                    continue;
+                };
+            }
+        }
+    };
+    const lazy = try S.runRetry(al, io, &.{ bin, "run", "/tmp/klio_eager_itest/e1.kt" }, &env);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, lazy.term);
-    const eager = std.process.run(al, io, .{
-        .argv = &.{ bin, "run", "/tmp/klio_eager_itest/e1.kt" },
-        .environ_map = &env,
-        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
-    }) catch return error.SpawnFailed;
+    const eager = try S.runRetry(al, io, &.{ bin, "run", "/tmp/klio_eager_itest/e1.kt" }, &env);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, eager.term);
     try std.testing.expectEqualStrings("int:42\nstring:y\nlist:2\n[1, 2, 3]\nnumber:4\n", lazy.stdout);
     try std.testing.expectEqualStrings(lazy.stdout, eager.stdout);
 
-    const eager_ir = std.process.run(al, io, .{
-        .argv = &.{ bin, "dump-ir", "/tmp/klio_eager_itest/e1.kt", "--func", "shadowedIdentityPick" },
-        .environ_map = &env,
-        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(120_000), .clock = .awake } },
-    }) catch return error.SpawnFailed;
+    const eager_ir = try S.runRetry(al, io, &.{ bin, "dump-ir", "/tmp/klio_eager_itest/e1.kt", "--func", "shadowedIdentityPick" }, &env);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, eager_ir.term);
     try std.testing.expect(std.mem.indexOf(
         u8,
