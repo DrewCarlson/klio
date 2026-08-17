@@ -2058,7 +2058,7 @@ fn receiverImplementsOwnerIdentity(
 /// and every hit is confirmed by comparing bytes, which keeps the entry sound
 /// even if a transient string is freed and its address reused.
 const NameIdSlot = struct { src: usize = 0, gen: u32 = 0, canon: []const u8 = &.{} };
-threadlocal var name_id_cache: [2048]NameIdSlot = @splat(.{});
+threadlocal var name_id_cache: [8192]NameIdSlot = @splat(.{});
 
 /// Canonical pointer identity for a dispatch-cache method name. Runtime
 /// callable references carry collected String storage, so their raw byte
@@ -2066,15 +2066,24 @@ threadlocal var name_id_cache: [2048]NameIdSlot = @splat(.{});
 ///
 /// Almost every caller passes a name slice straight out of the IR, whose
 /// address is stable for the life of the program — so the mapping is
-/// remembered per source address and confirmed with a byte compare, which
-/// takes the interning hash + shared-map probe off the dispatch path.
-fn memberNameIdentity(self: *VmHost, name: []const u8) ?usize {
+/// remembered per source address (multiplicatively mixed: arena-allocated
+/// name storage repeats at fixed strides, which a modulo of the raw
+/// address turned into constant slot ping-pong) and confirmed with a byte
+/// compare, which takes the interning hash + shared-map probe off the
+/// dispatch path. A miss probes the intern under the SHARED borrow first;
+/// only a genuinely new spelling takes the exclusive insert path.
+pub fn memberNameIdentity(self: *VmHost, name: []const u8) ?usize {
     const src = @intFromPtr(name.ptr);
-    const slot = &name_id_cache[(src >> 3) % name_id_cache.len];
+    const slot = &name_id_cache[((src *% 0x9E3779B97F4A7C15) >> 32) % name_id_cache.len];
     if (slot.src == src and slot.gen == cacheGen() and slot.canon.len == name.len and std.mem.eql(u8, slot.canon, name)) {
         return @intFromPtr(slot.canon.ptr);
     }
     const id = blk: {
+        {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            if (pg.get().memberNameIdentityExisting(name)) |id| break :blk id;
+        }
         const pg = self.prog.borrowMut();
         defer pg.deinit();
         break :blk pg.get().memberNameIdentity(name) orelse return null;
@@ -11446,10 +11455,29 @@ fn extMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey
     pg.get().ext_method_cache.put(key, fid) catch {};
 }
 
+/// Thread-local L1 for the pack-binding inline cache: a member call served
+/// by a native binding (or its cached "no intrinsic" miss) otherwise pays a
+/// program-cell borrow plus a shared-map probe on every single call. `state`:
+/// 0 empty, 1 mirrored. Same add-only/gen-stamp discipline as the method L1s.
+const TlIntrinsicEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, state: u8 = 0, gen: u32 = 0, entry: root_mod.ProgramImage.MemberResolveEntry = .{ .func = null, .fqn = "" } };
+threadlocal var tl_intrinsic_cache: [TL_METHOD_CACHE_SIZE]TlIntrinsicEntry = @splat(.{});
+
 fn instanceIntrinsicCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?root_mod.ProgramImage.MemberResolveEntry {
-    const pg = self.prog.borrow();
-    defer pg.deinit();
-    return pg.get().instance_intrinsic_cache.get(key);
+    const e = &tl_intrinsic_cache[tlSlot(key)];
+    if (e.state != 0 and e.gen == cacheGen() and e.class_p == key.class_p and e.name_p == key.name_p and
+        e.sig == key.sig and e.n_args == key.n_args)
+    {
+        return e.entry;
+    }
+    const hit: ?root_mod.ProgramImage.MemberResolveEntry = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().instance_intrinsic_cache.get(key);
+    };
+    if (hit) |h| {
+        e.* = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .state = 1, .gen = cacheGen(), .entry = h };
+    }
+    return hit;
 }
 
 /// Simple name of the class that DECLARES `fid` in `module`'s class table,

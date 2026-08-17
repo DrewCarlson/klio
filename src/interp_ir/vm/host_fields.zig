@@ -465,19 +465,14 @@ pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?
     if (receiver.* != .Instance) return null;
     if (std.mem.eql(u8, name, "coroutineContext")) return null;
     const inst = receiver.Instance;
-    var cls: u64 = 0;
-    const fqn = blk: {
+    const cls: u64 = blk: {
         const g = inst.borrow();
         defer g.deinit();
-        cls = @intCast(g.get().class.identity());
-        const cg = g.get().class.borrow();
-        defer cg.deinit();
-        break :blk cg.get().fqn;
+        break :blk @intCast(g.get().class.identity());
     };
     const hit = blk: {
-        const pg = self.prog.borrow();
-        defer pg.deinit();
-        break :blk pg.get().field_read_cache.get(.{ .a = fqn, .b = name });
+        const name_p = host_call_member.memberNameIdentity(self, name) orelse break :blk null;
+        break :blk fieldReadCacheGet(self, @intCast(cls), name_p);
     } orelse return null;
     const NONE = root.ProgramImage.FieldReadHit.NONE;
     if (hit.getter != NONE) return .{ .cls = cls, .route = (@as(u64, hit.getter) << 2) | 2 };
@@ -744,17 +739,14 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // suspend-state-dependent, not class-static).
     if (receiver.* == .Instance and !std.mem.eql(u8, name, "coroutineContext")) {
         const inst0 = receiver.Instance;
-        const fqn0 = blk: {
+        const class_p0 = blk: {
             const g = inst0.borrow();
             defer g.deinit();
-            const cg = g.get().class.borrow();
-            defer cg.deinit();
-            break :blk cg.get().fqn;
+            break :blk g.get().class.identity();
         };
         const hit: ?root.ProgramImage.FieldReadHit = blk: {
-            const pg = self.prog.borrow();
-            defer pg.deinit();
-            break :blk pg.get().field_read_cache.get(.{ .a = fqn0, .b = name });
+            const name_p = host_call_member.memberNameIdentity(self, name) orelse break :blk null;
+            break :blk fieldReadCacheGet(self, class_p0, name_p);
         };
         if (hit) |h| {
             const NONE = root.ProgramImage.FieldReadHit.NONE;
@@ -2981,7 +2973,7 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             const msg = try std.fmt.allocPrint(allocator, "getter FuncId {d} out of range", .{fid.int()});
             return errRes(.{ .Type = msg });
         }
-        fieldReadCachePut(self, cache_fqn, name, .{ .getter = fid.int(), .stored_idx = root.ProgramImage.FieldReadHit.NONE });
+        fieldReadCachePut(self, inst, cache_fqn, name, .{ .getter = fid.int(), .stored_idx = root.ProgramImage.FieldReadHit.NONE });
         return try evalGetterTagged(self, allocator, fid, receiver.*, "site2500");
     }
     // Most-derived override cell: an initialized `override val/var` keeps
@@ -3035,7 +3027,7 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         const fields = g.get().fields.items;
         for (fields, 0..) |f, fi| {
             if (std.mem.eql(u8, f.name, name)) {
-                fieldReadCachePut(self, cache_fqn, name, .{ .getter = root.ProgramImage.FieldReadHit.NONE, .stored_idx = @intCast(fi) });
+                fieldReadCachePut(self, inst, cache_fqn, name, .{ .getter = root.ProgramImage.FieldReadHit.NONE, .stored_idx = @intCast(fi) });
                 break :blk f.value;
             }
         }
@@ -3172,61 +3164,100 @@ fn enclosingCompanionDeclares(self: *VmHost, allocator: Allocator, class_name: [
     return false;
 }
 
-/// Resolve an instance custom-getter `FuncId`, applying the
-/// most-derived-stored-property override rule and the package-qualified
-/// own-class FQN-key discipline.
+/// Thread-local L1 in front of the shared field-resolution memos: the
+/// shared maps live behind the program cell's reader lock, whose atomic
+/// state word ping-pongs between cores on every borrow — the same
+/// coherence cost the method-cache L1 in `host_call_member` removes.
+/// A slot mirrors a shared-map entry; the hit site re-verifies stored
+/// slots by name anyway, so a stale slot is at worst a fall-through to
+/// the ladder. The generation stamp keeps entries from a finished
+/// in-process program (reused cell addresses) from ever hitting,
+/// including on still-parked pool worker threads.
+const TL_FIELD_CACHE_SIZE = 1024;
+const TlFieldReadEntry = struct { class_p: usize = 0, name_p: usize = 0, gen: u32 = 0, hit: root.ProgramImage.FieldReadHit = .{ .getter = 0, .stored_idx = 0 } };
+threadlocal var tl_field_read_cache: [TL_FIELD_CACHE_SIZE]TlFieldReadEntry = @splat(.{});
+const TlFieldWriteEntry = struct { class_p: usize = 0, name_p: usize = 0, gen: u32 = 0, hit: root.ProgramImage.FieldWriteHit = .{ .setter = 0, .store_name = "" } };
+threadlocal var tl_field_write_cache: [TL_FIELD_CACHE_SIZE]TlFieldWriteEntry = @splat(.{});
+
+inline fn tlFieldSlot(class_p: usize, name_p: usize) usize {
+    const h = (@as(u64, @intCast(class_p)) *% 0x9E3779B97F4A7C15) ^ @as(u64, @intCast(name_p));
+    return @intCast((h ^ (h >> 17)) & (TL_FIELD_CACHE_SIZE - 1));
+}
+
+fn fieldReadCacheGet(self: *VmHost, class_p: usize, name_p: usize) ?root.ProgramImage.FieldReadHit {
+    const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
+    const e = &tl_field_read_cache[tlFieldSlot(class_p, name_p)];
+    if (e.class_p == class_p and e.name_p == name_p and e.gen == gen) return e.hit;
+    const hit: ?root.ProgramImage.FieldReadHit = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().field_read_cache.get(.{ .class_p = class_p, .name_p = name_p });
+    };
+    if (hit) |h| e.* = .{ .class_p = class_p, .name_p = name_p, .gen = gen, .hit = h };
+    return hit;
+}
+
+fn fieldWriteCacheGet(self: *VmHost, class_p: usize, name_p: usize) ?root.ProgramImage.FieldWriteHit {
+    const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
+    const e = &tl_field_write_cache[tlFieldSlot(class_p, name_p)];
+    if (e.class_p == class_p and e.name_p == name_p and e.gen == gen) return e.hit;
+    const hit: ?root.ProgramImage.FieldWriteHit = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().field_write_cache.get(.{ .class_p = class_p, .name_p = name_p });
+    };
+    if (hit) |h| e.* = .{ .class_p = class_p, .name_p = name_p, .gen = gen, .hit = h };
+    return hit;
+}
+
 /// Insert into the field-read memo, capped so synthesized per-evaluation
-/// anonymous classes (fresh fqn each time) cannot grow it unboundedly.
-fn fieldReadCachePut(self: *VmHost, fqn: []const u8, name: []const u8, hit: root.ProgramImage.FieldReadHit) void {
+/// anonymous classes cannot grow it unboundedly.
+fn fieldReadCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []const u8, name: []const u8, hit: root.ProgramImage.FieldReadHit) void {
     if (!ir.eval.dispatchCacheStable()) return;
     // Main-module classes only, exactly like the WRITE memo below: a
-    // runtime / anonymous class's fqn key does not outlive the class def,
-    // and under the shared anon side module the dangling key corrupted the
-    // cache map (Allocator.grow reached unreachable growing it).
+    // runtime / anonymous class can be reclaimed mid-program, and a later
+    // class cell landing at the same address would alias its identity key.
+    // Main-module class cells stay registry-held for the program's life.
     {
         const mg = self.module.borrow();
         defer mg.deinit();
         if (mg.get().classIdByFqn(fqn) == null) return;
     }
-    // The memo OWNS its key strings: the caller's slices can be
-    // side-module or scratch memory whose reuse after a real free mutates
-    // the stored key under the map (rehash then reaches unreachable on
-    // the duplicate). Image-interned copies are identity-stable.
-    const a_owned = ownedMemoStr(self, fqn) orelse return;
-    const b_owned = ownedMemoStr(self, name) orelse return;
+    const class_p = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        break :blk g.get().class.identity();
+    };
     const pg = self.prog.borrowMut();
     defer pg.deinit();
+    // The interned name identity keys the entry: the caller's slice can be
+    // side-module or scratch memory, and only the image-interned id is
+    // stable (and unique per spelling) for the image's lifetime.
+    const name_p = pg.get().memberNameIdentity(name) orelse return;
     if (pg.get().field_read_cache.count() >= 65536) return;
-    pg.get().field_read_cache.put(.{ .a = a_owned, .b = b_owned }, hit) catch {};
-}
-
-/// Intern a memo key string on the program image so its bytes live (and
-/// keep their content) for the image's lifetime whatever allocator the
-/// caller's slice came from.
-fn ownedMemoStr(self: *VmHost, s: []const u8) ?[]const u8 {
-    const pg = self.prog.borrowMut();
-    defer pg.deinit();
-    const identity = pg.get().memberNameIdentity(s) orelse return null;
-    const p: [*]const u8 = @ptrFromInt(identity);
-    return p[0..s.len];
+    pg.get().field_read_cache.put(.{ .class_p = class_p, .name_p = name_p }, hit) catch {};
 }
 
 /// Insert into the field-WRITE memo. Main-module classes only: a runtime /
 /// anonymous class can gain `$set$` overrides after the first write, and its
-/// fqn key does not outlive the class def.
-fn fieldWriteCachePut(self: *VmHost, fqn: []const u8, name: []const u8, hit: root.ProgramImage.FieldWriteHit) void {
+/// class cell (the identity key) does not outlive the class def.
+fn fieldWriteCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []const u8, name: []const u8, hit: root.ProgramImage.FieldWriteHit) void {
     if (!ir.eval.dispatchCacheStable()) return;
     {
         const mg = self.module.borrow();
         defer mg.deinit();
         if (mg.get().classIdByFqn(fqn) == null) return;
     }
-    const a_owned = ownedMemoStr(self, fqn) orelse return;
-    const b_owned = ownedMemoStr(self, name) orelse return;
+    const class_p = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        break :blk g.get().class.identity();
+    };
     const pg = self.prog.borrowMut();
     defer pg.deinit();
+    const name_p = pg.get().memberNameIdentity(name) orelse return;
     if (pg.get().field_write_cache.count() >= 65536) return;
-    pg.get().field_write_cache.put(.{ .a = a_owned, .b = b_owned }, hit) catch {};
+    pg.get().field_write_cache.put(.{ .class_p = class_p, .name_p = name_p }, hit) catch {};
 }
 
 /// The terminal plain store: write through a boxed-capture Cell when the
@@ -3307,7 +3338,7 @@ fn sgetterPutGetter(self: *VmHost, receiver: *const Value, full_name: []const u8
         defer cg.deinit();
         break :blk cg.get().fqn;
     };
-    fieldReadCachePut(self, fqn, full_name, .{ .getter = @intCast(fid.int()), .stored_idx = root.ProgramImage.FieldReadHit.NONE });
+    fieldReadCachePut(self, receiver.Instance, fqn, full_name, .{ .getter = @intCast(fid.int()), .stored_idx = root.ProgramImage.FieldReadHit.NONE });
 }
 
 /// After a `$sgetter$` terminal recursed on the bare property and resolved,
@@ -3315,19 +3346,21 @@ fn sgetterPutGetter(self: *VmHost, receiver: *const Value, full_name: []const u8
 /// reads (and the GetField site memo) skip the arm's per-read walks.
 fn sgetterCopyMemo(self: *VmHost, receiver: *const Value, prop: []const u8, full_name: []const u8) void {
     if (receiver.* != .Instance) return;
+    const inst = receiver.Instance;
+    var class_p: usize = 0;
     const fqn = blk: {
-        const g = receiver.Instance.borrow();
+        const g = inst.borrow();
         defer g.deinit();
+        class_p = g.get().class.identity();
         const cg = g.get().class.borrow();
         defer cg.deinit();
         break :blk cg.get().fqn;
     };
     const hit = blk: {
-        const pg = self.prog.borrow();
-        defer pg.deinit();
-        break :blk pg.get().field_read_cache.get(.{ .a = fqn, .b = prop });
+        const name_p = host_call_member.memberNameIdentity(self, prop) orelse break :blk null;
+        break :blk fieldReadCacheGet(self, class_p, name_p);
     } orelse return;
-    fieldReadCachePut(self, fqn, full_name, hit);
+    fieldReadCachePut(self, inst, fqn, full_name, hit);
 }
 
 /// Whether a stored `.Null` in `name`'s slot means an uninitialized
@@ -3805,11 +3838,14 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     const write_cache_ok = receiver.* == .Instance and !bypass_setter and
         super_owner == null and ir.eval.dispatchCacheStable();
     if (write_cache_ok) {
-        const rf_c = classFqnOf(receiver.Instance);
+        const wclass_p = blk: {
+            const g = receiver.Instance.borrow();
+            defer g.deinit();
+            break :blk g.get().class.identity();
+        };
         const hit: ?root.ProgramImage.FieldWriteHit = blk: {
-            const pg = self.prog.borrow();
-            defer pg.deinit();
-            break :blk pg.get().field_write_cache.get(.{ .a = rf_c, .b = real_name });
+            const name_p = host_call_member.memberNameIdentity(self, real_name) orelse break :blk null;
+            break :blk fieldWriteCacheGet(self, wclass_p, name_p);
         };
         if (hit) |h| {
             if (h.setter != root.ProgramImage.FieldWriteHit.NONE) {
@@ -3999,7 +4035,7 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     return .{ .err = .{ .Type = msg } };
                 }
                 if (write_cacheable) {
-                    fieldWriteCachePut(self, classFqnOf(inst), real_name, .{
+                    fieldWriteCachePut(self, inst, classFqnOf(inst), real_name, .{
                         .setter = fid.int(),
                         .store_name = "",
                     });
@@ -4109,7 +4145,7 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 break :blk real_name;
             };
             if (write_cacheable and plain_recordable) {
-                fieldWriteCachePut(self, classFqnOf(inst), real_name, .{
+                fieldWriteCachePut(self, inst, classFqnOf(inst), real_name, .{
                     .setter = root.ProgramImage.FieldWriteHit.NONE,
                     .store_name = store_name,
                 });

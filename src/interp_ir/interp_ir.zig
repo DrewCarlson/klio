@@ -274,20 +274,25 @@ pub const ProgramImage = struct {
     /// the primitive-arg-type signature (computed only when every arg is a
     /// primitive scalar, where the tag fully determines selection).
     overload_cache: std.AutoHashMap(OverloadKey, u32),
-    /// Field-READ resolution memo, keyed (receiver fqn, field name):
+    /// Field-READ resolution memo, keyed (receiver class cell identity,
+    /// interned field-name identity — see `memberNameIdentity`) so the hot
+    /// probe hashes two integers instead of the class-fqn + name byte pair:
     /// whether the read runs a custom getter (`getter` FuncId) or lands in
     /// a stored slot (`stored_idx` into the instance field list, verified
     /// by name at each hit since instances can define extras dynamically).
     /// Both facts derive from the static class graph, so one probe here
-    /// replaces the per-read getter BFS + linear slot scan.
-    field_read_cache: std.HashMap(StrPair, FieldReadHit, build.StrPairContext, std.hash_map.default_max_load_percentage),
-    /// Field-WRITE resolution memo, keyed (receiver class fqn, field name):
+    /// replaces the per-read getter BFS + linear slot scan. Entries exist
+    /// only for main-module classes, whose cells the registry keeps alive
+    /// for the program's life — the identity key can never alias a
+    /// reclaimed cell (the same discipline as `instance_method_cache`).
+    field_read_cache: std.AutoHashMap(MemberHasKey, FieldReadHit),
+    /// Field-WRITE resolution memo, keyed like `field_read_cache`:
     /// whether the write runs a custom setter (`setter` FuncId) or lands in
     /// a stored slot under `store_name`. Recorded only when every consulted
     /// fact is class-static (main-module class, no delegate, no dynamic
     /// forwarding), so one probe replaces the per-write ext-setter /
     /// delegated / custom-setter / override-cell ladder.
-    field_write_cache: std.HashMap(StrPair, FieldWriteHit, build.StrPairContext, std.hash_map.default_max_load_percentage),
+    field_write_cache: std.AutoHashMap(MemberHasKey, FieldWriteHit),
     /// Declaring-class memo for an instance method's implicit-`this` static
     /// receiver resolution: `(module, FuncId)` → the simple name of the class
     /// whose `methods` list owns the FuncId (`null` = no owning class found).
@@ -412,8 +417,8 @@ pub const ProgramImage = struct {
             .host_has_member_cache = std.AutoHashMap(MemberHasKey, bool).init(allocator),
             .cmg_global_cache = std.AutoHashMap(CmgGlobalKey, void).init(allocator),
             .overload_cache = std.AutoHashMap(OverloadKey, u32).init(allocator),
-            .field_read_cache = std.HashMap(StrPair, FieldReadHit, build.StrPairContext, std.hash_map.default_max_load_percentage).init(allocator),
-            .field_write_cache = std.HashMap(StrPair, FieldWriteHit, build.StrPairContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .field_read_cache = std.AutoHashMap(MemberHasKey, FieldReadHit).init(allocator),
+            .field_write_cache = std.AutoHashMap(MemberHasKey, FieldWriteHit).init(allocator),
             .func_owner_class_cache = std.AutoHashMap(FuncOwnerKey, ?[]const u8).init(allocator),
             .allocator = allocator,
         };
@@ -480,6 +485,14 @@ pub const ProgramImage = struct {
         self.field_read_cache.deinit();
         self.field_write_cache.deinit();
         self.func_owner_class_cache.deinit();
+    }
+
+    /// Read-only probe for an already-interned name identity, so callers
+    /// holding only a shared borrow (the hot path) can resolve without the
+    /// exclusive lock `memberNameIdentity`'s insert arm needs.
+    pub fn memberNameIdentityExisting(self: *const ProgramImage, name: []const u8) ?usize {
+        if (self.member_names.getKey(name)) |stored| return @intFromPtr(stored.ptr);
+        return null;
     }
 
     /// Return the program-lifetime pointer identity for `name`. Cache callers
