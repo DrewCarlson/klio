@@ -342,13 +342,53 @@ the V4 tests as acceptance):
       pays appendNTimes ~1% — needs a per-frame written mask that gcMark
       and suspension snapshots respect, so it is a real change, not a
       tweak).
-- [ ] A3. Name-keyed map pressure: getIndex ~2.8% + eqlBytes ~3.5% spread
+- [x] A3. Name-keyed map pressure: getIndex ~2.8% + eqlBytes ~3.5% spread
       across registry/dispatch maps. The structural direction is
       intern-once: resolve names to integer ids at lowering/link time so
       runtime probes are integer-keyed (the member-resolve name_p identity
       cache is the pattern; extend it toward funcsBySimpleName,
       field lookup, and the import-scope maps). Measure per-map first via
       KLIO_PROF_CALLERS=getIndex before converting anything.
+      ROUND RECORD (2026-08-17, 9715a0cf; rig session baseline
+      ms_per_rep median 3646 solo — the recorded 3860 was a
+      heavier-load day, cross-day rig numbers do not compare):
+      - Landed (one commit, four steps, all verified together):
+        (1) field_read_cache/field_write_cache re-keyed from (fqn, name)
+        string pairs to (class cell identity, interned name identity) —
+        integer hash/eql, owned key strings deleted, one instance borrow
+        instead of instance+class per probe; (2) gen-stamped thread-local
+        L1s in front of both field memos (the tl_method_cache pattern —
+        steady-state field reads/writes skip the program-cell borrow and
+        shared probe); (3) the same L1 for instance_intrinsic_cache
+        (native-bound member calls stopped paying borrow + shared probe
+        per call); (4) memberNameIdentity hardened: multiplicative slot
+        mix (the raw-address modulo ping-ponged on arena allocation
+        strides), 2048 -> 8192 slots, and a shared-borrow intern probe
+        before the borrowMut insert arm (the old path took the EXCLUSIVE
+        program lock on every TLS miss).
+      - Measured: wall NEUTRAL solo (median 3646 -> 3648, min 3621 ->
+        3585; the rig's noise band is ~3% and swallows the ~1% these
+        probes cost). Matched profile runs: getIndex leaf samples
+        740 -> ~640; eqlBytes ~unchanged (~560-600). Mechanism
+        conclusion: the buckets are NOT one hot map — eql__anon_3017
+        (~2.5%) is the shared std.mem.eql instantiation summed over ALL
+        string maps AND the non-map string compares (arm guards,
+        type-name scoring in applicability), and the getAdapted spread
+        is dozens of registry maps at <0.3% each.
+      - Declined (recorded, re-open only on a motivating measurement):
+        converting the remaining registry string maps one-by-one (each
+        <0.3%, cost/risk beats win); lookupGlobalThrowing's 3-probe
+        ladder (~0.5%, needs an import-scope id design, not a map swap);
+        per-GetField-site name-id operands in the IR (the address-keyed
+        TLS cache already gives per-site behavior after the hash fix).
+        The real residual pressure is the callMember ladder re-probing
+        multiple caches per call for calls that resolve late (native
+        bindings, extensions) — that is per-call-SITE route memoization,
+        an A2-shaped exec-loop change, not a map conversion.
+      - Verified: interp_ir units 118/118, parity_corpus_pinned +
+        differential + e2e green (one e2e step flaked its first
+        background run under census load, green x3 foreground and via
+        the direct binary), full stdlib sweep 117 files / 0 fails.
 - [x] A4. Re-measure under CONTENTION, not just solo: the stress tests
       fail in-suite worse than solo. Add an 8-way contention variant of
       the rig (run 8 aacbench processes pinned) so lever measurements see
