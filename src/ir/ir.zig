@@ -1221,6 +1221,9 @@ pub const Func = struct {
     acc_route: u64 = 0,
     /// Cached `leafExprBody` verdict: 0 = unasked, 1 = no, 2 = yes.
     leaf_state: u8 = 0,
+    /// Cached `frameNoFill` verdict: 0 = unasked, 1 = must fill,
+    /// 2 = register file may start unfilled.
+    frame_fill_state: u8 = 0,
     /// True when `params[0]` is a *synthesized* `this` receiver — an
     /// instance method's / extension's / local-extension's dispatch
     /// receiver, a constructor's or init thunk's instance under
@@ -1425,6 +1428,143 @@ pub const Func = struct {
         return true;
     }
 
+    /// Whether a fresh frame for this func may leave its register file
+    /// unfilled: every register read in the body is preceded by a write on
+    /// ALL paths from entry, so no path can observe a stale slot. Beyond
+    /// `leafNoFill`'s same-block/entry rule this runs a must-written
+    /// dataflow over the CFG (join = intersection over predecessors), so
+    /// branch-and-join initialization (`val x = if (c) a else b`) proves
+    /// too. Funcs with catch/finally/labeled-return absorption keep the
+    /// eager fill — an exception edge can enter a handler with only part
+    /// of a block's writes done. The proof covers program reads only; the
+    /// frame layer's written mask keeps the collector and suspension
+    /// snapshots away from unwritten slots.
+    pub fn frameNoFill(self: *const Func) bool {
+        switch (self.frame_fill_state) {
+            1 => return false,
+            2 => return true,
+            else => {},
+        }
+        // A deferred body has no blocks to analyze yet; decide (and cache)
+        // only once it is decoded.
+        if (self.blocks.len == 0) return false;
+        const verdict = self.frameDefBeforeUse();
+        @constCast(self).frame_fill_state = if (verdict) 2 else 1;
+        return verdict;
+    }
+
+    fn frameDefBeforeUse(self: *const Func) bool {
+        if (self.n_locals > 64) return false;
+        const nb = self.blocks.len;
+        if (nb == 0 or nb > FRAME_FILL_MAX_BLOCKS) return false;
+        const entry_idx = self.entry.int();
+        if (entry_idx >= nb) return false;
+        for (self.blocks) |*b| {
+            if (b.catches.len != 0 or b.finally != null or b.lr_absorb != null) return false;
+        }
+        const Ctx = struct {
+            uses: u64 = 0,
+            defs: u64 = 0,
+            oob: bool = false,
+            fn visit(c: *@This(), reg: Reg, is_def: bool) void {
+                const r = reg.int();
+                if (r >= 64) {
+                    c.oob = true;
+                    return;
+                }
+                const bit = @as(u64, 1) << @intCast(r);
+                if (is_def) c.defs |= bit else c.uses |= bit;
+            }
+        };
+        // Per-block summary: `gen` = registers the block writes, `exposed` =
+        // registers it reads before writing them itself. An instruction's own
+        // def never covers its own use (operands are read first), so uses are
+        // checked against strictly earlier instructions only. The scratch
+        // lives in TLS: stack arrays this size are poisoned on every call
+        // under the safe builds, and every slot consulted below is written
+        // first (`gen`/`exposed` per block, `in` in the explicit init loop).
+        const gen = &frame_fill_scratch[0];
+        const exposed = &frame_fill_scratch[1];
+        for (self.blocks, 0..) |*b, bi| {
+            var written: u64 = 0;
+            var expo: u64 = 0;
+            for (b.insts) |*inst| {
+                // `CtxScope.ctx_args` is a contiguous run of `n_ctx`
+                // registers, but the register visitor's run convention
+                // covers only the `args`+`n_args` field pair — the run's
+                // tail registers would go unreported as uses. Keep the
+                // eager fill for such bodies.
+                if (inst.* == .CtxScope) return false;
+                var c: Ctx = .{};
+                visitInstRegs(inst, &c, Ctx.visit);
+                if (c.oob) return false;
+                expo |= c.uses & ~written;
+                written |= c.defs;
+            }
+            var c: Ctx = .{};
+            visitTerminatorRegs(&b.terminator, &c, Ctx.visit);
+            if (c.oob) return false;
+            expo |= c.uses & ~written;
+            written |= c.defs;
+            gen[bi] = written;
+            exposed[bi] = expo;
+        }
+        // Forward must-written fixpoint. Unreachable blocks keep the ALL
+        // set and verify vacuously — they never run. A `TailJump` resets
+        // the register file, so it contributes no edge (the entry's in-set
+        // is pinned empty anyway); `TailCallFunc` leaves the function.
+        const in = &frame_fill_scratch[2];
+        for (0..nb) |bi| in[bi] = ~@as(u64, 0);
+        in[entry_idx] = 0;
+        var rounds: usize = 0;
+        while (rounds < nb + 8) : (rounds += 1) {
+            var changed = false;
+            for (self.blocks, 0..) |*b, bi| {
+                const out = in[bi] | gen[bi];
+                switch (b.terminator) {
+                    .Goto => |t| {
+                        if (t.int() >= nb) return false;
+                        if (t.int() != entry_idx and in[t.int()] & out != in[t.int()]) {
+                            in[t.int()] &= out;
+                            changed = true;
+                        }
+                    },
+                    .Branch => |br| {
+                        for ([2]BlockId{ br.t, br.f }) |t| {
+                            if (t.int() >= nb) return false;
+                            if (t.int() != entry_idx and in[t.int()] & out != in[t.int()]) {
+                                in[t.int()] &= out;
+                                changed = true;
+                            }
+                        }
+                    },
+                    .Switch => |sw| {
+                        for (sw.arms) |arm| {
+                            const t = arm.target;
+                            if (t.int() >= nb) return false;
+                            if (t.int() != entry_idx and in[t.int()] & out != in[t.int()]) {
+                                in[t.int()] &= out;
+                                changed = true;
+                            }
+                        }
+                        const t = sw.default;
+                        if (t.int() >= nb) return false;
+                        if (t.int() != entry_idx and in[t.int()] & out != in[t.int()]) {
+                            in[t.int()] &= out;
+                            changed = true;
+                        }
+                    },
+                    .Return, .Throw, .Unreachable, .TailJump, .TailCallFunc, .NonLocalReturn, .LabeledReturn => {},
+                }
+            }
+            if (!changed) break;
+        } else return false;
+        for (0..nb) |bi| {
+            if (exposed[bi] & ~in[bi] != 0) return false;
+        }
+        return true;
+    }
+
     /// Structural admission only. Which INSTRUCTIONS a leaf serve can
     /// actually execute is decided per instruction as it runs, because a
     /// body may reach a value-returning path made entirely of leaf work
@@ -1468,6 +1608,15 @@ pub const Func = struct {
 /// the block bound keeps a guard-shaped body admissible without admitting
 /// real control flow, and `LEAF_MAX_STEPS` bounds the walk itself.
 pub const LEAF_MAX_REGS: u32 = 64;
+
+/// CFG size bound for `frameNoFill`'s dataflow: the scratch sets are fixed
+/// buffers, and a body past this many blocks keeps the eager fill.
+const FRAME_FILL_MAX_BLOCKS: usize = 256;
+
+/// `frameDefBeforeUse` scratch (gen / exposed / in). Thread-local so the
+/// once-per-func analysis never pays the safe builds' stack poisoning, and
+/// concurrent first-asks on different threads stay independent.
+threadlocal var frame_fill_scratch: [3][FRAME_FILL_MAX_BLOCKS]u64 = undefined;
 pub const LEAF_MAX_INSTS: usize = 96;
 pub const LEAF_MAX_BLOCKS: usize = 32;
 pub const LEAF_MAX_STEPS: usize = 160;
