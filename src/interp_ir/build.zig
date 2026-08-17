@@ -571,6 +571,10 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         if (runtime.envOnce("KLIO_COMPOSE_DBG") != null) {
             compose_pass.dbg_groups = true;
             std.debug.print("[compose-pass] enabled, {d} composable names, {d} lambda sinks, {d} decls\n", .{ names.count(), sinks.count(), decls.items.len });
+            if (std.mem.eql(u8, runtime.envOnce("KLIO_COMPOSE_DBG").?, "sinks")) {
+                var sit = sinks.keyIterator();
+                while (sit.next()) |k| std.debug.print("[compose-sink] {s}\n", .{k.*});
+            }
         }
         compose_pass.active_composable_getter_props = &comp_getter_props;
         defer compose_pass.active_composable_getter_props = null;
@@ -4871,6 +4875,13 @@ pub const StdlibBase = struct {
     /// whole-program build, because cross-boundary renames/mangles and
     /// resolution could differ from the snapshot's.
     decl_names: StringSet,
+    /// The subset of `decl_names` declared in the ROOT package (files with
+    /// no package header) plus every lifted/mangled decl. Only these can
+    /// collide with a root-package user declaration under Kotlin scoping —
+    /// a named-package base decl is invisible to bare references in other
+    /// packages, so a user namesake cannot change any decision the base
+    /// build settled and the extend gate lets it through.
+    root_decl_names: StringSet,
     /// Packages the base files declare; a user file sharing one falls back
     /// (pack-private object aliasing scans sibling types per package).
     packages: StringSet,
@@ -4983,6 +4994,7 @@ fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, allow_main: b
         .built = built,
         .lifted_decls = lifted,
         .decl_names = StringSet.init(allocator),
+        .root_decl_names = StringSet.init(allocator),
         .packages = StringSet.init(allocator),
         .param_type_names = StringSet.init(allocator),
         .type_names = StringSet.init(allocator),
@@ -5003,9 +5015,14 @@ fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, allow_main: b
             }
             try base.packages.put(try dotted.toOwnedSlice(allocator), {});
         }
-        for (f.decls) |*d| try noteBaseDeclNames(base, d);
+        for (f.decls) |*d| try noteBaseDeclNames(base, d, f.package == null);
     }
-    for (base.lifted_decls) |*d| try noteBaseDeclNames(base, d);
+    // Lifted decls: mangled names carry `$` (never a legal user identifier,
+    // so never collidable), and plain-named lifts (member extensions and
+    // company) originate from the named-package files noted above — their
+    // bare-name visibility follows the same package scoping. They join the
+    // general universe only; the root universe keeps the files-loop truth.
+    for (base.lifted_decls) |*d| try noteBaseDeclNames(base, d, false);
 
     {
         const mg = base.built.module.borrow();
@@ -5143,7 +5160,7 @@ fn composeBaseSinkDecl(sinks: *std.StringHashMap(void), d: *const Decl) Allocato
     }
 }
 
-fn noteBaseDeclNames(base: *StdlibBase, d: *const Decl) Allocator.Error!void {
+fn noteBaseDeclNames(base: *StdlibBase, d: *const Decl, root_pkg: bool) Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| try base.decl_names.put(f.name.name, {}),
         .Property => |p| try base.decl_names.put(p.name.name, {}),
@@ -5159,6 +5176,15 @@ fn noteBaseDeclNames(base: *StdlibBase, d: *const Decl) Allocator.Error!void {
             try base.decl_names.put(t.name.name, {});
             try base.type_names.put(t.name.name, {});
         },
+    }
+    if (root_pkg) {
+        switch (d.*) {
+            .Function => |*f| try base.root_decl_names.put(f.name.name, {}),
+            .Property => |p| try base.root_decl_names.put(p.name.name, {}),
+            .Class => |*c| try base.root_decl_names.put(c.name.name, {}),
+            .Object => |*o| try base.root_decl_names.put(o.name.name, {}),
+            .TypeAlias => |*t| try base.root_decl_names.put(t.name.name, {}),
+        }
     }
 }
 
@@ -5182,34 +5208,60 @@ pub fn canExtendBase(base: *const StdlibBase, user_files: []const KotlinFile) bo
                 @memcpy(buf[n .. n + id.name.len], id.name);
                 n += id.name.len;
             }
-            if (base.packages.contains(buf[0..n])) return false;
+            if (base.packages.contains(buf[0..n])) return extendRefused("package overlap", buf[0..n]);
         }
+        // A root-package user FUNCTION or PROPERTY can only collide with a
+        // base callable that is itself reachable from the root package
+        // (root-package base files): named-package base callables are
+        // invisible to bare references outside their package under Kotlin
+        // scoping, and the callable dispatch tails are visibility-filtered,
+        // so the user namesake cannot change any base decision. The TYPE
+        // namespace (classes, objects, typealiases) stays on the whole-set
+        // refusal: runtime casts / `is` checks / reified probes resolve
+        // type names WITHOUT package scoping (a user `Node` broke the
+        // kotlinx.coroutines-internal `as Node` cast), so a user type
+        // namesake of ANY base type forces the full build. A user file
+        // that DECLARES a package keeps the conservative whole-set refusal
+        // for callables too.
+        const callable_names: *const StringSet = if (f.package == null) &base.root_decl_names else &base.decl_names;
         for (f.decls) |*d| {
             switch (d.*) {
                 .Function => |*fd| {
-                    if (fd.is_expect or fd.is_actual) return false;
-                    if (base.decl_names.contains(fd.name.name)) return false;
+                    if (fd.is_expect or fd.is_actual) return extendRefused("expect/actual fn", fd.name.name);
+                    if (callable_names.contains(fd.name.name)) return extendRefused("fn name", fd.name.name);
                 },
                 .Property => |pd| {
-                    if (pd.is_expect or pd.is_actual) return false;
-                    if (base.decl_names.contains(pd.name.name)) return false;
+                    if (pd.is_expect or pd.is_actual) return extendRefused("expect/actual prop", pd.name.name);
+                    if (callable_names.contains(pd.name.name)) return extendRefused("prop name", pd.name.name);
                 },
                 .Class => |*cd| {
-                    if (cd.is_expect or cd.is_actual) return false;
-                    if (base.decl_names.contains(cd.name.name)) return false;
+                    if (cd.is_expect or cd.is_actual) return extendRefused("expect/actual class", cd.name.name);
+                    if (base.decl_names.contains(cd.name.name)) return extendRefused("class name", cd.name.name);
                 },
                 .Object => |*od| {
-                    if (od.is_expect or od.is_actual) return false;
-                    if (base.decl_names.contains(od.name.name)) return false;
+                    if (od.is_expect or od.is_actual) return extendRefused("expect/actual object", od.name.name);
+                    if (base.decl_names.contains(od.name.name)) return extendRefused("object name", od.name.name);
                 },
                 .TypeAlias => |*td| {
-                    if (base.decl_names.contains(td.name.name)) return false;
-                    if (td.target.function != null and base.param_type_names.contains(td.name.name)) return false;
+                    if (base.decl_names.contains(td.name.name)) return extendRefused("alias name", td.name.name);
+                    if (td.target.function != null and base.param_type_names.contains(td.name.name)) return extendRefused("fn alias vs base param type", td.name.name);
                 },
             }
         }
     }
     return true;
+}
+
+/// Named refusal for the extend gate, surfaced under `KLIO_TRACE_STDLIB_IMAGE`
+/// so a silent image fallback (a full source re-lower costing seconds) is
+/// attributable to the exact colliding declaration.
+fn extendRefused(reason: []const u8, name: []const u8) bool {
+    if (runtime.envOnce("KLIO_TRACE_STDLIB_IMAGE")) |v| {
+        if (v.len != 0 and !std.mem.eql(u8, v, "0")) {
+            std.debug.print("[stdlib-image] extend refused: {s} `{s}`\n", .{ reason, name });
+        }
+    }
+    return false;
 }
 
 /// Per-run clone of the base's BuiltModule onto `a`. Spines are copied;
