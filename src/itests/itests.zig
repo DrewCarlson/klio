@@ -34,7 +34,8 @@ test {
     _ = @import("parity_object_init.zig");
     _ = @import("parity_operator_edge_cases.zig");
     _ = @import("parity_properties_accessors.zig");
-    _ = @import("parity_ranges_arrays.zig");
+    // parity_ranges_arrays folded into parity_array_bulk_ops (all its tests
+    // run there now; the donor file is deleted).
     _ = @import("parity_sealed_when_patterns.zig");
     // parity_string_processing folded into parity_strings_numbers (all its
     // tests run there now; the donor file is deleted).

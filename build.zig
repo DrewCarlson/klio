@@ -129,7 +129,6 @@ const itests_files = [_]Itest{
     .{ .name = "parity_object_init", .weight = 12 },
     .{ .name = "parity_operator_edge_cases" },
     .{ .name = "parity_properties_accessors" },
-    .{ .name = "parity_ranges_arrays" },
     .{ .name = "parity_sealed_when_patterns" },
     .{ .name = "parity_strings_numbers" },
     .{ .name = "parity_stdlib_isolation", .weight = 25 },

@@ -4,6 +4,9 @@
 //! `fill` and `encodeToByteArray` / `toByteArray` / `decodeToString`
 //! without a klio-runnable body; before the host actuals landed every
 //! one silently no-opped (a `ByteArray` copy left the destination zeroed).
+//! Also ranges, progressions, and primitive array specializations
+//! (IntArray init, step/downTo/until, char ranges, sliceArray,
+//! arrayOfNulls, withIndex, DoubleArray aggregates).
 
 const std = @import("std");
 const parity = @import("parity");
@@ -241,4 +244,133 @@ test "kotlinx_io_bytestring_encode_decode" {
         \\
     ;
     try assertKlio("kxio_bytestring", src, "5\nhello\nhel\n");
+}
+
+test "int_array_init_pattern" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val xs = IntArray(5) { it * it }
+        \\    println(xs.joinToString(","))
+        \\}
+        \\
+    ;
+    try assertKlio("intArray_init", src, "0,1,4,9,16\n");
+}
+
+test "array_of_primitives_sum" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val xs = intArrayOf(3,1,4,1,5,9,2,6)
+        \\    println("sum=${xs.sum()} max=${xs.max()} avg=${xs.average()}")
+        \\}
+        \\
+    ;
+    try assertKlio("prim_arr", src, "sum=31 max=9 avg=3.875\n");
+}
+
+test "range_step_explicit" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val sb = StringBuilder()
+        \\    for (i in 1..15 step 2) sb.append("$i,")
+        \\    sb.append("|")
+        \\    for (i in 10 downTo 1 step 3) sb.append("$i,")
+        \\    println(sb)
+        \\}
+        \\
+    ;
+    try assertKlio("range_step", src, "1,3,5,7,9,11,13,15,|10,7,4,1,\n");
+}
+
+test "until_range_exclusive" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val sb = StringBuilder()
+        \\    for (i in 0 until 5) sb.append("$i,")
+        \\    println(sb)
+        \\}
+        \\
+    ;
+    try assertKlio("until", src, "0,1,2,3,4,\n");
+}
+
+test "char_range_iteration" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val sb = StringBuilder()
+        \\    for (c in 'a'..'e') sb.append(c)
+        \\    println(sb)
+        \\}
+        \\
+    ;
+    try assertKlio("char_range", src, "abcde\n");
+}
+
+test "array_copy_and_slice" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val xs = intArrayOf(10,20,30,40,50)
+        \\    val slice = xs.sliceArray(1..3)
+        \\    println(slice.joinToString(","))
+        \\}
+        \\
+    ;
+    try assertKlio("slice", src, "20,30,40\n");
+}
+
+test "array_of_nulls_works" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val arr = arrayOfNulls<String>(3)
+        \\    arr[0] = "a"; arr[2] = "c"
+        \\    println(arr.joinToString(",") { it ?: "_" })
+        \\}
+        \\
+    ;
+    try assertKlio("arr_nulls", src, "a,_,c\n");
+}
+
+test "range_contains_check" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val r = 1..10
+        \\    println("${5 in r},${15 in r},${(1..3).contains(2)}")
+        \\}
+        \\
+    ;
+    try assertKlio("range_in", src, "true,false,true\n");
+}
+
+test "int_array_indexed_iter" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val xs = intArrayOf(10,20,30)
+        \\    val sb = StringBuilder()
+        \\    for ((i, v) in xs.withIndex()) sb.append("$i=$v;")
+        \\    println(sb)
+        \\}
+        \\
+    ;
+    try assertKlio("withIndex", src, "0=10;1=20;2=30;\n");
+}
+
+test "double_array_operations" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val xs = doubleArrayOf(1.5, 2.5, 3.5, 4.5)
+        \\    println("sum=${xs.sum()} avg=${xs.average()}")
+        \\}
+        \\
+    ;
+    try assertKlio("double_arr", src, "sum=12.0 avg=3.0\n");
 }
