@@ -93,11 +93,40 @@ Ground rules carried forward:
       read the "Build Summary: N/N steps succeeded" line and the test
       counts instead (that artifact was misdiagnosed as an e2e flake
       three times before 39d37ef5 silenced its source).
+      LANDING 2: host_call_member.zig 16057 -> 13628. The member surface
+      the host serves for builtin value shapes (53 decls: structural
+      equality/hash/render, natural ordering and the comparator ops, the
+      collection/array/`componentN` ops, the data-class conventions, and
+      the iteration protocol — builtin iterators with their
+      concurrent-modification counters, range iterators, the lazy
+      `Sequence` puller) moved verbatim into
+      src/interp_ir/vm/builtin_members.zig (2515 lines). It touches no
+      module-level dispatch state at all, so every cache, name-identity
+      slot, perm slot and fallback flag stays single-copy in the parent.
+      2456 lines move; the cut costs 25 exported entry points (22 of them
+      newly `pub`) and 16 parent internals `pub` for the alias block back
+      — ~63 lines per `pub` added — and the parent re-aliases every entry
+      point so its call sites and its test block are untouched.
+      MEASURED CEILING for host_call_member.zig: a call graph over its 495
+      top-level decls, scored by closure (absorb every decl whose only
+      in-file callers are already inside), tops out around 50-67 lines per
+      `pub`. Rejected with numbers: the positional-call route
+      (`callMemberInnerStatic` + 95 helpers, 5310 lines but 79 parent
+      `pub`s AND 12 module-state vars crossing the boundary), the named
+      route (1299 lines, 3 in + 42 out), the extension-fallback walk (1163
+      lines, 10 in + 50 out), the virtual-dispatch tier (1202 lines, 4 in
+      + 31 out), the stdlib ladder (468 lines, cost 20) and the cache tier
+      (175 lines, cost 15 — and `tl_perm_cache`/`tl_resolve_cache` are read
+      from outside it, so it cannot move without splitting state).
       Landed so far: `src/ir/lower/static_call_type.zig` (2.5k lines) holds
       the static call return-type ladder lifted out of expr.zig, which is
-      now 21.5k. A sibling lower file needs no build.zig entry; the cut
-      cost three `pub` entry points out and nineteen shared expr.zig
-      internals `pub` for the alias block back.
+      now 21.5k, for three `pub` entry points out and nineteen shared
+      expr.zig internals `pub` back;
+      `src/interp_ir/vm/builtin_members.zig` (2.5k lines) holds the
+      builtin-receiver member surface lifted out of host_call_member.zig,
+      now 13.6k, for twenty-five entry points out and sixteen internals
+      `pub` back. A sibling file in an existing module needs no build.zig
+      entry.
 - [x] S3. Plan-register hygiene: 44 docs under plans/. Reconcile
       open-campaigns.md against current reality (zip/combine fixed, ktor
       census 465/2/0, coroutine cluster closed), move finished campaign

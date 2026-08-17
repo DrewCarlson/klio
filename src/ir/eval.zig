@@ -11117,7 +11117,7 @@ inline fn rangeElemEval(cur: i64, kind: runtime.RangeKind) Value {
 /// `hasNext()`/`next()` member calls; handling them here skips the full member
 /// dispatch (and its per-call hashmap probes), which dominates tight loops.
 /// Returns the result for hasNext/next, or null to fall through for any other
-/// method. Mirrors `host_call_member.rangeIterMember`.
+/// method. Mirrors `builtin_members.rangeIterMember`.
 inline fn rangeIterFast(allocator: Allocator, recv: *const Value, name: []const u8, n_args: u32) ?EvalResult {
     if (n_args != 0) return null;
     const is_has_next = std.mem.eql(u8, name, "hasNext");
