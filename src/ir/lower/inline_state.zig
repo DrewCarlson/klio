@@ -237,6 +237,19 @@ pub fn registerExprBodyMember(owner: []const u8, f: *const ast.Function) std.mem
     try expr_body_members.?.put(key, FnField.fromPtr(f));
 }
 
+/// Drop every registered expression-body member AST (and free the owned
+/// keys). The pointers share ONE program's build arena; an in-process
+/// driver must clear them at the run boundary or the next program's
+/// same-named lookups read freed memory.
+pub fn resetExprBodyMembers() void {
+    if (expr_body_members) |*m| {
+        var it = m.keyIterator();
+        while (it.next()) |k| std.heap.page_allocator.free(k.*);
+        m.deinit();
+        expr_body_members = null;
+    }
+}
+
 /// The registered expression body for (owner, name, arity), or null.
 pub fn exprBodyMemberAst(owner: []const u8, name: []const u8, nparams: usize) ?*const ast.Function {
     var buf: [256]u8 = undefined;

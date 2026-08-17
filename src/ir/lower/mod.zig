@@ -77,6 +77,7 @@ pub const exprBodyMemberAst = inline_state.exprBodyMemberAst;
 pub const resetInlineMemberOwners = inline_state.resetInlineMemberOwners;
 pub const registerInlineMemberOwner = inline_state.registerInlineMemberOwner;
 pub const resetMemberPropAsts = inline_state.resetMemberPropAsts;
+pub const resetExprBodyMembers = inline_state.resetExprBodyMembers;
 pub const registerMemberPropAst = inline_state.registerMemberPropAst;
 pub const resetMemberExtPropRecv = inline_state.resetMemberExtPropRecv;
 pub const registerMemberExtPropRecv = inline_state.registerMemberExtPropRecv;

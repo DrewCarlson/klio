@@ -55,6 +55,7 @@ pub const registerInlineMemberOwner = mod.registerInlineMemberOwner;
 pub const registerExprBodyMember = mod.registerExprBodyMember;
 pub const exprBodyMemberAst = mod.exprBodyMemberAst;
 pub const resetMemberPropAsts = mod.resetMemberPropAsts;
+pub const resetExprBodyMembers = mod.resetExprBodyMembers;
 pub const registerMemberPropAst = mod.registerMemberPropAst;
 pub const resetMemberExtPropRecv = mod.resetMemberExtPropRecv;
 pub const registerMemberExtPropRecv = mod.registerMemberExtPropRecv;

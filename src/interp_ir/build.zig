@@ -2422,6 +2422,9 @@ fn buildModuleWithOverrides(
         ir.lower.resetInlineMemberOwners();
         ir.lower.resetMemberPropAsts();
         ir.lower.resetMemberExtPropRecv();
+        // Same lifetime rule as the two above: the registered expression-body
+        // member ASTs point into the PREVIOUS build's arena.
+        ir.lower.resetExprBodyMembers();
         var fcit = file_classes.iterator();
         while (fcit.next()) |e| {
             registerInlineMemberOwners(e.value_ptr.get().members, e.value_ptr.get().name.name);
