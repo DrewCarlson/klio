@@ -118,7 +118,6 @@ const itests_files = [_]Itest{
     .{ .name = "parity_generics_advanced" },
     .{ .name = "parity_inheritance_dispatch" },
     .{ .name = "parity_inner_classes" },
-    .{ .name = "parity_interfaces_visibility" },
     .{ .name = "parity_kotlinx_io_read" },
     .{ .name = "parity_lambdas_and_dispatch", .weight = 8 },
     .{ .name = "parity_named_args_defaults" },

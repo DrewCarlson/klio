@@ -35,7 +35,10 @@ test {
     _ = @import("parity_generics_advanced.zig");
     _ = @import("parity_inheritance_dispatch.zig");
     _ = @import("parity_inner_classes.zig");
-    _ = @import("parity_interfaces_visibility.zig");
+    // parity_interfaces_visibility.zig is deleted, not skipped: its
+    // interface/dispatch tests were moved verbatim into
+    // parity_inheritance_dispatch; parity_visibility_modifiers remains the
+    // visibility suite.
     _ = @import("parity_kotlinx_io_read.zig");
     _ = @import("parity_lambdas_and_dispatch.zig");
     _ = @import("parity_named_args_defaults.zig");

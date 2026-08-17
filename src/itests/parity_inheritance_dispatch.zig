@@ -279,3 +279,99 @@ test "override_val_super_reads_base_cell" {
     ;
     try assertKlio("c_shadow_override", src, "2\n2\n1\n2\n");
 }
+
+// Interface contracts, default methods, fun interfaces, delegation, and
+// access through upcast/downcast.
+
+test "diamond_inheritance_explicit_super" {
+    const src =
+        \\
+        \\interface A { fun ping(): String = "A" }
+        \\interface B { fun ping(): String = "B" }
+        \\class C : A, B {
+        \\    override fun ping(): String = super<A>.ping() + super<B>.ping()
+        \\}
+        \\fun main() { println(C().ping()) }
+        \\
+    ;
+    try assertKlio("diamond", src, "AB\n");
+}
+
+test "fun_interface_lambda_conversion" {
+    const src =
+        \\
+        \\fun interface IntPred { fun test(x: Int): Boolean }
+        \\fun count(xs: List<Int>, p: IntPred): Int = xs.count { p.test(it) }
+        \\fun main() {
+        \\    val evens = count(listOf(1,2,3,4,5,6)) { it % 2 == 0 }
+        \\    println(evens)
+        \\}
+        \\
+    ;
+    try assertKlio("fun_iface", src, "3\n");
+}
+
+test "interface_property_via_getter" {
+    const src =
+        \\
+        \\interface Named { val name: String; val length: Int get() = name.length }
+        \\class P(override val name: String) : Named
+        \\fun main() {
+        \\    val p = P("kotlin")
+        \\    println("${p.name},${p.length}")
+        \\}
+        \\
+    ;
+    try assertKlio("iface_prop", src, "kotlin,6\n");
+}
+
+test "abstract_with_protected_concrete" {
+    const src =
+        \\
+        \\abstract class Shape {
+        \\    abstract fun area(): Double
+        \\    fun describe(): String = "area=${area()}"
+        \\}
+        \\class Circle(val r: Double) : Shape() { override fun area(): Double = r * r * 3.14 }
+        \\class Sq(val s: Double) : Shape() { override fun area(): Double = s * s }
+        \\fun main() {
+        \\    val xs: List<Shape> = listOf(Circle(2.0), Sq(3.0))
+        \\    println(xs.joinToString(";") { it.describe() })
+        \\}
+        \\
+    ;
+    try assertKlio("abstract_concrete", src, "area=12.56;area=9.0\n");
+}
+
+test "upcast_then_downcast_safe" {
+    const src =
+        \\
+        \\open class Animal(val name: String)
+        \\class Dog(name: String, val breed: String) : Animal(name)
+        \\fun main() {
+        \\    val a: Animal = Dog("Rex", "Pug")
+        \\    val d = a as? Dog
+        \\    val cat = a as? Cat
+        \\    println("${d?.breed},${cat?.name}")
+        \\}
+        \\class Cat(name: String) : Animal(name)
+        \\
+    ;
+    try assertKlio("upcast_safe", src, "Pug,null\n");
+}
+
+test "interface_implementation_through_property_delegation" {
+    const src =
+        \\
+        \\interface Pinger { fun ping(): String }
+        \\class DelegPinger(p: Pinger) : Pinger by p
+        \\class HelloP : Pinger { override fun ping(): String = "Hello" }
+        \\fun main() {
+        \\    val p = DelegPinger(HelloP())
+        \\    println(p.ping())
+        \\}
+        \\
+    ;
+    try assertKlio("iface_deleg", src, "Hello\n");
+}
+
