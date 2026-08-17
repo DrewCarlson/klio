@@ -221,6 +221,19 @@ Ground rules carried forward:
         - Still open in A5: differential (corpus × 2 modes, one
           process) needs the same grouping treatment or per-mode
           processes; re-measure after the ui-text determinism fix.
+      - V1 CLOSED — GATE GREEN (unit OK, 12-suite litmus batch OK,
+        harness sweep OK, rc=0). The last two in-gate reds were:
+        - a live-parked activation resumed on a different worker than
+          its parker dereferencing the dead thread's TLS (the
+          daemon-abandon teardown SEGV behind the ktor_server flake and
+          the litmus cancel-family load flakes) — fixed by rebinding to
+          the resuming thread at reactivation;
+        - the threaded-litmus suite spawning harness children without
+          being declared needs_exe — under the gate's clean env the
+          child fell back to a STALE debug zig-out/bin/klio, so the
+          eager IR pins tested weeks-old lowering (only reproducible
+          in-gate; every dev shell exported KLIO_ITEST_BIN). The pins
+          now name themselves and dump the IR on mismatch.
       - Singles, all closed:
         - threaded_litmus 45/45: manifest additions committed; the eager
           parity fail was the plus static commit lost to the advisory
@@ -271,18 +284,31 @@ Ground rules carried forward:
       unclear) and the recorded verdict is do-not-diverge. The raised
       440 baseline absorbs them; open-campaigns.md §4 carries the full
       anatomy.
-- [ ] V4. The 4 concurrency stress tests + validatePotentialDeadlock +
+- [x] V4. The 4 concurrency stress tests + validatePotentialDeadlock +
       the 2 PausableCompositionTests background tests: all compute-bound
       (measured, not mechanism bugs). They are the ACCEPTANCE METRIC for
       Accelerate work, not independent fixes — each Accelerate round
       re-runs them solo against their declared budgets and records the
       new standing.
-- [ ] V5. Leniency follow-through: the unimported-extension warning landed
+      Standing after the A5 memory round (2026-08-17): concurrency_stress
+      5/5 solo in 15s (RACE_JITTER on); validatePotentialDeadlock
+      (RecomposerTests) and both PausableCompositionTests background
+      tests pass inside the ratcheted plugin suite run (1372-1374
+      observed, 0 DNC) — within their runTest budgets. Recurring: re-run
+      at each future Accelerate round.
+- [x] V5. Leniency follow-through: the unimported-extension warning landed
       (once-per-declaration, exact import named). Consider the next
       escalation once import tracking is trusted: a `klio check` /
       diagnostic-mode error for the same evidence, keeping `klio run`
       lenient-but-loud. Blocked on confidence in wildcard/alias/default
       import coverage; not before.
+      DECISION (2026-08-17): the blocker stands — this campaign added
+      collectQualifiedPrefixes precisely because bare-FQN reference
+      tracking had a hole, evidence that import-coverage confidence is
+      not yet earned. The warning stays; the escalation re-opens when a
+      full pass over wildcard/alias/default/bare-FQN coverage lands with
+      its own test matrix. Recorded here and in open-campaigns.md; no
+      code change.
 
 ## Track A — Accelerate
 
