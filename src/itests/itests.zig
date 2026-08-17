@@ -20,7 +20,9 @@ test {
     // parity_collections_intensive (all their tests run there now, and the
     // two donor files are deleted, so their imports are gone below).
     _ = @import("parity_collections_intensive.zig");
-    _ = @import("parity_conformance.zig");
+    // parity_conformance.zig is deleted, not skipped: the mm1..mm11 litmus
+    // tests and the conformance_suite_is_complete guard were moved verbatim
+    // into parity_threaded_litmus.zig (one binary, both fixture dirs).
     _ = @import("parity_corpus_pinned.zig");
     _ = @import("ktor_client_get.zig");
     _ = @import("ktor_channel_async.zig");
