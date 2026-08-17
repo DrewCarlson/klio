@@ -774,3 +774,81 @@ test "overload delegation uses callable parameter return type" {
     ;
     try expectOutput("callable_return_overload", src, "true\n");
 }
+
+// kotlinx.atomicfu atomic-array bare simple names (`AtomicIntArray`,
+// `atomicArrayOfNulls`) must not ambiguate with the unimplemented
+// `kotlin.concurrent.atomics` `expect` classes the stdlib pack carried;
+// a user import once failed at runtime until the stdlib pack stopped
+// bundling those array `expect`s.
+test "atomic_int_array_get_set_and_size" {
+    const src =
+        \\
+        \\import kotlinx.atomicfu.AtomicIntArray
+        \\fun main() {
+        \\    val a = AtomicIntArray(3)
+        \\    a[0].value = 42
+        \\    a[2].value = 7
+        \\    println("${a[0].value},${a[1].value},${a[2].value},${a.size}")
+        \\}
+        \\
+    ;
+    try expectOutput("atomic_int_array", src, "42,0,7,3\n");
+}
+
+test "atomic_array_of_nulls" {
+    const src =
+        \\
+        \\import kotlinx.atomicfu.atomicArrayOfNulls
+        \\fun main() {
+        \\    val a = atomicArrayOfNulls<String>(4)
+        \\    a[0].value = "x"
+        \\    println("${a[0].value},${a[1].value},${a.size}")
+        \\}
+        \\
+    ;
+    try expectOutput("atomic_array_of_nulls", src, "x,null,4\n");
+}
+
+// Bare `min(Int, Int)` / `maxOf` resolve to the top-level math/comparison
+// functions even when the full kotlinx-io corpus has registered every
+// same-named array/collection receiver-extension intrinsic.
+test "bare_min_max_resolve_to_toplevel_under_full_corpus" {
+    const src =
+        \\
+        \\import kotlinx.io.Buffer
+        \\import kotlin.math.min
+        \\import kotlin.math.max
+        \\fun main() {
+        \\    val b = Buffer()
+        \\    println(min(5, 3))
+        \\    println(max(5, 3))
+        \\    println(minOf(2, 9))
+        \\    println(maxOf(2, 9))
+        \\}
+        \\
+    ;
+    try expectOutput("bare_min_max_corpus", src, "3\n5\n2\n9\n");
+}
+
+// `b.readLine()` dispatches the `Source.readLine()` extension, not the
+// top-level `kotlin.io.readLine` console reader (which the member probe
+// matched via `kotlin.io.{name}` and would have run against empty stdin,
+// returning null). A genuine source extension on the receiver's type
+// chain outranks a same-named non-extension top-level io function.
+test "read_line_dispatches_source_extension_not_console" {
+    const src =
+        \\
+        \\import kotlinx.io.Buffer
+        \\import kotlinx.io.readLine
+        \\import kotlinx.io.writeString
+        \\fun main() {
+        \\    val b = Buffer()
+        \\    b.writeString("line1\nline2\n")
+        \\    println(b.readLine())
+        \\    println(b.readLine())
+        \\    println(b.readLine())
+        \\}
+        \\
+    ;
+    try expectOutput("read_line_source_ext", src, "line1\nline2\nnull\n");
+}

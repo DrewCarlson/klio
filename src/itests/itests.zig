@@ -8,7 +8,10 @@ test {
     // nullability_deep, type_system_shapes, exceptions_and_flow,
     // data_class_features, sealed_when_patterns); both files are deleted.
     _ = @import("parity_array_bulk_ops.zig");
-    _ = @import("parity_atomicfu_arrays.zig");
+    // parity_atomicfu_arrays.zig and parity_kotlinx_io_read.zig are deleted,
+    // not skipped: their resolution pins were moved verbatim into
+    // resolve_ambiguity.zig; the library-behavior tests are owned by the
+    // atomicfu/io commontest census suites.
     // parity_closures_advanced folded into parity_closures_deep (its unique
     // tests run there now; the one dropped test was a duplicate of
     // captured_var_sibling_closures_and_hof).
@@ -39,7 +42,6 @@ test {
     // interface/dispatch tests were moved verbatim into
     // parity_inheritance_dispatch; parity_visibility_modifiers remains the
     // visibility suite.
-    _ = @import("parity_kotlinx_io_read.zig");
     _ = @import("parity_lambdas_and_dispatch.zig");
     _ = @import("parity_named_args_defaults.zig");
     _ = @import("parity_nullability_deep.zig");
