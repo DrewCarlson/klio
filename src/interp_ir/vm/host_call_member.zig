@@ -3362,6 +3362,58 @@ fn classChainHasInvokeIn(mod: *const Module, v: *const Value) bool {
     return false;
 }
 
+/// Whether the call's ARG COUNT leaves exactly one of the collected
+/// same-name candidates able to bind: every other candidate has a plain
+/// (no-vararg) parameter list whose arity can never accept `n_args`. The
+/// arg count is folded into every method-cache key, so a pick forced this
+/// way is a pure function of the RELAXED key too — the single-candidate
+/// cacheability gate widens to it (`addAll(Collection)` beside
+/// `addAll(index, Collection)` re-walked on every call because the
+/// name-level candidate count read as ambiguous). A candidate with
+/// defaults or a vararg counts as viable at any arity (conservative), and
+/// a pass-threaded composable pair bails outright — its effective arity
+/// consults the ambient composer, which no key folds.
+fn pickArityForced(self: *VmHost, candidates: []const Func, n_args: usize) bool {
+    var viable: usize = 0;
+    for (candidates) |*f| {
+        const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        const effective = f.params[skip..];
+        if (effective.len >= 2 and
+            std.mem.eql(u8, effective[effective.len - 1].name, "$changed") and
+            std.mem.eql(u8, effective[effective.len - 2].name, "$composer")) return false;
+        var has_vararg = false;
+        for (effective) |*p| {
+            if (p.is_vararg) has_vararg = true;
+        }
+        const viable_c = has_vararg or effective.len == n_args or
+            (effective.len > n_args and funcDefaults(self, f) != null);
+        if (viable_c) {
+            viable += 1;
+            if (viable > 1) return false;
+        }
+    }
+    return viable == 1;
+}
+
+/// Whether every argument's shape is fully discriminated by the RELAXED
+/// signature fold at the level the applicability tests consult: value
+/// tags, Instance class identities, closure bodies, primitive array
+/// kinds, and container KINDS (the tests are nominal/kind-level — they
+/// never inspect elements). Object arrays and every other value shape
+/// stay out: the fold cannot tell them apart as finely as a test might.
+fn argsRelaxedAdjudicable(args: []const Value) bool {
+    for (args) |*a| {
+        switch (a.*) {
+            .Int, .Long, .Double, .Float, .Short, .Byte, .Char, .Bool, .UInt, .ULong, .UShort, .UByte, .Instance, .String, .Unit, .IrClosure, .Null, .Result, .List, .Set, .Map => {},
+            .Array => |arr| {
+                if (arr.prim == null) return false;
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
 fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []const Func, args_in: []const Value) ?Func {
     if (candidates.len == 0) return null;
     const args = args_in;
@@ -9277,6 +9329,11 @@ pub fn setTrailingMemberCall(on: bool) bool {
     return prev;
 }
 
+/// `unambiguous` = the pick is a pure function of the RELAXED method-cache
+/// key: the resolving class collected exactly one candidate, or the call's
+/// arg count forced the pick among several (see `pickArityForced`) with
+/// every argument relaxed-adjudicable. Gates whether a relaxed-key cache
+/// entry may be stored.
 const ResolvedMethod = struct { fid: FuncId, unambiguous: bool };
 
 /// Resolve `receiver.name(args)` to the user method `FuncId` it would dispatch,
@@ -9707,7 +9764,8 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                 if (pickMethodOverload(self, mod, candidates.items, args)) |f| {
                     if (!callableArgPrefersFunctionExtension(self, mod, name, &f, receiver, args) and
                         !memberArgsDisprovenExtensionApplies(self, mod, name, &f, args))
-                        return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 };
+                        return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 or
+                            (pickArityForced(self, candidates.items, args.len) and argsRelaxedAdjudicable(args)) };
                 }
                 // Enqueue the resolved supertypes by identity (their IR class
                 // ids) so the inherited-method walk follows the real class
@@ -11572,6 +11630,9 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     // share its coarser signature.
     if (resolved.unambiguous or strict_key != null) {
         if (key) |k| instanceMethodCachePutRaw(self, k, @intFromEnum(resolved.fid));
+    }
+    if (runtime.envSetOnce("KLIO_WALK_TRACE")) {
+        std.debug.print("[ir-walk-fill] {s} strict={} key={} unamb={} -> cached={}\n", .{ name, strict_key != null, key != null, resolved.unambiguous, key != null and (resolved.unambiguous or strict_key != null) });
     }
     return try invokeMethodFuncId(self, allocator, receiver, resolved.fid, args);
 }
