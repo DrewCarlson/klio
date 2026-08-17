@@ -632,6 +632,22 @@ pub fn ObjRef(comptime T: type) type {
             cb.allocator.destroy(cb);
         }
 
+        /// Free the cell RIGHT NOW, regardless of refcount gating or memory
+        /// mode. For hand-managed process-global caches swapping their single
+        /// owner: the caller asserts no live handle dereferences the cell
+        /// afterwards, and the cell must not be on the sweep registry (mint
+        /// it under `alloc_perm`). Purges any remembered-set entry first.
+        pub fn destroyImmediately(self: Self) void {
+            if (gc.gc_enabled) gc.forgetCell(&self.cell.hdr);
+            const allocator = self.cell.allocator;
+            if (comptime owns_bytes) {
+                allocator.free(self.cell.data);
+            } else if (comptime hasDeinit(T)) {
+                deinitData(&self.cell.data, allocator);
+            }
+            allocator.destroy(self.cell);
+        }
+
         pub fn initOwned(allocator: std.mem.Allocator, v: T) std.mem.Allocator.Error!Self {
             const cell = try allocator.create(Cell);
             cell.* = .{

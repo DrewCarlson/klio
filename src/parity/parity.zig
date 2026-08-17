@@ -1711,6 +1711,12 @@ fn stdlibGateFull(io: Io, import_prefixes: *const std.StringHashMap(void), mask:
 fn getOrBuildBase(io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error!?*const BaseEntry {
     base_lock.lock();
     defer base_lock.unlock();
+    // A cached base outlives every program: its permanent cells must NOT
+    // land on the program-perm list of whichever program happened to build
+    // it first.
+    const saved_ppc = runtime.gc.program_perm_collect;
+    runtime.gc.program_perm_collect = false;
+    defer runtime.gc.program_perm_collect = saved_ppc;
 
     if (base_entries == null) base_entries = std.AutoHashMap(u32, CachedBase).init(std.heap.page_allocator);
     const key = baseKey(mode, mask, full);
@@ -1999,15 +2005,36 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
         runtime.gc.program_started = false;
         runtime.gc.alloc_perm = true;
         runtime.gc.release_to_os = runtime.slab.reclaimDormant;
+        if (runtime.envOnce("KLIO_GC_DEBUG")) |v| runtime.gc.gc_debug = v.len != 0 and !std.mem.eql(u8, v, "0");
+        if (runtime.envOnce("KLIO_GC_HIST")) |v| runtime.gc.gc_hist = v.len != 0 and !std.mem.eql(u8, v, "0");
         if (runtime.envOnce("KLIO_GC_STRESS")) |v| runtime.gc.gc_stress = v.len != 0 and !std.mem.eql(u8, v, "0");
+        // Program-perm window: permanent cells minted while THIS program
+        // builds and runs belong to the program, and the boundary frees
+        // them (`freeProgramPerm`). Shared mints are excluded surgically:
+        // `getOrBuildBase` masks the flag around the cached-base build.
+        runtime.gc.program_perm_collect = true;
+        // The mmap-site tracer normally arms in `main`; the in-process
+        // harness needs the same diagnosis surface for its multi-program
+        // RSS profile (`kill -TERM` dumps the top live sites).
+        if (runtime.envOnce("KLIO_SLAB_TRACE") != null and !runtime.slab.trace_enabled) {
+            runtime.slab.trace_enabled = true;
+            runtime.slab.trace_all = runtime.envOnce("KLIO_SLAB_TRACE_ALL") != null;
+            runtime.slab.installTraceSignalDump();
+        }
         if (runtime.envOnce("KLIO_GC_POISON")) |v| runtime.gc.gc_poison = v.len != 0 and !std.mem.eql(u8, v, "0");
         if (runtime.envOnce("KLIO_GC_EXT")) |v| runtime.gc.external_accounting = v.len != 0 and !std.mem.eql(u8, v, "0");
     }
     defer {
         // Every path out of a program — including a diagnostic failure that
         // never constructed a Vm — releases `arena_inst` next; remembered
-        // entries pointing into it must not survive that.
-        if (gc_run) runtime.gc.drainRemembered();
+        // entries pointing into it must not survive that, and the program's
+        // permanent cells go with it (the Vm teardown already freed them on
+        // the success path; this covers the diag/error exits).
+        if (gc_run) {
+            runtime.gc.program_perm_collect = false;
+            runtime.gc.drainRemembered();
+            runtime.gc.freeProgramPerm();
+        }
         runtime.gc.external_accounting = prev_external_accounting;
         runtime.gc.gc_poison = prev_gc_poison;
         runtime.gc.gc_stress = prev_gc_stress;
@@ -2111,6 +2138,18 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
             // compiler arena is about to be released.
             interp_ir.gcResetProgramHooks();
             runtime.gc.collect();
+            // The finished program's build-phase permanent cells (its own VM
+            // class/global graph) — the Vm is already out of the root set and
+            // the remembered set was drained while these were still mapped.
+            runtime.gc.freeProgramPerm();
+            // The collect's own trim is rate-limited (32MB of sweep credit);
+            // a program boundary is exactly when dormant slab pages should
+            // go back regardless, so hundreds of small programs in one
+            // process do not ratchet the slab high-water into the RSS cap.
+            // Repeated passes step the per-slab idle hysteresis so pages the
+            // finished program just vacated actually decommit now.
+            var trim_pass: usize = 0;
+            while (trim_pass < 4) : (trim_pass += 1) runtime.slab.reclaimDormant();
             runtime.gc.program_started = false;
             runtime.gc.alloc_perm = true;
         }

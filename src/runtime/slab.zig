@@ -125,6 +125,8 @@ pub var mapped_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 // (permanent-generation cells). Records the capture stack of each live mmap and
 // dumps the top sites by mapped bytes on SIGTERM/SIGINT.
 pub var trace_enabled: bool = false;
+/// KLIO_SLAB_TRACE_ALL: trace build-phase mmaps too (see `mapRaw`).
+pub var trace_all: bool = false;
 /// Like `trace_enabled` but for small slab cells (KLIO_CELL_TRACE). Tracks every
 /// live small allocation at `allocSmall`/`freeSmall` — the guaranteed-paired
 /// free path for slab cells, unlike the higher-level leak locator whose
@@ -286,8 +288,10 @@ fn mapRaw(size: usize) ?[]align(std.heap.page_size_min) u8 {
     ) catch return null;
     _ = mapped_bytes.fetchAdd(size, .monotonic);
     // Only track post-startup mmaps so the permanent stdlib-image baseline does
-    // not crowd out the per-iteration host leaks this hunts.
-    if (trace_enabled and gc.program_started) traceNote(@intFromPtr(m.ptr), size);
+    // not crowd out the per-iteration host leaks this hunts; KLIO_SLAB_TRACE_ALL
+    // drops the gate for the multi-program harnesses, whose build-phase mmaps
+    // ARE the hunt.
+    if (trace_enabled and (gc.program_started or trace_all)) traceNote(@intFromPtr(m.ptr), size);
     return m;
 }
 

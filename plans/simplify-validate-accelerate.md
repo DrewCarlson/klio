@@ -79,6 +79,23 @@ Ground rules carried forward:
       superseded/overlapping ones (anything targeting deleted paths, e.g.
       implicit-composer-era coverage) and fold or delete. CI time is a
       budget; every suite should earn its wall.
+      AUDIT DONE (all 69 read; verdict per suite recorded): nothing is
+      superseded — the implicit-composer suite was already deleted at
+      cutover (3 stale comment references remain in
+      compose_plugin_commontest.zig). All census suites, child-spawn
+      gates, corpus/differential/isolation/fuzz heavies, the Kotlin 2.4
+      acceptance matrices, and the gate.sh litmus set are CORE. The
+      realizable win is compile-side: retire parity_coroutine_smoke
+      (its 9-fixture runner moves into parity_coroutines_realistic; the
+      fixture dir stays — differential reads it) and collapse ~14
+      weight-1 micro-suite binaries into their canonical homes after
+      moving ~13 named unique pins (collections trio; strings pair;
+      ranges_arrays→array_bulk_ops; closures_advanced→closures_deep;
+      functional_patterns+advanced_idioms folds; the two visibility
+      suites merge with interface tests moving to inheritance_dispatch;
+      atomicfu_arrays'/kotlinx_io_read's resolution pins move into
+      resolve_ambiguity; conformance+threaded_litmus co-binary). Net
+      69 → ~57 binaries, ~12 fewer whole-program links per cold shard.
 
 ## Track V — Validate
 

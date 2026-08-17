@@ -3882,6 +3882,7 @@ fn anonSiteThunksPut(key: usize, entry: AnonSiteThunks) AnonSiteThunks {
 /// `anonLowerEnter`/`anonLowerExit`, held by callers around LOWERING
 /// sections only (never around thunk execution).
 var shared_anon_module: ?ObjRef(Module) = null;
+var shared_anon_arena: ?*std.heap.ArenaAllocator = null;
 /// Cell identity of the run module `shared_anon_module` was cloned from.
 /// An in-process driver that builds and frees a module PER PROGRAM (the
 /// parity itests) must not serve a later program from a side module whose
@@ -3927,8 +3928,21 @@ pub fn anonSiteModule(self: *VmHost, allocator: Allocator, cache: *?ObjRef(Modul
         return ObjRef(Module).init(allocator, Module.default(allocator));
     }
     if (shared_anon_module != null and shared_anon_base_identity != self.module.identity()) {
-        shared_anon_module.?.deinit();
+        // A real free, not the refcount-gated `deinit` (a no-op under the
+        // arena and tracing-GC modes): the retired clone is a whole deep
+        // Module (~tens of MB) and a multi-program harness swaps it every
+        // program — leaking it ratcheted the process into the RSS cap.
+        // `Module.deinit` cannot free a cloneForExtend product (it would
+        // free base buffers the clone only borrows), so the clone lives in
+        // its OWN arena and retirement drops the arena wholesale. Handles
+        // the finished program handed out are dead with it.
+        runtime.gc.forgetCell(&shared_anon_module.?.cell.hdr);
         shared_anon_module = null;
+        if (shared_anon_arena) |holder| {
+            holder.deinit();
+            std.heap.page_allocator.destroy(holder);
+            shared_anon_arena = null;
+        }
     }
     if (shared_anon_module == null) {
         shared_anon_base_identity = self.module.identity();
@@ -3942,9 +3956,22 @@ pub fn anonSiteModule(self: *VmHost, allocator: Allocator, cache: *?ObjRef(Modul
         // lowering scratch into the RSS cap. Persistent appends (the
         // lowered funcs themselves) stay bounded and live for the
         // process, matching the module's own lifetime.
-        var cloned = try mg.get().cloneForExtend(std.heap.smp_allocator);
+        const holder = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
+        holder.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        shared_anon_arena = holder;
+        var cloned = try mg.get().cloneForExtend(holder.allocator());
         cloned.anon_side = true;
-        shared_anon_module = try ObjRef(Module).init(std.heap.smp_allocator, cloned);
+        // PERMANENT cell, and never on the program-perm list: this cache
+        // outlives programs and is freed only by the identity swap above.
+        // A nursery mint here was swept by the next unrelated major (no
+        // root shades it) — the swap's arena teardown is the sole owner.
+        const saved_perm = runtime.gc.alloc_perm;
+        const saved_ppc = runtime.gc.program_perm_collect;
+        runtime.gc.alloc_perm = true;
+        runtime.gc.program_perm_collect = false;
+        shared_anon_module = try ObjRef(Module).init(holder.allocator(), cloned);
+        runtime.gc.program_perm_collect = saved_ppc;
+        runtime.gc.alloc_perm = saved_perm;
     }
     const ref = shared_anon_module.?.clone();
     cache.* = ref.clone();
