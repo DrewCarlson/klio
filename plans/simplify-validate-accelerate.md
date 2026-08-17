@@ -578,10 +578,17 @@ Memory management:
         never affected: they complete the Job as failed through the
         upstream machinery, pinned by tl_dispatched_failure_*.) Guard:
         threaded-litmus tl_dispatched_internal_error_fails_run.
-- [ ] A7. Ship-mode numbers: record ReleaseFast (the ~3% ReleaseSafe
+- [x] A7. Ship-mode numbers: record ReleaseFast (the ~3% ReleaseSafe
       undefined-poison memset and safety checks vanish there) alongside
       harness numbers when reporting user-facing performance;
       ReleaseSafe stays the itest/battery build on purpose.
+      RECORD (2026-08-17, aacbench, same box/day): ReleaseFast
+      3319/3327/3319 ms_per_rep vs ReleaseSafe ~3275-3493 — parity
+      within noise. The historical ~3% RS penalty was largely the
+      register-file poison memset, which the A2 no-fill lever removed
+      for provable frames; ship-mode reporting can quote the harness
+      number directly on this rig. Re-check after any lever that
+      re-adds safety-checked hot paths.
 
 Recorded measured-first roads (open only on a motivating measurement, per
 their own plans): Value 24 -> 16; C-transpiler C-to-C frames + inline
