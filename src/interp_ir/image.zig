@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 46;
+pub const FORMAT_VERSION: u32 = 47;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -822,6 +822,7 @@ const ImageRoot = struct {
     module: ModuleImage,
     built: BuiltImage,
     decl_names: []const []const u8,
+    root_decl_names: []const []const u8,
     packages: []const []const u8,
     param_type_names: []const []const u8,
     type_names: []const []const u8,
@@ -1335,6 +1336,7 @@ fn rootFromBase(
     if (!try builtToImage(a, &base.built, &root.built)) return null;
 
     root.decl_names = try setToSlice(a, &base.decl_names);
+    root.root_decl_names = try setToSlice(a, &base.root_decl_names);
     root.packages = try setToSlice(a, &base.packages);
     root.param_type_names = try setToSlice(a, &base.param_type_names);
     root.type_names = try setToSlice(a, &base.type_names);
@@ -2116,6 +2118,7 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot, slot: u32) Allocator.Error
         .built = built,
         .lifted_decls = root.lifted_decls,
         .decl_names = try sliceToSet(a, root.decl_names),
+        .root_decl_names = try sliceToSet(a, root.root_decl_names),
         .packages = try sliceToSet(a, root.packages),
         .param_type_names = try sliceToSet(a, root.param_type_names),
         .type_names = try sliceToSet(a, root.type_names),

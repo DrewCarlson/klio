@@ -665,6 +665,57 @@ pub fn examplesDir(allocator: Allocator) Allocator.Error![]u8 {
 
 /// Every `.kt` file directly under `dir`, sorted by path. Each path is owned by
 /// the caller; the outer slice too.
+/// Group `files` so programs sharing a dependency-base key run
+/// consecutively: grouped, a base cache of ONE covers a whole corpus with
+/// one rebuild per distinct mask instead of one per alphabetical mask
+/// switch — the difference between a bounded-RSS corpus run and the
+/// watchdog cap. Stable (alphabetical) within a group. Best-effort: a file
+/// that fails to read/parse keys as 0 and runs first.
+pub fn groupByBaseKey(allocator: Allocator, io: Io, files: [][]u8) void {
+    const Keyed = struct { key: u64, file: []u8 };
+    const keyed = allocator.alloc(Keyed, files.len) catch return;
+    defer allocator.free(keyed);
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    for (files, 0..) |f, i| {
+        keyed[i] = .{ .key = fileBaseKey(arena_inst.allocator(), io, f), .file = f };
+        _ = arena_inst.reset(.retain_capacity);
+    }
+    std.mem.sort(Keyed, keyed, {}, struct {
+        fn lt(_: void, x: Keyed, y: Keyed) bool {
+            if (x.key != y.key) return x.key < y.key;
+            return std.mem.lessThan(u8, x.file, y.file);
+        }
+    }.lt);
+    for (keyed, 0..) |k, i| files[i] = k.file;
+}
+
+fn fileBaseKey(arena: Allocator, io: Io, file: []const u8) u64 {
+    const text = readFileOpt(arena, io, file) orelse return 0;
+    var map = SourceMap.init(arena);
+    const parsed = parsePackFile(arena, &map, file, text) catch return 0;
+    const ast_f = switch (parsed) {
+        .err => return 0,
+        .ok => |f| f,
+    };
+    var prefixes = std.StringHashMap(void).init(arena);
+    collectImportPrefixes(arena, &ast_f, &prefixes) catch return 0;
+    collectQualifiedPrefixes(arena, text, &prefixes) catch return 0;
+    var imports_coroutines = false;
+    var itk = prefixes.keyIterator();
+    while (itk.next()) |imp| {
+        if (std.mem.startsWith(u8, imp.*, "kotlinx.coroutines")) {
+            imports_coroutines = true;
+            break;
+        }
+    }
+    base_lock.lock();
+    defer base_lock.unlock();
+    const mask = packMaskFor(io, &prefixes, imports_coroutines, arena) catch return 0;
+    const full = stdlibGateFull(io, &prefixes, mask, arena) catch return 0;
+    return (@as(u64, mask) << 1) | @intFromBool(full);
+}
+
 pub fn collectKt(allocator: Allocator, io: Io, dir: []const u8) Allocator.Error![][]u8 {
     var out: std.ArrayList([]u8) = .empty;
     errdefer {
@@ -1729,6 +1780,14 @@ fn getOrBuildBase(io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error
         return hit.entry;
     }
 
+    // Evict down BEFORE the build, not after the insert: a full-source base
+    // build is the process's RSS spike, and stacking it on top of a full
+    // cache put peak-RSS at (cap + 1) bases plus the build transient —
+    // exactly what trips the watchdog on the capped harnesses. Making room
+    // first bounds coexistence at the cap itself.
+    if (base_cache_max > 0) evictBasesToAtMost(base_cache_max - 1);
+    // Ride the build transient on a trimmed floor.
+    if (@import("builtin").os.tag == .linux) _ = malloc_trim(0);
     // Build each base in its own arena so eviction can hand its pages back.
     const holder = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
     holder.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -1757,6 +1816,11 @@ fn getOrBuildBase(io: Io, mode: LoadMode, mask: u16, full: bool) Allocator.Error
 /// null placeholders are free and kept.
 fn evictBasesBeyondCap() void {
     if (base_cache_max == 0) return;
+    evictBasesToAtMost(base_cache_max);
+}
+
+/// Drop least-recently-used real bases until at most `limit` remain.
+fn evictBasesToAtMost(limit: usize) void {
     while (true) {
         var owning: usize = 0;
         var lru_key: u32 = 0;
@@ -1770,7 +1834,7 @@ fn evictBasesBeyondCap() void {
                 lru_key = kv.key_ptr.*;
             }
         }
-        if (owning <= base_cache_max) return;
+        if (owning <= limit) return;
         const removed = base_entries.?.fetchRemove(lru_key).?;
         const arena = removed.value.arena.?;
         // The evicted base's cells may sit in the GC's remembered set (they

@@ -45,6 +45,7 @@ pub const thunks = @import("thunks.zig");
 pub const when_expr = @import("when_expr.zig");
 pub const decl = @import("decl.zig");
 pub const expr = @import("expr.zig");
+pub const static_call_type = @import("static_call_type.zig");
 pub const stmt = @import("stmt.zig");
 
 // AST-scan helpers (pure AST walks, no FuncBuilder dependency).
@@ -77,6 +78,7 @@ pub const exprBodyMemberAst = inline_state.exprBodyMemberAst;
 pub const resetInlineMemberOwners = inline_state.resetInlineMemberOwners;
 pub const registerInlineMemberOwner = inline_state.registerInlineMemberOwner;
 pub const resetMemberPropAsts = inline_state.resetMemberPropAsts;
+pub const resetExprBodyMembers = inline_state.resetExprBodyMembers;
 pub const registerMemberPropAst = inline_state.registerMemberPropAst;
 pub const resetMemberExtPropRecv = inline_state.resetMemberExtPropRecv;
 pub const registerMemberExtPropRecv = inline_state.registerMemberExtPropRecv;
