@@ -8,11 +8,12 @@ test {
     _ = @import("parity_closures_deep.zig");
     _ = @import("parity_collections_intensive.zig");
     _ = @import("parity_conformance.zig");
-    _ = @import("parity_coroutine_smoke.zig");
     _ = @import("parity_corpus_pinned.zig");
     _ = @import("ktor_client_get.zig");
     _ = @import("ktor_channel_async.zig");
     _ = @import("json_reified_inline.zig");
+    // parity_coroutine_smoke folded into parity_coroutines_realistic (the
+    // cs1..cs9 fixture tests run there now).
     _ = @import("parity_coroutines_realistic.zig");
     _ = @import("parity_data_class_features.zig");
     _ = @import("parity_dsl_operators.zig");

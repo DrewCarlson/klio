@@ -502,3 +502,89 @@ test "select_onsend_feeds_channel_iterator" {
     ;
     try assertKlio("select_onsend_iterator", src, "got 1\ngot 2\ndone\n");
 }
+
+// Regression net for the fixture-driven coroutine subset. Locks down
+// behavior across the layer-split and coroutine stages: a pure refactor must
+// not change any of these outputs. Expected stdout is encoded as leading
+// `//> ` comment lines in each program under `tests/fixtures/coroutine_smoke`.
+
+const SMOKE_DIR = "tests/fixtures/coroutine_smoke";
+
+/// Expected stdout = the leading run of `//> ` comment lines. Caller owns the
+/// returned bytes.
+fn expected(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        const t = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, t, "//>")) {
+            const rest = t["//>".len..];
+            const body = if (std.mem.startsWith(u8, rest, " ")) rest[1..] else rest;
+            try out.appendSlice(allocator, body);
+            try out.append(allocator, '\n');
+        } else if (std.mem.startsWith(u8, t, "//") or out.items.len == 0) {
+            // Skip leading comments and blank lead-in.
+        } else {
+            break;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn runSmoke(stem: []const u8) !void {
+    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
+    // is reclaimed instead of accumulating across this file's tests. Safe:
+    // the cross-program globals are page_allocator-backed, not this arena.
+    _ = file_arena.reset(.retain_capacity);
+    const a = file_arena.allocator();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const file = try std.fmt.allocPrint(a, "{s}/{s}.kt", .{ SMOKE_DIR, stem });
+    const src = std.Io.Dir.cwd().readFileAlloc(io, file, a, .unlimited) catch |e| {
+        std.debug.print("coroutine smoke {s}: read {s} ({s})\n", .{ stem, file, @errorName(e) });
+        return error.MissingSource;
+    };
+    const want = try expected(a, src);
+    try std.testing.expect(want.len != 0);
+
+    const res = try parity.runWithPacks(a, io, file);
+    switch (res) {
+        .ok => |got| try std.testing.expectEqualStrings(want, got),
+        .err => |m| {
+            std.debug.print("coroutine smoke {s}: {s}\n", .{ stem, m });
+            return error.KlioRunFailed;
+        },
+    }
+}
+
+test "cs1_launch_delay" {
+    try runSmoke("cs1_launch_delay");
+}
+test "cs2_async_await" {
+    try runSmoke("cs2_async_await");
+}
+test "cs3_many_launch" {
+    try runSmoke("cs3_many_launch");
+}
+test "cs4_suspend_seq" {
+    try runSmoke("cs4_suspend_seq");
+}
+test "cs5_flow_builder" {
+    try runSmoke("cs5_flow_builder");
+}
+test "cs6_flow_operators" {
+    try runSmoke("cs6_flow_operators");
+}
+test "cs7_scope_builders" {
+    try runSmoke("cs7_scope_builders");
+}
+test "cs8_dotted_in_builder" {
+    try runSmoke("cs8_dotted_in_builder");
+}
+test "cs9_channels" {
+    try runSmoke("cs9_channels");
+}
