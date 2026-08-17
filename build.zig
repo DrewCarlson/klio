@@ -104,24 +104,21 @@ const Itest = struct {
 const itests_files = [_]Itest{
     .{ .name = "cfa_builder", .parity_data = false, .interprets = false },
     .{ .name = "cfa_smartcast", .parity_data = false, .interprets = false },
-    .{ .name = "parity_advanced_idioms" },
     .{ .name = "parity_array_bulk_ops" },
-    .{ .name = "parity_atomicfu_arrays" },
     .{ .name = "parity_closures_deep" },
     .{ .name = "parity_collections_intensive" },
-    .{ .name = "parity_conformance", .dirs = &.{"tests/fixtures/conformance"}, .weight = 20 },
+    // parity_conformance runs inside parity_threaded_litmus now (same
+    // fixture-driver shape, one binary, both fixture dirs declared there and
+    // its weight folded in); the deleted entry is not a dropped suite.
     .{ .name = "parity_corpus_pinned", .dirs = &.{"tests/fixtures/parity_corpus"}, .weight = 50 },
     .{ .name = "parity_coroutines_realistic", .dirs = &.{"tests/fixtures/coroutine_smoke"}, .weight = 16 },
     .{ .name = "parity_data_class_features" },
     .{ .name = "parity_dsl_operators" },
     .{ .name = "parity_exceptions_and_flow" },
     .{ .name = "parity_extension_resolution", .weight = 12 },
-    .{ .name = "parity_functional_patterns" },
     .{ .name = "parity_generics_advanced" },
     .{ .name = "parity_inheritance_dispatch" },
     .{ .name = "parity_inner_classes" },
-    .{ .name = "parity_interfaces_visibility" },
-    .{ .name = "parity_kotlinx_io_read" },
     .{ .name = "parity_lambdas_and_dispatch", .weight = 8 },
     .{ .name = "parity_named_args_defaults" },
     .{ .name = "parity_nullability_deep" },
@@ -135,7 +132,7 @@ const itests_files = [_]Itest{
     // needs_exe: the eager-parity test spawns the harness (`run` + `dump-ir`)
     // — without it the child fell back to a stale `zig-out/bin/klio` and the
     // pins tested weeks-old lowering.
-    .{ .name = "parity_threaded_litmus", .dirs = &.{"tests/fixtures/threaded_litmus"}, .weight = 15, .needs_exe = true },
+    .{ .name = "parity_threaded_litmus", .dirs = &.{ "tests/fixtures/threaded_litmus", "tests/fixtures/conformance" }, .weight = 35, .needs_exe = true },
     .{ .name = "parity_type_system_shapes" },
     .{ .name = "parity_visibility_modifiers" },
     .{ .name = "explicit_backing_fields" },

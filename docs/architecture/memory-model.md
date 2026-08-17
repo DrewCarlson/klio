@@ -5,7 +5,7 @@ This is the normative reference for klio's memory model. The
 document states *what* is guaranteed, as numbered rules with a
 conformance litmus program for each. Litmus programs live in
 `tests/fixtures/conformance/` and run via
-`src/itests/parity_conformance.zig`.
+`src/itests/parity_threaded_litmus.zig`.
 
 klio promises a model **at least as strong as the Java Memory
 Model**. Every correctly-synchronized Kotlin program behaves
@@ -69,6 +69,6 @@ never invokes it; the interceptor does, through the same operation
 
 The litmus suite is the executable form of this document: each rule
 maps to one program (`mm1`–`mm10`), and the matching `test "mmN_..."`
-block in `parity_conformance.zig` asserts every program's exact
+block in `parity_threaded_litmus.zig` asserts every program's exact
 stdout. The suite is the contract a parallel value-model backing must
 continue to satisfy.

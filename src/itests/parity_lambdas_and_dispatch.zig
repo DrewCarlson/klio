@@ -996,3 +996,16 @@ test "local_fn_self_callable_ref_recurses" {
     ;
     try assertKlio("local_fn_self_callable_ref", src, "[1, 2, 3]\n");
 }
+
+test "a parenthesized factory result accepts a trailing lambda" {
+    const src =
+        \\
+        \\class CallableResult {
+        \\    operator fun invoke(block: () -> Int): Int = block()
+        \\}
+        \\fun callableResult(): CallableResult = CallableResult()
+        \\fun main() = println((callableResult()) { 42 })
+        \\
+    ;
+    try assertKlio("parenthesized_callable_result", src, "42\n");
+}

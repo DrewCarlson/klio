@@ -592,3 +592,18 @@ test "member_ext_prop_over_ctor_field_enclosing_member_receiver" {
     ;
     try assertKlio("member_ext_prop_enclosing_member_recv", src, "ext-tag\n");
 }
+
+test "forward member extension resolves in a receiver lambda" {
+    const src =
+        \\
+        \\class ForwardScope(val value: Int)
+        \\fun callInScope(scope: ForwardScope, block: ForwardScope.() -> Int): Int = scope.block()
+        \\class ForwardHost {
+        \\    fun result(): Int = callInScope(ForwardScope(41)) { later() }
+        \\    private fun ForwardScope.later(): Int = value + 1
+        \\}
+        \\fun main() = println(ForwardHost().result())
+        \\
+    ;
+    try assertKlio("forward_member_extension", src, "42\n");
+}

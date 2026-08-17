@@ -158,3 +158,20 @@ test "lateinit_var_uninitialized_check" {
     ;
     try assertKlio("lateinit_check", src, "ok|uninit\n");
 }
+
+test "safe_call_chain" {
+    const src =
+        \\
+        \\class A(val b: B?)
+        \\class B(val c: C?)
+        \\class C(val v: Int)
+        \\fun main() {
+        \\    val a1 = A(B(C(7)))
+        \\    val a2 = A(B(null))
+        \\    val a3 = A(null)
+        \\    println("${a1.b?.c?.v},${a2.b?.c?.v},${a3.b?.c?.v}")
+        \\}
+        \\
+    ;
+    try assertKlio("safe_call", src, "7,null,null\n");
+}

@@ -140,3 +140,21 @@ test "data_class_pattern_via_when" {
     ;
     try assertKlio("when_data", src, "click+,click0,scroll:7,other\n");
 }
+
+test "immutable_record_update" {
+    const src =
+        \\
+        \\data class State(val counter: Int, val log: List<String>)
+        \\fun tick(s: State, msg: String): State =
+        \\    s.copy(counter = s.counter + 1, log = s.log + msg)
+        \\fun main() {
+        \\    var s = State(0, emptyList())
+        \\    s = tick(s, "a")
+        \\    s = tick(s, "b")
+        \\    s = tick(s, "c")
+        \\    println("${s.counter}|${s.log.joinToString(",")}")
+        \\}
+        \\
+    ;
+    try assertKlio("record_update", src, "3|a,b,c\n");
+}

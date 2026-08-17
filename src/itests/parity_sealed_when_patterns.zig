@@ -177,3 +177,27 @@ test "when_inside_lambda_body" {
     // 1+3=4; 4*2=8; 8+7=15; 15*10=150
     try assertKlio("when_lambda", src, "150\n");
 }
+
+test "either_via_sealed_class" {
+    const src =
+        \\
+        \\sealed class Either<out A, out B> {
+        \\    data class Left<A>(val v: A) : Either<A, Nothing>()
+        \\    data class Right<B>(val v: B) : Either<Nothing, B>()
+        \\}
+        \\fun divide(a: Int, b: Int): Either<String, Int> =
+        \\    if (b == 0) Either.Left("zero") else Either.Right(a / b)
+        \\fun main() {
+        \\    val xs = listOf(Pair(10, 2), Pair(5, 0), Pair(8, 4))
+        \\    val out = xs.joinToString(",") { (a, b) ->
+        \\        when (val r = divide(a, b)) {
+        \\            is Either.Left -> "err:${r.v}"
+        \\            is Either.Right -> "ok:${r.v}"
+        \\        }
+        \\    }
+        \\    println(out)
+        \\}
+        \\
+    ;
+    try assertKlio("either", src, "ok:5,err:zero,ok:2\n");
+}
