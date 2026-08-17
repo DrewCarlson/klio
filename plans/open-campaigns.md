@@ -93,8 +93,20 @@ Open:
 - [ ] tl_atomic_update_contended litmus flake — watch state; postmortem
       on next natural occurrence (the sweep prints got-vs-expected
       tails).
-- [ ] Background-yield 55s round-trip — perf, not correctness; parked
-      with the suite-wall floor (`simplify-validate-accelerate.md` A6).
+- [x] Background-yield 55s round-trip — CLOSED BY MEASUREMENT
+      (`simplify-validate-accelerate.md` A6 round record): the yield hop
+      on Dispatchers.Default costs ~100us (2000-yield rig), and
+      resumeOnBackgroundThread's spinner never iterates (`running` stays
+      false) — the 55s is the test's own PausableComposition resume
+      protocol, quadratic upstream (recordModificationsOf over the whole
+      remaining scope set per resumeOnce), a compute floor here.
+- [ ] Dispatched-block import scope: an imported top-level fn
+      (kotlin.system.measureTimeMillis) is `unresolved global` inside a
+      Dispatchers.Default-dispatched block (pool child-Vm loses the
+      file's import scope), and the resulting internal CalleeFailed
+      leaves the runBlocking root parked forever — a silent hang where
+      upstream surfaces the failure. Repro: A6 session scratchpad
+      reprosrc/yieldhop.kt.
 
 ## 4. ktor commontest + upstream residue
 

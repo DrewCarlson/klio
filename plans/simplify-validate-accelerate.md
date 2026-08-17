@@ -481,12 +481,85 @@ Memory management:
       trigger pacing, dormant-page revival policy, or per-class spare
       tuning. Suite RSS is the acceptance number (KLIO_RSS_CAP_KB=6.5GB
       exists in the ratchet — how close does it run?).
-- [ ] A6. Wall-clock outliers as memory/dispatch probes:
+- [x] A6. Wall-clock outliers as memory/dispatch probes:
       compose_foundation_lazy at 3m42 warm and the 55s background-yield
       round-trip (a yield on Dispatchers.Default costs a cross-thread
       dispatch cycle — profile the hop: gate wake, child-Vm materialize,
       repost). Each gets one profiling pass and either a lever or a
       recorded floor.
+      ROUND RECORD (2026-08-17, ReleaseSafe harness; session re-baseline
+      — the recorded 3m42 predates the A2/A3/A5 rounds and does not
+      compare):
+      - Outlier 1, compose_foundation_lazy: LEVER LANDED, warm
+        42.6s -> 1.06s solo (40x), output byte-identical. Session
+        baseline was already 41.6s warm (the week's rounds had cut the
+        recorded 220s by 5.3x before this round). The wall was NOT
+        execution (~7s): `check` alone was 35s and an imports-only main
+        24s — every warm run silently re-lowered the whole compose pack
+        surface. KLIO_TRACE_STDLIB_IMAGE showed why: the image cache HIT
+        (85ms load) but `canExtendBase` refused on the user's
+        `var composed` vs androidx.compose.ui's `Modifier.composed` and
+        fell back to a full source re-lower — while printing "hit".
+        Two landings:
+        - cd93db9b (correctness, the lever's precondition): base bodies
+          lower during buildStdlibBase but the typeck eager-call pass ran
+          only AFTER (checkBaseSources), so a composable call the shape
+          resolver defers (default_param_shape — LazyColumn's bare
+          `LazyList`) lost its pick, lowered through the bare VALUE read,
+          and the baked image carried the call without its
+          ($composer, $changed) pair — any collision-FREE compose program
+          on the extend path died with `startRestartGroup` on
+          `kotlin.Nothing` (live bug on main, latent in every image).
+          stageBaseEagerCalls installs the pending channel pre-build
+          (the whole-program build's ordering); checkBaseSources derives
+          the image span->fid list from the module's consumed map (still
+          one typeck per bake).
+        - 59f2b43d (the gate): canExtendBase refuses callable namesakes
+          per-package — a root-package user fn/prop cannot be referenced
+          bare from a named-package base file, so only root-package base
+          callables (StdlibBase.root_decl_names, rides the image, format
+          47) refuse it. The TYPE namespace stays whole-set conservative:
+          runtime casts resolve type names without package scoping (a
+          user `Node` broke kotlinx.coroutines' internal `as Node` cast —
+          compose_subcompose caught it in e2e; refused again, green).
+        Residual floor: cold bake ~43s per (binary, pack closure) — one
+        image bake per zig build; warm execution ~7s interpreted compute.
+        Tooling debt recorded: KLIO_PROF_ALL startup samples are 99%
+        pc=0 (`<unknown>`) — the sampler cannot attribute the
+        load/lower phase; KLIO_PROF_RAW (new) dumps the raw PCs.
+      - Outlier 2, the "55s background-yield round-trip": FLOOR, and the
+        recorded attribution was WRONG. The hop itself is cheap: rig
+        (scratchpad reprosrc/yieldn_*.kt) measured N=0/100/1000 yields on
+        Dispatchers.Default at 0.166/0.181/0.265s wall — ~100us per
+        yield round-trip (post, gate wake, child-Vm materialize (a
+        struct copy), run, repost); a runTest+Default spinner does 559
+        yields per 100 virtual ms in 0.25s. The 55s is
+        PausableCompositionTests.resumeOnBackgroundThread's own COMPUTE:
+        51.7s solo (kotlinx timeout raised to 120s), and its mutator
+        `while (running) { ...; yield() }` NEVER iterates — `running` is
+        never set true in that test, so no yield cost exists to measure.
+        Scaling the PausableContent item count 250/500/1000 gives
+        8.2/19.4/51.8s, an exact fit to T(n) = 0.027n + 2.4e-5 n^2; the
+        quadratic 24s is upstream's own resume protocol
+        (`recomposePaused` re-records the ENTIRE remaining invalid-scope
+        set per `resumeOnce` and rebuilds pausedScopes each pass —
+        quadratic on the JVM too, visible here through the ~300x
+        interpreter multiplier). Call census: every bucket scales
+        linearly (x4.0 for x4 items; RecomposeScope flags 3.98x — each
+        scope composes exactly ONCE, no klio re-compose pathology); only
+        the aggregate lambda bucket carries the n^2 (0.74 n^2 calls).
+        The itest comment's "duration IS the yield round-trip cost" is
+        retired by this record.
+      - Side findings from the yield rig, recorded as OPEN bugs (not the
+        A6 wall, distinct mechanisms; repro scratchpad
+        reprosrc/yieldhop.kt): (1) an imported top-level fn
+        (kotlin.system.measureTimeMillis) is `unresolved global` when
+        called inside a Dispatchers.Default-dispatched block — the
+        pool child-Vm loses the file's import scope; (2) the resulting
+        CalleeFailed is recorded as the pool's first_error but the
+        runBlocking root stays parked FOREVER (silent hang instead of a
+        failed run) — upstream surfaces dispatched-continuation
+        failures.
 - [ ] A7. Ship-mode numbers: record ReleaseFast (the ~3% ReleaseSafe
       undefined-poison memset and safety checks vanish there) alongside
       harness numbers when reporting user-facing performance;
