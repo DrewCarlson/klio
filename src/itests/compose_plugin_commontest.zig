@@ -9,11 +9,11 @@
 //! conformance gate and the implicit-hook suite retires with the old
 //! implementation.
 //!
-//! Structure mirrors compose_runtime_commontest.zig: every `.kt` under the
-//! roots compiles into every child (cross-file fixtures), isolation is one
-//! child per test class via `--filter`, passes are counted from per-test
-//! `PASSED` lines, and the pass count is a ratchet — raise `BASELINE` as
-//! fixes land, never lower it.
+//! Structure: every `.kt` under the roots compiles into every child
+//! (cross-file fixtures), isolation is one child per test class via
+//! `--filter`, passes are counted from per-test `PASSED` lines, and the
+//! pass count is a ratchet — raise `BASELINE` as fixes land, never lower
+//! it.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -199,8 +199,7 @@ fn collectKt(a: std.mem.Allocator, io: std.Io, dir: []const u8, out: *std.ArrayL
     }
 }
 
-/// The test CLASS a file contributes, or null when it declares none (see
-/// compose_runtime_commontest.zig).
+/// The test CLASS a file contributes, or null when it declares none.
 fn testClassOf(a: std.mem.Allocator, io: std.Io, path: []const u8) ?[]const u8 {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return null;
     if (std.mem.indexOf(u8, bytes, "@Test") == null) return null;

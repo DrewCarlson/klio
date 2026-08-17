@@ -46,8 +46,9 @@ sparse=(
   "graphics/graphics-shapes/src/commonMain"
   # The upstream compose-runtime conformance suite and the mock View/Applier
   # harness it composes against (`compositionTest { … }`). Run by
-  # `zig build itest-compose_runtime_commontest` -- these are the tests that
-  # say whether klio's implicit-composer hook actually implements Compose.
+  # `zig build itest-compose_plugin_commontest` -- these are the tests that
+  # say whether klio's `@Composable` lowering plugin actually implements
+  # Compose.
   "compose/runtime/runtime-test-utils/src/commonMain"
   "compose/runtime/runtime/src/commonTest"
   "compose/runtime/runtime/src/nonEmulatorCommonTest"
