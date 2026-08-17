@@ -67,6 +67,11 @@ Ground rules carried forward:
         machinery, leaf serve, liveness.
       One module per landing, imports rewired via build.zig, zigcheck +
       battery after each. No logic edits ride along with a move.
+      Landed so far: `src/ir/lower/static_call_type.zig` (2.5k lines) holds
+      the static call return-type ladder lifted out of expr.zig, which is
+      now 21.5k. A sibling lower file needs no build.zig entry; the cut
+      cost three `pub` entry points out and nineteen shared expr.zig
+      internals `pub` for the alias block back.
 - [x] S3. Plan-register hygiene: 44 docs under plans/. Reconcile
       open-campaigns.md against current reality (zip/combine fixed, ktor
       census 465/2/0, coroutine cluster closed), move finished campaign

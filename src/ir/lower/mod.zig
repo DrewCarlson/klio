@@ -45,6 +45,7 @@ pub const thunks = @import("thunks.zig");
 pub const when_expr = @import("when_expr.zig");
 pub const decl = @import("decl.zig");
 pub const expr = @import("expr.zig");
+pub const static_call_type = @import("static_call_type.zig");
 pub const stmt = @import("stmt.zig");
 
 // AST-scan helpers (pure AST walks, no FuncBuilder dependency).
