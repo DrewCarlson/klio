@@ -1,0 +1,4 @@
+runs=3
+direct sane: true
+nanos sane: true
+dispatched sane: true
