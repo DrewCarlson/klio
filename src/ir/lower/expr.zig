@@ -2216,6 +2216,11 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             refAudit(b, name0, ref_pick);
             if (ref_pick) |fid| {
                 if (b.module.funcById(fid)) |f| {
+                    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+                        if (std.mem.eql(u8, w, name0)) {
+                            std.debug.print("[bare-value-arm] {s} -> {s}#{d} self_pkg={s} file={d} fn={s}\n", .{ name0, f.fqn, fid.int(), b.self_package, segments[0].span.file.int(), build.currentRealFn() orelse "-" });
+                        }
+                    }
                     _ = try recordOutOfScopeRef(b, name0, segments[0].span, f.fqn, b.module.bareRefTier(name0, b.self_package, segments[0].span.file));
                     const dst = b.allocReg();
                     const n = try b.module.internConst(b.allocator, .{ .String = f.fqn });
@@ -14679,6 +14684,9 @@ fn resolveCallWithComposerAbi(
         last_arg_lambda,
         ctx,
     );
+    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name)) std.debug.print("[abi-direct] {s} target={?d} reason={?s} composer_in_scope={} shapes_have_pair={} nshapes={d}\n", .{ name, if (direct.target) |t| t.int() else null, if (direct.reason) |r| @tagName(r) else null, b.resolve("$composer") != null, argShapesHaveComposerPair(shapes), shapes.len });
+    }
     if (direct.target != null or b.resolve("$composer") == null or
         argShapesHaveComposerPair(shapes))
     {

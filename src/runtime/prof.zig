@@ -285,6 +285,26 @@ pub fn maybeReport() void {
         }
     }.lt);
 
+    if (builtin.link_libc and std.c.getenv("KLIO_PROF_RAW") != null) {
+        const RawPc = struct {
+            addr: usize,
+            count: u32,
+            fn lt(_: void, a: @This(), b: @This()) bool {
+                return a.count > b.count;
+            }
+        };
+        var raw_list = std.ArrayList(RawPc).empty;
+        defer raw_list.deinit(gpa);
+        var rit = addr_counts.iterator();
+        while (rit.next()) |e| raw_list.append(gpa, .{ .addr = e.key_ptr.*, .count = e.value_ptr.* }) catch {};
+        std.mem.sort(RawPc, raw_list.items, {}, RawPc.lt);
+        std.debug.print("[prof-raw] top unique PCs:\n", .{});
+        for (raw_list.items, 0..) |rc, i| {
+            if (i >= 10) break;
+            std.debug.print("  0x{x}  {d}\n", .{ rc.addr, rc.count });
+        }
+    }
+
     std.debug.print("\n[prof] {d} samples by function (top 35):\n", .{total});
     const ft: f64 = @floatFromInt(total);
     var shown: usize = 0;
