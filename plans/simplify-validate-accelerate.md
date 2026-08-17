@@ -335,13 +335,80 @@ the V4 tests as acceptance):
         (the class.borrow() on every instance op).
       - Per-cell thread-bias is recorded as the expensive last resort
         (revocation needs safepoint coordination).
-- [ ] A2. Core-loop round: extend instruction fusion coverage (the
+- [x] A2. Core-loop round: extend instruction fusion coverage (the
       jump/br/cmp_br streams exist; measure getfield+call and
       const+binop pair frequency first), and framed-register fill masking
       (the leaf-serve def-before-use/no-fill landed; the framed path still
       pays appendNTimes ~1% — needs a per-frame written mask that gcMark
       and suspension snapshots respect, so it is a real change, not a
       tweak).
+      ROUND RECORD (2026-08-17; rig session baseline ms_per_rep median
+      3649 solo — re-baselined fresh, cross-day numbers do not compare).
+      Round total: 3649 -> 3275 median solo (-10.2%); 8-way pinned
+      contention variant 3666-3708 (+12% inflation, no pathology).
+      - Lever 1 LANDED (5186c52a), framed no-fill register files: memset
+        callers measured first — the frame fill was 248+5 samples
+        (~1.7%) of the 8.4% memset bucket (the rest: allocator zero/
+        poison 3.2%, free-path poison 1.9%, call-machinery buffers 1.2%).
+        `frameNoFill` = a full must-written CFG dataflow on Func (join =
+        intersection over preds, so if/else-join initialization proves;
+        catch/finally/lr_absorb, >64 locals, CtxScope refused — its
+        ctx_args run is invisible to visitInstRegs), TLS scratch (stack
+        arrays were re-poisoned per call by ReleaseSafe: 49 samples).
+        Frame carries a written mask; every write path sets bits
+        (Frame.write, writeFastU, binFast, both fused cmp_br arms); the
+        GC frame walk and spin dump skip unset slots; materializeRegs
+        Unit-fills before the file escapes (suspend snapshot, resume
+        rebuild, loop-JIT entry, C-native surface); tail jump/call
+        re-arm. Reclaim backend keeps eager fill (leaf rule). Measured:
+        3649 -> 3586 (-1.7%, = the removed bucket); fill attribution
+        253 -> 78 samples, memset 8.4% -> 7.5%. GC oracles:
+        parity_corpus_pinned 251/251 and differential 2/2 under
+        KLIO_GC_STRESS_EVERY=10, 48 corpus programs byte-exact under
+        full KLIO_GC_STRESS=1 (a full-stress differential run was infra-
+        killed at 71min CPU; the sampled mode catches the same holes per
+        gc.zig's contract).
+      - Lever 2 MEASURED then DECLINED, fusion coverage. Executed-stream
+        census on the rig (97.8M ops; temporary KLIO_BC_CENSUS
+        instrumentation, removed after): getfield->call receiver-match
+        0.12% — DEAD, below the 2-3% bar. const->bin operand-match 7.33%
+        (const_int->bin adjacency 5.85%) — above the bar, so the bin_ci
+        fused arm was built (const written first, register state
+        byte-identical, bin's exact path + fallback, idx_pc shared).
+        Mechanism confirmed (bin_ci 5.94% of dispatches; const_int
+        6.94->1.17%, bin 9.50->3.83%) but wall MEASURED NEGATIVE:
+        interleaved A/B median 3592 vs 3626 (+0.95%, B>A in 4/5 paired
+        rounds) — the fatter dispatch loop costs more than 5.9% fewer
+        cheap dispatches gain. Reverted; diff archived in the session
+        scratchpad (binci.patch). Census side-findings recorded: trace
+        ops are 15.3% of executed dispatches (span bookkeeping);
+        move->move 6.0%, escape->move 9.2% adjacency; ZERO fused
+        terminator ops execute on this workload (every hot coroutine
+        func carries try machinery, so `fusible()` refuses — fused-
+        terminator coverage is a lowering/try-shape question, not an
+        exec-loop one).
+      - Lever 3 LANDED (42eb4461), the A3 residual root-caused: the
+        planned per-site route memo was NOT needed — the ladder
+        population was 4 sites re-walking because the relaxed-key
+        cacheability gate read `unambiguous` as the NAME-level candidate
+        count, so any member beside a different-arity overload
+        (addAll(Collection) vs addAll(index, Collection)) with a
+        container arg (strict sig unbuildable) re-ran the full
+        resolution walk per call (~1.2us each: candidate collect, pick,
+        disproof scans, buffers). Widened the gate to arity-forced picks
+        (exactly one candidate can bind this arg count — arity is folded
+        in every key) over relaxed-adjudicable args (tags/class ids/
+        container kinds — the level every applicability test consults;
+        object arrays and composable $composer pairs bail). Measured:
+        3586 -> 3275 (-8.7%); member_ladder 160k -> 40k per run.
+      - Residuals recorded for a next round: the scoped/static-recv call
+        routes still enter irMethodWalk ~920k times/run (cache-hit
+        serves via the recursive invoker — a flat-serve widening or
+        scoped-route memo candidate); the one remaining ladder site
+        (PersistentVector.orderedEquals@equals, 40k); trace-op dispatch
+        share 15.3%; eqlBytes 3.6% + getIndex 2.7% remain the name-probe
+        floor. KLIO_OP_PROF's histogram now also dumps for `klio run`
+        (it only dumped for `test`).
 - [x] A3. Name-keyed map pressure: getIndex ~2.8% + eqlBytes ~3.5% spread
       across registry/dispatch maps. The structural direction is
       intern-once: resolve names to integer ids at lowering/link time so

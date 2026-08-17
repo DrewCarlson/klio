@@ -1557,6 +1557,9 @@ pub fn runBuiltModuleArgs(
     ir.eval.callStatsDump();
     ir.eval.dispatch_replay_hits = &interp_ir.VmHost.replayHits;
     ir.eval.dispatchStatsDump();
+    // `KLIO_OP_PROF` starts for `run` too, but only `test` dumped it; the
+    // per-opcode histogram belongs to both exits.
+    ir.eval.opProfDump();
     if (runtime.envOnce("KLIO_DECL_AUDIT") != null) declAudit(gpa, &built);
     // The dispatch census is reported for `run` as well as for `test`. The two
     // answer different questions: the stdlib's own tests are generic
