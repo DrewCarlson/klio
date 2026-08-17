@@ -10,6 +10,9 @@
 
 const std = @import("std");
 
+/// glibc: return free heap memory to the OS (see the boundary trim below).
+extern "c" fn malloc_trim(pad: usize) c_int;
+
 const ast = @import("ast");
 const interp_ir = @import("interp_ir");
 const kotlinx_atomicfu = @import("kotlinx_atomicfu");
@@ -2134,10 +2137,16 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
         if (gc_run) runtime.gc.drainRemembered();
         vm.deinit();
         if (gc_run) {
-            // Nothing from the finished program may remain rooted while its
-            // compiler arena is about to be released.
-            interp_ir.gcResetProgramHooks();
+            // The final collect runs with the program's closure/suspend hooks
+            // STILL INSTALLED: they are the only path that frees closure
+            // metadata (capture-name/chain arrays) and parked suspension
+            // snapshots, and clearing them first leaked every program's
+            // worth. The hooks' backing (the Vm's closure spine) is a
+            // program-perm cell — alive until `freeProgramPerm` below.
             runtime.gc.collect();
+            // NOW nothing from the finished program may remain rooted while
+            // its compiler arena is about to be released.
+            interp_ir.gcResetProgramHooks();
             // The finished program's build-phase permanent cells (its own VM
             // class/global graph) — the Vm is already out of the root set and
             // the remembered set was drained while these were still mapped.
@@ -2150,6 +2159,11 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
             // finished program just vacated actually decommit now.
             var trim_pass: usize = 0;
             while (trim_pass < 4) : (trim_pass += 1) runtime.slab.reclaimDormant();
+            // Frame register buffers live on glibc malloc (`regsAlloc`),
+            // which hoards freed memory per-thread-arena indefinitely; a
+            // multi-program process must hand it back or the high-water
+            // ratchets into the RSS cap.
+            if (@import("builtin").os.tag == .linux) _ = malloc_trim(0);
             runtime.gc.program_started = false;
             runtime.gc.alloc_perm = true;
         }
