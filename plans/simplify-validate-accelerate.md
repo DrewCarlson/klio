@@ -193,6 +193,34 @@ Ground rules carried forward:
           over the 6.5GB cap — the A5 target; per-program VM-structural
           cells now leak by design (perm) until an explicit boundary
           release exists.
+      - A5 round (pulled forward; measured at each step on the full e2e
+        corpus, peak RSS under a 16GB ceiling):
+        - 12.5GB baseline → 9.0GB: the shared anon side-module rebuild
+          leaked its retired ~30MB clone EVERY program (refcount deinit
+          is a no-op under arena/GC modes, and Module.deinit cannot free
+          a cloneForExtend product — it would free borrowed base
+          buffers). Clone now lives in its own arena, retired wholesale;
+          cell minted permanent so no major sweeps the live cache.
+        - Program-perm generation: perm cells minted in one program's
+          build window link on a list and free at the boundary (~1.6k
+          cells/program); the shared base builder masks the flag.
+        - 9.0 → 8.5GB: glibc malloc_trim at boundaries (frame register
+          buffers ride c_allocator; glibc hoards freed memory).
+        - Boundary collect now runs BEFORE the hooks clear (closure
+          metadata + suspension snapshots were never freed).
+        - The remaining floor was BASE COEXISTENCE, not creep: cap-2
+          cache + a compose-scale source build transient ≈ the cap.
+          Fixed structurally: the corpus is GROUPED by base key
+          (parity.groupByBaseKey) so a cache of ONE suffices with a
+          rebuild per distinct mask; eviction runs before the build.
+          Full e2e now runs under the 6.5GB cap.
+        - Slab tracer gained KLIO_SLAB_TRACE_ALL (build-phase mmaps) and
+          the driver honors KLIO_GC_DEBUG/HIST/SLAB_TRACE; measured:
+          slab holds ~60MB at a 6GB peak — the footprint lives in
+          arenas/glibc, not cells.
+        - Still open in A5: differential (corpus × 2 modes, one
+          process) needs the same grouping treatment or per-mode
+          processes; re-measure after the ui-text determinism fix.
       - Singles, all closed:
         - threaded_litmus 45/45: manifest additions committed; the eager
           parity fail was the plus static commit lost to the advisory
