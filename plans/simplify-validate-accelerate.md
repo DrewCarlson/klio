@@ -67,6 +67,32 @@ Ground rules carried forward:
         machinery, leaf serve, liveness.
       One module per landing, imports rewired via build.zig, zigcheck +
       battery after each. No logic edits ride along with a move.
+      LANDING 1 (e09d3385): expr.zig 24070 -> 21554. The static call
+      return-type ladder (26 decls, 1 inbound entry point, referenced by
+      no other file and no test block) moved verbatim into
+      src/ir/lower/static_call_type.zig (2576 lines); entry points are
+      re-aliased at the top of expr.zig so its call sites are untouched;
+      19 shared internals gained `pub`; the three module-level mutable
+      vars stay in expr.zig and are referenced qualified. No build.zig
+      change — mod_list registers by root file, so lower/ siblings are
+      picked up automatically. Verbatimness proved by a script diffing
+      both sides against `git show HEAD` modulo the pub keywords and
+      qualifications. ir units 247/247 unchanged; five parity/e2e suites
+      and the 117-file sweep green.
+      MEASURED CEILING for expr.zig: a call graph over its 528 top-level
+      decls scores the whole file at ~110-145 lines moved per `pub`
+      added — it is a dense web, not a set of islands. Rejected with
+      numbers: the audit/census family (427 lines for 14 inbound + 5
+      outbound), sibling-expected-type solving (515 lines, 1+5), the
+      whole static-type-derivation concern (4172 lines but 6+29 and it
+      drags in test-referenced decls). Best contiguous windows anywhere
+      topped out at 700-900 lines with cost 11-18. Plan accordingly:
+      further expr.zig cuts buy less per unit of churn than the first.
+      TOOLING NOTE for every landing here: the Zig build runner renders
+      a passing run step that writes to stderr as "failed command" —
+      read the "Build Summary: N/N steps succeeded" line and the test
+      counts instead (that artifact was misdiagnosed as an e2e flake
+      three times before 39d37ef5 silenced its source).
       Landed so far: `src/ir/lower/static_call_type.zig` (2.5k lines) holds
       the static call return-type ladder lifted out of expr.zig, which is
       now 21.5k. A sibling lower file needs no build.zig entry; the cut
