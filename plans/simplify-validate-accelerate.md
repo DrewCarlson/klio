@@ -316,9 +316,17 @@ Interpreter execution (the campaign continuation; rig:
 scratchpad reprosrc/aacbench.kt on the harness, plus the ratchet wall and
 the V4 tests as acceptance):
 
-- [ ] A1. Cross-thread borrow/refcount cost (~4% solo, amplified under
+- [x] A1. Cross-thread borrow/refcount cost (~4% solo, amplified under
       the suite's 8-way contention; the ~6% futex bucket is the same
-      locks contended). Candidates in order of risk:
+      locks contended). ROUND RECORD (2026-08-17, rig baseline
+      ms_per_rep=3860 solo): ClassDef (and the registry-frozen value
+      types) already carry objref_immutable — the cheap lever landed in
+      a prior round. The residual profile is borrow 1.6% + rw-counter
+      atomics ~2.7%, and its callers are the workload's OWN mutable
+      snapshot-list cells — contended by design, not overhead a noop
+      lock may remove. Seqlock/RCU and thread-bias stay recorded
+      last-resorts; no immutable-read surface above 1% remains.
+      Candidates in order of risk (kept for reference):
       - NoopRwLock adoption for provably-immutable cell types (the opt-in
         `objref_immutable` machinery exists; audit ClassDef and other
         registry-frozen types for post-load immutability, freeze-point
@@ -341,10 +349,18 @@ the V4 tests as acceptance):
       cache is the pattern; extend it toward funcsBySimpleName,
       field lookup, and the import-scope maps). Measure per-map first via
       KLIO_PROF_CALLERS=getIndex before converting anything.
-- [ ] A4. Re-measure under CONTENTION, not just solo: the stress tests
+- [x] A4. Re-measure under CONTENTION, not just solo: the stress tests
       fail in-suite worse than solo. Add an 8-way contention variant of
       the rig (run 8 aacbench processes pinned) so lever measurements see
       the cache-line and futex effects the suite sees.
+      DONE: rig at scratchpad aac-contention.sh (N pinned processes via
+      taskset, default 8). Baseline: solo 3860 ms/rep; 8-way pinned
+      3971-4229 ms/rep — only +3-9%. The suite's in-suite blowups are
+      NOT cross-process cache/futex effects at this scale; they are CPU
+      oversubscription plus each child's own intra-process lock
+      contention. Lever measurements can trust solo numbers within
+      ~10%; re-run the contention variant when a lever touches shared
+      lines (locks, allocator).
 
 Memory management:
 
