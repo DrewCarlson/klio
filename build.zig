@@ -104,7 +104,6 @@ const Itest = struct {
 const itests_files = [_]Itest{
     .{ .name = "cfa_builder", .parity_data = false, .interprets = false },
     .{ .name = "cfa_smartcast", .parity_data = false, .interprets = false },
-    .{ .name = "parity_advanced_idioms" },
     .{ .name = "parity_array_bulk_ops" },
     .{ .name = "parity_atomicfu_arrays" },
     .{ .name = "parity_closures_deep" },
@@ -116,7 +115,6 @@ const itests_files = [_]Itest{
     .{ .name = "parity_dsl_operators" },
     .{ .name = "parity_exceptions_and_flow" },
     .{ .name = "parity_extension_resolution", .weight = 12 },
-    .{ .name = "parity_functional_patterns" },
     .{ .name = "parity_generics_advanced" },
     .{ .name = "parity_inheritance_dispatch" },
     .{ .name = "parity_inner_classes" },

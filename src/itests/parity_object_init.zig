@@ -815,3 +815,17 @@ test "anon_object_super_ctor_args_evaluate_in_enclosing_scope" {
     ;
     try assertKlioBothModes("anon_super_ctor_args", src, "5\n6\n4\n");
 }
+
+test "anonymous object initializer retains lexical classifier identity" {
+    const src =
+        \\
+        \\import kotlin.coroutines.ContinuationInterceptor
+        \\
+        \\fun main() {
+        \\    val holder = object { val key = ContinuationInterceptor }
+        \\    println(holder.key === ContinuationInterceptor)
+        \\}
+        \\
+    ;
+    try assertKlio("anonymous_object_classifier_identity", src, "true\n");
+}

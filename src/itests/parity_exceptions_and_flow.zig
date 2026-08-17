@@ -186,3 +186,35 @@ test "check_require_helpers" {
     ;
     try assertKlio("require", src, "divide by zero\n5\n");
 }
+
+test "result_run_catching_chain" {
+    const src =
+        \\
+        \\fun parse(s: String): Result<Int> = runCatching { s.toInt() }
+        \\fun main() {
+        \\    val a = parse("42").getOrDefault(-1)
+        \\    val b = parse("nope").getOrDefault(-1)
+        \\    val c = parse("7").map { it * 10 }.getOrDefault(0)
+        \\    println("$a,$b,$c")
+        \\}
+        \\
+    ;
+    try assertKlio("result_chain", src, "42,-1,70\n");
+}
+
+test "auto_closeable_use_block_invokes_close" {
+    const src =
+        \\
+        \\class Resource(val name: String) : AutoCloseable {
+        \\    var closed = false
+        \\    override fun close() { closed = true }
+        \\}
+        \\fun main() {
+        \\    val r = Resource("A")
+        \\    val n = r.use { it.name.length }
+        \\    println("n=$n,closed=${r.closed}")
+        \\}
+        \\
+    ;
+    try assertKlio("autoclose_use", src, "n=1,closed=true\n");
+}

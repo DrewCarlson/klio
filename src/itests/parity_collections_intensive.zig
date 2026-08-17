@@ -404,3 +404,61 @@ test "map_count_and_any" {
     ;
     try assertKlio("map_count_any", src, "2,true,true\n");
 }
+
+test "sequence_lazy_evaluation" {
+    const src =
+        \\
+        \\fun main() {
+        \\    var n = 0
+        \\    val s = sequenceOf(1, 2, 3, 4, 5)
+        \\        .map { n += 1; it * 2 }
+        \\        .filter { it > 4 }
+        \\        .take(2)
+        \\    val r = s.toList()
+        \\    println("$r,n=$n")
+        \\}
+        \\
+    ;
+    try assertKlio("seq_lazy", src, "[6, 8],n=4\n");
+}
+
+test "flatmap_and_distinct" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val xs = listOf(listOf(1,2,2), listOf(2,3,3), listOf(3,4))
+        \\    val flat = xs.flatten()
+        \\    val unique = flat.distinct()
+        \\    println("$flat|$unique")
+        \\}
+        \\
+    ;
+    try assertKlio("flat_distinct", src, "[1, 2, 2, 2, 3, 3, 3, 4]|[1, 2, 3, 4]\n");
+}
+
+test "zip_and_unzip" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val a = listOf(1,2,3,4)
+        \\    val b = listOf("a","b","c")
+        \\    val z = a.zip(b)
+        \\    println(z.joinToString(",") { "${it.first}=${it.second}" })
+        \\}
+        \\
+    ;
+    try assertKlio("zip", src, "1=a,2=b,3=c\n");
+}
+
+test "recursive_list_sum" {
+    const src =
+        \\
+        \\fun sumRec(xs: List<Int>): Int =
+        \\    if (xs.isEmpty()) 0 else xs.first() + sumRec(xs.drop(1))
+        \\fun main() {
+        \\    println(sumRec(listOf(1, 2, 3, 4, 5)))
+        \\}
+        \\
+    ;
+    try assertKlio("recursive_sum", src, "15\n");
+}

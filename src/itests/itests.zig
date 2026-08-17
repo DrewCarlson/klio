@@ -1,7 +1,12 @@
 //! Integration test suite. Each file runs through
 //! the real pipeline and asserts behavior/diagnostics.
 test {
-    _ = @import("parity_advanced_idioms.zig");
+    // parity_advanced_idioms and parity_functional_patterns were
+    // redistributed into the suites that own their surfaces
+    // (operator_edge_cases, resolve_ambiguity, extension_resolution,
+    // lambdas_and_dispatch, object_init, collections_intensive,
+    // nullability_deep, type_system_shapes, exceptions_and_flow,
+    // data_class_features, sealed_when_patterns); both files are deleted.
     _ = @import("parity_array_bulk_ops.zig");
     _ = @import("parity_atomicfu_arrays.zig");
     // parity_closures_advanced folded into parity_closures_deep (its unique
@@ -24,7 +29,9 @@ test {
     _ = @import("parity_dsl_operators.zig");
     _ = @import("parity_exceptions_and_flow.zig");
     _ = @import("parity_extension_resolution.zig");
-    _ = @import("parity_functional_patterns.zig");
+    // parity_functional_patterns.zig is deleted, not skipped: its tests were
+    // moved verbatim into the owning suites (see the note at the top of this
+    // block), so the import has no file to point at.
     _ = @import("parity_generics_advanced.zig");
     _ = @import("parity_inheritance_dispatch.zig");
     _ = @import("parity_inner_classes.zig");

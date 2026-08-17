@@ -170,3 +170,16 @@ test "nullable_iterable_filter" {
     ;
     try assertKlio("nullable_iter", src, "6\n");
 }
+
+test "smart_cast_after_null_check" {
+    const src =
+        \\
+        \\fun shout(s: String?): Int {
+        \\    if (s == null) return -1
+        \\    return s.length  // smart-cast to non-null String
+        \\}
+        \\fun main() { println("${shout("hi")},${shout(null)}") }
+        \\
+    ;
+    try assertKlio("smart_null", src, "2,-1\n");
+}
