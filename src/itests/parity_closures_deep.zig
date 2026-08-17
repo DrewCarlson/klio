@@ -292,3 +292,98 @@ test "captured_var_sibling_closures_and_hof" {
     ;
     try assertKlio("carrier_siblings", src, "33\n");
 }
+
+// Advanced closure patterns: lambdas stored and invoked later, scope-fn
+// chaining with `this` reassignment, captures of class properties and
+// init-block locals, mutating fold accumulators, destructured let params.
+
+test "lambdas_stored_and_invoked_later" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val tasks = mutableListOf<() -> String>()
+        \\    for (i in 1..3) {
+        \\        val captured = i
+        \\        tasks.add { "t$captured" }
+        \\    }
+        \\    println(tasks.joinToString(",") { it() })
+        \\}
+        \\
+    ;
+    try assertKlio("stored_lambdas", src, "t1,t2,t3\n");
+}
+
+test "closure_chains_apply_let_run_with" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val result = StringBuilder()
+        \\        .apply { append("a") }
+        \\        .let { it.append("b") }
+        \\        .run { append("c"); toString() }
+        \\    println(result)
+        \\}
+        \\
+    ;
+    try assertKlio("scope_chain", src, "abc\n");
+}
+
+test "closure_capturing_class_property" {
+    const src =
+        \\
+        \\class P(val name: String) {
+        \\    fun greeter(): () -> String = { "hello $name" }
+        \\}
+        \\fun main() {
+        \\    val g = P("kotlin").greeter()
+        \\    println(g())
+        \\}
+        \\
+    ;
+    try assertKlio("capture_prop", src, "hello kotlin\n");
+}
+
+test "lambda_in_init_block_captures_init_local" {
+    const src =
+        \\
+        \\class Box {
+        \\    val getter: () -> Int
+        \\    init {
+        \\        val v = 42
+        \\        getter = { v }
+        \\    }
+        \\}
+        \\fun main() {
+        \\    println(Box().getter())
+        \\}
+        \\
+    ;
+    try assertKlio("init_lambda", src, "42\n");
+}
+
+test "fold_with_mutating_accumulator" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val r = listOf(1, 2, 3, 4, 5).fold(StringBuilder()) { acc, x ->
+        \\        acc.append(x); acc
+        \\    }
+        \\    println(r)
+        \\}
+        \\
+    ;
+    try assertKlio("fold_acc", src, "12345\n");
+}
+
+test "nested_let_destructure_pair" {
+    const src =
+        \\
+        \\fun main() {
+        \\    val r = Pair(3, 4).let { (a, b) -> a * b }
+        \\    println(r)
+        \\}
+        \\
+    ;
+    try assertKlio("let_dest", src, "12\n");
+}
+

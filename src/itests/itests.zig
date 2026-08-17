@@ -4,7 +4,9 @@ test {
     _ = @import("parity_advanced_idioms.zig");
     _ = @import("parity_array_bulk_ops.zig");
     _ = @import("parity_atomicfu_arrays.zig");
-    _ = @import("parity_closures_advanced.zig");
+    // parity_closures_advanced folded into parity_closures_deep (its unique
+    // tests run there now; the one dropped test was a duplicate of
+    // captured_var_sibling_closures_and_hof).
     _ = @import("parity_closures_deep.zig");
     // parity_iterables_special and parity_maps_intensive folded into
     // parity_collections_intensive (all their tests run there now, and the

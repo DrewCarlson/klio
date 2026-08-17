@@ -107,7 +107,6 @@ const itests_files = [_]Itest{
     .{ .name = "parity_advanced_idioms" },
     .{ .name = "parity_array_bulk_ops" },
     .{ .name = "parity_atomicfu_arrays" },
-    .{ .name = "parity_closures_advanced" },
     .{ .name = "parity_closures_deep" },
     .{ .name = "parity_collections_intensive" },
     .{ .name = "parity_conformance", .dirs = &.{"tests/fixtures/conformance"}, .weight = 20 },
