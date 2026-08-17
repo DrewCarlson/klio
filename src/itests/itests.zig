@@ -6,6 +6,9 @@ test {
     _ = @import("parity_atomicfu_arrays.zig");
     _ = @import("parity_closures_advanced.zig");
     _ = @import("parity_closures_deep.zig");
+    // parity_iterables_special and parity_maps_intensive folded into
+    // parity_collections_intensive (all their tests run there now, and the
+    // two donor files are deleted, so their imports are gone below).
     _ = @import("parity_collections_intensive.zig");
     _ = @import("parity_conformance.zig");
     _ = @import("parity_corpus_pinned.zig");
@@ -24,10 +27,8 @@ test {
     _ = @import("parity_inheritance_dispatch.zig");
     _ = @import("parity_inner_classes.zig");
     _ = @import("parity_interfaces_visibility.zig");
-    _ = @import("parity_iterables_special.zig");
     _ = @import("parity_kotlinx_io_read.zig");
     _ = @import("parity_lambdas_and_dispatch.zig");
-    _ = @import("parity_maps_intensive.zig");
     _ = @import("parity_named_args_defaults.zig");
     _ = @import("parity_nullability_deep.zig");
     _ = @import("parity_object_init.zig");
