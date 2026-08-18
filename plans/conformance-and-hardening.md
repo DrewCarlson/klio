@@ -245,7 +245,7 @@ evidence-backed; none is a hypothetical.
       exception: `lenient_warned` is not reset per program, so a second
       program can lose a leniency warning (suppresses a diagnostic, never
       changes a result).
-- [ ] H2. Two resolution paths that can disagree. `positional_lambda_binding`
+- [x] H2. Two resolution paths that can disagree. `positional_lambda_binding`
       passed through the CLI's eager typeck map and FAILED through the
       lazy engine in base mode — the same program, two answers, and the
       divergence was invisible until a driver switched paths. Establish
@@ -255,6 +255,28 @@ evidence-backed; none is a hypothetical.
       `KLIO_RESOLVE_AUDIT` already reports per-call decisions); if no,
       document which is authoritative where. Correctness that depends on
       which driver ran is not correctness.
+      DONE 2026-08-18 — `docs/development/resolution-paths.md`. They are
+      NOT meant to be equivalent and the precedence is already defined:
+      where the eager typeck map has an entry it WINS (type-derived and
+      overload-precise vs the lazy engine's shape-based scoring), with one
+      guard against a pick that resolves back to the enclosing declaration.
+      MEASURED with KLIO_EAGER_AUDIT over 60 corpus examples: 4
+      disagreements, ALL of the shape `eager=<fid> lazy=-1` — the lazy
+      engine declining and eager supplying — and ZERO cases where both
+      answered differently. So the paths never contradict; eager
+      supplements.
+      The real finding is structural: `pending_eager_calls` is built ONLY
+      under `src/cli/` — `src/parity/parity.zig` never builds it. So
+      `klio run`, `klio test`, bundles and corpus_check.py resolve WITH
+      the map, while e2e, differential, every parity itest and the
+      commontest censuses resolve WITHOUT it. That is precisely the
+      positional_lambda_binding shape: it ran under the CLI and failed in
+      base mode, and the eager map had been hiding a real lazy-scorer gap.
+      Coverage asymmetry recorded: the parity path is output-pinned (320
+      expected outputs) while the CLI path — the one users run — is mostly
+      exit-code-checked (16 pins). Rule written down: never "fix" a parity
+      failure by teaching parity to build the eager map; that would hide
+      lazy-engine gaps from the only suites that catch them.
 - [ ] H3. The coroutine park/wake contract. Three real bugs in one week:
       a cross-thread activation resume dereferencing the parker's dead
       TLS (SEGV), a dispatched task's internal failure never waking the
