@@ -166,6 +166,8 @@ const RUNNABLE = [_][]const u8{
     "tl_dispatched_failure_no_join",
     "tl_dispatched_failure_caught",
     "tl_dispatched_internal_error_fails_run",
+    "tl_dispatched_cancellation_is_not_failure",
+    "tl_dispatched_failure_after_resume",
     "tl_cancel_dispatched_child",
     "tl_cancel_sibling_plain",
     "tl_cancel_sibling_after_scope",
@@ -281,6 +283,14 @@ test "tl_dispatched_failure_caught" {
 }
 test "tl_dispatched_internal_error_fails_run" {
     try check("tl_dispatched_internal_error_fails_run");
+}
+
+test "tl_dispatched_cancellation_is_not_failure" {
+    try check("tl_dispatched_cancellation_is_not_failure");
+}
+
+test "tl_dispatched_failure_after_resume" {
+    try check("tl_dispatched_failure_after_resume");
 }
 test "tl_cancel_dispatched_child" {
     try check("tl_cancel_dispatched_child");

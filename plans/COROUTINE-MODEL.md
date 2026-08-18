@@ -5,6 +5,47 @@ Author role: concurrency runtime architect. This plan is grounded in the live co
 
 ---
 
+## The dispatched-task terminal-state contract (2026-08-18)
+
+The park/wake machinery's invariants used to live only in comments, and
+three real bugs came out of it in one week: a cross-thread resume
+dereferencing the parker's dead thread-local state (SEGV), a dispatched
+task's internal failure never waking the parked root (silent hang), and
+the pool's `first_error` being read only at the run boundary. What follows
+is the contract as TESTABLE statements, each naming the fixture that pins
+it. A statement with no fixture is a gap, not a convention.
+
+Every dispatched task ends in exactly one terminal state, and each has a
+required observable outcome:
+
+| terminal state | required behavior | pinned by |
+|---|---|---|
+| completes normally | the Job completes; `join()` returns; the parent is untouched | `tl_dispatch_many`, `tl_dispatch_thread_names` |
+| throws before suspending | the Job completes as FAILED, the parent scope is cancelled per structured concurrency, and the run crashes (rc=1) | `tl_dispatched_failure_join`, `tl_dispatched_failure_no_join` |
+| throws AFTER suspending (the resume path) | identical to the above — but the throw lands on whichever worker resumed the continuation, not the one that started it | `tl_dispatched_failure_after_resume` |
+| throws and the body catches it | no failure escapes; the parent survives | `tl_dispatched_failure_caught` |
+| throws `CancellationException` | NOT a failure — it is that coroutine's own normal cancellation. The parent scope must survive and the run must not crash | `tl_dispatched_cancellation_is_not_failure` |
+| fails with an INTERNAL eval error (not a Kotlin throwable) | the run must END with that error, never hang. Internal errors never reach the coroutine machinery, so the pump polls the pool's `first_error` from its parked-root idle arm | `tl_dispatched_internal_error_fails_run` |
+| cancelled by its parent | the child observes cancellation; siblings and the root follow structured-concurrency rules | `tl_cancel_dispatched_child`, `tl_cancel_sibling_plain`, `tl_cancel_sibling_after_scope`, `tl_cancel_root_not_independent` |
+| still running when the root finishes (daemon) | abandoned at the run boundary rather than joined; the process must not outlive it and must not hang | `tl_daemon_not_awaited`, `tl_daemon_queued_dropped`, `tl_daemon_infinite_abandoned` |
+
+Two invariants underneath the table, both learned from failures:
+
+1. **A resume may land on a different thread than the park.** A parked
+   activation must be rebound to the RESUMING thread's eval state before
+   reactivation; the parker's thread-local storage may already be dead.
+   The snapshot-resume path builds a fresh frame and is safe by
+   construction; the live-activation path must rebind explicitly.
+2. **An internal error is not a Kotlin throwable**, so it cannot complete a
+   Job as failed and no resume will ever arrive for a root waiting on it.
+   Anything that can leave the root parked forever must therefore be
+   surfaced from the pump's idle arm, not only at the run boundary.
+
+The failure-vs-cancellation pair is one `throw` apart and the two fixtures
+exist so that a change collapsing them is caught.
+
+---
+
 ## STATUS 2026-06-27 — verified current state and remaining work
 
 The original framing ("eager model, no async event loop") is **superseded**: klio has a
