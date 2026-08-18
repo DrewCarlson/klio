@@ -6348,6 +6348,20 @@ fn lowerCallSpread(
                     break :blk dst;
                 }
             }
+            // No local, no global, and no recorded enclosing member: a bare
+            // call can only be a member of the implicit receiver. The
+            // smart-cast `this` inside `when (this) { is Abs -> va(*a) }` of
+            // an extension on a TYPE PARAMETER is the live shape — no static
+            // member set records `Abs.va` there, and the value read below
+            // dies on `get_field`.
+            if (b.resolve(name) == null and !b.knowsOuter(name) and !b.isLocalFn(name) and
+                !b.module.hasBareCallCandidate(name, callee.Path.segments[0].span.file))
+            {
+                if (try resolveThisForBareCall(b)) |this_reg| {
+                    member_id = try b.module.internConst(b.allocator, .{ .String = name });
+                    break :blk this_reg;
+                }
+            }
         }
         break :blk try lowerExpr(b, callee);
     };

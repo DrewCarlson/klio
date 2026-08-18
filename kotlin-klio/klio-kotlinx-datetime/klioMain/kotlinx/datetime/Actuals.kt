@@ -652,8 +652,24 @@ class UtcOffset internal constructor(val totalSeconds: Int) {
         fun parseOrNull(input: CharSequence): UtcOffset? = try { parse(input) } catch (e: Exception) { null }
         fun orNull(hours: Int? = null, minutes: Int? = null, seconds: Int? = null): UtcOffset? =
             try { UtcOffset(hours, minutes, seconds) } catch (e: Exception) { null }
+
+        fun parse(input: CharSequence, format: DateTimeFormat<UtcOffset>): UtcOffset = format.parse(input)
+
+        fun Format(block: DateTimeFormatBuilder.WithUtcOffset.() -> Unit): DateTimeFormat<UtcOffset> =
+            UtcOffsetFormat.build(block)
+    }
+
+    object Formats {
+        val ISO: DateTimeFormat<UtcOffset> get() = ISO_OFFSET
+        val ISO_BASIC: DateTimeFormat<UtcOffset> get() = ISO_OFFSET_BASIC
+        val FOUR_DIGITS: DateTimeFormat<UtcOffset> get() = FOUR_DIGIT_OFFSET
     }
 }
+
+fun UtcOffset.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<UtcOffset>): UtcOffset? =
+    format.parseOrNull(input)
+
+fun UtcOffset.format(format: DateTimeFormat<UtcOffset>): String = format.format(this)
 
 private fun utcOffsetTotalSeconds(hours: Int?, minutes: Int?, seconds: Int?): Int = when {
     hours != null -> utcOffsetHms(hours, minutes ?: 0, seconds ?: 0)
