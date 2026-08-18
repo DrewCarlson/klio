@@ -2290,18 +2290,32 @@ fn companionOwnerName(name: []const u8) ?[]const u8 {
 /// every `T.Companion.f()` extension in scope survives the lenient pass and the
 /// first-declared one wins (`String.serializer()` binding
 /// `Char.Companion.serializer`).
-fn companionOwnerMismatch(param_name: []const u8, receiver: *const Value) bool {
+fn companionOwnerMismatch(self: *VmHost, param_name: []const u8, receiver: *const Value) bool {
     const want = companionOwnerName(param_name) orelse return false;
     const g = receiver.Instance.borrow();
     defer g.deinit();
     const cg = g.get().class.borrow();
     defer cg.deinit();
-    const got = companionOwnerName(cg.get().fqn) orelse return false;
-    return !std.mem.eql(u8, want, got);
+    if (companionOwnerName(cg.get().fqn)) |got| return !std.mem.eql(u8, want, got);
+    // A NAMED companion (`companion object Named`) carries no `.Companion`
+    // fqn segment; the registry maps the owner to its companion class.
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    if (mg.get().registry.companion_singletons.get(want)) |cn| {
+        if (std.mem.eql(u8, cn, cg.get().name)) return false;
+    }
+    // The receiver is not `want`'s companion under either naming, so a
+    // `want.Companion` receiver type cannot bind it.
+    return true;
 }
 
 fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver: *const Value) bool {
-    if (receiver.* == .Instance and companionOwnerMismatch(param_ty.name, receiver)) return true;
+    if (receiver.* == .Instance and companionOwnerMismatch(self, param_ty.name, receiver)) return true;
+    // `fun Unit.f()` applies to `Unit` alone. An interpreted instance is never
+    // `Unit`, so such an extension must not survive as a lenient candidate for
+    // it — `Unit.serializer()` otherwise answered `PlainObject.serializer()`.
+    if (receiver.* == .Instance and !param_ty.nullable and
+        std.mem.eql(u8, simpleName(param_ty.name), "Unit")) return true;
     if (argDefinitelyNotParamType(self, param_ty, receiver)) return true;
     // A function value implements only the Function* surface (plus
     // Any/type variables): a NOMINAL receiver type it does not satisfy
@@ -4788,24 +4802,36 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (try classCompanionForward(self, allocator, receiver, name, args)) |r| return r;
     }
 
-    // Reflective KSerializer synthesis.
-    if (std.mem.eql(u8, name, "serializer") and args.len == 0 and
-        (receiver.* == .Class))
-    {
-        const factory = blk: {
-            const cg = self.classes.borrow();
-            defer cg.deinit();
-            if (cg.get().get("ReflectiveKSerializer")) |d| break :blk d.clone();
-            break :blk null;
+    // kotlinx-serialization's plugin generates `serializer()` on a
+    // `@Serializable` declaration's companion. klio has no plugin, so the pack
+    // supplies `__klsx_generatedSerializer(kClass)` and this tail routes the
+    // call to it. An OBJECT declaration is its own receiver at the call site
+    // (`PlainObject.serializer()` passes the singleton, not a class value), so
+    // both receiver shapes resolve through the declaration's KClass.
+    if (std.mem.eql(u8, name, "serializer") and args.len == 0) {
+        const kclass: ?Value = switch (receiver.*) {
+            .Class => receiver.*,
+            .Instance => |inst| blk: {
+                const g = inst.borrow();
+                defer g.deinit();
+                const cg = g.get().class.borrow();
+                const is_object = cg.get().is_object;
+                cg.deinit();
+                break :blk if (is_object) Value{ .Class = g.get().class.clone() } else null;
+            },
+            else => null,
         };
-        if (factory) |def| {
-            defer def.deinit();
-            const dg = def.borrow();
-            const dn = dg.get().name;
-            dg.deinit();
-            if (self.module.borrow().get().classId(dn)) |cid| {
-                const ctor_args = [_]Value{receiver.*};
-                return newInstanceById(self, allocator, cid, &ctor_args, null);
+        if (kclass) |kc| {
+            const mg = self.module.borrow();
+            const fid = mg.get().funcIdByFqn("kotlinx.serialization.__klsx_generatedSerializer");
+            mg.deinit();
+            if (fid) |f| {
+                const call_args = [_]Value{kc};
+                const r = try callFuncRec(self, allocator, self.module.asPtr(), f, &call_args);
+                switch (r) {
+                    .ok => |v| if (v != .Null) return .{ .ok = v },
+                    .err => return r,
+                }
             }
         }
     }
