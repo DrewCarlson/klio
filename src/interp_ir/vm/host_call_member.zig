@@ -5823,6 +5823,12 @@ fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *const Va
             break :blk bg.get().resolve(p);
         };
         if (installed) |func| {
+            // A binding that declares itself inapplicable to this call shape
+            // (a property getter handed arguments) is not the target; keep
+            // walking so the library extension of the same name binds.
+            if (stdlib.implementationApplicable(p, args)) |applies| {
+                if (!applies) continue;
+            }
             if (ib_key) |k| instanceIntrinsicCachePut(self, k, func, p);
             const all_args = try prependReceiver(allocator, receiver, args);
             defer if (runtime.freeScratch()) allocator.free(all_args);

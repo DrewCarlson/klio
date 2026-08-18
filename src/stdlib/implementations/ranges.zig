@@ -39,7 +39,10 @@ fn rangeKindForArgs(a: Value, b: Value) RangeKind {
 // ============================================================
 
 pub fn ranges_down_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    const pair = pairIntArgs(ctx, "downTo") orelse return typeErr("downTo requires two Int operands");
+    // As `until`: the name is shared with library extensions on non-integral
+    // types, so a shape this builtin cannot serve declines rather than fails.
+    const pair = pairIntArgs(ctx, "downTo") orelse
+        return .{ .err = .{ .Unimplemented = "Vm::downTo non-integral operands" } };
     return ok(try Value.newRange(ctx.allocator, .{
         .start = pair[0],
         .end = pair[1],
@@ -72,8 +75,11 @@ pub fn ranges_until(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 pub fn ranges_step(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    if (ctx.args.len == 2 and ctx.args[0] == .Range and ctx.args[1].isIntegral()) {
-        const r = ctx.args[0].Range;
+    // Either range representation serves as the receiver: the host
+    // `Value.Range` and the `Value.Instance` an upstream
+    // `LongProgression.fromClosedRange` builds carry the same triple.
+    if (ctx.args.len == 2 and ctx.args[1].isIntegral()) {
+        if (asRangeView(&ctx.args[0])) |r| {
         const n = ctx.args[1].asI64().?;
         if (n <= 0) {
             const msg = try std.fmt.allocPrint(ctx.allocator, "Step must be positive, was: {d}.", .{n});
@@ -92,8 +98,12 @@ pub fn ranges_step(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             .kind = r.kind,
             .progression = true,
         }));
+        }
     }
-    return typeErr("step requires IntRange . step(Int)");
+    // Not the integral builtin's shape (a progression INSTANCE receiver, a
+    // non-integral step): decline so dispatch reaches the library extension
+    // of the same name rather than hard-failing here.
+    return .{ .err = .{ .Unimplemented = "Vm::step non-integral operands" } };
 }
 
 /// Match Kotlin's `IntProgression.fromClosedRange`: the stored `end` is the

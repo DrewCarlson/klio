@@ -22,8 +22,6 @@ class YearMonth(val year: Int, val monthNumber: Int) : Comparable<YearMonth> {
     val firstDay: LocalDate get() = LocalDate(year, monthNumber, 1)
     val lastDay: LocalDate get() = LocalDate(year, monthNumber, numberOfDays)
 
-    // Months since 0000-01 (the proleptic month index), used for arithmetic.
-    internal val prolepticMonth: Long get() = year.toLong() * 12L + (monthNumber - 1).toLong()
 
     override fun compareTo(other: YearMonth): Int {
         if (year != other.year) return year.compareTo(other.year)
@@ -42,6 +40,9 @@ class YearMonth(val year: Int, val monthNumber: Int) : Comparable<YearMonth> {
         }
         return "$y-${monthNumber.toString().padStart(2, '0')}"
     }
+
+    operator fun rangeTo(that: YearMonth): YearMonthRange = YearMonthRange.fromRangeTo(this, that)
+    operator fun rangeUntil(that: YearMonth): YearMonthRange = YearMonthRange.fromRangeUntil(this, that)
 
     companion object {
         val MIN: YearMonth = YearMonth(-999_999, 1)
@@ -116,6 +117,13 @@ fun YearMonth.plus(value: Int, unit: DateTimeUnit.MonthBased): YearMonth = plus(
 fun YearMonth.minus(value: Long, unit: DateTimeUnit.MonthBased): YearMonth = plus(-value, unit)
 fun YearMonth.minus(value: Int, unit: DateTimeUnit.MonthBased): YearMonth = plus(-value.toLong(), unit)
 
+// Months since 0000-01 (the proleptic month index), used for arithmetic.
+// Declared as upstream does, so the consumed YearMonthRange.kt binds it.
+internal val YearMonth.prolepticMonth: Long get() = year.toLong() * 12L + (monthNumber - 1).toLong()
+
+internal fun YearMonth.Companion.fromProlepticMonth(prolepticMonth: Long): YearMonth =
+    yearMonthFromProleptic(prolepticMonth)
+
 fun YearMonth.plusMonth(): YearMonth = plus(1, DateTimeUnit.MONTH)
 fun YearMonth.minusMonth(): YearMonth = minus(1, DateTimeUnit.MONTH)
 fun YearMonth.plusYear(): YearMonth = plus(1, DateTimeUnit.YEAR)
@@ -138,71 +146,3 @@ fun YearMonth.onDay(day: Int): LocalDate = LocalDate(year, monthNumber, day)
 val LocalDate.yearMonth: YearMonth get() = YearMonth(year, monthNumber)
 
 // --- YearMonth progression / range (over proleptic months) --------------
-
-open class YearMonthProgression(start: YearMonth, endInclusive: YearMonth, stepMonths: Long) : Collection<YearMonth> {
-    internal val longProgression: LongProgression =
-        LongProgression.fromClosedRange(start.prolepticMonth, endInclusive.prolepticMonth, stepMonths)
-
-    val first: YearMonth get() = yearMonthFromProleptic(longProgression.first)
-    val last: YearMonth get() = yearMonthFromProleptic(longProgression.last)
-
-    override val size: Int
-        get() {
-            if (longProgression.isEmpty()) return 0
-            val count = (longProgression.last - longProgression.first) / longProgression.step + 1L
-            return if (count > Int.MAX_VALUE.toLong()) Int.MAX_VALUE else count.toInt()
-        }
-    override fun isEmpty(): Boolean = longProgression.isEmpty()
-    override fun iterator(): Iterator<YearMonth> = object : Iterator<YearMonth> {
-        private val it = longProgression.iterator()
-        override fun hasNext(): Boolean = it.hasNext()
-        override fun next(): YearMonth = yearMonthFromProleptic(it.next())
-    }
-    override fun contains(value: YearMonth): Boolean {
-        val d = value.prolepticMonth
-        val f = longProgression.first; val l = longProgression.last; val s = longProgression.step
-        return if (s > 0) d in f..l && (d - f) % s == 0L else d in l..f && (f - d) % (-s) == 0L
-    }
-    override fun containsAll(elements: Collection<YearMonth>): Boolean = elements.all { contains(it) }
-    fun reversed(): YearMonthProgression = YearMonthProgression(last, first, -longProgression.step)
-    override fun equals(other: Any?): Boolean =
-        other is YearMonthProgression && longProgression == other.longProgression
-    override fun hashCode(): Int = longProgression.hashCode()
-    override fun toString(): String =
-        if (longProgression.step > 0) "$first..$last step ${longProgression.step}M"
-        else "$first downTo $last step ${-longProgression.step}M"
-}
-
-class YearMonthRange(start: YearMonth, endInclusive: YearMonth) :
-    YearMonthProgression(start, endInclusive, 1L), ClosedRange<YearMonth> {
-    override val start: YearMonth get() = first
-    override val endInclusive: YearMonth get() = last
-    override fun contains(value: YearMonth): Boolean = value >= start && value <= endInclusive
-    override fun isEmpty(): Boolean = start > endInclusive
-    override fun toString(): String = "$first..$last"
-
-    companion object {
-        val EMPTY: YearMonthRange = YearMonthRange(YearMonth(1970, 2), YearMonth(1970, 1))
-        fun fromRangeUntil(start: YearMonth, endExclusive: YearMonth): YearMonthRange =
-            if (endExclusive.prolepticMonth <= start.prolepticMonth) EMPTY
-            else YearMonthRange(start, yearMonthFromProleptic(endExclusive.prolepticMonth - 1))
-    }
-}
-
-operator fun YearMonth.rangeTo(that: YearMonth): YearMonthRange = YearMonthRange(this, that)
-operator fun YearMonth.rangeUntil(that: YearMonth): YearMonthRange = YearMonthRange.fromRangeUntil(this, that)
-infix fun YearMonth.downTo(that: YearMonth): YearMonthProgression = YearMonthProgression(this, that, -1L)
-
-fun YearMonthProgression.step(value: Int, unit: DateTimeUnit.MonthBased): YearMonthProgression =
-    step(value.toLong(), unit)
-fun YearMonthProgression.step(value: Long, unit: DateTimeUnit.MonthBased): YearMonthProgression {
-    require(value > 0) { "Step must be positive, but was $value." }
-    return YearMonthProgression(first, last, value * unit.months.toLong())
-}
-fun YearMonthProgression.random(random: kotlin.random.Random = kotlin.random.Random): YearMonth {
-    if (isEmpty()) throw NoSuchElementException("Cannot get a random element of an empty range.")
-    val count = (longProgression.last - longProgression.first) / longProgression.step + 1L
-    return yearMonthFromProleptic(longProgression.first + random.nextLong(count) * longProgression.step)
-}
-fun YearMonthProgression.randomOrNull(random: kotlin.random.Random = kotlin.random.Random): YearMonth? =
-    if (isEmpty()) null else random(random)

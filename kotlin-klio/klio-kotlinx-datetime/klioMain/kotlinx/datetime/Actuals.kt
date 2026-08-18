@@ -141,6 +141,9 @@ actual class LocalDate(
     }
     override fun hashCode(): Int = year * 10000 + monthNumber * 100 + day
 
+    operator fun rangeTo(that: LocalDate): LocalDateRange = LocalDateRange.fromRangeTo(this, that)
+    operator fun rangeUntil(that: LocalDate): LocalDateRange = LocalDateRange.fromRangeUntil(this, that)
+
     companion object {
         val MIN: LocalDate = LocalDate(-999_999, 1, 1)
         val MAX: LocalDate = LocalDate(999_999, 12, 31)
