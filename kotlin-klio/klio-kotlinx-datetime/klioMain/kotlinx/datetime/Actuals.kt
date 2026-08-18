@@ -260,6 +260,29 @@ internal fun dateFromEpochDays(epochDays: Long): LocalDate {
 // Add a (possibly negative) number of calendar months, clamping the day
 // of month to the resulting month's length (2024-01-31 + 1 month =
 // 2024-02-29).
+// The threeten-bp-shaped helpers upstream's own native actual declares.
+// They are `internal`, but the commonKotlin test set exercises them.
+internal fun LocalDate.plusMonths(monthsToAdd: Long): LocalDate =
+    localDatePlusMonths(this, monthsToAdd)
+
+internal fun LocalDate.plusDays(daysToAdd: Long): LocalDate =
+    if (daysToAdd == 0L) this else dateFromEpochDays(toEpochDays() + daysToAdd)
+
+internal fun LocalDateTime.toEpochSecond(offset: UtcOffset): Long =
+    date.toEpochDays() * 86400L + time.toSecondOfDay().toLong() - offset.totalSeconds.toLong()
+
+internal fun LocalDateTime.plusSeconds(seconds: Int): LocalDateTime {
+    if (seconds == 0) return this
+    val secondsPerDay = 86_400L
+    val nanosPerDay = 86_400_000_000_000L
+    val currentNanoOfDay = time.toNanosecondOfDay()
+    val totalNanos = (seconds % secondsPerDay) * 1_000_000_000L + currentNanoOfDay
+    val totalDays = seconds / secondsPerDay + totalNanos.floorDiv(nanosPerDay)
+    val newNanoOfDay = totalNanos.mod(nanosPerDay)
+    val newTime = if (newNanoOfDay == currentNanoOfDay) time else LocalTime.fromNanosecondOfDay(newNanoOfDay)
+    return LocalDateTime(date.plusDays(totalDays), newTime)
+}
+
 internal fun localDatePlusMonths(date: LocalDate, monthsToAdd: Long): LocalDate {
     val total = date.year.toLong() * 12 + (date.monthNumber - 1) + monthsToAdd
     var y = total / 12
@@ -541,10 +564,28 @@ open class TimeZone internal constructor(val id: String, internal val offsetSeco
     companion object {
         val UTC: FixedOffsetTimeZone = FixedOffsetTimeZone(UtcOffset.ZERO, "UTC")
         fun currentSystemDefault(): TimeZone = TimeZone(__kxdt_currentSystemTimeZoneId())
+
+        // The zone id keeps its written form for a PREFIXED fixed offset
+        // (`UTC+01:00`, `GMT+01:00`, `UT+01:00`), so two zones with the same
+        // offset stay distinguishable, exactly as kotlinx-datetime does.
         fun of(zoneId: String): TimeZone {
-            parseFixedOffsetSeconds(zoneId)?.let { off ->
-                if (zoneId == "UTC" || zoneId == "GMT" || zoneId == "UT") return FixedOffsetTimeZone(UtcOffset(off), zoneId)
-                return FixedOffsetTimeZone(UtcOffset(off))
+            if (zoneId == "UTC") return UTC
+            if (zoneId == "Z" || zoneId == "z") return UtcOffset.ZERO.asTimeZone()
+            if (zoneId == "SYSTEM") return currentSystemDefault()
+            if (zoneId.length == 1) throw IllegalTimeZoneException("Invalid zone ID: $zoneId")
+            if (zoneId == "GMT" || zoneId == "UT") return FixedOffsetTimeZone(UtcOffset.ZERO, zoneId)
+            if (zoneId.startsWith("+") || zoneId.startsWith("-")) {
+                val off = parseOffsetSecondsOrNull(zoneId)
+                    ?: throw IllegalTimeZoneException("Invalid zone ID: $zoneId")
+                return UtcOffset(off).asTimeZone()
+            }
+            for (prefix in listOf("UTC", "GMT", "UT")) {
+                if (zoneId.length > prefix.length && zoneId.startsWith(prefix) &&
+                    (zoneId[prefix.length] == '+' || zoneId[prefix.length] == '-')) {
+                    val off = parseOffsetSecondsOrNull(zoneId.substring(prefix.length))
+                        ?: throw IllegalTimeZoneException("Invalid zone ID: $zoneId")
+                    return UtcOffset(off).asTimeZone(prefix)
+                }
             }
             if (!__kxdt_validateTimeZone(zoneId)) {
                 throw IllegalTimeZoneException("Unknown time-zone id: $zoneId")
@@ -605,17 +646,41 @@ internal fun parseFixedOffsetSeconds(id: String): Int? {
     for (prefix in listOf("UTC", "GMT", "UT")) {
         if (s.startsWith(prefix)) { s = s.substring(prefix.length); break }
     }
-    if (s.isEmpty()) return null
-    val sign = when (s[0]) { '+' -> 1; '-' -> -1; else -> return null }
-    val body = s.substring(1)
+    return parseOffsetSecondsOrNull(s)
+}
+
+// ISO-8601 UTC offset body: a mandatory sign, then `HH`, `HH:MM`/`HHMM`, or
+// `HH:MM:SS`/`HHMMSS` — each component exactly two digits, minutes and
+// seconds under 60, and the whole offset within +/-18:00.
+internal fun parseOffsetSecondsOrNull(body: String): Int? {
     if (body.isEmpty()) return null
-    val parts = body.split(":")
-    if (parts.size > 3) return null
-    val h = parts[0].toIntOrNull() ?: return null
-    val m = if (parts.size > 1) (parts[1].toIntOrNull() ?: return null) else 0
-    val sec = if (parts.size > 2) (parts[2].toIntOrNull() ?: return null) else 0
-    if (m !in 0..59 || sec !in 0..59) return null
-    return sign * (h * 3600 + m * 60 + sec)
+    val sign = when (body[0]) { '+' -> 1; '-' -> -1; else -> return null }
+    val rest = body.substring(1)
+    fun twoDigits(x: String): Int? =
+        if (x.length == 2 && x.all { it in '0'..'9' }) x.toInt() else null
+    var h = 0; var m = 0; var sec = 0
+    if (rest.contains(":")) {
+        val parts = rest.split(":")
+        if (parts.size < 2 || parts.size > 3) return null
+        h = twoDigits(parts[0]) ?: return null
+        m = twoDigits(parts[1]) ?: return null
+        if (parts.size == 3) sec = twoDigits(parts[2]) ?: return null
+    } else {
+        when (rest.length) {
+            2 -> h = twoDigits(rest) ?: return null
+            4 -> { h = twoDigits(rest.substring(0, 2)) ?: return null; m = twoDigits(rest.substring(2)) ?: return null }
+            6 -> {
+                h = twoDigits(rest.substring(0, 2)) ?: return null
+                m = twoDigits(rest.substring(2, 4)) ?: return null
+                sec = twoDigits(rest.substring(4)) ?: return null
+            }
+            else -> return null
+        }
+    }
+    if (m > 59 || sec > 59) return null
+    val total = sign * (h * 3600 + m * 60 + sec)
+    if (total < -18 * 3600 || total > 18 * 3600) return null
+    return total
 }
 
 // Split epoch seconds into (floor days, seconds-of-day) with a non-negative
@@ -775,6 +840,10 @@ private fun utcOffsetHms(hours: Int, minutes: Int, seconds: Int): Int {
 
 /** The fixed-offset time zone with this offset. */
 fun UtcOffset.asTimeZone(): FixedOffsetTimeZone = FixedOffsetTimeZone(this)
+
+/** The fixed-offset zone written with an explicit `UTC`/`GMT`/`UT` prefix. */
+internal fun UtcOffset.asTimeZone(prefix: String): FixedOffsetTimeZone =
+    FixedOffsetTimeZone(this, prefix + toString())
 
 /** The wall-clock offset of [timeZone] from UTC at this instant. */
 fun Instant.offsetIn(timeZone: TimeZone): UtcOffset {
