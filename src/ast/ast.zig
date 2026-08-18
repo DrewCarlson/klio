@@ -564,6 +564,8 @@ pub const ObjectDecl = struct {
     /// delegation (`object O : Iface by impl`), `null` for a plain supertype.
     /// Empty when the declaration used no `by` clause.
     supertype_delegates: []?Expr = &.{},
+    /// Annotations written on the declaration (`@Serializable object O`).
+    annotations: []Annotation = &.{},
     /// `data object Foo { … }` — auto-generates `toString` returning the
     /// simple class name. Distinct from `data class`: no `copy` / no
     /// `componentN`, and user-declared `equals`/`hashCode` overrides are

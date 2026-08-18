@@ -198,6 +198,7 @@ pub fn parseStmt(p: *Parser) ?Stmt {
                         flags.is_expect,
                         flags.is_actual,
                         flags.visibility,
+                        flags.annotations.items,
                     ) orelse return null;
                     return Stmt{ .Decl = Decl{ .Object = o } };
                 } else {

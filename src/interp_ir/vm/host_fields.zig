@@ -2333,7 +2333,20 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
                     break;
                 }
             }
-            if (matches) try items.append(allocator, .{ .Class = c.* });
+            if (!matches) continue;
+            // The class table keys a lifted nested class under more than one
+            // name, so the same definition can be reached twice; report each
+            // subclass once.
+            var seen = false;
+            for (items.items) |prev| {
+                const pg = prev.Class.borrow();
+                defer pg.deinit();
+                if (std.mem.eql(u8, pg.get().fqn, sg.get().fqn)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) try items.append(allocator, .{ .Class = c.* });
         }
         return ok(try frozenList(allocator, items, false));
     }
@@ -2350,7 +2363,27 @@ fn resolveExtensionProp(
     recv_simple: []const u8,
     name: []const u8,
 ) Allocator.Error!?FuncId {
-    return resolveExtensionPropImpl(self, allocator, receiver, recv_simple, name, false);
+    const fid = try resolveExtensionPropImpl(self, allocator, receiver, recv_simple, name, false) orelse return null;
+    if (try memberExtOutOfScope(self, allocator, receiver, fid)) return null;
+    return fid;
+}
+
+/// A MEMBER extension property (`class C { val R.p get() = … }`) is in scope
+/// only while an implicit receiver of its owner class is. For a BUILTIN
+/// receiver that already answers the name itself, applying an out-of-scope
+/// member extension shadows the member — which Kotlin never does. Upstream
+/// kotlinx-serialization's `MapEntrySerializer` declares
+/// `override val Map.Entry<K, V>.value get() = this.value`; without this guard
+/// every `entry.value` read anywhere binds that getter, and the getter's own
+/// `this.value` re-enters it without bound.
+fn memberExtOutOfScope(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId) Allocator.Error!bool {
+    switch (receiver.*) {
+        .Instance, .Class => return false,
+        else => {},
+    }
+    const mptr: *const Module = self.module.asPtr();
+    const owner = mptr.registry.member_ext_owner_class.get(fid) orelse return false;
+    return (try host_call_member.memberExtOwnerInstance(self, allocator, receiver, owner)) == null;
 }
 
 /// Whether a class-value receiver's resolved extension property was
