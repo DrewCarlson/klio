@@ -10,11 +10,19 @@ bottom and are not campaigns.
 
 ## The active plan
 
-None. `plans/simplify-validate-accelerate.md` CLOSED 2026-08-17 with
-every item landed and `scripts/gate.sh` GREEN — its full record (three
-tracks: Simplify, Validate, Accelerate) is summarised in
-`PLAN-archive.md`. The items below are the standing fronts any next
-campaign draws from.
+`plans/conformance-and-hardening.md` — two tracks: Conformance (prove
+what the interpreter actually passes: the coroutines suite's 896
+failures behind a 340 floor, ratchet ceilings, the 44 unpinned examples,
+a stdlib surface inventory) and Hardening (the structural weak spots the
+last campaign exposed: process-global state, the two resolution paths
+that can disagree, the coroutine park/wake contract, dispatch-ladder
+density, the memory model). Carried perf roads stay measurement-gated.
+Order of work and completion state live there.
+
+Its predecessor `plans/simplify-validate-accelerate.md` CLOSED
+2026-08-17 with every item landed and `scripts/gate.sh` GREEN; the full
+record is summarised in `PLAN-archive.md`. The items below are the
+standing fronts both plans draw from.
 
 ## 1. Transpiler speedup + Value 16B
 
@@ -143,8 +151,9 @@ klio-compose-suite-perf; harness practice in `BENCHMARKS.md`.
 
 ## Doc register
 
-LIVE (open work tracked): `c-transpiler-plan.md`,
-`value-layout-campaign.md`, `KTOR-SERVER-UPSTREAM.md`, and this file.
+LIVE (open work tracked): `conformance-and-hardening.md` (the
+active plan), `c-transpiler-plan.md`, `value-layout-campaign.md`,
+`KTOR-SERVER-UPSTREAM.md`, and this file.
 `simplify-validate-accelerate.md` is FINISHED (closed 2026-08-17) and
 is kept as a log — it is still cited above for the V4 acceptance
 standing and the A6 yield-hop record. `worklist.md` is a pointer:
