@@ -16,13 +16,17 @@ test "kotlinx.datetime commonTest pass count holds at or above the ratchet basel
             .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
             .{ .dir = "kotlin-klio/klio-kotlinx-datetime", .artifact = "target/packs/kotlinx.datetime.klio-pack" },
         },
-        // Measured solo: 212 passed / 291 failed / 1 incomplete. The floor is a minimum pass
-        // count; the ceilings bound the red mass so a fixed case
-        // traded for a broken one cannot pass unnoticed. Lower the
-        // ceilings as fixes land, never raise them.
         .whole_source_set = true,
-        .baseline = 210,
-        .max_failed = 300,
-        .max_incomplete = 5,
+        // `LocalDateTest.fromEpochDays` walks ~1.4M epoch days building a
+        // LocalDate per step; interpreted that is ~3 minutes of pure compute,
+        // and the default 60s budget dropped the whole file's results.
+        .timeout_ms = 400_000,
+        // Measured solo: 457 passed / 62 failed / 0 incomplete. The floor is a
+        // minimum pass count; the ceilings bound the red mass so a fixed case
+        // traded for a broken one cannot pass unnoticed. Lower the ceilings as
+        // fixes land, never raise them.
+        .baseline = 450,
+        .max_failed = 70,
+        .max_incomplete = 1,
     });
 }
