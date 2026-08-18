@@ -277,7 +277,7 @@ evidence-backed; none is a hypothetical.
       exit-code-checked (16 pins). Rule written down: never "fix" a parity
       failure by teaching parity to build the eager map; that would hide
       lazy-engine gaps from the only suites that catch them.
-- [ ] H3. The coroutine park/wake contract. Three real bugs in one week:
+- [x] H3. The coroutine park/wake contract. Three real bugs in one week:
       a cross-thread activation resume dereferencing the parker's dead
       TLS (SEGV), a dispatched task's internal failure never waking the
       parked root (silent hang), and the pool's `first_error` being read
@@ -287,6 +287,22 @@ evidence-backed; none is a hypothetical.
       statements, then add litmus fixtures for the ones with no coverage
       — every terminal state of a dispatched task, not just the
       user-throwable path that `tl_dispatched_failure_*` pins.
+      DONE 2026-08-18 (70887b3b). COROUTINE-MODEL.md now opens with the
+      terminal-state contract as a table of testable statements: each state
+      a dispatched task can reach, its required observable outcome, and the
+      fixture pinning it — so an unpinned state reads as a gap, not a
+      convention. Plus the two invariants learned from the failures (a
+      resume may land on a different thread than the park; an internal
+      error is not a Kotlin throwable, so nothing will ever resume a root
+      waiting on it).
+      Two uncovered states probed, verified correct, then pinned:
+      CancellationException from a dispatched child is NOT a failure (the
+      parent survives — one `throw` from the fixtures pinning the
+      opposite), and a throw AFTER suspension lands on the resuming worker
+      yet must behave identically to the pre-suspension case. Litmus
+      58 -> 60. One probe of mine initially read rc=0 for an uncaught
+      exception; that was my own pipeline taking `tail`'s exit code, not
+      klio's — the behavior was correct throughout.
 - [ ] H4. Dispatch-ladder density. `host_call_member.zig` is 13.6k lines
       after extraction and measures 50-67 lines per `pub` extractable,
       meaning nearly every decl touches shared state. It is both the
