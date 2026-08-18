@@ -65,6 +65,13 @@ fn integerBinaryApplicable(args: []const Value) bool {
 /// (`LocalDate.until(other, unit)`, `LocalDateRange.step(DatePeriod)`).
 /// A call whose single argument is not an integral (or Char) endpoint is
 /// not the builtin's, so the probe must decline and let the extension bind.
+/// A property GETTER binding never serves a call that passes arguments:
+/// `progression.step` reads the stride, `progression.step(n, unit)` is the
+/// library extension of the same name.
+fn zeroArgApplicable(args: []const Value) bool {
+    return args.len == 0;
+}
+
 fn rangeBuilderApplicable(args: []const Value) bool {
     if (args.len != 1) return false;
     if (args[0] == .Char) return true;
@@ -1076,14 +1083,14 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.ranges.IntRange.start", .f = ranges.range_start },
     .{ .fqn = "kotlin.ranges.IntRange.endInclusive", .f = ranges.range_end_inclusive },
     .{ .fqn = "kotlin.ranges.IntRange.endExclusive", .f = ranges.range_end_exclusive },
-    .{ .fqn = "kotlin.ranges.IntRange.step", .f = ranges.range_step_field },
+    .{ .fqn = "kotlin.ranges.IntRange.step", .f = ranges.range_step_field, .applicable = zeroArgApplicable },
     .{ .fqn = "kotlin.ranges.IntRange.toString", .f = ranges.range_to_string },
     .{ .fqn = "kotlin.ranges.IntRange.contains", .f = ranges.range_contains },
     .{ .fqn = "kotlin.ranges.IntRange.isEmpty", .f = ranges.range_is_empty },
     .{ .fqn = "kotlin.ranges.IntProgression.isEmpty", .f = ranges.range_is_empty },
     .{ .fqn = "kotlin.ranges.IntProgression.first", .f = ranges.range_first },
     .{ .fqn = "kotlin.ranges.IntProgression.last", .f = ranges.range_last },
-    .{ .fqn = "kotlin.ranges.IntProgression.step", .f = ranges.range_step_field },
+    .{ .fqn = "kotlin.ranges.IntProgression.step", .f = ranges.range_step_field, .applicable = zeroArgApplicable },
     .{ .fqn = "kotlin.ranges.IntProgression.toString", .f = ranges.range_to_string },
     .{ .fqn = "kotlin.ranges.IntRange.reversed", .f = ranges.range_reversed },
     .{ .fqn = "kotlin.ranges.IntProgression.reversed", .f = ranges.range_reversed },
@@ -1100,14 +1107,14 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.ranges.CharRange.start", .f = ranges.range_start },
     .{ .fqn = "kotlin.ranges.CharRange.endInclusive", .f = ranges.range_end_inclusive },
     .{ .fqn = "kotlin.ranges.CharRange.endExclusive", .f = ranges.range_end_exclusive },
-    .{ .fqn = "kotlin.ranges.CharRange.step", .f = ranges.range_step_field },
+    .{ .fqn = "kotlin.ranges.CharRange.step", .f = ranges.range_step_field, .applicable = zeroArgApplicable },
     .{ .fqn = "kotlin.ranges.CharRange.toString", .f = ranges.range_to_string },
     .{ .fqn = "kotlin.ranges.CharRange.contains", .f = ranges.range_contains },
     .{ .fqn = "kotlin.ranges.CharRange.isEmpty", .f = ranges.range_is_empty },
     .{ .fqn = "kotlin.ranges.CharProgression.isEmpty", .f = ranges.range_is_empty },
     .{ .fqn = "kotlin.ranges.CharProgression.first", .f = ranges.range_first },
     .{ .fqn = "kotlin.ranges.CharProgression.last", .f = ranges.range_last },
-    .{ .fqn = "kotlin.ranges.CharProgression.step", .f = ranges.range_step_field },
+    .{ .fqn = "kotlin.ranges.CharProgression.step", .f = ranges.range_step_field, .applicable = zeroArgApplicable },
     .{ .fqn = "kotlin.ranges.CharProgression.toString", .f = ranges.range_to_string },
     .{ .fqn = "kotlin.ranges.CharRange.reversed", .f = ranges.range_reversed },
     .{ .fqn = "kotlin.ranges.CharProgression.reversed", .f = ranges.range_reversed },
@@ -1123,14 +1130,14 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.ranges.UIntRange.start", .f = ranges.range_start },
     .{ .fqn = "kotlin.ranges.UIntRange.endInclusive", .f = ranges.range_end_inclusive },
     .{ .fqn = "kotlin.ranges.UIntRange.endExclusive", .f = ranges.range_end_exclusive },
-    .{ .fqn = "kotlin.ranges.UIntRange.step", .f = ranges.range_step_field },
+    .{ .fqn = "kotlin.ranges.UIntRange.step", .f = ranges.range_step_field, .applicable = zeroArgApplicable },
     .{ .fqn = "kotlin.ranges.UIntRange.toString", .f = ranges.range_to_string },
     .{ .fqn = "kotlin.ranges.UIntRange.contains", .f = ranges.range_contains },
     .{ .fqn = "kotlin.ranges.UIntRange.isEmpty", .f = ranges.range_is_empty },
     .{ .fqn = "kotlin.ranges.UIntProgression.isEmpty", .f = ranges.range_is_empty },
     .{ .fqn = "kotlin.ranges.UIntProgression.first", .f = ranges.range_first },
     .{ .fqn = "kotlin.ranges.UIntProgression.last", .f = ranges.range_last },
-    .{ .fqn = "kotlin.ranges.UIntProgression.step", .f = ranges.range_step_field },
+    .{ .fqn = "kotlin.ranges.UIntProgression.step", .f = ranges.range_step_field, .applicable = zeroArgApplicable },
     .{ .fqn = "kotlin.ranges.UIntProgression.toString", .f = ranges.range_to_string },
     .{ .fqn = "kotlin.ranges.UIntRange.reversed", .f = ranges.range_reversed },
     .{ .fqn = "kotlin.ranges.UIntProgression.reversed", .f = ranges.range_reversed },
@@ -1145,14 +1152,14 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.ranges.ULongRange.start", .f = ranges.range_start },
     .{ .fqn = "kotlin.ranges.ULongRange.endInclusive", .f = ranges.range_end_inclusive },
     .{ .fqn = "kotlin.ranges.ULongRange.endExclusive", .f = ranges.range_end_exclusive },
-    .{ .fqn = "kotlin.ranges.ULongRange.step", .f = ranges.range_step_field },
+    .{ .fqn = "kotlin.ranges.ULongRange.step", .f = ranges.range_step_field, .applicable = zeroArgApplicable },
     .{ .fqn = "kotlin.ranges.ULongRange.toString", .f = ranges.range_to_string },
     .{ .fqn = "kotlin.ranges.ULongRange.contains", .f = ranges.range_contains },
     .{ .fqn = "kotlin.ranges.ULongRange.isEmpty", .f = ranges.range_is_empty },
     .{ .fqn = "kotlin.ranges.ULongProgression.isEmpty", .f = ranges.range_is_empty },
     .{ .fqn = "kotlin.ranges.ULongProgression.first", .f = ranges.range_first },
     .{ .fqn = "kotlin.ranges.ULongProgression.last", .f = ranges.range_last },
-    .{ .fqn = "kotlin.ranges.ULongProgression.step", .f = ranges.range_step_field },
+    .{ .fqn = "kotlin.ranges.ULongProgression.step", .f = ranges.range_step_field, .applicable = zeroArgApplicable },
     .{ .fqn = "kotlin.ranges.ULongProgression.toString", .f = ranges.range_to_string },
     .{ .fqn = "kotlin.ranges.ULongRange.reversed", .f = ranges.range_reversed },
     .{ .fqn = "kotlin.ranges.ULongProgression.reversed", .f = ranges.range_reversed },
@@ -1168,14 +1175,14 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.ranges.LongRange.start", .f = ranges.range_start },
     .{ .fqn = "kotlin.ranges.LongRange.endInclusive", .f = ranges.range_end_inclusive },
     .{ .fqn = "kotlin.ranges.LongRange.endExclusive", .f = ranges.range_end_exclusive },
-    .{ .fqn = "kotlin.ranges.LongRange.step", .f = ranges.range_step_field },
+    .{ .fqn = "kotlin.ranges.LongRange.step", .f = ranges.range_step_field, .applicable = zeroArgApplicable },
     .{ .fqn = "kotlin.ranges.LongRange.toString", .f = ranges.range_to_string },
     .{ .fqn = "kotlin.ranges.LongRange.contains", .f = ranges.range_contains },
     .{ .fqn = "kotlin.ranges.LongRange.isEmpty", .f = ranges.range_is_empty },
     .{ .fqn = "kotlin.ranges.LongProgression.isEmpty", .f = ranges.range_is_empty },
     .{ .fqn = "kotlin.ranges.LongProgression.first", .f = ranges.range_first },
     .{ .fqn = "kotlin.ranges.LongProgression.last", .f = ranges.range_last },
-    .{ .fqn = "kotlin.ranges.LongProgression.step", .f = ranges.range_step_field },
+    .{ .fqn = "kotlin.ranges.LongProgression.step", .f = ranges.range_step_field, .applicable = zeroArgApplicable },
     .{ .fqn = "kotlin.ranges.LongProgression.toString", .f = ranges.range_to_string },
     .{ .fqn = "kotlin.ranges.LongRange.reversed", .f = ranges.range_reversed },
     .{ .fqn = "kotlin.ranges.LongProgression.reversed", .f = ranges.range_reversed },
