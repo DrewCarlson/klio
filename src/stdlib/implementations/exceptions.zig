@@ -66,6 +66,9 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
                 },
                 else => {
                     if (message) |m| freeMessage(ctx.allocator, m);
+                    if (std.c.getenv("KLIO_ERR_TRACE") != null) {
+                        std.debug.print("[exc-ctor] {s} cause arg is {s}\n", .{ fqn, @tagName(std.meta.activeTag(c.*)) });
+                    }
                     return typeErr("Throwable cause must be a Throwable or null");
                 },
             }

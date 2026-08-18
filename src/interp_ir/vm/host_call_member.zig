@@ -4321,7 +4321,6 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             defer if (runtime.freeScratch()) allocator.free(fqn_probe);
             class_id = mod.classIdByFqn(fqn_probe);
         }
-        if (class_id == null) class_id = mod.classId(name);
         mg.deinit();
         if (class_id) |cid| {
             return newInstanceById(self, allocator, cid, args, null);
@@ -4331,6 +4330,21 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // Companion forwarding + enum values/valueOf for a class receiver.
     if (receiver.* == .Class) {
         if (try classCompanionAndEnum(self, allocator, receiver, name, args)) |r| return r;
+    }
+
+    // Last-resort nested-class construction by SIMPLE name, for a nested
+    // class the nesting tree could not link to its parent (a lifted class
+    // under a legacy simple-name stub). It runs AFTER companion forwarding:
+    // an unrelated global of the same simple name must never outrank the
+    // receiver's own companion member — `ParseResult.Error(pos) { … }` is
+    // the companion's factory, not `kotlin.Error`.
+    if (receiver.* == .Class) {
+        const cid = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().classId(name);
+        };
+        if (cid) |c| return newInstanceById(self, allocator, c, args, null);
     }
 
     // A null value has no useful runtime type, but a statically-directed call
