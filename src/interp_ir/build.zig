@@ -3713,6 +3713,36 @@ fn buildModuleWithOverrides(
             defer seen_sup.deinit();
             for (c.supertypes) |*st| try collectHierarchyCompanionMemberNames(st.name.name, &file_classes, &own_members, &seen_sup);
         }
+        // Which of those names a delegation/default thunk may CALL. Every
+        // function contributes its arity mask; a name that is only ever a
+        // property gets mask 0, so `: this(totalMonths(y, m), d)` next to a
+        // `val totalMonths` keeps binding the top-level `totalMonths(Int, Int)`
+        // instead of routing to a companion member that does not exist.
+        var own_arity = std.StringHashMap(u64).init(a);
+        defer own_arity.deinit();
+        {
+            var prop_names = StringSet.init(a);
+            defer prop_names.deinit();
+            for (c.primary_params) |*p| {
+                if (p.property != null) try prop_names.put(p.name.name, {});
+            }
+            for (c.members) |*m| {
+                switch (m.*) {
+                    .Property => |p| try prop_names.put(p.name.name, {}),
+                    .Function => |*f| try ir.lower.decl.mergeMemberArity(&own_arity, f.name.name, ir.lower.decl.funcArityMask(f)),
+                    .Class => |*inner| if (inner.is_companion) {
+                        for (inner.members) |*cm| {
+                            if (cm.* == .Function) try ir.lower.decl.mergeMemberArity(&own_arity, cm.Function.name.name, ir.lower.decl.funcArityMask(&cm.Function));
+                        }
+                    },
+                    else => {},
+                }
+            }
+            var pit = prop_names.keyIterator();
+            while (pit.next()) |pn| {
+                if (!own_arity.contains(pn.*)) try own_arity.put(pn.*, 0);
+            }
+        }
         var entries = try a.alloc(SecondaryCtorEntry, c.secondary_ctors.len);
         for (c.secondary_ctors, 0..) |*sc, sc_idx| {
             var param_names = try a.alloc([]const u8, sc.params.len);
@@ -3752,6 +3782,7 @@ fn buildModuleWithOverrides(
             for (delegation_args, 0..) |*e, arg_idx| {
                 const nm = try std.fmt.allocPrint(a, "__sec_ctor_{s}_{d}_arg{d}", .{ c.name.name, sc_idx, arg_idx });
                 module.pending_param_types = sc_param_types;
+                module.pending_own_member_arity = &own_arity;
                 arg_fids[arg_idx] = try ir.lower.lowerExprAsParamThunkScoped(module, param_names, e, nm, c.name.name, &own_members);
             }
             var default_arg_thunks = try a.alloc(?FuncId, sc.params.len);
@@ -3759,6 +3790,7 @@ fn buildModuleWithOverrides(
                 if (p.default) |e| {
                     const nm = try std.fmt.allocPrint(a, "__sec_ctor_{s}_{d}_def{d}", .{ c.name.name, sc_idx, p_idx });
                     module.pending_param_types = sc_param_types;
+                    module.pending_own_member_arity = &own_arity;
                     default_arg_thunks[p_idx] = try ir.lower.lowerExprAsParamThunkScoped(module, param_names, e, nm, c.name.name, &own_members);
                 } else {
                     default_arg_thunks[p_idx] = null;
@@ -3770,6 +3802,7 @@ fn buildModuleWithOverrides(
                 defer locals.deinit(a);
                 try locals.append(a, "this");
                 for (param_names) |pn| try locals.append(a, pn);
+                module.pending_own_member_arity = null;
                 const nm = try std.fmt.allocPrint(a, "__sec_ctor_body_{s}_{d}", .{ c.name.name, sc_idx });
                 const body_types = try a.alloc(?ast.TypeRef, locals.items.len);
                 body_types[0] = null;

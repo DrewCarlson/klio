@@ -25,64 +25,67 @@ pub fn isBoxedToAnyForm(e: *const Expr) bool {
 /// Recursively collect every single-segment `Path` identifier that
 /// appears anywhere in an expression. Used to find which names a nested
 /// lambda references.
-pub fn collectPathIdents(e: *const Expr, out: *StringSet) Allocator.Error!void {
+fn collectIdents(e: *const Expr, out: *StringSet, member_out: ?*StringSet) Allocator.Error!void {
     switch (e.*) {
         .Path => |p| {
             if (p.segments.len == 1) try out.put(p.segments[0].name, {});
         },
-        .Member => |m| try collectPathIdents(m.receiver, out),
-        .MemberRef => |m| try collectPathIdents(m.receiver, out),
+        .Member => |m| try collectIdents(m.receiver, out, member_out),
+        .MemberRef => |m| try collectIdents(m.receiver, out, member_out),
         .Call => |c| {
-            try collectPathIdents(c.callee, out);
-            for (c.args) |*a| try collectPathIdents(a, out);
+            if (member_out) |mo| {
+                if (c.callee.* == .Member) try mo.put(c.callee.Member.name.name, {});
+            }
+            try collectIdents(c.callee, out, member_out);
+            for (c.args) |*a| try collectIdents(a, out, member_out);
         },
         .Index => |idx| {
-            try collectPathIdents(idx.receiver, out);
-            for (idx.args) |*a| try collectPathIdents(a, out);
+            try collectIdents(idx.receiver, out, member_out);
+            for (idx.args) |*a| try collectIdents(a, out, member_out);
         },
         .Binary => |bin| {
-            try collectPathIdents(bin.lhs, out);
-            try collectPathIdents(bin.rhs, out);
+            try collectIdents(bin.lhs, out, member_out);
+            try collectIdents(bin.rhs, out, member_out);
         },
-        .Unary => |u| try collectPathIdents(u.expr, out),
-        .Postfix => |u| try collectPathIdents(u.expr, out),
-        .Spread => |u| try collectPathIdents(u.expr, out),
-        .Throw => |u| try collectPathIdents(u.value, out),
-        .Labeled => |u| try collectPathIdents(u.expr, out),
-        .As => |u| try collectPathIdents(u.expr, out),
-        .IsCheck => |u| try collectPathIdents(u.expr, out),
+        .Unary => |u| try collectIdents(u.expr, out, member_out),
+        .Postfix => |u| try collectIdents(u.expr, out, member_out),
+        .Spread => |u| try collectIdents(u.expr, out, member_out),
+        .Throw => |u| try collectIdents(u.value, out, member_out),
+        .Labeled => |u| try collectIdents(u.expr, out, member_out),
+        .As => |u| try collectIdents(u.expr, out, member_out),
+        .IsCheck => |u| try collectIdents(u.expr, out, member_out),
         .If => |f| {
-            try collectPathIdents(f.cond, out);
-            try collectPathIdents(f.then_branch, out);
-            if (f.else_branch) |els| try collectPathIdents(els, out);
+            try collectIdents(f.cond, out, member_out);
+            try collectIdents(f.then_branch, out, member_out);
+            if (f.else_branch) |els| try collectIdents(els, out, member_out);
         },
         .While => |w| {
-            try collectPathIdents(w.cond, out);
-            try collectPathIdents(w.body, out);
+            try collectIdents(w.cond, out, member_out);
+            try collectIdents(w.body, out, member_out);
         },
         .DoWhile => |w| {
-            if (w.body) |b| try collectPathIdents(b, out);
-            try collectPathIdents(w.cond, out);
+            if (w.body) |b| try collectIdents(b, out, member_out);
+            try collectIdents(w.cond, out, member_out);
         },
         .For => |f| {
-            try collectPathIdents(f.iter, out);
-            try collectPathIdents(f.body, out);
+            try collectIdents(f.iter, out, member_out);
+            try collectIdents(f.body, out, member_out);
         },
         .Return => |r| {
-            if (r.value) |v| try collectPathIdents(v, out);
+            if (r.value) |v| try collectIdents(v, out, member_out);
         },
         .Block => |b| {
-            for (b.stmts) |*s| try collectPathIdentsStmt(s, out);
+            for (b.stmts) |*s| try collectIdentsStmt(s, out, member_out);
         },
         .Lambda => |l| {
-            for (l.body.stmts) |*s| try collectPathIdentsStmt(s, out);
+            for (l.body.stmts) |*s| try collectIdentsStmt(s, out, member_out);
         },
         .AnonFun => |af| {
             if (af.body) |fb| switch (fb.*) {
                 .Block => |b| {
-                    for (b.stmts) |*s| try collectPathIdentsStmt(s, out);
+                    for (b.stmts) |*s| try collectIdentsStmt(s, out, member_out);
                 },
-                .Expr => |*ex| try collectPathIdents(ex, out),
+                .Expr => |*ex| try collectIdents(ex, out, member_out),
             };
         },
         // An anonymous object's member bodies reference captured outer
@@ -96,39 +99,39 @@ pub fn collectPathIdents(e: *const Expr, out: *StringSet) Allocator.Error!void {
                 .Function => |*f| {
                     if (f.body) |fb| switch (fb) {
                         .Block => |blk| {
-                            for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+                            for (blk.stmts) |*st| try collectIdentsStmt(st, out, member_out);
                         },
-                        .Expr => |ex| try collectPathIdents(&ex, out),
+                        .Expr => |ex| try collectIdents(&ex, out, member_out),
                     };
                 },
                 .Property => |p| {
-                    if (p.init) |*pi| try collectPathIdents(pi, out);
+                    if (p.init) |*pi| try collectIdents(pi, out, member_out);
                 },
                 else => {},
             };
             for (o.init_blocks) |*blk| {
-                for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+                for (blk.stmts) |*st| try collectIdentsStmt(st, out, member_out);
             }
             for (o.supertype_args) |sa| if (sa) |sargs| {
-                for (sargs) |*sarg| try collectPathIdents(sarg, out);
+                for (sargs) |*sarg| try collectIdents(sarg, out, member_out);
             };
         },
         .When => |w| {
-            if (w.subject) |s| try collectPathIdents(s, out);
-            for (w.branches) |*br| try collectPathIdents(&br.body, out);
+            if (w.subject) |s| try collectIdents(s, out, member_out);
+            for (w.branches) |*br| try collectIdents(&br.body, out, member_out);
         },
         .Try => |t| {
-            for (t.body.stmts) |*s| try collectPathIdentsStmt(s, out);
+            for (t.body.stmts) |*s| try collectIdentsStmt(s, out, member_out);
             for (t.catches) |*c| {
-                for (c.body.stmts) |*s| try collectPathIdentsStmt(s, out);
+                for (c.body.stmts) |*s| try collectIdentsStmt(s, out, member_out);
             }
             if (t.finally) |fb| {
-                for (fb.stmts) |*s| try collectPathIdentsStmt(s, out);
+                for (fb.stmts) |*s| try collectIdentsStmt(s, out, member_out);
             }
         },
         .StringTemplate => |st| {
             for (st.parts) |*p| switch (p.*) {
-                .Interp => |ex| try collectPathIdents(ex, out),
+                .Interp => |ex| try collectIdents(ex, out, member_out),
                 .ShortInterp => |id| try out.put(id.name, {}),
                 .Text => {},
             };
@@ -137,20 +140,20 @@ pub fn collectPathIdents(e: *const Expr, out: *StringSet) Allocator.Error!void {
     }
 }
 
-pub fn collectPathIdentsStmt(s: *const Stmt, out: *StringSet) Allocator.Error!void {
+fn collectIdentsStmt(s: *const Stmt, out: *StringSet, member_out: ?*StringSet) Allocator.Error!void {
     switch (s.*) {
-        .Expr => |*e| try collectPathIdents(e, out),
+        .Expr => |*e| try collectIdents(e, out, member_out),
         .Assign => |a| {
-            try collectPathIdents(&a.target, out);
-            try collectPathIdents(&a.value, out);
+            try collectIdents(&a.target, out, member_out);
+            try collectIdents(&a.value, out, member_out);
         },
-        .DestructuringDecl => |d| try collectPathIdents(&d.init, out),
+        .DestructuringDecl => |d| try collectIdents(&d.init, out, member_out),
         .Decl => |d| switch (d) {
             .Property => |p| {
-                if (p.init) |*e| try collectPathIdents(e, out);
+                if (p.init) |*e| try collectIdents(e, out, member_out);
                 // A `by`-delegate lambda references (and may mutate) an outer
                 // capture just as an initializer does.
-                if (p.delegate) |e| try collectPathIdents(e, out);
+                if (p.delegate) |e| try collectIdents(e, out, member_out);
             },
             // A nested local `fun` (declared inside a lambda) references —
             // and may mutate — a captured outer `var` in its body; without
@@ -161,9 +164,9 @@ pub fn collectPathIdentsStmt(s: *const Stmt, out: *StringSet) Allocator.Error!vo
             .Function => |f| {
                 if (f.body) |fb| switch (fb) {
                     .Block => |blk| {
-                        for (blk.stmts) |*ss| try collectPathIdentsStmt(ss, out);
+                        for (blk.stmts) |*ss| try collectIdentsStmt(ss, out, member_out);
                     },
-                    .Expr => |*ex| try collectPathIdents(ex, out),
+                    .Expr => |*ex| try collectIdents(ex, out, member_out),
                 };
             },
             // A nested local class's member / init-block bodies reference
@@ -173,18 +176,18 @@ pub fn collectPathIdentsStmt(s: *const Stmt, out: *StringSet) Allocator.Error!vo
                     .Function => |*f| {
                         if (f.body) |fb| switch (fb) {
                             .Block => |blk| {
-                                for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+                                for (blk.stmts) |*st| try collectIdentsStmt(st, out, member_out);
                             },
-                            .Expr => |ex| try collectPathIdents(&ex, out),
+                            .Expr => |ex| try collectIdents(&ex, out, member_out),
                         };
                     },
                     .Property => |p| {
-                        if (p.init) |*pi| try collectPathIdents(pi, out);
+                        if (p.init) |*pi| try collectIdents(pi, out, member_out);
                     },
                     else => {},
                 };
                 for (c.init_blocks) |*blk| {
-                    for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+                    for (blk.stmts) |*st| try collectIdentsStmt(st, out, member_out);
                 }
             },
             else => {},
@@ -247,6 +250,30 @@ pub fn namesReferencedInLambdas(stmts: []const Stmt, out: *StringSet) Allocator.
         }
     }
 }
+
+/// Recursively collect every single-segment `Path` identifier that
+/// appears anywhere in an expression. Used to find which names a nested
+/// lambda references.
+pub fn collectPathIdents(e: *const Expr, out: *StringSet) Allocator.Error!void {
+    return collectIdents(e, out, null);
+}
+
+pub fn collectPathIdentsStmt(s: *const Stmt, out: *StringSet) Allocator.Error!void {
+    return collectIdentsStmt(s, out, null);
+}
+
+/// As [`collectPathIdentsStmt`], additionally recording the NAME of every
+/// member call (`x.f(...)`) into `member_out`. A local extension function
+/// refers to itself in member-call position (`(this - 1).fact()`), which
+/// the plain-identifier scan never sees.
+pub fn collectIdentsAndCallNamesStmt(
+    s: *const Stmt,
+    out: *StringSet,
+    member_out: *StringSet,
+) Allocator.Error!void {
+    return collectIdentsStmt(s, out, member_out);
+}
+
 
 fn scanLambdaRefsExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
     switch (e.*) {

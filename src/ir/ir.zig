@@ -1847,6 +1847,13 @@ pub const Module = struct {
     /// NAMES only, so `seed1.inv()` inside `: this(..., seed1.inv(), ...)`
     /// had no receiver type at all. Not serialized.
     pending_param_types: ?[]const ?ast.TypeRef = null,
+    /// Lowering-only scratch: the callable arity mask of the owner class's
+    /// members, for a synthesized parameter thunk that also gets an
+    /// `own_members` set. A member name that is a PROPERTY and never a
+    /// function carries mask 0, so a bare CALL of that name in a
+    /// constructor-delegation argument is not mistaken for a companion
+    /// call on the owner class. Not serialized.
+    pending_own_member_arity: ?*const std.StringHashMap(u64) = null,
     /// Lowering-only scratch: the implicit label of the argument lambda whose
     /// body is about to lower (`runTest { … }` → "runTest"). The body binds
     /// `this@<label>` to its receiver so a reference from a nested scope — an

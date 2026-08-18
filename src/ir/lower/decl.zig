@@ -706,7 +706,7 @@ fn collectMembers(
 /// exactly `i` user arguments; bit 63 marks a vararg overload (accepts any
 /// count). Mirrors `collectMembers`' walk so member-vs-global resolution can
 /// be arity-aware.
-fn funcArityMask(f: *const ast.Function) u64 {
+pub fn funcArityMask(f: *const ast.Function) u64 {
     var required: usize = 0;
     var any_vararg = false;
     for (f.params) |*p| {
@@ -722,7 +722,7 @@ fn funcArityMask(f: *const ast.Function) u64 {
     return mask;
 }
 
-fn mergeMemberArity(out: *std.StringHashMap(u64), name: []const u8, mask: u64) Allocator.Error!void {
+pub fn mergeMemberArity(out: *std.StringHashMap(u64), name: []const u8, mask: u64) Allocator.Error!void {
     const gop = try out.getOrPut(name);
     if (gop.found_existing) gop.value_ptr.* |= mask else gop.value_ptr.* = mask;
 }

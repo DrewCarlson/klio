@@ -96,6 +96,19 @@ fn consumePendingParamTypes(b: *FuncBuilder, params: []const []const u8) Allocat
     }
 }
 
+/// Install the owner class's member arity mask when the declaration lowering
+/// stashed one. A no-op otherwise, so a thunk whose caller records no arities
+/// keeps the permissive default (`ownMemberApplicable` says yes for an
+/// unrecorded name).
+fn consumePendingOwnMemberArity(b: *FuncBuilder) Allocator.Error!void {
+    const src = b.module.pending_own_member_arity orelse return;
+    b.module.pending_own_member_arity = null;
+    var copy = std.StringHashMap(u64).init(b.allocator);
+    var it = src.iterator();
+    while (it.next()) |e| try copy.put(e.key_ptr.*, e.value_ptr.*);
+    b.setOwnMemberArity(copy);
+}
+
 fn consumePendingCtx(b: *FuncBuilder) Allocator.Error!void {
     if (b.module.pending_ctx) |pc| {
         b.module.pending_ctx = null;
@@ -220,6 +233,7 @@ pub fn lowerExprAsParamThunkScopedEnclosing(
     if (own_members) |set| {
         b.setOwnMembers(try cloneOwnMembers(allocator, set));
     }
+    try consumePendingOwnMemberArity(&b);
     if (enclosing_members) |em| b.setEnclosingMembers(try cloneOwnMembers(allocator, em));
     const v = try lowerExpr(&b, expr);
     b.terminate(.{ .Return = v });

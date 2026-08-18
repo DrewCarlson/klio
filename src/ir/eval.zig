@@ -7142,7 +7142,16 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         .Call => |*call| return execArmCall(H, allocator, frame, call, host, true),
         .CallValue => |cv| return execArmCallValue(H, allocator, frame, cv, host),
         .CallValueWithThis => |cvt| {
-            const callee_v = frame.read(cvt.callee);
+            var callee_v = frame.read(cvt.callee);
+            // A boxed capture holds the callable in a cell — a recursive local
+            // extension function reaches its own closure through the shared
+            // self-cell. A Cell is never callable itself, so classify its
+            // CONTENT, exactly as the value-or-member arm does.
+            if (callee_v == .Cell) {
+                const cg = callee_v.Cell.borrow();
+                callee_v = cg.get().*;
+                cg.deinit();
+            }
             const recv = frame.read(cvt.receiver);
             const arg_values = try readArgRun(allocator, frame, cvt.args, cvt.n_args);
             defer allocator.free(arg_values);

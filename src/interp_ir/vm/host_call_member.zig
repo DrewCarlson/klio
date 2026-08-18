@@ -1209,6 +1209,11 @@ fn receiverViolatesTypeParamBound(self: *VmHost, fid: FuncId, param_ty: *const T
         if (std.mem.indexOfScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
         bn = std.mem.trimEnd(u8, std.mem.trim(u8, bn, " "), "?");
         if (std.mem.eql(u8, bn, "Any")) continue;
+        // A bound that is itself one of the function's type parameters
+        // (`fun <C, R> C.ifEmpty(...): R where C : Collection<*>, C : R`)
+        // names no class: it constrains the inferred `R`, not the receiver,
+        // and cannot be decided against a runtime value.
+        if (typeParamOf(self, fid, bn)) continue;
         // Decide the bound for any receiver whose full type is known: an
         // Instance carries its class chain, and a concrete builtin's
         // `isRuntimeType` supertype set is authoritative (a `String` receiver
@@ -4316,7 +4321,6 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             defer if (runtime.freeScratch()) allocator.free(fqn_probe);
             class_id = mod.classIdByFqn(fqn_probe);
         }
-        if (class_id == null) class_id = mod.classId(name);
         mg.deinit();
         if (class_id) |cid| {
             return newInstanceById(self, allocator, cid, args, null);
@@ -4326,6 +4330,21 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // Companion forwarding + enum values/valueOf for a class receiver.
     if (receiver.* == .Class) {
         if (try classCompanionAndEnum(self, allocator, receiver, name, args)) |r| return r;
+    }
+
+    // Last-resort nested-class construction by SIMPLE name, for a nested
+    // class the nesting tree could not link to its parent (a lifted class
+    // under a legacy simple-name stub). It runs AFTER companion forwarding:
+    // an unrelated global of the same simple name must never outrank the
+    // receiver's own companion member — `ParseResult.Error(pos) { … }` is
+    // the companion's factory, not `kotlin.Error`.
+    if (receiver.* == .Class) {
+        const cid = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().classId(name);
+        };
+        if (cid) |c| return newInstanceById(self, allocator, c, args, null);
     }
 
     // A null value has no useful runtime type, but a statically-directed call

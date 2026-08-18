@@ -20,6 +20,7 @@ test "kotlinx.datetime commonTest pass count holds at or above the ratchet basel
         // count; the ceilings bound the red mass so a fixed case
         // traded for a broken one cannot pass unnoticed. Lower the
         // ceilings as fixes land, never raise them.
+        .whole_source_set = true,
         .baseline = 210,
         .max_failed = 300,
         .max_incomplete = 5,

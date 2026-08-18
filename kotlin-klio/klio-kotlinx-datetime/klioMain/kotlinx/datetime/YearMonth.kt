@@ -7,6 +7,7 @@
 package kotlinx.datetime
 
 import kotlinx.datetime.internal.isLeapYear
+import kotlinx.datetime.format.*
 
 class YearMonth(val year: Int, val monthNumber: Int) : Comparable<YearMonth> {
     constructor(year: Int, month: Month) : this(year, month.number)
@@ -75,8 +76,22 @@ class YearMonth(val year: Int, val monthNumber: Int) : Comparable<YearMonth> {
                 throw DateTimeFormatException("Invalid ISO-8601 year-month: $input")
             return YearMonth(year, month)
         }
+
+        fun parse(input: CharSequence, format: DateTimeFormat<YearMonth>): YearMonth = format.parse(input)
+
+        fun Format(block: DateTimeFormatBuilder.WithYearMonth.() -> Unit): DateTimeFormat<YearMonth> =
+            YearMonthFormat.build(block)
+    }
+
+    object Formats {
+        val ISO: DateTimeFormat<YearMonth> get() = ISO_YEAR_MONTH
     }
 }
+
+fun YearMonth.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<YearMonth>): YearMonth? =
+    format.parseOrNull(input)
+
+fun YearMonth.format(format: DateTimeFormat<YearMonth>): String = format.format(this)
 
 // Proleptic-month index -> YearMonth, with a floor division so a negative index
 // maps to the correct (year, month).
