@@ -1438,3 +1438,57 @@ generation, boundary trims, and grouping the corpus by dependency-base
 key; e2e and differential now run under the 6.5GB cap, differential green
 for the first time on record. A7: ReleaseFast is at parity with
 ReleaseSafe now that the no-fill lever removed the poison-memset gap.
+
+
+## conformance-and-hardening (closed 2026-08-18)
+
+Every item landed; `scripts/gate.sh` GREEN at close. The campaign asked
+what the censuses do NOT name, and the answer was that they were not
+measuring their libraries at all.
+
+Conformance. Three suites had been sitting behind pass-count floors that
+hid most of their surface:
+
+  coroutines    350 -> 1073 passed (896 -> 137 failed), floor 340 -> 1040
+  serialization   9 ->   60 passed (129 ->  78 failed), floor   9 ->   60
+  datetime      212 ->  457 passed (291 ->  62 failed), floor 205 ->  450
+
+coroutines was 84% ONE missing test-support surface (`TestBase` from
+`kotlinx.coroutines.testing`, a pack `[[test]]` root the census never
+passed to the child). serialization was a missing `expect val
+currentPlatform` actual plus a deliberately narrow 17-file include list.
+datetime was a genuine MIX — eleven roots, nine of them in the
+interpreter. Across the three, ~25 shared-path interpreter fixes landed
+(parser, lowering, reified inference, member and receiver dispatch, the
+integral range builders) with the rig unchanged at ~3340 ms/rep and both
+heavy ratchets holding exactly, which is the evidence they were
+root-cause fixes rather than special cases.
+
+Every census now carries `max_failed`/`max_incomplete` ceilings beside
+its floor, seeded from solo measurements and verified by negative
+control — a floor alone cannot see a fixed case traded for a broken one.
+
+Corpus: 18 `.out` files sat in `examples/` while e2e reads only
+`tests/corpus/expected/`, so those guards had never been enforced (all 18
+matched — nothing had regressed behind the gap). Pins 292 -> 320, plus a
+new `tests/corpus/expected-cli/` for the 16 programs the in-process
+runner cannot execute at all.
+
+Hardening produced three documents rather than three refactors, because
+the audits found the invariants already held and the value was writing
+them down: `docs/development/process-globals.md` (53 globals classified,
+the four defenses named, no undefended per-program state remaining),
+`docs/development/resolution-paths.md` (the eager map is built ONLY under
+src/cli, so users and most of the test apparatus run different resolution
+configurations — measured: 4 disagreements in 60 examples, all
+"lazy declined, eager supplied", zero contradictions), and the
+dispatched-task terminal-state contract in COROUTINE-MODEL.md (litmus
+58 -> 60). H4 and H5 closed BY MEASUREMENT against their own premises:
+the dispatch ladder is 0.10% of dispatches, and a per-program heap is not
+justified at e2e 4G / differential 6G against the 6.5G cap — with
+differential's ~8% margin recorded as the trip-wire.
+
+`scripts/coroutines-census.py` and `scripts/stdlib-surface-inventory.py`
+are the reusable instruments: per-failure error-shape histograms, and the
+upstream-vs-klio surface diff with a `--probe` mode that confirms
+suspects instead of trusting a static diff.
