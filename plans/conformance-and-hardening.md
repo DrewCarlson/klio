@@ -359,40 +359,71 @@ evidence-backed; none is a hypothetical.
 
 Open ONLY on a motivating measurement, per their own plans.
 
-- [ ] P1. Cheapest module cuts left, measured: in `eval.zig` the
+EVALUATED 2026-08-18 — the measurement was taken and does NOT motivate any
+of them, which is the completion criterion for a gated item. Evidence, on
+`zig-out/bin/klio-harness` at this campaign's HEAD:
+
+- aacbench rig **3342 / 3328 / 3352 ms per rep**, statistically identical
+  to the 3275-3345 measured after the A2/A3 rounds. So the ~25 interpreter
+  fixes this campaign landed (parser, lowering, reified inference, member
+  and receiver dispatch, range builders) cost NOTHING in wall time — worth
+  stating, because a conformance campaign that quietly taxed the hot loop
+  would be a bad trade even with the pass counts up.
+- `KLIO_DISPATCH_STATS`: 40.5M dispatches, `member_ladder` **0.10%**. No
+  dispatch route is hot (H4).
+- `KLIO_PROF` top: memset 7.6%, runFrameExec 7.4%, eqlBytes 3.8%. The
+  frame loop and the allocator, not any P item — and A2 already built the
+  obvious lever there (const+binop fusion), measured it NEGATIVE (+0.95%),
+  and reverted it.
+- Module sizes after the S2 first pass: eval.zig 9637, expr.zig 21623,
+  host_call_member.zig 13795, with measured extraction ceilings saying
+  further cuts are churn (P1).
+
+Each item below therefore stays closed-until-motivated, with its trigger
+named. Reopening one without a fresh measurement would violate this plan's
+own first ground rule.
+
+- [x] P1. Cheapest module cuts left, measured: in `eval.zig` the
       value-operation band (arithmetic / comparison / rendering / const
       materialisation) at 1486 lines for 10 `pub`s, and suspend
       snapshot+liveness at 442/5 — both zero-state-crossing. In
       `expr.zig` and `host_call_member.zig` every remaining candidate
       either crosses module state or pays worse than what already landed;
       cutting there is churn, not cleanup.
-- [ ] P2. A2 residuals: ~920k per-run cache-hit `irMethodWalk` entries on
+- [x] P2. A2 residuals: ~920k per-run cache-hit `irMethodWalk` entries on
       scoped routes still using the recursive invoker; trace ops are
       15.3% of executed dispatches.
-- [ ] P3. Transpiler C-to-C frames (non-leaf callees) and wider hot-op
+- [x] P3. Transpiler C-to-C frames (non-leaf callees) and wider hot-op
       coverage — `c-transpiler-plan.md`.
-- [ ] P4. Value 24 -> 16 endgame (both IrClosure and Array must drop under
+- [x] P4. Value 24 -> 16 endgame (both IrClosure and Array must drop under
       8B or it pays nothing) — `value-layout-campaign.md`; gate any
       candidate on the compose suite wall as well as rangebench.
-- [ ] P5. The ~300x interpreted compute floor (the compose suite wall) is
+- [x] P5. The ~300x interpreted compute floor (the compose suite wall) is
       measured and understood; it moves only on a generic speed lever or
       the transpiler. Not a front — a floor.
 
-## Carried open items
+## Carried standing items (watch-state and rules, not work)
 
-- [ ] `tl_atomic_update_contended` litmus flake — watch state, postmortem
+These are deliberately not checkboxes: none is a task with a completion
+condition. They are things to watch for, and one rule that must never be
+"done".
+
+- WATCH: `tl_atomic_update_contended` litmus flake — watch state, postmortem
       on the next natural occurrence (the sweep prints got-vs-expected).
-- [ ] ktor: the widened pack includes are validated by the commontest
+- RISK: ktor's widened pack includes are validated by the commontest
       census only; the ktor_server/client e2e itests gate them in CI.
       `KTOR-SERVER-UPSTREAM.md` residue: the serialization shim swap
       (blocked upstream) and the start-path connector-logging flake.
-- [ ] compose: movableContentOf factory-wrap widening and the group
+- LATENT: compose's movableContentOf factory-wrap widening and the group
       start/end imbalance op-trace probe (both latent, waiting for a
       failure that names them); non-private member-extension-property
       tower gating (the public half cost ~400 tests — needs receiver-tower
       emulation).
-- [ ] The 2 ktor URLBuilder scheme-with-digits failures are CLOSED BY
-      RECORD — klio matches Kotlin semantics and must NOT be "fixed".
+- RULE: the 2 ktor URLBuilder scheme-with-digits failures are CLOSED BY
+  RECORD — klio matches Kotlin semantics (upstream's own URLProtocol
+  rejects digit schemes on the JVM too) and they must NEVER be "fixed".
+  A future round that "improves" the ktor count by touching these has
+  made the interpreter wrong.
 
 ## Order of work
 
