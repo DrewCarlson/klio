@@ -15,8 +15,23 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
             .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
             .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
         },
-        // 237 pass when the suite runs alone (was 118 before `yield` reached its
-        // dispatcher); the ratchet leaves headroom for the loaded `test-all`.
-        .baseline = 340,
+        // Upstream's commonTest files all extend `TestBase` from
+        // `kotlinx.coroutines.testing` and route every case through its
+        // `runTest`/`expect`/`finish` helpers. Those live in the pack's
+        // `[[test]]` roots, which the child never sees — so without them
+        // 84% of the suite failed on the support surface rather than on
+        // coroutine behavior (350 passed / 897 failed; the payloads were
+        // `runTest`, `TestException`, `hang`, `finish`, `expectUnreached`
+        // and calls landing on `kotlin.Nothing`). Feeding them in as
+        // support takes the same census to 1073 passed / 141 failed.
+        .extra_support = &.{
+            "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/TestBase.common.kt",
+            "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/LaunchFlow.kt",
+            "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/MainDispatcherTestBase.kt",
+            "kotlin-klio/klio-kotlinx-coroutines/klioTestUtils/kotlinx/coroutines/testing/TestBase.kt",
+        },
+        // Census floor: 1073 solo with the support surface wired. The
+        // ratchet leaves headroom for the loaded `test-all`.
+        .baseline = 1040,
     });
 }
