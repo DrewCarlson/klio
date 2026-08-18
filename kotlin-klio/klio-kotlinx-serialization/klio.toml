@@ -37,7 +37,16 @@ include = [
     "kotlinx/serialization/encoding/ChunkedDecoder.kt",
     "kotlinx/serialization/encoding/Decoding.kt",
     "kotlinx/serialization/encoding/Encoding.kt",
+    "kotlinx/serialization/internal/CachedNames.kt",
+    "kotlinx/serialization/internal/CollectionDescriptors.kt",
+    "kotlinx/serialization/internal/ElementMarker.kt",
+    "kotlinx/serialization/internal/NullableSerializer.kt",
+    "kotlinx/serialization/internal/Platform.common.kt",
     "kotlinx/serialization/internal/SerializationConstructorMarker.kt",
+    "kotlinx/serialization/modules/PolymorphicModuleBuilder.kt",
+    "kotlinx/serialization/modules/SerializersModule.kt",
+    "kotlinx/serialization/modules/SerializersModuleBuilders.kt",
+    "kotlinx/serialization/modules/SerializersModuleCollector.kt",
 ]
 
 # klio-supplied layer: marker annotations / runtime helpers that the
