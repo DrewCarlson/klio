@@ -38,6 +38,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) std.mem.Allocator.Error!HostBi
     try b.register("kotlinx.datetime.__kxdt_instantToString", instantToString);
     try b.register("kotlinx.datetime.__kxdt_parseInstant", parseInstant);
     try b.register("kotlinx.datetime.__kxdt_validateTimeZone", validateTimeZone);
+    try b.register("kotlinx.datetime.__kxdt_availableZoneIds", availableZoneIds);
     try b.register("kotlinx.datetime.__kxdt_addPeriod", addPeriod);
     return b;
 }
@@ -516,6 +517,84 @@ fn validateTimeZone(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .Bool = valid });
 }
 
+/// Every IANA zone id the host's tz database offers, as a `List<String>`.
+/// Walks `/usr/share/zoneinfo` and keeps the entries whose file is TZif.
+/// The `posix/` and `right/` mirrors and the non-zone metadata files are
+/// skipped, matching what `TimeZone.availableZoneIds` reports elsewhere.
+fn availableZoneIds(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const allocator = ctx.allocator;
+    var out: std.ArrayList(Value) = .empty;
+    defer out.deinit(allocator);
+    try out.append(allocator, .{ .String = try runtime.strInit(allocator, "UTC") });
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var root = std.Io.Dir.cwd().openDir(io, "/usr/share/zoneinfo", .{ .iterate = true }) catch {
+        return ok(try zoneIdList(allocator, out));
+    };
+    defer root.close(io);
+
+    const Walk = struct {
+        fn skipTop(name: []const u8) bool {
+            const skip = [_][]const u8{ "posix", "right", "posixrules", "localtime", "Factory" };
+            for (skip) |s| {
+                if (std.mem.eql(u8, name, s)) return true;
+            }
+            // Data files, not zones: they carry no directory separator and
+            // start lowercase or contain a dot.
+            return std.mem.indexOfScalar(u8, name, '.') != null;
+        }
+        fn walk(
+            a: std.mem.Allocator,
+            w_io: std.Io,
+            dir: *std.Io.Dir,
+            prefix: []const u8,
+            depth: u8,
+            list: *std.ArrayList(Value),
+        ) std.mem.Allocator.Error!void {
+            if (depth > 3) return;
+            var it = dir.iterate();
+            while (it.next(w_io) catch null) |entry| {
+                if (prefix.len == 0 and skipTop(entry.name)) continue;
+                const id = if (prefix.len == 0)
+                    try a.dupe(u8, entry.name)
+                else
+                    try std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, entry.name });
+                defer a.free(id);
+                if (entry.kind == .directory) {
+                    var sub = dir.openDir(w_io, entry.name, .{ .iterate = true }) catch continue;
+                    defer sub.close(w_io);
+                    try walk(a, w_io, &sub, id, depth + 1, list);
+                    continue;
+                }
+                var head: [4]u8 = undefined;
+                const f = dir.openFile(w_io, entry.name, .{}) catch continue;
+                defer f.close(w_io);
+                var rbuf: [64]u8 = undefined;
+                var reader = f.reader(w_io, &rbuf);
+                reader.interface.readSliceAll(head[0..]) catch continue;
+                if (!std.mem.eql(u8, &head, "TZif")) continue;
+                try list.append(a, .{ .String = try runtime.strInit(a, id) });
+            }
+        }
+    };
+    Walk.walk(allocator, io, &root, "", 0, &out) catch {};
+    return ok(try zoneIdList(allocator, out));
+}
+
+fn zoneIdList(allocator: std.mem.Allocator, items: std.ArrayList(Value)) std.mem.Allocator.Error!Value {
+    var list: std.ArrayList(Value) = .empty;
+    try list.appendSlice(allocator, items.items);
+    if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
+    return try Value.newList(allocator, .{
+        .items = try ValueList.init(allocator, list),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    });
+}
+
 fn zoneExists(allocator: std.mem.Allocator, id: []const u8) bool {
     const data = readZoneInfo(allocator, id) catch return false;
     defer allocator.free(data);
@@ -983,7 +1062,8 @@ test "hostBindings registers every native symbol" {
     try testing.expect(b.resolve("kotlinx.datetime.__kxdt_currentTimeMillis") != null);
     try testing.expect(b.resolve("kotlinx.datetime.__kxdt_localToInstant") != null);
     try testing.expect(b.resolve("kotlinx.datetime.__kxdt_addPeriod") != null);
-    try testing.expectEqual(@as(usize, 9), b.len());
+    try testing.expect(b.resolve("kotlinx.datetime.__kxdt_availableZoneIds") != null);
+    try testing.expectEqual(@as(usize, 10), b.len());
 }
 
 test "currentTimeMillis returns a positive Long" {

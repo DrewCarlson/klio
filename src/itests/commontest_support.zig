@@ -39,6 +39,14 @@ pub const Config = struct {
     /// from the measured solo census and lower it as fixes land, never
     /// raise it. Null leaves the suite floor-only (state why).
     max_failed: ?usize = null,
+    /// Compile the WHOLE test source set into every child and run only the
+    /// target file's `@Test` methods (`--only-file`). Upstream commonTest is
+    /// one compilation unit, so a helper declared top-level in one
+    /// `@Test`-bearing file is visible from another (`checkComponents` in
+    /// kotlinx-datetime's LocalDateTimeTest.kt, used by InstantTest.kt); the
+    /// default one-target-per-child model cannot see it. Costs compile time
+    /// per child, so it is opted into per suite.
+    whole_source_set: bool = false,
     /// Ceiling on cases that never reported (timeout / crash). These are
     /// invisible to both the floor and `max_failed`, so they get their own
     /// bound: a suite whose children start hanging is regressing even when
@@ -188,8 +196,15 @@ pub fn runSuite(cfg: Config) !void {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, klioBin(&env));
         try argv.append(a, "test");
-        try argv.appendSlice(a, support.items);
-        try argv.append(a, target);
+        if (cfg.whole_source_set) {
+            try argv.append(a, "--only-file");
+            try argv.append(a, target);
+            try argv.appendSlice(a, support.items);
+            try argv.appendSlice(a, targets.items);
+        } else {
+            try argv.appendSlice(a, support.items);
+            try argv.append(a, target);
+        }
         try jobs.append(a, try argv.toOwnedSlice(a));
     }
 

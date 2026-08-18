@@ -69,6 +69,8 @@ include = [
     "DeprecatedInstant.kt",
     "DeprecatedClock.kt",
     "DateTimePeriod.kt",
+    "Instant.kt",
+    "Clock.kt",
     "DateTimeUnit.kt",
     "internal/math.kt",
     "internal/dateCalculations.kt",

@@ -53,6 +53,9 @@ internal fun __kxdt_localToInstant(
     tz: String,
 ): LongArray = throw NotImplementedError("__kxdt_localToInstant: host binding not installed")
 
+internal fun __kxdt_availableZoneIds(): List<String> =
+    throw NotImplementedError("__kxdt_availableZoneIds: host binding not installed")
+
 internal fun __kxdt_validateTimeZone(id: String): Boolean =
     throw NotImplementedError("__kxdt_validateTimeZone: host binding not installed")
 
@@ -478,7 +481,7 @@ fun LocalDateTime.Companion.parseOrNull(input: CharSequence, format: DateTimeFor
 // `offsetSeconds` is non-null for a FIXED-OFFSET zone (`+03:00`, `UTC+3`, `Z`),
 // whose instant<->local conversion is pure arithmetic and needs no IANA host
 // binding; null for a named region zone (chrono-host-backed).
-class TimeZone internal constructor(val id: String, internal val offsetSeconds: Int? = null) {
+open class TimeZone internal constructor(val id: String, internal val offsetSeconds: Int? = null) {
     override fun toString(): String = id
     override fun equals(other: Any?): Boolean = (other is TimeZone) && other.id == id
     override fun hashCode(): Int = id.hashCode()
@@ -488,18 +491,56 @@ class TimeZone internal constructor(val id: String, internal val offsetSeconds: 
     fun LocalDateTime.toInstant(): Instant = this.toInstant(this@TimeZone)
 
     companion object {
-        val UTC: TimeZone = TimeZone("UTC")
+        val UTC: FixedOffsetTimeZone = FixedOffsetTimeZone(UtcOffset.ZERO, "UTC")
         fun currentSystemDefault(): TimeZone = TimeZone(__kxdt_currentSystemTimeZoneId())
         fun of(zoneId: String): TimeZone {
             parseFixedOffsetSeconds(zoneId)?.let { off ->
-                return TimeZone(if (off == 0) "Z" else UtcOffset(off).toString(), off)
+                if (zoneId == "UTC" || zoneId == "GMT" || zoneId == "UT") return FixedOffsetTimeZone(UtcOffset(off), zoneId)
+                return FixedOffsetTimeZone(UtcOffset(off))
             }
             if (!__kxdt_validateTimeZone(zoneId)) {
                 throw IllegalTimeZoneException("Unknown time-zone id: $zoneId")
             }
             return TimeZone(zoneId)
         }
+
+        val availableZoneIds: Set<String> get() = __kxdt_availableZoneIds().toSet()
     }
+}
+
+/// A zone whose offset from UTC is constant. `id` is the offset's ISO
+/// rendering (`Z`, `+03:00`) unless the zone was named (`UTC`, `GMT`).
+class FixedOffsetTimeZone internal constructor(val offset: UtcOffset, id: String) :
+    TimeZone(id, offset.totalSeconds) {
+    constructor(offset: UtcOffset) : this(offset, offset.toString())
+
+    val totalSeconds: Int get() = offset.totalSeconds
+}
+
+/** The offset from UTC this zone applies at [instant]. */
+fun TimeZone.offsetAt(instant: Instant): UtcOffset {
+    offsetSeconds?.let { return UtcOffset(it) }
+    val local = instant.toLocalDateTime(this)
+    val localSec = local.date.toEpochDays() * 86400L +
+        local.hour.toLong() * 3600L + local.minute.toLong() * 60L + local.second.toLong()
+    return UtcOffset((localSec - instant.epochSeconds).toInt())
+}
+
+/** The zone's own conversion, named as upstream's `TimeZone` member is. */
+fun TimeZone.localDateTimeToInstant(dateTime: LocalDateTime): Instant = dateTime.toInstant(this)
+
+internal fun localDateTimeToInstant(
+    dateTime: LocalDateTime,
+    timeZone: TimeZone,
+    preferred: UtcOffset? = null,
+): Instant {
+    if (preferred != null && timeZone.offsetSeconds == null) {
+        // A wall-clock time that still exists under the preferred offset keeps
+        // it (upstream's gap/overlap resolution), otherwise the zone decides.
+        val candidate = dateTime.toInstant(preferred)
+        if (candidate.toLocalDateTime(timeZone) == dateTime) return candidate
+    }
+    return dateTime.toInstant(timeZone)
 }
 
 // --- instant <-> local conversion (over kotlin.time.Instant) -----
@@ -558,6 +599,15 @@ fun LocalDateTime.toInstant(timeZone: TimeZone): Instant {
     return Instant.fromEpochSeconds(r[0], r[1])
 }
 
+fun Instant.toLocalDateTime(offset: UtcOffset): LocalDateTime =
+    epochSecondsToLocalDateTime(epochSeconds + offset.totalSeconds, nanosecondsOfSecond)
+
+fun LocalDateTime.toInstant(offset: UtcOffset): Instant {
+    val localSec = date.toEpochDays() * 86400L + hour.toLong() * 3600L +
+        minute.toLong() * 60L + second.toLong()
+    return Instant.fromEpochSeconds(localSec - offset.totalSeconds, nanosecond.toLong())
+}
+
 /** The instant at the start of this day (midnight) in [timeZone]. */
 fun LocalDate.atStartOfDayIn(timeZone: TimeZone): Instant =
     LocalDateTime(this, LocalTime(0, 0, 0, 0)).toInstant(timeZone)
@@ -586,37 +636,8 @@ fun Instant.minusPeriod(period: DateTimePeriod, timeZone: TimeZone): Instant = p
     timeZone,
 )
 
-// Upstream-named calendar arithmetic (Instant.kt is format/internal-heavy and
-// not consumed, so these are supplied directly). The 2-arg shape is distinct
-// from the `kotlin.time.Instant.plus(Duration)` member by arity.
-fun Instant.plus(period: DateTimePeriod, timeZone: TimeZone): Instant = plusPeriod(period, timeZone)
-fun Instant.minus(period: DateTimePeriod, timeZone: TimeZone): Instant = minusPeriod(period, timeZone)
-
-// Unit-based arithmetic. A `TimeBased` unit is timezone-independent (a fixed
-// nanosecond span); `DayBased` / `MonthBased` need the zone for calendar math.
-// The nanosecond span is split into whole seconds + a nanos remainder so a
-// large multiple (`plus(2^32, NANOSECOND)`) does not overflow.
-fun Instant.plus(value: Long, unit: DateTimeUnit.TimeBased): Instant {
-    val secondsPerUnit = unit.nanoseconds / 1_000_000_000L
-    val nanosRem = unit.nanoseconds % 1_000_000_000L
-    val addSeconds = value * secondsPerUnit + (value * nanosRem) / 1_000_000_000L
-    val addNanos = (value * nanosRem) % 1_000_000_000L
-    val r = __kxdt_addPeriod(epochSeconds, nanosecondsOfSecond, 0, 0, 0, 0, 0, addSeconds, addNanos, "UTC")
-    return Instant.fromEpochSeconds(r[0], r[1])
-}
-fun Instant.plus(value: Int, unit: DateTimeUnit.TimeBased): Instant = plus(value.toLong(), unit)
-fun Instant.minus(value: Long, unit: DateTimeUnit.TimeBased): Instant = plus(-value, unit)
-fun Instant.minus(value: Int, unit: DateTimeUnit.TimeBased): Instant = plus(-value.toLong(), unit)
-
-fun Instant.plus(value: Long, unit: DateTimeUnit, timeZone: TimeZone): Instant = when (unit) {
-    is DateTimeUnit.TimeBased -> plus(value, unit)
-    is DateTimeUnit.DayBased -> plusPeriod(DatePeriod(days = (value * unit.days).toInt()), timeZone)
-    is DateTimeUnit.MonthBased -> plusPeriod(DatePeriod(months = (value * unit.months).toInt()), timeZone)
-    else -> throw IllegalArgumentException("Unsupported DateTimeUnit: $unit")
-}
-fun Instant.plus(value: Int, unit: DateTimeUnit, timeZone: TimeZone): Instant = plus(value.toLong(), unit, timeZone)
-fun Instant.minus(value: Long, unit: DateTimeUnit, timeZone: TimeZone): Instant = plus(-value, unit, timeZone)
-fun Instant.minus(value: Int, unit: DateTimeUnit, timeZone: TimeZone): Instant = plus(-value.toLong(), unit, timeZone)
+// Calendar arithmetic on Instant (plus/minus by period or unit, periodUntil,
+// until, daysUntil/monthsUntil/yearsUntil) comes from upstream Instant.kt.
 
 /** The offset from UTC, in whole seconds, at a specific moment in a time zone. */
 class UtcOffset internal constructor(val totalSeconds: Int) {
@@ -705,7 +726,7 @@ private fun utcOffsetHms(hours: Int, minutes: Int, seconds: Int): Int {
 }
 
 /** The fixed-offset time zone with this offset. */
-fun UtcOffset.asTimeZone(): TimeZone = TimeZone(if (totalSeconds == 0) "Z" else toString(), totalSeconds)
+fun UtcOffset.asTimeZone(): FixedOffsetTimeZone = FixedOffsetTimeZone(this)
 
 /** The wall-clock offset of [timeZone] from UTC at this instant. */
 fun Instant.offsetIn(timeZone: TimeZone): UtcOffset {
@@ -715,29 +736,3 @@ fun Instant.offsetIn(timeZone: TimeZone): UtcOffset {
     return UtcOffset((localSeconds - epochSeconds).toInt())
 }
 
-/** The calendar period between two instants in [timeZone] (largest units first). */
-fun Instant.periodUntil(other: Instant, timeZone: TimeZone): DateTimePeriod {
-    val thisLdt = toLocalDateTime(timeZone)
-    val otherLdt = other.toLocalDateTime(timeZone)
-    // Apply the date difference at this time-of-day; a day too far/short is
-    // corrected below so the leftover is < 24h and lives in the time component.
-    val timeAfterDate = LocalDateTime(otherLdt.date, thisLdt.time).toInstant(timeZone)
-    val delta = when {
-        other > this && timeAfterDate > other -> -1
-        other < this && timeAfterDate < other -> 1
-        else -> 0
-    }
-    val endDate = if (delta != 0) dateFromEpochDays(otherLdt.date.toEpochDays() + delta) else otherLdt.date
-    val newInstant = LocalDateTime(endDate, thisLdt.time).toInstant(timeZone)
-    val nanoseconds = (other.epochSeconds - newInstant.epochSeconds) * 1_000_000_000L +
-        (other.nanosecondsOfSecond - newInstant.nanosecondsOfSecond).toLong()
-    val datePeriod = thisLdt.date.periodUntil(endDate)
-    return DateTimePeriod(
-        months = datePeriod.totalMonths.toInt(),
-        days = datePeriod.days,
-        nanoseconds = nanoseconds,
-    )
-}
-
-/** `other - this` as a calendar period in [timeZone]. */
-fun Instant.minus(other: Instant, timeZone: TimeZone): DateTimePeriod = other.periodUntil(this, timeZone)

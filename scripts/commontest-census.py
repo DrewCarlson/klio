@@ -64,6 +64,7 @@ def parse_config(suite):
         ):
             packs.append((d, art))
     home = re.search(r'\.scratch_home\s*=\s*"([^"]*)"', src)
+    whole = re.search(r"\.whole_source_set\s*=\s*(true|false)", src)
     baseline = re.search(r"\.baseline\s*=\s*(\d+)", src)
     return {
         "test_roots": strings_in("test_roots"),
@@ -71,6 +72,7 @@ def parse_config(suite):
         "packs": packs,
         "scratch_home": home.group(1) if home else f"/tmp/klio_census_{suite}_home",
         "baseline": int(baseline.group(1)) if baseline else 0,
+        "whole_source_set": bool(whole and whole.group(1) == "true"),
     }
 
 
@@ -136,8 +138,11 @@ def symbol(msg):
     return None
 
 
-def run_target(target, support, env, timeout):
-    argv = [BIN, "test"] + support + [target]
+def run_target(target, support, env, timeout, all_targets=None):
+    if all_targets is not None:
+        argv = [BIN, "test", "--only-file", target] + support + all_targets
+    else:
+        argv = [BIN, "test"] + support + [target]
     try:
         r = sh(argv, env, timeout=timeout)
         out = r.stdout
@@ -197,7 +202,8 @@ def main():
           f"jobs={args.jobs} baseline={cfg['baseline']}")
     results, n_pass, n_fail, incomplete = [], 0, 0, 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futs = [pool.submit(run_target, t, support, env, args.timeout) for t in targets]
+        whole = targets if cfg["whole_source_set"] else None
+        futs = [pool.submit(run_target, t, support, env, args.timeout, whole) for t in targets]
         for f in concurrent.futures.as_completed(futs):
             target, passed, failed, inc, err = f.result()
             n_pass += len(passed)
