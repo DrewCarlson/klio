@@ -40,37 +40,56 @@ Green where measured:
 - Ratchets: compose plugin 1375 (floor 1370), ktor 448 pass / 2
   closed-by-record (floor 440), io 1140, datetime 457 (floor 450,
   raised this round from 210), atomicfu 63,
-  serialization 9.
+  serialization 60 (floor 60).
 - Perf: the aacbench rig fell ~10.2% last week (3649 -> 3275 ms/rep);
   compose_foundation_lazy warm 42.6s -> 1.069s (40x); ReleaseFast now at
   parity with ReleaseSafe (the no-fill lever removed the poison-memset
   gap).
+- Census conformance after this round: coroutines 1073, datetime 457,
+  io 1157, serialization 60, ktor 448, atomicfu 63.
 - Scale: ~290k lines of Zig; the three former giant modules are
   21.5k / 13.6k / 9.6k after one split each.
 
-The blind spot:
+The blind spot (CLOSED 2026-08-18 — kept as the record of what was
+hidden and how it was found):
 
-- `coroutines_commontest`: **350 passed, 896 failed, 3 did not complete**
-  across 148 files, ratchet baseline **340**. CI is green while 72% of
-  that suite is red. The register's "coroutine cluster CORRECTNESS
-  COMPLETE" is true only of *recorded bugs*; it is not a conformance
-  claim, and the two have been easy to conflate.
-- 44 of 339 examples have no pinned expected output (3 are legitimately
-  `// corpus: interactive`). They prove "runs without crashing", not
-  "produces the right answer".
-- Ratchets are pass-count FLOORS. A suite can sit at 28% passing forever
-  and gate green.
+- `coroutines_commontest` was **350 passed / 896 failed / 3 incomplete**
+  behind a ratchet floor of **340** — CI green while 72% of the suite was
+  red. 98.3% of those failures were three resolution shapes and only ~14
+  were real assertion failures. Root: upstream's commonTest extends
+  `TestBase` from `kotlinx.coroutines.testing`, which lives in the pack's
+  `[[test]]` roots and never reached the child. Wiring it as
+  `extra_support`: **1073 passed / 137 failed**, floor 340 -> 1040.
+- `serialization_commontest` was **9 / 129** behind a floor of 9. Two
+  roots: a missing `expect val currentPlatform` actual (klio reports
+  NATIVE, mirroring upstream's nativeTest), then a deliberately narrow
+  17-file pack include list. **60 / 78**, floor 9 -> 60.
+- `datetime_commontest` was **212 / 291** behind a floor of 205 — a MIX,
+  not one root: eleven distinct roots, nine of them in the interpreter and
+  shared by every program. **457 / 62**, floor 210 -> 450.
+- Corpus: 18 `.out` files sat in `examples/` while e2e reads only
+  `tests/corpus/expected/`, so those guards were never enforced (all 18
+  matched current behavior — nothing had regressed behind the gap). Pins
+  292 -> 320 enforced by e2e, plus 16 in `tests/corpus/expected-cli/` for
+  the programs the in-process runner cannot execute at all.
+- Ratchets were pass-count FLOORS only. Every census now carries
+  `max_failed` and `max_incomplete` ceilings seeded from a solo
+  measurement, verified by negative control.
+
+The lesson worth carrying: three censuses in a row were not measuring
+their libraries, they were measuring klio's own resolution and receiver
+machinery. Conformance work IS interpreter work.
 
 ## Track C — Conformance
 
-- [ ] C1. Characterize the coroutines 896. Census every failure by error
+- [x] C1. Characterize the coroutines 896. Census every failure by error
       shape before fixing anything (the 44-crash census family collapsed
       to seven roots; expect the same shape here). Sampled evidence from
       five files (49 failures): `Vm::call_value on X` 67%,
       `unresolved global X` 24%, `Vm::get_field X on X` 8%. Deliverable:
       a full error-shape histogram with a named candidate root per
       bucket, ranked by blast radius.
-- [ ] C2. The `kotlinx.coroutines.testing` support surface. Upstream's
+- [x] C2. The `kotlinx.coroutines.testing` support surface. Upstream's
       commonTest files all extend `TestBase` from that package, and every
       `runTest`/`expect`/`finish` call goes through it. The census
       (`src/itests/commontest_support.zig` + `coroutines_commontest.zig`)
@@ -88,14 +107,14 @@ The blind spot:
       superclass plus interface delegation (`by`), so this is narrower
       than a basic expect/actual gap. Find the real mechanism; do not
       assume the wiring fix is sufficient.
-- [ ] C3. Ratchet honesty. Pass-count floors cannot see a regression
+- [x] C3. Ratchet honesty. Pass-count floors cannot see a regression
       inside the red mass. Add a failure-count ceiling (and a
       did-not-complete ceiling) alongside the floor for every census
       suite, seeded from the current measured numbers, so both directions
       are gated. Note the coroutines suite's floor (340) sits far below
       its own solo pass count (350) — floors that lag reality hide
       movement in both directions.
-- [ ] C4. Corpus pinning. 44 examples run with no expected output. For
+- [x] C4. Corpus pinning. 44 examples run with no expected output. For
       each: pin the output (kotlinc-verified where the program is
       representable) or mark it `// corpus: interactive` with the reason.
       An example that asserts nothing is a smoke test wearing a
@@ -186,7 +205,7 @@ Recorded, not fixed:
 The weak spots the last campaign's root-cause work exposed. Each one is
 evidence-backed; none is a hypothetical.
 
-- [ ] H1. Cross-program state in one process. SEVEN distinct roots landed
+- [x] H1. Cross-program state in one process. SEVEN distinct roots landed
       last week (shared anon side-module and its clone crossing a
       boundary, generation-stamped dispatch caches, the bytecode stream
       cache, intrinsic intern keys, the GC remembered set, the
@@ -199,6 +218,19 @@ evidence-backed; none is a hypothetical.
       shared-mutable), and give the per-program ones a single audited
       reset path instead of the current scatter of hand-written resets.
       `KLIO_GC_STRESS` and the differential order test are the oracles.
+      DONE 2026-08-18 — audit in `docs/development/process-globals.md`.
+      All 53 contamination-capable globals across ir/interp_ir/runtime/
+      stdlib enumerated and classified: every one carries a defense or is
+      immortal by construction, and NO undefended per-program global
+      remained (the seven roots fixed last campaign were the real ones).
+      The audit's value is naming the four defenses the codebase already
+      uses ad hoc — boundary reset, generation stamping, identity
+      verification on lookup, scoped lifetime — with when each applies and
+      their reference implementations, plus a contract that new global
+      state must declare its defense in the same commit. Recorded
+      exception: `lenient_warned` is not reset per program, so a second
+      program can lose a leniency warning (suppresses a diagnostic, never
+      changes a result).
 - [ ] H2. Two resolution paths that can disagree. `positional_lambda_binding`
       passed through the CLI's eager typeck map and FAILED through the
       lazy engine in base mode — the same program, two answers, and the
