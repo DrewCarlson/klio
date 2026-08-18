@@ -478,6 +478,7 @@ pub fn parseObject(
         .supertypes = sup.types,
         .supertype_args = sup.args,
         .supertype_arg_names = sup.arg_names,
+        .supertype_delegates = sup.delegates,
         .members = cb.members,
         .init_blocks = cb.init_blocks,
         .init_block_positions = cb.init_block_positions,

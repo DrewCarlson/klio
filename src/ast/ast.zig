@@ -560,6 +560,10 @@ pub const ObjectDecl = struct {
     /// positional argument. Empty default = all positional. See the
     /// matching field on the class declaration.
     supertype_arg_names: []const ?[]const ?[]const u8 = &.{},
+    /// Parallel to `supertypes`: the delegate expression of an inheritance
+    /// delegation (`object O : Iface by impl`), `null` for a plain supertype.
+    /// Empty when the declaration used no `by` clause.
+    supertype_delegates: []?Expr = &.{},
     /// `data object Foo { … }` — auto-generates `toString` returning the
     /// simple class name. Distinct from `data class`: no `copy` / no
     /// `componentN`, and user-declared `equals`/`hashCode` overrides are

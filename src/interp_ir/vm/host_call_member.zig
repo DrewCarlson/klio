@@ -2274,7 +2274,34 @@ fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
 /// receiver class — a `KClass` is never an instance of `Pipeline`, so
 /// `Pipeline.execute` is not a candidate at that receiver (kotlinc drops
 /// it outright).
+/// The owner simple name of a companion-object type name (`kotlin.Char.Companion`
+/// → `Char`), or null when the name does not head a companion.
+fn companionOwnerName(name: []const u8) ?[]const u8 {
+    const suffix = ".Companion";
+    if (!std.mem.endsWith(u8, name, suffix)) return null;
+    const head = name[0 .. name.len - suffix.len];
+    if (head.len == 0) return null;
+    return simpleName(head);
+}
+
+/// A companion-object receiver type (`X.Companion`) is owner-specific: the
+/// runtime companion instance's class fqn names its own owner, so a candidate
+/// declared on a DIFFERENT owner's companion is inapplicable. Without this
+/// every `T.Companion.f()` extension in scope survives the lenient pass and the
+/// first-declared one wins (`String.serializer()` binding
+/// `Char.Companion.serializer`).
+fn companionOwnerMismatch(param_name: []const u8, receiver: *const Value) bool {
+    const want = companionOwnerName(param_name) orelse return false;
+    const g = receiver.Instance.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    const got = companionOwnerName(cg.get().fqn) orelse return false;
+    return !std.mem.eql(u8, want, got);
+}
+
 fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver: *const Value) bool {
+    if (receiver.* == .Instance and companionOwnerMismatch(param_ty.name, receiver)) return true;
     if (argDefinitelyNotParamType(self, param_ty, receiver)) return true;
     // A function value implements only the Function* surface (plus
     // Any/type variables): a NOMINAL receiver type it does not satisfy
@@ -2323,6 +2350,11 @@ fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver:
         if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return false;
         if (std.mem.startsWith(u8, pn, "Function")) return true;
         if (pn.len <= 2 and allUppercase(pn)) return false;
+        // A class value IS a `KClass` / `KClassifier`. The reflection heads it
+        // reports must not be disproven merely because the stdlib registers a
+        // ClassDef under that name — that dropped every `KClass<T>.f()`
+        // extension (`isInterface`, `serializerOrNull`) from the candidate set.
+        if (receiver.isRuntimeType(simpleName(pn))) return false;
         const cg = self.classes.borrow();
         defer cg.deinit();
         return cg.get().get(simpleName(pn)) != null;

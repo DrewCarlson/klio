@@ -850,6 +850,28 @@ fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
                 const here = peekIdentText(p) orelse break;
                 if (std.mem.eql(u8, here, "Companion")) break;
                 const k1 = kindAt(p, p.pos + 1) orelse break;
+                // `Ident<...>.` — a nested segment carrying generic arguments
+                // (`val Map.Entry<K, V>.key`). Fold it like a plain segment,
+                // keeping the arguments on the receiver type.
+                if (is(&k1, .Lt)) {
+                    const save_pos = p.pos;
+                    const seg = parseIdent(p, "type") orelse break;
+                    const args: []ast.TypeArg = if (is(peekKind(p), .Lt)) types.parseTypeArgs(p) else &.{};
+                    const n0 = kindAt(p, p.pos);
+                    const n1 = kindAt(p, p.pos + 1);
+                    if (!(n0 != null and is(&n0.?, .Dot)) or !(n1 != null and is(&n1.?, .Ident))) {
+                        p.pos = save_pos;
+                        break;
+                    }
+                    _ = bump(p); // `.`
+                    path.append(p.allocator, '.') catch @panic("OOM");
+                    path.appendSlice(p.allocator, seg.name) catch @panic("OOM");
+                    if (ty) |*t| {
+                        t.name = seg;
+                        t.type_args = args;
+                    }
+                    continue;
+                }
                 const k2 = kindAt(p, p.pos + 2) orelse break;
                 if (!is(&k1, .Dot) or !is(&k2, .Ident)) break;
                 const seg = parseIdent(p, "type") orelse break;
