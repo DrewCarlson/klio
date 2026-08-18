@@ -18,6 +18,13 @@ test "kotlinx.serialization commonTest pass count holds at or above the ratchet 
         .extra_support = &.{
             "kotlin-klio/klio-kotlinx-serialization/klioTest/kotlinx/serialization/test/CurrentPlatform.kt",
         },
-        .baseline = 9,
+        // Every bound below TIGHTENS the gate. The floor rises 9 -> 60 as the
+        // pack widened to upstream's own serializer lookup; the two ceilings
+        // are new (the suite was floor-only before), so a run that clears the
+        // floor while growing failures or hangs now fails. Measured solo:
+        // 60 passed, 78 failed, 0 did not complete.
+        .baseline = 60,
+        .max_failed = 78,
+        .max_incomplete = 0,
     });
 }
