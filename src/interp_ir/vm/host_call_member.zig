@@ -9250,6 +9250,62 @@ fn instanceIntrinsicCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceM
     };
 }
 
+/// Whether a lambda argument makes the resolved MEMBER inapplicable while a
+/// same-arity extension declares that slot as a function type. Kotlin ranks
+/// members over extensions only among APPLICABLE candidates, so
+/// `DateTimeFormat<DateTimeComponents>.format { … }` is the extension taking
+/// a `DateTimeComponents.() -> Unit`, never the member `format(value: T)`.
+/// Restricted to a member slot declared as a bare TYPE VARIABLE: a nominal
+/// parameter can still take the lambda by SAM conversion, and there the
+/// member keeps its precedence.
+fn lambdaArgPrefersExtension(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    fid: FuncId,
+    name: []const u8,
+    args: []const Value,
+) Allocator.Error!bool {
+    if (args.len == 0 or !isCallable(&args[args.len - 1])) return false;
+    var member_slot_is_tp = false;
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const f = funcAt(mg.get(), fid) orelse return false;
+        if (f.params.len != args.len + 1) return false;
+        const raw = std.mem.trimEnd(u8, f.params[f.params.len - 1].ty.name, "?");
+        const head = std.mem.trimEnd(u8, simpleName(raw), "?");
+        member_slot_is_tp = (head.len != 0 and head.len <= 2 and std.ascii.isUpper(head[0])) or
+            ir.parseClassTypeParamIdentity(raw) != null;
+    }
+    if (!member_slot_is_tp) return false;
+    var cands: std.ArrayList(FuncId) = .empty;
+    defer cands.deinit(allocator);
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const mod = mg.get();
+        for (mod.funcsBySimpleName(name)) |cand| {
+            const g = funcAt(mod, cand) orelse continue;
+            if (!g.hasBody() or g.params.len != args.len + 1) continue;
+            if (!std.mem.eql(u8, g.params[0].name, "this")) continue;
+            if (isMemberExt(mod, cand)) continue;
+            if (!std.mem.startsWith(u8, g.params[g.params.len - 1].ty.name, "Function")) continue;
+            cands.append(allocator, cand) catch {};
+        }
+    }
+    for (cands.items) |cand| {
+        const rty = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const g = funcAt(mg.get(), cand) orelse break :blk null;
+            break :blk &g.params[0].ty;
+        } orelse continue;
+        if (try strictReceiverProven(self, allocator, receiver, cand, rty)) return true;
+    }
+    return false;
+}
+
 fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8) Allocator.Error!?EvalResult {
     if (runtime.envSetOnce("KLIO_WALK_TRACE")) {
         std.debug.print("[ir-walk] {s} on {s} static={s}\n", .{ name, receiver.typeFqn(), static_recv orelse "-" });
@@ -9276,10 +9332,18 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     if (key) |k| {
         if (instanceMethodCacheGetRaw(self, k)) |raw| {
             if (raw == METHOD_MISS) return null;
-            return try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(raw), args);
+            const cached: FuncId = @enumFromInt(raw);
+            // The lambda-argument decline is a property of the CALL, not of
+            // the cached resolution, so it applies on the hit path too.
+            if (try lambdaArgPrefersExtension(self, allocator, receiver, cached, name, args)) return null;
+            return try invokeMethodFuncId(self, allocator, receiver, cached, args);
         }
     }
-    const resolved = (try resolveInstanceMethod(self, allocator, receiver, name, args, static_recv)) orelse {
+    const resolved0 = try resolveInstanceMethod(self, allocator, receiver, name, args, static_recv);
+    if (resolved0) |r0| {
+        if (try lambdaArgPrefersExtension(self, allocator, receiver, r0.fid, name, args)) return null;
+    }
+    const resolved = resolved0 orelse {
         // Cache the miss: a member-accessed field (`obj.field`) re-runs this
         // walk every read otherwise. Only a proven, key-stable miss is stored.
         if (key) |k| instanceMethodCachePutRaw(self, k, METHOD_MISS);

@@ -671,7 +671,12 @@ pub fn spliceInlineLambdaOn(
     var suspended_rlp: std.ArrayList([]const u8) = .empty;
     defer suspended_rlp.deinit(b.allocator);
     for (enclosing_subst_keys.items) |k| {
-        if (b.isReceiverLambdaParam(k)) {
+        // Only a mark THIS splice added for the inline fn's own parameter is
+        // suspended. When the caller declares a same-named receiver-lambda
+        // parameter (`fun mk(block: C.() -> Unit) = C().apply { block() }`),
+        // the mark is the caller's and suspending it drops the receiver from
+        // the bare call.
+        if (b.isReceiverLambdaParam(k) and b.isSpliceRlpMark(k)) {
             b.unmarkReceiverLambdaParam(k);
             try suspended_rlp.append(b.allocator, k);
         }
@@ -2027,6 +2032,7 @@ pub fn tryInlineCallWithTypeArgs(
                 if (std.mem.eql(u8, tp.name.name, rhead)) head_is_tp = true;
             }
             try b.setReceiverLambdaRecvHead(p.name.name, if (head_is_tp) null else rhead);
+            try b.noteSpliceRlpMark(p.name.name);
             try marked_rlp.append(b.allocator, p.name.name);
         }
     }
@@ -2353,6 +2359,7 @@ pub fn tryInlineCallWithTypeArgs(
     b.switchTo(join);
     for (marked_rlp.items) |n| {
         b.unmarkReceiverLambdaParam(n);
+        b.clearSpliceRlpMark(n);
     }
     // Remove the boxing marks added for this splice so a same-named caller
     // local keeps its own (un)boxed status.

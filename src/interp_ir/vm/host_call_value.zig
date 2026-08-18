@@ -2108,10 +2108,37 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
     // passed through; the intrinsic-host fallback below drops them.
     if (callee.* == .Instance) {
         var name_v: ?Value = null;
+        var bound_recv: ?Value = null;
         {
             const snap = callee.Instance.borrow();
             defer snap.deinit();
             name_v = snap.get().get("__bound_name__");
+            bound_recv = snap.get().get("__bound_receiver__");
+        }
+        // A BOUND reference (`predicate::test` on an instance / object
+        // singleton) already carries its receiver. Converted to a
+        // receiver-function type (`T.() -> Boolean`), the supplied `this`
+        // is its ARGUMENT — `obj.condition()` means `predicate.test(obj)`,
+        // never `obj.test()`. A TYPE-form reference (`String::plus`) is
+        // unbound and keeps the receiver-dispatch route below.
+        if (name_v != null and name_v.? == .String) {
+            if (bound_recv) |rv| {
+                const name0 = blk: {
+                    const g = name_v.?.String.borrow();
+                    defer g.deinit();
+                    break :blk g.get().bytes;
+                };
+                const type_like = (rv == .Class) or
+                    (rv == .Instance and isCompanionInstance(rv) and
+                        !companionServesName(self, &rv, name0));
+                if (!type_like) {
+                    var all: std.ArrayList(Value) = .empty;
+                    defer all.deinit(allocator);
+                    try all.append(allocator, this_value.*);
+                    try all.appendSlice(allocator, args);
+                    return callValue(self, allocator, callee, all.items);
+                }
+            }
         }
         if (name_v != null and name_v.? == .String) {
             const name = blk: {
