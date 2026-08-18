@@ -1,0 +1,4 @@
+border=2.0.dp
+shape built=true
+warning: `getValue` binds `androidx.compose.runtime.getValue` without an import; add `import androidx.compose.runtime.getValue` — kotlinc rejects the unimported call, and klio may type its lambda arguments incorrectly
+scroll=0

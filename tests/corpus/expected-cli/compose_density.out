@@ -1,0 +1,5 @@
+16.dp -> px: 32.0
+100 px -> dp: 50.0
+12.sp -> dp: 18.0
+24.dp -> sp: 16.0
+48 px -> dp -> rounded px: 48

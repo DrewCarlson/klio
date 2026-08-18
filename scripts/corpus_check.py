@@ -95,6 +95,23 @@ def main():
         if args.no_rust:
             ok = zrc == 0
             detail = f"zig rc={zrc}"
+            # Output-pin the examples the e2e corpus cannot reach. e2e runs
+            # programs through the in-process parity pipeline, which loads a
+            # different pack surface than the CLI and takes no `--feature`
+            # set: the compose scene examples fail there with `unresolved
+            # global application` / `PaddingValues`, and a `--feature`
+            # example with `Json`. Their expectations therefore live in
+            # tests/corpus/expected-cli/ (a .out under expected/ would make
+            # e2e run them and fail), and this runner — which uses the real
+            # CLI and honors the documented flags — enforces them.
+            stem = os.path.basename(f)[: -len(".kt")]
+            exp = os.path.join(ROOT, "tests/corpus/expected-cli", stem + ".out")
+            if ok and os.path.exists(exp):
+                with open(exp, "r", errors="replace") as fh:
+                    want = fh.read()
+                if zout != want:
+                    ok = False
+                    detail = f"zig rc={zrc} output != tests/corpus/expected-cli/{stem}.out"
         else:
             rrc, rout = run(args.rust, f, args.timeout)
             ok = zrc == 0 and rrc == 0 and zout == rout

@@ -1,0 +1,4 @@
+top=8.0.dp
+bottom=12.0.dp
+arrangement=Arrangement#SpaceBetween
+modifier chain built=true

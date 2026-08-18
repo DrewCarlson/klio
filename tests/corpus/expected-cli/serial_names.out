@@ -1,0 +1,7 @@
+{"name":"amy","years":31}
+Person(name=amy, age=31)
+true
+{"first_name":"bo"}
+Handle(firstName=kay)
+{"nick":"zed"}
+Alias(nickname=rem)
