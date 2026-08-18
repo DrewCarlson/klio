@@ -314,6 +314,7 @@ pub fn parseTopDecl(p: *Parser) ?Decl {
                         flags.is_expect,
                         flags.is_actual,
                         flags.visibility,
+                        flags.annotations.items,
                     );
                     if (o) |obj| return Decl{ .Object = obj };
                     return null;

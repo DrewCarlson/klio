@@ -467,6 +467,7 @@ pub fn parseObject(
     is_expect: bool,
     is_actual: bool,
     visibility: Visibility,
+    annotations: []Annotation,
 ) ?ObjectDecl {
     const kw = support.bump(p); // `object`
     const name = support.parseIdent(p, "object name") orelse return null;
@@ -479,6 +480,7 @@ pub fn parseObject(
         .supertype_args = sup.args,
         .supertype_arg_names = sup.arg_names,
         .supertype_delegates = sup.delegates,
+        .annotations = annotations,
         .members = cb.members,
         .init_blocks = cb.init_blocks,
         .init_block_positions = cb.init_block_positions,

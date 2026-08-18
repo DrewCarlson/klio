@@ -20,6 +20,8 @@
 package kotlinx.serialization
 
 import kotlin.reflect.KClass
+import kotlinx.serialization.internal.EnumSerializer
+import kotlinx.serialization.internal.ObjectSerializer
 import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.descriptors.SerialKind
 import kotlinx.serialization.descriptors.StructureKind
@@ -37,6 +39,67 @@ internal fun __klsx_get(obj: Any?, name: String): Any? =
 
 internal fun __klsx_construct(kClass: Any?, args: List<Any?>): Any? =
     error("intrinsic kotlinx.serialization.__klsx_construct not installed")
+
+internal fun __klsx_isSerializable(kClass: Any?): Boolean =
+    error("intrinsic kotlinx.serialization.__klsx_isSerializable not installed")
+
+internal fun __klsx_isEnum(kClass: Any?): Boolean =
+    error("intrinsic kotlinx.serialization.__klsx_isEnum not installed")
+
+internal fun __klsx_enumValues(kClass: Any?): List<Any?> =
+    error("intrinsic kotlinx.serialization.__klsx_enumValues not installed")
+
+// One generated serializer per declaration, as the plugin's generated
+// `Companion.serializer()` provides: `serializer()` called twice on the same
+// class must return the same instance.
+private val __klsx_generated = HashMap<KClass<*>, KSerializer<Any>>()
+
+// The serializer the compiler plugin would have generated for a
+// `@Serializable` declaration, built from the declaration's runtime shape:
+// an `object` serializes as an empty structure, an `enum class` by entry
+// index, a `sealed` class dispatches over its subclasses, an open hierarchy
+// root is polymorphic, and a plain class walks its primary-constructor
+// properties reflectively. A declaration that never opted in returns null,
+// which is what upstream's `serializerOrNull()` contract requires.
+@Suppress("UNCHECKED_CAST")
+internal fun __klsx_generatedSerializer(kClass: KClass<*>): KSerializer<Any>? {
+    if (!__klsx_isSerializable(kClass)) return null
+    __klsx_generated[kClass]?.let { return it }
+    val built = __klsx_buildSerializer(kClass)
+    __klsx_generated[kClass] = built
+    return built
+}
+
+@Suppress("UNCHECKED_CAST")
+private fun __klsx_buildSerializer(kClass: KClass<*>): KSerializer<Any> {
+    val serialName = __klsx_serialName(kClass)
+    val objectInstance = kClass.objectInstance
+    if (objectInstance != null) {
+        return ObjectSerializer(serialName, objectInstance) as KSerializer<Any>
+    }
+    if (__klsx_isEnum(kClass)) {
+        return EnumSerializer(serialName, __klsx_enumValues(kClass).toTypedArray()) as KSerializer<Any>
+    }
+    if (kClass.isSealed) {
+        val subclasses = ArrayList<KClass<*>>()
+        val subSerializers = ArrayList<KSerializer<Any>>()
+        for (sub in kClass.sealedSubclasses) {
+            val s = __klsx_generatedSerializer(sub) ?: continue
+            subclasses.add(sub)
+            subSerializers.add(s)
+        }
+        return SealedClassSerializer(
+            serialName,
+            kClass as KClass<Any>,
+            subclasses.toTypedArray() as Array<KClass<out Any>>,
+            subSerializers.toTypedArray() as Array<KSerializer<out Any>>
+        ) as KSerializer<Any>
+    }
+    if (kClass.isAbstract) {
+        return PolymorphicSerializer(kClass as KClass<Any>) as KSerializer<Any>
+    }
+    return ReflectiveKSerializer(kClass) as KSerializer<Any>
+}
 
 // A minimal SerialDescriptor over a fixed element-name list. Kind is
 // StructureKind.CLASS. The reflective path is type-erased (element values

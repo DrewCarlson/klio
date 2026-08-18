@@ -2347,7 +2347,19 @@ fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver:
     if (receiver.* == .Class) {
         const pn = param_ty.name;
         if (param_ty.nullable) return false;
-        if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return false;
+        // A companion-owner mismatch is definite through the class value too:
+        // `Foo.f()` may bind `fun Foo.Companion.f()`, never another owner's.
+        if (companionOwnerName(pn)) |want| {
+            const g = receiver.Class.borrow();
+            defer g.deinit();
+            return !std.mem.eql(u8, want, g.get().name) and
+                !std.mem.eql(u8, want, simpleName(g.get().fqn));
+        }
+        if (std.mem.eql(u8, pn, "Any")) return false;
+        // A class value is never `Unit`. Without this every `fun Unit.f()`
+        // extension in scope stays a lenient survivor for `X.f()`
+        // (`Unit.serializer()` answered `Foo.serializer()`).
+        if (std.mem.eql(u8, pn, "Unit")) return true;
         if (std.mem.startsWith(u8, pn, "Function")) return true;
         if (pn.len <= 2 and allUppercase(pn)) return false;
         // A class value IS a `KClass` / `KClassifier`. The reflection heads it
@@ -10860,8 +10872,16 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
                         const cf = ir.eval.currentFrameFunc() orelse break :blk false;
                         break :blk cf.id.int() == c.fid.int();
                     };
+                    // A class-value receiver (`TopE.serializer()`) records the
+                    // CLASS as its declared receiver, but the value flowing in
+                    // is a `KClass`. An extension declared on `KClass` is
+                    // exactly what such a call binds, so the value's own
+                    // reflection heads outrank the class-shaped hint.
+                    const class_reflection_proves = receiver.* == .Class and
+                        receiver.isRuntimeType(simpleName(rty.name));
                     const runtime_proves = !self_repick and
-                        committedExtReceiverProven(self, allocator, c.fid, receiver);
+                        (committedExtReceiverProven(self, allocator, c.fid, receiver) or
+                            class_reflection_proves);
                     if (!is_companion_recv and !runtime_proves and staticReceiverApplicable(self, allocator, dn, c.fid, rty) == false) {
                         if (mtr) std.debug.print("[extfb]  fid={d} lenient static-recv-refuse dn={s}\n", .{ c.fid.int(), dn });
                         continue;

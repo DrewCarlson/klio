@@ -57,6 +57,11 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("kotlinx.serialization.__klsx_ctorParamNames", ctorParamNames);
     try b.register("kotlinx.serialization.__klsx_get", propGet);
     try b.register("kotlinx.serialization.__klsx_construct", construct);
+    // Compiler-plugin replacement: the shape questions the generated
+    // serializer would have been synthesized from.
+    try b.register("kotlinx.serialization.__klsx_isSerializable", isSerializable);
+    try b.register("kotlinx.serialization.__klsx_isEnum", isEnumClass);
+    try b.register("kotlinx.serialization.__klsx_enumValues", enumEntryValues);
     // JSON format: reflective encode (runtime-value driven) and
     // type-driven decode (guided by each ctor param's declared type).
     try b.register("kotlinx.serialization.json.__klsx_jsonEncode", jsonEncode);
@@ -545,6 +550,53 @@ fn classOf(v: *const Value) ?ObjRef(ClassDef) {
     };
 }
 
+/// Whether `name` is one of the recorded annotation-name candidates for
+/// `kotlinx.serialization.Serializable` (the resolver records both the bare
+/// name and every import-derived fqn).
+fn isSerializableAnnotation(name: []const u8) bool {
+    return std.mem.eql(u8, name, "Serializable") or
+        std.mem.eql(u8, name, "kotlinx.serialization.Serializable");
+}
+
+/// `@Serializable` presence on the class. This is what the compiler plugin
+/// keys generation off; klio answers it from the retained annotation names so
+/// `serializerOrNull()` returns null for a class that never opted in.
+fn isSerializable(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return ok(.{ .Bool = false });
+    const cls_ref = classOf(&ctx.args[0]) orelse return ok(.{ .Bool = false });
+    defer cls_ref.deinit();
+    for (cls_ref.asPtr().annotation_names) |n| {
+        if (isSerializableAnnotation(n)) return ok(.{ .Bool = true });
+    }
+    return ok(.{ .Bool = false });
+}
+
+/// Whether the class is an `enum class`.
+fn isEnumClass(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return ok(.{ .Bool = false });
+    const cls_ref = classOf(&ctx.args[0]) orelse return ok(.{ .Bool = false });
+    defer cls_ref.deinit();
+    return ok(.{ .Bool = cls_ref.asPtr().is_enum });
+}
+
+/// The enum entry singletons in declaration order; empty for a non-enum.
+fn enumEntryValues(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    if (ctx.args.len != 0) {
+        if (classOf(&ctx.args[0])) |cls_ref| {
+            defer cls_ref.deinit();
+            for (cls_ref.asPtr().enum_entries) |e| try items.append(a, e.value);
+        }
+    }
+    return ok(try Value.newList(a, .{
+        .items = try ValueList.init(a, items),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    }));
+}
+
 /// Ordered names of the primary-constructor properties (`val`/`var`
 /// params). Plugin-generated serializers serialize exactly these, in
 /// declaration order.
@@ -1002,7 +1054,10 @@ test "hostBindings registers every serialization symbol" {
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_construct") != null);
     try testing.expect(b.resolve("kotlinx.serialization.json.__klsx_jsonEncode") != null);
     try testing.expect(b.resolve("kotlinx.serialization.json.__klsx_jsonDecode") != null);
-    try testing.expectEqual(@as(usize, 5), b.len());
+    try testing.expect(b.resolve("kotlinx.serialization.__klsx_isSerializable") != null);
+    try testing.expect(b.resolve("kotlinx.serialization.__klsx_isEnum") != null);
+    try testing.expect(b.resolve("kotlinx.serialization.__klsx_enumValues") != null);
+    try testing.expectEqual(@as(usize, 8), b.len());
 }
 
 test {

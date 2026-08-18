@@ -578,7 +578,7 @@ pub fn synthesizeClassFromObject(allocator: Allocator, o: *const ObjectDecl) All
         .members = o.members,
         .visibility = .Public,
         .primary_ctor_visibility = null,
-        .annotations = &.{},
+        .annotations = o.annotations,
         .span = o.span,
     };
 }
