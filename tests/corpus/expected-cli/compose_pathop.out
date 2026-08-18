@@ -1,0 +1,5 @@
+union ok=true bounds=0,0,60,60
+intersect ok=true bounds=20,20,40,40
+difference ok=true empty=false
+xor ok=true bounds=0,0,60,60
+disjoint ok=true empty=true

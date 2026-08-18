@@ -1,0 +1,7 @@
+argb: r=20 g=40 b=80 a=100
+teal: g=50 b=50
+orange: r=100 g=50 b=0
+luminance white=100 black=0
+luminance red=21 green=72 blue=7
+faded red: r=100 a=50
+space: sRGB IEC61966-2.1

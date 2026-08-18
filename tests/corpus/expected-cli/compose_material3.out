@@ -1,0 +1,10 @@
+scheme.primary=Color(0.0, 0.0, 1.0, 1.0, sRGB IEC61966-2.1)
+copied.tertiary=Color(1.0, 1.0, 0.0, 1.0, sRGB IEC61966-2.1)
+copied.primary=Color(0.0, 0.0, 1.0, 1.0, sRGB IEC61966-2.1)
+primary=Color(0.0, 0.0, 1.0, 1.0, sRGB IEC61966-2.1)
+secondary=Color(1.0, 0.0, 0.0, 1.0, sRGB IEC61966-2.1)
+bodyLarge=16.0.sp
+small shape set=true
+nested primary=Color(0.0, 1.0, 0.0, 1.0, sRGB IEC61966-2.1)
+restored primary=Color(0.0, 0.0, 1.0, 1.0, sRGB IEC61966-2.1)
+done
