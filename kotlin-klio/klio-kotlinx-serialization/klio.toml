@@ -63,3 +63,8 @@ json = { sources = ["klioMain/kotlinx/serialization/json"] }
 # commonTest sources for `klio test` (not packed).
 [[test]]
 root = "upstream/core/commonTest"
+
+# klio-authored platform actual for the commonTest support surface
+# (`expect val currentPlatform`); see klioTest/ for why NATIVE.
+[[test]]
+root = "klioTest"

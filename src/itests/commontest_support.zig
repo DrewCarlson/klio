@@ -7,6 +7,8 @@
 //! same way. Pass counting is per-`PASSED`-line so a file killed mid-run still
 //! contributes the cases it printed before the kill. The suite ratchets on the
 //! total pass count; raise the baseline as fixes land, never lower it.
+//! `max_failed`/`max_incomplete` bound the other direction — a floor alone
+//! cannot see a regression inside the red mass.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -31,6 +33,17 @@ pub const Config = struct {
     /// Once a suite reaches full coverage, set true to also fail on any
     /// non-passing case (a hard 100% gate on top of the ratchet).
     require_no_failures: bool = false,
+    /// Ceiling on failing cases. A pass-count floor alone cannot see a
+    /// regression INSIDE the red mass — a suite can trade a fixed test for
+    /// a broken one, or grow new failures, and still clear its floor. Seed
+    /// from the measured solo census and lower it as fixes land, never
+    /// raise it. Null leaves the suite floor-only (state why).
+    max_failed: ?usize = null,
+    /// Ceiling on cases that never reported (timeout / crash). These are
+    /// invisible to both the floor and `max_failed`, so they get their own
+    /// bound: a suite whose children start hanging is regressing even when
+    /// the surviving cases still pass.
+    max_incomplete: ?usize = null,
 };
 
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
@@ -226,4 +239,23 @@ pub fn runSuite(cfg: Config) !void {
     );
     try std.testing.expect(passed >= cfg.baseline);
     if (cfg.require_no_failures) try std.testing.expectEqual(@as(usize, 0), failed);
+    if (cfg.max_failed) |cap| {
+        if (failed > cap) {
+            std.debug.print(
+                "{s}_commontest: {d} failing cases exceeds the ceiling {d} — a floor-clearing run can still regress inside the red mass\n",
+                .{ cfg.name, failed, cap },
+            );
+            return error.FailureCeilingExceeded;
+        }
+    }
+    if (cfg.max_incomplete) |cap| {
+        const inc = hung.load(.monotonic);
+        if (inc > cap) {
+            std.debug.print(
+                "{s}_commontest: {d} cases did not complete, ceiling {d}\n",
+                .{ cfg.name, inc, cap },
+            );
+            return error.IncompleteCeilingExceeded;
+        }
+    }
 }
