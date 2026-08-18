@@ -6472,7 +6472,7 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
         }
     }
     const nlr_dbg = if (runtime.envOnce("KLIO_EF_TRACE")) |efw| std.mem.eql(u8, efw, nm) else false;
-    if (try inlineTargetForBareCall(b, &callee.Path.segments[0], args, inline_call_shape)) |f| {
+    if (try inlineTargetForBareCall(b, &callee.Path.segments[0], args, ast_arg_names, inline_call_shape)) |f| {
         if (nlr_dbg) {
             const last_stmts: usize = if (args.len > 0 and args[args.len - 1] == .Lambda) args[args.len - 1].Lambda.body.stmts.len else 999;
             std.debug.print("[tbie] synchronized file={d} in_fn={s} target-found needs={} nlr={} nstmts={d}\n", .{ callee.Path.segments[0].span.file.int(), build.currentRealFn() orelse "-", bareInlineNeedsSplice(b, nm, f, args), inline_call.argLambdaHasNonlocalReturn(args), last_stmts });
@@ -7769,6 +7769,7 @@ fn inlineTargetForBareCall(
     b: *FuncBuilder,
     seg: *const ast.Ident,
     args: []const Expr,
+    arg_names: []const ?[]const u8,
     shape: CallShape,
 ) Allocator.Error!?*const ast.Function {
     const nm = seg.name;
@@ -7970,14 +7971,14 @@ fn inlineTargetForBareCall(
     // pick's parameter (a user-class head against a primitive parameter, or
     // two distinct known classes), re-pick the sibling the evidence fits.
     if (pick) |pf| {
-        if (inlineEvidenceRejects(b, pf, args)) {
+        if (inlineEvidenceRejects(b, pf, args, arg_names)) {
             var better: ?*const ast.Function = null;
             if (inline_state.candidatesForName(nm)) |cands| {
                 for (cands) |cf| {
                     if (cf == pf) continue;
                     if ((cf.receiver_type == null) != (pf.receiver_type == null)) continue;
                     if (!inlineShapeFits(cf, args, shape)) continue;
-                    if (inlineEvidenceRejects(b, cf, args)) continue;
+                    if (inlineEvidenceRejects(b, cf, args, arg_names)) continue;
                     better = cf;
                     break;
                 }
@@ -8041,16 +8042,30 @@ fn inlineTargetForBareCall(
 /// class bound to a builtin-kind parameter (`NodeKind` -> `Int`), or two
 /// distinct known class heads with no shared name. Conservative — unknown
 /// evidence or parameter kinds never reject.
-fn inlineEvidenceRejects(b: *FuncBuilder, f: *const ast.Function, args: []const Expr) bool {
+fn inlineEvidenceRejects(b: *FuncBuilder, f: *const ast.Function, args: []const Expr, arg_names: []const ?[]const u8) bool {
     const positional_n = if (args.len > 0 and switch (args[args.len - 1]) {
         .Lambda, .AnonFun => true,
         else => false,
     }) args.len - 1 else args.len;
     for (args[0..positional_n], 0..) |*a, i| {
-        if (i >= f.params.len) break;
+        // A NAMED argument fills its declared parameter, not the slot at its
+        // call-site position: comparing it against `params[i]` disproves the
+        // candidate on a parameter it never binds (`element<T>(name,
+        // isOptional = true)` judged the Boolean against the skipped
+        // `annotations: List<Annotation>`), which declined the splice and
+        // left the reified parameter unbound.
+        const pi: usize = blk: {
+            const nm = if (i < arg_names.len) arg_names[i] else null;
+            const n = nm orelse break :blk i;
+            for (f.params, 0..) |p, pj| {
+                if (std.mem.eql(u8, p.name.name, n)) break :blk pj;
+            }
+            continue;
+        };
+        if (pi >= f.params.len) break;
         const ev = argDeclTypeRef(b, a) orelse continue;
         const ehead = std.mem.trimEnd(u8, ev.name, "?");
-        const pname = f.params[i].ty.name.name;
+        const pname = f.params[pi].ty.name.name;
         const phead = std.mem.trimEnd(u8, pname, "?");
         if (std.mem.eql(u8, ehead, phead)) continue;
         // A top-type parameter accepts every argument; evidence can never
