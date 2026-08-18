@@ -760,6 +760,17 @@ pub fn trySkipGenericCallArgs(p: *const Parser) bool {
                                 break :blk t1 != null and t1.?.isAt() and
                                     t2 != null and std.meta.activeTag(t2.?) == .LBrace;
                             },
+                            // `f<A, B>` then a line break then the trailing
+                            // lambda. Kotlin lets a trailing lambda start on
+                            // the following line, so the `<`/`>` still open a
+                            // type-argument list — reading them as comparisons
+                            // makes the type list itself (`Map.Entry<K, V>`,
+                            // `out T`) unparseable.
+                            .Newline => blk: {
+                                var j = i + 1;
+                                while (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Newline) j += 1;
+                                break :blk j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .LBrace;
+                            },
                             else => false,
                         };
                     }

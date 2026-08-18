@@ -660,6 +660,14 @@ pub fn parsePostfix(p: *Parser) ?Expr {
                 // for the next `Call`.
                 if (trySkipGenericCallArgs(p)) {
                     pending_type_args = parseCallTypeArgs(p);
+                    // The trailing lambda may start on the next line
+                    // (`x.aggregate<K, V, R>\n{ … }`); consume the break so
+                    // the postfix loop reaches the `{`.
+                    if (std.meta.activeTag(support.peekKind(p).*) == .Newline) {
+                        const save = p.pos;
+                        support.skipNl(p);
+                        if (std.meta.activeTag(support.peekKind(p).*) != .LBrace) p.pos = save;
+                    }
                     continue;
                 }
                 break;

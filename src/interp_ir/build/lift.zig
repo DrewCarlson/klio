@@ -543,8 +543,12 @@ fn putAlias(ctx: *LiftCtx, cls: []const u8, simple: []const u8, mangled: []const
 /// `object_names` map then allocates one instance per name and the Vm
 /// publishes it as a global at startup.
 pub fn synthesizeClassFromObject(allocator: Allocator, o: *const ObjectDecl) Allocator.Error!Class {
+    // Inheritance delegation carries over: `object O : Iface by impl` builds
+    // the same forwarders a delegating class does. The slot array is padded to
+    // the supertype count so a declaration that delegates only some supertypes
+    // still lines up.
     const delegates = try allocator.alloc(?Expr, o.supertypes.len);
-    for (delegates) |*d| d.* = null;
+    for (delegates, 0..) |*d, i| d.* = if (i < o.supertype_delegates.len) o.supertype_delegates[i] else null;
     return .{
         .name = o.name,
         .type_params = &.{},

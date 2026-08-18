@@ -8,9 +8,37 @@
 package kotlinx.serialization.internal
 
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.ReflectiveKSerializer
 import kotlinx.serialization.SerializationException
+import kotlinx.serialization.builtins.serializer
 import kotlin.reflect.KClass
 import kotlin.reflect.KType
+
+// The builtin serializer table upstream's `Primitives.kt` reads through
+// `initBuiltins()`. klio's stdlib has no unsigned-array / Uuid surface, so
+// this covers the primitives, `Unit` and `Nothing` — the entries the
+// descriptor-name guard and `builtinSerializerOrNull` are asked about.
+internal actual fun initBuiltins(): Map<KClass<*>, KSerializer<*>> = mapOf(
+    String::class to String.serializer(),
+    Char::class to Char.serializer(),
+    CharArray::class to CharArraySerializer(),
+    Double::class to Double.serializer(),
+    DoubleArray::class to DoubleArraySerializer(),
+    Float::class to Float.serializer(),
+    FloatArray::class to FloatArraySerializer(),
+    Long::class to Long.serializer(),
+    LongArray::class to LongArraySerializer(),
+    Int::class to Int.serializer(),
+    IntArray::class to IntArraySerializer(),
+    Short::class to Short.serializer(),
+    ShortArray::class to ShortArraySerializer(),
+    Byte::class to Byte.serializer(),
+    ByteArray::class to ByteArraySerializer(),
+    Boolean::class to Boolean.serializer(),
+    BooleanArray::class to BooleanArraySerializer(),
+    Unit::class to Unit.serializer(),
+    Nothing::class to NothingSerializer()
+)
 
 internal actual fun <T> Array<T>.getChecked(index: Int): T = get(index)
 
