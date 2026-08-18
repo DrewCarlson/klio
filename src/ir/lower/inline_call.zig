@@ -951,8 +951,37 @@ fn unifyParamAgainstArg(
         if (!mentions_tp) return;
         if (try argGenericTypeRef(allocator, arg, 0)) |aty| {
             try unifyTypeParam(param_ty, aty, tp_names, subst);
+            return;
+        }
+        // The argument names a DECLARATION (`serializersModuleOf(BSerializer)`
+        // where `object BSerializer : KSerializer<B>`): the parameter's type
+        // argument is solved from the declaration's own supertype list.
+        if (argDeclSupertypeMatching(arg, param_ty.name.name)) |sup| {
+            try unifyTypeParam(param_ty, sup, tp_names, subst);
         }
     }
+}
+
+/// The supertype of the class/object an argument path names whose head equals
+/// `want` — the declared instantiation (`KSerializer<B>`) an argument of that
+/// declaration's type satisfies. Null when the argument is not a plain
+/// declaration reference or declares no matching supertype.
+fn argDeclSupertypeMatching(arg: *const Expr, want: []const u8) ?*const TypeRef {
+    const name: []const u8 = switch (arg.*) {
+        .Path => |*p| blk: {
+            if (p.segments.len == 0) break :blk "";
+            break :blk p.segments[p.segments.len - 1].name;
+        },
+        .Member => |*m| m.name.name,
+        else => "",
+    };
+    if (name.len == 0) return null;
+    const sups = inline_state.classSupertypeRefs(name) orelse return null;
+    for (sups) |*sup| {
+        if (sup.type_args.len == 0) continue;
+        if (std.mem.eql(u8, sup.name.name, want)) return sup;
+    }
+    return null;
 }
 
 /// The argument expression's generic type, when statically evident:
@@ -1313,6 +1342,14 @@ fn callSiteFileOf(e: *const Expr) ?span.FileId {
     };
 }
 
+/// `KLIO_SPLICE_TRACE=<fn>` — why a splice that was entered declined, which
+/// is otherwise indistinguishable from "never considered".
+fn spliceBail(fname: []const u8, why: []const u8) void {
+    if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, fname)) std.debug.print("[splice-why] {s}: {s}\n", .{ fname, why });
+    }
+}
+
 pub fn tryInlineCallWithTypeArgs(
     b: *FuncBuilder,
     fname: []const u8,
@@ -1400,7 +1437,10 @@ pub fn tryInlineCallWithTypeArgs(
     }
     // Materialise the body if it is a deferred image marker before reading it.
     inline_state.ensureInlineBody(f);
-    const body = if (f.body) |*body_ref| body_ref else return null;
+    const body = if (f.body) |*body_ref| body_ref else {
+        spliceBail(fname, "no-body");
+        return null;
+    };
 
     var ordered = try b.allocator.alloc(?*const Expr, f.params.len);
     defer b.allocator.free(ordered);
@@ -1482,6 +1522,7 @@ pub fn tryInlineCallWithTypeArgs(
                 slot.* = d;
                 slot_is_default[i] = true;
             } else {
+                spliceBail(fname, "unfilled-param");
                 return null;
             }
         }
@@ -1503,10 +1544,14 @@ pub fn tryInlineCallWithTypeArgs(
             if (callableRefParamFor(f, ordered, tp.name.name) != null) continue;
             unbound_reified = true;
         }
-        if (unbound_reified and !(try reifiedParamsUnusedInBody(b.allocator, f))) return null;
+        if (unbound_reified and !(try reifiedParamsUnusedInBody(b.allocator, f))) {
+            spliceBail(fname, "unbound-reified");
+            return null;
+        }
     }
 
     if (!inline_state.inlineExpandEnter()) {
+        spliceBail(fname, "expand-depth");
         return null;
     }
     errdefer inline_state.inlineExpandLeave();
