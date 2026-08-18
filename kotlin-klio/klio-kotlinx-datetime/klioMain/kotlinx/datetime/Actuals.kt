@@ -318,11 +318,19 @@ actual class LocalTime(
         if (second != other.second) return second.compareTo(other.second)
         return nanosecond.compareTo(other.nanosecond)
     }
+    // ISO-8601 with the seconds omitted when the whole sub-minute part is
+    // zero, and a fractional part padded out to a whole group of three
+    // digits (`.100`, `.000000100`) — kotlinx-datetime's own rendering.
     override fun toString(): String {
         val h = hour.toString().padStart(2, '0')
         val m = minute.toString().padStart(2, '0')
+        if (second == 0 && nanosecond == 0) return "$h:$m"
         val s = second.toString().padStart(2, '0')
-        return if (nanosecond == 0) "$h:$m:$s" else "$h:$m:$s.${nanosecond.toString().padStart(9, '0')}"
+        if (nanosecond == 0) return "$h:$m:$s"
+        val nanos = nanosecond.toString().padStart(9, '0')
+        var digits = 9
+        while (digits > 3 && nanos.substring(digits - 3, digits) == "000") digits -= 3
+        return "$h:$m:$s.${nanos.substring(0, digits)}"
     }
     override fun equals(other: Any?): Boolean {
         if (other !is LocalTime) return false
@@ -404,6 +412,7 @@ actual class LocalTime(
 fun LocalTime.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<LocalTime>): LocalTime? =
     format.parseOrNull(input)
 
+
 // `actual` for upstream `expect class LocalDateTime` (LocalDateTime.kt).
 actual class LocalDateTime(
     val date: LocalDate,
@@ -474,6 +483,7 @@ actual class LocalDateTime(
 
 fun LocalDateTime.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<LocalDateTime>): LocalDateTime? =
     format.parseOrNull(input)
+
 
 // --- TimeZone ----------------------------------------------------
 //

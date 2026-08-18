@@ -1891,7 +1891,17 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                 const module = info.module orelse module_ref.asPtr();
                 if (module.funcById(info.body_func)) |bf| {
                     const takes_receiver = bf.params.len != 0 and std.mem.eql(u8, bf.params[0].name, "this");
-                    if (!std.mem.eql(u8, bf.name, "<lambda>") and !takes_receiver) {
+                    // …unless the reference is being INVOKED as a
+                    // receiver-function: a `::localFn` value in a
+                    // `T.() -> R` slot declares exactly one parameter more
+                    // than the call supplies, and the receiver fills it
+                    // (`obj.allSubFormatsNegative()` is
+                    // `checkIfAllNegative(obj)`). Dropping the receiver
+                    // there passed the body a null argument.
+                    const receiver_fills_slot = bf.params.len == args.len + 1;
+                    if (!std.mem.eql(u8, bf.name, "<lambda>") and !takes_receiver and
+                        !receiver_fills_slot)
+                    {
                         return callValue(self, allocator, callee, args);
                     }
                     // A pass-threaded composable lambda declaring one param
