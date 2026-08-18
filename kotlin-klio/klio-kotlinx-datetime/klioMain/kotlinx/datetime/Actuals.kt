@@ -85,6 +85,26 @@ actual class LocalDate(
 ) : Comparable<LocalDate> {
     constructor(year: Int, month: Month, day: Int) : this(year, month.number, day)
 
+    // kotlinx-datetime validates at construction; the format DSL's
+    // `parseOrNull` relies on the IllegalArgumentException to report a
+    // syntactically valid but impossible date ("Apr 99, 2024") as null.
+    init {
+        require(monthNumber in 1..12) {
+            "Invalid date: month must be a number between 1 and 12, got $monthNumber"
+        }
+        require(year in -999_999..999_999) { "Invalid date: the year is out of range" }
+        require(day in 1..31) {
+            "Invalid date: day of month must be a number between 1 and 31, got $day"
+        }
+        if (day > 28 && day > daysInMonth(year, monthNumber)) {
+            if (day == 29) {
+                throw IllegalArgumentException("Invalid date 'February 29' as '$year' is not a leap year")
+            } else {
+                throw IllegalArgumentException("Invalid date '$monthNumber $day'")
+            }
+        }
+    }
+
     val month: Month get() = Month(monthNumber)
     val dayOfMonth: Int get() = day
 
@@ -208,6 +228,10 @@ fun LocalDate.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<
 // `isLeapYear` is consumed from `kotlinx.datetime.internal` (imported above)
 // rather than redeclared here, so a test importing both packages sees one
 // declaration — matching upstream.
+// The epoch-day span of `LocalDate.MIN`..`LocalDate.MAX`.
+internal const val MIN_EPOCH_DAY: Long = -365961662L
+internal const val MAX_EPOCH_DAY: Long = 364522971L
+
 private fun daysInMonth(year: Int, month: Int): Int = when (month) {
     1, 3, 5, 7, 8, 10, 12 -> 31
     4, 6, 9, 11 -> 30
@@ -217,6 +241,9 @@ private fun daysInMonth(year: Int, month: Int): Int = when (month) {
 // Inverse of LocalDate.toEpochDays: the proleptic-Gregorian date for a
 // count of days since 1970-01-01 (Howard Hinnant's civil-from-days).
 internal fun dateFromEpochDays(epochDays: Long): LocalDate {
+    require(epochDays in MIN_EPOCH_DAY..MAX_EPOCH_DAY) {
+        "Invalid date: epoch day $epochDays is outside the boundaries of LocalDate"
+    }
     val z = epochDays + 719468L
     val era = (if (z >= 0) z else z - 146096) / 146097
     val doe = z - era * 146097
@@ -307,6 +334,14 @@ actual class LocalTime(
     val second: Int = 0,
     val nanosecond: Int = 0,
 ) : Comparable<LocalTime> {
+    init {
+        require(hour in 0..23) { "Invalid time: hour must be a number between 0 and 23, got $hour" }
+        require(minute in 0..59) { "Invalid time: minute must be a number between 0 and 59, got $minute" }
+        require(second in 0..59) { "Invalid time: second must be a number between 0 and 59, got $second" }
+        require(nanosecond in 0..999_999_999) {
+            "Invalid time: nanosecond must be a number between 0 and 999999999, got $nanosecond"
+        }
+    }
     fun toSecondOfDay(): Int = (hour * 60 + minute) * 60 + second
     fun toMillisecondOfDay(): Int = toSecondOfDay() * 1_000 + nanosecond / 1_000_000
     fun toNanosecondOfDay(): Long =
