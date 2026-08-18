@@ -2305,9 +2305,20 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                 }
                 break :blk cid;
             };
+            // Binding by CLASS id with no function to bind IS a construction,
+            // even when the lowering did not classify the call as a
+            // ctor-name one: `Stamp(a, b, c, d, e)` reaches here after the
+            // overload leg declined in favour of the constructor
+            // (`ctor-decline ctor_pts=500 best=499`). Without treating it as
+            // a ctor reference, `lookupGlobalById` returns the class's
+            // published companion singleton and the call lands on
+            // `Companion.invoke` — exactly what the comment above warns
+            // about, which kotlinx-datetime's TimeZoneTest hits through its
+            // own `LocalDateTime(year, month, day)` helper.
+            const binding_ctor = is_ctor_name or (ctor_class != null and by_id_func == null);
             const by_id: ?Value = if ((ctor_class != null or by_id_func != null) and
                 !host.isShadowingCapture(name_str))
-                host.lookupGlobalById(allocator, by_id_func, ctor_class, is_ctor_name)
+                host.lookupGlobalById(allocator, by_id_func, ctor_class, binding_ctor)
             else
                 null;
             // A bounded candidate set is authoritative. Once lowering has

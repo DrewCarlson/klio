@@ -682,6 +682,11 @@ pub const FuncBuilder = struct {
     /// must dispatch with the enclosing `this` as the implicit
     /// receiver.
     receiver_lambda_params: StringSet,
+    /// Which of `receiver_lambda_params` an INLINE SPLICE added for the
+    /// spliced fn's own parameters. A caller binding of the same simple
+    /// name keeps its own mark, so only these may be suspended while the
+    /// caller's lambda body is spliced.
+    splice_rlp_marks: StringSet,
     receiver_lambda_recv_heads: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     receiver_lambda_arity: std.StringHashMap(usize),
     context_fn_params: std.StringHashMap(ContextFnShape),
@@ -926,6 +931,7 @@ pub const FuncBuilder = struct {
             .nonfn_locals = StringSet.init(allocator),
             .local_fn_overloads = std.StringHashMap(std.ArrayList(LocalFnOverload)).init(allocator),
             .receiver_lambda_params = StringSet.init(allocator),
+            .splice_rlp_marks = StringSet.init(allocator),
             .receiver_lambda_arity = std.StringHashMap(usize).init(allocator),
             .context_fn_params = std.StringHashMap(ContextFnShape).init(allocator),
             .generic_typed_params = StringSet.init(allocator),
@@ -1041,6 +1047,7 @@ pub const FuncBuilder = struct {
         self.local_ext_fns.deinit();
         self.nonfn_locals.deinit();
         self.receiver_lambda_params.deinit();
+        self.splice_rlp_marks.deinit();
         self.splice_hidden_bands.deinit(a);
         self.receiver_lambda_recv_heads.deinit(self.allocator);
         self.receiver_lambda_arity.deinit();
@@ -2313,6 +2320,16 @@ pub const FuncBuilder = struct {
     }
     pub fn unmarkReceiverLambdaParam(self: *FuncBuilder, name: []const u8) void {
         _ = self.receiver_lambda_params.remove(name);
+    }
+    /// Record that the current inline splice owns this receiver-lambda mark.
+    pub fn noteSpliceRlpMark(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.splice_rlp_marks.put(name, {});
+    }
+    pub fn clearSpliceRlpMark(self: *FuncBuilder, name: []const u8) void {
+        _ = self.splice_rlp_marks.remove(name);
+    }
+    pub fn isSpliceRlpMark(self: *const FuncBuilder, name: []const u8) bool {
+        return self.splice_rlp_marks.contains(name);
     }
     /// The local-extension-function names this builder knows. The caller
     /// owns the returned set.

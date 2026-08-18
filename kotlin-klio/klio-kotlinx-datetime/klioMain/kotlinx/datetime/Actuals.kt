@@ -85,6 +85,28 @@ actual class LocalDate(
 ) : Comparable<LocalDate> {
     constructor(year: Int, month: Month, day: Int) : this(year, month.number, day)
 
+    // kotlinx-datetime validates at construction; the format DSL's
+    // `parseOrNull` relies on the IllegalArgumentException to report a
+    // syntactically valid but impossible date ("Apr 99, 2024") as null.
+    // Spelled with explicit throws rather than `require { }`: every
+    // LocalDate construction runs this, and the lambda-carrying form costs
+    // twice as much per call.
+    init {
+        if (monthNumber < 1 || monthNumber > 12)
+            throw IllegalArgumentException("Invalid date: month must be a number between 1 and 12, got $monthNumber")
+        if (year < YEAR_MIN || year > YEAR_MAX)
+            throw IllegalArgumentException("Invalid date: the year is out of range")
+        if (day < 1 || day > 31)
+            throw IllegalArgumentException("Invalid date: day of month must be a number between 1 and 31, got $day")
+        if (day > 28 && day > daysInMonth(year, monthNumber)) {
+            if (day == 29) {
+                throw IllegalArgumentException("Invalid date 'February 29' as '$year' is not a leap year")
+            } else {
+                throw IllegalArgumentException("Invalid date '$monthNumber $day'")
+            }
+        }
+    }
+
     val month: Month get() = Month(monthNumber)
     val dayOfMonth: Int get() = day
 
@@ -145,8 +167,8 @@ actual class LocalDate(
     operator fun rangeUntil(that: LocalDate): LocalDateRange = LocalDateRange.fromRangeUntil(this, that)
 
     companion object {
-        val MIN: LocalDate = LocalDate(-999_999, 1, 1)
-        val MAX: LocalDate = LocalDate(999_999, 12, 31)
+        val MIN: LocalDate = LocalDate(YEAR_MIN, 1, 1)
+        val MAX: LocalDate = LocalDate(YEAR_MAX, 12, 31)
 
         fun orNull(year: Int, monthNumber: Int, day: Int): LocalDate? =
             if (year in -999_999..999_999 && monthNumber in 1..12 &&
@@ -208,6 +230,13 @@ fun LocalDate.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<
 // `isLeapYear` is consumed from `kotlinx.datetime.internal` (imported above)
 // rather than redeclared here, so a test importing both packages sees one
 // declaration — matching upstream.
+// The epoch-day span of `LocalDate.MIN`..`LocalDate.MAX`.
+// `LocalDate(YEAR_MIN, 1, 1).toEpochDays()` and
+// `LocalDate(YEAR_MAX, 12, 31).toEpochDays()`, spelled as constants so the
+// bound check costs nothing per call.
+internal const val MIN_EPOCH_DAY: Long = -365243219162L
+internal const val MAX_EPOCH_DAY: Long = 365241780471L
+
 private fun daysInMonth(year: Int, month: Int): Int = when (month) {
     1, 3, 5, 7, 8, 10, 12 -> 31
     4, 6, 9, 11 -> 30
@@ -217,6 +246,8 @@ private fun daysInMonth(year: Int, month: Int): Int = when (month) {
 // Inverse of LocalDate.toEpochDays: the proleptic-Gregorian date for a
 // count of days since 1970-01-01 (Howard Hinnant's civil-from-days).
 internal fun dateFromEpochDays(epochDays: Long): LocalDate {
+    if (epochDays < MIN_EPOCH_DAY || epochDays > MAX_EPOCH_DAY)
+        throw IllegalArgumentException("Invalid date: epoch day $epochDays is outside the boundaries of LocalDate")
     val z = epochDays + 719468L
     val era = (if (z >= 0) z else z - 146096) / 146097
     val doe = z - era * 146097
@@ -233,8 +264,31 @@ internal fun dateFromEpochDays(epochDays: Long): LocalDate {
 // Add a (possibly negative) number of calendar months, clamping the day
 // of month to the resulting month's length (2024-01-31 + 1 month =
 // 2024-02-29).
+// The threeten-bp-shaped helpers upstream's own native actual declares.
+// They are `internal`, but the commonKotlin test set exercises them.
+internal fun LocalDate.plusMonths(monthsToAdd: Long): LocalDate =
+    localDatePlusMonths(this, monthsToAdd)
+
+internal fun LocalDate.plusDays(daysToAdd: Long): LocalDate =
+    if (daysToAdd == 0L) this else dateFromEpochDays(toEpochDays() + daysToAdd)
+
+internal fun LocalDateTime.toEpochSecond(offset: UtcOffset): Long =
+    date.toEpochDays() * 86400L + time.toSecondOfDay().toLong() - offset.totalSeconds.toLong()
+
+internal fun LocalDateTime.plusSeconds(seconds: Int): LocalDateTime {
+    if (seconds == 0) return this
+    val secondsPerDay = 86_400L
+    val nanosPerDay = 86_400_000_000_000L
+    val currentNanoOfDay = time.toNanosecondOfDay()
+    val totalNanos = (seconds % secondsPerDay) * 1_000_000_000L + currentNanoOfDay
+    val totalDays = seconds / secondsPerDay + totalNanos.floorDiv(nanosPerDay)
+    val newNanoOfDay = totalNanos.mod(nanosPerDay)
+    val newTime = if (newNanoOfDay == currentNanoOfDay) time else LocalTime.fromNanosecondOfDay(newNanoOfDay)
+    return LocalDateTime(date.plusDays(totalDays), newTime)
+}
+
 internal fun localDatePlusMonths(date: LocalDate, monthsToAdd: Long): LocalDate {
-    val total = date.year.toLong() * 12 + (date.monthNumber - 1) + monthsToAdd
+    val total = addOrArithmeticFail(date.year.toLong() * 12 + (date.monthNumber - 1), monthsToAdd)
     var y = total / 12
     var m0 = total % 12
     if (m0 < 0) {
@@ -265,14 +319,47 @@ internal fun localDateMonthsBetween(start: LocalDate, end: LocalDate): Long {
 // and `until` helpers declared in upstream LocalDate.kt. Pure
 // proleptic-Gregorian math over toEpochDays / dateFromEpochDays, so they
 // need no host calls and stay timezone-independent.
+// Date ARITHMETIC reports an out-of-range or overflowing result as a
+// DateTimeArithmeticException; only CONSTRUCTION reports an impossible date as
+// an IllegalArgumentException. The intermediate steps overflow in Long well
+// before the date bounds are reached, so each multiply and add is checked.
+internal fun mulOrArithmeticFail(a: Long, b: Long): Long {
+    if (a == 0L || b == 0L) return 0L
+    val r = a * b
+    if (r / b != a) throw DateTimeArithmeticException("Arithmetic overflow")
+    return r
+}
+
+internal fun addOrArithmeticFail(a: Long, b: Long): Long {
+    val r = a + b
+    // Overflow iff both operands share a sign that the result does not.
+    if (((a xor r) and (b xor r)) < 0L) throw DateTimeArithmeticException("Arithmetic overflow")
+    return r
+}
+
+private fun dateOrArithmeticFail(epochDays: Long): LocalDate = try {
+    dateFromEpochDays(epochDays)
+} catch (e: IllegalArgumentException) {
+    throw DateTimeArithmeticException("The result is out of the boundaries of LocalDate")
+}
+
+private fun monthsOrArithmeticFail(date: LocalDate, months: Long): LocalDate = try {
+    localDatePlusMonths(date, months)
+} catch (e: IllegalArgumentException) {
+    throw DateTimeArithmeticException("The result is out of the boundaries of LocalDate")
+}
+
 actual operator fun LocalDate.plus(period: DatePeriod): LocalDate {
-    val shifted = localDatePlusMonths(this, period.years.toLong() * 12 + period.months)
-    return dateFromEpochDays(shifted.toEpochDays() + period.days)
+    val months = addOrArithmeticFail(mulOrArithmeticFail(period.years.toLong(), 12L), period.months.toLong())
+    val shifted = monthsOrArithmeticFail(this, months)
+    return dateOrArithmeticFail(addOrArithmeticFail(shifted.toEpochDays(), period.days.toLong()))
 }
 
 actual fun LocalDate.plus(value: Long, unit: DateTimeUnit.DateBased): LocalDate = when (unit) {
-    is DateTimeUnit.DayBased -> dateFromEpochDays(toEpochDays() + value * unit.days)
-    is DateTimeUnit.MonthBased -> localDatePlusMonths(this, value * unit.months)
+    is DateTimeUnit.DayBased ->
+        dateOrArithmeticFail(addOrArithmeticFail(toEpochDays(), mulOrArithmeticFail(value, unit.days.toLong())))
+    is DateTimeUnit.MonthBased ->
+        monthsOrArithmeticFail(this, mulOrArithmeticFail(value, unit.months.toLong()))
     else -> throw IllegalArgumentException("Unsupported DateTimeUnit: $unit")
 }
 
@@ -307,6 +394,16 @@ actual class LocalTime(
     val second: Int = 0,
     val nanosecond: Int = 0,
 ) : Comparable<LocalTime> {
+    init {
+        if (hour < 0 || hour > 23)
+            throw IllegalArgumentException("Invalid time: hour must be a number between 0 and 23, got $hour")
+        if (minute < 0 || minute > 59)
+            throw IllegalArgumentException("Invalid time: minute must be a number between 0 and 59, got $minute")
+        if (second < 0 || second > 59)
+            throw IllegalArgumentException("Invalid time: second must be a number between 0 and 59, got $second")
+        if (nanosecond < 0 || nanosecond > 999_999_999)
+            throw IllegalArgumentException("Invalid time: nanosecond must be a number between 0 and 999999999, got $nanosecond")
+    }
     fun toSecondOfDay(): Int = (hour * 60 + minute) * 60 + second
     fun toMillisecondOfDay(): Int = toSecondOfDay() * 1_000 + nanosecond / 1_000_000
     fun toNanosecondOfDay(): Long =
@@ -318,11 +415,19 @@ actual class LocalTime(
         if (second != other.second) return second.compareTo(other.second)
         return nanosecond.compareTo(other.nanosecond)
     }
+    // ISO-8601 with the seconds omitted when the whole sub-minute part is
+    // zero, and a fractional part padded out to a whole group of three
+    // digits (`.100`, `.000000100`) — kotlinx-datetime's own rendering.
     override fun toString(): String {
         val h = hour.toString().padStart(2, '0')
         val m = minute.toString().padStart(2, '0')
+        if (second == 0 && nanosecond == 0) return "$h:$m"
         val s = second.toString().padStart(2, '0')
-        return if (nanosecond == 0) "$h:$m:$s" else "$h:$m:$s.${nanosecond.toString().padStart(9, '0')}"
+        if (nanosecond == 0) return "$h:$m:$s"
+        val nanos = nanosecond.toString().padStart(9, '0')
+        var digits = 9
+        while (digits > 3 && nanos.substring(digits - 3, digits) == "000") digits -= 3
+        return "$h:$m:$s.${nanos.substring(0, digits)}"
     }
     override fun equals(other: Any?): Boolean {
         if (other !is LocalTime) return false
@@ -404,6 +509,7 @@ actual class LocalTime(
 fun LocalTime.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<LocalTime>): LocalTime? =
     format.parseOrNull(input)
 
+
 // `actual` for upstream `expect class LocalDateTime` (LocalDateTime.kt).
 actual class LocalDateTime(
     val date: LocalDate,
@@ -475,6 +581,7 @@ actual class LocalDateTime(
 fun LocalDateTime.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<LocalDateTime>): LocalDateTime? =
     format.parseOrNull(input)
 
+
 // --- TimeZone ----------------------------------------------------
 //
 // klio-supplied (upstream's TimeZone.kt expect class pulls in
@@ -496,10 +603,28 @@ open class TimeZone internal constructor(val id: String, internal val offsetSeco
     companion object {
         val UTC: FixedOffsetTimeZone = FixedOffsetTimeZone(UtcOffset.ZERO, "UTC")
         fun currentSystemDefault(): TimeZone = TimeZone(__kxdt_currentSystemTimeZoneId())
+
+        // The zone id keeps its written form for a PREFIXED fixed offset
+        // (`UTC+01:00`, `GMT+01:00`, `UT+01:00`), so two zones with the same
+        // offset stay distinguishable, exactly as kotlinx-datetime does.
         fun of(zoneId: String): TimeZone {
-            parseFixedOffsetSeconds(zoneId)?.let { off ->
-                if (zoneId == "UTC" || zoneId == "GMT" || zoneId == "UT") return FixedOffsetTimeZone(UtcOffset(off), zoneId)
-                return FixedOffsetTimeZone(UtcOffset(off))
+            if (zoneId == "UTC") return UTC
+            if (zoneId == "Z" || zoneId == "z") return UtcOffset.ZERO.asTimeZone()
+            if (zoneId == "SYSTEM") return currentSystemDefault()
+            if (zoneId.length == 1) throw IllegalTimeZoneException("Invalid zone ID: $zoneId")
+            if (zoneId == "GMT" || zoneId == "UT") return FixedOffsetTimeZone(UtcOffset.ZERO, zoneId)
+            if (zoneId.startsWith("+") || zoneId.startsWith("-")) {
+                val off = parseOffsetSecondsOrNull(zoneId)
+                    ?: throw IllegalTimeZoneException("Invalid zone ID: $zoneId")
+                return UtcOffset(off).asTimeZone()
+            }
+            for (prefix in listOf("UTC", "GMT", "UT")) {
+                if (zoneId.length > prefix.length && zoneId.startsWith(prefix) &&
+                    (zoneId[prefix.length] == '+' || zoneId[prefix.length] == '-')) {
+                    val off = parseOffsetSecondsOrNull(zoneId.substring(prefix.length))
+                        ?: throw IllegalTimeZoneException("Invalid zone ID: $zoneId")
+                    return UtcOffset(off).asTimeZone(prefix)
+                }
             }
             if (!__kxdt_validateTimeZone(zoneId)) {
                 throw IllegalTimeZoneException("Unknown time-zone id: $zoneId")
@@ -560,17 +685,51 @@ internal fun parseFixedOffsetSeconds(id: String): Int? {
     for (prefix in listOf("UTC", "GMT", "UT")) {
         if (s.startsWith(prefix)) { s = s.substring(prefix.length); break }
     }
-    if (s.isEmpty()) return null
-    val sign = when (s[0]) { '+' -> 1; '-' -> -1; else -> return null }
-    val body = s.substring(1)
+    return parseOffsetSecondsOrNull(s)
+}
+
+// The ISO-8601 offset SPELLING `UtcOffset.parse` accepts: `+HH`, `+HH:MM` or
+// `+HH:MM:SS`, each component exactly two digits. The separator-less forms a
+// time-zone ID may carry (`+0100`) are not offsets on their own.
+internal fun parseIsoOffsetSecondsOrNull(body: String): Int? {
+    if (body.length != 3 && body.length != 6 && body.length != 9) return null
+    if (body.length > 3 && body[3] != ':') return null
+    if (body.length > 6 && body[6] != ':') return null
+    return parseOffsetSecondsOrNull(body)
+}
+
+// ISO-8601 UTC offset body: a mandatory sign, then `HH`, `HH:MM`/`HHMM`, or
+// `HH:MM:SS`/`HHMMSS` — each component exactly two digits, minutes and
+// seconds under 60, and the whole offset within +/-18:00.
+internal fun parseOffsetSecondsOrNull(body: String): Int? {
     if (body.isEmpty()) return null
-    val parts = body.split(":")
-    if (parts.size > 3) return null
-    val h = parts[0].toIntOrNull() ?: return null
-    val m = if (parts.size > 1) (parts[1].toIntOrNull() ?: return null) else 0
-    val sec = if (parts.size > 2) (parts[2].toIntOrNull() ?: return null) else 0
-    if (m !in 0..59 || sec !in 0..59) return null
-    return sign * (h * 3600 + m * 60 + sec)
+    val sign = when (body[0]) { '+' -> 1; '-' -> -1; else -> return null }
+    val rest = body.substring(1)
+    fun twoDigits(x: String): Int? =
+        if (x.length == 2 && x.all { it in '0'..'9' }) x.toInt() else null
+    var h = 0; var m = 0; var sec = 0
+    if (rest.contains(":")) {
+        val parts = rest.split(":")
+        if (parts.size < 2 || parts.size > 3) return null
+        h = twoDigits(parts[0]) ?: return null
+        m = twoDigits(parts[1]) ?: return null
+        if (parts.size == 3) sec = twoDigits(parts[2]) ?: return null
+    } else {
+        when (rest.length) {
+            2 -> h = twoDigits(rest) ?: return null
+            4 -> { h = twoDigits(rest.substring(0, 2)) ?: return null; m = twoDigits(rest.substring(2)) ?: return null }
+            6 -> {
+                h = twoDigits(rest.substring(0, 2)) ?: return null
+                m = twoDigits(rest.substring(2, 4)) ?: return null
+                sec = twoDigits(rest.substring(4)) ?: return null
+            }
+            else -> return null
+        }
+    }
+    if (m > 59 || sec > 59) return null
+    val total = sign * (h * 3600 + m * 60 + sec)
+    if (total < -18 * 3600 || total > 18 * 3600) return null
+    return total
 }
 
 // Split epoch seconds into (floor days, seconds-of-day) with a non-negative
@@ -584,13 +743,21 @@ private fun epochSecondsToLocalDateTime(sec: Long, nanos: Int): LocalDateTime {
     )
 }
 
-fun Instant.toLocalDateTime(timeZone: TimeZone): LocalDateTime {
+// An Instant outside LocalDateTime's range surfaces as
+// `DateTimeArithmeticException`, not the raw range failure. Upstream's
+// commonKotlin conversion wraps it exactly this way; klio supplies its own
+// actual over the chrono binding and has to keep the same contract, or
+// `assertFailsWith<DateTimeArithmeticException> { Instant.MAX.toLocalDateTime(tz) }`
+// sees an IllegalArgumentException instead.
+fun Instant.toLocalDateTime(timeZone: TimeZone): LocalDateTime = try {
     timeZone.offsetSeconds?.let { off ->
         return epochSecondsToLocalDateTime(epochSeconds + off, nanosecondsOfSecond)
     }
     val parts = __kxdt_instantToLocalParts(epochSeconds, nanosecondsOfSecond, timeZone.id)
-    return LocalDateTime(parts[0].toInt(), parts[1].toInt(), parts[2].toInt(),
+    LocalDateTime(parts[0].toInt(), parts[1].toInt(), parts[2].toInt(),
         parts[3].toInt(), parts[4].toInt(), parts[5].toInt(), parts[6].toInt())
+} catch (e: IllegalArgumentException) {
+    throw DateTimeArithmeticException("Instant $this is not representable as LocalDateTime", e)
 }
 
 fun LocalDateTime.toInstant(timeZone: TimeZone): Instant {
@@ -602,8 +769,11 @@ fun LocalDateTime.toInstant(timeZone: TimeZone): Instant {
     return Instant.fromEpochSeconds(r[0], r[1])
 }
 
-fun Instant.toLocalDateTime(offset: UtcOffset): LocalDateTime =
+fun Instant.toLocalDateTime(offset: UtcOffset): LocalDateTime = try {
     epochSecondsToLocalDateTime(epochSeconds + offset.totalSeconds, nanosecondsOfSecond)
+} catch (e: IllegalArgumentException) {
+    throw DateTimeArithmeticException("Instant $this is not representable as LocalDateTime", e)
+}
 
 fun LocalDateTime.toInstant(offset: UtcOffset): Instant {
     val localSec = date.toEpochDays() * 86400L + hour.toLong() * 3600L +
@@ -667,7 +837,10 @@ class UtcOffset internal constructor(val totalSeconds: Int) {
         fun parse(input: CharSequence): UtcOffset {
             val s = input.toString()
             if (s == "Z" || s == "z") return ZERO
-            val secs = parseFixedOffsetSeconds(s)
+            // The ISO-8601 offset grammar only: a time-zone ID prefix
+            // (`UTC`, `GMT`, `UT`) and the separator-less compact forms
+            // (`+0100`, `+180000`) are `TimeZone.of`'s, not this one's.
+            val secs = parseIsoOffsetSecondsOrNull(s)
                 ?: throw DateTimeFormatException("Invalid ISO-8601 UTC offset: $input")
             if (secs < -18 * 3600 || secs > 18 * 3600)
                 throw DateTimeFormatException("UTC offset out of range: $input")
@@ -730,6 +903,10 @@ private fun utcOffsetHms(hours: Int, minutes: Int, seconds: Int): Int {
 
 /** The fixed-offset time zone with this offset. */
 fun UtcOffset.asTimeZone(): FixedOffsetTimeZone = FixedOffsetTimeZone(this)
+
+/** The fixed-offset zone written with an explicit `UTC`/`GMT`/`UT` prefix. */
+internal fun UtcOffset.asTimeZone(prefix: String): FixedOffsetTimeZone =
+    FixedOffsetTimeZone(this, prefix + toString())
 
 /** The wall-clock offset of [timeZone] from UTC at this instant. */
 fun Instant.offsetIn(timeZone: TimeZone): UtcOffset {
