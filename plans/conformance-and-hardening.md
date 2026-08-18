@@ -303,7 +303,7 @@ evidence-backed; none is a hypothetical.
       58 -> 60. One probe of mine initially read rc=0 for an uncaught
       exception; that was my own pipeline taking `tail`'s exit code, not
       klio's — the behavior was correct throughout.
-- [ ] H4. Dispatch-ladder density. `host_call_member.zig` is 13.6k lines
+- [x] H4. Dispatch-ladder density. `host_call_member.zig` is 13.6k lines
       after extraction and measures 50-67 lines per `pub` extractable,
       meaning nearly every decl touches shared state. It is both the
       largest bug surface and a measured perf tax (A2 found late-resolving
@@ -312,6 +312,23 @@ evidence-backed; none is a hypothetical.
       splitting exercise — the goal is to reduce the number of tiers a
       single call can traverse, measured by the `member_ladder` counter
       and the rig.
+      CLOSED 2026-08-18 BY MEASUREMENT — the premise was already satisfied
+      and the honest answer is that no further work here is justified.
+      `KLIO_DISPATCH_STATS` on the aacbench rig: 40.5M dispatches, of which
+      `member_ladder` is **40,318 = 0.10%**. The A3 round's relaxed-key
+      cacheability fix took it 160k -> 40k, so the ladder is no longer a
+      measurable perf tax; the profile's top entries are now memset 7.6%,
+      runFrameExec 7.4%, eqlBytes 3.8% — none of them the ladder. Rig at
+      3345 ms/rep.
+      The structural half is bounded rather than open: the S2 landing took
+      the file 16057 -> 13628 and MEASURED its extraction ceiling at ~50-67
+      lines per `pub`, with every route-shaped candidate rejected because
+      module state crosses the boundary (the positional-call route alone
+      would drag 12 state variables; the cache tier cannot move at all
+      because `tl_perm_cache`/`tl_resolve_cache` are read from outside it).
+      Cutting further is deliberate churn, not cleanup.
+      What would reopen this: a profile where a dispatch route, not the
+      frame loop or the allocator, tops the list.
 - [ ] H5. Memory model. Per-program cells are minted permanent and never
       swept, with a boundary sweep added last week (program-perm
       generation, `drainRemembered`, boundary trims, base-key grouping).
