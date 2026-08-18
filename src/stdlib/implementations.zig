@@ -60,6 +60,17 @@ fn integerBinaryApplicable(args: []const Value) bool {
     return args.len == 1 and args[0].asI64() != null;
 }
 
+/// The integral range builders (`a until b`, `downTo`, `step`) share their
+/// names with library extensions on non-integral types
+/// (`LocalDate.until(other, unit)`, `LocalDateRange.step(DatePeriod)`).
+/// A call whose single argument is not an integral (or Char) endpoint is
+/// not the builtin's, so the probe must decline and let the extension bind.
+fn rangeBuilderApplicable(args: []const Value) bool {
+    if (args.len != 1) return false;
+    if (args[0] == .Char) return true;
+    return args[0].asI64() != null;
+}
+
 const TABLE = [_]Entry{
     // kotlin.concurrent.atomics — composite read-modify-write under the cell
     // lock (load/store stay as the class's atomic single field access).
@@ -1057,9 +1068,9 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.collections.Map.Entry.key", .f = sequence.map_entry_key },
     .{ .fqn = "kotlin.collections.Map.Entry.toString", .f = sequence.map_entry_to_string },
     .{ .fqn = "kotlin.collections.Map.Entry.value", .f = sequence.map_entry_value },
-    .{ .fqn = "kotlin.ranges.downTo", .f = ranges.ranges_down_to },
-    .{ .fqn = "kotlin.ranges.step", .f = ranges.ranges_step },
-    .{ .fqn = "kotlin.ranges.until", .f = ranges.ranges_until },
+    .{ .fqn = "kotlin.ranges.downTo", .f = ranges.ranges_down_to, .applicable = rangeBuilderApplicable },
+    .{ .fqn = "kotlin.ranges.step", .f = ranges.ranges_step, .applicable = rangeBuilderApplicable },
+    .{ .fqn = "kotlin.ranges.until", .f = ranges.ranges_until, .applicable = rangeBuilderApplicable },
     .{ .fqn = "kotlin.ranges.IntRange.first", .f = ranges.range_first },
     .{ .fqn = "kotlin.ranges.IntRange.last", .f = ranges.range_last },
     .{ .fqn = "kotlin.ranges.IntRange.start", .f = ranges.range_start },
