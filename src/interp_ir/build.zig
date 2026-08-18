@@ -2425,6 +2425,7 @@ fn buildModuleWithOverrides(
     {
         ir.lower.resetInlineMemberOwners();
         ir.lower.resetMemberPropAsts();
+        ir.lower.resetClassSupertypeRefs();
         ir.lower.resetMemberExtPropRecv();
         // Same lifetime rule as the two above: the registered expression-body
         // member ASTs point into the PREVIOUS build's arena.
@@ -2433,6 +2434,8 @@ fn buildModuleWithOverrides(
         while (fcit.next()) |e| {
             registerInlineMemberOwners(e.value_ptr.get().members, e.value_ptr.get().name.name);
             registerMemberPropAsts(a, e.value_ptr.get().members, e.value_ptr.get().name.name);
+            ir.lower.registerClassSupertypeRefs(e.value_ptr.get().name.name, e.value_ptr.get().supertypes);
+            registerClassSupertypes(e.value_ptr.get().members);
         }
         // Top-level objects (and any class the map above missed) from this
         // build's decls — user files plus re-parsed pack sources.
@@ -2443,6 +2446,7 @@ fn buildModuleWithOverrides(
                 else => {},
             }
         }
+        registerClassSupertypes(decls);
     }
     {
         var inline_fns = std.StringHashMap(std.ArrayList(FF(ast.Function))).init(a);
@@ -4324,6 +4328,25 @@ fn registerMemberPropAsts(a: Allocator, members: []const Decl, owner: []const u8
             },
             .Class => |*c| registerMemberPropAsts(a, c.members, c.name.name),
             .Object => |*o| registerMemberPropAsts(a, o.members, o.name.name),
+            else => {},
+        }
+    }
+}
+
+/// Register the declared supertypes of every class/object in `decls`,
+/// recursing into nested types, so reified-type-argument inference can read
+/// an argument declaration's own type arguments.
+fn registerClassSupertypes(members: []const Decl) void {
+    for (members) |*m| {
+        switch (m.*) {
+            .Class => |*c| {
+                ir.lower.registerClassSupertypeRefs(c.name.name, c.supertypes);
+                registerClassSupertypes(c.members);
+            },
+            .Object => |*o| {
+                ir.lower.registerClassSupertypeRefs(o.name.name, o.supertypes);
+                registerClassSupertypes(o.members);
+            },
             else => {},
         }
     }

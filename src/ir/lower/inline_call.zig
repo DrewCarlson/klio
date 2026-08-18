@@ -951,8 +951,37 @@ fn unifyParamAgainstArg(
         if (!mentions_tp) return;
         if (try argGenericTypeRef(allocator, arg, 0)) |aty| {
             try unifyTypeParam(param_ty, aty, tp_names, subst);
+            return;
+        }
+        // The argument names a DECLARATION (`serializersModuleOf(BSerializer)`
+        // where `object BSerializer : KSerializer<B>`): the parameter's type
+        // argument is solved from the declaration's own supertype list.
+        if (argDeclSupertypeMatching(arg, param_ty.name.name)) |sup| {
+            try unifyTypeParam(param_ty, sup, tp_names, subst);
         }
     }
+}
+
+/// The supertype of the class/object an argument path names whose head equals
+/// `want` — the declared instantiation (`KSerializer<B>`) an argument of that
+/// declaration's type satisfies. Null when the argument is not a plain
+/// declaration reference or declares no matching supertype.
+fn argDeclSupertypeMatching(arg: *const Expr, want: []const u8) ?*const TypeRef {
+    const name: []const u8 = switch (arg.*) {
+        .Path => |*p| blk: {
+            if (p.segments.len == 0) break :blk "";
+            break :blk p.segments[p.segments.len - 1].name;
+        },
+        .Member => |*m| m.name.name,
+        else => "",
+    };
+    if (name.len == 0) return null;
+    const sups = inline_state.classSupertypeRefs(name) orelse return null;
+    for (sups) |*sup| {
+        if (sup.type_args.len == 0) continue;
+        if (std.mem.eql(u8, sup.name.name, want)) return sup;
+    }
+    return null;
 }
 
 /// The argument expression's generic type, when statically evident:

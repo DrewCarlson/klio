@@ -2550,14 +2550,24 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
                             {
                                 var items: std.ArrayList(Value) = .empty;
                                 for (cd.get().enum_entries) |entry| {
-                                    // The List owns one reference per element;
-                                    // `enum_entries` keeps its own. Retain so
-                                    // the List teardown does not free the shared
-                                    // singleton out from under the ClassDef.
+                                    // The container owns one reference per
+                                    // element; `enum_entries` keeps its own.
+                                    // Retain so teardown does not free the
+                                    // shared singleton out from under the
+                                    // ClassDef.
                                     entry.value.retain();
                                     items.append(allocator, entry.value) catch {};
                                 }
+                                const want_array = std.mem.eql(u8, f.name, "enumValues");
                                 cd.deinit();
+                                // `enumValues<T>()` is declared to return
+                                // `Array<T>`; handing back a List makes every
+                                // array operation on the result (`copyOf`,
+                                // `toList`) miss its receiver. `enumEntries`
+                                // is an `EnumEntries<T>` — a List.
+                                if (want_array) {
+                                    return .{ .ok = runtime.ArrayData.fromBoxedList(try ValueList.init(allocator, items)) };
+                                }
                                 return .{ .ok = try Value.newList(allocator, .{
                                     .items = try ValueList.init(allocator, items),
                                     .mutable = false,

@@ -407,6 +407,34 @@ pub fn memberExtPropRecv(owner: []const u8, name: []const u8) ?[]const u8 {
     return m.get(key);
 }
 
+/// Declared supertype references (with their type arguments) by class/object
+/// simple name. Reified-type-argument inference reads them so an argument
+/// naming a declaration (`serializersModuleOf(BSerializer)` where
+/// `object BSerializer : KSerializer<B>`) solves the parameter's type
+/// argument from the declaration's own supertype list.
+threadlocal var class_supertype_refs: ?std.StringHashMap([]const ast.TypeRef) = null;
+
+pub fn resetClassSupertypeRefs() void {
+    if (class_supertype_refs) |*m| m.deinit();
+    class_supertype_refs = std.StringHashMap([]const ast.TypeRef).init(std.heap.page_allocator);
+}
+
+/// Record `name`'s declared supertypes. First registration wins, matching the
+/// other AST registries.
+pub fn registerClassSupertypeRefs(name: []const u8, sups: []const ast.TypeRef) void {
+    if (sups.len == 0) return;
+    if (class_supertype_refs == null) resetClassSupertypeRefs();
+    const gop = class_supertype_refs.?.getOrPut(name) catch return;
+    if (gop.found_existing) return;
+    gop.value_ptr.* = sups;
+}
+
+/// The declared supertypes of `name`, or null.
+pub fn classSupertypeRefs(name: []const u8) ?[]const ast.TypeRef {
+    const m = class_supertype_refs orelse return null;
+    return m.get(name);
+}
+
 /// Record that inline member fn `f` is declared directly on class `owner`.
 pub fn registerInlineMemberOwner(f: *const ast.Function, owner: []const u8) void {
     if (inline_member_owner == null) resetInlineMemberOwners();
