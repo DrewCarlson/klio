@@ -2499,7 +2499,30 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
                 false,
             ) catch null) orelse break :sub_ret;
             const substituted = ir.Module.substituteBoundType(a2, ret.*, solved.bindings) catch break :sub_ret;
-            if (tyMentionsBareTp(substituted)) break :sub_ret;
+            // With every one of the callee's OWN type parameters solved the
+            // substitution is complete, and a residual bare head belongs to
+            // the CALLER's scope — `List<Box<T>>.asReversed()` yields
+            // `List<Box<T>>`, as instantiated as this call site can be.
+            // Keeping the raw `List<T>` record there types a loop variable as
+            // the callee's erased parameter, which then refutes extensions on
+            // the real element type.
+            var all_solved = true;
+            if (b.module.registry.func_type_params.get(agreed_fid.?)) |tps| {
+                for (tps.items) |tp| {
+                    var found = false;
+                    for (solved.bindings) |bd| {
+                        if (std.mem.eql(u8, bd.name, tp)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        all_solved = false;
+                        break;
+                    }
+                }
+            }
+            if (!all_solved and tyMentionsBareTp(substituted)) break :sub_ret;
             const out2 = try substituted.clone(b.allocator);
             ret.deinit(b.allocator);
             ret.* = out2;

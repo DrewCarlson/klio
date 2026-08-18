@@ -477,6 +477,15 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
     } else null;
     if (body_block) |body| {
         const self_cell = try localFnSelfCell(b, f, &body);
+        // A recursive local EXTENSION binds its own name before the body
+        // lowers, so `(this - 1).fact()` inside it resolves to the in-scope
+        // closure (which takes the receiver as its leading parameter) instead
+        // of falling through to a runtime member lookup on `Int`.
+        if (self_cell != null and f.receiver_type != null) {
+            const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name.name, "this")) 1 else 0;
+            try b.markLocalFn(f.name.name);
+            try b.markLocalExtFn(f.name.name, @intCast(@min(f.params.len - recv_off, 127)));
+        }
         // Same-named sibling declarations are OVERLOADS, not rebindings.
         // Register this declaration's signature and bind its mangled
         // sibling name to a dedicated cell BEFORE the body lowers, so a
@@ -843,7 +852,16 @@ fn localFnSelfCell(
 ) Allocator.Error!?Reg {
     var self_refs = StringSet.init(b.allocator);
     defer self_refs.deinit();
-    for (body.stmts) |*s| try collectPathIdentsStmt(s, &self_refs);
+    // A local EXTENSION function refers to itself in member-call position
+    // (`fun Int.fact(): Int = ... (this - 1).fact()`), which the bare-identifier
+    // scan never reaches — collect member-call names into the same set so the
+    // recursion cell gets built.
+    var call_names = StringSet.init(b.allocator);
+    defer call_names.deinit();
+    for (body.stmts) |*s| try ast_scan.collectIdentsAndCallNamesStmt(s, &self_refs, &call_names);
+    if (f.receiver_type != null and call_names.contains(f.name.name)) {
+        try self_refs.put(f.name.name, {});
+    }
     // Reuse an existing mutable home only when it belongs to a previous
     // LOCAL FN of the name (a redeclaration/recursion cell). A same-named
     // local PROPERTY keeps its own cell: `var seen = ...; fun seen(x) { seen

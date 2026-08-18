@@ -1209,6 +1209,11 @@ fn receiverViolatesTypeParamBound(self: *VmHost, fid: FuncId, param_ty: *const T
         if (std.mem.indexOfScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
         bn = std.mem.trimEnd(u8, std.mem.trim(u8, bn, " "), "?");
         if (std.mem.eql(u8, bn, "Any")) continue;
+        // A bound that is itself one of the function's type parameters
+        // (`fun <C, R> C.ifEmpty(...): R where C : Collection<*>, C : R`)
+        // names no class: it constrains the inferred `R`, not the receiver,
+        // and cannot be decided against a runtime value.
+        if (typeParamOf(self, fid, bn)) continue;
         // Decide the bound for any receiver whose full type is known: an
         // Instance carries its class chain, and a concrete builtin's
         // `isRuntimeType` supertype set is authoritative (a `String` receiver

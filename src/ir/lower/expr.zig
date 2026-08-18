@@ -12027,7 +12027,8 @@ fn lowerPathCall(
     // in a param thunk); `own_members` already includes own + inherited
     // companion members, so a plain member name is filtered by `hasOwnMember`.
     if (b.isParamThunk() and b.resolve("this") == null and
-        b.hasOwnMember(name0) and !classWithCompanion(b, name0))
+        b.hasOwnMember(name0) and b.ownMemberApplicable(name0, args.len) and
+        !classWithCompanion(b, name0))
     {
         if (b.ownerClass()) |owner| {
             const cls = b.allocReg();
@@ -18012,6 +18013,31 @@ fn localOverloadReceiverCouldApply(
         {
             return true;
         }
+        // The same reasoning one level down: a type ARGUMENT that names no
+        // classifier and no in-scope parameter is an uninstantiated class
+        // parameter (`this.followedBy` inside `ParserStructure<in Output>`
+        // types as `ParserStructure<Output>`), which the invariance check
+        // then reads as a nominal mismatch against `ParserStructure<T>`.
+        // A REAL caller parameter is bound-known here and keeps refuting.
+        for (actual.args) |arg| {
+            var ah = std.mem.trimEnd(u8, arg.name, "?");
+            if (std.mem.startsWith(u8, ah, "in#")) ah = ah[3..];
+            if (std.mem.startsWith(u8, ah, "out#")) ah = ah[4..];
+            ah = typeHead(ah);
+            if (ah.len == 0 or std.mem.eql(u8, ah, "*")) continue;
+            if (isPrimitiveTypeName(ah)) continue;
+            var arg_bound_known = false;
+            for (actual_bounds) |tb| {
+                if (std.mem.eql(u8, tb.param, ah)) arg_bound_known = true;
+            }
+            if (arg_bound_known) continue;
+            if (b.module.classId(ah) != null or
+                b.module.registry.class_super_names.get(ah) != null) continue;
+            if (std.mem.eql(u8, ah, "Any") or std.mem.eql(u8, ah, "Unit") or
+                std.mem.eql(u8, ah, "Nothing") or std.mem.eql(u8, ah, "String") or
+                std.mem.eql(u8, ah, "CharSequence")) continue;
+            return true;
+        }
     }
     if (overload.receiver_has_type_params) {
         const r = try b.module.staticGenericReceiverCouldApply(
@@ -18032,7 +18058,7 @@ fn localOverloadReceiverCouldApply(
         actual_bounds,
     );
     if (runtime.envOnce("KLIO_ADM_TRACE") != null)
-        std.debug.print("[lorca-s] actual={s}({d}) n={} declared={s}({d}) n={} bounds={d} -> {}\n", .{ actual.name, actual.args.len, actual.nullable, declared.name, declared.args.len, declared.nullable, actual_bounds.len, r });
+        std.debug.print("[lorca-s] actual={s}({d}:{s}) n={} declared={s}({d}:{s}) n={} bounds={d} -> {}\n", .{ actual.name, actual.args.len, if (actual.args.len != 0) actual.args[0].name else "-", actual.nullable, declared.name, declared.args.len, if (declared.args.len != 0) declared.args[0].name else "-", declared.nullable, actual_bounds.len, r });
     return r;
 }
 

@@ -21,6 +21,7 @@
 package kotlinx.datetime
 
 import kotlinx.datetime.internal.isLeapYear
+import kotlinx.datetime.format.*
 import kotlin.time.Instant
 
 // --- internal native helpers (bound natively by the klio host) ----
@@ -182,8 +183,21 @@ actual class LocalDate(
 
         fun fromEpochDays(epochDays: Long): LocalDate = dateFromEpochDays(epochDays)
         fun fromEpochDays(epochDays: Int): LocalDate = dateFromEpochDays(epochDays.toLong())
+
+        fun parse(input: CharSequence, format: DateTimeFormat<LocalDate>): LocalDate = format.parse(input)
+
+        fun Format(block: DateTimeFormatBuilder.WithDate.() -> Unit): DateTimeFormat<LocalDate> =
+            LocalDateFormat.build(block)
+    }
+
+    object Formats {
+        val ISO: DateTimeFormat<LocalDate> get() = ISO_DATE
+        val ISO_BASIC: DateTimeFormat<LocalDate> get() = ISO_DATE_BASIC
     }
 }
+
+fun LocalDate.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<LocalDate>): LocalDate? =
+    format.parseOrNull(input)
 
 // `isLeapYear` is consumed from `kotlinx.datetime.internal` (imported above)
 // rather than redeclared here, so a test importing both packages sees one
@@ -369,8 +383,20 @@ actual class LocalTime(
                 throw DateTimeFormatException("Invalid ISO-8601 time: $input")
             return LocalTime(hour, minute, second, nanos)
         }
+
+        fun parse(input: CharSequence, format: DateTimeFormat<LocalTime>): LocalTime = format.parse(input)
+
+        fun Format(builder: DateTimeFormatBuilder.WithTime.() -> Unit): DateTimeFormat<LocalTime> =
+            LocalTimeFormat.build(builder)
+    }
+
+    object Formats {
+        val ISO: DateTimeFormat<LocalTime> get() = ISO_TIME
     }
 }
+
+fun LocalTime.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<LocalTime>): LocalTime? =
+    format.parseOrNull(input)
 
 // `actual` for upstream `expect class LocalDateTime` (LocalDateTime.kt).
 actual class LocalDateTime(
@@ -428,8 +454,20 @@ actual class LocalDateTime(
             if (t < 0) throw DateTimeFormatException("Invalid ISO-8601 date-time: $input")
             return LocalDateTime(LocalDate.parse(s.substring(0, t)), LocalTime.parse(s.substring(t + 1)))
         }
+
+        fun parse(input: CharSequence, format: DateTimeFormat<LocalDateTime>): LocalDateTime = format.parse(input)
+
+        fun Format(builder: DateTimeFormatBuilder.WithDateTime.() -> Unit): DateTimeFormat<LocalDateTime> =
+            LocalDateTimeFormat.build(builder)
+    }
+
+    object Formats {
+        val ISO: DateTimeFormat<LocalDateTime> get() = ISO_DATETIME
     }
 }
+
+fun LocalDateTime.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<LocalDateTime>): LocalDateTime? =
+    format.parseOrNull(input)
 
 // --- TimeZone ----------------------------------------------------
 //
