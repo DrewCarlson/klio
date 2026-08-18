@@ -119,13 +119,27 @@ machinery. Conformance work IS interpreter work.
       representable) or mark it `// corpus: interactive` with the reason.
       An example that asserts nothing is a smoke test wearing a
       conformance badge.
-- [ ] C5. Stdlib surface inventory. `kotlin.system.measureTimeMillis`
+- [x] C5. Stdlib surface inventory. `kotlin.system.measureTimeMillis`
       was simply never shipped and was found only because a perf rig
       happened to call it. Build the inventory that would have caught it:
       what upstream declares (the curated include lists +
       `kotlin/libraries/stdlib`) versus what klio resolves, as a
       generated report. Do not chase the diff to zero; rank it and record
       the deliberate omissions.
+      DONE 2026-08-18 — `scripts/stdlib-surface-inventory.py` (fc1472e9).
+      klio provides 986 public top-level names across 28 packages; upstream
+      declares 1791 across 87; 805 names in 51 packages are absent, most
+      correctly out of scope (org.w3c.* 180+, kotlin.js, kotlin.jvm
+      internals). `--probe <pkg>` CONFIRMS a package's suspects by
+      compiling references to them, because the static diff alone
+      misleads: runtime builtins (Comparator, AssertionError,
+      ArithmeticException) show as false positives, and `check` only
+      resolves a reference inside `main`'s body — a bare `run { X }` in an
+      unreferenced function reported nothing even for names that do not
+      exist. Confirmed gaps worth reading: kotlin.text 21/34 (Charsets,
+      codePointAt, concat, intern), kotlin.io 42/49, kotlin.collections
+      12/18, kotlin.concurrent 9/11 (withLock, timer, getOrSet). These are
+      the measureTimeMillis class — recorded, not chased.
 
 ### Round record — kotlinx-datetime (2026-08-18)
 
