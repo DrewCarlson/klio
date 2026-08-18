@@ -329,13 +329,31 @@ evidence-backed; none is a hypothetical.
       Cutting further is deliberate churn, not cleanup.
       What would reopen this: a profile where a dispatch route, not the
       frame loop or the allocator, tops the list.
-- [ ] H5. Memory model. Per-program cells are minted permanent and never
+- [x] H5. Memory model. Per-program cells are minted permanent and never
       swept, with a boundary sweep added last week (program-perm
       generation, `drainRemembered`, boundary trims, base-key grouping).
       That is a mitigation, not a model. Decide whether the in-process
       drivers should get a real per-program heap; the acceptance number
       is the 6.5GB itest cap, which e2e and differential now clear but
       without much headroom.
+      DECIDED 2026-08-18 — no per-program heap, and here is the number the
+      decision rests on. MaxRSS from the build runner, solo:
+        e2e           4G against the 6.5G cap  (~38% headroom)
+        differential  6G against the 6.5G cap  (~8% headroom)
+      e2e is comfortable. differential runs at ~92% of the cap because it
+      is inherently the worst case: the whole corpus times two load modes
+      in one process, with a base cache of 2 (one base per mode of the
+      current mask — it cannot drop to 1 the way e2e's did).
+      A real per-program heap is a large architectural change and the
+      evidence does not justify it: both suites pass, and the mitigation
+      landed last campaign (program-perm generation, boundary drains,
+      malloc_trim, forced slab reclaim, base-key grouping) is what took
+      differential from over-cap to green for the first time on record.
+      TRIP-WIRE, recorded so this is a decision rather than an omission:
+      differential's ~8% margin is the thing to watch. If it trips, the
+      cheap lever is to shard it by load mode into two processes — the
+      same fix that solved e2e's RSS problem — and only if THAT proves
+      insufficient does a per-program heap become the motivated change.
 
 ## Track P — Carried perf roads (measurement-gated)
 
