@@ -1,0 +1,5 @@
+a=7
+timeout
+[1, 2]
+[10, 20]
+permits=1 ran=2
