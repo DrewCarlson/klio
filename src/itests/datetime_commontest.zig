@@ -16,6 +16,12 @@ test "kotlinx.datetime commonTest pass count holds at or above the ratchet basel
             .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
             .{ .dir = "kotlin-klio/klio-kotlinx-datetime", .artifact = "target/packs/kotlinx.datetime.klio-pack" },
         },
-        .baseline = 205,
+        // Measured solo: 212 passed / 291 failed / 1 incomplete. The floor is a minimum pass
+        // count; the ceilings bound the red mass so a fixed case
+        // traded for a broken one cannot pass unnoticed. Lower the
+        // ceilings as fixes land, never raise them.
+        .baseline = 210,
+        .max_failed = 300,
+        .max_incomplete = 5,
     });
 }

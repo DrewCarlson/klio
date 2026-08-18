@@ -14,6 +14,12 @@ test "kotlinx.atomicfu commonTest pass count holds at or above the ratchet basel
             .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
             .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
         },
+        // Measured solo: 63 passed / 4 failed / 0 incomplete. The floor is a minimum pass
+        // count; the ceilings bound the red mass so a fixed case
+        // traded for a broken one cannot pass unnoticed. Lower the
+        // ceilings as fixes land, never raise them.
         .baseline = 63,
+        .max_failed = 8,
+        .max_incomplete = 2,
     });
 }
