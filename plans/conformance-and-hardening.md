@@ -38,7 +38,8 @@ Green where measured:
   (green for the first time on record); parity_corpus_pinned 251/251;
   threaded litmus 58 (conformance folded in).
 - Ratchets: compose plugin 1375 (floor 1370), ktor 448 pass / 2
-  closed-by-record (floor 440), io 1140, datetime 205, atomicfu 63,
+  closed-by-record (floor 440), io 1140, datetime 457 (floor 450,
+  raised this round from 210), atomicfu 63,
   serialization 9.
 - Perf: the aacbench rig fell ~10.2% last week (3649 -> 3275 ms/rep);
   compose_foundation_lazy warm 42.6s -> 1.069s (40x); ReleaseFast now at
@@ -106,6 +107,79 @@ The blind spot:
       `kotlin/libraries/stdlib`) versus what klio resolves, as a
       generated report. Do not chase the diff to zero; rank it and record
       the deliberate omissions.
+
+### Round record — kotlinx-datetime (2026-08-18)
+
+Measured, solo, on `zig-out/bin/klio-harness`:
+`itest-datetime_commontest` **212 passed / 291 failed / 1 incomplete ->
+457 passed / 62 failed / 0 incomplete** across the same 56 files. Ratchet
+raised 210 -> 450, `max_failed` lowered 300 -> 70, `max_incomplete` 5 -> 1.
+
+The census said the suite was a MIX, not one root, and it was: eleven
+distinct roots, nine of them in the interpreter and shared by every
+program. Ranked by the failures each closed:
+
+1. **Format DSL absent from the pack** (~155). The `klio.toml` include list
+   skipped `format/**` + `internal/format/**` on the premise that klio has
+   no `kotlin.time`; that premise is stale (kotlin.time ships). Consuming
+   them, plus the `Format`/`Formats`/`parse(input, format)` members on the
+   klio-supplied value types, is what the whole format half of the suite
+   needed.
+2. **A bound reference used as a receiver-function** took the supplied
+   `this` as its DISPATCH receiver instead of its first ARGUMENT
+   (`obj.condition()` is `predicate.test(obj)`).
+3. **`::localFn` in a `T.() -> R` slot** was dispatched as a plain value
+   call, so the receiver never reached the parameter it fills.
+4. **An inline splice suspended receiver-lambda marks by NAME**, so a
+   caller parameter that happened to share the inline function's parameter
+   name lost its receiver (`fun mk(block: C.() -> Unit) = C().apply { block() }`).
+5. **A lambda argument bound a member whose slot is the owner's type
+   variable** even though a same-arity extension declared that slot as a
+   function type — Kotlin ranks members over extensions only among
+   APPLICABLE candidates.
+6. **The integral range builders** (`until`/`downTo`/`step`) are probed by
+   package FQN before the extension fallback, so `date.until(other, unit)`
+   and `range.step(period)` were captured by the builtin. They now decline a
+   non-integral argument, and a property GETTER binding declines an
+   argument-bearing call.
+7. **A companion member lost to a same-named global class**: the
+   nested-class probe on a class receiver fell back to the global
+   simple-name index before companion forwarding, so
+   `ParseResult.Error(pos) { … }` constructed `kotlin.Error`.
+8. **A local extension function could not call itself** — the
+   self-reference scan never looked in member-call position, the name was
+   not bound before the body lowered, and a cell-valued callee did not
+   deref in `CallValueWithThis`.
+9. **A fully solved generic call discarded its substituted return** when
+   the CALLER's own type parameter remained in it, so
+   `List<Box<T>>.asReversed()` typed as the callee's erased `List<T>`.
+10. **An extension type-parameter bound that is itself a type parameter**
+    (`C : R` on `ifEmpty`) refuted every receiver.
+11. **A bare CALL in a constructor-delegation thunk routed a PROPERTY name
+    to the owner class** (`: this(totalMonths(y, m), d)` next to a
+    `val totalMonths`).
+
+Harness: `commontest_support.zig` gains `whole_source_set`, which compiles
+the whole test source set into each child and runs only the target file's
+tests (`klio test --only-file`). Upstream commonTest is one compilation
+unit, so a helper declared top-level in one `@Test`-bearing file
+(`checkComponents`) is visible from another; the one-target-per-child model
+could not see it. Opted into per suite; datetime is the first user.
+`scripts/commontest-census.py` reads the same flag.
+
+Recorded, not fixed:
+
+- The pure-Kotlin IANA tz database (`Tzfile`/`TimeZoneRules`/`PosixTzString`)
+  is not ported — klio resolves zones through a chrono-backed host binding
+  instead. `TimeZoneRulesTest` / `ThreeTenBpTimeZoneTest` test that port
+  directly and cannot pass without it (4 cases).
+- `LocalDateTest.fromEpochDays` walks ~1.4M epoch days constructing a
+  LocalDate per step: ~3 minutes interpreted. That is a compute floor, not
+  a hang; the suite's per-file budget was raised to let it finish instead
+  of silently dropping the file's results.
+- `println(listOf(userObject))` renders element identity rather than the
+  element's `toString` (pre-existing; confirmed against the pre-round
+  binary). Not on the datetime path.
 
 ## Track H — Hardening
 
