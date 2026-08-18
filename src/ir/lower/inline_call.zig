@@ -1342,6 +1342,14 @@ fn callSiteFileOf(e: *const Expr) ?span.FileId {
     };
 }
 
+/// `KLIO_SPLICE_TRACE=<fn>` — why a splice that was entered declined, which
+/// is otherwise indistinguishable from "never considered".
+fn spliceBail(fname: []const u8, why: []const u8) void {
+    if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, fname)) std.debug.print("[splice-why] {s}: {s}\n", .{ fname, why });
+    }
+}
+
 pub fn tryInlineCallWithTypeArgs(
     b: *FuncBuilder,
     fname: []const u8,
@@ -1429,7 +1437,10 @@ pub fn tryInlineCallWithTypeArgs(
     }
     // Materialise the body if it is a deferred image marker before reading it.
     inline_state.ensureInlineBody(f);
-    const body = if (f.body) |*body_ref| body_ref else return null;
+    const body = if (f.body) |*body_ref| body_ref else {
+        spliceBail(fname, "no-body");
+        return null;
+    };
 
     var ordered = try b.allocator.alloc(?*const Expr, f.params.len);
     defer b.allocator.free(ordered);
@@ -1511,6 +1522,7 @@ pub fn tryInlineCallWithTypeArgs(
                 slot.* = d;
                 slot_is_default[i] = true;
             } else {
+                spliceBail(fname, "unfilled-param");
                 return null;
             }
         }
@@ -1532,10 +1544,14 @@ pub fn tryInlineCallWithTypeArgs(
             if (callableRefParamFor(f, ordered, tp.name.name) != null) continue;
             unbound_reified = true;
         }
-        if (unbound_reified and !(try reifiedParamsUnusedInBody(b.allocator, f))) return null;
+        if (unbound_reified and !(try reifiedParamsUnusedInBody(b.allocator, f))) {
+            spliceBail(fname, "unbound-reified");
+            return null;
+        }
     }
 
     if (!inline_state.inlineExpandEnter()) {
+        spliceBail(fname, "expand-depth");
         return null;
     }
     errdefer inline_state.inlineExpandLeave();

@@ -5794,7 +5794,21 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
             // A reified MEMBER-inline fn is invisible to the top-level
             // stub index: a qualified call (`CC(e, a).pfw<E> { … }`) must
-            // still splice, or the reified parameter dies at runtime.
+            // still splice, or the reified parameter dies at runtime. The
+            // same holds for a reified EXTENSION that the single-pick above
+            // missed because a same-named top-level overload outranked it
+            // (`SerializersModule.serializer<T>()` next to the top-level
+            // `serializer<T>()`). Only an EXPLICITLY type-argumented call
+            // qualifies on that route: without `<…>` the widened scan would
+            // pull same-named non-reified overloads (`Int.serializer()`) into
+            // a splice their call shape does not select.
+            if (ast_type_args.len != 0) {
+                if (inline_state.candidatesForName(mname)) |cands| {
+                    for (cands) |cf| {
+                        if (anyReified(cf.type_params) and cf.receiver_type != null) break :blk true;
+                    }
+                }
+            }
             if (inline_state.candidatesForName(mname)) |cands| {
                 for (cands) |cf| {
                     if (anyReified(cf.type_params) and cf.receiver_type == null and
