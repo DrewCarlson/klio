@@ -836,7 +836,27 @@ fn lowerAndRegisterMethods(
             .name = try std.fmt.allocPrint(allocator, "$init$block${d}", .{idx}),
             .span = blk.span,
         };
-        const thunk = host_instances.synthThunk(thunk_name, .{ .Block = blk.* }, null, false);
+        var thunk = host_instances.synthThunk(thunk_name, .{ .Block = blk.* }, null, false);
+        // Declare the primary-constructor params, exactly as the
+        // `$super$arg$<i>` thunks do: an `init` block may read a constructor
+        // PARAMETER that is not a property, and a 0-arg thunk left that name
+        // to fall through to a field read on `this`.
+        {
+            const tparams = try allocator.alloc(ast.Param, class.primary_params.len);
+            for (class.primary_params, 0..) |*pp, pi| {
+                tparams[pi] = .{
+                    .name = pp.name,
+                    .ty = pp.ty,
+                    .default = null,
+                    .is_vararg = false,
+                    .is_crossinline = false,
+                    .is_noinline = false,
+                    .annotations = &.{},
+                    .span = pp.name.span,
+                };
+            }
+            thunk.params = tparams;
+        }
         const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
         const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
         const caps = try allocator.dupe(NameValue, capture_pairs);
