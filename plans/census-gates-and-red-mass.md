@@ -331,8 +331,31 @@ Failures tolerated by the ceilings, worst ratio first:
 
       `rawSourceSample` now gets PAST registration and fails one layer
       deeper, at B20.
-- [ ] B20. **A constructor parameter of a class nested in a local class is
-      not bound in its `init` block.** `private inner class RC4Key(key:
+- [x] B20. **A constructor parameter of a class nested in a local class is
+      not bound in its `init` block.** FIXED — the init thunks now declare the
+      primary params (as the `$super$arg$` thunks already did) and the
+      constructor args are threaded to the call. io 2 -> 1.
+- [ ] B22. **io's LAST failure: a local extension function shadows a
+      same-named member overload it cannot answer.** `unsafeSamples`
+      declares a LOCAL `fun Buffer.writeULEB128(data: UIntArray)` whose body
+      calls `writeULEB128(data.size.toUInt())` — the class's member extension
+      `writeULEB128(value: UInt)`. klio binds the local to ITSELF, so the
+      UInt lands in the UIntArray parameter and it recurses until the eval
+      depth blows. Repro: `scratchpad/localoverload.kt`, where the same shape
+      surfaces one step earlier as `Vm::get_field size on kotlin.Int`.
+
+      The spot is `prefer_member` in `lower/expr.zig`, which is disabled
+      whenever `isLocalFn`/`isLocalExtFn` holds — unconditionally, without
+      asking whether the local is APPLICABLE to this call. Arity cannot
+      discriminate here (both take one argument), so the fix needs the
+      argument's static type against the local's declared parameter type.
+
+      NOT attempted: `prefer_member` governs bare-call preference program
+      wide, and `localFnOverloads` deliberately only selects when a name is
+      declared twice as a LOCAL fn — the member-extension sibling is invisible
+      to it. Changing that rule for one test carries more regression risk than
+      it is worth without a full sweep behind it. Do it with the corpus and
+      both heavy suites ready to run. `private inner class RC4Key(key:
       String)` reads `key` — a plain parameter, not a property — from an
       `init` block, and klio treats it as a field:
       `Vm::get_field key on RC4Key`. Repro:
