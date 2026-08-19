@@ -136,6 +136,57 @@ fn passedLineCount(stdout: []const u8) usize {
     return n;
 }
 
+/// Small atomic spin lock. Zig 0.16's blocking `std.Io.Mutex` is parameterised
+/// on an `Io` handle, which the worker pool does not carry, so this guards the
+/// shared name list the same way the runtime guards its cell locks.
+const SpinLock = struct {
+    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn lock(self: *SpinLock) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.state.store(0, .release);
+    }
+};
+
+/// Names of failing tests, collected across workers. A bare count is not
+/// actionable; the name distinguishes a real regression from one known
+/// unstable test flipping between runs.
+const FailedNames = struct {
+    mu: SpinLock = .{},
+    a: std.mem.Allocator,
+    items: std.ArrayList([]const u8) = .empty,
+
+    fn addFrom(self: *FailedNames, text: []const u8) void {
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            const at = std.mem.indexOf(u8, trimmed, " FAILED") orelse continue;
+            const name = std.mem.trim(u8, trimmed[0..at], " \t");
+            if (name.len == 0) continue;
+            self.mu.lock();
+            defer self.mu.unlock();
+            const owned = self.a.dupe(u8, name) catch return;
+            self.items.append(self.a, owned) catch {};
+        }
+    }
+
+    fn report(self: *FailedNames) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        std.mem.sort([]const u8, self.items.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        for (self.items.items) |n| std.debug.print("androidx_commontest failing: {s}\n", .{n});
+    }
+};
+
 /// Count per-test `FAILED` lines, the mirror of `passedLineCount`. A floor on
 /// passes cannot see a regression *inside* the red mass: a change that turns
 /// one failure into a pass while breaking a different test leaves the pass
@@ -214,6 +265,7 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
     var next = std.atomic.Value(usize).init(0);
     var total_passed = std.atomic.Value(usize).init(0);
     var total_failed = std.atomic.Value(usize).init(0);
+    var failed_names = FailedNames{ .a = a };
     var hung = std.atomic.Value(usize).init(0);
     const Pool = struct {
         fn worker(
@@ -222,6 +274,7 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
             pnext: *std.atomic.Value(usize),
             ppassed: *std.atomic.Value(usize),
             pfailed: *std.atomic.Value(usize),
+            pnames: *FailedNames,
             phung: *std.atomic.Value(usize),
         ) void {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -236,6 +289,7 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
                 };
                 _ = ppassed.fetchAdd(passedLineCount(r.stdout), .monotonic);
                 _ = pfailed.fetchAdd(failedLineCount(r.stdout), .monotonic);
+                pnames.addFrom(r.stdout);
                 if (std.mem.indexOf(u8, r.stdout, " passed,") == null) _ = phung.fetchAdd(1, .monotonic);
             }
         }
@@ -243,12 +297,13 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
     var threads: std.ArrayList(std.Thread) = .empty;
     for (0..workerCount()) |_| {
         try threads.append(a, try std.Thread.spawn(.{}, Pool.worker, .{
-            @as([]const []const []const u8, jobs.items), &env, &next, &total_passed, &total_failed, &hung,
+            @as([]const []const []const u8, jobs.items), &env, &next, &total_passed, &total_failed, &failed_names, &hung,
         }));
     }
     for (threads.items) |t| t.join();
 
     const failed = total_failed.load(.monotonic);
+    failed_names.report();
     std.debug.print(
         "androidx_commontest: {d} passed, {d} failed across {d} files, {d} did not complete (baseline {d}, max_failed {d})\n",
         .{ total_passed.load(.monotonic), failed, targets.items.len, hung.load(.monotonic), BASELINE, MAX_FAILED },

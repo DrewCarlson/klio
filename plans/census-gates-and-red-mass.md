@@ -25,10 +25,19 @@ solo run.
       cannot produce a summary is counted `build-blocked`, not failed.)
 - [x] A2. `compose_plugin` — count `FAILED` lines, mirror of
       `passedLineCount`, with the same streamed-stderr fallback the pass
-      counter uses for a class killed mid-run. Measured solo: 1375 passed,
-      **15 failed**, 0 did not complete. Ceiling seeded at 15. Deliberately no
+      counter uses for a class killed mid-run. Deliberately no
       did-not-complete ceiling: DNC here is throughput-bound and varies by
       ~40 between runs, so a DNC gate would be a flake rather than a signal.
+
+      Two solo runs disagree: **1375 passed / 15 failed**, then **1374 / 16**,
+      with the total constant at 1390. One test flips. That is a real defect,
+      not ceiling noise — and it means a ceiling of 15 would fail the gate
+      roughly half the time. Rather than widen the number to cover it, both
+      this suite and androidx now *print the names* of failing tests: a bare
+      count cannot distinguish a regression from a known-unstable test
+      flipping, which is the same "not actionable" argument the suite already
+      makes for naming its did-not-complete classes. Identify the unstable
+      test, then decide whether the fix is to the test or to the interpreter.
 - [x] A3. `androidx_collection` — count `FAILED` lines. **Its ratchet had
       never run.** The sparse-checkout set in
       `scripts/init-androidx-collection-submodule.sh` pulled `commonMain`,

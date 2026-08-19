@@ -243,6 +243,63 @@ fn streamedPassedCount(stderr: []const u8) usize {
     return n;
 }
 
+/// Small atomic spin lock. Zig 0.16's blocking `std.Io.Mutex` is parameterised
+/// on an `Io` handle, which the worker pool does not carry, so this guards the
+/// shared name list the same way the runtime guards its cell locks.
+const SpinLock = struct {
+    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn lock(self: *SpinLock) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.state.store(0, .release);
+    }
+};
+
+/// Names of failing tests, collected across workers. "16 failed" is not
+/// actionable — the name is what tells you whether a run drifted because of a
+/// real regression or because one known-unstable test flipped.
+const FailedNames = struct {
+    mu: SpinLock = .{},
+    a: std.mem.Allocator,
+    items: std.ArrayList([]const u8) = .empty,
+
+    /// Matches both shapes the child emits: the end-of-run summary line
+    /// `Class.name FAILED`, and the streamed line `[test] Class.name FAILED
+    /// 12ms` that carries a duration after the marker.
+    fn addFrom(self: *FailedNames, text: []const u8, marker: []const u8) void {
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            const at = std.mem.indexOf(u8, trimmed, marker) orelse continue;
+            var name = std.mem.trim(u8, trimmed[0..at], " \t");
+            if (std.mem.startsWith(u8, name, "[test]")) {
+                name = std.mem.trim(u8, name["[test]".len..], " \t");
+            }
+            if (name.len == 0) continue;
+            self.mu.lock();
+            defer self.mu.unlock();
+            const owned = self.a.dupe(u8, name) catch return;
+            self.items.append(self.a, owned) catch {};
+        }
+    }
+
+    fn report(self: *FailedNames, comptime prefix: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        std.mem.sort([]const u8, self.items.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        for (self.items.items) |n| std.debug.print(prefix ++ " failing: {s}\n", .{n});
+    }
+};
+
 /// Mirrors of the pass counters for failing tests. A pass-count floor alone
 /// cannot see a regression inside the red mass; bounding failures gates the
 /// other direction.
@@ -340,6 +397,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     var next = std.atomic.Value(usize).init(0);
     var total_passed = std.atomic.Value(usize).init(0);
     var total_failed = std.atomic.Value(usize).init(0);
+    var failed_names = FailedNames{ .a = a };
     var hung = std.atomic.Value(usize).init(0);
     const Pool = struct {
         fn worker(
@@ -349,6 +407,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             pnext: *std.atomic.Value(usize),
             ppassed: *std.atomic.Value(usize),
             pfailed: *std.atomic.Value(usize),
+            pnames: *FailedNames,
             phung: *std.atomic.Value(usize),
         ) void {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -379,6 +438,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                 const n_passed = if (summary_count != 0) summary_count else streamedPassedCount(r.stderr);
                 _ = ppassed.fetchAdd(n_passed, .monotonic);
                 const summary_failed = failedLineCount(r.stdout);
+                if (summary_count != 0) pnames.addFrom(r.stdout, " FAILED") else pnames.addFrom(r.stderr, " FAILED");
                 _ = pfailed.fetchAdd(
                     if (summary_count != 0) summary_failed else streamedFailedCount(r.stderr),
                     .monotonic,
@@ -399,6 +459,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             &next,
             &total_passed,
             &total_failed,
+            &failed_names,
             &hung,
         }));
     }
@@ -410,6 +471,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     );
     try std.testing.expect(total_passed.load(.monotonic) >= BASELINE);
     const failed = total_failed.load(.monotonic);
+    failed_names.report("compose_plugin_commontest");
     if (failed > MAX_FAILED) {
         std.debug.print(
             "compose_plugin_commontest: {d} failed exceeds the ceiling {d}\n",
