@@ -66,14 +66,14 @@ Failures tolerated by the ceilings, worst ratio first:
 
 | suite | passes | failures | conforming |
 |---|---|---|---|
-| serialization | 60 | 78 | 43% |
+| serialization | 57 | 81 | 41% |
 | datetime | 450 | 70 | 87% |
 | coroutines | 1040 | 150 | 87% |
-| io | 1150 | 45 | 96% |
+| io | 1182 | 9 | 99% |
 | compose_plugin | 1375 | 15 | 99% |
 | androidx_collection | 1309 | 15 | 99% |
-| atomicfu | 63 | 8 | 89% |
-| ktor | 440 | 6 | 99% |
+| atomicfu | 67 | 0 | 100% |
+| ktor | 448 | 2 | 99.6% (both upstream skew) |
 | stdlib | 2301 | 0 | 100% |
 
 - [ ] B1. **serialization descriptor fidelity.** klio has no serialization
@@ -254,6 +254,45 @@ Failures tolerated by the ceilings, worst ratio first:
       Snapshot classes no longer completing, against 1345 at 10s. The real fix
       is the dispatch path, which is its own campaign.
 - [ ] B4. coroutines (150) and datetime (70) — the largest absolute masses.
+
+## Suites at zero
+
+`stdlib`, `androidx_collection`, `atomicfu`.
+
+- [x] B13. **atomicfu 4 -> 0.** All four were harness artefacts: `C.kt` used
+      `D`, `GetArrayElementTest` used `AtomicArrayClass`,
+      `SetArrayElementTest` used `IntBox`, each declared in a sibling file
+      carrying its own `@Test`s. `.whole_source_set = true` (the mechanism
+      datetime already used) fixed all four. Floor 63 -> 67, ceiling 8 -> 0.
+- [x] B14. **io 34 -> 9.** Two steps. First, klio supplied the two `expect`s
+      kotlinx-io's own tests declare (`tempFileName`,
+      `String.asUtf8ToByteArray`) — 21 failures, none of them interpreter
+      gaps. `asUtf8ToByteArray` must route to kotlinx-io's own
+      `commonAsUtf8ToByteArray()`, NOT the stdlib's `encodeToByteArray()`:
+      the stdlib substitutes U+FFFD and these tests assert byte-for-byte on
+      deliberately malformed input. Second, an extension namesake no longer
+      diverts a bare spread call away from the enclosing member (B15).
+- [x] B15. **Extension namesake diverting a bare spread call.** `Utf8Test`
+      declares both `assertCodePointDecoded(String, vararg Int)` and
+      `Buffer.assertCodePointDecoded(Int, String, Int)`; the latter made the
+      former's own `assertEncoded(hex, *codePoints)` look like a global, so
+      the spread path skipped its member branch and fell through to a
+      first-class value read (`Vm::get_field ... on Utf8Test`). The guard now
+      asks for a NON-EXTENSION bare-call candidate, so a genuine top-level
+      namesake (`maxOf(a, *rest)`, the case the original guard protected)
+      still wins. Spread-forwarding alone and the name clash alone both
+      resolve correctly — only the combination failed.
+- [ ] B16. **io's last 9.** Seven are lone-surrogate cases in `Utf8Test`
+      (`danglingHighSurrogate`, `lowSurrogateWithoutHighSurrogate`,
+      `highSurrogateFollowedByNonSurrogate`, `doubleLowSurrogate`,
+      `doubleHighSurrogate`), all failing as
+      `IndexOutOfBoundsException: index N out of bounds (length N)` — the
+      decoder yields MORE code points than the test expects. NOT a
+      representation limit: klio round-trips a lone surrogate correctly
+      (`"\ud800".length == 1`, `code == d800`, and pairs split into
+      `d83d`/`de00`). The fault is in the interpreted UTF-8 state machine's
+      surrogate handling. Plus two singles (`rawSourceSample`,
+      `unsafeSamples`).
 
 ## Traps
 
