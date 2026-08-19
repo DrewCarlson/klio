@@ -284,6 +284,23 @@ Failures tolerated by the ceilings, worst ratio first:
       `DateTimeComponentsSamples` 15/10, `InstantTest` 23/6,
       `TimeZoneTest` 8/5.
 
+      **Part of datetime is UPSTREAM VERSION SKEW, not klio.** `TimeZoneTest`
+      calls `LocalDateTime(2008, 1, 1)`, which fits nothing in the checked-out
+      source: both secondary constructors require `hour` and `minute`
+      (only `second`/`nanosecond` default), and both top-level factories need
+      five arguments. Newer kotlinx-datetime defaults `hour`/`minute`; this
+      checkout does not. klio reports it as
+      `Vm::call_member invoke on kotlinx.datetime.LocalDateTime.Companion`,
+      which LOOKS like a dispatch bug and is not. Same class of problem as
+      ktor's two URLBuilderTest cases — align the submodule pin, and do not
+      touch the tests or the source.
+
+      Timezone lookup itself is FINE and was checked directly: `TimeZone.UTC`,
+      `TimeZone.of("UTC")`, `TimeZone.of("America/New_York")` and
+      `availableZoneIds` (496 entries, contains New York) all resolve. The
+      `Expected <UTC>, actual <null>` failures come from elsewhere, so do not
+      start at the tz database.
+
 ## Suites at zero
 
 `stdlib`, `androidx_collection`, `atomicfu`.
