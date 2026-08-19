@@ -288,11 +288,30 @@ Failures tolerated by the ceilings, worst ratio first:
       (`fitsTrailingLambda`, `argLambdaBroadMasks`) — the bare-call ranking
       does not consult it here.
 
-      NOT attempted: this is the overload-ranking core, and plain `combine`
-      calls in every form resolve correctly today
+      ATTEMPTED AND REVERTED, with two useful eliminations:
+
+      1. The discriminator is NOT a lambda literal's header. In the real code
+         the argument is `transform` — the override's own function-typed
+         PARAMETER — so any check keyed on `args[li] == .Lambda` never fires.
+         The arity is still statically available, from that parameter's
+         declared type via `argDeclTypeRefLazy`.
+      2. The failing call does not pass through `resolveBareCall`'s
+         `cast_pick` pre-picks at all. An additive
+         `overloadPickByLambdaArity` there was traced against the real repro:
+         every site it sees carries `want=3` or `want=4` (the sibling test's
+         3-argument call), never the failing `want=2`. So the 2-argument
+         extension call is resolved on a DIFFERENT path — find that path
+         first.
+
+      For the record, at the site that does reach it the candidate shapes are
+      exactly as expected: `#2953 nparams=3 base=1 p0=this` (the extension),
+      `#2954 nparams=3 base=0 p0=flow`, `#2963`/`#2968 nparams=2 base=0
+      p0=flows` (the varargs). So the candidate set is right and only the
+      ranking is wrong.
+
+      Plain `combine` calls in every form resolve correctly today
       (`scratchpad/combine.kt` — extension, 3-arg and explicit vararg all
-      pass), so the change must not disturb them. Stage the corpus, the
-      stdlib sweep and both heavy suites.
+      pass), so whatever changes must not disturb them.
 
       The 0/13 file looked like one root but is not: under the census's real
       invocation its failures are ordering assertions — `Too few unhandled
