@@ -140,6 +140,24 @@ Failures tolerated by the ceilings, worst ratio first:
       annotation-record plumbing is straightforward (note `annotationRecordFor`
       stores AST-owned slices, so lifetimes want checking, and the layout
       change still needs the FORMAT_VERSION bump).
+- [ ] B12. **`whole_source_set` for serialization: tried, net NEGATIVE.**
+      Upstream commonTest is one compilation unit, so `shouldFail` — declared
+      top-level in `CompilerVersions.kt`, which also carries its own `@Test`s —
+      is invisible under the default one-target-per-child model
+      ("unresolved global `shouldFail`", 4 failures). `commontest_support`
+      already has `.whole_source_set = true` for exactly this (datetime opts in
+      for `checkComponents`).
+
+      Enabling it moved the census 57/81 -> **49/89**. It does resolve
+      `shouldFail`, but compiling every file together surfaces same-simple-name
+      classes declared in different test files — `A` (7 failures), `C` (3),
+      `Parametrized` — which klio then fails to tell apart. Reverted.
+
+      The blocker is therefore cross-file simple-name collision handling, not
+      the harness model. Note the lowering already has machinery for this (the
+      file-mangled `KeyInfo$f352` form), so the fix likely belongs there; once
+      it holds, `whole_source_set` should be revisited, since it is what
+      kotlinc actually does.
 - [ ] B11. **Top-level property initializers, two defects found while
       chasing B9.** A reduced program with a top-level
       `val M = SerializersModule { polymorphic(Base::class, Base.serializer()) { … } }`
