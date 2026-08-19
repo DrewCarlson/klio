@@ -18,8 +18,16 @@ test "kotlinx.atomicfu commonTest pass count holds at or above the ratchet basel
         // count; the ceilings bound the red mass so a fixed case
         // traded for a broken one cannot pass unnoticed. Lower the
         // ceilings as fixes land, never raise them.
-        .baseline = 63,
-        .max_failed = 8,
+        // Upstream's test sources are ONE compilation unit: `C.kt` uses `D` from
+        // `D.kt`, `GetArrayElementTest` uses `AtomicArrayClass`, and
+        // `SetArrayElementTest` uses `IntBox` — each declared in a sibling file
+        // that carries its own `@Test`s, so the default one-target-per-child
+        // model cannot see them and they resolve to nothing.
+        .whole_source_set = true,
+        .baseline = 67,
+        // Zero: with the whole source set compiled, every case that runs
+        // passes (67/0/0 measured), so any failure is a real regression.
+        .max_failed = 0,
         .max_incomplete = 2,
     });
 }
