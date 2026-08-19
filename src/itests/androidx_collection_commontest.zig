@@ -28,12 +28,22 @@ const runtime = @import("runtime");
 /// already printed, so the total moves with how many stress loops finish.
 const BASELINE: usize = 1250;
 
-/// Ceiling on failing cases, the mirror of `BASELINE`. Measured 15 on that
-/// same run. No did-not-complete ceiling: the 1M-iteration stress loops are
-/// throughput-bound and which ones beat the per-file timeout varies by run,
-/// so gating DNC would be a flake rather than a signal. Failures do not have
-/// that variance — a killed file contributes none.
-const MAX_FAILED: usize = 15;
+/// Ceiling on failing cases, the mirror of `BASELINE`. Dropped 15 -> 4 once
+/// bare calls to overloaded inline extensions stopped picking by shape alone:
+/// that single root took fourteen failures with it (the whole of
+/// `IndexBasedArrayIteratorTest`, all of `ArraySetTest`, and
+/// `ObjectFloatTest.emptyObjectFloatMap`), leaving `ObjectIntTest` and
+/// `ObjectLongTest`'s `emptyObject*Map`.
+///
+/// Set above the measured 2 because the count is biased DOWNWARD by the
+/// did-not-complete files: a file killed at the per-file timeout contributes
+/// no failures, and which of the 1M-iteration stress loops beat the timeout
+/// varies by run (9 and 10 across two runs). A file that completes next time
+/// can therefore add failures the measurement never saw. The margin covers
+/// that, not a regression — failing test names are printed on every run.
+///
+/// No did-not-complete ceiling, for the same throughput-bound reason.
+const MAX_FAILED: usize = 4;
 
 const TEST_ROOT = "kotlin-klio/klio-androidx-collection/upstream/collection/collection/src/commonTest/kotlin";
 const INLINE_RECEIVER_FIXTURE = "tests/fixtures/androidx_collection_inline_receiver.kt";

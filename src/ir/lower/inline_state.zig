@@ -754,6 +754,33 @@ fn noRequiredFnParam(f: *const ast.Function) bool {
 /// Whether `f` can take `want` positional arguments: at least the required
 /// (non-defaulted, non-vararg) count, and no more than the declared total —
 /// unless a vararg absorbs the excess.
+/// Whether several overloads fit the call's arity but declare DIFFERENT
+/// value-parameter types. Shape cannot separate those, so the first-declared
+/// fallback below is a coin flip. androidx.collection declares
+/// `ArraySet<E>.addAllInternal(ArraySet<out E>)` beside
+/// `ArraySet<E>.addAllInternal(Collection<E>)`; a bare `addAllInternal(elements)`
+/// inside `ArraySet.addAll` spliced the ArraySet body and read `.array` off a
+/// List. Declining to splice hands the call to normal dispatch, which ranks by
+/// argument type and picks correctly — the same call written `this.addAllInternal(…)`
+/// always resolved, because it never reached the splice path.
+fn ambiguousByParamTypes(cands: []const *const ast.Function, want: usize) bool {
+    var seen: ?[]const u8 = null;
+    for (cands) |f| {
+        if (!fitsArity(f, want)) continue;
+        // A reified type parameter can only be honoured by splicing, so an
+        // ambiguous set containing one keeps the existing behaviour rather
+        // than losing the type argument to the runtime walk.
+        for (f.type_params) |tp| if (tp.is_reified) return false;
+        const params = userParams(f);
+        if (params.len == 0) return false;
+        const ty = params[0].ty.name.name;
+        if (seen) |prev| {
+            if (!std.mem.eql(u8, prev, ty)) return true;
+        } else seen = ty;
+    }
+    return false;
+}
+
 fn fitsArity(f: *const ast.Function, want: usize) bool {
     const params = userParams(f);
     var required: usize = 0;
@@ -803,8 +830,10 @@ pub fn inlineFnAstFor(name: []const u8, call: ?CallShape) ?*const ast.Function {
     const shape = call orelse return first;
     if (cands.len < 2) return first;
     if (!shape.last_is_lambda) {
-        return pickNonlambdaShape(cands) orelse
-            pickUniqueArityFit(cands, shape.want) orelse first;
+        if (pickNonlambdaShape(cands)) |f| return f;
+        if (pickUniqueArityFit(cands, shape.want)) |f| return f;
+        if (ambiguousByParamTypes(cands, shape.want)) return null;
+        return first;
     }
     const lead = shape.want -| 1;
     var match: ?*const ast.Function = null;

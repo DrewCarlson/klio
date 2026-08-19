@@ -96,9 +96,34 @@ Failures tolerated by the ceilings, worst ratio first:
       `scripts/commontest-census.py serialization --errors` gives the
       per-failure error shapes; it reads the suite config straight out of the
       Zig itest so it cannot drift from the gate.
-- [ ] B3. Identify the 15 compose_plugin failures by name. The census tool
-      only supports the six `runSuite` suites, so this needs either a direct
-      run or extending the tool to the bespoke three.
+- [x] B3. Name the failures. Both bespoke suites now print failing test
+      names, which collapsed the counts into roots:
+
+      **compose (15)** — four `FloatingPointEqualityTest` negative-zero cases
+      (deterministic) and eleven concurrency cases
+      (`SnapshotStateList/Map/Set.concurrent*`, `RecomposerTests`
+      deadlock/frame-clock, `PausableCompositionTests.resumeOnBackgroundThread`).
+      The concurrency group is where the 15↔16 flip lives.
+
+      **androidx (16)** — nine are the whole of `IndexBasedArrayIteratorTest`,
+      four `ArraySetTest`, three the same `emptyObject*Map` shape across
+      `ObjectFloat`/`ObjectInt`/`ObjectLong`.
+- [x] B5. **Extension properties on a companion object.** Fixed the four
+      compose floating-point failures at the root. `class H { private val
+      T.Companion.p get() = … }` never resolved, because a companion receiver
+      arrives under its mangled runtime class name (`T$Companion$Companion`)
+      while the declaration registers under the source-written type
+      (`T.Companion`) — and a *private* member extension registers only under
+      its owner-qualified key, so the plain pair the companion arms consulted
+      did not exist. Both arms now try the source form. Example + corpus pin
+      added; unit tests 67/67.
+- [ ] B6. `IndexBasedArrayIteratorTest` (9 of androidx's 16). Every failing
+      case builds `ArraySet(setOf(...))` / `ArraySet(listOf(...))`; the one
+      case using `ArraySet<String>()` passes. `ArraySet` is an `expect class`
+      whose primary is `constructor(capacity: Int = 0)` — the default on the
+      expect side, the actual re-declaring it without — plus secondary
+      constructors including `constructor(set: Collection<E>?)`. Repro at
+      hand; suspect expect/actual constructor merging or overload scoring.
 - [ ] B4. coroutines (150) and datetime (70) — the largest absolute masses.
 
 ## Traps

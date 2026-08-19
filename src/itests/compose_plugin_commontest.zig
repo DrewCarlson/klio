@@ -59,16 +59,28 @@ const runtime = @import("runtime");
 // locals as the nearest binding) and the dirty-bits skip calculus landed:
 // four consecutive runs at 1370-1372 with the GroupSize slot anchor green.
 // Same ~±30 margin below the observed floor.
-const BASELINE: usize = 1370;
+const BASELINE: usize = 1375;
 
-/// Ceiling on failing cases, the mirror of `BASELINE`. Measured solo:
-/// 1375 passed, 15 failed, 0 did not complete. A pass floor alone cannot see
-/// a fix that trades one failure for another; this bounds that direction.
+/// Ceiling on failing cases, the mirror of `BASELINE`. Measured solo at
+/// 1380 passed / 10 failed once companion extension properties resolved
+/// (that root took five with it, including four FloatingPointEqualityTest
+/// cases). A pass floor alone cannot see a fix that trades one failure for
+/// another; this bounds that direction.
+///
+/// Set one above the measurement, not at it. Two runs of the previous state
+/// differed by exactly one failure (15 then 16) with the total constant, and
+/// every remaining failure is in the concurrency group
+/// (`SnapshotState*.concurrent*`, `RecomposerTests.validatePotentialDeadlock`,
+/// `PausableCompositionTests.resumeOnBackgroundThread`), so the flip lives
+/// there. The instability is real and tracked as open work; until it is
+/// fixed, a ceiling exactly at the measurement would red the gate about half
+/// the time. The names are printed on every run, so a genuine new failure is
+/// still identifiable rather than absorbed by the slack.
 /// Deliberately NO did-not-complete ceiling: DNC on this suite is
 /// throughput-bound and varies by ~40 between runs (see the note above the
 /// baseline), so a DNC gate would be a flake, not a signal. Failures do not
 /// have that variance — a killed class contributes neither.
-const MAX_FAILED: usize = 15;
+const MAX_FAILED: usize = 11;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
