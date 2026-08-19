@@ -24,8 +24,18 @@ test "ktor commonTest pass count holds at or above the ratchet baseline" {
         // count; the ceilings bound the red mass so a fixed case
         // traded for a broken one cannot pass unnoticed. Lower the
         // ceilings as fixes land, never raise them.
-        .baseline = 440,
-        .max_failed = 6,
+        .baseline = 448,
+        // Measured 2. Both are `URLBuilderTest.testParseSchemeWith{Digits,
+        // DotsPlusAndMinusSigns}`, and both are UPSTREAM VERSION SKEW in the
+        // sparse checkout rather than interpreter gaps: the tests expect a
+        // scheme to admit digits and `.+-` (RFC 3986:
+        // ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )), while the checked-out
+        // `URLProtocol.kt` still carries the older
+        // `require(name.all { it.isLowerCase() })`, which rejects them.
+        // klio's `Char.isLowerCase()` is correct — `'1'.isLowerCase()` is
+        // false, as on kotlinc — so the require genuinely throws. Aligning the
+        // submodule pin is the fix; do NOT touch the test or the source.
+        .max_failed = 2,
         .max_incomplete = 2,
     });
 }
