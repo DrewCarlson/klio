@@ -144,17 +144,39 @@ Failures tolerated by the ceilings, worst ratio first:
       Side effect worth noting: androidx passes rose 1275 -> 1547 and
       did-not-complete fell 10 -> 5, because the runaway recursion had been
       consuming per-file timeouts. Ceiling 4 -> 0.
-- [ ] B8. **compose concurrency cluster (11, the last in that suite).**
+- [ ] B8. **compose concurrency cluster (11, the last in that suite) — a
+      THROUGHPUT problem, not a correctness one.** Diagnosed, not fixed.
+
       `SnapshotStateList/Map/Set.concurrent*` (7),
       `RecomposerTests.validatePotentialDeadlock`,
-      `PausableCompositionTests.resumeOnBackgroundThread` (2). These are real
-      MVCC stress tests — 100 coroutines on `Dispatchers.Default` mutating one
-      snapshot state list, repeated 100 times — and they are the source of the
-      suite's run-to-run +/-1. A standalone `runBlocking` repro of the same
-      shape shows NO lost updates over 20 rounds, so the trigger involves
-      `runTest`'s virtual time rather than the snapshot machinery alone.
-      Getting the real failure text is slow: the class needs several minutes
-      even filtered to one method.
+      `PausableCompositionTests.resumeOnBackgroundThread` (2). Every one fails
+      the same way:
+
+          UncompletedCoroutinesError: After waiting for 1m, the test body did
+          not run to completion
+
+      The assertions are fine. `concurrentGlobalModification_add` PASSES in
+      50185ms when `kotlinx_coroutines_test_default_timeout` is raised; it
+      launches 100 coroutines per round for 100 rounds, so 10,000 dispatches.
+
+      Measured per-operation cost (`scripts`-free repro, no compose involved):
+
+      | operation | cost |
+      |---|---|
+      | `launch(Dispatchers.Default)` + join | **1556us** each |
+      | `yield()` round-trip | **616us** each |
+
+      A JVM dispatch is single-digit microseconds, so this is two to three
+      orders of magnitude off, and 10,000 dispatches cannot fit any sane
+      timeout. This is the same cost the suite's own comment already flags
+      ("the 55s yield cost is worth its own investigation; it is not a
+      property of the test").
+
+      Do NOT "fix" these by raising the cap. The suite deliberately sets
+      `kotlinx_coroutines_test_default_timeout=10s`, and the recorded
+      measurement for 90s was WORSE overall — 1336 passed with the two
+      Snapshot classes no longer completing, against 1345 at 10s. The real fix
+      is the dispatch path, which is its own campaign.
 - [ ] B4. coroutines (150) and datetime (70) — the largest absolute masses.
 
 ## Traps
