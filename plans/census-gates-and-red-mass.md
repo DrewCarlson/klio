@@ -442,11 +442,29 @@ Failures tolerated by the ceilings, worst ratio first:
       asserted it — is that `CallMemberOrGlobal` has no member-to-global
       fall-through. It does: `exec_call.zig` runs a global arm after the
       member walk ("Overloaded top-level function: select by runtime arg
-      types"). So the question is not whether the fall-through exists but
-      why it does not bind the top-level factory here, or where the
-      `Companion.invoke` attempt is made. Answer that before changing
-      anything; a dispatch-wide edit made on the wrong premise is how the
-      earlier `shadowedByClass` attempt turned into a no-op.
+      types").
+
+      NARROWED to that global arm, with the surrounding logic cleared. A gate
+      making `shadowedByClass`'s `enclosingHasMemberNamed` respect
+      `callableMemberApplicable(name, nargs)` WAS live this time (an earlier
+      attempt tested against a stale harness and looked inert):
+
+          [sbc2] Stamp nargs=3 enclHas=true callableApplicable=true  …
+          [sbc2] Stamp nargs=5 enclHas=true callableApplicable=false …
+
+      With it, the 5-argument call stops being shadowed by the 3-argument
+      member and the error moves from `call_member invoke on Companion` to
+      `unresolved global Stamp`. Following it further: `shadowedByClass`'s
+      tail then correctly answers "not shadowed", because the top-level
+      factory IS applicable (`required=5, total=6` for a call of 5), so the
+      call routes to `CallMemberOrGlobal` — and its GLOBAL arm fails to bind
+      that applicable factory.
+
+      So the defect is in the global arm binding a same-named top-level
+      factory when a CLASS shares the name. The `shadowedByClass` gate was
+      reverted: it is arguably more correct but fixes nothing on its own and
+      carries dispatch-wide risk. Fix the global arm first, then re-evaluate
+      whether the gate is still wanted.
 
       Worth at least the three `TimeZoneTest.newYorkOffset*` cases and
       probably more of the 62.
