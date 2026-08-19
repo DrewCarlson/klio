@@ -284,16 +284,35 @@ Failures tolerated by the ceilings, worst ratio first:
       `DateTimeComponentsSamples` 15/10, `InstantTest` 23/6,
       `TimeZoneTest` 8/5.
 
-      **Part of datetime is UPSTREAM VERSION SKEW, not klio.** `TimeZoneTest`
-      calls `LocalDateTime(2008, 1, 1)`, which fits nothing in the checked-out
-      source: both secondary constructors require `hour` and `minute`
-      (only `second`/`nanosecond` default), and both top-level factories need
-      five arguments. Newer kotlinx-datetime defaults `hour`/`minute`; this
-      checkout does not. klio reports it as
-      `Vm::call_member invoke on kotlinx.datetime.LocalDateTime.Companion`,
-      which LOOKS like a dispatch bug and is not. Same class of problem as
-      ktor's two URLBuilderTest cases — align the submodule pin, and do not
-      touch the tests or the source.
+      **CORRECTION — datetime's `LocalDateTime(2008, 1, 1)` failures are a
+      KLIO BUG, not upstream skew.** An earlier entry here claimed skew
+      because no constructor or top-level factory in the checkout takes three
+      arguments. That was wrong: the submodule is pinned at the release tag
+      v0.8.0, and `TimeZoneTest.kt:252` declares its own helper —
+
+          private fun LocalDateTime(year: Int, month: Int, day: Int) =
+              LocalDateTime(year, month, day, 0, 0)
+
+      so the call binds that private MEMBER function. klio instead reports
+      `Vm::call_member invoke on kotlinx.datetime.LocalDateTime.Companion`.
+
+      Root: a private member function named after a class loses a bare call
+      when same-named TOP-LEVEL factory functions also exist. Repro:
+      `scratchpad/memberfactory2.kt` — with the factories present the call
+      fails (`unresolved global Stamp`); delete them
+      (`scratchpad/memberfactory.kt`) and the member helper binds correctly.
+      kotlinx-datetime declares exactly that combination: two
+      `@LowPriorityInOverloadResolution` top-level `LocalDateTime(...)`
+      factories beside the class.
+
+      The emit is `class_or_factory_call` -> `CallMemberOrGlobal`
+      (`shadowedByClass` correctly declines to construct, since
+      `enclosingHasMemberNamed` holds), but no runtime dispatch line is
+      produced for the name, so the failure is before the member arm is
+      tried. That is where to start.
+
+      Worth at least the three `TimeZoneTest.newYorkOffset*` cases and
+      probably more of the 62.
 
       Timezone lookup itself is FINE and was checked directly: `TimeZone.UTC`,
       `TimeZone.of("UTC")`, `TimeZone.of("America/New_York")` and
