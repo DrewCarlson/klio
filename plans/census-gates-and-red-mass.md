@@ -673,6 +673,30 @@ Failures tolerated by the ceilings, worst ratio first:
       failure is identical with the import present, so the warning is a red
       herring here.
 
+      REDUCED TO PURE KOTLIN, no datetime involved
+      (`scratchpad/vr_probe.kt`):
+
+          fun f(vararg blocks: Sink.() -> Unit) { … blocks[i](s) … }
+          f({ emit("A") })                    // works
+          f({ emit("A") }, { emit("B") })     // FAILS
+
+      Invoking an element of a vararg of RECEIVER lambdas passes the wrong
+      receiver once the vararg holds two or more: `emit` dispatches but `this`
+      inside it is `kotlin.Unit`
+      (`Vm::get_field out on kotlin.Unit`). Zero and one element are correct.
+      The loop form is irrelevant — indexed, `for`, and `forEach` all fail —
+      and a vararg of PLAIN `(Sink) -> Unit` lambdas is correct at every
+      count, so it is specific to the receiver form.
+
+      It is an INVOCATION defect, not a typing one. A change adding
+      `recordVarargLambdaReceivers` (recording the declared receiver for every
+      lambda landing in a receiver-typed vararg) was implemented and traced —
+      it fires correctly, reporting `head=Sink last_vararg=true` for all arg
+      counts — and changes nothing, because the receiver is lost when the
+      element is CALLED, not when it is typed. Reverted. Look at how a vararg
+      array's function-typed elements are invoked, not at expected-type
+      propagation.
+
 ## Traps
 
 - `zig-out/bin/klio` goes stale silently. A pack build against a stale binary
