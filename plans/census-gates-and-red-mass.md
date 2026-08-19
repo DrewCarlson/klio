@@ -707,10 +707,24 @@ Failures tolerated by the ceilings, worst ratio first:
       the declared receiver. A `recordVarargLambdaReceivers` helper doing
       exactly that was written and hooked into all THREE
       `argLambdaBroadMasks` call sites in `expr.zig`; tracing shows it never
-      records for the failing call, so this call is lowered by a FOURTH path.
-      Find that path first — `lowerLambda` consults
-      `b.lambdaArgRecv(expr.span())`, so the recording just has to reach the
-      right site with the argument's own span.
+      records for the failing call.
+
+      WHY those sites are not reached: `KLIO_RESOLVE_AUDIT` reports
+
+          inline name=f pkg= arity=2 outcome=deferred reason=vararg_only
+
+      The bare call DEFERS because its only candidate is a vararg, so it never
+      takes the static-call path where lambda typing happens — and the emit it
+      does take produces no `KLIO_OR_AUDIT` line, i.e. a site with no audit
+      hook (the same obstacle the CombineTest chase hit).
+
+      Two things make this tractable for whoever picks it up: the target is
+      statically unambiguous (a single candidate `f`), so the receiver type is
+      available at the deferral; and `lowerLambda` already consults
+      `b.lambdaArgRecv(expr.span())` and `b.peekExpected()`'s
+      `function.receiver`, so either channel works once the deferred path
+      supplies it. Add an audit hook to that emit first so the site stops
+      being invisible.
 
 ## Traps
 
