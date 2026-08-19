@@ -581,14 +581,25 @@ Failures tolerated by the ceilings, worst ratio first:
           [localshadow] writeULEB128: ah=UInt      ph=UInt
           [localshadow] writeULEB128: ah=UIntArray ph=UIntArray
 
-      That is the real lead. `unsafeSamples` declares `Buffer.writeULEB128`
-      THREE times: a local `(UInt)` inside one test method, a private member
-      `(UInt)`, and a local `(UIntArray)` inside the failing test. The failing
-      call — `writeULEB128(data.size.toUInt())` from inside the UIntArray
-      local — never produces a mismatch, so the param-type table consulted for
-      it is not the enclosing local's. `local_fn_param_tys` is keyed by SIMPLE
-      NAME, and these siblings collide across test methods. Establish which
-      declaration the table holds at that site before gating on it. `private inner class RC4Key(key:
+      CORRECTION — an earlier version of this entry blamed a simple-name
+      collision in `local_fn_param_tys`. That was wrong. Instrumenting the
+      gate's ENTRY (rather than its verdict) shows it is reached exactly
+      twice, once per test method, and both hits are the OUTER calls:
+
+          [gate] writeULEB128 in_fn=writeUleb128      shape_known=true …
+          [gate] writeULEB128 in_fn=writeUleb128Array shape_known=true …
+
+      The INNER call — `writeULEB128(data.size.toUInt())` from inside the
+      local `Buffer.writeULEB128(UIntArray)` body, the one that recurses —
+      never reaches `member_or_local_callable` at all. So that site is not
+      where it is decided either, and the param-type table is not implicated.
+
+      Sites now ruled out for this bug: `prefer_member` in `resolveBareCall`,
+      and `member_or_local_callable`. Next: instrument the lowering of a bare
+      call made from inside a LOCAL EXTENSION's body — that body is lowered
+      through its own builder, and whatever emits its calls is the live path.
+      `KLIO_OR_AUDIT` reported no emit line for the inner call, so it is
+      likely emitted by a site with no audit hook; add one before guessing. `private inner class RC4Key(key:
       String)` reads `key` — a plain parameter, not a property — from an
       `init` block, and klio treats it as a field:
       `Vm::get_field key on RC4Key`. Repro:
