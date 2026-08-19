@@ -10,8 +10,15 @@ bottom and are not campaigns.
 
 ## The active plan
 
-None. `plans/conformance-and-hardening.md` CLOSED 2026-08-18 with every
-item landed and `scripts/gate.sh` GREEN; the record is summarised in
+`plans/census-gates-and-red-mass.md` — bound every census in both
+directions (the predecessor's C3 covered only the six suites that run
+through `commontest_support.zig`; `stdlib`, `compose_plugin`, and
+`androidx_collection` counted passes only, and androidx's ratchet had
+never run at all because its sparse checkout omitted `commonTest`), then
+drive the tolerated failure mass down starting with serialization.
+
+`plans/conformance-and-hardening.md` CLOSED 2026-08-18 with every item
+landed and `scripts/gate.sh` GREEN; the record is summarised in
 `PLAN-archive.md`. Its predecessor `simplify-validate-accelerate.md`
 closed 2026-08-17. The items below are the standing fronts any next
 campaign draws from.

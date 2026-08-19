@@ -61,6 +61,15 @@ const runtime = @import("runtime");
 // Same ~±30 margin below the observed floor.
 const BASELINE: usize = 1370;
 
+/// Ceiling on failing cases, the mirror of `BASELINE`. Measured solo:
+/// 1375 passed, 15 failed, 0 did not complete. A pass floor alone cannot see
+/// a fix that trades one failure for another; this bounds that direction.
+/// Deliberately NO did-not-complete ceiling: DNC on this suite is
+/// throughput-bound and varies by ~40 between runs (see the note above the
+/// baseline), so a DNC gate would be a flake, not a signal. Failures do not
+/// have that variance — a killed class contributes neither.
+const MAX_FAILED: usize = 15;
+
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
     UPSTREAM ++ "/runtime-test-utils/src/commonMain/kotlin",
@@ -234,6 +243,28 @@ fn streamedPassedCount(stderr: []const u8) usize {
     return n;
 }
 
+/// Mirrors of the pass counters for failing tests. A pass-count floor alone
+/// cannot see a regression inside the red mass; bounding failures gates the
+/// other direction.
+fn failedLineCount(stdout: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, stdout, '\n');
+    while (it.next()) |line| {
+        if (std.mem.endsWith(u8, line, " FAILED")) n += 1;
+    }
+    return n;
+}
+
+fn streamedFailedCount(stderr: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, stderr, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, "[test] ") != null and
+            std.mem.indexOf(u8, line, " FAILED") != null) n += 1;
+    }
+    return n;
+}
+
 var arena_inst = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 test "compose runtime commonTest under the lowering plugin holds the ratchet baseline" {
@@ -308,6 +339,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
 
     var next = std.atomic.Value(usize).init(0);
     var total_passed = std.atomic.Value(usize).init(0);
+    var total_failed = std.atomic.Value(usize).init(0);
     var hung = std.atomic.Value(usize).init(0);
     const Pool = struct {
         fn worker(
@@ -316,6 +348,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             penv: *std.process.Environ.Map,
             pnext: *std.atomic.Value(usize),
             ppassed: *std.atomic.Value(usize),
+            pfailed: *std.atomic.Value(usize),
             phung: *std.atomic.Value(usize),
         ) void {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -345,6 +378,11 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                 const summary_count = passedLineCount(r.stdout);
                 const n_passed = if (summary_count != 0) summary_count else streamedPassedCount(r.stderr);
                 _ = ppassed.fetchAdd(n_passed, .monotonic);
+                const summary_failed = failedLineCount(r.stdout);
+                _ = pfailed.fetchAdd(
+                    if (summary_count != 0) summary_failed else streamedFailedCount(r.stderr),
+                    .monotonic,
+                );
                 if (std.mem.indexOf(u8, r.stdout, " passed,") == null) {
                     _ = phung.fetchAdd(1, .monotonic);
                     std.debug.print("compose_plugin_commontest: {s} did not complete ({d} streamed passes kept)\n", .{ names[i], n_passed });
@@ -360,14 +398,37 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             &env,
             &next,
             &total_passed,
+            &total_failed,
             &hung,
         }));
     }
     for (threads.items) |t| t.join();
 
     std.debug.print(
-        "compose_plugin_commontest: {d} passed across {d} test classes, {d} did not complete (baseline {d})\n",
-        .{ total_passed.load(.monotonic), classes.items.len, hung.load(.monotonic), BASELINE },
+        "compose_plugin_commontest: {d} passed, {d} failed across {d} test classes, {d} did not complete (baseline {d})\n",
+        .{ total_passed.load(.monotonic), total_failed.load(.monotonic), classes.items.len, hung.load(.monotonic), BASELINE },
     );
     try std.testing.expect(total_passed.load(.monotonic) >= BASELINE);
+    const failed = total_failed.load(.monotonic);
+    if (failed > MAX_FAILED) {
+        std.debug.print(
+            "compose_plugin_commontest: {d} failed exceeds the ceiling {d}\n",
+            .{ failed, MAX_FAILED },
+        );
+        return error.FailureCeilingExceeded;
+    }
+}
+
+test "failedLineCount counts FAILED lines and ignores PASSED ones" {
+    const out =
+        \\SomeTest.a PASSED
+        \\SomeTest.b FAILED
+        \\SomeTest.c PASSED
+        \\SomeTest.d FAILED
+        \\3 tests, 1 passed, 2 failed
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 2), failedLineCount(out));
+    try std.testing.expectEqual(@as(usize, 2), passedLineCount(out));
+    try std.testing.expectEqual(@as(usize, 0), failedLineCount("nothing here\n"));
 }

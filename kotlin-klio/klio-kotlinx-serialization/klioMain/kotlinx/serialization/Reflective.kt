@@ -22,8 +22,11 @@ package kotlinx.serialization
 import kotlin.reflect.KClass
 import kotlinx.serialization.internal.EnumSerializer
 import kotlinx.serialization.internal.ObjectSerializer
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
 import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.descriptors.SerialKind
+import kotlinx.serialization.descriptors.nullable
 import kotlinx.serialization.descriptors.StructureKind
 import kotlinx.serialization.encoding.AbstractDecoder
 import kotlinx.serialization.encoding.AbstractEncoder
@@ -39,6 +42,12 @@ internal fun __klsx_get(obj: Any?, name: String): Any? =
 
 internal fun __klsx_construct(kClass: Any?, args: List<Any?>): Any? =
     error("intrinsic kotlinx.serialization.__klsx_construct not installed")
+
+internal fun __klsx_ctorParamTypes(kClass: Any?): List<String> =
+    error("intrinsic kotlinx.serialization.__klsx_ctorParamTypes not installed")
+
+internal fun __klsx_ctorParamOptional(kClass: Any?): List<Boolean> =
+    error("intrinsic kotlinx.serialization.__klsx_ctorParamOptional not installed")
 
 internal fun __klsx_isSerializable(kClass: Any?): Boolean =
     error("intrinsic kotlinx.serialization.__klsx_isSerializable not installed")
@@ -110,16 +119,56 @@ private fun __klsx_buildSerializer(kClass: KClass<*>): KSerializer<Any> {
 // recurse without bound.
 internal class ReflectiveDescriptor(
     override val serialName: String,
-    private val names: List<String>
+    private val names: List<String>,
+    // Rendered declared type per element, and whether the element has a
+    // default. Both come from the class's primary constructor; an empty
+    // list means the caller had no shape to give (the `Dynamic` descriptor),
+    // in which case every element falls back to the neutral answers.
+    private val types: List<String> = emptyList(),
+    private val optionals: List<Boolean> = emptyList()
 ) : SerialDescriptor {
     override val kind: SerialKind get() = StructureKind.CLASS
     override val elementsCount: Int get() = names.size
     override fun getElementName(index: Int): String = names[index]
     override fun getElementIndex(name: String): Int = names.indexOf(name)
     override fun getElementAnnotations(index: Int): List<Annotation> = emptyList()
-    override fun getElementDescriptor(index: Int): SerialDescriptor = ReflectiveElementDescriptor
-    override fun isElementOptional(index: Int): Boolean = false
+
+    // A primary-constructor parameter with a default is exactly kotlinx's
+    // notion of an optional element: a decoder may leave it absent.
+    override fun isElementOptional(index: Int): Boolean =
+        if (index < optionals.size) optionals[index] else false
+
+    // Name the element's real descriptor where the declared type maps to a
+    // primitive. Anything else stays neutral rather than guessing: the
+    // reflective encode/decode path is type-erased, so claiming a structure
+    // it cannot actually produce would be worse than admitting ignorance.
+    override fun getElementDescriptor(index: Int): SerialDescriptor {
+        if (index >= types.size) return ReflectiveElementDescriptor
+        return descriptorForDeclaredType(types[index])
+    }
+
     override fun toString(): String = "ReflectiveDescriptor($serialName)"
+}
+
+// Map a rendered declared type (`"Int"`, `"String?"`) to the descriptor the
+// plugin would have named for that element. Unknown or generic types get the
+// neutral descriptor.
+internal fun descriptorForDeclaredType(declared: String): SerialDescriptor {
+    val nullable = declared.endsWith("?")
+    val base = if (nullable) declared.substring(0, declared.length - 1) else declared
+    val d = when (base) {
+        "Int", "kotlin.Int" -> PrimitiveSerialDescriptor("kotlin.Int", PrimitiveKind.INT)
+        "Long", "kotlin.Long" -> PrimitiveSerialDescriptor("kotlin.Long", PrimitiveKind.LONG)
+        "Short", "kotlin.Short" -> PrimitiveSerialDescriptor("kotlin.Short", PrimitiveKind.SHORT)
+        "Byte", "kotlin.Byte" -> PrimitiveSerialDescriptor("kotlin.Byte", PrimitiveKind.BYTE)
+        "Float", "kotlin.Float" -> PrimitiveSerialDescriptor("kotlin.Float", PrimitiveKind.FLOAT)
+        "Double", "kotlin.Double" -> PrimitiveSerialDescriptor("kotlin.Double", PrimitiveKind.DOUBLE)
+        "Boolean", "kotlin.Boolean" -> PrimitiveSerialDescriptor("kotlin.Boolean", PrimitiveKind.BOOLEAN)
+        "Char", "kotlin.Char" -> PrimitiveSerialDescriptor("kotlin.Char", PrimitiveKind.CHAR)
+        "String", "kotlin.String" -> PrimitiveSerialDescriptor("kotlin.String", PrimitiveKind.STRING)
+        else -> return ReflectiveElementDescriptor
+    }
+    return if (nullable) d.nullable else d
 }
 
 // The neutral, terminal element descriptor the type-erased reflective path
@@ -163,7 +212,12 @@ public class ReflectiveKSerializer(private val kClass: Any?) : KSerializer<Any?>
     private val names: List<String> = __klsx_ctorParamNames(kClass)
 
     override val descriptor: SerialDescriptor =
-        ReflectiveDescriptor(__klsx_serialName(kClass), names)
+        ReflectiveDescriptor(
+            __klsx_serialName(kClass),
+            names,
+            __klsx_ctorParamTypes(kClass),
+            __klsx_ctorParamOptional(kClass)
+        )
 
     override fun serialize(encoder: Encoder, value: Any?) {
         val c = encoder.beginStructure(descriptor)

@@ -122,6 +122,19 @@ fn passedLineCount(stdout: []const u8) usize {
     return n;
 }
 
+/// Count per-test `FAILED` lines, the mirror of `passedLineCount`. A floor on
+/// passes cannot see a regression *inside* the red mass: a change that turns
+/// one failure into a pass while breaking a different test leaves the pass
+/// count flat. Counting failures too gates both directions.
+fn failedLineCount(stdout: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, stdout, '\n');
+    while (it.next()) |line| {
+        if (std.mem.endsWith(u8, line, " FAILED")) n += 1;
+    }
+    return n;
+}
+
 var arena_inst = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 test "androidx.collection commonTest pass count holds at or above the ratchet baseline" {
@@ -186,6 +199,7 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
     }
     var next = std.atomic.Value(usize).init(0);
     var total_passed = std.atomic.Value(usize).init(0);
+    var total_failed = std.atomic.Value(usize).init(0);
     var hung = std.atomic.Value(usize).init(0);
     const Pool = struct {
         fn worker(
@@ -193,6 +207,7 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
             penv: *std.process.Environ.Map,
             pnext: *std.atomic.Value(usize),
             ppassed: *std.atomic.Value(usize),
+            pfailed: *std.atomic.Value(usize),
             phung: *std.atomic.Value(usize),
         ) void {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -206,6 +221,7 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
                     continue;
                 };
                 _ = ppassed.fetchAdd(passedLineCount(r.stdout), .monotonic);
+                _ = pfailed.fetchAdd(failedLineCount(r.stdout), .monotonic);
                 if (std.mem.indexOf(u8, r.stdout, " passed,") == null) _ = phung.fetchAdd(1, .monotonic);
             }
         }
@@ -213,14 +229,28 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
     var threads: std.ArrayList(std.Thread) = .empty;
     for (0..workerCount()) |_| {
         try threads.append(a, try std.Thread.spawn(.{}, Pool.worker, .{
-            @as([]const []const []const u8, jobs.items), &env, &next, &total_passed, &hung,
+            @as([]const []const []const u8, jobs.items), &env, &next, &total_passed, &total_failed, &hung,
         }));
     }
     for (threads.items) |t| t.join();
 
     std.debug.print(
-        "androidx_commontest: {d} passed across {d} files, {d} did not complete (baseline {d})\n",
-        .{ total_passed.load(.monotonic), targets.items.len, hung.load(.monotonic), BASELINE },
+        "androidx_commontest: {d} passed, {d} failed across {d} files, {d} did not complete (baseline {d})\n",
+        .{ total_passed.load(.monotonic), total_failed.load(.monotonic), targets.items.len, hung.load(.monotonic), BASELINE },
     );
     try std.testing.expect(total_passed.load(.monotonic) >= BASELINE);
+}
+
+test "failedLineCount counts FAILED lines and ignores PASSED ones" {
+    const out =
+        \\SomeTest.a PASSED
+        \\SomeTest.b FAILED
+        \\SomeTest.c PASSED
+        \\SomeTest.d FAILED
+        \\3 tests, 1 passed, 2 failed
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 2), failedLineCount(out));
+    try std.testing.expectEqual(@as(usize, 2), passedLineCount(out));
+    try std.testing.expectEqual(@as(usize, 0), failedLineCount("nothing here\n"));
 }

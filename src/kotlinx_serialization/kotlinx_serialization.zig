@@ -13,6 +13,10 @@
 //! - `__klsx_get(obj, name)` — read a named property off an instance.
 //! - `__klsx_construct(kClass, args)` — build an instance by calling
 //!   the primary constructor with the (ordered) argument list.
+//! - `__klsx_ctorParamTypes(kClass)` — each property's rendered declared
+//!   type, so the descriptor can name a concrete element descriptor.
+//! - `__klsx_ctorParamOptional(kClass)` — whether each property has a
+//!   default, which is kotlinx's definition of an optional element.
 //!
 //! Everything else in serialization-core is pure Kotlin consumed
 //! straight from the upstream submodule.
@@ -55,6 +59,8 @@ fn typeErr(msg: []const u8) EvalResult {
 pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     var b = HostBindings.init(allocator);
     try b.register("kotlinx.serialization.__klsx_ctorParamNames", ctorParamNames);
+    try b.register("kotlinx.serialization.__klsx_ctorParamTypes", ctorParamTypes);
+    try b.register("kotlinx.serialization.__klsx_ctorParamOptional", ctorParamOptional);
     try b.register("kotlinx.serialization.__klsx_get", propGet);
     try b.register("kotlinx.serialization.__klsx_construct", construct);
     // Compiler-plugin replacement: the shape questions the generated
@@ -597,6 +603,77 @@ fn enumEntryValues(ctx: *CallCtx) Error!EvalResult {
     }));
 }
 
+
+/// Rendered declared type of each primary-constructor property, in the same
+/// order as `__klsx_ctorParamNames`: `"Int"`, `"String?"`, `"List<Int>"`. An
+/// empty string means the declaration carried no type the runtime retained,
+/// and the Kotlin side falls back to its neutral element descriptor.
+///
+/// The plugin-generated descriptor names a concrete descriptor per element;
+/// the reflective one could not, because this shape was never exposed.
+fn ctorParamTypes(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("__klsx_ctorParamTypes: expected a class");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return typeErr("__klsx_ctorParamTypes: expected a class");
+    defer cls_ref.deinit();
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (cls_ref.asPtr().primary_params) |p| {
+        if (p.property == null) continue;
+        var buf: std.ArrayList(u8) = .empty;
+        if (p.declared_shape) |shape| {
+            try renderShape(a, &buf, shape);
+        } else if (p.declared_type) |t| {
+            try buf.appendSlice(a, t);
+        }
+        items.append(a, .{ .String = try runtime.strInitOwned(a, try buf.toOwnedSlice(a)) }) catch |e| return e;
+    }
+    return ok(try Value.newList(a, .{
+        .items = try ValueList.init(a, items),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    }));
+}
+
+/// Render a `TypeShape` back to source form, generic args included.
+fn renderShape(a: std.mem.Allocator, buf: *std.ArrayList(u8), shape: TypeShape) !void {
+    try buf.appendSlice(a, shape.name);
+    if (shape.args.len != 0) {
+        try buf.append(a, '<');
+        for (shape.args, 0..) |arg, i| {
+            if (i != 0) try buf.appendSlice(a, ", ");
+            try renderShape(a, buf, arg);
+        }
+        try buf.append(a, '>');
+    }
+    if (shape.nullable) try buf.append(a, '?');
+}
+
+/// Whether each primary-constructor property carries a default value, in the
+/// same order as `__klsx_ctorParamNames`. This is exactly kotlinx's notion of
+/// an *optional* element: the plugin marks a defaulted parameter optional so a
+/// decoder may leave it absent. The reflective descriptor previously answered
+/// `false` for every element because the fact was never exposed.
+fn ctorParamOptional(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("__klsx_ctorParamOptional: expected a class");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return typeErr("__klsx_ctorParamOptional: expected a class");
+    defer cls_ref.deinit();
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (cls_ref.asPtr().primary_params) |p| {
+        if (p.property == null) continue;
+        try items.append(a, .{ .Bool = p.default != null });
+    }
+    return ok(try Value.newList(a, .{
+        .items = try ValueList.init(a, items),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    }));
+}
+
 /// Ordered names of the primary-constructor properties (`val`/`var`
 /// params). Plugin-generated serializers serialize exactly these, in
 /// declaration order.
@@ -1057,7 +1134,36 @@ test "hostBindings registers every serialization symbol" {
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_isSerializable") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_isEnum") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_enumValues") != null);
-    try testing.expectEqual(@as(usize, 8), b.len());
+    try testing.expect(b.resolve("kotlinx.serialization.__klsx_ctorParamTypes") != null);
+    try testing.expect(b.resolve("kotlinx.serialization.__klsx_ctorParamOptional") != null);
+    try testing.expectEqual(@as(usize, 10), b.len());
+}
+
+test "renderShape round-trips nullability and generic args" {
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+
+    try renderShape(a, &buf, .{ .name = "Int", .nullable = false, .args = &.{} });
+    try testing.expectEqualStrings("Int", buf.items);
+
+    buf.clearRetainingCapacity();
+    try renderShape(a, &buf, .{ .name = "String", .nullable = true, .args = &.{} });
+    try testing.expectEqualStrings("String?", buf.items);
+
+    buf.clearRetainingCapacity();
+    var inner = [_]TypeShape{.{ .name = "Int", .nullable = false, .args = &.{} }};
+    try renderShape(a, &buf, .{ .name = "List", .nullable = false, .args = &inner });
+    try testing.expectEqualStrings("List<Int>", buf.items);
+
+    // A nullable generic keeps the `?` outside the argument list.
+    buf.clearRetainingCapacity();
+    var pair = [_]TypeShape{
+        .{ .name = "String", .nullable = false, .args = &.{} },
+        .{ .name = "Int", .nullable = true, .args = &.{} },
+    };
+    try renderShape(a, &buf, .{ .name = "Map", .nullable = true, .args = &pair });
+    try testing.expectEqualStrings("Map<String, Int?>?", buf.items);
 }
 
 test {
