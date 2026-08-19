@@ -24,26 +24,30 @@ const runtime = @import("runtime");
 /// never enforced: the sparse checkout omitted `commonTest`, so `TEST_ROOT`
 /// was missing and the whole suite took the skip path. First real measurement:
 /// 1309 passed, 15 failed, 9 did not complete across 39 files. The floor sits
-/// below 1309 because a file killed mid-run keeps only the passes it had
-/// already printed, so the total moves with how many stress loops finish.
+/// below the measurement because a file killed mid-run keeps only the passes
+/// it had already printed, so the total moves with how many stress loops
+/// finish: 1275 passes at 10 did-not-complete, 1547 at 5. The floor stays at
+/// the low-water mark rather than the best run.
 const BASELINE: usize = 1250;
 
-/// Ceiling on failing cases, the mirror of `BASELINE`. Dropped 15 -> 4 once
-/// bare calls to overloaded inline extensions stopped picking by shape alone:
-/// that single root took fourteen failures with it (the whole of
-/// `IndexBasedArrayIteratorTest`, all of `ArraySetTest`, and
-/// `ObjectFloatTest.emptyObjectFloatMap`), leaving `ObjectIntTest` and
-/// `ObjectLongTest`'s `emptyObject*Map`.
+/// Ceiling on failing cases, the mirror of `BASELINE`. 15 -> 4 -> 0 as two
+/// resolution roots closed: overloaded inline extensions no longer bind by
+/// call shape alone (that took fourteen failures, the whole of
+/// `IndexBasedArrayIteratorTest` and `ArraySetTest`), and a call carrying
+/// explicit type arguments no longer binds a same-named member that declares
+/// none (the last two, `ObjectIntTest`/`ObjectLongTest`'s `emptyObject*Map`,
+/// which recursed into their own @Test method until the eval depth blew).
 ///
-/// Set above the measured 2 because the count is biased DOWNWARD by the
-/// did-not-complete files: a file killed at the per-file timeout contributes
-/// no failures, and which of the 1M-iteration stress loops beat the timeout
-/// varies by run (9 and 10 across two runs). A file that completes next time
-/// can therefore add failures the measurement never saw. The margin covers
-/// that, not a regression — failing test names are printed on every run.
+/// Zero, deliberately: every case that runs, passes, so any new failure is a
+/// real regression. The count is biased DOWNWARD by the did-not-complete
+/// files — a file killed at the per-file timeout contributes no failures, and
+/// which of the 1M-iteration stress loops finish varies by run. If one of
+/// those starts completing and brings a genuine failure with it, that is
+/// worth knowing rather than absorbing into slack; the failing names are
+/// printed on every run, so a trip is diagnosable.
 ///
 /// No did-not-complete ceiling, for the same throughput-bound reason.
-const MAX_FAILED: usize = 4;
+const MAX_FAILED: usize = 0;
 
 const TEST_ROOT = "kotlin-klio/klio-androidx-collection/upstream/collection/collection/src/commonTest/kotlin";
 const INLINE_RECEIVER_FIXTURE = "tests/fixtures/androidx_collection_inline_receiver.kt";

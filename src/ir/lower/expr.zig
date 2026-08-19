@@ -14957,6 +14957,15 @@ fn lowerImplicitThisCall(
     if (segments.len != 1) return null;
     const name0 = segments[0].name;
     if (b.resolve(name0) != null or b.knowsOuter(name0) or !b.hasOwnMember(name0)) return null;
+    // A call written with EXPLICIT type arguments cannot be answered by an own
+    // member that declares no type parameters, so that member does not shadow
+    // the same-named top-level function. androidx.collection's own test
+    // declares `@Test fun emptyObjectIntMap()` and calls the imported
+    // `fun <K> emptyObjectIntMap()` inside it; routing through implicit-this
+    // dispatch bound the enclosing method and recursed until the eval depth
+    // blew. Declining here returns the call to the normal resolution path,
+    // which is what the same call in initializer position always took.
+    if (ast_type_args.len != 0 and !b.ownMemberAcceptsTypeArgs(name0)) return null;
     // E4: when the eager channel committed this call to a PLAIN top-level
     // function, the same-named own member does not shadow it — kotlin
     // scoping resolved the other way, and the record gate now checks the
@@ -15637,6 +15646,37 @@ fn lowerUnresolvedBareCall(
             for (args, 0..) |*a, i| {
                 const t = argDeclTypeRefLazy(b, a);
                 std.debug.print("[barearm-miss]   arg{d} ty={?s}\n", .{ i, if (t) |tt| tt.name else null });
+            }
+        }
+    }
+    // A call written with EXPLICIT type arguments cannot be answered by a
+    // same-named own member that declares none, so the deferred member-first
+    // form would bind the wrong target: androidx.collection's own
+    // `@Test fun emptyObjectIntMap()` calling the imported
+    // `fun <K> emptyObjectIntMap()` bound itself and recursed until the eval
+    // depth blew. Commit the top-level function instead.
+    if (ast_type_args.len != 0 and !b.ownMemberAcceptsTypeArgs(name0)) {
+        if (b.module.funcId(name0)) |gid| {
+            if (b.module.funcById(gid)) |gf| {
+                const is_ext = gf.params.len != 0 and std.mem.eql(u8, gf.params[0].name, "this");
+                if (!is_ext) {
+                    orEmitAudit(b, "unresolved_bare_call", "Call/type-args-global", name0);
+                    const grun = try lowerArgRun(b, args);
+                    const gnames = try internArgNames(b.allocator, b.module, ast_arg_names);
+                    const gtargs = try internTypeArgs(b.allocator, b.module, ast_type_args);
+                    const gdst = b.allocReg();
+                    try b.push(.{ .Call = .{
+                        .dst = gdst,
+                        .func = gid,
+                        .trailing_lambda = b.callTrailingLambda(),
+                        .args = grun[0],
+                        .n_args = grun[1],
+                        .arg_names = gnames,
+                        .type_args = gtargs,
+                        .exact = false,
+                    } });
+                    return gdst;
+                }
             }
         }
     }
