@@ -6304,8 +6304,14 @@ fn lowerCallSpread(
         // global path — the member set over-approximates.
         if (callee.* == .Path and callee.Path.segments.len == 1) {
             const name = callee.Path.segments[0].name;
+            // Only a PLAIN top-level namesake keeps the global path. An
+            // EXTENSION namesake cannot answer this bare call — it needs a
+            // receiver of its own type — so it must not divert the call away
+            // from the enclosing class's member and into the value-read path
+            // below, which dies on `get_field` because a member fn is not a
+            // field.
             if (b.resolve(name) == null and !b.isLocalFn(name) and b.hasEnclosingMember(name) and
-                !b.module.hasBareCallCandidate(name, callee.Path.segments[0].span.file))
+                !b.module.hasNonExtensionBareCallCandidate(name, callee.Path.segments[0].span.file))
             {
                 if (try resolveThisForBareCall(b)) |this_reg| {
                     member_id = try b.module.internConst(b.allocator, .{ .String = name });

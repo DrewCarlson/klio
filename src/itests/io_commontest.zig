@@ -26,11 +26,11 @@ test "kotlinx.io commonTest pass count holds at or above the ratchet baseline" {
         // count; the ceilings bound the red mass so a fixed case
         // traded for a broken one cannot pass unnoticed. Lower the
         // ceilings as fixes land, never raise them.
-        .baseline = 1178,
+        .baseline = 1182,
         // 45 -> 13 once klio supplied the two `expect`s kotlinx-io's own test
-        // sources declare. The remaining 13 are 11 in Utf8Test (a bare call to
-        // a private vararg member read as a field), plus two singles.
-        .max_failed = 13,
+        // sources declare, then 13 -> 9 once an extension namesake stopped
+        // diverting a spread call away from the enclosing class's member.
+        .max_failed = 9,
         .max_incomplete = 0,
     });
 }

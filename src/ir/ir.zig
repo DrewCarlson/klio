@@ -8332,6 +8332,29 @@ pub const Module = struct {
         return candidate_it.next() != null;
     }
 
+    /// Whether any bare-call candidate for `name` is a PLAIN function rather
+    /// than an extension. An extension candidate cannot answer a bare call
+    /// that supplies no receiver of its receiver type, so a caller deciding
+    /// between "the enclosing class's member" and "a top-level function"
+    /// must not be talked out of the member by an extension namesake:
+    /// kotlinx-io's `Utf8Test` declares both
+    /// `assertCodePointDecoded(String, vararg Int)` and
+    /// `Buffer.assertCodePointDecoded(Int, String, Int)`, and the latter made
+    /// the former's own bare call look like a global.
+    pub fn hasNonExtensionBareCallCandidate(
+        self: *const Module,
+        name: []const u8,
+        caller_file: FileId,
+    ) bool {
+        var candidate_it = self.bareCallCandidateIterator(name, caller_file);
+        while (candidate_it.next()) |cand| {
+            const f = self.funcById(cand) orelse continue;
+            const is_ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+            if (!is_ext) return true;
+        }
+        return false;
+    }
+
     /// Whether source file `file` declares `import <pkg>.*`. A wildcard
     /// import is file-scoped like a named one.
     pub fn importWildcardIn(self: *const Module, file: FileId, pkg: []const u8) bool {
