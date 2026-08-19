@@ -113,13 +113,40 @@ Failures tolerated by the ceilings, worst ratio first:
       `String.Companion.serializer()`'s body stops resolving the internal
       `StringSerializer` object.
 
-      The decisive experiment: with the field present but NEVER POPULATED the
-      census is still 0. So the break is the LAYOUT, not the record data —
-      `ClassDef`/`ClassDefImage` field order is load-bearing for the pack
-      format, and a new field needs that format handled explicitly rather than
-      a struct field with a default. Do that first; the annotation-record
-      plumbing itself is straightforward and `annotationRecordFor` already
-      exists (note it stores AST-owned slices, so lifetimes want checking too).
+      Attempted twice, reverted twice. Findings, in the order they were ruled
+      out — the later ones are the useful ones:
+
+      1. With the field present but NEVER POPULATED the census is still 0, so
+         it is not the record data. `ClassDef`/`ClassDefImage` field order is
+         part of the pack wire format (`src/pack/write.zig` walks struct fields
+         positionally).
+      2. Bumping `FORMAT_VERSION` 2 -> 3 (so stale packs are REJECTED rather
+         than misread, which its own doc comment prescribes) did NOT fix it.
+         Same failure.
+      3. The failure needs the census's SUPPORT files. Bisected to exactly one:
+         `PolymorphismTestData.kt`, whose top-level
+         `val BaseAndDerivedModule = SerializersModule { ... }` runs during
+         module initialization. Every other support file is fine.
+
+      So the real blocker is INITIALIZATION ORDER, not the pack format:
+      `BUILTIN_SERIALIZERS` (a top-level val in upstream's `Primitives.kt`) can
+      initialize before the internal serializer objects it reads, and
+      `String.Companion.serializer()`'s body then misses `StringSerializer`:
+
+          [getfield-miss] name=StringSerializer recv=kotlin.String.Companion
+
+      Any change that perturbs top-level init order exposes it; retaining class
+      annotations was merely one such change. Fix the ordering first, then the
+      annotation-record plumbing is straightforward (note `annotationRecordFor`
+      stores AST-owned slices, so lifetimes want checking, and the layout
+      change still needs the FORMAT_VERSION bump).
+- [ ] B11. **Top-level property initializers, two defects found while
+      chasing B9.** A reduced program with a top-level
+      `val M = SerializersModule { polymorphic(Base::class, Base.serializer()) { … } }`
+      fails outright with `unresolved global BaseAndDerivedModule` — the file's
+      own top-level val does not resolve from `main`. Repro kept at
+      `scratchpad/initorder.kt`. This is independent of serialization and
+      likely worth more than the descriptor work it was blocking.
 - [ ] B10. Element descriptors cannot name their types yet. Building one with
       `PrimitiveSerialDescriptor("kotlin.Int", ...)` is rejected upstream
       ("For serial name kotlin.Int there already exists IntSerializer"), and
