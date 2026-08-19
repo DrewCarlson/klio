@@ -303,8 +303,39 @@ Failures tolerated by the ceilings, worst ratio first:
          extension call is resolved on a DIFFERENT path — find that path
          first.
 
-      For the record, at the site that does reach it the candidate shapes are
-      exactly as expected: `#2953 nparams=3 base=1 p0=this` (the extension),
+      **ROOT CONFIRMED — it is the INLINE SPLICE path, and it connects to
+      B15.** The vararg overload is
+
+          public inline fun <reified T, R> combine(
+              vararg flows: Flow<T>,
+              crossinline transform: suspend (Array<T>) -> R): Flow<R>
+
+      i.e. `inline` with a `reified` type parameter, so the call is resolved
+      by the splice path, not by `resolveBareCall` — which is why the
+      pre-pick experiment above never saw it. `KLIO_INLINE_PICK=combine`
+      against the repro prints
+
+          [ipick] combine n=2 chain0=Flow: recv=-/owner=- recv=-/owner=-
+
+      Two candidates, BOTH receiverless — the two vararg forms. The correct
+      target, `Flow<T1>.combine(flow, transform)`, is a plain `public fun`
+      and therefore is NOT in the inline candidate set at all. The splice
+      picks a vararg by shape and its body iterates `flows`.
+
+      Why B15's `ambiguousByParamTypes` does not catch it: that check
+      compares the inline candidates against EACH OTHER, and these two are
+      alike; the candidate that should win is absent from the set. Its
+      reified exemption is also live here (both varargs declare
+      `reified T`), so even a type-based comparison would decline to act.
+
+      The rule that fits: with a receiver in scope (`recv_chain != null`) and
+      NO inline candidate declaring a receiver, a same-named non-inline
+      extension whose receiver matches the chain should win — i.e. decline
+      the splice in `inlineFnAstForRecvExt`. Note `inline_state` may not have
+      module access to look that extension up; check before designing.
+
+      For the record, at the site that does reach the pre-picks the candidate
+      shapes are exactly as expected: `#2953 nparams=3 base=1 p0=this` (the extension),
       `#2954 nparams=3 base=0 p0=flow`, `#2963`/`#2968 nparams=2 base=0
       p0=flows` (the varargs). So the candidate set is right and only the
       ranking is wrong.
