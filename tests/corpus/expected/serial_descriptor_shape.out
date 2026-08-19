@@ -1,0 +1,5 @@
+elements=4
+host optional=false type=kotlin.String
+port optional=true type=kotlin.Int
+debug optional=true type=kotlin.Boolean?
+max_retries optional=true type=kotlin.Int

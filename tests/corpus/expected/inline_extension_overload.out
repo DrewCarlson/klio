@@ -1,0 +1,4 @@
+list: added=true via=Collection size=2
+set: via=Collection size=1
+bag: via=Bag size=2
+explicit: via=Collection size=2

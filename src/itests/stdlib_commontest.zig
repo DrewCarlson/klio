@@ -19,6 +19,14 @@ const runtime = @import("runtime");
 /// up as fixes land, never down. (Total discovered is ~2082.)
 const BASELINE: usize = 2150;
 
+/// Ceiling on *failing* cases, the mirror of `BASELINE`. A pass floor cannot
+/// see a regression inside the red mass; this bounds the other direction.
+/// Measured solo across both shards: 1024+1277 passed, 0 failed, 0
+/// build-blocked — every stdlib case that runs, passes, so a single new
+/// failure is a real regression and trips this. A file that cannot produce a
+/// summary at all is counted as `build-blocked`, not as a failure.
+const MAX_FAILED: usize = 0;
+
 const TEST_ROOT = "kotlin/libraries/stdlib/test";
 const ACTUALS = [_][]const u8{
     "tests/stdlib_commontest_actuals/PlatformActuals.kt",
@@ -121,6 +129,20 @@ fn testCount(a: std.mem.Allocator, io: std.Io, path: []const u8) usize {
 /// Parse the "<n> tests, <p> passed, ..." summary line for the passed count.
 fn passedCount(stdout: []const u8) ?usize {
     const idx = std.mem.indexOf(u8, stdout, " passed,") orelse return null;
+    var end = idx;
+    while (end > 0 and stdout[end - 1] == ' ') end -= 1;
+    var start = end;
+    while (start > 0 and std.ascii.isDigit(stdout[start - 1])) start -= 1;
+    if (start == end) return null;
+    return std.fmt.parseInt(usize, stdout[start..end], 10) catch null;
+}
+
+/// Parse the "<n> tests, <p> passed, <f> failed" summary line for the failed
+/// count. The mirror of `passedCount`: a pass floor cannot see a regression
+/// inside the red mass, so the failure total is bounded too.
+fn failedCount(stdout: []const u8) ?usize {
+    const idx = std.mem.indexOf(u8, stdout, " failed,") orelse
+        std.mem.lastIndexOf(u8, stdout, " failed") orelse return null;
     var end = idx;
     while (end > 0 and stdout[end - 1] == ' ') end -= 1;
     var start = end;
@@ -333,6 +355,7 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
 
     var next = std.atomic.Value(usize).init(0);
     var total_passed = std.atomic.Value(usize).init(0);
+    var total_failed = std.atomic.Value(usize).init(0);
     var build_blocked = std.atomic.Value(usize).init(0);
     const Pool = struct {
         fn worker(
@@ -340,6 +363,7 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
             penv: *std.process.Environ.Map,
             pnext: *std.atomic.Value(usize),
             ppassed: *std.atomic.Value(usize),
+            pfailed: *std.atomic.Value(usize),
             pblocked: *std.atomic.Value(usize),
         ) void {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -357,6 +381,7 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
                 };
                 if (passedCount(r.stdout)) |p| {
                     _ = ppassed.fetchAdd(p, .monotonic);
+                    if (failedCount(r.stdout)) |f| _ = pfailed.fetchAdd(f, .monotonic);
                 } else {
                     std.debug.print("build-blocked (no pass summary): {s}\n", .{target});
                     _ = pblocked.fetchAdd(1, .monotonic);
@@ -367,7 +392,7 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
     var threads: std.ArrayList(std.Thread) = .empty;
     for (0..workerCount()) |_| {
         try threads.append(a, try std.Thread.spawn(.{}, Pool.worker, .{
-            @as([]const []const []const u8, jobs.items), &env, &next, &total_passed, &build_blocked,
+            @as([]const []const []const u8, jobs.items), &env, &next, &total_passed, &total_failed, &build_blocked,
         }));
     }
     for (threads.items) |t| t.join();
@@ -382,12 +407,31 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
     else
         (BASELINE * my_weight / @max(total_weight, 1)) * 80 / 100;
     std.debug.print(
-        "stdlib_commontest: {d} passed across {d}/{d} files (shard {d}/{d}), {d} build-blocked (min {d}, baseline {d})\n",
+        "stdlib_commontest: {d} passed, {d} failed across {d}/{d} files (shard {d}/{d}), {d} build-blocked (min {d}, baseline {d})\n",
         .{
-            total_passed.load(.monotonic), my_targets,                       targets.items.len,
-            shard_k,                       shard_n,                          build_blocked.load(.monotonic),
-            min_pass,                      BASELINE,
+            total_passed.load(.monotonic),  total_failed.load(.monotonic), my_targets,
+            targets.items.len,              shard_k,                       shard_n,
+            build_blocked.load(.monotonic), min_pass,                      BASELINE,
         },
     );
     try std.testing.expect(total_passed.load(.monotonic) >= min_pass);
+    const failed = total_failed.load(.monotonic);
+    if (failed > MAX_FAILED) {
+        std.debug.print(
+            "stdlib_commontest: {d} failed exceeds the ceiling {d}\n",
+            .{ failed, MAX_FAILED },
+        );
+        return error.FailureCeilingExceeded;
+    }
+}
+
+test "failedCount parses the child summary (negative control for a zero)" {
+    // A zero failure total is only trustworthy if the parser can see a
+    // non-zero one. Same shapes the child actually prints.
+    try std.testing.expectEqual(@as(?usize, 7), failedCount("40 tests, 33 passed, 7 failed, 0 skipped\n"));
+    try std.testing.expectEqual(@as(?usize, 0), failedCount("40 tests, 40 passed, 0 failed, 0 skipped\n"));
+    try std.testing.expectEqual(@as(?usize, 12), failedCount("12 failed"));
+    try std.testing.expectEqual(@as(?usize, null), failedCount("no summary here\n"));
+    // The pass parser must not be fooled by the failure field, and vice versa.
+    try std.testing.expectEqual(@as(?usize, 33), passedCount("40 tests, 33 passed, 7 failed\n"));
 }

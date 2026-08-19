@@ -10,8 +10,39 @@ bottom and are not campaigns.
 
 ## The active plan
 
-None. `plans/conformance-and-hardening.md` CLOSED 2026-08-18 with every
-item landed and `scripts/gate.sh` GREEN; the record is summarised in
+`plans/green-main-backlog.md` (opened 2026-09-05, after CI went green at
+627c341e — `ci-green.md`): the ratchet audit and the `check_examples`
+pack-IR hole (`census-gates-and-red-mass.md` Track D,
+`verification-speed-plan.md`), the resolution residue
+(`resolution-residue-campaign.md`: bare factory vs value-class ctor, Char
+range endpoints, nested-subject context arguments), then the named
+compute floors as the perf era's requested profile evidence
+(`compute-floors-record.md`). Just closed: `serialization-surface-campaign.md`
+and `compose-ui-census-campaign.md` (2026-09-04, json 747/0/0 and
+compose_ui 452/0/0 standing) and the CI campaign (`ci-green.md`,
+2026-09-05, unit + 8 shards green). Just closed 2026-09-02: `leaf-wide-campaign.md`
+(inline leaf eligibility via type-head keys, enum statics, the
+getter-path gate; wide leaves 3200 -> 3764) and
+`open-residue-audit.md` (all seven verdicts; two live root fixes). Predecessors all closed:
+`census-gates-and-red-mass.md` (2026-08-31, every census at ZERO),
+`object-runtime-campaign.md` + `leaf-production-campaign.md`
+(2026-09-01, the kl_ leaf vehicle + standing gates), and
+`native-floor-and-tower-campaign.md` (2026-09-01, transpiled ≥
+interpreted by construction; member-extension tower scoping
+strict-by-default).
+
+THE PERF ERA IS CLOSED (2026-08-29 .. 2026-08-31, five campaigns, each
+doc terminal — do not reopen a per-op interpreter-perf campaign without
+NEW profile evidence): `concurrency-perf-campaigns.md`,
+`interpreter-next-campaign.md` (function-tier coverage + probe tax;
+cost parity), `interpreter-shared-op-campaign.md` (instance shapes;
+ratchet 650 -> 645), `interpreter-native-floor-campaign.md` (kl_
+sub-ABI measured 34x; suite wall proven vpd-bound; Value 16B,
+frame-push, and per-thread-prof closed below threshold). Standing:
+gate 1390/0/0, vpd ratchet 645s, replica 146us, fib native 34x AOT.
+
+`plans/conformance-and-hardening.md` CLOSED 2026-08-18 with every item
+landed and `scripts/gate.sh` GREEN; the record is summarised in
 `PLAN-archive.md`. Its predecessor `simplify-validate-accelerate.md`
 closed 2026-08-17. The items below are the standing fronts any next
 campaign draws from.
@@ -32,14 +63,12 @@ edge-guard/trace store in the emitted C) took rangebench 13.8s ->
 fib 695ms -> 220ms, ahead of the interpreter. The landing record
 (boxing waves, hot-view handover) is in PLAN-archive.md.
 
-Open — measured-first recorded roads, NOT an active front (reopen only
-when a measurement motivates):
-
-- [ ] Deeper C-to-C frames (non-leaf callees) — `c-transpiler-plan.md`.
-- [ ] Wider hot-op coverage in the emitted C — `c-transpiler-plan.md`.
-- [ ] Value 24 -> 16 endgame (both IrClosure and Array must drop under
-      8B or it pays nothing) — `value-layout-campaign.md`; gate any
-      candidate on the compose suite wall as well as rangebench.
+CLOSED 2026-08-31 (`interpreter-native-floor-campaign.md`): the C-to-C
+road was already the landed `kl_` pass — measured 34.5x on fib, corpus
+401/0 — and Value 24 -> 16 re-closed on its own terms (copy bucket
+~2-3% ceiling, IrClosure boxing taxes compose's hottest path). The only
+recorded future vein is WIDENING kl_ eligibility, driven by a real
+program that misses it; details and traps in `c-transpiler-plan.md`.
 
 ## 2. Compose plugin residue
 
@@ -58,21 +87,24 @@ klio-compose-plugin-triage; the build-out log is
 
 Open:
 
-- [ ] The 4 concurrency stress tests + validatePotentialDeadlock + the
-      2 PausableCompositionTests background tests: compute-bound
-      (measured, not mechanism bugs). They are the ACCEPTANCE METRIC
-      for the accelerate track
-      (`simplify-validate-accelerate.md` V4 / Track A).
-- [ ] Latent, waiting for a failure that names them: movableContentOf
-      factory-wrap widening (the drafted ungated patch recursed;
-      bisect plan in the triage memory) and the group start/end
-      imbalance op-trace probe recipe. checkboxLike's slot count is
-      the live emission-shape anchor; any emission work re-runs
-      GroupSizeValidationTests.
-- [ ] Recorded: non-private member-extension-property tower gating
-      (the private half landed; gating the public half cost the suite
-      ~400 tests — needs the receiver-tower emulation to see every
-      legal frame).
+- [x] CLOSED 2026-08-31: the concurrency stress family passes in the
+      standing gate (1390/0/0) under the declared per-test wall caps;
+      the compute floor is the recorded verdict
+      (`interpreter-native-floor-campaign.md` Task 4 — the suite wall
+      IS vpd, guarded by the 645s ratchet). Further movement is the
+      verification-latency campaign's Task 5.
+- [x] CLOSED BY RECORD 2026-08-31 (latent, no failing test names
+      them): movableContentOf factory-wrap widening (bisect plan in the
+      triage memory) and the imbalance op-trace probe recipe stay
+      recorded for the failure that names them; checkboxLike's slot
+      count remains the emission-shape anchor.
+- [x] LANDED 2026-09-01 (`native-floor-and-tower-campaign.md` Task 2):
+      the CALL-half public gating is now kotlinc-exact BY DEFAULT — the
+      program-wide plain (recv, name) pair is deleted for member
+      extension getters and setters. The recorded ~400-test gap
+      measured 540 and decomposed into four root-fixed mechanisms
+      (three synthesized-fn decl_span attribution holes + the owner
+      fqn-vs-simple supertype key mismatch); full battery green.
 
 ## 3. Coroutine debt cluster
 
@@ -87,9 +119,9 @@ is in PLAN-archive.md; the architecture reference is
 
 Open:
 
-- [ ] tl_atomic_update_contended litmus flake — watch state; postmortem
-      on next natural occurrence (the sweep prints got-vs-expected
-      tails).
+- [x] CLOSED AS WATCH-STATE 2026-08-31: litmus 45/45 and every parity
+      battery green all session; the postmortem recipe (sweep
+      got-vs-expected tails) stands for the next natural occurrence.
 - [x] Background-yield 55s round-trip — CLOSED BY MEASUREMENT
       (`simplify-validate-accelerate.md` A6 round record): the yield hop
       on Dispatchers.Default costs ~100us (2000-yield rig), and
@@ -97,13 +129,9 @@ Open:
       false) — the 55s is the test's own PausableComposition resume
       protocol, quadratic upstream (recordModificationsOf over the whole
       remaining scope set per resumeOnce), a compute floor here.
-- [ ] Dispatched-block import scope: an imported top-level fn
-      (kotlin.system.measureTimeMillis) is `unresolved global` inside a
-      Dispatchers.Default-dispatched block (pool child-Vm loses the
-      file's import scope), and the resulting internal CalleeFailed
-      leaves the runBlocking root parked forever — a silent hang where
-      upstream surfaces the failure. Repro: A6 session scratchpad
-      reprosrc/yieldhop.kt.
+- [x] CLOSED 2026-08-31 — verified FIXED: the kept repro (yieldhop.kt)
+      passes on main (yield ~133us, no hang); the defect died in the
+      Aug resolution work.
 
 ## 4. ktor commontest + upstream residue
 
@@ -124,14 +152,12 @@ passes them is unclear — do NOT diverge klio.
 
 Open:
 
-- [ ] Risk note: the widened pack includes are validated by the
-      commontest census only; the ktor_server/client e2e itests gate
-      them in CI.
-- [ ] `KTOR-SERVER-UPSTREAM.md` residue: the client/server
-      serialization shim swap (blocked on the kotlinx.serialization
-      pack growing the real serializer surface upstream
-      KotlinxSerializationConverter compiles against) and the
-      start-path connector-logging launch flake.
+- [x] CLOSED BY RECORD: the risk stands as documentation; the
+      ktor_server/client e2e itests gate the includes in CI.
+- [x] CLOSED AS BLOCKED-WITH-TERMS 2026-08-31: the shim swap reopens
+      when the kotlinx.serialization pack grows the serializer surface
+      KotlinxSerializationConverter compiles against; the launch flake
+      is watch-state. Both recorded in `KTOR-SERVER-UPSTREAM.md`.
 
 ## 5. Suite-wall profile
 
@@ -143,7 +169,8 @@ klio-compose-suite-perf; harness practice in `BENCHMARKS.md`.
 
 ## Doc register
 
-LIVE (open work tracked): `c-transpiler-plan.md`,
+LIVE (open work tracked): `serialization-surface-campaign.md`,
+`compose-ui-census-campaign.md`, `c-transpiler-plan.md`,
 `value-layout-campaign.md`, `KTOR-SERVER-UPSTREAM.md`, and this file.
 `conformance-and-hardening.md` is FINISHED (closed 2026-08-18) and kept
 as a log — it holds the census baselines, the process-global contract,

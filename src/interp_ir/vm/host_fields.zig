@@ -2716,6 +2716,14 @@ fn resolveExtensionPropImpl(
         const pg = self.prog.borrow();
         defer pg.deinit();
         if (lookupPairFunc(Pick.map(pg.get().*), comp_key, name)) |fid| return fid;
+        // A PRIVATE member extension on the companion registers ONLY under
+        // the owner-qualified key, so the plain pair above cannot see it:
+        // `class H { private val Float.Companion.p get() = … }` is reached
+        // from `Float.p` through these two.
+        if (pg.get().owner_keyed_ext_names.contains(name)) {
+            if (ownerKeyedExtProp(setters, Pick.map(pg.get().*), comp_key, name)) |fid| return fid;
+            if (importOwnedExtProp(self, Pick.map(pg.get().*), comp_key, name)) |fid| return fid;
+        }
         // A class value IS a `KClass`: a `val KClass<*>.x` extension applies
         // to it directly (`qualifiedOrSimpleName` behind `KClass.cast`'s
         // error message). The getter runs with the class value as `this`,
@@ -2755,15 +2763,38 @@ fn resolveExtensionPropImpl(
     {
         const pg = self.prog.borrow();
         defer pg.deinit();
+        // A companion-object receiver arrives under its MANGLED runtime class
+        // name (`Target$Companion$Companion`); extension properties on a
+        // companion are registered under the SOURCE-WRITTEN receiver type
+        // (`Target.Companion`). Every lookup below has to try both, or a
+        // companion extension is unreachable from a companion instance.
+        var comp_alias_buf: [256]u8 = undefined;
+        const comp_alias: ?[]const u8 = blk: {
+            const at = std.mem.indexOf(u8, recv_simple, "$Companion") orelse break :blk null;
+            if (at == 0) break :blk null;
+            break :blk std.fmt.bufPrint(&comp_alias_buf, "{s}.Companion", .{recv_simple[0..at]}) catch null;
+        };
+
         if (pg.get().owner_keyed_ext_names.contains(name)) {
             if (ownerKeyedExtProp(setters, Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
             if (importOwnedExtProp(self, Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
+            // A PRIVATE member extension registers ONLY under the
+            // owner-qualified key, so the companion alias must be tried here
+            // too — this is the arm that resolves
+            // `class H { private val T.Companion.p get() = … }`.
+            if (comp_alias) |alias| {
+                if (ownerKeyedExtProp(setters, Pick.map(pg.get().*), alias, name)) |fid| return fid;
+                if (importOwnedExtProp(self, Pick.map(pg.get().*), alias, name)) |fid| return fid;
+            }
         }
         if (missTraceEnvCached()) |w| {
             if (std.mem.eql(u8, w, name))
                 std.debug.print("[extprop-walk] try=({s},{s})\n", .{ recv_simple, name });
         }
         if (lookupPairFunc(Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
+        if (comp_alias) |alias| {
+            if (lookupPairFunc(Pick.map(pg.get().*), alias, name)) |fid| return fid;
+        }
         // A file-mangled class (`KeyInfo$f352`, one of two same-simple-name
         // internal classes) registers its extension properties under the
         // SOURCE-WRITTEN receiver name: retry with the base name.
