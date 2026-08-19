@@ -32,11 +32,16 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         },
         // Census floor: 1073 solo with the support surface wired. The
         // ratchet leaves headroom for the loaded `test-all`.
-        .baseline = 1040,
+        .baseline = 1070,
         // Bound the red mass too: a floor alone cannot see a fixed case
         // traded for a broken one. Measured solo: 137 failing, 6 not
         // completing. Lower these as fixes land, never raise them.
-        .max_failed = 150,
-        .max_incomplete = 10,
+        // 150 -> 141. Measured 1075 passed / 139 failed / 6 did not complete
+        // after bare calls stopped splicing a receiverless inline candidate
+        // when a non-inline extension fits the receiver in scope. Held two
+        // above the measurement: this suite's dispatched tests vary by a
+        // couple between runs.
+        .max_failed = 141,
+        .max_incomplete = 8,
     });
 }

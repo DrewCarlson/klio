@@ -7799,6 +7799,35 @@ fn receiverMemberTakesCall(b: *FuncBuilder, evid_chain: ?[]const []const u8, nm:
     return false;
 }
 
+/// Whether the module declares a same-named NON-inline extension whose
+/// receiver head appears in `chain`. Used to decline an inline splice that
+/// picked a receiverless candidate while a receiver is in scope: the inline
+/// candidate set cannot contain the extension (it is not inline), so the
+/// decline has to come from outside that set.
+fn nonInlineExtensionFits(b: *FuncBuilder, name: []const u8, chain: []const []const u8, file: ir.FileId) bool {
+    // `import kotlinx.coroutines.flow.combine as combineOriginal` means the
+    // call site's name is not the declared one; look the extension up under
+    // what it is actually called. CombineTest imports exactly this way, so
+    // without the unaliasing the check found nothing.
+    var lookup = name;
+    if (b.module.importAliasIn(file, name)) |segs| {
+        if (segs.len != 0) lookup = segs[segs.len - 1];
+    }
+    for (b.module.funcsBySimpleName(lookup)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        var rh = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
+        if (std.mem.indexOfScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
+        const rhead = typeHead(rh);
+        for (chain) |c| {
+            var ch = std.mem.trimEnd(u8, c, "?");
+            if (std.mem.indexOfScalar(u8, ch, '<')) |lt| ch = ch[0..lt];
+            if (std.mem.eql(u8, rhead, typeHead(ch))) return true;
+        }
+    }
+    return false;
+}
+
 fn inlineTargetForBareCall(
     b: *FuncBuilder,
     seg: *const ast.Ident,
@@ -7819,6 +7848,57 @@ fn inlineTargetForBareCall(
     // requires a splice; ordinary calls still fall through to the host binding
     // because `bareInlineNeedsSplice` rejects them.
     const narrowed = inlineFnAstForRecv(nm, shape, evid_chain);
+    // A receiver is in scope and the splice picked a RECEIVERLESS candidate,
+    // while a same-named non-inline EXTENSION fits that receiver: the correct
+    // target is not in the inline candidate set at all, so no comparison among
+    // inline candidates can find it. kotlinx-coroutines declares
+    // `Flow<T1>.combine(flow, transform)` as a plain `public fun` and
+    // `combine(vararg flows, transform)` as `inline` + `reified`, so a bare
+    // `combine(other, transform)` inside a Flow extension spliced a vararg and
+    // its body iterated `flows`:
+    //   Vm::call_member `iterator` on `kotlinx.coroutines.flow.SafeFlow`
+    // Declining hands the call to normal dispatch, which binds the extension.
+    // Gated on the extension existing, so a reified splice with no such
+    // sibling still splices and keeps its type argument.
+    if (runtime.envOnce("KLIO_SPLICEDECL")) |w| if (std.mem.eql(u8, w, nm)) {
+        std.debug.print("[splicedecl] {s} narrowed={} recvty={?s} chain={?d} fits={}\n", .{
+            nm, narrowed != null,
+            if (narrowed) |p| (if (p.receiver_type) |rt| rt.name.name else null) else null,
+            if (evid_chain) |c| c.len else null,
+            if (evid_chain) |c| nonInlineExtensionFits(b, nm, c, seg.span.file) else false,
+        });
+    };
+    // Whether the splice that would happen is RECEIVERLESS: either the
+    // receiver-narrowed pick is one, or narrowing found nothing at all and the
+    // indexed resolution below will choose among the receiverless namesakes.
+    const splice_would_be_receiverless = if (narrowed) |p|
+        (p.receiver_type == null and inline_state.inlineMemberOwner(p) == null)
+    else blk: {
+        // Narrowing found nothing, so the indexed resolution below will pick
+        // among the inline candidates. Only decline when NONE of them takes a
+        // receiver — otherwise the inline EXTENSION is the right target and
+        // declining would strand the call (`Flow<T>.collect { … }` is an
+        // inline extension, and declining it left `collect` unresolved).
+        // The candidate table is keyed by the DECLARED name, so an aliased
+        // call (`import … .combine as combineOriginal`) must unalias first.
+        var cname = nm;
+        if (b.module.importAliasIn(seg.span.file, nm)) |segs| {
+            if (segs.len != 0) cname = segs[segs.len - 1];
+        }
+        const cands = inline_state.candidatesForName(cname) orelse break :blk false;
+        for (cands) |c| {
+            if (c.receiver_type != null or inline_state.inlineMemberOwner(c) != null) break :blk false;
+        }
+        break :blk cands.len != 0;
+    };
+    if (splice_would_be_receiverless) {
+        if (evid_chain) |chain| {
+            // Abandon the splice outright: clearing `narrowed` is not enough,
+            // because the indexed resolution below re-picks the same
+            // receiverless namesake and splices it anyway.
+            if (nonInlineExtensionFits(b, nm, chain, seg.span.file)) return null;
+        }
+    }
     const ires = b.module.resolveBareCallIndexed(
         nm,
         b.self_package,
