@@ -552,12 +552,23 @@ Failures tolerated by the ceilings, worst ratio first:
       discriminate here (both take one argument), so the fix needs the
       argument's static type against the local's declared parameter type.
 
-      NOT attempted: `prefer_member` governs bare-call preference program
-      wide, and `localFnOverloads` deliberately only selects when a name is
-      declared twice as a LOCAL fn — the member-extension sibling is invisible
-      to it. Changing that rule for one test carries more regression risk than
-      it is worth without a full sweep behind it. Do it with the corpus and
-      both heavy suites ready to run. `private inner class RC4Key(key:
+      ATTEMPTED AND REVERTED. A gate was added at `prefer_member` allowing
+      the member to win when the local's declared parameter type provably
+      rejects the argument (`localFnParamTys` for the local,
+      `staticCallReturnTypeRef` for a call argument like
+      `data.size.toUInt()`). It never fires: traced against the real file,
+      `localFnRejectsArgs` is not reached at all, because neither
+      `isLocalFn(name)` nor `isLocalExtFn(name)` holds at that site. So the
+      `prefer_member` decision is NOT where this call is decided either —
+      the same lesson as the datetime and CombineTest chases.
+
+      Both pieces the fix needs do exist and are worth reusing when the right
+      site is found: `b.localFnParamTys(name)` gives the local's declared
+      parameter types, and `static_call_type.staticCallReturnTypeRef(b, expr)`
+      gives a call argument's static type. Arity cannot discriminate here —
+      both candidates take one argument — so a type comparison is required.
+
+      Paths ruled out for this bug: `prefer_member` in `resolveBareCall`. `private inner class RC4Key(key:
       String)` reads `key` — a plain parameter, not a property — from an
       `init` block, and klio treats it as a field:
       `Vm::get_field key on RC4Key`. Repro:
