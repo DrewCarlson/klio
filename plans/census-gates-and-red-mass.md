@@ -340,11 +340,18 @@ Failures tolerated by the ceilings, worst ratio first:
       the call ends as a total member miss that surfaces as
       `Companion.invoke`.
 
-      So the gap is: `CallMemberOrGlobal` commits to the MEMBER arm and, on a
-      total miss, never falls through to the GLOBAL arm — despite the
-      instruction's name. That fall-through is the fix, and it is a
-      dispatch-wide change: stage the corpus, the stdlib sweep and both heavy
-      suites before attempting it.
+      What is CONFIRMED stops there: the member walk ends in a total miss,
+      and the failure surfaces as `call_member invoke on Stamp.Companion`.
+
+      What is NOT confirmed — and an earlier draft of this entry wrongly
+      asserted it — is that `CallMemberOrGlobal` has no member-to-global
+      fall-through. It does: `exec_call.zig` runs a global arm after the
+      member walk ("Overloaded top-level function: select by runtime arg
+      types"). So the question is not whether the fall-through exists but
+      why it does not bind the top-level factory here, or where the
+      `Companion.invoke` attempt is made. Answer that before changing
+      anything; a dispatch-wide edit made on the wrong premise is how the
+      earlier `shadowedByClass` attempt turned into a no-op.
 
       Worth at least the three `TimeZoneTest.newYorkOffset*` cases and
       probably more of the 62.
