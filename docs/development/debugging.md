@@ -526,3 +526,33 @@ KLIO_COMPOSE_SKIP=0 ./zig-out/bin/klio run scene.kt            # no skip calculu
 Rebuild any baked pack between flips (the flag is part of the pack
 cache key), and add `KLIO_COMPOSE_DBG=1` to confirm the pass
 activated.
+
+## Measuring peak RSS (and the spin-loop trap)
+
+Use `scripts/measure-rss.sh -- <cmd>`; it prints `PEAK_KB=<n> RC=<rc>
+WALL=<s>`. For `zig build itest-*` you usually do not need it at all — the
+build runner already prints `MaxRSS:` per run step under `--summary all`.
+
+Do NOT hand-roll the sampler. The obvious inline version leaks a process
+that spins forever:
+
+    ( <cmd> ) &
+    TP=$(pgrep -f "<name>" | head -1)          # matches THIS shell too
+    while kill -0 $TP; do ...; sleep 10; done  # never terminates
+
+`pgrep -f` matches full command lines, and the wrapper's own command line
+contains the pattern, so `TP` is the wrapper itself, `kill -0` is always
+true, and the loop runs at 0% CPU with a `sleep` child until something
+reaps it. Three of these leaked in one session, two for sixteen hours,
+because a run that prints nothing reads as "the measurement failed" rather
+than "it is still going".
+
+`measure-rss.sh` removes both failure modes by construction: the PID comes
+from `$!` so no name matching happens, the loop is bounded by `--max-wall`
+(default 900s) as well as by the child exiting, and an EXIT trap kills the
+child on every path out.
+
+The same self-match bites VERIFICATION code: `pgrep -f "sleep 600"` run
+from a shell whose command line contains `sleep 600` reports a leak that
+is not there. Check with `ps -eo pid,comm,args` and match on `comm`
+instead.
