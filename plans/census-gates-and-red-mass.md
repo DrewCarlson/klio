@@ -718,13 +718,32 @@ Failures tolerated by the ceilings, worst ratio first:
       does take produces no `KLIO_OR_AUDIT` line, i.e. a site with no audit
       hook (the same obstacle the CombineTest chase hit).
 
-      Two things make this tractable for whoever picks it up: the target is
-      statically unambiguous (a single candidate `f`), so the receiver type is
-      available at the deferral; and `lowerLambda` already consults
-      `b.lambdaArgRecv(expr.span())` and `b.peekExpected()`'s
-      `function.receiver`, so either channel works once the deferred path
-      supplies it. Add an audit hook to that emit first so the site stops
-      being invisible.
+      THE TYPING APPROACH IS RULED OUT. A `recordVarargLambdaReceivers`
+      helper was eventually landed at the right site — `lowerCallGeneral`,
+      found by tracing, after `argLambdaBroadMasks`'s three sites and
+      `lowerUnresolvedBareCall` were each tried and traced as unreached —
+      and made to work end to end:
+
+          [vr] f: params=1 lastvararg=true lastty=Function0 head=Sink
+          [vr-rec] f arg0 span=379..392 had=null
+          [vr-rec] f arg1 span=394..407 had=null
+          [vr-lam] span=379..392 rec=Sink
+          [vr-lam] span=394..407 rec=Sink
+
+      `lowerLambda` receives `recorded_recv = Sink` for both literals, which
+      makes `receiver_head` non-null and `lambda_has_receiver` true — and the
+      program STILL fails with `this` as Unit at run time. So giving the
+      literal its receiver TYPE is not what is missing; the defect is
+      downstream of that, in how the receiver-lambda closure is built or how
+      an element of the vararg array is invoked. Reverted.
+
+      Note for contrast: the working `f(b1, b2)` case shows `rec=null` at
+      `lowerLambda` and works anyway, taking its receiver from
+      `peekExpected().function.receiver` at the declaration instead. Compare
+      the two closures' shapes — that difference is the remaining lead.
+
+      Sites eliminated: the three `argLambdaBroadMasks` call sites,
+      `lowerUnresolvedBareCall`, and receiver-type recording as a whole.
 
 ## Traps
 
