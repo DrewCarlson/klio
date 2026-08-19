@@ -637,6 +637,42 @@ Failures tolerated by the ceilings, worst ratio first:
       reaching the same class from INSIDE the local class works. Found while
       writing B18's example.
 
+- [ ] B23. **datetime: `alternativeParsing` formats its ALTERNATIVES once
+      there are two or more.** The alternatives are parse-only; only the
+      primary block formats. klio emits all of them:
+
+          zero-alt  = M     (correct)
+          one-alt   = M     (correct)
+          two-alt   = ABM   (should be M)
+          three-alt = ABCM  (should be M)
+
+      Repro: `scratchpad/altfmt3.kt`. Real symptom, `testRfc1123`:
+      `Expected <… 11:05:30 GMT>, actual <… 11:05:30 UTZGMT>` — the `UT` and
+      `Z` parse-alternatives leaking into the formatted output.
+
+      Upstream is correct on both sides:
+      `AlternativesParsingFormatStructure.formatter()` returns ONLY
+      `mainFormat.formatter()`, and `appendAlternativeParsingImpl` builds each
+      alternative in its own `createEmpty()` builder.
+
+      RULED OUT: `createEmpty()` (the sibling `appendOptionalImpl` uses the
+      same `createEmpty().also { … }` pattern and formats correctly — the
+      `GMT` in that same output comes from it), and generic spread-plus-named
+      argument binding (`scratchpad/spreadnamed.kt` reproduces the exact call
+      shape — `impl(*alts, mainOne = primary)` — in plain Kotlin and is
+      correct at 0, 1, 2 and 3 alternatives).
+
+      So the trigger is narrower than either: it needs the datetime builder's
+      shape — a GENERIC receiver-lambda parameter (`ActualSelf.() -> Unit`)
+      plus the `as Array<out AbstractDateTimeFormatBuilder<*, *>.() -> Unit>`
+      cast that `alternativeParsing` performs before forwarding. Start by
+      reproducing THAT, not the plain vararg.
+
+      Also of note: klio warns at the call site that it "may type its lambda
+      arguments incorrectly" for an unimported `alternativeParsing` — but the
+      failure is identical with the import present, so the warning is a red
+      herring here.
+
 ## Traps
 
 - `zig-out/bin/klio` goes stale silently. A pack build against a stale binary
