@@ -67,8 +67,8 @@ Failures tolerated by the ceilings, worst ratio first:
 | suite | passes | failures | conforming |
 |---|---|---|---|
 | serialization | 57 | 81 | 41% |
-| datetime | 450 | 70 | 87% |
-| coroutines | 1040 | 150 | 87% |
+| datetime | 457 | 62 | 88% |
+| coroutines | 1073 | 141 (+6 DNC) | 88% |
 | io | 1182 | 9 | 99% |
 | compose_plugin | 1375 | 15 | 99% |
 | androidx_collection | 1309 | 15 | 99% |
@@ -253,7 +253,36 @@ Failures tolerated by the ceilings, worst ratio first:
       measurement for 90s was WORSE overall — 1336 passed with the two
       Snapshot classes no longer completing, against 1345 at 10s. The real fix
       is the dispatch path, which is its own campaign.
-- [ ] B4. coroutines (150) and datetime (70) — the largest absolute masses.
+- [x] B4. coroutines and datetime CENSUSED — this was the missing
+      information; neither had been measured before.
+
+      **coroutines: 1073 passed / 141 failed / 6 did not complete across 148
+      files.** Shapes: `Vm::call_member X on X` 35.5% (50 — expect a handful
+      of dispatch roots, not 50 bugs), `Vm::get_field` 7.8%,
+      `unresolved global` 7.8%. Worst files: `CombineTest` 84/28,
+      `ChannelUndeliveredElementFailureTest` 0/13, `ParentCancellationTest`
+      3/8, `BufferedChannelTest` 4/7, `MergeTest` 8/6.
+
+      The 0/13 file looked like one root but is not: under the census's real
+      invocation its failures are ordering assertions — `Too few unhandled
+      exceptions`, `Should not be reached, 'expect' was not called yet` —
+      i.e. kotlinx's `expect(n)` execution-order helper disagreeing with
+      klio's scheduling. Behavioural semantics (undelivered-element handlers,
+      cancellation ordering), not a mechanical fix. Note the standalone run of
+      that file reports `unresolved global runTest` instead, which is a
+      harness artefact and NOT the real failure — always census it.
+
+      **datetime: 457 passed / 62 failed across 56 files.** Shapes are spread:
+      `exception` 24%, `IllegalStateException: Check failed.` 13%,
+      `Vm::call_member` 11%, and 5 cases of
+      `Expected DateTimeArithmeticException ... but was
+      IllegalArgumentException` (a wrong exception TYPE — likely cheap).
+      Two more assert `Expected <UTC>, actual <null>` and
+      `Expected <America/New_York>, actual <null>`, so timezone lookup
+      returns null — a bounded, concrete cluster worth taking first.
+      Worst files: `DateTimeComponentsFormatTest` 7/13,
+      `DateTimeComponentsSamples` 15/10, `InstantTest` 23/6,
+      `TimeZoneTest` 8/5.
 
 ## Suites at zero
 
