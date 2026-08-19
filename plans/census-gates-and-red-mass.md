@@ -92,10 +92,41 @@ Failures tolerated by the ceilings, worst ratio first:
       claiming a structure the type-erased path cannot produce).
       Still open: per-element annotations, which need the anchors exposed the
       same way.
-- [ ] B2. Census the remaining serialization failures and rank the roots.
-      `scripts/commontest-census.py serialization --errors` gives the
-      per-failure error shapes; it reads the suite config straight out of the
-      Zig itest so it cannot drift from the gate.
+- [x] B2. Serialization census taken: **57 passed / 81 failed across 28
+      files**. Three files carry 23 of the failures and all three are
+      descriptor fidelity: `SerialDescriptorAnnotationsTest` 0/9,
+      `SerialDescriptorEqualityTest` 0/7, `SchemaTest` 0/7. Failure shapes:
+      `Vm::call_member X on X` 18.5%, `NoSuchElementException: List is empty.`
+      11.1%, descriptor-name/serialName mismatches ~10%, `unresolved global`
+      6.2%.
+- [ ] B9. **`@SerialName` on a class — BLOCKED on the pack format.**
+      `ClassDef` retains annotation NAMES but not their arguments, so
+      `@SerialName("MyClass")` is known to be present and its value
+      unreachable; the descriptor falls back to the qualified class name.
+      That accounts for ~8 failures of the shape
+      `Expected <MyClass>, actual <pkg.Outer.WithNames>`.
+
+      Implemented and REVERTED. Adding `annotation_records` to `ClassDef` (and
+      `ClassDefImage`) works in a direct `klio run`, but takes the census from
+      57 passed to **0 passed / 28 "module initialization failed"** — every
+      file dies initializing `BUILTIN_SERIALIZERS`, where
+      `String.Companion.serializer()`'s body stops resolving the internal
+      `StringSerializer` object.
+
+      The decisive experiment: with the field present but NEVER POPULATED the
+      census is still 0. So the break is the LAYOUT, not the record data —
+      `ClassDef`/`ClassDefImage` field order is load-bearing for the pack
+      format, and a new field needs that format handled explicitly rather than
+      a struct field with a default. Do that first; the annotation-record
+      plumbing itself is straightforward and `annotationRecordFor` already
+      exists (note it stores AST-owned slices, so lifetimes want checking too).
+- [ ] B10. Element descriptors cannot name their types yet. Building one with
+      `PrimitiveSerialDescriptor("kotlin.Int", ...)` is rejected upstream
+      ("For serial name kotlin.Int there already exists IntSerializer"), and
+      taking it from `Int.serializer().descriptor` instead pulls
+      `BUILTIN_SERIALIZERS` into top-level module initialization, which fails
+      the same way as B9. `isElementOptional` (from the parameter default)
+      DID land and works.
 - [x] B3. Name the failures. Both bespoke suites now print failing test
       names, which collapsed the counts into roots:
 
