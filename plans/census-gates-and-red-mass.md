@@ -312,6 +312,30 @@ Failures tolerated by the ceilings, worst ratio first:
       symptom is a 3-byte result where 1 is expected, i.e. the surrogate
       branch's single `?` byte is not what lands in the buffer. Start there.
 
+- [x] B17. **io 9 -> 2: `lastIndex`/`indices` vs `length`.** See the commit;
+      the eliminations are recorded there.
+- [~] B18. **Classes nested inside a LOCAL class were never registered.**
+      `registerClass` synthesised the local class's own ClassDef and lowered
+      its methods but never walked `class.members`, so a class declared inside
+      a local class was unresolvable — `unresolved global RC4Key` in
+      kotlinx-io's `rawSourceSample`, which declares a decrypting source
+      inside a test function holding an `inner class` for its cipher key.
+      Fixed for BOTH registration paths (captured and uncaptured), plain
+      nested and `inner` alike, recursing for deeper nesting.
+
+      PARTIAL: this fixes the shape under `klio run` (example +
+      corpus pin), but the same source under `klio test` still fails, so
+      io's census is unchanged at 2. The test runner reaches local classes
+      by a different route that does not go through
+      `host_classes.registerClass`; find that route next. Repro:
+      `scratchpad/InnerT.kt` — identical code passes under `run` and fails
+      under `test`, which is the whole clue.
+- [ ] B19. Qualified access to a nested class of a local class
+      (`Decrypting.Marker()`) fails with
+      `Vm::call_member Marker on kotlin.reflect.KClass`. Separate from B18 —
+      reaching the same class from INSIDE the local class works. Found while
+      writing B18's example.
+
 ## Traps
 
 - `zig-out/bin/klio` goes stale silently. A pack build against a stale binary
