@@ -8567,8 +8567,36 @@ fn staticArgHead(b: *const FuncBuilder, e: *const Expr) ?[]const u8 {
             if (p.segments.len != 1) break :blk null;
             break :blk b.localDeclType(p.segments[0].name);
         },
+        // A zero-argument stdlib CONVERSION has a statically known result
+        // type, and it is often the only evidence a bare call has. Without it
+        // `writeULEB128(data.size.toUInt())` inside kotlinx-io's local
+        // `Buffer.writeULEB128(data: UIntArray)` had no argument head, the
+        // type disproof below was skipped, the local was judged applicable on
+        // arity alone, and the call recursed into itself.
+        .Call => |c| blk: {
+            if (c.args.len != 0 or c.callee.* != .Member) break :blk null;
+            break :blk conversionResultHead(c.callee.Member.name.name);
+        },
         else => null,
     };
+}
+
+/// The result type of a zero-argument stdlib conversion (`toUInt`, `toLong`,
+/// ...), or null for any other name. Deliberately a fixed list: these are
+/// canonical stdlib conversions whose result type is fixed by their name.
+fn conversionResultHead(name: []const u8) ?[]const u8 {
+    const pairs = [_]struct { m: []const u8, t: []const u8 }{
+        .{ .m = "toInt", .t = "Int" },       .{ .m = "toLong", .t = "Long" },
+        .{ .m = "toShort", .t = "Short" },   .{ .m = "toByte", .t = "Byte" },
+        .{ .m = "toFloat", .t = "Float" },   .{ .m = "toDouble", .t = "Double" },
+        .{ .m = "toUInt", .t = "UInt" },     .{ .m = "toULong", .t = "ULong" },
+        .{ .m = "toUShort", .t = "UShort" }, .{ .m = "toUByte", .t = "UByte" },
+        .{ .m = "toChar", .t = "Char" },     .{ .m = "toBoolean", .t = "Boolean" },
+    };
+    for (pairs) |p| {
+        if (std.mem.eql(u8, name, p.m)) return p.t;
+    }
+    return null;
 }
 
 fn allUppercase(s: []const u8) bool {
@@ -8620,6 +8648,23 @@ fn headIsFunctionType(d: []const u8) bool {
 /// applicability / shadow-or-fall-through decision) the lambda case is
 /// disproof-only: reject only a definite non-function scalar, since an
 /// unknown class name may be a function typealias.
+/// Builtin container heads: final array/collection types that no scalar can
+/// ever be an instance of.
+fn headIsContainer(h: []const u8) bool {
+    const heads = [_][]const u8{
+        "Array",       "IntArray",   "LongArray",  "ShortArray",  "ByteArray",
+        "FloatArray",  "DoubleArray", "CharArray", "BooleanArray",
+        "UIntArray",   "ULongArray", "UShortArray", "UByteArray",
+        "List",        "MutableList", "Set",       "MutableSet",
+        "Map",         "MutableMap", "Collection", "MutableCollection",
+        "Iterable",    "Sequence",
+    };
+    for (heads) |x| {
+        if (std.mem.eql(u8, h, x)) return true;
+    }
+    return false;
+}
+
 fn headCompatible(h: []const u8, d_raw: []const u8, strict: bool) bool {
     const d = std.mem.trimEnd(u8, d_raw, "?");
     if (std.mem.eql(u8, d, "Any") or std.mem.eql(u8, d, "Unit")) return true;
@@ -8632,6 +8677,14 @@ fn headCompatible(h: []const u8, d_raw: []const u8, strict: bool) bool {
     if (d_fn) return false;
     if (std.mem.eql(u8, h, d)) return true;
     if (headIsNumeric(h) and headIsNumeric(d)) return true;
+    // A scalar argument can never satisfy an ARRAY or COLLECTION parameter.
+    // These are final builtin containers with no scalar subtype, so unlike a
+    // plain class name (which could be a supertype of the argument) they
+    // disprove outright. kotlinx-io's local
+    // `Buffer.writeULEB128(data: UIntArray)` was judged able to take
+    // `writeULEB128(data.size.toUInt())` without this, and the call recursed
+    // into itself.
+    if (headIsScalar(h) and headIsContainer(d)) return false;
     // The head is a definite literal kind; a differently-named declared
     // class stays unknown (could be a supertype) — only the builtin
     // scalar heads disprove each other.
