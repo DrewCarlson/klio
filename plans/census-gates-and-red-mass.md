@@ -288,11 +288,29 @@ Failures tolerated by the ceilings, worst ratio first:
       `doubleHighSurrogate`), all failing as
       `IndexOutOfBoundsException: index N out of bounds (length N)` — the
       decoder yields MORE code points than the test expects. NOT a
-      representation limit: klio round-trips a lone surrogate correctly
-      (`"\ud800".length == 1`, `code == d800`, and pairs split into
-      `d83d`/`de00`). The fault is in the interpreted UTF-8 state machine's
-      surrogate handling. Plus two singles (`rawSourceSample`,
+      representation limit. Plus two singles (`rawSourceSample`,
       `unsafeSamples`).
+
+      RULED OUT, each checked directly rather than assumed — do not re-test
+      these:
+      - String representation. `"\ud800".length == 1` and `code == d800`;
+        a real pair splits into `d83d`/`de00`. Lone surrogates round-trip.
+      - `Char` range containment. `'\ud800' in '\ud800'..'\udfff'` is true,
+        `!in` is false, and a char below the range is excluded.
+      - `Int` range containment inside a `when`, which is the shape
+        `commonWriteUtf8CodePoint` uses: `0xd800`, `0xdc00`, `0xdfff` all
+        select the surrogate branch; `0xd7ff` and `0xe000` fall through to
+        the 3-byte branch. Correct.
+      - The encoder's branch structure. Replicating
+        `commonAsUtf8ToByteArray`'s `when` standalone yields `[63]` (`?`) for
+        both a lone high and a lone low surrogate, which is exactly what the
+        test expects.
+
+      So the arithmetic and the control flow are right, and the fault is
+      further down — in `Buffer`/`UnsafeBufferOperations.writeToTail` (the
+      surrogate branch writes through it) or in `readByteArray`. The
+      symptom is a 3-byte result where 1 is expected, i.e. the surrogate
+      branch's single `?` byte is not what lands in the buffer. Start there.
 
 ## Traps
 
