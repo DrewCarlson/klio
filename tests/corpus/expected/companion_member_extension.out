@@ -1,0 +1,8 @@
+top:T
+private-member:T
+public-member:T
+negativeZero=-0.0
+bits=0x80000000
+equalsPositiveZero=true
+equalsItself=true
+viaFunction=-0.0

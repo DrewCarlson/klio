@@ -183,6 +183,7 @@ Run any program with:
 | `accessor_return_type.kt`      | Accessor return-type inference.                             |
 | `backing_fields.kt`            | Explicit backing fields (`val items: List<T>` + `field = mutableListOf()`): field-typed reads inside the declaring scope, subtyped field types, deferred init-block assignment, top-level fields. |
 | `serial_names.kt`              | `@SerialName` wire-name renaming through `Json.encodeToString`/`decodeFromString` under target-less, `@property:`, and `@all:` placements (needs `--feature kotlinx.serialization/json`). |
+| `companion_member_extension.kt` | Extension properties on a companion object declared as members of another class, `private` and public, on a user class and on a builtin's companion. |
 | `serial_descriptor_shape.kt`   | The `SerialDescriptor` a `@Serializable` class reports: element names, which elements are optional (their constructor parameter has a default), and each element's own descriptor. |
 | `interface_companion_state.kt` | Shared companion-object state on an interface.              |
 | `safe_assign.kt`               | Safe-call assignment.                                       |
