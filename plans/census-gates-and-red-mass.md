@@ -322,10 +322,29 @@ Failures tolerated by the ceilings, worst ratio first:
       Attempted and REVERTED: gating `shadowedByClass`'s
       `enclosingHasMemberNamed` on `callableMemberApplicable(name, nargs)`.
       It has no effect — that helper answers true here, falling back to name
-      presence — and the emit stays `class_or_factory_call`. The fix belongs
-      in the runtime global arm (`host_call_func`, near
-      `hasConstructibleClass`), which should construct a class rather than
-      look for a companion `invoke` that does not exist.
+      presence — and the emit stays `class_or_factory_call`.
+
+      PINNED with `KLIO_MISS_TRACE`. The member arm behaves correctly:
+
+          [pmo] `Stamp` decline=oversupply eff_args=5 params=3
+          [rim2] collected=1 picked=false args=5
+          [extfb] name=Stamp simple-name fids=1 want=6 args: Int Int Int Int Int
+          [extfb]  fid=8356 shape-skip nparams=6
+          [miss] call_member `Stamp` total miss
+
+      The 3-param member declines on oversupply, as it should. The only
+      fallback consulted afterwards is `extfb`, which considers EXTENSIONS
+      only — it skips the top-level factory because that is a plain function
+      (`params[0].name != "this"`), which is correct for what `extfb` is for.
+      Nothing then tries the plain top-level function or the constructor, and
+      the call ends as a total member miss that surfaces as
+      `Companion.invoke`.
+
+      So the gap is: `CallMemberOrGlobal` commits to the MEMBER arm and, on a
+      total miss, never falls through to the GLOBAL arm — despite the
+      instruction's name. That fall-through is the fix, and it is a
+      dispatch-wide change: stage the corpus, the stdlib sweep and both heavy
+      suites before attempting it.
 
       Worth at least the three `TimeZoneTest.newYorkOffset*` cases and
       probably more of the 62.
