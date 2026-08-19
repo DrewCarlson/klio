@@ -697,13 +697,21 @@ private fun epochSecondsToLocalDateTime(sec: Long, nanos: Int): LocalDateTime {
     )
 }
 
-fun Instant.toLocalDateTime(timeZone: TimeZone): LocalDateTime {
+// An Instant outside LocalDateTime's range surfaces as
+// `DateTimeArithmeticException`, not the raw range failure. Upstream's
+// commonKotlin conversion wraps it exactly this way; klio supplies its own
+// actual over the chrono binding and has to keep the same contract, or
+// `assertFailsWith<DateTimeArithmeticException> { Instant.MAX.toLocalDateTime(tz) }`
+// sees an IllegalArgumentException instead.
+fun Instant.toLocalDateTime(timeZone: TimeZone): LocalDateTime = try {
     timeZone.offsetSeconds?.let { off ->
         return epochSecondsToLocalDateTime(epochSeconds + off, nanosecondsOfSecond)
     }
     val parts = __kxdt_instantToLocalParts(epochSeconds, nanosecondsOfSecond, timeZone.id)
-    return LocalDateTime(parts[0].toInt(), parts[1].toInt(), parts[2].toInt(),
+    LocalDateTime(parts[0].toInt(), parts[1].toInt(), parts[2].toInt(),
         parts[3].toInt(), parts[4].toInt(), parts[5].toInt(), parts[6].toInt())
+} catch (e: IllegalArgumentException) {
+    throw DateTimeArithmeticException("Instant $this is not representable as LocalDateTime", e)
 }
 
 fun LocalDateTime.toInstant(timeZone: TimeZone): Instant {
@@ -715,8 +723,11 @@ fun LocalDateTime.toInstant(timeZone: TimeZone): Instant {
     return Instant.fromEpochSeconds(r[0], r[1])
 }
 
-fun Instant.toLocalDateTime(offset: UtcOffset): LocalDateTime =
+fun Instant.toLocalDateTime(offset: UtcOffset): LocalDateTime = try {
     epochSecondsToLocalDateTime(epochSeconds + offset.totalSeconds, nanosecondsOfSecond)
+} catch (e: IllegalArgumentException) {
+    throw DateTimeArithmeticException("Instant $this is not representable as LocalDateTime", e)
+}
 
 fun LocalDateTime.toInstant(offset: UtcOffset): Instant {
     val localSec = date.toEpochDays() * 86400L + hour.toLong() * 3600L +

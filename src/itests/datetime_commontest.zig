@@ -25,11 +25,11 @@ test "kotlinx.datetime commonTest pass count holds at or above the ratchet basel
         // minimum pass count; the ceilings bound the red mass so a fixed case
         // traded for a broken one cannot pass unnoticed. Lower the ceilings as
         // fixes land, never raise them.
-        .baseline = 460,
+        .baseline = 464,
         // 70 -> 59: a call binding by class id is now treated as a
         // construction, so `LocalDateTime(y, m, d, h, min)` reaches the
         // constructor instead of the published companion's `invoke`.
-        .max_failed = 59,
+        .max_failed = 55,
         .max_incomplete = 1,
     });
 }
