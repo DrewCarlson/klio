@@ -128,28 +128,33 @@ Failures tolerated by the ceilings, worst ratio first:
       the arity with different parameter types (reified candidates exempt, as
       only splicing can honour those). androidx 16 failures -> 2; ceiling
       15 -> 4.
-- [ ] B7. **Explicit type arguments do not veto a same-named member.** The
-      last two androidx failures (`ObjectIntTest`/`ObjectLongTest`'s
-      `emptyObject*Map`). Both are a `@Test` method named `emptyObjectIntMap`
-      that calls the imported top-level `fun <K> emptyObjectIntMap()`. The
-      member declares no type parameters, so it cannot answer a call written
-      `emptyObjectIntMap<String>()` — kotlinc binds the import. klio routes the
-      bare call to member-first dispatch, the receiver supplies the enclosing
-      method, and it recurses until the eval depth blows:
+- [x] B7. **Explicit type arguments now veto a same-named member.** Fixed;
+      androidx 2 failures -> 0. A call `f<T>()` cannot be answered by a member
+      `fun f()` that declares no type parameters, so it does not shadow a
+      same-named top-level generic function. klio bound the member and
+      recursed until the eval depth blew. Position-dependent — correct in
+      initializer position, recursive in argument position — because the two
+      reach different emit paths. Two paths had to learn it: the implicit-this
+      route declines, and the unresolved-bare-call fallback commits the
+      top-level function. The fact rides in the existing own-member arity mask
+      as bit 62 (beside the vararg bit 63) rather than a parallel map,
+      following the `ownMemberApplicable` precedent that kotlinc resolves by
+      applicability, not by name.
 
-          Stack overflow: evaluation recursion exceeded the configured depth
-
-      Position-dependent, which is the useful clue: in initializer position
-      (`val m = emptyObjectIntMap<String>()`) it resolves correctly; in
-      ARGUMENT position (`assertSame(emptyObjectIntMap<String>(), m)`) it
-      recurses. Repro: `tests/fixtures/bare_call_type_args_vs_member.kt`
-      (no pack needed).
-
-      Attempted and reverted: a veto in `emitMemberOrGlobal` keyed on
-      `registry.func_type_params` — it compiled but never fired, so the
-      argument-position call reaches a different emit path. Find that path
-      before trying again. NOTE the count is under the ceiling of 4, so this
-      is correctness work, not a gate blocker.
+      Side effect worth noting: androidx passes rose 1275 -> 1547 and
+      did-not-complete fell 10 -> 5, because the runaway recursion had been
+      consuming per-file timeouts. Ceiling 4 -> 0.
+- [ ] B8. **compose concurrency cluster (11, the last in that suite).**
+      `SnapshotStateList/Map/Set.concurrent*` (7),
+      `RecomposerTests.validatePotentialDeadlock`,
+      `PausableCompositionTests.resumeOnBackgroundThread` (2). These are real
+      MVCC stress tests — 100 coroutines on `Dispatchers.Default` mutating one
+      snapshot state list, repeated 100 times — and they are the source of the
+      suite's run-to-run +/-1. A standalone `runBlocking` repro of the same
+      shape shows NO lost updates over 20 rounds, so the trigger involves
+      `runTest`'s virtual time rather than the snapshot machinery alone.
+      Getting the real failure text is slow: the class needs several minutes
+      even filtered to one method.
 - [ ] B4. coroutines (150) and datetime (70) — the largest absolute masses.
 
 ## Traps
