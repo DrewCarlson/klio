@@ -35,7 +35,11 @@ solo run.
       `nonJvmMain`, and `jbMain` but not `commonTest`, so `TEST_ROOT` did not
       exist and the suite took its `SkipZigTest` path — and a skipped suite
       reads as a pass. Added `commonTest` to the sparse set; 43 test files now
-      present and the suite runs for real.
+      present and the suite runs for real. First real measurement: **1309
+      passed, 15 failed, 9 did not complete** across 39 files — against a
+      floor of 560 that had never been enforced. Floor raised 560 -> 1250,
+      ceiling seeded at 15, no DNC ceiling (the 1M-iteration stress loops are
+      throughput-bound, so which ones beat the per-file timeout varies).
 - [x] A4. Negative controls. A ceiling seeded from a measured `0` is only
       trustworthy if the counter can see a non-zero. Each of the three counters
       has a unit test over synthetic child output asserting it counts failures,
@@ -58,6 +62,7 @@ Failures tolerated by the ceilings, worst ratio first:
 | coroutines | 1040 | 150 | 87% |
 | io | 1150 | 45 | 96% |
 | compose_plugin | 1375 | 15 | 99% |
+| androidx_collection | 1309 | 15 | 99% |
 | atomicfu | 63 | 8 | 89% |
 | ktor | 440 | 6 | 99% |
 | stdlib | 2301 | 0 | 100% |

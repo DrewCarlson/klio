@@ -19,7 +19,21 @@ const runtime = @import("runtime");
 /// Minimum number of androidx commonTest cases that must pass. A ratchet: bump
 /// it up as fixes land (and as the stress loops get fast enough to complete),
 /// never down.
-const BASELINE: usize = 560;
+///
+/// Raised 560 -> 1250 once the suite could actually run. The old figure was
+/// never enforced: the sparse checkout omitted `commonTest`, so `TEST_ROOT`
+/// was missing and the whole suite took the skip path. First real measurement:
+/// 1309 passed, 15 failed, 9 did not complete across 39 files. The floor sits
+/// below 1309 because a file killed mid-run keeps only the passes it had
+/// already printed, so the total moves with how many stress loops finish.
+const BASELINE: usize = 1250;
+
+/// Ceiling on failing cases, the mirror of `BASELINE`. Measured 15 on that
+/// same run. No did-not-complete ceiling: the 1M-iteration stress loops are
+/// throughput-bound and which ones beat the per-file timeout varies by run,
+/// so gating DNC would be a flake rather than a signal. Failures do not have
+/// that variance — a killed file contributes none.
+const MAX_FAILED: usize = 15;
 
 const TEST_ROOT = "kotlin-klio/klio-androidx-collection/upstream/collection/collection/src/commonTest/kotlin";
 const INLINE_RECEIVER_FIXTURE = "tests/fixtures/androidx_collection_inline_receiver.kt";
@@ -239,6 +253,13 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
         .{ total_passed.load(.monotonic), total_failed.load(.monotonic), targets.items.len, hung.load(.monotonic), BASELINE },
     );
     try std.testing.expect(total_passed.load(.monotonic) >= BASELINE);
+    if (failed > MAX_FAILED) {
+        std.debug.print(
+            "androidx_commontest: {d} failed exceeds the ceiling {d}\n",
+            .{ failed, MAX_FAILED },
+        );
+        return error.FailureCeilingExceeded;
+    }
 }
 
 test "failedLineCount counts FAILED lines and ignores PASSED ones" {
