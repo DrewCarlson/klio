@@ -26,11 +26,12 @@ test "kotlinx.io commonTest pass count holds at or above the ratchet baseline" {
         // count; the ceilings bound the red mass so a fixed case
         // traded for a broken one cannot pass unnoticed. Lower the
         // ceilings as fixes land, never raise them.
-        .baseline = 1182,
-        // 45 -> 13 once klio supplied the two `expect`s kotlinx-io's own test
-        // sources declare, then 13 -> 9 once an extension namesake stopped
-        // diverting a spread call away from the enclosing class's member.
-        .max_failed = 9,
+        .baseline = 1189,
+        // 45 -> 13 (klio supplied the two `expect`s kotlinx-io's own tests
+        // declare), -> 9 (an extension namesake stopped diverting a spread
+        // call away from the enclosing member), -> 2 (`lastIndex`/`indices`
+        // now agree with `length` for a string holding a lone surrogate).
+        .max_failed = 2,
         .max_incomplete = 0,
     });
 }

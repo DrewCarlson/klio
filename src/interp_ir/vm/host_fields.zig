@@ -136,8 +136,18 @@ fn lastSegment(s: []const u8) []const u8 {
 
 /// Number of UTF-16 code units in `s` (Kotlin `String` length unit),
 /// falling back to the byte count for malformed UTF-8.
+/// UTF-16 code units, agreeing with what `String.length` reports.
+///
+/// Delegates to the stdlib's counter rather than
+/// `std.unicode.calcUtf16LeLen`, whose `catch s.len` fallback silently
+/// returns the BYTE length for any string kotlinc considers valid but UTF-8
+/// does not — a lone surrogate is stored WTF-8 (`ED A0 80`), so `"\ud800"`
+/// reported `length == 1` but `lastIndex == 2` and `indices == 0..2`.
+/// kotlinx-io's Utf8Test iterates `string.indices` and indexes the string,
+/// so the extra indices threw IndexOutOfBounds on every lone-surrogate case.
 fn utf16Len(s: []const u8) usize {
-    return std.unicode.calcUtf16LeLen(s) catch s.len;
+    const n = stdlib.text.utf16Len(s);
+    return if (n < 0) 0 else @intCast(n);
 }
 
 /// Build a frozen `List` value over `items`. `enum_entries` marks the
