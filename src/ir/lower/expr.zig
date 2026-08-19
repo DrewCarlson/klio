@@ -8581,6 +8581,36 @@ fn staticArgHead(b: *const FuncBuilder, e: *const Expr) ?[]const u8 {
     };
 }
 
+/// The result head of a stdlib collection factory (`listOf`, `mapOf`, ...), or
+/// null for any other name. Deliberately a fixed list, like
+/// `conversionResultHead`: these names fix their own result head.
+fn factoryResultHead(name: []const u8) ?[]const u8 {
+    const pairs = [_]struct { m: []const u8, t: []const u8 }{
+        .{ .m = "listOf", .t = "List" },
+        .{ .m = "listOfNotNull", .t = "List" },
+        .{ .m = "emptyList", .t = "List" },
+        .{ .m = "mutableListOf", .t = "MutableList" },
+        .{ .m = "arrayListOf", .t = "ArrayList" },
+        .{ .m = "setOf", .t = "Set" },
+        .{ .m = "setOfNotNull", .t = "Set" },
+        .{ .m = "emptySet", .t = "Set" },
+        .{ .m = "mutableSetOf", .t = "MutableSet" },
+        .{ .m = "hashSetOf", .t = "HashSet" },
+        .{ .m = "linkedSetOf", .t = "LinkedHashSet" },
+        .{ .m = "mapOf", .t = "Map" },
+        .{ .m = "emptyMap", .t = "Map" },
+        .{ .m = "mutableMapOf", .t = "MutableMap" },
+        .{ .m = "hashMapOf", .t = "HashMap" },
+        .{ .m = "linkedMapOf", .t = "LinkedHashMap" },
+        .{ .m = "sequenceOf", .t = "Sequence" },
+        .{ .m = "emptySequence", .t = "Sequence" },
+    };
+    for (pairs) |p| {
+        if (std.mem.eql(u8, name, p.m)) return p.t;
+    }
+    return null;
+}
+
 /// The result type of a zero-argument stdlib conversion (`toUInt`, `toLong`,
 /// ...), or null for any other name. Deliberately a fixed list: these are
 /// canonical stdlib conversions whose result type is fixed by their name.
@@ -12346,7 +12376,21 @@ fn lowerPathCall(
     for (args, shapes, 0..) |*a, *sh, i| {
         if (i >= explicit_shape_owned.len) break;
         if (sh.ty != null) continue;
-        if (a.* != .Call or a.Call.type_args.len == 0) continue;
+        if (a.* != .Call) continue;
+        // A stdlib collection FACTORY names its own result head, and for a
+        // bare call that head is often the only evidence there is. Without
+        // it `combine(listOf(this, other)) { … }` inside a `Flow<T>`
+        // extension gave its first argument no type at all, the binary
+        // extension `Flow<T1>.combine(flow, transform)` was not disproved,
+        // and the enclosing receiver bound it — passing the list itself as
+        // `flow`, which then failed collecting a `List`.
+        if (a.Call.type_args.len == 0) {
+            if (a.Call.callee.* != .Path or a.Call.callee.Path.segments.len != 1) continue;
+            const head = factoryResultHead(a.Call.callee.Path.segments[0].name) orelse continue;
+            if (b.resolve(a.Call.callee.Path.segments[0].name) != null) continue;
+            sh.ty = .{ .name = head, .nullable = false, .args = &.{} };
+            continue;
+        }
         if (try staticCallReturnTypeRef(b, a)) |t| {
             // Only a FULLY CONCRETE record is disproof-grade: a derivation
             // still carrying a bare type parameter anywhere (`Core<E>(...)`
