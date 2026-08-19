@@ -330,9 +330,23 @@ Failures tolerated by the ceilings, worst ratio first:
 
       The rule that fits: with a receiver in scope (`recv_chain != null`) and
       NO inline candidate declaring a receiver, a same-named non-inline
-      extension whose receiver matches the chain should win — i.e. decline
-      the splice in `inlineFnAstForRecvExt`. Note `inline_state` may not have
-      module access to look that extension up; check before designing.
+      extension whose receiver matches the chain should win — decline the
+      splice. `inline_state.zig` cannot implement it (it imports only ast,
+      decl, span and runtime — no module), so the decline has to sit at a
+      CALLER, which has the `FuncBuilder`.
+
+      THIRD ELIMINATION. The decline was implemented at the main splice site
+      in `inline_call.zig` (the one that calls `inlineFnAstForRecvExt` with
+      `call_shape`/`recv_chain` around line 1405) and traced: it never fires
+      for `combine`. So that entry point is not on the failing call's path
+      either. `inlineFnAstForRecvExt` IS entered — `[ipick]` prints — so the
+      splice decision arrives through one of the OTHER entries:
+      `inline_state.zig:497` (`inlineFnAstFor`'s wrapper) or
+      `inline_call.zig:856` (the reified-probe helper). Instrument those two
+      next; do not re-attempt the 1405 site.
+
+      Paths now ruled out for this bug: `resolveBareCall`'s cast_pick
+      pre-picks, and the 1405 splice site.
 
       For the record, at the site that does reach the pre-picks the candidate
       shapes are exactly as expected: `#2953 nparams=3 base=1 p0=this` (the extension),
