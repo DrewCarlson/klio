@@ -305,11 +305,27 @@ Failures tolerated by the ceilings, worst ratio first:
       `@LowPriorityInOverloadResolution` top-level `LocalDateTime(...)`
       factories beside the class.
 
-      The emit is `class_or_factory_call` -> `CallMemberOrGlobal`
-      (`shadowedByClass` correctly declines to construct, since
-      `enclosingHasMemberNamed` holds), but no runtime dispatch line is
-      produced for the name, so the failure is before the member arm is
-      tried. That is where to start.
+      NARROWED FURTHER, and the earlier reading of it was wrong too. Split
+      into two tests (`scratchpad/memberfactory3.kt`), the private member
+      helper is NOT the problem:
+
+        - the 3-argument call, which binds the private member helper, PASSES;
+        - the 5-argument call, which must bind the class constructor or a
+          top-level factory, FAILS with the real error.
+
+      So the member helper merely shadows the NAME, and a call whose arity it
+      cannot take should fall through to the class. The runtime audit shows
+      what happens instead: `arm=member depth=0` misses by arity, then the
+      GLOBAL arm resolves the class name to `Companion.invoke` rather than
+      constructing the class — `Vm::call_member invoke on Stamp.Companion`.
+
+      Attempted and REVERTED: gating `shadowedByClass`'s
+      `enclosingHasMemberNamed` on `callableMemberApplicable(name, nargs)`.
+      It has no effect — that helper answers true here, falling back to name
+      presence — and the emit stays `class_or_factory_call`. The fix belongs
+      in the runtime global arm (`host_call_func`, near
+      `hasConstructibleClass`), which should construct a class rather than
+      look for a companion `invoke` that does not exist.
 
       Worth at least the three `TimeZoneTest.newYorkOffset*` cases and
       probably more of the 62.
