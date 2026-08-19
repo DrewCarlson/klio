@@ -688,14 +688,29 @@ Failures tolerated by the ceilings, worst ratio first:
       and a vararg of PLAIN `(Sink) -> Unit` lambdas is correct at every
       count, so it is specific to the receiver form.
 
-      It is an INVOCATION defect, not a typing one. A change adding
-      `recordVarargLambdaReceivers` (recording the declared receiver for every
-      lambda landing in a receiver-typed vararg) was implemented and traced —
-      it fires correctly, reporting `head=Sink last_vararg=true` for all arg
-      counts — and changes nothing, because the receiver is lost when the
-      element is CALLED, not when it is typed. Reverted. Look at how a vararg
-      array's function-typed elements are invoked, not at expected-type
-      propagation.
+      It is a TYPING defect, and an earlier note here calling it an
+      invocation defect was wrong. The discriminator:
+
+          val b1: Sink.() -> Unit = { emit("A") }
+          val b2: Sink.() -> Unit = { emit("B") }
+          f(b1, b2)                        // WORKS
+          f({ emit("A") }, { emit("B") })  // FAILS
+
+      Pre-typed variables are fine, so the vararg packing and the invocation
+      are both fine. Only the LITERALS fail: they lower with no receiver
+      parameter, so `b(s)` passes the receiver into a 0-parameter lambda and
+      `this` inside the body is Unit. With one element the literal IS the
+      trailing argument, which the existing trailing-lambda recording covers —
+      hence the 0/1-correct, 2+-broken boundary.
+
+      So the fix is to give every lambda landing in a receiver-typed vararg
+      the declared receiver. A `recordVarargLambdaReceivers` helper doing
+      exactly that was written and hooked into all THREE
+      `argLambdaBroadMasks` call sites in `expr.zig`; tracing shows it never
+      records for the failing call, so this call is lowered by a FOURTH path.
+      Find that path first — `lowerLambda` consults
+      `b.lambdaArgRecv(expr.span())`, so the recording just has to reach the
+      right site with the argument's own span.
 
 ## Traps
 
