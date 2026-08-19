@@ -806,7 +806,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         };
         var prop_idx: usize = 0;
         while (prop_idx < n_props) : (prop_idx += 1) {
-            switch (try host_instances.runAnonInitBlocksAt(self, cls, cls_name, prop_idx, &inst_value)) {
+            switch (try host_instances.runAnonInitBlocksAt(self, cls, cls_name, prop_idx, &inst_value, args)) {
                 .ok => {},
                 .err => |e| return .{ .err = e },
             }
@@ -874,7 +874,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 .err => |e| return .{ .err = e },
             }
         }
-        switch (try host_instances.runAnonInitBlocksAt(self, cls, cls_name, n_props, &inst_value)) {
+        switch (try host_instances.runAnonInitBlocksAt(self, cls, cls_name, n_props, &inst_value, args)) {
             .ok => {},
             .err => |e| return .{ .err = e },
         }

@@ -6304,8 +6304,14 @@ fn lowerCallSpread(
         // global path — the member set over-approximates.
         if (callee.* == .Path and callee.Path.segments.len == 1) {
             const name = callee.Path.segments[0].name;
+            // Only a PLAIN top-level namesake keeps the global path. An
+            // EXTENSION namesake cannot answer this bare call — it needs a
+            // receiver of its own type — so it must not divert the call away
+            // from the enclosing class's member and into the value-read path
+            // below, which dies on `get_field` because a member fn is not a
+            // field.
             if (b.resolve(name) == null and !b.isLocalFn(name) and b.hasEnclosingMember(name) and
-                !b.module.hasBareCallCandidate(name, callee.Path.segments[0].span.file))
+                !b.module.hasNonExtensionBareCallCandidate(name, callee.Path.segments[0].span.file))
             {
                 if (try resolveThisForBareCall(b)) |this_reg| {
                     member_id = try b.module.internConst(b.allocator, .{ .String = name });
@@ -7793,6 +7799,35 @@ fn receiverMemberTakesCall(b: *FuncBuilder, evid_chain: ?[]const []const u8, nm:
     return false;
 }
 
+/// Whether the module declares a same-named NON-inline extension whose
+/// receiver head appears in `chain`. Used to decline an inline splice that
+/// picked a receiverless candidate while a receiver is in scope: the inline
+/// candidate set cannot contain the extension (it is not inline), so the
+/// decline has to come from outside that set.
+fn nonInlineExtensionFits(b: *FuncBuilder, name: []const u8, chain: []const []const u8, file: ir.FileId) bool {
+    // `import kotlinx.coroutines.flow.combine as combineOriginal` means the
+    // call site's name is not the declared one; look the extension up under
+    // what it is actually called. CombineTest imports exactly this way, so
+    // without the unaliasing the check found nothing.
+    var lookup = name;
+    if (b.module.importAliasIn(file, name)) |segs| {
+        if (segs.len != 0) lookup = segs[segs.len - 1];
+    }
+    for (b.module.funcsBySimpleName(lookup)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+        var rh = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
+        if (std.mem.indexOfScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
+        const rhead = typeHead(rh);
+        for (chain) |c| {
+            var ch = std.mem.trimEnd(u8, c, "?");
+            if (std.mem.indexOfScalar(u8, ch, '<')) |lt| ch = ch[0..lt];
+            if (std.mem.eql(u8, rhead, typeHead(ch))) return true;
+        }
+    }
+    return false;
+}
+
 fn inlineTargetForBareCall(
     b: *FuncBuilder,
     seg: *const ast.Ident,
@@ -7813,6 +7848,57 @@ fn inlineTargetForBareCall(
     // requires a splice; ordinary calls still fall through to the host binding
     // because `bareInlineNeedsSplice` rejects them.
     const narrowed = inlineFnAstForRecv(nm, shape, evid_chain);
+    // A receiver is in scope and the splice picked a RECEIVERLESS candidate,
+    // while a same-named non-inline EXTENSION fits that receiver: the correct
+    // target is not in the inline candidate set at all, so no comparison among
+    // inline candidates can find it. kotlinx-coroutines declares
+    // `Flow<T1>.combine(flow, transform)` as a plain `public fun` and
+    // `combine(vararg flows, transform)` as `inline` + `reified`, so a bare
+    // `combine(other, transform)` inside a Flow extension spliced a vararg and
+    // its body iterated `flows`:
+    //   Vm::call_member `iterator` on `kotlinx.coroutines.flow.SafeFlow`
+    // Declining hands the call to normal dispatch, which binds the extension.
+    // Gated on the extension existing, so a reified splice with no such
+    // sibling still splices and keeps its type argument.
+    if (runtime.envOnce("KLIO_SPLICEDECL")) |w| if (std.mem.eql(u8, w, nm)) {
+        std.debug.print("[splicedecl] {s} narrowed={} recvty={?s} chain={?d} fits={}\n", .{
+            nm, narrowed != null,
+            if (narrowed) |p| (if (p.receiver_type) |rt| rt.name.name else null) else null,
+            if (evid_chain) |c| c.len else null,
+            if (evid_chain) |c| nonInlineExtensionFits(b, nm, c, seg.span.file) else false,
+        });
+    };
+    // Whether the splice that would happen is RECEIVERLESS: either the
+    // receiver-narrowed pick is one, or narrowing found nothing at all and the
+    // indexed resolution below will choose among the receiverless namesakes.
+    const splice_would_be_receiverless = if (narrowed) |p|
+        (p.receiver_type == null and inline_state.inlineMemberOwner(p) == null)
+    else blk: {
+        // Narrowing found nothing, so the indexed resolution below will pick
+        // among the inline candidates. Only decline when NONE of them takes a
+        // receiver — otherwise the inline EXTENSION is the right target and
+        // declining would strand the call (`Flow<T>.collect { … }` is an
+        // inline extension, and declining it left `collect` unresolved).
+        // The candidate table is keyed by the DECLARED name, so an aliased
+        // call (`import … .combine as combineOriginal`) must unalias first.
+        var cname = nm;
+        if (b.module.importAliasIn(seg.span.file, nm)) |segs| {
+            if (segs.len != 0) cname = segs[segs.len - 1];
+        }
+        const cands = inline_state.candidatesForName(cname) orelse break :blk false;
+        for (cands) |c| {
+            if (c.receiver_type != null or inline_state.inlineMemberOwner(c) != null) break :blk false;
+        }
+        break :blk cands.len != 0;
+    };
+    if (splice_would_be_receiverless) {
+        if (evid_chain) |chain| {
+            // Abandon the splice outright: clearing `narrowed` is not enough,
+            // because the indexed resolution below re-picks the same
+            // receiverless namesake and splices it anyway.
+            if (nonInlineExtensionFits(b, nm, chain, seg.span.file)) return null;
+        }
+    }
     const ires = b.module.resolveBareCallIndexed(
         nm,
         b.self_package,
@@ -8481,8 +8567,36 @@ fn staticArgHead(b: *const FuncBuilder, e: *const Expr) ?[]const u8 {
             if (p.segments.len != 1) break :blk null;
             break :blk b.localDeclType(p.segments[0].name);
         },
+        // A zero-argument stdlib CONVERSION has a statically known result
+        // type, and it is often the only evidence a bare call has. Without it
+        // `writeULEB128(data.size.toUInt())` inside kotlinx-io's local
+        // `Buffer.writeULEB128(data: UIntArray)` had no argument head, the
+        // type disproof below was skipped, the local was judged applicable on
+        // arity alone, and the call recursed into itself.
+        .Call => |c| blk: {
+            if (c.args.len != 0 or c.callee.* != .Member) break :blk null;
+            break :blk conversionResultHead(c.callee.Member.name.name);
+        },
         else => null,
     };
+}
+
+/// The result type of a zero-argument stdlib conversion (`toUInt`, `toLong`,
+/// ...), or null for any other name. Deliberately a fixed list: these are
+/// canonical stdlib conversions whose result type is fixed by their name.
+fn conversionResultHead(name: []const u8) ?[]const u8 {
+    const pairs = [_]struct { m: []const u8, t: []const u8 }{
+        .{ .m = "toInt", .t = "Int" },       .{ .m = "toLong", .t = "Long" },
+        .{ .m = "toShort", .t = "Short" },   .{ .m = "toByte", .t = "Byte" },
+        .{ .m = "toFloat", .t = "Float" },   .{ .m = "toDouble", .t = "Double" },
+        .{ .m = "toUInt", .t = "UInt" },     .{ .m = "toULong", .t = "ULong" },
+        .{ .m = "toUShort", .t = "UShort" }, .{ .m = "toUByte", .t = "UByte" },
+        .{ .m = "toChar", .t = "Char" },     .{ .m = "toBoolean", .t = "Boolean" },
+    };
+    for (pairs) |p| {
+        if (std.mem.eql(u8, name, p.m)) return p.t;
+    }
+    return null;
 }
 
 fn allUppercase(s: []const u8) bool {
@@ -8534,6 +8648,23 @@ fn headIsFunctionType(d: []const u8) bool {
 /// applicability / shadow-or-fall-through decision) the lambda case is
 /// disproof-only: reject only a definite non-function scalar, since an
 /// unknown class name may be a function typealias.
+/// Builtin container heads: final array/collection types that no scalar can
+/// ever be an instance of.
+fn headIsContainer(h: []const u8) bool {
+    const heads = [_][]const u8{
+        "Array",       "IntArray",   "LongArray",  "ShortArray",  "ByteArray",
+        "FloatArray",  "DoubleArray", "CharArray", "BooleanArray",
+        "UIntArray",   "ULongArray", "UShortArray", "UByteArray",
+        "List",        "MutableList", "Set",       "MutableSet",
+        "Map",         "MutableMap", "Collection", "MutableCollection",
+        "Iterable",    "Sequence",
+    };
+    for (heads) |x| {
+        if (std.mem.eql(u8, h, x)) return true;
+    }
+    return false;
+}
+
 fn headCompatible(h: []const u8, d_raw: []const u8, strict: bool) bool {
     const d = std.mem.trimEnd(u8, d_raw, "?");
     if (std.mem.eql(u8, d, "Any") or std.mem.eql(u8, d, "Unit")) return true;
@@ -8546,6 +8677,14 @@ fn headCompatible(h: []const u8, d_raw: []const u8, strict: bool) bool {
     if (d_fn) return false;
     if (std.mem.eql(u8, h, d)) return true;
     if (headIsNumeric(h) and headIsNumeric(d)) return true;
+    // A scalar argument can never satisfy an ARRAY or COLLECTION parameter.
+    // These are final builtin containers with no scalar subtype, so unlike a
+    // plain class name (which could be a supertype of the argument) they
+    // disprove outright. kotlinx-io's local
+    // `Buffer.writeULEB128(data: UIntArray)` was judged able to take
+    // `writeULEB128(data.size.toUInt())` without this, and the call recursed
+    // into itself.
+    if (headIsScalar(h) and headIsContainer(d)) return false;
     // The head is a definite literal kind; a differently-named declared
     // class stays unknown (could be a supertype) — only the builtin
     // scalar heads disprove each other.
@@ -14957,6 +15096,15 @@ fn lowerImplicitThisCall(
     if (segments.len != 1) return null;
     const name0 = segments[0].name;
     if (b.resolve(name0) != null or b.knowsOuter(name0) or !b.hasOwnMember(name0)) return null;
+    // A call written with EXPLICIT type arguments cannot be answered by an own
+    // member that declares no type parameters, so that member does not shadow
+    // the same-named top-level function. androidx.collection's own test
+    // declares `@Test fun emptyObjectIntMap()` and calls the imported
+    // `fun <K> emptyObjectIntMap()` inside it; routing through implicit-this
+    // dispatch bound the enclosing method and recursed until the eval depth
+    // blew. Declining here returns the call to the normal resolution path,
+    // which is what the same call in initializer position always took.
+    if (ast_type_args.len != 0 and !b.ownMemberAcceptsTypeArgs(name0)) return null;
     // E4: when the eager channel committed this call to a PLAIN top-level
     // function, the same-named own member does not shadow it — kotlin
     // scoping resolved the other way, and the record gate now checks the
@@ -15637,6 +15785,37 @@ fn lowerUnresolvedBareCall(
             for (args, 0..) |*a, i| {
                 const t = argDeclTypeRefLazy(b, a);
                 std.debug.print("[barearm-miss]   arg{d} ty={?s}\n", .{ i, if (t) |tt| tt.name else null });
+            }
+        }
+    }
+    // A call written with EXPLICIT type arguments cannot be answered by a
+    // same-named own member that declares none, so the deferred member-first
+    // form would bind the wrong target: androidx.collection's own
+    // `@Test fun emptyObjectIntMap()` calling the imported
+    // `fun <K> emptyObjectIntMap()` bound itself and recursed until the eval
+    // depth blew. Commit the top-level function instead.
+    if (ast_type_args.len != 0 and !b.ownMemberAcceptsTypeArgs(name0)) {
+        if (b.module.funcId(name0)) |gid| {
+            if (b.module.funcById(gid)) |gf| {
+                const is_ext = gf.params.len != 0 and std.mem.eql(u8, gf.params[0].name, "this");
+                if (!is_ext) {
+                    orEmitAudit(b, "unresolved_bare_call", "Call/type-args-global", name0);
+                    const grun = try lowerArgRun(b, args);
+                    const gnames = try internArgNames(b.allocator, b.module, ast_arg_names);
+                    const gtargs = try internTypeArgs(b.allocator, b.module, ast_type_args);
+                    const gdst = b.allocReg();
+                    try b.push(.{ .Call = .{
+                        .dst = gdst,
+                        .func = gid,
+                        .trailing_lambda = b.callTrailingLambda(),
+                        .args = grun[0],
+                        .n_args = grun[1],
+                        .arg_names = gnames,
+                        .type_args = gtargs,
+                        .exact = false,
+                    } });
+                    return gdst;
+                }
             }
         }
     }

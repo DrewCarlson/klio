@@ -1301,7 +1301,7 @@ fn runInitBlocksAt(
             // entry; its init blocks lowered as `$init$block$<idx>` anon
             // thunks at registration (with the enclosing scope's captured
             // cells bound). Run the ones due at this property position.
-            return runAnonInitBlocksAt(self, cls, cls_name, before_prop_idx, inst_value);
+            return runAnonInitBlocksAt(self, cls, cls_name, before_prop_idx, inst_value, fallback_args);
         };
     };
     var cls_args: []const Value = fallback_args;
@@ -1354,12 +1354,19 @@ fn runInitBlocksAt(
 /// `init_block_property_positions` (filled by `synthLocalClassDef`) carries
 /// each block's body-property index; a block declared after every property
 /// has position == body_properties.len, matching the terminal call.
+/// `ctor_args` are the constructor arguments, forwarded so an `init` block can
+/// read a primary-constructor PARAMETER that is not a property. The thunks
+/// declare the primary params (see `lowerAndRegisterMethods`), so without the
+/// arguments a bare `key` in `init { require(key.isNotEmpty()) }` fell through
+/// to a field read on `this` — `Vm::get_field key on RC4Key` in kotlinx-io's
+/// rawSourceSample.
 pub fn runAnonInitBlocksAt(
     self: *VmHost,
     cls: ObjRef(ClassDef),
     cls_name: []const u8,
     before_prop_idx: usize,
     inst_value: *const Value,
+    ctor_args: []const Value,
 ) Allocator.Error!UnitOrErr {
     const allocator = self.allocator;
     const n_blocks = blk: {
@@ -1385,7 +1392,7 @@ pub fn runAnonInitBlocksAt(
             break :blk ag.get().contains(key);
         };
         if (!has) continue;
-        switch (try host_call_member.callMember(self, allocator, inst_value, nm, &.{})) {
+        switch (try host_call_member.callMember(self, allocator, inst_value, nm, ctor_args)) {
             .ok => {},
             .err => |e| return .{ .err = e },
         }

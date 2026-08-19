@@ -706,6 +706,16 @@ fn collectMembers(
 /// exactly `i` user arguments; bit 63 marks a vararg overload (accepts any
 /// count). Mirrors `collectMembers`' walk so member-vs-global resolution can
 /// be arity-aware.
+/// Bit 63: some same-named member takes a vararg, so every arity binds.
+pub const ARITY_MASK_VARARG: u64 = @as(u64, 1) << 63;
+/// Bit 62: some same-named member declares TYPE PARAMETERS. A call written
+/// with explicit type arguments can only be answered by such a member, so a
+/// name whose members all lack them does not shadow a same-named top-level
+/// generic function. Carried in the arity mask because it travels the same
+/// path and answers the same question — is this member applicable to this
+/// call — as the arity bits.
+pub const ARITY_MASK_TYPE_PARAMS: u64 = @as(u64, 1) << 62;
+
 pub fn funcArityMask(f: *const ast.Function) u64 {
     var required: usize = 0;
     var any_vararg = false;
@@ -713,12 +723,13 @@ pub fn funcArityMask(f: *const ast.Function) u64 {
         if (p.is_vararg) any_vararg = true;
         if (p.default == null and !p.is_vararg) required += 1;
     }
-    if (any_vararg) return @as(u64, 1) << 63;
-    var mask: u64 = 0;
+    const tp: u64 = if (f.type_params.len != 0) ARITY_MASK_TYPE_PARAMS else 0;
+    if (any_vararg) return ARITY_MASK_VARARG | tp;
+    var mask: u64 = tp;
     // Every count from `required` up to the full parameter count binds (the
     // trailing defaulted params may be omitted).
     var n = required;
-    while (n <= f.params.len and n < 63) : (n += 1) mask |= @as(u64, 1) << @intCast(n);
+    while (n <= f.params.len and n < 62) : (n += 1) mask |= @as(u64, 1) << @intCast(n);
     return mask;
 }
 

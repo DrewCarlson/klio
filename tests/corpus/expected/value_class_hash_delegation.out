@@ -1,0 +1,7 @@
+value class matches property : true
+equal contents agree         : true
+hash tracks the property     : true
+differing contents differ    : true
+data class folds the override: true
+data class tracks the change : true
+equals agrees with hashCode  : true

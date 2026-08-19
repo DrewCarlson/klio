@@ -836,7 +836,27 @@ fn lowerAndRegisterMethods(
             .name = try std.fmt.allocPrint(allocator, "$init$block${d}", .{idx}),
             .span = blk.span,
         };
-        const thunk = host_instances.synthThunk(thunk_name, .{ .Block = blk.* }, null, false);
+        var thunk = host_instances.synthThunk(thunk_name, .{ .Block = blk.* }, null, false);
+        // Declare the primary-constructor params, exactly as the
+        // `$super$arg$<i>` thunks do: an `init` block may read a constructor
+        // PARAMETER that is not a property, and a 0-arg thunk left that name
+        // to fall through to a field read on `this`.
+        {
+            const tparams = try allocator.alloc(ast.Param, class.primary_params.len);
+            for (class.primary_params, 0..) |*pp, pi| {
+                tparams[pi] = .{
+                    .name = pp.name,
+                    .ty = pp.ty,
+                    .default = null,
+                    .is_vararg = false,
+                    .is_crossinline = false,
+                    .is_noinline = false,
+                    .annotations = &.{},
+                    .span = pp.name.span,
+                };
+            }
+            thunk.params = tparams;
+        }
         const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
         const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
         const caps = try allocator.dupe(NameValue, capture_pairs);
@@ -861,6 +881,28 @@ fn collectOwnMembers(class: *const ast.Class, out: *StringSet) Allocator.Error!v
     }
 }
 
+/// Register the class declarations NESTED inside a local class.
+///
+/// `registerClass` synthesises a ClassDef for the local class itself and
+/// lowers its methods, but never walked its members, so a class declared
+/// inside a local class was unresolvable: kotlinx-io's `rawSourceSample`
+/// declares `RC4DecryptingSource` inside a test function and an
+/// `inner class RC4Key` inside that, and constructing it failed with
+/// `unresolved global RC4Key`. Applies to plain nested and `inner` classes
+/// alike — neither was registered.
+///
+/// Recurses, so a class nested two deep inside a local class registers too.
+fn registerNestedClasses(self: *VmHost, allocator: Allocator, class: *const ast.Class) Allocator.Error!void {
+    for (class.members) |*m| {
+        switch (m.*) {
+            .Class => |*nested| {
+                _ = try registerClass(self, allocator, nested);
+            },
+            else => {},
+        }
+    }
+}
+
 pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Class) Allocator.Error!UnitResult {
     // Local classes declared inside fn bodies arrive here at runtime.
     // Synthesise the same ClassDef shape build_module produces and stash
@@ -880,6 +922,7 @@ pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Clas
     defer own_members.deinit();
     try collectOwnMembers(class, &own_members);
     try lowerAndRegisterMethods(self, allocator, class, &own_members, &.{});
+    try registerNestedClasses(self, allocator, class);
     // Parent-constructor arguments (`class C : Base(expr...)`) lower as
     // `$super$arg$<i>` thunks declaring the primary params, so a MODULE
     // parent's fields and body properties can initialize at construction.
@@ -973,6 +1016,9 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
             try collectOwnMembers(class, &own_members);
             const capture_pairs = try buildCapturePairs(allocator, captured_names, captures);
             try lowerAndRegisterMethods(self, allocator, class, &own_members, capture_pairs);
+            // Same reason as the uncaptured path: a class nested inside a
+            // local class is otherwise never registered.
+            try registerNestedClasses(self, allocator, class);
             return .ok;
         }
     }

@@ -32,11 +32,43 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         },
         // Census floor: 1073 solo with the support surface wired. The
         // ratchet leaves headroom for the loaded `test-all`.
-        .baseline = 1040,
+        //
+        // 1105 -> 1185 and 106 -> 58 after the harness stopped starving a
+        // test file of the base class / helper file it extends, and six
+        // interpreter roots landed (nested-class references, file-private
+        // function binding, inferred receiver-function parameters, the
+        // function-shape extension overload, the flow context-preservation
+        // invariant, null channel elements). Measured on the gate:
+        // 1192 passed, 52 failed, 6 did not complete.
+        // 1070 -> 1105 alongside the ceiling below. Measured solo: 1110.
+        // 1185 -> 1198 and 58 -> 48 after null channel elements stopped
+        // reading as an empty iterator, a spliced inline extension started
+        // resolving against its own receiver, and the channel honoured
+        // `onUndeliveredElement`. 1198 -> 1254 and 48 -> 43 once a DUE
+        // deadline became ready work on the inline resume path, which
+        // recovered the four WithTimeout files (55 cases) from the child
+        // timeout. Measured solo: 1259 passed, 40 failed, 0 incomplete —
+        // a file whose only `@Test` methods live on an ABSTRACT class now
+        // prints a zero summary instead of reading as a child that never
+        // reported. 1254 -> 1260 and 43 -> 37 after the vararg-vs-container
+        // overload pick and non-callable evidence following a local's static
+        // type. Measured solo: 1265 passed, 34 failed, 0 incomplete.
+        .baseline = 1260,
         // Bound the red mass too: a floor alone cannot see a fixed case
         // traded for a broken one. Measured solo: 137 failing, 6 not
         // completing. Lower these as fixes land, never raise them.
-        .max_failed = 150,
-        .max_incomplete = 10,
+        // 150 -> 141. Measured 1075 passed / 139 failed / 6 did not complete
+        // after bare calls stopped splicing a receiverless inline candidate
+        // when a non-inline extension fits the receiver in scope. Held two
+        // above the measurement: this suite's dispatched tests vary by a
+        // couple between runs.
+        // 141 -> 106. Two roots: a bare call inside an extension no longer
+        // binds a same-named extension via the enclosing receiver (combine's
+        // Iterable overload), and a call no longer reaches a same-named local
+        // whose initializer is an ordinary function call (`val flow =
+        // flowOf(...)` beside the `flow { … }` builder). Measured solo: 1110
+        // passed, 104 failed, 6 did not complete. Held two above.
+        .max_failed = 37,
+        .max_incomplete = 1,
     });
 }

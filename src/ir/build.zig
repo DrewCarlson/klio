@@ -1810,8 +1810,20 @@ pub const FuncBuilder = struct {
     pub fn ownMemberApplicable(self: *const FuncBuilder, name: []const u8, want: usize) bool {
         const mask = self.own_member_arity.get(name) orelse return true;
         if (mask & (@as(u64, 1) << 63) != 0) return true; // a vararg overload
-        if (want >= 63) return false;
+        if (want >= 62) return false;
         return mask & (@as(u64, 1) << @intCast(want)) != 0;
+    }
+
+    /// Whether an own member named `name` could bind a call that supplies
+    /// EXPLICIT type arguments. Conservative in the same way as
+    /// `ownMemberApplicable`: a name with no recorded mask is treated as
+    /// applicable. Only a recorded mask saying that no same-named member
+    /// declares type parameters reports inapplicable, which lets a same-named
+    /// top-level generic function resolve instead — kotlinc resolves by
+    /// applicability, not by name.
+    pub fn ownMemberAcceptsTypeArgs(self: *const FuncBuilder, name: []const u8) bool {
+        const mask = self.own_member_arity.get(name) orelse return true;
+        return mask & (@as(u64, 1) << 62) != 0;
     }
     /// Whether the lexical class hierarchy declares a callable member that
     /// could accept `want` arguments. Unlike `ownMemberApplicable`, a stored
@@ -1819,7 +1831,7 @@ pub const FuncBuilder = struct {
     pub fn callableMemberApplicable(self: *const FuncBuilder, name: []const u8, want: usize) bool {
         if (self.own_member_arity.get(name)) |mask| {
             if (mask & (@as(u64, 1) << 63) != 0) return true;
-            if (want >= 63) return false;
+            if (want >= 62) return false;
             return mask & (@as(u64, 1) << @intCast(want)) != 0;
         }
         const owner = self.owner_class orelse return false;
