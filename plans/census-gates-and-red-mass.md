@@ -117,13 +117,39 @@ Failures tolerated by the ceilings, worst ratio first:
       its owner-qualified key, so the plain pair the companion arms consulted
       did not exist. Both arms now try the source form. Example + corpus pin
       added; unit tests 67/67.
-- [ ] B6. `IndexBasedArrayIteratorTest` (9 of androidx's 16). Every failing
-      case builds `ArraySet(setOf(...))` / `ArraySet(listOf(...))`; the one
-      case using `ArraySet<String>()` passes. `ArraySet` is an `expect class`
-      whose primary is `constructor(capacity: Int = 0)` — the default on the
-      expect side, the actual re-declaring it without — plus secondary
-      constructors including `constructor(set: Collection<E>?)`. Repro at
-      hand; suspect expect/actual constructor merging or overload scoring.
+- [x] B6. **Overloaded inline extensions picked by shape, not argument type.**
+      Root of androidx's 9-failure `IndexBasedArrayIteratorTest` cluster (plus
+      all of `ArraySetTest` and `ObjectFloatTest`). `ArraySet.addAll(Collection)`
+      calls a bare `addAllInternal(elements)`; the sibling overload takes an
+      `ArraySet`. Same receiver, same arity, different parameter type — the
+      splice path resolves by call shape and its documented fallback is the
+      first-declared overload, so the ArraySet body was spliced for a List and
+      read `.array` off it. Now declines to splice when several overloads fit
+      the arity with different parameter types (reified candidates exempt, as
+      only splicing can honour those). androidx 16 failures -> 2; ceiling
+      15 -> 4.
+- [ ] B7. **Explicit type arguments do not veto a same-named member.** The
+      last two androidx failures (`ObjectIntTest`/`ObjectLongTest`'s
+      `emptyObject*Map`). Both are a `@Test` method named `emptyObjectIntMap`
+      that calls the imported top-level `fun <K> emptyObjectIntMap()`. The
+      member declares no type parameters, so it cannot answer a call written
+      `emptyObjectIntMap<String>()` — kotlinc binds the import. klio routes the
+      bare call to member-first dispatch, the receiver supplies the enclosing
+      method, and it recurses until the eval depth blows:
+
+          Stack overflow: evaluation recursion exceeded the configured depth
+
+      Position-dependent, which is the useful clue: in initializer position
+      (`val m = emptyObjectIntMap<String>()`) it resolves correctly; in
+      ARGUMENT position (`assertSame(emptyObjectIntMap<String>(), m)`) it
+      recurses. Repro: `tests/fixtures/bare_call_type_args_vs_member.kt`
+      (no pack needed).
+
+      Attempted and reverted: a veto in `emitMemberOrGlobal` keyed on
+      `registry.func_type_params` — it compiled but never fired, so the
+      argument-position call reaches a different emit path. Find that path
+      before trying again. NOTE the count is under the ceiling of 4, so this
+      is correctness work, not a gate blocker.
 - [ ] B4. coroutines (150) and datetime (70) — the largest absolute masses.
 
 ## Traps
