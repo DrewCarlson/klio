@@ -263,6 +263,37 @@ Failures tolerated by the ceilings, worst ratio first:
       `ChannelUndeliveredElementFailureTest` 0/13, `ParentCancellationTest`
       3/8, `BufferedChannelTest` 4/7, `MergeTest` 8/6.
 
+      **CombineTest's 28 (26 of them one shape) — ROOT FOUND.** A bare call
+      to an EXTENSION overload, made from inside an override of an abstract
+      member extension, picks a same-named VARARG overload instead. Repro:
+      `scratchpad/abstractext.kt`, two tests that differ only in how the
+      override delegates:
+
+        - `combine(this, other, transform)` (top-level 3-arg form) PASSES —
+          binds `combine#2954`, params=3, correct;
+        - `combine(other, transform)` (extension form, receiver implicit)
+          FAILS — binds `combine#2963`/`#2968`, params=2, which are
+          `combine(vararg flows: Flow<T>, transform: (Array<T>) -> R)`. The
+          vararg body then iterates what it thinks is a flow array:
+          `Vm::call_member iterator on kotlinx.coroutines.flow.SafeFlow`.
+
+      The right target is `combine#2953`, `kind=top_level_extension`,
+      params=3 (receiver + 2). klio prefers the exact-arity plain candidate
+      over the receiver-bound extension.
+
+      The discriminator kotlinc uses is available and cheap: the trailing
+      lambda has TWO parameters (`{ a, b -> }`), and the vararg overload's
+      transform takes ONE (the `Array<T>`), so the vararg candidate is not
+      applicable at all. klio already has lambda-arity machinery
+      (`fitsTrailingLambda`, `argLambdaBroadMasks`) — the bare-call ranking
+      does not consult it here.
+
+      NOT attempted: this is the overload-ranking core, and plain `combine`
+      calls in every form resolve correctly today
+      (`scratchpad/combine.kt` — extension, 3-arg and explicit vararg all
+      pass), so the change must not disturb them. Stage the corpus, the
+      stdlib sweep and both heavy suites.
+
       The 0/13 file looked like one root but is not: under the census's real
       invocation its failures are ordering assertions — `Too few unhandled
       exceptions`, `Should not be reached, 'expect' was not called yet` —
