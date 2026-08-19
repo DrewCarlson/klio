@@ -63,11 +63,43 @@ def parse_config(suite):
             r'\.dir\s*=\s*"([^"]*)"\s*,\s*\.artifact\s*=\s*"([^"]*)"', m.group(1)
         ):
             packs.append((d, art))
+    # The three suites that predate `commontest_support` (stdlib,
+    # compose_plugin, androidx_collection) declare the same facts as
+    # top-level constants instead of a runSuite literal. Fall back to those
+    # so their failures can be named too, rather than reporting an empty
+    # config that would look like a suite with no tests.
+    test_roots = strings_in("test_roots")
+    if not test_roots:
+        for m in re.finditer(r'const TEST_ROOTS?\b[^=]*=\s*(.+)', src):
+            test_roots += re.findall(r'"([^"]*)"', m.group(1))
+    if not packs:
+        m = re.search(r"const PACKS\s*=\s*\[_\]Pack\{(.*?)\n\};", src, re.S)
+        if m:
+            for d, art in re.findall(
+                r'\.dir\s*=\s*"([^"]*)"\s*,\s*\.artifact\s*=\s*"([^"]*)"', m.group(1)
+            ):
+                packs.append((d, art))
+
+    # Honesty guard: if the itest installs packs through a helper this parser
+    # cannot read, the census would run against whatever is already in the
+    # scratch home and report failures the gate does not have. Say so rather
+    # than emit a census that silently does not reproduce the suite.
+    if not packs and re.search(r"install\w*Pack|pack\W+install", src):
+        print(
+            f"warning: {suite} installs packs via a helper this parser cannot read; "
+            "its census may not reproduce the gate",
+            file=sys.stderr,
+        )
+
     home = re.search(r'\.scratch_home\s*=\s*"([^"]*)"', src)
+    if not home:
+        home = re.search(r'const SCRATCH_HOME\s*=\s*"([^"]*)"', src)
     whole = re.search(r"\.whole_source_set\s*=\s*(true|false)", src)
     baseline = re.search(r"\.baseline\s*=\s*(\d+)", src)
+    if not baseline:
+        baseline = re.search(r"const BASELINE:\s*usize\s*=\s*(\d+)", src)
     return {
-        "test_roots": strings_in("test_roots"),
+        "test_roots": test_roots,
         "extra_support": strings_in("extra_support"),
         "packs": packs,
         "scratch_home": home.group(1) if home else f"/tmp/klio_census_{suite}_home",
