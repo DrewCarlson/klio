@@ -568,7 +568,27 @@ Failures tolerated by the ceilings, worst ratio first:
       gives a call argument's static type. Arity cannot discriminate here —
       both candidates take one argument — so a type comparison is required.
 
-      Paths ruled out for this bug: `prefer_member` in `resolveBareCall`. `private inner class RC4Key(key:
+      Paths ruled out for this bug: `prefer_member` in `resolveBareCall`.
+
+      LIVE SITE FOUND, and a second attempt reverted. `KLIO_OR_AUDIT` shows
+      the call emitted from `member_or_local_callable` as `CallMemberOrValue`
+      with the local as fallback, and the runtime taking `arm=value`. A gate
+      was added there (emit a plain `CallMember` when the local's declared
+      parameter type rejects the arguments) and traced — it correctly
+      declines, because the recorded parameter type MATCHES the argument at
+      every site it sees:
+
+          [localshadow] writeULEB128: ah=UInt      ph=UInt
+          [localshadow] writeULEB128: ah=UIntArray ph=UIntArray
+
+      That is the real lead. `unsafeSamples` declares `Buffer.writeULEB128`
+      THREE times: a local `(UInt)` inside one test method, a private member
+      `(UInt)`, and a local `(UIntArray)` inside the failing test. The failing
+      call — `writeULEB128(data.size.toUInt())` from inside the UIntArray
+      local — never produces a mismatch, so the param-type table consulted for
+      it is not the enclosing local's. `local_fn_param_tys` is keyed by SIMPLE
+      NAME, and these siblings collide across test methods. Establish which
+      declaration the table holds at that site before gating on it. `private inner class RC4Key(key:
       String)` reads `key` — a plain parameter, not a property — from an
       `init` block, and klio treats it as a field:
       `Vm::get_field key on RC4Key`. Repro:
