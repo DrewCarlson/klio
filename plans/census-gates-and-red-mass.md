@@ -314,7 +314,7 @@ Failures tolerated by the ceilings, worst ratio first:
 
 - [x] B17. **io 9 -> 2: `lastIndex`/`indices` vs `length`.** See the commit;
       the eliminations are recorded there.
-- [~] B18. **Classes nested inside a LOCAL class were never registered.**
+- [x] B18. **Classes nested inside a LOCAL class were never registered.**
       `registerClass` synthesised the local class's own ClassDef and lowered
       its methods but never walked `class.members`, so a class declared inside
       a local class was unresolvable — `unresolved global RC4Key` in
@@ -323,13 +323,29 @@ Failures tolerated by the ceilings, worst ratio first:
       Fixed for BOTH registration paths (captured and uncaptured), plain
       nested and `inner` alike, recursing for deeper nesting.
 
-      PARTIAL: this fixes the shape under `klio run` (example +
-      corpus pin), but the same source under `klio test` still fails, so
-      io's census is unchanged at 2. The test runner reaches local classes
-      by a different route that does not go through
-      `host_classes.registerClass`; find that route next. Repro:
-      `scratchpad/InnerT.kt` — identical code passes under `run` and fails
-      under `test`, which is the whole clue.
+      The "still fails under `klio test`" note in the commit was WRONG and
+      is corrected here: `zig-out/bin/klio-harness` was stale. Rebuilt, the
+      same source passes under `test` too. (Second time this trap bit in one
+      session — `zig build` does not rebuild the harness; `zig build
+      klio-harness` does.)
+
+      `rawSourceSample` now gets PAST registration and fails one layer
+      deeper, at B20.
+- [ ] B20. **A constructor parameter of a class nested in a local class is
+      not bound in its `init` block.** `private inner class RC4Key(key:
+      String)` reads `key` — a plain parameter, not a property — from an
+      `init` block, and klio treats it as a field:
+      `Vm::get_field key on RC4Key`. Repro:
+      `scratchpad/innerparam2.kt`. This is io's `rawSourceSample`, the last
+      failure there besides `unsafeSamples` (a stack overflow).
+- [ ] B21. **A nested local class named `Key` collides.** The same repro with
+      the class named `Key` fails differently —
+      `InstantiationError: Cannot create an instance of an interface: Key` —
+      so the name resolves to some other `Key` in scope rather than the
+      user's nested declaration. Renaming to a unique name gives B20's error
+      instead. Per the project's root-cause rule a user declaration must win
+      such a clash, so this is a real bug and NOT to be worked around by
+      renaming. Found by accident while reducing B20.
 - [ ] B19. Qualified access to a nested class of a local class
       (`Decrypting.Marker()`) fails with
       `Vm::call_member Marker on kotlin.reflect.KClass`. Separate from B18 —
