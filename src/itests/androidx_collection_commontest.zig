@@ -248,9 +248,10 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
     }
     for (threads.items) |t| t.join();
 
+    const failed = total_failed.load(.monotonic);
     std.debug.print(
-        "androidx_commontest: {d} passed, {d} failed across {d} files, {d} did not complete (baseline {d})\n",
-        .{ total_passed.load(.monotonic), total_failed.load(.monotonic), targets.items.len, hung.load(.monotonic), BASELINE },
+        "androidx_commontest: {d} passed, {d} failed across {d} files, {d} did not complete (baseline {d}, max_failed {d})\n",
+        .{ total_passed.load(.monotonic), failed, targets.items.len, hung.load(.monotonic), BASELINE, MAX_FAILED },
     );
     try std.testing.expect(total_passed.load(.monotonic) >= BASELINE);
     if (failed > MAX_FAILED) {
