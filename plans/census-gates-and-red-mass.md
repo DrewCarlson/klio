@@ -615,88 +615,45 @@ is at zero.
       `KLIO_RLP_TRACE` and `KLIO_SHADOW_TRACE` are already taken, though, so
       a reused key mixes with an existing site's output.)
 
-### Open: vararg receiver-lambda literals lose their receiver (RFC_1123)
+- [x] B20. **Vararg receiver-lambda literals lost their receiver — datetime
+      55 -> 37.** A receiver lambda carries its receiver as a CAPTURE, not a
+      parameter (`src/ir/lower/lambda_body.zig:621`), so the call site must
+      supply it at invocation. Two recorders compute what that needs — the
+      lambda's expected arity and its bound receiver type — and both handled
+      only two argument shapes: a trailing lambda with
+      `args.len <= params.len`, and `args.len == params.len`. A vararg call
+      matches NEITHER, because two arguments never equal one declared
+      parameter. Both literals then kept their implicit `it`, the closure
+      reported one value parameter, and the VM's rule at
+      `host_call_value.zig:2087` — bind the extra leading argument when a
+      receiver-carrying closure is called with `n_params + 1` arguments —
+      could not fire. `this` stayed whatever the enclosing scope had.
 
-Two or more receiver-lambda LITERALS passed to a vararg lose `this`:
+      kotlinx-datetime's `alternativeParsing(vararg others: T.() -> Unit,
+      primary: T.() -> Unit)` carries RFC_1123's optional day-of-week and
+      alternative offsets, so every such parse failed. Guarded by
+      `examples/vararg_receiver_lambdas.kt`, which also pins the
+      vararg-plus-trailing-parameter shape; its negative control throws.
 
-    fun f(vararg blocks: Sink.() -> Unit): String {
-        val s = Sink(); for (b in blocks) b(s); return s.out.toString()
-    }
-    f({ emit("A") })                  // "A"      — works
-    f(b1, b2)                         // "AB"     — works (pre-typed vals)
-    f({ emit("A") }, { emit("B") })   // Vm::get_field `out` on `kotlin.Unit`
+      THE EXPERIMENT THAT CRACKED IT, after two earlier attempts stalled:
+      two literals against two DECLARED parameters works, the same two
+      against a `vararg` fails, and the lambda lowering inputs are IDENTICAL
+      on both sides (`rec=Sink params=1 implicit_it=true` for all four). That
+      ruled out the lambda and the receiver-type recording — which is exactly
+      what both earlier attempts had been fixing — and pointed at the
+      INVOCATION. The missing piece was the ARITY recorder, not the receiver
+      recorder: without arity 0 the implicit `it` survives and the receiver
+      rule is unreachable. Fixing the receiver recorder alone (twice, through
+      two different helpers) changed nothing, which is why it read as a
+      downstream defect.
 
-This is what fails RFC_1123: kotlinx-datetime's
-`alternativeParsing(vararg others: T.() -> Unit, primary: T.() -> Unit)`
-carries the optional day-of-week and the alternative offsets, so
-`'Sun, 06 Nov 1994 08:49:37 +0300'` fails to parse at position 0 ("at least
-one digit for day") and position 26 ("Expected UT but got +"). Roughly ten
-datetime failures sit behind it, concentrated in
-`DateTimeComponentsSamples` (10 of that file's 25 cases).
+      Note: the lowered vararg parameter carries the ELEMENT type directly
+      (`Function0`), not a materialized array, so `varargElementRef` is the
+      wrong accessor — take the parameter type as-is first.
 
-A REAL GAP WAS FOUND AND FILLING IT CHANGED NOTHING.
-`recordLambdaArgReceiversForCallReceiver` handles exactly two shapes —
-trailing-lambda with `args.len <= params.len`, and `args.len == params.len`.
-A vararg call with two literals matches NEITHER (two arguments never equal
-one declared parameter), so neither literal is recorded; one literal works
-only because it is also the trailing argument. A vararg branch was added
-(walking the vararg's argument run, then the parameters that follow it) and
-verified to compute the right answer:
-
-    [varecv] f nargs=2 nparams=1 [blocks vararg=true ty=Function0 recv=Sink args=<Sink><Unit>]
-
-Note the lowered vararg parameter carries the ELEMENT type directly
-(`Function0`), not a materialized array, so `varargElementRef` is the wrong
-accessor here — use the parameter type as-is.
-
-With both literals recorded and `recv=Sink`, the program STILL fails, and
-datetime (55), coroutines (104) and the stdlib sweep (0/117) are all
-unmoved. So the receiver is dropped DOWNSTREAM of the recording, and the
-recorder gap — though genuine — is masked by it. Reverted rather than ship
-an unmeasured change to a core path; re-apply it once the downstream drop is
-fixed. This is the second independent confirmation of that conclusion: an
-earlier attempt recorded the same receivers through a different helper in
-`lowerCallGeneral` and also changed nothing.
-
-ROOT FOUND, not yet fixed. It is not the recorder at all. From
-`src/ir/lower/lambda_body.zig:621`:
-
-    // ordinary receiver lambdas carry their receiver as a capture, not a param
-
-A `Sink.() -> Unit` LITERAL therefore captures the enclosing `this` — Unit at
-top level — instead of taking a receiver slot. A call site that knows the
-static type compensates: `a(s)` where `a: Sink.() -> Unit` is a declared
-parameter emits a receiver-bound call that overrides the capture. A value
-pulled out of the vararg array has no such type, emits a plain value call,
-and the closure falls back to its captured `this` — Unit.
-
-The experiment that isolates it: two literals against two DECLARED
-parameters works (`g({ emit("A") }, { emit("B") })` gives "AB"), while the
-same two literals against a `vararg` fails — with IDENTICAL lambda lowering
-inputs on both sides:
-
-    [lamrecv] span=430..443 rec=Sink params=1 implicit_it=true   <- g, works
-    [lamrecv] span=445..458 rec=Sink params=1 implicit_it=true   <- g, works
-    [lamrecv] span=493..506 rec=Sink params=1 implicit_it=true   <- f, fails
-    [lamrecv] span=508..521 rec=Sink params=1 implicit_it=true   <- f, fails
-
-So the receiver TYPE reaches the lambda in every case; what differs is
-whether the INVOCATION binds a receiver. Every array-sourced form fails the
-same way — `for (x in blocks) x(s)`, `blocks[i](s)`, and
-`blocks.forEach { it(s) }` — while assigning to a typed local first stops
-the crash (though it still returns the wrong result), which confirms the
-call site's static type is the whole difference.
-
-This single mechanism explains all three stalled threads: the vararg
-receiver-lambda defect, the RFC_1123 datetime cluster, and why recording
-receiver types never helped in either.
-
-Two ways out, neither small: mark the closure value itself as
-receiver-carrying so a plain value call with one extra leading argument
-binds it as `this` (general — also fixes `forEach`/indexing), or give the
-loop/index expression the vararg's element type so lowering emits the
-receiver-bound call (narrower, and the typed-local experiment suggests it is
-not sufficient on its own).
+      Still wrong, separately and pre-existing: assigning a vararg element to
+      a typed local first (`val t: Sink.() -> Unit = x; t(s)`) returns an
+      empty result rather than throwing. Unchanged by this fix.
 
 ### Open: an inline MEMBER called bare inside a receiver-lambda
 
