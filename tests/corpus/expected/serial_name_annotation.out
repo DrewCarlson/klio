@@ -1,0 +1,7 @@
+serialName=account
+  element 0 = id
+  element 1 = display_name
+  element 2 = is_active
+plain serialName=Plain
+property displayName=Ada active=true
+indexOf display_name=1

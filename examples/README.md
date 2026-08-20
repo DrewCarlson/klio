@@ -186,6 +186,7 @@ Run any program with:
 | `type_args_vs_member_name.kt` | A call with explicit type arguments resolves to a top-level generic function rather than a same-named member that declares no type parameters (and still binds a member that does). |
 | `inline_extension_overload.kt` | Overloaded inline extension functions picked by argument type, including a bare call whose receiver is implicit (the shape-based splice cannot separate them, so dispatch does). |
 | `local_class_nested.kt`        | Classes nested inside a LOCAL class (one declared in a function body), `inner` and plain, constructed from a property initializer regardless of declaration order. |
+| `serial_name_annotation.kt`    | `@SerialName` on a class replaces the descriptor's serial name, and on a property replaces that element's wire name, while the Kotlin declaration keeps its own names. |
 | `value_class_hash_delegation.kt` | A `value` class hashes as its underlying property and a `data` class folds each property's own `hashCode()`, so a property class's override decides the result. |
 | `companion_member_extension.kt` | Extension properties on a companion object declared as members of another class, `private` and public, on a user class and on a builtin's companion. |
 | `serial_descriptor_shape.kt`   | The `SerialDescriptor` a `@Serializable` class reports: element names, which elements are optional (their constructor parameter has a default), and each element's own descriptor. |

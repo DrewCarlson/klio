@@ -12,6 +12,8 @@
 //!   primary-constructor `val`/`var` properties.
 //! - `__klsx_ctorParamSerialNames(kClass)` — the same properties' WIRE
 //!   names, honouring `@SerialName`.
+//! - `__klsx_classSerialNameOverride(kClass)` — the class's own
+//!   `@SerialName` value, or null.
 //! - `__klsx_get(obj, name)` — read a named property off an instance.
 //! - `__klsx_construct(kClass, args)` — build an instance by calling
 //!   the primary constructor with the (ordered) argument list.
@@ -62,6 +64,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     var b = HostBindings.init(allocator);
     try b.register("kotlinx.serialization.__klsx_ctorParamNames", ctorParamNames);
     try b.register("kotlinx.serialization.__klsx_ctorParamSerialNames", ctorParamSerialNames);
+    try b.register("kotlinx.serialization.__klsx_classSerialNameOverride", classSerialNameOverride);
     try b.register("kotlinx.serialization.__klsx_ctorParamTypes", ctorParamTypes);
     try b.register("kotlinx.serialization.__klsx_ctorParamOptional", ctorParamOptional);
     try b.register("kotlinx.serialization.__klsx_get", propGet);
@@ -700,6 +703,27 @@ fn ctorParamNames(ctx: *CallCtx) Error!EvalResult {
     }));
 }
 
+/// The value of a `@SerialName("...")` on the CLASS itself, or null when it
+/// carries none. kotlinx's default serial name is the qualified class name;
+/// the annotation replaces it wholesale.
+fn classSerialNameOverride(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("__klsx_classSerialNameOverride: expected a class");
+    const cls_ref = classOf(&ctx.args[0]) orelse return ok(.Null);
+    defer cls_ref.deinit();
+    const cls = cls_ref.asPtr();
+    for (cls.annotation_records) |*rec| {
+        if (rec.is("kotlinx.serialization.SerialName") or rec.is("SerialName")) {
+            if (rec.stringArg("value")) |s| {
+                return ok(.{ .String = try runtime.strInitOwned(
+                    ctx.allocator,
+                    try ctx.allocator.dupe(u8, s),
+                ) });
+            }
+        }
+    }
+    return ok(.Null);
+}
+
 /// The WIRE names of the primary-constructor properties: each property's
 /// `@SerialName("...")` where it carries one, else its declared name. The
 /// descriptor reports these, while `ctorParamNames` keeps the declared names
@@ -1164,7 +1188,8 @@ test "hostBindings registers every serialization symbol" {
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_ctorParamTypes") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_ctorParamOptional") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_ctorParamSerialNames") != null);
-    try testing.expectEqual(@as(usize, 11), b.len());
+    try testing.expect(b.resolve("kotlinx.serialization.__klsx_classSerialNameOverride") != null);
+    try testing.expectEqual(@as(usize, 12), b.len());
 }
 
 test "renderShape round-trips nullability and generic args" {

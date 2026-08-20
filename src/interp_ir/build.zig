@@ -4680,6 +4680,11 @@ fn buildClassDef(
         .name = c.name.name,
         .fqn = fqn,
         .annotation_names = try ir.lower.resolveAnnotationNames(module, c.annotations),
+        .annotation_records = blk: {
+            const recs = try a.alloc(runtime.AnnotationRecord, c.annotations.len);
+            for (c.annotations, recs) |*ann, *rec| rec.* = try annotationRecordFor(module, a, ann);
+            break :blk recs;
+        },
         .primary_params = primary_params,
         .methods = &.{},
         .body_properties = try body_props.toOwnedSlice(a),

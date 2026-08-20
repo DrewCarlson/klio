@@ -41,6 +41,10 @@ pub const ClassDef = struct {
     fqn: []const u8,
     /// Runtime-retained annotation class names applied to this declaration.
     annotation_names: []const []const u8,
+    /// The same annotations with their resolved constructor ARGUMENTS, which
+    /// `annotation_names` alone cannot carry. Reflective consumers that read
+    /// an argument off a class annotation (`@SerialName("...")`) need these.
+    annotation_records: []const AnnotationRecord = &.{},
     primary_params: []ClassParamDef,
     /// Member functions keyed by simple name.
     methods: []MethodDef,

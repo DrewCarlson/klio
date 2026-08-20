@@ -36,6 +36,9 @@ import kotlinx.serialization.encoding.Encoder
 internal fun __klsx_ctorParamNames(kClass: Any?): List<String> =
     error("intrinsic kotlinx.serialization.__klsx_ctorParamNames not installed")
 
+internal fun __klsx_classSerialNameOverride(kClass: Any?): String? =
+    error("intrinsic kotlinx.serialization.__klsx_classSerialNameOverride not installed")
+
 internal fun __klsx_ctorParamSerialNames(kClass: Any?): List<String> =
     error("intrinsic kotlinx.serialization.__klsx_ctorParamSerialNames not installed")
 
@@ -272,6 +275,9 @@ public class ReflectiveKSerializer(private val kClass: Any?) : KSerializer<Any?>
 }
 
 internal fun __klsx_serialName(kClass: Any?): String {
+    // `@SerialName` on the class replaces the qualified-name default.
+    val override = __klsx_classSerialNameOverride(kClass)
+    if (override != null) return override
     if (kClass is KClass<*>) {
         val q = kClass.qualifiedName
         if (q != null) return q
