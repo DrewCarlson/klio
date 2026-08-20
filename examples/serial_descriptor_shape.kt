@@ -6,8 +6,12 @@
 // names the element's own type, so `port` reports `kotlin.Int` and a nullable
 // element reports the `?`-suffixed name upstream gives it.
 //
+// An element annotated `@SerialName` reports that WIRE name, while the
+// property keeps its declared name for reading and constructing the value.
+//
 // Run with: klio run examples/serial_descriptor_shape.kt
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.serializer
 
@@ -16,6 +20,7 @@ data class Config(
     val host: String,
     val port: Int = 8080,
     val debug: Boolean? = null,
+    @SerialName("max_retries") val maxRetries: Int = 3,
 )
 
 fun main() {

@@ -10,6 +10,8 @@
 //!
 //! - `__klsx_ctorParamNames(kClass)` — ordered names of the
 //!   primary-constructor `val`/`var` properties.
+//! - `__klsx_ctorParamSerialNames(kClass)` — the same properties' WIRE
+//!   names, honouring `@SerialName`.
 //! - `__klsx_get(obj, name)` — read a named property off an instance.
 //! - `__klsx_construct(kClass, args)` — build an instance by calling
 //!   the primary constructor with the (ordered) argument list.
@@ -59,6 +61,7 @@ fn typeErr(msg: []const u8) EvalResult {
 pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     var b = HostBindings.init(allocator);
     try b.register("kotlinx.serialization.__klsx_ctorParamNames", ctorParamNames);
+    try b.register("kotlinx.serialization.__klsx_ctorParamSerialNames", ctorParamSerialNames);
     try b.register("kotlinx.serialization.__klsx_ctorParamTypes", ctorParamTypes);
     try b.register("kotlinx.serialization.__klsx_ctorParamOptional", ctorParamOptional);
     try b.register("kotlinx.serialization.__klsx_get", propGet);
@@ -697,6 +700,30 @@ fn ctorParamNames(ctx: *CallCtx) Error!EvalResult {
     }));
 }
 
+/// The WIRE names of the primary-constructor properties: each property's
+/// `@SerialName("...")` where it carries one, else its declared name. The
+/// descriptor reports these, while `ctorParamNames` keeps the declared names
+/// that `__klsx_get` and `__klsx_construct` address the instance by.
+fn ctorParamSerialNames(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("__klsx_ctorParamSerialNames: expected a class");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return typeErr("__klsx_ctorParamSerialNames: expected a class");
+    defer cls_ref.deinit();
+    const cls = cls_ref.asPtr();
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (cls.primary_params) |*p| {
+        if (p.property == null) continue;
+        try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, serialFieldName(p))) });
+    }
+    return ok(try Value.newList(a, .{
+        .items = try ValueList.init(a, items),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    }));
+}
+
 /// Read property `name` off instance `obj`. Routes through
 /// `invoke_method` so a custom getter / data-class accessor still
 /// applies; falls back to the raw field.
@@ -1136,7 +1163,8 @@ test "hostBindings registers every serialization symbol" {
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_enumValues") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_ctorParamTypes") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_ctorParamOptional") != null);
-    try testing.expectEqual(@as(usize, 10), b.len());
+    try testing.expect(b.resolve("kotlinx.serialization.__klsx_ctorParamSerialNames") != null);
+    try testing.expectEqual(@as(usize, 11), b.len());
 }
 
 test "renderShape round-trips nullability and generic args" {

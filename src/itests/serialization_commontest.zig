@@ -21,10 +21,15 @@ test "kotlinx.serialization commonTest pass count holds at or above the ratchet 
         // Every bound below TIGHTENS the gate. The floor rises 9 -> 60 as the
         // pack widened to upstream's own serializer lookup; the two ceilings
         // are new (the suite was floor-only before), so a run that clears the
-        // floor while growing failures or hangs now fails. Measured solo:
-        // 60 passed, 78 failed, 0 did not complete.
-        .baseline = 60,
-        .max_failed = 78,
+        // floor while growing failures or hangs now fails.
+        //
+        // 60 -> 62 and 78 -> 76: the reflective element descriptor now hands
+        // back the builtin serializers' own descriptors instead of minting a
+        // `PrimitiveSerialDescriptor` with a primitive's serial name, which
+        // upstream rejects outright. Measured solo: 62 passed, 76 failed, 0
+        // did not complete.
+        .baseline = 62,
+        .max_failed = 76,
         .max_incomplete = 0,
     });
 }

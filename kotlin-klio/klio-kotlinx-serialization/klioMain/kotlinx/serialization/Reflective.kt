@@ -22,8 +22,7 @@ package kotlinx.serialization
 import kotlin.reflect.KClass
 import kotlinx.serialization.internal.EnumSerializer
 import kotlinx.serialization.internal.ObjectSerializer
-import kotlinx.serialization.descriptors.PrimitiveKind
-import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.descriptors.SerialKind
 import kotlinx.serialization.descriptors.nullable
@@ -36,6 +35,9 @@ import kotlinx.serialization.encoding.Encoder
 
 internal fun __klsx_ctorParamNames(kClass: Any?): List<String> =
     error("intrinsic kotlinx.serialization.__klsx_ctorParamNames not installed")
+
+internal fun __klsx_ctorParamSerialNames(kClass: Any?): List<String> =
+    error("intrinsic kotlinx.serialization.__klsx_ctorParamSerialNames not installed")
 
 internal fun __klsx_get(obj: Any?, name: String): Any? =
     error("intrinsic kotlinx.serialization.__klsx_get not installed")
@@ -156,16 +158,21 @@ internal class ReflectiveDescriptor(
 internal fun descriptorForDeclaredType(declared: String): SerialDescriptor {
     val nullable = declared.endsWith("?")
     val base = if (nullable) declared.substring(0, declared.length - 1) else declared
+    // The builtin serializers' own descriptors. Minting a fresh
+    // `PrimitiveSerialDescriptor` here instead is rejected outright:
+    // `checkNameIsNotAPrimitive` forbids reusing a primitive's serial name for
+    // a new descriptor ("For serial name kotlin.String there already exists
+    // StringSerializer"), so every element of a primitive type threw.
     val d = when (base) {
-        "Int", "kotlin.Int" -> PrimitiveSerialDescriptor("kotlin.Int", PrimitiveKind.INT)
-        "Long", "kotlin.Long" -> PrimitiveSerialDescriptor("kotlin.Long", PrimitiveKind.LONG)
-        "Short", "kotlin.Short" -> PrimitiveSerialDescriptor("kotlin.Short", PrimitiveKind.SHORT)
-        "Byte", "kotlin.Byte" -> PrimitiveSerialDescriptor("kotlin.Byte", PrimitiveKind.BYTE)
-        "Float", "kotlin.Float" -> PrimitiveSerialDescriptor("kotlin.Float", PrimitiveKind.FLOAT)
-        "Double", "kotlin.Double" -> PrimitiveSerialDescriptor("kotlin.Double", PrimitiveKind.DOUBLE)
-        "Boolean", "kotlin.Boolean" -> PrimitiveSerialDescriptor("kotlin.Boolean", PrimitiveKind.BOOLEAN)
-        "Char", "kotlin.Char" -> PrimitiveSerialDescriptor("kotlin.Char", PrimitiveKind.CHAR)
-        "String", "kotlin.String" -> PrimitiveSerialDescriptor("kotlin.String", PrimitiveKind.STRING)
+        "Int", "kotlin.Int" -> Int.serializer().descriptor
+        "Long", "kotlin.Long" -> Long.serializer().descriptor
+        "Short", "kotlin.Short" -> Short.serializer().descriptor
+        "Byte", "kotlin.Byte" -> Byte.serializer().descriptor
+        "Float", "kotlin.Float" -> Float.serializer().descriptor
+        "Double", "kotlin.Double" -> Double.serializer().descriptor
+        "Boolean", "kotlin.Boolean" -> Boolean.serializer().descriptor
+        "Char", "kotlin.Char" -> Char.serializer().descriptor
+        "String", "kotlin.String" -> String.serializer().descriptor
         else -> return ReflectiveElementDescriptor
     }
     return if (nullable) d.nullable else d
@@ -214,7 +221,9 @@ public class ReflectiveKSerializer(private val kClass: Any?) : KSerializer<Any?>
     override val descriptor: SerialDescriptor =
         ReflectiveDescriptor(
             __klsx_serialName(kClass),
-            names,
+            // The descriptor reports WIRE names (`@SerialName`); `names` stays
+            // the declared names that address the instance itself.
+            __klsx_ctorParamSerialNames(kClass),
             __klsx_ctorParamTypes(kClass),
             __klsx_ctorParamOptional(kClass)
         )
