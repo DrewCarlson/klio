@@ -535,6 +535,45 @@ is at zero.
       `examples/value_class_hash_delegation.kt`, whose negative control
       flips 5 of 7 lines when the fix is reverted.
 
+- [x] B18. **serialization 81 -> 71, in two roots.**
+
+      *Primitive element descriptors.* `descriptorForDeclaredType` minted a
+      fresh `PrimitiveSerialDescriptor("kotlin.String", …)`. Upstream forbids
+      exactly that — `checkNameIsNotAPrimitive` rejects reusing a primitive's
+      serial name — so EVERY element of a primitive type threw. Handing back
+      the builtin serializers' own descriptors fixed it: 81 -> 76. This also
+      un-broke `examples/serial_descriptor_shape.kt`, which was failing on
+      main with NO pinned output, so nothing guarded it.
+
+      *Annotation arguments at runtime.* `ClassDef` retained only annotation
+      NAMES, so no consumer could read an argument off a class annotation.
+      It now carries the resolved records too, through the baked image
+      (format 47 -> 48). `@SerialName` on a class replaces the qualified-name
+      default: 76 -> 71.
+
+      THE EARLIER ATTEMPT AT THIS FAILED FOR A KNOWABLE REASON. Adding the
+      field once took this census 57/81 -> 0/28, and the note then read
+      "unpopulated field still 0 => layout". That was right: `ClassDef` is
+      baked into the pack IMAGE, so a field addition invalidates every
+      installed pack. Bumping `FORMAT_VERSION` (so an old image is REJECTED
+      rather than misread) and clearing the suite's scratch home before
+      re-censusing makes it land clean.
+
+      Property-level `@SerialName` also reached the descriptor via a new
+      `__klsx_ctorParamSerialNames` intrinsic — the descriptor reports WIRE
+      names while the declared names keep addressing the instance. On its own
+      that moved NO test (every failure in that cluster was class-level), but
+      it is correct and JSON encode/decode already honoured it.
+
+      MEASUREMENT TRAP, cost an hour: ktor appeared to regress 448/2 -> 447/3
+      and held there over four runs. It is not a regression —
+      `WriterReaderTest.testWriterOnCancelled` is flaky under full-suite load
+      on BOTH sides (448 and 447 alternate) and passes 3/3 in isolation. The
+      apparent stability of the pre-change side was an artifact of running
+      with a fresh pack bake each time, which shifts the timing. Baseline a
+      suspected regression with the IDENTICAL protocol, `--no-install`
+      included, before believing it.
+
 ### Open: an inline MEMBER called bare inside a receiver-lambda
 
 `ValueClassListTest.string` still fails, and it is the reason the file
