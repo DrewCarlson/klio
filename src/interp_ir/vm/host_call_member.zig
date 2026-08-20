@@ -1372,6 +1372,19 @@ pub fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const
             {
                 const g = inst.borrow();
                 const cg = g.get().class.borrow();
+                // Kotlin declares `Enum<E> : Comparable<E>`, so every enum
+                // entry satisfies a `Comparable` bound without the supertype
+                // appearing in its declaration. Without this,
+                // `<T : Comparable<T>> T.coerceAtMost(...)` and its siblings
+                // were skipped for an enum receiver and the call missed.
+                const is_enum = cg.get().is_enum;
+                cg.deinit();
+                g.deinit();
+                if (is_enum and (std.mem.eql(u8, pn, "Comparable") or std.mem.eql(u8, pn, "Enum"))) return true;
+            }
+            {
+                const g = inst.borrow();
+                const cg = g.get().class.borrow();
                 queue.append(a, cg.get().name) catch {};
                 cg.deinit();
                 g.deinit();

@@ -37,6 +37,12 @@ fun main() {
     println("byName?    = " + (Priority.MEDIUM < Priority.HIGH))
     println("ordinals   = " + Priority.entries.map { it.ordinal })
 
+    // Every enum is Comparable, so the generic `Comparable` extensions apply.
+    println("coerceAtMost  = " + high.coerceAtMost(Priority.MEDIUM))
+    println("coerceAtLeast = " + low.coerceAtLeast(Priority.MEDIUM))
+    println("coerceIn      = " + high.coerceIn(low, Priority.MEDIUM))
+    println("inRange       = " + (Priority.MEDIUM in low..high))
+
     // A different enum is simply a different ordering.
     println("otherEnum  = " + listOf(Suit.HEARTS, Suit.CLUBS).sorted())
 }
