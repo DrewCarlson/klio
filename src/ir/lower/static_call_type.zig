@@ -599,6 +599,40 @@ fn scrtVia(call_expr: *const Expr, via: []const u8, t: ir.TypeRef) ir.TypeRef {
     return t;
 }
 
+/// Whether `target` belongs to an overload family whose members return
+/// DIFFERENT primitive types and whose choice this call cannot prove — every
+/// candidate takes one scalar parameter and returns it, so the argument's own
+/// type is the only discriminator, and an unproven argument leaves the family
+/// undecided. A bare-name call only.
+fn scalarOverloadUnproven(b: *FuncBuilder, call: anytype, target: FuncId) Allocator.Error!bool {
+    if (call.callee.* != .Path or call.callee.Path.segments.len != 1) return false;
+    if (call.args.len != 1) return false;
+    const tf = b.module.funcById(target) orelse return false;
+    if (!isPrimitiveTypeName(typeHead(std.mem.trimEnd(u8, tf.return_ty.name, "?")))) return false;
+    const nm = call.callee.Path.segments[0].name;
+    const cands = b.module.funcsBySimpleName(nm);
+    if (cands.len < 2) return false;
+    var disagree = false;
+    for (cands) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        const has_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+        if (f.params.len - @intFromBool(has_this) != 1) return false;
+        const rh = typeHead(std.mem.trimEnd(u8, f.return_ty.name, "?"));
+        if (!isPrimitiveTypeName(rh)) return false;
+        if (!std.mem.eql(u8, rh, typeHead(std.mem.trimEnd(u8, tf.return_ty.name, "?")))) disagree = true;
+    }
+    if (!disagree) return false;
+    if (expr.od_depth >= 3) return true;
+    expr.od_depth += 1;
+    var arg_ty = staticExprTypeRef(b, &call.args[0]) catch null;
+    expr.od_depth -= 1;
+    if (arg_ty) |*t| {
+        defer t.deinit(b.allocator);
+        return !isPrimitiveTypeName(typeHead(std.mem.trimEnd(u8, t.name, "?")));
+    }
+    return true;
+}
+
 pub fn staticCallReturnTypeRef(
     b: *FuncBuilder,
     call_expr: *const Expr,
@@ -1670,6 +1704,16 @@ fn staticCallReturnTypeRefInner(
                 if (inferred) |t| t.name else "-",
             });
         }
+    }
+    // A SCALAR overload family (`kotlin.math.abs`, `min`, `max`) answers a
+    // different type per argument type, so a target picked without proving
+    // the argument's type is a guess — and a guess here is worse than no
+    // answer: `for (t in range) abs(t).pad()` typed `abs(t)` as Double, and
+    // the local `Int.pad()` extension was dropped as inapplicable. Withdraw
+    // the claim rather than let declaration order decide it.
+    if (inferred != null and try scalarOverloadUnproven(b, call, target)) {
+        inferred.?.deinit(b.allocator);
+        inferred = null;
     }
     // Invoke convention: the pick is a fn-typed PROPERTY's accessor (zero
     // value params) while the call supplies arguments — `createFrom("a")`

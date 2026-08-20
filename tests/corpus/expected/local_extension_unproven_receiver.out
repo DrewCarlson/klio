@@ -1,0 +1,6 @@
+range  = 001;000;000;000;
+plain  = 00010203
+list   = <2><7>
+typed  = <9><9>
+family = i1i0i1i1i2i1i3i1
+double = d1.5d2.5
