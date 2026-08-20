@@ -2823,7 +2823,11 @@ pub fn coll_hash_set_ctor(ctx: *CallCtx) Error!EvalResult {
                     }
                     return ok(try makeSet(a, &.{}, true));
                 },
-                .List => |l| return ok(try makeSetVL(a, l.items, true)),
+                .List => |l| {
+                    const items = try snapshotItems(a, l.items);
+                    defer if (runtime.freeScratch()) a.free(items);
+                    return ok(try makeSetH(ctx.host, ctx.out, a, items, true));
+                },
                 .Set => |s| return ok(try makeSetVL(a, s.items, true)),
                 .Instance => {
                     const items = switch (try materialiseIterableInstance(ctx, arg)) {
@@ -3201,7 +3205,12 @@ pub fn coll_array_join_to_string(ctx: *CallCtx) Error!EvalResult {
 /// Caller owns the returned slice.
 fn elemPiece(ctx: *CallCtx, v: Value) Error![]u8 {
     const a = ctx.allocator;
-    if (v == .Instance) {
+    // A user Instance renders through its own override; a nested CONTAINER
+    // renders through its own `toString()` so ITS elements' overrides fire in
+    // turn (`listOf(listOf(box))`).
+    if (v == .Instance or v == .List or v == .Set or v == .Map or
+        v == .Pair or v == .Triple or v == .Result)
+    {
         if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |mr| {
             if (mr == .ok and mr.ok == .String) {
                 const g = mr.ok.String.borrow();
@@ -3259,16 +3268,7 @@ fn collToString(ctx: *CallCtx, what: []const u8) Error!EvalResult {
                 try out.appendSlice(a, "(this Collection)");
                 continue;
             }
-            const piece: []const u8 = if (v == .Instance) blk: {
-                if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |mr| {
-                    if (mr == .ok and mr.ok == .String) {
-                        const g = mr.ok.String.borrow();
-                        defer g.deinit();
-                        break :blk try a.dupe(u8, g.get().bytes);
-                    }
-                }
-                break :blk try display(a, v);
-            } else try display(a, v);
+            const piece: []const u8 = try elemPiece(ctx, v);
             try out.appendSlice(a, piece);
             if (runtime.freeScratch()) a.free(piece);
         }
@@ -6355,13 +6355,43 @@ pub fn pair_second(ctx: *CallCtx) Error!EvalResult {
     out.retain();
     return ok(out);
 }
+/// Render one value the way `toString()` would, dispatching a user override on
+/// an instance. Falls back to the structural renderer for everything else.
+fn displayElemH(ctx: *CallCtx, v: Value) Error!union(enum) { ok: []u8, err: EvalResult } {
+    const a = ctx.allocator;
+    if (v == .Instance) {
+        if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |m| {
+            switch (m) {
+                .ok => |sv| if (sv == .String) {
+                    const g = sv.String.borrow();
+                    defer g.deinit();
+                    return .{ .ok = try a.dupe(u8, g.get().bytes) };
+                },
+                .err => return .{ .err = m },
+            }
+        }
+    }
+    return .{ .ok = try display(a, v) };
+}
+
 pub fn pair_to_string(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     const p = switch (try recvPair(a, ctx.args, "Pair.toString")) {
         .pair => |v| v,
         .err => |e| return e,
     };
-    const buf = try display(a, p);
+    // Kotlin renders `($first, $second)`, each through its own `toString()`.
+    const first = switch (try displayElemH(ctx, p.Pair.first.asPtr().*)) {
+        .ok => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(first);
+    const second = switch (try displayElemH(ctx, p.Pair.second.asPtr().*)) {
+        .ok => |x| x,
+        .err => |e| return e,
+    };
+    defer if (runtime.freeScratch()) a.free(second);
+    const buf = try fmt(a, "({s}, {s})", .{ first, second });
     const s = try makeStringOwned(a, buf);
     if (runtime.freeScratch()) a.free(buf);
     return ok(s);
@@ -6533,7 +6563,12 @@ pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeSetVL(a, it, true));
+    const items = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(items);
+    // A LIST source may hold elements a user `equals` calls equal, and a Set
+    // holds one of each — `distinct()` is `toMutableSet().toList()`, so a
+    // structural-only dedup here made it answer by identity.
+    return ok(try makeSetH(ctx.host, ctx.out, a, items, true));
 }
 
 fn withIndexImpl(ctx: *CallCtx, items: []const Value) Error!Value {
@@ -7167,6 +7202,19 @@ pub fn array_content_to_string(ctx: *CallCtx) Error!EvalResult {
     try out.append(a, '[');
     for (items, 0..) |v, i| {
         if (i > 0) try out.appendSlice(a, ", ");
+        // Each element renders through its own `toString()`, so a user
+        // override fires instead of the structural `ClassName@id`.
+        if (v == .Instance) {
+            if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |m| {
+                if (m == .ok and m.ok == .String) {
+                    const g = m.ok.String.borrow();
+                    defer g.deinit();
+                    try out.appendSlice(a, g.get().bytes);
+                    continue;
+                }
+                if (m == .err) return m;
+            }
+        }
         try out.appendSlice(a, try display(a, v));
     }
     try out.append(a, ']');

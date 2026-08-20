@@ -452,8 +452,13 @@ pub fn string_plus(ctx: *CallCtx) Allocator.Error!EvalResult {
     errdefer joined.deinit(ctx.allocator);
     try joined.appendSlice(ctx.allocator, s);
     // An instance operand must stringify through its (possibly overridden)
-    // `toString()` so `"x=" + obj` matches the template `"x=$obj"`.
-    if (other == .Instance) {
+    // `toString()` so `"x=" + obj` matches the template `"x=$obj"`. A
+    // CONTAINER goes the same way: the structural renderer prints
+    // `ClassName@id` for a user element, so `"" + listOf(obj)` disagreed with
+    // `"$listOf(obj)"` and with `listOf(obj).toString()`.
+    if (other == .Instance or other == .List or other == .Set or other == .Map or
+        other == .Pair or other == .Triple or other == .Result)
+    {
         const mr = try ctx.host.invokeMethod(&other, "toString", &.{}, ctx.out);
         if (mr) |res| {
             switch (res) {

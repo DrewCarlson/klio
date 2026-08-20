@@ -1,0 +1,21 @@
+concat   = [Box(1), Box(1), Box(2)]
+template = [Box(1), Box(1), Box(2)]
+toString = [Box(1), Box(1), Box(2)]
+joined   = Box(1), Box(1), Box(2)
+set      = [Box(1), Box(2)]
+map      = {1=Box(1)}
+pair     = (1, Box(1))
+nested   = [[Box(1)]]
+appended = [Box(1), Box(1), Box(2)]
+array    = [Box(1)]
+distinct = [Box(1), Box(2)]
+toSet    = 2
+toMutable= 2
+hashSet  = 2
+contains = true
+indexOf  = 2
+groupBy  = 2
+distinctBy = 2
+opaque   = 2/2
+plus     = [a, b, c]
+plusList = [a, b, d]

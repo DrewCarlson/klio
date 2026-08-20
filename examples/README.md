@@ -200,6 +200,7 @@ Run any program with:
 | `reified_type_param_forwarding.kt` | A `reified` type parameter binds from an argument's own type with no explicit `<T>`, and stays bound when the body forwards it as another reified call's type argument. |
 | `local_extension_unproven_receiver.kt` | A local extension applies to a receiver the call site cannot type statically, because a scalar overload family (`abs`/`min`/`max`) withdraws its return type rather than guess it. |
 | `overload_defaults_vs_exact_arity.kt` | An overload that binds every parameter outranks one filling some from defaults or a vararg, including when the exact-arity candidate is declared on a supertype. |
+| `tostring_and_equals_in_containers.kt` | A class's `toString()` renders its elements wherever a container is rendered, and its `equals`/`hashCode` decide membership wherever one dedups. |
 | `companion_member_extension.kt` | Extension properties on a companion object declared as members of another class, `private` and public, on a user class and on a builtin's companion. |
 | `serial_descriptor_shape.kt`   | The `SerialDescriptor` a `@Serializable` class reports: element names, which elements are optional (their constructor parameter has a default), and each element's own descriptor. |
 | `interface_companion_state.kt` | Shared companion-object state on an interface.              |
