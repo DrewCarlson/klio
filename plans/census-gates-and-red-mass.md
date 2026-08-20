@@ -695,62 +695,62 @@ is at zero.
       case that must NOT change — the CharSequence extension still binds on a
       real StringBuilder receiver.
 
-### Open: a delegated property read misses its delegate under GC pressure
+### Open: a property-reference WRITE is lost under GC pressure
 
-Root of `DateTimeComponentsFormatTest` (12 of datetime's 35 failures). NOT a
-premature-free bug, which is what the first pass concluded — that reading was
-wrong and is corrected here.
+Root of `DateTimeComponentsFormatTest` (12 of datetime's 35 failures). Two
+earlier readings in this file were wrong and are corrected here: it is neither
+a premature free NOR a delegated-property READ fault. The READ is fine; the
+WRITE never lands.
 
-**Deterministic oracle.** `KLIO_GC_STRESS=1` (collect at every safe point)
-turns the intermittent failure into a certainty, so no long loop is needed:
+**Deterministic oracle** — `KLIO_GC_STRESS=1` collects at every safe point and
+makes it certain, so no long loop is needed:
 
     // scratchpad/g4.kt
     val f = DateTimeComponents.Format { timeZoneId(); chars("]") }
-    f.format { timeZoneId = "Europe/Berlin" }
-    f.parse("America/New_York]").timeZoneId      // null under stress, correct without
+    f.format { timeZoneId = "Europe/Berlin" }        // a prior format IS required
+    f.parse("America/New_York]").timeZoneId          // null under stress
 
-`KLIO_RECLAIM=0`, `KLIO_RECLAIM=arena` and `KLIO_OPT=off` all pass; every
-profile with the tracing GC fails. A prior `format()` is required — parse
-alone is fine.
+`KLIO_RECLAIM=0`, `arena`, and `KLIO_OPT=off` pass; every tracing-GC profile
+fails. `KLIO_GC_GEN=0` and `KLIO_GC_MINOR_STOP=0` still fail, so it is not a
+barrier or generational fault.
 
-**What actually happens**, from instrumenting both klio and the pack. The
-write lands correctly in BOTH runs, on the same object:
+**Proven, by instrumenting the pack and the interpreter together:**
 
-    [setf] DateTimeComponentsContents#166.timeZoneId <- String (before=Null)
+  * `validateTimeZone` matches (`lastMatch=16`) and the parse takes the
+    setting branch in both runs;
+  * `PropertyAccessor.trySetWithoutReassigning` runs `property.set(container,
+    v)` and reports no conflict — then an IMMEDIATE `property.get(container)`
+    returns null. The write is lost between set and get;
+  * the delegate machinery is innocent: `delegate_owner=true` for
+    `DateTimeComponents`, the bound reference resolves to the right receiver
+    (`delegate#197 bound_recv#166 contents#166` identically in both runs), and
+    there is no duplicate field (`dupes=1`);
+  * the value is never collected — a sweep trace over every freed `StringData`
+    shows no `America/...` string;
+  * **under stress, `setFieldInner` is never entered for the parse's contents
+    instance at all.** Both runs enter it for the format's instance (#132) and
+    for the facade (#133); only the plain run also enters for #166 and reaches
+    `storePlainField`. So the parse's `KMutableProperty1.set` takes a
+    different route entirely under GC pressure, and that route drops the write.
 
-Without stress the read then finds it through the delegate:
+**Correction on the field-write memo.** `KLIO_NO_WCACHE` (disabling the
+`field_write_cache` fast path) makes both repros pass, which looks like a
+smoking gun and is NOT one: under stress the memo already MISSES for the
+failing write, and `setFieldInner` is not even entered. Re-keying the memo on
+the interned class FQN instead of the class cell address — a genuine
+robustness fix for the address-recycling hazard its own comment describes —
+changed nothing. Whatever the kill-switch perturbs, it is not the memo lookup.
 
-    [deleg] bound_recv=DateTimeComponentsContents id=166 field timeZoneId=String
-    [deleg] get timeZoneId delegate=<instance> -> String
+**Next step:** find the route the parse's `property.set` actually takes when
+`setFieldInner` is bypassed — instrument `Value.PropertyRef` / KMutableProperty
+`set` dispatch and the IR `StoreField` arm, not `host_fields`.
 
-Under stress that read produces NO delegate trace at all — none of the three
-`getValue` sites in `host_fields.zig` is reached — and yields null. So
-`DateTimeComponents.timeZoneId` (declared `by contents::timeZoneId`) stops
-taking the delegate path; `delegate_owner` goes false, or the read is served
-before reaching it.
-
-Confirming the same thing from the other side: replacing that one line with an
-explicit `get()/set(value)` on `contents` makes the stress run pass, with no
-other change and no printlns.
-
-RULED OUT, so they need not be retried: the value is never swept (a sweep
-trace over string payloads shows no `America/...` ever freed); the 64-bit
-`Frame.wmask` aliasing; borrowed String `bytes` escaping their guard;
-`keepalive` rooting of the host re-entry inputs in `callValue`,
-`callValueWithThisSel` and `callMember`; a write-barrier or generational
-fault (`KLIO_GC_GEN=0` and `KLIO_GC_MINOR_STOP=0` both still fail).
-
-METHOD WARNING that cost several iterations: under `KLIO_GC_STRESS` any
-diagnostic that ALLOCATES (`Value.display`, `allocPrint`) changes the
-collection schedule and the failure moves or disappears. Only non-allocating
-traces (`@tagName`, raw `[]const u8` names, identities) are trustworthy here.
-
-NEXT STEP, concrete: instrument `delegate_owner` in
-`host_fields.zig:getFieldOnInstance` for the `DateTimeComponents` receiver
-under stress and find which of its three legs flips —
-`runtimeClassDelegatesProp`, the `delegated_body_props` registry probe, or the
-supertype walk. The write side is proven correct, so the fault is entirely on
-the read side.
+**Method warning, cost several iterations:** under `KLIO_GC_STRESS` any
+diagnostic that ALLOCATES (`Value.display`, `allocPrint`) shifts the collection
+schedule and the failure moves or vanishes. Only non-allocating traces
+(`@tagName`, raw `[]const u8`, identities) are trustworthy. Instance
+identities are also NOT comparable across two runs — the counter advances with
+allocation — only within one run.
 
 ### Open: an inline MEMBER called bare inside a receiver-lambda
 
