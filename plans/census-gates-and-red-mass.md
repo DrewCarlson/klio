@@ -658,8 +658,45 @@ fixed. This is the second independent confirmation of that conclusion: an
 earlier attempt recorded the same receivers through a different helper in
 `lowerCallGeneral` and also changed nothing.
 
-Next place to look: why a NON-TRAILING lambda argument's recorded receiver
-does not reach `lowerLambda`, given a trailing one's does.
+ROOT FOUND, not yet fixed. It is not the recorder at all. From
+`src/ir/lower/lambda_body.zig:621`:
+
+    // ordinary receiver lambdas carry their receiver as a capture, not a param
+
+A `Sink.() -> Unit` LITERAL therefore captures the enclosing `this` — Unit at
+top level — instead of taking a receiver slot. A call site that knows the
+static type compensates: `a(s)` where `a: Sink.() -> Unit` is a declared
+parameter emits a receiver-bound call that overrides the capture. A value
+pulled out of the vararg array has no such type, emits a plain value call,
+and the closure falls back to its captured `this` — Unit.
+
+The experiment that isolates it: two literals against two DECLARED
+parameters works (`g({ emit("A") }, { emit("B") })` gives "AB"), while the
+same two literals against a `vararg` fails — with IDENTICAL lambda lowering
+inputs on both sides:
+
+    [lamrecv] span=430..443 rec=Sink params=1 implicit_it=true   <- g, works
+    [lamrecv] span=445..458 rec=Sink params=1 implicit_it=true   <- g, works
+    [lamrecv] span=493..506 rec=Sink params=1 implicit_it=true   <- f, fails
+    [lamrecv] span=508..521 rec=Sink params=1 implicit_it=true   <- f, fails
+
+So the receiver TYPE reaches the lambda in every case; what differs is
+whether the INVOCATION binds a receiver. Every array-sourced form fails the
+same way — `for (x in blocks) x(s)`, `blocks[i](s)`, and
+`blocks.forEach { it(s) }` — while assigning to a typed local first stops
+the crash (though it still returns the wrong result), which confirms the
+call site's static type is the whole difference.
+
+This single mechanism explains all three stalled threads: the vararg
+receiver-lambda defect, the RFC_1123 datetime cluster, and why recording
+receiver types never helped in either.
+
+Two ways out, neither small: mark the closure value itself as
+receiver-carrying so a plain value call with one extra leading argument
+binds it as `this` (general — also fixes `forEach`/indexing), or give the
+loop/index expression the vararg's element type so lowering emits the
+receiver-bound call (narrower, and the typed-local experiment suggests it is
+not sufficient on its own).
 
 ### Open: an inline MEMBER called bare inside a receiver-lambda
 
