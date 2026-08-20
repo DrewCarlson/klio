@@ -195,6 +195,11 @@ Run any program with:
 | `value_class_hash_delegation.kt` | A `value` class hashes as its underlying property and a `data` class folds each property's own `hashCode()`, so a property class's override decides the result. |
 | `property_ref_write_through_delegate.kt` | A property written through a `by contents::prop` delegate and through an unbound `KMutableProperty1` lands in the same backing field, and stays readable after the delegate that carried the first write is gone. |
 | `serializer_generic_type_args.kt` | `serializer(...)` on a generic `@Serializable` class takes one serializer per type argument, which decides each type-parameter element's descriptor and separates otherwise identical descriptors. |
+| `interface_delegation_defaults.kt` | `class W(d: I) : I by d` forwards every member the class does not override, including ones the interface gives a default body, while a real `override` still wins. |
+| `member_extension_untyped_receiver.kt` | A member extension stays in scope for a receiver whose static type the call site never names — read through an interface, a chain, or a generic. |
+| `reified_type_param_forwarding.kt` | A `reified` type parameter binds from an argument's own type with no explicit `<T>`, and stays bound when the body forwards it as another reified call's type argument. |
+| `local_extension_unproven_receiver.kt` | A local extension applies to a receiver the call site cannot type statically, because a scalar overload family (`abs`/`min`/`max`) withdraws its return type rather than guess it. |
+| `overload_defaults_vs_exact_arity.kt` | An overload that binds every parameter outranks one filling some from defaults or a vararg, including when the exact-arity candidate is declared on a supertype. |
 | `companion_member_extension.kt` | Extension properties on a companion object declared as members of another class, `private` and public, on a user class and on a builtin's companion. |
 | `serial_descriptor_shape.kt`   | The `SerialDescriptor` a `@Serializable` class reports: element names, which elements are optional (their constructor parameter has a default), and each element's own descriptor. |
 | `interface_companion_state.kt` | Shared companion-object state on an interface.              |

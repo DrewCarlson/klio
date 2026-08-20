@@ -702,6 +702,17 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         if (try extensionPropRead(self, allocator, receiver, prop)) |v| return v;
         return getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
     }
+    // A property of a `by`-delegated interface the class does not override is
+    // the delegate's, even when the interface declares a default getter. The
+    // ladder below would find that default first and answer with it.
+    if (receiver.* == .Instance) {
+        if (host_call_member.interfaceDelegateFor(self, allocator, receiver.Instance, name)) |d| {
+            switch (try getFieldInner(self, allocator, &d, name, suppress_cc_redirect, member_probe)) {
+                .ok => |v| if (v != .Unit) return ok(v),
+                .err => |e| if (e == .Unimplemented) freeFieldMiss(allocator, e) else return .{ .err = e },
+            }
+        }
+    }
     // A bare class/interface name used as a value resolves to its companion
     // object, else the receiver unchanged. Hoisted ahead of the ladder: the
     // sentinel is klio-synthetic, so no other arm can ever claim it, and

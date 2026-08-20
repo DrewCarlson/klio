@@ -1,8 +1,8 @@
 // klio-supplied YearMonth. Upstream YearMonth.kt is an `expect class` that
-// pulls in the format DSL and LocalDateRange (out of scope), so klio provides
-// this standalone value type covering the year/month API the commonTest corpus
-// exercises. `days: LocalDateRange` and the format-DSL parse overload are
-// intentionally absent.
+// pulls in the format DSL, so klio provides this standalone value type. Its
+// year range is `LocalDate`'s (`YEAR_MIN..YEAR_MAX`): every year-month a date
+// can fall in must be representable, and `firstDay`/`lastDay`/`days` build
+// dates from it.
 
 package kotlinx.datetime
 
@@ -14,13 +14,14 @@ class YearMonth(val year: Int, val monthNumber: Int) : Comparable<YearMonth> {
 
     init {
         if (monthNumber < 1 || monthNumber > 12) throw IllegalArgumentException("Invalid month: $monthNumber")
-        if (year < -999_999 || year > 999_999) throw IllegalArgumentException("Invalid year: $year")
+        if (year < YEAR_MIN || year > YEAR_MAX) throw IllegalArgumentException("Invalid year: $year")
     }
 
     val month: Month get() = Month(monthNumber)
     val numberOfDays: Int get() = daysInMonth(year, monthNumber)
     val firstDay: LocalDate get() = LocalDate(year, monthNumber, 1)
     val lastDay: LocalDate get() = LocalDate(year, monthNumber, numberOfDays)
+    val days: LocalDateRange get() = LocalDateRange(firstDay, lastDay)
 
 
     override fun compareTo(other: YearMonth): Int {
@@ -45,11 +46,11 @@ class YearMonth(val year: Int, val monthNumber: Int) : Comparable<YearMonth> {
     operator fun rangeUntil(that: YearMonth): YearMonthRange = YearMonthRange.fromRangeUntil(this, that)
 
     companion object {
-        val MIN: YearMonth = YearMonth(-999_999, 1)
-        val MAX: YearMonth = YearMonth(999_999, 12)
+        val MIN: YearMonth = YearMonth(YEAR_MIN, 1)
+        val MAX: YearMonth = YearMonth(YEAR_MAX, 12)
 
         fun orNull(year: Int, month: Int): YearMonth? =
-            if (month in 1..12 && year in -999_999..999_999) YearMonth(year, month) else null
+            if (month in 1..12 && year in YEAR_MIN..YEAR_MAX) YearMonth(year, month) else null
 
         fun orNull(year: Int, month: Month): YearMonth? = orNull(year, month.number)
 
@@ -73,7 +74,7 @@ class YearMonth(val year: Int, val monthNumber: Int) : Comparable<YearMonth> {
             val yMag = yStr.toIntOrNull() ?: throw DateTimeFormatException("Invalid ISO-8601 year-month: $input")
             val year = if (neg) -yMag else yMag
             val month = mStr.toInt()
-            if (month !in 1..12 || year !in -999_999..999_999)
+            if (month !in 1..12 || year !in YEAR_MIN..YEAR_MAX)
                 throw DateTimeFormatException("Invalid ISO-8601 year-month: $input")
             return YearMonth(year, month)
         }
@@ -97,7 +98,7 @@ fun YearMonth.format(format: DateTimeFormat<YearMonth>): String = format.format(
 // Proleptic-month index -> YearMonth, with a floor division so a negative index
 // maps to the correct (year, month).
 private fun yearMonthFromProleptic(pm: Long): YearMonth {
-    if (pm < -999_999L * 12L || pm > 999_999L * 12L + 11L)
+    if (pm < YEAR_MIN.toLong() * 12L || pm > YEAR_MAX.toLong() * 12L + 11L)
         throw DateTimeArithmeticException("YearMonth out of range")
     val y = if (pm >= 0) pm / 12L else -((-pm + 11L) / 12L)
     val m = (pm - y * 12L).toInt() + 1
