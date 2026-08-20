@@ -1,0 +1,6 @@
+bare          = 0123
+in with       = 0123
+in apply      = 0123
+plain in with = 0123
+qualified     = 0123
+buildString   = [0123]

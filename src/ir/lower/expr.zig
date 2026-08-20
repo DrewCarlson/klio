@@ -4069,6 +4069,14 @@ fn mapArgsToParams(
     return out;
 }
 
+/// The element type of a function-typed VARARG parameter. The lowered
+/// parameter may carry the element type directly (`Function0`) rather than a
+/// materialized array, so try it as-is before stripping an array layer.
+fn varargFnElemTy(b: *FuncBuilder, ty: ir.TypeRef) ir.TypeRef {
+    if (fnTypeArityAlias(b, ty) != null) return ty;
+    return applicability.varargElementRef(&ty);
+}
+
 fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_names: []const ?[]const u8, recv_offset: usize) Allocator.Error!?[]i16 {
     if (args.len == 0) return null;
     for (args) |*a| if (a.* == .Spread) return null;
@@ -4094,6 +4102,29 @@ fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_name
     // A trailing lambda fills the last function-typed parameter even when
     // earlier defaulted parameters are omitted; align the trailing lambda
     // with the last parameter and the leading args from the front.
+    // Same vararg run as the receiver recorder below. Without this the
+    // literals keep their implicit `it` parameter, so the closure reports one
+    // value parameter, and the VM's receiver rule — bind the extra leading
+    // argument when a receiver-carrying closure is called with `n_params + 1`
+    // arguments — cannot fire.
+    for (params, 0..) |p, vp| {
+        if (!p.is_vararg) continue;
+        const n_after = params.len - vp - 1;
+        if (args.len < vp + n_after) break;
+        const vararg_end = args.len - n_after;
+        const elem_arity = fnTypeArityAlias(b, varargFnElemTy(b, params[vp].ty)) orelse -1;
+        var vi2: usize = 0;
+        while (vi2 < vp and vi2 < args.len) : (vi2 += 1) out[vi2] = fnTypeArityAlias(b, params[vi2].ty) orelse -1;
+        vi2 = vp;
+        while (vi2 < vararg_end) : (vi2 += 1) out[vi2] = elem_arity;
+        var k: usize = 0;
+        while (k < n_after) : (k += 1) {
+            const ai = vararg_end + k;
+            const pi = vp + 1 + k;
+            if (ai < args.len and pi < params.len) out[ai] = fnTypeArityAlias(b, params[pi].ty) orelse -1;
+        }
+        return out;
+    }
     const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
     if (trailing_lambda and args.len <= params.len) {
         // Leading positional args map 1:1 from the front.
@@ -4377,6 +4408,37 @@ fn recordLambdaArgReceiversForCallReceiver(
                     try recordCallBoundLambdaReceiver(b, func, a.span(), receiver, params, args, arg_names, type_args, call_receiver);
                 }
             };
+        }
+        return;
+    }
+    // A function-typed VARARG parameter binds EVERY argument in its run.
+    // `f(vararg blocks: Sink.() -> Unit)` called with two lambda literals
+    // matches neither shape below — two arguments never equal the one
+    // declared parameter, nor fit `args.len <= params.len` — so neither
+    // literal was recorded. kotlinx-datetime's `alternativeParsing(vararg
+    // others: T.() -> Unit, primary: T.() -> Unit)` is the shape RFC_1123
+    // parses through.
+    for (params, 0..) |p, vp| {
+        if (!p.is_vararg) continue;
+        const n_after = params.len - vp - 1;
+        if (args.len < vp + n_after) break;
+        const vararg_end = args.len - n_after;
+        if (fnTypeReceiver(b, varargFnElemTy(b, params[vp].ty))) |receiver| {
+            var vi: usize = vp;
+            while (vi < vararg_end) : (vi += 1) {
+                if (args[vi] != .Lambda and args[vi] != .AnonFun) continue;
+                try recordCallBoundLambdaReceiver(b, func, args[vi].span(), receiver, params, args, arg_names, type_args, call_receiver);
+            }
+        }
+        var k: usize = 0;
+        while (k < n_after) : (k += 1) {
+            const ai = vararg_end + k;
+            const pi = vp + 1 + k;
+            if (ai >= args.len or pi >= params.len) break;
+            if (args[ai] != .Lambda and args[ai] != .AnonFun) continue;
+            if (fnTypeReceiver(b, params[pi].ty)) |receiver| {
+                try recordCallBoundLambdaReceiver(b, func, args[ai].span(), receiver, params, args, arg_names, type_args, call_receiver);
+            }
         }
         return;
     }
@@ -6790,6 +6852,21 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         runtime.envOnce("KLIO_SPLICE_PIN") == null and
                         allNull(ast_arg_names)) pin: {
                         const chain0 = recv_chain.?[0];
+                        // The pin dispatches on the BOUND `this`, so the
+                        // chain's head must be that same value. Inside a
+                        // receiver lambda over another type the two diverge —
+                        // the chain names the enclosing class that owns the
+                        // member while `this` is the lambda's receiver — and
+                        // pinning then dispatched the owner's member on the
+                        // lambda receiver (`eachInline` on
+                        // kotlin.text.StringBuilder inside `with(sb) { … }`),
+                        // blocking the outward walk a non-inline sibling uses.
+                        if (b.recvTy() orelse b.spliceRecvTy()) |inner| {
+                            const ih = typeHead(std.mem.trimEnd(u8, inner, "?"));
+                            const ch = typeHead(std.mem.trimEnd(u8, chain0, "?"));
+                            if (!std.mem.eql(u8, ih, ch) and
+                                !std.mem.eql(u8, simpleTail(ih), simpleTail(ch))) break :pin;
+                        }
                         const pin_cid = (if (std.mem.indexOfScalar(u8, chain0, '.') != null)
                             b.module.classIdByFqn(chain0)
                         else
@@ -9281,6 +9358,7 @@ fn lowerValueInvocation(
             if (b.localInitExpr(name0)) |init_e| {
                 if (argLitKind(init_e) != null) return null;
                 if (ctorInitNonInvocable(b, init_e, args.len)) return null;
+                if (callInitNonInvocable(b, init_e, args.len)) return null;
             }
         }
         // Nor does a function-typed param shadow one for a TRAILING-LAMBDA
@@ -9444,6 +9522,45 @@ fn argLitKind(e: *const Expr) ?LitKind {
 /// call of its name must bind a same-named function or member instead.
 /// Answers false whenever anything is unknown (qualified callee, abstract
 /// classifier, absent hierarchy entry): unknown keeps the local binding.
+/// Whether a local initialized by an ordinary FUNCTION call is non-invocable,
+/// judged from that function's declared return type. `ctorInitNonInvocable`
+/// answers only `val x = X(...)`; this answers `val box = mk()` and, the shape
+/// that matters across kotlinx's flow tests, `val flow = flowOf(1, 2)` — a
+/// `Flow` declares no `invoke`, so the call `flow { … }` written beside it
+/// names the `flow { … }` builder, exactly as Kotlin resolves it.
+fn callInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) bool {
+    const call = switch (init_e.*) {
+        .Call => |*c| c,
+        else => return false,
+    };
+    const path = switch (call.callee.*) {
+        .Path => |*p| p,
+        else => return false,
+    };
+    if (path.segments.len != 1) return false;
+    const fid = b.module.funcId(path.segments[0].name) orelse return false;
+    const f = b.module.funcById(fid) orelse return false;
+    if (!f.return_ty_declared) return false;
+    const head = typeHead(std.mem.trimEnd(u8, f.return_ty.name, "?"));
+    if (std.mem.indexOf(u8, f.return_ty.name, "->") != null) return false;
+    if (std.mem.startsWith(u8, head, "Function")) return false;
+    const cid = b.module.classId(head) orelse return false;
+    if (cid.int() >= b.module.classes.items.len) return false;
+    const cls = &b.module.classes.items[cid.int()];
+    const methods = b.module.registry.hierarchy_methods.get(cls.name) orelse
+        b.module.registry.hierarchy_methods.get(cls.fqn) orelse return false;
+    if (methods.contains("invoke")) return false;
+    return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", argc) == .none;
+}
+
+/// The last dotted segment of a type head (`kotlin.text.StringBuilder` ->
+/// `StringBuilder`), so a qualified and an unqualified spelling of the same
+/// class compare equal.
+fn simpleTail(h: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, h, '.')) |i| return h[i + 1 ..];
+    return h;
+}
+
 fn ctorInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) bool {
     const call = switch (init_e.*) {
         .Call => |*c| c,

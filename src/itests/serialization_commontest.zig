@@ -26,10 +26,22 @@ test "kotlinx.serialization commonTest pass count holds at or above the ratchet 
         // 60 -> 62 and 78 -> 76: the reflective element descriptor now hands
         // back the builtin serializers' own descriptors instead of minting a
         // `PrimitiveSerialDescriptor` with a primitive's serial name, which
-        // upstream rejects outright. Measured solo: 62 passed, 76 failed, 0
-        // did not complete.
-        .baseline = 62,
-        .max_failed = 76,
+        // upstream rejects outright.
+        //
+        // 62 -> 67 and 76 -> 71: the runtime class now retains its
+        // annotations' ARGUMENTS, so `@SerialName` on the class replaces the
+        // qualified-name default.
+        //
+        // 67 -> 69 and 71 -> 69: a descriptor reports the `@SerialInfo`
+        // annotations written on the class and on each property, built by
+        // running each annotation class's own constructor. Measured solo: 69
+        // passed, 69 failed, 0 did not complete.
+        // 69 -> 96 and 69 -> 42 after the harness stopped starving a target
+        // of its helper file, `+=` on a nested container stopped flattening,
+        // and a spliced inline extension started resolving against its own
+        // receiver. Measured solo: 98 passed, 40 failed.
+        .baseline = 96,
+        .max_failed = 42,
         .max_incomplete = 0,
     });
 }
