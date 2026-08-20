@@ -6852,6 +6852,21 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         runtime.envOnce("KLIO_SPLICE_PIN") == null and
                         allNull(ast_arg_names)) pin: {
                         const chain0 = recv_chain.?[0];
+                        // The pin dispatches on the BOUND `this`, so the
+                        // chain's head must be that same value. Inside a
+                        // receiver lambda over another type the two diverge —
+                        // the chain names the enclosing class that owns the
+                        // member while `this` is the lambda's receiver — and
+                        // pinning then dispatched the owner's member on the
+                        // lambda receiver (`eachInline` on
+                        // kotlin.text.StringBuilder inside `with(sb) { … }`),
+                        // blocking the outward walk a non-inline sibling uses.
+                        if (b.recvTy() orelse b.spliceRecvTy()) |inner| {
+                            const ih = typeHead(std.mem.trimEnd(u8, inner, "?"));
+                            const ch = typeHead(std.mem.trimEnd(u8, chain0, "?"));
+                            if (!std.mem.eql(u8, ih, ch) and
+                                !std.mem.eql(u8, simpleTail(ih), simpleTail(ch))) break :pin;
+                        }
                         const pin_cid = (if (std.mem.indexOfScalar(u8, chain0, '.') != null)
                             b.module.classIdByFqn(chain0)
                         else
@@ -9536,6 +9551,14 @@ fn callInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) bool 
         b.module.registry.hierarchy_methods.get(cls.fqn) orelse return false;
     if (methods.contains("invoke")) return false;
     return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", argc) == .none;
+}
+
+/// The last dotted segment of a type head (`kotlin.text.StringBuilder` ->
+/// `StringBuilder`), so a qualified and an unqualified spelling of the same
+/// class compare equal.
+fn simpleTail(h: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, h, '.')) |i| return h[i + 1 ..];
+    return h;
 }
 
 fn ctorInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) bool {
