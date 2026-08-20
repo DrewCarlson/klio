@@ -522,6 +522,56 @@ is at zero.
       overload selection only. A `factoryResultHead` added there is inert
       for module and pack candidates.
 
+- [x] B17. **data/value-class `hashCode` ignored a property's override.**
+      The generated `hashCode` folded `valueStructuralHash` — a pure hash
+      with no member dispatch — so a property whose class overrides
+      `hashCode()` had the override ignored. androidx's
+      `value class TestValueClassList(val list: LongList)` must hash as
+      `LongList.hashCode()` (walks `_size`); the structural hash read the
+      fixed-capacity backing array instead, so `removeAt`/`clear` left it
+      unchanged. The sibling `equals` already dispatched through
+      `deepValueEquals`, so the two conventions disagreed — that mismatch is
+      the tell. `ValueClassListTest` 61/2 -> 62/1. Guarded by
+      `examples/value_class_hash_delegation.kt`, whose negative control
+      flips 5 of 7 lines when the fix is reverted.
+
+### Open: an inline MEMBER called bare inside a receiver-lambda
+
+`ValueClassListTest.string` still fails, and it is the reason the file
+blows the 300s child timeout — `toString()` runs ~330s solo before dying.
+Reduced to a five-line repro:
+
+    class Holder(val n: Int) {
+        inline fun eachInline(block: (Int) -> Unit) { for (i in 0 until n) block(i) }
+        fun eachPlain(block: (Int) -> Unit) { for (i in 0 until n) block(i) }
+        fun f(): String { val sb = StringBuilder(); with(sb) { eachInline { sb.append(it) } }; return sb.toString() }
+    }
+
+`eachPlain` in that position works; `eachInline` dies with
+`Vm::call_member eachInline on kotlin.text.StringBuilder`. Called bare with
+no inner receiver, or with an explicit `this@Holder.`, or through a plain
+(receiverless) lambda, it also works — the trigger is precisely a bare call
+to an inline MEMBER of an enclosing class where the innermost implicit
+receiver is a different type. In androidx the same call is inside
+`buildString { … }`, and the spliced `for (i in 0 until _size)` then read
+`_size` off the wrong object and looped unbounded (the spin trace shows the
+index climbing 24124 -> 32316 -> 40508 at line 353).
+
+Both routes fail: the static path declines to splice, and the runtime
+member walk cannot recover, because inline members are not reachable
+through its outer-receiver fallback the way `eachPlain` is.
+
+ATTEMPTED AND REVERTED: adding an `inner_recv_not_owner` term to
+`bareInlineNeedsSplice` (splice when the innermost receiver is not the
+inline member's owner). The gate fires exactly as intended — traced
+`owner=Holder recvty=kotlin.text.StringBuilder irno=true tower=2
+[kotlin.text.StringBuilder] [Holder]` — and behavior does not change at
+all, so the decision is discarded downstream. Note when tracing this that
+`bareInlineNeedsSplice` is ALSO called from `inlineResolveAudit`, so two
+prints appear per site and only the one carrying a non-empty tower is the
+lambda-body context. Next lead is the consumer of
+`inlineTargetForBareCall`, not the gate.
+
 - [x] B13. **atomicfu 4 -> 0.** All four were harness artefacts: `C.kt` used
       `D`, `GetArrayElementTest` used `AtomicArrayClass`,
       `SetArrayElementTest` used `IntBox`, each declared in a sibling file
