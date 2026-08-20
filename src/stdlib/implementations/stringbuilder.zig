@@ -280,8 +280,11 @@ fn renderPiece(ctx: *CallCtx, v: Value) Allocator.Error![]u8 {
                 return buf.toOwnedSlice(a);
             }
         },
-        .Instance => {
-            // `append(Any?)` calls the object's `toString()`.
+        // `append(Any?)` calls the value's `toString()` — a user override on an
+        // instance, and a container's own rendering, which is what makes its
+        // ELEMENTS' overrides fire (the structural renderer prints
+        // `ClassName@id` for a user element).
+        .Instance, .List, .Set, .Map, .Pair, .Triple, .Result => {
             if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |res| {
                 switch (res) {
                     .ok => |sv| if (sv == .String) {

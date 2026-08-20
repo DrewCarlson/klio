@@ -1,0 +1,7 @@
+sealed     = [a]
+abstract   = [a]
+interfaces = [a]
+count      = 1
+withLocal  = [Discriminator, Local]
+localValue = [own]
+untagged   = 0

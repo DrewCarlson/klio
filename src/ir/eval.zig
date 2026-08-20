@@ -7436,7 +7436,14 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
     }
     // StringConcat over a Value.Instance routes the instance
     // through toString so user-defined overrides fire.
-    if (bo.op == .StringConcat) {
+    // `Add` with a String operand IS concatenation (`String.plus(Any?)`), so
+    // it renders the other side the same way — through the host, where a user
+    // `toString` and a container's element renderings fire. The host-free
+    // arithmetic fallback would print `ClassName@id` for a user element.
+    // LEFT operand only: `String.plus(Any?)` is a member on String, while
+    // `collection + element` is the collection's own `plus`.
+    const string_add = bo.op == .Add and l == .String;
+    if (bo.op == .StringConcat or string_add) {
         const ls = switch (try stringify(H, allocator, host, &l)) {
             .ok => |s| s,
             .err => |e| return raiseStep(frame, e),
@@ -8365,12 +8372,15 @@ fn applyUnop(allocator: Allocator, op: UnOp, v: *const Value) Allocator.Error!Ev
 /// user-defined overrides fire; primitives use `renderValue`'s fast
 /// path. Caller owns the returned string.
 fn stringify(comptime H: type, allocator: Allocator, host: *H, v: *const Value) Allocator.Error!union(enum) { ok: []const u8, err: EvalError } {
-    // Instances dispatch their `toString()` override; List/Set/Map dispatch too
-    // so their element `toString()` fires (the fast `renderValue`/`display`
-    // formatter prints `ClassName@id` for a user element), and `Result` so
-    // `Failure($exception)` interpolates the payload's override. Arrays keep
-    // Kotlin's identity `toString`, so they are not included.
-    if (v.* == .Instance or v.* == .List or v.* == .Set or v.* == .Map or v.* == .Result) {
+    // Instances dispatch their `toString()` override; List/Set/Map and the
+    // tuple shapes dispatch too so their element `toString()` fires (the fast
+    // `renderValue`/`display` formatter prints `ClassName@id` for a user
+    // element), and `Result` so `Failure($exception)` interpolates the
+    // payload's override. Arrays keep Kotlin's identity `toString`, so they
+    // are not included.
+    if (v.* == .Instance or v.* == .List or v.* == .Set or v.* == .Map or v.* == .Result or
+        v.* == .Pair or v.* == .Triple)
+    {
         switch (try host.callMember(allocator, v, "toString", &.{})) {
             .ok => |result| {
                 if (result == .String) {

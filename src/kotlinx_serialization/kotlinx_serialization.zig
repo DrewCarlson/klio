@@ -813,9 +813,62 @@ fn annotationClassValue(ctx: *CallCtx, rec: *const runtime.AnnotationRecord) ?Va
 fn annotationIsSerialInfo(cls: *const ClassDef) bool {
     for (cls.annotation_names) |n| {
         if (std.mem.eql(u8, n, "kotlinx.serialization.SerialInfo") or
-            std.mem.eql(u8, n, "SerialInfo")) return true;
+            std.mem.eql(u8, n, "SerialInfo") or
+            std.mem.eql(u8, n, "kotlinx.serialization.InheritableSerialInfo") or
+            std.mem.eql(u8, n, "InheritableSerialInfo")) return true;
     }
     return false;
+}
+
+/// An `@InheritableSerialInfo` annotation reaches a descriptor from the
+/// declaration's SUPERTYPES as well as from the declaration itself; a plain
+/// `@SerialInfo` one does not.
+fn annotationIsInheritable(cls: *const ClassDef) bool {
+    for (cls.annotation_names) |n| {
+        if (std.mem.eql(u8, n, "kotlinx.serialization.InheritableSerialInfo") or
+            std.mem.eql(u8, n, "InheritableSerialInfo")) return true;
+    }
+    return false;
+}
+
+/// Append the `@InheritableSerialInfo` annotations `cls` inherits, walking its
+/// supertype closure. Kotlin requires every occurrence of one annotation to
+/// agree, so the FIRST reached wins and later duplicates are skipped.
+fn collectInheritedAnnotations(
+    ctx: *CallCtx,
+    cls: *const ClassDef,
+    out: *std.ArrayList(runtime.AnnotationRecord),
+    seen: *std.ArrayList([]const u8),
+    depth: u8,
+) Error!void {
+    if (depth > 16) return;
+    const a = ctx.allocator;
+    var supers: std.ArrayList(ObjRef(ClassDef)) = .empty;
+    defer {
+        for (supers.items) |sc| sc.deinit();
+        supers.deinit(a);
+    }
+    if (cls.parent) |p| try supers.append(a, p.clone());
+    for (cls.interfaces) |i| try supers.append(a, i.clone());
+    for (supers.items) |sup| {
+        const sp = sup.asPtr();
+        for (sp.annotation_records) |*rec| {
+            const cls_val = annotationClassValue(ctx, rec) orelse continue;
+            const cls_ref = classOf(&cls_val) orelse continue;
+            const inheritable = annotationIsInheritable(cls_ref.asPtr());
+            const fqn = cls_ref.asPtr().fqn;
+            cls_ref.deinit();
+            if (!inheritable) continue;
+            var dup = false;
+            for (seen.items) |n| {
+                if (std.mem.eql(u8, n, fqn)) dup = true;
+            }
+            if (dup) continue;
+            try seen.append(a, fqn);
+            try out.append(a, rec.*);
+        }
+        try collectInheritedAnnotations(ctx, sp, out, seen, depth + 1);
+    }
 }
 
 /// One recorded annotation argument as a runtime value. An `EnumEntry` names
@@ -934,10 +987,23 @@ fn classAnnotations(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return typeErr("__klsx_classAnnotations: expected a class");
     const cls_ref = classOf(&ctx.args[0]) orelse
         return ok(try annotationInstanceList(ctx, &.{}));
-    const records = cls_ref.asPtr().annotation_records;
-    const r = try annotationInstanceList(ctx, records);
-    cls_ref.deinit();
-    return ok(r);
+    defer cls_ref.deinit();
+    const a = ctx.allocator;
+    var records: std.ArrayList(runtime.AnnotationRecord) = .empty;
+    defer records.deinit(a);
+    var seen: std.ArrayList([]const u8) = .empty;
+    defer seen.deinit(a);
+    for (cls_ref.asPtr().annotation_records) |*rec| {
+        try records.append(a, rec.*);
+        const cls_val = annotationClassValue(ctx, rec) orelse continue;
+        const acls = classOf(&cls_val) orelse continue;
+        defer acls.deinit();
+        if (annotationIsInheritable(acls.asPtr())) try seen.append(a, acls.asPtr().fqn);
+    }
+    // An `@InheritableSerialInfo` annotation on a supertype is reported here
+    // too — that is what makes it inheritable.
+    try collectInheritedAnnotations(ctx, cls_ref.asPtr(), &records, &seen, 0);
+    return ok(try annotationInstanceList(ctx, records.items));
 }
 
 /// The `@SerialInfo` annotations applied to the primary-constructor property
