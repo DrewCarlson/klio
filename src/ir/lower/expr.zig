@@ -9281,6 +9281,7 @@ fn lowerValueInvocation(
             if (b.localInitExpr(name0)) |init_e| {
                 if (argLitKind(init_e) != null) return null;
                 if (ctorInitNonInvocable(b, init_e, args.len)) return null;
+                if (callInitNonInvocable(b, init_e, args.len)) return null;
             }
         }
         // Nor does a function-typed param shadow one for a TRAILING-LAMBDA
@@ -9444,6 +9445,37 @@ fn argLitKind(e: *const Expr) ?LitKind {
 /// call of its name must bind a same-named function or member instead.
 /// Answers false whenever anything is unknown (qualified callee, abstract
 /// classifier, absent hierarchy entry): unknown keeps the local binding.
+/// Whether a local initialized by an ordinary FUNCTION call is non-invocable,
+/// judged from that function's declared return type. `ctorInitNonInvocable`
+/// answers only `val x = X(...)`; this answers `val box = mk()` and, the shape
+/// that matters across kotlinx's flow tests, `val flow = flowOf(1, 2)` — a
+/// `Flow` declares no `invoke`, so the call `flow { … }` written beside it
+/// names the `flow { … }` builder, exactly as Kotlin resolves it.
+fn callInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) bool {
+    const call = switch (init_e.*) {
+        .Call => |*c| c,
+        else => return false,
+    };
+    const path = switch (call.callee.*) {
+        .Path => |*p| p,
+        else => return false,
+    };
+    if (path.segments.len != 1) return false;
+    const fid = b.module.funcId(path.segments[0].name) orelse return false;
+    const f = b.module.funcById(fid) orelse return false;
+    if (!f.return_ty_declared) return false;
+    const head = typeHead(std.mem.trimEnd(u8, f.return_ty.name, "?"));
+    if (std.mem.indexOf(u8, f.return_ty.name, "->") != null) return false;
+    if (std.mem.startsWith(u8, head, "Function")) return false;
+    const cid = b.module.classId(head) orelse return false;
+    if (cid.int() >= b.module.classes.items.len) return false;
+    const cls = &b.module.classes.items[cid.int()];
+    const methods = b.module.registry.hierarchy_methods.get(cls.name) orelse
+        b.module.registry.hierarchy_methods.get(cls.fqn) orelse return false;
+    if (methods.contains("invoke")) return false;
+    return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", argc) == .none;
+}
+
 fn ctorInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) bool {
     const call = switch (init_e.*) {
         .Call => |*c| c,
