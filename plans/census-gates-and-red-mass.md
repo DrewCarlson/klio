@@ -574,6 +574,56 @@ is at zero.
       suspected regression with the IDENTICAL protocol, `--no-install`
       included, before believing it.
 
+### Open: a local named like a PACK function captures the call
+
+A local variable whose name matches a pack-provided function binds a CALL
+written with that name, and the local is then invoked as a value:
+
+    import kotlinx.coroutines.flow.*
+    fun make(): Flow<Int> {
+        val flow = flowOf(9)
+        return flow { emit(1); emit(2) }   // Vm::call_member `invoke` on `$anon$1`
+    }
+
+Kotlin resolves a call against FUNCTIONS; a variable answers one only when
+its type carries an `invoke` operator, so this must reach the `flow { … }`
+builder. kotlinx's own flow tests name locals `flow` constantly, which is
+why this shows up across the coroutines suite — `FilterTest.testFilter`
+reaches it through `filter`, whose inline body splices `transform`, whose
+body is `flow { collect { … } }`.
+
+Sharply bounded by experiment:
+- The local must be named `flow` AND be a `Flow`. `val flow = 42` beside the
+  same call is FINE, and a local named `flo` is fine — so a type match is
+  steering the pick, not the name alone.
+- No splice is required: calling the builder directly with the local in
+  scope fails identically. The earlier reading that this was inline-splice
+  hygiene was WRONG.
+- The equivalent in SOURCE is correct. `class Box; fun box(body: () -> Int)`
+  with `val box = Box(99)` resolves `box { 1 }` to the function and `box.n`
+  to the local. It works because `ctorInitNonInvocable` proves a constructor
+  initializer non-invocable; `val flow = flowOf(9)` is an ordinary CALL, so
+  neither that proof nor the literal proof fires, and no declared type is
+  recorded for the local.
+
+ATTEMPTED AND REVERTED (three variants, none reached the defect):
+`localTypeNonInvocable` keyed on the local's declared type — `localDeclType`
+returns null for an inferred local; inverting the default in
+`lowerValueInvocation` to Kotlin's actual rule (a call binds a variable only
+when provably invocable); and widening that guard's precondition past
+`hasBareCallCandidate` to the whole-module `funcsBySimpleName`, since a pack
+function is not in the caller file's candidate set.
+
+None changed behavior, and tracing says why: **`lowerValueInvocation` is
+never reached for this call.** A `[localcall]` probe at its
+`if (b.resolve(name0))` arm does not fire, while the `[rlp-arm]` probe at the
+function's top does — so the call is handled by an earlier branch or a
+different lowering entry, and the whole local-vs-function guard block is the
+wrong place to fix it. Find the real entry first. (Trap while probing:
+`runtime.envOnce` keys are one-shot per key, and both `KLIO_RLP_TRACE` and
+`KLIO_SHADOW_TRACE` are already taken — a shared key silently prints
+nothing.)
+
 ### Open: an inline MEMBER called bare inside a receiver-lambda
 
 `ValueClassListTest.string` still fails, and it is the reason the file
