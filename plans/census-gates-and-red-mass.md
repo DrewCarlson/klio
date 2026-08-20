@@ -477,7 +477,50 @@ Failures tolerated by the ceilings, worst ratio first:
 
 ## Suites at zero
 
-`stdlib`, `androidx_collection`, `atomicfu`.
+`atomicfu`, `io`.
+
+**`androidx_collection` is NOT at zero, and the gate cannot see it.**
+`ValueClassListTest.kt` fails two cases, but in the batched run the file
+exceeds the 300s child timeout and is counted as *incomplete* instead — so
+`max_failed = 0` passes on a timeout rather than on a clean result. Run it
+solo (`--filter ValueClassListTest --jobs 1 --timeout 500`) to see
+61 passed / 2 failed. Both reproduce on the pre-change binary, so they
+predate the factory-head fix. Any suite whose ceiling is satisfied while a
+file times out is reporting a floor, not a result.
+
+**The `stdlib` census and the stdlib sweep measure different surfaces.**
+The sweep reports 117 files / 0 failures; the census reports 121 files /
+2242 passed / **281 failed**, identical before and after the factory-head
+fix. The sweep's green is real but partial — it is not evidence that stdlib
+is at zero.
+
+- [x] B16. **combine's `Iterable` overload — coroutines 26 -> 0.** A bare
+      call inside an extension can bind a same-named *extension* using the
+      enclosing receiver. `combine(listOf(this, other)) { … }` inside a
+      `Flow<T1>.combineLatest` override did exactly that: `listOf(...)` had
+      no static type, so the binary extension
+      `Flow<T1>.combine(flow, transform)` was never disproved and the
+      enclosing `this` bound it — passing the list itself as `flow`.
+      `combineInternal` then collected a `List`, surfacing as the
+      misleading `unresolved global collect` (the miss is a *member* miss on
+      `kotlin.collections.List` falling through to a global lookup).
+      The argument-shape pass already derived a type for a `.Call` argument
+      carrying explicit type arguments; it now also derives one for stdlib
+      collection factories, whose names fix their own result head.
+      `CombineTest` 86/26 -> 112/0; coroutines census 1075/139 -> 1101/113.
+
+      Bisection that found it: V1 `combine(listOf(this, other))` in a
+      generic extension FAILS; V2 hoisting the list to a local passes; V3
+      the same call with concrete types FAILS; V4 the same call with the
+      flows as plain parameters passes. Generics were irrelevant — the
+      discriminator is `listOf(this, …)` written inline as the argument of
+      a bare call inside an extension. `KLIO_BARE_TRACE` named the culprit
+      outright: `combine#2940 params=3 ext=true`.
+
+      Dead end worth not repeating: `staticArgHead`'s `.Call` arm looks like
+      the place to fix this, but all three of its call sites serve LOCAL fn
+      overload selection only. A `factoryResultHead` added there is inert
+      for module and pack candidates.
 
 - [x] B13. **atomicfu 4 -> 0.** All four were harness artefacts: `C.kt` used
       `D`, `GetArrayElementTest` used `AtomicArrayClass`,

@@ -2445,15 +2445,39 @@ pub fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *cons
             return .{ .ok = try renderStructural(self, allocator, inst) };
         }
         if (std.mem.eql(u8, name, "hashCode")) {
-            const g = inst.borrow();
-            const cg = g.get().class.borrow();
-            var h: i32 = 0;
-            for (cg.get().primary_params) |p| {
-                const v = g.get().get(p.name) orelse Value.Null;
-                h = h *% 31 +% valueStructuralHash(&v);
+            // Kotlin folds each property's OWN `hashCode()`, so a property
+            // whose class overrides it decides the result — androidx's
+            // `value class TestValueClassList(val list: LongList)` hashes as
+            // `LongList.hashCode()`, which walks `_size` elements. A pure
+            // structural hash instead read the fixed-capacity backing array,
+            // so `removeAt`/`clear` left the hash unchanged.
+            //
+            // The fold dispatches back into the interpreter, so the field
+            // values are collected (and kept alive) first: the instance and
+            // its class must not stay borrowed across a member call.
+            var fields: std.ArrayList(Value) = .empty;
+            defer {
+                if (runtime.reclaimEnabled()) {
+                    for (fields.items) |v| v.release(allocator);
+                }
+                fields.deinit(allocator);
             }
-            cg.deinit();
-            g.deinit();
+            {
+                const g = inst.borrow();
+                const cg = g.get().class.borrow();
+                defer {
+                    cg.deinit();
+                    g.deinit();
+                }
+                try fields.ensureTotalCapacity(allocator, cg.get().primary_params.len);
+                for (cg.get().primary_params) |p| {
+                    const v = g.get().get(p.name) orelse Value.Null;
+                    if (runtime.reclaimEnabled()) v.retain();
+                    fields.appendAssumeCapacity(v);
+                }
+            }
+            var h: i32 = 0;
+            for (fields.items) |*v| h = h *% 31 +% try hashWithDispatch(self, allocator, v);
             return .{ .ok = Value.newInt(@as(i64, h)) };
         }
     }
