@@ -655,80 +655,45 @@ is at zero.
       a typed local first (`val t: Sink.() -> Unit = x; t(s)`) returns an
       empty result rather than throwing. Unchanged by this fix.
 
-### Open: a bare call in a receiver lambda binds a stdlib EXTENSION over the enclosing member
+- [x] B21. **androidx 1 failed + 1 timeout -> 0/0.** A lambda literal that
+      ANNOTATES its parameters states their types, and kotlinc uses them to
+      drop a candidate that cannot accept the literal. klio discarded that
+      entirely: `ArgShape.lambda_param_types` existed, unpopulated and unread.
 
-`androidx`'s last real failure and its only timeout. `ValueClassListTest.string`
-runs ~330s and dies; the file is then counted did-not-complete, which is why
-`max_failed = 0` passes while a real failure hides behind it.
+      Inside `buildString { … }` the innermost receiver is a StringBuilder, so
+      a bare `forEachIndexed { index: Int, element: TestValueClass -> … }`
+      bound `CharSequence.forEachIndexed` and then iterated the builder its own
+      body was appending to. `ValueClassListTest.string` ran ~330s and died,
+      and because the FILE timed out its failures counted as did-not-complete
+      — which is how a real failure sat behind a `max_failed = 0` ceiling.
 
-`TestValueClassList.toString` is:
+      Two parts, both needed. The ARGUMENT side populates the shape from the
+      literal's `param_tys` and refutes a definite mismatch (two different
+      builtin scalars, or a scalar against a declared class); that drops the
+      CharSequence candidate. The RECEIVER side drops the `Iterable` one:
+      inside a receiver lambda the receiver types are not "known" in the
+      plain-method-body sense, so the existing `extReceiverPlausible` gate was
+      skipped altogether; it now runs there too, disqualifying a candidate
+      implausible for EVERY receiver in scope.
 
-    buildString {
-        append('[')
-        forEachIndexed { index: Int, element: TestValueClass -> ... }
-        append(']')
-    }
+      THE RECEIVER RULE MUST STAY GATED on the enclosing class actually
+      declaring a member of that name. The ungated version regressed private
+      stdlib extensions on `String` called from inside stdlib:
 
-Inside `buildString` the innermost implicit receiver is a StringBuilder, so
-the bare `forEachIndexed` binds `kotlin.text.forEachIndexed` (the
-`CharSequence` one) instead of the enclosing class's member. It then iterates
-the builder WHILE the body appends to it, which is the runaway loop the spin
-trace shows (index climbing 24124 -> 32316 -> 40508).
+          DurationTest.parseDefaultFailing  Vm::call_member `parseDigits` on `kotlin.String`
+          UuidTest.parse                    Vm::call_member `uuidCheckHyphenAt` on `kotlin.String`
 
-    [bare] forEachIndexed -> kotlin.text.forEachIndexed#1519 params=2 ext=true recv_ty=StringBuilder
+      Only the STDLIB SWEEP catches that — all six censuses stayed green
+      through it. Any future change to this gate must run the sweep.
 
-kotlinc rejects that candidate because the literal ANNOTATES its parameters
-(`element: TestValueClass` is not a `Char`), which is exactly the information
-klio was discarding.
-
-ATTEMPTED AND REVERTED, but it got halfway. `ArgShape.lambda_param_types`
-already exists and was never populated or read. Populating it from the AST
-literal's `param_tys` and refuting a definite builtin-scalar mismatch in
-`scoreArg` works — the pick moves off the `CharSequence` candidate:
-
-    [bare] forEachIndexed -> kotlin.collections.forEachIndexed#1783 ext=true recv_ty=StringBuilder
-
-but lands on the `Iterable<T>` one instead, whose element is generic so
-nothing refutes it, and the program still fails. Every suite measured
-neutral, so it was reverted rather than kept as an unmeasured scorer change.
-
-RECEIVER REFUTATION WAS ALSO TRIED, AND IT REGRESSES THE STDLIB. Four
-coordinated changes get a reduced repro working end to end:
-
-  1. populate `ArgShape.lambda_param_types` from the literal's `param_tys`
-     (the field existed, unpopulated and unread);
-  2. refute a definite mismatch in `applicability.scoreArg`;
-  3. extend the `extReceiverPlausible` gate in `Module.resolveCall` to run
-     when `ctx.receiver_known` is FALSE, disqualifying only when the declared
-     receiver is implausible for EVERY receiver in scope (lambda receiver,
-     owner class, each tower level);
-  4. the same lambda-parameter disproof in the RUNTIME `extfb` tail — in the
-     STRICT pass, not just the lenient one, which is where the pick is made.
-
-With all four, the reduced case prints the right answer. The real androidx
-test still hangs, because its literal declares `element: TestValueClass` — a
-user class, not a builtin scalar — so widening the rule to "a known class is
-not a Char" was needed as well, and even then the test did not clear.
-
-Then the stdlib sweep failed, which is what settled it:
-
-    DurationTest.parseDefaultFailing  Vm::call_member `parseDigits` on `kotlin.String`
-    UuidTest.parse                    Vm::call_member `uuidCheckHyphenAt` on `kotlin.String`
-
-Step 3 is the culprit: private stdlib extensions on `String`, called from
-inside stdlib, have a receiver context none of those three sources capture,
-so the gate disqualifies them. All four were reverted.
-
-So the argument-side refutation (1, 2, 4) is sound and reusable; the receiver
-side needs a receiver source that covers a stdlib-internal call site before
-it can be turned on. Do not re-attempt step 3 without running the stdlib
-sweep — the six censuses do NOT catch it.
-
-Isolation notes, so this need not be re-derived: the trigger is the NAME
-colliding with a stdlib extension, not the value class (a plain class fails
-identically), not the lambda arity, not the `val content = content` shadow,
-and not two splice levels — calling `list.forEachIndexed` directly inside
-`buildString` works.
+      Order of attempts, for anyone extending this: runtime-only refutation in
+      the `extfb` tail does nothing here (the pick is made statically);
+      argument-side alone moves the pick from `CharSequence` to `Iterable`;
+      receiver-side alone cannot drop `CharSequence` (a StringBuilder IS one).
+      Both, plus the member-exists gate, is the working combination. Guarded
+      by `examples/lambda_param_types_pick_overload.kt`, which also pins the
+      case that must NOT change — the CharSequence extension still binds on a
+      real StringBuilder receiver.
 
 ### Open: an inline MEMBER called bare inside a receiver-lambda
 
