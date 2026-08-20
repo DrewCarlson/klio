@@ -7469,6 +7469,9 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
         cg.deinit();
         g.deinit();
     }
+    // The best fit found so far that needed DEFAULTS to bind; used only when
+    // the walk finds no exact-arity candidate anywhere in the hierarchy.
+    var defaulted_hit: ?ResolvedMethod = null;
     const WalkItem = struct { cid: ?ir.ClassId, name: []const u8 };
     var queue: std.ArrayList(WalkItem) = .empty;
     defer queue.deinit(allocator);
@@ -7618,8 +7621,23 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                 if (pickMethodOverload(self, mod, candidates.items, args)) |f| {
                     if (!callableArgPrefersFunctionExtension(self, mod, name, &f, receiver, args) and
                         !memberArgsDisprovenExtensionApplies(self, mod, name, &f, args))
-                        return .{ .fid = f.id, .unambiguous = candidates.items.len == 1 or
+                    {
+                        const hit = ResolvedMethod{ .fid = f.id, .unambiguous = candidates.items.len == 1 or
                             (pickArityForced(self, candidates.items, args.len) and argsRelaxedAdjudicable(args)) };
+                        // Kotlin resolves against the WHOLE member scope, and a
+                        // candidate that binds without defaults is more specific
+                        // than one that needs them. A fit leaning on defaults
+                        // therefore cannot commit here — a supertype may declare
+                        // the exact-arity overload (`WithTime.secondFraction(
+                        // fixedLength)` under `AbstractWithTimeBuilder`'s
+                        // `secondFraction(minLength, maxLength)`, where a
+                        // one-argument call otherwise filled `maxLength` from its
+                        // default). Keep the FIRST such fit so an override still
+                        // outranks the base it overrides, and let the walk look
+                        // for an exact one.
+                        if (methodBindsWithoutDefaults(&f, args.len)) return hit;
+                        if (defaulted_hit == null) defaulted_hit = hit;
+                    }
                 }
                 // Enqueue the resolved supertypes by identity (their IR class
                 // ids) so the inherited-method walk follows the real class
@@ -7658,7 +7676,19 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
             cg.deinit();
         }
     }
-    return null;
+    return defaulted_hit;
+}
+
+/// Whether `f` binds a call of `argc` arguments with every parameter supplied
+/// — no default filled, no vararg absorbing the tail. Kotlin ranks such a
+/// candidate above one that needs either.
+fn methodBindsWithoutDefaults(f: *const Func, argc: usize) bool {
+    const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    if (f.params.len - skip != argc) return false;
+    for (f.params[skip..]) |*p| {
+        if (p.is_vararg) return false;
+    }
+    return true;
 }
 
 /// See the candidate loop in `resolveInstanceMethod`: whether a declared
