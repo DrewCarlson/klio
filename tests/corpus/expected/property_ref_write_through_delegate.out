@@ -1,0 +1,13 @@
+seeded        = Europe/Berlin/Europe/Berlin
+empty         = null
+conflict      = null
+after set     = America/New_York
+direct read   = America/New_York
+second set    = America/New_York
+unchanged     = America/New_York
+copied        = America/New_York
+label empty   = null
+label set     = null
+label read    = second
+via lens      = UTC
+via facade    = UTC+1

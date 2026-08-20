@@ -3315,6 +3315,13 @@ fn fieldReadCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []const u8,
 /// Insert into the field-WRITE memo. Main-module classes only: a runtime /
 /// anonymous class can gain `$set$` overrides after the first write, and its
 /// class cell (the identity key) does not outlive the class def.
+///
+/// `hit.store_name` is re-anchored onto `member_names`: a write reached
+/// through a callable reference (`Class::prop`, a delegate's `setValue`)
+/// resolves its name from a runtime String's bytes, and storing that slice
+/// leaves the entry pointing at freed memory once the String is collected.
+/// A later hit then stores the value under a garbage key, and the property
+/// reads back null.
 fn fieldWriteCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []const u8, name: []const u8, hit: root.ProgramImage.FieldWriteHit) void {
     if (!ir.eval.dispatchCacheStable()) return;
     {
@@ -3331,7 +3338,11 @@ fn fieldWriteCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []const u8
     defer pg.deinit();
     const name_p = pg.get().memberNameIdentity(name) orelse return;
     if (pg.get().field_write_cache.count() >= 65536) return;
-    pg.get().field_write_cache.put(.{ .class_p = class_p, .name_p = name_p }, hit) catch {};
+    var stable = hit;
+    if (hit.setter == root.ProgramImage.FieldWriteHit.NONE) {
+        stable.store_name = pg.get().memberNameCanonical(hit.store_name) orelse return;
+    }
+    pg.get().field_write_cache.put(.{ .class_p = class_p, .name_p = name_p }, stable) catch {};
 }
 
 /// The terminal plain store: write through a boxed-capture Cell when the

@@ -335,7 +335,8 @@ pub const ProgramImage = struct {
         /// Custom setter to run, `NONE` when the write is a plain store.
         setter: u32,
         /// Resolved store key for the plain write (the override-cell key or
-        /// the plain name); borrowed from registry/IR memory.
+        /// the plain name), interned into `member_names` so it outlives the
+        /// slice the write was resolved from.
         store_name: []const u8,
         pub const NONE: u32 = std.math.maxInt(u32);
     };
@@ -499,13 +500,22 @@ pub const ProgramImage = struct {
     /// must decline to cache when allocation fails rather than keying a
     /// temporary runtime string directly.
     pub fn memberNameIdentity(self: *ProgramImage, name: []const u8) ?usize {
-        if (self.member_names.getKey(name)) |stored| return @intFromPtr(stored.ptr);
+        const c = self.memberNameCanonical(name) orelse return null;
+        return @intFromPtr(c.ptr);
+    }
+
+    /// The program-lifetime copy of `name`. A cache entry that stores a name
+    /// as a *value* (not just as a pointer key) must hold this copy: a name
+    /// reaching the write path through a callable reference is the bytes of a
+    /// runtime String, which the collector can free while the entry lives on.
+    pub fn memberNameCanonical(self: *ProgramImage, name: []const u8) ?[]const u8 {
+        if (self.member_names.getKey(name)) |stored| return stored;
         const owned = self.allocator.dupe(u8, name) catch return null;
         self.member_names.put(owned, {}) catch {
             self.allocator.free(owned);
             return null;
         };
-        return @intFromPtr(owned.ptr);
+        return owned;
     }
 
     fn clearResolvedRedirects(self: *ProgramImage) void {
