@@ -692,10 +692,37 @@ but lands on the `Iterable<T>` one instead, whose element is generic so
 nothing refutes it, and the program still fails. Every suite measured
 neutral, so it was reverted rather than kept as an unmeasured scorer change.
 
-What is still missing is RECEIVER refutation: a StringBuilder is not an
-`Iterable`, so neither extension is applicable to the innermost receiver and
-resolution must fall out to the enclosing class's member. That is the next
-step, and it is a broader change than the argument-side refutation.
+RECEIVER REFUTATION WAS ALSO TRIED, AND IT REGRESSES THE STDLIB. Four
+coordinated changes get a reduced repro working end to end:
+
+  1. populate `ArgShape.lambda_param_types` from the literal's `param_tys`
+     (the field existed, unpopulated and unread);
+  2. refute a definite mismatch in `applicability.scoreArg`;
+  3. extend the `extReceiverPlausible` gate in `Module.resolveCall` to run
+     when `ctx.receiver_known` is FALSE, disqualifying only when the declared
+     receiver is implausible for EVERY receiver in scope (lambda receiver,
+     owner class, each tower level);
+  4. the same lambda-parameter disproof in the RUNTIME `extfb` tail — in the
+     STRICT pass, not just the lenient one, which is where the pick is made.
+
+With all four, the reduced case prints the right answer. The real androidx
+test still hangs, because its literal declares `element: TestValueClass` — a
+user class, not a builtin scalar — so widening the rule to "a known class is
+not a Char" was needed as well, and even then the test did not clear.
+
+Then the stdlib sweep failed, which is what settled it:
+
+    DurationTest.parseDefaultFailing  Vm::call_member `parseDigits` on `kotlin.String`
+    UuidTest.parse                    Vm::call_member `uuidCheckHyphenAt` on `kotlin.String`
+
+Step 3 is the culprit: private stdlib extensions on `String`, called from
+inside stdlib, have a receiver context none of those three sources capture,
+so the gate disqualifies them. All four were reverted.
+
+So the argument-side refutation (1, 2, 4) is sound and reusable; the receiver
+side needs a receiver source that covers a stdlib-internal call site before
+it can be turned on. Do not re-attempt step 3 without running the stdlib
+sweep — the six censuses do NOT catch it.
 
 Isolation notes, so this need not be re-derived: the trigger is the NAME
 colliding with a stdlib extension, not the value class (a plain class fails
