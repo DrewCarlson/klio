@@ -794,43 +794,46 @@ Serialization census 69 passed / 69 failed -> 86 / 52 over these three changes.
 
 `flatMapConcat` / `flattenConcat` / `flattenMerge(1)` return the INNER FLOWS
 instead of their elements — 10 coroutines failures across FlatMapConcatTest,
-FlatMapMergeTest, FlattenConcatTest and FlattenMergeTest, reported as
-`Vm::call_value on kotlin.Nothing` or `Vm::call_member emit on kotlin.Nothing`.
+FlatMapMergeTest, FlattenConcatTest and FlattenMergeTest.
 
     flowOf(flowOf(1, 2), flowOf(3)).flattenConcat().toList()
     // [$anon$1@9b, $anon$2@9c]   want [1, 2, 3]
 
 Upstream's body is `flow { collect { value -> emitAll(value) } }`, where
-Merge.kt's `flow` is `import kotlinx.coroutines.flow.internal.unsafeFlow as
-flow`. Bisected inside the pack with probe functions, one variable at a time:
+Merge.kt's `flow` is `import ….internal.unsafeFlow as flow`.
 
-  * the same body written with the real `flow` builder — WORKS;
-  * with `unsafeFlow` imported UNALIASED — WORKS;
-  * with `unsafeFlow` imported AS another name — FAILS;
-  * with the non-inline `flow` imported AS another name — WORKS;
-  * an identical `unsafeFlow` copy declared in the SAME file — WORKS.
+**What the chain actually is**, established by probing inside the pack:
 
-So the trigger is a renamed import of an INLINE function. Inside the aliased
-block a bare `emit` still reaches the collector, but a bare `emitAll` (a
-top-level extension on `FlowCollector`) misses and is re-dispatched as `emit` —
-`[member-miss] emitAll on kotlin.Function`, and `val outer = this` inside the
-block yields a Function rather than the collector.
+  * `unsafeFlow`'s block receives its `FlowCollector` as a RAW CLOSURE — klio
+    SAM-converts at the call, not at the boundary — so `this` inside the block
+    prints `{ir-closure#48}` rather than a collector. True for the aliased AND
+    unaliased spellings; the real `flow` builder gives a real `SafeCollector`.
+  * At one nesting level the block still works: a bare `emit` reaches the
+    closure through SAM dispatch.
+  * At two levels — inside `collect { value -> … }` — the bare `collect` binds
+    its receiver to the block's `this` (the closure) instead of walking out to
+    the extension receiver `Flow<Flow<T>>`, and the miss is re-dispatched as
+    `emit`, so each inner flow is emitted whole.
 
-Two things were checked and are NOT the cause: the splice (both the aliased and
-the unaliased call report `needs=false` and take the ordinary call path), and
-the lambda-receiver recording (`recordLambdaArgReceivers` fires for
-`flattenConcat` itself). Resolving the spelled name through the file's import
-aliases before consulting the inline candidate table was tried, changed nothing
-measurable — including for an aliased reified inline and an aliased non-local
-return, which both already worked — and was reverted rather than landed
-unexercised.
+**Tried and reverted, both unexercised by any test:**
 
-**Next step:** find what the aliased call site stamps differently for the block
-argument. `KLIO_ALIAS_TRACE`-style probes belong on the bare-name resolution
-INSIDE the block (why `emitAll` cannot prove a `FlowCollector` receiver there),
-not on the call's own resolution, which is already known to succeed. Note the
-lowering is cached: clear `.klio-local/.klio/cache` before every trace run or the
-trace prints nothing.
+  1. Carrying the enclosing scope's receiver-lambda marks onto `BuildObject`
+     so an anon-object CAPTURE that is a receiver lambda is invoked with its
+     receiver bound. This DID change the emission (`CallMemberOrValue` ->
+     `CallValueWithThis`) and the battery stayed green, but changed no
+     observable behaviour: `callValueWithThisExact` finds no positional fit for
+     a 0-param block, so the closure's own `this` still wins.
+  2. Letting a callable satisfy a single-abstract-method interface in the
+     extension-applicability check. It moved the miss from `emitAll` to
+     `collect`, and it makes a closure satisfy EVERY such interface — `Flow`
+     included — which is the wrong direction for a bare `collect`.
+
+**Next step:** the bare `collect` inside the block, not `emitAll`. Its receiver
+must be `this@flattenConcat`, and what mis-ranks it is the receiver tower
+inside a block whose own `this` is a raw closure. Traces that pay: `KLIO_OR_AUDIT=1`
+for the emitted form, `KLIO_CALLVALUE_TRACE=1` for what a closure call binds as
+`this`, and clearing `.klio-local/.klio/cache` before every run — lowering is
+cached and a trace prints nothing on a warm cache.
 
 ### Open: `secondFraction(n)` picks the defaulted overload
 
