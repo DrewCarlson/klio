@@ -94,7 +94,7 @@ actual class LocalDate(
     init {
         if (monthNumber < 1 || monthNumber > 12)
             throw IllegalArgumentException("Invalid date: month must be a number between 1 and 12, got $monthNumber")
-        if (year < -999_999 || year > 999_999)
+        if (year < YEAR_MIN || year > YEAR_MAX)
             throw IllegalArgumentException("Invalid date: the year is out of range")
         if (day < 1 || day > 31)
             throw IllegalArgumentException("Invalid date: day of month must be a number between 1 and 31, got $day")
@@ -167,8 +167,8 @@ actual class LocalDate(
     operator fun rangeUntil(that: LocalDate): LocalDateRange = LocalDateRange.fromRangeUntil(this, that)
 
     companion object {
-        val MIN: LocalDate = LocalDate(-999_999, 1, 1)
-        val MAX: LocalDate = LocalDate(999_999, 12, 31)
+        val MIN: LocalDate = LocalDate(YEAR_MIN, 1, 1)
+        val MAX: LocalDate = LocalDate(YEAR_MAX, 12, 31)
 
         fun orNull(year: Int, monthNumber: Int, day: Int): LocalDate? =
             if (year in -999_999..999_999 && monthNumber in 1..12 &&
@@ -231,8 +231,11 @@ fun LocalDate.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<
 // rather than redeclared here, so a test importing both packages sees one
 // declaration — matching upstream.
 // The epoch-day span of `LocalDate.MIN`..`LocalDate.MAX`.
-internal const val MIN_EPOCH_DAY: Long = -365961662L
-internal const val MAX_EPOCH_DAY: Long = 364522971L
+// `LocalDate(YEAR_MIN, 1, 1).toEpochDays()` and
+// `LocalDate(YEAR_MAX, 12, 31).toEpochDays()`, spelled as constants so the
+// bound check costs nothing per call.
+internal const val MIN_EPOCH_DAY: Long = -365243219162L
+internal const val MAX_EPOCH_DAY: Long = 365241780471L
 
 private fun daysInMonth(year: Int, month: Int): Int = when (month) {
     1, 3, 5, 7, 8, 10, 12 -> 31
@@ -285,7 +288,7 @@ internal fun LocalDateTime.plusSeconds(seconds: Int): LocalDateTime {
 }
 
 internal fun localDatePlusMonths(date: LocalDate, monthsToAdd: Long): LocalDate {
-    val total = date.year.toLong() * 12 + (date.monthNumber - 1) + monthsToAdd
+    val total = addOrArithmeticFail(date.year.toLong() * 12 + (date.monthNumber - 1), monthsToAdd)
     var y = total / 12
     var m0 = total % 12
     if (m0 < 0) {
@@ -316,14 +319,47 @@ internal fun localDateMonthsBetween(start: LocalDate, end: LocalDate): Long {
 // and `until` helpers declared in upstream LocalDate.kt. Pure
 // proleptic-Gregorian math over toEpochDays / dateFromEpochDays, so they
 // need no host calls and stay timezone-independent.
+// Date ARITHMETIC reports an out-of-range or overflowing result as a
+// DateTimeArithmeticException; only CONSTRUCTION reports an impossible date as
+// an IllegalArgumentException. The intermediate steps overflow in Long well
+// before the date bounds are reached, so each multiply and add is checked.
+internal fun mulOrArithmeticFail(a: Long, b: Long): Long {
+    if (a == 0L || b == 0L) return 0L
+    val r = a * b
+    if (r / b != a) throw DateTimeArithmeticException("Arithmetic overflow")
+    return r
+}
+
+internal fun addOrArithmeticFail(a: Long, b: Long): Long {
+    val r = a + b
+    // Overflow iff both operands share a sign that the result does not.
+    if (((a xor r) and (b xor r)) < 0L) throw DateTimeArithmeticException("Arithmetic overflow")
+    return r
+}
+
+private fun dateOrArithmeticFail(epochDays: Long): LocalDate = try {
+    dateFromEpochDays(epochDays)
+} catch (e: IllegalArgumentException) {
+    throw DateTimeArithmeticException("The result is out of the boundaries of LocalDate")
+}
+
+private fun monthsOrArithmeticFail(date: LocalDate, months: Long): LocalDate = try {
+    localDatePlusMonths(date, months)
+} catch (e: IllegalArgumentException) {
+    throw DateTimeArithmeticException("The result is out of the boundaries of LocalDate")
+}
+
 actual operator fun LocalDate.plus(period: DatePeriod): LocalDate {
-    val shifted = localDatePlusMonths(this, period.years.toLong() * 12 + period.months)
-    return dateFromEpochDays(shifted.toEpochDays() + period.days)
+    val months = addOrArithmeticFail(mulOrArithmeticFail(period.years.toLong(), 12L), period.months.toLong())
+    val shifted = monthsOrArithmeticFail(this, months)
+    return dateOrArithmeticFail(addOrArithmeticFail(shifted.toEpochDays(), period.days.toLong()))
 }
 
 actual fun LocalDate.plus(value: Long, unit: DateTimeUnit.DateBased): LocalDate = when (unit) {
-    is DateTimeUnit.DayBased -> dateFromEpochDays(toEpochDays() + value * unit.days)
-    is DateTimeUnit.MonthBased -> localDatePlusMonths(this, value * unit.months)
+    is DateTimeUnit.DayBased ->
+        dateOrArithmeticFail(addOrArithmeticFail(toEpochDays(), mulOrArithmeticFail(value, unit.days.toLong())))
+    is DateTimeUnit.MonthBased ->
+        monthsOrArithmeticFail(this, mulOrArithmeticFail(value, unit.months.toLong()))
     else -> throw IllegalArgumentException("Unsupported DateTimeUnit: $unit")
 }
 
