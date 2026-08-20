@@ -45,6 +45,11 @@ pub const ClassDef = struct {
     /// `annotation_names` alone cannot carry. Reflective consumers that read
     /// an argument off a class annotation (`@SerialName("...")`) need these.
     annotation_records: []const AnnotationRecord = &.{},
+    /// Declared type-parameter names, in declaration order. A reflective
+    /// consumer handed one serializer per type argument matches them against
+    /// the rendered declared types of the properties to know which element a
+    /// given argument describes.
+    type_params: []const []const u8 = &.{},
     primary_params: []ClassParamDef,
     /// Member functions keyed by simple name.
     methods: []MethodDef,

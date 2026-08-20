@@ -23,6 +23,9 @@
 //!   type, so the descriptor can name a concrete element descriptor.
 //! - `__klsx_ctorParamOptional(kClass)` — whether each property has a
 //!   default, which is kotlinx's definition of an optional element.
+//! - `__klsx_typeParamNames(kClass)` — the declaration's type-parameter
+//!   names, which pair a generic `serializer(...)`'s arguments with the
+//!   elements they describe.
 //!
 //! Everything else in serialization-core is pure Kotlin consumed
 //! straight from the upstream submodule.
@@ -70,6 +73,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("kotlinx.serialization.__klsx_classAnnotations", classAnnotations);
     try b.register("kotlinx.serialization.__klsx_paramAnnotations", paramAnnotations);
     try b.register("kotlinx.serialization.__klsx_ctorParamTypes", ctorParamTypes);
+    try b.register("kotlinx.serialization.__klsx_typeParamNames", typeParamNames);
     try b.register("kotlinx.serialization.__klsx_ctorParamOptional", ctorParamOptional);
     try b.register("kotlinx.serialization.__klsx_get", propGet);
     try b.register("kotlinx.serialization.__klsx_construct", construct);
@@ -637,6 +641,27 @@ fn ctorParamTypes(ctx: *CallCtx) Error!EvalResult {
             try buf.appendSlice(a, t);
         }
         items.append(a, .{ .String = try runtime.strInitOwned(a, try buf.toOwnedSlice(a)) }) catch |e| return e;
+    }
+    return ok(try Value.newList(a, .{
+        .items = try ValueList.init(a, items),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    }));
+}
+
+/// The declaration's type-parameter names in declaration order, so a caller
+/// handed one serializer per type argument can tell which rendered declared
+/// type (`"T"`, `"List<T>"`) that argument stands for.
+fn typeParamNames(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("__klsx_typeParamNames: expected a class");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return typeErr("__klsx_typeParamNames: expected a class");
+    defer cls_ref.deinit();
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (cls_ref.asPtr().type_params) |tp| {
+        try items.append(a, .{ .String = try runtime.strInit(a, tp) });
     }
     return ok(try Value.newList(a, .{
         .items = try ValueList.init(a, items),
@@ -1358,7 +1383,7 @@ test "hostBindings registers every serialization symbol" {
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classSerialNameOverride") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classAnnotations") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_paramAnnotations") != null);
-    try testing.expectEqual(@as(usize, 14), b.len());
+    try testing.expectEqual(@as(usize, 15), b.len());
 }
 
 test "renderShape round-trips nullability and generic args" {

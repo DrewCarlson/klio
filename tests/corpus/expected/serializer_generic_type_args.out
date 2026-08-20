@@ -1,0 +1,17 @@
+name       = Box
+elements   = 1
+elem name  = value
+elem int   = kotlin.Int
+elem str   = kotlin.String
+same args  = true
+hash match = true
+diff args  = false
+pair name  = Pair2
+pair elems = kotlin.Int,kotlin.String
+pair flip  = false
+holder eq  = false
+holder self= true
+plain same = true
+plain name = Plain
+plain elems= kotlin.Int,kotlin.String
+cross eq   = false

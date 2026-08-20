@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 48;
+pub const FORMAT_VERSION: u32 = 49;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -756,6 +756,7 @@ const ClassDefImage = struct {
     fqn: []const u8,
     annotation_names: []const []const u8,
     annotation_records: []const runtime.AnnotationRecord,
+    type_params: []const []const u8,
     primary_params: []ClassParamImage,
     methods: []MethodImage,
     body_properties: []PropertyImage,
@@ -1967,6 +1968,7 @@ fn classDefToImage(
         .fqn = cd.fqn,
         .annotation_names = cd.annotation_names,
         .annotation_records = cd.annotation_records,
+        .type_params = cd.type_params,
         .primary_params = primary,
         .methods = methods,
         .body_properties = props,
@@ -2333,6 +2335,7 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
             .fqn = ci.fqn,
             .annotation_names = ci.annotation_names,
             .annotation_records = ci.annotation_records,
+            .type_params = ci.type_params,
             .primary_params = blk: {
                 const params = try a.alloc(runtime.ClassParamDef, ci.primary_params.len);
                 for (ci.primary_params, 0..) |p, j| {
