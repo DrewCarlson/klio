@@ -1,0 +1,9 @@
+circles = [1, 3]
+squares = [2]
+shapes  = 3
+strings = [text]
+ints    = [7]
+alt1    = 2/1
+alt2    = 2/1
+erased  = [2]
+typed   = [2]

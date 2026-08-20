@@ -868,22 +868,23 @@ so the trigger is something further into the real builder chain (the private
 companion `Builder`, or `AppendableFormatStructure`) rather than the overload
 shape alone.
 
-### Open: `filterIsInstance<T>()` on an untyped receiver
+### Fixed: an explicit reified type argument survives a declined splice
 
     val anns = someDescriptor.annotations       // inferred, cross-module type
-    anns.filterIsInstance<P>()                  // returns EVERY element
+    anns.filterIsInstance<P>()                  // returned EVERY element
 
-Declaring the receiver (`val anns: List<Annotation> = …`) fixes it, and an
-element-wise `it is P` is correct either way, so the `is` check itself is
-sound — the reified `R` is what goes wrong. A reified type parameter can only
-be honoured by splicing, and with the receiver's static type unavailable the
-splice declines, leaving the body to read an unbound/stale `R` (the
-process-global reified slot). The explicit `<P>` at the call site should be
-enough on its own: nothing about the RECEIVER's type bears on binding `R`.
+`filterIsInstance` has three reified candidates (`Iterable`, `Sequence`,
+`Array` receivers), and with no static receiver type the pick cannot choose, so
+the splice declines. The body then reads its reified parameter from the
+process-wide slot the splice writes — still holding whatever an UNRELATED
+earlier splice left there.
 
-Reached while writing `examples/inheritable_serial_info.kt`, which binds a
-typed local instead — that is idiomatic Kotlin and not the example's subject,
-but the underlying gap is real and unfixed.
+The call knows its own type arguments, so the declined path now publishes them
+under the callee's reified parameter names before dispatching. The remaining
+unsoundness of that slot (re-entrancy) is unchanged and still recorded in
+[[klio-reified-type-param-global]] terms; this closes the common case where the
+argument is written at the call site. Guarded by
+`examples/reified_type_arg_without_splice.kt`.
 
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 

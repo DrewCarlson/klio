@@ -5988,7 +5988,13 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
                 if (std.mem.eql(u8, w, mname)) std.debug.print("[splice-bail] {s} span={}:{}\n", .{ mname, exprSpan(callee).file, exprSpan(callee).start });
             }
-            // Splice bailed: fall back to a plain member dispatch.
+            // Splice bailed: fall back to a plain member dispatch. The
+            // reified parameters then have no binding of their own, and the
+            // body reads them from the process-wide slot the splice writes —
+            // which still holds whatever an UNRELATED earlier splice left
+            // there. The call knows its own type arguments, so write them
+            // where the body looks before dispatching.
+            try storeExplicitReifiedGlobals(b, mname, ast_type_args);
             const recv = try lowerReceiver(b, receiver);
             const bail_arity: ?[]const i16 = try memberCallArgArities(b, receiver, mname, args, ast_arg_names);
             const run = try lowerArgRunWithArity(b, args, bail_arity);
@@ -7903,6 +7909,39 @@ fn nonInlineExtensionFits(b: *FuncBuilder, name: []const u8, chain: []const []co
         }
     }
     return false;
+}
+
+/// Publish a call's EXPLICIT type arguments under the callee's reified
+/// type-parameter names, for a call that could not be spliced. The spliced
+/// form binds these names itself; without the splice the body would read a
+/// stale binding. Only reified parameters of a candidate with this name are
+/// written, and each name once.
+fn storeExplicitReifiedGlobals(b: *FuncBuilder, name: []const u8, type_args: []const ast.TypeRef) Allocator.Error!void {
+    if (type_args.len == 0) return;
+    const cands = inline_state.candidatesForName(name) orelse return;
+    var written: std.ArrayList([]const u8) = .empty;
+    defer written.deinit(b.allocator);
+    for (cands) |cf| {
+        for (cf.type_params, 0..) |tp, i| {
+            if (!tp.is_reified or i >= type_args.len) continue;
+            var dup = false;
+            for (written.items) |w| {
+                if (std.mem.eql(u8, w, tp.name.name)) dup = true;
+            }
+            if (dup) continue;
+            const arg = &type_args[i];
+            if (arg.function != null) continue;
+            const resolved = scopeTypeRename(b, arg.name.name, arg.name.span.file.int()) orelse arg.name.name;
+            const cls_reg = b.allocReg();
+            const arg_name = try b.module.internConst(b.allocator, .{ .String = resolved });
+            const cls_pick: ?ir.ClassId = b.module.classIdIndexed(resolved, b.self_package, arg.name.span.file) orelse
+                b.module.classId(resolved);
+            try b.push(.{ .LoadGlobal = .{ .dst = cls_reg, .name = arg_name, .class = cls_pick, .ctor_ref = true } });
+            const tp_global = try b.module.internConst(b.allocator, .{ .String = tp.name.name });
+            try b.push(.{ .StoreGlobal = .{ .name = tp_global, .value = cls_reg } });
+            try written.append(b.allocator, tp.name.name);
+        }
+    }
 }
 
 fn inlineTargetForBareCall(

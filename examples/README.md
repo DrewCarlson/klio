@@ -202,6 +202,7 @@ Run any program with:
 | `overload_defaults_vs_exact_arity.kt` | An overload that binds every parameter outranks one filling some from defaults or a vararg, including when the exact-arity candidate is declared on a supertype. |
 | `tostring_and_equals_in_containers.kt` | A class's `toString()` renders its elements wherever a container is rendered, and its `equals`/`hashCode` decide membership wherever one dedups. |
 | `inheritable_serial_info.kt` | An `@InheritableSerialInfo` annotation reaches a descriptor from its supertypes — class, interface or sealed hierarchy — and is reported once; a plain `@SerialInfo` one stays where it is written. |
+| `reified_type_arg_without_splice.kt` | An explicit `<T>` binds a `reified` parameter even when the receiver's static type is unavailable and the call cannot be inlined, and successive calls do not inherit each other's argument. |
 | `companion_member_extension.kt` | Extension properties on a companion object declared as members of another class, `private` and public, on a user class and on a builtin's companion. |
 | `serial_descriptor_shape.kt`   | The `SerialDescriptor` a `@Serializable` class reports: element names, which elements are optional (their constructor parameter has a default), and each element's own descriptor. |
 | `interface_companion_state.kt` | Shared companion-object state on an interface.              |
