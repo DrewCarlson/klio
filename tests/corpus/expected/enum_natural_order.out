@@ -1,0 +1,12 @@
+compareTo  = -2
+less       = true
+greater    = true
+equalSelf  = 0
+sorted     = [LOW, MEDIUM, HIGH]
+descending = [HIGH, LOW]
+min/max    = LOW/HIGH
+compareVal = -1
+byKey      = [a, b]
+byName?    = true
+ordinals   = [0, 1, 2]
+otherEnum  = [CLUBS, HEARTS]

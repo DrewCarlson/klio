@@ -28,11 +28,11 @@ test "kotlinx.datetime commonTest pass count holds at or above the ratchet basel
         // 464 -> 480: receiver-lambda literals passed to a `vararg` now bind
         // the receiver the call supplies, which is how RFC_1123 parses its
         // optional day-of-week and alternative offsets.
-        .baseline = 480,
+        .baseline = 482,
         // 70 -> 59: a call binding by class id is now treated as a
         // construction, so `LocalDateTime(y, m, d, h, min)` reaches the
         // constructor instead of the published companion's `invoke`.
-        .max_failed = 39,
+        .max_failed = 37,
         .max_incomplete = 1,
     });
 }

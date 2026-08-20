@@ -66,6 +66,30 @@ fn compareValues(a: *const Value, b: *const Value) CmpResult {
             .Bool => |y| .{ .ord = std.math.order(@intFromBool(x), @intFromBool(y)) },
             else => notComparable(a, b),
         },
+        // Enum entries carry Kotlin's natural ordering as their declaration
+        // ordinal, so `compareValues(SUNDAY, SATURDAY)` orders them instead of
+        // refusing. Restricted to two entries of the SAME enum class: entries
+        // of different enums have no common ordering.
+        .Instance => |x| switch (b.*) {
+            .Instance => |y| blk: {
+                const gx = x.borrow();
+                defer gx.deinit();
+                const gy = y.borrow();
+                defer gy.deinit();
+                const cx = gx.get().class.borrow();
+                defer cx.deinit();
+                const cy = gy.get().class.borrow();
+                defer cy.deinit();
+                if (!cx.get().is_enum or !cy.get().is_enum) break :blk notComparable(a, b);
+                if (!std.mem.eql(u8, cx.get().fqn, cy.get().fqn)) break :blk notComparable(a, b);
+                const ox = gx.get().get("ordinal") orelse break :blk notComparable(a, b);
+                const oy = gy.get().get("ordinal") orelse break :blk notComparable(a, b);
+                const ix = ox.asI64() orelse break :blk notComparable(a, b);
+                const iy = oy.asI64() orelse break :blk notComparable(a, b);
+                break :blk .{ .ord = std.math.order(ix, iy) };
+            },
+            else => notComparable(a, b),
+        },
         else => notComparable(a, b),
     };
 }
