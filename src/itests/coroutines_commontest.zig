@@ -32,7 +32,8 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         },
         // Census floor: 1073 solo with the support surface wired. The
         // ratchet leaves headroom for the loaded `test-all`.
-        .baseline = 1070,
+        // 1070 -> 1105 alongside the ceiling below. Measured solo: 1110.
+        .baseline = 1105,
         // Bound the red mass too: a floor alone cannot see a fixed case
         // traded for a broken one. Measured solo: 137 failing, 6 not
         // completing. Lower these as fixes land, never raise them.
@@ -41,7 +42,13 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         // when a non-inline extension fits the receiver in scope. Held two
         // above the measurement: this suite's dispatched tests vary by a
         // couple between runs.
-        .max_failed = 141,
+        // 141 -> 106. Two roots: a bare call inside an extension no longer
+        // binds a same-named extension via the enclosing receiver (combine's
+        // Iterable overload), and a call no longer reaches a same-named local
+        // whose initializer is an ordinary function call (`val flow =
+        // flowOf(...)` beside the `flow { … }` builder). Measured solo: 1110
+        // passed, 104 failed, 6 did not complete. Held two above.
+        .max_failed = 106,
         .max_incomplete = 8,
     });
 }
