@@ -695,38 +695,57 @@ is at zero.
       case that must NOT change — the CharSequence extension still binds on a
       real StringBuilder receiver.
 
-### Open: cross-test pollution in DateTimeComponentsFormatTest
+### Open: the tracing GC frees a live object under repeated host re-entry
 
-That one file carries 12 of datetime's 35 failures, and at least SIX of them
-are not independent failures — they are victims of an earlier test in the
-same file.
+This is the root behind `DateTimeComponentsFormatTest` (12 of datetime's 35
+failures) and it is a MEMORY bug, not a datetime one.
 
-Run alone, `testSpecialNamedTimeZones` and `testValidSinglePartTimeZones`
-PASS. Run with `testZonedDateTime` they fail:
+Minimal repro — `scratchpad/tzcount.kt`, no assertions, one zone:
 
-    testZonedDateTime,testSpecialNamedTimeZones    2 tests, 0 passed, 2 failed
-    testErrorHandling,testSpecialNamedTimeZones    2 tests, 1 passed, 1 failed
-    testRfc1123,testSpecialNamedTimeZones          2 tests, 2 passed, 0 failed
+    val f = DateTimeComponents.Format {
+        dateTime(LocalDateTime.Formats.ISO); offset(UtcOffset.Formats.ISO)
+        char('['); timeZoneId(); char(']')
+    }
+    f.format { setDateTime(...); setOffset(...); timeZoneId = "Europe/Berlin" }
+    repeat(120) { f.parse("...[America/New_York]").timeZoneId }   // null after ~57
 
-So `testZonedDateTime` specifically poisons them — `testErrorHandling`, which
-also fails, does not. The victims all report `Expected <UTC>, actual <null>`
-and friends: a `timeZoneId()` parse that silently yields null.
+The parse silently starts returning null partway through and never recovers.
 
-NOT the trie: `NamedUnsignedIntParser`'s trie is per-instance, built in `init`
-and read-only in `consume`, and each `DateTimeComponents.Format { … }` builds
-its own.
+Bounded by knob, which is what makes it a GC bug and not a datetime one:
 
-NOT the parse loop either. A direct repro — greedy parse, then
-`testZonedDateTime`'s combined format over all 496 `availableZoneIds`, then
-greedy again — reports ZERO failures and the greedy check still works
-afterwards. So the trigger is earlier in that test than the loop: the
-`format.format { setDateTime(...); setOffset(...); timeZoneId = berlin }`
-write, or the `toLocalDateTime()` / `toUtcOffset()` reads before it.
+    KLIO_RECLAIM=0      firstBad=-1   (passes)
+    KLIO_RECLAIM=arena  firstBad=-1   (passes)
+    KLIO_RECLAIM=gc     firstBad=66
+    KLIO_RECLAIM=debug  General protection exception (core dump)
+    KLIO_OPT=off        firstBad=-1   (passes)
+    KLIO_OPT=safe/fast  firstBad=66 / 57
+    KLIO_GC_GEN=0       firstBad=66   (a MAJOR collection misses it too)
 
-Next step is to bisect `testZonedDateTime` statement by statement against a
-following greedy parse. Worth doing before counting datetime's remaining
-failures as independent: the true count is lower than 35, and this is one
-root, not six.
+So a live object is unreachable from the root set during a full mark — a
+missing root, not a write-barrier or generational problem. The debug backend
+names the victim: an `InstanceData` whose `fields.items` has been freed, read
+from `varargShadowedFieldInvoke` (`host_call_member.zig:3621`) reached
+through `callValueWithThisSel` -> `callValue` -> `callMember`.
+
+Ruled out, so they need not be re-tried:
+  * the 64-bit `Frame.wmask` aliasing for register indices >= 64 (real hazard,
+    `write` grows the file past `frameNoFill`'s `n_locals <= 64` bound — but
+    fixing it does not change this repro);
+  * borrowed String `bytes` escaping their guard in `callValueWithThisSel`
+    (also a real hazard, also not this);
+  * rooting that function's host-local `all` buffer with the existing
+    `keepaliveMark`/`keepalivePushSlice` API.
+
+A correction worth keeping: this first looked like `format()` poisoning a
+later `parse()`, and then like `main` behaving differently from a function.
+Both readings were wrong — it is purely CUMULATIVE. A function-scoped loop
+fails too, just at a different count (158 bad of 200), and the count moves
+with the allocator profile. Any bisect that changes the amount of work also
+moves the threshold, which is what made the earlier readings look meaningful.
+
+Next step is a root-set audit of the host re-entry paths, using
+`KLIO_RECLAIM=debug` on the repro to catch the use, and `KLIO_GC_DEBUG` to
+correlate the collection that kills it.
 
 ### Open: an inline MEMBER called bare inside a receiver-lambda
 
