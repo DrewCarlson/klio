@@ -14,6 +14,8 @@
 //!   names, honouring `@SerialName`.
 //! - `__klsx_classSerialNameOverride(kClass)` — the class's own
 //!   `@SerialName` value, or null.
+//! - `__klsx_classAnnotations(kClass)` / `__klsx_paramAnnotations(kClass, i)`
+//!   — the `@SerialInfo` annotation instances a descriptor reports.
 //! - `__klsx_get(obj, name)` — read a named property off an instance.
 //! - `__klsx_construct(kClass, args)` — build an instance by calling
 //!   the primary constructor with the (ordered) argument list.
@@ -65,6 +67,8 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("kotlinx.serialization.__klsx_ctorParamNames", ctorParamNames);
     try b.register("kotlinx.serialization.__klsx_ctorParamSerialNames", ctorParamSerialNames);
     try b.register("kotlinx.serialization.__klsx_classSerialNameOverride", classSerialNameOverride);
+    try b.register("kotlinx.serialization.__klsx_classAnnotations", classAnnotations);
+    try b.register("kotlinx.serialization.__klsx_paramAnnotations", paramAnnotations);
     try b.register("kotlinx.serialization.__klsx_ctorParamTypes", ctorParamTypes);
     try b.register("kotlinx.serialization.__klsx_ctorParamOptional", ctorParamOptional);
     try b.register("kotlinx.serialization.__klsx_get", propGet);
@@ -703,6 +707,169 @@ fn ctorParamNames(ctx: *CallCtx) Error!EvalResult {
     }));
 }
 
+/// Resolve the annotation class named by `rec` to its `Class` value, trying
+/// each resolved candidate in turn. Null when none names a class in scope.
+fn annotationClassValue(ctx: *CallCtx, rec: *const runtime.AnnotationRecord) ?Value {
+    for (rec.names) |n| {
+        const v = ctx.host.lookupGlobal(n) orelse continue;
+        if (v == .Class) return v;
+    }
+    return null;
+}
+
+/// Whether an annotation class is itself `@SerialInfo`. kotlinx surfaces only
+/// those on a descriptor, so a plain Kotlin annotation stays invisible.
+fn annotationIsSerialInfo(cls: *const ClassDef) bool {
+    for (cls.annotation_names) |n| {
+        if (std.mem.eql(u8, n, "kotlinx.serialization.SerialInfo") or
+            std.mem.eql(u8, n, "SerialInfo")) return true;
+    }
+    return false;
+}
+
+/// One recorded annotation argument as a runtime value. An `EnumEntry` names
+/// only its trailing segment, so the owning enum comes from the constructor
+/// parameter's declared type. Null for anything the lowering left unresolved —
+/// the caller then skips the whole annotation rather than fabricate a value.
+fn annotationArgValue(
+    ctx: *CallCtx,
+    arg: runtime.AnnotationArg,
+    param: ?*const runtime.ClassParamDef,
+) Error!?Value {
+    switch (arg) {
+        .Str => |s| return Value{ .String = try runtime.strInitOwned(
+            ctx.allocator,
+            try ctx.allocator.dupe(u8, s),
+        ) },
+        .Int => |i| return Value.newInt(i),
+        .Bool => |b| return Value{ .Bool = b },
+        .EnumEntry => |name| {
+            const p = param orelse return null;
+            const ty = p.declared_type orelse return null;
+            const cls_val = ctx.host.lookupGlobal(ty) orelse return null;
+            if (cls_val != .Class) return null;
+            const got = try ctx.host.getProperty(&cls_val, name, ctx.out) orelse return null;
+            return switch (got) {
+                .ok => |v| v,
+                .err => null,
+            };
+        },
+        .Other => return null,
+    }
+}
+
+/// The recorded arguments as a positional argument list for the annotation
+/// class's constructor, so unsupplied parameters take their declared defaults.
+/// Null when an argument cannot be represented, or when named arguments leave
+/// an earlier parameter unfilled (which no positional call can express).
+fn annotationArgList(
+    ctx: *CallCtx,
+    rec: *const runtime.AnnotationRecord,
+    cls: *const ClassDef,
+) Error!?[]Value {
+    const a = ctx.allocator;
+    var any_named = false;
+    for (rec.arg_names) |n| {
+        if (n != null) any_named = true;
+    }
+    if (!any_named) {
+        const out = try a.alloc(Value, rec.args.len);
+        for (rec.args, out, 0..) |arg, *slot, i| {
+            const p: ?*const runtime.ClassParamDef =
+                if (i < cls.primary_params.len) &cls.primary_params[i] else null;
+            slot.* = (try annotationArgValue(ctx, arg, p)) orelse {
+                a.free(out);
+                return null;
+            };
+        }
+        return out;
+    }
+    var filled = try a.alloc(?Value, cls.primary_params.len);
+    defer a.free(filled);
+    @memset(filled, null);
+    for (rec.args, 0..) |arg, i| {
+        const nm: ?[]const u8 = if (i < rec.arg_names.len) rec.arg_names[i] else null;
+        const pos: usize = if (nm) |n| blk: {
+            for (cls.primary_params, 0..) |p, j| {
+                if (std.mem.eql(u8, p.name, n)) break :blk j;
+            }
+            return null;
+        } else i;
+        if (pos >= filled.len) return null;
+        filled[pos] = (try annotationArgValue(ctx, arg, &cls.primary_params[pos])) orelse return null;
+    }
+    var last: usize = 0;
+    for (filled, 0..) |v, i| {
+        if (v != null) last = i + 1;
+    }
+    for (filled[0..last]) |v| {
+        if (v == null) return null;
+    }
+    const out = try a.alloc(Value, last);
+    for (filled[0..last], out) |v, *slot| slot.* = v.?;
+    return out;
+}
+
+/// Build annotation INSTANCES for `records` by running each annotation class's
+/// own constructor, so declared defaults apply.
+fn annotationInstanceList(ctx: *CallCtx, records: []const runtime.AnnotationRecord) Error!Value {
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (records) |*rec| {
+        const cls_val = annotationClassValue(ctx, rec) orelse continue;
+        const cls_ref = classOf(&cls_val) orelse continue;
+        const keep = annotationIsSerialInfo(cls_ref.asPtr());
+        const args: ?[]Value = if (keep) try annotationArgList(ctx, rec, cls_ref.asPtr()) else null;
+        cls_ref.deinit();
+        if (!keep) continue;
+        const arg_slice = args orelse continue;
+        defer a.free(arg_slice);
+        const r = try ctx.host.invokeCallable(&cls_val, arg_slice, ctx.out);
+        switch (r) {
+            .ok => |v| try items.append(a, v),
+            .err => {},
+        }
+    }
+    return try Value.newList(a, .{
+        .items = try ValueList.init(a, items),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    });
+}
+
+/// The `@SerialInfo` annotations applied to the class itself.
+fn classAnnotations(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("__klsx_classAnnotations: expected a class");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return ok(try annotationInstanceList(ctx, &.{}));
+    const records = cls_ref.asPtr().annotation_records;
+    const r = try annotationInstanceList(ctx, records);
+    cls_ref.deinit();
+    return ok(r);
+}
+
+/// The `@SerialInfo` annotations applied to the primary-constructor property
+/// at `index`, counting only the properties the descriptor reports.
+fn paramAnnotations(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return typeErr("__klsx_paramAnnotations: expected a class and an index");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return ok(try annotationInstanceList(ctx, &.{}));
+    defer cls_ref.deinit();
+    const want: i64 = switch (ctx.args[1]) {
+        .Int => |i| i,
+        .Long => |l| l,
+        else => return typeErr("__klsx_paramAnnotations: index must be Int"),
+    };
+    var seen: i64 = 0;
+    for (cls_ref.asPtr().primary_params) |*p| {
+        if (p.property == null) continue;
+        if (seen == want) return ok(try annotationInstanceList(ctx, p.anchors.property));
+        seen += 1;
+    }
+    return ok(try annotationInstanceList(ctx, &.{}));
+}
+
 /// The value of a `@SerialName("...")` on the CLASS itself, or null when it
 /// carries none. kotlinx's default serial name is the qualified class name;
 /// the annotation replaces it wholesale.
@@ -1189,7 +1356,9 @@ test "hostBindings registers every serialization symbol" {
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_ctorParamOptional") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_ctorParamSerialNames") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classSerialNameOverride") != null);
-    try testing.expectEqual(@as(usize, 12), b.len());
+    try testing.expect(b.resolve("kotlinx.serialization.__klsx_classAnnotations") != null);
+    try testing.expect(b.resolve("kotlinx.serialization.__klsx_paramAnnotations") != null);
+    try testing.expectEqual(@as(usize, 14), b.len());
 }
 
 test "renderShape round-trips nullability and generic args" {

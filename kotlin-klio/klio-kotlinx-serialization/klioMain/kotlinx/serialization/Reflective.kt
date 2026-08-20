@@ -36,6 +36,12 @@ import kotlinx.serialization.encoding.Encoder
 internal fun __klsx_ctorParamNames(kClass: Any?): List<String> =
     error("intrinsic kotlinx.serialization.__klsx_ctorParamNames not installed")
 
+internal fun __klsx_classAnnotations(kClass: Any?): List<Annotation> =
+    error("intrinsic kotlinx.serialization.__klsx_classAnnotations not installed")
+
+internal fun __klsx_paramAnnotations(kClass: Any?, index: Int): List<Annotation> =
+    error("intrinsic kotlinx.serialization.__klsx_paramAnnotations not installed")
+
 internal fun __klsx_classSerialNameOverride(kClass: Any?): String? =
     error("intrinsic kotlinx.serialization.__klsx_classSerialNameOverride not installed")
 
@@ -130,13 +136,21 @@ internal class ReflectiveDescriptor(
     // list means the caller had no shape to give (the `Dynamic` descriptor),
     // in which case every element falls back to the neutral answers.
     private val types: List<String> = emptyList(),
-    private val optionals: List<Boolean> = emptyList()
+    private val optionals: List<Boolean> = emptyList(),
+    private val owner: Any? = null
 ) : SerialDescriptor {
     override val kind: SerialKind get() = StructureKind.CLASS
     override val elementsCount: Int get() = names.size
     override fun getElementName(index: Int): String = names[index]
     override fun getElementIndex(name: String): Int = names.indexOf(name)
-    override fun getElementAnnotations(index: Int): List<Annotation> = emptyList()
+    // kotlinx reports the `@SerialInfo` annotations written on the class and
+    // on each property. `owner` is the class the descriptor was built from;
+    // a descriptor with no owner (the neutral `Dynamic` one) has none.
+    override val annotations: List<Annotation>
+        get() = if (owner == null) emptyList() else __klsx_classAnnotations(owner)
+
+    override fun getElementAnnotations(index: Int): List<Annotation> =
+        if (owner == null) emptyList() else __klsx_paramAnnotations(owner, index)
 
     // A primary-constructor parameter with a default is exactly kotlinx's
     // notion of an optional element: a decoder may leave it absent.
@@ -228,7 +242,8 @@ public class ReflectiveKSerializer(private val kClass: Any?) : KSerializer<Any?>
             // the declared names that address the instance itself.
             __klsx_ctorParamSerialNames(kClass),
             __klsx_ctorParamTypes(kClass),
-            __klsx_ctorParamOptional(kClass)
+            __klsx_ctorParamOptional(kClass),
+            kClass
         )
 
     override fun serialize(encoder: Encoder, value: Any?) {

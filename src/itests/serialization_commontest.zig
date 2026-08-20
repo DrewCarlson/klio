@@ -30,10 +30,14 @@ test "kotlinx.serialization commonTest pass count holds at or above the ratchet 
         //
         // 62 -> 67 and 76 -> 71: the runtime class now retains its
         // annotations' ARGUMENTS, so `@SerialName` on the class replaces the
-        // qualified-name default. Measured solo: 67 passed, 71 failed, 0 did
-        // not complete.
-        .baseline = 67,
-        .max_failed = 71,
+        // qualified-name default.
+        //
+        // 67 -> 69 and 71 -> 69: a descriptor reports the `@SerialInfo`
+        // annotations written on the class and on each property, built by
+        // running each annotation class's own constructor. Measured solo: 69
+        // passed, 69 failed, 0 did not complete.
+        .baseline = 69,
+        .max_failed = 69,
         .max_incomplete = 0,
     });
 }
