@@ -695,6 +695,39 @@ is at zero.
       case that must NOT change — the CharSequence extension still binds on a
       real StringBuilder receiver.
 
+### Open: cross-test pollution in DateTimeComponentsFormatTest
+
+That one file carries 12 of datetime's 35 failures, and at least SIX of them
+are not independent failures — they are victims of an earlier test in the
+same file.
+
+Run alone, `testSpecialNamedTimeZones` and `testValidSinglePartTimeZones`
+PASS. Run with `testZonedDateTime` they fail:
+
+    testZonedDateTime,testSpecialNamedTimeZones    2 tests, 0 passed, 2 failed
+    testErrorHandling,testSpecialNamedTimeZones    2 tests, 1 passed, 1 failed
+    testRfc1123,testSpecialNamedTimeZones          2 tests, 2 passed, 0 failed
+
+So `testZonedDateTime` specifically poisons them — `testErrorHandling`, which
+also fails, does not. The victims all report `Expected <UTC>, actual <null>`
+and friends: a `timeZoneId()` parse that silently yields null.
+
+NOT the trie: `NamedUnsignedIntParser`'s trie is per-instance, built in `init`
+and read-only in `consume`, and each `DateTimeComponents.Format { … }` builds
+its own.
+
+NOT the parse loop either. A direct repro — greedy parse, then
+`testZonedDateTime`'s combined format over all 496 `availableZoneIds`, then
+greedy again — reports ZERO failures and the greedy check still works
+afterwards. So the trigger is earlier in that test than the loop: the
+`format.format { setDateTime(...); setOffset(...); timeZoneId = berlin }`
+write, or the `toLocalDateTime()` / `toUtcOffset()` reads before it.
+
+Next step is to bisect `testZonedDateTime` statement by statement against a
+following greedy parse. Worth doing before counting datetime's remaining
+failures as independent: the true count is lower than 35, and this is one
+root, not six.
+
 ### Open: an inline MEMBER called bare inside a receiver-lambda
 
 `ValueClassListTest.string` still fails, and it is the reason the file
