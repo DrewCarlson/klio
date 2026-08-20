@@ -4920,7 +4920,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // call to it. An OBJECT declaration is its own receiver at the call site
     // (`PlainObject.serializer()` passes the singleton, not a class value), so
     // both receiver shapes resolve through the declaration's KClass.
-    if (std.mem.eql(u8, name, "serializer") and args.len == 0) {
+    if (std.mem.eql(u8, name, "serializer")) {
         const kclass: ?Value = switch (receiver.*) {
             .Class => receiver.*,
             .Instance => |inst| blk: {
@@ -4934,15 +4934,37 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             else => null,
         };
         if (kclass) |kc| {
-            const mg = self.module.borrow();
-            const fid = mg.get().funcIdByFqn("kotlinx.serialization.__klsx_generatedSerializer");
-            mg.deinit();
-            if (fid) |f| {
-                const call_args = [_]Value{kc};
-                const r = try callFuncRec(self, allocator, self.module.asPtr(), f, &call_args);
-                switch (r) {
-                    .ok => |v| if (v != .Null) return .{ .ok = v },
-                    .err => return r,
+            // `Foo.serializer(tSerializer, …)` on a generic declaration: the
+            // arguments stand for the type parameters, in order.
+            if (args.len != 0) {
+                const mg = self.module.borrow();
+                const fid = mg.get().funcIdByFqn("kotlinx.serialization.__klsx_generatedSerializerGeneric");
+                mg.deinit();
+                if (fid) |f| {
+                    var items: std.ArrayList(Value) = .empty;
+                    for (args) |a| {
+                        a.retain();
+                        try items.append(allocator, a);
+                    }
+                    const list = try listOf(allocator, items, false);
+                    const call_args = [_]Value{ kc, list };
+                    const r = try callFuncRec(self, allocator, self.module.asPtr(), f, &call_args);
+                    switch (r) {
+                        .ok => |v| if (v != .Null) return .{ .ok = v },
+                        .err => return r,
+                    }
+                }
+            } else {
+                const mg = self.module.borrow();
+                const fid = mg.get().funcIdByFqn("kotlinx.serialization.__klsx_generatedSerializer");
+                mg.deinit();
+                if (fid) |f| {
+                    const call_args = [_]Value{kc};
+                    const r = try callFuncRec(self, allocator, self.module.asPtr(), f, &call_args);
+                    switch (r) {
+                        .ok => |v| if (v != .Null) return .{ .ok = v },
+                        .err => return r,
+                    }
                 }
             }
         }

@@ -23,6 +23,9 @@
 //!   type, so the descriptor can name a concrete element descriptor.
 //! - `__klsx_ctorParamOptional(kClass)` — whether each property has a
 //!   default, which is kotlinx's definition of an optional element.
+//! - `__klsx_typeParamNames(kClass)` — the declaration's type-parameter
+//!   names, which pair a generic `serializer(...)`'s arguments with the
+//!   elements they describe.
 //!
 //! Everything else in serialization-core is pure Kotlin consumed
 //! straight from the upstream submodule.
@@ -70,6 +73,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("kotlinx.serialization.__klsx_classAnnotations", classAnnotations);
     try b.register("kotlinx.serialization.__klsx_paramAnnotations", paramAnnotations);
     try b.register("kotlinx.serialization.__klsx_ctorParamTypes", ctorParamTypes);
+    try b.register("kotlinx.serialization.__klsx_typeParamNames", typeParamNames);
     try b.register("kotlinx.serialization.__klsx_ctorParamOptional", ctorParamOptional);
     try b.register("kotlinx.serialization.__klsx_get", propGet);
     try b.register("kotlinx.serialization.__klsx_construct", construct);
@@ -78,6 +82,8 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("kotlinx.serialization.__klsx_isSerializable", isSerializable);
     try b.register("kotlinx.serialization.__klsx_isEnum", isEnumClass);
     try b.register("kotlinx.serialization.__klsx_enumValues", enumEntryValues);
+    try b.register("kotlinx.serialization.__klsx_enumEntryAnnotations", enumEntryAnnotations);
+    try b.register("kotlinx.serialization.__klsx_enumEntrySerialNames", enumEntrySerialNames);
     // JSON format: reflective encode (runtime-value driven) and
     // type-driven decode (guided by each ctor param's declared type).
     try b.register("kotlinx.serialization.json.__klsx_jsonEncode", jsonEncode);
@@ -646,6 +652,27 @@ fn ctorParamTypes(ctx: *CallCtx) Error!EvalResult {
     }));
 }
 
+/// The declaration's type-parameter names in declaration order, so a caller
+/// handed one serializer per type argument can tell which rendered declared
+/// type (`"T"`, `"List<T>"`) that argument stands for.
+fn typeParamNames(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("__klsx_typeParamNames: expected a class");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return typeErr("__klsx_typeParamNames: expected a class");
+    defer cls_ref.deinit();
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (cls_ref.asPtr().type_params) |tp| {
+        try items.append(a, .{ .String = try runtime.strInit(a, tp) });
+    }
+    return ok(try Value.newList(a, .{
+        .items = try ValueList.init(a, items),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    }));
+}
+
 /// Render a `TypeShape` back to source form, generic args included.
 fn renderShape(a: std.mem.Allocator, buf: *std.ArrayList(u8), shape: TypeShape) !void {
     try buf.appendSlice(a, shape.name);
@@ -868,6 +895,48 @@ fn paramAnnotations(ctx: *CallCtx) Error!EvalResult {
         seen += 1;
     }
     return ok(try annotationInstanceList(ctx, &.{}));
+}
+
+/// The `@SerialInfo` annotations applied to the enum entry at `index`.
+fn enumEntryAnnotations(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return typeErr("__klsx_enumEntryAnnotations: expected a class and an index");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return ok(try annotationInstanceList(ctx, &.{}));
+    defer cls_ref.deinit();
+    const want: i64 = switch (ctx.args[1]) {
+        .Int => |i| i,
+        .Long => |l| l,
+        else => return typeErr("__klsx_enumEntryAnnotations: index must be Int"),
+    };
+    const entries = cls_ref.asPtr().enum_entries;
+    if (want < 0 or want >= entries.len) return ok(try annotationInstanceList(ctx, &.{}));
+    return ok(try annotationInstanceList(ctx, entries[@intCast(want)].annotation_records));
+}
+
+/// The WIRE name of each enum entry: its `@SerialName` when it carries one,
+/// otherwise the declared entry name.
+fn enumEntrySerialNames(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("__klsx_enumEntrySerialNames: expected a class");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return typeErr("__klsx_enumEntrySerialNames: expected a class");
+    defer cls_ref.deinit();
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (cls_ref.asPtr().enum_entries) |entry| {
+        var wire: []const u8 = entry.name;
+        for (entry.annotation_records) |*rec| {
+            if (rec.is("kotlinx.serialization.SerialName") or rec.is("SerialName")) {
+                if (rec.stringArg("value")) |s| wire = s;
+            }
+        }
+        try items.append(a, .{ .String = try runtime.strInit(a, wire) });
+    }
+    return ok(try Value.newList(a, .{
+        .items = try ValueList.init(a, items),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    }));
 }
 
 /// The value of a `@SerialName("...")` on the CLASS itself, or null when it
@@ -1358,7 +1427,7 @@ test "hostBindings registers every serialization symbol" {
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classSerialNameOverride") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classAnnotations") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_paramAnnotations") != null);
-    try testing.expectEqual(@as(usize, 14), b.len());
+    try testing.expectEqual(@as(usize, 17), b.len());
 }
 
 test "renderShape round-trips nullability and generic args" {

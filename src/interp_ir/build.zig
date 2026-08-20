@@ -3436,7 +3436,16 @@ fn buildModuleWithOverrides(
                 .identity = id,
                 .native_state = null,
             });
-            try entries.append(a, .{ .name = entry.name.name, .value = .{ .Instance = inst } });
+            const entry_annotations = blk: {
+                const recs = try a.alloc(runtime.AnnotationRecord, entry.annotations.len);
+                for (entry.annotations, recs) |*ann, *rec| rec.* = try annotationRecordFor(module, a, ann);
+                break :blk recs;
+            };
+            try entries.append(a, .{
+                .name = entry.name.name,
+                .value = .{ .Instance = inst },
+                .annotation_records = entry_annotations,
+            });
 
             // Lower an init thunk per constructor slot: the entry's explicit
             // args, then default values for any trailing primary-ctor params
@@ -4684,6 +4693,11 @@ fn buildClassDef(
             const recs = try a.alloc(runtime.AnnotationRecord, c.annotations.len);
             for (c.annotations, recs) |*ann, *rec| rec.* = try annotationRecordFor(module, a, ann);
             break :blk recs;
+        },
+        .type_params = blk: {
+            const names = try a.alloc([]const u8, c.type_params.len);
+            for (c.type_params, names) |*tp, *out| out.* = tp.name.name;
+            break :blk names;
         },
         .primary_params = primary_params,
         .methods = &.{},

@@ -20,6 +20,7 @@
 package kotlinx.serialization
 
 import kotlin.reflect.KClass
+import kotlinx.serialization.internal.EnumDescriptor
 import kotlinx.serialization.internal.EnumSerializer
 import kotlinx.serialization.internal.ObjectSerializer
 import kotlinx.serialization.builtins.serializer
@@ -57,6 +58,9 @@ internal fun __klsx_construct(kClass: Any?, args: List<Any?>): Any? =
 internal fun __klsx_ctorParamTypes(kClass: Any?): List<String> =
     error("intrinsic kotlinx.serialization.__klsx_ctorParamTypes not installed")
 
+internal fun __klsx_typeParamNames(kClass: Any?): List<String> =
+    error("intrinsic kotlinx.serialization.__klsx_typeParamNames not installed")
+
 internal fun __klsx_ctorParamOptional(kClass: Any?): List<Boolean> =
     error("intrinsic kotlinx.serialization.__klsx_ctorParamOptional not installed")
 
@@ -68,6 +72,12 @@ internal fun __klsx_isEnum(kClass: Any?): Boolean =
 
 internal fun __klsx_enumValues(kClass: Any?): List<Any?> =
     error("intrinsic kotlinx.serialization.__klsx_enumValues not installed")
+
+internal fun __klsx_enumEntryAnnotations(kClass: Any?, index: Int): List<Annotation> =
+    error("intrinsic kotlinx.serialization.__klsx_enumEntryAnnotations not installed")
+
+internal fun __klsx_enumEntrySerialNames(kClass: Any?): List<String> =
+    error("intrinsic kotlinx.serialization.__klsx_enumEntrySerialNames not installed")
 
 // One generated serializer per declaration, as the plugin's generated
 // `Companion.serializer()` provides: `serializer()` called twice on the same
@@ -90,15 +100,70 @@ internal fun __klsx_generatedSerializer(kClass: KClass<*>): KSerializer<Any>? {
     return built
 }
 
+// The generic form the plugin generates for `@Serializable class Foo<T>`:
+// `Foo.serializer(tSerializer)`. The arguments stand, in order, for the
+// declaration's type parameters, and they are what lets the descriptor name a
+// real element descriptor where the declared type is a type parameter.
+//
+// Two calls with the same arguments must produce EQUAL descriptors (and two
+// with different arguments unequal ones), which is a property of the
+// descriptor rather than of the instance, so this mints a fresh serializer
+// each time rather than caching by argument list.
+@Suppress("UNCHECKED_CAST")
+internal fun __klsx_generatedSerializerGeneric(
+    kClass: KClass<*>,
+    typeArgs: List<KSerializer<Any?>>
+): KSerializer<Any>? {
+    if (!__klsx_isSerializable(kClass)) return null
+    if (typeArgs.isEmpty()) return __klsx_generatedSerializer(kClass)
+    // Only the plain-class shape carries elements the arguments can describe;
+    // every other shape ignores its type arguments exactly as the plugin does.
+    if (kClass.objectInstance != null || __klsx_isEnum(kClass) || kClass.isSealed || kClass.isAbstract) {
+        return __klsx_generatedSerializer(kClass)
+    }
+    return ReflectiveKSerializer(kClass, typeArgs) as KSerializer<Any>
+}
+
 @Suppress("UNCHECKED_CAST")
 private fun __klsx_buildSerializer(kClass: KClass<*>): KSerializer<Any> {
     val serialName = __klsx_serialName(kClass)
+    // Every shape below reports the declaration's `@SerialInfo` annotations on
+    // its descriptor, which is what the plugin passes to each of these.
+    val declAnnotations = __klsx_classAnnotations(kClass).toTypedArray()
     val objectInstance = kClass.objectInstance
     if (objectInstance != null) {
-        return ObjectSerializer(serialName, objectInstance) as KSerializer<Any>
+        return ObjectSerializer(serialName, objectInstance, declAnnotations) as KSerializer<Any>
     }
     if (__klsx_isEnum(kClass)) {
-        return EnumSerializer(serialName, __klsx_enumValues(kClass).toTypedArray()) as KSerializer<Any>
+        // The entry wire names and the `@SerialInfo` annotations on the class
+        // and on each entry are exactly what the plugin passes here.
+        val values = __klsx_enumValues(kClass).toTypedArray()
+        val wire = __klsx_enumEntrySerialNames(kClass)
+        val classAnnotations = __klsx_classAnnotations(kClass)
+        val entryAnnotations = ArrayList<List<Annotation>>()
+        var annotated = false
+        var i = 0
+        while (i < values.size) {
+            val anns = __klsx_enumEntryAnnotations(kClass, i)
+            if (anns.isNotEmpty()) annotated = true
+            entryAnnotations.add(anns)
+            i = i + 1
+        }
+        if (!annotated && classAnnotations.isEmpty()) {
+            return EnumSerializer(serialName, values) as KSerializer<Any>
+        }
+        // Same shape as upstream's `createAnnotatedEnumSerializer`, built here
+        // because the entry names and annotations come from the declaration
+        // rather than from plugin-emitted arrays.
+        val descriptor = EnumDescriptor(serialName, values.size)
+        for (a in classAnnotations) descriptor.pushClassAnnotation(a)
+        i = 0
+        while (i < values.size) {
+            descriptor.addElement(if (i < wire.size) wire[i] else "$i")
+            for (a in entryAnnotations[i]) descriptor.pushAnnotation(a)
+            i = i + 1
+        }
+        return EnumSerializer(serialName, values, descriptor) as KSerializer<Any>
     }
     if (kClass.isSealed) {
         val subclasses = ArrayList<KClass<*>>()
@@ -112,11 +177,12 @@ private fun __klsx_buildSerializer(kClass: KClass<*>): KSerializer<Any> {
             serialName,
             kClass as KClass<Any>,
             subclasses.toTypedArray() as Array<KClass<out Any>>,
-            subSerializers.toTypedArray() as Array<KSerializer<out Any>>
+            subSerializers.toTypedArray() as Array<KSerializer<out Any>>,
+            declAnnotations
         ) as KSerializer<Any>
     }
     if (kClass.isAbstract) {
-        return PolymorphicSerializer(kClass as KClass<Any>) as KSerializer<Any>
+        return PolymorphicSerializer(kClass as KClass<Any>, declAnnotations) as KSerializer<Any>
     }
     return ReflectiveKSerializer(kClass) as KSerializer<Any>
 }
@@ -137,7 +203,11 @@ internal class ReflectiveDescriptor(
     // in which case every element falls back to the neutral answers.
     private val types: List<String> = emptyList(),
     private val optionals: List<Boolean> = emptyList(),
-    private val owner: Any? = null
+    private val owner: Any? = null,
+    // The declaration's type-parameter names paired with the serializer given
+    // for each, when the descriptor was built by a generic `serializer(...)`.
+    private val typeParamNames: List<String> = emptyList(),
+    private val typeArgs: List<KSerializer<Any?>> = emptyList()
 ) : SerialDescriptor {
     override val kind: SerialKind get() = StructureKind.CLASS
     override val elementsCount: Int get() = names.size
@@ -163,8 +233,55 @@ internal class ReflectiveDescriptor(
     // it cannot actually produce would be worse than admitting ignorance.
     override fun getElementDescriptor(index: Int): SerialDescriptor {
         if (index >= types.size) return ReflectiveElementDescriptor
-        return descriptorForDeclaredType(types[index])
+        val declared = types[index]
+        // An element declared as one of the type parameters is described by
+        // the serializer the call supplied for it.
+        val nullable = declared.endsWith("?")
+        val base = if (nullable) declared.substring(0, declared.length - 1) else declared
+        val at = typeParamNames.indexOf(base)
+        if (at >= 0 && at < typeArgs.size) {
+            val d = typeArgs[at].descriptor
+            return if (nullable) d.nullable else d
+        }
+        return descriptorForDeclaredType(declared)
     }
+
+    // kotlinx's descriptor equality: same serial name, same type arguments,
+    // and element-wise agreement on each element's serial name and kind. It
+    // stops at the element's name/kind rather than recursing, which is what
+    // lets a self-referential class compare at all. A descriptor built any
+    // other way is never equal to a generated one, even under the same name.
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is ReflectiveDescriptor) return false
+        if (serialName != other.serialName) return false
+        if (typeArgDescriptors() != other.typeArgDescriptors()) return false
+        if (elementsCount != other.elementsCount) return false
+        var i = 0
+        while (i < elementsCount) {
+            val a = getElementDescriptor(i)
+            val b = other.getElementDescriptor(i)
+            if (a.serialName != b.serialName) return false
+            if (a.kind != b.kind) return false
+            i = i + 1
+        }
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = serialName.hashCode()
+        result = result * 31 + typeArgDescriptors().hashCode()
+        var i = 0
+        while (i < elementsCount) {
+            val e = getElementDescriptor(i)
+            result = result * 31 + e.serialName.hashCode()
+            result = result * 31 + e.kind.toString().hashCode()
+            i = i + 1
+        }
+        return result
+    }
+
+    private fun typeArgDescriptors(): List<SerialDescriptor> = typeArgs.map { it.descriptor }
 
     override fun toString(): String = "ReflectiveDescriptor($serialName)"
 }
@@ -232,7 +349,10 @@ public object DynamicValueSerializer : KSerializer<Any?> {
     }
 }
 
-public class ReflectiveKSerializer(private val kClass: Any?) : KSerializer<Any?> {
+public class ReflectiveKSerializer(
+    private val kClass: Any?,
+    private val typeArgs: List<KSerializer<Any?>> = emptyList()
+) : KSerializer<Any?> {
     private val names: List<String> = __klsx_ctorParamNames(kClass)
 
     override val descriptor: SerialDescriptor =
@@ -243,7 +363,9 @@ public class ReflectiveKSerializer(private val kClass: Any?) : KSerializer<Any?>
             __klsx_ctorParamSerialNames(kClass),
             __klsx_ctorParamTypes(kClass),
             __klsx_ctorParamOptional(kClass),
-            kClass
+            kClass,
+            __klsx_typeParamNames(kClass),
+            typeArgs
         )
 
     override fun serialize(encoder: Encoder, value: Any?) {

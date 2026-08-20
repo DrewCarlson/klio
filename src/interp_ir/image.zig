@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 48;
+pub const FORMAT_VERSION: u32 = 49;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -756,6 +756,7 @@ const ClassDefImage = struct {
     fqn: []const u8,
     annotation_names: []const []const u8,
     annotation_records: []const runtime.AnnotationRecord,
+    type_params: []const []const u8,
     primary_params: []ClassParamImage,
     methods: []MethodImage,
     body_properties: []PropertyImage,
@@ -777,7 +778,7 @@ const ClassDefImage = struct {
     is_inner: bool,
     is_anonymous: bool,
     secondary_ctors: []const FF(ast.SecondaryCtor),
-    enum_entries: []struct { name: []const u8, value: ValueImage },
+    enum_entries: []struct { name: []const u8, value: ValueImage, annotation_records: []const runtime.AnnotationRecord },
     enclosing: ?u32,
     nested_classes: []struct { name: []const u8, idx: u32 },
     supertype_delegates: []DelegateImage,
@@ -1929,7 +1930,7 @@ fn classDefToImage(
     const entries = try a.alloc(EntryImage, cd.enum_entries.len);
     for (cd.enum_entries, 0..) |entry, i| {
         const v = (try valueToImage(a, def_index, entry.value)) orelse return false;
-        entries[i] = .{ .name = entry.name, .value = v };
+        entries[i] = .{ .name = entry.name, .value = v, .annotation_records = entry.annotation_records };
     }
 
     const NestedImage = @TypeOf(out.nested_classes[0]);
@@ -1967,6 +1968,7 @@ fn classDefToImage(
         .fqn = cd.fqn,
         .annotation_names = cd.annotation_names,
         .annotation_records = cd.annotation_records,
+        .type_params = cd.type_params,
         .primary_params = primary,
         .methods = methods,
         .body_properties = props,
@@ -2333,6 +2335,7 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
             .fqn = ci.fqn,
             .annotation_names = ci.annotation_names,
             .annotation_records = ci.annotation_records,
+            .type_params = ci.type_params,
             .primary_params = blk: {
                 const params = try a.alloc(runtime.ClassParamDef, ci.primary_params.len);
                 for (ci.primary_params, 0..) |p, j| {
@@ -2446,7 +2449,7 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
             const entries = try a.alloc(ClassDef.EnumEntry, ci.enum_entries.len);
             for (ci.enum_entries, 0..) |entry, j| {
                 const v = (try valueFromImage(a, defs, entry.value)) orelse return false;
-                entries[j] = .{ .name = entry.name, .value = v };
+                entries[j] = .{ .name = entry.name, .value = v, .annotation_records = entry.annotation_records };
             }
             c.enum_entries = entries;
         }

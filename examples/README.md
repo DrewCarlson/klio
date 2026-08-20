@@ -194,6 +194,7 @@ Run any program with:
 | `serial_name_annotation.kt`    | `@SerialName` on a class replaces the descriptor's serial name, and on a property replaces that element's wire name, while the Kotlin declaration keeps its own names. |
 | `value_class_hash_delegation.kt` | A `value` class hashes as its underlying property and a `data` class folds each property's own `hashCode()`, so a property class's override decides the result. |
 | `property_ref_write_through_delegate.kt` | A property written through a `by contents::prop` delegate and through an unbound `KMutableProperty1` lands in the same backing field, and stays readable after the delegate that carried the first write is gone. |
+| `serializer_generic_type_args.kt` | `serializer(...)` on a generic `@Serializable` class takes one serializer per type argument, which decides each type-parameter element's descriptor and separates otherwise identical descriptors. |
 | `companion_member_extension.kt` | Extension properties on a companion object declared as members of another class, `private` and public, on a user class and on a builtin's companion. |
 | `serial_descriptor_shape.kt`   | The `SerialDescriptor` a `@Serializable` class reports: element names, which elements are optional (their constructor parameter has a default), and each element's own descriptor. |
 | `interface_companion_state.kt` | Shared companion-object state on an interface.              |

@@ -45,6 +45,11 @@ pub const ClassDef = struct {
     /// `annotation_names` alone cannot carry. Reflective consumers that read
     /// an argument off a class annotation (`@SerialName("...")`) need these.
     annotation_records: []const AnnotationRecord = &.{},
+    /// Declared type-parameter names, in declaration order. A reflective
+    /// consumer handed one serializer per type argument matches them against
+    /// the rendered declared types of the properties to know which element a
+    /// given argument describes.
+    type_params: []const []const u8 = &.{},
     primary_params: []ClassParamDef,
     /// Member functions keyed by simple name.
     methods: []MethodDef,
@@ -140,7 +145,14 @@ pub const ClassDef = struct {
     resolve_cid: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// One eager enum entry: its name and the `Value::Instance` for it.
-    pub const EnumEntry = struct { name: []const u8, value: Value };
+    pub const EnumEntry = struct {
+        name: []const u8,
+        value: Value,
+        /// Annotations written on the entry declaration, with their arguments.
+        /// A reflective consumer reports these per element the way the class's
+        /// own `annotation_records` are reported for the declaration.
+        annotation_records: []const AnnotationRecord = &.{},
+    };
     /// One nested class binding: simple name -> resolved `ClassDef`.
     pub const NestedClass = struct { name: []const u8, class: ObjRef(ClassDef) };
 
