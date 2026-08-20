@@ -655,6 +655,54 @@ is at zero.
       a typed local first (`val t: Sink.() -> Unit = x; t(s)`) returns an
       empty result rather than throwing. Unchanged by this fix.
 
+### Open: a bare call in a receiver lambda binds a stdlib EXTENSION over the enclosing member
+
+`androidx`'s last real failure and its only timeout. `ValueClassListTest.string`
+runs ~330s and dies; the file is then counted did-not-complete, which is why
+`max_failed = 0` passes while a real failure hides behind it.
+
+`TestValueClassList.toString` is:
+
+    buildString {
+        append('[')
+        forEachIndexed { index: Int, element: TestValueClass -> ... }
+        append(']')
+    }
+
+Inside `buildString` the innermost implicit receiver is a StringBuilder, so
+the bare `forEachIndexed` binds `kotlin.text.forEachIndexed` (the
+`CharSequence` one) instead of the enclosing class's member. It then iterates
+the builder WHILE the body appends to it, which is the runaway loop the spin
+trace shows (index climbing 24124 -> 32316 -> 40508).
+
+    [bare] forEachIndexed -> kotlin.text.forEachIndexed#1519 params=2 ext=true recv_ty=StringBuilder
+
+kotlinc rejects that candidate because the literal ANNOTATES its parameters
+(`element: TestValueClass` is not a `Char`), which is exactly the information
+klio was discarding.
+
+ATTEMPTED AND REVERTED, but it got halfway. `ArgShape.lambda_param_types`
+already exists and was never populated or read. Populating it from the AST
+literal's `param_tys` and refuting a definite builtin-scalar mismatch in
+`scoreArg` works — the pick moves off the `CharSequence` candidate:
+
+    [bare] forEachIndexed -> kotlin.collections.forEachIndexed#1783 ext=true recv_ty=StringBuilder
+
+but lands on the `Iterable<T>` one instead, whose element is generic so
+nothing refutes it, and the program still fails. Every suite measured
+neutral, so it was reverted rather than kept as an unmeasured scorer change.
+
+What is still missing is RECEIVER refutation: a StringBuilder is not an
+`Iterable`, so neither extension is applicable to the innermost receiver and
+resolution must fall out to the enclosing class's member. That is the next
+step, and it is a broader change than the argument-side refutation.
+
+Isolation notes, so this need not be re-derived: the trigger is the NAME
+colliding with a stdlib extension, not the value class (a plain class fails
+identically), not the lambda arity, not the `val content = content` shadow,
+and not two splice levels — calling `list.forEachIndexed` directly inside
+`buildString` works.
+
 ### Open: an inline MEMBER called bare inside a receiver-lambda
 
 `ValueClassListTest.string` still fails, and it is the reason the file
