@@ -695,57 +695,62 @@ is at zero.
       case that must NOT change — the CharSequence extension still binds on a
       real StringBuilder receiver.
 
-### Open: the tracing GC frees a live object under repeated host re-entry
+### Open: a delegated property read misses its delegate under GC pressure
 
-This is the root behind `DateTimeComponentsFormatTest` (12 of datetime's 35
-failures) and it is a MEMORY bug, not a datetime one.
+Root of `DateTimeComponentsFormatTest` (12 of datetime's 35 failures). NOT a
+premature-free bug, which is what the first pass concluded — that reading was
+wrong and is corrected here.
 
-Minimal repro — `scratchpad/tzcount.kt`, no assertions, one zone:
+**Deterministic oracle.** `KLIO_GC_STRESS=1` (collect at every safe point)
+turns the intermittent failure into a certainty, so no long loop is needed:
 
-    val f = DateTimeComponents.Format {
-        dateTime(LocalDateTime.Formats.ISO); offset(UtcOffset.Formats.ISO)
-        char('['); timeZoneId(); char(']')
-    }
-    f.format { setDateTime(...); setOffset(...); timeZoneId = "Europe/Berlin" }
-    repeat(120) { f.parse("...[America/New_York]").timeZoneId }   // null after ~57
+    // scratchpad/g4.kt
+    val f = DateTimeComponents.Format { timeZoneId(); chars("]") }
+    f.format { timeZoneId = "Europe/Berlin" }
+    f.parse("America/New_York]").timeZoneId      // null under stress, correct without
 
-The parse silently starts returning null partway through and never recovers.
+`KLIO_RECLAIM=0`, `KLIO_RECLAIM=arena` and `KLIO_OPT=off` all pass; every
+profile with the tracing GC fails. A prior `format()` is required — parse
+alone is fine.
 
-Bounded by knob, which is what makes it a GC bug and not a datetime one:
+**What actually happens**, from instrumenting both klio and the pack. The
+write lands correctly in BOTH runs, on the same object:
 
-    KLIO_RECLAIM=0      firstBad=-1   (passes)
-    KLIO_RECLAIM=arena  firstBad=-1   (passes)
-    KLIO_RECLAIM=gc     firstBad=66
-    KLIO_RECLAIM=debug  General protection exception (core dump)
-    KLIO_OPT=off        firstBad=-1   (passes)
-    KLIO_OPT=safe/fast  firstBad=66 / 57
-    KLIO_GC_GEN=0       firstBad=66   (a MAJOR collection misses it too)
+    [setf] DateTimeComponentsContents#166.timeZoneId <- String (before=Null)
 
-So a live object is unreachable from the root set during a full mark — a
-missing root, not a write-barrier or generational problem. The debug backend
-names the victim: an `InstanceData` whose `fields.items` has been freed, read
-from `varargShadowedFieldInvoke` (`host_call_member.zig:3621`) reached
-through `callValueWithThisSel` -> `callValue` -> `callMember`.
+Without stress the read then finds it through the delegate:
 
-Ruled out, so they need not be re-tried:
-  * the 64-bit `Frame.wmask` aliasing for register indices >= 64 (real hazard,
-    `write` grows the file past `frameNoFill`'s `n_locals <= 64` bound — but
-    fixing it does not change this repro);
-  * borrowed String `bytes` escaping their guard in `callValueWithThisSel`
-    (also a real hazard, also not this);
-  * rooting that function's host-local `all` buffer with the existing
-    `keepaliveMark`/`keepalivePushSlice` API.
+    [deleg] bound_recv=DateTimeComponentsContents id=166 field timeZoneId=String
+    [deleg] get timeZoneId delegate=<instance> -> String
 
-A correction worth keeping: this first looked like `format()` poisoning a
-later `parse()`, and then like `main` behaving differently from a function.
-Both readings were wrong — it is purely CUMULATIVE. A function-scoped loop
-fails too, just at a different count (158 bad of 200), and the count moves
-with the allocator profile. Any bisect that changes the amount of work also
-moves the threshold, which is what made the earlier readings look meaningful.
+Under stress that read produces NO delegate trace at all — none of the three
+`getValue` sites in `host_fields.zig` is reached — and yields null. So
+`DateTimeComponents.timeZoneId` (declared `by contents::timeZoneId`) stops
+taking the delegate path; `delegate_owner` goes false, or the read is served
+before reaching it.
 
-Next step is a root-set audit of the host re-entry paths, using
-`KLIO_RECLAIM=debug` on the repro to catch the use, and `KLIO_GC_DEBUG` to
-correlate the collection that kills it.
+Confirming the same thing from the other side: replacing that one line with an
+explicit `get()/set(value)` on `contents` makes the stress run pass, with no
+other change and no printlns.
+
+RULED OUT, so they need not be retried: the value is never swept (a sweep
+trace over string payloads shows no `America/...` ever freed); the 64-bit
+`Frame.wmask` aliasing; borrowed String `bytes` escaping their guard;
+`keepalive` rooting of the host re-entry inputs in `callValue`,
+`callValueWithThisSel` and `callMember`; a write-barrier or generational
+fault (`KLIO_GC_GEN=0` and `KLIO_GC_MINOR_STOP=0` both still fail).
+
+METHOD WARNING that cost several iterations: under `KLIO_GC_STRESS` any
+diagnostic that ALLOCATES (`Value.display`, `allocPrint`) changes the
+collection schedule and the failure moves or disappears. Only non-allocating
+traces (`@tagName`, raw `[]const u8` names, identities) are trustworthy here.
+
+NEXT STEP, concrete: instrument `delegate_owner` in
+`host_fields.zig:getFieldOnInstance` for the `DateTimeComponents` receiver
+under stress and find which of its three legs flips —
+`runtimeClassDelegatesProp`, the `delegated_body_props` registry probe, or the
+supertype walk. The write side is proven correct, so the fault is entirely on
+the read side.
 
 ### Open: an inline MEMBER called bare inside a receiver-lambda
 
