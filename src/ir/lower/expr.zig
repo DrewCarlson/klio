@@ -4069,6 +4069,14 @@ fn mapArgsToParams(
     return out;
 }
 
+/// The element type of a function-typed VARARG parameter. The lowered
+/// parameter may carry the element type directly (`Function0`) rather than a
+/// materialized array, so try it as-is before stripping an array layer.
+fn varargFnElemTy(b: *FuncBuilder, ty: ir.TypeRef) ir.TypeRef {
+    if (fnTypeArityAlias(b, ty) != null) return ty;
+    return applicability.varargElementRef(&ty);
+}
+
 fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_names: []const ?[]const u8, recv_offset: usize) Allocator.Error!?[]i16 {
     if (args.len == 0) return null;
     for (args) |*a| if (a.* == .Spread) return null;
@@ -4094,6 +4102,29 @@ fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_name
     // A trailing lambda fills the last function-typed parameter even when
     // earlier defaulted parameters are omitted; align the trailing lambda
     // with the last parameter and the leading args from the front.
+    // Same vararg run as the receiver recorder below. Without this the
+    // literals keep their implicit `it` parameter, so the closure reports one
+    // value parameter, and the VM's receiver rule — bind the extra leading
+    // argument when a receiver-carrying closure is called with `n_params + 1`
+    // arguments — cannot fire.
+    for (params, 0..) |p, vp| {
+        if (!p.is_vararg) continue;
+        const n_after = params.len - vp - 1;
+        if (args.len < vp + n_after) break;
+        const vararg_end = args.len - n_after;
+        const elem_arity = fnTypeArityAlias(b, varargFnElemTy(b, params[vp].ty)) orelse -1;
+        var vi2: usize = 0;
+        while (vi2 < vp and vi2 < args.len) : (vi2 += 1) out[vi2] = fnTypeArityAlias(b, params[vi2].ty) orelse -1;
+        vi2 = vp;
+        while (vi2 < vararg_end) : (vi2 += 1) out[vi2] = elem_arity;
+        var k: usize = 0;
+        while (k < n_after) : (k += 1) {
+            const ai = vararg_end + k;
+            const pi = vp + 1 + k;
+            if (ai < args.len and pi < params.len) out[ai] = fnTypeArityAlias(b, params[pi].ty) orelse -1;
+        }
+        return out;
+    }
     const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
     if (trailing_lambda and args.len <= params.len) {
         // Leading positional args map 1:1 from the front.
@@ -4377,6 +4408,37 @@ fn recordLambdaArgReceiversForCallReceiver(
                     try recordCallBoundLambdaReceiver(b, func, a.span(), receiver, params, args, arg_names, type_args, call_receiver);
                 }
             };
+        }
+        return;
+    }
+    // A function-typed VARARG parameter binds EVERY argument in its run.
+    // `f(vararg blocks: Sink.() -> Unit)` called with two lambda literals
+    // matches neither shape below — two arguments never equal the one
+    // declared parameter, nor fit `args.len <= params.len` — so neither
+    // literal was recorded. kotlinx-datetime's `alternativeParsing(vararg
+    // others: T.() -> Unit, primary: T.() -> Unit)` is the shape RFC_1123
+    // parses through.
+    for (params, 0..) |p, vp| {
+        if (!p.is_vararg) continue;
+        const n_after = params.len - vp - 1;
+        if (args.len < vp + n_after) break;
+        const vararg_end = args.len - n_after;
+        if (fnTypeReceiver(b, varargFnElemTy(b, params[vp].ty))) |receiver| {
+            var vi: usize = vp;
+            while (vi < vararg_end) : (vi += 1) {
+                if (args[vi] != .Lambda and args[vi] != .AnonFun) continue;
+                try recordCallBoundLambdaReceiver(b, func, args[vi].span(), receiver, params, args, arg_names, type_args, call_receiver);
+            }
+        }
+        var k: usize = 0;
+        while (k < n_after) : (k += 1) {
+            const ai = vararg_end + k;
+            const pi = vp + 1 + k;
+            if (ai >= args.len or pi >= params.len) break;
+            if (args[ai] != .Lambda and args[ai] != .AnonFun) continue;
+            if (fnTypeReceiver(b, params[pi].ty)) |receiver| {
+                try recordCallBoundLambdaReceiver(b, func, args[ai].span(), receiver, params, args, arg_names, type_args, call_receiver);
+            }
         }
         return;
     }

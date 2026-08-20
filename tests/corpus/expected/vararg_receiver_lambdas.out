@@ -1,0 +1,10 @@
+none          = ''
+one literal   = A
+two literals  = AB
+three         = ABC
+declared vals = DD
+mixed         = DA
+by index      = AB
+by forEach    = AB
+with primary  = ABM
+primary only  = M
