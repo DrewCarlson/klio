@@ -695,12 +695,12 @@ is at zero.
       case that must NOT change — the CharSequence extension still binds on a
       real StringBuilder receiver.
 
-### Open: a property-reference WRITE is lost under GC pressure
+### Fixed: a property-reference write was stored under a freed name
 
-Root of `DateTimeComponentsFormatTest` (12 of datetime's 35 failures). Two
-earlier readings in this file were wrong and are corrected here: it is neither
-a premature free NOR a delegated-property READ fault. The READ is fine; the
-WRITE never lands.
+Root of `DateTimeComponentsFormatTest` (12 of datetime's 35 failures). Three
+earlier readings in this file were wrong and are corrected here: it was neither
+a premature free, nor a delegated-property READ fault, nor a lost write. The
+write LANDED — under a garbage field name.
 
 **Deterministic oracle** — `KLIO_GC_STRESS=1` collects at every safe point and
 makes it certain, so no long loop is needed:
@@ -710,47 +710,94 @@ makes it certain, so no long loop is needed:
     f.format { timeZoneId = "Europe/Berlin" }        // a prior format IS required
     f.parse("America/New_York]").timeZoneId          // null under stress
 
-`KLIO_RECLAIM=0`, `arena`, and `KLIO_OPT=off` pass; every tracing-GC profile
-fails. `KLIO_GC_GEN=0` and `KLIO_GC_MINOR_STOP=0` still fail, so it is not a
-barrier or generational fault.
+**The mechanism.** `boundRefDispatch` reads a callable reference's name from
+`__bound_name__`, the bytes of a runtime String on the reference instance, and
+passes that slice down to `setField`. `fieldWriteCachePut` stored the slice as
+the memo's plain-store key. `DateTimeComponents.timeZoneId` is
+`by contents::timeZoneId`, so the `format {}` seeded the memo through the
+facade's PER-INSTANCE delegate; once that delegate was collected the entry
+pointed at freed memory, and the `parse` stored its value under whatever those
+bytes had become. `memberNameCanonical` (the interned copy `memberNameIdentity`
+was already making for the memo's KEY) now anchors the stored key too. Census
+484 passed / 35 failed -> 492 / 27.
 
-**Proven, by instrumenting the pack and the interpreter together:**
+**Method notes worth keeping.** Under `KLIO_GC_STRESS` any diagnostic that
+ALLOCATES (`Value.display`, `allocPrint`) shifts the collection schedule and
+the failure moves or vanishes; only non-allocating traces (`@tagName`, raw
+`[]const u8`, identities) are trustworthy. Instance identities are NOT
+comparable across two runs — the counter advances with allocation — and the
+three wrong diagnoses all came from comparing them across runs instead of
+reading one run's trace end to end. `KLIO_NO_WCACHE` making both repros pass
+looked like a smoking gun for the memo LOOKUP and was not one; the fault was
+in what the memo stored.
 
-  * `validateTimeZone` matches (`lastMatch=16`) and the parse takes the
-    setting branch in both runs;
-  * `PropertyAccessor.trySetWithoutReassigning` runs `property.set(container,
-    v)` and reports no conflict — then an IMMEDIATE `property.get(container)`
-    returns null. The write is lost between set and get;
-  * the delegate machinery is innocent: `delegate_owner=true` for
-    `DateTimeComponents`, the bound reference resolves to the right receiver
-    (`delegate#197 bound_recv#166 contents#166` identically in both runs), and
-    there is no duplicate field (`dupes=1`);
-  * the value is never collected — a sweep trace over every freed `StringData`
-    shows no `America/...` string;
-  * **under stress, `setFieldInner` is never entered for the parse's contents
-    instance at all.** Both runs enter it for the format's instance (#132) and
-    for the facade (#133); only the plain run also enters for #166 and reaches
-    `storePlainField`. So the parse's `KMutableProperty1.set` takes a
-    different route entirely under GC pressure, and that route drops the write.
+The read/probe memos were audited for the same hazard and are clean — they dupe
+into the program allocator (`memberCachePut`, the field-probe cache) or store
+only integers.
 
-**Correction on the field-write memo.** `KLIO_NO_WCACHE` (disabling the
-`field_write_cache` fast path) makes both repros pass, which looks like a
-smoking gun and is NOT one: under stress the memo already MISSES for the
-failing write, and `setFieldInner` is not even entered. Re-keying the memo on
-the interned class FQN instead of the class cell address — a genuine
-robustness fix for the address-recycling hazard its own comment describes —
-changed nothing. Whatever the kill-switch perturbs, it is not the memo lookup.
+### Fixed: class delegation skipped interface members with a default body
 
-**Next step:** find the route the parse's `property.set` actually takes when
-`setFieldInner` is bypassed — instrument `Value.PropertyRef` / KMutableProperty
-`set` dispatch and the IR `StoreField` arm, not `host_fields`.
+`class W(d: I) : I by d` forwarded only the members `I` left abstract. A member
+`I` gives a default body is inherited like any other implementation, so
+resolution reached the interface's own body and ran it against the wrapper.
+Kotlin generates a forwarder for every member the class does not override.
 
-**Method warning, cost several iterations:** under `KLIO_GC_STRESS` any
-diagnostic that ALLOCATES (`Value.display`, `allocPrint`) shifts the collection
-schedule and the failure moves or vanishes. Only non-allocating traces
-(`@tagName`, raw `[]const u8`, identities) are trustworthy. Instance
-identities are also NOT comparable across two runs — the counter advances with
-allocation — only within one run.
+The decision is made wherever a call can commit to an inherited target — the
+virtual-slot dispatch (where a defaulted member arrives, through the class
+hierarchy), the lowering-resolved target, both flat-call preparations, the
+named/plain member ladders, and the property read. Each asks whether the
+receiver's own CLASS chain declares the name and forwards only when it does
+not. Three sources answer that: the runtime `ClassDef`, the module's class
+table (the authority on which declaration owns a method), and the anon-method
+table — `object : I by d { override … }` is the shape that carries the
+override in `kotlinx-io`'s `SourceFactory`, and missing it cost io 13 tests
+before the anon arm went in. Guarded by
+`examples/interface_delegation_defaults.kt`, which pins both directions.
+
+This was the root of kotlinx-serialization's polymorphic descriptors reporting
+no annotations: `ContextDescriptor(original) : SerialDescriptor by original`
+answered `SerialDescriptor.annotations`' empty default.
+
+### Fixed: a named class's member extension was unreachable from a dynamic call
+
+`class T { private fun List<Annotation>.getCustom() = … }` bound only
+statically. When the call site cannot name the receiver's type — a property
+read whose declared type lives in another module — lowering emits a dynamic
+call, and the dispatch tail had no arm for it. The anonymous-class equivalent
+already had one (`enclosingAnonMemberExtDispatch`); the named case now walks
+the same enclosing receiver tower, resolving candidates through the module's
+name index and `member_ext_owner_class`. Guarded by
+`examples/member_extension_untyped_receiver.kt`.
+
+### Fixed: generic `serializer(...)` and descriptor equality
+
+`@Serializable class Foo<T>` gets `serializer(tSerializer)` from the compiler
+plugin upstream; the reflective replacement only answered the zero-argument
+form. The dispatch tail now accepts arguments and routes them to
+`__klsx_generatedSerializerGeneric`, which pairs them positionally with the
+declaration's type parameters — which needs the runtime `ClassDef` to retain
+them, so it gained `type_params` (image format 49). `ReflectiveDescriptor` uses
+the arguments twice: an element whose declared type IS a type parameter reports
+that argument's descriptor, and the arguments join the serial name and the
+elements in a real `equals`/`hashCode` (element comparison stops at each
+element's serial name and kind, which is what lets a self-referential class be
+compared at all).
+
+Descriptors also report the declaration's `@SerialInfo` annotations for every
+shape, not just the plain class: enum, object, sealed and polymorphic all have
+an annotation-carrying constructor upstream. Enum entries had nowhere to keep
+theirs, so `ClassDef.EnumEntry` gained `annotation_records`.
+
+Serialization census 69 passed / 69 failed -> 86 / 52 over these three changes.
+
+### Open: compose examples segfault under GC stress
+
+`GC_STRESS=1 scripts/gc_stress_examples.sh` reports SIGSEGV (rc=139) on
+`compose_ui.kt`, `compose_ui_lazy.kt` and `compose_ui_click.kt`, and the
+120s timeout (rc=124) on `compose_foundation_lazy.kt`,
+`compose_multiwindow.kt`, `compose_window.kt` and `compose_ui_dashboard.kt`.
+The segfaults survive the field-write-memo fix, so they are a separate root.
+Everything else in the corpus passes under stress.
 
 ### Open: an inline MEMBER called bare inside a receiver-lambda
 
