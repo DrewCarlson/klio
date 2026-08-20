@@ -1,0 +1,8 @@
+typed     = [aa|b|ccc]
+chained   = [aa|b|ccc]
+deepChain = [aa|b|ccc]
+withArg   = aa+b+ccc
+width     = 6
+generic   = [aa|b|ccc]
+inLambda  = [aa|b|ccc];[aa|b|ccc]
+empty     = []

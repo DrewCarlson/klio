@@ -4915,6 +4915,10 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         // the per-site table, not the module func index, so the extension
         // fallback never sees them.
         if (try enclosingAnonMemberExtDispatch(self, allocator, receiver, name, args)) |r| return r;
+        // The same for a NAMED enclosing class: a member extension the
+        // lowerer could not bind statically because the receiver's declared
+        // type was unavailable at the call site.
+        if (try enclosingNamedMemberExtDispatch(self, allocator, receiver, name, args)) |r| return r;
     }
 
     // Range → List re-dispatch: a last-resort member surface only. It must
@@ -6368,6 +6372,48 @@ fn enclosingAnonMemberExtDispatch(self: *VmHost, allocator: Allocator, receiver:
         ir.eval.pushEnclosing(&e.v);
         defer ir.eval.popEnclosing();
         return try invokeAnonMethod(self, allocator, receiver, hit, args, null);
+    }
+    return null;
+}
+
+/// A member EXTENSION declared by a NAMED class on the enclosing receiver
+/// tower (`class T { private fun List<Annotation>.getCustom() = … }`). The
+/// lowerer binds such a call statically when it can name the receiver's type;
+/// when the receiver's static type is unknown — a property read whose declared
+/// type comes from another module — the call arrives here instead, and without
+/// this tail it reports a member miss on the builtin receiver.
+fn enclosingNamedMemberExtDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    const mptr: *const Module = self.module.asPtr();
+    const candidates = mptr.funcsBySimpleName(name);
+    if (candidates.len == 0) return null;
+    const entries = try ir.eval.enclosingEntriesAlloc(allocator);
+    defer allocator.free(entries);
+    if (entries.len == 0) return null;
+    for (entries) |e| {
+        if (e.v != .Instance) continue;
+        var cls_name: []const u8 = undefined;
+        var cls_fqn: []const u8 = undefined;
+        {
+            const g = e.v.Instance.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            cls_name = cg.get().name;
+            cls_fqn = cg.get().fqn;
+        }
+        for (candidates) |fid| {
+            const owner = mptr.registry.member_ext_owner_class.get(fid) orelse continue;
+            if (!std.mem.eql(u8, owner, cls_name) and !std.mem.eql(u8, owner, cls_fqn)) continue;
+            const f = mptr.funcById(fid) orelse continue;
+            if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+            if (f.params.len - 1 != args.len) continue;
+            if (!receiverImplementsType(self, receiver, f.params[0].ty.name)) continue;
+            const all = try prependReceiver(allocator, receiver, args);
+            defer if (runtime.freeScratch()) allocator.free(all);
+            ir.eval.pushEnclosing(&e.v);
+            defer ir.eval.popEnclosing();
+            return try callFuncRec(self, allocator, mptr, fid, all);
+        }
     }
     return null;
 }
