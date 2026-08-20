@@ -1143,6 +1143,86 @@ fn valueNominalFqn(v: *const Value) []const u8 {
     return cg.get().fqn;
 }
 
+/// Whether a lambda ARGUMENT's own declared parameter types disprove a
+/// candidate's function-typed parameter. A literal that annotates its
+/// parameters states them, and kotlinc drops a candidate that cannot accept
+/// them: inside `buildString { … }` a bare
+/// `forEachIndexed { index: Int, element: TestValueClass -> … }` must not
+/// reach `CharSequence.forEachIndexed`, whose element is a `Char`. It did,
+/// and iterating the builder while the body appended to it never terminated.
+/// Refutes only on a DEFINITE mismatch: two different builtin scalars, or a
+/// builtin scalar against a class this build declares.
+fn closureParamsDisproveFnParam(self: *VmHost, pty: *const TypeRef, arg: *const Value) bool {
+    if (arg.* != .IrClosure) return false;
+    if (!std.mem.startsWith(u8, pty.name, "Function")) return false;
+    const info = self.closures.get(@intCast(arg.IrClosure.id)) orelse return false;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const module = if (info.module) |m| m else mg.get();
+    const cf = module.funcById(info.body_func) orelse return false;
+    const expected = fnTypeValueParams(pty) orelse return false;
+    const skip: usize = if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")) 1 else 0;
+    if (cf.params.len <= skip) return false;
+    const got = cf.params[skip..];
+    const n = @min(got.len, expected.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const gh = fnParamHead(got[i].ty.name);
+        const eh = fnParamHead(expected[i].name);
+        if (gh.len == 0 or eh.len == 0) continue;
+        if (std.mem.eql(u8, gh, eh)) continue;
+        const g_scalar = scalarHeadOf(gh) != null;
+        const e_scalar = scalarHeadOf(eh) != null;
+        if (g_scalar and e_scalar) return true;
+        if (e_scalar and knownClassHead(module, gh)) return true;
+        if (g_scalar and knownClassHead(module, eh)) return true;
+    }
+    return false;
+}
+
+/// The declared VALUE parameter types of a lowered function type. Encoding:
+/// `[#suspend?] [receiver?] params… ret [#markers]`.
+fn fnTypeValueParams(ty: *const TypeRef) ?[]const TypeRef {
+    const want = std.fmt.parseInt(usize, ty.name["Function".len..], 10) catch return null;
+    var hi: usize = ty.args.len;
+    while (hi > 0 and ty.args[hi - 1].name.len != 0 and ty.args[hi - 1].name[0] == '#') hi -= 1;
+    if (hi == 0) return null;
+    var lo: usize = 0;
+    if (lo < hi and std.mem.eql(u8, ty.args[lo].name, "#suspend")) lo += 1;
+    hi -= 1;
+    if (hi < lo) return null;
+    var params = ty.args[lo..hi];
+    if (params.len > want) params = params[params.len - want ..];
+    return params;
+}
+
+fn fnParamHead(name: []const u8) []const u8 {
+    var h = simpleName(std.mem.trimEnd(u8, name, "?"));
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    return h;
+}
+
+fn scalarHeadOf(h: []const u8) ?[]const u8 {
+    const scalars = [_][]const u8{
+        "Int",  "Long",  "Short",  "Byte",   "Double",  "Float",
+        "UInt", "ULong", "UShort", "UByte",  "Boolean", "Char",
+        "String",
+    };
+    for (scalars) |sc| {
+        if (std.mem.eql(u8, h, sc)) return sc;
+    }
+    return null;
+}
+
+/// Whether `h` names a class this build declares. A one-letter or
+/// unresolvable head is a type parameter and proves nothing.
+fn knownClassHead(module: *const Module, h: []const u8) bool {
+    if (h.len <= 1) return false;
+    if (std.mem.eql(u8, h, "Any")) return false;
+    if (std.mem.startsWith(u8, h, "Function")) return false;
+    return module.classId(h) != null;
+}
+
 fn candidateArgsDisproven(self: *VmHost, f: *const Func, args: []const Value) bool {
     if (f.params.len <= 1 or args.len == 0) return false;
     // A single TRAILING vararg adjudicates every remaining arg against its
@@ -10906,6 +10986,19 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
             }
             if (!extArityApplicableTL(self, &c.func, want, args.len != 0 and isCallable(&args[args.len - 1]))) {
                 if (missTraceWant(name)) std.debug.print("[extfb]  fid={d} strict arity nparams={d} want={d}\n", .{ c.fid.int(), c.func.params.len, want });
+                continue;
+            }
+            const strict_lam_disproof = blk_sld: {
+                if (c.func.params.len < 2) break :blk_sld false;
+                for (args, 0..) |*av, ai| {
+                    const pi = ai + 1;
+                    if (pi >= c.func.params.len) break;
+                    if (closureParamsDisproveFnParam(self, &c.func.params[pi].ty, av)) break :blk_sld true;
+                }
+                break :blk_sld false;
+            };
+            if (strict_lam_disproof) {
+                if (missTraceWant(name)) std.debug.print("[extfb]  fid={d} strict lambda-param-disproof\n", .{c.fid.int()});
                 continue;
             }
             if (candidateArgsDisproven(self, &c.func, args)) {

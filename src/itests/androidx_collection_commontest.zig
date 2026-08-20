@@ -28,7 +28,12 @@ const runtime = @import("runtime");
 /// it had already printed, so the total moves with how many stress loops
 /// finish: 1275 passes at 10 did-not-complete, 1547 at 5. The floor stays at
 /// the low-water mark rather than the best run.
-const BASELINE: usize = 1250;
+// 1250 -> 1560. ValueClassListTest no longer hangs: a bare `forEachIndexed`
+// inside `buildString { … }` bound `CharSequence.forEachIndexed` and iterated
+// the builder its own body was appending to. The suite now reports 1841
+// passed, 0 failed, 0 did not complete — previously 1500/0 with 6 classes
+// timing out, which is how a real failure hid behind a green ceiling.
+const BASELINE: usize = 1560;
 
 /// Ceiling on failing cases, the mirror of `BASELINE`. 15 -> 4 -> 0 as two
 /// resolution roots closed: overloaded inline extensions no longer bind by

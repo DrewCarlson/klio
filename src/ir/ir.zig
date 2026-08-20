@@ -9185,6 +9185,22 @@ pub const Module = struct {
     /// candidate (`TestScope.runTest` inside a plain test class). A
     /// type-parameter, function-type, or unresolvable receiver head keeps
     /// the candidate.
+    /// Whether `owner` (or its hierarchy) declares a member called `name`.
+    /// Gates the receiver-implausibility rule above: with no member competitor
+    /// there is nothing to prefer, so the extension must stand.
+    fn ownerDeclaresMember(self: *const Module, owner: []const u8, name: []const u8) bool {
+        if (self.registry.hierarchy_methods.get(owner)) |set| {
+            if (set.contains(name)) return true;
+        }
+        const simple = applicability.simpleName(owner);
+        if (!std.mem.eql(u8, simple, owner)) {
+            if (self.registry.hierarchy_methods.get(simple)) |set2| {
+                if (set2.contains(name)) return true;
+            }
+        }
+        return false;
+    }
+
     fn extReceiverPlausible(self: *const Module, id: FuncId, f: *const Func, owner: ?[]const u8) bool {
         const dbg = if (runtime.envOnce("KLIO_EXT_TRACE")) |w| std.mem.eql(u8, w, f.name) else false;
         if (dbg) std.debug.print("[extplaus] fid={d} fqn={s} recv_ty={s} owner={?s}\n", .{ id.int(), f.fqn, if (f.params.len != 0) f.params[0].ty.name else "-", owner });
@@ -9381,6 +9397,43 @@ pub const Module = struct {
                 if (self.memberExtOutOfScope(id, ctx.owner_class)) continue;
                 if (ctx.receiver_known and
                     !self.extReceiverPlausible(id, f, ctx.owner_class)) continue;
+                // Inside a receiver LAMBDA the receiver types are not "known"
+                // in the plain-method-body sense, so the check above is
+                // skipped and an extension on an unrelated type can win over
+                // the enclosing class's own member: a bare `forEachIndexed`
+                // written inside `buildString { … }` bound
+                // `CharSequence.forEachIndexed` and iterated the builder the
+                // body was appending to.
+                //
+                // Narrow deliberately. This fires ONLY when the enclosing
+                // class really declares a member of this name, so there is a
+                // competitor to prefer. Without that guard it also
+                // disqualified private stdlib extensions on `String` called
+                // from inside stdlib (`parseDigits`, `uuidCheckHyphenAt`),
+                // whose receiver context none of these sources capture.
+                if (!ctx.receiver_known and ctx.recv_ty != null and ctx.owner_class != null and
+                    self.ownerDeclaresMember(ctx.owner_class.?, name))
+                {
+                    const inner_head = blk_ih: {
+                        var h = applicability.simpleName(std.mem.trimEnd(u8, ctx.recv_ty.?, "?"));
+                        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+                        break :blk_ih h;
+                    };
+                    var plausible = self.extReceiverPlausible(id, f, inner_head);
+                    if (!plausible) plausible = self.extReceiverPlausible(id, f, ctx.owner_class);
+                    if (!plausible) {
+                        for (ctx.tower) |entry| {
+                            if (self.extReceiverPlausible(id, f, entry.head)) {
+                                plausible = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!plausible) {
+                        if (drop_trace) std.debug.print("[drop] {s}#{d} ext-recv-implausible\n", .{ name, id.int() });
+                        continue;
+                    }
+                }
             }
             const sig = self.sigViewForApplicability(id, include_compiler_abi) orelse {
                 if (drop_trace) std.debug.print("[drop] {s}#{d} no-sigview\n", .{ name, id.int() });

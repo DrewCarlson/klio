@@ -9629,6 +9629,28 @@ fn astArgLambdaArity(arg: *const Expr) ?u8 {
 /// not statically decidable. Declared-type evidence is additive-only in
 /// the scorer: it can promote a head-matching candidate but never
 /// disqualify one.
+/// Head-only `TypeRef`s for a lambda literal's ANNOTATED parameters, or null
+/// when it annotates none. Only the head matters: the consumer refutes on a
+/// definite mismatch and stays silent otherwise.
+fn lambdaDeclaredParamTypes(b: *FuncBuilder, arg: *const Expr) ?[]const ir.TypeRef {
+    if (arg.* != .Lambda) return null;
+    const tys = arg.Lambda.param_tys;
+    if (tys.len == 0) return null;
+    var any = false;
+    for (tys) |t| {
+        if (t != null) any = true;
+    }
+    if (!any) return null;
+    const out = b.allocator.alloc(ir.TypeRef, tys.len) catch return null;
+    for (tys, out) |t, *o| {
+        o.* = if (t) |ast_ty|
+            .{ .name = ast_ty.name.name, .nullable = ast_ty.nullable, .args = &.{} }
+        else
+            .{ .name = "", .nullable = false, .args = &.{} };
+    }
+    return out;
+}
+
 fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicability.ArgShape {
     const lazy_ty = argDeclTypeRefLazy(b, arg);
     const ty = argDeclTypeRef(b, arg);
@@ -9653,6 +9675,10 @@ fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) applicabi
         } else null,
         .ty = ty,
         .ty_authoritative = lazy_ty != null,
+        // Explicitly annotated lambda parameters are programmer-stated types,
+        // and kotlinc drops a candidate whose function parameter cannot accept
+        // them.
+        .lambda_param_types = lambdaDeclaredParamTypes(b, arg),
     };
     if (runtime.envSetOnce("KLIO_ARGSHAPE_UNK") and
         sh.ty == null and sh.literal_kind == null and !sh.is_lambda)
