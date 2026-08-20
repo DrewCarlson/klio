@@ -688,6 +688,16 @@ internal fun parseFixedOffsetSeconds(id: String): Int? {
     return parseOffsetSecondsOrNull(s)
 }
 
+// The ISO-8601 offset SPELLING `UtcOffset.parse` accepts: `+HH`, `+HH:MM` or
+// `+HH:MM:SS`, each component exactly two digits. The separator-less forms a
+// time-zone ID may carry (`+0100`) are not offsets on their own.
+internal fun parseIsoOffsetSecondsOrNull(body: String): Int? {
+    if (body.length != 3 && body.length != 6 && body.length != 9) return null
+    if (body.length > 3 && body[3] != ':') return null
+    if (body.length > 6 && body[6] != ':') return null
+    return parseOffsetSecondsOrNull(body)
+}
+
 // ISO-8601 UTC offset body: a mandatory sign, then `HH`, `HH:MM`/`HHMM`, or
 // `HH:MM:SS`/`HHMMSS` — each component exactly two digits, minutes and
 // seconds under 60, and the whole offset within +/-18:00.
@@ -827,7 +837,10 @@ class UtcOffset internal constructor(val totalSeconds: Int) {
         fun parse(input: CharSequence): UtcOffset {
             val s = input.toString()
             if (s == "Z" || s == "z") return ZERO
-            val secs = parseFixedOffsetSeconds(s)
+            // The ISO-8601 offset grammar only: a time-zone ID prefix
+            // (`UTC`, `GMT`, `UT`) and the separator-less compact forms
+            // (`+0100`, `+180000`) are `TimeZone.of`'s, not this one's.
+            val secs = parseIsoOffsetSecondsOrNull(s)
                 ?: throw DateTimeFormatException("Invalid ISO-8601 UTC offset: $input")
             if (secs < -18 * 3600 || secs > 18 * 3600)
                 throw DateTimeFormatException("UTC offset out of range: $input")
