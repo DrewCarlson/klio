@@ -615,6 +615,52 @@ is at zero.
       `KLIO_RLP_TRACE` and `KLIO_SHADOW_TRACE` are already taken, though, so
       a reused key mixes with an existing site's output.)
 
+### Open: vararg receiver-lambda literals lose their receiver (RFC_1123)
+
+Two or more receiver-lambda LITERALS passed to a vararg lose `this`:
+
+    fun f(vararg blocks: Sink.() -> Unit): String {
+        val s = Sink(); for (b in blocks) b(s); return s.out.toString()
+    }
+    f({ emit("A") })                  // "A"      — works
+    f(b1, b2)                         // "AB"     — works (pre-typed vals)
+    f({ emit("A") }, { emit("B") })   // Vm::get_field `out` on `kotlin.Unit`
+
+This is what fails RFC_1123: kotlinx-datetime's
+`alternativeParsing(vararg others: T.() -> Unit, primary: T.() -> Unit)`
+carries the optional day-of-week and the alternative offsets, so
+`'Sun, 06 Nov 1994 08:49:37 +0300'` fails to parse at position 0 ("at least
+one digit for day") and position 26 ("Expected UT but got +"). Roughly ten
+datetime failures sit behind it, concentrated in
+`DateTimeComponentsSamples` (10 of that file's 25 cases).
+
+A REAL GAP WAS FOUND AND FILLING IT CHANGED NOTHING.
+`recordLambdaArgReceiversForCallReceiver` handles exactly two shapes —
+trailing-lambda with `args.len <= params.len`, and `args.len == params.len`.
+A vararg call with two literals matches NEITHER (two arguments never equal
+one declared parameter), so neither literal is recorded; one literal works
+only because it is also the trailing argument. A vararg branch was added
+(walking the vararg's argument run, then the parameters that follow it) and
+verified to compute the right answer:
+
+    [varecv] f nargs=2 nparams=1 [blocks vararg=true ty=Function0 recv=Sink args=<Sink><Unit>]
+
+Note the lowered vararg parameter carries the ELEMENT type directly
+(`Function0`), not a materialized array, so `varargElementRef` is the wrong
+accessor here — use the parameter type as-is.
+
+With both literals recorded and `recv=Sink`, the program STILL fails, and
+datetime (55), coroutines (104) and the stdlib sweep (0/117) are all
+unmoved. So the receiver is dropped DOWNSTREAM of the recording, and the
+recorder gap — though genuine — is masked by it. Reverted rather than ship
+an unmeasured change to a core path; re-apply it once the downstream drop is
+fixed. This is the second independent confirmation of that conclusion: an
+earlier attempt recorded the same receivers through a different helper in
+`lowerCallGeneral` and also changed nothing.
+
+Next place to look: why a NON-TRAILING lambda argument's recorded receiver
+does not reach `lowerLambda`, given a trailing one's does.
+
 ### Open: an inline MEMBER called bare inside a receiver-lambda
 
 `ValueClassListTest.string` still fails, and it is the reason the file
