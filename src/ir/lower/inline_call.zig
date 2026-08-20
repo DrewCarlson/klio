@@ -945,6 +945,19 @@ fn unifyParamAgainstArg(
         }
         return;
     }
+    // The parameter IS a type parameter (`cause: T`). Its argument's own type
+    // solves it whenever that type is statically evident — a constructor call
+    // is the shape that matters (`testUpstreamError(TimeoutCancellationException(""))`
+    // binds `T = TimeoutCancellationException`). Positive proof only: a call
+    // that is not a constructor says nothing about `T` here.
+    if (param_ty.type_args.len == 0 and param_ty.function == null and
+        tp_names.contains(param_ty.name.name) and !subst.contains(param_ty.name.name))
+    {
+        if (ctorArgTypeRef(allocator, arg, bb)) |aty| {
+            try subst.put(param_ty.name.name, aty.*);
+            return;
+        }
+    }
     if (param_ty.type_args.len != 0) {
         var mentions_tp = false;
         for (param_ty.type_args) |*ta| {
@@ -965,6 +978,43 @@ fn unifyParamAgainstArg(
             try unifyTypeParam(param_ty, sup, tp_names, subst);
         }
     }
+}
+
+/// The class an argument CONSTRUCTS, as a `TypeRef` — the one argument shape
+/// whose type is evident without a type checker. `Foo(...)` names `Foo` when
+/// `Foo` resolves to a class; anything else (a factory function, a variable,
+/// a member call) stays unproven and returns null.
+fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilder) ?*const TypeRef {
+    const call = switch (arg.*) {
+        .Call => |*c| c,
+        else => return null,
+    };
+    const path = switch (call.callee.*) {
+        .Path => |*p| p,
+        else => return null,
+    };
+    if (path.segments.len == 0) return null;
+    const head = path.segments[path.segments.len - 1];
+    if (head.name.len == 0 or !std.ascii.isUpper(head.name[0])) return null;
+    const b = bb orelse return null;
+    if (b.module.classId(head.name) == null and
+        b.module.classIdIndexed(head.name, b.self_package, head.span.file) == null) return null;
+    const targs = allocator.alloc(ast.TypeArg, call.type_args.len) catch return null;
+    for (call.type_args, 0..) |ta, i| {
+        targs[i] = .{ .variance = .Invariant, .is_star = false, .ty = ta, .span = ta.span };
+    }
+    const out = allocator.create(TypeRef) catch return null;
+    out.* = .{
+        .name = head,
+        .nullable = false,
+        .span = head.span,
+        .type_args = targs,
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    return out;
 }
 
 /// The supertype of the class/object an argument path names whose head equals

@@ -197,6 +197,7 @@ Run any program with:
 | `serializer_generic_type_args.kt` | `serializer(...)` on a generic `@Serializable` class takes one serializer per type argument, which decides each type-parameter element's descriptor and separates otherwise identical descriptors. |
 | `interface_delegation_defaults.kt` | `class W(d: I) : I by d` forwards every member the class does not override, including ones the interface gives a default body, while a real `override` still wins. |
 | `member_extension_untyped_receiver.kt` | A member extension stays in scope for a receiver whose static type the call site never names — read through an interface, a chain, or a generic. |
+| `reified_type_param_forwarding.kt` | A `reified` type parameter binds from an argument's own type with no explicit `<T>`, and stays bound when the body forwards it as another reified call's type argument. |
 | `companion_member_extension.kt` | Extension properties on a companion object declared as members of another class, `private` and public, on a user class and on a builtin's companion. |
 | `serial_descriptor_shape.kt`   | The `SerialDescriptor` a `@Serializable` class reports: element names, which elements are optional (their constructor parameter has a default), and each element's own descriptor. |
 | `interface_companion_state.kt` | Shared companion-object state on an interface.              |

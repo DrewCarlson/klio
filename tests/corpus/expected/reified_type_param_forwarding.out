@@ -1,0 +1,10 @@
+Dog/true/rex
+Cat/true/mia
+Animal/true/mia
+IllegalStateException expected=true matched=true
+IllegalArgumentException expected=true matched=false
+IllegalArgumentException expected=true matched=false
+Dog,String,Int
+truefalsetrue
+rex,mia
+s,7
