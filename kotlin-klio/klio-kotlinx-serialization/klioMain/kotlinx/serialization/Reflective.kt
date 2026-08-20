@@ -61,6 +61,9 @@ internal fun __klsx_ctorParamTypes(kClass: Any?): List<String> =
 internal fun __klsx_typeParamNames(kClass: Any?): List<String> =
     error("intrinsic kotlinx.serialization.__klsx_typeParamNames not installed")
 
+internal fun __klsx_ctorParamClasses(kClass: Any?): List<Any?> =
+    error("intrinsic kotlinx.serialization.__klsx_ctorParamClasses not installed")
+
 internal fun __klsx_ctorParamOptional(kClass: Any?): List<Boolean> =
     error("intrinsic kotlinx.serialization.__klsx_ctorParamOptional not installed")
 
@@ -207,7 +210,11 @@ internal class ReflectiveDescriptor(
     // The declaration's type-parameter names paired with the serializer given
     // for each, when the descriptor was built by a generic `serializer(...)`.
     private val typeParamNames: List<String> = emptyList(),
-    private val typeArgs: List<KSerializer<Any?>> = emptyList()
+    private val typeArgs: List<KSerializer<Any?>> = emptyList(),
+    // The class each element's declared type names, where it names one. An
+    // element declared as another `@Serializable` class reports that class's
+    // own descriptor, which is where its annotations and elements live.
+    private val elementClasses: List<Any?> = emptyList()
 ) : SerialDescriptor {
     override val kind: SerialKind get() = StructureKind.CLASS
     override val elementsCount: Int get() = names.size
@@ -242,6 +249,16 @@ internal class ReflectiveDescriptor(
         if (at >= 0 && at < typeArgs.size) {
             val d = typeArgs[at].descriptor
             return if (nullable) d.nullable else d
+        }
+        if (index < elementClasses.size) {
+            val cls = elementClasses[index]
+            if (cls is KClass<*>) {
+                val s = __klsx_generatedSerializer(cls)
+                if (s != null) {
+                    val d = s.descriptor
+                    return if (nullable) d.nullable else d
+                }
+            }
         }
         return descriptorForDeclaredType(declared)
     }
@@ -365,7 +382,8 @@ public class ReflectiveKSerializer(
             __klsx_ctorParamOptional(kClass),
             kClass,
             __klsx_typeParamNames(kClass),
-            typeArgs
+            typeArgs,
+            __klsx_ctorParamClasses(kClass)
         )
 
     override fun serialize(encoder: Encoder, value: Any?) {

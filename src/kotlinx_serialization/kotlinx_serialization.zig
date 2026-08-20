@@ -74,6 +74,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("kotlinx.serialization.__klsx_paramAnnotations", paramAnnotations);
     try b.register("kotlinx.serialization.__klsx_ctorParamTypes", ctorParamTypes);
     try b.register("kotlinx.serialization.__klsx_typeParamNames", typeParamNames);
+    try b.register("kotlinx.serialization.__klsx_ctorParamClasses", ctorParamClasses);
     try b.register("kotlinx.serialization.__klsx_ctorParamOptional", ctorParamOptional);
     try b.register("kotlinx.serialization.__klsx_get", propGet);
     try b.register("kotlinx.serialization.__klsx_construct", construct);
@@ -650,6 +651,69 @@ fn ctorParamTypes(ctx: *CallCtx) Error!EvalResult {
         .enum_entries = false,
         .backing = null,
     }));
+}
+
+/// The class each primary-constructor property's declared type names, in the
+/// same order as `__klsx_ctorParamNames`, or null where the type is a
+/// primitive, a type parameter, or names nothing the runtime knows. This is
+/// what lets a descriptor report an element's REAL descriptor rather than the
+/// neutral one — an element declared as another `@Serializable` class is
+/// described by that class's own serializer.
+fn ctorParamClasses(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("__klsx_ctorParamClasses: expected a class");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return typeErr("__klsx_ctorParamClasses: expected a class");
+    defer cls_ref.deinit();
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (cls_ref.asPtr().primary_params) |p| {
+        if (p.property == null) continue;
+        // The HEAD of the declared type: `List<Foo>` names `List`, which is
+        // not itself a serializable declaration, so only a bare head resolves.
+        const head: ?[]const u8 = if (p.declared_shape) |shape|
+            (if (shape.args.len == 0) shape.name else null)
+        else
+            p.declared_type;
+        const resolved: Value = blk: {
+            const h = head orelse break :blk .Null;
+            const v = siblingClassNamed(cls_ref.asPtr(), h, ctx) orelse break :blk .Null;
+            // An `object` resolves to its singleton; the descriptor needs the
+            // declaration itself.
+            if (v == .Instance) {
+                const cls2 = classOf(&v) orelse break :blk .Null;
+                defer cls2.deinit();
+                if (!cls2.asPtr().is_object) break :blk .Null;
+                break :blk .{ .Class = cls2.clone() };
+            }
+            break :blk v;
+        };
+        try items.append(a, resolved);
+    }
+    return ok(try Value.newList(a, .{
+        .items = try ValueList.init(a, items),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    }));
+}
+
+/// Resolve a type name written inside `owner`'s declaration, Kotlin-style:
+/// the enclosing scopes from innermost outward, then the bare name. A
+/// declaration nested beside the owner (`class Outer { class A; class B(val
+/// a: A) }`) is written unqualified but registered under its qualified name,
+/// and resolving the bare name first would reach an unrelated same-named
+/// declaration — `Result` beside `kotlin.Result` being the case that matters.
+fn siblingClassNamed(owner: *const ClassDef, name: []const u8, ctx: *CallCtx) ?Value {
+    var scope = owner.fqn;
+    var hops: u8 = 0;
+    while (hops < 16) : (hops += 1) {
+        const dot = std.mem.lastIndexOfScalar(u8, scope, '.') orelse break;
+        scope = scope[0..dot];
+        var buf: [512]u8 = undefined;
+        const probe = std.fmt.bufPrint(&buf, "{s}.{s}", .{ scope, name }) catch break;
+        if (resolveClass(probe, ctx)) |v| return v;
+    }
+    return resolveClass(name, ctx);
 }
 
 /// The declaration's type-parameter names in declaration order, so a caller
@@ -1427,7 +1491,7 @@ test "hostBindings registers every serialization symbol" {
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classSerialNameOverride") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classAnnotations") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_paramAnnotations") != null);
-    try testing.expectEqual(@as(usize, 17), b.len());
+    try testing.expectEqual(@as(usize, 18), b.len());
 }
 
 test "renderShape round-trips nullability and generic args" {

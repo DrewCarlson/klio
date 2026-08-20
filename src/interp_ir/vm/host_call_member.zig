@@ -3909,6 +3909,14 @@ pub fn prepareVirtualFlatCall(
         if (vtrace) std.debug.print("[vflat] decline non-instance {s}\n", .{@tagName(std.meta.activeTag(receiver.*))});
         return null;
     }
+    // A delegating receiver re-decides an interface-declared slot (see
+    // `invokeVirtualMember`); decline so the call takes that route.
+    if (virtualSlotInterfaceMember(self, slot)) |name| {
+        if (interfaceDelegateFor(self, allocator, receiver.Instance, name) != null) {
+            if (vtrace) std.debug.print("[vflat] decline delegated {s}\n", .{name});
+            return null;
+        }
+    }
     const target = blk: {
         const instance = receiver.Instance.borrow();
         defer instance.deinit();
@@ -3984,6 +3992,13 @@ pub fn prepareResolvedFlatCall(
         const f = funcAt(module, fid) orelse return null;
         if (!f.hasBody()) return null;
     }
+    // A delegating receiver re-decides an interface-declared target (see
+    // `invokeResolvedMember`); decline so the call takes that route.
+    if (receiver.* == .Instance) {
+        if (resolvedMemberName(self, fid)) |name| {
+            if (interfaceDelegateFor(self, allocator, receiver.Instance, name) != null) return null;
+        }
+    }
     return prepareFlatFromFid(self, allocator, receiver, args, fid);
 }
 
@@ -4049,6 +4064,18 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // A function-typed property shadowed by a same-named vararg method: invoke
     // the property when the call's argument shape matches it (see the helper).
     if (try varargShadowedFieldInvoke(self, allocator, receiver, name, args)) |r| return r;
+    // A member of a `by`-delegated interface the class does not override is
+    // the delegate's, even when the interface supplies a default body — the
+    // ladder below would reach that default first.
+    if (receiver.* == .Instance and !strict_ext and !no_ext) {
+        if (interfaceDelegateFor(self, allocator, receiver.Instance, name)) |d| {
+            const r = try callMemberRec(self, allocator, &d, name, args);
+            switch (r) {
+                .ok => return r,
+                .err => |e| if (e != .Unimplemented) return r else freeDispatchMiss(allocator, r),
+            }
+        }
+    }
     runtime.prof.opRoute(15);
 
     // Fast path: a previously-resolved zero-arg user instance method bypasses the
@@ -7660,6 +7687,22 @@ pub fn invokeResolvedMember(
     args: []const Value,
     arg_names: []const ?[]const u8,
 ) Allocator.Error!EvalResult {
+    // Lowering resolves a member the receiver's class does not declare to the
+    // implementation it inherits — for a `by`-delegated interface that is the
+    // interface's own default body, but Kotlin routes it to the delegate. The
+    // static identity is only correct for a class that actually inherits the
+    // member, so re-decide it here for a delegating receiver.
+    if (receiver.* == .Instance) {
+        if (resolvedMemberName(self, fid)) |name| {
+            if (interfaceDelegateFor(self, allocator, receiver.Instance, name)) |d| {
+                const r = try callMemberRec(self, allocator, &d, name, args);
+                switch (r) {
+                    .ok => return r,
+                    .err => |e| if (e != .Unimplemented) return r else freeDispatchMiss(allocator, r),
+                }
+            }
+        }
+    }
     // A member-extension needs its declaring class's `this` seeded as an
     // enclosing receiver before the body runs; a plain member binds
     // `[receiver] ++ args` directly.
@@ -8278,6 +8321,21 @@ pub fn invokeVirtualMember(
         argbuf[0] = receiver.*;
         @memcpy(argbuf[1..], args);
         return dispatchIntrinsic(self, allocator, member_fqn, native, argbuf);
+    }
+    // A `by`-delegated interface member the class does not override belongs
+    // to the delegate. The slot resolves against the class hierarchy, which
+    // for a defaulted interface member lands on the interface's own body —
+    // Kotlin routes it to the delegate instead.
+    if (receiver.* == .Instance) {
+        if (virtualSlotInterfaceMember(self, slot)) |name| {
+            if (interfaceDelegateFor(self, allocator, receiver.Instance, name)) |d| {
+                const r = try callMemberNamed(self, allocator, &d, name, args, arg_names_in);
+                switch (r) {
+                    .ok => return r,
+                    .err => |e| if (e != .Unimplemented) return r else freeDispatchMiss(allocator, r),
+                }
+            }
+        }
     }
     // Named arguments folded into `arg_params` at lowering must survive a
     // BY-NAME fallback (an unlinked slot, a bodyless target): derive the
@@ -9317,6 +9375,38 @@ fn instanceIntrinsicCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceM
         e.* = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .state = 1, .gen = cacheGen(), .entry = h };
     }
     return hit;
+}
+
+/// The member name a virtual slot stands for, but ONLY when the slot's root
+/// declaration belongs to an INTERFACE — the one case where a delegating
+/// receiver must re-decide the call.
+fn virtualSlotInterfaceMember(self: *VmHost, slot: MethodSlotId) ?[]const u8 {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    const root = FuncId.from(slot.int());
+    const sig = module.decl_sigs.get(root.int()) orelse return null;
+    const owner = sig.enclosing_class orelse return null;
+    if (owner.int() >= module.classes.items.len) return null;
+    if (!module.classes.items[owner.int()].is_interface) return null;
+    const f = module.funcById(root) orelse return null;
+    return f.name;
+}
+
+/// The member name a lowering-resolved target stands for, but ONLY when its
+/// declaring class is an interface — the one case where a delegating receiver
+/// must re-decide the call. Everything else answers null so the resolved
+/// identity runs untouched.
+fn resolvedMemberName(self: *VmHost, fid: FuncId) ?[]const u8 {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    const owner = declaringClassSimpleName(self, mod, fid) orelse return null;
+    const cid = mod.classId(owner) orelse return null;
+    if (cid.int() >= mod.classes.items.len) return null;
+    if (!mod.classes.items[cid.int()].is_interface) return null;
+    const f = mod.funcById(fid) orelse return null;
+    return f.name;
 }
 
 /// Simple name of the class that DECLARES `fid` in `module`'s class table,
@@ -10540,6 +10630,145 @@ fn delegateForward(self: *VmHost, allocator: Allocator, receiver: *const Value, 
 /// hierarchy. Returns `null` when the interface cannot be resolved (the
 /// caller keeps the legacy forward-anything behavior), `true`/`false`
 /// when membership is decidable.
+/// The delegate a `by` clause makes responsible for `name`, or null when the
+/// receiver answers it itself.
+///
+/// Kotlin generates a forwarding member for EVERY member of a delegated
+/// interface the class does not override — including members the interface
+/// supplies a default body for. Resolution reaches an inherited default first,
+/// so without this the default runs against the wrapper and the delegate is
+/// never consulted (`SerialDescriptor.annotations` has a default body, and a
+/// `ContextDescriptor(original) : SerialDescriptor by original` reported the
+/// empty default instead of the wrapped descriptor's annotations).
+pub fn interfaceDelegateFor(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), name: []const u8) ?Value {
+    var has_delegate = false;
+    {
+        const g = inst.borrow();
+        defer g.deinit();
+        for (g.get().fields.items) |f| {
+            if (std.mem.startsWith(u8, f.name, "__delegate__")) {
+                has_delegate = true;
+                break;
+            }
+        }
+    }
+    if (!has_delegate) return null;
+    // A member the receiver's own class chain declares is not forwarded —
+    // that is exactly the `override` the compiler skips generating for.
+    if (concreteChainDeclares(self, allocator, inst, name)) return null;
+    const g = inst.borrow();
+    defer g.deinit();
+    for (g.get().fields.items) |f| {
+        if (!std.mem.startsWith(u8, f.name, "__delegate__")) continue;
+        const iface = f.name["__delegate__".len..];
+        if (delegatedInterfaceDeclares(self, allocator, inst, iface, name) != true) continue;
+        return f.value;
+    }
+    return null;
+}
+
+/// Whether the anon-method table holds a member `name` for `class_name`, at
+/// any arity or as an accessor. Entries are keyed `class\x1fname#arity` and
+/// `class\x1fname`, so a prefix scan answers "declared at all".
+fn anonClassDeclares(self: *VmHost, allocator: Allocator, class_name: []const u8, name: []const u8) bool {
+    const tbl = self.anon_methods.borrow();
+    defer tbl.deinit();
+    if (tbl.get().count() == 0) return false;
+    var kb: [256]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&kb, "{s}\u{1f}{s}", .{ class_name, name }) catch {
+        const p = anonKey(allocator, class_name, name) catch return false;
+        defer allocator.free(p);
+        return anonTableHasPrefix(tbl.get(), p);
+    };
+    return anonTableHasPrefix(tbl.get(), prefix);
+}
+
+fn anonTableHasPrefix(tbl: anytype, prefix: []const u8) bool {
+    if (tbl.get(prefix) != null) return true;
+    var it = tbl.keyIterator();
+    while (it.next()) |k| {
+        if (!std.mem.startsWith(u8, k.*, prefix)) continue;
+        // Either an exact hit or the `name#arity` form — never a longer name.
+        if (k.len == prefix.len or k.*[prefix.len] == '#') return true;
+    }
+    return false;
+}
+
+/// Whether the receiver's own CLASS chain (never its interfaces) declares
+/// `name`. An interface's own body is exactly what a `by` clause replaces; a
+/// class's is an `override`, which the compiler honours over the delegate.
+fn concreteChainDeclares(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), name: []const u8) bool {
+    {
+        const g = inst.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        for (cg.get().primary_params) |*p| {
+            if (p.property != null and std.mem.eql(u8, p.name, name)) return true;
+        }
+        for (cg.get().body_properties) |*p| {
+            if (std.mem.eql(u8, p.name, name)) return true;
+        }
+    }
+    // An anonymous / local class keeps its members in the anon-method table
+    // rather than on its `ClassDef`, and `object : I by d { override … }` is
+    // the shape that most often carries the override.
+    {
+        const g = inst.borrow();
+        const cg = g.get().class.borrow();
+        const class_name = cg.get().name;
+        const is_anon = cg.get().is_anonymous;
+        const found = is_anon and anonClassDeclares(self, allocator, class_name, name);
+        cg.deinit();
+        g.deinit();
+        if (found) return true;
+    }
+    const cls = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        break :blk g.get().class.clone();
+    };
+    defer cls.deinit();
+    if (ClassDef.findMethod(cls, allocator, name)) |hit| {
+        const cg = hit.class.borrow();
+        const from_class = !cg.get().is_interface;
+        cg.deinit();
+        hit.class.deinit();
+        if (from_class) return true;
+    }
+    // The runtime class def carries only what the class body lowered; the
+    // module's class table is the authority on which declaration owns a
+    // method, so walk the CLASS supertypes there too.
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    var cur: ?ir.ClassId = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk module.classIdByFqn(cg.get().fqn) orelse module.classId(cg.get().name);
+    };
+    var hops: u8 = 0;
+    while (cur) |cid| : (hops += 1) {
+        if (hops > ClassDef.MAX_WALK or cid.int() >= module.classes.items.len) break;
+        const c = &module.classes.items[cid.int()];
+        if (c.is_interface) break;
+        for (c.methods) |mfid| {
+            const f = module.funcById(mfid) orelse continue;
+            if (std.mem.eql(u8, f.name, name)) return true;
+        }
+        cur = null;
+        for (c.supertypes) |sid| {
+            if (sid.int() >= module.classes.items.len) continue;
+            if (module.classes.items[sid.int()].is_interface) continue;
+            cur = sid;
+            break;
+        }
+    }
+    return false;
+}
+
 pub fn delegatedInterfaceDeclares(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), iface_name_raw: []const u8, name: []const u8) ?bool {
     // The key carries the source-spelled supertype; strip generic args
     // (`Continuation<T>` -> `Continuation`).
@@ -11935,6 +12164,17 @@ fn callMemberNamedInner(self: *VmHost, allocator: Allocator, receiver: *const Va
     // `recvFnFieldInvoke` on the static ladder): the stored lambda runs
     // with the owning instance as its receiver.
     if (try recvFnFieldInvoke(self, allocator, receiver, name, args)) |r| return r;
+    // A member of a `by`-delegated interface the class does not override
+    // belongs to the delegate, defaulted interface bodies included.
+    if (receiver.* == .Instance and !strict_ext and !no_ext) {
+        if (interfaceDelegateFor(self, allocator, receiver.Instance, name)) |d| {
+            const r = try callMemberNamed(self, allocator, &d, name, args, arg_names_in);
+            switch (r) {
+                .ok => return r,
+                .err => |e| if (e != .Unimplemented) return r else freeDispatchMiss(allocator, r),
+            }
+        }
+    }
     // A member `invoke` whose only named arguments are plugin-synthetic
     // (`$composer = c, $changed = n`): the names were emitted against a
     // transformed closure's literal parameter names, but a memo-wrapped
