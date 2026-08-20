@@ -82,6 +82,8 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("kotlinx.serialization.__klsx_isSerializable", isSerializable);
     try b.register("kotlinx.serialization.__klsx_isEnum", isEnumClass);
     try b.register("kotlinx.serialization.__klsx_enumValues", enumEntryValues);
+    try b.register("kotlinx.serialization.__klsx_enumEntryAnnotations", enumEntryAnnotations);
+    try b.register("kotlinx.serialization.__klsx_enumEntrySerialNames", enumEntrySerialNames);
     // JSON format: reflective encode (runtime-value driven) and
     // type-driven decode (guided by each ctor param's declared type).
     try b.register("kotlinx.serialization.json.__klsx_jsonEncode", jsonEncode);
@@ -895,6 +897,48 @@ fn paramAnnotations(ctx: *CallCtx) Error!EvalResult {
     return ok(try annotationInstanceList(ctx, &.{}));
 }
 
+/// The `@SerialInfo` annotations applied to the enum entry at `index`.
+fn enumEntryAnnotations(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return typeErr("__klsx_enumEntryAnnotations: expected a class and an index");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return ok(try annotationInstanceList(ctx, &.{}));
+    defer cls_ref.deinit();
+    const want: i64 = switch (ctx.args[1]) {
+        .Int => |i| i,
+        .Long => |l| l,
+        else => return typeErr("__klsx_enumEntryAnnotations: index must be Int"),
+    };
+    const entries = cls_ref.asPtr().enum_entries;
+    if (want < 0 or want >= entries.len) return ok(try annotationInstanceList(ctx, &.{}));
+    return ok(try annotationInstanceList(ctx, entries[@intCast(want)].annotation_records));
+}
+
+/// The WIRE name of each enum entry: its `@SerialName` when it carries one,
+/// otherwise the declared entry name.
+fn enumEntrySerialNames(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("__klsx_enumEntrySerialNames: expected a class");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return typeErr("__klsx_enumEntrySerialNames: expected a class");
+    defer cls_ref.deinit();
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (cls_ref.asPtr().enum_entries) |entry| {
+        var wire: []const u8 = entry.name;
+        for (entry.annotation_records) |*rec| {
+            if (rec.is("kotlinx.serialization.SerialName") or rec.is("SerialName")) {
+                if (rec.stringArg("value")) |s| wire = s;
+            }
+        }
+        try items.append(a, .{ .String = try runtime.strInit(a, wire) });
+    }
+    return ok(try Value.newList(a, .{
+        .items = try ValueList.init(a, items),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    }));
+}
+
 /// The value of a `@SerialName("...")` on the CLASS itself, or null when it
 /// carries none. kotlinx's default serial name is the qualified class name;
 /// the annotation replaces it wholesale.
@@ -1383,7 +1427,7 @@ test "hostBindings registers every serialization symbol" {
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classSerialNameOverride") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classAnnotations") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_paramAnnotations") != null);
-    try testing.expectEqual(@as(usize, 15), b.len());
+    try testing.expectEqual(@as(usize, 17), b.len());
 }
 
 test "renderShape round-trips nullability and generic args" {

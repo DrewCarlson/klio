@@ -20,6 +20,7 @@
 package kotlinx.serialization
 
 import kotlin.reflect.KClass
+import kotlinx.serialization.internal.EnumDescriptor
 import kotlinx.serialization.internal.EnumSerializer
 import kotlinx.serialization.internal.ObjectSerializer
 import kotlinx.serialization.builtins.serializer
@@ -72,6 +73,12 @@ internal fun __klsx_isEnum(kClass: Any?): Boolean =
 internal fun __klsx_enumValues(kClass: Any?): List<Any?> =
     error("intrinsic kotlinx.serialization.__klsx_enumValues not installed")
 
+internal fun __klsx_enumEntryAnnotations(kClass: Any?, index: Int): List<Annotation> =
+    error("intrinsic kotlinx.serialization.__klsx_enumEntryAnnotations not installed")
+
+internal fun __klsx_enumEntrySerialNames(kClass: Any?): List<String> =
+    error("intrinsic kotlinx.serialization.__klsx_enumEntrySerialNames not installed")
+
 // One generated serializer per declaration, as the plugin's generated
 // `Companion.serializer()` provides: `serializer()` called twice on the same
 // class must return the same instance.
@@ -120,12 +127,43 @@ internal fun __klsx_generatedSerializerGeneric(
 @Suppress("UNCHECKED_CAST")
 private fun __klsx_buildSerializer(kClass: KClass<*>): KSerializer<Any> {
     val serialName = __klsx_serialName(kClass)
+    // Every shape below reports the declaration's `@SerialInfo` annotations on
+    // its descriptor, which is what the plugin passes to each of these.
+    val declAnnotations = __klsx_classAnnotations(kClass).toTypedArray()
     val objectInstance = kClass.objectInstance
     if (objectInstance != null) {
-        return ObjectSerializer(serialName, objectInstance) as KSerializer<Any>
+        return ObjectSerializer(serialName, objectInstance, declAnnotations) as KSerializer<Any>
     }
     if (__klsx_isEnum(kClass)) {
-        return EnumSerializer(serialName, __klsx_enumValues(kClass).toTypedArray()) as KSerializer<Any>
+        // The entry wire names and the `@SerialInfo` annotations on the class
+        // and on each entry are exactly what the plugin passes here.
+        val values = __klsx_enumValues(kClass).toTypedArray()
+        val wire = __klsx_enumEntrySerialNames(kClass)
+        val classAnnotations = __klsx_classAnnotations(kClass)
+        val entryAnnotations = ArrayList<List<Annotation>>()
+        var annotated = false
+        var i = 0
+        while (i < values.size) {
+            val anns = __klsx_enumEntryAnnotations(kClass, i)
+            if (anns.isNotEmpty()) annotated = true
+            entryAnnotations.add(anns)
+            i = i + 1
+        }
+        if (!annotated && classAnnotations.isEmpty()) {
+            return EnumSerializer(serialName, values) as KSerializer<Any>
+        }
+        // Same shape as upstream's `createAnnotatedEnumSerializer`, built here
+        // because the entry names and annotations come from the declaration
+        // rather than from plugin-emitted arrays.
+        val descriptor = EnumDescriptor(serialName, values.size)
+        for (a in classAnnotations) descriptor.pushClassAnnotation(a)
+        i = 0
+        while (i < values.size) {
+            descriptor.addElement(if (i < wire.size) wire[i] else "$i")
+            for (a in entryAnnotations[i]) descriptor.pushAnnotation(a)
+            i = i + 1
+        }
+        return EnumSerializer(serialName, values, descriptor) as KSerializer<Any>
     }
     if (kClass.isSealed) {
         val subclasses = ArrayList<KClass<*>>()
@@ -139,11 +177,12 @@ private fun __klsx_buildSerializer(kClass: KClass<*>): KSerializer<Any> {
             serialName,
             kClass as KClass<Any>,
             subclasses.toTypedArray() as Array<KClass<out Any>>,
-            subSerializers.toTypedArray() as Array<KSerializer<out Any>>
+            subSerializers.toTypedArray() as Array<KSerializer<out Any>>,
+            declAnnotations
         ) as KSerializer<Any>
     }
     if (kClass.isAbstract) {
-        return PolymorphicSerializer(kClass as KClass<Any>) as KSerializer<Any>
+        return PolymorphicSerializer(kClass as KClass<Any>, declAnnotations) as KSerializer<Any>
     }
     return ReflectiveKSerializer(kClass) as KSerializer<Any>
 }

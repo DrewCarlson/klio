@@ -145,7 +145,14 @@ pub const ClassDef = struct {
     resolve_cid: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// One eager enum entry: its name and the `Value::Instance` for it.
-    pub const EnumEntry = struct { name: []const u8, value: Value };
+    pub const EnumEntry = struct {
+        name: []const u8,
+        value: Value,
+        /// Annotations written on the entry declaration, with their arguments.
+        /// A reflective consumer reports these per element the way the class's
+        /// own `annotation_records` are reported for the declaration.
+        annotation_records: []const AnnotationRecord = &.{},
+    };
     /// One nested class binding: simple name -> resolved `ClassDef`.
     pub const NestedClass = struct { name: []const u8, class: ObjRef(ClassDef) };
 

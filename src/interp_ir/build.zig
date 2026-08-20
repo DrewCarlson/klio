@@ -3436,7 +3436,16 @@ fn buildModuleWithOverrides(
                 .identity = id,
                 .native_state = null,
             });
-            try entries.append(a, .{ .name = entry.name.name, .value = .{ .Instance = inst } });
+            const entry_annotations = blk: {
+                const recs = try a.alloc(runtime.AnnotationRecord, entry.annotations.len);
+                for (entry.annotations, recs) |*ann, *rec| rec.* = try annotationRecordFor(module, a, ann);
+                break :blk recs;
+            };
+            try entries.append(a, .{
+                .name = entry.name.name,
+                .value = .{ .Instance = inst },
+                .annotation_records = entry_annotations,
+            });
 
             // Lower an init thunk per constructor slot: the entry's explicit
             // args, then default values for any trailing primary-ctor params

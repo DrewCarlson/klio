@@ -778,7 +778,7 @@ const ClassDefImage = struct {
     is_inner: bool,
     is_anonymous: bool,
     secondary_ctors: []const FF(ast.SecondaryCtor),
-    enum_entries: []struct { name: []const u8, value: ValueImage },
+    enum_entries: []struct { name: []const u8, value: ValueImage, annotation_records: []const runtime.AnnotationRecord },
     enclosing: ?u32,
     nested_classes: []struct { name: []const u8, idx: u32 },
     supertype_delegates: []DelegateImage,
@@ -1930,7 +1930,7 @@ fn classDefToImage(
     const entries = try a.alloc(EntryImage, cd.enum_entries.len);
     for (cd.enum_entries, 0..) |entry, i| {
         const v = (try valueToImage(a, def_index, entry.value)) orelse return false;
-        entries[i] = .{ .name = entry.name, .value = v };
+        entries[i] = .{ .name = entry.name, .value = v, .annotation_records = entry.annotation_records };
     }
 
     const NestedImage = @TypeOf(out.nested_classes[0]);
@@ -2449,7 +2449,7 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
             const entries = try a.alloc(ClassDef.EnumEntry, ci.enum_entries.len);
             for (ci.enum_entries, 0..) |entry, j| {
                 const v = (try valueFromImage(a, defs, entry.value)) orelse return false;
-                entries[j] = .{ .name = entry.name, .value = v };
+                entries[j] = .{ .name = entry.name, .value = v, .annotation_records = entry.annotation_records };
             }
             c.enum_entries = entries;
         }
