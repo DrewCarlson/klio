@@ -868,6 +868,23 @@ so the trigger is something further into the real builder chain (the private
 companion `Builder`, or `AppendableFormatStructure`) rather than the overload
 shape alone.
 
+### Open: `filterIsInstance<T>()` on an untyped receiver
+
+    val anns = someDescriptor.annotations       // inferred, cross-module type
+    anns.filterIsInstance<P>()                  // returns EVERY element
+
+Declaring the receiver (`val anns: List<Annotation> = …`) fixes it, and an
+element-wise `it is P` is correct either way, so the `is` check itself is
+sound — the reified `R` is what goes wrong. A reified type parameter can only
+be honoured by splicing, and with the receiver's static type unavailable the
+splice declines, leaving the body to read an unbound/stale `R` (the
+process-global reified slot). The explicit `<P>` at the call site should be
+enough on its own: nothing about the RECEIVER's type bears on binding `R`.
+
+Reached while writing `examples/inheritable_serial_info.kt`, which binds a
+typed local instead — that is idiomatic Kotlin and not the example's subject,
+but the underlying gap is real and unfixed.
+
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 
 7 failures read `bufferEnd` on `KlioBufferedChannel`. The tests cast the
