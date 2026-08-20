@@ -832,6 +832,42 @@ not on the call's own resolution, which is already known to succeed. Note the
 lowering is cached: clear `.klio-local/.klio/cache` before every trace run or the
 trace prints nothing.
 
+### Open: `secondFraction(n)` picks the defaulted overload
+
+Three datetime sample tests (`LocalTimeSamples.customFormat`,
+`LocalDateTimeSamples.customFormat`, `LocalDateSamples.toStringSample`) fail
+with `Check failed.` because a format built with `secondFraction(fixedLength =
+3)` prints all nine digits.
+
+`DateTimeFormatBuilder.WithTime` declares BOTH `secondFraction(minLength: Int =
+1, maxLength: Int = 9)` and `secondFraction(fixedLength: Int)` (whose default
+body delegates to the first). Kotlin binds a one-argument call to the
+one-parameter overload; klio binds it to the defaulted pair, so the argument
+lands in `minLength` and `maxLength` stays 9.
+
+Reduced as far as it goes:
+
+    LocalTime.Format { hour(); char('.'); secondFraction(3) }.format(t)
+    // 08.123456789   want 08.123
+
+  * the POSITIONAL form is wrong on EVERY call;
+  * the NAMED form (`fixedLength = 3`) is right for the first two invocations
+    of the whole process and wrong from the third on — including at a fresh
+    call site, so the flip is global, not per-site;
+  * `KLIO_BC=0`, `KLIO_JIT=0`, `KLIO_OPT=off`, `KLIO_COUNTED=0`,
+    `KLIO_MEMBER_SITE=0` and `KLIO_FLAT=0` all reproduce it, so it is neither
+    the bytecode tier, the loop JIT, nor the call-site memo;
+  * `KLIO_NU_TRACE=secondFraction` shows the pick moving from
+    `DateTimeFormatBuilder.WithTime.secondFraction#201` (params=2) to
+    `AbstractWithTimeBuilder.secondFraction#266` (params=3).
+
+Four user-code models of the shape — plain class, interface with a defaulted
+body, a bare call inside a builder receiver lambda, and the full
+`FormatBuilder<T, Self>` / nested-interface hierarchy — ALL resolve correctly,
+so the trigger is something further into the real builder chain (the private
+companion `Builder`, or `AppendableFormatStructure`) rather than the overload
+shape alone.
+
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 
 7 failures read `bufferEnd` on `KlioBufferedChannel`. The tests cast the
