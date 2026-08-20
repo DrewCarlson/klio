@@ -601,6 +601,35 @@ pub fn tyEvidenceBonusScoped(params: []const Param, args: []const ArgShape, scop
 
 /// Score one (param, arg) pair. Higher is better; null disqualifies the
 /// candidate. Value-dependent deltas are deferred to the scope callbacks.
+/// The declared VALUE parameter types of a lowered function type, or null when
+/// `ty` is not one. Encoding: `[#suspend?] [receiver?] params… ret [#markers]`.
+fn fnTypeValueParamRefs(ty: *const TypeRef) ?[]const TypeRef {
+    if (!std.mem.startsWith(u8, ty.name, "Function")) return null;
+    const want = std.fmt.parseInt(usize, ty.name["Function".len..], 10) catch return null;
+    var hi: usize = ty.args.len;
+    while (hi > 0 and ty.args[hi - 1].name.len != 0 and ty.args[hi - 1].name[0] == '#') hi -= 1;
+    if (hi == 0) return null;
+    var lo: usize = 0;
+    if (lo < hi and std.mem.eql(u8, ty.args[lo].name, "#suspend")) lo += 1;
+    hi -= 1;
+    if (hi < lo) return null;
+    var params = ty.args[lo..hi];
+    if (params.len > want) params = params[params.len - want ..];
+    return params;
+}
+
+fn builtinScalarHead(h: []const u8) bool {
+    const scalars = [_][]const u8{
+        "Int",  "Long",  "Short",  "Byte",   "Double",  "Float",
+        "UInt", "ULong", "UShort", "UByte",  "Boolean", "Char",
+        "String",
+    };
+    for (scalars) |sc| {
+        if (std.mem.eql(u8, h, sc)) return true;
+    }
+    return false;
+}
+
 fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape, scope: *const ApplicabilityScope) ?i32 {
     const nm = param_ty.name;
     const member = scope.member;
@@ -665,6 +694,27 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
     const is_bound_ref = !member and std.mem.startsWith(u8, v_ty, "$bound_ref$");
     const is_callable = shape_callable or is_bound_ref;
     if (is_callable) {
+        // A literal that ANNOTATES its parameters states their types. Refute
+        // only on a DEFINITE mismatch — two different builtin scalars — so an
+        // unannotated literal, a type parameter or a class type is untouched.
+        if (arg.lambda_param_types) |declared| {
+            if (fnTypeValueParamRefs(param_ty)) |expected| {
+                const n = @min(declared.len, expected.len);
+                var di: usize = 0;
+                while (di < n) : (di += 1) {
+                    const dh = evidenceHead(std.mem.trimEnd(u8, declared[di].name, "?"));
+                    const eh = evidenceHead(std.mem.trimEnd(u8, expected[di].name, "?"));
+                    if (dh.len == 0 or eh.len == 0) continue;
+                    if (std.mem.eql(u8, dh, eh)) continue;
+                    if (builtinScalarHead(dh) and builtinScalarHead(eh)) return null;
+                    // A builtin scalar against a head that is neither a scalar
+                    // nor a one-letter type parameter: androidx's
+                    // `element: TestValueClass` against a `Char`.
+                    if (builtinScalarHead(eh) and dh.len > 1 and !builtinScalarHead(dh) and
+                        !std.mem.eql(u8, dh, "Any") and !std.mem.startsWith(u8, dh, "Function")) return null;
+                }
+            }
+        }
         if (std.mem.startsWith(u8, nm, "Function")) {
             const expected = nm["Function".len..];
             if (std.fmt.parseInt(usize, expected, 10)) |want| {

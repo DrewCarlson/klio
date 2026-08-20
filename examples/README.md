@@ -186,12 +186,14 @@ Run any program with:
 | `type_args_vs_member_name.kt` | A call with explicit type arguments resolves to a top-level generic function rather than a same-named member that declares no type parameters (and still binds a member that does). |
 | `inline_extension_overload.kt` | Overloaded inline extension functions picked by argument type, including a bare call whose receiver is implicit (the shape-based splice cannot separate them, so dispatch does). |
 | `local_class_nested.kt`        | Classes nested inside a LOCAL class (one declared in a function body), `inner` and plain, constructed from a property initializer regardless of declaration order. |
+| `lambda_param_types_pick_overload.kt` | An annotated lambda parameter decides which candidate a bare call reaches: the enclosing class's member over a stdlib extension that only looks applicable. |
 | `inline_member_in_receiver_lambda.kt` | An `inline` member called by bare name from inside a receiver lambda over another type still resolves to the enclosing class, matching its non-inline sibling. |
 | `enum_natural_order.kt`        | An enum's natural ordering is its declaration order: entries sort and compare, and the generic comparison helpers order them the same way. |
 | `vararg_receiver_lambdas.kt`   | Receiver lambdas passed to a `vararg`: each literal binds the receiver the call supplies, whether reached by loop, index or `forEach`, and a parameter after the vararg keeps its own position. |
 | `local_shadows_function_call.kt` | A local and a function sharing a name: a CALL reaches the function, a plain reference reads the local, and a local whose type declares `invoke` still answers the call. |
 | `serial_name_annotation.kt`    | `@SerialName` on a class replaces the descriptor's serial name, and on a property replaces that element's wire name, while the Kotlin declaration keeps its own names. |
 | `value_class_hash_delegation.kt` | A `value` class hashes as its underlying property and a `data` class folds each property's own `hashCode()`, so a property class's override decides the result. |
+| `property_ref_write_through_delegate.kt` | A property written through a `by contents::prop` delegate and through an unbound `KMutableProperty1` lands in the same backing field, and stays readable after the delegate that carried the first write is gone. |
 | `companion_member_extension.kt` | Extension properties on a companion object declared as members of another class, `private` and public, on a user class and on a builtin's companion. |
 | `serial_descriptor_shape.kt`   | The `SerialDescriptor` a `@Serializable` class reports: element names, which elements are optional (their constructor parameter has a default), and each element's own descriptor. |
 | `interface_companion_state.kt` | Shared companion-object state on an interface.              |

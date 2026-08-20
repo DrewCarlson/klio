@@ -1,0 +1,3 @@
+render     = [1, 2, 3]
+renderRows = 123
+charSeq    = abc
