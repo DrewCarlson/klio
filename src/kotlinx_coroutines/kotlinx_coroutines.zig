@@ -47,6 +47,14 @@ const ChannelState = struct {
     /// Kotlin permits exactly one `invokeOnClose` registration, including
     /// after the channel has already closed.
     close_handler_registered: bool,
+    /// `Channel(capacity) { element -> … }` — the `onUndeliveredElement`
+    /// handler. Invoked for every element the channel accepted but never
+    /// handed to a receiver: an evicted buffer entry, a cancelled parked
+    /// `send`, a `send` to a closed channel, and everything still buffered
+    /// or in flight when the channel is CANCELLED (a plain `close` leaves
+    /// the buffer receivable, so it does not fire). `Null` when the channel
+    /// was created without one.
+    on_undelivered: Value,
     /// `receive()` / `receiveCatching()` callers currently parked because
     /// the buffer was empty. The next `send` resumes the head waiter. A
     /// `catching` waiter is resumed with a `ChannelResult.success(value)`
@@ -98,6 +106,7 @@ const ChannelState = struct {
             .closed = false,
             .close_cause = .Null,
             .close_handler_registered = false,
+            .on_undelivered = .Null,
             .receive_waiters = Deque(RecvWaiter).empty,
             .receive_iter_waiters = Deque(IterWaiter).empty,
             .send_waiters = Deque(SendWaiter).empty,
@@ -110,6 +119,7 @@ const ChannelState = struct {
     fn deinit(self: *ChannelState, allocator: std.mem.Allocator) void {
         if (runtime.reclaimEnabled()) {
             self.close_cause.release(allocator);
+            self.on_undelivered.release(allocator);
             for (self.close_handlers.items.items) |h| h.release(allocator);
         }
         self.buffer.deinit(allocator);
@@ -298,6 +308,59 @@ const DEFAULT_BUFFER_CAPACITY: usize = 64;
 const BUFFERED_CHANNEL_FQN = "kotlinx.coroutines.channels.KlioBufferedChannel";
 const CONFLATED_CHANNEL_FQN = "kotlinx.coroutines.channels.KlioConflatedBufferedChannel";
 
+/// Whether a value can be invoked as a `(E) -> Unit` handler. The native
+/// `Channel(...)` factory sees the arguments as written, so the
+/// `onUndeliveredElement` lambda is identified by shape rather than by
+/// position: a capacity is numeric and a `BufferOverflow` is an enum entry,
+/// so a callable in any slot is the handler.
+fn isCallableValue(v: *const Value) bool {
+    return switch (v.*) {
+        .IrClosure, .Intrinsic, .BoundMethod => true,
+        else => false,
+    };
+}
+
+/// The channel's `onUndeliveredElement` handler, retained for the caller.
+fn undeliveredHandler(id: u64) Value {
+    coro_reg_mutex.lock();
+    defer coro_reg_mutex.unlock();
+    const state = coro_reg.channels.getPtr(id) orelse return .Null;
+    const h = state.on_undelivered;
+    if (h != .Null and runtime.reclaimEnabled()) h.retain();
+    return h;
+}
+
+/// Run the handler for one undelivered element. A handler that THROWS is
+/// wrapped in `UndeliveredElementException` and handed back, exactly as
+/// upstream's `callUndeliveredElementCatchingException` does; the caller
+/// decides whether that surfaces at the call site (a drop, a cancel) or as
+/// an unhandled coroutine exception (a cancelled park). Any other failure
+/// (a suspension, a control-flow unwind) passes through untouched.
+fn runUndelivered(ctx: *CallCtx, handler: Value, value: Value) std.mem.Allocator.Error!?RuntimeError {
+    if (handler == .Null) return null;
+    const r = try ctx.host.invokeCallable(&handler, &.{value}, ctx.out);
+    switch (r) {
+        .ok => return null,
+        .err => |e| {
+            if (e != .Thrown) return e;
+            const rendered = value.display(ctx.allocator) catch null;
+            defer if (rendered) |m| ctx.allocator.free(m);
+            const message = try std.fmt.allocPrint(
+                ctx.allocator,
+                "Exception in undelivered element handler for {s}",
+                .{rendered orelse "?"},
+            );
+            defer if (runtime.freeScratch()) ctx.allocator.free(message);
+            e.Thrown.retain();
+            return .{ .Thrown = try Value.newException(ctx.allocator, .{
+                .fqn = try runtime.strInit(ctx.allocator, "kotlinx.coroutines.internal.UndeliveredElementException"),
+                .message = .from(try runtime.strInit(ctx.allocator, message)),
+                .cause = (try Value.boxRef(ctx.allocator, e.Thrown)).cell,
+            }) };
+        },
+    }
+}
+
 fn channelIllegalArgument(ctx: *CallCtx, message: []const u8) std.mem.Allocator.Error!EvalResult {
     return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
@@ -371,12 +434,27 @@ fn channelCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         if (overflow != .suspend_) class_fqn = CONFLATED_CHANNEL_FQN;
     }
 
+    // `Channel(capacity) { … }` / `Channel(capacity, overflow, handler)`:
+    // the handler is the callable argument, wherever it landed.
+    var handler: Value = .Null;
+    for (ctx.args) |a| {
+        if (isCallableValue(&a)) {
+            handler = a;
+            break;
+        }
+    }
+
     const id = ctx.host.allocInstanceId();
     ensureCoroRegRoot();
     {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
-        try coro_reg.channels.put(regAllocator(), id, ChannelState.init(effective_cap, eff_overflow, rendezvous));
+        var st = ChannelState.init(effective_cap, eff_overflow, rendezvous);
+        if (handler != .Null) {
+            if (runtime.reclaimEnabled()) handler.retain();
+            st.on_undelivered = handler;
+        }
+        try coro_reg.channels.put(regAllocator(), id, st);
     }
     const inst = try ctx.host.newSynthInstance(class_fqn, id, &.{});
     return .{ .ok = inst };
@@ -736,14 +814,21 @@ fn channelCancelWaiter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
 
     var found = false;
+    var lost: ?Value = null;
     {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
         if (coro_reg.channels.getPtr(id)) |state| {
-            found = removeWaiterBySlot(state, slot);
+            found = removeWaiterBySlotLosing(state, slot, &lost);
         }
     }
     if (!found) return .{ .ok = .Unit };
+    // A cancelled `send` leaves its element undelivered.
+    if (lost) |element| {
+        const handler = undeliveredHandler(id);
+        defer if (runtime.reclaimEnabled()) handler.release(ctx.allocator);
+        if (try runUndelivered(ctx, handler, element)) |e| return .{ .err = e };
+    }
 
     // A throw at the suspension point: `Result.failure(cause)` routed by
     // the resume engine as `pending_throw_from_inner` (see ir/eval.zig).
@@ -754,8 +839,14 @@ fn channelCancelWaiter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 /// Drop the channel waiter (send/receive/iterator) whose park slot equals
-/// `slot`. Returns whether one was removed.
+/// `slot`. Returns whether one was removed; a removed SENDER also hands
+/// back its element, which the channel never delivered.
 fn removeWaiterBySlot(state: *ChannelState, slot: i64) bool {
+    var lost: ?Value = null;
+    return removeWaiterBySlotLosing(state, slot, &lost);
+}
+
+fn removeWaiterBySlotLosing(state: *ChannelState, slot: i64, lost: *?Value) bool {
     {
         var i: usize = 0;
         while (i < state.receive_waiters.items.items.len) : (i += 1) {
@@ -769,7 +860,7 @@ fn removeWaiterBySlot(state: *ChannelState, slot: i64) bool {
         var i: usize = 0;
         while (i < state.send_waiters.items.items.len) : (i += 1) {
             if (state.send_waiters.items.items[i].slot == slot) {
-                _ = state.send_waiters.items.orderedRemove(i);
+                lost.* = state.send_waiters.items.orderedRemove(i).value;
                 return true;
             }
         }
@@ -864,6 +955,10 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // check-and-transition is one atomic section under the registry lock;
     // the host resume runs after release.
     var outcome: ChannelSendOutcome = undefined;
+    // An element the channel accepted but will never hand to a receiver:
+    // reported to `onUndeliveredElement` after the lock is released, since
+    // the handler is interpreted Kotlin.
+    var undelivered: ?Value = null;
     var offer_to_selects = false;
     {
         coro_reg_mutex.lock();
@@ -902,11 +997,16 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
                 outcome = .{ .ParkOnSlot = slot };
             },
             .drop_oldest => {
-                _ = state.buffer.popFront();
+                undelivered = state.buffer.popFront();
                 try state.buffer.pushBack(regAllocator(), value);
                 outcome = .Buffered;
             },
-            .drop_latest => outcome = .Buffered,
+            // DROP_LATEST drops the element being sent. `send` reports it;
+            // `trySend` leaves that to its caller (upstream's `isSendOp`).
+            .drop_latest => {
+                undelivered = value;
+                outcome = .Buffered;
+            },
         }
     }
 
@@ -938,14 +1038,23 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
                     fallback = .{ .ParkOnSlot = slot };
                 },
                 .drop_oldest => {
-                    _ = state.buffer.popFront();
+                    undelivered = state.buffer.popFront();
                     try state.buffer.pushBack(regAllocator(), value);
                     fallback = .Buffered;
                 },
-                .drop_latest => fallback = .Buffered,
+                .drop_latest => {
+                    undelivered = value;
+                    fallback = .Buffered;
+                },
             }
         }
         outcome = fallback;
+    }
+
+    if (undelivered) |lost| {
+        const handler = undeliveredHandler(id);
+        defer if (runtime.reclaimEnabled()) handler.release(ctx.allocator);
+        if (try runUndelivered(ctx, handler, lost)) |e| return .{ .err = e };
     }
 
     switch (outcome) {
@@ -964,7 +1073,13 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             armChannelCancel(ctx, recv, slot);
             return .{ .err = .{ .Suspend = -1 } };
         },
-        .Closed => |cause| return .{ .err = .{ .Thrown = try channelCloseException(ctx.allocator, cause, false) } },
+        .Closed => |cause| {
+            // A `send` to a closed channel never delivers its element.
+            const handler = undeliveredHandler(id);
+            defer if (runtime.reclaimEnabled()) handler.release(ctx.allocator);
+            if (try runUndelivered(ctx, handler, value)) |e| return .{ .err = e };
+            return .{ .err = .{ .Thrown = try channelCloseException(ctx.allocator, cause, false) } };
+        },
     }
 }
 
@@ -983,6 +1098,11 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
     var outcome: ChannelTrySendOutcome = undefined;
     var offer_to_selects = false;
+    // Only a DROP_OLDEST eviction is the channel's to report from
+    // `trySend`: dropping the element being offered is the CALLER's to
+    // handle (upstream passes `isSendOp = false` here), and a closed
+    // channel returns a failed result rather than accepting the element.
+    var undelivered: ?Value = null;
     {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
@@ -1008,7 +1128,7 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         } else switch (state.overflow) {
             .suspend_ => outcome = .Full,
             .drop_oldest => {
-                _ = state.buffer.popFront();
+                undelivered = state.buffer.popFront();
                 try state.buffer.pushBack(regAllocator(), value);
                 outcome = .Success;
             },
@@ -1039,12 +1159,17 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             } else switch (state.overflow) {
                 .suspend_ => fb = .Full,
                 .drop_oldest => {
-                    _ = state.buffer.popFront();
+                    undelivered = state.buffer.popFront();
                     try state.buffer.pushBack(regAllocator(), value);
                     fb = .Success;
                 },
                 .drop_latest => fb = .Success,
             }
+        }
+        if (undelivered) |lost| {
+            const handler = undeliveredHandler(id);
+            defer if (runtime.reclaimEnabled()) handler.release(ctx.allocator);
+            if (try runUndelivered(ctx, handler, lost)) |e| return .{ .err = e };
         }
         switch (fb) {
             .HandToReceiver => |h| {
@@ -1062,6 +1187,11 @@ fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
 
+    if (undelivered) |lost| {
+        const handler = undeliveredHandler(id);
+        defer if (runtime.reclaimEnabled()) handler.release(ctx.allocator);
+        if (try runUndelivered(ctx, handler, lost)) |e| return .{ .err = e };
+    }
     const result: Value = switch (outcome) {
         .HandToReceiver => |h| blk: {
             const resume_val = if (h.catching) try channelResult(ctx, .success, h.value) else h.value;
@@ -1245,6 +1375,27 @@ fn channelCloseImpl(ctx: *CallCtx, cancel_pending_sends: bool) std.mem.Allocator
     defer regAllocator().free(iters);
     defer regAllocator().free(sends);
     defer regAllocator().free(discarded);
+    // Cancelling drops everything the channel still holds: the buffer and
+    // every parked sender's element. A plain `close` drains neither, so it
+    // reports nothing.
+    if (cancel_pending_sends) {
+        const handler = undeliveredHandler(id);
+        defer if (runtime.reclaimEnabled()) handler.release(ctx.allocator);
+        if (handler != .Null) {
+            for (discarded) |v| {
+                if (try runUndelivered(ctx, handler, v)) |e| {
+                    if (runtime.reclaimEnabled()) for (discarded) |d| d.release(regAllocator());
+                    return .{ .err = e };
+                }
+            }
+            for (sends) |sw| {
+                if (try runUndelivered(ctx, handler, sw.value)) |e| {
+                    if (runtime.reclaimEnabled()) for (discarded) |d| d.release(regAllocator());
+                    return .{ .err = e };
+                }
+            }
+        }
+    }
     if (runtime.reclaimEnabled()) for (discarded) |v| v.release(regAllocator());
 
     const exc = try closedReceiveExc(ctx.allocator);

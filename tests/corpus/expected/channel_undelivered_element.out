@@ -1,0 +1,9 @@
+delivered   = ok
+cancelled   = parked!
+after send  = buffered overflowed!
+after cancel= buffered! overflowed!
+conflated   = first! second
+closed      = rejected!
+DROP_OLDEST = [1, 2]
+DROP_LATEST = [3]
+handler     = boom

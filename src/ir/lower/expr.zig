@@ -12934,6 +12934,17 @@ fn lowerPathCall(
 /// The receiver-context bits `resolveCall` folds into its emit-form decision,
 /// read once from the builder. Shared by the live path and the audit shadow so
 /// both query `resolveCall` identically.
+/// The active inline splice's receiver head, for a name the spliced body
+/// does NOT bind itself. A spliced inline function's own parameter shadows
+/// its receiver's extensions exactly as it does before splicing — `mp`'s
+/// `crossinline transform` against `Flw.transform` — so a name the splice
+/// substituted keeps resolving as that parameter.
+fn spliceRecvForName(b: *const FuncBuilder, name0: []const u8) ?[]const u8 {
+    if (b.resolve(name0) != null or b.knowsOuter(name0)) return null;
+    if (b.inlineLambdaFor(name0) != null) return null;
+    return b.spliceRecvTy();
+}
+
 pub fn resolveCtxFor(
     b: *FuncBuilder,
     name0: []const u8,
@@ -12962,13 +12973,13 @@ pub fn resolveCtxFor(
         // (`serializer(type)` inside `SerializersModule.serializer()` bound
         // the module-less overload). The splice channel carries the spliced
         // declaration's receiver; consult it only when the frame has none.
-        .recv_ty = b.thisNarrow() orelse b.recvTy() orelse b.spliceRecvTy(),
+        .recv_ty = b.thisNarrow() orelse b.recvTy() orelse spliceRecvForName(b, name0),
         .recv_type = if (b.thisNarrow()) |t|
             ir.TypeRef{ .name = t, .nullable = false, .args = &.{} }
         else if (b.recvTypeRef()) |rt|
             rt
-        else if (b.spliceRecvTyRef()) |srt|
-            srt.*
+        else if (spliceRecvForName(b, name0) != null)
+            (if (b.spliceRecvTyRef()) |srt| srt.* else null)
         else
             null,
         .actual_type_param_bounds = actual_type_param_bounds,
