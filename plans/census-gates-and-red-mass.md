@@ -985,6 +985,69 @@ passed with the gate disabled and proved nothing. Whatever makes the real
 program record the cross-file pick is not reproduced by the `Builder`
 harness, and the end-to-end pin is the honest guard.
 
+### Fixed: an inferred receiver-function parameter kept no receiver
+
+`driver { fail -> fail() }` against
+`child: Scope.(block: Scope.() -> Unit) -> Unit` never marked `fail` a
+receiver-lambda param: only ANNOTATED parameter types reached the
+classification loop in `lowerLambdaBodyCapturingKindWith`, while the
+INFERRED ones (from `pending_lambda_param_types`) were used solely to
+record a declared type. A bare `fail()` then ran the block receiverless —
+its body could not see the receiver at all — and in coroutine code a
+builder inside it attached to the wrong scope: eight
+ParentCancellationTest cases lost the failing grandchild to the root
+`runBlocking` instead of the `CompletableDeferred` meant to absorb it.
+The expected type is now classified too, decoding the receiver out of the
+lowered `FunctionN` shape (`[#suspend?] [receiver?] params… ret
+[#markers]`). Census 1167 -> 1175.
+
+### Fixed: a function-typed receiver's shape picks the extension overload
+
+`suspend R.() -> T` lowers to `Function0` (its receiver rides in the type
+args) and `suspend (P) -> T` to `Function1`. Both are one runtime class,
+so the extension walk had nothing to separate a same-named pair declared
+on the two shapes and the receiver form won every call. kotlinx's
+`block.startCoroutineUninterceptedOrReturn(value, cont)` on a
+`suspend (V) -> T` therefore ran the block with `value` bound as `this`
+and its value parameter null — so a `flowOn` that only changes the
+coroutine NAME (no dispatcher change, the `collectWithContextUndispatched`
+fast path) collected through a null collector and died `emit` on
+`kotlin.Nothing`. The lenient extension pass now keeps only candidates
+whose declared receiver head matches the call's declared head exactly,
+when any do. Census 1175 -> 1179.
+
+Still open in the same family: a LOCAL annotated `val f: (String) -> Int`
+records its declared head as the parser's `<function>` tag rather than
+`Function1`, so the same overload pair still ties for a call on a local.
+Only the parameter-typed form (what the library uses) is decided.
+
+### Fixed: the flow builder enforces context preservation
+
+klio's `SafeCollector` actual forwarded every value straight downstream,
+on the reasoning that one cooperative scheduler already serializes
+emissions. Context preservation is not a thread-safety device though: it
+is `flow { }`'s contract, and emitting from a child coroutine or across a
+`withContext` must be reported. The actual now runs the shared
+`checkContext` on each context change, memoized on the emitting context's
+identity. Census 1179 -> 1187 (three `testTransparencyViolation`, five
+FlowInvariantsTest, one CancellableTest half).
+
+**No `ensureActive` rides along, and CancellableTest.testCancellable
+cannot currently pass whole.** The JVM actual calls
+`currentContext.ensureActive()` on the EMITTER's continuation context;
+klio's `currentCoroutineContext()` inside `emit` is the COLLECTING
+coroutine's. With the check in, `assertEquals(1, sum)` (the
+`cancellable()` half) passes and `assertEquals(500500, sum)` (the plain
+half, pinning "a flow is not cancellable by default") fails; with it out,
+the reverse. Measured both ways: net zero either direction. The unresolved
+half is `cancellable()`: upstream's `AbstractFlow` IS a `CancellableFlow`,
+so `onEach`'s SafeFlow returns ITSELF from `cancellable()` — which cannot
+explain the test expecting different sums from the two collections. A
+hand-written `CancellableFlowImpl` equivalent DOES give `sum == 1` in
+klio, so the wrapper logic works and the discriminator is which flows
+count as already-cancellable. Needs the kotlinc oracle, not more
+guessing.
+
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 
 7 failures read `bufferEnd` on `KlioBufferedChannel`. The tests cast the
