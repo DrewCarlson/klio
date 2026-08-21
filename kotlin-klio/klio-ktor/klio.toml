@@ -81,6 +81,7 @@ include = [
 root = "upstream/ktor-utils/common/src"
 include = [
     "io/ktor/util/Text.kt",
+    "io/ktor/util/Charset.kt",
     "io/ktor/util/Base64.kt",
     "io/ktor/util/Crypto.kt",
     "io/ktor/util/Hash.kt",
