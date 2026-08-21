@@ -152,8 +152,14 @@ actual class LocalDate(
     }
     override fun toString(): String {
         // A negative proleptic year formats as `-0001`, not `00-1`: pad the
-        // magnitude, then re-attach the sign.
-        val y = if (year < 0) "-" + (-year).toString().padStart(4, '0') else year.toString().padStart(4, '0')
+        // magnitude, then re-attach the sign. ISO leaves 0..9999 unsigned at
+        // four digits and signs everything outside it, so the width stays
+        // unambiguous.
+        val y = when {
+            year < 0 -> "-" + (-year).toString().padStart(4, '0')
+            year > 9999 -> "+" + year.toString()
+            else -> year.toString().padStart(4, '0')
+        }
         return "$y-${monthNumber.toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}"
     }
 
@@ -186,22 +192,25 @@ actual class LocalDate(
         fun parse(input: CharSequence): LocalDate {
             val s = input.toString()
             val neg = s.startsWith("-")
-            val body = if (neg) s.substring(1) else s
+            val signed = neg || s.startsWith("+")
+            val body = if (signed) s.substring(1) else s
             val parts = body.split("-")
             if (parts.size != 3) throw DateTimeFormatException("Invalid ISO-8601 date: $input")
-            // ISO: 4-digit year (a signed year with more digits is only valid
-            // via the leading `-`; a leading `+` or padded width is rejected),
-            // 2-digit month and day, all digits.
             val yStr = parts[0]; val mStr = parts[1]; val dStr = parts[2]
-            // An unsigned year is EXACTLY 4 digits (0000..9999); a wider year is
-            // only valid with the leading `-` (this parser's supported sign),
-            // where it is 4+ digits. `102017-10-01` (6 unsigned digits) is
-            // rejected, matching kotlinx-datetime.
-            val yearDigitsValid = if (neg) yStr.length >= 4 else yStr.length == 4
+            // ISO: an UNSIGNED year is exactly 4 digits (0000..9999), so
+            // `102017-10-01` is invalid. An EXPLICITLY SIGNED year is 4 or
+            // more digits and may carry any amount of zero padding
+            // (`+00000002024-01-01` is the year 2024).
+            val yearDigitsValid = if (signed) yStr.length >= 4 else yStr.length == 4
             if (!yearDigitsValid || mStr.length != 2 || dStr.length != 2 ||
                 !yStr.all { it in '0'..'9' } || !mStr.all { it in '0'..'9' } || !dStr.all { it in '0'..'9' })
                 throw DateTimeFormatException("Invalid ISO-8601 date: $input")
-            val yMag = yStr.toIntOrNull() ?: throw DateTimeFormatException("Invalid ISO-8601 date: $input")
+            // Trim the padding before converting: a year written with thirty
+            // leading zeros overflows every integer width on its digits alone.
+            val yDigits = yStr.trimStart('0')
+            val yMag = if (yDigits.isEmpty()) 0 else
+                (if (yDigits.length > 9) null else yDigits.toIntOrNull())
+                    ?: throw DateTimeFormatException("Invalid ISO-8601 date: $input")
             val year = if (neg) -yMag else yMag
             val month = mStr.toInt(); val day = dStr.toInt()
             if (year !in -999_999..999_999 || month !in 1..12 || day !in 1..daysInMonth(year, month))
