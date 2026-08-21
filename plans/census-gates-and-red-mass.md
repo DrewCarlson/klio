@@ -885,6 +885,40 @@ unsoundness of that slot (re-entrancy) is unchanged and still recorded in
 argument is written at the call site. Guarded by
 `examples/reified_type_arg_without_splice.kt`.
 
+### Open: `JobSupport.notifyCompletion` binds the wrong receiver
+
+8 flow tests fail as `Vm::call_value on kotlin.Nothing`
+(FlatMapConcat/FlatMapMerge/FlattenConcat/FlattenMerge `testFlatMapConcurrency`
+and friends). The frame chain puts every one of them in the same place:
+
+    [getfield-miss] name=notifyHandlers recv=kotlinx.coroutines.NodeList
+    [frame-params] JobSupport.notifyCompletion (2 params, 2 bound):
+      [0] this = Instance NodeList
+    at JobSupport.notifyCompletion (common/src/JobSupport.kt:357)
+       JobSupport.completeStateFinalization (JobSupport.kt:316)
+       JobSupport.finalizeFinishingState (JobSupport.kt:233)
+
+`private fun NodeList.notifyCompletion(cause)` is a member EXTENSION on
+`NodeList` inside `JobSupport`, so its `this` is the NodeList and the enclosing
+`JobSupport` is the dispatch receiver. Its body calls the enclosing class's
+`notifyHandlers(this, cause) { true }` — and klio probes the NODELIST for it.
+Note the miss is a `getfield`, so the bare name was lowered as a VALUE READ
+followed by a call, not as a member call: nothing in scope was recognised as a
+function of that name, and the read produced null.
+
+Four reductions of the shape all PASS, so the trigger is not the shape alone:
+a bare enclosing-member call from a member extension; the same with an inline
+callee taking a trailing lambda; the same with a receiver-member call
+(`close(...)`) before it; and the same with `$this` referenced inside the
+spliced body. Whatever separates the real case lives further into
+`JobSupport` — it is a large class with a deep hierarchy, and the callee is
+`private inline`.
+
+**Next step:** find why the bare `notifyHandlers` lowers as a field read rather
+than a call — `KLIO_OR_AUDIT=1` names the emitted form, and the answer is
+whether the enclosing class's members are in scope while lowering a member
+extension's body.
+
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 
 7 failures read `bufferEnd` on `KlioBufferedChannel`. The tests cast the
