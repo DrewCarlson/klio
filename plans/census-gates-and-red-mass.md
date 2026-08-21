@@ -1048,6 +1048,47 @@ klio, so the wrapper logic works and the discriminator is which flows
 count as already-cancellable. Needs the kotlinc oracle, not more
 guessing.
 
+### Fixed: a null channel element is a value
+
+The channel iterator used `__pending__`'s CONTENTS as its "have a value"
+sentinel: `hasNext()` re-pulled when the cached element was null, and
+`next()` raised "`hasNext()` has not produced an element" for a real null
+on a `Channel<T?>` (`listOf(flowOf(1), flowOf(null), flowOf(2)).merge()`).
+Both now read the iterator STATE, which every delivery path already sets.
+Census 1187 -> 1192.
+
+### Fixed: five datetime roots
+
+- **Extended ISO years.** `LocalDate.parse` rejected a leading `+`, so
+  every year past 9999 failed, and `toString` rendered such a year
+  unsigned — ambiguous, and not a round trip. ISO leaves 0000..9999
+  unsigned at four digits and signs everything outside it, with any zero
+  padding allowed on a signed year; the padding is trimmed before
+  conversion so a thirty-zero year does not overflow on its digits alone.
+- **An ambiguous local time takes the EARLIER offset.** The local-time
+  walk advanced to a transition's new offset at `transition + newOffset`,
+  which around a fall-back starts an hour before the old offset's local
+  end, so the repeated hour bound the SECOND pass. The new offset now
+  takes over only once the local time is past the transition under both
+  readings — the earlier-offset rule for both the overlap and the gap.
+- **Single-digit-hour zone ids.** `TimeZone.of` routed every offset form
+  through a parser demanding two hour digits, so `UTC+3`, `+4` and `-9`
+  were rejected.
+- **Offset identity.** Parsing handed back a fresh `UtcOffset` every time,
+  so two spellings of one offset — `Z` against `UtcOffset.ZERO` included —
+  differed by identity. Parse now caches per total-second value.
+- **Natural ordering for a user `Comparable`.** `compareValues`,
+  `compareValuesBy` and the sequence sorts compared only builtin kinds and
+  refused everything else, so `sortedBy { it.instant }` on a library value
+  type died while `<` on the same values worked. Each dispatches the
+  value's own `compareTo` once the builtin table declines. The datetime
+  pack also grew upstream's Kotlin TZif reader, which its own tests read a
+  zoneinfo blob through.
+
+Datetime census 484/35 at the start of this campaign -> 517 passed, 2
+failed. The two left are `DateTimeComponents` shapes: a `set` on
+`PropertyAndItsValue` and a `monthNumber` read on the companion.
+
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 
 7 failures read `bufferEnd` on `KlioBufferedChannel`. The tests cast the
