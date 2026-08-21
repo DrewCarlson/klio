@@ -34,6 +34,27 @@ pub const EnclosingOwner = struct {
     members: StringSet,
 };
 
+/// The declared receiver and value-parameter count of a LOWERED function
+/// type, or null when `ty` is not a receiver-typed function. The lowered
+/// encoding is `[#suspend?] [receiver?] params… ret [#markers]`, so a
+/// receiver shows up as one extra leading entry over `FunctionN`'s N.
+const RecvFnShape = struct { arity: usize, recv_head: []const u8 };
+
+fn loweredRecvFnShape(ty: *const TypeRef) ?RecvFnShape {
+    if (!std.mem.startsWith(u8, ty.name, "Function")) return null;
+    const want = std.fmt.parseInt(usize, ty.name["Function".len..], 10) catch return null;
+    var hi: usize = ty.args.len;
+    while (hi > 0 and ty.args[hi - 1].name.len != 0 and ty.args[hi - 1].name[0] == '#') hi -= 1;
+    if (hi == 0) return null;
+    var lo: usize = 0;
+    if (lo < hi and std.mem.eql(u8, ty.args[lo].name, "#suspend")) lo += 1;
+    hi -= 1;
+    if (hi < lo) return null;
+    const mid = ty.args[lo..hi];
+    if (mid.len != want + 1) return null;
+    return .{ .arity = want, .recv_head = mid[0].name };
+}
+
 /// The allocator backing a `Module`'s growable tables. The module's
 /// containers are unmanaged, so recover the allocator from a managed
 /// member (`func_name_index`) it was initialised with.
@@ -459,6 +480,19 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
                 owned.deinit(b.allocator);
                 continue;
             }
+            // A lambda parameter whose EXPECTED type is a receiver-typed
+            // function (`{ fail -> fail() }` bound to
+            // `child: Scope.(block: Scope.() -> Unit) -> Unit`) is a
+            // receiver-lambda param exactly as an annotated one is: a bare
+            // `fail()` in the body invokes it with the enclosing `this`.
+            // Only the ANNOTATED types reach the classification loop below,
+            // so an inferred parameter had to be marked here or the block
+            // ran receiverless.
+            if (loweredRecvFnShape(&owned)) |shape| {
+                try b.markReceiverLambdaParam(name);
+                try b.markReceiverLambdaArity(name, shape.arity);
+                try b.setReceiverLambdaRecvHead(name, if (b.isTypeParam(shape.recv_head)) null else shape.recv_head);
+            }
             try b.setLocalDeclTypeOwned(name, owned);
         }
         for (expected_types[bind_n..]) |surplus| {
@@ -670,3 +704,40 @@ test {
     std.testing.refAllDecls(@This());
 }
 
+
+test "an inferred receiver-function parameter type marks a receiver-lambda param" {
+    const testing = std.testing;
+    // `Scope.() -> Unit` lowers to `Function0` with the receiver as one
+    // extra leading arg before the return type.
+    const unit = TypeRef{ .name = "Unit", .nullable = false, .args = &.{} };
+    const scope = TypeRef{ .name = "Scope", .nullable = false, .args = &.{} };
+    var recv_args = [_]TypeRef{ scope, unit };
+    const recv_fn = TypeRef{ .name = "Function0", .nullable = false, .args = &recv_args };
+    const shape = loweredRecvFnShape(&recv_fn) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 0), shape.arity);
+    try testing.expectEqualStrings("Scope", shape.recv_head);
+
+    // A plain `() -> Unit` has no receiver.
+    var plain_args = [_]TypeRef{unit};
+    const plain_fn = TypeRef{ .name = "Function0", .nullable = false, .args = &plain_args };
+    try testing.expect(loweredRecvFnShape(&plain_fn) == null);
+
+    // `suspend Scope.(Int) -> Unit`: the marker and the value parameter
+    // both sit between the head and the return type.
+    const int = TypeRef{ .name = "Int", .nullable = false, .args = &.{} };
+    const suspend_marker = TypeRef{ .name = "#suspend", .nullable = false, .args = &.{} };
+    var s_args = [_]TypeRef{ suspend_marker, scope, int, unit };
+    const s_fn = TypeRef{ .name = "Function1", .nullable = false, .args = &s_args };
+    const s_shape = loweredRecvFnShape(&s_fn) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), s_shape.arity);
+    try testing.expectEqualStrings("Scope", s_shape.recv_head);
+
+    // `suspend (Int) -> Unit` without a receiver stays unmarked.
+    var sp_args = [_]TypeRef{ suspend_marker, int, unit };
+    const sp_fn = TypeRef{ .name = "Function1", .nullable = false, .args = &sp_args };
+    try testing.expect(loweredRecvFnShape(&sp_fn) == null);
+
+    // A non-function head is never a receiver-function type.
+    const not_fn = TypeRef{ .name = "Scope", .nullable = false, .args = &recv_args };
+    try testing.expect(loweredRecvFnShape(&not_fn) == null);
+}
