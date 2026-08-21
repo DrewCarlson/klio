@@ -32,8 +32,16 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         },
         // Census floor: 1073 solo with the support surface wired. The
         // ratchet leaves headroom for the loaded `test-all`.
+        //
+        // 1105 -> 1185 and 106 -> 58 after the harness stopped starving a
+        // test file of the base class / helper file it extends, and six
+        // interpreter roots landed (nested-class references, file-private
+        // function binding, inferred receiver-function parameters, the
+        // function-shape extension overload, the flow context-preservation
+        // invariant, null channel elements). Measured on the gate:
+        // 1192 passed, 52 failed, 6 did not complete.
         // 1070 -> 1105 alongside the ceiling below. Measured solo: 1110.
-        .baseline = 1105,
+        .baseline = 1185,
         // Bound the red mass too: a floor alone cannot see a fixed case
         // traded for a broken one. Measured solo: 137 failing, 6 not
         // completing. Lower these as fixes land, never raise them.
@@ -48,7 +56,7 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         // whose initializer is an ordinary function call (`val flow =
         // flowOf(...)` beside the `flow { … }` builder). Measured solo: 1110
         // passed, 104 failed, 6 did not complete. Held two above.
-        .max_failed = 106,
+        .max_failed = 58,
         .max_incomplete = 8,
     });
 }
