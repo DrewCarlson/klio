@@ -12956,11 +12956,21 @@ pub fn resolveCtxFor(
         .has_type_args = ast_type_args.len != 0,
         .has_composer = b.resolve("$composer") != null,
         .cast_pick = cast_pick,
-        .recv_ty = b.thisNarrow() orelse b.recvTy(),
+        // Inside an inline SPLICE the frame's own `recv_ty` is the CALLER's,
+        // so a spliced extension body would resolve its bare calls with no
+        // receiver at all and lose its own receiver's extensions
+        // (`serializer(type)` inside `SerializersModule.serializer()` bound
+        // the module-less overload). The splice channel carries the spliced
+        // declaration's receiver; consult it only when the frame has none.
+        .recv_ty = b.thisNarrow() orelse b.recvTy() orelse b.spliceRecvTy(),
         .recv_type = if (b.thisNarrow()) |t|
             ir.TypeRef{ .name = t, .nullable = false, .args = &.{} }
+        else if (b.recvTypeRef()) |rt|
+            rt
+        else if (b.spliceRecvTyRef()) |srt|
+            srt.*
         else
-            b.recvTypeRef(),
+            null,
         .actual_type_param_bounds = actual_type_param_bounds,
         .is_value_capture = b.knowsOuter(name0) and b.resolve(name0) == null,
         .in_tailrec_body = b.tailrecSelf() != null,
