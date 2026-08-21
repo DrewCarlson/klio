@@ -857,12 +857,30 @@ census number, so none was landed):
      bare `collect { … }` inside the block goes through the bare-name resolver,
      not `resolveInstanceMethod`'s member pick where that rule lives.
 
-**What would actually close it:** make the SAM conversion produce a real
-instance of the interface (klio already builds `__sam_target__` synth instances
-elsewhere) instead of passing the raw closure, OR apply the SAM-specificity
-rule on the BARE-NAME resolution path as well as the member pick. The first is
-the principled fix and the larger change; memory records the raw-closure
-collector as a deliberate choice, so it is a design reversal, not a patch.
+**Fifth attempt, also reverted:** implicit SAM conversion at the CALL boundary,
+mirroring the constructor boundary's existing one (`host_instances.zig` already
+wraps a callable ctor argument whose declared type is a `fun interface`). Added
+to `callFunc` — and it never fires. A probe with a plain `fun interface`
+confirms the gap independently of flows:
+
+    fun interface Handler { fun handle(v: Int): String }
+    fun run1(h: Handler) = "" + (h is Handler)
+    run1 { v -> "<$v>" }        // is=false
+    run1(Handler { v -> "<$v>" })  // is=true
+
+so a lambda passed to a `fun interface` parameter is NOT an instance of it,
+while the explicit constructor form is. The argument never reaches `callFunc`:
+a bare call with a trailing lambda binds its parameters in the evaluator's
+activation setup (`ir.eval.evalWith` / the flat-call path), not in the host
+entry. `KLIO_FLAT=0` does not change it.
+
+**What would actually close it:** perform the conversion where the activation
+binds parameters, which is the interpreter's hottest path — every call would
+consult the callee's parameter types for a fun-interface name. That is the
+principled fix and a real design reversal (memory records the raw-closure
+collector as deliberate), not a patch, and it needs a performance plan of its
+own. The `Handler` probe above is the smallest thing to make pass first; the
+flow chain follows from it.
 ### Open: `secondFraction(n)` picks the defaulted overload
 
 Three datetime sample tests (`LocalTimeSamples.customFormat`,
