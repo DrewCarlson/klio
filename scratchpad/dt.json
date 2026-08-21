@@ -114,7 +114,6 @@
   {
    "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/LocalDateTest.kt",
    "passed": [
-    "LocalDateTest.parseIsoString",
     "LocalDateTest.localDateTimePart",
     "LocalDateTest.atTime",
     "LocalDateTest.atStartOfDay",
@@ -131,13 +130,17 @@
     "LocalDateTest.toEpochDays",
     "LocalDateTest.nextAndPreviousDayOfWeek"
    ],
-   "failed": [],
+   "failed": [
+    {
+     "test": "LocalDateTest.parseIsoString",
+     "err": "exception"
+    }
+   ],
    "incomplete": false
   },
   {
    "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/LocalDateTimeTest.kt",
    "passed": [
-    "LocalDateTimeTest.localDateTimeParsing",
     "LocalDateTimeTest.localDtToInstantConversion",
     "LocalDateTimeTest.localDtToInstantConversionRespectsTimezones",
     "LocalDateTimeTest.instantToLocalConversion",
@@ -149,7 +152,12 @@
     "LocalDateTimeTest.constructInvalidTime",
     "LocalDateTimeTest.orNull"
    ],
-   "failed": [],
+   "failed": [
+    {
+     "test": "LocalDateTimeTest.localDateTimeParsing",
+     "err": "exception"
+    }
+   ],
    "incomplete": false
   },
   {
@@ -580,7 +588,6 @@
     "LocalDateSamples.dayOfYear",
     "LocalDateSamples.toEpochDays",
     "LocalDateSamples.compareToSample",
-    "LocalDateSamples.toStringSample",
     "LocalDateSamples.formatting",
     "LocalDateSamples.atTimeInline",
     "LocalDateSamples.atTime",
@@ -599,7 +606,12 @@
     "LocalDateSamples.nextOrSame",
     "LocalDateSamples.previous"
    ],
-   "failed": [],
+   "failed": [
+    {
+     "test": "LocalDateSamples.toStringSample",
+     "err": "kotlin.IllegalStateException: Check failed."
+    }
+   ],
    "incomplete": false
   },
   {
@@ -961,7 +973,7 @@
  "hist": [
   [
    "exception",
-   4
+   6
   ],
   [
    "Vm::call_member `X` on `X`",
@@ -977,6 +989,10 @@
   ],
   [
    "kotlin.Exception: Didn't find an overlap at N-N-03T02:N for America/New_York",
+   1
+  ],
+  [
+   "kotlin.IllegalStateException: Check failed.",
    1
   ],
   [
@@ -1011,6 +1027,8 @@
   ],
   "exception": [
    "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/InstantTest.kt::InstantTest.zoneDependentDiff",
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/LocalDateTest.kt::LocalDateTest.parseIsoString",
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/LocalDateTimeTest.kt::LocalDateTimeTest.localDateTimeParsing",
    "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/ReadmeTest.kt::ReadmeTest.testConvertingAnInstantToLocalDateAndTimeComponents",
    "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/TimeZoneTest.kt::TimeZoneTest.utcOffsetNormalization",
    "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/DateTimeComponentsFormatTest.kt::DateTimeComponentsFormatTest.testPrefixWithCorrectParsableOffset"
@@ -1021,6 +1039,9 @@
   "Vm::call_member `X` on `X`": [
    "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/DateTimeComponentsFormatTest.kt::DateTimeComponentsFormatTest.testFormattingWithUnsetFields",
    "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/DateTimeComponentsTest.kt::DateTimeComponentsTest.testAssigningLegalValues"
+  ],
+  "kotlin.IllegalStateException: Check failed.": [
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/LocalDateSamples.kt::LocalDateSamples.toStringSample"
   ],
   "kotlin.AssertionError: Expected <Z>, actual <Z> is not same.": [
    "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/ThreeTenBpTimeZoneTest.kt::ThreeTenBpTimeZoneTest.utcIsCached"

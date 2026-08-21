@@ -1,0 +1,16 @@
+2019-10-01 -> year=2019 roundtrip=true
+0999-12-31 -> year=999 roundtrip=true
+-0001-01-02 -> year=-1 roundtrip=true
+9999-12-31 -> year=9999 roundtrip=true
+-9999-12-31 -> year=-9999 roundtrip=true
++10000-01-01 -> year=10000 roundtrip=true
+-10000-01-01 -> year=-10000 roundtrip=true
++123456-01-01 -> year=123456 roundtrip=true
+-123456-01-01 -> year=-123456 roundtrip=true
+padded  = 2024-01-01
+padded- = -2024-01-01
+datetime = +10000-01-01T00:00
+invalid 102017-10-01 = true
+invalid +1000000000-10-01 = true
+invalid 2017-9-00 = true
+invalid 2021-02-29 = true
