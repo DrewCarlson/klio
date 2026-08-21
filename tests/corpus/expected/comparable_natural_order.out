@@ -1,0 +1,12 @@
+less      = true
+compareTo = -1
+compareValues = -1
+sorted    = [1.2, 1.10, 2.0]
+desc      = [2.0, 1.10, 1.2]
+min/max   = 1.2/2.0
+coerceIn  = 2.0
+byKey     = [alpha, beta, stable]
+seqByKey  = [alpha, beta, stable]
+seqSorted = [1.2, 1.10, 2.0]
+comparator= [alpha, beta, stable]
+in range  = true

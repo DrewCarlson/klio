@@ -1242,7 +1242,7 @@ fn applyBufferedOp(
             items.* = nx;
         },
         .Sorted => |descending| {
-            if (sortNatural(items.items, descending)) |e| return e;
+            if (try sortNatural(host, out, items.items, descending)) |e| return e;
         },
         .SortedBy => |sb| {
             var keyed = try allocator.alloc(Value, items.items.len);
@@ -1254,7 +1254,7 @@ fn applyBufferedOp(
                     .err => |e| return e,
                 }
             }
-            if (sortByKey(items.items, keyed, sb.descending)) |e| return e;
+            if (try sortByKey(host, out, items.items, keyed, sb.descending)) |e| return e;
         },
         .SortedWith => |comparator| {
             // Insertion sort so the comparator callback can dispatch back
@@ -1586,14 +1586,36 @@ const Utf16Iter = struct {
     }
 };
 
-fn sortNatural(items: []Value, descending: bool) ?RuntimeError {
+/// Kotlin's natural ordering reaches any class that implements
+/// `Comparable`. The builtin table above covers the primitives; anything
+/// else dispatches its own `compareTo` before the sort gives up.
+fn compareValuesVia(
+    host: IntrinsicHost,
+    out: Output,
+    a: *const Value,
+    b: *const Value,
+) std.mem.Allocator.Error!CmpResult {
+    const builtin = compareValues(a, b);
+    if (builtin == .order) return builtin;
+    if (a.* != .Instance) return builtin;
+    const r = (try host.invokeMethod(a, "compareTo", &.{b.*}, out)) orelse return builtin;
+    switch (r) {
+        .ok => |v| {
+            const n = v.asI64() orelse return builtin;
+            return CmpResult{ .order = if (n < 0) .lt else if (n > 0) .gt else .eq };
+        },
+        .err => |e| return CmpResult{ .err = e },
+    }
+}
+
+fn sortNatural(host: IntrinsicHost, out: Output, items: []Value, descending: bool) std.mem.Allocator.Error!?RuntimeError {
     // Insertion sort: the comparison is fallible (returns RuntimeError data),
     // so a borrow-free total-order sort that can bail out is simplest.
     var i: usize = 1;
     while (i < items.len) : (i += 1) {
         var j = i;
         while (j > 0) {
-            switch (compareValues(&items[j - 1], &items[j])) {
+            switch (try compareValuesVia(host, out, &items[j - 1], &items[j])) {
                 .order => |o| {
                     const ord = if (descending) o.invert() else o;
                     if (ord == .gt) {
@@ -1608,12 +1630,12 @@ fn sortNatural(items: []Value, descending: bool) ?RuntimeError {
     return null;
 }
 
-fn sortByKey(items: []Value, keys: []Value, descending: bool) ?RuntimeError {
+fn sortByKey(host: IntrinsicHost, out: Output, items: []Value, keys: []Value, descending: bool) std.mem.Allocator.Error!?RuntimeError {
     var i: usize = 1;
     while (i < items.len) : (i += 1) {
         var j = i;
         while (j > 0) {
-            switch (compareValues(&keys[j - 1], &keys[j])) {
+            switch (try compareValuesVia(host, out, &keys[j - 1], &keys[j])) {
                 .order => |o| {
                     const ord = if (descending) o.invert() else o;
                     if (ord == .gt) {
