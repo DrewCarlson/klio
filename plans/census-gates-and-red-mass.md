@@ -69,7 +69,7 @@ the last measurement.
 
 | suite | passes | failures | opened at |
 |---|---|---|---|
-| serialization | 103 | 35 | 57 / 81 |
+| serialization | 110 | 28 | 57 / 81 |
 | datetime | 517 | 2 | 457 / 62 |
 | coroutines | 1268 | 31 | 1073 / 141 (+6 DNC) |
 | io | 1191 | 0 | 1182 / 9 |
@@ -1201,6 +1201,40 @@ recorded type's arguments — which required a local initialized by an
 object literal to record its supertype WITH type arguments, the only place
 an anonymous object's type arguments are written. Guarded by
 `examples/reified_from_argument.kt`.
+
+### Root: the plugin surface a `@Serializable` declaration names for itself
+
+Five roots behind the serialization lookups, each its own mechanism:
+
+  * `X.Companion` on a class value missed. A `@Serializable` class has no
+    DECLARED companion — the plugin writes it — so the class value stands in
+    for it, exactly as a bare `X` in value position does.
+  * `Data.Named.serializer()` asked the COMPANION for a serializer. The
+    companion is not the `@Serializable` declaration; its owner is.
+  * `@Serializable(with = Custom::class)` was ignored, so a declaration that
+    names its own serializer got a reflective one. Annotation records now
+    carry the class literal, `__klsx_customSerializer` reads it, and an
+    object answers its singleton while a class is constructed.
+  * A `@Serializer(forClass = C::class)` declaration is written with NO
+    supertype; the plugin makes it a `KSerializer<C>`. It now carries that
+    supertype, which is what `is KSerializer` and the lookups' `as` read.
+    Its generated body reads C's REFLECTIVE shape — going through C's own
+    `@Serializable(with = …)` names this declaration right back, which
+    recursed until the stack died.
+  * A reified type parameter with no arguments to solve from, called inside
+    a splice that binds exactly one reified name, takes that binding
+    (`EnumSerializer(serialName, enumValues())`).
+
+### Root: a class literal answered the builtin of the same simple name
+
+`object Target` beside `kotlin.annotation.Target`: `Target.tag` read the
+user's object but `Target::class` answered `kotlin.annotation.Target`, so
+`Target::class == (Target as Any)::class` was false and every registry keyed
+by the class literal missed. The `::class` arm resolved through the
+simple-name index, which holds whichever class registered last; it now
+resolves by the reference's own file and package first. Guarded by
+`examples/class_literal_builtin_name.kt` (`Target`, `Retention`,
+`Deprecated`).
 
 ### Root: an anonymous object's `is` stopped at its direct supertypes
 

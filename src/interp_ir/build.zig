@@ -4481,6 +4481,19 @@ fn annotationTargetEntries(
     return null;
 }
 
+/// Whether these annotations include `@Serializer(forClass = …)`.
+fn serializerForClassAnnotated(annotations: []const ast.Annotation) bool {
+    for (annotations) |*ann| {
+        if (ann.path.len == 0) continue;
+        const name = ann.path[ann.path.len - 1].name;
+        if (!std.mem.eql(u8, name, "Serializer")) continue;
+        for (ann.args) |*arg| {
+            if (arg.* == .MemberRef and std.mem.eql(u8, arg.MemberRef.name.name, "class")) return true;
+        }
+    }
+    return false;
+}
+
 /// Lower one source annotation entry to a runtime record: resolved FQN
 /// candidates plus resolved constructor arguments.
 fn annotationRecordFor(
@@ -4678,8 +4691,18 @@ fn buildClassDef(
     var secondary = try a.alloc(FF(ast.SecondaryCtor), c.secondary_ctors.len);
     for (c.secondary_ctors, 0..) |*sc, i| secondary[i] = FF(ast.SecondaryCtor).fromPtr(sc);
 
-    var supertype_names = try a.alloc([]const u8, c.supertypes.len);
-    var supertype_paths = try a.alloc(?[]const u8, c.supertypes.len);
+    // `@Serializer(forClass = C::class)` is written on a declaration with no
+    // supertype at all; the kotlinx plugin makes it a `KSerializer<C>`. That
+    // supertype is what `is KSerializer` and `as KSerializer` read, and what
+    // a serializer lookup casts its answer to.
+    const serializer_supertype = c.supertypes.len == 0 and serializerForClassAnnotated(c.annotations);
+    const extra: usize = if (serializer_supertype) 1 else 0;
+    var supertype_names = try a.alloc([]const u8, c.supertypes.len + extra);
+    var supertype_paths = try a.alloc(?[]const u8, c.supertypes.len + extra);
+    if (serializer_supertype) {
+        supertype_names[c.supertypes.len] = "KSerializer";
+        supertype_paths[c.supertypes.len] = null;
+    }
     for (c.supertypes, 0..) |*t, i| {
         // A supertype naming a renamed file-private class resolves to the
         // mangled lift name; the rename is keyed by the reference's own
