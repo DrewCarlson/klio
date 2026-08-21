@@ -1,0 +1,2 @@
+lost after receive-cancel = [recv:A]
+lost after send-cancel    = [recv:A, send:B]

@@ -14,12 +14,16 @@ package kotlinx.coroutines.selects
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.channels.ChannelResult
+import kotlinx.coroutines.internal.callUndeliveredElement
 
 // Host intrinsics implemented in `src/kotlinx_coroutines`.
 internal fun __kxco_chanSelectAddReceiver(channel: Any, select: Any) {}
 internal fun __kxco_chanSelectRemoveReceiver(channel: Any, select: Any) {}
 internal fun __kxco_chanSelectAddSender(channel: Any, select: Any) {}
-internal fun __kxco_chanSelectRemoveSender(channel: Any, select: Any) {}
+// Returns whether a STILL-PARKED waiter was removed — its element was never
+// sent, so the caller reports it to `onUndeliveredElement`.
+internal fun __kxco_chanSelectRemoveSender(channel: Any, select: Any): Boolean = false
+internal fun __kxco_chanUndeliveredHandler(channel: Any): Any? = null
 // Returns 0 = took a value (written into holder.__value__),
 // 1 = closed, 2 = not ready.
 internal fun __kxco_chanSelectPollReceive(channel: Any, holder: KlioClauseHolder): Int = 2
@@ -43,7 +47,8 @@ public val <E> ReceiveChannel<E>.onReceive: SelectClause1<E>
     get() = SelectClause1Impl(
         clauseObject = this,
         regFunc = ::klioRegReceive as RegistrationFunction,
-        processResFunc = ::klioProcessReceive as ProcessResultFunction
+        processResFunc = ::klioProcessReceive as ProcessResultFunction,
+        onCancellationConstructor = klioReceiveCancellationConstructor(this)
     )
 
 @Suppress("UNUSED_PARAMETER")
@@ -83,7 +88,8 @@ public val <E> ReceiveChannel<E>.onReceiveCatching: SelectClause1<ChannelResult<
     get() = SelectClause1Impl(
         clauseObject = this,
         regFunc = ::klioRegReceive as RegistrationFunction,
-        processResFunc = ::klioProcessReceiveCatching as ProcessResultFunction
+        processResFunc = ::klioProcessReceiveCatching as ProcessResultFunction,
+        onCancellationConstructor = klioReceiveCancellationConstructor(this)
     )
 
 @Suppress("UNCHECKED_CAST")
@@ -104,15 +110,25 @@ public val <E> SendChannel<E>.onSend: SelectClause2<E, SendChannel<E>>
         processResFunc = ::klioProcessSend as ProcessResultFunction
     )
 
-@Suppress("UNUSED_PARAMETER")
+@Suppress("UNUSED_PARAMETER", "UNCHECKED_CAST")
 private fun klioRegSend(clauseObject: Any, select: SelectInstance<*>, param: Any?) {
     when (__kxco_chanSelectPollSend(clauseObject, param)) {
         0 -> select.selectInRegistrationPhase(Unit)
         1 -> select.selectInRegistrationPhase(KLIO_CLOSED)
         else -> {
             __kxco_chanSelectAddSender(clauseObject, select)
+            val context = select.context
             select.disposeOnCompletion(DisposableHandle {
-                __kxco_chanSelectRemoveSender(clauseObject, select)
+                // A waiter still parked at disposal never sent its element
+                // (the select was cancelled, or another clause won): report
+                // it undelivered, exactly as the channel's own sender-queue
+                // cancellation does.
+                if (__kxco_chanSelectRemoveSender(clauseObject, select)) {
+                    val h = __kxco_chanUndeliveredHandler(clauseObject)
+                    if (h != null) {
+                        (h as (Any?) -> Unit).callUndeliveredElement(param, context)
+                    }
+                }
             })
         }
     }
@@ -130,6 +146,22 @@ private fun klioProcessSend(clauseObject: Any, param: Any?, result: Any?): Any? 
         }
     }
     return clauseObject
+}
+
+// The action a delivered-then-cancelled `onReceive` runs: the value already
+// handed to the select is undelivered when its coroutine is cancelled before
+// dispatch. Mirrors `BufferedChannel.onUndeliveredElementReceiveCancellationConstructor`.
+@Suppress("UNCHECKED_CAST")
+private fun klioReceiveCancellationConstructor(channel: Any): OnCancellationConstructor? {
+    val h = __kxco_chanUndeliveredHandler(channel) ?: return null
+    return { select: SelectInstance<*>, _: Any?, internalResult: Any? ->
+        { _, _, _ ->
+            val element: Any? = if (internalResult is KlioClauseHolder) internalResult.value else internalResult
+            if (internalResult !== KLIO_CLOSED) {
+                (h as (Any?) -> Unit).callUndeliveredElement(element, select.context)
+            }
+        }
+    }
 }
 
 private fun closedReceiveException(channel: Any): Throwable =

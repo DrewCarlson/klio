@@ -1720,12 +1720,36 @@ pub fn enclosingEntriesAlloc(allocator: Allocator) Allocator.Error![]EnclosingEn
 /// whichever thread) that happens. `access` entries are dispatch-transient
 /// and excluded. Caller owns the returned slice.
 pub fn captureChainAlloc(allocator: Allocator) Allocator.Error![]EnclosingEntry {
-    const chain = evtls.active_chain orelse return allocator.alloc(EnclosingEntry, 0);
     var out: std.ArrayList(EnclosingEntry) = .empty;
     errdefer out.deinit(allocator);
-    for (chain.items) |e| {
-        if (e.kind == .access) continue;
-        try out.append(allocator, e);
+    if (evtls.active_chain) |chain| {
+        for (chain.items) |e| {
+            if (e.kind == .access) continue;
+            try out.append(allocator, e);
+        }
+    }
+    // The creating function's OWN receiver (`this`, params[0] of an
+    // extension or member) is the innermost lexical receiver at the
+    // literal, and it lives in the frame's params — never on the enclosing
+    // chain. Without it a lambda inside `ReceiveChannel.toList()` had only
+    // the buildList receiver in scope and `consumeEach(::add)` dispatched
+    // on the MutableList.
+    if (evtls.frame_chain) |fr| {
+        if (fr.func.params.len != 0 and std.mem.eql(u8, fr.func.params[0].name, "this") and
+            fr.params.items.len != 0)
+        {
+            const own = fr.params.items[0];
+            const dup = blk: {
+                if (out.items.len == 0) break :blk false;
+                const last = out.items[out.items.len - 1].v;
+                if (last == .Instance and own == .Instance)
+                    break :blk last.Instance.identity() == own.Instance.identity();
+                break :blk false;
+            };
+            if (!dup and own != .Null and own != .Unit) {
+                try out.append(allocator, .{ .v = own, .kind = .receiver });
+            }
+        }
     }
     return out.toOwnedSlice(allocator);
 }

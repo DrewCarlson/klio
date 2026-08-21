@@ -1276,14 +1276,17 @@ fn lowerAssign(
     // rebind path instead loses the write — and when a same-named member
     // field exists, `storeCombinedToTarget`'s member fallback overwrites
     // THAT field with the combined value.
+    // A name that is BOTH locally resolvable and known-outer is a captured
+    // immutable (a lambda capturing the enclosing fn's parameter): Kotlin
+    // can only mean `<op>Assign` on it — the rebind path wrote a fresh
+    // value into the capture cell and the caller's map stayed empty
+    // (`dest += transform(element)` inside `Flow.associateTo`'s collect).
+    // A captured written `var` is boxed and stays excluded.
     const path_is_val = switch (target.*) {
         .Path => |p| p.segments.len == 1 and
             !b.isMutable(p.segments[0].name) and
             !b.isBoxed(p.segments[0].name) and
-            (if (b.resolve(p.segments[0].name) != null)
-                !b.knowsOuter(p.segments[0].name)
-            else
-                b.knowsOuter(p.segments[0].name)),
+            (b.resolve(p.segments[0].name) != null or b.knowsOuter(p.segments[0].name)),
         else => false,
     };
     if (op != .Assign and path_is_val) {

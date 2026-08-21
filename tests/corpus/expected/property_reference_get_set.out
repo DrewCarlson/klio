@@ -1,0 +1,5 @@
+unbound set = 11
+unbound get = 11
+bound set   = loud
+bound get   = loud
+table       = 42/table
