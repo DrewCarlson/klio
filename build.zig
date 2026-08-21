@@ -110,7 +110,7 @@ const itests_files = [_]Itest{
     // parity_conformance runs inside parity_threaded_litmus now (same
     // fixture-driver shape, one binary, both fixture dirs declared there and
     // its weight folded in); the deleted entry is not a dropped suite.
-    .{ .name = "parity_corpus_pinned", .dirs = &.{"tests/fixtures/parity_corpus"}, .weight = 50 },
+    .{ .name = "parity_corpus_pinned", .dirs = &.{ "tests/fixtures/parity_corpus", "examples/file_private_collision" }, .weight = 50 },
     .{ .name = "parity_coroutines_realistic", .dirs = &.{"tests/fixtures/coroutine_smoke"}, .weight = 16 },
     .{ .name = "parity_data_class_features" },
     .{ .name = "parity_dsl_operators" },

@@ -821,6 +821,25 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
             }
         }
     }
+    // File-private gate: a top-level `private fun` is visible only inside
+    // its declaring file. The flat name registry is file-blind, so two
+    // files each declaring the same-signature private function let one
+    // file's call record the OTHER file's declaration — and the eager pick
+    // then overrides the per-file mangled name lowering resolved
+    // correctly (kotlinx's two `private fun createSegment`).
+    if (sig.decl_span) |ds| {
+        if (ds.file.int() != call_span.file.int()) {
+            if (self.fn_visibility.get(record_name)) |entries| {
+                for (entries.items) |vf| {
+                    if (vf.file.int() != ds.file.int()) continue;
+                    if (vf.visibility == .Private) {
+                        eagerGate(5);
+                        return;
+                    }
+                }
+            }
+        }
+    }
     if (sig.decl_span) |ds| {
         const decl_pkg = self.file_packages.get(ds.file.int()) orelse "";
         const call_pkg = self.file_packages.get(call_span.file.int()) orelse "";

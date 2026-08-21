@@ -638,6 +638,24 @@ test "member_factory_constructor_shadow" {
     );
 }
 
+test "file_private_collision" {
+    try checkFiles(&.{
+        "examples/file_private_collision/alpha.kt",
+        "examples/file_private_collision/beta.kt",
+        "examples/file_private_collision/main.kt",
+    },
+        \\alpha:A#1
+        \\alpha:A#2
+        \\alpha:A#3
+        \\alpha:A#4
+        \\beta:B#1
+        \\beta:B#2
+        \\beta:B#3
+        \\beta:B#4
+        \\
+    );
+}
+
 test "constructor_scope_import" {
     try checkFiles(&.{
         CORPUS_DIR ++ "/constructor_scope_import/lib.kt",
