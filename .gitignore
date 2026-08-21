@@ -18,3 +18,6 @@ scripts/__pycache__/
 .klio-census-home3/
 .klio/
 .sweep-home/
+
+# Session scratch programs and census dumps.
+scratchpad/
