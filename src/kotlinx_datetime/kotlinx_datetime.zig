@@ -393,11 +393,21 @@ fn tzifOffsetLocal(data: []const u8, local_epoch: i64) ?i32 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const table = parseTzif(arena.allocator(), data) orelse return null;
-    // Walk transitions in local time and pick the segment whose local span
-    // contains `local_epoch` (local = utc + offset).
+    // Walk transitions in local time and pick the offset a local date-time
+    // maps through. A transition's two offsets disagree about where it sits
+    // on the local timeline, and BOTH ambiguous shapes resolve to the
+    // EARLIER offset, so the new one takes over only once the local time is
+    // past the transition under both readings:
+    //
+    //   * fall back (`new < prev`): the local hour repeats, and Kotlin picks
+    //     the first pass — `2007-10-28T02:30` in Europe/Paris is +02:00;
+    //   * spring forward (`new > prev`): the local hour does not exist, and
+    //     the result is the local time read with the offset BEFORE the gap
+    //     (equivalently, shifted later by the gap and read with the new one).
     var off = table.initial_offset;
     for (table.entries) |e| {
-        const seg_local_start = e.transition + e.offset;
+        const later = if (e.offset > off) e.offset else off;
+        const seg_local_start = e.transition + later;
         if (local_epoch >= seg_local_start) off = e.offset else break;
     }
     return off;
@@ -875,6 +885,41 @@ test "localToInstant is the inverse in UTC" {
     defer testing.allocator.free(items);
     try testing.expectEqual(@as(i64, 1_700_000_000), items[0].Long);
     try testing.expectEqual(@as(i64, 0), items[1].Long);
+}
+
+test "an ambiguous local time resolves to the earlier offset" {
+    // Europe/Paris 2007: spring forward 03-25 01:00Z (+1 -> +2), fall back
+    // 10-28 01:00Z (+2 -> +1). Both ambiguous shapes read through the
+    // EARLIER offset, so the repeated 02:30 is the first pass and the
+    // missing 02:30 lands one hour past the gap's start.
+    var hh = Harness.init();
+    defer hh.deinit();
+    if (!zoneExists(testing.allocator, "Europe/Paris")) return error.SkipZigTest;
+
+    const Case = struct { month: i32, expect: i64 };
+    const cases = [_]Case{
+        // 2007-10-28T02:30 local, +02:00 -> 2007-10-28T00:30Z
+        .{ .month = 10, .expect = 1193531400 },
+        // 2007-03-25T02:30 local, +01:00 -> 2007-03-25T01:30Z
+        .{ .month = 3, .expect = 1174786200 },
+    };
+    for (cases) |c| {
+        var tz = try runtime.strInit(testing.allocator, "Europe/Paris");
+        defer tz.deinit();
+        const day: i32 = if (c.month == 10) 28 else 25;
+        const args = [_]Value{
+            .{ .Int = 2007 }, .{ .Int = c.month }, .{ .Int = day },
+            .{ .Int = 2 },    .{ .Int = 30 },      .{ .Int = 0 },
+            .{ .Int = 0 },    .{ .String = tz },
+        };
+        var ctx = hh.ctx(&args);
+        const r = try localToInstant(&ctx);
+        try testing.expect(r == .ok);
+        defer freeArray(r.ok);
+        const items = try r.ok.Array.snapshot(testing.allocator);
+        defer testing.allocator.free(items);
+        try testing.expectEqual(c.expect, items[0].Long);
+    }
 }
 
 test "localToInstant rejects an impossible date" {
