@@ -926,11 +926,36 @@ receivers and the declaring instance rides the enclosing chain;
 `invokeResolvedMember` seeds it (`pushEnclosing`) but the dynamic walk does
 not.
 
-Seeding it in `invokeMethodFuncId` was tried and reverted: a trace shows that
-function is never reached for `notifyCompletion`, so it arrives by some third
-path. **Next step:** find which invoke actually runs a member extension here —
-instrument the entries that can (`invokeResolvedMember`, the virtual-slot
-invoke, the flat preparations) and check which one omits the enclosing push.
+**The path is `invokeResolvedMember`, and it DOES push.** `KLIO_CM_TRACE`
+shows the call site emits `resolved=true dispatch=KlioBlockingCoroutine`, the
+flat preparation declines member extensions, and a trace inside
+`invokeResolvedMember` confirms `kind=member_extension dispatch=true`. So the
+declaring instance reaches the chain. Seeding it again in
+`invokeMethodFuncId` was tried and reverted — that function is never reached
+here.
+
+**The real gap is the SPLICE, not the chain.** `notifyHandlers` is
+`private inline`, and a private inline member has NO dispatchable registration:
+`[extfb] name=notifyHandlers simple-name fids=0` — it is not in the module's
+name index at all. So a call that does not splice has nothing to find. Two
+lowering changes make it splice (verified with `KLIO_SPLICE_TRACE`: `[splice]
+notifyHandlers entered, params=3` with all three params bound):
+
+  1. `inlineBodyRecvChain` appending the OWNER class chain after the extension
+     receiver's — a member extension's body has both receivers in scope.
+  2. `bareInlineNeedsSplice` returning true for a private inline member of the
+     enclosing class, since the splice is its only route.
+
+Both were REVERTED: with them the coroutines census goes 1124/90 -> 1123/91 (a
+net loss elsewhere), and this test still fails — the failure moves further
+along, to a `getfield-miss` on `runTest` (the `TestBase` member vs the
+top-level `kotlinx.coroutines.test.runTest`). So the cluster has at least two
+layers, and the first one alone is not worth its regression.
+
+**Next step:** find what the owner-chain widening breaks (one test, somewhere
+in coroutines) — it is the more principled of the two changes and the loss is
+probably a same-named member now reachable through the owner. Then the second
+layer, `runTest` resolution inside a `TestBase` subclass.
 
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 
