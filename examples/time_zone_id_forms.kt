@@ -7,6 +7,7 @@
 
 import kotlinx.datetime.FixedOffsetTimeZone
 import kotlinx.datetime.TimeZone
+import kotlinx.datetime.UtcOffset
 
 fun main() {
     val sameOffset = listOf("+4", "+04", "+04:00", "+0400", "UTC+4", "UT+04", "GMT+04:00:00")
@@ -23,6 +24,13 @@ fun main() {
     println("+0  -> " + TimeZone.of("+0").id)
     println("UTC -> " + TimeZone.of("UTC").id)
     println("GMT -> " + TimeZone.of("GMT").id)
+
+    // Parsing the same offset twice yields the same instance: an offset is a
+    // value, and the zero offset is `UtcOffset.ZERO` however it was written.
+    println("Z is ZERO    = " + (UtcOffset.parse("Z") === UtcOffset.ZERO))
+    println("+00:00 ZERO  = " + (UtcOffset.parse("+00:00") === UtcOffset.ZERO))
+    println("-00:00:00    = " + (UtcOffset.parse("-00:00:00") === UtcOffset.ZERO))
+    println("+04:00 twice = " + (UtcOffset.parse("+04:00") === UtcOffset.parse("+04:00")))
 
     // A region id is not a fixed offset.
     val paris = TimeZone.of("Europe/Paris")

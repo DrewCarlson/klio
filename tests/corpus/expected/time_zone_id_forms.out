@@ -10,6 +10,10 @@ ids distinct     = 4
 +0  -> Z
 UTC -> UTC
 GMT -> GMT
+Z is ZERO    = true
++00:00 ZERO  = true
+-00:00:00    = true
++04:00 twice = true
 region fixed = false id=Europe/Paris
 accepts UTC+ = false
 accepts + = false

@@ -847,6 +847,18 @@ class UtcOffset internal constructor(val totalSeconds: Int) {
     companion object {
         val ZERO: UtcOffset = UtcOffset(0)
 
+        // Offsets are value types, and the whole-quarter-hour ones are what
+        // real data uses, so hand back one instance per offset: `assertSame`
+        // on two parses of the same offset holds, as it does upstream.
+        internal fun ofTotalSeconds(total: Int): UtcOffset {
+            if (total == 0) return ZERO
+            if (total % 900 != 0) return UtcOffset(total)
+            utcOffsetCache[total]?.let { return it }
+            val made = UtcOffset(total)
+            utcOffsetCache[total] = made
+            return made
+        }
+
         fun parse(input: CharSequence): UtcOffset {
             val s = input.toString()
             if (s == "Z" || s == "z") return ZERO
@@ -857,13 +869,14 @@ class UtcOffset internal constructor(val totalSeconds: Int) {
                 ?: throw DateTimeFormatException("Invalid ISO-8601 UTC offset: $input")
             if (secs < -18 * 3600 || secs > 18 * 3600)
                 throw DateTimeFormatException("UTC offset out of range: $input")
-            return UtcOffset(secs)
+            return ofTotalSeconds(secs)
         }
         fun parseOrNull(input: CharSequence): UtcOffset? = try { parse(input) } catch (e: Exception) { null }
         fun orNull(hours: Int? = null, minutes: Int? = null, seconds: Int? = null): UtcOffset? =
             try { UtcOffset(hours, minutes, seconds) } catch (e: Exception) { null }
 
-        fun parse(input: CharSequence, format: DateTimeFormat<UtcOffset>): UtcOffset = format.parse(input)
+        fun parse(input: CharSequence, format: DateTimeFormat<UtcOffset>): UtcOffset =
+            ofTotalSeconds(format.parse(input).totalSeconds)
 
         fun Format(block: DateTimeFormatBuilder.WithUtcOffset.() -> Unit): DateTimeFormat<UtcOffset> =
             UtcOffsetFormat.build(block)
@@ -880,6 +893,9 @@ fun UtcOffset.Companion.parseOrNull(input: CharSequence, format: DateTimeFormat<
     format.parseOrNull(input)
 
 fun UtcOffset.format(format: DateTimeFormat<UtcOffset>): String = format.format(this)
+
+// One instance per whole-quarter-hour offset, keyed by total seconds.
+private val utcOffsetCache: MutableMap<Int, UtcOffset> = mutableMapOf()
 
 private fun utcOffsetTotalSeconds(hours: Int?, minutes: Int?, seconds: Int?): Int = when {
     hours != null -> utcOffsetHms(hours, minutes ?: 0, seconds ?: 0)
