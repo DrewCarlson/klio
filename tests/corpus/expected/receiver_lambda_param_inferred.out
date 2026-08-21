@@ -1,0 +1,5 @@
+scope=outer
+scope=inner
+scope=outer
+outer#7
+scope=b|scope=a
