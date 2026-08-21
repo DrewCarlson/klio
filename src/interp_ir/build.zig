@@ -4505,6 +4505,14 @@ fn annotationRecordFor(
             else
                 .Other,
             .Member => |m| .{ .EnumEntry = m.name.name },
+            // `Foo::class` names the declaration the annotation is about
+            // (`@Serializer(forClass = Foo::class)`), not a value.
+            .MemberRef => |mr| blk: {
+                if (!std.mem.eql(u8, mr.name.name, "class")) break :blk .Other;
+                const recv = mr.receiver;
+                if (recv.* != .Path or recv.Path.segments.len == 0) break :blk .Other;
+                break :blk runtime.AnnotationArg{ .ClassRef = recv.Path.segments[recv.Path.segments.len - 1].name };
+            },
             else => .Other,
         };
     }

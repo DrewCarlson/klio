@@ -372,6 +372,13 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
                     for (cdef.supertype_names) |n| {
                         if (std.mem.eql(u8, n, target_simple)) return true;
                     }
+                    // An anonymous class records only the supertypes it was
+                    // WRITTEN with, and those are names, not resolved
+                    // handles: `object : KSerializer<Int> by …` never filled
+                    // `interfaces`, so the direct-name test above was the
+                    // whole answer and `is SerializationStrategy` — which
+                    // `KSerializer` extends — said false.
+                    if (supertypeNameChainMatches(self, cdef, target_simple, target_fqn, ty.name)) return true;
                 }
                 if (cdef.parent) |parent| {
                     cur = parent.clone();
@@ -424,6 +431,56 @@ fn typeAliasTarget(self: *VmHost, name: []const u8) ?[]const u8 {
 /// target against each by identity (`subtypeMatch`). The `interfaces` slices
 /// are linked package-aware, so the walk follows the real interface hierarchy;
 /// a same-simple-name interface in another package cannot be reached.
+/// Whether any TRANSITIVE supertype of a class recorded by NAME matches the
+/// target. `interfaceChainMatches` walks resolved `interfaces` handles, which
+/// a runtime-synthesized class never has; this resolves each recorded name to
+/// its registered declaration and continues from there.
+fn supertypeNameChainMatches(
+    self: *VmHost,
+    cdef: *const ClassDef,
+    target_simple: []const u8,
+    target_fqn: ?[]const u8,
+    raw_target: []const u8,
+) bool {
+    const a = self.allocator;
+    var queue: std.ArrayList([]const u8) = .empty;
+    defer queue.deinit(a);
+    var seen: std.ArrayList([]const u8) = .empty;
+    defer seen.deinit(a);
+    for (cdef.supertype_names) |n| queue.append(a, n) catch return false;
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const name = queue.items[head];
+        if (containsStr(seen.items, name)) continue;
+        seen.append(a, name) catch return false;
+        const def = classDefByNameLocal(self, name) orelse continue;
+        defer def.deinit();
+        const dg = def.borrow();
+        defer dg.deinit();
+        const d = dg.get();
+        if (subtypeMatch(self, d.name, d.fqn, target_simple, target_fqn, raw_target)) return true;
+        if (interfaceChainMatches(self, d, target_simple, target_fqn, raw_target)) return true;
+        for (d.supertype_names) |sn| queue.append(a, sn) catch return false;
+        if (d.parent) |parent| {
+            const pg = parent.borrow();
+            queue.append(a, pg.get().name) catch {};
+            pg.deinit();
+        }
+    }
+    return false;
+}
+
+fn classDefByNameLocal(self: *VmHost, name: []const u8) ?ObjRef(ClassDef) {
+    const g = self.classes.borrow();
+    defer g.deinit();
+    if (g.get().get(name)) |d| return d.clone();
+    const simple = lastSegment(name);
+    if (simple.len != name.len) {
+        if (g.get().get(simple)) |d| return d.clone();
+    }
+    return null;
+}
+
 fn interfaceChainMatches(
     self: *VmHost,
     cdef: *const ClassDef,
@@ -706,6 +763,10 @@ fn lowerAndRegisterMethods(
     defer _ = ir.build.setLowerAnonPropHeads(prev_prop_heads);
     host_instances.anonLowerEnter();
     defer host_instances.anonLowerExit();
+    // Occurrence counter per `name#arity`: two same-arity overloads of one
+    // name share that key, so each also registers under an indexed key.
+    var overload_seen = std.StringHashMap(usize).init(allocator);
+    defer overload_seen.deinit();
     for (class.members) |*m| {
         switch (m.*) {
             .Function => |*f| {
@@ -718,6 +779,10 @@ fn lowerAndRegisterMethods(
                 const tbl = self.anon_methods.borrowMut();
                 defer tbl.deinit();
                 const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ f.name.name, f.params.len });
+                const gop = try overload_seen.getOrPut(arity_name);
+                if (!gop.found_existing) gop.value_ptr.* = 0 else gop.value_ptr.* += 1;
+                const overload_name = try root.anonOverloadMemberName(allocator, arity_name, gop.value_ptr.*);
+                try tbl.get().put(try anonKey(allocator, class.name.name, overload_name), .{ .module = sub_ref.clone(), .func = fid, .captures = caps });
                 try tbl.get().put(try anonKey(allocator, class.name.name, arity_name), entry);
                 try tbl.get().put(try anonKey(allocator, class.name.name, f.name.name), .{ .module = sub_ref.clone(), .func = fid, .captures = caps });
             },
@@ -1038,6 +1103,15 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
                     if (tbl.get().getPtr(key)) |entry| {
                         entry.captures = capture_pairs;
                     }
+                }
+                // The indexed keys of a same-arity overload family are dense
+                // from zero, so patch until one is missing.
+                var overload_index: usize = 0;
+                while (true) : (overload_index += 1) {
+                    const member = try root.anonOverloadMemberName(allocator, arity_name, overload_index);
+                    const key = try anonKey(allocator, class.name.name, member);
+                    const entry = tbl.get().getPtr(key) orelse break;
+                    entry.captures = capture_pairs;
                 }
             },
             // Accessor / property-initializer thunks capture the same outer

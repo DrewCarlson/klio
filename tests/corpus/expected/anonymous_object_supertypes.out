@@ -1,0 +1,7 @@
+named    = leaf/named/1
+body     = leaf/body/2
+is Root  = true
+as Root  = body
+delegate = leaf/named/1
+subclass = sub/true
+bare     = false/true

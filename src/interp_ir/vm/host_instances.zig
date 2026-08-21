@@ -4256,6 +4256,10 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     const inherited_tps: []const []const u8 =
         if (site_built) &.{} else ir.eval.currentFrameTypeParams();
     anonLowerEnter();
+    // Occurrence counter per `name#arity`: two same-arity overloads of one
+    // name share that key, so each also registers under an indexed key.
+    var overload_seen = std.StringHashMap(usize).init(allocator);
+    defer overload_seen.deinit();
     for (members) |*m| {
         switch (m.*) {
             .Function => |*f| {
@@ -4272,6 +4276,10 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 const tbl = self.anon_methods.borrowMut();
                 inheritAnonTypeParams(self, inherited_tps, fid);
                 const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ f.name.name, f.params.len });
+                const gop = try overload_seen.getOrPut(arity_name);
+                if (!gop.found_existing) gop.value_ptr.* = 0 else gop.value_ptr.* += 1;
+                const overload_name = try root.anonOverloadMemberName(allocator, arity_name, gop.value_ptr.*);
+                tbl.get().put(try anonKey(allocator, synth_class_name, overload_name), .{ .module = sub_ref.clone(), .func = fid, .captures = &.{} }) catch {};
                 if (runtime.envOnce("KLIO_ANON_AUDIT") != null) {
                     std.debug.print("[ANON] method {s}.{s} fid={d}\n", .{ synth_class_name, arity_name, fid.int() });
                 }

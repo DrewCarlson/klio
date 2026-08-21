@@ -64,17 +64,20 @@ them. Any new census must state which it is.
 
 Failures tolerated by the ceilings, worst ratio first:
 
-| suite | passes | failures | conforming |
+The column on the right is where the campaign opened; the one before it is
+the last measurement.
+
+| suite | passes | failures | opened at |
 |---|---|---|---|
-| serialization | 57 | 81 | 41% |
-| datetime | 457 | 62 | 88% |
-| coroutines | 1073 | 141 (+6 DNC) | 88% |
-| io | 1182 | 9 | 99% |
-| compose_plugin | 1375 | 15 | 99% |
-| androidx_collection | 1309 | 15 | 99% |
-| atomicfu | 67 | 0 | 100% |
-| ktor | 448 | 2 | 99.6% (both upstream skew) |
-| stdlib | 2301 | 0 | 100% |
+| serialization | 103 | 35 | 57 / 81 |
+| datetime | 517 | 2 | 457 / 62 |
+| coroutines | 1268 | 31 | 1073 / 141 (+6 DNC) |
+| io | 1191 | 0 | 1182 / 9 |
+| androidx_collection | 1841 | 0 | 1309 / 15 |
+| atomicfu | 67 | 0 | 67 / 0 |
+| ktor | 450 | 0 | 448 / 2 |
+| stdlib (sweep) | 117 files | 0 | 2301 / 0 |
+| compose_plugin | not re-measured | — | 1375 / 15 |
 
 - [ ] B1. **serialization descriptor fidelity.** klio has no serialization
       compiler plugin, so `T.serializer()` resolves to a reflective
@@ -1133,33 +1136,82 @@ non-inline sibling binds `R`'s extension). Setting
 nothing, so the lambda builder takes the receiver from another channel —
 the receiver TOWER is the next place to look.
 
-### Open: `contextual(kClass, serializer)` binds the provider overload
+### Root: an unclaimed classifier header dispatched a defaulted member directly
 
-`SerializersModule + SerializersModule` throws
+`SerializersModule + SerializersModule` threw
 `SerializerAlreadyRegisteredException` for two modules holding the SAME
-serializer. Established by instrumenting the pack sources:
+serializer, and every copied serializer landed as an anonymous PROVIDER.
 
-  * both modules really hold `ContextualProvider.Argless` — the builder's
-    Argless override runs for the original registrations;
-  * `dumpTo`'s `when (serial) { is Argless -> ... }` takes the right
-    branch, and `serial.serializer` really is the ReflectiveKSerializer
-    (printed from a `val` in the branch);
-  * yet `collector.contextual(kclass as KClass<Any>, ser0 as
-    KSerializer<Any>)` runs the PROVIDER override — traced by a print
-    inside each override — so the argument arrives SAM-wrapped as an
-    `IrClosure` and the aggregate holds two `WithTypeArguments`, which have
-    no `equals` and collide.
+The chain, established by instrumenting the pack and then the dispatcher:
 
-The pick is over the receiver's DECLARED type (`SerializersModuleCollector`),
-where the KSerializer form is a defaulted interface method and the provider
-form is abstract. Nine reductions of that shape all resolve CORRECTLY:
-concrete-typed receiver, interface-typed receiver, split across files,
-inside a `forEach` with a destructured pair, with `as` casts on both
-arguments, with a star-projected argument, with the provider override
-declared first, through a generic interface hierarchy, and with a
-same-named top-level function in scope. Whatever separates the real case
-is not in that list; the next step is to instrument the member overload
-scorer for this call rather than reduce further.
+  * `dumpTo` really takes the `Argless` branch and really passes the
+    `ReflectiveKSerializer` — the pick is not the problem;
+  * the call `collector.contextual(kClass, serializer)` reached the
+    INTERFACE's default body, whose forward is
+    `contextual(kClass) { serializer }`. That lambda is the provider the
+    scorer then saw, so the overload trace was a consequence, not a cause;
+  * lowering resolved the call correctly (`target=624 dispatch=virtual`)
+    and then DOWNGRADED it to a direct fid call, because
+    `dispatchForTarget` reads a stub owner's all-false modifiers as
+    "closed class, final method".
+
+`SerializersModuleCollector` is a stub at that moment: the pack lowers
+`SerializersModule.kt` before the collector's own file fills its header, so
+`is_interface`/`is_open`/`is_abstract` are still placeholders.
+`resolveMemberCall` already answered `virtual` for a stub;
+`dispatchForTarget` now agrees. Guarded by an `ir` unit test (the
+placeholder shape) and `examples/serializers_module_merge.kt`.
+
+Traps this cost time on: the bake cache in the data home serves a
+pre-lowered pack, so `KLIO_EXT_TRACE` printed nothing for pack code until
+`.klio-local/.klio/cache` was cleared; and `[pmo-multi]`/`[rim]` describe
+only the calls that REACH dispatch — a direct call is invisible there, and
+its absence from the trace is the evidence.
+
+### Root: two same-arity overrides on one anonymous class shared a key
+
+With the interface default no longer intercepting, `overwriteWith` failed
+with `call_member invoke on ReflectiveKSerializer`: its anonymous collector
+declares both `contextual` overloads, `anon_methods` keys them
+`name#arity`, and the second registration overwrote the first — so the
+virtual slot for the serializer form ran the provider body. Each
+declaration now also registers under `name#arity#<n>`, and
+`runtimeVirtualOverride` walks those, taking the one whose parameter type
+heads are the slot root's.
+
+### Root: `@Serializer(forClass = C::class)` had no body at all
+
+The kotlinx plugin generates that declaration's `descriptor`, `serialize`
+and `deserialize` from `C`. klio has no plugin and no fallback, so
+`ASerializer.descriptor` was a `get_field` miss. Annotation records now
+carry a `ClassRef` argument (the lowering recorded `Foo::class` as
+`.Other`), and both the member-call and field misses forward to `C`'s own
+serializer. Guarded by `examples/serializer_for_class.kt`.
+
+### Root: a reified type parameter was not solved from its argument
+
+`inline fun <reified T : Any> f(v: T) = T::class` called as `f(42)` left
+`T` unbound, so the splice declined and the un-spliced body read a
+PROCESS-GLOBAL `T` — unresolved on the first call, and the PREVIOUS call's
+answer on every later one (`f(42)` then `f("x")` both printed `Int`).
+`inferReifiedTypeArgs` only solved a bare-`T` parameter from a constructor
+argument. It now also takes the argument's recorded static type, and for a
+generic parameter (`serializer: KSerializer<T>`) unifies against that
+recorded type's arguments — which required a local initialized by an
+object literal to record its supertype WITH type arguments, the only place
+an anonymous object's type arguments are written. Guarded by
+`examples/reified_from_argument.kt`.
+
+### Root: an anonymous object's `is` stopped at its direct supertypes
+
+`object : KSerializer<Int> by … {}` answered `is KSerializer` true and
+`is SerializationStrategy` FALSE, so `getPolymorphic`'s
+`as? SerializationStrategy<T>` returned null for a registration that was
+really there. A runtime-synthesized class records supertype NAMES and never
+fills the resolved `interfaces` handles `interfaceChainMatches` walks, so
+the direct-name test was the whole answer. The names are now resolved to
+their declarations and walked transitively. Guarded by
+`examples/anonymous_object_supertypes.kt`.
 
 ### Fixed: `onUndeliveredElement`
 
@@ -1248,26 +1300,34 @@ ready-queue check then sends the resume behind the timer that just came due
   `receiver::method` built a synthetic instance whose class named no
   supertypes, so `is Function0<*>` was false.
 
-### Open: a member call on a bound reference invokes it
+### Root: a member call on a bound reference invoked it
 
 `s::produce` is a `$bound_ref$produce` synthetic instance. A member call on
-it that is not `invoke` — `f.asFlow()`, or any extension declared on a
-function type — returns the BOUND METHOD's result instead of binding the
-extension: `(() -> T).asFlow()` on `source::produce` yields an `Int`, so
-`FlowOnTest`'s three cases die on `flowOn`/`size` over a `kotlin.Int`.
+it that was not `invoke` — `f.asFlow()`, or any extension declared on a
+function type — returned the BOUND METHOD's result instead of binding the
+extension: `(() -> T).asFlow()` on `source::produce` yielded an `Int`, so
+`FlowOnTest`'s three cases died on `flowOn`/`size` over a `kotlin.Int`.
 
-Established: the value really is the synthetic instance (it invokes
-correctly, and now answers `is Function0<*>` after the supertypes landed);
-`callMemberInnerStatic` IS entered with the extension's name; and the
-extension fallback is never reached (`[extfb]` silent under
-`KLIO_MISS_TRACE`), so an arm between the two returns the invoke result.
-The `.IrClosure`-gated SAM-direct arm in `callMember` is NOT it (a bound
-ref is an Instance), and neither is the `__sam_target__` slot path.
-Instrumenting every `return` in `callMemberInnerStatic` produced no hit,
-so the arm returns through a form the naive scan missed (a multi-line
-`return switch`, an `orelse return`, or a same-line `if (…) return`). Next
-step is a shim around `callMemberInnerStatic` that logs its result, then
-bisecting inward.
+Two roots, both in `host_call_member.zig`:
+
+1. `boundRefDispatch`'s tail forwarded EVERY unknown member name to the
+   bound member. It now declines when an extension declared on a function
+   type is in scope for the name (`invoke`/`call` keep forwarding — those
+   are the reference's own surface), so the ordinary member/extension walk
+   runs.
+2. With the walk reached, the extension fallback kept eight lenient
+   `asFlow` survivors and picked `Iterable<T>.asFlow()` — the flow body
+   then called `iterator()` on the reference (`get_field entries on
+   $bound_ref$produce`). `receiverDefinitelyNotParam` disproved nominal
+   receiver types for `.IrClosure`/`.BoundMethod` only. A bound reference
+   is a function value carried as an Instance, so the same rule applies to
+   it: `isBoundReference` now feeds the callable-receiver arm.
+
+`FlowOnTest` 15/3 -> 17/1 (the survivor is a distinct
+`CancellationException`-vs-`IllegalStateException` shape). Guarded by
+`examples/bound_callable_reference.kt`, which now declares
+`(() -> T).twice()`, `(() -> Int).label()` and a same-named
+`Iterable<T>.label()` and asserts each binds its own receiver.
 
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 

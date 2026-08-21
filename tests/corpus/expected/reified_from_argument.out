@@ -1,0 +1,6 @@
+literal  = Int
+string   = String
+local    = Boolean
+mixed    = Int,String,Char
+registry = [Int=3, String=three]
+handler  = Int -> int:7

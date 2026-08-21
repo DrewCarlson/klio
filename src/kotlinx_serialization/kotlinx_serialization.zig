@@ -898,6 +898,11 @@ fn annotationArgValue(
                 .err => null,
             };
         },
+        .ClassRef => |name| {
+            const cls_val = ctx.host.lookupGlobal(name) orelse return null;
+            if (cls_val != .Class) return null;
+            return cls_val;
+        },
         .Other => return null,
     }
 }

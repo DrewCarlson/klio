@@ -2007,6 +2007,16 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             }
         }
     }
+    // `@Serializer(forClass = C::class)` marks a declaration the kotlinx
+    // plugin fills in; `descriptor` is one of the properties it generates.
+    if (try host_call_member.serializerForClassTarget(self, allocator, receiver)) |ser| {
+        defer ser.release(allocator);
+        const forwarded = try getFieldInner(self, allocator, &ser, name, suppress_cc_redirect, member_probe);
+        switch (forwarded) {
+            .ok => return forwarded,
+            .err => |e| freeFieldMiss(allocator, e),
+        }
+    }
     const tf = try allocator.dupe(u8, receiverLabel(receiver));
     if (ir.eval.errTraceOn())
         std.debug.print("[getfield-miss] name={s} recv={s}\n", .{ name, tf });

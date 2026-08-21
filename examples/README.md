@@ -46,6 +46,7 @@ Run any program with:
 | `forward_member_extension.kt` | A member extension declared after its caller resolves statically inside a receiver lambda. |
 | `parenthesized_callable_result.kt` | A trailing lambda after a parenthesized call invokes the callable returned by that call. |
 | `anonymous_object_classifier_identity.kt` | An anonymous-object initializer retains the exact lexical classifier and companion identity. |
+| `anonymous_object_supertypes.kt` | An object literal is an instance of its supertype's supertypes too: `is` and a safe cast walk the whole declared chain, for a literal with a body, a delegating one, and a class subtype alike. |
 | `receiver_extension_shadow.kt` | A receiver-lambda extension shadows an applicable same-named top-level function. |
 | `receiver_lambda_bare_write.kt` | A bare-name assignment inside a receiver lambda writes the receiver's property — including in the spliced body of an inline extension such as `apply`/`run`, where the receiver is a register rather than a capture — and falls through to the enclosing binding when the receiver declares no such property. |
 | `private_base_accessor_inherited.kt` | An accessor-only property inherited from a private abstract base resolves on the subclass — the private base's accessors live under its qualified registry key, and the hierarchy walk follows it. |
@@ -114,6 +115,7 @@ Run any program with:
 | `qualified_constructor_call.kt` | A fully-qualified constructor call (`demo.app.Widget(...)`) from inside a class method resolves the package-qualified class, not a field access on the implicit receiver — the pattern behind the engine's `androidx.compose.runtime.composer.gapbuffer.SlotTable()`. |
 | `reified_function_type.kt` | A reified type parameter bound to a function type (`boxOf<() -> Unit>()`) erases to Any instead of loading the synthetic `<function>` global — the pattern behind the engine's `mutableVectorOf<() -> Unit>()` side-effect list. |
 | `reified_param_inference.kt` | A reified type parameter inferred from a value/lambda-parameter position (not just the return type). |
+| `reified_from_argument.kt` | A reified type parameter solved from an ARGUMENT's own static type — a literal, a typed local, or an object literal's type argument — so each call reads its own `T::class` rather than the previous call's. |
 | `reified_inline_property_receiver.kt` | A reified inline extension spliced on a CLASS PROPERTY receiver, so `is T` tests the real class (the receiver type comes from the enclosing class's members, not just locals/params). |
 | `smartcast_extension_receiver.kt` | Smart casts narrow the receiver's STATIC type, so an extension resolves against the narrowed type (`is String` -> `CharSequence.isEmpty`), in both the `when`-subject and `if (x is T)` forms. |
 | `fn_param_name_shadows_operator.kt` | A function-typed parameter does not shadow a same-named function for a trailing-lambda call it cannot accept (`Flow.map`'s `crossinline transform` vs the `transform` operator). |
@@ -223,6 +225,8 @@ Run any program with:
 | `renamed_import_property_read.kt` | A bare read of a renamed import (`import a.b as c`) is the imported declaration, while a member of the enclosing class still wins over it. |
 | `companion_member_extension.kt` | Extension properties on a companion object declared as members of another class, `private` and public, on a user class and on a builtin's companion. |
 | `serial_descriptor_shape.kt`   | The `SerialDescriptor` a `@Serializable` class reports: element names, which elements are optional (their constructor parameter has a default), and each element's own descriptor. |
+| `serializers_module_merge.kt`  | Combining two `SerializersModule`s: `+` copies each registration through `SerializersModuleCollector`, whose serializer-taking member has a default body the builder overrides, and `overwriteWith` replaces one. |
+| `serializer_for_class.kt`      | `@Serializer(forClass = C::class)` stands in for `C`'s generated serializer — its descriptor and members are `C`'s — and a reified `subclass(serializer)` reads its subclass off the serializer's type argument. |
 | `interface_companion_state.kt` | Shared companion-object state on an interface.              |
 | `safe_assign.kt`               | Safe-call assignment.                                       |
 

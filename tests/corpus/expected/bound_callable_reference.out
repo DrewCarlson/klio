@@ -7,3 +7,6 @@ is Function1 = true
 as transform = [43, 44, 45]
 after add    = 52
 unbound      = 7
+ext twice    = [52, 52]
+ext label    = () -> 52
+ext on list  = iterable

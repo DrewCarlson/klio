@@ -2421,8 +2421,17 @@ fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver:
     // `Comparable<T>.compareTo` binds a lambda receiver, and its body's
     // member re-dispatch loops back to the same pick forever (two
     // lambdas compared through a pack's same-named member).
-    switch (receiver.*) {
-        .IrClosure, .BoundMethod => {
+    // A `receiver::method` reference is a function value too, even though it
+    // is carried as a synthetic Instance: `source::produce` satisfies
+    // `(() -> T).asFlow()` and nothing else, so `Iterable<T>.asFlow()` must
+    // not survive beside it.
+    const callable_like = switch (receiver.*) {
+        .IrClosure, .BoundMethod => true,
+        .Instance => isBoundReference(receiver),
+        else => false,
+    };
+    if (callable_like) {
+        {
             const pn = simpleName(param_ty.name);
             if (param_ty.nullable) return false;
             if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return false;
@@ -2453,8 +2462,7 @@ fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver:
                 }
             }
             return true;
-        },
-        else => {},
+        }
     }
     if (receiver.* == .Class) {
         const pn = param_ty.name;
@@ -3119,6 +3127,17 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
         break :blk h;
     };
     for (args, 0..) |*a, i| shapes[i] = shapeOfValueMember(self, a);
+    if (candidates.len > 0 and missTraceWant(candidates[0].name)) {
+        for (shapes, 0..) |sh, i| {
+            var cn: []const u8 = "-";
+            if (args[i] == .IrClosure) {
+                if (self.closures.get(@intCast(args[i].IrClosure.id))) |info| {
+                    { const mg2 = self.module.borrow(); defer mg2.deinit(); if (funcAt(mg2.get(), info.body_func)) |cf| cn = cf.fqn; }
+                }
+            }
+            std.debug.print("[pmo-shape] #{d} tag={s} rc={s} lambda={} arity={?d} functyped={} fqn={s} closure={s}\n", .{ i, @tagName(std.meta.activeTag(args[i])), sh.runtime_class orelse "-", sh.is_lambda, sh.lambda_arity, sh.func_typed, args[i].typeFqn(), cn });
+        }
+    }
     const scope = applicability.ApplicabilityScope{
         .member = true,
         .ctx = @ptrCast(self),
@@ -3152,6 +3171,11 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
         // The `+5` exact-arity bonus and `-1000` low-priority penalty are the
         // member caller's tiebreaks, applied from the returned `Score`.
         const score = appliedMemberScore(applic.points, applic.exact_arity, applic.low_priority);
+        if (missTraceWant(f.name)) {
+            std.debug.print("[pmo-multi] `{s}`#{d} score={d} params:", .{ f.name, f.id.int(), score });
+            for (f.params) |p| std.debug.print(" {s}:{s}", .{ p.name, p.ty.name });
+            std.debug.print("\n", .{});
+        }
         if (check_inv and score == best_score) tied.append(self.allocator, f) catch {};
         if (score > best_score) {
             best_score = score;
@@ -4048,6 +4072,7 @@ pub fn replayHits() u64 {
 }
 
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
+
     if (receiver.* != .Instance and !strict_ext and !no_ext and static_recv == null and declared_recv == null) {
         if (try builtinIntrinsicReplay(self, allocator, receiver, name, args)) |r| {
             _ = replay_hits.fetchAdd(1, .monotonic);
@@ -4999,6 +5024,17 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 }
             }
         }
+    }
+
+    // `@Serializer(forClass = C::class)` marks a declaration the kotlinx
+    // plugin fills in: the object IS C's serializer, and its `descriptor`,
+    // `serialize` and `deserialize` are generated. klio has no plugin, so a
+    // member the declaration does not itself define is answered by C's own
+    // serializer.
+    if (try serializerForClassTarget(self, allocator, receiver)) |ser| {
+        defer ser.release(allocator);
+        if (routeTraceOn(name)) std.debug.print("[route] serializer-forClass\n", .{});
+        return callMemberRec(self, allocator, &ser, name, args);
     }
 
     // Companion fallback for an instance receiver.
@@ -6545,6 +6581,15 @@ fn samMemberExtRecvType(self: *VmHost, cls: []const u8, name: []const u8) ?[]con
     return mg.get().registry.iface_member_ext_recv.get(.{ .a = cls, .b = name });
 }
 
+/// A `receiver::member` reference is carried as a synthetic Instance holding
+/// the captured receiver and the member name.
+fn isBoundReference(receiver: *const Value) bool {
+    if (receiver.* != .Instance) return false;
+    const g = receiver.Instance.borrow();
+    defer g.deinit();
+    return g.get().get("__bound_receiver__") != null and g.get().get("__bound_name__") != null;
+}
+
 fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     var rc: ?Value = null;
@@ -6665,6 +6710,14 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
             return r;
         }
     }
+    // An EXTENSION declared on a function type serves the reference itself,
+    // not the member it names: `source::produce` is a `() -> Int`, so
+    // `.asFlow()` on it is `(() -> T).asFlow()`. Forwarding every unknown
+    // name to the bound member turned that into `produce()`'s value. Decline
+    // so the ordinary member/extension walk runs; `invoke`/`call` are the
+    // reference's own surface and keep forwarding.
+    if (!std.mem.eql(u8, name, "invoke") and !std.mem.eql(u8, name, "call") and
+        extWithThisLongerThanArgs(self, name, args.len)) return null;
     // Bound method reference: forward the call.
     const r = try callMemberRec(self, allocator, &recv_capt, n, args);
     if ((std.mem.eql(u8, name, "invoke") or std.mem.eql(u8, name, "call")) and r == .err and r.err == .Unimplemented) {
@@ -7885,7 +7938,23 @@ fn runtimeVirtualOverride(
         .{ root_func.name, root_func.params.len - receiver_count },
     );
     defer if (runtime.freeScratch()) allocator.free(arity_name);
-    const hit = lookupAnonMethodExact(self, allocator, class_name, arity_name) orelse return null;
+    // Two same-arity overrides of one name share the arity key and only the
+    // last is reachable through it. Walk the indexed keys first and take the
+    // one whose parameter types are the slot root's; the arity key is the
+    // answer when the family has just one member.
+    const hit = blk: {
+        var index: usize = 0;
+        while (true) : (index += 1) {
+            const member = root_mod.anonOverloadMemberName(allocator, arity_name, index) catch break;
+            defer if (runtime.freeScratch()) allocator.free(member);
+            const candidate_hit = lookupAnonMethodExact(self, allocator, class_name, member) orelse break;
+            const cg = candidate_hit.module.borrow();
+            defer cg.deinit();
+            const cf = funcAt(cg.get(), candidate_hit.func) orelse continue;
+            if (root_mod.anonParamsMatch(cf.params, root_func.params)) break :blk candidate_hit;
+        }
+        break :blk lookupAnonMethodExact(self, allocator, class_name, arity_name) orelse return null;
+    };
     const hg = hit.module.borrow();
     defer hg.deinit();
     const candidate = funcAt(hg.get(), hit.func) orelse return null;
@@ -14309,4 +14378,60 @@ test "discarded member probes release their owned miss message" {
 
 test {
     testing.refAllDecls(@This());
+}
+
+/// The serializer a `@Serializer(forClass = C::class)` declaration stands for.
+/// The kotlinx plugin generates that declaration's whole body from `C`; klio
+/// answers the members it never wrote by forwarding to `C`'s own serializer.
+/// Null unless the receiver's class carries the annotation with a resolvable
+/// class argument that is not the receiver itself.
+pub fn serializerForClassTarget(self: *VmHost, allocator: Allocator, receiver: *const Value) Allocator.Error!?Value {
+    const cls: ObjRef(ClassDef) = switch (receiver.*) {
+        .Class => |c| c.clone(),
+        .Instance => |inst| blk: {
+            const g = inst.borrow();
+            defer g.deinit();
+            break :blk g.get().class.clone();
+        },
+        else => return null,
+    };
+    defer cls.deinit();
+    const for_class: []const u8 = blk: {
+        const g = cls.borrow();
+        defer g.deinit();
+        for (g.get().annotation_records) |rec| {
+            if (!rec.is("Serializer") and !rec.is("kotlinx.serialization.Serializer")) continue;
+            for (rec.args) |arg| {
+                if (arg == .ClassRef) break :blk arg.ClassRef;
+            }
+        }
+        return null;
+    };
+    const target = host_globals.lookupGlobal(self, for_class) orelse return null;
+    if (target != .Class) return null;
+    // `@Serializer(forClass = Self::class)` would forward to itself.
+    {
+        const tg = target.Class.borrow();
+        defer tg.deinit();
+        const cg = cls.borrow();
+        defer cg.deinit();
+        if (std.mem.eql(u8, tg.get().fqn, cg.get().fqn)) return null;
+    }
+    const fid = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk mg.get().funcIdByFqn("kotlinx.serialization.__klsx_generatedSerializer") orelse return null;
+    };
+    const call_args = [_]Value{target};
+    const r = try callFuncRec(self, allocator, self.module.asPtr(), fid, &call_args);
+    switch (r) {
+        .ok => |v| {
+            if (v == .Null) return null;
+            return v;
+        },
+        .err => |e| {
+            freeDispatchMiss(allocator, .{ .err = e });
+            return null;
+        },
+    }
 }
