@@ -44,8 +44,11 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         // 1185 -> 1198 and 58 -> 48 after null channel elements stopped
         // reading as an empty iterator, a spliced inline extension started
         // resolving against its own receiver, and the channel honoured
-        // `onUndeliveredElement`. Measured solo: 1203 passed, 45 failed.
-        .baseline = 1198,
+        // `onUndeliveredElement`. 1198 -> 1254 and 48 -> 43 once a DUE
+        // deadline became ready work on the inline resume path, which
+        // recovered the four WithTimeout files (55 cases) from the child
+        // timeout. Measured solo: 1259 passed, 40 failed, 2 incomplete.
+        .baseline = 1254,
         // Bound the red mass too: a floor alone cannot see a fixed case
         // traded for a broken one. Measured solo: 137 failing, 6 not
         // completing. Lower these as fixes land, never raise them.
@@ -60,7 +63,7 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         // whose initializer is an ordinary function call (`val flow =
         // flowOf(...)` beside the `flow { … }` builder). Measured solo: 1110
         // passed, 104 failed, 6 did not complete. Held two above.
-        .max_failed = 48,
-        .max_incomplete = 8,
+        .max_failed = 43,
+        .max_incomplete = 4,
     });
 }
