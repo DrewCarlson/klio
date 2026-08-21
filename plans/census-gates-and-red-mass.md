@@ -790,97 +790,47 @@ theirs, so `ClassDef.EnumEntry` gained `annotation_records`.
 
 Serialization census 69 passed / 69 failed -> 86 / 52 over these three changes.
 
-### Open: `flattenConcat` loses its collector receiver
+### Fixed: a lambda now converts to a fun interface at the call boundary
 
-`flatMapConcat` / `flattenConcat` / `flattenMerge(1)` return the INNER FLOWS
-instead of their elements — 10 coroutines failures across FlatMapConcatTest,
-FlatMapMergeTest, FlattenConcatTest and FlattenMergeTest.
-
-    flowOf(flowOf(1, 2), flowOf(3)).flattenConcat().toList()
-    // [$anon$1@9b, $anon$2@9c]   want [1, 2, 3]
-
-Upstream's body is `flow { collect { value -> emitAll(value) } }`, where
-Merge.kt's `flow` is `import ….internal.unsafeFlow as flow`.
-
-**What the chain actually is**, established by probing inside the pack:
-
-  * `unsafeFlow`'s block receives its `FlowCollector` as a RAW CLOSURE — klio
-    SAM-converts at the call, not at the boundary — so `this` inside the block
-    prints `{ir-closure#48}` rather than a collector. True for the aliased AND
-    unaliased spellings; the real `flow` builder gives a real `SafeCollector`.
-  * At one nesting level the block still works: a bare `emit` reaches the
-    closure through SAM dispatch.
-  * At two levels — inside `collect { value -> … }` — the bare `collect` binds
-    its receiver to the block's `this` (the closure) instead of walking out to
-    the extension receiver `Flow<Flow<T>>`, and the miss is re-dispatched as
-    `emit`, so each inner flow is emitted whole.
-
-**Tried and reverted, both unexercised by any test:**
-
-  1. Carrying the enclosing scope's receiver-lambda marks onto `BuildObject`
-     so an anon-object CAPTURE that is a receiver lambda is invoked with its
-     receiver bound. This DID change the emission (`CallMemberOrValue` ->
-     `CallValueWithThis`) and the battery stayed green, but changed no
-     observable behaviour: `callValueWithThisExact` finds no positional fit for
-     a 0-param block, so the closure's own `this` still wins.
-  2. Letting a callable satisfy a single-abstract-method interface in the
-     extension-applicability check. It moved the miss from `emitAll` to
-     `collect`, and it makes a closure satisfy EVERY such interface — `Flow`
-     included — which is the wrong direction for a bare `collect`.
-
-**Proven by direct instrumentation** (a `println` inside `unsafeFlow`'s own
-`collect` override, in the pack): the collector that arrives is
-`{ir-closure#50}` — a raw closure, NOT the `object : FlowCollector` that
-upstream's `collect(action)` extension builds. So that extension never runs:
-`flow.collect { … }` binds the MEMBER `collect(collector: FlowCollector<T>)`
-and SAM-converts the lambda into the slot. One level survives because a bare
-`emit` SAM-dispatches on the closure; a bare `emitAll` — a top-level extension
-on `FlowCollector` — cannot, and `[extfb] strict recv-unproven` rejects both
-its candidates because a closure cannot be PROVEN to be a `FlowCollector`.
-
-**Four attempts, all reverted** (each left the battery green and changed no
-census number, so none was landed):
-
-  1. Receiver-lambda marks carried onto `BuildObject`, so an anon-object
-     capture that is a receiver lambda is invoked with its receiver bound. It
-     changed the emission (`CallMemberOrValue` -> `CallValueWithThis`) and
-     nothing else: `callValueWithThisExact` finds no positional fit for a
-     0-param block, so the closure's own `this` still wins.
-  2. A callable satisfying any single-abstract-method interface in the
-     extension-applicability check. Moved the miss from `emitAll` to `collect`,
-     and makes a closure satisfy EVERY such interface — `Flow` included.
-  3. Resolving a renamed import to its declaration before the inline candidate
-     lookup (see the alias note above).
-  4. Extending `callableArgPrefersFunctionExtension` so a member param that
-     needs SAM conversion loses to an extension taking the function type
-     directly — the real Kotlin specificity rule. It does not fire here: the
-     bare `collect { … }` inside the block goes through the bare-name resolver,
-     not `resolveInstanceMethod`'s member pick where that rule lives.
-
-**Fifth attempt, also reverted:** implicit SAM conversion at the CALL boundary,
-mirroring the constructor boundary's existing one (`host_instances.zig` already
-wraps a callable ctor argument whose declared type is a `fun interface`). Added
-to `callFunc` — and it never fires. A probe with a plain `fun interface`
-confirms the gap independently of flows:
+`flatMapConcat` / `flattenConcat` / `flattenMerge(1)` returned the INNER FLOWS
+instead of their elements. The root had nothing to do with flows:
 
     fun interface Handler { fun handle(v: Int): String }
-    fun run1(h: Handler) = "" + (h is Handler)
-    run1 { v -> "<$v>" }        // is=false
-    run1(Handler { v -> "<$v>" })  // is=true
+    fun run(h: Handler) = "" + (h is Handler)
+    run { v -> "<$v>" }             // was false
+    run(Handler { v -> "<$v>" })    // true
 
-so a lambda passed to a `fun interface` parameter is NOT an instance of it,
-while the explicit constructor form is. The argument never reaches `callFunc`:
-a bare call with a trailing lambda binds its parameters in the evaluator's
-activation setup (`ir.eval.evalWith` / the flat-call path), not in the host
-entry. `KLIO_FLAT=0` does not change it.
+Kotlin converts where the argument is PASSED, so the callee's parameter holds
+an instance of the interface. klio passed the raw closure: the constructor
+boundary already converted (`host_instances.zig`), the call boundary did not.
+`flow.collect { … }` therefore handed `unsafeFlow`'s block a raw closure as its
+`FlowCollector` — a bare `emit` still SAM-dispatched, but a bare `emitAll`, an
+extension on `FlowCollector`, could not prove its receiver
+(`[extfb] strict recv-unproven`) and the miss re-dispatched as `emit`, emitting
+each inner flow whole.
 
-**What would actually close it:** perform the conversion where the activation
-binds parameters, which is the interpreter's hottest path — every call would
-consult the callee's parameter types for a fun-interface name. That is the
-principled fix and a real design reversal (memory records the raw-closure
-collector as deliberate), not a patch, and it needs a performance plan of its
-own. The `Handler` probe above is the smallest thing to make pass first; the
-flow chain follows from it.
+Both activation paths now convert — `evalWithCapturesChained` and
+`openActivation` — with the callee's fun-interface parameters memoized per
+function, so the common answer (none) is one comparison. Coroutines census
+1116 passed / 98 failed -> 1121 / 93. Guarded by
+`examples/sam_conversion_at_call_boundary.kt`.
+
+**Four earlier attempts, all reverted**, each recorded because they cost real
+time: receiver-lambda marks on `BuildObject`; a callable satisfying any
+single-abstract-method interface in extension applicability; resolving a
+renamed import before the inline candidate lookup; and extending
+`callableArgPrefersFunctionExtension` to rank a SAM-converting member below a
+function-taking extension. All left the battery green and moved no census
+number. The fifth attempt failed for a locatable reason — it hooked `callFunc`,
+which a bare call with a trailing lambda never reaches — and moving it to the
+activation setup is what worked.
+
+**Still open, same area:** conversion driven by an EXPECTED TYPE rather than a
+parameter type. `val hs: List<Handler> = listOf({ v -> … })` leaves the
+elements raw closures, so `hs.all { it is Handler }` is false. `listOf`'s
+parameter is a `vararg T`, so the parameter-type rule cannot see it.
+
+
 ### Open: `secondFraction(n)` picks the defaulted overload
 
 Three datetime sample tests (`LocalTimeSamples.customFormat`,
