@@ -1,21 +1,18 @@
-interface B {
-    fun frac(minLength: Int = 1, maxLength: Int = 9): String
-    fun frac(fixedLength: Int): String = frac(fixedLength, fixedLength)
-}
-class Impl : B {
-    override fun frac(minLength: Int, maxLength: Int): String = "min=$minLength max=$maxLength"
+fun <R, T> (R.() -> T).run2(receiver: R, tag: String): T {
+    println("receiver-form $tag")
+    val b = this
+    return receiver.b()
 }
 
-open class C {
-    open fun g(a: Int = 1, b: Int = 9): String = "ab($a,$b)"
-    fun g(only: Int): String = "only($only)"
+fun <P, T> ((P) -> T).run2(param: P, tag: String): T {
+    println("param-form $tag")
+    val b = this
+    return b(param)
 }
 
 fun main() {
-    val i: B = Impl()
-    println("iface pos   = " + i.frac(3))
-    println("iface named = " + i.frac(fixedLength = 3))
-    val c = C()
-    println("class pos   = " + c.g(3))
-    println("class named = " + c.g(only = 3))
+    val withRecv: String.() -> Int = { length }
+    val withParam: (String) -> Int = { s -> s.length }
+    println(withRecv.run2("abc", "r"))
+    println(withParam.run2("abcd", "p"))
 }
