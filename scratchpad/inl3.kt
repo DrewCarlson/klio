@@ -1,28 +1,17 @@
-enum class Platform { JVM, JS, NATIVE }
-val currentPlatform: Platform = Platform.NATIVE
-fun isJvm(): Boolean = currentPlatform == Platform.JVM
-fun isJs(): Boolean = currentPlatform == Platform.JS
-fun isNative(): Boolean = currentPlatform == Platform.NATIVE
-
-internal inline fun <reified T : Throwable> shouldFail(
-    sinceKotlin: String? = null,
-    beforeKotlin: String? = null,
-    onJvm: Boolean = true,
-    onJs: Boolean = true,
-    onNative: Boolean = true,
-    test: () -> Unit
-) {
-    val args = mapOf("since" to sinceKotlin, "before" to beforeKotlin, "onJvm" to onJvm)
-    val platform = (isJvm() && onJvm) || (isJs() && onJs) || (isNative() && onNative)
-    var error: Throwable? = null
-    try { test() } catch (e: Throwable) { error = e }
-    if (platform) {
-        if (error == null) throw AssertionError("Expected to fail $args")
-        if (error !is T) throw AssertionError("Expected ${T::class} got $error")
-    } else if (error != null) throw error
-    println("  ok platform=$platform err=${error != null}")
+class Src(val n: Int) {
+    fun items(): List<Int> = (0 until n).toList()
 }
 
+inline fun <R> Src.use(block: Src.() -> R): R = block()
+
+inline fun Src.eachInline(action: (Int) -> Unit): Unit =
+    use { for (e in items()) action(e) }
+
+fun Src.collect1(): List<Int> = buildList { eachInline(::add) }
+fun Src.collect2(): List<Int> = buildList { eachInline { add(it) } }
+
 fun main() {
-    shouldFail<AssertionError>(beforeKotlin = "2.0.0", onJvm = true, onNative = false, onJs = false) { }
+    val s = Src(3)
+    println(s.collect2())
+    println(s.collect1())
 }

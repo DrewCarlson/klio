@@ -160,6 +160,7 @@ Run any program with:
 | `generic_class_type_param_dispatch.kt` | A method param typed as a full-word CLASS type parameter (`put(key: Key)` on `Store<Key, Value>`) accepts any argument even when an unrelated class named `Key` exists. |
 | `nested_class_name_collision.kt` | Two nested classes sharing a simple name under different outers keep distinct identities and enclosing-companion scopes. |
 | `nested_class_reference.kt` | A private nested class reached from inside a lambda in its declaring class: construction, `Type::member` references, and use as a declared type all bind the same declaration. |
+| `channel_null_elements.kt` | A `Channel<T?>` delivers null elements through the for-loop iterator, `consumeEach`, `receive` and `tryReceive`, and an all-null channel still terminates on close. |
 | `flow_context_preservation.kt` | A `flow { }` refuses an emission from another coroutine or another context; `channelFlow` allows concurrent emission and `flowOn` moves the whole upstream. |
 | `function_type_receiver_overload.kt` | Extensions overloaded on a function-typed receiver's shape (`R.() -> T` vs `(P) -> T`) bind by the receiver's declared type, deciding whether the argument arrives as receiver or value parameter. |
 | `receiver_lambda_param_inferred.kt` | A lambda parameter whose extension-function type is only inferred still invokes with the enclosing receiver on a bare call, with value parameters and nesting. |

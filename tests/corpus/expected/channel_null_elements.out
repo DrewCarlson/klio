@@ -1,0 +1,6 @@
+rendezvous = [1, null, 2]
+buffered   = [a, null, b]
+consumeEach= [null, 7]
+receive    = null
+tryReceive = null/true then closed=true
+all nulls  = 2
