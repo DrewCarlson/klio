@@ -765,10 +765,32 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .IsCheck => |ck| {
             const s = try lowerExpr(b, ck.expr);
             const dst = b.allocReg();
+            // An enclosing splice's reified parameter is substituted here,
+            // NULLABILITY included. Leaving the parameter name for the
+            // runtime to resolve through its bound class value loses the
+            // `?`: `filterIsInstance<Int?>()` then dropped every null,
+            // because a class value cannot carry nullability.
+            var check_name = loweredCheckTypeName(b, &ck.ty);
+            var check_nullable = ck.ty.nullable;
+            if (ck.ty.type_args.len == 0) {
+                if (b.resolveReifiedTypeName(ck.ty.name.name)) |bound| {
+                    var head = bound;
+                    if (std.mem.endsWith(u8, head, "?")) {
+                        head = head[0 .. head.len - 1];
+                        check_nullable = true;
+                    }
+                    // The bound name carries the FULL spelling
+                    // (`BufferedChannel<*>`); an `is` check is on the head
+                    // alone, exactly as the runtime's class-value fallback
+                    // was.
+                    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+                    if (head.len != 0) check_name = head;
+                }
+            }
             try b.push(.{ .InstanceOf = .{
                 .dst = dst,
                 .src = s,
-                .ty = .{ .name = loweredCheckTypeName(b, &ck.ty), .nullable = ck.ty.nullable, .args = &.{} },
+                .ty = .{ .name = check_name, .nullable = check_nullable, .args = &.{} },
             } });
             if (ck.negated) {
                 const neg = b.allocReg();
@@ -3531,6 +3553,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // Carry the enclosing non-reified type-parameter names so an `x as T`
     // cast inside the lambda body is still erased.
     b.module.pending_lambda_type_params = try b.typeParamNamesSlice();
+    b.module.pending_lambda_reified_names = try b.reifiedTypeNamesSlice();
     b.module.pending_lambda_type_param_bounds = try b.typeParamBoundsSlice();
     b.module.pending_lambda_type_param_bound_refs = try b.typeParamBoundRefsSlice();
     // A lambda inside a local fn's body keeps that fn's self-identity (a

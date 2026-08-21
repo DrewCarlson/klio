@@ -814,6 +814,33 @@ fn inferReifiedTypeArgs(
             }
         }
     }
+    // An enclosing splice that already bound a reified parameter of the SAME
+    // NAME resolves it lexically: the body text `filterIsInstanceTo(
+    // ArrayList<R>())` inside a spliced `filterIsInstance<reified R>` means
+    // that R, and solving it through the callee's `C : MutableCollection<in
+    // R>` bound is inference this does not do. Without it the nested call
+    // declined its splice and reached the runtime with no type argument at
+    // all, so `is R` read a process-global (`filterIsInstance<Int?>` kept
+    // only the non-null elements).
+    if (bb) |b| {
+        for (f.type_params, 0..) |tp, i| {
+            if (out[i] != null or !tp.is_reified) continue;
+            const bound = b.resolveReifiedTypeName(tp.name.name) orelse continue;
+            const nullable = std.mem.endsWith(u8, bound, "?");
+            const head = if (nullable) bound[0 .. bound.len - 1] else bound;
+            if (std.mem.indexOfScalar(u8, head, '<') != null) continue;
+            out[i] = .{
+                .name = .{ .name = head, .span = tp.name.span },
+                .nullable = nullable,
+                .span = tp.name.span,
+                .type_args = &.{},
+                .function = null,
+                .definitely_non_null = false,
+                .annotations = &.{},
+                .qualified_path = null,
+            };
+        }
+    }
     return out;
 }
 
@@ -997,6 +1024,14 @@ fn unifyParamAgainstArg(
             try unifyTypeParam(param_ty, sup, tp_names, subst);
             return;
         }
+        // A local whose DECLARED type names a class solves through that
+        // class's supertype list: `boxWithItemSerializer` is a
+        // `ThirdPartyBoxSerializer`, which is a
+        // `KSerializer<ThirdPartyBox<S>>`, so a `KSerializer<T>` parameter
+        // binds `T` to the HEAD `ThirdPartyBox` — the head is all a reified
+        // consumer (`T::class`, `is T`) can read, and the inner `S` is the
+        // class's own parameter with no binding at this site.
+        try declTypeSupertypeBind(param_ty, arg, tp_names, subst, bb);
         // Last: the argument's statically recorded type, which carries its
         // type arguments even when the argument is a plain local
         // (`val s = object : KSerializer<Int> by …` handed to
@@ -1134,6 +1169,61 @@ fn unifyLoweredTypeParam(
             .annotations = &.{},
             .qualified_path = null,
         });
+    }
+}
+
+/// Bind `param_ty`'s type-parameter arguments from the class supertype of the
+/// argument's recorded declared type, heads only (see the call site).
+fn declTypeSupertypeBind(
+    param_ty: *const TypeRef,
+    arg: *const Expr,
+    tp_names: *const std.StringHashMap(void),
+    subst: *std.StringHashMap(TypeRef),
+    bb: ?*const FuncBuilder,
+) Allocator.Error!void {
+    const b = bb orelse return;
+    if (arg.* != .Path or arg.Path.segments.len != 1) return;
+    const nm = arg.Path.segments[0].name;
+    // A bare name that is an enclosing class's MEMBER property reads its
+    // registered head; a local reads its recorded declared type.
+    const decl_name: []const u8 = if (b.localDeclTypeRef(nm)) |d| d.name else blk: {
+        if (b.resolve(nm) != null) return;
+        const owner = b.ownerClass() orelse return;
+        const heads = b.module.registry.class_prop_type_heads;
+        if (heads.get(.{ .a = owner, .b = nm })) |h| break :blk h;
+        const chain: []const []const u8 = b.module.registry.class_super_names.get(owner) orelse return;
+        for (chain) |cls| {
+            if (heads.get(.{ .a = cls, .b = nm })) |h| break :blk h;
+        }
+        return;
+    };
+    var head = std.mem.trimEnd(u8, decl_name, "?");
+    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (head.len == 0) return;
+    const sups = inline_state.classSupertypeRefs(head) orelse return;
+    for (sups) |*sup| {
+        if (sup.type_args.len == 0) continue;
+        if (!std.mem.eql(u8, sup.name.name, param_ty.name.name)) continue;
+        const n = @min(param_ty.type_args.len, sup.type_args.len);
+        for (param_ty.type_args[0..n], sup.type_args[0..n]) |*pa, *sa| {
+            if (pa.is_star or sa.is_star) continue;
+            if (!tp_names.contains(pa.ty.name.name)) continue;
+            if (subst.contains(pa.ty.name.name)) continue;
+            const ah = sa.ty.name.name;
+            if (ah.len == 0) continue;
+            if (ah.len <= 2 and isAllUpper(ah)) continue;
+            try subst.put(pa.ty.name.name, .{
+                .name = .{ .name = ah, .span = arg.span() },
+                .nullable = sa.ty.nullable,
+                .span = arg.span(),
+                .type_args = &.{},
+                .function = null,
+                .definitely_non_null = false,
+                .annotations = &.{},
+                .qualified_path = null,
+            });
+        }
+        return;
     }
 }
 

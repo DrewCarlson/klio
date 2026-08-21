@@ -69,9 +69,9 @@ the last measurement.
 
 | suite | passes | failures | opened at |
 |---|---|---|---|
-| serialization | 110 | 28 | 57 / 81 |
+| serialization | 116 | 22 | 57 / 81 |
 | datetime | 517 | 2 | 457 / 62 |
-| coroutines | 1268 | 31 | 1073 / 141 (+6 DNC) |
+| coroutines | 1269 | 30 | 1073 / 141 (+6 DNC) |
 | io | 1191 | 0 | 1182 / 9 |
 | androidx_collection | 1841 | 0 | 1309 / 15 |
 | atomicfu | 67 | 0 | 67 / 0 |
@@ -1224,6 +1224,77 @@ Five roots behind the serialization lookups, each its own mechanism:
   * A reified type parameter with no arguments to solve from, called inside
     a splice that binds exactly one reified name, takes that binding
     (`EnumSerializer(serialName, enumValues())`).
+
+### Root: a reified type argument lost its nullability
+
+`filterIsInstance<Int?>()` dropped the nulls: the `?` was stripped at three
+places, each its own root —
+
+  * `internTypeArgsScoped` stamped the head without the `?`;
+  * an `is T` check in a spliced body left the parameter NAME for the
+    runtime, which resolves it through the bound CLASS VALUE — and a class
+    value cannot carry nullability. The lowering now substitutes the
+    enclosing splice's reified binding (nullability and all) into the
+    `InstanceOf`; a full generic spelling contributes its head. First cut
+    substituted the full spelling and broke `ChannelFactoryTest` /
+    `CombineParametersTest` (`assertIs<BufferedChannel<*>>` on
+    `BufferedChannel<*>` matched nothing) — heads only;
+  * a LAMBDA inside the spliced body (`filter { it is R }`, the
+    `Flow.filterIsInstance` shape) lowered with no reified context at all.
+    The splice's substitutions now travel into lambda bodies via
+    `pending_lambda_reified_names`.
+
+Also: a nested reified inline call whose type parameter is spelled the SAME
+as the enclosing splice's binds it lexically (`filterIsInstanceTo(
+ArrayList<R>())` inside `filterIsInstance`). Guarded by
+`examples/reified_nullable_type_argument.kt`.
+
+### Root: a reified parameter solved from a class-typed argument's supertype
+
+`contextual(serializer)` with a `ThirdPartyBoxSerializer<Item>` argument
+left `T` unbound: the argument's recorded static type is the head
+`ThirdPartyBoxSerializer`, and nothing read that class's
+`KSerializer<ThirdPartyBox<S>>` supertype. `unifyParamAgainstArg` now binds
+a `KSerializer<T>` parameter's `T` from the argument's declared-type class
+supertype list, heads only (`T := ThirdPartyBox` — the head is all
+`T::class` / `is T` can read; the inner `S` is the class's own parameter
+with no binding at the site). The argument resolves as a local's recorded
+type or an enclosing class's member-property head (the test holds these as
+`protected val`s read from inside the builder lambda).
+ContextualGenericsTest 0/3 -> 3/0.
+
+### Root: body properties were not serialized at all
+
+The kotlinc plugin serializes every BACKING-FIELD property — constructor
+ones first, then body properties in declaration order, skipping delegated
+and `@Transient` ones. klio's reflective serializer walked only the primary
+constructor, so a class carrying state in its body serialized none of it
+(`CustomPropertyAccessorsTest` both cases; several SchemaTest shapes).
+
+The pieces:
+
+  * `PropertyDef` now records `has_backing` (kotlinc's rule, including the
+    accessor-reads-`field` scan — shared walkers added to `ast`) and
+    `type_head` (declared, or inferred from a literal initializer). Image
+    format bumped to 50.
+  * Five intrinsics: `__klsx_bodyPropNames` / `SerialNames` / `Types` /
+    `HasInit` and `__klsx_setField` (a direct backing-field write, the
+    generated deserializer's shape — custom setters are bypassed).
+  * `ReflectiveKSerializer` appends the body elements to its descriptor
+    (optional = has-initializer), encodes them in order, and on decode
+    writes each seen value to the backing field — EXCEPT properties with no
+    initializer, whose only assignment is an `init` block that must win
+    (`deferredInit` keeps `initial6`). `@Transient` is checked on every
+    anchor, not just `property`.
+  * Element decode routes through the TYPED hooks (`decodeStringElement`
+    -> `decodeString`) by declared head; `decodeValue()` alone throws on a
+    format that only overrides the typed surface — which is every
+    AbstractDecoder-based test format.
+  * `__klsx_paramAnnotations` indexes continue into the body properties.
+
+serialization 110 -> 116 net (8 fixed incl. both CustomPropertyAccessors,
+nullability + external-class lookups; 0 new). Guarded by
+`examples/serializable_body_properties.kt`.
 
 ### Root: a class literal answered the builtin of the same simple name
 

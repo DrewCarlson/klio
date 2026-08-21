@@ -77,6 +77,11 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("kotlinx.serialization.__klsx_ctorParamClasses", ctorParamClasses);
     try b.register("kotlinx.serialization.__klsx_ctorParamOptional", ctorParamOptional);
     try b.register("kotlinx.serialization.__klsx_get", propGet);
+    try b.register("kotlinx.serialization.__klsx_setField", propSetField);
+    try b.register("kotlinx.serialization.__klsx_bodyPropNames", bodyPropNames);
+    try b.register("kotlinx.serialization.__klsx_bodyPropSerialNames", bodyPropSerialNames);
+    try b.register("kotlinx.serialization.__klsx_bodyPropTypes", bodyPropTypes);
+    try b.register("kotlinx.serialization.__klsx_bodyPropHasInit", bodyPropHasInit);
     try b.register("kotlinx.serialization.__klsx_construct", construct);
     // Compiler-plugin replacement: the shape questions the generated
     // serializer would have been synthesized from.
@@ -458,6 +463,127 @@ fn decodeNumber(f: f64, i: i64, is_int: bool, ty: ?[]const u8) Value {
 /// `@SerialName("...")` on the property anchor (where the LV 2.4 target
 /// assignment puts a target-less, `@property:`, or `@all:` entry —
 /// `SerialName` is `@Target(PROPERTY, CLASS)`), else the property name.
+/// Whether a body property is a serialized element: the kotlinc plugin takes
+/// exactly the backing-field properties, skipping delegated and `@Transient`
+/// ones.
+fn bodyPropIncluded(p: *const runtime.PropertyDef) bool {
+    if (!p.has_backing or p.delegate != null) return false;
+    // `@Transient` declares `@Target(PROPERTY)`, but the anchor assignment
+    // depends on resolving that declaration; check every anchor so an
+    // unresolved target cannot leak the property into the element set.
+    const anchor_sets = [_][]const runtime.AnnotationRecord{
+        p.anchors.property, p.anchors.field, p.anchors.param, p.anchors.get, p.anchors.set,
+    };
+    for (anchor_sets) |records| {
+        for (records) |*rec| {
+            if (rec.is("kotlinx.serialization.Transient") or rec.is("Transient")) return false;
+        }
+    }
+    return true;
+}
+
+fn bodyPropSerialFieldName(p: *const runtime.PropertyDef) []const u8 {
+    for (p.anchors.property) |*rec| {
+        if (rec.is("kotlinx.serialization.SerialName") or rec.is("SerialName")) {
+            if (rec.stringArg("value")) |v| return v;
+        }
+    }
+    return p.name;
+}
+
+fn bodyPropNames(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("__klsx_bodyPropNames: expected a class");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return typeErr("__klsx_bodyPropNames: expected a class");
+    defer cls_ref.deinit();
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (cls_ref.asPtr().body_properties) |*p| {
+        if (!bodyPropIncluded(p)) continue;
+        try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, p.name)) });
+    }
+    return ok(try Value.newList(a, .{
+        .items = try ValueList.init(a, items),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    }));
+}
+
+fn bodyPropSerialNames(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("__klsx_bodyPropSerialNames: expected a class");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return typeErr("__klsx_bodyPropSerialNames: expected a class");
+    defer cls_ref.deinit();
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (cls_ref.asPtr().body_properties) |*p| {
+        if (!bodyPropIncluded(p)) continue;
+        try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, bodyPropSerialFieldName(p))) });
+    }
+    return ok(try Value.newList(a, .{
+        .items = try ValueList.init(a, items),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    }));
+}
+
+fn bodyPropTypes(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("__klsx_bodyPropTypes: expected a class");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return typeErr("__klsx_bodyPropTypes: expected a class");
+    defer cls_ref.deinit();
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (cls_ref.asPtr().body_properties) |*p| {
+        if (!bodyPropIncluded(p)) continue;
+        const head = p.type_head orelse "";
+        try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, head)) });
+    }
+    return ok(try Value.newList(a, .{
+        .items = try ValueList.init(a, items),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    }));
+}
+
+fn bodyPropHasInit(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("__klsx_bodyPropHasInit: expected a class");
+    const cls_ref = classOf(&ctx.args[0]) orelse
+        return typeErr("__klsx_bodyPropHasInit: expected a class");
+    defer cls_ref.deinit();
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (cls_ref.asPtr().body_properties) |*p| {
+        if (!bodyPropIncluded(p)) continue;
+        try items.append(a, .{ .Bool = p.init != null or p.is_lateinit });
+    }
+    return ok(try Value.newList(a, .{
+        .items = try ValueList.init(a, items),
+        .mutable = false,
+        .enum_entries = false,
+        .backing = null,
+    }));
+}
+
+/// Write property `name`'s BACKING FIELD on instance `obj`, bypassing any
+/// custom setter — the shape of the plugin's generated deserializer.
+fn propSetField(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3 or ctx.args[0] != .Instance or ctx.args[1] != .String) {
+        return typeErr("__klsx_setField: expected (instance, name, value)");
+    }
+    const ng = ctx.args[1].String.borrow();
+    const name = try ctx.allocator.dupe(u8, ng.get().bytes);
+    ng.deinit();
+    const g = ctx.args[0].Instance.borrowMut();
+    defer g.deinit();
+    ctx.args[2].retain();
+    try g.get().define(ctx.allocator, name, ctx.args[2]);
+    return ok(.Unit);
+}
+
 fn serialFieldName(p: *const runtime.ClassParamDef) []const u8 {
     for (p.anchors.property) |*rec| {
         if (rec.is("kotlinx.serialization.SerialName") or rec.is("SerialName")) {
@@ -1074,6 +1200,13 @@ fn paramAnnotations(ctx: *CallCtx) Error!EvalResult {
         if (seen == want) return ok(try annotationInstanceList(ctx, p.anchors.property));
         seen += 1;
     }
+    // Element indexes continue into the serialized body properties, in the
+    // same order the descriptor lists them after the constructor ones.
+    for (cls_ref.asPtr().body_properties) |*p| {
+        if (!bodyPropIncluded(p)) continue;
+        if (seen == want) return ok(try annotationInstanceList(ctx, p.anchors.property));
+        seen += 1;
+    }
     return ok(try annotationInstanceList(ctx, &.{}));
 }
 
@@ -1608,7 +1741,7 @@ test "hostBindings registers every serialization symbol" {
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classSerialNameOverride") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classAnnotations") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_paramAnnotations") != null);
-    try testing.expectEqual(@as(usize, 19), b.len());
+    try testing.expectEqual(@as(usize, 24), b.len());
 }
 
 test "renderShape round-trips nullability and generic args" {

@@ -427,6 +427,15 @@ pub const PropertyDef = struct {
     primitive_zero: ?Value,
     /// Per-anchor annotation records after use-site target assignment.
     anchors: PropertyAnchors = .{},
+    /// Whether the property stores a backing field (kotlinc's rule:
+    /// initializer, defaulted accessor, or an accessor that reads `field`).
+    /// Serialization treats exactly the backing-field properties as
+    /// elements.
+    has_backing: bool = true,
+    /// Declared type head, when the source annotates one. Null for an
+    /// inferred type — descriptor consumers fall back to the dynamic
+    /// element descriptor.
+    type_head: ?[]const u8 = null,
 };
 
 pub const InstanceData = struct {

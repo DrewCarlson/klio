@@ -67,6 +67,24 @@ internal fun __klsx_ctorParamClasses(kClass: Any?): List<Any?> =
 internal fun __klsx_ctorParamOptional(kClass: Any?): List<Boolean> =
     error("intrinsic kotlinx.serialization.__klsx_ctorParamOptional not installed")
 
+// Serialized BODY properties (backing-field, non-delegated, non-@Transient),
+// in declaration order — the elements the plugin appends after the
+// primary-constructor properties.
+internal fun __klsx_bodyPropNames(kClass: Any?): List<String> =
+    error("intrinsic kotlinx.serialization.__klsx_bodyPropNames not installed")
+
+internal fun __klsx_bodyPropSerialNames(kClass: Any?): List<String> =
+    error("intrinsic kotlinx.serialization.__klsx_bodyPropSerialNames not installed")
+
+internal fun __klsx_bodyPropTypes(kClass: Any?): List<String> =
+    error("intrinsic kotlinx.serialization.__klsx_bodyPropTypes not installed")
+
+internal fun __klsx_bodyPropHasInit(kClass: Any?): List<Boolean> =
+    error("intrinsic kotlinx.serialization.__klsx_bodyPropHasInit not installed")
+
+internal fun __klsx_setField(instance: Any?, name: String, value: Any?): Unit =
+    error("intrinsic kotlinx.serialization.__klsx_setField not installed")
+
 internal fun __klsx_isSerializable(kClass: Any?): Boolean =
     error("intrinsic kotlinx.serialization.__klsx_isSerializable not installed")
 
@@ -408,20 +426,30 @@ public class ReflectiveKSerializer(
     private val kClass: Any?,
     private val typeArgs: List<KSerializer<Any?>> = emptyList()
 ) : KSerializer<Any?> {
-    private val names: List<String> = __klsx_ctorParamNames(kClass)
+    private val ctorNames: List<String> = __klsx_ctorParamNames(kClass)
+    // Serialized body properties follow the constructor properties, exactly
+    // as the plugin appends them. Decoded body values are written to the
+    // BACKING FIELD after construction — but only for properties with their
+    // own initializer (or `lateinit`): one assigned only in an `init` block
+    // keeps the init block's value, matching the generated deserializer's
+    // write-then-init order.
+    private val bodyNames: List<String> = __klsx_bodyPropNames(kClass)
+    private val bodyHasInit: List<Boolean> = __klsx_bodyPropHasInit(kClass)
+    private val names: List<String> = ctorNames + bodyNames
+    private val elementTypes: List<String> = __klsx_ctorParamTypes(kClass) + __klsx_bodyPropTypes(kClass)
 
     override val descriptor: SerialDescriptor =
         ReflectiveDescriptor(
             __klsx_serialName(kClass),
             // The descriptor reports WIRE names (`@SerialName`); `names` stays
             // the declared names that address the instance itself.
-            __klsx_ctorParamSerialNames(kClass),
-            __klsx_ctorParamTypes(kClass),
-            __klsx_ctorParamOptional(kClass),
+            __klsx_ctorParamSerialNames(kClass) + __klsx_bodyPropSerialNames(kClass),
+            __klsx_ctorParamTypes(kClass) + __klsx_bodyPropTypes(kClass),
+            __klsx_ctorParamOptional(kClass) + bodyHasInit,
             kClass,
             __klsx_typeParamNames(kClass),
             typeArgs,
-            __klsx_ctorParamClasses(kClass)
+            __klsx_ctorParamClasses(kClass) + bodyNames.map { null }
         )
 
     override fun serialize(encoder: Encoder, value: Any?) {
@@ -453,17 +481,50 @@ public class ReflectiveKSerializer(
         // the defaulted two-arg form). `decodeValue()` is the stable
         // path AbstractDecoder exposes for untyped reads.
         val ad = c as AbstractDecoder
+        val seen = ArrayList<Boolean>()
+        i = 0
+        while (i < names.size) {
+            seen.add(false)
+            i = i + 1
+        }
         while (true) {
             val index = ad.decodeElementIndex(descriptor)
             if (index == CompositeDecoder.DECODE_DONE) break
             if (index >= 0 && index < names.size) {
-                args[index] = if (ad.decodeNotNullMark()) ad.decodeValue() else ad.decodeNull()
+                // A primitively-typed element decodes through its TYPED hook
+                // (`decodeStringElement` -> `decodeString`), which is the
+                // surface an AbstractDecoder-based format actually overrides;
+                // `decodeValue()` alone throws on a format that only
+                // implements the typed hooks.
+                val t = elementTypes[index].removeSuffix("?")
+                args[index] = when (t) {
+                    "String", "kotlin.String" -> ad.decodeStringElement(descriptor, index)
+                    "Int", "kotlin.Int" -> ad.decodeIntElement(descriptor, index)
+                    "Long", "kotlin.Long" -> ad.decodeLongElement(descriptor, index)
+                    "Short", "kotlin.Short" -> ad.decodeShortElement(descriptor, index)
+                    "Byte", "kotlin.Byte" -> ad.decodeByteElement(descriptor, index)
+                    "Boolean", "kotlin.Boolean" -> ad.decodeBooleanElement(descriptor, index)
+                    "Double", "kotlin.Double" -> ad.decodeDoubleElement(descriptor, index)
+                    "Float", "kotlin.Float" -> ad.decodeFloatElement(descriptor, index)
+                    "Char", "kotlin.Char" -> ad.decodeCharElement(descriptor, index)
+                    else -> if (ad.decodeNotNullMark()) ad.decodeValue() else ad.decodeNull()
+                }
+                seen[index] = true
             } else {
                 break
             }
         }
         ad.endStructure(descriptor)
-        return __klsx_construct(kClass, args)
+        val instance = __klsx_construct(kClass, args.subList(0, ctorNames.size))
+        var j = 0
+        while (j < bodyNames.size) {
+            val idx = ctorNames.size + j
+            if (seen[idx] && bodyHasInit[j]) {
+                __klsx_setField(instance, bodyNames[j], args[idx])
+            }
+            j = j + 1
+        }
+        return instance
     }
 }
 

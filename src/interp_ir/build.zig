@@ -4595,11 +4595,27 @@ fn buildPropertyAnchors(
 /// it: an initializer, an explicit `field` clause, or any defaulted
 /// accessor supplies one; delegated / abstract properties and properties
 /// with only custom accessor bodies have none.
+/// Type head of an unannotated property whose initializer is a literal —
+/// the shapes where inference is unambiguous. Null for anything else.
+fn inferredPropTypeHead(p: *const ast.Property) ?[]const u8 {
+    const init = if (p.init) |*e| e else return null;
+    return switch (init.*) {
+        .StringTemplate => "String",
+        .IntLit => "Int",
+        .BoolLit => "Boolean",
+        .FloatLit => "Double",
+        .CharLit => "Char",
+        else => null,
+    };
+}
+
 fn memberHasBackingField(p: *const ast.Property) bool {
     if (p.delegate != null or p.is_abstract or p.is_expect or p.receiver_type != null) return false;
     if (p.init != null or p.explicit_field != null) return true;
     if (p.getter == null) return true;
     if (p.mutable and p.setter == null) return true;
+    if (p.getter) |g| if (ast.accessorUsesField(g)) return true;
+    if (p.setter) |s| if (ast.accessorUsesField(s)) return true;
     return false;
 }
 
@@ -4665,6 +4681,8 @@ fn buildClassDef(
                 .has_backing_field = memberHasBackingField(p),
                 .is_delegated = p.delegate != null,
             }),
+            .has_backing = memberHasBackingField(p),
+            .type_head = if (p.ty) |*ty| ty.name.name else inferredPropTypeHead(p),
         });
     }
 

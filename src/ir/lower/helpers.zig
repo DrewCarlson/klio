@@ -446,7 +446,15 @@ pub fn internTypeArgsScoped(
         // A nested-generic argument (`typeOf<List<Int>>()`) stamps its FULL
         // spelling so runtime KType materialisation sees the arguments;
         // class-resolving consumers strip at `<`. Plain heads stamp as-is.
-        const full = if (t.type_args.len == 0) nm else try renderFullTypeArg(b, nm, &t);
+        const head = if (t.type_args.len == 0) nm else try renderFullTypeArg(b, nm, &t);
+        // NULLABILITY is part of the argument: `filterIsInstance<Int?>()`
+        // differs from `filterIsInstance<Int>()` only in the `?`, and the
+        // body's `is T` is what reads it. A head already carrying one (a
+        // reified substitution of a nullable actual) is left alone.
+        const full = if (t.nullable and !std.mem.endsWith(u8, head, "?"))
+            try std.fmt.allocPrint(b.allocator, "{s}?", .{head})
+        else
+            head;
         slot.* = try b.module.internConst(b.allocator, .{ .String = full });
     }
     return out;
