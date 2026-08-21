@@ -36,8 +36,12 @@ test "kotlinx.serialization commonTest pass count holds at or above the ratchet 
         // annotations written on the class and on each property, built by
         // running each annotation class's own constructor. Measured solo: 69
         // passed, 69 failed, 0 did not complete.
-        .baseline = 69,
-        .max_failed = 69,
+        // 69 -> 96 and 69 -> 42 after the harness stopped starving a target
+        // of its helper file, `+=` on a nested container stopped flattening,
+        // and a spliced inline extension started resolving against its own
+        // receiver. Measured solo: 98 passed, 40 failed.
+        .baseline = 96,
+        .max_failed = 42,
         .max_incomplete = 0,
     });
 }
