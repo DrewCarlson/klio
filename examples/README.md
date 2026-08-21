@@ -160,6 +160,7 @@ Run any program with:
 | `generic_class_type_param_dispatch.kt` | A method param typed as a full-word CLASS type parameter (`put(key: Key)` on `Store<Key, Value>`) accepts any argument even when an unrelated class named `Key` exists. |
 | `nested_class_name_collision.kt` | Two nested classes sharing a simple name under different outers keep distinct identities and enclosing-companion scopes. |
 | `nested_class_reference.kt` | A private nested class reached from inside a lambda in its declaring class: construction, `Type::member` references, and use as a declared type all bind the same declaration. |
+| `file_private_collision/` | Two files in one package each declaring a same-signature `private fun`: a bare call, a `::` reference, and a call from inside a lambda each bind the caller's own file's declaration. Run all three files together. |
 | `typealias.kt`                | `typealias`.                                                |
 | `typealias_receiver_member_ext.kt` | A member extension declared on a typealias receiver (`fun AliasedUnit.report()` where `typealias AliasedUnit = Unit`) dispatches on values of the aliased type through the enclosing scope. |
 | `throwable_suppressed_user_class.kt` | `addSuppressed`/`suppressedExceptions` on a user-defined throwable class: the suppressed set is shared across aliases and survives throw/catch. |

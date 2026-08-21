@@ -807,6 +807,23 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // lower the reference as a zero-arg closure over the stamped
             // call instead.
             if (try reifiedRefClosure(b, pr.name.name, pr.name.span)) |r| return r;
+            // `::name` naming a file-private top-level function mangled per
+            // file (two files in one package each declaring the same
+            // `private fun`) references the calling file's mangled name.
+            // Without the rewrite the bare name has no declaration at all
+            // and the reference degrades to a member ref on the enclosing
+            // `this` — kotlinx's `::createSegment` inside SemaphoreImpl.
+            // Locals, outer captures and own members still shadow it, the
+            // same scope order the bare CALL rewrite honors.
+            if (build.filePrivateFuncRename(pr.name.name, pr.name.span.file.int())) |renamed| {
+                if (b.resolve(pr.name.name) == null and !b.knowsOuter(pr.name.name) and
+                    !b.hasOwnMember(pr.name.name))
+                {
+                    var rewritten = expr.*;
+                    rewritten.PropertyRef.name = .{ .name = renamed, .span = pr.name.span };
+                    return lowerExpr(b, &rewritten);
+                }
+            }
             // `::greet` — a registered top-level fn loads the function value;
             // a tracked local / top-level prop keeps the unbound PropertyRef;
             // an untracked own-receiver member binds a MemberRef. The symbol
