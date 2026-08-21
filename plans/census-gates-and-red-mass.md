@@ -1190,6 +1190,35 @@ Still open in that file: the seven `runTest(unhandled = …)` cases, where
 the wrapped exception must reach `handleCoroutineException` as an
 UNHANDLED coroutine exception rather than surface at the call site.
 
+### Open: a `yield()` loop starves every timer (the four WithTimeout files)
+
+`WithTimeoutTest`, `WithTimeoutOrNullTest` and their Duration siblings each
+blow the 300s child timeout, taking four whole files with them. Reduced to:
+
+    runBlocking {
+        val j = launch { delay(100); fired = true }
+        while (!fired) { yield() }        // never terminates
+    }
+
+and equivalently `withTimeout(100) { while (true) { yield() } }`, which is
+`WithTimeoutTest.testYieldBlockingWithTimeout` verbatim. `withTimeout` over
+a plain `delay` DOES fire, so the timeout machinery works; what fails is
+the clock.
+
+The mechanism is exact: klio's pump runs `runBlocking` on the VIRTUAL
+clock, and `coroutines.zig`'s timer step only advances `virtual_now` when
+the earliest timer is in the FUTURE. `yield()` suspends with `Suspend = 0`,
+i.e. a timer at the current instant, so an infinite yield loop keeps
+ready-now work available forever and the clock never reaches the delay's
+deadline.
+
+That is correct behaviour for a virtual-time scheduler — kotlinx's own
+`TestScope` hangs the same way — but `TestBase.runTest` is backed by
+`runBlocking`, which upstream runs on REAL time, so the timeout fires after
+100ms of wall clock. The fix is a mode question (which pumps run `.Wall`),
+not a bug in the timer step, and it touches every suite that depends on
+virtual time being instant. Sized, not started.
+
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 
 7 failures read `bufferEnd` on `KlioBufferedChannel`. The tests cast the
