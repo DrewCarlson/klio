@@ -405,6 +405,7 @@ pub const VmHost = struct {
     pub const closureNeedsThisCapture = host_call_value.closureNeedsThisCapture;
     pub const overrideClosureThis = host_call_value.overrideClosureThis;
     pub const callFunc = host_call_func.callFunc;
+    pub const samConvertActivationArgs = host_call_func.samConvertActivationArgs;
     pub const callFuncNamed = host_call_func.callFuncNamed;
     pub const callFuncTyped = host_call_func.callFuncTyped;
     pub const setTrailingLambdaCall = host_call_func.setTrailingLambdaCall;

@@ -1,0 +1,8 @@
+literal  = true/<1>/<2><2>
+member   = b:true:[3][3]
+explicit = true/{1}/{2}{2}
+variable = true/(1)/(2)(2)
+predicate= true/false/false
+inline p = true/true/truetrue
+plain    = p9
+reuse    = true/s1/s2s2 x:true:s3s3

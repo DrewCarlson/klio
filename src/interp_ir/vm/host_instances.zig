@@ -1987,6 +1987,50 @@ fn classDefIsInner(d: ObjRef(ClassDef)) bool {
     return g.get().is_inner;
 }
 
+/// Wrap a callable into an instance of the `fun interface` named by a
+/// parameter's declared type — Kotlin's SAM conversion, which happens at the
+/// call boundary, so the value the callee sees IS an instance of the
+/// interface. The caller's reference MOVES into the wrapper (the argument slot
+/// it came from is overwritten with the wrapper), so nothing is retained here.
+///
+/// Null when no conversion applies: not a callable, a `Function` slot, a type
+/// parameter, or a name that is not a `fun interface`.
+pub fn samWrapForParamType(self: *VmHost, allocator: Allocator, v: *const Value, ty_name: []const u8) Allocator.Error!?Value {
+    if (v.* != .IrClosure) return null;
+    if (ty_name.len <= 2 or std.mem.startsWith(u8, ty_name, "Function")) return null;
+    const bare = std.mem.trimEnd(u8, ty_name, "?");
+    const simple = blk: {
+        const dot = std.mem.lastIndexOfScalar(u8, bare, '.') orelse break :blk bare;
+        break :blk bare[dot + 1 ..];
+    };
+    const pd = classDefByName(self, simple) orelse return null;
+    defer pd.deinit();
+    if (!classDefIsFunInterface(pd)) return null;
+    var fields: std.ArrayList(InstanceData.Field) = .empty;
+    try fields.append(allocator, .{ .name = "__sam_target__", .value = v.* });
+    const inst = try ObjRef(InstanceData).init(allocator, .{
+        .class = pd.clone(),
+        .fields = fields,
+        .outer = null,
+        .identity = nextInstanceId(self),
+        .native_state = null,
+    });
+    return .{ .Instance = inst };
+}
+
+/// Whether `ty_name` names a `fun interface`, for the per-func mask below.
+pub fn paramTypeIsFunInterface(self: *VmHost, ty_name: []const u8) bool {
+    if (ty_name.len <= 2 or std.mem.startsWith(u8, ty_name, "Function")) return false;
+    const bare = std.mem.trimEnd(u8, ty_name, "?");
+    const simple = blk: {
+        const dot = std.mem.lastIndexOfScalar(u8, bare, '.') orelse break :blk bare;
+        break :blk bare[dot + 1 ..];
+    };
+    const pd = classDefByName(self, simple) orelse return false;
+    defer pd.deinit();
+    return classDefIsFunInterface(pd);
+}
+
 fn classDefIsFunInterface(d: ObjRef(ClassDef)) bool {
     const g = d.borrow();
     defer g.deinit();
