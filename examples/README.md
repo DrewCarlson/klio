@@ -159,6 +159,7 @@ Run any program with:
 | `long_property_literal_init.kt` | A Long-typed property initialized with a bare Int literal stores a Long in every property position (top-level, object, companion, ctor default, body field). |
 | `generic_class_type_param_dispatch.kt` | A method param typed as a full-word CLASS type parameter (`put(key: Key)` on `Store<Key, Value>`) accepts any argument even when an unrelated class named `Key` exists. |
 | `nested_class_name_collision.kt` | Two nested classes sharing a simple name under different outers keep distinct identities and enclosing-companion scopes. |
+| `nested_class_reference.kt` | A private nested class reached from inside a lambda in its declaring class: construction, `Type::member` references, and use as a declared type all bind the same declaration. |
 | `typealias.kt`                | `typealias`.                                                |
 | `typealias_receiver_member_ext.kt` | A member extension declared on a typealias receiver (`fun AliasedUnit.report()` where `typealias AliasedUnit = Unit`) dispatches on values of the aliased type through the enclosing scope. |
 | `throwable_suppressed_user_class.kt` | `addSuppressed`/`suppressedExceptions` on a user-defined throwable class: the suppressed set is shared across aliases and survives throw/catch. |

@@ -140,45 +140,76 @@ def has_test(path):
         return "@Test" in fh.read()
 
 
-DECL_RE = re.compile(
-    r"^[^\S\n]*(?:(?:public|internal|private|protected|abstract|open|sealed|final|"
-    r"data|value|inner|enum|annotation|expect|actual|companion)\s+)*"
-    r"(?:class|interface|object)\s+(\w+)", re.M)
-HEADER_RE = re.compile(
-    r"^[^\S\n]*(?:(?:public|internal|private|protected|abstract|open|sealed|final|"
-    r"data|value|inner|enum|annotation|expect|actual|companion)\s+)*"
-    r"(?:class|interface|object)\s+\w+(?:<[^>\n]*>)?\s*(?:\([^)]*\))?\s*:([^{\n]*)", re.M)
-NAME_RE = re.compile(r"[\w.]+")
+MODIFIERS = (r"(?:public|internal|private|protected|expect|actual|open|abstract|"
+             r"sealed|final|data|value|enum|annotation|inline|suspend|external|"
+             r"const|lateinit|operator|infix|tailrec)")
+TOP_DECL_RE = re.compile(r"^(?:" + MODIFIERS + r"\s+)*"
+                         r"(fun|val|var|class|interface|object|typealias)\b\s*(.*)$", re.M)
+PACKAGE_RE = re.compile(r"^package\s+(\S+)", re.M)
+IMPORT_RE = re.compile(r"^import\s+([\w.]+)(\.\*)?", re.M)
+WORD_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def top_level_names(src):
+    """Names a source declares at top level. Anchored at column zero, so a
+    nested or member declaration is not a provider for another file."""
+    out = set()
+    for kw, tail in TOP_DECL_RE.findall(src):
+        t = tail.strip()
+        if t.startswith("<"):          # `fun <T> ...`: skip the type params
+            depth = 0
+            for i, c in enumerate(t):
+                if c == "<":
+                    depth += 1
+                elif c == ">":
+                    depth -= 1
+                    if depth == 0:
+                        t = t[i + 1:].strip()
+                        break
+        if kw == "fun":                # skip an extension receiver: `Flow<T>.id()`
+            mm = re.match(r"[\w.<>?,\[\] ]*?([A-Za-z_]\w*)\s*[({:=<]", t)
+            if mm:
+                out.add(mm.group(1))
+                continue
+        mm = re.match(r"([A-Za-z_]\w*)", t)
+        if mm:
+            out.add(mm.group(1))
+    return out
 
 
 def decl_scan(path):
-    """Simple names a file declares, and the simple names its declarations
-    list as supertypes."""
+    """(package, packages in scope, top-level names declared, identifiers
+    mentioned). A file resolves an unqualified name against its own package
+    and every package it imports, so both are provider scopes."""
     with open(os.path.join(ROOT, path), "r", errors="replace") as fh:
         src = fh.read()
-    declares = DECL_RE.findall(src)
-    extends = []
-    for tail in HEADER_RE.findall(src):
-        for n in NAME_RE.findall(tail):
-            extends.append(n.rsplit(".", 1)[-1])
-    return declares, extends
+    m = PACKAGE_RE.search(src)
+    pkg = m.group(1) if m else ""
+    scopes = {pkg}
+    for path_str, star in IMPORT_RE.findall(src):
+        scopes.add(path_str if star else path_str.rsplit(".", 1)[0])
+    return (pkg, scopes, top_level_names(src), set(WORD_RE.findall(src)))
 
 
-def base_closure(scans, owner, target):
-    """Test files `target` must compile with because it extends a classifier
-    they declare, transitively. Upstream commonTest is one compilation unit,
-    so a @Test-bearing file may extend a base class declared in another
-    @Test-bearing file; compiled alone it loses the inherited members and
-    the inherited cases."""
+def provider_closure(scans, owner, target):
+    """Test files `target` must compile with because it names something they
+    declare at top level in its own package, transitively. Upstream
+    commonTest is one compilation unit, so a @Test-bearing file may extend a
+    base class or call a helper declared in another @Test-bearing file;
+    compiled alone it resolves the name against whatever else matches and
+    loses the inherited cases outright."""
     out, queue, seen = [], [target], {target}
     while queue:
-        for name in scans[queue.pop(0)][1]:
-            i = owner.get(name)
-            if i is None or i in seen:
-                continue
-            seen.add(i)
-            queue.append(i)
-            out.append(i)
+        i = queue.pop(0)
+        _pkg, scopes, declares, words = scans[i]
+        for name in words - declares:
+            for scope in scopes:
+                for j in owner.get((scope, name), ()):
+                    if j in seen:
+                        continue
+                    seen.add(j)
+                    queue.append(j)
+                    out.append(j)
     return out
 
 
@@ -273,6 +304,10 @@ def main():
     targets = [p for p in all_kt if has_test(p)]
     for d in cfg["extra_support"] + args.extra_support:
         support += collect_kt(d)
+    # The provider closure is computed over EVERY target: `--filter` narrows
+    # what RUNS, not what a run compiles against, so a helper declared in a
+    # filtered-out file is still pulled in.
+    all_targets = list(targets)
     if args.filter:
         targets = [t for t in targets if args.filter in t]
 
@@ -281,14 +316,15 @@ def main():
     results, n_pass, n_fail, incomplete = [], 0, 0, 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         whole = targets if cfg["whole_source_set"] else None
-        scans = [decl_scan(t) for t in targets]
-        owner = {}
-        for i, (declares, _) in enumerate(scans):
+        scans = [decl_scan(t) for t in all_targets]
+        owner = collections.defaultdict(list)
+        for i, (pkg, _scopes, declares, _) in enumerate(scans):
             for d in declares:
-                owner[d] = i
+                owner[(pkg, d)].append(i)
+        index_of = {t: i for i, t in enumerate(all_targets)}
         futs = [pool.submit(run_target, t, support, env, args.timeout, whole,
-                            [targets[b] for b in base_closure(scans, owner, i)])
-                for i, t in enumerate(targets)]
+                            [all_targets[b] for b in provider_closure(scans, owner, index_of[t])])
+                for t in targets]
         for f in concurrent.futures.as_completed(futs):
             target, passed, failed, inc, err = f.result()
             n_pass += len(passed)

@@ -1094,7 +1094,13 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // class constructed a UIntArray from the ref's first use).
             if (mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1) {
                 const rn = mr.receiver.Path.segments[0].name;
-                if (b.resolve(rn) == null and !b.knowsOuter(rn) and
+                // A scope-renamed name has no bare `class_id` either, but it
+                // is a real classifier — a nested `Box` inside its declaring
+                // class lifts to `Holder$Box`. Loading the bare name would
+                // strand the reference on an unresolved global; defer to
+                // `lowerReceiver`, which applies the rewrite.
+                const renamed = scopeTypeRename(b, rn, mr.receiver.Path.segments[0].span.file.int()) != null;
+                if (!renamed and b.resolve(rn) == null and !b.knowsOuter(rn) and
                     b.module.classId(rn) == null and !b.hasOwnMember(rn) and
                     !isTopLevelProp(rn))
                 {
@@ -22073,4 +22079,61 @@ test "bare call commits an outer tower extension through its label slot" {
         }
     }
     try testing.expect(moved_from_outer);
+}
+
+test "a member reference on a scope-renamed nested class loads the lifted name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+    const sp = dummySpan();
+    // `Box` is a nested class of `Holder`, lifted to `Holder$Box`: it has no
+    // binding under its bare simple name.
+    var aliases = std.StringHashMap([]const u8).init(a);
+    try aliases.put("Box", "Holder$Box");
+    try m.registry.nested_object_aliases.put("Holder", aliases);
+    _ = try m.addClass(a, .{
+        .id = ir.ClassId.from(0),
+        .name = "Holder$Box",
+        .fqn = "sample.Holder$Box",
+        .package = "sample",
+        .type_params = &.{},
+        .primary_params = &.{},
+        .methods = &.{},
+        .init_block = null,
+        .companion = null,
+        .supertypes = &.{},
+    });
+
+    var b = try FuncBuilder.init(a, &m);
+    defer b.deinit();
+    b.setOwnerClass("Holder");
+
+    var recv_segments = [_]ast.Ident{.{ .name = "Box", .span = sp }};
+    var recv = Expr{ .Path = .{ .segments = &recv_segments, .span = sp } };
+    const ref = Expr{ .MemberRef = .{
+        .receiver = &recv,
+        .name = .{ .name = "i", .span = sp },
+        .span = sp,
+    } };
+    _ = try lowerExpr(&b, &ref);
+
+    // The qualifier resolves through the lifted name, never the bare `Box`
+    // (which has no binding of its own and would raise an unresolved global).
+    var lifted = false;
+    var bare = false;
+    for (b.blocks.items[b.cur.int()].insts) |inst| {
+        const name: ?[]const u8 = switch (inst) {
+            .LoadGlobal => |lg| m.consts.items[lg.name.int()].String,
+            .LoadFromThisOrGlobal => |lt| m.consts.items[lt.name.int()].String,
+            .GetField => |gf| m.consts.items[gf.field.int()].String,
+            else => null,
+        };
+        const n = name orelse continue;
+        if (std.mem.eql(u8, n, "Holder$Box")) lifted = true;
+        if (std.mem.eql(u8, n, "Box")) bare = true;
+    }
+    try testing.expect(lifted);
+    try testing.expect(!bare);
 }
