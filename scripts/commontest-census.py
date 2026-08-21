@@ -140,6 +140,48 @@ def has_test(path):
         return "@Test" in fh.read()
 
 
+DECL_RE = re.compile(
+    r"^[^\S\n]*(?:(?:public|internal|private|protected|abstract|open|sealed|final|"
+    r"data|value|inner|enum|annotation|expect|actual|companion)\s+)*"
+    r"(?:class|interface|object)\s+(\w+)", re.M)
+HEADER_RE = re.compile(
+    r"^[^\S\n]*(?:(?:public|internal|private|protected|abstract|open|sealed|final|"
+    r"data|value|inner|enum|annotation|expect|actual|companion)\s+)*"
+    r"(?:class|interface|object)\s+\w+(?:<[^>\n]*>)?\s*(?:\([^)]*\))?\s*:([^{\n]*)", re.M)
+NAME_RE = re.compile(r"[\w.]+")
+
+
+def decl_scan(path):
+    """Simple names a file declares, and the simple names its declarations
+    list as supertypes."""
+    with open(os.path.join(ROOT, path), "r", errors="replace") as fh:
+        src = fh.read()
+    declares = DECL_RE.findall(src)
+    extends = []
+    for tail in HEADER_RE.findall(src):
+        for n in NAME_RE.findall(tail):
+            extends.append(n.rsplit(".", 1)[-1])
+    return declares, extends
+
+
+def base_closure(scans, owner, target):
+    """Test files `target` must compile with because it extends a classifier
+    they declare, transitively. Upstream commonTest is one compilation unit,
+    so a @Test-bearing file may extend a base class declared in another
+    @Test-bearing file; compiled alone it loses the inherited members and
+    the inherited cases."""
+    out, queue, seen = [], [target], {target}
+    while queue:
+        for name in scans[queue.pop(0)][1]:
+            i = owner.get(name)
+            if i is None or i in seen:
+                continue
+            seen.add(i)
+            queue.append(i)
+            out.append(i)
+    return out
+
+
 # `Class.method FAILED` then an indented error line.
 FAILED_RE = re.compile(r"^(\S+) FAILED\s*$")
 
@@ -170,9 +212,13 @@ def symbol(msg):
     return None
 
 
-def run_target(target, support, env, timeout, all_targets=None):
+def run_target(target, support, env, timeout, all_targets=None, bases=()):
     if all_targets is not None:
         argv = [BIN, "test", "--only-file", target] + support + all_targets
+    elif bases:
+        # The base files carry their own cases; `--only-file` keeps them
+        # compiled but unrun so each case is counted once.
+        argv = [BIN, "test", "--only-file", target] + support + list(bases) + [target]
     else:
         argv = [BIN, "test"] + support + [target]
     try:
@@ -235,7 +281,14 @@ def main():
     results, n_pass, n_fail, incomplete = [], 0, 0, 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         whole = targets if cfg["whole_source_set"] else None
-        futs = [pool.submit(run_target, t, support, env, args.timeout, whole) for t in targets]
+        scans = [decl_scan(t) for t in targets]
+        owner = {}
+        for i, (declares, _) in enumerate(scans):
+            for d in declares:
+                owner[d] = i
+        futs = [pool.submit(run_target, t, support, env, args.timeout, whole,
+                            [targets[b] for b in base_closure(scans, owner, i)])
+                for i, t in enumerate(targets)]
         for f in concurrent.futures.as_completed(futs):
             target, passed, failed, inc, err = f.result()
             n_pass += len(passed)

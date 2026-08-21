@@ -127,6 +127,108 @@ fn fileHasTest(a: std.mem.Allocator, io: std.Io, path: []const u8) bool {
     return std.mem.indexOf(u8, bytes, "@Test") != null;
 }
 
+fn isIdentByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// The simple names a Kotlin source declares as classifiers, and the simple
+/// names those declarations list as supertypes. Header-only scan: a
+/// classifier keyword at a word boundary, its name, then the supertype list
+/// after the header's top-level `:` (parenthesized constructor arguments and
+/// generic arguments keep the depth above zero, so a header spanning several
+/// lines is read whole).
+const DeclScan = struct {
+    declares: []const []const u8,
+    extends: []const []const u8,
+};
+
+fn scanDecls(a: std.mem.Allocator, src: []const u8) !DeclScan {
+    var declares: std.ArrayList([]const u8) = .empty;
+    var extends: std.ArrayList([]const u8) = .empty;
+    const keywords = [_][]const u8{ "class", "interface", "object" };
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) {
+        if (i != 0 and isIdentByte(src[i - 1])) continue;
+        const kw = for (keywords) |k| {
+            if (std.mem.startsWith(u8, src[i..], k) and
+                i + k.len < src.len and !isIdentByte(src[i + k.len])) break k;
+        } else continue;
+        var p = i + kw.len;
+        while (p < src.len and (src[p] == ' ' or src[p] == '\t')) p += 1;
+        if (p >= src.len or !(std.ascii.isAlphabetic(src[p]) or src[p] == '_')) {
+            i = p;
+            continue;
+        }
+        var e = p;
+        while (e < src.len and isIdentByte(src[e])) e += 1;
+        try declares.append(a, src[p..e]);
+        var depth: i32 = 0;
+        var seen_colon = false;
+        var k = e;
+        while (k < src.len) : (k += 1) {
+            const c = src[k];
+            if (c == '(' or c == '<' or c == '[') {
+                depth += 1;
+            } else if (c == ')' or c == '>' or c == ']') {
+                depth -= 1;
+            } else if (depth <= 0 and c == '{') {
+                break;
+            } else if (depth <= 0 and c == '\n') {
+                if (seen_colon) break;
+                // A header with no supertypes ends at its line; keep
+                // scanning only while the `:` may still be coming (a
+                // constructor list wrapped across lines holds depth > 0).
+                var q = k + 1;
+                while (q < src.len and (src[q] == ' ' or src[q] == '\t')) q += 1;
+                if (q >= src.len or src[q] != ':') break;
+            } else if (depth <= 0 and c == ':') {
+                seen_colon = true;
+            } else if (seen_colon and depth <= 0 and (std.ascii.isAlphabetic(c) or c == '_')) {
+                var q = k;
+                var last = k;
+                while (q < src.len and (isIdentByte(src[q]) or src[q] == '.')) : (q += 1) {
+                    if (src[q] == '.') last = q + 1;
+                }
+                try extends.append(a, src[last..q]);
+                k = q - 1;
+            }
+        }
+        i = k;
+    }
+    return .{ .declares = declares.items, .extends = extends.items };
+}
+
+/// Test files that `target` must be compiled with because it extends a
+/// classifier they declare, transitively. Upstream commonTest is one
+/// compilation unit, so a `@Test`-bearing file may extend a base class
+/// declared in ANOTHER `@Test`-bearing file (`FlattenConcatTest :
+/// FlatMapBaseTest()`); compiled alone the subclass gets an unresolved
+/// supertype and loses both the inherited members and the inherited cases.
+fn baseClosure(
+    a: std.mem.Allocator,
+    scans: []const DeclScan,
+    owner: *const std.StringHashMapUnmanaged(usize),
+    target: usize,
+) ![]const usize {
+    var out: std.ArrayList(usize) = .empty;
+    var queue: std.ArrayList(usize) = .empty;
+    try queue.append(a, target);
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        for (scans[queue.items[head]].extends) |name| {
+            const idx = owner.get(name) orelse continue;
+            if (idx == target) continue;
+            for (queue.items) |seen| {
+                if (seen == idx) break;
+            } else {
+                try queue.append(a, idx);
+                try out.append(a, idx);
+            }
+        }
+    }
+    return out.items;
+}
+
 /// Count per-test `PASSED` lines (`<Class>.<method> PASSED`). Robust to a file
 /// killed mid-run: passes printed before the kill still count.
 fn passedLineCount(stdout: []const u8) usize {
@@ -191,8 +293,17 @@ pub fn runSuite(cfg: Config) !void {
         if (fileHasTest(a, io, p)) try targets.append(a, p) else try support.append(a, p);
     }
 
+    var scans: std.ArrayList(DeclScan) = .empty;
+    var owner: std.StringHashMapUnmanaged(usize) = .empty;
+    for (targets.items, 0..) |t, ti| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, t, a, .unlimited) catch "";
+        const s = try scanDecls(a, bytes);
+        try scans.append(a, s);
+        for (s.declares) |d| try owner.put(a, d, ti);
+    }
+
     var jobs: std.ArrayList([]const []const u8) = .empty;
-    for (targets.items) |target| {
+    for (targets.items, 0..) |target, ti| {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, klioBin(&env));
         try argv.append(a, "test");
@@ -202,7 +313,15 @@ pub fn runSuite(cfg: Config) !void {
             try argv.appendSlice(a, support.items);
             try argv.appendSlice(a, targets.items);
         } else {
+            const bases = try baseClosure(a, scans.items, &owner, ti);
+            if (bases.len != 0) {
+                // The base files carry their own cases; `--only-file` keeps
+                // them compiled but unrun so each case is counted once.
+                try argv.append(a, "--only-file");
+                try argv.append(a, target);
+            }
             try argv.appendSlice(a, support.items);
+            for (bases) |bi| try argv.append(a, targets.items[bi]);
             try argv.append(a, target);
         }
         try jobs.append(a, try argv.toOwnedSlice(a));
