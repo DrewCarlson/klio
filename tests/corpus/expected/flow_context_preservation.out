@@ -1,0 +1,5 @@
+direct   = [1, 2]
+child    = Flow invariant is violated:
+switched = Flow invariant is violated:
+channel  = [1, 2]
+flowOn   = [1, 2]
