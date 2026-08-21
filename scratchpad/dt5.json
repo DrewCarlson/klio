@@ -1,0 +1,1095 @@
+{
+ "suite": "datetime",
+ "results": [
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/ClockTimeSourceTest.kt",
+   "passed": [
+    "ClockTimeSourceTest.arithmetic",
+    "ClockTimeSourceTest.elapsed",
+    "ClockTimeSourceTest.differentSources",
+    "ClockTimeSourceTest.saturation",
+    "ClockTimeSourceTest.timeSourceAsClock",
+    "ClockTimeSourceTest.syncMultipleClocksFromTimeSource"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/DateTimePeriodTest.kt",
+   "passed": [
+    "DateTimePeriodTest.normalization",
+    "DateTimePeriodTest.toStringConversion",
+    "DateTimePeriodTest.parseIsoString",
+    "DateTimePeriodTest.periodArithmetic",
+    "DateTimePeriodTest.durationConversion"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/DateTimeUnitTest.kt",
+   "passed": [
+    "DateTimeUnitTest.baseUnits",
+    "DateTimeUnitTest.productUnits"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/DayOfWeekTest.kt",
+   "passed": [
+    "DayOfWeekTest.testDayOfWeek",
+    "DayOfWeekTest.testExhaustiveWhenDayOfWeek"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/InstantTest.kt",
+   "passed": [
+    "InstantTest.testNow",
+    "InstantTest.instantArithmetic",
+    "InstantTest.instantToLocalDTConversion",
+    "InstantTest.addingMultiplesOf2_32",
+    "InstantTest.unitMultiplesUntil",
+    "InstantTest.changingTimeZoneRules",
+    "InstantTest.periodUntilSameSign",
+    "InstantTest.untilDays",
+    "InstantTest.dateTimePeriodWithGapBetweenMonthsAndDays",
+    "InstantTest.periodUntilWithGapBetweenMonthsAndDays",
+    "InstantTest.diffInvariant",
+    "InstantTest.diffInvariantSameAsDate",
+    "InstantTest.nanosecondAdjustment",
+    "InstantTest.strings",
+    "InstantTest.distantPastAndFuture",
+    "InstantRangeTest.epochMillisecondsClamping",
+    "InstantRangeTest.epochSecondsClamping",
+    "InstantRangeTest.durationArithmeticClamping",
+    "InstantRangeTest.periodArithmeticOutOfRange",
+    "InstantRangeTest.timeBasedUnitArithmeticOutOfRange",
+    "InstantRangeTest.periodUntilOutOfRange",
+    "InstantRangeTest.unitsUntilClamping",
+    "InstantRangeTest.unitsUntilOutOfRange",
+    "InstantRangeTest.addSmallDurationsToLargeInstants",
+    "InstantRangeTest.subtractInstants"
+   ],
+   "failed": [
+    {
+     "test": "InstantTest.instantCalendarArithmetic",
+     "err": "kotlin.AssertionError: hours. Expected <1>, actual <2>."
+    },
+    {
+     "test": "InstantTest.instantOffset",
+     "err": "kotlin.AssertionError: Expected <2019-10-27T02:59>, actual <2019-10-27T03:59>."
+    },
+    {
+     "test": "InstantTest.zoneDependentDiff",
+     "err": "exception"
+    },
+    {
+     "test": "InstantRangeTest.unitArithmeticOutOfRange",
+     "err": "exception"
+    }
+   ],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/LocalDateRangeTest.kt",
+   "passed": [
+    "LocalDateRangeTest.emptyRange",
+    "LocalDateRangeTest.forwardRange",
+    "LocalDateRangeTest.backwardRange",
+    "LocalDateRangeTest.step",
+    "LocalDateRangeTest.string",
+    "LocalDateRangeTest.random",
+    "LocalDateRangeTest.first",
+    "LocalDateRangeTest.last",
+    "LocalDateRangeTest.firstOrNull",
+    "LocalDateRangeTest.lastOrNull",
+    "LocalDateRangeTest.reversed",
+    "LocalDateRangeTest.contains",
+    "LocalDateRangeTest.getSize",
+    "LocalDateRangeTest.equalityAndHashCode"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/LocalDateTest.kt",
+   "passed": [
+    "LocalDateTest.localDateTimePart",
+    "LocalDateTest.atTime",
+    "LocalDateTest.atStartOfDay",
+    "LocalDateTest.addComponents",
+    "LocalDateTest.tomorrow",
+    "LocalDateTest.diffInvariant",
+    "LocalDateTest.unitsUntil",
+    "LocalDateTest.unitMultiplesUntil",
+    "LocalDateTest.constructInvalidDate",
+    "LocalDateTest.unitArithmeticOutOfRange",
+    "LocalDateTest.periodArithmeticOutOfRange",
+    "LocalDateTest.orNull",
+    "LocalDateTest.fromEpochDays",
+    "LocalDateTest.toEpochDays",
+    "LocalDateTest.nextAndPreviousDayOfWeek"
+   ],
+   "failed": [
+    {
+     "test": "LocalDateTest.parseIsoString",
+     "err": "exception"
+    }
+   ],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/LocalDateTimeTest.kt",
+   "passed": [
+    "LocalDateTimeTest.localDtToInstantConversion",
+    "LocalDateTimeTest.localDtToInstantConversionRespectsTimezones",
+    "LocalDateTimeTest.instantToLocalConversion",
+    "LocalDateTimeTest.getCurrentHMS",
+    "LocalDateTimeTest.tomorrow",
+    "LocalDateTimeTest.constructFromParts",
+    "LocalDateTimeTest.strings",
+    "LocalDateTimeTest.constructInvalidDate",
+    "LocalDateTimeTest.constructInvalidTime",
+    "LocalDateTimeTest.orNull"
+   ],
+   "failed": [
+    {
+     "test": "LocalDateTimeTest.localDateTimeParsing",
+     "err": "exception"
+    }
+   ],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/LocalIsoWeekDateTest.kt",
+   "passed": [
+    "LocalIsoWeekDateTest.testWikipedia",
+    "LocalIsoWeekDateTest.construction",
+    "LocalIsoWeekDateTest.parsing",
+    "LocalIsoWeekDateTest.parseOrNull"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/LocalTimeTest.kt",
+   "passed": [
+    "LocalTimeTest.localTimeParsing",
+    "LocalTimeTest.strings",
+    "LocalTimeTest.constructInvalidTime",
+    "LocalTimeTest.orNull",
+    "LocalTimeTest.fromNanosecondOfDay",
+    "LocalTimeTest.fromNanosecondOfDayInvalid",
+    "LocalTimeTest.fromMillisecondOfDay",
+    "LocalTimeTest.fromMillisecondOfDayInvalid",
+    "LocalTimeTest.fromSecondOfDay",
+    "LocalTimeTest.fromSecondOfDayInvalid",
+    "LocalTimeTest.fromSecondOfDayIgnoresNanosecond",
+    "LocalTimeTest.atDate"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/MonthTest.kt",
+   "passed": [
+    "MonthTest.testExhaustiveWhen"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/MultiplyAndDivideTest.kt",
+   "passed": [
+    "MultiplyAndDivideTest.small",
+    "MultiplyAndDivideTest.smallNegative",
+    "MultiplyAndDivideTest.large",
+    "MultiplyAndDivideTest.largeNegative",
+    "MultiplyAndDivideTest.halfLarge",
+    "MultiplyAndDivideTest.randomProductFitsInLong",
+    "MultiplyAndDivideTest.nearIntBoundary",
+    "MultiplyAndDivideTest.largeOverflows"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/ReadmeTest.kt",
+   "passed": [
+    "ReadmeTest.testGettingCurrentMoment",
+    "ReadmeTest.testGettingLocalDateComponents",
+    "ReadmeTest.testObtainingYearMonth",
+    "ReadmeTest.testGettingLocalTimeComponents",
+    "ReadmeTest.testConvertingInstantToAndFromUnixTime",
+    "ReadmeTest.testConvertingInstantAndLocalDateTimeToAndFromIso8601String",
+    "ReadmeTest.testWorkingWithOtherStringFormats",
+    "ReadmeTest.testUnicodePatterns",
+    "ReadmeTest.testParsingAndFormattingPartialCompoundOrOutOfBoundsData",
+    "ReadmeTest.testInstantArithmetic",
+    "ReadmeTest.testDateArithmetic",
+    "ReadmeTest.testDateTimeArithmetic"
+   ],
+   "failed": [
+    {
+     "test": "ReadmeTest.testConvertingAnInstantToLocalDateAndTimeComponents",
+     "err": "exception"
+    }
+   ],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/TimeZoneTest.kt",
+   "passed": [
+    "TimeZoneTest.utc",
+    "TimeZoneTest.system",
+    "TimeZoneTest.available",
+    "TimeZoneTest.availableZonesAreAvailable",
+    "TimeZoneTest.of",
+    "TimeZoneTest.ofFailsOnInvalidOffset",
+    "TimeZoneTest.timeZoneEquals",
+    "TimeZoneTest.timeZoneToString",
+    "TimeZoneTest.newYorkOffset",
+    "TimeZoneTest.newYorkOffsetToDST",
+    "TimeZoneTest.newYorkOffsetFromDST"
+   ],
+   "failed": [
+    {
+     "test": "TimeZoneTest.utcOffsetNormalization",
+     "err": "exception"
+    },
+    {
+     "test": "TimeZoneTest.checkKnownTimezoneDatabaseRecords",
+     "err": "kotlin.Exception: Didn't find an overlap at 2019-11-03T02:00 for America/New_York"
+    }
+   ],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/UtcOffsetTest.kt",
+   "passed": [
+    "UtcOffsetTest.construction",
+    "UtcOffsetTest.constructionErrors",
+    "UtcOffsetTest.utcOffsetToString",
+    "UtcOffsetTest.parseAllValidValues",
+    "UtcOffsetTest.asTimeZone"
+   ],
+   "failed": [
+    {
+     "test": "UtcOffsetTest.invalidUtcOffsetStrings",
+     "err": "kotlin.AssertionError: Time zone name should not be parsed as UtcOffset: UTC. Expected an exception of DateTimeFormatException to be thrown, but was completed successfully with the result: <Z>."
+    },
+    {
+     "test": "UtcOffsetTest.equality",
+     "err": "kotlin.AssertionError: [Z, Z, Z, Z, Z]. Expected <1>, actual <5>."
+    }
+   ],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/YearMonthRangeTest.kt",
+   "passed": [
+    "YearMonthRangeTest.emptyRange",
+    "YearMonthRangeTest.forwardRange",
+    "YearMonthRangeTest.backwardRange",
+    "YearMonthRangeTest.step",
+    "YearMonthRangeTest.string",
+    "YearMonthRangeTest.random",
+    "YearMonthRangeTest.first",
+    "YearMonthRangeTest.last",
+    "YearMonthRangeTest.firstOrNull",
+    "YearMonthRangeTest.lastOrNull",
+    "YearMonthRangeTest.reversed",
+    "YearMonthRangeTest.contains",
+    "YearMonthRangeTest.getSize",
+    "YearMonthRangeTest.equalityAndHashCode"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/YearMonthTest.kt",
+   "passed": [
+    "YearMonthTest.parseIsoString",
+    "YearMonthTest.parseOrNull",
+    "YearMonthTest.localDatePart",
+    "YearMonthTest.onDay",
+    "YearMonthTest.addComponents",
+    "YearMonthTest.unitsUntil",
+    "YearMonthTest.unitMultiplesUntil",
+    "YearMonthTest.constructInvalidYearMonth",
+    "YearMonthTest.monthsUntilClamping",
+    "YearMonthTest.daysRange"
+   ],
+   "failed": [
+    {
+     "test": "YearMonthTest.unitArithmeticOutOfRange",
+     "err": "kotlin.AssertionError: Expected an exception of DateTimeArithmeticException to be thrown, but was kotlin.AssertionError: +1000000-12"
+    }
+   ],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/DateTimeComponentsFormatTest.kt",
+   "passed": [
+    "DateTimeComponentsFormatTest.testErrorHandling",
+    "DateTimeComponentsFormatTest.testInconsistentLocalTime",
+    "DateTimeComponentsFormatTest.testRfc1123",
+    "DateTimeComponentsFormatTest.testZonedDateTime",
+    "DateTimeComponentsFormatTest.testTimeZoneGreedyParsing",
+    "DateTimeComponentsFormatTest.testDocFormatting",
+    "DateTimeComponentsFormatTest.testDocOutOfBoundsParsing",
+    "DateTimeComponentsFormatTest.testDocCombinedParsing",
+    "DateTimeComponentsFormatTest.testDefaultValueAssignment",
+    "DateTimeComponentsFormatTest.testByUnicodePatternDoc",
+    "DateTimeComponentsFormatTest.testZuluTimeZone",
+    "DateTimeComponentsFormatTest.testSpecialNamedTimeZones",
+    "DateTimeComponentsFormatTest.testPrefixWithIncorrectParsableOffset",
+    "DateTimeComponentsFormatTest.testValidSinglePartTimeZones",
+    "DateTimeComponentsFormatTest.testValidMultiPartTimeZones",
+    "DateTimeComponentsFormatTest.testInvalidTimeZones",
+    "DateTimeComponentsFormatTest.testPartiallyValidTimeZones",
+    "DateTimeComponentsFormatTest.testPrefixWithIncorrectUnparsableOffset"
+   ],
+   "failed": [
+    {
+     "test": "DateTimeComponentsFormatTest.testFormattingWithUnsetFields",
+     "err": "Vm::call_member `set` on `PropertyAndItsValue`"
+    },
+    {
+     "test": "DateTimeComponentsFormatTest.testPrefixWithCorrectParsableOffset",
+     "err": "exception"
+    }
+   ],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/DateTimeComponentsTest.kt",
+   "passed": [
+    "DateTimeComponentsTest.testAssigningIllegalValues",
+    "DateTimeComponentsTest.testGettingInvalidMonth"
+   ],
+   "failed": [
+    {
+     "test": "DateTimeComponentsTest.testAssigningLegalValues",
+     "err": "Vm::call_member `monthNumber` on `kotlinx.datetime.format.DateTimeComponents.Companion`"
+    }
+   ],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/DateTimeFormatTest.kt",
+   "passed": [
+    "DateTimeFormatTest.testStringRepresentations",
+    "DateTimeFormatTest.testStringRepresentationWithConstants",
+    "DateTimeFormatTest.testStringRepresentationAfterIncorrectConversion",
+    "DateTimeFormatTest.testParseStringWithNumbers",
+    "DateTimeFormatTest.testCreatingAmbiguousFormat",
+    "DateTimeFormatTest.testOptionalBetweenConsecutiveNumbers",
+    "DateTimeFormatTest.testNotParsingNonAsciiNumbers"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/LocalDateFormatTest.kt",
+   "passed": [
+    "LocalDateFormatTest.testErrorHandling",
+    "LocalDateFormatTest.testBigEndianDates",
+    "LocalDateFormatTest.testSmallEndianDates",
+    "LocalDateFormatTest.testSingleNumberDates",
+    "LocalDateFormatTest.testDayMonthNameYear",
+    "LocalDateFormatTest.testRomanNumerals",
+    "LocalDateFormatTest.testReducedYear",
+    "LocalDateFormatTest.testIso",
+    "LocalDateFormatTest.testBasicIso",
+    "LocalDateFormatTest.testDayOfYear",
+    "LocalDateFormatTest.testDoc",
+    "LocalDateFormatTest.testEmptyDayOfWeekNames",
+    "LocalDateFormatTest.testIdenticalDayOfWeekNames"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/LocalDateTimeFormatTest.kt",
+   "passed": [
+    "LocalDateTimeFormatTest.testErrorHandling",
+    "LocalDateTimeFormatTest.testPythonDateTime",
+    "LocalDateTimeFormatTest.testPythonDateTimeWithoutSeconds",
+    "LocalDateTimeFormatTest.testSingleNumberDateTimes",
+    "LocalDateTimeFormatTest.testNoPadding",
+    "LocalDateTimeFormatTest.testSpacePadding",
+    "LocalDateTimeFormatTest.testIso",
+    "LocalDateTimeFormatTest.testDoc"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/LocalTimeFormatTest.kt",
+   "passed": [
+    "LocalTimeFormatTest.testErrorHandling",
+    "LocalTimeFormatTest.testHoursMinutes",
+    "LocalTimeFormatTest.testHoursMinutesSeconds",
+    "LocalTimeFormatTest.testAmPmHour",
+    "LocalTimeFormatTest.testIso",
+    "LocalTimeFormatTest.testFormattingSecondFractions",
+    "LocalTimeFormatTest.testDoc",
+    "LocalTimeFormatTest.testParsingDisagreeingComponents",
+    "LocalTimeFormatTest.testEmptyAmPmMarkers",
+    "LocalTimeFormatTest.testIdenticalAmPmMarkers"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/ParserStructureConcatenationTest.kt",
+   "passed": [
+    "ParserStructureConcatenationTest.concatDistributesNumberSpanParserOperation",
+    "ParserStructureConcatenationTest.concatDistributesUnconditionalModificationAfterNumberSpanParserOperation",
+    "ParserStructureConcatenationTest.concatFlattensOperations",
+    "ParserStructureConcatenationTest.concatDistributesTopLevelNumberSpanParserOperationIntoBranches"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/UtcOffsetFormatTest.kt",
+   "passed": [
+    "UtcOffsetFormatTest.testErrorHandling",
+    "UtcOffsetFormatTest.testLenientIso8601",
+    "UtcOffsetFormatTest.testIso",
+    "UtcOffsetFormatTest.testBasicIso",
+    "UtcOffsetFormatTest.testCompact",
+    "UtcOffsetFormatTest.testDoc"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/YearMonthFormatTest.kt",
+   "passed": [
+    "YearMonthFormatTest.testIso",
+    "YearMonthFormatTest.testIsoWithoutSeparators",
+    "YearMonthFormatTest.testErrorHandling",
+    "YearMonthFormatTest.testEmptyMonthNames",
+    "YearMonthFormatTest.testIdenticalMonthNames"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/ClockSamples.kt",
+   "passed": [
+    "ClockSamples.system",
+    "ClockSamples.dependencyInjection",
+    "ClockSamples.todayIn",
+    "ClockSamples.timeSourceAsClock"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/DateTimePeriodSamples.kt",
+   "passed": [
+    "DateTimePeriodSamples.construction",
+    "DateTimePeriodSamples.simpleParsingAndFormatting",
+    "DateTimePeriodSamples.valueNormalization",
+    "DateTimePeriodSamples.toStringSample",
+    "DateTimePeriodSamples.parsing",
+    "DateTimePeriodSamples.parseOrNull",
+    "DateTimePeriodSamples.constructorFunction",
+    "DateTimePeriodSamples.durationToDateTimePeriod",
+    "DatePeriodSamples.simpleParsingAndFormatting",
+    "DatePeriodSamples.construction",
+    "DatePeriodSamples.parsing",
+    "DatePeriodSamples.parseOrNull"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/DateTimeUnitSamples.kt",
+   "passed": [
+    "DateTimeUnitSamples.construction",
+    "DateTimeUnitSamples.multiplication",
+    "DateTimeUnitSamples.timeBasedUnit",
+    "DateTimeUnitSamples.dayBasedUnit",
+    "DateTimeUnitSamples.monthBasedUnit"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/DayOfWeekSamples.kt",
+   "passed": [
+    "DayOfWeekSamples.usage",
+    "DayOfWeekSamples.isoDayNumber",
+    "DayOfWeekSamples.constructorFunction"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/InstantSamples.kt",
+   "passed": [
+    "InstantSamples.epochSeconds",
+    "InstantSamples.nanosecondsOfSecond",
+    "InstantSamples.toEpochMilliseconds",
+    "InstantSamples.plusDuration",
+    "InstantSamples.minusDuration",
+    "InstantSamples.minusInstant",
+    "InstantSamples.compareToSample",
+    "InstantSamples.toStringSample",
+    "InstantSamples.fromEpochMilliseconds",
+    "InstantSamples.fromEpochSeconds",
+    "InstantSamples.fromEpochSecondsIntNanos",
+    "InstantSamples.parsing",
+    "InstantSamples.parseOrNull",
+    "InstantSamples.isDistantPast",
+    "InstantSamples.isDistantFuture",
+    "InstantSamples.plusPeriod",
+    "InstantSamples.minusPeriod",
+    "InstantSamples.periodUntil",
+    "InstantSamples.untilAsDateTimeUnit",
+    "InstantSamples.untilAsTimeBasedUnit",
+    "InstantSamples.daysUntil",
+    "InstantSamples.monthsUntil",
+    "InstantSamples.yearsUntil",
+    "InstantSamples.minusInstantInZone",
+    "InstantSamples.plusDateTimeUnit",
+    "InstantSamples.minusDateTimeUnit",
+    "InstantSamples.plusTimeBasedUnit",
+    "InstantSamples.minusTimeBasedUnit",
+    "InstantSamples.minusAsDateTimeUnit",
+    "InstantSamples.minusAsTimeBasedUnit",
+    "InstantSamples.formatting"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/LocalDateRangeSamples.kt",
+   "passed": [
+    "LocalDateRangeSamples.simpleRangeCreation",
+    "LocalDateRangeSamples.progressionWithStep",
+    "LocalDateRangeSamples.reversedProgression",
+    "LocalDateRangeSamples.firstAndLast",
+    "LocalDateRangeSamples.random"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/LocalDateSamples.kt",
+   "passed": [
+    "LocalDateSamples.simpleParsingAndFormatting",
+    "LocalDateSamples.parsing",
+    "LocalDateSamples.parseOrNull",
+    "LocalDateSamples.fromAndToEpochDays",
+    "LocalDateSamples.customFormat",
+    "LocalDateSamples.constructorFunctionMonthNumber",
+    "LocalDateSamples.constructorFunction",
+    "LocalDateSamples.orNullMonthNumber",
+    "LocalDateSamples.orNull",
+    "LocalDateSamples.year",
+    "LocalDateSamples.month",
+    "LocalDateSamples.day",
+    "LocalDateSamples.dayOfWeek",
+    "LocalDateSamples.dayOfYear",
+    "LocalDateSamples.toEpochDays",
+    "LocalDateSamples.compareToSample",
+    "LocalDateSamples.formatting",
+    "LocalDateSamples.atTimeInline",
+    "LocalDateSamples.atTime",
+    "LocalDateSamples.plusPeriod",
+    "LocalDateSamples.minusPeriod",
+    "LocalDateSamples.periodUntil",
+    "LocalDateSamples.minusDate",
+    "LocalDateSamples.until",
+    "LocalDateSamples.daysUntil",
+    "LocalDateSamples.monthsUntil",
+    "LocalDateSamples.yearsUntil",
+    "LocalDateSamples.plus",
+    "LocalDateSamples.minus",
+    "LocalDateSamples.previousOrSame",
+    "LocalDateSamples.next",
+    "LocalDateSamples.nextOrSame",
+    "LocalDateSamples.previous"
+   ],
+   "failed": [
+    {
+     "test": "LocalDateSamples.toStringSample",
+     "err": "kotlin.IllegalStateException: Check failed."
+    }
+   ],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/LocalDateTimeSamples.kt",
+   "passed": [
+    "LocalDateTimeSamples.alternativeConstruction",
+    "LocalDateTimeSamples.simpleParsingAndFormatting",
+    "LocalDateTimeSamples.parsing",
+    "LocalDateTimeSamples.parseOrNull",
+    "LocalDateTimeSamples.customFormat",
+    "LocalDateTimeSamples.constructorFunctionWithMonthNumber",
+    "LocalDateTimeSamples.constructorFunction",
+    "LocalDateTimeSamples.fromDateAndTime",
+    "LocalDateTimeSamples.dateComponents",
+    "LocalDateTimeSamples.timeComponents",
+    "LocalDateTimeSamples.dateAndTime",
+    "LocalDateTimeSamples.compareToSample",
+    "LocalDateTimeSamples.toStringSample",
+    "LocalDateTimeSamples.orNull",
+    "LocalDateTimeSamples.orNullWithMonth",
+    "LocalDateTimeSamples.formatting"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/LocalIsoWeekDateSamples.kt",
+   "passed": [
+    "LocalIsoWeekDateSamples.constructorFunction",
+    "LocalIsoWeekDateSamples.localDateConversion",
+    "LocalIsoWeekDateSamples.parsingAndFormatting",
+    "LocalIsoWeekDateSamples.weekYearProperty",
+    "LocalIsoWeekDateSamples.weekNumberProperty",
+    "LocalIsoWeekDateSamples.dayOfWeekProperty",
+    "LocalIsoWeekDateSamples.constructorFunctionDayOfWeekNumber",
+    "LocalIsoWeekDateSamples.orNull",
+    "LocalIsoWeekDateSamples.orNullDayOfWeekNumber",
+    "LocalIsoWeekDateSamples.parsing",
+    "LocalIsoWeekDateSamples.toStringSample",
+    "LocalIsoWeekDateSamples.compareToSample",
+    "LocalIsoWeekDateSamples.parseOrNull"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/LocalTimeSamples.kt",
+   "passed": [
+    "LocalTimeSamples.construction",
+    "LocalTimeSamples.representingAsNumbers",
+    "LocalTimeSamples.simpleParsingAndFormatting",
+    "LocalTimeSamples.parsing",
+    "LocalTimeSamples.parseOrNull",
+    "LocalTimeSamples.fromAndToSecondOfDay",
+    "LocalTimeSamples.fromAndToMillisecondOfDay",
+    "LocalTimeSamples.fromAndToNanosecondOfDay",
+    "LocalTimeSamples.customFormat",
+    "LocalTimeSamples.constructorFunction",
+    "LocalTimeSamples.orNull",
+    "LocalTimeSamples.hour",
+    "LocalTimeSamples.minute",
+    "LocalTimeSamples.second",
+    "LocalTimeSamples.nanosecond",
+    "LocalTimeSamples.toSecondOfDay",
+    "LocalTimeSamples.toMillisecondOfDay",
+    "LocalTimeSamples.toNanosecondOfDay",
+    "LocalTimeSamples.compareTo",
+    "LocalTimeSamples.toStringSample",
+    "LocalTimeSamples.formatting",
+    "LocalTimeSamples.atDateComponentWiseMonthNumber",
+    "LocalTimeSamples.atDateComponentWise",
+    "LocalTimeSamples.atDate"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/MonthSamples.kt",
+   "passed": [
+    "MonthSamples.usage",
+    "MonthSamples.number",
+    "MonthSamples.constructorFunction"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/TimeZoneSamples.kt",
+   "passed": [
+    "TimeZoneSamples.usage",
+    "TimeZoneSamples.id",
+    "TimeZoneSamples.toStringSample",
+    "TimeZoneSamples.equalsSample",
+    "TimeZoneSamples.currentSystemDefault",
+    "TimeZoneSamples.utc",
+    "TimeZoneSamples.constructorFunction",
+    "TimeZoneSamples.availableZoneIds",
+    "TimeZoneSamples.toLocalDateTimeWithTwoReceivers",
+    "TimeZoneSamples.toInstantWithTwoReceivers",
+    "TimeZoneSamples.offsetAt",
+    "TimeZoneSamples.instantToLocalDateTime",
+    "TimeZoneSamples.instantToLocalDateTimeInOffset",
+    "TimeZoneSamples.offsetIn",
+    "TimeZoneSamples.localDateTimeToInstantInZone",
+    "TimeZoneSamples.localDateTimeToInstantInOffset"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/UtcOffsetSamples.kt",
+   "passed": [
+    "UtcOffsetSamples.construction",
+    "UtcOffsetSamples.simpleParsingAndFormatting",
+    "UtcOffsetSamples.customFormat",
+    "UtcOffsetSamples.equalsSample",
+    "UtcOffsetSamples.parsing",
+    "UtcOffsetSamples.parseOrNull",
+    "UtcOffsetSamples.toStringSample",
+    "UtcOffsetSamples.formatting",
+    "UtcOffsetSamples.constructorFunction",
+    "UtcOffsetSamples.asFixedOffsetTimeZone",
+    "UtcOffsetSamples.orNull"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/YearMonthRangeSamples.kt",
+   "passed": [
+    "YearMonthRangeSamples.simpleRangeCreation",
+    "YearMonthRangeSamples.progressionWithStep",
+    "YearMonthRangeSamples.reversedProgression",
+    "YearMonthRangeSamples.firstAndLast",
+    "YearMonthRangeSamples.random"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/YearMonthSamples.kt",
+   "passed": [
+    "YearMonthSamples.simpleParsingAndFormatting",
+    "YearMonthSamples.parsing",
+    "YearMonthSamples.customFormat",
+    "YearMonthSamples.constructorFunctionMonthNumber",
+    "YearMonthSamples.constructorFunction",
+    "YearMonthSamples.orNullMonthNumber",
+    "YearMonthSamples.orNull",
+    "YearMonthSamples.year",
+    "YearMonthSamples.month",
+    "YearMonthSamples.days",
+    "YearMonthSamples.compareToSample",
+    "YearMonthSamples.toStringSample",
+    "YearMonthSamples.formatting",
+    "YearMonthSamples.plusYear",
+    "YearMonthSamples.minusYear",
+    "YearMonthSamples.plusMonth",
+    "YearMonthSamples.minusMonth",
+    "YearMonthSamples.yearMonth",
+    "YearMonthSamples.onDay",
+    "YearMonthSamples.until",
+    "YearMonthSamples.monthsUntil",
+    "YearMonthSamples.yearsUntil",
+    "YearMonthSamples.plus",
+    "YearMonthSamples.minus",
+    "YearMonthSamples.firstAndLastDay",
+    "YearMonthSamples.numberOfDays",
+    "YearMonthSamples.parseOrNull"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/format/DateTimeComponentsFormatSamples.kt",
+   "passed": [
+    "DateTimeComponentsFormatSamples.timeZoneId",
+    "DateTimeComponentsFormatSamples.dateTimeComponents"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/format/DateTimeComponentsSamples.kt",
+   "passed": [
+    "DateTimeComponentsSamples.parsingComplexInput",
+    "DateTimeComponentsSamples.parsingInvalidInput",
+    "DateTimeComponentsSamples.simpleFormatting",
+    "DateTimeComponentsSamples.customFormat",
+    "DateTimeComponentsSamples.setDateTime",
+    "DateTimeComponentsSamples.setDateTimeOffsetInstant",
+    "DateTimeComponentsSamples.setDateTimeOffset",
+    "DateTimeComponentsSamples.dayOfWeek",
+    "DateTimeComponentsSamples.yearMonth",
+    "DateTimeComponentsSamples.dayOfYear",
+    "DateTimeComponentsSamples.date",
+    "DateTimeComponentsSamples.setMonth",
+    "DateTimeComponentsSamples.timeAmPm",
+    "DateTimeComponentsSamples.time",
+    "DateTimeComponentsSamples.offset",
+    "DateTimeComponentsSamples.timeZoneId",
+    "DateTimeComponentsSamples.toUtcOffset",
+    "DateTimeComponentsSamples.toYearMonth",
+    "DateTimeComponentsSamples.toLocalDate",
+    "DateTimeComponentsSamples.toLocalTime",
+    "DateTimeComponentsSamples.toLocalDateTime",
+    "DateTimeComponentsSamples.toInstantUsingOffset",
+    "DateTimeComponentsSamples.formatting",
+    "DateTimeComponentsSamples.parsing",
+    "DateTimeComponentsSamples.parseOrNull"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/format/DateTimeFormatBuilderSamples.kt",
+   "passed": [
+    "DateTimeFormatBuilderSamples.chars",
+    "DateTimeFormatBuilderSamples.alternativeParsing",
+    "DateTimeFormatBuilderSamples.optional",
+    "DateTimeFormatBuilderSamples.char"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/format/DateTimeFormatSamples.kt",
+   "passed": [
+    "DateTimeFormatSamples.format",
+    "DateTimeFormatSamples.formatTo",
+    "DateTimeFormatSamples.parse",
+    "DateTimeFormatSamples.parseOrNull",
+    "DateTimeFormatSamples.formatAsKotlinBuilderDsl"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/format/LocalDateFormatSamples.kt",
+   "passed": [
+    "LocalDateFormatSamples.dayOfMonth",
+    "LocalDateFormatSamples.dayOfWeek",
+    "LocalDateFormatSamples.dayOfYear",
+    "LocalDateFormatSamples.date"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/format/LocalDateTimeFormatSamples.kt",
+   "passed": [
+    "LocalDateTimeFormatSamples.dateTime"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/format/LocalTimeFormatSamples.kt",
+   "passed": [
+    "LocalTimeFormatSamples.hhmmss",
+    "LocalTimeFormatSamples.amPm",
+    "LocalTimeFormatSamples.fixedLengthSecondFraction",
+    "LocalTimeFormatSamples.time"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/format/UnicodeSamples.kt",
+   "passed": [
+    "UnicodeSamples.byUnicodePattern"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/format/UtcOffsetFormatSamples.kt",
+   "passed": [
+    "UtcOffsetFormatSamples.isoOrGmt",
+    "UtcOffsetFormatSamples.offset"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/format/YearMonthFormatSamples.kt",
+   "passed": [
+    "YearMonthFormatSamples.year",
+    "YearMonthFormatSamples.yearTwoDigits",
+    "YearMonthFormatSamples.monthNumber",
+    "YearMonthFormatSamples.monthName",
+    "YearMonthFormatSamples.yearMonth"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/ThreeTenBpLocalDateTest.kt",
+   "passed": [
+    "ThreeTenBpLocalDateTest.dayOfWeek",
+    "ThreeTenBpLocalDateTest.getDayOfYear",
+    "ThreeTenBpLocalDateTest.plusMonths",
+    "ThreeTenBpLocalDateTest.plusDays"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/ThreeTenBpLocalDateTimeTest.kt",
+   "passed": [
+    "ThreeTenBpLocalDateTimeTest.toSecondsAfterEpoch",
+    "ThreeTenBpLocalDateTimeTest.toSecondsBeforeEpoch",
+    "ThreeTenBpLocalDateTimeTest.plusSeconds"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/ThreeTenBpTimeZoneTest.kt",
+   "passed": [
+    "ThreeTenBpTimeZoneTest.nonExistentLocalTime"
+   ],
+   "failed": [
+    {
+     "test": "ThreeTenBpTimeZoneTest.utcIsCached",
+     "err": "kotlin.AssertionError: Expected <Z>, actual <Z> is not same."
+    },
+    {
+     "test": "ThreeTenBpTimeZoneTest.overlappingLocalTime",
+     "err": "kotlin.AssertionError: Expected <2007-10-28T00:30:00Z>, actual <2007-10-28T01:30:00Z>."
+    }
+   ],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/ThreeTenBpUtilTest.kt",
+   "passed": [
+    "ThreeTenBpUtilTest.isLeap"
+   ],
+   "failed": [],
+   "incomplete": false
+  },
+  {
+   "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/TimeZoneRulesTest.kt",
+   "passed": [],
+   "failed": [
+    {
+     "test": "TimeZoneRulesTest.ruleStrings",
+     "err": "unresolved global `readTzFile`"
+    },
+    {
+     "test": "TimeZoneRulesTest.ruleStringWithNonLastDayOfWeek",
+     "err": "Vm::get_field `PosixTzString` on `kotlinx.datetime.test.TimeZoneRulesTest`"
+    }
+   ],
+   "incomplete": false
+  }
+ ],
+ "hist": [
+  [
+   "exception",
+   7
+  ],
+  [
+   "Vm::call_member `X` on `X`",
+   2
+  ],
+  [
+   "kotlin.AssertionError: hours. Expected <N>, actual <N>.",
+   1
+  ],
+  [
+   "kotlin.AssertionError: Expected <N-N-27T02:N>, actual <N-N-27T03:N>.",
+   1
+  ],
+  [
+   "kotlin.Exception: Didn't find an overlap at N-N-03T02:N for America/New_York",
+   1
+  ],
+  [
+   "kotlin.AssertionError: Time zone name should not be parsed as UtcOffset: UTC. Expected an exception of DateTimeFormatException to be thrown, but was completed successfully with the result: <Z>.",
+   1
+  ],
+  [
+   "kotlin.AssertionError: [Z, Z, Z, Z, Z]. Expected <N>, actual <N>.",
+   1
+  ],
+  [
+   "kotlin.AssertionError: Expected an exception of DateTimeArithmeticException to be thrown, but was kotlin.AssertionError: +N-N",
+   1
+  ],
+  [
+   "kotlin.IllegalStateException: Check failed.",
+   1
+  ],
+  [
+   "kotlin.AssertionError: Expected <Z>, actual <Z> is not same.",
+   1
+  ],
+  [
+   "kotlin.AssertionError: Expected <N-N-28T00:N:00Z>, actual <N-N-28T01:N:00Z>.",
+   1
+  ],
+  [
+   "unresolved global `X`",
+   1
+  ],
+  [
+   "Vm::get_field `X` on `X`",
+   1
+  ]
+ ],
+ "symbols": [
+  [
+   "readTzFile",
+   1
+  ]
+ ],
+ "by_shape": {
+  "kotlin.AssertionError: hours. Expected <N>, actual <N>.": [
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/InstantTest.kt::InstantTest.instantCalendarArithmetic"
+  ],
+  "kotlin.AssertionError: Expected <N-N-27T02:N>, actual <N-N-27T03:N>.": [
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/InstantTest.kt::InstantTest.instantOffset"
+  ],
+  "exception": [
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/InstantTest.kt::InstantTest.zoneDependentDiff",
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/InstantTest.kt::InstantRangeTest.unitArithmeticOutOfRange",
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/LocalDateTest.kt::LocalDateTest.parseIsoString",
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/LocalDateTimeTest.kt::LocalDateTimeTest.localDateTimeParsing",
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/ReadmeTest.kt::ReadmeTest.testConvertingAnInstantToLocalDateAndTimeComponents",
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/TimeZoneTest.kt::TimeZoneTest.utcOffsetNormalization",
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/DateTimeComponentsFormatTest.kt::DateTimeComponentsFormatTest.testPrefixWithCorrectParsableOffset"
+  ],
+  "kotlin.Exception: Didn't find an overlap at N-N-03T02:N for America/New_York": [
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/TimeZoneTest.kt::TimeZoneTest.checkKnownTimezoneDatabaseRecords"
+  ],
+  "kotlin.AssertionError: Time zone name should not be parsed as UtcOffset: UTC. Expected an exception of DateTimeFormatException to be thrown, but was completed successfully with the result: <Z>.": [
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/UtcOffsetTest.kt::UtcOffsetTest.invalidUtcOffsetStrings"
+  ],
+  "kotlin.AssertionError: [Z, Z, Z, Z, Z]. Expected <N>, actual <N>.": [
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/UtcOffsetTest.kt::UtcOffsetTest.equality"
+  ],
+  "kotlin.AssertionError: Expected an exception of DateTimeArithmeticException to be thrown, but was kotlin.AssertionError: +N-N": [
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/YearMonthTest.kt::YearMonthTest.unitArithmeticOutOfRange"
+  ],
+  "Vm::call_member `X` on `X`": [
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/DateTimeComponentsFormatTest.kt::DateTimeComponentsFormatTest.testFormattingWithUnsetFields",
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/DateTimeComponentsTest.kt::DateTimeComponentsTest.testAssigningLegalValues"
+  ],
+  "kotlin.IllegalStateException: Check failed.": [
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/samples/LocalDateSamples.kt::LocalDateSamples.toStringSample"
+  ],
+  "kotlin.AssertionError: Expected <Z>, actual <Z> is not same.": [
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/ThreeTenBpTimeZoneTest.kt::ThreeTenBpTimeZoneTest.utcIsCached"
+  ],
+  "kotlin.AssertionError: Expected <N-N-28T00:N:00Z>, actual <N-N-28T01:N:00Z>.": [
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/ThreeTenBpTimeZoneTest.kt::ThreeTenBpTimeZoneTest.overlappingLocalTime"
+  ],
+  "unresolved global `X`": [
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/TimeZoneRulesTest.kt::TimeZoneRulesTest.ruleStrings"
+  ],
+  "Vm::get_field `X` on `X`": [
+   "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/TimeZoneRulesTest.kt::TimeZoneRulesTest.ruleStringWithNonLastDayOfWeek"
+  ]
+ }
+}

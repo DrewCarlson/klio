@@ -1,0 +1,5 @@
+FlattenConcatTest.testFlatMapConcurrency FAILED
+    Vm::call_value on `kotlin.Nothing`
+FlattenConcatTest.testCancellation PASSED
+
+2 tests, 1 passed, 1 failed, 0 skipped

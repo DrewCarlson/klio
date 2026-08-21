@@ -1,0 +1,81 @@
+FAIL examples/compose_foundation_lazy.kt (baseline rc=0 gc rc=124)
+1,5d0
+< items composed=7 of 30
+< first visible=10
+< visible count=7
+< first visible key=10
+< total=30
+FAIL examples/compose_multiwindow.kt (baseline rc=0 gc rc=124)
+FAIL examples/compose_ui_click.kt (baseline rc=0 gc rc=139)
+8,20c8
+< rect 0 0 15 16 FF9E9E9E
+< rect 1 1 13 7 FF2196F3
+< text 2 7 5 FFFFFFFF ADD
+< text 2 14 5 FF000000 N 1
+< 
+FAIL examples/compose_ui_dashboard.kt (baseline rc=124 gc rc=139)
+0a1
+> timeout: the monitored command dumped core
+\ No newline at end of file
+FAIL examples/compose_ui.kt (baseline rc=0 gc rc=139)
+14,23c14
+< rect 0 0 17 18 FF9E9E9E
+< srect 0 0 17 18 1 FF000000
+< text 1 6 5 FF000000 KLIO
+< rect 2 7 3 4 FFF44336
+< srect 2 7 3 4 1 FFFFFFFF
+FAIL examples/compose_ui_lazy.kt (baseline rc=0 gc rc=139)
+16,28c16
+< rect 0 0 20 20 FF9E9E9E
+< rect 0 0 20 4 FF2196F3
+< text 1 6 5 FFFFFFFF I 10
+< rect 0 4 20 4 FF4CAF50
+< text 1 10 5 FFFFFFFF I 11
+FAIL examples/compose_window.kt (baseline rc=0 gc rc=124)
+FAIL examples/jit_nested_call_loop.kt (baseline rc=0 gc rc=124)
+1d0
+< s=1074908112
+\ No newline at end of file
+FAIL examples/jit_object_traversal_loop.kt (baseline rc=0 gc rc=124)
+1d0
+< total=2997000000
+\ No newline at end of file
+FAIL examples/mosaic_hello.kt (baseline rc=0 gc rc=139)
+6,12c6
+< Hello, mosaic!
+< count is 3    
+< [###]         
+< --- frame 2 (count=7) ---
+< Hello, mosaic!
+FAIL examples/numeric_literal_coercion.kt (baseline rc=0 gc rc=124)
+3d2
+< 2000001000000
+FAIL examples/synchronized_nonlocal_return.kt (baseline rc=0 gc rc=124)
+3,5c3
+< caught boom
+< 42
+< done
+\ No newline at end of file
+---
+FAIL examples/text_transforms.kt (baseline rc=0 gc rc=139)
+3,6c3
+< call ******** or ********
+< 01.06.2024
+< one 2 two two
+< The Quick Brown Fox
+\ No newline at end of file
+---
+pass=340 fail=13
+  failed: examples/compose_foundation_lazy.kt
+  failed: examples/compose_multiwindow.kt
+  failed: examples/compose_ui_click.kt
+  failed: examples/compose_ui_dashboard.kt
+  failed: examples/compose_ui.kt
+  failed: examples/compose_ui_lazy.kt
+  failed: examples/compose_window.kt
+  failed: examples/jit_nested_call_loop.kt
+  failed: examples/jit_object_traversal_loop.kt
+  failed: examples/mosaic_hello.kt
+  failed: examples/numeric_literal_coercion.kt
+  failed: examples/synchronized_nonlocal_return.kt
+  failed: examples/text_transforms.kt

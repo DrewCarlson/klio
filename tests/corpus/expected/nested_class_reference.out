@@ -1,0 +1,6 @@
+direct    = 6
+lambda    = 6
+methodref = 12
+nested    = 6
+build     = 7
+astype    = 9

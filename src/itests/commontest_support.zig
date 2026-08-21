@@ -131,83 +131,155 @@ fn isIdentByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
-/// The simple names a Kotlin source declares as classifiers, and the simple
-/// names those declarations list as supertypes. Header-only scan: a
-/// classifier keyword at a word boundary, its name, then the supertype list
-/// after the header's top-level `:` (parenthesized constructor arguments and
-/// generic arguments keep the depth above zero, so a header spanning several
-/// lines is read whole).
+/// What one test source contributes to, and needs from, its compilation unit:
+/// the package it declares, the names it declares at TOP level (column zero,
+/// so a nested or member declaration never provides for another file), and
+/// every identifier it mentions.
 const DeclScan = struct {
+    package: []const u8,
     declares: []const []const u8,
-    extends: []const []const u8,
+    words: []const []const u8,
 };
+
+const decl_keywords = [_][]const u8{ "fun", "val", "var", "class", "interface", "object", "typealias" };
+const decl_modifiers = [_][]const u8{
+    "public",   "internal", "private", "protected", "expect",  "actual",
+    "open",     "abstract", "sealed",  "final",     "data",    "value",
+    "enum",     "annotation", "inline", "suspend",  "external", "const",
+    "lateinit", "operator", "infix",   "tailrec",
+};
+
+fn wordAt(src: []const u8, i: usize) []const u8 {
+    var e = i;
+    while (e < src.len and isIdentByte(src[e])) e += 1;
+    return src[i..e];
+}
+
+fn isDeclKeyword(w: []const u8) bool {
+    for (decl_keywords) |k| if (std.mem.eql(u8, w, k)) return true;
+    return false;
+}
+
+fn isDeclModifier(w: []const u8) bool {
+    for (decl_modifiers) |k| if (std.mem.eql(u8, w, k)) return true;
+    return false;
+}
+
+/// The name a top-level declaration binds, given the text after its keyword.
+/// Skips a `fun`'s type parameters and extension receiver so
+/// `inline fun<T: Flow<Int>> CoroutineScope.helper(...)` yields `helper`.
+fn declaredName(tail: []const u8, is_fun: bool) ?[]const u8 {
+    var i: usize = 0;
+    while (i < tail.len and (tail[i] == ' ' or tail[i] == '\t')) i += 1;
+    if (i < tail.len and tail[i] == '<') {
+        var depth: usize = 0;
+        while (i < tail.len) : (i += 1) {
+            if (tail[i] == '<') depth += 1;
+            if (tail[i] == '>') {
+                depth -= 1;
+                if (depth == 0) {
+                    i += 1;
+                    break;
+                }
+            }
+            if (tail[i] == '\n') return null;
+        }
+        while (i < tail.len and (tail[i] == ' ' or tail[i] == '\t')) i += 1;
+    }
+    if (i >= tail.len or !(std.ascii.isAlphabetic(tail[i]) or tail[i] == '_')) return null;
+    if (!is_fun) return wordAt(tail, i);
+    // Walk the receiver/name path to the identifier the call site uses.
+    var name = wordAt(tail, i);
+    var k = i + name.len;
+    while (k < tail.len) {
+        switch (tail[k]) {
+            '<', '[' => {
+                var depth: usize = 0;
+                while (k < tail.len) : (k += 1) {
+                    if (tail[k] == '<' or tail[k] == '[') depth += 1;
+                    if (tail[k] == '>' or tail[k] == ']') {
+                        depth -= 1;
+                        if (depth == 0) {
+                            k += 1;
+                            break;
+                        }
+                    }
+                    if (tail[k] == '\n') return name;
+                }
+            },
+            '?' => k += 1,
+            '.' => {
+                k += 1;
+                if (k >= tail.len or !(std.ascii.isAlphabetic(tail[k]) or tail[k] == '_')) return name;
+                name = wordAt(tail, k);
+                k += name.len;
+            },
+            else => return name,
+        }
+    }
+    return name;
+}
 
 fn scanDecls(a: std.mem.Allocator, src: []const u8) !DeclScan {
     var declares: std.ArrayList([]const u8) = .empty;
-    var extends: std.ArrayList([]const u8) = .empty;
-    const keywords = [_][]const u8{ "class", "interface", "object" };
+    var words: std.ArrayList([]const u8) = .empty;
+    var package: []const u8 = "";
+    var line_start = true;
     var i: usize = 0;
-    while (i < src.len) : (i += 1) {
-        if (i != 0 and isIdentByte(src[i - 1])) continue;
-        const kw = for (keywords) |k| {
-            if (std.mem.startsWith(u8, src[i..], k) and
-                i + k.len < src.len and !isIdentByte(src[i + k.len])) break k;
-        } else continue;
-        var p = i + kw.len;
-        while (p < src.len and (src[p] == ' ' or src[p] == '\t')) p += 1;
-        if (p >= src.len or !(std.ascii.isAlphabetic(src[p]) or src[p] == '_')) {
-            i = p;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == '\n') {
+            line_start = true;
+            i += 1;
             continue;
         }
-        var e = p;
-        while (e < src.len and isIdentByte(src[e])) e += 1;
-        try declares.append(a, src[p..e]);
-        var depth: i32 = 0;
-        var seen_colon = false;
-        var k = e;
-        while (k < src.len) : (k += 1) {
-            const c = src[k];
-            if (c == '(' or c == '<' or c == '[') {
-                depth += 1;
-            } else if (c == ')' or c == '>' or c == ']') {
-                depth -= 1;
-            } else if (depth <= 0 and c == '{') {
-                break;
-            } else if (depth <= 0 and c == '\n') {
-                if (seen_colon) break;
-                // A header with no supertypes ends at its line; keep
-                // scanning only while the `:` may still be coming (a
-                // constructor list wrapped across lines holds depth > 0).
-                var q = k + 1;
-                while (q < src.len and (src[q] == ' ' or src[q] == '\t')) q += 1;
-                if (q >= src.len or src[q] != ':') break;
-            } else if (depth <= 0 and c == ':') {
-                seen_colon = true;
-            } else if (seen_colon and depth <= 0 and (std.ascii.isAlphabetic(c) or c == '_')) {
-                var q = k;
-                var last = k;
-                while (q < src.len and (isIdentByte(src[q]) or src[q] == '.')) : (q += 1) {
-                    if (src[q] == '.') last = q + 1;
+        if (!(std.ascii.isAlphabetic(c) or c == '_')) {
+            if (c != ' ' and c != '\t') line_start = false;
+            i += 1;
+            continue;
+        }
+        const w = wordAt(src, i);
+        try words.append(a, w);
+        if (line_start and (i == 0 or src[i - 1] == '\n')) {
+            // A declaration at column zero: skip its modifiers, then read
+            // the bound name.
+            if (std.mem.eql(u8, w, "package")) {
+                var p = i + w.len;
+                while (p < src.len and (src[p] == ' ' or src[p] == '\t')) p += 1;
+                var e = p;
+                while (e < src.len and src[e] != '\n' and src[e] != ' ') e += 1;
+                package = src[p..e];
+            } else {
+                var p = i;
+                var head = w;
+                while (isDeclModifier(head)) {
+                    p += head.len;
+                    while (p < src.len and (src[p] == ' ' or src[p] == '\t')) p += 1;
+                    if (p >= src.len or !(std.ascii.isAlphabetic(src[p]) or src[p] == '_')) break;
+                    head = wordAt(src, p);
                 }
-                try extends.append(a, src[last..q]);
-                k = q - 1;
+                if (isDeclKeyword(head)) {
+                    const tail = src[p + head.len ..];
+                    if (declaredName(tail, std.mem.eql(u8, head, "fun"))) |n| try declares.append(a, n);
+                }
             }
         }
-        i = k;
+        line_start = false;
+        i += w.len;
     }
-    return .{ .declares = declares.items, .extends = extends.items };
+    return .{ .package = package, .declares = declares.items, .words = words.items };
 }
 
-/// Test files that `target` must be compiled with because it extends a
-/// classifier they declare, transitively. Upstream commonTest is one
-/// compilation unit, so a `@Test`-bearing file may extend a base class
-/// declared in ANOTHER `@Test`-bearing file (`FlattenConcatTest :
-/// FlatMapBaseTest()`); compiled alone the subclass gets an unresolved
-/// supertype and loses both the inherited members and the inherited cases.
-fn baseClosure(
+/// Test files that `target` must be compiled with because it names something
+/// they declare at top level in its own package, transitively. Upstream
+/// commonTest is one compilation unit, so a `@Test`-bearing file may extend a
+/// base class or call a helper declared in ANOTHER `@Test`-bearing file
+/// (`FlattenConcatTest : FlatMapBaseTest()`); compiled alone it resolves the
+/// name against whatever else matches and loses the inherited cases outright.
+fn providerClosure(
     a: std.mem.Allocator,
     scans: []const DeclScan,
-    owner: *const std.StringHashMapUnmanaged(usize),
+    owner: *const std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)),
     target: usize,
 ) ![]const usize {
     var out: std.ArrayList(usize) = .empty;
@@ -215,14 +287,21 @@ fn baseClosure(
     try queue.append(a, target);
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
-        for (scans[queue.items[head]].extends) |name| {
-            const idx = owner.get(name) orelse continue;
-            if (idx == target) continue;
-            for (queue.items) |seen| {
-                if (seen == idx) break;
+        const s = scans[queue.items[head]];
+        for (s.words) |name| {
+            for (s.declares) |d| {
+                if (std.mem.eql(u8, d, name)) break;
             } else {
-                try queue.append(a, idx);
-                try out.append(a, idx);
+                const key = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ scans[target].package, name });
+                const owners = owner.get(key) orelse continue;
+                for (owners.items) |idx| {
+                    for (queue.items) |seen| {
+                        if (seen == idx) break;
+                    } else {
+                        try queue.append(a, idx);
+                        try out.append(a, idx);
+                    }
+                }
             }
         }
     }
@@ -294,12 +373,17 @@ pub fn runSuite(cfg: Config) !void {
     }
 
     var scans: std.ArrayList(DeclScan) = .empty;
-    var owner: std.StringHashMapUnmanaged(usize) = .empty;
+    var owner: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty;
     for (targets.items, 0..) |t, ti| {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, t, a, .unlimited) catch "";
         const s = try scanDecls(a, bytes);
         try scans.append(a, s);
-        for (s.declares) |d| try owner.put(a, d, ti);
+        for (s.declares) |d| {
+            const key = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ s.package, d });
+            const gop = try owner.getOrPut(a, key);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(a, ti);
+        }
     }
 
     var jobs: std.ArrayList([]const []const u8) = .empty;
@@ -313,10 +397,10 @@ pub fn runSuite(cfg: Config) !void {
             try argv.appendSlice(a, support.items);
             try argv.appendSlice(a, targets.items);
         } else {
-            const bases = try baseClosure(a, scans.items, &owner, ti);
+            const bases = try providerClosure(a, scans.items, &owner, ti);
             if (bases.len != 0) {
-                // The base files carry their own cases; `--only-file` keeps
-                // them compiled but unrun so each case is counted once.
+                // The provider files carry their own cases; `--only-file`
+                // keeps them compiled but unrun so each case counts once.
                 try argv.append(a, "--only-file");
                 try argv.append(a, target);
             }
@@ -392,4 +476,69 @@ pub fn runSuite(cfg: Config) !void {
             return error.IncompleteCeilingExceeded;
         }
     }
+}
+
+test "top-level declarations provide for other files in the same package" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const base =
+        \\package kotlinx.coroutines.flow
+        \\
+        \\abstract class FlatMapBaseTest : TestBase() {
+        \\    abstract fun <T> Flow<T>.flatMap(m: (T) -> Flow<T>): Flow<T>
+        \\}
+        \\
+        \\inline fun<T: Flow<Int>> CoroutineScope.helper(flow: T) {}
+        \\
+    ;
+    const sub =
+        \\package kotlinx.coroutines.flow
+        \\
+        \\class FlattenConcatTest : FlatMapBaseTest() {
+        \\    private class Box(val i: Int)
+        \\    fun t() { helper(flowOf(1)) }
+        \\}
+        \\
+    ;
+    const other =
+        \\package kotlinx.coroutines.channels
+        \\
+        \\class FlatMapBaseTest
+        \\
+    ;
+
+    const s_base = try scanDecls(aa, base);
+    const s_sub = try scanDecls(aa, sub);
+    const s_other = try scanDecls(aa, other);
+
+    try std.testing.expectEqualStrings("kotlinx.coroutines.flow", s_base.package);
+    try std.testing.expectEqual(@as(usize, 2), s_base.declares.len);
+    try std.testing.expectEqualStrings("FlatMapBaseTest", s_base.declares[0]);
+    // A `fun`'s type parameters and extension receiver are not its name.
+    try std.testing.expectEqualStrings("helper", s_base.declares[1]);
+    // An indented member declaration provides for nobody.
+    try std.testing.expectEqual(@as(usize, 1), s_sub.declares.len);
+    try std.testing.expectEqualStrings("FlattenConcatTest", s_sub.declares[0]);
+
+    const scans = [_]DeclScan{ s_base, s_sub, s_other };
+    var owner: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty;
+    for (scans, 0..) |s, i| {
+        for (s.declares) |d| {
+            const key = try std.fmt.allocPrint(aa, "{s}\x00{s}", .{ s.package, d });
+            const gop = try owner.getOrPut(aa, key);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(aa, i);
+        }
+    }
+
+    // The subclass pulls in the file declaring its base and its helper; the
+    // same-named class in another package is not a provider.
+    const need = try providerClosure(aa, &scans, &owner, 1);
+    try std.testing.expectEqual(@as(usize, 1), need.len);
+    try std.testing.expectEqual(@as(usize, 0), need[0]);
+    // A file that needs nothing pulls in nothing.
+    try std.testing.expectEqual(@as(usize, 0), (try providerClosure(aa, &scans, &owner, 2)).len);
 }
