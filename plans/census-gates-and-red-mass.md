@@ -934,28 +934,38 @@ declaring instance reaches the chain. Seeding it again in
 `invokeMethodFuncId` was tried and reverted — that function is never reached
 here.
 
-**The real gap is the SPLICE, not the chain.** `notifyHandlers` is
-`private inline`, and a private inline member has NO dispatchable registration:
-`[extfb] name=notifyHandlers simple-name fids=0` — it is not in the module's
-name index at all. So a call that does not splice has nothing to find. Two
-lowering changes make it splice (verified with `KLIO_SPLICE_TRACE`: `[splice]
-notifyHandlers entered, params=3` with all three params bound):
+**A misreading to avoid repeating.** `[extfb] name=notifyHandlers simple-name
+fids=0` was taken as "the function has no dispatchable registration". It is
+not: `[extfb]` is the EXTENSION fallback, and zero extension candidates is the
+expected answer for a MEMBER. Nothing was established about whether
+`JobSupport.notifyHandlers` is reachable by the member walk, and the
+`[anon-disp] … hit=false` lines are the anon-method table, a different channel
+again.
+
+Two lowering changes were built on that misreading and measured:
 
   1. `inlineBodyRecvChain` appending the OWNER class chain after the extension
      receiver's — a member extension's body has both receivers in scope.
-  2. `bareInlineNeedsSplice` returning true for a private inline member of the
-     enclosing class, since the splice is its only route.
+     Measured ALONE: census unchanged at 1124/90. Principled but unexercised.
+  2. `bareInlineNeedsSplice` forcing a splice for a private inline member of
+     the enclosing class. It DOES make the splice happen (`KLIO_SPLICE_TRACE`
+     shows `[splice] notifyHandlers entered, params=3`, all params bound), and
+     the test still fails — the failure moves along to a `getfield-miss` on
+     `runTest`. Census 1124/90 -> 1123/91, and the diff names the loss exactly:
+     `JobExtensionsTest.testIsCancelled`, whose `private inline fun
+     checkException(block)` wraps its lambda parameter in `runCatching(block)`
+     and then `?: fail()`. Spliced, the block stops throwing. Restricting the
+     rule to funcs absent from the name index did NOT separate the two cases.
 
-Both were REVERTED: with them the coroutines census goes 1124/90 -> 1123/91 (a
-net loss elsewhere), and this test still fails — the failure moves further
-along, to a `getfield-miss` on `runTest` (the `TestBase` member vs the
-top-level `kotlinx.coroutines.test.runTest`). So the cluster has at least two
-layers, and the first one alone is not worth its regression.
+Both REVERTED.
 
-**Next step:** find what the owner-chain widening breaks (one test, somewhere
-in coroutines) — it is the more principled of the two changes and the loss is
-probably a same-named member now reachable through the owner. Then the second
-layer, `runTest` resolution inside a `TestBase` subclass.
+**Next step:** the honest one is to establish, rather than assume, how
+`JobSupport.notifyHandlers` is meant to be reached — instrument the MEMBER walk
+(`resolveInstanceMethod`) for that name on a `KlioBlockingCoroutine` receiver
+and see whether the method is in `ClassDef.methods` at all. If it is, the
+splice is a red herring and the miss is elsewhere. A reduced `checkException`
+(private inline member wrapping its lambda in `runCatching`) does NOT reproduce
+the splice failure, so that half needs the real test to bisect.
 
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 
