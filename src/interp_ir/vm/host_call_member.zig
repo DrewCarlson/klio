@@ -5014,6 +5014,19 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                         .ok => |v| if (v != .Null) return .{ .ok = v },
                         .err => return r,
                     }
+                    // A COMPANION (named or not) serves the plugin's
+                    // `serializer(...)` for its OWNER declaration; the
+                    // companion itself is not `@Serializable`.
+                    if (try companionOwnerClassValue(self, &kc)) |owner| {
+                        defer owner.release(allocator);
+                        list.retain();
+                        const owner_args = [_]Value{ owner, list };
+                        const r2 = try callFuncRec(self, allocator, self.module.asPtr(), f, &owner_args);
+                        switch (r2) {
+                            .ok => |v| if (v != .Null) return .{ .ok = v },
+                            .err => return r2,
+                        }
+                    }
                 }
             } else {
                 const mg = self.module.borrow();

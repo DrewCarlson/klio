@@ -365,6 +365,30 @@ internal class ReflectiveDescriptor(
                 }
             }
         }
+        // A COLLECTION of a type parameter (`list: List<T>`) reports the
+        // structural descriptor around the SUPPLIED argument's descriptor.
+        run {
+            val lt0 = base.indexOf('<')
+            if (lt0 >= 0 && base.endsWith(">")) {
+                val head0 = base.substring(0, lt0).substringAfterLast('.')
+                val args0 = splitTypeArgs(base.substring(lt0 + 1, base.length - 1))
+                if (args0.size == 1) {
+                    val argName = args0[0].removeSuffix("?")
+                    val at0 = typeParamNames.indexOf(argName)
+                    if (at0 >= 0 && at0 < typeArgs.size) {
+                        var inner = typeArgs[at0].descriptor
+                        if (args0[0].endsWith("?")) inner = inner.nullable
+                        val built0: SerialDescriptor? = when (head0) {
+                            "List", "MutableList", "ArrayList", "Collection", "MutableCollection", "Iterable" ->
+                                listSerialDescriptor(inner)
+                            "Set", "MutableSet", "HashSet", "LinkedHashSet" -> setSerialDescriptor(inner)
+                            else -> null
+                        }
+                        if (built0 != null) return if (nullable) built0.nullable else built0
+                    }
+                }
+            }
+        }
         // A GENERIC class element (`stringBox: Box<String>`) reports the
         // parametrized serializer's descriptor, so its own elements read
         // the substituted argument types.

@@ -69,7 +69,7 @@ the last measurement.
 
 | suite | passes | failures | opened at |
 |---|---|---|---|
-| serialization | 136 | 2 | 57 / 81 |
+| serialization | 138 | 0 | 57 / 81 — AT ZERO |
 | datetime | 517 | 2 | 457 / 62 |
 | coroutines | 1269 | 30 | 1073 / 141 (+6 DNC) |
 | io | 1191 | 0 | 1182 / 9 |
@@ -1369,9 +1369,29 @@ anchor too (`@Target(PROPERTY)` resolution cannot be assumed).
     Still missing: the same adoption for a plain LOCAL binding
     (`val a: Array<Byte> = arrayOf(1, 2)` still holds Ints).
 
-Remaining 2: `SerialDescriptorBuilderTest.testGenericDescriptor` (generic
-custom-descriptor builder shape) and `SerializersLookupNamedCompanionTest`
-(a PARAMETRIZED named companion's `serializer(typeArg)`).
+The final two: a PARAMETRIZED named companion's `serializer(typeArg)` routes
+to the OWNER declaration exactly as the zero-arg form does (the generic
+`__klsx_generatedSerializerGeneric` branch gained the companion-owner
+fallback), and a collection of a TYPE PARAMETER (`list: List<T>`) reports
+the structural descriptor around the SUPPLIED argument's descriptor.
+
+**serialization is AT ZERO: 138/0** (campaign opened at 57 passed / 81
+failed).
+
+### Open: the buildList receiver-lambda loses the enclosing extension receiver
+
+`ReceiveChannel.toList() = buildList { consumeEach(::add) }` dispatches
+`consumeEach` on the MutableList: at runtime the closure's enclosing
+receiver CHAIN holds List at depth 0 AND depth 1 — the channel receiver of
+`this@toList` is absent, and the closure's `this` capture recorded the
+LIST. Repro: `scratchpad/recvwalk3.kt` (`suspend fun <E>
+ReceiveChannel<E>.myToList(): List<E> = buildList { consumeEach(::add) }`).
+Evidence trail: `[bare]` shows lowering resolved `CallMemberOrGlobal
+recv_ty=MutableList encl_recv=MutableList` (the tower never offered the
+extension receiver), and `[cmg-cap] this = List` shows the closure captured
+the splice window's receiver instead of the lexical one. The non-inline
+sibling (`recvwalk4.kt`) binds fine. This is the coroutines
+`ChannelsTest.testToListOnFailedChannel` root.
 
 ### Root: a bare spread call dropped the implicit receiver
 
