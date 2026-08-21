@@ -1190,7 +1190,7 @@ Still open in that file: the seven `runTest(unhandled = …)` cases, where
 the wrapped exception must reach `handleCoroutineException` as an
 UNHANDLED coroutine exception rather than surface at the call site.
 
-### Open: a `yield()` loop starves every timer (the four WithTimeout files)
+### Fixed: a `yield()` loop starved every timer (the four WithTimeout files)
 
 `WithTimeoutTest`, `WithTimeoutOrNullTest` and their Duration siblings each
 blow the 300s child timeout, taking four whole files with them. Reduced to:
@@ -1212,12 +1212,16 @@ i.e. a timer at the current instant, so an infinite yield loop keeps
 ready-now work available forever and the clock never reaches the delay's
 deadline.
 
-That is correct behaviour for a virtual-time scheduler — kotlinx's own
-`TestScope` hangs the same way — but `TestBase.runTest` is backed by
-`runBlocking`, which upstream runs on REAL time, so the timeout fires after
-100ms of wall clock. The fix is a mode question (which pumps run `.Wall`),
-not a bug in the timer step, and it touches every suite that depends on
-virtual time being instant. Sized, not started.
+That first reading was WRONG about the mode, and the correction is the
+whole fix. `klio test` runs `.Wall`, not `.Virtual`; the pump does arm due
+Wall deadlines every turn (`armDueWallTimers`, whose doc comment already
+named this exact hazard). What starved was the PUMP: `[PUMP] resumeInline`
+showed every `yield()` resuming inline and never returning to the pump
+loop, because a Kotlin-level DISPATCHED resume is exempt from the per-turn
+inline cap. Arming from the inline-resume gate as well — where the existing
+ready-queue check then sends the resume behind the timer that just came due
+— fixes it. All four files go fully green: census 1204 -> 1259 passed,
+44 -> 40 failed, 6 -> 2 incomplete, and the 300s child timeouts are gone.
 
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 
