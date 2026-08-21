@@ -146,6 +146,7 @@ MODIFIERS = (r"(?:public|internal|private|protected|expect|actual|open|abstract|
 TOP_DECL_RE = re.compile(r"^(?:" + MODIFIERS + r"\s+)*"
                          r"(fun|val|var|class|interface|object|typealias)\b\s*(.*)$", re.M)
 PACKAGE_RE = re.compile(r"^package\s+(\S+)", re.M)
+IMPORT_RE = re.compile(r"^import\s+([\w.]+)(\.\*)?", re.M)
 WORD_RE = re.compile(r"[A-Za-z_]\w*")
 
 
@@ -177,12 +178,17 @@ def top_level_names(src):
 
 
 def decl_scan(path):
-    """(package, top-level names declared, every identifier mentioned)."""
+    """(package, packages in scope, top-level names declared, identifiers
+    mentioned). A file resolves an unqualified name against its own package
+    and every package it imports, so both are provider scopes."""
     with open(os.path.join(ROOT, path), "r", errors="replace") as fh:
         src = fh.read()
-    pkg = PACKAGE_RE.search(src)
-    return (pkg.group(1) if pkg else "",
-            top_level_names(src), set(WORD_RE.findall(src)))
+    m = PACKAGE_RE.search(src)
+    pkg = m.group(1) if m else ""
+    scopes = {pkg}
+    for path_str, star in IMPORT_RE.findall(src):
+        scopes.add(path_str if star else path_str.rsplit(".", 1)[0])
+    return (pkg, scopes, top_level_names(src), set(WORD_RE.findall(src)))
 
 
 def provider_closure(scans, owner, target):
@@ -195,14 +201,15 @@ def provider_closure(scans, owner, target):
     out, queue, seen = [], [target], {target}
     while queue:
         i = queue.pop(0)
-        pkg, declares, words = scans[i]
+        _pkg, scopes, declares, words = scans[i]
         for name in words - declares:
-            for j in owner.get((pkg, name), ()):
-                if j in seen:
-                    continue
-                seen.add(j)
-                queue.append(j)
-                out.append(j)
+            for scope in scopes:
+                for j in owner.get((scope, name), ()):
+                    if j in seen:
+                        continue
+                    seen.add(j)
+                    queue.append(j)
+                    out.append(j)
     return out
 
 
@@ -307,7 +314,7 @@ def main():
         whole = targets if cfg["whole_source_set"] else None
         scans = [decl_scan(t) for t in targets]
         owner = collections.defaultdict(list)
-        for i, (pkg, declares, _) in enumerate(scans):
+        for i, (pkg, _scopes, declares, _) in enumerate(scans):
             for d in declares:
                 owner[(pkg, d)].append(i)
         futs = [pool.submit(run_target, t, support, env, args.timeout, whole,

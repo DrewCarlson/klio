@@ -137,6 +137,9 @@ fn isIdentByte(c: u8) bool {
 /// every identifier it mentions.
 const DeclScan = struct {
     package: []const u8,
+    /// Every package whose top-level declarations this file resolves an
+    /// unqualified name against: its own, plus each import's package.
+    scopes: []const []const u8,
     declares: []const []const u8,
     words: []const []const u8,
 };
@@ -223,6 +226,7 @@ fn declaredName(tail: []const u8, is_fun: bool) ?[]const u8 {
 fn scanDecls(a: std.mem.Allocator, src: []const u8) !DeclScan {
     var declares: std.ArrayList([]const u8) = .empty;
     var words: std.ArrayList([]const u8) = .empty;
+    var scopes: std.ArrayList([]const u8) = .empty;
     var package: []const u8 = "";
     var line_start = true;
     var i: usize = 0;
@@ -249,6 +253,17 @@ fn scanDecls(a: std.mem.Allocator, src: []const u8) !DeclScan {
                 var e = p;
                 while (e < src.len and src[e] != '\n' and src[e] != ' ') e += 1;
                 package = src[p..e];
+            } else if (std.mem.eql(u8, w, "import")) {
+                var p = i + w.len;
+                while (p < src.len and (src[p] == ' ' or src[p] == '\t')) p += 1;
+                var e = p;
+                while (e < src.len and (isIdentByte(src[e]) or src[e] == '.' or src[e] == '*')) e += 1;
+                const path = src[p..e];
+                // `import a.b.*` scopes package `a.b`; `import a.b.Name`
+                // scopes `a.b` too — the leaf is the declaration.
+                if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot| {
+                    try scopes.append(a, path[0..dot]);
+                }
             } else {
                 var p = i;
                 var head = w;
@@ -267,7 +282,8 @@ fn scanDecls(a: std.mem.Allocator, src: []const u8) !DeclScan {
         line_start = false;
         i += w.len;
     }
-    return .{ .package = package, .declares = declares.items, .words = words.items };
+    try scopes.append(a, package);
+    return .{ .package = package, .scopes = scopes.items, .declares = declares.items, .words = words.items };
 }
 
 /// Test files that `target` must be compiled with because it names something
@@ -292,14 +308,16 @@ fn providerClosure(
             for (s.declares) |d| {
                 if (std.mem.eql(u8, d, name)) break;
             } else {
-                const key = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ scans[target].package, name });
-                const owners = owner.get(key) orelse continue;
-                for (owners.items) |idx| {
-                    for (queue.items) |seen| {
-                        if (seen == idx) break;
-                    } else {
-                        try queue.append(a, idx);
-                        try out.append(a, idx);
+                for (s.scopes) |scope| {
+                    const key = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ scope, name });
+                    const owners = owner.get(key) orelse continue;
+                    for (owners.items) |idx| {
+                        for (queue.items) |seen| {
+                            if (seen == idx) break;
+                        } else {
+                            try queue.append(a, idx);
+                            try out.append(a, idx);
+                        }
                     }
                 }
             }
@@ -541,4 +559,38 @@ test "top-level declarations provide for other files in the same package" {
     try std.testing.expectEqual(@as(usize, 0), need[0]);
     // A file that needs nothing pulls in nothing.
     try std.testing.expectEqual(@as(usize, 0), (try providerClosure(aa, &scans, &owner, 2)).len);
+
+    // An IMPORTED package is a provider scope too: a helper declared in
+    // `kotlinx.coroutines.channels` reaches a file that wildcard-imports it.
+    const importer =
+        \\package kotlinx.coroutines.flow
+        \\
+        \\import kotlinx.coroutines.channels.*
+        \\
+        \\class Uses {
+        \\    fun t() { helper(flowOf(1)) }
+        \\}
+        \\
+    ;
+    const provider =
+        \\package kotlinx.coroutines.channels
+        \\
+        \\inline fun<T> CoroutineScope.helper(flow: T) {}
+        \\
+    ;
+    const s_imp = try scanDecls(aa, importer);
+    const s_prov = try scanDecls(aa, provider);
+    const scans2 = [_]DeclScan{ s_imp, s_prov };
+    var owner2: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty;
+    for (scans2, 0..) |sc, i| {
+        for (sc.declares) |d| {
+            const key = try std.fmt.allocPrint(aa, "{s}\x00{s}", .{ sc.package, d });
+            const gop = try owner2.getOrPut(aa, key);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(aa, i);
+        }
+    }
+    const imported = try providerClosure(aa, &scans2, &owner2, 0);
+    try std.testing.expectEqual(@as(usize, 1), imported.len);
+    try std.testing.expectEqual(@as(usize, 1), imported[0]);
 }

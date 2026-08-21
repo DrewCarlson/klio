@@ -5,16 +5,13 @@
    "file": "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/BasicTypesSerializationTest.kt",
    "passed": [
     "BasicTypesSerializationTest.testEncodeDuration",
+    "BasicTypesSerializationTest.testDecodeDuration",
     "BasicTypesSerializationTest.testNothingSerialization"
    ],
    "failed": [
     {
      "test": "BasicTypesSerializationTest.testKvSerialization",
-     "err": "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)"
-    },
-    {
-     "test": "BasicTypesSerializationTest.testDecodeDuration",
-     "err": "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)"
+     "err": "exception"
     }
    ],
    "incomplete": false
@@ -63,41 +60,22 @@
   {
    "file": "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/EnumDescriptorsTest.kt",
    "passed": [
-    "EnumDescriptorsTest.testSerializableEnum"
+    "EnumDescriptorsTest.testSerializableEnum",
+    "EnumDescriptorsTest.testFullyAnnotatedEnum",
+    "EnumDescriptorsTest.testEntriesAnnotatedEnum",
+    "EnumDescriptorsTest.testClassAnnotatedEnum"
    ],
-   "failed": [
-    {
-     "test": "EnumDescriptorsTest.testFullyAnnotatedEnum",
-     "err": "kotlin.AssertionError: Expected <1>, actual <0>."
-    },
-    {
-     "test": "EnumDescriptorsTest.testEntriesAnnotatedEnum",
-     "err": "kotlin.AssertionError: Expected <1>, actual <0>."
-    },
-    {
-     "test": "EnumDescriptorsTest.testClassAnnotatedEnum",
-     "err": "kotlin.AssertionError: Expected <1>, actual <0>."
-    }
-   ],
+   "failed": [],
    "incomplete": false
   },
   {
    "file": "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InheritableSerialInfoTest.kt",
-   "passed": [],
-   "failed": [
-    {
-     "test": "InheritableSerialInfoTest.testInheritanceFromSealed",
-     "err": "kotlin.AssertionError: Expected <1>, actual <0>."
-    },
-    {
-     "test": "InheritableSerialInfoTest.testInheritanceFromAbstract",
-     "err": "kotlin.AssertionError: Expected <1>, actual <0>."
-    },
-    {
-     "test": "InheritableSerialInfoTest.testInheritanceFromInterface",
-     "err": "kotlin.AssertionError: Expected <1>, actual <0>."
-    }
+   "passed": [
+    "InheritableSerialInfoTest.testInheritanceFromSealed",
+    "InheritableSerialInfoTest.testInheritanceFromAbstract",
+    "InheritableSerialInfoTest.testInheritanceFromInterface"
    ],
+   "failed": [],
    "incomplete": false
   },
   {
@@ -177,17 +155,11 @@
   },
   {
    "file": "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SealedGenericClassesTest.kt",
-   "passed": [],
-   "failed": [
-    {
-     "test": "SealedGenericClassesTest.testQuery",
-     "err": "Vm::call_member `serializer` on `kotlin.reflect.KClass`"
-    },
-    {
-     "test": "SealedGenericClassesTest.testFetcher",
-     "err": "Vm::call_member `serializer` on `kotlin.reflect.KClass`"
-    }
+   "passed": [
+    "SealedGenericClassesTest.testQuery",
+    "SealedGenericClassesTest.testFetcher"
    ],
+   "failed": [],
    "incomplete": false
   },
   {
@@ -195,34 +167,15 @@
    "passed": [
     "SerialDescriptorAnnotationsTest.testSerialNameOnClass",
     "SerialDescriptorAnnotationsTest.testCustomSerialAnnotationOnProperty",
-    "SerialDescriptorAnnotationsTest.testCustomSerialAnnotationOnClass"
+    "SerialDescriptorAnnotationsTest.testCustomSerialAnnotationOnClass",
+    "SerialDescriptorAnnotationsTest.testCustomAnnotationWithDefaultValue",
+    "SerialDescriptorAnnotationsTest.testAnnotationWithMultipleArgs",
+    "SerialDescriptorAnnotationsTest.testCustomAnnotationOnSealedClass",
+    "SerialDescriptorAnnotationsTest.testCustomAnnotationOnPolymorphicClass",
+    "SerialDescriptorAnnotationsTest.testCustomAnnotationOnObject",
+    "SerialDescriptorAnnotationsTest.testCustomAnnotationTransparentForContextual"
    ],
-   "failed": [
-    {
-     "test": "SerialDescriptorAnnotationsTest.testCustomAnnotationWithDefaultValue",
-     "err": "kotlin.AssertionError: Expected <default_annotation_value>, actual <onProperty>."
-    },
-    {
-     "test": "SerialDescriptorAnnotationsTest.testAnnotationWithMultipleArgs",
-     "err": "kotlin.NoSuchElementException: List is empty."
-    },
-    {
-     "test": "SerialDescriptorAnnotationsTest.testCustomAnnotationOnSealedClass",
-     "err": "kotlin.NoSuchElementException: List is empty."
-    },
-    {
-     "test": "SerialDescriptorAnnotationsTest.testCustomAnnotationOnPolymorphicClass",
-     "err": "kotlin.NoSuchElementException: List is empty."
-    },
-    {
-     "test": "SerialDescriptorAnnotationsTest.testCustomAnnotationOnObject",
-     "err": "kotlin.NoSuchElementException: List is empty."
-    },
-    {
-     "test": "SerialDescriptorAnnotationsTest.testCustomAnnotationTransparentForContextual",
-     "err": "kotlin.NoSuchElementException: List is empty."
-    }
-   ],
+   "failed": [],
    "incomplete": false
   },
   {
@@ -243,49 +196,29 @@
     },
     {
      "test": "SerialDescriptorBuilderTest.testGenericDescriptor",
-     "err": "Vm::call_member `serializer` on `kotlin.reflect.KClass`"
+     "err": "kotlin.ArrayIndexOutOfBoundsException: Index 0 out of bounds for length 0"
     }
    ],
    "incomplete": false
   },
   {
    "file": "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorEqualityTest.kt",
-   "passed": [],
-   "failed": [
-    {
-     "test": "SerialDescriptorEqualityTest.testUsedOnce",
-     "err": "Vm::call_member `serializer` on `kotlin.reflect.KClass`"
-    },
-    {
-     "test": "SerialDescriptorEqualityTest.testUsedTwice",
-     "err": "Vm::call_member `serializer` on `kotlin.reflect.KClass`"
-    },
-    {
-     "test": "SerialDescriptorEqualityTest.testUsedInList",
-     "err": "Vm::call_member `serializer` on `kotlin.reflect.KClass`"
-    },
-    {
-     "test": "SerialDescriptorEqualityTest.testRecursive",
-     "err": "Vm::call_member `serializer` on `kotlin.reflect.KClass`"
-    },
-    {
-     "test": "SerialDescriptorEqualityTest.testRecursiveSimple",
-     "err": "Vm::call_member `serializer` on `kotlin.reflect.KClass`"
-    },
-    {
-     "test": "SerialDescriptorEqualityTest.testRecursiveGeneric",
-     "err": "Vm::call_member `serializer` on `kotlin.reflect.KClass`"
-    },
-    {
-     "test": "SerialDescriptorEqualityTest.testCantBeComparedToUserDescriptor",
-     "err": "Vm::call_member `serializer` on `kotlin.reflect.KClass`"
-    }
+   "passed": [
+    "SerialDescriptorEqualityTest.testUsedOnce",
+    "SerialDescriptorEqualityTest.testUsedTwice",
+    "SerialDescriptorEqualityTest.testUsedInList",
+    "SerialDescriptorEqualityTest.testRecursive",
+    "SerialDescriptorEqualityTest.testRecursiveSimple",
+    "SerialDescriptorEqualityTest.testRecursiveGeneric",
+    "SerialDescriptorEqualityTest.testCantBeComparedToUserDescriptor"
    ],
+   "failed": [],
    "incomplete": false
   },
   {
    "file": "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorSpecificationTest.kt",
    "passed": [
+    "SerialDescriptorSpecificationTest.testEnumDescriptor",
     "SerialDescriptorSpecificationTest.testListDescriptor",
     "SerialDescriptorSpecificationTest.testMapDescriptor",
     "SerialDescriptorSpecificationTest.testObjectDescriptor",
@@ -301,10 +234,6 @@
     {
      "test": "SerialDescriptorSpecificationTest.testManuallyConstructedDescriptor",
      "err": "unresolved global `StaticHolder`"
-    },
-    {
-     "test": "SerialDescriptorSpecificationTest.testEnumDescriptor",
-     "err": "kotlin.AssertionError: Expected <1>, actual <-3>."
     }
    ],
    "incomplete": false
@@ -481,15 +410,15 @@
    "failed": [
     {
      "test": "ContextualGenericsTest.testSurrogateSerializerFoundForGenericWithKotlinType",
-     "err": "Vm::call_member `serializer` on `kotlin.reflect.KClass`"
+     "err": "unresolved global `T`"
     },
     {
      "test": "ContextualGenericsTest.testSerializerFoundForContextualGeneric",
-     "err": "Vm::call_member `serializer` on `kotlin.reflect.KClass`"
+     "err": "unresolved global `T`"
     },
     {
      "test": "ContextualGenericsTest.testModuleProvidesMultipleGenericSerializers",
-     "err": "Vm::call_member `serializer` on `kotlin.reflect.KClass`"
+     "err": "unresolved global `T`"
     }
    ],
    "incomplete": false
@@ -556,39 +485,27 @@
  ],
  "hist": [
   [
-   "Vm::call_member `X` on `X`",
-   15
-  ],
-  [
    "exception",
-   9
-  ],
-  [
-   "kotlin.AssertionError: Expected <N>, actual <N>.",
-   7
-  ],
-  [
-   "kotlin.NoSuchElementException: List is empty.",
-   6
+   10
   ],
   [
    "unresolved global `X`",
-   5
+   8
   ],
   [
    "Vm::get_field `X` on `X`",
    4
   ],
   [
-   "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)",
-   2
+   "kotlin.ArrayIndexOutOfBoundsException: Index N out of bounds for length N",
+   3
   ],
   [
    "kotlin.AssertionError: Expected <decoded1>, actual <initial1>.",
    2
   ],
   [
-   "kotlin.ArrayIndexOutOfBoundsException: Index N out of bounds for length N",
+   "Vm::call_member `X` on `X`",
    2
   ],
   [
@@ -600,15 +517,11 @@
    1
   ],
   [
-   "kotlin.AssertionError: Expected <default_annotation_value>, actual <onProperty>.",
+   "kotlin.NoSuchElementException: List is empty.",
    1
   ],
   [
    "kotlin.AssertionError: Expected <-N>, actual <-N>.",
-   1
-  ],
-  [
-   "kotlin.AssertionError: Expected <N>, actual <-N>.",
    1
   ],
   [
@@ -633,6 +546,10 @@
   ],
   [
    "kotlin.AssertionError: Expected value to be true.",
+   1
+  ],
+  [
+   "kotlin.AssertionError: Expected <N>, actual <N>.",
    1
   ],
   [
@@ -666,39 +583,17 @@
    4
   ],
   [
+   "T",
+   3
+  ],
+  [
    "StaticHolder",
    1
   ]
  ],
  "by_shape": {
-  "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)": [
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/BasicTypesSerializationTest.kt::BasicTypesSerializationTest.testKvSerialization",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/BasicTypesSerializationTest.kt::BasicTypesSerializationTest.testDecodeDuration"
-  ],
-  "kotlin.AssertionError: Expected <decoded1>, actual <initial1>.": [
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/CustomPropertyAccessorsTest.kt::CustomPropertyAccessorsTest.testVarProperties",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/CustomPropertyAccessorsTest.kt::CustomPropertyAccessorsTest.testValProperties"
-  ],
-  "kotlin.AssertionError: Expected <N>, actual <N>.": [
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/EnumDescriptorsTest.kt::EnumDescriptorsTest.testFullyAnnotatedEnum",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/EnumDescriptorsTest.kt::EnumDescriptorsTest.testEntriesAnnotatedEnum",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/EnumDescriptorsTest.kt::EnumDescriptorsTest.testClassAnnotatedEnum",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InheritableSerialInfoTest.kt::InheritableSerialInfoTest.testInheritanceFromSealed",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InheritableSerialInfoTest.kt::InheritableSerialInfoTest.testInheritanceFromAbstract",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InheritableSerialInfoTest.kt::InheritableSerialInfoTest.testInheritanceFromInterface",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/features/SchemaTest.kt::SchemaTest.testRichSchema"
-  ],
-  "kotlin.AssertionError: Expected <CustomSer>, actual <kotlinx.serialization.ReflectiveKSerializer@N> is not same.": [
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InterfaceContextualSerializerTest.kt::InterfaceContextualSerializerTest.testCustom"
-  ],
-  "unresolved global `X`": [
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InterfaceContextualSerializerTest.kt::InterfaceContextualSerializerTest.testContextual",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InterfaceContextualSerializerTest.kt::InterfaceContextualSerializerTest.testInsideList",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InterfaceContextualSerializerTest.kt::InterfaceContextualSerializerTest.testWithNullabilityInsideList",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InterfaceContextualSerializerTest.kt::InterfaceContextualSerializerTest.testParametrizedInterface",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorSpecificationTest.kt::SerialDescriptorSpecificationTest.testManuallyConstructedDescriptor"
-  ],
   "exception": [
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/BasicTypesSerializationTest.kt::BasicTypesSerializationTest.testKvSerialization",
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InterfaceContextualSerializerTest.kt::InterfaceContextualSerializerTest.testInsideBox",
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/MetaSerializableTest.kt::MetaSerializableTest.testMetaSerializable",
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/MetaSerializableTest.kt::MetaSerializableTest.testMetaSerializableWithInfo",
@@ -708,6 +603,23 @@
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/modules/ModuleBuildersTest.kt::ModuleBuildersTest.testOverwriteWithDifferentClass",
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/modules/ModuleBuildersTest.kt::ModuleBuildersTest.testDoesntThrowOnTheSameSerializer",
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/modules/ModuleBuildersTest.kt::ModuleBuildersTest.testDoesntThrowOnTheEqualSerializers"
+  ],
+  "kotlin.AssertionError: Expected <decoded1>, actual <initial1>.": [
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/CustomPropertyAccessorsTest.kt::CustomPropertyAccessorsTest.testVarProperties",
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/CustomPropertyAccessorsTest.kt::CustomPropertyAccessorsTest.testValProperties"
+  ],
+  "kotlin.AssertionError: Expected <CustomSer>, actual <kotlinx.serialization.ReflectiveKSerializer@N> is not same.": [
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InterfaceContextualSerializerTest.kt::InterfaceContextualSerializerTest.testCustom"
+  ],
+  "unresolved global `X`": [
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InterfaceContextualSerializerTest.kt::InterfaceContextualSerializerTest.testContextual",
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InterfaceContextualSerializerTest.kt::InterfaceContextualSerializerTest.testInsideList",
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InterfaceContextualSerializerTest.kt::InterfaceContextualSerializerTest.testWithNullabilityInsideList",
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InterfaceContextualSerializerTest.kt::InterfaceContextualSerializerTest.testParametrizedInterface",
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorSpecificationTest.kt::SerialDescriptorSpecificationTest.testManuallyConstructedDescriptor",
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/modules/ContextualGenericsTest.kt::ContextualGenericsTest.testSurrogateSerializerFoundForGenericWithKotlinType",
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/modules/ContextualGenericsTest.kt::ContextualGenericsTest.testSerializerFoundForContextualGeneric",
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/modules/ContextualGenericsTest.kt::ContextualGenericsTest.testModuleProvidesMultipleGenericSerializers"
   ],
   "kotlin.AssertionError: Expected <PrimitiveDescriptor(IApiError)?>, actual <PrimitiveDescriptor(IApiError)>.": [
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/InterfaceContextualSerializerTest.kt::InterfaceContextualSerializerTest.testWithNullability"
@@ -719,48 +631,25 @@
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/modules/ModuleBuildersTest.kt::ModuleBuildersTest.testThrowOnTheSamePolymorphicSerializer"
   ],
   "kotlin.NoSuchElementException: List is empty.": [
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/MetaSerializableTest.kt::MetaSerializableTest.testMetaSerializableOnProperty",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorAnnotationsTest.kt::SerialDescriptorAnnotationsTest.testAnnotationWithMultipleArgs",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorAnnotationsTest.kt::SerialDescriptorAnnotationsTest.testCustomAnnotationOnSealedClass",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorAnnotationsTest.kt::SerialDescriptorAnnotationsTest.testCustomAnnotationOnPolymorphicClass",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorAnnotationsTest.kt::SerialDescriptorAnnotationsTest.testCustomAnnotationOnObject",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorAnnotationsTest.kt::SerialDescriptorAnnotationsTest.testCustomAnnotationTransparentForContextual"
-  ],
-  "Vm::call_member `X` on `X`": [
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SealedGenericClassesTest.kt::SealedGenericClassesTest.testQuery",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SealedGenericClassesTest.kt::SealedGenericClassesTest.testFetcher",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorBuilderTest.kt::SerialDescriptorBuilderTest.testGenericDescriptor",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorEqualityTest.kt::SerialDescriptorEqualityTest.testUsedOnce",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorEqualityTest.kt::SerialDescriptorEqualityTest.testUsedTwice",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorEqualityTest.kt::SerialDescriptorEqualityTest.testUsedInList",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorEqualityTest.kt::SerialDescriptorEqualityTest.testRecursive",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorEqualityTest.kt::SerialDescriptorEqualityTest.testRecursiveSimple",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorEqualityTest.kt::SerialDescriptorEqualityTest.testRecursiveGeneric",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorEqualityTest.kt::SerialDescriptorEqualityTest.testCantBeComparedToUserDescriptor",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerializersLookupNamedCompanionTest.kt::SerializersLookupNamedCompanionTest.test",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/features/SchemaTest.kt::SchemaTest.testManualSchema",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/modules/ContextualGenericsTest.kt::ContextualGenericsTest.testSurrogateSerializerFoundForGenericWithKotlinType",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/modules/ContextualGenericsTest.kt::ContextualGenericsTest.testSerializerFoundForContextualGeneric",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/modules/ContextualGenericsTest.kt::ContextualGenericsTest.testModuleProvidesMultipleGenericSerializers"
-  ],
-  "kotlin.AssertionError: Expected <default_annotation_value>, actual <onProperty>.": [
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorAnnotationsTest.kt::SerialDescriptorAnnotationsTest.testCustomAnnotationWithDefaultValue"
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/MetaSerializableTest.kt::MetaSerializableTest.testMetaSerializableOnProperty"
   ],
   "kotlin.ArrayIndexOutOfBoundsException: Index N out of bounds for length N": [
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorBuilderTest.kt::SerialDescriptorBuilderTest.testTrivialDescriptor",
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorBuilderTest.kt::SerialDescriptorBuilderTest.testNestedDescriptors"
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorBuilderTest.kt::SerialDescriptorBuilderTest.testNestedDescriptors",
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorBuilderTest.kt::SerialDescriptorBuilderTest.testGenericDescriptor"
   ],
   "kotlin.AssertionError: Expected <-N>, actual <-N>.": [
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorSpecificationTest.kt::SerialDescriptorSpecificationTest.testAutoGeneratedDescriptorContract"
-  ],
-  "kotlin.AssertionError: Expected <N>, actual <-N>.": [
-   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerialDescriptorSpecificationTest.kt::SerialDescriptorSpecificationTest.testEnumDescriptor"
   ],
   "kotlin.AssertionError: Expected <EnumExternalObjectSerializer>, actual <kotlinx.serialization.internal.EnumSerializer<kotlinx.serialization.SerializersLookupEnumTest.EnumExternalObject>> is not same.": [
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerializersLookupEnumTest.kt::SerializersLookupEnumTest.testEnumExternalObject"
   ],
   "kotlin.AssertionError: Expected value to be of type <kotlin.reflect.KType@N>, actual <class EnumSerializer>.": [
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerializersLookupEnumTest.kt::SerializersLookupEnumTest.testEnumExternalClass"
+  ],
+  "Vm::call_member `X` on `X`": [
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerializersLookupNamedCompanionTest.kt::SerializersLookupNamedCompanionTest.test",
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/features/SchemaTest.kt::SchemaTest.testManualSchema"
   ],
   "kotlin.AssertionError: Expected <ObjectCustomObjectSerializer>, actual <kotlinx.serialization.internal.ObjectSerializer@N> is not same.": [
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/SerializersLookupObjectTest.kt::SerializersLookupObjectTest.testObjectExternalObject"
@@ -773,6 +662,9 @@
   ],
   "kotlin.AssertionError: Expected value to be true.": [
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/features/SchemaTest.kt::SchemaTest.testGeneratedSchema"
+  ],
+  "kotlin.AssertionError: Expected <N>, actual <N>.": [
+   "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/features/SchemaTest.kt::SchemaTest.testRichSchema"
   ],
   "kotlin.IndexOutOfBoundsException": [
    "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest/src/kotlinx/serialization/features/SchemaTest.kt::SchemaTest.testGenericDescriptors"
