@@ -2561,6 +2561,16 @@ pub const FuncBuilder = struct {
         while (it.next()) |k| : (i += 1) out[i] = k.*;
         return out;
     }
+    /// Snapshot of the active splice's reified substitutions, for a lambda
+    /// body lowered inside it.
+    pub fn reifiedTypeNamesSlice(self: *const FuncBuilder) Allocator.Error!?[]const ir.ReifiedName {
+        if (self.reified_type_names.count() == 0) return null;
+        var out = try self.allocator.alloc(ir.ReifiedName, self.reified_type_names.count());
+        var it = self.reified_type_names.iterator();
+        var i: usize = 0;
+        while (it.next()) |e| : (i += 1) out[i] = .{ .name = e.key_ptr.*, .actual = e.value_ptr.* };
+        return out;
+    }
     pub fn markGenericTypedParam(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.generic_typed_params.put(name, {});
     }

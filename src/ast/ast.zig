@@ -56,6 +56,66 @@ pub const Annotation = struct {
     span: Span,
 };
 
+/// Whether an accessor body reads or writes the backing `field`. The walk
+/// covers the statement/expression shapes accessor bodies actually use; an
+/// exotic shape answers false, which errs toward "no backing field".
+pub fn accessorUsesField(a: *const Accessor) bool {
+    return switch (a.body) {
+        .Block => |b| blockUsesField(&b),
+        .Expr => |e| exprUsesField(&e),
+    };
+}
+
+pub fn blockUsesField(b: *const Block) bool {
+    for (b.stmts) |s| {
+        const hit = switch (s) {
+            .Expr => |*e| exprUsesField(e),
+            .Assign => |a| exprUsesField(&a.target) or exprUsesField(&a.value),
+            .Decl => |d| switch (d) {
+                .Property => |p| if (p.init) |*i| exprUsesField(i) else false,
+                else => false,
+            },
+            else => false,
+        };
+        if (hit) return true;
+    }
+    return false;
+}
+
+pub fn exprUsesField(e: *const Expr) bool {
+    return switch (e.*) {
+        .Path => |p| p.segments.len == 1 and std.mem.eql(u8, p.segments[0].name, "field"),
+        .Block => |b| blockUsesField(&b),
+        .If => |i| exprUsesField(i.cond) or exprUsesField(i.then_branch) or
+            (if (i.else_branch) |eb| exprUsesField(eb) else false),
+        .When => |w| (if (w.subject) |s| exprUsesField(s) else false) or blk: {
+            for (w.branches) |*b| {
+                if (exprUsesField(&b.body)) break :blk true;
+            }
+            break :blk false;
+        },
+        .Call => |c| exprUsesField(c.callee) or blk: {
+            for (c.args) |*a| if (exprUsesField(a)) break :blk true;
+            break :blk false;
+        },
+        .Index => |x| blk: {
+            if (exprUsesField(x.receiver)) break :blk true;
+            for (x.args) |*a| if (exprUsesField(a)) break :blk true;
+            break :blk false;
+        },
+        .Binary => |b| exprUsesField(b.lhs) or exprUsesField(b.rhs),
+        .Return => |r| if (r.value) |v| exprUsesField(v) else false,
+        .Member => |m| exprUsesField(m.receiver),
+        .Unary => |x| exprUsesField(x.expr),
+        .Postfix => |x| exprUsesField(x.expr),
+        .As => |x| exprUsesField(x.expr),
+        .IsCheck => |x| exprUsesField(x.expr),
+        .Spread => |x| exprUsesField(x.expr),
+        .Labeled => |x| exprUsesField(x.expr),
+        else => false,
+    };
+}
+
 pub const KotlinFile = struct {
     package: ?PackageHeader,
     imports: []ImportDecl,

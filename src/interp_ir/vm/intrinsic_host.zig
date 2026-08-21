@@ -18,6 +18,7 @@ const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
 const scheduler = @import("scheduler.zig");
 const host_call_member = @import("host_call_member.zig");
+const host_instances = @import("host_instances.zig");
 const trace = @import("trace.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -182,6 +183,32 @@ fn flattenEval(r: EvalResult) RuntimeEvalResult {
 pub fn construct(self: *VmIntrinsicHost, class_id: ClassId, args: []const Value, out: Output) Allocator.Error!RawResult {
     var host = vmHost(self, out);
     return host.newInstance(self.allocator, class_id, args, null);
+}
+
+/// NAMED construction of a class value: every parameter not in `names`
+/// takes its declared default. Null when the value is not a resolvable
+/// class — the caller falls back to the positional path.
+pub fn constructNamed(self: *VmIntrinsicHost, class: *const Value, names: []const []const u8, args: []const Value, out: Output) Allocator.Error!?RuntimeEvalResult {
+    if (class.* != .Class) return null;
+    var name: []const u8 = undefined;
+    var fqn: []const u8 = undefined;
+    {
+        const dg = class.Class.borrow();
+        defer dg.deinit();
+        name = dg.get().name;
+        fqn = dg.get().fqn;
+    }
+    const class_id = blk: {
+        const module_g = self.module.borrow();
+        defer module_g.deinit();
+        break :blk module_g.get().classIdByFqn(fqn) orelse module_g.get().classId(name);
+    } orelse return null;
+    const arg_names = try self.allocator.alloc(?[]const u8, names.len);
+    defer self.allocator.free(arg_names);
+    for (names, arg_names) |n, *slot| slot.* = n;
+    var host = vmHost(self, out);
+    const r = try host_instances.newInstanceNamed(&host, self.allocator, class_id, args, arg_names, null);
+    return flattenEval(r);
 }
 
 /// Evaluate an `IrClosure` and return the *raw* `EvalError` so the

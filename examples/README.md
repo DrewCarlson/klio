@@ -116,6 +116,7 @@ Run any program with:
 | `reified_function_type.kt` | A reified type parameter bound to a function type (`boxOf<() -> Unit>()`) erases to Any instead of loading the synthetic `<function>` global — the pattern behind the engine's `mutableVectorOf<() -> Unit>()` side-effect list. |
 | `reified_param_inference.kt` | A reified type parameter inferred from a value/lambda-parameter position (not just the return type). |
 | `reified_from_argument.kt` | A reified type parameter solved from an ARGUMENT's own static type — a literal, a typed local, or an object literal's type argument — so each call reads its own `T::class` rather than the previous call's. |
+| `reified_nullable_type_argument.kt` | A reified type ARGUMENT keeps its nullability through the splice: `filterIsInstance<Int?>()` keeps the nulls `filterIsInstance<Int>()` drops, and `is T` in an inline body reads the argument as written. |
 | `reified_inline_property_receiver.kt` | A reified inline extension spliced on a CLASS PROPERTY receiver, so `is T` tests the real class (the receiver type comes from the enclosing class's members, not just locals/params). |
 | `smartcast_extension_receiver.kt` | Smart casts narrow the receiver's STATIC type, so an extension resolves against the narrowed type (`is String` -> `CharSequence.isEmpty`), in both the `when`-subject and `if (x is T)` forms. |
 | `fn_param_name_shadows_operator.kt` | A function-typed parameter does not shadow a same-named function for a trailing-lambda call it cannot accept (`Flow.map`'s `crossinline transform` vs the `transform` operator). |
@@ -228,6 +229,7 @@ Run any program with:
 | `serial_descriptor_shape.kt`   | The `SerialDescriptor` a `@Serializable` class reports: element names, which elements are optional (their constructor parameter has a default), and each element's own descriptor. |
 | `serializers_module_merge.kt`  | Combining two `SerializersModule`s: `+` copies each registration through `SerializersModuleCollector`, whose serializer-taking member has a default body the builder overrides, and `overwriteWith` replaces one. |
 | `serializer_for_class.kt`      | `@Serializer(forClass = C::class)` stands in for `C`'s generated serializer — its descriptor and members are `C`'s — and a reified `subclass(serializer)` reads its subclass off the serializer's type argument. |
+| `serializable_body_properties.kt` | A `@Serializable` class's BODY properties are elements too: backing-field properties in declaration order after the constructor ones, `@Transient` and accessor-only properties excluded, init-block-assigned ones keeping the init value on decode. |
 | `interface_companion_state.kt` | Shared companion-object state on an interface.              |
 | `safe_assign.kt`               | Safe-call assignment.                                       |
 

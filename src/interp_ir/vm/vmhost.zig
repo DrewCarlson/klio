@@ -483,6 +483,9 @@ fn ivInvokeMethod(ctx: *anyopaque, receiver: *const Value, name: []const u8, arg
 fn ivGetProperty(ctx: *anyopaque, receiver: *const Value, name: []const u8, out: Output) Allocator.Error!?RuntimeEvalResult {
     return intrinsic_host.getProperty(ip(ctx), receiver, name, out);
 }
+fn ivConstructNamed(ctx: *anyopaque, class: *const Value, names: []const []const u8, args: []const Value, out: Output) Allocator.Error!?RuntimeEvalResult {
+    return intrinsic_host.constructNamed(ip(ctx), class, names, args, out);
+}
 fn ivLookupGlobal(ctx: *anyopaque, name: []const u8) ?Value {
     return intrinsic_host.lookupGlobal(ip(ctx), name);
 }
@@ -602,6 +605,7 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .invoke_callable_with_this = ivInvokeCallableWithThis,
     .invoke_method = ivInvokeMethod,
     .get_property = ivGetProperty,
+    .construct_named = ivConstructNamed,
     .lookup_global = ivLookupGlobal,
     .alloc_instance_id = ivAllocInstanceId,
     .new_synth_instance = ivNewSynthInstance,

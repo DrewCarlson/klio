@@ -134,6 +134,10 @@ pub const VirtNativeSite = struct {
     name_len: *u32,
 };
 
+/// One reified type-parameter substitution: the parameter's name and the
+/// rendered actual type it stands for.
+pub const ReifiedName = struct { name: []const u8, actual: []const u8 };
+
 pub const MethodSlotId = enum(u32) {
     _,
     pub fn from(v: u32) MethodSlotId {
@@ -1894,6 +1898,12 @@ pub const Module = struct {
     /// still erased (`forEachScopeOf(v) { scope -> scope as Scope }` inside a
     /// generic class). Not serialized.
     pending_lambda_type_params: ?[]const []const u8 = null,
+    /// The enclosing splice's REIFIED type-parameter substitutions, carried
+    /// into a lambda body lowered inside that splice. `filter { it is R }` in
+    /// a spliced `filterIsInstance<reified R>` reads `R` from here; without
+    /// it the body falls back to the runtime's bound class value, which
+    /// cannot carry nullability. Not serialized.
+    pending_lambda_reified_names: ?[]const ReifiedName = null,
     /// Effective upper bounds parallel to the type-parameter names carried
     /// into the pending lambda/local-function body. Not serialized.
     pending_lambda_type_param_bounds: ?[]const ModuleRegistry.TypeParamBound = null,

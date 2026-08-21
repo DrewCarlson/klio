@@ -58,6 +58,10 @@ pub const IntrinsicHost = struct {
         /// Invoke a named method on a receiver. `null` slot => default
         /// (returns `null`, i.e. fall back to structural rendering).
         invoke_method: ?*const fn (ctx: *anyopaque, receiver: *const Value, name: []const u8, args: []const Value, out: Output) std.mem.Allocator.Error!?EvalResult = null,
+        /// Construct an instance of a class value with NAMED arguments,
+        /// letting the constructor's defaults fill every unnamed parameter.
+        /// `null` slot => unavailable.
+        construct_named: ?*const fn (ctx: *anyopaque, class: *const Value, names: []const []const u8, args: []const Value, out: Output) std.mem.Allocator.Error!?EvalResult = null,
         /// Read a property/field off a receiver: resolves custom getters,
         /// stored fields, and ctor-property params (unlike `invoke_method`,
         /// which only dispatches functions). `null` slot => default (returns
@@ -161,6 +165,11 @@ pub const IntrinsicHost = struct {
 
     pub fn getProperty(self: IntrinsicHost, receiver: *const Value, name: []const u8, out: Output) !?EvalResult {
         if (self.vtable.get_property) |f| return f(self.ctx, receiver, name, out);
+        return null;
+    }
+
+    pub fn constructNamed(self: IntrinsicHost, class: *const Value, names: []const []const u8, args: []const Value, out: Output) !?EvalResult {
+        if (self.vtable.construct_named) |f| return f(self.ctx, class, names, args, out);
         return null;
     }
 

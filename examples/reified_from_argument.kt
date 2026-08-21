@@ -49,4 +49,28 @@ fun main() {
     // literal's supertype is where its type arguments are written.
     val ints = object : Handler<Int> { override fun handle(v: Int) = "int:" + v }
     println("handler  = " + describe(ints))
+
+    Wiring().run()
+}
+
+// A named class argument solves through the CLASS's supertype list: a
+// `BoxHandler<S>` is a `Handler<Box<S>>`, so `register(handler)` reads
+// `T = Box` off the declaration — including when the argument is a member
+// property read from inside a lambda.
+class Box<S>(val v: S)
+
+class BoxHandler<S> : Handler<Box<S>> {
+    override fun handle(v: Box<S>): String = "box:" + v.v
+}
+
+inline fun <reified T : Any> register(handler: Handler<T>): String = T::class.simpleName ?: "?"
+
+class Wiring {
+    private val boxHandler = BoxHandler<Int>()
+
+    fun run() {
+        println("class    = " + register(boxHandler))
+        val viaLambda = listOf(1).map { register(boxHandler) }
+        println("member   = " + viaLambda)
+    }
 }

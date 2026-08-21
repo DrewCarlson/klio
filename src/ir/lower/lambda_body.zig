@@ -354,6 +354,13 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         defer moduleAllocator(module).free(tps);
         for (tps) |tp| try b.addTypeParamName(tp);
     }
+    // The enclosing splice's reified substitutions: `filter { it is R }`
+    // inside a spliced `filterIsInstance<reified R>` resolves `R` here.
+    if (module.pending_lambda_reified_names) |names| {
+        module.pending_lambda_reified_names = null;
+        defer moduleAllocator(module).free(names);
+        for (names) |rn| _ = try b.bindReifiedTypeName(rn.name, rn.actual);
+    }
     if (module.pending_lambda_type_param_bounds) |bounds| {
         module.pending_lambda_type_param_bounds = null;
         defer moduleAllocator(module).free(bounds);

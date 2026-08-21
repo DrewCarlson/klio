@@ -1,0 +1,12 @@
+elements = 4
+  user optional=false
+  visits optional=true
+  label optional=true
+  note optional=false
+encoded  = [ada, 7, session, fresh]
+user     = decoded1
+visits   = 42
+label    = decoded3
+note     = fresh
+cache    = skipped
+display  = decoded1/42
