@@ -1,0 +1,6 @@
+plain    = registry(r1):a
+inline   = registry(r1):a
+reified  = registry(r1):a/String
+member   = registry(r1)
+lambda   = [registry(r1):a, registry(r1):b]
+no recv  = global:a

@@ -8015,6 +8015,54 @@ fn storeExplicitReifiedGlobals(b: *FuncBuilder, name: []const u8, type_args: []c
     }
 }
 
+/// Heads whose values a `vararg` sibling's single argument can never be.
+fn containerParamHead(name: []const u8) bool {
+    const heads = [_][]const u8{
+        "Iterable", "Collection", "List", "MutableList", "Set", "MutableSet",
+        "Sequence", "Array",
+    };
+    for (heads) |h| if (std.mem.eql(u8, name, h)) return true;
+    return false;
+}
+
+/// The same-named inline sibling that declares the first parameter
+/// `vararg`, when `picked` declares it as a CONTAINER the first argument's
+/// static type is not. Null when the pick already fits.
+fn varargSiblingForContainerMismatch(
+    b: *FuncBuilder,
+    nm: []const u8,
+    picked: *const ast.Function,
+    args: []const Expr,
+) Allocator.Error!?*const ast.Function {
+    if (args.len == 0) return null;
+    if (picked.params.len == 0) return null;
+    const p0 = &picked.params[0];
+    if (p0.is_vararg) return null;
+    if (!containerParamHead(typeHead(p0.ty.name.name))) return null;
+
+    var arg_ty = (staticExprTypeRef(b, &args[0]) catch null) orelse return null;
+    defer arg_ty.deinit(b.allocator);
+    const arg_head = typeHead(std.mem.trimEnd(u8, arg_ty.name, "?"));
+    if (arg_head.len == 0) return null;
+    if (containerParamHead(arg_head)) return null;
+    // A class that really does implement the container is no mismatch.
+    if (b.module.uniqueClassIdBySimpleName(arg_head)) |acid| {
+        if (b.module.uniqueClassIdBySimpleName(typeHead(p0.ty.name.name))) |pcid| {
+            if (b.module.classIdIsOrExtends(acid, pcid)) return null;
+        }
+    }
+
+    const cands = inline_state.candidatesForName(nm) orelse return null;
+    for (cands) |c| {
+        if (c == picked) continue;
+        if (c.params.len != picked.params.len) continue;
+        if (c.params.len == 0 or !c.params[0].is_vararg) continue;
+        if (c.receiver_type != null) continue;
+        return c;
+    }
+    return null;
+}
+
 fn inlineTargetForBareCall(
     b: *FuncBuilder,
     seg: *const ast.Ident,
@@ -8171,6 +8219,18 @@ fn inlineTargetForBareCall(
             break :blk nf;
         },
     };
+    // Vararg-vs-container siblings: the index resolves by NAME and ARITY,
+    // and `combine(vararg flows: Flow<T>, transform)` and
+    // `combine(flows: Iterable<Flow<T>>, transform)` are both arity 2. A
+    // single `Flow` argument only fits the vararg one — a `Flow` is not an
+    // `Iterable` — but the index cannot see that, and splicing the
+    // container overload made its body iterate the flow itself
+    // (`Vm::call_member iterator`). Swap in the vararg sibling when the
+    // argument disproves the container parameter.
+    if (pick) |pf| {
+        if (try varargSiblingForContainerMismatch(b, nm, pf, args)) |alt| pick = alt;
+    }
+
     // Same-simple-name inline MEMBER overloads declared in unrelated classes:
     // a bare call inside a member binds `this.<name>`, so the overload must be
     // one declared in the enclosing class's own hierarchy — never a namesake
@@ -9469,6 +9529,7 @@ fn lowerValueInvocation(
                 if (argLitKind(init_e) != null) return null;
                 if (ctorInitNonInvocable(b, init_e, args.len)) return null;
                 if (callInitNonInvocable(b, init_e, args.len)) return null;
+                if (try initTypeNonInvocable(b, init_e, args.len)) return null;
             }
         }
         // Nor does a function-typed param shadow one for a TRAILING-LAMBDA
@@ -9638,6 +9699,28 @@ fn argLitKind(e: *const Expr) ?LitKind {
 /// that matters across kotlinx's flow tests, `val flow = flowOf(1, 2)` — a
 /// `Flow` declares no `invoke`, so the call `flow { … }` written beside it
 /// names the `flow { … }` builder, exactly as Kotlin resolves it.
+/// The same non-invokable test over the initializer's STATIC TYPE, so a
+/// local initialised by anything the deriver can type — a member call
+/// (`val flow = listOf(1).asFlow()`), a property read, a chain — shadows a
+/// same-named function only when its own type could actually take the call.
+/// `Flow` declares no `invoke`, so `flow { emit(42) }` beside such a local
+/// is the BUILDER.
+fn initTypeNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) Allocator.Error!bool {
+    var ty = (staticExprTypeRef(b, init_e) catch null) orelse return false;
+    defer ty.deinit(b.allocator);
+    const head = typeHead(std.mem.trimEnd(u8, ty.name, "?"));
+    if (head.len == 0) return false;
+    if (std.mem.startsWith(u8, head, "Function")) return false;
+    if (std.mem.eql(u8, head, "<function>")) return false;
+    const cid = b.module.uniqueClassIdBySimpleName(head) orelse b.module.classId(head) orelse return false;
+    if (cid.int() >= b.module.classes.items.len) return false;
+    const cls = &b.module.classes.items[cid.int()];
+    const methods = b.module.registry.hierarchy_methods.get(cls.name) orelse
+        b.module.registry.hierarchy_methods.get(cls.fqn) orelse return false;
+    if (methods.contains("invoke")) return false;
+    return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", argc) == .none;
+}
+
 fn callInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) bool {
     const call = switch (init_e.*) {
         .Call => |*c| c,
@@ -12934,6 +13017,17 @@ fn lowerPathCall(
 /// The receiver-context bits `resolveCall` folds into its emit-form decision,
 /// read once from the builder. Shared by the live path and the audit shadow so
 /// both query `resolveCall` identically.
+/// The active inline splice's receiver head, for a name the spliced body
+/// does NOT bind itself. A spliced inline function's own parameter shadows
+/// its receiver's extensions exactly as it does before splicing — `mp`'s
+/// `crossinline transform` against `Flw.transform` — so a name the splice
+/// substituted keeps resolving as that parameter.
+fn spliceRecvForName(b: *const FuncBuilder, name0: []const u8) ?[]const u8 {
+    if (b.resolve(name0) != null or b.knowsOuter(name0)) return null;
+    if (b.inlineLambdaFor(name0) != null) return null;
+    return b.spliceRecvTy();
+}
+
 pub fn resolveCtxFor(
     b: *FuncBuilder,
     name0: []const u8,
@@ -12956,11 +13050,21 @@ pub fn resolveCtxFor(
         .has_type_args = ast_type_args.len != 0,
         .has_composer = b.resolve("$composer") != null,
         .cast_pick = cast_pick,
-        .recv_ty = b.thisNarrow() orelse b.recvTy(),
+        // Inside an inline SPLICE the frame's own `recv_ty` is the CALLER's,
+        // so a spliced extension body would resolve its bare calls with no
+        // receiver at all and lose its own receiver's extensions
+        // (`serializer(type)` inside `SerializersModule.serializer()` bound
+        // the module-less overload). The splice channel carries the spliced
+        // declaration's receiver; consult it only when the frame has none.
+        .recv_ty = b.thisNarrow() orelse b.recvTy() orelse spliceRecvForName(b, name0),
         .recv_type = if (b.thisNarrow()) |t|
             ir.TypeRef{ .name = t, .nullable = false, .args = &.{} }
+        else if (b.recvTypeRef()) |rt|
+            rt
+        else if (spliceRecvForName(b, name0) != null)
+            (if (b.spliceRecvTyRef()) |srt| srt.* else null)
         else
-            b.recvTypeRef(),
+            null,
         .actual_type_param_bounds = actual_type_param_bounds,
         .is_value_capture = b.knowsOuter(name0) and b.resolve(name0) == null,
         .in_tailrec_body = b.tailrecSelf() != null,

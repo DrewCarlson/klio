@@ -1,0 +1,9 @@
+invoke       = 42
+is Function0 = true
+as argument  = 42
+in a list    = [42]
+one arg      = 50
+is Function1 = true
+as transform = [43, 44, 45]
+after add    = 52
+unbound      = 7

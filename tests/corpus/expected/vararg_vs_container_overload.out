@@ -1,0 +1,7 @@
+one       = vararg(1) -> 3
+two       = vararg(2) -> 6
+list      = iterable(2) -> 6
+one/inl   = vararg(1) -> 3
+two/inl   = vararg(2) -> 6
+list/inl  = iterable(2) -> 6
+spread    = vararg(2) -> 6

@@ -13546,6 +13546,38 @@ pub fn memberRefExact(
     return memberRefResolved(self, allocator, receiver, name, func);
 }
 
+/// The value-parameter count of the member a bound reference names, so the
+/// reference can report the `FunctionN` it satisfies. Null when the target
+/// cannot be identified (an unbound/type-form reference, a dynamic name).
+fn boundRefArity(self: *VmHost, receiver: *const Value, name: []const u8, func: ?FuncId) ?usize {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    if (func) |fid| {
+        if (mod.funcById(fid)) |f| {
+            const skip: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+            return f.params.len - skip;
+        }
+    }
+    if (receiver.* != .Instance) return null;
+    const cls_fqn = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk cg.get().fqn;
+    };
+    var found: ?usize = null;
+    for (mod.memberDecls(cls_fqn, name)) |fid| {
+        const f = mod.funcById(fid) orelse continue;
+        const skip: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        const n = f.params.len - skip;
+        if (found != null and found.? != n) return null; // overloaded: no single arity
+        found = n;
+    }
+    return found;
+}
+
 fn memberRefResolved(
     self: *VmHost,
     allocator: Allocator,
@@ -13591,6 +13623,18 @@ fn memberRefResolved(
     };
     const cls_name = try std.fmt.allocPrint(allocator, "$bound_ref${s}", .{name});
     const env = try ObjRef(runtime.Env).init(allocator, runtime.Env.init(allocator));
+    // A bound reference IS a function value: `s::produce` satisfies
+    // `() -> Int`, answers `is Function0<*>`, and takes every extension
+    // declared on a function type (`(() -> T).asFlow()`). Name the
+    // function supertypes so the dispatch walk and `is` see them; without
+    // them a member call on the reference found no candidate and fell back
+    // to invoking the bound method itself.
+    const supers: []const []const u8 = blk: {
+        const arity = boundRefArity(self, receiver, name, func) orelse
+            break :blk try allocator.dupe([]const u8, &.{"kotlin.Function"});
+        const fn_name = try std.fmt.allocPrint(allocator, "Function{d}", .{arity});
+        break :blk try allocator.dupe([]const u8, &.{ fn_name, "kotlin.Function" });
+    };
     const synth_class = try ObjRef(ClassDef).init(allocator, .{
         .name = cls_name,
         .fqn = cls_name,
@@ -13605,7 +13649,7 @@ fn memberRefResolved(
         .is_object = false,
         .is_enum = false,
         .is_sealed = false,
-        .supertype_names = &.{},
+        .supertype_names = supers,
         .parent = null,
         .interfaces = &.{},
         .is_interface = false,
