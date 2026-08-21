@@ -8015,6 +8015,54 @@ fn storeExplicitReifiedGlobals(b: *FuncBuilder, name: []const u8, type_args: []c
     }
 }
 
+/// Heads whose values a `vararg` sibling's single argument can never be.
+fn containerParamHead(name: []const u8) bool {
+    const heads = [_][]const u8{
+        "Iterable", "Collection", "List", "MutableList", "Set", "MutableSet",
+        "Sequence", "Array",
+    };
+    for (heads) |h| if (std.mem.eql(u8, name, h)) return true;
+    return false;
+}
+
+/// The same-named inline sibling that declares the first parameter
+/// `vararg`, when `picked` declares it as a CONTAINER the first argument's
+/// static type is not. Null when the pick already fits.
+fn varargSiblingForContainerMismatch(
+    b: *FuncBuilder,
+    nm: []const u8,
+    picked: *const ast.Function,
+    args: []const Expr,
+) Allocator.Error!?*const ast.Function {
+    if (args.len == 0) return null;
+    if (picked.params.len == 0) return null;
+    const p0 = &picked.params[0];
+    if (p0.is_vararg) return null;
+    if (!containerParamHead(typeHead(p0.ty.name.name))) return null;
+
+    var arg_ty = (staticExprTypeRef(b, &args[0]) catch null) orelse return null;
+    defer arg_ty.deinit(b.allocator);
+    const arg_head = typeHead(std.mem.trimEnd(u8, arg_ty.name, "?"));
+    if (arg_head.len == 0) return null;
+    if (containerParamHead(arg_head)) return null;
+    // A class that really does implement the container is no mismatch.
+    if (b.module.uniqueClassIdBySimpleName(arg_head)) |acid| {
+        if (b.module.uniqueClassIdBySimpleName(typeHead(p0.ty.name.name))) |pcid| {
+            if (b.module.classIdIsOrExtends(acid, pcid)) return null;
+        }
+    }
+
+    const cands = inline_state.candidatesForName(nm) orelse return null;
+    for (cands) |c| {
+        if (c == picked) continue;
+        if (c.params.len != picked.params.len) continue;
+        if (c.params.len == 0 or !c.params[0].is_vararg) continue;
+        if (c.receiver_type != null) continue;
+        return c;
+    }
+    return null;
+}
+
 fn inlineTargetForBareCall(
     b: *FuncBuilder,
     seg: *const ast.Ident,
@@ -8171,6 +8219,18 @@ fn inlineTargetForBareCall(
             break :blk nf;
         },
     };
+    // Vararg-vs-container siblings: the index resolves by NAME and ARITY,
+    // and `combine(vararg flows: Flow<T>, transform)` and
+    // `combine(flows: Iterable<Flow<T>>, transform)` are both arity 2. A
+    // single `Flow` argument only fits the vararg one — a `Flow` is not an
+    // `Iterable` — but the index cannot see that, and splicing the
+    // container overload made its body iterate the flow itself
+    // (`Vm::call_member iterator`). Swap in the vararg sibling when the
+    // argument disproves the container parameter.
+    if (pick) |pf| {
+        if (try varargSiblingForContainerMismatch(b, nm, pf, args)) |alt| pick = alt;
+    }
+
     // Same-simple-name inline MEMBER overloads declared in unrelated classes:
     // a bare call inside a member binds `this.<name>`, so the overload must be
     // one declared in the enclosing class's own hierarchy — never a namesake
