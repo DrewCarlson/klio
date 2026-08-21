@@ -32,12 +32,13 @@ test "kotlinx.datetime commonTest pass count holds at or above the ratchet basel
         // years, the earlier-offset rule for an ambiguous local time,
         // single-digit-hour zone ids, cached UTC offsets, and the harness
         // no longer starving a target of the file its helpers live in.
-        // Measured solo: 515 passed, 4 failed.
-        .baseline = 512,
+        // Measured solo: 517 passed, 2 failed, after natural ordering
+        // reached a user `Comparable` and the pack grew the TZif reader.
+        .baseline = 515,
         // 70 -> 59: a call binding by class id is now treated as a
         // construction, so `LocalDateTime(y, m, d, h, min)` reaches the
         // constructor instead of the published companion's `invoke`.
-        .max_failed = 6,
+        .max_failed = 3,
         .max_incomplete = 1,
     });
 }
