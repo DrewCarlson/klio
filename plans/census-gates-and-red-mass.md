@@ -828,13 +828,41 @@ Merge.kt's `flow` is `import ….internal.unsafeFlow as flow`.
      `collect`, and it makes a closure satisfy EVERY such interface — `Flow`
      included — which is the wrong direction for a bare `collect`.
 
-**Next step:** the bare `collect` inside the block, not `emitAll`. Its receiver
-must be `this@flattenConcat`, and what mis-ranks it is the receiver tower
-inside a block whose own `this` is a raw closure. Traces that pay: `KLIO_OR_AUDIT=1`
-for the emitted form, `KLIO_CALLVALUE_TRACE=1` for what a closure call binds as
-`this`, and clearing `.klio-local/.klio/cache` before every run — lowering is
-cached and a trace prints nothing on a warm cache.
+**Proven by direct instrumentation** (a `println` inside `unsafeFlow`'s own
+`collect` override, in the pack): the collector that arrives is
+`{ir-closure#50}` — a raw closure, NOT the `object : FlowCollector` that
+upstream's `collect(action)` extension builds. So that extension never runs:
+`flow.collect { … }` binds the MEMBER `collect(collector: FlowCollector<T>)`
+and SAM-converts the lambda into the slot. One level survives because a bare
+`emit` SAM-dispatches on the closure; a bare `emitAll` — a top-level extension
+on `FlowCollector` — cannot, and `[extfb] strict recv-unproven` rejects both
+its candidates because a closure cannot be PROVEN to be a `FlowCollector`.
 
+**Four attempts, all reverted** (each left the battery green and changed no
+census number, so none was landed):
+
+  1. Receiver-lambda marks carried onto `BuildObject`, so an anon-object
+     capture that is a receiver lambda is invoked with its receiver bound. It
+     changed the emission (`CallMemberOrValue` -> `CallValueWithThis`) and
+     nothing else: `callValueWithThisExact` finds no positional fit for a
+     0-param block, so the closure's own `this` still wins.
+  2. A callable satisfying any single-abstract-method interface in the
+     extension-applicability check. Moved the miss from `emitAll` to `collect`,
+     and makes a closure satisfy EVERY such interface — `Flow` included.
+  3. Resolving a renamed import to its declaration before the inline candidate
+     lookup (see the alias note above).
+  4. Extending `callableArgPrefersFunctionExtension` so a member param that
+     needs SAM conversion loses to an extension taking the function type
+     directly — the real Kotlin specificity rule. It does not fire here: the
+     bare `collect { … }` inside the block goes through the bare-name resolver,
+     not `resolveInstanceMethod`'s member pick where that rule lives.
+
+**What would actually close it:** make the SAM conversion produce a real
+instance of the interface (klio already builds `__sam_target__` synth instances
+elsewhere) instead of passing the raw closure, OR apply the SAM-specificity
+rule on the BARE-NAME resolution path as well as the member pick. The first is
+the principled fix and the larger change; memory records the raw-closure
+collector as a deliberate choice, so it is a design reversal, not a patch.
 ### Open: `secondFraction(n)` picks the defaulted overload
 
 Three datetime sample tests (`LocalTimeSamples.customFormat`,
