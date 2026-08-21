@@ -361,6 +361,44 @@ fn runUndelivered(ctx: *CallCtx, handler: Value, value: Value) std.mem.Allocator
     }
 }
 
+/// Report a handler failure the way upstream does when the PARK was
+/// cancelled: not at the call site — that coroutine is already unwinding
+/// with a `CancellationException` — but through `handleCoroutineException`,
+/// which reaches the context's `CoroutineExceptionHandler` and, failing
+/// that, the global one. Best effort: a program without the coroutines
+/// pack loaded has neither a scope nor the reporter.
+fn reportUndeliveredUnhandled(ctx: *CallCtx, err: RuntimeError, scope_in: Value) void {
+    if (err != .Thrown) return;
+    // The element belongs to the PARKED coroutine, not to whoever is doing
+    // the cancelling, so the report goes through that coroutine's context.
+    var scope = scope_in;
+    if (scope == .Unit) scope = ctx.host.activeCoroScope() orelse return;
+    const ctx_res = (ctx.host.getProperty(&scope, "coroutineContext", ctx.out) catch return) orelse return;
+    const coro_ctx = switch (ctx_res) {
+        .ok => |v| v,
+        .err => return,
+    };
+    // The context's own `CoroutineExceptionHandler`, not the top-level
+    // `handleCoroutineException`: its no-handler tail reaches the platform
+    // uncaught reporter, which re-enters the runtime from inside a
+    // cancellation unwind and wedges it.
+    // `context[CoroutineExceptionHandler]` reads the interface's COMPANION,
+    // which is the context key; the bare name resolves to the class value.
+    var key = ctx.host.lookupGlobal("CoroutineExceptionHandler") orelse return;
+    if (key == .Class) {
+        if (ctx.host.getProperty(&key, "Key", ctx.out) catch null) |r| {
+            if (r == .ok and r.ok != .Null) key = r.ok;
+        }
+    }
+    const got = (ctx.host.invokeMethod(&coro_ctx, "get", &.{key}, ctx.out) catch return) orelse return;
+    const handler = switch (got) {
+        .ok => |v| v,
+        .err => return,
+    };
+    if (handler == .Null) return;
+    _ = ctx.host.invokeMethod(&handler, "handleException", &.{ coro_ctx, err.Thrown }, ctx.out) catch return;
+}
+
 fn channelIllegalArgument(ctx: *CallCtx, message: []const u8) std.mem.Allocator.Error!EvalResult {
     return .{ .err = .{ .Thrown = try Value.newException(ctx.allocator, .{
         .fqn = try runtime.strInit(ctx.allocator, "kotlin.IllegalArgumentException"),
@@ -815,19 +853,21 @@ fn channelCancelWaiter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
     var found = false;
     var lost: ?Value = null;
+    var lost_scope: Value = .Unit;
     {
         coro_reg_mutex.lock();
         defer coro_reg_mutex.unlock();
         if (coro_reg.channels.getPtr(id)) |state| {
-            found = removeWaiterBySlotLosing(state, slot, &lost);
+            found = removeWaiterBySlotLosing(state, slot, &lost, &lost_scope);
         }
     }
     if (!found) return .{ .ok = .Unit };
-    // A cancelled `send` leaves its element undelivered.
+    // A cancelled `send` leaves its element undelivered. The coroutine is
+    // already unwinding, so a failing handler is reported, not rethrown.
     if (lost) |element| {
         const handler = undeliveredHandler(id);
         defer if (runtime.reclaimEnabled()) handler.release(ctx.allocator);
-        if (try runUndelivered(ctx, handler, element)) |e| return .{ .err = e };
+        if (try runUndelivered(ctx, handler, element)) |e| reportUndeliveredUnhandled(ctx, e, lost_scope);
     }
 
     // A throw at the suspension point: `Result.failure(cause)` routed by
@@ -843,10 +883,11 @@ fn channelCancelWaiter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// back its element, which the channel never delivered.
 fn removeWaiterBySlot(state: *ChannelState, slot: i64) bool {
     var lost: ?Value = null;
-    return removeWaiterBySlotLosing(state, slot, &lost);
+    var lost_scope: Value = .Unit;
+    return removeWaiterBySlotLosing(state, slot, &lost, &lost_scope);
 }
 
-fn removeWaiterBySlotLosing(state: *ChannelState, slot: i64, lost: *?Value) bool {
+fn removeWaiterBySlotLosing(state: *ChannelState, slot: i64, lost: *?Value, lost_scope: *Value) bool {
     {
         var i: usize = 0;
         while (i < state.receive_waiters.items.items.len) : (i += 1) {
@@ -860,7 +901,9 @@ fn removeWaiterBySlotLosing(state: *ChannelState, slot: i64, lost: *?Value) bool
         var i: usize = 0;
         while (i < state.send_waiters.items.items.len) : (i += 1) {
             if (state.send_waiters.items.items[i].slot == slot) {
-                lost.* = state.send_waiters.items.orderedRemove(i).value;
+                const w = state.send_waiters.items.orderedRemove(i);
+                lost.* = w.value;
+                lost_scope.* = w.scope;
                 return true;
             }
         }
