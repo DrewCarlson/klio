@@ -1,0 +1,5 @@
+id      = Short
+offset  = Long
+sample  = Byte
+content = true
+param   = Byte

@@ -24,6 +24,19 @@ import kotlinx.serialization.internal.EnumDescriptor
 import kotlinx.serialization.internal.EnumSerializer
 import kotlinx.serialization.internal.ObjectSerializer
 import kotlinx.serialization.builtins.serializer
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.SetSerializer
+import kotlinx.serialization.builtins.MapSerializer
+import kotlinx.serialization.builtins.ArraySerializer
+import kotlinx.serialization.builtins.IntArraySerializer
+import kotlinx.serialization.builtins.LongArraySerializer
+import kotlinx.serialization.builtins.ShortArraySerializer
+import kotlinx.serialization.builtins.ByteArraySerializer
+import kotlinx.serialization.builtins.CharArraySerializer
+import kotlinx.serialization.builtins.FloatArraySerializer
+import kotlinx.serialization.builtins.DoubleArraySerializer
+import kotlinx.serialization.builtins.BooleanArraySerializer
+import kotlinx.serialization.builtins.nullable
 import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.descriptors.listSerialDescriptor
 import kotlinx.serialization.descriptors.mapSerialDescriptor
@@ -107,8 +120,17 @@ internal fun __klsx_customSerializer(kClass: Any?): Any? =
 
 // The registered class a bare name resolves to, or null. Serves the
 // descriptor's rendered-type parser, whose inner names arrive as strings.
-internal fun __klsx_classByName(name: String): Any? =
+internal fun __klsx_classByName(name: String, owner: Any? = null): Any? =
     error("intrinsic kotlinx.serialization.__klsx_classByName not installed")
+
+internal fun __klsx_isInterfaceClass(kClass: Any?): Boolean =
+    error("intrinsic kotlinx.serialization.__klsx_isInterfaceClass not installed")
+
+internal fun __klsx_classIsPolymorphic(kClass: Any?): Boolean =
+    error("intrinsic kotlinx.serialization.__klsx_classIsPolymorphic not installed")
+
+internal fun __klsx_paramIsPolymorphic(kClass: Any?, index: Int): Boolean =
+    error("intrinsic kotlinx.serialization.__klsx_paramIsPolymorphic not installed")
 
 internal fun __klsx_enumValues(kClass: Any?): List<Any?> =
     error("intrinsic kotlinx.serialization.__klsx_enumValues not installed")
@@ -329,6 +351,13 @@ internal class ReflectiveDescriptor(
         if (index < elementClasses.size) {
             val cls = elementClasses[index]
             if (cls is KClass<*>) {
+                // `@Polymorphic` on the property overrides the class's own
+                // serializer with the open polymorphic one.
+                if (owner != null && __klsx_paramIsPolymorphic(owner, index)) {
+                    @Suppress("UNCHECKED_CAST")
+                    val d = PolymorphicSerializer(cls as KClass<Any>).descriptor
+                    return if (nullable) d.nullable else d
+                }
                 val s = __klsx_serializerForElementClass(cls)
                 if (s != null) {
                     val d = s.descriptor
@@ -408,10 +437,21 @@ internal class ReflectiveDescriptor(
 // The serializer an ELEMENT declared as `kClass` reports. A plain enum class
 // serializes without opting in (kotlinc generates its serializer on demand),
 // so an unannotated enum takes the ungated reflective build.
+@Suppress("UNCHECKED_CAST")
 internal fun __klsx_serializerForElementClass(kClass: KClass<*>): KSerializer<Any>? {
+    // `@Polymorphic` on the DECLARATION forces the open polymorphic
+    // serializer, even over a sealed hierarchy's generated one.
+    if (__klsx_classIsPolymorphic(kClass)) {
+        return PolymorphicSerializer(kClass as KClass<Any>)
+    }
     val s = __klsx_generatedSerializer(kClass)
     if (s != null) return s
     if (__klsx_isEnum(kClass)) return __klsx_reflectiveSerializer(kClass)
+    // A plain interface element serializes polymorphically (OPEN), exactly
+    // as the plugin's generated descriptor reports it.
+    if (__klsx_isInterfaceClass(kClass)) {
+        return PolymorphicSerializer(kClass as KClass<Any>)
+    }
     return null
 }
 
@@ -440,8 +480,42 @@ private fun splitTypeArgs(inner: String): List<String> {
 // the primitives and resolvable user classes. Null when the name does not
 // pin a serializer (a type variable, a star, an unregistered head).
 @Suppress("UNCHECKED_CAST")
-internal fun serializerForDeclaredType(declared: String): KSerializer<Any?>? {
-    val base = declared.removeSuffix("?")
+internal fun serializerForDeclaredType(declared: String, owner: Any? = null): KSerializer<Any?>? {
+    val nullable = declared.endsWith("?")
+    val base = if (nullable) declared.substring(0, declared.length - 1) else declared
+    // Generic collection spellings build the structural serializer around
+    // the recursively-resolved element serializer.
+    val lt = base.indexOf('<')
+    if (lt >= 0 && base.endsWith(">")) {
+        val head = base.substring(0, lt).substringAfterLast('.')
+        val args = splitTypeArgs(base.substring(lt + 1, base.length - 1))
+        val built: KSerializer<*>? = when (head) {
+            "List", "MutableList", "ArrayList", "Collection", "MutableCollection", "Iterable" ->
+                if (args.size == 1) serializerForDeclaredType(args[0], owner)?.let { ListSerializer(it) } else null
+            "Set", "MutableSet", "HashSet", "LinkedHashSet" ->
+                if (args.size == 1) serializerForDeclaredType(args[0], owner)?.let { SetSerializer(it) } else null
+            "Map", "MutableMap", "HashMap", "LinkedHashMap" ->
+                if (args.size == 2) {
+                    val k = serializerForDeclaredType(args[0], owner)
+                    val v = serializerForDeclaredType(args[1], owner)
+                    if (k != null && v != null) MapSerializer(k, v) else null
+                } else null
+            "Array" ->
+                if (args.size == 1) {
+                    val elemName = args[0].removeSuffix("?").substringAfterLast('.')
+                    val cls = __klsx_classByName(elemName, owner)
+                    val es = serializerForDeclaredType(args[0], owner)
+                    @Suppress("UNCHECKED_CAST")
+                    if (cls != null && es != null) ArraySerializer(cls as KClass<Any>, es) else null
+                } else null
+            else -> null
+        }
+        if (built != null) {
+            val cast = built as KSerializer<Any?>
+            return if (nullable) cast.nullable as KSerializer<Any?> else cast
+        }
+        return null
+    }
     val s: KSerializer<*>? = when (base.substringAfterLast('.')) {
         "Int" -> Int.serializer()
         "Long" -> Long.serializer()
@@ -452,12 +526,23 @@ internal fun serializerForDeclaredType(declared: String): KSerializer<Any?>? {
         "Boolean" -> Boolean.serializer()
         "Char" -> Char.serializer()
         "String" -> String.serializer()
+        "Unit" -> Unit.serializer()
+        "IntArray" -> IntArraySerializer()
+        "LongArray" -> LongArraySerializer()
+        "ShortArray" -> ShortArraySerializer()
+        "ByteArray" -> ByteArraySerializer()
+        "CharArray" -> CharArraySerializer()
+        "FloatArray" -> FloatArraySerializer()
+        "DoubleArray" -> DoubleArraySerializer()
+        "BooleanArray" -> BooleanArraySerializer()
         else -> {
-            val cls = __klsx_classByName(base.substringAfterLast('.'))
+            val cls = __klsx_classByName(base.substringAfterLast('.'), owner)
             if (cls == null) null else __klsx_serializerForElementClass(cls as KClass<*>)
         }
     }
-    return s as KSerializer<Any?>?
+    if (s == null) return null
+    val cast = s as KSerializer<Any?>
+    return if (nullable) cast.nullable as KSerializer<Any?> else cast
 }
 
 internal fun descriptorForDeclaredType(declared: String): SerialDescriptor {
@@ -580,12 +665,70 @@ public class ReflectiveKSerializer(
             __klsx_ctorParamClasses(kClass) + bodyNames.map { null }
         )
 
+    // The serializer each element routes through, resolved from its
+    // declared type (null = the untyped dynamic hooks). Primitives keep the
+    // dedicated `decode*Element` surface — an AbstractDecoder-based format
+    // overrides the typed hook, not `decodeSerializableElement`.
+    // LAZY: resolving an element's serializer can reach back to this class
+    // (`class Node(val next: Node?)`); by first use the enclosing serializer
+    // is already in the generated cache, so the cycle terminates.
+    private val elementSerializers: List<KSerializer<Any?>?> by lazy {
+        val out = ArrayList<KSerializer<Any?>?>()
+        var i = 0
+        while (i < elementTypes.size) {
+            val t = elementTypes[i]
+            // A NULLABLE primitive is not "primitive" here: the typed
+            // element hooks carry no null mark, so `Boolean?` must route
+            // through the nullable serializer (`booleanN=null` decoded
+            // `false` otherwise).
+            val primitive = !t.endsWith("?") && when (t.substringAfterLast('.')) {
+                "Int", "Long", "Short", "Byte", "Boolean", "Double", "Float", "Char", "String" -> true
+                else -> false
+            }
+            if (primitive || t.isEmpty()) {
+                out.add(null)
+            } else {
+                // The SCOPED class resolution wins: `elementClasses` resolved
+                // each element's class beside its declaration, where a global
+                // simple-name lookup can land on an unrelated namesake
+                // (sample's nested `Attitude` vs kotlinx.serialization's).
+                val scoped = elementClassSerializer(i, t)
+                out.add(scoped ?: serializerForDeclaredType(t, kClass))
+            }
+            i = i + 1
+        }
+        out
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun elementClassSerializer(index: Int, declared: String): KSerializer<Any?>? {
+        val classes = __klsx_ctorParamClasses(kClass) + __klsx_bodyPropNames(kClass).map { null }
+        if (index >= classes.size) return null
+        val cls = classes[index] as? KClass<*> ?: return null
+        val s = __klsx_serializerForElementClass(cls) as KSerializer<Any?>? ?: return null
+        return if (declared.endsWith("?")) s.nullable as KSerializer<Any?> else s
+    }
+
     override fun serialize(encoder: Encoder, value: Any?) {
         val c = encoder.beginStructure(descriptor)
         var i = 0
         while (i < names.size) {
             val v = __klsx_get(value, names[i])
-            c.encodeSerializableElement(descriptor, i, DynamicValueSerializer, v)
+            // Primitives take the TYPED element surface (`encodeStringElement`
+            // -> `encodeString`), which is what a format overrides; the
+            // untyped hook would skip a custom `encodeString` entirely.
+            val declared0 = if (i < elementTypes.size) elementTypes[i] else ""
+            val t = if (declared0.endsWith("?")) "" else declared0
+            val es = if (i < elementSerializers.size) elementSerializers[i] else null
+            when {
+                v is String && (t.substringAfterLast('.') == "String" || es == null) ->
+                    c.encodeStringElement(descriptor, i, v)
+                v is Char && (t.substringAfterLast('.') == "Char" || es == null) ->
+                    c.encodeCharElement(descriptor, i, v)
+                v == null -> c.encodeSerializableElement(descriptor, i, DynamicValueSerializer, v)
+                es != null -> c.encodeSerializableElement(descriptor, i, es, v)
+                else -> c.encodeSerializableElement(descriptor, i, DynamicValueSerializer, v)
+            }
             i = i + 1
         }
         c.endStructure(descriptor)
@@ -624,7 +767,9 @@ public class ReflectiveKSerializer(
                 // surface an AbstractDecoder-based format actually overrides;
                 // `decodeValue()` alone throws on a format that only
                 // implements the typed hooks.
-                val t = elementTypes[index].removeSuffix("?")
+                val declared0 = elementTypes[index]
+                val t = if (declared0.endsWith("?")) "" else declared0
+                val es = if (index < elementSerializers.size) elementSerializers[index] else null
                 args[index] = when (t) {
                     "String", "kotlin.String" -> ad.decodeStringElement(descriptor, index)
                     "Int", "kotlin.Int" -> ad.decodeIntElement(descriptor, index)
@@ -635,7 +780,9 @@ public class ReflectiveKSerializer(
                     "Double", "kotlin.Double" -> ad.decodeDoubleElement(descriptor, index)
                     "Float", "kotlin.Float" -> ad.decodeFloatElement(descriptor, index)
                     "Char", "kotlin.Char" -> ad.decodeCharElement(descriptor, index)
-                    else -> if (ad.decodeNotNullMark()) ad.decodeValue() else ad.decodeNull()
+                    else -> if (es != null)
+                        ad.decodeSerializableElement(descriptor, index, es, null)
+                    else if (ad.decodeNotNullMark()) ad.decodeValue() else ad.decodeNull()
                 }
                 seen[index] = true
             } else {

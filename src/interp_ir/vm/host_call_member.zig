@@ -914,6 +914,11 @@ fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name: []
     // prover's universal cases.
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
     if (typeParamOf(self, fid, pn)) return true;
+    // A receiver that IS the owner class's type parameter (`C.collectionSize`
+    // inside `CollectionSerializer<E, C, B>`) accepts any static hint — the
+    // hint may itself be another class's type parameter that happens to
+    // spell a real class's name (upstream names one `Collection`).
+    if (ir.parseClassTypeParamIdentity(std.mem.trimEnd(u8, ty.name, "?")) != null) return true;
     // A dotted nested receiver whose class lifted under a mangled key
     // (`Modifier.Node` when another `Node` exists) canonicalizes to that
     // key, so it compares equal to a hint that resolved the same class

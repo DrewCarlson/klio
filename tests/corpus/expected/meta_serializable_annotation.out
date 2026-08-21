@@ -1,4 +1,4 @@
 name     = Payload
 elements = 2
 version  = 3
-root     = class String
+root     = class kotlin.String

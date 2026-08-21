@@ -3215,7 +3215,10 @@ pub const Value = union(enum) {
             .Class => |c| {
                 const g = c.borrow();
                 defer g.deinit();
-                try writer.print("class {s}", .{g.get().name});
+                // `KClass.toString()` renders the QUALIFIED name (`class
+                // kotlin.Any`), as Kotlin's common/native surface does — a
+                // packageless class's fqn is its simple name, unchanged.
+                try writer.print("class {s}", .{g.get().fqn});
             },
             .Delegate => try writer.writeAll("<delegate>"),
             .PropertyRef => |p| {

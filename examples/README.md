@@ -159,6 +159,7 @@ Run any program with:
 | `companion_import_identity.kt` | A named companion-member import aliases the same value as the qualified read and outranks a same-named class in expression position. |
 | `member_shadows_imported_class.kt` | A member function named like an imported class wins the bare call from the method body, lambdas, nested lambdas, and coroutine blocks — never the imported constructor. |
 | `class_literal_builtin_name.kt` | A class literal on a user declaration whose simple name collides with a builtin (`Target`, `Retention`, `Deprecated`) answers the user's class, matching the class of an instance of it. |
+| `numeric_literal_adoption.kt` | An integer literal adopts the declared type at its binding site: `Short`/`Long` constructor properties, `arrayOf(1, 2)` bound to `Array<Byte>`, and function parameters all store the declared primitive. |
 | `inline_member_owner_pick.kt` | A bare call inside an extension splices the receiver class's own `internal inline` member, not a same-named member of an unrelated class that registered first. |
 | `block_body_returns_unit.kt` | A block-bodied function with no `return` yields Unit, never its last statement's value. |
 | `ctor_over_inline_factory.kt` | A bare constructor call in the class's own body binds the constructor over a same-named reified inline factory of the same arity. |
@@ -232,6 +233,8 @@ Run any program with:
 | `serializers_module_merge.kt`  | Combining two `SerializersModule`s: `+` copies each registration through `SerializersModuleCollector`, whose serializer-taking member has a default body the builder overrides, and `overwriteWith` replaces one. |
 | `serializer_for_class.kt`      | `@Serializer(forClass = C::class)` stands in for `C`'s generated serializer — its descriptor and members are `C`'s — and a reified `subclass(serializer)` reads its subclass off the serializer's type argument. |
 | `serializable_body_properties.kt` | A `@Serializable` class's BODY properties are elements too: backing-field properties in declaration order after the constructor ones, `@Transient` and accessor-only properties excluded, init-block-assigned ones keeping the init value on decode. |
+| `polymorphic_module_dsl.kt` | The polymorphic module DSL's reified `subclass` overloads select by argument shape (class literal vs companion serializer factory), a plain interface element serializes OPEN, and `@Polymorphic` on a declaration forces OPEN over its own serializer. |
+| `typed_format_round_trip.kt` | A custom AbstractEncoder/AbstractDecoder format round-trips a class through the TYPED hooks: quoted strings, enums by name, nullable primitives via the null mark, nested classes and collections recursively. |
 | `meta_serializable_annotation.kt` | `@MetaSerializable` lifts an annotation into a `@Serializable` marker: the annotated class serializes, and the annotation (arguments and class literals included) is retained on the descriptor. |
 | `interface_companion_state.kt` | Shared companion-object state on an interface.              |
 | `safe_assign.kt`               | Safe-call assignment.                                       |

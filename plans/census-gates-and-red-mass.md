@@ -69,7 +69,7 @@ the last measurement.
 
 | suite | passes | failures | opened at |
 |---|---|---|---|
-| serialization | 132 | 6 | 57 / 81 |
+| serialization | 136 | 2 | 57 / 81 |
 | datetime | 517 | 2 | 457 / 62 |
 | coroutines | 1269 | 30 | 1073 / 141 (+6 DNC) |
 | io | 1191 | 0 | 1182 / 9 |
@@ -1332,6 +1332,46 @@ by NAME through a new `construct_named` host hook backed by
 `newInstanceNamed`, binding only the DECODED elements so every unbound
 parameter takes its declared default. Body-prop `@Transient` checks every
 anchor too (`@Target(PROPERTY)` resolution cannot be assumed).
+
+### Roots: the last serialization stretch (132 -> 136, 2 open)
+
+  * `subclass(C::class)` picked the SERIALIZER overload: same arity, both
+    reified, registration order decided. `CallShape.arg0_class_literal` now
+    breaks the tie toward the `KClass`-first-param candidate
+    (`pickKClassParam`), and `unifyParamAgainstArg` solves `KClass<T>` from
+    a class-literal argument and `KSerializer<T>` from a companion
+    serializer-factory argument (`PolyDerived.serializer()` names its type
+    in the receiver). Both otherwise reached the runtime with `T` reading
+    the PROCESS-GLOBAL left by a sibling splice — the "B already
+    registered" cross-test corruption.
+  * `KClass.toString()` renders the QUALIFIED name (`class kotlin.Any`),
+    as the common/native surface does; the polymorphic-collision message
+    tests read it.
+  * A member-extension override on a CLASS TYPE PARAM receiver
+    (`C.collectionSize` in `CollectionSerializer<E, C, B>`) was refused by
+    the lenient extension pass when the call-site hint spelled another
+    class's type parameter that collides with a real class name (upstream
+    names one `Collection`). A class-type-param receiver now accepts any
+    static hint.
+  * `@MetaSerializable`, `@Polymorphic` (declaration and property),
+    interface elements as OPEN polymorphic, element descriptors/serializers
+    resolved OWNER-SCOPED (`__klsx_classByName(name, owner)` — a global
+    simple-name lookup landed on the wrong `Attitude`), nullable primitives
+    through their serializers (`Boolean?` decoded `false` from a null),
+    string/char elements through the TYPED encode hooks, primitive-array
+    and `Array<T>` element serializers, and per-element serializers made
+    LAZY (a self-referential `Node(next: Node?)` recursed at construction).
+  * Integer literals ADOPT the declared type at the constructor boundary:
+    `Sensor(7, 12, arrayOf(1, 2, 3))` with `Short`/`Long`/`Array<Byte>`
+    properties stores the declared primitives (`adoptDeclaredNumeric`,
+    generalizing the old Long-only retag). kotlinc does this at compile
+    time; `contentEquals` against a decoded array agreed once it landed.
+    Still missing: the same adoption for a plain LOCAL binding
+    (`val a: Array<Byte> = arrayOf(1, 2)` still holds Ints).
+
+Remaining 2: `SerialDescriptorBuilderTest.testGenericDescriptor` (generic
+custom-descriptor builder shape) and `SerializersLookupNamedCompanionTest`
+(a PARAMETRIZED named companion's `serializer(typeArg)`).
 
 ### Root: a bare spread call dropped the implicit receiver
 
