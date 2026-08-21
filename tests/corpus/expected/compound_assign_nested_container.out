@@ -1,0 +1,7 @@
+rows      = [[], [a, b]] size=2
+flattened = [[a], [b]] size=2
+nums      = [1, 2, 3]
+sets      = [[1, 2]] size=1
+after -=  = [[]]
+property  = [[], [x], [y]] size=3
+anys      = [1, 2] size=2
