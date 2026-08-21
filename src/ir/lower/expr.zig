@@ -6681,6 +6681,8 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
         .last_is_lambda = lastArgIsLambdaOrAnon(args),
         .trailing_lambda_arity = trailingLambdaArity(args),
         .call_file = callee.Path.segments[0].span.file,
+        .arg0_class_literal = args.len != 0 and args[0] == .MemberRef and
+            std.mem.eql(u8, args[0].MemberRef.name.name, "class"),
     };
     // An explicit `<T>` argument binds a reified parameter, so a reified
     // inline overload of this shape outranks a non-reified `KClass<T>`

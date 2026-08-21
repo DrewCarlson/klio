@@ -88,6 +88,9 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("kotlinx.serialization.__klsx_isSerializable", isSerializable);
     try b.register("kotlinx.serialization.__klsx_customSerializer", customSerializer);
     try b.register("kotlinx.serialization.__klsx_classByName", classByName);
+    try b.register("kotlinx.serialization.__klsx_isInterfaceClass", isInterfaceClass);
+    try b.register("kotlinx.serialization.__klsx_classIsPolymorphic", classIsPolymorphic);
+    try b.register("kotlinx.serialization.__klsx_paramIsPolymorphic", paramIsPolymorphic);
     try b.register("kotlinx.serialization.__klsx_constructNamed", constructNamed);
     try b.register("kotlinx.serialization.__klsx_isEnum", isEnumClass);
     try b.register("kotlinx.serialization.__klsx_enumValues", enumEntryValues);
@@ -823,9 +826,82 @@ fn classByName(ctx: *CallCtx) Error!EvalResult {
     const ng = ctx.args[0].String.borrow();
     const name = try ctx.allocator.dupe(u8, ng.get().bytes);
     ng.deinit();
+    // An optional OWNER class scopes the resolution: a nested/sibling class
+    // of the declaration wins over a global namesake (sample's nested
+    // `Attitude` vs kotlinx.serialization's).
+    if (ctx.args.len > 1) {
+        if (classOf(&ctx.args[1])) |owner_ref| {
+            defer owner_ref.deinit();
+            if (siblingClassNamed(owner_ref.asPtr(), name, ctx)) |v| {
+                if (v == .Class) return ok(v);
+                if (classOf(&v)) |cr| {
+                    defer cr.deinit();
+                    if (cr.asPtr().is_object) return ok(.{ .Class = cr.clone() });
+                }
+            }
+        }
+    }
     const v = ctx.host.lookupGlobal(name) orelse return ok(.Null);
     if (v != .Class) return ok(.Null);
     return ok(v);
+}
+
+/// Whether the class value names an `interface` declaration.
+fn isInterfaceClass(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return ok(.{ .Bool = false });
+    const cls_ref = classOf(&ctx.args[0]) orelse return ok(.{ .Bool = false });
+    defer cls_ref.deinit();
+    return ok(.{ .Bool = cls_ref.asPtr().is_interface });
+}
+
+/// Whether the class declaration itself is annotated `@Polymorphic`.
+fn classIsPolymorphic(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return ok(.{ .Bool = false });
+    const cls_ref = classOf(&ctx.args[0]) orelse return ok(.{ .Bool = false });
+    defer cls_ref.deinit();
+    for (cls_ref.asPtr().annotation_names) |n| {
+        if (std.mem.eql(u8, n, "kotlinx.serialization.Polymorphic") or
+            std.mem.eql(u8, n, "Polymorphic")) return ok(.{ .Bool = true });
+    }
+    return ok(.{ .Bool = false });
+}
+
+/// Whether the element at `index` (constructor properties first, then body
+/// properties) is annotated `@Polymorphic`.
+fn paramIsPolymorphic(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 2) return ok(.{ .Bool = false });
+    const cls_ref = classOf(&ctx.args[0]) orelse return ok(.{ .Bool = false });
+    defer cls_ref.deinit();
+    const want: i64 = switch (ctx.args[1]) {
+        .Int => |i| i,
+        .Long => |l| l,
+        else => return ok(.{ .Bool = false }),
+    };
+    var seen: i64 = 0;
+    for (cls_ref.asPtr().primary_params) |*p| {
+        if (p.property == null) continue;
+        if (ctorParamTransient(p)) continue;
+        if (seen == want) return ok(.{ .Bool = anchorsPolymorphic(&p.anchors) });
+        seen += 1;
+    }
+    for (cls_ref.asPtr().body_properties) |*p| {
+        if (!bodyPropIncluded(p)) continue;
+        if (seen == want) return ok(.{ .Bool = anchorsPolymorphic(&p.anchors) });
+        seen += 1;
+    }
+    return ok(.{ .Bool = false });
+}
+
+fn anchorsPolymorphic(anchors: *const runtime.PropertyAnchors) bool {
+    const sets = [_][]const runtime.AnnotationRecord{
+        anchors.property, anchors.field, anchors.param, anchors.get, anchors.set,
+    };
+    for (sets) |records| {
+        for (records) |*rec| {
+            if (rec.is("kotlinx.serialization.Polymorphic") or rec.is("Polymorphic")) return true;
+        }
+    }
+    return false;
 }
 
 /// Whether the class is an `enum class`.
@@ -1828,7 +1904,7 @@ test "hostBindings registers every serialization symbol" {
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classSerialNameOverride") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classAnnotations") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_paramAnnotations") != null);
-    try testing.expectEqual(@as(usize, 26), b.len());
+    try testing.expectEqual(@as(usize, 29), b.len());
 }
 
 test "renderShape round-trips nullability and generic args" {

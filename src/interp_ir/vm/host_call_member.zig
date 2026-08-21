@@ -914,6 +914,11 @@ fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name: []
     // prover's universal cases.
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
     if (typeParamOf(self, fid, pn)) return true;
+    // A receiver that IS the owner class's type parameter (`C.collectionSize`
+    // inside `CollectionSerializer<E, C, B>`) accepts any static hint — the
+    // hint may itself be another class's type parameter that happens to
+    // spell a real class's name (upstream names one `Collection`).
+    if (ir.parseClassTypeParamIdentity(std.mem.trimEnd(u8, ty.name, "?")) != null) return true;
     // A dotted nested receiver whose class lifted under a mangled key
     // (`Modifier.Node` when another `Node` exists) canonicalizes to that
     // key, so it compares equal to a hint that resolved the same class
@@ -5008,6 +5013,19 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                     switch (r) {
                         .ok => |v| if (v != .Null) return .{ .ok = v },
                         .err => return r,
+                    }
+                    // A COMPANION (named or not) serves the plugin's
+                    // `serializer(...)` for its OWNER declaration; the
+                    // companion itself is not `@Serializable`.
+                    if (try companionOwnerClassValue(self, &kc)) |owner| {
+                        defer owner.release(allocator);
+                        list.retain();
+                        const owner_args = [_]Value{ owner, list };
+                        const r2 = try callFuncRec(self, allocator, self.module.asPtr(), f, &owner_args);
+                        switch (r2) {
+                            .ok => |v| if (v != .Null) return .{ .ok = v },
+                            .err => return r2,
+                        }
                     }
                 }
             } else {

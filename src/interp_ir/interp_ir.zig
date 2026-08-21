@@ -44,6 +44,7 @@ pub const resetRunGlobalCaches = vmhost.resetRunGlobalCaches;
 /// Drop this thread's per-function JIT state between programs (the test/parity
 /// harness runs many programs in one process on recycled module memory).
 pub const resetJitForTest = ir.jit_loop.resetForTest;
+pub const resetLenientWarned = @import("vm/host_call_member.zig").resetLenientWarned;
 
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;

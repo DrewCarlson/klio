@@ -795,6 +795,8 @@ fn inferReifiedTypeArgs(
     for (f.params, 0..) |*p, i| {
         if (i >= ordered.len) break;
         const arg = ordered[i] orelse continue;
+        if (std.c.getenv("KLIO_UNIFY_TRACE") != null)
+            std.debug.print("[unify-fn] {s} p{d}={s}:{s}<{d}> arg={s}\n", .{ f.name.name, i, p.name.name, p.ty.name.name, p.ty.type_args.len, @tagName(std.meta.activeTag(arg.*)) });
         try unifyParamAgainstArg(allocator, &p.ty, arg, &tp_names, &subst, bb);
     }
 
@@ -992,6 +994,66 @@ fn unifyParamAgainstArg(
         if (staticArgTypeRef(allocator, arg, bb)) |aty| {
             try subst.put(param_ty.name.name, aty.*);
             return;
+        }
+    }
+    // A companion serializer-factory argument (`subclass(PolyDerived
+    // .serializer())`) against a `KSerializer<T>` parameter solves
+    // `T = PolyDerived`: the plugin's generated factory returns the
+    // declaration's own serializer, so the receiver names the type.
+    if (param_ty.type_args.len == 1 and !param_ty.type_args[0].is_star and
+        std.mem.eql(u8, std.mem.trimEnd(u8, param_ty.name.name, "?"), "KSerializer") and
+        tp_names.contains(param_ty.type_args[0].ty.name.name) and
+        !subst.contains(param_ty.type_args[0].ty.name.name))
+    {
+        if (arg.* == .Call and arg.Call.callee.* == .Member and
+            std.mem.eql(u8, arg.Call.callee.Member.name.name, "serializer") and
+            arg.Call.callee.Member.receiver.* == .Path)
+        {
+            const segs = arg.Call.callee.Member.receiver.Path.segments;
+            if (segs.len >= 1) {
+                const cls_name = segs[segs.len - 1].name;
+                if (cls_name.len != 0 and std.ascii.isUpper(cls_name[0])) {
+                    try subst.put(param_ty.type_args[0].ty.name.name, .{
+                        .name = .{ .name = cls_name, .span = arg.span() },
+                        .nullable = false,
+                        .span = arg.span(),
+                        .type_args = &.{},
+                        .function = null,
+                        .definitely_non_null = false,
+                        .annotations = &.{},
+                        .qualified_path = null,
+                    });
+                    return;
+                }
+            }
+        }
+    }
+    // A class-literal argument (`subclass(C::class)`) against a
+    // `KClass<T>` parameter solves `T = C` — the literal names its class
+    // statically.
+    if (param_ty.type_args.len == 1 and !param_ty.type_args[0].is_star and
+        std.mem.eql(u8, std.mem.trimEnd(u8, param_ty.name.name, "?"), "KClass") and
+        tp_names.contains(param_ty.type_args[0].ty.name.name) and
+        !subst.contains(param_ty.type_args[0].ty.name.name))
+    {
+        if (arg.* == .MemberRef and std.mem.eql(u8, arg.MemberRef.name.name, "class") and
+            arg.MemberRef.receiver.* == .Path and arg.MemberRef.receiver.Path.segments.len >= 1)
+        {
+            const segs = arg.MemberRef.receiver.Path.segments;
+            const cls_name = segs[segs.len - 1].name;
+            if (cls_name.len != 0 and std.ascii.isUpper(cls_name[0])) {
+                try subst.put(param_ty.type_args[0].ty.name.name, .{
+                    .name = .{ .name = cls_name, .span = arg.span() },
+                    .nullable = false,
+                    .span = arg.span(),
+                    .type_args = &.{},
+                    .function = null,
+                    .definitely_non_null = false,
+                    .annotations = &.{},
+                    .qualified_path = null,
+                });
+                return;
+            }
         }
     }
     if (param_ty.type_args.len != 0) {
@@ -1642,6 +1704,8 @@ pub fn tryInlineCallWithTypeArgs(
             .last_is_lambda = last_is_lambda,
             .trailing_lambda_arity = trailing_arity,
             .call_file = if (this_arg) |ta| callSiteFileOf(ta) else null,
+            .arg0_class_literal = args.len != 0 and args[0] == .MemberRef and
+                std.mem.eql(u8, args[0].MemberRef.name.name, "class"),
         };
         var recv_ty = try inferReceiverType(b, this_arg);
         // A BARE call inside an extension body has the enclosing

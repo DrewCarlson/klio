@@ -17,6 +17,8 @@ const ast = @import("ast");
 const interp_ir = @import("interp_ir");
 const kotlinx_atomicfu = @import("kotlinx_atomicfu");
 const kotlinx_coroutines = @import("kotlinx_coroutines");
+const kotlinx_serialization = @import("kotlinx_serialization");
+const kotlinx_datetime = @import("kotlinx_datetime");
 const compose_runtime = @import("compose_runtime");
 const compose_ui = @import("compose_ui");
 const lexer = @import("lexer");
@@ -1232,7 +1234,7 @@ const PackSource = struct { path: []u8, text: []u8 };
 
 /// The in-repo kotlinx pack directories, in load order.
 /// Number of in-repo packs the parity pipeline can load from source.
-pub const N_PACK_DIRS = 14;
+pub const N_PACK_DIRS = 16;
 
 fn kotlinxPackDirs(arena: Allocator) Allocator.Error![N_PACK_DIRS][]u8 {
     const ws = try workspaceRoot(arena);
@@ -1251,6 +1253,8 @@ fn kotlinxPackDirs(arena: Allocator) Allocator.Error![N_PACK_DIRS][]u8 {
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-animation-core" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-runtime-saveable" }),
         try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-compose-ui-text" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-serialization" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-datetime" }),
     };
 }
 
@@ -1433,7 +1437,7 @@ pub fn loadProgramFiles(arena: Allocator, io: Io, files: []const []const u8, mod
 }
 
 /// Host bindings installed for the pack load modes: stdlib defaults plus
-/// the kotlinx coroutines/atomicfu overlays.
+/// the kotlinx coroutines/atomicfu/serialization/datetime overlays.
 fn packHostBindings(arena: Allocator) Allocator.Error!HostBindings {
     var b = try HostBindings.withStdlibDefaults(arena);
     {
@@ -1447,6 +1451,18 @@ fn packHostBindings(arena: Allocator) Allocator.Error!HostBindings {
         var it = af.table.iterator();
         while (it.next()) |e| try b.register(e.key_ptr.*, e.value_ptr.*);
         af.deinit();
+    }
+    {
+        var sr = try kotlinx_serialization.hostBindings(arena);
+        var it = sr.table.iterator();
+        while (it.next()) |e| try b.register(e.key_ptr.*, e.value_ptr.*);
+        sr.deinit();
+    }
+    {
+        var dt = try kotlinx_datetime.hostBindings(arena);
+        var it = dt.table.iterator();
+        while (it.next()) |e| try b.register(e.key_ptr.*, e.value_ptr.*);
+        dt.deinit();
     }
     {
         var cr = try compose_runtime.hostBindings(arena);
@@ -2050,6 +2066,9 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
     // hang the harness process. Call-once.
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
+    // Per-run diagnostic state: the lenient-bind warning prints once per
+    // function per PROGRAM, and the memo is process-global.
+    interp_ir.resetLenientWarned();
 
     var arena_inst = std.heap.ArenaAllocator.init(allocator);
     defer arena_inst.deinit();

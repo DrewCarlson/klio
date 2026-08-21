@@ -72,6 +72,11 @@ pub const CallShape = struct {
     /// pack file spliced into an unrelated caller. Null keeps every
     /// candidate (callers that predate the field).
     call_file: ?span.FileId = null,
+    /// The first argument is a class literal (`subclass(C::class)`). Breaks
+    /// a same-arity reified overload tie toward the candidate whose first
+    /// parameter is a `KClass` (`subclass(clazz)` over
+    /// `subclass(serializer)`), which registration order otherwise decides.
+    arg0_class_literal: bool = false,
 };
 
 /// Whether `f` is visible to a call in `call_file`: a `private`
@@ -763,6 +768,22 @@ fn noRequiredFnParam(f: *const ast.Function) bool {
 /// List. Declining to splice hands the call to normal dispatch, which ranks by
 /// argument type and picks correctly — the same call written `this.addAllInternal(…)`
 /// always resolved, because it never reached the splice path.
+/// Among arity-fitting candidates, the unique one whose first parameter is
+/// declared `KClass` — the overload a class-literal first argument selects.
+fn pickKClassParam(cands: []const *const ast.Function, want: usize) ?*const ast.Function {
+    var hit: ?*const ast.Function = null;
+    for (cands) |f| {
+        if (!fitsArity(f, want)) continue;
+        const params = userParams(f);
+        if (params.len == 0) continue;
+        const head = std.mem.trimEnd(u8, params[0].ty.name.name, "?");
+        if (!std.mem.eql(u8, head, "KClass")) continue;
+        if (hit != null) return null;
+        hit = f;
+    }
+    return hit;
+}
+
 fn ambiguousByParamTypes(cands: []const *const ast.Function, want: usize) bool {
     var seen: ?[]const u8 = null;
     for (cands) |f| {
@@ -830,6 +851,9 @@ pub fn inlineFnAstFor(name: []const u8, call: ?CallShape) ?*const ast.Function {
     const shape = call orelse return first;
     if (cands.len < 2) return first;
     if (!shape.last_is_lambda) {
+        if (shape.arg0_class_literal) {
+            if (pickKClassParam(cands, shape.want)) |f| return f;
+        }
         if (pickNonlambdaShape(cands)) |f| return f;
         if (pickUniqueArityFit(cands, shape.want)) |f| return f;
         if (ambiguousByParamTypes(cands, shape.want)) return null;

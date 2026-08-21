@@ -463,8 +463,54 @@ fn appendPrimaryCtorPropertyFields(
     defer dg.deinit();
     for (dg.get().primary_params, 0..) |param, i| {
         if (param.property == null or i >= args.len) continue;
-        try fields.append(allocator, .{ .name = param.name, .value = args[i] });
+        try fields.append(allocator, .{ .name = param.name, .value = adoptDeclaredNumeric(&param, args[i]) });
     }
+}
+
+/// kotlinc ADOPTS an integer literal to the declared type at the call site
+/// (`C(2)` with `val s: Short` stores a Short; `arrayOf(1, 2)` bound to
+/// `Array<Byte>` holds Bytes). klio's lowering adopts function parameters
+/// but not constructor properties, so the declared boundary retags here: an
+/// `.Int` value against a narrower declared scalar, and an array/list
+/// value's `.Int` elements against a declared `Array<scalar>`. Only the
+/// literal-compatible `.Int` repr converts — a genuinely Int-typed value
+/// cannot reach a `Short` slot in valid Kotlin.
+fn adoptDeclaredNumeric(param: *const runtime.ClassParamDef, v: Value) Value {
+    const shape = if (param.declared_shape) |*sh| sh else return v;
+    if (v == .Int) {
+        if (scalarRetag(shape.name, v.Int)) |rv| return rv;
+        return v;
+    }
+    if (std.mem.eql(u8, shape.name, "Array") and shape.args.len == 1 and v == .Array) {
+        const elem = shape.args[0].name;
+        if (!scalarRetagName(elem)) return v;
+        switch (v.Array.storage()) {
+            .boxed => |vl| {
+                const g = vl.borrowMut();
+                defer g.deinit();
+                for (g.get().items) |*it| {
+                    if (it.* == .Int) {
+                        if (scalarRetag(elem, it.Int)) |rv| it.* = rv;
+                    }
+                }
+            },
+            .scalars => {},
+        }
+    }
+    return v;
+}
+
+fn scalarRetagName(name: []const u8) bool {
+    const eq = std.mem.eql;
+    return eq(u8, name, "Byte") or eq(u8, name, "Short") or eq(u8, name, "Long");
+}
+
+fn scalarRetag(name: []const u8, iv: i64) ?Value {
+    const eq = std.mem.eql;
+    if (eq(u8, name, "Byte")) return .{ .Byte = @truncate(iv) };
+    if (eq(u8, name, "Short")) return .{ .Short = @truncate(iv) };
+    if (eq(u8, name, "Long")) return .{ .Long = iv };
+    return null;
 }
 
 fn nextInstanceId(self: *VmHost) u64 {
@@ -3157,11 +3203,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                 var k: usize = 0;
                 while (k < pp.len and k < cls_args.len) : (k += 1) {
                     if (pp[k].property != null) {
-                        var fv = cls_args[k];
-                        if (pp[k].declared_type != null and std.mem.eql(u8, pp[k].declared_type.?, "Long") and fv == .Int) {
-                            const n: i64 = fv.Int;
-                            fv = .{ .Long = n };
-                        }
+                        const fv = adoptDeclaredNumeric(&pp[k], cls_args[k]);
                         // Dedup on the STORAGE key: a subclass's private
                         // SHADOW of a base ctor property lives in its own
                         // owner-mangled cell and must not displace the base's
