@@ -24,7 +24,12 @@ test "ktor commonTest pass count holds at or above the ratchet baseline" {
         // count; the ceilings bound the red mass so a fixed case
         // traded for a broken one cannot pass unnoticed. Lower the
         // ceilings as fixes land, never raise them.
-        .baseline = 448,
+        // 448 -> 449 once the pack carried ktor's own `Char.isLowerCase`
+        // (io/ktor/util/Charset.kt), which URLProtocol's scheme check reads
+        // and which accepts digits where the stdlib's letter-only one does
+        // not. Measured solo: 450 passed, 0 failed — held one below because
+        // `WriterReaderTest.testWriterOnCancelled` still flakes.
+        .baseline = 449,
         // Measured 2. Both are `URLBuilderTest.testParseSchemeWith{Digits,
         // DotsPlusAndMinusSigns}`, and both are UPSTREAM VERSION SKEW in the
         // sparse checkout rather than interpreter gaps: the tests expect a
@@ -41,7 +46,7 @@ test "ktor commonTest pass count holds at or above the ratchet baseline" {
         // deterministic. A ceiling at 2 would red the gate on roughly a
         // third of runs; failing test names are printed, so a genuine new
         // failure is still identifiable rather than absorbed.
-        .max_failed = 3,
+        .max_failed = 1,
         .max_incomplete = 2,
     });
 }
