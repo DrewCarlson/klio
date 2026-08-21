@@ -6002,22 +6002,17 @@ pub const Module = struct {
         if (!ds.has_body) return .virtual;
         if (ds.visibility == .Private) return .direct;
         const f = self.funcById(target) orelse return null;
-        if (class.is_stub) {
-            // An unclaimed classifier header carries no trustworthy
-            // final/open/interface modifiers, but a FINAL method on a closed
-            // stub is safe to call by fid. Value classes are NOT held here:
-            // their receivers arrive boxed like any instance (the one
-            // "erased receiver" failure this gate once served was a
-            // mis-typed Binary site committing Duration arithmetic into
-            // ValueTimeMark's body, fixed at the deriver), so they take the
-            // ordinary final-class rule below.
-            if (!class.is_interface and !class.is_open and !class.is_abstract and
-                methodIsFinal(f))
-            {
-                return .direct;
-            }
-            return .virtual;
-        }
+        // An unclaimed classifier header carries no trustworthy final/open/
+        // interface modifiers: every flag reads false whether the class is
+        // closed or merely unlowered, so "closed and final" cannot be told
+        // from "unknown". Answer virtual, exactly as `resolveMemberCall`
+        // does — reading the placeholder as closed bound a defaulted
+        // INTERFACE member by fid and the implementing class's override
+        // never ran (`SerializersModuleCollector.contextual`, whose default
+        // forwards to the provider overload, registered every serializer as
+        // a provider). Value classes never reach here as stubs; their
+        // receivers take the ordinary final-class rule below.
+        if (class.is_stub) return .virtual;
         const declaring_class = if (ds.enclosing_class) |decl_owner|
             (if (decl_owner.int() < self.classes.items.len) &self.classes.items[decl_owner.int()] else null)
         else
@@ -12045,6 +12040,32 @@ test "extension candidate index uses declaration metadata for bodyless headers" 
     // The extension declares no value parameters, so a one-argument call
     // cannot select it and it cannot shadow a member of that name.
     try testing.expect(!m.extCouldApply(a, "IntArray", "min", 1));
+}
+
+test "an unclaimed classifier header dispatches its bodied member virtually" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = Module.default(a);
+    defer m.deinit(a);
+
+    // A reserved placeholder reads closed-and-final on every modifier
+    // whether the class is a final class or an unlowered interface.
+    const owner = try m.reserveClass(a, "Sink", false);
+    try testing.expect(m.classes.items[owner.int()].is_stub);
+
+    const accept = try pushTestFuncOpts(&m, a, "accept", "sample.Sink.accept", "sample", 1, .{ .param_ty = "String" });
+    try m.decl_sigs.put(accept.int(), .{
+        .enclosing_class = owner,
+        .arity = .{ .required = 1, .total = 1, .has_vararg = false },
+        .sig = &.{.{ .name = "String", .nullable = false, .args = &.{} }},
+        .kind = .instance_method,
+        .has_body = true,
+    });
+
+    // Reading the placeholder as a closed class binds the body by identity,
+    // and an implementing class's override never runs.
+    try testing.expectEqual(Module.MemberDispatch.virtual, m.dispatchForTarget(owner, accept).?);
 }
 
 test "member resolution uses declaration-owner visibility" {

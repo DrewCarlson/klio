@@ -301,6 +301,9 @@ pub const AnnotationArg = union(enum) {
     /// The trailing segment of a dotted path (`AnnotationTarget.PROPERTY`
     /// records `"PROPERTY"`).
     EnumEntry: []const u8,
+    /// A class literal argument (`@Serializer(forClass = Foo::class)` records
+    /// `"Foo"`), which names a declaration rather than a value.
+    ClassRef: []const u8,
     /// Any argument shape the lowering does not resolve to a value.
     Other,
 };

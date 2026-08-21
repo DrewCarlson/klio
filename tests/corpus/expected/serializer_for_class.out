@@ -1,0 +1,6 @@
+name     = Config
+elements = 2
+first    = host
+same     = true
+byValue  = true
+byName   = true

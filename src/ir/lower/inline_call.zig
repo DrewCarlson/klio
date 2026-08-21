@@ -957,6 +957,15 @@ fn unifyParamAgainstArg(
             try subst.put(param_ty.name.name, aty.*);
             return;
         }
+        // Any argument whose static type lowering already knows solves it
+        // too: a literal, a typed local, a declared parameter. Without this
+        // a reified `T` bound only by `f(42)` stayed unsolved, the splice
+        // declined, and the un-spliced body read a PROCESS-GLOBAL `T` — so
+        // `T::class` was either unresolved or the previous call's answer.
+        if (staticArgTypeRef(allocator, arg, bb)) |aty| {
+            try subst.put(param_ty.name.name, aty.*);
+            return;
+        }
     }
     if (param_ty.type_args.len != 0) {
         var mentions_tp = false;
@@ -976,7 +985,24 @@ fn unifyParamAgainstArg(
         // argument is solved from the declaration's own supertype list.
         if (argDeclSupertypeMatching(arg, param_ty.name.name)) |sup| {
             try unifyTypeParam(param_ty, sup, tp_names, subst);
+            return;
         }
+        // A local initialized by an OBJECT LITERAL carries its supertype the
+        // same way, and that is the only place its type arguments are
+        // written: `val s = object : KSerializer<Int> by … {}` handed to
+        // `subclass(serializer: KSerializer<T>)` solves `T = Int`. The
+        // local's recorded declared type is head-only, so this is the one
+        // channel that reaches the argument.
+        if (localObjectSupertypeMatching(arg, param_ty.name.name, bb)) |sup| {
+            try unifyTypeParam(param_ty, sup, tp_names, subst);
+            return;
+        }
+        // Last: the argument's statically recorded type, which carries its
+        // type arguments even when the argument is a plain local
+        // (`val s = object : KSerializer<Int> by …` handed to
+        // `subclass(serializer: KSerializer<T>)` solves `T = Int`). Head-
+        // matched, because that recorded type is the local's denotable one.
+        try unifyLoweredTypeParam(param_ty, arg, tp_names, subst, bb);
     }
 }
 
@@ -1017,6 +1043,40 @@ fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilde
     return out;
 }
 
+/// The argument's statically-known type, for solving a parameter that IS a
+/// type parameter (`v: T`). Head only: a reified `T` is read as `T::class` or
+/// `is T`, and both erase type arguments. A head that is itself a type
+/// parameter answers nothing — substituting it leaves the body's `T` as
+/// unresolved as before.
+fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilder) ?*const TypeRef {
+    const b = bb orelse return null;
+    const ty = expr_lower.argDeclTypeRefLazy(@constCast(b), arg) orelse return null;
+    const head = std.mem.trimEnd(u8, ty.name, "?");
+    if (head.len == 0) return null;
+    if (std.mem.indexOfAny(u8, head, "<>-(") != null) return null;
+    if (head.len <= 2 and isAllUpper(head)) return null;
+    const out = allocator.create(TypeRef) catch return null;
+    out.* = .{
+        .name = .{ .name = head, .span = arg.span() },
+        .nullable = ty.nullable,
+        .span = arg.span(),
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    return out;
+}
+
+fn isAllUpper(s: []const u8) bool {
+    for (s) |c| {
+        if (!std.ascii.isUpper(c) and !std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
+
 /// The supertype of the class/object an argument path names whose head equals
 /// `want` — the declared instantiation (`KSerializer<B>`) an argument of that
 /// declaration's type satisfies. Null when the argument is not a plain
@@ -1033,6 +1093,59 @@ fn argDeclSupertypeMatching(arg: *const Expr, want: []const u8) ?*const TypeRef 
     if (name.len == 0) return null;
     const sups = inline_state.classSupertypeRefs(name) orelse return null;
     for (sups) |*sup| {
+        if (sup.type_args.len == 0) continue;
+        if (std.mem.eql(u8, sup.name.name, want)) return sup;
+    }
+    return null;
+}
+
+/// Solve `param_ty`'s type-parameter arguments from the argument's recorded
+/// static type. The recorded type is a lowered `ir.TypeRef`, so this matches
+/// the head and binds each parameter position to the corresponding argument's
+/// own head — enough for a reified parameter, which erases its arguments.
+fn unifyLoweredTypeParam(
+    param_ty: *const TypeRef,
+    arg: *const Expr,
+    tp_names: *const std.StringHashMap(void),
+    subst: *std.StringHashMap(TypeRef),
+    bb: ?*const FuncBuilder,
+) Allocator.Error!void {
+    const b = bb orelse return;
+    const ty = expr_lower.argDeclTypeRefLazy(@constCast(b), arg) orelse return;
+    var head = std.mem.trimEnd(u8, ty.name, "?");
+    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (!std.mem.eql(u8, head, param_ty.name.name)) return;
+    const n = @min(param_ty.type_args.len, ty.args.len);
+    for (param_ty.type_args[0..n], ty.args[0..n]) |*pa, *aa| {
+        if (pa.is_star) continue;
+        if (!tp_names.contains(pa.ty.name.name)) continue;
+        if (subst.contains(pa.ty.name.name)) continue;
+        const ah = std.mem.trimEnd(u8, aa.name, "?");
+        if (ah.len == 0) continue;
+        if (std.mem.indexOfAny(u8, ah, "<>-(") != null) continue;
+        if (ah.len <= 2 and isAllUpper(ah)) continue;
+        try subst.put(pa.ty.name.name, .{
+            .name = .{ .name = ah, .span = arg.span() },
+            .nullable = aa.nullable,
+            .span = arg.span(),
+            .type_args = &.{},
+            .function = null,
+            .definitely_non_null = false,
+            .annotations = &.{},
+            .qualified_path = null,
+        });
+    }
+}
+
+/// The supertype matching `want` of the object literal a LOCAL was
+/// initialized with. `argDeclSupertypeMatching` reads a named declaration's
+/// supertypes; this reads an anonymous one through the local that holds it.
+fn localObjectSupertypeMatching(arg: *const Expr, want: []const u8, bb: ?*const FuncBuilder) ?*const TypeRef {
+    if (arg.* != .Path or arg.Path.segments.len != 1) return null;
+    const b = bb orelse return null;
+    const init = b.localInitExpr(arg.Path.segments[0].name) orelse return null;
+    if (init.* != .ObjectExpr) return null;
+    for (init.ObjectExpr.supertypes) |*sup| {
         if (sup.type_args.len == 0) continue;
         if (std.mem.eql(u8, sup.name.name, want)) return sup;
     }

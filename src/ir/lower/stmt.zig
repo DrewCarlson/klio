@@ -368,6 +368,16 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
                     if (was_nullable) try b.setLocalDeclNullable(p.name.name);
                 }
             },
+            // An object literal's denotable type is its single supertype,
+            // and that supertype is the only place its type ARGUMENTS are
+            // written (`object : KSerializer<Int> by …`). Recording the head
+            // alone left a call taking `KSerializer<T>` with nothing to
+            // solve a reified `T` from.
+            .ObjectExpr => {
+                if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
+                    try b.setLocalDeclTypeOwned(p.name.name, ct);
+                }
+            },
             // Shapes that name their own type: a cast states it, `this` is the
             // enclosing class, `!x` is Boolean and `-x` keeps its operand's
             // type. Each of these left the local untyped, so every member call

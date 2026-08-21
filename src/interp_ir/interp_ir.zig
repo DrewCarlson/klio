@@ -57,6 +57,49 @@ pub const FuncId = ir.FuncId;
 const TypeRef = ir.TypeRef;
 const RuntimeError = runtime.RuntimeError;
 
+/// Normalized head of a declared parameter type for the type-qualified
+/// anon-method key. Every function-type spelling collapses to one token: the
+/// same parameter reads `(T) -> R` where it is written and `Function1` once
+/// lowered, and neither form is more authoritative than the other.
+pub fn anonParamTypeHead(name: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, name, "->") != null) return "Function";
+    if (std.mem.startsWith(u8, name, "Function")) return "Function";
+    if (std.mem.startsWith(u8, name, "suspend")) return "Function";
+    if (std.mem.eql(u8, name, "<function>")) return "Function";
+    const bare = std.mem.trimEnd(u8, name, "?");
+    const dot = std.mem.lastIndexOfScalar(u8, bare, '.') orelse return bare;
+    return bare[dot + 1 ..];
+}
+
+/// Whether two declarations name the same parameter types, comparing each
+/// parameter's normalized head. A leading `this` is the receiver, not a
+/// parameter. Two same-name, same-arity overrides on one anonymous class
+/// share the arity key, so this is what tells them apart
+/// (`SerializersModuleCollector.contextual` declares a serializer form and a
+/// provider form, both of arity two).
+pub fn anonParamsMatch(a: []const ir.Param, b: []const ir.Param) bool {
+    const skip_a: usize = if (a.len != 0 and std.mem.eql(u8, a[0].name, "this")) 1 else 0;
+    const skip_b: usize = if (b.len != 0 and std.mem.eql(u8, b[0].name, "this")) 1 else 0;
+    const pa = a[skip_a..];
+    const pb = b[skip_b..];
+    if (pa.len != pb.len) return false;
+    for (pa, pb) |x, y| {
+        if (!std.mem.eql(u8, anonParamTypeHead(x.ty.name), anonParamTypeHead(y.ty.name))) return false;
+    }
+    return true;
+}
+
+/// `name#arity#<n>`: the arity key plus the declaration's occurrence index
+/// among the class's same-name, same-arity members. The plain arity key holds
+/// only the LAST such declaration; the indexed keys keep every one reachable.
+pub fn anonOverloadMemberName(
+    allocator: Allocator,
+    arity_name: []const u8,
+    index: usize,
+) Allocator.Error![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}#{d}", .{ arity_name, index });
+}
+
 /// Runtime-lowered method bodies for anonymous-object / local classes,
 /// keyed by `(class, method)`: the owning module, the body's `FuncId`,
 /// and the captured-name/value pairs to bind on call.
