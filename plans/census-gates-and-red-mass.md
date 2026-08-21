@@ -1161,6 +1161,35 @@ same-named top-level function in scope. Whatever separates the real case
 is not in that list; the next step is to instrument the member overload
 scorer for this call rather than reduce further.
 
+### Fixed: `onUndeliveredElement`
+
+`Channel(capacity) { … }` accepted the handler and dropped it on the
+floor, so an element the channel took but never delivered was lost
+silently. It now runs for every such element, matching upstream case by
+case:
+
+  * a DROP_OLDEST eviction, from `send` AND `trySend`;
+  * a DROP_LATEST drop, from `send` only — `trySend` leaves that to its
+    caller (upstream's `isSendOp`);
+  * a `send` to a closed channel; a `trySend` to one reports nothing,
+    because it returns a failed result instead of accepting the element;
+  * a cancelled parked `send`;
+  * the whole buffer plus every parked sender when the channel is
+    CANCELLED. A plain `close` reports nothing — the buffer stays
+    receivable.
+
+The handler is identified by SHAPE, not position: the native `Channel(...)`
+factory sees the arguments as the user wrote them, so a callable in any
+slot is the handler while a capacity is numeric and a `BufferOverflow` is
+an enum entry. A handler that throws is wrapped in
+`UndeliveredElementException` with the original as its cause, as upstream's
+`callUndeliveredElementCatchingException` does, and surfaces at the drop /
+cancel site. Coroutines census 1192 -> 1203.
+
+Still open in that file: the seven `runTest(unhandled = …)` cases, where
+the wrapped exception must reach `handleCoroutineException` as an
+UNHANDLED coroutine exception rather than surface at the call site.
+
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 
 7 failures read `bufferEnd` on `KlioBufferedChannel`. The tests cast the
