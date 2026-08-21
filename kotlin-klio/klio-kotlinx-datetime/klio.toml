@@ -78,6 +78,7 @@ include = [
     "internal/math.kt",
     "internal/dateCalculations.kt",
     "internal/util.kt",
+    "internal/BinaryDataReader.kt",
     "internal/toKotlinCode.kt",
     "internal/format/Builder.kt",
     "internal/format/FieldSpec.kt",
@@ -99,6 +100,19 @@ include = [
     "format/UtcOffsetFormat.kt",
     "format/DateTimeComponents.kt",
     "format/Unicode.kt",
+]
+
+# The TZif reader and the recurring-rule model upstream writes in Kotlin.
+# klio's own TimeZone conversions are native (see src/kotlinx_datetime), but
+# these types are part of the library's surface and its own tests read a
+# zoneinfo blob through them, so they are packed as ordinary sources.
+[[source]]
+root = "upstream/core/commonKotlin/src"
+include = [
+    "internal/Tzfile.kt",
+    "internal/TimeZoneRules.kt",
+    "internal/MonthDayTime.kt",
+    "internal/OffsetInfo.kt",
 ]
 
 # klio-supplied platform layer. The `actual class` bodies for the

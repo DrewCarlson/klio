@@ -917,11 +917,11 @@
    "failed": [
     {
      "test": "TimeZoneRulesTest.ruleStrings",
-     "err": "unresolved global `readTzFile`"
+     "err": "values are not comparable: kotlin.time.Instant@942, kotlin.time.Instant@94a"
     },
     {
      "test": "TimeZoneRulesTest.ruleStringWithNonLastDayOfWeek",
-     "err": "Vm::get_field `PosixTzString` on `kotlinx.datetime.test.TimeZoneRulesTest`"
+     "err": "values are not comparable: kotlin.time.Instant@969, kotlin.time.Instant@971"
     }
    ],
    "incomplete": false
@@ -933,29 +933,24 @@
    2
   ],
   [
-   "unresolved global `X`",
+   "values are not comparable: kotlin.time.Instant@N, kotlin.time.Instant@94a",
    1
   ],
   [
-   "Vm::get_field `X` on `X`",
+   "values are not comparable: kotlin.time.Instant@N, kotlin.time.Instant@N",
    1
   ]
  ],
- "symbols": [
-  [
-   "readTzFile",
-   1
-  ]
- ],
+ "symbols": [],
  "by_shape": {
   "Vm::call_member `X` on `X`": [
    "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/DateTimeComponentsFormatTest.kt::DateTimeComponentsFormatTest.testFormattingWithUnsetFields",
    "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/DateTimeComponentsTest.kt::DateTimeComponentsTest.testAssigningLegalValues"
   ],
-  "unresolved global `X`": [
+  "values are not comparable: kotlin.time.Instant@N, kotlin.time.Instant@94a": [
    "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/TimeZoneRulesTest.kt::TimeZoneRulesTest.ruleStrings"
   ],
-  "Vm::get_field `X` on `X`": [
+  "values are not comparable: kotlin.time.Instant@N, kotlin.time.Instant@N": [
    "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/TimeZoneRulesTest.kt::TimeZoneRulesTest.ruleStringWithNonLastDayOfWeek"
   ]
  }

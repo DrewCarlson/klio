@@ -37,7 +37,7 @@ fn kotlinFloatTotalCmp(a: f64, b: f64) std.math.Order {
 /// widened value (integral via `i64`, floating via the IEEE total order);
 /// strings via UTF-16 code units; chars and booleans by their ordinal.
 /// Any other pairing is not comparable.
-fn compareValues(a: *const Value, b: *const Value) CmpResult {
+fn compareValuesPure(a: *const Value, b: *const Value) CmpResult {
     if (a.isNumeric() and b.isNumeric()) {
         if (a.isIntegral() and b.isIntegral()) {
             if (a.isUnsigned() and b.isUnsigned()) {
@@ -92,6 +92,38 @@ fn compareValues(a: *const Value, b: *const Value) CmpResult {
         },
         else => notComparable(a, b),
     };
+}
+
+/// Kotlin's natural ordering reaches any class that implements
+/// `Comparable`, not just the builtins: `sortedBy { it.instant }` and
+/// `compareValues(a, b)` on a library value type must dispatch its own
+/// `compareTo`. Tried only after the builtin table declines, so the common
+/// numeric/string path stays allocation- and dispatch-free.
+fn compareViaCompareTo(
+    ctx: *CallCtx,
+    a: *const Value,
+    b: *const Value,
+) std.mem.Allocator.Error!?CmpResult {
+    if (a.* != .Instance) return null;
+    const r = (try ctx.host.invokeMethod(a, "compareTo", &.{b.*}, ctx.out)) orelse return null;
+    switch (r) {
+        .ok => |v| {
+            const n = v.asI64() orelse return null;
+            return CmpResult{ .ord = if (n < 0) .lt else if (n > 0) .gt else .eq };
+        },
+        .err => |e| return CmpResult{ .err = e },
+    }
+}
+
+fn compareValues(
+    ctx: *CallCtx,
+    a: *const Value,
+    b: *const Value,
+) std.mem.Allocator.Error!CmpResult {
+    const builtin = compareValuesPure(a, b);
+    if (builtin == .ord) return builtin;
+    if (try compareViaCompareTo(ctx, a, b)) |r| return r;
+    return builtin;
 }
 
 fn notComparable(a: *const Value, b: *const Value) CmpResult {
@@ -163,7 +195,7 @@ pub fn cmp_compare_values_by(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             .lt
         else if (isNull(kb))
             .gt
-        else switch (compareValues(&ka, &kb)) {
+        else switch (try compareValues(ctx, &ka, &kb)) {
             .ord => |o| o,
             .err => |e| return .{ .err = e },
         };
@@ -240,7 +272,7 @@ pub fn cmp_compare_values(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         -1
     else if (isNull(b))
         1
-    else switch (compareValues(&a, &b)) {
+    else switch (try compareValues(ctx, &a, &b)) {
         .ord => |o| orderToInt(o),
         .err => |e| return .{ .err = e },
     };

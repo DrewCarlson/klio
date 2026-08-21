@@ -913,17 +913,11 @@
   },
   {
    "file": "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/TimeZoneRulesTest.kt",
-   "passed": [],
-   "failed": [
-    {
-     "test": "TimeZoneRulesTest.ruleStrings",
-     "err": "unresolved global `readTzFile`"
-    },
-    {
-     "test": "TimeZoneRulesTest.ruleStringWithNonLastDayOfWeek",
-     "err": "Vm::get_field `PosixTzString` on `kotlinx.datetime.test.TimeZoneRulesTest`"
-    }
+   "passed": [
+    "TimeZoneRulesTest.ruleStrings",
+    "TimeZoneRulesTest.ruleStringWithNonLastDayOfWeek"
    ],
+   "failed": [],
    "incomplete": false
   }
  ],
@@ -931,32 +925,13 @@
   [
    "Vm::call_member `X` on `X`",
    2
-  ],
-  [
-   "unresolved global `X`",
-   1
-  ],
-  [
-   "Vm::get_field `X` on `X`",
-   1
   ]
  ],
- "symbols": [
-  [
-   "readTzFile",
-   1
-  ]
- ],
+ "symbols": [],
  "by_shape": {
   "Vm::call_member `X` on `X`": [
    "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/DateTimeComponentsFormatTest.kt::DateTimeComponentsFormatTest.testFormattingWithUnsetFields",
    "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test/format/DateTimeComponentsTest.kt::DateTimeComponentsTest.testAssigningLegalValues"
-  ],
-  "unresolved global `X`": [
-   "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/TimeZoneRulesTest.kt::TimeZoneRulesTest.ruleStrings"
-  ],
-  "Vm::get_field `X` on `X`": [
-   "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test/TimeZoneRulesTest.kt::TimeZoneRulesTest.ruleStringWithNonLastDayOfWeek"
   ]
  }
 }
