@@ -1858,6 +1858,36 @@ pub fn filePrivatePropRename(b: *FuncBuilder, name: []const u8, file: u32) ?[]co
 }
 
 /// `Path` lowering — the full bare-name resolution ladder.
+/// The DECLARED name a renamed import binds `seg` to for a bare READ, when
+/// the caller's file imports something under a different leaf and nothing in
+/// scope — a local, a parameter, an enclosing capture, a top-level of that
+/// spelling — claims the name as written. Null leaves the spelling alone.
+fn bareAliasTargetName(b: *FuncBuilder, seg: *const ast.Ident) ?[]const u8 {
+    if (b.resolve(seg.name) != null or b.knowsOuter(seg.name) or b.isParam(seg.name)) return null;
+    // A MEMBER of the enclosing class wins over an import, so the alias
+    // decides only a name nothing in scope claims.
+    if (b.hasOwnMember(seg.name) or b.hasEnclosingMember(seg.name)) return null;
+    if (topLevelNameExists(b, seg.name)) return null;
+    for (b.module.importAliasPathsIn(seg.span.file, seg.name)) |p| {
+        if (p.segs.len == 0) continue;
+        const target = p.segs[p.segs.len - 1];
+        if (std.mem.eql(u8, target, seg.name)) continue;
+        // The import itself is the evidence: Kotlin validated the path, and
+        // the target may be a compiler intrinsic with no registry row of its
+        // own (`kotlin.coroutines.coroutineContext`).
+        return target;
+    }
+    return null;
+}
+
+/// Whether a top-level PROPERTY of this spelling exists — a stored global or a
+/// custom-getter one. Only the property channel is consulted: a call and a
+/// classifier already resolve through their own alias paths.
+fn topLevelNameExists(b: *FuncBuilder, name: []const u8) bool {
+    if (b.module.registry.top_level_prop_getters.contains(name)) return true;
+    return b.module.registry.top_level_prop_pkgs.contains(name);
+}
+
 fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const segments = expr.Path.segments;
     const span0 = expr.Path.span;
@@ -1924,6 +1954,18 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     return dst;
                 }
             }
+        }
+        // A RENAMED import binds this spelling to another declaration
+        // (`import kotlin.coroutines.coroutineContext as currentContext`). A
+        // call and a classifier already resolve through the alias; a bare
+        // PROPERTY read did not, and reached the runtime as the spelling — a
+        // member probe on the enclosing receiver, then an unresolved global.
+        // Nothing in scope claims the name, so the import decides it.
+        if (bareAliasTargetName(b, &segments[0])) |target| {
+            const dst = b.allocReg();
+            const n = try b.module.internConst(b.allocator, .{ .String = target });
+            try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
+            return dst;
         }
         if (b.resolve(name0)) |r| {
             if (runtime.envOnce("KLIO_BARE_TRACE")) |w| if (std.mem.eql(u8, w, name0)) {
@@ -2344,6 +2386,12 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (!inReceiverContext(b)) {
             orEmitAudit(b, "bare_name_fallthrough", "LoadGlobal", name0);
             const dst = b.allocReg();
+            // A RENAMED import binds this spelling to another declaration
+            // (`import kotlin.coroutines.coroutineContext as currentContext`).
+            // A call and a classifier already resolve through the alias; a
+            // bare PROPERTY read reached the runtime as the spelled name and
+            // found nothing. Resolve it at the emission only, so the spelling
+            // the source wrote is what every diagnostic still reports.
             const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
             try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
             return dst;
