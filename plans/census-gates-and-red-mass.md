@@ -914,10 +914,23 @@ spliced body. Whatever separates the real case lives further into
 `JobSupport` — it is a large class with a deep hierarchy, and the callee is
 `private inline`.
 
-**Next step:** find why the bare `notifyHandlers` lowers as a field read rather
-than a call — `KLIO_OR_AUDIT=1` names the emitted form, and the answer is
-whether the enclosing class's members are in scope while lowering a member
-extension's body.
+**Emission is fine; the receiver TOWER is not.** `KLIO_OR_AUDIT=1` shows the
+call site emits what it should:
+
+    emit site=unresolved_bare_call inst=CallMemberOrGlobal name=notifyHandlers
+        recvctx=1 pkg=kotlinx.coroutines fn=notifyCompletion recv=NodeList
+
+so the runtime walk starts at the NodeList (the extension receiver), misses,
+and never reaches the declaring `JobSupport`. A member extension's body has TWO
+receivers and the declaring instance rides the enclosing chain;
+`invokeResolvedMember` seeds it (`pushEnclosing`) but the dynamic walk does
+not.
+
+Seeding it in `invokeMethodFuncId` was tried and reverted: a trace shows that
+function is never reached for `notifyCompletion`, so it arrives by some third
+path. **Next step:** find which invoke actually runs a member extension here —
+instrument the entries that can (`invokeResolvedMember`, the virtual-slot
+invoke, the flat preparations) and check which one omits the enclosing push.
 
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 
