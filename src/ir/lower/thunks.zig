@@ -340,7 +340,7 @@ fn setInitBlockBoxedVars(
     var boxed = try ast_scan.computeBoxedVars(allocator, block.stmts);
     var assigned = StringSet.init(allocator);
     defer assigned.deinit();
-    try ast_scan.namesAssignedInLambdas(block.stmts, &assigned);
+    try ast_scan.namesAssignedInLambdasRebindsOnly(block.stmts, &assigned);
     for (params) |pname| {
         if (assigned.contains(pname)) try boxed.put(pname, {});
     }

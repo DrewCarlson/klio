@@ -2085,7 +2085,7 @@ pub fn tryInlineCallWithTypeArgs(
         // box any that name a parameter.
         var assigned = ast_scan.StringSet.init(b.allocator);
         defer assigned.deinit();
-        try ast_scan.namesAssignedInLambdas(body.Block.stmts, &assigned);
+        try ast_scan.namesAssignedInLambdasRebindsOnly(body.Block.stmts, &assigned);
         for (f.params) |*p| {
             if (assigned.contains(p.name.name)) try splice_boxed.put(p.name.name, {});
         }

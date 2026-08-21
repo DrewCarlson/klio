@@ -461,7 +461,7 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     {
         var assigned = ast_scan.StringSet.init(b.allocator);
         defer assigned.deinit();
-        try ast_scan.namesAssignedInLambdas(body.stmts, &assigned);
+        try ast_scan.namesAssignedInLambdasRebindsOnly(body.stmts, &assigned);
         for (names.items) |pname| {
             if (assigned.contains(pname)) try boxed.put(pname, {});
         }

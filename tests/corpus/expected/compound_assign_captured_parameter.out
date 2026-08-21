@@ -1,0 +1,4 @@
+map    = {a=1, bb=2}
+list   = [0, 10, 20]
+inline = {x=1}
+var    = 6

@@ -15,6 +15,7 @@ const stdlib = @import("stdlib");
 const applicability = @import("applicability");
 
 const vmhost = @import("vmhost.zig");
+const host_classes = @import("host_classes.zig");
 const host_globals = @import("host_globals.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -1492,7 +1493,12 @@ pub fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const
                 }
                 cg.deinit();
             }
-            return false;
+            // The name walk sees only the ClassTable's simple-name entries;
+            // a chain that crosses a host-synth class (KlioBufferedChannel
+            // -> BufferedChannel -> Channel -> ReceiveChannel) can break
+            // where a name is registered differently. `instanceOf` is the
+            // authoritative subtype answer — the same one `is` uses.
+            return host_classes.instanceOf(self, receiver, .{ .name = pn, .nullable = false, .args = &.{} });
         },
         else => return receiver.isRuntimeType(pn),
     }

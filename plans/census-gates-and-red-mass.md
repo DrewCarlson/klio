@@ -71,7 +71,7 @@ the last measurement.
 |---|---|---|---|
 | serialization | 138 | 0 | 57 / 81 — AT ZERO |
 | datetime | 517 | 2 | 457 / 62 |
-| coroutines | 1269 | 30 | 1073 / 141 (+6 DNC) |
+| coroutines | 1271 | 28 | 1073 / 141 (+6 DNC) |
 | io | 1191 | 0 | 1182 / 9 |
 | androidx_collection | 1841 | 0 | 1309 / 15 |
 | atomicfu | 67 | 0 | 67 / 0 |
@@ -1378,20 +1378,41 @@ the structural descriptor around the SUPPLIED argument's descriptor.
 **serialization is AT ZERO: 138/0** (campaign opened at 57 passed / 81
 failed).
 
-### Open: the buildList receiver-lambda loses the enclosing extension receiver
+### Root: the closure chain lacked the creator's own receiver
 
-`ReceiveChannel.toList() = buildList { consumeEach(::add) }` dispatches
-`consumeEach` on the MutableList: at runtime the closure's enclosing
-receiver CHAIN holds List at depth 0 AND depth 1 — the channel receiver of
-`this@toList` is absent, and the closure's `this` capture recorded the
-LIST. Repro: `scratchpad/recvwalk3.kt` (`suspend fun <E>
-ReceiveChannel<E>.myToList(): List<E> = buildList { consumeEach(::add) }`).
-Evidence trail: `[bare]` shows lowering resolved `CallMemberOrGlobal
-recv_ty=MutableList encl_recv=MutableList` (the tower never offered the
-extension receiver), and `[cmg-cap] this = List` shows the closure captured
-the splice window's receiver instead of the lexical one. The non-inline
-sibling (`recvwalk4.kt`) binds fine. This is the coroutines
-`ChannelsTest.testToListOnFailedChannel` root.
+`ReceiveChannel.toList() = buildList { consumeEach(::add) }` dispatched
+`consumeEach` on the MutableList. Two mechanisms:
+
+  * A closure's enclosing-receiver snapshot (`captureChainAlloc`) copied
+    only the frame's pushed chain — the creating function's OWN receiver
+    (`this`, params[0] of an extension or member) lives in the params and
+    was never part of the lexical scope the lambda carried. It is now
+    appended innermost.
+  * With the channel in the chain, the STRICT extension pass still refused
+    it: `receiverImplementsHead`'s name walk crosses host-synth classes
+    (`KlioBufferedChannel -> BufferedChannel -> Channel -> ReceiveChannel`)
+    through the ClassTable's simple-name entries and broke mid-chain. The
+    walk now falls back to `instanceOf` — the same authoritative subtype
+    answer `is` uses.
+
+Guarded by `examples/builder_lambda_outer_receiver.kt`. Coroutines
+`ChannelsTest` 9/0.
+
+### Root: a compound assign on a captured parameter boxed it
+
+`destination += transform(element)` inside `Flow.associateTo`'s collect
+lambda filled a PRIVATE copy — the caller's map stayed empty. The
+assigned-in-lambdas scan counted compound-assign targets as writes, so the
+parameter was boxed into a fresh cell; and the compound-assign lowering's
+`path_is_val` refused the `plusAssign` dispatch for a name that is both
+locally resolvable and known-outer. Both directions fixed: parameters (and
+lambda/splice params) box only on REBINDS
+(`namesAssignedInLambdasRebindsOnly` — a parameter can never be reassigned
+in Kotlin, so `dest += e` can only mean `dest.plusAssign(e)`), and a
+captured immutable dispatches `<op>Assign`. A captured written `var` still
+boxes via `computeBoxedVars`. Guarded by
+`examples/compound_assign_captured_parameter.kt`. Coroutines
+`ToMapCollectionSamplesTest` green; 1269 -> 1271.
 
 ### Root: a bare spread call dropped the implicit receiver
 

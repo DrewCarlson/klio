@@ -590,11 +590,29 @@ fn assignedInLambdasExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
 
 /// Inside a lambda body, collect every single-segment assignment target
 /// (the names the lambda mutates), recursing into deeper lambdas too.
+/// Bare-name targets a nested lambda REBINDS (`x = ...`), as opposed to
+/// compound-assigns: `dest += e` on an immutable (a parameter, a `val`)
+/// means `dest.plusAssign(e)` and is not a write to the binding at all.
+/// Recorded into the thread-set only when a caller opts in via
+/// `collect_compound_targets`; the `var`-boxing scan keeps them (a captured
+/// `var n` under `n += 1` rebinds), while the PARAMETER-boxing scan must
+/// not (a parameter can never be reassigned in Kotlin — boxing it detached
+/// the caller's value, so `Flow.associateTo`'s destination stayed empty).
+threadlocal var collect_compound_targets: bool = true;
+
+pub fn namesAssignedInLambdasRebindsOnly(stmts: []const Stmt, out: *StringSet) Allocator.Error!void {
+    const prev = collect_compound_targets;
+    collect_compound_targets = false;
+    defer collect_compound_targets = prev;
+    try namesAssignedInLambdas(stmts, out);
+}
+
 fn collectLambdaBodyAssigns(stmts: []const Stmt, out: *StringSet) Allocator.Error!void {
     for (stmts) |*s| {
         switch (s.*) {
             .Assign => |a| {
-                try collectAssignTargetPath(&a.target, out);
+                if (a.op == .Assign or collect_compound_targets)
+                    try collectAssignTargetPath(&a.target, out);
                 // The value side may itself contain deeper nested lambdas.
                 try assignedInLambdasExpr(&a.value, out);
             },

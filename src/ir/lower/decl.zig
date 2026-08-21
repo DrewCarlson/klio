@@ -2182,7 +2182,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             var boxed = try mod.computeBoxedVars(a, body.Block.stmts);
             var assigned = mod.ast_scan.StringSet.init(a);
             defer assigned.deinit();
-            try mod.ast_scan.namesAssignedInLambdas(body.Block.stmts, &assigned);
+            try mod.ast_scan.namesAssignedInLambdasRebindsOnly(body.Block.stmts, &assigned);
             for (names.items) |pname| {
                 if (assigned.contains(pname)) try boxed.put(pname, {});
             }
