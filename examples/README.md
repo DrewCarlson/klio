@@ -166,6 +166,7 @@ Run any program with:
 | `time_zone_id_forms.kt` | Every written form of a fixed offset (`+4`, `+04:00`, `UTC+4`, `GMT+04:00:00`) resolves to one offset while keeping distinct zone ids; parsing the same offset twice yields the same instance; malformed ids are rejected. |
 | `dst_local_time_mapping.kt` | A repeated local hour maps to its first pass and a missing one to the pre-gap offset, while each instant still has exactly one local time. |
 | `iso_extended_year_dates.kt` | ISO-8601 dates outside 0000..9999 carry an explicit sign and any zero padding; parse and `toString` are inverses across the range and reject an unsigned wide year. |
+| `timeout_over_a_yield_loop.kt` | A `withTimeout` around a busy `yield()` loop fires on schedule, and a sibling `delay` wakes while the loop spins: a due timer is ready work, not something that waits for the run queue to drain. |
 | `channel_undelivered_element.kt` | `onUndeliveredElement` runs for an evicted buffer entry, a cancelled parked `send`, a send to a closed channel and everything held at cancel — never for a delivered element; a throwing handler surfaces as `UndeliveredElementException`. |
 | `channel_null_elements.kt` | A `Channel<T?>` delivers null elements through the for-loop iterator, `consumeEach`, `receive` and `tryReceive`, and an all-null channel still terminates on close. |
 | `flow_context_preservation.kt` | A `flow { }` refuses an emission from another coroutine or another context; `channelFlow` allows concurrent emission and `flowOn` moves the whole upstream. |

@@ -3045,6 +3045,13 @@ fn ownerReadyPending(slot: i64) bool {
         const drv = &coro_stack.items[i];
         if (drv.slot_to_token.get(slot) != null) {
             if (drv.scheduler_backed) return false;
+            // A DUE deadline is ready work too. The pump arms its Wall
+            // timers once per turn, but a dispatched resume chain (a
+            // `yield()` loop is one) never returns to the pump — so a
+            // `withTimeout` deadline could pass unnoticed forever while the
+            // loop spun. Arm here as well, then let the queue check below
+            // send this resume behind the timer that just came due.
+            drv.armDueWallTimers() catch {};
             for (drv.ready.items) |rtok| {
                 if (drv.parked.contains(rtok)) return true;
             }
