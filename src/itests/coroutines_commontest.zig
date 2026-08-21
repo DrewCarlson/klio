@@ -47,7 +47,10 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         // `onUndeliveredElement`. 1198 -> 1254 and 48 -> 43 once a DUE
         // deadline became ready work on the inline resume path, which
         // recovered the four WithTimeout files (55 cases) from the child
-        // timeout. Measured solo: 1259 passed, 40 failed, 2 incomplete.
+        // timeout. Measured solo: 1259 passed, 40 failed, 0 incomplete —
+        // a file whose only `@Test` methods live on an ABSTRACT class now
+        // prints a zero summary instead of reading as a child that never
+        // reported.
         .baseline = 1254,
         // Bound the red mass too: a floor alone cannot see a fixed case
         // traded for a broken one. Measured solo: 137 failing, 6 not
@@ -64,6 +67,6 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         // flowOf(...)` beside the `flow { … }` builder). Measured solo: 1110
         // passed, 104 failed, 6 did not complete. Held two above.
         .max_failed = 43,
-        .max_incomplete = 4,
+        .max_incomplete = 1,
     });
 }

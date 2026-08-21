@@ -936,7 +936,11 @@ pub fn runTestsIsolated(
         if (t.len != 0) names.append(gpa, t) catch return 2;
     }
     if (names.items.len == 0) {
-        io.printStdout(gpa, "no tests found\n", .{});
+        // Still print the summary line: a file whose only `@Test` methods
+        // live on an ABSTRACT class contributes no cases but DID run, and a
+        // harness that reads the summary must not score it as a child that
+        // never reported.
+        io.printStdout(gpa, "no tests found\n\n0 tests, 0 passed, 0 failed, 0 skipped\n", .{});
         return 0;
     }
 
@@ -1221,7 +1225,7 @@ fn runTestsOnBuilt(
             io.printStdout(gpa, "test runner failed before producing a result\n", .{});
             return 1;
         }
-        io.printStdout(gpa, "no tests found\n", .{});
+        io.printStdout(gpa, "no tests found\n\n0 tests, 0 passed, 0 failed, 0 skipped\n", .{});
         return 0;
     }
     io.printStdout(gpa, "\n{d} tests, {d} passed, {d} failed, {d} skipped\n", .{
