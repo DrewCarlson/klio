@@ -19,6 +19,8 @@ class Callable(val n: Int) {
 }
 
 fun produce(): Holder = Holder(1)
+fun List<Int>.asHolder(): Holder = Holder(size)
+val topLevelHolder: Holder = Holder(99)
 fun make(body: () -> Int): Holder = Holder(body())
 fun makeCallable(): Callable = Callable(10)
 
@@ -32,6 +34,18 @@ fun main() {
     // Declaration order does not change which one a call reaches.
     val early = make { 1 }
     println("before and after agree    : " + (early.n == 1))
+
+    // The initializer's SHAPE does not matter — only its type. A member
+    // call, an extension call and a property read all produce a `Holder`,
+    // which declares no `invoke`, so the call still reaches the function.
+    run {
+        val make = listOf(1, 2).asHolder()
+        println("member-call initializer   : " + make { 7 } + " / local " + make)
+    }
+    run {
+        val make = topLevelHolder
+        println("property initializer      : " + make { 7 } + " / local " + make)
+    }
 
     // A local whose type declares `invoke` still answers the call itself.
     val makeCallable = makeCallable()

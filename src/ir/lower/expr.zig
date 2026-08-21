@@ -9529,6 +9529,7 @@ fn lowerValueInvocation(
                 if (argLitKind(init_e) != null) return null;
                 if (ctorInitNonInvocable(b, init_e, args.len)) return null;
                 if (callInitNonInvocable(b, init_e, args.len)) return null;
+                if (try initTypeNonInvocable(b, init_e, args.len)) return null;
             }
         }
         // Nor does a function-typed param shadow one for a TRAILING-LAMBDA
@@ -9698,6 +9699,28 @@ fn argLitKind(e: *const Expr) ?LitKind {
 /// that matters across kotlinx's flow tests, `val flow = flowOf(1, 2)` — a
 /// `Flow` declares no `invoke`, so the call `flow { … }` written beside it
 /// names the `flow { … }` builder, exactly as Kotlin resolves it.
+/// The same non-invokable test over the initializer's STATIC TYPE, so a
+/// local initialised by anything the deriver can type — a member call
+/// (`val flow = listOf(1).asFlow()`), a property read, a chain — shadows a
+/// same-named function only when its own type could actually take the call.
+/// `Flow` declares no `invoke`, so `flow { emit(42) }` beside such a local
+/// is the BUILDER.
+fn initTypeNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) Allocator.Error!bool {
+    var ty = (staticExprTypeRef(b, init_e) catch null) orelse return false;
+    defer ty.deinit(b.allocator);
+    const head = typeHead(std.mem.trimEnd(u8, ty.name, "?"));
+    if (head.len == 0) return false;
+    if (std.mem.startsWith(u8, head, "Function")) return false;
+    if (std.mem.eql(u8, head, "<function>")) return false;
+    const cid = b.module.uniqueClassIdBySimpleName(head) orelse b.module.classId(head) orelse return false;
+    if (cid.int() >= b.module.classes.items.len) return false;
+    const cls = &b.module.classes.items[cid.int()];
+    const methods = b.module.registry.hierarchy_methods.get(cls.name) orelse
+        b.module.registry.hierarchy_methods.get(cls.fqn) orelse return false;
+    if (methods.contains("invoke")) return false;
+    return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", argc) == .none;
+}
+
 fn callInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) bool {
     const call = switch (init_e.*) {
         .Call => |*c| c,
