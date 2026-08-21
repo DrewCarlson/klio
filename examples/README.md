@@ -155,6 +155,7 @@ Run any program with:
 | `positional_lambda_binding.kt` | Two positional lambdas with a defaulted third lambda parameter bind positionally; the trailing-lambda shift fires only when the callable does not fit its positional slot. |
 | `companion_import_identity.kt` | A named companion-member import aliases the same value as the qualified read and outranks a same-named class in expression position. |
 | `member_shadows_imported_class.kt` | A member function named like an imported class wins the bare call from the method body, lambdas, nested lambdas, and coroutine blocks — never the imported constructor. |
+| `class_literal_builtin_name.kt` | A class literal on a user declaration whose simple name collides with a builtin (`Target`, `Retention`, `Deprecated`) answers the user's class, matching the class of an instance of it. |
 | `inline_member_owner_pick.kt` | A bare call inside an extension splices the receiver class's own `internal inline` member, not a same-named member of an unrelated class that registered first. |
 | `block_body_returns_unit.kt` | A block-bodied function with no `return` yields Unit, never its last statement's value. |
 | `ctor_over_inline_factory.kt` | A bare constructor call in the class's own body binds the constructor over a same-named reified inline factory of the same arity. |

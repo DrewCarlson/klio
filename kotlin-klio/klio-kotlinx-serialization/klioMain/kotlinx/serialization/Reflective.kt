@@ -73,6 +73,12 @@ internal fun __klsx_isSerializable(kClass: Any?): Boolean =
 internal fun __klsx_isEnum(kClass: Any?): Boolean =
     error("intrinsic kotlinx.serialization.__klsx_isEnum not installed")
 
+// The serializer a declaration names for itself with `@Serializable(with =
+// Custom::class)`. Null when it names none. An `object Custom` answers its
+// singleton; a class answers the class, for the caller to construct.
+internal fun __klsx_customSerializer(kClass: Any?): Any? =
+    error("intrinsic kotlinx.serialization.__klsx_customSerializer not installed")
+
 internal fun __klsx_enumValues(kClass: Any?): List<Any?> =
     error("intrinsic kotlinx.serialization.__klsx_enumValues not installed")
 
@@ -87,6 +93,26 @@ internal fun __klsx_enumEntrySerialNames(kClass: Any?): List<String> =
 // class must return the same instance.
 private val __klsx_generated = HashMap<KClass<*>, KSerializer<Any>>()
 
+// Serializers built for `@Serializer(forClass = C::class)` declarations, kept
+// apart from `__klsx_generated`: these are C's GENERATED shape whatever C
+// names with `@Serializable(with = …)`, which is usually the very declaration
+// asking for this.
+private val __klsx_reflective = HashMap<KClass<*>, KSerializer<Any>>()
+
+// The body the plugin writes into a `@Serializer(forClass = C::class)`
+// declaration: C's generated serializer, built from C's runtime shape.
+// Unlike `__klsx_generatedSerializer` this does not consult C's own
+// `@Serializable(with = …)` — that names this declaration right back — and
+// does not require C to be `@Serializable` at all, since the annotation is
+// itself the request to generate.
+@Suppress("UNCHECKED_CAST")
+internal fun __klsx_reflectiveSerializer(kClass: KClass<*>): KSerializer<Any>? {
+    __klsx_reflective[kClass]?.let { return it }
+    val built = __klsx_buildSerializer(kClass)
+    __klsx_reflective[kClass] = built
+    return built
+}
+
 // The serializer the compiler plugin would have generated for a
 // `@Serializable` declaration, built from the declaration's runtime shape:
 // an `object` serializes as an empty structure, an `enum class` by entry
@@ -98,6 +124,18 @@ private val __klsx_generated = HashMap<KClass<*>, KSerializer<Any>>()
 internal fun __klsx_generatedSerializer(kClass: KClass<*>): KSerializer<Any>? {
     if (!__klsx_isSerializable(kClass)) return null
     __klsx_generated[kClass]?.let { return it }
+    // `@Serializable(with = Custom::class)` hands the whole job to `Custom`;
+    // the plugin's `serializer()` returns that declaration itself, so the
+    // identity a test asserts is the named object's.
+    val named = __klsx_customSerializer(kClass)
+    if (named != null) {
+        // A `@Serializer(forClass = …)` declaration has no written supertype
+        // — the plugin gives it one — so this cannot test `is KSerializer`.
+        @Suppress("UNCHECKED_CAST")
+        val custom = named as KSerializer<Any>
+        __klsx_generated[kClass] = custom
+        return custom
+    }
     val built = __klsx_buildSerializer(kClass)
     __klsx_generated[kClass] = built
     return built

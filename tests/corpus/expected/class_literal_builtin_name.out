@@ -1,0 +1,10 @@
+object value = user object
+object class = Target
+object same  = true
+class value  = 3
+class class  = Retention
+class same   = true
+data value   = Deprecated(why=obsolete)
+data class   = Deprecated
+data same    = true
+plain class  = Mark

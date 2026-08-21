@@ -81,6 +81,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     // Compiler-plugin replacement: the shape questions the generated
     // serializer would have been synthesized from.
     try b.register("kotlinx.serialization.__klsx_isSerializable", isSerializable);
+    try b.register("kotlinx.serialization.__klsx_customSerializer", customSerializer);
     try b.register("kotlinx.serialization.__klsx_isEnum", isEnumClass);
     try b.register("kotlinx.serialization.__klsx_enumValues", enumEntryValues);
     try b.register("kotlinx.serialization.__klsx_enumEntryAnnotations", enumEntryAnnotations);
@@ -592,6 +593,50 @@ fn isSerializable(ctx: *CallCtx) Error!EvalResult {
         if (isSerializableAnnotation(n)) return ok(.{ .Bool = true });
     }
     return ok(.{ .Bool = false });
+}
+
+/// The serializer a declaration NAMES for itself: `@Serializable(with =
+/// Custom::class)` — written positionally in most sources — hands the whole
+/// job to `Custom`, and the plugin's `serializer()` returns that instead of
+/// generating one. Answers the object singleton when `Custom` is an object
+/// declaration (the usual shape) and the class value otherwise, leaving the
+/// caller to construct it.
+fn customSerializer(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return ok(.Null);
+    const cls_ref = classOf(&ctx.args[0]) orelse return ok(.Null);
+    defer cls_ref.deinit();
+    for (cls_ref.asPtr().annotation_records) |rec| {
+        if (!isSerializableAnnotation(rec.names[rec.names.len - 1]) and
+            !recIsSerializable(&rec)) continue;
+        for (rec.args) |arg| {
+            if (arg != .ClassRef) continue;
+            const v = ctx.host.lookupGlobal(arg.ClassRef) orelse continue;
+            // An `object` answers its singleton; a CLASS answers the class,
+            // and the plugin instantiates it through its no-arg constructor.
+            if (v == .Class) {
+                const is_object = blk: {
+                    const g = v.Class.borrow();
+                    defer g.deinit();
+                    break :blk g.get().is_object;
+                };
+                if (!is_object) {
+                    switch (try ctx.host.invokeCallable(&v, &.{}, ctx.out)) {
+                        .ok => |built| return ok(built),
+                        .err => |e| return .{ .err = e },
+                    }
+                }
+            }
+            return ok(v);
+        }
+    }
+    return ok(.Null);
+}
+
+fn recIsSerializable(rec: *const runtime.AnnotationRecord) bool {
+    for (rec.names) |n| {
+        if (isSerializableAnnotation(n)) return true;
+    }
+    return false;
 }
 
 /// Whether the class is an `enum class`.
@@ -1554,6 +1599,7 @@ test "hostBindings registers every serialization symbol" {
     try testing.expect(b.resolve("kotlinx.serialization.json.__klsx_jsonEncode") != null);
     try testing.expect(b.resolve("kotlinx.serialization.json.__klsx_jsonDecode") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_isSerializable") != null);
+    try testing.expect(b.resolve("kotlinx.serialization.__klsx_customSerializer") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_isEnum") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_enumValues") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_ctorParamTypes") != null);
@@ -1562,7 +1608,7 @@ test "hostBindings registers every serialization symbol" {
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classSerialNameOverride") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classAnnotations") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_paramAnnotations") != null);
-    try testing.expectEqual(@as(usize, 18), b.len());
+    try testing.expectEqual(@as(usize, 19), b.len());
 }
 
 test "renderShape round-trips nullability and generic args" {

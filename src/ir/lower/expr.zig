@@ -1035,7 +1035,14 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             {
                 const rn = mr.receiver.Path.segments[0].name;
                 if (b.resolve(rn) == null and !b.knowsOuter(rn)) {
-                    if (b.module.classId(rn)) |cid| {
+                    // Resolve by the reference's own file and package first: a
+                    // user declaration whose simple name collides with a
+                    // builtin (`object Target` beside `kotlin.annotation
+                    // .Target`) owns the name at its own site, and the
+                    // simple-name index answers whichever registered last.
+                    if (b.module.classIdIndexed(rn, b.self_package, mr.receiver.Path.segments[0].span.file) orelse
+                        b.module.classId(rn)) |cid|
+                    {
                         const recv = b.allocReg();
                         const rnm = try b.module.internConst(b.allocator, .{ .String = rn });
                         try b.push(.{ .LoadGlobal = .{ .dst = recv, .name = rnm, .class = cid, .ctor_ref = true } });
@@ -14256,7 +14263,7 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
     const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
     var type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
     if (type_args.len == 0) {
-        if (try spliceReifiedTypeArgs(b, func_id)) |stamped| type_args = stamped;
+        if (try spliceReifiedTypeArgs(b, func_id, args.len)) |stamped| type_args = stamped;
     }
     const dst = b.allocReg();
     try b.push(.{ .Call = .{
@@ -14891,15 +14898,28 @@ fn enumClassOfPath(b: *FuncBuilder, e: *const Expr) ?[]const u8 {
 /// map, the substituted names stamp the call (`enumEntriesIntrinsic()`
 /// inside a spliced `enumEntries<E>()` body gets `<E>` — the runtime
 /// typed dispatch is blind otherwise). Null when not fully bound.
-fn spliceReifiedTypeArgs(b: *FuncBuilder, func_id: FuncId) Allocator.Error!?[]ConstId {
+fn spliceReifiedTypeArgs(b: *FuncBuilder, func_id: FuncId, argc: usize) Allocator.Error!?[]ConstId {
     if (b.reified_type_names.count() == 0) return null;
     const tps = b.module.registry.func_type_params.get(func_id) orelse return null;
     if (tps.items.len == 0) return null;
     const out = try b.allocator.alloc(ConstId, tps.items.len);
     for (tps.items, out) |tp, *slot| {
-        const actual = b.resolveReifiedTypeName(tp) orelse {
-            b.allocator.free(out);
-            return null;
+        const actual = b.resolveReifiedTypeName(tp) orelse blk: {
+            // The callee names its type parameter differently from the
+            // enclosing splice's. Kotlin solves it from the expected type;
+            // with NO arguments to solve from and exactly one reified type
+            // in scope, that binding is the only candidate there is —
+            // `EnumSerializer(serialName, enumValues())` inside
+            // `inline fun <reified E : Enum<E>> EnumSerializer(...)`.
+            if (argc != 0 or tps.items.len != 1 or b.reified_type_names.count() != 1) {
+                b.allocator.free(out);
+                return null;
+            }
+            var it = b.reified_type_names.valueIterator();
+            break :blk (it.next() orelse {
+                b.allocator.free(out);
+                return null;
+            }).*;
         };
         slot.* = try b.module.internConst(b.allocator, .{ .String = actual });
     }
@@ -15027,7 +15047,7 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
     // spliced `enumEntriesIntrinsic()` lowered in a receiver context
     // (a lambda body) is otherwise blind at the runtime intrinsic.
     if (type_args.len == 0) {
-        if (try spliceReifiedTypeArgs(b, func_id)) |stamped| type_args = stamped;
+        if (try spliceReifiedTypeArgs(b, func_id, args.len)) |stamped| type_args = stamped;
     }
     try b.push(.{ .CallMemberOrGlobal = .{
         .dst = dst,

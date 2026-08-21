@@ -750,6 +750,30 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         }
         return ok(receiver.*);
     }
+    // `X.Companion` names the companion explicitly. A declared companion is
+    // reached by the ladder below; one that only the kotlinx-serialization
+    // plugin would have written is not there at all, and the class value
+    // stands in for it exactly as a bare `X` in value position does —
+    // `Data.Companion.serializer()` then resolves like `Data.serializer()`.
+    if (receiver.* == .Class and std.mem.eql(u8, name, "Companion")) {
+        const cls_name = blk: {
+            const g = receiver.Class.borrow();
+            defer g.deinit();
+            break :blk g.get().name;
+        };
+        const comp_name: ?[]const u8 = blk: {
+            const g = self.module.borrow();
+            defer g.deinit();
+            break :blk g.get().registry.companion_singletons.get(cls_name);
+        };
+        if (comp_name) |cn| {
+            switch (try host_globals.ensureObjectSingleton(self, cn)) {
+                .ok => |maybe| if (maybe) |s| return ok(s),
+                .err => |e| return errRes(e),
+            }
+        }
+        return ok(receiver.*);
+    }
     // Field-read memo, consulted before the whole ladder: entries exist
     // ONLY for (class, name) pairs that previously fell through every
     // earlier arm and resolved in `instanceField` as a custom getter or

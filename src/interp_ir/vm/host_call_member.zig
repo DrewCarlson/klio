@@ -5021,6 +5021,20 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                         .ok => |v| if (v != .Null) return .{ .ok = v },
                         .err => return r,
                     }
+                    // A COMPANION is where the plugin writes `serializer()`,
+                    // and the declaration it describes is the companion's
+                    // OWNER — `Data.Named.serializer()` is `Data`'s. The
+                    // companion itself is not `@Serializable`, so the probe
+                    // above answered null for it.
+                    if (try companionOwnerClassValue(self, &kc)) |owner| {
+                        defer owner.release(allocator);
+                        const owner_args = [_]Value{owner};
+                        const r2 = try callFuncRec(self, allocator, self.module.asPtr(), f, &owner_args);
+                        switch (r2) {
+                            .ok => |v| if (v != .Null) return .{ .ok = v },
+                            .err => return r2,
+                        }
+                    }
                 }
             }
         }
@@ -14420,7 +14434,7 @@ pub fn serializerForClassTarget(self: *VmHost, allocator: Allocator, receiver: *
     const fid = blk: {
         const mg = self.module.borrow();
         defer mg.deinit();
-        break :blk mg.get().funcIdByFqn("kotlinx.serialization.__klsx_generatedSerializer") orelse return null;
+        break :blk mg.get().funcIdByFqn("kotlinx.serialization.__klsx_reflectiveSerializer") orelse return null;
     };
     const call_args = [_]Value{target};
     const r = try callFuncRec(self, allocator, self.module.asPtr(), fid, &call_args);
@@ -14434,4 +14448,29 @@ pub fn serializerForClassTarget(self: *VmHost, allocator: Allocator, receiver: *
             return null;
         },
     }
+}
+
+/// The class a companion object belongs to, as a `Value.Class`. Null when the
+/// argument is not a registered companion.
+fn companionOwnerClassValue(self: *VmHost, kc: *const Value) Allocator.Error!?Value {
+    if (kc.* != .Class) return null;
+    const comp_name = blk: {
+        const g = kc.Class.borrow();
+        defer g.deinit();
+        break :blk g.get().name;
+    };
+    const owner: ?[]const u8 = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const reg = &mg.get().registry;
+        var it = reg.companion_singletons.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.value_ptr.*, comp_name)) break :blk e.key_ptr.*;
+        }
+        break :blk reg.enclosing_class.get(comp_name);
+    };
+    const name = owner orelse return null;
+    const v = host_globals.lookupGlobal(self, name) orelse return null;
+    if (v != .Class) return null;
+    return v;
 }
