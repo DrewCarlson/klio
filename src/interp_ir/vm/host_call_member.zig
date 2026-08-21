@@ -11467,6 +11467,35 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
     }
 
     // Kotlin resolves scope level by scope level, and a class body is an
+    // A function-typed receiver's DECLARED head decides which member of a
+    // same-named extension family binds. `suspend R.() -> T` lowers to
+    // `Function0` (its receiver rides in the type args) while
+    // `suspend (P) -> T` lowers to `Function1`; both are the same runtime
+    // class, so nothing below can separate them, and the receiver form won
+    // every call — `block.startCoroutineUninterceptedOrReturn(value, cont)`
+    // on a `suspend (V) -> T` ran the block with `value` bound as `this`
+    // and its value parameter left null.
+    if (candidates.items.len > 1) {
+        if (declared_recv) |dn| {
+            if (std.mem.startsWith(u8, dn, "Function")) {
+                var n_exact: usize = 0;
+                for (candidates.items) |c| {
+                    const rh = std.mem.trimEnd(u8, c.func.params[0].ty.name, "?");
+                    if (std.mem.eql(u8, rh, dn)) n_exact += 1;
+                }
+                if (n_exact != 0 and n_exact != candidates.items.len) {
+                    var filtered: std.ArrayList(Candidate) = .empty;
+                    for (candidates.items) |c| {
+                        const rh = std.mem.trimEnd(u8, c.func.params[0].ty.name, "?");
+                        if (std.mem.eql(u8, rh, dn)) filtered.append(allocator, c) catch {};
+                    }
+                    candidates.deinit(allocator);
+                    candidates = filtered;
+                }
+            }
+        }
+    }
+
     // INNER scope relative to its file: a member extension of an enclosing
     // class outranks a same-named top-level extension for calls inside the
     // class. Surviving member-ext candidates already passed
