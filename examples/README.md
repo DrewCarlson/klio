@@ -47,7 +47,9 @@ Run any program with:
 | `parenthesized_callable_result.kt` | A trailing lambda after a parenthesized call invokes the callable returned by that call. |
 | `anonymous_object_classifier_identity.kt` | An anonymous-object initializer retains the exact lexical classifier and companion identity. |
 | `anonymous_object_supertypes.kt` | An object literal is an instance of its supertype's supertypes too: `is` and a safe cast walk the whole declared chain, for a literal with a body, a delegating one, and a class subtype alike. |
+| `anonymous_object_receiver_shapes.kt` | One anonymous-object site instantiated under different receivers: a property initializer reading the receiver's member works for a stored field and a backing-field-less getter alike — the shared site lowering must not bake in the first receiver's storage layout. |
 | `receiver_extension_shadow.kt` | A receiver-lambda extension shadows an applicable same-named top-level function. |
+| `extension_spread_implicit_receiver.kt` | A bare spread call inside an extension or member body binds the implicit receiver (`tag(*xs)` is `this.tag(*xs)`), instead of invoking the extension as a value and reading the first spread element as the receiver. |
 | `receiver_lambda_bare_write.kt` | A bare-name assignment inside a receiver lambda writes the receiver's property — including in the spliced body of an inline extension such as `apply`/`run`, where the receiver is a register rather than a capture — and falls through to the enclosing binding when the receiver declares no such property. |
 | `private_base_accessor_inherited.kt` | An accessor-only property inherited from a private abstract base resolves on the subclass — the private base's accessors live under its qualified registry key, and the hierarchy walk follows it. |
 | `member_ext_property_not_instance_prop.kt` | A member-extension property (`private val Any?.x` inside a class) resolves through the extension surface for any receiver — it is not an instance property of the class and never shadows the read on subtype instances. |
@@ -230,6 +232,7 @@ Run any program with:
 | `serializers_module_merge.kt`  | Combining two `SerializersModule`s: `+` copies each registration through `SerializersModuleCollector`, whose serializer-taking member has a default body the builder overrides, and `overwriteWith` replaces one. |
 | `serializer_for_class.kt`      | `@Serializer(forClass = C::class)` stands in for `C`'s generated serializer — its descriptor and members are `C`'s — and a reified `subclass(serializer)` reads its subclass off the serializer's type argument. |
 | `serializable_body_properties.kt` | A `@Serializable` class's BODY properties are elements too: backing-field properties in declaration order after the constructor ones, `@Transient` and accessor-only properties excluded, init-block-assigned ones keeping the init value on decode. |
+| `meta_serializable_annotation.kt` | `@MetaSerializable` lifts an annotation into a `@Serializable` marker: the annotated class serializes, and the annotation (arguments and class literals included) is retained on the descriptor. |
 | `interface_companion_state.kt` | Shared companion-object state on an interface.              |
 | `safe_assign.kt`               | Safe-call assignment.                                       |
 

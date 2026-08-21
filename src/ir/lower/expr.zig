@@ -6503,6 +6503,26 @@ fn lowerCallSpread(
                     b.self_package,
                     callee.Path.segments[0].span.file,
                 )) |ids| {
+                    // Every candidate an EXTENSION: the bare call binds the
+                    // implicit receiver, so it must route as a member-form
+                    // dispatch on `this` — the global-value invoke below
+                    // passes only the flattened args, and the extension's
+                    // receiver slot then swallowed the first spread element
+                    // (`constructSerializerForGivenTypeArgs(*arr)` inside a
+                    // KClass extension bound `this = IntSerializer`).
+                    const all_ext = ids.len != 0 and blk_ext: {
+                        for (ids) |fid| {
+                            const f = b.module.funcById(fid) orelse break :blk_ext false;
+                            if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) break :blk_ext false;
+                        }
+                        break :blk_ext true;
+                    };
+                    if (all_ext) {
+                        if (try resolveThisForBareCall(b)) |this_reg| {
+                            member_id = nm;
+                            break :blk this_reg;
+                        }
+                    }
                     spread_name = nm;
                     spread_candidates = ids;
                     if (ids.len != 0) {
@@ -6518,6 +6538,21 @@ fn lowerCallSpread(
                     }
                 }
                 if (b.module.funcIdForSpreadCall(name, b.ownerClass())) |fid| {
+                    // An EXTENSION picked for a bare spread call binds the
+                    // implicit receiver; invoking it as a global value passes
+                    // only the flattened args and the receiver slot swallows
+                    // the first spread element. Route it as a member-form
+                    // dispatch on `this`.
+                    const is_ext = blk_ext2: {
+                        const f = b.module.funcById(fid) orelse break :blk_ext2 false;
+                        break :blk_ext2 f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+                    };
+                    if (is_ext) {
+                        if (try resolveThisForBareCall(b)) |this_reg| {
+                            member_id = nm;
+                            break :blk this_reg;
+                        }
+                    }
                     const dst = b.allocReg();
                     try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .func = fid } });
                     break :blk dst;

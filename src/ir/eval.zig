@@ -8789,6 +8789,7 @@ pub fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Va
     const lstr = l.display(allocator) catch "?";
     const rstr = r.display(allocator) catch "?";
     const msg = try std.fmt.allocPrint(allocator, "BinOp.{s} on {s} and {s}", .{ @tagName(op), lstr, rstr });
+    dumpFrameChainForDiag();
     return errResult(.{ .Type = msg });
 }
 

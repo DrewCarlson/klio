@@ -69,7 +69,7 @@ the last measurement.
 
 | suite | passes | failures | opened at |
 |---|---|---|---|
-| serialization | 124 | 14 | 57 / 81 |
+| serialization | 132 | 6 | 57 / 81 |
 | datetime | 517 | 2 | 457 / 62 |
 | coroutines | 1269 | 30 | 1073 / 141 (+6 DNC) |
 | io | 1191 | 0 | 1182 / 9 |
@@ -1332,6 +1332,57 @@ by NAME through a new `construct_named` host hook backed by
 `newInstanceNamed`, binding only the DECODED elements so every unbound
 parameter takes its declared default. Body-prop `@Transient` checks every
 anchor too (`@Target(PROPERTY)` resolution cannot be assumed).
+
+### Root: a bare spread call dropped the implicit receiver
+
+`constructSerializerForGivenTypeArgs(*serializers.toTypedArray())` inside a
+`KClass` extension bound `this = IntSerializer` — the first spread element —
+and every parametrized serializer lookup (`Box<Int>`, `Box<SealedI>`, the
+whole `serializer<Generic<T>>()` family) answered "not found".
+`lowerCallSpread`'s bare-name arms resolved the name to a global fn value
+and invoked it with only the flattened args; an EXTENSION target's receiver
+slot then swallowed the first element. Both arms (bounded candidates and
+`funcIdForSpreadCall`) now route an extension pick as a member-form
+dispatch on the resolved `this`. Guarded by
+`examples/extension_spread_implicit_receiver.kt`.
+
+Debug note: the `BinOp.* on null` family now dumps the frame chain under
+`KLIO_ERR_TRACE`, which is what located both this and the next root.
+
+### Root: an anon-object site baked in its first receiver's storage layout
+
+`object : Iterator { var left = count }` in a `Sized` extension property:
+built first under a receiver STORING `count`, `bareCaptureResolvable`
+answered "resolvable from the captured `this`'s fields" and the site
+(a per-SITE cache) skipped lowering the init thunk. The next receiver —
+`count` a custom getter with no backing field — then constructed with
+`left = null`. The resolvability decision is now site-static: direct
+captures only; anything else always gets the thunk, whose dynamic member
+read serves fields and getters alike. This was the
+`SerialDescriptor.elementDescriptors` iterator, so it broke descriptor
+walks order-dependently. Guarded by
+`examples/anonymous_object_receiver_shapes.kt`.
+
+### Root: `@MetaSerializable` did nothing
+
+An annotation itself annotated `@MetaSerializable` marks its targets
+serializable and is retained on the descriptor.
+`__klsx_isSerializable` now consults the annotation DECLARATIONS' own
+annotations, and `annotationIsSerialInfo` keeps meta-serializable
+annotation instances on the descriptor. Class-literal annotation arguments
+(`root = String::class`) ride the ClassRef record. MetaSerializableTest
+0/3 -> 3/0. Guarded by `examples/meta_serializable_annotation.kt`.
+
+### Root: constructSerializerForGivenTypeArgs dropped its arguments
+
+klio's actual ignored the vararg serializers, so a parametrized descriptor
+had no type-argument substitutions (`Box<SealedI>`'s `boxed` element read
+CLASS instead of SEALED). It now routes through
+`__klsx_generatedSerializerGeneric` when arguments are present.
+
+serialization 124 -> 132 across these four. OPEN (noted in passing): a
+`vararg names: String` parameter's `.toList()` dies with `get_field length
+on kotlin.Array` — untriaged.
 
 ### Root: a class literal answered the builtin of the same simple name
 

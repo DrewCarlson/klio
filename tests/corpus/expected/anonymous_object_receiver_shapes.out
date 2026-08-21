@@ -1,0 +1,4 @@
+stored   = [0, 1, 2]
+computed = [0, 1]
+again    = [0]
+mixed    = [2, 3]

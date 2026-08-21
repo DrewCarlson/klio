@@ -3722,15 +3722,16 @@ fn snapshotCapture(v: Value) Value {
 fn bareCaptureResolvable(expr: *const ast.Expr, pairs: []const NameValue) bool {
     if (expr.* != .Path or expr.Path.segments.len != 1) return false;
     const nm = expr.Path.segments[0].name;
-    if (findCapture(pairs, nm) != null) return true;
-    if (findCapture(pairs, "this")) |tv| {
-        if (tv == .Instance) {
-            const ig = tv.Instance.borrow();
-            defer ig.deinit();
-            if (ig.get().get(nm) != null) return true;
-        }
-    }
-    return false;
+    // Direct captures ONLY. The capture-name list is site-static, so this
+    // answer holds for every construction. Probing the captured `this` for a
+    // FIELD of the name is a first-instance fact: this decision is cached
+    // per SITE, and `object : Iterator { var left = count }` built first
+    // under a receiver STORING `count` skipped the init thunk — the next
+    // receiver, whose `count` is a custom getter with no backing field, then
+    // constructed with `left = null`. The runtime fills still read the
+    // captured `this` directly where that resolves; the thunk is the
+    // fallback that works for every receiver shape.
+    return findCapture(pairs, nm) != null;
 }
 
 /// Like `synthThunk` but carrying the custom setter's single value parameter,
