@@ -885,87 +885,105 @@ unsoundness of that slot (re-entrancy) is unchanged and still recorded in
 argument is written at the call site. Guarded by
 `examples/reified_type_arg_without_splice.kt`.
 
-### Open: `JobSupport.notifyCompletion` binds the wrong receiver
+### Fixed: the flow `Vm::call_value on kotlin.Nothing` cluster was a starved harness
 
-8 flow tests fail as `Vm::call_value on kotlin.Nothing`
-(FlatMapConcat/FlatMapMerge/FlattenConcat/FlattenMerge `testFlatMapConcurrency`
-and friends). The frame chain puts every one of them in the same place:
+The 8 flow failures (FlatMapConcat / FlatMapMerge / FlattenConcat /
+FlattenMerge `testFlatMapConcurrency` and friends) were never an
+interpreter bug. Every one of those files extends `FlatMapBaseTest`, which
+is declared in `FlatMapBaseTest.kt` — a file that carries its own `@Test`
+methods and therefore lands in the harness's TARGET list, not its support
+list. One target per child meant the subclass compiled with an unresolved
+supertype: it lost the inherited members (`expect(value)` inside the
+`collect` lambda fell through to `kotlin.test.expect(expected, block)`
+with a null `block` — hence `call_value on kotlin.Nothing`) and never ran
+the inherited cases at all.
 
-    [getfield-miss] name=notifyHandlers recv=kotlinx.coroutines.NodeList
-    [frame-params] JobSupport.notifyCompletion (2 params, 2 bound):
-      [0] this = Instance NodeList
-    at JobSupport.notifyCompletion (common/src/JobSupport.kt:357)
-       JobSupport.completeStateFinalization (JobSupport.kt:316)
-       JobSupport.finalizeFinishingState (JobSupport.kt:233)
+The route to it, for the record: `[cmg-cand]` shows the implicit-receiver
+walk reaching `FlattenConcatTest` at ci=2 in BOTH the real run and a
+passing reduction, so the candidate list was never the difference.
+`missDumpClassChain` is what separated them — `[chain 0]
+FlattenConcatTest methods: supers: FlatMapBaseTest parent=false`. The
+`parent=false` is the whole story: the supertype name is recorded, the
+ClassDef is not, and the walk ends at depth 0.
 
-`private fun NodeList.notifyCompletion(cause)` is a member EXTENSION on
-`NodeList` inside `JobSupport`, so its `this` is the NodeList and the enclosing
-`JobSupport` is the dispatch receiver. Its body calls the enclosing class's
-`notifyHandlers(this, cause) { true }` — and klio probes the NODELIST for it.
-Note the miss is a `getfield`, so the bare name was lowered as a VALUE READ
-followed by a call, not as a member call: nothing in scope was recognised as a
-function of that name, and the read produced null.
+Two earlier readings of this cluster were wrong and are recorded so they
+are not repeated. `JobSupport.notifyCompletion` binding the wrong receiver
+was a different failure in the same run, not this one; and `[extfb]
+name=notifyHandlers simple-name fids=0` was read as "no dispatchable
+registration" when `[extfb]` is the EXTENSION fallback, where zero
+candidates is the expected answer for a member. Two lowering changes built
+on that misreading (`inlineBodyRecvChain` appending the owner chain;
+`bareInlineNeedsSplice` forcing a splice for a private inline member) were
+measured — the first census-neutral, the second net −1 (it broke
+`JobExtensionsTest.testIsCancelled`, whose `private inline fun
+checkException(block)` stops throwing once spliced) — and both reverted.
 
-Four reductions of the shape all PASS, so the trigger is not the shape alone:
-a bare enclosing-member call from a member extension; the same with an inline
-callee taking a trailing lambda; the same with a receiver-member call
-(`close(...)`) before it; and the same with `$this` referenced inside the
-spliced body. Whatever separates the real case lives further into
-`JobSupport` — it is a large class with a deep hierarchy, and the callee is
-`private inline`.
+The fix is in the harness, in both the gate (`commontest_support.zig`) and
+the census script: each target now also compiles the transitive closure of
+the target files whose top-level declarations it names, with `--only-file`
+keeping those files' own cases counted exactly once. The closure is
+computed from a column-zero declaration scan plus an identifier scan,
+scoped to the target's own package, so it pulls in a base class
+(`FlatMapBaseTest`) and a shared helper (`SharedFlowTest`'s
+`testSubscriptionByFirstSuspensionInCollect`, `IdFlowTest`'s `Flow<T>.id`)
+and nothing else — 34 extra file inclusions across the coroutines suite's
+148 targets, none for io / androidx_collection / serialization, one for
+ktor. Coroutines census 1124/90 -> 1162/86.
 
-**Emission is fine; the receiver TOWER is not.** `KLIO_OR_AUDIT=1` shows the
-call site emits what it should:
+**Whole-source-set is NOT the answer here.** Flipping the suite to
+`whole_source_set = true` (compile all 148 test files into every child) is
+the more faithful model of a Kotlin compilation unit, and it measures
+741 passed / 507 failed — 440 of the failures `Vm::call_member`. That is a
+real and large defect surface (compiling the whole test tree together
+breaks resolution), but it is a separate campaign; the per-file model plus
+the provider closure is what the gate runs today.
 
-    emit site=unresolved_bare_call inst=CallMemberOrGlobal name=notifyHandlers
-        recvctx=1 pkg=kotlinx.coroutines fn=notifyCompletion recv=NodeList
+### Fixed: a nested class reached from inside a lambda
 
-so the runtime walk starts at the NodeList (the extension receiver), misses,
-and never reaches the declaring `JobSupport`. A member extension's body has TWO
-receivers and the declaring instance rides the enclosing chain;
-`invokeResolvedMember` seeds it (`pushEnclosing`) but the dynamic walk does
-not.
+`Box::i` inside a lambda in `Box`'s declaring class died on `unresolved
+global Box` while the identical reference in the method body resolved
+(coroutines' `DistinctUntilChangedTest.testDistinctUntilChangedKeySelector`,
+whose `private class Box` is nested in the test class). A nested class
+lifts to `Holder$Box` and has no binding under its bare simple name; the
+`MemberRef` arm that loads a type reference with no IR class id — the arm
+for `ULongArray::copyInto` — read the bare name without consulting the
+scope rename. It now defers to `lowerReceiver`, which applies the rewrite,
+exactly as `lowerReceiver`'s own `aliased` guard does. Guarded by
+`examples/nested_class_reference.kt` and a lowering unit test.
 
-**The path is `invokeResolvedMember`, and it DOES push.** `KLIO_CM_TRACE`
-shows the call site emits `resolved=true dispatch=KlioBlockingCoroutine`, the
-flat preparation declines member extensions, and a trace inside
-`invokeResolvedMember` confirms `kind=member_extension dispatch=true`. So the
-declaring instance reaches the chain. Seeding it again in
-`invokeMethodFuncId` was tried and reverted — that function is never reached
-here.
+### Fixed: a file-private function bound the other file's declaration
 
-**A misreading to avoid repeating.** `[extfb] name=notifyHandlers simple-name
-fids=0` was taken as "the function has no dispatchable registration". It is
-not: `[extfb]` is the EXTENSION fallback, and zero extension candidates is the
-expected answer for a MEMBER. Nothing was established about whether
-`JobSupport.notifyHandlers` is reachable by the member walk, and the
-`[anon-disp] … hit=false` lines are the anon-method table, a different channel
-again.
+Two files in one package each declaring a same-signature `private fun`
+mangle per file (`makeIt$f228` / `makeIt$f229`) and each file's bare CALL
+rewrites to its own mangled name. Two holes let the other file's
+declaration win anyway:
 
-Two lowering changes were built on that misreading and measured:
+  1. A `::name` reference never applied the rewrite. With no declaration
+     left under the bare name, the reference fell through to the
+     member-ref-on-`this` branch and missed at run time —
+     `Vm::call_member 'createSegment' on SemaphoreImpl`, from kotlinx's
+     `val createNewSegment = ::createSegment` inside
+     `SemaphoreAndMutexImpl.addAcquireToQueue`, with a second
+     `private fun createSegment` in BufferedChannel.kt supplying the
+     collision. Four coroutines tests (`FlatMapMerge*`, `FlattenMerge`,
+     `MutexTest.testUnconfinedStackOverflow`).
+  2. The typeck overload channel recorded a cross-file private pick, which
+     `eagerCallTarget` then applied ON TOP of the correctly-mangled
+     lowering — `[bare] makeIt$f229 -> makeIt$f228#7481` with a candidate
+     list of exactly one entry, `makeIt$f229#7482`. Symptom: a bare call
+     bound whichever file was compiled FIRST, in both directions.
 
-  1. `inlineBodyRecvChain` appending the OWNER class chain after the extension
-     receiver's — a member extension's body has both receivers in scope.
-     Measured ALONE: census unchanged at 1124/90. Principled but unexercised.
-  2. `bareInlineNeedsSplice` forcing a splice for a private inline member of
-     the enclosing class. It DOES make the splice happen (`KLIO_SPLICE_TRACE`
-     shows `[splice] notifyHandlers entered, params=3`, all params bound), and
-     the test still fails — the failure moves along to a `getfield-miss` on
-     `runTest`. Census 1124/90 -> 1123/91, and the diff names the loss exactly:
-     `JobExtensionsTest.testIsCancelled`, whose `private inline fun
-     checkException(block)` wraps its lambda parameter in `runCatching(block)`
-     and then `?: fail()`. Spliced, the block stops throwing. Restricting the
-     rule to funcs absent from the name index did NOT separate the two cases.
+`recordResolvedCall` now declines any pick whose declaration is a
+top-level `private` in a different file, beside the existing
+package-visibility gate. Colliding file-private top-level PROPERTIES were
+checked and are already correct.
 
-Both REVERTED.
-
-**Next step:** the honest one is to establish, rather than assume, how
-`JobSupport.notifyHandlers` is meant to be reached — instrument the MEMBER walk
-(`resolveInstanceMethod`) for that name on a `KlioBlockingCoroutine` receiver
-and see whether the method is in `ClassDef.methods` at all. If it is, the
-splice is a red herring and the miss is elsewhere. A reduced `checkException`
-(private inline member wrapping its lambda in `runCatching`) does NOT reproduce
-the splice failure, so that half needs the real test to bisect.
+Guarded end to end by `examples/file_private_collision/` (pinned in
+`parity_corpus_pinned`). A synthetic two-file typeck test was written and
+DROPPED: the checker records nothing at all for that module, so the test
+passed with the gate disabled and proved nothing. Whatever makes the real
+program record the cross-file pick is not reproduced by the `Builder`
+harness, and the end-to-end pin is the honest guard.
 
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 
