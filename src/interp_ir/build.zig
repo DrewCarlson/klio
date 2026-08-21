@@ -3665,7 +3665,10 @@ fn buildModuleWithOverrides(
             if (delegate_opt) |delegate_expr| {
                 const sup_name = if (sup_idx < c.supertypes.len) c.supertypes[sup_idx].name.name else "";
                 const nm = try std.fmt.allocPrint(a, "__class_delegate_{s}_{d}", .{ c.name.name, sup_idx });
-                const fid = try ir.lower.lowerExprAsParamThunk(module, param_refs.items, &delegate_expr, nm);
+                // The delegate expression is written in the CLASS's scope: a
+                // nested class's `by StaticHolder.shared` names a sibling
+                // nested object that only the enclosing-class walk resolves.
+                const fid = try ir.lower.lowerExprAsParamThunkScoped(module, param_refs.items, &delegate_expr, nm, c.name.name, null);
                 try entries.append(a, .{ .name = sup_name, .func = fid });
             }
         }

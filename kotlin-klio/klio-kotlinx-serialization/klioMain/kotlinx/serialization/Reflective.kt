@@ -25,6 +25,9 @@ import kotlinx.serialization.internal.EnumSerializer
 import kotlinx.serialization.internal.ObjectSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.descriptors.listSerialDescriptor
+import kotlinx.serialization.descriptors.mapSerialDescriptor
+import kotlinx.serialization.descriptors.setSerialDescriptor
 import kotlinx.serialization.descriptors.SerialKind
 import kotlinx.serialization.descriptors.nullable
 import kotlinx.serialization.descriptors.StructureKind
@@ -85,6 +88,11 @@ internal fun __klsx_bodyPropHasInit(kClass: Any?): List<Boolean> =
 internal fun __klsx_setField(instance: Any?, name: String, value: Any?): Unit =
     error("intrinsic kotlinx.serialization.__klsx_setField not installed")
 
+// Construct binding only the named parameters; the constructor's defaults
+// fill the rest (a `@Transient` constructor property is not an element).
+internal fun __klsx_constructNamed(kClass: Any?, names: List<String>, values: List<Any?>): Any? =
+    error("intrinsic kotlinx.serialization.__klsx_constructNamed not installed")
+
 internal fun __klsx_isSerializable(kClass: Any?): Boolean =
     error("intrinsic kotlinx.serialization.__klsx_isSerializable not installed")
 
@@ -96,6 +104,11 @@ internal fun __klsx_isEnum(kClass: Any?): Boolean =
 // singleton; a class answers the class, for the caller to construct.
 internal fun __klsx_customSerializer(kClass: Any?): Any? =
     error("intrinsic kotlinx.serialization.__klsx_customSerializer not installed")
+
+// The registered class a bare name resolves to, or null. Serves the
+// descriptor's rendered-type parser, whose inner names arrive as strings.
+internal fun __klsx_classByName(name: String): Any? =
+    error("intrinsic kotlinx.serialization.__klsx_classByName not installed")
 
 internal fun __klsx_enumValues(kClass: Any?): List<Any?> =
     error("intrinsic kotlinx.serialization.__klsx_enumValues not installed")
@@ -275,20 +288,27 @@ internal class ReflectiveDescriptor(
     override val kind: SerialKind get() = StructureKind.CLASS
     override val elementsCount: Int get() = names.size
     override fun getElementName(index: Int): String = names[index]
-    override fun getElementIndex(name: String): Int = names.indexOf(name)
+    override fun getElementIndex(name: String): Int {
+        val i = names.indexOf(name)
+        return if (i == -1) CompositeDecoder.UNKNOWN_NAME else i
+    }
     // kotlinx reports the `@SerialInfo` annotations written on the class and
     // on each property. `owner` is the class the descriptor was built from;
     // a descriptor with no owner (the neutral `Dynamic` one) has none.
     override val annotations: List<Annotation>
         get() = if (owner == null) emptyList() else __klsx_classAnnotations(owner)
 
-    override fun getElementAnnotations(index: Int): List<Annotation> =
-        if (owner == null) emptyList() else __klsx_paramAnnotations(owner, index)
+    override fun getElementAnnotations(index: Int): List<Annotation> {
+        if (index < 0 || index >= names.size) throw IndexOutOfBoundsException("element $index of ${names.size}")
+        return if (owner == null) emptyList() else __klsx_paramAnnotations(owner, index)
+    }
 
     // A primary-constructor parameter with a default is exactly kotlinx's
     // notion of an optional element: a decoder may leave it absent.
-    override fun isElementOptional(index: Int): Boolean =
-        if (index < optionals.size) optionals[index] else false
+    override fun isElementOptional(index: Int): Boolean {
+        if (index < 0 || index >= names.size) throw IndexOutOfBoundsException("element $index of ${names.size}")
+        return if (index < optionals.size) optionals[index] else false
+    }
 
     // Name the element's real descriptor where the declared type maps to a
     // primitive. Anything else stays neutral rather than guessing: the
@@ -309,10 +329,33 @@ internal class ReflectiveDescriptor(
         if (index < elementClasses.size) {
             val cls = elementClasses[index]
             if (cls is KClass<*>) {
-                val s = __klsx_generatedSerializer(cls)
+                val s = __klsx_serializerForElementClass(cls)
                 if (s != null) {
                     val d = s.descriptor
                     return if (nullable) d.nullable else d
+                }
+            }
+        }
+        // A GENERIC class element (`stringBox: Box<String>`) reports the
+        // parametrized serializer's descriptor, so its own elements read
+        // the substituted argument types.
+        val lt = base.indexOf('<')
+        if (lt >= 0 && base.endsWith(">")) {
+            val head = base.substring(0, lt).substringAfterLast('.')
+            val cls = __klsx_classByName(head)
+            if (cls != null) {
+                val argSerializers = ArrayList<KSerializer<Any?>>()
+                var all = true
+                for (argName in splitTypeArgs(base.substring(lt + 1, base.length - 1))) {
+                    val argSer = serializerForDeclaredType(argName)
+                    if (argSer == null) { all = false } else { argSerializers.add(argSer) }
+                }
+                if (all && argSerializers.isNotEmpty()) {
+                    val s = __klsx_generatedSerializerGeneric(cls as KClass<*>, argSerializers)
+                    if (s != null) {
+                        val d = s.descriptor
+                        return if (nullable) d.nullable else d
+                    }
                 }
             }
         }
@@ -362,25 +405,110 @@ internal class ReflectiveDescriptor(
 // Map a rendered declared type (`"Int"`, `"String?"`) to the descriptor the
 // plugin would have named for that element. Unknown or generic types get the
 // neutral descriptor.
+// The serializer an ELEMENT declared as `kClass` reports. A plain enum class
+// serializes without opting in (kotlinc generates its serializer on demand),
+// so an unannotated enum takes the ungated reflective build.
+internal fun __klsx_serializerForElementClass(kClass: KClass<*>): KSerializer<Any>? {
+    val s = __klsx_generatedSerializer(kClass)
+    if (s != null) return s
+    if (__klsx_isEnum(kClass)) return __klsx_reflectiveSerializer(kClass)
+    return null
+}
+
+// Split `inner` on top-level commas: `String, Map<Int, Long>` keeps the
+// nested map's comma inside its own argument.
+private fun splitTypeArgs(inner: String): List<String> {
+    val out = ArrayList<String>()
+    var depth = 0
+    var start = 0
+    var i = 0
+    while (i < inner.length) {
+        val ch = inner[i]
+        if (ch == '<') depth = depth + 1
+        if (ch == '>') depth = depth - 1
+        if (ch == ',' && depth == 0) {
+            out.add(inner.substring(start, i).trim())
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out.add(inner.substring(start).trim())
+    return out
+}
+
+// A KSerializer for a rendered declared-type name, where one is nameable:
+// the primitives and resolvable user classes. Null when the name does not
+// pin a serializer (a type variable, a star, an unregistered head).
+@Suppress("UNCHECKED_CAST")
+internal fun serializerForDeclaredType(declared: String): KSerializer<Any?>? {
+    val base = declared.removeSuffix("?")
+    val s: KSerializer<*>? = when (base.substringAfterLast('.')) {
+        "Int" -> Int.serializer()
+        "Long" -> Long.serializer()
+        "Short" -> Short.serializer()
+        "Byte" -> Byte.serializer()
+        "Float" -> Float.serializer()
+        "Double" -> Double.serializer()
+        "Boolean" -> Boolean.serializer()
+        "Char" -> Char.serializer()
+        "String" -> String.serializer()
+        else -> {
+            val cls = __klsx_classByName(base.substringAfterLast('.'))
+            if (cls == null) null else __klsx_serializerForElementClass(cls as KClass<*>)
+        }
+    }
+    return s as KSerializer<Any?>?
+}
+
 internal fun descriptorForDeclaredType(declared: String): SerialDescriptor {
     val nullable = declared.endsWith("?")
     val base = if (nullable) declared.substring(0, declared.length - 1) else declared
+    // A generic collection type builds its structural descriptor around the
+    // recursively-described element type — `List<Int>` is a
+    // ListLikeDescriptor over Int's own primitive descriptor, exactly what
+    // the generated serializer would report.
+    val lt = base.indexOf('<')
+    if (lt >= 0 && base.endsWith(">")) {
+        val head = base.substring(0, lt).substringAfterLast('.')
+        val args = splitTypeArgs(base.substring(lt + 1, base.length - 1))
+        val built: SerialDescriptor? = when (head) {
+            "List", "MutableList", "ArrayList", "Collection", "MutableCollection", "Iterable" ->
+                if (args.size == 1) listSerialDescriptor(descriptorForDeclaredType(args[0])) else null
+            "Set", "MutableSet", "HashSet", "LinkedHashSet" ->
+                if (args.size == 1) setSerialDescriptor(descriptorForDeclaredType(args[0])) else null
+            "Map", "MutableMap", "HashMap", "LinkedHashMap" ->
+                if (args.size == 2) mapSerialDescriptor(
+                    descriptorForDeclaredType(args[0]),
+                    descriptorForDeclaredType(args[1])
+                ) else null
+            else -> null
+        }
+        if (built != null) return if (nullable) built.nullable else built
+    }
+    val simpleHead = (if (lt >= 0) base.substring(0, lt) else base).substringAfterLast('.')
     // The builtin serializers' own descriptors. Minting a fresh
     // `PrimitiveSerialDescriptor` here instead is rejected outright:
     // `checkNameIsNotAPrimitive` forbids reusing a primitive's serial name for
     // a new descriptor ("For serial name kotlin.String there already exists
     // StringSerializer"), so every element of a primitive type threw.
-    val d = when (base) {
-        "Int", "kotlin.Int" -> Int.serializer().descriptor
-        "Long", "kotlin.Long" -> Long.serializer().descriptor
-        "Short", "kotlin.Short" -> Short.serializer().descriptor
-        "Byte", "kotlin.Byte" -> Byte.serializer().descriptor
-        "Float", "kotlin.Float" -> Float.serializer().descriptor
-        "Double", "kotlin.Double" -> Double.serializer().descriptor
-        "Boolean", "kotlin.Boolean" -> Boolean.serializer().descriptor
-        "Char", "kotlin.Char" -> Char.serializer().descriptor
-        "String", "kotlin.String" -> String.serializer().descriptor
-        else -> return ReflectiveElementDescriptor
+    val d = when (simpleHead) {
+        "Int" -> Int.serializer().descriptor
+        "Long" -> Long.serializer().descriptor
+        "Short" -> Short.serializer().descriptor
+        "Byte" -> Byte.serializer().descriptor
+        "Float" -> Float.serializer().descriptor
+        "Double" -> Double.serializer().descriptor
+        "Boolean" -> Boolean.serializer().descriptor
+        "Char" -> Char.serializer().descriptor
+        "String" -> String.serializer().descriptor
+        else -> {
+            // A user `@Serializable` class element reports that class's own
+            // descriptor, resolved from the rendered name.
+            val cls = __klsx_classByName(simpleHead)
+            val s = if (cls == null) null else __klsx_serializerForElementClass(cls as KClass<*>)
+            if (s == null) return ReflectiveElementDescriptor
+            s.descriptor
+        }
     }
     return if (nullable) d.nullable else d
 }
@@ -515,7 +643,20 @@ public class ReflectiveKSerializer(
             }
         }
         ad.endStructure(descriptor)
-        val instance = __klsx_construct(kClass, args.subList(0, ctorNames.size))
+        // Named construction: only the DECODED constructor elements are
+        // bound; anything else (an undecoded optional, a `@Transient`
+        // parameter that is not an element at all) takes its default.
+        val boundNames = ArrayList<String>()
+        val boundValues = ArrayList<Any?>()
+        i = 0
+        while (i < ctorNames.size) {
+            if (seen[i]) {
+                boundNames.add(ctorNames[i])
+                boundValues.add(args[i])
+            }
+            i = i + 1
+        }
+        val instance = __klsx_constructNamed(kClass, boundNames, boundValues)
         var j = 0
         while (j < bodyNames.size) {
             val idx = ctorNames.size + j

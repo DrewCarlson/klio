@@ -69,7 +69,7 @@ the last measurement.
 
 | suite | passes | failures | opened at |
 |---|---|---|---|
-| serialization | 116 | 22 | 57 / 81 |
+| serialization | 124 | 14 | 57 / 81 |
 | datetime | 517 | 2 | 457 / 62 |
 | coroutines | 1269 | 30 | 1073 / 141 (+6 DNC) |
 | io | 1191 | 0 | 1182 / 9 |
@@ -1295,6 +1295,43 @@ The pieces:
 serialization 110 -> 116 net (8 fixed incl. both CustomPropertyAccessors,
 nullability + external-class lookups; 0 new). Guarded by
 `examples/serializable_body_properties.kt`.
+
+### Root: element descriptors stopped at the primitives
+
+`SchemaTest` 1 -> 6/7 and both `SerialDescriptorSpecificationTest` cases,
+five mechanisms:
+
+  * `descriptorForDeclaredType` now parses the rendered generic type:
+    `List<Int>` is a `ListLikeDescriptor` over Int's primitive descriptor
+    (built with `listSerialDescriptor`/`set`/`map`), recursively, and a
+    user-class head resolves through the new `__klsx_classByName`.
+  * A generic class element (`stringBox: Box<String>`) reports the
+    PARAMETRIZED serializer's descriptor: the type arguments' serializers
+    are minted from the rendered names and passed to
+    `__klsx_generatedSerializerGeneric`.
+  * A plain (unannotated) enum class still serializes — kotlinc generates
+    enum serializers on demand — so element resolution goes through
+    `__klsx_serializerForElementClass`, which falls to the ungated
+    reflective build for enums.
+  * `getElementIndex` answers `UNKNOWN_NAME` (-3), and the element
+    accessors throw `IndexOutOfBoundsException` out of range, per the
+    SerialDescriptor contract.
+  * A nested private object DELEGATING through a sibling nested object's
+    member (`object HolderDescriptor : SerialDescriptor by
+    StaticHolder.userDefinedHolderDescriptor`) resolved `StaticHolder`
+    globally and missed: the delegate thunk now lowers scoped to its class
+    (`lowerExprAsParamThunkScoped`), so the enclosing-class walk resolves
+    the sibling.
+
+### Root: `@Transient` constructor properties stayed elements
+
+kotlinc removes them from the whole surface. Every ctor-walk intrinsic now
+skips them (`ctorParamTransient`, all five anchors), and — since a skipped
+middle parameter breaks positional construction — `deserialize` constructs
+by NAME through a new `construct_named` host hook backed by
+`newInstanceNamed`, binding only the DECODED elements so every unbound
+parameter takes its declared default. Body-prop `@Transient` checks every
+anchor too (`@Target(PROPERTY)` resolution cannot be assumed).
 
 ### Root: a class literal answered the builtin of the same simple name
 

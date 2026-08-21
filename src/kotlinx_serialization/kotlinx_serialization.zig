@@ -87,6 +87,8 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     // serializer would have been synthesized from.
     try b.register("kotlinx.serialization.__klsx_isSerializable", isSerializable);
     try b.register("kotlinx.serialization.__klsx_customSerializer", customSerializer);
+    try b.register("kotlinx.serialization.__klsx_classByName", classByName);
+    try b.register("kotlinx.serialization.__klsx_constructNamed", constructNamed);
     try b.register("kotlinx.serialization.__klsx_isEnum", isEnumClass);
     try b.register("kotlinx.serialization.__klsx_enumValues", enumEntryValues);
     try b.register("kotlinx.serialization.__klsx_enumEntryAnnotations", enumEntryAnnotations);
@@ -164,6 +166,7 @@ fn valueToJson(v: *const Value, ctx: *CallCtx, tree: std.mem.Allocator) Error!Js
             var map: JsonObjectMap = .empty;
             for (cls.primary_params) |*p| {
                 if (p.property == null) continue;
+                if (ctorParamTransient(p)) continue;
                 const pv_r = try readProp(v, p.name, ctx);
                 const pv = switch (pv_r) {
                     .ok => |val| val,
@@ -584,6 +587,20 @@ fn propSetField(ctx: *CallCtx) Error!EvalResult {
     return ok(.Unit);
 }
 
+/// `@Transient` on a constructor property removes it from the whole
+/// serialization surface, descriptor included.
+fn ctorParamTransient(p: *const runtime.ClassParamDef) bool {
+    const anchor_sets = [_][]const runtime.AnnotationRecord{
+        p.anchors.property, p.anchors.field, p.anchors.param, p.anchors.get, p.anchors.set,
+    };
+    for (anchor_sets) |records| {
+        for (records) |*rec| {
+            if (rec.is("kotlinx.serialization.Transient") or rec.is("Transient")) return true;
+        }
+    }
+    return false;
+}
+
 fn serialFieldName(p: *const runtime.ClassParamDef) []const u8 {
     for (p.anchors.property) |*rec| {
         if (rec.is("kotlinx.serialization.SerialName") or rec.is("SerialName")) {
@@ -604,6 +621,7 @@ fn decodeObject(map: JsonObjectMap, cls_val: *const Value, ctx: *CallCtx) Error!
     var args: std.ArrayList(Value) = .empty;
     for (cls.primary_params) |*p| {
         if (p.property == null) continue;
+        if (ctorParamTransient(p)) continue;
         const shape: ?*const TypeShape = if (p.declared_shape) |*s| s else null;
         const v: Value = blk: {
             if (map.get(serialFieldName(p))) |jv| {
@@ -765,6 +783,50 @@ fn recIsSerializable(rec: *const runtime.AnnotationRecord) bool {
     return false;
 }
 
+/// Construct an instance binding only the NAMED parameters; every other
+/// constructor parameter takes its declared default. This is the generated
+/// deserializer's shape: a `@Transient` constructor property is not an
+/// element, and its default fills the slot.
+fn constructNamed(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len < 3) return typeErr("__klsx_constructNamed: expected (class, names, values)");
+    const cls_val = ctx.args[0];
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(ctx.allocator);
+    if (ctx.args[1] == .List) {
+        const g = ctx.args[1].List.items.borrow();
+        defer g.deinit();
+        for (g.get().items) |v| {
+            if (v != .String) return typeErr("__klsx_constructNamed: names must be strings");
+            const sg = v.String.borrow();
+            defer sg.deinit();
+            try names.append(ctx.allocator, try ctx.allocator.dupe(u8, sg.get().bytes));
+        }
+    }
+    var vals: std.ArrayList(Value) = .empty;
+    defer vals.deinit(ctx.allocator);
+    if (ctx.args[2] == .List) {
+        const g = ctx.args[2].List.items.borrow();
+        defer g.deinit();
+        try vals.appendSlice(ctx.allocator, g.get().items);
+    }
+    if (names.items.len != vals.items.len) return typeErr("__klsx_constructNamed: names/values length mismatch");
+    const r = try ctx.host.constructNamed(&cls_val, names.items, vals.items, ctx.out);
+    if (r) |res| return res;
+    return typeErr("__klsx_constructNamed: receiver is not a constructible class");
+}
+
+/// The registered class a bare name resolves to, or null. The rendered-type
+/// parser's inner names are strings; this is its way back to a declaration.
+fn classByName(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0 or ctx.args[0] != .String) return ok(.Null);
+    const ng = ctx.args[0].String.borrow();
+    const name = try ctx.allocator.dupe(u8, ng.get().bytes);
+    ng.deinit();
+    const v = ctx.host.lookupGlobal(name) orelse return ok(.Null);
+    if (v != .Class) return ok(.Null);
+    return ok(v);
+}
+
 /// Whether the class is an `enum class`.
 fn isEnumClass(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return ok(.{ .Bool = false });
@@ -808,6 +870,7 @@ fn ctorParamTypes(ctx: *CallCtx) Error!EvalResult {
     var items: std.ArrayList(Value) = .empty;
     for (cls_ref.asPtr().primary_params) |p| {
         if (p.property == null) continue;
+        if (ctorParamTransient(&p)) continue;
         var buf: std.ArrayList(u8) = .empty;
         if (p.declared_shape) |shape| {
             try renderShape(a, &buf, shape);
@@ -839,6 +902,7 @@ fn ctorParamClasses(ctx: *CallCtx) Error!EvalResult {
     var items: std.ArrayList(Value) = .empty;
     for (cls_ref.asPtr().primary_params) |p| {
         if (p.property == null) continue;
+        if (ctorParamTransient(&p)) continue;
         // The HEAD of the declared type: `List<Foo>` names `List`, which is
         // not itself a serializable declaration, so only a bare head resolves.
         const head: ?[]const u8 = if (p.declared_shape) |shape|
@@ -936,6 +1000,7 @@ fn ctorParamOptional(ctx: *CallCtx) Error!EvalResult {
     var items: std.ArrayList(Value) = .empty;
     for (cls_ref.asPtr().primary_params) |p| {
         if (p.property == null) continue;
+        if (ctorParamTransient(&p)) continue;
         try items.append(a, .{ .Bool = p.default != null });
     }
     return ok(try Value.newList(a, .{
@@ -959,6 +1024,7 @@ fn ctorParamNames(ctx: *CallCtx) Error!EvalResult {
     var items: std.ArrayList(Value) = .empty;
     for (cls.primary_params) |p| {
         if (p.property == null) continue;
+        if (ctorParamTransient(&p)) continue;
         try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, p.name)) });
     }
     return ok(try Value.newList(a, .{
@@ -1197,6 +1263,7 @@ fn paramAnnotations(ctx: *CallCtx) Error!EvalResult {
     var seen: i64 = 0;
     for (cls_ref.asPtr().primary_params) |*p| {
         if (p.property == null) continue;
+        if (ctorParamTransient(p)) continue;
         if (seen == want) return ok(try annotationInstanceList(ctx, p.anchors.property));
         seen += 1;
     }
@@ -1287,6 +1354,7 @@ fn ctorParamSerialNames(ctx: *CallCtx) Error!EvalResult {
     var items: std.ArrayList(Value) = .empty;
     for (cls.primary_params) |*p| {
         if (p.property == null) continue;
+        if (ctorParamTransient(p)) continue;
         try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, serialFieldName(p))) });
     }
     return ok(try Value.newList(a, .{
@@ -1741,7 +1809,7 @@ test "hostBindings registers every serialization symbol" {
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classSerialNameOverride") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_classAnnotations") != null);
     try testing.expect(b.resolve("kotlinx.serialization.__klsx_paramAnnotations") != null);
-    try testing.expectEqual(@as(usize, 24), b.len());
+    try testing.expectEqual(@as(usize, 26), b.len());
 }
 
 test "renderShape round-trips nullability and generic args" {
