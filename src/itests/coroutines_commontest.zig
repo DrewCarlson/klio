@@ -41,7 +41,11 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         // invariant, null channel elements). Measured on the gate:
         // 1192 passed, 52 failed, 6 did not complete.
         // 1070 -> 1105 alongside the ceiling below. Measured solo: 1110.
-        .baseline = 1185,
+        // 1185 -> 1198 and 58 -> 48 after null channel elements stopped
+        // reading as an empty iterator, a spliced inline extension started
+        // resolving against its own receiver, and the channel honoured
+        // `onUndeliveredElement`. Measured solo: 1203 passed, 45 failed.
+        .baseline = 1198,
         // Bound the red mass too: a floor alone cannot see a fixed case
         // traded for a broken one. Measured solo: 137 failing, 6 not
         // completing. Lower these as fixes land, never raise them.
@@ -56,7 +60,7 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         // whose initializer is an ordinary function call (`val flow =
         // flowOf(...)` beside the `flow { … }` builder). Measured solo: 1110
         // passed, 104 failed, 6 did not complete. Held two above.
-        .max_failed = 58,
+        .max_failed = 48,
         .max_incomplete = 8,
     });
 }
