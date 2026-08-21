@@ -736,6 +736,7 @@ fn isSerializable(ctx: *CallCtx) Error!EvalResult {
     for (cls_ref.asPtr().annotation_names) |n| {
         if (isSerializableAnnotation(n)) return ok(.{ .Bool = true });
     }
+    if (hasMetaSerializableAnnotation(ctx, cls_ref.asPtr())) return ok(.{ .Bool = true });
     return ok(.{ .Bool = false });
 }
 
@@ -1052,7 +1053,25 @@ fn annotationIsSerialInfo(cls: *const ClassDef) bool {
         if (std.mem.eql(u8, n, "kotlinx.serialization.SerialInfo") or
             std.mem.eql(u8, n, "SerialInfo") or
             std.mem.eql(u8, n, "kotlinx.serialization.InheritableSerialInfo") or
-            std.mem.eql(u8, n, "InheritableSerialInfo")) return true;
+            std.mem.eql(u8, n, "InheritableSerialInfo") or
+            std.mem.eql(u8, n, "kotlinx.serialization.MetaSerializable") or
+            std.mem.eql(u8, n, "MetaSerializable")) return true;
+    }
+    return false;
+}
+
+/// Whether the class's annotation set includes one whose own DECLARATION is
+/// `@MetaSerializable` — that marks the class serializable exactly as
+/// `@Serializable` does, and the plugin generates the same serializer.
+fn hasMetaSerializableAnnotation(ctx: *CallCtx, cls: *const ClassDef) bool {
+    for (cls.annotation_records) |*rec| {
+        const av = annotationClassValue(ctx, rec) orelse continue;
+        const acls = classOf(&av) orelse continue;
+        defer acls.deinit();
+        for (acls.asPtr().annotation_names) |n| {
+            if (std.mem.eql(u8, n, "kotlinx.serialization.MetaSerializable") or
+                std.mem.eql(u8, n, "MetaSerializable")) return true;
+        }
     }
     return false;
 }

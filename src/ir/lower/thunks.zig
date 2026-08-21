@@ -442,8 +442,11 @@ fn lowerAccessorExprFull(
         try b.setLocalDeclType("this", owner_class);
         for (typed) |p| {
             if (b.resolve(p.name) == null) continue;
-            try b.setLocalDeclType(p.name, p.ty.name);
-            if (p.ty.nullable) try b.setLocalDeclNullable(p.name);
+            // A `vararg names: String` parameter's VALUE is an Array; typing
+            // it by its element sent `names.toList()` in a property
+            // initializer to the CharSequence extension.
+            try b.setLocalDeclType(p.name, if (p.is_vararg) "Array" else p.ty.name);
+            if (p.ty.nullable and !p.is_vararg) try b.setLocalDeclNullable(p.name);
         }
     }
     const prev = b.pushExpected(expected);

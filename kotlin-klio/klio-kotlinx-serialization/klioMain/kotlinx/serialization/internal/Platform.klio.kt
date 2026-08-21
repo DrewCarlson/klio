@@ -57,8 +57,16 @@ internal actual fun KClass<*>.platformSpecificSerializerNotRegistered(): Nothing
 // type-erased through the reflective path, so the argument serializers add
 // nothing).
 @Suppress("UNCHECKED_CAST")
-internal actual fun <T : Any> KClass<T>.constructSerializerForGivenTypeArgs(vararg args: KSerializer<Any?>): KSerializer<T>? =
-    __klsx_generatedSerializer(this) as KSerializer<T>?
+internal actual fun <T : Any> KClass<T>.constructSerializerForGivenTypeArgs(vararg args: KSerializer<Any?>): KSerializer<T>? {
+    if (args.isEmpty()) {
+        @Suppress("UNCHECKED_CAST")
+        return __klsx_generatedSerializer(this) as KSerializer<T>?
+    }
+    val list = ArrayList<KSerializer<Any?>>()
+    for (a in args) list.add(a)
+    @Suppress("UNCHECKED_CAST")
+    return __klsx_generatedSerializerGeneric(this, list) as KSerializer<T>?
+}
 
 // klio's stand-in for the plugin-generated `Companion.serializer()`.
 @Suppress("UNCHECKED_CAST")
