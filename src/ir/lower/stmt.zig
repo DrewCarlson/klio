@@ -1067,6 +1067,82 @@ fn spliceReceiverHidesMember(b: *FuncBuilder, name: []const u8) bool {
     return true;
 }
 
+/// Heads that carry an element type for `+=` / `-=` purposes.
+fn containerHead(name: []const u8) bool {
+    const heads = [_][]const u8{
+        "List",           "MutableList",  "ArrayList",       "Collection",
+        "MutableCollection", "Iterable",  "Set",             "MutableSet",
+        "HashSet",        "LinkedHashSet", "Sequence",       "Array",
+    };
+    for (heads) |h| if (std.mem.eql(u8, name, h)) return true;
+    return false;
+}
+
+/// `xs += y` where `xs: MutableList<List<T>>` and `y: List<T>` appends ONE
+/// element: `plusAssign(element: T)` beats `plusAssign(elements: Iterable<T>)`
+/// because a `List<T>` is not an `Iterable<List<T>>`. The runtime decides on
+/// the argument's TAG alone and would flatten, so when the receiver's declared
+/// ELEMENT type is itself the container being added, name the single-element
+/// member directly. `y`'s own element type settles the ambiguity: a
+/// `List<List<T>>` really is the iterable form and keeps flattening.
+/// The declared type (with arguments) of a compound-assignment target: a
+/// local's annotation, or the owning class's property declaration when the
+/// target names a member bare or through an explicit receiver.
+fn declaredTargetTypeRef(b: *FuncBuilder, target: *const Expr) ?ast.TypeRef {
+    switch (target.*) {
+        .Path => |pth| {
+            if (pth.segments.len != 1) return null;
+            const nm = pth.segments[0].name;
+            if (b.localAstTy(nm)) |t| return t.*;
+            if (b.resolve(nm) != null or b.knowsOuter(nm)) return null;
+            const owner = b.ownerClass() orelse return null;
+            const prop = @import("inline_state.zig").memberPropAst(owner, nm) orelse return null;
+            return prop.ty;
+        },
+        .Member => |m| {
+            if (m.safe) return null;
+            var rty = (expr_mod.staticExprTypeRef(b, m.receiver) catch null) orelse return null;
+            defer rty.deinit(b.allocator);
+            const head = expr_mod.typeHead(std.mem.trimEnd(u8, rty.name, "?"));
+            const prop = @import("inline_state.zig").memberPropAst(head, m.name.name) orelse return null;
+            return prop.ty;
+        },
+        else => return null,
+    }
+}
+
+fn compoundSingleElementMember(
+    b: *FuncBuilder,
+    target: *const Expr,
+    value: *const Expr,
+    op: ast.AssignOp,
+) Allocator.Error!?[]const u8 {
+    const member: []const u8 = switch (op) {
+        .Add => "add",
+        .Sub => "remove",
+        else => return null,
+    };
+    // The receiver's DECLARED type, with its arguments: a local's annotation,
+    // or the owning class's property declaration for `field += y` /
+    // `this.field += y`. The static deriver answers heads without arguments
+    // for a member, which is exactly the fact this rule needs.
+    const decl_ty: ast.TypeRef = (declaredTargetTypeRef(b, target) orelse return null);
+    if (decl_ty.type_args.len != 1 or decl_ty.type_args[0].is_star) return null;
+    if (!containerHead(expr_mod.typeHead(decl_ty.name.name))) return null;
+    const elem_head = expr_mod.typeHead(decl_ty.type_args[0].ty.name.name);
+    if (!containerHead(elem_head)) return null;
+
+    var val_ty = (expr_mod.staticExprTypeRef(b, value) catch null) orelse return null;
+    defer val_ty.deinit(b.allocator);
+    const val_head = expr_mod.typeHead(std.mem.trimEnd(u8, val_ty.name, "?"));
+    if (!containerHead(val_head)) return null;
+    // A value whose OWN element type is the receiver's element type is the
+    // iterable form (`MutableList<List<T>> += listOf(listOf(t))`).
+    if (val_ty.args.len == 1 and
+        std.mem.eql(u8, expr_mod.typeHead(std.mem.trimEnd(u8, val_ty.args[0].name, "?")), elem_head)) return null;
+    return member;
+}
+
 fn lowerAssign(
     b: *FuncBuilder,
     target: *const Expr,
@@ -1102,6 +1178,29 @@ fn lowerAssign(
     const prev_expected = if (assign_expected != null) b.pushExpected(assign_expected) else null;
     const v = try lowerExpr(b, value);
     if (assign_expected != null) b.restoreExpected(prev_expected);
+    // `xs += y` where the DECLARED element type is itself the container being
+    // added is a single-element `add`, not a flattening `addAll`. Every route
+    // below (the `<op>Assign` member call, `CompoundField`, the compound
+    // `BinOp`) decides on the argument's runtime TAG alone, so settle it here
+    // where the declared types are still in hand.
+    if (op == .Add or op == .Sub) {
+        if (try compoundSingleElementMember(b, target, value, op)) |single| {
+            const cur = try lowerExpr(b, target);
+            const args_start = b.allocReg();
+            try b.push(.{ .Move = .{ .dst = args_start, .src = v } });
+            const dst = b.allocReg();
+            const nm = try b.module.internConst(b.allocator, .{ .String = single });
+            try b.push(.{ .CallMember = .{
+                .dst = dst,
+                .receiver = cur,
+                .name = nm,
+                .args = args_start,
+                .n_args = 1,
+                .arg_names = &.{},
+            } });
+            return null;
+        }
+    }
     // Compound assigns first try `<op>Assign` as a member
     // call on the target — covers user types declaring
     // `operator fun plusAssign(...)` and built-in mutable

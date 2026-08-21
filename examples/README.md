@@ -160,6 +160,7 @@ Run any program with:
 | `generic_class_type_param_dispatch.kt` | A method param typed as a full-word CLASS type parameter (`put(key: Key)` on `Store<Key, Value>`) accepts any argument even when an unrelated class named `Key` exists. |
 | `nested_class_name_collision.kt` | Two nested classes sharing a simple name under different outers keep distinct identities and enclosing-companion scopes. |
 | `nested_class_reference.kt` | A private nested class reached from inside a lambda in its declaring class: construction, `Type::member` references, and use as a declared type all bind the same declaration. |
+| `compound_assign_nested_container.kt` | `xs += y` on a `MutableList<List<T>>` appends one element, not `y`'s items; a list OF the element type still flattens, and the flat-list split is unchanged. |
 | `comparable_natural_order.kt` | A user `Comparable` participates in every natural-order path: operators, list and sequence sorts, key selectors, `min`/`max`, `coerceIn`, `compareValues` and ranges. |
 | `time_zone_id_forms.kt` | Every written form of a fixed offset (`+4`, `+04:00`, `UTC+4`, `GMT+04:00:00`) resolves to one offset while keeping distinct zone ids; parsing the same offset twice yields the same instance; malformed ids are rejected. |
 | `dst_local_time_mapping.kt` | A repeated local hour maps to its first pass and a missing one to the pre-gap offset, while each instant still has exactly one local time. |
