@@ -1,20 +1,21 @@
-import kotlin.test.*
+class Src(val n: Int)
 
-internal inline fun <reified T : Throwable> shouldFail(
-    sinceKotlin: String? = null,
-    beforeKotlin: String? = null,
-    onJvm: Boolean = true,
-    onJs: Boolean = true,
-    test: () -> Unit
-) {
-    var error: Throwable? = null
-    try { test() } catch (e: Throwable) { error = e }
-    println("  shouldFail<${T::class.simpleName}> since=$sinceKotlin before=$beforeKotlin jvm=$onJvm js=$onJs err=${error != null}")
+inline fun Src.eachInline(action: (Int) -> Unit) { for (i in 0 until n) action(i) }
+fun Src.eachPlain(action: (Int) -> Unit) { for (i in 0 until n) action(i) }
+
+fun Src.collectInline(): List<Int> = buildList { eachInline(::add) }
+fun Src.collectPlain(): List<Int> = buildList { eachPlain(::add) }
+fun Src.collectInlineLambda(): List<Int> = buildList { eachInline { add(it) } }
+
+class Holder(val n: Int) {
+    inline fun eachInline(block: (Int) -> Unit) { for (i in 0 until n) block(i) }
+    fun f(): String { val sb = StringBuilder(); with(sb) { eachInline { sb.append(it) } }; return sb.toString() }
 }
 
 fun main() {
-    shouldFail<AssertionError>(beforeKotlin = "2.0.0", onJvm = true, onJs = false) {
-        throw AssertionError("boom")
-    }
-    shouldFail<IllegalStateException> { }
+    val s = Src(3)
+    println(s.collectPlain())
+    println(s.collectInlineLambda())
+    println(s.collectInline())
+    println(Holder(3).f())
 }

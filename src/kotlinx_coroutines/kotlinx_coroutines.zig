@@ -1667,12 +1667,12 @@ fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         else => return .{ .err = .{ .Type = "hasNext: bad receiver" } },
     };
     // Already have a cached pending value? Report true without touching
-    // the channel.
-    if (iter_inst.asPtr().get("__pending__")) |c| {
-        if (c != .Null) {
-            try setIteratorNextState(iter_inst, .value_ready);
-            return .{ .ok = .{ .Bool = true } };
-        }
+    // the channel. The ITERATOR STATE is what says a value is cached, not
+    // the field's contents: `Channel<Int?>` delivers real nulls, and
+    // reading the field as the sentinel dropped every null element back
+    // onto the channel (`listOf(flowOf(1), flowOf(null)).merge()`).
+    if (iteratorNextState(iter_inst) == .value_ready) {
+        return .{ .ok = .{ .Bool = true } };
     }
     // Try a synchronous pull. If the buffer holds a value, cache it and
     // return true; if the channel is drained-and-closed, return false;
@@ -1758,11 +1758,10 @@ fn channelIterNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     switch (iteratorNextState(inst)) {
         .needs_has_next => return channelIllegalState(ctx, "`hasNext()` has not been invoked"),
         .value_ready => {
+            // A null element is a value like any other on a `Channel<T?>`;
+            // only a MISSING field means `hasNext()` produced nothing.
             const value = inst.asPtr().get("__pending__") orelse
                 return channelIllegalState(ctx, "`hasNext()` has not produced an element");
-            if (value == .Null) {
-                return channelIllegalState(ctx, "`hasNext()` has not produced an element");
-            }
             try inst.asPtr().define(regAllocator(), "__pending__", .Null);
             try setIteratorNextState(inst, .needs_has_next);
             return .{ .ok = value };

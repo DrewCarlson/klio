@@ -1,20 +1,21 @@
-internal inline fun <reified T : Throwable> shouldFail(
-    sinceKotlin: String? = null,
-    beforeKotlin: String? = null,
-    onJvm: Boolean = true,
-    onJs: Boolean = true,
-    onNative: Boolean = true,
-    onWasm: Boolean = true,
-    test: () -> Unit
-) {
-    var error: Throwable? = null
-    try { test() } catch (e: Throwable) { error = e }
-    println("  <${T::class.simpleName}> before=$beforeKotlin jvm=$onJvm js=$onJs native=$onNative wasm=$onWasm err=${error != null}")
+import kotlinx.coroutines.*
+import kotlin.coroutines.coroutineContext
+
+class Src(val n: Int)
+
+suspend inline fun Src.eachSuspendInline(action: (Int) -> Unit) {
+    val hasJob = coroutineContext[Job] != null
+    for (i in 0 until n) action(i)
+    if (!hasJob) throw IllegalStateException("no job")
 }
 
-fun main() {
-    // declaration order
-    shouldFail<AssertionError>(beforeKotlin = "2.0.0", onJvm = true, onJs = false, onNative = false, onWasm = false) { }
-    // reordered backwards
-    shouldFail<AssertionError>(beforeKotlin = "2.0.0", onJvm = true, onWasm = false, onNative = false, onJs = false) { }
+suspend fun Src.collect1(): List<Int> = buildList { eachSuspendInline(::add) }
+suspend fun Src.collect2(): List<Int> = buildList { eachSuspendInline { add(it) } }
+suspend fun Src.collect3(): List<Int> = buildList { this@collect3.eachSuspendInline(::add) }
+
+fun main() = runBlocking {
+    val s = Src(3)
+    println(s.collect2())
+    println(s.collect3())
+    println(s.collect1())
 }
