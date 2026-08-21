@@ -1089,6 +1089,78 @@ Datetime census 484/35 at the start of this campaign -> 517 passed, 2
 failed. The two left are `DateTimeComponents` shapes: a `set` on
 `PropertyAndItsValue` and a `monthNumber` read on the companion.
 
+### Fixed: ktor's own `Char.isLowerCase` was not packed
+
+`URLProtocol`'s scheme check calls `it.isLowerCase()` against ktor's own
+`io.ktor.util` extension — `lowercaseChar() == this`, which accepts digits
+and punctuation — but `io/ktor/util/Charset.kt` was not in the pack's
+include list, so the call fell to the stdlib's letter-only one and every
+scheme with a digit or `.+-` was rejected. Ktor census 448/2 -> 450/0
+(`WriterReaderTest.testWriterOnCancelled` still flakes under a loaded
+census; it passes six times out of six solo).
+
+### Fixed: `+=` on a nested container adds one element
+
+`MutableCollection<in T>.plusAssign` has an element form and an iterable
+form, and Kotlin picks by the receiver's declared ELEMENT type: a
+`MutableList<List<T>>` takes a `List<T>` as ONE element, because a
+`List<T>` is not an `Iterable<List<T>>`. Every klio route — the
+`<op>Assign` member call, `CompoundField`, the compound `BinOp` — decided
+on the argument's runtime TAG alone and flattened, so
+`buildClassSerialDescriptor { element(...) }` produced a descriptor whose
+per-element annotation lists were empty and whose reads went out of
+bounds. Settled at the assignment's lowering, where the declared types are
+in hand; a value whose own element type IS the receiver's keeps
+flattening.
+
+### Fixed: a spliced inline extension resolves against its own receiver
+
+Inside an inline splice the frame's `recv_ty` is the CALLER's, so a
+spliced extension body resolved its bare calls with no receiver at all and
+lost its own receiver's extensions: `serializer(typeOf<T>())` inside
+`SerializersModule.serializer()` bound the module-less overload and every
+contextual lookup through it reported the class as not serializable. The
+splice already carries the spliced declaration's receiver on its own
+channel (`spliceRecvTy`, deliberately separate from `recv_ty`); the
+bare-call resolution context now consults it when the frame has none.
+Serialization census 94 -> 98.
+
+Still open in the same family: a lambda NESTED in a spliced inline
+extension body still loses the receiver
+(`inline fun R.f(xs) = xs.map { bare(it) }` binds the global where the
+non-inline sibling binds `R`'s extension). Setting
+`pending_lambda_enclosing_recv` from `spliceRecvTy` was tried and changed
+nothing, so the lambda builder takes the receiver from another channel —
+the receiver TOWER is the next place to look.
+
+### Open: `contextual(kClass, serializer)` binds the provider overload
+
+`SerializersModule + SerializersModule` throws
+`SerializerAlreadyRegisteredException` for two modules holding the SAME
+serializer. Established by instrumenting the pack sources:
+
+  * both modules really hold `ContextualProvider.Argless` — the builder's
+    Argless override runs for the original registrations;
+  * `dumpTo`'s `when (serial) { is Argless -> ... }` takes the right
+    branch, and `serial.serializer` really is the ReflectiveKSerializer
+    (printed from a `val` in the branch);
+  * yet `collector.contextual(kclass as KClass<Any>, ser0 as
+    KSerializer<Any>)` runs the PROVIDER override — traced by a print
+    inside each override — so the argument arrives SAM-wrapped as an
+    `IrClosure` and the aggregate holds two `WithTypeArguments`, which have
+    no `equals` and collide.
+
+The pick is over the receiver's DECLARED type (`SerializersModuleCollector`),
+where the KSerializer form is a defaulted interface method and the provider
+form is abstract. Nine reductions of that shape all resolve CORRECTLY:
+concrete-typed receiver, interface-typed receiver, split across files,
+inside a `forEach` with a destructured pair, with `as` casts on both
+arguments, with a star-projected argument, with the provider override
+declared first, through a generic interface hierarchy, and with a
+same-named top-level function in scope. Whatever separates the real case
+is not in that list; the next step is to instrument the member overload
+scorer for this call rather than reduce further.
+
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 
 7 failures read `bufferEnd` on `KlioBufferedChannel`. The tests cast the

@@ -11,9 +11,14 @@ class Builder : Collector {
     override fun <T : Any> reg(k: String, provider: (List<Ser<*>>) -> Ser<*>) { out.add("provider:$k") }
 }
 
+fun dump(c: Collector) {
+    c.reg("via-iface", Ser<Int>("s"))
+}
+
 fun main() {
     val b = Builder()
     b.reg("a", Ser<Int>("s"))
     b.reg("b") { Ser<Int>("t") }
+    dump(b)
     println(b.out)
 }
