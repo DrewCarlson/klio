@@ -21,6 +21,7 @@ const host_globals = @import("host_globals.zig");
 const intrinsic_host = @import("intrinsic_host.zig");
 const overload_match = @import("overload_match.zig");
 const compose = @import("compose.zig");
+const host_instances = @import("host_instances.zig");
 
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -1380,6 +1381,43 @@ fn missingActual(allocator: Allocator, f: *const Func) EvalResult {
             "Run `klio check --unimplemented <file>` to list every unimplemented declaration this program reaches.",
         .{f.fqn},
     ) };
+}
+
+/// Direct-mapped memo of "which parameters of this func take a `fun
+/// interface`", as a bitmask over the first 32 parameters. Consulted on every
+/// activation, so the cost of a miss (a class-table probe per parameter) is
+/// paid once per function, and the overwhelmingly common answer — zero — is a
+/// single comparison thereafter.
+const SamMaskEntry = struct { func_p: usize = 0, mask: u32 = 0, valid: bool = false };
+threadlocal var sam_mask_cache: [1024]SamMaskEntry = @splat(.{});
+
+fn samParamMask(self: *VmHost, func: *const ir.Func) u32 {
+    const key = @intFromPtr(func);
+    const slot = &sam_mask_cache[(key >> 4) % sam_mask_cache.len];
+    if (slot.valid and slot.func_p == key) return slot.mask;
+    var mask: u32 = 0;
+    for (func.params, 0..) |*p, i| {
+        if (i >= 32) break;
+        if (p.is_vararg) continue;
+        if (host_instances.paramTypeIsFunInterface(self, p.ty.name)) mask |= @as(u32, 1) << @intCast(i);
+    }
+    slot.* = .{ .func_p = key, .mask = mask, .valid = true };
+    return mask;
+}
+
+/// Kotlin converts a lambda to a `fun interface` at the CALL boundary, so the
+/// callee's parameter holds an instance of the interface — a bare extension on
+/// it applies, and `is Iface` answers true. Convert in place at activation
+/// setup, which is the one point every call shape passes through. The
+/// argument's reference moves into the wrapper.
+pub fn samConvertActivationArgs(self: *VmHost, allocator: Allocator, func: *const ir.Func, args: []Value) Allocator.Error!void {
+    const mask = samParamMask(self, func);
+    if (mask == 0) return;
+    for (args, 0..) |*a, i| {
+        if (i >= 32 or a.* != .IrClosure) continue;
+        if (mask & (@as(u32, 1) << @intCast(i)) == 0) continue;
+        if (try host_instances.samWrapForParamType(self, allocator, a, func.params[i].ty.name)) |w| a.* = w;
+    }
 }
 
 pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args_in: []const Value) Allocator.Error!EvalResult {

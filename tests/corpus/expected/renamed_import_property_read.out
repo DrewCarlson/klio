@@ -1,0 +1,7 @@
+property = true
+function = 7
+member   = mine
+aliasIn  = 3
+inLambda = [1, 2]
+scoped   = on/4
+agrees   = true

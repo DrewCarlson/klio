@@ -3800,6 +3800,12 @@ pub fn evalWithCapturesChained(
     const ev: *EvalTls = &evtls;
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);
+    // Kotlin's SAM conversion happens at the CALL boundary: a lambda bound to
+    // a `fun interface` parameter arrives as an instance of that interface.
+    // Activation setup is the one point every call shape passes through.
+    if (comptime @hasDecl(H, "samConvertActivationArgs")) {
+        try host.samConvertActivationArgs(allocator, func, args.items);
+    }
     var frame = try Frame.newWithCaptures(ev, allocator, module, func, args, captures);
     frame.closure_id = closure_id;
     defer frame.deinit();
@@ -4331,6 +4337,11 @@ fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const 
     boolThisTrap(req.func, req.args.items);
     const module = req.run_module orelse caller_module;
     dumpFnIfRequested(module, req.func);
+    // SAM conversion at the call boundary, as `evalWithCapturesChained` does
+    // for the recursive path — the flat activation is the other way in.
+    if (comptime @hasDecl(H, "samConvertActivationArgs")) {
+        try host.samConvertActivationArgs(allocator, req.func, req.args.items);
+    }
     const act = try actAlloc(ev, allocator);
     errdefer actFree(ev, allocator, act);
     act.* = .{
