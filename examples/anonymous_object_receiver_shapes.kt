@@ -10,8 +10,8 @@ interface Sized { val count: Int }
 
 class Stored(n: Int) : Sized { override val count = n }
 
-class Computed(names: List<String>) : Sized {
-    val items = names
+class Computed(vararg names: String) : Sized {
+    val items = names.toList()
     override val count: Int
         get() = items.size
 }
@@ -29,10 +29,10 @@ fun main() {
     // Stored first: the site is built under the backing-field receiver, and
     // the getter receiver must still initialize through the member read.
     println("stored   = " + Stored(3).indices.toList())
-    println("computed = " + Computed(listOf("a", "b")).indices.toList())
+    println("computed = " + Computed("a", "b").indices.toList())
     println("again    = " + Stored(1).indices.toList())
 
     // A meta-annotated shape of the same bug: the enum entries under each.
-    val meta = listOf(Stored(2), Computed(listOf("x", "y", "z"))).map { it.indices.toList().size }
+    val meta = listOf(Stored(2), Computed("x", "y", "z")).map { it.indices.toList().size }
     println("mixed    = " + meta)
 }

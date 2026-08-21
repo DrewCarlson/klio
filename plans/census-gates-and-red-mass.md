@@ -1380,9 +1380,16 @@ had no type-argument substitutions (`Box<SealedI>`'s `boxed` element read
 CLASS instead of SEALED). It now routes through
 `__klsx_generatedSerializerGeneric` when arguments are present.
 
-serialization 124 -> 132 across these four. OPEN (noted in passing): a
-`vararg names: String` parameter's `.toList()` dies with `get_field length
-on kotlin.Array` — untriaged.
+serialization 124 -> 132 across these four.
+
+### Root: a vararg ctor param typed as its ELEMENT in property inits
+
+`class C(vararg names: String) { val items = names.toList() }` died with
+`get_field length on kotlin.Array`: the property-init thunk's declared-type
+seed recorded `names: String`, so `toList()` picked the CharSequence
+extension. A vararg parameter's VALUE is an Array; the seed now types it
+so. Exercised by `examples/anonymous_object_receiver_shapes.kt`'s
+`Computed(vararg names: String)`.
 
 ### Root: a class literal answered the builtin of the same simple name
 
