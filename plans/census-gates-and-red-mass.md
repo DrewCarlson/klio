@@ -1223,6 +1223,52 @@ ready-queue check then sends the resume behind the timer that just came due
 — fixes it. All four files go fully green: census 1204 -> 1259 passed,
 44 -> 40 failed, 6 -> 2 incomplete, and the 300s child timeouts are gone.
 
+### Fixed: four more coroutine roots
+
+- **A vararg sibling wins when the container parameter is disproved.** The
+  inline-target index resolves by NAME and ARITY, and
+  `combine(vararg flows: Flow<T>, transform)` and
+  `combine(flows: Iterable<Flow<T>>, transform)` are both arity 2. A single
+  `Flow` argument only fits the vararg one, but the index cannot see that,
+  so the container overload was spliced and its body iterated the flow
+  itself. Census +2.
+- **Non-callable evidence follows a local's static TYPE.** It was recorded
+  only for a literal initializer or a definite non-function annotation, so
+  `val flow = flowOf(1, 2)` still swallowed the next `flow { … }` — and,
+  because that evidence set is what nested lambdas inherit, so did every
+  capture of it. Derived from the initializer's static type now (a class
+  declaring no `invoke`, no `invoke` extension applicable), gated on a
+  same-named bare-call candidate existing. Census +4 across
+  `CancellableTest` and `FlatMapLatestTest`.
+- **A run with no matching cases prints its summary.** A file whose only
+  `@Test` methods live on an ABSTRACT class contributes no cases but DID
+  run; printing just "no tests found" left the harness scoring it as a
+  child that never reported. Incomplete 2 -> 0.
+- **A bound callable reference names its function supertypes.**
+  `receiver::method` built a synthetic instance whose class named no
+  supertypes, so `is Function0<*>` was false.
+
+### Open: a member call on a bound reference invokes it
+
+`s::produce` is a `$bound_ref$produce` synthetic instance. A member call on
+it that is not `invoke` — `f.asFlow()`, or any extension declared on a
+function type — returns the BOUND METHOD's result instead of binding the
+extension: `(() -> T).asFlow()` on `source::produce` yields an `Int`, so
+`FlowOnTest`'s three cases die on `flowOn`/`size` over a `kotlin.Int`.
+
+Established: the value really is the synthetic instance (it invokes
+correctly, and now answers `is Function0<*>` after the supertypes landed);
+`callMemberInnerStatic` IS entered with the extension's name; and the
+extension fallback is never reached (`[extfb]` silent under
+`KLIO_MISS_TRACE`), so an arm between the two returns the invoke result.
+The `.IrClosure`-gated SAM-direct arm in `callMember` is NOT it (a bound
+ref is an Instance), and neither is the `__sam_target__` slot path.
+Instrumenting every `return` in `callMemberInnerStatic` produced no hit,
+so the arm returns through a form the naive scan missed (a multi-line
+`return switch`, an `orelse return`, or a same-line `if (…) return`). Next
+step is a shim around `callMemberInnerStatic` that logs its result, then
+bisecting inward.
+
 ### Open: `BufferedChannelTest` reaches into upstream's channel internals
 
 7 failures read `bufferEnd` on `KlioBufferedChannel`. The tests cast the
