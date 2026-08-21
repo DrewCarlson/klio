@@ -47,6 +47,13 @@ fun main() {
         println("property initializer      : " + make { 7 } + " / local " + make)
     }
 
+    // The evidence survives into a nested lambda that CAPTURES the local.
+    run {
+        val make = produce()
+        val nested = listOf(1).map { make { 7 }.n }
+        println("captured in a lambda      : " + nested.first() + " / local " + make)
+    }
+
     // A local whose type declares `invoke` still answers the call itself.
     val makeCallable = makeCallable()
     println("invoke operator wins      : " + makeCallable(5))

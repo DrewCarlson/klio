@@ -410,7 +410,20 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         switch (e.*) {
             .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate => try b.markNonFnLocal(p.name.name),
             .Lambda, .AnonFun => b.clearNonFnLocal(p.name.name),
-            else => {},
+            else => {
+                // Any initializer whose static TYPE is a class with no
+                // `invoke` is non-callable evidence too, whatever its shape:
+                // `val flow = flowOf(1, 2)` beside the `flow { … }` builder
+                // must leave the builder reachable, including from a nested
+                // lambda that captures the local. Gated on a same-named
+                // bare-call candidate existing, so the derivation runs only
+                // where the answer can matter.
+                if (b.module.hasBareCallCandidate(p.name.name, p.name.span.file) and
+                    try initTypeIsNonInvokable(b, e))
+                {
+                    try b.markNonFnLocal(p.name.name);
+                }
+            },
         }
     }
     // Keep the source annotation for later plain assignments to this name:
@@ -1141,6 +1154,24 @@ fn compoundSingleElementMember(
     if (val_ty.args.len == 1 and
         std.mem.eql(u8, expr_mod.typeHead(std.mem.trimEnd(u8, val_ty.args[0].name, "?")), elem_head)) return null;
     return member;
+}
+
+/// Whether an initializer's static type is a class that can never take a
+/// call: it declares no `invoke` member and no `invoke` extension applies.
+fn initTypeIsNonInvokable(b: *FuncBuilder, e: *const Expr) Allocator.Error!bool {
+    var ty = (expr_mod.staticExprTypeRef(b, e) catch null) orelse return false;
+    defer ty.deinit(b.allocator);
+    const head = expr_mod.typeHead(std.mem.trimEnd(u8, ty.name, "?"));
+    if (head.len == 0) return false;
+    if (std.mem.startsWith(u8, head, "Function")) return false;
+    if (std.mem.eql(u8, head, "<function>")) return false;
+    const cid = b.module.uniqueClassIdBySimpleName(head) orelse b.module.classId(head) orelse return false;
+    if (cid.int() >= b.module.classes.items.len) return false;
+    const cls = &b.module.classes.items[cid.int()];
+    const methods = b.module.registry.hierarchy_methods.get(cls.name) orelse
+        b.module.registry.hierarchy_methods.get(cls.fqn) orelse return false;
+    if (methods.contains("invoke")) return false;
+    return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", 1) == .none;
 }
 
 fn lowerAssign(

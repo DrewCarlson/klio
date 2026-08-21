@@ -3,4 +3,5 @@ name reads the local      : Holder(1)
 before and after agree    : true
 member-call initializer   : Holder(7) / local Holder(2)
 property initializer      : Holder(7) / local Holder(99)
+captured in a lambda      : 7 / local Holder(1)
 invoke operator wins      : 15
