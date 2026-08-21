@@ -304,6 +304,10 @@ def main():
     targets = [p for p in all_kt if has_test(p)]
     for d in cfg["extra_support"] + args.extra_support:
         support += collect_kt(d)
+    # The provider closure is computed over EVERY target: `--filter` narrows
+    # what RUNS, not what a run compiles against, so a helper declared in a
+    # filtered-out file is still pulled in.
+    all_targets = list(targets)
     if args.filter:
         targets = [t for t in targets if args.filter in t]
 
@@ -312,14 +316,15 @@ def main():
     results, n_pass, n_fail, incomplete = [], 0, 0, 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         whole = targets if cfg["whole_source_set"] else None
-        scans = [decl_scan(t) for t in targets]
+        scans = [decl_scan(t) for t in all_targets]
         owner = collections.defaultdict(list)
         for i, (pkg, _scopes, declares, _) in enumerate(scans):
             for d in declares:
                 owner[(pkg, d)].append(i)
+        index_of = {t: i for i, t in enumerate(all_targets)}
         futs = [pool.submit(run_target, t, support, env, args.timeout, whole,
-                            [targets[b] for b in provider_closure(scans, owner, i)])
-                for i, t in enumerate(targets)]
+                            [all_targets[b] for b in provider_closure(scans, owner, index_of[t])])
+                for t in targets]
         for f in concurrent.futures.as_completed(futs):
             target, passed, failed, inc, err = f.result()
             n_pass += len(passed)
