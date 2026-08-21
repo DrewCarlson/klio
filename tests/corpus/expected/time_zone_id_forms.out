@@ -1,0 +1,19 @@
++4 -> id=+04:00 offset=+04:00
++04 -> id=+04:00 offset=+04:00
++04:00 -> id=+04:00 offset=+04:00
++0400 -> id=+04:00 offset=+04:00
+UTC+4 -> id=UTC+04:00 offset=+04:00
+UT+04 -> id=UT+04:00 offset=+04:00
+GMT+04:00:00 -> id=GMT+04:00 offset=+04:00
+offsets distinct = 1
+ids distinct     = 4
++0  -> Z
+UTC -> UTC
+GMT -> GMT
+region fixed = false id=Europe/Paris
+accepts UTC+ = false
+accepts + = false
+accepts X = false
+accepts +4:0 = false
+accepts +99 = false
+accepts Nowhere/Nowhere = false

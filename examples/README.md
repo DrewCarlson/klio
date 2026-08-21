@@ -160,6 +160,7 @@ Run any program with:
 | `generic_class_type_param_dispatch.kt` | A method param typed as a full-word CLASS type parameter (`put(key: Key)` on `Store<Key, Value>`) accepts any argument even when an unrelated class named `Key` exists. |
 | `nested_class_name_collision.kt` | Two nested classes sharing a simple name under different outers keep distinct identities and enclosing-companion scopes. |
 | `nested_class_reference.kt` | A private nested class reached from inside a lambda in its declaring class: construction, `Type::member` references, and use as a declared type all bind the same declaration. |
+| `time_zone_id_forms.kt` | Every written form of a fixed offset (`+4`, `+04:00`, `UTC+4`, `GMT+04:00:00`) resolves to one offset while keeping distinct zone ids; malformed ids are rejected. |
 | `dst_local_time_mapping.kt` | A repeated local hour maps to its first pass and a missing one to the pre-gap offset, while each instant still has exactly one local time. |
 | `iso_extended_year_dates.kt` | ISO-8601 dates outside 0000..9999 carry an explicit sign and any zero padding; parse and `toString` are inverses across the range and reject an unsigned wide year. |
 | `channel_null_elements.kt` | A `Channel<T?>` delivers null elements through the for-loop iterator, `consumeEach`, `receive` and `tryReceive`, and an all-null channel still terminates on close. |

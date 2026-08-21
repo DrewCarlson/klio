@@ -725,6 +725,10 @@ internal fun parseOffsetSecondsOrNull(body: String): Int? {
         if (parts.size == 3) sec = twoDigits(parts[2]) ?: return null
     } else {
         when (rest.length) {
+            // `+4` / `-9`: a single-digit hour is a zone id in its own right
+            // (`TimeZone.of("UTC+4")`), distinct from the ISO offset grammar
+            // `UtcOffset.parse` accepts.
+            1 -> h = if (rest[0] in '0'..'9') rest[0] - '0' else return null
             2 -> h = twoDigits(rest) ?: return null
             4 -> { h = twoDigits(rest.substring(0, 2)) ?: return null; m = twoDigits(rest.substring(2)) ?: return null }
             6 -> {
