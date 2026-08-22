@@ -27,7 +27,7 @@ int klio_rt_run_image(const char *base_image, const char *path);
  * requires the per-op helpers instead. */
 typedef struct {
   uint32_t value_size, tag_off, tag_size, int_off, long_off, bool_off;
-  uint64_t tag_int, tag_long, tag_bool;
+  uint64_t tag_int, tag_long, tag_bool, tag_unit;
   uint8_t usable;
   /* Frame cur_span (?Span) layout for the inlined trace store;
    * span_usable == 0 keeps traces on the klio_op_trace helper. */

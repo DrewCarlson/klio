@@ -177,6 +177,35 @@ standalone binary.
       the milestone delivers total-coverage AOT C with exact interpreter
       semantics and byte parity, NOT yet a speedup.
 
+## 2026-08-23: the perf-neutral history EXPLAINED, and the first win
+
+The hot view had NEVER engaged. Both layout probes (`tagOffset`,
+`spanProbe`) compared UNDEFINED padding bytes of stack-constructed
+values — UB the optimizer lowered to a trap, which killed the fill
+thread silently: `usable` stayed 0 in every historic run, so every
+kv_ fast path compiled into the emitted C was dead and every op ran
+through the exported helpers. That is the whole story behind the
+"measured perf-NEUTRAL" stage-4 result. Fixed by zeroing each probe
+value's backing bytes before construction.
+
+With the view live, the first fused-loop emitter landed: a BC-stream
+recognizer for the lowerer's rotated step-progression shape (entry
+check, straight-line body, Eq-snap latch, increment back-edge) emits
+one typed C loop over int64 locals — per-op width flags frozen by a
+two-round fixpoint prologue so the loop body is branch-invariant and
+the C compiler unswitches it; traces move to exits (nothing in a
+fused region can throw); the edge guard is strip-mined 1/256 with a
+spill-first contract. Measured: a 100M-iteration Int/Long accumulate
+runs 122ms native vs 180ms interpreted — the FIRST C-beats-interpreter
+result — and rangebench drops 830 -> 535ms with only one of its three
+loops fused. Parity: 392/393 with compose_foundation solo-verified
+byte-identical (its gate failure is the standing under-load flake).
+
+Remaining on the yardstick: the downTo/step loop is rejected by the
+recognizer (widen it), and the char-range loop still escapes to the
+interpreter per iteration (emit it as a counted loop or include the
+step-progression stdlib leaves in the emitted set).
+
 ## Next: the speedup campaign (open)
 
 The opaque call-per-op ABI trades the stream's inlined switch dispatch

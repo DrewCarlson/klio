@@ -579,7 +579,7 @@ fn transpileEmit(
         // allow_fuse mirrors the frame loop's default (the loop JIT off):
         // the running binary builds the same streams this emission used.
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
-        emitNativeFunc(w, f, fs) catch return 1;
+        emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
         emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
     }
 
@@ -631,7 +631,7 @@ fn emitCString(w: anytype, s: []const u8) !void {
     try w.print("\"", .{});
 }
 
-fn emitNativeFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams) !void {
+fn emitNativeFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) !void {
     try w.print("/* {s} (fid {d}) */\n", .{ f.fqn, f.id.int() });
     try w.print("static void kf_{d}(void *ctx, uint32_t entry) {{\n  uint8_t *const regs = klio_op_regs(ctx);\n  (void)regs;\n  uint8_t *const span_slot = KV.span_usable ? klio_op_span_slot(ctx) : 0;\n  (void)span_slot;\n  klio_edge_view EV;\n  klio_op_edge_view(ctx, &EV);\n  switch (entry) {{\n", .{f.id.int()});
     for (fs.streams, 0..) |sopt, bi| {
@@ -643,7 +643,7 @@ fn emitNativeFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams) !
     try w.print("  default: return;\n  }}\n", .{});
     for (fs.streams, 0..) |sopt, bi| {
         const st = sopt orelse continue;
-        try emitNativeBlock(w, f, st, @intCast(bi), fs);
+        try emitNativeBlock(w, f, st, @intCast(bi), fs, consts);
     }
     try w.print("}}\n\n", .{});
 }
@@ -659,8 +659,478 @@ fn emitEdgeTo(w: anytype, fs: *const ir.bc.FuncStreams, target: u32) !void {
     }
 }
 
-fn emitNativeBlock(w: anytype, f: *const ir.Func, st: *const ir.bc.Stream, block: u32, fs: *const ir.bc.FuncStreams) !void {
+
+/// One straight-line region op a fused counted loop replays on C locals.
+const FusedOp = union(enum) {
+    trace: struct { file: u32, start: u32, end: u32 },
+    const_int: struct { dst: u32, v: u32 },
+    /// A const-table load resolved at emit time to a scalar: g encodes the
+    /// width tag (0 int, 1 long, 2 bool, 3 unit) and v the payload bits.
+    const_scalar: struct { dst: u32, g: u8, v: i64 },
+    move: struct { dst: u32, src: u32 },
+    bin: struct { kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32 },
+};
+
+const FUSE_MAX_OPS = 48;
+const FUSE_MAX_REGS = 96;
+
+/// A recognized counted int loop over the BC streams:
+///   H:    [trace*] cmp_br(LessEq|GreaterEq, hdst, I, B) ? BODY : EXIT
+///   BODY: straight-line {trace, const_int, move, wrap-arith, compare} .. jump L1
+///   L1:   [trace*] cmp_br(Eq, ldst, I, B) ? DONE : L2
+///   L2:   [trace*] bin(Add, I, I, STEP) .. jump H
+/// with B and STEP loop-invariant — exactly the lowerer's step-progression
+/// shape (the Eq latch is the overflow-free last-element snap). The whole
+/// region is re-emitted as one typed C loop over int64 locals with a
+/// runtime width tag per register (Int arithmetic wraps at 32 bits, a Long
+/// operand promotes — `applyBinop`'s exact fast-path semantics), entered
+/// from the header label only when every live-in register carries an
+/// Int/Long tag; anything else falls through to the per-op code unchanged.
+/// Interpreter entries at the BODY/latch labels keep the generic per-op
+/// path (their next header arrival re-engages the fused form).
+const CountedLoop = struct {
+    header: u32,
+    exit: u32,
+    done: u32,
+    ind: u32,
+    bound: u32,
+    step: u32,
+    hkind: ir.BinOp,
+    hdst: u32,
+    last: u32,
+    ldst: u32,
+    htrace: ?[3]u32,
+    ltrace: ?[3]u32,
+    ops: [FUSE_MAX_OPS]FusedOp,
+    n_ops: usize,
+    latch_ops: [8]FusedOp,
+    n_latch: usize,
+    regs: [FUSE_MAX_REGS]u32,
+    n_regs: usize,
+    reads: [FUSE_MAX_REGS]u32,
+    n_reads: usize,
+    writes: [FUSE_MAX_REGS]u32,
+    n_writes: usize,
+};
+
+fn fuseNoteReg(cl: *CountedLoop, r: u32) bool {
+    if (r >= FUSE_MAX_REGS) return false;
+    for (cl.regs[0..cl.n_regs]) |x| {
+        if (x == r) return true;
+    }
+    if (cl.n_regs >= cl.regs.len) return false;
+    cl.regs[cl.n_regs] = r;
+    cl.n_regs += 1;
+    return true;
+}
+
+fn fuseNoteRead(cl: *CountedLoop, written: []bool, r: u32) bool {
+    if (!fuseNoteReg(cl, r)) return false;
+    if (!written[r]) {
+        for (cl.reads[0..cl.n_reads]) |x| {
+            if (x == r) return true;
+        }
+        if (cl.n_reads >= cl.reads.len) return false;
+        cl.reads[cl.n_reads] = r;
+        cl.n_reads += 1;
+    }
+    return true;
+}
+
+fn fuseNoteWrite(cl: *CountedLoop, written: []bool, r: u32) bool {
+    if (!fuseNoteReg(cl, r)) return false;
+    written[r] = true;
+    for (cl.writes[0..cl.n_writes]) |x| {
+        if (x == r) return true;
+    }
+    if (cl.n_writes >= cl.writes.len) return false;
+    cl.writes[cl.n_writes] = r;
+    cl.n_writes += 1;
+    return true;
+}
+
+const FuseCmp = struct { kind: u32, dst: u32, lhs: u32, rhs: u32, t: u32, f: u32, trace: ?[3]u32 };
+
+/// Parse a stream of shape [trace*] cmp_br; null on anything else.
+fn fuseHeaderCmp(st: *const ir.bc.Stream) ?FuseCmp {
+    const code = st.code;
+    var pc: usize = 0;
+    var trace: ?[3]u32 = null;
+    while (pc < code.len) {
+        const op: ir.bc.Op = @enumFromInt(code[pc]);
+        switch (op) {
+            .trace => {
+                trace = .{ code[pc + 1], code[pc + 2], code[pc + 3] };
+                pc += 4;
+            },
+            .cmp_br => {
+                if (pc + 8 != code.len) return null;
+                return .{ .kind = code[pc + 2], .dst = code[pc + 3], .lhs = code[pc + 4], .rhs = code[pc + 5], .t = code[pc + 6], .f = code[pc + 7], .trace = trace };
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// Collect a straight-line block's fusible ops; the block must end in
+/// `jump expected_next`.
+fn fuseConstScalar(consts: []const ir.Const, id: u32) ?struct { g: u8, v: i64 } {
+    if (id >= consts.len) return null;
+    return switch (consts[id]) {
+        .Int => |v| .{ .g = 0, .v = v },
+        .Long => |v| .{ .g = 1, .v = v },
+        .Bool => |v| .{ .g = 2, .v = @intFromBool(v) },
+        .Unit => .{ .g = 3, .v = 0 },
+        else => null,
+    };
+}
+
+fn fuseStraightBlock(cl: *CountedLoop, written: []bool, st: *const ir.bc.Stream, out: []FusedOp, n_out: *usize, expected_next: ?u32, out_target: *u32, consts: []const ir.Const) bool {
+    const code = st.code;
+    var pc: usize = 0;
+    while (pc < code.len) {
+        const op: ir.bc.Op = @enumFromInt(code[pc]);
+        switch (op) {
+            .trace => {
+                if (n_out.* >= out.len) return false;
+                out[n_out.*] = .{ .trace = .{ .file = code[pc + 1], .start = code[pc + 2], .end = code[pc + 3] } };
+                n_out.* += 1;
+                pc += 4;
+            },
+            .const_int => {
+                if (n_out.* >= out.len) return false;
+                if (!fuseNoteWrite(cl, written, code[pc + 1])) return false;
+                out[n_out.*] = .{ .const_int = .{ .dst = code[pc + 1], .v = code[pc + 2] } };
+                n_out.* += 1;
+                pc += 3;
+            },
+            .const_load => {
+                const sc = fuseConstScalar(consts, code[pc + 2]) orelse return false;
+                if (n_out.* >= out.len) return false;
+                if (!fuseNoteWrite(cl, written, code[pc + 1])) return false;
+                out[n_out.*] = .{ .const_scalar = .{ .dst = code[pc + 1], .g = sc.g, .v = sc.v } };
+                n_out.* += 1;
+                pc += 3;
+            },
+            .move => {
+                if (n_out.* >= out.len) return false;
+                if (!fuseNoteRead(cl, written, code[pc + 2])) return false;
+                if (!fuseNoteWrite(cl, written, code[pc + 1])) return false;
+                out[n_out.*] = .{ .move = .{ .dst = code[pc + 1], .src = code[pc + 2] } };
+                n_out.* += 1;
+                pc += 3;
+            },
+            .bin => {
+                const kind: ir.BinOp = @enumFromInt(code[pc + 2]);
+                const hot = hotIntExpr(kind) orelse return false;
+                if (hot.divmod) return false;
+                if (n_out.* >= out.len) return false;
+                if (!fuseNoteRead(cl, written, code[pc + 4])) return false;
+                if (!fuseNoteRead(cl, written, code[pc + 5])) return false;
+                if (!fuseNoteWrite(cl, written, code[pc + 3])) return false;
+                out[n_out.*] = .{ .bin = .{ .kind = kind, .dst = code[pc + 3], .lhs = code[pc + 4], .rhs = code[pc + 5] } };
+                n_out.* += 1;
+                pc += 6;
+            },
+            .jump => {
+                if (pc + 2 != code.len) {
+                    fuseTrace("  straight: jump not at tail", .{});
+                    return false;
+                }
+                if (expected_next) |want| {
+                    if (code[pc + 1] != want) {
+                        fuseTrace("  straight: jump to B{d} want B{d}", .{ code[pc + 1], want });
+                        return false;
+                    }
+                }
+                out_target.* = code[pc + 1];
+                return true;
+            },
+            else => {
+                fuseTrace("  straight: op {s} not fusible", .{@tagName(op)});
+                return false;
+            },
+        }
+    }
+    return false;
+}
+
+/// Recognize the counted-loop region headed at `header`, or null.
+fn fuseTrace(comptime fmt: []const u8, args: anytype) void {
+    if (std.c.getenv("KLIO_FUSE_TRACE") != null) std.debug.print("[fuse] " ++ fmt ++ "\n", args);
+}
+
+fn recognizeCountedLoop(fs: *const ir.bc.FuncStreams, header: u32, consts: []const ir.Const) ?CountedLoop {
+    var cl: CountedLoop = undefined;
+    cl.n_ops = 0;
+    cl.n_latch = 0;
+    cl.n_regs = 0;
+    cl.n_reads = 0;
+    cl.n_writes = 0;
+    var written = [_]bool{false} ** FUSE_MAX_REGS;
+
+    const hstream = (if (header < fs.streams.len) fs.streams[header] else null) orelse return null;
+    const h = fuseHeaderCmp(hstream) orelse return null;
+    const hkind: ir.BinOp = @enumFromInt(h.kind);
+    fuseTrace("B{d}: header cmp kind={s}", .{ header, @tagName(hkind) });
+    if (hkind != .LessEq and hkind != .GreaterEq) return null;
+    if (h.lhs >= FUSE_MAX_REGS or h.rhs >= FUSE_MAX_REGS or h.dst >= FUSE_MAX_REGS) return null;
+    cl.header = header;
+    cl.exit = h.f;
+    cl.ind = h.lhs;
+    cl.bound = h.rhs;
+    cl.hkind = hkind;
+    cl.hdst = h.dst;
+    cl.htrace = h.trace;
+    if (!fuseNoteRead(&cl, &written, cl.ind)) return null;
+    if (!fuseNoteRead(&cl, &written, cl.bound)) return null;
+    if (!fuseNoteWrite(&cl, &written, cl.hdst)) return null;
+
+    const body = h.t;
+    const bstream = (if (body < fs.streams.len) fs.streams[body] else null) orelse return null;
+    var l1: u32 = 0;
+    if (!fuseStraightBlock(&cl, &written, bstream, &cl.ops, &cl.n_ops, null, &l1, consts)) {
+        fuseTrace("B{d}: body block B{d} not fusible", .{ header, body });
+        return null;
+    }
+
+    const l1stream = (if (l1 < fs.streams.len) fs.streams[l1] else null) orelse return null;
+    const lc = fuseHeaderCmp(l1stream) orelse {
+        fuseTrace("B{d}: latch B{d} not a cmp", .{ header, l1 });
+        return null;
+    };
+    if (@as(ir.BinOp, @enumFromInt(lc.kind)) != .Eq) return null;
+    // The Eq exit compares the induction register against the progression's
+    // LAST element — for a stepped/downTo loop the lowerer snaps it into a
+    // register distinct from the entry bound. Any loop-invariant register
+    // is acceptable.
+    if (lc.lhs != cl.ind) {
+        fuseTrace("B{d}: latch operands mismatch", .{header});
+        return null;
+    }
+    cl.last = lc.rhs;
+    if (cl.last >= FUSE_MAX_REGS) return null;
+    if (!fuseNoteRead(&cl, &written, cl.last)) return null;
+    if (lc.dst >= FUSE_MAX_REGS) return null;
+    cl.done = lc.t;
+    cl.ldst = lc.dst;
+    cl.ltrace = lc.trace;
+    if (!fuseNoteWrite(&cl, &written, cl.ldst)) return null;
+
+    // The increment block's back edge returns to the BODY (the rotated
+    // loop's head), not to this entry-check block.
+    const l2 = lc.f;
+    const l2stream = (if (l2 < fs.streams.len) fs.streams[l2] else null) orelse return null;
+    var back: u32 = 0;
+    if (!fuseStraightBlock(&cl, &written, l2stream, &cl.latch_ops, &cl.n_latch, body, &back, consts)) {
+        fuseTrace("B{d}: incr block B{d} not fusible", .{ header, l2 });
+        return null;
+    }
+    var incs: usize = 0;
+    var step: u32 = 0;
+    for (cl.latch_ops[0..cl.n_latch]) |op| {
+        switch (op) {
+            .bin => |b| {
+                if (b.dst != cl.ind or b.kind != .Add or b.lhs != cl.ind) return null;
+                step = b.rhs;
+                incs += 1;
+            },
+            .trace, .const_scalar, .const_int => {},
+            else => return null,
+        }
+    }
+    if (incs != 1) return null;
+    cl.step = step;
+    if (written[cl.bound] or written[cl.last]) return null;
+    if (step != cl.ind and written[step]) return null;
+    if (cl.exit >= fs.streams.len or fs.streams[cl.exit] == null) {
+        fuseTrace("B{d}: exit B{d} uncompiled", .{ header, cl.exit });
+        return null;
+    }
+    if (cl.done >= fs.streams.len or fs.streams[cl.done] == null) {
+        fuseTrace("B{d}: done B{d} uncompiled", .{ header, cl.done });
+        return null;
+    }
+    fuseTrace("B{d}: FUSED (body B{d}, exit B{d}, done B{d})", .{ header, body, cl.exit, cl.done });
+    return cl;
+}
+
+fn fuseArithSym(kind: ir.BinOp) []const u8 {
+    return switch (kind) {
+        .Add => "+",
+        .Sub => "-",
+        .Mul => "*",
+        else => unreachable,
+    };
+}
+
+fn fuseCmpSym(kind: ir.BinOp) []const u8 {
+    return switch (kind) {
+        .Less => "<",
+        .LessEq => "<=",
+        .Greater => ">",
+        .GreaterEq => ">=",
+        .Eq, .BoxedEq => "==",
+        .NotEq, .BoxedNotEq => "!=",
+        else => unreachable,
+    };
+}
+
+fn fuseLastTrace(cl: *const CountedLoop) ?[3]u32 {
+    var last: ?[3]u32 = null;
+    if (cl.htrace) |t| last = t;
+    for (cl.ops[0..cl.n_ops]) |op| {
+        if (op == .trace) last = .{ op.trace.file, op.trace.start, op.trace.end };
+    }
+    if (cl.ltrace) |t| last = t;
+    for (cl.latch_ops[0..cl.n_latch]) |op| {
+        if (op == .trace) last = .{ op.trace.file, op.trace.start, op.trace.end };
+    }
+    return last;
+}
+
+fn emitFuseSpill(w: anytype, cl: *const CountedLoop) !void {
+    if (fuseLastTrace(cl)) |t| {
+        try w.print("        if (span_slot) kv_trace(span_slot, {d}u, {d}u, {d}u);\n", .{ t[0], t[1], t[2] });
+    }
+    for (cl.writes[0..cl.n_writes]) |r| {
+        try w.print("        if (g{d} == 3) kv_set_tag(kv_slot(regs, {d}u), KV.tag_unit); else if (g{d} == 2) kv_set_bool(kv_slot(regs, {d}u), (uint8_t)l{d}); else if (g{d} == 1) kv_set_long(kv_slot(regs, {d}u), l{d}); else kv_const_int(kv_slot(regs, {d}u), (int32_t)l{d});\n", .{ r, r, r, r, r, r, r, r, r, r });
+    }
+}
+
+/// Prologue tag propagation for one region op: updates the register width
+/// tags and, for an arithmetic op, freezes its promoted-ness flag `f<idx>`.
+/// Run twice before the loop, the tag state reaches its fixpoint (promotion
+/// is driven by the deterministic op sequence); a third round that changes
+/// any flag falls back to the generic path.
+fn emitTagPropOp(w: anytype, op: FusedOp, idx: usize, round: u32) !void {
+    switch (op) {
+        .trace => {},
+        .const_int => |c| try w.print("      g{d} = 0;\n", .{c.dst}),
+        .const_scalar => |c| try w.print("      g{d} = {d};\n", .{ c.dst, c.g }),
+        .move => |m| try w.print("      g{d} = g{d};\n", .{ m.dst, m.src }),
+        .bin => |b| {
+            const hot = hotIntExpr(b.kind).?;
+            if (hot.is_bool) {
+                try w.print("      g{d} = 2;\n", .{b.dst});
+            } else if (round == 0) {
+                try w.print("      f{d} = (g{d} | g{d}) & 1; g{d} = f{d};\n", .{ idx, b.lhs, b.rhs, b.dst, idx });
+            } else {
+                try w.print("      {{ int nf = (g{d} | g{d}) & 1; if (nf != f{d}) fok = 0; f{d} = nf; g{d} = nf; }}\n", .{ b.lhs, b.rhs, idx, idx, b.dst });
+            }
+        },
+    }
+}
+
+/// In-loop emission: width decisions read the FROZEN per-op flags, so the
+/// loop body carries no data-dependent tag writes and the C compiler can
+/// unswitch it into typed variants.
+fn emitFusedOp(w: anytype, op: FusedOp, idx: usize) !void {
+    switch (op) {
+        // Per-iteration span updates are unobservable inside a fused region
+        // (no op in it can throw — divmod is excluded); the region's LAST
+        // trace is written once at every exit instead.
+        .trace => {},
+        .const_int => |c| try w.print("        l{d} = (int32_t)0x{x}u;\n", .{ c.dst, c.v }),
+        .const_scalar => |c| try w.print("        l{d} = (int64_t){d}ll;\n", .{ c.dst, c.v }),
+        .move => |m| try w.print("        l{d} = l{d};\n", .{ m.dst, m.src }),
+        .bin => |b| {
+            const hot = hotIntExpr(b.kind).?;
+            if (hot.is_bool) {
+                if (b.kind == .BoxedEq or b.kind == .BoxedNotEq) {
+                    const neg: []const u8 = if (b.kind == .BoxedNotEq) "!" else "";
+                    try w.print("        l{d} = {s}(g{d} == g{d} && l{d} == l{d});\n", .{ b.dst, neg, b.lhs, b.rhs, b.lhs, b.rhs });
+                } else {
+                    try w.print("        l{d} = (l{d} {s} l{d});\n", .{ b.dst, b.lhs, fuseCmpSym(b.kind), b.rhs });
+                }
+            } else {
+                try w.print("        if (f{d}) l{d} = (int64_t)((uint64_t)l{d} {s} (uint64_t)l{d}); else l{d} = (int32_t)((uint32_t)l{d} {s} (uint32_t)l{d});\n", .{ idx, b.dst, b.lhs, fuseArithSym(b.kind), b.rhs, b.dst, b.lhs, fuseArithSym(b.kind), b.rhs });
+            }
+        },
+    }
+}
+
+/// Emit the typed replay of a recognized counted loop at its header label,
+/// ahead of the generic per-op code (which stays as the fallthrough for
+/// non-scalar entry tags and for interpreter entries at the inner labels).
+fn emitFusedCountedLoop(w: anytype, cl: *const CountedLoop) !void {
+    try w.print("  /* fused counted loop over blocks B{d}.. (typed int64 replay) */\n", .{cl.header});
+    try w.print("  if (KV.usable) {{\n    int fok = 1;\n", .{});
+    for (cl.regs[0..cl.n_regs]) |r| {
+        try w.print("    int64_t l{d} = 0; int g{d} = 0; (void)l{d}; (void)g{d};\n", .{ r, r, r, r });
+    }
+    for (cl.reads[0..cl.n_reads]) |r| {
+        try w.print("    {{ const uint8_t *s = kv_slot(regs, {d}u); uint64_t t = kv_tag(s); if (t == KV.tag_int) {{ l{d} = kv_int(s); g{d} = 0; }} else if (t == KV.tag_long) {{ l{d} = kv_long(s); g{d} = 1; }} else fok = 0; }}\n", .{ r, r, r, r, r });
+    }
+    // Per-arith-op frozen width flags, settled by two propagation rounds
+    // (fixpoint) and a verify round; a tag pattern that has not converged
+    // clears fok and the generic path serves.
+    {
+        var idx: usize = 0;
+        for (cl.ops[0..cl.n_ops]) |op| {
+            if (op == .bin and !hotIntExpr(op.bin.kind).?.is_bool)
+                try w.print("    int f{d} = 0;\n", .{idx});
+            idx += 1;
+        }
+        var lidx: usize = 100;
+        for (cl.latch_ops[0..cl.n_latch]) |op| {
+            if (op == .bin and !hotIntExpr(op.bin.kind).?.is_bool)
+                try w.print("    int f{d} = 0;\n", .{lidx});
+            lidx += 1;
+        }
+    }
+    try w.print("    if (fok) {{\n", .{});
+    inline for (.{ @as(u32, 0), @as(u32, 1), @as(u32, 2) }) |round| {
+        var idx2: usize = 0;
+        for (cl.ops[0..cl.n_ops]) |op| {
+            try emitTagPropOp(w, op, idx2, round);
+            idx2 += 1;
+        }
+        try w.print("      g{d} = 2;\n", .{cl.ldst});
+        var lidx2: usize = 100;
+        for (cl.latch_ops[0..cl.n_latch]) |op| {
+            try emitTagPropOp(w, op, lidx2, round);
+            lidx2 += 1;
+        }
+    }
+    try w.print("      g{d} = 2;\n    }}\n", .{cl.hdst});
+    try w.print("    if (fok) {{\n      uint32_t kfl = 0;\n", .{});
+    try w.print("      l{d} = (l{d} {s} l{d});\n", .{ cl.hdst, cl.ind, fuseCmpSym(cl.hkind), cl.bound });
+    try w.print("      if (!l{d}) {{\n", .{cl.hdst});
+    try emitFuseSpill(w, cl);
+    try w.print("        goto B{d};\n      }}\n", .{cl.exit});
+    try w.print("      for (;;) {{\n", .{});
+    {
+        var idx3: usize = 0;
+        for (cl.ops[0..cl.n_ops]) |op| {
+            try emitFusedOp(w, op, idx3);
+            idx3 += 1;
+        }
+    }
+    try w.print("        l{d} = (l{d} == l{d});\n", .{ cl.ldst, cl.ind, cl.last });
+    try w.print("        if (l{d}) {{\n", .{cl.ldst});
+    try emitFuseSpill(w, cl);
+    try w.print("        goto B{d};\n        }}\n", .{cl.done});
+    {
+        var lidx3: usize = 100;
+        for (cl.latch_ops[0..cl.n_latch]) |op| {
+            try emitFusedOp(w, op, lidx3);
+            lidx3 += 1;
+        }
+    }
+    // Periodic edge guard: keep the interpreter cadence (two per-jump
+    // increments per iteration) by bumping the shared counter in bulk,
+    // spilling first so an abort/GC observes a consistent register file.
+    try w.print("        kfl += 1;\n        if ((kfl & 0xFFu) == 0) {{\n", .{});
+    try emitFuseSpill(w, cl);
+    try w.print("        *EV.counter += 511u;\n        if (kv_edge(ctx, &EV)) return;\n        }}\n", .{});
+    try w.print("      }}\n    }}\n  }}\n", .{});
+}
+
+fn emitNativeBlock(w: anytype, f: *const ir.Func, st: *const ir.bc.Stream, block: u32, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) !void {
     try w.print("B{d}:\n", .{block});
+    if (recognizeCountedLoop(fs, block, consts)) |cl| try emitFusedCountedLoop(w, &cl);
     const code = st.code;
     var pc: usize = 0;
     var closed = false;

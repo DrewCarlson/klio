@@ -141,7 +141,15 @@ Work items:
       untyped registers — the emitter needs the same counted-loop lowering
       (typed C for-loops, tags spilled only at exits). (c) is the big one:
       it is what lets the C compiler see a plain int64 loop and vectorize.
-- [ ] Verify engagement with KLIO_NATIVE_TRACE; hold 293/293 byte-parity.
+- [x] ENGAGEMENT ROOT FOUND AND FIXED (2026-08-23): the hot view never
+      engaged — the klio_rt layout probes read undefined padding, UB
+      lowered to a trap that silently killed the fill thread; usable was 0
+      in every historic measurement. Probes now zero their backing bytes.
+- [x] First fused-loop emitter landed: intbench 122ms native vs 180ms
+      interp (first C-beats-interpreter), rangebench 830 -> 535ms with 1/3
+      loops fused; parity 392/393 (compose_foundation = standing load
+      flake, solo byte-identical). Remaining: downTo recognizer widening +
+      the char-range escape.
 - [ ] Exit: a measured speedup on rangebench (target: beat interpreted
       JIT-off by a recorded factor, not neutrality), corpus parity intact,
       full battery green.
