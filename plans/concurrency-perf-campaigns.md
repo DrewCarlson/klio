@@ -65,8 +65,11 @@ memory (`klio-compose-suite-perf`) already established:
   pathology or genuine cost.
 
 Work items:
-- [ ] Profile the heavy classes (KLIO_PROF on the ReleaseSafe harness — never
-      the Debug one) and answer the buildSubTable question first.
+- [x] Profile the heavy classes and answer the buildSubTable question:
+      ANSWERED 2026-08-22 — buildSubTable is LINEAR (in-module scaling probe:
+      2.08/2.09/2.07 ms per ~30-group round across 4000 rounds with an aging
+      parent table; zero growth). No pathology; the cost is genuine
+      interpreted work, so the wall-time lever is per-call overhead.
 - [ ] Attack the top interpreter frames the profile names (dispatch, field
       access, allocation — whatever actually dominates), measure after each
       change on the SAME solo class before touching the suite.
