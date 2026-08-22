@@ -73,6 +73,15 @@ Work items:
 - [ ] Attack the top interpreter frames the profile names (dispatch, field
       access, allocation — whatever actually dominates), measure after each
       change on the SAME solo class before touching the suite.
+- 2026-08-22 SOLO GATE BASELINE: 727s wall (including the itest binary
+  rebuild) — 1378 passed (ABOVE the 1375 ratchet, best measurement ever
+  recorded), 12 counted failures = exactly the throughput-timeout family
+  (Snapshot concurrent group, validatePotentialDeadlock,
+  resumeOnBackgroundThread double-counted) + one MovableContent load flake.
+  The former contamination flakes (frame-clock, testInsertDuringRecomposition,
+  markInvalidFromBackgroundThread) are green at gate scale. NOTE: 12 is one
+  over MAX_FAILED=11 under this box's background load; the ceiling stays —
+  the fix direction is down via throughput work, not a wider ceiling.
 - [ ] Exit: full solo `itest-compose_plugin_commontest` wall time halved from
       the current measured baseline (record it first), with the gate still at
       its pass baseline.
