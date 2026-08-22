@@ -441,6 +441,7 @@ fn wallCapSeconds() i64 {
 fn armWallDeadline() void {
     const cap = wallCapSeconds();
     if (cap <= 0) return;
+    ir.eval.wall_cap_thrown.store(false, .monotonic);
     ir.eval.test_wall_deadline_ms.store(ir.eval.nowMonotonicMs() + cap * 1000, .monotonic);
 }
 
@@ -455,14 +456,30 @@ fn clearWallDeadline() void {
 /// and <=50 ms sleep slices), then clear so the next step starts clean.
 fn drainWallCapAbandon() void {
     if (!runtime.runBoundaryAbandonActive()) return;
-    // Raw sleep: the sliced runtime sleep would observe the very
-    // abandonment being drained and return immediately.
+    // Wait for QUIESCENCE, not a fixed grace window: every cohort member
+    // observes the flags at block granularity / <=50 ms sleep slices, but a
+    // worker parked in a bounded native wait (a sync-resume spin, a gate
+    // slice) can outlive a fixed 200 ms window — clearing the flags then
+    // stranded it mid-task, and its dead test's infinite loops kept running
+    // into every later test in the class (the RecomposerTests frame-clock
+    // test flaked exactly this way after validatePotentialDeadlock hit the
+    // wall cap). Poll the interpreter's in-eval census until only this
+    // thread remains, bounded at 10 s; on timeout, clear anyway (the old
+    // behavior) but say so — a silent leak reads as a flake.
     runtime.gc.enterBlockingSafe();
-    {
-        const ts = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+    var waited_ms: u64 = 0;
+    while (ir.eval.threads_in_eval.load(.monotonic) != 0 and waited_ms < 10_000) {
+        const ts = std.c.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
         _ = std.c.nanosleep(&ts, null);
+        waited_ms += 10;
     }
     runtime.gc.exitBlockingSafe();
+    if (ir.eval.threads_in_eval.load(.monotonic) != 0) {
+        std.debug.print(
+            "[wall-cap] {d} abandoned worker(s) still executing after 10s drain; later tests may be contaminated\n",
+            .{ir.eval.threads_in_eval.load(.monotonic)},
+        );
+    }
     runtime.setRunBoundaryAbandon(false);
     runtime.clearAbandon();
 }

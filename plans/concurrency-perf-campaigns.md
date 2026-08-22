@@ -169,6 +169,32 @@ Work items:
   exactly tasks 2+3. Native shadow implementations of the vendored
   PersistentVector were considered and REJECTED on the same grounds the
   native channels were deleted.
+- 2026-08-22 CONTAMINATION FIXED: two-part root. (1) The wall-cap abort
+  unwound with an interpreter-level error that SKIPPED Kotlin catch/finally,
+  so a capped test's infra teardown (compositionTest disposing its
+  recomposer/composition, runTest cancelling children) never ran — its
+  globally registered snapshot observers and live compositions poisoned
+  every later test in the class. The wall cap is now STAGED: first fire
+  throws a catchable kotlin.RuntimeException (finally/teardown runs) with a
+  20s unwind budget; a second expiry hard-aborts + abandons as before.
+  (2) The drain window was a fixed 200ms with an unconditional flag clear —
+  a straggler in a bounded native wait (sync-resume spin) could outlive it
+  and keep running its dead test forever with the flags cleared. The drain
+  now polls a new `threads_in_eval` census until the cohort actually leaves
+  interpreted code (10s bound, loud warning on timeout). Verified:
+  RecomposerTests 4/4 runs = 11/1 with ONLY the throughput livelock red
+  (pausing frame-clock was 2/3 red, now 4/4 green in class context);
+  SnapshotStateSetTests.concurrentGlobalModification_remove 5/5 green
+  solo — its earlier flake was the same contamination. Unit tests +
+  coroutines census 1299/0 hold.
+- validatePotentialDeadlock RECLASSIFIED: spin dumps 40s apart show
+  different live frames (ChangeList apply, then a worker's snapshot write)
+  — progress, not deadlock. Mechanism: the interpreted TestCoroutineScheduler
+  drain iteration is slower than the worker round-trip, so the infinite
+  withContext(Default) writer keeps the zero-virtual-delay task stream
+  dense and advanceTimeBy never reaches its target (upstream passes only
+  because real JVM threads out-pace the drain loop). Folds into the
+  throughput campaign with the rest of the timeout family.
 - 2026-08-22 CONTAMINATION MECHANISM (task 1 correctness item): the
   pausing frame-clock test is 4/4 green run as the ONLY test, but 2/3 red
   when its class runs — validatePotentialDeadlock (declared earlier in the

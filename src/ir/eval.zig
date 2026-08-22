@@ -903,6 +903,15 @@ var spin_interval_read = false;
 /// at the next gate, so retry ladders cannot absorb it.
 pub var test_wall_deadline_ms = std.atomic.Value(i64).init(0);
 
+/// Threads currently inside at least one interpreted activation (the
+/// outermost `runFrame` entry). The test runner's wall-cap drain polls this
+/// to know every abandoned cohort member has actually LEFT interpreted code
+/// before it clears the abandonment flags — a straggler that outlives a
+/// fixed grace window would otherwise keep running its dead test's loops
+/// (with the flags cleared, forever) and contaminate every later test in
+/// the class.
+pub var threads_in_eval = std.atomic.Value(u32).init(0);
+
 /// A wall-capped test must DIE, not cascade: without this, the deadline
 /// error unwound one coroutine while its siblings kept being resumed
 /// against half-torn state (each dying at its own next deadline check) —
@@ -915,6 +924,37 @@ pub var test_wall_deadline_ms = std.atomic.Value(i64).init(0);
 pub fn wallCapAbandon() void {
     runtime.requestAbandon();
     runtime.setRunBoundaryAbandon(true);
+}
+
+/// First wall-cap fire already threw the catchable timeout on some thread;
+/// a second expiry (the extended unwind deadline) hard-aborts. Reset by the
+/// test runner when it arms a fresh deadline.
+pub var wall_cap_thrown = std.atomic.Value(bool).init(false);
+
+/// The wall-cap firing policy. FIRST fire: extend the deadline by an unwind
+/// budget and unwind with a CATCHABLE Kotlin exception, so the test's
+/// `catch`/`finally` (and the test infra's teardown — a compositionTest
+/// disposing its recomposer, a runTest cancelling its children) actually
+/// run; the hard `.Type` abort skipped them, and the dead test's globally
+/// registered snapshot observers and live compositions contaminated every
+/// later test in the class. SECOND fire (teardown itself hung past the
+/// budget): the original hard abort + cohort abandonment.
+fn wallCapFire(allocator: Allocator) Allocator.Error!EvalResult {
+    if (!wall_cap_thrown.swap(true, .acq_rel)) {
+        const dl = test_wall_deadline_ms.load(.monotonic);
+        if (dl != 0) test_wall_deadline_ms.store(dl + 20_000, .monotonic);
+        std.debug.print("[wall-cap] test wall-clock deadline exceeded — throwing; hang location follows:\n", .{});
+        dumpFrameChainForDiagAlways();
+        return errResult(.{ .Throw = try Value.newException(allocator, .{
+            .fqn = try runtime.strInit(allocator, "kotlin.RuntimeException"),
+            .message = .from(try runtime.strInit(allocator, "test wall-clock deadline exceeded")),
+            .cause = null,
+        }) });
+    }
+    std.debug.print("[wall-cap] deadline exceeded again during unwind — hard abort:\n", .{});
+    dumpFrameChainForDiagAlways();
+    wallCapAbandon();
+    return errResult(.{ .Type = "test wall-clock deadline exceeded" });
 }
 
 /// Whether dispatch caches may be populated. A wall-capped or abandoned
@@ -4230,12 +4270,16 @@ fn runFrame(
         dumpFrameChainForDiag();
         return errResult(.{ .StackOverflow = "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)" });
     }
+    if (evtls.eval_depth == 0) _ = threads_in_eval.fetchAdd(1, .monotonic);
     evtls.eval_depth += 1;
     defer {
         evtls.eval_depth -= 1;
         // Safe point: back at the outermost activation, no native JIT frame is on
         // the stack, so the JIT cache can be trimmed if it has grown past its cap.
-        if (evtls.eval_depth == 0) jit_loop.evictIfOverBudget();
+        if (evtls.eval_depth == 0) {
+            _ = threads_in_eval.fetchSub(1, .monotonic);
+            jit_loop.evictIfOverBudget();
+        }
     }
     return runFrameInner(H, allocator, module, frame, try_stack, cur, resume_idx, null, null, host);
 }
@@ -5443,10 +5487,7 @@ fn runFrameExec(
                 // A caught hang should say WHERE it looped, not just that it did.
                 // Dump the live frame chain (innermost first, with file:line) so
                 // the culprit function/recursion is named at the abort point.
-                std.debug.print("[wall-cap] test wall-clock deadline exceeded — hang location follows:\n", .{});
-                dumpFrameChainForDiagAlways();
-                wallCapAbandon();
-                return errResult(.{ .Type = "test wall-clock deadline exceeded" });
+                return try wallCapFire(allocator);
             }
         }
         // GC safe point: at an opcode boundary all live Values are in registered
@@ -5789,7 +5830,7 @@ fn runFrameExec(
                             }
                             target = if (cv.Bool) code[pc + 2] else code[pc + 3];
                         }
-                        if (fusedEdgeGuard(ftls)) |er| {
+                        if (fusedEdgeGuard(allocator, ftls)) |er| {
                             cur = bcur;
                             return er;
                         }
@@ -5840,7 +5881,7 @@ fn runFrameExec(
                             }
                             taken = cv.Bool;
                         }
-                        if (fusedEdgeGuard(ftls)) |er| {
+                        if (fusedEdgeGuard(allocator, ftls)) |er| {
                             cur = bcur;
                             return er;
                         }
@@ -6533,7 +6574,7 @@ inline fn scalarBin(op: BinOp, lv: Value, rv: Value) ?Value {
 /// The frame loop's per-block-entry guards, run on every taken FUSED
 /// edge: daemon abandonment, the spin/wall diagnostic, and the GC safe
 /// point. Non-null = abort the frame with this result.
-inline fn fusedEdgeGuard(ftls: *EvalTls) ?EvalResult {
+inline fn fusedEdgeGuard(allocator: Allocator, ftls: *EvalTls) ?EvalResult {
     if (runtime.shouldAbandon()) {
         return errResult(.{ .Type = "daemon task abandoned at run boundary" });
     }
@@ -6542,10 +6583,8 @@ inline fn fusedEdgeGuard(ftls: *EvalTls) ?EvalResult {
         spinDumpMaybe();
         const wall_dl = test_wall_deadline_ms.load(.monotonic);
         if (wall_dl != 0 and nowMonotonicMs() > wall_dl) {
-            std.debug.print("[wall-cap] test wall-clock deadline exceeded — hang location follows:\n", .{});
-            dumpFrameChainForDiagAlways();
-            wallCapAbandon();
-            return errResult(.{ .Type = "test wall-clock deadline exceeded" });
+            return wallCapFire(allocator) catch
+                errResult(.{ .Type = "test wall-clock deadline exceeded" });
         }
     }
     if (runtime.gc.gc_enabled and runtime.gc.pending()) {
@@ -6848,10 +6887,8 @@ pub fn nativeOpEdgeRare(ctx: *NativeCtx, reasons: u32) i32 {
         spinDumpMaybe();
         const wall_dl = test_wall_deadline_ms.load(.monotonic);
         if (wall_dl != 0 and nowMonotonicMs() > wall_dl) {
-            std.debug.print("[wall-cap] test wall-clock deadline exceeded — hang location follows:\n", .{});
-            dumpFrameChainForDiagAlways();
-            wallCapAbandon();
-            ctx.ret_v.* = errResult(.{ .Type = "test wall-clock deadline exceeded" });
+            ctx.ret_v.* = wallCapFire(ctx.allocator) catch
+                errResult(.{ .Type = "test wall-clock deadline exceeded" });
             ctx.outcome = .ret;
             return 1;
         }
@@ -6978,7 +7015,7 @@ pub fn nativeOpEscape(ctx: *NativeCtx, block: u32, inst_idx: u32) i32 {
 
 /// The per-taken-edge guards on a fused `goto`. Nonzero = return.
 pub fn nativeOpEdge(ctx: *NativeCtx) i32 {
-    if (fusedEdgeGuard(ctx.ftls)) |er| {
+    if (fusedEdgeGuard(ctx.allocator, ctx.ftls)) |er| {
         ctx.ret_v.* = er;
         ctx.outcome = .ret;
         return 1;
@@ -6995,7 +7032,7 @@ pub fn nativeOpBr(ctx: *NativeCtx, block: u32, cond: u32) i32 {
         ctx.out_block = block;
         return 2;
     }
-    if (fusedEdgeGuard(ctx.ftls)) |er| {
+    if (fusedEdgeGuard(ctx.allocator, ctx.ftls)) |er| {
         ctx.ret_v.* = er;
         ctx.outcome = .ret;
         return 2;
@@ -7044,7 +7081,7 @@ pub fn nativeOpCmpBr(ctx: *NativeCtx, block: u32, inst_idx: u32, kind: u32, dst:
         }
         taken = cv.Bool;
     }
-    if (fusedEdgeGuard(ctx.ftls)) |er| {
+    if (fusedEdgeGuard(ctx.allocator, ctx.ftls)) |er| {
         ctx.ret_v.* = er;
         ctx.outcome = .ret;
         return 2;
