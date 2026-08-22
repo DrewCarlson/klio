@@ -127,6 +127,11 @@ pub fn lowerForLabeled(
         if (step_lit != 1 and lo_e == null) break :counted;
         var is_int = false;
         var is_long = false;
+        // Char ranges run the same register loop: Char comparisons order by
+        // code and `Char +/- Int` yields Char, so the induction register
+        // holds real Char values. The step-snap arithmetic is Int-only, so
+        // a stepped char progression keeps the iterator lowering.
+        var is_char = false;
         if (lo_e != null) {
             var lo_ty = (expr.staticExprTypeRef(b, lo_e.?) catch null) orelse break :counted;
             defer lo_ty.deinit(b.allocator);
@@ -134,7 +139,9 @@ pub fn lowerForLabeled(
             defer hi_ty.deinit(b.allocator);
             is_int = std.mem.eql(u8, lo_ty.name, "Int") and std.mem.eql(u8, hi_ty.name, "Int");
             is_long = std.mem.eql(u8, lo_ty.name, "Long") and std.mem.eql(u8, hi_ty.name, "Long");
-            if ((!is_int and !is_long) or lo_ty.nullable or hi_ty.nullable) break :counted;
+            is_char = std.mem.eql(u8, lo_ty.name, "Char") and std.mem.eql(u8, hi_ty.name, "Char");
+            if ((!is_int and !is_long and !is_char) or lo_ty.nullable or hi_ty.nullable) break :counted;
+            if (is_char and step_lit != 1) break :counted;
         } else {
             // TYPE-DRIVEN prong: any iterable whose static type is a
             // non-nullable IntRange/LongRange (a hoisted `val`, a
@@ -150,7 +157,8 @@ pub fn lowerForLabeled(
             if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
             is_int = std.mem.eql(u8, head, "IntRange");
             is_long = std.mem.eql(u8, head, "LongRange");
-            if (!is_int and !is_long) break :counted;
+            is_char = std.mem.eql(u8, head, "CharRange");
+            if (!is_int and !is_long and !is_char) break :counted;
             inclusive = true;
         }
 
@@ -240,7 +248,7 @@ pub fn lowerForLabeled(
         try b.pushScope();
         try b.bind(vars[0].name, i_reg);
         try b.setLocalDeclTypeOwned(vars[0].name, .{
-            .name = try b.allocator.dupe(u8, if (is_long) "Long" else "Int"),
+            .name = try b.allocator.dupe(u8, if (is_long) "Long" else if (is_char) "Char" else "Int"),
             .nullable = false,
             .args = &.{},
         });

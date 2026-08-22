@@ -149,6 +149,8 @@ fn runtimeErrorFromEval(e: EvalError) RuntimeError {
             // never completes — an indefinite hang for every joiner. Loud by
             // design; the message names the phase for triage.
             std.debug.print("[SUSPEND-LOST] coroutine suspended across a non-suspending boundary; activation dropped\n", .{});
+            if (runtime.envOnce("KLIO_ERR_TRACE") != null) std.debug.dumpCurrentStackTrace(.{});
+            ir.eval.dumpFrameChainForDiag();
             break :blk .{ .Type = "coroutine suspended across a non-suspending boundary" };
         },
         .Unsupported => |s| .{ .Type = s },
