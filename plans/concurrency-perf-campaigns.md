@@ -149,3 +149,33 @@ Work items:
   genuine correctness items: validatePotentialDeadlock (hang-vs-slow probe
   under 400s wall in flight) and pausingTheFrameClockStopShouldBlockWithFrameNanos
   (frame-clock ordering, flaky 2/3).
+- 2026-08-22 ROOT QUANTIFIED (ReleaseSafe harness this time — the earlier
+  Debug numbers were 6x inflated): empty cross-thread launch 234us,
+  same-thread 350us, withContext(Default) round-trip 486us — launches are
+  NOT the problem. The killer is the VERIFY phase of the Snapshot tests:
+  `SnapshotStateList.contains` at size 1000 costs 6.0ms/call (vs 27us on a
+  plain klio ArrayList — 220x); the addAll test's 50x1000-contains verify
+  loop alone needs ~300s against its 30s cap. Direct PersistentVector
+  numbers (scratchpad/pvbench.kt): indexed get 9us, iterator step 8.2us,
+  contains 9.6ms (≈19us/element scanned), snapshot `readable` read 27us.
+  The per-element cost is INTERPRETED-CALL OVERHEAD (~6us/call across
+  hasNext/next/equals), not instruction-walk: the bytecode tier moves it
+  only 6% (KLIO_BC=0 A/B), CallMemberOrGlobal/callNamedOverload are COLD
+  in the loop (64 CMGs total), and the profile is flat — libc (malloc/
+  memcpy family) ~16-18%, runFrameExec ~11%, memset ~4% (callNamedOverload
+  stack-buffer init), eqlBytes ~4% (name-keyed cache checks), everything
+  else <3%. No single lever: the campaign target is per-call overhead
+  (frame open/close, register-file init, name-identity string work), i.e.
+  exactly tasks 2+3. Native shadow implementations of the vendored
+  PersistentVector were considered and REJECTED on the same grounds the
+  native channels were deleted.
+- 2026-08-22 CONTAMINATION MECHANISM (task 1 correctness item): the
+  pausing frame-clock test is 4/4 green run as the ONLY test, but 2/3 red
+  when its class runs — validatePotentialDeadlock (declared earlier in the
+  class) hits the 90s wall cap first and its two INFINITE LaunchedEffect
+  loops + Default-dispatcher workers are ABANDONED, not stopped; the
+  successor test inherits stolen CPU and possibly dirty process-global
+  snapshot state ("daemon task abandoned at run boundary" then surfaces in
+  arbitrary later monitor waits). NEXT: verify what the run boundary
+  actually does to abandoned worker loops, and make a wall-capped test's
+  teardown quiesce them before the next test starts.
