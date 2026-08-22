@@ -115,6 +115,20 @@ Work items:
 
 ## Running log
 
+- 2026-08-22 PERF BATCH 1 (tasks 2+3): the top profile frame of the heavy
+  compose classes was memset (15.5% of oneRectBenchmarkSimulation) — Zig
+  safety builds 0xAA-fill every `undefined` stack array at its DECLARED
+  size, and three hot paths declared multi-KB buffers per call. Fixes:
+  leaf-serve coerce buffer moved to a per-depth threadlocal bank; the leaf
+  register-bank eager Unit-fill replaced by a wmask read-guard (reads of
+  unwritten slots serve the fill value; reclaim builds keep the eager
+  fill); two-tier buffers in invokeMethodFuncId (8 before 64 Value slots)
+  and the runtime applicability shapes (6 before heap ArgShape). Measured:
+  oneRect solo 64-65s -> 61s stable, SnapshotStateList.contains(1000)
+  6.0ms -> 5.0ms, empty cross-thread launch 234 -> 214us, withContext
+  round-trip 486 -> 424us. memset bucket 15.5% -> 7.8%. Full battery
+  green.
+
 - 2026-08-22: plan written. Task 1 started.
 - 2026-08-22 flip-rate measurement (5 classes x 3 SOLO runs, itest-exact
   env): the group splits three ways.

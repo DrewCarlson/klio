@@ -9128,10 +9128,21 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
         if (fp.has_receiver_param and args_in.len + 1 == fp.params.len and
             args_in.len < ir.LEAF_MAX_REGS)
         {
-            var argbuf: [ir.LEAF_MAX_REGS]Value = undefined;
-            argbuf[0] = receiver.*;
-            for (args_in, 0..) |a, i| argbuf[i + 1] = a;
-            if (try ir.eval.leafExprServe(VmHost, allocator, mod, fp, argbuf[0 .. args_in.len + 1], self)) |r| return r;
+            // Two tiers: safety builds 0xAA-fill an `undefined` stack array
+            // at its DECLARED size on every entry, and the 64-slot buffer's
+            // 2.5KB fill was a top profile frame across member-call-heavy
+            // suites. Nearly every call fits eight slots.
+            if (args_in.len + 1 <= 8) {
+                var argbuf: [8]Value = undefined;
+                argbuf[0] = receiver.*;
+                for (args_in, 0..) |a, i| argbuf[i + 1] = a;
+                if (try ir.eval.leafExprServe(VmHost, allocator, mod, fp, argbuf[0 .. args_in.len + 1], self)) |r| return r;
+            } else {
+                var argbuf: [ir.LEAF_MAX_REGS]Value = undefined;
+                argbuf[0] = receiver.*;
+                for (args_in, 0..) |a, i| argbuf[i + 1] = a;
+                if (try ir.eval.leafExprServe(VmHost, allocator, mod, fp, argbuf[0 .. args_in.len + 1], self)) |r| return r;
+            }
         }
     }
     if (nuTraceEnv()) |want| {
