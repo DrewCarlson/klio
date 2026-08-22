@@ -29,13 +29,14 @@ internal actual class SafeCollector<T> actual constructor(
     public actual fun releaseIntercepted() {}
 
     actual override suspend fun emit(value: T) {
-        // No cancellation check here: a plain `flow` is NOT cancellable by
-        // default (that is what `cancellable()` is for), and the JVM
-        // actual's `ensureActive` reads the EMITTER's continuation context,
-        // not the collecting coroutine's. klio's `currentCoroutineContext()`
-        // is the collecting coroutine's, so checking it here stops a flow
-        // whose collector cancelled itself mid-collect.
+        // The `flow {}` builder IS cancellable by default: the JVM actual's
+        // `ensureActive` runs on the emitter's continuation context, which
+        // is the collecting coroutine's context (the emitting code runs
+        // inside the collect). Only the UNSAFE builders (`unsafeFlow`,
+        // `unsafeTransform` — what `onEach`/`map`/`filter` build on) skip
+        // the check; that is what `cancellable()` is for.
         val currentContext = currentCoroutineContext()
+        currentContext.ensureActive()
         if (lastEmissionContext !== currentContext) {
             checkContext(currentContext)
             lastEmissionContext = currentContext

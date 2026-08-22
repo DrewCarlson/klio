@@ -71,7 +71,7 @@ the last measurement.
 |---|---|---|---|
 | serialization | 138 | 0 | 57 / 81 — AT ZERO |
 | datetime | 519 | 0 | 457 / 62 — AT ZERO |
-| coroutines | 1280 | 19 | 1073 / 141 (+6 DNC) |
+| coroutines | 1296 | 3 | 1073 / 141 (+6 DNC) |
 | io | 1191 | 0 | 1182 / 9 |
 | androidx_collection | 1841 | 0 | 1309 / 15 |
 | atomicfu | 67 | 0 | 67 / 0 |
@@ -1972,6 +1972,95 @@ lambda-body context. Next lead is the consumer of
 
       Sites eliminated: the three `argLambdaBroadMasks` call sites,
       `lowerUnresolvedBareCall`, and receiver-type recording as a whole.
+
+- [x] B24. **Upstream-channel cutover + the internal `Segment` namesake.**
+      `hostBindings()` no longer registers the native
+      `kotlinx.coroutines.channels.Channel` factory by default, so upstream's
+      `Channel(...)` (BufferedChannel / ConflatedBufferedChannel) serves;
+      `KLIO_NATIVE_CHANNEL=1` restores the native factory for A/B. Coroutines
+      1280/19 -> 1292/7 (BufferedChannelTest 7 and the undelivered-element
+      family land with upstream's own implementation). The cutover exposed a
+      resolution root: `kotlinx.coroutines.internal.Segment` (internal)
+      collides with kotlinx.io's public `Segment` in the combined image, so
+      the internal classifier is package-mangled — and every cross-package
+      reference that legally reaches it through an import of its declaring
+      package (ChannelSegment's supertype, sync/Semaphore's SemaphoreSegment,
+      `is Segment` type refs) silently bound the PUBLIC namesake instead: the
+      inherited-member walk then missed `cleanPrev`/`_prev` (ktor 450 -> 419
+      under the cutover). Fix: `importedPkgTypeRename` — rename resolution
+      follows wildcard/named imports of the declaring package — applied in
+      `populateClassSupertypes` (IR supertype identity), the runtime ClassDef
+      `supertype_names`, and `scopeTypeRename` (general type refs). Also
+      `classByNamePreferring`: the three inherited-member hierarchy walks in
+      `host_call_member.zig` resolve a simple-name supertype by longest
+      common FQN prefix with the referencing class (`WalkItem.hint`), so a
+      name-chain fallback can never cross into another package's namesake.
+      Example: `examples/channel_segment_namesake.kt`. ktor back to 450/0
+      under the cutover; all other suites held.
+
+- [x] B25. **Aliased-import inline splice picked the namesake — flows were
+      never uncancellable.** `CancellableTest.testCancellable`: a plain
+      operator chain must NOT stop at a mid-collect cancel (500500), only
+      `.cancellable()` must (1). klio returned SafeFlow from `onEach` because
+      Transform.kt's `transform { ... }` — an ALIASED import of
+      `unsafeTransform` — resolved correctly in the indexed bare-call path
+      (`[bare] transform -> unsafeTransform#2876`) but the INLINE body pick
+      is name-keyed (`inlineFnAstForRecv("transform")`) and its
+      receiver-narrowed answer (the public safe `transform`) PREEMPTS the
+      index's exact pick in `inlineTargetForBareCall`. The splice therefore
+      expanded the safe body (`Call flow#2776` visible in
+      `dump-ir --func onEach`), wrapping every operator chain in SafeFlow
+      and making it cancellable. Fix: unalias the inline lookup name — when
+      the call-site file's renamed import denotes an inline declaration, the
+      candidate-table lookup uses the TARGET's declared leaf name
+      (`inline_nm`); the indexed resolution keeps the source name (it
+      already handles renamed imports). Example:
+      `examples/flow_cancellable_operator.kt`.
+
+- [x] B26. **Invoke convention: a receiver-typed lambda PARAMETER shadows
+      the receiver's same-named member.** `flow.emit(1)` inside SharedFlowTest's
+      inline `testSubscriptionByFirstSuspensionInCollect(flow, emit: T.(Int) ->
+      Unit)` must invoke the local `emit` (Kotlin resolves the nearer local
+      scope), not `MutableStateFlow`'s own member `emit` — the member bound and
+      the collector never saw the pre-assert yield. New arm in
+      `lowerCallGeneral` next to the existing `this.f(x)` case: a qualified
+      call whose name is a RECEIVER-typed inline-lambda param splices the
+      lambda with the qualifier as its receiver (plain `(Int) -> Unit` params
+      stay with the member — inapplicable to a qualified call).
+      Repro: scratchpad/sfyield2.kt.
+
+- [x] B27. **`flow {}` chains are cancellable again.** klio's SafeCollector
+      actual had deliberately dropped the per-emit `ensureActive()` on the
+      wrong theory that plain flows are never cancellable; the truth (settled
+      by B25) is that only the UNSAFE builders skip the check — the safe
+      `flow {}`/`transform {}` DO ensureActive on the collecting context, and
+      `cancellable()` exists for the unsafe operator chains. Restored in
+      klioMain SafeCollector.emit.
+
+- [x] B28. **Qualified suspend-intrinsic property call:**
+      `kotlin.coroutines.coroutineContext.cancel()` lowered as ONE dotted
+      global (`unresolved global kotlin...cancel`) while the plain read
+      worked. The `kotlin.math.PI.toFloat()` property-prefix split in
+      `lowerFqnGlobalCall` only consults the top-level-property registry,
+      which has no row for the compiler-intrinsic property; the prefix is now
+      special-cased so the call lowers as LoadGlobal(prefix) + CallMember.
+      This was the actual IdFlowTest×2 blocker ("Exception was expected but
+      none produced" — the cancel() never ran).
+
+- [x] B29. **Compose regression from B24, fixed: the runtime name domain
+      must understand file-mangles.** Linking `Operation.Downs : Operation$f83`
+      correctly (B24's populate rename) let the inherited-member walk ascend
+      into the mangled base, where `receiverDefinitelyNotParam` could no
+      longer prove `InsertSlotsWithFixups` is not an `OperationArgContainer`
+      (that name resolves to NO class — both declarations are mangled) — the
+      walk then bound the member-EXTENSION `executeWithComposeStackTrace` with
+      the dispatch receiver in the extension-receiver slot, and every
+      compose/mosaic example died with `unresolved global getObject`.
+      Fix: `stripFileMangle` (`X$f12` -> `X`) + `anyFileMangledVariant` in
+      host_call_member — the classes-map presence check accepts a mangled
+      variant, and every chain comparison (argDefinitelyNotParamType walk,
+      class_super_names tailMatch, receiverImplementsHead) also matches a
+      chain entry's source spelling.
 
 ## Traps
 

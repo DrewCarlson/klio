@@ -901,6 +901,31 @@ pub fn classPrimaryParams(a: Allocator, c: *const ast.Class) Allocator.Error![]P
     return primary_params.toOwnedSlice(a);
 }
 
+/// The mangled name an `internal` package-renamed classifier resolves to
+/// when referenced from ANOTHER package through an import of its declaring
+/// package (wildcard or named). Internal visibility spans the whole module,
+/// so such a reference is legal and must follow the mangle — without this a
+/// `kotlinx.coroutines.channels.ChannelSegment : Segment` supertype bound
+/// the public `kotlinx.io.Segment` instead of the renamed
+/// `kotlinx.coroutines.internal.Segment`.
+pub fn importedPkgTypeRename(module: *const Module, name: []const u8, file: ir.FileId) ?[]const u8 {
+    if (module.registry.import_wildcards.get(file)) |packages| {
+        for (packages.items) |pkg| {
+            if (build.pkgTypeRename(name, pkg)) |rn| return rn;
+        }
+    }
+    if (module.registry.import_aliases.get(file)) |m| {
+        if (m.get(name)) |paths| {
+            for (paths.items) |p| {
+                if (std.mem.lastIndexOfScalar(u8, p.fqn, '.')) |dot| {
+                    if (build.pkgTypeRename(name, p.fqn[0..dot])) |rn| return rn;
+                }
+            }
+        }
+    }
+    return null;
+}
+
 /// Resolve and install a class's nominal superclass edges after every class
 /// shell has been reserved. Method bodies then see the complete hierarchy
 /// regardless of declaration order.
@@ -923,7 +948,13 @@ pub fn populateClassSupertypes(
                 continue;
             }
         }
-        if (module.classIdIndexed(t.name.name, class_pkg, t.name.span.file)) |cid| {
+        // A package-mangled `internal` classifier: the reference follows the
+        // rename — its own file's map, its package's map, then an import of
+        // the declaring package.
+        const sup_name = build.fileOrPkgTypeRename(t.name.name, t.name.span.file.int()) orelse
+            importedPkgTypeRename(module, t.name.name, t.name.span.file) orelse
+            t.name.name;
+        if (module.classIdIndexed(sup_name, class_pkg, t.name.span.file)) |cid| {
             try supertypes.append(a, cid);
             try supertype_refs.append(a, try loweredTypeRef(a, t, false));
         }

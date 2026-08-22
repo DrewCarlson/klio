@@ -4729,7 +4729,9 @@ fn buildClassDef(
         // mangled lift name; the rename is keyed by the reference's own
         // span file, matching the file scope of the declaration.
         supertype_names[i] = if (t.qualified_path == null)
-            ir.build.fileTypeRename(t.name.name, t.span.file.int()) orelse t.name.name
+            ir.build.fileOrPkgTypeRename(t.name.name, t.span.file.int()) orelse
+                ir.lower.decl.importedPkgTypeRename(module, t.name.name, t.span.file) orelse
+                t.name.name
         else
             t.name.name;
         supertype_paths[i] = t.qualified_path;

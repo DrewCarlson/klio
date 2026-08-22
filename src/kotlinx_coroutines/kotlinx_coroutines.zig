@@ -2498,7 +2498,14 @@ pub fn hostBindings(allocator: std.mem.Allocator) std.mem.Allocator.Error!HostBi
     runtime.registerRunBoundaryHook(sweepRegistryAtRunBoundary);
     var b = HostBindings.init(allocator);
     errdefer b.deinit();
+    // Upstream's own `Channel(...)` factory (BufferedChannel and friends)
+    // serves every construction by default: the interpreted lock-free
+    // channel passes the whole conformance surface the native FIFO could
+    // not (segment invariants, precise cancellation windows).
+    // `KLIO_NATIVE_CHANNEL=1` restores the native factory for A/B.
+    const native_channel = if (runtime.envOnce("KLIO_NATIVE_CHANNEL")) |v| std.mem.eql(u8, v, "1") else false;
     for (BINDINGS) |entry| {
+        if (!native_channel and std.mem.eql(u8, entry.fqn, "kotlinx.coroutines.channels.Channel")) continue;
         try b.register(entry.fqn, entry.f);
     }
     inline for (CHANNEL_CLASS_FQNS) |class_fqn| {
@@ -2533,9 +2540,11 @@ fn makeCtx(host: *NoopHost, cap: *CaptureOutput, args: []const Value) CallCtx {
 test "host bindings registry populated" {
     var b = try hostBindings(testing.allocator);
     defer b.deinit();
-    try testing.expectEqual(@as(usize, BINDINGS.len + CHANNEL_CLASS_FQNS.len * CHANNEL_MEMBER_BINDINGS.len), b.len());
+    // The default registry skips the native `Channel(...)` factory (the
+    // upstream channel cutover).
+    try testing.expectEqual(@as(usize, BINDINGS.len - 1 + CHANNEL_CLASS_FQNS.len * CHANNEL_MEMBER_BINDINGS.len), b.len());
     try testing.expect(b.resolve("kotlinx.coroutines.__kxco_delayMillis") != null);
-    try testing.expect(b.resolve("kotlinx.coroutines.channels.Channel") != null);
+    try testing.expect(b.resolve("kotlinx.coroutines.channels.Channel") == null);
     try testing.expect(b.resolve("kotlinx.coroutines.channels.KlioBufferedChannel.send") != null);
     try testing.expect(b.resolve("kotlinx.coroutines.channels.KlioConflatedBufferedChannel.receive") != null);
     try testing.expect(b.resolve("kotlinx.coroutines.__kxco_rbPump") != null);
