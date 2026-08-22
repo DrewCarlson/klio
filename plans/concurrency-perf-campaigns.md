@@ -116,3 +116,36 @@ Work items:
 ## Running log
 
 - 2026-08-22: plan written. Task 1 started.
+- 2026-08-22 flip-rate measurement (5 classes x 3 SOLO runs, itest-exact
+  env): the group splits three ways.
+  - DETERMINISTIC (3/3): List.concurrentGlobalModifications_addAll,
+    List.concurrentMixingWriteApply_addAll_clear / _addAll_removeRange,
+    Map.concurrentModificationInGlobal_put_replace,
+    Map.concurrentMixingWriteApply_set / _clear,
+    Set.concurrentMixingWriteApply_add, Recomposer.validatePotentialDeadlock,
+    Pausable.resumeOnBackgroundThread.
+  - FLAKY SOLO: Set.concurrentGlobalModification_remove (1/3),
+    Recomposer.pausingTheFrameClockStopShouldBlockWithFrameNanos (2/3).
+  - LOAD-ONLY (pass 3/3 solo): List.concurrentGlobalModification_add,
+    Map.concurrentModificationInGlobal_put_new,
+    Pausable.markInvalidFromBackgroundThread, MovableContent/Recomposer
+    strays seen in gate runs.
+  - Every deterministic failure lands EXACTLY on its cap (30.2s on the
+    declared 30s runTest timeout, 10.3s on the 10s env cap, 90.2s on the
+    wall cap). These are TIMEOUTS, not lost writes: no assertion failure
+    observed anywhere in the group.
+- 2026-08-22 microbench (scratchpad/xthread.kt): an EMPTY
+  `launch(Dispatchers.Default) {}` costs ~1.5ms; an empty SAME-thread
+  launch ~2.2ms; a `withContext(Default)` round-trip ~2.9ms. KLIO_PROF
+  shows no sleeping (libc <2%) — the cost is flat interpreted compute:
+  string hashing for dispatch-cache keys (`hash`/`hashString`/`mum` ~10%,
+  via methodArgSig / memberSiteSig / instanceMethodKeyScoped), string
+  equality (`eqlBytes` 4.4%), and the interpreter loop. The GetField site
+  cache already serves field reads (mono+poly routes); the residue is the
+  breadth of interpreted upstream Job/context machinery per launch.
+  CONCLUSION: tasks 1 and 2 share one root — coroutine-op throughput —
+  and the fix surface is task-2/3-shaped (shorten or cache the hot
+  interpreted paths), NOT a memory-model race. Task 1 keeps two possibly
+  genuine correctness items: validatePotentialDeadlock (hang-vs-slow probe
+  under 400s wall in flight) and pausingTheFrameClockStopShouldBlockWithFrameNanos
+  (frame-clock ordering, flaky 2/3).
