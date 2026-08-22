@@ -129,8 +129,19 @@ Work items:
       until whole scalar loops stay in C (then the C compiler vectorizes).
       Value layout is settled at 24B (task 3), so the KV offsets are
       stable to build against.
-- [ ] Implement the inline hot-view sub-ABI; verify engagement with
-      KLIO_NATIVE_TRACE; hold 293/293 byte-parity.
+- [ ] Implement the REMAINING speedup work, now precisely characterized
+      (2026-08-22 diagnosis on rangebench, native 830ms vs interp 291ms):
+      (a) startup floor is 62ms (empty program) — fine; (b) the char-range
+      loop ESCAPES to the interpreter per iteration (52k `[native-miss]
+      hasNext/nextChar` — the step-progression protocol fns are stdlib-side
+      and not in the emitted set): either emit the counted char loop as C
+      like the int loops, or include reachable stdlib leaf fns in the
+      emitted set; (c) the int loops ARE inline C but run TAG-CHECKED per
+      op while the interpreter's BC tier runs FUSED counted loops over
+      untyped registers — the emitter needs the same counted-loop lowering
+      (typed C for-loops, tags spilled only at exits). (c) is the big one:
+      it is what lets the C compiler see a plain int64 loop and vectorize.
+- [ ] Verify engagement with KLIO_NATIVE_TRACE; hold 293/293 byte-parity.
 - [ ] Exit: a measured speedup on rangebench (target: beat interpreted
       JIT-off by a recorded factor, not neutrality), corpus parity intact,
       full battery green.
