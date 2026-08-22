@@ -77,7 +77,7 @@ the last measurement.
 | atomicfu | 67 | 0 | 67 / 0 |
 | ktor | 450 | 0 | 448 / 2 |
 | stdlib (sweep) | 117 files | 0 | 2301 / 0 |
-| compose_plugin | not re-measured | — | 1375 / 15 |
+| compose_plugin | 1375 | concurrency-group flakes | 1375 / 15 |
 
 - [ ] B1. **serialization descriptor fidelity.** klio has no serialization
       compiler plugin, so `T.serializer()` resolves to a reflective
@@ -2088,6 +2088,27 @@ lambda-body context. Next lead is the consumer of
       (`ArrayList<E>().apply(builderAction)`, the upstream JVM shape) so the
       spliced chain bottoms out in interpreted code that parks normally.
       Example: `examples/suspending_build_list.kt`. Coroutines 1299/0 — EVERY census suite at zero.
+
+- [x] B32. **SAM conversion had timing-dependent identity.** The
+      compose_plugin gate regressed on `CompositionTests.funInterface_isMemoized`:
+      `samConvertActivationArgs` wraps a lambda argument into a fun-interface
+      instance based on a direct-mapped per-func mask cache, so a cache
+      eviction between two compositions wrapped the SECOND `TestMemoizedFun`
+      argument and not the first — `remember { compute }` held the raw
+      closure and the recompose compared it against a fresh wrapper (the
+      pre-session pass was itself eviction-order luck). `equals` dispatched
+      ON the wrapper routes into the wrapped lambda, so the fix makes
+      equality see through the wrapper: `Value.samTargetOf` +
+      `structuralEq` unwraps either side, and the eval `==` arm
+      short-circuits SAM wrappers to structural equality before the member
+      dispatch. The plugin gate returned to its 1375 baseline (remaining
+      failures = the known concurrency group, inflated under battery load).
+      Also: the gate itest now prints the failing names BEFORE the baseline
+      expect, so a red gate is actionable.
+
+- compose_plugin standing (2026-08-22): 1375/15-under-load (baseline 1375,
+  MAX_FAILED 11 sized for solo runs; the concurrency group flips more under
+  8-way census load — measure the gate SOLO).
 
 ## Traps
 

@@ -2052,6 +2052,9 @@ pub fn samWrapForParamType(self: *VmHost, allocator: Allocator, v: *const Value,
     const pd = classDefByName(self, simple) orelse return null;
     defer pd.deinit();
     if (!classDefIsFunInterface(pd)) return null;
+    if (runtime.envOnce("KLIO_SAM_WRAP_TRACE") != null) {
+        std.debug.print("[sam-wrap] ty={s} simple={s}\n", .{ ty_name, simple });
+    }
     var fields: std.ArrayList(InstanceData.Field) = .empty;
     try fields.append(allocator, .{ .name = "__sam_target__", .value = v.* });
     const inst = try ObjRef(InstanceData).init(allocator, .{

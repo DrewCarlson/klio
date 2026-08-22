@@ -7623,6 +7623,19 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
     }
     if (operatorMethod(bo.op)) |method| {
         if (l == .Instance or r == .Instance) {
+            // A `fun interface` SAM wrapper has no equality of its own —
+            // dispatching `equals` on it routes into the wrapped lambda.
+            // Compare through the wrapper (structuralEq unwraps both
+            // sides), so a memoized lambda equals its converted form no
+            // matter which call boundary happened to wrap it.
+            if ((bo.op == .Eq or bo.op == .BoxedEq or bo.op == .NotEq or bo.op == .BoxedNotEq) and
+                (Value.samTargetOf(&l) != null or Value.samTargetOf(&r) != null))
+            {
+                const eqv = Value.structuralEq(&l, &r);
+                const bv = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eqv else eqv;
+                try frame.write(bo.dst, .{ .Bool = bv });
+                return .cont;
+            }
             // `a == b` dispatches `a.equals(b)`, but a builtin
             // collection carries only structural equality; when the
             // left operand is a builtin and the right is a user

@@ -481,9 +481,11 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
         "compose_plugin_commontest: {d} passed, {d} failed across {d} test classes, {d} did not complete (baseline {d})\n",
         .{ total_passed.load(.monotonic), total_failed.load(.monotonic), classes.items.len, hung.load(.monotonic), BASELINE },
     );
-    try std.testing.expect(total_passed.load(.monotonic) >= BASELINE);
+    // Names first: a red gate without the failing names is not actionable
+    // (the expect aborts the test body).
     const failed = total_failed.load(.monotonic);
     failed_names.report("compose_plugin_commontest");
+    try std.testing.expect(total_passed.load(.monotonic) >= BASELINE);
     if (failed > MAX_FAILED) {
         std.debug.print(
             "compose_plugin_commontest: {d} failed exceeds the ceiling {d}\n",
