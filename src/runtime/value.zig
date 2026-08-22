@@ -2964,7 +2964,28 @@ pub const Value = union(enum) {
         return structuralEq(a, b);
     }
 
+    /// The callable wrapped by a `fun interface` SAM wrapper, else null.
+    pub fn samTargetOf(v: *const Value) ?Value {
+        if (v.* != .Instance) return null;
+        const g = v.Instance.borrow();
+        defer g.deinit();
+        return g.get().get("__sam_target__");
+    }
+
     pub fn structuralEq(a: *const Value, b: *const Value) bool {
+        // A `fun interface` SAM wrapper equals the callable it wraps.
+        // Conversion happens at klio's call boundaries and is
+        // timing-dependent (a mask-cache eviction can wrap one
+        // composition's argument and not another's), so equality must see
+        // through the wrapper exactly as Kotlin sees one converted value —
+        // compose's `remember { compute }` memo comparison depends on it.
+        if (samTargetOf(a)) |ta| {
+            if (!(b.* == .Instance and ObjRef(InstanceData).ptrEq(a.Instance, b.Instance))) {
+                return structuralEq(&ta, b);
+            }
+        } else if (samTargetOf(b)) |tb| {
+            return structuralEq(a, &tb);
+        }
         if (a.isNumeric() and b.isNumeric()) {
             return switch (a.*) {
                 .Int => |x| b.* == .Int and x == b.Int,

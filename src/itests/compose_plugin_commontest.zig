@@ -137,6 +137,11 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     // classmates' passes stay counted. Generous enough for the compute-heavy
     // benchmark tests under 8-way contention.
     try map.put("KLIO_TEST_WALL_CAP", "90");
+    // Four children each defaulting to a half-the-cores compute pool
+    // oversubscribe the box 2x and inflate the concurrent classes'
+    // walls 3-8x. Cap each child so the children together match the
+    // core count.
+    try map.put("KLIO_MAX_WORKERS", "5");
     return map;
 }
 
@@ -144,7 +149,7 @@ fn workerCount() usize {
     const cores = std.Thread.getCpuCount() catch 4;
     // Half the cores, capped low: suites run beside sweeps and editors,
     // and each child is itself a multi-threaded interpreter.
-    return std.math.clamp(cores / 2, 1, 4);
+    return std.math.clamp(cores / 2, 1, 6);
 }
 
 fn runKlio(
@@ -481,9 +486,11 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
         "compose_plugin_commontest: {d} passed, {d} failed across {d} test classes, {d} did not complete (baseline {d})\n",
         .{ total_passed.load(.monotonic), total_failed.load(.monotonic), classes.items.len, hung.load(.monotonic), BASELINE },
     );
-    try std.testing.expect(total_passed.load(.monotonic) >= BASELINE);
+    // Names first: a red gate without the failing names is not actionable
+    // (the expect aborts the test body).
     const failed = total_failed.load(.monotonic);
     failed_names.report("compose_plugin_commontest");
+    try std.testing.expect(total_passed.load(.monotonic) >= BASELINE);
     if (failed > MAX_FAILED) {
         std.debug.print(
             "compose_plugin_commontest: {d} failed exceeds the ceiling {d}\n",
