@@ -115,9 +115,20 @@ the 256MB runCli initial-thread stack, `KLIO_NATIVE_TRACE` is the engagement
 oracle.
 
 Work items:
-- [ ] Re-read the transpiler plan's speedup design; confirm the sub-ABI
-      surface against the current Value layout (task 3 may change it — run
-      task 4 AFTER task 3 settles, or pin the layout first).
+- [x] Design re-read + REALITY RE-MEASURED (2026-08-22): the hot-view
+      sub-ABI partially EXISTS in the emitter (klio_hot_layout KV,
+      kv_const_int/int/long/bool inlines, kv_trace, kv_edge, div-guarded
+      scalar binop fast paths) — the plan's speedup section is half built.
+      Fresh A/B on rangebench: transpiled native 825-830ms vs TODAY'S
+      interpreter 291ms (ReleaseSafe harness, BC tier + recent levers) —
+      the interpreter has improved ~3.3x since the plan's recorded 0.97s/
+      0.83s numbers, so the C output is now ~2.9x SLOWER than interpreted.
+      The neutral-to-losing gap means the remaining exported-call ops
+      (loops' compare/branch/add run through klio_op_* calls per op)
+      dominate; the campaign's real work is extending the inline coverage
+      until whole scalar loops stay in C (then the C compiler vectorizes).
+      Value layout is settled at 24B (task 3), so the KV offsets are
+      stable to build against.
 - [ ] Implement the inline hot-view sub-ABI; verify engagement with
       KLIO_NATIVE_TRACE; hold 293/293 byte-parity.
 - [ ] Exit: a measured speedup on rangebench (target: beat interpreted
