@@ -823,7 +823,7 @@ pub fn newSynthInstance(self: *VmIntrinsicHost, class_fqn: []const u8, identity:
     // members (componentN, equals, toString). Reuse it so the synth instance
     // behaves like one the constructor would build, instead of the bare
     // field-bag stub below (which klio's klio-internal synth types — Grouping,
-    // SequenceScope, KlioChannel — are not data classes, so they keep).
+    // SequenceScope — are not data classes, so they keep).
     {
         const cg = self.classes.borrow();
         defer cg.deinit();
@@ -845,18 +845,7 @@ pub fn newSynthInstance(self: *VmIntrinsicHost, class_fqn: []const u8, identity:
             }
         }
     }
-    // Native channel synths carry the source implementation type plus the
-    // `Channel` interface hierarchy. This keeps runtime type checks accurate
-    // while extension resolution still finds `ReceiveChannel`/`SendChannel`
-    // properties such as `onReceive`, `onSend`, and `onReceiveCatching`.
-    const supertypes: []const []const u8 = if (std.mem.eql(u8, class_fqn, "kotlinx.coroutines.channels.KlioChannel"))
-        &.{ "Channel", "ReceiveChannel", "SendChannel" }
-    else if (std.mem.eql(u8, class_fqn, "kotlinx.coroutines.channels.KlioBufferedChannel"))
-        &.{ "BufferedChannel", "Channel", "ReceiveChannel", "SendChannel" }
-    else if (std.mem.eql(u8, class_fqn, "kotlinx.coroutines.channels.KlioConflatedBufferedChannel"))
-        &.{ "ConflatedBufferedChannel", "BufferedChannel", "Channel", "ReceiveChannel", "SendChannel" }
-    else
-        &.{};
+    const supertypes: []const []const u8 = &.{};
     const class_def = try ObjRef(ClassDef).init(self.allocator, .{
         .name = simple,
         .fqn = class_fqn,

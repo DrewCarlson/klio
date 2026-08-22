@@ -283,7 +283,6 @@ KLIO_ERR_TRACE=1 KLIO_THROW_TRACE=1 KLIO_THROW_STACK=1 ./zig-out/bin/klio run re
 | `KLIO_PUMP_DIAG` | set | The cooperative pump: loop/slot/parked dumps, the park/adopt/persist/take token lifecycle, stalled-pump dumps, idle-streak and exit-time sleep attribution | `[PUMP]`, `[tok]`, `[pump-streak]`, `[wall-timer]`, `[pump-sleep]` |
 | `KLIO_RESUME_TRACE` | set | The resumer's identity and frame chain, then one line per frame a resume drive re-runs, with `path:line`, the delivery route (`via=pump-ready`, `inline-claim`, `persisted-on-top`, ...), and the activation id. Catches double delivery | `[resume-call]`, `[resume-frame]` |
 | `KLIO_SCOPE_DIAG` | set | The coroutine active-scope stack lifecycle: capture/restore on park and resume, guard enter/leave, push/pop | `[scope]` |
-| `KLIO_CHAN_DIAG` | set | The channel-waiter cancellation lifecycle: arming, watcher bind/drop, handler firing, waiter removal | `[chan]` |
 | `KLIO_NO_INLINE_RESUME` | set disables | Forces every continuation resume to queue on the pump instead of running inline on the caller's stack | none |
 | `KLIO_PUMP_NOSLEEP` | set | Skips the 1 ms sleep slice in the wall-clock timer drain (busy-loops instead) | none |
 | `KLIO_SYNC_RESUME` | `1` to enable (default off) | A cross-thread Kotlin `resumeWith` post waits (bounded) for the owner pump to run the routed step before the caller continues, instead of the fire-and-forget default | none |

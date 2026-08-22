@@ -1498,8 +1498,7 @@ pub fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const
                 cg.deinit();
             }
             // The name walk sees only the ClassTable's simple-name entries;
-            // a chain that crosses a host-synth class (KlioBufferedChannel
-            // -> BufferedChannel -> Channel -> ReceiveChannel) can break
+            // a chain that crosses a host-synth class can break
             // where a name is registered differently. `instanceOf` is the
             // authoritative subtype answer — the same one `is` uses.
             return host_classes.instanceOf(self, receiver, .{ .name = pn, .nullable = false, .args = &.{} });
@@ -8901,12 +8900,11 @@ pub fn invokeVirtualMember(
     const slot_name: ?[]const u8 = if (module.funcById(FuncId.from(slot.int()))) |f| f.name else null;
     // A host-synthesized class implements its members as native intrinsics
     // keyed by its own FQN, and that binding is the most-derived override of
-    // the slot. The synth's `supertype_names` exist for type checks (a
-    // KlioBufferedChannel names BufferedChannel), so linking the slot through
-    // them would enter the supertype's Kotlin body — which reads internal
-    // fields the native implementation never materializes. Only anonymous
-    // (runtime-built) classes can carry such bindings, so named classes skip
-    // the probe.
+    // the slot. The synth's `supertype_names` exist for type checks, so
+    // linking the slot through them would enter the supertype's Kotlin body —
+    // which reads internal fields the native implementation never
+    // materializes. Only anonymous (runtime-built) classes can carry such
+    // bindings, so named classes skip the probe.
     if (slot_name) |n| {
         const anon = blk: {
             const class = runtime_def.borrow();
@@ -8976,13 +8974,11 @@ pub fn invokeVirtualMember(
     }
     // A main-module slot link on an ANONYMOUS receiver class is a
     // supertype-matched guess: the synth lists upstream classes for type
-    // checks (a KlioBufferedChannel names BufferedChannel), and entering
-    // the supertype's Kotlin body bypasses the pack's shadowing extension
-    // properties — `ch.onReceive` inside a select must reach the klio
-    // clause glue, not upstream's SelectClause machinery. Dispatch by
-    // name so the full ladder (host bindings, extension properties, anon
-    // methods) serves; a SAM conversion keeps the slot path (its stored
-    // lambda is served below by target signature).
+    // checks, and entering the supertype's Kotlin body bypasses the pack's
+    // shadowing extension properties. Dispatch by name so the full ladder
+    // (host bindings, extension properties, anon methods) serves; a SAM
+    // conversion keeps the slot path (its stored lambda is served below by
+    // target signature).
     if (linked == .main_func) {
         const anon_recv = blk: {
             const class = runtime_def.borrow();

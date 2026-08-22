@@ -2110,6 +2110,21 @@ lambda-body context. Next lead is the consumer of
   MAX_FAILED 11 sized for solo runs; the concurrency group flips more under
   8-way census load — measure the gate SOLO).
 
+- [x] B33. **Native channel machinery DELETED.** The upstream cutover held
+      through every gate, so the `KLIO_NATIVE_CHANNEL` lever and the whole
+      native FIFO went away rather than rotting behind a flag:
+      `ChannelState`/`Deque`, the factory and all channel member bindings,
+      the waiter/watcher lifecycle (`armChannelCancel`, `channelCancelWaiter`,
+      `resumeWaiterNormal`, `chanResumeNow`), the select bridge intrinsics,
+      the iterator machinery, the registry's channel fields + GC root, the
+      `KlioChannelClauses.kt` select glue and KlioRuntime.kt's
+      `__kxco_chan*` declarations, and the `KLIO_CHAN_DIAG` knob
+      (src/kotlinx_coroutines 3073 -> 757 lines). Upstream `BufferedChannel`
+      carries its own select clauses and cancellation, so nothing replaces
+      them. The host-synth supertype arms for the Klio channel classes went
+      too; general synth/anon dispatch mechanisms stay (comments no longer
+      cite the deleted classes as their motivating example).
+
 ## Traps
 
 - `zig-out/bin/klio` goes stale silently. A pack build against a stale binary
