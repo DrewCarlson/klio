@@ -2249,7 +2249,9 @@ fn runtimeMemberApplicability(
     arg_names: ?[]const ?[]const u8,
     named: bool,
 ) Allocator.Error!?applicability.Score {
-    var shapes_buf: [24]applicability.ArgShape = undefined;
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
+    // entry; >6 args fall to the heap branch below (rare).
+    var shapes_buf: [6]applicability.ArgShape = undefined;
     const shapes = if (args.len <= shapes_buf.len)
         shapes_buf[0..args.len]
     else
@@ -3164,7 +3166,9 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
         }
         return f;
     }
-    var shapes_buf: [24]applicability.ArgShape = undefined;
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
+    // entry; >6 args fall to the heap branch below (rare).
+    var shapes_buf: [6]applicability.ArgShape = undefined;
     var shapes_heap: ?[]applicability.ArgShape = null;
     defer if (shapes_heap) |h| self.allocator.free(h);
     const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
@@ -12138,7 +12142,9 @@ fn extKeyGreater(a: ExtKey, b: ExtKey) bool {
 }
 
 fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Value, candidates: []const Candidate, args: []const Value) Allocator.Error!?Candidate {
-    var shapes_buf: [24]applicability.ArgShape = undefined;
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
+    // entry; >6 args fall to the heap branch below (rare).
+    var shapes_buf: [6]applicability.ArgShape = undefined;
     const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
         shapes_buf[0..args.len]
     else

@@ -1031,7 +1031,9 @@ fn pickOverloadInner(self: *VmHost, module: *const Module, func: FuncId, args: [
     const candidates = module.funcsBySimpleName(name);
     if (candidates.len < 2) return null;
 
-    var shapes_buf: [24]applicability.ArgShape = undefined;
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
+    // entry; >6 args fall to the heap branch below (rare).
+    var shapes_buf: [6]applicability.ArgShape = undefined;
     var shapes_heap: ?[]applicability.ArgShape = null;
     defer if (shapes_heap) |h| self.allocator.free(h);
     const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
@@ -1906,7 +1908,9 @@ pub fn pickNamedOverloadIdRecv(
     if (candidates.len < 2) return null;
     const baked_is_ext = paramIsThis(f0.params);
 
-    var shapes_buf: [24]applicability.ArgShape = undefined;
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
+    // entry; >6 args fall to the heap branch below (rare).
+    var shapes_buf: [6]applicability.ArgShape = undefined;
     var shapes_heap: ?[]applicability.ArgShape = null;
     defer if (shapes_heap) |h| self.allocator.free(h);
     const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
@@ -2848,7 +2852,9 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     // (`ParagraphIntrinsics(annotations = …)` picked the deprecated
     // `spanStyles` overload and dropped the annotations).
     var any_named = false;
-    var shapes_buf: [24]applicability.ArgShape = undefined;
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
+    // entry; >6 args fall to the heap branch below (rare).
+    var shapes_buf: [6]applicability.ArgShape = undefined;
     const shapes = if (args.len <= shapes_buf.len)
         shapes_buf[0..args.len]
     else

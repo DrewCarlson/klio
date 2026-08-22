@@ -115,6 +115,14 @@ Work items:
 
 ## Running log
 
+- 2026-08-22 PERF BATCH 2: every remaining `[24]ArgShape` scratch shrunk
+  to `[6]` (heap fallback covers the rare rest) — oneRect 61 -> 60s,
+  contains(1000) 5.0 -> 4.87ms. ReleaseFast A/B DATA POINT (not adopted):
+  the harness at ReleaseFast runs oneRect in 48s vs 60s (-20%), contains
+  4.47ms, launch 190us — the whole delta is Zig safety machinery (stack
+  0xAA fills we cannot reach + allocator poison + bounds checks). Whether
+  the GATE should trade safety checking for 20% wall is a build-policy
+  call for the user; recorded, not switched.
 - 2026-08-22 PERF BATCH 1 (tasks 2+3): the top profile frame of the heavy
   compose classes was memset (15.5% of oneRectBenchmarkSimulation) — Zig
   safety builds 0xAA-fill every `undefined` stack array at its DECLARED
