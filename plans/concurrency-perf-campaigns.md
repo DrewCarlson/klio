@@ -86,23 +86,24 @@ Work items:
       the current measured baseline (record it first), with the gate still at
       its pass baseline.
 
-## Task 3 — Value layout stage 5b (measure-first)
+## Task 3 — Value layout stage 5b (RESOLVED: further along than assumed)
 
-The value-layout campaign shrank `Value` 56B -> 40B; stage 5b (toward 16B
-boxing) is pinned open with a measure-first discipline: the interpreter is
-compute-bound, so layout wins multiply everything, but the last attempt
-recorded measured-negative roads (see `klio-static-dispatch-bake` /
-`klio-value-layout-campaign` memories for the traps).
+Plan correction (2026-08-22): the value-layout campaign is FURTHER along
+than this tracker assumed — per `plans/value-layout-campaign.md`, stage 5b's
+first half LANDED and `Value` = 24B today (hot-layout-confirmed). Only
+stage 5c (24 -> 16: Array pointer-bit tag + IrClosure boxing) remains, and
+it is DEFERRED by its own recorded measurement discipline: IrClosure boxing
+adds an allocation to compose's hottest creation path (the profile's
+`buildAstLambdaWithFlagFuncid`), so it re-opens only when a measurement
+motivates it, gated on the compose plugin wall as well as rangebench.
 
-Work items:
-- [ ] Re-measure the standing baseline (rangebench + a compose heavy + the
-      stdlib sweep wall) on the CURRENT tree before any change.
-- [ ] Prototype the 5b boxing step behind a build option if the change is
-      structural; measure each step against the recorded baseline; keep only
-      measured-positive steps.
-- [ ] Exit: either a landed, measured-positive layout step with the full
-      battery green, or a recorded disproof in the value-layout plan closing
-      stage 5b with numbers.
+- [x] Baseline re-measured on the current tree (post perf batches 1+2):
+      rangebench 290ms warm on the ReleaseSafe harness (1650ms cold with
+      bake load), oneRect 60s, SnapshotStateList.contains(1000) 4.87ms.
+- [x] Exit satisfied per the task's own terms: the landed measured-positive
+      step is 5b-first-half (Value 24B, prior session); 5c's deferral with
+      numbers is recorded in the value-layout plan. Nothing to do here until
+      a profile shows Value-copy traffic dominating.
 
 ## Task 4 — C transpiler speedup (inline hot-view sub-ABI)
 
