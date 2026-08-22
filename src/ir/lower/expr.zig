@@ -6105,6 +6105,19 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
             const nm = try b.module.internConst(b.allocator, .{ .String = mname });
             const dst = b.allocReg();
+            // An unsafe-cast receiver fixes the static type for overload
+            // resolution even on this dynamic bail: `(this as Flow<T>)
+            // .catch(action)` in the deprecated SharedFlow.catch stub must
+            // never re-bind the stub on the runtime SharedFlow receiver
+            // (kotlinc binds the general Flow.catch through the cast; the
+            // re-bind self-recursed to stack overflow).
+            const bail_declared: ?ir.ConstId = blk: {
+                if (receiver.* != .As or receiver.As.safe) break :blk null;
+                const t = argDeclTypeRef(b, receiver) orelse break :blk null;
+                const head = std.mem.trimEnd(u8, t.name, "?");
+                if (head.len == 0) break :blk null;
+                break :blk try b.module.internConst(b.allocator, .{ .String = head });
+            };
             try b.push(.{ .CallMember = .{
                 .dst = dst,
                 .receiver = recv,
@@ -6113,6 +6126,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 .args = run[0],
                 .n_args = run[1],
                 .arg_names = arg_names,
+                .declared_recv = bail_declared,
             } });
             return dst;
         }
@@ -8771,7 +8785,8 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
     return !recv_mismatch and
         (f.is_suspend or argLambdaHasNonlocalReturn(args) or
             inline_call.argsForwardInlineLambda(b, args) or has_reified or shadowed_by_member or
-            companion_super_member or member_body_ext);
+            companion_super_member or member_body_ext or
+            inline_call.argLambdaMaySuspend(b, f, args));
 }
 
 /// True when `owner` names a companion object (a `$Companion`-mangled

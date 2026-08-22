@@ -86,6 +86,88 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(buildable);
 }
 
+/// `__klio_freezeList(list)` — flip an already-built list read-only in
+/// place: the frozen counter rejects mutation through every leaked view,
+/// and an empty result collapses to the shared empty singleton. The
+/// suspension-safe `buildListInternal` builds through interpreted
+/// `ArrayList().apply(builderAction)` (so a suspending builder parks
+/// normally) and freezes here — no lambda ever crosses this boundary.
+pub fn builders_freeze_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len != 1 or ctx.args[0] != .List) {
+        return .{ .err = .{ .Type = "__klio_freezeList expects a List" } };
+    }
+    var buildable = ctx.args[0];
+    if (buildable.List.mod_count.get()) |mc| {
+        const g = mc.borrowMut();
+        g.get().* |= collections.FROZEN_MOD_BIT;
+        g.deinit();
+    }
+    const list_empty = blk: {
+        const g = buildable.List.items.borrow();
+        defer g.deinit();
+        break :blk g.get().items.len == 0;
+    };
+    if (list_empty) {
+        return ok(try collections.sharedEmptyList(ctx.allocator));
+    }
+    buildable.retain();
+    buildable.List.mutable = false;
+    return ok(buildable);
+}
+
+/// `__klio_freezeSet(set)` — as `__klio_freezeList` for `buildSet`.
+pub fn builders_freeze_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len != 1 or ctx.args[0] != .Set) {
+        return .{ .err = .{ .Type = "__klio_freezeSet expects a Set" } };
+    }
+    var buildable = ctx.args[0];
+    if (buildable.Set.mod_count.get()) |mc| {
+        const g = mc.borrowMut();
+        g.get().* |= collections.FROZEN_MOD_BIT;
+        g.deinit();
+    }
+    const set_empty = blk: {
+        const g = buildable.Set.items.borrow();
+        defer g.deinit();
+        break :blk g.get().items.len == 0;
+    };
+    if (set_empty) {
+        return ok(try collections.sharedEmptySet(ctx.allocator));
+    }
+    buildable.retain();
+    buildable.Set.mutable = false;
+    return ok(buildable);
+}
+
+/// `__klio_freezeMap(map)` — as `__klio_freezeList` for `buildMap`.
+pub fn builders_freeze_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len != 1 or ctx.args[0] != .Map) {
+        return .{ .err = .{ .Type = "__klio_freezeMap expects a Map" } };
+    }
+    var buildable = ctx.args[0];
+    {
+        const g = buildable.Map.entries.borrow();
+        const mc = g.get().mod_count;
+        g.deinit();
+        if (mc.get()) |cell| {
+            const cg = cell.borrowMut();
+            cg.get().* |= collections.FROZEN_MOD_BIT;
+            cg.deinit();
+        }
+    }
+    const map_empty = blk: {
+        const g = buildable.Map.entries.borrow();
+        defer g.deinit();
+        break :blk g.get().pairs.items.len == 0;
+    };
+    if (map_empty) {
+        return ok(try collections.sharedEmptyMap(ctx.allocator));
+    }
+    buildable.retain();
+    buildable.Map.mutable = false;
+    return ok(buildable);
+}
+
 pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args.len > 2) {
         return arityErr("buildSet expects (block) or (capacity, block)");

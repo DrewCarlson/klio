@@ -247,6 +247,151 @@ pub fn argLambdaHasNonlocalReturn(args: []const Expr) bool {
     return false;
 }
 
+/// Does any argument lambda contain a call that can SUSPEND (any same-name
+/// declaration is a suspend fn)? An inline fn's inline lambda inherits the
+/// caller's suspend capability, so such a call site must SPLICE — the
+/// host-served intrinsic route runs the lambda across a non-suspending
+/// native boundary and a real suspension is lost (`toList()` =
+/// `buildList { consumeEach { add(it) } }` dropped the consume).
+/// Descends into nested lambdas: their suspension crosses this frame too.
+pub fn argLambdaMaySuspend(b: *const FuncBuilder, f: *const ast.Function, args: []const Expr) bool {
+    // The receiver heads a bare call inside the argument lambda can bind
+    // against: each fn-typed parameter's declared lambda receiver, plus the
+    // ENCLOSING function's own receiver (the receiver tower a spliced lambda
+    // body still sees — `consumeEach` inside `toList()`'s builder binds
+    // this@toList, a ReceiveChannel).
+    var heads_buf: [6][]const u8 = undefined;
+    var n_heads: usize = 0;
+    for (f.params) |*p| {
+        if (p.ty.function) |pf| {
+            if (pf.receiver) |r| {
+                if (n_heads < heads_buf.len) {
+                    heads_buf[n_heads] = r.name.name;
+                    n_heads += 1;
+                }
+            }
+        }
+    }
+    if (b.recvTy()) |rt| {
+        if (n_heads < heads_buf.len) {
+            heads_buf[n_heads] = rt;
+            n_heads += 1;
+        }
+    }
+    if (b.spliceRecvTy()) |rt| {
+        if (n_heads < heads_buf.len) {
+            heads_buf[n_heads] = rt;
+            n_heads += 1;
+        }
+    }
+    const heads = heads_buf[0..n_heads];
+    for (args) |*a| {
+        switch (a.*) {
+            .Lambda => |l| if (suspendScanStmts(b, heads, l.body.stmts)) return true,
+            .AnonFun => |af| {
+                const body = af.body orelse continue;
+                switch (body.*) {
+                    .Block => |blk| if (suspendScanStmts(b, heads, blk.stmts)) return true,
+                    .Expr => |*ex| if (suspendScan(b, heads, ex)) return true,
+                }
+            },
+            else => continue,
+        }
+    }
+    return false;
+}
+
+fn callNameMaySuspend(b: *const FuncBuilder, heads: []const []const u8, name: []const u8) bool {
+    // A suspend candidate counts only when the receivers visible to the
+    // lambda body could actually bind it: it is receiverless, or its
+    // declared receiver accepts one of the visible receiver heads. Without
+    // the filter, ByteWriteChannel's suspend `writeInt` forced a splice of
+    // ktor's `buildPacket { writeInt(1) }` — whose call binds the plain
+    // Sink member — and the forced splice broke the receiver binding.
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (!f.is_suspend) continue;
+        const is_ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+        if (!is_ext) return true;
+        const want = typeHeadOf(f.params[0].ty.name);
+        for (heads) |h| {
+            if (std.mem.eql(u8, h, want) or b.module.classIsOrExtends(h, want)) return true;
+        }
+    }
+    return false;
+}
+
+fn typeHeadOf(n: []const u8) []const u8 {
+    var h = std.mem.trimEnd(u8, n, "?");
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    return h;
+}
+
+fn suspendScanStmts(b: *const FuncBuilder, heads: []const []const u8, stmts: []const Stmt) bool {
+    for (stmts) |*s| {
+        const hit = switch (s.*) {
+            .Expr => |*e| suspendScan(b, heads, e),
+            .Assign => |asg| suspendScan(b, heads, &asg.target) or suspendScan(b, heads, &asg.value),
+            .DestructuringDecl => |d| suspendScan(b, heads, &d.init),
+            .Decl => |decl| switch (decl) {
+                .Property => |p| if (p.init) |*init| suspendScan(b, heads, init) else false,
+                else => false,
+            },
+        };
+        if (hit) return true;
+    }
+    return false;
+}
+
+fn suspendScan(b: *const FuncBuilder, heads: []const []const u8, e: *const Expr) bool {
+    return switch (e.*) {
+        .Call => |c| blk: {
+            const cname: ?[]const u8 = switch (c.callee.*) {
+                .Path => |pth| if (pth.segments.len != 0) pth.segments[pth.segments.len - 1].name else null,
+                .Member => |m| m.name.name,
+                else => null,
+            };
+            if (cname) |n| {
+                if (callNameMaySuspend(b, heads, n)) break :blk true;
+            }
+            break :blk suspendScan(b, heads, c.callee) or suspendScanArgs(b, heads, c.args);
+        },
+        .Lambda => |l| suspendScanStmts(b, heads, l.body.stmts),
+        .AnonFun => |af| blk3: {
+            const body = af.body orelse break :blk3 false;
+            break :blk3 switch (body.*) {
+                .Block => |blkb| suspendScanStmts(b, heads, blkb.stmts),
+                .Expr => |*ex| suspendScan(b, heads, ex),
+            };
+        },
+        .Member => |m| suspendScan(b, heads, m.receiver),
+        .Unary => |u| suspendScan(b, heads, u.expr),
+        .Postfix => |pf| suspendScan(b, heads, pf.expr),
+        .Spread => |sp| suspendScan(b, heads, sp.expr),
+        .Throw => |t| suspendScan(b, heads, t.value),
+        .Labeled => |l| suspendScan(b, heads, l.expr),
+        .As => |a| suspendScan(b, heads, a.expr),
+        .IsCheck => |c| suspendScan(b, heads, c.expr),
+        .MemberRef => |r| suspendScan(b, heads, r.receiver),
+        .Index => |i| suspendScan(b, heads, i.receiver) or suspendScanArgs(b, heads, i.args),
+        .Binary => |bin| suspendScan(b, heads, bin.lhs) or suspendScan(b, heads, bin.rhs),
+        .If => |i| suspendScan(b, heads, i.cond) or suspendScan(b, heads, i.then_branch) or
+            (if (i.else_branch) |eb| suspendScan(b, heads, eb) else false),
+        .While => |w| suspendScan(b, heads, w.cond) or suspendScan(b, heads, w.body),
+        .DoWhile => |dw| (if (dw.body) |body| suspendScan(b, heads, body) else false) or suspendScan(b, heads, dw.cond),
+        .For => |f| suspendScan(b, heads, f.iter) or suspendScan(b, heads, f.body),
+        .Block => |blk2| suspendScanStmts(b, heads, blk2.stmts),
+        else => false,
+    };
+}
+
+fn suspendScanArgs(b: *const FuncBuilder, heads: []const []const u8, args: []const Expr) bool {
+    for (args) |*a| {
+        if (suspendScan(b, heads, a)) return true;
+    }
+    return false;
+}
+
 /// Recover the original literal when an inline body forwards one of its
 /// lambda parameters to another inline call. The forwarding expression is a
 /// plain path in the callee body, but Kotlin keeps the original lambda inline

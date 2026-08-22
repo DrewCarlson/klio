@@ -37,28 +37,44 @@ private fun <K, V> __klio_buildMap(builderAction: MutableMap<K, V>.() -> Unit): 
 private fun <K, V> __klio_buildMap(capacity: Int, builderAction: MutableMap<K, V>.() -> Unit): Map<K, V> =
     error("intrinsic kotlin.collections.__klio_buildMap not installed")
 
+// Pure-Kotlin builder invocation (the upstream JVM actuals' shape): the
+// builder lambda runs INLINE in the caller, so a suspending builder
+// (`toList()` = `buildList { consumeEach(::add) }`) parks and resumes like
+// any other suspend code — the native builder intrinsics invoked the lambda
+// across a non-suspending host boundary and dropped the activation. The
+// read-only contract is restored AFTER the build by the freeze intrinsics,
+// which never touch a lambda.
+private fun <E> __klio_freezeList(list: MutableList<E>): List<E> =
+    error("intrinsic kotlin.collections.__klio_freezeList not installed")
+
+private fun <E> __klio_freezeSet(set: MutableSet<E>): Set<E> =
+    error("intrinsic kotlin.collections.__klio_freezeSet not installed")
+
+private fun <K, V> __klio_freezeMap(map: MutableMap<K, V>): Map<K, V> =
+    error("intrinsic kotlin.collections.__klio_freezeMap not installed")
+
 internal actual inline fun <E> buildListInternal(builderAction: MutableList<E>.() -> Unit): List<E> {
-    return __klio_buildList(builderAction)
+    return __klio_freezeList(ArrayList<E>().apply(builderAction))
 }
 
 internal actual inline fun <E> buildListInternal(capacity: Int, builderAction: MutableList<E>.() -> Unit): List<E> {
-    return __klio_buildList(capacity, builderAction)
+    return __klio_freezeList(ArrayList<E>(capacity).apply(builderAction))
 }
 
 internal actual inline fun <E> buildSetInternal(builderAction: MutableSet<E>.() -> Unit): Set<E> {
-    return __klio_buildSet(builderAction)
+    return __klio_freezeSet(LinkedHashSet<E>().apply(builderAction))
 }
 
 internal actual inline fun <E> buildSetInternal(capacity: Int, builderAction: MutableSet<E>.() -> Unit): Set<E> {
-    return __klio_buildSet(capacity, builderAction)
+    return __klio_freezeSet(LinkedHashSet<E>(capacity).apply(builderAction))
 }
 
 internal actual inline fun <K, V> buildMapInternal(builderAction: MutableMap<K, V>.() -> Unit): Map<K, V> {
-    return __klio_buildMap(builderAction)
+    return __klio_freezeMap(LinkedHashMap<K, V>().apply(builderAction))
 }
 
 internal actual inline fun <K, V> buildMapInternal(capacity: Int, builderAction: MutableMap<K, V>.() -> Unit): Map<K, V> {
-    return __klio_buildMap(capacity, builderAction)
+    return __klio_freezeMap(LinkedHashMap<K, V>(capacity).apply(builderAction))
 }
 
 // The interpreter's arrays are exact-sized; collection-to-array

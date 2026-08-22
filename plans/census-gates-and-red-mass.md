@@ -71,7 +71,7 @@ the last measurement.
 |---|---|---|---|
 | serialization | 138 | 0 | 57 / 81 — AT ZERO |
 | datetime | 519 | 0 | 457 / 62 — AT ZERO |
-| coroutines | 1296 | 3 | 1073 / 141 (+6 DNC) |
+| coroutines | 1299 | 0 — AT ZERO | 1073 / 141 (+6 DNC) |
 | io | 1191 | 0 | 1182 / 9 |
 | androidx_collection | 1841 | 0 | 1309 / 15 |
 | atomicfu | 67 | 0 | 67 / 0 |
@@ -2061,6 +2061,33 @@ lambda-body context. Next lead is the consumer of
       variant, and every chain comparison (argDefinitelyNotParamType walk,
       class_super_names tailMatch, receiverImplementsHead) also matches a
       chain entry's source spelling.
+
+- [x] B30. **The dynamic member bail carries an unsafe-cast receiver's
+      declared type.** `(this as Flow<T>).catch(action)` in the deprecated
+      `SharedFlow.catch` stub lowered to a plain dynamic CallMember with no
+      static evidence when a batch sibling (test-utils' reified
+      `LaunchFlowBuilder.catch`) pushed the site off the direct path — the
+      runtime extension pick then re-bound the SharedFlow stub on the
+      runtime receiver and self-recursed to stack overflow (the batch-only
+      onSubscriptionThrows failures). The bail now stamps `declared_recv`
+      from the cast, and the extension-selection filter excludes the
+      subtype-declared candidate, exactly as kotlinc resolves through the
+      cast. Both onSubscriptionThrows tests pass in-batch.
+
+- [x] B31. **Suspending inline-builder lambdas never cross the host
+      boundary.** `ReceiveChannel.toList()` = `buildList { consumeEach(::add) }`
+      — the builder lambda SUSPENDS per element, but the call lowered to the
+      native `__klio_buildList` intrinsic, which invokes the lambda across a
+      non-suspending seam: the suspension was dropped
+      ("[SUSPEND-LOST] ... activation dropped", the last census failure).
+      Two-part fix: (1) `argLambdaMaySuspend` — the bare-inline splice gate
+      also splices when an argument lambda contains a call with any suspend
+      declaration (an inline lambda inherits the caller's suspend
+      capability), so `buildList` expands through its source chain; (2) the
+      klio `buildListInternal` actuals are pure Kotlin
+      (`ArrayList<E>().apply(builderAction)`, the upstream JVM shape) so the
+      spliced chain bottoms out in interpreted code that parks normally.
+      Example: `examples/suspending_build_list.kt`. Coroutines 1299/0 — EVERY census suite at zero.
 
 ## Traps
 
