@@ -131,15 +131,18 @@ const ChannelState = struct {
         self.close_handlers.deinit(allocator);
     }
 
-    fn removeSelectInst(deque: *Deque(ObjRef(InstanceData)), sel: ObjRef(InstanceData)) void {
+    fn removeSelectInst(deque: *Deque(ObjRef(InstanceData)), sel: ObjRef(InstanceData)) bool {
+        var removed = false;
         var i: usize = 0;
         while (i < deque.items.items.len) {
             if (ObjRef(InstanceData).ptrEq(deque.items.items[i], sel)) {
                 _ = deque.items.orderedRemove(i);
+                removed = true;
                 continue;
             }
             i += 1;
         }
+        return removed;
     }
 };
 
@@ -223,6 +226,10 @@ const CoroutineRegistry = struct {
     /// dispatched runnable is in flight, consumed by `__kxco_chanResumeNow`
     /// when the dispatcher runs it.
     chan_pending_resume: std.AutoHashMapUnmanaged(i64, Value) = .empty,
+    /// For a dispatched ITERATOR delivery (`HandToIter`), the iterator
+    /// instance whose `__pending__` holds the element — the cancel-window
+    /// intercept reads the element back from it.
+    chan_iter_pending: std.AutoHashMapUnmanaged(i64, ObjRef(InstanceData)) = .empty,
 };
 
 var coro_reg_mutex: runtime.SpinMutex = .{};
@@ -290,6 +297,7 @@ fn sweepRegistryAtRunBoundary() void {
     coro_reg.chan_watchers.deinit(regAllocator());
     coro_reg.chan_delivered.deinit(regAllocator());
     coro_reg.chan_pending_resume.deinit(regAllocator());
+    coro_reg.chan_iter_pending.deinit(regAllocator());
     coro_reg = .{};
 }
 
@@ -756,22 +764,24 @@ fn resumeWaiterNormal(ctx: *CallCtx, slot: i64, value: Value, scope: Value) void
         switch (code) {
             1 => {
                 // Dispatched; the runnable delivers (it may already have, if
-                // the dispatcher ran it synchronously). The watcher completes
-                // now: the waiter irrevocably owns the value.
+                // the dispatcher ran it synchronously). The watcher STAYS
+                // ARMED until the runnable actually resumes: a cancel landing
+                // in the delivery-to-dispatch window must intercept the
+                // stashed value and run `onUndeliveredElement` — dropping the
+                // watcher here made that cancel invisible. The runnable's
+                // `chanResumeNow` completes the watcher on delivery.
                 //
                 // The waiter's dispatcher (a `runTest` `TestCoroutineScheduler`)
                 // orders this resume on ITS queue, not the pump's ready queue,
                 // so mark the owning pump: its dispatched resumes (a `yield`)
                 // must keep the inline shortcut rather than defer to `drv.ready`.
                 ctx.host.markSlotOwnerSchedulerBacked(slot);
-                dropWatcher(ctx, slot);
                 return;
             },
             3 => {
                 // The runnable is ordered with every other KlioDispatcher
-                // task on the pump. Unlike an external scheduler, it does not
-                // change how the pump's own ready queue is drained.
-                dropWatcher(ctx, slot);
+                // task on the pump. Same delivery-window rule as code 1: the
+                // watcher completes when the runnable delivers.
                 return;
             },
             2 => {
@@ -806,7 +816,13 @@ fn chanResumeNow(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         else => return .{ .ok = .Unit },
     };
     const v = takePendingResume(slot) orelse return .{ .ok = .Unit };
+    {
+        coro_reg_mutex.lock();
+        defer coro_reg_mutex.unlock();
+        _ = coro_reg.chan_iter_pending.remove(slot);
+    }
     ctx.host.coroutineResumeContinuation(slot, v, ctx.out);
+    dropWatcher(ctx, slot);
     return .{ .ok = .Unit };
 }
 
@@ -861,7 +877,49 @@ fn channelCancelWaiter(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             found = removeWaiterBySlotLosing(state, slot, &lost, &lost_scope);
         }
     }
-    if (!found) return .{ .ok = .Unit };
+    if (!found) {
+        // The waiter may already be OUT of the queues with its element
+        // stashed for a dispatched resume (`chan_pending_resume`): the
+        // cancel landed in the window between delivery and dispatch. The
+        // element is then undelivered — run the handler, report a failing
+        // one as unhandled (the coroutine is unwinding), and resume the
+        // slot with the cancellation instead of the value.
+        if (takePendingResume(slot)) |pending| {
+            var element: ?Value = pending;
+            if (pending == .Instance) {
+                // A `receiveCatching` waiter stashes a ChannelResult
+                // wrapper; the element is its payload.
+                const g = pending.Instance.borrow();
+                defer g.deinit();
+                if (g.get().get("value")) |inner| element = inner;
+            }
+            if (pending == .Bool) {
+                // An ITERATOR delivery: the element sits in the iterator's
+                // `__pending__` field.
+                element = null;
+                const iter_opt: ?ObjRef(InstanceData) = blk: {
+                    coro_reg_mutex.lock();
+                    defer coro_reg_mutex.unlock();
+                    if (coro_reg.chan_iter_pending.fetchRemove(slot)) |kv| break :blk kv.value;
+                    break :blk null;
+                };
+                if (iter_opt) |it| {
+                    const g = it.borrow();
+                    defer g.deinit();
+                    if (g.get().get("__pending__")) |pv| element = pv;
+                }
+            }
+            if (element) |e| {
+                const handler = undeliveredHandler(id);
+                defer if (runtime.reclaimEnabled()) handler.release(ctx.allocator);
+                if (try runUndelivered(ctx, handler, e)) |err| reportUndeliveredUnhandled(ctx, err, .Unit);
+            }
+            const cancellation0: Value = if (cause == .Null) try cancellationExc(ctx.allocator) else cause;
+            const failure0 = try Value.newResult(ctx.allocator, .{ .ok = false, .payload = try Value.boxRef(ctx.allocator, cancellation0) });
+            ctx.host.coroutineResumeExternal(slot, failure0, ctx.out);
+        }
+        return .{ .ok = .Unit };
+    }
     // A cancelled `send` leaves its element undelivered. The coroutine is
     // already unwinding, so a failing handler is reported, not rethrown.
     if (lost) |element| {
@@ -1017,6 +1075,7 @@ fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             // `__pending__` field and resume with Bool(true).
             try w.iter.asPtr().define(regAllocator(), "__pending__", value);
             try setIteratorNextState(w.iter, .value_ready);
+            coro_reg.chan_iter_pending.put(regAllocator(), w.slot, w.iter) catch {};
             outcome = .{ .HandToIter = .{ .slot = w.slot, .scope = w.scope } };
         } else if (state.receive_waiters.popFront()) |w| {
             outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching, .scope = w.scope } };
@@ -1622,8 +1681,16 @@ fn channelSelectRemoveReceiver(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
     };
     coro_reg_mutex.lock();
     defer coro_reg_mutex.unlock();
-    if (coro_reg.channels.getPtr(id)) |state| ChannelState.removeSelectInst(&state.select_recv_waiters, sel);
+    if (coro_reg.channels.getPtr(id)) |state| _ = ChannelState.removeSelectInst(&state.select_recv_waiters, sel);
     return .{ .ok = .Unit };
+}
+
+/// `__kxco_chanUndeliveredHandler(channel)` — the channel's
+/// `onUndeliveredElement` handler, or Null.
+fn channelUndeliveredHandlerIntrinsic(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .ok = .Null };
+    const id = channelId(&ctx.args[0]) orelse return .{ .ok = .Null };
+    return .{ .ok = undeliveredHandler(id) };
 }
 
 /// `__kxco_chanSelectAddSender(channel, select)` — store `select` as an
@@ -1650,10 +1717,15 @@ fn channelSelectRemoveSender(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .Instance => |i| i,
         else => return .{ .err = .{ .Type = "selectRemoveSender: bad select" } },
     };
-    coro_reg_mutex.lock();
-    defer coro_reg_mutex.unlock();
-    if (coro_reg.channels.getPtr(id)) |state| ChannelState.removeSelectInst(&state.select_send_waiters, sel);
-    return .{ .ok = .Unit };
+    var removed = false;
+    {
+        coro_reg_mutex.lock();
+        defer coro_reg_mutex.unlock();
+        if (coro_reg.channels.getPtr(id)) |state| removed = ChannelState.removeSelectInst(&state.select_send_waiters, sel);
+    }
+    // Whether a still-parked waiter was removed: the caller reports its
+    // never-sent element to `onUndeliveredElement`.
+    return .{ .ok = .{ .Bool = removed } };
 }
 
 /// `__kxco_chanSelectPollReceive(channel, holder): Int` — atomically take a
@@ -1743,6 +1815,7 @@ fn channelSelectPollSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         } else if (state.receive_iter_waiters.popFront()) |w| {
             try w.iter.asPtr().define(regAllocator(), "__pending__", value);
             try setIteratorNextState(w.iter, .value_ready);
+            coro_reg.chan_iter_pending.put(regAllocator(), w.slot, w.iter) catch {};
             outcome = .{ .HandToIter = .{ .slot = w.slot, .scope = w.scope } };
         } else if (state.receive_waiters.popFront()) |w| {
             outcome = .{ .HandToReceiver = .{ .slot = w.slot, .value = value, .catching = w.catching, .scope = w.scope } };
@@ -2405,6 +2478,7 @@ const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectRemoveReceiver", .f = channelSelectRemoveReceiver },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectAddSender", .f = channelSelectAddSender },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectRemoveSender", .f = channelSelectRemoveSender },
+    .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanUndeliveredHandler", .f = channelUndeliveredHandlerIntrinsic },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectPollReceive", .f = channelSelectPollReceive },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanSelectPollSend", .f = channelSelectPollSend },
     .{ .fqn = "kotlinx.coroutines.selects.__kxco_chanCloseCause", .f = channelCloseCause },

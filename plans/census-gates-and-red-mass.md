@@ -71,7 +71,7 @@ the last measurement.
 |---|---|---|---|
 | serialization | 138 | 0 | 57 / 81 — AT ZERO |
 | datetime | 519 | 0 | 457 / 62 — AT ZERO |
-| coroutines | 1271 | 28 | 1073 / 141 (+6 DNC) |
+| coroutines | 1280 | 19 | 1073 / 141 (+6 DNC) |
 | io | 1191 | 0 | 1182 / 9 |
 | androidx_collection | 1841 | 0 | 1309 / 15 |
 | atomicfu | 67 | 0 | 67 / 0 |
@@ -1377,6 +1377,34 @@ the structural descriptor around the SUPPLIED argument's descriptor.
 
 **serialization is AT ZERO: 138/0** (campaign opened at 57 passed / 81
 failed).
+
+### Root: the delivery-to-dispatch cancellation window (coroutines 1271 -> 1280)
+
+An element handed to a parked waiter is not DELIVERED until the waiter's
+coroutine dispatches. A cancel landing in that window must intercept the
+element and run `onUndeliveredElement`; klio's channel completed the
+cancellation watcher at delivery-SCHEDULE time, making the cancel
+invisible, and the element sat in `chan_pending_resume` until the
+dispatched task delivered it to a dead coroutine. Four pieces:
+
+  * `resumeWaiterNormal` keeps the watcher ARMED for the dispatched routes
+    (codes 1 and 3); `chanResumeNow` completes it on actual delivery.
+  * `channelCancelWaiter`'s not-in-queue tail takes the pending resume:
+    the element (unwrapped from a `receiveCatching` ChannelResult; read
+    back from the iterator's `__pending__` via the new `chan_iter_pending`
+    slot->iterator map for `hasNext`) runs the handler, a failing handler
+    reports unhandled, and the slot resumes with the cancellation.
+  * Select RECEIVE clauses carry `onCancellationConstructor` (mirroring
+    `BufferedChannel`'s): a value handed to a select then cancelled before
+    dispatch runs the handler via `callUndeliveredElement`, with the
+    handler exposed by the new `__kxco_chanUndeliveredHandler` intrinsic.
+  * A select-parked SENDER cancelled while waiting never sent its element:
+    `__kxco_chanSelectRemoveSender` now reports whether a still-parked
+    waiter was removed, and the disposal handle runs the handler for it.
+
+Closed the whole `ChannelUndeliveredElementFailureTest` (13/0) plus
+BroadcastTest lazy-close, FlowOn, Zip and a StateFlow case. Guarded by
+`examples/channel_cancel_before_dispatch.kt`.
 
 ### Roots: datetime to ZERO (519/0)
 
