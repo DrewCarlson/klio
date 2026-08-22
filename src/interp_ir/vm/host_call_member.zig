@@ -16,6 +16,7 @@ const applicability = @import("applicability");
 
 const vmhost = @import("vmhost.zig");
 const host_classes = @import("host_classes.zig");
+const ClassTable = @import("../build.zig").ClassTable;
 const host_globals = @import("host_globals.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -1480,6 +1481,9 @@ pub fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const
                 seen.put(c, {}) catch {};
                 const sn = simpleName(c);
                 if (std.mem.eql(u8, sn, pn)) return true;
+                // A file-collision mangle (`X$f12`) satisfies its source
+                // spelling `X`.
+                if (std.mem.eql(u8, stripFileMangle(sn), pn)) return true;
                 // A lifted nested class registers under its mangled name
                 // (`Modifier$Node`); a bound written `Modifier.Node` carries
                 // the simple head `Node`, so match the `$` tail too.
@@ -2573,6 +2577,32 @@ fn isScalarKindName(n: []const u8) bool {
     return false;
 }
 
+/// The source-level name behind a file-collision mangle (`X$f12` -> `X`).
+/// Nested-lift names (`Outer$Name`) keep their shape: the stripped suffix
+/// must be `$f` followed by digits only.
+fn stripFileMangle(n: []const u8) []const u8 {
+    const i = std.mem.lastIndexOfScalar(u8, n, '$') orelse return n;
+    if (i + 2 >= n.len or n[i + 1] != 'f') return n;
+    for (n[i + 2 ..]) |c| {
+        if (c < '0' or c > '9') return n;
+    }
+    return n[0..i];
+}
+
+/// Whether the class table registers any file-mangled variant of `name`
+/// (`name$f<digits>`). A private/internal classifier whose simple name
+/// collides across files registers ONLY under its mangled name, so a
+/// declared type spelled with the source name still names a known class.
+fn anyFileMangledVariant(classes: *const ClassTable, name: []const u8) bool {
+    var it = classes.keyIterator();
+    while (it.next()) |k| {
+        const kn = k.*;
+        if (kn.len > name.len + 2 and std.mem.startsWith(u8, kn, name) and
+            kn[name.len] == '$' and stripFileMangle(kn).len == name.len) return true;
+    }
+    return false;
+}
+
 pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) bool {
     var pn = param_ty.name;
     // A QUALIFIED function-type head (`kotlin.Function1`) must reach the
@@ -2755,7 +2785,8 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     if (!container_or_range_head) {
         const cg = self.classes.borrow();
         defer cg.deinit();
-        if (cg.get().get(pn) == null and cg.get().get(orig) == null) return false;
+        if (cg.get().get(pn) == null and cg.get().get(orig) == null and
+            !anyFileMangledVariant(cg.get(), pn)) return false;
     }
     const inst = switch (arg.*) {
         .Instance => |i| i,
@@ -2849,6 +2880,7 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
             const tailMatch = struct {
                 fn m(cur: []const u8, want: []const u8) bool {
                     if (std.mem.eql(u8, cur, want)) return true;
+                    if (std.mem.eql(u8, stripFileMangle(cur), want)) return true;
                     return cur.len > want.len and cur[cur.len - want.len - 1] == '$' and
                         std.mem.endsWith(u8, cur, want);
                 }
@@ -2870,8 +2902,14 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const cur = queue.items[head];
-        // arg IS-A param type (under either reading of an aliased name).
+        // arg IS-A param type (under either reading of an aliased name). A
+        // chain entry may carry a file-collision mangle (`X$f12`) the
+        // declared type's source spelling does not — compare its source
+        // name too.
         if (std.mem.eql(u8, cur, pn) or std.mem.eql(u8, cur, orig)) return false;
+        const cur_src = stripFileMangle(cur);
+        if (cur_src.ptr != cur.ptr and
+            (std.mem.eql(u8, cur_src, pn) or std.mem.eql(u8, cur_src, orig))) return false;
         // A lifted nested/inner class is registered under `Outer$Name`;
         // a type reference written `Outer.Name` collapses to `Name`, so
         // match the mangled tail too.
@@ -7444,7 +7482,7 @@ fn findClassInHierarchy(self: *VmHost, allocator: Allocator, receiver: *const Va
         cg.deinit();
         g.deinit();
     }
-    const WalkItem = struct { cid: ?ir.ClassId, name: []const u8 };
+    const WalkItem = struct { cid: ?ir.ClassId, name: []const u8, hint: []const u8 = "" };
     var queue: std.ArrayList(WalkItem) = .empty;
     defer queue.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);
@@ -7467,12 +7505,9 @@ fn findClassInHierarchy(self: *VmHost, allocator: Allocator, receiver: *const Va
             if (@intFromEnum(cid) < mod.classes.items.len) ir_class = mod.classes.items[@intFromEnum(cid)];
         }
         if (ir_class == null) {
-            for (mod.classes.items, 0..) |c, i| {
-                if (std.mem.eql(u8, c.name, item.name)) {
-                    ir_class = c;
-                    cid_of = @enumFromInt(i);
-                    break;
-                }
+            if (classByNamePreferring(mod, item.name, item.hint)) |hit| {
+                ir_class = hit.cls;
+                cid_of = hit.cid;
             }
         }
         const irc = ir_class orelse continue;
@@ -7537,6 +7572,29 @@ fn closureHasMethodNamed(mod: *const Module, start_cid: ir.ClassId, name: []cons
     const hm = mod.registry.hierarchy_methods.get(irc.name) orelse
         mod.registry.hierarchy_methods.get(simpleName(irc.fqn)) orelse return true;
     return hm.contains(name);
+}
+
+/// Resolve a supertype recorded by SIMPLE NAME, preferring the candidate
+/// whose fqn shares the longest dotted prefix with `hint_fqn` — the class
+/// that recorded the name. Two packs both declare a `Segment`
+/// (kotlinx.coroutines.internal and kotlinx.io); `ChannelSegment`'s parent
+/// is the one beside it, and first-match-wins walked the wrong hierarchy.
+const ClassByNameHit = struct { cls: ir.Class, cid: ir.ClassId };
+
+fn classByNamePreferring(mod: *const Module, want: []const u8, hint_fqn: []const u8) ?ClassByNameHit {
+    var best: ?ClassByNameHit = null;
+    var best_score: usize = 0;
+    for (mod.classes.items, 0..) |c, i| {
+        if (!std.mem.eql(u8, c.name, want)) continue;
+        var score: usize = 0;
+        const n = @min(c.fqn.len, hint_fqn.len);
+        while (score < n and c.fqn[score] == hint_fqn[score]) : (score += 1) {}
+        if (best == null or score > best_score) {
+            best = .{ .cls = c, .cid = @enumFromInt(i) };
+            best_score = score;
+        }
+    }
+    return best;
 }
 
 /// Whether the static receiver type `start_cid` (or one of its supertypes)
@@ -7616,7 +7674,7 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
     // The best fit found so far that needed DEFAULTS to bind; used only when
     // the walk finds no exact-arity candidate anywhere in the hierarchy.
     var defaulted_hit: ?ResolvedMethod = null;
-    const WalkItem = struct { cid: ?ir.ClassId, name: []const u8 };
+    const WalkItem = struct { cid: ?ir.ClassId, name: []const u8, hint: []const u8 = "" };
     var queue: std.ArrayList(WalkItem) = .empty;
     defer queue.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);
@@ -7647,11 +7705,8 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                 if (@intFromEnum(cid) < mod.classes.items.len) ir_class = mod.classes.items[@intFromEnum(cid)];
             }
             if (ir_class == null) {
-                for (mod.classes.items) |c| {
-                    if (std.mem.eql(u8, c.name, cur_name)) {
-                        ir_class = c;
-                        break;
-                    }
+                if (classByNamePreferring(mod, cur_name, item.hint)) |hit| {
+                    ir_class = hit.cls;
                 }
             }
             // Dedup on the resolved class's FQN (identity) so two distinct
@@ -7803,7 +7858,7 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
                         mod.registry.class_super_names.get(irc.fqn) orelse
                         mod.registry.class_super_names.get(irc.name) orelse &.{};
                     for (chain) |sup| {
-                        try queue.append(allocator, .{ .cid = null, .name = sup });
+                        try queue.append(allocator, .{ .cid = null, .name = sup, .hint = irc.fqn });
                     }
                 }
             }
@@ -7814,7 +7869,7 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
             const cg = self.classes.borrow();
             if (cg.get().get(cur_name)) |def| {
                 const dg = def.borrow();
-                for (dg.get().supertype_names) |sup| try queue.append(allocator, .{ .cid = null, .name = sup });
+                for (dg.get().supertype_names) |sup| try queue.append(allocator, .{ .cid = null, .name = sup, .hint = dg.get().fqn });
                 dg.deinit();
             }
             cg.deinit();
@@ -13466,7 +13521,7 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
         cg.deinit();
         g.deinit();
     }
-    const WalkItem = struct { cid: ?ir.ClassId, name: []const u8 };
+    const WalkItem = struct { cid: ?ir.ClassId, name: []const u8, hint: []const u8 = "" };
     var queue: std.ArrayList(WalkItem) = .empty;
     defer queue.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);
@@ -13494,11 +13549,8 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
                 if (@intFromEnum(cid) < mod.classes.items.len) ir_class = mod.classes.items[@intFromEnum(cid)];
             }
             if (ir_class == null) {
-                for (mod.classes.items) |c| {
-                    if (std.mem.eql(u8, c.name, item.name)) {
-                        ir_class = c;
-                        break;
-                    }
+                if (classByNamePreferring(mod, item.name, item.hint)) |hit| {
+                    ir_class = hit.cls;
                 }
             }
             // Dedup on the resolved class's FQN (identity) so two distinct
@@ -13608,7 +13660,7 @@ fn instanceMethodWalkNamed(self: *VmHost, allocator: Allocator, receiver: *const
             const cg = self.classes.borrow();
             if (cg.get().get(item.name)) |def| {
                 const dg = def.borrow();
-                for (dg.get().supertype_names) |s| try queue.append(allocator, .{ .cid = null, .name = s });
+                for (dg.get().supertype_names) |sn| try queue.append(allocator, .{ .cid = null, .name = sn, .hint = dg.get().fqn });
                 dg.deinit();
             }
             cg.deinit();

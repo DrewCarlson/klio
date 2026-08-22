@@ -1703,6 +1703,9 @@ pub fn scopeTypeRename(b: *const FuncBuilder, name: []const u8, file: u32) ?[]co
     if (b.module.packageOfFile(ir.FileId.from(file))) |pkg| {
         if (build.pkgTypeRename(name, pkg)) |renamed| return renamed;
     }
+    // Cross-package reference through an import of the declaring package
+    // (internal visibility spans the whole module).
+    if (decl_mod.importedPkgTypeRename(b.module, name, ir.FileId.from(file))) |renamed| return renamed;
     return null;
 }
 
@@ -6844,6 +6847,30 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
+    // `flow.emit(1)` — an inline lambda PARAMETER with a RECEIVER-typed
+    // function type (`T.(Int) -> Unit`) invoked with an explicit receiver
+    // expression. Kotlin's invoke convention resolves the local parameter
+    // over the receiver's same-named MEMBER (the local scope is nearer), so
+    // the call splices the lambda with the qualifier as its receiver —
+    // SharedFlowTest's testSubscriptionByFirstSuspensionInCollect calls
+    // `flow.emit(1)` where `emit: T.(Int) -> Unit` must shadow
+    // MutableStateFlow's own `emit`. Receiver-typed params only: a plain
+    // `(Int) -> Unit` param is inapplicable to a qualified call and the
+    // member keeps it.
+    if (!is_infix and callee.* == .Member and !callee.Member.safe and
+        callee.Member.receiver.* != .This)
+    {
+        const lam_name = callee.Member.name.name;
+        if (b.isReceiverLambdaParam(lam_name)) {
+            if (b.inlineLambdaFor(lam_name)) |lam| {
+                if (!b.hasEnclosingMember(lam_name)) {
+                    const recv_reg = try lowerExpr(b, callee.Member.receiver);
+                    return try inline_call.spliceInlineLambdaOn(b, lam_name, lam, args, recv_reg);
+                }
+            }
+        }
+    }
+
     // Inline expansion (suspend-inline only).
     if (try tryBareInlineExpansion(b, expr)) |r| {
         return r;
@@ -8138,6 +8165,23 @@ fn inlineTargetForBareCall(
     shape: CallShape,
 ) Allocator.Error!?*const ast.Function {
     const nm = seg.name;
+    // A renamed import (`import a.b.f as g`) fixes the declaration family
+    // by exact FQN, but the inline candidate table is keyed by DECLARED
+    // name — the aliased call must look the target up under its own name,
+    // or a same-named declaration in scope preempts the aliased one.
+    // kotlinx-coroutines aliases `unsafeTransform as transform` inside the
+    // flow operators; the name-keyed pick spliced the public safe
+    // `transform` and made every unsafe-chain flow cancellable.
+    const inline_nm: []const u8 = blk: {
+        if (b.module.importAliasIn(seg.span.file, nm)) |asegs| {
+            if (asegs.len != 0 and !std.mem.eql(u8, asegs[asegs.len - 1], nm) and
+                inline_state.candidatesForName(asegs[asegs.len - 1]) != null)
+            {
+                break :blk asegs[asegs.len - 1];
+            }
+        }
+        break :blk nm;
+    };
     // The active splice's declared receiver serves as evidence when the
     // caller context has none of its own (a bare reified call inside a
     // spliced extension body); it feeds only this pick, not binding.
@@ -8149,7 +8193,7 @@ fn inlineTargetForBareCall(
     // must be available when reification, non-local return, or suspension
     // requires a splice; ordinary calls still fall through to the host binding
     // because `bareInlineNeedsSplice` rejects them.
-    const narrowed = inlineFnAstForRecv(nm, shape, evid_chain);
+    const narrowed = inlineFnAstForRecv(inline_nm, shape, evid_chain);
     // A receiver is in scope and the splice picked a RECEIVERLESS candidate,
     // while a same-named non-inline EXTENSION fits that receiver: the correct
     // target is not in the inline candidate set at all, so no comparison among
@@ -16635,7 +16679,14 @@ fn lowerFqnGlobalCall(
     if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| {
         const prefix = fqn[0..dot];
         const prefix_name = rsplitLast(prefix, '.');
-        if (b.module.topLevelPropFqn(prefix_name)) |pfqn| {
+        // The suspend-intrinsic property has no registry row of its own; a
+        // qualified call through it (`kotlin.coroutines.coroutineContext
+        // .cancel()`) is a member call on the property's value exactly like
+        // the registered-property case below.
+        const intrinsic_prop = std.mem.eql(u8, prefix, "kotlin.coroutines.coroutineContext");
+        if (b.module.topLevelPropFqn(prefix_name) orelse
+            (if (intrinsic_prop) @as(?[]const u8, prefix) else null)) |pfqn|
+        {
             if (std.mem.eql(u8, pfqn, prefix)) {
                 // Load the property value by its package-qualified FQN, then
                 // member-call the trailing segment on it.
