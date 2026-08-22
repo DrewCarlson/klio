@@ -663,6 +663,11 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         .name = class.name.name,
         .fqn = class.name.name,
         .annotation_names = &.{},
+        .type_params = blk: {
+            const names = try allocator.alloc([]const u8, class.type_params.len);
+            for (class.type_params, names) |*tp, *out| out.* = tp.name.name;
+            break :blk names;
+        },
         .primary_params = primary_params,
         .methods = &.{},
         .body_properties = try body_props.toOwnedSlice(allocator),

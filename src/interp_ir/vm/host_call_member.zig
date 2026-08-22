@@ -6654,6 +6654,36 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
     if (std.mem.eql(u8, name, "name") or std.mem.eql(u8, name, "simpleName")) {
         return null; // handled by get_field
     }
+    // `KMutableProperty.set` / `KProperty.get`: an UNBOUND property
+    // reference (`T::prop`, captured receiver = the class) takes the target
+    // first; a bound one uses the captured receiver.
+    if (std.mem.eql(u8, name, "set") or std.mem.eql(u8, name, "get")) {
+        // Arity decides bound vs unbound: `T::prop` captures the CLASS (or
+        // its companion stand-in) and takes the target first; `x::prop`
+        // captures the instance. `set` is 2 args unbound / 1 bound; `get`
+        // is 1 / 0.
+        if (std.mem.eql(u8, name, "set")) {
+            if (args.len == 2) {
+                switch (try host_fields.setField(self, allocator, &args[0], n, args[1])) {
+                    .ok => return .{ .ok = .Unit },
+                    .err => |e| return .{ .err = e },
+                }
+            }
+            if (args.len == 1 and recv_capt != .Class) {
+                switch (try host_fields.setField(self, allocator, &recv_capt, n, args[0])) {
+                    .ok => return .{ .ok = .Unit },
+                    .err => |e| return .{ .err = e },
+                }
+            }
+        } else {
+            if (args.len == 1) {
+                return try host_fields.getField(self, allocator, &args[0], n);
+            }
+            if (args.len == 0 and recv_capt != .Class) {
+                return try host_fields.getField(self, allocator, &recv_capt, n);
+            }
+        }
+    }
     // Dispatch under the reference's creation-site file (private
     // visibility is decided where the reference was written).
     var ref_pushed = false;
@@ -7039,7 +7069,30 @@ fn anonMethodDisprovenFn(self: *VmHost, f: *const ir.Func, args: []const Value) 
         // nominal class; adjudicating it as one would let an unrelated
         // registered class of the same simple name refute valid arguments.
         if (fidTypeVar(self, f.id, &effective[i].ty)) continue;
+        // A LOCAL class's own type parameter (`Target` in a function-body
+        // `class PropertyAndItsValue<Target, Value>`) is registered on the
+        // synthesized ClassDef, not the method fid; reading it as a nominal
+        // class refuted every argument (`set(target: Target)` missed).
+        if (localClassTypeParam(self, f, &effective[i].ty)) continue;
         if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i])) return true;
+    }
+    return false;
+}
+
+fn localClassTypeParam(self: *VmHost, f: *const ir.Func, ty: *const ir.TypeRef) bool {
+    const head = std.mem.trimEnd(u8, simpleName(ty.name), "?");
+    if (head.len == 0) return false;
+    // A runtime-lowered local-class member's params[0] is `this`, typed by
+    // the class; that names the ClassDef holding the declared type params.
+    if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) return false;
+    const cls_name = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
+    const cg = self.classes.borrow();
+    defer cg.deinit();
+    const def = cg.get().get(cls_name) orelse return false;
+    const dg = def.borrow();
+    defer dg.deinit();
+    for (dg.get().type_params) |tp| {
+        if (std.mem.eql(u8, tp, head)) return true;
     }
     return false;
 }

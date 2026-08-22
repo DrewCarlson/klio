@@ -176,6 +176,7 @@ Run any program with:
 | `dst_local_time_mapping.kt` | A repeated local hour maps to its first pass and a missing one to the pre-gap offset, while each instant still has exactly one local time. |
 | `iso_extended_year_dates.kt` | ISO-8601 dates outside 0000..9999 carry an explicit sign and any zero padding; parse and `toString` are inverses across the range and reject an unsigned wide year. |
 | `bound_callable_reference.kt` | `receiver::method` is a function value: invocable, `is FunctionN`, and usable as an argument, a collection element or a `map` transform; an unbound reference takes its receiver first. |
+| `property_reference_get_set.kt` | A property reference's `get`/`set` members: unbound `T::prop` takes the target first, bound `x::prop` uses its captured receiver, and a generic local class drives table-driven writes through `KMutableProperty1`. |
 | `vararg_vs_container_overload.kt` | A name overloaded on `vararg T` and on a container of `T` resolves by what the argument is, including when the callee is `inline` and the call would be spliced. |
 | `timeout_over_a_yield_loop.kt` | A `withTimeout` around a busy `yield()` loop fires on schedule, and a sibling `delay` wakes while the loop spins: a due timer is ready work, not something that waits for the run queue to drain. |
 | `channel_undelivered_element.kt` | `onUndeliveredElement` runs for an evicted buffer entry, a cancelled parked `send`, a send to a closed channel and everything held at cancel — never for a delivered element; a throwing handler surfaces as `UndeliveredElementException`. |

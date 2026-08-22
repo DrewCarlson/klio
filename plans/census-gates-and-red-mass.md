@@ -70,7 +70,7 @@ the last measurement.
 | suite | passes | failures | opened at |
 |---|---|---|---|
 | serialization | 138 | 0 | 57 / 81 — AT ZERO |
-| datetime | 517 | 2 | 457 / 62 |
+| datetime | 519 | 0 | 457 / 62 — AT ZERO |
 | coroutines | 1271 | 28 | 1073 / 141 (+6 DNC) |
 | io | 1191 | 0 | 1182 / 9 |
 | androidx_collection | 1841 | 0 | 1309 / 15 |
@@ -1377,6 +1377,20 @@ the structural descriptor around the SUPPLIED argument's descriptor.
 
 **serialization is AT ZERO: 138/0** (campaign opened at 57 passed / 81
 failed).
+
+### Roots: datetime to ZERO (519/0)
+
+  * A property reference's `get`/`set` members were unimplemented:
+    `boundRefDispatch` now serves them, bound/unbound decided by ARITY
+    (`T::prop` may capture the class OR its companion stand-in, so the
+    captured value's tag cannot decide). Guarded by
+    `examples/property_reference_get_set.kt`.
+  * A LOCAL (function-body) class's method taking its class's own TYPE
+    PARAMETER (`set(target: Target)` in `class PropertyAndItsValue<Target,
+    Value>`) was refuted by the anon-method disproof reading `Target` as a
+    nominal class: the runtime-synthesized ClassDef now carries the
+    declared `type_params`, and the disproof skips a param typed by one
+    (resolved through the method's `this` param's class).
 
 ### Root: the closure chain lacked the creator's own receiver
 
