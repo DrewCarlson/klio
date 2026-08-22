@@ -931,12 +931,18 @@ pub fn runtimeFuncApplicability(
     cand: FuncId,
     args: []const Value,
 ) Allocator.Error!?applicability.Score {
-    var shapes_buf: [24]applicability.ArgShape = undefined;
-    const shapes = if (args.len <= shapes_buf.len)
-        shapes_buf[0..args.len]
-    else
-        try allocator.alloc(applicability.ArgShape, args.len);
-    defer if (args.len > shapes_buf.len) allocator.free(shapes);
+    // Two tiers: safety builds 0xAA-fill an `undefined` stack array at its
+    // DECLARED size on every entry; the 24-slot ArgShape buffer's fill was a
+    // top profile frame. Nearly every call fits six shapes.
+    if (args.len <= 6) {
+        var shapes_buf: [6]applicability.ArgShape = undefined;
+        const shapes = shapes_buf[0..args.len];
+        for (args, 0..) |*arg, i| shapes[i] = shapeOfValue(self, arg);
+        const sig = sigViewOfFunc(self, module, cand, args.len) orelse return null;
+        return applicability.applicable(&sig, shapes, runtimeApplicabilityScope(self));
+    }
+    const shapes = try allocator.alloc(applicability.ArgShape, args.len);
+    defer allocator.free(shapes);
     for (args, 0..) |*arg, i| shapes[i] = shapeOfValue(self, arg);
     const sig = sigViewOfFunc(self, module, cand, args.len) orelse return null;
     return applicability.applicable(&sig, shapes, runtimeApplicabilityScope(self));
@@ -1025,7 +1031,9 @@ fn pickOverloadInner(self: *VmHost, module: *const Module, func: FuncId, args: [
     const candidates = module.funcsBySimpleName(name);
     if (candidates.len < 2) return null;
 
-    var shapes_buf: [24]applicability.ArgShape = undefined;
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
+    // entry; >6 args fall to the heap branch below (rare).
+    var shapes_buf: [6]applicability.ArgShape = undefined;
     var shapes_heap: ?[]applicability.ArgShape = null;
     defer if (shapes_heap) |h| self.allocator.free(h);
     const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
@@ -1900,7 +1908,9 @@ pub fn pickNamedOverloadIdRecv(
     if (candidates.len < 2) return null;
     const baked_is_ext = paramIsThis(f0.params);
 
-    var shapes_buf: [24]applicability.ArgShape = undefined;
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
+    // entry; >6 args fall to the heap branch below (rare).
+    var shapes_buf: [6]applicability.ArgShape = undefined;
     var shapes_heap: ?[]applicability.ArgShape = null;
     defer if (shapes_heap) |h| self.allocator.free(h);
     const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
@@ -2842,7 +2852,9 @@ pub fn callNamedOverload(self: *VmHost, allocator: Allocator, module: *const Mod
     // (`ParagraphIntrinsics(annotations = …)` picked the deprecated
     // `spanStyles` overload and dropped the annotations).
     var any_named = false;
-    var shapes_buf: [24]applicability.ArgShape = undefined;
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
+    // entry; >6 args fall to the heap branch below (rare).
+    var shapes_buf: [6]applicability.ArgShape = undefined;
     const shapes = if (args.len <= shapes_buf.len)
         shapes_buf[0..args.len]
     else

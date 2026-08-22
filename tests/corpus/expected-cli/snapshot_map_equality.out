@@ -1,0 +1,10 @@
+reordered=true
+valueDiff=false
+missingKey=false
+collidingKeys=true
+collidingDiff=false
+customEqualsSame=true
+customEqualsDiff=false
+wideEqual=true
+wideOneDiff=false
+selfEqual=true

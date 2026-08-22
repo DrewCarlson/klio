@@ -3210,6 +3210,13 @@ pub fn leafExprServe(
 const LEAF_BANK_DEPTH: usize = 8;
 threadlocal var leaf_bank: [LEAF_BANK_DEPTH][ir.LEAF_MAX_REGS]Value = undefined;
 
+/// Scratch for the leaf serve's literal-typing coercion, per nesting level.
+/// A per-call `[LEAF_MAX_REGS]Value = undefined` stack array paid a 2.5KB
+/// safety-mode 0xAA fill on EVERY serve — 15% of the compose slot-table
+/// benchmark's whole profile; the threadlocal bank is initialized once per
+/// thread and reused.
+threadlocal var coerce_bank: [LEAF_BANK_DEPTH][ir.LEAF_MAX_REGS]Value = undefined;
+
 /// How far a leaf serve chains into other leaf callees. A gap-buffer read is
 /// typically three levels (`groupSize` -> `groupIndexToAddress` -> the array
 /// index helper); the bound keeps the native recursion trivially finite.
@@ -3260,20 +3267,20 @@ fn leafExprServeAt(
     // into a declared Long param, or into a shared type-variable slot
     // beside a Long peer, is a Long-typed literal — `eq(0, 0L)` must
     // compare two Longs here exactly as on the framed path.
-    var coerce_buf: [ir.LEAF_MAX_REGS]Value = undefined;
-    var eff_args = args;
-    {
-        const plan = coercePlanFor(module, func);
-        if (plan & 6 != 0 and args.len <= coerce_buf.len) {
-            @memcpy(coerce_buf[0..args.len], args);
-            if (plan & 2 != 0) coerceIntArgsToLong(func, coerce_buf[0..args.len]);
-            if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, coerce_buf[0..args.len]);
-            eff_args = coerce_buf[0..args.len];
-        }
-    }
     const reclaim = runtime.reclaimEnabled();
     const ev: *EvalTls = &evtls;
     if (ev.leaf_depth >= LEAF_BANK_DEPTH) return null;
+    var eff_args = args;
+    {
+        const plan = coercePlanFor(module, func);
+        if (plan & 6 != 0 and args.len <= ir.LEAF_MAX_REGS) {
+            const coerce_buf: []Value = coerce_bank[ev.leaf_depth][0..args.len];
+            @memcpy(coerce_buf, args);
+            if (plan & 2 != 0) coerceIntArgsToLong(func, coerce_buf);
+            if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, coerce_buf);
+            eff_args = coerce_buf;
+        }
+    }
     // Only the body's own locals are live, and they come from the per-thread
     // bank rather than a fresh stack array.
     const nlive: usize = @min(@as(usize, func.n_locals), ir.LEAF_MAX_REGS);
@@ -3287,7 +3294,7 @@ fn leafExprServeAt(
     // written so a lazy pin can zero the rest first (the keepalive pins the
     // whole slice, and a stale slot must not reach the collector).
     var wmask: u64 = 0;
-    if (reclaim or !func.leafNoFill()) {
+    if (reclaim) {
         for (regs) |*v| v.* = .Unit;
         wmask = ~@as(u64, 0);
     }
@@ -3339,11 +3346,11 @@ fn leafWalk(
         switch (b.terminator) {
             .Return => |r| {
                 const rr = r orelse return .Unit;
-                return leafRead(regs, rr) orelse return error.LeafAbandon;
+                return leafRead(regs, wmask.*, rr) orelse return error.LeafAbandon;
             },
             .Goto => |g| block_idx = g.int(),
             .Branch => |br| {
-                const c = leafRead(regs, br.cond) orelse return error.LeafAbandon;
+                const c = leafRead(regs, wmask.*, br.cond) orelse return error.LeafAbandon;
                 if (c != .Bool) {
                     if (trace) std.debug.print("[leaf] {s}: branch on {s}\n", .{ func.name, @tagName(c) });
                     return error.LeafAbandon;
@@ -3387,17 +3394,17 @@ fn leafRunInsts(
                 if (!leafWrite(allocator, regs, c.dst, v, reclaim, false, wmask)) return error.LeafAbandon;
             },
             .Move => |mv| {
-                const v = leafRead(regs, mv.src) orelse return error.LeafAbandon;
+                const v = leafRead(regs, wmask.*, mv.src) orelse return error.LeafAbandon;
                 if (!leafWrite(allocator, regs, mv.dst, v, reclaim, true, wmask)) return error.LeafAbandon;
             },
             .Not => |n| {
-                const v = leafRead(regs, n.src) orelse return error.LeafAbandon;
+                const v = leafRead(regs, wmask.*, n.src) orelse return error.LeafAbandon;
                 if (v != .Bool) return error.LeafAbandon;
                 if (!leafWrite(allocator, regs, n.dst, .{ .Bool = !v.Bool }, reclaim, false, wmask)) return error.LeafAbandon;
             },
             .BinOp => |bo| {
-                const l = leafRead(regs, bo.lhs) orelse return error.LeafAbandon;
-                const r = leafRead(regs, bo.rhs) orelse return error.LeafAbandon;
+                const l = leafRead(regs, wmask.*, bo.lhs) orelse return error.LeafAbandon;
+                const r = leafRead(regs, wmask.*, bo.rhs) orelse return error.LeafAbandon;
                 if (scalarBin(bo.op, l, r)) |v| {
                     if (!leafWrite(allocator, regs, bo.dst, v, reclaim, false, wmask)) return error.LeafAbandon;
                     continue;
@@ -3408,7 +3415,7 @@ fn leafRunInsts(
                 if (!leafWrite(allocator, regs, bo.dst, res.ok, reclaim, false, wmask)) return error.LeafAbandon;
             },
             .GetField => |gf| {
-                const recv = leafRead(regs, gf.receiver) orelse return error.LeafAbandon;
+                const recv = leafRead(regs, wmask.*, gf.receiver) orelse return error.LeafAbandon;
                 if (gf.field.int() >= module.consts.items.len) return error.LeafAbandon;
                 const fname: []const u8 = switch (module.consts.items[gf.field.int()]) {
                     .String => |s| s,
@@ -3435,10 +3442,10 @@ fn leafRunInsts(
                 // helpers this exists for (`indexSegment`, the mask/shift
                 // predicates) are otherwise a full activation per bit twiddle.
                 if (cm.arg_names.len != 0 or cm.n_args > 1) return error.LeafAbandon;
-                const recv = leafRead(regs, cm.receiver) orelse return error.LeafAbandon;
+                const recv = leafRead(regs, wmask.*, cm.receiver) orelse return error.LeafAbandon;
                 const nm = constStr(module, cm.name) orelse return error.LeafAbandon;
                 const marg: ?Value = if (cm.n_args == 1)
-                    (leafRead(regs, Reg.from(cm.args.int())) orelse return error.LeafAbandon)
+                    (leafRead(regs, wmask.*, Reg.from(cm.args.int())) orelse return error.LeafAbandon)
                 else
                     null;
                 const mv = primitiveMemberOp(&recv, nm, marg) orelse {
@@ -3448,8 +3455,8 @@ fn leafRunInsts(
                 if (!leafWrite(allocator, regs, cm.dst, mv, reclaim, false, wmask)) return error.LeafAbandon;
             },
             .Index => |ix| {
-                const recv = leafRead(regs, ix.receiver) orelse return error.LeafAbandon;
-                const idx = leafRead(regs, ix.index) orelse return error.LeafAbandon;
+                const recv = leafRead(regs, wmask.*, ix.receiver) orelse return error.LeafAbandon;
+                const idx = leafRead(regs, wmask.*, ix.index) orelse return error.LeafAbandon;
                 const v = fastIndexGet(&recv, &idx) orelse {
                     if (trace) std.debug.print("[leaf] {s}: index needs the slow get\n", .{func.name});
                     return error.LeafAbandon;
@@ -3493,6 +3500,16 @@ fn leafRunInsts(
                 }
                 const base = c.args.int();
                 if (base + c.n_args > regs.len) return error.LeafAbandon;
+                // The arg slice reads raw slots: settle any not-yet-written
+                // one to the fill value first (the lazy-fill invariant every
+                // masked read enforces individually).
+                var ai: usize = base;
+                while (ai < base + c.n_args) : (ai += 1) {
+                    if (ai < 64 and (wmask.* >> @as(u6, @intCast(ai))) & 1 == 0) {
+                        regs[ai] = .{ .Unit = {} };
+                        wmask.* |= @as(u64, 1) << @as(u6, @intCast(ai));
+                    }
+                }
                 leafPin(pin, regs, wmask);
                 const r = try leafExprServeAt(H, allocator, module, callee, regs[base .. base + c.n_args], host, depth - 1) orelse
                     return error.LeafAbandon;
@@ -3556,9 +3573,16 @@ fn leafPin(pin: *?usize, regs: []Value, wmask: *u64) void {
     runtime.keepalivePushSlice(regs);
 }
 
-fn leafRead(regs: []const Value, r: Reg) ?Value {
+fn leafRead(regs: []const Value, wmask: u64, r: Reg) ?Value {
     const i = r.int();
     if (i >= regs.len) return null;
+    // A slot this serve has not written yet reads as the fill value. The
+    // eager whole-bank fill was 15% of the compose slot-table benchmark's
+    // profile (millions of serves x n_locals Unit stores); reads are far
+    // rarer than slots, so the zero moved here. Reclaim builds keep the
+    // eager fill (their teardown releases every slot, so all slots must
+    // hold owned values) and pass an all-ones mask.
+    if ((wmask >> @as(u6, @truncate(i))) & 1 == 0) return .{ .Unit = {} };
     return regs[i];
 }
 

@@ -21,6 +21,7 @@ const host_globals = @import("host_globals.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 const trace = @import("trace.zig");
+const persistent_map_eq = @import("persistent_map_eq.zig");
 const overload_match = @import("overload_match.zig");
 const host_call_func = @import("host_call_func.zig");
 const host_call_value = @import("host_call_value.zig");
@@ -1498,8 +1499,7 @@ pub fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const
                 cg.deinit();
             }
             // The name walk sees only the ClassTable's simple-name entries;
-            // a chain that crosses a host-synth class (KlioBufferedChannel
-            // -> BufferedChannel -> Channel -> ReceiveChannel) can break
+            // a chain that crosses a host-synth class can break
             // where a name is registered differently. `instanceOf` is the
             // authoritative subtype answer — the same one `is` uses.
             return host_classes.instanceOf(self, receiver, .{ .name = pn, .nullable = false, .args = &.{} });
@@ -2250,7 +2250,9 @@ fn runtimeMemberApplicability(
     arg_names: ?[]const ?[]const u8,
     named: bool,
 ) Allocator.Error!?applicability.Score {
-    var shapes_buf: [24]applicability.ArgShape = undefined;
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
+    // entry; >6 args fall to the heap branch below (rare).
+    var shapes_buf: [6]applicability.ArgShape = undefined;
     const shapes = if (args.len <= shapes_buf.len)
         shapes_buf[0..args.len]
     else
@@ -3165,7 +3167,9 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
         }
         return f;
     }
-    var shapes_buf: [24]applicability.ArgShape = undefined;
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
+    // entry; >6 args fall to the heap branch below (rare).
+    var shapes_buf: [6]applicability.ArgShape = undefined;
     var shapes_heap: ?[]applicability.ArgShape = null;
     defer if (shapes_heap) |h| self.allocator.free(h);
     const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
@@ -4121,6 +4125,16 @@ pub fn replayHits() u64 {
 }
 
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
+    // Vendored persistent-map equality: answered host-side with trie
+    // node-identity pruning (see persistent_map_eq.zig). Bails (null) for
+    // any operand or element the host does not own equality for.
+    if (args.len == 1 and receiver.* == .Instance and args[0] == .Instance and
+        std.mem.eql(u8, name, "equals"))
+    {
+        if (persistent_map_eq.tryEquals(receiver.Instance, args[0].Instance)) |eq| {
+            return .{ .ok = .{ .Bool = eq } };
+        }
+    }
 
     if (receiver.* != .Instance and !strict_ext and !no_ext and static_recv == null and declared_recv == null) {
         if (try builtinIntrinsicReplay(self, allocator, receiver, name, args)) |r| {
@@ -8901,12 +8915,11 @@ pub fn invokeVirtualMember(
     const slot_name: ?[]const u8 = if (module.funcById(FuncId.from(slot.int()))) |f| f.name else null;
     // A host-synthesized class implements its members as native intrinsics
     // keyed by its own FQN, and that binding is the most-derived override of
-    // the slot. The synth's `supertype_names` exist for type checks (a
-    // KlioBufferedChannel names BufferedChannel), so linking the slot through
-    // them would enter the supertype's Kotlin body — which reads internal
-    // fields the native implementation never materializes. Only anonymous
-    // (runtime-built) classes can carry such bindings, so named classes skip
-    // the probe.
+    // the slot. The synth's `supertype_names` exist for type checks, so
+    // linking the slot through them would enter the supertype's Kotlin body —
+    // which reads internal fields the native implementation never
+    // materializes. Only anonymous (runtime-built) classes can carry such
+    // bindings, so named classes skip the probe.
     if (slot_name) |n| {
         const anon = blk: {
             const class = runtime_def.borrow();
@@ -8976,13 +8989,11 @@ pub fn invokeVirtualMember(
     }
     // A main-module slot link on an ANONYMOUS receiver class is a
     // supertype-matched guess: the synth lists upstream classes for type
-    // checks (a KlioBufferedChannel names BufferedChannel), and entering
-    // the supertype's Kotlin body bypasses the pack's shadowing extension
-    // properties — `ch.onReceive` inside a select must reach the klio
-    // clause glue, not upstream's SelectClause machinery. Dispatch by
-    // name so the full ladder (host bindings, extension properties, anon
-    // methods) serves; a SAM conversion keeps the slot path (its stored
-    // lambda is served below by target signature).
+    // checks, and entering the supertype's Kotlin body bypasses the pack's
+    // shadowing extension properties. Dispatch by name so the full ladder
+    // (host bindings, extension properties, anon methods) serves; a SAM
+    // conversion keeps the slot path (its stored lambda is served below by
+    // target signature).
     if (linked == .main_func) {
         const anon_recv = blk: {
             const class = runtime_def.borrow();
@@ -9132,10 +9143,21 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
         if (fp.has_receiver_param and args_in.len + 1 == fp.params.len and
             args_in.len < ir.LEAF_MAX_REGS)
         {
-            var argbuf: [ir.LEAF_MAX_REGS]Value = undefined;
-            argbuf[0] = receiver.*;
-            for (args_in, 0..) |a, i| argbuf[i + 1] = a;
-            if (try ir.eval.leafExprServe(VmHost, allocator, mod, fp, argbuf[0 .. args_in.len + 1], self)) |r| return r;
+            // Two tiers: safety builds 0xAA-fill an `undefined` stack array
+            // at its DECLARED size on every entry, and the 64-slot buffer's
+            // 2.5KB fill was a top profile frame across member-call-heavy
+            // suites. Nearly every call fits eight slots.
+            if (args_in.len + 1 <= 8) {
+                var argbuf: [8]Value = undefined;
+                argbuf[0] = receiver.*;
+                for (args_in, 0..) |a, i| argbuf[i + 1] = a;
+                if (try ir.eval.leafExprServe(VmHost, allocator, mod, fp, argbuf[0 .. args_in.len + 1], self)) |r| return r;
+            } else {
+                var argbuf: [ir.LEAF_MAX_REGS]Value = undefined;
+                argbuf[0] = receiver.*;
+                for (args_in, 0..) |a, i| argbuf[i + 1] = a;
+                if (try ir.eval.leafExprServe(VmHost, allocator, mod, fp, argbuf[0 .. args_in.len + 1], self)) |r| return r;
+            }
         }
     }
     if (nuTraceEnv()) |want| {
@@ -12131,7 +12153,9 @@ fn extKeyGreater(a: ExtKey, b: ExtKey) bool {
 }
 
 fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Value, candidates: []const Candidate, args: []const Value) Allocator.Error!?Candidate {
-    var shapes_buf: [24]applicability.ArgShape = undefined;
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
+    // entry; >6 args fall to the heap branch below (rare).
+    var shapes_buf: [6]applicability.ArgShape = undefined;
     const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
         shapes_buf[0..args.len]
     else
