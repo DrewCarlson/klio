@@ -350,6 +350,26 @@ family 9 -> 4:
   (23s of 30s budget — margin recovered). Map put group unchanged
   (its costs are flat machinery, not frame count: census -30% frames,
   wall flat).
+- Stdlib sweep drove three more fit gates (eacede58, a36c97c9): 6
+  OrderingTest-family failures were all wrong-overload splices —
+  crossinline/noinline capture (compareBy embeds the selector in a
+  result closure), arity + lambda-slot fit under the trailing-lambda
+  mapping with default-fill tails (conditionalUpdate(structural=true,
+  block)), and a same-package same-shape candidate-tie decline (sumOf's
+  per-numeric selectors; kotlin.synchronized vs platform.synchronized
+  are scope-separated, NOT a tie — cross-package ties cost 0.5s/rep
+  until scoped). Sweep 117/0 under LLP.
+- 5eabde0b FLIPPED: splice on by default (KLIO_LLP=0 bisects back).
+  SnapshotStateListTests 65/65 solo — FIRST full green.
+  COMPOSE GATE RECORD: 1383 passed / 7 failed at 510s (from 1380/10 at
+  522s): both List timeout tests and Pausable.markInvalid left the fail
+  set. Remaining 6 unique: Movable flake, Pausable.resumeOnBackground,
+  Recomposer pausing/testInsert/validatePotentialDeadlock, Map _clear.
+- Queued next: spliced-body LAMBDA splicing (the lambda literal still
+  frames inside a spliced callee — 12 frames/pair, kotlinc splices
+  both), SnapshotThreadLocal.get/Snapshot.current host serve (4.3
+  frames/put), Map _clear whole-op decision, wall-cap teardown quiesce,
+  window-family corpus rc=None flakes.
 
 ## Call-throughput round 3 (2026-08-24)
 
