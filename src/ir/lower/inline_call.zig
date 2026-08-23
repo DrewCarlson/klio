@@ -408,6 +408,17 @@ pub fn argsForwardInlineLambda(b: *const FuncBuilder, args: []const Expr) bool {
     return false;
 }
 
+/// Whether any argument lambda literal contains a `return@LABEL` naming
+/// `label` — used to keep a widened splice off calls whose own label the
+/// lambda targets, so the label stays on a real frame.
+pub fn argLambdaTargetsLabel(args: []const Expr, label: []const u8) bool {
+    for (args) |*a| {
+        if (a.* != .Lambda) continue;
+        if (labelScanStmtsG(true, a.Lambda.body.stmts, label)) return true;
+    }
+    return false;
+}
+
 /// Whether any argument lambda contains a `return@LABEL` whose label is an
 /// inline splice currently open in this builder — a FRAMELESS scope the
 /// dynamic unwind can never find. Such a call must splice (kotlinc inlines
@@ -425,13 +436,21 @@ pub fn argLambdaTargetsSplicedLabel(b: *const FuncBuilder, args: []const Expr) b
 }
 
 fn labelScanStmts(stmts: []const Stmt, label: []const u8) bool {
+    return labelScanStmtsG(false, stmts, label);
+}
+
+fn labelScan(e: *const Expr, label: []const u8) bool {
+    return labelScanG(false, e, label);
+}
+
+fn labelScanStmtsG(comptime deep: bool, stmts: []const Stmt, label: []const u8) bool {
     for (stmts) |*st| {
         const hit = switch (st.*) {
-            .Expr => |*e| labelScan(e, label),
-            .Assign => |asg| labelScan(&asg.target, label) or labelScan(&asg.value, label),
-            .DestructuringDecl => |d| labelScan(&d.init, label),
+            .Expr => |*e| labelScanG(deep, e, label),
+            .Assign => |asg| labelScanG(deep, &asg.target, label) or labelScanG(deep, &asg.value, label),
+            .DestructuringDecl => |d| labelScanG(deep, &d.init, label),
             .Decl => |decl| switch (decl) {
-                .Property => |pr| if (pr.init) |*init| labelScan(init, label) else false,
+                .Property => |pr| if (pr.init) |*init| labelScanG(deep, init, label) else false,
                 else => false,
             },
         };
@@ -440,46 +459,55 @@ fn labelScanStmts(stmts: []const Stmt, label: []const u8) bool {
     return false;
 }
 
-fn labelScanArgs(args: []const Expr, label: []const u8) bool {
+fn labelScanArgs(comptime deep: bool, args: []const Expr, label: []const u8) bool {
     for (args) |*a| {
-        if (labelScan(a, label)) return true;
+        if (labelScanG(deep, a, label)) return true;
     }
     return false;
 }
 
-fn labelScan(e: *const Expr, label: []const u8) bool {
+fn labelScanG(comptime deep: bool, e: *const Expr, label: []const u8) bool {
     return switch (e.*) {
         .Return => |r| if (r.label) |l| std.mem.eql(u8, l.name, label) else false,
-        .Lambda, .AnonFun, .ObjectExpr => false,
-        .Member => |m| labelScan(m.receiver, label),
-        .Unary => |u| labelScan(u.expr, label),
-        .Postfix => |po| labelScan(po.expr, label),
-        .Spread => |sp| labelScan(sp.expr, label),
-        .Throw => |t| labelScan(t.value, label),
-        .Labeled => |l| labelScan(l.expr, label),
-        .As => |a| labelScan(a.expr, label),
-        .IsCheck => |c| labelScan(c.expr, label),
-        .MemberRef => |r| labelScan(r.receiver, label),
-        .Call => |c| labelScan(c.callee, label) or labelScanArgs(c.args, label),
-        .Index => |i| labelScan(i.receiver, label) or labelScanArgs(i.args, label),
-        .Binary => |bin| labelScan(bin.lhs, label) or labelScan(bin.rhs, label),
-        .If => |i| labelScan(i.cond, label) or labelScan(i.then_branch, label) or
-            (if (i.else_branch) |eb| labelScan(eb, label) else false),
-        .While => |w| labelScan(w.cond, label) or labelScan(w.body, label),
-        .DoWhile => |dw| (if (dw.body) |body| labelScan(body, label) else false) or labelScan(dw.cond, label),
-        .For => |f| labelScan(f.iter, label) or labelScan(f.body, label),
-        .Block => |blk| labelScanStmts(blk.stmts, label),
-        .When => |w| (if (w.subject) |sub| labelScan(sub, label) else false) or blk: {
+        .Lambda => |lam| deep and labelScanStmtsG(deep, lam.body.stmts, label),
+        .AnonFun => |af| blk: {
+            if (!deep) break :blk false;
+            const body = af.body orelse break :blk false;
+            break :blk switch (body.*) {
+                .Block => |bb| labelScanStmtsG(deep, bb.stmts, label),
+                .Expr => |*ex| labelScanG(deep, ex, label),
+            };
+        },
+        .ObjectExpr => false,
+        .Member => |m| labelScanG(deep, m.receiver, label),
+        .Unary => |u| labelScanG(deep, u.expr, label),
+        .Postfix => |po| labelScanG(deep, po.expr, label),
+        .Spread => |sp| labelScanG(deep, sp.expr, label),
+        .Throw => |t| labelScanG(deep, t.value, label),
+        .Labeled => |l| labelScanG(deep, l.expr, label),
+        .As => |a| labelScanG(deep, a.expr, label),
+        .IsCheck => |c| labelScanG(deep, c.expr, label),
+        .MemberRef => |r| labelScanG(deep, r.receiver, label),
+        .Call => |c| labelScanG(deep, c.callee, label) or labelScanArgs(deep, c.args, label),
+        .Index => |i| labelScanG(deep, i.receiver, label) or labelScanArgs(deep, i.args, label),
+        .Binary => |bin| labelScanG(deep, bin.lhs, label) or labelScanG(deep, bin.rhs, label),
+        .If => |i| labelScanG(deep, i.cond, label) or labelScanG(deep, i.then_branch, label) or
+            (if (i.else_branch) |eb| labelScanG(deep, eb, label) else false),
+        .While => |w| labelScanG(deep, w.cond, label) or labelScanG(deep, w.body, label),
+        .DoWhile => |dw| (if (dw.body) |body| labelScanG(deep, body, label) else false) or labelScanG(deep, dw.cond, label),
+        .For => |f| labelScanG(deep, f.iter, label) or labelScanG(deep, f.body, label),
+        .Block => |blk| labelScanStmtsG(deep, blk.stmts, label),
+        .When => |w| (if (w.subject) |sub| labelScanG(deep, sub, label) else false) or blk: {
             for (w.branches) |*br| {
-                if (labelScan(&br.body, label)) break :blk true;
+                if (labelScanG(deep, &br.body, label)) break :blk true;
             }
             break :blk false;
         },
-        .Try => |t| labelScanStmts(t.body.stmts, label) or blk: {
+        .Try => |t| labelScanStmtsG(deep, t.body.stmts, label) or blk: {
             for (t.catches) |*c| {
-                if (labelScanStmts(c.body.stmts, label)) break :blk true;
+                if (labelScanStmtsG(deep, c.body.stmts, label)) break :blk true;
             }
-            break :blk (if (t.finally) |fb| labelScanStmts(fb.stmts, label) else false);
+            break :blk (if (t.finally) |fb| labelScanStmtsG(deep, fb.stmts, label) else false);
         },
         else => false,
     };

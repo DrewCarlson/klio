@@ -10422,9 +10422,13 @@ pub const Module = struct {
     pub fn bareRefTier(
         self: *const Module,
         name: []const u8,
-        caller_pkg: []const u8,
+        caller_pkg_in: []const u8,
         caller_file: FileId,
     ) ?u8 {
+        // Scope follows the reference span's FILE (see
+        // resolveBareCallIndexed): a spliced inline body carries the donor
+        // file's spans, so its bare reads rank in the donor's package.
+        const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
         var best_tier: u8 = 255;
         var candidate_it = self.bareCallCandidateIterator(name, caller_file);
         while (candidate_it.next()) |id| {
@@ -10446,9 +10450,10 @@ pub const Module = struct {
     pub fn classRefTier(
         self: *const Module,
         name: []const u8,
-        caller_pkg: []const u8,
+        caller_pkg_in: []const u8,
         caller_file: FileId,
     ) ?u8 {
+        const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
         // Exact imports include renamed aliases and collision-mangled classes
         // that have no `class_index` entry under the call-site spelling.
         if (self.classIdExactImport(name, caller_file) != null) return 0;
@@ -10472,9 +10477,10 @@ pub const Module = struct {
     pub fn topLevelPropRefTier(
         self: *const Module,
         name: []const u8,
-        caller_pkg: []const u8,
+        caller_pkg_in: []const u8,
         caller_file: FileId,
     ) ?u8 {
+        const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
         const list = self.registry.top_level_prop_pkgs.get(name) orelse return null;
         var best_tier: u8 = 255;
         for (list.items) |pd| {

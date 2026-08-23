@@ -454,33 +454,46 @@ fn trivialInitServe(allocator: Allocator, m: *const ir.Module, func: *const ir.F
     if (func.triv_init_state == 0) {
         const mut = @constCast(func);
         mut.triv_init_state = 1;
+        // An image func decodes its body lazily; classify the real blocks.
+        if (func.blocks.len == 0) _ = m.ensureFuncBody(mut);
         if (func.blocks.len == 1) one: {
             const blk = &func.blocks[0];
             if (blk.catches.len != 0 or blk.finally != null) break :one;
             if (blk.terminator != .Return) break :one;
             const ret_reg = blk.terminator.Return orelse break :one;
+            if (blk.insts.len > 24) break :one;
+            // The lowered thunk prologue loads every ctor param; the body
+            // is trivial when each inst is a param load or a Const whose
+            // destination is the returned register. The LAST write to the
+            // return register decides the served value.
             var state: u8 = 0;
             var val: u32 = 0;
-            var dst: ir.Reg = undefined;
             for (blk.insts) |*inst| switch (inst.*) {
                 .Trace => {},
                 .Const => |c| {
-                    if (state != 0) break :one;
+                    if (c.dst.int() != ret_reg.int()) break :one;
                     state = 2;
                     val = c.value.int();
-                    dst = c.dst;
                 },
                 .LoadParam => |lp| {
-                    if (state != 0) break :one;
-                    state = 3;
-                    val = lp.idx;
-                    dst = lp.dst;
+                    if (lp.dst.int() == ret_reg.int()) {
+                        state = 3;
+                        val = lp.idx;
+                    }
                 },
                 else => break :one,
             };
-            if (state == 0 or ret_reg.int() != dst.int()) break :one;
+            if (state == 0) break :one;
             mut.triv_init_val = val;
             mut.triv_init_state = state;
+        }
+        if (runtime.envOnce("KLIO_TRIV_TRACE") != null) {
+            std.debug.print("[triv] {s} state={d} val={d} blocks={d}", .{ func.name, func.triv_init_state, func.triv_init_val, func.blocks.len });
+            if (func.blocks.len >= 1) {
+                std.debug.print(" term={s} insts:", .{@tagName(std.meta.activeTag(func.blocks[0].terminator))});
+                for (func.blocks[0].insts) |*bi| std.debug.print(" {s}", .{@tagName(std.meta.activeTag(bi.*))});
+            }
+            std.debug.print("\n", .{});
         }
     }
     switch (func.triv_init_state) {
@@ -695,7 +708,13 @@ pub fn initLocalParentChain(
                         defer all.deinit(allocator);
                         try all.append(allocator, inst_value);
                         try all.appendSlice(allocator, cur_args.items);
-                        switch (try evalThunk(self, func, all.items)) {
+                        const served = blk: {
+                            const mg3 = self.module.borrow();
+                            defer mg3.deinit();
+                            break :blk try trivialInitServe(allocator, mg3.get(), func, all.items);
+                        };
+                        const r: ir.eval.EvalResult = if (served) |sv| .{ .ok = sv } else try evalThunk(self, func, all.items);
+                        switch (r) {
                             .ok => |v| {
                                 const g = inst.borrowMut();
                                 defer g.deinit();
