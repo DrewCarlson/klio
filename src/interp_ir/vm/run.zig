@@ -441,7 +441,17 @@ pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
 /// and the dispatcher pool must drain, and the process-global registries
 /// (slot owners, persisted continuations, run-scoped library state) must
 /// sweep, before the Vm and its arena tear down on any path.
+/// Count of Vm runs live in this process. A nested run (a lazy
+/// image-extend baking eager calls mid-program) must not treat its own
+/// completion as THE run boundary: the abandon flags, the dispatcher
+/// pool, and the run-scoped global registries all belong to the
+/// outermost run, and raising the boundary from a nested join killed the
+/// outer program's coroutines mid-flight.
+var live_vm_runs = std.atomic.Value(usize).init(0);
+
 pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
+    _ = live_vm_runs.fetchAdd(1, .acq_rel);
+    defer _ = live_vm_runs.fetchSub(1, .acq_rel);
     const result = try vmRunBody(self, main);
     // Join every still-running spawned thread before returning so a
     // program that omits an explicit `join()` does not lose a child's
@@ -844,6 +854,8 @@ pub fn vmRunCalls(
     runtime.gc.program_started = true;
     vmhost.coroutines.gcThreadEnter();
     defer vmhost.coroutines.gcThreadExit();
+    _ = live_vm_runs.fetchAdd(1, .acq_rel);
+    defer _ = live_vm_runs.fetchSub(1, .acq_rel);
     const prep = try vmPrepare(self);
     if (prep == null) try body(ctx, self);
     _ = joinAllThreads(self, .{ .ok = .{ .Unit = {} } });
@@ -865,26 +877,36 @@ pub fn vmRunCalls(
 /// it — keeps a stale entry from surviving into the next run's reset arena.
 fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
     var out = result;
-    // The run's result is computed; every worker still executing user code
-    // — explicit threads included — must stop cooperatively so a leaked
-    // spinner or sleeper cannot hold this join open forever (the per-test
-    // wall cap is already cleared here, and the pool's own abandonment
-    // only begins after the explicit joins). The pool shutdown inside the
-    // drain loop clears `abandon_requested` when it finishes; re-arm it at
-    // each pass so the request stays live for stragglers.
-    runtime.setRunBoundaryAbandon(true);
-    defer runtime.setRunBoundaryAbandon(false);
-    defer runtime.clearAbandon();
-    runtime.requestAbandon();
+    // A NESTED join (a mid-program image-extend's bake Vm) owns only its
+    // own explicit threads. The abandon flags, the shared dispatcher
+    // pool, and the run-scoped global registries belong to the outermost
+    // run — raising the boundary here aborted the outer program's
+    // coroutines at their next block edge.
+    const outermost = live_vm_runs.load(.acquire) <= 1;
+    if (outermost) {
+        // The run's result is computed; every worker still executing user code
+        // — explicit threads included — must stop cooperatively so a leaked
+        // spinner or sleeper cannot hold this join open forever (the per-test
+        // wall cap is already cleared here, and the pool's own abandonment
+        // only begins after the explicit joins). The pool shutdown inside the
+        // drain loop clears `abandon_requested` when it finishes; re-arm it at
+        // each pass so the request stays live for stragglers.
+        runtime.setRunBoundaryAbandon(true);
+        runtime.requestAbandon();
+    }
+    defer if (outermost) {
+        runtime.setRunBoundaryAbandon(false);
+        runtime.clearAbandon();
+    };
     // Once both worker populations have drained, sweep the process-global
     // registries that key into this run's value graph: the slot-owner and
     // persisted-continuation maps here, and each library layer's run-scoped
     // state (e.g. the kxco channel registry) through its registered
     // run-boundary hook.
-    defer runtime.runBoundarySweep();
-    defer vmhost.coroutines.drainVirtualClock();
-    defer vmhost.coroutines.drainPersistedParked();
-    defer vmhost.coroutines.drainSlotOwners();
+    defer if (outermost) runtime.runBoundarySweep();
+    defer if (outermost) vmhost.coroutines.drainVirtualClock();
+    defer if (outermost) vmhost.coroutines.drainPersistedParked();
+    defer if (outermost) vmhost.coroutines.drainSlotOwners();
     // Two worker populations drain in turn: explicit `kotlin.concurrent`
     // threads (which may still post dispatcher tasks) first, then the
     // dispatcher pool (whose tasks may have spawned threads). Loop until
@@ -893,7 +915,7 @@ fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
         var joined_any = false;
         // The pool-shutdown pass below clears the abandon request when it
         // finishes; re-arm for this pass's joins.
-        runtime.requestAbandon();
+        if (outermost) runtime.requestAbandon();
         while (true) {
             // Take one outstanding handle under the lock, then join it
             // without holding the lock so the worker's own result
@@ -934,6 +956,10 @@ fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
                     };
                 }
             }
+        }
+        if (!outermost) {
+            if (!joined_any) break;
+            continue;
         }
         const pool_had_work = vmhost.scheduler.outstandingOther() != 0;
         vmhost.scheduler.shutdownAndJoin();
