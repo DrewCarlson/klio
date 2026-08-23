@@ -23,6 +23,7 @@ const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 const trace = @import("trace.zig");
 const persistent_map_eq = @import("persistent_map_eq.zig");
 const persistent_list_eq = @import("persistent_list_eq.zig");
+const persistent_list_mut = @import("persistent_list_mut.zig");
 const overload_match = @import("overload_match.zig");
 const host_call_func = @import("host_call_func.zig");
 const host_call_value = @import("host_call_value.zig");
@@ -3796,6 +3797,14 @@ pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *con
     {
         return null;
     }
+    // Builder removeRange/addAll are host-served the same way.
+    if (((args.len == 2 and std.mem.eql(u8, name, "removeRange")) or
+        (args.len == 1 and std.mem.eql(u8, name, "addAll"))) and
+        receiver.* == .Instance and
+        persistent_list_mut.isBuilderClass(receiver.Instance))
+    {
+        return null;
+    }
     // `closure.invoke(args…)`: the ladder lands at `callValueRec(receiver,
     // args)` with no closure-specific step before it, so the plain closure
     // invocation flattens identically.
@@ -4012,6 +4021,15 @@ pub fn prepareVirtualFlatCall(
             if (std.mem.eql(u8, vn, "contains") or std.mem.eql(u8, vn, "indexOf")) return null;
         }
     }
+    // Builder removeRange/addAll are host-served the same way.
+    if ((args.len == 1 or args.len == 2) and receiver.* == .Instance and
+        persistent_list_mut.isBuilderClass(receiver.Instance))
+    {
+        if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vn| {
+            if (args.len == 2 and std.mem.eql(u8, vn, "removeRange")) return null;
+            if (args.len == 1 and std.mem.eql(u8, vn, "addAll")) return null;
+        }
+    }
     if (receiver.* != .Instance) {
         if (vtrace) {
             const nm = virtualSlotInterfaceMember(self, slot) orelse slotNameForTrace(self, slot);
@@ -4181,6 +4199,20 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (persistent_list_eq.tryIndexOf(receiver.Instance, &args[0])) |idx| {
             if (name.len == 8) return .{ .ok = .{ .Bool = idx >= 0 } };
             return .{ .ok = Value.newInt(idx) };
+        }
+    }
+    // Vendored persistent-vector builder bulk ops: `removeRange` otherwise
+    // runs one interpreted removeAt per element with a suffix shift each,
+    // and `addAll` an interpreted per-element buffer fill (see
+    // persistent_list_mut.zig).
+    if (args.len == 2 and receiver.* == .Instance and std.mem.eql(u8, name, "removeRange")) {
+        if (try persistent_list_mut.tryRemoveRange(allocator, receiver.Instance, &args[0], &args[1])) |v| {
+            return .{ .ok = v };
+        }
+    }
+    if (args.len == 1 and receiver.* == .Instance and std.mem.eql(u8, name, "addAll")) {
+        if (try persistent_list_mut.tryAddAll(allocator, receiver.Instance, &args[0])) |v| {
+            return .{ .ok = v };
         }
     }
 
@@ -8664,6 +8696,23 @@ pub fn invokeVirtualMember(
             }
         }
     }
+    // Vendored persistent-vector builder bulk ops (see the
+    // callMemberInnerStatic intercept): `subList(...).clear()` reaches the
+    // builder's `removeRange` as a virtual slot, and `addAll` likewise.
+    if ((args.len == 1 or args.len == 2) and receiver.* == .Instance) {
+        if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vname| {
+            if (args.len == 2 and std.mem.eql(u8, vname, "removeRange")) {
+                if (try persistent_list_mut.tryRemoveRange(allocator, receiver.Instance, &args[0], &args[1])) |v| {
+                    return .{ .ok = v };
+                }
+            }
+            if (args.len == 1 and std.mem.eql(u8, vname, "addAll")) {
+                if (try persistent_list_mut.tryAddAll(allocator, receiver.Instance, &args[0])) |v| {
+                    return .{ .ok = v };
+                }
+            }
+        }
+    }
     // Replay a stamped host-receiver site: same interned type FQN means the
     // walk below would reach the same verdict, so serve it without the
     // registry probes. Verdicts are tagged in `site_native`'s low bits
@@ -9199,6 +9248,27 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
             if (persistent_list_eq.tryIndexOf(receiver.Instance, &args_in[0])) |idx| {
                 if (fname.len == 8) return .{ .ok = .{ .Bool = idx >= 0 } };
                 return .{ .ok = Value.newInt(idx) };
+            }
+        }
+    }
+    // Vendored persistent-vector builder bulk ops (see the
+    // callMemberInnerStatic intercept): serve a memoized removeRange or
+    // addAll site replaying straight to its FuncId.
+    if ((args_in.len == 1 or args_in.len == 2) and receiver.* == .Instance) {
+        const fname2 = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const f = mg.get().funcById(fid) orelse break :blk "";
+            break :blk f.name;
+        };
+        if (args_in.len == 2 and std.mem.eql(u8, fname2, "removeRange")) {
+            if (try persistent_list_mut.tryRemoveRange(allocator, receiver.Instance, &args_in[0], &args_in[1])) |v| {
+                return .{ .ok = v };
+            }
+        }
+        if (args_in.len == 1 and std.mem.eql(u8, fname2, "addAll")) {
+            if (try persistent_list_mut.tryAddAll(allocator, receiver.Instance, &args_in[0])) |v| {
+                return .{ .ok = v };
             }
         }
     }
