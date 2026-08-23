@@ -261,6 +261,35 @@ roots, all landed; final gate.sh GREEN:
   run-scoped registries the outer run still owned (latent; found en
   route). Scoped to the outermost join via a live-run counter.
 
+## Collection-hot-path round (2026-08-24, closed)
+
+Three levers landed after the gate-green round; solo-deterministic
+family 9 -> 4:
+- 25db6cfa: scalar bitwise infix (and/or/xor/shl/shr/ushr on static
+  Int/Long, Boolean trio) lowers as BinOps — 3.7M virtual-slot calls
+  became register ops in the snapshot-map repro (call_virtual_slot
+  4.0M -> 0.9M); took SnapshotStateSetTests to 21/21 SOLO GREEN and
+  Map's mixing_set under budget solo.
+- 45bc114a: host contains/indexOf scans for the vendored persistent
+  vectors — 4257ms -> 31ms per 1000 contains. The flat-call preparers
+  must DECLINE host-served names or a flat-prepared interpreted body
+  bypasses every dispatch-ladder intercept (the virtual-slot preparer
+  was the live route). SnapshotStateListTests 62 -> 63/65
+  (concurrentGlobalModifications_addAll passes).
+- Gate at width6/cap5: 528s / 1378 passed / 12 failed — the
+  global-modification + put_replace family is GONE at gate scale;
+  remaining = the five 30s-budget mixing tests (re-inflated by gate
+  contention; Set's passes solo), the Recomposer pair, Pausable pair,
+  one MovableContent flake.
+- REMAINING CEILING, precisely sized: the mixing_clear shape runs 1M
+  puts + 100k clears against a 30s budget = 30us/put needed vs 280us
+  today (~10x). Profile stays diffuse (memset 5.3, eqlBytes 3.8,
+  getIndex 2.6, alloc ~3, libc 8) — this IS the dispatch/activation
+  call-throughput campaign, nothing narrower is left.
+- TRAP: solo harness class runs now hit the default 6GB RSS cap
+  (arena profile + tests running further); use KLIO_RSS_CAP_KB=16777216
+  for solo classes. Gate children run CLI GC mode, unaffected.
+
 ## Running log
 
 - 2026-08-22 PERF BATCH 2: every remaining `[24]ArgShape` scratch shrunk
