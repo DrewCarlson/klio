@@ -2930,6 +2930,9 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
         }
         cg.deinit();
     }
+    if (runtime.envOnce("KLIO_ADM_TRACE") != null) {
+        std.debug.print("[adm] definite-mismatch pn={s} orig={s} start={s} walked={d}\n", .{ pn, orig, start, queue.items.len });
+    }
     return true;
 }
 
@@ -12045,6 +12048,16 @@ fn maybeWarnLenientExtBind(self: *VmHost, mod: *const Module, fid: FuncId) void 
         "warning: `{s}` binds `{s}` without an import; add `import {s}` — kotlinc rejects the unimported call, and klio may type its lambda arguments incorrectly\n",
         .{ f.name, f.fqn, f.fqn },
     );
+}
+
+/// The lenient-bind warning prints once per function per PROGRAM RUN. The
+/// memo is process-global, so an in-process harness running many programs
+/// must reset it at each run boundary or later programs lose the warning
+/// their pinned output carries.
+pub fn resetLenientWarned() void {
+    lenient_warned_mutex.lock();
+    defer lenient_warned_mutex.unlock();
+    if (lenient_warned) |*m| m.clearRetainingCapacity();
 }
 
 /// The instance serving as a member-extension's dispatch receiver: the

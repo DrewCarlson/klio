@@ -5945,7 +5945,14 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // argument like `Nodes.Draw : NodeKind<DrawModifierNode>`), so the
         // spliced `is T` checks the real class — runtime dispatch of the
         // inline body would read a stale/unbound `T`.
-        if (inline_call.argsBindAllReified(b.allocator, callee.Member.name.name, args, b)) break :gate true;
+        // EXCEPT when the receiver's own static type serves the name at
+        // this arity: kotlinc resolves members before extensions, so
+        // `pipelineCall.respond(message, typeInfo)` binds the interface
+        // member — splicing the reified two-parameter respond EXTENSION
+        // here committed the message into its HttpStatusCode parameter.
+        if (inline_call.argsBindAllReified(b.allocator, callee.Member.name.name, args, b)) {
+            break :gate !(try receiverStaticMemberApplies(b, callee.Member.receiver, callee.Member.name.name, args.len, callee.Member.name.span.file));
+        }
         const recv = callee.Member.receiver;
         if (recv.* != .Path or recv.Path.segments.len != 1) break :gate false;
         const n = recv.Path.segments[0].name;
@@ -22404,3 +22411,28 @@ test "a member reference on a scope-renamed nested class loads the lifted name" 
     try testing.expect(lifted);
     try testing.expect(!bare);
 }
+
+/// Whether the receiver's STATIC type (head-resolved) declares a visible
+/// member of `name` applicable at `argc` unnamed arguments. kotlinc
+/// resolves members before extensions, so an applicable member blocks the
+/// inference-opened reified-extension splice.
+fn receiverStaticMemberApplies(b: *FuncBuilder, receiver: *const Expr, name: []const u8, argc: usize, caller_file: span.FileId) Allocator.Error!bool {
+    const head = (try inline_call.gateReceiverHead(b, receiver)) orelse return false;
+    var h = std.mem.trimEnd(u8, head, "?");
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (h.len == 0) return false;
+    const cid = (if (std.mem.indexOfScalar(u8, h, '.') != null)
+        b.module.classIdByFqn(h)
+    else
+        b.module.uniqueClassIdBySimpleName(h)) orelse return false;
+    if (argc > 8) return false;
+    var shapes: [8]applicability.ArgShape = @splat(.{ .ty_authoritative = false });
+    const res = b.module.resolveMemberCall(cid, name, shapes[0..argc], .{
+        .caller_file = caller_file,
+        .lexical_owner = null,
+        .actual_type_param_bounds = &.{},
+        .receiver_type = null,
+    });
+    return res.applicable;
+}
+
