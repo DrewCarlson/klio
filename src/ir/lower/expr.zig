@@ -8690,6 +8690,13 @@ fn anyReceiverFormedFnParam(f: *const ast.Function) bool {
     return false;
 }
 
+fn anyCrossOrNoinlineParam(f: *const ast.Function) bool {
+    for (f.params) |*p| {
+        if (p.is_crossinline or p.is_noinline) return true;
+    }
+    return false;
+}
+
 /// Whether `f`'s body contains a `this` reference INSIDE a nested lambda /
 /// anon-fun. Such a `this` may belong to a receiver-formed block invoked
 /// dynamically (`withCurrent { this }`), which a member-body splice would
@@ -8844,9 +8851,32 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
     // its own label is also excluded — a nested member-inline call inside
     // it stays framed, so the label must live on a real frame to be
     // found at unwind.
+    // `crossinline`/`noinline` params embed the lambda in a result
+    // closure rather than calling it in place; that capture wiring is
+    // not spliced correctly yet (compareBy { it.name } handed the
+    // selector the comparator's other operand), so those stay framed.
+    // Exact positional fit only: `f` is the name's inline candidate, not
+    // a resolved overload, so a call whose arity differs (the 4-arg
+    // compareValuesBy against the 1-selector inline) must stay on the
+    // dynamic path where real overload resolution runs.
+    const llp_arity_fits = want == f.params.len and blk: {
+        for (f.params, 0..) |*p, pi| {
+            if (p.is_vararg or p.default != null) break :blk false;
+            // A lambda literal must land on a function-typed param —
+            // the 4-arg compareValuesBy(a, b, sel, sel) arity-matches
+            // the (a, b, Comparator, selector) inline overload, but its
+            // third lambda lands on the Comparator slot.
+            const arg_is_lambda = pi < args.len and
+                (args[pi] == .Lambda or args[pi] == .AnonFun);
+            if (arg_is_lambda and p.ty.function == null) break :blk false;
+        }
+        break :blk true;
+    };
     const lambda_literal_plain = inline_takes_fn and trailing_lambda and
+        llp_arity_fits and
         inline_state.inlineMemberOwner(f) == null and
         !anyReceiverFormedFnParam(f) and
+        !anyCrossOrNoinlineParam(f) and
         !inline_call.argLambdaTargetsLabel(args, nm) and
         std.mem.eql(u8, runtime.envOnce("KLIO_LLP") orelse "0", "1");
     return !recv_mismatch and

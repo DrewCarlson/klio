@@ -317,6 +317,40 @@ family 9 -> 4:
   bit-set over Long fields, host-readable layout), allocator zero-fill
   audit (memset 186/425 = allocBytesWithAlignment).
 
+## Call-throughput round 4 (2026-08-23)
+
+- 6d33ce07 LANDED: persistent-vector builder bulk ops host-served
+  (persistent_list_mut.zig). `removeRange` (the SubList-clear
+  iterator-removeAt O(n^2) walk) rebuilds the trie from kept elements in
+  fresh owned 33-slot buffers: 3.8ms -> 0.33ms per addAll+removeRange
+  pair (11.6x); `addAll` append (tail-fit fast path + gated full
+  rebuild): addAll+clear pair 305 -> 218us. BOTH List timeout tests now
+  PASS solo (addAll_clear 29.1s, removeRange 12.3s vs 39s). Example
+  snapshot_list_bulk_ops.kt pins 16 shapes incl. two-level tries.
+- 4b916b7d LANDED, three roots on the way to the literal-lambda splice:
+  (1) trivial-init serve now classifies LAZY image funcs
+  (ensureFuncBody before the block scan) and multi-LoadParam prologues,
+  and runs at the parent-chain site too — aconly census -23%.
+  (2) VALUE-REFERENCE scoping now follows the reference span's file
+  (bareRefTier/classRefTier/topLevelPropRefTier derive the package from
+  packageOfFile, as resolveBareCallIndexed already did) — kills the
+  cross-file `observers` unresolved-reference that sank the first LLP
+  attempt.
+  (3) KLIO_LLP=1 re-lands lambda-literal splicing with three exclusions:
+  class-member callees (bare member reads need the decl class's this —
+  `objectArgs` global miss), receiver-formed lambda params (with(x){}
+  nested rebinding unimplemented, as member_body_ext), and lambdas that
+  `return@<callee>` their own label (a nested member-inline stays
+  framed, so the label must live on a real frame; deep label scan
+  descends nested lambdas). CompositionTests-family 147/148 under
+  LLP=1 (the one fail = the standing cap-bound Pausable test); the old
+  collapse (1259/131 + hangs) is GONE.
+- LLP=1 measured: synchronized 2640 -> 975ns/block; addAll+clear pair
+  218 -> 164us; the real addAll_clear test shape 2.87 -> 2.30s/rep
+  (23s of 30s budget — margin recovered). Map put group unchanged
+  (its costs are flat machinery, not frame count: census -30% frames,
+  wall flat).
+
 ## Call-throughput round 3 (2026-08-24)
 
 - 956600b5 LANDED: host-served snapshot validity walk (readable/valid
