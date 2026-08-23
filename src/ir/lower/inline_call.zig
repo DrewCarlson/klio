@@ -408,6 +408,17 @@ pub fn argsForwardInlineLambda(b: *const FuncBuilder, args: []const Expr) bool {
     return false;
 }
 
+/// Whether any argument lambda literal contains a `return@LABEL` naming
+/// `label` — used to keep a widened splice off calls whose own label the
+/// lambda targets, so the label stays on a real frame.
+pub fn argLambdaTargetsLabel(args: []const Expr, label: []const u8) bool {
+    for (args) |*a| {
+        if (a.* != .Lambda) continue;
+        if (labelScanStmtsG(true, a.Lambda.body.stmts, label)) return true;
+    }
+    return false;
+}
+
 /// Whether any argument lambda contains a `return@LABEL` whose label is an
 /// inline splice currently open in this builder — a FRAMELESS scope the
 /// dynamic unwind can never find. Such a call must splice (kotlinc inlines
@@ -425,13 +436,21 @@ pub fn argLambdaTargetsSplicedLabel(b: *const FuncBuilder, args: []const Expr) b
 }
 
 fn labelScanStmts(stmts: []const Stmt, label: []const u8) bool {
+    return labelScanStmtsG(false, stmts, label);
+}
+
+fn labelScan(e: *const Expr, label: []const u8) bool {
+    return labelScanG(false, e, label);
+}
+
+fn labelScanStmtsG(comptime deep: bool, stmts: []const Stmt, label: []const u8) bool {
     for (stmts) |*st| {
         const hit = switch (st.*) {
-            .Expr => |*e| labelScan(e, label),
-            .Assign => |asg| labelScan(&asg.target, label) or labelScan(&asg.value, label),
-            .DestructuringDecl => |d| labelScan(&d.init, label),
+            .Expr => |*e| labelScanG(deep, e, label),
+            .Assign => |asg| labelScanG(deep, &asg.target, label) or labelScanG(deep, &asg.value, label),
+            .DestructuringDecl => |d| labelScanG(deep, &d.init, label),
             .Decl => |decl| switch (decl) {
-                .Property => |pr| if (pr.init) |*init| labelScan(init, label) else false,
+                .Property => |pr| if (pr.init) |*init| labelScanG(deep, init, label) else false,
                 else => false,
             },
         };
@@ -440,48 +459,173 @@ fn labelScanStmts(stmts: []const Stmt, label: []const u8) bool {
     return false;
 }
 
-fn labelScanArgs(args: []const Expr, label: []const u8) bool {
+fn labelScanArgs(comptime deep: bool, args: []const Expr, label: []const u8) bool {
     for (args) |*a| {
-        if (labelScan(a, label)) return true;
+        if (labelScanG(deep, a, label)) return true;
     }
     return false;
 }
 
-fn labelScan(e: *const Expr, label: []const u8) bool {
+fn labelScanG(comptime deep: bool, e: *const Expr, label: []const u8) bool {
     return switch (e.*) {
         .Return => |r| if (r.label) |l| std.mem.eql(u8, l.name, label) else false,
-        .Lambda, .AnonFun, .ObjectExpr => false,
-        .Member => |m| labelScan(m.receiver, label),
-        .Unary => |u| labelScan(u.expr, label),
-        .Postfix => |po| labelScan(po.expr, label),
-        .Spread => |sp| labelScan(sp.expr, label),
-        .Throw => |t| labelScan(t.value, label),
-        .Labeled => |l| labelScan(l.expr, label),
-        .As => |a| labelScan(a.expr, label),
-        .IsCheck => |c| labelScan(c.expr, label),
-        .MemberRef => |r| labelScan(r.receiver, label),
-        .Call => |c| labelScan(c.callee, label) or labelScanArgs(c.args, label),
-        .Index => |i| labelScan(i.receiver, label) or labelScanArgs(i.args, label),
-        .Binary => |bin| labelScan(bin.lhs, label) or labelScan(bin.rhs, label),
-        .If => |i| labelScan(i.cond, label) or labelScan(i.then_branch, label) or
-            (if (i.else_branch) |eb| labelScan(eb, label) else false),
-        .While => |w| labelScan(w.cond, label) or labelScan(w.body, label),
-        .DoWhile => |dw| (if (dw.body) |body| labelScan(body, label) else false) or labelScan(dw.cond, label),
-        .For => |f| labelScan(f.iter, label) or labelScan(f.body, label),
-        .Block => |blk| labelScanStmts(blk.stmts, label),
-        .When => |w| (if (w.subject) |sub| labelScan(sub, label) else false) or blk: {
+        .Lambda => |lam| deep and labelScanStmtsG(deep, lam.body.stmts, label),
+        .AnonFun => |af| blk: {
+            if (!deep) break :blk false;
+            const body = af.body orelse break :blk false;
+            break :blk switch (body.*) {
+                .Block => |bb| labelScanStmtsG(deep, bb.stmts, label),
+                .Expr => |*ex| labelScanG(deep, ex, label),
+            };
+        },
+        .ObjectExpr => false,
+        .Member => |m| labelScanG(deep, m.receiver, label),
+        .Unary => |u| labelScanG(deep, u.expr, label),
+        .Postfix => |po| labelScanG(deep, po.expr, label),
+        .Spread => |sp| labelScanG(deep, sp.expr, label),
+        .Throw => |t| labelScanG(deep, t.value, label),
+        .Labeled => |l| labelScanG(deep, l.expr, label),
+        .As => |a| labelScanG(deep, a.expr, label),
+        .IsCheck => |c| labelScanG(deep, c.expr, label),
+        .MemberRef => |r| labelScanG(deep, r.receiver, label),
+        .Call => |c| labelScanG(deep, c.callee, label) or labelScanArgs(deep, c.args, label),
+        .Index => |i| labelScanG(deep, i.receiver, label) or labelScanArgs(deep, i.args, label),
+        .Binary => |bin| labelScanG(deep, bin.lhs, label) or labelScanG(deep, bin.rhs, label),
+        .If => |i| labelScanG(deep, i.cond, label) or labelScanG(deep, i.then_branch, label) or
+            (if (i.else_branch) |eb| labelScanG(deep, eb, label) else false),
+        .While => |w| labelScanG(deep, w.cond, label) or labelScanG(deep, w.body, label),
+        .DoWhile => |dw| (if (dw.body) |body| labelScanG(deep, body, label) else false) or labelScanG(deep, dw.cond, label),
+        .For => |f| labelScanG(deep, f.iter, label) or labelScanG(deep, f.body, label),
+        .Block => |blk| labelScanStmtsG(deep, blk.stmts, label),
+        .When => |w| (if (w.subject) |sub| labelScanG(deep, sub, label) else false) or blk: {
             for (w.branches) |*br| {
-                if (labelScan(&br.body, label)) break :blk true;
+                if (labelScanG(deep, &br.body, label)) break :blk true;
             }
             break :blk false;
         },
-        .Try => |t| labelScanStmts(t.body.stmts, label) or blk: {
+        .Try => |t| labelScanStmtsG(deep, t.body.stmts, label) or blk: {
             for (t.catches) |*c| {
-                if (labelScanStmts(c.body.stmts, label)) break :blk true;
+                if (labelScanStmtsG(deep, c.body.stmts, label)) break :blk true;
             }
-            break :blk (if (t.finally) |fb| labelScanStmts(fb.stmts, label) else false);
+            break :blk (if (t.finally) |fb| labelScanStmtsG(deep, fb.stmts, label) else false);
         },
         else => false,
+    };
+}
+
+
+/// True when every reference to `name` in the callee body is the CALLEE
+/// head of a call — i.e. the splice's call-position expansion consumes
+/// every use and no value position remains. Conservative: any construct
+/// this walk does not understand, a shadowing risk, or a bare value
+/// occurrence returns false.
+fn paramOnlyCalled(f: *const ast.Function, name: []const u8) bool {
+    const body = if (f.body) |*bd| bd else return false;
+    return switch (body.*) {
+        .Block => |blk| !pocStmts(true, blk.stmts, name),
+        .Expr => |*ex| !pocUses(true, ex, name),
+    };
+}
+
+fn pocStmts(comptime exempt_call_head: bool, stmts: []const Stmt, name: []const u8) bool {
+    for (stmts) |*st| {
+        const hit = switch (st.*) {
+            .Expr => |*e| pocUses(exempt_call_head, e, name),
+            .Assign => |asg| pocUses(exempt_call_head, &asg.target, name) or pocUses(exempt_call_head, &asg.value, name),
+            .DestructuringDecl => |d| pocUses(exempt_call_head, &d.init, name),
+            .Decl => |decl| switch (decl) {
+                .Property => |pr| blk: {
+                    // A same-named local re-declaration shadows below; too
+                    // rare to model — treat as a value use (keep the arg).
+                    if (std.mem.eql(u8, pr.name.name, name)) break :blk true;
+                    break :blk if (pr.init) |*init| pocUses(exempt_call_head, init, name) else false;
+                },
+                else => true,
+            },
+        };
+        if (hit) return true;
+    }
+    return false;
+}
+
+/// Whether `name` occurs as a VALUE (any position that is not the callee
+/// head of a call) under `e`. Unknown constructs count as a use.
+fn pocUses(comptime exempt_call_head: bool, e: *const Expr, name: []const u8) bool {
+    return switch (e.*) {
+        .IntLit, .FloatLit, .BoolLit, .NullLit, .CharLit, .This, .Super, .Break, .Continue => false,
+        .Path => |pth| pth.segments.len == 1 and std.mem.eql(u8, pth.segments[0].name, name),
+        .StringTemplate => |st| blk: {
+            for (st.parts) |*part| switch (part.*) {
+                .Text => {},
+                .ShortInterp => |id| if (std.mem.eql(u8, id.name, name)) break :blk true,
+                .Interp => |ie| if (pocUses(exempt_call_head, ie, name)) break :blk true,
+            };
+            break :blk false;
+        },
+        // A receiver-lambda param invoked with an explicit receiver
+        // (`expected.getter()`) reaches the param through the MEMBER name;
+        // that route needs the materialized value.
+        .Member => |m| std.mem.eql(u8, m.name.name, name) or
+            pocUses(exempt_call_head, m.receiver, name),
+        .Call => |c| blk: {
+            const head_is_param = exempt_call_head and c.callee.* == .Path and
+                c.callee.Path.segments.len == 1 and
+                std.mem.eql(u8, c.callee.Path.segments[0].name, name);
+            if (!head_is_param and pocUses(exempt_call_head, c.callee, name)) break :blk true;
+            for (c.args) |*a2| {
+                if (pocUses(exempt_call_head, a2, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .Index => |ix| blk: {
+            if (pocUses(exempt_call_head, ix.receiver, name)) break :blk true;
+            for (ix.args) |*a2| {
+                if (pocUses(exempt_call_head, a2, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .Binary => |bin| pocUses(exempt_call_head, bin.lhs, name) or pocUses(exempt_call_head, bin.rhs, name),
+        .Unary => |u| pocUses(exempt_call_head, u.expr, name),
+        .Postfix => |po| pocUses(exempt_call_head, po.expr, name),
+        .If => |i| pocUses(exempt_call_head, i.cond, name) or pocUses(exempt_call_head, i.then_branch, name) or
+            (if (i.else_branch) |eb| pocUses(exempt_call_head, eb, name) else false),
+        .While => |w| pocUses(exempt_call_head, w.cond, name) or pocUses(exempt_call_head, w.body, name),
+        .DoWhile => |dw| (if (dw.body) |bd| pocUses(exempt_call_head, bd, name) else false) or pocUses(exempt_call_head, dw.cond, name),
+        .For => |fo| pocUses(exempt_call_head, fo.iter, name) or pocUses(exempt_call_head, fo.body, name),
+        .Return => |r| if (r.value) |v| pocUses(exempt_call_head, v, name) else false,
+        .Labeled => |l| pocUses(exempt_call_head, l.expr, name),
+        .Block => |blk2| pocStmts(exempt_call_head, blk2.stmts, name),
+        .Throw => |t| pocUses(exempt_call_head, t.value, name),
+        .Try => |t| blk: {
+            if (pocStmts(exempt_call_head, t.body.stmts, name)) break :blk true;
+            for (t.catches) |*c2| {
+                if (pocStmts(exempt_call_head, c2.body.stmts, name)) break :blk true;
+            }
+            break :blk (if (t.finally) |fb| pocStmts(exempt_call_head, fb.stmts, name) else false);
+        },
+        // A nested lambda in the callee body may itself splice, materialize,
+        // or defer — the param's reachability through that layer is not
+        // decidable here, so any nested literal keeps the materialization
+        // (observe's `observeDerivedStateRecalculations(...) { ...block... }`
+        // lost the binding through exactly this interplay).
+        .Lambda => true,
+        .When => |w| blk: {
+            if (w.subject) |sub| {
+                if (pocUses(exempt_call_head, sub, name)) break :blk true;
+            }
+            for (w.branches) |*br| {
+                if (pocUses(exempt_call_head, &br.body, name)) break :blk true;
+                for (br.patterns) |*pat| switch (pat.kind) {
+                    .Value, .InRange, .NotInRange => |*pe| if (pocUses(exempt_call_head, pe, name)) break :blk true,
+                    else => {},
+                };
+            }
+            break :blk false;
+        },
+        .IsCheck => |c| pocUses(exempt_call_head, c.expr, name),
+        .As => |a2| pocUses(exempt_call_head, a2.expr, name),
+        .Spread => |sp| pocUses(exempt_call_head, sp.expr, name),
+        else => true,
     };
 }
 
@@ -556,13 +700,20 @@ fn scanCatches(catches: []const ast.Catch) bool {
 
 /// Splice an `inline fun` argument lambda where the inlined body
 /// invokes the corresponding lambda parameter.
+/// Receiver-formed lambda SPLICING and its supporting resolution changes
+/// are opt-in (KLIO_RFS=1) until spliced windows carry a runtime receiver
+/// tower; see the round record in plans/concurrency-perf-campaigns.md.
+pub fn rfsEnabled() bool {
+    return std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_RFS") orelse "0", "1");
+}
+
 pub fn spliceInlineLambda(
     b: *FuncBuilder,
     lambda_name: []const u8,
     lam: *const Expr,
     arg_exprs: []const Expr,
 ) Allocator.Error!Reg {
-    return spliceInlineLambdaOn(b, lambda_name, lam, arg_exprs, null);
+    return spliceInlineLambdaOn(b, lambda_name, lam, arg_exprs, null, null);
 }
 
 /// As `spliceInlineLambda`, with the lambda's receiver supplied by the call
@@ -575,6 +726,7 @@ pub fn spliceInlineLambdaOn(
     lam: *const Expr,
     arg_exprs: []const Expr,
     explicit_receiver: ?Reg,
+    receiver_expr: ?*const Expr,
 ) Allocator.Error!Reg {
     if (lam.* != .Lambda) {
         return lowerExpr(b, lam);
@@ -841,13 +993,41 @@ pub fn spliceInlineLambdaOn(
     }
     const lam_prev_active = b.spliceHintActive();
     const lam_prev_recv = b.spliceHintRecv();
+    // The spliced receiver lambda has no runtime closure — its subject is
+    // only the window's bound register — so the body's bare member reads
+    // need the subject's STATIC head to win the member-vs-global
+    // arbitration (`objectArgs` inside `with(stack) { ... }` is the
+    // stack's member, never a global). The declared head decides when
+    // concrete; a generic head (`with`'s `T.()`) substitutes the
+    // receiver EXPRESSION's static type, exactly as the inline-fn splice
+    // substitutes a generic `T.apply` receiver.
+    var recv_head: ?[]const u8 = null;
+    if (receiver != null) {
+        recv_head = b.receiverLambdaRecvHead(lambda_name);
+        if (recv_head == null and rfsEnabled()) if (receiver_expr) |rex| {
+            var derived: ?[]const u8 = null;
+            if (expr_lower.argDeclTypeRefLazy(b, rex)) |known| {
+                derived = expr_lower.typeHead(std.mem.trimEnd(u8, known.name, "?"));
+            } else if (try expr_lower.staticExprTypeRef(b, rex)) |owned_ty| {
+                var owned = owned_ty;
+                defer owned.deinit(b.allocator);
+                derived = try b.allocator.dupe(u8, expr_lower.typeHead(std.mem.trimEnd(u8, owned.name, "?")));
+            }
+            if (derived) |h| {
+                const bare_tp = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
+                    b.isTypeParam(h) or ir.parseClassTypeParamIdentity(h) != null;
+                if (!bare_tp and h.len != 0) recv_head = h;
+            }
+        };
+    }
+    const lam_prev_splice_recv = b.spliceRecvTy();
     if (receiver != null) {
         // Receiver lambda (`apply { minusAssign(key) }`): the innermost
         // implicit receiver inside the body is the lambda's SUBJECT, so
-        // bare calls hint its declared head (none when generic) — never
-        // the enclosing fn's receiver, which would refute candidates the
-        // subject satisfies.
-        b.setSpliceHint(true, b.receiverLambdaRecvHead(lambda_name));
+        // bare calls hint its head — never the enclosing fn's receiver,
+        // which would refute candidates the subject satisfies.
+        b.setSpliceHint(true, recv_head);
+        if (rfsEnabled()) b.setSpliceRecvTy(recv_head);
     } else if (site_hint) |sh| b.setSpliceHint(sh.active, sh.recv);
     const lam_prev_narrow = b.setThisNarrow(if (receiver != null) null else if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
     // Body-declared `var`s a nested closure WRITES must box (`var expected
@@ -881,6 +1061,7 @@ pub fn spliceInlineLambdaOn(
     for (suspended_rlp.items) |k| try b.markReceiverLambdaParam(k);
     _ = b.setThisNarrow(lam_prev_narrow);
     b.setSpliceHint(lam_prev_active, lam_prev_recv);
+    if (receiver != null and rfsEnabled()) b.setSpliceRecvTy(lam_prev_splice_recv);
     if (pushed_band) _ = b.splice_hidden_bands.pop();
     b.lambda_splice_resolve = prev_splice;
     try b.push(.{ .Move = .{ .dst = result, .src = v } });
@@ -2316,6 +2497,41 @@ pub fn tryInlineCallWithTypeArgs(
         else
             false;
         const sib_prev = if (sib_push) b.pushExpected(b.sib_expected_ty) else null;
+        // A lambda-literal argument the body only ever CALLS is consumed
+        // by the splice's call-position expansion; materializing it here
+        // builds a dead closure (plus captures) per call. Skip the value
+        // entirely — the substitution map serves the call positions, and
+        // the use scan proved no value position exists.
+        // The literal's own body referencing the PARAM'S NAME (a caller
+        // binding `block` passed into a callee whose param is also
+        // `block`) needs the binding as the shadow the window hides —
+        // observe's literal into observeDerivedStateRecalculations lost
+        // its outer `block` exactly this way.
+        const splice_consumed_lambda = a.* == .Lambda and !slot_is_default[i] and
+            p.ty.function != null and paramOnlyCalled(f, p.name.name) and
+            !pocStmts(false, a.Lambda.body.stmts, p.name.name) and
+            !std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_ARG_SKIP") orelse "1", "0") and
+            blk_only: {
+                const only = inline_state.runtime.envOnce("KLIO_ARG_SKIP_ONLY") orelse break :blk_only true;
+                var it = std.mem.splitScalar(u8, only, ',');
+                while (it.next()) |w| {
+                    if (std.mem.eql(u8, w, fname)) break :blk_only true;
+                }
+                break :blk_only false;
+            };
+        if (splice_consumed_lambda) {
+            if (inline_state.runtime.envOnce("KLIO_ARG_SKIP_TRACE") != null) {
+                std.debug.print("[arg-skip] fn={s} param={s}\n", .{ fname, p.name.name });
+            }
+            if (sib_push) b.restoreExpected(sib_prev);
+            b.pending_lambda_arity = -1;
+            b.pending_ref_lambda_param_types = null;
+            arg_regs[i] = try b.emitConst(Const.Unit);
+            try bound_param_names.append(b.allocator, p.name.name);
+            try lambda_map.put(p.name.name, a);
+            any_literal_lambda = true;
+            continue;
+        }
         const r = if (slot_is_default[i] and explicit_receiver != null) blk: {
             try b.pushScope();
             try b.bind("this", explicit_receiver.?);

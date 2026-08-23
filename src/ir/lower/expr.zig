@@ -2424,7 +2424,13 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 const decl_owner = sgetterOwner(b, name0) orelse break :blk false;
                 const rhh = typeHead(std.mem.trimEnd(u8, rh, "?"));
                 if (rhh.len == 0) break :blk false;
-                break :blk b.module.classIsOrExtends(rhh, decl_owner);
+                if (b.module.classIsOrExtends(rhh, decl_owner)) break :blk true;
+                // The declaring owner may carry a file-collision mangle
+                // (`Operations$f429`) the receiver's SOURCE-spelled head
+                // never does; compare the source names too.
+                if (!inline_call.rfsEnabled()) break :blk false;
+                break :blk std.mem.eql(u8, rhh, stripLowerFileMangle(decl_owner)) or
+                    b.module.classIsOrExtends(rhh, stripLowerFileMangle(decl_owner));
             };
             if ((!is_known_global or splice_receiver_first) and
                 (!enclosing_only_member or receiver_is_owner))
@@ -2553,6 +2559,16 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 /// its enclosing class as `ownerClass`, while a lifted inner class reaches its
 /// outer classes through `enclosing_class`; consulting both gives a scoped
 /// getter the class that actually contributes the bare property.
+/// The source-level name behind a file-collision mangle (`X$f12` -> `X`).
+fn stripLowerFileMangle(n: []const u8) []const u8 {
+    const i = std.mem.lastIndexOfScalar(u8, n, '$') orelse return n;
+    if (i + 2 >= n.len or n[i + 1] != 'f') return n;
+    for (n[i + 2 ..]) |c| {
+        if (c < '0' or c > '9') return n;
+    }
+    return n[0..i];
+}
+
 fn sgetterOwner(b: *const FuncBuilder, name: []const u8) ?[]const u8 {
     const lexical_owner = b.ownerClass() orelse return null;
     var owner: ?[]const u8 = lexical_owner;
@@ -2872,6 +2888,28 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         const field = try b.module.internConst(b.allocator, .{ .String = "$coroutineContext$explicit" });
         try b.push(.{ .GetField = .{ .dst = dst, .receiver = recv, .field = field } });
         return dst;
+    }
+
+    // `c.code` on a STATIC Char receiver is the scalar identity read â
+    // emit it as `c - NUL` (Char minus Char is Int in Kotlin, and the
+    // subtrahend is code zero), a plain BinOp instead of a dynamic field
+    // read: it stays in fused loop regions and skips the runtime
+    // extension-getter dispatch per read.
+    if (std.mem.eql(u8, name.name, "code")) {
+        const recv_head: ?[]const u8 = blk: {
+            const t = staticExprTypeRef(b, receiver) catch null;
+            var tr = t orelse break :blk null;
+            defer tr.deinit(b.allocator);
+            if (tr.nullable) break :blk null;
+            break :blk if (std.mem.eql(u8, typeHead(tr.name), "Char")) "Char" else null;
+        };
+        if (recv_head != null) {
+            const recv = try lowerReceiver(b, receiver);
+            const zero = try b.emitConst(.{ .Char = 0 });
+            const dst = b.allocReg();
+            try b.push(.{ .BinOp = .{ .dst = dst, .op = .Sub, .lhs = recv, .rhs = zero } });
+            return dst;
+        }
     }
 
     // Static-type-directed extension-property read. When the receiver's
@@ -6896,7 +6934,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (b.inlineLambdaFor(lam_name)) |lam| {
             if (!b.hasEnclosingMember(lam_name)) {
                 const recv_reg = try lowerExpr(b, callee.Member.receiver);
-                return try inline_call.spliceInlineLambdaOn(b, lam_name, lam, args, recv_reg);
+                return try inline_call.spliceInlineLambdaOn(b, lam_name, lam, args, recv_reg, callee.Member.receiver);
             }
         }
     }
@@ -6919,7 +6957,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (b.inlineLambdaFor(lam_name)) |lam| {
                 if (!b.hasEnclosingMember(lam_name)) {
                     const recv_reg = try lowerExpr(b, callee.Member.receiver);
-                    return try inline_call.spliceInlineLambdaOn(b, lam_name, lam, args, recv_reg);
+                    return try inline_call.spliceInlineLambdaOn(b, lam_name, lam, args, recv_reg, callee.Member.receiver);
                 }
             }
         }
@@ -6997,6 +7035,29 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // same-named top-level function.
         if (recv_chain == null) {
             if (b.spliceRecvTy()) |sr| recv_chain = try recvChainOf(b, sr);
+        } else if (b.lambda_splice_resolve != null and inline_call.rfsEnabled()) {
+            // A spliced receiver LAMBDA is the innermost implicit receiver,
+            // AHEAD of the enclosing (framed) receiver the narrowing chain
+            // starts from: `with(operation) { executeWithComposeStackTrace(...) }`
+            // inside a framed `OpIterator.()` block resolves the bare call
+            // against the with-subject first, exactly as kotlinc scopes it.
+            if (b.spliceRecvTy()) |sr| {
+                var sh = typeHead(std.mem.trimEnd(u8, sr, "?"));
+                // The registry keys carry file-collision mangles
+                // (`Operation$f429`); resolve the source-spelled head
+                // through the class index scoped at this reference site.
+                if (b.module.classIdIndexed(sh, b.self_package, callee.Path.segments[0].span.file)) |cid| {
+                    if (cid.int() < b.module.classes.items.len) sh = b.module.classes.items[cid.int()].name;
+                }
+                if (recv_chain.?.len == 0 or !std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, recv_chain.?[0], "?")), sh)) {
+                    const inner = try recvChainOf(b, sh);
+                    const outer = recv_chain.?;
+                    const joined = try b.allocator.alloc([]const u8, inner.len + outer.len);
+                    @memcpy(joined[0..inner.len], inner);
+                    @memcpy(joined[inner.len..], outer);
+                    recv_chain = joined;
+                }
+            }
         }
         // A captured crossinline param shadows a same-named member of the
         // anonymous object being lowered (`object : Iterable<T> { override fun
@@ -7022,7 +7083,15 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const member_of_recv = blk: {
                 const chain = recv_chain orelse break :blk false;
                 if (chain.len == 0) break :blk false;
-                const hs = b.module.registry.hierarchy_shadow_names.get(chain[0]) orelse break :blk false;
+                const hs = b.module.registry.hierarchy_shadow_names.get(chain[0]) orelse {
+                    // An image-loaded class carries no per-build shadow
+                    // entry; the function index still proves member-EXT
+                    // membership (`executeWithComposeStackTrace` inside
+                    // `with(operation) { ... }` is Operation's member
+                    // extension in the pack).
+                    if (!inline_call.rfsEnabled()) break :blk false;
+                    break :blk mextCandidateOwnedBy(b, nm, chain[0], callee.Path.segments[0].span.file) catch false;
+                };
                 if (!hs.complete) break :blk false;
                 break :blk hs.names.contains(nm);
             };
@@ -7212,12 +7281,34 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.resolve(callee.Path.segments[0].name) == null and
         isLowerAnonCapture(callee.Path.segments[0].name))
     {
-        const idx = try b.recordCapture(callee.Path.segments[0].name);
+        const nm0 = callee.Path.segments[0].name;
+        const idx = try b.recordCapture(nm0);
         const callee_r = b.allocReg();
         try b.push(.{ .LoadCapture = .{ .dst = callee_r, .idx = idx } });
         const run = try lowerArgRun(b, args);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const dst = b.allocReg();
+        // Inside a receiver splice the captured name may shadow a MEMBER
+        // of the spliced receiver (`lock()` in withLock's body vs the
+        // caller's captured `val lock`): Kotlin resolves the body's bare
+        // call to the receiver member, and the capture is usually not
+        // even callable — emit the runtime-arbitrated form.
+        if (b.spliceRecvTy() != null) {
+            if (try resolveThisForBareCallNoBind(b)) |this_reg| {
+                const nmc = try b.module.internConst(b.allocator, .{ .String = nm0 });
+                orEmitAudit(b, "cvom_anon_capture_splice", "CallValueOrMember", nm0);
+                try b.push(.{ .CallValueOrMember = .{
+                    .dst = dst,
+                    .callee = callee_r,
+                    .this_recv = this_reg,
+                    .name = nmc,
+                    .args = run[0],
+                    .n_args = run[1],
+                    .arg_names = arg_names,
+                } });
+                return dst;
+            }
+        }
         try b.push(.{ .CallValue = .{
             .dst = dst,
             .callee = callee_r,
@@ -7893,6 +7984,22 @@ fn aFuncFits(b: *FuncBuilder, nm: []const u8, want: usize) bool {
 /// itself, since `this` is the implicit receiver Kotlin resolves the
 /// call's extension on — followed by its transitive supertype names,
 /// most-derived first. Null when no receiver is in scope.
+/// Whether any bare-call candidate for `nm` visible from `file` is a
+/// member EXTENSION declared in (a supertype of) `chain_head`'s class.
+fn mextCandidateOwnedBy(b: *FuncBuilder, nm: []const u8, chain_head: []const u8, file: ir.FileId) Allocator.Error!bool {
+    const head = stripLowerFileMangle(typeHead(std.mem.trimEnd(u8, chain_head, "?")));
+    if (head.len == 0) return false;
+    const cands = try b.module.bareCallCandidates(b.allocator, nm, file);
+    defer b.allocator.free(cands);
+    for (cands) |fid| {
+        const owner_fqn = b.module.registry.member_ext_owner_class.get(fid) orelse continue;
+        const owner_simple = stripLowerFileMangle(simpleTail(owner_fqn));
+        if (std.mem.eql(u8, owner_simple, head)) return true;
+        if (b.module.classIsOrExtends(head, owner_simple)) return true;
+    }
+    return false;
+}
+
 fn narrowingRecvChain(b: *FuncBuilder) Allocator.Error!?[]const []const u8 {
     const cur = b.recvTy() orelse b.ownerClass() orelse return null;
     return try recvChainOf(b, cur);
@@ -8690,6 +8797,13 @@ fn anyReceiverFormedFnParam(f: *const ast.Function) bool {
     return false;
 }
 
+fn anyCrossOrNoinlineParam(f: *const ast.Function) bool {
+    for (f.params) |*p| {
+        if (p.is_crossinline or p.is_noinline) return true;
+    }
+    return false;
+}
+
 /// Whether `f`'s body contains a `this` reference INSIDE a nested lambda /
 /// anon-fun. Such a `this` may belong to a receiver-formed block invoked
 /// dynamically (`withCurrent { this }`), which a member-body splice would
@@ -8778,6 +8892,76 @@ fn thisScan(e: *const Expr, in_lambda: bool) bool {
     };
 }
 
+/// Whether any LAMBDA argument's body contains a bare single-segment call
+/// whose candidate set includes a member EXTENSION. Such a call needs TWO
+/// implicit receivers (the mext's dispatch owner AND its extension
+/// receiver) resolved from the runtime receiver tower — which a spliced
+/// receiver lambda does not carry yet — so the callee stays framed
+/// (`drain { with(operation) { executeWithComposeStackTrace(...) } }`).
+fn argLambdaHasMemberExtBareCall(b: *FuncBuilder, args: []const Expr) bool {
+    for (args) |*a| {
+        if (a.* != .Lambda) continue;
+        if (mextScanStmts(b, a.Lambda.body.stmts, a.Lambda.span.file)) return true;
+    }
+    return false;
+}
+
+fn mextScanStmts(b: *FuncBuilder, stmts: []const ast.Stmt, file: ir.FileId) bool {
+    for (stmts) |*st| {
+        const hit = switch (st.*) {
+            .Expr => |*e| mextScan(b, e, file),
+            .Assign => |asg| mextScan(b, &asg.target, file) or mextScan(b, &asg.value, file),
+            .DestructuringDecl => |d| mextScan(b, &d.init, file),
+            .Decl => |decl| switch (decl) {
+                .Property => |pr| if (pr.init) |*init| mextScan(b, init, file) else false,
+                else => false,
+            },
+        };
+        if (hit) return true;
+    }
+    return false;
+}
+
+fn mextScan(b: *FuncBuilder, e: *const Expr, file: ir.FileId) bool {
+    switch (e.*) {
+        .Call => |c| {
+            if (c.callee.* == .Path and c.callee.Path.segments.len == 1) {
+                const nm0 = c.callee.Path.segments[0].name;
+                if (nameHasMemberExtCandidate(b, nm0, file)) return true;
+            }
+            if (c.callee.* == .Member and mextScan(b, c.callee.Member.receiver, file)) return true;
+            for (c.args) |*a| {
+                if (mextScan(b, a, file)) return true;
+            }
+            return false;
+        },
+        .Lambda => |l| return mextScanStmts(b, l.body.stmts, file),
+        .Member => |m| return mextScan(b, m.receiver, file),
+        .Unary => |u| return mextScan(b, u.expr, file),
+        .Postfix => |po| return mextScan(b, po.expr, file),
+        .Binary => |bi| return mextScan(b, bi.lhs, file) or mextScan(b, bi.rhs, file),
+        .If => |iff| {
+            if (mextScan(b, iff.cond, file)) return true;
+            if (mextScan(b, iff.then_branch, file)) return true;
+            if (iff.else_branch) |eb| {
+                if (mextScan(b, eb, file)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+fn nameHasMemberExtCandidate(b: *FuncBuilder, nm: []const u8, file: ir.FileId) bool {
+    if (nm.len == 0 or std.ascii.isUpper(nm[0])) return false;
+    const cands = b.module.bareCallCandidates(b.allocator, nm, file) catch return true;
+    defer b.allocator.free(cands);
+    for (cands) |fid| {
+        if (b.module.registry.member_ext_owner_class.get(fid) != null) return true;
+    }
+    return false;
+}
+
 fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function, args: []const Expr) bool {
     const has_reified = anyReified(f.type_params);
     const want = args.len;
@@ -8826,15 +9010,103 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
     // receiver (`current.modification` read off the list instead of the
     // record) — those keep the dynamic route until the nested receiver
     // rebinding is fixed.
+    // Receiver-formed lambda splicing is OPT-IN (KLIO_RFS=1) until the
+    // splice carries a runtime receiver TOWER: without one, QUALIFIED
+    // member-extension calls, operators, and companion-chain reads inside
+    // the spliced body lose the subject from the runtime dispatch chain
+    // (parity: with_receiver_member_extension_visible_in_lambda,
+    // static_operator_resolution). The bare-call decline scan below is
+    // not enough — the hazard surface is every dispatch that walks
+    // enclosing receivers.
+    const rfs_on = inline_call.rfsEnabled() and
+        !argLambdaHasMemberExtBareCall(b, args);
     const member_body_ext = f.receiver_type != null and
         b.lambda_splice_resolve == null and b.spliceRecvTy() == null and
         b.recvTy() == null and b.ownerClass() != null and
-        !anyReceiverFormedFnParam(f) and !bodyLambdaBindsThis(f) and
+        (rfs_on or !anyReceiverFormedFnParam(f)) and !bodyLambdaBindsThis(f) and
         !std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_EXT_SPLICE") orelse "1", "0");
+    // Literal-lambda inline calls splice by default (kotlinc semantics);
+    // KLIO_LLP=0 restores the framed route for bisecting. A CLASS MEMBER
+    // callee is excluded: its bare member reads need the decl class's
+    // `this`, which the splice does not thread.
+    // Receiver-formed lambda params (`block: R.() -> T`) are excluded for
+    // the same reason as member_body_ext: the nested receiver rebinding
+    // is not implemented, so `with(x) { field }` would bind the block's
+    // bare reads to the wrong receiver. A lambda that `return@<callee>`s
+    // its own label is also excluded — a nested member-inline call inside
+    // it stays framed, so the label must live on a real frame to be
+    // found at unwind.
+    // `crossinline`/`noinline` params embed the lambda in a result
+    // closure rather than calling it in place; that capture wiring is
+    // not spliced correctly yet (compareBy { it.name } handed the
+    // selector the comparator's other operand), so those stay framed.
+    // Exact positional fit only: `f` is the name's inline candidate, not
+    // a resolved overload, so a call whose arity differs (the 4-arg
+    // compareValuesBy against the 1-selector inline) must stay on the
+    // dynamic path where real overload resolution runs.
+    // Positional fit under Kotlin's trailing-lambda rule: the trailing
+    // lambda binds the LAST param, leading args bind positionally, and
+    // the gap in between must be default-filled. `f` is the name's
+    // inline pick, not a type-resolved overload, so a call that does not
+    // fit (the 4-arg compareValuesBy against the 1-selector inline) must
+    // stay on the dynamic path where real overload resolution runs.
+    const llp_arity_fits = want >= 1 and want <= f.params.len and blk: {
+        for (f.params) |*p| {
+            if (p.is_vararg) break :blk false;
+        }
+        var pi: usize = 0;
+        while (pi + 1 < want) : (pi += 1) {
+            // A lambda literal must land on a function-typed param —
+            // compareValuesBy(a, b, sel, sel) arity-matches the
+            // (a, b, Comparator, selector) inline overload, but its
+            // third lambda lands on the Comparator slot.
+            const arg_is_lambda = args[pi] == .Lambda or args[pi] == .AnonFun;
+            if (arg_is_lambda and f.params[pi].ty.function == null) break :blk false;
+        }
+        var gi: usize = want - 1;
+        while (gi + 1 < f.params.len) : (gi += 1) {
+            if (f.params[gi].default == null) break :blk false;
+        }
+        // Several same-shape inline candidates (sumOf's per-numeric
+        // selectors, Grouping.fold's two-fn-param variant) tie on shape
+        // alone — stay dynamic. Receiver-ness separates plain `run`
+        // from `T.run`.
+        if (inline_state.candidatesForName(nm)) |cands| {
+            var fitting: usize = 0;
+            for (cands) |cf| {
+                if (cf.params.len != f.params.len) continue;
+                if ((cf.receiver_type == null) != (f.receiver_type == null)) continue;
+                // Only same-package candidates form a genuine overload
+                // set (kotlin.synchronized vs the compose platform
+                // namesake are separated by scope, not types).
+                if (cf != f and cf.name.span.file.int() != f.name.span.file.int()) {
+                    const cf_pkg = b.module.packageOfFile(cf.name.span.file) orelse "";
+                    const f_pkg = b.module.packageOfFile(f.name.span.file) orelse "";
+                    if (!std.mem.eql(u8, cf_pkg, f_pkg)) continue;
+                }
+                fitting += 1;
+            }
+            if (fitting > 1) break :blk false;
+        }
+        break :blk true;
+    };
+    // A same-named member or in-scope binding can win by Kotlin's scope
+    // ranking (a class property `run: CallableHolder.((Int) -> Unit) ->
+    // Unit` invoked as `run { total += it }` outranks kotlin.run) — the
+    // dynamic path resolves those; the splice must not preempt them.
+    const llp_unshadowed = !b.hasOwnMember(nm) and !b.hasEnclosingMember(nm) and
+        b.resolve(nm) == null and !b.knowsOuter(nm);
+    const lambda_literal_plain = inline_takes_fn and trailing_lambda and
+        llp_arity_fits and llp_unshadowed and
+        inline_state.inlineMemberOwner(f) == null and
+        (rfs_on or !anyReceiverFormedFnParam(f)) and
+        !anyCrossOrNoinlineParam(f) and
+        !inline_call.argLambdaTargetsLabel(args, nm) and
+        !std.mem.eql(u8, runtime.envOnce("KLIO_LLP") orelse "1", "0");
     return !recv_mismatch and
         (f.is_suspend or argLambdaHasNonlocalReturn(args) or
             inline_call.argsForwardInlineLambda(b, args) or has_reified or shadowed_by_member or
-            companion_super_member or member_body_ext or
+            companion_super_member or member_body_ext or lambda_literal_plain or
             inline_call.argLambdaMaySuspend(b, f, args));
 }
 
@@ -9705,6 +9977,15 @@ fn lowerValueInvocation(
                 if (ctorInitNonInvocable(b, init_e, args.len)) return null;
                 if (callInitNonInvocable(b, init_e, args.len)) return null;
                 if (try initTypeNonInvocable(b, init_e, args.len)) return null;
+            } else if (b.knowsOuter(name0) and b.spliceRecvTy() != null and
+                anyReceiverClassDeclares(b, name0))
+            {
+                // A CAPTURE-reached local has no recorded initializer to
+                // disprove invocability, but the spliced receiver's class
+                // declares the name: the same `lock()`-in-withLock rule
+                // applies (the body's bare call is the receiver's member),
+                // so defer to the arbitrated/member path.
+                return null;
             }
         }
         // Nor does a function-typed param shadow one for a TRAILING-LAMBDA
