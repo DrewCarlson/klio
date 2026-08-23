@@ -5684,6 +5684,39 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const ast_arg_names = call.arg_names;
     const ast_type_args = call.type_args;
     const is_infix = call.is_infix;
+    // Scalar bitwise infix: `a and b` / `shl` / `shr` / `ushr` / `or` /
+    // `xor` over statically-typed Int/Long (Bool for the logical trio)
+    // are Int members with intrinsic semantics; lowering them as member
+    // calls sent every bit of hot trie arithmetic through the virtual
+    // dispatch ladder with a full frame per op. Emit the BinOp the
+    // evaluator already serves. Members always outrank extensions on
+    // these final receivers, so the reduction can never shadow user code.
+    if (is_infix and args.len == 2 and callee.* == .Path and
+        callee.Path.segments.len == 1 and ast_type_args.len == 0)
+    {
+        if (scalarBitBinOp(callee.Path.segments[0].name)) |op| blk: {
+            var lt = (try staticExprTypeRef(b, &args[0])) orelse break :blk;
+            defer lt.deinit(b.allocator);
+            var rt = (try staticExprTypeRef(b, &args[1])) orelse break :blk;
+            defer rt.deinit(b.allocator);
+            if (lt.nullable or rt.nullable) break :blk;
+            const shift = op == .Shl or op == .Shr or op == .UShr;
+            const ok_types = if (shift)
+                ((std.mem.eql(u8, lt.name, "Int") or std.mem.eql(u8, lt.name, "Long")) and
+                    std.mem.eql(u8, rt.name, "Int"))
+            else
+                ((std.mem.eql(u8, lt.name, "Int") and std.mem.eql(u8, rt.name, "Int")) or
+                    (std.mem.eql(u8, lt.name, "Long") and std.mem.eql(u8, rt.name, "Long")) or
+                    (op != .Xor and std.mem.eql(u8, lt.name, "Bool") and std.mem.eql(u8, rt.name, "Bool")) or
+                    (op == .Xor and std.mem.eql(u8, lt.name, "Bool") and std.mem.eql(u8, rt.name, "Bool")));
+            if (!ok_types) break :blk;
+            const lr = try lowerExpr(b, &args[0]);
+            const rr = try lowerExpr(b, &args[1]);
+            const dst = b.allocReg();
+            try b.push(.{ .BinOp = .{ .dst = dst, .op = op, .lhs = lr, .rhs = rr } });
+            return dst;
+        }
+    }
     // Record each lambda argument's expected value-parameter arity by span,
     // taken from the resolved callee's parameter types, BEFORE the args are
     // lowered. `lowerLambda` reads it authoritatively, so a receiver lambda
@@ -22436,3 +22469,13 @@ fn receiverStaticMemberApplies(b: *FuncBuilder, receiver: *const Expr, name: []c
     return res.applicable;
 }
 
+/// The scalar bitwise/logical infix members with intrinsic BinOp forms.
+fn scalarBitBinOp(name: []const u8) ?ir.BinOp {
+    if (std.mem.eql(u8, name, "and")) return .And;
+    if (std.mem.eql(u8, name, "or")) return .Or;
+    if (std.mem.eql(u8, name, "xor")) return .Xor;
+    if (std.mem.eql(u8, name, "shl")) return .Shl;
+    if (std.mem.eql(u8, name, "shr")) return .Shr;
+    if (std.mem.eql(u8, name, "ushr")) return .UShr;
+    return null;
+}
