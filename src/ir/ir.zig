@@ -1225,6 +1225,14 @@ pub const Func = struct {
     acc_route: u64 = 0,
     /// Cached `leafExprBody` verdict: 0 = unasked, 1 = no, 2 = yes.
     leaf_state: u8 = 0,
+    /// Trivial property-initializer memo (benign-race fill): 0 = unasked,
+    /// 1 = not trivial, 2 = the body returns one constant
+    /// (`triv_init_val` = ConstId), 3 = it echoes one parameter
+    /// (`triv_init_val` = param index). Construction serves 2/3 without a
+    /// framed eval — a builder-heavy write path otherwise pays one full
+    /// eval per `= 0`-style field.
+    triv_init_state: u8 = 0,
+    triv_init_val: u32 = 0,
     /// Cached `frameNoFill` verdict: 0 = unasked, 1 = must fill,
     /// 2 = register file may start unfilled.
     frame_fill_state: u8 = 0,

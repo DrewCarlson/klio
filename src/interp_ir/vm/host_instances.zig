@@ -447,6 +447,57 @@ fn classDelegateThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) []cons
     return g.get().class_delegates.get(sideTableKey(fqn, name)) orelse &.{};
 }
 
+/// Serve a trivial property initializer (one constant, or one parameter
+/// echo) without a framed eval; null = not trivial, run the body.
+/// `all` is the initializer call vector `[this, ctor args...]`.
+fn trivialInitServe(allocator: Allocator, m: *const ir.Module, func: *const ir.Func, all: []const Value) Allocator.Error!?Value {
+    if (func.triv_init_state == 0) {
+        const mut = @constCast(func);
+        mut.triv_init_state = 1;
+        if (func.blocks.len == 1) one: {
+            const blk = &func.blocks[0];
+            if (blk.catches.len != 0 or blk.finally != null) break :one;
+            if (blk.terminator != .Return) break :one;
+            const ret_reg = blk.terminator.Return orelse break :one;
+            var state: u8 = 0;
+            var val: u32 = 0;
+            var dst: ir.Reg = undefined;
+            for (blk.insts) |*inst| switch (inst.*) {
+                .Trace => {},
+                .Const => |c| {
+                    if (state != 0) break :one;
+                    state = 2;
+                    val = c.value.int();
+                    dst = c.dst;
+                },
+                .LoadParam => |lp| {
+                    if (state != 0) break :one;
+                    state = 3;
+                    val = lp.idx;
+                    dst = lp.dst;
+                },
+                else => break :one,
+            };
+            if (state == 0 or ret_reg.int() != dst.int()) break :one;
+            mut.triv_init_val = val;
+            mut.triv_init_state = state;
+        }
+    }
+    switch (func.triv_init_state) {
+        2 => {
+            if (func.triv_init_val >= m.consts.items.len) return null;
+            return try ir.eval.constToValue(allocator, &m.consts.items[func.triv_init_val]);
+        },
+        3 => {
+            if (func.triv_init_val >= all.len) return null;
+            const v = all[func.triv_init_val];
+            v.retain();
+            return v;
+        },
+        else => return null,
+    }
+}
+
 fn bodyPropInit(self: *VmHost, class_fqn: ?[]const u8, class_name: []const u8, prop_name: []const u8) ?FuncId {
     const g = self.prog.borrow();
     defer g.deinit();
@@ -3521,9 +3572,14 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                             defer all.deinit(allocator);
                             try all.append(allocator, inst_value);
                             try all.appendSlice(allocator, cls_args);
-                            var v = switch (try evalThunk(self, func, all.items)) {
-                                .ok => |rv| rv,
-                                .err => |e| return .{ .err = e },
+                            var v = blk_v: {
+                                const mg3 = self.module.borrow();
+                                defer mg3.deinit();
+                                if (try trivialInitServe(allocator, mg3.get(), func, all.items)) |sv| break :blk_v sv;
+                                break :blk_v switch (try evalThunk(self, func, all.items)) {
+                                    .ok => |rv| rv,
+                                    .err => |e| return .{ .err = e },
+                                };
                             };
                             v = try maybeProvideDelegate(self, allocator, cls_name, prop_name, &inst_value, v);
                             const g = inst.borrowMut();
@@ -4923,6 +4979,31 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             try all.append(allocator, inst_value);
             try all.appendSlice(allocator, cls_args);
             const module_ref = self.module.clone();
+            served: {
+                const mg2 = module_ref.borrow();
+                const v = trivialInitServe(allocator, mg2.get(), func, all.items) catch |e| {
+                    mg2.deinit();
+                    module_ref.deinit();
+                    return e;
+                } orelse {
+                    mg2.deinit();
+                    break :served;
+                };
+                mg2.deinit();
+                module_ref.deinit();
+                all.deinit(allocator);
+                const already = blk: {
+                    const ig = inst.borrow();
+                    defer ig.deinit();
+                    break :blk ig.get().get(p.name) != null;
+                };
+                if (!already) {
+                    const ig = inst.borrowMut();
+                    defer ig.deinit();
+                    try ig.get().define(allocator, p.name, v);
+                } else if (runtime.reclaimEnabled()) v.release(allocator);
+                continue;
+            }
             vmhost.emitPath(allocator, "object_build", func.fqn, fid, &inst_value, cls_args);
             const r = try ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), func, all, self);
             module_ref.deinit();
