@@ -1233,6 +1233,9 @@ pub const Func = struct {
     /// eval per `= 0`-style field.
     triv_init_state: u8 = 0,
     triv_init_val: u32 = 0,
+    /// Host-served static routing memo (snapshot_fast): 0 = unasked,
+    /// then a `snapshot_fast.Route` value.
+    host_route: u8 = 0,
     /// Cached `frameNoFill` verdict: 0 = unasked, 1 = must fill,
     /// 2 = register file may start unfilled.
     frame_fill_state: u8 = 0,

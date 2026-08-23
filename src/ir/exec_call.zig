@@ -123,6 +123,31 @@ fn isBoundRefInstance(v: *const Value) bool {
 /// transpiler's call op serves recursively instead so the native caller
 /// stays put, until `NATIVE_RECURSE_MAX_DEPTH`, where it reverts to the
 /// flat park to bound the C stack.
+const snapshot_fast = @import("snapshot_fast.zig");
+
+/// Host-served static fns (the snapshot validity walk): classify once
+/// per Func, serve without any call machinery on a hit.
+inline fn hostStaticServe(allocator: Allocator, frame: *Frame, call: anytype) Allocator.Error!?Value {
+    _ = allocator;
+    const cf = frame.module.funcById(call.func) orelse return null;
+    if (cf.host_route == 0) {
+        const route: snapshot_fast.Route = blk: {
+            if (cf.params.len != 3) break :blk .none;
+            break :blk snapshot_fast.classify(cf.fqn, cf.params.len, cf.params[cf.params.len - 1].ty.name);
+        };
+        @constCast(cf).host_route = @intFromEnum(route);
+    }
+    if (cf.host_route <= @intFromEnum(snapshot_fast.Route.none)) return null;
+    if (call.n_args != 3 or call.type_args.len != 0 or !argNamesAllNull(call.arg_names)) return null;
+    var args: [3]Value = undefined;
+    for (0..3) |i| args[i] = frame.read(ir.Reg.from(call.args.int() + @as(u32, @intCast(i))));
+    return switch (@as(snapshot_fast.Route, @enumFromInt(cf.host_route))) {
+        .readable => snapshot_fast.serveReadable(args[0..]),
+        .valid => snapshot_fast.serveValid(args[0..]),
+        else => null,
+    };
+}
+
 pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H, allow_flat: bool) Allocator.Error!Step {
     if (cmgTraceWant()) |w| {
         if (frame.module.funcById(call.func)) |cf| if (std.mem.eql(u8, w, cf.name)) {
@@ -130,6 +155,10 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
         };
     }
     dispatchBump(.call_static);
+    if (try hostStaticServe(allocator, frame, call)) |served| {
+        try frame.write(call.dst, served);
+        return .cont;
+    }
     // Monomorphic fast path: a plain top-level user function (single
     // overload, has body, non-extension, no varargs / defaults / type
     // params / native binding) called positionally at exact arity needs
