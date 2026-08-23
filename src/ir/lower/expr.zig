@@ -8764,7 +8764,16 @@ fn thisScan(e: *const Expr, in_lambda: bool) bool {
             }
             break :blk false;
         },
-        .Try => true,
+        .Try => |t| blk: {
+            if (thisScanStmts(t.body.stmts, in_lambda)) break :blk true;
+            for (t.catches) |*c| {
+                if (thisScanStmts(c.body.stmts, in_lambda)) break :blk true;
+            }
+            if (t.finally) |fin| {
+                if (thisScanStmts(fin.stmts, in_lambda)) break :blk true;
+            }
+            break :blk false;
+        },
         else => false,
     };
 }
