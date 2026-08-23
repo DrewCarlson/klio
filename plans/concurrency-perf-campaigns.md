@@ -55,11 +55,48 @@ Work items:
 - [x] Lever 1 LANDED (5f6b22be): TTAS spin locks (SpinMutex spun on a
       bus-locked swap; lockExclusive retried cmpxchg blind). Contended
       repro 904 -> 630ms/round; swap leaf 31.6% -> 7.4%.
-- [ ] Levers next (measure each on the putrep3 repro, then the solo
-      class): Backoff yield-storm (libc 33% = sched_yield after 16
-      spins), the hot fetchAdd RMW (suspect: refcount ping-pong on the
-      shared map cell), per-block-edge atomic polls (shouldAbandon
-      acquire-load + gc_pending every block entry).
+- [x] Lever 2 LANDED (c8dda94e): host equality for the vendored
+      PersistentHashMap — CHAMP-trie walk with node-identity pruning,
+      collision nodes unordered, non-scalar elements bail to dispatch.
+      Contended-replace repro 630 -> 78ms; put_replace PASSES solo
+      (SnapshotStateMapTests 56 -> 57/59). Guard example
+      snapshot_map_equality.kt pins the semantics (reorder, collision
+      keys, custom equals, wide tries).
+- [x] Lever 3 LANDED (47d9c817): same for the persistent vectors
+      (SmallPersistentVector/PersistentVector) — array-identity pruned,
+      tail padding respected, disjoint size ranges make cross-class
+      false. Contended list-replace 40ms/round; every list
+      assertEquals in the suite takes the pruned path. Guard example
+      snapshot_list_equality.kt.
+- [x] Levers probed and REJECTED with measurements: backoff sleep
+      ladder after yield window (667ms vs 630ms on putrep3 — reverted;
+      the libc time is malloc/memcpy, not sched_yield — ~500 voluntary
+      switches/s/thread only); module-cell lock is already Noop
+      (objref_immutable); memberNameIdentity already pointer-cached;
+      field read/write memos already exist.
+- 2026-08-23 IDLE-BOX RE-BASELINE after the three levers: gate 725s /
+  1376 passed / 14 failed, 0 DNC. put_replace passes SOLO but
+  re-crosses the 10s runTest cap under the gate's own 8-way
+  contention (3-8x class inflation). The whole remaining family is
+  contention-amplified throughput; no correctness component left.
+- [ ] REMAINING = interpreted CALL throughput, ~1.5-2x needed. The
+      mixing repro (mixrep.kt: 100 maps x 100 indexed puts +
+      notifyObjectsInitialized) runs 3.06s/rep on the harness; the
+      failing tests do 10 reps against a 30s upstream budget. Per put
+      ~300us =~ 100 interpreted calls x ~3us frame/dispatch cost.
+      Profile is DIFFUSE: getAdapted string-map gets ~4% across many
+      tables, eqlBytes 4% (eql__anon_3017 dominant), acquireRegs
+      memset 2.5% (frames failing frameDefBeforeUse's <=64-local
+      def-before-use test still eagerly fill), allocSmall/
+      allocLockedOne ~3%, libc malloc/memcpy ~8%. No single 2x lever;
+      this is the dispatch/activation-machinery campaign shape (frame
+      open/close, arg settle, member-dispatch ladder).
+- [ ] Solo-failing set with timings (all deterministic, vs their
+      budgets): List addAll trio 31/31/42s, Set mixing add 31s, Map
+      mixing set/clear 31/47s (30s upstream runTest timeouts);
+      validatePotentialDeadlock 90s wall cap; Pausable pair
+      resumeOnBackgroundThread ~28s yield-cost + markInvalid needs
+      >10s (env-cap bound, pass at 90s).
 - [ ] Each interpreter root ships an example + pinned output.
 - [ ] Exit: the concurrency classes pass 10/10 consecutive SOLO gate runs;
       `MAX_FAILED` lowered to the new honest ceiling (target 0, and the
