@@ -603,14 +603,12 @@ fn pocUses(comptime exempt_call_head: bool, e: *const Expr, name: []const u8) bo
             }
             break :blk (if (t.finally) |fb| pocStmts(exempt_call_head, fb.stmts, name) else false);
         },
-        .Lambda => |lam| blk: {
-            // A nested lambda param of the same name shadows — treat as a
-            // use rather than model shadowing.
-            for (lam.params) |lp| {
-                if (std.mem.eql(u8, lp.name, name)) break :blk true;
-            }
-            break :blk pocStmts(false, lam.body.stmts, name);
-        },
+        // A nested lambda in the callee body may itself splice, materialize,
+        // or defer — the param's reachability through that layer is not
+        // decidable here, so any nested literal keeps the materialization
+        // (observe's `observeDerivedStateRecalculations(...) { ...block... }`
+        // lost the binding through exactly this interplay).
+        .Lambda => true,
         .When => |w| blk: {
             if (w.subject) |sub| {
                 if (pocUses(exempt_call_head, sub, name)) break :blk true;
@@ -2467,9 +2465,27 @@ pub fn tryInlineCallWithTypeArgs(
         // builds a dead closure (plus captures) per call. Skip the value
         // entirely — the substitution map serves the call positions, and
         // the use scan proved no value position exists.
+        // The literal's own body referencing the PARAM'S NAME (a caller
+        // binding `block` passed into a callee whose param is also
+        // `block`) needs the binding as the shadow the window hides —
+        // observe's literal into observeDerivedStateRecalculations lost
+        // its outer `block` exactly this way.
         const splice_consumed_lambda = a.* == .Lambda and !slot_is_default[i] and
-            p.ty.function != null and paramOnlyCalled(f, p.name.name);
+            p.ty.function != null and paramOnlyCalled(f, p.name.name) and
+            !pocStmts(false, a.Lambda.body.stmts, p.name.name) and
+            !std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_ARG_SKIP") orelse "1", "0") and
+            blk_only: {
+                const only = inline_state.runtime.envOnce("KLIO_ARG_SKIP_ONLY") orelse break :blk_only true;
+                var it = std.mem.splitScalar(u8, only, ',');
+                while (it.next()) |w| {
+                    if (std.mem.eql(u8, w, fname)) break :blk_only true;
+                }
+                break :blk_only false;
+            };
         if (splice_consumed_lambda) {
+            if (inline_state.runtime.envOnce("KLIO_ARG_SKIP_TRACE") != null) {
+                std.debug.print("[arg-skip] fn={s} param={s}\n", .{ fname, p.name.name });
+            }
             if (sib_push) b.restoreExpected(sib_prev);
             b.pending_lambda_arity = -1;
             b.pending_ref_lambda_param_types = null;
