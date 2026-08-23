@@ -8859,16 +8859,49 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
     // a resolved overload, so a call whose arity differs (the 4-arg
     // compareValuesBy against the 1-selector inline) must stay on the
     // dynamic path where real overload resolution runs.
-    const llp_arity_fits = want == f.params.len and blk: {
-        for (f.params, 0..) |*p, pi| {
-            if (p.is_vararg or p.default != null) break :blk false;
+    // Positional fit under Kotlin's trailing-lambda rule: the trailing
+    // lambda binds the LAST param, leading args bind positionally, and
+    // the gap in between must be default-filled. `f` is the name's
+    // inline pick, not a type-resolved overload, so a call that does not
+    // fit (the 4-arg compareValuesBy against the 1-selector inline) must
+    // stay on the dynamic path where real overload resolution runs.
+    const llp_arity_fits = want >= 1 and want <= f.params.len and blk: {
+        for (f.params) |*p| {
+            if (p.is_vararg) break :blk false;
+        }
+        var pi: usize = 0;
+        while (pi + 1 < want) : (pi += 1) {
             // A lambda literal must land on a function-typed param —
-            // the 4-arg compareValuesBy(a, b, sel, sel) arity-matches
-            // the (a, b, Comparator, selector) inline overload, but its
+            // compareValuesBy(a, b, sel, sel) arity-matches the
+            // (a, b, Comparator, selector) inline overload, but its
             // third lambda lands on the Comparator slot.
-            const arg_is_lambda = pi < args.len and
-                (args[pi] == .Lambda or args[pi] == .AnonFun);
-            if (arg_is_lambda and p.ty.function == null) break :blk false;
+            const arg_is_lambda = args[pi] == .Lambda or args[pi] == .AnonFun;
+            if (arg_is_lambda and f.params[pi].ty.function == null) break :blk false;
+        }
+        var gi: usize = want - 1;
+        while (gi + 1 < f.params.len) : (gi += 1) {
+            if (f.params[gi].default == null) break :blk false;
+        }
+        // Several same-shape inline candidates (sumOf's per-numeric
+        // selectors, Grouping.fold's two-fn-param variant) tie on shape
+        // alone — stay dynamic. Receiver-ness separates plain `run`
+        // from `T.run`.
+        if (inline_state.candidatesForName(nm)) |cands| {
+            var fitting: usize = 0;
+            for (cands) |cf| {
+                if (cf.params.len != f.params.len) continue;
+                if ((cf.receiver_type == null) != (f.receiver_type == null)) continue;
+                // Only same-package candidates form a genuine overload
+                // set (kotlin.synchronized vs the compose platform
+                // namesake are separated by scope, not types).
+                if (cf != f and cf.name.span.file.int() != f.name.span.file.int()) {
+                    const cf_pkg = b.module.packageOfFile(cf.name.span.file) orelse "";
+                    const f_pkg = b.module.packageOfFile(f.name.span.file) orelse "";
+                    if (!std.mem.eql(u8, cf_pkg, f_pkg)) continue;
+                }
+                fitting += 1;
+            }
+            if (fitting > 1) break :blk false;
         }
         break :blk true;
     };
