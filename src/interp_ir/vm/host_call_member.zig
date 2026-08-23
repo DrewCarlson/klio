@@ -8631,25 +8631,11 @@ pub fn invokeVirtualMember(
         @memcpy(argbuf[1..], args);
         return dispatchIntrinsic(self, allocator, member_fqn, native, argbuf);
     }
-    // A `by`-delegated interface member the class does not override belongs
-    // to the delegate. The slot resolves against the class hierarchy, which
-    // for a defaulted interface member lands on the interface's own body —
-    // Kotlin routes it to the delegate instead.
-    if (receiver.* == .Instance) {
-        if (virtualSlotInterfaceMember(self, slot)) |name| {
-            if (interfaceDelegateFor(self, allocator, receiver.Instance, name)) |d| {
-                const r = try callMemberNamed(self, allocator, &d, name, args, arg_names_in);
-                switch (r) {
-                    .ok => return r,
-                    .err => |e| if (e != .Unimplemented) return r else freeDispatchMiss(allocator, r),
-                }
-            }
-        }
-    }
-    // Named arguments folded into `arg_params` at lowering must survive a
-    // BY-NAME fallback (an unlinked slot, a bodyless target): derive the
-    // names back from the slot root's declared params, or a delegated
-    // `emit(tag = ..., scale = ...)` re-binds its arguments positionally.
+    // Named arguments folded into `arg_params` at lowering must survive
+    // every re-dispatching arm below (the interface-delegate forward, an
+    // unlinked slot, a bodyless target): derive the names back from the
+    // slot root's declared params, or a delegated `emit(tag = ..., scale =
+    // ...)` re-binds its arguments positionally.
     var derived_names: []?[]const u8 = &.{};
     defer if (derived_names.len != 0 and runtime.freeScratch()) allocator.free(derived_names);
     const arg_names: []const ?[]const u8 = blk: {
@@ -8665,6 +8651,21 @@ pub fn invokeVirtualMember(
         }
         break :blk derived_names;
     };
+    // A `by`-delegated interface member the class does not override belongs
+    // to the delegate. The slot resolves against the class hierarchy, which
+    // for a defaulted interface member lands on the interface's own body —
+    // Kotlin routes it to the delegate instead.
+    if (receiver.* == .Instance) {
+        if (virtualSlotInterfaceMember(self, slot)) |name| {
+            if (interfaceDelegateFor(self, allocator, receiver.Instance, name)) |d| {
+                const r = try callMemberNamed(self, allocator, &d, name, args, arg_names);
+                switch (r) {
+                    .ok => return r,
+                    .err => |e| if (e != .Unimplemented) return r else freeDispatchMiss(allocator, r),
+                }
+            }
+        }
+    }
     if (receiver.* != .Instance) {
         if (isCallable(receiver)) {
             const root = FuncId.from(slot.int());
