@@ -381,11 +381,36 @@ family 9 -> 4:
   the KEPT pass resolves captures differently (resolve() non-null via
   hoist) — arbitration arms must cover capture-reached names, and
   single-pass lowering traces can mislead.
-- Queued next: spliced-body LAMBDA splicing (the lambda literal still
-  frames inside a spliced callee — 12 frames/pair, kotlinc splices
-  both), SnapshotThreadLocal.get/Snapshot.current host serve (4.3
-  frames/put), Map _clear whole-op decision, wall-cap teardown quiesce,
-  window-family corpus rc=None flakes.
+- Dead-closure elimination LANDED (06d2a3aa + f8fb6e20): a lambda
+  literal the spliced callee only CALLS no longer materializes (the
+  splice's call-position expansion consumes it; the per-call closure
+  alloc + captures vanish). The `paramOnlyCalled` scan's final rule
+  set, each clause bought by a real regression: call-head exemption at
+  the body's TOP LEVEL only (tryAdd called inside loopOnState's nested
+  lambda); MEMBER-name occurrences count (`expected.getter()` invokes
+  the receiver-lambda param through the member route); any nested
+  lambda literal in the body counts (undecidable through another
+  splice layer); the ARG lambda referencing the PARAM'S OWN NAME
+  declines (observe's literal into observeDerivedStateRecalculations —
+  both named `block` — needed the binding as the shadow the window
+  hides). KLIO_ARG_SKIP=0 bisects, KLIO_ARG_SKIP_ONLY=<names> narrows,
+  KLIO_ARG_SKIP_TRACE lists fired skips. Measured: synchronized 2640
+  -> 490ns/block cumulative, map group 1649 -> 1606ms.
+  GATE RECORD: 1385 passed / 5 failed at 502s; RecomposerTests
+  pausing/testInsert left the fail set. Ratchet RAISED 1377 -> 1381.
+  Remaining fail set (4 unique): Movable flake,
+  Pausable.resumeOnBackgroundThread, validatePotentialDeadlock,
+  Map _clear.
+- Solo standing: List 65/65, Set 21/21, Observer 30/30, Recomposer
+  11/12 (validatePotentialDeadlock only), Pausable 24/25, Map 58/59
+  (_clear 36.9s vs 30). compose_window example: correct output but
+  394s wall solo (the corpus rc=None entries are real perf, not
+  flakes).
+- Queued next: Pausable.resumeOnBackgroundThread failure detail,
+  Map _clear re-solo + whole-op decision, validatePotentialDeadlock
+  (drain-vs-worker ratio; throughput gains may flip it),
+  compose_window profile, SnapshotThreadLocal.get serve re-eval,
+  wall-cap teardown quiesce, window-family corpus timeouts.
 
 ## Call-throughput round 3 (2026-08-24)
 
