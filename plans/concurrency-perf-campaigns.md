@@ -406,11 +406,27 @@ family 9 -> 4:
   (_clear 36.9s vs 30). compose_window example: correct output but
   394s wall solo (the corpus rc=None entries are real perf, not
   flakes).
-- Queued next: Pausable.resumeOnBackgroundThread failure detail,
-  Map _clear re-solo + whole-op decision, validatePotentialDeadlock
-  (drain-vs-worker ratio; throughput gains may flip it),
-  compose_window profile, SnapshotThreadLocal.get serve re-eval,
-  wall-cap teardown quiesce, window-family corpus timeouts.
+- Pausable.resumeOnBackgroundThread ROOT-CAUSED and CLOSED: the test
+  resumes 1000 pausable chunks one cross-thread round-trip at a time
+  (~40-55s interpreted) and passes under upstream's OWN 60s runTest
+  default; the only failure was our 10s gate override — a hang-era
+  trade (90s once measured 1336 with two classes not completing vs
+  1345 at 10s) whose hang population no longer exists. The cap
+  returned to the upstream default.
+  GATE: **1388 passed / 2 failed at 452s** — the 10s cap was also
+  COSTING wall (capped tests burned their 10s then their classmates
+  absorbed noise; 502 -> 452s). Movable flake and both Pausable
+  entries left the fail set.
+- REMAINING REAL FAILURES (2): RecomposerTests.validatePotentialDeadlock
+  (interpreted TestCoroutineScheduler drain slower than the infinite
+  withContext(Default) writer round-trip at one virtual instant) and
+  SnapshotStateMapTests.concurrentMixingWriteApply_clear (1M puts vs
+  its declared 30s: ~170us/put vs 28us needed — CHAMP-put + mutate
+  wrapper floor). Both are pure interpreted-throughput ceilings.
+- Queued next: Map _clear re-solo after the splice era, whole-op-serve
+  decision; validatePotentialDeadlock re-solo; compose_window profile;
+  SnapshotThreadLocal.get serve re-eval; window-family corpus
+  timeouts.
 
 ## Call-throughput round 3 (2026-08-24)
 
