@@ -171,6 +171,7 @@ Run any program with:
 | `nested_class_reference.kt` | A private nested class reached from inside a lambda in its declaring class: construction, `Type::member` references, and use as a declared type all bind the same declaration. |
 | `inline_extension_receiver_scope.kt` | An `inline` extension's spliced body resolves bare names against ITS receiver — a same-named extension of that receiver wins over a global, and its members stay reachable. |
 | `compound_assign_nested_container.kt` | `xs += y` on a `MutableList<List<T>>` appends one element, not `y`'s items; a list OF the element type still flattens, and the flat-list split is unchanged. |
+| `char_range_loops.kt` | Char ranges iterate as counted register loops — literal `'a'..'z'`, `downTo`, `until`, an empty range, and a hoisted `CharRange` val — with a stepped char progression agreeing through the iterator protocol, including the `'\uFFFF'` boundary. |
 | `comparable_natural_order.kt` | A user `Comparable` participates in every natural-order path: operators, list and sequence sorts, key selectors, `min`/`max`, `coerceIn`, `compareValues` and ranges. |
 | `time_zone_id_forms.kt` | Every written form of a fixed offset (`+4`, `+04:00`, `UTC+4`, `GMT+04:00:00`) resolves to one offset while keeping distinct zone ids; parsing the same offset twice yields the same instance; malformed ids are rejected. |
 | `dst_local_time_mapping.kt` | A repeated local hour maps to its first pass and a missing one to the pre-gap offset, while each instant still has exactly one local time. |
