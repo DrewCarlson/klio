@@ -7212,12 +7212,34 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.resolve(callee.Path.segments[0].name) == null and
         isLowerAnonCapture(callee.Path.segments[0].name))
     {
-        const idx = try b.recordCapture(callee.Path.segments[0].name);
+        const nm0 = callee.Path.segments[0].name;
+        const idx = try b.recordCapture(nm0);
         const callee_r = b.allocReg();
         try b.push(.{ .LoadCapture = .{ .dst = callee_r, .idx = idx } });
         const run = try lowerArgRun(b, args);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const dst = b.allocReg();
+        // Inside a receiver splice the captured name may shadow a MEMBER
+        // of the spliced receiver (`lock()` in withLock's body vs the
+        // caller's captured `val lock`): Kotlin resolves the body's bare
+        // call to the receiver member, and the capture is usually not
+        // even callable — emit the runtime-arbitrated form.
+        if (b.spliceRecvTy() != null) {
+            if (try resolveThisForBareCallNoBind(b)) |this_reg| {
+                const nmc = try b.module.internConst(b.allocator, .{ .String = nm0 });
+                orEmitAudit(b, "cvom_anon_capture_splice", "CallValueOrMember", nm0);
+                try b.push(.{ .CallValueOrMember = .{
+                    .dst = dst,
+                    .callee = callee_r,
+                    .this_recv = this_reg,
+                    .name = nmc,
+                    .args = run[0],
+                    .n_args = run[1],
+                    .arg_names = arg_names,
+                } });
+                return dst;
+            }
+        }
         try b.push(.{ .CallValue = .{
             .dst = dst,
             .callee = callee_r,
@@ -8903,8 +8925,14 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
         }
         break :blk true;
     };
+    // A same-named member or in-scope binding can win by Kotlin's scope
+    // ranking (a class property `run: CallableHolder.((Int) -> Unit) ->
+    // Unit` invoked as `run { total += it }` outranks kotlin.run) — the
+    // dynamic path resolves those; the splice must not preempt them.
+    const llp_unshadowed = !b.hasOwnMember(nm) and !b.hasEnclosingMember(nm) and
+        b.resolve(nm) == null and !b.knowsOuter(nm);
     const lambda_literal_plain = inline_takes_fn and trailing_lambda and
-        llp_arity_fits and
+        llp_arity_fits and llp_unshadowed and
         inline_state.inlineMemberOwner(f) == null and
         !anyReceiverFormedFnParam(f) and
         !anyCrossOrNoinlineParam(f) and
@@ -9784,6 +9812,15 @@ fn lowerValueInvocation(
                 if (ctorInitNonInvocable(b, init_e, args.len)) return null;
                 if (callInitNonInvocable(b, init_e, args.len)) return null;
                 if (try initTypeNonInvocable(b, init_e, args.len)) return null;
+            } else if (b.knowsOuter(name0) and b.spliceRecvTy() != null and
+                anyReceiverClassDeclares(b, name0))
+            {
+                // A CAPTURE-reached local has no recorded initializer to
+                // disprove invocability, but the spliced receiver's class
+                // declares the name: the same `lock()`-in-withLock rule
+                // applies (the body's bare call is the receiver's member),
+                // so defer to the arbitrated/member path.
+                return null;
             }
         }
         // Nor does a function-typed param shadow one for a TRAILING-LAMBDA
