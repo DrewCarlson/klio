@@ -129,18 +129,17 @@ Work items:
       until whole scalar loops stay in C (then the C compiler vectorizes).
       Value layout is settled at 24B (task 3), so the KV offsets are
       stable to build against.
-- [ ] Implement the REMAINING speedup work, now precisely characterized
-      (2026-08-22 diagnosis on rangebench, native 830ms vs interp 291ms):
-      (a) startup floor is 62ms (empty program) — fine; (b) the char-range
-      loop ESCAPES to the interpreter per iteration (52k `[native-miss]
-      hasNext/nextChar` — the step-progression protocol fns are stdlib-side
-      and not in the emitted set): either emit the counted char loop as C
-      like the int loops, or include reachable stdlib leaf fns in the
-      emitted set; (c) the int loops ARE inline C but run TAG-CHECKED per
-      op while the interpreter's BC tier runs FUSED counted loops over
-      untyped registers — the emitter needs the same counted-loop lowering
-      (typed C for-loops, tags spilled only at exits). (c) is the big one:
-      it is what lets the C compiler see a plain int64 loop and vectorize.
+- [x] Remaining speedup work, all landed (2026-08-23): (a) startup floor
+      62ms — fine; (b) char-range escape ROOT-FIXED IN THE LOWERING
+      (4d00da2f): char ranges now lower as counted register loops like
+      int/long (Char comparisons order by code, Char±Int is Char), so
+      the iterator protocol vanishes for BOTH tiers — interpreter 291 ->
+      164ms, native escapes 52k -> 132; stepped char keeps the iterator
+      lowering (step-snap arithmetic is Int-only); (c) fused counted-loop
+      emission extended to descending loops (28c73118): the latch
+      validator admitted only Add so downTo/step (Sub latch) was
+      silently rejected — Sub admitted, every recognizer bail now
+      fuseTraces, rangebench 535 -> 303ms with both int loops fused.
 - [x] ENGAGEMENT ROOT FOUND AND FIXED (2026-08-23): the hot view never
       engaged — the klio_rt layout probes read undefined padding, UB
       lowered to a trap that silently killed the fill thread; usable was 0
@@ -150,9 +149,14 @@ Work items:
       loops fused; parity 392/393 (compose_foundation = standing load
       flake, solo byte-identical). Remaining: downTo recognizer widening +
       the char-range escape.
-- [ ] Exit: a measured speedup on rangebench (target: beat interpreted
-      JIT-off by a recorded factor, not neutrality), corpus parity intact,
-      full battery green.
+- [x] EXIT MET (2026-08-23): rangebench transpiled native 124ms vs
+      interpreter 164ms (1.32x, JIT-off ReleaseSafe harness; was 830ms vs
+      291ms = 2.9x SLOWER at diagnosis). Full battery green: unit tests,
+      sweep 117/0, transpiler corpus 392/1 (standing foundation load
+      flake), cli corpus 395/396 (same flake). char_range_loops.kt
+      example + pinned output added. Corpus transpile timeout 300 -> 600s
+      (heavy compose files bake cold after any zig build and take ~380s
+      on the first transpile — the 300s limit flapped).
 
 ---
 
