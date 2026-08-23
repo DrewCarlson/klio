@@ -32,13 +32,34 @@ work, not test noise: the flip lives in klio's MVCC snapshot machinery
 and/or the pump/worker cross-thread handoff.
 
 Work items:
-- [ ] Measure the per-test flip rate SOLO (each class run N times alone) to
-      split "fails deterministically" from "races under any load" from
-      "races only under 8-way census load".
-- [ ] Root-cause the deterministic/solo-racing subset first; peel one
-      mechanism at a time (suspects: snapshot pinning/advance vs the
-      interpreter's cross-thread value visibility, `SpinMutex` fairness,
-      worker-pump mailbox ordering, `KLIO_SYNC_RESUME` default).
+- [x] Flip rate measured (2026-08-23, 5 classes x 6 solo reps on an idle
+      box): counts are 100% STABLE — List 62/3, Set 20/1, Map 56/3,
+      Pausable 24/1, Recomposer 11/1 every rep. The "race family" is
+      DISPROVEN as races: every solo failure is a deterministic
+      THROUGHPUT timeout. concurrentMixingWriteApply_* declare
+      `runTest(timeout = 30.seconds)` upstream and exceed it;
+      put_replace exceeds even a 60s budget; validatePotentialDeadlock
+      hits the 90s wall cap; the PausableComposition pair is the known
+      timeout-bound pair. The gate-scale "flip" is load pushing
+      borderline classmates over the same caps.
+- [x] put_replace mechanism named (repro putrep2.kt bisect: replace on a
+      100-entry map = 24ms/write, add = 2ms; ctor/collide-small = fast):
+      SnapshotStateMap.mutate retries `newMap == oldMap` per attempt;
+      the vendored PersistentHashMap has NO equals override, so `==` is
+      AbstractMap's entry-walk (~50 interpreted trie-gets); a REPLACE
+      keeps sizes equal so equality never short-circuits (put_new exits
+      via the size check), and 100 concurrent writers amplify attempts
+      quadratically. Upstream JVM runs the same asymptotics at native
+      constants — the klio-side lever is interpreter throughput on this
+      shape, not semantics.
+- [x] Lever 1 LANDED (5f6b22be): TTAS spin locks (SpinMutex spun on a
+      bus-locked swap; lockExclusive retried cmpxchg blind). Contended
+      repro 904 -> 630ms/round; swap leaf 31.6% -> 7.4%.
+- [ ] Levers next (measure each on the putrep3 repro, then the solo
+      class): Backoff yield-storm (libc 33% = sched_yield after 16
+      spins), the hot fetchAdd RMW (suspect: refcount ping-pong on the
+      shared map cell), per-block-edge atomic polls (shouldAbandon
+      acquire-load + gc_pending every block entry).
 - [ ] Each interpreter root ships an example + pinned output.
 - [ ] Exit: the concurrency classes pass 10/10 consecutive SOLO gate runs;
       `MAX_FAILED` lowered to the new honest ceiling (target 0, and the
