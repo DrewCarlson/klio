@@ -22,6 +22,7 @@ const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 const trace = @import("trace.zig");
 const persistent_map_eq = @import("persistent_map_eq.zig");
+const persistent_list_eq = @import("persistent_list_eq.zig");
 const overload_match = @import("overload_match.zig");
 const host_call_func = @import("host_call_func.zig");
 const host_call_value = @import("host_call_value.zig");
@@ -2929,6 +2930,9 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
         }
         cg.deinit();
     }
+    if (runtime.envOnce("KLIO_ADM_TRACE") != null) {
+        std.debug.print("[adm] definite-mismatch pn={s} orig={s} start={s} walked={d}\n", .{ pn, orig, start, queue.items.len });
+    }
     return true;
 }
 
@@ -4132,6 +4136,9 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         std.mem.eql(u8, name, "equals"))
     {
         if (persistent_map_eq.tryEquals(receiver.Instance, args[0].Instance)) |eq| {
+            return .{ .ok = .{ .Bool = eq } };
+        }
+        if (persistent_list_eq.tryEquals(receiver.Instance, args[0].Instance)) |eq| {
             return .{ .ok = .{ .Bool = eq } };
         }
     }
@@ -8627,25 +8634,11 @@ pub fn invokeVirtualMember(
         @memcpy(argbuf[1..], args);
         return dispatchIntrinsic(self, allocator, member_fqn, native, argbuf);
     }
-    // A `by`-delegated interface member the class does not override belongs
-    // to the delegate. The slot resolves against the class hierarchy, which
-    // for a defaulted interface member lands on the interface's own body —
-    // Kotlin routes it to the delegate instead.
-    if (receiver.* == .Instance) {
-        if (virtualSlotInterfaceMember(self, slot)) |name| {
-            if (interfaceDelegateFor(self, allocator, receiver.Instance, name)) |d| {
-                const r = try callMemberNamed(self, allocator, &d, name, args, arg_names_in);
-                switch (r) {
-                    .ok => return r,
-                    .err => |e| if (e != .Unimplemented) return r else freeDispatchMiss(allocator, r),
-                }
-            }
-        }
-    }
-    // Named arguments folded into `arg_params` at lowering must survive a
-    // BY-NAME fallback (an unlinked slot, a bodyless target): derive the
-    // names back from the slot root's declared params, or a delegated
-    // `emit(tag = ..., scale = ...)` re-binds its arguments positionally.
+    // Named arguments folded into `arg_params` at lowering must survive
+    // every re-dispatching arm below (the interface-delegate forward, an
+    // unlinked slot, a bodyless target): derive the names back from the
+    // slot root's declared params, or a delegated `emit(tag = ..., scale =
+    // ...)` re-binds its arguments positionally.
     var derived_names: []?[]const u8 = &.{};
     defer if (derived_names.len != 0 and runtime.freeScratch()) allocator.free(derived_names);
     const arg_names: []const ?[]const u8 = blk: {
@@ -8661,6 +8654,21 @@ pub fn invokeVirtualMember(
         }
         break :blk derived_names;
     };
+    // A `by`-delegated interface member the class does not override belongs
+    // to the delegate. The slot resolves against the class hierarchy, which
+    // for a defaulted interface member lands on the interface's own body —
+    // Kotlin routes it to the delegate instead.
+    if (receiver.* == .Instance) {
+        if (virtualSlotInterfaceMember(self, slot)) |name| {
+            if (interfaceDelegateFor(self, allocator, receiver.Instance, name)) |d| {
+                const r = try callMemberNamed(self, allocator, &d, name, args, arg_names);
+                switch (r) {
+                    .ok => return r,
+                    .err => |e| if (e != .Unimplemented) return r else freeDispatchMiss(allocator, r),
+                }
+            }
+        }
+    }
     if (receiver.* != .Instance) {
         if (isCallable(receiver)) {
             const root = FuncId.from(slot.int());
@@ -12040,6 +12048,16 @@ fn maybeWarnLenientExtBind(self: *VmHost, mod: *const Module, fid: FuncId) void 
         "warning: `{s}` binds `{s}` without an import; add `import {s}` — kotlinc rejects the unimported call, and klio may type its lambda arguments incorrectly\n",
         .{ f.name, f.fqn, f.fqn },
     );
+}
+
+/// The lenient-bind warning prints once per function per PROGRAM RUN. The
+/// memo is process-global, so an in-process harness running many programs
+/// must reset it at each run boundary or later programs lose the warning
+/// their pinned output carries.
+pub fn resetLenientWarned() void {
+    lenient_warned_mutex.lock();
+    defer lenient_warned_mutex.unlock();
+    if (lenient_warned) |*m| m.clearRetainingCapacity();
 }
 
 /// The instance serving as a member-extension's dispatch receiver: the

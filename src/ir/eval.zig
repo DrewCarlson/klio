@@ -6545,6 +6545,12 @@ inline fn scalarBin(op: BinOp, lv: Value, rv: Value) ?Value {
             .GreaterEq => .{ .Bool = a >= b },
             .Eq, .BoxedEq => .{ .Bool = a == b },
             .NotEq, .BoxedNotEq => .{ .Bool = a != b },
+            .And => .{ .Int = a & b },
+            .Or => .{ .Int = a | b },
+            .Xor => .{ .Int = a ^ b },
+            .Shl => .{ .Int = @as(i32, @bitCast(@as(u32, @bitCast(a)) << @as(u5, @intCast(@as(u32, @bitCast(b)) & 31)))) },
+            .Shr => .{ .Int = a >> @as(u5, @intCast(@as(u32, @bitCast(b)) & 31)) },
+            .UShr => .{ .Int = @as(i32, @bitCast(@as(u32, @bitCast(a)) >> @as(u5, @intCast(@as(u32, @bitCast(b)) & 31)))) },
             else => break :blk null,
         };
     } else if (lv == .Long and rv == .Long) blk: {
@@ -6562,12 +6568,16 @@ inline fn scalarBin(op: BinOp, lv: Value, rv: Value) ?Value {
             .GreaterEq => .{ .Bool = a >= b },
             .Eq, .BoxedEq => .{ .Bool = a == b },
             .NotEq, .BoxedNotEq => .{ .Bool = a != b },
+            .And => .{ .Long = a & b },
+            .Or => .{ .Long = a | b },
+            .Xor => .{ .Long = a ^ b },
             else => break :blk null,
         };
     } else if (lv == .Bool and rv == .Bool) blk: {
         break :blk switch (op) {
             .And => .{ .Bool = lv.Bool and rv.Bool },
             .Or => .{ .Bool = lv.Bool or rv.Bool },
+            .Xor => .{ .Bool = lv.Bool != rv.Bool },
             .Eq, .BoxedEq => .{ .Bool = lv.Bool == rv.Bool },
             .NotEq, .BoxedNotEq => .{ .Bool = lv.Bool != rv.Bool },
             else => break :blk null,
@@ -6590,6 +6600,18 @@ inline fn scalarBin(op: BinOp, lv: Value, rv: Value) ?Value {
             .GreaterEq => .{ .Bool = a >= b },
             .Eq => .{ .Bool = a == b },
             .NotEq => .{ .Bool = a != b },
+            // The logical trio only lowers to a BinOp when the STATIC
+            // types agree, but a literal's runtime tag can be narrower
+            // than its declared Long; compute wide, return Long as the
+            // declared type promised.
+            .And => .{ .Long = a & b },
+            .Or => .{ .Long = a | b },
+            .Xor => .{ .Long = a ^ b },
+            // Long shifts take an Int count (`Long.shl(bitCount: Int)`);
+            // the count uses its low 6 bits, JVM-style.
+            .Shl => if (lv == .Long) .{ .Long = @as(i64, @bitCast(@as(u64, @bitCast(a)) << @as(u6, @intCast(@as(u64, @bitCast(b)) & 63)))) } else break :blk null,
+            .Shr => if (lv == .Long) .{ .Long = a >> @as(u6, @intCast(@as(u64, @bitCast(b)) & 63)) } else break :blk null,
+            .UShr => if (lv == .Long) .{ .Long = @as(i64, @bitCast(@as(u64, @bitCast(a)) >> @as(u6, @intCast(@as(u64, @bitCast(b)) & 63)))) } else break :blk null,
             else => break :blk null,
         };
     } else null;
@@ -8865,11 +8887,10 @@ pub fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Va
         .Less, .LessEq, .Greater, .GreaterEq => {
             if (try compareValues(op, l, r)) |b| return ok(.{ .Bool = b });
         },
-        .And => {
-            if (l.* == .Bool and r.* == .Bool) return ok(.{ .Bool = l.Bool and r.Bool });
-        },
-        .Or => {
-            if (l.* == .Bool and r.* == .Bool) return ok(.{ .Bool = l.Bool or r.Bool });
+        .And, .Or, .Xor, .Shl, .Shr, .UShr => {
+            if (op == .And and l.* == .Bool and r.* == .Bool) return ok(.{ .Bool = l.Bool and r.Bool });
+            if (op == .Or and l.* == .Bool and r.* == .Bool) return ok(.{ .Bool = l.Bool or r.Bool });
+            if (scalarBin(op, l.*, r.*)) |v| return ok(v);
         },
         .RangeTo, .RangeUntil => {
             if (try rangeValue(allocator, op, l, r)) |v| return ok(v);
