@@ -290,6 +290,33 @@ family 9 -> 4:
   (arena profile + tests running further); use KLIO_RSS_CAP_KB=16777216
   for solo classes. Gate children run CLI GC mode, unaffected.
 
+## Call-throughput round 2 (2026-08-24)
+
+- d5815f1e LANDED: trivial property initializers (one Const or one
+  LoadParam, returned) serve without a framed eval at both construction
+  sites — put census 60.9k -> 42.6k calls (-30%). Builder-heavy paths
+  carried ~10 such frames per operation.
+- Try-recursion in thisScan LANDED: the binds-this scan no longer
+  blanket-trues try/finally bodies (over-declining member splices).
+- ATTEMPTED AND REVERTED, both findings recorded: bare-inline
+  lambda-literal splicing (kotlinc semantics — run/repeat/synchronized
+  splice instead of closure+two frames). kotlin.synchronized measured
+  2640 -> 905ns/block spliced, BUT: (1) spliced bodies resolve bare
+  names against the CALL file — creatingSnapshot's file-private
+  `observers` leaked cross-file; a DECL-FILE RESOLUTION window
+  (extend lambda_splice_resolve) is prerequisite; (2) even same-file
+  gated, the compose plugin suite COLLAPSED (1259/131, CompositionTests
+  hangs) — the composable lowering conflicts with newly-spliced inline
+  bodies in test files; plugin compatibility is the second
+  prerequisite. Ratchet restored at 526s/1378/12 after revert.
+- Put-cycle census (oneput.kt, 1000 puts): 55 calls/put — snapshot
+  validity cluster is the largest coherent block (8x valid(),
+  4x SnapshotIdSet.get, 4x Snapshot.current, 4x readable per put),
+  then per-construction inits (now served), then 4x synchronized.
+  Queued next: host fast path for SnapshotIdSet.get/valid (interpreted
+  bit-set over Long fields, host-readable layout), allocator zero-fill
+  audit (memset 186/425 = allocBytesWithAlignment).
+
 ## Running log
 
 - 2026-08-22 PERF BATCH 2: every remaining `[24]ArgShape` scratch shrunk
