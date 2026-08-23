@@ -137,6 +137,11 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     // classmates' passes stay counted. Generous enough for the compute-heavy
     // benchmark tests under 8-way contention.
     try map.put("KLIO_TEST_WALL_CAP", "90");
+    // Four children each defaulting to a half-the-cores compute pool
+    // oversubscribe the box 2x and inflate the concurrent classes'
+    // walls 3-8x. Cap each child so the children together match the
+    // core count.
+    try map.put("KLIO_MAX_WORKERS", "8");
     return map;
 }
 
