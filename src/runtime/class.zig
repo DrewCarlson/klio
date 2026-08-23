@@ -484,6 +484,26 @@ pub const InstanceData = struct {
         return null;
     }
 
+    /// `get` for a host-side probe with a NON-interned literal name: the
+    /// ptr fast path can never hit, so every call pays a byte-compare per
+    /// field. The caller passes a per-name cache slot; the first hit
+    /// stores the field's interned pointer and later calls ride the
+    /// integer compare. A class whose intern differs just re-fills.
+    pub fn getCached(self: *const InstanceData, slot: *std.atomic.Value(?[*]const u8), name: []const u8) ?Value {
+        if (slot.load(.monotonic)) |p| {
+            for (self.fields.items) |f| {
+                if (f.name.ptr == p) return f.value;
+            }
+        }
+        for (self.fields.items) |f| {
+            if (std.mem.eql(u8, f.name, name)) {
+                slot.store(f.name.ptr, .monotonic);
+                return f.value;
+            }
+        }
+        return null;
+    }
+
     pub fn set(self: *InstanceData, name: []const u8, v: Value) bool {
         for (self.fields.items) |*f| {
             if (f.name.ptr == name.ptr or std.mem.eql(u8, f.name, name)) {

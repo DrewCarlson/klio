@@ -41,6 +41,13 @@ fn asI64(v: *const Value) ?i64 {
 
 const IdSet = struct { upper: i64, lower: i64, bound: i64 };
 
+var fn_below = std.atomic.Value(?[*]const u8).init(null);
+var fn_upper = std.atomic.Value(?[*]const u8).init(null);
+var fn_lower = std.atomic.Value(?[*]const u8).init(null);
+var fn_bound = std.atomic.Value(?[*]const u8).init(null);
+var fn_sid = std.atomic.Value(?[*]const u8).init(null);
+var fn_next = std.atomic.Value(?[*]const u8).init(null);
+
 /// Read the three scalar fields of a SnapshotIdSet; null when the shape
 /// is not the expected one or the overflow array is present.
 fn readIdSet(v: *const Value) ?IdSet {
@@ -48,11 +55,11 @@ fn readIdSet(v: *const Value) ?IdSet {
     const g = v.Instance.borrow();
     defer g.deinit();
     const inst = g.get();
-    const below = inst.get("belowBound") orelse return null;
+    const below = inst.getCached(&fn_below, "belowBound") orelse return null;
     if (below != .Null) return null;
-    const upper = inst.get("upperSet") orelse return null;
-    const lower = inst.get("lowerSet") orelse return null;
-    const bound = inst.get("lowerBound") orelse return null;
+    const upper = inst.getCached(&fn_upper, "upperSet") orelse return null;
+    const lower = inst.getCached(&fn_lower, "lowerSet") orelse return null;
+    const bound = inst.getCached(&fn_bound, "lowerBound") orelse return null;
     return .{
         .upper = asI64(&upper) orelse return null,
         .lower = asI64(&lower) orelse return null,
@@ -91,7 +98,7 @@ pub fn serveValid(args: []const Value) ?Value {
     const sid = blk: {
         const g = args[0].Instance.borrow();
         defer g.deinit();
-        const v = g.get().get("snapshotId") orelse return null;
+        const v = g.get().getCached(&fn_sid, "snapshotId") orelse return null;
         break :blk asI64(&v) orelse return null;
     };
     return .{ .Bool = validId(snap, sid, s) };
@@ -109,7 +116,7 @@ pub fn serveReadable(args: []const Value) ?Value {
     var cand_sid: i64 = std.math.minInt(i64);
     while (current == .Instance) {
         const g = current.Instance.borrow();
-        const sv = g.get().get("snapshotId") orelse {
+        const sv = g.get().getCached(&fn_sid, "snapshotId") orelse {
             g.deinit();
             return null;
         };
@@ -117,7 +124,7 @@ pub fn serveReadable(args: []const Value) ?Value {
             g.deinit();
             return null;
         };
-        const next = g.get().get("next") orelse Value.Null;
+        const next = g.get().getCached(&fn_next, "next") orelse Value.Null;
         g.deinit();
         if (validId(id, sid, s) and sid > cand_sid) {
             candidate = current;
