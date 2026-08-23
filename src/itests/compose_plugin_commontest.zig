@@ -141,7 +141,7 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     // oversubscribe the box 2x and inflate the concurrent classes'
     // walls 3-8x. Cap each child so the children together match the
     // core count.
-    try map.put("KLIO_MAX_WORKERS", "8");
+    try map.put("KLIO_MAX_WORKERS", "5");
     return map;
 }
 
@@ -149,7 +149,7 @@ fn workerCount() usize {
     const cores = std.Thread.getCpuCount() catch 4;
     // Half the cores, capped low: suites run beside sweeps and editors,
     // and each child is itself a multi-threaded interpreter.
-    return std.math.clamp(cores / 2, 1, 4);
+    return std.math.clamp(cores / 2, 1, 6);
 }
 
 fn runKlio(
