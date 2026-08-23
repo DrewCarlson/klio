@@ -233,6 +233,22 @@ Work items:
 
 ---
 
+## Gate-red round (2026-08-24, in progress)
+
+The first full `scripts/gate.sh` of the campaign flagged two suites the
+targeted batteries never ran:
+- `itest-e2e`: delegated_member_named_args — ROOT FIXED (1932fb08): the
+  virtual-slot path derives folded named args from arg_params, but the
+  interface-delegate arm ran BEFORE that reconstruction and forwarded
+  positionally (regression from the delegation-defaults commit
+  d62d97d4, bisected). noncallable_capture_member_fallback — identity
+  hash shifted one allocation with the channel cutover; re-pinned.
+  REMAINING: a jit=true-labelled serialization/datetime family
+  (unresolved global `serializer`/`TimeZone`) that reproduces only in
+  the itest-prepared scratch home; green at aedd737b, bisect running.
+- `itest-ktor_server`: one failing test, detail pending the e2e bisect
+  (avoids concurrent builds).
+
 ## Running log
 
 - 2026-08-22 PERF BATCH 2: every remaining `[24]ArgShape` scratch shrunk
