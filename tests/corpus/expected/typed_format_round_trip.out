@@ -1,4 +1,3 @@
-warning: `serializer` binds `kotlinx.serialization.serializer` without an import; add `import kotlinx.serialization.serializer` — kotlinc rejects the unimported call, and klio may type its lambda arguments incorrectly
 enc = {name:"run one", mode:SLOW, hint:null, skipped:true, inner:{n:7}, sizes:{0:3, 1:5}}
 dec = Record(name=run one, mode=SLOW, hint=null, skipped=true, inner=Inner(n=7), sizes=[3, 5])
 eq  = true
