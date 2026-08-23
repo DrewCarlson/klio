@@ -333,6 +333,11 @@ family 9 -> 4:
 - Remaining profile: diffuse floor (libc 8.3, runFrameExec 7.7,
   memset 4.9, eqlBytes 4.2, alloc ~4.5) — no single >10% item left on
   the put cycle.
+- Round close: List addAll_clear at 30.4s vs its 30.0s budget (0.4s
+  over — boundary); removeRange 39s; Map _clear 38s. Durable passage
+  needs either host addAll-at-index/removeRange (vendored
+  PersistentVectorBuilder mutation surgery) or the diffuse floor
+  (string-keyed dispatch caches -> interned ids; allocator zero-fill).
 
 ## Running log
 
