@@ -1334,9 +1334,16 @@ pub const Func = struct {
     /// The GetField name ConstId when this function's body is exactly the
     /// accessor shape `LoadParam #0; GetField; return` — the canonical
     /// property-getter lowering — else null. Cached in place under the
-    /// `fast_call` benign-race convention. A deferred (not yet decoded)
-    /// body is never classified, so the verdict is only ever computed from
-    /// real instructions.
+    /// `fast_call` benign-race convention. An image func's body decodes
+    /// lazily; classify the real instructions (`accessorFieldConstIn`),
+    /// or never for a caller without the module in hand.
+    pub fn accessorFieldConstIn(self: *const Func, module: *const Module) ?ConstId {
+        if (self.acc_state == 0 and self.blocks.len == 0) {
+            _ = module.ensureFuncBody(@constCast(self));
+        }
+        return self.accessorFieldConst();
+    }
+
     pub fn accessorFieldConst(self: *const Func) ?ConstId {
         switch (self.acc_state) {
             1 => return null,

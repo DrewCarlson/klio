@@ -410,7 +410,7 @@ pub const FieldSiteClaim = struct { cls: u64, route: u64 };
 /// frame path, as does a getter-routed or unclaimed (class, name).
 pub fn accessorFastGet(self: *VmHost, mod: *const Module, f: *const ir.Func, receiver: *const Value) ?EvalResult {
     if (receiver.* != .Instance) return null;
-    const fc = f.accessorFieldConst() orelse return null;
+    const fc = f.accessorFieldConstIn(mod) orelse return null;
     const claimed = @atomicLoad(u64, @constCast(&f.acc_cls), .acquire);
     if (claimed == 1) return null;
     if (fc.int() >= mod.consts.items.len) return null;
