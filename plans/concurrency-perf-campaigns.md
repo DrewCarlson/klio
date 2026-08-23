@@ -365,6 +365,22 @@ family 9 -> 4:
   522s): both List timeout tests and Pausable.markInvalid left the fail
   set. Remaining 6 unique: Movable flake, Pausable.resumeOnBackground,
   Recomposer pausing/testInsert/validatePotentialDeadlock, Map _clear.
+- Gate-red round on the flip (3 itest fails), all three splice
+  regressions root-caused: (1) lock-family "virtual call receiver is
+  not an instance" (tl_atomicfu_lock_mutex, ktor_locks_mutex) — a
+  CAPTURE-reached caller local (`val lock`) shadowed the spliced
+  receiver's member `lock()`; the documented ctorInitNonInvocable bail
+  only covers init-recorded locals, so capture-hoisted names with a
+  splice receiver whose class declares the name now defer to the
+  member path, and the anon-capture call arm emits the arbitrated
+  CallValueOrMember under a splice receiver. (2)
+  captured_write_shared_resolution — a class's fn-typed property `run`
+  outranks kotlin.run by scope; the splice now declines SHADOWED
+  callees (own/enclosing member or in-scope binding named like the
+  inline fn). TRAP recorded: a lambda body lowers more than once and
+  the KEPT pass resolves captures differently (resolve() non-null via
+  hoist) — arbitration arms must cover capture-reached names, and
+  single-pass lowering traces can mislead.
 - Queued next: spliced-body LAMBDA splicing (the lambda literal still
   frames inside a spliced callee — 12 frames/pair, kotlinc splices
   both), SnapshotThreadLocal.get/Snapshot.current host serve (4.3
