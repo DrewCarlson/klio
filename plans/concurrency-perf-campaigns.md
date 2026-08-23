@@ -82,9 +82,24 @@ Work items:
   markInvalidFromBackgroundThread) are green at gate scale. NOTE: 12 is one
   over MAX_FAILED=11 under this box's background load; the ceiling stays —
   the fix direction is down via throughput work, not a wider ceiling.
+- 2026-08-23 WORKER-WIDTH SCALING MEASURED (32-core box, solo):
+  4 workers = 727s / 1378 passed / 12 failed; 8 workers = 512s / 1372 /
+  18; 6 workers = 513s / 1372 / 18 (0 DNC everywhere). Two findings:
+  (a) the wall FLOORS at ~510s above 4 workers — the heavy-class tail
+  (snapshot/SlotTable compute) bounds it, not queue width; (b) any width
+  above 4 inflates the task-1 race family past the ratchet (1372 < 1375,
+  18 > MAX_FAILED 11) — the same concurrent* snapshot tests plus
+  markInvalidFromBackgroundThread/testInsertDuringRecomposition. Width
+  stays at 4. CONVERGENCE: task 2's halving is BLOCKED by task 1's race
+  family; fixing the MVCC-snapshot cross-thread races unlocks both the
+  fail ceiling and ~-215s of wall.
 - [ ] Exit: full solo `itest-compose_plugin_commontest` wall time halved from
       the current measured baseline (record it first), with the gate still at
-      its pass baseline.
+      its pass baseline. Path after the width measurement: fix the task-1
+      races first, then re-adopt width 6-8 (~510s), then shorten the
+      heavy-class tail (interpreter throughput: profile is diffuse —
+      libc-malloc 14%, runFrameExec 9%, allocator-poison memset 4.5%,
+      eqlBytes 3% — allocation traffic is the aggregate theme).
 
 ## Task 3 — Value layout stage 5b (RESOLVED: further along than assumed)
 
