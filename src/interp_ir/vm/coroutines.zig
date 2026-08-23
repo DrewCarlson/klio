@@ -819,6 +819,10 @@ pub const CooperativeInterceptor = struct {
     /// `select { onTimeout(…) }`) is promoted into `launched` by the pump
     /// loop and runs on this pump as an ordinary timer.
     timeout_launched: std.ArrayList(Value),
+    /// Starvation tracking for `virtualStarvationDue`: the virtual instant
+    /// last observed and the real time this pump first saw it.
+    starve_seen_now: i64 = -1,
+    starve_base_real: i64 = 0,
     /// Set by `__kxco_parkSlot` immediately before the activation
     /// unwinds with an indefinite suspend; consumed by the next
     /// `interceptSuspend` to bind that token to the slot.
@@ -864,6 +868,8 @@ pub const CooperativeInterceptor = struct {
             .ready = .empty,
             .launched = .empty,
             .timeout_launched = .empty,
+            .starve_seen_now = -1,
+            .starve_base_real = 0,
             .pending_slot = null,
             .slot_to_token = std.AutoHashMap(i64, u64).init(allocator),
             .token_resume_value = std.AutoHashMap(u64, Value).init(allocator),
@@ -1208,6 +1214,33 @@ pub const CooperativeInterceptor = struct {
     /// arm every activation due then. Under `Virtual` the clock jumps to
     /// the timer once the global barrier permits; under `Wall` the thread
     /// sleeps toward the real deadline.
+    /// Whether this Virtual-mode pump has sat at one virtual instant for
+    /// longer in REAL time than the earliest parked timer's virtual delay.
+    /// Under wall semantics that timer would already have fired: real time
+    /// passes while busy work (a `yield()` loop) runs. Virtual time must
+    /// never run SLOWER than real time, so the pump treats this as a due
+    /// advance even though runnable work exists.
+    pub fn virtualStarvationDue(self: *CooperativeInterceptor) bool {
+        if (self.mode != .Virtual) return false;
+        var soonest: ?i64 = null;
+        var it = self.parked.iterator();
+        while (it.next()) |e| {
+            const w = e.value_ptr.wake_at;
+            if (w == INDEFINITE) continue;
+            if (soonest == null or w < soonest.?) soonest = w;
+        }
+        const t = soonest orelse return false;
+        const now_real = ir.eval.nowMonotonicMs();
+        if (self.starve_seen_now != self.virtual_now) {
+            self.starve_seen_now = self.virtual_now;
+            self.starve_base_real = now_real;
+            return false;
+        }
+        const delay = t - self.virtual_now;
+        if (delay <= 0) return true;
+        return now_real - self.starve_base_real >= delay;
+    }
+
     pub fn advanceTimeGated(self: *CooperativeInterceptor) Allocator.Error!Advance {
         var soonest: ?i64 = null;
         {
@@ -2277,6 +2310,10 @@ fn pumpLoop(
         if (launched.len != 0) {
             endStreak("launched");
             idle_rounds = 0;
+            // A yield-heavy round keeps the launch queue hot forever and a
+            // parked timer would starve; when real time has outrun the
+            // earliest virtual delay, let the clock advance now.
+            if ((coroTop().?).virtualStarvationDue()) _ = try (coroTop().?).advanceTimeGated();
             continue;
         }
 
@@ -2334,6 +2371,7 @@ fn pumpLoop(
                     },
                 }
             }
+            if ((coroTop().?).virtualStarvationDue()) _ = try (coroTop().?).advanceTimeGated();
             continue;
         }
 
