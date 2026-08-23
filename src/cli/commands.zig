@@ -806,7 +806,10 @@ fn fuseStraightBlock(cl: *CountedLoop, written: []bool, st: *const ir.bc.Stream,
                 pc += 3;
             },
             .const_load => {
-                const sc = fuseConstScalar(consts, code[pc + 2]) orelse return false;
+                const sc = fuseConstScalar(consts, code[pc + 2]) orelse {
+                    fuseTrace("  straight: const#{d} not scalar", .{code[pc + 2]});
+                    return false;
+                };
                 if (n_out.* >= out.len) return false;
                 if (!fuseNoteWrite(cl, written, code[pc + 1])) return false;
                 out[n_out.*] = .{ .const_scalar = .{ .dst = code[pc + 1], .g = sc.g, .v = sc.v } };
@@ -873,7 +876,7 @@ fn recognizeCountedLoop(fs: *const ir.bc.FuncStreams, header: u32, consts: []con
     const hstream = (if (header < fs.streams.len) fs.streams[header] else null) orelse return null;
     const h = fuseHeaderCmp(hstream) orelse return null;
     const hkind: ir.BinOp = @enumFromInt(h.kind);
-    fuseTrace("B{d}: header cmp kind={s}", .{ header, @tagName(hkind) });
+    fuseTrace("B{d}: header cmp kind={s} I=r{d} B=r{d} dst=r{d} t=B{d} f=B{d}", .{ header, @tagName(hkind), h.lhs, h.rhs, h.dst, h.t, h.f });
     if (hkind != .LessEq and hkind != .GreaterEq) return null;
     if (h.lhs >= FUSE_MAX_REGS or h.rhs >= FUSE_MAX_REGS or h.dst >= FUSE_MAX_REGS) return null;
     cl.header = header;
@@ -883,24 +886,27 @@ fn recognizeCountedLoop(fs: *const ir.bc.FuncStreams, header: u32, consts: []con
     cl.hkind = hkind;
     cl.hdst = h.dst;
     cl.htrace = h.trace;
-    if (!fuseNoteRead(&cl, &written, cl.ind)) return null;
-    if (!fuseNoteRead(&cl, &written, cl.bound)) return null;
-    if (!fuseNoteWrite(&cl, &written, cl.hdst)) return null;
+    if (!fuseNoteRead(&cl, &written, cl.ind)) { fuseTrace("B{d}: note ind", .{header}); return null; }
+    if (!fuseNoteRead(&cl, &written, cl.bound)) { fuseTrace("B{d}: note bound", .{header}); return null; }
+    if (!fuseNoteWrite(&cl, &written, cl.hdst)) { fuseTrace("B{d}: note hdst", .{header}); return null; }
 
     const body = h.t;
-    const bstream = (if (body < fs.streams.len) fs.streams[body] else null) orelse return null;
+    const bstream = (if (body < fs.streams.len) fs.streams[body] else null) orelse {
+        fuseTrace("B{d}: body B{d} has no stream", .{ header, h.t });
+        return null;
+    };
     var l1: u32 = 0;
     if (!fuseStraightBlock(&cl, &written, bstream, &cl.ops, &cl.n_ops, null, &l1, consts)) {
         fuseTrace("B{d}: body block B{d} not fusible", .{ header, body });
         return null;
     }
 
-    const l1stream = (if (l1 < fs.streams.len) fs.streams[l1] else null) orelse return null;
+    const l1stream = (if (l1 < fs.streams.len) fs.streams[l1] else null) orelse { fuseTrace("B{d}: l1 B{d} no stream", .{ header, l1 }); return null; };
     const lc = fuseHeaderCmp(l1stream) orelse {
         fuseTrace("B{d}: latch B{d} not a cmp", .{ header, l1 });
         return null;
     };
-    if (@as(ir.BinOp, @enumFromInt(lc.kind)) != .Eq) return null;
+    if (@as(ir.BinOp, @enumFromInt(lc.kind)) != .Eq) { fuseTrace("B{d}: latch kind not Eq", .{header}); return null; }
     // The Eq exit compares the induction register against the progression's
     // LAST element — for a stepped/downTo loop the lowerer snaps it into a
     // register distinct from the entry bound. Any loop-invariant register
@@ -910,18 +916,18 @@ fn recognizeCountedLoop(fs: *const ir.bc.FuncStreams, header: u32, consts: []con
         return null;
     }
     cl.last = lc.rhs;
-    if (cl.last >= FUSE_MAX_REGS) return null;
-    if (!fuseNoteRead(&cl, &written, cl.last)) return null;
-    if (lc.dst >= FUSE_MAX_REGS) return null;
+    if (cl.last >= FUSE_MAX_REGS) { fuseTrace("B{d}: last reg big", .{header}); return null; }
+    if (!fuseNoteRead(&cl, &written, cl.last)) { fuseTrace("B{d}: note last", .{header}); return null; }
+    if (lc.dst >= FUSE_MAX_REGS) { fuseTrace("B{d}: ldst big", .{header}); return null; }
     cl.done = lc.t;
     cl.ldst = lc.dst;
     cl.ltrace = lc.trace;
-    if (!fuseNoteWrite(&cl, &written, cl.ldst)) return null;
+    if (!fuseNoteWrite(&cl, &written, cl.ldst)) { fuseTrace("B{d}: note ldst", .{header}); return null; }
 
     // The increment block's back edge returns to the BODY (the rotated
     // loop's head), not to this entry-check block.
     const l2 = lc.f;
-    const l2stream = (if (l2 < fs.streams.len) fs.streams[l2] else null) orelse return null;
+    const l2stream = (if (l2 < fs.streams.len) fs.streams[l2] else null) orelse { fuseTrace("B{d}: l2 B{d} no stream", .{ header, l2 }); return null; };
     var back: u32 = 0;
     if (!fuseStraightBlock(&cl, &written, l2stream, &cl.latch_ops, &cl.n_latch, body, &back, consts)) {
         fuseTrace("B{d}: incr block B{d} not fusible", .{ header, l2 });
@@ -932,7 +938,13 @@ fn recognizeCountedLoop(fs: *const ir.bc.FuncStreams, header: u32, consts: []con
     for (cl.latch_ops[0..cl.n_latch]) |op| {
         switch (op) {
             .bin => |b| {
-                if (b.dst != cl.ind or b.kind != .Add or b.lhs != cl.ind) return null;
+                // Ascending loops increment; `downTo` decrements. Either
+                // way the op replays generically — the validator only pins
+                // the shape (exactly one in-place +/- on the induction reg).
+                if (b.dst != cl.ind or b.lhs != cl.ind or (b.kind != .Add and b.kind != .Sub)) {
+                    fuseTrace("latch op shape: dst=r{d} lhs=r{d} kind={s}", .{ b.dst, b.lhs, @tagName(b.kind) });
+                    return null;
+                }
                 step = b.rhs;
                 incs += 1;
             },
@@ -940,10 +952,10 @@ fn recognizeCountedLoop(fs: *const ir.bc.FuncStreams, header: u32, consts: []con
             else => return null,
         }
     }
-    if (incs != 1) return null;
+    if (incs != 1) { fuseTrace("B{d}: incs={d}", .{ header, incs }); return null; }
     cl.step = step;
-    if (written[cl.bound] or written[cl.last]) return null;
-    if (step != cl.ind and written[step]) return null;
+    if (written[cl.bound] or written[cl.last]) { fuseTrace("B{d}: bound/last written", .{header}); return null; }
+    if (step != cl.ind and written[step]) { fuseTrace("B{d}: step written", .{header}); return null; }
     if (cl.exit >= fs.streams.len or fs.streams[cl.exit] == null) {
         fuseTrace("B{d}: exit B{d} uncompiled", .{ header, cl.exit });
         return null;

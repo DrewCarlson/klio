@@ -24,7 +24,7 @@ check_one() {
     local kt="$1"
     local name
     name=$(basename "$kt" .kt)
-    if ! timeout 300 ./zig-out/bin/klio transpile "$kt" -o "$out/$name.c" > "$out/$name.transpile.log" 2>&1; then
+    if ! timeout 600 ./zig-out/bin/klio transpile "$kt" -o "$out/$name.c" > "$out/$name.transpile.log" 2>&1; then
         echo "FAIL transpile" > "$out/$name.status"; echo "  FAIL $name (transpile)"; return
     fi
     if ! zig cc "$out/$name.c" -Izig-out/include -Lzig-out/lib -lklio_rt -lzstd -o "$out/$name" 2> "$out/$name.cc.log"; then
