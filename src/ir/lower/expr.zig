@@ -8838,10 +8838,8 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
         b.recvTy() == null and b.ownerClass() != null and
         !anyReceiverFormedFnParam(f) and !bodyLambdaBindsThis(f) and
         !std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_EXT_SPLICE") orelse "1", "0");
-    // Bisect gate for widening the splice to every literal-lambda inline
-    // call (kotlinc semantics). Default off while the two recorded
-    // prerequisites (decl-file resolution for spliced bare names,
-    // compose-plugin compatibility) are driven down. A CLASS MEMBER
+    // Literal-lambda inline calls splice by default (kotlinc semantics);
+    // KLIO_LLP=0 restores the framed route for bisecting. A CLASS MEMBER
     // callee is excluded: its bare member reads need the decl class's
     // `this`, which the splice does not thread.
     // Receiver-formed lambda params (`block: R.() -> T`) are excluded for
@@ -8911,7 +8909,7 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
         !anyReceiverFormedFnParam(f) and
         !anyCrossOrNoinlineParam(f) and
         !inline_call.argLambdaTargetsLabel(args, nm) and
-        std.mem.eql(u8, runtime.envOnce("KLIO_LLP") orelse "0", "1");
+        !std.mem.eql(u8, runtime.envOnce("KLIO_LLP") orelse "1", "0");
     return !recv_mismatch and
         (f.is_suspend or argLambdaHasNonlocalReturn(args) or
             inline_call.argsForwardInlineLambda(b, args) or has_reified or shadowed_by_member or
