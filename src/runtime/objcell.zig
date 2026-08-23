@@ -240,7 +240,9 @@ const SpinRwLock = struct {
     fn lockExclusive(self: *SpinRwLock) void {
         var b: Backoff = .{};
         while (true) {
-            if (self.state.cmpxchgWeak(0, WRITER, .acquire, .monotonic) == null) {
+            if (self.state.load(.monotonic) == 0 and
+                self.state.cmpxchgWeak(0, WRITER, .acquire, .monotonic) == null)
+            {
                 return;
             }
             b.pause();
@@ -308,7 +310,14 @@ pub const SpinMutex = struct {
 
     pub fn lock(self: *SpinMutex) void {
         var b: SpinRwLock.Backoff = .{};
-        while (self.locked.swap(true, .acquire)) {
+        // Test-and-test-and-set: spin on a plain load while the lock is
+        // held so waiters share the cache line instead of ping-ponging it
+        // with bus-locked swaps; only attempt the swap on an observed
+        // release.
+        while (true) {
+            if (!self.locked.load(.monotonic)) {
+                if (!self.locked.swap(true, .acquire)) return;
+            }
             b.pause();
         }
     }
