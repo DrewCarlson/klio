@@ -3788,6 +3788,14 @@ pub fn prepareMemberFlatCallNamed(
 /// up to `invokeMethodFuncId`'s `evalWith` terminal, including the threaded
 /// ambient-composer push (undone at activation close via `flatCallClosed`).
 pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8, declared_recv: ?[]const u8, allow_ext_cache: bool) Allocator.Error!?ir.eval.FlatCallReq {
+    // Persistent-vector contains/indexOf are host-served (the ladder's
+    // intercept); a flat-prepared interpreted body would bypass that.
+    if (args.len == 1 and receiver.* == .Instance and
+        (std.mem.eql(u8, name, "contains") or std.mem.eql(u8, name, "indexOf")) and
+        persistent_list_eq.isVectorClass(receiver.Instance))
+    {
+        return null;
+    }
     // `closure.invoke(args…)`: the ladder lands at `callValueRec(receiver,
     // args)` with no closure-specific step before it, so the plain closure
     // invocation flattens identically.
@@ -3978,6 +3986,14 @@ pub fn prepareMemberFlatFromFid(
 /// interpreted body. Anonymous receivers (intrinsic shadowing, SAM targets,
 /// name-ladder fallbacks), runtime-defined classes, and unlinked or bodyless
 /// entries all decline to the recursive invoker unchanged.
+
+fn slotNameForTrace(self: *VmHost, slot: MethodSlotId) []const u8 {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const f = mg.get().funcById(FuncId.from(slot.int())) orelse return "?";
+    return f.name;
+}
+
 pub fn prepareVirtualFlatCall(
     self: *VmHost,
     allocator: Allocator,
@@ -3986,8 +4002,21 @@ pub fn prepareVirtualFlatCall(
     args: []const Value,
 ) Allocator.Error!?ir.eval.FlatCallReq {
     const vtrace = vflatTraceOn();
+    // Persistent-vector contains/indexOf are host-served (the
+    // invokeVirtualMember intercept); a flat-prepared interpreted body
+    // would bypass that.
+    if (args.len == 1 and receiver.* == .Instance and
+        persistent_list_eq.isVectorClass(receiver.Instance))
+    {
+        if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vn| {
+            if (std.mem.eql(u8, vn, "contains") or std.mem.eql(u8, vn, "indexOf")) return null;
+        }
+    }
     if (receiver.* != .Instance) {
-        if (vtrace) std.debug.print("[vflat] decline non-instance {s}\n", .{@tagName(std.meta.activeTag(receiver.*))});
+        if (vtrace) {
+            const nm = virtualSlotInterfaceMember(self, slot) orelse slotNameForTrace(self, slot);
+            std.debug.print("[vflat] decline non-instance {s} name={s}\n", .{ @tagName(std.meta.activeTag(receiver.*)), nm });
+        }
         return null;
     }
     // A delegating receiver re-decides an interface-declared slot (see
@@ -4140,6 +4169,18 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         }
         if (persistent_list_eq.tryEquals(receiver.Instance, args[0].Instance)) |eq| {
             return .{ .ok = .{ .Bool = eq } };
+        }
+    }
+    // Vendored persistent-vector scans: `contains`/`indexOf` otherwise
+    // iterate the trie through a fully interpreted iterator with a
+    // dispatched equals per element (~4.5ms per contains on 1000
+    // elements); the host walks the leaf arrays directly.
+    if (args.len == 1 and receiver.* == .Instance and
+        (std.mem.eql(u8, name, "contains") or std.mem.eql(u8, name, "indexOf")))
+    {
+        if (persistent_list_eq.tryIndexOf(receiver.Instance, &args[0])) |idx| {
+            if (name.len == 8) return .{ .ok = .{ .Bool = idx >= 0 } };
+            return .{ .ok = Value.newInt(idx) };
         }
     }
 
@@ -8592,6 +8633,14 @@ fn stampVirtSite(site: ?ir.VirtNativeSite, receiver: *const Value, encoded: u64,
     @atomicStore(u64, st.native, encoded, .release);
 }
 
+
+fn slotNameOrNull(self: *VmHost, slot: MethodSlotId) ?[]const u8 {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const f = mg.get().funcById(FuncId.from(slot.int())) orelse return null;
+    return f.name;
+}
+
 pub fn invokeVirtualMember(
     self: *VmHost,
     allocator: Allocator,
@@ -8602,6 +8651,19 @@ pub fn invokeVirtualMember(
     arg_params: ?[]const u32,
     site: ?ir.VirtNativeSite,
 ) Allocator.Error!EvalResult {
+    // Vendored persistent-vector scans (see the callMemberInnerStatic
+    // intercept): the hot `readable.contains(element)` arrives as a
+    // virtual slot, so serve it here too.
+    if (args.len == 1 and receiver.* == .Instance) {
+        if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vname| {
+            if (std.mem.eql(u8, vname, "contains") or std.mem.eql(u8, vname, "indexOf")) {
+                if (persistent_list_eq.tryIndexOf(receiver.Instance, &args[0])) |idx| {
+                    if (vname.len == 8) return .{ .ok = .{ .Bool = idx >= 0 } };
+                    return .{ .ok = Value.newInt(idx) };
+                }
+            }
+        }
+    }
     // Replay a stamped host-receiver site: same interned type FQN means the
     // walk below would reach the same verdict, so serve it without the
     // registry probes. Verdicts are tagged in `site_native`'s low bits
@@ -9123,6 +9185,23 @@ pub fn invokeVirtualMember(
 }
 
 fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args_in: []const Value) Allocator.Error!?EvalResult {
+    // Vendored persistent-vector scans: a memoized contains/indexOf site
+    // replays straight to its FuncId, so the host walk must intercept at
+    // the invoker too (see the callMemberInnerStatic intercept).
+    if (args_in.len == 1 and receiver.* == .Instance) {
+        const fname = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const f = mg.get().funcById(fid) orelse break :blk "";
+            break :blk f.name;
+        };
+        if (std.mem.eql(u8, fname, "contains") or std.mem.eql(u8, fname, "indexOf")) {
+            if (persistent_list_eq.tryIndexOf(receiver.Instance, &args_in[0])) |idx| {
+                if (fname.len == 8) return .{ .ok = .{ .Bool = idx >= 0 } };
+                return .{ .ok = Value.newInt(idx) };
+            }
+        }
+    }
     ir.eval.dispatchNote(.served_user_body);
     runtime.prof.opRoute(4);
     const mg = self.module.borrow();

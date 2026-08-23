@@ -93,6 +93,91 @@ fn nodeEq(a: ArrayData, b: ArrayData, shift: u32, remaining: usize) ?bool {
     return true;
 }
 
+/// Ordered host scan of a vendored persistent vector for `element`,
+/// returning its first index, -1 when absent, or null when the receiver
+/// is another class or an element needs dispatched equality. Serves
+/// `contains`/`indexOf`, which otherwise walk the trie through a fully
+/// interpreted iterator with a dispatched equals per element.
+/// Whether `inst` is one of the vendored persistent-vector classes —
+/// the gate a flat-call preparer uses to stand aside so the host scan
+/// intercepts serve `contains`/`indexOf`.
+pub fn isVectorClass(inst: ObjRef(InstanceData)) bool {
+    if (classMatches(inst, &small_class_hit, SMALL_FQN)) return true;
+    return classMatches(inst, &vec_class_hit, VEC_FQN);
+}
+
+pub fn tryIndexOf(a: ObjRef(InstanceData), element: *const Value) ?i64 {
+    const hostable = switch (element.*) {
+        .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Bool, .Char, .String, .Null, .Unit => true,
+        else => false,
+    };
+    if (!hostable) return null;
+    const a_small = classMatches(a, &small_class_hit, SMALL_FQN);
+    const a_vec = !a_small and classMatches(a, &vec_class_hit, VEC_FQN);
+    if (!a_small and !a_vec) return null;
+    const ga = a.borrow();
+    defer ga.deinit();
+    if (a_small) {
+        const ba = ga.get().get("buffer") orelse return null;
+        if (ba != .Array) return null;
+        const n = ba.Array.len();
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const e = ba.Array.get(i);
+            if (eqVal(&e, element) orelse return null) return @intCast(i);
+        }
+        return -1;
+    }
+    const sa = ga.get().get("size") orelse return null;
+    if (sa != .Int) return null;
+    const size: usize = @intCast(sa.Int);
+    if (size == 0) return -1;
+    const sha = ga.get().get("rootShift") orelse return null;
+    if (sha != .Int or sha.Int < 0) return null;
+    const ta = ga.get().get("tail") orelse return null;
+    const ra = ga.get().get("root") orelse return null;
+    if (ta != .Array or ra != .Array) return null;
+    const root_len: usize = (size - 1) & ~@as(usize, 31);
+    const found = nodeIndexOf(ra.Array, @intCast(sha.Int), root_len, 0, element) orelse return null;
+    if (found >= 0) return found;
+    const tail_len = size - root_len;
+    if (ta.Array.len() < tail_len) return null;
+    var i: usize = 0;
+    while (i < tail_len) : (i += 1) {
+        const e = ta.Array.get(i);
+        if (eqVal(&e, element) orelse return null) return @intCast(root_len + i);
+    }
+    return -1;
+}
+
+/// First index of `element` under a trie node covering `remaining`
+/// logical elements starting at absolute index `base`; -1 = absent,
+/// null = bail.
+fn nodeIndexOf(arr: ArrayData, shift: u32, remaining: usize, base: usize, element: *const Value) ?i64 {
+    if (remaining == 0) return -1;
+    if (shift == 0) {
+        if (arr.len() < remaining) return null;
+        var i: usize = 0;
+        while (i < remaining) : (i += 1) {
+            const e = arr.get(i);
+            if (eqVal(&e, element) orelse return null) return @intCast(base + i);
+        }
+        return -1;
+    }
+    const span = @as(usize, 1) << @intCast(shift);
+    const used = (remaining + span - 1) / span;
+    if (arr.len() < used) return null;
+    var i: usize = 0;
+    while (i < used) : (i += 1) {
+        const ca = arr.get(i);
+        if (ca != .Array) return null;
+        const rem = @min(span, remaining - i * span);
+        const r = nodeIndexOf(ca.Array, shift - LOG_BRANCH, rem, base + i * span, element) orelse return null;
+        if (r >= 0) return r;
+    }
+    return -1;
+}
+
 /// Answer `a.equals(b)` for two vendored persistent-vector instances,
 /// or null when either operand is another class or an element needs
 /// dispatched equality.
