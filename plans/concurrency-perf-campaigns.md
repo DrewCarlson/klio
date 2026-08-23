@@ -317,6 +317,23 @@ family 9 -> 4:
   bit-set over Long fields, host-readable layout), allocator zero-fill
   audit (memset 186/425 = allocBytesWithAlignment).
 
+## Call-throughput round 3 (2026-08-24)
+
+- 956600b5 LANDED: host-served snapshot validity walk (readable/valid
+  + IdSet probe via a Func.host_route fqn-classified memo at
+  execArmCall). Put census 42.6k -> 29.2k calls; mixrep 2.8 -> 2.44s;
+  COMPOSE GATE RECORD: 1380 passed / 10 failed at 524s. The residual
+  `readable` stat = the same-fqn T.readable(state) extension wrapper
+  (needs Snapshot.current threadlocal + observer dispatch — poor host
+  fit, not chased).
+- Cached-pointer field probes for host paths (InstanceData.getCached).
+- Cumulative shape standing: clearShape 22.3 -> 18.1s/rep, mixrep
+  2.8 -> 2.44s, putrep3 78 -> 47ms. Map _clear solo 46 -> 38s (needs
+  ~6x more on its bulk shape); List addAll_clear 33s / removeRange 39s.
+- Remaining profile: diffuse floor (libc 8.3, runFrameExec 7.7,
+  memset 4.9, eqlBytes 4.2, alloc ~4.5) — no single >10% item left on
+  the put cycle.
+
 ## Running log
 
 - 2026-08-22 PERF BATCH 2: every remaining `[24]ArgShape` scratch shrunk
