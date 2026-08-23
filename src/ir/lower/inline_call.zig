@@ -513,6 +513,124 @@ fn labelScanG(comptime deep: bool, e: *const Expr, label: []const u8) bool {
     };
 }
 
+
+/// True when every reference to `name` in the callee body is the CALLEE
+/// head of a call — i.e. the splice's call-position expansion consumes
+/// every use and no value position remains. Conservative: any construct
+/// this walk does not understand, a shadowing risk, or a bare value
+/// occurrence returns false.
+fn paramOnlyCalled(f: *const ast.Function, name: []const u8) bool {
+    const body = if (f.body) |*bd| bd else return false;
+    return switch (body.*) {
+        .Block => |blk| !pocStmts(true, blk.stmts, name),
+        .Expr => |*ex| !pocUses(true, ex, name),
+    };
+}
+
+fn pocStmts(comptime exempt_call_head: bool, stmts: []const Stmt, name: []const u8) bool {
+    for (stmts) |*st| {
+        const hit = switch (st.*) {
+            .Expr => |*e| pocUses(exempt_call_head, e, name),
+            .Assign => |asg| pocUses(exempt_call_head, &asg.target, name) or pocUses(exempt_call_head, &asg.value, name),
+            .DestructuringDecl => |d| pocUses(exempt_call_head, &d.init, name),
+            .Decl => |decl| switch (decl) {
+                .Property => |pr| blk: {
+                    // A same-named local re-declaration shadows below; too
+                    // rare to model — treat as a value use (keep the arg).
+                    if (std.mem.eql(u8, pr.name.name, name)) break :blk true;
+                    break :blk if (pr.init) |*init| pocUses(exempt_call_head, init, name) else false;
+                },
+                else => true,
+            },
+        };
+        if (hit) return true;
+    }
+    return false;
+}
+
+/// Whether `name` occurs as a VALUE (any position that is not the callee
+/// head of a call) under `e`. Unknown constructs count as a use.
+fn pocUses(comptime exempt_call_head: bool, e: *const Expr, name: []const u8) bool {
+    return switch (e.*) {
+        .IntLit, .FloatLit, .BoolLit, .NullLit, .CharLit, .This, .Super, .Break, .Continue => false,
+        .Path => |pth| pth.segments.len == 1 and std.mem.eql(u8, pth.segments[0].name, name),
+        .StringTemplate => |st| blk: {
+            for (st.parts) |*part| switch (part.*) {
+                .Text => {},
+                .ShortInterp => |id| if (std.mem.eql(u8, id.name, name)) break :blk true,
+                .Interp => |ie| if (pocUses(exempt_call_head, ie, name)) break :blk true,
+            };
+            break :blk false;
+        },
+        // A receiver-lambda param invoked with an explicit receiver
+        // (`expected.getter()`) reaches the param through the MEMBER name;
+        // that route needs the materialized value.
+        .Member => |m| std.mem.eql(u8, m.name.name, name) or
+            pocUses(exempt_call_head, m.receiver, name),
+        .Call => |c| blk: {
+            const head_is_param = exempt_call_head and c.callee.* == .Path and
+                c.callee.Path.segments.len == 1 and
+                std.mem.eql(u8, c.callee.Path.segments[0].name, name);
+            if (!head_is_param and pocUses(exempt_call_head, c.callee, name)) break :blk true;
+            for (c.args) |*a2| {
+                if (pocUses(exempt_call_head, a2, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .Index => |ix| blk: {
+            if (pocUses(exempt_call_head, ix.receiver, name)) break :blk true;
+            for (ix.args) |*a2| {
+                if (pocUses(exempt_call_head, a2, name)) break :blk true;
+            }
+            break :blk false;
+        },
+        .Binary => |bin| pocUses(exempt_call_head, bin.lhs, name) or pocUses(exempt_call_head, bin.rhs, name),
+        .Unary => |u| pocUses(exempt_call_head, u.expr, name),
+        .Postfix => |po| pocUses(exempt_call_head, po.expr, name),
+        .If => |i| pocUses(exempt_call_head, i.cond, name) or pocUses(exempt_call_head, i.then_branch, name) or
+            (if (i.else_branch) |eb| pocUses(exempt_call_head, eb, name) else false),
+        .While => |w| pocUses(exempt_call_head, w.cond, name) or pocUses(exempt_call_head, w.body, name),
+        .DoWhile => |dw| (if (dw.body) |bd| pocUses(exempt_call_head, bd, name) else false) or pocUses(exempt_call_head, dw.cond, name),
+        .For => |fo| pocUses(exempt_call_head, fo.iter, name) or pocUses(exempt_call_head, fo.body, name),
+        .Return => |r| if (r.value) |v| pocUses(exempt_call_head, v, name) else false,
+        .Labeled => |l| pocUses(exempt_call_head, l.expr, name),
+        .Block => |blk2| pocStmts(exempt_call_head, blk2.stmts, name),
+        .Throw => |t| pocUses(exempt_call_head, t.value, name),
+        .Try => |t| blk: {
+            if (pocStmts(exempt_call_head, t.body.stmts, name)) break :blk true;
+            for (t.catches) |*c2| {
+                if (pocStmts(exempt_call_head, c2.body.stmts, name)) break :blk true;
+            }
+            break :blk (if (t.finally) |fb| pocStmts(exempt_call_head, fb.stmts, name) else false);
+        },
+        .Lambda => |lam| blk: {
+            // A nested lambda param of the same name shadows — treat as a
+            // use rather than model shadowing.
+            for (lam.params) |lp| {
+                if (std.mem.eql(u8, lp.name, name)) break :blk true;
+            }
+            break :blk pocStmts(false, lam.body.stmts, name);
+        },
+        .When => |w| blk: {
+            if (w.subject) |sub| {
+                if (pocUses(exempt_call_head, sub, name)) break :blk true;
+            }
+            for (w.branches) |*br| {
+                if (pocUses(exempt_call_head, &br.body, name)) break :blk true;
+                for (br.patterns) |*pat| switch (pat.kind) {
+                    .Value, .InRange, .NotInRange => |*pe| if (pocUses(exempt_call_head, pe, name)) break :blk true,
+                    else => {},
+                };
+            }
+            break :blk false;
+        },
+        .IsCheck => |c| pocUses(exempt_call_head, c.expr, name),
+        .As => |a2| pocUses(exempt_call_head, a2.expr, name),
+        .Spread => |sp| pocUses(exempt_call_head, sp.expr, name),
+        else => true,
+    };
+}
+
 fn scanStmts(stmts: []const Stmt) bool {
     for (stmts) |*s| {
         const hit = switch (s.*) {
@@ -2344,6 +2462,23 @@ pub fn tryInlineCallWithTypeArgs(
         else
             false;
         const sib_prev = if (sib_push) b.pushExpected(b.sib_expected_ty) else null;
+        // A lambda-literal argument the body only ever CALLS is consumed
+        // by the splice's call-position expansion; materializing it here
+        // builds a dead closure (plus captures) per call. Skip the value
+        // entirely — the substitution map serves the call positions, and
+        // the use scan proved no value position exists.
+        const splice_consumed_lambda = a.* == .Lambda and !slot_is_default[i] and
+            p.ty.function != null and paramOnlyCalled(f, p.name.name);
+        if (splice_consumed_lambda) {
+            if (sib_push) b.restoreExpected(sib_prev);
+            b.pending_lambda_arity = -1;
+            b.pending_ref_lambda_param_types = null;
+            arg_regs[i] = try b.emitConst(Const.Unit);
+            try bound_param_names.append(b.allocator, p.name.name);
+            try lambda_map.put(p.name.name, a);
+            any_literal_lambda = true;
+            continue;
+        }
         const r = if (slot_is_default[i] and explicit_receiver != null) blk: {
             try b.pushScope();
             try b.bind("this", explicit_receiver.?);
