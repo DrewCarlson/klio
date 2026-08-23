@@ -126,19 +126,15 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     // should fail fast, not hold its class's child (and the pump's job tree)
     // for a minute per occurrence.
     //
-    // Two background-thread tests in `PausableCompositionTests` need more
-    // than this and so fail here: `markInvalidFromBackgroundThread` runs
-    // ~11,000 launches across 1000 recomposition passes (12s), and
-    // `resumeOnBackgroundThread` spins `while (running) { ...; yield() }`
-    // on `Dispatchers.Default` until another coroutine finishes, so its
-    // duration IS the yield round-trip cost (55s). Both PASS when run with
-    // a 90s cap. Raising it here is still the wrong trade: at 90s a slow
-    // test eats 90s of its class's 480s budget, and the measured result was
-    // 1336 passed with `SnapshotStateMapTests` and `SnapshotStateListTests`
-    // no longer completing, against 1345 and zero incomplete at 10s. The
-    // 55s yield cost is worth its own investigation; it is not a property
-    // of the test, and it is not paid for by a looser cap.
-    try map.put("kotlinx_coroutines_test_default_timeout", "10s");
+    // `resumeOnBackgroundThread` resumes 1000 pausable chunks one
+    // cross-thread round-trip at a time (~40-55s interpreted) and PASSES
+    // under upstream's own 60s default; a 10s override was the right
+    // trade when dozens of hanging tests each ate their timeout (measured
+    // then: 90s gave 1336 with two Snapshot classes not completing vs
+    // 1345 at 10s). That hang population is gone — the suite stands at
+    // 1385/5 with the failures enumerated — so the cap returns to the
+    // upstream default and only genuinely-stuck tests pay it.
+    try map.put("kotlinx_coroutines_test_default_timeout", "60s");
     // Per-test wall cap: a test that genuinely deadlocks (the Recomposer
     // deadlock-regression shape, the concurrent-mixing teardown stall) fails
     // in place instead of eating the class's whole 480s budget — its
