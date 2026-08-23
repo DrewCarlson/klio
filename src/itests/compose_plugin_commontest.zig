@@ -59,7 +59,12 @@ const runtime = @import("runtime");
 // locals as the nearest binding) and the dirty-bits skip calculus landed:
 // four consecutive runs at 1370-1372 with the GroupSize slot anchor green.
 // Same ~±30 margin below the observed floor.
-const BASELINE: usize = 1375;
+// RAISED 1375 -> 1377 after the call-throughput rounds (trivial-init
+// serve, scalar bitwise BinOps, persistent-collection host scans, the
+// host-served snapshot validity walk): three consecutive solo runs at
+// 1378/1380/1380 under the width-6 capped-children config. Margin below
+// the 1380 observations covers the ±3 band this config has shown.
+const BASELINE: usize = 1377;
 
 /// Ceiling on failing cases, the mirror of `BASELINE`. Measured solo at
 /// 1380 passed / 10 failed once companion extension properties resolved

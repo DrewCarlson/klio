@@ -36,6 +36,12 @@ const LOG_BRANCH = 5;
 var small_class_hit = std.atomic.Value(usize).init(0);
 var vec_class_hit = std.atomic.Value(usize).init(0);
 
+var fn_buffer = std.atomic.Value(?[*]const u8).init(null);
+var fn_size = std.atomic.Value(?[*]const u8).init(null);
+var fn_shift = std.atomic.Value(?[*]const u8).init(null);
+var fn_tail = std.atomic.Value(?[*]const u8).init(null);
+var fn_root = std.atomic.Value(?[*]const u8).init(null);
+
 fn classMatches(inst: ObjRef(InstanceData), hit: *std.atomic.Value(usize), fqn: []const u8) bool {
     const g = inst.borrow();
     defer g.deinit();
@@ -93,6 +99,91 @@ fn nodeEq(a: ArrayData, b: ArrayData, shift: u32, remaining: usize) ?bool {
     return true;
 }
 
+/// Ordered host scan of a vendored persistent vector for `element`,
+/// returning its first index, -1 when absent, or null when the receiver
+/// is another class or an element needs dispatched equality. Serves
+/// `contains`/`indexOf`, which otherwise walk the trie through a fully
+/// interpreted iterator with a dispatched equals per element.
+/// Whether `inst` is one of the vendored persistent-vector classes —
+/// the gate a flat-call preparer uses to stand aside so the host scan
+/// intercepts serve `contains`/`indexOf`.
+pub fn isVectorClass(inst: ObjRef(InstanceData)) bool {
+    if (classMatches(inst, &small_class_hit, SMALL_FQN)) return true;
+    return classMatches(inst, &vec_class_hit, VEC_FQN);
+}
+
+pub fn tryIndexOf(a: ObjRef(InstanceData), element: *const Value) ?i64 {
+    const hostable = switch (element.*) {
+        .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Bool, .Char, .String, .Null, .Unit => true,
+        else => false,
+    };
+    if (!hostable) return null;
+    const a_small = classMatches(a, &small_class_hit, SMALL_FQN);
+    const a_vec = !a_small and classMatches(a, &vec_class_hit, VEC_FQN);
+    if (!a_small and !a_vec) return null;
+    const ga = a.borrow();
+    defer ga.deinit();
+    if (a_small) {
+        const ba = ga.get().getCached(&fn_buffer, "buffer") orelse return null;
+        if (ba != .Array) return null;
+        const n = ba.Array.len();
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const e = ba.Array.get(i);
+            if (eqVal(&e, element) orelse return null) return @intCast(i);
+        }
+        return -1;
+    }
+    const sa = ga.get().getCached(&fn_size, "size") orelse return null;
+    if (sa != .Int) return null;
+    const size: usize = @intCast(sa.Int);
+    if (size == 0) return -1;
+    const sha = ga.get().getCached(&fn_shift, "rootShift") orelse return null;
+    if (sha != .Int or sha.Int < 0) return null;
+    const ta = ga.get().getCached(&fn_tail, "tail") orelse return null;
+    const ra = ga.get().getCached(&fn_root, "root") orelse return null;
+    if (ta != .Array or ra != .Array) return null;
+    const root_len: usize = (size - 1) & ~@as(usize, 31);
+    const found = nodeIndexOf(ra.Array, @intCast(sha.Int), root_len, 0, element) orelse return null;
+    if (found >= 0) return found;
+    const tail_len = size - root_len;
+    if (ta.Array.len() < tail_len) return null;
+    var i: usize = 0;
+    while (i < tail_len) : (i += 1) {
+        const e = ta.Array.get(i);
+        if (eqVal(&e, element) orelse return null) return @intCast(root_len + i);
+    }
+    return -1;
+}
+
+/// First index of `element` under a trie node covering `remaining`
+/// logical elements starting at absolute index `base`; -1 = absent,
+/// null = bail.
+fn nodeIndexOf(arr: ArrayData, shift: u32, remaining: usize, base: usize, element: *const Value) ?i64 {
+    if (remaining == 0) return -1;
+    if (shift == 0) {
+        if (arr.len() < remaining) return null;
+        var i: usize = 0;
+        while (i < remaining) : (i += 1) {
+            const e = arr.get(i);
+            if (eqVal(&e, element) orelse return null) return @intCast(base + i);
+        }
+        return -1;
+    }
+    const span = @as(usize, 1) << @intCast(shift);
+    const used = (remaining + span - 1) / span;
+    if (arr.len() < used) return null;
+    var i: usize = 0;
+    while (i < used) : (i += 1) {
+        const ca = arr.get(i);
+        if (ca != .Array) return null;
+        const rem = @min(span, remaining - i * span);
+        const r = nodeIndexOf(ca.Array, shift - LOG_BRANCH, rem, base + i * span, element) orelse return null;
+        if (r >= 0) return r;
+    }
+    return -1;
+}
+
 /// Answer `a.equals(b)` for two vendored persistent-vector instances,
 /// or null when either operand is another class or an element needs
 /// dispatched equality.
@@ -112,8 +203,8 @@ pub fn tryEquals(a: ObjRef(InstanceData), b: ObjRef(InstanceData)) ?bool {
     const gb = b.borrow();
     defer gb.deinit();
     if (a_small) {
-        const ba = ga.get().get("buffer") orelse return null;
-        const bb = gb.get().get("buffer") orelse return null;
+        const ba = ga.get().getCached(&fn_buffer, "buffer") orelse return null;
+        const bb = gb.get().getCached(&fn_buffer, "buffer") orelse return null;
         if (ba != .Array or bb != .Array) return null;
         if (sameArrayCell(ba.Array, bb.Array)) return true;
         const n = ba.Array.len();
@@ -126,19 +217,19 @@ pub fn tryEquals(a: ObjRef(InstanceData), b: ObjRef(InstanceData)) ?bool {
         }
         return true;
     }
-    const sa = ga.get().get("size") orelse return null;
-    const sb = gb.get().get("size") orelse return null;
+    const sa = ga.get().getCached(&fn_size, "size") orelse return null;
+    const sb = gb.get().getCached(&fn_size, "size") orelse return null;
     if (sa != .Int or sb != .Int) return null;
     if (sa.Int != sb.Int) return false;
-    const sha = ga.get().get("rootShift") orelse return null;
-    const shb = gb.get().get("rootShift") orelse return null;
+    const sha = ga.get().getCached(&fn_shift, "rootShift") orelse return null;
+    const shb = gb.get().getCached(&fn_shift, "rootShift") orelse return null;
     if (sha != .Int or shb != .Int) return null;
     // Equal sizes fix the trie height; a mismatch here is malformed.
     if (sha.Int != shb.Int or sha.Int < 0) return null;
-    const ta = ga.get().get("tail") orelse return null;
-    const tb = gb.get().get("tail") orelse return null;
-    const ra = ga.get().get("root") orelse return null;
-    const rb = gb.get().get("root") orelse return null;
+    const ta = ga.get().getCached(&fn_tail, "tail") orelse return null;
+    const tb = gb.get().getCached(&fn_tail, "tail") orelse return null;
+    const ra = ga.get().getCached(&fn_root, "root") orelse return null;
+    const rb = gb.get().getCached(&fn_root, "root") orelse return null;
     if (ta != .Array or tb != .Array or ra != .Array or rb != .Array) return null;
     const size: usize = @intCast(sa.Int);
     if (size == 0) return null;
