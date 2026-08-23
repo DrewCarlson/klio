@@ -40,6 +40,12 @@ const MAX_SHIFT = 30;
 var map_class_hit = std.atomic.Value(usize).init(0);
 var node_class_hit = std.atomic.Value(usize).init(0);
 
+var fn_datamap = std.atomic.Value(?[*]const u8).init(null);
+var fn_nodemap = std.atomic.Value(?[*]const u8).init(null);
+var fn_buffer = std.atomic.Value(?[*]const u8).init(null);
+var fn_size = std.atomic.Value(?[*]const u8).init(null);
+var fn_node = std.atomic.Value(?[*]const u8).init(null);
+
 fn classMatches(inst: ObjRef(InstanceData), hit: *std.atomic.Value(usize), fqn: []const u8) bool {
     const g = inst.borrow();
     defer g.deinit();
@@ -75,13 +81,13 @@ fn nodeEq(a: ObjRef(InstanceData), b: ObjRef(InstanceData), shift: u32) ?bool {
     defer ga.deinit();
     const gb = b.borrow();
     defer gb.deinit();
-    const da = ga.get().get("dataMap") orelse return null;
-    const db = gb.get().get("dataMap") orelse return null;
-    const na = ga.get().get("nodeMap") orelse return null;
-    const nb = gb.get().get("nodeMap") orelse return null;
+    const da = ga.get().getCached(&fn_datamap, "dataMap") orelse return null;
+    const db = gb.get().getCached(&fn_datamap, "dataMap") orelse return null;
+    const na = ga.get().getCached(&fn_nodemap, "nodeMap") orelse return null;
+    const nb = gb.get().getCached(&fn_nodemap, "nodeMap") orelse return null;
     if (da != .Int or db != .Int or na != .Int or nb != .Int) return null;
-    const ba = ga.get().get("buffer") orelse return null;
-    const bb = gb.get().get("buffer") orelse return null;
+    const ba = ga.get().getCached(&fn_buffer, "buffer") orelse return null;
+    const bb = gb.get().getCached(&fn_buffer, "buffer") orelse return null;
     if (ba != .Array or bb != .Array) return null;
     const abuf = ba.Array;
     const bbuf = bb.Array;
@@ -139,12 +145,12 @@ pub fn tryEquals(a: ObjRef(InstanceData), b: ObjRef(InstanceData)) ?bool {
     defer ga.deinit();
     const gb = b.borrow();
     defer gb.deinit();
-    const sa = ga.get().get("size") orelse return null;
-    const sb = gb.get().get("size") orelse return null;
+    const sa = ga.get().getCached(&fn_size, "size") orelse return null;
+    const sb = gb.get().getCached(&fn_size, "size") orelse return null;
     if (sa != .Int or sb != .Int) return null;
     if (sa.Int != sb.Int) return false;
-    const na = ga.get().get("node") orelse return null;
-    const nb = gb.get().get("node") orelse return null;
+    const na = ga.get().getCached(&fn_node, "node") orelse return null;
+    const nb = gb.get().getCached(&fn_node, "node") orelse return null;
     if (na != .Instance or nb != .Instance) return null;
     return nodeEq(na.Instance, nb.Instance, 0);
 }

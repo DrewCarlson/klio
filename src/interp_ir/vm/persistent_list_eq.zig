@@ -36,6 +36,12 @@ const LOG_BRANCH = 5;
 var small_class_hit = std.atomic.Value(usize).init(0);
 var vec_class_hit = std.atomic.Value(usize).init(0);
 
+var fn_buffer = std.atomic.Value(?[*]const u8).init(null);
+var fn_size = std.atomic.Value(?[*]const u8).init(null);
+var fn_shift = std.atomic.Value(?[*]const u8).init(null);
+var fn_tail = std.atomic.Value(?[*]const u8).init(null);
+var fn_root = std.atomic.Value(?[*]const u8).init(null);
+
 fn classMatches(inst: ObjRef(InstanceData), hit: *std.atomic.Value(usize), fqn: []const u8) bool {
     const g = inst.borrow();
     defer g.deinit();
@@ -118,7 +124,7 @@ pub fn tryIndexOf(a: ObjRef(InstanceData), element: *const Value) ?i64 {
     const ga = a.borrow();
     defer ga.deinit();
     if (a_small) {
-        const ba = ga.get().get("buffer") orelse return null;
+        const ba = ga.get().getCached(&fn_buffer, "buffer") orelse return null;
         if (ba != .Array) return null;
         const n = ba.Array.len();
         var i: usize = 0;
@@ -128,14 +134,14 @@ pub fn tryIndexOf(a: ObjRef(InstanceData), element: *const Value) ?i64 {
         }
         return -1;
     }
-    const sa = ga.get().get("size") orelse return null;
+    const sa = ga.get().getCached(&fn_size, "size") orelse return null;
     if (sa != .Int) return null;
     const size: usize = @intCast(sa.Int);
     if (size == 0) return -1;
-    const sha = ga.get().get("rootShift") orelse return null;
+    const sha = ga.get().getCached(&fn_shift, "rootShift") orelse return null;
     if (sha != .Int or sha.Int < 0) return null;
-    const ta = ga.get().get("tail") orelse return null;
-    const ra = ga.get().get("root") orelse return null;
+    const ta = ga.get().getCached(&fn_tail, "tail") orelse return null;
+    const ra = ga.get().getCached(&fn_root, "root") orelse return null;
     if (ta != .Array or ra != .Array) return null;
     const root_len: usize = (size - 1) & ~@as(usize, 31);
     const found = nodeIndexOf(ra.Array, @intCast(sha.Int), root_len, 0, element) orelse return null;
@@ -197,8 +203,8 @@ pub fn tryEquals(a: ObjRef(InstanceData), b: ObjRef(InstanceData)) ?bool {
     const gb = b.borrow();
     defer gb.deinit();
     if (a_small) {
-        const ba = ga.get().get("buffer") orelse return null;
-        const bb = gb.get().get("buffer") orelse return null;
+        const ba = ga.get().getCached(&fn_buffer, "buffer") orelse return null;
+        const bb = gb.get().getCached(&fn_buffer, "buffer") orelse return null;
         if (ba != .Array or bb != .Array) return null;
         if (sameArrayCell(ba.Array, bb.Array)) return true;
         const n = ba.Array.len();
@@ -211,19 +217,19 @@ pub fn tryEquals(a: ObjRef(InstanceData), b: ObjRef(InstanceData)) ?bool {
         }
         return true;
     }
-    const sa = ga.get().get("size") orelse return null;
-    const sb = gb.get().get("size") orelse return null;
+    const sa = ga.get().getCached(&fn_size, "size") orelse return null;
+    const sb = gb.get().getCached(&fn_size, "size") orelse return null;
     if (sa != .Int or sb != .Int) return null;
     if (sa.Int != sb.Int) return false;
-    const sha = ga.get().get("rootShift") orelse return null;
-    const shb = gb.get().get("rootShift") orelse return null;
+    const sha = ga.get().getCached(&fn_shift, "rootShift") orelse return null;
+    const shb = gb.get().getCached(&fn_shift, "rootShift") orelse return null;
     if (sha != .Int or shb != .Int) return null;
     // Equal sizes fix the trie height; a mismatch here is malformed.
     if (sha.Int != shb.Int or sha.Int < 0) return null;
-    const ta = ga.get().get("tail") orelse return null;
-    const tb = gb.get().get("tail") orelse return null;
-    const ra = ga.get().get("root") orelse return null;
-    const rb = gb.get().get("root") orelse return null;
+    const ta = ga.get().getCached(&fn_tail, "tail") orelse return null;
+    const tb = gb.get().getCached(&fn_tail, "tail") orelse return null;
+    const ra = ga.get().getCached(&fn_root, "root") orelse return null;
+    const rb = gb.get().getCached(&fn_root, "root") orelse return null;
     if (ta != .Array or tb != .Array or ra != .Array or rb != .Array) return null;
     const size: usize = @intCast(sa.Int);
     if (size == 0) return null;
