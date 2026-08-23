@@ -233,21 +233,33 @@ Work items:
 
 ---
 
-## Gate-red round (2026-08-24, in progress)
+## Gate-red round (2026-08-24, CLOSED — GATE GREEN)
 
-The first full `scripts/gate.sh` of the campaign flagged two suites the
-targeted batteries never ran:
-- `itest-e2e`: delegated_member_named_args — ROOT FIXED (1932fb08): the
-  virtual-slot path derives folded named args from arg_params, but the
-  interface-delegate arm ran BEFORE that reconstruction and forwarded
-  positionally (regression from the delegation-defaults commit
-  d62d97d4, bisected). noncallable_capture_member_fallback — identity
-  hash shifted one allocation with the channel cutover; re-pinned.
-  REMAINING: a jit=true-labelled serialization/datetime family
-  (unresolved global `serializer`/`TimeZone`) that reproduces only in
-  the itest-prepared scratch home; green at aedd737b, bisect running.
-- `itest-ktor_server`: one failing test, detail pending the e2e bisect
-  (avoids concurrent builds).
+The first full `scripts/gate.sh` of the campaign flagged suites the
+targeted batteries never ran (e2e at 16 fails, ktor_server red). Five
+roots, all landed; final gate.sh GREEN:
+- 1932fb08: the virtual-slot interface-delegate arm forwarded before
+  the arg_params->names reconstruction — delegated named args bound
+  positionally (bisected to the delegation-defaults commit).
+- c73ce5f9: the parity/e2e in-process runner never grew the
+  serialization/datetime packs or their host bindings — every
+  census-era example importing them failed since being pinned (the
+  bisect "first bad" was where each example APPEARED, twice over —
+  appearance-not-regression trap). Lenient-warn memo made per-run;
+  typed_format pin de-warninged (stderr never reaches the capture).
+- 61bdf9c7: the inference-opened reified-extension splice never asked
+  whether the receiver's static type serves the call — kotlinc
+  resolves members first; pipelineCall.respond(message, typeInfo)
+  spliced respond(status, message) and every ktor server response died
+  on a status dispatch miss (itest-ktor_server red).
+- 0e13c1e5: Virtual-mode pumps starved parked timers under a busy
+  yield loop (launch queue hot every round; advance never ran) —
+  timeout_over_a_yield_loop livelocked to the harness wall cap. Rule
+  landed: virtual time never runs slower than real time.
+- 071d1ca0: a NESTED Vm join (mid-run image-extend bake) raised the
+  process-global boundary abandon, drained the shared pool, and swept
+  run-scoped registries the outer run still owned (latent; found en
+  route). Scoped to the outermost join via a live-run counter.
 
 ## Running log
 
