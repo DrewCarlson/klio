@@ -22,6 +22,7 @@ const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 const trace = @import("trace.zig");
 const persistent_map_eq = @import("persistent_map_eq.zig");
+const persistent_list_eq = @import("persistent_list_eq.zig");
 const overload_match = @import("overload_match.zig");
 const host_call_func = @import("host_call_func.zig");
 const host_call_value = @import("host_call_value.zig");
@@ -4132,6 +4133,9 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         std.mem.eql(u8, name, "equals"))
     {
         if (persistent_map_eq.tryEquals(receiver.Instance, args[0].Instance)) |eq| {
+            return .{ .ok = .{ .Bool = eq } };
+        }
+        if (persistent_list_eq.tryEquals(receiver.Instance, args[0].Instance)) |eq| {
             return .{ .ok = .{ .Bool = eq } };
         }
     }

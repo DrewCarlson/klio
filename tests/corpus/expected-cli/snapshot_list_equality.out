@@ -1,0 +1,9 @@
+small=true
+smallDiff=false
+smallShort=false
+wide=true
+wideTailDiff=false
+wideHeadDiff=false
+nulls=true
+customEqualsSame=true
+customEqualsDiff=false
