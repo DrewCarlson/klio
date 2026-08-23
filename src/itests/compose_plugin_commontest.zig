@@ -64,7 +64,10 @@ const runtime = @import("runtime");
 // host-served snapshot validity walk): three consecutive solo runs at
 // 1378/1380/1380 under the width-6 capped-children config. Margin below
 // the 1380 observations covers the ±3 band this config has shown.
-const BASELINE: usize = 1377;
+// RAISED 1377 -> 1381 after the literal-lambda splice landed by default
+// (with the builder bulk-op serves and the dead-closure skip): gate runs
+// at 1383 and 1385 passed; margin below both covers the ±3 band.
+const BASELINE: usize = 1381;
 
 /// Ceiling on failing cases, the mirror of `BASELINE`. Measured solo at
 /// 1380 passed / 10 failed once companion extension properties resolved
