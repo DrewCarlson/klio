@@ -21,6 +21,7 @@ const host_globals = @import("host_globals.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 const trace = @import("trace.zig");
+const persistent_map_eq = @import("persistent_map_eq.zig");
 const overload_match = @import("overload_match.zig");
 const host_call_func = @import("host_call_func.zig");
 const host_call_value = @import("host_call_value.zig");
@@ -4124,6 +4125,16 @@ pub fn replayHits() u64 {
 }
 
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
+    // Vendored persistent-map equality: answered host-side with trie
+    // node-identity pruning (see persistent_map_eq.zig). Bails (null) for
+    // any operand or element the host does not own equality for.
+    if (args.len == 1 and receiver.* == .Instance and args[0] == .Instance and
+        std.mem.eql(u8, name, "equals"))
+    {
+        if (persistent_map_eq.tryEquals(receiver.Instance, args[0].Instance)) |eq| {
+            return .{ .ok = .{ .Bool = eq } };
+        }
+    }
 
     if (receiver.* != .Instance and !strict_ext and !no_ext and static_recv == null and declared_recv == null) {
         if (try builtinIntrinsicReplay(self, allocator, receiver, name, args)) |r| {
