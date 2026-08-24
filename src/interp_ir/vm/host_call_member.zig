@@ -14396,8 +14396,18 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
     return .{ .err = try typeErr(allocator, "super.{s}: no matching method up the supertype chain from `{s}`", .{ name, owner_class }) };
 }
 
+var qt_trace_init: bool = false;
+var qt_trace_val: ?[]const u8 = null;
+fn qtTraceWant() ?[]const u8 {
+    if (!qt_trace_init) {
+        qt_trace_val = if (std.c.getenv("KLIO_QT_TRACE")) |w| std.mem.span(w) else null;
+        qt_trace_init = true;
+    }
+    return qt_trace_val;
+}
+
 pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value, qualifier: []const u8) Allocator.Error!EvalResult {
-    const qt_trace = if (std.c.getenv("KLIO_QT_TRACE")) |w0| std.mem.indexOf(u8, qualifier, std.mem.span(w0)) != null else false;
+    const qt_trace = if (qtTraceWant()) |w0| std.mem.indexOf(u8, qualifier, w0) != null else false;
     if (std.mem.indexOfScalar(u8, qualifier, '.') != null) {
         var walk: ?Value = receiver.*;
         var steps: usize = 0;

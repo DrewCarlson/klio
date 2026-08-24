@@ -495,6 +495,16 @@ pub fn prepareValueRecvCtxFlatCall(self: *VmHost, allocator: Allocator, callee: 
     return prepareClosureFlatCall(self, allocator, callee, args);
 }
 
+var rsel_trace_init: bool = false;
+var rsel_trace_on: bool = false;
+fn rselTraceOn() bool {
+    if (!rsel_trace_init) {
+        rsel_trace_on = std.c.getenv("KLIO_RSEL_TRACE") != null;
+        rsel_trace_init = true;
+    }
+    return rsel_trace_on;
+}
+
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
     // A captured-and-written local is BOXED into a shared cell at its binding
     // site, so a function-typed one arrives here as the cell, not the closure.
@@ -1813,7 +1823,7 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                     if (try host_call_member.implicitReceiverForHead(self, allocator, this_value_in, head)) |matched| {
                         selected_this = matched;
                     }
-                    if (std.c.getenv("KLIO_RSEL_TRACE") != null) {
+                    if (rselTraceOn()) {
                         std.debug.print("[rsel] head={s} passed={s} selected={s}\n", .{ head, this_value_in.typeFqn(), selected_this.typeFqn() });
                     }
                 }

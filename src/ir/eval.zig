@@ -2041,6 +2041,38 @@ fn cvTraceOn() bool {
     return b;
 }
 var lr_trace_cached: ?bool = null;
+var gf_trace_init: bool = false;
+var gf_trace_val: ?[]const u8 = null;
+/// `KLIO_GF_TRACE` — cached once: the raw getenv is a full environ scan
+/// and this gate sits on EVERY GetField execution.
+fn gfTraceWant() ?[]const u8 {
+    if (!gf_trace_init) {
+        gf_trace_val = if (std.c.getenv("KLIO_GF_TRACE")) |w| std.mem.span(w) else null;
+        gf_trace_init = true;
+    }
+    return gf_trace_val;
+}
+
+var cm_trace_init: bool = false;
+var cm_trace_val: ?[]const u8 = null;
+fn cmTraceWant() ?[]const u8 {
+    if (!cm_trace_init) {
+        cm_trace_val = if (std.c.getenv("KLIO_CM_TRACE")) |w| std.mem.span(w) else null;
+        cm_trace_init = true;
+    }
+    return cm_trace_val;
+}
+
+var chain_trace_init: bool = false;
+var chain_trace_on: bool = false;
+fn chainTraceOn() bool {
+    if (!chain_trace_init) {
+        chain_trace_on = std.c.getenv("KLIO_CHAIN_TRACE") != null;
+        chain_trace_init = true;
+    }
+    return chain_trace_on;
+}
+
 fn lrTraceOn() bool {
     if (lr_trace_cached) |b| return b;
     const b = runtime.envOnce("KLIO_LR_TRACE") != null;
@@ -2868,7 +2900,7 @@ pub const Frame = struct {
     /// member-extension owner). `access` entries are dispatch-transient and
     /// never cross the frame boundary.
     fn activateChain(self: *Frame, seed: []const EnclosingEntry) Allocator.Error!void {
-        if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
+        if (chainTraceOn()) {
             std.debug.print("[chain] enter tid={d} tls={*} frame={*} caller={*} base={d} fn={s}\n", .{
                 std.Thread.getCurrentId(), self.tls, self, self.tls.active_chain, self.tls.active_chain_base, self.func.name,
             });
@@ -2905,7 +2937,7 @@ pub const Frame = struct {
     }
 
     fn activateAs(self: *Frame) void {
-        if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
+        if (chainTraceOn()) {
             std.debug.print("[chain] act tid={d} tls={*} frame={*} list={*} prev={*} base={d} fn={s}\n", .{
                 std.Thread.getCurrentId(), self.tls, self, &self.enclosing_this, self.tls.active_chain, self.tls.active_chain_base, self.func.name,
             });
@@ -2917,7 +2949,7 @@ pub const Frame = struct {
     }
 
     fn deactivateChain(self: *Frame) void {
-        if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
+        if (chainTraceOn()) {
             std.debug.print("[chain] deact tid={d} tls={*} frame={*} restore={*} fn={s}\n", .{
                 std.Thread.getCurrentId(), self.tls, self, self.prev_chain, self.func.name,
             });
@@ -7513,9 +7545,9 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         },
         .GetField => |*gf| {
             const gf_step = try execArmGetField(H, allocator, frame, gf, host);
-            if (std.c.getenv("KLIO_GF_TRACE")) |w0| {
+            if (gfTraceWant()) |w0| {
                 if (constStr(frame.module, gf.field)) |fname| {
-                    if (std.mem.indexOf(u8, fname, std.mem.span(w0)) != null and gf_step == .cont) {
+                    if (std.mem.indexOf(u8, fname, w0) != null and gf_step == .cont) {
                         const rv = frame.read(gf.dst);
                         const rn: []const u8 = if (rv == .Instance) blk: {
                             const g = rv.Instance.borrow();
@@ -8097,9 +8129,9 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Frame, gf: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(gf.receiver);
-    if (std.c.getenv("KLIO_GF_TRACE")) |w0| {
+    if (gfTraceWant()) |w0| {
         if (constStr(frame.module, gf.field)) |fname| {
-            if (std.mem.indexOf(u8, fname, std.mem.span(w0)) != null) {
+            if (std.mem.indexOf(u8, fname, w0) != null) {
                 const rn: []const u8 = if (recv == .Instance) blk: {
                     const g = recv.Instance.borrow();
                     const cg = g.get().class.borrow();
@@ -8386,8 +8418,8 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Frame, cm: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(cm.receiver);
-    if (std.c.getenv("KLIO_CM_TRACE")) |w0| {
-        const want = std.mem.span(w0);
+    if (cmTraceWant()) |w0| {
+        const want = w0;
         if (constStr(frame.module, cm.name)) |nm| {
             if (std.mem.eql(u8, nm, want)) {
                 const chain = evtls.active_chain;
