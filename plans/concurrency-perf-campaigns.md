@@ -502,6 +502,13 @@ mis-attribution hid it: the scans were inlined into unknown-libc.
   x10 = ~3000 recomposes x 200 Texts. Needs order-of-magnitude call
   throughput (the pinned campaign), not a fairness fix.
 
+- 1288874b: bc_memo gen-stamped (v54) — the memo dangled into
+  FuncStreams freed by `resetCacheForTest` at in-process program
+  boundaries (parity_object_init "invalid enum value" crash). Rule: a
+  per-Func pointer memo into a resettable cache must carry that cache's
+  generation. gate.sh GREEN (litmus 126s, sweep 164s); gate 419s
+  true-warm, 1388/2.
+
 ## Call-throughput round 3 (2026-08-24)
 
 - 956600b5 LANDED: host-served snapshot validity walk (readable/valid
