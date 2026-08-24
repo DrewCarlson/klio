@@ -1244,6 +1244,12 @@ pub const Func = struct {
     /// before the program runs, so the first resolution is final;
     /// benign-race fill.
     leaf_route: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// The frameless leaf serve hit a STRUCTURALLY unsupported
+    /// instruction in this body: every future serve would abandon at the
+    /// same instruction, so the attempt (which may execute half the body
+    /// before abandoning, doubling the call's work) is skipped outright.
+    /// Value-dependent abandons never set this. Benign-race fill.
+    leaf_hopeless: u8 = 0,
     /// True when `params[0]` is a *synthesized* `this` receiver — an
     /// instance method's / extension's / local-extension's dispatch
     /// receiver, a constructor's or init thunk's instance under

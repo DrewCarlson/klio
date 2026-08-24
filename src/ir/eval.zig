@@ -3258,6 +3258,7 @@ fn leafExprServeAt(
         if (trace) std.debug.print("[leaf] {s}: not a leaf body\n", .{func.name});
         return null;
     }
+    if (func.leaf_hopeless != 0) return null;
     if (args.len != func.params.len) {
         if (trace) std.debug.print("[leaf] {s}: arity {d} vs {d}\n", .{ func.name, args.len, func.params.len });
         return null;
@@ -3308,7 +3309,14 @@ fn leafExprServeAt(
     // shape this exists for — reaches no safe point and pays nothing.
     var pin: ?usize = null;
     defer if (pin) |m| runtime.keepaliveRestore(m);
-    const out = leafWalk(H, allocator, module, func, eff_args, host, depth, regs, reclaim, trace, &pin, &wmask) catch |e| switch (e) {
+    const fs: ?*const bc.FuncStreams = if (bc.enabled())
+        bc.funcStreams(func, !jit_loop.enabled(), module.consts.items)
+    else
+        null;
+    const out = (if (fs) |f|
+        leafWalkStream(H, allocator, module, func, eff_args, host, depth, regs, reclaim, trace, &pin, &wmask, f)
+    else
+        leafWalk(H, allocator, module, func, eff_args, host, depth, regs, reclaim, trace, &pin, &wmask)) catch |e| switch (e) {
         error.LeafAbandon => return null,
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -3316,6 +3324,133 @@ fn leafExprServeAt(
     // reference to the result, exactly as a returning frame would hand over.
     out.retain();
     return EvalResult{ .ok = out };
+}
+
+
+/// The leaf walk over the function's DENSE bytecode stream: the same op
+/// set the framed flat loop runs, over the leaf bank. The Inst-union
+/// re-walk this replaces was the single largest cost of call-dense
+/// interpreted code (~35% of a 3M-call benchmark); simple ops decode from
+/// packed u32s here, and only the complex ops (`escape`) touch the union,
+/// through the same `leafRunOne` the fallback walker uses. Any structure
+/// the stream cannot express abandons to the framed path exactly as the
+/// union walker would.
+fn leafWalkStream(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    func: *const Func,
+    args: []const Value,
+    host: *H,
+    depth: u8,
+    regs: []Value,
+    reclaim: bool,
+    trace: bool,
+    pin: *?usize,
+    wmask: *u64,
+    fs: *const bc.FuncStreams,
+) (Allocator.Error || LeafAbandon)!Value {
+    var block: usize = 0;
+    var steps: usize = 0;
+    outer: while (true) {
+        if (block >= func.blocks.len) return error.LeafAbandon;
+        const st = (if (block < fs.streams.len) fs.streams[block] else null) orelse return error.LeafAbandon;
+        const code = st.code;
+        var pc: usize = 0;
+        while (pc < code.len) {
+            steps += 1;
+            if (steps > ir.LEAF_MAX_STEPS) return error.LeafAbandon;
+            const op: bc.Op = @enumFromInt(code[pc]);
+            switch (op) {
+                .trace => pc += 4,
+                .const_int => {
+                    if (!leafWrite(allocator, regs, @enumFromInt(code[pc + 1]), .{ .Int = @bitCast(code[pc + 2]) }, reclaim, false, wmask)) return error.LeafAbandon;
+                    pc += 3;
+                },
+                .const_load => {
+                    const cid = code[pc + 2];
+                    if (cid >= module.consts.items.len) return error.LeafAbandon;
+                    if (module.consts.items[cid] == .String) leafPin(pin, regs, wmask);
+                    const v = try constToValue(allocator, &module.consts.items[cid]);
+                    if (!leafWrite(allocator, regs, @enumFromInt(code[pc + 1]), v, reclaim, false, wmask)) return error.LeafAbandon;
+                    pc += 3;
+                },
+                .move => {
+                    const v = leafRead(regs, wmask.*, @enumFromInt(code[pc + 2])) orelse return error.LeafAbandon;
+                    if (!leafWrite(allocator, regs, @enumFromInt(code[pc + 1]), v, reclaim, true, wmask)) return error.LeafAbandon;
+                    pc += 3;
+                },
+                .load_param => {
+                    const pi = code[pc + 2];
+                    if (pi >= args.len) return error.LeafAbandon;
+                    if (!leafWrite(allocator, regs, @enumFromInt(code[pc + 1]), args[pi], reclaim, true, wmask)) return error.LeafAbandon;
+                    pc += 3;
+                },
+                .cell_get => return error.LeafAbandon,
+                .bin => {
+                    const kind: ir.BinOp = @enumFromInt(code[pc + 2]);
+                    const l = leafRead(regs, wmask.*, @enumFromInt(code[pc + 4])) orelse return error.LeafAbandon;
+                    const r = leafRead(regs, wmask.*, @enumFromInt(code[pc + 5])) orelse return error.LeafAbandon;
+                    if (scalarBin(kind, l, r)) |v| {
+                        if (!leafWrite(allocator, regs, @enumFromInt(code[pc + 3]), v, reclaim, false, wmask)) return error.LeafAbandon;
+                    } else {
+                        if (!leafPrimitive(&l) or !leafPrimitive(&r)) return error.LeafAbandon;
+                        const res = try applyBinop(allocator, kind, &l, &r);
+                        if (res != .ok) return error.LeafAbandon;
+                        if (!leafWrite(allocator, regs, @enumFromInt(code[pc + 3]), res.ok, reclaim, false, wmask)) return error.LeafAbandon;
+                    }
+                    pc += 6;
+                },
+                .escape => {
+                    const inst_idx = code[pc + 1];
+                    const b = &func.blocks[block];
+                    if (inst_idx >= b.insts.len) return error.LeafAbandon;
+                    try leafRunOne(H, allocator, module, func, args, host, depth, &b.insts[inst_idx], regs, reclaim, trace, pin, wmask);
+                    pc += 2;
+                },
+                .jump => {
+                    block = code[pc + 1];
+                    continue :outer;
+                },
+                .br => {
+                    const c = leafRead(regs, wmask.*, @enumFromInt(code[pc + 1])) orelse return error.LeafAbandon;
+                    if (c != .Bool) return error.LeafAbandon;
+                    block = if (c.Bool) code[pc + 2] else code[pc + 3];
+                    continue :outer;
+                },
+                .ret => {
+                    if (code[pc + 1] == 0) return .Unit;
+                    return leafRead(regs, wmask.*, @enumFromInt(code[pc + 2])) orelse error.LeafAbandon;
+                },
+                .term_exit => break,
+                .cmp_br => {
+                    const kind: ir.BinOp = @enumFromInt(code[pc + 2]);
+                    const l = leafRead(regs, wmask.*, @enumFromInt(code[pc + 4])) orelse return error.LeafAbandon;
+                    const r = leafRead(regs, wmask.*, @enumFromInt(code[pc + 5])) orelse return error.LeafAbandon;
+                    const v = scalarBin(kind, l, r) orelse return error.LeafAbandon;
+                    if (!leafWrite(allocator, regs, @enumFromInt(code[pc + 3]), v, reclaim, false, wmask)) return error.LeafAbandon;
+                    if (v != .Bool) return error.LeafAbandon;
+                    block = if (v.Bool) code[pc + 6] else code[pc + 7];
+                    continue :outer;
+                },
+            }
+        }
+        // Off the stream's end (or `term_exit`): the block's REAL
+        // terminator decides, exactly as the union walker's loop does.
+        switch (func.blocks[block].terminator) {
+            .Return => |r| {
+                const rr = r orelse return .Unit;
+                return leafRead(regs, wmask.*, rr) orelse return error.LeafAbandon;
+            },
+            .Goto => |g| block = g.int(),
+            .Branch => |br| {
+                const c = leafRead(regs, wmask.*, br.cond) orelse return error.LeafAbandon;
+                if (c != .Bool) return error.LeafAbandon;
+                block = if (c.Bool) br.t.int() else br.f.int();
+            },
+            else => return error.LeafAbandon,
+        }
+    }
 }
 
 /// Walk the body's blocks until one returns. `Goto`/`Branch` are followed;
@@ -3381,6 +3516,29 @@ fn leafRunInsts(
     wmask: *u64,
 ) (Allocator.Error || LeafAbandon)!void {
     for (b.insts) |*inst| {
+        try leafRunOne(H, allocator, module, func, args, host, depth, inst, regs, reclaim, trace, pin, wmask);
+    }
+}
+
+/// One leaf-body instruction — shared by the Inst-union walker above and
+/// the dense-stream walker (`leafWalkStream`), whose `escape` ops land
+/// here.
+fn leafRunOne(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    func: *const Func,
+    args: []const Value,
+    host: *H,
+    depth: u8,
+    inst: *const Inst,
+    regs: []Value,
+    reclaim: bool,
+    trace: bool,
+    pin: *?usize,
+    wmask: *u64,
+) (Allocator.Error || LeafAbandon)!void {
+    {
         switch (inst.*) {
             .Trace => {},
             .LoadParam => |lp| {
@@ -3407,7 +3565,7 @@ fn leafRunInsts(
                 const r = leafRead(regs, wmask.*, bo.rhs) orelse return error.LeafAbandon;
                 if (scalarBin(bo.op, l, r)) |v| {
                     if (!leafWrite(allocator, regs, bo.dst, v, reclaim, false, wmask)) return error.LeafAbandon;
-                    continue;
+                    return;
                 }
                 if (!leafPrimitive(&l) or !leafPrimitive(&r)) return error.LeafAbandon;
                 const res = try applyBinop(allocator, bo.op, &l, &r);
@@ -3423,7 +3581,7 @@ fn leafRunInsts(
                 };
                 if (builtinFieldFast(&recv, fname)) |bv| {
                     if (!leafWrite(allocator, regs, gf.dst, bv, reclaim, false, wmask)) return error.LeafAbandon;
-                    continue;
+                    return;
                 }
                 if (recv != .Instance) {
                     if (trace) std.debug.print("[leaf] {s}: field receiver is {s}\n", .{ func.name, @tagName(recv) });
@@ -3518,6 +3676,9 @@ fn leafRunInsts(
             },
             else => |other| {
                 if (trace) std.debug.print("[leaf] {s}: unsupported {s}\n", .{ func.name, @tagName(other) });
+                // Structural: this instruction can never serve, so no
+                // future attempt on this body can succeed.
+                @constCast(func).leaf_hopeless = 1;
                 return error.LeafAbandon;
             },
         }
