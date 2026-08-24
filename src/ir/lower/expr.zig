@@ -8067,6 +8067,16 @@ fn narrowingRecvChain(b: *FuncBuilder) Allocator.Error!?[]const []const u8 {
 fn inlineBodyRecvHead(b: *const FuncBuilder) ?[]const u8 {
     if (b.lambda_splice_resolve == null) {
         if (b.spliceRecvTy()) |receiver| return receiver;
+    } else if (inline_call.rfsEnabled() and b.splice_recv_from_window) {
+        // A spliced receiver LAMBDA's window carries its subject's head
+        // (`polymorphic { subclass(ints) }` lowers under
+        // PolymorphicModuleBuilder, not the outer serializers-module
+        // builder): without it the reified `subclass` splice declined on
+        // recv_mismatch and fell to a dynamic call that cannot carry `T`.
+        // Only the WINDOW-set head qualifies — a stale enclosing-EXT
+        // receiver keeps the hygiene contract (the test pinning
+        // MeasurePolicy over List).
+        if (b.spliceRecvTy()) |receiver| return receiver;
     }
     return b.recvTy() orelse b.ownerClass();
 }

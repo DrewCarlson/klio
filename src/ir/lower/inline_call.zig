@@ -704,7 +704,7 @@ fn scanCatches(catches: []const ast.Catch) bool {
 /// are opt-in (KLIO_RFS=1) until spliced windows carry a runtime receiver
 /// tower; see the round record in plans/concurrency-perf-campaigns.md.
 pub fn rfsEnabled() bool {
-    return std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_RFS") orelse "0", "1");
+    return !std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_RFS") orelse "1", "0");
 }
 
 pub fn spliceInlineLambda(
@@ -1028,13 +1028,17 @@ pub fn spliceInlineLambdaOn(
         if (recv_head == null and rfsEnabled()) recv_head = b.spliceRecvTy();
     }
     const lam_prev_splice_recv = b.spliceRecvTy();
+    const lam_prev_recv_from_window = b.splice_recv_from_window;
     if (receiver != null) {
         // Receiver lambda (`apply { minusAssign(key) }`): the innermost
         // implicit receiver inside the body is the lambda's SUBJECT, so
         // bare calls hint its head — never the enclosing fn's receiver,
         // which would refute candidates the subject satisfies.
         b.setSpliceHint(true, recv_head);
-        if (rfsEnabled()) b.setSpliceRecvTy(recv_head);
+        if (rfsEnabled()) {
+            b.setSpliceRecvTy(recv_head);
+            b.splice_recv_from_window = recv_head != null;
+        }
     } else if (site_hint) |sh| b.setSpliceHint(sh.active, sh.recv);
     const lam_prev_narrow = b.setThisNarrow(if (receiver != null) null else if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
     // Body-declared `var`s a nested closure WRITES must box (`var expected
@@ -1085,7 +1089,10 @@ pub fn spliceInlineLambdaOn(
     for (suspended_rlp.items) |k| try b.markReceiverLambdaParam(k);
     _ = b.setThisNarrow(lam_prev_narrow);
     b.setSpliceHint(lam_prev_active, lam_prev_recv);
-    if (receiver != null and rfsEnabled()) b.setSpliceRecvTy(lam_prev_splice_recv);
+    if (receiver != null and rfsEnabled()) {
+        b.setSpliceRecvTy(lam_prev_splice_recv);
+        b.splice_recv_from_window = lam_prev_recv_from_window;
+    }
     if (pushed_band) _ = b.splice_hidden_bands.pop();
     b.lambda_splice_resolve = prev_splice;
     try b.push(.{ .Move = .{ .dst = result, .src = v } });

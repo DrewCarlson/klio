@@ -548,6 +548,12 @@ pub const FuncBuilder = struct {
     /// bound receiver nested inside the region (must stay pinned — it is
     /// NOT on the runtime chain).
     encl_tower_top: ?Reg = null,
+    /// True while `splice_recv_ty` was set by the INNERMOST spliced
+    /// receiver-lambda window itself (its subject head) rather than
+    /// carried over from an enclosing inline-EXT splice. Only then may a
+    /// lambda-window body use it as receiver evidence — the stale ext
+    /// head must keep the pre-splice hygiene contract.
+    splice_recv_from_window: bool = false,
     /// The active splice's ACTUAL receiver static type WITH its type
     /// arguments, when the call site derived one (`data.count { }` on
     /// `data: T`, `T : Iterable<String>`, records `Iterable<String>`).
@@ -1651,7 +1657,7 @@ pub const FuncBuilder = struct {
             var val: bool = false;
         };
         if (!S.cached) {
-            S.val = if (std.c.getenv("KLIO_RFS")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+            S.val = if (std.c.getenv("KLIO_RFS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
             S.cached = true;
         }
         return S.val;
