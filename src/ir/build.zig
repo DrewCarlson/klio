@@ -537,6 +537,11 @@ pub const FuncBuilder = struct {
     /// preserves nullability, arguments, and classifier identity.
     recv_type_ref: ?TypeRef = null,
     splice_recv_ty: ?[]const u8 = null,
+    /// Depth of active spliced receiver-lambda regions that emitted an
+    /// `EnclosingPush` for their subject: dispatch emissions inside such a
+    /// region rely on the runtime chain (which holds every nested subject
+    /// in the right order) instead of pinning one bound register.
+    encl_tower_depth: u32 = 0,
     /// The active splice's ACTUAL receiver static type WITH its type
     /// arguments, when the call site derived one (`data.count { }` on
     /// `data: T`, `T : Iterable<String>`, records `Iterable<String>`).

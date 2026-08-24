@@ -1054,7 +1054,19 @@ pub fn spliceInlineLambdaOn(
     // call resolves against the caller's class exactly as it would outside
     // the splice.
     const caller_scope = try b.enterCallerMemberScope();
+    // The spliced subject joins the RUNTIME enclosing-receiver chain for
+    // the body's region: qualified member-extension calls, operators, and
+    // companion-chain reads inside the body dispatch against it exactly
+    // as the framed route's closure receiver would. Label returns funnel
+    // through `end`, whose first instruction pops; a non-local owner
+    // return skips the pop and frame teardown heals it.
+    const encl_pushed = receiver != null and rfsEnabled();
+    if (encl_pushed) {
+        try b.push(.{ .EnclosingPush = .{ .src = receiver.? } });
+        b.encl_tower_depth += 1;
+    }
     const v = try lowerBlock(b, &body);
+    if (encl_pushed) b.encl_tower_depth -= 1;
     if (caller_scope) |cs| b.exitCallerMemberScope(cs);
     for (lam_boxed_here.items) |n| b.unmarkBoxed(n);
     for (hidden_binds.items) |hb| b.restoreHiddenBinding(hb.name, hb.h);
@@ -1067,6 +1079,7 @@ pub fn spliceInlineLambdaOn(
     try b.push(.{ .Move = .{ .dst = result, .src = v } });
     b.terminate(.{ .Goto = end });
     b.switchTo(end);
+    if (encl_pushed) try b.push(.{ .EnclosingPop = .{} });
     if (label != null) {
         b.popInlineLambdaRet();
     }

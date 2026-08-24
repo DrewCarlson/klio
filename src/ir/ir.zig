@@ -656,6 +656,15 @@ pub const Inst = union(enum) {
     NotNullAssert: struct { dst: Reg, src: Reg },
     /// Marker for the evaluator's debugger / tracing hook.
     Trace: struct { span: Span },
+    /// Push the value in `src` onto the executing frame's
+    /// enclosing-receiver chain as a `with`-subject for the duration of a
+    /// spliced receiver-lambda region (`EnclosingPop` ends it). Runtime
+    /// dispatch — bare-name walks, member-extension owners, operators —
+    /// then sees the subject exactly as the framed route would. The chain
+    /// is frame-owned, so a non-local exit that skips the pop is healed
+    /// at frame teardown.
+    EnclosingPush: struct { src: Reg },
+    EnclosingPop: struct {},
     /// Resolve a bare global identifier through the Host. Used when
     /// Path lowering cannot bind the name to a local register —
     /// covers top-level stdlib calls (`println`, `listOf`) and any

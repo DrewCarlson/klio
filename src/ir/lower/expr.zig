@@ -7213,13 +7213,21 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         .args = run[0],
                         .n_args = run[1],
                         .arg_names = arg_names,
-                        .recv = bound_this,
+                        // With the runtime subject tower live, the chain
+                        // already holds every nested subject in scope order;
+                        // pinning one bound register would put it AHEAD of an
+                        // inner subject and invert Kotlin's innermost-first
+                        // receiver ranking.
+                        .recv = if (b.encl_tower_depth > 0) null else bound_this,
                         .candidates = try cmgCandidates(b, nm, callee.Path.segments[0].span.file, run[1]),
                         .static_recv = try cmgStaticRecv(b),
                     } });
                     return dst;
                 }
-            } else if (recv_chain == null and nameHasReceiverCandidate(b, nm, null)) {
+            } else if ((recv_chain == null or
+                (b.lambda_splice_resolve != null and inline_call.rfsEnabled())) and
+                nameHasReceiverCandidate(b, nm, null))
+            {
                 // The name is an extension namesake but the spliced receiver's
                 // type is unknown here, so we cannot prove it binds to the
                 // innermost `this`. Emit the receiver-walking form rather than
@@ -7247,7 +7255,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         .args = run[0],
                         .n_args = run[1],
                         .arg_names = arg_names,
-                        .recv = bound_this,
+                        .recv = if (b.encl_tower_depth > 0) null else bound_this,
                         .candidates = try cmgCandidates(b, nm, callee.Path.segments[0].span.file, run[1]),
                         .static_recv = try cmgStaticRecv(b),
                     } });
@@ -8892,76 +8900,6 @@ fn thisScan(e: *const Expr, in_lambda: bool) bool {
     };
 }
 
-/// Whether any LAMBDA argument's body contains a bare single-segment call
-/// whose candidate set includes a member EXTENSION. Such a call needs TWO
-/// implicit receivers (the mext's dispatch owner AND its extension
-/// receiver) resolved from the runtime receiver tower — which a spliced
-/// receiver lambda does not carry yet — so the callee stays framed
-/// (`drain { with(operation) { executeWithComposeStackTrace(...) } }`).
-fn argLambdaHasMemberExtBareCall(b: *FuncBuilder, args: []const Expr) bool {
-    for (args) |*a| {
-        if (a.* != .Lambda) continue;
-        if (mextScanStmts(b, a.Lambda.body.stmts, a.Lambda.span.file)) return true;
-    }
-    return false;
-}
-
-fn mextScanStmts(b: *FuncBuilder, stmts: []const ast.Stmt, file: ir.FileId) bool {
-    for (stmts) |*st| {
-        const hit = switch (st.*) {
-            .Expr => |*e| mextScan(b, e, file),
-            .Assign => |asg| mextScan(b, &asg.target, file) or mextScan(b, &asg.value, file),
-            .DestructuringDecl => |d| mextScan(b, &d.init, file),
-            .Decl => |decl| switch (decl) {
-                .Property => |pr| if (pr.init) |*init| mextScan(b, init, file) else false,
-                else => false,
-            },
-        };
-        if (hit) return true;
-    }
-    return false;
-}
-
-fn mextScan(b: *FuncBuilder, e: *const Expr, file: ir.FileId) bool {
-    switch (e.*) {
-        .Call => |c| {
-            if (c.callee.* == .Path and c.callee.Path.segments.len == 1) {
-                const nm0 = c.callee.Path.segments[0].name;
-                if (nameHasMemberExtCandidate(b, nm0, file)) return true;
-            }
-            if (c.callee.* == .Member and mextScan(b, c.callee.Member.receiver, file)) return true;
-            for (c.args) |*a| {
-                if (mextScan(b, a, file)) return true;
-            }
-            return false;
-        },
-        .Lambda => |l| return mextScanStmts(b, l.body.stmts, file),
-        .Member => |m| return mextScan(b, m.receiver, file),
-        .Unary => |u| return mextScan(b, u.expr, file),
-        .Postfix => |po| return mextScan(b, po.expr, file),
-        .Binary => |bi| return mextScan(b, bi.lhs, file) or mextScan(b, bi.rhs, file),
-        .If => |iff| {
-            if (mextScan(b, iff.cond, file)) return true;
-            if (mextScan(b, iff.then_branch, file)) return true;
-            if (iff.else_branch) |eb| {
-                if (mextScan(b, eb, file)) return true;
-            }
-            return false;
-        },
-        else => return false,
-    }
-}
-
-fn nameHasMemberExtCandidate(b: *FuncBuilder, nm: []const u8, file: ir.FileId) bool {
-    if (nm.len == 0 or std.ascii.isUpper(nm[0])) return false;
-    const cands = b.module.bareCallCandidates(b.allocator, nm, file) catch return true;
-    defer b.allocator.free(cands);
-    for (cands) |fid| {
-        if (b.module.registry.member_ext_owner_class.get(fid) != null) return true;
-    }
-    return false;
-}
-
 fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function, args: []const Expr) bool {
     const has_reified = anyReified(f.type_params);
     const want = args.len;
@@ -9018,8 +8956,7 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
     // static_operator_resolution). The bare-call decline scan below is
     // not enough — the hazard surface is every dispatch that walks
     // enclosing receivers.
-    const rfs_on = inline_call.rfsEnabled() and
-        !argLambdaHasMemberExtBareCall(b, args);
+    const rfs_on = inline_call.rfsEnabled();
     const member_body_ext = f.receiver_type != null and
         b.lambda_splice_resolve == null and b.spliceRecvTy() == null and
         b.recvTy() == null and b.ownerClass() != null and

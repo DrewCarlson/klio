@@ -7525,6 +7525,11 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         .UnOp => |u| return execArmUnOp(H, allocator, frame, u, host),
         .BinOp => |bo| return execArmBinOp(H, allocator, frame, bo, host),
         .Trace => |t| frame.cur_span = t.span,
+        .EnclosingPush => |x| {
+            const v = frame.read(x.src);
+            pushEnclosingSubject(&v);
+        },
+        .EnclosingPop => popEnclosing(),
         .LoadParam => |lp| {
             const v = if (lp.idx < frame.params.items.len) frame.params.items[lp.idx] else Value.Unit;
             v.retain();
