@@ -540,11 +540,27 @@ keeps those callees framed. Splicing them emitted `unresolved global`
 (the fallback emission has no runtime receiver walk). Future work:
 thread a splice receiver TOWER so this last shape splices too.
 
-Results: sweep 117/0, unit green, gate.sh GREEN, vpd `kotlin.with`
+Results with RFS ON: sweep 117/0, unit green, vpd `kotlin.with`
 612k→259k (residual = the declined mext site), compose gate 1388/2 @
 415s true-warm (from 419). Map _clear/oneRect flat (no apply-path
 dependence). One gate-load flake (pausingTheFrameClock*) passed solo
 and in class context.
+
+OUTCOME: OPT-IN (5e9cb057, `KLIO_RFS=1`), default OFF. The parity
+battery caught the broader hazard surface the decline scan cannot
+cover: QUALIFIED member-ext calls (`with(owner) { list.show() }` —
+Vm::call_member miss), static operator resolution, and companion
+implicit-chain reads inside spliced bodies all need the subject on the
+RUNTIME receiver chain. Every RFS resolution change (subject-head
+derivation, chain prepend, mangle-tolerant receiver_is_owner, index
+mext fallback) is gated on the same switch — the tree is
+behavior-identical to pre-RFS with the flag off. PREREQUISITE pinned:
+a splice receiver TOWER — emitted dispatches inside spliced receiver
+lambdas must carry the bound subject registers so the runtime
+member/mext/operator walks see them ahead of the frame chain (likely
+an inst-level `splice_tower: []Reg` on the CallMember family + walk
+plumbing). That is the completing piece for this round's ~4s wall and
+the op-VM splice family.
 
 ## Call-throughput round 3 (2026-08-24)
 
