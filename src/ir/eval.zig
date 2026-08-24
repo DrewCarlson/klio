@@ -6869,6 +6869,14 @@ fn NativeGlue(comptime H: type) type {
                                 argv[i] = v;
                                 argg[i] = 4;
                             },
+                            .Double => |v| {
+                                argv[i] = @bitCast(v);
+                                argg[i] = 5;
+                            },
+                            .Float => |v| {
+                                argv[i] = @as(u32, @bitCast(v));
+                                argg[i] = 6;
+                            },
                             else => break :klx,
                         }
                     }
@@ -6883,6 +6891,8 @@ fn NativeGlue(comptime H: type) type {
                             2 => .{ .Bool = rl != 0 },
                             3 => .Unit,
                             4 => .{ .Char = @intCast(rl) },
+                            5 => .{ .Double = @bitCast(rl) },
+                            6 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(rl))))) },
                             else => break :klx,
                         };
                         frame.write(c.dst, v) catch return .oom;

@@ -496,6 +496,8 @@ fn transpileEmit(
         \\ * Build: zig cc <this file> -I<include> -L<lib> -lklio_rt -lzstd */
         \\#include <klio_rt.h>
         \\#include <string.h>
+        \\#include <math.h>
+        \\#include <stdint.h>
         \\
         \\/* Hot view: inline scalar ops over the runtime-measured Value
         \\ * layout. The runtime fills KV after profile selection;
@@ -543,6 +545,21 @@ fn transpileEmit(
         \\static inline void kv_set_char(uint8_t *s, uint16_t v) {{
         \\  memcpy(s + KV.char_off, &v, 2);
         \\  kv_set_tag(s, KV.tag_char);
+        \\}}
+        \\/* Scalar-replay float lanes: genre 5 stores double bits, genre 6
+        \\ * stores float bits, both in the int64 value lane. */
+        \\static inline double kl_bits2d(int64_t l) {{ double d; memcpy(&d, &l, 8); return d; }}
+        \\static inline int64_t kl_d2bits(double d) {{ int64_t l; memcpy(&l, &d, 8); return l; }}
+        \\static inline float kl_bits2f(int64_t l) {{ uint32_t u = (uint32_t)l; float f; memcpy(&f, &u, 4); return f; }}
+        \\static inline int64_t kl_f2bits(float f) {{ uint32_t u; memcpy(&u, &f, 4); return (int64_t)u; }}
+        \\static inline double kl_asd(int64_t l, int g) {{
+        \\  if (g == 5) return kl_bits2d(l);
+        \\  if (g == 6) return (double)kl_bits2f(l);
+        \\  return (double)l;
+        \\}}
+        \\static inline float kl_asf(int64_t l, int g) {{
+        \\  if (g == 6) return kl_bits2f(l);
+        \\  return (float)l;
         \\}}
         \\
         \\/* Inlined per-statement trace store: a plain 3-field + presence
@@ -611,6 +628,10 @@ fn transpileEmit(
             if (drop != null) break;
         }
         if (drop) |d| {
+            if (std.c.getenv("KLIO_LEAF_TRACE") != null) {
+                const df = m.funcById(ir.FuncId.from(d));
+                std.debug.print("[leaf-prune] {s}\n", .{if (df) |x| x.fqn else "?"});
+            }
             var v = leaf_targets.fetchRemove(d).?.value;
             v.deinit(gpa);
             pruned = true;
@@ -708,18 +729,42 @@ fn leafBinModeled(kind: ir.BinOp) bool {
 /// over (int64, genre) pairs, every call a plain positional exact-arity
 /// direct call. Returns the call-target fids (empty ok) or null when
 /// ineligible. The caller closes the set over targets (fixpoint).
+/// kl_-only scalar consts: the fused-loop set plus the float genres
+/// (stored as raw bits in the int64 lane).
+fn leafConstScalar(consts: []const ir.Const, id: u32) ?struct { g: u8, v: i64 } {
+    if (fuseConstScalar(consts, id)) |sc| return .{ .g = sc.g, .v = sc.v };
+    if (id >= consts.len) return null;
+    return switch (consts[id]) {
+        .Double => |d| .{ .g = 5, .v = @bitCast(d) },
+        .Float => |fl| .{ .g = 6, .v = @as(i64, @as(u32, @bitCast(fl))) },
+        else => null,
+    };
+}
+
+fn leafTrace(f: *const ir.Func, comptime why: []const u8) void {
+    if (std.c.getenv("KLIO_LEAF_TRACE") != null) std.debug.print("[leaf-miss] {s}: " ++ why ++ "\n", .{f.fqn});
+}
+
 fn leafEligible(gpa: std.mem.Allocator, f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) ?std.ArrayList(u32) {
     var targets: std.ArrayList(u32) = .empty;
     var ok = true;
-    if (f.params.len > 8) ok = false;
-    if (f.is_suspend) ok = false;
+    if (f.params.len > 8) {
+        leafTrace(f, "arity");
+        ok = false;
+    }
+    if (f.is_suspend) {
+        leafTrace(f, "suspend");
+        ok = false;
+    }
     for (f.blocks, 0..) |*blk, bi| {
         if (!ok) break;
         if (blk.catches.len != 0 or blk.finally != null) {
+            leafTrace(f, "try");
             ok = false;
             break;
         }
         const st = (if (bi < fs.streams.len) fs.streams[bi] else null) orelse {
+            leafTrace(f, "no-stream");
             ok = false;
             break;
         };
@@ -731,16 +776,23 @@ fn leafEligible(gpa: std.mem.Allocator, f: *const ir.Func, fs: *const ir.bc.Func
                 .trace => pc += 4,
                 .const_int => pc += 3,
                 .const_load => {
-                    if (fuseConstScalar(consts, code[pc + 2]) == null) ok = false;
+                    if (leafConstScalar(consts, code[pc + 2]) == null) {
+                        leafTrace(f, "nonscalar-const");
+                        ok = false;
+                    }
                     pc += 3;
                 },
                 .move, .load_param => pc += 3,
                 .cell_get => {
+                    leafTrace(f, "cell");
                     ok = false;
                     pc += 3;
                 },
                 .bin => {
-                    if (!leafBinModeled(@enumFromInt(code[pc + 2]))) ok = false;
+                    if (!leafBinModeled(@enumFromInt(code[pc + 2]))) {
+                        leafTrace(f, "bin-kind");
+                        ok = false;
+                    }
                     pc += 6;
                 },
                 .escape => {
@@ -748,6 +800,7 @@ fn leafEligible(gpa: std.mem.Allocator, f: *const ir.Func, fs: *const ir.bc.Func
                     switch (f.blocks[bi].insts[inst_idx]) {
                         .Call => |c| {
                             if (c.type_args.len != 0 or c.n_args > 8) {
+                                leafTrace(f, "call-shape");
                                 ok = false;
                             } else {
                                 var names_null = true;
@@ -759,7 +812,11 @@ fn leafEligible(gpa: std.mem.Allocator, f: *const ir.Func, fs: *const ir.bc.Func
                                 };
                             }
                         },
-                        else => ok = false,
+                        .UnOp => {},
+                        else => {
+                            leafTrace(f, "escape-op");
+                            ok = false;
+                        },
                     }
                     pc += 2;
                 },
@@ -767,11 +824,15 @@ fn leafEligible(gpa: std.mem.Allocator, f: *const ir.Func, fs: *const ir.bc.Func
                 .br => pc += 4,
                 .ret => pc += 3,
                 .term_exit => {
+                    leafTrace(f, "term");
                     ok = false;
                     pc += 1;
                 },
                 .cmp_br => {
-                    if (!leafBinModeled(@enumFromInt(code[pc + 2]))) ok = false;
+                    if (!leafBinModeled(@enumFromInt(code[pc + 2]))) {
+                        leafTrace(f, "bin-kind");
+                        ok = false;
+                    }
                     pc += 8;
                 },
             }
@@ -798,8 +859,11 @@ fn emitLeafBin(w: anytype, kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32) !void {
                 .GreaterEq => ">=",
                 else => unreachable,
             };
-            try w.print("  if (g{d} > 4 || g{d} > 4 || g{d} == 2 || g{d} == 2 || g{d} == 3 || g{d} == 3) return 0;\n", .{ lhs, rhs, lhs, rhs, lhs, rhs });
-            try w.print("  l{d} = (l{d} {s} l{d}); g{d} = 2;\n", .{ dst, lhs, sym, rhs, dst });
+            try w.print("  if (g{d} > 6 || g{d} > 6 || g{d} == 2 || g{d} == 2 || g{d} == 3 || g{d} == 3) return 0;\n", .{ lhs, rhs, lhs, rhs, lhs, rhs });
+            // A float operand compares in floating point (IEEE — NaN
+            // yields false), the other side converted by its genre.
+            try w.print("  if (g{d} >= 5 || g{d} >= 5) {{ double fa = kl_asd(l{d}, g{d}), fb = kl_asd(l{d}, g{d}); l{d} = (fa {s} fb); g{d} = 2; }}\n", .{ lhs, rhs, lhs, lhs, rhs, rhs, dst, sym, dst });
+            try w.print("  else {{ l{d} = (l{d} {s} l{d}); g{d} = 2; }}\n", .{ dst, lhs, sym, rhs, dst });
         },
         .Eq, .NotEq => {
             // Same genre or both signed-numeric widths compare by value
@@ -807,14 +871,18 @@ fn emitLeafBin(w: anytype, kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32) !void {
             // numeric, literal-adoption shapes) bails to the interpreter.
             const neg: []const u8 = if (kind == .NotEq) "!" else "";
             try w.print("  if (!(g{d} == g{d} || (g{d} <= 1 && g{d} <= 1))) return 0;\n", .{ lhs, rhs, lhs, rhs });
-            try w.print("  l{d} = {s}(l{d} == l{d}); g{d} = 2;\n", .{ dst, neg, lhs, rhs, dst });
+            // Same-genre float equality is the IEEE operator (NaN false),
+            // never the bit compare.
+            try w.print("  if (g{d} == 5) {{ l{d} = {s}(kl_bits2d(l{d}) == kl_bits2d(l{d})); g{d} = 2; }}\n", .{ lhs, dst, neg, lhs, rhs, dst });
+            try w.print("  else if (g{d} == 6) {{ l{d} = {s}(kl_bits2f(l{d}) == kl_bits2f(l{d})); g{d} = 2; }}\n", .{ lhs, dst, neg, lhs, rhs, dst });
+            try w.print("  else {{ l{d} = {s}(l{d} == l{d}); g{d} = 2; }}\n", .{ dst, neg, lhs, rhs, dst });
         },
         .BoxedEq, .BoxedNotEq => {
             // Boxed equality is tag-sensitive across widths AND the framed
             // path may have adopted an Int literal to Long at bind — a
             // genre mismatch here cannot be decided locally, so it bails.
             const neg: []const u8 = if (kind == .BoxedNotEq) "!" else "";
-            try w.print("  if (g{d} != g{d}) return 0;\n", .{ lhs, rhs });
+            try w.print("  if (g{d} != g{d} || g{d} >= 5) return 0;\n", .{ lhs, rhs, lhs });
             try w.print("  l{d} = {s}(l{d} == l{d}); g{d} = 2;\n", .{ dst, neg, lhs, rhs, dst });
         },
         .Add, .Sub, .Mul => {
@@ -824,6 +892,12 @@ fn emitLeafBin(w: anytype, kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32) !void {
                 .Mul => "*",
                 else => unreachable,
             };
+            // Float promotion first: any Double operand computes double,
+            // any Float pair/int mix computes float — IEEE exactly as the
+            // interpreter's scalar arms. Then the integer/Char rules.
+            try w.print("  if (g{d} == 5 || g{d} == 5) {{ if (g{d} == 2 || g{d} == 2 || g{d} == 3 || g{d} == 3 || g{d} == 4 || g{d} == 4) return 0; double fa = kl_asd(l{d}, g{d}), fb = kl_asd(l{d}, g{d}); l{d} = kl_d2bits(fa {s} fb); g{d} = 5; }}\n", .{ lhs, rhs, lhs, rhs, lhs, rhs, lhs, rhs, lhs, lhs, rhs, rhs, dst, sym, dst });
+            try w.print("  else if (g{d} == 6 || g{d} == 6) {{ if (g{d} == 2 || g{d} == 2 || g{d} == 3 || g{d} == 3 || g{d} == 4 || g{d} == 4) return 0; float fa = kl_asf(l{d}, g{d}), fb = kl_asf(l{d}, g{d}); l{d} = kl_f2bits(fa {s} fb); g{d} = 6; }}\n", .{ lhs, rhs, lhs, rhs, lhs, rhs, lhs, rhs, lhs, lhs, rhs, rhs, dst, sym, dst });
+            try w.print("  else {{\n", .{});
             // Char rules: Char-Char (Sub) is Int; Char +/- Int stays Char;
             // any other Char combo bails. Width by promotion, wrap via
             // unsigned casts, exactly the interpreter's scalar arms.
@@ -837,14 +911,24 @@ fn emitLeafBin(w: anytype, kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32) !void {
                 try w.print("    else if (cl || cr) {{ if (cr) return 0; l{d} = (int64_t)(uint16_t)((uint32_t)l{d} {s} (uint32_t)l{d}); g{d} = 4; }}\n", .{ dst, lhs, sym, rhs, dst });
             }
             try w.print("    else if ((g{d} | g{d}) & 1) {{ l{d} = (int64_t)((uint64_t)l{d} {s} (uint64_t)l{d}); g{d} = 1; }}\n", .{ lhs, rhs, dst, lhs, sym, rhs, dst });
-            try w.print("    else {{ l{d} = (int64_t)(int32_t)((uint32_t)l{d} {s} (uint32_t)l{d}); g{d} = 0; }}\n  }}\n", .{ dst, lhs, sym, rhs, dst });
+            try w.print("    else {{ l{d} = (int64_t)(int32_t)((uint32_t)l{d} {s} (uint32_t)l{d}); g{d} = 0; }}\n  }} }}\n", .{ dst, lhs, sym, rhs, dst });
         },
         .Div, .Mod => {
             const sym: []const u8 = if (kind == .Div) "/" else "%";
+            // Float division/remainder: IEEE (no zero guard — inf/NaN),
+            // fmod matches Kotlin's truncated %.
+            if (kind == .Div) {
+                try w.print("  if (g{d} == 5 || g{d} == 5) {{ if (!((g{d} <= 1 || g{d} == 5) && (g{d} <= 1 || g{d} == 5))) return 0; l{d} = kl_d2bits(kl_asd(l{d}, g{d}) / kl_asd(l{d}, g{d})); g{d} = 5; goto klx_dm_{d}_{d}; }}\n", .{ lhs, rhs, lhs, lhs, rhs, rhs, dst, lhs, lhs, rhs, rhs, dst, dst, lhs });
+                try w.print("  if (g{d} == 6 || g{d} == 6) {{ if (!((g{d} <= 1 || g{d} == 6) && (g{d} <= 1 || g{d} == 6))) return 0; l{d} = kl_f2bits(kl_asf(l{d}, g{d}) / kl_asf(l{d}, g{d})); g{d} = 6; goto klx_dm_{d}_{d}; }}\n", .{ lhs, rhs, lhs, rhs, lhs, rhs, dst, lhs, lhs, rhs, rhs, dst, dst, lhs });
+            } else {
+                try w.print("  if (g{d} == 5 || g{d} == 5) {{ if (!((g{d} <= 1 || g{d} == 5) && (g{d} <= 1 || g{d} == 5))) return 0; l{d} = kl_d2bits(fmod(kl_asd(l{d}, g{d}), kl_asd(l{d}, g{d}))); g{d} = 5; goto klx_dm_{d}_{d}; }}\n", .{ lhs, rhs, lhs, rhs, lhs, rhs, dst, lhs, lhs, rhs, rhs, dst, dst, lhs });
+                try w.print("  if (g{d} == 6 || g{d} == 6) {{ if (!((g{d} <= 1 || g{d} == 6) && (g{d} <= 1 || g{d} == 6))) return 0; l{d} = kl_f2bits(fmodf(kl_asf(l{d}, g{d}), kl_asf(l{d}, g{d}))); g{d} = 6; goto klx_dm_{d}_{d}; }}\n", .{ lhs, rhs, lhs, rhs, lhs, rhs, dst, lhs, lhs, rhs, rhs, dst, dst, lhs });
+            }
             try w.print("  if ((g{d} | g{d}) & ~1) return 0;\n", .{ lhs, rhs });
             try w.print("  if (l{d} == 0) return 0;\n", .{rhs});
             try w.print("  if ((g{d} | g{d}) & 1) {{ if (l{d} == INT64_MIN && l{d} == -1) return 0; l{d} = l{d} {s} l{d}; g{d} = 1; }}\n", .{ lhs, rhs, lhs, rhs, dst, lhs, sym, rhs, dst });
             try w.print("  else {{ if ((int32_t)l{d} == INT32_MIN && (int32_t)l{d} == -1) return 0; l{d} = (int64_t)((int32_t)l{d} {s} (int32_t)l{d}); g{d} = 0; }}\n", .{ lhs, rhs, dst, lhs, sym, rhs, dst });
+            try w.print("  klx_dm_{d}_{d}:;\n", .{ dst, lhs });
         },
         .And, .Or, .Xor => {
             const sym: []const u8 = switch (kind) {
@@ -876,6 +960,34 @@ fn emitLeafBin(w: anytype, kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32) !void {
     }
 }
 
+/// One scalar unary op of the replay, `applyUnop`'s exact semantics over
+/// the modeled genres; anything else bails.
+fn emitLeafUn(w: anytype, op: ir.UnOp, dst: u32, operand: u32) !void {
+    switch (op) {
+        .Plus => try w.print("  l{d} = l{d}; g{d} = g{d};\n", .{ dst, operand, dst, operand }),
+        .Inc, .Dec => {
+            const sym: []const u8 = if (op == .Inc) "+" else "-";
+            try w.print("  switch (g{d}) {{\n", .{operand});
+            try w.print("  case 0: l{d} = (int64_t)(int32_t)((uint32_t)l{d} {s} 1u); g{d} = 0; break;\n", .{ dst, operand, sym, dst });
+            try w.print("  case 1: l{d} = (int64_t)((uint64_t)l{d} {s} 1u); g{d} = 1; break;\n", .{ dst, operand, sym, dst });
+            try w.print("  case 4: l{d} = (int64_t)(uint16_t)((uint32_t)l{d} {s} 1u); g{d} = 4; break;\n", .{ dst, operand, sym, dst });
+            try w.print("  case 5: l{d} = kl_d2bits(kl_bits2d(l{d}) {s} 1.0); g{d} = 5; break;\n", .{ dst, operand, sym, dst });
+            try w.print("  case 6: l{d} = kl_f2bits(kl_bits2f(l{d}) {s} 1.0f); g{d} = 6; break;\n", .{ dst, operand, sym, dst });
+            try w.print("  default: return 0;\n  }}\n", .{});
+        },
+        .Neg => {
+            // Negating NaN keeps the canonical quiet NaN (the interpreter
+            // pins Double.NaN's raw bits), not the IEEE sign flip.
+            try w.print("  switch (g{d}) {{\n", .{operand});
+            try w.print("  case 0: l{d} = (int64_t)(int32_t)(0u - (uint32_t)l{d}); g{d} = 0; break;\n", .{ dst, operand, dst });
+            try w.print("  case 1: l{d} = (int64_t)(0u - (uint64_t)l{d}); g{d} = 1; break;\n", .{ dst, operand, dst });
+            try w.print("  case 5: {{ double dv = kl_bits2d(l{d}); l{d} = kl_d2bits(dv != dv ? (double)NAN : -dv); g{d} = 5; break; }}\n", .{ operand, dst, dst });
+            try w.print("  case 6: {{ float fv = kl_bits2f(l{d}); l{d} = kl_f2bits(fv != fv ? (float)NAN : -fv); g{d} = 6; break; }}\n", .{ operand, dst, dst });
+            try w.print("  default: return 0;\n  }}\n", .{});
+        },
+    }
+}
+
 /// Emit the scalar-replay body `kl_<fid>` for an eligible function.
 fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) !void {
     const fid = f.id.int();
@@ -901,9 +1013,17 @@ fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, con
                     pc += 6;
                 },
                 .escape => {
-                    const c = &f.blocks[bi].insts[code[pc + 1]].Call;
-                    if (c.dst.int() > max_reg) max_reg = c.dst.int();
-                    if (c.args.int() + c.n_args > max_reg) max_reg = c.args.int() + c.n_args;
+                    switch (f.blocks[bi].insts[code[pc + 1]]) {
+                        .Call => |*c| {
+                            if (c.dst.int() > max_reg) max_reg = c.dst.int();
+                            if (c.args.int() + c.n_args > max_reg) max_reg = c.args.int() + c.n_args;
+                        },
+                        .UnOp => |*u| {
+                            if (u.dst.int() > max_reg) max_reg = u.dst.int();
+                            if (u.operand.int() > max_reg) max_reg = u.operand.int();
+                        },
+                        else => {},
+                    }
                     pc += 2;
                 },
                 .jump => pc += 2,
@@ -944,7 +1064,7 @@ fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, con
                     pc += 3;
                 },
                 .const_load => {
-                    const sc = fuseConstScalar(consts, code[pc + 2]).?;
+                    const sc = leafConstScalar(consts, code[pc + 2]).?;
                     try w.print("  l{d} = (int64_t){d}ll; g{d} = {d};\n", .{ code[pc + 1], sc.v, code[pc + 1], sc.g });
                     pc += 3;
                 },
@@ -962,6 +1082,12 @@ fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, con
                     pc += 6;
                 },
                 .escape => {
+                    if (f.blocks[bi].insts[code[pc + 1]] == .UnOp) {
+                        const u = &f.blocks[bi].insts[code[pc + 1]].UnOp;
+                        try emitLeafUn(w, u.op, u.dst.int(), u.operand.int());
+                        pc += 2;
+                        continue;
+                    }
                     const c = &f.blocks[bi].insts[code[pc + 1]].Call;
                     const base = c.args.int();
                     try w.print("  {{ int64_t cav[{d}]; int32_t cag[{d}];\n", .{ @max(c.n_args, 1), @max(c.n_args, 1) });
