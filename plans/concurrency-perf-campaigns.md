@@ -509,6 +509,43 @@ mis-attribution hid it: the scans were inlined into unknown-libc.
   generation. gate.sh GREEN (litmus 126s, sweep 164s); gate 419s
   true-warm, 1388/2.
 
+## Round 7: receiver-formed lambda splicing (2026-08-24)
+
+The round-4 splice exclusion (`with(x){}`-family receiver lambdas stayed
+framed) is LIFTED (81c76695, KLIO_RFS=0 restores). The changelist op VM
+(`Operations.executeAndFlushAllPendingOperations`: drain → forEach →
+with(operation) → executeWithComposeStackTrace, ~30 interpreted calls
+per applied op, `kotlin.with` alone 612k calls in a 45s vpd window) was
+the motivating shape. Three enabling fixes:
+
+- Spliced receiver lambdas set `spliceRecvTy` from the SUBJECT's static
+  head — declared head when concrete, else derived from the receiver
+  EXPRESSION (`with(stack)` substitutes Operations for the generic `T`),
+  mirroring the inline-fn splice's generic-receiver substitution.
+- The spliced subject PREPENDS to the bare-call receiver chain (it is
+  the innermost implicit receiver, ahead of the enclosing framed
+  receiver), with the head resolved through `classIdIndexed` because
+  registry keys carry file-collision mangles (`Operation$f429`).
+- `hierarchy_shadow_names` has NO entry for image-loaded pack classes
+  (the round-4 assumption "baked emissions never consult it" broke once
+  pack inline bodies re-splice at test-source sites): membership falls
+  back to the function index (`mextCandidateOwnedBy` via
+  `member_ext_owner_class`).
+
+DECLINED (precise, scanned): a lambda body whose bare call is a member
+EXTENSION candidate (`executeWithComposeStackTrace` = Operation's mext
+on OperationArgContainer) needs TWO implicit receivers from the runtime
+tower, which a spliced lambda does not carry — `argLambdaHasMemberExtBareCall`
+keeps those callees framed. Splicing them emitted `unresolved global`
+(the fallback emission has no runtime receiver walk). Future work:
+thread a splice receiver TOWER so this last shape splices too.
+
+Results: sweep 117/0, unit green, gate.sh GREEN, vpd `kotlin.with`
+612k→259k (residual = the declined mext site), compose gate 1388/2 @
+415s true-warm (from 419). Map _clear/oneRect flat (no apply-path
+dependence). One gate-load flake (pausingTheFrameClock*) passed solo
+and in class context.
+
 ## Call-throughput round 3 (2026-08-24)
 
 - 956600b5 LANDED: host-served snapshot validity walk (readable/valid
