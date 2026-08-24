@@ -287,6 +287,27 @@ klsem edge micro (wrap, mixed width, div guards + div0 exception via
 bail, bitwise, shift masking, 3000-deep recursion bail, char, bool)
 exact.
 
+## Speedup campaign round 3 (2026-08-24): floats and unary ops
+
+Genres 5 (Double, raw bits in the int64 lane) and 6 (Float, low-32
+bits): arithmetic with kl_asd/kl_asf promotion (any Double operand ->
+double, Float pairs/int mixes -> float, IEEE exactly — no zero guard,
+fmod/fmodf for %), relational compares in floating point (NaN false),
+plain Eq as the IEEE operator on same-genre floats (never the bit
+compare), Boxed(Not)Eq BAILS on any float genre (equals-semantics
+bit canonicalization stays with the interpreter). UnOp joined the
+replay (Inc/Dec with width wrap incl Char u16 and float +/-1.0; Neg
+with the canonical-NaN pin; Plus identity) — `i++` rode the stream as
+an escape and its absence made every counting loop body ineligible
+(mandel was 143s, fully interpreted). TRAP for the next op class:
+admit it in the eligibility scan AND the max-reg scan AND the emission
+dispatch — all three switch on the escape's Inst.
+
+Measured: mandel sweep 143s -> 7.5s (19x, parity); the IEEE gauntlet
+(Infinity, NaN, -0.0 == 0.0 true, NaN == NaN false, fmod sign, float
+mixing) byte-identical. fib/branchy/klsem/flsem parity, sweep 117/0,
+corpus 399/0.
+
 ## Next: the speedup campaign (open)
 
 The opaque call-per-op ABI trades the stream's inlined switch dispatch
