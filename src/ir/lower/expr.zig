@@ -12927,6 +12927,27 @@ fn lowerPathCall(
     const segments = callee.Path.segments;
     const name0 = segments[0].name;
 
+    // RESOLUTION PARITY for spliced receiver-lambda regions: the framed
+    // route lowers a receiver lambda's body with only the bare `T` head,
+    // so every shadowable bare call defers to the runtime member-first
+    // walk — and the walk is what implements Kotlin's implicit-receiver
+    // ranking. The spliced body sees concrete heads and local bindings
+    // and would COMMIT static picks the framed body never makes
+    // (`toTypedArray().apply { sort() }` bound a wrong `sort`). With the
+    // subject tower on the runtime chain, deferring is both correct and
+    // cheap: bail to the generic member-or-global fallthrough whenever
+    // the name could be claimed by a receiver.
+    if (inline_call.rfsEnabled() and b.encl_tower_depth > 0 and
+        b.resolve(name0) == null and !b.knowsOuter(name0) and
+        b.inlineLambdaFor(name0) == null and
+        (name0.len == 0 or !std.ascii.isUpper(name0[0])) and
+        (nameHasReceiverCandidate(b, name0, null) or
+            b.module.registry.class_member_names.contains(name0)))
+    {
+        orEmitAudit(b, "tower_parity_defer", "fallthrough", name0);
+        return null;
+    }
+
     // Secondary-ctor delegation / default-value thunk: a bare own-member call
     // with no `this` in scope is a companion access — the enclosing instance
     // does not exist yet, so `generateOetf(x)` inside `: this(generateOetf(x))`
