@@ -282,6 +282,7 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
         if (takes_receiver) return null;
         if (!std.mem.eql(u8, f.name, "<lambda>")) return null;
         if (f.lambda_receiver_ty) |head| {
+            if (callValueTraceOn()) std.debug.print("[cvt-head] id={d} head={s}\n", .{ id, head });
             if (try host_call_member.implicitReceiverForHead(self, allocator, this_value_in, head)) |matched| {
                 selected_this = matched;
             }
@@ -347,7 +348,7 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
     req.ctx_mark_override = ctx_mark;
     req.pop_enclosing_n = pushes;
     if (callValueTraceOn()) {
-        std.debug.print("[cvt-flat] id={d} pushes={d}\n", .{ id, pushes });
+        std.debug.print("[cvt-flat] id={d} pushes={d} this_idx={?d} ncaps={d} sel_tag={s}\n", .{ id, pushes, this_idx, info.capture_names.len, @tagName(std.meta.activeTag(selected_this)) });
     }
     return req;
 }

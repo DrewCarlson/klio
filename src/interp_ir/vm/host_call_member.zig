@@ -1451,6 +1451,12 @@ fn elementSatisfies(self: *VmHost, allocator: Allocator, elem: *const Value, fid
 /// class hierarchy for an `Instance`, the runtime type-name sets
 /// otherwise. No generosity for generics or function shapes — callers
 /// handle those.
+fn headNamesRegisteredClass(self: *VmHost, head: []const u8) bool {
+    const cg = self.classes.borrow();
+    defer cg.deinit();
+    return cg.get().get(head) != null;
+}
+
 pub fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const u8) bool {
     switch (receiver.*) {
         .Instance => |inst| {
@@ -3678,6 +3684,12 @@ fn recvFnPropHeadOf(self: *VmHost, receiver: *const Value, name: []const u8) ?[]
 /// replaced by the field's lambda).
 fn recvFnReceiverFor(self: *VmHost, allocator: Allocator, receiver: *const Value, head: []const u8) Allocator.Error!?Value {
     if (head.len == 0 or receiverImplementsHead(self, receiver, head)) return receiver.*;
+    // A head that names NO registered class (a bare type parameter --
+    // `with`'s `T.()` block) proves nothing about any receiver: the value
+    // the invoke supplied stands. Walking the chain here replaced a
+    // `with(list)` subject with whatever Instance happened to be enclosing
+    // once the subject tower put one there.
+    if (!headNamesRegisteredClass(self, head)) return receiver.*;
     const chain = try enclosingThisChain(self, allocator);
     defer allocator.free(chain);
     for (chain) |c| {
