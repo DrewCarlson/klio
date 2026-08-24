@@ -6694,6 +6694,43 @@ fn nativeFor(fid: u32, fqn: []const u8) ?NativeFn {
     return e.f;
 }
 
+/// Scalar-replay leaf body (`kl_<fid>`): the whole function computed over
+/// (int64 value, genre) pairs — genres 0 Int, 1 Long, 2 Bool, 3 Unit,
+/// 4 Char. Returns nonzero with the result in (ret, retg); zero = the
+/// body bailed (non-scalar input, div guard, depth or edge trigger) and
+/// the caller re-runs the call through the ordinary path — sound because
+/// only statically PURE bodies are ever registered here.
+pub const NativeLeafFn = *const fn (
+    ctx: ?*anyopaque,
+    ev: *NativeEdgeView,
+    argv: [*]const i64,
+    argg: [*]const i32,
+    ret: *i64,
+    retg: *i32,
+    depth: u32,
+) callconv(.c) i32;
+
+const NativeLeafEntry = struct { f: NativeLeafFn, fqn: []const u8 };
+var native_leaf_table: std.AutoHashMapUnmanaged(u32, NativeLeafEntry) = .empty;
+var native_leaf_any: std.atomic.Value(bool) = .init(false);
+
+pub fn registerNativeLeaf(fid: u32, f: NativeLeafFn, fqn: []const u8) void {
+    native_mutex.lock();
+    defer native_mutex.unlock();
+    const owned = std.heap.smp_allocator.dupe(u8, fqn) catch return;
+    native_leaf_table.put(std.heap.smp_allocator, fid, .{ .f = f, .fqn = owned }) catch return;
+    native_leaf_any.store(true, .release);
+}
+
+fn nativeLeafFor(fid: u32, fqn: []const u8) ?NativeLeafFn {
+    if (!native_leaf_any.load(.acquire)) return null;
+    native_mutex.lock();
+    defer native_mutex.unlock();
+    const e = native_leaf_table.get(fid) orelse return null;
+    if (!std.mem.eql(u8, e.fqn, fqn)) return null;
+    return e.f;
+}
+
 var native_expect_funcs: usize = 0;
 var native_expect_consts: usize = 0;
 
@@ -6798,6 +6835,60 @@ fn NativeGlue(comptime H: type) type {
                 const c = &inst.Call;
                 if (c.type_args.len != 0 or !argNamesAllNull(c.arg_names)) break :direct;
                 const cf = frame.module.funcById(c.func) orelse break :direct;
+                // Scalar-replay body (`kl_`): the whole call runs as direct
+                // C over (int64, genre) pairs when every argument is a
+                // scalar. A zero return is a pure bail — fall through to
+                // the ordinary paths, which re-run the call exactly.
+                if (native_leaf_any.load(.acquire) and c.n_args <= 8 and
+                    c.n_args == cf.params.len)
+                klx: {
+                    const klf = nativeLeafFor(c.func.int(), cf.fqn) orelse break :klx;
+                    var argv: [8]i64 = undefined;
+                    var argg: [8]i32 = undefined;
+                    const base = c.args.int();
+                    if (base + c.n_args > frame.regs.items.len) break :klx;
+                    for (0..c.n_args) |i| {
+                        switch (frame.regs.items[base + i]) {
+                            .Int => |v| {
+                                argv[i] = v;
+                                argg[i] = 0;
+                            },
+                            .Long => |v| {
+                                argv[i] = v;
+                                argg[i] = 1;
+                            },
+                            .Bool => |v| {
+                                argv[i] = @intFromBool(v);
+                                argg[i] = 2;
+                            },
+                            .Unit => {
+                                argv[i] = 0;
+                                argg[i] = 3;
+                            },
+                            .Char => |v| {
+                                argv[i] = v;
+                                argg[i] = 4;
+                            },
+                            else => break :klx,
+                        }
+                    }
+                    var ev: NativeEdgeView = undefined;
+                    nativeEdgeView(ctx, &ev);
+                    var rl: i64 = 0;
+                    var rg: i32 = 0;
+                    if (klf(@ptrCast(ctx), &ev, &argv, &argg, &rl, &rg, 0) != 0) {
+                        const v: Value = switch (rg) {
+                            0 => .{ .Int = @intCast(rl) },
+                            1 => .{ .Long = rl },
+                            2 => .{ .Bool = rl != 0 },
+                            3 => .Unit,
+                            4 => .{ .Char = @intCast(rl) },
+                            else => break :klx,
+                        };
+                        frame.write(c.dst, v) catch return .oom;
+                        return .cont;
+                    }
+                }
                 if (!cf.leafExprBody()) break :direct;
                 var plan = cf.fast_call;
                 if (plan == 0) {

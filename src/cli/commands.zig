@@ -579,6 +579,52 @@ fn transpileEmit(
     const Emitted = struct { fid: u32, fqn: []const u8 };
     var emitted: std.ArrayList(Emitted) = .empty;
     defer emitted.deinit(gpa);
+    // Scalar-replay (`kl_`) pass: per-fn eligibility, then a fixpoint
+    // closing the set over call targets (a body is only pure when every
+    // callee is), then prototypes (mutual/self recursion) and bodies.
+    var leaf_targets = std.AutoHashMap(u32, std.ArrayList(u32)).init(gpa);
+    defer {
+        var it = leaf_targets.valueIterator();
+        while (it.next()) |v| v.deinit(gpa);
+        leaf_targets.deinit();
+    }
+    for (m.funcs.items) |*f| {
+        if (f.blocks.len == 0) continue;
+        if (f.package.len != 0) continue;
+        const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
+        if (leafEligible(gpa, f, fs, m.consts.items)) |tg| {
+            leaf_targets.put(f.id.int(), tg) catch return 1;
+        }
+    }
+    var pruned = true;
+    while (pruned) {
+        pruned = false;
+        var it = leaf_targets.iterator();
+        var drop: ?u32 = null;
+        while (it.next()) |e| {
+            for (e.value_ptr.items) |t| {
+                if (!leaf_targets.contains(t)) {
+                    drop = e.key_ptr.*;
+                    break;
+                }
+            }
+            if (drop != null) break;
+        }
+        if (drop) |d| {
+            var v = leaf_targets.fetchRemove(d).?.value;
+            v.deinit(gpa);
+            pruned = true;
+        }
+    }
+    {
+        var it = leaf_targets.keyIterator();
+        while (it.next()) |fid| {
+            w.print("static int32_t kl_{d}(void *ctx, klio_edge_view *ev, const int64_t *argv, const int32_t *argg, int64_t *ret, int32_t *retg, uint32_t depth);\n", .{fid.*}) catch return 1;
+        }
+        w.print("\n", .{}) catch return 1;
+    }
+    var leaf_emitted: std.ArrayList(Emitted) = .empty;
+    defer leaf_emitted.deinit(gpa);
     for (m.funcs.items) |*f| {
         // The user script's functions only: pack/stdlib bodies keep full
         // interpretation (the fids the emitter registers must match the
@@ -588,6 +634,10 @@ fn transpileEmit(
         // allow_fuse mirrors the frame loop's default (the loop JIT off):
         // the running binary builds the same streams this emission used.
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
+        if (leaf_targets.contains(f.id.int())) {
+            emitLeafFunc(w, f, fs, m.consts.items) catch return 1;
+            leaf_emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+        }
         emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
         emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
     }
@@ -597,6 +647,11 @@ fn transpileEmit(
     w.print("  klio_rt_register_module_check({d}u, {d}u);\n", .{ m.funcs.items.len, m.consts.items.len }) catch return 1;
     for (emitted.items) |e| {
         w.print("  klio_rt_register_native({d}u, kf_{d}, ", .{ e.fid, e.fid }) catch return 1;
+        emitCString(w, e.fqn) catch return 1;
+        w.print(");\n", .{}) catch return 1;
+    }
+    for (leaf_emitted.items) |e| {
+        w.print("  klio_rt_register_native_leaf({d}u, kl_{d}, ", .{ e.fid, e.fid }) catch return 1;
         emitCString(w, e.fqn) catch return 1;
         w.print(");\n", .{}) catch return 1;
     }
@@ -638,6 +693,320 @@ fn emitCString(w: anytype, s: []const u8) !void {
         }
     }
     try w.print("\"", .{});
+}
+
+
+/// Whether `kind` is modeled by the scalar-replay (`kl_`) emitter.
+fn leafBinModeled(kind: ir.BinOp) bool {
+    return switch (kind) {
+        .Add, .Sub, .Mul, .Div, .Mod, .Less, .LessEq, .Greater, .GreaterEq, .Eq, .NotEq, .BoxedEq, .BoxedNotEq, .And, .Or, .Xor, .Shl, .Shr, .UShr => true,
+        else => false,
+    };
+}
+
+/// Scalar-replay eligibility for one function: every stream op computable
+/// over (int64, genre) pairs, every call a plain positional exact-arity
+/// direct call. Returns the call-target fids (empty ok) or null when
+/// ineligible. The caller closes the set over targets (fixpoint).
+fn leafEligible(gpa: std.mem.Allocator, f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) ?std.ArrayList(u32) {
+    var targets: std.ArrayList(u32) = .empty;
+    var ok = true;
+    if (f.params.len > 8) ok = false;
+    if (f.is_suspend) ok = false;
+    for (f.blocks, 0..) |*blk, bi| {
+        if (!ok) break;
+        if (blk.catches.len != 0 or blk.finally != null) {
+            ok = false;
+            break;
+        }
+        const st = (if (bi < fs.streams.len) fs.streams[bi] else null) orelse {
+            ok = false;
+            break;
+        };
+        const code = st.code;
+        var pc: usize = 0;
+        while (pc < code.len) {
+            const op: ir.bc.Op = @enumFromInt(code[pc]);
+            switch (op) {
+                .trace => pc += 4,
+                .const_int => pc += 3,
+                .const_load => {
+                    if (fuseConstScalar(consts, code[pc + 2]) == null) ok = false;
+                    pc += 3;
+                },
+                .move, .load_param => pc += 3,
+                .cell_get => {
+                    ok = false;
+                    pc += 3;
+                },
+                .bin => {
+                    if (!leafBinModeled(@enumFromInt(code[pc + 2]))) ok = false;
+                    pc += 6;
+                },
+                .escape => {
+                    const inst_idx = code[pc + 1];
+                    switch (f.blocks[bi].insts[inst_idx]) {
+                        .Call => |c| {
+                            if (c.type_args.len != 0 or c.n_args > 8) {
+                                ok = false;
+                            } else {
+                                var names_null = true;
+                                for (c.arg_names) |n| {
+                                    if (n != null) names_null = false;
+                                }
+                                if (!names_null) ok = false else targets.append(gpa, c.func.int()) catch {
+                                    ok = false;
+                                };
+                            }
+                        },
+                        else => ok = false,
+                    }
+                    pc += 2;
+                },
+                .jump => pc += 2,
+                .br => pc += 4,
+                .ret => pc += 3,
+                .term_exit => {
+                    ok = false;
+                    pc += 1;
+                },
+                .cmp_br => {
+                    if (!leafBinModeled(@enumFromInt(code[pc + 2]))) ok = false;
+                    pc += 8;
+                },
+            }
+            if (!ok) break;
+        }
+    }
+    if (!ok) {
+        targets.deinit(gpa);
+        return null;
+    }
+    return targets;
+}
+
+/// One scalar bin op of the replay: dynamic genre/width arithmetic with
+/// `scalarBin`'s exact semantics over the modeled genre set; any combo
+/// outside the model bails (`return 0`), which purity makes exact.
+fn emitLeafBin(w: anytype, kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32) !void {
+    switch (kind) {
+        .Less, .LessEq, .Greater, .GreaterEq => {
+            const sym: []const u8 = switch (kind) {
+                .Less => "<",
+                .LessEq => "<=",
+                .Greater => ">",
+                .GreaterEq => ">=",
+                else => unreachable,
+            };
+            try w.print("  if (g{d} > 4 || g{d} > 4 || g{d} == 2 || g{d} == 2 || g{d} == 3 || g{d} == 3) return 0;\n", .{ lhs, rhs, lhs, rhs, lhs, rhs });
+            try w.print("  l{d} = (l{d} {s} l{d}); g{d} = 2;\n", .{ dst, lhs, sym, rhs, dst });
+        },
+        .Eq, .NotEq => {
+            // Same genre or both signed-numeric widths compare by value
+            // (Kotlin promotes `1 == 1L`); any other mix (Bool/Char vs
+            // numeric, literal-adoption shapes) bails to the interpreter.
+            const neg: []const u8 = if (kind == .NotEq) "!" else "";
+            try w.print("  if (!(g{d} == g{d} || (g{d} <= 1 && g{d} <= 1))) return 0;\n", .{ lhs, rhs, lhs, rhs });
+            try w.print("  l{d} = {s}(l{d} == l{d}); g{d} = 2;\n", .{ dst, neg, lhs, rhs, dst });
+        },
+        .BoxedEq, .BoxedNotEq => {
+            // Boxed equality is tag-sensitive across widths AND the framed
+            // path may have adopted an Int literal to Long at bind — a
+            // genre mismatch here cannot be decided locally, so it bails.
+            const neg: []const u8 = if (kind == .BoxedNotEq) "!" else "";
+            try w.print("  if (g{d} != g{d}) return 0;\n", .{ lhs, rhs });
+            try w.print("  l{d} = {s}(l{d} == l{d}); g{d} = 2;\n", .{ dst, neg, lhs, rhs, dst });
+        },
+        .Add, .Sub, .Mul => {
+            const sym: []const u8 = switch (kind) {
+                .Add => "+",
+                .Sub => "-",
+                .Mul => "*",
+                else => unreachable,
+            };
+            // Char rules: Char-Char (Sub) is Int; Char +/- Int stays Char;
+            // any other Char combo bails. Width by promotion, wrap via
+            // unsigned casts, exactly the interpreter's scalar arms.
+            try w.print("  {{ int cl = (g{d} == 4), cr = (g{d} == 4);\n", .{ lhs, rhs });
+            try w.print("    if (g{d} > 4 || g{d} > 4 || g{d} == 2 || g{d} == 2 || g{d} == 3 || g{d} == 3) return 0;\n", .{ lhs, rhs, lhs, rhs, lhs, rhs });
+            if (kind == .Sub) {
+                try w.print("    if (cl && cr) {{ l{d} = (int64_t)((int32_t)l{d} - (int32_t)l{d}); g{d} = 0; }}\n", .{ dst, lhs, rhs, dst });
+                try w.print("    else if (cl || cr) {{ if (cr) return 0; l{d} = (int64_t)(uint16_t)((uint32_t)l{d} - (uint32_t)l{d}); g{d} = 4; }}\n", .{ dst, lhs, rhs, dst });
+            } else {
+                try w.print("    if (cl && cr) return 0;\n", .{});
+                try w.print("    else if (cl || cr) {{ if (cr) return 0; l{d} = (int64_t)(uint16_t)((uint32_t)l{d} {s} (uint32_t)l{d}); g{d} = 4; }}\n", .{ dst, lhs, sym, rhs, dst });
+            }
+            try w.print("    else if ((g{d} | g{d}) & 1) {{ l{d} = (int64_t)((uint64_t)l{d} {s} (uint64_t)l{d}); g{d} = 1; }}\n", .{ lhs, rhs, dst, lhs, sym, rhs, dst });
+            try w.print("    else {{ l{d} = (int64_t)(int32_t)((uint32_t)l{d} {s} (uint32_t)l{d}); g{d} = 0; }}\n  }}\n", .{ dst, lhs, sym, rhs, dst });
+        },
+        .Div, .Mod => {
+            const sym: []const u8 = if (kind == .Div) "/" else "%";
+            try w.print("  if ((g{d} | g{d}) & ~1) return 0;\n", .{ lhs, rhs });
+            try w.print("  if (l{d} == 0) return 0;\n", .{rhs});
+            try w.print("  if ((g{d} | g{d}) & 1) {{ if (l{d} == INT64_MIN && l{d} == -1) return 0; l{d} = l{d} {s} l{d}; g{d} = 1; }}\n", .{ lhs, rhs, lhs, rhs, dst, lhs, sym, rhs, dst });
+            try w.print("  else {{ if ((int32_t)l{d} == INT32_MIN && (int32_t)l{d} == -1) return 0; l{d} = (int64_t)((int32_t)l{d} {s} (int32_t)l{d}); g{d} = 0; }}\n", .{ lhs, rhs, dst, lhs, sym, rhs, dst });
+        },
+        .And, .Or, .Xor => {
+            const sym: []const u8 = switch (kind) {
+                .And => "&",
+                .Or => "|",
+                .Xor => "^",
+                else => unreachable,
+            };
+            try w.print("  if (g{d} == 2 && g{d} == 2) {{ l{d} = (l{d} {s} l{d}) & 1; g{d} = 2; }}\n", .{ lhs, rhs, dst, lhs, sym, rhs, dst });
+            try w.print("  else if (((g{d} | g{d}) & ~1) == 0) {{ int wide = (g{d} | g{d}) & 1; l{d} = l{d} {s} l{d}; if (!wide) l{d} = (int64_t)(int32_t)l{d}; g{d} = wide; }}\n", .{ lhs, rhs, lhs, rhs, dst, lhs, sym, rhs, dst, dst, dst });
+            try w.print("  else return 0;\n", .{});
+        },
+        .Shl, .Shr, .UShr => {
+            try w.print("  if ((g{d} != 0 && g{d} != 1) || g{d} != 0) return 0;\n", .{ lhs, lhs, rhs });
+            switch (kind) {
+                .Shl => {
+                    try w.print("  if (g{d}) {{ unsigned sh = (unsigned)l{d} & 63u; l{d} = (int64_t)((uint64_t)l{d} << sh); g{d} = 1; }} else {{ unsigned sh = (unsigned)l{d} & 31u; l{d} = (int64_t)(int32_t)((uint32_t)l{d} << sh); g{d} = 0; }}\n", .{ lhs, rhs, dst, lhs, dst, rhs, dst, lhs, dst });
+                },
+                .Shr => {
+                    try w.print("  if (g{d}) {{ unsigned sh = (unsigned)l{d} & 63u; l{d} = l{d} >> sh; g{d} = 1; }} else {{ unsigned sh = (unsigned)l{d} & 31u; l{d} = (int64_t)((int32_t)l{d} >> sh); g{d} = 0; }}\n", .{ lhs, rhs, dst, lhs, dst, rhs, dst, lhs, dst });
+                },
+                .UShr => {
+                    try w.print("  if (g{d}) {{ unsigned sh = (unsigned)l{d} & 63u; l{d} = (int64_t)((uint64_t)l{d} >> sh); g{d} = 1; }} else {{ unsigned sh = (unsigned)l{d} & 31u; l{d} = (int64_t)(int32_t)((uint32_t)l{d} >> sh); g{d} = 0; }}\n", .{ lhs, rhs, dst, lhs, dst, rhs, dst, lhs, dst });
+                },
+                else => unreachable,
+            }
+        },
+        else => unreachable,
+    }
+}
+
+/// Emit the scalar-replay body `kl_<fid>` for an eligible function.
+fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) !void {
+    const fid = f.id.int();
+    var max_reg: u32 = 0;
+    for (f.blocks, 0..) |*blk, bi| {
+        _ = blk;
+        const st = fs.streams[bi] orelse continue;
+        const code = st.code;
+        var pc: usize = 0;
+        while (pc < code.len) {
+            const op: ir.bc.Op = @enumFromInt(code[pc]);
+            switch (op) {
+                .trace => pc += 4,
+                .const_int, .const_load, .move, .load_param, .cell_get => {
+                    if (code[pc + 1] > max_reg) max_reg = code[pc + 1];
+                    if (op == .move and code[pc + 2] > max_reg) max_reg = code[pc + 2];
+                    pc += 3;
+                },
+                .bin => {
+                    if (code[pc + 3] > max_reg) max_reg = code[pc + 3];
+                    if (code[pc + 4] > max_reg) max_reg = code[pc + 4];
+                    if (code[pc + 5] > max_reg) max_reg = code[pc + 5];
+                    pc += 6;
+                },
+                .escape => {
+                    const c = &f.blocks[bi].insts[code[pc + 1]].Call;
+                    if (c.dst.int() > max_reg) max_reg = c.dst.int();
+                    if (c.args.int() + c.n_args > max_reg) max_reg = c.args.int() + c.n_args;
+                    pc += 2;
+                },
+                .jump => pc += 2,
+                .br => {
+                    if (code[pc + 1] > max_reg) max_reg = code[pc + 1];
+                    pc += 4;
+                },
+                .ret => pc += 3,
+                .term_exit => pc += 1,
+                .cmp_br => {
+                    if (code[pc + 3] > max_reg) max_reg = code[pc + 3];
+                    if (code[pc + 4] > max_reg) max_reg = code[pc + 4];
+                    if (code[pc + 5] > max_reg) max_reg = code[pc + 5];
+                    pc += 8;
+                },
+            }
+        }
+    }
+    try w.print("static int32_t kl_{d}(void *ctx, klio_edge_view *ev, const int64_t *argv, const int32_t *argg, int64_t *ret, int32_t *retg, uint32_t depth) {{\n", .{fid});
+    try w.print("  if (depth > 2000u) return 0;\n", .{});
+    var r: u32 = 0;
+    while (r <= max_reg) : (r += 1) {
+        try w.print("  int64_t l{d} = 0; int g{d} = 3; (void)l{d}; (void)g{d};\n", .{ r, r, r, r });
+    }
+    for (f.blocks, 0..) |*blk2, bi| {
+        _ = blk2;
+        try w.print("KLB{d}:;\n", .{bi});
+        const st = fs.streams[bi] orelse return error.Unexpected;
+        const code = st.code;
+        var pc: usize = 0;
+        var closed = false;
+        while (pc < code.len) {
+            const op: ir.bc.Op = @enumFromInt(code[pc]);
+            switch (op) {
+                .trace => pc += 4,
+                .const_int => {
+                    try w.print("  l{d} = (int64_t)(int32_t)0x{x}u; g{d} = 0;\n", .{ code[pc + 1], code[pc + 2], code[pc + 1] });
+                    pc += 3;
+                },
+                .const_load => {
+                    const sc = fuseConstScalar(consts, code[pc + 2]).?;
+                    try w.print("  l{d} = (int64_t){d}ll; g{d} = {d};\n", .{ code[pc + 1], sc.v, code[pc + 1], sc.g });
+                    pc += 3;
+                },
+                .move => {
+                    try w.print("  l{d} = l{d}; g{d} = g{d};\n", .{ code[pc + 1], code[pc + 2], code[pc + 1], code[pc + 2] });
+                    pc += 3;
+                },
+                .load_param => {
+                    try w.print("  l{d} = argv[{d}]; g{d} = argg[{d}];\n", .{ code[pc + 1], code[pc + 2], code[pc + 1], code[pc + 2] });
+                    pc += 3;
+                },
+                .cell_get => return error.Unexpected,
+                .bin => {
+                    try emitLeafBin(w, @enumFromInt(code[pc + 2]), code[pc + 3], code[pc + 4], code[pc + 5]);
+                    pc += 6;
+                },
+                .escape => {
+                    const c = &f.blocks[bi].insts[code[pc + 1]].Call;
+                    const base = c.args.int();
+                    try w.print("  {{ int64_t cav[{d}]; int32_t cag[{d}];\n", .{ @max(c.n_args, 1), @max(c.n_args, 1) });
+                    var i: u32 = 0;
+                    while (i < c.n_args) : (i += 1) {
+                        try w.print("    cav[{d}] = l{d}; cag[{d}] = g{d};\n", .{ i, base + i, i, base + i });
+                    }
+                    try w.print("    int32_t rg2; int64_t rl2;\n", .{});
+                    try w.print("    if (!kl_{d}(ctx, ev, cav, cag, &rl2, &rg2, depth + 1u)) return 0;\n", .{c.func.int()});
+                    try w.print("    l{d} = rl2; g{d} = rg2; }}\n", .{ c.dst.int(), c.dst.int() });
+                    pc += 2;
+                },
+                .jump => {
+                    try w.print("  if (kv_edge(ctx, ev)) return 0;\n  goto KLB{d};\n", .{code[pc + 1]});
+                    closed = true;
+                    pc += 2;
+                },
+                .br => {
+                    try w.print("  if (g{d} != 2) return 0;\n", .{code[pc + 1]});
+                    try w.print("  if (l{d}) goto KLB{d}; else goto KLB{d};\n", .{ code[pc + 1], code[pc + 2], code[pc + 3] });
+                    closed = true;
+                    pc += 4;
+                },
+                .ret => {
+                    if (code[pc + 1] != 0) {
+                        try w.print("  *ret = l{d}; *retg = g{d}; return 1;\n", .{ code[pc + 2], code[pc + 2] });
+                    } else {
+                        try w.print("  *ret = 0; *retg = 3; return 1;\n", .{});
+                    }
+                    closed = true;
+                    pc += 3;
+                },
+                .term_exit => return error.Unexpected,
+                .cmp_br => {
+                    try emitLeafBin(w, @enumFromInt(code[pc + 2]), code[pc + 3], code[pc + 4], code[pc + 5]);
+                    try w.print("  if (g{d} != 2) return 0;\n", .{code[pc + 3]});
+                    try w.print("  if (l{d}) goto KLB{d}; else goto KLB{d};\n", .{ code[pc + 3], code[pc + 6], code[pc + 7] });
+                    closed = true;
+                    pc += 8;
+                },
+            }
+        }
+        if (!closed) try w.print("  return 0;\n", .{});
+    }
+    try w.print("}}\n\n", .{});
 }
 
 fn emitNativeFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) !void {
