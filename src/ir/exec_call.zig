@@ -2823,6 +2823,22 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
     var depth: u16 = 0;
     const entries = try enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
+    // IN-FLIGHT chain pushes — entries this frame pushed DURING execution
+    // (a spliced `with`/`apply` subject via `EnclosingPush`, a dispatch
+    // access push) — are lexically INNER to the frame's own receiver: the
+    // subject of `toTypedArray().apply { sort() }` inside `List.sorted`
+    // outranks the extension's List `this`, exactly as the framed route's
+    // closure receiver would. `enclosingEntriesAlloc` reverses the chain,
+    // so the in-flight region is its PREFIX; rank it ahead of `inner`.
+    const in_flight: usize = blk: {
+        if (frame.tls.active_chain != &frame.enclosing_this) break :blk 0;
+        const total = frame.enclosing_this.items.len;
+        const base = frame.tls.active_chain_base;
+        break :blk if (total > base) total - base else 0;
+    };
+    for (entries[0..@min(in_flight, entries.len)]) |e| {
+        try appendCandidateRun(H, allocator, &out, e.v, e.isSubject(), false, &depth, host, bare_name);
+    }
     // The innermost candidate is the inline-splice's bound receiver when
     // supplied (it lives in a local register, invisible to the frame `this`
     // slot / capture lookup), otherwise the frame's own `this`. A supplied
@@ -2839,7 +2855,7 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
             // When the innermost receiver is also the innermost chain entry
             // (a seeded method/extension receiver, or a receiver-split
             // subject), the entry's own run covers it with the right kind.
-            const dup = entries.len > 0 and sameReceiver(entries[0].v, iv);
+            const dup = entries.len > in_flight and sameReceiver(entries[in_flight].v, iv);
             if (!dup) {
                 // The frame's own `this` brings its class-nesting tower (and
                 // companion) only when it is a *dispatch* receiver. An
@@ -2892,7 +2908,7 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
             }
         }
     }
-    for (entries, 0..) |e, ei| {
+    for (entries[@min(in_flight, entries.len)..], 0..) |e, ei| {
         // The innermost chain entry is often the frame's own dispatch
         // receiver seeded by the invoke path (the dup check above then
         // skipped the frame-`this` run); it is still the OWN run.
