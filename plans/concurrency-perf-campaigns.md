@@ -695,8 +695,20 @@ receiver's member through the chain fallbacks — with the spliced
 Iterable looked like a Map and drained empty. The sniff now routes
 through the MEMBER-STRICT probe (`getMemberField`). Ten distinct roots
 total drove the flip green (rounds 8-8i); KLIO_RFS=0 remains the
-bisect switch. Measurement pass (compose gate wall/count, vpd
-with-census, Map _clear, oneRect) running next.
+bisect switch.
+
+MEASURED (flip vs opt-in): compose gate 1388/2 unchanged, 423s
+true-warm (415 pre-flip — variance-level); vpd census: `kotlin.with`
+ELIMINATED from the hot list (612k -> absent) and total interpreted
+calls in the same 45s window 7.52M -> 8.02M (~+7-12% op-path
+throughput on the changelist apply loop); Map _clear 32.8s (32.4
+pre-flip, its path never used the spliced shapes), oneRect 21.6s,
+mapops 1516ms — all flat. The flip's value: kotlinc-equivalent inline
+semantics for the with/apply family across the whole corpus (a
+structural completeness milestone the earlier splice campaign
+excluded), plus the vpd op-loop gain. The two remaining gate tests
+still need the deeper call-throughput work; the with-splice alone was
+never their whole gap.
 
 ROUND 8h (baab8f95): the 22-sweep family root LANDED — subject-kind
 chain entries (a spliced/framed `with` subject) no longer suppress a
