@@ -222,6 +222,44 @@ no warning), and the check compared merged channels. The check now
 compares stdout byte-strict and stderr with `warning:` lines removed;
 compose_foundation passes deterministically — 399/0.
 
+## Speedup campaign round 1 (2026-08-24): the call ceiling, measured
+
+Branchy non-fused code (3M calls to a small classifier): native 4.0s vs
+interp 6.7s, and the native profile is ~69% INTERPRETIVE LEAF WALK
+(leafRead 24% / leafRunInsts 23% / leafWrite 13% / leafWalk 6%) — the
+glue leaf-serves every monomorphic callee, so the callee's own emitted
+C never runs (kf_ for the callee: 1.3%). fib(30): native 2.96s vs
+interp 3.15s — parity, same reason.
+
+MEASURED-NEGATIVE (tried, reverted): preferring the FRAMED native
+callee at the glue's direct-call arm (mirroring the evalWith-entry
+preference) — fib 2.96 -> 5.95s, branchy 4.0 -> 8.1s. The frame open +
+evalWith prologue costs ~2x more than the interpretive leaf walk saves;
+this is the same trade the glue's comment records from the original 3x
+fib regression. A frame-per-call route can never win at leaf sizes.
+
+THE DESIGN that can: scalar function replay (`kl_` bodies). Generalize
+the fused-loop int64+genre value model from loop regions to WHOLE
+function bodies:
+- Eligibility (static, emitter-side fixpoint): every op in {trace,
+  const_int, scalar const_load, move, load_param, scalar bin/cmp, br,
+  jump, ret, direct positional exact-arity calls to fns in the SAME
+  eligible set (self-recursion included)}. Such bodies are PURE over
+  scalars — no heap refs, no retain/release, no observable effects.
+- ABI: `int kl_<fid>(void *ctx, klio_edge_view *ev, const int64_t *argv,
+  const int *argg, int64_t *ret, int *retg, uint32_t depth)` — args and
+  result as (value, genre) pairs, locals as C int64s, branches on the
+  Bool genre, calls as DIRECT C calls to the callee's kl_.
+- Bail contract: return 0 anywhere (non-scalar entry arg, div-by-zero,
+  depth cap, edge-guard fire) — purity makes the caller's re-run of the
+  call through the existing interpretive leaf path exact, side-effect
+  free, and it raises the right exception in the right frame.
+- Edge guard: the fused-loop cadence per call entry; GC needs no
+  rooting (scalars only).
+- Entry: the native glue's direct-call arm tries kl_ first; the
+  interpretive leaf-serve stays as the fallback and the non-eligible
+  path.
+
 ## Next: the speedup campaign (open)
 
 The opaque call-per-op ABI trades the stream's inlined switch dispatch
