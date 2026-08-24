@@ -591,6 +591,28 @@ for receiver-formed closures. Until that lands, KLIO_RFS stays opt-in
 and the tree is behavior-identical with it off (parity 0 fails, sweep
 117/0).
 
+## Round 8b: with-family CORRECT under RFS; the flip backlog (2026-08-24)
+
+c715b615: the diagnosed AstLambda root fixed at its true mechanism —
+`recvFnReceiverFor` walked the chain to REPLACE a supplied receiver when
+the literal's declared head is a bare TYPE PARAMETER (`with`'s `T.()`),
+which proves nothing about any value; once the subject tower put an
+Instance on the chain it won over the real `with(list)` subject. An
+unprovable (unregistered-class) head now keeps the supplied receiver.
+With `KLIO_RFS=1`, ext_receiver_strict_proof.kt matches kotlinc
+EXACTLY — nested with() subjects, strict extension proofs, typealias
+expansion, nullable subjects all correct through spliced regions.
+
+DEFAULT-ON ATTEMPT: 14 parity reds (census in scratchpad/rfs_backlog.txt:
+two-receivers-via-this@label, companion implicit chain, static operator
+resolution, unsigned compare/sort via comparator paths, empty-container
+declared/binding elem typing, local-ext f-bounded param, nested-it
+shadow, char/string compareTo difference, nested expected-comparator
+chain, derived-receiver static binds). Each is a distinct shape where
+the splice's static resolution diverges from the framed route — the
+drive-green backlog for the flip. Default stays opt-in; the head-guard
+lands unconditionally (parity 0, sweep 117/0 with RFS off).
+
 ## Call-throughput round 3 (2026-08-24)
 
 - 956600b5 LANDED: host-served snapshot validity walk (readable/valid
