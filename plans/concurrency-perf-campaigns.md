@@ -683,10 +683,24 @@ removeAt` thrown with NO closure frame above mutableList:154
 op-literal body (`{ removeAt(2) }`, a CollectionOperation ctor arg
 consumed DYNAMICALLY) executing through an emission that only makes
 sense spliced. The failing test then pollutes siblings in-process.
-Splicing went back to OPT-IN on top (all fixes kept); next root = why
-a dynamically-consumed receiver-formed literal's body got a
-splice-context emission (multi-pass keep-selection of ctor-arg
-lambdas), then re-flip.
+Splicing went back to OPT-IN on top (all fixes kept). BISECTED
+(minimal repro: ConcurrentModificationTest.kt + the 3 actuals +
+testUtils, --filter=mutableList — fails SOLO, no batch needed): with
+KLIO_RFS=1 the failure persists with LLP=0, MEMBER_EXT_SPLICE=0, the
+tower reorder, receiver_is_owner widening, head derivation/inheritance,
+window recvTy, the relaxed walking arm, and the parity-defer bail ALL
+individually disabled — and DISAPPEARS exactly when the
+spliceInlineLambdaOn `EnclosingPush` is disabled (the ext-splice push
+alone is innocent). So the remaining root is the RUNTIME interaction:
+a subject pushed for an always-on splice kind (reified/suspend
+literals run even with LLP=0) lands on the chain that AstLambda
+CLOSURES created in the region snapshot (`captureChainAlloc` keeps
+kind=subject), and an op-literal (`{ removeAt(2) }`, receiver-formed
+CollectionOperation ctor arg) later resolves its bare calls against
+the stale snapshot instead of its invoke-time receiver-split. Next:
+either exclude tower-pushed subjects from closure creation snapshots
+when the literal declares its OWN receiver, or rank the snapshot
+subject below the receiver-split at the closure's walk.
 
 ROUND 8e (88bf1f7f, flip residue 4 -> 1 family): (a) the tower-region
 pin declines outright (a lexical-owner pin dispatched Holder's member ON
