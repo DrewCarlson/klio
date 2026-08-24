@@ -2221,6 +2221,21 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         }
     }
     try bindParams(&b, names.items);
+    // An EXTENSION function's own receiver is addressable as
+    // `this@<name>` from anywhere in its body — including inside a
+    // spliced receiver-lambda region, where the innermost `this` is the
+    // splice subject (`destination.apply { putAll(this@toMap) }` must
+    // read the ITERABLE, not the destination). Bind the labeled slot at
+    // entry so the labeled-this lowering resolves it directly; the
+    // framed-lambda route reaches the same slot through the capture walk.
+    if (f.receiver_type != null and names.items.len != 0 and
+        std.mem.eql(u8, names.items[0], "this"))
+    {
+        if (b.resolve("this")) |own_this| {
+            const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{f.name.name});
+            try b.bind(label, own_this);
+        }
+    }
     // A normal member's synthesized `this` is not present in the source
     // parameter list below. Seed it from the reserved declaration header so
     // explicit `this.member(...)` resolution sees the same qualified generic

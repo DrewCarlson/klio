@@ -2350,6 +2350,15 @@ pub const FuncBuilder = struct {
     pub fn contextFnParam(self: *const FuncBuilder, name: []const u8) ?ContextFnShape {
         return self.context_fn_params.get(name);
     }
+    /// The OUTERMOST scope's binding for `name` (a function's own entry
+    /// binding), ignoring inner shadowing — for `this@<ownFn>` inside a
+    /// spliced receiver lambda, where the innermost `this` is the subject.
+    pub fn resolveOutermost(self: *const FuncBuilder, name: []const u8) ?Reg {
+        for (self.scopes.items) |*scope| {
+            if (scope.get(name)) |r| return r;
+        }
+        return null;
+    }
     pub fn isReceiverLambdaParam(self: *const FuncBuilder, name: []const u8) bool {
         return self.receiver_lambda_params.contains(name);
     }

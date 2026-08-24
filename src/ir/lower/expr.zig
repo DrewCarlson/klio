@@ -1224,6 +1224,21 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     try b.push(.{ .LoadCapture = .{ .dst = dst2, .idx = idx } });
                     return dst2;
                 }
+                // Inside a spliced receiver-lambda region, `this@<fn>`
+                // naming the enclosing REAL function is that function's
+                // OWN receiver — the innermost `this` is the splice
+                // subject (`destination.apply { putAll(this@toMap) }`
+                // read the destination back and built an empty map). The
+                // outermost scope's `this` binding is the function's own.
+                if (inline_call.rfsEnabled() and
+                    (b.lambda_splice_resolve != null or b.encl_tower_depth > 0))
+                {
+                    if (build.currentRealFn()) |rf| {
+                        if (std.mem.eql(u8, rf, q.name)) {
+                            if (b.resolveOutermost("this")) |own| return own;
+                        }
+                    }
+                }
                 // Otherwise a class-name label (`this@Outer`): walk at runtime
                 // from the nearest `this` over the class/outer chain.
                 const this_reg = b.resolve("this") orelse blk: {
@@ -7119,7 +7134,20 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // walk's member-first runtime pick took the Iterable one), and
             // its own deferral remains the fallback when the shapes cannot
             // prove a pick.
-            const binds_this = !is_scoped_class and (b.hasOwnMember(nm) or member_of_recv);
+            var binds_this = !is_scoped_class and (b.hasOwnMember(nm) or member_of_recv);
+            // Under the subject tower, when the name ALSO has an
+            // extension candidate whose declared receiver matches the
+            // chain, the member-vs-extension arbitration needs argument
+            // applicability — static resolution's strength, not the
+            // runtime walk's (`putAll(pairs)` must drop the member
+            // `putAll(Map)` for the Iterable-pairs extension). Fall
+            // through to the static tiers; the commit-point parity guard
+            // still defers plain top-level picks.
+            if (binds_this and inline_call.rfsEnabled() and b.encl_tower_depth > 0 and
+                nameHasReceiverCandidate(b, nm, null))
+            {
+                binds_this = false;
+            }
             if (runtime.envOnce("KLIO_BINDS_TRACE")) |w| {
                 if (std.mem.eql(u8, w, nm)) {
                     const c0: []const u8 = if (recv_chain) |ch| (if (ch.len != 0) ch[0] else "<empty>") else "<null>";
@@ -7267,10 +7295,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     } });
                     return dst;
                 }
-            } else if ((recv_chain == null or
-                (b.lambda_splice_resolve != null and inline_call.rfsEnabled())) and
-                nameHasReceiverCandidate(b, nm, null))
-            {
+            } else if (recv_chain == null and nameHasReceiverCandidate(b, nm, null)) {
                 // The name is an extension namesake but the spliced receiver's
                 // type is unknown here, so we cannot prove it binds to the
                 // innermost `this`. Emit the receiver-walking form rather than
@@ -11668,6 +11693,20 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
                         }
                     }
                 }
+                // `this@<ownFn>` inside the function's own body (through
+                // any spliced receiver-lambda window) is the declared
+                // extension receiver — WITH its type arguments, so an
+                // overload rank on the labeled value keeps its element
+                // knowledge (`putAll(this@toMap)` must pick the
+                // Iterable-of-pairs extension, not a sibling).
+                if (build.currentRealFn()) |rf| {
+                    if (std.mem.eql(u8, rf, q.name)) {
+                        if (b.recvTypeRef()) |declared| return try declared.clone(b.allocator);
+                        if (b.recvTy()) |head| {
+                            return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
+                        }
+                    }
+                }
                 return null;
             }
             // The declared extension receiver, then the splice window's
@@ -12985,34 +13024,6 @@ fn lowerPathCall(
     const segments = callee.Path.segments;
     const name0 = segments[0].name;
 
-    // RESOLUTION PARITY for spliced receiver-lambda regions: the framed
-    // route lowers a receiver lambda's body with only the bare `T` head,
-    // so every shadowable bare call defers to the runtime member-first
-    // walk — and the walk is what implements Kotlin's implicit-receiver
-    // ranking. The spliced body sees concrete heads and local bindings
-    // and would COMMIT static picks the framed body never makes
-    // (`toTypedArray().apply { sort() }` bound a wrong `sort`). With the
-    // subject tower on the runtime chain, deferring is both correct and
-    // cheap: bail to the generic member-or-global fallthrough whenever
-    // the name could be claimed by a receiver.
-    if (inline_call.rfsEnabled() and b.encl_tower_depth > 0 and
-        b.resolve(name0) == null and !b.knowsOuter(name0) and
-        b.inlineLambdaFor(name0) == null and
-        !nameHasReifiedInlineCandidate(name0) and
-        (name0.len == 0 or !std.ascii.isUpper(name0[0])) and
-        // Receiver-shaped candidates only: the program-wide member-name
-        // universe is too weak here — it diverted `assertTypeEquals`
-        // (an expect/actual top-level whose bodyless EXPECT the runtime
-        // name lookup cannot serve) because some unrelated class happens
-        // to declare the name. A receiver member that genuinely shadows
-        // still wins through the runtime walk of the emitted deferred
-        // form when the static tiers decline on their own.
-        nameHasReceiverCandidate(b, name0, null))
-    {
-        orEmitAudit(b, "tower_parity_defer", "fallthrough", name0);
-        return null;
-    }
-
     // Secondary-ctor delegation / default-value thunk: a bare own-member call
     // with no `this` in scope is a companion access — the enclosing instance
     // does not exist yet, so `generateOetf(x)` inside `: this(generateOetf(x))`
@@ -13386,6 +13397,25 @@ fn lowerPathCall(
             orEmitAudit(b, "type_overload_deferred", "CallMemberOrGlobal", name0);
             return try emitMemberOrGlobal(b, expr, first_cand, false);
         }
+    }
+    // RESOLUTION PARITY for spliced receiver-lambda regions: a PLAIN
+    // top-level pick may be shadowed by the subject's members/extensions
+    // (the framed route's runtime walk would rank them first — static
+    // `sort()` inside `toTypedArray().apply { }` bound a wrong top-level
+    // where Array.sort must win). Defer those to the member-first walk.
+    // An EXTENSION pick stands: it is receiver-compatible evidence the
+    // walk can only weaken (`putAll(this@toMap)` must keep the
+    // Iterable-pairs extension, not fall to the member `putAll(Map)`).
+    if (inline_call.rfsEnabled() and b.encl_tower_depth > 0 and
+        res_final.target != null and !nameHasReifiedInlineCandidate(name0))
+    plain_defer: {
+        const tf0 = b.module.funcById(res_final.target.?) orelse break :plain_defer;
+        const is_ext0 = tf0.params.len != 0 and std.mem.eql(u8, tf0.params[0].name, "this");
+        if (is_ext0) break :plain_defer;
+        if (!nameHasReceiverCandidate(b, name0, null) and
+            !b.module.registry.class_member_names.contains(name0)) break :plain_defer;
+        orEmitAudit(b, "tower_parity_defer", "fallthrough", name0);
+        return null;
     }
     if (res_final.target) |target| {
         if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
