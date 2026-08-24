@@ -1251,6 +1251,9 @@ pub const Func = struct {
     /// the shared-cache path. Benign-race fill.
     bc_memo: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     bc_memo_fuse: u8 = 0,
+    /// `bc.streamGen()` at fill time; a cache reset frees the streams the
+    /// memo points at, so a stale generation must fall to the shared path.
+    bc_memo_gen: u32 = 0,
     /// The frameless leaf serve hit a STRUCTURALLY unsupported
     /// instruction in this body: every future serve would abandon at the
     /// same instruction, so the attempt (which may execute half the body

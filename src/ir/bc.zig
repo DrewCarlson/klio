@@ -94,6 +94,15 @@ pub const FuncStreams = struct {
 var cache_mutex: runtime.SpinMutex = .{};
 var cache: ?std.AutoHashMap(usize, *const FuncStreams) = null;
 
+/// Generation for the per-Func `bc_memo` fast path. `resetCacheForTest`
+/// FREES every cached FuncStreams; a Func that survives the reset (an
+/// in-process driver reusing one loaded module across programs) would
+/// otherwise serve its memoized pointer into freed memory.
+var stream_gen = std.atomic.Value(u32).init(1);
+pub fn streamGen() u32 {
+    return stream_gen.load(.monotonic);
+}
+
 /// Drop every cached stream table. The cache keys on the function's BLOCKS
 /// POINTER, which is stable for one program's life — an in-process driver
 /// that frees a program's module and runs another reuses those addresses,
@@ -105,6 +114,7 @@ var cache: ?std.AutoHashMap(usize, *const FuncStreams) = null;
 pub fn resetCacheForTest() void {
     cache_mutex.lock();
     defer cache_mutex.unlock();
+    _ = stream_gen.fetchAdd(1, .monotonic);
     const c = if (cache) |*cc| cc else return;
     const a = std.heap.smp_allocator;
     var it = c.valueIterator();
@@ -134,9 +144,10 @@ pub fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Co
     // The fill is final for a given allow_fuse; the other variant (a
     // process flips KLIO_JIT between runs only) keeps the shared path.
     const want_fuse: u8 = if (allow_fuse) 2 else 1;
+    const gen = stream_gen.load(.monotonic);
     {
         const m = func.bc_memo.load(.acquire);
-        if (m != 0 and func.bc_memo_fuse == want_fuse) {
+        if (m != 0 and func.bc_memo_fuse == want_fuse and func.bc_memo_gen == gen) {
             return if (m == 1) null else @ptrFromInt(m);
         }
     }
@@ -148,6 +159,7 @@ pub fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Co
     }
     if (cache.?.get(key)) |fs| {
         @constCast(func).bc_memo_fuse = want_fuse;
+        @constCast(func).bc_memo_gen = gen;
         @constCast(func).bc_memo.store(@intFromPtr(fs), .release);
         return fs;
     }
@@ -161,6 +173,7 @@ pub fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Co
     fs.* = .{ .streams = streams, .fused = fuse };
     cache.?.put(key, fs) catch return fs;
     @constCast(func).bc_memo_fuse = want_fuse;
+    @constCast(func).bc_memo_gen = gen;
     @constCast(func).bc_memo.store(@intFromPtr(fs), .release);
     return fs;
 }
