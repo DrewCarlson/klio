@@ -639,6 +639,14 @@ would, instead of letting the static tiers commit. One rule, applied at
 lowerPathCall's commit point gated on (rfsEnabled, encl_tower_depth >
 0), should retire most of the 14-shape backlog at once.
 
+Parity-defer LANDED (inert with RFS off): the lowerPathCall bail is in
+(gated rfsEnabled + encl_tower_depth>0). Default-on census after it:
+still 12 corpus reds, with several failure MODES changed (receiver
+ranking outputs shifted) — the rule moves shapes but is not sufficient
+alone; the remaining divergences also live outside bare-Path calls
+(operators, comparator paths through non-Path forms, elem typing).
+Continue peeling per-fixture with the default flipped locally.
+
 ## Call-throughput round 3 (2026-08-24)
 
 - 956600b5 LANDED: host-served snapshot validity walk (readable/valid
