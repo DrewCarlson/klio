@@ -2607,7 +2607,40 @@ fn anyFileMangledVariant(classes: *const ClassTable, name: []const u8) bool {
     return false;
 }
 
+/// Memo key for `argDefinitelyNotParamType`: the adjudication is a pure
+/// function of (param type, arg's runtime TYPE) for scalars, callables,
+/// Null, and Instances (whose arm reads only the class and its static
+/// hierarchy). Container/tuple/range args adjudicate their CONTENTS, so
+/// they stay unmemoized (null key).
+fn admArgKey(arg: *const Value) ?usize {
+    return switch (arg.*) {
+        .Instance => |i| @intFromPtr(i.asPtrConst().class.asPtrConst()),
+        .List, .Set, .Map, .Array, .Sequence, .Range, .Pair, .Triple, .MapEntry => null,
+        else => (@as(usize, @intFromEnum(std.meta.activeTag(arg.*))) << 1) | 1,
+    };
+}
+
+const TlAdmEntry = struct { ty: usize = 0, akey: usize = 0, gen: u32 = 0, verdict: u8 = 0 };
+threadlocal var tl_adm_cache: [4096]TlAdmEntry = @splat(.{});
+
+/// Per-call front for the type-disproof adjudicator: overload resolution
+/// consults it per (candidate param, arg) on every dispatch that walks
+/// candidates, and the uncached ladder pays alias/class-registry string
+/// probes plus a heap-allocating supertype BFS each time — measured as the
+/// dominant string-eql source on recompose-heavy workloads.
 pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) bool {
+    const akey = admArgKey(arg) orelse return argDefinitelyNotParamTypeUncached(self, param_ty, arg);
+    const ty = @intFromPtr(param_ty);
+    const h = (@as(u64, @intCast(ty)) *% 0x9E3779B97F4A7C15) ^ @as(u64, @intCast(akey));
+    const e = &tl_adm_cache[@as(usize, @intCast((h ^ (h >> 17)) & (tl_adm_cache.len - 1)))];
+    const gen = cacheGen();
+    if (e.verdict != 0 and e.ty == ty and e.akey == akey and e.gen == gen) return e.verdict == 2;
+    const v = argDefinitelyNotParamTypeUncached(self, param_ty, arg);
+    e.* = .{ .ty = ty, .akey = akey, .gen = gen, .verdict = if (v) 2 else 1 };
+    return v;
+}
+
+fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) bool {
     var pn = param_ty.name;
     // A QUALIFIED function-type head (`kotlin.Function1`) must reach the
     // Function arm below, not the qualified-name early-out: the callable
@@ -9730,7 +9763,14 @@ inline fn cacheGen() u32 {
     return dispatch_cache_gen.load(.monotonic);
 }
 
-const TlMethodEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, raw_plus: u64 = 0, gen: u32 = 0 };
+const TlMethodEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, raw_plus: u64 = 0, gen: u32 = 0, miss_ttl: u8 = 0 };
+
+/// `raw_plus` sentinel: the SHARED map had no entry for this key when last
+/// probed. The shared maps are add-only, so the only staleness is an entry
+/// appearing later; `miss_ttl` re-probes every 64th consult to pick it up,
+/// amortizing the program-cell borrow (whose atomic word ping-pongs between
+/// cores) instead of paying it on every miss forever.
+const TL_ABSENT: u64 = std.math.maxInt(u64);
 threadlocal var tl_method_cache: [TL_METHOD_CACHE_SIZE]TlMethodEntry = @splat(.{});
 threadlocal var tl_ext_cache: [TL_METHOD_CACHE_SIZE]TlMethodEntry = @splat(.{});
 
@@ -9739,18 +9779,31 @@ inline fn tlSlot(key: root_mod.ProgramImage.InstanceMethodKey) usize {
     return @intCast((h ^ (h >> 17)) & (TL_METHOD_CACHE_SIZE - 1));
 }
 
-inline fn tlGet(cache: *[TL_METHOD_CACHE_SIZE]TlMethodEntry, key: root_mod.ProgramImage.InstanceMethodKey) ?u32 {
+const TlProbe = union(enum) { hit: u32, absent, unknown };
+
+inline fn tlGet(cache: *[TL_METHOD_CACHE_SIZE]TlMethodEntry, key: root_mod.ProgramImage.InstanceMethodKey) TlProbe {
     const e = &cache[tlSlot(key)];
     if (e.raw_plus != 0 and e.gen == cacheGen() and e.class_p == key.class_p and e.name_p == key.name_p and
         e.sig == key.sig and e.n_args == key.n_args)
     {
-        return @intCast(e.raw_plus - 1);
+        if (e.raw_plus == TL_ABSENT) {
+            if (e.miss_ttl > 0) {
+                e.miss_ttl -= 1;
+                return .absent;
+            }
+            return .unknown;
+        }
+        return .{ .hit = @intCast(e.raw_plus - 1) };
     }
-    return null;
+    return .unknown;
 }
 
 inline fn tlPut(cache: *[TL_METHOD_CACHE_SIZE]TlMethodEntry, key: root_mod.ProgramImage.InstanceMethodKey, raw: u32) void {
     cache[tlSlot(key)] = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .raw_plus = @as(u64, raw) + 1, .gen = cacheGen() };
+}
+
+inline fn tlPutAbsent(cache: *[TL_METHOD_CACHE_SIZE]TlMethodEntry, key: root_mod.ProgramImage.InstanceMethodKey) void {
+    cache[tlSlot(key)] = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .raw_plus = TL_ABSENT, .gen = cacheGen(), .miss_ttl = 63 };
 }
 
 /// Thread-local L1 for the named-binding permutation map.
@@ -9787,36 +9840,46 @@ fn tlResolveStore(key: root_mod.ProgramImage.MemberResolveKey, entry: root_mod.P
 }
 
 fn instanceMethodCacheGetRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?u32 {
-    if (tlGet(&tl_method_cache, key)) |raw| return raw;
+    switch (tlGet(&tl_method_cache, key)) {
+        .hit => |raw| return raw,
+        .absent => return null,
+        .unknown => {},
+    }
     const raw: ?u32 = blk: {
         const pg = self.prog.borrow();
         defer pg.deinit();
         break :blk pg.get().instance_method_cache.get(key);
     };
-    if (raw) |r| tlPut(&tl_method_cache, key, r);
+    if (raw) |r| tlPut(&tl_method_cache, key, r) else tlPutAbsent(&tl_method_cache, key);
     return raw;
 }
 
 fn instanceMethodCachePutRaw(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, raw: u32) void {
     if (!ir.eval.dispatchCacheStable()) return;
+    tlPut(&tl_method_cache, key, raw);
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     pg.get().instance_method_cache.put(key, raw) catch {};
 }
 
 fn extMethodCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?u32 {
-    if (tlGet(&tl_ext_cache, key)) |raw| return raw;
+    switch (tlGet(&tl_ext_cache, key)) {
+        .hit => |raw| return raw,
+        .absent => return null,
+        .unknown => {},
+    }
     const raw: ?u32 = blk: {
         const pg = self.prog.borrow();
         defer pg.deinit();
         break :blk pg.get().ext_method_cache.get(key);
     };
-    if (raw) |r| tlPut(&tl_ext_cache, key, r);
+    if (raw) |r| tlPut(&tl_ext_cache, key, r) else tlPutAbsent(&tl_ext_cache, key);
     return raw;
 }
 
 fn extMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, fid: u32) void {
     if (!ir.eval.dispatchCacheStable()) return;
+    tlPut(&tl_ext_cache, key, fid);
     const pg = self.prog.borrowMut();
     defer pg.deinit();
     pg.get().ext_method_cache.put(key, fid) catch {};
@@ -9826,7 +9889,7 @@ fn extMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey
 /// by a native binding (or its cached "no intrinsic" miss) otherwise pays a
 /// program-cell borrow plus a shared-map probe on every single call. `state`:
 /// 0 empty, 1 mirrored. Same add-only/gen-stamp discipline as the method L1s.
-const TlIntrinsicEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, state: u8 = 0, gen: u32 = 0, entry: root_mod.ProgramImage.MemberResolveEntry = .{ .func = null, .fqn = "" } };
+const TlIntrinsicEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, state: u8 = 0, gen: u32 = 0, miss_ttl: u8 = 0, entry: root_mod.ProgramImage.MemberResolveEntry = .{ .func = null, .fqn = "" } };
 threadlocal var tl_intrinsic_cache: [TL_METHOD_CACHE_SIZE]TlIntrinsicEntry = @splat(.{});
 
 fn instanceIntrinsicCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey) ?root_mod.ProgramImage.MemberResolveEntry {
@@ -9834,7 +9897,12 @@ fn instanceIntrinsicCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceM
     if (e.state != 0 and e.gen == cacheGen() and e.class_p == key.class_p and e.name_p == key.name_p and
         e.sig == key.sig and e.n_args == key.n_args)
     {
-        return e.entry;
+        if (e.state == 2) {
+            if (e.miss_ttl > 0) {
+                e.miss_ttl -= 1;
+                return null;
+            }
+        } else return e.entry;
     }
     const hit: ?root_mod.ProgramImage.MemberResolveEntry = blk: {
         const pg = self.prog.borrow();
@@ -9843,6 +9911,8 @@ fn instanceIntrinsicCacheGet(self: *VmHost, key: root_mod.ProgramImage.InstanceM
     };
     if (hit) |h| {
         e.* = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .state = 1, .gen = cacheGen(), .entry = h };
+    } else {
+        e.* = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .state = 2, .gen = cacheGen(), .miss_ttl = 63, .entry = .{ .func = null, .fqn = "" } };
     }
     return hit;
 }
