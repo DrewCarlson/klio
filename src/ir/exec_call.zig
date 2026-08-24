@@ -1210,8 +1210,9 @@ pub noinline fn execArmStoreToThisOrGlobal(comptime H: type, allocator: Allocato
         // resolves to an extension-property *setter* (`var T.x set(…)`)
         // declared on the receiver's type or a supertype, not only a
         // stored member; `setField` dispatches both.
-        const cands = try implicitCandidatesAlloc(H, allocator, frame, stg.this_idx, true, host, name_str, null);
-        defer allocator.free(cands);
+        var cands_l = try implicitCandidatesAlloc(H, allocator, frame, stg.this_idx, true, host, name_str, null);
+        defer releaseCands(allocator, &cands_l);
+        const cands = cands_l.items;
         const cands_keepalive = pinImplicitCandidates(cands);
         defer runtime.keepaliveRestore(cands_keepalive);
         // Mirror the read side's capture shadow: a captured enclosing
@@ -1258,8 +1259,9 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
         // implicit receiver is the frame's `this` *parameter*, not
         // a capture slot.
         runtime.prof.opRoute(11);
-        const cands = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, stripScopeGetter(name_str), null);
-        defer allocator.free(cands);
+        var cands_l = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, stripScopeGetter(name_str), null);
+        defer releaseCands(allocator, &cands_l);
+        const cands = cands_l.items;
         const cands_keepalive = pinImplicitCandidates(cands);
         defer runtime.keepaliveRestore(cands_keepalive);
         // Per-candidate probes are member-only (`getMemberField`):
@@ -1435,8 +1437,9 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
                     // Kotlin-legal binding left: retry the candidates with
                     // the PLAIN property name before failing.
                     if (!std.mem.eql(u8, bare_name, constStr(frame.module, lt.name) orelse bare_name)) {
-                        const cands2 = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, bare_name, null);
-                        defer allocator.free(cands2);
+                        var cands2_l = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, bare_name, null);
+                        defer releaseCands(allocator, &cands2_l);
+                        const cands2 = cands2_l.items;
                         const ka2 = pinImplicitCandidates(cands2);
                         defer runtime.keepaliveRestore(ka2);
                         for (cands2) |c2| {
@@ -1714,8 +1717,9 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
         // The nearest receiver carrying the member may sit deeper in the
         // implicit chain than the innermost `this` (a suspend block's
         // innermost receiver is the coroutine, not the declaring class).
-        const rcands = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
-        defer allocator.free(rcands);
+        var rcands_l = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
+        defer releaseCands(allocator, &rcands_l);
+        const rcands = rcands_l.items;
         const rcands_keepalive = pinImplicitCandidates(rcands);
         defer runtime.keepaliveRestore(rcands_keepalive);
         for (rcands) |c| {
@@ -1835,8 +1839,9 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
 
     if (routeTraceOn(name_str)) std.debug.print("[cmgsec] member-gate ctor={} shadow={} skip={}\n", .{ is_ctor_name, shadow_capture, skip_member });
     if (!is_ctor_name and !shadow_capture and !skip_member) {
-        const cands = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
-        defer allocator.free(cands);
+        var cands_l = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
+        defer releaseCands(allocator, &cands_l);
+        const cands = cands_l.items;
         const cands_keepalive = pinImplicitCandidates(cands);
         defer runtime.keepaliveRestore(cands_keepalive);
         single_cand = cands.len == 1;
@@ -2103,8 +2108,9 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
         }
     }
     if (resolved == null and if (nuTraceWant()) |w| std.mem.eql(u8, name_str, w) else false) {
-        const cands2 = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
-        defer allocator.free(cands2);
+        var cands2_l = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
+        defer releaseCands(allocator, &cands2_l);
+        const cands2 = cands2_l.items;
         const cands_keepalive = pinImplicitCandidates(cands2);
         defer runtime.keepaliveRestore(cands_keepalive);
         const dbg_srt: []const u8 = blk: {
@@ -2781,9 +2787,39 @@ fn samCandidateInvoke(
     }
 }
 
-fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const Frame, this_idx: usize, consult_param: bool, host: *H, bare_name: []const u8, direct_this: ?Value) Allocator.Error![]ImplicitCandidate {
-    var out: std.ArrayList(ImplicitCandidate) = .empty;
-    errdefer out.deinit(allocator);
+/// Free-list of candidate buffers: the walk runs on every dynamic member
+/// dispatch and its alloc/free pair showed in the gate's heaviest test.
+/// Buffers are allocator-owned (growth past the class frees them into the
+/// allocator exactly as the args pool's carriers do); release retains
+/// only exact-class capacities.
+const CAND_POOL_CAP = 32;
+const CAND_POOL_MAX = 8;
+threadlocal var cand_pool: struct { bufs: [CAND_POOL_MAX][]ImplicitCandidate, len: usize } = .{ .bufs = undefined, .len = 0 };
+
+fn acquireCands(allocator: Allocator) Allocator.Error!std.ArrayList(ImplicitCandidate) {
+    if (cand_pool.len > 0) {
+        cand_pool.len -= 1;
+        const b = cand_pool.bufs[cand_pool.len];
+        return .{ .items = b[0..0], .capacity = b.len };
+    }
+    var l: std.ArrayList(ImplicitCandidate) = .empty;
+    try l.ensureTotalCapacityPrecise(allocator, CAND_POOL_CAP);
+    return l;
+}
+
+fn releaseCands(allocator: Allocator, l: *std.ArrayList(ImplicitCandidate)) void {
+    if (l.capacity == CAND_POOL_CAP and cand_pool.len < CAND_POOL_MAX) {
+        cand_pool.bufs[cand_pool.len] = l.items.ptr[0..l.capacity];
+        cand_pool.len += 1;
+        l.* = .empty;
+        return;
+    }
+    l.deinit(allocator);
+}
+
+fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const Frame, this_idx: usize, consult_param: bool, host: *H, bare_name: []const u8, direct_this: ?Value) Allocator.Error!std.ArrayList(ImplicitCandidate) {
+    var out: std.ArrayList(ImplicitCandidate) = try acquireCands(allocator);
+    errdefer releaseCands(allocator, &out);
     var depth: u16 = 0;
     const entries = try enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
@@ -2863,7 +2899,7 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
         const e_own = ei == 0 and inner != null and sameReceiver(e.v, inner.?);
         try appendCandidateRun(H, allocator, &out, e.v, e.isSubject(), e_own, &depth, host, bare_name);
     }
-    return out.toOwnedSlice(allocator);
+    return out;
 }
 
 /// Append `v` and, unless it entered scope as a `with`/`run` subject, its
