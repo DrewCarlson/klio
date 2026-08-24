@@ -2874,6 +2874,28 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         return dst;
     }
 
+    // `c.code` on a STATIC Char receiver is the scalar identity read â
+    // emit it as `c - NUL` (Char minus Char is Int in Kotlin, and the
+    // subtrahend is code zero), a plain BinOp instead of a dynamic field
+    // read: it stays in fused loop regions and skips the runtime
+    // extension-getter dispatch per read.
+    if (std.mem.eql(u8, name.name, "code")) {
+        const recv_head: ?[]const u8 = blk: {
+            const t = staticExprTypeRef(b, receiver) catch null;
+            var tr = t orelse break :blk null;
+            defer tr.deinit(b.allocator);
+            if (tr.nullable) break :blk null;
+            break :blk if (std.mem.eql(u8, typeHead(tr.name), "Char")) "Char" else null;
+        };
+        if (recv_head != null) {
+            const recv = try lowerReceiver(b, receiver);
+            const zero = try b.emitConst(.{ .Char = 0 });
+            const dst = b.allocReg();
+            try b.push(.{ .BinOp = .{ .dst = dst, .op = .Sub, .lhs = recv, .rhs = zero } });
+            return dst;
+        }
+    }
+
     // Static-type-directed extension-property read. When the receiver's
     // STATIC type resolves `name` to an in-scope member-extension property
     // rather than a member of that type, Kotlin runs the extension getter —

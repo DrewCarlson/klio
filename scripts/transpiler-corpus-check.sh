@@ -30,11 +30,20 @@ check_one() {
     if ! zig cc "$out/$name.c" -Izig-out/include -Lzig-out/lib -lklio_rt -lzstd -o "$out/$name" 2> "$out/$name.cc.log"; then
         echo "FAIL cc" > "$out/$name.status"; echo "  FAIL $name (cc)"; return
     fi
-    timeout 120 ./zig-out/bin/klio run "$kt" > "$out/$name.interp.out" 2>&1
+    # stdout compares byte-strict; stderr compares with lowering
+    # `warning:` lines removed — the native binary runs its PINNED image
+    # (no lowering pass), so those warnings legitimately appear only on
+    # the interpreter side. Runtime errors still differ loudly (rc +
+    # remaining stderr lines).
+    timeout 120 ./zig-out/bin/klio run "$kt" > "$out/$name.interp.out" 2> "$out/$name.interp.err"
     local interp_rc=$?
-    timeout 120 "$out/$name" > "$out/$name.native.out" 2>&1
+    timeout 120 "$out/$name" > "$out/$name.native.out" 2> "$out/$name.native.err"
     local native_rc=$?
-    if [[ $interp_rc -ne $native_rc ]] || ! diff -q "$out/$name.interp.out" "$out/$name.native.out" > /dev/null; then
+    grep -v '^warning: ' "$out/$name.interp.err" > "$out/$name.interp.err.f" || true
+    grep -v '^warning: ' "$out/$name.native.err" > "$out/$name.native.err.f" || true
+    if [[ $interp_rc -ne $native_rc ]] ||
+        ! diff -q "$out/$name.interp.out" "$out/$name.native.out" > /dev/null ||
+        ! diff -q "$out/$name.interp.err.f" "$out/$name.native.err.f" > /dev/null; then
         echo "FAIL parity" > "$out/$name.status"
         echo "  FAIL $name (parity: interp rc=$interp_rc native rc=$native_rc)"; return
     fi

@@ -34,6 +34,9 @@ typedef struct {
   uint8_t span_usable;
   uint32_t span_file_off, span_start_off, span_end_off, span_tag_off;
   uint8_t span_tag_set;
+  /* Char payload location + tag, for fused loops over Char scalars. */
+  uint32_t char_off;
+  uint64_t tag_char;
 } klio_hot_layout;
 void klio_rt_hot_layout(klio_hot_layout *out);
 
@@ -63,7 +66,7 @@ uint8_t *klio_op_span_slot(void *ctx);
  * `usable`) is chosen. Call before klio_rt_run_*. */
 void klio_rt_register_hot_layout(klio_hot_layout *slot);
 
-/* The library's ABI version (this header describes version 3). */
+/* The library's ABI version (this header describes version 4). */
 int klio_rt_abi_version(void);
 
 /* A transpiled function body: runs the function's blocks starting at

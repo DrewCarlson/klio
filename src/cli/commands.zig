@@ -535,6 +535,15 @@ fn transpileEmit(
         \\  memcpy(s + KV.long_off, &v, 8);
         \\  kv_set_tag(s, KV.tag_long);
         \\}}
+        \\static inline uint16_t kv_char(const uint8_t *s) {{
+        \\  uint16_t v;
+        \\  memcpy(&v, s + KV.char_off, 2);
+        \\  return v;
+        \\}}
+        \\static inline void kv_set_char(uint8_t *s, uint16_t v) {{
+        \\  memcpy(s + KV.char_off, &v, 2);
+        \\  kv_set_tag(s, KV.tag_char);
+        \\}}
         \\
         \\/* Inlined per-statement trace store: a plain 3-field + presence
         \\ * write into the frame's cur_span slot (no ownership). */
@@ -782,6 +791,7 @@ fn fuseConstScalar(consts: []const ir.Const, id: u32) ?struct { g: u8, v: i64 } 
         .Long => |v| .{ .g = 1, .v = v },
         .Bool => |v| .{ .g = 2, .v = @intFromBool(v) },
         .Unit => .{ .g = 3, .v = 0 },
+        .Char => |v| .{ .g = 4, .v = v },
         else => null,
     };
 }
@@ -1007,7 +1017,7 @@ fn emitFuseSpill(w: anytype, cl: *const CountedLoop) !void {
         try w.print("        if (span_slot) kv_trace(span_slot, {d}u, {d}u, {d}u);\n", .{ t[0], t[1], t[2] });
     }
     for (cl.writes[0..cl.n_writes]) |r| {
-        try w.print("        if (g{d} == 3) kv_set_tag(kv_slot(regs, {d}u), KV.tag_unit); else if (g{d} == 2) kv_set_bool(kv_slot(regs, {d}u), (uint8_t)l{d}); else if (g{d} == 1) kv_set_long(kv_slot(regs, {d}u), l{d}); else kv_const_int(kv_slot(regs, {d}u), (int32_t)l{d});\n", .{ r, r, r, r, r, r, r, r, r, r });
+        try w.print("        if (g{d} == 4) kv_set_char(kv_slot(regs, {d}u), (uint16_t)l{d}); else if (g{d} == 3) kv_set_tag(kv_slot(regs, {d}u), KV.tag_unit); else if (g{d} == 2) kv_set_bool(kv_slot(regs, {d}u), (uint8_t)l{d}); else if (g{d} == 1) kv_set_long(kv_slot(regs, {d}u), l{d}); else kv_const_int(kv_slot(regs, {d}u), (int32_t)l{d});\n", .{ r, r, r, r, r, r, r, r, r, r, r, r, r });
     }
 }
 
@@ -1027,9 +1037,12 @@ fn emitTagPropOp(w: anytype, op: FusedOp, idx: usize, round: u32) !void {
             if (hot.is_bool) {
                 try w.print("      g{d} = 2;\n", .{b.dst});
             } else if (round == 0) {
-                try w.print("      f{d} = (g{d} | g{d}) & 1; g{d} = f{d};\n", .{ idx, b.lhs, b.rhs, b.dst, idx });
+                // Char operands: Char-Char is Int, Char+/-Int stays Char;
+                // either way the compute width is 32-bit (f = 0). The
+                // legal-Kotlin combinations are the only reachable ones.
+                try w.print("      if (g{d} == 4 || g{d} == 4) {{ f{d} = 0; g{d} = (g{d} == 4 && g{d} == 4) ? 0 : 4; }} else {{ f{d} = (g{d} | g{d}) & 1; g{d} = f{d}; }}\n", .{ b.lhs, b.rhs, idx, b.dst, b.lhs, b.rhs, idx, b.lhs, b.rhs, b.dst, idx });
             } else {
-                try w.print("      {{ int nf = (g{d} | g{d}) & 1; if (nf != f{d}) fok = 0; f{d} = nf; g{d} = nf; }}\n", .{ b.lhs, b.rhs, idx, idx, b.dst });
+                try w.print("      {{ int nf; int ng; if (g{d} == 4 || g{d} == 4) {{ nf = 0; ng = (g{d} == 4 && g{d} == 4) ? 0 : 4; }} else {{ nf = (g{d} | g{d}) & 1; ng = nf; }} if (nf != f{d}) fok = 0; f{d} = nf; g{d} = ng; }}\n", .{ b.lhs, b.rhs, b.lhs, b.rhs, b.lhs, b.rhs, idx, idx, b.dst });
             }
         },
     }
@@ -1073,7 +1086,7 @@ fn emitFusedCountedLoop(w: anytype, cl: *const CountedLoop) !void {
         try w.print("    int64_t l{d} = 0; int g{d} = 0; (void)l{d}; (void)g{d};\n", .{ r, r, r, r });
     }
     for (cl.reads[0..cl.n_reads]) |r| {
-        try w.print("    {{ const uint8_t *s = kv_slot(regs, {d}u); uint64_t t = kv_tag(s); if (t == KV.tag_int) {{ l{d} = kv_int(s); g{d} = 0; }} else if (t == KV.tag_long) {{ l{d} = kv_long(s); g{d} = 1; }} else fok = 0; }}\n", .{ r, r, r, r, r });
+        try w.print("    {{ const uint8_t *s = kv_slot(regs, {d}u); uint64_t t = kv_tag(s); if (t == KV.tag_int) {{ l{d} = kv_int(s); g{d} = 0; }} else if (t == KV.tag_long) {{ l{d} = kv_long(s); g{d} = 1; }} else if (t == KV.tag_char) {{ l{d} = (int64_t)kv_char(s); g{d} = 4; }} else fok = 0; }}\n", .{ r, r, r, r, r, r, r });
     }
     // Per-arith-op frozen width flags, settled by two propagation rounds
     // (fixpoint) and a verify round; a tag pattern that has not converged

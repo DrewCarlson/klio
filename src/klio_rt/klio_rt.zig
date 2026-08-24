@@ -113,6 +113,9 @@ pub const HotLayout = extern struct {
     span_end_off: u32,
     span_tag_off: u32,
     span_tag_set: u8,
+    /// Char payload location + tag, for fused loops over Char scalars.
+    char_off: u32,
+    tag_char: u64,
 };
 
 fn tagOffset() struct { off: u32, size: u32 } {
@@ -245,14 +248,17 @@ export fn klio_rt_hot_layout(out: *HotLayout) void {
     var vl: runtime.Value = undefined;
     var vb: runtime.Value = undefined;
     var vu: runtime.Value = undefined;
+    var vc: runtime.Value = undefined;
     @memset(std.mem.asBytes(&vi), 0);
     @memset(std.mem.asBytes(&vl), 0);
     @memset(std.mem.asBytes(&vb), 0);
     @memset(std.mem.asBytes(&vu), 0);
+    @memset(std.mem.asBytes(&vc), 0);
     vi = .{ .Int = 0 };
     vl = .{ .Long = 0 };
     vb = .{ .Bool = false };
     vu = .{ .Unit = {} };
+    vc = .{ .Char = 0 };
     const sp = spanProbe();
     out.* = .{
         .value_size = @sizeOf(runtime.Value),
@@ -278,6 +284,8 @@ export fn klio_rt_hot_layout(out: *HotLayout) void {
         .span_end_off = sp.end_off,
         .span_tag_off = sp.tag_off,
         .span_tag_set = sp.tag_set,
+        .char_off = @intCast(@intFromPtr(&vc.Char) - @intFromPtr(&vc)),
+        .tag_char = readTag(&vc, t.off, t.size),
     };
     if (std.c.getenv("KLIO_NATIVE_TRACE") != null)
         std.debug.print("[rt] wrote usable={d} vsize={d} (sizeOf={d}) reclaimReq={}\n", .{ out.usable, out.value_size, @sizeOf(runtime.Value), runtime.reclaimRequested() });
@@ -285,7 +293,7 @@ export fn klio_rt_hot_layout(out: *HotLayout) void {
 
 /// Library version tag for the header/link handshake.
 export fn klio_rt_abi_version() c_int {
-    return 3;
+    return 4;
 }
 
 /// Register a transpiled function for `fid`; the interpreter's frame loop
