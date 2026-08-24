@@ -128,13 +128,29 @@ pub fn resetCacheForTest() void {
 /// module's constant table (for embedding small Int payloads).
 pub fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Const) ?*const FuncStreams {
     if (func.blocks.len == 0) return null;
+    // Per-Func memo: the shared cache below takes a global mutex + hash
+    // probe on EVERY activation (and the leaf serve asks again) — a
+    // measured per-call compounder and a cross-thread contention point.
+    // The fill is final for a given allow_fuse; the other variant (a
+    // process flips KLIO_JIT between runs only) keeps the shared path.
+    const want_fuse: u8 = if (allow_fuse) 2 else 1;
+    {
+        const m = func.bc_memo.load(.acquire);
+        if (m != 0 and func.bc_memo_fuse == want_fuse) {
+            return if (m == 1) null else @ptrFromInt(m);
+        }
+    }
     const key = @intFromPtr(func.blocks.ptr);
     cache_mutex.lock();
     defer cache_mutex.unlock();
     if (cache == null) {
         cache = std.AutoHashMap(usize, *const FuncStreams).init(std.heap.smp_allocator);
     }
-    if (cache.?.get(key)) |fs| return fs;
+    if (cache.?.get(key)) |fs| {
+        @constCast(func).bc_memo_fuse = want_fuse;
+        @constCast(func).bc_memo.store(@intFromPtr(fs), .release);
+        return fs;
+    }
     const a = std.heap.smp_allocator;
     const fuse = allow_fuse and fusible(func);
     const streams = a.alloc(?*const Stream, func.blocks.len) catch return null;
@@ -144,6 +160,8 @@ pub fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Co
     const fs = a.create(FuncStreams) catch return null;
     fs.* = .{ .streams = streams, .fused = fuse };
     cache.?.put(key, fs) catch return fs;
+    @constCast(func).bc_memo_fuse = want_fuse;
+    @constCast(func).bc_memo.store(@intFromPtr(fs), .release);
     return fs;
 }
 

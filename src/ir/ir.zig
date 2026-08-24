@@ -1244,6 +1244,13 @@ pub const Func = struct {
     /// before the program runs, so the first resolution is final;
     /// benign-race fill.
     leaf_route: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// The bytecode-stream table for this func (`bc.funcStreams` memo):
+    /// 0 unresolved, 1 none, else a `*const bc.FuncStreams` address.
+    /// `bc_memo_fuse` records which allow_fuse variant the memo holds
+    /// (1 = false, 2 = true); a caller wanting the other variant takes
+    /// the shared-cache path. Benign-race fill.
+    bc_memo: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    bc_memo_fuse: u8 = 0,
     /// The frameless leaf serve hit a STRUCTURALLY unsupported
     /// instruction in this body: every future serve would abandon at the
     /// same instruction, so the attempt (which may execute half the body
