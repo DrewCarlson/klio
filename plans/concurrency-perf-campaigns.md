@@ -683,6 +683,27 @@ removeAt` thrown with NO closure frame above mutableList:154
 op-literal body (`{ removeAt(2) }`, a CollectionOperation ctor arg
 consumed DYNAMICALLY) executing through an emission that only makes
 sense spliced. The failing test then pollutes siblings in-process.
+ROUND 8h (baab8f95): the 22-sweep family root LANDED — subject-kind
+chain entries (a spliced/framed `with` subject) no longer suppress a
+REAL receiver param's own candidate run (the dispatch tower is what
+lets the inner IteratorImpl's `remove` reach the OUTER list), while a
+capture-received lambda `this` still dedups against its subject entry
+(kotlinc REJECTS `describe()` inside `with(outer.Inner())` — the
+subject exposes no enclosing-instance tower; the with_subject_outer_
+member_call_rejected fixture pins both sides). Sweep default-on went
+22 -> 2 with this + the walk-ordering fix; the seed file (CMT) is
+6/6 under the flip. Plus: ext fns bind `this@<name>` at entry (the
+labeled receiver resolves inside spliced regions), the labeled-this
+static type derives from the declared receiver, the commit-point
+parity guard defers only PLAIN top-level picks (extension picks
+stand), and the walking arm declines member-claims when a chain-
+compatible extension candidate needs argument adjudication. REMAINING
+under default-on: the MapTest pair (createFrom/populateTo) — the
+spliced `destination.apply { putAll(this@toMap) }` still ranks the
+putAll overload family wrong through the fallthrough (labeled-this
+type derivation not consulted by that site's shapes; #2423 vs #2422).
+One overload-rank root from the flip.
+
 Splicing went back to OPT-IN on top (all fixes kept). BISECTED
 (minimal repro: ConcurrentModificationTest.kt + the 3 actuals +
 testUtils, --filter=mutableList — fails SOLO, no batch needed): with
