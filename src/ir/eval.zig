@@ -2155,10 +2155,28 @@ pub inline fn errResult(e: EvalError) EvalResult {
 /// the *done sentinel* (the synthesized block whose entry signals
 /// the finally body has run to completion regardless of any internal
 /// control flow in the user finally body).
+
+/// Restore the frame's enclosing-receiver chain to its try-entry length
+/// when a throw routes to a catch or finally: the unwind skipped any
+/// `EnclosingPop` inside the try body, and the stale spliced subject
+/// would otherwise shadow reads for the rest of the frame.
+fn truncChainTo(frame: *Frame, chain_len: usize) void {
+    if (frame.enclosing_this.items.len > chain_len) {
+        frame.enclosing_this.shrinkRetainingCapacity(chain_len);
+    }
+}
+
 pub const TryFrame = struct {
     /// The try body's entry block — the key for matching pop /
     /// pending-return / pending-rethrow against `Block.finally_done_for`.
     body: BlockId,
+    /// The frame's enclosing-receiver chain length at try entry: an
+    /// exception unwinding out of a spliced receiver-lambda region skips
+    /// its `EnclosingPop`, and a caught throw would otherwise leave the
+    /// stale subject on the chain for everything after the catch
+    /// (`assertFails { ... }` inside a spliced test-DSL region polluted
+    /// every later test in the runner's frame). Restored on catch.
+    chain_len: usize = 0,
     catches: []ir.CatchHandler,
     /// Where to jump to start running the finally / first catch.
     /// `null` for a try with only catches and no finally.
@@ -5832,6 +5850,7 @@ fn runFrameExec(
         if (resume_idx == 0 and (has_catches or finally != null or block.lr_absorb != null)) {
             try try_stack.append(allocator, .{
                 .body = cur,
+                .chain_len = frame.enclosing_this.items.len,
                 .catches = block.catches,
                 .finally_entry = finally,
                 .finally_done = finally_done,
@@ -6208,6 +6227,7 @@ fn runFrameExec(
                     if (pending_depth) |depth| {
                         if (try_stack.items.len < depth) frame.pending_finally.release(allocator);
                     }
+                    truncChainTo(frame, tf.chain_len);
                     try frame.write(h.exception_reg, exc);
                     cur = h.handler;
                     routed = true;
@@ -6218,6 +6238,7 @@ fn runFrameExec(
                     // so it supersedes the already-pending control flow.
                     frame.pending_finally.release(allocator);
                     const key = tf.finally_done orelse fin;
+                    truncChainTo(frame, tf.chain_len);
                     frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                     cur = fin;
                     routed = true;
@@ -6299,13 +6320,15 @@ fn runFrameExec(
                 var routed = false;
                 while (try_stack.pop()) |tf| {
                     if (findCatch(H, host, &exc, tf.catches)) |h| {
-                        try frame.write(h.exception_reg, exc);
+                        truncChainTo(frame, tf.chain_len);
+                    try frame.write(h.exception_reg, exc);
                         cur = h.handler;
                         routed = true;
                         break;
                     } else if (tf.finally_entry) |fin2| {
                         const key = tf.finally_done orelse fin2;
-                        frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
+                        truncChainTo(frame, tf.chain_len);
+                    frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                         cur = fin2;
                         routed = true;
                         break;
@@ -6472,14 +6495,16 @@ fn runFrameExec(
                         if (pending_depth) |depth| {
                             if (try_stack.items.len < depth) frame.pending_finally.release(allocator);
                         }
-                        try frame.write(h.exception_reg, exc);
+                        truncChainTo(frame, tf.chain_len);
+                    try frame.write(h.exception_reg, exc);
                         cur = h.handler;
                         routed = true;
                         break;
                     } else if (tf.finally_entry) |fin| {
                         frame.pending_finally.release(allocator);
                         const key = tf.finally_done orelse fin;
-                        frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
+                        truncChainTo(frame, tf.chain_len);
+                    frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                         cur = fin;
                         routed = true;
                         break;

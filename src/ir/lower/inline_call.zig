@@ -704,7 +704,7 @@ fn scanCatches(catches: []const ast.Catch) bool {
 /// are opt-in (KLIO_RFS=1) until spliced windows carry a runtime receiver
 /// tower; see the round record in plans/concurrency-perf-campaigns.md.
 pub fn rfsEnabled() bool {
-    return !std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_RFS") orelse "1", "0");
+    return std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_RFS") orelse "0", "1");
 }
 
 pub fn spliceInlineLambda(

@@ -1657,7 +1657,7 @@ pub const FuncBuilder = struct {
             var val: bool = false;
         };
         if (!S.cached) {
-            S.val = if (std.c.getenv("KLIO_RFS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+            S.val = if (std.c.getenv("KLIO_RFS")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
             S.cached = true;
         }
         return S.val;

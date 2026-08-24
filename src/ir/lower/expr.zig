@@ -13000,8 +13000,14 @@ fn lowerPathCall(
         b.inlineLambdaFor(name0) == null and
         !nameHasReifiedInlineCandidate(name0) and
         (name0.len == 0 or !std.ascii.isUpper(name0[0])) and
-        (nameHasReceiverCandidate(b, name0, null) or
-            b.module.registry.class_member_names.contains(name0)))
+        // Receiver-shaped candidates only: the program-wide member-name
+        // universe is too weak here — it diverted `assertTypeEquals`
+        // (an expect/actual top-level whose bodyless EXPECT the runtime
+        // name lookup cannot serve) because some unrelated class happens
+        // to declare the name. A receiver member that genuinely shadows
+        // still wins through the runtime walk of the emitted deferred
+        // form when the static tiers decline on their own.
+        nameHasReceiverCandidate(b, name0, null))
     {
         orEmitAudit(b, "tower_parity_defer", "fallthrough", name0);
         return null;
