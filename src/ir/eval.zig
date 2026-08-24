@@ -6842,7 +6842,21 @@ fn NativeGlue(comptime H: type) type {
                 if (native_leaf_any.load(.acquire) and c.n_args <= 8 and
                     c.n_args == cf.params.len)
                 klx: {
-                    const klf = nativeLeafFor(c.func.int(), cf.fqn) orelse break :klx;
+                    // Per-Func route memo: the registry lookup (mutex +
+                    // hash + fqn compare) priced every call by ~20% on a
+                    // call-dense benchmark; the table is write-once, so
+                    // one resolution is final.
+                    const route = cf.leaf_route.load(.acquire);
+                    const klf: NativeLeafFn = switch (route) {
+                        0 => blk_r: {
+                            const f0 = nativeLeafFor(c.func.int(), cf.fqn);
+                            const enc: usize = if (f0) |fp| @intFromPtr(fp) else 1;
+                            @constCast(cf).leaf_route.store(enc, .release);
+                            break :blk_r f0 orelse break :klx;
+                        },
+                        1 => break :klx,
+                        else => @ptrFromInt(route),
+                    };
                     var argv: [8]i64 = undefined;
                     var argg: [8]i32 = undefined;
                     const base = c.args.int();

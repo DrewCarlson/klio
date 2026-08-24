@@ -1239,6 +1239,11 @@ pub const Func = struct {
     /// Cached `frameNoFill` verdict: 0 = unasked, 1 = must fill,
     /// 2 = register file may start unfilled.
     frame_fill_state: u8 = 0,
+    /// Scalar-replay (`kl_`) route memo: 0 unresolved, 1 none, else the
+    /// registered NativeLeafFn as an address. The table is write-once
+    /// before the program runs, so the first resolution is final;
+    /// benign-race fill.
+    leaf_route: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     /// True when `params[0]` is a *synthesized* `this` receiver — an
     /// instance method's / extension's / local-extension's dispatch
     /// receiver, a constructor's or init thunk's instance under
