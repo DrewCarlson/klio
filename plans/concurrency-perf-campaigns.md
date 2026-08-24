@@ -620,12 +620,24 @@ PRE-BAKED base images (KLIO_PARITY_BASE_IMAGES) whose STDLIB was
 lowered with the flipped default; fresh-lowered stdlib under RFS=1
 passes where the baked form fails (unsigned_compare dies in `sorted`'s
 UnsupportedOperationException fallback arm). So the flip blocker is a
-bake/image-path interaction with RFS-spliced stdlib bodies (candidate
-mechanisms: EnclosingPush regions through image encode/decode of
-deferred blocks, AstLambda runtime re-lowering context, span-scoped
-resolution changing across the bake boundary). Next: bake ONE base
-image with RFS on, decode-dump a with-spliced stdlib func (e.g.
-`sorted`/`compareTo` path), and diff against the fresh lowering.
+bake/image-path interaction with RFS-spliced stdlib bodies — WRONG,
+retired by the next isolation:
+
+ISOLATED (second peel): the baked-image path is INNOCENT — a default-on
+build's `klio-harness run` (fresh KLIO_HOME, freshly re-baked embedded
+stdlib) passes the fixtures, and the corpus itest fails EVEN WITHOUT
+`KLIO_PARITY_BASE_IMAGES` set. The failing universe is parity's
+`.SourcePacks` mode (stdlib + kotlinx packs lowered from source, one
+process). First mechanism read: `sorted()` is
+`toTypedArray().apply { sort() }` — the RFS-spliced `apply` body
+statically binds a WRONG `sort` (UnsupportedOperationException at
+runtime) where the framed closure defers everything (its recv_ty is the
+bare `T`). The flip therefore needs RESOLUTION PARITY: inside a tower
+region, a bare call with any receiver-shadowable candidate must defer
+to the chain-driven CallMemberOrGlobal exactly as the framed body
+would, instead of letting the static tiers commit. One rule, applied at
+lowerPathCall's commit point gated on (rfsEnabled, encl_tower_depth >
+0), should retire most of the 14-shape backlog at once.
 
 ## Call-throughput round 3 (2026-08-24)
 
