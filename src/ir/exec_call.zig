@@ -2855,7 +2855,17 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
             // When the innermost receiver is also the innermost chain entry
             // (a seeded method/extension receiver, or a receiver-split
             // subject), the entry's own run covers it with the right kind.
-            const dup = entries.len > in_flight and sameReceiver(entries[in_flight].v, iv);
+            // A subject-kind duplicate must not suppress a REAL receiver
+            // param's own run (the inner IteratorImpl's `remove` reaches
+            // the OUTER list only through its dispatch tower) — but a
+            // capture-received lambda `this` IS the subject (a `with`
+            // block's bare call must NOT see the subject's enclosing
+            // instances; kotlinc rejects `describe()` in
+            // `with(outer.Inner())`).
+            const own_dispatch_shape = frame.func.params.len != 0 and
+                std.mem.eql(u8, frame.func.params[0].name, "this");
+            const dup = entries.len > in_flight and sameReceiver(entries[in_flight].v, iv) and
+                (!entries[in_flight].isSubject() or !own_dispatch_shape);
             if (!dup) {
                 // The frame's own `this` brings its class-nesting tower (and
                 // companion) only when it is a *dispatch* receiver. An
@@ -2868,14 +2878,33 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
                 // companion stay in scope; only a FOREIGN direct receiver
                 // (a splice/extension subject) suppresses them.
                 const direct_is_frame_recv = if (direct_this) |dt| blk: {
-                    const ti = frameThisParam(frame) orelse break :blk false;
-                    if (ti >= frame.params.items.len) break :blk false;
-                    break :blk sameReceiver(frame.params.items[ti], dt);
+                    if (frameThisParam(frame)) |ti| {
+                        if (ti < frame.params.items.len and sameReceiver(frame.params.items[ti], dt)) break :blk true;
+                    }
+                    // An INSTANCE METHOD's `this` param has no
+                    // has_receiver_param bit, and a flat activation may
+                    // route it through the capture slot: compare against
+                    // whatever the non-direct path would have used, so a
+                    // splice-bound register that holds the frame's OWN
+                    // dispatch receiver keeps its class-nesting tower
+                    // (`removeAt(...)` inside AbstractMutableList's inner
+                    // IteratorImpl.remove reaches the OUTER list).
+                    const tv = implicitThisValue(frame, this_idx, consult_param);
+                    if (tv != .Null and tv != .Unit and sameReceiver(tv, dt)) break :blk true;
+                    break :blk false;
                 } else false;
                 const own_is_subject = (direct_this != null and !direct_is_frame_recv) or switch (frame.func.kind) {
                     .top_level_extension, .member_extension => true,
                     else => false,
                 };
+                // The same value may already sit on the chain as a spliced
+                // SUBJECT (an `iterator().apply { ... remove() }` splice
+                // pushes the iterator; `remove`'s own frame then re-sees it
+                // as its dispatch receiver). The subject entry's run has no
+                // class-nesting tower, so it must not suppress the own
+                // dispatch run — `removeAt(...)` inside the inner
+                // IteratorImpl reaches the OUTER list only through the own
+                // run's tower. The own kind still decides subject-ness.
                 try appendCandidateRun(H, allocator, &out, iv, own_is_subject, true, &depth, host, bare_name);
             }
         }

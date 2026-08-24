@@ -2311,6 +2311,72 @@ pub const Value = union(enum) {
         }
     }
 
+    /// Kotlin's `hashCode()` for the value shapes whose hash is a pure
+    /// function of the value itself: scalars per kotlinc's boxed hash
+    /// (Long folds halves, Bool is 1231/1237, unsigned types hash their
+    /// signed storage, NaN canonicalizes) and String as the UTF-16
+    /// 31-polynomial. Null when the shape's hash could involve dispatch
+    /// (instances) — the one definition every host fast path and the
+    /// stdlib hashing intrinsics must share, or trie/bucket placement
+    /// diverges between served and interpreted operations.
+    pub fn kotlinScalarHash(v: *const Value) ?i32 {
+        const longHash = struct {
+            fn f(x: i64) i32 {
+                return @truncate(x ^ (x >> 32));
+            }
+        }.f;
+        return switch (v.*) {
+            .Null, .Unit => 0,
+            .Int => |x| x,
+            .Short => |x| @as(i32, x),
+            .Byte => |x| @as(i32, x),
+            .Char => |x| @as(i32, @intCast(x)),
+            .Bool => |b| if (b) @as(i32, 1231) else @as(i32, 1237),
+            .Long => |x| longHash(x),
+            .UInt => |x| @bitCast(x),
+            .UShort => |x| @as(i32, @as(i16, @bitCast(x))),
+            .UByte => |x| @as(i32, @as(i8, @bitCast(x))),
+            .ULong => |x| longHash(@bitCast(x)),
+            .Float => |f| if (std.math.isNan(f)) @as(i32, @bitCast(@as(u32, 0x7fc0_0000))) else @as(i32, @bitCast(f)),
+            .Double => |d| blk: {
+                const bits: i64 = if (std.math.isNan(d)) @bitCast(@as(u64, 0x7ff8_0000_0000_0000)) else @bitCast(d);
+                break :blk longHash(bits);
+            },
+            .String => |s| blk: {
+                const g = s.borrow();
+                defer g.deinit();
+                var h: i32 = 0;
+                const str = g.get().bytes;
+                var i: usize = 0;
+                while (i < str.len) {
+                    const cp_len = std.unicode.utf8ByteSequenceLength(str[i]) catch {
+                        h = h *% 31 +% @as(i32, str[i]);
+                        i += 1;
+                        continue;
+                    };
+                    const slice_end = @min(i + cp_len, str.len);
+                    const cp = std.unicode.utf8Decode(str[i..slice_end]) catch {
+                        h = h *% 31 +% @as(i32, str[i]);
+                        i += 1;
+                        continue;
+                    };
+                    if (cp <= 0xFFFF) {
+                        h = h *% 31 +% @as(i32, @intCast(cp));
+                    } else {
+                        const cp_v = cp - 0x10000;
+                        const high: u16 = @intCast(0xD800 + (cp_v >> 10));
+                        const low: u16 = @intCast(0xDC00 + (cp_v & 0x3FF));
+                        h = h *% 31 +% @as(i32, high);
+                        h = h *% 31 +% @as(i32, low);
+                    }
+                    i = slice_end;
+                }
+                break :blk h;
+            },
+            else => null,
+        };
+    }
+
     /// Reference-counting decrement: drop one owning handle to
     /// this value graph. When a handle's strong count reaches zero its
     /// payload `deinit` recursively releases what it owns. The dual of

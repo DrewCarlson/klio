@@ -282,6 +282,7 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
         if (takes_receiver) return null;
         if (!std.mem.eql(u8, f.name, "<lambda>")) return null;
         if (f.lambda_receiver_ty) |head| {
+            if (callValueTraceOn()) std.debug.print("[cvt-head] id={d} head={s}\n", .{ id, head });
             if (try host_call_member.implicitReceiverForHead(self, allocator, this_value_in, head)) |matched| {
                 selected_this = matched;
             }
@@ -347,7 +348,7 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
     req.ctx_mark_override = ctx_mark;
     req.pop_enclosing_n = pushes;
     if (callValueTraceOn()) {
-        std.debug.print("[cvt-flat] id={d} pushes={d}\n", .{ id, pushes });
+        std.debug.print("[cvt-flat] id={d} pushes={d} this_idx={?d} ncaps={d} sel_tag={s}\n", .{ id, pushes, this_idx, info.capture_names.len, @tagName(std.meta.activeTag(selected_this)) });
     }
     return req;
 }
@@ -493,6 +494,16 @@ pub fn prepareValueRecvCtxFlatCall(self: *VmHost, allocator: Allocator, callee: 
         }
     }
     return prepareClosureFlatCall(self, allocator, callee, args);
+}
+
+var rsel_trace_init: bool = false;
+var rsel_trace_on: bool = false;
+fn rselTraceOn() bool {
+    if (!rsel_trace_init) {
+        rsel_trace_on = std.c.getenv("KLIO_RSEL_TRACE") != null;
+        rsel_trace_init = true;
+    }
+    return rsel_trace_on;
 }
 
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
@@ -1813,7 +1824,7 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                     if (try host_call_member.implicitReceiverForHead(self, allocator, this_value_in, head)) |matched| {
                         selected_this = matched;
                     }
-                    if (std.c.getenv("KLIO_RSEL_TRACE") != null) {
+                    if (rselTraceOn()) {
                         std.debug.print("[rsel] head={s} passed={s} selected={s}\n", .{ head, this_value_in.typeFqn(), selected_this.typeFqn() });
                     }
                 }

@@ -7246,58 +7246,11 @@ fn valueHashDispatch(ctx: *CallCtx, v: Value) i32 {
 }
 
 fn kotlinValueHash(v: Value) i32 {
-    return switch (v) {
-        .Null, .Unit => 0,
-        .Int => |x| x,
-        .Short => |x| @as(i32, x),
-        .Byte => |x| @as(i32, x),
-        .Char => |x| @as(i32, x),
-        .Bool => |b| if (b) @as(i32, 1231) else @as(i32, 1237),
-        .Long => |x| longHash(x),
-        .UInt => |x| @bitCast(x),
-        // An unsigned value class synthesizes hashCode from its SIGNED
-        // storage (`UShort.data: Short`), so kotlinc hashes 65535u as -1.
-        .UShort => |x| @as(i32, @as(i16, @bitCast(x))),
-        .UByte => |x| @as(i32, @as(i8, @bitCast(x))),
-        .ULong => |x| longHash(@bitCast(x)),
-        .Float => |f| if (std.math.isNan(f)) @as(i32, @bitCast(@as(u32, 0x7fc0_0000))) else @as(i32, @bitCast(f)),
-        .Double => |d| blk: {
-            const bits: i64 = if (std.math.isNan(d)) @bitCast(@as(u64, 0x7ff8_0000_0000_0000)) else @bitCast(d);
-            break :blk longHash(bits);
-        },
-        .String => |s| blk: {
-            const g = s.borrow();
-            defer g.deinit();
-            var h: i32 = 0;
-            const str = g.get().bytes;
-            var i: usize = 0;
-            while (i < str.len) {
-                const cp_len = std.unicode.utf8ByteSequenceLength(str[i]) catch {
-                    h = h *% 31 +% @as(i32, str[i]);
-                    i += 1;
-                    continue;
-                };
-                const slice_end = @min(i + cp_len, str.len);
-                const cp = std.unicode.utf8Decode(str[i..slice_end]) catch {
-                    h = h *% 31 +% @as(i32, str[i]);
-                    i += 1;
-                    continue;
-                };
-                if (cp <= 0xFFFF) {
-                    h = h *% 31 +% @as(i32, @intCast(cp));
-                } else {
-                    const cp_v = cp - 0x10000;
-                    const high: u16 = @intCast(0xD800 + (cp_v >> 10));
-                    const low: u16 = @intCast(0xDC00 + (cp_v & 0x3FF));
-                    h = h *% 31 +% @as(i32, high);
-                    h = h *% 31 +% @as(i32, low);
-                }
-                i = slice_end;
-            }
-            break :blk h;
-        },
-        else => 0,
-    };
+    // The scalar/String cases live in `Value.kotlinScalarHash` (shared
+    // with the host persistent-collection fast paths so bucket placement
+    // can never diverge); every other shape hashes 0 here exactly as the
+    // pre-refactor switch did.
+    return Value.kotlinScalarHash(&v) orelse 0;
 }
 
 pub fn array_content_hash_code(ctx: *CallCtx) Error!EvalResult {

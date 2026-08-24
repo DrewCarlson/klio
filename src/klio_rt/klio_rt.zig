@@ -305,6 +305,12 @@ export fn klio_rt_register_native(fid: u32, f: eval.NativeFn, fqn: [*:0]const u8
     eval.registerNative(fid, f, std.mem.span(fqn));
 }
 
+/// Register a scalar-replay leaf body (`kl_<fid>`). Same fqn guard as
+/// `klio_rt_register_native`.
+export fn klio_rt_register_native_leaf(fid: u32, f: eval.NativeLeafFn, fqn: [*:0]const u8) void {
+    eval.registerNativeLeaf(fid, f, std.mem.span(fqn));
+}
+
 /// Declare the table sizes of the module the emitter walked. A frame
 /// whose module disagrees runs interpreted — the emitted const/func ids
 /// index these tables and mean nothing against any other module.

@@ -3332,9 +3332,9 @@ fn enclosingCompanionDeclares(self: *VmHost, allocator: Allocator, class_name: [
 /// in-process program (reused cell addresses) from ever hitting,
 /// including on still-parked pool worker threads.
 const TL_FIELD_CACHE_SIZE = 1024;
-const TlFieldReadEntry = struct { class_p: usize = 0, name_p: usize = 0, gen: u32 = 0, hit: root.ProgramImage.FieldReadHit = .{ .getter = 0, .stored_idx = 0 } };
+const TlFieldReadEntry = struct { class_p: usize = 0, name_p: usize = 0, gen: u32 = 0, state: u8 = 0, miss_ttl: u8 = 0, hit: root.ProgramImage.FieldReadHit = .{ .getter = 0, .stored_idx = 0 } };
 threadlocal var tl_field_read_cache: [TL_FIELD_CACHE_SIZE]TlFieldReadEntry = @splat(.{});
-const TlFieldWriteEntry = struct { class_p: usize = 0, name_p: usize = 0, gen: u32 = 0, hit: root.ProgramImage.FieldWriteHit = .{ .setter = 0, .store_name = "" } };
+const TlFieldWriteEntry = struct { class_p: usize = 0, name_p: usize = 0, gen: u32 = 0, state: u8 = 0, miss_ttl: u8 = 0, hit: root.ProgramImage.FieldWriteHit = .{ .setter = 0, .store_name = "" } };
 threadlocal var tl_field_write_cache: [TL_FIELD_CACHE_SIZE]TlFieldWriteEntry = @splat(.{});
 
 inline fn tlFieldSlot(class_p: usize, name_p: usize) usize {
@@ -3345,26 +3345,51 @@ inline fn tlFieldSlot(class_p: usize, name_p: usize) usize {
 fn fieldReadCacheGet(self: *VmHost, class_p: usize, name_p: usize) ?root.ProgramImage.FieldReadHit {
     const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
     const e = &tl_field_read_cache[tlFieldSlot(class_p, name_p)];
-    if (e.class_p == class_p and e.name_p == name_p and e.gen == gen) return e.hit;
+    if (e.state != 0 and e.class_p == class_p and e.name_p == name_p and e.gen == gen) {
+        // state 2: the shared map had no entry at last probe. It is
+        // add-only, so re-probe every 64th consult rather than paying
+        // the program-cell borrow on every miss forever.
+        if (e.state == 2) {
+            if (e.miss_ttl > 0) {
+                e.miss_ttl -= 1;
+                return null;
+            }
+        } else return e.hit;
+    }
     const hit: ?root.ProgramImage.FieldReadHit = blk: {
         const pg = self.prog.borrow();
         defer pg.deinit();
         break :blk pg.get().field_read_cache.get(.{ .class_p = class_p, .name_p = name_p });
     };
-    if (hit) |h| e.* = .{ .class_p = class_p, .name_p = name_p, .gen = gen, .hit = h };
+    if (hit) |h| {
+        e.* = .{ .class_p = class_p, .name_p = name_p, .gen = gen, .state = 1, .hit = h };
+    } else {
+        e.* = .{ .class_p = class_p, .name_p = name_p, .gen = gen, .state = 2, .miss_ttl = 63, .hit = .{ .getter = 0, .stored_idx = 0 } };
+    }
     return hit;
 }
 
 fn fieldWriteCacheGet(self: *VmHost, class_p: usize, name_p: usize) ?root.ProgramImage.FieldWriteHit {
     const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
     const e = &tl_field_write_cache[tlFieldSlot(class_p, name_p)];
-    if (e.class_p == class_p and e.name_p == name_p and e.gen == gen) return e.hit;
+    if (e.state != 0 and e.class_p == class_p and e.name_p == name_p and e.gen == gen) {
+        if (e.state == 2) {
+            if (e.miss_ttl > 0) {
+                e.miss_ttl -= 1;
+                return null;
+            }
+        } else return e.hit;
+    }
     const hit: ?root.ProgramImage.FieldWriteHit = blk: {
         const pg = self.prog.borrow();
         defer pg.deinit();
         break :blk pg.get().field_write_cache.get(.{ .class_p = class_p, .name_p = name_p });
     };
-    if (hit) |h| e.* = .{ .class_p = class_p, .name_p = name_p, .gen = gen, .hit = h };
+    if (hit) |h| {
+        e.* = .{ .class_p = class_p, .name_p = name_p, .gen = gen, .state = 1, .hit = h };
+    } else {
+        e.* = .{ .class_p = class_p, .name_p = name_p, .gen = gen, .state = 2, .miss_ttl = 63, .hit = .{ .setter = 0, .store_name = "" } };
+    }
     return hit;
 }
 

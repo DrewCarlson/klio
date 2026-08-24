@@ -2041,6 +2041,38 @@ fn cvTraceOn() bool {
     return b;
 }
 var lr_trace_cached: ?bool = null;
+var gf_trace_init: bool = false;
+var gf_trace_val: ?[]const u8 = null;
+/// `KLIO_GF_TRACE` — cached once: the raw getenv is a full environ scan
+/// and this gate sits on EVERY GetField execution.
+fn gfTraceWant() ?[]const u8 {
+    if (!gf_trace_init) {
+        gf_trace_val = if (std.c.getenv("KLIO_GF_TRACE")) |w| std.mem.span(w) else null;
+        gf_trace_init = true;
+    }
+    return gf_trace_val;
+}
+
+var cm_trace_init: bool = false;
+var cm_trace_val: ?[]const u8 = null;
+fn cmTraceWant() ?[]const u8 {
+    if (!cm_trace_init) {
+        cm_trace_val = if (std.c.getenv("KLIO_CM_TRACE")) |w| std.mem.span(w) else null;
+        cm_trace_init = true;
+    }
+    return cm_trace_val;
+}
+
+var chain_trace_init: bool = false;
+var chain_trace_on: bool = false;
+fn chainTraceOn() bool {
+    if (!chain_trace_init) {
+        chain_trace_on = std.c.getenv("KLIO_CHAIN_TRACE") != null;
+        chain_trace_init = true;
+    }
+    return chain_trace_on;
+}
+
 fn lrTraceOn() bool {
     if (lr_trace_cached) |b| return b;
     const b = runtime.envOnce("KLIO_LR_TRACE") != null;
@@ -2123,10 +2155,28 @@ pub inline fn errResult(e: EvalError) EvalResult {
 /// the *done sentinel* (the synthesized block whose entry signals
 /// the finally body has run to completion regardless of any internal
 /// control flow in the user finally body).
+
+/// Restore the frame's enclosing-receiver chain to its try-entry length
+/// when a throw routes to a catch or finally: the unwind skipped any
+/// `EnclosingPop` inside the try body, and the stale spliced subject
+/// would otherwise shadow reads for the rest of the frame.
+fn truncChainTo(frame: *Frame, chain_len: usize) void {
+    if (frame.enclosing_this.items.len > chain_len) {
+        frame.enclosing_this.shrinkRetainingCapacity(chain_len);
+    }
+}
+
 pub const TryFrame = struct {
     /// The try body's entry block — the key for matching pop /
     /// pending-return / pending-rethrow against `Block.finally_done_for`.
     body: BlockId,
+    /// The frame's enclosing-receiver chain length at try entry: an
+    /// exception unwinding out of a spliced receiver-lambda region skips
+    /// its `EnclosingPop`, and a caught throw would otherwise leave the
+    /// stale subject on the chain for everything after the catch
+    /// (`assertFails { ... }` inside a spliced test-DSL region polluted
+    /// every later test in the runner's frame). Restored on catch.
+    chain_len: usize = 0,
     catches: []ir.CatchHandler,
     /// Where to jump to start running the finally / first catch.
     /// `null` for a try with only catches and no finally.
@@ -2868,7 +2918,7 @@ pub const Frame = struct {
     /// member-extension owner). `access` entries are dispatch-transient and
     /// never cross the frame boundary.
     fn activateChain(self: *Frame, seed: []const EnclosingEntry) Allocator.Error!void {
-        if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
+        if (chainTraceOn()) {
             std.debug.print("[chain] enter tid={d} tls={*} frame={*} caller={*} base={d} fn={s}\n", .{
                 std.Thread.getCurrentId(), self.tls, self, self.tls.active_chain, self.tls.active_chain_base, self.func.name,
             });
@@ -2905,7 +2955,7 @@ pub const Frame = struct {
     }
 
     fn activateAs(self: *Frame) void {
-        if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
+        if (chainTraceOn()) {
             std.debug.print("[chain] act tid={d} tls={*} frame={*} list={*} prev={*} base={d} fn={s}\n", .{
                 std.Thread.getCurrentId(), self.tls, self, &self.enclosing_this, self.tls.active_chain, self.tls.active_chain_base, self.func.name,
             });
@@ -2917,7 +2967,7 @@ pub const Frame = struct {
     }
 
     fn deactivateChain(self: *Frame) void {
-        if (std.c.getenv("KLIO_CHAIN_TRACE") != null) {
+        if (chainTraceOn()) {
             std.debug.print("[chain] deact tid={d} tls={*} frame={*} restore={*} fn={s}\n", .{
                 std.Thread.getCurrentId(), self.tls, self, self.prev_chain, self.func.name,
             });
@@ -3258,6 +3308,7 @@ fn leafExprServeAt(
         if (trace) std.debug.print("[leaf] {s}: not a leaf body\n", .{func.name});
         return null;
     }
+    if (func.leaf_hopeless != 0) return null;
     if (args.len != func.params.len) {
         if (trace) std.debug.print("[leaf] {s}: arity {d} vs {d}\n", .{ func.name, args.len, func.params.len });
         return null;
@@ -3308,7 +3359,14 @@ fn leafExprServeAt(
     // shape this exists for — reaches no safe point and pays nothing.
     var pin: ?usize = null;
     defer if (pin) |m| runtime.keepaliveRestore(m);
-    const out = leafWalk(H, allocator, module, func, eff_args, host, depth, regs, reclaim, trace, &pin, &wmask) catch |e| switch (e) {
+    const fs: ?*const bc.FuncStreams = if (bc.enabled())
+        bc.funcStreams(func, !jit_loop.enabled(), module.consts.items)
+    else
+        null;
+    const out = (if (fs) |f|
+        leafWalkStream(H, allocator, module, func, eff_args, host, depth, regs, reclaim, trace, &pin, &wmask, f)
+    else
+        leafWalk(H, allocator, module, func, eff_args, host, depth, regs, reclaim, trace, &pin, &wmask)) catch |e| switch (e) {
         error.LeafAbandon => return null,
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -3316,6 +3374,133 @@ fn leafExprServeAt(
     // reference to the result, exactly as a returning frame would hand over.
     out.retain();
     return EvalResult{ .ok = out };
+}
+
+
+/// The leaf walk over the function's DENSE bytecode stream: the same op
+/// set the framed flat loop runs, over the leaf bank. The Inst-union
+/// re-walk this replaces was the single largest cost of call-dense
+/// interpreted code (~35% of a 3M-call benchmark); simple ops decode from
+/// packed u32s here, and only the complex ops (`escape`) touch the union,
+/// through the same `leafRunOne` the fallback walker uses. Any structure
+/// the stream cannot express abandons to the framed path exactly as the
+/// union walker would.
+fn leafWalkStream(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    func: *const Func,
+    args: []const Value,
+    host: *H,
+    depth: u8,
+    regs: []Value,
+    reclaim: bool,
+    trace: bool,
+    pin: *?usize,
+    wmask: *u64,
+    fs: *const bc.FuncStreams,
+) (Allocator.Error || LeafAbandon)!Value {
+    var block: usize = 0;
+    var steps: usize = 0;
+    outer: while (true) {
+        if (block >= func.blocks.len) return error.LeafAbandon;
+        const st = (if (block < fs.streams.len) fs.streams[block] else null) orelse return error.LeafAbandon;
+        const code = st.code;
+        var pc: usize = 0;
+        while (pc < code.len) {
+            steps += 1;
+            if (steps > ir.LEAF_MAX_STEPS) return error.LeafAbandon;
+            const op: bc.Op = @enumFromInt(code[pc]);
+            switch (op) {
+                .trace => pc += 4,
+                .const_int => {
+                    if (!leafWrite(allocator, regs, @enumFromInt(code[pc + 1]), .{ .Int = @bitCast(code[pc + 2]) }, reclaim, false, wmask)) return error.LeafAbandon;
+                    pc += 3;
+                },
+                .const_load => {
+                    const cid = code[pc + 2];
+                    if (cid >= module.consts.items.len) return error.LeafAbandon;
+                    if (module.consts.items[cid] == .String) leafPin(pin, regs, wmask);
+                    const v = try constToValue(allocator, &module.consts.items[cid]);
+                    if (!leafWrite(allocator, regs, @enumFromInt(code[pc + 1]), v, reclaim, false, wmask)) return error.LeafAbandon;
+                    pc += 3;
+                },
+                .move => {
+                    const v = leafRead(regs, wmask.*, @enumFromInt(code[pc + 2])) orelse return error.LeafAbandon;
+                    if (!leafWrite(allocator, regs, @enumFromInt(code[pc + 1]), v, reclaim, true, wmask)) return error.LeafAbandon;
+                    pc += 3;
+                },
+                .load_param => {
+                    const pi = code[pc + 2];
+                    if (pi >= args.len) return error.LeafAbandon;
+                    if (!leafWrite(allocator, regs, @enumFromInt(code[pc + 1]), args[pi], reclaim, true, wmask)) return error.LeafAbandon;
+                    pc += 3;
+                },
+                .cell_get => return error.LeafAbandon,
+                .bin => {
+                    const kind: ir.BinOp = @enumFromInt(code[pc + 2]);
+                    const l = leafRead(regs, wmask.*, @enumFromInt(code[pc + 4])) orelse return error.LeafAbandon;
+                    const r = leafRead(regs, wmask.*, @enumFromInt(code[pc + 5])) orelse return error.LeafAbandon;
+                    if (scalarBin(kind, l, r)) |v| {
+                        if (!leafWrite(allocator, regs, @enumFromInt(code[pc + 3]), v, reclaim, false, wmask)) return error.LeafAbandon;
+                    } else {
+                        if (!leafPrimitive(&l) or !leafPrimitive(&r)) return error.LeafAbandon;
+                        const res = try applyBinop(allocator, kind, &l, &r);
+                        if (res != .ok) return error.LeafAbandon;
+                        if (!leafWrite(allocator, regs, @enumFromInt(code[pc + 3]), res.ok, reclaim, false, wmask)) return error.LeafAbandon;
+                    }
+                    pc += 6;
+                },
+                .escape => {
+                    const inst_idx = code[pc + 1];
+                    const b = &func.blocks[block];
+                    if (inst_idx >= b.insts.len) return error.LeafAbandon;
+                    try leafRunOne(H, allocator, module, func, args, host, depth, &b.insts[inst_idx], regs, reclaim, trace, pin, wmask);
+                    pc += 2;
+                },
+                .jump => {
+                    block = code[pc + 1];
+                    continue :outer;
+                },
+                .br => {
+                    const c = leafRead(regs, wmask.*, @enumFromInt(code[pc + 1])) orelse return error.LeafAbandon;
+                    if (c != .Bool) return error.LeafAbandon;
+                    block = if (c.Bool) code[pc + 2] else code[pc + 3];
+                    continue :outer;
+                },
+                .ret => {
+                    if (code[pc + 1] == 0) return .Unit;
+                    return leafRead(regs, wmask.*, @enumFromInt(code[pc + 2])) orelse error.LeafAbandon;
+                },
+                .term_exit => break,
+                .cmp_br => {
+                    const kind: ir.BinOp = @enumFromInt(code[pc + 2]);
+                    const l = leafRead(regs, wmask.*, @enumFromInt(code[pc + 4])) orelse return error.LeafAbandon;
+                    const r = leafRead(regs, wmask.*, @enumFromInt(code[pc + 5])) orelse return error.LeafAbandon;
+                    const v = scalarBin(kind, l, r) orelse return error.LeafAbandon;
+                    if (!leafWrite(allocator, regs, @enumFromInt(code[pc + 3]), v, reclaim, false, wmask)) return error.LeafAbandon;
+                    if (v != .Bool) return error.LeafAbandon;
+                    block = if (v.Bool) code[pc + 6] else code[pc + 7];
+                    continue :outer;
+                },
+            }
+        }
+        // Off the stream's end (or `term_exit`): the block's REAL
+        // terminator decides, exactly as the union walker's loop does.
+        switch (func.blocks[block].terminator) {
+            .Return => |r| {
+                const rr = r orelse return .Unit;
+                return leafRead(regs, wmask.*, rr) orelse return error.LeafAbandon;
+            },
+            .Goto => |g| block = g.int(),
+            .Branch => |br| {
+                const c = leafRead(regs, wmask.*, br.cond) orelse return error.LeafAbandon;
+                if (c != .Bool) return error.LeafAbandon;
+                block = if (c.Bool) br.t.int() else br.f.int();
+            },
+            else => return error.LeafAbandon,
+        }
+    }
 }
 
 /// Walk the body's blocks until one returns. `Goto`/`Branch` are followed;
@@ -3381,6 +3566,29 @@ fn leafRunInsts(
     wmask: *u64,
 ) (Allocator.Error || LeafAbandon)!void {
     for (b.insts) |*inst| {
+        try leafRunOne(H, allocator, module, func, args, host, depth, inst, regs, reclaim, trace, pin, wmask);
+    }
+}
+
+/// One leaf-body instruction — shared by the Inst-union walker above and
+/// the dense-stream walker (`leafWalkStream`), whose `escape` ops land
+/// here.
+fn leafRunOne(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    func: *const Func,
+    args: []const Value,
+    host: *H,
+    depth: u8,
+    inst: *const Inst,
+    regs: []Value,
+    reclaim: bool,
+    trace: bool,
+    pin: *?usize,
+    wmask: *u64,
+) (Allocator.Error || LeafAbandon)!void {
+    {
         switch (inst.*) {
             .Trace => {},
             .LoadParam => |lp| {
@@ -3407,7 +3615,7 @@ fn leafRunInsts(
                 const r = leafRead(regs, wmask.*, bo.rhs) orelse return error.LeafAbandon;
                 if (scalarBin(bo.op, l, r)) |v| {
                     if (!leafWrite(allocator, regs, bo.dst, v, reclaim, false, wmask)) return error.LeafAbandon;
-                    continue;
+                    return;
                 }
                 if (!leafPrimitive(&l) or !leafPrimitive(&r)) return error.LeafAbandon;
                 const res = try applyBinop(allocator, bo.op, &l, &r);
@@ -3423,7 +3631,7 @@ fn leafRunInsts(
                 };
                 if (builtinFieldFast(&recv, fname)) |bv| {
                     if (!leafWrite(allocator, regs, gf.dst, bv, reclaim, false, wmask)) return error.LeafAbandon;
-                    continue;
+                    return;
                 }
                 if (recv != .Instance) {
                     if (trace) std.debug.print("[leaf] {s}: field receiver is {s}\n", .{ func.name, @tagName(recv) });
@@ -3518,6 +3726,9 @@ fn leafRunInsts(
             },
             else => |other| {
                 if (trace) std.debug.print("[leaf] {s}: unsupported {s}\n", .{ func.name, @tagName(other) });
+                // Structural: this instruction can never serve, so no
+                // future attempt on this body can succeed.
+                @constCast(func).leaf_hopeless = 1;
                 return error.LeafAbandon;
             },
         }
@@ -5639,6 +5850,7 @@ fn runFrameExec(
         if (resume_idx == 0 and (has_catches or finally != null or block.lr_absorb != null)) {
             try try_stack.append(allocator, .{
                 .body = cur,
+                .chain_len = frame.enclosing_this.items.len,
                 .catches = block.catches,
                 .finally_entry = finally,
                 .finally_done = finally_done,
@@ -6015,6 +6227,7 @@ fn runFrameExec(
                     if (pending_depth) |depth| {
                         if (try_stack.items.len < depth) frame.pending_finally.release(allocator);
                     }
+                    truncChainTo(frame, tf.chain_len);
                     try frame.write(h.exception_reg, exc);
                     cur = h.handler;
                     routed = true;
@@ -6025,6 +6238,7 @@ fn runFrameExec(
                     // so it supersedes the already-pending control flow.
                     frame.pending_finally.release(allocator);
                     const key = tf.finally_done orelse fin;
+                    truncChainTo(frame, tf.chain_len);
                     frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                     cur = fin;
                     routed = true;
@@ -6106,13 +6320,15 @@ fn runFrameExec(
                 var routed = false;
                 while (try_stack.pop()) |tf| {
                     if (findCatch(H, host, &exc, tf.catches)) |h| {
-                        try frame.write(h.exception_reg, exc);
+                        truncChainTo(frame, tf.chain_len);
+                    try frame.write(h.exception_reg, exc);
                         cur = h.handler;
                         routed = true;
                         break;
                     } else if (tf.finally_entry) |fin2| {
                         const key = tf.finally_done orelse fin2;
-                        frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
+                        truncChainTo(frame, tf.chain_len);
+                    frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                         cur = fin2;
                         routed = true;
                         break;
@@ -6279,14 +6495,16 @@ fn runFrameExec(
                         if (pending_depth) |depth| {
                             if (try_stack.items.len < depth) frame.pending_finally.release(allocator);
                         }
-                        try frame.write(h.exception_reg, exc);
+                        truncChainTo(frame, tf.chain_len);
+                    try frame.write(h.exception_reg, exc);
                         cur = h.handler;
                         routed = true;
                         break;
                     } else if (tf.finally_entry) |fin| {
                         frame.pending_finally.release(allocator);
                         const key = tf.finally_done orelse fin;
-                        frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
+                        truncChainTo(frame, tf.chain_len);
+                    frame.pending_finally.rethrow = .{ .key = key, .exc = exc, .depth = try_stack.items.len };
                         cur = fin;
                         routed = true;
                         break;
@@ -6694,6 +6912,43 @@ fn nativeFor(fid: u32, fqn: []const u8) ?NativeFn {
     return e.f;
 }
 
+/// Scalar-replay leaf body (`kl_<fid>`): the whole function computed over
+/// (int64 value, genre) pairs — genres 0 Int, 1 Long, 2 Bool, 3 Unit,
+/// 4 Char. Returns nonzero with the result in (ret, retg); zero = the
+/// body bailed (non-scalar input, div guard, depth or edge trigger) and
+/// the caller re-runs the call through the ordinary path — sound because
+/// only statically PURE bodies are ever registered here.
+pub const NativeLeafFn = *const fn (
+    ctx: ?*anyopaque,
+    ev: *NativeEdgeView,
+    argv: [*]const i64,
+    argg: [*]const i32,
+    ret: *i64,
+    retg: *i32,
+    depth: u32,
+) callconv(.c) i32;
+
+const NativeLeafEntry = struct { f: NativeLeafFn, fqn: []const u8 };
+var native_leaf_table: std.AutoHashMapUnmanaged(u32, NativeLeafEntry) = .empty;
+var native_leaf_any: std.atomic.Value(bool) = .init(false);
+
+pub fn registerNativeLeaf(fid: u32, f: NativeLeafFn, fqn: []const u8) void {
+    native_mutex.lock();
+    defer native_mutex.unlock();
+    const owned = std.heap.smp_allocator.dupe(u8, fqn) catch return;
+    native_leaf_table.put(std.heap.smp_allocator, fid, .{ .f = f, .fqn = owned }) catch return;
+    native_leaf_any.store(true, .release);
+}
+
+fn nativeLeafFor(fid: u32, fqn: []const u8) ?NativeLeafFn {
+    if (!native_leaf_any.load(.acquire)) return null;
+    native_mutex.lock();
+    defer native_mutex.unlock();
+    const e = native_leaf_table.get(fid) orelse return null;
+    if (!std.mem.eql(u8, e.fqn, fqn)) return null;
+    return e.f;
+}
+
 var native_expect_funcs: usize = 0;
 var native_expect_consts: usize = 0;
 
@@ -6798,6 +7053,84 @@ fn NativeGlue(comptime H: type) type {
                 const c = &inst.Call;
                 if (c.type_args.len != 0 or !argNamesAllNull(c.arg_names)) break :direct;
                 const cf = frame.module.funcById(c.func) orelse break :direct;
+                // Scalar-replay body (`kl_`): the whole call runs as direct
+                // C over (int64, genre) pairs when every argument is a
+                // scalar. A zero return is a pure bail — fall through to
+                // the ordinary paths, which re-run the call exactly.
+                if (native_leaf_any.load(.acquire) and c.n_args <= 8 and
+                    c.n_args == cf.params.len)
+                klx: {
+                    // Per-Func route memo: the registry lookup (mutex +
+                    // hash + fqn compare) priced every call by ~20% on a
+                    // call-dense benchmark; the table is write-once, so
+                    // one resolution is final.
+                    const route = cf.leaf_route.load(.acquire);
+                    const klf: NativeLeafFn = switch (route) {
+                        0 => blk_r: {
+                            const f0 = nativeLeafFor(c.func.int(), cf.fqn);
+                            const enc: usize = if (f0) |fp| @intFromPtr(fp) else 1;
+                            @constCast(cf).leaf_route.store(enc, .release);
+                            break :blk_r f0 orelse break :klx;
+                        },
+                        1 => break :klx,
+                        else => @ptrFromInt(route),
+                    };
+                    var argv: [8]i64 = undefined;
+                    var argg: [8]i32 = undefined;
+                    const base = c.args.int();
+                    if (base + c.n_args > frame.regs.items.len) break :klx;
+                    for (0..c.n_args) |i| {
+                        switch (frame.regs.items[base + i]) {
+                            .Int => |v| {
+                                argv[i] = v;
+                                argg[i] = 0;
+                            },
+                            .Long => |v| {
+                                argv[i] = v;
+                                argg[i] = 1;
+                            },
+                            .Bool => |v| {
+                                argv[i] = @intFromBool(v);
+                                argg[i] = 2;
+                            },
+                            .Unit => {
+                                argv[i] = 0;
+                                argg[i] = 3;
+                            },
+                            .Char => |v| {
+                                argv[i] = v;
+                                argg[i] = 4;
+                            },
+                            .Double => |v| {
+                                argv[i] = @bitCast(v);
+                                argg[i] = 5;
+                            },
+                            .Float => |v| {
+                                argv[i] = @as(u32, @bitCast(v));
+                                argg[i] = 6;
+                            },
+                            else => break :klx,
+                        }
+                    }
+                    var ev: NativeEdgeView = undefined;
+                    nativeEdgeView(ctx, &ev);
+                    var rl: i64 = 0;
+                    var rg: i32 = 0;
+                    if (klf(@ptrCast(ctx), &ev, &argv, &argg, &rl, &rg, 0) != 0) {
+                        const v: Value = switch (rg) {
+                            0 => .{ .Int = @intCast(rl) },
+                            1 => .{ .Long = rl },
+                            2 => .{ .Bool = rl != 0 },
+                            3 => .Unit,
+                            4 => .{ .Char = @intCast(rl) },
+                            5 => .{ .Double = @bitCast(rl) },
+                            6 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(rl))))) },
+                            else => break :klx,
+                        };
+                        frame.write(c.dst, v) catch return .oom;
+                        return .cont;
+                    }
+                }
                 if (!cf.leafExprBody()) break :direct;
                 var plan = cf.fast_call;
                 if (plan == 0) {
@@ -7217,6 +7550,11 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         .UnOp => |u| return execArmUnOp(H, allocator, frame, u, host),
         .BinOp => |bo| return execArmBinOp(H, allocator, frame, bo, host),
         .Trace => |t| frame.cur_span = t.span,
+        .EnclosingPush => |x| {
+            const v = frame.read(x.src);
+            pushEnclosingSubject(&v);
+        },
+        .EnclosingPop => popEnclosing(),
         .LoadParam => |lp| {
             const v = if (lp.idx < frame.params.items.len) frame.params.items[lp.idx] else Value.Unit;
             v.retain();
@@ -7237,9 +7575,9 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         },
         .GetField => |*gf| {
             const gf_step = try execArmGetField(H, allocator, frame, gf, host);
-            if (std.c.getenv("KLIO_GF_TRACE")) |w0| {
+            if (gfTraceWant()) |w0| {
                 if (constStr(frame.module, gf.field)) |fname| {
-                    if (std.mem.indexOf(u8, fname, std.mem.span(w0)) != null and gf_step == .cont) {
+                    if (std.mem.indexOf(u8, fname, w0) != null and gf_step == .cont) {
                         const rv = frame.read(gf.dst);
                         const rn: []const u8 = if (rv == .Instance) blk: {
                             const g = rv.Instance.borrow();
@@ -7821,9 +8159,9 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Frame, gf: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(gf.receiver);
-    if (std.c.getenv("KLIO_GF_TRACE")) |w0| {
+    if (gfTraceWant()) |w0| {
         if (constStr(frame.module, gf.field)) |fname| {
-            if (std.mem.indexOf(u8, fname, std.mem.span(w0)) != null) {
+            if (std.mem.indexOf(u8, fname, w0) != null) {
                 const rn: []const u8 = if (recv == .Instance) blk: {
                     const g = recv.Instance.borrow();
                     const cg = g.get().class.borrow();
@@ -8110,8 +8448,8 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Frame, cm: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(cm.receiver);
-    if (std.c.getenv("KLIO_CM_TRACE")) |w0| {
-        const want = std.mem.span(w0);
+    if (cmTraceWant()) |w0| {
+        const want = w0;
         if (constStr(frame.module, cm.name)) |nm| {
             if (std.mem.eql(u8, nm, want)) {
                 const chain = evtls.active_chain;

@@ -537,6 +537,23 @@ pub const FuncBuilder = struct {
     /// preserves nullability, arguments, and classifier identity.
     recv_type_ref: ?TypeRef = null,
     splice_recv_ty: ?[]const u8 = null,
+    /// Depth of active spliced receiver-lambda regions that emitted an
+    /// `EnclosingPush` for their subject: dispatch emissions inside such a
+    /// region rely on the runtime chain (which holds every nested subject
+    /// in the right order) instead of pinning one bound register.
+    encl_tower_depth: u32 = 0,
+    /// The register holding the INNERMOST pushed tower subject (the last
+    /// `EnclosingPush`), so emission sites can tell a tower subject's
+    /// bound `this` (defer to the chain) from an inline-EXT splice's
+    /// bound receiver nested inside the region (must stay pinned — it is
+    /// NOT on the runtime chain).
+    encl_tower_top: ?Reg = null,
+    /// True while `splice_recv_ty` was set by the INNERMOST spliced
+    /// receiver-lambda window itself (its subject head) rather than
+    /// carried over from an enclosing inline-EXT splice. Only then may a
+    /// lambda-window body use it as receiver evidence — the stale ext
+    /// head must keep the pre-splice hygiene contract.
+    splice_recv_from_window: bool = false,
     /// The active splice's ACTUAL receiver static type WITH its type
     /// arguments, when the call site derived one (`data.count { }` on
     /// `data: T`, `T : Iterable<String>`, records `Iterable<String>`).
@@ -687,6 +704,7 @@ pub const FuncBuilder = struct {
     /// name keeps its own mark, so only these may be suspended while the
     /// caller's lambda body is spliced.
     splice_rlp_marks: StringSet,
+    shared_rlp_marks: StringSet,
     receiver_lambda_recv_heads: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     receiver_lambda_arity: std.StringHashMap(usize),
     context_fn_params: std.StringHashMap(ContextFnShape),
@@ -932,6 +950,7 @@ pub const FuncBuilder = struct {
             .local_fn_overloads = std.StringHashMap(std.ArrayList(LocalFnOverload)).init(allocator),
             .receiver_lambda_params = StringSet.init(allocator),
             .splice_rlp_marks = StringSet.init(allocator),
+            .shared_rlp_marks = StringSet.init(allocator),
             .receiver_lambda_arity = std.StringHashMap(usize).init(allocator),
             .context_fn_params = std.StringHashMap(ContextFnShape).init(allocator),
             .generic_typed_params = StringSet.init(allocator),
@@ -1048,6 +1067,7 @@ pub const FuncBuilder = struct {
         self.nonfn_locals.deinit();
         self.receiver_lambda_params.deinit();
         self.splice_rlp_marks.deinit();
+        self.shared_rlp_marks.deinit();
         self.splice_hidden_bands.deinit(a);
         self.receiver_lambda_recv_heads.deinit(self.allocator);
         self.receiver_lambda_arity.deinit();
@@ -1632,6 +1652,12 @@ pub const FuncBuilder = struct {
     /// first, with each entry's value label where one is known. `innermost`
     /// is the receiver the NEW body itself introduces (with `innermost_label`
     /// the name its `this@<label>` binds under).
+    /// Mirrors `inline_call.rfsEnabled` (imported there would cycle):
+    /// the receiver-formed-splice feature switch.
+    fn rfsSpliceFirst() bool {
+        return true;
+    }
+
     pub fn collectReceiverTowerLabeled(
         self: *const FuncBuilder,
         allocator: Allocator,
@@ -1644,18 +1670,28 @@ pub const FuncBuilder = struct {
             .head = head,
             .label = innermost_label,
         });
+        // An inline SPLICE window's receiver is an implicit receiver too,
+        // labeled by the spliced function: a SAM lambda built inside
+        // `thenBy`'s spliced body reads `this@thenBy`, and without this
+        // entry the closure's tower never carried it. Under the
+        // receiver-formed splice it is the `with`/`apply` SUBJECT — the
+        // INNERMOST implicit receiver, ranked ahead of the lexical owner
+        // (member-extension scope tiers index this order: InnerScope's
+        // `String.towerTag()` must outrank OuterScope's inside
+        // `with(InnerScope()) { "receiver".towerTag() }`).
+        const splice_head = self.spliceRecvTy() orelse self.spliceHintRecv();
+        const splice_first = rfsSpliceFirst();
+        if (splice_first) if (splice_head) |head| {
+            try appendTowerEntry(&out, allocator, .{ .head = head, .label = self.currentInlineFn() });
+        };
         const current = self.recv_ty orelse self.enclosing_recv_ty orelse self.owner_class;
         if (current) |head| {
             const label: ?[]const u8 = if (self.recv_ty != null) self.own_this_label else null;
             try appendTowerEntry(&out, allocator, .{ .head = head, .label = label });
         }
-        // An inline SPLICE window's receiver is an implicit receiver too,
-        // labeled by the spliced function: a SAM lambda built inside
-        // `thenBy`'s spliced body reads `this@thenBy`, and without this
-        // entry the closure's tower never carried it.
-        if (self.spliceRecvTy() orelse self.spliceHintRecv()) |head| {
+        if (!splice_first) if (splice_head) |head| {
             try appendTowerEntry(&out, allocator, .{ .head = head, .label = self.currentInlineFn() });
-        }
+        };
         for (self.implicit_receiver_tower.items) |entry| {
             try appendTowerEntry(&out, allocator, entry);
         }
@@ -2309,6 +2345,15 @@ pub const FuncBuilder = struct {
     pub fn contextFnParam(self: *const FuncBuilder, name: []const u8) ?ContextFnShape {
         return self.context_fn_params.get(name);
     }
+    /// The OUTERMOST scope's binding for `name` (a function's own entry
+    /// binding), ignoring inner shadowing — for `this@<ownFn>` inside a
+    /// spliced receiver lambda, where the innermost `this` is the subject.
+    pub fn resolveOutermost(self: *const FuncBuilder, name: []const u8) ?Reg {
+        for (self.scopes.items) |*scope| {
+            if (scope.get(name)) |r| return r;
+        }
+        return null;
+    }
     pub fn isReceiverLambdaParam(self: *const FuncBuilder, name: []const u8) bool {
         return self.receiver_lambda_params.contains(name);
     }
@@ -2336,6 +2381,21 @@ pub const FuncBuilder = struct {
     /// Record that the current inline splice owns this receiver-lambda mark.
     pub fn noteSpliceRlpMark(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.splice_rlp_marks.put(name, {});
+    }
+    /// Record that an inline splice found `name` ALREADY marked by an
+    /// enclosing splice (`kotlin.with`'s own `block` param inside
+    /// `SlotTable.edit`, whose receiver-formed param is also `block`):
+    /// mark ownership is shared, so the caller-body suspension must keep
+    /// it — unmarking would strip the OUTER callee's receiver from the
+    /// caller's bare invocation.
+    pub fn noteSharedRlpMark(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.shared_rlp_marks.put(name, {});
+    }
+    pub fn clearSharedRlpMark(self: *FuncBuilder, name: []const u8) void {
+        _ = self.shared_rlp_marks.remove(name);
+    }
+    pub fn isSharedRlpMark(self: *const FuncBuilder, name: []const u8) bool {
+        return self.shared_rlp_marks.contains(name);
     }
     pub fn clearSpliceRlpMark(self: *FuncBuilder, name: []const u8) void {
         _ = self.splice_rlp_marks.remove(name);

@@ -68,6 +68,32 @@ fn checkErr(stem: []const u8, needle: []const u8) !void {
     }
 }
 
+test "fn_param_member_vs_string_extension" {
+    try check("fn_param_member_vs_string_extension",
+        \\http://a/
+        \\http://b/
+        \\
+    );
+}
+
+test "static_operator_resolution" {
+    try check("static_operator_resolution",
+        \\nullable:1
+        \\int:2
+        \\string:qualified
+        \\[1, 2, 3]
+        \\string:inherited
+        \\int:4
+        \\number:4
+        \\extension:shadow
+        \\inner:receiver
+        \\[3]
+        \\extension:constructor
+        \\21500
+        \\
+    );
+}
+
 test "annotated_expression_body" {
     try check("annotated_expression_body",
         \\neg
@@ -101,23 +127,6 @@ test "captured_write_shared_resolution" {
     );
 }
 
-test "static_operator_resolution" {
-    try check("static_operator_resolution",
-        \\nullable:1
-        \\int:2
-        \\string:qualified
-        \\[1, 2, 3]
-        \\string:inherited
-        \\int:4
-        \\number:4
-        \\extension:shadow
-        \\inner:receiver
-        \\[3]
-        \\extension:constructor
-        \\21500
-        \\
-    );
-}
 
 test "qualified_type_parameter_collision" {
     try check("qualified_type_parameter_collision",
@@ -278,13 +287,6 @@ test "member_shadowed_buildstring" {
     );
 }
 
-test "fn_param_member_vs_string_extension" {
-    try check("fn_param_member_vs_string_extension",
-        \\http://a/
-        \\http://b/
-        \\
-    );
-}
 
 test "init_block_companion_call" {
     try check("init_block_companion_call",

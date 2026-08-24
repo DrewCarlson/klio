@@ -656,6 +656,15 @@ pub const Inst = union(enum) {
     NotNullAssert: struct { dst: Reg, src: Reg },
     /// Marker for the evaluator's debugger / tracing hook.
     Trace: struct { span: Span },
+    /// Push the value in `src` onto the executing frame's
+    /// enclosing-receiver chain as a `with`-subject for the duration of a
+    /// spliced receiver-lambda region (`EnclosingPop` ends it). Runtime
+    /// dispatch — bare-name walks, member-extension owners, operators —
+    /// then sees the subject exactly as the framed route would. The chain
+    /// is frame-owned, so a non-local exit that skips the pop is healed
+    /// at frame teardown.
+    EnclosingPush: struct { src: Reg },
+    EnclosingPop: struct {},
     /// Resolve a bare global identifier through the Host. Used when
     /// Path lowering cannot bind the name to a local register —
     /// covers top-level stdlib calls (`println`, `listOf`) and any
@@ -1239,6 +1248,27 @@ pub const Func = struct {
     /// Cached `frameNoFill` verdict: 0 = unasked, 1 = must fill,
     /// 2 = register file may start unfilled.
     frame_fill_state: u8 = 0,
+    /// Scalar-replay (`kl_`) route memo: 0 unresolved, 1 none, else the
+    /// registered NativeLeafFn as an address. The table is write-once
+    /// before the program runs, so the first resolution is final;
+    /// benign-race fill.
+    leaf_route: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// The bytecode-stream table for this func (`bc.funcStreams` memo):
+    /// 0 unresolved, 1 none, else a `*const bc.FuncStreams` address.
+    /// `bc_memo_fuse` records which allow_fuse variant the memo holds
+    /// (1 = false, 2 = true); a caller wanting the other variant takes
+    /// the shared-cache path. Benign-race fill.
+    bc_memo: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    bc_memo_fuse: u8 = 0,
+    /// `bc.streamGen()` at fill time; a cache reset frees the streams the
+    /// memo points at, so a stale generation must fall to the shared path.
+    bc_memo_gen: u32 = 0,
+    /// The frameless leaf serve hit a STRUCTURALLY unsupported
+    /// instruction in this body: every future serve would abandon at the
+    /// same instruction, so the attempt (which may execute half the body
+    /// before abandoning, doubling the call's work) is skipped outright.
+    /// Value-dependent abandons never set this. Benign-race fill.
+    leaf_hopeless: u8 = 0,
     /// True when `params[0]` is a *synthesized* `this` receiver — an
     /// instance method's / extension's / local-extension's dispatch
     /// receiver, a constructor's or init thunk's instance under
@@ -4550,9 +4580,7 @@ pub const Module = struct {
             // refutation too: a lambda converts only to a function type or
             // a fun interface (`propertyEquals(property: KProperty1<..>)`
             // drops for a lambda argument; its getter sibling binds).
-            if (std.c.getenv("KLIO_LAMBDA_REFUTE") == null or
-                !std.mem.eql(u8, std.mem.span(std.c.getenv("KLIO_LAMBDA_REFUTE").?), "0"))
-            {
+            if (lambdaRefuteOn()) {
                 if (self.staticTypeClassId(.{ .name = head, .nullable = false, .args = &.{} })) |pcid| {
                     if (pcid.int() < self.classes.items.len and
                         !self.classes.items[pcid.int()].is_fun_interface)
@@ -4563,7 +4591,59 @@ pub const Module = struct {
             }
             return .unknown;
         }
+        // The reverse refutation: a definitely NON-callable argument (a
+        // String/scalar static type, no lambda and no callable surface)
+        // never satisfies a FUNCTION-TYPE parameter, whatever its
+        // spelling — the parser's `<function>` tag, a spelled
+        // `(A) -> B`, or the erased `FunctionN` names. `url(urlString)`
+        // must drop the member `url(block)` so the String extension
+        // binds; without this the head named no registered class and the
+        // probe answered `.unknown`, letting the member survive.
+        if (!arg.is_lambda and arg.lambda_arity == null and !arg.func_typed) {
+            if (headIsFunctionSpelling(param.name)) {
+                if (arg.ty) |aty| {
+                    if (nonCallableBuiltinHead(staticTypeHead(aty.name))) return .incompatible;
+                }
+            }
+        }
         return .unknown;
+    }
+
+    fn lambdaRefuteOn() bool {
+        const S = struct {
+            var cached: bool = false;
+            var val: bool = true;
+        };
+        if (!S.cached) {
+            S.val = std.c.getenv("KLIO_LAMBDA_REFUTE") == null or
+                !std.mem.eql(u8, std.mem.span(std.c.getenv("KLIO_LAMBDA_REFUTE").?), "0");
+            S.cached = true;
+        }
+        return S.val;
+    }
+
+    /// Whether a param-type NAME denotes a function type in any spelling:
+    /// the parser's `<function>` tag, a spelled-out `(A) -> B`, or the
+    /// erased `FunctionN`/`SuspendFunctionN`/`KFunctionN` names (digit
+    /// tail required so a user class named `FunctionTable` never claims
+    /// the surface).
+    fn headIsFunctionSpelling(name: []const u8) bool {
+        if (std.mem.eql(u8, name, "<function>")) return true;
+        if (std.mem.indexOf(u8, name, "->") != null) return true;
+        var head = staticTypeHead(name);
+        for ([_][]const u8{ "Function", "SuspendFunction", "KFunction", "KSuspendFunction" }) |p| {
+            if (std.mem.startsWith(u8, head, p) and head.len > p.len) {
+                var all_digits = true;
+                for (head[p.len..]) |c| {
+                    if (c < '0' or c > '9') {
+                        all_digits = false;
+                        break;
+                    }
+                }
+                if (all_digits) return true;
+            }
+        }
+        return false;
     }
 
     /// Whether the params a trailing-callable mapping would SKIP — those

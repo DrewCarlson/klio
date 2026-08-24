@@ -35,7 +35,16 @@ const lowerBlock = expr_lower.lowerBlock;
 /// type, looked up from a same-named non-extension function). Returns
 /// `null` when the type can't be inferred cheaply — the caller then falls
 /// back to shape-based overload resolution.
+threadlocal var infer_recv_depth: u16 = 0;
+
 pub fn inferReceiverType(b: *const FuncBuilder, this_arg: ?*const Expr) Allocator.Error!?[]const u8 {
+    // A local's recorded initializer can reference the local itself
+    // (`val x = x.rotateLeft(1)` shadowing an outer `x`), and the
+    // init-expr recursion below then never terminates. Bound the depth;
+    // real inference chains are a handful of hops.
+    if (infer_recv_depth >= 16) return null;
+    infer_recv_depth += 1;
+    defer infer_recv_depth -= 1;
     const arg = this_arg orelse return b.thisNarrow() orelse b.recvTy();
     switch (arg.*) {
         // A smart-cast `this` (`when (this) { is List -> this.single() }`)
@@ -700,11 +709,11 @@ fn scanCatches(catches: []const ast.Catch) bool {
 
 /// Splice an `inline fun` argument lambda where the inlined body
 /// invokes the corresponding lambda parameter.
-/// Receiver-formed lambda SPLICING and its supporting resolution changes
-/// are opt-in (KLIO_RFS=1) until spliced windows carry a runtime receiver
-/// tower; see the round record in plans/concurrency-perf-campaigns.md.
+/// Receiver-formed lambda splicing is unconditional: the runtime subject
+/// tower and its resolution rules are the semantics, not a mode. The
+/// name survives as a seam marker for the (now always-true) call sites.
 pub fn rfsEnabled() bool {
-    return std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_RFS") orelse "0", "1");
+    return true;
 }
 
 pub fn spliceInlineLambda(
@@ -779,6 +788,9 @@ pub fn spliceInlineLambdaOn(
     try b.pushScope();
     const lambda_own_base = b.scopeDepth() - 1;
     if (receiver) |reg| try b.bind("this", reg);
+    if (inline_state.runtime.envOnce("KLIO_THIS_TRACE") != null) {
+        std.debug.print("[lam-splice-bind] {s} recv={?d} own_base={d} depth={d}\n", .{ lambda_name, if (receiver) |r| r.int() else null, lambda_own_base, b.scopeDepth() });
+    }
     // The splice's parameter bindings inherit the ARGUMENT expressions'
     // static types: `predicate(element)` inside a spliced `all` body binds
     // the caller lambda's `it` to `element`, and the loop variable's derived
@@ -973,7 +985,17 @@ pub fn spliceInlineLambdaOn(
         // parameter (`fun mk(block: C.() -> Unit) = C().apply { block() }`),
         // the mark is the caller's and suspending it drops the receiver from
         // the bare call.
-        if (b.isReceiverLambdaParam(k) and b.isSpliceRlpMark(k)) {
+        //
+        // The splice-mark bit is NAME-keyed with no provenance: when an
+        // OUTER inline frame binds the same name (`kotlin.with`'s own
+        // `block` param spliced inside `SlotTable.edit`, whose
+        // receiver-formed param is ALSO `block`), suspending drops the
+        // OUTER callee's mark too and the caller-body `block()` splices
+        // with NO receiver — the editor lambda ran on the table. Keep the
+        // mark whenever any outer frame's substitution also carries it.
+        if (b.isReceiverLambdaParam(k) and b.isSpliceRlpMark(k) and
+            !b.isSharedRlpMark(k))
+        {
             b.unmarkReceiverLambdaParam(k);
             try suspended_rlp.append(b.allocator, k);
         }
@@ -1019,15 +1041,33 @@ pub fn spliceInlineLambdaOn(
                 if (!bare_tp and h.len != 0) recv_head = h;
             }
         };
+        // A BARE invocation of a generic receiver-formed param
+        // (`apply`'s `block()` — no receiver expression to type) binds
+        // the CALLEE's own substituted subject: inherit the enclosing
+        // splice window's head rather than clobbering it with null
+        // (`scope.apply { result = ... }` must keep Scope so the write
+        // arbitration knows the subject hides no `result`). ONLY the
+        // bare form: an EXPLICIT `receiver.block()` (`with`'s body)
+        // binds the receiver expression, which need not relate to the
+        // enclosing head at all — a member-inline splice's owner head
+        // (SlotTable) fed `with(openEditor())`'s editor subject and
+        // every bare editor read pinned to the table.
+        if (recv_head == null and rfsEnabled() and explicit_receiver == null) {
+            recv_head = b.spliceRecvTy();
+        }
     }
     const lam_prev_splice_recv = b.spliceRecvTy();
+    const lam_prev_recv_from_window = b.splice_recv_from_window;
     if (receiver != null) {
         // Receiver lambda (`apply { minusAssign(key) }`): the innermost
         // implicit receiver inside the body is the lambda's SUBJECT, so
         // bare calls hint its head — never the enclosing fn's receiver,
         // which would refute candidates the subject satisfies.
         b.setSpliceHint(true, recv_head);
-        if (rfsEnabled()) b.setSpliceRecvTy(recv_head);
+        if (rfsEnabled()) {
+            b.setSpliceRecvTy(recv_head);
+            b.splice_recv_from_window = recv_head != null;
+        }
     } else if (site_hint) |sh| b.setSpliceHint(sh.active, sh.recv);
     const lam_prev_narrow = b.setThisNarrow(if (receiver != null) null else if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
     // Body-declared `var`s a nested closure WRITES must box (`var expected
@@ -1054,19 +1094,40 @@ pub fn spliceInlineLambdaOn(
     // call resolves against the caller's class exactly as it would outside
     // the splice.
     const caller_scope = try b.enterCallerMemberScope();
+    // The spliced subject joins the RUNTIME enclosing-receiver chain for
+    // the body's region: qualified member-extension calls, operators, and
+    // companion-chain reads inside the body dispatch against it exactly
+    // as the framed route's closure receiver would. Label returns funnel
+    // through `end`, whose first instruction pops; a non-local owner
+    // return skips the pop and frame teardown heals it.
+    const encl_pushed = receiver != null and rfsEnabled();
+    const prev_tower_top = b.encl_tower_top;
+    if (encl_pushed) {
+        try b.push(.{ .EnclosingPush = .{ .src = receiver.? } });
+        b.encl_tower_depth += 1;
+        b.encl_tower_top = receiver.?;
+    }
     const v = try lowerBlock(b, &body);
+    if (encl_pushed) {
+        b.encl_tower_depth -= 1;
+        b.encl_tower_top = prev_tower_top;
+    }
     if (caller_scope) |cs| b.exitCallerMemberScope(cs);
     for (lam_boxed_here.items) |n| b.unmarkBoxed(n);
     for (hidden_binds.items) |hb| b.restoreHiddenBinding(hb.name, hb.h);
     for (suspended_rlp.items) |k| try b.markReceiverLambdaParam(k);
     _ = b.setThisNarrow(lam_prev_narrow);
     b.setSpliceHint(lam_prev_active, lam_prev_recv);
-    if (receiver != null and rfsEnabled()) b.setSpliceRecvTy(lam_prev_splice_recv);
+    if (receiver != null and rfsEnabled()) {
+        b.setSpliceRecvTy(lam_prev_splice_recv);
+        b.splice_recv_from_window = lam_prev_recv_from_window;
+    }
     if (pushed_band) _ = b.splice_hidden_bands.pop();
     b.lambda_splice_resolve = prev_splice;
     try b.push(.{ .Move = .{ .dst = result, .src = v } });
     b.terminate(.{ .Goto = end });
     b.switchTo(end);
+    if (encl_pushed) try b.push(.{ .EnclosingPop = .{} });
     if (label != null) {
         b.popInlineLambdaRet();
     }
@@ -2696,8 +2757,16 @@ pub fn tryInlineCallWithTypeArgs(
     // the generic marks above.
     var marked_rlp: std.ArrayList([]const u8) = .empty;
     defer marked_rlp.deinit(b.allocator);
+    var shared_rlp_here: std.ArrayList([]const u8) = .empty;
+    defer shared_rlp_here.deinit(b.allocator);
     for (f.params) |*p| {
         const has_recv = if (p.ty.function) |ft| ft.receiver != null else false;
+        if (has_recv and b.isReceiverLambdaParam(p.name.name)) {
+            // Already marked by an ENCLOSING splice: ownership is shared;
+            // the caller-body suspension must keep it.
+            try b.noteSharedRlpMark(p.name.name);
+            try shared_rlp_here.append(b.allocator, p.name.name);
+        }
         if (has_recv and !b.isReceiverLambdaParam(p.name.name)) {
             try b.markReceiverLambdaParam(p.name.name);
             // Record the declared receiver head so a spliced lambda body's
@@ -2802,6 +2871,20 @@ pub fn tryInlineCallWithTypeArgs(
     var prev_splice_window: @TypeOf(b.lambda_splice_resolve) = null;
     if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
         if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} recv={} ext={} member={} this_arg={}\n", .{ fname, explicit_receiver != null, f.receiver_type != null, member_splice, this_arg != null });
+    }
+    // An EXT-splice's bound receiver is an implicit receiver inner to
+    // any spliced lambda subject already on the tower: push it too so
+    // the runtime chain stays complete (`resumeWith` inside a spliced
+    // `Continuation.resume`, itself inside a spliced atomic `loop { }`,
+    // dispatches on the continuation, which no other walk entry holds).
+    // Only while a tower region is active — outside one, emissions pin
+    // the bound register directly, exactly as before.
+    const encl_ext_pushed = explicit_receiver != null and rfsEnabled() and b.encl_tower_depth > 0;
+    const prev_ext_tower_top = b.encl_tower_top;
+    if (encl_ext_pushed) {
+        try b.push(.{ .EnclosingPush = .{ .src = explicit_receiver.? } });
+        b.encl_tower_depth += 1;
+        b.encl_tower_top = explicit_receiver.?;
     }
     if (explicit_receiver) |receiver| {
         try b.bind("this", receiver);
@@ -3035,10 +3118,16 @@ pub fn tryInlineCallWithTypeArgs(
     if (ext_splice) b.lambda_splice_resolve = prev_splice_window;
     b.terminate(.{ .Goto = join });
     b.switchTo(join);
+    if (encl_ext_pushed) {
+        try b.push(.{ .EnclosingPop = .{} });
+        b.encl_tower_depth -= 1;
+        b.encl_tower_top = prev_ext_tower_top;
+    }
     for (marked_rlp.items) |n| {
         b.unmarkReceiverLambdaParam(n);
         b.clearSpliceRlpMark(n);
     }
+    for (shared_rlp_here.items) |n| b.clearSharedRlpMark(n);
     // Remove the boxing marks added for this splice so a same-named caller
     // local keeps its own (un)boxed status.
     for (boxed_here.items) |n| b.unmarkBoxed(n);

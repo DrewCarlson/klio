@@ -577,6 +577,12 @@ fn scalarRetag(name: []const u8, iv: i64) ?Value {
     return null;
 }
 
+/// The instance-identity counter for host modules that mint interpreted
+/// instances directly (the persistent-collection fast paths).
+pub fn mintInstanceId(self: *VmHost) u64 {
+    return nextInstanceId(self);
+}
+
 fn nextInstanceId(self: *VmHost) u64 {
     const g = self.instance_id_counter.borrowMut();
     defer g.deinit();

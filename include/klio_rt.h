@@ -107,6 +107,14 @@ void    klio_op_cell_get(void *ctx, uint32_t dst, uint32_t cell);
 int32_t klio_op_bin(void *ctx, uint32_t block, uint32_t inst_idx, uint32_t kind, uint32_t dst, uint32_t lhs, uint32_t rhs);
 int32_t klio_op_escape(void *ctx, uint32_t block, uint32_t inst_idx);
 int32_t klio_op_call(void *ctx, uint32_t block, uint32_t inst_idx);
+
+/* Scalar-replay leaf body: the whole function over (int64 value, genre)
+ * pairs — genres 0 Int, 1 Long, 2 Bool, 3 Unit, 4 Char. Nonzero = result
+ * in (*ret, *retg); zero = pure bail, the runtime re-runs the call. */
+typedef int32_t (*klio_leaf_fn)(void *ctx, klio_edge_view *ev,
+                                const int64_t *argv, const int32_t *argg,
+                                int64_t *ret, int32_t *retg, uint32_t depth);
+void klio_rt_register_native_leaf(uint32_t fid, klio_leaf_fn f, const char *fqn);
 int32_t klio_op_edge(void *ctx);
 int32_t klio_op_br(void *ctx, uint32_t block, uint32_t cond);
 int32_t klio_op_cmp_br(void *ctx, uint32_t block, uint32_t inst_idx, uint32_t kind, uint32_t dst, uint32_t lhs, uint32_t rhs);

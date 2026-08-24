@@ -149,9 +149,15 @@ var major_threshold: usize = 8 * 1024 * 1024;
 /// cells); drained (flags cleared, list emptied) by every collection.
 /// Env probe for the remembered-set diagnostics, safe in libc-free builds
 /// (module test binaries never set the variable anyway).
+var remember_trace_init: bool = false;
+var remember_trace_on: bool = false;
 fn rememberTraceOn() bool {
     if (comptime !@import("builtin").link_libc) return false;
-    return std.c.getenv("KLIO_GC_REMEMBER_TRACE") != null;
+    if (!remember_trace_init) {
+        remember_trace_on = std.c.getenv("KLIO_GC_REMEMBER_TRACE") != null;
+        remember_trace_init = true;
+    }
+    return remember_trace_on;
 }
 
 var remembered: std.ArrayListUnmanaged(*GcHeader) = .empty;
