@@ -562,6 +562,35 @@ an inst-level `splice_tower: []Reg` on the CallMember family + walk
 plumbing). That is the completing piece for this round's ~4s wall and
 the op-VM splice family.
 
+## Round 8: the splice receiver tower (2026-08-24, infrastructure landed)
+
+24fa6c50: two new insts — `EnclosingPush {src}` / `EnclosingPop` — mark a
+spliced receiver-lambda region; the exec arms push the subject onto the
+frame-owned enclosing-receiver chain (`pushEnclosingSubject`), which every
+dispatch walk already consults and which callees inherit (`activateChain`
+copies in-flight pushes). A non-local exit that skips the pop is healed at
+frame teardown (the chain dies with the frame). Emission sites inside a
+tower region use chain-driven CMG (`recv = null`) instead of pinning one
+bound register — a pinned subject REPLACES the frame `this` and inverts
+Kotlin's innermost-first ranking for nested subjects. FORMAT_VERSION 55.
+
+Acceptance progress with KLIO_RFS=1: the qualified member-extension pair
+(with_receiver_member_extension_visible_in_lambda,
+inline_member_extension_via_with_block) PASSES — the tower works for the
+shape that motivated it. REMAINING ROOT, precisely diagnosed on
+ext_receiver_strict_proof.kt: an `AstLambda` closure CREATED inside a
+pushed-subject region materializes its `this` capture from the chain top
+(the pushed subject), and the receiver-split override at
+`callValueWithThis` then leaves the stale subject in the activation's
+capture slot — `with(Outer()) { with(list) { render() } }` walks
+[Outer] instead of [List, Outer] and the member beats the applicable
+extension. The fix lives in AstLambda capture materialization (creation
+must not eagerly bind a pushed SUBJECT as the `this` capture of a
+receiver-formed literal) or in making the split override unconditional
+for receiver-formed closures. Until that lands, KLIO_RFS stays opt-in
+and the tree is behavior-identical with it off (parity 0 fails, sweep
+117/0).
+
 ## Call-throughput round 3 (2026-08-24)
 
 - 956600b5 LANDED: host-served snapshot validity walk (readable/valid
