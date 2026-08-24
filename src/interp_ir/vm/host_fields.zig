@@ -690,6 +690,20 @@ fn builtinMemberProperty(receiver: *const Value, name: []const u8) bool {
     };
 }
 
+/// Fill the class's `<class-companion-or-self>` memo with the resolved
+/// singleton. A losing concurrent filler re-retains the same immortal
+/// singleton — benign. The memo's copy is retained once for the class's
+/// lifetime.
+fn fillCompanionReadMemo(cls: ObjRef(ClassDef), v: Value) void {
+    const g = cls.borrow();
+    defer g.deinit();
+    const d = @constCast(g.get());
+    if (d.companion_read_state.load(.monotonic) != 0) return;
+    if (runtime.reclaimEnabled()) v.retain();
+    d.companion_read_value = v;
+    d.companion_read_state.store(2, .release);
+}
+
 fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, suppress_cc_redirect: bool, member_probe: bool) Allocator.Error!EvalResult {
     // Static-type-directed extension-property read. The lowerer emits this
     // marker when a read's STATIC receiver type resolves `name` to an in-scope
@@ -720,6 +734,20 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // wading the whole prefix per read showed up in profiles.
     if (std.mem.eql(u8, name, "<class-companion-or-self>")) {
         if (receiver.* == .Class) {
+            // Class-static single-fill memo: the resolution (companion
+            // singleton / object singleton / the class value itself) never
+            // changes once the singleton exists, and this read is hot
+            // enough (`Job` in value position per context lookup) that the
+            // string-keyed registry probe priced every occurrence.
+            {
+                const g = receiver.Class.borrow();
+                defer g.deinit();
+                switch (g.get().companion_read_state.load(.acquire)) {
+                    1 => return ok(receiver.*),
+                    2 => return ok(g.get().companion_read_value),
+                    else => {},
+                }
+            }
             const cls_name = blk: {
                 const g = receiver.Class.borrow();
                 defer g.deinit();
@@ -737,15 +765,26 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             };
             if (comp_name) |cn| {
                 switch (try host_globals.ensureObjectSingleton(self, cn)) {
-                    .ok => |maybe| if (maybe) |s| return ok(s),
+                    .ok => |maybe| if (maybe) |s| {
+                        fillCompanionReadMemo(receiver.Class, s);
+                        return ok(s);
+                    },
                     .err => |e| return errRes(e),
                 }
             }
             if (is_object) {
                 switch (try host_globals.ensureObjectSingleton(self, cls_name)) {
-                    .ok => |maybe| if (maybe) |s| return ok(s),
+                    .ok => |maybe| if (maybe) |s| {
+                        fillCompanionReadMemo(receiver.Class, s);
+                        return ok(s);
+                    },
                     .err => |e| return errRes(e),
                 }
+            }
+            if (comp_name == null and !is_object) {
+                const g = receiver.Class.borrow();
+                defer g.deinit();
+                @constCast(g.get()).companion_read_state.store(1, .release);
             }
         }
         return ok(receiver.*);

@@ -144,6 +144,16 @@ pub const ClassDef = struct {
     resolve_mod: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     resolve_cid: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
+    /// Single-fill memo for the `<class-companion-or-self>` value read:
+    /// whether this class resolves to a companion/object singleton and,
+    /// when it does, the singleton value itself (process-stable once
+    /// constructed — the shared singleton registry keeps it alive, so the
+    /// memo holds a borrowed copy). 0 = unresolved, 1 = the class value
+    /// itself (no companion, not an object), 2 = `companion_read_value`.
+    /// Benign-race: concurrent fillers store the same singleton.
+    companion_read_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    companion_read_value: Value = .Null,
+
     /// One eager enum entry: its name and the `Value::Instance` for it.
     pub const EnumEntry = struct {
         name: []const u8,
