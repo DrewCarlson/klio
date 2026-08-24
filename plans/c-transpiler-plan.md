@@ -308,6 +308,17 @@ Measured: mandel sweep 143s -> 7.5s (19x, parity); the IEEE gauntlet
 mixing) byte-identical. fib/branchy/klsem/flsem parity, sweep 117/0,
 corpus 399/0.
 
+## The scalar replay's natural boundary (2026-08-24)
+
+A leaf-miss tally over 25 corpus examples: escape-op 57 (GetField /
+NewInstance / member dispatch — object work), nonscalar-const 26
+(strings), call-shape 6, prune 1. Every remaining miss is
+object-shaped: the scalar-replay campaign is COMPLETE at its natural
+boundary. The next frontier — object-shape replay (field reads,
+strings, allocation) — is a distinct campaign with the interpreter's
+full aliasing/GC/dispatch semantics in scope; do not start it without
+profiling a workload that needs it.
+
 ## Next: the speedup campaign (open)
 
 The opaque call-per-op ABI trades the stream's inlined switch dispatch
