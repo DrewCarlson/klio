@@ -308,6 +308,18 @@ Measured: mandel sweep 143s -> 7.5s (19x, parity); the IEEE gauntlet
 mixing) byte-identical. fib/branchy/klsem/flsem parity, sweep 117/0,
 corpus 399/0.
 
+## Speedup round 4 (2026-08-24): the leaf-route memo
+
+The per-call kl_ resolution (registry mutex + hash probe + fqn compare)
+cost ~20% of the call-dense benchmark; `ir.Func.leaf_route` (atomic
+usize: 0 unresolved / 1 none / the fn address) memoizes it — the table
+is write-once before the program runs, so one resolution is final.
+branchy 1.9 -> 1.17s (5.7x vs the interpreter); fib/mandel hold;
+sweep + corpus 399/0. TRAP recorded the hard way: ANY ir.Func field
+addition changes the image layout — bump image.FORMAT_VERSION (50 ->
+51 here) or stale pinned artifacts PANIC with `incorrect alignment` in
+decodeInto instead of refusing gracefully.
+
 ## The scalar replay's natural boundary (2026-08-24)
 
 A leaf-miss tally over 25 corpus examples: escape-op 57 (GetField /
