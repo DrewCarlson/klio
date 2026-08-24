@@ -2424,11 +2424,12 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 const decl_owner = sgetterOwner(b, name0) orelse break :blk false;
                 const rhh = typeHead(std.mem.trimEnd(u8, rh, "?"));
                 if (rhh.len == 0) break :blk false;
+                if (b.module.classIsOrExtends(rhh, decl_owner)) break :blk true;
                 // The declaring owner may carry a file-collision mangle
                 // (`Operations$f429`) the receiver's SOURCE-spelled head
                 // never does; compare the source names too.
-                break :blk b.module.classIsOrExtends(rhh, decl_owner) or
-                    std.mem.eql(u8, rhh, stripLowerFileMangle(decl_owner)) or
+                if (!inline_call.rfsEnabled()) break :blk false;
+                break :blk std.mem.eql(u8, rhh, stripLowerFileMangle(decl_owner)) or
                     b.module.classIsOrExtends(rhh, stripLowerFileMangle(decl_owner));
             };
             if ((!is_known_global or splice_receiver_first) and
@@ -7034,7 +7035,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // same-named top-level function.
         if (recv_chain == null) {
             if (b.spliceRecvTy()) |sr| recv_chain = try recvChainOf(b, sr);
-        } else if (b.lambda_splice_resolve != null) {
+        } else if (b.lambda_splice_resolve != null and inline_call.rfsEnabled()) {
             // A spliced receiver LAMBDA is the innermost implicit receiver,
             // AHEAD of the enclosing (framed) receiver the narrowing chain
             // starts from: `with(operation) { executeWithComposeStackTrace(...) }`
@@ -7088,6 +7089,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     // membership (`executeWithComposeStackTrace` inside
                     // `with(operation) { ... }` is Operation's member
                     // extension in the pack).
+                    if (!inline_call.rfsEnabled()) break :blk false;
                     break :blk mextCandidateOwnedBy(b, nm, chain[0], callee.Path.segments[0].span.file) catch false;
                 };
                 if (!hs.complete) break :blk false;
@@ -9008,7 +9010,15 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
     // receiver (`current.modification` read off the list instead of the
     // record) — those keep the dynamic route until the nested receiver
     // rebinding is fixed.
-    const rfs_on = !std.mem.eql(u8, runtime.envOnce("KLIO_RFS") orelse "1", "0") and
+    // Receiver-formed lambda splicing is OPT-IN (KLIO_RFS=1) until the
+    // splice carries a runtime receiver TOWER: without one, QUALIFIED
+    // member-extension calls, operators, and companion-chain reads inside
+    // the spliced body lose the subject from the runtime dispatch chain
+    // (parity: with_receiver_member_extension_visible_in_lambda,
+    // static_operator_resolution). The bare-call decline scan below is
+    // not enough — the hazard surface is every dispatch that walks
+    // enclosing receivers.
+    const rfs_on = inline_call.rfsEnabled() and
         !argLambdaHasMemberExtBareCall(b, args);
     const member_body_ext = f.receiver_type != null and
         b.lambda_splice_resolve == null and b.spliceRecvTy() == null and

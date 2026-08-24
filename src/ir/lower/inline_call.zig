@@ -700,6 +700,13 @@ fn scanCatches(catches: []const ast.Catch) bool {
 
 /// Splice an `inline fun` argument lambda where the inlined body
 /// invokes the corresponding lambda parameter.
+/// Receiver-formed lambda SPLICING and its supporting resolution changes
+/// are opt-in (KLIO_RFS=1) until spliced windows carry a runtime receiver
+/// tower; see the round record in plans/concurrency-perf-campaigns.md.
+pub fn rfsEnabled() bool {
+    return std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_RFS") orelse "0", "1");
+}
+
 pub fn spliceInlineLambda(
     b: *FuncBuilder,
     lambda_name: []const u8,
@@ -997,7 +1004,7 @@ pub fn spliceInlineLambdaOn(
     var recv_head: ?[]const u8 = null;
     if (receiver != null) {
         recv_head = b.receiverLambdaRecvHead(lambda_name);
-        if (recv_head == null) if (receiver_expr) |rex| {
+        if (recv_head == null and rfsEnabled()) if (receiver_expr) |rex| {
             var derived: ?[]const u8 = null;
             if (expr_lower.argDeclTypeRefLazy(b, rex)) |known| {
                 derived = expr_lower.typeHead(std.mem.trimEnd(u8, known.name, "?"));
@@ -1020,7 +1027,7 @@ pub fn spliceInlineLambdaOn(
         // bare calls hint its head — never the enclosing fn's receiver,
         // which would refute candidates the subject satisfies.
         b.setSpliceHint(true, recv_head);
-        b.setSpliceRecvTy(recv_head);
+        if (rfsEnabled()) b.setSpliceRecvTy(recv_head);
     } else if (site_hint) |sh| b.setSpliceHint(sh.active, sh.recv);
     const lam_prev_narrow = b.setThisNarrow(if (receiver != null) null else if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
     // Body-declared `var`s a nested closure WRITES must box (`var expected
@@ -1054,7 +1061,7 @@ pub fn spliceInlineLambdaOn(
     for (suspended_rlp.items) |k| try b.markReceiverLambdaParam(k);
     _ = b.setThisNarrow(lam_prev_narrow);
     b.setSpliceHint(lam_prev_active, lam_prev_recv);
-    if (receiver != null) b.setSpliceRecvTy(lam_prev_splice_recv);
+    if (receiver != null and rfsEnabled()) b.setSpliceRecvTy(lam_prev_splice_recv);
     if (pushed_band) _ = b.splice_hidden_bands.pop();
     b.lambda_splice_resolve = prev_splice;
     try b.push(.{ .Move = .{ .dst = result, .src = v } });
