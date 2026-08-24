@@ -683,6 +683,21 @@ removeAt` thrown with NO closure frame above mutableList:154
 op-literal body (`{ removeAt(2) }`, a CollectionOperation ctor arg
 consumed DYNAMICALLY) executing through an emission that only makes
 sense spliced. The failing test then pollutes siblings in-process.
+ROUND 8i — THE FLIP LANDED (29e052f5): receiver-formed lambda
+splicing is ON BY DEFAULT with COMPLETE acceptance — stdlib sweep
+117/0, the full litmus battery (parity suites, examples, e2e, ktor,
+concurrency, bundle) at ZERO failures, unit tests green, gate.sh
+GREEN. The final root was a HOST-layer leak: a native's capability
+sniff (`getProperty(iterable, "entries")` inside host `putAll`,
+telling a user Map from an Iterable) was answered by an ENCLOSING
+receiver's member through the chain fallbacks — with the spliced
+`apply` subject (the destination map) on the runtime chain, every
+Iterable looked like a Map and drained empty. The sniff now routes
+through the MEMBER-STRICT probe (`getMemberField`). Ten distinct roots
+total drove the flip green (rounds 8-8i); KLIO_RFS=0 remains the
+bisect switch. Measurement pass (compose gate wall/count, vpd
+with-census, Map _clear, oneRect) running next.
+
 ROUND 8h (baab8f95): the 22-sweep family root LANDED — subject-kind
 chain entries (a spliced/framed `with` subject) no longer suppress a
 REAL receiver param's own candidate run (the dispatch tower is what
