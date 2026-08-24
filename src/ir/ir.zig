@@ -4580,9 +4580,7 @@ pub const Module = struct {
             // refutation too: a lambda converts only to a function type or
             // a fun interface (`propertyEquals(property: KProperty1<..>)`
             // drops for a lambda argument; its getter sibling binds).
-            if (std.c.getenv("KLIO_LAMBDA_REFUTE") == null or
-                !std.mem.eql(u8, std.mem.span(std.c.getenv("KLIO_LAMBDA_REFUTE").?), "0"))
-            {
+            if (lambdaRefuteOn()) {
                 if (self.staticTypeClassId(.{ .name = head, .nullable = false, .args = &.{} })) |pcid| {
                     if (pcid.int() < self.classes.items.len and
                         !self.classes.items[pcid.int()].is_fun_interface)
@@ -4593,7 +4591,59 @@ pub const Module = struct {
             }
             return .unknown;
         }
+        // The reverse refutation: a definitely NON-callable argument (a
+        // String/scalar static type, no lambda and no callable surface)
+        // never satisfies a FUNCTION-TYPE parameter, whatever its
+        // spelling — the parser's `<function>` tag, a spelled
+        // `(A) -> B`, or the erased `FunctionN` names. `url(urlString)`
+        // must drop the member `url(block)` so the String extension
+        // binds; without this the head named no registered class and the
+        // probe answered `.unknown`, letting the member survive.
+        if (!arg.is_lambda and arg.lambda_arity == null and !arg.func_typed) {
+            if (headIsFunctionSpelling(param.name)) {
+                if (arg.ty) |aty| {
+                    if (nonCallableBuiltinHead(staticTypeHead(aty.name))) return .incompatible;
+                }
+            }
+        }
         return .unknown;
+    }
+
+    fn lambdaRefuteOn() bool {
+        const S = struct {
+            var cached: bool = false;
+            var val: bool = true;
+        };
+        if (!S.cached) {
+            S.val = std.c.getenv("KLIO_LAMBDA_REFUTE") == null or
+                !std.mem.eql(u8, std.mem.span(std.c.getenv("KLIO_LAMBDA_REFUTE").?), "0");
+            S.cached = true;
+        }
+        return S.val;
+    }
+
+    /// Whether a param-type NAME denotes a function type in any spelling:
+    /// the parser's `<function>` tag, a spelled-out `(A) -> B`, or the
+    /// erased `FunctionN`/`SuspendFunctionN`/`KFunctionN` names (digit
+    /// tail required so a user class named `FunctionTable` never claims
+    /// the surface).
+    fn headIsFunctionSpelling(name: []const u8) bool {
+        if (std.mem.eql(u8, name, "<function>")) return true;
+        if (std.mem.indexOf(u8, name, "->") != null) return true;
+        var head = staticTypeHead(name);
+        for ([_][]const u8{ "Function", "SuspendFunction", "KFunction", "KSuspendFunction" }) |p| {
+            if (std.mem.startsWith(u8, head, p) and head.len > p.len) {
+                var all_digits = true;
+                for (head[p.len..]) |c| {
+                    if (c < '0' or c > '9') {
+                        all_digits = false;
+                        break;
+                    }
+                }
+                if (all_digits) return true;
+            }
+        }
+        return false;
     }
 
     /// Whether the params a trailing-callable mapping would SKIP — those

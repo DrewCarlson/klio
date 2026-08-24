@@ -7177,6 +7177,20 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         const target = resolved.target orelse break :pin;
                         const tf = b.module.funcById(target) orelse break :pin;
                         if (!tf.hasBody()) break :pin;
+                        // A FUNCTION-SPELLED parameter fed a non-lambda
+                        // argument is exactly the member-vs-extension shape
+                        // the static shapes cannot always refute (the arg's
+                        // static type may be unknowable through the splice
+                        // substitution): `url(urlString)` must not pin the
+                        // member `url(block)`. Fall to the walking form,
+                        // whose runtime adjudication sees the value.
+                        for (tf.params, 0..) |*tp, tpi| {
+                            if (tpi == 0 and std.mem.eql(u8, tp.name, "this")) continue;
+                            const ai = tpi - @intFromBool(tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this"));
+                            if (ai >= args.len) break;
+                            if (recvHeadIsFunctionType(tp.ty.name) and
+                                args[ai] != .Lambda and args[ai] != .AnonFun) break :pin;
+                        }
                         // A member in a stdlib/pack package may be shadowed
                         // by a HOST binding the lowering cannot see
                         // (atomicfu's ReentrantLock.unlock stub deadlocked

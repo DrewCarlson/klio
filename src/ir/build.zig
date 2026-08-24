@@ -1637,6 +1637,20 @@ pub const FuncBuilder = struct {
     /// first, with each entry's value label where one is known. `innermost`
     /// is the receiver the NEW body itself introduces (with `innermost_label`
     /// the name its `this@<label>` binds under).
+    /// Mirrors `inline_call.rfsEnabled` (imported there would cycle):
+    /// the receiver-formed-splice feature switch.
+    fn rfsSpliceFirst() bool {
+        const S = struct {
+            var cached: bool = false;
+            var val: bool = false;
+        };
+        if (!S.cached) {
+            S.val = if (std.c.getenv("KLIO_RFS")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+            S.cached = true;
+        }
+        return S.val;
+    }
+
     pub fn collectReceiverTowerLabeled(
         self: *const FuncBuilder,
         allocator: Allocator,
@@ -1649,18 +1663,28 @@ pub const FuncBuilder = struct {
             .head = head,
             .label = innermost_label,
         });
+        // An inline SPLICE window's receiver is an implicit receiver too,
+        // labeled by the spliced function: a SAM lambda built inside
+        // `thenBy`'s spliced body reads `this@thenBy`, and without this
+        // entry the closure's tower never carried it. Under the
+        // receiver-formed splice it is the `with`/`apply` SUBJECT — the
+        // INNERMOST implicit receiver, ranked ahead of the lexical owner
+        // (member-extension scope tiers index this order: InnerScope's
+        // `String.towerTag()` must outrank OuterScope's inside
+        // `with(InnerScope()) { "receiver".towerTag() }`).
+        const splice_head = self.spliceRecvTy() orelse self.spliceHintRecv();
+        const splice_first = rfsSpliceFirst();
+        if (splice_first) if (splice_head) |head| {
+            try appendTowerEntry(&out, allocator, .{ .head = head, .label = self.currentInlineFn() });
+        };
         const current = self.recv_ty orelse self.enclosing_recv_ty orelse self.owner_class;
         if (current) |head| {
             const label: ?[]const u8 = if (self.recv_ty != null) self.own_this_label else null;
             try appendTowerEntry(&out, allocator, .{ .head = head, .label = label });
         }
-        // An inline SPLICE window's receiver is an implicit receiver too,
-        // labeled by the spliced function: a SAM lambda built inside
-        // `thenBy`'s spliced body reads `this@thenBy`, and without this
-        // entry the closure's tower never carried it.
-        if (self.spliceRecvTy() orelse self.spliceHintRecv()) |head| {
+        if (!splice_first) if (splice_head) |head| {
             try appendTowerEntry(&out, allocator, .{ .head = head, .label = self.currentInlineFn() });
-        }
+        };
         for (self.implicit_receiver_tower.items) |entry| {
             try appendTowerEntry(&out, allocator, entry);
         }
