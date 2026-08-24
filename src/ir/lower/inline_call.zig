@@ -1019,6 +1019,13 @@ pub fn spliceInlineLambdaOn(
                 if (!bare_tp and h.len != 0) recv_head = h;
             }
         };
+        // A BARE invocation of a generic receiver-formed param
+        // (`apply`'s `block()` — no receiver expression to type) binds
+        // the CALLEE's own substituted subject: inherit the enclosing
+        // splice window's head rather than clobbering it with null
+        // (`scope.apply { result = ... }` must keep Scope so the write
+        // arbitration knows the subject hides no `result`).
+        if (recv_head == null and rfsEnabled()) recv_head = b.spliceRecvTy();
     }
     const lam_prev_splice_recv = b.spliceRecvTy();
     if (receiver != null) {
@@ -1061,12 +1068,17 @@ pub fn spliceInlineLambdaOn(
     // through `end`, whose first instruction pops; a non-local owner
     // return skips the pop and frame teardown heals it.
     const encl_pushed = receiver != null and rfsEnabled();
+    const prev_tower_top = b.encl_tower_top;
     if (encl_pushed) {
         try b.push(.{ .EnclosingPush = .{ .src = receiver.? } });
         b.encl_tower_depth += 1;
+        b.encl_tower_top = receiver.?;
     }
     const v = try lowerBlock(b, &body);
-    if (encl_pushed) b.encl_tower_depth -= 1;
+    if (encl_pushed) {
+        b.encl_tower_depth -= 1;
+        b.encl_tower_top = prev_tower_top;
+    }
     if (caller_scope) |cs| b.exitCallerMemberScope(cs);
     for (lam_boxed_here.items) |n| b.unmarkBoxed(n);
     for (hidden_binds.items) |hb| b.restoreHiddenBinding(hb.name, hb.h);
@@ -2816,6 +2828,20 @@ pub fn tryInlineCallWithTypeArgs(
     if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
         if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} recv={} ext={} member={} this_arg={}\n", .{ fname, explicit_receiver != null, f.receiver_type != null, member_splice, this_arg != null });
     }
+    // An EXT-splice's bound receiver is an implicit receiver inner to
+    // any spliced lambda subject already on the tower: push it too so
+    // the runtime chain stays complete (`resumeWith` inside a spliced
+    // `Continuation.resume`, itself inside a spliced atomic `loop { }`,
+    // dispatches on the continuation, which no other walk entry holds).
+    // Only while a tower region is active — outside one, emissions pin
+    // the bound register directly, exactly as before.
+    const encl_ext_pushed = explicit_receiver != null and rfsEnabled() and b.encl_tower_depth > 0;
+    const prev_ext_tower_top = b.encl_tower_top;
+    if (encl_ext_pushed) {
+        try b.push(.{ .EnclosingPush = .{ .src = explicit_receiver.? } });
+        b.encl_tower_depth += 1;
+        b.encl_tower_top = explicit_receiver.?;
+    }
     if (explicit_receiver) |receiver| {
         try b.bind("this", receiver);
         if (inline_state.runtime.envOnce("KLIO_THIS_TRACE") != null) {
@@ -3048,6 +3074,11 @@ pub fn tryInlineCallWithTypeArgs(
     if (ext_splice) b.lambda_splice_resolve = prev_splice_window;
     b.terminate(.{ .Goto = join });
     b.switchTo(join);
+    if (encl_ext_pushed) {
+        try b.push(.{ .EnclosingPop = .{} });
+        b.encl_tower_depth -= 1;
+        b.encl_tower_top = prev_ext_tower_top;
+    }
     for (marked_rlp.items) |n| {
         b.unmarkReceiverLambdaParam(n);
         b.clearSpliceRlpMark(n);

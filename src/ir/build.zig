@@ -542,6 +542,12 @@ pub const FuncBuilder = struct {
     /// region rely on the runtime chain (which holds every nested subject
     /// in the right order) instead of pinning one bound register.
     encl_tower_depth: u32 = 0,
+    /// The register holding the INNERMOST pushed tower subject (the last
+    /// `EnclosingPush`), so emission sites can tell a tower subject's
+    /// bound `this` (defer to the chain) from an inline-EXT splice's
+    /// bound receiver nested inside the region (must stay pinned — it is
+    /// NOT on the runtime chain).
+    encl_tower_top: ?Reg = null,
     /// The active splice's ACTUAL receiver static type WITH its type
     /// arguments, when the call site derived one (`data.count { }` on
     /// `data: T`, `T : Iterable<String>`, records `Iterable<String>`).

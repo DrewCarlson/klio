@@ -2085,7 +2085,9 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // `LayoutNode`, referenced bare) is also excepted: it is a class
         // reference, not an instance member, so it falls to the class-ref
         // lowering below (which loads the nested class and reads the enum entry).
-        if (b.hasOwnMember(name0) and !classWithCompanion(b, name0)) {
+        if (b.hasOwnMember(name0) and !classWithCompanion(b, name0) and
+            !spliceSubjectHidesOwnMember(b, name0))
+        {
             if (b.resolve("this")) |this_reg| {
                 const dst = b.allocReg();
                 const nm = try sgetterName(b, name0);
@@ -5647,6 +5649,19 @@ fn lastTypeSegment(name: []const u8) []const u8 {
 /// splice's bound `this`; the latter falls through to the bare-name path.
 /// A null `chain` (no receiver type narrowing available) admits any
 /// extension namesake, preserving the prior receiver-agnostic behavior.
+/// Whether any inline candidate for `name` declares a REIFIED type
+/// parameter. Such a call can only run as a SPLICE (the runtime walk
+/// cannot instantiate `T`), so no dispatch-deferring arm may claim it.
+fn nameHasReifiedInlineCandidate(name: []const u8) bool {
+    const cands = inline_state.candidatesForName(name) orelse return false;
+    for (cands) |cf| {
+        for (cf.type_params) |tp| {
+            if (tp.is_reified) return true;
+        }
+    }
+    return false;
+}
+
 fn nameHasReceiverCandidate(b: *FuncBuilder, name: []const u8, chain: ?[]const []const u8) bool {
     for (b.module.funcsBySimpleName(name)) |fid| {
         const idx = fid.int();
@@ -7064,7 +7079,9 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // iterator() = iterator() }` — the bare `iterator()` is the captured
         // lambda, not the override, which would recurse). Let it fall through
         // to the anon-capture invocation below.
-        if (b.resolve(nm) == null and !b.knowsOuter(nm) and !isLowerAnonCapture(nm)) {
+        if (b.resolve(nm) == null and !b.knowsOuter(nm) and !isLowerAnonCapture(nm) and
+            !nameHasReifiedInlineCandidate(nm))
+        {
             // Confident the call binds to the spliced `this`: the name is a
             // member of its class, or an extension whose declared receiver is
             // compatible with the *known* receiver-type chain. Dispatch it
@@ -7143,6 +7160,13 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     // (the atomicfu mutex splice livelocked when pinned).
                     if (member_of_recv and ast_type_args.len == 0 and
                         recv_chain.?.len == 1 and
+                        // Under the subject tower the bound `this` is the
+                        // spliced SUBJECT; a pin resolved against a lexical
+                        // owner would dispatch that owner's member ON the
+                        // subject (CallVirtual Holder.eachInline on the
+                        // StringBuilder). The walking form ranks receivers
+                        // correctly there.
+                        b.encl_tower_depth == 0 and
                         runtime.envOnce("KLIO_SPLICE_PIN") == null and
                         allNull(ast_arg_names)) pin: {
                         const chain0 = recv_chain.?[0];
@@ -7234,7 +7258,12 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         // receiver ranking.
                         .recv = if (b.encl_tower_depth > 0) null else bound_this,
                         .candidates = try cmgCandidates(b, nm, callee.Path.segments[0].span.file, run[1]),
-                        .static_recv = try cmgStaticRecv(b),
+                        // Under the subject tower the runtime chain ranks the
+                        // receivers; a static head would pin the strict-ext
+                        // arm to the SUBJECT and raise where the walk should
+                        // fall outward (`eachInline` in `with(sb) { ... }` is
+                        // the enclosing Holder's member-inline).
+                        .static_recv = if (b.encl_tower_depth > 0) null else try cmgStaticRecv(b),
                     } });
                     return dst;
                 }
@@ -7271,7 +7300,12 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         .arg_names = arg_names,
                         .recv = if (b.encl_tower_depth > 0) null else bound_this,
                         .candidates = try cmgCandidates(b, nm, callee.Path.segments[0].span.file, run[1]),
-                        .static_recv = try cmgStaticRecv(b),
+                        // Under the subject tower the runtime chain ranks the
+                        // receivers; a static head would pin the strict-ext
+                        // arm to the SUBJECT and raise where the walk should
+                        // fall outward (`eachInline` in `with(sb) { ... }` is
+                        // the enclosing Holder's member-inline).
+                        .static_recv = if (b.encl_tower_depth > 0) null else try cmgStaticRecv(b),
                     } });
                     return dst;
                 } else if (b.knowsOuter("this") or b.capturesThisSlot()) {
@@ -12954,6 +12988,7 @@ fn lowerPathCall(
     if (inline_call.rfsEnabled() and b.encl_tower_depth > 0 and
         b.resolve(name0) == null and !b.knowsOuter(name0) and
         b.inlineLambdaFor(name0) == null and
+        !nameHasReifiedInlineCandidate(name0) and
         (name0.len == 0 or !std.ascii.isUpper(name0[0])) and
         (nameHasReceiverCandidate(b, name0, null) or
             b.module.registry.class_member_names.contains(name0)))
@@ -13831,6 +13866,32 @@ fn recordOutOfScopeCall(
 /// no implicit receiver exists, so member-vs-global is statically
 /// decidable: kotlinc rejects resolving a bare name against a *caller's*
 /// receiver (dynamic scope), so those sites emit the static global form.
+/// Whether the CURRENT `this` is a spliced receiver-lambda SUBJECT of a
+/// known type that is not the enclosing owner and does not declare `name`:
+/// an own-member read must then take the walking load, not a GetField on
+/// the subject (a companion `tag` inside `with(Other()) { tag }` is the
+/// enclosing class's, never a field of Other). Mirrors the write side's
+/// `spliceReceiverHidesMember`.
+fn spliceSubjectHidesOwnMember(b: *FuncBuilder, name: []const u8) bool {
+    if (!inline_call.rfsEnabled() or b.encl_tower_depth == 0) return false;
+    const recv = b.spliceRecvTy() orelse b.spliceHintRecv() orelse return false;
+    var head = std.mem.trimEnd(u8, recv, "?");
+    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
+    const owner = b.ownerClass() orelse return false;
+    if (std.mem.eql(u8, head, owner)) return false;
+    if (inline_state.memberPropAst(head, name) != null) return false;
+    if (b.module.classId(head)) |cid| {
+        if (cid.int() < b.module.classes.items.len) {
+            const c = &b.module.classes.items[cid.int()];
+            for (c.primary_params) |*pp| {
+                if (std.mem.eql(u8, pp.name, name)) return false;
+            }
+        }
+    }
+    return true;
+}
+
 fn inReceiverContext(b: *const FuncBuilder) bool {
     // A binding named `this` that is an ordinary user parameter (backtick-
     // quoted on a receiver-less function) is not a dispatch receiver.
@@ -15546,7 +15607,26 @@ fn nestedClassIdAtLexicalSite(b: *FuncBuilder, name0: []const u8) ?ir.ClassId {
     return null;
 }
 
+/// Whether the currently bound `this` is the tower's INNERMOST pushed
+/// subject (already on the runtime chain, so emissions defer to the
+/// chain) rather than a nested inline-EXT splice receiver (not on the
+/// chain — must stay pinned; `resumeWith` inside a spliced
+/// `Continuation.resume` dispatches on the CAST receiver, which no walk
+/// can find).
+fn boundThisIsTowerTop(b: *FuncBuilder) bool {
+    if (b.encl_tower_depth == 0) return false;
+    const top = b.encl_tower_top orelse return false;
+    const cur = b.resolve("this") orelse return false;
+    return cur.int() == top.int();
+}
+
 fn cmgStaticRecv(b: *FuncBuilder) Allocator.Error!?ConstId {
+    // Under an active subject tower the runtime chain ranks the
+    // receivers; a static head would pin the strict-ext arm to the
+    // innermost SUBJECT and raise where the walk must fall outward
+    // (`eachInline` inside `with(sb) { ... }` is the enclosing class's
+    // member-inline, StringBuilder declares nothing by that name).
+    if (boundThisIsTowerTop(b)) return null;
     const rt = bareStaticRecvHead(b) orelse return null;
     return try b.module.internConst(b.allocator, .{ .String = rt });
 }
