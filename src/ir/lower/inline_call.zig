@@ -706,7 +706,7 @@ pub fn spliceInlineLambda(
     lam: *const Expr,
     arg_exprs: []const Expr,
 ) Allocator.Error!Reg {
-    return spliceInlineLambdaOn(b, lambda_name, lam, arg_exprs, null);
+    return spliceInlineLambdaOn(b, lambda_name, lam, arg_exprs, null, null);
 }
 
 /// As `spliceInlineLambda`, with the lambda's receiver supplied by the call
@@ -719,6 +719,7 @@ pub fn spliceInlineLambdaOn(
     lam: *const Expr,
     arg_exprs: []const Expr,
     explicit_receiver: ?Reg,
+    receiver_expr: ?*const Expr,
 ) Allocator.Error!Reg {
     if (lam.* != .Lambda) {
         return lowerExpr(b, lam);
@@ -985,13 +986,41 @@ pub fn spliceInlineLambdaOn(
     }
     const lam_prev_active = b.spliceHintActive();
     const lam_prev_recv = b.spliceHintRecv();
+    // The spliced receiver lambda has no runtime closure — its subject is
+    // only the window's bound register — so the body's bare member reads
+    // need the subject's STATIC head to win the member-vs-global
+    // arbitration (`objectArgs` inside `with(stack) { ... }` is the
+    // stack's member, never a global). The declared head decides when
+    // concrete; a generic head (`with`'s `T.()`) substitutes the
+    // receiver EXPRESSION's static type, exactly as the inline-fn splice
+    // substitutes a generic `T.apply` receiver.
+    var recv_head: ?[]const u8 = null;
+    if (receiver != null) {
+        recv_head = b.receiverLambdaRecvHead(lambda_name);
+        if (recv_head == null) if (receiver_expr) |rex| {
+            var derived: ?[]const u8 = null;
+            if (expr_lower.argDeclTypeRefLazy(b, rex)) |known| {
+                derived = expr_lower.typeHead(std.mem.trimEnd(u8, known.name, "?"));
+            } else if (try expr_lower.staticExprTypeRef(b, rex)) |owned_ty| {
+                var owned = owned_ty;
+                defer owned.deinit(b.allocator);
+                derived = try b.allocator.dupe(u8, expr_lower.typeHead(std.mem.trimEnd(u8, owned.name, "?")));
+            }
+            if (derived) |h| {
+                const bare_tp = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
+                    b.isTypeParam(h) or ir.parseClassTypeParamIdentity(h) != null;
+                if (!bare_tp and h.len != 0) recv_head = h;
+            }
+        };
+    }
+    const lam_prev_splice_recv = b.spliceRecvTy();
     if (receiver != null) {
         // Receiver lambda (`apply { minusAssign(key) }`): the innermost
         // implicit receiver inside the body is the lambda's SUBJECT, so
-        // bare calls hint its declared head (none when generic) — never
-        // the enclosing fn's receiver, which would refute candidates the
-        // subject satisfies.
-        b.setSpliceHint(true, b.receiverLambdaRecvHead(lambda_name));
+        // bare calls hint its head — never the enclosing fn's receiver,
+        // which would refute candidates the subject satisfies.
+        b.setSpliceHint(true, recv_head);
+        b.setSpliceRecvTy(recv_head);
     } else if (site_hint) |sh| b.setSpliceHint(sh.active, sh.recv);
     const lam_prev_narrow = b.setThisNarrow(if (receiver != null) null else if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
     // Body-declared `var`s a nested closure WRITES must box (`var expected
@@ -1025,6 +1054,7 @@ pub fn spliceInlineLambdaOn(
     for (suspended_rlp.items) |k| try b.markReceiverLambdaParam(k);
     _ = b.setThisNarrow(lam_prev_narrow);
     b.setSpliceHint(lam_prev_active, lam_prev_recv);
+    if (receiver != null) b.setSpliceRecvTy(lam_prev_splice_recv);
     if (pushed_band) _ = b.splice_hidden_bands.pop();
     b.lambda_splice_resolve = prev_splice;
     try b.push(.{ .Move = .{ .dst = result, .src = v } });
