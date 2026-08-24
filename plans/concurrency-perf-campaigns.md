@@ -613,6 +613,20 @@ the splice's static resolution diverges from the framed route — the
 drive-green backlog for the flip. Default stays opt-in; the head-guard
 lands unconditionally (parity 0, sweep 117/0 with RFS off).
 
+BACKLOG REFRAMED (first peel): `string_compare_to_difference.kt` run
+STANDALONE under KLIO_RFS=1 is byte-identical to RFS=0 — the 14 reds
+are NOT per-shape user-code divergences. The parity itests run against
+PRE-BAKED base images (KLIO_PARITY_BASE_IMAGES) whose STDLIB was
+lowered with the flipped default; fresh-lowered stdlib under RFS=1
+passes where the baked form fails (unsigned_compare dies in `sorted`'s
+UnsupportedOperationException fallback arm). So the flip blocker is a
+bake/image-path interaction with RFS-spliced stdlib bodies (candidate
+mechanisms: EnclosingPush regions through image encode/decode of
+deferred blocks, AstLambda runtime re-lowering context, span-scoped
+resolution changing across the bake boundary). Next: bake ONE base
+image with RFS on, decode-dump a with-spliced stdlib func (e.g.
+`sorted`/`compareTo` path), and diff against the fresh lowering.
+
 ## Call-throughput round 3 (2026-08-24)
 
 - 956600b5 LANDED: host-served snapshot validity walk (readable/valid
