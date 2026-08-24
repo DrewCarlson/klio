@@ -465,6 +465,43 @@ family 9 -> 4:
   BOTH are compile-tier territory (the pinned transpiler/bytecode
   campaigns); every surgical lever is landed or measured-insufficient.
 
+## Round 6: the compounding core found (2026-08-24)
+
+The "diffuse floor" verdict in Round 5 was WRONG in one decisive way: the
+unattributable libc bucket (17-29% in every profile) was not diffuse — it
+was `std.c.getenv` (a full environ scan) executing on EVERY GetField (two
+sites), EVERY CallMember, and EVERY frame activation x3, for trace gates
+(KLIO_GF_TRACE/KLIO_CM_TRACE/KLIO_CHAIN_TRACE) nobody had set. Profile
+mis-attribution hid it: the scans were inlined into unknown-libc.
+
+- ed851d67 LANDED: all per-call env probes now one-time cached statics
+  (gf/cm/chain + rsel/qt/remember). framed 1.56 -> 1.11s (-29%),
+  oneRect 28.4 -> 22.1s (-22%), stdlib sweep 190 -> 168s, libc bucket
+  GONE from profiles.
+- cf7594d0 LANDED: leaf serve runs the dense bytecode stream (fib
+  interp 3.15 -> 0.44s, 7x) + structural leaf-abandons memoize on Func
+  (leaf_hopeless; framed micro -17%).
+- 73184cd8 LANDED: per-Func bc-stream memo (bc_memo) — funcStreams took
+  a GLOBAL mutex + hashmap probe per activation (and the leaf walker
+  asked twice). framed 1.11 -> 1.055s, oneRect 22.1 -> 21.2s.
+  FORMAT_VERSION 52 -> 53 (TRAP: any ir.Func field addition must bump
+  it, else stale pinned images panic "incorrect alignment").
+- 280ae7ab LANDED: negative TL cache entries (miss_ttl=63 amortized
+  re-probe) for method/ext/intrinsic/field-read/field-write caches —
+  measured FLAT on mapops/Map _clear (their misses were rare) but kills
+  the per-miss prog-cell borrow class; and the type-disproof
+  adjudicator (`argDefinitelyNotParamType`) memoized by (param_ty ptr,
+  arg-type identity) — its uncached ladder pays alias/class string
+  probes + a HEAP-ALLOCATING supertype BFS per candidate-arg per call.
+  vpd eqlBytes 6.5 -> 4.8%. Containers excluded (content-dependent).
+- Gate wall: 497s (relink-tainted) -> 420s WARM (prev best 452). Target
+  364.
+- validatePotentialDeadlock re-diagnosed at speed: NOT a livelock —
+  live churn (spin shows recomposeToGroupEnd over the 200 Texts while
+  the Dispatchers.Default loop ticks ~10/s). advance(5000 virtual ms)
+  x10 = ~3000 recomposes x 200 Texts. Needs order-of-magnitude call
+  throughput (the pinned campaign), not a fairness fix.
+
 ## Call-throughput round 3 (2026-08-24)
 
 - 956600b5 LANDED: host-served snapshot validity walk (readable/valid
