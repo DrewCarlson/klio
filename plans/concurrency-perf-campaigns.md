@@ -423,10 +423,37 @@ family 9 -> 4:
   SnapshotStateMapTests.concurrentMixingWriteApply_clear (1M puts vs
   its declared 30s: ~170us/put vs 28us needed — CHAMP-put + mutate
   wrapper floor). Both are pure interpreted-throughput ceilings.
-- Queued next: Map _clear re-solo after the splice era, whole-op-serve
-  decision; validatePotentialDeadlock re-solo; compose_window profile;
-  SnapshotThreadLocal.get serve re-eval; window-family corpus
-  timeouts.
+## Round 5: the ceiling quantified (2026-08-24)
+
+- 9fa01f5f LANDED: class-static memo for `<class-companion-or-self>`
+  value reads (the string-keyed companion_singletons probe priced every
+  `Job`-in-value-position context lookup; 700k occurrences in one
+  drainbench). Wall-neutral — another cheap-event elimination.
+- MEASURED-NEGATIVE, recorded: (a) id-keyed dispatch caches — the
+  string-hash cluster is DIFFUSE (~10 distinct maps at 1-2% each:
+  member registry via callMemberInnerStatic, field-ladder probes via
+  getFieldInner/getMemberField, per-map getAdapted instances); ceiling
+  ~10% wall, unreachable to either remaining test. (b) Accessor and
+  init classifiers were dead for lazy image funcs — fixed earlier;
+  eliminating 487k getter frames moved census -16%, wall FLAT. Frame
+  counts are not the wall; the flat floor (libc/memset/exec loop/
+  refcount) is.
+- The allocator memset (5.9% + free-poison) is STRUCTURAL to
+  ReleaseSafe: std.mem.Allocator's generic wrapper `@memset(...,
+  undefined)`s every alloc and free in safe builds regardless of
+  backing allocator. Only ReleaseFast removes it.
+- ReleaseFast DECISIVE A/B: passes NEITHER remaining test
+  (Map _clear 31.1s vs 30 declared; validatePotentialDeadlock still
+  incomplete past 600s). It would buy gate wall (~-15-20%, ≈380s vs
+  the 364 target) and nothing else. Build-policy call stays with the
+  user, now with complete data.
+- validatePotentialDeadlock QUANTIFIED: not a stuck race — the bare
+  drain-vs-worker race is trivially winnable (advance returned in 2ms
+  in isolation). The cost is volume: 10 advances x ~300 virtual frames
+  x (recompose 200 Texts + apply + notifications) ≈ 500-900s
+  interpreted vs the 90s cap — needs ~10x. Map _clear needs ~5.5x.
+  BOTH are compile-tier territory (the pinned transpiler/bytecode
+  campaigns); every surgical lever is landed or measured-insufficient.
 
 ## Call-throughput round 3 (2026-08-24)
 
