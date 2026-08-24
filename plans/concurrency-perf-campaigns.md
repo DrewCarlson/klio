@@ -667,6 +667,28 @@ with(sb){}), receiver_fn_field_direct_invoke (null hit),
 splice_receiver_member_write (member WRITE in spliced body). Then:
 full battery + compose gate + flip.
 
+ROUND 8e (88bf1f7f, flip residue 4 -> 1 family): (a) the tower-region
+pin declines outright (a lexical-owner pin dispatched Holder's member ON
+the StringBuilder subject); (b) a BARE generic receiver-lambda
+invocation inherits the enclosing splice window's head instead of
+clobbering it with null (`scope.apply { result = ... }` kept Scope, so
+the write arbitration knows the subject hides no `result`); (c) the
+own-member GetField READ shortcut is guarded like the write side
+(`spliceSubjectHidesOwnMember` — companion `tag` inside
+`with(Other()) { tag }`); (d) EXT-splice receivers join the runtime
+tower too (EnclosingPush around inline-ext bodies inside an active
+region — `resumeWith` inside a spliced `Continuation.resume` inside a
+spliced atomic `loop {}` dispatches on the continuation), with
+`encl_tower_top` distinguishing tower subjects from pinned ext
+receivers at emission sites; (e) REIFIED-inline candidates are never
+claimed by dispatch-deferring arms (they can only run as splices).
+REMAINING (1 family): nested receiver-lambda windows under RFS keep the
+OUTER window's head in the kept pass (`polymorphic(Any::class) {
+subclass(ints) }` sees SerializersModuleBuilder where
+PolymorphicModuleBuilder is the subject) -> recv_mismatch declines the
+reified subclass splice -> dynamic CMG -> unresolved `T`. Multi-pass
+keep-selection is the mechanism to pin down next.
+
 THE UOE FAMILY ROOT (12 -> 2): `implicitCandidatesAlloc` ranked the
 frame's own receiver ABOVE in-flight chain pushes, so inside
 `List.sorted`'s spliced `toTypedArray().apply { sort() }` the walk's
