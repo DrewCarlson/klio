@@ -647,6 +647,26 @@ alone; the remaining divergences also live outside bare-Path calls
 (operators, comparator paths through non-Path forms, elem typing).
 Continue peeling per-fixture with the default flipped locally.
 
+CORPUS CLEAR (252/252 default-on) via three more roots on top of the
+walk-ordering fix: (1) reverse fn-type refutation in the static shape
+engine — a definitely non-callable argument (String/scalar) never
+satisfies a function-typed param in ANY spelling (`<function>`, `->`,
+FunctionN; the head previously named no class and answered .unknown);
+also the raw KLIO_LAMBDA_REFUTE getenv there is now cached. (2) The
+inline-splice PIN declines when the resolved member has a fn-spelled
+param fed a non-lambda argument (url(urlString) must not pin
+url(block)). (3) `collectReceiverTowerLabeled` ranks the splice-window
+subject BEFORE the lexical owner under RFS (member-extension scope
+tiers index that order: InnerScope's String.towerTag() outranks
+OuterScope's inside with(InnerScope())); mirrored switch
+rfsSpliceFirst in build.zig (import cycle). FLIP RESIDUE (4 shapes,
+full-litmus census under default-on): companion_property_rides_
+implicit_chain (companion read in spliced body -> global), e2e
+inline_member_in_receiver_lambda (member-inline eachInline in
+with(sb){}), receiver_fn_field_direct_invoke (null hit),
+splice_receiver_member_write (member WRITE in spliced body). Then:
+full battery + compose gate + flip.
+
 THE UOE FAMILY ROOT (12 -> 2): `implicitCandidatesAlloc` ranked the
 frame's own receiver ABOVE in-flight chain pushes, so inside
 `List.sorted`'s spliced `toTypedArray().apply { sort() }` the walk's
