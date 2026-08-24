@@ -765,8 +765,13 @@ pub fn invokeMethod(self: *VmIntrinsicHost, receiver: *const Value, name: []cons
 pub fn getProperty(self: *VmIntrinsicHost, receiver: *const Value, name: []const u8, out: Output) Allocator.Error!?RuntimeEvalResult {
     // Route through the field path so custom getters / stored fields /
     // ctor-property params resolve (call_member only dispatches functions).
+    // MEMBER-strict: a native's capability sniff (`entries` to tell a user
+    // Map from an Iterable in `putAll`) must never be answered by an
+    // ENCLOSING receiver's member through the chain fallbacks — with a
+    // spliced `apply` subject on the chain, the destination map's own
+    // `entries` made every Iterable look like a Map.
     var host = vmHost(self, out);
-    const r = try host.getField(self.allocator, receiver, name);
+    const r = try vmhost.host_fields.getMemberField(&host, self.allocator, receiver, name);
     return switch (r) {
         .ok => |v| RuntimeEvalResult{ .ok = v },
         .err => |e| switch (e) {
