@@ -201,10 +201,26 @@ result — and rangebench drops 830 -> 535ms with only one of its three
 loops fused. Parity: 392/393 with compose_foundation solo-verified
 byte-identical (its gate failure is the standing under-load flake).
 
-Remaining on the yardstick: the downTo/step loop is rejected by the
-recognizer (widen it), and the char-range loop still escapes to the
-interpreter per iteration (emit it as a counted loop or include the
-step-progression stdlib leaves in the emitted set).
+Yardstick CLOSED (2026-08-24): all three rangebench loops fuse. The
+downTo/step recognizer had already widened; the char-range loop's
+escape was `c.code` — a dynamic GetField per iteration — now lowered
+as `c - NUL` (Char minus Char is Int in Kotlin, subtrahend code zero),
+a plain BinOp that stays in the region AND kills the runtime
+extension-getter dispatch for every static-Char `.code` read
+interpreter-wide. Char rides the fused replay as genre g=4:
+klio_hot_layout grew char_off/tag_char (ABI 3 -> 4), the prelude
+gained kv_char/kv_set_char, entry reads accept tag_char, the tag
+propagation knows Char-Char -> Int and Char +/- Int -> Char (width
+always 32-bit; the Eq-snap latch fires at the progression's last
+element before any increment could wrap, so int64 replay is exact),
+and the spill re-boxes g==4 as Char. Measured: rangebench native
+777 -> 501ms vs interpreter 5.28s (10.5x), byte parity; corpus 398/1
+where the 1 was the compose_foundation "under-load flake" — ROOT
+FOUND: the interpreter side re-lowers (printing lowering warnings to
+stderr) while the native binary runs its pinned image (no lowering,
+no warning), and the check compared merged channels. The check now
+compares stdout byte-strict and stderr with `warning:` lines removed;
+compose_foundation passes deterministically — 399/0.
 
 ## Next: the speedup campaign (open)
 
