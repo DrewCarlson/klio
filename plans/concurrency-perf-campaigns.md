@@ -647,6 +647,20 @@ alone; the remaining divergences also live outside bare-Path calls
 (operators, comparator paths through non-Path forms, elem typing).
 Continue peeling per-fixture with the default flipped locally.
 
+THE UOE FAMILY ROOT (12 -> 2): `implicitCandidatesAlloc` ranked the
+frame's own receiver ABOVE in-flight chain pushes, so inside
+`List.sorted`'s spliced `toTypedArray().apply { sort() }` the walk's
+innermost candidate was the LIST (the extension's `this`), whose
+MutableList.sort actual mutates an immutable list —
+UnsupportedOperationException. In-flight pushes (the spliced subject)
+are lexically INNER to the frame receiver; they now rank first
+(in_flight = chain len - active_chain_base, the reversal's prefix).
+One fix cleared 10 fixtures. REMAINING 2 (static_operator_resolution
+line-9 inner-vs-outer ranking, fn_param_member_vs_string_extension
+invoke_callable_with_this on String) fail ONLY inside the corpus itest
+process — both pass standalone with the default-on binary — an
+in-process interaction still to isolate.
+
 ## Call-throughput round 3 (2026-08-24)
 
 - 956600b5 LANDED: host-served snapshot validity walk (readable/valid
