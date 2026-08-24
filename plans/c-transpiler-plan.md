@@ -260,6 +260,33 @@ function bodies:
   interpretive leaf-serve stays as the fallback and the non-eligible
   path.
 
+## Speedup campaign round 2 (2026-08-24): scalar function replay LANDED
+
+The design above, built end to end: the emitter classifies pure-scalar
+bodies (fixpoint over call targets), emits `kl_<fid>` C functions over
+(int64, genre) locals with direct kl_-to-kl_ calls (self/mutual
+recursion included), and the native glue's direct-call arm marshals
+scalar args, runs kl_, and re-boxes the result — with the pure-bail
+contract (`return 0` anywhere: non-scalar input, div/overflow guards,
+depth cap 2000, edge-guard fire, unmodeled genre combos) falling back
+to the ordinary path, which re-runs the call exactly because only
+statically pure bodies register. Runtime: NativeLeafFn +
+klio_rt_register_native_leaf (header typedef klio_leaf_fn).
+
+Two equality rules were bought by corpus failures: plain Eq/NotEq
+computes only for same-genre or both-signed-numeric pairs (Kotlin
+promotes 1 == 1L; Bool/Char-vs-numeric bails); Boxed(Not)Eq bails on
+ANY genre mismatch — tag-sensitive across widths AND the framed path
+may adopt an Int literal to Long at parameter bind
+(generic_literal_long_widening), undecidable locally.
+
+Measured (KLIO_JIT=0): fib(30) 2.96s -> 0.48s (6.2x, now beats the
+interpreter 6.6x); branchy 3M-call classifier 4.0 -> 1.9s (3.5x vs
+interpreter); rangebench 501 -> 474ms. Corpus 399/0 byte parity;
+klsem edge micro (wrap, mixed width, div guards + div0 exception via
+bail, bitwise, shift masking, 3000-deep recursion bail, char, bool)
+exact.
+
 ## Next: the speedup campaign (open)
 
 The opaque call-per-op ABI trades the stream's inlined switch dispatch
