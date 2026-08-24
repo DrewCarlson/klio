@@ -667,6 +667,27 @@ with(sb){}), receiver_fn_field_direct_invoke (null hit),
 splice_receiver_member_write (member WRITE in spliced body). Then:
 full battery + compose gate + flip.
 
+ROUND 8f: the LITMUS surface reached ZERO under default-on (nested
+window-head provenance fix: `inlineBodyRecvHead` may use the window's
+subject head only when the WINDOW set it — `splice_recv_from_window` —
+which un-declined the reified `subclass` splice while keeping the
+MeasurePolicy/List hygiene test; plus catch/finally routes now restore
+the frame chain to try-entry length). The FLIP COMMIT (d7912d93) then
+hit the STDLIB SWEEP: 22 failures, one dominant mechanism (values
+becoming `kotlin.Unit`, e.g. ReversedViews subLists), reproducible ONLY
+with the full per-directory RUN SET in one process (compile context
+alone is clean; single-file and single-target runs pass). Seed
+isolated: ConcurrentModificationTest.mutableList — `unresolved global
+removeAt` thrown with NO closure frame above mutableList:154
+(`ArrayDeque(4).apply { addAll(...); action(this) }`), i.e. an
+op-literal body (`{ removeAt(2) }`, a CollectionOperation ctor arg
+consumed DYNAMICALLY) executing through an emission that only makes
+sense spliced. The failing test then pollutes siblings in-process.
+Splicing went back to OPT-IN on top (all fixes kept); next root = why
+a dynamically-consumed receiver-formed literal's body got a
+splice-context emission (multi-pass keep-selection of ctor-arg
+lambdas), then re-flip.
+
 ROUND 8e (88bf1f7f, flip residue 4 -> 1 family): (a) the tower-region
 pin declines outright (a lexical-owner pin dispatched Holder's member ON
 the StringBuilder subject); (b) a BARE generic receiver-lambda
