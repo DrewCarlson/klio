@@ -423,6 +423,16 @@ family 9 -> 4:
   SnapshotStateMapTests.concurrentMixingWriteApply_clear (1M puts vs
   its declared 30s: ~170us/put vs 28us needed — CHAMP-put + mutate
   wrapper floor). Both are pure interpreted-throughput ceilings.
+## Candidate-pool chip (2026-08-24)
+
+- dda02ebc: the implicit-candidate dispatch walk's per-call buffer
+  (alloc + free every dynamic member dispatch) now rides a threadlocal
+  free-list mirroring the args-pool pattern. oneRect 28.5 -> 27.8s
+  (-2.3%) — the diffuse-wall verdict re-confirmed: no single interpreter
+  allocation family moves the gate meaningfully. Full battery green.
+  (Context: oneRect itself had already halved across the session,
+  61 -> 28.5s, from the splice + serve rounds.)
+
 ## Round 5: the ceiling quantified (2026-08-24)
 
 - 9fa01f5f LANDED: class-static memo for `<class-companion-or-self>`
