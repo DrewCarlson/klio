@@ -885,6 +885,32 @@ in-process interaction still to isolate.
 
 ## Running log
 
+- 2026-08-25 SNAPSHOT-MAP LIVELOCK ROOT (07939c91): the Map `_clear`
+  90s-wall + 16.7GB-RSS regression was a RECEIVER-SEATING bug exposed by
+  the member-inline-lambda tier going always-on. `SnapshotStateMap`'s
+  member `withCurrent` forwards its `StateMapStateRecord.() -> R` block
+  into the global `T.withCurrent(block) = block(current(this))`; the
+  call-position splice of the literal bound `current(this)` to the
+  parser's speculative implicit `it` and derived `this` from the
+  ENCLOSING splice subject (`firstStateRecord`). Reads therefore pinned
+  to the first record; correct while it IS the current record (reps
+  0-1), livelocked the moment record reuse split them (rep 2): the CAS
+  compared a stale modification forever, and every retry re-registered
+  the sync-block closure (SharedClosures grows per AstLambda exec) —
+  the RSS explosion. Fix: a receiver-formed literal invoked with
+  declared-value-arity+1 positional args seats arg0 as `this` (declared
+  arity recorded span-keyed at materialization; `String.(Int)` literals
+  keep `it`). Also landed: materialized splice literals lower under the
+  param's declared fn type (receiver-formedness survives forwarding),
+  and break/continue unwind the subject tower to loop-entry depth.
+  Diagnosis traps burned: stale bake caches serve OLD lowering across
+  env changes (A/B needs a fresh data home per config), the first run
+  after an install pays a ~50s bake (never time it), and pack lowering
+  happens in the first-run bake, not `pack build` (traces go there).
+  Verified: cliff micro linear (17.6s N=12 warm), sweep 117/0, litmus
+  48/48, units green, SnapshotStateMapTests 58/59 (the `_clear` budget
+  test now runs 31.8s vs its 30s runTest cap — the standing perf item,
+  no longer a hang).
 - 2026-08-22 PERF BATCH 2: every remaining `[24]ArgShape` scratch shrunk
   to `[6]` (heap fallback covers the rare rest) — oneRect 61 -> 60s,
   contains(1000) 5.0 -> 4.87ms. ReleaseFast A/B DATA POINT (not adopted):
