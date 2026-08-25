@@ -3818,6 +3818,21 @@ fn builtinFieldFast(recv: *const Value, name: []const u8) ?Value {
             defer g.deinit();
             return Value.newInt(@intCast(g.get().u16_len));
         },
+        // Plain container sizes: `backing != null` marks a live VIEW
+        // (`subList`, a map's `values`), whose length the view machinery
+        // computes — only backing-free containers read their own item
+        // list here. `Stack.size` -> `backing.size` otherwise paid the
+        // slow field ladder on every read (678k in one recompose test).
+        .List => |l| if (l.backing == null and std.mem.eql(u8, name, "size")) {
+            const g = l.items.borrow();
+            defer g.deinit();
+            return Value.newInt(@intCast(g.get().items.len));
+        },
+        .Set => |st| if (st.backing == null and std.mem.eql(u8, name, "size")) {
+            const g = st.items.borrow();
+            defer g.deinit();
+            return Value.newInt(@intCast(g.get().items.len));
+        },
         else => {},
     }
     return null;
@@ -8235,6 +8250,36 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
     if (builtinFieldFast(&recv, name)) |bv| {
         try frame.write(gf.dst, bv);
         return .cont;
+    }
+    // A bare class name in value position resolves through the per-class
+    // companion memo, and any NON-class receiver of the sentinel is an
+    // identity read (the host arm returns it unchanged); the site-claim
+    // machinery below never claims these, so without this arm every read
+    // paid the host round-trip (718k sentinel reads in one recompose
+    // test, most of them instance identities).
+    if (std.mem.eql(u8, name, "<class-companion-or-self>")) {
+        if (recv == .Class) {
+            const g = recv.Class.borrow();
+            defer g.deinit();
+            switch (g.get().companion_read_state.load(.acquire)) {
+                1 => {
+                    recv.retain();
+                    try frame.write(gf.dst, recv);
+                    return .cont;
+                },
+                2 => {
+                    const v = g.get().companion_read_value;
+                    v.retain();
+                    try frame.write(gf.dst, v);
+                    return .cont;
+                },
+                else => {},
+            }
+        } else {
+            recv.retain();
+            try frame.write(gf.dst, recv);
+            return .cont;
+        }
     }
     // Keep the executing function's receiver reachable as the
     // enclosing `this` while the field/property is resolved. Inside
