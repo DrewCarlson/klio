@@ -960,6 +960,20 @@ fn visitPayloadRegs(payload: anytype, ctx: anytype, comptime cb: fn (@TypeOf(ctx
                             continue;
                         }
                     }
+                    // `CtxScope`'s context-value run pairs `ctx_args` with
+                    // `n_ctx` (`CtxCall`'s single `args` run already spans
+                    // its context prefix via `n_args`). Without the
+                    // expansion, register analyses missed every context
+                    // value past the run base.
+                    if (comptime std.mem.eql(u8, f.name, "ctx_args")) {
+                        if (comptime @hasField(P, "n_ctx")) {
+                            var k: u32 = 0;
+                            while (k < payload.n_ctx) : (k += 1) {
+                                cb(ctx, Reg.from(@field(payload, f.name).int() + k), false);
+                            }
+                            continue;
+                        }
+                    }
                     cb(ctx, @field(payload, f.name), is_def);
                 } else if (f.type == ?Reg) {
                     if (@field(payload, f.name)) |r| cb(ctx, r, is_def);

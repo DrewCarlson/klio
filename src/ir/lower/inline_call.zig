@@ -2685,6 +2685,13 @@ pub fn tryInlineCallWithTypeArgs(
         b.pending_lambda_arity = -1;
         b.pending_ref_lambda_param_types = null;
         arg_regs[i] = r;
+        // A fn-typed literal that MATERIALIZED because the body forwards
+        // it (not only-calls it) is a dead-construction candidate: when
+        // every forward lands in a nested call-position splice, nothing
+        // ever reads the closure register and `finish` nops the build.
+        if (a.* == .Lambda and p.ty.function != null and !slot_is_default[i]) {
+            b.noteForwardedLambda(r, a.Lambda.span);
+        }
         // A lambda argument is spliced inline (its body is expanded at the
         // call site), so it is never a closure value to box — skip boxing
         // it even if a deeper nested lambda mentions the param name.
