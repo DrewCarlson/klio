@@ -9123,10 +9123,41 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
         !anyCrossOrNoinlineParam(f) and
         !inline_call.argLambdaTargetsLabel(args, nm) and
         !std.mem.eql(u8, runtime.envOnce("KLIO_LLP") orelse "1", "0");
+    // Kotlin inlines EVERY `inline fun`, lambda parameters or not — a
+    // no-lambda member inline (`private inline fun peekOperation() =
+    // opCodes[opCodesSize - 1]`) otherwise dispatches a full frame per
+    // call (311k activations in one vpd window). Splice when the call is
+    // bare inside the OWNER's own hierarchy (the member-splice window
+    // threads `this`/owner scope), positional args fit with a defaulted
+    // tail, and no local binding shadows the name. Top-level no-lambda
+    // inlines already lower flat; receiver-typed ones ride the ext tiers.
+    const plain_inline_nolambda = !inline_takes_fn and !trailing_lambda and
+        f.receiver_type == null and !f.is_suspend and
+        b.resolve(nm) == null and blk: {
+        if (std.mem.eql(u8, runtime.envOnce("KLIO_PIS") orelse "1", "0")) break :blk false;
+        if (!rfs_on) break :blk false;
+        for (f.params) |*p| {
+            if (p.is_vararg) break :blk false;
+        }
+        if (want > f.params.len) break :blk false;
+        var gi: usize = want;
+        while (gi < f.params.len) : (gi += 1) {
+            if (f.params[gi].default == null) break :blk false;
+        }
+        const owner = inline_state.inlineMemberOwner(f) orelse {
+            // Top-level: only when unshadowed, mirroring the lambda tier.
+            break :blk llp_unshadowed;
+        };
+        const enc = b.ownerClass() orelse break :blk false;
+        const enc_host = hostClassOfCompanion(enc) orelse enc;
+        const own_host = hostClassOfCompanion(owner) orelse owner;
+        break :blk b.module.classIsOrExtends(enc_host, own_host);
+    };
     return !recv_mismatch and
         (f.is_suspend or argLambdaHasNonlocalReturn(args) or
             inline_call.argsForwardInlineLambda(b, args) or has_reified or shadowed_by_member or
             companion_super_member or member_body_ext or lambda_literal_plain or
+            plain_inline_nolambda or
             inline_call.argLambdaMaySuspend(b, f, args));
 }
 
