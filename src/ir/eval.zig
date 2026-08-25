@@ -1002,6 +1002,37 @@ pub fn nowMonotonicMs() i64 {
 /// calls than the reference would" (missed skipping, repeated recompose).
 var call_stats_state: u8 = 0;
 var call_stats_mutex: runtime.SpinMutex = .{};
+/// Serve an outer-hop stored-slot field route (tag 3): hop the receiver's
+/// `outer` links, verify the destination's class identity (low 32 bits),
+/// then read the indexed slot with the same name/Null/Delegate guards the
+/// own-slot route applies. The returned value carries a retained ref.
+fn serveOuterSlotRoute(recv: *const Value, name: []const u8, route: u64) ?Value {
+    const hops: u64 = (route >> 2) & 63;
+    const idx: usize = @intCast((route >> 8) & 0xFFFFFF);
+    const want_cls: u32 = @intCast(route >> 32);
+    var cur: Value = recv.*;
+    var h: u64 = 0;
+    while (h < hops) : (h += 1) {
+        if (cur != .Instance) return null;
+        const g = cur.Instance.borrow();
+        const o = g.get().outer;
+        g.deinit();
+        cur = o orelse return null;
+    }
+    if (cur != .Instance) return null;
+    const g = cur.Instance.borrow();
+    defer g.deinit();
+    const b = g.get();
+    if (@as(u32, @truncate(@as(u64, @intCast(b.class.identity())))) != want_cls) return null;
+    if (idx >= b.fields.items.len) return null;
+    const f = &b.fields.items[idx];
+    if (!std.mem.eql(u8, f.name, name)) return null;
+    const v = f.value;
+    if (v == .Null or v == .Delegate) return null;
+    v.retain();
+    return v;
+}
+
 var call_stats: ?std.StringHashMap(u64) = null;
 fn callStatsBump(fqn: []const u8) void {
     if (call_stats_state == 0)
@@ -3671,7 +3702,16 @@ fn leafRunOne(
                     (leafRead(regs, wmask.*, Reg.from(cm.args.int())) orelse return error.LeafAbandon)
                 else
                     null;
-                const mv = primitiveMemberOp(&recv, nm, marg) orelse {
+                const mv = primitiveMemberOp(&recv, nm, marg) orelse blk: {
+                    // `data[idx]` on a container lowers as a `get` member
+                    // call in accessor bodies; serve it exactly as the
+                    // `.Index` arm below does (a bounds miss abandons to
+                    // the framed path, which raises properly).
+                    if (marg) |ia| {
+                        if (std.mem.eql(u8, nm, "get")) {
+                            if (fastIndexGet(&recv, &ia)) |v| break :blk v;
+                        }
+                    }
                     if (trace) std.debug.print("[leaf] {s}: member {s} is not a primitive op\n", .{ func.name, nm });
                     return error.LeafAbandon;
                 };
@@ -3848,7 +3888,7 @@ fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype
         // a getter that is itself a leaf.
         if (host.fieldSiteRoute(recv, fname)) |route| {
             const usable = switch (route.route & 3) {
-                1 => true,
+                1, 3 => true,
                 2 => host.fieldGetterIsLeaf(@enumFromInt(route.route >> 2)),
                 else => false,
             };
@@ -3873,6 +3913,7 @@ fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype
             .err => null,
         };
     }
+    if (route & 3 == 3) return serveOuterSlotRoute(recv, fname, route);
     if (route & 3 != 1) return null;
     const idx: usize = @intCast(route >> 2);
     const g = recv.Instance.borrow();
@@ -8262,6 +8303,14 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                         return .cont;
                     }
                     if (route & 3 == 2) getter_fid = route >> 2;
+                    if (route & 3 == 3) {
+                        if (serveOuterSlotRoute(&recv, name, route)) |v| {
+                            if (pushed_enclosing) popEnclosing();
+                            try frame.write(gf.dst, v);
+                            return .cont;
+                        }
+                        break :fast;
+                    }
                 }
                 if (getter_fid != 0) {
                     const got_g = host.runFieldGetter(allocator, @enumFromInt(getter_fid), recv);
@@ -8312,6 +8361,13 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                             return .cont;
                         },
                         .err => |e| return raiseStep(frame, e),
+                    }
+                }
+                if (r.route & 3 == 3) {
+                    if (serveOuterSlotRoute(&recv, name, r.route)) |v| {
+                        if (pushed_enclosing) popEnclosing();
+                        try frame.write(gf.dst, v);
+                        return .cont;
                     }
                 }
             }

@@ -372,6 +372,14 @@ pub const ProgramImage = struct {
         getter: u32,
         /// Stored-slot index, `NONE` when a getter serves the read.
         stored_idx: u32,
+        /// For an inner-class read answered by an ENCLOSING instance's
+        /// stored slot: how many `outer` links to hop before the slot
+        /// read. Zero = the receiver's own slot/getter.
+        outer_hops: u8 = 0,
+        /// Runtime class identity of the outer instance that owned the
+        /// slot, verified at serve time (different receivers of the same
+        /// inner class can have outers of different classes).
+        outer_cls: u64 = 0,
         pub const NONE: u32 = std.math.maxInt(u32);
     };
 
