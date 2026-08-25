@@ -701,7 +701,15 @@ local inits (`val x = x.rotateLeft(1)` shadowing) — now depth-bounded.
 (3) member_inline_lambda: member-inline callees WITH lambda params
 (`drain { }`/`forEach { }` inside Operations' own methods) splice in
 the owner hierarchy — vpd `<lambda>` count 803k -> 492k (-39% on the
-op loop). REMAINING census giants: the accessor family
+op loop). ROLLED BACK TO OPT-IN (KLIO_MIS=1; 1e7ecf4d): the gate
+caught two regressions — MovableContentTests.movableContent_nested
+MovableContent_tree fails fast with `Vm::get_field currentGroup on
+linkbuffer.SlotTable` (a spliced member-inline body's bare read of a
+SIBLING member bound the wrong `this` in a nested-splice context) and
+Map _clear degraded from 32.8s to the 90s wall cap. The tier needs
+the nested this-binding root fixed before default-on; the -39% op-loop
+win is banked behind the switch. Map _clear meanwhile IMPROVED to
+31.8s with PIS+XIS alone (~3% from the no-lambda tiers). REMAINING census giants: the accessor family
 (OpIterator_operation 649k getter frames, Stack_size 262k,
 MutableList.size 330k gf), executeWithComposeStackTrace 324k (plain
 member fn), and countOneBits INSIDE pack code (the scalar tier
