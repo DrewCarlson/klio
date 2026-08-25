@@ -885,6 +885,19 @@ in-process interaction still to isolate.
 
 ## Running log
 
+- 2026-08-25 CONCRETE PARAM HEADS + WIDTH-MATCHED SCALAR SPLICES: spliced
+  inline parameters with concrete declared types now record their heads
+  in the local-decl channel (previously only type-param-declared ones
+  did), so explicit-receiver derivations work inside spliced bodies —
+  the pack-side `countOneBits` wrapper's inner call now splices (403k
+  ladder dispatches gone from the deadlock census). The new heads
+  activated a dormant hazard: the scalar-extension arm picked the first
+  receiver+arity candidate without checking argument widths, so
+  `Long.mod` inside `Instant.fromEpochMilliseconds` spliced as a
+  narrower overload and truncated milliseconds (two v7-UUID sweep
+  reds). Arguments' derived heads must now equal the declared param
+  heads. The owner-blind member-namesake decline is hierarchy-scoped
+  for scalar heads. Gate re-held 1388/2/0; sweep 117/0; litmus 48/48.
 - 2026-08-25 OUTER-HOP FIELD ROUTES: inner-class reads of an enclosing
   instance's stored field ran the slow field ladder every time
   (`OpIterator.operation` reading `opCodes`: 1.5M ladder runs inside
