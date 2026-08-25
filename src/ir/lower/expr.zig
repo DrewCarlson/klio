@@ -6855,7 +6855,7 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
             inline_call_shape.trailing_lambda_arity != null and
             reifiedNeedsLambdaArity(b, f, inline_call_shape.trailing_lambda_arity.?) and
             !inline_call.reifiedBindableFromArgs(b, f, args, ast_arg_names);
-        if (!reified_underfilled and bareInlineNeedsSplice(b, nm, f, args)) {
+        if (!reified_underfilled and bareInlineNeedsSpliceT(b, nm, f, args, ast_type_args.len != 0)) {
             const expected = b.peekExpected();
             const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
             var selected = if (inline_state.inlineIdByAst(f)) |id|
@@ -8984,6 +8984,10 @@ fn thisScan(e: *const Expr, in_lambda: bool) bool {
 }
 
 fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function, args: []const Expr) bool {
+    return bareInlineNeedsSpliceT(b, nm, f, args, false);
+}
+
+fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Function, args: []const Expr, has_explicit_type_args: bool) bool {
     const has_reified = anyReified(f.type_params);
     const want = args.len;
     const trailing_lambda = lastArgIsLambdaOrAnon(args);
@@ -9136,6 +9140,11 @@ fn bareInlineNeedsSplice(b: *FuncBuilder, nm: []const u8, f: *const ast.Function
         b.resolve(nm) == null and blk: {
         if (std.mem.eql(u8, runtime.envOnce("KLIO_PIS") orelse "1", "0")) break :blk false;
         if (!rfs_on) break :blk false;
+        // An explicit call-site type argument on a NON-reified inline
+        // (`listOf<String>()`) carries element knowledge the receiver
+        // proofs read off the CALL; the splice would replace the call
+        // with its body (`emptyList()`) and drop it. Keep those framed.
+        if (has_explicit_type_args and !anyReified(f.type_params)) break :blk false;
         for (f.params) |*p| {
             if (p.is_vararg) break :blk false;
         }
