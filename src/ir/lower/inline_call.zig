@@ -35,7 +35,16 @@ const lowerBlock = expr_lower.lowerBlock;
 /// type, looked up from a same-named non-extension function). Returns
 /// `null` when the type can't be inferred cheaply — the caller then falls
 /// back to shape-based overload resolution.
+threadlocal var infer_recv_depth: u16 = 0;
+
 pub fn inferReceiverType(b: *const FuncBuilder, this_arg: ?*const Expr) Allocator.Error!?[]const u8 {
+    // A local's recorded initializer can reference the local itself
+    // (`val x = x.rotateLeft(1)` shadowing an outer `x`), and the
+    // init-expr recursion below then never terminates. Bound the depth;
+    // real inference chains are a handful of hops.
+    if (infer_recv_depth >= 16) return null;
+    infer_recv_depth += 1;
+    defer infer_recv_depth -= 1;
     const arg = this_arg orelse return b.thisNarrow() orelse b.recvTy();
     switch (arg.*) {
         // A smart-cast `this` (`when (this) { is List -> this.single() }`)

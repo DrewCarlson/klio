@@ -6240,6 +6240,50 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
+    // An explicit-receiver call to a NO-LAMBDA inline EXTENSION on a
+    // SCALAR receiver (`value.countOneBits()`, `mask.rotateLeft(n)`)
+    // splices exactly as kotlinc inlines it: the ladder otherwise
+    // dispatches a frame per call (193k countOneBits activations in one
+    // vpd window). Scoped to scalar heads with no member namesake
+    // anywhere in the program — a member would outrank the extension.
+    if (!is_infix and callee.* == .Member and !callee.Member.safe and
+        ast_type_args.len == 0 and args.len <= 2 and
+        inline_call.rfsEnabled() and
+        !std.mem.eql(u8, runtime.envOnce("KLIO_XIS") orelse "1", "0") and
+        !lastArgIsLambdaOrAnon(args))
+    scalar_ext: {
+        const mname = callee.Member.name.name;
+        if (b.module.registry.class_member_names.contains(mname)) break :scalar_ext;
+        const receiver = callee.Member.receiver;
+        const cands = inline_state.candidatesForName(mname) orelse break :scalar_ext;
+        const head = (try inline_call.gateReceiverHead(b, receiver)) orelse break :scalar_ext;
+        const h = typeHead(std.mem.trimEnd(u8, head, "?"));
+        const scalar = for ([_][]const u8{
+            "Int",   "Long",  "Short",  "Byte",  "Char", "Boolean",
+            "Float", "Double", "UInt",  "ULong", "UShort", "UByte",
+        }) |sc| {
+            if (std.mem.eql(u8, h, sc)) break true;
+        } else false;
+        if (!scalar) break :scalar_ext;
+        for (cands) |cf| {
+            const rt = cf.receiver_type orelse continue;
+            if (!std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, rt.name.name, "?")), h)) continue;
+            if (cf.params.len != args.len) continue;
+            var has_fn_or_vararg = false;
+            for (cf.params) |*p| {
+                if (p.ty.function != null or p.is_vararg) has_fn_or_vararg = true;
+            }
+            if (has_fn_or_vararg) continue;
+            if (anyReified(cf.type_params)) continue;
+            const expected0 = b.peekExpected();
+            const exp_ptr0: ?*const ast.TypeRef = if (expected0) |*_e| _e else null;
+            if (try inline_call.tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr0)) |r| {
+                return r;
+            }
+            break;
+        }
+    }
+
     // A qualified member-inline call whose lambda (literal or forwarded)
     // carries a labeled return TARGETING AN OPEN INLINE SPLICE must splice:
     // kotlinc inlines these, and the label targets a frameless spliced
