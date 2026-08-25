@@ -718,9 +718,18 @@ openEditor())`); the fatal `currentGroup` GetField lands on the
 SlotTable. Note edit{} is an EXPLICIT-receiver member-inline — the MIS
 tier is bare-only, so the actual MIS-spliced fn is further in
 (executeAndFlushAllPendingOperations' bare member-inline callees under
-linkbuffer's Operations). Next: trace which emission produced the
-fatal read (KLIO_OR_AUDIT on the linkbuffer lowering) rather than
-guessing the arm. Map _clear meanwhile IMPROVED to
+linkbuffer's Operations). Traced further: every currentGroup emission
+is the runtime-walking LoadFromThisOrGlobal; the fatal one executes in
+the forEach-lambda inside `SlotTable.extractNestedStates`'s spliced
+`edit { references.forEach { ... } }` — at runtime the walk's
+candidate list is missing the EDITOR (the with(openEditor()) subject),
+probing the SlotTable and then missing everywhere. The editor's
+absence from the closure's runtime chain under MIS is the mechanism
+still to pin (nested member-splice x with-subject x closure-snapshot).
+DEPRIORITIZED: MIS stays opt-in with its -39% op-loop win banked; the
+accessor family (649k OpIterator_operation frames) and
+executeWithComposeStackTrace are simpler and larger levers for the
+remaining two tests. Map _clear meanwhile IMPROVED to
 31.8s with PIS+XIS alone (~3% from the no-lambda tiers). REMAINING census giants: the accessor family
 (OpIterator_operation 649k getter frames, Stack_size 262k,
 MutableList.size 330k gf), executeWithComposeStackTrace 324k (plain
