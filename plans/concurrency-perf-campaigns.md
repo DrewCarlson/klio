@@ -683,6 +683,31 @@ removeAt` thrown with NO closure frame above mutableList:154
 op-literal body (`{ removeAt(2) }`, a CollectionOperation ctor arg
 consumed DYNAMICALLY) executing through an emission that only makes
 sense spliced. The failing test then pollutes siblings in-process.
+ROUND 9 — FULL INLINE COVERAGE (bd2deccf, fb0453ab, 28891e49,
+5f65e2f3; user goal: "make sure this applies to any relevant inline
+functions"): three new splice tiers, all gate.sh GREEN —
+(1) plain_inline_nolambda: no-lambda inline fns splice at bare call
+sites (member inlines inside the owner hierarchy via the member-splice
+window; top-level when unshadowed) — `peekOperation` (311k frames in
+one vpd window) eliminated; declined when the call carries explicit
+type args on a NON-reified inline (`listOf<String>()`'s type arg IS
+the empty list's element knowledge — the splice would drop it; caught
+by parity empty_container_declared_elem).
+(2) scalar-receiver no-lambda inline EXTENSIONS splice at explicit-
+receiver sites (`value.countOneBits()`, 193k ladder dispatches) —
+scoped to scalar heads with no member namesake; exposed a LOWERING
+stack overflow: inferReceiverType recursed through self-referential
+local inits (`val x = x.rotateLeft(1)` shadowing) — now depth-bounded.
+(3) member_inline_lambda: member-inline callees WITH lambda params
+(`drain { }`/`forEach { }` inside Operations' own methods) splice in
+the owner hierarchy — vpd `<lambda>` count 803k -> 492k (-39% on the
+op loop). REMAINING census giants: the accessor family
+(OpIterator_operation 649k getter frames, Stack_size 262k,
+MutableList.size 330k gf), executeWithComposeStackTrace 324k (plain
+member fn), and countOneBits INSIDE pack code (the scalar tier
+declines because some stub class declares the name as a member —
+class_member_names is owner-blind; refine with the shadow set).
+
 ROUND 8i — THE FLIP LANDED (29e052f5): receiver-formed lambda
 splicing is ON BY DEFAULT with COMPLETE acceptance — stdlib sweep
 117/0, the full litmus battery (parity suites, examples, e2e, ktor,
