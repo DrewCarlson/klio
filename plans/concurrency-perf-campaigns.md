@@ -708,7 +708,19 @@ linkbuffer.SlotTable` (a spliced member-inline body's bare read of a
 SIBLING member bound the wrong `this` in a nested-splice context) and
 Map _clear degraded from 32.8s to the 90s wall cap. The tier needs
 the nested this-binding root fixed before default-on; the -39% op-loop
-win is banked behind the switch. Map _clear meanwhile IMPROVED to
+win is banked behind the switch. FIRST PROBE: window_recv_declares now
+requires window-bound provenance (sweep+corpus green, insufficient for
+Movable — the failing read survives). The failing frame chain:
+`ChangeList.execute` -> `slotTable.edit { executeAndFlushAllPending
+Changes(applier, this, ...) }` (SlotTable.edit = member-inline with a
+RECEIVER-FORMED SlotTableEditor lambda + try/finally + `with(
+openEditor())`); the fatal `currentGroup` GetField lands on the
+SlotTable. Note edit{} is an EXPLICIT-receiver member-inline — the MIS
+tier is bare-only, so the actual MIS-spliced fn is further in
+(executeAndFlushAllPendingOperations' bare member-inline callees under
+linkbuffer's Operations). Next: trace which emission produced the
+fatal read (KLIO_OR_AUDIT on the linkbuffer lowering) rather than
+guessing the arm. Map _clear meanwhile IMPROVED to
 31.8s with PIS+XIS alone (~3% from the no-lambda tiers). REMAINING census giants: the accessor family
 (OpIterator_operation 649k getter frames, Stack_size 262k,
 MutableList.size 330k gf), executeWithComposeStackTrace 324k (plain
