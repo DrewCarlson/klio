@@ -3343,6 +3343,34 @@ pub fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) 
             if (ord) |o| return Value.newInt(o);
         }
     }
+    // Backing-free container `isEmpty`, exactly the host member
+    // intrinsic's answer; a live view (`backing != null`) computes its
+    // length in the view machinery and stays on the framed path. Member
+    // only — `isNotEmpty` is a SHADOWABLE extension, but its `!isEmpty()`
+    // body leaf-serves through this arm anyway.
+    if (arg_in == null) {
+        switch (recv) {
+            .List => |l| if (l.backing == null) {
+                const n = blk: {
+                    const g = l.items.borrow();
+                    defer g.deinit();
+                    break :blk g.get().items.len;
+                };
+                if (std.mem.eql(u8, nm, "isEmpty")) return .{ .Bool = n == 0 };
+                return null;
+            },
+            .Set => |st| if (st.backing == null) {
+                const n = blk: {
+                    const g = st.items.borrow();
+                    defer g.deinit();
+                    break :blk g.get().items.len;
+                };
+                if (std.mem.eql(u8, nm, "isEmpty")) return .{ .Bool = n == 0 };
+                return null;
+            },
+            else => {},
+        }
+    }
     if (recv != .Int and recv != .Long) return null;
     if (arg_in == null) {
         const wide: i64 = switch (recv) {
