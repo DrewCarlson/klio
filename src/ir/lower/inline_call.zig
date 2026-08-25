@@ -993,17 +993,9 @@ pub fn spliceInlineLambdaOn(
         // OUTER callee's mark too and the caller-body `block()` splices
         // with NO receiver — the editor lambda ran on the table. Keep the
         // mark whenever any outer frame's substitution also carries it.
-        if (b.isReceiverLambdaParam(k) and b.isSpliceRlpMark(k)) {
-            var outer_also_binds = false;
-            if (b.inline_lambda_subst.items.len > 1) {
-                for (b.inline_lambda_subst.items[0 .. b.inline_lambda_subst.items.len - 1]) |*fr| {
-                    if (fr.subst.contains(k)) {
-                        outer_also_binds = true;
-                        break;
-                    }
-                }
-            }
-            if (outer_also_binds) continue;
+        if (b.isReceiverLambdaParam(k) and b.isSpliceRlpMark(k) and
+            !b.isSharedRlpMark(k))
+        {
             b.unmarkReceiverLambdaParam(k);
             try suspended_rlp.append(b.allocator, k);
         }
@@ -2765,8 +2757,16 @@ pub fn tryInlineCallWithTypeArgs(
     // the generic marks above.
     var marked_rlp: std.ArrayList([]const u8) = .empty;
     defer marked_rlp.deinit(b.allocator);
+    var shared_rlp_here: std.ArrayList([]const u8) = .empty;
+    defer shared_rlp_here.deinit(b.allocator);
     for (f.params) |*p| {
         const has_recv = if (p.ty.function) |ft| ft.receiver != null else false;
+        if (has_recv and b.isReceiverLambdaParam(p.name.name)) {
+            // Already marked by an ENCLOSING splice: ownership is shared;
+            // the caller-body suspension must keep it.
+            try b.noteSharedRlpMark(p.name.name);
+            try shared_rlp_here.append(b.allocator, p.name.name);
+        }
         if (has_recv and !b.isReceiverLambdaParam(p.name.name)) {
             try b.markReceiverLambdaParam(p.name.name);
             // Record the declared receiver head so a spliced lambda body's
@@ -3127,6 +3127,7 @@ pub fn tryInlineCallWithTypeArgs(
         b.unmarkReceiverLambdaParam(n);
         b.clearSpliceRlpMark(n);
     }
+    for (shared_rlp_here.items) |n| b.clearSharedRlpMark(n);
     // Remove the boxing marks added for this splice so a same-named caller
     // local keeps its own (un)boxed status.
     for (boxed_here.items) |n| b.unmarkBoxed(n);

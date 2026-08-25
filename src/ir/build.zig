@@ -704,6 +704,7 @@ pub const FuncBuilder = struct {
     /// name keeps its own mark, so only these may be suspended while the
     /// caller's lambda body is spliced.
     splice_rlp_marks: StringSet,
+    shared_rlp_marks: StringSet,
     receiver_lambda_recv_heads: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     receiver_lambda_arity: std.StringHashMap(usize),
     context_fn_params: std.StringHashMap(ContextFnShape),
@@ -949,6 +950,7 @@ pub const FuncBuilder = struct {
             .local_fn_overloads = std.StringHashMap(std.ArrayList(LocalFnOverload)).init(allocator),
             .receiver_lambda_params = StringSet.init(allocator),
             .splice_rlp_marks = StringSet.init(allocator),
+            .shared_rlp_marks = StringSet.init(allocator),
             .receiver_lambda_arity = std.StringHashMap(usize).init(allocator),
             .context_fn_params = std.StringHashMap(ContextFnShape).init(allocator),
             .generic_typed_params = StringSet.init(allocator),
@@ -1065,6 +1067,7 @@ pub const FuncBuilder = struct {
         self.nonfn_locals.deinit();
         self.receiver_lambda_params.deinit();
         self.splice_rlp_marks.deinit();
+        self.shared_rlp_marks.deinit();
         self.splice_hidden_bands.deinit(a);
         self.receiver_lambda_recv_heads.deinit(self.allocator);
         self.receiver_lambda_arity.deinit();
@@ -2378,6 +2381,21 @@ pub const FuncBuilder = struct {
     /// Record that the current inline splice owns this receiver-lambda mark.
     pub fn noteSpliceRlpMark(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
         try self.splice_rlp_marks.put(name, {});
+    }
+    /// Record that an inline splice found `name` ALREADY marked by an
+    /// enclosing splice (`kotlin.with`'s own `block` param inside
+    /// `SlotTable.edit`, whose receiver-formed param is also `block`):
+    /// mark ownership is shared, so the caller-body suspension must keep
+    /// it — unmarking would strip the OUTER callee's receiver from the
+    /// caller's bare invocation.
+    pub fn noteSharedRlpMark(self: *FuncBuilder, name: []const u8) Allocator.Error!void {
+        try self.shared_rlp_marks.put(name, {});
+    }
+    pub fn clearSharedRlpMark(self: *FuncBuilder, name: []const u8) void {
+        _ = self.shared_rlp_marks.remove(name);
+    }
+    pub fn isSharedRlpMark(self: *const FuncBuilder, name: []const u8) bool {
+        return self.shared_rlp_marks.contains(name);
     }
     pub fn clearSpliceRlpMark(self: *FuncBuilder, name: []const u8) void {
         _ = self.splice_rlp_marks.remove(name);
