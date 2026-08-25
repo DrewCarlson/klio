@@ -885,6 +885,21 @@ in-process interaction still to isolate.
 
 ## Running log
 
+- 2026-08-25 OUTER-HOP FIELD ROUTES: inner-class reads of an enclosing
+  instance's stored field ran the slow field ladder every time
+  (`OpIterator.operation` reading `opCodes`: 1.5M ladder runs inside
+  validatePotentialDeadlock's window). The outer-chain fallback now
+  propagates a hop-counted slot route onto the inner class's field-read
+  memo (outer runtime-class identity verified at serve); the GetField
+  site fast path, its polymorphic sibling, and the frameless leaf
+  evaluator all serve the new route, and the leaf member arm serves
+  container `get` indexing (accessor bodies lower `data[idx]` as a
+  member call). Inner-accessor microbench 7.26s -> 1.43s; the
+  OpIterator pair left the recompose census top; compose gate re-held
+  1388/2/0-DNC; sweep 117/0, litmus 48/48, units green. Remaining
+  census heads (`MutableList.size`, companion-or-self reads,
+  `executeWithComposeStackTrace`'s frame + virtual execute) are
+  call-throughput-campaign shapes, not memo gaps.
 - 2026-08-25 SNAPSHOT-MAP LIVELOCK ROOT (07939c91): the Map `_clear`
   90s-wall + 16.7GB-RSS regression was a RECEIVER-SEATING bug exposed by
   the member-inline-lambda tier going always-on. `SnapshotStateMap`'s
