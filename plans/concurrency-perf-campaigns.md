@@ -885,6 +885,19 @@ in-process interaction still to isolate.
 
 ## Running log
 
+- 2026-08-25 DEAD FORWARDED-LITERAL ELISION + WALL RECORD 394s: the
+  pinned pass landed same-day — `finish()` nops a materialized
+  forwarded-literal AstLambda when no instruction or terminator reads
+  its register, using the comptime-generated `visitInstRegs` /
+  `visitTerminatorRegs` walkers (which made the "complete operand
+  model" risk vanish; the visitor also gained the missing
+  `CtxScope.ctx_args`+`n_ctx` run expansion — a latent hole under
+  every register analysis including Move fusion). The sync-chain
+  closures (compose -> atomicfu -> kotlin.synchronized) elide in
+  `SnapshotStateMap.put`; deadlock-test throughput rose ~7% by
+  capped-window census; TRUE-WARM WALL 402 -> 394s (halving target
+  364). Map `_clear` flat at ~31.4s — its remaining gap is not the
+  closure churn.
 - 2026-08-25 GETFIELD FAST SERVES + WALL RECORD 402s: builtinFieldFast
   now answers plain-container `.size`, Range `first`/`last`/`step`
   (host-arm-exact, view-backed containers decline), the
