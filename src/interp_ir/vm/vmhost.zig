@@ -391,6 +391,7 @@ pub const VmHost = struct {
     pub const registerClassCaptured = host_classes.registerClassCaptured;
     pub const localClassValue = host_classes.localClassValue;
     pub const lookupGlobal = host_globals.lookupGlobal;
+    pub const composeSnapshotGlobals = host_globals.composeSnapshotGlobals;
     pub const lookupGlobalById = host_globals.lookupGlobalById;
     pub const mainFuncNameMatches = host_globals.mainFuncNameMatches;
     pub const lookupGlobalThrowing = host_globals.lookupGlobalThrowing;

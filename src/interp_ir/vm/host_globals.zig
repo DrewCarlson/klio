@@ -22,6 +22,7 @@ const vmhost = @import("vmhost.zig");
 const host_impl = @import("host_impl.zig");
 const host_instances = @import("host_instances.zig");
 const trace = @import("trace.zig");
+const host_call_member = @import("host_call_member.zig");
 
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -1171,6 +1172,28 @@ pub fn restoreGlobalBinding(self: *VmHost, name: []const u8, prev: ?Value) void 
     } else {
         g.get().removeLocal(name);
     }
+}
+
+/// Threadlocal memo of the two snapshot-core globals the snapshot-fast
+/// `currentSnapshot` serve reads per call: probing the shared globals
+/// cell's reader lock from every worker on every read ping-ponged its
+/// line under the concurrent map test (the serve LOST 30% to the framed
+/// path there while winning 30% single-threaded). Both are top-level
+/// `private val`s — the VALUES never change within a program; the
+/// dispatch-cache generation invalidates across program boundaries.
+const SnapGlobals = struct { gen: u32 = 0, ts: Value = .Null, gs: Value = .Null };
+threadlocal var snap_globals: SnapGlobals = .{};
+
+pub fn composeSnapshotGlobals(self: *VmHost) ?struct { ts: Value, gs: Value } {
+    const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
+    if (snap_globals.gen == gen) {
+        return .{ .ts = snap_globals.ts, .gs = snap_globals.gs };
+    }
+    const ts = lookupGlobal(self, "threadSnapshot") orelse return null;
+    const gs = lookupGlobal(self, "globalSnapshot") orelse return null;
+    if (ts != .Instance or gs != .Instance) return null;
+    snap_globals = .{ .gen = gen, .ts = ts, .gs = gs };
+    return .{ .ts = ts, .gs = gs };
 }
 
 pub fn lookupGlobal(self: *VmHost, name_in: []const u8) ?Value {

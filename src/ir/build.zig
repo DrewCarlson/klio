@@ -455,6 +455,13 @@ pub const FuncBuilder = struct {
     blocks: std.ArrayList(Block) = .empty,
     cur: BlockId,
     next_reg: u32,
+    /// Forwarded inline-lambda literals materialized inside a splice: the
+    /// AstLambda's position and dst, so `finish` can nop the construction
+    /// when NO instruction ever reads the register (every use was consumed
+    /// by nested call-position splices — the compose->atomicfu->
+    /// kotlin.synchronized chain otherwise registers a closure per call
+    /// purely to feed forwards whose terminal only CALLS the block).
+    pending_fwd_lambdas: std.ArrayList(FwdLambda) = .empty,
     /// Scope stack. The bottom frame holds the function's parameter
     /// bindings; lowering pushes a fresh frame per block expression
     /// so val/var declarations are popped correctly.
@@ -984,6 +991,7 @@ pub const FuncBuilder = struct {
             if (b.catches.len != 0) a.free(b.catches);
         }
         self.blocks.deinit(a);
+        self.pending_fwd_lambdas.deinit(a);
         for (self.scopes.items) |*s| s.deinit();
         self.scopes.deinit(a);
         self.lambda_arg_arity.deinit();
@@ -1479,6 +1487,7 @@ pub const FuncBuilder = struct {
             .continue_target = cont_t,
             .break_target = brk_t,
             .finally_base = self.finally_stack.items.len,
+            .encl_tower_base = self.encl_tower_depth,
         });
     }
     pub fn popLoop(self: *FuncBuilder) void {
@@ -3160,12 +3169,67 @@ pub const FuncBuilder = struct {
     /// `Func`, and the builder's `blocks` are cleared so a subsequent
     /// `deinit` does not double-free them. Caller supplies the metadata
     /// that lives outside the per-function blocks.
+    /// Record a just-emitted forwarded-literal AstLambda as a dead-code
+    /// candidate: the inst at the CURRENT block's tail whose dst is `r`.
+    /// A mismatched tail (the literal's lowering emitted something after
+    /// the AstLambda) records nothing — the elimination is best-effort.
+    pub fn noteForwardedLambda(self: *FuncBuilder, r: Reg, sp: span_mod.Span) void {
+        if (self.cur.int() >= self.blocks.items.len) return;
+        const blk = &self.blocks.items[self.cur.int()];
+        if (blk.insts.len == 0) return;
+        const last = &blk.insts[blk.insts.len - 1];
+        if (last.* != .AstLambda or last.AstLambda.dst != r) return;
+        self.pending_fwd_lambdas.append(self.allocator, .{
+            .block = self.cur,
+            .idx = @intCast(blk.insts.len - 1),
+            .reg = r,
+            .span = sp,
+        }) catch {};
+    }
+
+    /// Nop every recorded forwarded-literal AstLambda whose register no
+    /// instruction or terminator reads: all its uses were consumed by
+    /// nested call-position splices, so the construction (a per-call
+    /// closure registration on hot paths) is dead. Runs on the builder's
+    /// blocks right before they are sealed; the reg-operand walk is the
+    /// same comptime-generated visitor the Move-fusion pass trusts.
+    fn elideDeadForwardedLambdas(self: *FuncBuilder) void {
+        if (self.pending_fwd_lambdas.items.len == 0) return;
+        const Scan = struct {
+            reg: Reg,
+            hit: *bool,
+            fn cb(c: @This(), r: ir.Reg, is_def: bool) void {
+                if (!is_def and r == c.reg) c.hit.* = true;
+            }
+        };
+        for (self.pending_fwd_lambdas.items) |cand| {
+            if (cand.block.int() >= self.blocks.items.len) continue;
+            const cblk = &self.blocks.items[cand.block.int()];
+            if (cand.idx >= cblk.insts.len) continue;
+            const inst = &cblk.insts[cand.idx];
+            if (inst.* != .AstLambda or inst.AstLambda.dst != cand.reg) continue;
+            var read = false;
+            outer: for (self.blocks.items, 0..) |*blk, bi| {
+                for (blk.insts, 0..) |*in2, ii| {
+                    if (bi == cand.block.int() and ii == cand.idx) continue;
+                    ir.visitInstRegs(in2, Scan{ .reg = cand.reg, .hit = &read }, Scan.cb);
+                    if (read) break :outer;
+                }
+                ir.visitTerminatorRegs(&blk.terminator, Scan{ .reg = cand.reg, .hit = &read }, Scan.cb);
+                if (read) break :outer;
+            }
+            if (!read) inst.* = .{ .Trace = .{ .span = cand.span } };
+        }
+        self.pending_fwd_lambdas.clearRetainingCapacity();
+    }
+
     pub fn finish(
         self: *FuncBuilder,
         name: []const u8,
         fqn: []const u8,
         return_ty: TypeRef,
     ) Allocator.Error!Func {
+        self.elideDeadForwardedLambdas();
         const n_locals = self.next_reg;
         const blocks = try self.blocks.toOwnedSlice(self.allocator);
         self.fuseSingleUseMoves(blocks);
@@ -3221,9 +3285,22 @@ pub const MutableUndo = struct {
     prev_mutable: bool,
 };
 
+pub const FwdLambda = struct {
+    block: BlockId,
+    idx: u32,
+    reg: Reg,
+    span: span_mod.Span,
+};
+
 pub const LoopFrame = struct {
     label: ?[]const u8,
     continue_target: BlockId,
+    /// The frame's spliced-subject tower depth at loop entry: a
+    /// `break`/`continue` from inside a spliced receiver-lambda region
+    /// jumps past the region's `EnclosingPop`, and without unwinding the
+    /// per-iteration push LEAKS a chain entry per retry (the snapshot
+    /// map's CAS loop grew the chain unboundedly to the RSS cap).
+    encl_tower_base: u32 = 0,
     break_target: BlockId,
     /// Depth of `finally_stack` when the loop was entered. A `break`/
     /// `continue` targeting this loop replays the finallys pushed above

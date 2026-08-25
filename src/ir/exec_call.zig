@@ -127,35 +127,68 @@ const snapshot_fast = @import("snapshot_fast.zig");
 
 /// Host-served static fns (the snapshot validity walk): classify once
 /// per Func, serve without any call machinery on a hit.
-inline fn hostStaticServe(allocator: Allocator, frame: *Frame, call: anytype) Allocator.Error!?Value {
+inline fn hostStaticServe(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H) Allocator.Error!?Value {
     _ = allocator;
     const cf = frame.module.funcById(call.func) orelse return null;
     if (cf.host_route == 0) {
         const route: snapshot_fast.Route = blk: {
-            if (cf.params.len != 3) break :blk .none;
-            break :blk snapshot_fast.classify(cf.fqn, cf.params.len, cf.params[cf.params.len - 1].ty.name);
+            if (cf.params.len != 3 and cf.params.len != 0) break :blk .none;
+            const last_ty: []const u8 = if (cf.params.len == 0) "" else cf.params[cf.params.len - 1].ty.name;
+            break :blk snapshot_fast.classify(cf.fqn, cf.params.len, last_ty);
         };
         @constCast(cf).host_route = @intFromEnum(route);
     }
     if (cf.host_route <= @intFromEnum(snapshot_fast.Route.none)) return null;
-    if (call.n_args != 3 or call.type_args.len != 0 or !argNamesAllNull(call.arg_names)) return null;
-    var args: [3]Value = undefined;
-    for (0..3) |i| args[i] = frame.read(ir.Reg.from(call.args.int() + @as(u32, @intCast(i))));
-    return switch (@as(snapshot_fast.Route, @enumFromInt(cf.host_route))) {
-        .readable => snapshot_fast.serveReadable(args[0..]),
-        .valid => snapshot_fast.serveValid(args[0..]),
-        else => null,
-    };
+    if (call.type_args.len != 0 or !argNamesAllNull(call.arg_names)) return null;
+    switch (@as(snapshot_fast.Route, @enumFromInt(cf.host_route))) {
+        .readable, .valid => {
+            if (call.n_args != 3) return null;
+            var args: [3]Value = undefined;
+            for (0..3) |i| args[i] = frame.read(ir.Reg.from(call.args.int() + @as(u32, @intCast(i))));
+            return switch (@as(snapshot_fast.Route, @enumFromInt(cf.host_route))) {
+                .readable => snapshot_fast.serveReadable(args[0..]),
+                .valid => snapshot_fast.serveValid(args[0..]),
+                else => unreachable,
+            };
+        },
+        .current_snapshot => {
+            if (call.n_args != 0) return null;
+            if (comptime !@hasDecl(H, "composeSnapshotGlobals")) return null;
+            const g = host.composeSnapshotGlobals() orelse return null;
+            return snapshot_fast.serveCurrentSnapshot(&g.ts, &g.gs);
+        },
+        else => return null,
+    }
 }
 
 pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H, allow_flat: bool) Allocator.Error!Step {
     if (cmgTraceWant()) |w| {
         if (frame.module.funcById(call.func)) |cf| if (std.mem.eql(u8, w, cf.name)) {
-            std.debug.print("[call-inst] {s}#{d} n_args={d} n_names={d} exact={}\n", .{ cf.name, call.func.int(), call.n_args, call.arg_names.len, call.exact });
+            std.debug.print("[call-inst] {s}#{d} n_args={d} n_names={d} exact={} caller={s}", .{ cf.name, call.func.int(), call.n_args, call.arg_names.len, call.exact, frame.func.name });
+            const base = call.args.int();
+            var i: usize = 0;
+            while (i < call.n_args and i < 4) : (i += 1) {
+                if (base + i < frame.regs.items.len) {
+                    const v = &frame.regs.items[base + i];
+                    switch (v.*) {
+                        .Int => |x| std.debug.print(" a{d}=i{d}", .{ i, x }),
+                        .Long => |x| std.debug.print(" a{d}=L{d}", .{ i, x }),
+                        .Instance => |inst| {
+                            const g = inst.borrow();
+                            const cg = g.get().class.borrow();
+                            std.debug.print(" a{d}={s}@{x}", .{ i, cg.get().name, inst.identity() });
+                            cg.deinit();
+                            g.deinit();
+                        },
+                        else => std.debug.print(" a{d}={s}", .{ i, @tagName(std.meta.activeTag(v.*)) }),
+                    }
+                }
+            }
+            std.debug.print("\n", .{});
         };
     }
     dispatchBump(.call_static);
-    if (try hostStaticServe(allocator, frame, call)) |served| {
+    if (try hostStaticServe(H, allocator, frame, call, host)) |served| {
         try frame.write(call.dst, served);
         return .cont;
     }
@@ -3321,6 +3354,34 @@ pub fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) 
                 else => null,
             };
             if (ord) |o| return Value.newInt(o);
+        }
+    }
+    // Backing-free container `isEmpty`, exactly the host member
+    // intrinsic's answer; a live view (`backing != null`) computes its
+    // length in the view machinery and stays on the framed path. Member
+    // only — `isNotEmpty` is a SHADOWABLE extension, but its `!isEmpty()`
+    // body leaf-serves through this arm anyway.
+    if (arg_in == null) {
+        switch (recv) {
+            .List => |l| if (l.backing == null) {
+                const n = blk: {
+                    const g = l.items.borrow();
+                    defer g.deinit();
+                    break :blk g.get().items.len;
+                };
+                if (std.mem.eql(u8, nm, "isEmpty")) return .{ .Bool = n == 0 };
+                return null;
+            },
+            .Set => |st| if (st.backing == null) {
+                const n = blk: {
+                    const g = st.items.borrow();
+                    defer g.deinit();
+                    break :blk g.get().items.len;
+                };
+                if (std.mem.eql(u8, nm, "isEmpty")) return .{ .Bool = n == 0 };
+                return null;
+            },
+            else => {},
         }
     }
     if (recv != .Int and recv != .Long) return null;

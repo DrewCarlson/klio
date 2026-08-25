@@ -226,6 +226,8 @@ pub const ScopeClassRef = struct {
 };
 
 /// One IR instruction. Drives the per-frame evaluator switch.
+pub const snapshot_fast = @import("snapshot_fast.zig");
+
 pub const Inst = union(enum) {
     /// Materialise a constant into a register.
     Const: struct { dst: Reg, value: ConstId },
@@ -955,6 +957,20 @@ fn visitPayloadRegs(payload: anytype, ctx: anytype, comptime cb: fn (@TypeOf(ctx
                         if (comptime @hasField(P, "n_args")) {
                             var k: u32 = 0;
                             while (k < payload.n_args) : (k += 1) {
+                                cb(ctx, Reg.from(@field(payload, f.name).int() + k), false);
+                            }
+                            continue;
+                        }
+                    }
+                    // `CtxScope`'s context-value run pairs `ctx_args` with
+                    // `n_ctx` (`CtxCall`'s single `args` run already spans
+                    // its context prefix via `n_args`). Without the
+                    // expansion, register analyses missed every context
+                    // value past the run base.
+                    if (comptime std.mem.eql(u8, f.name, "ctx_args")) {
+                        if (comptime @hasField(P, "n_ctx")) {
+                            var k: u32 = 0;
+                            while (k < payload.n_ctx) : (k += 1) {
                                 cb(ctx, Reg.from(@field(payload, f.name).int() + k), false);
                             }
                             continue;

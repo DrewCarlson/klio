@@ -486,7 +486,17 @@ pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?
     } orelse return null;
     const NONE = root.ProgramImage.FieldReadHit.NONE;
     if (hit.getter != NONE) return .{ .cls = cls, .route = (@as(u64, hit.getter) << 2) | 2 };
-    if (hit.stored_idx != NONE) return .{ .cls = cls, .route = (@as(u64, hit.stored_idx) << 2) | 1 };
+    if (hit.stored_idx != NONE) {
+        // An outer-hop slot read packs [63:32]=outer class identity (low
+        // 32 bits, exact for identity-counter values), [31:8]=slot index,
+        // [7:2]=hop count, tag 3.
+        if (hit.outer_hops != 0) {
+            if (hit.stored_idx > 0xFFFFFF or hit.outer_hops > 63) return null;
+            return .{ .cls = cls, .route = (@as(u64, @truncate(hit.outer_cls)) << 32) |
+                (@as(u64, hit.stored_idx) << 8) | (@as(u64, hit.outer_hops) << 2) | 3 };
+        }
+        return .{ .cls = cls, .route = (@as(u64, hit.stored_idx) << 2) | 1 };
+    }
     return null;
 }
 
@@ -3865,7 +3875,8 @@ fn outerInstanceChain(self: *VmHost, allocator: Allocator, inst: ObjRef(Instance
         defer g.deinit();
         break :blk g.get().outer;
     };
-    while (cur_outer) |o| {
+    var hops: u8 = 1;
+    while (cur_outer) |o| : (hops +|= 1) {
         switch (o) {
             .Instance => |outer_inst| {
                 // Resolve through getFieldInner first so an overriding custom
@@ -3877,12 +3888,71 @@ fn outerInstanceChain(self: *VmHost, allocator: Allocator, inst: ObjRef(Instance
                 // fields still read correctly.
                 const oid = outer_inst.identity();
                 if (try withFieldResolvePair(self, allocator, oid, name, &o, false, false)) |r| {
-                    if (r == .ok and r.ok != .Unit) return r;
+                    if (r == .ok and r.ok != .Unit) {
+                        // The outer read just filled the OUTER class's own
+                        // (class, name) memo; when it answers with a plain
+                        // stored slot, propagate an outer-hop route onto
+                        // the INNER class so the GetField site serves later
+                        // reads without re-walking the chain.
+                        if (hops <= 63) prop: {
+                            const ocls_id: u64 = blk2: {
+                                const g = outer_inst.borrow();
+                                defer g.deinit();
+                                break :blk2 @intCast(g.get().class.identity());
+                            };
+                            const name_p = host_call_member.memberNameIdentity(self, name) orelse break :prop;
+                            const ohit = fieldReadCacheGet(self, ocls_id, name_p) orelse break :prop;
+                            const NONE = root.ProgramImage.FieldReadHit.NONE;
+                            if (ohit.getter != NONE or ohit.stored_idx == NONE) break :prop;
+                            if (ohit.outer_hops != 0 or ohit.stored_idx > 0xFFFFFF) break :prop;
+                            const inner_fqn = blk2: {
+                                const ig = inst.borrow();
+                                defer ig.deinit();
+                                const cg = ig.get().class.borrow();
+                                defer cg.deinit();
+                                break :blk2 cg.get().fqn;
+                            };
+                            fieldReadCachePut(self, inst, inner_fqn, name, .{
+                                .getter = NONE,
+                                .stored_idx = ohit.stored_idx,
+                                .outer_hops = hops,
+                                .outer_cls = ocls_id,
+                            });
+                        }
+                        return r;
+                    }
                 }
                 {
                     const g = outer_inst.borrow();
                     defer g.deinit();
-                    if (g.get().get(name)) |v| return ok(v);
+                    const b = g.get();
+                    for (b.fields.items, 0..) |f, fi| {
+                        if (!std.mem.eql(u8, f.name, name)) continue;
+                        // Memoize the outer-hop slot route on the INNER
+                        // class so the GetField site serves later reads
+                        // without re-walking the chain (the OpIterator
+                        // `operation` accessor read `opCodes` through
+                        // this fallback 1.5M times in one recompose
+                        // test). The outer's runtime class identity is
+                        // verified at serve time.
+                        if (fi <= 0xFFFFFF and hops <= 63) {
+                            const inner_fqn = blk2: {
+                                const ig = inst.borrow();
+                                defer ig.deinit();
+                                const cg = ig.get().class.borrow();
+                                defer cg.deinit();
+                                break :blk2 cg.get().fqn;
+                            };
+                            const ocls: u64 = @intCast(b.class.identity());
+                            fieldReadCachePut(self, inst, inner_fqn, name, .{
+                                .getter = root.ProgramImage.FieldReadHit.NONE,
+                                .stored_idx = @intCast(fi),
+                                .outer_hops = hops,
+                                .outer_cls = ocls,
+                            });
+                        }
+                        return ok(f.value);
+                    }
                 }
                 cur_outer = blk: {
                     const g = outer_inst.borrow();
