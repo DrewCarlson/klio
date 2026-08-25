@@ -3833,6 +3833,30 @@ fn builtinFieldFast(recv: *const Value, name: []const u8) ?Value {
             defer g.deinit();
             return Value.newInt(@intCast(g.get().items.len));
         },
+        // Progression `first`/`last`/`step` property reads on a host range
+        // value, exactly the host field arm's answers (stored bounds even
+        // when empty; `step` in the progression's width). The map CAS
+        // loop's `indices` iteration read these through the slow ladder
+        // 440k times in one run.
+        .Range => |r| {
+            if (std.mem.eql(u8, name, "step")) {
+                return switch (r.kind) {
+                    .Long, .ULong => .{ .Long = r.step },
+                    .Int, .Char, .UInt => Value.newInt(@truncate(r.step)),
+                };
+            }
+            const is_first = std.mem.eql(u8, name, "first");
+            if (is_first or std.mem.eql(u8, name, "last")) {
+                const v: i64 = if (is_first) r.start else r.end;
+                return switch (r.kind) {
+                    .Int => Value.newInt(@truncate(v)),
+                    .Long => .{ .Long = v },
+                    .Char => .{ .Char = @truncate(@as(u64, @bitCast(v))) },
+                    .UInt => .{ .UInt = @truncate(@as(u64, @bitCast(v))) },
+                    .ULong => .{ .ULong = @bitCast(v) },
+                };
+            }
+        },
         else => {},
     }
     return null;
