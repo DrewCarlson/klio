@@ -1652,15 +1652,7 @@ pub const FuncBuilder = struct {
     /// Mirrors `inline_call.rfsEnabled` (imported there would cycle):
     /// the receiver-formed-splice feature switch.
     fn rfsSpliceFirst() bool {
-        const S = struct {
-            var cached: bool = false;
-            var val: bool = false;
-        };
-        if (!S.cached) {
-            S.val = if (std.c.getenv("KLIO_RFS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
-            S.cached = true;
-        }
-        return S.val;
+        return true;
     }
 
     pub fn collectReceiverTowerLabeled(

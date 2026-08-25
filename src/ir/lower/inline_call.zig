@@ -709,11 +709,11 @@ fn scanCatches(catches: []const ast.Catch) bool {
 
 /// Splice an `inline fun` argument lambda where the inlined body
 /// invokes the corresponding lambda parameter.
-/// Receiver-formed lambda SPLICING and its supporting resolution changes
-/// are opt-in (KLIO_RFS=1) until spliced windows carry a runtime receiver
-/// tower; see the round record in plans/concurrency-perf-campaigns.md.
+/// Receiver-formed lambda splicing is unconditional: the runtime subject
+/// tower and its resolution rules are the semantics, not a mode. The
+/// name survives as a seam marker for the (now always-true) call sites.
 pub fn rfsEnabled() bool {
-    return !std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_RFS") orelse "1", "0");
+    return true;
 }
 
 pub fn spliceInlineLambda(
@@ -788,6 +788,9 @@ pub fn spliceInlineLambdaOn(
     try b.pushScope();
     const lambda_own_base = b.scopeDepth() - 1;
     if (receiver) |reg| try b.bind("this", reg);
+    if (inline_state.runtime.envOnce("KLIO_THIS_TRACE") != null) {
+        std.debug.print("[lam-splice-bind] {s} recv={?d} own_base={d} depth={d}\n", .{ lambda_name, if (receiver) |r| r.int() else null, lambda_own_base, b.scopeDepth() });
+    }
     // The splice's parameter bindings inherit the ARGUMENT expressions'
     // static types: `predicate(element)` inside a spliced `all` body binds
     // the caller lambda's `it` to `element`, and the loop variable's derived
@@ -982,7 +985,25 @@ pub fn spliceInlineLambdaOn(
         // parameter (`fun mk(block: C.() -> Unit) = C().apply { block() }`),
         // the mark is the caller's and suspending it drops the receiver from
         // the bare call.
+        //
+        // The splice-mark bit is NAME-keyed with no provenance: when an
+        // OUTER inline frame binds the same name (`kotlin.with`'s own
+        // `block` param spliced inside `SlotTable.edit`, whose
+        // receiver-formed param is ALSO `block`), suspending drops the
+        // OUTER callee's mark too and the caller-body `block()` splices
+        // with NO receiver — the editor lambda ran on the table. Keep the
+        // mark whenever any outer frame's substitution also carries it.
         if (b.isReceiverLambdaParam(k) and b.isSpliceRlpMark(k)) {
+            var outer_also_binds = false;
+            if (b.inline_lambda_subst.items.len > 1) {
+                for (b.inline_lambda_subst.items[0 .. b.inline_lambda_subst.items.len - 1]) |*fr| {
+                    if (fr.subst.contains(k)) {
+                        outer_also_binds = true;
+                        break;
+                    }
+                }
+            }
+            if (outer_also_binds) continue;
             b.unmarkReceiverLambdaParam(k);
             try suspended_rlp.append(b.allocator, k);
         }
@@ -1033,8 +1054,15 @@ pub fn spliceInlineLambdaOn(
         // the CALLEE's own substituted subject: inherit the enclosing
         // splice window's head rather than clobbering it with null
         // (`scope.apply { result = ... }` must keep Scope so the write
-        // arbitration knows the subject hides no `result`).
-        if (recv_head == null and rfsEnabled()) recv_head = b.spliceRecvTy();
+        // arbitration knows the subject hides no `result`). ONLY the
+        // bare form: an EXPLICIT `receiver.block()` (`with`'s body)
+        // binds the receiver expression, which need not relate to the
+        // enclosing head at all — a member-inline splice's owner head
+        // (SlotTable) fed `with(openEditor())`'s editor subject and
+        // every bare editor read pinned to the table.
+        if (recv_head == null and rfsEnabled() and explicit_receiver == null) {
+            recv_head = b.spliceRecvTy();
+        }
     }
     const lam_prev_splice_recv = b.spliceRecvTy();
     const lam_prev_recv_from_window = b.splice_recv_from_window;

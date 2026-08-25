@@ -6256,7 +6256,6 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (!is_infix and callee.* == .Member and !callee.Member.safe and
         ast_type_args.len == 0 and args.len <= 2 and
         inline_call.rfsEnabled() and
-        !std.mem.eql(u8, runtime.envOnce("KLIO_XIS") orelse "1", "0") and
         !lastArgIsLambdaOrAnon(args))
     scalar_ext: {
         const mname = callee.Member.name.name;
@@ -8930,6 +8929,57 @@ fn lastArgIsObjectNotFunction(b: *FuncBuilder, args: []const Expr) bool {
 
 /// Whether any of `f`'s value parameters is a RECEIVER-formed function type
 /// (`block: R.() -> T`).
+/// A body cheap enough to splice into every caller: an expression body
+/// or a short block, containing no try machinery (whose splice drags the
+/// finally/catch lowering into each call site).
+fn smallInlineBody(f: *const ast.Function) bool {
+    const body = &(f.body orelse return false);
+    switch (body.*) {
+        .Expr => |*e| return !exprContainsTry(e),
+        .Block => |*blk| {
+            if (blk.stmts.len > 4) return false;
+            for (blk.stmts) |*st| {
+                const has_try = switch (st.*) {
+                    .Expr => |*e| exprContainsTry(e),
+                    .Assign => |asg| exprContainsTry(&asg.value),
+                    .DestructuringDecl => |d| exprContainsTry(&d.init),
+                    .Decl => |decl| switch (decl) {
+                        .Property => |pr| if (pr.init) |*init| exprContainsTry(init) else false,
+                        else => false,
+                    },
+                };
+                if (has_try) return false;
+            }
+            return true;
+        },
+    }
+}
+
+fn exprContainsTry(e: *const Expr) bool {
+    return switch (e.*) {
+        .Try => true,
+        .Lambda => |l| blk: {
+            for (l.body.stmts) |*st| {
+                if (st.* == .Expr and exprContainsTry(&st.Expr)) break :blk true;
+            }
+            break :blk false;
+        },
+        .Call => |c| blk: {
+            if (exprContainsTry(c.callee)) break :blk true;
+            for (c.args) |*a| {
+                if (exprContainsTry(a)) break :blk true;
+            }
+            break :blk false;
+        },
+        .Member => |m| exprContainsTry(m.receiver),
+        .Binary => |bi| exprContainsTry(bi.lhs) or exprContainsTry(bi.rhs),
+        .Unary => |u| exprContainsTry(u.expr),
+        .If => |iff| exprContainsTry(iff.cond) or exprContainsTry(iff.then_branch) or
+            (if (iff.else_branch) |eb| exprContainsTry(eb) else false),
+        else => false,
+    };
+}
+
 fn anyReceiverFormedFnParam(f: *const ast.Function) bool {
     for (f.params) |*p| {
         if (p.ty.function) |ft| {
@@ -9086,14 +9136,6 @@ fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Functio
     // receiver (`current.modification` read off the list instead of the
     // record) — those keep the dynamic route until the nested receiver
     // rebinding is fixed.
-    // Receiver-formed lambda splicing is OPT-IN (KLIO_RFS=1) until the
-    // splice carries a runtime receiver TOWER: without one, QUALIFIED
-    // member-extension calls, operators, and companion-chain reads inside
-    // the spliced body lose the subject from the runtime dispatch chain
-    // (parity: with_receiver_member_extension_visible_in_lambda,
-    // static_operator_resolution). The bare-call decline scan below is
-    // not enough — the hazard surface is every dispatch that walks
-    // enclosing receivers.
     const rfs_on = inline_call.rfsEnabled();
     const member_body_ext = f.receiver_type != null and
         b.lambda_splice_resolve == null and b.spliceRecvTy() == null and
@@ -9182,7 +9224,15 @@ fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Functio
         b.resolve(nm) == null and
         !anyCrossOrNoinlineParam(f) and
         !inline_call.argLambdaTargetsLabel(args, nm) and
-        std.mem.eql(u8, runtime.envOnce("KLIO_MIS") orelse "0", "1") and blk: {
+        // COST gate, not a semantics gate: a plain member-inline is
+        // semantically identical framed or spliced (reified/non-local
+        // returns have their own mandatory tiers), and splicing a LARGE
+        // body into every hot caller inflates frames past the no-fill
+        // mask — the map path lost a third of its throughput to
+        // per-activation fill/alloc when `edit`'s try machinery spliced
+        // everywhere. Small try-free bodies (`drain`, `forEach`,
+        // `peekOperation`) splice; the rest stay framed.
+        smallInlineBody(f) and blk: {
         const owner = inline_state.inlineMemberOwner(f) orelse break :blk false;
         const enc = b.ownerClass() orelse break :blk false;
         const enc_host = hostClassOfCompanion(enc) orelse enc;
@@ -9207,8 +9257,6 @@ fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Functio
     const plain_inline_nolambda = !inline_takes_fn and !trailing_lambda and
         f.receiver_type == null and !f.is_suspend and
         b.resolve(nm) == null and blk: {
-        if (std.mem.eql(u8, runtime.envOnce("KLIO_PIS") orelse "1", "0")) break :blk false;
-        if (!rfs_on) break :blk false;
         // An explicit call-site type argument on a NON-reified inline
         // (`listOf<String>()`) carries element knowledge the receiver
         // proofs read off the CALL; the splice would replace the call
