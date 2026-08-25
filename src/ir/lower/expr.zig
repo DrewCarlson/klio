@@ -9164,6 +9164,24 @@ fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Functio
     // dynamic path resolves those; the splice must not preempt them.
     const llp_unshadowed = !b.hasOwnMember(nm) and !b.hasEnclosingMember(nm) and
         b.resolve(nm) == null and !b.knowsOuter(nm);
+    // A MEMBER-inline callee taking a lambda (`drain { ... }` inside
+    // Operations' own methods) splices when the call sits in the OWNER's
+    // hierarchy — the member-splice window threads `this` and the owner
+    // scope, exactly as the no-lambda tier relies on. Outside the owner
+    // the dynamic path keeps its member ranking. The shadowing test
+    // differs from the top-level tier: the callee IS an own member.
+    const member_inline_lambda = inline_takes_fn and trailing_lambda and
+        llp_arity_fits and rfs_on and
+        b.resolve(nm) == null and
+        !anyCrossOrNoinlineParam(f) and
+        !inline_call.argLambdaTargetsLabel(args, nm) and
+        !std.mem.eql(u8, runtime.envOnce("KLIO_MIS") orelse "1", "0") and blk: {
+        const owner = inline_state.inlineMemberOwner(f) orelse break :blk false;
+        const enc = b.ownerClass() orelse break :blk false;
+        const enc_host = hostClassOfCompanion(enc) orelse enc;
+        const own_host = hostClassOfCompanion(owner) orelse owner;
+        break :blk b.module.classIsOrExtends(enc_host, own_host);
+    };
     const lambda_literal_plain = inline_takes_fn and trailing_lambda and
         llp_arity_fits and llp_unshadowed and
         inline_state.inlineMemberOwner(f) == null and
@@ -9210,7 +9228,7 @@ fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Functio
         (f.is_suspend or argLambdaHasNonlocalReturn(args) or
             inline_call.argsForwardInlineLambda(b, args) or has_reified or shadowed_by_member or
             companion_super_member or member_body_ext or lambda_literal_plain or
-            plain_inline_nolambda or
+            member_inline_lambda or plain_inline_nolambda or
             inline_call.argLambdaMaySuspend(b, f, args));
 }
 
