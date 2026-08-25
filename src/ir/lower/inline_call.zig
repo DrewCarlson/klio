@@ -742,12 +742,38 @@ pub fn spliceInlineLambdaOn(
     }
     const params = lam.Lambda.params;
     const body = lam.Lambda.body;
-    const receiver = explicit_receiver orelse if (b.isReceiverLambdaParam(lambda_name))
+    // A receiver-formed literal invoked with ONE MORE positional argument
+    // than it declares gets its receiver from that argument (`T.() -> R`
+    // passed through a `(T) -> R` param and invoked `block(current(this))`
+    // — Kotlin's function types interconvert and the receiver rides
+    // positionally). The mark-route fallback (`resolve("this")`) is the
+    // lexically-enclosing subject, which is the WRONG object exactly when
+    // the caller computed a fresh receiver to pass — the snapshot map read
+    // the stale first record forever once record reuse split the two.
+    const lam_receiver_formed = b.isReceiverLambdaParam(lambda_name) or
+        b.lambdaArgRecv(lam.Lambda.span) != null;
+    // The literal's value-parameter count under its DECLARED function type:
+    // a headerless block's speculative implicit `it` is vacuous under a
+    // zero-param `T.()` shape (kotlinc gives such a lambda no `it`), but it
+    // IS the value parameter under `T.(A)` (`{ this.onError(it) }` for
+    // `String.(Int) -> Nothing`). The declared arity is recorded span-keyed
+    // when the literal materializes through a receiver-formed param; without
+    // a record the literal's own header stands.
+    const decl_params: usize = blk: {
+        if (b.lambdaArgArity(lam.Lambda.span)) |n| break :blk @intCast(@max(n, 0));
+        break :blk params.len;
+    };
+    const arg_supplies_recv = explicit_receiver == null and lam_receiver_formed and
+        !(lam.Lambda.implicit_it and b.lambdaArgArity(lam.Lambda.span) == null) and
+        arg_exprs.len == decl_params + 1;
+    const receiver = if (arg_supplies_recv)
+        null
+    else explicit_receiver orelse if (b.isReceiverLambdaParam(lambda_name))
         b.resolve("this")
     else
         null;
     if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
-        if (std.mem.eql(u8, w, lambda_name)) std.debug.print("[splice-lam] {s} owner={s} rlp={} explicit={} recv={} span={}:{}\n", .{ lambda_name, b.ownerClass() orelse "?", b.isReceiverLambdaParam(lambda_name), explicit_receiver != null, receiver != null, lam.Lambda.span.file, lam.Lambda.span.start });
+        if (std.mem.eql(u8, w, lambda_name)) std.debug.print("[splice-lam] {s} owner={s} rlp={} explicit={} recv={} seat={} nargs={d} nparams={d} it={} lar={} span={}:{}\n", .{ lambda_name, b.ownerClass() orelse "?", b.isReceiverLambdaParam(lambda_name), explicit_receiver != null, receiver != null, arg_supplies_recv, arg_exprs.len, params.len, lam.Lambda.implicit_it, b.lambdaArgRecv(lam.Lambda.span) != null, lam.Lambda.span.file, lam.Lambda.span.start });
     }
 
     const arg_regs = try b.allocator.alloc(Reg, arg_exprs.len);
@@ -755,6 +781,17 @@ pub fn spliceInlineLambdaOn(
     for (arg_exprs, 0..) |*a, i| {
         arg_regs[i] = try lowerExpr(b, a);
     }
+    // A RECEIVER-formed literal invoked through a param-form function type
+    // (`T.() -> R` passed where `(T) -> R` is declared — Kotlin's function
+    // types interconvert) supplies its receiver as the FIRST argument:
+    // `block(current(this))` binds `current(this)` as the literal's `this`.
+    // Without the seat the argument fell into `it` and the body's bare
+    // `this` leaked to the enclosing splice's subject — the snapshot map
+    // read the stale first record forever once record reuse split the two.
+    const recv_seat = arg_supplies_recv;
+    const arg_shift: usize = if (recv_seat) 1 else 0;
+    const eff_arg_regs = arg_regs[arg_shift..];
+    const eff_arg_exprs = arg_exprs[arg_shift..];
     // The lambda being spliced was defined in the inline call's caller
     // scope, so its free names must resolve there — not against the
     // inline fn's parameter scope, whose names would shadow a same-named
@@ -787,7 +824,7 @@ pub fn spliceInlineLambdaOn(
     const counted = inline_state.inlineExpandEnter();
     try b.pushScope();
     const lambda_own_base = b.scopeDepth() - 1;
-    if (receiver) |reg| try b.bind("this", reg);
+    if (receiver) |reg| try b.bind("this", reg) else if (recv_seat) try b.bind("this", arg_regs[0]);
     if (inline_state.runtime.envOnce("KLIO_THIS_TRACE") != null) {
         std.debug.print("[lam-splice-bind] {s} recv={?d} own_base={d} depth={d}\n", .{ lambda_name, if (receiver) |r| r.int() else null, lambda_own_base, b.scopeDepth() });
     }
@@ -811,9 +848,9 @@ pub fn spliceInlineLambdaOn(
         shadow_saves.deinit(b.allocator);
     }
     const bind_n: usize = if (params.len == 0)
-        @min(@as(usize, 1), arg_regs.len)
+        @min(@as(usize, 1), eff_arg_regs.len)
     else
-        @min(params.len, arg_regs.len);
+        @min(params.len, eff_arg_regs.len);
     // Every argument's type is read BEFORE any parameter binds. The
     // argument expressions belong to the callee's body scope, and a lambda
     // parameter that shares a name with something that scope declares
@@ -833,11 +870,11 @@ pub fn spliceInlineLambdaOn(
         // `predicate(element)`. Only the second one bound a type, so every
         // member call on `it` inside the user's lambda resolved by name for
         // the indexed half of the family.
-        if (expr_lower.argDeclTypeRefLazy(b, &arg_exprs[ai])) |ty| {
+        if (expr_lower.argDeclTypeRefLazy(b, &eff_arg_exprs[ai])) |ty| {
             slot.* = try ty.clone(b.allocator);
             continue;
         }
-        const ae = &arg_exprs[ai];
+        const ae = &eff_arg_exprs[ai];
         if (ae.* == .Index and ae.Index.args.len == 1) {
             slot.* = try expr_lower.iterableElementTypeRef(b, ae.Index.receiver);
         } else {
@@ -856,7 +893,7 @@ pub fn spliceInlineLambdaOn(
             .ty = if (b.localDeclTypeRef(pname)) |t| try t.clone(b.allocator) else null,
             .init = b.localInitExpr(pname),
         });
-        try b.bind(pname, arg_regs[bi]);
+        try b.bind(pname, eff_arg_regs[bi]);
         b.clearLocalDeclType(pname);
         // The literal's OWN annotation is the parameter's type
         // (`{ index, acc: Number, e -> ... }`): it outranks whatever the
@@ -2558,7 +2595,34 @@ pub fn tryInlineCallWithTypeArgs(
         else
             false;
         const sib_prev = if (sib_push) b.pushExpected(b.sib_expected_ty) else null;
-        // A lambda-literal argument the body only ever CALLS is consumed
+        // A literal lambda that MATERIALIZES (the body forwards the param
+        // as a value rather than only calling it) must lower under the
+        // param's declared FUNCTION TYPE, exactly as `lowerArgRun` would
+        // have: the expected type is where `lowerLambda` reads the
+        // receiver head. Without it a `StateMapStateRecord.() -> R`
+        // literal lowers as a PLAIN block — `lambda_has_receiver` false,
+        // `this` captured from the enclosing splice's subject binding —
+        // and every later invocation runs the body against the stale
+        // creation-time subject instead of the supplied receiver (the
+        // snapshot map's CAS loop livelocked on exactly that once record
+        // reuse split the two).
+        const lam_ty_push = (a.* == .Lambda or a.* == .AnonFun) and p.ty.function != null;
+        const lam_ty_prev = if (lam_ty_push) b.pushExpected(p.ty) else null;
+        // Span-keyed receiver record for the literal: a later CALL-POSITION
+        // splice of this same literal (the body forwards the param into
+        // another inline whose body invokes it — `withCurrent(block)` into
+        // `block(current(this))`) must know the literal is receiver-formed
+        // so the supplied argument seats as `this`, not as `it`.
+        if (lam_ty_push and a.* == .Lambda) {
+            if (p.ty.function.?.receiver) |*rty| {
+                const lowered_recv = try expr_lower.loweredOwnedLocalTypeRef(b, rty);
+                try b.recordLambdaArgRecvOwned(a.Lambda.span, lowered_recv);
+                b.recordLambdaArgArity(a.Lambda.span, @intCast(p.ty.function.?.params.len));
+            }
+        }
+        if (lam_ty_push and inline_state.runtime.envOnce("KLIO_ARG_SKIP_TRACE") != null) {
+            std.debug.print("[arg-mat] fn={s} param={s} recv_ty={s}\n", .{ fname, p.name.name, if (p.ty.function.?.receiver) |r| r.name.name else "-" });
+        }
         // by the splice's call-position expansion; materializing it here
         // builds a dead closure (plus captures) per call. Skip the value
         // entirely — the substitution map serves the call positions, and
@@ -2584,6 +2648,7 @@ pub fn tryInlineCallWithTypeArgs(
             if (inline_state.runtime.envOnce("KLIO_ARG_SKIP_TRACE") != null) {
                 std.debug.print("[arg-skip] fn={s} param={s}\n", .{ fname, p.name.name });
             }
+            if (lam_ty_push) b.restoreExpected(lam_ty_prev);
             if (sib_push) b.restoreExpected(sib_prev);
             b.pending_lambda_arity = -1;
             b.pending_ref_lambda_param_types = null;
@@ -2615,6 +2680,7 @@ pub fn tryInlineCallWithTypeArgs(
             }
             break :blk rr;
         };
+        if (lam_ty_push) b.restoreExpected(lam_ty_prev);
         if (sib_push) b.restoreExpected(sib_prev);
         b.pending_lambda_arity = -1;
         b.pending_ref_lambda_param_types = null;

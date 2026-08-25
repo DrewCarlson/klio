@@ -740,6 +740,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (b.loopFor(lbl)) |frame| {
                 const target = frame.break_target;
                 try replayFinallysForJump(b, frame.finally_base);
+                try emitTowerPopsForJump(b, frame.encl_tower_base);
                 b.terminate(.{ .Goto = target });
                 const dead = try b.allocBlock();
                 b.switchTo(dead);
@@ -753,6 +754,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (b.loopFor(lbl)) |frame| {
                 const target = frame.continue_target;
                 try replayFinallysForJump(b, frame.finally_base);
+                try emitTowerPopsForJump(b, frame.encl_tower_base);
                 b.terminate(.{ .Goto = target });
                 const dead = try b.allocBlock();
                 b.switchTo(dead);
@@ -14093,6 +14095,17 @@ fn spliceSubjectHidesOwnMember(b: *FuncBuilder, name: []const u8) bool {
         }
     }
     return true;
+}
+
+/// Unwind the spliced-subject tower down to `base` before a jump that
+/// leaves the regions (`break`/`continue` past a spliced `sync {}`):
+/// every skipped region's `EnclosingPop` is emitted here, or the CAS
+/// retry loop leaks one chain entry per iteration.
+fn emitTowerPopsForJump(b: *FuncBuilder, base: u32) Allocator.Error!void {
+    var d = b.encl_tower_depth;
+    while (d > base) : (d -= 1) {
+        try b.push(.{ .EnclosingPop = .{} });
+    }
 }
 
 fn inReceiverContext(b: *const FuncBuilder) bool {

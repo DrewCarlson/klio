@@ -1479,6 +1479,7 @@ pub const FuncBuilder = struct {
             .continue_target = cont_t,
             .break_target = brk_t,
             .finally_base = self.finally_stack.items.len,
+            .encl_tower_base = self.encl_tower_depth,
         });
     }
     pub fn popLoop(self: *FuncBuilder) void {
@@ -3224,6 +3225,12 @@ pub const MutableUndo = struct {
 pub const LoopFrame = struct {
     label: ?[]const u8,
     continue_target: BlockId,
+    /// The frame's spliced-subject tower depth at loop entry: a
+    /// `break`/`continue` from inside a spliced receiver-lambda region
+    /// jumps past the region's `EnclosingPop`, and without unwinding the
+    /// per-iteration push LEAKS a chain entry per retry (the snapshot
+    /// map's CAS loop grew the chain unboundedly to the RSS cap).
+    encl_tower_base: u32 = 0,
     break_target: BlockId,
     /// Depth of `finally_stack` when the loop was entered. A `break`/
     /// `continue` targeting this loop replays the finallys pushed above

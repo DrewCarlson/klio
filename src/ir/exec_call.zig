@@ -151,7 +151,27 @@ inline fn hostStaticServe(allocator: Allocator, frame: *Frame, call: anytype) Al
 pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H, allow_flat: bool) Allocator.Error!Step {
     if (cmgTraceWant()) |w| {
         if (frame.module.funcById(call.func)) |cf| if (std.mem.eql(u8, w, cf.name)) {
-            std.debug.print("[call-inst] {s}#{d} n_args={d} n_names={d} exact={}\n", .{ cf.name, call.func.int(), call.n_args, call.arg_names.len, call.exact });
+            std.debug.print("[call-inst] {s}#{d} n_args={d} n_names={d} exact={} caller={s}", .{ cf.name, call.func.int(), call.n_args, call.arg_names.len, call.exact, frame.func.name });
+            const base = call.args.int();
+            var i: usize = 0;
+            while (i < call.n_args and i < 4) : (i += 1) {
+                if (base + i < frame.regs.items.len) {
+                    const v = &frame.regs.items[base + i];
+                    switch (v.*) {
+                        .Int => |x| std.debug.print(" a{d}=i{d}", .{ i, x }),
+                        .Long => |x| std.debug.print(" a{d}=L{d}", .{ i, x }),
+                        .Instance => |inst| {
+                            const g = inst.borrow();
+                            const cg = g.get().class.borrow();
+                            std.debug.print(" a{d}={s}@{x}", .{ i, cg.get().name, inst.identity() });
+                            cg.deinit();
+                            g.deinit();
+                        },
+                        else => std.debug.print(" a{d}={s}", .{ i, @tagName(std.meta.activeTag(v.*)) }),
+                    }
+                }
+            }
+            std.debug.print("\n", .{});
         };
     }
     dispatchBump(.call_static);

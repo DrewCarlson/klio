@@ -746,6 +746,21 @@ inline fn gcPushFrame(f: *Frame) void {
     // capture, not only GC marking); only the GC root registration is gated on
     // the collector being active.
     if (runtime.gc.gc_enabled) gcInstallFrameRoot();
+    if (cmgTraceWant()) |w| {
+        if (std.mem.eql(u8, w, f.func.name)) {
+            std.debug.print("[frame-push] {s}#{d}", .{ f.func.name, f.func.id.int() });
+            for (f.params.items, 0..) |*v, i| {
+                if (i >= 4) break;
+                switch (v.*) {
+                    .Int => |x| std.debug.print(" p{d}=i{d}", .{ i, x }),
+                    .Long => |x| std.debug.print(" p{d}=L{d}", .{ i, x }),
+                    .Instance => |inst| std.debug.print(" p{d}=@{x}", .{ i, inst.identity() }),
+                    else => std.debug.print(" p{d}={s}", .{ i, @tagName(std.meta.activeTag(v.*)) }),
+                }
+            }
+            std.debug.print("\n", .{});
+        }
+    }
     f.gc_link = evtls.frame_chain;
     evtls.frame_chain = f;
 }
