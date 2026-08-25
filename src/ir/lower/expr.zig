@@ -9175,7 +9175,7 @@ fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Functio
         b.resolve(nm) == null and
         !anyCrossOrNoinlineParam(f) and
         !inline_call.argLambdaTargetsLabel(args, nm) and
-        !std.mem.eql(u8, runtime.envOnce("KLIO_MIS") orelse "1", "0") and blk: {
+        std.mem.eql(u8, runtime.envOnce("KLIO_MIS") orelse "0", "1") and blk: {
         const owner = inline_state.inlineMemberOwner(f) orelse break :blk false;
         const enc = b.ownerClass() orelse break :blk false;
         const enc_host = hostClassOfCompanion(enc) orelse enc;
