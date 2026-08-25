@@ -2723,7 +2723,25 @@ pub fn tryInlineCallWithTypeArgs(
                     }
                     break :blk_tp false;
                 };
-            if (!tp_declared) break :tp_arg;
+            if (!tp_declared) {
+                // A CONCRETE declared head (`value: Int`) is the
+                // parameter's static type inside the spliced body just
+                // as it is in the framed activation. Recording it lets
+                // the explicit-receiver derivations (the scalar
+                // extension splice's receiver head, member proofs) see
+                // through the binding — the SlotTable `countOneBits`
+                // wrapper's inner `value.countOneBits()` otherwise
+                // stayed framed pack-wide for want of a head. Same
+                // shadow-save discipline as the tp arm.
+                if (dh.len == 0) break :tp_arg;
+                try param_ty_saves.append(b.allocator, .{
+                    .name = p.name.name,
+                    .ty = if (b.localDeclTypeRef(p.name.name)) |t| try t.clone(b.allocator) else null,
+                });
+                b.clearLocalDeclType(p.name.name);
+                try b.setLocalDeclTypeOwned(p.name.name, try expr_lower.loweredOwnedLocalTypeRef(b, &p.ty));
+                break :tp_arg;
+            }
             var derived_owned: ?ir.TypeRef = null;
             defer if (derived_owned) |*t| t.deinit(b.allocator);
             const derived: ?ir.TypeRef = expr_lower.argDeclTypeRefLazy(b, a) orelse dblk: {

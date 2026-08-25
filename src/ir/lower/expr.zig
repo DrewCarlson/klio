@@ -6261,11 +6261,32 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         !lastArgIsLambdaOrAnon(args))
     scalar_ext: {
         const mname = callee.Member.name.name;
-        if (b.module.registry.class_member_names.contains(mname)) break :scalar_ext;
         const receiver = callee.Member.receiver;
-        const cands = inline_state.candidatesForName(mname) orelse break :scalar_ext;
-        const head = (try inline_call.gateReceiverHead(b, receiver)) orelse break :scalar_ext;
+        const sxt = if (runtime.envOnce("KLIO_SEXT_TRACE")) |w| std.mem.eql(u8, w, mname) else false;
+        const cands = inline_state.candidatesForName(mname) orelse {
+            if (sxt) std.debug.print("[sext] {s}: no candidates\n", .{mname});
+            break :scalar_ext;
+        };
+        const head = (try inline_call.gateReceiverHead(b, receiver)) orelse {
+            if (sxt) std.debug.print("[sext] {s}: no receiver head (in {s})\n", .{ mname, build.currentRealFn() orelse "-" });
+            break :scalar_ext;
+        };
         const h = typeHead(std.mem.trimEnd(u8, head, "?"));
+        if (sxt) std.debug.print("[sext] {s}: head={s} in {s}\n", .{ mname, h, build.currentRealFn() orelse "-" });
+        // Member-namesake decline, hierarchy-scoped: the global
+        // `class_member_names` set is owner-blind — ANY class declaring a
+        // member of this name suppressed the splice program-wide (a pack
+        // class's `countOneBits` member kept every scalar call framed).
+        // On a scalar head only the scalar's own hierarchy can outrank
+        // the extension; when its shadow set is complete, decide by it.
+        if (b.module.registry.class_member_names.contains(mname)) {
+            const shadowed = blk: {
+                const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk true;
+                if (!hs.complete) break :blk true;
+                break :blk hs.names.contains(mname);
+            };
+            if (shadowed) break :scalar_ext;
+        }
         const scalar = for ([_][]const u8{
             "Int",   "Long",  "Short",  "Byte",  "Char", "Boolean",
             "Float", "Double", "UInt",  "ULong", "UShort", "UByte",
@@ -6283,6 +6304,32 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
             if (has_fn_or_vararg) continue;
             if (anyReified(cf.type_params)) continue;
+            // Scalar overload sets differ ONLY by parameter width
+            // (`Long.mod(Int)` vs `Long.mod(Long)`), and picking the
+            // first arity match computed `Instant.fromEpochMilliseconds`'
+            // millisecond remainder with the wrong overload. Every
+            // argument's derived head must equal the declared param head;
+            // an underivable argument declines the splice (the framed
+            // path resolves it).
+            var args_match = true;
+            for (cf.params, 0..) |*p, pi| {
+                const want = typeHead(std.mem.trimEnd(u8, p.ty.name.name, "?"));
+                var got_owned: ?ir.TypeRef = null;
+                defer if (got_owned) |*t| t.deinit(b.allocator);
+                const got: ?ir.TypeRef = argDeclTypeRefLazy(b, &args[pi]) orelse gblk: {
+                    got_owned = try staticExprTypeRef(b, &args[pi]);
+                    break :gblk got_owned;
+                };
+                const gv = got orelse {
+                    args_match = false;
+                    break;
+                };
+                if (!std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, gv.name, "?")), want)) {
+                    args_match = false;
+                    break;
+                }
+            }
+            if (!args_match) continue;
             const expected0 = b.peekExpected();
             const exp_ptr0: ?*const ast.TypeRef = if (expected0) |*_e| _e else null;
             if (try inline_call.tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr0)) |r| {
