@@ -683,6 +683,27 @@ removeAt` thrown with NO closure frame above mutableList:154
 op-literal body (`{ removeAt(2) }`, a CollectionOperation ctor arg
 consumed DYNAMICALLY) executing through an emission that only makes
 sense spliced. The failing test then pollutes siblings in-process.
+ROUND 10 — FLAG RETIREMENT + THE MARK-PROVENANCE ROOT (fa1dc55c,
+a4272233; user directive: no feature flags for landed behavior):
+KLIO_RFS (+ its build.zig mirror), KLIO_PIS, KLIO_XIS are GONE — the
+receiver-formed splice family and both no-lambda inline tiers are
+unconditional. The Movable regression root LANDED: nested splices
+sharing a param NAME (`kotlin.with`'s own `block` inside
+`SlotTable.edit`, whose receiver-formed param is also `block`) had
+name-keyed mark suspension strip the OUTER callee's receiver-lambda
+mark — the caller's `block()` then spliced with NO receiver and the
+editor lambda ran on the table. Marks now carry SHARED provenance
+(noteSharedRlpMark at the already-marked skip; suspension keeps shared
+keys). A 12-line repro (scratchpad/edm4.kt) pins it. member_inline_
+lambda additionally got a COST gate (smallInlineBody: expr-body or
+<=4 stmts, no try) — splicing large bodies into hot callers inflates
+frames past the no-fill mask (the map test lost a third of its
+throughput to per-activation fill/alloc, compounding under CAS
+contention to the 90s cap). KLIO_MIS remains the LAST flag: with the
+provenance fix Movable passes under it, but the map path still
+degrades under contention even cost-gated (~-13% per-op) — root that,
+then delete the flag.
+
 ROUND 9 — FULL INLINE COVERAGE (bd2deccf, fb0453ab, 28891e49,
 5f65e2f3; user goal: "make sure this applies to any relevant inline
 functions"): three new splice tiers, all gate.sh GREEN —
