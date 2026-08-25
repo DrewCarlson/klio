@@ -2405,7 +2405,14 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // member read wins here — a bare `parameters` inside
             // `URLBuilder(...).apply { … }` is the builder's property, never
             // the top-level `parameters(builder)` function value.
-            const window_recv_declares = b.lambda_splice_resolve != null and blk: {
+            const window_recv_declares = b.lambda_splice_resolve != null and
+                // The head must describe the value actually BOUND as
+                // `this` (the window's own subject). A member-inline
+                // splice binds its OWNER while a nested plain-lambda
+                // window carries the lambda's context head — pinning a
+                // GetField on that mismatch read `currentGroup` off the
+                // SlotTable instead of the writer.
+                b.splice_recv_from_window and blk: {
                 const rh = b.spliceRecvTy() orelse break :blk false;
                 const h = typeHead(std.mem.trimEnd(u8, rh, "?"));
                 const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk false;
