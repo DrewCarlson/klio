@@ -885,6 +885,26 @@ in-process interaction still to isolate.
 
 ## Running log
 
+- 2026-08-25 GETFIELD FAST SERVES + WALL RECORD 402s: builtinFieldFast
+  now answers plain-container `.size`, Range `first`/`last`/`step`
+  (host-arm-exact, view-backed containers decline), the
+  companion-or-self sentinel serves in the exec arm (memo for Class
+  receivers, identity otherwise), and the leaf member arm serves
+  backing-free `isEmpty` (member only). Census heads eliminated:
+  `MutableList.size` 678k, `Stack_size` 538k, sentinel 718k, range
+  bounds 440k. True-warm compose-gate wall 402s (record, was 406).
+  Measured-negative: host-binding `SnapshotThreadLocal.get/set` via
+  member-form bindings made the map test 40% SLOWER (dynamic member
+  dispatch to a native form takes the slow tail per call) — reverted.
+  PINNED NEXT LEVER for Map `_clear` (31.5s vs 30) and the recompose
+  lambda head: lazy materialization of forwarded inline-lambda
+  literals. The compose->atomicfu->kotlin.synchronized chain
+  materializes and registers a closure per call purely to feed forwards
+  whose terminal only CALLS the block; a lazy bind (emit the AstLambda
+  only on a value-position resolve; call positions ride the existing
+  lambda_map chase) removes the per-op allocation. A fiat skip is
+  UNSOUND (50/59 map tests red) — the lazy form is required because it
+  alone proves the value is never needed.
 - 2026-08-25 CONCRETE PARAM HEADS + WIDTH-MATCHED SCALAR SPLICES: spliced
   inline parameters with concrete declared types now record their heads
   in the local-decl channel (previously only type-param-declared ones
