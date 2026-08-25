@@ -904,7 +904,16 @@ in-process interaction still to isolate.
   only on a value-position resolve; call positions ride the existing
   lambda_map chase) removes the per-op allocation. A fiat skip is
   UNSOUND (50/59 map tests red) — the lazy form is required because it
-  alone proves the value is never needed.
+  alone proves the value is never needed. Implementation shape settled:
+  emit the materialization as today, then a post-splice dead-reg pass
+  nops the AstLambda when NO instruction reads its dst register. The
+  pass needs a COMPLETE per-variant register-operand model of Inst
+  (call arg runs are base+count ranges, so byte-scanning is unsound;
+  any unmodeled variant must conservatively count as a read, which
+  neuters the pass unless the model covers essentially every variant).
+  A fresh-session task: write `instReadsReg(inst, r) bool` beside the
+  Inst union with a unit test that constructs one of EVERY variant, so
+  a new variant fails the test until modeled.
 - 2026-08-25 CONCRETE PARAM HEADS + WIDTH-MATCHED SCALAR SPLICES: spliced
   inline parameters with concrete declared types now record their heads
   in the local-decl channel (previously only type-param-declared ones
