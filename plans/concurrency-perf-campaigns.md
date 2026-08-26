@@ -885,6 +885,37 @@ in-process interaction still to isolate.
 
 ## Running log
 
+- 2026-08-26 MAP-BUILDER CHAMP SERVE + SLAB SPARE AGING: the vendored
+  `PersistentHashMapBuilder.put`/`build` are host-served
+  (persistent_map_mut.zig — the exact TrieNode `mutablePut` over the
+  interpreted objects: ownership-gated in-place mutation vs fresh node
+  minting from a captured class/field template, `makeNode` chains,
+  collision nodes; keys restricted to scalars/strings whose
+  hashCode+equals the host owns via the NEW shared
+  `Value.kotlinScalarHash` — Float/Double bail on `equals`-NaN
+  divergence; every bail provably precedes the first mutation). All
+  five list-serve intercept points mirrored (ladder head + two
+  flat-preparer declines + virtual-slot + funcid replay). The scalar
+  hash moved from stdlib collections into `Value.kotlinScalarHash` so
+  served and interpreted bucket placement can never diverge. TRAP
+  burned: i32 bitmap math (`mask - 1` at bit 31) PANICS in safe builds
+  — all CHAMP mask arithmetic must run in u32 (the first class run
+  crash). Slab allocator: fully-free slabs now park UNBOUNDED on the
+  per-class spare stack (a GC sweep frees whole bursts; any free-time
+  cap made the next burst remap+rethread) and the reclaim pass ages
+  them out after RECLAIM_IDLE_PASSES instead of dropping all spares
+  each cycle; measured NEUTRAL on the map test (its newSlab 2.3% is
+  raw heap growth, not churn) but principled + unit-tested. MEASURED:
+  solo wall-to-fail 38.8 -> 31.9s; size-setter frames gone (400k);
+  map class 58/59; compose gate 1388/2/0 held; sweep/litmus/units +
+  gate.sh GREEN. GROUND TRUTH (timed replica, warm): ~8s per rep ->
+  full 10-rep workload ~82s vs the 30s budget — the test needs ~2.7x
+  more end-to-end. Remaining per-insert census: <lambda> 5.7 (fqn is
+  literally "<lambda>" — needs an id-keyed census discriminator),
+  map.readable getter 2.1, Snapshot.current getter 1.2, readable
+  wrapper residue 1.1, builder ctor 1.0, attemptUpdate 1.0. NEXT:
+  getter-route serves for Snapshot.current + SnapshotState*.readable,
+  builder() host mint, lambda census decomposition.
 - 2026-08-26 SNAPSHOT-READ WRAPPER SERVES: THROUGHPUT 2x + THE
   WALL-TO-FAIL DECOY: the KLIO_PROF+KLIO_PROF_CALLERS/KLIO_CALL_STATS
   round on the contended map test found the per-insert cost was the

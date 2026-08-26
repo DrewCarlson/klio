@@ -24,6 +24,7 @@ const trace = @import("trace.zig");
 const persistent_map_eq = @import("persistent_map_eq.zig");
 const persistent_list_eq = @import("persistent_list_eq.zig");
 const persistent_list_mut = @import("persistent_list_mut.zig");
+const persistent_map_mut = @import("persistent_map_mut.zig");
 const overload_match = @import("overload_match.zig");
 const host_call_func = @import("host_call_func.zig");
 const host_call_value = @import("host_call_value.zig");
@@ -3850,6 +3851,14 @@ pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *con
     {
         return null;
     }
+    // Map-builder put/build are host-served (persistent_map_mut.zig).
+    if (((args.len == 2 and std.mem.eql(u8, name, "put")) or
+        (args.len == 0 and std.mem.eql(u8, name, "build"))) and
+        receiver.* == .Instance and
+        persistent_map_mut.isBuilderClass(receiver.Instance))
+    {
+        return null;
+    }
     // `closure.invoke(args…)`: the ladder lands at `callValueRec(receiver,
     // args)` with no closure-specific step before it, so the plain closure
     // invocation flattens identically.
@@ -4075,6 +4084,15 @@ pub fn prepareVirtualFlatCall(
             if (args.len == 1 and std.mem.eql(u8, vn, "addAll")) return null;
         }
     }
+    // Map-builder put/build are host-served (persistent_map_mut.zig).
+    if ((args.len == 0 or args.len == 2) and receiver.* == .Instance and
+        persistent_map_mut.isBuilderClass(receiver.Instance))
+    {
+        if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vn| {
+            if (args.len == 2 and std.mem.eql(u8, vn, "put")) return null;
+            if (args.len == 0 and std.mem.eql(u8, vn, "build")) return null;
+        }
+    }
     if (receiver.* != .Instance) {
         if (vtrace) {
             const nm = virtualSlotInterfaceMember(self, slot) orelse slotNameForTrace(self, slot);
@@ -4258,6 +4276,21 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     if (args.len == 1 and receiver.* == .Instance and std.mem.eql(u8, name, "addAll")) {
         if (try persistent_list_mut.tryAddAll(allocator, receiver.Instance, &args[0])) |v| {
             return .{ .ok = v };
+        }
+    }
+    // Vendored persistent-map builder ops: `put` walks the CHAMP trie
+    // through framed calls per map write, `build` re-wraps it (see
+    // persistent_map_mut.zig).
+    if (receiver.* == .Instance and persistent_map_mut.isBuilderClass(receiver.Instance)) {
+        if (args.len == 2 and std.mem.eql(u8, name, "put")) {
+            if (try persistent_map_mut.tryPut(self, allocator, receiver.Instance, &args[0], &args[1])) |v| {
+                return .{ .ok = v };
+            }
+        }
+        if (args.len == 0 and std.mem.eql(u8, name, "build")) {
+            if (try persistent_map_mut.tryBuild(self, allocator, receiver.Instance)) |v| {
+                return .{ .ok = v };
+            }
         }
     }
 
@@ -8758,6 +8791,21 @@ pub fn invokeVirtualMember(
             }
         }
     }
+    // Map-builder put/build reached as virtual slots.
+    if ((args.len == 0 or args.len == 2) and receiver.* == .Instance) {
+        if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vname| {
+            if (args.len == 2 and std.mem.eql(u8, vname, "put")) {
+                if (try persistent_map_mut.tryPut(self, allocator, receiver.Instance, &args[0], &args[1])) |v| {
+                    return .{ .ok = v };
+                }
+            }
+            if (args.len == 0 and std.mem.eql(u8, vname, "build")) {
+                if (try persistent_map_mut.tryBuild(self, allocator, receiver.Instance)) |v| {
+                    return .{ .ok = v };
+                }
+            }
+        }
+    }
     // Replay a stamped host-receiver site: same interned type FQN means the
     // walk below would reach the same verdict, so serve it without the
     // registry probes. Verdicts are tagged in `site_native`'s low bits
@@ -9299,7 +9347,7 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     // Vendored persistent-vector builder bulk ops (see the
     // callMemberInnerStatic intercept): serve a memoized removeRange or
     // addAll site replaying straight to its FuncId.
-    if ((args_in.len == 1 or args_in.len == 2) and receiver.* == .Instance) {
+    if (args_in.len <= 2 and receiver.* == .Instance) {
         const fname2 = blk: {
             const mg = self.module.borrow();
             defer mg.deinit();
@@ -9313,6 +9361,16 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
         }
         if (args_in.len == 1 and std.mem.eql(u8, fname2, "addAll")) {
             if (try persistent_list_mut.tryAddAll(allocator, receiver.Instance, &args_in[0])) |v| {
+                return .{ .ok = v };
+            }
+        }
+        if (args_in.len == 2 and std.mem.eql(u8, fname2, "put")) {
+            if (try persistent_map_mut.tryPut(self, allocator, receiver.Instance, &args_in[0], &args_in[1])) |v| {
+                return .{ .ok = v };
+            }
+        }
+        if (args_in.len == 0 and std.mem.eql(u8, fname2, "build")) {
+            if (try persistent_map_mut.tryBuild(self, allocator, receiver.Instance)) |v| {
                 return .{ .ok = v };
             }
         }

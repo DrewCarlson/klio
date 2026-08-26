@@ -86,14 +86,19 @@ const ClassState = struct {
     /// free cells is unlinked (found again on free via the pointer mask); a slab
     /// with every cell free is unlinked and either parked in `spare` or unmapped.
     partial: ?*SlabHeader = null,
-    /// One fully-free slab kept mapped and threaded, reused by the next
-    /// allocation of this class instead of mapping a fresh one. Unmapping a slab
-    /// the instant its last cell frees thrashes any workload that holds a single
-    /// live cell of a class across a call — the interpreted receiver chain is
-    /// exactly that, so a method-call loop paid an mmap, a 16K-cell threading
-    /// pass, and an munmap PER CALL. Parking one empty slab makes that
-    /// alloc/free pair hit the free list. Bounded: at most one SLAB per class.
+    /// Fully-free slabs kept mapped and threaded (an intrusive stack via
+    /// `next`), reused by the next allocation of this class instead of mapping
+    /// fresh ones. Unmapping a slab the instant its last cell frees thrashes
+    /// any workload that holds a single live cell of a class across a call —
+    /// the interpreted receiver chain is exactly that, so a method-call loop
+    /// paid an mmap, a 16K-cell threading pass, and an munmap PER CALL. A
+    /// single parked slab still thrashed GC-heavy churn (a sweep frees whole
+    /// bursts of slabs per class, the next allocation burst remaps them), so
+    /// every fully-free slab parks, and instead of the reclaim pass dropping
+    /// them unconditionally they age there (`idle_passes`) and return to the
+    /// OS only after sitting unused for `RECLAIM_IDLE_PASSES` passes.
     spare: ?*SlabHeader = null,
+    spare_count: u32 = 0,
 };
 
 const SpinLock = struct {
@@ -366,7 +371,9 @@ inline fn slabOf(ptr: [*]u8) *SlabHeader {
 /// threaded) before a freshly mapped slab. Caller holds the class lock.
 fn takeFrontier(cs: *ClassState, ci: usize) ?*SlabHeader {
     const s = if (cs.spare) |sp| blk: {
-        cs.spare = null;
+        cs.spare = sp.next;
+        cs.spare_count -= 1;
+        sp.idle_passes = 0;
         break :blk sp;
     } else newSlab(ci) orelse return null;
     s.prev = null;
@@ -431,11 +438,20 @@ fn freeLockedOne(ptr: [*]u8, slab: *SlabHeader, cs: *ClassState) void {
         if (slab.next) |n| n.prev = slab.prev;
         slab.prev = null;
         slab.next = null;
-        // Park it as the class's spare when there is none, so the next
-        // allocation reuses this mapped, already-threaded slab. Otherwise return
-        // the whole span — `munmap` reclaims the dormant pages too.
-        if (cs.spare == null and slab.dormant_pages == 0) {
+        // Park it on the class's spare stack, so the next allocation burst
+        // reuses mapped, already-threaded slabs. A GC sweep frees whole
+        // bursts of slabs per class at once; any free-time cap here made the
+        // sweep unmap the burst and the next mutator burst remap+rethread it
+        // (`newSlab` was 2.3% of the concurrent map profile). Unbounded
+        // parking never raises the peak — these spans were mapped as garbage
+        // moments ago — and the reclaim pass ages idle spares back to the
+        // OS, so only a live churn cycle keeps them. Dormant-paged slabs
+        // still unmap outright (`munmap` reclaims their pages too).
+        if (slab.dormant_pages == 0) {
+            slab.idle_passes = 0;
+            slab.next = cs.spare;
             cs.spare = slab;
+            cs.spare_count += 1;
         } else {
             unmapRaw(@ptrCast(slab), SLAB);
         }
@@ -711,13 +727,29 @@ pub fn reclaimDormant() void {
     for (&class_states, 0..) |*cs, ci| {
         cs.lock.lock();
         defer cs.lock.unlock();
-        // A spare parked by `freeSmall` holds no live cells; a reclaim pass is
-        // exactly when to hand its span back, so the alloc/free thrash guard
-        // never becomes a permanent per-class 256K tax.
-        if (cs.spare) |sp| {
-            cs.spare = null;
-            unmapRaw(@ptrCast(sp), SLAB);
+        // Parked spares hold no live cells, but dropping them all here made
+        // every GC cycle of a churn-heavy workload remap+rethread its whole
+        // burst (`newSlab` was 2.4% of the concurrent map profile). They age
+        // instead: a spare untouched for `RECLAIM_IDLE_PASSES` consecutive
+        // passes hands its span back, so a burst-cycled spare survives while
+        // a long-idle one never becomes a permanent per-class 256K tax.
+        var keep: ?*SlabHeader = null;
+        var keep_count: u32 = 0;
+        var sp = cs.spare;
+        while (sp) |s| {
+            const next = s.next;
+            s.idle_passes +|= 1;
+            if (s.idle_passes >= RECLAIM_IDLE_PASSES) {
+                unmapRaw(@ptrCast(s), SLAB);
+            } else {
+                s.next = keep;
+                keep = s;
+                keep_count += 1;
+            }
+            sp = next;
         }
+        cs.spare = keep;
+        cs.spare_count = keep_count;
         // Skip the partial head: it is the active allocation frontier, so
         // decommitting it would just be undone by the next allocation. Reclaimed
         // slabs stay linked — their dormant capacity is revived on demand by
@@ -828,6 +860,54 @@ test "slab magazine caches a freed cell and flush returns it" {
     try std.testing.expect(seen);
     for (bufs) |b| a.free(b);
     flushMagazines();
+}
+
+test "slab spare stack parks freed slabs and ages them out across reclaim passes" {
+    const a = allocator;
+    const T = std.testing;
+    flushMagazines();
+    const ci = classIndex(2048);
+    const cs = &class_states[ci];
+    // Fill several slabs' worth of one class, then free everything. The
+    // design parks EVERY fully-free slab (no free-time cap: a GC sweep
+    // frees whole bursts and a cap forced the next burst to remap them;
+    // the aging below is the only unmapper), so a multi-slab burst must
+    // park more than one slab, bounded by the number of slabs the burst
+    // could have created.
+    const N = 400; // ~128 cells per 256K slab at 2 KiB → several slabs
+    var bufs: [N][]u8 = undefined;
+    for (&bufs) |*b| b.* = try a.alloc(u8, 2048);
+    for (bufs) |b| a.free(b);
+    flushMagazines();
+    var parked: u32 = 0;
+    {
+        cs.lock.lock();
+        defer cs.lock.unlock();
+        parked = cs.spare_count;
+        try T.expect(parked >= 2);
+        try T.expect(parked <= N);
+    }
+    // One pass ages the spares but keeps every one (hysteresis window):
+    // the count must not shrink yet.
+    reclaimDormant();
+    {
+        cs.lock.lock();
+        defer cs.lock.unlock();
+        try T.expectEqual(parked, cs.spare_count);
+    }
+    // An allocation between passes reuses a parked spare (its age resets).
+    const p = try a.alloc(u8, 2048);
+    a.free(p);
+    flushMagazines();
+    // Enough consecutive idle passes return every parked span to the OS.
+    var pass: usize = 0;
+    while (pass < RECLAIM_IDLE_PASSES + 1) : (pass += 1) reclaimDormant();
+    {
+        cs.lock.lock();
+        defer cs.lock.unlock();
+        try T.expectEqual(@as(u8, 0), cs.spare_count);
+        try T.expectEqual(@as(?*SlabHeader, null), cs.spare);
+    }
 }
 
 test "slab reclaim decommits sparse slabs, preserves stragglers, revives dormant" {
