@@ -32,6 +32,12 @@ pub const Route = enum(u8) {
     /// `current(r: T, snapshot: Snapshot)` — walk against the given
     /// snapshot, no observer semantics.
     current_with_snapshot = 7,
+    /// The `SnapshotState{Map,List,Set}.readable` getter: its whole body
+    /// is `(firstStateRecord as R).readable(this)`, so the serve is the
+    /// wrapper walk rooted at the receiver's stored `firstStateRecord`.
+    state_readable_getter = 8,
+    /// The `Snapshot.Companion.current` getter: `currentSnapshot()`.
+    current_getter = 9,
 };
 
 /// Classify a Func for host service, memoized by the caller into
@@ -46,6 +52,10 @@ pub fn classify(fqn: []const u8, n_params: usize, last_param_ty: []const u8) Rou
     }
     if (n_params == 1) {
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.snapshots.current")) return .current_record;
+        if (std.mem.eql(u8, fqn, "__get_SnapshotStateMap_readable") or
+            std.mem.eql(u8, fqn, "__get_SnapshotStateList_readable") or
+            std.mem.eql(u8, fqn, "__get_SnapshotStateSet_readable")) return .state_readable_getter;
+        if (std.mem.eql(u8, fqn, "__get_Snapshot$Companion$Companion_current")) return .current_getter;
         return .none;
     }
     if (n_params == 2) {
@@ -325,6 +335,24 @@ pub fn serveCurrentRecord(args: []const Value, thread_snapshot: *const Value, gl
     if (candidate == .Null) return null;
     candidate.retain();
     return candidate;
+}
+
+var fn_first_record = std.atomic.Value(?[*]const u8).init(null);
+
+/// The `SnapshotState*.readable` getter: the wrapper walk rooted at the
+/// receiver's stored `firstStateRecord`. Same gates as
+/// `serveReadableState` (exact GlobalSnapshot, null observer, non-null
+/// walk); anything else runs the interpreted getter.
+pub fn serveStateReadableGetter(receiver: *const Value, thread_snapshot: *const Value, global_snapshot: *const Value) ?Value {
+    if (receiver.* != .Instance) return null;
+    const first: Value = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        break :blk g.get().getCached(&fn_first_record, "firstStateRecord") orelse return null;
+    };
+    if (first != .Instance) return null;
+    const wrapped: [2]Value = .{ first, receiver.* };
+    return serveReadableState(wrapped[0..2], thread_snapshot, global_snapshot);
 }
 
 /// `current(r, snapshot)` — walk against the given snapshot's window.

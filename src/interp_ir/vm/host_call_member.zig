@@ -3859,6 +3859,13 @@ pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *con
     {
         return null;
     }
+    // `map.builder()` is host-served once the builder template exists.
+    if (args.len == 0 and std.mem.eql(u8, name, "builder") and
+        receiver.* == .Instance and
+        persistent_map_mut.isMapClass(receiver.Instance))
+    {
+        return null;
+    }
     // `closure.invoke(args…)`: the ladder lands at `callValueRec(receiver,
     // args)` with no closure-specific step before it, so the plain closure
     // invocation flattens identically.
@@ -4084,13 +4091,14 @@ pub fn prepareVirtualFlatCall(
             if (args.len == 1 and std.mem.eql(u8, vn, "addAll")) return null;
         }
     }
-    // Map-builder put/build are host-served (persistent_map_mut.zig).
+    // Map-builder put/build/builder are host-served (persistent_map_mut.zig).
     if ((args.len == 0 or args.len == 2) and receiver.* == .Instance and
-        persistent_map_mut.isBuilderClass(receiver.Instance))
+        (persistent_map_mut.isBuilderClass(receiver.Instance) or
+            persistent_map_mut.isMapClass(receiver.Instance)))
     {
         if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vn| {
             if (args.len == 2 and std.mem.eql(u8, vn, "put")) return null;
-            if (args.len == 0 and std.mem.eql(u8, vn, "build")) return null;
+            if (args.len == 0 and (std.mem.eql(u8, vn, "build") or std.mem.eql(u8, vn, "builder"))) return null;
         }
     }
     if (receiver.* != .Instance) {
@@ -4291,6 +4299,11 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             if (try persistent_map_mut.tryBuild(self, allocator, receiver.Instance)) |v| {
                 return .{ .ok = v };
             }
+        }
+    }
+    if (args.len == 0 and receiver.* == .Instance and std.mem.eql(u8, name, "builder")) {
+        if (try persistent_map_mut.tryBuilder(self, allocator, receiver.Instance)) |v| {
+            return .{ .ok = v };
         }
     }
 
@@ -8791,7 +8804,7 @@ pub fn invokeVirtualMember(
             }
         }
     }
-    // Map-builder put/build reached as virtual slots.
+    // Map-builder put/build/builder reached as virtual slots.
     if ((args.len == 0 or args.len == 2) and receiver.* == .Instance) {
         if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vname| {
             if (args.len == 2 and std.mem.eql(u8, vname, "put")) {
@@ -8801,6 +8814,11 @@ pub fn invokeVirtualMember(
             }
             if (args.len == 0 and std.mem.eql(u8, vname, "build")) {
                 if (try persistent_map_mut.tryBuild(self, allocator, receiver.Instance)) |v| {
+                    return .{ .ok = v };
+                }
+            }
+            if (args.len == 0 and std.mem.eql(u8, vname, "builder")) {
+                if (try persistent_map_mut.tryBuilder(self, allocator, receiver.Instance)) |v| {
                     return .{ .ok = v };
                 }
             }
@@ -9371,6 +9389,11 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
         }
         if (args_in.len == 0 and std.mem.eql(u8, fname2, "build")) {
             if (try persistent_map_mut.tryBuild(self, allocator, receiver.Instance)) |v| {
+                return .{ .ok = v };
+            }
+        }
+        if (args_in.len == 0 and std.mem.eql(u8, fname2, "builder")) {
+            if (try persistent_map_mut.tryBuilder(self, allocator, receiver.Instance)) |v| {
                 return .{ .ok = v };
             }
         }

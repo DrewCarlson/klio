@@ -1035,15 +1035,44 @@ fn serveOuterSlotRoute(recv: *const Value, name: []const u8, route: u64) ?Value 
 
 var call_stats: ?std.StringHashMap(u64) = null;
 fn callStatsBump(fqn: []const u8) void {
+    callStatsBumpId(fqn, 0);
+}
+/// Census bump with the executing FuncId, so the anonymous-lambda mass
+/// (every lambda's fqn is the literal "<lambda>") decomposes into
+/// per-body counters under KLIO_CALL_STATS_LAMBDA — the id keys resolve
+/// back to bodies via `dump-ir --func`.
+fn callStatsBumpId(fqn: []const u8, fid: u32) void {
     if (call_stats_state == 0)
         call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
     if (call_stats == null) call_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
-    const gop = call_stats.?.getOrPut(fqn) catch return;
-    if (!gop.found_existing) gop.value_ptr.* = 0;
+    var key: []const u8 = fqn;
+    var buf: [48]u8 = undefined;
+    if (fid != 0 and std.mem.eql(u8, fqn, "<lambda>") and lambdaStatsOn()) {
+        const printed = std.fmt.bufPrint(&buf, "<lambda>#{d}", .{fid}) catch fqn;
+        key = printed;
+    }
+    const gop = call_stats.?.getOrPut(key) catch return;
+    if (!gop.found_existing) {
+        if (key.ptr == &buf) {
+            const owned = std.heap.page_allocator.dupe(u8, key) catch return;
+            _ = call_stats.?.remove(key);
+            const gop2 = call_stats.?.getOrPut(owned) catch return;
+            gop2.value_ptr.* = 1;
+            return;
+        }
+        gop.value_ptr.* = 0;
+    }
     gop.value_ptr.* += 1;
+}
+fn lambdaStatsOn() bool {
+    const S = struct {
+        var state: u8 = 0;
+    };
+    if (S.state == 0) S.state = if (runtime.envOnce("KLIO_CALL_STATS_LAMBDA") != null) 2 else 1;
+    return S.state == 2;
 }
 /// KLIO_CALL_STATS census tap for slow-ladder GetField executions: keys are
 /// `<gf>Type.name`, so the dump separates the field-read workload from the
@@ -4219,7 +4248,7 @@ pub fn evalWithCapturesChained(
             return lr;
         }
     }
-    callStatsBump(func.fqn);
+    callStatsBumpId(func.fqn, func.id.int());
     const ev: *EvalTls = &evtls;
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);

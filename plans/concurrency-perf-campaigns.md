@@ -883,8 +883,109 @@ in-process interaction still to isolate.
   PersistentVectorBuilder mutation surgery) or the diffuse floor
   (string-keyed dispatch caches -> interned ids; allocator zero-fill).
 
+## Three-front closure plan (the map/vpd class of failures, defined 2026-08-26)
+
+The remaining gap on the concurrency stress tests decomposes into three
+fronts. Each has a concrete mechanism, an owner-lever, and an exit test.
+
+### Front A — ship precompiled natives for the heavy library functions
+
+Current state, honestly assessed: the loop JIT (60-79x) and bytecode
+tier only accelerate SCALAR code; the snapshot/collection functions are
+object- and call-heavy, so today they run interpreted or hand-served.
+The C transpiler already produces AOT native bodies bound to a pinned
+image (`kl_<fid>` scalar-replay: fib 6.6x, corpus 293/293 byte-parity)
+— but its replay set is scalar-pure only; the recorded leaf-miss tally
+says the boundary is exactly "escape-op 57 = object work". So the
+existing per-function host serves (snapshot_fast, persistent_map_mut)
+are hand-written instances of what Front A generalizes.
+
+Plan:
+- A1. Object-shape sub-ABI for the transpiler: stable native access to
+  Instance field slots (index-claimed like the GetField site memos),
+  object-array elements, instance minting via the template mechanism
+  persistent_map_mut proved, and native->native calls. Bail-to-interp
+  on shape surprise exactly like the serves.
+- A2. Bake-time AOT: at pack bake (ids are pinned within the artifact),
+  transpile the hot library functions (snapshot walk family, CHAMP trie
+  ops, TestScheduler drain loop) and ship the .so with the pack; the
+  runtime registers them via the existing
+  `klio_rt_register_native_leaf` path. No runtime JIT needed — bakes
+  are already the natural AOT point.
+- A3. Retire the hand serves one for one as the transpiled versions
+  reach parity (each serve is the acceptance oracle for its function).
+- Exit: the snapshot write cycle (currentSnapshot -> readable ->
+  builder/put/build -> attemptUpdate) runs with zero interpreted frames
+  on the happy path.
+
+### Front B — interpreter floor (make the ritual cheap even interpreted)
+
+- B1. Frame cost: activation open/close is the diffuse floor
+  (runFrameExec 6.3%, memset/poison ~6.8% scales with allocation, arg
+  marshaling). Levers: smaller Value (56->40 landed; 5b pinned),
+  register-bank reuse pools, and the ReleaseFast-for-gate build-policy
+  decision (measured -20%, awaiting user call).
+- B2. Id-keyed dispatch: eqlBytes 4.2% + getIndex ~5% + hash family =
+  string-keyed cache probes on member dispatch; replace name/sig string
+  keys with interned symbol ids stamped at bake. (The earlier
+  "id-keyed dispatch caches" successor item — now quantified.)
+- B3. Allocation rate: boxing per put (builder+ownership+buffers) is
+  ~GBs per stress test; A1's native bodies cut it structurally, and
+  slab spare aging already removed the remap churn.
+- Exit: the timed replica's per-rep wall (currently ~8s warm) reaches
+  <=3s, which puts the 10-rep test inside its 30s runTest budget.
+
+### Front C — inline parity with kotlinc (frames that should not exist)
+
+kotlinc inlines EVERY inline-fun lambda at compile time — `mutate {}`,
+`withCurrent {}`, `sync {}` contribute ZERO frames on the JVM. klio's
+splicer covers top-level/extension inlines and many member shapes; the
+recorded exclusion set (member-inline callees whose bodies need
+this-threading through receiver-formed blocks, own-label returns,
+crossinline capture) is exactly the five 1/insert lambda bodies the
+KLIO_CALL_STATS_LAMBDA decomposition isolated (3.4M frames in one map
+run).
+
+- C1. Member-splice this-threading: bind `this` in a spliced member
+  body to the CALL's dispatch receiver (the round-9b mechanism), which
+  un-excludes mutate/withCurrent/update and their blocks.
+- C2. Own-label returns + crossinline capture shapes, in that order
+  (each currently forces framing).
+- Frame-count target: after C, one interpreted map put should cost
+  <=5 frames (the genuinely polymorphic boundaries); kotlinc's
+  equivalent compiles to ~1 unit with everything else inlined, so
+  frames-per-put is the tracked parity metric (was ~30 at session
+  start, ~15 now, <=5 after C, ~0 after A).
+
 ## Running log
 
+- 2026-08-26 GETTER-ROUTE SERVES + BUILDER MINT: census throughput
+  200k -> 700k inserts inside the watchdog window (3.5x the session
+  baseline). (a) snapshot_fast routes 8/9 classify the ACCESSOR fqns
+  (`__get_SnapshotStateMap_readable` + List/Set twins,
+  `__get_Snapshot$Companion$Companion_current`) and evalGetterTagged
+  serves them through the same wrapper-walk/GlobalSnapshot gates — the
+  840k+480k getter-frame families vanished. (b) `map.builder()` is
+  host-minted from a template captured off a live builder in tryPut;
+  TRAPS burned: the live builder carries TEN fields — the six declared
+  ones plus AbstractMap's `_keys`/`_values` AND their owner-qualified
+  `AbstractMutableMap\x1f_keys` twins (owner-scoped storage names use
+  the 0x1f separator, which PRINTS as an underscore — eql against the
+  printed spelling silently fails; match by last-0x1f-segment); and a
+  capture latch that stamped the generation before validation turned
+  the first failure permanent. (c) KLIO_CALL_STATS_LAMBDA decomposes
+  the literal-"<lambda>"-fqn census mass into per-body `<lambda>#<id>`
+  counters: the map test's 5.7/insert lambda mass = five bodies at
+  exactly 1/insert — the mutate/withCurrent/sync member-inline blocks,
+  i.e. the recorded member-splice-widening exclusion set (the next
+  structural lever). (d) The compose itest child RSS cap rose 6.5 ->
+  10GB: per-test arena churn scales with interpreter THROUGHPUT inside
+  a fixed runTest window, so every serve round raises it — the 1-DNC
+  gate signature (test vanishes from failing, did-not-complete = 1) is
+  the cap tripping, not a hang. Remaining per-insert: <lambda> 5.7,
+  readable wrapper residue 1.1 (serve bails ~1/insert — root-cause
+  next), attemptUpdate 1.0 (sync-gated). Gate 1388/2/0 restored at the
+  raised cap; class 58/59; sweep/litmus/units green.
 - 2026-08-26 MAP-BUILDER CHAMP SERVE + SLAB SPARE AGING: the vendored
   `PersistentHashMapBuilder.put`/`build` are host-served
   (persistent_map_mut.zig — the exact TrieNode `mutablePut` over the

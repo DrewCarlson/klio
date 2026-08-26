@@ -175,6 +175,36 @@ fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: 
     };
     // Frameless serve for the canonical getter shape on a claimed class.
     if (accessorFastGet(self, mptr, func, &receiver)) |r| return r;
+    // Host-served compose snapshot getters (`SnapshotState*.readable`,
+    // `Snapshot.current`): classified once per Func, exactly like the
+    // static-call routes in exec_call's hostStaticServe.
+    {
+        if (func.host_route == 0) {
+            const route: ir.snapshot_fast.Route = blk: {
+                if (func.params.len > 3) break :blk .none;
+                const last_ty: []const u8 = if (func.params.len == 0) "" else func.params[func.params.len - 1].ty.name;
+                break :blk ir.snapshot_fast.classify(func.fqn, func.params.len, last_ty);
+            };
+            @constCast(func).host_route = @intFromEnum(route);
+        }
+        switch (@as(ir.snapshot_fast.Route, @enumFromInt(func.host_route))) {
+            .state_readable_getter => {
+                if (host_globals.composeSnapshotGlobals(self)) |g| {
+                    if (ir.snapshot_fast.serveStateReadableGetter(&receiver, &g.ts, &g.gs)) |v| {
+                        return .{ .ok = v };
+                    }
+                }
+            },
+            .current_getter => {
+                if (host_globals.composeSnapshotGlobals(self)) |g| {
+                    if (ir.snapshot_fast.serveCurrentSnapshot(&g.ts, &g.gs)) |v| {
+                        return .{ .ok = v };
+                    }
+                }
+            },
+            else => {},
+        }
+    }
     // Frameless serve for the wider leaf-expression shape (a getter that
     // combines a couple of stored reads with primitive arithmetic).
     if (try ir.eval.leafExprServe(VmHost, allocator, mptr, func, &.{receiver}, self)) |r| return r;
