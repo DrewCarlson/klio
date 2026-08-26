@@ -79,24 +79,14 @@ Work items:
   re-crosses the 10s runTest cap under the gate's own 8-way
   contention (3-8x class inflation). The whole remaining family is
   contention-amplified throughput; no correctness component left.
-- [ ] REMAINING = interpreted CALL throughput, ~1.5-2x needed. The
-      mixing repro (mixrep.kt: 100 maps x 100 indexed puts +
-      notifyObjectsInitialized) runs 3.06s/rep on the harness; the
-      failing tests do 10 reps against a 30s upstream budget. Per put
-      ~300us =~ 100 interpreted calls x ~3us frame/dispatch cost.
-      Profile is DIFFUSE: getAdapted string-map gets ~4% across many
-      tables, eqlBytes 4% (eql__anon_3017 dominant), acquireRegs
-      memset 2.5% (frames failing frameDefBeforeUse's <=64-local
-      def-before-use test still eagerly fill), allocSmall/
-      allocLockedOne ~3%, libc malloc/memcpy ~8%. No single 2x lever;
-      this is the dispatch/activation-machinery campaign shape (frame
-      open/close, arg settle, member-dispatch ladder).
-- [ ] Solo-failing set with timings (all deterministic, vs their
-      budgets): List addAll trio 31/31/42s, Set mixing add 31s, Map
-      mixing set/clear 31/47s (30s upstream runTest timeouts);
-      validatePotentialDeadlock 90s wall cap; Pausable pair
-      resumeOnBackgroundThread ~28s yield-cost + markInvalid needs
-      >10s (env-cap bound, pass at 90s).
+- [x] Interpreted CALL throughput rounds (see the running log through
+      2026-08-26): mixrep 3.06s -> 0.77s/rep, putrep3 78 -> 22ms,
+      map-replica frames/insert ~30 -> ~5.3, mixing_set PASSES solo at
+      7.5s. Solo standing 2026-08-26: List 65/65, Set 21/21, Map 58/59
+      (_clear ~36s of work vs its 30s declared budget — 1.2x), the
+      Pausable pair green under upstream's 60s default; remaining =
+      _clear (allocation-bound floor) + validatePotentialDeadlock
+      (order-of-magnitude, re-measurement in flight).
 - [ ] Each interpreter root ships an example + pinned output.
 - [ ] Exit: the concurrency classes pass 10/10 consecutive SOLO gate runs;
       `MAX_FAILED` lowered to the new honest ceiling (target 0, and the
@@ -418,11 +408,14 @@ family 9 -> 4:
   absorbed noise; 502 -> 452s). Movable flake and both Pausable
   entries left the fail set.
 - REMAINING REAL FAILURES (2): RecomposerTests.validatePotentialDeadlock
-  (interpreted TestCoroutineScheduler drain slower than the infinite
-  withContext(Default) writer round-trip at one virtual instant) and
-  SnapshotStateMapTests.concurrentMixingWriteApply_clear (1M puts vs
-  its declared 30s: ~170us/put vs 28us needed — CHAMP-put + mutate
-  wrapper floor). Both are pure interpreted-throughput ceilings.
+  and SnapshotStateMapTests.concurrentMixingWriteApply_clear. Both are
+  pure interpreted-throughput ceilings, both now PRECISELY sized
+  (2026-08-26): vpd PASSES solo at 763s under a raised wall cap — the
+  first-ever completion, correct end to end, needs 8.5x vs the 90s cap
+  (its cost is the recompose/apply machinery, untouched by the map-path
+  rounds); _clear does its 10-rep workload in ~36s vs the declared 30s
+  runTest budget — 1.2x, allocation-bound (~16% of profile is
+  alloc/poison/slab; frames/insert already ~5).
 ## Candidate-pool chip (2026-08-24)
 
 - dda02ebc: the implicit-candidate dispatch walk's per-call buffer
@@ -959,6 +952,44 @@ run).
 
 ## Running log
 
+- 2026-08-26 WHOLE-CYCLE SnapshotStateMap.put SERVE (LANDED OPT-IN,
+  KLIO_SSMPUT=1; default OFF pending a GC root-cause): the steady-state
+  write cycle host-side — record read under the map file's `sync`
+  monitor (resolved from globals by mangled name `sync$f<N>` with the
+  file-basename check, plain-name fallback for collision-free names),
+  writableRecord's born-in-current-snapshot fast gate, the
+  builder()/put/build sequence composed from the proven builder serves,
+  then attemptUpdate's protected section replayed under the host
+  monitor with a retry loop. notifyWrite proven no-op via the
+  file-private `globalWriteObservers` list being empty (GlobalSnapshot's
+  writeObserver is NEVER null — it is the ctor lambda draining that
+  list; snapshot_fast.globalWriteGate deliberately does NOT check it).
+  MEASURED ON: map replica 3.7 -> 1.26s/rep (2.9x), mapclear_full 10
+  reps in 12.5s vs the 30s budget, census 1.29M -> 474k. BLOCKED BY a
+  GC-profile memory-corruption interaction, diagnosed to a precise
+  fingerprint but not to root: a committed map's trie node reads back
+  0xAA-poisoned (fields ptr/len = 0xAAAA…) minutes of puts later.
+  Repro (KLIO_SSMPUT=1, crashes in seconds; needs MAIN-thread seeding +
+  replaces from a worker coroutine + commits):
+  `repeat(300) { val map = mutableStateMapOf<Int,Int>();
+  repeat(100){ map[it] = -1 };
+  repeat(100){ coroutineScope { launch(Dispatchers.Default){ map[it] = it } } };
+  repeat(100){ check(map[it] == it) } }`
+  (sv8 all-main passes, sv6 all-worker
+  passes, compute-only mode passes, full-monitor-lock mode still
+  crashes, arena and debug-allocator profiles survive 150+ rounds, and
+  gc_debug's never-free mode STILL crashes — so the dangling reference
+  exists before any sweep; the commit's `record.map` define is the
+  publishing edge, mode-7 bisect). Groundwork landed along the way:
+  keepalive pins on every host mint (collect-at-alloc discipline for
+  node/buffer/map/builder mints — the builder serves had unrooted
+  mid-construction windows), entry marks on tryPut/tryBuild/tryBuilder,
+  validator + phase-trace + victim-report modes (KLIO_SSMPUT=2/4/5/6/7,
+  KLIO_SSMPUT_TRACE). NEXT SESSION: run with the GC arsenal
+  (KLIO_GC_STRESS bisect, remembered-set traces, per-cell provenance)
+  and root-cause the reachability/initialization hole; then flip the
+  serve default and Map _clear closes (its budget math already passes
+  with the serve on).
 - 2026-08-26 EXT-LAMBDA TIER HEAD-EVIDENCE REGRESSION (caught by the
   sweep, fixed): SequenceTest spun forever — the tier derived the
   receiver head of `nats().withIndex()` through the general static

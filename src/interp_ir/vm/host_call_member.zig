@@ -3866,6 +3866,13 @@ pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *con
     {
         return null;
     }
+    // SnapshotStateMap.put is host-served (whole write cycle).
+    if (args.len == 2 and std.mem.eql(u8, name, "put") and
+        receiver.* == .Instance and
+        persistent_map_mut.isSnapshotMapClass(receiver.Instance))
+    {
+        return null;
+    }
     // `closure.invoke(args…)`: the ladder lands at `callValueRec(receiver,
     // args)` with no closure-specific step before it, so the plain closure
     // invocation flattens identically.
@@ -4036,6 +4043,7 @@ pub fn memberSiteSig(self: *VmHost, args: []const Value) ?u64 {
 pub const HostServeKind = enum(u32) {
     map_put = 1,
     map_build = 2,
+    snapshot_map_put = 3,
 };
 
 /// Probe a (receiver, name, args) run for a host member serve at the
@@ -4065,6 +4073,14 @@ pub fn hostMemberServeProbe(
         }
         return null;
     }
+    if (args.len == 2 and std.mem.eql(u8, name, "put") and
+        persistent_map_mut.isSnapshotMapClass(receiver.Instance))
+    {
+        if (try persistent_map_mut.trySnapshotMapPut(self, allocator, receiver.Instance, &args[0], &args[1])) |v| {
+            return .{ .kind = @intFromEnum(HostServeKind.snapshot_map_put), .val = v };
+        }
+        return null;
+    }
     return null;
 }
 
@@ -4086,6 +4102,10 @@ pub fn hostMemberServeKind(
         @intFromEnum(HostServeKind.map_build) => {
             if (args.len != 0 or !persistent_map_mut.isBuilderClass(receiver.Instance)) return null;
             return persistent_map_mut.tryBuild(self, allocator, receiver.Instance);
+        },
+        @intFromEnum(HostServeKind.snapshot_map_put) => {
+            if (args.len != 2 or !persistent_map_mut.isSnapshotMapClass(receiver.Instance)) return null;
+            return persistent_map_mut.trySnapshotMapPut(self, allocator, receiver.Instance, &args[0], &args[1]);
         },
         else => return null,
     }
@@ -4161,6 +4181,14 @@ pub fn prepareVirtualFlatCall(
         if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vn| {
             if (args.len == 2 and std.mem.eql(u8, vn, "put")) return null;
             if (args.len == 0 and (std.mem.eql(u8, vn, "build") or std.mem.eql(u8, vn, "builder"))) return null;
+        }
+    }
+    // SnapshotStateMap.put is host-served (whole write cycle).
+    if (args.len == 2 and receiver.* == .Instance and
+        persistent_map_mut.isSnapshotMapClass(receiver.Instance))
+    {
+        if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vn| {
+            if (std.mem.eql(u8, vn, "put")) return null;
         }
     }
     if (receiver.* != .Instance) {
@@ -4365,6 +4393,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
     if (args.len == 0 and receiver.* == .Instance and std.mem.eql(u8, name, "builder")) {
         if (try persistent_map_mut.tryBuilder(self, allocator, receiver.Instance)) |v| {
+            return .{ .ok = v };
+        }
+    }
+    // The whole-cycle SnapshotStateMap.put serve (persistent_map_mut.zig).
+    if (args.len == 2 and receiver.* == .Instance and std.mem.eql(u8, name, "put") and
+        persistent_map_mut.isSnapshotMapClass(receiver.Instance))
+    {
+        if (try persistent_map_mut.trySnapshotMapPut(self, allocator, receiver.Instance, &args[0], &args[1])) |v| {
             return .{ .ok = v };
         }
     }
@@ -8881,6 +8917,14 @@ pub fn invokeVirtualMember(
             }
             if (args.len == 0 and std.mem.eql(u8, vname, "builder")) {
                 if (try persistent_map_mut.tryBuilder(self, allocator, receiver.Instance)) |v| {
+                    return .{ .ok = v };
+                }
+            }
+            // Whole-cycle SnapshotStateMap.put via its virtual slot.
+            if (args.len == 2 and std.mem.eql(u8, vname, "put") and
+                persistent_map_mut.isSnapshotMapClass(receiver.Instance))
+            {
+                if (try persistent_map_mut.trySnapshotMapPut(self, allocator, receiver.Instance, &args[0], &args[1])) |v| {
                     return .{ .ok = v };
                 }
             }

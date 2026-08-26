@@ -28,9 +28,13 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
+const ir = @import("ir");
+const span_mod = @import("span");
 
 const vmhost = @import("vmhost.zig");
 const host_instances = @import("host_instances.zig");
+const host_globals = @import("host_globals.zig");
+const concurrent = @import("stdlib").implementations.concurrent;
 
 const VmHost = vmhost.VmHost;
 const Allocator = std.mem.Allocator;
@@ -233,7 +237,13 @@ fn mintNode(ctx: *PutCtx, data_map: i32, node_map: i32, items: []const Value, ow
         .identity = host_instances.mintInstanceId(ctx.self),
         .native_state = null,
     });
-    return .{ .Instance = inst };
+    const v: Value = .{ .Instance = inst };
+    // Collect-at-alloc: the NEXT host allocation on this thread may run a
+    // collection, and a freshly minted node referenced only by native
+    // locals is invisible to the root walk — pin until the serve's
+    // entry-mark restores.
+    runtime.keepalivePush(v);
+    return v;
 }
 
 /// In-place store of the node's three mutable fields (the caller proved
@@ -268,7 +278,9 @@ fn bufferInsertEntry(ctx: *PutCtx, buffer: ArrayData, key_index: usize, key: *co
     list.appendAssumeCapacity(value.*);
     while (i < n) : (i += 1) list.appendAssumeCapacity(buffer.get(i));
     retainAll(list.items);
-    return ArrayData.fromBoxedList(try runtime.ValueList.init(ctx.a, list));
+    const bv = ArrayData.fromBoxedList(try runtime.ValueList.init(ctx.a, list));
+    runtime.keepalivePush(bv);
+    return bv;
 }
 
 /// `buffer.replaceEntryWithNode(keyIndex, nodeIndex, node)` as a fresh
@@ -285,7 +297,9 @@ fn bufferReplaceEntryWithNode(ctx: *PutCtx, buffer: ArrayData, key_index: usize,
     list.appendAssumeCapacity(node);
     while (i < n) : (i += 1) list.appendAssumeCapacity(buffer.get(i));
     retainAll(list.items);
-    return ArrayData.fromBoxedList(try runtime.ValueList.init(ctx.a, list));
+    const bv = ArrayData.fromBoxedList(try runtime.ValueList.init(ctx.a, list));
+    runtime.keepalivePush(bv);
+    return bv;
 }
 
 /// A whole-buffer copy with one slot replaced.
@@ -296,7 +310,9 @@ fn bufferCopyReplace(ctx: *PutCtx, buffer: ArrayData, index: usize, v: *const Va
     var i: usize = 0;
     while (i < n) : (i += 1) list.appendAssumeCapacity(if (i == index) v.* else buffer.get(i));
     retainAll(list.items);
-    return ArrayData.fromBoxedList(try runtime.ValueList.init(ctx.a, list));
+    const bv = ArrayData.fromBoxedList(try runtime.ValueList.init(ctx.a, list));
+    runtime.keepalivePush(bv);
+    return bv;
 }
 
 /// `makeNode`: a fresh subtree holding the two entries, recursing while
@@ -373,6 +389,13 @@ fn mutablePut(ctx: *PutCtx, node_inst: ObjRef(InstanceData), key_hash: i32, key:
         if (node_index >= view.buffer.len()) return null;
         const target = view.buffer.get(node_index);
         if (target != .Instance) return null;
+        if (std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT_TRACE") orelse "", "3")) {
+            const p = @intFromPtr(target.Instance.cell);
+            if (p < 0x1000 or (p >> 47) != 0) {
+                std.debug.print("[ssm-badchild] parent={x} idx={d} child={x} dm={x} nm={x} buflen={d}\n", .{ @intFromPtr(node_inst.cell), node_index, p, view.data_map, view.node_map, view.buffer.len() });
+                return null;
+            }
+        }
         const new_node = (try mutablePut(ctx, target.Instance, key_hash, key, value, shift + LOG_BRANCH)) orelse return null;
         if (new_node == .Instance and ObjRef(InstanceData).ptrEq(new_node.Instance, target.Instance)) {
             return .{ .Instance = node_inst };
@@ -431,7 +454,9 @@ fn mintNodeFromBuf(ctx: *PutCtx, data_map: i32, node_map: i32, buf_v: Value) All
         .identity = host_instances.mintInstanceId(ctx.self),
         .native_state = null,
     });
-    return .{ .Instance = inst };
+    const v: Value = .{ .Instance = inst };
+    runtime.keepalivePush(v);
+    return v;
 }
 
 /// `mutableCollisionPut`: flat unordered [k, v, ...] scan.
@@ -557,6 +582,8 @@ fn captureBuilderTemplate(inst: ObjRef(InstanceData), ownership: *const Value) v
 /// (the first cycle of a process runs interpreted).
 pub fn tryBuilder(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceData)) Allocator.Error!?Value {
     if (!classMatches(map_inst, &map_class_hit, MAP_FQN)) return null;
+    const km = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(km);
     if (builder_tmpl.gen != cacheGen() or builder_tmpl.class == null) {
         if (runtime.envOnce("KLIO_MAPMUT_TRACE") != null) {
             const S = struct {
@@ -585,6 +612,7 @@ pub fn tryBuilder(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceData)) A
         .identity = host_instances.mintInstanceId(self),
         .native_state = null,
     });
+    runtime.keepalivePush(.{ .Instance = owner_inst });
     const map_v: Value = .{ .Instance = map_inst };
     var fields: std.ArrayList(InstanceData.Field) = .empty;
     try fields.ensureTotalCapacity(a, t.count);
@@ -640,6 +668,8 @@ fn readBuilder(inst: ObjRef(InstanceData)) ?BuilderState {
 /// or Null; null bails to the interpreted body.
 pub fn tryPut(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData), key: *const Value, value: *const Value) Allocator.Error!?Value {
     if (!isBuilderClass(inst)) return null;
+    const km = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(km);
     if (!keyHostable(key)) return null;
     const key_hash = Value.kotlinScalarHash(key) orelse return null;
     const st = readBuilder(inst) orelse return null;
@@ -671,11 +701,473 @@ pub fn tryPut(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData), key: *con
     return ctx.op_result;
 }
 
+// ==== Whole-cycle SnapshotStateMap.put serve ====
+//
+// The steady-state write cycle (`mutate { it.put(key, value) }` when the
+// current snapshot is the observer-free GlobalSnapshot and the record was
+// born in it) replayed host-side: read the record under the map file's
+// `sync` monitor, compute the new PersistentHashMap fully persistently
+// (owner = Null: every trie path mints, nothing mutates in place), then
+// re-check `modification` under the monitor and assign — exactly
+// `attemptUpdate`'s protected section. No builder, no ownership, no
+// build step, and an identical-value put allocates nothing. Every gate
+// failure bails BEFORE any mutation, so the interpreted cycle serves the
+// rest (record creation after a snapshot advance, nested snapshots,
+// observers, non-scalar keys).
+
+const SSM_FQN = "androidx.compose.runtime.snapshots.SnapshotStateMap";
+var ssm_class_hit = std.atomic.Value(usize).init(0);
+var fn_first_rec = std.atomic.Value(?[*]const u8).init(null);
+var fn_rec_map = std.atomic.Value(?[*]const u8).init(null);
+var fn_rec_mod = std.atomic.Value(?[*]const u8).init(null);
+var fn_rec_sid = std.atomic.Value(?[*]const u8).init(null);
+
+pub fn isSnapshotMapClass(inst: ObjRef(InstanceData)) bool {
+    return classMatches(inst, &ssm_class_hit, SSM_FQN);
+}
+
+/// A file-private top-level global (`<prefix>$f<N>` where file N's path
+/// ends in `file_base`), resolved by scanning the globals env once per
+/// dispatch gen and re-LOOKED-UP by name per call (the cell may be a
+/// `var`). The memo holds the mangled NAME.
+const FpName = struct { gen: u32 = 0, ok: bool = false, buf: [64]u8 = undefined, len: usize = 0 };
+
+fn filePrivateGlobal(self: *VmHost, memo: *FpName, comptime prefix: []const u8, comptime file_base: []const u8) ?Value {
+    const gen = cacheGen();
+    if (memo.gen != gen) {
+        memo.gen = gen;
+        memo.ok = false;
+        var level: ?runtime.ObjRef(runtime.Env) = self.globals;
+        outer: while (level) |lv| {
+            const g = lv.borrow();
+            var it = g.get().vars.iterator();
+            while (it.next()) |ent| {
+                const k = ent.key_ptr.*;
+                if (!std.mem.startsWith(u8, k, prefix ++ "$f")) continue;
+                const n = std.fmt.parseInt(u32, k[prefix.len + 2 ..], 10) catch continue;
+                if (span_mod.active_map) |am| {
+                    if (am.getChecked(span_mod.FileId.from(n))) |sf| {
+                        if (std.mem.endsWith(u8, sf.path, file_base) and k.len <= memo.buf.len) {
+                            @memcpy(memo.buf[0..k.len], k);
+                            memo.len = k.len;
+                            memo.ok = true;
+                            g.deinit();
+                            break :outer;
+                        }
+                    }
+                }
+            }
+            const parent = g.get().parent;
+            g.deinit();
+            level = parent;
+        }
+    }
+    if (!memo.ok) {
+        // A file-private top-level only gets the `$f<N>` mangle on a
+        // NAME COLLISION; a program-wide-unique one binds plain — and a
+        // plain hit is unambiguous (a second declaration anywhere would
+        // have forced both onto the mangled form).
+        const g = self.globals.borrow();
+        defer g.deinit();
+        return g.get().lookup(prefix);
+    }
+    const g = self.globals.borrow();
+    defer g.deinit();
+    return g.get().lookup(memo.buf[0..memo.len]);
+}
+
+threadlocal var sync_name: FpName = .{};
+threadlocal var gwo_name: FpName = .{};
+
+fn snapshotMapSync(self: *VmHost) ?Value {
+    const v = filePrivateGlobal(self, &sync_name, "sync", "SnapshotStateMap.kt") orelse return null;
+    if (v != .Instance) return null;
+    return v;
+}
+
+/// notifyWrite is a provable no-op only while the file-private
+/// `globalWriteObservers` list (Snapshot.kt) is EMPTY — GlobalSnapshot's
+/// writeObserver is the ctor lambda draining it.
+fn globalWriteObserversEmpty(self: *VmHost) bool {
+    const v = filePrivateGlobal(self, &gwo_name, "globalWriteObservers", "Snapshot.kt") orelse {
+        ssmTrace("gwo-unresolved");
+        return false;
+    };
+    switch (v) {
+        .Array => |arr| return arr.len() == 0,
+        .List => |l| {
+            const g = l.items.borrow();
+            defer g.deinit();
+            return g.get().items.len == 0;
+        },
+        .Instance => |inst| {
+            const g = inst.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            if (std.mem.eql(u8, cg.get().name, "EmptyList")) return true;
+            if (runtime.envOnce("KLIO_SSMPUT_TRACE") != null) {
+                std.debug.print("[ssmput] gwo class={s}\n", .{cg.get().name});
+            }
+            return false;
+        },
+        else => {
+            if (runtime.envOnce("KLIO_SSMPUT_TRACE") != null) {
+                std.debug.print("[ssmput] gwo tag={s}\n", .{@tagName(std.meta.activeTag(v))});
+            }
+            return false;
+        },
+    }
+}
+
+/// Mint a PersistentHashMap over (node, size) from a live map's exact
+/// field surface (`node`, `size`, AbstractMap's null view caches).
+/// Consumes `node`'s reference on success; the caller releases it on a
+/// null bail.
+fn mintMapFrom(self: *VmHost, a: Allocator, proto: ObjRef(InstanceData), node: Value, size: i32) Allocator.Error!?Value {
+    var fields: std.ArrayList(InstanceData.Field) = .empty;
+    {
+        const g = proto.borrow();
+        defer g.deinit();
+        const d = g.get();
+        try fields.ensureTotalCapacity(a, d.fields.items.len);
+        for (d.fields.items) |f| {
+            const v: Value = if (std.mem.eql(u8, f.name, "node"))
+                node
+            else if (std.mem.eql(u8, f.name, "size"))
+                Value.newInt(size)
+            else if (std.mem.eql(u8, f.name, "_keys") or std.mem.eql(u8, f.name, "_values"))
+                Value.Null
+            else {
+                fields.deinit(a);
+                return null;
+            };
+            fields.appendAssumeCapacity(.{ .name = f.name, .value = v });
+        }
+    }
+    const cls = blk: {
+        const g = proto.borrow();
+        defer g.deinit();
+        break :blk g.get().class.clone();
+    };
+    const inst = try ObjRef(InstanceData).init(a, .{
+        .class = cls,
+        .fields = fields,
+        .outer = null,
+        .identity = host_instances.mintInstanceId(self),
+        .native_state = null,
+    });
+    return .{ .Instance = inst };
+}
+
+
+/// Debug (KLIO_SSMPUT=5): recursively validate a trie's shape — every
+/// reachable node must read as a well-formed TrieNode.
+fn pageMapped(addr: usize) bool {
+    const pg = std.heap.pageSize();
+    const base = std.mem.alignBackward(usize, addr, pg);
+    return std.os.linux.msync(@ptrFromInt(base), pg, std.os.linux.MSF.ASYNC) == 0;
+}
+
+fn validateTrie(node: ObjRef(InstanceData), depth: u32) bool {
+    if (depth > 8) return false;
+    {
+        const cp = @intFromPtr(node.cell);
+        if (!pageMapped(cp)) {
+            std.debug.print("[ssm-rot] node cell UNMAPPED {x} depth={d}\n", .{ cp, depth });
+            return false;
+        }
+        const fslice = node.cell.data.fields.items;
+        const fp = @intFromPtr(fslice.ptr);
+        if (fslice.len > 64 or (fp >> 47) != 0 or (fslice.len != 0 and !pageMapped(fp))) {
+            std.debug.print("[ssm-rot] node {x} fields ptr={x} len={d} depth={d}\n", .{ cp, fp, fslice.len, depth });
+            return false;
+        }
+    }
+    const null_owner: Value = .Null;
+    const view = NodeView.read(node, &null_owner) orelse {
+        std.debug.print("[ssm-rot] node={x} unreadable at depth={d}\n", .{ @intFromPtr(node.cell), depth });
+        return false;
+    };
+    var i: usize = 0;
+    const n = view.buffer.len();
+    _ = view.data_map;
+    while (i < n) : (i += 1) {
+        const v = view.buffer.get(i);
+        if (v == .Instance and classMatches(v.Instance, &node_class_hit, NODE_FQN)) {
+            if (!validateTrie(v.Instance, depth + 1)) return false;
+        }
+    }
+    return true;
+}
+
+fn mapTrieValid(map_v: Value) bool {
+    if (map_v != .Instance) return false;
+    const node_v: Value = blk: {
+        const g = map_v.Instance.borrow();
+        defer g.deinit();
+        break :blk g.get().getCached(&fn_node, "node") orelse return false;
+    };
+    if (node_v != .Instance) return false;
+    return validateTrie(node_v.Instance, 0);
+}
+
+const RecordRead = struct { rec: ObjRef(InstanceData), map: Value, mod: i32 };
+
+/// The current-snapshot record of `map_inst` with its stored map and
+/// modification count; null unless the record was BORN in the gate's
+/// snapshot (the writableRecord fast path — no record creation, no
+/// recordModified).
+fn currentBornRecord(map_inst: ObjRef(InstanceData), gate: ir.snapshot_fast.WriteGate) ?RecordRead {
+    const first: Value = blk: {
+        const g = map_inst.borrow();
+        defer g.deinit();
+        break :blk g.get().getCached(&fn_first_rec, "firstStateRecord") orelse return null;
+    };
+    if (first != .Instance) return null;
+    const rec_v = ir.snapshot_fast.recordForWrite(&first, gate) orelse return null;
+    if (rec_v != .Instance) return null;
+    const g = rec_v.Instance.borrow();
+    defer g.deinit();
+    const d = g.get();
+    const sid = d.getCached(&fn_rec_sid, "snapshotId") orelse return null;
+    const sid_i: i64 = switch (sid) {
+        .Int => |x| x,
+        .Long => |x| x,
+        else => return null,
+    };
+    if (sid_i != gate.id) return null;
+    const map_v = d.getCached(&fn_rec_map, "map") orelse return null;
+    const mod_v = d.getCached(&fn_rec_mod, "modification") orelse return null;
+    if (map_v != .Instance or mod_v != .Int) return null;
+    if (!classMatches(map_v.Instance, &map_class_hit, MAP_FQN)) return null;
+    return .{ .rec = rec_v.Instance, .map = map_v, .mod = mod_v.Int };
+}
+
+/// Serve `SnapshotStateMap.put(key, value)` end to end. Returns the
+/// previous value (retained) / Null; null bails to the interpreted
+/// mutate cycle with nothing mutated.
+fn ssmTrace(comptime why: []const u8) void {
+    const S = struct {
+        var state: u8 = 0;
+    };
+    if (S.state == 0) S.state = if (runtime.envOnce("KLIO_SSMPUT_TRACE") != null) 2 else 1;
+    if (S.state == 2) std.debug.print("[ssmput] bail: " ++ why ++ "\n", .{});
+}
+
+fn ssmPhase(comptime tag: []const u8) void {
+    const S = struct {
+        var state: u8 = 0;
+    };
+    if (S.state == 0) {
+        S.state = if (std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT_TRACE") orelse "", "3")) 3 else 1;
+    }
+    if (S.state == 3) std.debug.print("[ssm:{d}] " ++ tag ++ "\n", .{std.Thread.getCurrentId()});
+}
+
+pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceData), key: *const Value, value: *const Value) Allocator.Error!?Value {
+    // OPT-IN (KLIO_SSMPUT=1): the whole-cycle serve measured 2.9x on the
+    // map-write replica but a committed map's node intermittently reads
+    // back as 0xAA-poisoned memory under the GC profile (sv7 repro in the
+    // plan; survives arena and the debug allocator, persists under
+    // gc_debug's never-free mode, needs a cross-thread build/replace mix).
+    // Root-cause with the GC arsenal before enabling by default.
+    const S = struct {
+        var state: u8 = 0;
+    };
+    if (S.state == 0) {
+        const v = runtime.envOnce("KLIO_SSMPUT") orelse "0";
+        S.state = if (v.len != 0 and !std.mem.eql(u8, v, "0")) 1 else 2;
+    }
+    if (S.state == 2) return null;
+    if (!isSnapshotMapClass(map_inst)) return null;
+    if (!keyHostable(key)) {
+        ssmTrace("key");
+        return null;
+    }
+    const globals = host_globals.composeSnapshotGlobals(self) orelse {
+        ssmTrace("globals");
+        return null;
+    };
+    const sync_obj = snapshotMapSync(self) orelse {
+        ssmTrace("sync-global");
+        return null;
+    };
+    const sync_key = sync_obj.lockIdentity() orelse {
+        ssmTrace("sync-identity");
+        return null;
+    };
+    if (!globalWriteObserversEmpty(self)) {
+        ssmTrace("write-observers");
+        return null;
+    }
+
+    var attempts: u32 = 0;
+    while (attempts < 64) : (attempts += 1) {
+        // A concurrent committer REPLACES record.map, unrooting the map
+        // this attempt reads (and the previous value inside its buffers)
+        // while they sit in native locals the collector cannot see — pin
+        // for the attempt, and hold a reference under reclaim.
+        const km = runtime.keepaliveMark();
+        defer runtime.keepaliveRestore(km);
+        // Read phase, mirroring mutate's `synchronized(sync) { ... }`.
+        if (std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT_TRACE") orelse "", "3")) {
+            std.debug.print("[ssm:{d}] enter gc={} reclaim={}\n", .{ std.Thread.getCurrentId(), runtime.gc.gc_enabled, runtime.reclaimEnabled() });
+        } else ssmPhase("enter");
+        if (!try concurrent.monitorEnter(sync_key)) return null;
+        const gate = ir.snapshot_fast.globalWriteGate(&globals.ts, &globals.gs) orelse {
+            _ = try concurrent.monitorExit(sync_key);
+            ssmTrace("write-gate");
+            return null;
+        };
+        const r0 = currentBornRecord(map_inst, gate) orelse {
+            _ = try concurrent.monitorExit(sync_key);
+            ssmTrace("record");
+            return null;
+        };
+        const expected_mod = r0.mod;
+        const old_map = r0.map;
+        if (std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT") orelse "1", "5")) {
+            if (!mapTrieValid(old_map)) {
+                std.debug.print("[ssm-CORRUPT] old_map invalid at READ, map_inst={x} thread={d}\n", .{ @intFromPtr(map_inst.cell), std.Thread.getCurrentId() });
+                _ = try concurrent.monitorExit(sync_key);
+                return null;
+            }
+        }
+        if (runtime.reclaimEnabled()) old_map.retain();
+        defer if (runtime.reclaimEnabled()) old_map.release(a);
+        runtime.keepalivePush(old_map);
+        const old_size: i32 = blk: {
+            const g = old_map.Instance.borrow();
+            const sv = g.get().getCached(&fn_size, "size");
+            g.deinit();
+            const s = sv orelse {
+                _ = try concurrent.monitorExit(sync_key);
+                return null;
+            };
+            if (s != .Int) {
+                _ = try concurrent.monitorExit(sync_key);
+                return null;
+            }
+            break :blk s.Int;
+        };
+        const full_lock = std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT") orelse "1", "4");
+        if (!full_lock) _ = try concurrent.monitorExit(sync_key);
+
+        ssmPhase("read-done");
+        // Compute phase (unlocked): the interpreted cycle's exact
+        // builder()/put/build sequence, composed from the proven builder
+        // serves. `old_size` is read above only to keep the read-phase
+        // shape; the builder tracks size itself.
+        _ = old_size;
+        const builder_v = (try tryBuilder(self, a, old_map.Instance)) orelse return null;
+        if (builder_v != .Instance) return null;
+        runtime.keepalivePush(builder_v);
+        defer if (runtime.reclaimEnabled()) builder_v.release(a);
+        const prev = (try tryPut(self, a, builder_v.Instance, key, value)) orelse return null;
+        const new_map = (try tryBuild(self, a, builder_v.Instance)) orelse {
+            if (runtime.reclaimEnabled()) prev.release(a);
+            return null;
+        };
+        if (new_map == .Instance and ObjRef(InstanceData).ptrEq(new_map.Instance, old_map.Instance)) {
+            // Node unchanged (identical value already present): mutate's
+            // `newMap == oldMap` break — no CAS.
+            if (runtime.reclaimEnabled()) new_map.release(a);
+            return prev;
+        }
+        runtime.keepalivePush(new_map);
+        ssmPhase("minted");
+
+        // KLIO_SSMPUT=2: compute-only bisect mode — mint then bail to the
+        // interpreted cycle without ever committing.
+        if (std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT") orelse "1", "2")) {
+            if (runtime.reclaimEnabled()) {
+                new_map.release(a);
+                prev.release(a);
+            }
+            return null;
+        }
+        // CAS phase, mirroring `writable { attemptUpdate(mod, newMap) }`.
+        if (!full_lock and !try concurrent.monitorEnter(sync_key)) {
+            if (runtime.reclaimEnabled()) {
+                new_map.release(a);
+                prev.release(a);
+            }
+            return null;
+        }
+        const gate2 = ir.snapshot_fast.globalWriteGate(&globals.ts, &globals.gs) orelse {
+            _ = try concurrent.monitorExit(sync_key);
+            if (runtime.reclaimEnabled()) {
+                new_map.release(a);
+                prev.release(a);
+            }
+            return null;
+        };
+        const r2 = currentBornRecord(map_inst, gate2) orelse {
+            _ = try concurrent.monitorExit(sync_key);
+            if (runtime.reclaimEnabled()) {
+                new_map.release(a);
+                prev.release(a);
+            }
+            return null;
+        };
+        ssmPhase("cas");
+        var committed = false;
+        if (r2.mod == expected_mod) {
+            const g = r2.rec.borrowMut();
+            defer g.deinit();
+            const d = g.get();
+            // The record's storage names must be the plain spellings —
+            // `define` CREATES a missing field, and an owner-qualified
+            // twin surface would leave readers on the stale slot.
+            if (d.get("map") == null or d.get("modification") == null) {
+                _ = try concurrent.monitorExit(sync_key);
+                if (runtime.reclaimEnabled()) {
+                    new_map.release(a);
+                    prev.release(a);
+                }
+                ssmTrace("record-field-names");
+                return null;
+            }
+            const mode = runtime.envOnce("KLIO_SSMPUT") orelse "1";
+            if (!std.mem.eql(u8, mode, "6")) try d.define(a, "map", new_map);
+            if (!std.mem.eql(u8, mode, "7")) try d.define(a, "modification", Value.newInt(expected_mod + 1));
+            committed = true;
+        }
+        _ = try concurrent.monitorExit(sync_key);
+        if (committed) {
+            ssmPhase("committed");
+            if (std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT") orelse "1", "5")) {
+                const root: usize = blk: {
+                    const g2 = new_map.Instance.borrow();
+                    defer g2.deinit();
+                    const nv2 = g2.get().getCached(&fn_node, "node") orelse break :blk 0;
+                    break :blk if (nv2 == .Instance) @intFromPtr(nv2.Instance.cell) else 0;
+                };
+                std.debug.print("[ssm-commit] map={x} newmap={x} root={x} t={d}\n", .{ @intFromPtr(map_inst.cell), @intFromPtr(new_map.Instance.cell), root, std.Thread.getCurrentId() });
+                if (!mapTrieValid(new_map)) {
+                    std.debug.print("[ssm-CORRUPT] new_map invalid at COMMIT, thread={d}\n", .{std.Thread.getCurrentId()});
+                }
+            }
+            return prev;
+        }
+        if (runtime.reclaimEnabled()) {
+            new_map.release(a);
+            prev.release(a);
+        }
+        // Another writer moved `modification`: retry the whole cycle,
+        // exactly as the interpreted mutate loop does.
+    }
+    return null;
+}
+
 /// Serve `builder.build()`: the stored map when the node is unchanged,
 /// else a fresh PersistentHashMap over (node, size) plus a fresh
 /// ownership for the builder. Bails on any shape surprise.
 pub fn tryBuild(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData)) Allocator.Error!?Value {
     if (!isBuilderClass(inst)) return null;
+    const km = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(km);
     const st = readBuilder(inst) orelse return null;
     const map_v: Value = blk: {
         const g = inst.borrow();
@@ -730,6 +1222,7 @@ pub fn tryBuild(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData)) Allocat
         .identity = host_instances.mintInstanceId(self),
         .native_state = null,
     });
+    runtime.keepalivePush(.{ .Instance = new_map });
     // Fresh ownership: an empty instance of the ownership's own class.
     const new_owner: Value = blk: {
         if (st.ownership != .Instance) return null;
