@@ -729,6 +729,8 @@ pub var gc_nofree: bool = false;
 /// Diagnostics: called after marking, before the sweep (stop-the-world
 /// still in effect). Registered by a host-side checker.
 pub var audit_hook: ?*const fn (major: bool, epoch: usize) void = null;
+/// Diagnostics: called after the sweep, world still stopped.
+pub var post_sweep_hook: ?*const fn (major: bool, epoch: usize) void = null;
 
 /// Audit view of a cell's sweep fate this collection: would the sweep
 /// keep it (marked or tenured-under-minor), or free it (white)?
@@ -744,6 +746,14 @@ pub fn cellSweepFate(h: *const GcHeader, major: bool) enum { marked, tenured, wh
 /// collection re-shades + traces it, firing the trap with the cell's type and a
 /// stack trace: the exact swept-while-live cell that an incomplete root missed.
 pub var gc_poison: bool = false;
+
+/// Diagnostics: whether `h` is a cell the (poison-mode) sweep already
+/// freed — its trace fn was replaced by the trap. Host walks can probe
+/// this BEFORE dereferencing payload memory, converting a UAF crash into
+/// a report of the stale edge.
+pub fn cellSweptPoisoned(h: *const GcHeader) bool {
+    return gc_poison and h.gc_trace == poisonTrap;
+}
 /// Whether a MINOR mark stops at tenured cells (the classic generational
 /// shortcut). Re-validated after the empty-singleton root fix (the boxed
 /// payloads' one root hole): the StringTest heap-shaping repro and the full
@@ -833,6 +843,7 @@ fn collectImpl(force_major: bool) void {
     // sweep frees them, naming the broken edge instead of a later UAF.
     if (audit_hook) |f| f(major, cur_epoch);
     const freed = if (major) sweepFull() else sweepMinor();
+    if (post_sweep_hook) |f| f(major, cur_epoch);
     // Reclaim closure side-table metadata for slots no live value marked this
     // epoch (still stop-the-world: the side-table is stable). Major only: a
     // minor mark never re-stamps tenured closures, so its epoch proves nothing

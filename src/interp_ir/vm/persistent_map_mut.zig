@@ -176,6 +176,11 @@ const NodeView = struct {
     owned: bool,
 
     fn read(inst: ObjRef(InstanceData), owner: *const Value) ?NodeView {
+        if (runtime.gc.cellSweptPoisoned(&inst.cell.hdr)) {
+            std.debug.print("[stale-edge] NodeView.read on SWEPT cell {x}\n", .{@intFromPtr(inst.cell)});
+            runtime.trace.dumpCurrent(.{});
+            return null;
+        }
         if (!classMatches(inst, &node_class_hit, NODE_FQN)) return null;
         const g = inst.borrow();
         defer g.deinit();
@@ -389,6 +394,14 @@ fn mutablePut(ctx: *PutCtx, node_inst: ObjRef(InstanceData), key_hash: i32, key:
         if (node_index >= view.buffer.len()) return null;
         const target = view.buffer.get(node_index);
         if (target != .Instance) return null;
+        if (runtime.gc.cellSweptPoisoned(&target.Instance.cell.hdr)) {
+            const bufid: usize = switch (view.buffer.storage()) {
+                .boxed => |vl| @intFromPtr(vl.cell),
+                else => 0,
+            };
+            std.debug.print("[stale-edge] parent {x} (owned={}) buffer {x} idx={d} -> SWEPT child {x}\n", .{ @intFromPtr(node_inst.cell), view.owned, bufid, node_index, @intFromPtr(target.Instance.cell) });
+            return null;
+        }
         if (std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT_TRACE") orelse "", "3")) {
             const p = @intFromPtr(target.Instance.cell);
             if (p < 0x1000 or (p >> 47) != 0) {
@@ -919,6 +932,7 @@ fn mapTrieValid(map_v: Value) bool {
 var audit_lock: runtime.SpinMutex = .{};
 var audit_records: [64]?ObjRef(InstanceData) = @splat(null);
 var audit_next: usize = 0;
+var audit_commits = std.atomic.Value(usize).init(0);
 
 fn auditRegisterOne(rec: ObjRef(InstanceData)) void {
     for (audit_records) |e| {
@@ -945,7 +959,10 @@ fn auditRegisterRecord(rec: ObjRef(InstanceData)) void {
         if (n != .Instance) break;
         cur = n.Instance;
     }
-    if (runtime.gc.audit_hook == null) runtime.gc.audit_hook = gcAudit;
+    if (runtime.gc.audit_hook == null) {
+        runtime.gc.audit_hook = gcAudit;
+        runtime.gc.post_sweep_hook = gcPostSweep;
+    }
 }
 
 fn auditFate(inst: ObjRef(InstanceData), major: bool) []const u8 {
@@ -987,10 +1004,60 @@ fn auditWalkNode(node: ObjRef(InstanceData), major: bool, depth: u32, parent: us
     }
 }
 
+/// Post-sweep: re-walk the audited records; a node that now reads as
+/// poisoned/unmapped was freed THIS epoch despite the pre-sweep walk.
+fn gcPostSweep(major: bool, epoch: usize) void {
+    _ = major;
+    audit_lock.lock();
+    defer audit_lock.unlock();
+    for (audit_records) |e| {
+        const rec = e orelse continue;
+        if (!pageMapped(@intFromPtr(rec.cell))) {
+            std.debug.print("[post-sweep] record cell unmapped {x} epoch={d}\n", .{ @intFromPtr(rec.cell), epoch });
+            continue;
+        }
+        const g = rec.borrow();
+        const map_v = g.get().getCached(&fn_rec_map, "map");
+        g.deinit();
+        const mv = map_v orelse continue;
+        if (mv != .Instance) continue;
+        const node_v: Value = blk: {
+            const g2 = mv.Instance.borrow();
+            defer g2.deinit();
+            break :blk g2.get().getCached(&fn_node, "node") orelse continue;
+        };
+        if (node_v != .Instance) continue;
+        postWalk(node_v.Instance, 0, epoch, @intFromPtr(mv.Instance.cell));
+    }
+}
+
+fn postWalk(node: ObjRef(InstanceData), depth: u32, epoch: usize, parent: usize) void {
+    if (depth > 8) return;
+    const cp = @intFromPtr(node.cell);
+    if (!pageMapped(cp)) {
+        std.debug.print("[post-sweep] SWEPT node {x} depth={d} parent={x} epoch={d}\n", .{ cp, depth, parent, epoch });
+        return;
+    }
+    const fp = @intFromPtr(node.cell.data.fields.items.ptr);
+    if ((fp >> 47) != 0 or node.cell.data.fields.items.len > 64) {
+        std.debug.print("[post-sweep] POISONED node {x} fields={x}/{d} depth={d} parent={x} epoch={d}\n", .{ cp, fp, node.cell.data.fields.items.len, depth, parent, epoch });
+        return;
+    }
+    const null_owner: Value = .Null;
+    const view = NodeView.read(node, &null_owner) orelse return;
+    var i: usize = 0;
+    const n = view.buffer.len();
+    while (i < n) : (i += 1) {
+        const v = view.buffer.get(i);
+        if (v == .Instance) postWalk(v.Instance, depth + 1, epoch, cp);
+    }
+}
+
 fn gcAudit(major: bool, epoch: usize) void {
     _ = epoch;
     audit_lock.lock();
     defer audit_lock.unlock();
+    std.debug.print("[gc-audit] commits={d} registered={d} major={}\n", .{ audit_commits.load(.monotonic), @min(audit_next, audit_records.len), major });
     for (audit_records) |e| {
         const rec = e orelse continue;
         const rec_fate = runtime.gc.cellSweepFate(&rec.cell.hdr, major);
@@ -1249,6 +1316,7 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
         if (committed) {
             ssmPhase("committed");
             if (std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT") orelse "0", "8")) {
+                _ = audit_commits.fetchAdd(1, .monotonic);
                 auditRegisterRecord(r2.rec);
                 const S8 = struct {
                     var once: bool = false;
