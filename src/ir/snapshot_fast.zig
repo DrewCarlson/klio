@@ -17,13 +17,17 @@ const std = @import("std");
 const runtime = @import("runtime");
 const Value = runtime.Value;
 
-pub const Route = enum(u8) { unknown = 0, none = 1, readable = 2, valid = 3 };
+pub const Route = enum(u8) { unknown = 0, none = 1, readable = 2, valid = 3, current_snapshot = 4 };
 
 /// Classify a Func for host service, memoized by the caller into
-/// `Func.host_route`. Matched by fqn + the 3-arg shape whose last
-/// parameter is a SnapshotIdSet (excludes the same-named record
-/// extensions).
+/// `Func.host_route`. The walk pair is matched by fqn + the 3-arg shape
+/// whose last parameter is a SnapshotIdSet (excludes the same-named
+/// record extensions); `currentSnapshot` by fqn + zero params.
 pub fn classify(fqn: []const u8, n_params: usize, last_param_ty: []const u8) Route {
+    if (n_params == 0) {
+        if (std.mem.eql(u8, fqn, "androidx.compose.runtime.snapshots.currentSnapshot")) return .current_snapshot;
+        return .none;
+    }
     if (n_params != 3) return .none;
     if (!std.mem.endsWith(u8, last_param_ty, "SnapshotIdSet")) return .none;
     if (std.mem.eql(u8, fqn, "androidx.compose.runtime.snapshots.readable")) return .readable;
@@ -41,6 +45,12 @@ fn asI64(v: *const Value) ?i64 {
 
 const IdSet = struct { upper: i64, lower: i64, bound: i64 };
 
+var fn_map = std.atomic.Value(?[*]const u8).init(null);
+var fn_ref = std.atomic.Value(?[*]const u8).init(null);
+var fn_value = std.atomic.Value(?[*]const u8).init(null);
+var fn_size = std.atomic.Value(?[*]const u8).init(null);
+var fn_keys = std.atomic.Value(?[*]const u8).init(null);
+var fn_values = std.atomic.Value(?[*]const u8).init(null);
 var fn_below = std.atomic.Value(?[*]const u8).init(null);
 var fn_upper = std.atomic.Value(?[*]const u8).init(null);
 var fn_lower = std.atomic.Value(?[*]const u8).init(null);
@@ -102,6 +112,77 @@ pub fn serveValid(args: []const Value) ?Value {
         break :blk asI64(&v) orelse return null;
     };
     return .{ .Bool = validId(snap, sid, s) };
+}
+
+/// `currentSnapshot() = threadSnapshot.get() ?: globalSnapshot`, over the
+/// interpreted objects the Kotlin bodies read: the SnapshotThreadLocal's
+/// `map` (engine AtomicReference wrapping an atomicfu `ref` cell) holds a
+/// ThreadMap `(size, keys: LongArray, values: Array<Any?>)`; the lookup is
+/// its binary search keyed on the SAME thread id the
+/// `__compose_currentThreadId` intrinsic reports. klio's `MainThreadId`
+/// actual is `-1` (no thread takes the field path); a `-1` id or any
+/// unexpected shape bails to the interpreted body. The returned snapshot
+/// is retained.
+pub fn serveCurrentSnapshot(thread_snapshot: *const Value, global_snapshot: *const Value) ?Value {
+    const tid: i64 = @bitCast(@as(u64, std.Thread.getCurrentId()));
+    if (tid == -1) return null;
+    if (thread_snapshot.* != .Instance) return null;
+    const map_cell: Value = blk: {
+        const g = thread_snapshot.Instance.borrow();
+        defer g.deinit();
+        break :blk g.get().getCached(&fn_map, "map") orelse return null;
+    };
+    if (map_cell != .Instance) return null;
+    const ref_cell: Value = blk: {
+        const g = map_cell.Instance.borrow();
+        defer g.deinit();
+        break :blk g.get().getCached(&fn_ref, "ref") orelse return null;
+    };
+    if (ref_cell != .Instance) return null;
+    const tm: Value = blk: {
+        const g = ref_cell.Instance.borrow();
+        defer g.deinit();
+        break :blk g.get().getCached(&fn_value, "value") orelse return null;
+    };
+    var found: Value = .Null;
+    if (tm == .Instance) {
+        const g = tm.Instance.borrow();
+        defer g.deinit();
+        const inst = g.get();
+        const size_v = inst.getCached(&fn_size, "size") orelse return null;
+        const keys_v = inst.getCached(&fn_keys, "keys") orelse return null;
+        const values_v = inst.getCached(&fn_values, "values") orelse return null;
+        const n: usize = switch (size_v) {
+            .Int => |x| if (x < 0) return null else @intCast(x),
+            else => return null,
+        };
+        if (keys_v != .Array or values_v != .Array) return null;
+        if (keys_v.Array.prim != .Long) return null;
+        if (n > keys_v.Array.len() or n > values_v.Array.len()) return null;
+        var lo: usize = 0;
+        var hi: usize = n;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const kv = keys_v.Array.get(mid);
+            const k: i64 = switch (kv) {
+                .Long => |x| x,
+                else => return null,
+            };
+            if (k < tid) {
+                lo = mid + 1;
+            } else if (k > tid) {
+                hi = mid;
+            } else {
+                found = values_v.Array.get(mid);
+                break;
+            }
+        }
+    } else if (tm != .Null) {
+        return null;
+    }
+    const result: Value = if (found != .Null and found != .Unit) found else global_snapshot.*;
+    result.retain();
+    return result;
 }
 
 /// `readable(r, id, invalid)` — the record-chain walk. Returns the

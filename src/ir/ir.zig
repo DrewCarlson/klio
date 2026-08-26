@@ -226,6 +226,8 @@ pub const ScopeClassRef = struct {
 };
 
 /// One IR instruction. Drives the per-frame evaluator switch.
+pub const snapshot_fast = @import("snapshot_fast.zig");
+
 pub const Inst = union(enum) {
     /// Materialise a constant into a register.
     Const: struct { dst: Reg, value: ConstId },

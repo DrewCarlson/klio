@@ -127,25 +127,38 @@ const snapshot_fast = @import("snapshot_fast.zig");
 
 /// Host-served static fns (the snapshot validity walk): classify once
 /// per Func, serve without any call machinery on a hit.
-inline fn hostStaticServe(allocator: Allocator, frame: *Frame, call: anytype) Allocator.Error!?Value {
+inline fn hostStaticServe(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H) Allocator.Error!?Value {
     _ = allocator;
     const cf = frame.module.funcById(call.func) orelse return null;
     if (cf.host_route == 0) {
         const route: snapshot_fast.Route = blk: {
-            if (cf.params.len != 3) break :blk .none;
-            break :blk snapshot_fast.classify(cf.fqn, cf.params.len, cf.params[cf.params.len - 1].ty.name);
+            if (cf.params.len != 3 and cf.params.len != 0) break :blk .none;
+            const last_ty: []const u8 = if (cf.params.len == 0) "" else cf.params[cf.params.len - 1].ty.name;
+            break :blk snapshot_fast.classify(cf.fqn, cf.params.len, last_ty);
         };
         @constCast(cf).host_route = @intFromEnum(route);
     }
     if (cf.host_route <= @intFromEnum(snapshot_fast.Route.none)) return null;
-    if (call.n_args != 3 or call.type_args.len != 0 or !argNamesAllNull(call.arg_names)) return null;
-    var args: [3]Value = undefined;
-    for (0..3) |i| args[i] = frame.read(ir.Reg.from(call.args.int() + @as(u32, @intCast(i))));
-    return switch (@as(snapshot_fast.Route, @enumFromInt(cf.host_route))) {
-        .readable => snapshot_fast.serveReadable(args[0..]),
-        .valid => snapshot_fast.serveValid(args[0..]),
-        else => null,
-    };
+    if (call.type_args.len != 0 or !argNamesAllNull(call.arg_names)) return null;
+    switch (@as(snapshot_fast.Route, @enumFromInt(cf.host_route))) {
+        .readable, .valid => {
+            if (call.n_args != 3) return null;
+            var args: [3]Value = undefined;
+            for (0..3) |i| args[i] = frame.read(ir.Reg.from(call.args.int() + @as(u32, @intCast(i))));
+            return switch (@as(snapshot_fast.Route, @enumFromInt(cf.host_route))) {
+                .readable => snapshot_fast.serveReadable(args[0..]),
+                .valid => snapshot_fast.serveValid(args[0..]),
+                else => unreachable,
+            };
+        },
+        .current_snapshot => {
+            if (call.n_args != 0) return null;
+            if (comptime !@hasDecl(H, "composeSnapshotGlobals")) return null;
+            const g = host.composeSnapshotGlobals() orelse return null;
+            return snapshot_fast.serveCurrentSnapshot(&g.ts, &g.gs);
+        },
+        else => return null,
+    }
 }
 
 pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H, allow_flat: bool) Allocator.Error!Step {
@@ -175,7 +188,7 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
         };
     }
     dispatchBump(.call_static);
-    if (try hostStaticServe(allocator, frame, call)) |served| {
+    if (try hostStaticServe(H, allocator, frame, call, host)) |served| {
         try frame.write(call.dst, served);
         return .cont;
     }
