@@ -4029,6 +4029,68 @@ pub fn memberSiteSig(self: *VmHost, args: []const Value) ?u64 {
     return if (sig == 0) 1 else sig;
 }
 
+/// Host-serve kinds a CallMember instruction-site memo can claim: route
+/// word bit0 = 0, kind in the remaining bits (the flat-target form keeps
+/// bit0 = 1 with the FuncId above it). The claimed class identity plus the
+/// serve's own shape validation make a stale claim a safe bail.
+pub const HostServeKind = enum(u32) {
+    map_put = 1,
+    map_build = 2,
+};
+
+/// Probe a (receiver, name, args) run for a host member serve at the
+/// CallMember exec site, BEFORE the ladder entry: on a hit the value is
+/// served and the kind returned so the site memo can claim the route.
+pub fn hostMemberServeProbe(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    name: []const u8,
+    args: []const Value,
+) Allocator.Error!?struct { kind: u32, val: Value } {
+    if (receiver.* != .Instance) return null;
+    if (args.len == 2 and std.mem.eql(u8, name, "put") and
+        persistent_map_mut.isBuilderClass(receiver.Instance))
+    {
+        if (try persistent_map_mut.tryPut(self, allocator, receiver.Instance, &args[0], &args[1])) |v| {
+            return .{ .kind = @intFromEnum(HostServeKind.map_put), .val = v };
+        }
+        return null;
+    }
+    if (args.len == 0 and std.mem.eql(u8, name, "build") and
+        persistent_map_mut.isBuilderClass(receiver.Instance))
+    {
+        if (try persistent_map_mut.tryBuild(self, allocator, receiver.Instance)) |v| {
+            return .{ .kind = @intFromEnum(HostServeKind.map_build), .val = v };
+        }
+        return null;
+    }
+    return null;
+}
+
+/// Replay a site-claimed host-serve kind. Any shape surprise returns null
+/// and the call falls back to the full dispatch path.
+pub fn hostMemberServeKind(
+    self: *VmHost,
+    allocator: Allocator,
+    kind: u32,
+    receiver: *const Value,
+    args: []const Value,
+) Allocator.Error!?Value {
+    if (receiver.* != .Instance) return null;
+    switch (kind) {
+        @intFromEnum(HostServeKind.map_put) => {
+            if (args.len != 2 or !persistent_map_mut.isBuilderClass(receiver.Instance)) return null;
+            return persistent_map_mut.tryPut(self, allocator, receiver.Instance, &args[0], &args[1]);
+        },
+        @intFromEnum(HostServeKind.map_build) => {
+            if (args.len != 0 or !persistent_map_mut.isBuilderClass(receiver.Instance)) return null;
+            return persistent_map_mut.tryBuild(self, allocator, receiver.Instance);
+        },
+        else => return null,
+    }
+}
+
 /// Replay a CallMember site memo's claimed target as a flat call. A stored
 /// same-named instance field outranks a cached top-level extension (and an
 /// invoke-convention callable can shadow), so the presence of one declines

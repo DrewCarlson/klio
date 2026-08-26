@@ -8893,6 +8893,20 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 if (route == 0) break :site;
                 const sig_now = host.memberSiteSig(arg_values) orelse break :site;
                 if (sig_now != @atomicLoad(u64, @constCast(&cm.site_sig), .monotonic)) break :site;
+                // Route bit0 = 1 carries a flat-call FuncId; bit0 = 0
+                // carries a host-serve kind (the CHAMP builder ops) that
+                // answers without any call machinery.
+                if (route & 1 == 0) {
+                    if (comptime @hasDecl(H, "hostMemberServeKind")) {
+                        if (try host.hostMemberServeKind(allocator, @intCast(route >> 1), &recv, arg_values)) |served| {
+                            dispatchBump(.member_site_flat);
+                            if (pushed_enclosing) popEnclosing();
+                            try frame.write(cm.dst, served);
+                            return .cont;
+                        }
+                    }
+                    break :site;
+                }
                 if (try host.prepareMemberFlatFromFid(allocator, &recv, name_str, arg_values, @enumFromInt(@as(u32, @intCast(route >> 1))))) |prep0| {
                     dispatchBump(.member_site_flat);
                     var prep = prep0;
@@ -8950,6 +8964,35 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 frame.flat_call = prep;
                 runtime.prof.opRoute(5);
                 return .flat_call;
+            }
+        }
+    }
+    // Host member serves (the CHAMP builder ops) answer here, ahead of the
+    // ladder entry, and claim the site memo with a host-kind route so later
+    // executions skip the flat-prepare decline walk entirely.
+    if (comptime @hasDecl(H, "hostMemberServeProbe")) {
+        if (recv == .Instance and argNamesAllNull(cm.arg_names)) {
+            if (try host.hostMemberServeProbe(allocator, &recv, name_str, arg_values)) |hit| {
+                if (comptime @hasDecl(H, "memberSiteSig")) {
+                    if (memberSiteEnabled() and dispatchCacheStable() and
+                        @atomicLoad(u64, @constCast(&cm.site_cls), .monotonic) == 0)
+                    {
+                        if (host.memberSiteSig(arg_values)) |sig| {
+                            const cls: u64 = blk: {
+                                const g = recv.Instance.borrow();
+                                defer g.deinit();
+                                break :blk @intCast(g.get().class.identity());
+                            };
+                            if (cls > 1 and @cmpxchgStrong(u64, @constCast(&cm.site_cls), 0, cls, .acq_rel, .monotonic) == null) {
+                                @atomicStore(u64, @constCast(&cm.site_sig), sig, .monotonic);
+                                @atomicStore(u64, @constCast(&cm.site_route), @as(u64, hit.kind) << 1, .release);
+                            }
+                        }
+                    }
+                }
+                if (pushed_enclosing) popEnclosing();
+                try frame.write(cm.dst, hit.val);
+                return .cont;
             }
         }
     }
