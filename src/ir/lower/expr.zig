@@ -6380,6 +6380,107 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
+    // An explicit-receiver call to a top-level inline EXTENSION whose last
+    // param is fn-typed, fed a lambda literal or a forwarded inline-lambda
+    // param (`record.withCurrent(block)`, `(firstStateRecord as
+    // StateMapStateRecord).writable(this, block)`) splices as kotlinc
+    // inlines it. The declared receiver may be a concrete head or a
+    // BOUNDED fn type param (`T : StateRecord`) the derived head extends;
+    // an unbounded `T` (the scope-function family) keeps its existing
+    // routes. A member of the head's own hierarchy outranks the extension
+    // and declines the splice; unknown heads decline.
+    if (!is_infix and callee.* == .Member and !callee.Member.safe and
+        ast_type_args.len == 0 and args.len >= 1 and
+        !std.mem.eql(u8, runtime.envOnce("KLIO_XLE") orelse "1", "0") and
+        !inline_call.argLambdaTargetsLabel(args, callee.Member.name.name))
+    ext_lambda: {
+        const mname = callee.Member.name.name;
+        const receiver = callee.Member.receiver;
+        const xlt = if (runtime.envOnce("KLIO_XLE_TRACE")) |w|
+            (std.mem.eql(u8, w, "*") or std.mem.eql(u8, w, mname))
+        else
+            false;
+        const last = &args[args.len - 1];
+        const last_forwarded = last.* == .Path and last.Path.segments.len == 1 and
+            b.inlineLambdaFor(last.Path.segments[0].name) != null;
+        if (last.* != .Lambda and last.* != .AnonFun and !last_forwarded) break :ext_lambda;
+        const cands = inline_state.candidatesForName(mname) orelse break :ext_lambda;
+        // DECLARED evidence only: an unsafe cast's target, a declared
+        // local/param type, a constructor call, or the enclosing
+        // extension's declared receiver for `this`. The general derivation
+        // chain resolves overloaded-call returns heuristically and once
+        // handed this tier `Iterable` for a Sequence expression — which
+        // spliced the EAGER `Iterable.filter` onto an infinite sequence.
+        const head0: []const u8 = blk: {
+            switch (receiver.*) {
+                .As => |a| {
+                    if (a.safe) break :ext_lambda;
+                    break :blk a.ty.name.name;
+                },
+                .This => |t| {
+                    if (t.qualifier != null) break :ext_lambda;
+                    break :blk b.recvTy() orelse break :ext_lambda;
+                },
+                else => {
+                    if (argDeclTypeRefLazy(b, receiver)) |ty| break :blk ty.name;
+                    break :ext_lambda;
+                },
+            }
+        };
+        const h = typeHead(std.mem.trimEnd(u8, head0, "?"));
+        if (b.module.registry.class_member_names.contains(mname)) {
+            const cid = b.module.classIdIndexed(h, b.self_package, callee.Member.name.span.file) orelse {
+                if (xlt) std.debug.print("[xle] {s}: head {s} unresolvable for shadow check\n", .{ mname, h });
+                break :ext_lambda;
+            };
+            if (b.module.classHierarchyDeclaresMember(cid, mname)) {
+                if (xlt) std.debug.print("[xle] {s}: member shadows on {s}\n", .{ mname, h });
+                break :ext_lambda;
+            }
+        }
+        var picked: ?*const ast.Function = null;
+        var ambiguous = false;
+        for (cands) |cf| {
+            if (inline_state.inlineMemberOwner(cf) != null) continue;
+            const rt = cf.receiver_type orelse continue;
+            if (cf.params.len != args.len) continue;
+            if (anyReified(cf.type_params)) continue;
+            if (anyCrossOrNoinlineParam(cf)) continue;
+            if (cf.params[cf.params.len - 1].ty.function == null) continue;
+            const rhead = typeHead(std.mem.trimEnd(u8, rt.name.name, "?"));
+            var head_ok = std.mem.eql(u8, rhead, h);
+            if (!head_ok) {
+                for (cf.type_params) |tp| {
+                    if (!std.mem.eql(u8, tp.name.name, rhead)) continue;
+                    const ub = tp.upper_bound orelse break;
+                    const ub_head = typeHead(std.mem.trimEnd(u8, ub.name.name, "?"));
+                    head_ok = b.module.classIsOrExtends(h, ub_head);
+                    break;
+                }
+            }
+            if (!head_ok) continue;
+            if (picked != null) {
+                ambiguous = true;
+                break;
+            }
+            picked = cf;
+        }
+        if (ambiguous) {
+            if (xlt) std.debug.print("[xle] {s}: ambiguous candidates\n", .{mname});
+            break :ext_lambda;
+        }
+        const cf = picked orelse {
+            if (xlt) std.debug.print("[xle] {s}: no applicable candidate (head {s})\n", .{ mname, h });
+            break :ext_lambda;
+        };
+        if (xlt) std.debug.print("[xle] {s}: splicing head={s} in {s}\n", .{ mname, h, build.currentRealFn() orelse "-" });
+        const expected0 = b.peekExpected();
+        const exp_ptr0: ?*const ast.TypeRef = if (expected0) |*_e| _e else null;
+        if (try inline_call.tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr0)) |r| {
+            return r;
+        }
+    }
+
     // `recv?.m(args)` — null-guard the whole call.
     if (callee.* == .Member and callee.Member.safe) {
         const receiver = callee.Member.receiver;
@@ -6880,7 +6981,11 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
     const args = call.args;
     const ast_arg_names = call.arg_names;
     const ast_type_args = call.type_args;
-    if (call.is_infix or callee.* != .Path or callee.Path.segments.len != 1) return null;
+    if (call.is_infix or callee.* != .Path) {
+        if (!call.is_infix and callee.* == .Member) return tryQualifiedInlineExpansion(b, expr);
+        return null;
+    }
+    if (callee.Path.segments.len != 1) return tryQualifiedInlineExpansion(b, expr);
     const nm = callee.Path.segments[0].name;
     if (b.inlineLambdaFor(nm)) |lam| {
         if (!plainFnParamRejectsTrailingLambda(b, nm, args)) {
@@ -6977,6 +7082,120 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
     }
     if (nlr_dbg) std.debug.print("[tbie] synchronized file={d} NO-TARGET-OR-DECLINED\n", .{callee.Path.segments[0].span.file.int()});
     return null;
+}
+
+/// Package-qualified inline expansion: `kotlin.synchronized(lock) { ... }`,
+/// `kotlinx.atomicfu.locks.synchronized(lock, block)`. Kotlin inlines an
+/// inline fun at every call spelling; the bare-path tier alone left
+/// package-qualified wrapper chains framed (the compose sync chain
+/// materialized a closure per block through three forwarding wrappers).
+/// Applies only when the WHOLE dotted prefix equals the candidate's
+/// declaring package, so a value/class/companion prefix never matches and
+/// those calls keep their existing routes.
+fn tryQualifiedInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg {
+    const call = expr.Call;
+    const callee = call.callee;
+    const args = call.args;
+    // Flatten the callee into a dotted name run: either a multi-segment
+    // Path, or a Member chain (`kotlin.synchronized(...)` parses as
+    // Member(receiver=Path(kotlin), name=synchronized)) whose links are
+    // all plain non-safe accesses over a Path head.
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(b.allocator);
+    {
+        var member_names: std.ArrayList([]const u8) = .empty;
+        defer member_names.deinit(b.allocator);
+        var cur = callee;
+        while (cur.* == .Member) {
+            if (cur.Member.safe) return null;
+            try member_names.append(b.allocator, cur.Member.name.name);
+            cur = cur.Member.receiver;
+        }
+        if (cur.* != .Path) return null;
+        for (cur.Path.segments) |seg| try names.append(b.allocator, seg.name);
+        var i = member_names.items.len;
+        while (i > 0) {
+            i -= 1;
+            try names.append(b.allocator, member_names.items[i]);
+        }
+    }
+    if (names.items.len < 2) return null;
+    const segs = names.items;
+    const nm = segs[segs.len - 1];
+    const qtrace = if (runtime.envOnce("KLIO_QIE_TRACE")) |w| std.mem.eql(u8, w, nm) else false;
+    // A resolvable head names a value chain, not a package path; a class
+    // head is a companion/static route.
+    if (b.resolve(segs[0]) != null) {
+        if (qtrace) std.debug.print("[qie] {s}: head resolves\n", .{nm});
+        return null;
+    }
+    const cands = inline_state.candidatesForName(nm) orelse {
+        if (qtrace) std.debug.print("[qie] {s}: no candidates\n", .{nm});
+        return null;
+    };
+    var pkg_buf: std.ArrayList(u8) = .empty;
+    defer pkg_buf.deinit(b.allocator);
+    for (segs[0 .. segs.len - 1], 0..) |seg, i| {
+        if (i != 0) try pkg_buf.append(b.allocator, '.');
+        try pkg_buf.appendSlice(b.allocator, seg);
+    }
+    const pkg = pkg_buf.items;
+    var picked: ?*const ast.Function = null;
+    for (cands) |f| {
+        if (f.receiver_type != null) continue;
+        if (inline_state.inlineMemberOwner(f) != null) continue;
+        const fpkg = b.module.packageOfFile(f.name.span.file) orelse {
+            if (qtrace) std.debug.print("[qie] {s}: cand file={d} no package\n", .{ nm, f.name.span.file.int() });
+            continue;
+        };
+        if (!std.mem.eql(u8, fpkg, pkg)) {
+            if (qtrace) std.debug.print("[qie] {s}: cand pkg={s} want={s}\n", .{ nm, fpkg, pkg });
+            continue;
+        }
+        if (!qualifiedInlineArityFits(f, args.len)) {
+            if (qtrace) std.debug.print("[qie] {s}: arity misfit\n", .{nm});
+            continue;
+        }
+        // Same-package overloads that both fit: the dynamic path ranks.
+        if (picked != null) return null;
+        picked = f;
+    }
+    const f = picked orelse {
+        if (qtrace) std.debug.print("[qie] {s}: no pick\n", .{nm});
+        return null;
+    };
+    if (!bareInlineNeedsSpliceT(b, nm, f, args, call.type_args.len != 0)) {
+        if (qtrace) std.debug.print("[qie] {s}: needs-splice false\n", .{nm});
+        return null;
+    }
+    if (qtrace) std.debug.print("[qie] {s}: splicing pkg={s}\n", .{ nm, pkg });
+    const expected = b.peekExpected();
+    const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
+    var selected = if (inline_state.inlineIdByAst(f)) |id|
+        try selectedCallArgsForBuilder(
+            b,
+            FuncId.from(id),
+            args,
+            call.arg_names,
+            exprSpan(callee),
+            call.has_trailing_lambda,
+        )
+    else
+        SelectedCallArgs{ .args = args, .names = call.arg_names };
+    defer selected.deinit(b.allocator);
+    return try tryInlineCallWithTypeArgs(b, nm, f, selected.args, selected.names, null, call.type_args, exp_ptr);
+}
+
+fn qualifiedInlineArityFits(f: *const ast.Function, want: usize) bool {
+    if (want > f.params.len) return false;
+    for (f.params) |*p| {
+        if (p.is_vararg) return false;
+    }
+    var i: usize = want;
+    while (i < f.params.len) : (i += 1) {
+        if (f.params[i].default == null) return false;
+    }
+    return true;
 }
 
 /// Whether any registered class's fqn ends in `.{name}` or `${name}` (a
@@ -9328,6 +9547,18 @@ fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Functio
         const own_host = hostClassOfCompanion(owner) orelse owner;
         break :blk b.module.classIsOrExtends(enc_host, own_host);
     };
+    if (runtime.envOnce("KLIO_EF_TRACE")) |efw| {
+        if (std.mem.eql(u8, efw, nm)) {
+            std.debug.print("[needs] {s} mismatch={} llp={} llp_unshadowed={} own={} encl={} resolve={} outer={} fits={} mil={} pin={}\n", .{
+                nm,                         recv_mismatch,
+                lambda_literal_plain,       llp_unshadowed,
+                b.hasOwnMember(nm),         b.hasEnclosingMember(nm),
+                b.resolve(nm) != null,      b.knowsOuter(nm),
+                llp_arity_fits,             member_inline_lambda,
+                plain_inline_nolambda,
+            });
+        }
+    }
     return !recv_mismatch and
         (f.is_suspend or argLambdaHasNonlocalReturn(args) or
             inline_call.argsForwardInlineLambda(b, args) or has_reified or shadowed_by_member or
@@ -14905,7 +15136,14 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
     };
     if (needs_this) {
         const this_reg_opt = try resolveThisForBareCall(b);
-        if (this_reg_opt) |this_reg| {
+        if (this_reg_opt) |this_reg0| {
+            const this_reg = blk: {
+                const c0 = call.callee;
+                if (c0.* == .Path and c0.Path.segments.len == 1) {
+                    break :blk subjectCorrectedBareThis(b, c0.Path.segments[0].name, this_reg0);
+                }
+                break :blk this_reg0;
+            };
             return emitExtBareCall(b, expr, func_id, this_reg, was_cast);
         }
         // No `this` in scope — fall through to the unmodified Call below.
@@ -15678,10 +15916,54 @@ fn spliceReifiedTypeArgs(b: *FuncBuilder, func_id: FuncId, argc: usize) Allocato
 /// gap / cast, the prepended static `Call`). With no `this` in scope the bind
 /// degrades to the static `Call` of `emitCall`.
 fn emitCallMember(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
-    if (try resolveThisForBareCall(b)) |this_reg| {
+    if (try resolveThisForBareCall(b)) |this_reg0| {
+        const this_reg = blk: {
+            const c0 = expr.Call.callee;
+            if (c0.* == .Path and c0.Path.segments.len == 1) {
+                break :blk subjectCorrectedBareThis(b, c0.Path.segments[0].name, this_reg0);
+            }
+            break :blk this_reg0;
+        };
         return emitExtBareCall(b, expr, func_id, this_reg, was_cast);
     }
     return emitCall(b, expr, func_id, was_cast);
+}
+
+/// The receiver a BARE call to member `name` actually dispatches on when
+/// spliced-subject binds shadow `this` (`with(rec) { writable { … } }`
+/// where `writable` is the enclosing class's member): the innermost
+/// subject whose class declares the member, else the receiver beneath
+/// the whole subject run. Anything unprovable keeps the supplied reg.
+fn subjectCorrectedBareThis(b: *FuncBuilder, name: []const u8, this_reg: Reg) Reg {
+    const sct = if (runtime.envOnce("KLIO_SCT_TRACE")) |w| std.mem.eql(u8, w, name) else false;
+    const sbs = b.subject_binds.items;
+    if (sbs.len == 0) return this_reg;
+    // Only correct when the ambient `this` IS the innermost subject —
+    // otherwise scope already resolved beneath the subjects.
+    if (sbs[sbs.len - 1].reg != this_reg) {
+        if (sct) std.debug.print("[sct] {s}: this r{d} != innermost subject r{d}\n", .{ name, this_reg.int(), sbs[sbs.len - 1].reg.int() });
+        return this_reg;
+    }
+    var i = sbs.len;
+    while (i > 0) {
+        i -= 1;
+        const h = sbs[i].head orelse {
+            if (sct) std.debug.print("[sct] {s}: subject {d} head unknown\n", .{ name, i });
+            return this_reg;
+        };
+        const cid = b.module.classIdIndexed(h, b.self_package, ir.FileId.from(0)) orelse
+            b.module.classId(h) orelse
+            {
+                if (sct) std.debug.print("[sct] {s}: head {s} unresolvable\n", .{ name, h });
+                return this_reg;
+            };
+        if (b.module.classHierarchyDeclaresMember(cid, name)) {
+            if (sct) std.debug.print("[sct] {s}: subject {d} ({s}) declares it\n", .{ name, i, h });
+            return sbs[i].reg;
+        }
+    }
+    if (sct) std.debug.print("[sct] {s}: -> beneath-subjects this {?}\n", .{ name, sbs[0].prior_this });
+    return sbs[0].prior_this orelse this_reg;
 }
 
 /// The `CallMemberOrGlobal` emit form: the bare name dispatches member-first on
@@ -16306,7 +16588,8 @@ fn lowerImplicitThisCall(
     // top-level function: defer to the global-resolution path instead of
     // emitting a `this.<member>` call that can't dispatch.
     if (!b.ownMemberApplicable(name0, args.len)) return null;
-    const this_reg = b.resolve("this") orelse return null;
+    const this_reg0 = b.resolve("this") orelse return null;
+    const this_reg = subjectCorrectedBareThis(b, name0, this_reg0);
 
     const member_lambda_shape: ?ir.ModuleRegistry.MemberTrailingLambdaShape = if (allNull(ast_arg_names) and lastArgIsLambda(args))
         predeclaredMemberTrailingLambdaShape(b, name0, args.len)

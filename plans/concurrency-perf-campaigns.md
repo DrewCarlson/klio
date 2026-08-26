@@ -959,6 +959,85 @@ run).
 
 ## Running log
 
+- 2026-08-26 EXT-LAMBDA TIER HEAD-EVIDENCE REGRESSION (caught by the
+  sweep, fixed): SequenceTest spun forever — the tier derived the
+  receiver head of `nats().withIndex()` through the general static
+  deriver, which resolved the OVERLOADED `withIndex` return
+  heuristically to `Iterable`, matched the EAGER inline
+  `Iterable.filter`, and spliced it onto an infinite Sequence (the
+  right target, Sequence.filter, is not inline so the tier never saw
+  it). The tier now accepts DECLARED evidence only: an unsafe cast's
+  target type, a declared local/param type, or the enclosing
+  extension's declared receiver for bare `this`. `KLIO_XLE=0` /
+  `KLIO_NRG=0` landed as bisect switches for the tier and the
+  recursion-guard visibility base. TRAP for perf tiers: a head from
+  overload-heuristic derivation is not resolution evidence — an
+  inline-only candidate index can pick an inapplicable eager overload
+  when the true target is not inline.
+- 2026-08-26 FRONT C ROUND 2 — ALL per-insert closure frames eliminated
+  (map replica census 3.62M -> 1.59M total frames, -56%; wall/rep 4.9 ->
+  3.7s, -25%; frames/insert ~5.3 = the Front C target). Four roots on
+  top of the qualified-inline splice:
+  (a) Explicit-receiver ext-inline-lambda tier (`record.withCurrent(
+  block)`, `(firstStateRecord as T).writable(this, block)`): a
+  top-level inline EXTENSION with a fn-typed last param fed a literal
+  or forwarded inline-lambda param now splices when the whole prefix
+  head derives (gateReceiverHead gained an `.As` arm — an unsafe cast
+  fixes the static type) and the declared receiver is a concrete head
+  or a BOUNDED type param the head extends; hierarchy-scoped member
+  shadow declines; ambiguity declines.
+  (b) SEATED subjects get the full window: a receiver-formed literal
+  invoked value-arity+1 (`block(current(this))`) now sets the splice
+  window head (from the span-keyed recorded receiver) and joins the
+  runtime tower, exactly like a supplied receiver — bare member reads
+  inside the seated body resolve against the record, not the enclosing
+  class (the `unresolved global map` failure).
+  (c) Subject-bind stack (`FuncBuilder.subject_binds` — with/apply/ext/
+  seat subjects with derived heads + the `this` beneath the run): a
+  bare MEMBER-inline splice and the own-private-member direct path
+  (`lowerImplicitThisCall`) now dispatch on the innermost receiver
+  whose class reaches the owner instead of the ambient (subject)
+  `this` — `with(rec) { writable { … } }` dispatched SnapshotStateMap's
+  writable ON THE RECORD before (pre-existing bug, exposed by the new
+  splices; xler2/xler3 repros pin it).
+  (d) The splice self-recursion guard (`inlineDeclInProgress`) no
+  longer blocks a same-fn call inside a spliced ARGUMENT literal
+  (caller code): `repeat { forEach { repeat { } } }` now splices all
+  the way (visibility base lifted around literal-content lowering;
+  the expand-depth cap bounds pathology). Plus: `contract { }` literals
+  are dead code to the consumption scan (repeat's action no longer
+  materializes).
+- 2026-08-26 READABLE RESIDUE CLOSED + QUALIFIED-INLINE SPLICE: two roots.
+  (a) Caller-attributed census (KLIO_CALL_STATS_CALLER=<substr> bumps
+  `<fqn>@<caller>[file:line]`; lambda keys carry the caller's cur_span =
+  the exact call site) named the 1.1/insert `readable` route in ONE run:
+  writableRecord's direct 3-arg call rides the CMG OVERLOAD leg
+  (callNamedOverload dispatches natively — no static-arm, no replay, no
+  serve). Fix: `hostRouteServe` now also runs at the recursive seam in
+  evalWithCapturesChained (owning/closure/chain/captures all empty), so a
+  routed target serves from EVERY dispatch path. Census 3.62M -> 3.30M
+  frames on the map replica; readable rows gone.
+  (b) Front C root: package-QUALIFIED calls to inline fns never spliced
+  (`tryBareInlineExpansion` required a single-segment bare Path; dotted
+  callees parse as Member chains). The compose sync chain (platform
+  synchronized -> kotlinx.atomicfu.locks.synchronized ->
+  kotlin.synchronized, each a qualified forward) therefore materialized a
+  closure + framed the block per sync region — 4 of the 6 residual
+  1/insert lambda bodies. `tryQualifiedInlineExpansion` flattens a
+  Path/Member dotted callee, requires the WHOLE prefix to equal the
+  candidate's declaring package (value/class/companion prefixes can never
+  match), requires a unique arity-fitting top-level non-receiver inline
+  candidate, then runs the normal splice. attemptUpdate now lowers to
+  __klioMonitorEnter + inline body + exit — zero closures. Map replica
+  census 3.30M -> 2.22M (-33%); lambda mass 6.7 -> ~3.0/insert.
+  Remaining 1/insert bodies, caller-named: withCurrent block (framed
+  top-level T.withCurrent @ Snapshot.kt:2529), writable block (framed
+  T.writable @ 2418), user repeat action (framed kotlin.repeat @
+  Standard.kt:163 — its contract literal mentions `action`, so the
+  consumption scan keeps the closure). Next: why the explicit-receiver
+  member-forwarded T.withCurrent/T.writable calls stay framed, and the
+  nested-literal clause in pocUses (blanket `.Lambda => true` — descend
+  and check the name instead).
 - 2026-08-26 READABLE-RESIDUE ROUTE HUNT (finding recorded, route not
   yet found): the 1.1/insert interpreted `readable` frame residue is
   NOT serve bails — KLIO_SNAPFAST_TRACE per-reason counters printed

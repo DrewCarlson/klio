@@ -1035,37 +1035,93 @@ fn serveOuterSlotRoute(recv: *const Value, name: []const u8, route: u64) ?Value 
 
 var call_stats: ?std.StringHashMap(u64) = null;
 fn callStatsBump(fqn: []const u8) void {
-    callStatsBumpId(fqn, 0);
+    callStatsBumpId(fqn, 0, null);
 }
 /// Census bump with the executing FuncId, so the anonymous-lambda mass
 /// (every lambda's fqn is the literal "<lambda>") decomposes into
 /// per-body counters under KLIO_CALL_STATS_LAMBDA — the id keys resolve
 /// back to bodies via `dump-ir --func`.
-fn callStatsBumpId(fqn: []const u8, fid: u32) void {
+fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
     if (call_stats_state == 0)
         call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
+    var key: []const u8 = fqn;
+    var buf: [160]u8 = undefined;
+    if (fid != 0 and std.mem.eql(u8, fqn, "<lambda>") and lambdaStatsOn()) {
+        key = blk: {
+            // Name the body by its declaration site so the census reads
+            // without a dump-ir id correlation step.
+            if (module) |m| {
+                if (@constCast(m).decl_span.get(fid)) |sp| {
+                    if (span.active_map) |am| {
+                        if (am.getChecked(sp.file)) |sf| {
+                            const lc = sf.lineCol(sp.start);
+                            const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |ix| sf.path[ix + 1 ..] else sf.path;
+                            break :blk std.fmt.bufPrint(&buf, "<lambda>#{d}[{s}:{d}]", .{ fid, base, lc.line }) catch fqn;
+                        }
+                    }
+                }
+            }
+            break :blk std.fmt.bufPrint(&buf, "<lambda>#{d}", .{fid}) catch fqn;
+        };
+    }
+    // KLIO_CALL_STATS_CALLER=<substr>: a matching fqn additionally bumps
+    // `<fqn>@<caller-fqn>`, attributing the frame to the interpreted frame
+    // live at activation. This names the dispatch context of census residue
+    // whose serve route is unknown.
+    var cbuf: [256]u8 = undefined;
+    var caller_key: ?[]const u8 = null;
+    if (callerStatsFilter()) |substr| {
+        if (std.mem.indexOf(u8, key, substr) != null) {
+            const cfqn: []const u8 = if (evtls.frame_chain) |fr| fr.func.fqn else "<top>";
+            // The caller's current span IS the call site — it names which
+            // literal/site invoked this body without any id correlation.
+            var site_buf: [64]u8 = undefined;
+            var site: []const u8 = "";
+            if (evtls.frame_chain) |fr| {
+                if (fr.cur_span) |sp| {
+                    if (span.active_map) |am| {
+                        if (am.getChecked(sp.file)) |sf| {
+                            const lc = sf.lineCol(sp.start);
+                            const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |ix| sf.path[ix + 1 ..] else sf.path;
+                            site = std.fmt.bufPrint(&site_buf, "[{s}:{d}]", .{ base, lc.line }) catch "";
+                        }
+                    }
+                }
+            }
+            caller_key = std.fmt.bufPrint(&cbuf, "{s}@{s}{s}", .{ key, cfqn, site }) catch null;
+        }
+    }
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
     if (call_stats == null) call_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
-    var key: []const u8 = fqn;
-    var buf: [48]u8 = undefined;
-    if (fid != 0 and std.mem.eql(u8, fqn, "<lambda>") and lambdaStatsOn()) {
-        const printed = std.fmt.bufPrint(&buf, "<lambda>#{d}", .{fid}) catch fqn;
-        key = printed;
-    }
+    callStatsBumpKeyLocked(key);
+    if (caller_key) |ck| callStatsBumpKeyLocked(ck);
+}
+
+/// Bump one census key with `call_stats_mutex` already held. The key may
+/// point at a stack buffer: the first insertion re-keys with an owned dupe.
+fn callStatsBumpKeyLocked(key: []const u8) void {
     const gop = call_stats.?.getOrPut(key) catch return;
     if (!gop.found_existing) {
-        if (key.ptr == &buf) {
-            const owned = std.heap.page_allocator.dupe(u8, key) catch return;
-            _ = call_stats.?.remove(key);
-            const gop2 = call_stats.?.getOrPut(owned) catch return;
-            gop2.value_ptr.* = 1;
-            return;
-        }
+        gop.key_ptr.* = std.heap.page_allocator.dupe(u8, key) catch key;
         gop.value_ptr.* = 0;
     }
     gop.value_ptr.* += 1;
+}
+
+fn callerStatsFilter() ?[]const u8 {
+    const S = struct {
+        var state: u8 = 0;
+        var val: []const u8 = "";
+    };
+    if (S.state == 0) {
+        if (runtime.envOnce("KLIO_CALL_STATS_CALLER")) |v| {
+            S.val = v;
+            S.state = 2;
+        } else S.state = 1;
+    }
+    return if (S.state == 2) S.val else null;
 }
 fn lambdaStatsOn() bool {
     const S = struct {
@@ -4248,7 +4304,25 @@ pub fn evalWithCapturesChained(
             return lr;
         }
     }
-    callStatsBumpId(func.fqn, func.id.int());
+    // Host-route serve at the same seam: a routed target (the snapshot walk
+    // family) reached through ANY dispatch path — overload ranking, value
+    // invocation, extension fallback — serves here without a frame. The
+    // static-call and CMG-replay intercepts cannot see a target the overload
+    // leg resolves natively (`readable` inside `writableRecord` rode that
+    // route at 1.1 frames per map insert). Args are already settled in param
+    // order, which is exactly the shape the serves take.
+    if (owning == null and closure_id == null and chain_seed.len == 0 and
+        captures.items.len == 0)
+    {
+        if (exec_call.hostRouteServe(H, func, args.items, host)) |served| {
+            var a = args;
+            a.deinit(allocator);
+            var c = captures;
+            c.deinit(allocator);
+            return ok(served);
+        }
+    }
+    callStatsBumpId(func.fqn, func.id.int(), module);
     const ev: *EvalTls = &evtls;
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);
