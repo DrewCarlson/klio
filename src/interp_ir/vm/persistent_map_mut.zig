@@ -80,6 +80,10 @@ pub fn isBuilderClass(inst: ObjRef(InstanceData)) bool {
     return classMatches(inst, &builder_class_hit, BUILDER_FQN);
 }
 
+pub fn isMapClass(inst: ObjRef(InstanceData)) bool {
+    return classMatches(inst, &map_class_hit, MAP_FQN);
+}
+
 /// Key shapes the host owns hashing AND equality for, at exactly
 /// kotlinc's semantics. Float/Double stay out (`equals` treats NaN as
 /// equal to itself and -0.0 as distinct from 0.0, unlike `==` which
@@ -453,6 +457,164 @@ fn mutableCollisionPut(ctx: *PutCtx, view: *const NodeView, key: *const Value, v
     return try mintNodeFromBuf(ctx, 0, 0, new_buf);
 }
 
+/// Builder minting template: the class cell plus the interned field
+/// names in declaration order, captured from a live builder in `tryPut`.
+/// A builder carrying any field outside the six known ones refuses
+/// capture, so `tryBuilder` can only ever mint the exact shape the
+/// interpreted constructor produces.
+const BuilderTmpl = struct {
+    gen: u32 = 0,
+    class: ?ObjRef(ClassDef) = null,
+    owner_class: ?ObjRef(ClassDef) = null,
+    count: u8 = 0,
+    names: [12][]const u8 = @splat(""),
+    /// 0 map, 1 ownership, 2 node, 3 operationResult, 4 modCount,
+    /// 5 size, 6 a null-initialized lazy view cache (`_keys`/`_values`
+    /// from AbstractMap plus their owner-mangled AbstractMutableMap
+    /// twins).
+    order: [12]u8 = @splat(0),
+};
+threadlocal var builder_tmpl: BuilderTmpl = .{};
+
+/// Whether a stored field name is one of the AbstractMap-family lazy
+/// view caches (`_keys`/`_values`, possibly behind an owner-qualified
+/// `<Owner>\x1f` prefix) whose constructor-initial value is null.
+fn isViewCacheName(name: []const u8) bool {
+    const last = if (std.mem.lastIndexOfScalar(u8, name, 0x1f)) |i| name[i + 1 ..] else name;
+    return std.mem.eql(u8, last, "_keys") or std.mem.eql(u8, last, "_values");
+}
+
+fn captureBuilderTemplate(inst: ObjRef(InstanceData), ownership: *const Value) void {
+    const gen = cacheGen();
+    if (builder_tmpl.gen == gen and builder_tmpl.class != null) return;
+    if (builder_tmpl.class) |c| c.deinit();
+    if (builder_tmpl.owner_class) |c| c.deinit();
+    builder_tmpl = .{};
+    const trace = runtime.envOnce("KLIO_MAPMUT_TRACE") != null;
+    const g = inst.borrow();
+    defer g.deinit();
+    const d = g.get();
+    if (trace) {
+        std.debug.print("[mapmut] builder fields ({d}):", .{d.fields.items.len});
+        for (d.fields.items) |f| std.debug.print(" {s}", .{f.name});
+        std.debug.print("\n", .{});
+    }
+    if (d.fields.items.len > 12) return;
+    var tmpl: BuilderTmpl = .{ .gen = gen, .count = @intCast(d.fields.items.len) };
+    var seen: u8 = 0;
+    for (d.fields.items, 0..) |f, i| {
+        tmpl.names[i] = f.name;
+        if (std.mem.eql(u8, f.name, "map")) {
+            tmpl.order[i] = 0;
+        } else if (std.mem.eql(u8, f.name, "ownership")) {
+            tmpl.order[i] = 1;
+        } else if (std.mem.eql(u8, f.name, "node")) {
+            tmpl.order[i] = 2;
+        } else if (std.mem.eql(u8, f.name, "operationResult")) {
+            tmpl.order[i] = 3;
+        } else if (std.mem.eql(u8, f.name, "modCount")) {
+            tmpl.order[i] = 4;
+        } else if (std.mem.eql(u8, f.name, "size")) {
+            tmpl.order[i] = 5;
+        } else if (isViewCacheName(f.name)) {
+            // Lazy view caches (AbstractMap's `_keys`/`_values` and their
+            // owner-qualified `AbstractMutableMap\x1f_keys` twins —
+            // owner-scoped storage names use the 0x1f separator):
+            // ctor-initial null.
+            tmpl.order[i] = 6;
+            continue;
+        } else {
+            if (trace) std.debug.print("[mapmut] capture bail unknown field {s} hex={x}\n", .{ f.name, f.name });
+            return;
+        }
+        seen |= @as(u8, 1) << @intCast(tmpl.order[i]);
+    }
+    // All six declared fields must be present, or the mint would build a
+    // shape the interpreted constructor never produces.
+    if (seen != 0b111111) {
+        if (trace) std.debug.print("[mapmut] capture bail seen={b}\n", .{seen});
+        return;
+    }
+    if (ownership.* != .Instance) {
+        if (trace) std.debug.print("[mapmut] capture bail owner not instance\n", .{});
+        return;
+    }
+    const og = ownership.Instance.borrow();
+    defer og.deinit();
+    if (og.get().fields.items.len != 0) {
+        if (trace) std.debug.print("[mapmut] capture bail owner fields={d}\n", .{og.get().fields.items.len});
+        return;
+    }
+    tmpl.class = d.class.clone();
+    tmpl.owner_class = og.get().class.clone();
+    builder_tmpl = tmpl;
+    if (trace) std.debug.print("[mapmut] capture OK count={d} gen={d}\n", .{ tmpl.count, tmpl.gen });
+}
+
+/// Serve `map.builder()`: mint the PersistentHashMapBuilder + a fresh
+/// MutabilityOwnership without the interpreted constructor chain. Bails
+/// until `tryPut` has captured the builder template from a live builder
+/// (the first cycle of a process runs interpreted).
+pub fn tryBuilder(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceData)) Allocator.Error!?Value {
+    if (!classMatches(map_inst, &map_class_hit, MAP_FQN)) return null;
+    if (builder_tmpl.gen != cacheGen() or builder_tmpl.class == null) {
+        if (runtime.envOnce("KLIO_MAPMUT_TRACE") != null) {
+            const S = struct {
+                threadlocal var once: bool = false;
+            };
+            if (!S.once) {
+                S.once = true;
+                std.debug.print("[mapmut] tryBuilder bail no-template gen={d} want={d} class={}\n", .{ builder_tmpl.gen, cacheGen(), builder_tmpl.class != null });
+            }
+        }
+        return null;
+    }
+    const t = &builder_tmpl;
+    const map_node: Value, const map_size: Value = blk: {
+        const g = map_inst.borrow();
+        defer g.deinit();
+        const node = g.get().getCached(&fn_node, "node") orelse return null;
+        const size = g.get().getCached(&fn_size, "size") orelse return null;
+        if (node != .Instance or size != .Int) return null;
+        break :blk .{ node, size };
+    };
+    const owner_inst = try ObjRef(InstanceData).init(a, .{
+        .class = t.owner_class.?.clone(),
+        .fields = .empty,
+        .outer = null,
+        .identity = host_instances.mintInstanceId(self),
+        .native_state = null,
+    });
+    const map_v: Value = .{ .Instance = map_inst };
+    var fields: std.ArrayList(InstanceData.Field) = .empty;
+    try fields.ensureTotalCapacity(a, t.count);
+    for (t.names[0..t.count], t.order[0..t.count]) |name, which| {
+        const v: Value = switch (which) {
+            0 => blk: {
+                if (runtime.reclaimEnabled()) map_v.retain();
+                break :blk map_v;
+            },
+            1 => .{ .Instance = owner_inst },
+            2 => blk: {
+                if (runtime.reclaimEnabled()) map_node.retain();
+                break :blk map_node;
+            },
+            3, 6 => Value.Null,
+            4 => Value.newInt(0),
+            else => map_size,
+        };
+        fields.appendAssumeCapacity(.{ .name = name, .value = v });
+    }
+    const inst = try ObjRef(InstanceData).init(a, .{
+        .class = t.class.?.clone(),
+        .fields = fields,
+        .outer = null,
+        .identity = host_instances.mintInstanceId(self),
+        .native_state = null,
+    });
+    return .{ .Instance = inst };
+}
+
 /// The builder's live fields for a put, in one borrow.
 const BuilderState = struct {
     node: Value,
@@ -482,6 +644,7 @@ pub fn tryPut(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData), key: *con
     const key_hash = Value.kotlinScalarHash(key) orelse return null;
     const st = readBuilder(inst) orelse return null;
     const tmpl = nodeTemplate(st.node.Instance) orelse return null;
+    captureBuilderTemplate(inst, &st.ownership);
     var ctx: PutCtx = .{ .a = a, .self = self, .owner = st.ownership, .tmpl = tmpl };
     const new_node = (try mutablePut(&ctx, st.node.Instance, key_hash, key, value, 0)) orelse return null;
     // Write-back: node, size (its setter bumps modCount), operationResult.

@@ -84,6 +84,11 @@ const Itest = struct {
     /// harness-optimized `zig-out/bin/klio-harness` and points the test at it
     /// via `KLIO_ITEST_BIN`.
     needs_exe: bool = false,
+    /// Point KLIO_ITEST_BIN at a ReleaseFast harness instead of the
+    /// ReleaseSafe default — the throughput-gate policy (measured
+    /// 1.18-1.20x on the compose suite). Correctness coverage keeps
+    /// ReleaseSafe everywhere else (sweeps, units, the other itests).
+    fast_exe: bool = false,
     /// Spends its runtime interpreting Kotlin programs (in-process through
     /// the parity pipeline, or via a spawned `klio` child), so the binary
     /// compiles with the harness optimize mode. Unit-style suites that lean
@@ -232,7 +237,7 @@ const itests_files = [_]Itest{
     // RestartTests, MovableContentTests, the snapshot suites) run through a
     // child `klio test` against the ENGINE pack with the `@Composable` lowering
     // plugin — THE compose conformance gate.
-    .{ .name = "compose_plugin_commontest", .needs_exe = true, .dirs = &.{
+    .{ .name = "compose_plugin_commontest", .needs_exe = true, .fast_exe = true, .dirs = &.{
         "kotlin-klio/klio-compose-runtime-engine",
         "kotlin-klio/klio-androidx-collection",
         "kotlin-klio/klio-kotlinx-coroutines",
@@ -657,6 +662,26 @@ pub fn build(b: *std.Build) void {
     const harness_exe_step = b.step("klio-harness", "Build+install the harness-optimized klio binary");
     harness_exe_step.dependOn(&b.addInstallArtifact(harness_exe, .{}).step);
 
+    // The throughput-gate harness: ReleaseFast, its own name so it can never
+    // shadow the ReleaseSafe binary the sweep scripts target. Only the gate
+    // suites marked `fast_exe` spawn it.
+    const fast_harness_exe = b.addExecutable(.{
+        .name = "klio-harness-fast",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "cli", .module = harness_mods.get("cli").? },
+                .{ .name = "runtime", .module = harness_mods.get("runtime").? },
+            },
+        }),
+    });
+    if (apple_sdk) |sdk| wireAppleSdk(b, fast_harness_exe.root_module, sdk);
+    if (android_ndk) |ndk| wireAndroidNdk(b, fast_harness_exe.root_module, ndk);
+    const fast_harness_step = b.step("klio-harness-fast", "Build+install the ReleaseFast gate harness");
+    fast_harness_step.dependOn(&b.addInstallArtifact(fast_harness_exe, .{}).step);
+
     // Static interpreter library for a mobile app host (iOS/Android). The app's
     // native launch code links this archive and calls the exported C `klio_run`
     // (src/mobile_lib.zig); there is no spawned klio executable on device. Only
@@ -761,9 +786,15 @@ pub fn build(b: *std.Build) void {
                 // served. These tests also bind sockets and mutate a scratch
                 // HOME — genuine side effects — so always re-run them.
                 if (spec.needs_exe) {
-                    const hinst = b.addInstallArtifact(harness_exe, .{});
-                    run_t.step.dependOn(&hinst.step);
-                    run_t.setEnvironmentVariable("KLIO_ITEST_BIN", b.fmt("zig-out/bin/{s}", .{harness_bin_name}));
+                    if (spec.fast_exe) {
+                        const finst = b.addInstallArtifact(fast_harness_exe, .{});
+                        run_t.step.dependOn(&finst.step);
+                        run_t.setEnvironmentVariable("KLIO_ITEST_BIN", "zig-out/bin/klio-harness-fast");
+                    } else {
+                        const hinst = b.addInstallArtifact(harness_exe, .{});
+                        run_t.step.dependOn(&hinst.step);
+                        run_t.setEnvironmentVariable("KLIO_ITEST_BIN", b.fmt("zig-out/bin/{s}", .{harness_bin_name}));
+                    }
                     run_t.has_side_effects = true;
                 }
                 if (spec.parity_data) {
@@ -771,9 +802,13 @@ pub fn build(b: *std.Build) void {
                     declareDataDirs(b, run_t, &data_memo, &kotlinx_pack_dirs);
                     // The parity harness caches one base snapshot per (load-mode,
                     // pack-mask) combination and never evicts, so the ceiling
-                    // rises as the in-repo pack set grows. Give the parity suites
-                    // headroom over the 6 GB default watchdog cap.
-                    run_t.setEnvironmentVariable("KLIO_RSS_CAP_KB", "6815744");
+                    // rises as the in-repo pack set grows. The concurrent
+                    // snapshot stress tests additionally churn arena memory in
+                    // proportion to interpreter THROUGHPUT — every host-serve
+                    // round that speeds the map/list write cycle raises the
+                    // per-test churn inside the same runTest window — so the
+                    // watchdog headroom tracks that, not a leak.
+                    run_t.setEnvironmentVariable("KLIO_RSS_CAP_KB", "10485760");
                     run_t.setEnvironmentVariable("KLIO_PARITY_BASE_IMAGES", base_images_path);
                     run_t.step.dependOn(&base_images_install.step);
                     run_t.addFileInput(base_images.path(b, "embedded-gate0.klio-image"));

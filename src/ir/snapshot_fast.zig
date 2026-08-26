@@ -32,6 +32,12 @@ pub const Route = enum(u8) {
     /// `current(r: T, snapshot: Snapshot)` — walk against the given
     /// snapshot, no observer semantics.
     current_with_snapshot = 7,
+    /// The `SnapshotState{Map,List,Set}.readable` getter: its whole body
+    /// is `(firstStateRecord as R).readable(this)`, so the serve is the
+    /// wrapper walk rooted at the receiver's stored `firstStateRecord`.
+    state_readable_getter = 8,
+    /// The `Snapshot.Companion.current` getter: `currentSnapshot()`.
+    current_getter = 9,
 };
 
 /// Classify a Func for host service, memoized by the caller into
@@ -46,6 +52,10 @@ pub fn classify(fqn: []const u8, n_params: usize, last_param_ty: []const u8) Rou
     }
     if (n_params == 1) {
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.snapshots.current")) return .current_record;
+        if (std.mem.eql(u8, fqn, "__get_SnapshotStateMap_readable") or
+            std.mem.eql(u8, fqn, "__get_SnapshotStateList_readable") or
+            std.mem.eql(u8, fqn, "__get_SnapshotStateSet_readable")) return .state_readable_getter;
+        if (std.mem.eql(u8, fqn, "__get_Snapshot$Companion$Companion_current")) return .current_getter;
         return .none;
     }
     if (n_params == 2) {
@@ -106,6 +116,30 @@ fn isGlobalSnapshotClass(v: *const Value) bool {
     if (!std.mem.eql(u8, cg.get().fqn, "androidx.compose.runtime.snapshots.GlobalSnapshot")) return false;
     global_snap_hit.store(id, .monotonic);
     return true;
+}
+
+/// KLIO_SNAPFAST_TRACE: per-reason bail counters for the wrapper-family
+/// serves, printed every 65536 bails so a dominant reason names itself
+/// without an exit hook.
+const BailReason = enum(u8) { not_global_class, observer, idset_shape, walk_null, record_shape, cur_snapshot };
+var bail_counts: [6]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
+var bail_trace_state = std.atomic.Value(u8).init(0);
+
+fn noteBail(reason: BailReason) void {
+    var st = bail_trace_state.load(.monotonic);
+    if (st == 0) {
+        st = if (runtime.envOnce("KLIO_SNAPFAST_TRACE") != null) 2 else 1;
+        bail_trace_state.store(st, .monotonic);
+    }
+    if (st != 2) return;
+    const n = bail_counts[@intFromEnum(reason)].fetchAdd(1, .monotonic) + 1;
+    if (n % 8192 == 0) {
+        std.debug.print("[snapfast] bails:", .{});
+        inline for (@typeInfo(BailReason).@"enum".fields, 0..) |f, i| {
+            std.debug.print(" {s}={d}", .{ f.name, bail_counts[i].load(.monotonic) });
+        }
+        std.debug.print("\n", .{});
+    }
 }
 
 const SnapFields = struct { id: i64, set: IdSet, read_observer_null: bool };
@@ -307,11 +341,26 @@ pub fn serveReadable(args: []const Value) ?Value {
 /// retry, and any other snapshot class runs the interpreted body.
 pub fn serveReadableState(args: []const Value, thread_snapshot: *const Value, global_snapshot: *const Value) ?Value {
     if (args.len != 2) return null;
-    const snap = currentSnapshotRaw(thread_snapshot, global_snapshot) orelse return null;
-    const f = globalSnapFields(&snap) orelse return null;
-    if (!f.read_observer_null) return null;
-    const candidate = readableWalk(&args[0], f.id, f.set) orelse return null;
-    if (candidate == .Null) return null;
+    const snap = currentSnapshotRaw(thread_snapshot, global_snapshot) orelse {
+        noteBail(.cur_snapshot);
+        return null;
+    };
+    const f = globalSnapFields(&snap) orelse {
+        noteBail(if (isGlobalSnapshotClass(&snap)) .idset_shape else .not_global_class);
+        return null;
+    };
+    if (!f.read_observer_null) {
+        noteBail(.observer);
+        return null;
+    }
+    const candidate = readableWalk(&args[0], f.id, f.set) orelse {
+        noteBail(.record_shape);
+        return null;
+    };
+    if (candidate == .Null) {
+        noteBail(.walk_null);
+        return null;
+    }
     candidate.retain();
     return candidate;
 }
@@ -325,6 +374,24 @@ pub fn serveCurrentRecord(args: []const Value, thread_snapshot: *const Value, gl
     if (candidate == .Null) return null;
     candidate.retain();
     return candidate;
+}
+
+var fn_first_record = std.atomic.Value(?[*]const u8).init(null);
+
+/// The `SnapshotState*.readable` getter: the wrapper walk rooted at the
+/// receiver's stored `firstStateRecord`. Same gates as
+/// `serveReadableState` (exact GlobalSnapshot, null observer, non-null
+/// walk); anything else runs the interpreted getter.
+pub fn serveStateReadableGetter(receiver: *const Value, thread_snapshot: *const Value, global_snapshot: *const Value) ?Value {
+    if (receiver.* != .Instance) return null;
+    const first: Value = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        break :blk g.get().getCached(&fn_first_record, "firstStateRecord") orelse return null;
+    };
+    if (first != .Instance) return null;
+    const wrapped: [2]Value = .{ first, receiver.* };
+    return serveReadableState(wrapped[0..2], thread_snapshot, global_snapshot);
 }
 
 /// `current(r, snapshot)` — walk against the given snapshot's window.
