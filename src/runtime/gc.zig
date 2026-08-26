@@ -726,6 +726,18 @@ pub var gc_debug: bool = false;
 /// free (an incomplete root/tracer), not a marking/sweep bug.
 pub var gc_nofree: bool = false;
 
+/// Diagnostics: called after marking, before the sweep (stop-the-world
+/// still in effect). Registered by a host-side checker.
+pub var audit_hook: ?*const fn (major: bool, epoch: usize) void = null;
+
+/// Audit view of a cell's sweep fate this collection: would the sweep
+/// keep it (marked or tenured-under-minor), or free it (white)?
+pub fn cellSweepFate(h: *const GcHeader, major: bool) enum { marked, tenured, white } {
+    if (h.gc_mark == cur_epoch) return .marked;
+    if (!major and h.gc_gen != 0) return .tenured;
+    return .white;
+}
+
 /// Diagnostic (KLIO_GC_POISON): on sweep, do NOT free a white cell. Instead
 /// quarantine it — leak the memory, overwrite the payload, and swap its tracer
 /// to `poisonTrap`. If a live value still references the cell, the NEXT
@@ -816,6 +828,10 @@ fn collectImpl(force_major: bool) void {
     remembered.clearRetainingCapacity();
     remembered_lock.unlock();
 
+    // Pre-sweep audit hook (diagnostics): a registered checker walks known
+    // live structures and reports reachable-but-unmarked cells before the
+    // sweep frees them, naming the broken edge instead of a later UAF.
+    if (audit_hook) |f| f(major, cur_epoch);
     const freed = if (major) sweepFull() else sweepMinor();
     // Reclaim closure side-table metadata for slots no live value marked this
     // epoch (still stop-the-world: the side-table is stable). Major only: a

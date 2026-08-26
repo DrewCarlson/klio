@@ -912,6 +912,95 @@ fn mapTrieValid(map_v: Value) bool {
     return validateTrie(node_v.Instance, 0);
 }
 
+// ==== Pre-sweep mark audit (KLIO_SSMPUT=8) ====
+// Commits register their record; the GC audit hook re-walks each
+// registered record's map trie after marking and reports any cell the
+// sweep would free — naming the broken edge before it becomes a UAF.
+var audit_lock: runtime.SpinMutex = .{};
+var audit_records: [16]?ObjRef(InstanceData) = @splat(null);
+var audit_next: usize = 0;
+
+fn auditRegisterRecord(rec: ObjRef(InstanceData)) void {
+    audit_lock.lock();
+    defer audit_lock.unlock();
+    for (audit_records) |e| {
+        if (e) |x| if (ObjRef(InstanceData).ptrEq(x, rec)) return;
+    }
+    audit_records[audit_next % audit_records.len] = rec;
+    audit_next += 1;
+    if (runtime.gc.audit_hook == null) runtime.gc.audit_hook = gcAudit;
+}
+
+fn auditFate(inst: ObjRef(InstanceData), major: bool) []const u8 {
+    return @tagName(runtime.gc.cellSweepFate(&inst.cell.hdr, major));
+}
+
+fn auditWalkNode(node: ObjRef(InstanceData), major: bool, depth: u32, parent: usize, parent_fate: []const u8) void {
+    if (depth > 8) return;
+    const fate = runtime.gc.cellSweepFate(&node.cell.hdr, major);
+    if (fate == .white) {
+        const ob: usize = blk: {
+            const g = node.borrow();
+            defer g.deinit();
+            const v = g.get().getCached(&fn_ownedby, "ownedBy") orelse break :blk 1;
+            break :blk if (v == .Instance) @intFromPtr(v.Instance.cell) else 0;
+        };
+        std.debug.print("[gc-audit] WHITE trie node {x} depth={d} ownedBy={x} parent={x}({s}) major={}\n", .{ @intFromPtr(node.cell), depth, ob, parent, parent_fate, major });
+        return;
+    }
+    if (depth == 0) {
+        const ob: usize = blk: {
+            const g = node.borrow();
+            defer g.deinit();
+            const v = g.get().getCached(&fn_ownedby, "ownedBy") orelse break :blk 1;
+            break :blk if (v == .Instance) @intFromPtr(v.Instance.cell) else 0;
+        };
+        std.debug.print("[gc-audit] root {x} ownedBy={x} fate={s}\n", .{ @intFromPtr(node.cell), ob, @tagName(fate) });
+    }
+    const null_owner: Value = .Null;
+    const view = NodeView.read(node, &null_owner) orelse return;
+    // The buffer cell's own fate.
+    var i: usize = 0;
+    const n = view.buffer.len();
+    while (i < n) : (i += 1) {
+        const v = view.buffer.get(i);
+        if (v == .Instance and classMatches(v.Instance, &node_class_hit, NODE_FQN)) {
+            auditWalkNode(v.Instance, major, depth + 1, @intFromPtr(node.cell), @tagName(fate));
+        }
+    }
+}
+
+fn gcAudit(major: bool, epoch: usize) void {
+    _ = epoch;
+    audit_lock.lock();
+    defer audit_lock.unlock();
+    for (audit_records) |e| {
+        const rec = e orelse continue;
+        const rec_fate = runtime.gc.cellSweepFate(&rec.cell.hdr, major);
+        if (rec_fate == .white) continue; // the record itself died (map gone) — fine
+        const g = rec.borrow();
+        const map_v = g.get().getCached(&fn_rec_map, "map") orelse {
+            g.deinit();
+            continue;
+        };
+        g.deinit();
+        if (map_v != .Instance) continue;
+        const map_fate = runtime.gc.cellSweepFate(&map_v.Instance.cell.hdr, major);
+        if (map_fate == .white) {
+            std.debug.print("[gc-audit] WHITE map {x} under {s} record {x} major={}\n", .{ @intFromPtr(map_v.Instance.cell), @tagName(rec_fate), @intFromPtr(rec.cell), major });
+            continue;
+        }
+        const node_v: Value = blk: {
+            const g2 = map_v.Instance.borrow();
+            defer g2.deinit();
+            break :blk g2.get().getCached(&fn_node, "node") orelse continue;
+        };
+        if (node_v != .Instance) continue;
+        std.debug.print("[gc-audit] rec {x}={s} map {x}={s} root {x}={s}\n", .{ @intFromPtr(rec.cell), @tagName(rec_fate), @intFromPtr(map_v.Instance.cell), @tagName(map_fate), @intFromPtr(node_v.Instance.cell), auditFate(node_v.Instance, major) });
+        auditWalkNode(node_v.Instance, major, 0, @intFromPtr(map_v.Instance.cell), @tagName(map_fate));
+    }
+}
+
 const RecordRead = struct { rec: ObjRef(InstanceData), map: Value, mod: i32 };
 
 /// The current-snapshot record of `map_inst` with its stored map and
@@ -1137,6 +1226,22 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
         _ = try concurrent.monitorExit(sync_key);
         if (committed) {
             ssmPhase("committed");
+            if (std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT") orelse "0", "8")) {
+                auditRegisterRecord(r2.rec);
+                const S8 = struct {
+                    var once: bool = false;
+                };
+                if (!S8.once) {
+                    S8.once = true;
+                    const g8 = r2.rec.borrow();
+                    defer g8.deinit();
+                    std.debug.print("[ssm-fields] record fields:", .{});
+                    for (g8.get().fields.items) |f| {
+                        std.debug.print(" <{f}>", .{std.zig.fmtString(f.name)});
+                    }
+                    std.debug.print("\n", .{});
+                }
+            }
             if (std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT") orelse "1", "5")) {
                 const root: usize = blk: {
                     const g2 = new_map.Instance.borrow();

@@ -990,6 +990,24 @@ run).
   and root-cause the reachability/initialization hole; then flip the
   serve default and Map _clear closes (its budget math already passes
   with the serve on).
+  SESSION-END FACTS (tooling landed): KLIO_GC_NOFREE=1 makes sv7 PASS
+  — a PREMATURE FREE is proven (the earlier "predates any sweep"
+  read was wrong; KLIO_GC_DEBUG only logs, never-free is
+  KLIO_GC_NOFREE). A pre-sweep mark AUDIT is landed
+  (gc.audit_hook + gc.cellSweepFate; KLIO_SSMPUT=8 registers committed
+  records and re-walks their tries after marking): it reports WHITE
+  (about-to-be-freed) depth-1 trie nodes with FRESH per-put ownedBy
+  instances under a TENURED root inside a MARKED record whose `map`
+  field reads TENURED (stale) — an age-inverted tenured-root ->
+  nursery-children shape the minor's stop-at-tenured rule cannot
+  reach. CHECK FIRST next session: (a) whether the record carries
+  owner-qualified twin `map` fields (StateMapStateRecord\x1fmap) so
+  getCached/define and the interpreted accessors use DIFFERENT slots
+  (the audit read a tenured "map" seconds after a nursery commit);
+  (b) the audit registry keeps records from finished rounds — filter
+  to the live round before trusting WHITE reports; (c) who mutates a
+  committed root in place across puts (each WHITE child carries a
+  different ownership instance = one child per builder generation).
 - 2026-08-26 EXT-LAMBDA TIER HEAD-EVIDENCE REGRESSION (caught by the
   sweep, fixed): SequenceTest spun forever — the tier derived the
   receiver head of `nats().withIndex()` through the general static
