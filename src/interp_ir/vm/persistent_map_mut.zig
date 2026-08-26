@@ -917,17 +917,34 @@ fn mapTrieValid(map_v: Value) bool {
 // registered record's map trie after marking and reports any cell the
 // sweep would free — naming the broken edge before it becomes a UAF.
 var audit_lock: runtime.SpinMutex = .{};
-var audit_records: [16]?ObjRef(InstanceData) = @splat(null);
+var audit_records: [64]?ObjRef(InstanceData) = @splat(null);
 var audit_next: usize = 0;
 
-fn auditRegisterRecord(rec: ObjRef(InstanceData)) void {
-    audit_lock.lock();
-    defer audit_lock.unlock();
+fn auditRegisterOne(rec: ObjRef(InstanceData)) void {
     for (audit_records) |e| {
         if (e) |x| if (ObjRef(InstanceData).ptrEq(x, rec)) return;
     }
     audit_records[audit_next % audit_records.len] = rec;
     audit_next += 1;
+}
+
+fn auditRegisterRecord(rec: ObjRef(InstanceData)) void {
+    audit_lock.lock();
+    defer audit_lock.unlock();
+    // The whole record chain: commits and reads may target different
+    // records (readable walk vs the chain head).
+    var cur: ?ObjRef(InstanceData) = rec;
+    var hops: u32 = 0;
+    while (cur) |c| : (hops += 1) {
+        if (hops > 8) break;
+        auditRegisterOne(c);
+        const g = c.borrow();
+        const nv = g.get().get("next");
+        g.deinit();
+        const n = nv orelse break;
+        if (n != .Instance) break;
+        cur = n.Instance;
+    }
     if (runtime.gc.audit_hook == null) runtime.gc.audit_hook = gcAudit;
 }
 
@@ -990,6 +1007,11 @@ fn gcAudit(major: bool, epoch: usize) void {
             std.debug.print("[gc-audit] WHITE map {x} under {s} record {x} major={}\n", .{ @intFromPtr(map_v.Instance.cell), @tagName(rec_fate), @intFromPtr(rec.cell), major });
             continue;
         }
+        // A tenured map under a registered record is a STALE entry (a
+        // finished round, or commits moved to another record in the
+        // chain): its unreferenced children are legitimately white.
+        // Audit only records whose map is CURRENT (marked this epoch).
+        if (map_fate == .tenured and !major) continue;
         const node_v: Value = blk: {
             const g2 = map_v.Instance.borrow();
             defer g2.deinit();
