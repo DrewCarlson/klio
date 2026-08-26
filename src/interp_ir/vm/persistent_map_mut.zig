@@ -1316,6 +1316,10 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
         if (committed) {
             ssmPhase("committed");
             if (std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT") orelse "0", "8")) {
+                const c8n = audit_commits.load(.monotonic);
+                if (c8n % 100 == 0) {
+                    std.debug.print("[ssm-id] commit#{d} snap_id={d} rec={x}\n", .{ c8n, gate2.id, @intFromPtr(r2.rec.cell) });
+                }
                 _ = audit_commits.fetchAdd(1, .monotonic);
                 auditRegisterRecord(r2.rec);
                 const S8 = struct {
