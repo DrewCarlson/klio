@@ -885,6 +885,21 @@ in-process interaction still to isolate.
 
 ## Running log
 
+- 2026-08-26 CURRENTSNAPSHOT NATIVE SERVE + THE ROUTE-CONTENTION TRAP:
+  snapshot_fast serves `currentSnapshot()` natively (the ThreadMap
+  binary search over the interpreted objects, same thread-id source as
+  the intrinsic, globals memoized behind the dispatch-cache
+  generation). Route-dependent outcome measured on the concurrent map
+  test: the execArmCall serve is −0.7s (kept; median ~30.7s vs the 30s
+  budget); the SAME serve on the leaf-serve entries was +10s under
+  8-thread contention while −30% single-threaded, and a getter-route
+  serve was neutral — both removed. Working theory for the divergence:
+  the shared GlobalSnapshot's refcount line is RMW-contended and the
+  leaf propagation pays extra retain/release pairs per read. PINNED:
+  refcount elision / borrow-free reads for program-lifetime singletons
+  (fetchAdd+fetchSub+borrow ≈ 5-7% of the map profile) — the likely
+  unlock for both remaining tests. Never adopt a host serve from a
+  solo micro; measure the contended test per route.
 - 2026-08-25 DEAD FORWARDED-LITERAL ELISION + WALL RECORD 394s: the
   pinned pass landed same-day — `finish()` nops a materialized
   forwarded-literal AstLambda when no instruction or terminator reads
