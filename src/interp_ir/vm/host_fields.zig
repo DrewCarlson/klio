@@ -2796,6 +2796,48 @@ fn importOwnedExtProp(self: *VmHost, map: anytype, recv_key: []const u8, name: [
     return null;
 }
 
+/// Whether the exec-arm fast serve for the builtin `indices`/`lastIndex`
+/// extension properties is sound for this program: false as soon as ANY
+/// loaded declaration outside the known stdlib packages defines an
+/// extension property with either name — Kotlin scoping can then pick
+/// the user's shadow, which a receiver-shape serve cannot see. Computed
+/// once per dispatch-cache generation over the extension-prop tables
+/// (name-global, so it over-declines rather than ever mis-serving).
+var index_props_verdict = std.atomic.Value(u64).init(0);
+pub fn builtinIndexPropsServable(self: *VmHost) bool {
+    const gen: u64 = host_call_member.dispatch_cache_gen.load(.monotonic);
+    const packed_v = index_props_verdict.load(.acquire);
+    if (packed_v >> 32 == gen) return (packed_v & 1) == 1;
+    var shadowed = false;
+    {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        const p = pg.get();
+        if (p.owner_keyed_ext_names.contains("indices") or p.owner_keyed_ext_names.contains("lastIndex") or
+            p.nullable_ext_props.contains("indices") or p.nullable_ext_props.contains("lastIndex"))
+        {
+            shadowed = true;
+        } else {
+            const mptr: *const Module = self.module.asPtr();
+            var it = p.extension_props.iterator();
+            while (it.next()) |e| {
+                const b = e.key_ptr.b;
+                if (!std.mem.eql(u8, b, "indices") and !std.mem.eql(u8, b, "lastIndex")) continue;
+                const f = mptr.funcById(e.value_ptr.*) orelse {
+                    shadowed = true;
+                    break;
+                };
+                if (!stdlib.isKnownPackage(f.package)) {
+                    shadowed = true;
+                    break;
+                }
+            }
+        }
+    }
+    index_props_verdict.store((gen << 32) | @as(u64, if (shadowed) 0 else 1), .release);
+    return !shadowed;
+}
+
 fn resolveExtensionPropImpl(
     self: *VmHost,
     allocator: Allocator,
@@ -4687,6 +4729,15 @@ fn collectionLen(receiver: *const Value) ?i64 {
     return switch (receiver.*) {
         .Array => |a| @intCast(a.len()),
         .List => |l| @intCast(listLen(l.items)),
+        // `Collection<*>.indices` / `lastIndex` apply to sets too; without
+        // this arm `setOf(1).indices` was a runtime dispatch error. Views
+        // (`backing != null`) keep falling through — their length belongs
+        // to the view machinery.
+        .Set => |st| if (st.backing == null) blk: {
+            const g = st.items.borrow();
+            defer g.deinit();
+            break :blk @intCast(g.get().items.len);
+        } else null,
         .String => |s| blk: {
             const g = s.borrow();
             defer g.deinit();

@@ -132,7 +132,7 @@ inline fn hostStaticServe(comptime H: type, allocator: Allocator, frame: *Frame,
     const cf = frame.module.funcById(call.func) orelse return null;
     if (cf.host_route == 0) {
         const route: snapshot_fast.Route = blk: {
-            if (cf.params.len != 3 and cf.params.len != 0) break :blk .none;
+            if (cf.params.len > 3) break :blk .none;
             const last_ty: []const u8 = if (cf.params.len == 0) "" else cf.params[cf.params.len - 1].ty.name;
             break :blk snapshot_fast.classify(cf.fqn, cf.params.len, last_ty);
         };
@@ -140,22 +140,39 @@ inline fn hostStaticServe(comptime H: type, allocator: Allocator, frame: *Frame,
     }
     if (cf.host_route <= @intFromEnum(snapshot_fast.Route.none)) return null;
     if (call.type_args.len != 0 or !argNamesAllNull(call.arg_names)) return null;
+    var args: [3]Value = undefined;
+    if (call.n_args > 3) return null;
+    for (0..call.n_args) |i| args[i] = frame.read(ir.Reg.from(call.args.int() + @as(u32, @intCast(i))));
     switch (@as(snapshot_fast.Route, @enumFromInt(cf.host_route))) {
-        .readable, .valid => {
+        .readable => {
             if (call.n_args != 3) return null;
-            var args: [3]Value = undefined;
-            for (0..3) |i| args[i] = frame.read(ir.Reg.from(call.args.int() + @as(u32, @intCast(i))));
-            return switch (@as(snapshot_fast.Route, @enumFromInt(cf.host_route))) {
-                .readable => snapshot_fast.serveReadable(args[0..]),
-                .valid => snapshot_fast.serveValid(args[0..]),
-                else => unreachable,
-            };
+            return snapshot_fast.serveReadable(args[0..3]);
+        },
+        .valid => {
+            if (call.n_args != 3) return null;
+            return snapshot_fast.serveValid(args[0..3]);
         },
         .current_snapshot => {
             if (call.n_args != 0) return null;
             if (comptime !@hasDecl(H, "composeSnapshotGlobals")) return null;
             const g = host.composeSnapshotGlobals() orelse return null;
             return snapshot_fast.serveCurrentSnapshot(&g.ts, &g.gs);
+        },
+        .readable_state => {
+            if (call.n_args != 2) return null;
+            if (comptime !@hasDecl(H, "composeSnapshotGlobals")) return null;
+            const g = host.composeSnapshotGlobals() orelse return null;
+            return snapshot_fast.serveReadableState(args[0..2], &g.ts, &g.gs);
+        },
+        .current_record => {
+            if (call.n_args != 1) return null;
+            if (comptime !@hasDecl(H, "composeSnapshotGlobals")) return null;
+            const g = host.composeSnapshotGlobals() orelse return null;
+            return snapshot_fast.serveCurrentRecord(args[0..1], &g.ts, &g.gs);
+        },
+        .current_with_snapshot => {
+            if (call.n_args != 2) return null;
+            return snapshot_fast.serveCurrentWithSnapshot(args[0..2]);
         },
         else => return null,
     }

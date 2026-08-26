@@ -17,15 +17,42 @@ const std = @import("std");
 const runtime = @import("runtime");
 const Value = runtime.Value;
 
-pub const Route = enum(u8) { unknown = 0, none = 1, readable = 2, valid = 3, current_snapshot = 4 };
+pub const Route = enum(u8) {
+    unknown = 0,
+    none = 1,
+    readable = 2,
+    valid = 3,
+    current_snapshot = 4,
+    /// `T.readable(state: StateObject)` — the public wrapper: current
+    /// snapshot, observer notification (served only when there is none),
+    /// then the walk.
+    readable_state = 5,
+    /// `current(r: T)` — current snapshot + walk, no observer semantics.
+    current_record = 6,
+    /// `current(r: T, snapshot: Snapshot)` — walk against the given
+    /// snapshot, no observer semantics.
+    current_with_snapshot = 7,
+};
 
 /// Classify a Func for host service, memoized by the caller into
 /// `Func.host_route`. The walk pair is matched by fqn + the 3-arg shape
 /// whose last parameter is a SnapshotIdSet (excludes the same-named
-/// record extensions); `currentSnapshot` by fqn + zero params.
+/// record extensions); `currentSnapshot` by fqn + zero params; the
+/// wrapper family by fqn + arity + last-parameter head.
 pub fn classify(fqn: []const u8, n_params: usize, last_param_ty: []const u8) Route {
     if (n_params == 0) {
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.snapshots.currentSnapshot")) return .current_snapshot;
+        return .none;
+    }
+    if (n_params == 1) {
+        if (std.mem.eql(u8, fqn, "androidx.compose.runtime.snapshots.current")) return .current_record;
+        return .none;
+    }
+    if (n_params == 2) {
+        if (std.mem.eql(u8, fqn, "androidx.compose.runtime.snapshots.readable") and
+            std.mem.endsWith(u8, last_param_ty, "StateObject")) return .readable_state;
+        if (std.mem.eql(u8, fqn, "androidx.compose.runtime.snapshots.current") and
+            std.mem.endsWith(u8, last_param_ty, "Snapshot")) return .current_with_snapshot;
         return .none;
     }
     if (n_params != 3) return .none;
@@ -57,6 +84,47 @@ var fn_lower = std.atomic.Value(?[*]const u8).init(null);
 var fn_bound = std.atomic.Value(?[*]const u8).init(null);
 var fn_sid = std.atomic.Value(?[*]const u8).init(null);
 var fn_next = std.atomic.Value(?[*]const u8).init(null);
+var fn_invalid = std.atomic.Value(?[*]const u8).init(null);
+var fn_readobs = std.atomic.Value(?[*]const u8).init(null);
+
+/// Class identity of `GlobalSnapshot`, the one snapshot class whose
+/// `snapshotId` / `invalid` / `readObserver` are known plain stored
+/// fields. Subclasses like `TransparentObserverMutableSnapshot` override
+/// these as computed delegating accessors while the base ctor's stored
+/// slots go stale, so a stored-field read is only sound behind this
+/// exact-class gate.
+var global_snap_hit = std.atomic.Value(usize).init(0);
+
+fn isGlobalSnapshotClass(v: *const Value) bool {
+    if (v.* != .Instance) return false;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    const id = g.get().class.identity();
+    if (global_snap_hit.load(.monotonic) == id) return true;
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    if (!std.mem.eql(u8, cg.get().fqn, "androidx.compose.runtime.snapshots.GlobalSnapshot")) return false;
+    global_snap_hit.store(id, .monotonic);
+    return true;
+}
+
+const SnapFields = struct { id: i64, set: IdSet, read_observer_null: bool };
+
+/// The stored `snapshotId` / `invalid` / `readObserver` of a
+/// GlobalSnapshot instance; null on any shape surprise or when the
+/// receiver is not exactly that class.
+fn globalSnapFields(snap: *const Value) ?SnapFields {
+    if (!isGlobalSnapshotClass(snap)) return null;
+    const g = snap.Instance.borrow();
+    defer g.deinit();
+    const inst = g.get();
+    const idv = inst.getCached(&fn_sid, "snapshotId") orelse return null;
+    const id = asI64(&idv) orelse return null;
+    const invalid = inst.getCached(&fn_invalid, "invalid") orelse return null;
+    const s = readIdSet(&invalid) orelse return null;
+    const obs = inst.getCached(&fn_readobs, "readObserver") orelse return null;
+    return .{ .id = id, .set = s, .read_observer_null = obs == .Null };
+}
 
 /// Read the three scalar fields of a SnapshotIdSet; null when the shape
 /// is not the expected one or the overflow array is present.
@@ -124,6 +192,15 @@ pub fn serveValid(args: []const Value) ?Value {
 /// unexpected shape bails to the interpreted body. The returned snapshot
 /// is retained.
 pub fn serveCurrentSnapshot(thread_snapshot: *const Value, global_snapshot: *const Value) ?Value {
+    const result = currentSnapshotRaw(thread_snapshot, global_snapshot) orelse return null;
+    result.retain();
+    return result;
+}
+
+/// `serveCurrentSnapshot` without the retain: for internal use by serves
+/// that only read fields off the result while the caller's globals keep
+/// it rooted.
+fn currentSnapshotRaw(thread_snapshot: *const Value, global_snapshot: *const Value) ?Value {
     const tid: i64 = @bitCast(@as(u64, std.Thread.getCurrentId()));
     if (tid == -1) return null;
     if (thread_snapshot.* != .Instance) return null;
@@ -180,19 +257,15 @@ pub fn serveCurrentSnapshot(thread_snapshot: *const Value, global_snapshot: *con
     } else if (tm != .Null) {
         return null;
     }
-    const result: Value = if (found != .Null and found != .Unit) found else global_snapshot.*;
-    result.retain();
-    return result;
+    return if (found != .Null and found != .Unit) found else global_snapshot.*;
 }
 
-/// `readable(r, id, invalid)` — the record-chain walk. Returns the
-/// valid record with the highest snapshotId, or Null.
-pub fn serveReadable(args: []const Value) ?Value {
-    if (args.len != 3) return null;
-    if (args[0] != .Instance) return null;
-    const id = asI64(&args[1]) orelse return null;
-    const s = readIdSet(&args[2]) orelse return null;
-    var current: Value = args[0];
+/// The record-chain walk shared by every readable/current serve: the
+/// valid record with the highest snapshotId, `.Null` when none, and
+/// null on a shape surprise (fall back to the interpreter).
+fn readableWalk(first: *const Value, id: i64, s: IdSet) ?Value {
+    if (first.* != .Instance) return null;
+    var current: Value = first.*;
     var candidate: Value = .Null;
     var cand_sid: i64 = std.math.minInt(i64);
     while (current == .Instance) {
@@ -213,6 +286,53 @@ pub fn serveReadable(args: []const Value) ?Value {
         }
         current = next;
     }
+    return candidate;
+}
+
+/// `readable(r, id, invalid)` — the private record-chain walk. Returns
+/// the valid record with the highest snapshotId, or Null.
+pub fn serveReadable(args: []const Value) ?Value {
+    if (args.len != 3) return null;
+    const id = asI64(&args[1]) orelse return null;
+    const s = readIdSet(&args[2]) orelse return null;
+    const candidate = readableWalk(&args[0], id, s) orelse return null;
+    candidate.retain();
+    return candidate;
+}
+
+/// `T.readable(state)` — the public wrapper: current snapshot, observer
+/// notification, walk. Served only when the current snapshot is exactly
+/// the GlobalSnapshot with a null readObserver (nothing to notify) and
+/// the walk finds a record; a null walk must run the interpreted sync
+/// retry, and any other snapshot class runs the interpreted body.
+pub fn serveReadableState(args: []const Value, thread_snapshot: *const Value, global_snapshot: *const Value) ?Value {
+    if (args.len != 2) return null;
+    const snap = currentSnapshotRaw(thread_snapshot, global_snapshot) orelse return null;
+    const f = globalSnapFields(&snap) orelse return null;
+    if (!f.read_observer_null) return null;
+    const candidate = readableWalk(&args[0], f.id, f.set) orelse return null;
+    if (candidate == .Null) return null;
+    candidate.retain();
+    return candidate;
+}
+
+/// `current(r)` — current snapshot + walk, no observer semantics.
+pub fn serveCurrentRecord(args: []const Value, thread_snapshot: *const Value, global_snapshot: *const Value) ?Value {
+    if (args.len != 1) return null;
+    const snap = currentSnapshotRaw(thread_snapshot, global_snapshot) orelse return null;
+    const f = globalSnapFields(&snap) orelse return null;
+    const candidate = readableWalk(&args[0], f.id, f.set) orelse return null;
+    if (candidate == .Null) return null;
+    candidate.retain();
+    return candidate;
+}
+
+/// `current(r, snapshot)` — walk against the given snapshot's window.
+pub fn serveCurrentWithSnapshot(args: []const Value) ?Value {
+    if (args.len != 2) return null;
+    const f = globalSnapFields(&args[1]) orelse return null;
+    const candidate = readableWalk(&args[0], f.id, f.set) orelse return null;
+    if (candidate == .Null) return null;
     candidate.retain();
     return candidate;
 }

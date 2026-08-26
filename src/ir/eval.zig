@@ -3675,7 +3675,7 @@ fn leafRunOne(
                     .String => |s| s,
                     else => return error.LeafAbandon,
                 };
-                if (builtinFieldFast(&recv, fname)) |bv| {
+                if (try builtinFieldFast(H, host, allocator, &recv, fname)) |bv| {
                     if (!leafWrite(allocator, regs, gf.dst, bv, reclaim, false, wmask)) return error.LeafAbandon;
                     return;
                 }
@@ -3808,7 +3808,36 @@ fn leafTraceWant(func: *const Func) bool {
 /// shadow and that the field ladder reaches only after some sixty name
 /// comparisons. Array length reads dominate the slow-ladder field census on a
 /// composition workload, so answer them without entering the ladder.
-fn builtinFieldFast(recv: *const Value, name: []const u8) ?Value {
+fn builtinFieldFast(comptime H: type, host: *H, allocator: Allocator, recv: *const Value, name: []const u8) Allocator.Error!?Value {
+    // `indices` / `lastIndex` over any host container with a direct
+    // length: the same answers the host field arm computes, minus the
+    // ladder. The map CAS loop's `fastForEach` read `List.indices`
+    // through the slow ladder 220k times in one run. Both names are
+    // SHADOWABLE stdlib extension properties, so the serve is gated on
+    // the host's program-wide verdict that no user declaration shadows
+    // them (a user `List.indices` must win through the ladder).
+    if (std.mem.eql(u8, name, "indices") or std.mem.eql(u8, name, "lastIndex")) {
+        const servable = if (comptime @hasDecl(H, "builtinIndexPropsServable")) host.builtinIndexPropsServable() else false;
+        if (!servable) return null;
+        const len: ?i64 = switch (recv.*) {
+            .Array => |a| @intCast(a.len()),
+            .List => |l| if (l.backing == null) blk: {
+                const g = l.items.borrow();
+                defer g.deinit();
+                break :blk @intCast(g.get().items.len);
+            } else null,
+            .Set => |st| if (st.backing == null) blk: {
+                const g = st.items.borrow();
+                defer g.deinit();
+                break :blk @intCast(g.get().items.len);
+            } else null,
+            else => null,
+        };
+        if (len) |n| {
+            if (name.len == 9) return Value.newInt(@intCast(n - 1));
+            return try Value.newRange(allocator, .{ .start = 0, .end = n - 1, .step = 1, .kind = .Int });
+        }
+    }
     switch (recv.*) {
         .Array => |a| if (std.mem.eql(u8, name, "size")) {
             return Value.newInt(@intCast(a.len()));
@@ -8271,7 +8300,7 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
     }
     const name = constStr(frame.module, gf.field) orelse
         return raiseStep(frame, .{ .Type = "GetField: name not a string const" });
-    if (builtinFieldFast(&recv, name)) |bv| {
+    if (try builtinFieldFast(H, host, allocator, &recv, name)) |bv| {
         try frame.write(gf.dst, bv);
         return .cont;
     }
