@@ -125,57 +125,66 @@ fn isBoundRefInstance(v: *const Value) bool {
 /// flat park to bound the C stack.
 const snapshot_fast = @import("snapshot_fast.zig");
 
-/// Host-served static fns (the snapshot validity walk): classify once
-/// per Func, serve without any call machinery on a hit.
-inline fn hostStaticServe(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H) Allocator.Error!?Value {
-    _ = allocator;
-    const cf = frame.module.funcById(call.func) orelse return null;
-    if (cf.host_route == 0) {
+/// Classify `f` for host service (memoized on `Func.host_route`) and
+/// serve `args` on a routed hit. The shared core behind the static-call
+/// arm and the CMG global-replay arm — any dispatch path that has
+/// resolved a plain global target and its positional arguments can
+/// consult it.
+pub fn hostRouteServe(comptime H: type, f: *const ir.Func, args: []const Value, host: *H) ?Value {
+    if (f.host_route == 0) {
         const route: snapshot_fast.Route = blk: {
-            if (cf.params.len > 3) break :blk .none;
-            const last_ty: []const u8 = if (cf.params.len == 0) "" else cf.params[cf.params.len - 1].ty.name;
-            break :blk snapshot_fast.classify(cf.fqn, cf.params.len, last_ty);
+            if (f.params.len > 3) break :blk .none;
+            const last_ty: []const u8 = if (f.params.len == 0) "" else f.params[f.params.len - 1].ty.name;
+            break :blk snapshot_fast.classify(f.fqn, f.params.len, last_ty);
         };
-        @constCast(cf).host_route = @intFromEnum(route);
+        @constCast(f).host_route = @intFromEnum(route);
     }
-    if (cf.host_route <= @intFromEnum(snapshot_fast.Route.none)) return null;
-    if (call.type_args.len != 0 or !argNamesAllNull(call.arg_names)) return null;
-    var args: [3]Value = undefined;
-    if (call.n_args > 3) return null;
-    for (0..call.n_args) |i| args[i] = frame.read(ir.Reg.from(call.args.int() + @as(u32, @intCast(i))));
-    switch (@as(snapshot_fast.Route, @enumFromInt(cf.host_route))) {
+    if (f.host_route <= @intFromEnum(snapshot_fast.Route.none)) return null;
+    switch (@as(snapshot_fast.Route, @enumFromInt(f.host_route))) {
         .readable => {
-            if (call.n_args != 3) return null;
-            return snapshot_fast.serveReadable(args[0..3]);
+            if (args.len != 3) return null;
+            return snapshot_fast.serveReadable(args);
         },
         .valid => {
-            if (call.n_args != 3) return null;
-            return snapshot_fast.serveValid(args[0..3]);
+            if (args.len != 3) return null;
+            return snapshot_fast.serveValid(args);
         },
         .current_snapshot => {
-            if (call.n_args != 0) return null;
+            if (args.len != 0) return null;
             if (comptime !@hasDecl(H, "composeSnapshotGlobals")) return null;
             const g = host.composeSnapshotGlobals() orelse return null;
             return snapshot_fast.serveCurrentSnapshot(&g.ts, &g.gs);
         },
         .readable_state => {
-            if (call.n_args != 2) return null;
+            if (args.len != 2) return null;
             if (comptime !@hasDecl(H, "composeSnapshotGlobals")) return null;
             const g = host.composeSnapshotGlobals() orelse return null;
-            return snapshot_fast.serveReadableState(args[0..2], &g.ts, &g.gs);
+            return snapshot_fast.serveReadableState(args, &g.ts, &g.gs);
         },
         .current_record => {
-            if (call.n_args != 1) return null;
+            if (args.len != 1) return null;
             if (comptime !@hasDecl(H, "composeSnapshotGlobals")) return null;
             const g = host.composeSnapshotGlobals() orelse return null;
-            return snapshot_fast.serveCurrentRecord(args[0..1], &g.ts, &g.gs);
+            return snapshot_fast.serveCurrentRecord(args, &g.ts, &g.gs);
         },
         .current_with_snapshot => {
-            if (call.n_args != 2) return null;
-            return snapshot_fast.serveCurrentWithSnapshot(args[0..2]);
+            if (args.len != 2) return null;
+            return snapshot_fast.serveCurrentWithSnapshot(args);
         },
         else => return null,
     }
+}
+
+/// Host-served static fns (the snapshot validity walk): classify once
+/// per Func, serve without any call machinery on a hit.
+inline fn hostStaticServe(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H) Allocator.Error!?Value {
+    _ = allocator;
+    const cf = frame.module.funcById(call.func) orelse return null;
+    if (call.type_args.len != 0 or !argNamesAllNull(call.arg_names)) return null;
+    var args: [3]Value = undefined;
+    if (call.n_args > 3) return null;
+    for (0..call.n_args) |i| args[i] = frame.read(ir.Reg.from(call.args.int() + @as(u32, @intCast(i))));
+    return hostRouteServe(H, cf, args[0..call.n_args], host);
 }
 
 pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H, allow_flat: bool) Allocator.Error!Step {
@@ -1872,6 +1881,14 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
             const fid = FuncId.from(claimed - 1);
             if (frame.module.funcById(fid)) |gf| {
                 if (gf.params.len == arg_values.len) {
+                    // The claimed global may be a host-routed serve target
+                    // (the snapshot walk family): the write path's bare
+                    // `readable(...)` inside sync blocks reaches it through
+                    // this replay, never through the static-call arm.
+                    if (hostRouteServe(H, gf, arg_values, host)) |served| {
+                        try frame.write(cmg.dst, served);
+                        return .cont;
+                    }
                     var args_list = try acquireArgsCap(allocator, arg_values.len);
                     args_list.appendSliceAssumeCapacity(arg_values);
                     frame.flat_call = .{

@@ -959,6 +959,21 @@ run).
 
 ## Running log
 
+- 2026-08-26 READABLE-RESIDUE ROUTE HUNT (finding recorded, route not
+  yet found): the 1.1/insert interpreted `readable` frame residue is
+  NOT serve bails — KLIO_SNAPFAST_TRACE per-reason counters printed
+  nothing at an 8192 threshold over a full run (<8k bails/reason
+  total), and the exec-route trace shows the sync-retry lambdas' 3-arg
+  calls (53k, exact=false) ARE reaching hostStaticServe and being
+  served. The CMG `site_global_replay` arm now consults the shared
+  `hostRouteServe` helper (extracted from hostStaticServe) — measured
+  no census movement, so the residue rides neither the static-call arm,
+  the getter route, nor the CMG global replay. NEXT: attribute the
+  frames by CALLER (a census key like `readable@<caller>` under the
+  lambda-stats flag), then hook whichever dispatch path that names
+  (candidates: the member-walk invoking the accessor/wrapper via
+  invokeMethodFuncId-adjacent paths, extensionFnFallback, or a flat
+  prepare that bypasses serves).
 - 2026-08-26 GETTER-ROUTE SERVES + BUILDER MINT: census throughput
   200k -> 700k inserts inside the watchdog window (3.5x the session
   baseline). (a) snapshot_fast routes 8/9 classify the ACCESSOR fqns

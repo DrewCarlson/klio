@@ -118,6 +118,30 @@ fn isGlobalSnapshotClass(v: *const Value) bool {
     return true;
 }
 
+/// KLIO_SNAPFAST_TRACE: per-reason bail counters for the wrapper-family
+/// serves, printed every 65536 bails so a dominant reason names itself
+/// without an exit hook.
+const BailReason = enum(u8) { not_global_class, observer, idset_shape, walk_null, record_shape, cur_snapshot };
+var bail_counts: [6]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
+var bail_trace_state = std.atomic.Value(u8).init(0);
+
+fn noteBail(reason: BailReason) void {
+    var st = bail_trace_state.load(.monotonic);
+    if (st == 0) {
+        st = if (runtime.envOnce("KLIO_SNAPFAST_TRACE") != null) 2 else 1;
+        bail_trace_state.store(st, .monotonic);
+    }
+    if (st != 2) return;
+    const n = bail_counts[@intFromEnum(reason)].fetchAdd(1, .monotonic) + 1;
+    if (n % 8192 == 0) {
+        std.debug.print("[snapfast] bails:", .{});
+        inline for (@typeInfo(BailReason).@"enum".fields, 0..) |f, i| {
+            std.debug.print(" {s}={d}", .{ f.name, bail_counts[i].load(.monotonic) });
+        }
+        std.debug.print("\n", .{});
+    }
+}
+
 const SnapFields = struct { id: i64, set: IdSet, read_observer_null: bool };
 
 /// The stored `snapshotId` / `invalid` / `readObserver` of a
@@ -317,11 +341,26 @@ pub fn serveReadable(args: []const Value) ?Value {
 /// retry, and any other snapshot class runs the interpreted body.
 pub fn serveReadableState(args: []const Value, thread_snapshot: *const Value, global_snapshot: *const Value) ?Value {
     if (args.len != 2) return null;
-    const snap = currentSnapshotRaw(thread_snapshot, global_snapshot) orelse return null;
-    const f = globalSnapFields(&snap) orelse return null;
-    if (!f.read_observer_null) return null;
-    const candidate = readableWalk(&args[0], f.id, f.set) orelse return null;
-    if (candidate == .Null) return null;
+    const snap = currentSnapshotRaw(thread_snapshot, global_snapshot) orelse {
+        noteBail(.cur_snapshot);
+        return null;
+    };
+    const f = globalSnapFields(&snap) orelse {
+        noteBail(if (isGlobalSnapshotClass(&snap)) .idset_shape else .not_global_class);
+        return null;
+    };
+    if (!f.read_observer_null) {
+        noteBail(.observer);
+        return null;
+    }
+    const candidate = readableWalk(&args[0], f.id, f.set) orelse {
+        noteBail(.record_shape);
+        return null;
+    };
+    if (candidate == .Null) {
+        noteBail(.walk_null);
+        return null;
+    }
     candidate.retain();
     return candidate;
 }
