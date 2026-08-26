@@ -1144,18 +1144,15 @@ fn ssmPhase(comptime tag: []const u8) void {
 }
 
 pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceData), key: *const Value, value: *const Value) Allocator.Error!?Value {
-    // OPT-IN (KLIO_SSMPUT=1): the whole-cycle serve measured 2.9x on the
-    // map-write replica but a committed map's node intermittently reads
-    // back as 0xAA-poisoned memory under the GC profile (sv7 repro in the
-    // plan; survives arena and the debug allocator, persists under
-    // gc_debug's never-free mode, needs a cross-thread build/replace mix).
-    // Root-cause with the GC arsenal before enabling by default.
+    // KLIO_SSMPUT=0 restores the interpreted mutate cycle (bisect). The
+    // GC crash that kept this opt-in was the perm-mint birth-edge hole
+    // (worker mints are permanent; a host mint holds nursery references
+    // from birth with no barrier) — fixed at gc.register.
     const S = struct {
         var state: u8 = 0;
     };
     if (S.state == 0) {
-        const v = runtime.envOnce("KLIO_SSMPUT") orelse "0";
-        S.state = if (v.len != 0 and !std.mem.eql(u8, v, "0")) 1 else 2;
+        S.state = if (std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT") orelse "1", "0")) 2 else 1;
     }
     if (S.state == 2) return null;
     if (!isSnapshotMapClass(map_inst)) return null;

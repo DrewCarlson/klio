@@ -340,6 +340,15 @@ pub fn register(h: *GcHeader, bytes: usize) void {
         // mark stops at it instead of walking the stdlib image graph, and so
         // a runtime mutation of a permanent cell hits the write barrier.
         h.gc_gen = 1;
+        // PROGRAM-phase permanent mints (worker threads keep the permanent
+        // threadlocal): the cell may be BORN holding nursery references —
+        // a host mint assembles its field list before `init`, so no
+        // borrowMut barrier ever remembers the perm->nursery birth edges,
+        // and a minor sweep frees children reachable only through it (a
+        // worker-minted trie node embedding main-minted subtrees). Join
+        // the remembered set at birth so the next minor traces it once;
+        // it re-registers via the ordinary barrier only if mutated.
+        if (program_started) writeBarrier(h);
         // An in-process driver arms `program_perm_collect` around the ONE
         // program's build window (never around shared caches like the base
         // entries): its permanent cells belong to the program, not the
