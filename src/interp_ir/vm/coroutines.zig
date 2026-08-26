@@ -1547,12 +1547,22 @@ pub fn gcUninstallCoroRoot() void {
 /// dispatcher thread): join the mutator set so a collection on any thread stops
 /// this one at its next safe point before reading the shared heap. The
 /// per-thread root nodes (frames, keepalive, interceptor stack) link lazily on
-/// first use. Worker threads stay in the permanent generation: a worker-minted
-/// cell can be referenced cross-thread through paths the collector does not yet
-/// fully root (queued tasks, the dispatched result handoff), so sweeping them
-/// would be unsound. Only main-minted cells they reference are reclaimed.
+/// first use. A PROGRAM-phase thread mints NURSERY cells like the main run
+/// thread: the old workers-stay-permanent stopgap (from before the
+/// per-thread root and pool-queue root work) made every worker-minted
+/// structure invisible to minor marks — a permanent trie node born holding
+/// main-minted subtrees was those subtrees' only holder, and the minor
+/// swept them (no borrowMut barrier ever sees birth edges). Startup helper
+/// threads (pre-`program_started`) keep the permanent default.
 pub fn gcThreadEnter() void {
     if (!runtime.gc.gc_enabled) return;
+    // `KLIO_WORKER_PERM=1` restores the old stopgap (workers mint
+    // permanent) for bisecting a worker-cell rooting hole.
+    if (runtime.gc.program_started and
+        !std.mem.eql(u8, runtime.envOnce("KLIO_WORKER_PERM") orelse "0", "1"))
+    {
+        runtime.gc.alloc_perm = false;
+    }
     runtime.gc.enterMutator();
 }
 

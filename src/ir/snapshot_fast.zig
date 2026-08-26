@@ -144,6 +144,45 @@ fn noteBail(reason: BailReason) void {
 
 const SnapFields = struct { id: i64, set: IdSet, read_observer_null: bool };
 
+pub const WriteGate = struct { id: i64, set: IdSet };
+
+/// The write-cycle gate for the whole-op SnapshotStateMap serves: the
+/// current snapshot must be exactly the GlobalSnapshot with BOTH
+/// observers null — `withCurrent`'s contract skips read notification,
+/// and `notifyWrite` must be a provable no-op. A registered global
+/// read/write observer produces a GlobalSnapshot with the observer
+/// stored non-null, so the gate bails to the interpreted cycle there.
+/// GlobalSnapshot's `writeObserver` is never null — it is the ctor lambda
+/// draining the file-private `globalWriteObservers` list — so write-side
+/// observer soundness is the CALLER's obligation: prove that list empty
+/// (persistent_map_mut resolves it) before treating notifyWrite as a
+/// no-op. This gate proves only the exact-GlobalSnapshot class and the
+/// null READ observer.
+pub fn globalWriteGate(thread_snapshot: *const Value, global_snapshot: *const Value) ?WriteGate {
+    const wtrace = runtime.envOnce("KLIO_SSMPUT_TRACE") != null;
+    const snap = currentSnapshotRaw(thread_snapshot, global_snapshot) orelse {
+        if (wtrace) std.debug.print("[wgate] no current snapshot\n", .{});
+        return null;
+    };
+    const f = globalSnapFields(&snap) orelse {
+        if (wtrace) std.debug.print("[wgate] fields/class\n", .{});
+        return null;
+    };
+    if (!f.read_observer_null) {
+        if (wtrace) std.debug.print("[wgate] read observer\n", .{});
+        return null;
+    }
+    return .{ .id = f.id, .set = f.set };
+}
+
+/// The valid record with the highest snapshotId for a write cycle (the
+/// readable walk). Returns a BORROWED value or null.
+pub fn recordForWrite(first: *const Value, gate: WriteGate) ?Value {
+    const c = readableWalk(first, gate.id, gate.set) orelse return null;
+    if (c == .Null) return null;
+    return c;
+}
+
 /// The stored `snapshotId` / `invalid` / `readObserver` of a
 /// GlobalSnapshot instance; null on any shape surprise or when the
 /// receiver is not exactly that class.

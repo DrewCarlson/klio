@@ -462,6 +462,12 @@ pub const FuncBuilder = struct {
     /// kotlin.synchronized chain otherwise registers a closure per call
     /// purely to feed forwards whose terminal only CALLS the block).
     pending_fwd_lambdas: std.ArrayList(FwdLambda) = .empty,
+    /// Active spliced-subject `this` binds, innermost last: a receiver
+    /// lambda's subject (`with(x) { … }`, a seated `block(current(this))`
+    /// receiver) shadows the scope `this` for its region. A nested
+    /// member-inline splice consults this stack to find the receiver its
+    /// OWNER actually dispatches on when no subject's class reaches it.
+    subject_binds: std.ArrayList(SubjectBind) = .empty,
     /// Scope stack. The bottom frame holds the function's parameter
     /// bindings; lowering pushes a fresh frame per block expression
     /// so val/var declarations are popped correctly.
@@ -790,6 +796,10 @@ pub const FuncBuilder = struct {
     /// may delegate to one another and must remain spliceable.
     inline_return: std.ArrayList(InlineReturn) = .empty,
     inline_stack: std.ArrayList(InlineCallFrame) = .empty,
+    /// See `inlineDeclInProgress`: entries below this index are invisible
+    /// to the self-recursion check while a spliced argument literal's
+    /// content (caller code) lowers.
+    inline_stack_visible_base: usize = 0,
     /// Per inline-fn-splice frame: the lambda-param substitution map
     /// *and* a snapshot of `inline_return` as it was when this frame
     /// was pushed. An unlabeled `return` inside a spliced lambda must
@@ -992,6 +1002,7 @@ pub const FuncBuilder = struct {
         }
         self.blocks.deinit(a);
         self.pending_fwd_lambdas.deinit(a);
+        self.subject_binds.deinit(a);
         for (self.scopes.items) |*s| s.deinit();
         self.scopes.deinit(a);
         self.lambda_arg_arity.deinit();
@@ -1181,8 +1192,28 @@ pub const FuncBuilder = struct {
         self.allocator.free(saved);
     }
     pub fn inlineDeclInProgress(self: *const FuncBuilder, decl: *const ast.Function) bool {
-        for (self.inline_stack.items) |frame| {
+        // Entries below the visibility base belong to enclosing splices
+        // whose ARGUMENT-literal content is being lowered: that content is
+        // caller code, and a same-fn call inside it (`repeat { repeat { } }`)
+        // is nesting, not self-recursion. A genuine self-recursive body
+        // re-pushes above the base and is still caught; the expand-depth
+        // cap bounds pathological nesting.
+        for (self.inline_stack.items[self.inline_stack_visible_base..]) |frame| {
             if (frame.decl == decl) return true;
+        }
+        // RECEIVER-FORMED callees (`with`, `apply`) keep the full-stack
+        // check even through literal content: a nested same-fn splice
+        // (`with(a) { with(b) { … } }`) loses the OUTER subject's
+        // member-extension ranking in the inner static window, so the
+        // inner call stays framed and the runtime tower ranks it.
+        for (decl.params) |*p| {
+            const ft = p.ty.function orelse continue;
+            if (ft.receiver != null) {
+                for (self.inline_stack.items[0..self.inline_stack_visible_base]) |frame| {
+                    if (frame.decl == decl) return true;
+                }
+                break;
+            }
         }
         return false;
     }
@@ -3290,6 +3321,16 @@ pub const FwdLambda = struct {
     idx: u32,
     reg: Reg,
     span: span_mod.Span,
+};
+
+/// One active spliced-subject `this` bind (see `FuncBuilder.subject_binds`).
+pub const SubjectBind = struct {
+    reg: Reg,
+    /// The subject's derived static head, when known.
+    head: ?[]const u8,
+    /// The scope `this` that was visible just before this subject bound —
+    /// the receiver beneath the whole subject run for the outermost entry.
+    prior_this: ?Reg,
 };
 
 pub const LoopFrame = struct {

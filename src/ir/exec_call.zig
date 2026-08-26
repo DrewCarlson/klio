@@ -1912,6 +1912,107 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
         const cands_keepalive = pinImplicitCandidates(cands);
         defer runtime.keepaliveRestore(cands_keepalive);
         single_cand = cands.len == 1;
+        // A bare MEMBER-EXTENSION call takes its two receivers from the
+        // implicit tower independently: the extension receiver is the
+        // innermost candidate satisfying the target's DECLARED receiver
+        // type, the dispatch receiver the innermost candidate whose class
+        // owns a member extension of this name. `with(node) { measure(m, c) }`
+        // otherwise landed the owner in `params[0]` — the coordinator that
+        // IS the `MeasureScope` never reached the callee — and a nested
+        // `with(other) { f() }` inside `f` re-entered the ENCLOSING
+        // declaration instead of `other`'s override, recursing forever.
+        if (comptime @hasDecl(H, "receiverImplementsType")) mext: {
+            if (!argNamesAllNull(cmg.arg_names)) break :mext;
+            // A committed target names the declared receiver outright; an
+            // interface call arrives uncommitted and each candidate's own
+            // declaration supplies it.
+            var committed_rt: ?[]const u8 = null;
+            if (cmg.func) |cfid| {
+                if (frame.module.funcById(cfid)) |cf| {
+                    if (cf.kind != .member_extension) break :mext;
+                    if (cf.params.len != arg_values.len + 1) break :mext;
+                    if (cf.params.len == 0 or !std.mem.eql(u8, cf.params[0].name, "this")) break :mext;
+                    committed_rt = cf.params[0].ty.name;
+                }
+            }
+            // Cheap early-out before any candidate scanning: when the
+            // innermost receiver already satisfies the committed target's
+            // declared receiver, the ordinary walk binds it correctly.
+            if (committed_rt) |crt| {
+                if (cands.len != 0 and cands[0].v == .Instance and
+                    host.receiverImplementsType(&cands[0].v, crt)) break :mext;
+            }
+            var owner: ?Value = null;
+            var target: ?ir.FuncId = null;
+            var ext_recv: ?Value = null;
+            for (cands) |c| {
+                if (c.v != .Instance) continue;
+                var best: ?ir.FuncId = null;
+                var best_exact = false;
+                var best_er: ?Value = null;
+                const cls_name: []const u8 = if (comptime @hasDecl(H, "debugClassNameOf"))
+                    host.debugClassNameOf(&c.v)
+                else
+                    "";
+                for (frame.module.funcsBySimpleName(name_str)) |fid| {
+                    const f = frame.module.funcById(fid) orelse continue;
+                    if (f.kind != .member_extension) continue;
+                    if (f.params.len != arg_values.len + 1) continue;
+                    if (!std.mem.eql(u8, f.params[0].name, "this")) continue;
+                    if (!f.hasBody()) continue;
+                    const ocls = declaringClassName(frame.module, fid) orelse
+                        frame.module.registry.member_ext_owner_class.get(fid) orelse continue;
+                    if (!host.receiverImplementsType(&c.v, ocls)) continue;
+                    const frt = committed_rt orelse f.params[0].ty.name;
+                    var er_here: ?Value = null;
+                    for (cands) |c2| {
+                        if (c2.v != .Instance) continue;
+                        if (host.receiverImplementsType(&c2.v, frt)) {
+                            er_here = c2.v;
+                            break;
+                        }
+                    }
+                    const ev = er_here orelse continue;
+                    // The most derived declaration wins: an override on the
+                    // candidate's own class outranks the base it inherits.
+                    const exact = cls_name.len != 0 and
+                        std.mem.eql(u8, simpleClassHead(ocls), simpleClassHead(cls_name));
+                    if (best == null or (exact and !best_exact)) {
+                        best = fid;
+                        best_exact = exact;
+                        best_er = ev;
+                    }
+                }
+                if (best) |b| {
+                    owner = c.v;
+                    target = b;
+                    ext_recv = best_er;
+                    break;
+                }
+            }
+            const t = target orelse break :mext;
+            const er = ext_recv orelse break :mext;
+            const tf = frame.module.funcById(t) orelse break :mext;
+            // Only a genuine mismatch is corrected: when the innermost
+            // candidate already satisfies the declared receiver the ordinary
+            // walk binds it correctly.
+            if (cands.len != 0 and cands[0].v == .Instance and
+                host.receiverImplementsType(&cands[0].v, tf.params[0].ty.name)) break :mext;
+            const all = try allocator.alloc(Value, arg_values.len + 1);
+            defer allocator.free(all);
+            all[0] = er;
+            for (arg_values, 0..) |v, i| all[i + 1] = v;
+            if (owner) |o| pushEnclosing(&o);
+            defer if (owner != null) popEnclosing();
+            orAudit("CallMemberOrGlobal", name_str, "member_ext_recv", -1, &er);
+            switch (try host.callFuncNamed(allocator, frame.module, t, all, &.{})) {
+                .ok => |v| {
+                    try frame.write(cmg.dst, v);
+                    return .cont;
+                },
+                .err => |e| return raiseStep(frame, e),
+            }
+        }
         // Inside an extension body, the implicit `this` has the
         // extension's DECLARED receiver type, and Kotlin resolves a bare
         // extension call against that static type — not the runtime
@@ -2608,13 +2709,35 @@ fn frameThisParam(frame: *const Frame) ?usize {
 /// instance method's implicit-`this` call the static receiver type Kotlin
 /// resolves it against — its declaring class. `null` when no class owns it
 /// (a top-level / local function reached with an injected receiver).
+/// The head of a dotted class name (`a.b.C` -> `C`).
+fn simpleClassHead(name: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
+    return name;
+}
+
+/// The class that declares `fid`, over a lazily built reverse index. The
+/// linear scan this replaces is O(classes x methods) per lookup, which a
+/// dispatch arm consulting several candidate fids per call turned into the
+/// dominant cost of a compose recomposition (63% of one profile).
+var decl_class_cache: ?std.AutoHashMap(u32, []const u8) = null;
+var decl_class_module: ?*const Module = null;
+var decl_class_mutex: runtime.SpinMutex = .{};
+
 pub fn declaringClassName(module: *const Module, fid: ir.FuncId) ?[]const u8 {
-    for (module.classes.items) |*c| {
-        for (c.methods) |mfid| {
-            if (@intFromEnum(mfid) == @intFromEnum(fid)) return c.name;
+    decl_class_mutex.lock();
+    defer decl_class_mutex.unlock();
+    if (decl_class_module != module or decl_class_cache == null) {
+        if (decl_class_cache) |*old_map| old_map.deinit();
+        var map = std.AutoHashMap(u32, []const u8).init(std.heap.page_allocator);
+        for (module.classes.items) |*c| {
+            for (c.methods) |mfid| {
+                map.put(@intFromEnum(mfid), c.name) catch {};
+            }
         }
+        decl_class_cache = map;
+        decl_class_module = module;
     }
-    return null;
+    return decl_class_cache.?.get(@intFromEnum(fid));
 }
 
 /// The calling frame's receiver, an Instance from either a `this`-named

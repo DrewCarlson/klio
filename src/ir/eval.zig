@@ -732,6 +732,10 @@ const ResumeFrames = struct {
 const FrameAnchor = struct {
     chain: *const ?*Frame,
     resuming: *const ?*ResumeFrames,
+    /// Owning thread, for the frame-walk audit (`KLIO_GC_FRAME_AUDIT=1`):
+    /// a collector marking ANOTHER thread's chain must find that thread
+    /// parked, so a torn frame there names an unparked mutator.
+    tid: u32 = 0,
 };
 threadlocal var frame_anchor: FrameAnchor = undefined;
 /// This thread's GC root node. Its `ctx` is `&frame_anchor`, so the collector
@@ -784,10 +788,32 @@ fn gcMarkFrameRegs(f: *const Frame, m: *runtime.gc.Marker) void {
     }
 }
 
+var stw_audit_state: u8 = 0;
+fn stwAuditOn() bool {
+    if (stw_audit_state == 0)
+        stw_audit_state = if (runtime.envOnce("KLIO_GC_STW_AUDIT") != null) 2 else 1;
+    return stw_audit_state == 2;
+}
+
 fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
     const anchor: *const FrameAnchor = @ptrCast(@alignCast(ctx));
+    const audit = runtime.envOnce("KLIO_GC_FRAME_AUDIT") != null;
     var cur = anchor.chain.*;
-    while (cur) |f| : (cur = f.gc_link) {
+    var fi: usize = 0;
+    while (cur) |f| : ({
+        cur = f.gc_link;
+        fi += 1;
+    }) {
+        if (audit) {
+            const me: u32 = @bitCast(std.Thread.getCurrentId());
+            const bad = @intFromPtr(f) < 0x1000 or (@intFromPtr(f) >> 47) != 0 or
+                f.captures.items.len > 4096 or f.params.items.len > 4096 or
+                f.regs.items.len > 65536;
+            if (bad) {
+                std.debug.print("[gc-frame] TORN anchor_tid={d} marker_tid={d} idx={d} f={x} caps={d} params={d} regs={d}\n", .{ anchor.tid, me, fi, @intFromPtr(f), f.captures.items.len, f.params.items.len, f.regs.items.len });
+                return;
+            }
+        }
         gcMarkFrameRegs(f, m);
         for (f.params.items) |v| v.gcMark(m);
         for (f.captures.items) |v| v.gcMark(m);
@@ -829,7 +855,7 @@ inline fn markFrameClosure(closure_id: ?u64, m: *runtime.gc.Marker) void {
 pub fn gcInstallFrameRoot() void {
     if (frame_troot_inited) return;
     frame_troot_inited = true;
-    frame_anchor = .{ .chain = &evtls.frame_chain, .resuming = &evtls.resuming };
+    frame_anchor = .{ .chain = &evtls.frame_chain, .resuming = &evtls.resuming, .tid = @bitCast(std.Thread.getCurrentId()) };
     frame_troot = .{ .ctx = @ptrCast(&frame_anchor), .mark = gcMarkFramesCtx };
     runtime.gc.registerThreadRoot(&frame_troot);
 }
@@ -1035,37 +1061,93 @@ fn serveOuterSlotRoute(recv: *const Value, name: []const u8, route: u64) ?Value 
 
 var call_stats: ?std.StringHashMap(u64) = null;
 fn callStatsBump(fqn: []const u8) void {
-    callStatsBumpId(fqn, 0);
+    callStatsBumpId(fqn, 0, null);
 }
 /// Census bump with the executing FuncId, so the anonymous-lambda mass
 /// (every lambda's fqn is the literal "<lambda>") decomposes into
 /// per-body counters under KLIO_CALL_STATS_LAMBDA — the id keys resolve
 /// back to bodies via `dump-ir --func`.
-fn callStatsBumpId(fqn: []const u8, fid: u32) void {
+fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
     if (call_stats_state == 0)
         call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
+    var key: []const u8 = fqn;
+    var buf: [160]u8 = undefined;
+    if (fid != 0 and std.mem.eql(u8, fqn, "<lambda>") and lambdaStatsOn()) {
+        key = blk: {
+            // Name the body by its declaration site so the census reads
+            // without a dump-ir id correlation step.
+            if (module) |m| {
+                if (@constCast(m).decl_span.get(fid)) |sp| {
+                    if (span.active_map) |am| {
+                        if (am.getChecked(sp.file)) |sf| {
+                            const lc = sf.lineCol(sp.start);
+                            const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |ix| sf.path[ix + 1 ..] else sf.path;
+                            break :blk std.fmt.bufPrint(&buf, "<lambda>#{d}[{s}:{d}]", .{ fid, base, lc.line }) catch fqn;
+                        }
+                    }
+                }
+            }
+            break :blk std.fmt.bufPrint(&buf, "<lambda>#{d}", .{fid}) catch fqn;
+        };
+    }
+    // KLIO_CALL_STATS_CALLER=<substr>: a matching fqn additionally bumps
+    // `<fqn>@<caller-fqn>`, attributing the frame to the interpreted frame
+    // live at activation. This names the dispatch context of census residue
+    // whose serve route is unknown.
+    var cbuf: [256]u8 = undefined;
+    var caller_key: ?[]const u8 = null;
+    if (callerStatsFilter()) |substr| {
+        if (std.mem.indexOf(u8, key, substr) != null) {
+            const cfqn: []const u8 = if (evtls.frame_chain) |fr| fr.func.fqn else "<top>";
+            // The caller's current span IS the call site — it names which
+            // literal/site invoked this body without any id correlation.
+            var site_buf: [64]u8 = undefined;
+            var site: []const u8 = "";
+            if (evtls.frame_chain) |fr| {
+                if (fr.cur_span) |sp| {
+                    if (span.active_map) |am| {
+                        if (am.getChecked(sp.file)) |sf| {
+                            const lc = sf.lineCol(sp.start);
+                            const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |ix| sf.path[ix + 1 ..] else sf.path;
+                            site = std.fmt.bufPrint(&site_buf, "[{s}:{d}]", .{ base, lc.line }) catch "";
+                        }
+                    }
+                }
+            }
+            caller_key = std.fmt.bufPrint(&cbuf, "{s}@{s}{s}", .{ key, cfqn, site }) catch null;
+        }
+    }
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
     if (call_stats == null) call_stats = std.StringHashMap(u64).init(std.heap.page_allocator);
-    var key: []const u8 = fqn;
-    var buf: [48]u8 = undefined;
-    if (fid != 0 and std.mem.eql(u8, fqn, "<lambda>") and lambdaStatsOn()) {
-        const printed = std.fmt.bufPrint(&buf, "<lambda>#{d}", .{fid}) catch fqn;
-        key = printed;
-    }
+    callStatsBumpKeyLocked(key);
+    if (caller_key) |ck| callStatsBumpKeyLocked(ck);
+}
+
+/// Bump one census key with `call_stats_mutex` already held. The key may
+/// point at a stack buffer: the first insertion re-keys with an owned dupe.
+fn callStatsBumpKeyLocked(key: []const u8) void {
     const gop = call_stats.?.getOrPut(key) catch return;
     if (!gop.found_existing) {
-        if (key.ptr == &buf) {
-            const owned = std.heap.page_allocator.dupe(u8, key) catch return;
-            _ = call_stats.?.remove(key);
-            const gop2 = call_stats.?.getOrPut(owned) catch return;
-            gop2.value_ptr.* = 1;
-            return;
-        }
+        gop.key_ptr.* = std.heap.page_allocator.dupe(u8, key) catch key;
         gop.value_ptr.* = 0;
     }
     gop.value_ptr.* += 1;
+}
+
+fn callerStatsFilter() ?[]const u8 {
+    const S = struct {
+        var state: u8 = 0;
+        var val: []const u8 = "";
+    };
+    if (S.state == 0) {
+        if (runtime.envOnce("KLIO_CALL_STATS_CALLER")) |v| {
+            S.val = v;
+            S.state = 2;
+        } else S.state = 1;
+    }
+    return if (S.state == 2) S.val else null;
 }
 fn lambdaStatsOn() bool {
     const S = struct {
@@ -3052,6 +3134,19 @@ pub const Frame = struct {
     }
 
     fn deinit(self: *Frame) void {
+        // Tripwire (`KLIO_GC_STW_AUDIT=1`): tearing a frame down while the
+        // world is stopped means the collector is walking this thread's
+        // chain right now — a rendezvous hole, and exactly the shape that
+        // makes a mark walk read freed frame buffers.
+        if (stwAuditOn() and runtime.gc.worldStopped()) {
+            const me: u32 = @bitCast(std.Thread.getCurrentId());
+            if (me != runtime.gc.collector_tid.load(.acquire)) {
+                if (runtime.gc.blocking_safe_depth == 0) {
+                    std.debug.print("[gc-stw] tid={d} collector={d} bs={d} park_depth={d} mut={} mutators={d} parked={d} cpark={d} func={s}\n", .{ me, runtime.gc.collector_tid.load(.acquire), runtime.gc.blocking_safe_depth, runtime.gc.park_depth, runtime.gc.is_mutator, runtime.gc.dbg_mutators.load(.acquire), runtime.gc.dbg_parked.load(.acquire), runtime.gc.dbg_collector_park.load(.acquire), self.func.name });
+                    runtime.trace.dumpCurrent(.{});
+                }
+            }
+        }
         // A register owns one reference to its value; release them all on
         // teardown. The return/escaping value is retained out before this runs,
         // and a suspended frame's registers are retained into its snapshot.
@@ -4248,7 +4343,25 @@ pub fn evalWithCapturesChained(
             return lr;
         }
     }
-    callStatsBumpId(func.fqn, func.id.int());
+    // Host-route serve at the same seam: a routed target (the snapshot walk
+    // family) reached through ANY dispatch path — overload ranking, value
+    // invocation, extension fallback — serves here without a frame. The
+    // static-call and CMG-replay intercepts cannot see a target the overload
+    // leg resolves natively (`readable` inside `writableRecord` rode that
+    // route at 1.1 frames per map insert). Args are already settled in param
+    // order, which is exactly the shape the serves take.
+    if (owning == null and closure_id == null and chain_seed.len == 0 and
+        captures.items.len == 0)
+    {
+        if (exec_call.hostRouteServe(H, func, args.items, host)) |served| {
+            var a = args;
+            a.deinit(allocator);
+            var c = captures;
+            c.deinit(allocator);
+            return ok(served);
+        }
+    }
+    callStatsBumpId(func.fqn, func.id.int(), module);
     const ev: *EvalTls = &evtls;
     var try_stack: std.ArrayList(TryFrame) = .empty;
     defer try_stack.deinit(allocator);
@@ -8819,6 +8932,20 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 if (route == 0) break :site;
                 const sig_now = host.memberSiteSig(arg_values) orelse break :site;
                 if (sig_now != @atomicLoad(u64, @constCast(&cm.site_sig), .monotonic)) break :site;
+                // Route bit0 = 1 carries a flat-call FuncId; bit0 = 0
+                // carries a host-serve kind (the CHAMP builder ops) that
+                // answers without any call machinery.
+                if (route & 1 == 0) {
+                    if (comptime @hasDecl(H, "hostMemberServeKind")) {
+                        if (try host.hostMemberServeKind(allocator, @intCast(route >> 1), &recv, arg_values)) |served| {
+                            dispatchBump(.member_site_flat);
+                            if (pushed_enclosing) popEnclosing();
+                            try frame.write(cm.dst, served);
+                            return .cont;
+                        }
+                    }
+                    break :site;
+                }
                 if (try host.prepareMemberFlatFromFid(allocator, &recv, name_str, arg_values, @enumFromInt(@as(u32, @intCast(route >> 1))))) |prep0| {
                     dispatchBump(.member_site_flat);
                     var prep = prep0;
@@ -8876,6 +9003,35 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 frame.flat_call = prep;
                 runtime.prof.opRoute(5);
                 return .flat_call;
+            }
+        }
+    }
+    // Host member serves (the CHAMP builder ops) answer here, ahead of the
+    // ladder entry, and claim the site memo with a host-kind route so later
+    // executions skip the flat-prepare decline walk entirely.
+    if (comptime @hasDecl(H, "hostMemberServeProbe")) {
+        if (recv == .Instance and argNamesAllNull(cm.arg_names)) {
+            if (try host.hostMemberServeProbe(allocator, &recv, name_str, arg_values)) |hit| {
+                if (comptime @hasDecl(H, "memberSiteSig")) {
+                    if (memberSiteEnabled() and dispatchCacheStable() and
+                        @atomicLoad(u64, @constCast(&cm.site_cls), .monotonic) == 0)
+                    {
+                        if (host.memberSiteSig(arg_values)) |sig| {
+                            const cls: u64 = blk: {
+                                const g = recv.Instance.borrow();
+                                defer g.deinit();
+                                break :blk @intCast(g.get().class.identity());
+                            };
+                            if (cls > 1 and @cmpxchgStrong(u64, @constCast(&cm.site_cls), 0, cls, .acq_rel, .monotonic) == null) {
+                                @atomicStore(u64, @constCast(&cm.site_sig), sig, .monotonic);
+                                @atomicStore(u64, @constCast(&cm.site_route), @as(u64, hit.kind) << 1, .release);
+                            }
+                        }
+                    }
+                }
+                if (pushed_enclosing) popEnclosing();
+                try frame.write(cm.dst, hit.val);
+                return .cont;
             }
         }
     }

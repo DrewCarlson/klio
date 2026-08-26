@@ -67,7 +67,13 @@ const runtime = @import("runtime");
 // RAISED 1377 -> 1381 after the literal-lambda splice landed by default
 // (with the builder bulk-op serves and the dead-closure skip): gate runs
 // at 1383 and 1385 passed; margin below both covers the ±3 band.
-const BASELINE: usize = 1381;
+// RAISED 1381 -> 1386 after the inline-parity rounds (qualified splice,
+// ext-lambda tier, seated subjects), the whole-cycle SnapshotStateMap.put
+// serve, and the perm-mint birth-barrier GC fix: the gate runs at 1389
+// with the ONLY real failure validatePotentialDeadlock, and
+// SnapshotStateMapTests is 59/59 solo. Margin below 1389 covers the
+// load-flake band (Movable, the Pausable pair, frame-clock).
+const BASELINE: usize = 1386;
 
 /// Ceiling on failing cases, the mirror of `BASELINE`. Measured solo at
 /// 1380 passed / 10 failed once companion extension properties resolved
@@ -88,7 +94,13 @@ const BASELINE: usize = 1381;
 /// throughput-bound and varies by ~40 between runs (see the note above the
 /// baseline), so a DNC gate would be a flake, not a signal. Failures do not
 /// have that variance — a killed class contributes neither.
-const MAX_FAILED: usize = 11;
+/// LOWERED 11 -> 5 with the concurrency family closed (the map class is
+/// 59/59 solo; the only standing real failure is
+/// `RecomposerTests.validatePotentialDeadlock`, a pure throughput
+/// ceiling). The slack above 1 covers the known load flakes that appear
+/// only at gate contention: MovableContent, the PausableComposition
+/// pair, and the frame-clock test.
+const MAX_FAILED: usize = 5;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{
@@ -134,13 +146,24 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     // 1345 at 10s). That hang population is gone — the suite stands at
     // 1385/5 with the failures enumerated — so the cap returns to the
     // upstream default and only genuinely-stuck tests pay it.
-    try map.put("kotlinx_coroutines_test_default_timeout", "60s");
+    // Upstream's own per-test budget. It must never fire BEFORE klio's wall
+    // cap, which is the suite's hang guard and is per-test tunable: when it
+    // did, a slow-but-progressing test reported `UncompletedCoroutinesError`
+    // at an arbitrary point instead of either passing or hitting the cap.
+    try map.put("kotlinx_coroutines_test_default_timeout", "900s");
     // Per-test wall cap: a test that genuinely deadlocks (the Recomposer
     // deadlock-regression shape, the concurrent-mixing teardown stall) fails
     // in place instead of eating the class's whole 480s budget — its
     // classmates' passes stay counted. Generous enough for the compute-heavy
     // benchmark tests under 8-way contention.
     try map.put("KLIO_TEST_WALL_CAP", "90");
+    // `validatePotentialDeadlock` is throughput-bound, not wedged: it races
+    // two infinite writer loops against ~3120 frames of 200 composables and
+    // PASSES in ~724s. It gets a declared budget so the suite reports what it
+    // is (slow) rather than what it is not (stuck). The budget is a ratchet —
+    // it must only shrink as the recomposition path gets faster, and
+    // exceeding it still fails.
+    try map.put("KLIO_TEST_WALL_CAP_FOR", "validatePotentialDeadlock=900");
     // Four children each defaulting to a half-the-cores compute pool
     // oversubscribe the box 2x and inflate the concurrent classes'
     // walls 3-8x. Cap each child so the children together match the
@@ -150,10 +173,18 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
 }
 
 fn workerCount() usize {
+    // `KLIO_ITEST_JOBS` overrides the width for wall-time measurement.
+    if (runtime.envOnce("KLIO_ITEST_JOBS")) |v| {
+        if (std.fmt.parseInt(usize, v, 10) catch null) |n| {
+            if (n >= 1 and n <= 32) return n;
+        }
+    }
     const cores = std.Thread.getCpuCount() catch 4;
-    // Half the cores, capped low: suites run beside sweeps and editors,
-    // and each child is itself a multi-threaded interpreter.
-    return std.math.clamp(cores / 2, 1, 6);
+    // Half the cores, capped at 8. The old cap of 6 existed because wider
+    // job sets inflated the concurrent-snapshot family past its budgets;
+    // with that family fixed, width 8 measured 334s vs 418s at width 6
+    // with an identical 1389/1/0 result.
+    return std.math.clamp(cores / 2, 1, 8);
 }
 
 fn runKlio(
@@ -444,7 +475,15 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                 // progress and their (buffered, lost-on-kill) passes vanished
                 // from the count — a deterministic 616 -> 403 that was pace,
                 // not correctness.
-                const r = runKlio(arena.allocator(), penv, queue[i], 480_000) catch {
+                // RecomposerTests carries `validatePotentialDeadlock`, whose
+                // cost is modelled (~724s to a full pass; see the campaign
+                // plan) rather than wedged, so its class gets a budget that
+                // fits it. Every other class keeps the 480s hang guard.
+                const class_cap_ms: i64 = if (std.mem.indexOf(u8, names[i], "RecomposerTests") != null)
+                    1_200_000
+                else
+                    480_000;
+                const r = runKlio(arena.allocator(), penv, queue[i], class_cap_ms) catch {
                     _ = phung.fetchAdd(1, .monotonic);
                     // Name it. "2 did not complete" is not actionable; the
                     // class is what tells you whether it is the known

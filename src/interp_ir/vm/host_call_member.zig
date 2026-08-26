@@ -1538,7 +1538,17 @@ pub fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []
     }
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
     if (std.mem.startsWith(u8, pn, "Function")) return true;
-    if (pn.len > 0 and pn.len <= 2 and allUppercase(pn)) return true;
+    // A short all-caps head is a TYPE PARAMETER (`T`, `R`, `E1`), which any
+    // receiver satisfies -- unless the program declares a class of that name,
+    // in which case it is that user type and must be proven like any other.
+    if (pn.len > 0 and pn.len <= 2 and allUppercase(pn)) {
+        const declared = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().classId(pn) != null;
+        };
+        if (!declared) return true;
+    }
     switch (receiver.*) {
         .Instance => |inst| {
             const a = self.allocator;
@@ -3866,6 +3876,13 @@ pub fn prepareMemberFlatCall(self: *VmHost, allocator: Allocator, receiver: *con
     {
         return null;
     }
+    // SnapshotStateMap.put is host-served (whole write cycle).
+    if (args.len == 2 and std.mem.eql(u8, name, "put") and
+        receiver.* == .Instance and
+        persistent_map_mut.isSnapshotMapClass(receiver.Instance))
+    {
+        return null;
+    }
     // `closure.invoke(args…)`: the ladder lands at `callValueRec(receiver,
     // args)` with no closure-specific step before it, so the plain closure
     // invocation flattens identically.
@@ -4029,6 +4046,81 @@ pub fn memberSiteSig(self: *VmHost, args: []const Value) ?u64 {
     return if (sig == 0) 1 else sig;
 }
 
+/// Host-serve kinds a CallMember instruction-site memo can claim: route
+/// word bit0 = 0, kind in the remaining bits (the flat-target form keeps
+/// bit0 = 1 with the FuncId above it). The claimed class identity plus the
+/// serve's own shape validation make a stale claim a safe bail.
+pub const HostServeKind = enum(u32) {
+    map_put = 1,
+    map_build = 2,
+    snapshot_map_put = 3,
+};
+
+/// Probe a (receiver, name, args) run for a host member serve at the
+/// CallMember exec site, BEFORE the ladder entry: on a hit the value is
+/// served and the kind returned so the site memo can claim the route.
+pub fn hostMemberServeProbe(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    name: []const u8,
+    args: []const Value,
+) Allocator.Error!?struct { kind: u32, val: Value } {
+    if (receiver.* != .Instance) return null;
+    if (args.len == 2 and std.mem.eql(u8, name, "put") and
+        persistent_map_mut.isBuilderClass(receiver.Instance))
+    {
+        if (try persistent_map_mut.tryPut(self, allocator, receiver.Instance, &args[0], &args[1])) |v| {
+            return .{ .kind = @intFromEnum(HostServeKind.map_put), .val = v };
+        }
+        return null;
+    }
+    if (args.len == 0 and std.mem.eql(u8, name, "build") and
+        persistent_map_mut.isBuilderClass(receiver.Instance))
+    {
+        if (try persistent_map_mut.tryBuild(self, allocator, receiver.Instance)) |v| {
+            return .{ .kind = @intFromEnum(HostServeKind.map_build), .val = v };
+        }
+        return null;
+    }
+    if (args.len == 2 and std.mem.eql(u8, name, "put") and
+        persistent_map_mut.isSnapshotMapClass(receiver.Instance))
+    {
+        if (try persistent_map_mut.trySnapshotMapPut(self, allocator, receiver.Instance, &args[0], &args[1])) |v| {
+            return .{ .kind = @intFromEnum(HostServeKind.snapshot_map_put), .val = v };
+        }
+        return null;
+    }
+    return null;
+}
+
+/// Replay a site-claimed host-serve kind. Any shape surprise returns null
+/// and the call falls back to the full dispatch path.
+pub fn hostMemberServeKind(
+    self: *VmHost,
+    allocator: Allocator,
+    kind: u32,
+    receiver: *const Value,
+    args: []const Value,
+) Allocator.Error!?Value {
+    if (receiver.* != .Instance) return null;
+    switch (kind) {
+        @intFromEnum(HostServeKind.map_put) => {
+            if (args.len != 2 or !persistent_map_mut.isBuilderClass(receiver.Instance)) return null;
+            return persistent_map_mut.tryPut(self, allocator, receiver.Instance, &args[0], &args[1]);
+        },
+        @intFromEnum(HostServeKind.map_build) => {
+            if (args.len != 0 or !persistent_map_mut.isBuilderClass(receiver.Instance)) return null;
+            return persistent_map_mut.tryBuild(self, allocator, receiver.Instance);
+        },
+        @intFromEnum(HostServeKind.snapshot_map_put) => {
+            if (args.len != 2 or !persistent_map_mut.isSnapshotMapClass(receiver.Instance)) return null;
+            return persistent_map_mut.trySnapshotMapPut(self, allocator, receiver.Instance, &args[0], &args[1]);
+        },
+        else => return null,
+    }
+}
+
 /// Replay a CallMember site memo's claimed target as a flat call. A stored
 /// same-named instance field outranks a cached top-level extension (and an
 /// invoke-convention callable can shadow), so the presence of one declines
@@ -4099,6 +4191,14 @@ pub fn prepareVirtualFlatCall(
         if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vn| {
             if (args.len == 2 and std.mem.eql(u8, vn, "put")) return null;
             if (args.len == 0 and (std.mem.eql(u8, vn, "build") or std.mem.eql(u8, vn, "builder"))) return null;
+        }
+    }
+    // SnapshotStateMap.put is host-served (whole write cycle).
+    if (args.len == 2 and receiver.* == .Instance and
+        persistent_map_mut.isSnapshotMapClass(receiver.Instance))
+    {
+        if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vn| {
+            if (std.mem.eql(u8, vn, "put")) return null;
         }
     }
     if (receiver.* != .Instance) {
@@ -4303,6 +4403,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }
     if (args.len == 0 and receiver.* == .Instance and std.mem.eql(u8, name, "builder")) {
         if (try persistent_map_mut.tryBuilder(self, allocator, receiver.Instance)) |v| {
+            return .{ .ok = v };
+        }
+    }
+    // The whole-cycle SnapshotStateMap.put serve (persistent_map_mut.zig).
+    if (args.len == 2 and receiver.* == .Instance and std.mem.eql(u8, name, "put") and
+        persistent_map_mut.isSnapshotMapClass(receiver.Instance))
+    {
+        if (try persistent_map_mut.trySnapshotMapPut(self, allocator, receiver.Instance, &args[0], &args[1])) |v| {
             return .{ .ok = v };
         }
     }
@@ -8822,6 +8930,14 @@ pub fn invokeVirtualMember(
                     return .{ .ok = v };
                 }
             }
+            // Whole-cycle SnapshotStateMap.put via its virtual slot.
+            if (args.len == 2 and std.mem.eql(u8, vname, "put") and
+                persistent_map_mut.isSnapshotMapClass(receiver.Instance))
+            {
+                if (try persistent_map_mut.trySnapshotMapPut(self, allocator, receiver.Instance, &args[0], &args[1])) |v| {
+                    return .{ .ok = v };
+                }
+            }
         }
     }
     // Replay a stamped host-receiver site: same interned type FQN means the
@@ -11186,6 +11302,28 @@ fn enclosingOwnerSet(self: *VmHost, allocator: Allocator) Allocator.Error!std.St
                 g.deinit();
                 cur = outer;
             } else break;
+        }
+    }
+    // The executing frames' own receivers are implicit receivers too, and
+    // the dynamic chain does not carry them: an extension body binds its
+    // receiver in `params[0]`, never by pushing it. Inside
+    // `ColumnMeasurePolicy.measure(MeasureScope)` the `MeasureScope` is a
+    // `Density`, which is what makes `Dp.roundToPx()` visible there.
+    var fit = ir.eval.frameThisChainIter();
+    while (fit.next()) |fv| {
+        var cur: ?Value = fv;
+        while (cur) |cv| {
+            if (cv != .Instance) break;
+            const g = cv.Instance.borrow();
+            closure.clearRetainingCapacity();
+            collectClassClosure(g.get().class.asPtr(), &closure, &seen, allocator);
+            for (closure.items) |cd| {
+                set.put(cd.name, {}) catch {};
+                set.put(cd.fqn, {}) catch {};
+            }
+            const outer = g.get().outer;
+            g.deinit();
+            cur = outer;
         }
     }
     return set;

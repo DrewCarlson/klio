@@ -169,6 +169,15 @@ pub fn gateReceiverHead(b: *const FuncBuilder, receiver: *const Expr) Allocator.
             _ = call;
             break :blk null;
         },
+        // An unsafe cast fixes the receiver's static type for resolution:
+        // kotlinc resolves the member/extension through the cast's target
+        // (`(firstStateRecord as StateMapStateRecord).withCurrent(block)`).
+        .As => |a| {
+            if (a.safe) return null;
+            const nm2 = std.mem.trimEnd(u8, a.ty.name.name, "?");
+            if (nm2.len == 0) return null;
+            return nm2;
+        },
         else => return null,
     }
 }
@@ -577,6 +586,15 @@ fn pocUses(comptime exempt_call_head: bool, e: *const Expr, name: []const u8) bo
         .Member => |m| std.mem.eql(u8, m.name.name, name) or
             pocUses(exempt_call_head, m.receiver, name),
         .Call => |c| blk: {
+            // `contract { … }` lowers to Unit (a compile-time marker): a
+            // param mentioned inside its literal (`callsInPlace(action)`)
+            // is dead code, never a value use.
+            if (c.callee.* == .Path and c.callee.Path.segments.len == 1 and
+                std.mem.eql(u8, c.callee.Path.segments[0].name, "contract") and
+                c.args.len == 1 and c.args[0] == .Lambda)
+            {
+                break :blk false;
+            }
             const head_is_param = exempt_call_head and c.callee.* == .Path and
                 c.callee.Path.segments.len == 1 and
                 std.mem.eql(u8, c.callee.Path.segments[0].name, name);
@@ -822,6 +840,7 @@ pub fn spliceInlineLambdaOn(
         while (kit0.next()) |k0| try enclosing_subst_keys.append(b.allocator, k0.*);
     }
     const counted = inline_state.inlineExpandEnter();
+    const subject_prior_this = b.resolve("this");
     try b.pushScope();
     const lambda_own_base = b.scopeDepth() - 1;
     if (receiver) |reg| try b.bind("this", reg) else if (recv_seat) try b.bind("this", arg_regs[0]);
@@ -1061,9 +1080,26 @@ pub fn spliceInlineLambdaOn(
     // receiver EXPRESSION's static type, exactly as the inline-fn splice
     // substitutes a generic `T.apply` receiver.
     var recv_head: ?[]const u8 = null;
-    if (receiver != null) {
+    // A SEATED subject (a receiver-formed literal invoked with value-arity+1
+    // positional args — `block(current(this))`) is a subject exactly like a
+    // supplied receiver: the body's bare member reads/calls resolve against
+    // it, so it gets the same window head and runtime tower push.
+    const subject_reg: ?Reg = receiver orelse if (recv_seat) arg_regs[0] else null;
+    if (subject_reg != null) {
         recv_head = b.receiverLambdaRecvHead(lambda_name);
-        if (recv_head == null and rfsEnabled()) if (receiver_expr) |rex| {
+        // The seat case's declared receiver head was recorded span-keyed
+        // when the literal lowered through its receiver-formed param.
+        if (recv_head == null) {
+            if (b.lambdaArgRecv(lam.Lambda.span)) |rt| {
+                const h0 = expr_lower.typeHead(std.mem.trimEnd(u8, rt.name, "?"));
+                const bare_tp0 = (h0.len > 0 and h0.len <= 2 and std.ascii.isUpper(h0[0])) or
+                    b.isTypeParam(h0) or ir.parseClassTypeParamIdentity(h0) != null;
+                if (!bare_tp0 and h0.len != 0) recv_head = h0;
+            }
+        }
+        const subj_expr: ?*const Expr = receiver_expr orelse
+            (if (recv_seat and arg_exprs.len != 0) &arg_exprs[0] else null);
+        if (recv_head == null and rfsEnabled()) if (subj_expr) |rex| {
             var derived: ?[]const u8 = null;
             if (expr_lower.argDeclTypeRefLazy(b, rex)) |known| {
                 derived = expr_lower.typeHead(std.mem.trimEnd(u8, known.name, "?"));
@@ -1089,13 +1125,26 @@ pub fn spliceInlineLambdaOn(
         // enclosing head at all — a member-inline splice's owner head
         // (SlotTable) fed `with(openEditor())`'s editor subject and
         // every bare editor read pinned to the table.
-        if (recv_head == null and rfsEnabled() and explicit_receiver == null) {
+        if (recv_head == null and rfsEnabled() and explicit_receiver == null and
+            receiver != null)
+        {
             recv_head = b.spliceRecvTy();
         }
     }
     const lam_prev_splice_recv = b.spliceRecvTy();
     const lam_prev_recv_from_window = b.splice_recv_from_window;
-    if (receiver != null) {
+    const subject_bind_pushed = subject_reg != null;
+    if (subject_bind_pushed) {
+        try b.subject_binds.append(b.allocator, .{
+            .reg = subject_reg.?,
+            .head = recv_head,
+            .prior_this = subject_prior_this,
+        });
+    }
+    defer if (subject_bind_pushed) {
+        _ = b.subject_binds.pop();
+    };
+    if (subject_reg != null) {
         // Receiver lambda (`apply { minusAssign(key) }`): the innermost
         // implicit receiver inside the body is the lambda's SUBJECT, so
         // bare calls hint its head — never the enclosing fn's receiver,
@@ -1106,7 +1155,7 @@ pub fn spliceInlineLambdaOn(
             b.splice_recv_from_window = recv_head != null;
         }
     } else if (site_hint) |sh| b.setSpliceHint(sh.active, sh.recv);
-    const lam_prev_narrow = b.setThisNarrow(if (receiver != null) null else if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
+    const lam_prev_narrow = b.setThisNarrow(if (subject_reg != null) null else if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
     // Body-declared `var`s a nested closure WRITES must box (`var expected
     // = 0` in a spliced lambda whose `repeat { expected += 2 }` closure
     // mutates it) — the same scan `tryInlineCallWithTypeArgs` runs for an
@@ -1137,14 +1186,22 @@ pub fn spliceInlineLambdaOn(
     // as the framed route's closure receiver would. Label returns funnel
     // through `end`, whose first instruction pops; a non-local owner
     // return skips the pop and frame teardown heals it.
-    const encl_pushed = receiver != null and rfsEnabled();
+    const encl_pushed = subject_reg != null and rfsEnabled();
     const prev_tower_top = b.encl_tower_top;
     if (encl_pushed) {
-        try b.push(.{ .EnclosingPush = .{ .src = receiver.? } });
+        try b.push(.{ .EnclosingPush = .{ .src = subject_reg.? } });
         b.encl_tower_depth += 1;
-        b.encl_tower_top = receiver.?;
+        b.encl_tower_top = subject_reg.?;
+    }
+    // The literal's content is CALLER code: enclosing splices' in-progress
+    // marks don't make a same-fn call inside it self-recursive
+    // (`repeat { … forEach { repeat { … } } }` must splice all the way).
+    const prev_decl_base = b.inline_stack_visible_base;
+    if (!std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_NRG") orelse "1", "0")) {
+        b.inline_stack_visible_base = b.inline_stack.items.len;
     }
     const v = try lowerBlock(b, &body);
+    b.inline_stack_visible_base = prev_decl_base;
     if (encl_pushed) {
         b.encl_tower_depth -= 1;
         b.encl_tower_top = prev_tower_top;
@@ -1155,7 +1212,7 @@ pub fn spliceInlineLambdaOn(
     for (suspended_rlp.items) |k| try b.markReceiverLambdaParam(k);
     _ = b.setThisNarrow(lam_prev_narrow);
     b.setSpliceHint(lam_prev_active, lam_prev_recv);
-    if (receiver != null and rfsEnabled()) {
+    if (subject_reg != null and rfsEnabled()) {
         b.setSpliceRecvTy(lam_prev_splice_recv);
         b.splice_recv_from_window = lam_prev_recv_from_window;
     }
@@ -2977,7 +3034,16 @@ pub fn tryInlineCallWithTypeArgs(
         b.encl_tower_depth += 1;
         b.encl_tower_top = explicit_receiver.?;
     }
+    const ext_subject_pushed = explicit_receiver != null;
     if (explicit_receiver) |receiver| {
+        // The bound receiver shadows `this` for the body: join the
+        // subject-bind stack so a nested bare member-inline splice can
+        // find the receiver its owner actually dispatches on.
+        try b.subject_binds.append(b.allocator, .{
+            .reg = receiver,
+            .head = b.spliceRecvTy(),
+            .prior_this = b.resolve("this"),
+        });
         try b.bind("this", receiver);
         if (inline_state.runtime.envOnce("KLIO_THIS_TRACE") != null) {
             std.debug.print("[splice-bind] {s} this=r{d} scope={d}\n", .{ fname, receiver.int(), b.scopes.items.len - 1 });
@@ -2988,6 +3054,41 @@ pub fn tryInlineCallWithTypeArgs(
         // splice provides the same binding in its scope.
         const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{fname});
         try b.bind(label, receiver);
+    }
+    defer if (ext_subject_pushed) {
+        _ = b.subject_binds.pop();
+    };
+    // A BARE member-inline call inside spliced-subject regions
+    // (`with(rec) { bump2(...) }` where `bump2` is the enclosing class's
+    // member): the call dispatches on the innermost receiver whose class
+    // reaches the OWNER. The ambient scope `this` is the innermost
+    // subject; when that subject (or any inner one) cannot receive the
+    // member, the body's `this` is the owning receiver further out —
+    // without the rebind every owner member access pins to the subject.
+    if (this_arg == null and inline_state.inlineMemberOwner(f) != null and
+        b.subject_binds.items.len != 0) owner_this: {
+        const owner = inline_state.inlineMemberOwner(f).?;
+        const owner_base = if (std.mem.indexOf(u8, owner, "$f")) |oi| owner[0..oi] else owner;
+        var si = b.subject_binds.items.len;
+        while (si > 0) {
+            si -= 1;
+            const sb = b.subject_binds.items[si];
+            // An unknown subject head cannot be disproven a receiver:
+            // keep the ambient binding.
+            const h = sb.head orelse break :owner_this;
+            if (b.module.classIsOrExtends(h, owner) or
+                b.module.classIsOrExtends(h, owner_base))
+            {
+                // This subject receives the call. Innermost is already
+                // the ambient `this`; an outer one rebinds to its reg.
+                if (si != b.subject_binds.items.len - 1) {
+                    try b.bind("this", sb.reg);
+                }
+                break :owner_this;
+            }
+        }
+        const outer = b.subject_binds.items[0].prior_this orelse break :owner_this;
+        try b.bind("this", outer);
     }
     if (ext_splice) {
         prev_splice_window = b.lambda_splice_resolve;
