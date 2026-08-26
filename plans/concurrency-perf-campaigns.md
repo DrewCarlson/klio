@@ -885,6 +885,45 @@ in-process interaction still to isolate.
 
 ## Running log
 
+- 2026-08-26 SNAPSHOT-READ WRAPPER SERVES: THROUGHPUT 2x + THE
+  WALL-TO-FAIL DECOY: the KLIO_PROF+KLIO_PROF_CALLERS/KLIO_CALL_STATS
+  round on the contended map test found the per-insert cost was the
+  snapshot READ machinery, not the trie put: per insert ~4.3
+  `Snapshot.current` companion-getter frames (860k), ~3.2 top-level
+  `readable` wrapper frames (640k — only the 3-arg private walk was
+  served), ~2.1 `SnapshotStateMap.readable` getter frames, plus 220k
+  slow-ladder `List.indices` reads. snapshot_fast now also serves the
+  2-arg `T.readable(state)` wrapper (GlobalSnapshot-exact class gate —
+  subclasses override `snapshotId`/`invalid`/`readObserver` as computed
+  accessors, so stored-field reads are only sound on that final class;
+  observer-null gate; walk-null bails to the interpreted sync retry),
+  `current(r)` and `current(r, snapshot)` (same walk, no observer
+  semantics), sharing one `readableWalk` core. builtinFieldFast serves
+  `indices`/`lastIndex` for backing-free containers, GATED on a
+  program-wide "no non-stdlib extension property of either name exists"
+  verdict (`builtinIndexPropsServable`, gen-stamped) — the ungated form
+  hijacked user extension shadows (A/B-proven against kotlinc
+  semantics: a user `List.lastIndex` must print its own answer).
+  Bonus root fix from the same audit: `setOf(...).indices` was a
+  runtime dispatch error (`collectionLen` had no Set arm) — fixed, with
+  `examples/indices_shadowing.kt` + `examples/collection_indices.kt`
+  pinning both behaviors. MEASURED: identical-census throughput
+  DOUBLED (400k vs 200k inserts inside the watchdog window); compose
+  gate held 1388/2/0; class run 58/59 (only `_clear`); sweep 117/0,
+  litmus 48/48, units green. THE DECOY: solo wall-to-fail ROSE 30.8 ->
+  38.8s and looked like a regression — it is watchdog(30s) + teardown
+  over a ~2x fatter churned heap, not slowness; judge this test by
+  work-inside-the-window, never by wall-to-fail. Standalone full-scale
+  replica (mapclear_full.kt, run-mode arena) hit the 6GB RSS cap at
+  rep 7 of 10: the workload is ALLOCATION-BOUND (~900MB garbage per
+  rep: a builder + ownership instance per put, trie buffer copies,
+  records). Post-serve profile: slab family ~8.5% (newSlab 2.4% — GC
+  unmap/remap churn against the single parked spare), memset 6.8%
+  (alloc/free poison scales with allocation count), materializeInstance
+  1.2%. NEXT LEVERS: slab spare-depth/hysteresis for GC-churn
+  workloads, then the persistent-map builder serve family
+  (`builder()`/`put`/`build` host-side; CHAMP node shape already mapped
+  in persistent_map_eq.zig) which cuts compute AND garbage per put.
 - 2026-08-26 CURRENTSNAPSHOT NATIVE SERVE + THE ROUTE-CONTENTION TRAP:
   snapshot_fast serves `currentSnapshot()` natively (the ThreadMap
   binary search over the interpreted objects, same thread-id source as
