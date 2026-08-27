@@ -61,8 +61,10 @@ locking (already Noop), name-identity and field memos (already present).
       the wall unchanged (3093ms vs 3094ms), and extending the frameless leaf
       serve to requests carrying a pending enclosing-chain pop removes 12% of
       activations for no wall change. So frame COUNT and frame SETUP are both
-      off the critical path: the cost is the ~10k interpreted instructions a
-      recomposition executes, at ~76ns each.
+      off the critical path. What is left is raw interpreted work: ~1833
+      tree-walked instructions per recomposition (plus the bytecode tier's own
+      stream, which does not pass through `execInst`) for ~765us. That is the
+      interpreted-vs-native factor, and only Front A moves it.
       LANDED THIS ROUND (78132521): a member-extension winner is now memoized
       under the chain-folded key (the owner is re-found on the chain at serve
       time), which took a member-extension call from 3.0us to 1.5us and the
