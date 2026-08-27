@@ -209,6 +209,7 @@ pub fn runModuleFiles(
     runtime.startRunDeadline();
     runtime.prof.opProfMaybeStart();
     runtime.prof.fnProfMaybeStart();
+    ir.eval.frameCountInit();
     interp_ir.resetReceiverThreadLocals();
     interp_ir.resetRunGlobalCaches();
     if (tryImagePath(gpa, paths, features)) |code| return code;
@@ -1999,6 +2000,7 @@ pub fn runTestFiles(
     runtime.startRunDeadline();
     runtime.prof.opProfMaybeStart();
     runtime.prof.fnProfMaybeStart();
+    ir.eval.frameCountInit();
     interp_ir.resetReceiverThreadLocals();
     interp_ir.resetRunGlobalCaches();
 
@@ -2228,6 +2230,7 @@ fn runTestsOnBuilt(
         const mg = built.module.borrow();
         defer mg.deinit();
         ir.eval.fnProfDump(mg.get());
+        ir.eval.frameCountDump(mg.get());
     }
     ir.eval.callStatsDump();
     ir.eval.dispatch_replay_hits = &interp_ir.VmHost.replayHits;
@@ -2559,6 +2562,7 @@ pub fn runBuiltModuleArgs(
         const mg = built.module.borrow();
         defer mg.deinit();
         ir.eval.fnProfDump(mg.get());
+        ir.eval.frameCountDump(mg.get());
     }
     ir.eval.callStatsDump();
     ir.eval.dispatch_replay_hits = &interp_ir.VmHost.replayHits;

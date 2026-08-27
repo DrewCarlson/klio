@@ -522,6 +522,7 @@ fn classifyFlattenable(f: *const Func) u8 {
 /// fresh at the call, never a stored pointer — which also keeps the thread
 /// pointer to one lookup per frame operation instead of one per pool.
 fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32, no_fill: bool) Allocator.Error!std.ArrayList(Value) {
+    if (frame_count_on) frame_alloc_total += 1;
     const ra = regsAlloc(allocator);
     if (ev.regs_pool.items.len > 0) {
         const buf = ev.regs_pool.items[ev.regs_pool.items.len - 1];
@@ -1421,6 +1422,54 @@ pub fn callStatsDump() void {
 /// names through `module`. Ids fold into the table, so a name is reported
 /// only when its id owns the slot; the fold is 1:1 for every program with
 /// fewer functions than the table's slots.
+/// KLIO_FRAME_COUNT / KLIO_FRAME_CENSUS: how many interpreted activations a
+/// workload runs, and which functions they belong to. `activations` counts
+/// register-bank acquisitions (one per real frame); `entries` counts
+/// `runFrameExec` entries, which is higher because a flat call re-enters its
+/// caller's frame. The frames-per-unit-of-work metric that separates "too
+/// many frames" (splice work) from "frames too expensive" (activation cost).
+pub var frame_count_total: u64 = 0;
+pub var frame_alloc_total: u64 = 0;
+pub var frame_count_on: bool = false;
+const FRAME_CENSUS_SLOTS: usize = 1 << 17;
+var frame_census: [FRAME_CENSUS_SLOTS]u32 = @splat(0);
+var frame_census_on: bool = false;
+
+pub fn frameCountInit() void {
+    frame_count_on = runtime.envOnce("KLIO_FRAME_COUNT") != null;
+    frame_census_on = runtime.envOnce("KLIO_FRAME_CENSUS") != null;
+    if (frame_census_on) frame_count_on = true;
+}
+
+inline fn frameCensusBump(fid: u32) void {
+    if (!frame_census_on) return;
+    frame_census[fid & (FRAME_CENSUS_SLOTS - 1)] +%= 1;
+}
+
+pub fn frameCountDump(module: *const Module) void {
+    if (!frame_count_on) return;
+    std.debug.print("[frames] entries={d} activations={d}\n", .{ frame_count_total, frame_alloc_total });
+    if (!frame_census_on) return;
+    const Entry = struct { name: []const u8, n: u32 };
+    var list: std.ArrayList(Entry) = .empty;
+    defer list.deinit(std.heap.page_allocator);
+    var fid: u32 = 0;
+    while (fid < frame_census.len) : (fid += 1) {
+        const n = frame_census[fid];
+        if (n == 0) continue;
+        const f = module.funcById(@enumFromInt(fid));
+        const nm: []const u8 = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "<unknown>";
+        list.append(std.heap.page_allocator, .{ .name = nm, .n = n }) catch return;
+    }
+    std.mem.sort(Entry, list.items, {}, struct {
+        fn lt(_: void, a: Entry, b: Entry) bool {
+            return a.n > b.n;
+        }
+    }.lt);
+    const top = @min(list.items.len, 40);
+    for (list.items[0..top]) |e| std.debug.print("[frames] {d:>9} {s}\n", .{ e.n, e.name });
+}
+
 pub fn fnProfDump(module: *const Module) void {
     const counts = runtime.prof.fnProfCounts() orelse return;
     const Entry = struct { name: []const u8, n: u32 };
@@ -5921,6 +5970,10 @@ fn runFrameExec(
     park_out: *?ParkPoint,
     host: *H,
 ) Allocator.Error!EvalResult {
+    if (frame_count_on) {
+        frame_count_total += 1;
+        frameCensusBump(frame.func.id.int());
+    }
     // KLIO_FN_PROF: attribute samples to the interpreted function running
     // here, restoring the caller's on exit so the histogram is self-time.
     const fn_prof_prev = runtime.prof.current_fn;
