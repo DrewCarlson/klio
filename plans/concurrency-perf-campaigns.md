@@ -150,9 +150,13 @@ Work items:
   stays at 4. CONVERGENCE: task 2's halving is BLOCKED by task 1's race
   family; fixing the MVCC-snapshot cross-thread races unlocks both the
   fail ceiling and ~-215s of wall.
-- [ ] Exit: full solo `itest-compose_plugin_commontest` wall time halved from
-      the current measured baseline (record it first), with the gate still at
-      its pass baseline. Path after the width measurement: fix the task-1
+- [x] EXIT MET (2026-08-27): **334s at width 8** vs the recorded 727s
+      baseline (2.18x), with the gate at 1389 passed / 1 failed / 0 DNC
+      — better than the halving target of 364s. The width cap rose 6 ->
+      8 (`KLIO_ITEST_JOBS` overrides it for measurement): wider jobs
+      were previously blocked by the concurrent-snapshot family, which
+      the throughput work and the GC rendezvous fix closed. Prior exit
+      note: halve the wall Path after the width measurement: fix the task-1
       races first, then re-adopt width 6-8 (~510s), then shorten the
       heavy-class tail (interpreter throughput: profile is diffuse —
       libc-malloc 14%, runFrameExec 9%, allocator-poison memset 4.5%,
