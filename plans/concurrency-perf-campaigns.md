@@ -118,6 +118,13 @@ Work items:
       24/25 (resumeOnBackgroundThread needs ~40-55s), which is a
       harness artifact, not a failure. Export the 60s budget for any
       solo confirmation.
+      FRONT A SIZING NOTE: `KLIO_LEAF_TRACE` is a TRANSPILE-TIME
+      emitter trace (cli/commands.zig), not a runtime one, so it cannot
+      tally leaf-misses from a `klio test` run — sizing Front A for vpd
+      needs a runtime census of the recompose+apply machinery instead.
+      vpd's work is compose-runtime OBJECT machinery with no scalar
+      tail, which is exactly Front A's target and why no surgical lever
+      exists.
 - [~] TOOLING NOTE (2026-08-27): `scripts/corpus_check.py` is OBSOLETE —
       it diffs the Zig binary against `target/release/klio`, the retired
       Rust reference, so it reports 0/N with the reference absent. The
