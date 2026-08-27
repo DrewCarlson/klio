@@ -1417,6 +1417,39 @@ pub fn callStatsDump() void {
     for (list.items[0..top]) |e| std.debug.print("[call-stats] {d:>10} {s}\n", .{ e.n, e.fqn });
 }
 
+/// KLIO_FN_PROF report: the sampler's per-id counts resolved to function
+/// names through `module`. Ids fold into the table, so a name is reported
+/// only when its id owns the slot; the fold is 1:1 for every program with
+/// fewer functions than the table's slots.
+pub fn fnProfDump(module: *const Module) void {
+    const counts = runtime.prof.fnProfCounts() orelse return;
+    const Entry = struct { name: []const u8, n: u32 };
+    var list: std.ArrayList(Entry) = .empty;
+    defer list.deinit(std.heap.page_allocator);
+    var total: u64 = 0;
+    var fid: u32 = 0;
+    while (fid < counts.len) : (fid += 1) {
+        const n = counts[fid].load(.monotonic);
+        if (n == 0) continue;
+        total += n;
+        const f = module.funcById(@enumFromInt(fid));
+        const nm: []const u8 = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "<unknown>";
+        list.append(std.heap.page_allocator, .{ .name = nm, .n = n }) catch return;
+    }
+    if (total == 0) return;
+    std.mem.sort(Entry, list.items, {}, struct {
+        fn lt(_: void, a: Entry, b: Entry) bool {
+            return a.n > b.n;
+        }
+    }.lt);
+    std.debug.print("[fn-prof] samples={d} distinct={d}\n", .{ total, list.items.len });
+    const top = @min(list.items.len, 40);
+    for (list.items[0..top]) |e| {
+        const pct = @as(f64, @floatFromInt(e.n)) * 100.0 / @as(f64, @floatFromInt(total));
+        std.debug.print("[fn-prof] {d:>7.2}% {d:>8} {s}\n", .{ pct, e.n, e.name });
+    }
+}
+
 /// Cached KLIO_ERR_TRACE presence — the flag is read on every dispatch-miss
 /// diagnostic path, and `getenvSlice` takes a global mutex per call. The env
 /// is set at launch; a mid-run change is not observed (benign data race:
@@ -5888,6 +5921,13 @@ fn runFrameExec(
     park_out: *?ParkPoint,
     host: *H,
 ) Allocator.Error!EvalResult {
+    // KLIO_FN_PROF: attribute samples to the interpreted function running
+    // here, restoring the caller's on exit so the histogram is self-time.
+    const fn_prof_prev = runtime.prof.current_fn;
+    if (runtime.prof.fn_prof_active) runtime.prof.current_fn = frame.func.id.int();
+    defer if (runtime.prof.fn_prof_active) {
+        runtime.prof.current_fn = fn_prof_prev;
+    };
     // Resolved once: the per-instruction gates below would otherwise pay a
     // dynamic thread-local lookup each, which the compiler cannot hoist past
     // the dispatch calls between them.

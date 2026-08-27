@@ -206,6 +206,61 @@ pub fn opProfMaybeStart() void {
     _ = setitimer(ITIMER_PROF_C, &itv, null);
 }
 
+// ---------------------------------------------------------------------------
+// Kotlin-function sampler (`KLIO_FN_PROF`): the PC sampler attributes time to
+// INTERPRETER functions; this one attributes it to the interpreted program's
+// own functions. `runFrameExec` stamps the executing func id into a
+// threadlocal (gated on `fn_prof_active`) and restores the caller's on exit,
+// so the histogram reads as self-time per Kotlin function — the census that
+// says which library bodies are worth serving natively.
+// ---------------------------------------------------------------------------
+
+pub var fn_prof_active: bool = false;
+pub threadlocal var current_fn: u32 = FN_OUTSIDE;
+/// Id meaning "not inside an interpreted frame".
+pub const FN_OUTSIDE: u32 = 0xFFFF_FFFF;
+const FN_SLOTS: usize = 1 << 17;
+var fn_hist: [FN_SLOTS]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(0));
+
+fn fnHandler(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
+    _ = sig;
+    _ = info;
+    _ = ctx;
+    const f = current_fn;
+    if (f == FN_OUTSIDE) return;
+    _ = fn_hist[f & (FN_SLOTS - 1)].fetchAdd(1, .monotonic);
+}
+
+pub fn fnProfMaybeStart() void {
+    if (comptime !builtin.link_libc) return;
+    const env = std.c.getenv("KLIO_FN_PROF") orelse return;
+    const env_s = std.mem.span(env);
+    var usec: i64 = 1000;
+    if (env_s.len > 0 and env_s[0] >= '0' and env_s[0] <= '9') {
+        usec = std.fmt.parseInt(i64, env_s, 10) catch 1000;
+        if (usec < 100) usec = 100;
+    }
+    fn_prof_active = true;
+    var act = posix.Sigaction{
+        .handler = .{ .sigaction = fnHandler },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = posix.SA.SIGINFO | posix.SA.RESTART,
+    };
+    posix.sigaction(.PROF, &act, null);
+    const itv = c_itimerval{
+        .it_interval = .{ .sec = @intCast(@divFloor(usec, 1_000_000)), .usec = @intCast(@mod(usec, 1_000_000)) },
+        .it_value = .{ .sec = @intCast(@divFloor(usec, 1_000_000)), .usec = @intCast(@mod(usec, 1_000_000)) },
+    };
+    _ = setitimer(ITIMER_PROF_C, &itv, null);
+}
+
+/// The raw per-id sample counts (index = func id, folded into the table).
+/// The caller maps ids to names — the runtime layer cannot see the IR.
+pub fn fnProfCounts() ?*const [FN_SLOTS]std.atomic.Value(u32) {
+    if (!fn_prof_active) return null;
+    return &fn_hist;
+}
+
 /// The raw per-tag sample counts (index = instruction enum tag;
 /// `OP_OUTSIDE` = time outside the eval loop). The caller maps indexes to
 /// opcode names — the runtime layer cannot see the IR enum.
