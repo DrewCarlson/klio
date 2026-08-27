@@ -342,6 +342,7 @@ pub const VmHost = struct {
     pub const hostMemberServeKind = host_call_member.hostMemberServeKind;
     pub const prepareMemberFlatFromFid = host_call_member.prepareMemberFlatFromFid;
     pub const callMemberStrictExt = host_call_member.callMemberStrictExt;
+    pub const receiverImplementsType = host_call_member.receiverImplementsType;
     pub const callMemberMembersOnly = host_call_member.callMemberMembersOnly;
     pub const callMemberMembersOnlyLenient = host_call_member.callMemberMembersOnlyLenient;
     pub const committedExtReceiverDisproven = host_call_member.committedExtReceiverDisproven;
