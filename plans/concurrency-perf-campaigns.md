@@ -33,15 +33,26 @@ Rejected with measurements: backoff-sleep ladder (667 vs 630ms), module-cell
 locking (already Noop), name-identity and field memos (already present).
 
 - [ ] OPEN — `RecomposerTests.validatePotentialDeadlock`: **753s solo vs the
-      gate's 90s per-class cap (8.4x)**. Re-measured after the whole-put
-      serve and the GC rendezvous fix (763 -> 753s): this campaign's gains
-      never touched its path. Re-profiled at the same commit — DIFFUSE, no
-      lever at or above 9% (memset 8.95%, runFrameExec 6.17%, eqlBytes 4.20%,
-      getIndex 3.33%, shade 2.23%). `withCurrentStackTrace` already splices.
-      No surgical lever buys 8.4x: this is **Front A** (bake-time AOT
-      object-shape natives) and nothing smaller. The test races two infinite
-      writer loops against the drain, so recompose+apply speedups converge on
-      it superlinearly.
+      gate's 90s per-class cap (8.4x)**. COST MODEL MEASURED (2026-08-27,
+      replica `f10_texts200`: 200 texts, ten frames, both composers):
+      `advanceTimeBy(5_000)` x10 at a 16ms frame clock = ~3120 frames, each
+      recomposing the root and its 200 `Text` children = ~624k composable
+      recompositions. Frames and recompositions are CORRECT (9 frames ->
+      10 recompositions for 160ms; no divergence, no runaway drain), and the
+      per-recomposition cost is ~1.05ms, which multiplies out to the observed
+      wall. So the gap is throughput per composable recomposition, not a
+      scheduling pathology, and it needs ~7x.
+      KOTLIN-LEVEL PROFILE (the new `KLIO_FN_PROF`): a quarter of the time is
+      `Operation.executeWithComposeStackTrace` self-time — a three-line
+      wrapper whose body is two bare MEMBER-EXTENSION dispatches
+      (`getGroupAnchor`, `execute`) — plus ~11% in the drain and ~11% in
+      lambdas. The interpreter-level profile is diffuse behind that (memset
+      ~16%, getIndex 4.8%, runFrameExec 3.8%, eqlBytes 3.2%).
+      Reaching 90s means native-speed execution of that inner loop: **Front A**
+      (bake-time AOT object-shape natives), with Front B's frame/allocation
+      levers as the compounding half. The test races two infinite writer loops
+      against the drain, so recompose+apply speedups converge on it
+      superlinearly.
 
 ## Task 2 — compose suite wall time — EXIT MET (2026-08-27)
 
@@ -96,6 +107,11 @@ instances of what this generalizes.
 - A3. Retire the hand serves one for one; each serve is its function's oracle.
 - Exit: the snapshot write cycle (currentSnapshot -> readable ->
   builder/put/build -> attemptUpdate) runs with zero interpreted frames.
+
+The census tool for both fronts is `KLIO_FN_PROF` (see
+`docs/development/debugging.md`): it samples the INTERPRETED program's
+currently executing function, so a profile names the Kotlin body to serve
+instead of the interpreter internals underneath it.
 
 ### Front B — interpreter floor (OPEN)
 
@@ -185,3 +201,9 @@ receiver fix and the recursion-guard base took map frames 3.62M -> 1.59M
   pack-side questions with runtime frame-params dumps (`KLIO_ERR_TRACE=1`).
 - Installed packs shadow `kotlin-klio/` sources: rebuild and reinstall after
   any lowering change or the measurement is of old code.
+- A member-extension override must be picked by its DECLARED extension
+  receiver, not by name+arity alone: the class index's first match sent
+  `LayoutModifierNodeCoordinator` into the wrong body (`get_field 'type'`).
+- `declaringClassName` was an O(classes x methods) scan; any dispatch arm that
+  consults candidate fids must answer from an index (it reached 63% of a
+  compose profile before it was memoized).
