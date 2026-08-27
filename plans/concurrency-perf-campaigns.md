@@ -91,7 +91,9 @@ Work items:
       (snapshot_map_equality/list_equality/list_bulk_ops,
       indices_shadowing, collection_indices, char_range_loops; the
       whole-put serve's oracle is the 59/59 class itself).
-- [~] Exit: SnapshotStateMapTests 59/59 SOLO (first ever; _clear 14.4s
+- [~] Exit (2026-08-27 gate on the rendezvous fix: **1389 passed / 1
+      failed / 0 DNC at 418s**, ratchet 1386): the ONLY standing failure
+      is validatePotentialDeadlock. Was: SnapshotStateMapTests 59/59 SOLO (first ever; _clear 14.4s
       vs 30s budget after the whole-cycle put serve + the perm-mint
       birth-barrier GC fix), List 65/65, Set 21/21, Observer 30/30
       solo; gate 1389/1/0 with the ONLY real failure

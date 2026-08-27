@@ -162,6 +162,13 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
 }
 
 fn workerCount() usize {
+    // `KLIO_ITEST_JOBS` overrides the width for wall-time measurement.
+    if (std.process.getEnvVarOwned(std.heap.page_allocator, "KLIO_ITEST_JOBS")) |v| {
+        defer std.heap.page_allocator.free(v);
+        if (std.fmt.parseInt(usize, v, 10) catch null) |n| {
+            if (n >= 1 and n <= 32) return n;
+        }
+    } else |_| {}
     const cores = std.Thread.getCpuCount() catch 4;
     // Half the cores, capped low: suites run beside sweeps and editors,
     // and each child is itself a multi-threaded interpreter.
