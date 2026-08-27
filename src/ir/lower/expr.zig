@@ -2458,8 +2458,19 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 break :blk std.mem.eql(u8, rhh, stripLowerFileMangle(decl_owner)) or
                     b.module.classIsOrExtends(rhh, stripLowerFileMangle(decl_owner));
             };
-            if ((!is_known_global or splice_receiver_first) and
-                (!enclosing_only_member or receiver_is_owner))
+            // The EXTENSION receiver's own members shadow the enclosing
+            // class's: inside `fun Scope.f()` declared in `class C`, a bare
+            // name both `Scope` and `C` declare is `Scope`'s — kotlinc ranks
+            // implicit receivers innermost first, and `this` is the receiver.
+            const recv_declares = blk: {
+                const rh = b.recvTy() orelse break :blk false;
+                const h = typeHead(std.mem.trimEnd(u8, rh, "?"));
+                const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk false;
+                if (!hs.complete) break :blk false;
+                break :blk hs.names.contains(name0);
+            };
+            if ((!is_known_global or splice_receiver_first or recv_declares) and
+                (!enclosing_only_member or receiver_is_owner or recv_declares))
             {
                 const dst = b.allocReg();
                 const nm = try b.module.internConst(b.allocator, .{ .String = name0 });

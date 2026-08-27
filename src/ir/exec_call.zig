@@ -1912,59 +1912,98 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
         const cands_keepalive = pinImplicitCandidates(cands);
         defer runtime.keepaliveRestore(cands_keepalive);
         single_cand = cands.len == 1;
-        // A committed MEMBER-EXTENSION target takes its extension receiver
-        // from the implicit candidates, never from the dispatch owner:
-        // `with(node) { config.applySemantics() }` lowers to a bare
-        // implicit-receiver call with the explicit receiver dropped, so
-        // without this the owner (`node`) landed in `params[0]` and every
-        // bare call inside the body resolved against the wrong receiver.
-        // The candidate that satisfies the declared receiver type is the
-        // extension receiver; the owner joins the dispatch scope.
-        if (comptime @hasDecl(H, "receiverImplementsType")) {
-            if (cmg.func) |cfid| mext: {
-                const cf = frame.module.funcById(cfid) orelse break :mext;
-                if (cf.kind != .member_extension) break :mext;
-                if (cf.params.len == 0 or !std.mem.eql(u8, cf.params[0].name, "this")) break :mext;
-                if (cf.params.len != arg_values.len + 1) break :mext;
-                if (!argNamesAllNull(cmg.arg_names)) break :mext;
-                const rt = cf.params[0].ty.name;
-                // The dispatch owner is the candidate whose class DECLARES
-                // the target (its `this@Owner` label and its own members
-                // resolve against that instance); anything else leaves the
-                // body's labeled receiver unbound.
-                const owner_cls = declaringClassName(frame.module, cfid) orelse
-                    frame.module.registry.member_ext_owner_class.get(cfid) orelse break :mext;
-                var owner: ?Value = null;
-                var ext_recv: ?Value = null;
-                for (cands) |c| {
-                    if (c.v != .Instance) continue;
-                    if (owner == null and host.receiverImplementsType(&c.v, owner_cls)) {
-                        owner = c.v;
-                        continue;
+        // A bare MEMBER-EXTENSION call takes its two receivers from the
+        // implicit tower independently: the extension receiver is the
+        // innermost candidate satisfying the target's DECLARED receiver
+        // type, the dispatch receiver the innermost candidate whose class
+        // owns a member extension of this name. `with(node) { measure(m, c) }`
+        // otherwise landed the owner in `params[0]` — the coordinator that
+        // IS the `MeasureScope` never reached the callee — and a nested
+        // `with(other) { f() }` inside `f` re-entered the ENCLOSING
+        // declaration instead of `other`'s override, recursing forever.
+        if (comptime @hasDecl(H, "receiverImplementsType")) mext: {
+            if (!argNamesAllNull(cmg.arg_names)) break :mext;
+            // A committed target names the declared receiver outright; an
+            // interface call arrives uncommitted and each candidate's own
+            // declaration supplies it.
+            var committed_rt: ?[]const u8 = null;
+            if (cmg.func) |cfid| {
+                if (frame.module.funcById(cfid)) |cf| {
+                    if (cf.kind != .member_extension) break :mext;
+                    if (cf.params.len != arg_values.len + 1) break :mext;
+                    if (cf.params.len == 0 or !std.mem.eql(u8, cf.params[0].name, "this")) break :mext;
+                    committed_rt = cf.params[0].ty.name;
+                }
+            }
+            var owner: ?Value = null;
+            var target: ?ir.FuncId = null;
+            var ext_recv: ?Value = null;
+            for (cands) |c| {
+                if (c.v != .Instance) continue;
+                var best: ?ir.FuncId = null;
+                var best_exact = false;
+                var best_er: ?Value = null;
+                const cls_name: []const u8 = if (comptime @hasDecl(H, "debugClassNameOf"))
+                    host.debugClassNameOf(&c.v)
+                else
+                    "";
+                for (frame.module.funcsBySimpleName(name_str)) |fid| {
+                    const f = frame.module.funcById(fid) orelse continue;
+                    if (f.kind != .member_extension) continue;
+                    if (f.params.len != arg_values.len + 1) continue;
+                    if (!std.mem.eql(u8, f.params[0].name, "this")) continue;
+                    if (!f.hasBody()) continue;
+                    const ocls = declaringClassName(frame.module, fid) orelse
+                        frame.module.registry.member_ext_owner_class.get(fid) orelse continue;
+                    if (!host.receiverImplementsType(&c.v, ocls)) continue;
+                    const frt = committed_rt orelse f.params[0].ty.name;
+                    var er_here: ?Value = null;
+                    for (cands) |c2| {
+                        if (c2.v != .Instance) continue;
+                        if (host.receiverImplementsType(&c2.v, frt)) {
+                            er_here = c2.v;
+                            break;
+                        }
                     }
-                    if (ext_recv == null and host.receiverImplementsType(&c.v, rt)) ext_recv = c.v;
+                    const ev = er_here orelse continue;
+                    // The most derived declaration wins: an override on the
+                    // candidate's own class outranks the base it inherits.
+                    const exact = cls_name.len != 0 and
+                        std.mem.eql(u8, simpleClassHead(ocls), simpleClassHead(cls_name));
+                    if (best == null or (exact and !best_exact)) {
+                        best = fid;
+                        best_exact = exact;
+                        best_er = ev;
+                    }
                 }
-                const er = ext_recv orelse break :mext;
-                if (owner == null) break :mext;
-                // Only a genuine mismatch is corrected: when the innermost
-                // candidate already satisfies the declared receiver the
-                // ordinary walk binds it correctly.
-                if (cands.len != 0 and cands[0].v == .Instance and
-                    host.receiverImplementsType(&cands[0].v, rt)) break :mext;
-                const all = try allocator.alloc(Value, arg_values.len + 1);
-                defer allocator.free(all);
-                all[0] = er;
-                for (arg_values, 0..) |v, i| all[i + 1] = v;
-                if (owner) |o| pushEnclosing(&o);
-                defer if (owner != null) popEnclosing();
-                orAudit("CallMemberOrGlobal", name_str, "member_ext_recv", -1, &er);
-                switch (try host.callFuncNamed(allocator, frame.module, cfid, all, &.{})) {
-                    .ok => |v| {
-                        try frame.write(cmg.dst, v);
-                        return .cont;
-                    },
-                    .err => |e| return raiseStep(frame, e),
+                if (best) |b| {
+                    owner = c.v;
+                    target = b;
+                    ext_recv = best_er;
+                    break;
                 }
+            }
+            const t = target orelse break :mext;
+            const er = ext_recv orelse break :mext;
+            const tf = frame.module.funcById(t) orelse break :mext;
+            // Only a genuine mismatch is corrected: when the innermost
+            // candidate already satisfies the declared receiver the ordinary
+            // walk binds it correctly.
+            if (cands.len != 0 and cands[0].v == .Instance and
+                host.receiverImplementsType(&cands[0].v, tf.params[0].ty.name)) break :mext;
+            const all = try allocator.alloc(Value, arg_values.len + 1);
+            defer allocator.free(all);
+            all[0] = er;
+            for (arg_values, 0..) |v, i| all[i + 1] = v;
+            if (owner) |o| pushEnclosing(&o);
+            defer if (owner != null) popEnclosing();
+            orAudit("CallMemberOrGlobal", name_str, "member_ext_recv", -1, &er);
+            switch (try host.callFuncNamed(allocator, frame.module, t, all, &.{})) {
+                .ok => |v| {
+                    try frame.write(cmg.dst, v);
+                    return .cont;
+                },
+                .err => |e| return raiseStep(frame, e),
             }
         }
         // Inside an extension body, the implicit `this` has the
@@ -2663,6 +2702,12 @@ fn frameThisParam(frame: *const Frame) ?usize {
 /// instance method's implicit-`this` call the static receiver type Kotlin
 /// resolves it against — its declaring class. `null` when no class owns it
 /// (a top-level / local function reached with an injected receiver).
+/// The head of a dotted class name (`a.b.C` -> `C`).
+fn simpleClassHead(name: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
+    return name;
+}
+
 pub fn declaringClassName(module: *const Module, fid: ir.FuncId) ?[]const u8 {
     for (module.classes.items) |*c| {
         for (c.methods) |mfid| {

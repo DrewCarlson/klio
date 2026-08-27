@@ -449,6 +449,15 @@ test "internal_props_cross_package" {
     }
 }
 
+test "member_extension_receiver_tower" {
+    try check("member_extension_receiver_tower",
+        \\sized:coord
+        \\branch[leaf(w)]
+        \\scope
+        \\
+    );
+}
+
 test "companion_member_extension_import" {
     try check("companion_member_extension_import",
         \\a=label:none

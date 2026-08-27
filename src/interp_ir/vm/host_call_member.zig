@@ -11294,6 +11294,28 @@ fn enclosingOwnerSet(self: *VmHost, allocator: Allocator) Allocator.Error!std.St
             } else break;
         }
     }
+    // The executing frames' own receivers are implicit receivers too, and
+    // the dynamic chain does not carry them: an extension body binds its
+    // receiver in `params[0]`, never by pushing it. Inside
+    // `ColumnMeasurePolicy.measure(MeasureScope)` the `MeasureScope` is a
+    // `Density`, which is what makes `Dp.roundToPx()` visible there.
+    var fit = ir.eval.frameThisChainIter();
+    while (fit.next()) |fv| {
+        var cur: ?Value = fv;
+        while (cur) |cv| {
+            if (cv != .Instance) break;
+            const g = cv.Instance.borrow();
+            closure.clearRetainingCapacity();
+            collectClassClosure(g.get().class.asPtr(), &closure, &seen, allocator);
+            for (closure.items) |cd| {
+                set.put(cd.name, {}) catch {};
+                set.put(cd.fqn, {}) catch {};
+            }
+            const outer = g.get().outer;
+            g.deinit();
+            cur = outer;
+        }
+    }
     return set;
 }
 
