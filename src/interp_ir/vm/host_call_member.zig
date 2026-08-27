@@ -10946,6 +10946,12 @@ fn inheritedInstanceToString(allocator: Allocator, inst: ObjRef(InstanceData), i
 /// first-class `kind`; the `member_ext_owner_class` side table carries the
 /// owner-gating data (the kind selects which funcs are gated, the side
 /// table says by which owner class).
+fn isMemberExtFid(self: *VmHost, fid: FuncId) bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    return isMemberExt(mg.get(), fid);
+}
+
 fn isMemberExt(mod: *const Module, fid: FuncId) bool {
     if (funcAt(mod, fid)) |f| return f.kind == .member_extension;
     return false;
@@ -11842,6 +11848,48 @@ fn narrowSameNameExtensionTwins(self: *VmHost, allocator: Allocator, receiver: *
 /// bare accessor calls inside engine methods took the full candidate walk on
 /// every single call (half of a recompose workload's runtime), and a walk
 /// MISS memoizes as METHOD_MISS so non-extension calls stop re-walking.
+/// Serve a memoized MEMBER-EXTENSION winner: re-find its owner on the
+/// enclosing chain and invoke it with that owner pushed, exactly as the walk
+/// does. The cache entry is keyed by the chain SHAPE, so the owner sits at
+/// the same position with the same class; only the instance differs per
+/// call. Declines (null) whenever the shape is not the plain one the walk
+/// resolved, and the caller re-walks.
+fn serveCachedMemberExt(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value) Allocator.Error!?EvalResult {
+    const mg = self.module.borrow();
+    const mod = mg.get();
+    const f = funcAt(mod, fid) orelse {
+        mg.deinit();
+        return null;
+    };
+    if (!f.hasBody() or f.params.len != args.len + 1) {
+        mg.deinit();
+        return null;
+    }
+    const owner = mod.registry.member_ext_owner_class.get(fid) orelse {
+        mg.deinit();
+        return null;
+    };
+    const inst_opt = memberExtOwnerInstance(self, allocator, receiver, owner) catch {
+        mg.deinit();
+        return null;
+    };
+    const inst = inst_opt orelse {
+        mg.deinit();
+        return null;
+    };
+    if (inst != .Instance) {
+        mg.deinit();
+        return null;
+    }
+    const all = try prependReceiver(allocator, receiver, args);
+    defer if (runtime.freeScratch()) allocator.free(all);
+    ir.eval.pushEnclosing(&inst);
+    const r = try callFuncRec(self, allocator, mod, fid, all);
+    ir.eval.popEnclosing();
+    mg.deinit();
+    return r;
+}
+
 fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
 
     runtime.prof.opRoute(3);
@@ -11872,7 +11920,10 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     if (chain_key) |k| {
         if (extMethodCacheGet(self, k)) |fid| {
             if (fid == METHOD_MISS) return null;
-            if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
+            const f: FuncId = @enumFromInt(fid);
+            if (isMemberExtFid(self, f)) {
+                if (try serveCachedMemberExt(self, allocator, receiver, f, args)) |r| return r;
+            } else if (try invokeMethodFuncId(self, allocator, receiver, f, args)) |r| return r;
         }
     }
     var saw_member_ext = false;
@@ -12546,6 +12597,13 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
             } else if (chain_key) |k| {
                 extMethodCachePut(self, k, @intFromEnum(c.fid));
             }
+        } else if (sam_target == null and c.func.params.len == args.len + 1) {
+            // A member-extension winner is owner-dependent, but the owner is
+            // recovered from the chain at serve time and the key folds the
+            // chain SHAPE, so the resolution is still a pure function of the
+            // key. Without this every such call re-ran the whole ladder
+            // (3.0us vs 0.37us for a plain member call).
+            if (chain_key) |k| extMethodCachePut(self, k, @intFromEnum(c.fid));
         }
         const r = try callFuncRec(self, allocator, mod, c.fid, all);
         if (pushed_owner) ir.eval.popEnclosing();

@@ -449,6 +449,14 @@ test "internal_props_cross_package" {
     }
 }
 
+test "member_extension_owner_memo" {
+    try check("member_extension_owner_memo",
+        \\A7 bB7 A7 bB7 A7 bB7
+        \\A7 bB7
+        \\
+    );
+}
+
 test "short_uppercase_user_type" {
     try check("short_uppercase_user_type",
         \\CFc
