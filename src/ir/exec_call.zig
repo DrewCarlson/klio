@@ -1935,6 +1935,13 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                     committed_rt = cf.params[0].ty.name;
                 }
             }
+            // Cheap early-out before any candidate scanning: when the
+            // innermost receiver already satisfies the committed target's
+            // declared receiver, the ordinary walk binds it correctly.
+            if (committed_rt) |crt| {
+                if (cands.len != 0 and cands[0].v == .Instance and
+                    host.receiverImplementsType(&cands[0].v, crt)) break :mext;
+            }
             var owner: ?Value = null;
             var target: ?ir.FuncId = null;
             var ext_recv: ?Value = null;
@@ -2708,13 +2715,29 @@ fn simpleClassHead(name: []const u8) []const u8 {
     return name;
 }
 
+/// The class that declares `fid`, over a lazily built reverse index. The
+/// linear scan this replaces is O(classes x methods) per lookup, which a
+/// dispatch arm consulting several candidate fids per call turned into the
+/// dominant cost of a compose recomposition (63% of one profile).
+var decl_class_cache: ?std.AutoHashMap(u32, []const u8) = null;
+var decl_class_module: ?*const Module = null;
+var decl_class_mutex: runtime.SpinMutex = .{};
+
 pub fn declaringClassName(module: *const Module, fid: ir.FuncId) ?[]const u8 {
-    for (module.classes.items) |*c| {
-        for (c.methods) |mfid| {
-            if (@intFromEnum(mfid) == @intFromEnum(fid)) return c.name;
+    decl_class_mutex.lock();
+    defer decl_class_mutex.unlock();
+    if (decl_class_module != module or decl_class_cache == null) {
+        if (decl_class_cache) |*old_map| old_map.deinit();
+        var map = std.AutoHashMap(u32, []const u8).init(std.heap.page_allocator);
+        for (module.classes.items) |*c| {
+            for (c.methods) |mfid| {
+                map.put(@intFromEnum(mfid), c.name) catch {};
+            }
         }
+        decl_class_cache = map;
+        decl_class_module = module;
     }
-    return null;
+    return decl_class_cache.?.get(@intFromEnum(fid));
 }
 
 /// The calling frame's receiver, an Instance from either a `this`-named
