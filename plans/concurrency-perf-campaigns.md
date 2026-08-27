@@ -100,12 +100,41 @@ Work items:
       validatePotentialDeadlock; ratchet RAISED 1381 -> 1386,
       MAX_FAILED LOWERED 11 -> 5. Remaining for target-0: vpd's 8.5x
       (Front A) and the 10/10-consecutive-solo confirmation runs.
-- [ ] Verify whether the 5 standing corpus compose load-flakes
-      (compose_foundation/material3/material3_text/multiwindow/window under
-      `--jobs 4`) share the root; they are contention-sensitivity of the same
-      machinery by hypothesis. If they fall, pin them green in the corpus
-      run; if not, they move to task 2 (throughput) or get their own root
-      entry here.
+- [~] TOOLING NOTE (2026-08-27): `scripts/corpus_check.py` is OBSOLETE —
+      it diffs the Zig binary against `target/release/klio`, the retired
+      Rust reference, so it reports 0/N with the reference absent. The
+      live example oracles are `itest-check_examples` and
+      `itest-parity_corpus_pinned` (both green). Verify the 5 flakes by
+      running them directly.
+- [x] ANSWERED 2026-08-27, and the load-flake hypothesis is DISPROVEN.
+      Run solo against freshly built local packs: compose_foundation and
+      compose_material3 PASS (70s); the other three fail
+      DETERMINISTICALLY, and both failures are ONE root, not contention:
+      an implicit MEMBER-EXTENSION RECEIVER is lost at dispatch.
+      `compose_multiwindow`/`compose_window` die on
+      `unresolved global requestFocus` — inside
+      `SemanticsPropertyReceiver.applySemantics()` (invoked as
+      `with(it) { config.applySemantics() }`) the bare
+      `requestFocus(action = ::requestFocus)` must bind the imported
+      `SemanticsPropertyReceiver.requestFocus` extension, but the
+      runtime candidate walk offers only the DISPATCH receiver
+      (`[icand-append]` shows FocusableNode twice, and `[strictext]`
+      probes only FocusableNode) — the extension receiver `config`
+      never enters the walk. `compose_material3_text` dies on
+      `Vm::call_member roundToPx on Dp`, the same shape:
+      `Dp.roundToPx()` is a MEMBER EXTENSION OF `Density`, so with the
+      Density receiver missing the call degrades to a member lookup on
+      Dp. NEXT: publish a member-extension frame's extension receiver
+      as the innermost implicit candidate on the interface/virtual-slot
+      route (synthetic repros of the same source shape PASS, so the
+      loss is in that invocation route, not in resolution).
+- [x] ROOT FIXED en route (accessor thunks): property-accessor bodies
+      lowered with NO parameter metadata, so `frameThisParam` found no
+      `this`, the implicit-receiver walk never ran, and a bare member
+      call inside any accessor fell through to the global tier — an
+      inner class's setter calling an OUTER class member died as
+      `unresolved global`. The three thunk builders that were missing
+      `accessorParams` now record it (a sibling builder already did).
 
 ## Task 2 — compose suite wall time
 
@@ -127,9 +156,13 @@ Work items:
       2.08/2.09/2.07 ms per ~30-group round across 4000 rounds with an aging
       parent table; zero growth). No pathology; the cost is genuine
       interpreted work, so the wall-time lever is per-call overhead.
-- [ ] Attack the top interpreter frames the profile names (dispatch, field
-      access, allocation — whatever actually dominates), measure after each
-      change on the SAME solo class before touching the suite.
+- [x] Attack the top interpreter frames the profile names — done across
+      the rounds below (env-probe caching, leaf bytecode serve, bc/site
+      memos, GetField fast serves, outer-hop routes, dead-closure
+      elision, the inline-parity splice tiers, the snapshot/CHAMP/whole
+      -put serves). Cumulative on the shared shapes: oneRect 61 -> 21s,
+      framed micro 1.56 -> 1.06s, map replica 4.9 -> 1.42s/rep, gate
+      727 -> 334s.
 - 2026-08-22 SOLO GATE BASELINE: 727s wall (including the itest binary
   rebuild) — 1378 passed (ABOVE the 1375 ratchet, best measurement ever
   recorded), 12 counted failures = exactly the throughput-timeout family

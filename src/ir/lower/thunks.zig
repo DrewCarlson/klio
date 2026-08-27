@@ -534,6 +534,13 @@ pub fn lowerAccessorBlockRet(
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, try accessorReturnTy(allocator, expected));
+    // Record the synthesized parameter list. Without it the frame's `this`
+    // is invisible to `frameThisParam`, so a bare member call in the body
+    // finds NO implicit receiver and falls through to the global tier —
+    // an inner class's accessor calling the OUTER class's member died as
+    // `unresolved global` (the receiver walk never ran, so it never
+    // followed the `outer` link).
+    func.params = try accessorParams(allocator, params);
     func.has_receiver_param = leadsWithThis(params);
     return pushFunc(module, func);
 }
@@ -568,6 +575,7 @@ pub fn lowerSetterBlockTyped(
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
+    func.params = try accessorParams(allocator, params);
     func.has_receiver_param = leadsWithThis(params);
     return pushFunc(module, func);
 }
@@ -597,6 +605,7 @@ pub fn lowerSetterExprTyped(
     const v = try lowerExpr(&b, expr);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
+    func.params = try accessorParams(allocator, params);
     func.has_receiver_param = leadsWithThis(params);
     return pushFunc(module, func);
 }
