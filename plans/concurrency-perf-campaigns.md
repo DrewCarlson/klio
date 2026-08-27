@@ -124,7 +124,22 @@ Work items:
       `Vm::call_member roundToPx on Dp`, the same shape:
       `Dp.roundToPx()` is a MEMBER EXTENSION OF `Density`, so with the
       Density receiver missing the call degrades to a member lookup on
-      Dp. NEXT (two surgical attempts made and REVERTED as non-firing;
+      Dp. LAYER IDENTIFIED 2026-08-27 by measurement: the call is NOT
+      served by any runtime member-dispatch seam. Trace probes at
+      `invokeMethodFuncId`, at the virtual-slot target inside
+      `invokeVirtualMember`, and at `prepareFlatFromFid` (the flat
+      preparer) printed NOTHING for a member-extension target on this
+      program, while the frame is demonstrably pushed with
+      `params[0] = FocusableNode`. So the override is reached by a
+      STATICALLY RESOLVED call and the wrong receiver is chosen at
+      EMISSION — every runtime-side correction is inert by construction
+      (three were written and reverted). NEXT: dump the CALLER
+      (`BackwardsCompatNode.applySemantics`, `LayoutNode`'s semantics
+      collection) and read which call form and receiver register the
+      lowering emits for `config.applySemantics()` inside `with(it)`;
+      the fix belongs in that emission, which must pass the explicit
+      receiver as `params[0]` and put the `with` subject in dispatch
+      scope. Superseded note (two surgical attempts made and REVERTED;
       the tree keeps only this diagnosis): the correction rule already
       exists in the ANON-OBJECT arm (`anonMethodDispatch` takes the
       extension receiver from the enclosing entries and pushes the
