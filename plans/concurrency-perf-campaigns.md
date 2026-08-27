@@ -125,13 +125,26 @@ instances of what this generalizes.
 - A1. Object-shape sub-ABI: native access to Instance field slots
   (index-claimed like the GetField site memos), object-array elements,
   instance minting via the persistent_map_mut template mechanism, and
-  native->native calls; bail-to-interp on shape surprise.
+  native->native calls; bail-to-interp on shape surprise. Oracle: the
+  transpiler corpus at byte parity (293/293 today), extended with
+  object-shaped programs. NOTE: A1 alone moves no gate number — the emitted
+  bodies only run once A2 registers them.
 - A2. Bake-time AOT: transpile the hot library functions at pack bake (ids are
   pinned there) and ship the .so with the pack, registered through
-  `klio_rt_register_native_leaf`. No runtime JIT.
+  `klio_rt_register_native_leaf`. No runtime JIT. Oracle: the compose gate
+  count unchanged with the natives engaged (`KLIO_NATIVE_TRACE` is the
+  engagement check), then vpd's wall.
 - A3. Retire the hand serves one for one; each serve is its function's oracle.
 - Exit: the snapshot write cycle (currentSnapshot -> readable ->
   builder/put/build -> attemptUpdate) runs with zero interpreted frames.
+
+WHY NOTHING SMALLER WORKS (ceiling arithmetic against the frame census, so a
+future round does not re-derive it): the hot bodies are spread thin. Serving
+the slot-table group readers natively covers ~90 of the ~355 activations per
+recomposition (~1.3x), the composer end/enterGroup/exitGroup another ~46
+(~1.15x), the changelist pushes ~25 (~1.08x) — about 1.6x compounded, and
+~2x with the measured -20% ReleaseFast gate build. vpd needs 4.6x. Only
+compiling the whole recomposition path reaches it.
 
 The census tool for both fronts is `KLIO_FN_PROF` (see
 `docs/development/debugging.md`): it samples the INTERPRETED program's
