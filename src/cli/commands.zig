@@ -208,6 +208,8 @@ pub fn runModuleFiles(
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
     runtime.prof.opProfMaybeStart();
+    runtime.prof.fnProfMaybeStart();
+    ir.eval.frameCountInit();
     interp_ir.resetReceiverThreadLocals();
     interp_ir.resetRunGlobalCaches();
     if (tryImagePath(gpa, paths, features)) |code| return code;
@@ -1997,6 +1999,8 @@ pub fn runTestFiles(
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
     runtime.prof.opProfMaybeStart();
+    runtime.prof.fnProfMaybeStart();
+    ir.eval.frameCountInit();
     interp_ir.resetReceiverThreadLocals();
     interp_ir.resetRunGlobalCaches();
 
@@ -2222,6 +2226,12 @@ fn runTestsOnBuilt(
         report.results.len, report.passed, report.failed, report.skipped,
     });
     if (runtime.envOnce("KLIO_PUMP_DIAG") != null) interp_ir.coroutines_diag.dumpSleepCounts();
+    {
+        const mg = built.module.borrow();
+        defer mg.deinit();
+        ir.eval.fnProfDump(mg.get());
+        ir.eval.frameCountDump(mg.get());
+    }
     ir.eval.callStatsDump();
     ir.eval.dispatch_replay_hits = &interp_ir.VmHost.replayHits;
     ir.eval.dispatchStatsDump();
@@ -2548,6 +2558,12 @@ pub fn runBuiltModuleArgs(
     runtime.prof.maybeStart();
     const res = runMainBigStack(&vm, main, stdout.output());
     runtime.prof.maybeReport();
+    {
+        const mg = built.module.borrow();
+        defer mg.deinit();
+        ir.eval.fnProfDump(mg.get());
+        ir.eval.frameCountDump(mg.get());
+    }
     ir.eval.callStatsDump();
     ir.eval.dispatch_replay_hits = &interp_ir.VmHost.replayHits;
     ir.eval.dispatchStatsDump();

@@ -10946,6 +10946,12 @@ fn inheritedInstanceToString(allocator: Allocator, inst: ObjRef(InstanceData), i
 /// first-class `kind`; the `member_ext_owner_class` side table carries the
 /// owner-gating data (the kind selects which funcs are gated, the side
 /// table says by which owner class).
+fn isMemberExtFid(self: *VmHost, fid: FuncId) bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    return isMemberExt(mg.get(), fid);
+}
+
 fn isMemberExt(mod: *const Module, fid: FuncId) bool {
     if (funcAt(mod, fid)) |f| return f.kind == .member_extension;
     return false;
@@ -11274,6 +11280,99 @@ fn collectClassClosure(
     out.append(allocator, cls) catch return;
     if (cls.parent) |p| collectClassClosure(p.asPtr(), out, seen, allocator);
     for (cls.interfaces) |iface| collectClassClosure(iface.asPtr(), out, seen, allocator);
+}
+
+/// The member EXTENSION named `name` with `nparams` parameters that
+/// `receiver`'s class declares or inherits, most-derived first. Answers from
+/// the module's per-class member index, so a bare member-extension dispatch
+/// costs a walk of the receiver's own supertypes instead of a scan of every
+/// same-named declaration in the program.
+const MEXT_OVERRIDE_MAX = 4;
+const MextOverrideEntry = struct {
+    cls: u64 = 0,
+    name_p: usize = 0,
+    nparams: u32 = 0,
+    n: u32 = 0,
+    fids: [MEXT_OVERRIDE_MAX]u32 = @splat(0),
+    valid: bool = false,
+};
+const MEXT_OVERRIDE_SLOTS = 1024;
+threadlocal var mext_override_cache: [MEXT_OVERRIDE_SLOTS]MextOverrideEntry = @splat(.{});
+
+/// The member EXTENSIONS named `name` with `nparams` parameters that
+/// `receiver`'s class declares or inherits, most-derived first (at most
+/// `out.len`). Answers from the module's per-class member index behind a
+/// direct-mapped per-thread cache, so a repeated bare member-extension
+/// dispatch — the changelist executes one operation per node update — costs
+/// a probe instead of a scan over every same-named declaration in the
+/// program. Returns how many entries of `out` were written.
+pub fn memberExtOverridesFor(self: *VmHost, receiver: *const Value, name: []const u8, nparams: usize, out: []ir.FuncId) usize {
+    if (receiver.* != .Instance) return 0;
+    const cls_id: u64 = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        break :blk @intCast(g.get().class.identity());
+    };
+    const slot = (cls_id ^ (@intFromPtr(name.ptr) >> 3) ^ (nparams *% 0x9E37)) & (MEXT_OVERRIDE_SLOTS - 1);
+    const e = mext_override_cache[slot];
+    if (e.valid and e.cls == cls_id and e.name_p == @intFromPtr(name.ptr) and e.nparams == nparams) {
+        const n = @min(e.n, out.len);
+        for (0..n) |i| out[i] = @enumFromInt(e.fids[i]);
+        return n;
+    }
+    var found: [MEXT_OVERRIDE_MAX]ir.FuncId = @splat(@enumFromInt(0));
+    const n = memberExtOverrideLookup(self, receiver, name, nparams, &found);
+    var entry = MextOverrideEntry{
+        .cls = cls_id,
+        .name_p = @intFromPtr(name.ptr),
+        .nparams = @intCast(nparams),
+        .n = @intCast(n),
+        .valid = true,
+    };
+    for (0..n) |i| entry.fids[i] = @intCast(found[i].int());
+    mext_override_cache[slot] = entry;
+    const m = @min(n, out.len);
+    for (0..m) |i| out[i] = found[i];
+    return m;
+}
+
+fn memberExtOverrideLookup(self: *VmHost, receiver: *const Value, name: []const u8, nparams: usize, out: []ir.FuncId) usize {
+    const a = self.allocator;
+    var closure: std.ArrayList(*const ClassDef) = .empty;
+    defer closure.deinit(a);
+    var seen: std.ArrayList(*const ClassDef) = .empty;
+    defer seen.deinit(a);
+    {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        collectClassClosure(g.get().class.asPtr(), &closure, &seen, a);
+    }
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    var n: usize = 0;
+    for (closure.items) |cd| {
+        for ([2][]const u8{ cd.fqn, cd.name }) |owner| {
+            if (owner.len == 0) continue;
+            for (mod.memberDecls(owner, name)) |fid| {
+                const f = funcAt(mod, fid) orelse continue;
+                if (f.kind != .member_extension) continue;
+                if (f.params.len != nparams) continue;
+                if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+                if (!f.hasBody()) continue;
+                var dup = false;
+                for (out[0..n]) |seen_fid| {
+                    if (seen_fid.int() == fid.int()) dup = true;
+                }
+                if (dup) continue;
+                out[n] = fid;
+                n += 1;
+                if (n == out.len) return n;
+            }
+            if (std.mem.eql(u8, cd.fqn, cd.name)) break;
+        }
+    }
+    return n;
 }
 
 /// Set of class names (with the full supertype closure — superclasses AND
@@ -11749,6 +11848,48 @@ fn narrowSameNameExtensionTwins(self: *VmHost, allocator: Allocator, receiver: *
 /// bare accessor calls inside engine methods took the full candidate walk on
 /// every single call (half of a recompose workload's runtime), and a walk
 /// MISS memoizes as METHOD_MISS so non-extension calls stop re-walking.
+/// Serve a memoized MEMBER-EXTENSION winner: re-find its owner on the
+/// enclosing chain and invoke it with that owner pushed, exactly as the walk
+/// does. The cache entry is keyed by the chain SHAPE, so the owner sits at
+/// the same position with the same class; only the instance differs per
+/// call. Declines (null) whenever the shape is not the plain one the walk
+/// resolved, and the caller re-walks.
+fn serveCachedMemberExt(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value) Allocator.Error!?EvalResult {
+    const mg = self.module.borrow();
+    const mod = mg.get();
+    const f = funcAt(mod, fid) orelse {
+        mg.deinit();
+        return null;
+    };
+    if (!f.hasBody() or f.params.len != args.len + 1) {
+        mg.deinit();
+        return null;
+    }
+    const owner = mod.registry.member_ext_owner_class.get(fid) orelse {
+        mg.deinit();
+        return null;
+    };
+    const inst_opt = memberExtOwnerInstance(self, allocator, receiver, owner) catch {
+        mg.deinit();
+        return null;
+    };
+    const inst = inst_opt orelse {
+        mg.deinit();
+        return null;
+    };
+    if (inst != .Instance) {
+        mg.deinit();
+        return null;
+    }
+    const all = try prependReceiver(allocator, receiver, args);
+    defer if (runtime.freeScratch()) allocator.free(all);
+    ir.eval.pushEnclosing(&inst);
+    const r = try callFuncRec(self, allocator, mod, fid, all);
+    ir.eval.popEnclosing();
+    mg.deinit();
+    return r;
+}
+
 fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
 
     runtime.prof.opRoute(3);
@@ -11779,7 +11920,10 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     if (chain_key) |k| {
         if (extMethodCacheGet(self, k)) |fid| {
             if (fid == METHOD_MISS) return null;
-            if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
+            const f: FuncId = @enumFromInt(fid);
+            if (isMemberExtFid(self, f)) {
+                if (try serveCachedMemberExt(self, allocator, receiver, f, args)) |r| return r;
+            } else if (try invokeMethodFuncId(self, allocator, receiver, f, args)) |r| return r;
         }
     }
     var saw_member_ext = false;
@@ -12453,6 +12597,13 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
             } else if (chain_key) |k| {
                 extMethodCachePut(self, k, @intFromEnum(c.fid));
             }
+        } else if (sam_target == null and c.func.params.len == args.len + 1) {
+            // A member-extension winner is owner-dependent, but the owner is
+            // recovered from the chain at serve time and the key folds the
+            // chain SHAPE, so the resolution is still a pure function of the
+            // key. Without this every such call re-ran the whole ladder
+            // (3.0us vs 0.37us for a plain member call).
+            if (chain_key) |k| extMethodCachePut(self, k, @intFromEnum(c.fid));
         }
         const r = try callFuncRec(self, allocator, mod, c.fid, all);
         if (pushed_owner) ir.eval.popEnclosing();

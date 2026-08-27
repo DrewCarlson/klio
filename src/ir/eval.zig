@@ -522,6 +522,7 @@ fn classifyFlattenable(f: *const Func) u8 {
 /// fresh at the call, never a stored pointer — which also keeps the thread
 /// pointer to one lookup per frame operation instead of one per pool.
 fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32, no_fill: bool) Allocator.Error!std.ArrayList(Value) {
+    if (frame_count_on) frame_alloc_total += 1;
     const ra = regsAlloc(allocator);
     if (ev.regs_pool.items.len > 0) {
         const buf = ev.regs_pool.items[ev.regs_pool.items.len - 1];
@@ -1415,6 +1416,93 @@ pub fn callStatsDump() void {
     std.debug.print("[call-stats] total={d} distinct={d}\n", .{ total, list.items.len });
     const top = @min(list.items.len, 60);
     for (list.items[0..top]) |e| std.debug.print("[call-stats] {d:>10} {s}\n", .{ e.n, e.fqn });
+}
+
+/// KLIO_FN_PROF report: the sampler's per-id counts resolved to function
+/// names through `module`. Ids fold into the table, so a name is reported
+/// only when its id owns the slot; the fold is 1:1 for every program with
+/// fewer functions than the table's slots.
+/// KLIO_FRAME_COUNT / KLIO_FRAME_CENSUS: how many interpreted activations a
+/// workload runs, and which functions they belong to. `activations` counts
+/// register-bank acquisitions (one per real frame); `entries` counts
+/// `runFrameExec` entries, which is higher because a flat call re-enters its
+/// caller's frame. The frames-per-unit-of-work metric that separates "too
+/// many frames" (splice work) from "frames too expensive" (activation cost).
+pub var frame_count_total: u64 = 0;
+pub var frame_alloc_total: u64 = 0;
+pub var frame_count_on: bool = false;
+const FRAME_CENSUS_SLOTS: usize = 1 << 21;
+var frame_census: [FRAME_CENSUS_SLOTS]u32 = @splat(0);
+var frame_census_on: bool = false;
+
+pub var frame_watch_want: []const u8 = "";
+
+pub fn frameCountInit() void {
+    frame_count_on = runtime.envOnce("KLIO_FRAME_COUNT") != null;
+    if (runtime.envOnce("KLIO_FRAME_WATCH")) |w| {
+        frame_watch_want = w;
+        frame_count_on = true;
+    }
+    frame_census_on = runtime.envOnce("KLIO_FRAME_CENSUS") != null;
+    if (frame_census_on) frame_count_on = true;
+}
+
+inline fn frameCensusBump(fid: u32) void {
+    if (!frame_census_on) return;
+    frame_census[fid & (FRAME_CENSUS_SLOTS - 1)] +%= 1;
+}
+
+pub fn frameCountDump(module: *const Module) void {
+    if (!frame_count_on) return;
+    std.debug.print("[frames] entries={d} activations={d}\n", .{ frame_count_total, frame_alloc_total });
+    if (!frame_census_on) return;
+    const Entry = struct { name: []const u8, n: u32 };
+    var list: std.ArrayList(Entry) = .empty;
+    defer list.deinit(std.heap.page_allocator);
+    var fid: u32 = 0;
+    while (fid < frame_census.len) : (fid += 1) {
+        const n = frame_census[fid];
+        if (n == 0) continue;
+        const f = module.funcById(@enumFromInt(fid));
+        const nm: []const u8 = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "<unknown>";
+        list.append(std.heap.page_allocator, .{ .name = nm, .n = n }) catch return;
+    }
+    std.mem.sort(Entry, list.items, {}, struct {
+        fn lt(_: void, a: Entry, b: Entry) bool {
+            return a.n > b.n;
+        }
+    }.lt);
+    const top = @min(list.items.len, 40);
+    for (list.items[0..top]) |e| std.debug.print("[frames] {d:>9} {s}\n", .{ e.n, e.name });
+}
+
+pub fn fnProfDump(module: *const Module) void {
+    const counts = runtime.prof.fnProfCounts() orelse return;
+    const Entry = struct { name: []const u8, n: u32 };
+    var list: std.ArrayList(Entry) = .empty;
+    defer list.deinit(std.heap.page_allocator);
+    var total: u64 = 0;
+    var fid: u32 = 0;
+    while (fid < counts.len) : (fid += 1) {
+        const n = counts[fid].load(.monotonic);
+        if (n == 0) continue;
+        total += n;
+        const f = module.funcById(@enumFromInt(fid));
+        const nm: []const u8 = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "<unknown>";
+        list.append(std.heap.page_allocator, .{ .name = nm, .n = n }) catch return;
+    }
+    if (total == 0) return;
+    std.mem.sort(Entry, list.items, {}, struct {
+        fn lt(_: void, a: Entry, b: Entry) bool {
+            return a.n > b.n;
+        }
+    }.lt);
+    std.debug.print("[fn-prof] samples={d} distinct={d}\n", .{ total, list.items.len });
+    const top = @min(list.items.len, 40);
+    for (list.items[0..top]) |e| {
+        const pct = @as(f64, @floatFromInt(e.n)) * 100.0 / @as(f64, @floatFromInt(total));
+        std.debug.print("[fn-prof] {d:>7.2}% {d:>8} {s}\n", .{ pct, e.n, e.name });
+    }
 }
 
 /// Cached KLIO_ERR_TRACE presence — the flag is read on every dispatch-miss
@@ -3049,6 +3137,13 @@ pub const Frame = struct {
         // every write and every slot at teardown, so its frames stay
         // eagerly filled (exactly the leaf serve's rule).
         const no_fill = !runtime.reclaimEnabled() and func.frameNoFill();
+        if (frame_count_on) {
+            frameCensusBump(func.id.int());
+            if (frame_watch_want.len != 0 and std.mem.indexOf(u8, func.name, frame_watch_want) != null) {
+                const caller: []const u8 = if (evtls.frame_chain) |fr| fr.func.name else "<top>";
+                std.debug.print("[framewatch] {s} <- {s}\n", .{ func.name, caller });
+            }
+        }
         const regs = try acquireRegs(ev, allocator, func.n_locals, no_fill);
         return .{
             .module = module,
@@ -5888,6 +5983,14 @@ fn runFrameExec(
     park_out: *?ParkPoint,
     host: *H,
 ) Allocator.Error!EvalResult {
+    if (frame_count_on) frame_count_total += 1;
+    // KLIO_FN_PROF: attribute samples to the interpreted function running
+    // here, restoring the caller's on exit so the histogram is self-time.
+    const fn_prof_prev = runtime.prof.current_fn;
+    if (runtime.prof.fn_prof_active) runtime.prof.current_fn = frame.func.id.int();
+    defer if (runtime.prof.fn_prof_active) {
+        runtime.prof.current_fn = fn_prof_prev;
+    };
     // Resolved once: the per-instruction gates below would otherwise pay a
     // dynamic thread-local lookup each, which the compiler cannot hoist past
     // the dispatch calls between them.

@@ -26,6 +26,25 @@ const CatchHandler = ir.CatchHandler;
 pub const StringSet = std.StringHashMap(void);
 const StringRegMap = std.StringHashMap(Reg);
 
+/// A mutable var's shared-cell register plus the scope depth it was bound
+/// at. The depth lets `mutableHome` honor a splice-resolve window: a home
+/// installed by a spliced inline body must be invisible to the call-site
+/// lambda lowered inside that splice, exactly as `resolve` hides those
+/// scopes — a body-local `var index` otherwise captures the caller lambda's
+/// `index = …` write (the Duration parser's cursor never advanced).
+const MutableHome = struct { reg: Reg, depth: usize };
+
+/// The active spliced-lambda resolution window: free names resolve in the
+/// caller scopes below `caller_depth` plus the lambda's own scopes at and
+/// above `own_base`, skipping the spliced inline fn's scopes between.
+pub const SpliceWindow = struct { caller_depth: usize, own_base: usize };
+
+/// See `finally_window_stack`.
+pub const FinallyWindow = struct {
+    window: ?SpliceWindow,
+    bands_len: usize,
+};
+
 /// Per inline-fn-splice frame: a lambda-param substitution map paired
 /// with the `inline_return` snapshot taken when the frame was pushed.
 const InlineLambdaFrame = struct {
@@ -498,7 +517,7 @@ pub const FuncBuilder = struct {
     /// the local always resolve to this reg; writes emit a Move
     /// into it. This gives the IR's flat block model the slot
     /// semantics that mutable Kotlin locals need.
-    mutable_homes: StringRegMap,
+    mutable_homes: std.StringHashMap(MutableHome),
     /// Per-scope undo journal for `mutables`/`mutable_homes`. A
     /// block-scoped `var` must stop shadowing when its block ends: a
     /// same-named class property written after the block would otherwise
@@ -767,6 +786,15 @@ pub const FuncBuilder = struct {
     /// try each finally belongs to, so an inline `return` can pop exactly
     /// those runtime `TryFrame`s when it jumps to its join.
     finally_body_stack: std.ArrayList(BlockId) = .empty,
+    /// The splice-resolve window (and hidden-band depth) active when each
+    /// finally was PUSHED. A finally body replayed at a jump site re-lowers
+    /// under whatever window is active THERE — but its names belong to the
+    /// scope context where its `try` was lowered: the spliced
+    /// `synchronized` body's `finally { __klioMonitorExit(lock) }` replayed
+    /// inside a spliced lambda resolved `lock` against the lambda's caller
+    /// region and found a foreign package's global instead of the body
+    /// param.
+    finally_window_stack: std.ArrayList(FinallyWindow) = .empty,
     is_lambda_body: bool,
     is_anon_fn_body: bool,
     is_named_local_fn: bool,
@@ -812,7 +840,7 @@ pub const FuncBuilder = struct {
     /// skipping the inline fn's parameter scopes in between whose names
     /// would otherwise shadow a same-named caller variable the lambda
     /// body references. Null when no such splice is in progress.
-    lambda_splice_resolve: ?struct { caller_depth: usize, own_base: usize } = null,
+    lambda_splice_resolve: ?SpliceWindow = null,
     /// Scope-index bands hidden by ENCLOSING lambda-splice windows, one
     /// `[lo, hi]` per window still on the splice stack. A nested window's
     /// caller region (`[0, caller_depth)`) can reach past an outer splice's
@@ -936,7 +964,7 @@ pub const FuncBuilder = struct {
             .capture_regs = StringRegMap.init(allocator),
             .capture_loads_emitted = StringSet.init(allocator),
             .mutables = StringSet.init(allocator),
-            .mutable_homes = StringRegMap.init(allocator),
+            .mutable_homes = std.StringHashMap(MutableHome).init(allocator),
             .boxed_vars = StringSet.init(allocator),
             .any_typed_locals = StringSet.init(allocator),
             .broad_coll_locals = StringSet.init(allocator),
@@ -1102,6 +1130,7 @@ pub const FuncBuilder = struct {
         self.implicit_receiver_tower.deinit(a);
         self.finally_stack.deinit(a);
         self.finally_body_stack.deinit(a);
+        self.finally_window_stack.deinit(a);
         self.inline_return.deinit(a);
         self.inline_stack.deinit(a);
         for (self.inline_lambda_subst.items) |*frame| {
@@ -1384,10 +1413,23 @@ pub const FuncBuilder = struct {
 
     pub fn setMutableHome(self: *FuncBuilder, name: []const u8, reg: Reg) Allocator.Error!void {
         try self.recordMutableUndo(name);
-        try self.mutable_homes.put(name, reg);
+        try self.mutable_homes.put(name, .{
+            .reg = reg,
+            .depth = self.scopes.items.len -| 1,
+        });
     }
     pub fn mutableHome(self: *const FuncBuilder, name: []const u8) ?Reg {
-        return self.mutable_homes.get(name);
+        const e = self.mutable_homes.get(name) orelse return null;
+        // Inside a spliced-lambda window the inline body's scopes are not
+        // the lambda's lexical scope: a home bound there is hidden, the
+        // same rule `resolve` applies to plain bindings.
+        if (self.lambda_splice_resolve) |w| {
+            if (e.depth >= w.caller_depth and e.depth < w.own_base) return null;
+            for (self.splice_hidden_bands.items) |band| {
+                if (e.depth >= band.lo and e.depth <= band.hi) return null;
+            }
+        }
+        return e.reg;
     }
 
     /// Replace the boxed-var set with `names`. Takes ownership of
@@ -2760,10 +2802,19 @@ pub const FuncBuilder = struct {
     pub fn pushFinally(self: *FuncBuilder, block: ast.Block, body_entry: BlockId) Allocator.Error!void {
         try self.finally_stack.append(self.allocator, block);
         try self.finally_body_stack.append(self.allocator, body_entry);
+        try self.finally_window_stack.append(self.allocator, .{
+            .window = self.lambda_splice_resolve,
+            .bands_len = self.splice_hidden_bands.items.len,
+        });
     }
     pub fn popFinally(self: *FuncBuilder) void {
         _ = self.finally_stack.pop();
         _ = self.finally_body_stack.pop();
+        _ = self.finally_window_stack.pop();
+    }
+    /// Snapshot of the per-finally window records for a jump replay.
+    pub fn finallyWindowsSnapshot(self: *const FuncBuilder) Allocator.Error![]FinallyWindow {
+        return self.allocator.dupe(FinallyWindow, self.finally_window_stack.items);
     }
     /// The try-region body-entry ids for the finallys currently at
     /// `finally_stack[from..]` — the frames an inline `return` targeting a
@@ -3312,7 +3363,7 @@ fn instDefOf(inst: *const ir.Inst) ?ir.Reg {
 /// that redeclared it pops (see `FuncBuilder.mutable_undo`).
 pub const MutableUndo = struct {
     name: []const u8,
-    prev_home: ?Reg,
+    prev_home: ?MutableHome,
     prev_mutable: bool,
 };
 

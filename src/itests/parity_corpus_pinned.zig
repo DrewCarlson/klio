@@ -449,6 +449,33 @@ test "internal_props_cross_package" {
     }
 }
 
+test "splice_hygiene_shadow" {
+    try check("splice_hygiene_shadow",
+        \\member=6
+        \\member=11
+        \\ext=18
+        \\signed=101
+        \\plain=1
+        \\
+    );
+}
+
+test "wide_infix_chain" {
+    try check("wide_infix_chain",
+        \\wide=20
+        \\wide=20
+        \\
+    );
+}
+
+test "member_extension_owner_memo" {
+    try check("member_extension_owner_memo",
+        \\A7 bB7 A7 bB7 A7 bB7
+        \\A7 bB7
+        \\
+    );
+}
+
 test "short_uppercase_user_type" {
     try check("short_uppercase_user_type",
         \\CFc

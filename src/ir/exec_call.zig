@@ -1922,6 +1922,7 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
         // `with(other) { f() }` inside `f` re-entered the ENCLOSING
         // declaration instead of `other`'s override, recursing forever.
         if (comptime @hasDecl(H, "receiverImplementsType")) mext: {
+            if (!mextArmEnabled()) break :mext;
             if (!argNamesAllNull(cmg.arg_names)) break :mext;
             // A committed target names the declared receiver outright; an
             // interface call arrives uncommitted and each candidate's own
@@ -1947,22 +1948,16 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
             var ext_recv: ?Value = null;
             for (cands) |c| {
                 if (c.v != .Instance) continue;
-                var best: ?ir.FuncId = null;
-                var best_exact = false;
-                var best_er: ?Value = null;
-                const cls_name: []const u8 = if (comptime @hasDecl(H, "debugClassNameOf"))
-                    host.debugClassNameOf(&c.v)
-                else
-                    "";
-                for (frame.module.funcsBySimpleName(name_str)) |fid| {
+                // The receiver's own class index answers "does this class
+                // declare or inherit a member extension of this name", so a
+                // dispatch costs a supertype walk instead of a scan over
+                // every same-named declaration in the program.
+                if (comptime !@hasDecl(H, "memberExtOverridesFor")) break :mext;
+                var fids: [4]ir.FuncId = @splat(@enumFromInt(0));
+                const nf = host.memberExtOverridesFor(&c.v, name_str, arg_values.len + 1, &fids);
+                if (nf == 0) continue;
+                for (fids[0..nf]) |fid| {
                     const f = frame.module.funcById(fid) orelse continue;
-                    if (f.kind != .member_extension) continue;
-                    if (f.params.len != arg_values.len + 1) continue;
-                    if (!std.mem.eql(u8, f.params[0].name, "this")) continue;
-                    if (!f.hasBody()) continue;
-                    const ocls = declaringClassName(frame.module, fid) orelse
-                        frame.module.registry.member_ext_owner_class.get(fid) orelse continue;
-                    if (!host.receiverImplementsType(&c.v, ocls)) continue;
                     const frt = committed_rt orelse f.params[0].ty.name;
                     var er_here: ?Value = null;
                     for (cands) |c2| {
@@ -1973,22 +1968,12 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                         }
                     }
                     const ev = er_here orelse continue;
-                    // The most derived declaration wins: an override on the
-                    // candidate's own class outranks the base it inherits.
-                    const exact = cls_name.len != 0 and
-                        std.mem.eql(u8, simpleClassHead(ocls), simpleClassHead(cls_name));
-                    if (best == null or (exact and !best_exact)) {
-                        best = fid;
-                        best_exact = exact;
-                        best_er = ev;
-                    }
-                }
-                if (best) |b| {
                     owner = c.v;
-                    target = b;
-                    ext_recv = best_er;
+                    target = fid;
+                    ext_recv = ev;
                     break;
                 }
+                if (target != null) break;
             }
             const t = target orelse break :mext;
             const er = ext_recv orelse break :mext;
@@ -3222,6 +3207,19 @@ var or_audit_enabled: bool = false;
 /// runtime arms are live before an emit site is statically classified.
 var route_trace_init: bool = false;
 var route_trace_val: ?[]const u8 = null;
+/// KLIO_MEXT_ARM=0 disables the bare member-extension receiver arm, for
+/// single-binary A/B of its cost.
+fn mextArmEnabled() bool {
+    const S = struct {
+        var state: u8 = 0;
+    };
+    if (S.state == 0) {
+        const v = runtime.envOnce("KLIO_MEXT_ARM") orelse "1";
+        S.state = if (std.mem.eql(u8, v, "0")) 1 else 2;
+    }
+    return S.state == 2;
+}
+
 fn routeTraceOn(name: []const u8) bool {
     if (!route_trace_init) {
         route_trace_val = if (std.c.getenv("KLIO_ROUTE")) |w| std.mem.span(w) else null;
