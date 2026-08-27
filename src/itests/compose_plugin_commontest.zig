@@ -67,7 +67,13 @@ const runtime = @import("runtime");
 // RAISED 1377 -> 1381 after the literal-lambda splice landed by default
 // (with the builder bulk-op serves and the dead-closure skip): gate runs
 // at 1383 and 1385 passed; margin below both covers the ±3 band.
-const BASELINE: usize = 1381;
+// RAISED 1381 -> 1386 after the inline-parity rounds (qualified splice,
+// ext-lambda tier, seated subjects), the whole-cycle SnapshotStateMap.put
+// serve, and the perm-mint birth-barrier GC fix: the gate runs at 1389
+// with the ONLY real failure validatePotentialDeadlock, and
+// SnapshotStateMapTests is 59/59 solo. Margin below 1389 covers the
+// load-flake band (Movable, the Pausable pair, frame-clock).
+const BASELINE: usize = 1386;
 
 /// Ceiling on failing cases, the mirror of `BASELINE`. Measured solo at
 /// 1380 passed / 10 failed once companion extension properties resolved
@@ -88,7 +94,13 @@ const BASELINE: usize = 1381;
 /// throughput-bound and varies by ~40 between runs (see the note above the
 /// baseline), so a DNC gate would be a flake, not a signal. Failures do not
 /// have that variance — a killed class contributes neither.
-const MAX_FAILED: usize = 11;
+/// LOWERED 11 -> 5 with the concurrency family closed (the map class is
+/// 59/59 solo; the only standing real failure is
+/// `RecomposerTests.validatePotentialDeadlock`, a pure throughput
+/// ceiling). The slack above 1 covers the known load flakes that appear
+/// only at gate contention: MovableContent, the PausableComposition
+/// pair, and the frame-clock test.
+const MAX_FAILED: usize = 5;
 
 const UPSTREAM = "kotlin-klio/klio-compose-runtime/upstream/compose/runtime";
 const ROOTS = [_][]const u8{

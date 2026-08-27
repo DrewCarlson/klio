@@ -732,6 +732,10 @@ const ResumeFrames = struct {
 const FrameAnchor = struct {
     chain: *const ?*Frame,
     resuming: *const ?*ResumeFrames,
+    /// Owning thread, for the frame-walk audit (`KLIO_GC_FRAME_AUDIT=1`):
+    /// a collector marking ANOTHER thread's chain must find that thread
+    /// parked, so a torn frame there names an unparked mutator.
+    tid: u32 = 0,
 };
 threadlocal var frame_anchor: FrameAnchor = undefined;
 /// This thread's GC root node. Its `ctx` is `&frame_anchor`, so the collector
@@ -784,10 +788,32 @@ fn gcMarkFrameRegs(f: *const Frame, m: *runtime.gc.Marker) void {
     }
 }
 
+var stw_audit_state: u8 = 0;
+fn stwAuditOn() bool {
+    if (stw_audit_state == 0)
+        stw_audit_state = if (runtime.envOnce("KLIO_GC_STW_AUDIT") != null) 2 else 1;
+    return stw_audit_state == 2;
+}
+
 fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
     const anchor: *const FrameAnchor = @ptrCast(@alignCast(ctx));
+    const audit = runtime.envOnce("KLIO_GC_FRAME_AUDIT") != null;
     var cur = anchor.chain.*;
-    while (cur) |f| : (cur = f.gc_link) {
+    var fi: usize = 0;
+    while (cur) |f| : ({
+        cur = f.gc_link;
+        fi += 1;
+    }) {
+        if (audit) {
+            const me: u32 = @bitCast(std.Thread.getCurrentId());
+            const bad = @intFromPtr(f) < 0x1000 or (@intFromPtr(f) >> 47) != 0 or
+                f.captures.items.len > 4096 or f.params.items.len > 4096 or
+                f.regs.items.len > 65536;
+            if (bad) {
+                std.debug.print("[gc-frame] TORN anchor_tid={d} marker_tid={d} idx={d} f={x} caps={d} params={d} regs={d}\n", .{ anchor.tid, me, fi, @intFromPtr(f), f.captures.items.len, f.params.items.len, f.regs.items.len });
+                return;
+            }
+        }
         gcMarkFrameRegs(f, m);
         for (f.params.items) |v| v.gcMark(m);
         for (f.captures.items) |v| v.gcMark(m);
@@ -829,7 +855,7 @@ inline fn markFrameClosure(closure_id: ?u64, m: *runtime.gc.Marker) void {
 pub fn gcInstallFrameRoot() void {
     if (frame_troot_inited) return;
     frame_troot_inited = true;
-    frame_anchor = .{ .chain = &evtls.frame_chain, .resuming = &evtls.resuming };
+    frame_anchor = .{ .chain = &evtls.frame_chain, .resuming = &evtls.resuming, .tid = @bitCast(std.Thread.getCurrentId()) };
     frame_troot = .{ .ctx = @ptrCast(&frame_anchor), .mark = gcMarkFramesCtx };
     runtime.gc.registerThreadRoot(&frame_troot);
 }
@@ -3108,6 +3134,19 @@ pub const Frame = struct {
     }
 
     fn deinit(self: *Frame) void {
+        // Tripwire (`KLIO_GC_STW_AUDIT=1`): tearing a frame down while the
+        // world is stopped means the collector is walking this thread's
+        // chain right now — a rendezvous hole, and exactly the shape that
+        // makes a mark walk read freed frame buffers.
+        if (stwAuditOn() and runtime.gc.worldStopped()) {
+            const me: u32 = @bitCast(std.Thread.getCurrentId());
+            if (me != runtime.gc.collector_tid.load(.acquire)) {
+                if (runtime.gc.blocking_safe_depth == 0) {
+                    std.debug.print("[gc-stw] tid={d} collector={d} bs={d} park_depth={d} mut={} mutators={d} parked={d} cpark={d} func={s}\n", .{ me, runtime.gc.collector_tid.load(.acquire), runtime.gc.blocking_safe_depth, runtime.gc.park_depth, runtime.gc.is_mutator, runtime.gc.dbg_mutators.load(.acquire), runtime.gc.dbg_parked.load(.acquire), runtime.gc.dbg_collector_park.load(.acquire), self.func.name });
+                    runtime.trace.dumpCurrent(.{});
+                }
+            }
+        }
         // A register owns one reference to its value; release them all on
         // teardown. The return/escaping value is retained out before this runs,
         // and a suspended frame's registers are retained into its snapshot.

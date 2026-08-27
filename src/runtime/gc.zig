@@ -340,15 +340,14 @@ pub fn register(h: *GcHeader, bytes: usize) void {
         // mark stops at it instead of walking the stdlib image graph, and so
         // a runtime mutation of a permanent cell hits the write barrier.
         h.gc_gen = 1;
-        // PROGRAM-phase permanent mints (worker threads keep the permanent
-        // threadlocal): the cell may be BORN holding nursery references —
-        // a host mint assembles its field list before `init`, so no
-        // borrowMut barrier ever remembers the perm->nursery birth edges,
-        // and a minor sweep frees children reachable only through it (a
-        // worker-minted trie node embedding main-minted subtrees). Join
-        // the remembered set at birth so the next minor traces it once;
-        // it re-registers via the ordinary barrier only if mutated.
-        if (program_started) writeBarrier(h);
+        // NOTE: a permanent cell BORN holding nursery references is a
+        // reachability hole — no borrowMut barrier ever remembers birth
+        // edges, and a minor sweep frees children reachable only through
+        // it. Program-phase threads therefore must not mint permanent
+        // (gcThreadEnter drops the flag once the program has started);
+        // birth-remembering every perm mint instead was measured as a
+        // remembered-set meltdown (minors re-traced the whole worker
+        // allocation history).
         // An in-process driver arms `program_perm_collect` around the ONE
         // program's build window (never around shared caches like the base
         // entries): its permanent cells belong to the program, not the
@@ -679,8 +678,45 @@ var gc_lock: SpinLock = .{};
 /// Register the calling thread as an active mutator (it runs program code and
 /// holds collectable roots). Called at a thread's entry seam, after its
 /// per-thread root nodes are linked.
+/// Diagnostics: is a stop-the-world collection in progress right now, and
+/// which thread is running it? A mutator that mutates or frees during a
+/// stop is a rendezvous bug — the collector is walking its state.
+pub fn worldStopped() bool {
+    return world_marking.load(.acquire);
+}
+/// True only between "every other mutator is parked" and the end of the
+/// sweep — the window in which no mutator may touch its own state.
+pub var world_marking: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+pub var collector_tid: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+/// Diagnostics: the rendezvous numbers the collector saw when it began
+/// marking.
+pub var dbg_mutators: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+pub var dbg_parked: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+pub var dbg_collector_park: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+pub threadlocal var is_mutator: bool = false;
+
+/// Serializes mutator-set membership changes against the start of a stop.
+/// The collector snapshots `mutators` and raises `stop_flag` under it, so a
+/// thread can never slip out of (or into) the set between the snapshot and
+/// the rendezvous.
+var mutator_lock: SpinLock = .{};
+
 pub fn enterMutator() void {
-    _ = mutators.fetchAdd(1, .acq_rel);
+    while (true) {
+        mutator_lock.lock();
+        if (!stop_flag.load(.acquire)) {
+            is_mutator = true;
+            _ = mutators.fetchAdd(1, .acq_rel);
+            mutator_lock.unlock();
+            return;
+        }
+        mutator_lock.unlock();
+        // A stop is in progress and its `others` snapshot predates us:
+        // wait it out before joining, so the collector never marks while
+        // this thread runs.
+        spinWait(stopFlagSet);
+    }
 }
 
 /// Deregister the calling thread as a mutator at its exit seam, before its
@@ -689,36 +725,119 @@ pub fn enterMutator() void {
 /// that is leaving, and waits out an active collection so the caller can safely
 /// unlink its (still-readable) root nodes immediately afterward.
 pub fn exitMutator() void {
-    _ = parked_count.fetchAdd(1, .acq_rel);
-    _ = mutators.fetchSub(1, .acq_rel);
-    while (stop_flag.load(.acquire)) std.atomic.spinLoopHint();
-    _ = parked_count.fetchSub(1, .acq_rel);
+    // Leaving must be atomic with respect to a stop's `others` snapshot.
+    // The old order (publish as parked, then decrement `mutators`) counted
+    // the leaver on the parked side while removing it from the mutator
+    // side, so its publication silently covered for a DIFFERENT mutator
+    // that was still running — the collector marked that thread's frame
+    // chain while it tore frames down.
+    while (true) {
+        mutator_lock.lock();
+        if (!stop_flag.load(.acquire)) {
+            is_mutator = false;
+            _ = mutators.fetchSub(1, .acq_rel);
+            mutator_lock.unlock();
+            return;
+        }
+        mutator_lock.unlock();
+        // A stop is in progress: park through it as a still-counted
+        // mutator, then retry the exit.
+        parkForStop();
+    }
 }
 
 /// Park the calling thread for the duration of an in-progress collection: it
 /// publishes itself as quiescent (its roots are stable in its registered
 /// threadlocals) and spins until the collector clears `stop_flag`.
 fn parkForStop() void {
-    _ = parked_count.fetchAdd(1, .acq_rel);
-    while (stop_flag.load(.acquire)) std.atomic.spinLoopHint();
-    _ = parked_count.fetchSub(1, .acq_rel);
+    // The increment must happen ONLY for a stop that is actually in
+    // progress. Incrementing unconditionally let a thread that found no
+    // stop (it lost the `gc_lock` race a moment before the winner raised
+    // `stop_flag`) satisfy the winner's `parked_count >= others`
+    // rendezvous transiently and then run ON through the mark: the
+    // collector walked a live thread's frame chain while that thread tore
+    // frames down, and the mark read freed frame buffers. A thread that
+    // sees no stop simply returns and parks at its next safe point, which
+    // the collector waits for.
+    if (!stop_flag.load(.acquire)) return;
+    // Counted for THIS stop only; the next stop's raise resets the tally,
+    // so there is no decrement to lag behind the loop exit.
+    _ = stopped_count.fetchAdd(1, .acq_rel);
+    spinWait(stopFlagSet);
 }
 
 /// Bracket a blocking primitive (timer sleep, thread join, socket accept, idle
 /// park): the thread holds no unrooted live Value (its state is in registered
 /// threadlocals) and is about to stop making progress, so it counts as already
 /// parked for the STW rendezvous.
+pub threadlocal var blocking_safe_depth: u32 = 0;
+
+/// How many nested reasons this thread is currently parked for. The
+/// rendezvous counts THREADS, not reasons: `parked_count` moves only on
+/// this depth's 0<->1 edges. A plain `fetchAdd` per reason let one thread
+/// (nested blocking-safe regions, or a blocking-safe thread reaching
+/// `exitMutator`) satisfy the collector's `parked_count >= others` on its
+/// own, leaving a genuinely running mutator unwaited-for — the collector
+/// then marked that thread's frame chain while it tore frames down.
+pub threadlocal var park_depth: u32 = 0;
+
+/// Threads parked FOR THE CURRENT STOP. Reset to zero as each stop is
+/// raised (under `mutator_lock`), so a publication left over from the
+/// previous stop — a thread whose decrement lags its exit from the park
+/// loop — can never satisfy the next rendezvous while that thread runs.
+var stopped_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+
+/// Wait for `pred` to go false. A stop-the-world rendezvous can span the
+/// time it takes a mutator to reach its next safe point, so a pure spin
+/// burns a core for the whole window; spin briefly (the common,
+/// sub-microsecond case), then yield.
+fn spinWait(comptime pred: fn () bool) void {
+    var rounds: u32 = 0;
+    while (pred()) {
+        rounds +|= 1;
+        if (rounds <= 256) {
+            std.atomic.spinLoopHint();
+        } else {
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+    }
+}
+
+fn stopFlagSet() bool {
+    return stop_flag.load(.acquire);
+}
+
+fn parkPublish() void {
+    // Only MUTATORS are counted. `parked_count` is compared against a
+    // count derived from `mutators`, so a parked non-mutator (the RSS
+    // watchdog, the deadline timer, any helper sleeping inside a
+    // blocking-safe bracket) used to satisfy the rendezvous one thread
+    // early — the collector then marked while a real mutator ran on,
+    // reading frame buffers that mutator was tearing down.
+    if (!is_mutator) return;
+    park_depth += 1;
+    if (park_depth == 1) _ = parked_count.fetchAdd(1, .acq_rel);
+}
+
+fn parkUnpublish() void {
+    if (park_depth == 0) return;
+    park_depth -= 1;
+    if (park_depth == 0) _ = parked_count.fetchSub(1, .acq_rel);
+}
+
 pub fn enterBlockingSafe() void {
     if (!gc_enabled) return;
-    _ = parked_count.fetchAdd(1, .acq_rel);
+    blocking_safe_depth += 1;
+    parkPublish();
 }
 
 /// Leave a blocking-safe region. If a collection is in progress, wait for it to
 /// finish before touching the heap again, then stop counting as parked.
 pub fn exitBlockingSafe() void {
     if (!gc_enabled) return;
-    while (stop_flag.load(.acquire)) std.atomic.spinLoopHint();
-    _ = parked_count.fetchSub(1, .acq_rel);
+    spinWait(stopFlagSet);
+    blocking_safe_depth -|= 1;
+    parkUnpublish();
 }
 
 // ---------------------------------------------------------------------------
@@ -792,6 +911,8 @@ fn collectImpl(force_major: bool) void {
         return;
     }
     defer gc_lock.unlock();
+    collector_tid.store(@bitCast(std.Thread.getCurrentId()), .release);
+    defer collector_tid.store(0, .release);
     // The collector's own buffered external delta joins the shared counters
     // before the threshold math reads them (other threads' buffers are
     // unreachable threadlocals; their bounded lag is accepted).
@@ -800,11 +921,25 @@ fn collectImpl(force_major: bool) void {
     // Stop the world: signal every other registered mutator to park at its next
     // safe point, then wait until all of them are parked (or in a blocking-safe
     // region). Single-threaded: `others == 0`, so this is a no-op.
+    // Snapshot the mutator count and raise the stop under the membership
+    // lock: from here no thread may join or leave the set without first
+    // parking, so `others` and `parked_count` describe the same cohort.
+    mutator_lock.lock();
     const others = mutators.load(.acquire) -| 1;
+    stopped_count.store(0, .release);
+    if (others != 0) stop_flag.store(true, .release);
+    mutator_lock.unlock();
     if (others != 0) {
-        stop_flag.store(true, .release);
-        while (parked_count.load(.acquire) < others) std.atomic.spinLoopHint();
+        // Blocked threads (inside blocking-safe brackets) cannot run, so
+        // they count as parked for free; the rest must park for THIS stop.
+        while (parked_count.load(.acquire) + stopped_count.load(.acquire) < others)
+            std.atomic.spinLoopHint();
     }
+    dbg_collector_park.store(park_depth, .release);
+    dbg_mutators.store(mutators.load(.acquire), .release);
+    dbg_parked.store(parked_count.load(.acquire), .release);
+    world_marking.store(true, .release);
+    defer world_marking.store(false, .release);
 
     const major = force_major or !generational or gc_stress or
         major_pending.load(.monotonic);
@@ -870,6 +1005,10 @@ fn collectImpl(force_major: bool) void {
     last_live.store(live_bytes, .monotonic);
     last_collect_ms.store(nowMillis(), .monotonic);
     bytes_since_gc.store(0, .monotonic);
+    // The stop ends here: release the parked mutators and close the
+    // marking window together (the deferred clear below only covers the
+    // early-return paths).
+    world_marking.store(false, .release);
     if (others != 0) stop_flag.store(false, .release);
     if (major) {
         major_pending.store(false, .monotonic);

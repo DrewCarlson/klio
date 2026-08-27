@@ -87,10 +87,17 @@ Work items:
       Pausable pair green under upstream's 60s default; remaining =
       _clear (allocation-bound floor) + validatePotentialDeadlock
       (order-of-magnitude, re-measurement in flight).
-- [ ] Each interpreter root ships an example + pinned output.
-- [ ] Exit: the concurrency classes pass 10/10 consecutive SOLO gate runs;
-      `MAX_FAILED` lowered to the new honest ceiling (target 0, and the
-      baseline expect tightened accordingly).
+- [x] Each interpreter root ships an example + pinned output
+      (snapshot_map_equality/list_equality/list_bulk_ops,
+      indices_shadowing, collection_indices, char_range_loops; the
+      whole-put serve's oracle is the 59/59 class itself).
+- [~] Exit: SnapshotStateMapTests 59/59 SOLO (first ever; _clear 14.4s
+      vs 30s budget after the whole-cycle put serve + the perm-mint
+      birth-barrier GC fix), List 65/65, Set 21/21, Observer 30/30
+      solo; gate 1389/1/0 with the ONLY real failure
+      validatePotentialDeadlock; ratchet RAISED 1381 -> 1386,
+      MAX_FAILED LOWERED 11 -> 5. Remaining for target-0: vpd's 8.5x
+      (Front A) and the 10/10-consecutive-solo confirmation runs.
 - [ ] Verify whether the 5 standing corpus compose load-flakes
       (compose_foundation/material3/material3_text/multiwindow/window under
       `--jobs 4`) share the root; they are contention-sensitivity of the same
@@ -952,6 +959,64 @@ run).
 
 ## Running log
 
+- 2026-08-27 THE REAL ROOT: A STOP-THE-WORLD RENDEZVOUS HOLE (not a
+  missing GC root at all). The map UAF, the "premature free", and the
+  0xAA-poisoned trie nodes were all one bug: the collector could begin
+  MARKING while another mutator was still running, so it walked that
+  thread's frame chain as the thread tore frames down and swept cells
+  the running thread was still linking. Found with a new tripwire
+  (`KLIO_GC_STW_AUDIT=1`: frame teardown inside the marking window,
+  reporting tid/collector/park state) plus `gc.world_marking` — the
+  audit showed ~90k violations per stress run. Four distinct holes in
+  the handshake, all fixed:
+  (a) `parkForStop` incremented `parked_count` even when NO stop was in
+  progress (a thread that lost the `gc_lock` race a moment before the
+  winner raised the flag), transiently satisfying the winner's wait;
+  (b) the count was per-REASON, so one thread (nested blocking-safe, or
+  blocking-safe plus exit) could satisfy the rendezvous alone — now
+  per-THREAD (0<->1 edges only);
+  (c) NON-mutator threads (the RSS watchdog, deadline timer, any helper
+  sleeping in a blocking-safe bracket) were counted against a total
+  derived from `mutators` — parking is now published by mutators only;
+  (d) the fatal one: `exitMutator` published as parked and THEN
+  decremented `mutators`, so a leaving thread was removed from the
+  wait's target while still counted as parked, covering for a
+  DIFFERENT running mutator. Membership changes now take a
+  `mutator_lock` that the collector also holds while snapshotting
+  `mutators` and raising the stop, and per-stop parking is tallied in a
+  `stopped_count` reset as each stop is raised (so a publication left
+  over from the previous stop cannot satisfy the next rendezvous).
+  Result: stress-mode violations 90k -> ZERO, every crash repro passes,
+  normal-mode wall unchanged (map replica 1.42s/rep). The worker
+  perm-mint stopgap stays retired (`gcThreadEnter` drops `alloc_perm`
+  once the program starts; `KLIO_WORKER_PERM=1` restores it for
+  bisecting). NOTE: `KLIO_GC_STRESS` is now much slower — it forces a
+  full major mark at every safe point AND the rendezvous now genuinely
+  waits; that is honest cost, not a regression.
+
+- 2026-08-26 THE GC ROOT NAMED AND FIXED; MAP CLASS 59/59 — FIRST FULL
+  GREEN: worker threads minted PERMANENT (a June stopgap, "for now",
+  from before the per-thread-root and pool-queue-root work; the
+  threadlocal `alloc_perm` never flipped on workers and vmRun's
+  comment claiming otherwise was wrong). Minors stop at permanent
+  cells, and a HOST mint assembles its field list before ObjRef.init,
+  so no borrowMut barrier ever remembers the perm->nursery BIRTH
+  edges — a worker-minted trie node embedding main-minted subtrees
+  was their only holder and the minor swept them (the interpreted
+  flow survives only because its post-construction field writes
+  barrier). FIRST FIX (a2269ee4) birth-remembered every program-phase
+  permanent mint: correct but a remembered-set MELTDOWN — minors
+  re-traced the whole worker allocation history and the litmus ran
+  hours. REAL FIX: retire the stopgap — `gcThreadEnter` drops
+  `alloc_perm` once `program_started`, so program-phase threads mint
+  NURSERY like the main thread and ordinary marking covers them. Every sv-repro passes, put_replace passes,
+  the whole-put serve is ON BY DEFAULT (KLIO_SSMPUT=0 bisects), and
+  SnapshotStateMapTests is 59/59 solo with _clear at 14.4s vs its 30s
+  budget. Task 1's remaining real failure: validatePotentialDeadlock
+  alone (8.5x). TRAP class recorded: any HOST-SIDE mint that
+  references non-permanent cells at construction, running on a worker
+  thread, was invisible to minor GC — every host serve had this
+  latent hazard.
 - 2026-08-26 WHOLE-CYCLE SnapshotStateMap.put SERVE (LANDED OPT-IN,
   KLIO_SSMPUT=1; default OFF pending a GC root-cause): the steady-state
   write cycle host-side — record read under the map file's `sync`
