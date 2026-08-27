@@ -8,10 +8,11 @@ Discipline: root-cause only, peel one root at a time, full battery before
 every commit, example + pinned output per interpreter root, never `zig build`
 while a background battery runs.
 
-Standing gate (2026-08-27): **1387 passed / 3 failed / 0 DNC**, ratchet 1386,
-`MAX_FAILED = 5`, width 8, ~330-420s. Two of the three failures are one
-contention-flaky class (`PausableCompositionTests.resumeOnBackgroundThread`,
-25/25 solo); the third is `validatePotentialDeadlock`, the last real item.
+Standing gate (2026-08-27): **1389 passed / 1 failed / 0 DNC at 397s**,
+ratchet 1386, `MAX_FAILED = 5`, width 8 — the best recorded. The one failure
+is `validatePotentialDeadlock`, the last real item.
+`PausableCompositionTests.resumeOnBackgroundThread` fails only under gate
+contention (25/25 solo) and is a wall-cap artifact, not a defect.
 
 ---
 
