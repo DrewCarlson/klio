@@ -107,7 +107,17 @@ Work items:
       implementsSupertypeMemberExt 1.13%, extensionFnFallbackWalk
       0.93%). 753s vs the 90s cap = 8.4x, which no surgical lever buys:
       this is Front A (bake-time AOT object-shape natives) and nothing
-      smaller.
+      smaller. **10/10 CONFIRMATION DONE (2026-08-27)**: ten
+      consecutive SOLO runs of each concurrency class at the GATE's
+      coroutine budget — 40 class runs, ZERO failures
+      (SnapshotStateListTests 65/65 x10, SnapshotStateSetTests 21/21
+      x10, SnapshotStateMapTests 59/59 x10, PausableCompositionTests
+      25/25 x10). TRAP: `scripts/compose-test.sh` defaults
+      `kotlinx_coroutines_test_default_timeout` to 10s, but the gate
+      uses upstream's 60s — under the script default Pausable reports
+      24/25 (resumeOnBackgroundThread needs ~40-55s), which is a
+      harness artifact, not a failure. Export the 60s budget for any
+      solo confirmation.
 - [~] TOOLING NOTE (2026-08-27): `scripts/corpus_check.py` is OBSOLETE —
       it diffs the Zig binary against `target/release/klio`, the retired
       Rust reference, so it reports 0/N with the reference absent. The
