@@ -33,8 +33,10 @@ the GC stop-the-world rendezvous fix; and the call-throughput rounds
 Rejected with measurements: backoff-sleep ladder (667 vs 630ms), module-cell
 locking (already Noop), name-identity and field memos (already present).
 
-- [ ] OPEN — `RecomposerTests.validatePotentialDeadlock`: **753s solo vs the
-      gate's 90s per-class cap (8.4x)**. COST MODEL MEASURED (2026-08-27,
+- [ ] OPEN — `RecomposerTests.validatePotentialDeadlock`: **416s solo vs the
+      gate's 90s per-class cap (4.6x)**, down from 753s on this round's
+      dispatch work (the failure it reports is its own 60s `runTest` budget —
+      still throughput, no correctness component). COST MODEL MEASURED (2026-08-27,
       replica `f10_texts200`: 200 texts, ten frames, both composers):
       `advanceTimeBy(5_000)` x10 at a 16ms frame clock = ~3120 frames, each
       recomposing the root and its 200 `Text` children = ~624k composable
@@ -49,6 +51,14 @@ locking (already Noop), name-identity and field memos (already present).
       (`getGroupAnchor`, `execute`) — plus ~11% in the drain and ~11% in
       lambdas. The interpreter-level profile is diffuse behind that (memset
       ~16%, getIndex 4.8%, runFrameExec 3.8%, eqlBytes 3.2%).
+      LANDED THIS ROUND (78132521): a member-extension winner is now memoized
+      under the chain-folded key (the owner is re-found on the chain at serve
+      time), which took a member-extension call from 3.0us to 1.5us and the
+      replica from 4.37s to 3.06s. DISPROVEN by A/B: the wrapper's cost is
+      NOT `getGroupAnchor` or the inline `withCurrentStackTrace` — deleting
+      both from the pack saved 2.4%. It is the op bodies plus their dispatch,
+      which `KLIO_FN_PROF` attributes to the caller whenever the callee is
+      leaf/bytecode-served rather than framed.
       Reaching 90s means native-speed execution of that inner loop: **Front A**
       (bake-time AOT object-shape natives), with Front B's frame/allocation
       levers as the compounding half. The test races two infinite writer loops
