@@ -449,6 +449,13 @@ test "internal_props_cross_package" {
     }
 }
 
+test "short_uppercase_user_type" {
+    try check("short_uppercase_user_type",
+        \\CFc
+        \\
+    );
+}
+
 test "member_extension_receiver_tower" {
     try check("member_extension_receiver_tower",
         \\sized:coord

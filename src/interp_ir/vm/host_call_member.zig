@@ -1538,7 +1538,17 @@ pub fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []
     }
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
     if (std.mem.startsWith(u8, pn, "Function")) return true;
-    if (pn.len > 0 and pn.len <= 2 and allUppercase(pn)) return true;
+    // A short all-caps head is a TYPE PARAMETER (`T`, `R`, `E1`), which any
+    // receiver satisfies -- unless the program declares a class of that name,
+    // in which case it is that user type and must be proven like any other.
+    if (pn.len > 0 and pn.len <= 2 and allUppercase(pn)) {
+        const declared = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().classId(pn) != null;
+        };
+        if (!declared) return true;
+    }
     switch (receiver.*) {
         .Instance => |inst| {
             const a = self.allocator;
