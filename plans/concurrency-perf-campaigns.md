@@ -144,9 +144,13 @@ Work items:
       `kotlin.IndexOutOfBoundsException: Index -1 out of bounds for
       length 0` inside the compose UI stack, and compose_material3_text
       still reports `Vm::call_member roundToPx on Dp` at a second site.
-      Both are application-path bugs beyond the receiver root; run them
-      with `scripts/klio-local.sh` after `scripts/install-local-packs.sh`
-      and bisect from the throwing frame.
+      The window pair's throw is precise: `AbstractApplier.up` pops an
+      EMPTY `Stack` inside `Operation.PostInsertNodeFixup.execute`
+      (via `FixupList.executeAndFlushAllPendingFixups`) — an applier
+      down/up imbalance on the node-insert path, i.e. a compose
+      node-emission bug, not a dispatch one. Repro:
+      `scripts/install-local-packs.sh` then
+      `scripts/klio-local.sh run examples/compose_window.kt`.
 - [x] ROOT FIXED en route (accessor thunks): property-accessor bodies
       lowered with NO parameter metadata, so `frameThisParam` found no
       `this`, the implicit-receiver walk never ran, and a bare member
