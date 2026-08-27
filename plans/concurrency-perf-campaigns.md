@@ -124,10 +124,22 @@ Work items:
       `Vm::call_member roundToPx on Dp`, the same shape:
       `Dp.roundToPx()` is a MEMBER EXTENSION OF `Density`, so with the
       Density receiver missing the call degrades to a member lookup on
-      Dp. NEXT: publish a member-extension frame's extension receiver
-      as the innermost implicit candidate on the interface/virtual-slot
-      route (synthetic repros of the same source shape PASS, so the
-      loss is in that invocation route, not in resolution).
+      Dp. NEXT (two surgical attempts made and REVERTED as non-firing;
+      the tree keeps only this diagnosis): the correction rule already
+      exists in the ANON-OBJECT arm (`anonMethodDispatch` takes the
+      extension receiver from the enclosing entries and pushes the
+      owner as dispatch scope when the dispatch receiver does not
+      satisfy the declared one), and `invokeResolvedMember` honours a
+      supplied dispatch receiver. Mirroring it at `invokeMethodFuncId`
+      and at the virtual-slot target (the `callFuncIndexedRec` site in
+      `invokeVirtualMember`) did NOT fire — so either the live route is
+      a third seam, or `receiverImplementsType(FocusableNode,
+      SemanticsPropertyReceiver)` answers TRUE and silently skips every
+      correction. Instrument each member-ext invocation seam to find
+      which one binds `params[0]` to the dispatch owner. Synthetic
+      repros of the same SOURCE shape PASS (scratchpad mx1-mx4), so the
+      divergence is in the invocation route, not in resolution. This is
+      the long-recorded compose-window "receiver-loss residue".
 - [x] ROOT FIXED en route (accessor thunks): property-accessor bodies
       lowered with NO parameter metadata, so `frameThisParam` found no
       `this`, the implicit-receiver walk never ran, and a bare member
