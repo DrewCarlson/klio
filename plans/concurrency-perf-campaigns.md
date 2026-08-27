@@ -137,9 +137,21 @@ Work items:
       (`BackwardsCompatNode.applySemantics`, `LayoutNode`'s semantics
       collection) and read which call form and receiver register the
       lowering emits for `config.applySemantics()` inside `with(it)`;
-      the fix belongs in that emission, which must pass the explicit
-      receiver as `params[0]` and put the `with` subject in dispatch
-      scope. Superseded note (two surgical attempts made and REVERTED;
+      MEASURED: the caller emits
+      `CallMemberOrGlobal this.'applySemantics' ()` — ZERO arguments,
+      with a COMMITTED fid (`[DYN-bound -> applySemantics#118]`). So
+      `config.applySemantics()` lowers to a bare implicit-receiver call
+      and the explicit receiver never reaches the callee; the CMG leg
+      then fills `params[0]` from the implicit `this` (the `with`
+      subject, FocusableNode) instead of from the candidate that
+      satisfies the declared extension receiver (the
+      SemanticsConfiguration the walk DOES collect, at depth 2). THE
+      FIX: in the CMG arm, when the committed/bound target is a member
+      extension, bind `params[0]` from the innermost candidate whose
+      type satisfies `params[0].ty` and push the owner as dispatch
+      scope — the rule `anonMethodDispatch` already implements for anon
+      objects. (This is why probes at the three member-DISPATCH seams
+      printed nothing: the call never reaches them.) Superseded note (two surgical attempts made and REVERTED;
       the tree keeps only this diagnosis): the correction rule already
       exists in the ANON-OBJECT arm (`anonMethodDispatch` takes the
       extension receiver from the enclosing entries and pushes the
