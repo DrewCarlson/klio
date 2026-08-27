@@ -124,49 +124,29 @@ Work items:
       `Vm::call_member roundToPx on Dp`, the same shape:
       `Dp.roundToPx()` is a MEMBER EXTENSION OF `Density`, so with the
       Density receiver missing the call degrades to a member lookup on
-      Dp. LAYER IDENTIFIED 2026-08-27 by measurement: the call is NOT
-      served by any runtime member-dispatch seam. Trace probes at
-      `invokeMethodFuncId`, at the virtual-slot target inside
-      `invokeVirtualMember`, and at `prepareFlatFromFid` (the flat
-      preparer) printed NOTHING for a member-extension target on this
-      program, while the frame is demonstrably pushed with
-      `params[0] = FocusableNode`. So the override is reached by a
-      STATICALLY RESOLVED call and the wrong receiver is chosen at
-      EMISSION — every runtime-side correction is inert by construction
-      (three were written and reverted). NEXT: dump the CALLER
-      (`BackwardsCompatNode.applySemantics`, `LayoutNode`'s semantics
-      collection) and read which call form and receiver register the
-      lowering emits for `config.applySemantics()` inside `with(it)`;
-      MEASURED: the caller emits
-      `CallMemberOrGlobal this.'applySemantics' ()` — ZERO arguments,
-      with a COMMITTED fid (`[DYN-bound -> applySemantics#118]`). So
-      `config.applySemantics()` lowers to a bare implicit-receiver call
-      and the explicit receiver never reaches the callee; the CMG leg
-      then fills `params[0]` from the implicit `this` (the `with`
-      subject, FocusableNode) instead of from the candidate that
-      satisfies the declared extension receiver (the
-      SemanticsConfiguration the walk DOES collect, at depth 2). THE
-      FIX: in the CMG arm, when the committed/bound target is a member
-      extension, bind `params[0]` from the innermost candidate whose
-      type satisfies `params[0].ty` and push the owner as dispatch
-      scope — the rule `anonMethodDispatch` already implements for anon
-      objects. (This is why probes at the three member-DISPATCH seams
-      printed nothing: the call never reaches them.) Superseded note (two surgical attempts made and REVERTED;
-      the tree keeps only this diagnosis): the correction rule already
-      exists in the ANON-OBJECT arm (`anonMethodDispatch` takes the
-      extension receiver from the enclosing entries and pushes the
-      owner as dispatch scope when the dispatch receiver does not
-      satisfy the declared one), and `invokeResolvedMember` honours a
-      supplied dispatch receiver. Mirroring it at `invokeMethodFuncId`
-      and at the virtual-slot target (the `callFuncIndexedRec` site in
-      `invokeVirtualMember`) did NOT fire — so either the live route is
-      a third seam, or `receiverImplementsType(FocusableNode,
-      SemanticsPropertyReceiver)` answers TRUE and silently skips every
-      correction. Instrument each member-ext invocation seam to find
-      which one binds `params[0]` to the dispatch owner. Synthetic
-      repros of the same SOURCE shape PASS (scratchpad mx1-mx4), so the
-      divergence is in the invocation route, not in resolution. This is
-      the long-recorded compose-window "receiver-loss residue".
+      Dp. ROOT FIXED (93db0bcd): `config.applySemantics()` inside
+      `with(node) { … }` lowers to a bare implicit-receiver call with a
+      COMMITTED target and NO arguments, so the explicit receiver never
+      reached the callee and the CMG leg filled `params[0]` from the
+      implicit `this` (the `with` subject). The CMG arm now binds a
+      committed member-extension's `params[0]` from the innermost
+      candidate satisfying the declared extension receiver, pushing the
+      candidate whose class DECLARES the target as dispatch scope (so
+      the body's `this@Owner` resolves); a genuine mismatch only. Both
+      window examples clear BOTH errors and now fail later in
+      application logic (IndexOutOfBoundsException, pre-existing) —
+      tracked as its own item below. NOTE for the hunt's record: three
+      earlier corrections at the member-DISPATCH seams
+      (`invokeMethodFuncId`, the virtual-slot target, the flat
+      preparer) were written and reverted after trace probes showed
+      those seams never see this call.
+- [ ] NEW (2026-08-27): compose_window / compose_multiwindow now reach
+      `kotlin.IndexOutOfBoundsException: Index -1 out of bounds for
+      length 0` inside the compose UI stack, and compose_material3_text
+      still reports `Vm::call_member roundToPx on Dp` at a second site.
+      Both are application-path bugs beyond the receiver root; run them
+      with `scripts/klio-local.sh` after `scripts/install-local-packs.sh`
+      and bisect from the throwing frame.
 - [x] ROOT FIXED en route (accessor thunks): property-accessor bodies
       lowered with NO parameter metadata, so `frameThisParam` found no
       `this`, the implicit-receiver walk never ran, and a bare member
