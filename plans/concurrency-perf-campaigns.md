@@ -98,8 +98,16 @@ Work items:
       birth-barrier GC fix), List 65/65, Set 21/21, Observer 30/30
       solo; gate 1389/1/0 with the ONLY real failure
       validatePotentialDeadlock; ratchet RAISED 1381 -> 1386,
-      MAX_FAILED LOWERED 11 -> 5. Remaining for target-0: vpd's 8.5x
-      (Front A) and the 10/10-consecutive-solo confirmation runs.
+      MAX_FAILED LOWERED 11 -> 5. Remaining for target-0: vpd ALONE.
+      RE-MEASURED 2026-08-27 after the whole-put serve and the GC
+      rendezvous fix: 753s solo (was 763s) — this session's gains never
+      touched its path. RE-PROFILED at the same commit: still DIFFUSE,
+      no lever at or above 9% (memset 8.95%, runFrameExec 6.17%,
+      eqlBytes 4.20%, getIndex 3.33%, shade 2.23%, long tail incl.
+      implementsSupertypeMemberExt 1.13%, extensionFnFallbackWalk
+      0.93%). 753s vs the 90s cap = 8.4x, which no surgical lever buys:
+      this is Front A (bake-time AOT object-shape natives) and nothing
+      smaller.
 - [~] TOOLING NOTE (2026-08-27): `scripts/corpus_check.py` is OBSOLETE —
       it diffs the Zig binary against `target/release/klio`, the retired
       Rust reference, so it reports 0/N with the reference absent. The
