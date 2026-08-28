@@ -13,8 +13,8 @@ green and deterministic, ratchet 1386, width 8. Three measured-slow tests
 (`validatePotentialDeadlock` ~724s, `resumeOnBackgroundThread`,
 `pausingTheFrameClockStopShouldBlockWithFrameNanos`) run under DECLARED
 budgets instead of being cut off by the 90s hang detector; each budget is a
-ratchet that must only shrink. The wall is now ~847s because those tests run
-to completion — driving it back under 400s is the one open item, and it is
+ratchet that must only shrink. The wall is 797s because those tests run to
+completion — driving it under 364s is the one open item, and it is
 recomposition throughput.
 
 ---
