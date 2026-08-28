@@ -83,6 +83,10 @@ pub const Route = enum(u8) {
     op_iter_next = 35,
     op_iter_get_int = 36,
     op_iter_get_object = 37,
+    /// `SlotReader.objectKey` (the IntArray member-extension) and
+    /// `groupObjectKey(index)` — the object key behind the data anchor.
+    sr_object_key = 38,
+    sr_group_object_key = 39,
 };
 
 /// Classify once per `Func` (the caller memoizes into `func.host_route`).
@@ -110,6 +114,8 @@ pub fn classify(fqn: []const u8, n_params: usize) Route {
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.composer.gapbuffer.slotAnchor")) return .slot_anchor;
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.composer.gapbuffer.parentAnchor")) return .gap_parent_anchor;
         if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotReader.nodeCount")) return .sr_node_count_at;
+        if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotReader.objectKey")) return .sr_object_key;
+        if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotReader.groupObjectKey")) return .sr_group_object_key;
         if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotReader.groupKey")) return .sr_group_key_at;
         if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotWriter.dataIndex")) return .sw_data_index;
         if (std.mem.endsWith(u8, fqn, ".changelist.Operations.OpIterator.getInt")) return .op_iter_get_int;
@@ -664,7 +670,12 @@ pub fn serveGapParentAnchor(args: []const Value) ?Value {
 }
 
 /// `groups.dataIndex(groupIndexToAddress(index))` over the writer's gaps.
+/// Handles BOTH same-fqn overloads: the member fun (receiver = the writer,
+/// gap-adjusts the index) and the IntArray member-extension (receiver = the
+/// group table, index already an address, writer owner on the enclosing
+/// chain).
 pub fn serveSlotWriterDataIndex(args: []const Value) ?Value {
+    if (args[0] == .Array) return serveSlotWriterDataIndexExt(args);
     if (args[0] != .Instance) return null;
     const index = asI32(&args[1]) orelse return null;
     const g = args[0].Instance.borrow();
@@ -684,6 +695,71 @@ pub fn serveSlotWriterDataIndex(args: []const Value) ?Value {
     if (anchor >= 0) return .{ .Int = anchor };
     const cap_slots: i32 = @intCast(slots.len());
     return .{ .Int = (cap_slots -% slots_gap_len) +% anchor +% 1 };
+}
+
+/// The member-extension owner for the same-class private IntArray helpers.
+/// Member-extension dispatch pushes the owner as the top enclosing receiver
+/// before the body runs, and the serve validates the shape by field
+/// presence — a wrong top declines.
+fn extOwner() ?Value {
+    const v = @import("eval.zig").enclosingThisLast() orelse return null;
+    if (v != .Instance) return null;
+    return v;
+}
+
+fn serveSlotWriterDataIndexExt(args: []const Value) ?Value {
+    if (args[0].Array.prim != .Int) return null;
+    const address = asI32(&args[1]) orelse return null;
+    const owner = extOwner() orelse return null;
+    const g = owner.Instance.borrow();
+    defer g.deinit();
+    const inst = g.get();
+    const slots_gap_len = intField(inst, &fn_slots_gap_len, "slotsGapLen") orelse return null;
+    const groups = intArrayField(inst, &fn_groups, "groups") orelse return null;
+    const slots = objArrayField(inst, &fn_slots_field, "slots") orelse return null;
+    const capacity: i64 = @intCast(groups.len() / GROUP_FIELDS);
+    if (address >= capacity) {
+        return .{ .Int = @as(i32, @intCast(@as(i64, @intCast(slots.len())) - slots_gap_len)) };
+    }
+    const anchor = groupField(args[0].Array, address, DATA_ANCHOR_OFF) orelse return null;
+    if (anchor >= 0) return .{ .Int = anchor };
+    const cap_slots: i32 = @intCast(slots.len());
+    return .{ .Int = (cap_slots -% slots_gap_len) +% anchor +% 1 };
+}
+
+fn objectKeyFrom(groups: runtime.ArrayData, slots: runtime.ArrayData, index: i32) ?Value {
+    const info = groupField(groups, index, GROUP_INFO_OFF) orelse return null;
+    if (info & (@as(i32, 1) << 29) == 0) return .{ .Null = {} };
+    const anchor = groupField(groups, index, DATA_ANCHOR_OFF) orelse return null;
+    const idx = anchor +% @as(i32, @intCast(@popCount(@as(u32, @bitCast(info >> 30)))));
+    if (idx < 0 or @as(usize, @intCast(idx)) >= slots.len()) return null;
+    const v = slots.get(@intCast(idx));
+    v.retain();
+    return v;
+}
+
+/// The IntArray member-extension form: the receiver IS the reader's group
+/// table, `slots` comes from the owner on the chain.
+pub fn serveSlotReaderObjectKey(args: []const Value) ?Value {
+    if (args[0] != .Array or args[0].Array.prim != .Int) return null;
+    const index = asI32(&args[1]) orelse return null;
+    const owner = extOwner() orelse return null;
+    const g = owner.Instance.borrow();
+    defer g.deinit();
+    const slots = objArrayField(g.get(), &fn_slots_field, "slots") orelse return null;
+    return objectKeyFrom(args[0].Array, slots, index);
+}
+
+/// `groupObjectKey(index) = groups.objectKey(index)` — the member fun.
+pub fn serveSlotReaderGroupObjectKey(args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    const index = asI32(&args[1]) orelse return null;
+    const g = args[0].Instance.borrow();
+    defer g.deinit();
+    const inst = g.get();
+    const groups = intArrayField(inst, &fn_groups, "groups") orelse return null;
+    const slots = objArrayField(inst, &fn_slots_field, "slots") orelse return null;
+    return objectKeyFrom(groups, slots, index);
 }
 
 const REQUIRES_RECOMPOSE_FLAG: i32 = 0x008;
