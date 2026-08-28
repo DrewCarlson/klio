@@ -62,22 +62,20 @@ distribution is FLAT: nothing above 14%.
   (98.8% of its probes HIT — the cost is rebuilding the key, not the walk),
   SetField 5.0%, NewInstance 4.8%.
 
-LANDED 2026-08-28 rounds: **253us -> ~193us (1.31x)** per composable; vpd
-SOLO **~724s -> ~500s (1.45x** — it leans harder on the served drain
-machinery than the replica); suite wall **847s -> 727s** (gates green:
-1390/0/0 and 1389/1/0 with the known resumeOnBackgroundThread flake in
-slack). SCHEDULING IS MINED OUT, measured three ways on the 32-core box:
-width 6 vs 8 is 767 vs 758s; giving vpd its OWN child (negated --filter
-tokens landed for it) plus trimming that child's compile from ~180s to
-~20s (class file + the two same-package helper files) bought only ~30s
-combined. The wall is the vpd child itself at ~700s in-suite vs ~500s
-solo — a ~1.4x co-tenancy inflation across separate processes (memory
-bandwidth / turbo, not a lock: the children share nothing). Suite
-diagnostics added: per-child wall lines ([child-wall]).
-Remaining arithmetic: wall 364s needs vpd solo ~260s = another 1.9x of
-recomposition throughput; serve batches are yielding ~10% each with the
-largest un-served census item now ~2%. ReleaseFast (1.18x policy) would
-land ~590s in-gate — still short alone. The
+LANDED 2026-08-28 rounds: **253us -> 182us (1.39x)** per composable; vpd
+SOLO **~724s -> ~480s (1.5x)**; suite wall **847s -> ~700s**, gate
+1390/0/0, vpd budget ratcheted 900 -> 800s. The [child-wall] diagnostic
+now names the wall exactly: the vpd child at **694s in-suite** vs ~500s
+solo (1.4x co-tenancy inflation across separate processes — memory
+bandwidth / turbo, not a lock), every other child drains by ~300s.
+SCHEDULING IS MINED OUT, measured three ways: width 6 vs 8 = 767 vs
+758s; vpd's own child (negated --filter tokens) + its compile trimmed
+~180s -> ~20s bought ~30s combined.
+Remaining arithmetic: wall 364s needs vpd solo ~260s = another ~1.9x of
+recomposition throughput; serve batches yield ~10% each with the largest
+un-served census item now ~2%. ReleaseFast (1.18x policy) would land
+~590s in-gate — still short alone. The open code paths: the
+member-inline tier hardening (below) and Front A1d. The
 serve family (`src/ir/compose_fast.zig`, `KLIO_COMPOSE_FAST` bisect mask,
 wired at `hostRouteServe` AND the flat-call seam): IntStack, the
 composite-key rotation, BOTH changelists' push, the write scope, the
