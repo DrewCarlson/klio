@@ -542,6 +542,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                     1_200_000
                 else
                     480_000;
+                const child_t0 = std.time.milliTimestamp();
                 const r = runKlio(arena.allocator(), penv, queue[i], class_cap_ms) catch {
                     _ = phung.fetchAdd(1, .monotonic);
                     // Name it. "2 did not complete" is not actionable; the
@@ -553,6 +554,9 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                 // A completed run counts its end-of-run summary; a killed
                 // run's summary never printed, so its streamed per-test
                 // lines carry the count — only the wedged test is lost.
+                std.debug.print("compose_plugin_commontest: [child-wall] {s} {d}s\n", .{
+                    names[i], @divTrunc(std.time.milliTimestamp() - child_t0, 1000),
+                });
                 const summary_count = passedLineCount(r.stdout);
                 const n_passed = if (summary_count != 0) summary_count else streamedPassedCount(r.stderr);
                 _ = ppassed.fetchAdd(n_passed, .monotonic);
