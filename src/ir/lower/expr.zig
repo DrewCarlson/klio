@@ -3246,6 +3246,12 @@ fn replayFinallysForJump(b: *FuncBuilder, base_raw: usize) Allocator.Error!void 
     const base = @min(base_raw, b.finally_stack.items.len);
     const pop_bodies = try b.finallyBodiesFrom(base);
     if (b.finally_stack.items.len > base) {
+        // Each finally body re-lowers under the splice-resolve context that
+        // was active when its `try` was lowered, not the jump site's: a
+        // spliced body's finally replayed inside a spliced lambda otherwise
+        // resolves the body's own params against the lambda's caller region.
+        const windows = try b.finallyWindowsSnapshot();
+        defer b.allocator.free(windows);
         const prior = try b.swapFinallyStack(&.{});
         defer b.allocator.free(prior);
         var idx: usize = prior.len;
@@ -3255,7 +3261,24 @@ fn replayFinallysForJump(b: *FuncBuilder, base_raw: usize) Allocator.Error!void 
             const outer = try b.allocator.dupe(ast.Block, prior[0..idx]);
             const dropped = try b.swapFinallyStack(outer);
             b.allocator.free(dropped);
+            const saved_window = b.lambda_splice_resolve;
+            // The band list is restored by VALUE: a nested splice inside the
+            // replayed body appends at the truncated length and would
+            // otherwise overwrite the outer bands a bare length restore
+            // re-exposes.
+            const saved_bands = try b.allocator.dupe(
+                @TypeOf(b.splice_hidden_bands.items[0]),
+                b.splice_hidden_bands.items,
+            );
+            defer b.allocator.free(saved_bands);
+            if (idx < windows.len) {
+                b.lambda_splice_resolve = windows[idx].window;
+                b.splice_hidden_bands.items.len = @min(b.splice_hidden_bands.items.len, windows[idx].bands_len);
+            }
             _ = try lowerBlock(b, blk);
+            b.lambda_splice_resolve = saved_window;
+            b.splice_hidden_bands.clearRetainingCapacity();
+            try b.splice_hidden_bands.appendSlice(b.allocator, saved_bands);
         }
         const restore = try b.allocator.dupe(ast.Block, prior);
         const dropped2 = try b.swapFinallyStack(restore);
@@ -6105,8 +6128,62 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // defaults or varargs, arity matched, the declared callback shape
         // matched against the site's lambda, owner on the receiver chain,
         // and exactly one survivor. `KLIO_MEMBER_INLINE=0` bisects.
+        // Whether an inline body contains a loop at its statement spine.
+        // The monomorphic member-inline tier is scoped to LOOP-FREE bodies:
+        // a loop body invoking the lambda per element exercises receiver
+        // plumbing the splice tier has not hardened yet (SlotTable's
+        // forEachTailSlot mis-resolved its `slots[...]` receiver), while the
+        // delegating-wrapper shape this tier exists for (`Operations.push`)
+        // is straight-line.
+        const bodyHasLoop = struct {
+            fn scanExpr(e: *const ast.Expr) bool {
+                return switch (e.*) {
+                    .While, .DoWhile, .For => true,
+                    .If => |iff| scanExpr(iff.cond) or scanExpr(iff.then_branch) or
+                        (if (iff.else_branch) |el| scanExpr(el) else false),
+                    .Block => |blk2| scanStmts(blk2.stmts),
+                    .Try => |t| scanStmts(t.body.stmts),
+                    else => false,
+                };
+            }
+            fn scanStmts(list: []const ast.Stmt) bool {
+                for (list) |*st| {
+                    switch (st.*) {
+                        .Expr => |*e| if (scanExpr(e)) return true,
+                        .Assign => |*a2| if (scanExpr(&a2.value)) return true,
+                        .Decl => |*d| switch (d.*) {
+                            .Property => |pr| if (pr.init) |*ini| {
+                                if (scanExpr(ini)) return true;
+                            },
+                            else => {},
+                        },
+                        else => {},
+                    }
+                }
+                return false;
+            }
+        };
         const plain_member_inline: ?*const ast.Function = blk: {
-            if (std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_INLINE") orelse "1", "0")) break :blk null;
+            // `KLIO_MEMBER_INLINE`: "0" disables; a comma list allows ONLY
+            // those names; a list starting with '!' allows all BUT those.
+            if (runtime.envOnce("KLIO_MEMBER_INLINE")) |sel| {
+                if (std.mem.eql(u8, sel, "0")) break :blk null;
+                if (!std.mem.eql(u8, sel, "1")) {
+                    var wanted = std.mem.startsWith(u8, sel, "!");
+                    var it = std.mem.splitScalar(u8, if (wanted) sel[1..] else sel, ',');
+                    const inverted = wanted;
+                    wanted = inverted;
+                    while (it.next()) |tok| {
+                        if (tok.len != 0 and std.mem.eql(u8, tok, mname)) {
+                            wanted = !inverted;
+                            break;
+                        }
+                    }
+                    if (inverted) {
+                        if (!wanted) break :blk null;
+                    } else if (!wanted) break :blk null;
+                }
+            }
             if (ast_type_args.len != 0) break :blk null;
             if (args.len == 0) break :blk null;
             const site_lambda: ?struct { n: usize, implicit: bool } = switch (args[args.len - 1]) {
@@ -6119,8 +6196,17 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             var found: ?*const ast.Function = null;
             for (cands) |cf| {
                 if (cf.receiver_type != null) continue;
-                if (inline_state.inlineMemberOwner(cf) == null) continue;
+                const owner = inline_state.inlineMemberOwner(cf) orelse continue;
                 if (cf.type_params.len != 0) continue;
+                // The OWNER must be monomorphic too: a generic class's
+                // member body (`MutableVector<T>.forEach`) casts through the
+                // class parameter, and a splice leaves `T` reading the
+                // process-global slot — unbound or stale. An owner the
+                // module cannot name declines conservatively.
+                const owner_cid = b.module.uniqueClassIdBySimpleName(owner) orelse
+                    b.module.classIdByFqn(owner) orelse continue;
+                if (owner_cid.int() >= b.module.classes.items.len) continue;
+                if (b.module.classes.items[owner_cid.int()].type_params.len != 0) continue;
                 if (cf.params.len != args.len) continue;
                 var irregular = false;
                 for (cf.params) |*p| {
@@ -6140,7 +6226,13 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 else
                     sl.n == decl_fn.params.len;
                 if (!shape_ok) continue;
-                if (!try memberOwnerOnReceiverChain(b, callee.Member.receiver, cf)) continue;
+                const cf_body = cf.body orelse continue;
+                const loops = switch (cf_body) {
+                    .Block => |bb| bodyHasLoop.scanStmts(bb.stmts),
+                    .Expr => |be| bodyHasLoop.scanExpr(&be),
+                };
+                if (loops) continue;
+                if (!try memberOwnerOnReceiverChainStrict(b, callee.Member.receiver, cf)) continue;
                 if (found != null) break :blk null;
                 found = cf;
             }
@@ -6276,6 +6368,11 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
             if (member_target == null) member_target = plain_member_inline;
+            if (runtime.envOnce("KLIO_PMI_TRACE") != null and plain_member_inline != null and
+                member_target == plain_member_inline)
+            {
+                std.debug.print("[pmi] {s}\n", .{mname});
+            }
             if (try tryInlineCallWithTypeArgs(b, mname, member_target, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| {
                 if (runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
                     if (std.mem.eql(u8, w, mname)) std.debug.print("[splice-ok] {s} span={}:{}\n", .{ mname, exprSpan(callee).file, exprSpan(callee).start });
@@ -8543,6 +8640,15 @@ fn inlineOwnerInEnclosingHierarchy(b: *FuncBuilder, enclosing: []const u8, f: *c
 /// receiver whose hierarchy does not include the owner rejects it —
 /// `resp.body<User>()` on an `HttpResponse` must not splice the
 /// unrelated `HttpStatement.body`.
+/// Strict form for the monomorphic member-inline splice: an UNPROVABLE
+/// receiver type rejects instead of passing — `xs.fold(init) { }` on a
+/// List must never splice SnapshotIdSet's same-named member body.
+fn memberOwnerOnReceiverChainStrict(b: *FuncBuilder, receiver: *const Expr, cf: *const ast.Function) Allocator.Error!bool {
+    const owner = inline_state.inlineMemberOwner(cf) orelse return false;
+    const head = (try inline_call.inferReceiverType(b, receiver)) orelse return false;
+    return classIsOrExtendsHosted(b, head, owner);
+}
+
 fn memberOwnerOnReceiverChain(b: *FuncBuilder, receiver: *const Expr, cf: *const ast.Function) Allocator.Error!bool {
     const owner = inline_state.inlineMemberOwner(cf) orelse return true;
     const head = (try inline_call.inferReceiverType(b, receiver)) orelse return true;
@@ -14409,6 +14515,12 @@ fn recordOutOfScopeRef(
     // pick); rejecting it would be a false positive, so a bare-FQN
     // declaration is never reported out of scope.
     if (std.mem.indexOfScalar(u8, fqn, '.') == null) return false;
+    if (runtime.envOnce("KLIO_UNRES_TRACE") != null) {
+        std.debug.print("[unres] name={s} fqn={s} inline_fn={s} owner={s} window={} depth={d}\n", .{
+            name, fqn, b.currentInlineFn() orelse "-", b.owner_class orelse "-",
+            b.lambda_splice_resolve != null, b.scopes.items.len,
+        });
+    }
     try b.module.resolve_diags.append(b.allocator, .{
         .name = name,
         .fqn_a = fqn,
