@@ -64,11 +64,20 @@ distribution is FLAT: nothing above 14%.
 
 LANDED 2026-08-28 rounds: **253us -> ~193us (1.31x)** per composable; vpd
 SOLO **~724s -> ~500s (1.45x** — it leans harder on the served drain
-machinery than the replica); suite wall **847s -> 758s** (gate 1389/1/0,
-the 1 = the known resumeOnBackgroundThread load flake inside its declared
-slack). The wall moved less than vpd because 8-way CONTENTION inflates the
-in-gate run ~1.4x over solo — scheduling/width is now a live lever again
-alongside throughput. The
+machinery than the replica); suite wall **847s -> 727s** (gates green:
+1390/0/0 and 1389/1/0 with the known resumeOnBackgroundThread flake in
+slack). SCHEDULING IS MINED OUT, measured three ways on the 32-core box:
+width 6 vs 8 is 767 vs 758s; giving vpd its OWN child (negated --filter
+tokens landed for it) plus trimming that child's compile from ~180s to
+~20s (class file + the two same-package helper files) bought only ~30s
+combined. The wall is the vpd child itself at ~700s in-suite vs ~500s
+solo — a ~1.4x co-tenancy inflation across separate processes (memory
+bandwidth / turbo, not a lock: the children share nothing). Suite
+diagnostics added: per-child wall lines ([child-wall]).
+Remaining arithmetic: wall 364s needs vpd solo ~260s = another 1.9x of
+recomposition throughput; serve batches are yielding ~10% each with the
+largest un-served census item now ~2%. ReleaseFast (1.18x policy) would
+land ~590s in-gate — still short alone. The
 serve family (`src/ir/compose_fast.zig`, `KLIO_COMPOSE_FAST` bisect mask,
 wired at `hostRouteServe` AND the flat-call seam): IntStack, the
 composite-key rotation, BOTH changelists' push, the write scope, the
