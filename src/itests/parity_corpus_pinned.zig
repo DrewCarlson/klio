@@ -449,6 +449,14 @@ test "internal_props_cross_package" {
     }
 }
 
+test "wide_infix_chain" {
+    try check("wide_infix_chain",
+        \\wide=20
+        \\wide=20
+        \\
+    );
+}
+
 test "member_extension_owner_memo" {
     try check("member_extension_owner_memo",
         \\A7 bB7 A7 bB7 A7 bB7

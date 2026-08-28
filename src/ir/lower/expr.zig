@@ -11045,6 +11045,14 @@ fn headDeclaresTypeParams(b: *FuncBuilder, head: []const u8) bool {
 }
 
 pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+    if (lazyMemoGet(b, arg)) |hit| return hit.ty;
+    const owns = tyMemoEnter(b);
+    const r = argDeclTypeRefLazyUncached(b, arg);
+    lazyMemoLeave(b, owns, arg, r);
+    return r;
+}
+
+fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (runtime.envOnce("KLIO_VALTY_TRACE")) |w| {
         if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
             std.debug.print("[valty] LAZY {s} decl={s} splice={} lsr={}\n", .{ w, if (b.localDeclTypeRef(w)) |t| t.name else "<unset>", b.spliceParamTy(w) != null, b.lambda_splice_resolve != null });
@@ -11976,7 +11984,126 @@ pub fn iterableElementTypeName(b: *FuncBuilder, iter: *const Expr) Allocator.Err
 /// terminate on mutual recursion.
 pub threadlocal var od_depth: u8 = 0;
 
+/// Every resolution arm that needs an operand's type asks for it again, so a
+/// chain of infix calls (`a and 1 + b and 1 + ...`) re-typed its whole left
+/// operand once per arm: 24 terms cost 20M type queries and 17s of lowering.
+/// One outermost query now types each subexpression once. The memo lives only
+/// for that query — builder state (splice windows, narrowed locals) cannot
+/// change while it runs, and the stamp below drops the memo if it does.
+const TyMemo = struct {
+    map: std.AutoHashMapUnmanaged(u64, ?ir.TypeRef) = .{},
+    /// Lazy answers are BORROWED (the deriver returns registry/AST slices
+    /// without cloning), so this map never frees what it holds.
+    lazy: std.AutoHashMapUnmanaged(u64, ?ir.TypeRef) = .{},
+    owner: ?*FuncBuilder = null,
+    stamp: u64 = 0,
+    depth: u32 = 0,
+};
+threadlocal var ty_memo: TyMemo = .{};
+
+/// The memo outlives any one function build, so its own storage comes from a
+/// process-lifetime allocator instead of the builder's arena.
+fn memoAlloc() std.mem.Allocator {
+    return std.heap.smp_allocator;
+}
+
+fn tyMemoOn() bool {
+    return !std.mem.eql(u8, runtime.envOnce("KLIO_TY_MEMO") orelse "1", "0");
+}
+
+pub const TyMemoHit = struct { ty: ?ir.TypeRef };
+
+fn tyMemoStamp(b: *const FuncBuilder) u64 {
+    var h: u64 = if (b.caller_member_scope) |ms| @intFromPtr(ms) else 8;
+    h = h *% 31 +% b.inline_stack_visible_base;
+    h = h *% 31 +% b.inline_lambda_subst.items.len;
+    h = h *% 31 +% b.splice_hidden_bands.items.len;
+    h = h *% 31 +% b.local_decl_types.count();
+    if (b.lambda_splice_resolve) |ls| h = h *% 31 +% ls.caller_depth *% 7 +% ls.own_base;
+    return h;
+}
+
+fn tyMemoKey(e: *const Expr, tag: u1) u64 {
+    return (@as(u64, @intFromPtr(e)) << 1) | tag;
+}
+
+fn tyMemoGet(b: *FuncBuilder, e: *const Expr, tag: u1) ?TyMemoHit {
+    if (ty_memo.depth == 0 or ty_memo.owner != b) return null;
+    const hit = ty_memo.map.get(tyMemoKey(e, tag)) orelse return null;
+    const cloned: ?ir.TypeRef = if (hit) |t| (t.clone(b.allocator) catch return null) else null;
+    return .{ .ty = cloned };
+}
+
+fn tyMemoEnter(b: *FuncBuilder) bool {
+    if (!tyMemoOn()) return false;
+    if (ty_memo.depth == 0) {
+        ty_memo.owner = b;
+        ty_memo.stamp = tyMemoStamp(b);
+        ty_memo.depth = 1;
+        return true;
+    }
+    ty_memo.depth += 1;
+    return false;
+}
+
+fn tyMemoLeave(b: *FuncBuilder, owns: bool, e: *const Expr, tag: u1, r: ?ir.TypeRef) void {
+    if (!tyMemoOn()) return;
+    ty_memo.depth -= 1;
+    if (owns) {
+        tyMemoClear();
+        return;
+    }
+    if (ty_memo.owner != b or ty_memo.stamp != tyMemoStamp(b)) return;
+    const stored: ?ir.TypeRef = if (r) |t| (t.clone(memoAlloc()) catch return) else null;
+    ty_memo.map.put(memoAlloc(), tyMemoKey(e, tag), stored) catch {
+        if (stored) |t| @constCast(&t).deinit(memoAlloc());
+    };
+}
+
+fn tyMemoClear() void {
+    var it = ty_memo.map.iterator();
+    while (it.next()) |ent| if (ent.value_ptr.*) |*t| t.deinit(memoAlloc());
+    ty_memo.map.clearRetainingCapacity();
+    ty_memo.lazy.clearRetainingCapacity();
+    ty_memo.owner = null;
+}
+
+fn lazyMemoGet(b: *FuncBuilder, e: *const Expr) ?TyMemoHit {
+    if (ty_memo.depth == 0 or ty_memo.owner != b) return null;
+    const hit = ty_memo.lazy.get(@intFromPtr(e)) orelse return null;
+    return .{ .ty = hit };
+}
+
+fn lazyMemoLeave(b: *FuncBuilder, owns: bool, e: *const Expr, r: ?ir.TypeRef) void {
+    if (!tyMemoOn()) return;
+    if (!owns and ty_memo.owner == b and ty_memo.stamp == tyMemoStamp(b)) {
+        ty_memo.lazy.put(memoAlloc(), @intFromPtr(e), r) catch {};
+    }
+    ty_memo.depth -= 1;
+    if (owns) tyMemoClear();
+}
+
 pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (tyMemoGet(b, e, 0)) |hit| return hit.ty;
+    const owns = tyMemoEnter(b);
+    const r = try staticExprTypeRefUncached(b, e);
+    tyMemoLeave(b, owns, e, 0, r);
+    return r;
+}
+
+/// Memo entry point for the call-return deriver, which several arms re-enter
+/// on the same subexpression.
+pub fn tyMemoCall(b: *FuncBuilder, e: *const Expr) ?TyMemoHit {
+    return tyMemoGet(b, e, 1);
+}
+pub fn tyMemoCallEnter(b: *FuncBuilder) bool {
+    return tyMemoEnter(b);
+}
+pub fn tyMemoCallLeave(b: *FuncBuilder, owns: bool, e: *const Expr, r: ?ir.TypeRef) void {
+    tyMemoLeave(b, owns, e, 1, r);
+}
+
+fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
     // Literals name their own type (`var result = 0` is an Int wherever
     // the var is read, including across a capture boundary).
     switch (e.*) {

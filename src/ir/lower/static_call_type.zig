@@ -637,7 +637,10 @@ pub fn staticCallReturnTypeRef(
     b: *FuncBuilder,
     call_expr: *const Expr,
 ) Allocator.Error!?ir.TypeRef {
+    if (expr.tyMemoCall(b, call_expr)) |hit| return hit.ty;
+    const owns = expr.tyMemoCallEnter(b);
     const r = try staticCallReturnTypeRefInner(b, call_expr);
+    expr.tyMemoCallLeave(b, owns, call_expr, r);
     if (runtime.envOnce("KLIO_SCRT_TRACE")) |w| {
         if (call_expr.* == .Call and call_expr.Call.callee.* == .Path and
             call_expr.Call.callee.Path.segments.len == 1 and
