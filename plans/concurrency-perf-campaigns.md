@@ -79,9 +79,16 @@ locking (already Noop), name-identity and field memos (already present).
       both from the pack saved 2.4%. It is the op bodies plus their dispatch,
       which `KLIO_FN_PROF` attributes to the caller whenever the callee is
       leaf/bytecode-served rather than framed.
-      Reaching 90s means native-speed execution of that inner loop: **Front A**
-      (bake-time AOT object-shape natives), with Front B's frame/allocation
-      levers as the compounding half. The test races two infinite writer loops
+      FRONT A WAS THEN BUILT AND MEASURED (2026-08-28) — and it does not close
+      this: with 6575 compose-runtime bodies emitted as C and registered
+      against a pinned image, a recomposition costs 1828-1835us against 1758us
+      interpreted. The per-op ABI hands every uninlined op back to the
+      interpreter, and dispatch plus frames IS the recomposition. Front B's
+      remaining levers are 1-5% each and diffuse (the 5% of string compares
+      has no single caller; the ReleaseFast harness is a policy call worth
+      1.20x). NOTHING AVAILABLE COMPOUNDS TO 4.6x: closing this test needs a
+      compiler that inlines dispatch and manages frames natively, which is a
+      research-scale project rather than a lever. The test races two infinite writer loops
       against the drain, so recompose+apply speedups converge on it
       superlinearly.
 
