@@ -51,6 +51,10 @@ pub const Route = enum(u8) {
     /// `SlotWriter.dataAnchorToDataIndex(anchor, gapLen, capacity)` — pure
     /// arithmetic that reads none of the writer's state.
     data_anchor_to_index = 20,
+    /// The link-buffer changelist's `pushOp`/`push`: the gap-buffer body plus
+    /// `requiresApplication` raised from the operation's visibility, which is
+    /// a stored constructor property there.
+    ops_push_op_link = 21,
 };
 
 /// Classify once per `Func` (the caller memoizes into `func.host_route`).
@@ -67,11 +71,10 @@ pub fn classify(fqn: []const u8, n_params: usize) Route {
     }
     if (n_params == 2) {
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.composer.gapbuffer.slotAnchor")) return .slot_anchor;
-        // Only the gap-buffer changelist: the link-buffer's `pushOp` also
-        // raises `requiresApplication` from the operation's visibility, which
-        // is a virtual getter the host cannot read.
         if (std.mem.endsWith(u8, fqn, "gapbuffer.changelist.Operations.pushOp") or
             std.mem.endsWith(u8, fqn, "gapbuffer.changelist.Operations.push")) return .ops_push_op;
+        if (std.mem.endsWith(u8, fqn, "linkbuffer.changelist.Operations.pushOp") or
+            std.mem.endsWith(u8, fqn, "linkbuffer.changelist.Operations.push")) return .ops_push_op_link;
         if (std.mem.endsWith(u8, fqn, "changelist.Operations.ensureAllArgumentsPushedFor")) return .ops_ensure_args;
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.IntStack.push")) return .int_stack_push;
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.IntStack.peekOr")) return .int_stack_peek_or;
@@ -378,6 +381,31 @@ pub fn serveSetObject(allocator: std.mem.Allocator, args: []const Value) ?Value 
     const slot = topSlot(&stack, parameter, true) orelse return null;
     slot.arr.set(allocator, @intCast(slot.index), args[2]);
     return .{ .Unit = {} };
+}
+
+threadlocal var fn_visible: std.atomic.Value(?[*]const u8) = .init(null);
+
+/// The link-buffer changelist additionally aggregates the operation's
+/// visibility into `requiresApplication`. That flag is a stored constructor
+/// property of `Operation`, so the host reads it directly.
+pub fn servePushOpLink(allocator: std.mem.Allocator, args: []const Value) ?Value {
+    if (args[1] != .Instance) return null;
+    const visible = blk: {
+        const g = args[1].Instance.borrow();
+        defer g.deinit();
+        const v = g.get().getCached(&fn_visible, "isExternallyVisible") orelse return null;
+        break :blk switch (v) {
+            .Bool => |b| b,
+            else => return null,
+        };
+    };
+    const pushed = servePushOp(allocator, args) orelse return null;
+    if (visible) {
+        const g = args[0].Instance.borrowMut();
+        defer g.deinit();
+        if (!g.get().set("requiresApplication", .{ .Bool = true })) return null;
+    }
+    return pushed;
 }
 
 /// `groups[address * 5 + 4] + countOneBits(groups[address * 5 + 1] shr 28)`.

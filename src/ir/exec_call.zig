@@ -206,7 +206,7 @@ fn composeRouteServe(allocator: Allocator, f: *const ir.Func, args: []const Valu
     const route: compose_fast.Route = @enumFromInt(f.compose_route);
     const bit: u8 = switch (route) {
         .slot_anchor, .data_anchor_to_index => 16,
-        .ops_push_op => 2,
+        .ops_push_op, .ops_push_op_link => 2,
         .ops_ensure_args => 4,
         .ops_set_int, .ops_set_object => 8,
         else => 1,
@@ -227,6 +227,7 @@ fn composeRouteServe(allocator: Allocator, f: *const ir.Func, args: []const Valu
         .int_stack_clear => compose_fast.serveClear(args),
         .int_stack_size => compose_fast.serveSize(args),
         .ops_push_op => compose_fast.servePushOp(allocator, args),
+        .ops_push_op_link => compose_fast.servePushOpLink(allocator, args),
         .ops_ensure_args => compose_fast.serveEnsureArgs(args),
         .ops_set_int => compose_fast.serveSetInt(allocator, args),
         .ops_set_object => compose_fast.serveSetObject(allocator, args),
