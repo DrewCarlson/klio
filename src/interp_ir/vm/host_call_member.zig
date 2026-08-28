@@ -11909,6 +11909,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
         if (extMethodCacheGet(self, k)) |fid| {
             ext_fb_plain_hit += 1;
             if (fid == METHOD_MISS) return null;
+            if (missTraceWant(name)) std.debug.print("[extfb] PLAIN-HIT fid={d} name={s} member_ext={}\n", .{ fid, name, isMemberExtFid(self, @enumFromInt(fid)) });
             if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
         }
     }

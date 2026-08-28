@@ -449,6 +449,23 @@ test "internal_props_cross_package" {
     }
 }
 
+test "fused_throw_catch" {
+    try check("fused_throw_catch",
+        \\ok=15
+        \\caught=Invalid radix: 37
+        \\failed=true
+        \\
+    );
+}
+
+test "fused_member_ext_owner" {
+    try check("fused_member_ext_owner",
+        \\PRESENT,OPTIONAL|2|h:ABSENT=false
+        \\PRESENT,OPTIONAL|2|k:ABSENT=false
+        \\
+    );
+}
+
 test "splice_hygiene_shadow" {
     try check("splice_hygiene_shadow",
         \\member=6
@@ -456,6 +473,7 @@ test "splice_hygiene_shadow" {
         \\ext=18
         \\signed=101
         \\plain=1
+        \\tail=1y2z
         \\
     );
 }

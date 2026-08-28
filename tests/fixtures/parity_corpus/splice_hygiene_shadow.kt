@@ -23,6 +23,24 @@ class Parser(val allowSign: Boolean, val limit: Int) {
     }
 }
 
+class Table {
+    val slots = arrayOf<Any?>("x", "y", "z")
+    fun addr(i: Int): Int = i
+    inline fun forEachTail(count: Int, block: (Int, Any?) -> Unit) {
+        for (slotIndex in (3 - count) until 3) {
+            block(slotIndex, slots[addr(slotIndex)])
+        }
+    }
+}
+
+// The caller's own `slots` parameter must not capture the body's bare
+// `slots` field read.
+fun drain(slots: Table): String {
+    var acc = ""
+    slots.forEachTail(2) { i, v -> acc += "" + i + v }
+    return acc
+}
+
 fun main() {
     val s = Scanner()
     var index = 1
@@ -40,4 +58,5 @@ fun main() {
     println("signed=" + got)
     plain.parse(1) { got = it }
     println("plain=" + got)
+    println("tail=" + drain(Table()))
 }

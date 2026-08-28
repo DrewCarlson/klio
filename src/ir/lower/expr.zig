@@ -6128,41 +6128,6 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // defaults or varargs, arity matched, the declared callback shape
         // matched against the site's lambda, owner on the receiver chain,
         // and exactly one survivor. `KLIO_MEMBER_INLINE=0` bisects.
-        // Whether an inline body contains a loop at its statement spine.
-        // The monomorphic member-inline tier is scoped to LOOP-FREE bodies:
-        // a loop body invoking the lambda per element exercises receiver
-        // plumbing the splice tier has not hardened yet (SlotTable's
-        // forEachTailSlot mis-resolved its `slots[...]` receiver), while the
-        // delegating-wrapper shape this tier exists for (`Operations.push`)
-        // is straight-line.
-        const bodyHasLoop = struct {
-            fn scanExpr(e: *const ast.Expr) bool {
-                return switch (e.*) {
-                    .While, .DoWhile, .For => true,
-                    .If => |iff| scanExpr(iff.cond) or scanExpr(iff.then_branch) or
-                        (if (iff.else_branch) |el| scanExpr(el) else false),
-                    .Block => |blk2| scanStmts(blk2.stmts),
-                    .Try => |t| scanStmts(t.body.stmts),
-                    else => false,
-                };
-            }
-            fn scanStmts(list: []const ast.Stmt) bool {
-                for (list) |*st| {
-                    switch (st.*) {
-                        .Expr => |*e| if (scanExpr(e)) return true,
-                        .Assign => |*a2| if (scanExpr(&a2.value)) return true,
-                        .Decl => |*d| switch (d.*) {
-                            .Property => |pr| if (pr.init) |*ini| {
-                                if (scanExpr(ini)) return true;
-                            },
-                            else => {},
-                        },
-                        else => {},
-                    }
-                }
-                return false;
-            }
-        };
         const plain_member_inline: ?*const ast.Function = blk: {
             // `KLIO_MEMBER_INLINE`: "0" disables; a comma list allows ONLY
             // those names; a list starting with '!' allows all BUT those.
@@ -6226,12 +6191,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 else
                     sl.n == decl_fn.params.len;
                 if (!shape_ok) continue;
-                const cf_body = cf.body orelse continue;
-                const loops = switch (cf_body) {
-                    .Block => |bb| bodyHasLoop.scanStmts(bb.stmts),
-                    .Expr => |be| bodyHasLoop.scanExpr(&be),
-                };
-                if (loops) continue;
+                if (cf.body == null) continue;
                 if (!try memberOwnerOnReceiverChainStrict(b, callee.Member.receiver, cf)) continue;
                 if (found != null) break :blk null;
                 found = cf;

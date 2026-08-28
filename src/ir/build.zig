@@ -841,6 +841,14 @@ pub const FuncBuilder = struct {
     /// would otherwise shadow a same-named caller variable the lambda
     /// body references. Null when no such splice is in progress.
     lambda_splice_resolve: ?SpliceWindow = null,
+    /// Scope FLOOR for a spliced MEMBER body: bare names in the body resolve
+    /// only in scopes at or above the splice base — a caller local is not in
+    /// the body's lexical scope, so `slots.forEachTailSlot(...)` spliced into
+    /// a caller whose own parameter is named `slots` must not let the body's
+    /// bare `slots` (a field on the bound receiver) bind that parameter.
+    /// Null outside a member splice; the caller-lambda window (above) takes
+    /// precedence while a spliced arg lambda lowers.
+    splice_body_floor: ?usize = null,
     /// Scope-index bands hidden by ENCLOSING lambda-splice windows, one
     /// `[lo, hi]` per window still on the splice stack. A nested window's
     /// caller region (`[0, caller_depth)`) can reach past an outer splice's
@@ -1428,6 +1436,10 @@ pub const FuncBuilder = struct {
             for (self.splice_hidden_bands.items) |band| {
                 if (e.depth >= band.lo and e.depth <= band.hi) return null;
             }
+        } else if (self.splice_body_floor) |fl| {
+            // Body code under the member-splice floor: a caller local's
+            // home below the base is not in the body's lexical scope.
+            if (e.depth < fl) return null;
         }
         return e.reg;
     }
@@ -2927,7 +2939,8 @@ pub const FuncBuilder = struct {
             return null;
         }
         var i = self.scopes.items.len;
-        while (i > 0) {
+        const stop = self.splice_body_floor orelse 0;
+        while (i > stop) {
             i -= 1;
             if (self.scopes.items[i].get(name)) |r| return r;
         }
