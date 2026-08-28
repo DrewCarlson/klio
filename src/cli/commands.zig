@@ -252,6 +252,9 @@ pub fn runFileIrVm(
 ) u8 {
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
+    runtime.prof.opProfMaybeStart();
+    runtime.prof.fnProfMaybeStart();
+    ir.eval.frameCountInit();
     // Catch any receiver/coroutine thread-local state leaked from a prior run
     // on this thread before assembling the next program.
     interp_ir.resetReceiverThreadLocals();
@@ -2456,6 +2459,7 @@ fn runTestsOnBuilt(
     }
     ir.eval.callStatsDump();
     ir.eval.dispatch_replay_hits = &interp_ir.VmHost.replayHits;
+    ir.eval.ext_fb_counts = &interp_ir.VmHost.extFbCounts;
     ir.eval.dispatchStatsDump();
     if (runtime.envOnce("KLIO_DISPATCH_STATS") != null) {
         ir.lower.expr.lowerSitesDump();
@@ -2788,6 +2792,7 @@ pub fn runBuiltModuleArgs(
     }
     ir.eval.callStatsDump();
     ir.eval.dispatch_replay_hits = &interp_ir.VmHost.replayHits;
+    ir.eval.ext_fb_counts = &interp_ir.VmHost.extFbCounts;
     ir.eval.dispatchStatsDump();
     // `KLIO_OP_PROF` starts for `run` too, but only `test` dumped it; the
     // per-opcode histogram belongs to both exits.

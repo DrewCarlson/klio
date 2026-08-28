@@ -521,6 +521,10 @@ fn classifyFlattenable(f: *const Func) u8 {
 /// guarded decrement went negative). Callers therefore pass `&evtls` read
 /// fresh at the call, never a stored pointer — which also keeps the thread
 /// pointer to one lookup per frame operation instead of one per pool.
+pub var regs_pool_hit: u64 = 0;
+pub var regs_pool_miss: u64 = 0;
+pub var regs_fill_slots: u64 = 0;
+
 fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32, no_fill: bool) Allocator.Error!std.ArrayList(Value) {
     if (frame_count_on) frame_alloc_total += 1;
     const ra = regsAlloc(allocator);
@@ -532,10 +536,18 @@ fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32, no_fill: bool) Alloca
             // A no-fill frame keeps whatever the pooled buffer last held;
             // its written mask keeps every reader away from those slots.
             if (!no_fill) @memset(list.items, .Unit);
+            if (frame_count_on) {
+                regs_pool_hit += 1;
+                if (!no_fill) regs_fill_slots += n;
+            }
             // Re-enters the traced set (see releaseRegs).
             if (runtime.gc.gc_enabled and !runtime.reclaimEnabled() and runtime.gc.external_accounting) runtime.gc.noteExternalBytes(buf.len * @sizeOf(Value));
             return list;
         }
+    }
+    if (frame_count_on) {
+        regs_pool_miss += 1;
+        if (!no_fill) regs_fill_slots += n;
     }
     var regs: std.ArrayList(Value) = .empty;
     if (no_fill) {
@@ -1381,7 +1393,18 @@ pub fn dispatchNote(comptime k: DispatchKind) void {
 /// counts the ROUTE a call took, not the work it did, so the two differ.
 pub var dispatch_replay_hits: ?*const fn () u64 = null;
 
+/// Set by the host so the dispatch report can name how the member-extension
+/// fallback resolved: a plain-key hit, a chain-folded hit, or a full walk.
+pub var ext_fb_counts: ?*const fn () [4]u64 = null;
+
 pub fn dispatchStatsDump() void {
+    if (ext_fb_counts) |f| {
+        const c = f();
+        if (c[0] != 0) std.debug.print(
+            "[ext-fb] total={d} plain-hit={d} chain-hit={d} walk={d}\n",
+            .{ c[0], c[1], c[2], c[3] },
+        );
+    }
     if (dispatch_stats_state != 2) return;
     var total: u64 = 0;
     for (&dispatch_counts) |*c| total += c.load(.monotonic);
@@ -1452,9 +1475,16 @@ inline fn frameCensusBump(fid: u32) void {
     frame_census[fid & (FRAME_CENSUS_SLOTS - 1)] +%= 1;
 }
 
+/// Executed-instruction total (`KLIO_FRAME_COUNT` prints it): the denominator
+/// that turns a sampled opcode profile into a per-instruction cost.
+pub threadlocal var inst_count: u64 = 0;
+pub var inst_count_all: std.atomic.Value(u64) = .init(0);
+
 pub fn frameCountDump(module: *const Module) void {
     if (!frame_count_on) return;
-    std.debug.print("[frames] entries={d} activations={d}\n", .{ frame_count_total, frame_alloc_total });
+    std.debug.print("[frames] entries={d} activations={d} insts={d}\n", .{ frame_count_total, frame_alloc_total, inst_count_all.load(.monotonic) + inst_count });
+    std.debug.print("[regs] pool_hit={d} pool_miss={d} filled_slots={d}\n", .{ regs_pool_hit, regs_pool_miss, regs_fill_slots });
+    std.debug.print("[getfield] mono={d} getter={d} poly={d} total={d} getter_ms={d} slow_ms={d}\n", .{ gf_mono, gf_getter, gf_poly, gf_slow, gf_getter_ns / 1_000_000, gf_slow_ns / 1_000_000 });
     if (!frame_census_on) return;
     const Entry = struct { name: []const u8, n: u32 };
     var list: std.ArrayList(Entry) = .empty;
@@ -3996,12 +4026,28 @@ fn leafRunOne(
                 if (comptime !@hasDecl(H, "funcRunsItsBody")) return error.LeafAbandon;
                 if (c.arg_names.len != 0 or c.type_args.len != 0) return error.LeafAbandon;
                 const callee = module.funcById(c.func) orelse return error.LeafAbandon;
+                _ = module.ensureFuncBody(@constCast(callee));
                 if (!callee.leafExprBody()) {
                     if (trace) {
                         var ninsts: usize = 0;
                         for (callee.blocks) |*cb| ninsts += cb.insts.len;
-                        std.debug.print("[leaf] {s}: callee {s}#{d} is not a leaf (blocks={d} locals={d} insts={d} lambda={} suspend={})\n", .{
-                            func.name, callee.name, callee.id.int(), callee.blocks.len, callee.n_locals, ninsts, callee.is_lambda, callee.is_suspend,
+                        var why: []const u8 = "?";
+                        var pflag = false;
+                        for (callee.params) |*cp| {
+                            if (cp.is_vararg or cp.default != null) pflag = true;
+                        }
+                        if (pflag) why = "param-default-or-vararg";
+                        for (callee.blocks) |*cb| {
+                            if (cb.catches.len != 0 or cb.finally != null or cb.lr_absorb != null) why = "try-region";
+                            switch (cb.terminator) {
+                                .Return, .Goto, .Branch, .Throw, .Unreachable => {},
+                                else => |t| {
+                                    if (std.mem.eql(u8, why, "?")) why = @tagName(t);
+                                },
+                            }
+                        }
+                        std.debug.print("[leaf] {s}: callee {s}#{d} is not a leaf why={s} (blocks={d} locals={d} insts={d} lambda={} suspend={} hopeless={d} state={d})\n", .{
+                            func.name, callee.name, callee.id.int(), why, callee.blocks.len, callee.n_locals, ninsts, callee.is_lambda, callee.is_suspend, callee.leaf_hopeless, callee.leaf_state,
                         });
                     }
                     return error.LeafAbandon;
@@ -4053,6 +4099,7 @@ fn leafTraceWant(func: *const Func) bool {
         leaf_trace_state = 1;
     }
     if (leaf_trace_want.len == 0) return false;
+    if (leaf_trace_want.len == 1 and leaf_trace_want[0] == '*') return true;
     return std.mem.indexOf(u8, func.name, leaf_trace_want) != null;
 }
 
@@ -7975,6 +8022,7 @@ pub fn nativeOpGotoExit(ctx: *NativeCtx, block: u32) void {
 }
 
 noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!Step {
+    if (frame_count_on) inst_count += 1;
     if (runtime.prof.op_prof_active) runtime.prof.current_op = @intFromEnum(inst.*);
     switch (inst.*) {
         .SuspendResumePoint => {
@@ -8646,7 +8694,75 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
 }
 
 /// Outlined `execInst` arm — see `execInst`.
+
+/// The stored slot's name against the site's name. Both come from the same
+/// module string pool at nearly every site, so the pointer check settles it
+/// without touching the bytes — this guard runs on EVERY field read.
+inline fn sameFieldName(stored: []const u8, want: []const u8) bool {
+    if (stored.ptr == want.ptr and stored.len == want.len) return true;
+    if (std.mem.eql(u8, stored, want)) return true;
+    // A scoped `$sgetter$<owner>\u{1f}<prop>` site stores its slot under the
+    // bare property name; the separator-guarded suffix keeps it exact.
+    return std.mem.startsWith(u8, want, "$sgetter$") and
+        want.len > stored.len and
+        std.mem.endsWith(u8, want, stored) and
+        want[want.len - stored.len - 1] == '\u{1f}';
+}
+
+/// A field-read site that sees more than one receiver class re-asked the
+/// host's (class, name) memo on every read, which interns the name and
+/// probes a hash map. Remember the answer per (site, class) instead: the
+/// route is a pure function of that pair.
+pub var gf_mono: u64 = 0;
+pub var gf_getter_ns: u64 = 0;
+pub var gf_slow_ns: u64 = 0;
+
+/// Monotonic nanoseconds for the field-read attribution buckets. Read only
+/// when `KLIO_FRAME_COUNT` is on, so the clock never prices a normal run.
+inline fn gfNow() u64 {
+    if (!frame_count_on) return 0;
+    return @intCast(runtime.clockMonotonicNanos());
+}
+var gf_slow_census_state: u8 = 0;
+var gf_slow_census_val: bool = false;
+/// `KLIO_GF_SLOW_CENSUS=1`: one line per field read that reaches the ladder.
+fn gfSlowCensusOn() bool {
+    if (gf_slow_census_state == 0) {
+        gf_slow_census_val = runtime.envOnce("KLIO_GF_SLOW_CENSUS") != null;
+        gf_slow_census_state = 1;
+    }
+    return gf_slow_census_val;
+}
+
+pub var gf_getter: u64 = 0;
+pub var gf_poly: u64 = 0;
+pub var gf_slow: u64 = 0;
+
+const POLY_FIELD_SLOTS: usize = 1 << 14;
+const PolyFieldEnt = struct { key: u64 = 0, route: u64 = 0 };
+threadlocal var poly_field_cache: [POLY_FIELD_SLOTS]PolyFieldEnt = @splat(.{});
+
+inline fn polyFieldKey(site: usize, cls: u64) u64 {
+    const k = (@as(u64, site) *% 0x9E3779B97F4A7C15) ^ (cls *% 0xC2B2AE3D27D4EB4F);
+    return k | 1;
+}
+
+fn polyFieldRoute(comptime H: type, host: *H, site: usize, cls: u64, recv: *const Value, name: []const u8) ?u64 {
+    // The host's own (class, name) memo is generation-guarded; this cache
+    // mirrors it, so the generation belongs in the key.
+    const gen: u64 = if (comptime @hasDecl(H, "dispatchCacheGen")) H.dispatchCacheGen() else 0;
+    const key = polyFieldKey(site, cls ^ (gen *% 0x51_7C_C1_B7_27_22_0A_95));
+    const slot = &poly_field_cache[@as(usize, @intCast(key >> 17)) & (POLY_FIELD_SLOTS - 1)];
+    if (slot.key == key) return if (slot.route == 0) null else slot.route;
+    const r = host.fieldSiteRoute(recv, name);
+    const route: u64 = if (r) |rr| (if (rr.cls == cls) rr.route else 0) else 0;
+    slot.key = key;
+    slot.route = route;
+    return if (route == 0) null else route;
+}
+
 noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Frame, gf: anytype, host: *H) Allocator.Error!Step {
+    if (frame_count_on) gf_slow += 1;
     const recv = frame.read(gf.receiver);
     if (gfTraceWant()) |w0| {
         if (constStr(frame.module, gf.field)) |fname| {
@@ -8744,13 +8860,10 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                         // its slot under the bare property name; the
                         // separator-guarded suffix match keeps the index-drift
                         // guard exact.
-                        if (!std.mem.eql(u8, f.name, name) and
-                            !(std.mem.startsWith(u8, name, "$sgetter$") and
-                                name.len > f.name.len and
-                                std.mem.endsWith(u8, name, f.name) and
-                                name[name.len - f.name.len - 1] == '\u{1f}')) break :fast;
+                        if (!sameFieldName(f.name, name)) break :fast;
                         const v = f.value;
                         if (v == .Delegate) break :fast;
+                        if (frame_count_on) gf_mono += 1;
                         // A stored slot holding NULL is a plain null unless the
                         // property is an unset `lateinit`, whose read must
                         // throw. Declining every null sent the commonest field
@@ -8776,6 +8889,9 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                     }
                 }
                 if (getter_fid != 0) {
+                    if (frame_count_on) gf_getter += 1;
+                    const t0 = gfNow();
+                    defer gf_getter_ns +%= gfNow() -% t0;
                     const got_g = host.runFieldGetter(allocator, @enumFromInt(getter_fid), recv);
                     if (pushed_enclosing) popEnclosing();
                     switch (try got_g) {
@@ -8794,7 +8910,14 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
             // (class, name) memo route — one probe instead of the slow
             // ladder — leaving the site's claim untouched.
             if (site_mismatch) poly: {
-                const r = host.fieldSiteRoute(&recv, name) orelse break :poly;
+                const cls_now: u64 = blk: {
+                    const g = recv.Instance.borrow();
+                    defer g.deinit();
+                    break :blk @intCast(g.get().class.identity());
+                };
+                const r: struct { route: u64 } = .{
+                    .route = polyFieldRoute(H, host, @intFromPtr(gf), cls_now, &recv, name) orelse break :poly,
+                };
                 if (r.route & 3 == 1) {
                     const idx: usize = @intCast(r.route >> 2);
                     const g = recv.Instance.borrow();
@@ -8802,13 +8925,10 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                     const b = g.get();
                     if (idx >= b.fields.items.len) break :poly;
                     const f = &b.fields.items[idx];
-                    if (!std.mem.eql(u8, f.name, name) and
-                        !(std.mem.startsWith(u8, name, "$sgetter$") and
-                            name.len > f.name.len and
-                            std.mem.endsWith(u8, name, f.name) and
-                            name[name.len - f.name.len - 1] == '\u{1f}')) break :poly;
+                    if (!sameFieldName(f.name, name)) break :poly;
                     const v = f.value;
                     if (v == .Null or v == .Delegate) break :poly;
+                    if (frame_count_on) gf_poly += 1;
                     v.retain();
                     if (pushed_enclosing) popEnclosing();
                     try frame.write(gf.dst, v);
@@ -8834,11 +8954,23 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                     }
                 }
             }
+            if (gfSlowCensusOn()) {
+                const cn: []const u8 = if (recv == .Instance) blk: {
+                    const g = recv.Instance.borrow();
+                    defer g.deinit();
+                    const cg = g.get().class.borrow();
+                    defer cg.deinit();
+                    break :blk cg.get().name;
+                } else @tagName(recv);
+                std.debug.print("[gf-slow] {s}.{s}\n", .{ cn, name });
+            }
         }
     }
     runtime.prof.opRoute(14);
     gfStatsBump(&recv, name);
+    const t_slow = gfNow();
     const got = host.getField(allocator, &recv, name);
+    gf_slow_ns +%= gfNow() -% t_slow;
     if (pushed_enclosing) popEnclosing();
     switch (try got) {
         // host.getField returns a borrowed field value; the register owns its ref.

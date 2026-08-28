@@ -529,6 +529,29 @@ pub fn fieldWriteSiteRoute(self: *VmHost, receiver: *const Value, name: []const 
 pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?FieldSiteClaim {
     if (receiver.* != .Instance) return null;
     if (std.mem.eql(u8, name, "coroutineContext")) return null;
+    // A property getter reading its own backing store carries the SCOPED
+    // name (`$sgetter$<owner>\u{1f}<prop>`), which no (class, name) memo
+    // holds — so every such read declined a route and sent the whole body
+    // to a frame. When the receiver really is the scoped owner the read is
+    // the plain property on the receiver's own class, which is what Kotlin's
+    // virtual dispatch resolves it to.
+    if (std.mem.startsWith(u8, name, "$sgetter$")) {
+        const rest = name["$sgetter$".len..];
+        if (std.mem.indexOfScalar(u8, rest, '\u{1f}')) |sep| {
+            const owner = rest[0..sep];
+            const prop = rest[sep + 1 ..];
+            if (prop.len == 0) return null;
+            const rcn = className(receiver.Instance);
+            const owns = std.mem.eql(u8, rcn, owner) or blk: {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                break :blk mg.get().classIsOrExtends(rcn, owner);
+            };
+            if (!owns) return null;
+            return fieldSiteRoute(self, receiver, prop);
+        }
+        return null;
+    }
     const inst = receiver.Instance;
     const cls: u64 = blk: {
         const g = inst.borrow();

@@ -1441,6 +1441,11 @@ pub const Func = struct {
             2, 3 => return true,
             else => {},
         }
+        // A DEFERRED body carries no blocks until the image section decodes
+        // it. Classifying one here would cache "not a leaf" for a function
+        // that becomes a leaf the moment it loads, which is how `Stack.isEmpty`
+        // and every other tiny library accessor lost the frameless tier.
+        if (self.blocks.len == 0) return false;
         const verdict = self.classifyLeafExprBody();
         @constCast(self).leaf_state = if (!verdict)
             1
