@@ -4220,8 +4220,18 @@ fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype
         }
         return null;
     }
-    if (claimed != cls) return null;
-    const route = @atomicLoad(u64, @constCast(&gf.site_route), .acquire);
+    // A POLYMORPHIC site (`op.ints` inside `Operations.pushOp`, where `op` is
+    // any of the changelist's ~40 Operation subclasses) claims one class and
+    // then sees another on nearly every call. Declining there sent the whole
+    // body — one of the hottest in a recomposition — to the frame path
+    // forever. The per-site claim is only a fast path: on a miss, ask the
+    // shared (class, name) memo, which answers from its own cache.
+    var route = @atomicLoad(u64, @constCast(&gf.site_route), .acquire);
+    if (claimed != cls) {
+        const alt = host.fieldSiteRoute(recv, fname) orelse return null;
+        if (alt.cls != cls) return null;
+        route = alt.route;
+    }
     // A property whose backing is another leaf property chains through it:
     // the callee is pure by construction, so re-running it if this serve is
     // later abandoned observes nothing.
