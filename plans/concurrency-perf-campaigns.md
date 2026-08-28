@@ -52,10 +52,14 @@ locking (already Noop), name-identity and field memos (already present).
       lambdas. The interpreter-level profile is diffuse behind that (memset
       ~16%, getIndex 4.8%, runFrameExec 3.8%, eqlBytes 3.2%).
       FRAME CENSUS (`KLIO_FRAME_CENSUS`, added this round): one Text
-      recomposition costs **~355 interpreted activations at ~2.1us each**, and
-      the census is a flat list of compose-runtime one-liners (composer
-      end/enterGroup/exitGroup, slot-table group reads, IntStack push/pop,
-      changelist pushes). TWO LEVERS MEASURED AND REJECTED on that basis:
+      recomposition costs **~355 interpreted activations**, and the census is a
+      flat list of compose-runtime one-liners (IntStack push/pop, slot-table
+      group reads, Stack push/pop/isEmpty, compoundWith, OpIterator.getInt).
+      A tiny member call measures ~0.4us, so activations account for only
+      ~18% of the wall — the rest is dispatch, host serves, allocation and GC,
+      and the interpreter profile behind them is a long tail of 1-5% items
+      (memset 9%, runFrameExec 9%, eqlBytes 5%, execInst 3%, getIndex 2%).
+      TWO LEVERS MEASURED AND REJECTED on that basis:
       widening the def-before-use analysis and the frame write-mask from 64 to
       256 registers halves the register-fill memset in the profile but leaves
       the wall unchanged (3093ms vs 3094ms), and extending the frameless leaf
@@ -63,8 +67,9 @@ locking (already Noop), name-identity and field memos (already present).
       activations for no wall change. So frame COUNT and frame SETUP are both
       off the critical path. What is left is raw interpreted work: ~1833
       tree-walked instructions per recomposition (plus the bytecode tier's own
-      stream, which does not pass through `execInst`) for ~765us. That is the
-      interpreted-vs-native factor, and only Front A moves it.
+      stream, which does not pass through `execInst`) for ~765us, spread over
+      a long tail no single lever dominates. That is the interpreted-vs-native
+      factor, and only Front A moves it.
       LANDED THIS ROUND (78132521): a member-extension winner is now memoized
       under the chain-folded key (the owner is re-found on the chain at serve
       time), which took a member-extension call from 3.0us to 1.5us and the
