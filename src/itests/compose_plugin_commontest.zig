@@ -456,13 +456,36 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             break;
         }
     }
+    var job_names: std.ArrayList([]const u8) = .empty;
     for (classes.items) |cls| {
+        // `validatePotentialDeadlock` IS the suite wall (~500s solo), and the
+        // rest of RecomposerTests queued behind it in the same child pushed
+        // the wall past 750s. The test gets its own child, scheduled first;
+        // the class's remainder runs as a separate job that overlaps it.
+        if (std.mem.eql(u8, cls, "RecomposerTests")) {
+            var solo: std.ArrayList([]const u8) = .empty;
+            try solo.append(a, klioBin(&env));
+            try solo.append(a, "test");
+            try solo.appendSlice(a, sources.items);
+            try solo.append(a, "--filter=RecomposerTests.validatePotentialDeadlock");
+            try jobs.append(a, try solo.toOwnedSlice(a));
+            try job_names.append(a, "RecomposerTests.validatePotentialDeadlock");
+            var rest: std.ArrayList([]const u8) = .empty;
+            try rest.append(a, klioBin(&env));
+            try rest.append(a, "test");
+            try rest.appendSlice(a, sources.items);
+            try rest.append(a, "--filter=RecomposerTests,!validatePotentialDeadlock");
+            try jobs.append(a, try rest.toOwnedSlice(a));
+            try job_names.append(a, "RecomposerTests-rest");
+            continue;
+        }
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, klioBin(&env));
         try argv.append(a, "test");
         try argv.appendSlice(a, sources.items);
         try argv.append(a, try std.fmt.allocPrint(a, "--filter={s}", .{cls}));
         try jobs.append(a, try argv.toOwnedSlice(a));
+        try job_names.append(a, cls);
     }
 
     var next = std.atomic.Value(usize).init(0);
@@ -533,7 +556,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     for (0..workerCount()) |_| {
         try threads.append(a, try std.Thread.spawn(.{}, Pool.worker, .{
             @as([]const []const []const u8, jobs.items),
-            @as([]const []const u8, classes.items),
+            @as([]const []const u8, job_names.items),
             &env,
             &next,
             &total_passed,
