@@ -6340,6 +6340,7 @@ fn runFrameExec(
                 .escape = &NativeGlue(H).escape,
                 .call = &NativeGlue(H).call,
                 .field_route = &NativeGlue(H).fieldRoute,
+                .field_write_route = &NativeGlue(H).fieldWriteRoute,
             };
             nf(@ptrCast(&nctx), cur.int());
             if (runtime.envOnce("KLIO_NATIVE_TRACE") != null) {
@@ -7429,6 +7430,10 @@ pub const NativeCtx = struct {
     /// slot inline behind a class guard. Zero when the site is not a plain
     /// stored read (custom accessor, non-instance receiver, unknown class).
     field_route: *const fn (*NativeCtx, u32, u32, *u64, *i32) i32,
+    /// The same for a `SetField` site: a plain stored-slot verdict from the
+    /// interpreter's write memo, so the emitted C can store into the slot
+    /// behind a class guard (with the GC write barrier).
+    field_write_route: *const fn (*NativeCtx, u32, u32, *u64, *i32) i32,
     outcome: NativeOutcome = .none,
     out_block: u32 = 0,
 };
@@ -7479,6 +7484,22 @@ fn NativeGlue(comptime H: type) type {
                 cls_out.* = @intFromPtr(g.get().class.cell);
             }
             slot_out.* = @intCast(slot);
+            return 1;
+        }
+        fn fieldWriteRoute(ctx: *NativeCtx, block: u32, idx: u32, cls_out: *u64, slot_out: *i32) i32 {
+            if (comptime !@hasDecl(H, "fieldWriteSiteRoute")) return 0;
+            const host: *H = @ptrCast(@alignCast(ctx.host));
+            const frame = ctx.frame;
+            const inst = &frame.func.blocks[block].insts[idx];
+            if (inst.* != .SetField) return 0;
+            const sf = inst.SetField;
+            const recv = frame.read(sf.receiver);
+            if (recv != .Instance) return 0;
+            const name = constStr(frame.module, sf.field) orelse return 0;
+            const claim = host.fieldWriteSiteRoute(&recv, name) orelse return 0;
+            if (claim.route & 3 != 1) return 0;
+            cls_out.* = claim.cls;
+            slot_out.* = @intCast(claim.route >> 2);
             return 1;
         }
         fn escape(ctx: *NativeCtx, block: u32, idx: u32) NativeStep {
@@ -7835,6 +7856,10 @@ pub fn nativeOpCall(ctx: *NativeCtx, block: u32, inst_idx: u32) i32 {
 /// receiver's current class; 0 leaves the site on the escape helper.
 pub fn nativeOpFieldRoute(ctx: *NativeCtx, block: u32, inst_idx: u32, cls_out: *u64, slot_out: *i32) i32 {
     return ctx.field_route(ctx, block, inst_idx, cls_out, slot_out);
+}
+
+pub fn nativeOpFieldWriteRoute(ctx: *NativeCtx, block: u32, inst_idx: u32, cls_out: *u64, slot_out: *i32) i32 {
+    return ctx.field_write_route(ctx, block, inst_idx, cls_out, slot_out);
 }
 
 pub fn nativeOpEscape(ctx: *NativeCtx, block: u32, inst_idx: u32) i32 {

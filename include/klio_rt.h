@@ -129,8 +129,13 @@ int32_t klio_op_bin(void *ctx, uint32_t block, uint32_t inst_idx, uint32_t kind,
 int32_t klio_op_escape(void *ctx, uint32_t block, uint32_t inst_idx);
 /* Resolve a GetField site to (class identity, stored slot) for the receiver
    currently in its register. 0 means the site is not a plain stored read. */
+/* GC write barrier for a cell about to receive a Value store. */
+void klio_rt_write_barrier(void *cell);
 int32_t klio_op_field_route(void *ctx, uint32_t block, uint32_t inst_idx,
                             uint64_t *cls_out, int32_t *slot_out);
+/* The same verdict for a SetField site (from the interpreter's write memo). */
+int32_t klio_op_field_write_route(void *ctx, uint32_t block, uint32_t inst_idx,
+                                  uint64_t *cls_out, int32_t *slot_out);
 int32_t klio_op_call(void *ctx, uint32_t block, uint32_t inst_idx);
 
 /* Scalar-replay leaf body: the whole function over (int64 value, genre)

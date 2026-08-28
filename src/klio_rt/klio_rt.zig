@@ -446,8 +446,20 @@ export fn klio_op_bin(ctx: *anyopaque, block: u32, inst_idx: u32, kind: u32, dst
     return eval.nativeOpBin(ctxOf(ctx), block, inst_idx, kind, dst, lhs, rhs);
 }
 
+/// The GC write barrier for a cell the emitted C is about to store a Value
+/// into. A stored field can hold a reference, so the containing cell must be
+/// remembered exactly as the interpreter's own store does it.
+export fn klio_rt_write_barrier(cell: *anyopaque) void {
+    const c: *runtime.ObjRef(runtime.InstanceData).Cell = @ptrCast(@alignCast(cell));
+    runtime.gc.writeBarrier(&c.hdr);
+}
+
 export fn klio_op_field_route(ctx: *anyopaque, block: u32, inst_idx: u32, cls_out: *u64, slot_out: *i32) i32 {
     return eval.nativeOpFieldRoute(ctxOf(ctx), block, inst_idx, cls_out, slot_out);
+}
+
+export fn klio_op_field_write_route(ctx: *anyopaque, block: u32, inst_idx: u32, cls_out: *u64, slot_out: *i32) i32 {
+    return eval.nativeOpFieldWriteRoute(ctxOf(ctx), block, inst_idx, cls_out, slot_out);
 }
 
 export fn klio_op_escape(ctx: *anyopaque, block: u32, inst_idx: u32) i32 {

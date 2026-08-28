@@ -501,6 +501,31 @@ pub fn storedNullServable(self: *VmHost, receiver: *const Value, name: []const u
     return !storedNullIsLateinit(receiver.Instance, name);
 }
 
+/// The WRITE-side sibling of `fieldSiteRoute`: a plain stored-slot verdict for
+/// a `SetField`, from the write memo the interpreter's own store fills. A
+/// custom setter, an unfilled memo or a name that resolves to no field
+/// declines, so the caller keeps the full store path.
+pub fn fieldWriteSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?FieldSiteClaim {
+    if (receiver.* != .Instance) return null;
+    const inst = receiver.Instance;
+    const cls_id: usize = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        break :blk g.get().class.identity();
+    };
+    const name_p = host_call_member.memberNameIdentity(self, name) orelse return null;
+    const hit = fieldWriteCacheGet(self, cls_id, name_p) orelse return null;
+    if (hit.setter != root.ProgramImage.FieldWriteHit.NONE) return null;
+    const g = inst.borrow();
+    defer g.deinit();
+    for (g.get().fields.items, 0..) |f, i| {
+        if (!std.mem.eql(u8, f.name, hit.store_name)) continue;
+        if (i > (std.math.maxInt(u64) >> 2)) return null;
+        return .{ .cls = @intFromPtr(g.get().class.cell), .route = (@as(u64, @intCast(i)) << 2) | 1 };
+    }
+    return null;
+}
+
 pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?FieldSiteClaim {
     if (receiver.* != .Instance) return null;
     if (std.mem.eql(u8, name, "coroutineContext")) return null;

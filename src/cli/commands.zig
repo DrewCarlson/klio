@@ -594,6 +594,70 @@ fn transpileEmit(
         \\  memcpy(kv_slot(regs, dst), items + slot * KV.field_stride + KV.field_value_off, KV.value_size);
         \\  return 1;
         \\}}
+        \\/* An IntArray element WRITE, inline. Same guards as the read, plus
+        \\ * the value must be an Int: a primitive buffer holds no references,
+        \\ * so the store needs no write barrier and no release of a previous
+        \\ * occupant. Anything else escapes. */
+        \\static inline int kv_index_set_int(uint8_t *regs, uint32_t recv, uint32_t idxreg, uint32_t valreg) {{
+        \\  if (!KV.obj_usable) return 0;
+        \\  const uint8_t *rs = kv_slot(regs, recv);
+        \\  if (kv_tag(rs) != KV.tag_array) return 0;
+        \\  uint64_t prim = 0;
+        \\  memcpy(&prim, rs + KV.arr_prim_off, sizeof(uint64_t));
+        \\  if (prim != KV.arr_prim_int_word) return 0;
+        \\  const uint8_t *is_ = kv_slot(regs, idxreg);
+        \\  const uint8_t *vs = kv_slot(regs, valreg);
+        \\  if (kv_tag(is_) != KV.tag_int || kv_tag(vs) != KV.tag_int) return 0;
+        \\  int32_t i = kv_int(is_);
+        \\  if (i < 0) return 0;
+        \\  uint8_t *cell;
+        \\  memcpy(&cell, rs + KV.arr_cell_off, sizeof(void *));
+        \\  if (!cell) return 0;
+        \\  uint8_t *items;
+        \\  size_t nbytes;
+        \\  memcpy(&items, cell + KV.primbuf_ptr_off, sizeof(void *));
+        \\  memcpy(&nbytes, cell + KV.primbuf_len_off, sizeof(size_t));
+        \\  if ((size_t)i * 4u + 4u > nbytes) return 0;
+        \\  int32_t v = kv_int(vs);
+        \\  memcpy(items + (size_t)i * 4u, &v, 4);
+        \\  return 1;
+        \\}}
+        \\/* A plain stored-field WRITE, inline behind the same one-word class
+        \\ * guard as the read. A stored field can hold a reference, so the
+        \\ * containing cell takes the GC write barrier before the store. A
+        \\ * custom setter, a delegate or an unresolved site escapes. */
+        \\static inline int kv_setfield(void *ctx, uint8_t *regs, uint32_t blk, uint32_t idx,
+        \\                              uint32_t recv, uint32_t val, uint64_t *site) {{
+        \\  if (!KV.obj_usable) return 0;
+        \\  const uint8_t *rs = kv_slot(regs, recv);
+        \\  if (kv_tag(rs) != KV.tag_instance) return 0;
+        \\  uint8_t *cell = (uint8_t *)kv_inst(rs);
+        \\  if (!cell) return 0;
+        \\  uint8_t *inst = cell + KV.cell_data_off;
+        \\  uint64_t cls;
+        \\  memcpy(&cls, inst + KV.inst_class_off, sizeof(uint64_t));
+        \\  uint64_t cls48 = cls & 0xFFFFFFFFFFFFull;
+        \\  uint64_t want = *site;
+        \\  if ((want >> 16) != cls48 || (want & 0xFFFFu) == 0) {{
+        \\    uint64_t rcls = 0;
+        \\    int32_t rslot = -1;
+        \\    if (!klio_op_field_write_route(ctx, blk, idx, &rcls, &rslot)) return 0;
+        \\    if ((rcls & 0xFFFFFFFFFFFFull) != cls48) return 0;
+        \\    if (rslot < 0 || rslot >= 0xFFFE) return 0;
+        \\    want = (cls48 << 16) | (uint64_t)(rslot + 1);
+        \\    *site = want;
+        \\  }}
+        \\  size_t slot = (size_t)((want & 0xFFFFu) - 1u);
+        \\  uint8_t *fields = inst + KV.inst_fields_off;
+        \\  uint8_t *items;
+        \\  size_t len;
+        \\  memcpy(&items, fields + KV.fields_ptr_off, sizeof(void *));
+        \\  memcpy(&len, fields + KV.fields_len_off, sizeof(size_t));
+        \\  if (slot >= len) return 0;
+        \\  klio_rt_write_barrier(cell);
+        \\  memcpy(items + slot * KV.field_stride + KV.field_value_off, kv_slot(regs, val), KV.value_size);
+        \\  return 1;
+        \\}}
         \\/* Scalar-replay float lanes: genre 5 stores double bits, genre 6
         \\ * stores float bits, both in the int64 value lane. */
         \\static inline double kl_bits2d(int64_t l) {{ double d; memcpy(&d, &l, 8); return d; }}
@@ -1810,6 +1874,32 @@ fn emitNativeBlock(w: anytype, f: *const ir.Func, st: *const ir.bc.Stream, block
                             block,        inst_idx,
                             block,        inst_idx,
                         },
+                    );
+                    pc += 2;
+                    continue;
+                }
+                if (f.blocks[block].insts[inst_idx] == .SetField) {
+                    const sf = f.blocks[block].insts[inst_idx].SetField;
+                    try w.print(
+                        "  {{ static uint64_t sfr_{d}_{d} = 0;\n" ++
+                            "    if (!kv_setfield(ctx, regs, {d}u, {d}u, {d}u, {d}u, &sfr_{d}_{d}))\n" ++
+                            "      if (klio_op_escape(ctx, {d}u, {d}u)) return; }}\n",
+                        .{
+                            block,        inst_idx,
+                            block,        inst_idx, sf.receiver.int(), sf.value.int(),
+                            block,        inst_idx,
+                            block,        inst_idx,
+                        },
+                    );
+                    pc += 2;
+                    continue;
+                }
+                if (f.blocks[block].insts[inst_idx] == .IndexSet) {
+                    const ixs = f.blocks[block].insts[inst_idx].IndexSet;
+                    try w.print(
+                        "  if (!kv_index_set_int(regs, {d}u, {d}u, {d}u))\n" ++
+                            "    if (klio_op_escape(ctx, {d}u, {d}u)) return;\n",
+                        .{ ixs.receiver.int(), ixs.index.int(), ixs.value.int(), block, inst_idx },
                     );
                     pc += 2;
                     continue;
