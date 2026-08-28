@@ -138,6 +138,31 @@ native composer group/slot serve ~15-25%, frameless leaf WRITES ~2%, the
 ReleaseFast gate harness 1.20x (a policy call that trades the safety checks a
 test suite wants).
 
+ANATOMY OF ONE COMPOSABLE RECOMPOSITION (2026-08-28, measured, not sampled —
+`KLIO_FRAME_COUNT` deltas between a 10-frame and a 60-frame replica run):
+**740 IR instructions, 173 activations, 319 field reads, ~250us.** That is
+335ns per instruction against a 20ns walker floor (6ns under the bytecode
+tier), so the cost is entirely in what the heavy ops do, not in the loop.
+Attribution, each measured by ablation or by a wall-clock bucket:
+- member-call dispatch 590ns per call, 14% of the window; virtual 225ns, 4%
+- field reads 12% (23 getter-route reads and 34 ladder reads per composable)
+- register fill 7% before the fix below, ~1.5% after
+- every dispatch fast path *together* (KLIO_FLAT, KLIO_FLAT_VCALL, the site
+  memo, the leaf tier) is worth 14%: turning them all off costs only that
+- the leaf tier and the CallMember site memo are each worth ~0% here
+The distribution is FLAT — no single removable component is worth more than
+15%, which is why nine separate hypotheses (fills, a field PIC, leaf
+coverage, the bytecode tier, register banks, allocation, GC, string
+interning) each measured at or near zero on the wall.
+Landed this round: **252us -> 228us (9.5%)**, from host serves for the
+composer's IntStack, the composite-key rotation, the gap-buffer changelist
+push and its write scope, plus a polymorphic call-site cache. ReleaseFast
+adds a further 1.18x (214us), confirming the earlier 1.20x.
+vpd does exactly the work its design implies — 3125 virtual frames x 200
+Texts x 2 composers = 1.25M recompositions, confirmed by counting the state
+reads (276k in a 150s window) — so there is no amplification to remove, only
+throughput.
+
 
 
 **334s at width 8** vs the 727s baseline (2.18x) was met on 2026-08-27 — but
@@ -275,6 +300,12 @@ receiver fix and the recursion-guard base took map frames 3.62M -> 1.59M
 
 ## Closed rounds (chronological, one line each)
 
+- 2026-08-28 round: nine measured-zero hypotheses (above) plus five landed
+  roots — the exponential typing memo, the scoped `$sgetter$` field route
+  (half the ladder reads), deferred callees kept leaf-eligible (a callee
+  probed before its body decoded cached "not a leaf" for the whole run), the
+  register-fill proof widened 64 -> 512 slots (`GapComposer.end` alone carries
+  502 registers; fills 4.62M -> 0.49M), and the compose host serves.
 - 2026-08-28 EXPONENTIAL LOWERING (found while sizing frame cost): every
   resolution arm re-derives an operand's type, so a chain of infix calls
   re-typed its whole left operand once per arm. 24 terms = 20M type queries /
@@ -330,6 +361,17 @@ receiver fix and the recursion-guard base took map frames 3.62M -> 1.59M
   Guards: `member_extension_receiver_tower.kt`, `short_uppercase_user_type.kt`.
 
 ## Traps (hard-won, do not re-learn)
+
+- A host serve matched by FQN *suffix* must be checked against EVERY composer:
+  the link-buffer's `pushOp` raises `requiresApplication` from the operation's
+  visibility while the gap-buffer's does not, and serving both took
+  MovableContentTests 44 -> 4.
+- Diagnostic code on a serve seam costs more than the serve saves: two
+  `indexOf` scans over the callee fqn per call turned a 10% win into a 9%
+  loss until they were removed.
+- An activation cut does NOT imply a wall win here: -7% activations from the
+  leaf work and -77% register fills both measured 0% on the clock. Only
+  measure the clock.
 
 - `KLIO_GC_DEBUG` only LOGS; never-free is `KLIO_GC_NOFREE`.
 - Perf-tier heads must be DECLARED evidence: deriving a receiver head
