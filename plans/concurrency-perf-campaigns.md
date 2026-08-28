@@ -275,6 +275,13 @@ receiver fix and the recursion-guard base took map frames 3.62M -> 1.59M
 
 ## Closed rounds (chronological, one line each)
 
+- 2026-08-28 EXPONENTIAL LOWERING (found while sizing frame cost): every
+  resolution arm re-derives an operand's type, so a chain of infix calls
+  re-typed its whole left operand once per arm. 24 terms = 20M type queries /
+  17s; 28 terms never finished. Static typing is now memoized per outermost
+  query (`KLIO_TY_MEMO=0` restores the old path); 120 terms lower in 5.5s.
+  Fixture `wide_infix_chain.kt`. Typing is now off the compose critical path;
+  it did NOT move suite wall (compose sources were already under the knee).
 - Gate-red round (2026-08-24): five roots; `scripts/gate.sh` GREEN.
 - Collection hot paths, call-throughput rounds 2/3/4, candidate-pool chip,
   round 5 (ceiling quantified), round 6 (compounding core), round 7
