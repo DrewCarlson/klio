@@ -62,8 +62,13 @@ distribution is FLAT: nothing above 14%.
   (98.8% of its probes HIT — the cost is rebuilding the key, not the walk),
   SetField 5.0%, NewInstance 4.8%.
 
-LANDED 2026-08-28 rounds: **253us -> ~193us (1.31x)** per composable; wall
-was 847s -> 797s at the 220us point (fresh wall measurement pending). The
+LANDED 2026-08-28 rounds: **253us -> ~193us (1.31x)** per composable; vpd
+SOLO **~724s -> ~500s (1.45x** — it leans harder on the served drain
+machinery than the replica); suite wall **847s -> 758s** (gate 1389/1/0,
+the 1 = the known resumeOnBackgroundThread load flake inside its declared
+slack). The wall moved less than vpd because 8-way CONTENTION inflates the
+in-gate run ~1.4x over solo — scheduling/width is now a live lever again
+alongside throughput. The
 serve family (`src/ir/compose_fast.zig`, `KLIO_COMPOSE_FAST` bisect mask,
 wired at `hostRouteServe` AND the flat-call seam): IntStack, the
 composite-key rotation, BOTH changelists' push, the write scope, the
