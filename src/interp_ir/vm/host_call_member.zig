@@ -9734,9 +9734,7 @@ fn methodArgSigRelaxed(self: *VmHost, args: []const Value) u64 {
         h.update((&tag)[0..1]);
         switch (a.*) {
             .Instance => |inst| {
-                const g = inst.borrow();
-                const id = g.get().class.identity();
-                g.deinit();
+                const id = runtime.InstanceData.classIdentityUnlocked(inst);
                 h.update(std.mem.asBytes(&id));
             },
             .IrClosure => |c| {
@@ -9834,9 +9832,7 @@ fn methodArgSig(self: *VmHost, args: []const Value) ?u64 {
         h.update((&tag)[0..1]);
         switch (a.*) {
             .Instance => |inst| {
-                const g = inst.borrow();
-                const id = g.get().class.identity();
-                g.deinit();
+                const id = runtime.InstanceData.classIdentityUnlocked(inst);
                 h.update(std.mem.asBytes(&id));
             },
             .Array => |arr| {
@@ -9880,11 +9876,7 @@ fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []const 
     // suspend block, `throwOnFailure` on a `Result`) re-ran the full
     // extension walk per call without this.
     const class_identity: usize = switch (receiver.*) {
-        .Instance => |inst| blk: {
-            const g = inst.borrow();
-            defer g.deinit();
-            break :blk g.get().class.identity();
-        },
+        .Instance => |inst| runtime.InstanceData.classIdentityUnlocked(inst),
         .IrClosure => |c| blk: {
             const info = self.closures.get(@intCast(c.id)) orelse return null;
             var h = std.hash.Wyhash.init(0x2545f4914f6cdd1d);

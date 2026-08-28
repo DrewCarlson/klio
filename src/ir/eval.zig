@@ -2076,9 +2076,7 @@ pub fn enclosingChainClassHash() u64 {
             h.update((&kb)[0..1]);
             var k: u64 = undefined;
             if (e.v == .Instance) {
-                const g = e.v.Instance.borrow();
-                k = @intCast(g.get().class.identity());
-                g.deinit();
+                k = @intCast(runtime.InstanceData.classIdentityUnlocked(e.v.Instance));
             } else {
                 k = @as(u64, @intFromEnum(std.meta.activeTag(e.v))) +% 0x2b8c;
             }
@@ -9014,11 +9012,7 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
             // (class, name) memo route — one probe instead of the slow
             // ladder — leaving the site's claim untouched.
             if (site_mismatch) poly: {
-                const cls_now: u64 = blk: {
-                    const g = recv.Instance.borrow();
-                    defer g.deinit();
-                    break :blk @intCast(g.get().class.identity());
-                };
+                const cls_now: u64 = @intCast(runtime.InstanceData.classIdentityUnlocked(recv.Instance));
                 const r: struct { route: u64 } = .{
                     .route = polyFieldRoute(H, host, @intFromPtr(gf), cls_now, &recv, name) orelse break :poly,
                 };
@@ -9421,11 +9415,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
         if (flatEnabled() and memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.arg_names)) {
             const w0 = @atomicLoad(u64, @constCast(&cm.site_cls), .acquire);
             if (w0 > 1) site: {
-                const cls_now: u64 = blk_cls: {
-                    const g = recv.Instance.borrow();
-                    defer g.deinit();
-                    break :blk_cls @intCast(g.get().class.identity());
-                };
+                const cls_now: u64 = @intCast(runtime.InstanceData.classIdentityUnlocked(recv.Instance));
                 if (w0 != cls_now) {
                     // A polymorphic site: this class has its own remembered
                     // target, so it never re-runs the ladder either.
@@ -9505,11 +9495,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                         dispatchCacheStable())
                     {
                         if (host.memberSiteSig(arg_values)) |sig| {
-                            const cls: u64 = blk: {
-                                const g = recv.Instance.borrow();
-                                defer g.deinit();
-                                break :blk @intCast(g.get().class.identity());
-                            };
+                            const cls: u64 = @intCast(runtime.InstanceData.classIdentityUnlocked(recv.Instance));
                             if (cls > 1 and @cmpxchgStrong(u64, @constCast(&cm.site_cls), 0, cls, .acq_rel, .monotonic) == null) {
                                 @atomicStore(u64, @constCast(&cm.site_sig), sig, .monotonic);
                                 @atomicStore(u64, @constCast(&cm.site_route), (@as(u64, prep.func.id.int()) << 1) | 1, .release);

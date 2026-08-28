@@ -499,6 +499,15 @@ pub const InstanceData = struct {
     /// field. The caller passes a per-name cache slot; the first hit
     /// stores the field's interned pointer and later calls ride the
     /// integer compare. A class whose intern differs just re-fills.
+    /// The instance's class WITHOUT taking its reader lock. An instance's
+    /// class is written once at construction and never changes, so a
+    /// dispatch key or a site guard that needs only that pointer must not
+    /// pay two atomics for it — a recomposition takes ~380 such reads per
+    /// composable.
+    pub fn classIdentityUnlocked(inst: objcell.ObjRef(InstanceData)) usize {
+        return inst.asPtrConst().class.identity();
+    }
+
     pub fn getCached(self: *const InstanceData, slot: *std.atomic.Value(?[*]const u8), name: []const u8) ?Value {
         if (slot.load(.monotonic)) |p| {
             for (self.fields.items) |f| {
