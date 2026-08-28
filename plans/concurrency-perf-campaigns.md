@@ -119,6 +119,23 @@ corpus transpile timeout 300 -> 600s.
 
 ## The three fronts (defined 2026-08-26)
 
+### Front A — precompiled natives for the heavy library functions (RE-SCOPED 2026-08-28)
+
+**MEASURED DEAD END for the recomposition path.** With
+`KLIO_TRANSPILE_PKGS=androidx.compose.runtime` the transpiler now emits and
+registers natives for library bodies (6575 compose functions, 1226 of them as
+frameless leaf replays) against a pinned image. On a 50-composable
+recomposition loop over the real compose runtime the result is **1828-1835us
+per recomposition against 1758us interpreted** — no speedup, output identical.
+The emitted C calls the same `klio_op_*` helpers for every op it does not
+inline, and a recomposition is dispatch and frame machinery, so the C adds a
+layer without removing work. (The inlined ops do pay where they apply: a
+field-heavy loop is 2.7x and an IntArray loop 1.75x.)
+So closing vpd needs a compiler that inlines DISPATCH and manages frames
+natively — a different architecture from the per-op ABI, not a wider op
+selector. That is a research-scale project; nothing in the current transpiler
+design reaches 4.6x.
+
 ### Front A — precompiled natives for the heavy library functions (OPEN)
 
 The loop JIT and bytecode tier accelerate SCALAR code only; snapshot and

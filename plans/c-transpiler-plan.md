@@ -331,6 +331,31 @@ strings, allocation) — is a distinct campaign with the interpreter's
 full aliasing/GC/dispatch semantics in scope; do not start it without
 profiling a workload that needs it.
 
+## Object-shape replay: what it bought, and where it stops (2026-08-28)
+
+The object frontier this plan gated behind "a workload that needs it" was
+profiled (compose recomposition, `plans/concurrency-perf-campaigns.md`) and
+started:
+- Stored-field reads inline behind a class guard, the route (class cell +
+  slot) published in ONE word so a torn pair cannot index the wrong field.
+  Gated on `fieldSiteRoute`'s verdict — `plainStoredFieldIndex` matches a
+  `by lazy` delegate's own storage slot by name. Field-heavy loop 2.7x.
+- IntArray element reads, guarded on tag, the probed primitive-storage
+  discriminator and the index. IntArray loop 1.75x.
+- `KLIO_TRANSPILE_PKGS=<prefixes>` widens emission to library bodies (lazy IR
+  decoded first), with the frameless leaf replay for library leaves.
+- `KLIO_OBJVIEW=0` disables the object view for single-binary A/B.
+Corpus: 400 passed, 1 failed (an interpreter failure under the shared
+`~/.klio` pack home, green with the repo-local one).
+
+THE LIMIT, MEASURED: with 6575 compose-runtime bodies emitted, a
+recomposition costs 1828-1835us against 1758us interpreted — no speedup. The
+per-op ABI hands every unhandled op back to `klio_op_*`, and dispatch plus
+frame machinery IS the recomposition. Beating the interpreter on
+object/dispatch code needs inlined dispatch (inline caches in C),
+native-to-native calls and native frame management. Do not expect a wider op
+selector to get there.
+
 ## Next: the speedup campaign (open)
 
 The opaque call-per-op ABI trades the stream's inlined switch dispatch
