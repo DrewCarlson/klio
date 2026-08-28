@@ -6061,6 +6061,21 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // back to runtime dispatch.
     if (!is_infix and callee.* == .Member and !callee.Member.safe and gate: {
         if (ast_type_args.len != 0 or b.peekExpected() != null) break :gate true;
+        // A trailing-lambda call whose name has a monomorphic member-inline
+        // candidate enters regardless of receiver form — the strict pick
+        // inside re-validates everything, and a decline falls through to
+        // the ordinary member lowering.
+        if (args.len != 0 and switch (args[args.len - 1]) {
+            .Lambda, .AnonFun => true,
+            else => false,
+        }) {
+            if (inline_state.candidatesForName(callee.Member.name.name)) |mcands| {
+                for (mcands) |mcf| {
+                    if (mcf.receiver_type == null and mcf.type_params.len == 0 and
+                        inline_state.inlineMemberOwner(mcf) != null) break :gate true;
+                }
+            }
+        }
         // Statement position with no type args: splice anyway when the value
         // arguments alone bind every reified parameter (a generic-class
         // argument like `Nodes.Draw : NodeKind<DrawModifierNode>`), so the
@@ -6082,6 +6097,55 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     }) {
         const mname = callee.Member.name.name;
         if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s} cands={d}\n", .{ mname, if (inline_state.candidatesForName(mname)) |c| c.len else 0 });
+        // A MONOMORPHIC member `inline fun` taking a lambda splices like its
+        // reified siblings — kotlinc inlines every inline fun, and the framed
+        // form pays an activation for the wrapper AND one for the lambda
+        // (`Operations.push(op) { setInt(...) }` is two frames per
+        // changelist push). The pick is strict: no type parameters, no
+        // defaults or varargs, arity matched, the declared callback shape
+        // matched against the site's lambda, owner on the receiver chain,
+        // and exactly one survivor. `KLIO_MEMBER_INLINE=0` bisects.
+        const plain_member_inline: ?*const ast.Function = blk: {
+            if (std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_INLINE") orelse "1", "0")) break :blk null;
+            if (ast_type_args.len != 0) break :blk null;
+            if (args.len == 0) break :blk null;
+            const site_lambda: ?struct { n: usize, implicit: bool } = switch (args[args.len - 1]) {
+                .Lambda => |l| .{ .n = l.params.len, .implicit = l.implicit_it },
+                .AnonFun => |af| .{ .n = af.params.len, .implicit = false },
+                else => null,
+            };
+            const sl = site_lambda orelse break :blk null;
+            const cands = inline_state.candidatesForName(mname) orelse break :blk null;
+            var found: ?*const ast.Function = null;
+            for (cands) |cf| {
+                if (cf.receiver_type != null) continue;
+                if (inline_state.inlineMemberOwner(cf) == null) continue;
+                if (cf.type_params.len != 0) continue;
+                if (cf.params.len != args.len) continue;
+                var irregular = false;
+                for (cf.params) |*p| {
+                    if (p.default != null or p.is_vararg) irregular = true;
+                }
+                if (irregular) continue;
+                // Callback-shape discrimination: same-name same-arity
+                // member-inline overloads can differ only here (Duration's
+                // LongParser vs FractionalParser `parse`). A receiver
+                // lambda matches a parameterless site block; an implicit-it
+                // site block matches a declared arity of at most one.
+                const decl_fn = cf.params[cf.params.len - 1].ty.function orelse continue;
+                const shape_ok = if (decl_fn.receiver != null)
+                    (sl.implicit or sl.n == decl_fn.params.len)
+                else if (sl.implicit)
+                    decl_fn.params.len <= 1
+                else
+                    sl.n == decl_fn.params.len;
+                if (!shape_ok) continue;
+                if (!try memberOwnerOnReceiverChain(b, callee.Member.receiver, cf)) continue;
+                if (found != null) break :blk null;
+                found = cf;
+            }
+            break :blk found;
+        };
         const reified_ext = blk: {
             if (inlineFnAst(mname)) |f| {
                 if (f.receiver_type != null and anyReified(f.type_params)) break :blk true;
@@ -6114,7 +6178,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
             break :blk false;
         };
-        if (reified_ext) {
+        if (reified_ext or plain_member_inline != null) {
             const receiver = callee.Member.receiver;
             const expected = b.peekExpected();
             const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
@@ -6211,6 +6275,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     return dst;
                 }
             }
+            if (member_target == null) member_target = plain_member_inline;
             if (try tryInlineCallWithTypeArgs(b, mname, member_target, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| {
                 if (runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
                     if (std.mem.eql(u8, w, mname)) std.debug.print("[splice-ok] {s} span={}:{}\n", .{ mname, exprSpan(callee).file, exprSpan(callee).start });

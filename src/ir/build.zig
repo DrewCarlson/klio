@@ -26,6 +26,14 @@ const CatchHandler = ir.CatchHandler;
 pub const StringSet = std.StringHashMap(void);
 const StringRegMap = std.StringHashMap(Reg);
 
+/// A mutable var's shared-cell register plus the scope depth it was bound
+/// at. The depth lets `mutableHome` honor a splice-resolve window: a home
+/// installed by a spliced inline body must be invisible to the call-site
+/// lambda lowered inside that splice, exactly as `resolve` hides those
+/// scopes — a body-local `var index` otherwise captures the caller lambda's
+/// `index = …` write (the Duration parser's cursor never advanced).
+const MutableHome = struct { reg: Reg, depth: usize };
+
 /// Per inline-fn-splice frame: a lambda-param substitution map paired
 /// with the `inline_return` snapshot taken when the frame was pushed.
 const InlineLambdaFrame = struct {
@@ -498,7 +506,7 @@ pub const FuncBuilder = struct {
     /// the local always resolve to this reg; writes emit a Move
     /// into it. This gives the IR's flat block model the slot
     /// semantics that mutable Kotlin locals need.
-    mutable_homes: StringRegMap,
+    mutable_homes: std.StringHashMap(MutableHome),
     /// Per-scope undo journal for `mutables`/`mutable_homes`. A
     /// block-scoped `var` must stop shadowing when its block ends: a
     /// same-named class property written after the block would otherwise
@@ -936,7 +944,7 @@ pub const FuncBuilder = struct {
             .capture_regs = StringRegMap.init(allocator),
             .capture_loads_emitted = StringSet.init(allocator),
             .mutables = StringSet.init(allocator),
-            .mutable_homes = StringRegMap.init(allocator),
+            .mutable_homes = std.StringHashMap(MutableHome).init(allocator),
             .boxed_vars = StringSet.init(allocator),
             .any_typed_locals = StringSet.init(allocator),
             .broad_coll_locals = StringSet.init(allocator),
@@ -1384,10 +1392,23 @@ pub const FuncBuilder = struct {
 
     pub fn setMutableHome(self: *FuncBuilder, name: []const u8, reg: Reg) Allocator.Error!void {
         try self.recordMutableUndo(name);
-        try self.mutable_homes.put(name, reg);
+        try self.mutable_homes.put(name, .{
+            .reg = reg,
+            .depth = self.scopes.items.len -| 1,
+        });
     }
     pub fn mutableHome(self: *const FuncBuilder, name: []const u8) ?Reg {
-        return self.mutable_homes.get(name);
+        const e = self.mutable_homes.get(name) orelse return null;
+        // Inside a spliced-lambda window the inline body's scopes are not
+        // the lambda's lexical scope: a home bound there is hidden, the
+        // same rule `resolve` applies to plain bindings.
+        if (self.lambda_splice_resolve) |w| {
+            if (e.depth >= w.caller_depth and e.depth < w.own_base) return null;
+            for (self.splice_hidden_bands.items) |band| {
+                if (e.depth >= band.lo and e.depth <= band.hi) return null;
+            }
+        }
+        return e.reg;
     }
 
     /// Replace the boxed-var set with `names`. Takes ownership of
@@ -3312,7 +3333,7 @@ fn instDefOf(inst: *const ir.Inst) ?ir.Reg {
 /// that redeclared it pops (see `FuncBuilder.mutable_undo`).
 pub const MutableUndo = struct {
     name: []const u8,
-    prev_home: ?Reg,
+    prev_home: ?MutableHome,
     prev_mutable: bool,
 };
 
