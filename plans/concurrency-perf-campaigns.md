@@ -62,16 +62,26 @@ distribution is FLAT: nothing above 14%.
   (98.8% of its probes HIT — the cost is rebuilding the key, not the walk),
   SetField 5.0%, NewInstance 4.8%.
 
-LANDED 2026-08-28 round: **253us -> 220us (13%)** per composable, wall
-**847s -> 797s**, fully green. Each measured alone: host serves for the
-composer's IntStack, the composite-key rotation, BOTH changelists' push, the
-write scope and the slot-table index math (`src/ir/compose_fast.zig`;
-`KLIO_COMPOSE_FAST` is a bisect mask, wired at `hostRouteServe` AND the
-flat-call seam); a polymorphic member-call-site cache; unlocked
-class-identity reads (`InstanceData.classIdentityUnlocked`, ~380 per
-composable). ReleaseFast (`-Dharness-optimize=ReleaseFast`) adds a further
-1.18x and stays unused — a policy call that trades the safety checks a test
-suite wants.
+LANDED 2026-08-28 rounds: **253us -> ~193us (1.31x)** per composable; wall
+was 847s -> 797s at the 220us point (fresh wall measurement pending). The
+serve family (`src/ir/compose_fast.zig`, `KLIO_COMPOSE_FAST` bisect mask,
+wired at `hostRouteServe` AND the flat-call seam): IntStack, the
+composite-key rotation, BOTH changelists' push, the write scope, the
+slot-table index math, then SlotReader
+next/startGroup/endGroup/groupKey/isGroupEnd/nodeCount/objectKey,
+SlotWriter.dataIndex (both same-fqn overloads — the member fun and the
+IntArray member-extension whose owner reads from the enclosing-chain top),
+the OpIterator drain cursor (both composers), the requiresRecompose flag
+bit, GapComposer's node assertion, and ObserverHolder.current. Plus a
+polymorphic member-call-site cache and unlocked class-identity reads.
+Serve discipline that kept it correct: reads and validations before any
+write (a decline must not half-mutate), raising branches stay interpreted,
+ref-valued returns retain and field writes adopt via define. ReleaseFast
+adds a further 1.18x and stays unused (policy).
+MEASUREMENT TRAPS hit here: a solo vpd run without the gate env aborts at
+upstream's 60s runTest budget (~325s wall = compile + abort, NOT a pass),
+and KLIO_ERR_TRACE=1 on a vpd run prints per-miss diagnostics until the
+budget fires — never profile vpd with it.
 
 MEASURED AT OR NEAR ZERO (do not re-try): register-fill reduction (-77%
 slots), leaf-coverage gains (-7% activations), a polymorphic field-site
