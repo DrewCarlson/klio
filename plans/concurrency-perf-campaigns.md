@@ -218,8 +218,14 @@ instances of what this generalizes.
   - [x] A1b IntArray element reads (2867f7ef): tag, primitive-storage
         discriminator (probed) and index guarded, escape otherwise.
         IntArray loop 1403 -> 803 ns/iter (1.75x).
-  - [ ] A1c stored-field WRITES (needs the GC write barrier exposed to C).
-  - [ ] A1d boxed-array reads/writes, then instance minting.
+  - [x] A1c stored-field + IntArray WRITES (c1bb7f05): write memo gates the
+        route, GC write barrier on the cell. Mutator loop 1.31x — and with
+        reads AND writes inlined a compose recomposition is STILL 1788us
+        native vs 1737us interpreted, which is the measurement that says the
+        path is bound by calls, not data access.
+  - [ ] A1d would be inline DISPATCH (native frames, inline caches) — the
+        only remaining piece that could move compose, and a different
+        architecture from the per-op ABI.
   `KLIO_OBJVIEW=0` disables the object view for single-binary A/B.
 - A2. Bake-time AOT: transpile the hot library functions at pack bake (ids are
   pinned there) and ship the .so with the pack, registered through

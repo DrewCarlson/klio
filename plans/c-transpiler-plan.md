@@ -348,10 +348,15 @@ started:
 Corpus: 400 passed, 1 failed (an interpreter failure under the shared
 `~/.klio` pack home, green with the repo-local one).
 
-THE LIMIT, MEASURED: with 6575 compose-runtime bodies emitted, a
-recomposition costs 1828-1835us against 1758us interpreted — no speedup. The
-per-op ABI hands every unhandled op back to `klio_op_*`, and dispatch plus
-frame machinery IS the recomposition. Beating the interpreter on
+- Stored-field and IntArray WRITES, gated on the interpreter's write memo,
+  with the GC write barrier on the containing cell. Mutator loop 1.31x.
+
+THE LIMIT, MEASURED TWICE: with 6575 compose-runtime bodies emitted, a
+recomposition costs 1828-1835us against 1758us interpreted; re-measured with
+reads AND writes inlined (10145 read sites, 1439 write sites) it is 1788us
+against 1737us. No speedup either way. The per-op ABI hands every unhandled op
+back to `klio_op_*`, and dispatch plus frame machinery IS the recomposition —
+data access is not what costs. Beating the interpreter on
 object/dispatch code needs inlined dispatch (inline caches in C),
 native-to-native calls and native frame management. Do not expect a wider op
 selector to get there.
