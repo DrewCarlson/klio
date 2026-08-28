@@ -180,16 +180,16 @@ pub fn hostRouteServe(comptime H: type, allocator: Allocator, f: *const ir.Func,
 /// answered by the host at the same seam. Classified once per body, and any
 /// shape the serve cannot prove falls through to the interpreted body.
 var compose_fast_state: u8 = 0;
-var compose_fast_mask: u8 = 31;
+var compose_fast_mask: u8 = 63;
 
 /// `KLIO_COMPOSE_FAST` is a bisect mask over the compose serves: bit0 the
 /// stack/key helpers, bit1 the changelist push, bit2 its argument assertion,
-/// bit3 the write scope, bit4 the slot-table index math. 0 keeps every
-/// helper interpreted.
+/// bit3 the write scope, bit4 the slot-table index math, bit5 the reader /
+/// writer / drain-cursor family. 0 keeps every helper interpreted.
 fn composeFastMask() u8 {
     if (compose_fast_state == 0) {
-        const raw = runtime.envOnce("KLIO_COMPOSE_FAST") orelse "31";
-        compose_fast_mask = std.fmt.parseInt(u8, raw, 10) catch 31;
+        const raw = runtime.envOnce("KLIO_COMPOSE_FAST") orelse "63";
+        compose_fast_mask = std.fmt.parseInt(u8, raw, 10) catch 63;
         compose_fast_state = 1;
     }
     return compose_fast_mask;
@@ -206,6 +206,7 @@ fn composeRouteServe(allocator: Allocator, f: *const ir.Func, args: []const Valu
     const route: compose_fast.Route = @enumFromInt(f.compose_route);
     const bit: u8 = switch (route) {
         .slot_anchor, .data_anchor_to_index => 16,
+        .sr_next, .sr_group_key_get, .sr_group_key_at, .sr_is_group_end_get, .sr_node_count_get, .sr_node_count_at, .gap_parent_anchor, .sw_data_index, .rsi_req_recompose_get, .rsi_req_recompose_set, .gap_validate_node, .sr_start_group, .sr_end_group, .op_iter_next, .op_iter_get_int, .op_iter_get_object, .sr_object_key, .sr_group_object_key, .obs_holder_current, .sw_slot_index => 32,
         .ops_push_op, .ops_push_op_link => 2,
         .ops_ensure_args => 4,
         .ops_set_int, .ops_set_object => 8,
@@ -233,6 +234,26 @@ fn composeRouteServe(allocator: Allocator, f: *const ir.Func, args: []const Valu
         .ops_set_object => compose_fast.serveSetObject(allocator, args),
         .slot_anchor => compose_fast.serveSlotAnchor(args),
         .data_anchor_to_index => compose_fast.serveDataAnchorToDataIndex(args),
+        .sr_next => compose_fast.serveSlotReaderNext(args),
+        .sr_group_key_get => compose_fast.serveSlotReaderGroupKeyGet(args),
+        .sr_group_key_at => compose_fast.serveSlotReaderGroupKeyAt(args),
+        .sr_is_group_end_get => compose_fast.serveSlotReaderIsGroupEnd(args),
+        .sr_node_count_get => compose_fast.serveSlotReaderNodeCountGet(args),
+        .sr_node_count_at => compose_fast.serveSlotReaderNodeCountAt(args),
+        .gap_parent_anchor => compose_fast.serveGapParentAnchor(args),
+        .sw_data_index => compose_fast.serveSlotWriterDataIndex(args),
+        .rsi_req_recompose_get => compose_fast.serveRsiRequiresRecomposeGet(args),
+        .rsi_req_recompose_set => compose_fast.serveRsiRequiresRecomposeSet(args),
+        .gap_validate_node => compose_fast.serveValidateNodeNotExpected(args),
+        .sr_start_group => compose_fast.serveSlotReaderStartGroup(args),
+        .sr_end_group => compose_fast.serveSlotReaderEndGroup(args),
+        .op_iter_next => compose_fast.serveOpIterNext(args),
+        .op_iter_get_int => compose_fast.serveOpIterGetInt(args),
+        .op_iter_get_object => compose_fast.serveOpIterGetObject(args),
+        .sr_object_key => compose_fast.serveSlotReaderObjectKey(args),
+        .obs_holder_current => compose_fast.serveObserverHolderCurrent(allocator, args),
+        .sw_slot_index => compose_fast.serveSlotWriterSlotIndex(args),
+        .sr_group_object_key => compose_fast.serveSlotReaderGroupObjectKey(args),
         else => null,
     };
 }
@@ -3474,7 +3495,7 @@ pub inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
 /// Null when not handled: out-of-bounds, an immutable receiver, and a live
 /// view (subList / map-values / asList backing) all decline to the full
 /// member path, whose guards throw the right exceptions and write through.
-inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *const Value, new_val: Value) ?Value {
+pub inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *const Value, new_val: Value) ?Value {
     if (idx_v.* != .Int) return null;
     const idx = idx_v.Int;
     if (idx < 0) return null;

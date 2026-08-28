@@ -1250,6 +1250,12 @@ pub const Func = struct {
     acc_route: u64 = 0,
     /// Cached `leafExprBody` verdict: 0 = unasked, 1 = no, 2 = yes.
     leaf_state: u8 = 0,
+    /// Fused-tier verdict, memoized like `leaf_state`: 0 = unasked, 1 =
+    /// eligible (this body and, transitively, every statically-resolved
+    /// callee), 2 = ineligible, 3 = classification in progress (a cycle
+    /// reads as eligible for the frame asking and settles when the root
+    /// classification completes).
+    fuse_state: u8 = 0,
     /// Trivial property-initializer memo (benign-race fill): 0 = unasked,
     /// 1 = not trivial, 2 = the body returns one constant
     /// (`triv_init_val` = ConstId), 3 = it echoes one parameter

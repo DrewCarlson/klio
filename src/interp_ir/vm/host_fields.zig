@@ -553,11 +553,7 @@ pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?
         return null;
     }
     const inst = receiver.Instance;
-    const cls: u64 = blk: {
-        const g = inst.borrow();
-        defer g.deinit();
-        break :blk @intCast(g.get().class.identity());
-    };
+    const cls: u64 = @intCast(runtime.InstanceData.classIdentityUnlocked(inst));
     const hit = blk: {
         const name_p = host_call_member.memberNameIdentity(self, name) orelse break :blk null;
         break :blk fieldReadCacheGet(self, @intCast(cls), name_p);

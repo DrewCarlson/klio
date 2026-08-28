@@ -552,6 +552,27 @@ fn outcomeFromRuntime(self: *Vm, r: runtime.EvalResult) CallOutcome {
 /// top-level / enum-entry initializer. `module` and `sink` are already
 /// borrowed by the caller.
 fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Error!?VmError {
+    runtime.InstanceData.initFieldStats();
+    // Canonicalize name-bearing strings once per module, before any user
+    // code runs, so hot-path name compares exit on pointer equality. The
+    // shared borrow the callers hold guards nothing concurrent here —
+    // prepare is single-threaded — so the const cast is sound.
+    {
+        const canon_off = if (runtime.envOnce("KLIO_CANON")) |v| std.mem.eql(u8, v, "0") else false;
+        const need = !canon_off and blk: {
+            const pg = self.prog.borrow();
+            defer pg.deinit();
+            break :blk pg.get().canonicalized_module_identity != self.module.identity();
+        };
+        if (need) {
+            const pg = self.prog.borrowMut();
+            defer pg.deinit();
+            const cg = self.classes.borrowMut();
+            defer cg.deinit();
+            pg.get().canonicalizeProgramNames(@constCast(module), cg.get());
+            pg.get().canonicalized_module_identity = self.module.identity();
+        }
+    }
     // Settle each symbol's single executable form before any user code
     // runs. `setInstalledBindings` already links when a pack overlay is
     // installed; this covers the no-overlay configurations (the embedded

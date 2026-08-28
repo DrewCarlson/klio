@@ -251,6 +251,9 @@ pub const ProgramImage = struct {
     /// every name to this content-interned address keeps pointer-keyed caches
     /// both fast and exact.
     member_names: std.StringHashMap(void),
+    /// Identity of the module `canonicalizeProgramNames` last processed, so
+    /// the per-program prepare pass runs once per module.
+    canonicalized_module_identity: usize = 0,
     /// Monomorphic inline cache for user-class instance-method dispatch. Without
     /// it, every `inst.method()` re-walks the class hierarchy (linear class +
     /// method scans, string compares) and heap-allocates a work queue + seen-set
@@ -568,6 +571,73 @@ pub const ProgramImage = struct {
             return null;
         };
         return owned;
+    }
+
+    /// Rewrite every short name-bearing string in the program to its
+    /// program-lifetime canonical copy, so hot-path name compares exit on
+    /// `mem.eql`'s pointer-equality check instead of scanning bytes: every
+    /// field read/write compares its instruction name operand against
+    /// instance-field storage names, and every string-keyed cache probe
+    /// compares its key on a hit. Instance-field storage names come from
+    /// `ClassDef` param/property descriptors, name operands from the const
+    /// pool; canonicalizing both sides makes the pointers meet. Strings
+    /// over the cap are data, not identifiers, and stay put — a non-canonical
+    /// name is never wrong, only slower.
+    pub fn canonicalizeProgramNames(self: *ProgramImage, module: *Module, classes: *ClassTable) void {
+        for (module.consts.items) |*c| {
+            if (c.* != .String) continue;
+            c.String = self.canonName(c.String);
+        }
+        var it = classes.valueIterator();
+        while (it.next()) |cell| {
+            const g = cell.borrowMut();
+            defer g.deinit();
+            const d = g.get();
+            for (d.primary_params) |*p| p.name = self.canonName(p.name);
+            for (d.body_properties) |*p| p.name = self.canonName(p.name);
+        }
+        for (module.classes.items) |*cl| {
+            cl.name = self.canonName(cl.name);
+            cl.fqn = self.canonName(cl.fqn);
+            cl.package = self.canonName(cl.package);
+            for (cl.primary_params) |*p| p.name = self.canonName(p.name);
+        }
+        for (module.funcs.items) |*f| {
+            f.name = self.canonName(f.name);
+            f.fqn = self.canonName(f.fqn);
+            f.package = self.canonName(f.package);
+        }
+        // Re-key the per-read/per-write accessor maps and the member-decl
+        // index with canonical parts, so a successful probe's key compare
+        // exits on pointer equality instead of scanning both strings.
+        self.rekeyPairMap(&self.body_prop_inits);
+        self.rekeyPairMap(&self.instance_prop_getters);
+        self.rekeyPairMap(&self.instance_prop_setters);
+        self.rekeyPairMap(&self.instance_prop_private);
+        self.rekeyPairMap(&module.member_name_index);
+    }
+
+    /// The canonical copy of `s` when it is identifier-sized, else `s`
+    /// unchanged (long strings are data; a non-canonical name is never
+    /// wrong, only slower to compare).
+    fn canonName(self: *ProgramImage, s: []const u8) []const u8 {
+        if (s.len == 0 or s.len > 160) return s;
+        return self.memberNameCanonical(s) orelse s;
+    }
+
+    fn rekeyPairMap(self: *ProgramImage, map: anytype) void {
+        var fresh = @TypeOf(map.*).init(map.allocator);
+        fresh.ensureTotalCapacity(map.count()) catch return;
+        var it = map.iterator();
+        while (it.next()) |e| {
+            fresh.putAssumeCapacity(
+                .{ .a = self.canonName(e.key_ptr.a), .b = self.canonName(e.key_ptr.b) },
+                e.value_ptr.*,
+            );
+        }
+        var old = map.*;
+        map.* = fresh;
+        old.deinit();
     }
 
     fn clearResolvedRedirects(self: *ProgramImage) void {
@@ -1644,21 +1714,19 @@ pub fn extDeclRecvIsUserClass(ty_name: []const u8) bool {
     const s = simpleName(ty_name);
     if (s.len == 0) return false;
     if (s.len <= 2 and allAsciiUpper(s)) return false;
-    const builtins = [_][]const u8{
-        "String",       "StringBuilder",     "CharSequence",  "Appendable",   "Int",          "Long",
-        "Short",        "Byte",              "Double",        "Float",        "Char",         "Boolean",
-        "Number",       "Array",             "List",          "MutableList",  "Collection",   "Iterable",
-        "Map",          "MutableMap",        "Set",           "MutableSet",   "Sequence",     "Comparable",
-        "Any",          "Unit",              "UInt",          "ULong",        "UShort",       "UByte",
-        "ByteArray",    "ShortArray",        "IntArray",      "LongArray",    "CharArray",    "BooleanArray",
-        "FloatArray",   "DoubleArray",       "UByteArray",    "UShortArray",  "UIntArray",    "ULongArray",
-        "Iterator",     "MutableIterator",   "ListIterator",  "MutableListIterator",          "MutableIterable",
-        "MutableCollection",                 "Comparator",    "Enum",         "Throwable",    "Nothing",
-        "IntRange",     "LongRange",         "CharRange",     "ClosedRange",  "Pair",         "Triple",
-    };
-    for (builtins) |b| {
-        if (std.mem.eql(u8, s, b)) return false;
-    }
+    const builtins = std.StaticStringMap(void).initComptime(.{
+        .{"String"},       .{"StringBuilder"},     .{"CharSequence"},  .{"Appendable"},   .{"Int"},          .{"Long"},
+        .{"Short"},        .{"Byte"},              .{"Double"},        .{"Float"},        .{"Char"},         .{"Boolean"},
+        .{"Number"},       .{"Array"},             .{"List"},          .{"MutableList"},  .{"Collection"},   .{"Iterable"},
+        .{"Map"},          .{"MutableMap"},        .{"Set"},           .{"MutableSet"},   .{"Sequence"},     .{"Comparable"},
+        .{"Any"},          .{"Unit"},              .{"UInt"},          .{"ULong"},        .{"UShort"},       .{"UByte"},
+        .{"ByteArray"},    .{"ShortArray"},        .{"IntArray"},      .{"LongArray"},    .{"CharArray"},    .{"BooleanArray"},
+        .{"FloatArray"},   .{"DoubleArray"},       .{"UByteArray"},    .{"UShortArray"},  .{"UIntArray"},    .{"ULongArray"},
+        .{"Iterator"},     .{"MutableIterator"},   .{"ListIterator"},  .{"MutableListIterator"},             .{"MutableIterable"},
+        .{"MutableCollection"},                    .{"Comparator"},    .{"Enum"},         .{"Throwable"},    .{"Nothing"},
+        .{"IntRange"},     .{"LongRange"},         .{"CharRange"},     .{"ClosedRange"},  .{"Pair"},         .{"Triple"},
+    });
+    if (builtins.has(s)) return false;
     return true;
 }
 
