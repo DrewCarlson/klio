@@ -88,9 +88,18 @@ locking (already Noop), name-identity and field memos (already present).
       has no single caller; the ReleaseFast harness is a policy call worth
       1.20x). NOTHING AVAILABLE COMPOUNDS TO 4.6x: closing this test needs a
       compiler that inlines dispatch and manages frames natively, which is a
-      research-scale project rather than a lever. The test races two infinite writer loops
-      against the drain, so recompose+apply speedups converge on it
-      superlinearly.
+      research-scale project rather than a lever.
+      ALSO RULED OUT this round: the memory profile is already the GC one
+      (`safe` = JIT off + GC), not the never-free arena, so there is no
+      profile switch to take; and a vpd-scale activation census (151M
+      activations, ~1.25M composable calls) matches the test's own design, so
+      there is no hidden amplification to remove.
+      NOT DONE, DELIBERATELY: raising the 90s wall cap or the 60s coroutine
+      budget for this test would manufacture a pass. The cap catches WEDGED
+      tests and vpd is not wedged, so a documented per-test budget is
+      arguable — but this campaign already decided "the ceiling stays; the fix
+      direction is down via throughput work", and revisiting that is the
+      user's call, not one to take silently.
 
 ## Task 2 — compose suite wall time — EXIT MET (2026-08-27)
 
