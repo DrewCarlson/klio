@@ -462,18 +462,35 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
         // rest of RecomposerTests queued behind it in the same child pushed
         // the wall past 750s. The test gets its own child, scheduled first;
         // the class's remainder runs as a separate job that overlaps it.
+        // Both children compile a TRIMMED source set — the full set costs
+        // ~180s of lowering per child, which sat inside the wall. The trim
+        // is the class file plus the same-package files whose helpers it
+        // reaches without imports (`Trigger` in EffectsTests,
+        // `TestSubcomposition` in CompositionTests); an unlisted helper
+        // fails loudly as an unresolved global, never silently.
         if (std.mem.eql(u8, cls, "RecomposerTests")) {
+            var trimmed: std.ArrayList([]const u8) = .empty;
+            for (sources.items) |src| {
+                const in_test_dirs =
+                    std.mem.indexOf(u8, src, "/commonTest/") != null or
+                    std.mem.indexOf(u8, src, "/nonEmulatorCommonTest/") != null;
+                const keep = !in_test_dirs or
+                    std.mem.endsWith(u8, src, "/RecomposerTests.kt") or
+                    std.mem.endsWith(u8, src, "/EffectsTests.kt") or
+                    std.mem.endsWith(u8, src, "/CompositionTests.kt");
+                if (keep) try trimmed.append(a, src);
+            }
             var solo: std.ArrayList([]const u8) = .empty;
             try solo.append(a, klioBin(&env));
             try solo.append(a, "test");
-            try solo.appendSlice(a, sources.items);
+            try solo.appendSlice(a, trimmed.items);
             try solo.append(a, "--filter=RecomposerTests.validatePotentialDeadlock");
             try jobs.append(a, try solo.toOwnedSlice(a));
             try job_names.append(a, "RecomposerTests.validatePotentialDeadlock");
             var rest: std.ArrayList([]const u8) = .empty;
             try rest.append(a, klioBin(&env));
             try rest.append(a, "test");
-            try rest.appendSlice(a, sources.items);
+            try rest.appendSlice(a, trimmed.items);
             try rest.append(a, "--filter=RecomposerTests,!validatePotentialDeadlock");
             try jobs.append(a, try rest.toOwnedSlice(a));
             try job_names.append(a, "RecomposerTests-rest");
