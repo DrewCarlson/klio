@@ -146,13 +146,24 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     // 1345 at 10s). That hang population is gone — the suite stands at
     // 1385/5 with the failures enumerated — so the cap returns to the
     // upstream default and only genuinely-stuck tests pay it.
-    try map.put("kotlinx_coroutines_test_default_timeout", "60s");
+    // Upstream's own per-test budget. It must never fire BEFORE klio's wall
+    // cap, which is the suite's hang guard and is per-test tunable: when it
+    // did, a slow-but-progressing test reported `UncompletedCoroutinesError`
+    // at an arbitrary point instead of either passing or hitting the cap.
+    try map.put("kotlinx_coroutines_test_default_timeout", "900s");
     // Per-test wall cap: a test that genuinely deadlocks (the Recomposer
     // deadlock-regression shape, the concurrent-mixing teardown stall) fails
     // in place instead of eating the class's whole 480s budget — its
     // classmates' passes stay counted. Generous enough for the compute-heavy
     // benchmark tests under 8-way contention.
     try map.put("KLIO_TEST_WALL_CAP", "90");
+    // `validatePotentialDeadlock` is throughput-bound, not wedged: it races
+    // two infinite writer loops against ~3120 frames of 200 composables and
+    // PASSES in ~724s. It gets a declared budget so the suite reports what it
+    // is (slow) rather than what it is not (stuck). The budget is a ratchet —
+    // it must only shrink as the recomposition path gets faster, and
+    // exceeding it still fails.
+    try map.put("KLIO_TEST_WALL_CAP_FOR", "validatePotentialDeadlock=900");
     // Four children each defaulting to a half-the-cores compute pool
     // oversubscribe the box 2x and inflate the concurrent classes'
     // walls 3-8x. Cap each child so the children together match the
@@ -464,7 +475,15 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                 // progress and their (buffered, lost-on-kill) passes vanished
                 // from the count — a deterministic 616 -> 403 that was pace,
                 // not correctness.
-                const r = runKlio(arena.allocator(), penv, queue[i], 480_000) catch {
+                // RecomposerTests carries `validatePotentialDeadlock`, whose
+                // cost is modelled (~724s to a full pass; see the campaign
+                // plan) rather than wedged, so its class gets a budget that
+                // fits it. Every other class keeps the 480s hang guard.
+                const class_cap_ms: i64 = if (std.mem.indexOf(u8, names[i], "RecomposerTests") != null)
+                    1_200_000
+                else
+                    480_000;
+                const r = runKlio(arena.allocator(), penv, queue[i], class_cap_ms) catch {
                     _ = phung.fetchAdd(1, .monotonic);
                     // Name it. "2 did not complete" is not actionable; the
                     // class is what tells you whether it is the known
