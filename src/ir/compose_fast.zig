@@ -87,6 +87,9 @@ pub const Route = enum(u8) {
     /// `groupObjectKey(index)` — the object key behind the data anchor.
     sr_object_key = 38,
     sr_group_object_key = 39,
+    /// `CompositionObserverHolder.current()` — the observer, refreshed from
+    /// the parent context's holder for a non-root holder.
+    obs_holder_current = 40,
 };
 
 /// Classify once per `Func` (the caller memoizes into `func.host_route`).
@@ -97,6 +100,7 @@ pub fn classify(fqn: []const u8, n_params: usize) Route {
         if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotReader.endGroup")) return .sr_end_group;
         if (std.mem.endsWith(u8, fqn, ".changelist.Operations.OpIterator.next")) return .op_iter_next;
         if (std.mem.endsWith(u8, fqn, "GapComposer.validateNodeNotExpected")) return .gap_validate_node;
+        if (std.mem.endsWith(u8, fqn, ".CompositionObserverHolder.current")) return .obs_holder_current;
         if (std.mem.eql(u8, fqn, "__get_SlotReader_groupKey")) return .sr_group_key_get;
         if (std.mem.eql(u8, fqn, "__get_SlotReader_isGroupEnd")) return .sr_is_group_end_get;
         if (std.mem.eql(u8, fqn, "__get_SlotReader_nodeCount")) return .sr_node_count_get;
@@ -511,6 +515,68 @@ test "compoundWith round-trips through unCompoundWith" {
 test "compoundWith matches rotateLeft xor" {
     const c = serveCompoundWith(&.{ .{ .Long = 1 }, .{ .Int = 7 }, .{ .Int = 3 } }).?;
     try std.testing.expectEqual(@as(i64, 8 ^ 7), c.Long);
+}
+
+threadlocal var fn_observer: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_root_flag: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_parent_ctx: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_obs_holder: std.atomic.Value(?[*]const u8) = .init(null);
+
+/// Identity in the sense Kotlin's `!=` means for observer objects (no custom
+/// equals): the same instance cell, or both null.
+fn sameObserver(a: *const Value, b: *const Value) bool {
+    if (a.* == .Null and b.* == .Null) return true;
+    if (a.* == .Instance and b.* == .Instance) return a.Instance.cell == b.Instance.cell;
+    return false;
+}
+
+/// `CompositionObserverHolder.current()`: the root holder answers its own
+/// observer; a non-root holder refreshes it from the parent context's
+/// holder. The parent's `observerHolder` must be a STORED override (the base
+/// class computes null) — a computed one declines by field absence.
+pub fn serveObserverHolderCurrent(allocator: std.mem.Allocator, args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    var own_obs: Value = undefined;
+    var parent_obs: Value = undefined;
+    {
+        const g = args[0].Instance.borrow();
+        defer g.deinit();
+        const inst = g.get();
+        const root_v = inst.getCached(&fn_root_flag, "root") orelse return null;
+        const root = switch (root_v) {
+            .Bool => |b| b,
+            else => return null,
+        };
+        own_obs = inst.getCached(&fn_observer, "observer") orelse return null;
+        if (root) {
+            own_obs.retain();
+            return own_obs;
+        }
+        const parent = inst.getCached(&fn_parent_ctx, "parent") orelse return null;
+        if (parent != .Instance) return null;
+        const pg = parent.Instance.borrow();
+        defer pg.deinit();
+        const holder = pg.get().getCached(&fn_obs_holder, "observerHolder") orelse return null;
+        if (holder == .Null) {
+            parent_obs = .{ .Null = {} };
+        } else {
+            if (holder != .Instance) return null;
+            const hg = holder.Instance.borrow();
+            defer hg.deinit();
+            parent_obs = hg.get().getCached(&fn_observer, "observer") orelse return null;
+        }
+    }
+    if (!sameObserver(&parent_obs, &own_obs)) {
+        parent_obs.retain();
+        const g = args[0].Instance.borrowMut();
+        defer g.deinit();
+        g.get().define(allocator, "observer", parent_obs) catch {
+            parent_obs.release(allocator);
+            return null;
+        };
+    }
+    parent_obs.retain();
+    return parent_obs;
 }
 
 // ---- Slot-table reader / writer / changelist-iterator serves ----------------
