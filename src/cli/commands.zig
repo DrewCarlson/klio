@@ -548,6 +548,41 @@ fn transpileEmit(
         \\  memcpy(s + KV.char_off, &v, 2);
         \\  kv_set_tag(s, KV.tag_char);
         \\}}
+        \\/* Object view: a plain stored field read, inline behind a class
+        \\ * guard. The route (class identity + stored slot) is resolved once
+        \\ * per site by the runtime and cached by the caller; a different
+        \\ * class, a non-instance receiver or an unresolved site returns 0 and
+        \\ * the site falls back to the escape helper, which carries the full
+        \\ * semantics (custom getters, delegates, misses). */
+        \\static inline void *kv_inst(const uint8_t *s) {{
+        \\  void *p;
+        \\  memcpy(&p, s + KV.inst_ptr_off, sizeof(void *));
+        \\  return p;
+        \\}}
+        \\static inline int kv_getfield(void *ctx, uint8_t *regs, uint32_t blk, uint32_t idx,
+        \\                              uint32_t dst, uint32_t recv,
+        \\                              uint64_t *site_cls, int32_t *site_slot) {{
+        \\  if (!KV.obj_usable) return 0;
+        \\  const uint8_t *rs = kv_slot(regs, recv);
+        \\  if (kv_tag(rs) != KV.tag_instance) return 0;
+        \\  uint8_t *cell = (uint8_t *)kv_inst(rs);
+        \\  if (!cell) return 0;
+        \\  uint8_t *inst = cell + KV.cell_data_off;
+        \\  uint64_t cls;
+        \\  memcpy(&cls, inst + KV.inst_class_off, sizeof(uint64_t));
+        \\  if (*site_slot < 0 || *site_cls != cls) {{
+        \\    if (!klio_op_field_route(ctx, blk, idx, site_cls, site_slot)) {{ *site_slot = -1; return 0; }}
+        \\    if (*site_cls != cls) return 0;
+        \\  }}
+        \\  uint8_t *fields = inst + KV.inst_fields_off;
+        \\  uint8_t *items;
+        \\  size_t len;
+        \\  memcpy(&items, fields + KV.fields_ptr_off, sizeof(void *));
+        \\  memcpy(&len, fields + KV.fields_len_off, sizeof(size_t));
+        \\  if ((size_t)*site_slot >= len) return 0;
+        \\  memcpy(kv_slot(regs, dst), items + (size_t)*site_slot * KV.field_stride + KV.field_value_off, KV.value_size);
+        \\  return 1;
+        \\}}
         \\/* Scalar-replay float lanes: genre 5 stores double bits, genre 6
         \\ * stores float bits, both in the int64 value lane. */
         \\static inline double kl_bits2d(int64_t l) {{ double d; memcpy(&d, &l, 8); return d; }}
@@ -1692,6 +1727,27 @@ fn emitNativeBlock(w: anytype, f: *const ir.Func, st: *const ir.bc.Stream, block
                 // native caller stays on the C stack and the callee's own
                 // emitted body engages inside the recursive activation.
                 const inst_idx = code[pc + 1];
+                // A plain stored FIELD read runs inline behind a class guard:
+                // the site caches the (class, slot) route the runtime
+                // resolves on its first execution, and anything the guard
+                // does not cover falls through to the escape, which carries
+                // the full semantics.
+                if (f.blocks[block].insts[inst_idx] == .GetField) {
+                    const gf = f.blocks[block].insts[inst_idx].GetField;
+                    try w.print(
+                        "  {{ static uint64_t gfc_{d}_{d} = 0; static int32_t gfs_{d}_{d} = -1;\n" ++
+                            "    if (!kv_getfield(ctx, regs, {d}u, {d}u, {d}u, {d}u, &gfc_{d}_{d}, &gfs_{d}_{d}))\n" ++
+                            "      if (klio_op_escape(ctx, {d}u, {d}u)) return; }}\n",
+                        .{
+                            block,          inst_idx,       block, inst_idx,
+                            block,          inst_idx,       gf.dst.int(), gf.receiver.int(),
+                            block,          inst_idx,       block, inst_idx,
+                            block,          inst_idx,
+                        },
+                    );
+                    pc += 2;
+                    continue;
+                }
                 const op_name = switch (f.blocks[block].insts[inst_idx]) {
                     .Call => "klio_op_call",
                     else => "klio_op_escape",

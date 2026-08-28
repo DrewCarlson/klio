@@ -92,6 +92,12 @@ export fn klio_rt_run_image(base_image: [*:0]const u8, path: [*:0]const u8) c_in
 /// is false when the process runs a reclaim mode whose register writes
 /// must release the old value — the emitted code then falls back to the
 /// exported per-op helpers.
+const InstCell = runtime.ObjRef(runtime.InstanceData).Cell;
+const FieldList = std.ArrayList(runtime.InstanceData.Field);
+/// A slice is `{ptr, len}` in that order; there is no `@offsetOf` for one.
+const SLICE_PTR_OFF: u32 = 0;
+const SLICE_LEN_OFF: u32 = @sizeOf(usize);
+
 pub const HotLayout = extern struct {
     value_size: u32,
     tag_off: u32,
@@ -116,6 +122,27 @@ pub const HotLayout = extern struct {
     /// Char payload location + tag, for fused loops over Char scalars.
     char_off: u32,
     tag_char: u64,
+    /// Object view: enough of the Instance layout for the emitted C to read
+    /// a plain stored field inline behind a class guard. `obj_usable == 0`
+    /// keeps every field read on the escape helper — it is set only under
+    /// the tracing GC, where copying a `Value` into a register needs no
+    /// retain. Offsets come from `@offsetOf` on the real structs, so a
+    /// layout change moves them with the runtime instead of drifting.
+    obj_usable: u8,
+    tag_instance: u64,
+    /// `Value.Instance` payload (the `ObjRef` cell pointer) inside a Value.
+    inst_ptr_off: u32,
+    /// `data` inside the cell's control block.
+    cell_data_off: u32,
+    /// `class` / `fields` inside `InstanceData`.
+    inst_class_off: u32,
+    inst_fields_off: u32,
+    /// `items.ptr` / `items.len` inside the fields `ArrayList`.
+    fields_ptr_off: u32,
+    fields_len_off: u32,
+    /// One `Field` record: its size and the offset of its `value`.
+    field_stride: u32,
+    field_value_off: u32,
 };
 
 fn tagOffset() struct { off: u32, size: u32 } {
@@ -240,6 +267,11 @@ fn spanProbe() SpanProbe {
     return out;
 }
 
+fn objViewOff() bool {
+    const v = std.c.getenv("KLIO_OBJVIEW") orelse return false;
+    return std.mem.span(v).len != 0 and std.mem.span(v)[0] == '0';
+}
+
 export fn klio_rt_hot_layout(out: *HotLayout) void {
     if (std.c.getenv("KLIO_NATIVE_TRACE") != null) std.debug.print("[rt] hot_layout enter out=0x{x}\n", .{@intFromPtr(out)});
     const t = tagOffset();
@@ -249,11 +281,14 @@ export fn klio_rt_hot_layout(out: *HotLayout) void {
     var vb: runtime.Value = undefined;
     var vu: runtime.Value = undefined;
     var vc: runtime.Value = undefined;
+    var vinst: runtime.Value = undefined;
     @memset(std.mem.asBytes(&vi), 0);
     @memset(std.mem.asBytes(&vl), 0);
     @memset(std.mem.asBytes(&vb), 0);
     @memset(std.mem.asBytes(&vu), 0);
     @memset(std.mem.asBytes(&vc), 0);
+    @memset(std.mem.asBytes(&vinst), 0);
+    vinst = .{ .Instance = undefined };
     vi = .{ .Int = 0 };
     vl = .{ .Long = 0 };
     vb = .{ .Bool = false };
@@ -286,6 +321,20 @@ export fn klio_rt_hot_layout(out: *HotLayout) void {
         .span_tag_set = sp.tag_set,
         .char_off = @intCast(@intFromPtr(&vc.Char) - @intFromPtr(&vc)),
         .tag_char = readTag(&vc, t.off, t.size),
+        // Object view: only under the tracing GC, where a register write is
+        // a plain copy (the reclaim backends would owe a retain).
+        // KLIO_OBJVIEW=0 keeps field reads on the escape helper, for
+        // single-binary A/B of the inline object view.
+        .obj_usable = @intFromBool(!runtime.reclaimRequested() and !objViewOff()),
+        .tag_instance = @intFromEnum(@as(std.meta.Tag(runtime.Value), .Instance)),
+        .inst_ptr_off = @intCast(@intFromPtr(&vinst.Instance) - @intFromPtr(&vinst)),
+        .cell_data_off = @offsetOf(InstCell, "data"),
+        .inst_class_off = @offsetOf(runtime.InstanceData, "class"),
+        .inst_fields_off = @offsetOf(runtime.InstanceData, "fields"),
+        .fields_ptr_off = @offsetOf(FieldList, "items") + SLICE_PTR_OFF,
+        .fields_len_off = @offsetOf(FieldList, "items") + SLICE_LEN_OFF,
+        .field_stride = @sizeOf(runtime.InstanceData.Field),
+        .field_value_off = @offsetOf(runtime.InstanceData.Field, "value"),
     };
     if (std.c.getenv("KLIO_NATIVE_TRACE") != null)
         std.debug.print("[rt] wrote usable={d} vsize={d} (sizeOf={d}) reclaimReq={}\n", .{ out.usable, out.value_size, @sizeOf(runtime.Value), runtime.reclaimRequested() });
@@ -364,6 +413,10 @@ export fn klio_op_cell_get(ctx: *anyopaque, dst: u32, cell: u32) void {
 
 export fn klio_op_bin(ctx: *anyopaque, block: u32, inst_idx: u32, kind: u32, dst: u32, lhs: u32, rhs: u32) i32 {
     return eval.nativeOpBin(ctxOf(ctx), block, inst_idx, kind, dst, lhs, rhs);
+}
+
+export fn klio_op_field_route(ctx: *anyopaque, block: u32, inst_idx: u32, cls_out: *u64, slot_out: *i32) i32 {
+    return eval.nativeOpFieldRoute(ctxOf(ctx), block, inst_idx, cls_out, slot_out);
 }
 
 export fn klio_op_escape(ctx: *anyopaque, block: u32, inst_idx: u32) i32 {

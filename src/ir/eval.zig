@@ -6296,6 +6296,7 @@ fn runFrameExec(
                 .arm_bin = &NativeGlue(H).armBin,
                 .escape = &NativeGlue(H).escape,
                 .call = &NativeGlue(H).call,
+                .field_route = &NativeGlue(H).fieldRoute,
             };
             nf(@ptrCast(&nctx), cur.int());
             if (runtime.envOnce("KLIO_NATIVE_TRACE") != null) {
@@ -7380,6 +7381,11 @@ pub const NativeCtx = struct {
     arm_bin: *const fn (*NativeCtx, u32, u32) NativeStep,
     escape: *const fn (*NativeCtx, u32, u32) NativeStep,
     call: *const fn (*NativeCtx, u32, u32) NativeStep,
+    /// Resolve a `GetField` site to (class cell identity, stored slot) for
+    /// the receiver currently in its register, so the emitted C can read the
+    /// slot inline behind a class guard. Zero when the site is not a plain
+    /// stored read (custom accessor, non-instance receiver, unknown class).
+    field_route: *const fn (*NativeCtx, u32, u32, *u64, *i32) i32,
     outcome: NativeOutcome = .none,
     out_block: u32 = 0,
 };
@@ -7392,6 +7398,28 @@ fn NativeGlue(comptime H: type) type {
             const inst = &frame.func.blocks[block].insts[idx];
             const r = execArmBinOp(H, ctx.allocator, frame, inst.BinOp, host) catch return .oom;
             return glueAfter(ctx, r, inst, idx, block);
+        }
+        fn fieldRoute(ctx: *NativeCtx, block: u32, idx: u32, cls_out: *u64, slot_out: *i32) i32 {
+            if (comptime !@hasDecl(H, "plainStoredFieldIndex")) return 0;
+            const host: *H = @ptrCast(@alignCast(ctx.host));
+            const frame = ctx.frame;
+            const inst = &frame.func.blocks[block].insts[idx];
+            if (inst.* != .GetField) return 0;
+            const gf = inst.GetField;
+            const recv = frame.read(gf.receiver);
+            if (recv != .Instance) return 0;
+            const name = constStr(frame.module, gf.field) orelse return 0;
+            const slot = host.plainStoredFieldIndex(ctx.allocator, &recv, name) orelse return 0;
+            // The identity the emitted C compares is the raw CELL pointer it
+            // reads out of `InstanceData.class` — `asPtr` would hand back the
+            // payload address instead, and the guard would never match.
+            cls_out.* = blk: {
+                const g = recv.Instance.borrow();
+                defer g.deinit();
+                break :blk @intFromPtr(g.get().class.cell);
+            };
+            slot_out.* = @intCast(slot);
+            return 1;
         }
         fn escape(ctx: *NativeCtx, block: u32, idx: u32) NativeStep {
             const host: *H = @ptrCast(@alignCast(ctx.host));
@@ -7742,6 +7770,13 @@ pub fn nativeOpCall(ctx: *NativeCtx, block: u32, inst_idx: u32) i32 {
 }
 
 /// Nonzero = the emitted function must return (outcome set on the ctx).
+/// Resolve a `GetField` site for the emitted C's inline read. Returns 1 with
+/// `cls_out`/`slot_out` filled when the site is a plain stored field on the
+/// receiver's current class; 0 leaves the site on the escape helper.
+pub fn nativeOpFieldRoute(ctx: *NativeCtx, block: u32, inst_idx: u32, cls_out: *u64, slot_out: *i32) i32 {
+    return ctx.field_route(ctx, block, inst_idx, cls_out, slot_out);
+}
+
 pub fn nativeOpEscape(ctx: *NativeCtx, block: u32, inst_idx: u32) i32 {
     switch (ctx.escape(ctx, block, inst_idx)) {
         .cont => return 0,
