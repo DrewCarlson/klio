@@ -124,6 +124,7 @@ fn isBoundRefInstance(v: *const Value) bool {
 /// stays put, until `NATIVE_RECURSE_MAX_DEPTH`, where it reverts to the
 /// flat park to bound the C stack.
 const snapshot_fast = @import("snapshot_fast.zig");
+const compose_fast = @import("compose_fast.zig");
 
 /// Classify `f` for host service (memoized on `Func.host_route`) and
 /// serve `args` on a routed hit. The shared core behind the static-call
@@ -139,7 +140,7 @@ pub fn hostRouteServe(comptime H: type, f: *const ir.Func, args: []const Value, 
         };
         @constCast(f).host_route = @intFromEnum(route);
     }
-    if (f.host_route <= @intFromEnum(snapshot_fast.Route.none)) return null;
+    if (f.host_route <= @intFromEnum(snapshot_fast.Route.none)) return composeRouteServe(f, args);
     switch (@as(snapshot_fast.Route, @enumFromInt(f.host_route))) {
         .readable => {
             if (args.len != 3) return null;
@@ -175,6 +176,33 @@ pub fn hostRouteServe(comptime H: type, f: *const ir.Func, args: []const Value, 
     }
 }
 
+/// Compose's one-line helpers (`IntStack`, the composite-key rotation)
+/// answered by the host at the same seam. Classified once per body, and any
+/// shape the serve cannot prove falls through to the interpreted body.
+fn composeRouteServe(f: *const ir.Func, args: []const Value) ?Value {
+    if (f.compose_route == 0) {
+        @constCast(f).compose_route = @intFromEnum(compose_fast.classify(f.fqn, f.params.len));
+    }
+    if (f.compose_route <= @intFromEnum(compose_fast.Route.none)) return null;
+    if (args.len != f.params.len) return null;
+    return switch (@as(compose_fast.Route, @enumFromInt(f.compose_route))) {
+        .compound_with => compose_fast.serveCompoundWith(args),
+        .uncompound_with => compose_fast.serveUnCompoundWith(args),
+        .int_stack_push => compose_fast.servePush(args),
+        .int_stack_pop => compose_fast.servePop(args),
+        .int_stack_pop_or => compose_fast.servePopOr(args),
+        .int_stack_peek => compose_fast.servePeek(args),
+        .int_stack_peek2 => compose_fast.servePeek2(args),
+        .int_stack_peek_at => compose_fast.servePeekAt(args),
+        .int_stack_peek_or => compose_fast.servePeekOr(args),
+        .int_stack_is_empty => compose_fast.serveIsEmpty(args),
+        .int_stack_is_not_empty => compose_fast.serveIsNotEmpty(args),
+        .int_stack_clear => compose_fast.serveClear(args),
+        .int_stack_size => compose_fast.serveSize(args),
+        else => null,
+    };
+}
+
 /// Host-served static fns (the snapshot validity walk): classify once
 /// per Func, serve without any call machinery on a hit.
 inline fn hostStaticServe(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H) Allocator.Error!?Value {
@@ -188,6 +216,11 @@ inline fn hostStaticServe(comptime H: type, allocator: Allocator, frame: *Frame,
 }
 
 pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H, allow_flat: bool) Allocator.Error!Step {
+    const arm_t0 = eval.armNow();
+    defer if (eval.armIsOn()) {
+        eval.st_calls += 1;
+        eval.st_ns +%= eval.armNow() -% arm_t0;
+    };
     if (cmgTraceWant()) |w| {
         if (frame.module.funcById(call.func)) |cf| if (std.mem.eql(u8, w, cf.name)) {
             std.debug.print("[call-inst] {s}#{d} n_args={d} n_names={d} exact={} caller={s}", .{ cf.name, call.func.int(), call.n_args, call.arg_names.len, call.exact, frame.func.name });
@@ -701,6 +734,11 @@ pub noinline fn execArmCallSuper(comptime H: type, allocator: Allocator, frame: 
 /// has no name-based fallback: a missing slot is a link error in the program
 /// image and is reported by the host.
 pub noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *Frame, cv: anytype, host: *H) Allocator.Error!Step {
+    const arm_t0 = eval.armNow();
+    defer if (eval.armIsOn()) {
+        eval.vc_calls += 1;
+        eval.vc_ns +%= eval.armNow() -% arm_t0;
+    };
     dispatchBump(.call_virtual_slot);
     if (comptime !@hasDecl(H, "invokeVirtualMember")) {
         return raiseStep(frame, .{ .Type = "CallVirtual is unsupported by this host" });
@@ -1678,6 +1716,11 @@ fn freeMissErr(allocator: Allocator, e: EvalError) void {
 }
 
 pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, cmg: anytype, host: *H) Allocator.Error!Step {
+    const arm_t0 = eval.armNow();
+    defer if (eval.armIsOn()) {
+        eval.mg_calls += 1;
+        eval.mg_ns +%= eval.armNow() -% arm_t0;
+    };
     dispatchBump(.call_member_or_global);
     const name_str = constStr(frame.module, cmg.name) orelse
         return raiseStep(frame, .{ .Type = "CallMemberOrGlobal: name not a string const" });

@@ -1261,6 +1261,9 @@ pub const Func = struct {
     /// Host-served static routing memo (snapshot_fast): 0 = unasked,
     /// then a `snapshot_fast.Route` value.
     host_route: u8 = 0,
+    /// Compose fast-path verdict for this body (`compose_fast.Route`),
+    /// classified once on first execution like `host_route`.
+    compose_route: u8 = 0,
     /// Cached `frameNoFill` verdict: 0 = unasked, 1 = must fill,
     /// 2 = register file may start unfilled.
     frame_fill_state: u8 = 0,

@@ -1498,6 +1498,12 @@ pub var inst_count_all: std.atomic.Value(u64) = .init(0);
 pub fn frameCountDump(module: *const Module) void {
     if (!frame_count_on) return;
     std.debug.print("[frames] entries={d} activations={d} insts={d}\n", .{ frame_count_total, frame_alloc_total, inst_count_all.load(.monotonic) + inst_count });
+    std.debug.print("[call] member={d}/{d}ms static={d}/{d}ms virtual={d}/{d}ms mog={d}/{d}ms\n", .{
+        cm_calls, cm_ns / 1_000_000,
+        st_calls, st_ns / 1_000_000,
+        vc_calls, vc_ns / 1_000_000,
+        mg_calls, mg_ns / 1_000_000,
+    });
     std.debug.print("[regs] pool_hit={d} pool_miss={d} filled_slots={d}\n", .{ regs_pool_hit, regs_pool_miss, regs_fill_slots });
     if (frame_census_on) {
         const FE = struct { name: []const u8, n: u32 };
@@ -5458,6 +5464,19 @@ fn runFlatLoop(
                 }
                 break :blk_cm f.module;
             };
+            // A host-served compose helper answers before any activation
+            // opens, on the flat path as well as the recursive seam: the
+            // composer's stacks are reached through both.
+            if (site.req.captures.items.len == 0 and site.req.pop_enclosing_n == 0) {
+                if (exec_call.hostRouteServe(H, site.req.func, site.req.args.items, host)) |served| {
+                    const dst = site.req.dst;
+                    discardFlatReq(H, allocator, site.req, host);
+                    try f.write(dst, served);
+                    cur = site.ret_block;
+                    ridx = site.ret_idx;
+                    continue;
+                }
+            }
             if (leafReqServable(site.req)) {
                 // A flat request carries the callee's `Func` directly, but the
                 // module its body must be READ against is only known when the
@@ -8786,6 +8805,24 @@ inline fn sameFieldName(stored: []const u8, want: []const u8) bool {
 /// host's (class, name) memo on every read, which interns the name and
 /// probes a hash map. Remember the answer per (site, class) instead: the
 /// route is a pure function of that pair.
+pub var cm_calls: u64 = 0;
+pub var cm_ns: u64 = 0;
+pub var st_calls: u64 = 0;
+pub var st_ns: u64 = 0;
+pub var vc_calls: u64 = 0;
+pub var vc_ns: u64 = 0;
+pub var mg_calls: u64 = 0;
+pub var mg_ns: u64 = 0;
+
+/// Wall nanoseconds inside a dispatch arm, counted only under
+/// `KLIO_FRAME_COUNT`. On the flat path the arm returns before the callee
+/// runs, so this is dispatch cost, not callee cost.
+pub fn armNow() u64 {
+    return gfNow();
+}
+pub fn armIsOn() bool {
+    return frame_count_on;
+}
 pub var gf_mono: u64 = 0;
 pub var gf_getter_ns: u64 = 0;
 pub var gf_slow_ns: u64 = 0;
@@ -9185,7 +9222,44 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
 }
 
 /// Outlined `execInst` arm — see `execInst`.
+
+/// A member call site that sees more than one receiver class re-ran the
+/// whole resolution ladder on every call — the single claimed class in the
+/// instruction only ever serves one of them. Compose's changelist walks ~40
+/// `Operation` subclasses through one site, so remember the resolved target
+/// per (site, class, argument signature) instead. The dispatch generation is
+/// folded into the key, so a cache flush invalidates every entry at once.
+const CALL_PIC_SLOTS: usize = 1 << 14;
+const CallPicEnt = struct { key: u64 = 0, fid: u32 = 0 };
+threadlocal var call_pic: [CALL_PIC_SLOTS]CallPicEnt = @splat(.{});
+
+inline fn callPicKey(site: usize, cls: u64, sig: u64, gen: u64) u64 {
+    var k = (@as(u64, site) *% 0x9E3779B97F4A7C15) ^ (cls *% 0xC2B2AE3D27D4EB4F);
+    k ^= sig *% 0xD6E8FEB86659FD93;
+    k ^= gen *% 0x517CC1B727220A95;
+    return k | 1;
+}
+
+fn callPicGet(site: usize, cls: u64, sig: u64, gen: u64) ?u32 {
+    const key = callPicKey(site, cls, sig, gen);
+    const e = &call_pic[@as(usize, @intCast(key >> 17)) & (CALL_PIC_SLOTS - 1)];
+    if (e.key != key) return null;
+    return e.fid;
+}
+
+fn callPicPut(site: usize, cls: u64, sig: u64, gen: u64, fid: u32) void {
+    const key = callPicKey(site, cls, sig, gen);
+    const e = &call_pic[@as(usize, @intCast(key >> 17)) & (CALL_PIC_SLOTS - 1)];
+    e.key = key;
+    e.fid = fid;
+}
+
 noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Frame, cm: anytype, host: *H) Allocator.Error!Step {
+    const cm_t0 = gfNow();
+    defer if (frame_count_on) {
+        cm_calls += 1;
+        cm_ns +%= gfNow() -% cm_t0;
+    };
     const recv = frame.read(cm.receiver);
     if (cmTraceWant()) |w0| {
         const want = w0;
@@ -9351,10 +9425,26 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
         if (flatEnabled() and memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.arg_names)) {
             const w0 = @atomicLoad(u64, @constCast(&cm.site_cls), .acquire);
             if (w0 > 1) site: {
-                {
+                const cls_now: u64 = blk_cls: {
                     const g = recv.Instance.borrow();
                     defer g.deinit();
-                    if (w0 != @as(u64, @intCast(g.get().class.identity()))) break :site;
+                    break :blk_cls @intCast(g.get().class.identity());
+                };
+                if (w0 != cls_now) {
+                    // A polymorphic site: this class has its own remembered
+                    // target, so it never re-runs the ladder either.
+                    const gen: u64 = if (comptime @hasDecl(H, "dispatchCacheGen")) H.dispatchCacheGen() else 0;
+                    const sig_p = host.memberSiteSig(arg_values) orelse break :site;
+                    const fid_p = callPicGet(@intFromPtr(cm), cls_now, sig_p, gen) orelse break :site;
+                    if (try host.prepareMemberFlatFromFid(allocator, &recv, name_str, arg_values, @enumFromInt(fid_p))) |prep0| {
+                        dispatchBump(.member_site_flat);
+                        var prep = prep0;
+                        prep.dst = cm.dst;
+                        prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
+                        frame.flat_call = prep;
+                        return .flat_call;
+                    }
+                    break :site;
                 }
                 const route = @atomicLoad(u64, @constCast(&cm.site_route), .acquire);
                 if (route == 0) break :site;
@@ -9412,8 +9502,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 // own caches fill under) and only for the positional form.
                 if (comptime @hasDecl(H, "memberSiteSig")) {
                     if (memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.arg_names) and
-                        dispatchCacheStable() and
-                        @atomicLoad(u64, @constCast(&cm.site_cls), .monotonic) == 0)
+                        dispatchCacheStable())
                     {
                         if (host.memberSiteSig(arg_values)) |sig| {
                             const cls: u64 = blk: {
@@ -9424,6 +9513,12 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                             if (cls > 1 and @cmpxchgStrong(u64, @constCast(&cm.site_cls), 0, cls, .acq_rel, .monotonic) == null) {
                                 @atomicStore(u64, @constCast(&cm.site_sig), sig, .monotonic);
                                 @atomicStore(u64, @constCast(&cm.site_route), (@as(u64, prep.func.id.int()) << 1) | 1, .release);
+                            } else if (cls > 1) {
+                                // The instruction already belongs to another
+                                // class: remember this one in the per-site
+                                // cache so it stops re-resolving too.
+                                const gen: u64 = if (comptime @hasDecl(H, "dispatchCacheGen")) H.dispatchCacheGen() else 0;
+                                callPicPut(@intFromPtr(cm), cls, sig, gen, prep.func.id.int());
                             }
                         }
                     }
