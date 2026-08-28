@@ -34,10 +34,14 @@ the GC stop-the-world rendezvous fix; and the call-throughput rounds
 Rejected with measurements: backoff-sleep ladder (667 vs 630ms), module-cell
 locking (already Noop), name-identity and field memos (already present).
 
-- [ ] OPEN — `RecomposerTests.validatePotentialDeadlock`: **416s solo vs the
-      gate's 90s per-class cap (4.6x)**, down from 753s on this round's
-      dispatch work (the failure it reports is its own 60s `runTest` budget —
-      still throughput, no correctness component). COST MODEL MEASURED (2026-08-27,
+- [ ] OPEN — `RecomposerTests.validatePotentialDeadlock`: **724s to a full
+      PASS vs the gate's 90s per-test cap (8x)**. NUMBER CORRECTED 2026-08-28:
+      the 416s figures were ABORTED runs (they stop at upstream's 60s
+      `runTest` budget, which fires non-deterministically here), not passes.
+      Given budget enough to finish (`KLIO_TEST_WALL_CAP=1800`,
+      `kotlinx_coroutines_test_default_timeout=900s`) the test PASSES in 724s
+      — so it is correct, and this round's dispatch work bought ~4% on it
+      (753 -> 724s), not the 1.8x an aborted run suggested. COST MODEL MEASURED (2026-08-27,
       replica `f10_texts200`: 200 texts, ten frames, both composers):
       `advanceTimeBy(5_000)` x10 at a 16ms frame clock = ~3120 frames, each
       recomposing the root and its 200 `Text` children = ~624k composable
@@ -94,12 +98,15 @@ locking (already Noop), name-identity and field memos (already present).
       profile switch to take; and a vpd-scale activation census (151M
       activations, ~1.25M composable calls) matches the test's own design, so
       there is no hidden amplification to remove.
-      NOT DONE, DELIBERATELY: raising the 90s wall cap or the 60s coroutine
-      budget for this test would manufacture a pass. The cap catches WEDGED
-      tests and vpd is not wedged, so a documented per-test budget is
-      arguable — but this campaign already decided "the ceiling stays; the fix
-      direction is down via throughput work", and revisiting that is the
-      user's call, not one to take silently.
+      THE BUDGET PATH, PRICED (2026-08-28): the runner now supports a
+      documented per-test budget (`KLIO_TEST_WALL_CAP_FOR=name=secs`) for a
+      test whose cost is modelled rather than wedged. Enabling it for vpd
+      needs ~900s for the test, the per-CLASS cap raised from 480s to ~1000s,
+      and the coroutine budget raised suite-wide — which makes RecomposerTests
+      the gate's long pole at ~900s and takes the suite wall from ~400s back
+      past its 727s pre-campaign baseline. That trades Task 2's exit for a
+      green Task 1, so the mechanism stays available and OFF; the fix
+      direction remains throughput.
 
 ## Task 2 — compose suite wall time — EXIT MET (2026-08-27)
 

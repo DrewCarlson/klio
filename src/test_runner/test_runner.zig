@@ -438,6 +438,32 @@ fn wallCapSeconds() i64 {
     return v;
 }
 
+/// Per-test budget overrides: `KLIO_TEST_WALL_CAP_FOR=name=secs,name=secs`.
+/// The default cap catches a WEDGED test; a test whose cost is measured and
+/// modelled — it completes, it just takes longer than the hang detector's
+/// window — declares its own budget here instead of being reported as stuck.
+/// A declared budget is an upper bound that must only shrink: exceeding it
+/// still fails, so a regression is still caught.
+fn wallCapForTest(name: []const u8) i64 {
+    const spec = runtime.envOnce("KLIO_TEST_WALL_CAP_FOR") orelse return wallCapSeconds();
+    var it = std.mem.splitScalar(u8, spec, ',');
+    while (it.next()) |entry| {
+        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        const key = std.mem.trim(u8, entry[0..eq], " ");
+        if (key.len == 0) continue;
+        if (std.mem.indexOf(u8, name, key) == null) continue;
+        return std.fmt.parseInt(i64, std.mem.trim(u8, entry[eq + 1 ..], " "), 10) catch continue;
+    }
+    return wallCapSeconds();
+}
+
+fn armWallDeadlineFor(name: []const u8) void {
+    const cap = wallCapForTest(name);
+    if (cap <= 0) return;
+    ir.eval.wall_cap_thrown.store(false, .monotonic);
+    ir.eval.test_wall_deadline_ms.store(ir.eval.nowMonotonicMs() + cap * 1000, .monotonic);
+}
+
 fn armWallDeadline() void {
     const cap = wallCapSeconds();
     if (cap <= 0) return;
@@ -496,7 +522,7 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
             continue;
         };
         if (ir.eval.evalDepthNow() != 0) std.debug.print("[depth-leak] {d} before {s}\n", .{ ir.eval.evalDepthNow(), t.display });
-        armWallDeadline();
+        armWallDeadlineFor(t.display);
         const oc = try vm.callNoArg(fid);
         clearWallDeadline();
         drainWallCapAbandon();
@@ -519,7 +545,7 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
             };
             // Fresh instance per test (JUnit semantics).
             if (ir.eval.evalDepthNow() != 0) std.debug.print("[depth-leak] {d} before {s}\n", .{ ir.eval.evalDepthNow(), m.display });
-            armWallDeadline();
+            armWallDeadlineFor(m.display);
             const inst = try vm.construct(cid);
             drainWallCapAbandon();
             switch (inst) {
