@@ -132,9 +132,20 @@ instances of what this generalizes.
   (index-claimed like the GetField site memos), object-array elements,
   instance minting via the persistent_map_mut template mechanism, and
   native->native calls; bail-to-interp on shape surprise. Oracle: the
-  transpiler corpus at byte parity (293/293 today), extended with
-  object-shaped programs. NOTE: A1 alone moves no gate number — the emitted
-  bodies only run once A2 registers them.
+  transpiler corpus at byte parity. NOTE: A1 alone moves no gate number —
+  the emitted bodies only run once A2 registers them.
+  - [x] A1a stored-field reads (d535383b, d10e4051): the site caches the
+        (class cell, stored slot) route and reads the slot inline behind a
+        class guard. Field-heavy loop 514 -> 197 ns/iter (2.6x). The gate is
+        `fieldSiteRoute`'s own verdict, NOT `plainStoredFieldIndex` — the
+        latter matches a `by lazy` delegate's storage slot by name and handed
+        back the delegate object.
+  - [x] A1b IntArray element reads (2867f7ef): tag, primitive-storage
+        discriminator (probed) and index guarded, escape otherwise.
+        IntArray loop 1403 -> 803 ns/iter (1.75x).
+  - [ ] A1c stored-field WRITES (needs the GC write barrier exposed to C).
+  - [ ] A1d boxed-array reads/writes, then instance minting.
+  `KLIO_OBJVIEW=0` disables the object view for single-binary A/B.
 - A2. Bake-time AOT: transpile the hot library functions at pack bake (ids are
   pinned there) and ship the .so with the pack, registered through
   `klio_rt_register_native_leaf`. No runtime JIT. Oracle: the compose gate
