@@ -19,11 +19,34 @@ export fn klio_rt_register_hot_layout(slot: *HotLayout) void {
     hot_layout_slot = slot;
 }
 
+/// The generated file's EMIT-TIME copy of the layout, frozen as constants
+/// in its inline fast paths. Verified against the live fill: a .c linked
+/// against a runtime with a different layout gets the whole hot view
+/// disabled (helpers fall back to the exported per-op entry points)
+/// instead of reading through wrong offsets.
+var hot_frozen_slot: ?*const HotLayout = null;
+
+export fn klio_rt_register_hot_frozen(frozen: *const HotLayout) void {
+    hot_frozen_slot = frozen;
+}
+
 fn fillHotLayoutSlot() void {
     if (std.c.getenv("KLIO_NATIVE_TRACE") != null)
         std.debug.print("[rt] fillHotLayoutSlot slot=0x{x}\n", .{if (hot_layout_slot) |sl| @intFromPtr(sl) else 0});
     if (hot_layout_slot) |slot| {
         klio_rt_hot_layout(slot);
+        // The generated file's frozen constants must match the live
+        // layout exactly, or every inline fast path reads garbage —
+        // disable the whole view and let the exported helpers carry it.
+        if (hot_frozen_slot) |fz| {
+            if (!ir.hot_layout.layoutMatches(fz, slot)) {
+                slot.usable = 0;
+                slot.obj_usable = 0;
+                slot.span_usable = 0;
+                if (std.c.getenv("KLIO_NATIVE_TRACE") != null)
+                    std.debug.print("[rt] FROZEN LAYOUT MISMATCH — hot view disabled\n", .{});
+            }
+        }
         if (std.c.getenv("KLIO_NATIVE_TRACE") != null)
             std.debug.print("[rt] filled usable={d} size={d}\n", .{ slot.usable, slot.value_size });
     }
@@ -92,208 +115,34 @@ export fn klio_rt_run_image(base_image: [*:0]const u8, path: [*:0]const u8) c_in
 /// is false when the process runs a reclaim mode whose register writes
 /// must release the old value — the emitted code then falls back to the
 /// exported per-op helpers.
-pub const HotLayout = extern struct {
-    value_size: u32,
-    tag_off: u32,
-    tag_size: u32,
-    int_off: u32,
-    long_off: u32,
-    bool_off: u32,
-    tag_int: u64,
-    tag_long: u64,
-    tag_bool: u64,
-    tag_unit: u64,
-    usable: u8,
-    /// Frame `cur_span` (`?Span`) layout for the inlined trace store:
-    /// three u32 field offsets plus the optional's presence byte and
-    /// its set value. `span_usable == 0` keeps traces on the helper.
-    span_usable: u8,
-    span_file_off: u32,
-    span_start_off: u32,
-    span_end_off: u32,
-    span_tag_off: u32,
-    span_tag_set: u8,
-    /// Char payload location + tag, for fused loops over Char scalars.
-    char_off: u32,
-    tag_char: u64,
-};
+pub const HotLayout = ir.hot_layout.HotLayout;
 
-fn tagOffset() struct { off: u32, size: u32 } {
-    // The tag's location is compiler-chosen; find it by diffing values
-    // that differ only in tag (payload bytes zero in both). Undefined
-    // padding bytes are poisoned per-construction in safe builds, so a
-    // same-tag pair first yields the padding mask to ignore.
-    const N = @sizeOf(runtime.Value);
-    // Zero the backing bytes BEFORE constructing each probe value: the
-    // padding bytes of a struct assignment are undefined, and comparing
-    // undefined memory is UB the optimizer may lower to a trap (it did —
-    // the fill crashed the run thread and the hot view silently never
-    // engaged). With zeroed backing, padding compares equal and only the
-    // tag/payload fields differ.
-    var z1: runtime.Value = undefined;
-    var z2: runtime.Value = undefined;
-    var a: runtime.Value = undefined;
-    var b: runtime.Value = undefined;
-    @memset(std.mem.asBytes(&z1), 0);
-    @memset(std.mem.asBytes(&z2), 0);
-    @memset(std.mem.asBytes(&a), 0);
-    @memset(std.mem.asBytes(&b), 0);
-    z1 = .{ .Int = 0 };
-    z2 = .{ .Int = 0 };
-    a = .{ .Int = 0 };
-    b = .{ .Long = 0 };
-    const p1: [*]const u8 = @ptrCast(&z1);
-    const p2: [*]const u8 = @ptrCast(&z2);
-    const pa: [*]const u8 = @ptrCast(&a);
-    const pb: [*]const u8 = @ptrCast(&b);
-    var first: ?u32 = null;
-    var last: u32 = 0;
-    var i: u32 = 0;
-    while (i < N) : (i += 1) {
-        if (p1[i] != p2[i]) continue; // padding: unstable even same-tag
-        if (pa[i] != pb[i]) {
-            if (first == null) first = i;
-            last = i;
-        }
-    }
-    const off = first orelse 0;
-    var size = last - off + 1;
-    if (size > 8) size = 8;
-    return .{ .off = off, .size = size };
-}
-
-fn readTag(v: *const runtime.Value, off: u32, size: u32) u64 {
-    const p: [*]const u8 = @ptrCast(v);
-    var out: u64 = 0;
-    @memcpy(std.mem.asBytes(&out)[0..size], p[off .. off + size]);
-    return out;
-}
-
-/// Locate the fields of the frame's `?Span` slot by value probing:
-/// distinct u32 patterns find each field; the presence byte is the one
-/// that flips between null and set outside the payload (padding-masked
-/// by comparing two identical null values).
-const SpanProbe = struct {
-    usable: u8,
-    file_off: u32,
-    start_off: u32,
-    end_off: u32,
-    tag_off: u32,
-    tag_set: u8,
-};
-
-fn spanProbe() SpanProbe {
-    const OptSpan = ?ir.Span;
-    const N = @sizeOf(OptSpan);
-    // Zero the backing bytes before construction: padding is undefined and
-    // comparing undefined memory is UB the optimizer may lower to a trap
-    // (the tagOffset probe crashed exactly this way).
-    var set: OptSpan = undefined;
-    var null1: OptSpan = undefined;
-    var null2: OptSpan = undefined;
-    @memset(std.mem.asBytes(&set), 0);
-    @memset(std.mem.asBytes(&null1), 0);
-    @memset(std.mem.asBytes(&null2), 0);
-    set = .{ .file = @enumFromInt(@as(u32, 0x01020304)), .start = 0x05060708, .end = 0x090A0B0C };
-    null1 = null;
-    null2 = null;
-    const ps: [*]const u8 = @ptrCast(&set);
-    const p1: [*]const u8 = @ptrCast(&null1);
-    const p2: [*]const u8 = @ptrCast(&null2);
-    var out: SpanProbe = .{ .usable = 0, .file_off = 0, .start_off = 0, .end_off = 0, .tag_off = 0, .tag_set = 1 };
-    var found_file: ?u32 = null;
-    var found_start: ?u32 = null;
-    var found_end: ?u32 = null;
-    var i: u32 = 0;
-    while (i + 4 <= N) : (i += 1) {
-        var w: u32 = 0;
-        @memcpy(std.mem.asBytes(&w), ps[i .. i + 4]);
-        switch (w) {
-            0x01020304 => found_file = i,
-            0x05060708 => found_start = i,
-            0x090A0B0C => found_end = i,
-            else => {},
-        }
-    }
-    const fo = found_file orelse return out;
-    const so = found_start orelse return out;
-    const eo = found_end orelse return out;
-    // Presence byte: differs between null and set, is stable across two
-    // nulls (excludes poisoned padding), and lies outside the payload.
-    var tag: ?u32 = null;
-    i = 0;
-    while (i < N) : (i += 1) {
-        if (p1[i] != p2[i]) continue;
-        if ((i >= fo and i < fo + 4) or (i >= so and i < so + 4) or (i >= eo and i < eo + 4)) continue;
-        if (p1[i] != ps[i]) {
-            if (tag != null) return out; // ambiguous: decline
-            tag = i;
-        }
-    }
-    const to = tag orelse return out;
-    out.file_off = fo;
-    out.start_off = so;
-    out.end_off = eo;
-    out.tag_off = to;
-    out.tag_set = ps[to];
-    out.usable = 1;
-    return out;
+fn objViewOff() bool {
+    const v = std.c.getenv("KLIO_OBJVIEW") orelse return false;
+    return std.mem.span(v).len != 0 and std.mem.span(v)[0] == '0';
 }
 
 export fn klio_rt_hot_layout(out: *HotLayout) void {
     if (std.c.getenv("KLIO_NATIVE_TRACE") != null) std.debug.print("[rt] hot_layout enter out=0x{x}\n", .{@intFromPtr(out)});
-    const t = tagOffset();
-    if (std.c.getenv("KLIO_NATIVE_TRACE") != null) std.debug.print("[rt] tagOffset off={d} size={d}\n", .{ t.off, t.size });
-    var vi: runtime.Value = undefined;
-    var vl: runtime.Value = undefined;
-    var vb: runtime.Value = undefined;
-    var vu: runtime.Value = undefined;
-    var vc: runtime.Value = undefined;
-    @memset(std.mem.asBytes(&vi), 0);
-    @memset(std.mem.asBytes(&vl), 0);
-    @memset(std.mem.asBytes(&vb), 0);
-    @memset(std.mem.asBytes(&vu), 0);
-    @memset(std.mem.asBytes(&vc), 0);
-    vi = .{ .Int = 0 };
-    vl = .{ .Long = 0 };
-    vb = .{ .Bool = false };
-    vu = .{ .Unit = {} };
-    vc = .{ .Char = 0 };
-    const sp = spanProbe();
-    out.* = .{
-        .value_size = @sizeOf(runtime.Value),
-        .tag_off = t.off,
-        .tag_size = t.size,
-        .int_off = @intCast(@intFromPtr(&vi.Int) - @intFromPtr(&vi)),
-        .long_off = @intCast(@intFromPtr(&vl.Long) - @intFromPtr(&vl)),
-        .bool_off = @intCast(@intFromPtr(&vb.Bool) - @intFromPtr(&vb)),
-        .tag_int = readTag(&vi, t.off, t.size),
-        .tag_long = readTag(&vl, t.off, t.size),
-        .tag_bool = readTag(&vb, t.off, t.size),
-        .tag_unit = readTag(&vu, t.off, t.size),
-        // The run path turns per-thread reclaim OFF unless the process
-        // explicitly requested a reclaim mode (KLIO_RECLAIM); the live
-        // flag is not yet set on this thread when the slot fills, so the
-        // request is the decision that matters.
-        .usable = @intFromBool(!runtime.reclaimRequested()),
-        // The trace store has no ownership semantics, so span inlining
-        // only needs the probe to have succeeded — any reclaim mode.
-        .span_usable = sp.usable,
-        .span_file_off = sp.file_off,
-        .span_start_off = sp.start_off,
-        .span_end_off = sp.end_off,
-        .span_tag_off = sp.tag_off,
-        .span_tag_set = sp.tag_set,
-        .char_off = @intCast(@intFromPtr(&vc.Char) - @intFromPtr(&vc)),
-        .tag_char = readTag(&vc, t.off, t.size),
-    };
+    ir.hot_layout.fillLayout(out);
+    // Policy gates on top of the pure layout probe: the run path turns
+    // per-thread reclaim OFF unless the process explicitly requested a
+    // reclaim mode (KLIO_RECLAIM); the live flag is not yet set on this
+    // thread when the slot fills, so the request is the decision that
+    // matters. The object view additionally honors KLIO_OBJVIEW=0 for
+    // single-binary A/B.
+    if (runtime.reclaimRequested()) {
+        out.usable = 0;
+        out.obj_usable = 0;
+    }
+    if (objViewOff()) out.obj_usable = 0;
     if (std.c.getenv("KLIO_NATIVE_TRACE") != null)
         std.debug.print("[rt] wrote usable={d} vsize={d} (sizeOf={d}) reclaimReq={}\n", .{ out.usable, out.value_size, @sizeOf(runtime.Value), runtime.reclaimRequested() });
 }
 
 /// Library version tag for the header/link handshake.
 export fn klio_rt_abi_version() c_int {
-    return 4;
+    return 5;
 }
 
 /// Register a transpiled function for `fid`; the interpreter's frame loop
@@ -364,6 +213,22 @@ export fn klio_op_cell_get(ctx: *anyopaque, dst: u32, cell: u32) void {
 
 export fn klio_op_bin(ctx: *anyopaque, block: u32, inst_idx: u32, kind: u32, dst: u32, lhs: u32, rhs: u32) i32 {
     return eval.nativeOpBin(ctxOf(ctx), block, inst_idx, kind, dst, lhs, rhs);
+}
+
+/// The GC write barrier for a cell the emitted C is about to store a Value
+/// into. A stored field can hold a reference, so the containing cell must be
+/// remembered exactly as the interpreter's own store does it.
+export fn klio_rt_write_barrier(cell: *anyopaque) void {
+    const c: *runtime.ObjRef(runtime.InstanceData).Cell = @ptrCast(@alignCast(cell));
+    runtime.gc.writeBarrier(&c.hdr);
+}
+
+export fn klio_op_field_route(ctx: *anyopaque, block: u32, inst_idx: u32, cls_out: *u64, slot_out: *i32) i32 {
+    return eval.nativeOpFieldRoute(ctxOf(ctx), block, inst_idx, cls_out, slot_out);
+}
+
+export fn klio_op_field_write_route(ctx: *anyopaque, block: u32, inst_idx: u32, cls_out: *u64, slot_out: *i32) i32 {
+    return eval.nativeOpFieldWriteRoute(ctxOf(ctx), block, inst_idx, cls_out, slot_out);
 }
 
 export fn klio_op_escape(ctx: *anyopaque, block: u32, inst_idx: u32) i32 {

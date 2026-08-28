@@ -9965,6 +9965,10 @@ const TL_METHOD_CACHE_SIZE = 2048;
 /// the generation at each program boundary; entries from an older
 /// generation never hit.
 pub var dispatch_cache_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
+pub fn dispatchCacheGen() u32 {
+    return dispatch_cache_gen.load(.monotonic);
+}
+
 pub fn bumpDispatchCacheGen() void {
     _ = dispatch_cache_gen.fetchAdd(1, .monotonic);
 }
@@ -11890,9 +11894,19 @@ fn serveCachedMemberExt(self: *VmHost, allocator: Allocator, receiver: *const Va
     return r;
 }
 
+pub fn extFbCounts() [4]u64 {
+    return .{ ext_fb_total, ext_fb_plain_hit, ext_fb_chain_hit, ext_fb_walk };
+}
+
+pub var ext_fb_total: u64 = 0;
+pub var ext_fb_plain_hit: u64 = 0;
+pub var ext_fb_chain_hit: u64 = 0;
+pub var ext_fb_walk: u64 = 0;
+
 fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
 
     runtime.prof.opRoute(3);
+    ext_fb_total += 1;
     var cache_key: ?root_mod.ProgramImage.InstanceMethodKey =
         instanceMethodKeyScoped(self, receiver, name, args, static_recv, declared_recv);
     if (cache_key != null and strict_ext) {
@@ -11901,6 +11915,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     }
     if (cache_key) |k| {
         if (extMethodCacheGet(self, k)) |fid| {
+            ext_fb_plain_hit += 1;
             if (fid == METHOD_MISS) return null;
             if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
         }
@@ -11919,6 +11934,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     };
     if (chain_key) |k| {
         if (extMethodCacheGet(self, k)) |fid| {
+            ext_fb_chain_hit += 1;
             if (fid == METHOD_MISS) return null;
             const f: FuncId = @enumFromInt(fid);
             if (isMemberExtFid(self, f)) {
@@ -11930,6 +11946,7 @@ fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
     if (runtime.envSetOnce("KLIO_WALK_TRACE")) {
         std.debug.print("[extfb-walk] {s} on {s} strict={} static={s} keyed={}\n", .{ name, receiver.typeFqn(), strict_ext, static_recv orelse "-", cache_key != null });
     }
+    ext_fb_walk += 1;
     const r = try extensionFnFallbackWalk(self, allocator, receiver, name, args, strict_ext, static_recv, declared_recv, cache_key, chain_key, &saw_member_ext);
     if (r == null) {
         if (!saw_member_ext) {

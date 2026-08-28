@@ -163,7 +163,14 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     // is (slow) rather than what it is not (stuck). The budget is a ratchet —
     // it must only shrink as the recomposition path gets faster, and
     // exceeding it still fails.
-    try map.put("KLIO_TEST_WALL_CAP_FOR", "validatePotentialDeadlock=900");
+    // Two more measured-slow, not-stuck tests: `resumeOnBackgroundThread`
+    // resumes 1000 pausable chunks one cross-thread round-trip at a time
+    // (~40-55s solo, 25/25) and the frame-clock test is a timing test; under
+    // 8-way contention both cross the 90s hang window while still passing.
+    try map.put(
+        "KLIO_TEST_WALL_CAP_FOR",
+        "validatePotentialDeadlock=645,resumeOnBackgroundThread=300,pausingTheFrameClockStopShouldBlockWithFrameNanos=300",
+    );
     // Four children each defaulting to a half-the-cores compute pool
     // oversubscribe the box 2x and inflate the concurrent classes'
     // walls 3-8x. Cap each child so the children together match the
@@ -437,13 +444,65 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     }
 
     var jobs: std.ArrayList([]const []const u8) = .empty;
+    // Longest-first: the wall is the slowest child, so a class known to run
+    // for minutes (RecomposerTests carries the ~724s
+    // `validatePotentialDeadlock`) must start with the first worker, not be
+    // picked up near the end where nothing overlaps it.
+    for (classes.items, 0..) |cls, ci| {
+        if (std.mem.indexOf(u8, cls, "RecomposerTests") != null and ci != 0) {
+            const first = classes.items[0];
+            classes.items[0] = classes.items[ci];
+            classes.items[ci] = first;
+            break;
+        }
+    }
+    var job_names: std.ArrayList([]const u8) = .empty;
     for (classes.items) |cls| {
+        // `validatePotentialDeadlock` IS the suite wall (~500s solo), and the
+        // rest of RecomposerTests queued behind it in the same child pushed
+        // the wall past 750s. The test gets its own child, scheduled first;
+        // the class's remainder runs as a separate job that overlaps it.
+        // Both children compile a TRIMMED source set — the full set costs
+        // ~180s of lowering per child, which sat inside the wall. The trim
+        // is the class file plus the same-package files whose helpers it
+        // reaches without imports (`Trigger` in EffectsTests,
+        // `TestSubcomposition` in CompositionTests); an unlisted helper
+        // fails loudly as an unresolved global, never silently.
+        if (std.mem.eql(u8, cls, "RecomposerTests")) {
+            var trimmed: std.ArrayList([]const u8) = .empty;
+            for (sources.items) |src| {
+                const in_test_dirs =
+                    std.mem.indexOf(u8, src, "/commonTest/") != null or
+                    std.mem.indexOf(u8, src, "/nonEmulatorCommonTest/") != null;
+                const keep = !in_test_dirs or
+                    std.mem.endsWith(u8, src, "/RecomposerTests.kt") or
+                    std.mem.endsWith(u8, src, "/EffectsTests.kt") or
+                    std.mem.endsWith(u8, src, "/CompositionTests.kt");
+                if (keep) try trimmed.append(a, src);
+            }
+            var solo: std.ArrayList([]const u8) = .empty;
+            try solo.append(a, klioBin(&env));
+            try solo.append(a, "test");
+            try solo.appendSlice(a, trimmed.items);
+            try solo.append(a, "--filter=RecomposerTests.validatePotentialDeadlock");
+            try jobs.append(a, try solo.toOwnedSlice(a));
+            try job_names.append(a, "RecomposerTests.validatePotentialDeadlock");
+            var rest: std.ArrayList([]const u8) = .empty;
+            try rest.append(a, klioBin(&env));
+            try rest.append(a, "test");
+            try rest.appendSlice(a, trimmed.items);
+            try rest.append(a, "--filter=RecomposerTests,!validatePotentialDeadlock");
+            try jobs.append(a, try rest.toOwnedSlice(a));
+            try job_names.append(a, "RecomposerTests-rest");
+            continue;
+        }
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, klioBin(&env));
         try argv.append(a, "test");
         try argv.appendSlice(a, sources.items);
         try argv.append(a, try std.fmt.allocPrint(a, "--filter={s}", .{cls}));
         try jobs.append(a, try argv.toOwnedSlice(a));
+        try job_names.append(a, cls);
     }
 
     var next = std.atomic.Value(usize).init(0);
@@ -483,6 +542,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                     1_200_000
                 else
                     480_000;
+                const child_t0 = runtime.clockMonotonicNanos();
                 const r = runKlio(arena.allocator(), penv, queue[i], class_cap_ms) catch {
                     _ = phung.fetchAdd(1, .monotonic);
                     // Name it. "2 did not complete" is not actionable; the
@@ -494,6 +554,9 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                 // A completed run counts its end-of-run summary; a killed
                 // run's summary never printed, so its streamed per-test
                 // lines carry the count — only the wedged test is lost.
+                std.debug.print("compose_plugin_commontest: [child-wall] {s} {d}s\n", .{
+                    names[i], @divTrunc(runtime.clockMonotonicNanos() - child_t0, std.time.ns_per_s),
+                });
                 const summary_count = passedLineCount(r.stdout);
                 const n_passed = if (summary_count != 0) summary_count else streamedPassedCount(r.stderr);
                 _ = ppassed.fetchAdd(n_passed, .monotonic);
@@ -514,7 +577,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     for (0..workerCount()) |_| {
         try threads.append(a, try std.Thread.spawn(.{}, Pool.worker, .{
             @as([]const []const []const u8, jobs.items),
-            @as([]const []const u8, classes.items),
+            @as([]const []const u8, job_names.items),
             &env,
             &next,
             &total_passed,

@@ -37,6 +37,27 @@ typedef struct {
   /* Char payload location + tag, for fused loops over Char scalars. */
   uint32_t char_off;
   uint64_t tag_char;
+  /* Object view: enough of the Instance layout for an inline stored-field
+     read behind a class guard. obj_usable == 0 keeps field reads on the
+     escape helper. */
+  uint8_t obj_usable;
+  uint64_t tag_instance;
+  uint32_t inst_ptr_off;
+  uint32_t cell_data_off;
+  uint32_t inst_class_off;
+  uint32_t inst_fields_off;
+  uint32_t fields_ptr_off;
+  uint32_t fields_len_off;
+  uint32_t field_stride;
+  uint32_t field_value_off;
+  /* Array view: an IntArray element read. arr_prim_int_word is the probed
+     byte pattern that means "primitive Int storage". */
+  uint64_t tag_array;
+  uint32_t arr_cell_off;
+  uint32_t arr_prim_off;
+  uint64_t arr_prim_int_word;
+  uint32_t primbuf_ptr_off;
+  uint32_t primbuf_len_off;
 } klio_hot_layout;
 void klio_rt_hot_layout(klio_hot_layout *out);
 
@@ -66,7 +87,15 @@ uint8_t *klio_op_span_slot(void *ctx);
  * `usable`) is chosen. Call before klio_rt_run_*. */
 void klio_rt_register_hot_layout(klio_hot_layout *slot);
 
-/* The library's ABI version (this header describes version 4). */
+/* Registers the generated file's EMIT-TIME copy of the layout, whose
+ * values its inline fast paths carry as compile-time constants. The run
+ * entries verify it against the live fill; on any mismatch the whole hot
+ * view is disabled (usable/obj_usable/span_usable forced 0) so the
+ * generated code falls back to the exported helpers instead of reading
+ * through wrong offsets. Call before klio_rt_run_*. */
+void klio_rt_register_hot_frozen(const klio_hot_layout *frozen);
+
+/* The library's ABI version (this header describes version 5). */
 int klio_rt_abi_version(void);
 
 /* A transpiled function body: runs the function's blocks starting at
@@ -106,6 +135,15 @@ void    klio_op_load_param(void *ctx, uint32_t dst, uint32_t idx);
 void    klio_op_cell_get(void *ctx, uint32_t dst, uint32_t cell);
 int32_t klio_op_bin(void *ctx, uint32_t block, uint32_t inst_idx, uint32_t kind, uint32_t dst, uint32_t lhs, uint32_t rhs);
 int32_t klio_op_escape(void *ctx, uint32_t block, uint32_t inst_idx);
+/* Resolve a GetField site to (class identity, stored slot) for the receiver
+   currently in its register. 0 means the site is not a plain stored read. */
+/* GC write barrier for a cell about to receive a Value store. */
+void klio_rt_write_barrier(void *cell);
+int32_t klio_op_field_route(void *ctx, uint32_t block, uint32_t inst_idx,
+                            uint64_t *cls_out, int32_t *slot_out);
+/* The same verdict for a SetField site (from the interpreter's write memo). */
+int32_t klio_op_field_write_route(void *ctx, uint32_t block, uint32_t inst_idx,
+                                  uint64_t *cls_out, int32_t *slot_out);
 int32_t klio_op_call(void *ctx, uint32_t block, uint32_t inst_idx);
 
 /* Scalar-replay leaf body: the whole function over (int64 value, genre)

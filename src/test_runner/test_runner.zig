@@ -150,18 +150,52 @@ fn fileSelected(only_fids: []const u32, fid: u32) bool {
 /// name (a top-level `method`, or a class's `Class`) contains any of the
 /// comma-separated substrings. A token beginning with `=` matches the entire
 /// display name, which the isolated runner uses to avoid prefix collisions.
+/// A token beginning with `!` EXCLUDES matching names regardless of the
+/// positive tokens — `Recomposer,!validatePotentialDeadlock` runs a class
+/// minus one test, which is how a suite carves its longest test into its
+/// own child.
 fn filterMatches(filter: ?[]const u8, name: []const u8) bool {
     const pat = filter orelse return true;
+    var any_pos = false;
+    var pos_hit = false;
     var it = std.mem.splitScalar(u8, pat, ',');
     while (it.next()) |p| {
         if (p.len == 0) continue;
+        if (p[0] == '!') {
+            if (p.len > 1 and std.mem.indexOf(u8, name, p[1..]) != null) return false;
+            continue;
+        }
+        any_pos = true;
         if (p[0] == '=') {
-            if (std.mem.eql(u8, name, p[1..])) return true;
+            if (std.mem.eql(u8, name, p[1..])) pos_hit = true;
         } else if (std.mem.indexOf(u8, name, p) != null) {
-            return true;
+            pos_hit = true;
         }
     }
+    return !any_pos or pos_hit;
+}
+
+fn filterHasNegation(filter: ?[]const u8) bool {
+    const pat = filter orelse return false;
+    var it = std.mem.splitScalar(u8, pat, ',');
+    while (it.next()) |p| {
+        if (p.len > 1 and p[0] == '!') return true;
+    }
     return false;
+}
+
+test "filterMatches negation carves one test out of a class" {
+    try std.testing.expect(filterMatches("Recomposer,!validatePotentialDeadlock", "RecomposerTests"));
+    try std.testing.expect(!filterMatches(
+        "Recomposer,!validatePotentialDeadlock",
+        "RecomposerTests.validatePotentialDeadlock",
+    ));
+    try std.testing.expect(filterMatches(
+        "Recomposer,!validatePotentialDeadlock",
+        "RecomposerTests.recomposesWhenStateChanges",
+    ));
+    try std.testing.expect(!filterMatches("!Snapshot", "SnapshotStateMapTests"));
+    try std.testing.expect(filterMatches("!Snapshot", "RecomposerTests"));
 }
 
 fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.KotlinFile, only_fids: []const u32, filter: ?[]const u8) Allocator.Error!Plan {
@@ -290,7 +324,7 @@ fn discoverClass(
     // only the methods whose `Class.method` display matches (a class whose
     // name matches keeps all its methods). Dropped methods are freed here.
     if (filter) |pat| {
-        if (!filterMatches(pat, c.name.name)) {
+        if (!filterMatches(pat, c.name.name) or filterHasNegation(pat)) {
             var kept: usize = 0;
             for (methods.items) |m| {
                 if (filterMatches(pat, m.display)) {

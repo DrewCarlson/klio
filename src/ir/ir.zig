@@ -1261,6 +1261,9 @@ pub const Func = struct {
     /// Host-served static routing memo (snapshot_fast): 0 = unasked,
     /// then a `snapshot_fast.Route` value.
     host_route: u8 = 0,
+    /// Compose fast-path verdict for this body (`compose_fast.Route`),
+    /// classified once on first execution like `host_route`.
+    compose_route: u8 = 0,
     /// Cached `frameNoFill` verdict: 0 = unasked, 1 = must fill,
     /// 2 = register file may start unfilled.
     frame_fill_state: u8 = 0,
@@ -1441,6 +1444,11 @@ pub const Func = struct {
             2, 3 => return true,
             else => {},
         }
+        // A DEFERRED body carries no blocks until the image section decodes
+        // it. Classifying one here would cache "not a leaf" for a function
+        // that becomes a leaf the moment it loads, which is how `Stack.isEmpty`
+        // and every other tiny library accessor lost the frameless tier.
+        if (self.blocks.len == 0) return false;
         const verdict = self.classifyLeafExprBody();
         @constCast(self).leaf_state = if (!verdict)
             1
@@ -1522,7 +1530,7 @@ pub const Func = struct {
     }
 
     fn frameDefBeforeUse(self: *const Func) bool {
-        if (self.n_locals > 64) return false;
+        if (self.n_locals > FRAME_FILL_MAX_REGS) return false;
         const nb = self.blocks.len;
         if (nb == 0 or nb > FRAME_FILL_MAX_BLOCKS) return false;
         const entry_idx = self.entry.int();
@@ -1531,17 +1539,16 @@ pub const Func = struct {
             if (b.catches.len != 0 or b.finally != null or b.lr_absorb != null) return false;
         }
         const Ctx = struct {
-            uses: u64 = 0,
-            defs: u64 = 0,
+            uses: RegSet = regSetEmpty(),
+            defs: RegSet = regSetEmpty(),
             oob: bool = false,
             fn visit(c: *@This(), reg: Reg, is_def: bool) void {
                 const r = reg.int();
-                if (r >= 64) {
+                if (r >= FRAME_FILL_MAX_REGS) {
                     c.oob = true;
                     return;
                 }
-                const bit = @as(u64, 1) << @intCast(r);
-                if (is_def) c.defs |= bit else c.uses |= bit;
+                if (is_def) regSetSet(&c.defs, r) else regSetSet(&c.uses, r);
             }
         };
         // Per-block summary: `gen` = registers the block writes, `exposed` =
@@ -1554,8 +1561,8 @@ pub const Func = struct {
         const gen = &frame_fill_scratch[0];
         const exposed = &frame_fill_scratch[1];
         for (self.blocks, 0..) |*b, bi| {
-            var written: u64 = 0;
-            var expo: u64 = 0;
+            var written: RegSet = regSetEmpty();
+            var expo: RegSet = regSetEmpty();
             for (b.insts) |*inst| {
                 // `CtxScope.ctx_args` is a contiguous run of `n_ctx`
                 // registers, but the register visitor's run convention
@@ -1566,14 +1573,14 @@ pub const Func = struct {
                 var c: Ctx = .{};
                 visitInstRegs(inst, &c, Ctx.visit);
                 if (c.oob) return false;
-                expo |= c.uses & ~written;
-                written |= c.defs;
+                regSetOrAndNot(&expo, c.uses, written);
+                regSetOr(&written, c.defs);
             }
             var c: Ctx = .{};
             visitTerminatorRegs(&b.terminator, &c, Ctx.visit);
             if (c.oob) return false;
-            expo |= c.uses & ~written;
-            written |= c.defs;
+            regSetOrAndNot(&expo, c.uses, written);
+            regSetOr(&written, c.defs);
             gen[bi] = written;
             exposed[bi] = expo;
         }
@@ -1582,45 +1589,34 @@ pub const Func = struct {
         // the register file, so it contributes no edge (the entry's in-set
         // is pinned empty anyway); `TailCallFunc` leaves the function.
         const in = &frame_fill_scratch[2];
-        for (0..nb) |bi| in[bi] = ~@as(u64, 0);
-        in[entry_idx] = 0;
+        for (0..nb) |bi| in[bi] = regSetFull();
+        in[entry_idx] = regSetEmpty();
         var rounds: usize = 0;
         while (rounds < nb + 8) : (rounds += 1) {
             var changed = false;
             for (self.blocks, 0..) |*b, bi| {
-                const out = in[bi] | gen[bi];
+                var out = in[bi];
+                regSetOr(&out, gen[bi]);
                 switch (b.terminator) {
                     .Goto => |t| {
                         if (t.int() >= nb) return false;
-                        if (t.int() != entry_idx and in[t.int()] & out != in[t.int()]) {
-                            in[t.int()] &= out;
-                            changed = true;
-                        }
+                        if (t.int() != entry_idx and regSetAndInto(&in[t.int()], out)) changed = true;
                     },
                     .Branch => |br| {
                         for ([2]BlockId{ br.t, br.f }) |t| {
                             if (t.int() >= nb) return false;
-                            if (t.int() != entry_idx and in[t.int()] & out != in[t.int()]) {
-                                in[t.int()] &= out;
-                                changed = true;
-                            }
+                            if (t.int() != entry_idx and regSetAndInto(&in[t.int()], out)) changed = true;
                         }
                     },
                     .Switch => |sw| {
                         for (sw.arms) |arm| {
                             const t = arm.target;
                             if (t.int() >= nb) return false;
-                            if (t.int() != entry_idx and in[t.int()] & out != in[t.int()]) {
-                                in[t.int()] &= out;
-                                changed = true;
-                            }
+                            if (t.int() != entry_idx and regSetAndInto(&in[t.int()], out)) changed = true;
                         }
                         const t = sw.default;
                         if (t.int() >= nb) return false;
-                        if (t.int() != entry_idx and in[t.int()] & out != in[t.int()]) {
-                            in[t.int()] &= out;
-                            changed = true;
-                        }
+                        if (t.int() != entry_idx and regSetAndInto(&in[t.int()], out)) changed = true;
                     },
                     .Return, .Throw, .Unreachable, .TailJump, .TailCallFunc, .NonLocalReturn, .LabeledReturn => {},
                 }
@@ -1628,7 +1624,7 @@ pub const Func = struct {
             if (!changed) break;
         } else return false;
         for (0..nb) |bi| {
-            if (exposed[bi] & ~in[bi] != 0) return false;
+            if (regSetAnyOutside(exposed[bi], in[bi])) return false;
         }
         return true;
     }
@@ -1681,10 +1677,55 @@ pub const LEAF_MAX_REGS: u32 = 64;
 /// buffers, and a body past this many blocks keeps the eager fill.
 const FRAME_FILL_MAX_BLOCKS: usize = 256;
 
+/// Register-set width for `frameDefBeforeUse`, in 64-bit words. Compose's
+/// composables and slot-table walkers run 70-500 locals (`GapComposer.end`
+/// alone carries 502); capping the analysis at one word sent every one of
+/// them to the eager fill.
+pub const FRAME_FILL_WORDS: usize = 8;
+pub const FRAME_FILL_MAX_REGS: u32 = FRAME_FILL_WORDS * 64;
+
+const RegSet = [FRAME_FILL_WORDS]u64;
+
+inline fn regSetEmpty() RegSet {
+    return @splat(0);
+}
+inline fn regSetFull() RegSet {
+    return @splat(~@as(u64, 0));
+}
+inline fn regSetHas(a: RegSet, i: usize) bool {
+    return (a[i >> 6] >> @as(u6, @truncate(i))) & 1 != 0;
+}
+inline fn regSetSet(a: *RegSet, i: usize) void {
+    a[i >> 6] |= @as(u64, 1) << @as(u6, @truncate(i));
+}
+inline fn regSetOrAndNot(dst: *RegSet, x: RegSet, notted: RegSet) void {
+    for (dst, x, notted) |*d, xv, nv| d.* |= xv & ~nv;
+}
+inline fn regSetOr(dst: *RegSet, x: RegSet) void {
+    for (dst, x) |*d, xv| d.* |= xv;
+}
+inline fn regSetAndInto(dst: *RegSet, x: RegSet) bool {
+    var changed = false;
+    for (dst, x) |*d, xv| {
+        const nv = d.* & xv;
+        if (nv != d.*) {
+            d.* = nv;
+            changed = true;
+        }
+    }
+    return changed;
+}
+inline fn regSetAnyOutside(a: RegSet, b: RegSet) bool {
+    for (a, b) |av, bv| {
+        if (av & ~bv != 0) return true;
+    }
+    return false;
+}
+
 /// `frameDefBeforeUse` scratch (gen / exposed / in). Thread-local so the
 /// once-per-func analysis never pays the safe builds' stack poisoning, and
 /// concurrent first-asks on different threads stay independent.
-threadlocal var frame_fill_scratch: [3][FRAME_FILL_MAX_BLOCKS]u64 = undefined;
+threadlocal var frame_fill_scratch: [3][FRAME_FILL_MAX_BLOCKS]RegSet = undefined;
 pub const LEAF_MAX_INSTS: usize = 96;
 pub const LEAF_MAX_BLOCKS: usize = 32;
 pub const LEAF_MAX_STEPS: usize = 160;

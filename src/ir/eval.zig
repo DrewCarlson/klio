@@ -521,7 +521,20 @@ fn classifyFlattenable(f: *const Func) u8 {
 /// guarded decrement went negative). Callers therefore pass `&evtls` read
 /// fresh at the call, never a stored pointer — which also keeps the thread
 /// pointer to one lookup per frame operation instead of one per pool.
-fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32, no_fill: bool) Allocator.Error!std.ArrayList(Value) {
+/// Per-function eager-fill census (`KLIO_FRAME_CENSUS`): which bodies still
+/// pay the whole register bank on every call.
+var fill_census: [FRAME_CENSUS_SLOTS]u32 = @splat(0);
+
+pub fn fillCensusBump(fid: u32, n: u32) void {
+    if (!frame_census_on) return;
+    fill_census[fid & (FRAME_CENSUS_SLOTS - 1)] +%= n;
+}
+
+pub var regs_pool_hit: u64 = 0;
+pub var regs_pool_miss: u64 = 0;
+pub var regs_fill_slots: u64 = 0;
+
+fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32, no_fill: bool, fid: u32) Allocator.Error!std.ArrayList(Value) {
     if (frame_count_on) frame_alloc_total += 1;
     const ra = regsAlloc(allocator);
     if (ev.regs_pool.items.len > 0) {
@@ -532,9 +545,23 @@ fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32, no_fill: bool) Alloca
             // A no-fill frame keeps whatever the pooled buffer last held;
             // its written mask keeps every reader away from those slots.
             if (!no_fill) @memset(list.items, .Unit);
+            if (frame_count_on) {
+                regs_pool_hit += 1;
+                if (!no_fill) {
+                    regs_fill_slots += n;
+                    fillCensusBump(fid, n);
+                }
+            }
             // Re-enters the traced set (see releaseRegs).
             if (runtime.gc.gc_enabled and !runtime.reclaimEnabled() and runtime.gc.external_accounting) runtime.gc.noteExternalBytes(buf.len * @sizeOf(Value));
             return list;
+        }
+    }
+    if (frame_count_on) {
+        regs_pool_miss += 1;
+        if (!no_fill) {
+            regs_fill_slots += n;
+            fillCensusBump(fid, n);
         }
     }
     var regs: std.ArrayList(Value) = .empty;
@@ -780,12 +807,12 @@ inline fn gcPopFrame(f: *Frame) void {
 /// carried and must never reach the collector.
 fn gcMarkFrameRegs(f: *const Frame, m: *runtime.gc.Marker) void {
     const mask = f.wmask;
-    if (mask == ~@as(u64, 0)) {
+    if (mask.isAll()) {
         for (f.regs.items) |v| v.gcMark(m);
         return;
     }
     for (f.regs.items, 0..) |v, i| {
-        if ((mask >> @as(u6, @truncate(i))) & 1 != 0) v.gcMark(m);
+        if (mask.has(i)) v.gcMark(m);
     }
 }
 
@@ -1381,7 +1408,18 @@ pub fn dispatchNote(comptime k: DispatchKind) void {
 /// counts the ROUTE a call took, not the work it did, so the two differ.
 pub var dispatch_replay_hits: ?*const fn () u64 = null;
 
+/// Set by the host so the dispatch report can name how the member-extension
+/// fallback resolved: a plain-key hit, a chain-folded hit, or a full walk.
+pub var ext_fb_counts: ?*const fn () [4]u64 = null;
+
 pub fn dispatchStatsDump() void {
+    if (ext_fb_counts) |f| {
+        const c = f();
+        if (c[0] != 0) std.debug.print(
+            "[ext-fb] total={d} plain-hit={d} chain-hit={d} walk={d}\n",
+            .{ c[0], c[1], c[2], c[3] },
+        );
+    }
     if (dispatch_stats_state != 2) return;
     var total: u64 = 0;
     for (&dispatch_counts) |*c| total += c.load(.monotonic);
@@ -1452,9 +1490,39 @@ inline fn frameCensusBump(fid: u32) void {
     frame_census[fid & (FRAME_CENSUS_SLOTS - 1)] +%= 1;
 }
 
+/// Executed-instruction total (`KLIO_FRAME_COUNT` prints it): the denominator
+/// that turns a sampled opcode profile into a per-instruction cost.
+pub threadlocal var inst_count: u64 = 0;
+pub var inst_count_all: std.atomic.Value(u64) = .init(0);
+
 pub fn frameCountDump(module: *const Module) void {
     if (!frame_count_on) return;
-    std.debug.print("[frames] entries={d} activations={d}\n", .{ frame_count_total, frame_alloc_total });
+    std.debug.print("[frames] entries={d} activations={d} insts={d}\n", .{ frame_count_total, frame_alloc_total, inst_count_all.load(.monotonic) + inst_count });
+    std.debug.print("[call] pre_ms={d} args_ms={d} replay_ms={d} prep_ms={d} probe_ms={d}\n", .{ cm_pre_ns / 1_000_000, cm_args_ns / 1_000_000, cm_replay_ns / 1_000_000, cm_prep_ns / 1_000_000, cm_probe_ns / 1_000_000 });
+    std.debug.print("[call] member_arms={d}\n", .{cm_calls});
+    std.debug.print("[regs] pool_hit={d} pool_miss={d} filled_slots={d}\n", .{ regs_pool_hit, regs_pool_miss, regs_fill_slots });
+    if (frame_census_on) {
+        const FE = struct { name: []const u8, n: u32 };
+        var fl: std.ArrayList(FE) = .empty;
+        defer fl.deinit(std.heap.page_allocator);
+        var fid: u32 = 0;
+        while (fid < fill_census.len) : (fid += 1) {
+            const n = fill_census[fid];
+            if (n == 0) continue;
+            const f = module.funcById(@enumFromInt(fid));
+            const nm: []const u8 = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "<unknown>";
+            fl.append(std.heap.page_allocator, .{ .name = nm, .n = n }) catch break;
+        }
+        std.mem.sort(FE, fl.items, {}, struct {
+            fn gt(_: void, a: FE, b: FE) bool {
+                return a.n > b.n;
+            }
+        }.gt);
+        for (fl.items[0..@min(fl.items.len, 12)]) |e| {
+            std.debug.print("[fill] {d:>10} {s}\n", .{ e.n, e.name });
+        }
+    }
+    std.debug.print("[getfield] mono={d} getter={d} poly={d} total={d} getter_ms={d} slow_ms={d}\n", .{ gf_mono, gf_getter, gf_poly, gf_slow, gf_getter_ns / 1_000_000, gf_slow_ns / 1_000_000 });
     if (!frame_census_on) return;
     const Entry = struct { name: []const u8, n: u32 };
     var list: std.ArrayList(Entry) = .empty;
@@ -1476,6 +1544,17 @@ pub fn frameCountDump(module: *const Module) void {
     for (list.items[0..top]) |e| std.debug.print("[frames] {d:>9} {s}\n", .{ e.n, e.name });
 }
 
+/// The first source span an emitted body carries, for naming an anonymous
+/// function in a profile.
+fn funcFirstSpan(f: *const ir.Func) ?ir.Span {
+    for (f.blocks) |*b| {
+        for (b.insts) |*inst| {
+            if (inst.* == .Trace) return inst.Trace.span;
+        }
+    }
+    return null;
+}
+
 pub fn fnProfDump(module: *const Module) void {
     const counts = runtime.prof.fnProfCounts() orelse return;
     const Entry = struct { name: []const u8, n: u32 };
@@ -1488,7 +1567,29 @@ pub fn fnProfDump(module: *const Module) void {
         if (n == 0) continue;
         total += n;
         const f = module.funcById(@enumFromInt(fid));
-        const nm: []const u8 = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "<unknown>";
+        var nm: []const u8 = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "<unknown>";
+        // A lambda's name says nothing; every one of them reads `<lambda>` and
+        // the whole population lands in one bucket. Name it by id and its
+        // source position, which is what makes a hot one findable.
+        if (f) |ff| {
+            if (std.mem.eql(u8, nm, "<lambda>")) {
+                const buf = std.heap.page_allocator.alloc(u8, 160) catch return;
+                var site: []const u8 = "";
+                var site_buf: [96]u8 = undefined;
+                if (ff.blocks.len != 0 and ff.blocks[0].insts.len != 0) {
+                    if (funcFirstSpan(ff)) |sp| {
+                        if (span.active_map) |am| {
+                            if (am.getChecked(sp.file)) |sf| {
+                                const lc = sf.lineCol(sp.start);
+                                const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |ix| sf.path[ix + 1 ..] else sf.path;
+                                site = std.fmt.bufPrint(&site_buf, " {s}:{d}", .{ base, lc.line }) catch "";
+                            }
+                        }
+                    }
+                }
+                nm = std.fmt.bufPrint(buf, "<lambda>#{d}{s}", .{ fid, site }) catch nm;
+            }
+        }
         list.append(std.heap.page_allocator, .{ .name = nm, .n = n }) catch return;
     }
     if (total == 0) return;
@@ -1654,7 +1755,7 @@ fn spinDumpMaybe() void {
             const n = @min(f0.regs.items.len, 60);
             std.debug.print("  [regs#{d} {s}]", .{ fi, f0.func.name });
             for (f0.regs.items[0..n], 0..) |*v, i| {
-                if ((f0.wmask >> @as(u6, @truncate(i))) & 1 == 0) continue;
+                if (!f0.wmask.has(i)) continue;
                 switch (v.*) {
                     .Int => |x| std.debug.print(" r{d}=i{d}", .{ i, x }),
                     .Long => |x| std.debug.print(" r{d}=L{d}", .{ i, x }),
@@ -2997,6 +3098,43 @@ fn freeSnapshotBuffers(snap: FrameSnapshot, allocator: Allocator) void {
 }
 
 /// Per-call evaluation frame.
+/// Which register slots a frame has actually written. A no-fill frame keeps
+/// whatever its pooled buffer last held, so the collector — and any consumer
+/// that materializes the file — must know which slots are live. Four words
+/// cover every frame the def-before-use analysis admits.
+pub const RegMask = struct {
+    pub const WORDS = ir.FRAME_FILL_WORDS;
+    pub const CAP: usize = WORDS * 64;
+
+    w: [WORDS]u64,
+
+    pub const none: RegMask = .{ .w = @splat(0) };
+    pub const all: RegMask = .{ .w = @splat(~@as(u64, 0)) };
+
+    pub inline fn isAll(self: RegMask) bool {
+        for (self.w) |x| {
+            if (x != ~@as(u64, 0)) return false;
+        }
+        return true;
+    }
+
+    /// A slot past the tracked range belongs to an eagerly filled frame, so
+    /// it reads as written.
+    pub inline fn has(self: RegMask, i: usize) bool {
+        if (i >= CAP) return true;
+        return (self.w[i >> 6] >> @as(u6, @truncate(i))) & 1 != 0;
+    }
+
+    pub inline fn set(self: *RegMask, i: usize) void {
+        if (i >= CAP) return;
+        self.w[i >> 6] |= @as(u64, 1) << @as(u6, @truncate(i));
+    }
+
+    pub inline fn setAll(self: *RegMask) void {
+        self.w = @splat(~@as(u64, 0));
+    }
+};
+
 pub const Frame = struct {
     module: *const Module,
     func: *const Func,
@@ -3008,7 +3146,7 @@ pub const Frame = struct {
     /// dump mark/read only set slots, and `materializeRegs` fills the rest
     /// with `Unit` before the file escapes the masked world (suspension
     /// snapshot, loop JIT, C-native surface, resume rebuild).
-    wmask: u64,
+    wmask: RegMask,
     params: std.ArrayList(Value),
     captures: std.ArrayList(Value),
     /// The enclosing-`this` chain this frame runs with, innermost last. Seeded
@@ -3144,12 +3282,12 @@ pub const Frame = struct {
                 std.debug.print("[framewatch] {s} <- {s}\n", .{ func.name, caller });
             }
         }
-        const regs = try acquireRegs(ev, allocator, func.n_locals, no_fill);
+        const regs = try acquireRegs(ev, allocator, func.n_locals, no_fill, func.id.int());
         return .{
             .module = module,
             .func = func,
             .regs = regs,
-            .wmask = if (no_fill) 0 else ~@as(u64, 0),
+            .wmask = if (no_fill) RegMask.none else RegMask.all,
             .params = params,
             .captures = captures,
             .enclosing_this = chainAcquire(ev),
@@ -3284,7 +3422,7 @@ pub const Frame = struct {
         // For an eagerly-filled frame the mask is already all-ones and the
         // (wrapped) bit is a no-op; a no-fill frame's indices are < 64 by
         // the `frameNoFill` gate.
-        self.wmask |= @as(u64, 1) << @as(u6, @truncate(idx));
+        self.wmask.set(idx);
         if (runtime.reclaimEnabled()) {
             const old = self.regs.items[idx];
             self.regs.items[idx] = v;
@@ -3304,11 +3442,11 @@ pub const Frame = struct {
     /// surface, a resume rebuild — so those consumers see exactly the file
     /// an eagerly-filled frame would carry. No-op once saturated.
     fn materializeRegs(self: *Frame) void {
-        if (self.wmask == ~@as(u64, 0)) return;
+        if (self.wmask.isAll()) return;
         for (self.regs.items, 0..) |*v, i| {
-            if ((self.wmask >> @as(u6, @truncate(i))) & 1 == 0) v.* = .Unit;
+            if (!self.wmask.has(i)) v.* = .Unit;
         }
-        self.wmask = ~@as(u64, 0);
+        self.wmask.setAll();
     }
 };
 
@@ -3963,12 +4101,28 @@ fn leafRunOne(
                 if (comptime !@hasDecl(H, "funcRunsItsBody")) return error.LeafAbandon;
                 if (c.arg_names.len != 0 or c.type_args.len != 0) return error.LeafAbandon;
                 const callee = module.funcById(c.func) orelse return error.LeafAbandon;
+                _ = module.ensureFuncBody(@constCast(callee));
                 if (!callee.leafExprBody()) {
                     if (trace) {
                         var ninsts: usize = 0;
                         for (callee.blocks) |*cb| ninsts += cb.insts.len;
-                        std.debug.print("[leaf] {s}: callee {s}#{d} is not a leaf (blocks={d} locals={d} insts={d} lambda={} suspend={})\n", .{
-                            func.name, callee.name, callee.id.int(), callee.blocks.len, callee.n_locals, ninsts, callee.is_lambda, callee.is_suspend,
+                        var why: []const u8 = "?";
+                        var pflag = false;
+                        for (callee.params) |*cp| {
+                            if (cp.is_vararg or cp.default != null) pflag = true;
+                        }
+                        if (pflag) why = "param-default-or-vararg";
+                        for (callee.blocks) |*cb| {
+                            if (cb.catches.len != 0 or cb.finally != null or cb.lr_absorb != null) why = "try-region";
+                            switch (cb.terminator) {
+                                .Return, .Goto, .Branch, .Throw, .Unreachable => {},
+                                else => |t| {
+                                    if (std.mem.eql(u8, why, "?")) why = @tagName(t);
+                                },
+                            }
+                        }
+                        std.debug.print("[leaf] {s}: callee {s}#{d} is not a leaf why={s} (blocks={d} locals={d} insts={d} lambda={} suspend={} hopeless={d} state={d})\n", .{
+                            func.name, callee.name, callee.id.int(), why, callee.blocks.len, callee.n_locals, ninsts, callee.is_lambda, callee.is_suspend, callee.leaf_hopeless, callee.leaf_state,
                         });
                     }
                     return error.LeafAbandon;
@@ -4020,6 +4174,7 @@ fn leafTraceWant(func: *const Func) bool {
         leaf_trace_state = 1;
     }
     if (leaf_trace_want.len == 0) return false;
+    if (leaf_trace_want.len == 1 and leaf_trace_want[0] == '*') return true;
     return std.mem.indexOf(u8, func.name, leaf_trace_want) != null;
 }
 
@@ -4187,8 +4342,18 @@ fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype
         }
         return null;
     }
-    if (claimed != cls) return null;
-    const route = @atomicLoad(u64, @constCast(&gf.site_route), .acquire);
+    // A POLYMORPHIC site (`op.ints` inside `Operations.pushOp`, where `op` is
+    // any of the changelist's ~40 Operation subclasses) claims one class and
+    // then sees another on nearly every call. Declining there sent the whole
+    // body — one of the hottest in a recomposition — to the frame path
+    // forever. The per-site claim is only a fast path: on a miss, ask the
+    // shared (class, name) memo, which answers from its own cache.
+    var route = @atomicLoad(u64, @constCast(&gf.site_route), .acquire);
+    if (claimed != cls) {
+        const alt = host.fieldSiteRoute(recv, fname) orelse return null;
+        if (alt.cls != cls) return null;
+        route = alt.route;
+    }
     // A property whose backing is another leaf property chains through it:
     // the callee is pure by construction, so re-running it if this serve is
     // later abandoned observes nothing.
@@ -4448,7 +4613,7 @@ pub fn evalWithCapturesChained(
     if (owning == null and closure_id == null and chain_seed.len == 0 and
         captures.items.len == 0)
     {
-        if (exec_call.hostRouteServe(H, func, args.items, host)) |served| {
+        if (exec_call.hostRouteServe(H, allocator, func, args.items, host)) |served| {
             var a = args;
             a.deinit(allocator);
             var c = captures;
@@ -4724,7 +4889,7 @@ pub fn resumeContinuation(
             .dense => |values| {
                 frame.regs.clearRetainingCapacity();
                 try frame.regs.appendSlice(regsAlloc(allocator), values);
-                frame.wmask = ~@as(u64, 0);
+                frame.wmask.setAll();
             },
         }
         // Kotlin `Continuation.resumeWith(Result.failure(e))` means
@@ -5295,6 +5460,19 @@ fn runFlatLoop(
                 }
                 break :blk_cm f.module;
             };
+            // A host-served compose helper answers before any activation
+            // opens, on the flat path as well as the recursive seam: the
+            // composer's stacks are reached through both.
+            if (site.req.captures.items.len == 0 and site.req.pop_enclosing_n == 0) {
+                if (exec_call.hostRouteServe(H, allocator, site.req.func, site.req.args.items, host)) |served| {
+                    const dst = site.req.dst;
+                    discardFlatReq(H, allocator, site.req, host);
+                    try f.write(dst, served);
+                    cur = site.ret_block;
+                    ridx = site.ret_idx;
+                    continue;
+                }
+            }
             if (leafReqServable(site.req)) {
                 // A flat request carries the callee's `Func` directly, but the
                 // module its body must be READ against is only known when the
@@ -6296,6 +6474,8 @@ fn runFrameExec(
                 .arm_bin = &NativeGlue(H).armBin,
                 .escape = &NativeGlue(H).escape,
                 .call = &NativeGlue(H).call,
+                .field_route = &NativeGlue(H).fieldRoute,
+                .field_write_route = &NativeGlue(H).fieldWriteRoute,
             };
             nf(@ptrCast(&nctx), cur.int());
             if (runtime.envOnce("KLIO_NATIVE_TRACE") != null) {
@@ -6464,7 +6644,7 @@ fn runFrameExec(
                                 if (out == .Bool) {
                                     const old = regs[di];
                                     regs[di] = out;
-                                    frame.wmask |= @as(u64, 1) << @as(u6, @truncate(di));
+                                    frame.wmask.set(di);
                                     if (runtime.reclaimEnabled()) old.release(allocator);
                                     taken = out.Bool;
                                 }
@@ -6900,10 +7080,10 @@ fn runFrameExec(
                 frame.regs.clearRetainingCapacity();
                 if (!runtime.reclaimEnabled() and frame.func.frameNoFill()) {
                     frame.regs.items.len = n;
-                    frame.wmask = 0;
+                    frame.wmask = RegMask.none;
                 } else {
                     try frame.regs.appendNTimes(regsAlloc(allocator), .Unit, n);
-                    frame.wmask = ~@as(u64, 0);
+                    frame.wmask.setAll();
                 }
                 try_stack.clearRetainingCapacity();
                 cur = frame.func.entry;
@@ -6923,10 +7103,10 @@ fn runFrameExec(
                 if (!runtime.reclaimEnabled() and new_func.frameNoFill()) {
                     try frame.regs.ensureTotalCapacity(regsAlloc(allocator), new_func.n_locals);
                     frame.regs.items.len = new_func.n_locals;
-                    frame.wmask = 0;
+                    frame.wmask = RegMask.none;
                 } else {
                     try frame.regs.appendNTimes(regsAlloc(allocator), .Unit, new_func.n_locals);
-                    frame.wmask = ~@as(u64, 0);
+                    frame.wmask.setAll();
                 }
                 try_stack.clearRetainingCapacity();
                 cur = new_func.entry;
@@ -7107,7 +7287,7 @@ inline fn binFast(frame: *Frame, op: BinOp, dst: Reg, lhs: Reg, rhs: Reg, alloca
     const out: Value = scalarBin(op, lv, rv) orelse return false;
     const old = regs[dst.int()];
     regs[dst.int()] = out;
-    frame.wmask |= @as(u64, 1) << @as(u6, @truncate(dst.int()));
+    frame.wmask.set(dst.int());
     if (runtime.reclaimEnabled()) old.release(allocator);
     return true;
 }
@@ -7233,7 +7413,7 @@ inline fn writeFastU(frame: *Frame, r: Reg, v: Value, allocator: Allocator) void
     const idx = r.int();
     const old = frame.regs.items.ptr[idx];
     frame.regs.items.ptr[idx] = v;
-    frame.wmask |= @as(u64, 1) << @as(u6, @truncate(idx));
+    frame.wmask.set(idx);
     if (runtime.reclaimEnabled()) old.release(allocator);
 }
 
@@ -7380,6 +7560,15 @@ pub const NativeCtx = struct {
     arm_bin: *const fn (*NativeCtx, u32, u32) NativeStep,
     escape: *const fn (*NativeCtx, u32, u32) NativeStep,
     call: *const fn (*NativeCtx, u32, u32) NativeStep,
+    /// Resolve a `GetField` site to (class cell identity, stored slot) for
+    /// the receiver currently in its register, so the emitted C can read the
+    /// slot inline behind a class guard. Zero when the site is not a plain
+    /// stored read (custom accessor, non-instance receiver, unknown class).
+    field_route: *const fn (*NativeCtx, u32, u32, *u64, *i32) i32,
+    /// The same for a `SetField` site: a plain stored-slot verdict from the
+    /// interpreter's write memo, so the emitted C can store into the slot
+    /// behind a class guard (with the GC write barrier).
+    field_write_route: *const fn (*NativeCtx, u32, u32, *u64, *i32) i32,
     outcome: NativeOutcome = .none,
     out_block: u32 = 0,
 };
@@ -7392,6 +7581,61 @@ fn NativeGlue(comptime H: type) type {
             const inst = &frame.func.blocks[block].insts[idx];
             const r = execArmBinOp(H, ctx.allocator, frame, inst.BinOp, host) catch return .oom;
             return glueAfter(ctx, r, inst, idx, block);
+        }
+        fn fieldRoute(ctx: *NativeCtx, block: u32, idx: u32, cls_out: *u64, slot_out: *i32) i32 {
+            if (comptime !@hasDecl(H, "fieldSiteRoute")) return 0;
+            const host: *H = @ptrCast(@alignCast(ctx.host));
+            const frame = ctx.frame;
+            const inst = &frame.func.blocks[block].insts[idx];
+            if (inst.* != .GetField) return 0;
+            const gf = inst.GetField;
+            const recv = frame.read(gf.receiver);
+            if (recv != .Instance) return 0;
+            const name = constStr(frame.module, gf.field) orelse return 0;
+            // The site memo's own verdict decides this, exactly as the
+            // frameless accessor serve reads it: only a PLAIN STORED slot
+            // (tag 1) may be read inline. A getter route, an outer-hop read
+            // or a delegated/lateinit property keeps the escape path, which
+            // is what forces a `by lazy` instead of handing back the
+            // delegate object.
+            const claim = host.fieldSiteRoute(&recv, name) orelse return 0;
+            if (claim.route & 3 != 1) return 0;
+            const slot: usize = @intCast(claim.route >> 2);
+            {
+                const g = recv.Instance.borrow();
+                defer g.deinit();
+                const fields = g.get().fields.items;
+                if (slot >= fields.len) return 0;
+                // Re-verify by name, and decline the shapes the serve
+                // declines: a null slot may be an unset lateinit, and a
+                // Delegate must be read through its own protocol.
+                const fld = fields[slot];
+                if (!std.mem.eql(u8, fld.name, name) and
+                    !H.sgetterNameMatches(name, fld.name)) return 0;
+                if (fld.value == .Null or fld.value == .Delegate) return 0;
+                // The identity the emitted C compares is the raw CELL
+                // pointer it reads out of `InstanceData.class`; `asPtr`
+                // would hand back the payload address instead.
+                cls_out.* = @intFromPtr(g.get().class.cell);
+            }
+            slot_out.* = @intCast(slot);
+            return 1;
+        }
+        fn fieldWriteRoute(ctx: *NativeCtx, block: u32, idx: u32, cls_out: *u64, slot_out: *i32) i32 {
+            if (comptime !@hasDecl(H, "fieldWriteSiteRoute")) return 0;
+            const host: *H = @ptrCast(@alignCast(ctx.host));
+            const frame = ctx.frame;
+            const inst = &frame.func.blocks[block].insts[idx];
+            if (inst.* != .SetField) return 0;
+            const sf = inst.SetField;
+            const recv = frame.read(sf.receiver);
+            if (recv != .Instance) return 0;
+            const name = constStr(frame.module, sf.field) orelse return 0;
+            const claim = host.fieldWriteSiteRoute(&recv, name) orelse return 0;
+            if (claim.route & 3 != 1) return 0;
+            cls_out.* = claim.cls;
+            slot_out.* = @intCast(claim.route >> 2);
+            return 1;
         }
         fn escape(ctx: *NativeCtx, block: u32, idx: u32) NativeStep {
             const host: *H = @ptrCast(@alignCast(ctx.host));
@@ -7742,6 +7986,17 @@ pub fn nativeOpCall(ctx: *NativeCtx, block: u32, inst_idx: u32) i32 {
 }
 
 /// Nonzero = the emitted function must return (outcome set on the ctx).
+/// Resolve a `GetField` site for the emitted C's inline read. Returns 1 with
+/// `cls_out`/`slot_out` filled when the site is a plain stored field on the
+/// receiver's current class; 0 leaves the site on the escape helper.
+pub fn nativeOpFieldRoute(ctx: *NativeCtx, block: u32, inst_idx: u32, cls_out: *u64, slot_out: *i32) i32 {
+    return ctx.field_route(ctx, block, inst_idx, cls_out, slot_out);
+}
+
+pub fn nativeOpFieldWriteRoute(ctx: *NativeCtx, block: u32, inst_idx: u32, cls_out: *u64, slot_out: *i32) i32 {
+    return ctx.field_write_route(ctx, block, inst_idx, cls_out, slot_out);
+}
+
 pub fn nativeOpEscape(ctx: *NativeCtx, block: u32, inst_idx: u32) i32 {
     switch (ctx.escape(ctx, block, inst_idx)) {
         .cont => return 0,
@@ -7798,7 +8053,7 @@ pub fn nativeOpCmpBr(ctx: *NativeCtx, block: u32, inst_idx: u32, kind: u32, dst:
             if (out == .Bool) {
                 const old = regs[dst];
                 regs[dst] = out;
-                frame.wmask |= @as(u64, 1) << @as(u6, @truncate(dst));
+                frame.wmask.set(dst);
                 if (runtime.reclaimEnabled()) old.release(ctx.allocator);
                 taken = out.Bool;
             }
@@ -7855,6 +8110,7 @@ pub fn nativeOpGotoExit(ctx: *NativeCtx, block: u32) void {
 }
 
 noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst: *const Inst, host: *H) Allocator.Error!Step {
+    if (frame_count_on) inst_count += 1;
     if (runtime.prof.op_prof_active) runtime.prof.current_op = @intFromEnum(inst.*);
     switch (inst.*) {
         .SuspendResumePoint => {
@@ -8526,7 +8782,91 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
 }
 
 /// Outlined `execInst` arm — see `execInst`.
+
+/// The stored slot's name against the site's name. Both come from the same
+/// module string pool at nearly every site, so the pointer check settles it
+/// without touching the bytes — this guard runs on EVERY field read.
+inline fn sameFieldName(stored: []const u8, want: []const u8) bool {
+    if (stored.ptr == want.ptr and stored.len == want.len) return true;
+    if (std.mem.eql(u8, stored, want)) return true;
+    // A scoped `$sgetter$<owner>\u{1f}<prop>` site stores its slot under the
+    // bare property name; the separator-guarded suffix keeps it exact.
+    return std.mem.startsWith(u8, want, "$sgetter$") and
+        want.len > stored.len and
+        std.mem.endsWith(u8, want, stored) and
+        want[want.len - stored.len - 1] == '\u{1f}';
+}
+
+/// A field-read site that sees more than one receiver class re-asked the
+/// host's (class, name) memo on every read, which interns the name and
+/// probes a hash map. Remember the answer per (site, class) instead: the
+/// route is a pure function of that pair.
+pub var cm_calls: u64 = 0;
+pub var cm_args_ns: u64 = 0;
+pub var cm_prep_ns: u64 = 0;
+pub var cm_replay_ns: u64 = 0;
+pub var cm_pre_ns: u64 = 0;
+pub var cm_probe_ns: u64 = 0;
+/// Dispatch-phase nanoseconds, counted only under `KLIO_FRAME_COUNT`. Only
+/// phases that RETURN before the callee runs are timed: a timer around a
+/// whole dispatch arm would bill the callee's own execution to dispatch,
+/// which is how a 63ns resolution first read as 590ns.
+pub fn armNow() u64 {
+    return gfNow();
+}
+pub fn armIsOn() bool {
+    return frame_count_on;
+}
+pub var gf_mono: u64 = 0;
+pub var gf_getter_ns: u64 = 0;
+pub var gf_slow_ns: u64 = 0;
+
+/// Monotonic nanoseconds for the field-read attribution buckets. Read only
+/// when `KLIO_FRAME_COUNT` is on, so the clock never prices a normal run.
+inline fn gfNow() u64 {
+    if (!frame_count_on) return 0;
+    return @intCast(runtime.clockMonotonicNanos());
+}
+var gf_slow_census_state: u8 = 0;
+var gf_slow_census_val: bool = false;
+/// `KLIO_GF_SLOW_CENSUS=1`: one line per field read that reaches the ladder.
+fn gfSlowCensusOn() bool {
+    if (gf_slow_census_state == 0) {
+        gf_slow_census_val = runtime.envOnce("KLIO_GF_SLOW_CENSUS") != null;
+        gf_slow_census_state = 1;
+    }
+    return gf_slow_census_val;
+}
+
+pub var gf_getter: u64 = 0;
+pub var gf_poly: u64 = 0;
+pub var gf_slow: u64 = 0;
+
+const POLY_FIELD_SLOTS: usize = 1 << 14;
+const PolyFieldEnt = struct { key: u64 = 0, route: u64 = 0 };
+threadlocal var poly_field_cache: [POLY_FIELD_SLOTS]PolyFieldEnt = @splat(.{});
+
+inline fn polyFieldKey(site: usize, cls: u64) u64 {
+    const k = (@as(u64, site) *% 0x9E3779B97F4A7C15) ^ (cls *% 0xC2B2AE3D27D4EB4F);
+    return k | 1;
+}
+
+fn polyFieldRoute(comptime H: type, host: *H, site: usize, cls: u64, recv: *const Value, name: []const u8) ?u64 {
+    // The host's own (class, name) memo is generation-guarded; this cache
+    // mirrors it, so the generation belongs in the key.
+    const gen: u64 = if (comptime @hasDecl(H, "dispatchCacheGen")) H.dispatchCacheGen() else 0;
+    const key = polyFieldKey(site, cls ^ (gen *% 0x51_7C_C1_B7_27_22_0A_95));
+    const slot = &poly_field_cache[@as(usize, @intCast(key >> 17)) & (POLY_FIELD_SLOTS - 1)];
+    if (slot.key == key) return if (slot.route == 0) null else slot.route;
+    const r = host.fieldSiteRoute(recv, name);
+    const route: u64 = if (r) |rr| (if (rr.cls == cls) rr.route else 0) else 0;
+    slot.key = key;
+    slot.route = route;
+    return if (route == 0) null else route;
+}
+
 noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Frame, gf: anytype, host: *H) Allocator.Error!Step {
+    if (frame_count_on) gf_slow += 1;
     const recv = frame.read(gf.receiver);
     if (gfTraceWant()) |w0| {
         if (constStr(frame.module, gf.field)) |fname| {
@@ -8624,13 +8964,10 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                         // its slot under the bare property name; the
                         // separator-guarded suffix match keeps the index-drift
                         // guard exact.
-                        if (!std.mem.eql(u8, f.name, name) and
-                            !(std.mem.startsWith(u8, name, "$sgetter$") and
-                                name.len > f.name.len and
-                                std.mem.endsWith(u8, name, f.name) and
-                                name[name.len - f.name.len - 1] == '\u{1f}')) break :fast;
+                        if (!sameFieldName(f.name, name)) break :fast;
                         const v = f.value;
                         if (v == .Delegate) break :fast;
+                        if (frame_count_on) gf_mono += 1;
                         // A stored slot holding NULL is a plain null unless the
                         // property is an unset `lateinit`, whose read must
                         // throw. Declining every null sent the commonest field
@@ -8656,6 +8993,9 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                     }
                 }
                 if (getter_fid != 0) {
+                    if (frame_count_on) gf_getter += 1;
+                    const t0 = gfNow();
+                    defer gf_getter_ns +%= gfNow() -% t0;
                     const got_g = host.runFieldGetter(allocator, @enumFromInt(getter_fid), recv);
                     if (pushed_enclosing) popEnclosing();
                     switch (try got_g) {
@@ -8674,7 +9014,14 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
             // (class, name) memo route — one probe instead of the slow
             // ladder — leaving the site's claim untouched.
             if (site_mismatch) poly: {
-                const r = host.fieldSiteRoute(&recv, name) orelse break :poly;
+                const cls_now: u64 = blk: {
+                    const g = recv.Instance.borrow();
+                    defer g.deinit();
+                    break :blk @intCast(g.get().class.identity());
+                };
+                const r: struct { route: u64 } = .{
+                    .route = polyFieldRoute(H, host, @intFromPtr(gf), cls_now, &recv, name) orelse break :poly,
+                };
                 if (r.route & 3 == 1) {
                     const idx: usize = @intCast(r.route >> 2);
                     const g = recv.Instance.borrow();
@@ -8682,13 +9029,10 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                     const b = g.get();
                     if (idx >= b.fields.items.len) break :poly;
                     const f = &b.fields.items[idx];
-                    if (!std.mem.eql(u8, f.name, name) and
-                        !(std.mem.startsWith(u8, name, "$sgetter$") and
-                            name.len > f.name.len and
-                            std.mem.endsWith(u8, name, f.name) and
-                            name[name.len - f.name.len - 1] == '\u{1f}')) break :poly;
+                    if (!sameFieldName(f.name, name)) break :poly;
                     const v = f.value;
                     if (v == .Null or v == .Delegate) break :poly;
+                    if (frame_count_on) gf_poly += 1;
                     v.retain();
                     if (pushed_enclosing) popEnclosing();
                     try frame.write(gf.dst, v);
@@ -8714,11 +9058,23 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                     }
                 }
             }
+            if (gfSlowCensusOn()) {
+                const cn: []const u8 = if (recv == .Instance) blk: {
+                    const g = recv.Instance.borrow();
+                    defer g.deinit();
+                    const cg = g.get().class.borrow();
+                    defer cg.deinit();
+                    break :blk cg.get().name;
+                } else @tagName(recv);
+                std.debug.print("[gf-slow] {s}.{s}\n", .{ cn, name });
+            }
         }
     }
     runtime.prof.opRoute(14);
     gfStatsBump(&recv, name);
+    const t_slow = gfNow();
     const got = host.getField(allocator, &recv, name);
+    gf_slow_ns +%= gfNow() -% t_slow;
     if (pushed_enclosing) popEnclosing();
     switch (try got) {
         // host.getField returns a borrowed field value; the register owns its ref.
@@ -8860,7 +9216,43 @@ noinline fn execArmCompoundField(comptime H: type, allocator: Allocator, frame: 
 }
 
 /// Outlined `execInst` arm — see `execInst`.
+
+/// A member call site that sees more than one receiver class re-ran the
+/// whole resolution ladder on every call — the single claimed class in the
+/// instruction only ever serves one of them. Compose's changelist walks ~40
+/// `Operation` subclasses through one site, so remember the resolved target
+/// per (site, class, argument signature) instead. The dispatch generation is
+/// folded into the key, so a cache flush invalidates every entry at once.
+const CALL_PIC_SLOTS: usize = 1 << 14;
+const CallPicEnt = struct { key: u64 = 0, fid: u32 = 0 };
+threadlocal var call_pic: [CALL_PIC_SLOTS]CallPicEnt = @splat(.{});
+
+inline fn callPicKey(site: usize, cls: u64, sig: u64, gen: u64) u64 {
+    var k = (@as(u64, site) *% 0x9E3779B97F4A7C15) ^ (cls *% 0xC2B2AE3D27D4EB4F);
+    k ^= sig *% 0xD6E8FEB86659FD93;
+    k ^= gen *% 0x517CC1B727220A95;
+    return k | 1;
+}
+
+fn callPicGet(site: usize, cls: u64, sig: u64, gen: u64) ?u32 {
+    const key = callPicKey(site, cls, sig, gen);
+    const e = &call_pic[@as(usize, @intCast(key >> 17)) & (CALL_PIC_SLOTS - 1)];
+    if (e.key != key) return null;
+    return e.fid;
+}
+
+fn callPicPut(site: usize, cls: u64, sig: u64, gen: u64, fid: u32) void {
+    const key = callPicKey(site, cls, sig, gen);
+    const e = &call_pic[@as(usize, @intCast(key >> 17)) & (CALL_PIC_SLOTS - 1)];
+    e.key = key;
+    e.fid = fid;
+}
+
 noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Frame, cm: anytype, host: *H) Allocator.Error!Step {
+    const cm_t0 = gfNow();
+    defer if (frame_count_on) {
+        cm_calls += 1;
+    };
     const recv = frame.read(cm.receiver);
     if (cmTraceWant()) |w0| {
         const want = w0;
@@ -8998,7 +9390,9 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     const name_str = constStr(frame.module, cm.name) orelse
         return raiseStep(frame, .{ .Type = "CallMember: name not a string const" });
     runtime.prof.opRoute(0);
+    const cm_args_t0 = gfNow();
     const arg_values = try readArgRun(allocator, frame, cm.args, cm.n_args);
+    if (frame_count_on) cm_args_ns +%= gfNow() -% cm_args_t0;
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cm.arg_names);
     defer freeArgNames(allocator, names);
@@ -9022,14 +9416,31 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     // recorded target without the string-keyed cache probe. The signature is
     // the same strict fold the method cache keys under, so the replay can
     // never serve an overload that cache would have discriminated.
+    if (frame_count_on) cm_pre_ns +%= gfNow() -% cm_t0;
     if (comptime @hasDecl(H, "memberSiteSig") and @hasDecl(H, "prepareMemberFlatFromFid")) {
         if (flatEnabled() and memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.arg_names)) {
             const w0 = @atomicLoad(u64, @constCast(&cm.site_cls), .acquire);
             if (w0 > 1) site: {
-                {
+                const cls_now: u64 = blk_cls: {
                     const g = recv.Instance.borrow();
                     defer g.deinit();
-                    if (w0 != @as(u64, @intCast(g.get().class.identity()))) break :site;
+                    break :blk_cls @intCast(g.get().class.identity());
+                };
+                if (w0 != cls_now) {
+                    // A polymorphic site: this class has its own remembered
+                    // target, so it never re-runs the ladder either.
+                    const gen: u64 = if (comptime @hasDecl(H, "dispatchCacheGen")) H.dispatchCacheGen() else 0;
+                    const sig_p = host.memberSiteSig(arg_values) orelse break :site;
+                    const fid_p = callPicGet(@intFromPtr(cm), cls_now, sig_p, gen) orelse break :site;
+                    if (try host.prepareMemberFlatFromFid(allocator, &recv, name_str, arg_values, @enumFromInt(fid_p))) |prep0| {
+                        dispatchBump(.member_site_flat);
+                        var prep = prep0;
+                        prep.dst = cm.dst;
+                        prep.pop_enclosing_n = if (pushed_enclosing) 1 else 0;
+                        frame.flat_call = prep;
+                        return .flat_call;
+                    }
+                    break :site;
                 }
                 const route = @atomicLoad(u64, @constCast(&cm.site_route), .acquire);
                 if (route == 0) break :site;
@@ -9067,6 +9478,10 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     if (comptime @hasDecl(H, "prepareMemberFlatCall")) {
         if (flatEnabled()) {
             runtime.prof.opRoute(1);
+            const cm_prep_t0 = gfNow();
+            defer if (frame_count_on) {
+                cm_prep_ns +%= gfNow() -% cm_prep_t0;
+            };
             const prep_opt: ?FlatCallReq = if (argNamesAllNull(cm.arg_names))
                 try host.prepareMemberFlatCall(allocator, &recv, name_str, arg_values, static_recv, declared_recv, true)
             else if (comptime @hasDecl(H, "prepareMemberFlatCallNamed"))
@@ -9087,8 +9502,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                 // own caches fill under) and only for the positional form.
                 if (comptime @hasDecl(H, "memberSiteSig")) {
                     if (memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.arg_names) and
-                        dispatchCacheStable() and
-                        @atomicLoad(u64, @constCast(&cm.site_cls), .monotonic) == 0)
+                        dispatchCacheStable())
                     {
                         if (host.memberSiteSig(arg_values)) |sig| {
                             const cls: u64 = blk: {
@@ -9099,6 +9513,12 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                             if (cls > 1 and @cmpxchgStrong(u64, @constCast(&cm.site_cls), 0, cls, .acq_rel, .monotonic) == null) {
                                 @atomicStore(u64, @constCast(&cm.site_sig), sig, .monotonic);
                                 @atomicStore(u64, @constCast(&cm.site_route), (@as(u64, prep.func.id.int()) << 1) | 1, .release);
+                            } else if (cls > 1) {
+                                // The instruction already belongs to another
+                                // class: remember this one in the per-site
+                                // cache so it stops re-resolving too.
+                                const gen: u64 = if (comptime @hasDecl(H, "dispatchCacheGen")) H.dispatchCacheGen() else 0;
+                                callPicPut(@intFromPtr(cm), cls, sig, gen, prep.func.id.int());
                             }
                         }
                     }
