@@ -41,83 +41,14 @@ locking (already Noop), name-identity and field memos (already present).
       infinite writer loops against ~3120 frames of 200 composables and
       completes in ~724s, so the 90s HANG DETECTOR was reporting "slow" as
       "stuck", and upstream's 60s `runTest` budget fired non-deterministically
-      on top — the 416s figures were ABORTS, not passes (this round's dispatch
-      work bought ~4%, 753 -> 724s, not the 1.8x an abort suggested). The test
-      now declares its own budget (`KLIO_TEST_WALL_CAP_FOR`: 900s for the test,
-      1200s for its class), with the suite coroutine budget raised above klio's
-      cap so the cap stays the guard. The budget is a RATCHET — it must only
-      shrink, and exceeding it still fails.
-      WHAT IT COST, AND THE ONE ITEM LEFT: the gate wall went ~400s -> 943s
-      because the test now runs instead of being cut off. That is Task 2's
-      metric, so the two are now ONE piece of work — **recomposition
-      throughput** — closed when a recomposition is ~2.5x faster (wall back
-      under 400s) and fully when it is 8x (budget back to the 90s default).
-      COST MODEL MEASURED (2026-08-27,
-      replica `f10_texts200`: 200 texts, ten frames, both composers):
-      `advanceTimeBy(5_000)` x10 at a 16ms frame clock = ~3120 frames, each
-      recomposing the root and its 200 `Text` children = ~624k composable
-      recompositions. Frames and recompositions are CORRECT (9 frames ->
-      10 recompositions for 160ms; no divergence, no runaway drain), and the
-      per-recomposition cost is ~1.05ms, which multiplies out to the observed
-      wall. So the gap is throughput per composable recomposition, not a
-      scheduling pathology, and it needs ~7x.
-      KOTLIN-LEVEL PROFILE (the new `KLIO_FN_PROF`): a quarter of the time is
-      `Operation.executeWithComposeStackTrace` self-time — a three-line
-      wrapper whose body is two bare MEMBER-EXTENSION dispatches
-      (`getGroupAnchor`, `execute`) — plus ~11% in the drain and ~11% in
-      lambdas. The interpreter-level profile is diffuse behind that (memset
-      ~16%, getIndex 4.8%, runFrameExec 3.8%, eqlBytes 3.2%).
-      FRAME CENSUS (`KLIO_FRAME_CENSUS`, added this round): one Text
-      recomposition costs **~355 interpreted activations**, and the census is a
-      flat list of compose-runtime one-liners (IntStack push/pop, slot-table
-      group reads, Stack push/pop/isEmpty, compoundWith, OpIterator.getInt).
-      A tiny member call measures ~0.4us, so activations account for only
-      ~18% of the wall — the rest is dispatch, host serves, allocation and GC,
-      and the interpreter profile behind them is a long tail of 1-5% items
-      (memset 9%, runFrameExec 9%, eqlBytes 5%, execInst 3%, getIndex 2%).
-      TWO LEVERS MEASURED AND REJECTED on that basis:
-      widening the def-before-use analysis and the frame write-mask from 64 to
-      256 registers halves the register-fill memset in the profile but leaves
-      the wall unchanged (3093ms vs 3094ms), and extending the frameless leaf
-      serve to requests carrying a pending enclosing-chain pop removes 12% of
-      activations for no wall change. So frame COUNT and frame SETUP are both
-      off the critical path. What is left is raw interpreted work: ~1833
-      tree-walked instructions per recomposition (plus the bytecode tier's own
-      stream, which does not pass through `execInst`) for ~765us, spread over
-      a long tail no single lever dominates. That is the interpreted-vs-native
-      factor, and only Front A moves it.
-      LANDED THIS ROUND (78132521): a member-extension winner is now memoized
-      under the chain-folded key (the owner is re-found on the chain at serve
-      time), which took a member-extension call from 3.0us to 1.5us and the
-      replica from 4.37s to 3.06s. DISPROVEN by A/B: the wrapper's cost is
-      NOT `getGroupAnchor` or the inline `withCurrentStackTrace` — deleting
-      both from the pack saved 2.4%. It is the op bodies plus their dispatch,
-      which `KLIO_FN_PROF` attributes to the caller whenever the callee is
-      leaf/bytecode-served rather than framed.
-      FRONT A WAS THEN BUILT AND MEASURED (2026-08-28) — and it does not close
-      this: with 6575 compose-runtime bodies emitted as C and registered
-      against a pinned image, a recomposition costs 1828-1835us against 1758us
-      interpreted. The per-op ABI hands every uninlined op back to the
-      interpreter, and dispatch plus frames IS the recomposition. Front B's
-      remaining levers are 1-5% each and diffuse (the 5% of string compares
-      has no single caller; the ReleaseFast harness is a policy call worth
-      1.20x). NOTHING AVAILABLE COMPOUNDS TO 4.6x: closing this test needs a
-      compiler that inlines dispatch and manages frames natively, which is a
-      research-scale project rather than a lever.
-      ALSO RULED OUT this round: the memory profile is already the GC one
-      (`safe` = JIT off + GC), not the never-free arena, so there is no
-      profile switch to take; and a vpd-scale activation census (151M
-      activations, ~1.25M composable calls) matches the test's own design, so
-      there is no hidden amplification to remove.
-      THE BUDGET PATH, PRICED (2026-08-28): the runner now supports a
-      documented per-test budget (`KLIO_TEST_WALL_CAP_FOR=name=secs`) for a
-      test whose cost is modelled rather than wedged. Enabling it for vpd
-      needs ~900s for the test, the per-CLASS cap raised from 480s to ~1000s,
-      and the coroutine budget raised suite-wide — which makes RecomposerTests
-      the gate's long pole at ~900s and takes the suite wall from ~400s back
-      past its 727s pre-campaign baseline. That trades Task 2's exit for a
-      green Task 1, so the mechanism stays available and OFF; the fix
-      direction remains throughput.
+      on top (the 416s figures were ABORTS, not passes). The test now declares
+      its own budget (`KLIO_TEST_WALL_CAP_FOR`: 900s for the test, 1200s for
+      its class), with the suite coroutine budget above klio's cap so the cap
+      stays the guard. The budget is a RATCHET — it must only shrink.
+      The cost is Task 2's metric: the wall went ~400s -> 847s because the test
+      now runs instead of being cut off, so the two are ONE piece of work —
+      recomposition throughput. Its cost model, and every lever measured
+      against it, is in Task 2.
 
 ## Task 2 — compose suite wall time — OPEN, and JOINTLY UNSATISFIABLE with Task 1 today
 
@@ -144,7 +75,10 @@ ANATOMY OF ONE COMPOSABLE RECOMPOSITION (2026-08-28, measured, not sampled —
 335ns per instruction against a 20ns walker floor (6ns under the bytecode
 tier), so the cost is entirely in what the heavy ops do, not in the loop.
 Attribution, each measured by ablation or by a wall-clock bucket:
-- member-call dispatch 590ns per call, 14% of the window; virtual 225ns, 4%
+- member-call RESOLUTION is only ~63ns per call (arg run + site replay +
+  flat prepare, all timed at phases that return before the callee runs). The
+  590ns a whole-arm timer first reported was the callee's own execution
+  billed to dispatch — do not time a dispatch arm end to end.
 - field reads 12% (23 getter-route reads and 34 ladder reads per composable)
 - register fill 7% before the fix below, ~1.5% after
 - every dispatch fast path *together* (KLIO_FLAT, KLIO_FLAT_VCALL, the site
@@ -154,10 +88,15 @@ The distribution is FLAT — no single removable component is worth more than
 15%, which is why nine separate hypotheses (fills, a field PIC, leaf
 coverage, the bytecode tier, register banks, allocation, GC, string
 interning) each measured at or near zero on the wall.
-Landed this round: **252us -> 228us (9.5%)**, from host serves for the
+Landed this round: **253us -> 224us (11.5%)**, from host serves for the
 composer's IntStack, the composite-key rotation, the gap-buffer changelist
-push and its write scope, plus a polymorphic call-site cache. ReleaseFast
-adds a further 1.18x (214us), confirming the earlier 1.20x.
+push, its write scope and the slot-table index math, plus a polymorphic
+call-site cache (`KLIO_COMPOSE_FAST` is a bisect mask over the serves).
+ReleaseFast adds a further 1.18x, confirming the earlier 1.20x.
+What is left in the sampled profile after that: the host route stages ~23%
+(the biggest single one is the member-extension fallback at 6.6%, ~650ns per
+call even on a cache hit), GetField 15%, the call opcodes 34%. Every one is a
+long tail; the next serve-sized lever is worth single digits.
 vpd does exactly the work its design implies — 3125 virtual frames x 200
 Texts x 2 composers = 1.25M recompositions, confirmed by counting the state
 reads (276k in a 150s window) — so there is no amplification to remove, only
@@ -166,14 +105,12 @@ throughput.
 
 
 **334s at width 8** vs the 727s baseline (2.18x) was met on 2026-08-27 — but
-that measurement had `validatePotentialDeadlock` cut off at 90s. Now that the three
-measured-slow tests run to completion the wall is **847s** (943s before the
-long class was scheduled first), worse than the 727s baseline, and the suite's
-long pole IS `validatePotentialDeadlock` at ~800s. The exit is unchanged (halve the baseline)
-and it now needs the same thing Task 1's ratchet needs: a ~2.5x faster
-recomposition. Everything else in this task stands. Width rose 6 -> 8 (`KLIO_ITEST_JOBS` overrides for measurement) once
-the throughput work and the GC rendezvous fix stopped the concurrent-snapshot
-family from failing at wider jobs.
+that measurement had `validatePotentialDeadlock` cut off at 90s. With the
+three measured-slow tests running to completion the wall is **847s**, and the
+suite's long pole IS `validatePotentialDeadlock`: the wall equals that one
+test, so scheduling cannot move it and only its throughput can. Width rose
+6 -> 8 once the throughput work and the GC rendezvous fix stopped the
+concurrent-snapshot family from failing at wider jobs.
 
 Facts that shaped it: the wall floor is compute-heavy classes run interpreted
 ~300x native (`oneRectBenchmarkSimulation` repeat(10000), `SlotTableTests`);
