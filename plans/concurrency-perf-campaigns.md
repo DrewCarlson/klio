@@ -8,11 +8,14 @@ Discipline: root-cause only, peel one root at a time, full battery before
 every commit, example + pinned output per interpreter root, never `zig build`
 while a background battery runs.
 
-Standing gate (2026-08-28): **1390 passed / 0 failed / 0 DNC at 943s** — the
-first fully green run, ratchet 1386, `MAX_FAILED = 5`, width 8. The wall grew
-from ~400s because `validatePotentialDeadlock` now runs to completion under a
-declared budget instead of being cut off by the hang detector; driving it back
-down is the one open item.
+Standing gate (2026-08-28): **1390 passed / 0 failed / 0 DNC at 847s** — fully
+green and deterministic, ratchet 1386, width 8. Three measured-slow tests
+(`validatePotentialDeadlock` ~724s, `resumeOnBackgroundThread`,
+`pausingTheFrameClockStopShouldBlockWithFrameNanos`) run under DECLARED
+budgets instead of being cut off by the 90s hang detector; each budget is a
+ratchet that must only shrink. The wall is now ~847s because those tests run
+to completion — driving it back under 400s is the one open item, and it is
+recomposition throughput.
 
 ---
 
@@ -116,12 +119,13 @@ locking (already Noop), name-identity and field memos (already present).
       green Task 1, so the mechanism stays available and OFF; the fix
       direction remains throughput.
 
-## Task 2 — compose suite wall time — RE-OPENED 2026-08-28 by Task 1's closure
+## Task 2 — compose suite wall time — OPEN (the campaign's one remaining item)
 
 **334s at width 8** vs the 727s baseline (2.18x) was met on 2026-08-27 — but
-that measurement had `validatePotentialDeadlock` cut off at 90s. Now that it
-runs to completion the wall is **943s**, worse than the 727s baseline, and the
-suite's long pole IS that one test. The exit is unchanged (halve the baseline)
+that measurement had `validatePotentialDeadlock` cut off at 90s. Now that the three
+measured-slow tests run to completion the wall is **847s** (943s before the
+long class was scheduled first), worse than the 727s baseline, and the suite's
+long pole IS `validatePotentialDeadlock` at ~800s. The exit is unchanged (halve the baseline)
 and it now needs the same thing Task 1's ratchet needs: a ~2.5x faster
 recomposition. Everything else in this task stands. Width rose 6 -> 8 (`KLIO_ITEST_JOBS` overrides for measurement) once
 the throughput work and the GC rendezvous fix stopped the concurrent-snapshot
