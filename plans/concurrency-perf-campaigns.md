@@ -8,7 +8,7 @@ Discipline: root-cause only, peel one root at a time, full battery before
 every commit, example + pinned output per interpreter root, never `zig build`
 while a background battery runs.
 
-Standing gate (2026-08-28): **1390 passed / 0 failed / 0 DNC at 847s** — fully
+Standing gate (2026-08-28): **1390 passed / 0 failed / 0 DNC at 797s** — fully
 green and deterministic, ratchet 1386, width 8. Three measured-slow tests
 (`validatePotentialDeadlock` ~724s, `resumeOnBackgroundThread`,
 `pausingTheFrameClockStopShouldBlockWithFrameNanos`) run under DECLARED
@@ -88,15 +88,27 @@ The distribution is FLAT — no single removable component is worth more than
 15%, which is why nine separate hypotheses (fills, a field PIC, leaf
 coverage, the bytecode tier, register banks, allocation, GC, string
 interning) each measured at or near zero on the wall.
-Landed this round: **253us -> 224us (11.5%)**, from host serves for the
-composer's IntStack, the composite-key rotation, the gap-buffer changelist
-push, its write scope and the slot-table index math, plus a polymorphic
-call-site cache (`KLIO_COMPOSE_FAST` is a bisect mask over the serves).
-ReleaseFast adds a further 1.18x, confirming the earlier 1.20x.
-What is left in the sampled profile after that: the host route stages ~23%
-(the biggest single one is the member-extension fallback at 6.6%, ~650ns per
-call even on a cache hit), GetField 15%, the call opcodes 34%. Every one is a
-long tail; the next serve-sized lever is worth single digits.
+Landed this round: **253us -> 220us (13%)** on the replica and the suite
+wall **847s -> 797s**, fully green (1390/0/0). The wins, each measured
+alone: host serves for the composer's IntStack, the composite-key rotation,
+BOTH changelists' push, the write scope and the slot-table index math
+(`KLIO_COMPOSE_FAST` is a bisect mask over them); a polymorphic call-site
+cache; and reading an instance's class identity without its reader lock
+(~380 such reads per composable). ReleaseFast would add a further 1.18x and
+is still unused by default.
+What is left in the sampled profile after that: GetField 13.4%, Call 12.7%,
+CallMemberOrGlobal 8.9%, CallVirtual 7.6%, the member-extension fallback
+7.5% (98.8% of its probes HIT — the cost is rebuilding the key, not the
+walk), SetField 5.0%, NewInstance 4.8%. Nothing above 14%.
+Also measured at zero this round and not kept: a chain-hash memo (the chain
+mutates as often as it is read) and a member-extension site cache on
+`CallMember` — those fallbacks come from BARE calls through
+`CallMemberOrGlobal`, whose member leg resolves per implicit-receiver
+candidate, so a site cache there needs the winning candidate too.
+The exit needs 2.2x. No measured lever exceeds 14%, and the biggest ones are
+already taken, so the remaining path is an execution core that does not
+resolve, frame and box per call — the same conclusion Front A reached, now
+priced at the instruction level.
 vpd does exactly the work its design implies — 3125 virtual frames x 200
 Texts x 2 composers = 1.25M recompositions, confirmed by counting the state
 reads (276k in a 150s window) — so there is no amplification to remove, only
