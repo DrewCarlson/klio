@@ -124,14 +124,18 @@ LANDED after the first attempt was reverted and its blockers root-caused
 - The MONOMORPHIC MEMBER-INLINE tier itself, scoped by declared evidence:
   monomorphic owner class (a generic owner's `as T` reads the
   process-global slot), PROVABLE receiver type (the permissive check
-  spliced SnapshotIdSet.fold onto a List), loop-free body
-  (forEachTailSlot mis-resolved `slots[...]`; hardening = the open item
-  below), callback shape matched, exactly one survivor.
-  `KLIO_MEMBER_INLINE` bisects by name list; `KLIO_PMI_TRACE` lists picks.
-- [ ] member-inline tier hardening: loop-bodied members
-  (forEach/forEachTailSlot family) need the splice receiver plumbing for
-  field-index reads inside RLP loops before the loop-free restriction can
-  lift.
+  spliced SnapshotIdSet.fold onto a List), callback shape matched,
+  exactly one survivor. `KLIO_MEMBER_INLINE` bisects by name list;
+  `KLIO_PMI_TRACE` lists picks.
+- [x] member-inline tier hardening CLOSED (2026-08-28): the loop-body
+  failure was not about loops — the spliced body's bare `slots` (a field
+  on the bound receiver) bound the CALLER's parameter of the same name.
+  A member body's lexical scope is its owner class, never the call site,
+  so a member splice now sets a scope FLOOR (`splice_body_floor`): bare
+  names resolve only at or above the splice base, the caller-lambda
+  window overriding it while an arg lambda lowers. The loop-free
+  restriction is lifted; forEachTailSlot and the traverse family splice.
+  Fixture extended (`splice_hygiene_shadow.kt`, `drain(slots: Table)`).
 
 ## Task 3 — Value layout stage 5b — RESOLVED
 

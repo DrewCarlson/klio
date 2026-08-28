@@ -456,6 +456,7 @@ test "splice_hygiene_shadow" {
         \\ext=18
         \\signed=101
         \\plain=1
+        \\tail=1y2z
         \\
     );
 }

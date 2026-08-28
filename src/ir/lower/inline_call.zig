@@ -2972,6 +2972,22 @@ pub fn tryInlineCallWithTypeArgs(
     // hierarchy's member-name set for the splice.
     var member_scope_prev_owner: ?[]const u8 = null;
     var member_scope_prev_members: ?build.StringSet = null;
+    // The body's lexical scope is the owner class, not the call site: bare
+    // names in a spliced MEMBER body must never bind a caller local (the
+    // caller's `slots` parameter captured the body's `slots`-field read).
+    // The floor covers the whole splice; the caller-lambda window overrides
+    // it while an arg lambda lowers, and body finallies replayed inside
+    // that window still resolve above the floor.
+    var prev_body_floor: ?usize = null;
+    var body_floor_set = false;
+    if (member_splice) {
+        prev_body_floor = b.splice_body_floor;
+        b.splice_body_floor = caller_scope_depth;
+        body_floor_set = true;
+    }
+    defer if (body_floor_set) {
+        b.splice_body_floor = prev_body_floor;
+    };
     if (member_splice) {
         const owner = inline_state.inlineMemberOwner(f).?;
         member_scope_prev_owner = b.owner_class;
