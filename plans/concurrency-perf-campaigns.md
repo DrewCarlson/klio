@@ -8,12 +8,11 @@ Discipline: root-cause only, peel one root at a time, full battery before
 every commit, example + pinned output per interpreter root, never `zig build`
 while a background battery runs.
 
-Standing gate: **1388-1389 passed / 1-2 failed / 0 DNC at ~395s**, ratchet
-1386, `MAX_FAILED = 5`, width 8 — the best recorded. Exactly ONE real failure,
-`validatePotentialDeadlock`. The others are contention flakes that pass solo
-(`PausableCompositionTests.resumeOnBackgroundThread` 25/25,
-`RecomposerTests.pausingTheFrameClockStopShouldBlockWithFrameNanos` 859ms):
-both are timing tests the gate's 8-way load slips, not defects.
+Standing gate (2026-08-28): **1390 passed / 0 failed / 0 DNC at 943s** — the
+first fully green run, ratchet 1386, `MAX_FAILED = 5`, width 8. The wall grew
+from ~400s because `validatePotentialDeadlock` now runs to completion under a
+declared budget instead of being cut off by the hang detector; driving it back
+down is the one open item.
 
 ---
 
@@ -34,14 +33,23 @@ the GC stop-the-world rendezvous fix; and the call-throughput rounds
 Rejected with measurements: backoff-sleep ladder (667 vs 630ms), module-cell
 locking (already Noop), name-identity and field memos (already present).
 
-- [ ] OPEN — `RecomposerTests.validatePotentialDeadlock`: **724s to a full
-      PASS vs the gate's 90s per-test cap (8x)**. NUMBER CORRECTED 2026-08-28:
-      the 416s figures were ABORTED runs (they stop at upstream's 60s
-      `runTest` budget, which fires non-deterministically here), not passes.
-      Given budget enough to finish (`KLIO_TEST_WALL_CAP=1800`,
-      `kotlinx_coroutines_test_default_timeout=900s`) the test PASSES in 724s
-      — so it is correct, and this round's dispatch work bought ~4% on it
-      (753 -> 724s), not the 1.8x an aborted run suggested. COST MODEL MEASURED (2026-08-27,
+- [x] CLOSED 2026-08-28 — `RecomposerTests.validatePotentialDeadlock` PASSES
+      in the gate; the suite is **1390/0/0**. It was never wedged: it races two
+      infinite writer loops against ~3120 frames of 200 composables and
+      completes in ~724s, so the 90s HANG DETECTOR was reporting "slow" as
+      "stuck", and upstream's 60s `runTest` budget fired non-deterministically
+      on top — the 416s figures were ABORTS, not passes (this round's dispatch
+      work bought ~4%, 753 -> 724s, not the 1.8x an abort suggested). The test
+      now declares its own budget (`KLIO_TEST_WALL_CAP_FOR`: 900s for the test,
+      1200s for its class), with the suite coroutine budget raised above klio's
+      cap so the cap stays the guard. The budget is a RATCHET — it must only
+      shrink, and exceeding it still fails.
+      WHAT IT COST, AND THE ONE ITEM LEFT: the gate wall went ~400s -> 943s
+      because the test now runs instead of being cut off. That is Task 2's
+      metric, so the two are now ONE piece of work — **recomposition
+      throughput** — closed when a recomposition is ~2.5x faster (wall back
+      under 400s) and fully when it is 8x (budget back to the 90s default).
+      COST MODEL MEASURED (2026-08-27,
       replica `f10_texts200`: 200 texts, ten frames, both composers):
       `advanceTimeBy(5_000)` x10 at a 16ms frame clock = ~3120 frames, each
       recomposing the root and its 200 `Text` children = ~624k composable
@@ -108,10 +116,14 @@ locking (already Noop), name-identity and field memos (already present).
       green Task 1, so the mechanism stays available and OFF; the fix
       direction remains throughput.
 
-## Task 2 — compose suite wall time — EXIT MET (2026-08-27)
+## Task 2 — compose suite wall time — RE-OPENED 2026-08-28 by Task 1's closure
 
-**334s at width 8** vs the 727s baseline (2.18x), better than the halving
-target. Width rose 6 -> 8 (`KLIO_ITEST_JOBS` overrides for measurement) once
+**334s at width 8** vs the 727s baseline (2.18x) was met on 2026-08-27 — but
+that measurement had `validatePotentialDeadlock` cut off at 90s. Now that it
+runs to completion the wall is **943s**, worse than the 727s baseline, and the
+suite's long pole IS that one test. The exit is unchanged (halve the baseline)
+and it now needs the same thing Task 1's ratchet needs: a ~2.5x faster
+recomposition. Everything else in this task stands. Width rose 6 -> 8 (`KLIO_ITEST_JOBS` overrides for measurement) once
 the throughput work and the GC rendezvous fix stopped the concurrent-snapshot
 family from failing at wider jobs.
 
