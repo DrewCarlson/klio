@@ -1431,12 +1431,18 @@ pub fn callStatsDump() void {
 pub var frame_count_total: u64 = 0;
 pub var frame_alloc_total: u64 = 0;
 pub var frame_count_on: bool = false;
-const FRAME_CENSUS_SLOTS: usize = 1 << 17;
+const FRAME_CENSUS_SLOTS: usize = 1 << 21;
 var frame_census: [FRAME_CENSUS_SLOTS]u32 = @splat(0);
 var frame_census_on: bool = false;
 
+pub var frame_watch_want: []const u8 = "";
+
 pub fn frameCountInit() void {
     frame_count_on = runtime.envOnce("KLIO_FRAME_COUNT") != null;
+    if (runtime.envOnce("KLIO_FRAME_WATCH")) |w| {
+        frame_watch_want = w;
+        frame_count_on = true;
+    }
     frame_census_on = runtime.envOnce("KLIO_FRAME_CENSUS") != null;
     if (frame_census_on) frame_count_on = true;
 }
@@ -3131,6 +3137,13 @@ pub const Frame = struct {
         // every write and every slot at teardown, so its frames stay
         // eagerly filled (exactly the leaf serve's rule).
         const no_fill = !runtime.reclaimEnabled() and func.frameNoFill();
+        if (frame_count_on) {
+            frameCensusBump(func.id.int());
+            if (frame_watch_want.len != 0 and std.mem.indexOf(u8, func.name, frame_watch_want) != null) {
+                const caller: []const u8 = if (evtls.frame_chain) |fr| fr.func.name else "<top>";
+                std.debug.print("[framewatch] {s} <- {s}\n", .{ func.name, caller });
+            }
+        }
         const regs = try acquireRegs(ev, allocator, func.n_locals, no_fill);
         return .{
             .module = module,
@@ -5970,10 +5983,7 @@ fn runFrameExec(
     park_out: *?ParkPoint,
     host: *H,
 ) Allocator.Error!EvalResult {
-    if (frame_count_on) {
-        frame_count_total += 1;
-        frameCensusBump(frame.func.id.int());
-    }
+    if (frame_count_on) frame_count_total += 1;
     // KLIO_FN_PROF: attribute samples to the interpreted function running
     // here, restoring the caller's on exit so the histogram is self-time.
     const fn_prof_prev = runtime.prof.current_fn;
