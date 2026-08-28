@@ -7400,7 +7400,7 @@ fn NativeGlue(comptime H: type) type {
             return glueAfter(ctx, r, inst, idx, block);
         }
         fn fieldRoute(ctx: *NativeCtx, block: u32, idx: u32, cls_out: *u64, slot_out: *i32) i32 {
-            if (comptime !@hasDecl(H, "plainStoredFieldIndex")) return 0;
+            if (comptime !@hasDecl(H, "fieldSiteRoute")) return 0;
             const host: *H = @ptrCast(@alignCast(ctx.host));
             const frame = ctx.frame;
             const inst = &frame.func.blocks[block].insts[idx];
@@ -7409,15 +7409,32 @@ fn NativeGlue(comptime H: type) type {
             const recv = frame.read(gf.receiver);
             if (recv != .Instance) return 0;
             const name = constStr(frame.module, gf.field) orelse return 0;
-            const slot = host.plainStoredFieldIndex(ctx.allocator, &recv, name) orelse return 0;
-            // The identity the emitted C compares is the raw CELL pointer it
-            // reads out of `InstanceData.class` — `asPtr` would hand back the
-            // payload address instead, and the guard would never match.
-            cls_out.* = blk: {
+            // The site memo's own verdict decides this, exactly as the
+            // frameless accessor serve reads it: only a PLAIN STORED slot
+            // (tag 1) may be read inline. A getter route, an outer-hop read
+            // or a delegated/lateinit property keeps the escape path, which
+            // is what forces a `by lazy` instead of handing back the
+            // delegate object.
+            const claim = host.fieldSiteRoute(&recv, name) orelse return 0;
+            if (claim.route & 3 != 1) return 0;
+            const slot: usize = @intCast(claim.route >> 2);
+            {
                 const g = recv.Instance.borrow();
                 defer g.deinit();
-                break :blk @intFromPtr(g.get().class.cell);
-            };
+                const fields = g.get().fields.items;
+                if (slot >= fields.len) return 0;
+                // Re-verify by name, and decline the shapes the serve
+                // declines: a null slot may be an unset lateinit, and a
+                // Delegate must be read through its own protocol.
+                const fld = fields[slot];
+                if (!std.mem.eql(u8, fld.name, name) and
+                    !H.sgetterNameMatches(name, fld.name)) return 0;
+                if (fld.value == .Null or fld.value == .Delegate) return 0;
+                // The identity the emitted C compares is the raw CELL
+                // pointer it reads out of `InstanceData.class`; `asPtr`
+                // would hand back the payload address instead.
+                cls_out.* = @intFromPtr(g.get().class.cell);
+            }
             slot_out.* = @intCast(slot);
             return 1;
         }
