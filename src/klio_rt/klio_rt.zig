@@ -95,6 +95,18 @@ export fn klio_rt_run_image(base_image: [*:0]const u8, path: [*:0]const u8) c_in
 const InstCell = runtime.ObjRef(runtime.InstanceData).Cell;
 const FieldList = std.ArrayList(runtime.InstanceData.Field);
 /// A slice is `{ptr, len}` in that order; there is no `@offsetOf` for one.
+const PrimBufCell = runtime.ObjRef(runtime.PrimBuf).Cell;
+
+/// The 8 bytes at `off` inside `v`, for a probe whose encoding is
+/// compiler-chosen (an optional enum's niche).
+fn readWord(v: *const runtime.Value, off: u32) u64 {
+    var w: u64 = 0;
+    const bytes = std.mem.asBytes(v);
+    const n = @min(@as(usize, 8), bytes.len - off);
+    @memcpy(std.mem.asBytes(&w)[0..n], bytes[off..][0..n]);
+    return w;
+}
+
 const SLICE_PTR_OFF: u32 = 0;
 const SLICE_LEN_OFF: u32 = @sizeOf(usize);
 
@@ -143,6 +155,16 @@ pub const HotLayout = extern struct {
     /// One `Field` record: its size and the offset of its `value`.
     field_stride: u32,
     field_value_off: u32,
+    /// Array view: an `IntArray` element read, inline. `arr_prim_word` is
+    /// the 8 bytes at `arr_prim_off` that mean "primitive Int storage" —
+    /// the optional-enum encoding is compiler-chosen, so it is probed from
+    /// two constructed values rather than assumed.
+    tag_array: u64,
+    arr_cell_off: u32,
+    arr_prim_off: u32,
+    arr_prim_int_word: u64,
+    primbuf_ptr_off: u32,
+    primbuf_len_off: u32,
 };
 
 fn tagOffset() struct { off: u32, size: u32 } {
@@ -282,6 +304,7 @@ export fn klio_rt_hot_layout(out: *HotLayout) void {
     var vu: runtime.Value = undefined;
     var vc: runtime.Value = undefined;
     var vinst: runtime.Value = undefined;
+    var vai: runtime.Value = undefined;
     @memset(std.mem.asBytes(&vi), 0);
     @memset(std.mem.asBytes(&vl), 0);
     @memset(std.mem.asBytes(&vb), 0);
@@ -289,6 +312,8 @@ export fn klio_rt_hot_layout(out: *HotLayout) void {
     @memset(std.mem.asBytes(&vc), 0);
     @memset(std.mem.asBytes(&vinst), 0);
     vinst = .{ .Instance = undefined };
+    @memset(std.mem.asBytes(&vai), 0);
+    vai = .{ .Array = .{ .cell = @ptrFromInt(0x1000), .prim = .Int } };
     vi = .{ .Int = 0 };
     vl = .{ .Long = 0 };
     vb = .{ .Bool = false };
@@ -335,6 +360,12 @@ export fn klio_rt_hot_layout(out: *HotLayout) void {
         .fields_len_off = @offsetOf(FieldList, "items") + SLICE_LEN_OFF,
         .field_stride = @sizeOf(runtime.InstanceData.Field),
         .field_value_off = @offsetOf(runtime.InstanceData.Field, "value"),
+        .tag_array = @intFromEnum(@as(std.meta.Tag(runtime.Value), .Array)),
+        .arr_cell_off = @intCast(@intFromPtr(&vai.Array.cell) - @intFromPtr(&vai)),
+        .arr_prim_off = @intCast(@intFromPtr(&vai.Array.prim) - @intFromPtr(&vai)),
+        .arr_prim_int_word = readWord(&vai, @intCast(@intFromPtr(&vai.Array.prim) - @intFromPtr(&vai))),
+        .primbuf_ptr_off = @offsetOf(PrimBufCell, "data") + @offsetOf(runtime.PrimBuf, "bytes") + SLICE_PTR_OFF,
+        .primbuf_len_off = @offsetOf(PrimBufCell, "data") + @offsetOf(runtime.PrimBuf, "bytes") + SLICE_LEN_OFF,
     };
     if (std.c.getenv("KLIO_NATIVE_TRACE") != null)
         std.debug.print("[rt] wrote usable={d} vsize={d} (sizeOf={d}) reclaimReq={}\n", .{ out.usable, out.value_size, @sizeOf(runtime.Value), runtime.reclaimRequested() });

@@ -50,6 +50,14 @@ typedef struct {
   uint32_t fields_len_off;
   uint32_t field_stride;
   uint32_t field_value_off;
+  /* Array view: an IntArray element read. arr_prim_int_word is the probed
+     byte pattern that means "primitive Int storage". */
+  uint64_t tag_array;
+  uint32_t arr_cell_off;
+  uint32_t arr_prim_off;
+  uint64_t arr_prim_int_word;
+  uint32_t primbuf_ptr_off;
+  uint32_t primbuf_len_off;
 } klio_hot_layout;
 void klio_rt_hot_layout(klio_hot_layout *out);
 

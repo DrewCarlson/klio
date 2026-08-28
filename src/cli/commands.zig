@@ -583,6 +583,34 @@ fn transpileEmit(
         \\  memcpy(kv_slot(regs, dst), items + (size_t)*site_slot * KV.field_stride + KV.field_value_off, KV.value_size);
         \\  return 1;
         \\}}
+        \\/* An IntArray element read, inline. Guards the value tag, the
+        \\ * primitive-storage discriminator and the index; anything else
+        \\ * (a boxed array, another element type, an out-of-range index)
+        \\ * returns 0 and the site falls back to the escape helper. */
+        \\static inline int kv_index_int(uint8_t *regs, uint32_t dst, uint32_t recv, uint32_t idxreg) {{
+        \\  if (!KV.obj_usable) return 0;
+        \\  const uint8_t *rs = kv_slot(regs, recv);
+        \\  if (kv_tag(rs) != KV.tag_array) return 0;
+        \\  uint64_t prim = 0;
+        \\  memcpy(&prim, rs + KV.arr_prim_off, sizeof(uint64_t));
+        \\  if (prim != KV.arr_prim_int_word) return 0;
+        \\  const uint8_t *is_ = kv_slot(regs, idxreg);
+        \\  if (kv_tag(is_) != KV.tag_int) return 0;
+        \\  int32_t i = kv_int(is_);
+        \\  if (i < 0) return 0;
+        \\  uint8_t *cell;
+        \\  memcpy(&cell, rs + KV.arr_cell_off, sizeof(void *));
+        \\  if (!cell) return 0;
+        \\  uint8_t *items;
+        \\  size_t nbytes;
+        \\  memcpy(&items, cell + KV.primbuf_ptr_off, sizeof(void *));
+        \\  memcpy(&nbytes, cell + KV.primbuf_len_off, sizeof(size_t));
+        \\  if ((size_t)i * 4u + 4u > nbytes) return 0;
+        \\  int32_t v;
+        \\  memcpy(&v, items + (size_t)i * 4u, 4);
+        \\  kv_const_int(kv_slot(regs, dst), v);
+        \\  return 1;
+        \\}}
         \\/* Scalar-replay float lanes: genre 5 stores double bits, genre 6
         \\ * stores float bits, both in the int64 value lane. */
         \\static inline double kl_bits2d(int64_t l) {{ double d; memcpy(&d, &l, 8); return d; }}
@@ -1744,6 +1772,16 @@ fn emitNativeBlock(w: anytype, f: *const ir.Func, st: *const ir.bc.Stream, block
                             block,          inst_idx,       block, inst_idx,
                             block,          inst_idx,
                         },
+                    );
+                    pc += 2;
+                    continue;
+                }
+                if (f.blocks[block].insts[inst_idx] == .Index) {
+                    const ix = f.blocks[block].insts[inst_idx].Index;
+                    try w.print(
+                        "  if (!kv_index_int(regs, {d}u, {d}u, {d}u))\n" ++
+                            "    if (klio_op_escape(ctx, {d}u, {d}u)) return;\n",
+                        .{ ix.dst.int(), ix.receiver.int(), ix.index.int(), block, inst_idx },
                     );
                     pc += 2;
                     continue;
