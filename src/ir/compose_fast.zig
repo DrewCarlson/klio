@@ -45,6 +45,12 @@ pub const Route = enum(u8) {
     ops_set_int = 17,
     /// `Operations.WriteScope.setObject(parameter, value)`
     ops_set_object = 18,
+    /// `IntArray.slotAnchor(address)` — the gap-buffer group table's data
+    /// anchor plus the slot bits above it.
+    slot_anchor = 19,
+    /// `SlotWriter.dataAnchorToDataIndex(anchor, gapLen, capacity)` — pure
+    /// arithmetic that reads none of the writer's state.
+    data_anchor_to_index = 20,
 };
 
 /// Classify once per `Func` (the caller memoizes into `func.host_route`).
@@ -60,6 +66,7 @@ pub fn classify(fqn: []const u8, n_params: usize) Route {
         return .none;
     }
     if (n_params == 2) {
+        if (std.mem.eql(u8, fqn, "androidx.compose.runtime.composer.gapbuffer.slotAnchor")) return .slot_anchor;
         // Only the gap-buffer changelist: the link-buffer's `pushOp` also
         // raises `requiresApplication` from the operation's visibility, which
         // is a virtual getter the host cannot read.
@@ -70,6 +77,10 @@ pub fn classify(fqn: []const u8, n_params: usize) Route {
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.IntStack.peekOr")) return .int_stack_peek_or;
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.IntStack.popOr")) return .int_stack_pop_or;
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.IntStack.peek")) return .int_stack_peek_at;
+        return .none;
+    }
+    if (n_params == 4) {
+        if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotWriter.dataAnchorToDataIndex")) return .data_anchor_to_index;
         return .none;
     }
     if (n_params == 3) {
@@ -367,6 +378,35 @@ pub fn serveSetObject(allocator: std.mem.Allocator, args: []const Value) ?Value 
     const slot = topSlot(&stack, parameter, true) orelse return null;
     slot.arr.set(allocator, @intCast(slot.index), args[2]);
     return .{ .Unit = {} };
+}
+
+/// `groups[address * 5 + 4] + countOneBits(groups[address * 5 + 1] shr 28)`.
+/// Kotlin's `shr` is arithmetic and `countOneBits` counts the 32-bit pattern,
+/// so the shift is signed and the population count unsigned.
+pub fn serveSlotAnchor(args: []const Value) ?Value {
+    if (args[0] != .Array) return null;
+    const arr = args[0].Array;
+    if (arr.prim != .Int) return null;
+    const address = asI32(&args[1]) orelse return null;
+    if (address < 0) return null;
+    const slot = @as(i64, address) * 5;
+    if (slot + 4 >= @as(i64, @intCast(arr.len()))) return null;
+    const anchor_v = arr.get(@intCast(slot + 4));
+    const info_v = arr.get(@intCast(slot + 1));
+    const anchor = asI32(&anchor_v) orelse return null;
+    const info = asI32(&info_v) orelse return null;
+    const shifted: i32 = info >> 28;
+    const bits: i32 = @intCast(@popCount(@as(u32, @bitCast(shifted))));
+    return .{ .Int = anchor +% bits };
+}
+
+/// `if (anchor < 0) (capacity - gapLen) + anchor + 1 else anchor`
+pub fn serveDataAnchorToDataIndex(args: []const Value) ?Value {
+    const anchor = asI32(&args[1]) orelse return null;
+    if (anchor >= 0) return .{ .Int = anchor };
+    const gap_len = asI32(&args[2]) orelse return null;
+    const capacity = asI32(&args[3]) orelse return null;
+    return .{ .Int = (capacity -% gap_len) +% anchor +% 1 };
 }
 
 /// The argument-completeness assertion compiles out in this build, so the
