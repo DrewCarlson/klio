@@ -119,7 +119,26 @@ locking (already Noop), name-identity and field memos (already present).
       green Task 1, so the mechanism stays available and OFF; the fix
       direction remains throughput.
 
-## Task 2 — compose suite wall time — OPEN (the campaign's one remaining item)
+## Task 2 — compose suite wall time — OPEN, and JOINTLY UNSATISFIABLE with Task 1 today
+
+THE TWO EXITS CONFLICT AT CURRENT THROUGHPUT, proven from both sides: cut
+`validatePotentialDeadlock` off at 90s and Task 1 is red (it is reported as a
+failure for being slow); let it run and Task 2 is red (it alone is ~800s, and
+the suite wall is its slowest child). Only a ~2.2x faster recomposition
+satisfies both.
+
+WHERE A RECOMPOSITION'S TIME GOES (replica, ten frames x 200 composables):
+0.5s composition+effects baseline, ~1.3s the plugin's per-call-site ritual,
+~1.5s node emission (ComposeNode + Updater.set + changelist + applier).
+String interpolation is FREE: alternating two constant strings costs the same
+as building one per call (3284 vs 3290ms), so the parameter CHANGE (which
+defeats skipping), not the string, is what costs.
+Sized levers, none of which reach 2.2x: a native changelist serve ~10-20%, a
+native composer group/slot serve ~15-25%, frameless leaf WRITES ~2%, the
+ReleaseFast gate harness 1.20x (a policy call that trades the safety checks a
+test suite wants).
+
+
 
 **334s at width 8** vs the 727s baseline (2.18x) was met on 2026-08-27 — but
 that measurement had `validatePotentialDeadlock` cut off at 90s. Now that the three
