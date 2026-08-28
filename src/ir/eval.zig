@@ -1476,6 +1476,17 @@ pub fn frameCountDump(module: *const Module) void {
     for (list.items[0..top]) |e| std.debug.print("[frames] {d:>9} {s}\n", .{ e.n, e.name });
 }
 
+/// The first source span an emitted body carries, for naming an anonymous
+/// function in a profile.
+fn funcFirstSpan(f: *const ir.Func) ?ir.Span {
+    for (f.blocks) |*b| {
+        for (b.insts) |*inst| {
+            if (inst.* == .Trace) return inst.Trace.span;
+        }
+    }
+    return null;
+}
+
 pub fn fnProfDump(module: *const Module) void {
     const counts = runtime.prof.fnProfCounts() orelse return;
     const Entry = struct { name: []const u8, n: u32 };
@@ -1488,7 +1499,29 @@ pub fn fnProfDump(module: *const Module) void {
         if (n == 0) continue;
         total += n;
         const f = module.funcById(@enumFromInt(fid));
-        const nm: []const u8 = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "<unknown>";
+        var nm: []const u8 = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "<unknown>";
+        // A lambda's name says nothing; every one of them reads `<lambda>` and
+        // the whole population lands in one bucket. Name it by id and its
+        // source position, which is what makes a hot one findable.
+        if (f) |ff| {
+            if (std.mem.eql(u8, nm, "<lambda>")) {
+                const buf = std.heap.page_allocator.alloc(u8, 160) catch return;
+                var site: []const u8 = "";
+                var site_buf: [96]u8 = undefined;
+                if (ff.blocks.len != 0 and ff.blocks[0].insts.len != 0) {
+                    if (funcFirstSpan(ff)) |sp| {
+                        if (span.active_map) |am| {
+                            if (am.getChecked(sp.file)) |sf| {
+                                const lc = sf.lineCol(sp.start);
+                                const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |ix| sf.path[ix + 1 ..] else sf.path;
+                                site = std.fmt.bufPrint(&site_buf, " {s}:{d}", .{ base, lc.line }) catch "";
+                            }
+                        }
+                    }
+                }
+                nm = std.fmt.bufPrint(buf, "<lambda>#{d}{s}", .{ fid, site }) catch nm;
+            }
+        }
         list.append(std.heap.page_allocator, .{ .name = nm, .n = n }) catch return;
     }
     if (total == 0) return;

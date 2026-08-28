@@ -437,6 +437,18 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     }
 
     var jobs: std.ArrayList([]const []const u8) = .empty;
+    // Longest-first: the wall is the slowest child, so a class known to run
+    // for minutes (RecomposerTests carries the ~724s
+    // `validatePotentialDeadlock`) must start with the first worker, not be
+    // picked up near the end where nothing overlaps it.
+    for (classes.items, 0..) |cls, ci| {
+        if (std.mem.indexOf(u8, cls, "RecomposerTests") != null and ci != 0) {
+            const first = classes.items[0];
+            classes.items[0] = classes.items[ci];
+            classes.items[ci] = first;
+            break;
+        }
+    }
     for (classes.items) |cls| {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, klioBin(&env));
