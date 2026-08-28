@@ -647,15 +647,57 @@ fn transpileEmit(
     // Scalar-replay (`kl_`) pass: per-fn eligibility, then a fixpoint
     // closing the set over call targets (a body is only pure when every
     // callee is), then prototypes (mutual/self recursion) and bodies.
+    // KLIO_TRANSPILE_PKGS=<comma-separated package prefixes> widens emission
+    // past the user script into library code. The pinned image the binary
+    // loads carries those same fids, so a registered pack body is the one the
+    // run resolves; without the flag the emitter keeps its user-only default
+    // (pack bodies would add tens of thousands of C functions).
+    const pkg_sel: ?[]const u8 = runtime.envOnce("KLIO_TRANSPILE_PKGS");
+    const emitFor = struct {
+        fn ok(sel: ?[]const u8, f: *const ir.Func) bool {
+            if (f.package.len == 0) return true;
+            const s2 = sel orelse return false;
+            var it = std.mem.splitScalar(u8, s2, ',');
+            while (it.next()) |pfx| {
+                if (pfx.len != 0 and std.mem.startsWith(u8, f.package, pfx)) return true;
+            }
+            return false;
+        }
+    }.ok;
+
+    // With a selector, the image's own functions (addressed by id through the
+    // lazy header table, not present in `funcs.items`) join the walk.
+    var extra_funcs: std.ArrayList(*const ir.Func) = .empty;
+    defer extra_funcs.deinit(gpa);
+    if (pkg_sel != null) {
+        var fid: u32 = 0;
+        while (fid < m.func_header_offsets.len) : (fid += 1) {
+            const f = m.funcById(@enumFromInt(fid)) orelse continue;
+            if (!emitFor(pkg_sel, f)) continue;
+            if (f.blocks.len == 0 and !m.ensureFuncBody(@constCast(f))) continue;
+            extra_funcs.append(gpa, f) catch return 1;
+        }
+    }
+
     var leaf_targets = std.AutoHashMap(u32, std.ArrayList(u32)).init(gpa);
     defer {
         var it = leaf_targets.valueIterator();
         while (it.next()) |v| v.deinit(gpa);
         leaf_targets.deinit();
     }
+    for (extra_funcs.items) |f| {
+        const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
+        if (leafEligible(gpa, f, fs, m.consts.items)) |tg| {
+            var tg2 = tg;
+            leaf_targets.put(f.id.int(), tg2) catch {
+                tg2.deinit(gpa);
+                return 1;
+            };
+        }
+    }
     for (m.funcs.items) |*f| {
-        if (f.blocks.len == 0) continue;
-        if (f.package.len != 0) continue;
+        if (!emitFor(pkg_sel, f)) continue;
+        if (f.blocks.len == 0 and !m.ensureFuncBody(@constCast(f))) continue;
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
         if (leafEligible(gpa, f, fs, m.consts.items)) |tg| {
             leaf_targets.put(f.id.int(), tg) catch return 1;
@@ -694,15 +736,28 @@ fn transpileEmit(
     }
     var leaf_emitted: std.ArrayList(Emitted) = .empty;
     defer leaf_emitted.deinit(gpa);
+    // The user script's functions by default; `KLIO_TRANSPILE_PKGS` widens the
+    // walk to the image's library bodies. The fids the emitter registers must
+    // match the fids the running binary resolves, which the pinned image
+    // guarantees.
     for (m.funcs.items) |*f| {
-        // The user script's functions only: pack/stdlib bodies keep full
-        // interpretation (the fids the emitter registers must match the
-        // fids the running binary lowers this same source to).
-        if (f.blocks.len == 0) continue;
-        if (f.package.len != 0) continue;
+        if (!emitFor(pkg_sel, f)) continue;
+        if (f.blocks.len == 0 and !m.ensureFuncBody(@constCast(f))) continue;
         // allow_fuse mirrors the frame loop's default (the loop JIT off):
         // the running binary builds the same streams this emission used.
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
+        if (leaf_targets.contains(f.id.int())) {
+            emitLeafFunc(w, f, fs, m.consts.items) catch return 1;
+            leaf_emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+        }
+        emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
+        emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+    }
+    for (extra_funcs.items) |f| {
+        const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
+        // A library leaf gets the frameless scalar replay too: the census of
+        // a recomposition is mostly one-line accessors, and the replay is the
+        // only emitted form that skips the activation entirely.
         if (leaf_targets.contains(f.id.int())) {
             emitLeafFunc(w, f, fs, m.consts.items) catch return 1;
             leaf_emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
