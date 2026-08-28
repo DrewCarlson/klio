@@ -55,11 +55,48 @@ pub const Route = enum(u8) {
     /// `requiresApplication` raised from the operation's visibility, which is
     /// a stored constructor property there.
     ops_push_op_link = 21,
+    /// `SlotReader.next()` — the hot had-a-slot branch only.
+    sr_next = 22,
+    /// `SlotReader.groupKey` getter / `groupKey(index)` / `isGroupEnd` /
+    /// `nodeCount` getter / `nodeCount(index)`.
+    sr_group_key_get = 23,
+    sr_is_group_end_get = 24,
+    sr_node_count_get = 25,
+    sr_node_count_at = 26,
+    sr_group_key_at = 27,
+    /// Top-level `IntArray.parentAnchor(address)` (file-private, lowered as a
+    /// package function).
+    gap_parent_anchor = 28,
+    /// `SlotWriter.dataIndex(index)` — gap-adjusted anchor arithmetic.
+    sw_data_index = 29,
+    /// `RecomposeScopeImpl.requiresRecompose` accessor pair — one bit of the
+    /// packed `flags` field.
+    rsi_req_recompose_set = 30,
+    rsi_req_recompose_get = 31,
+    /// `GapComposer.validateNodeNotExpected()` — a no-op unless it raises.
+    gap_validate_node = 32,
+    /// `SlotReader.startGroup()` / `endGroup()` — group cursor bookkeeping.
+    sr_start_group = 33,
+    sr_end_group = 34,
+    /// `Operations.OpIterator.next/getInt/getObject` — the changelist drain
+    /// cursor (identical bodies in both composers).
+    op_iter_next = 35,
+    op_iter_get_int = 36,
+    op_iter_get_object = 37,
 };
 
 /// Classify once per `Func` (the caller memoizes into `func.host_route`).
 pub fn classify(fqn: []const u8, n_params: usize) Route {
     if (n_params == 1) {
+        if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotReader.next")) return .sr_next;
+        if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotReader.startGroup")) return .sr_start_group;
+        if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotReader.endGroup")) return .sr_end_group;
+        if (std.mem.endsWith(u8, fqn, ".changelist.Operations.OpIterator.next")) return .op_iter_next;
+        if (std.mem.endsWith(u8, fqn, "GapComposer.validateNodeNotExpected")) return .gap_validate_node;
+        if (std.mem.eql(u8, fqn, "__get_SlotReader_groupKey")) return .sr_group_key_get;
+        if (std.mem.eql(u8, fqn, "__get_SlotReader_isGroupEnd")) return .sr_is_group_end_get;
+        if (std.mem.eql(u8, fqn, "__get_SlotReader_nodeCount")) return .sr_node_count_get;
+        if (std.mem.eql(u8, fqn, "__get_RecomposeScopeImpl_requiresRecompose")) return .rsi_req_recompose_get;
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.IntStack.pop")) return .int_stack_pop;
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.IntStack.peek")) return .int_stack_peek;
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.IntStack.peek2")) return .int_stack_peek2;
@@ -71,6 +108,13 @@ pub fn classify(fqn: []const u8, n_params: usize) Route {
     }
     if (n_params == 2) {
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.composer.gapbuffer.slotAnchor")) return .slot_anchor;
+        if (std.mem.eql(u8, fqn, "androidx.compose.runtime.composer.gapbuffer.parentAnchor")) return .gap_parent_anchor;
+        if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotReader.nodeCount")) return .sr_node_count_at;
+        if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotReader.groupKey")) return .sr_group_key_at;
+        if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotWriter.dataIndex")) return .sw_data_index;
+        if (std.mem.endsWith(u8, fqn, ".changelist.Operations.OpIterator.getInt")) return .op_iter_get_int;
+        if (std.mem.endsWith(u8, fqn, ".changelist.Operations.OpIterator.getObject")) return .op_iter_get_object;
+        if (std.mem.eql(u8, fqn, "__set_RecomposeScopeImpl_requiresRecompose")) return .rsi_req_recompose_set;
         if (std.mem.endsWith(u8, fqn, "gapbuffer.changelist.Operations.pushOp") or
             std.mem.endsWith(u8, fqn, "gapbuffer.changelist.Operations.push")) return .ops_push_op;
         if (std.mem.endsWith(u8, fqn, "linkbuffer.changelist.Operations.pushOp") or
@@ -461,4 +505,429 @@ test "compoundWith round-trips through unCompoundWith" {
 test "compoundWith matches rotateLeft xor" {
     const c = serveCompoundWith(&.{ .{ .Long = 1 }, .{ .Int = 7 }, .{ .Int = 3 } }).?;
     try std.testing.expectEqual(@as(i64, 8 ^ 7), c.Long);
+}
+
+// ---- Slot-table reader / writer / changelist-iterator serves ----------------
+//
+// All of these are field-and-index math over the gap-buffer group table
+// (five ints per group: key, info, parent anchor, size, data anchor) and the
+// changelist's parallel arrays. Reads and validations run first under a
+// shared borrow; writes run after, under a mutable borrow, and only once
+// every written field has been proven present — a serve must never leave an
+// instance half-mutated before declining.
+
+threadlocal var fn_empty_count: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_cur_slot: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_cur_slot_end: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_had_next: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_slots_field: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_cur_group: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_cur_end: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_groups: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_parent_f: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_groups_size: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_slots_size: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_src_map: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_slot_stack: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_flags: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_node_expected: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_group_gap_start: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_group_gap_len: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_slots_gap_len: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_op_idx: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_int_idx: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_obj_idx: std.atomic.Value(?[*]const u8) = .init(null);
+
+const GROUP_FIELDS = 5;
+const GROUP_INFO_OFF = 1;
+const PARENT_ANCHOR_OFF = 2;
+const SIZE_OFF = 3;
+const DATA_ANCHOR_OFF = 4;
+const NODE_COUNT_MASK: i32 = 0x03FF_FFFF;
+
+fn groupField(arr: runtime.ArrayData, group: i32, off: i32) ?i32 {
+    if (group < 0) return null;
+    const idx = @as(i64, group) * GROUP_FIELDS + off;
+    if (idx < 0 or idx >= @as(i64, @intCast(arr.len()))) return null;
+    const v = arr.get(@intCast(idx));
+    return asI32(&v);
+}
+
+fn intField(inst: anytype, slot: *std.atomic.Value(?[*]const u8), name: []const u8) ?i32 {
+    const v = inst.getCached(slot, name) orelse return null;
+    return asI32(&v);
+}
+
+fn intArrayField(inst: anytype, slot: *std.atomic.Value(?[*]const u8), name: []const u8) ?runtime.ArrayData {
+    const v = inst.getCached(slot, name) orelse return null;
+    if (v != .Array or v.Array.prim != .Int) return null;
+    return v.Array;
+}
+
+fn objArrayField(inst: anytype, slot: *std.atomic.Value(?[*]const u8), name: []const u8) ?runtime.ArrayData {
+    const v = inst.getCached(slot, name) orelse return null;
+    if (v != .Array or v.Array.prim != null) return null;
+    return v.Array;
+}
+
+/// `slots[currentSlot++]` on the had-a-slot branch; the empty/end branch
+/// returns `Composer.Empty`, which only the interpreted body can name.
+pub fn serveSlotReaderNext(args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    var slot_v: Value = undefined;
+    var cur: i32 = 0;
+    {
+        const g = args[0].Instance.borrow();
+        defer g.deinit();
+        const inst = g.get();
+        const empty = intField(inst, &fn_empty_count, "emptyCount") orelse return null;
+        cur = intField(inst, &fn_cur_slot, "currentSlot") orelse return null;
+        const end = intField(inst, &fn_cur_slot_end, "currentSlotEnd") orelse return null;
+        if (empty > 0 or cur >= end) return null;
+        const slots = objArrayField(inst, &fn_slots_field, "slots") orelse return null;
+        if (cur < 0 or @as(usize, @intCast(cur)) >= slots.len()) return null;
+        _ = inst.getCached(&fn_had_next, "hadNext") orelse return null;
+        slot_v = slots.get(@intCast(cur));
+    }
+    {
+        const g = args[0].Instance.borrowMut();
+        defer g.deinit();
+        const inst = g.get();
+        if (!inst.set("hadNext", .{ .Bool = true })) return null;
+        if (!inst.set("currentSlot", .{ .Int = cur + 1 })) return null;
+    }
+    slot_v.retain();
+    return slot_v;
+}
+
+pub fn serveSlotReaderGroupKeyGet(args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    const g = args[0].Instance.borrow();
+    defer g.deinit();
+    const inst = g.get();
+    const cur = intField(inst, &fn_cur_group, "currentGroup") orelse return null;
+    const end = intField(inst, &fn_cur_end, "currentEnd") orelse return null;
+    if (cur >= end) return .{ .Int = 0 };
+    const groups = intArrayField(inst, &fn_groups, "groups") orelse return null;
+    const k = groupField(groups, cur, 0) orelse return null;
+    return .{ .Int = k };
+}
+
+pub fn serveSlotReaderGroupKeyAt(args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    const index = asI32(&args[1]) orelse return null;
+    const g = args[0].Instance.borrow();
+    defer g.deinit();
+    const groups = intArrayField(g.get(), &fn_groups, "groups") orelse return null;
+    const k = groupField(groups, index, 0) orelse return null;
+    return .{ .Int = k };
+}
+
+pub fn serveSlotReaderIsGroupEnd(args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    const g = args[0].Instance.borrow();
+    defer g.deinit();
+    const inst = g.get();
+    const empty = intField(inst, &fn_empty_count, "emptyCount") orelse return null;
+    const cur = intField(inst, &fn_cur_group, "currentGroup") orelse return null;
+    const end = intField(inst, &fn_cur_end, "currentEnd") orelse return null;
+    return .{ .Bool = empty > 0 or cur == end };
+}
+
+pub fn serveSlotReaderNodeCountGet(args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    const g = args[0].Instance.borrow();
+    defer g.deinit();
+    const inst = g.get();
+    const cur = intField(inst, &fn_cur_group, "currentGroup") orelse return null;
+    const groups = intArrayField(inst, &fn_groups, "groups") orelse return null;
+    const info = groupField(groups, cur, GROUP_INFO_OFF) orelse return null;
+    return .{ .Int = info & NODE_COUNT_MASK };
+}
+
+pub fn serveSlotReaderNodeCountAt(args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    const index = asI32(&args[1]) orelse return null;
+    const g = args[0].Instance.borrow();
+    defer g.deinit();
+    const groups = intArrayField(g.get(), &fn_groups, "groups") orelse return null;
+    const info = groupField(groups, index, GROUP_INFO_OFF) orelse return null;
+    return .{ .Int = info & NODE_COUNT_MASK };
+}
+
+pub fn serveGapParentAnchor(args: []const Value) ?Value {
+    if (args[0] != .Array) return null;
+    if (args[0].Array.prim != .Int) return null;
+    const address = asI32(&args[1]) orelse return null;
+    const v = groupField(args[0].Array, address, PARENT_ANCHOR_OFF) orelse return null;
+    return .{ .Int = v };
+}
+
+/// `groups.dataIndex(groupIndexToAddress(index))` over the writer's gaps.
+pub fn serveSlotWriterDataIndex(args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    const index = asI32(&args[1]) orelse return null;
+    const g = args[0].Instance.borrow();
+    defer g.deinit();
+    const inst = g.get();
+    const gap_start = intField(inst, &fn_group_gap_start, "groupGapStart") orelse return null;
+    const gap_len = intField(inst, &fn_group_gap_len, "groupGapLen") orelse return null;
+    const slots_gap_len = intField(inst, &fn_slots_gap_len, "slotsGapLen") orelse return null;
+    const groups = intArrayField(inst, &fn_groups, "groups") orelse return null;
+    const slots = objArrayField(inst, &fn_slots_field, "slots") orelse return null;
+    const address: i32 = index + (if (index < gap_start) @as(i32, 0) else gap_len);
+    const capacity: i64 = @intCast(groups.len() / GROUP_FIELDS);
+    if (address >= capacity) {
+        return .{ .Int = @as(i32, @intCast(@as(i64, @intCast(slots.len())) - slots_gap_len)) };
+    }
+    const anchor = groupField(groups, address, DATA_ANCHOR_OFF) orelse return null;
+    if (anchor >= 0) return .{ .Int = anchor };
+    const cap_slots: i32 = @intCast(slots.len());
+    return .{ .Int = (cap_slots -% slots_gap_len) +% anchor +% 1 };
+}
+
+const REQUIRES_RECOMPOSE_FLAG: i32 = 0x008;
+
+pub fn serveRsiRequiresRecomposeGet(args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    const g = args[0].Instance.borrow();
+    defer g.deinit();
+    const flags = intField(g.get(), &fn_flags, "flags") orelse return null;
+    return .{ .Bool = flags & REQUIRES_RECOMPOSE_FLAG != 0 };
+}
+
+pub fn serveRsiRequiresRecomposeSet(args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    const value = switch (args[1]) {
+        .Bool => |b| b,
+        else => return null,
+    };
+    var flags: i32 = 0;
+    {
+        const g = args[0].Instance.borrow();
+        defer g.deinit();
+        flags = intField(g.get(), &fn_flags, "flags") orelse return null;
+    }
+    const updated = if (value) flags | REQUIRES_RECOMPOSE_FLAG else flags & ~REQUIRES_RECOMPOSE_FLAG;
+    const g = args[0].Instance.borrowMut();
+    defer g.deinit();
+    if (!g.get().set("flags", .{ .Int = updated })) return null;
+    return .{ .Unit = {} };
+}
+
+/// `runtimeCheck(!nodeExpected)` — a no-op unless it must raise, and the
+/// raising path belongs to the interpreted body.
+pub fn serveValidateNodeNotExpected(args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    const g = args[0].Instance.borrow();
+    defer g.deinit();
+    const v = g.get().getCached(&fn_node_expected, "nodeExpected") orelse return null;
+    return switch (v) {
+        .Bool => |b| if (b) null else .{ .Unit = {} },
+        else => null,
+    };
+}
+
+/// `startGroup()`: cursor bookkeeping plus one push onto the reader's
+/// IntStack. Declines when the stack must grow, the precondition would
+/// fail, or a source-information map is attached.
+pub fn serveSlotReaderStartGroup(args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    var stack_v: Value = undefined;
+    var push_v: i32 = 0;
+    var new_parent: i32 = 0;
+    var new_end: i32 = 0;
+    var new_group: i32 = 0;
+    var new_slot: i32 = 0;
+    var new_slot_end: i32 = 0;
+    {
+        const g = args[0].Instance.borrow();
+        defer g.deinit();
+        const inst = g.get();
+        const empty = intField(inst, &fn_empty_count, "emptyCount") orelse return null;
+        if (empty > 0) return .{ .Unit = {} };
+        const src = inst.getCached(&fn_src_map, "sourceInformationMap") orelse return null;
+        if (src != .Null) return null;
+        const parent = intField(inst, &fn_parent_f, "parent") orelse return null;
+        const cur = intField(inst, &fn_cur_group, "currentGroup") orelse return null;
+        const groups = intArrayField(inst, &fn_groups, "groups") orelse return null;
+        const pa = groupField(groups, cur, PARENT_ANCHOR_OFF) orelse return null;
+        if (pa != parent) return null;
+        const cur_slot = intField(inst, &fn_cur_slot, "currentSlot") orelse return null;
+        const cur_slot_end = intField(inst, &fn_cur_slot_end, "currentSlotEnd") orelse return null;
+        const groups_size = intField(inst, &fn_groups_size, "groupsSize") orelse return null;
+        const slots_size = intField(inst, &fn_slots_size, "slotsSize") orelse return null;
+        stack_v = inst.getCached(&fn_slot_stack, "currentSlotStack") orelse return null;
+        if (stack_v != .Instance) return null;
+
+        push_v = if (cur_slot == 0 and cur_slot_end == 0) -1 else cur_slot;
+        const size = groupField(groups, cur, SIZE_OFF) orelse return null;
+        const anchor = groupField(groups, cur, DATA_ANCHOR_OFF) orelse return null;
+        const info = groupField(groups, cur, GROUP_INFO_OFF) orelse return null;
+        new_parent = cur;
+        new_end = cur +% size;
+        new_group = cur + 1;
+        new_slot = anchor +% @as(i32, @intCast(@popCount(@as(u32, @bitCast(info >> 28)))));
+        new_slot_end = if (cur >= groups_size - 1)
+            slots_size
+        else
+            groupField(groups, cur + 1, DATA_ANCHOR_OFF) orelse return null;
+    }
+    // The IntStack push first: it is the only step that can decline (a full
+    // stack resizes on the interpreted path), and nothing is written before
+    // it succeeds.
+    const s = readStack(&stack_v) orelse return null;
+    if (s.tos < 0 or @as(usize, @intCast(s.tos)) >= s.len) return null;
+    s.slots.set(std.heap.page_allocator, @intCast(s.tos), .{ .Int = push_v });
+    if (!writeTos(&stack_v, s.tos + 1)) return null;
+    const g = args[0].Instance.borrowMut();
+    defer g.deinit();
+    const inst = g.get();
+    if (!inst.set("parent", .{ .Int = new_parent })) return null;
+    if (!inst.set("currentEnd", .{ .Int = new_end })) return null;
+    if (!inst.set("currentGroup", .{ .Int = new_group })) return null;
+    if (!inst.set("currentSlot", .{ .Int = new_slot })) return null;
+    if (!inst.set("currentSlotEnd", .{ .Int = new_slot_end })) return null;
+    return .{ .Unit = {} };
+}
+
+/// `endGroup()`: the inverse bookkeeping plus one IntStack pop.
+pub fn serveSlotReaderEndGroup(args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    var stack_v: Value = undefined;
+    var new_parent: i32 = 0;
+    var new_end: i32 = 0;
+    var groups_size: i32 = 0;
+    var slots_size: i32 = 0;
+    var groups: runtime.ArrayData = undefined;
+    {
+        const g = args[0].Instance.borrow();
+        defer g.deinit();
+        const inst = g.get();
+        const empty = intField(inst, &fn_empty_count, "emptyCount") orelse return null;
+        if (empty != 0) return .{ .Unit = {} };
+        const cur = intField(inst, &fn_cur_group, "currentGroup") orelse return null;
+        const end = intField(inst, &fn_cur_end, "currentEnd") orelse return null;
+        if (cur != end) return null;
+        const parent = intField(inst, &fn_parent_f, "parent") orelse return null;
+        if (parent < 0) return null;
+        groups = intArrayField(inst, &fn_groups, "groups") orelse return null;
+        groups_size = intField(inst, &fn_groups_size, "groupsSize") orelse return null;
+        slots_size = intField(inst, &fn_slots_size, "slotsSize") orelse return null;
+        new_parent = groupField(groups, parent, PARENT_ANCHOR_OFF) orelse return null;
+        if (new_parent < 0) {
+            new_end = groups_size;
+        } else {
+            const psize = groupField(groups, new_parent, SIZE_OFF) orelse return null;
+            new_end = new_parent +% psize;
+        }
+        _ = intField(inst, &fn_cur_slot, "currentSlot") orelse return null;
+        _ = intField(inst, &fn_cur_slot_end, "currentSlotEnd") orelse return null;
+        stack_v = inst.getCached(&fn_slot_stack, "currentSlotStack") orelse return null;
+        if (stack_v != .Instance) return null;
+    }
+    const s = readStack(&stack_v) orelse return null;
+    const popped = slotAt(s, s.tos - 1) orelse return null;
+    var new_slot: i32 = 0;
+    var new_slot_end: i32 = 0;
+    if (popped >= 0) {
+        new_slot = popped;
+        new_slot_end = if (new_parent >= groups_size - 1)
+            slots_size
+        else
+            groupField(groups, new_parent + 1, DATA_ANCHOR_OFF) orelse return null;
+    }
+    if (!writeTos(&stack_v, s.tos - 1)) return null;
+    const g = args[0].Instance.borrowMut();
+    defer g.deinit();
+    const inst = g.get();
+    if (!inst.set("parent", .{ .Int = new_parent })) return null;
+    if (!inst.set("currentEnd", .{ .Int = new_end })) return null;
+    if (!inst.set("currentSlot", .{ .Int = new_slot })) return null;
+    if (!inst.set("currentSlotEnd", .{ .Int = new_slot_end })) return null;
+    return .{ .Unit = {} };
+}
+
+/// The drain cursor over the changelist's parallel arrays. The iterator is
+/// an inner class: its `Operations` lives in the instance's captured outer.
+fn iterOuter(recv: *const Value) ?Value {
+    if (recv.* != .Instance) return null;
+    const g = recv.Instance.borrow();
+    defer g.deinit();
+    const outer = g.get().outer orelse return null;
+    if (outer != .Instance) return null;
+    return outer;
+}
+
+pub fn serveOpIterNext(args: []const Value) ?Value {
+    const outer = iterOuter(&args[0]) orelse return null;
+    var op_idx: i32 = 0;
+    var int_idx: i32 = 0;
+    var obj_idx: i32 = 0;
+    {
+        const g = args[0].Instance.borrow();
+        defer g.deinit();
+        const inst = g.get();
+        op_idx = intField(inst, &fn_op_idx, "opIdx") orelse return null;
+        int_idx = intField(inst, &fn_int_idx, "intIdx") orelse return null;
+        obj_idx = intField(inst, &fn_obj_idx, "objIdx") orelse return null;
+    }
+    var op_size: i32 = 0;
+    var op_v: Value = undefined;
+    {
+        const g = outer.Instance.borrow();
+        defer g.deinit();
+        const inst = g.get();
+        const os = inst.getCached(&fn_opcodes_size, "opCodesSize") orelse return null;
+        op_size = asI32(&os) orelse return null;
+        if (op_idx >= op_size) return .{ .Bool = false };
+        const codes = objArrayField(inst, &fn_opcodes, "opCodes") orelse return null;
+        if (op_idx < 0 or @as(usize, @intCast(op_idx)) >= codes.len()) return null;
+        op_v = codes.get(@intCast(op_idx));
+    }
+    const counts = readOpCounts(&op_v) orelse return null;
+    const g = args[0].Instance.borrowMut();
+    defer g.deinit();
+    const inst = g.get();
+    if (!inst.set("intIdx", .{ .Int = int_idx +% counts.ints })) return null;
+    if (!inst.set("objIdx", .{ .Int = obj_idx +% counts.objects })) return null;
+    if (!inst.set("opIdx", .{ .Int = op_idx + 1 })) return null;
+    return .{ .Bool = op_idx + 1 < op_size };
+}
+
+pub fn serveOpIterGetInt(args: []const Value) ?Value {
+    const outer = iterOuter(&args[0]) orelse return null;
+    const param = asI32(&args[1]) orelse return null;
+    var int_idx: i32 = 0;
+    {
+        const g = args[0].Instance.borrow();
+        defer g.deinit();
+        int_idx = intField(g.get(), &fn_int_idx, "intIdx") orelse return null;
+    }
+    const g = outer.Instance.borrow();
+    defer g.deinit();
+    const ints = intArrayField(g.get(), &fn_int_args, "intArgs") orelse return null;
+    const idx = int_idx +% param;
+    if (idx < 0 or @as(usize, @intCast(idx)) >= ints.len()) return null;
+    const v = ints.get(@intCast(idx));
+    return .{ .Int = asI32(&v) orelse return null };
+}
+
+pub fn serveOpIterGetObject(args: []const Value) ?Value {
+    const outer = iterOuter(&args[0]) orelse return null;
+    const param = paramOffset(&args[1]) orelse return null;
+    var obj_idx: i32 = 0;
+    {
+        const g = args[0].Instance.borrow();
+        defer g.deinit();
+        obj_idx = intField(g.get(), &fn_obj_idx, "objIdx") orelse return null;
+    }
+    const g = outer.Instance.borrow();
+    defer g.deinit();
+    const objs = objArrayField(g.get(), &fn_obj_args, "objectArgs") orelse return null;
+    const idx = obj_idx +% param;
+    if (idx < 0 or @as(usize, @intCast(idx)) >= objs.len()) return null;
+    const v = objs.get(@intCast(idx));
+    v.retain();
+    return v;
 }

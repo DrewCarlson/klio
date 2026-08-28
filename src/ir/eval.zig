@@ -4633,9 +4633,12 @@ pub fn evalWithCapturesChained(
     // leg resolves natively (`readable` inside `writableRecord` rode that
     // route at 1.1 frames per map insert). Args are already settled in param
     // order, which is exactly the shape the serves take.
-    if (owning == null and closure_id == null and chain_seed.len == 0 and
-        captures.items.len == 0)
-    {
+    // A host-served target is a pure function of (receiver, args) by
+    // construction, so a chain SEED does not disqualify it: the seed only
+    // matters to a framed body, and member calls always carry one — which
+    // silently kept every serve off the member-call path (`Operations.push`
+    // framed 4% of vpd with its serve sitting right here).
+    if (owning == null and closure_id == null and captures.items.len == 0) {
         if (exec_call.hostRouteServe(H, allocator, func, args.items, host)) |served| {
             var a = args;
             a.deinit(allocator);
@@ -5485,8 +5488,12 @@ fn runFlatLoop(
             };
             // A host-served compose helper answers before any activation
             // opens, on the flat path as well as the recursive seam: the
-            // composer's stacks are reached through both.
-            if (site.req.captures.items.len == 0 and site.req.pop_enclosing_n == 0) {
+            // composer's stacks are reached through both. A pending
+            // enclosing pop or chain seed is fine — `discardFlatReq` undoes
+            // everything the request set up.
+            if (site.req.captures.items.len == 0 and site.req.closure_id == null and
+                site.req.type_args.len == 0 and !site.req.composer_pushed)
+            {
                 if (exec_call.hostRouteServe(H, allocator, site.req.func, site.req.args.items, host)) |served| {
                     const dst = site.req.dst;
                     discardFlatReq(H, allocator, site.req, host);
