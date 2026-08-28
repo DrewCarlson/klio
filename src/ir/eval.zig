@@ -1477,6 +1477,8 @@ pub var frame_watch_want: []const u8 = "";
 
 pub fn frameCountInit() void {
     frame_count_on = runtime.envOnce("KLIO_FRAME_COUNT") != null;
+    fuse_census_on = runtime.envOnce("KLIO_FUSE_CENSUS") != null;
+    if (fuse_census_on) frame_count_on = true;
     if (runtime.envOnce("KLIO_FRAME_WATCH")) |w| {
         frame_watch_want = w;
         frame_count_on = true;
@@ -1488,6 +1490,61 @@ pub fn frameCountInit() void {
 inline fn frameCensusBump(fid: u32) void {
     if (!frame_census_on) return;
     frame_census[fid & (FRAME_CENSUS_SLOTS - 1)] +%= 1;
+}
+
+/// `KLIO_FUSE_CENSUS`: the ceiling measurement for a fused native-bank
+/// execution tier. Every activated body is classified once — could a walker
+/// with C-stack registers, routed field access and pre-resolved calls run
+/// it end to end? — and activations tally by verdict, with the blocking
+/// instruction named for the near-misses.
+var fuse_census_on: bool = false;
+var fuse_ok_acts: u64 = 0;
+var fuse_blocked_acts: u64 = 0;
+var fuse_structural_acts: u64 = 0;
+var fuse_block_by_tag: [64]u64 = @splat(0);
+const FUSE_VERDICT_SLOTS: usize = 1 << 21;
+/// 0 = unclassified, 1 = ok, 2 + tag = blocked by that instruction tag,
+/// 255 = structural (suspend / catches / too big).
+var fuse_verdict: [FUSE_VERDICT_SLOTS]u8 = @splat(0);
+
+fn fuseClassify(func: *const Func) u8 {
+    if (func.is_suspend) return 255;
+    if (func.blocks.len == 0 or func.blocks.len > 64) return 255;
+    if (func.n_locals > 128) return 255;
+    var total: usize = 0;
+    for (func.blocks) |*b| {
+        if (b.catches.len != 0 or b.finally != null or b.lr_absorb != null) return 255;
+        total += b.insts.len;
+        if (total > 256) return 255;
+        switch (b.terminator) {
+            .Return, .Goto, .Branch, .Throw, .Unreachable, .Switch => {},
+            else => return 255,
+        }
+        for (b.insts) |*inst| {
+            switch (inst.*) {
+                .Const, .Move, .LoadParam, .LoadCapture, .BinOp, .UnOp, .Not, .Trace,
+                .GetField, .SetField, .Index, .IndexSet, .Cast, .InstanceOf,
+                .NotNullAssert, .Call, .MakeCell, .CellGet,
+                .CellSet, .QualifiedThis, .EnclosingPush, .EnclosingPop => {},
+                else => return 2 + @as(u8, @intFromEnum(std.meta.activeTag(inst.*))),
+            }
+        }
+    }
+    return 1;
+}
+
+inline fn fuseCensusBump(func: *const Func) void {
+    if (!fuse_census_on) return;
+    const slot = func.id.int() & (FUSE_VERDICT_SLOTS - 1);
+    if (fuse_verdict[slot] == 0) fuse_verdict[slot] = fuseClassify(func);
+    switch (fuse_verdict[slot]) {
+        1 => fuse_ok_acts += 1,
+        255 => fuse_structural_acts += 1,
+        else => |v| {
+            fuse_blocked_acts += 1;
+            if (v >= 2 and v - 2 < fuse_block_by_tag.len) fuse_block_by_tag[v - 2] += 1;
+        },
+    }
 }
 
 /// Executed-instruction total (`KLIO_FRAME_COUNT` prints it): the denominator
@@ -1520,6 +1577,15 @@ pub fn frameCountDump(module: *const Module) void {
         }.gt);
         for (fl.items[0..@min(fl.items.len, 12)]) |e| {
             std.debug.print("[fill] {d:>10} {s}\n", .{ e.n, e.name });
+        }
+    }
+    if (fuse_census_on) {
+        std.debug.print("[fuse] ok={d} blocked={d} structural={d}\n", .{ fuse_ok_acts, fuse_blocked_acts, fuse_structural_acts });
+        const tag_fields = @typeInfo(@typeInfo(Inst).@"union".tag_type.?).@"enum".fields;
+        inline for (tag_fields) |f| {
+            if (f.value < fuse_block_by_tag.len and fuse_block_by_tag[f.value] != 0) {
+                std.debug.print("[fuse-block] {d:>10} {s}\n", .{ fuse_block_by_tag[f.value], f.name });
+            }
         }
     }
     std.debug.print("[getfield] mono={d} getter={d} poly={d} total={d} getter_ms={d} slow_ms={d}\n", .{ gf_mono, gf_getter, gf_poly, gf_slow, gf_getter_ns / 1_000_000, gf_slow_ns / 1_000_000 });
@@ -3300,6 +3366,7 @@ pub const Frame = struct {
         const no_fill = !runtime.reclaimEnabled() and func.frameNoFill();
         if (frame_count_on) {
             frameCensusBump(func.id.int());
+            fuseCensusBump(func);
             if (frame_watch_want.len != 0 and std.mem.indexOf(u8, func.name, frame_watch_want) != null) {
                 const caller: []const u8 = if (evtls.frame_chain) |fr| fr.func.name else "<top>";
                 std.debug.print("[framewatch] {s} <- {s}\n", .{ func.name, caller });

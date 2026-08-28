@@ -173,18 +173,30 @@ hands every uninlined op back to `klio_op_*`, and a recomposition IS dispatch
 and frame machinery, so the C adds a layer without removing work. Do not
 re-try a wider op selector.
 
-- [ ] A1d — inline DISPATCH and native frames (inline caches, native
-      activation records): the only remaining piece that could move compose,
-      and a different architecture from the per-op ABI. Research-scale.
-      SCOPED 2026-08-28 (`[census-split]` in the frame census): per
-      recomposition window the activation split is compose 70% + compose
-      accessors 18% + lambdas 3.6% = **~92% of activations live inside the
-      emittable compose set**; coroutines 2%, long-tail stdlib 6%. So a
-      native set that elides dispatch+frames BETWEEN its own bodies covers
-      the window; the interpreter bridge is the ~8% tail, not the spine.
-      Next: native->native direct calls for bake-resolved targets within the
-      emitted set, C-local register banks with GC keepalive registration,
-      bail-to-interp on polymorphic-guard miss / suspension / throw.
+- [ ] A1d — the fused native-bank execution tier, now DESIGNED AGAINST
+      MEASUREMENT (`KLIO_FUSE_CENSUS`, landed): a per-body classifier
+      tallies which activations a walker with C-stack registers, routed
+      field access and host-entry slow paths could run end to end.
+      - Package split: ~92% of activations live in the emittable compose
+        set (70% named + 18% accessors + 3.6% lambdas).
+      - OPEN-WORLD expressibility (dynamic calls allowed): 58% of
+        activations; blockers CallMemberOrGlobal 23k / LoadGlobal 23k /
+        LoadFromThisOrGlobal 21k / NewInstance 21k per replica run.
+        Admitting those four via host entries reaches ~96%.
+      - CLOSED-WORLD (dynamic calls excluded): only 27% (~7% wall) —
+        CallMember alone blocks 36k. NOT worth a tier alone.
+      - The boundary is RESUMABILITY: a frameless body cannot sit under a
+        suspending callee. The sound design is SUSPENSION
+        MATERIALIZATION — on `.Suspended` from a callee, build the real
+        Frame from the C bank at the current (block, inst) and hand it to
+        the park machinery as if it had always been framed. Abandon never
+        exists in this tier (bodies have writes); errors RAISE.
+      - Ceiling arithmetic: frame machinery is ~270ns of a ~430ns framed
+        call (measured on a 1M-call probe); full open-world coverage is
+        ~25% of the recomposition wall -> vpd solo ~360s, in-suite ~520s.
+        Slice 1 (the walker + materialization) does NOT close Task 2 by
+        itself; slice 2 is typed unboxing + direct native->native calls on
+        the same skeleton.
 - A2 (bake-time AOT registration) and A3 (retire the hand serves) only
   matter once A1d exists; the hand serves (`snapshot_fast`, `compose_fast`,
   `persistent_map_mut`) stay as the working instances.
