@@ -1675,9 +1675,10 @@ pub const LEAF_MAX_REGS: u32 = 64;
 const FRAME_FILL_MAX_BLOCKS: usize = 256;
 
 /// Register-set width for `frameDefBeforeUse`, in 64-bit words. Compose's
-/// composables and the slot-table walkers run 70-210 locals; capping the
-/// analysis at one word sent every one of them to the eager fill.
-pub const FRAME_FILL_WORDS: usize = 4;
+/// composables and slot-table walkers run 70-500 locals (`GapComposer.end`
+/// alone carries 502); capping the analysis at one word sent every one of
+/// them to the eager fill.
+pub const FRAME_FILL_WORDS: usize = 8;
 pub const FRAME_FILL_MAX_REGS: u32 = FRAME_FILL_WORDS * 64;
 
 const RegSet = [FRAME_FILL_WORDS]u64;

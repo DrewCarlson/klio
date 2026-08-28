@@ -521,11 +521,20 @@ fn classifyFlattenable(f: *const Func) u8 {
 /// guarded decrement went negative). Callers therefore pass `&evtls` read
 /// fresh at the call, never a stored pointer — which also keeps the thread
 /// pointer to one lookup per frame operation instead of one per pool.
+/// Per-function eager-fill census (`KLIO_FRAME_CENSUS`): which bodies still
+/// pay the whole register bank on every call.
+var fill_census: [FRAME_CENSUS_SLOTS]u32 = @splat(0);
+
+pub fn fillCensusBump(fid: u32, n: u32) void {
+    if (!frame_census_on) return;
+    fill_census[fid & (FRAME_CENSUS_SLOTS - 1)] +%= n;
+}
+
 pub var regs_pool_hit: u64 = 0;
 pub var regs_pool_miss: u64 = 0;
 pub var regs_fill_slots: u64 = 0;
 
-fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32, no_fill: bool) Allocator.Error!std.ArrayList(Value) {
+fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32, no_fill: bool, fid: u32) Allocator.Error!std.ArrayList(Value) {
     if (frame_count_on) frame_alloc_total += 1;
     const ra = regsAlloc(allocator);
     if (ev.regs_pool.items.len > 0) {
@@ -538,7 +547,10 @@ fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32, no_fill: bool) Alloca
             if (!no_fill) @memset(list.items, .Unit);
             if (frame_count_on) {
                 regs_pool_hit += 1;
-                if (!no_fill) regs_fill_slots += n;
+                if (!no_fill) {
+                    regs_fill_slots += n;
+                    fillCensusBump(fid, n);
+                }
             }
             // Re-enters the traced set (see releaseRegs).
             if (runtime.gc.gc_enabled and !runtime.reclaimEnabled() and runtime.gc.external_accounting) runtime.gc.noteExternalBytes(buf.len * @sizeOf(Value));
@@ -547,7 +559,10 @@ fn acquireRegs(ev: *EvalTls, allocator: Allocator, n: u32, no_fill: bool) Alloca
     }
     if (frame_count_on) {
         regs_pool_miss += 1;
-        if (!no_fill) regs_fill_slots += n;
+        if (!no_fill) {
+            regs_fill_slots += n;
+            fillCensusBump(fid, n);
+        }
     }
     var regs: std.ArrayList(Value) = .empty;
     if (no_fill) {
@@ -1484,6 +1499,27 @@ pub fn frameCountDump(module: *const Module) void {
     if (!frame_count_on) return;
     std.debug.print("[frames] entries={d} activations={d} insts={d}\n", .{ frame_count_total, frame_alloc_total, inst_count_all.load(.monotonic) + inst_count });
     std.debug.print("[regs] pool_hit={d} pool_miss={d} filled_slots={d}\n", .{ regs_pool_hit, regs_pool_miss, regs_fill_slots });
+    if (frame_census_on) {
+        const FE = struct { name: []const u8, n: u32 };
+        var fl: std.ArrayList(FE) = .empty;
+        defer fl.deinit(std.heap.page_allocator);
+        var fid: u32 = 0;
+        while (fid < fill_census.len) : (fid += 1) {
+            const n = fill_census[fid];
+            if (n == 0) continue;
+            const f = module.funcById(@enumFromInt(fid));
+            const nm: []const u8 = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "<unknown>";
+            fl.append(std.heap.page_allocator, .{ .name = nm, .n = n }) catch break;
+        }
+        std.mem.sort(FE, fl.items, {}, struct {
+            fn gt(_: void, a: FE, b: FE) bool {
+                return a.n > b.n;
+            }
+        }.gt);
+        for (fl.items[0..@min(fl.items.len, 12)]) |e| {
+            std.debug.print("[fill] {d:>10} {s}\n", .{ e.n, e.name });
+        }
+    }
     std.debug.print("[getfield] mono={d} getter={d} poly={d} total={d} getter_ms={d} slow_ms={d}\n", .{ gf_mono, gf_getter, gf_poly, gf_slow, gf_getter_ns / 1_000_000, gf_slow_ns / 1_000_000 });
     if (!frame_census_on) return;
     const Entry = struct { name: []const u8, n: u32 };
@@ -3065,7 +3101,7 @@ fn freeSnapshotBuffers(snap: FrameSnapshot, allocator: Allocator) void {
 /// that materializes the file — must know which slots are live. Four words
 /// cover every frame the def-before-use analysis admits.
 pub const RegMask = struct {
-    pub const WORDS = 4;
+    pub const WORDS = ir.FRAME_FILL_WORDS;
     pub const CAP: usize = WORDS * 64;
 
     w: [WORDS]u64,
@@ -3244,7 +3280,7 @@ pub const Frame = struct {
                 std.debug.print("[framewatch] {s} <- {s}\n", .{ func.name, caller });
             }
         }
-        const regs = try acquireRegs(ev, allocator, func.n_locals, no_fill);
+        const regs = try acquireRegs(ev, allocator, func.n_locals, no_fill, func.id.int());
         return .{
             .module = module,
             .func = func,
