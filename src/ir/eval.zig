@@ -1540,6 +1540,31 @@ pub fn frameCountDump(module: *const Module) void {
             return a.n > b.n;
         }
     }.lt);
+    // Package split for the AOT scoping question: how many activations are
+    // bodies an emitted compose set could own outright.
+    var in_compose: u64 = 0;
+    var in_coroutines: u64 = 0;
+    var in_accessor: u64 = 0;
+    var in_lambda: u64 = 0;
+    var in_other: u64 = 0;
+    for (list.items) |e| {
+        if (std.mem.startsWith(u8, e.name, "androidx.compose")) {
+            in_compose += e.n;
+        } else if (std.mem.startsWith(u8, e.name, "kotlinx.coroutines")) {
+            in_coroutines += e.n;
+        } else if (std.mem.startsWith(u8, e.name, "__get_") or
+            std.mem.startsWith(u8, e.name, "__set_") or
+            std.mem.startsWith(u8, e.name, "__init_prop_") or
+            std.mem.startsWith(u8, e.name, "__ext_get_"))
+        {
+            in_accessor += e.n;
+        } else if (std.mem.startsWith(u8, e.name, "<lambda>")) {
+            in_lambda += e.n;
+        } else {
+            in_other += e.n;
+        }
+    }
+    std.debug.print("[census-split] compose={d} accessor={d} lambda={d} coroutines={d} other={d}\n", .{ in_compose, in_accessor, in_lambda, in_coroutines, in_other });
     const top = @min(list.items.len, 40);
     for (list.items[0..top]) |e| std.debug.print("[frames] {d:>9} {s}\n", .{ e.n, e.name });
 }

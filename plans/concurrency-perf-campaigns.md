@@ -128,6 +128,15 @@ re-try a wider op selector.
 - [ ] A1d — inline DISPATCH and native frames (inline caches, native
       activation records): the only remaining piece that could move compose,
       and a different architecture from the per-op ABI. Research-scale.
+      SCOPED 2026-08-28 (`[census-split]` in the frame census): per
+      recomposition window the activation split is compose 70% + compose
+      accessors 18% + lambdas 3.6% = **~92% of activations live inside the
+      emittable compose set**; coroutines 2%, long-tail stdlib 6%. So a
+      native set that elides dispatch+frames BETWEEN its own bodies covers
+      the window; the interpreter bridge is the ~8% tail, not the spine.
+      Next: native->native direct calls for bake-resolved targets within the
+      emitted set, C-local register banks with GC keepalive registration,
+      bail-to-interp on polymorphic-guard miss / suspension / throw.
 - A2 (bake-time AOT registration) and A3 (retire the hand serves) only
   matter once A1d exists; the hand serves (`snapshot_fast`, `compose_fast`,
   `persistent_map_mut`) stay as the working instances.
