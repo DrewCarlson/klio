@@ -248,11 +248,6 @@ inline fn hostStaticServe(comptime H: type, allocator: Allocator, frame: *Frame,
 }
 
 pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H, allow_flat: bool) Allocator.Error!Step {
-    const arm_t0 = eval.armNow();
-    defer if (eval.armIsOn()) {
-        eval.st_calls += 1;
-        eval.st_ns +%= eval.armNow() -% arm_t0;
-    };
     if (cmgTraceWant()) |w| {
         if (frame.module.funcById(call.func)) |cf| if (std.mem.eql(u8, w, cf.name)) {
             std.debug.print("[call-inst] {s}#{d} n_args={d} n_names={d} exact={} caller={s}", .{ cf.name, call.func.int(), call.n_args, call.arg_names.len, call.exact, frame.func.name });
@@ -766,11 +761,6 @@ pub noinline fn execArmCallSuper(comptime H: type, allocator: Allocator, frame: 
 /// has no name-based fallback: a missing slot is a link error in the program
 /// image and is reported by the host.
 pub noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *Frame, cv: anytype, host: *H) Allocator.Error!Step {
-    const arm_t0 = eval.armNow();
-    defer if (eval.armIsOn()) {
-        eval.vc_calls += 1;
-        eval.vc_ns +%= eval.armNow() -% arm_t0;
-    };
     dispatchBump(.call_virtual_slot);
     if (comptime !@hasDecl(H, "invokeVirtualMember")) {
         return raiseStep(frame, .{ .Type = "CallVirtual is unsupported by this host" });
@@ -1748,11 +1738,6 @@ fn freeMissErr(allocator: Allocator, e: EvalError) void {
 }
 
 pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, cmg: anytype, host: *H) Allocator.Error!Step {
-    const arm_t0 = eval.armNow();
-    defer if (eval.armIsOn()) {
-        eval.mg_calls += 1;
-        eval.mg_ns +%= eval.armNow() -% arm_t0;
-    };
     dispatchBump(.call_member_or_global);
     const name_str = constStr(frame.module, cmg.name) orelse
         return raiseStep(frame, .{ .Type = "CallMemberOrGlobal: name not a string const" });

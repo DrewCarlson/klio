@@ -1498,12 +1498,8 @@ pub var inst_count_all: std.atomic.Value(u64) = .init(0);
 pub fn frameCountDump(module: *const Module) void {
     if (!frame_count_on) return;
     std.debug.print("[frames] entries={d} activations={d} insts={d}\n", .{ frame_count_total, frame_alloc_total, inst_count_all.load(.monotonic) + inst_count });
-    std.debug.print("[call] member={d}/{d}ms static={d}/{d}ms virtual={d}/{d}ms mog={d}/{d}ms\n", .{
-        cm_calls, cm_ns / 1_000_000,
-        st_calls, st_ns / 1_000_000,
-        vc_calls, vc_ns / 1_000_000,
-        mg_calls, mg_ns / 1_000_000,
-    });
+    std.debug.print("[call] pre_ms={d} args_ms={d} replay_ms={d} prep_ms={d} probe_ms={d}\n", .{ cm_pre_ns / 1_000_000, cm_args_ns / 1_000_000, cm_replay_ns / 1_000_000, cm_prep_ns / 1_000_000, cm_probe_ns / 1_000_000 });
+    std.debug.print("[call] member_arms={d}\n", .{cm_calls});
     std.debug.print("[regs] pool_hit={d} pool_miss={d} filled_slots={d}\n", .{ regs_pool_hit, regs_pool_miss, regs_fill_slots });
     if (frame_census_on) {
         const FE = struct { name: []const u8, n: u32 };
@@ -8806,17 +8802,15 @@ inline fn sameFieldName(stored: []const u8, want: []const u8) bool {
 /// probes a hash map. Remember the answer per (site, class) instead: the
 /// route is a pure function of that pair.
 pub var cm_calls: u64 = 0;
-pub var cm_ns: u64 = 0;
-pub var st_calls: u64 = 0;
-pub var st_ns: u64 = 0;
-pub var vc_calls: u64 = 0;
-pub var vc_ns: u64 = 0;
-pub var mg_calls: u64 = 0;
-pub var mg_ns: u64 = 0;
-
-/// Wall nanoseconds inside a dispatch arm, counted only under
-/// `KLIO_FRAME_COUNT`. On the flat path the arm returns before the callee
-/// runs, so this is dispatch cost, not callee cost.
+pub var cm_args_ns: u64 = 0;
+pub var cm_prep_ns: u64 = 0;
+pub var cm_replay_ns: u64 = 0;
+pub var cm_pre_ns: u64 = 0;
+pub var cm_probe_ns: u64 = 0;
+/// Dispatch-phase nanoseconds, counted only under `KLIO_FRAME_COUNT`. Only
+/// phases that RETURN before the callee runs are timed: a timer around a
+/// whole dispatch arm would bill the callee's own execution to dispatch,
+/// which is how a 63ns resolution first read as 590ns.
 pub fn armNow() u64 {
     return gfNow();
 }
@@ -9258,7 +9252,6 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     const cm_t0 = gfNow();
     defer if (frame_count_on) {
         cm_calls += 1;
-        cm_ns +%= gfNow() -% cm_t0;
     };
     const recv = frame.read(cm.receiver);
     if (cmTraceWant()) |w0| {
@@ -9397,7 +9390,9 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     const name_str = constStr(frame.module, cm.name) orelse
         return raiseStep(frame, .{ .Type = "CallMember: name not a string const" });
     runtime.prof.opRoute(0);
+    const cm_args_t0 = gfNow();
     const arg_values = try readArgRun(allocator, frame, cm.args, cm.n_args);
+    if (frame_count_on) cm_args_ns +%= gfNow() -% cm_args_t0;
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cm.arg_names);
     defer freeArgNames(allocator, names);
@@ -9421,6 +9416,7 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     // recorded target without the string-keyed cache probe. The signature is
     // the same strict fold the method cache keys under, so the replay can
     // never serve an overload that cache would have discriminated.
+    if (frame_count_on) cm_pre_ns +%= gfNow() -% cm_t0;
     if (comptime @hasDecl(H, "memberSiteSig") and @hasDecl(H, "prepareMemberFlatFromFid")) {
         if (flatEnabled() and memberSiteEnabled() and recv == .Instance and argNamesAllNull(cm.arg_names)) {
             const w0 = @atomicLoad(u64, @constCast(&cm.site_cls), .acquire);
@@ -9482,6 +9478,10 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
     if (comptime @hasDecl(H, "prepareMemberFlatCall")) {
         if (flatEnabled()) {
             runtime.prof.opRoute(1);
+            const cm_prep_t0 = gfNow();
+            defer if (frame_count_on) {
+                cm_prep_ns +%= gfNow() -% cm_prep_t0;
+            };
             const prep_opt: ?FlatCallReq = if (argNamesAllNull(cm.arg_names))
                 try host.prepareMemberFlatCall(allocator, &recv, name_str, arg_values, static_recv, declared_recv, true)
             else if (comptime @hasDecl(H, "prepareMemberFlatCallNamed"))
