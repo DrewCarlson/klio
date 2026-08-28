@@ -792,12 +792,12 @@ inline fn gcPopFrame(f: *Frame) void {
 /// carried and must never reach the collector.
 fn gcMarkFrameRegs(f: *const Frame, m: *runtime.gc.Marker) void {
     const mask = f.wmask;
-    if (mask == ~@as(u64, 0)) {
+    if (mask.isAll()) {
         for (f.regs.items) |v| v.gcMark(m);
         return;
     }
     for (f.regs.items, 0..) |v, i| {
-        if ((mask >> @as(u6, @truncate(i))) & 1 != 0) v.gcMark(m);
+        if (mask.has(i)) v.gcMark(m);
     }
 }
 
@@ -1717,7 +1717,7 @@ fn spinDumpMaybe() void {
             const n = @min(f0.regs.items.len, 60);
             std.debug.print("  [regs#{d} {s}]", .{ fi, f0.func.name });
             for (f0.regs.items[0..n], 0..) |*v, i| {
-                if ((f0.wmask >> @as(u6, @truncate(i))) & 1 == 0) continue;
+                if (!f0.wmask.has(i)) continue;
                 switch (v.*) {
                     .Int => |x| std.debug.print(" r{d}=i{d}", .{ i, x }),
                     .Long => |x| std.debug.print(" r{d}=L{d}", .{ i, x }),
@@ -3060,6 +3060,43 @@ fn freeSnapshotBuffers(snap: FrameSnapshot, allocator: Allocator) void {
 }
 
 /// Per-call evaluation frame.
+/// Which register slots a frame has actually written. A no-fill frame keeps
+/// whatever its pooled buffer last held, so the collector — and any consumer
+/// that materializes the file — must know which slots are live. Four words
+/// cover every frame the def-before-use analysis admits.
+pub const RegMask = struct {
+    pub const WORDS = 4;
+    pub const CAP: usize = WORDS * 64;
+
+    w: [WORDS]u64,
+
+    pub const none: RegMask = .{ .w = @splat(0) };
+    pub const all: RegMask = .{ .w = @splat(~@as(u64, 0)) };
+
+    pub inline fn isAll(self: RegMask) bool {
+        for (self.w) |x| {
+            if (x != ~@as(u64, 0)) return false;
+        }
+        return true;
+    }
+
+    /// A slot past the tracked range belongs to an eagerly filled frame, so
+    /// it reads as written.
+    pub inline fn has(self: RegMask, i: usize) bool {
+        if (i >= CAP) return true;
+        return (self.w[i >> 6] >> @as(u6, @truncate(i))) & 1 != 0;
+    }
+
+    pub inline fn set(self: *RegMask, i: usize) void {
+        if (i >= CAP) return;
+        self.w[i >> 6] |= @as(u64, 1) << @as(u6, @truncate(i));
+    }
+
+    pub inline fn setAll(self: *RegMask) void {
+        self.w = @splat(~@as(u64, 0));
+    }
+};
+
 pub const Frame = struct {
     module: *const Module,
     func: *const Func,
@@ -3071,7 +3108,7 @@ pub const Frame = struct {
     /// dump mark/read only set slots, and `materializeRegs` fills the rest
     /// with `Unit` before the file escapes the masked world (suspension
     /// snapshot, loop JIT, C-native surface, resume rebuild).
-    wmask: u64,
+    wmask: RegMask,
     params: std.ArrayList(Value),
     captures: std.ArrayList(Value),
     /// The enclosing-`this` chain this frame runs with, innermost last. Seeded
@@ -3212,7 +3249,7 @@ pub const Frame = struct {
             .module = module,
             .func = func,
             .regs = regs,
-            .wmask = if (no_fill) 0 else ~@as(u64, 0),
+            .wmask = if (no_fill) RegMask.none else RegMask.all,
             .params = params,
             .captures = captures,
             .enclosing_this = chainAcquire(ev),
@@ -3347,7 +3384,7 @@ pub const Frame = struct {
         // For an eagerly-filled frame the mask is already all-ones and the
         // (wrapped) bit is a no-op; a no-fill frame's indices are < 64 by
         // the `frameNoFill` gate.
-        self.wmask |= @as(u64, 1) << @as(u6, @truncate(idx));
+        self.wmask.set(idx);
         if (runtime.reclaimEnabled()) {
             const old = self.regs.items[idx];
             self.regs.items[idx] = v;
@@ -3367,11 +3404,11 @@ pub const Frame = struct {
     /// surface, a resume rebuild — so those consumers see exactly the file
     /// an eagerly-filled frame would carry. No-op once saturated.
     fn materializeRegs(self: *Frame) void {
-        if (self.wmask == ~@as(u64, 0)) return;
+        if (self.wmask.isAll()) return;
         for (self.regs.items, 0..) |*v, i| {
-            if ((self.wmask >> @as(u6, @truncate(i))) & 1 == 0) v.* = .Unit;
+            if (!self.wmask.has(i)) v.* = .Unit;
         }
-        self.wmask = ~@as(u64, 0);
+        self.wmask.setAll();
     }
 };
 
@@ -4814,7 +4851,7 @@ pub fn resumeContinuation(
             .dense => |values| {
                 frame.regs.clearRetainingCapacity();
                 try frame.regs.appendSlice(regsAlloc(allocator), values);
-                frame.wmask = ~@as(u64, 0);
+                frame.wmask.setAll();
             },
         }
         // Kotlin `Continuation.resumeWith(Result.failure(e))` means
@@ -6556,7 +6593,7 @@ fn runFrameExec(
                                 if (out == .Bool) {
                                     const old = regs[di];
                                     regs[di] = out;
-                                    frame.wmask |= @as(u64, 1) << @as(u6, @truncate(di));
+                                    frame.wmask.set(di);
                                     if (runtime.reclaimEnabled()) old.release(allocator);
                                     taken = out.Bool;
                                 }
@@ -6992,10 +7029,10 @@ fn runFrameExec(
                 frame.regs.clearRetainingCapacity();
                 if (!runtime.reclaimEnabled() and frame.func.frameNoFill()) {
                     frame.regs.items.len = n;
-                    frame.wmask = 0;
+                    frame.wmask = RegMask.none;
                 } else {
                     try frame.regs.appendNTimes(regsAlloc(allocator), .Unit, n);
-                    frame.wmask = ~@as(u64, 0);
+                    frame.wmask.setAll();
                 }
                 try_stack.clearRetainingCapacity();
                 cur = frame.func.entry;
@@ -7015,10 +7052,10 @@ fn runFrameExec(
                 if (!runtime.reclaimEnabled() and new_func.frameNoFill()) {
                     try frame.regs.ensureTotalCapacity(regsAlloc(allocator), new_func.n_locals);
                     frame.regs.items.len = new_func.n_locals;
-                    frame.wmask = 0;
+                    frame.wmask = RegMask.none;
                 } else {
                     try frame.regs.appendNTimes(regsAlloc(allocator), .Unit, new_func.n_locals);
-                    frame.wmask = ~@as(u64, 0);
+                    frame.wmask.setAll();
                 }
                 try_stack.clearRetainingCapacity();
                 cur = new_func.entry;
@@ -7199,7 +7236,7 @@ inline fn binFast(frame: *Frame, op: BinOp, dst: Reg, lhs: Reg, rhs: Reg, alloca
     const out: Value = scalarBin(op, lv, rv) orelse return false;
     const old = regs[dst.int()];
     regs[dst.int()] = out;
-    frame.wmask |= @as(u64, 1) << @as(u6, @truncate(dst.int()));
+    frame.wmask.set(dst.int());
     if (runtime.reclaimEnabled()) old.release(allocator);
     return true;
 }
@@ -7325,7 +7362,7 @@ inline fn writeFastU(frame: *Frame, r: Reg, v: Value, allocator: Allocator) void
     const idx = r.int();
     const old = frame.regs.items.ptr[idx];
     frame.regs.items.ptr[idx] = v;
-    frame.wmask |= @as(u64, 1) << @as(u6, @truncate(idx));
+    frame.wmask.set(idx);
     if (runtime.reclaimEnabled()) old.release(allocator);
 }
 
@@ -7965,7 +8002,7 @@ pub fn nativeOpCmpBr(ctx: *NativeCtx, block: u32, inst_idx: u32, kind: u32, dst:
             if (out == .Bool) {
                 const old = regs[dst];
                 regs[dst] = out;
-                frame.wmask |= @as(u64, 1) << @as(u6, @truncate(dst));
+                frame.wmask.set(dst);
                 if (runtime.reclaimEnabled()) old.release(ctx.allocator);
                 taken = out.Bool;
             }
