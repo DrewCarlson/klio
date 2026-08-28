@@ -161,7 +161,11 @@ instead of the interpreter internals underneath it.
 
 - B1. Frame cost: activation open/close is the diffuse floor (runFrameExec
   ~6%, memset/poison ~7%). Levers: register-bank reuse pools; the
-  ReleaseFast-for-gate build policy (measured -20%, awaiting a user call).
+  ReleaseFast-for-gate build policy — RE-CONFIRMED 2026-08-28 on the
+  recomposition replica, **2574ms vs 3091ms (1.20x)** with
+  `zig build klio-harness -Dharness-optimize=ReleaseFast`. It is a policy
+  call, not code: the gate harness is ReleaseSafe so a failure stays
+  debuggable. Taking it puts vpd at ~347s, still 3.9x over its cap.
 - B2. Id-keyed dispatch: eqlBytes 4.2% + getIndex ~5% + hash family are
   string-keyed cache probes; intern symbol ids at bake and key on them.
 - B3. Allocation rate: boxing per put is ~GBs per stress test; A1's native
