@@ -131,7 +131,7 @@ const compose_fast = @import("compose_fast.zig");
 /// arm and the CMG global-replay arm — any dispatch path that has
 /// resolved a plain global target and its positional arguments can
 /// consult it.
-pub fn hostRouteServe(comptime H: type, f: *const ir.Func, args: []const Value, host: *H) ?Value {
+pub fn hostRouteServe(comptime H: type, allocator: Allocator, f: *const ir.Func, args: []const Value, host: *H) ?Value {
     if (f.host_route == 0) {
         const route: snapshot_fast.Route = blk: {
             if (f.params.len > 3) break :blk .none;
@@ -140,7 +140,7 @@ pub fn hostRouteServe(comptime H: type, f: *const ir.Func, args: []const Value, 
         };
         @constCast(f).host_route = @intFromEnum(route);
     }
-    if (f.host_route <= @intFromEnum(snapshot_fast.Route.none)) return composeRouteServe(f, args);
+    if (f.host_route <= @intFromEnum(snapshot_fast.Route.none)) return composeRouteServe(allocator, f, args);
     switch (@as(snapshot_fast.Route, @enumFromInt(f.host_route))) {
         .readable => {
             if (args.len != 3) return null;
@@ -179,16 +179,41 @@ pub fn hostRouteServe(comptime H: type, f: *const ir.Func, args: []const Value, 
 /// Compose's one-line helpers (`IntStack`, the composite-key rotation)
 /// answered by the host at the same seam. Classified once per body, and any
 /// shape the serve cannot prove falls through to the interpreted body.
-fn composeRouteServe(f: *const ir.Func, args: []const Value) ?Value {
+var compose_fast_state: u8 = 0;
+var compose_fast_mask: u8 = 15;
+
+/// `KLIO_COMPOSE_FAST` is a bisect mask over the compose serves: bit0 the
+/// stack/key helpers, bit1 the changelist push, bit2 its argument assertion,
+/// bit3 the write scope. 0 keeps every helper interpreted.
+fn composeFastMask() u8 {
+    if (compose_fast_state == 0) {
+        const raw = runtime.envOnce("KLIO_COMPOSE_FAST") orelse "15";
+        compose_fast_mask = std.fmt.parseInt(u8, raw, 10) catch 15;
+        compose_fast_state = 1;
+    }
+    return compose_fast_mask;
+}
+
+fn composeRouteServe(allocator: Allocator, f: *const ir.Func, args: []const Value) ?Value {
+    const mask = composeFastMask();
+    if (mask == 0) return null;
     if (f.compose_route == 0) {
         @constCast(f).compose_route = @intFromEnum(compose_fast.classify(f.fqn, f.params.len));
     }
     if (f.compose_route <= @intFromEnum(compose_fast.Route.none)) return null;
     if (args.len != f.params.len) return null;
-    return switch (@as(compose_fast.Route, @enumFromInt(f.compose_route))) {
+    const route: compose_fast.Route = @enumFromInt(f.compose_route);
+    const bit: u8 = switch (route) {
+        .ops_push_op => 2,
+        .ops_ensure_args => 4,
+        .ops_set_int, .ops_set_object => 8,
+        else => 1,
+    };
+    if (mask & bit == 0) return null;
+    return switch (route) {
         .compound_with => compose_fast.serveCompoundWith(args),
         .uncompound_with => compose_fast.serveUnCompoundWith(args),
-        .int_stack_push => compose_fast.servePush(args),
+        .int_stack_push => compose_fast.servePush(allocator, args),
         .int_stack_pop => compose_fast.servePop(args),
         .int_stack_pop_or => compose_fast.servePopOr(args),
         .int_stack_peek => compose_fast.servePeek(args),
@@ -199,6 +224,10 @@ fn composeRouteServe(f: *const ir.Func, args: []const Value) ?Value {
         .int_stack_is_not_empty => compose_fast.serveIsNotEmpty(args),
         .int_stack_clear => compose_fast.serveClear(args),
         .int_stack_size => compose_fast.serveSize(args),
+        .ops_push_op => compose_fast.servePushOp(allocator, args),
+        .ops_ensure_args => compose_fast.serveEnsureArgs(args),
+        .ops_set_int => compose_fast.serveSetInt(allocator, args),
+        .ops_set_object => compose_fast.serveSetObject(allocator, args),
         else => null,
     };
 }
@@ -206,13 +235,12 @@ fn composeRouteServe(f: *const ir.Func, args: []const Value) ?Value {
 /// Host-served static fns (the snapshot validity walk): classify once
 /// per Func, serve without any call machinery on a hit.
 inline fn hostStaticServe(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H) Allocator.Error!?Value {
-    _ = allocator;
     const cf = frame.module.funcById(call.func) orelse return null;
     if (call.type_args.len != 0 or !argNamesAllNull(call.arg_names)) return null;
     var args: [3]Value = undefined;
     if (call.n_args > 3) return null;
     for (0..call.n_args) |i| args[i] = frame.read(ir.Reg.from(call.args.int() + @as(u32, @intCast(i))));
-    return hostRouteServe(H, cf, args[0..call.n_args], host);
+    return hostRouteServe(H, allocator, cf, args[0..call.n_args], host);
 }
 
 pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H, allow_flat: bool) Allocator.Error!Step {
@@ -1928,7 +1956,7 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                     // (the snapshot walk family): the write path's bare
                     // `readable(...)` inside sync blocks reaches it through
                     // this replay, never through the static-call arm.
-                    if (hostRouteServe(H, gf, arg_values, host)) |served| {
+                    if (hostRouteServe(H, allocator, gf, arg_values, host)) |served| {
                         try frame.write(cmg.dst, served);
                         return .cont;
                     }

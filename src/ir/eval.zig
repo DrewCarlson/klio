@@ -4617,7 +4617,7 @@ pub fn evalWithCapturesChained(
     if (owning == null and closure_id == null and chain_seed.len == 0 and
         captures.items.len == 0)
     {
-        if (exec_call.hostRouteServe(H, func, args.items, host)) |served| {
+        if (exec_call.hostRouteServe(H, allocator, func, args.items, host)) |served| {
             var a = args;
             a.deinit(allocator);
             var c = captures;
@@ -5468,7 +5468,7 @@ fn runFlatLoop(
             // opens, on the flat path as well as the recursive seam: the
             // composer's stacks are reached through both.
             if (site.req.captures.items.len == 0 and site.req.pop_enclosing_n == 0) {
-                if (exec_call.hostRouteServe(H, site.req.func, site.req.args.items, host)) |served| {
+                if (exec_call.hostRouteServe(H, allocator, site.req.func, site.req.args.items, host)) |served| {
                     const dst = site.req.dst;
                     discardFlatReq(H, allocator, site.req, host);
                     try f.write(dst, served);

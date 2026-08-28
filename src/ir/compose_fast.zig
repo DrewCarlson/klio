@@ -34,6 +34,17 @@ pub const Route = enum(u8) {
     int_stack_is_not_empty = 12,
     int_stack_clear = 13,
     int_stack_size = 14,
+    /// `Operations.pushOp(op)` and its checked wrapper `push(op)`: record the
+    /// operation and advance the argument cursors.
+    ops_push_op = 15,
+    /// `Operations.ensureAllArgumentsPushedFor(op)`: a debug-only assertion
+    /// that this build compiles out (`EnableDebugRuntimeChecks = false`), so
+    /// its whole body is dead.
+    ops_ensure_args = 16,
+    /// `Operations.WriteScope.setInt(parameter, value)`
+    ops_set_int = 17,
+    /// `Operations.WriteScope.setObject(parameter, value)`
+    ops_set_object = 18,
 };
 
 /// Classify once per `Func` (the caller memoizes into `func.host_route`).
@@ -49,6 +60,12 @@ pub fn classify(fqn: []const u8, n_params: usize) Route {
         return .none;
     }
     if (n_params == 2) {
+        // Only the gap-buffer changelist: the link-buffer's `pushOp` also
+        // raises `requiresApplication` from the operation's visibility, which
+        // is a virtual getter the host cannot read.
+        if (std.mem.endsWith(u8, fqn, "gapbuffer.changelist.Operations.pushOp") or
+            std.mem.endsWith(u8, fqn, "gapbuffer.changelist.Operations.push")) return .ops_push_op;
+        if (std.mem.endsWith(u8, fqn, "changelist.Operations.ensureAllArgumentsPushedFor")) return .ops_ensure_args;
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.IntStack.push")) return .int_stack_push;
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.IntStack.peekOr")) return .int_stack_peek_or;
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.IntStack.popOr")) return .int_stack_pop_or;
@@ -56,6 +73,8 @@ pub fn classify(fqn: []const u8, n_params: usize) Route {
         return .none;
     }
     if (n_params == 3) {
+        if (std.mem.endsWith(u8, fqn, "Operations.WriteScope.setInt")) return .ops_set_int;
+        if (std.mem.endsWith(u8, fqn, "Operations.WriteScope.setObject")) return .ops_set_object;
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.compoundWith")) return .compound_with;
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.unCompoundWith")) return .uncompound_with;
         return .none;
@@ -133,14 +152,12 @@ fn writeTos(recv: *const Value, tos: i32) bool {
     return g.get().set("tos", .{ .Int = tos });
 }
 
-pub fn servePush(args: []const Value) ?Value {
+pub fn servePush(allocator: std.mem.Allocator, args: []const Value) ?Value {
     const s = readStack(&args[0]) orelse return null;
     const value = asI32(&args[1]) orelse return null;
     // A full stack takes the interpreted `resize()` path.
     if (s.tos < 0 or @as(usize, @intCast(s.tos)) >= s.len) return null;
-    // A packed `IntArray` slot holds a scalar, so the store never releases
-    // a previous reference and the allocator argument goes unused.
-    s.slots.set(std.heap.page_allocator, @intCast(s.tos), .{ .Int = value });
+    s.slots.set(allocator, @intCast(s.tos), .{ .Int = value });
     if (!writeTos(&args[0], s.tos + 1)) return null;
     return .{ .Unit = {} };
 }
@@ -200,6 +217,162 @@ pub fn serveIsNotEmpty(args: []const Value) ?Value {
 pub fn serveClear(args: []const Value) ?Value {
     _ = readStack(&args[0]) orelse return null;
     if (!writeTos(&args[0], 0)) return null;
+    return .{ .Unit = {} };
+}
+
+threadlocal var fn_opcodes: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_opcodes_size: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_int_args: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_int_args_size: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_obj_args: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_obj_args_size: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_ints: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_objects: std.atomic.Value(?[*]const u8) = .init(null);
+
+const OpCounts = struct { ints: i32, objects: i32 };
+
+fn readOpCounts(op: *const Value) ?OpCounts {
+    if (op.* != .Instance) return null;
+    const g = op.Instance.borrow();
+    defer g.deinit();
+    const inst = g.get();
+    const iv = inst.getCached(&fn_ints, "ints") orelse return null;
+    const ov = inst.getCached(&fn_objects, "objects") orelse return null;
+    return .{ .ints = asI32(&iv) orelse return null, .objects = asI32(&ov) orelse return null };
+}
+
+/// `Operations.pushOp`: bounds-check the three parallel stores the upstream
+/// body performs, then record the operation and advance the cursors. Any
+/// stack that must grow bails to the interpreted body, which resizes.
+pub fn servePushOp(allocator: std.mem.Allocator, args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
+    const counts = readOpCounts(&args[1]) orelse return null;
+    if (counts.ints < 0 or counts.objects < 0) return null;
+
+    var op_codes: runtime.ArrayData = undefined;
+    var op_size: i32 = 0;
+    var int_size: i32 = 0;
+    var obj_size: i32 = 0;
+    {
+        const g = args[0].Instance.borrow();
+        defer g.deinit();
+        const inst = g.get();
+        const codes_v = inst.getCached(&fn_opcodes, "opCodes") orelse return null;
+        if (codes_v != .Array or codes_v.Array.prim != null) return null;
+        const int_args_v = inst.getCached(&fn_int_args, "intArgs") orelse return null;
+        if (int_args_v != .Array or int_args_v.Array.prim != .Int) return null;
+        const obj_args_v = inst.getCached(&fn_obj_args, "objectArgs") orelse return null;
+        if (obj_args_v != .Array or obj_args_v.Array.prim != null) return null;
+
+        const os = inst.getCached(&fn_opcodes_size, "opCodesSize") orelse return null;
+        const is = inst.getCached(&fn_int_args_size, "intArgsSize") orelse return null;
+        const bs = inst.getCached(&fn_obj_args_size, "objectArgsSize") orelse return null;
+        op_size = asI32(&os) orelse return null;
+        int_size = asI32(&is) orelse return null;
+        obj_size = asI32(&bs) orelse return null;
+
+        if (op_size < 0 or int_size < 0 or obj_size < 0) return null;
+        if (@as(usize, @intCast(op_size)) >= codes_v.Array.len()) return null;
+        if (@as(i64, int_size) + counts.ints > @as(i64, @intCast(int_args_v.Array.len()))) return null;
+        if (@as(i64, obj_size) + counts.objects > @as(i64, @intCast(obj_args_v.Array.len()))) return null;
+        op_codes = codes_v.Array;
+    }
+    // The boxed store retains through `ArrayData.set` and its mutable borrow
+    // raises the generational write barrier.
+    op_codes.set(allocator, @intCast(op_size), args[1]);
+    const g = args[0].Instance.borrowMut();
+    defer g.deinit();
+    const inst = g.get();
+    if (!inst.set("opCodesSize", .{ .Int = op_size + 1 })) return null;
+    if (!inst.set("intArgsSize", .{ .Int = int_size + counts.ints })) return null;
+    if (!inst.set("objectArgsSize", .{ .Int = obj_size + counts.objects })) return null;
+    return .{ .Unit = {} };
+}
+
+threadlocal var fn_stack: std.atomic.Value(?[*]const u8) = .init(null);
+threadlocal var fn_offset: std.atomic.Value(?[*]const u8) = .init(null);
+
+/// The `WriteScope` value class wraps the `Operations` it writes into. A
+/// boxed scope carries it in `stack`; an unboxed one IS the stack.
+fn scopeStack(recv: *const Value) ?Value {
+    if (recv.* != .Instance) return null;
+    const g = recv.Instance.borrow();
+    defer g.deinit();
+    if (g.get().getCached(&fn_stack, "stack")) |st| {
+        if (st == .Instance) return st;
+        return null;
+    }
+    return recv.*;
+}
+
+/// The offset of an `ObjectParameter`, boxed or not.
+fn paramOffset(v: *const Value) ?i32 {
+    if (asI32(v)) |i| return i;
+    if (v.* != .Instance) return null;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    const off = g.get().getCached(&fn_offset, "offset") orelse return null;
+    return asI32(&off);
+}
+
+const TopArgs = struct { arr: runtime.ArrayData, index: i32 };
+
+/// `intArgs[intArgsSize - peekOperation().ints + parameter]`, or the object
+/// equivalent. Declines whenever the stack is empty or the index escapes.
+fn topSlot(stack: *const Value, parameter: i32, comptime objects: bool) ?TopArgs {
+    const g = stack.Instance.borrow();
+    defer g.deinit();
+    const inst = g.get();
+    const codes_v = inst.getCached(&fn_opcodes, "opCodes") orelse return null;
+    if (codes_v != .Array or codes_v.Array.prim != null) return null;
+    const os = inst.getCached(&fn_opcodes_size, "opCodesSize") orelse return null;
+    const op_size = asI32(&os) orelse return null;
+    if (op_size <= 0 or @as(usize, @intCast(op_size)) > codes_v.Array.len()) return null;
+    const op = codes_v.Array.get(@intCast(op_size - 1));
+    const counts = readOpCounts(&op) orelse return null;
+
+    const arr_v = inst.getCached(
+        if (objects) &fn_obj_args else &fn_int_args,
+        if (objects) "objectArgs" else "intArgs",
+    ) orelse return null;
+    if (arr_v != .Array) return null;
+    if (objects) {
+        if (arr_v.Array.prim != null) return null;
+    } else {
+        if (arr_v.Array.prim != .Int) return null;
+    }
+    const sv = inst.getCached(
+        if (objects) &fn_obj_args_size else &fn_int_args_size,
+        if (objects) "objectArgsSize" else "intArgsSize",
+    ) orelse return null;
+    const size = asI32(&sv) orelse return null;
+    const used = if (objects) counts.objects else counts.ints;
+    const idx = size - used + parameter;
+    if (idx < 0 or @as(usize, @intCast(idx)) >= arr_v.Array.len()) return null;
+    return .{ .arr = arr_v.Array, .index = idx };
+}
+
+pub fn serveSetInt(allocator: std.mem.Allocator, args: []const Value) ?Value {
+    const stack = scopeStack(&args[0]) orelse return null;
+    const parameter = asI32(&args[1]) orelse return null;
+    const value = asI32(&args[2]) orelse return null;
+    const slot = topSlot(&stack, parameter, false) orelse return null;
+    slot.arr.set(allocator, @intCast(slot.index), .{ .Int = value });
+    return .{ .Unit = {} };
+}
+
+pub fn serveSetObject(allocator: std.mem.Allocator, args: []const Value) ?Value {
+    const stack = scopeStack(&args[0]) orelse return null;
+    const parameter = paramOffset(&args[1]) orelse return null;
+    const slot = topSlot(&stack, parameter, true) orelse return null;
+    slot.arr.set(allocator, @intCast(slot.index), args[2]);
+    return .{ .Unit = {} };
+}
+
+/// The argument-completeness assertion compiles out in this build, so the
+/// call has no effect at all.
+pub fn serveEnsureArgs(args: []const Value) ?Value {
+    if (args[0] != .Instance) return null;
     return .{ .Unit = {} };
 }
 
