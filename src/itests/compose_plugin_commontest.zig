@@ -163,7 +163,14 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     // is (slow) rather than what it is not (stuck). The budget is a ratchet —
     // it must only shrink as the recomposition path gets faster, and
     // exceeding it still fails.
-    try map.put("KLIO_TEST_WALL_CAP_FOR", "validatePotentialDeadlock=900");
+    // Two more measured-slow, not-stuck tests: `resumeOnBackgroundThread`
+    // resumes 1000 pausable chunks one cross-thread round-trip at a time
+    // (~40-55s solo, 25/25) and the frame-clock test is a timing test; under
+    // 8-way contention both cross the 90s hang window while still passing.
+    try map.put(
+        "KLIO_TEST_WALL_CAP_FOR",
+        "validatePotentialDeadlock=900,resumeOnBackgroundThread=300,pausingTheFrameClockStopShouldBlockWithFrameNanos=300",
+    );
     // Four children each defaulting to a half-the-cores compute pool
     // oversubscribe the box 2x and inflate the concurrent classes'
     // walls 3-8x. Cap each child so the children together match the
