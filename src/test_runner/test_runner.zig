@@ -157,11 +157,13 @@ fn fileSelected(only_fids: []const u32, fid: u32) bool {
 fn filterMatches(filter: ?[]const u8, name: []const u8) bool {
     const pat = filter orelse return true;
     var any_pos = false;
+    var any_neg = false;
     var pos_hit = false;
     var it = std.mem.splitScalar(u8, pat, ',');
     while (it.next()) |p| {
         if (p.len == 0) continue;
         if (p[0] == '!') {
+            any_neg = true;
             if (p.len > 1 and std.mem.indexOf(u8, name, p[1..]) != null) return false;
             continue;
         }
@@ -172,7 +174,9 @@ fn filterMatches(filter: ?[]const u8, name: []const u8) bool {
             pos_hit = true;
         }
     }
-    return !any_pos or pos_hit;
+    // A purely negative pattern admits everything it does not exclude; a
+    // pattern with no real tokens at all admits nothing, as it always did.
+    return pos_hit or (!any_pos and any_neg);
 }
 
 fn filterHasNegation(filter: ?[]const u8) bool {

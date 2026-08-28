@@ -206,7 +206,7 @@ fn composeRouteServe(allocator: Allocator, f: *const ir.Func, args: []const Valu
     const route: compose_fast.Route = @enumFromInt(f.compose_route);
     const bit: u8 = switch (route) {
         .slot_anchor, .data_anchor_to_index => 16,
-        .sr_next, .sr_group_key_get, .sr_group_key_at, .sr_is_group_end_get, .sr_node_count_get, .sr_node_count_at, .gap_parent_anchor, .sw_data_index, .rsi_req_recompose_get, .rsi_req_recompose_set, .gap_validate_node, .sr_start_group, .sr_end_group, .op_iter_next, .op_iter_get_int, .op_iter_get_object, .sr_object_key, .sr_group_object_key, .obs_holder_current => 32,
+        .sr_next, .sr_group_key_get, .sr_group_key_at, .sr_is_group_end_get, .sr_node_count_get, .sr_node_count_at, .gap_parent_anchor, .sw_data_index, .rsi_req_recompose_get, .rsi_req_recompose_set, .gap_validate_node, .sr_start_group, .sr_end_group, .op_iter_next, .op_iter_get_int, .op_iter_get_object, .sr_object_key, .sr_group_object_key, .obs_holder_current, .sw_slot_index => 32,
         .ops_push_op, .ops_push_op_link => 2,
         .ops_ensure_args => 4,
         .ops_set_int, .ops_set_object => 8,
@@ -252,6 +252,7 @@ fn composeRouteServe(allocator: Allocator, f: *const ir.Func, args: []const Valu
         .op_iter_get_object => compose_fast.serveOpIterGetObject(args),
         .sr_object_key => compose_fast.serveSlotReaderObjectKey(args),
         .obs_holder_current => compose_fast.serveObserverHolderCurrent(allocator, args),
+        .sw_slot_index => compose_fast.serveSlotWriterSlotIndex(args),
         .sr_group_object_key => compose_fast.serveSlotReaderGroupObjectKey(args),
         else => null,
     };

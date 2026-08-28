@@ -90,6 +90,9 @@ pub const Route = enum(u8) {
     /// `CompositionObserverHolder.current()` — the observer, refreshed from
     /// the parent context's holder for a non-root holder.
     obs_holder_current = 40,
+    /// `SlotWriter`'s IntArray `slotIndex(address)` member-extension — the
+    /// slot-anchor sibling of `dataIndex`.
+    sw_slot_index = 41,
 };
 
 /// Classify once per `Func` (the caller memoizes into `func.host_route`).
@@ -122,6 +125,7 @@ pub fn classify(fqn: []const u8, n_params: usize) Route {
         if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotReader.groupObjectKey")) return .sr_group_object_key;
         if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotReader.groupKey")) return .sr_group_key_at;
         if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotWriter.dataIndex")) return .sw_data_index;
+        if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotWriter.slotIndex")) return .sw_slot_index;
         if (std.mem.endsWith(u8, fqn, ".changelist.Operations.OpIterator.getInt")) return .op_iter_get_int;
         if (std.mem.endsWith(u8, fqn, ".changelist.Operations.OpIterator.getObject")) return .op_iter_get_object;
         if (std.mem.eql(u8, fqn, "__set_RecomposeScopeImpl_requiresRecompose")) return .rsi_req_recompose_set;
@@ -788,6 +792,30 @@ fn serveSlotWriterDataIndexExt(args: []const Value) ?Value {
         return .{ .Int = @as(i32, @intCast(@as(i64, @intCast(slots.len())) - slots_gap_len)) };
     }
     const anchor = groupField(args[0].Array, address, DATA_ANCHOR_OFF) orelse return null;
+    if (anchor >= 0) return .{ .Int = anchor };
+    const cap_slots: i32 = @intCast(slots.len());
+    return .{ .Int = (cap_slots -% slots_gap_len) +% anchor +% 1 };
+}
+
+/// `slotIndex(address)`: `dataAnchorToDataIndex(slotAnchor(address), ...)`
+/// against the owner's gaps; past-capacity addresses answer the slot end.
+pub fn serveSlotWriterSlotIndex(args: []const Value) ?Value {
+    if (args[0] != .Array or args[0].Array.prim != .Int) return null;
+    const address = asI32(&args[1]) orelse return null;
+    const owner = extOwner() orelse return null;
+    const g = owner.Instance.borrow();
+    defer g.deinit();
+    const inst = g.get();
+    const slots_gap_len = intField(inst, &fn_slots_gap_len, "slotsGapLen") orelse return null;
+    const groups = intArrayField(inst, &fn_groups, "groups") orelse return null;
+    const slots = objArrayField(inst, &fn_slots_field, "slots") orelse return null;
+    const capacity: i64 = @intCast(groups.len() / GROUP_FIELDS);
+    if (address >= capacity) {
+        return .{ .Int = @as(i32, @intCast(@as(i64, @intCast(slots.len())) - slots_gap_len)) };
+    }
+    const anchor_base = groupField(args[0].Array, address, DATA_ANCHOR_OFF) orelse return null;
+    const info = groupField(args[0].Array, address, GROUP_INFO_OFF) orelse return null;
+    const anchor = anchor_base +% @as(i32, @intCast(@popCount(@as(u32, @bitCast(info >> 28)))));
     if (anchor >= 0) return .{ .Int = anchor };
     const cap_slots: i32 = @intCast(slots.len());
     return .{ .Int = (cap_slots -% slots_gap_len) +% anchor +% 1 };
