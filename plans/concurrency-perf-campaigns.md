@@ -112,6 +112,17 @@ a pathology.
 EXIT PATH: no measured lever exceeds 14% and the biggest are taken, so the
 remaining path is an execution core that does not resolve, frame and box per
 call — Front A1d. Serve-sized levers from here are single digits.
+ATTEMPTED AND REVERTED (2026-08-28): splicing MONOMORPHIC member inline
+funs with lambda args (`Operations.push{...}` pays two frames per
+changelist push; kotlinc inlines it). The splice machinery accepts it and
+the probe worked, but two real blockers surfaced on the stdlib sweep:
+same-name same-arity member-inline overloads differing only in callback
+shape need the real typed overload picker (Duration's LongParser vs
+FractionalParser), and the spliced member body can mis-bind PER-INSTANCE
+state (`allowSign` on `iso` vs `default` — a silent-corruption class of
+bug). The lever is real (~5% of vpd) but needs the receiver-bound splice
+design, not a pick heuristic. Repro shape pinned in the session notes;
+`KLIO_MEMBER_INLINE=0` was the bisect knob in the reverted diff.
 
 ## Task 3 — Value layout stage 5b — RESOLVED
 
