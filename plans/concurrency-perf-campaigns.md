@@ -112,17 +112,28 @@ a pathology.
 EXIT PATH: no measured lever exceeds 14% and the biggest are taken, so the
 remaining path is an execution core that does not resolve, frame and box per
 call — Front A1d. Serve-sized levers from here are single digits.
-ATTEMPTED AND REVERTED (2026-08-28): splicing MONOMORPHIC member inline
-funs with lambda args (`Operations.push{...}` pays two frames per
-changelist push; kotlinc inlines it). The splice machinery accepts it and
-the probe worked, but two real blockers surfaced on the stdlib sweep:
-same-name same-arity member-inline overloads differing only in callback
-shape need the real typed overload picker (Duration's LongParser vs
-FractionalParser), and the spliced member body can mis-bind PER-INSTANCE
-state (`allowSign` on `iso` vs `default` — a silent-corruption class of
-bug). The lever is real (~5% of vpd) but needs the receiver-bound splice
-design, not a pick heuristic. Repro shape pinned in the session notes;
-`KLIO_MEMBER_INLINE=0` was the bisect knob in the reverted diff.
+LANDED after the first attempt was reverted and its blockers root-caused
+(2026-08-28, 41b35ffd + 140384da):
+- SPLICE HYGIENE: mutable-var homes were a flat name-keyed map, so a
+  spliced body's own `var index` hijacked the call-site lambda's
+  `index = ...` write — LATENT in the whole splice tier (Duration's parse
+  cursor). Homes now carry their binding depth and honor the
+  splice-resolve window. Fixture `splice_hygiene_shadow.kt`.
+- FINALLY WINDOW: a finally replayed at a jump re-lowered under the jump
+  site's window; each finally now records and replays under its own
+  (the spliced `synchronized` finally resolved `lock` to a foreign
+  package's global).
+- The MONOMORPHIC MEMBER-INLINE tier itself, scoped by declared evidence:
+  monomorphic owner class (a generic owner's `as T` reads the
+  process-global slot), PROVABLE receiver type (the permissive check
+  spliced SnapshotIdSet.fold onto a List), loop-free body
+  (forEachTailSlot mis-resolved `slots[...]`; hardening = the open item
+  below), callback shape matched, exactly one survivor.
+  `KLIO_MEMBER_INLINE` bisects by name list; `KLIO_PMI_TRACE` lists picks.
+- [ ] member-inline tier hardening: loop-bodied members
+  (forEach/forEachTailSlot family) need the splice receiver plumbing for
+  field-index reads inside RLP loops before the loop-free restriction can
+  lift.
 
 ## Task 3 — Value layout stage 5b — RESOLVED
 
