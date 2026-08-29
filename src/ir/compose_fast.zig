@@ -93,6 +93,13 @@ pub const Route = enum(u8) {
     /// `SlotWriter`'s IntArray `slotIndex(address)` member-extension — the
     /// slot-anchor sibling of `dataIndex`.
     sw_slot_index = 41,
+    /// The generic `Stack<T>` (an ArrayList-backed value class): the pure
+    /// read members. `push`/`pop` mutate through the MutableList intrinsic
+    /// and live on the host seam instead.
+    stack_t_is_empty = 42,
+    stack_t_is_not_empty = 43,
+    stack_t_peek = 44,
+    stack_t_peek_at = 45,
 };
 
 /// Classify once per `Func` (the caller memoizes into `func.host_route`).
@@ -104,6 +111,9 @@ pub fn classify(fqn: []const u8, n_params: usize) Route {
         if (std.mem.endsWith(u8, fqn, ".changelist.Operations.OpIterator.next")) return .op_iter_next;
         if (std.mem.endsWith(u8, fqn, "GapComposer.validateNodeNotExpected")) return .gap_validate_node;
         if (std.mem.endsWith(u8, fqn, ".CompositionObserverHolder.current")) return .obs_holder_current;
+        if (std.mem.eql(u8, fqn, "androidx.compose.runtime.Stack.isEmpty")) return .stack_t_is_empty;
+        if (std.mem.eql(u8, fqn, "androidx.compose.runtime.Stack.isNotEmpty")) return .stack_t_is_not_empty;
+        if (std.mem.eql(u8, fqn, "androidx.compose.runtime.Stack.peek")) return .stack_t_peek;
         if (std.mem.eql(u8, fqn, "__get_SlotReader_groupKey")) return .sr_group_key_get;
         if (std.mem.eql(u8, fqn, "__get_SlotReader_isGroupEnd")) return .sr_is_group_end_get;
         if (std.mem.eql(u8, fqn, "__get_SlotReader_nodeCount")) return .sr_node_count_get;
@@ -126,6 +136,7 @@ pub fn classify(fqn: []const u8, n_params: usize) Route {
         if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotReader.groupKey")) return .sr_group_key_at;
         if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotWriter.dataIndex")) return .sw_data_index;
         if (std.mem.endsWith(u8, fqn, "gapbuffer.SlotWriter.slotIndex")) return .sw_slot_index;
+        if (std.mem.eql(u8, fqn, "androidx.compose.runtime.Stack.peek")) return .stack_t_peek_at;
         if (std.mem.endsWith(u8, fqn, ".changelist.Operations.OpIterator.getInt")) return .op_iter_get_int;
         if (std.mem.endsWith(u8, fqn, ".changelist.Operations.OpIterator.getObject")) return .op_iter_get_object;
         if (std.mem.eql(u8, fqn, "__set_RecomposeScopeImpl_requiresRecompose")) return .rsi_req_recompose_set;
@@ -526,6 +537,51 @@ pub fn serveDataAnchorToDataIndex(args: []const Value) ?Value {
 pub fn serveEnsureArgs(args: []const Value) ?Value {
     if (args[0] != .Instance) return null;
     return .{ .Unit = {} };
+}
+
+threadlocal var fn_backing: std.atomic.Value(?[*]const u8) = .init(null);
+
+/// The generic `Stack<T>` value class wraps an `ArrayList<T>`. A boxed
+/// receiver carries the list in `backing`; an unboxed one IS the list.
+pub fn stackTBacking(recv: *const Value) ?Value {
+    if (recv.* == .List) return recv.*;
+    if (recv.* != .Instance) return null;
+    const g = recv.Instance.borrow();
+    defer g.deinit();
+    const b = g.get().getCached(&fn_backing, "backing") orelse return null;
+    if (b == .List) return b;
+    return null;
+}
+
+fn stackTLen(recv: *const Value) ?usize {
+    const b = stackTBacking(recv) orelse return null;
+    const g = b.List.items.borrow();
+    defer g.deinit();
+    return g.get().items.len;
+}
+
+pub fn serveStackTIsEmpty(args: []const Value) ?Value {
+    const n = stackTLen(&args[0]) orelse return null;
+    return .{ .Bool = n == 0 };
+}
+
+pub fn serveStackTIsNotEmpty(args: []const Value) ?Value {
+    const n = stackTLen(&args[0]) orelse return null;
+    return .{ .Bool = n != 0 };
+}
+
+/// `peek()` / `peek(index)`. An out-of-bounds index declines (read-only, no
+/// side effects) so the interpreted body raises the exact exception.
+pub fn serveStackTPeek(args: []const Value, at: ?i64) ?Value {
+    const b = stackTBacking(&args[0]) orelse return null;
+    const g = b.List.items.borrow();
+    defer g.deinit();
+    const items = g.get().items;
+    const idx: i64 = at orelse @as(i64, @intCast(items.len)) - 1;
+    if (idx < 0 or idx >= @as(i64, @intCast(items.len))) return null;
+    const v = items[@intCast(idx)];
+    v.retain();
+    return v;
 }
 
 pub fn serveSize(args: []const Value) ?Value {
