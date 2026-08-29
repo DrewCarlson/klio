@@ -11158,6 +11158,7 @@ const FUSED_MAX_BLOCKS: usize = 64;
 const FUSED_MAX_INSTS: usize = 256;
 
 threadlocal var fused_bank: [FUSED_BANK_DEPTH][FUSED_MAX_REGS]Value = undefined;
+threadlocal var fused_chain: [FUSED_BANK_DEPTH]std.ArrayList(EnclosingEntry) = @splat(.empty);
 threadlocal var fused_depth: usize = 0;
 
 var fused_enabled_state: u8 = 0;
@@ -11415,6 +11416,33 @@ fn fusedRun(
     defer if (reclaim) {
         for (regs) |*v| v.release(allocator);
     };
+    // The fused body OWNS an enclosing chain exactly as a frame does
+    // (seeded from the caller's in-flight pushes plus its own receiver,
+    // then activated). Without this, a body invoked with the chain
+    // DETACHED (host trampolines null it) lost its own subject pushes —
+    // `apply { add(...) }`'s subject silently vanished and the framed
+    // remainder resolved `add` against the test instance.
+    const chain = &fused_chain[fused_depth - 1];
+    chain.clearRetainingCapacity();
+    if (evtls.active_chain) |caller| {
+        const base = @min(evtls.active_chain_base, caller.items.len);
+        for (caller.items[base..]) |e| {
+            if (e.kind == .access) continue;
+            try chain.append(chainAllocator(), e);
+        }
+    }
+    if (exec_call.ownReceiverEntry(func, eff_args)) |own| {
+        const dup = chain.items.len > 0 and sameReceiver(chain.items[chain.items.len - 1].v, own.v);
+        if (!dup) try chain.append(chainAllocator(), own);
+    }
+    const prev_chain = evtls.active_chain;
+    const prev_chain_base = evtls.active_chain_base;
+    evtls.active_chain = chain;
+    evtls.active_chain_base = chain.items.len;
+    defer {
+        evtls.active_chain = prev_chain;
+        evtls.active_chain_base = prev_chain_base;
+    }
     var pushed_enclosing: usize = 0;
     defer while (pushed_enclosing > 0) : (pushed_enclosing -= 1) popEnclosing();
 
@@ -11438,18 +11466,22 @@ fn fusedRun(
                 // the remainder framed, starting AT this instruction (no
                 // side effect of it has run). The framed machinery then
                 // owns the heavy op — including any suspension beneath it.
-                error.Materialize => return try fusedMaterializeAndRun(
-                    H,
-                    allocator,
-                    module,
-                    func,
-                    args_in,
-                    regs,
-                    cur,
-                    idx,
-                    pushed_enclosing,
-                    host,
-                ),
+                error.Materialize => {
+                    const moved_pushes = pushed_enclosing;
+                    pushed_enclosing = 0;
+                    return try fusedMaterializeAndRun(
+                        H,
+                        allocator,
+                        module,
+                        func,
+                        args_in,
+                        regs,
+                        cur,
+                        idx,
+                        moved_pushes,
+                        host,
+                    );
+                },
                 else => |oe| return oe,
             };
         }
@@ -11510,6 +11542,11 @@ fn fusedMaterializeAndRun(
     host: *H,
 ) Allocator.Error!EvalResult {
     const ev: *EvalTls = &evtls;
+    if (runtime.envOnce("KLIO_FUSED_TRACE") != null) {
+        std.debug.print("[fused-mat] {s} at b{d}:{d} pushes={d}\n", .{
+            if (func.fqn.len != 0) func.fqn else func.name, cur.int(), idx, pushed_enclosing,
+        });
+    }
     var arg_list: std.ArrayList(Value) = .empty;
     try arg_list.appendSlice(allocator, args_in);
     if (runtime.reclaimEnabled()) for (arg_list.items) |v| v.retain();
@@ -11519,25 +11556,42 @@ fn fusedMaterializeAndRun(
     defer frame.deinit();
     gcPushFrame(&frame);
     defer gcPopFrame(&frame);
-    try frame.activateChain(&.{});
-    defer frame.deactivateChain();
+    // The walker's subject pushes move to the FRAME as its own in-flight
+    // pushes, in framed order: [seeded own receiver][subjects...] with the
+    // base between — the remainder's EnclosingPop ops pop the subjects
+    // from the top exactly as if the frame had pushed them itself. Strip
+    // them from the walker's chain first so activateChain's caller-copy
+    // does not double them (and the walker's own defer has nothing left
+    // to pop).
+    var moved: [8]EnclosingEntry = undefined;
+    var moved_n: usize = 0;
     if (pushed_enclosing > 0) {
-        if (ev.active_chain) |chain| {
-            _ = chain;
-        }
-        // The walker's own subject pushes live at the tail of the CALLER's
-        // chain (the walker had no chain of its own). Mirror them onto the
-        // materialized frame's chain so the framed remainder sees them; the
-        // walker's defer still pops the originals.
-        // NOTE: activateChain repointed the active chain to this frame, so
-        // read the originals from the frame's prev chain.
-        if (frame.prev_chain) |prev| {
-            const items = prev.items;
-            const start = items.len -| pushed_enclosing;
-            for (items[start..]) |e| {
-                try frame.enclosing_this.append(chainAllocator(), e);
+        if (ev.active_chain) |wchain| {
+            var k: usize = @min(pushed_enclosing, moved.len);
+            while (k > 0 and wchain.items.len > 0) : (k -= 1) {
+                moved[moved_n] = wchain.items[wchain.items.len - 1];
+                moved_n += 1;
+                _ = wchain.pop();
             }
         }
+    }
+    try frame.activateChain(&.{});
+    defer frame.deactivateChain();
+    {
+        var k: usize = moved_n;
+        while (k > 0) : (k -= 1) {
+            try frame.enclosing_this.append(chainAllocator(), moved[k - 1]);
+        }
+    }
+    if (runtime.envOnce("KLIO_FUSED_TRACE") != null) {
+        const prev_len: usize = if (frame.prev_chain) |pc| pc.items.len else 999;
+        std.debug.print("[fused-mat-chain] len={d} base={d} prev_len={d} prev_base={d} entries:", .{
+            frame.enclosing_this.items.len, evtls.active_chain_base, prev_len, frame.prev_chain_base,
+        });
+        for (frame.enclosing_this.items) |e| {
+            std.debug.print(" {s}/{s}", .{ @tagName(e.kind), @tagName(std.meta.activeTag(e.v)) });
+        }
+        std.debug.print("\n", .{});
     }
     const ctx_mark: usize = if (comptime @hasDecl(H, "ctxStackLen")) host.ctxStackLen() else 0;
     if (comptime @hasDecl(H, "ctxPush")) {
