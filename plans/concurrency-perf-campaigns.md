@@ -248,8 +248,18 @@ re-try a wider op selector.
         reference, and unlike a framed call the fused body crosses safe
         points before params are rooted (validateWrite default-map root).
         Replica: MAT ~192us vs 187us off (~3% window cost, buys the
-        coverage). NEXT: re-measure vpd/wall, then typed unboxing +
-        direct native->native calls.
+        coverage). FRAMED-CONTEXT PARITY round (gate caught 1380/1386):
+        a fused body IS the executing function — currentFrameFunc
+        answers with it via a per-depth mark (chain head recorded at
+        fused entry; a callee's pushed frame wins again), the
+        receiver-tower iterator yields active fused receivers (a private
+        member-ext property's owner executing fused was invisible to the
+        owner-keyed lookups), and the fused Cast arm gets the
+        erased-target leniency leg (typeParamCastPassesIn; '<function>'
+        heads never match instanceOf for closures). Fixtures:
+        fused_private_companion_ext.kt, fused_erased_cast.kt.
+        NEXT: gate + wall re-measure, then typed unboxing + direct
+        native->native calls.
 - A2 (bake-time AOT registration) and A3 (retire the hand serves) only
   matter once A1d exists; the hand serves (`snapshot_fast`, `compose_fast`,
   `persistent_map_mut`) stay as the working instances.
