@@ -212,11 +212,16 @@ re-try a wider op selector.
       callees. KLIO_FUSED=0 / name-list bisect; KLIO_FUSED_TRACE.
       MEASURED NEUTRAL on the replica at closed-world coverage — the
       skeleton is the deliverable.
-      - [ ] A1d slice 2: open-world ops (LoadGlobal /
-        LoadFromThisOrGlobal / CallMemberOrGlobal / NewInstance via host
-        entries) with SUSPENSION MATERIALIZATION, then typed unboxing +
-        direct native->native calls — the slices that carry the ~25%
-        ceiling and beyond.
+      - [ ] A1d slice 2 (IN PROGRESS): LoadGlobal + NewInstance LANDED
+        (3c7fef99 — non-suspending, so no materialization needed;
+        loadGlobalValue extracted as a shared frame-free core; the
+        load-bearing find was the flat seam routing every fused error
+        through runwind, bypassing catch dispatch — a throw rides rthrow;
+        fixture fused_throw_catch.kt). REMAINING: LoadFromThisOrGlobal
+        (needs the implicit-candidate walk extracted from its frame
+        coupling), CallMemberOrGlobal + dynamic calls (need SUSPENSION
+        MATERIALIZATION), then typed unboxing + direct native->native
+        calls — the slices that carry the ~25% ceiling and beyond.
 - A2 (bake-time AOT registration) and A3 (retire the hand serves) only
   matter once A1d exists; the hand serves (`snapshot_fast`, `compose_fast`,
   `persistent_map_mut`) stay as the working instances.
