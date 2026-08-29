@@ -1270,6 +1270,9 @@ pub const Func = struct {
     /// Compose fast-path verdict for this body (`compose_fast.Route`),
     /// classified once on first execution like `host_route`.
     compose_route: u8 = 0,
+    /// Throw-capable host-serve route (`hostRouteServeThrowing`): 0 unasked,
+    /// 1 none, 2 the gap-buffer changelist wrapper, 3 the link-buffer one.
+    throw_route: u8 = 0,
     /// Cached `frameNoFill` verdict: 0 = unasked, 1 = must fill,
     /// 2 = register file may start unfilled.
     frame_fill_state: u8 = 0,

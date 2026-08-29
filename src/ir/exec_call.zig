@@ -180,19 +180,58 @@ pub fn hostRouteServe(comptime H: type, allocator: Allocator, f: *const ir.Func,
 /// answered by the host at the same seam. Classified once per body, and any
 /// shape the serve cannot prove falls through to the interpreted body.
 var compose_fast_state: u8 = 0;
-var compose_fast_mask: u8 = 63;
+var compose_fast_mask: u8 = 127;
 
 /// `KLIO_COMPOSE_FAST` is a bisect mask over the compose serves: bit0 the
 /// stack/key helpers, bit1 the changelist push, bit2 its argument assertion,
 /// bit3 the write scope, bit4 the slot-table index math, bit5 the reader /
-/// writer / drain-cursor family. 0 keeps every helper interpreted.
+/// writer / drain-cursor family, bit6 the throw-capable changelist wrapper
+/// serve. 0 keeps every helper interpreted.
 fn composeFastMask() u8 {
     if (compose_fast_state == 0) {
-        const raw = runtime.envOnce("KLIO_COMPOSE_FAST") orelse "63";
-        compose_fast_mask = std.fmt.parseInt(u8, raw, 10) catch 63;
+        const raw = runtime.envOnce("KLIO_COMPOSE_FAST") orelse "127";
+        compose_fast_mask = std.fmt.parseInt(u8, raw, 10) catch 127;
         compose_fast_state = 1;
     }
     return compose_fast_mask;
+}
+
+/// Serves that can RAISE — reached from the same seams as `hostRouteServe`
+/// but with the full result channel. Null = decline (the framed body runs).
+/// One resident: the changelist wrapper `executeWithComposeStackTrace`,
+/// whose body with a NULL errorContext is exactly
+/// `getGroupAnchor(slots); execute(applier, slots, rememberManager, null)`
+/// with a catch that RETHROWS UNCHANGED (`attachComposeStackTrace` returns
+/// `this` for a null context) — so forwarding the two member dispatches
+/// preserves semantics while dropping the wrapper's frame. Both dispatches
+/// re-resolve against the live enclosing chain (the operation object the
+/// wrapper's own dispatch pushed), exactly as the interpreted body's
+/// CallMemberOrGlobal arms would. A non-null errorContext declines.
+pub fn hostRouteServeThrowing(comptime H: type, allocator: Allocator, f: *const ir.Func, args: []const Value, host: *H) Allocator.Error!?EvalResult {
+    if (comptime !@hasDecl(H, "callMemberNamed")) return null;
+    if (composeFastMask() & 64 == 0) return null;
+    if (f.throw_route == 0) {
+        const r: u8 = blk: {
+            if (f.params.len == 5) {
+                if (std.mem.endsWith(u8, f.fqn, "gapbuffer.changelist.Operation.executeWithComposeStackTrace"))
+                    break :blk 2;
+                if (std.mem.endsWith(u8, f.fqn, "linkbuffer.changelist.Operation.executeWithComposeStackTrace"))
+                    break :blk 3;
+            }
+            break :blk 1;
+        };
+        @constCast(f).throw_route = r;
+    }
+    if (f.throw_route != 2 and f.throw_route != 3) return null;
+    if (args.len != 5) return null;
+    if (args[4] != .Null) return null;
+    if (args[0] != .Instance) return null;
+    const anchor_name: []const u8 = if (f.throw_route == 2) "getGroupAnchor" else "getGroupHandle";
+    switch (try host.callMemberNamed(allocator, &args[0], anchor_name, args[2..3], &.{})) {
+        .ok => |anchor| anchor.release(allocator),
+        .err => |e| return .{ .err = e },
+    }
+    return try host.callMemberNamed(allocator, &args[0], "execute", args[1..5], &.{});
 }
 
 fn composeRouteServe(allocator: Allocator, f: *const ir.Func, args: []const Value) ?Value {

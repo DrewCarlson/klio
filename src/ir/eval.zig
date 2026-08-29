@@ -4790,6 +4790,13 @@ pub fn evalWithCapturesChained(
             c.deinit(allocator);
             return ok(served);
         }
+        if (try exec_call.hostRouteServeThrowing(H, allocator, func, args.items, host)) |r| {
+            var a = args;
+            a.deinit(allocator);
+            var c = captures;
+            c.deinit(allocator);
+            return r;
+        }
     }
     callStatsBumpId(func.fqn, func.id.int(), module);
     const ev: *EvalTls = &evtls;
@@ -5645,6 +5652,32 @@ fn runFlatLoop(
                     cur = site.ret_block;
                     ridx = site.ret_idx;
                     continue;
+                }
+                if (try exec_call.hostRouteServeThrowing(H, allocator, site.req.func, site.req.args.items, host)) |r| {
+                    const dst = site.req.dst;
+                    discardFlatReq(H, allocator, site.req, host);
+                    switch (r) {
+                        .ok => |v| {
+                            try f.write(dst, v);
+                            cur = site.ret_block;
+                            ridx = site.ret_idx;
+                            continue;
+                        },
+                        .err => |e| switch (e) {
+                            .Throw => |v| {
+                                rthrow = v;
+                                cur = site.ret_block;
+                                ridx = site.ret_idx;
+                                continue;
+                            },
+                            else => {
+                                runwind = e;
+                                cur = site.ret_block;
+                                ridx = site.ret_idx;
+                                continue;
+                            },
+                        },
+                    }
                 }
             }
             if (site.req.captures.items.len == 0 and site.req.closure_id == null and
