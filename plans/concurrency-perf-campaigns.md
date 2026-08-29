@@ -107,9 +107,17 @@ string), and lowering the runTest dispatch cap (HARMFUL —
 teardown-deadlock hangs). `buildSubTable` is LINEAR — per-call overhead, not
 a pathology.
 
-EXIT PATH: no measured lever exceeds 14% and the biggest are taken, so the
-remaining path is an execution core that does not resolve, frame and box per
-call — Front A1d. Serve-sized levers from here are single digits.
+EXIT PATH (revised 2026-08-29, A1d measured dead as a wall lever like the
+per-op transpiler before it): the remaining measured levers are (1) the
+ReleaseFast gate-harness policy (1.18-1.20x, adopt it), (2) fresh
+profile-driven serve/splice rounds (re-profile after each — the mix
+shifts), (3) nothing else — three execution-tier attempts all measured
+neutral because the heavy-op bodies dominate in every tier. Wall
+arithmetic honestly restated: 364s needs ~1.9x of recomposition; the
+levers above compound to ~1.4-1.5x from here, so the target needs either
+several profile rounds to keep finding double-digit items or a revised
+exit criterion once the vein is measurably dry — record each round's
+yield and decide on numbers.
 LANDED after the first attempt was reverted and its blockers root-caused
 (2026-08-28, 41b35ffd + 140384da):
 - SPLICE HYGIENE: mutable-var homes were a flat name-keyed map, so a
@@ -173,124 +181,37 @@ hands every uninlined op back to `klio_op_*`, and a recomposition IS dispatch
 and frame machinery, so the C adds a layer without removing work. Do not
 re-try a wider op selector.
 
-- [ ] A1d — the fused native-bank execution tier, now DESIGNED AGAINST
-      MEASUREMENT (`KLIO_FUSE_CENSUS`, landed): a per-body classifier
-      tallies which activations a walker with C-stack registers, routed
-      field access and host-entry slow paths could run end to end.
-      - Package split: ~92% of activations live in the emittable compose
-        set (70% named + 18% accessors + 3.6% lambdas).
-      - OPEN-WORLD expressibility (dynamic calls allowed): 58% of
-        activations; blockers CallMemberOrGlobal 23k / LoadGlobal 23k /
-        LoadFromThisOrGlobal 21k / NewInstance 21k per replica run.
-        Admitting those four via host entries reaches ~96%.
-      - CLOSED-WORLD (dynamic calls excluded): only 27% (~7% wall) —
-        CallMember alone blocks 36k. NOT worth a tier alone.
-      - The boundary is RESUMABILITY: a frameless body cannot sit under a
-        suspending callee. The sound design is SUSPENSION
-        MATERIALIZATION — on `.Suspended` from a callee, build the real
-        Frame from the C bank at the current (block, inst) and hand it to
-        the park machinery as if it had always been framed. Abandon never
-        exists in this tier (bodies have writes); errors RAISE.
-      - Ceiling arithmetic: frame machinery is ~270ns of a ~430ns framed
-        call (measured on a 1M-call probe); full open-world coverage is
-        ~25% of the recomposition wall -> vpd solo ~360s, in-suite ~520s.
-        Slice 1 (the walker + materialization) does NOT close Task 2 by
-        itself; slice 2 is typed unboxing + direct native->native calls on
-        the same skeleton.
-      SLICE 1a+1b LANDED, DEFAULT ON (78457be1, 8c148d3b): the fused
-      walker — C-bank registers, unconditional GC safe point per block
-      (pending() never sees another thread's stop_flag; gating on it let
-      a fused spin-loop skip the STW rendezvous), pinned bank, no abandon
-      (errors RAISE; binopValue extracted as the shared frame-free
-      operator core), TRANSITIVE host-in-the-verdict classification
-      (KlioContinuation.resumeWith runs its own body but calls the
-      host-owned __klio_co_resume, and the resume machinery assumes a
-      framed caller — the pump-stall root), generic markers excluded
-      (frame reified context), INNER-class receivers excluded (bare reads
-      reach the enclosing instance — IteratorImpl.hasNext reads the outer
-      list's size; the subList CME root), seam fallback for declined
-      callees. KLIO_FUSED=0 / name-list bisect; KLIO_FUSED_TRACE.
-      MEASURED NEUTRAL on the replica at closed-world coverage — the
-      skeleton is the deliverable.
-      - [ ] A1d slice 2 (IN PROGRESS): LoadGlobal + NewInstance LANDED
-        (3c7fef99; loadGlobalValue as a shared frame-free core; the
-        load-bearing find: the flat seam routed every fused error through
-        runwind, BYPASSING CATCH DISPATCH — a throw rides rthrow; fixture
-        fused_throw_catch.kt). MATERIALIZE-ON-DEMAND LANDED OPT-IN
-        (354f50ee, KLIO_FUSED_MAT=1): a PARTIAL body runs its fused
-        prefix, then builds the real Frame from the bank at the first
-        heavy op and continues framed — the framed engine then owns the
-        heavy op and any suspension beneath it. This subsumes the
-        LoadFromThisOrGlobal/CMG extraction question entirely (no arm
-        duplication needed). Recursive seam only; a fused .Call parent
-        materializes ITSELF rather than sitting above a parkable callee.
-        The scan/runningReduce family (8 sweep fails) is FIXED: a fused
-        body invoked with the chain DETACHED dropped its subject pushes —
-        the walker now owns a framed-parity chain window, and
-        materialization transfers subjects in framed order.
-        MAT NOW DEFAULT ON (both seams; KLIO_FUSED_MAT=0 bisects): the
-        whole remaining resolution family (windowed capacity, Base64
-        qualified-this, compose isClosed) was ONE root — the window's
-        SEED (member-ext owner, receiver scope) sits below its base, and
-        materialization re-derived the frame chain from in-flight entries
-        only, dropping it; the frame now inherits the window whole (base
-        restored to seed length). KLIO_FUSED name-lists match fqn now
-        (they matched only func.name — every fqn bisect was a no-op).
-        Fixture: fused_member_ext_owner.kt. GC-STRESS roots (the gate's
-        KLIO_GC_STRESS map-copy probe caught all three, poison oracle
-        `root shaded a swept cell` + poison_ctx frame/reg naming): (1)
-        the walker chain windows are thread roots now (anchor-marked);
-        (2) a materialized frame takes the bank's references MOVED (bank
-        zeroed — the pinned bank kept re-rooting objects the remainder
-        dropped) and claims only the copied wmask prefix (setAll rooted
-        pool garbage); (3) eff_args is PINNED for the fused run — a
-        defaulted call's argv lives in a scratch buffer with no other
-        reference, and unlike a framed call the fused body crosses safe
-        points before params are rooted (validateWrite default-map root).
-        Replica: MAT ~192us vs 187us off (~3% window cost, buys the
-        coverage). FRAMED-CONTEXT PARITY round (gate caught 1380/1386):
-        a fused body IS the executing function — currentFrameFunc
-        answers with it via a per-depth mark (chain head recorded at
-        fused entry; a callee's pushed frame wins again), the
-        receiver-tower iterator yields active fused receivers (a private
-        member-ext property's owner executing fused was invisible to the
-        owner-keyed lookups), and the fused Cast arm gets the
-        erased-target leniency leg (typeParamCastPassesIn; '<function>'
-        heads never match instanceOf for closures). Fixtures:
-        fused_private_companion_ext.kt, fused_erased_cast.kt.
-        GATE GREEN with MAT ON: 1390/0/0 (direct child twice; wrapper
-        exit 0), vpd child 708-712s (~pre-MAT 700s — MAT is
-        wall-neutral, the coverage is the point). MEASUREMENT TRAP: read
-        the gate wrapper's EXIT CODE, not its output — zig build prints
-        a dim 'failed command:' context line even on exit-0 runs, and a
-        piped tail + echo masks the code (two green runs were misread
-        red). DYNAMIC-CALL ARMS LANDED FLAGGED (KLIO_FUSED_DYN=1,
-        default off): CallMember/CallVirtual on the walker via the
-        recursive host entries + primitiveMemberOp/range-iter semantics
-        + site-memo replay; measured ~5% SLOWER on the replica because
-        fused-first execution never stamps the site memos framed runs
-        earn — the arms earn the default when calls go native->native.
-        Unconditional fixes that came out of it: the fused .Call
-        ambiguous-site gate (fuseSiteBinds — a host binding beat the
-        baked pack body for convertDurationUnit), walker Trace spans on
-        the mark (file-private extension visibility; slotAnchor), and
-        package answers from the mark.
-        SLICE-2 PERF VERDICT (measured 4x reps, quiet box): the walker
-        cannot win the wall. Replica: no-minprefix ~204, minprefix=24
-        ~195, PARTIAL-off ~195, FUSED=0 ~191 — near-entry
-        materialization was pure overhead (the [fused-mat] b0:1..b0:5
-        family paid walker entry + a full frame build per call; a
-        MINPREFIX gate now classifies those bodies framed, default 24,
-        KLIO_FUSED_MINPREFIX overrides), and even at full coverage the
-        tier is ~2% overhead: the heavy op BODIES (field lookup,
-        dispatch, alloc) dominate and run through the same host paths in
-        every tier — the same lesson the per-op C transpiler measured.
-        Typed unboxing would optimize scalar ops that are ALREADY inline
-        (scalarBin): dropped as a wall lever. A1d stands as landed
-        infrastructure (correctness-hardened, ~neutral); the wall work
-        returns to the PROVEN vein — profile-driven serve/splice rounds
-        (253 -> 182us came from exactly that) + the ReleaseFast gate
-        policy (measured 1.18-1.20x standing option).
+- [x] A1d — the fused native-bank execution tier: CLOSED 2026-08-29,
+      landed default-on and correctness-hardened, with the perf leg
+      MEASURED DEAD for the wall. What stands (session memory
+      `klio-four-campaign-session` carries the full root list):
+      - The walker (C-bank registers, no Frame), unconditional per-block
+        GC safe point, transitive host-in-the-verdict classification,
+        generic/inner-class exclusions, no-abandon (errors RAISE).
+      - MATERIALIZE-ON-DEMAND default on: a PARTIAL body runs its fused
+        prefix and builds the real Frame at the first heavy op; the
+        walker owns a framed-parity chain window the frame inherits
+        whole; the walker's windows/args are GC thread roots; a fused
+        body IS the executing function (currentFrameFunc, receiver
+        tower, call-site span, package via a per-depth mark); the fused
+        Cast has the erased-target leniency; the fused .Call honors the
+        ambiguous-site host-binding gate. MINPREFIX gate (default 24):
+        bodies whose entry hits a heavy op immediately run framed.
+      - Dynamic-call arms exist FLAGGED (KLIO_FUSED_DYN=1, default off;
+        ~5% slower via the recursive entries).
+      - Knobs: KLIO_FUSED=0/fqn-list, KLIO_FUSED_MAT=0,
+        KLIO_FUSED_MINPREFIX, KLIO_FUSED_TRACE, KLIO_FUSE_CENSUS.
+        Fixtures: fused_throw_catch, fused_member_ext_owner,
+        fused_private_companion_ext, fused_erased_cast.
+      - VERDICT (4x reps, quiet box): gated ~195us vs FUSED=0 ~191us —
+        the heavy op bodies (field lookup, dispatch, alloc) dominate and
+        run through the same host paths in every tier, the per-op C
+        transpiler's lesson again. Typed unboxing dropped (scalar ops
+        already inline via scalarBin). Do not reopen a frameless walker
+        as a WALL lever; it is infrastructure.
+      - Gate GREEN with the tier on: 1390/0/0, vpd child 708-712s.
+        TRAP: judge the gate wrapper by EXIT CODE — zig build prints a
+        dim 'failed command:' line even on exit-0 runs.
 - A2 (bake-time AOT registration) and A3 (retire the hand serves) only
   matter once A1d exists; the hand serves (`snapshot_fast`, `compose_fast`,
   `persistent_map_mut`) stay as the working instances.
