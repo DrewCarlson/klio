@@ -3495,7 +3495,7 @@ pub inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
 /// Null when not handled: out-of-bounds, an immutable receiver, and a live
 /// view (subList / map-values / asList backing) all decline to the full
 /// member path, whose guards throw the right exceptions and write through.
-inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *const Value, new_val: Value) ?Value {
+pub inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *const Value, new_val: Value) ?Value {
     if (idx_v.* != .Int) return null;
     const idx = idx_v.Int;
     if (idx < 0) return null;

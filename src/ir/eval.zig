@@ -4693,6 +4693,21 @@ pub fn evalWithCapturesChained(
             return lr;
         }
     }
+    // The fused tier at the same seam: a transitively closed body runs on
+    // the C bank with no Frame at all, raising real errors (never
+    // abandoning) — see `fusedExec`.
+    if (owning == null and closure_id == null and chain_seed.len == 0 and
+        captures.items.len == 0 and
+        (!nativeModuleOk(module) or nativeFor(func.id.int(), func.fqn) == null))
+    {
+        if (try fusedExec(H, allocator, module, func, args.items, host)) |fr| {
+            var a = args;
+            a.deinit(allocator);
+            var c = captures;
+            c.deinit(allocator);
+            return fr;
+        }
+    }
     // Host-route serve at the same seam: a routed target (the snapshot walk
     // family) reached through ANY dispatch path — overload ranking, value
     // invocation, extension fallback — serves here without a frame. The
@@ -5568,6 +5583,36 @@ fn runFlatLoop(
                     cur = site.ret_block;
                     ridx = site.ret_idx;
                     continue;
+                }
+            }
+            if (site.req.captures.items.len == 0 and site.req.closure_id == null and
+                site.req.type_args.len == 0 and !site.req.composer_pushed and
+                site.req.chain.len == 0)
+            fused: {
+                const callee_mod2 = blk_cm2: {
+                    if (funcOwnedBy(f.module, site.req.func)) break :blk_cm2 f.module;
+                    if (comptime @hasDecl(H, "ownerModuleForFunc")) {
+                        if (host.ownerModuleForFunc(site.req.func)) |m| break :blk_cm2 m;
+                    }
+                    break :blk_cm2 f.module;
+                };
+                const fr = (try fusedExec(H, allocator, callee_mod2, site.req.func, site.req.args.items, host)) orelse break :fused;
+                const dst = site.req.dst;
+                discardFlatReq(H, allocator, site.req, host);
+                switch (fr) {
+                    .ok => |v| {
+                        try f.write(dst, v);
+                        cur = site.ret_block;
+                        ridx = site.ret_idx;
+                        continue;
+                    },
+                    .err => |e| {
+                        runwind = e;
+                        cur = site.ret_block;
+                        ridx = site.ret_idx;
+                        _ = &runwind;
+                        continue;
+                    },
                 }
             }
             if (leafReqServable(site.req)) {
@@ -8596,8 +8641,22 @@ noinline fn execArmUnOp(comptime H: type, allocator: Allocator, frame: *Frame, u
 
 /// Outlined `execInst` arm — see `execInst`.
 noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, bo: anytype, host: *H) Allocator.Error!Step {
-    var l = frame.read(bo.lhs);
-    var r = frame.read(bo.rhs);
+    const l = frame.read(bo.lhs);
+    const r = frame.read(bo.rhs);
+    switch (try binopValue(H, allocator, l, r, @TypeOf(bo), bo, host)) {
+        .ok => |v| try frame.write(bo.dst, v),
+        .err => |e| return raiseStep(frame, e),
+    }
+    return .cont;
+}
+
+/// The full binary-operator semantics with no frame coupling: the framed
+/// arm and the fused tier both call this, so the slow tails (identity and
+/// structural equality, string concatenation through user toString,
+/// collection operators, compareTo reduction) exist exactly once.
+fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Value, comptime OpT: type, bo: OpT, host: *H) Allocator.Error!EvalResult {
+    var l = l_in;
+    var r = r_in;
     // A boxed capture is transparent to every operator: the Cell
     // is a carrier (an anon-object method's captured outer `var`),
     // never a user value — `result == null` must compare the
@@ -8624,11 +8683,11 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
     if (bo.op == .StringConcat or string_add) {
         const ls = switch (try stringify(H, allocator, host, &l)) {
             .ok => |s| s,
-            .err => |e| return raiseStep(frame, e),
+            .err => |e| return errResult(e),
         };
         const rs = switch (try stringify(H, allocator, host, &r)) {
             .ok => |s| s,
-            .err => |e| return raiseStep(frame, e),
+            .err => |e| return errResult(e),
         };
         const combined = try std.mem.concat(allocator, u8, &.{ ls, rs });
         // `ls`/`rs` are owned renderings (stringify/renderValue allocate
@@ -8638,8 +8697,7 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
             allocator.free(ls);
             allocator.free(rs);
         }
-        try frame.write(bo.dst, .{ .String = try runtime.strInitOwned(allocator, combined) });
-        return .cont;
+        return ok(.{ .String = try runtime.strInitOwned(allocator, combined) });
     }
     // Collection `+` / `-` operators are stdlib operator
     // functions on the left collection.
@@ -8665,30 +8723,27 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
                 switch (try host.callMember(allocator, &l, assign, &.{r})) {
                     .ok => {
                         l.retain();
-                        try frame.write(bo.dst, l);
-                        return .cont;
+                        return ok(l);
                     },
-                    .err => |e| return raiseStep(frame, e),
+                    .err => |e| return errResult(e),
                 }
             }
         }
         const method = if (bo.op == .Add) "plus" else "minus";
         switch (try host.callMember(allocator, &l, method, &.{r})) {
             .ok => |rv| {
-                try frame.write(bo.dst, rv);
-                return .cont;
+                return ok(rv);
             },
-            .err => |e| return raiseStep(frame, e),
+            .err => |e| return errResult(e),
         }
     }
     // Arrays define `+` (`plus`) but no `-`.
     if (bo.op == .Add and l == .Array) {
         switch (try host.callMember(allocator, &l, "plus", &.{r})) {
             .ok => |rv| {
-                try frame.write(bo.dst, rv);
-                return .cont;
+                return ok(rv);
             },
-            .err => |e| return raiseStep(frame, e),
+            .err => |e| return errResult(e),
         }
     }
     // Referential identity (`===` / `!==`): pure pointer
@@ -8696,8 +8751,7 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
     if (bo.op == .IdentEq or bo.op == .IdentNeq) {
         const same = Value.referenceEq(&l, &r);
         const b = if (bo.op == .IdentNeq) !same else same;
-        try frame.write(bo.dst, .{ .Bool = b });
-        return .cont;
+        return ok(.{ .Bool = b });
     }
     // Result wrappers have no user `equals` surface of their own, but their
     // payload equality still follows Kotlin `==`. This matters for value-class
@@ -8713,8 +8767,7 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
         else
             false;
         const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eq else eq;
-        try frame.write(bo.dst, .{ .Bool = b });
-        return .cont;
+        return ok(.{ .Bool = b });
     }
     // The suspension marker has identity-only equality and no member surface.
     if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
@@ -8722,8 +8775,7 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
     {
         const eq = Value.structuralEq(&l, &r);
         const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eq else eq;
-        try frame.write(bo.dst, .{ .Bool = b });
-        return .cont;
+        return ok(.{ .Bool = b });
     }
     // `x == null` / `x != null` is a null check, never a user `equals`
     // dispatch (Kotlin compares against the null literal by identity).
@@ -8734,8 +8786,7 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
     {
         const both_null = l == .Null and r == .Null;
         const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !both_null else both_null;
-        try frame.write(bo.dst, .{ .Bool = b });
-        return .cont;
+        return ok(.{ .Bool = b });
     }
     // Collection `==` / `!=`: compare element/entry-wise so a user
     // `equals` override fires (bare structural equality treats a
@@ -8760,8 +8811,7 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
         if (comptime @hasDecl(H, "deepValueEquals")) {
             const eq = try host.deepValueEquals(allocator, &l, &r);
             const neg = bo.op == .NotEq or bo.op == .BoxedNotEq;
-            try frame.write(bo.dst, .{ .Bool = if (neg) !eq else eq });
-            return .cont;
+            return ok(.{ .Bool = if (neg) !eq else eq });
         }
     }
     if (operatorMethod(bo.op)) |method| {
@@ -8776,8 +8826,7 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
             {
                 const eqv = Value.structuralEq(&l, &r);
                 const bv = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eqv else eqv;
-                try frame.write(bo.dst, .{ .Bool = bv });
-                return .cont;
+                return ok(.{ .Bool = bv });
             }
             // `a == b` dispatches `a.equals(b)`, but a builtin
             // collection carries only structural equality; when the
@@ -8806,7 +8855,7 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
                             const assign = compoundAssignMethod(bo.op).?;
                             switch (try host.callMember(allocator, &l, assign, &.{r})) {
                                 .ok => {},
-                                .err => |e2| return raiseStep(frame, e2),
+                                .err => |e2| return errResult(e2),
                             }
                             result = l;
                         } else if (bo.op == .Eq or bo.op == .BoxedEq or bo.op == .NotEq or bo.op == .BoxedNotEq) {
@@ -8819,10 +8868,10 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
                             else
                                 Value.structuralEq(&l, &r) };
                         } else {
-                            return raiseStep(frame, e);
+                            return errResult(e);
                         }
                     },
-                    else => return raiseStep(frame, e),
+                    else => return errResult(e),
                 },
             }
             // compareTo wrappers need to be reduced to a Bool.
@@ -8835,8 +8884,7 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
                 .NotEq, .BoxedNotEq => if (result == .Bool) Value{ .Bool = !result.Bool } else result,
                 else => result,
             };
-            try frame.write(bo.dst, final_val);
-            return .cont;
+            return ok(final_val);
         }
     }
     // A `..` / `..<` over operands the i64-backed `Range` value cannot
@@ -8851,10 +8899,9 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
         const method = if (bo.op == .RangeUntil) "rangeUntil" else "rangeTo";
         switch (try host.callMember(allocator, &l, method, &.{r})) {
             .ok => |rv| {
-                try frame.write(bo.dst, rv);
-                return .cont;
+                return ok(rv);
             },
-            .err => |e| return raiseStep(frame, e),
+            .err => |e| return errResult(e),
         }
     }
     // Builtin-collection equality whose ELEMENTS include user
@@ -8867,15 +8914,13 @@ noinline fn execArmBinOp(comptime H: type, allocator: Allocator, frame: *Frame, 
     {
         if (host.collectionsEqualHostAware(allocator, &l, &r)) |eq| {
             const b = if (bo.op == .NotEq or bo.op == .BoxedNotEq) !eq else eq;
-            try frame.write(bo.dst, .{ .Bool = b });
-            return .cont;
+            return ok(.{ .Bool = b });
         }
     }
     switch (try applyBinop(allocator, bo.op, &l, &r)) {
-        .ok => |out| try frame.write(bo.dst, out),
-        .err => |e| return raiseStep(frame, e),
+        .ok => |out| return ok(out),
+        .err => |e| return errResult(e),
     }
-    return .cont;
 }
 
 /// Outlined `execInst` arm — see `execInst`.
@@ -11075,4 +11120,455 @@ test "enclosing chain pushes are dropped with no active frame" {
 
 test {
     testing.refAllDecls(@This());
+}
+
+// ---- The fused execution tier -----------------------------------------------
+//
+// A body the classifier accepts runs with its registers in a per-thread
+// C bank: no Frame, no register pool, no activation bookkeeping. Unlike the
+// leaf tier there is NO abandon — fused bodies contain writes, so every
+// admitted instruction either executes or RAISES exactly as the framed arm
+// would, and classification is TRANSITIVE over statically-resolved calls so
+// no framed machinery (and no suspension) can ever appear beneath a fused
+// activation. `KLIO_FUSED=0` disables the tier.
+
+pub const FUSED_MAX_REGS: usize = 128;
+const FUSED_BANK_DEPTH: usize = 24;
+const FUSED_MAX_BLOCKS: usize = 64;
+const FUSED_MAX_INSTS: usize = 256;
+
+threadlocal var fused_bank: [FUSED_BANK_DEPTH][FUSED_MAX_REGS]Value = undefined;
+threadlocal var fused_depth: usize = 0;
+
+var fused_enabled_state: u8 = 0;
+var fused_enabled_val: bool = false;
+/// OPT-IN while the tier hardens (`KLIO_FUSED=1`): fusing the kotlinx
+/// lock-free-list and JobSupport accessors hung a composition test, and
+/// that family needs per-op verification before the tier can default on.
+pub fn fusedEnabled() bool {
+    if (fused_enabled_state == 0) {
+        fused_enabled_val = std.mem.eql(u8, runtime.envOnce("KLIO_FUSED") orelse "0", "1");
+        fused_enabled_state = 1;
+    }
+    return fused_enabled_val;
+}
+
+/// Transitive closed-world classification, memoized on the Func. A cycle
+/// (mutual recursion) reads as eligible while the root classification runs
+/// and settles with the root's verdict.
+fn fusedEligible(module: *const Module, func: *const Func) bool {
+    switch (func.fuse_state) {
+        1, 3 => return true,
+        2 => return false,
+        else => {},
+    }
+    @constCast(func).fuse_state = 3;
+    const verdict = fusedClassify(module, func);
+    @constCast(func).fuse_state = if (verdict) 1 else 2;
+    return verdict;
+}
+
+fn bareTypeVarHead(name: []const u8) bool {
+    const head = std.mem.trimEnd(u8, name, "?");
+    return head.len > 0 and head.len <= 2 and std.ascii.isUpper(head[0]);
+}
+
+fn fusedClassify(module: *const Module, func: *const Func) bool {
+    if (func.is_suspend or func.is_lambda) return false;
+    // A generic body's `as T` / `is T` consults the frame's reified
+    // context (`typeParamCastPasses`), which the fused walker does not
+    // carry — kotlinx's `systemProp<T>` silently failed its cast and the
+    // DEFAULT_TIMEOUT initializer died with it. Func carries no type-param
+    // list, so a parameter or return typed as a bare type variable is the
+    // generic marker, and the Cast/InstanceOf ops are guarded below too.
+    if (bareTypeVarHead(func.return_ty.name)) return false;
+    for (func.params) |*p| {
+        if (bareTypeVarHead(p.ty.name)) return false;
+    }
+    if (func.blocks.len == 0 or func.blocks.len > FUSED_MAX_BLOCKS) return false;
+    if (func.n_locals > FUSED_MAX_REGS) return false;
+    for (func.params) |*p| {
+        if (p.is_vararg or p.default != null) return false;
+    }
+    var total: usize = 0;
+    for (func.blocks) |*b| {
+        if (b.catches.len != 0 or b.finally != null or b.lr_absorb != null) return false;
+        total += b.insts.len;
+        if (total > FUSED_MAX_INSTS) return false;
+        switch (b.terminator) {
+            .Return, .Goto, .Branch, .Switch, .Throw, .Unreachable => {},
+            else => return false,
+        }
+        for (b.insts) |*inst| {
+            switch (inst.*) {
+                .Trace, .Const, .Move, .LoadParam, .BinOp, .Not, .GetField, .SetField,
+                .Index, .IndexSet, .NotNullAssert, .MakeCell,
+                .CellGet, .CellSet, .EnclosingPush, .EnclosingPop => {},
+                .Cast => |ct| if (bareTypeVarHead(ct.ty.name)) return false,
+                .InstanceOf => |io| if (bareTypeVarHead(io.ty.name)) return false,
+                .Call => |c| {
+                    if (c.arg_names.len != 0 or c.type_args.len != 0) return false;
+                    const callee = module.funcById(c.func) orelse return false;
+                    _ = module.ensureFuncBody(@constCast(callee));
+                    if (callee.params.len != c.n_args) return false;
+                    if (!fusedEligible(module, callee)) return false;
+                },
+                else => return false,
+            }
+        }
+    }
+    return true;
+}
+
+const FusedFail = error{Raise} || Allocator.Error;
+threadlocal var fused_err: EvalError = undefined;
+
+inline fn fusedRaise(e: EvalError) FusedFail {
+    fused_err = e;
+    return error.Raise;
+}
+
+/// The tier's entry: null when the body is ineligible (caller proceeds to
+/// the framed path), an EvalResult otherwise — `.ok` or a genuinely raised
+/// `.err`, never an abandon.
+pub fn fusedExec(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    func: *const Func,
+    args: []const Value,
+    host: *H,
+) Allocator.Error!?EvalResult {
+    if (comptime !@hasDecl(H, "fieldSiteRoute")) return null;
+    if (!fusedEnabled()) return null;
+    // A symbol the host settled onto a native binding or a redirect does
+    // not run its lowered body — fusing it executes a stub the host never
+    // intended to run. The coroutine bridge (`__klio_co_resume`,
+    // `KlioContinuation.resumeWith`) is exactly this shape, and fusing it
+    // leaked the pump's per-resume state until the RSS cap fired.
+    if (comptime @hasDecl(H, "funcRunsItsBody")) {
+        if (!host.funcRunsItsBody(func.id)) return null;
+    }
+    if (!fusedEligible(module, func)) return null;
+    if (args.len != func.params.len) return null;
+    if (fused_depth >= FUSED_BANK_DEPTH) return null;
+    if (frame_count_on) frame_count_total += 1;
+    if (runtime.envOnce("KLIO_FUSED_TRACE") != null) {
+        std.debug.print("[fused] {s}\n", .{if (func.fqn.len != 0) func.fqn else func.name});
+    }
+    const r = fusedRun(H, allocator, module, func, args, host) catch |e| switch (e) {
+        error.Raise => return .{ .err = fused_err },
+        else => |oe| return oe,
+    };
+    return .{ .ok = r };
+}
+
+fn fusedRun(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    func: *const Func,
+    args_in: []const Value,
+    host: *H,
+) FusedFail!Value {
+    const reclaim = runtime.reclaimEnabled();
+    var eff_args = args_in;
+    {
+        const plan = coercePlanFor(module, func);
+        if (plan & 6 != 0 and args_in.len <= ir.LEAF_MAX_REGS) {
+            const coerce_buf: []Value = coerce_bank[fused_depth % LEAF_BANK_DEPTH][0..args_in.len];
+            @memcpy(coerce_buf, args_in);
+            if (plan & 2 != 0) coerceIntArgsToLong(func, coerce_buf);
+            if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, coerce_buf);
+            eff_args = coerce_buf;
+        }
+    }
+    const nlive: usize = @min(@as(usize, func.n_locals), FUSED_MAX_REGS);
+    const regs: []Value = fused_bank[fused_depth][0..nlive];
+    fused_depth += 1;
+    defer fused_depth -= 1;
+    // Unlike the leaf bank there is no def-before-use proof here: fill the
+    // bank so the register file is always well-formed, and pin it for the
+    // collector for the whole run (fused bodies allocate and call).
+    for (regs) |*v| v.* = .Unit;
+    const pin_mark = runtime.keepaliveMark();
+    runtime.keepalivePushSlice(regs);
+    defer runtime.keepaliveRestore(pin_mark);
+    defer if (reclaim) {
+        for (regs) |*v| v.release(allocator);
+    };
+    var pushed_enclosing: usize = 0;
+    defer while (pushed_enclosing > 0) : (pushed_enclosing -= 1) popEnclosing();
+
+    var cur: BlockId = func.entry;
+    walk: while (true) {
+        // The framed loop's GC safe point, once per block: a fused-only hot
+        // loop otherwise allocates without ever letting a collection run
+        // (DeepRecursiveTest grew past the RSS cap). The bank is pinned, so
+        // stopping here is root-exact.
+        if (runtime.gc.gc_enabled and runtime.gc.pending()) runtime.gc.safePoint();
+        const blk = &func.blocks[cur.int()];
+        for (blk.insts) |*inst| {
+            try fusedInst(H, allocator, module, eff_args, host, inst, regs, reclaim, &pushed_enclosing);
+        }
+        switch (blk.terminator) {
+            .Goto => |next| cur = next,
+            .Branch => |br| {
+                const v = fusedRead(regs, br.cond);
+                switch (try valueTruthy(allocator, &v)) {
+                    .ok => |b| cur = if (b) br.t else br.f,
+                    .err => |e| return fusedRaise(e),
+                }
+            },
+            .Switch => |sw| {
+                const v = fusedRead(regs, sw.reg);
+                var next = sw.default;
+                for (sw.arms) |arm| {
+                    if (constMatches(module, arm.key, &v)) {
+                        next = arm.target;
+                        break;
+                    }
+                }
+                cur = next;
+            },
+            .Return => |maybe_r| {
+                const v = if (maybe_r) |r| fusedRead(regs, r) else Value.Unit;
+                v.retain();
+                return v;
+            },
+            .Throw => |r| {
+                const exc = fusedRead(regs, r);
+                exc.retain();
+                return fusedRaise(.{ .Throw = exc });
+            },
+            .Unreachable => return fusedRaise(.{ .Type = "unreachable block executed" }),
+            else => unreachable,
+        }
+        continue :walk;
+    }
+}
+
+inline fn fusedRead(regs: []const Value, r: Reg) Value {
+    const i = r.int();
+    if (i >= regs.len) return .Unit;
+    return regs[i];
+}
+
+inline fn fusedWrite(allocator: Allocator, regs: []Value, dst: Reg, v: Value, reclaim: bool, retain_src: bool) void {
+    const i = dst.int();
+    if (i >= regs.len) {
+        if (reclaim and !retain_src) v.release(allocator);
+        return;
+    }
+    if (reclaim) {
+        if (retain_src) v.retain();
+        const old = regs[i];
+        regs[i] = v;
+        old.release(allocator);
+    } else {
+        regs[i] = v;
+    }
+}
+
+fn fusedInst(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    args: []const Value,
+    host: *H,
+    inst: *const Inst,
+    regs: []Value,
+    reclaim: bool,
+    pushed_enclosing: *usize,
+) FusedFail!void {
+    switch (inst.*) {
+        .Trace => {},
+        .LoadParam => |lp| {
+            const v = if (lp.idx < args.len) args[lp.idx] else Value.Unit;
+            fusedWrite(allocator, regs, lp.dst, v, reclaim, true);
+        },
+        .Const => |c| {
+            if (c.value.int() >= module.consts.items.len)
+                return fusedRaise(.{ .Type = "fused: const id out of range" });
+            const v = try constToValue(allocator, &module.consts.items[c.value.int()]);
+            fusedWrite(allocator, regs, c.dst, v, reclaim, false);
+        },
+        .Move => |mv| fusedWrite(allocator, regs, mv.dst, fusedRead(regs, mv.src), reclaim, true),
+        .Not => |n| {
+            const v = fusedRead(regs, n.src);
+            if (v == .Instance) {
+                switch (try host.callMember(allocator, &v, "not", &.{})) {
+                    .ok => |rv| fusedWrite(allocator, regs, n.dst, rv, reclaim, false),
+                    .err => |e| return fusedRaise(e),
+                }
+                return;
+            }
+            const b = switch (v) {
+                .Bool => |bv| !bv,
+                else => return fusedRaise(.{ .Type = "Not on non-bool" }),
+            };
+            fusedWrite(allocator, regs, n.dst, .{ .Bool = b }, reclaim, false);
+        },
+        .BinOp => |bo| {
+            const l = fusedRead(regs, bo.lhs);
+            const r = fusedRead(regs, bo.rhs);
+            if (scalarBin(bo.op, l, r)) |v| {
+                fusedWrite(allocator, regs, bo.dst, v, reclaim, false);
+                return;
+            }
+            switch (try binopValue(H, allocator, l, r, @TypeOf(bo), bo, host)) {
+                .ok => |v| fusedWrite(allocator, regs, bo.dst, v, reclaim, false),
+                .err => |e| return fusedRaise(e),
+            }
+        },
+        .GetField => |gf| {
+            const recv = fusedRead(regs, gf.receiver);
+            const fname = constStr(module, gf.field) orelse
+                return fusedRaise(.{ .Type = "GetField: name not a string const" });
+            if (try builtinFieldFast(H, host, allocator, &recv, fname)) |bv| {
+                fusedWrite(allocator, regs, gf.dst, bv, reclaim, false);
+                return;
+            }
+            switch (try host.getField(allocator, &recv, fname)) {
+                .ok => |v| fusedWrite(allocator, regs, gf.dst, v, reclaim, true),
+                .err => |e| return fusedRaise(e),
+            }
+        },
+        .SetField => |sf| {
+            const recv = fusedRead(regs, sf.receiver);
+            const v = fusedRead(regs, sf.value);
+            const fname = constStr(module, sf.field) orelse
+                return fusedRaise(.{ .Type = "SetField: name not a string const" });
+            const super_owner: ?[]const u8 = if (sf.super_owner) |c| constStr(module, c) else null;
+            switch (try host.setFieldFrom(allocator, &recv, fname, v, super_owner)) {
+                .ok => {},
+                .err => |e| return fusedRaise(e),
+            }
+        },
+        .Index => |ix| {
+            const recv = fusedRead(regs, ix.receiver);
+            const idx = fusedRead(regs, ix.index);
+            if (fastIndexGet(&recv, &idx)) |v| {
+                v.retain();
+                fusedWrite(allocator, regs, ix.dst, v, reclaim, false);
+                return;
+            }
+            switch (try host.callMember(allocator, &recv, "get", &.{idx})) {
+                .ok => |v| fusedWrite(allocator, regs, ix.dst, v, reclaim, false),
+                .err => |e| return fusedRaise(e),
+            }
+        },
+        .IndexSet => |ixs| {
+            const recv = fusedRead(regs, ixs.receiver);
+            const idx = fusedRead(regs, ixs.index);
+            const v = fusedRead(regs, ixs.value);
+            if (exec_call.fastIndexSet(allocator, &recv, &idx, v)) |expr_val| {
+                if (reclaim) expr_val.release(allocator);
+                return;
+            }
+            switch (try host.callMember(allocator, &recv, "set", &.{ idx, v })) {
+                .ok => {},
+                .err => |e| return fusedRaise(e),
+            }
+        },
+        .InstanceOf => |io| {
+            const v = fusedRead(regs, io.src);
+            fusedWrite(allocator, regs, io.dst, .{ .Bool = host.instanceOf(&v, io.ty) }, reclaim, false);
+        },
+        .Cast => |cast| {
+            const v = fusedRead(regs, cast.src);
+            if (host.instanceOf(&v, cast.ty)) {
+                fusedWrite(allocator, regs, cast.dst, v, reclaim, true);
+            } else if (cast.safe) {
+                fusedWrite(allocator, regs, cast.dst, .Null, reclaim, false);
+            } else {
+                const msg = try std.fmt.allocPrint(allocator, "cast to `{s}` failed", .{cast.ty.name});
+                const exc = try Value.newException(allocator, .{
+                    .fqn = try runtime.strInit(allocator, "kotlin.ClassCastException"),
+                    .message = .from(try runtime.strInitOwned(allocator, msg)),
+                    .cause = null,
+                });
+                return fusedRaise(.{ .Throw = exc });
+            }
+        },
+        .NotNullAssert => |nn| {
+            const v = fusedRead(regs, nn.src);
+            if (v == .Null) {
+                const exc = try Value.newException(allocator, .{
+                    .fqn = try runtime.strInit(allocator, "kotlin.NullPointerException"),
+                    .message = .{},
+                    .cause = null,
+                });
+                return fusedRaise(.{ .Throw = exc });
+            }
+            fusedWrite(allocator, regs, nn.dst, v, reclaim, true);
+        },
+        .MakeCell => |mc| {
+            const v = fusedRead(regs, mc.src);
+            v.retain();
+            fusedWrite(allocator, regs, mc.dst, try Value.newCell(allocator, v), reclaim, false);
+        },
+        .CellGet => |cg| {
+            const v = switch (fusedRead(regs, cg.cell)) {
+                .Cell => |c| blk: {
+                    const g = c.borrow();
+                    defer g.deinit();
+                    break :blk g.get().*;
+                },
+                else => |other| other,
+            };
+            fusedWrite(allocator, regs, cg.dst, v, reclaim, true);
+        },
+        .CellSet => |cs| {
+            const cell_v = fusedRead(regs, cs.cell);
+            const v = fusedRead(regs, cs.value);
+            switch (cell_v) {
+                .Cell => |c| {
+                    v.retain();
+                    const g = c.borrowMut();
+                    defer g.deinit();
+                    const old = g.get().*;
+                    g.get().* = v;
+                    if (reclaim) old.release(allocator);
+                },
+                else => return fusedRaise(.{ .Type = "CellSet on non-cell" }),
+            }
+        },
+        .EnclosingPush => |x| {
+            const v = fusedRead(regs, x.src);
+            pushEnclosingSubject(&v);
+            pushed_enclosing.* += 1;
+        },
+        .EnclosingPop => {
+            popEnclosing();
+            if (pushed_enclosing.* > 0) pushed_enclosing.* -= 1;
+        },
+        .Call => |c| {
+            const callee = module.funcById(c.func) orelse
+                return fusedRaise(.{ .Type = "fused: unknown callee" });
+            var argv: [FUSED_MAX_REGS]Value = undefined;
+            if (c.n_args > FUSED_MAX_REGS)
+                return fusedRaise(.{ .Type = "fused: too many call args" });
+            var i: u32 = 0;
+            while (i < c.n_args) : (i += 1) {
+                argv[i] = fusedRead(regs, Reg.from(c.args.int() + i));
+            }
+            const direct = try fusedExec(H, allocator, module, callee, argv[0..c.n_args], host);
+            const r = direct orelse blk: {
+                // The runtime gates (bank depth, a host-owned callee) can
+                // decline what the classifier admitted; the callee then runs
+                // through the ordinary seam. Transitive classification keeps
+                // it non-suspending either way.
+                var arg_list: std.ArrayList(Value) = .empty;
+                try arg_list.appendSlice(allocator, argv[0..c.n_args]);
+                if (runtime.reclaimEnabled()) for (arg_list.items) |v| v.retain();
+                break :blk try evalWithCapturesChained(H, allocator, module, null, callee, arg_list, .empty, &.{}, null, host);
+            };
+            switch (r) {
+                .ok => |v| fusedWrite(allocator, regs, c.dst, v, reclaim, false),
+                .err => |e| return fusedRaise(e),
+            }
+        },
+        else => unreachable,
+    }
 }
