@@ -224,14 +224,14 @@ re-try a wider op selector.
         LoadFromThisOrGlobal/CMG extraction question entirely (no arm
         duplication needed). Recursive seam only; a fused .Call parent
         materializes ITSELF rather than sitting above a parkable callee.
-        REMAINING before MAT defaults on: ONE failure family — bare `add`
-        inside a spliced `apply{}` subject lambda when materialization
-        lands mid-splice (scan/runningReduce ×8 in the sweep; the fused
-        prefix's subject push is mirrored onto the frame's chain but the
-        framed remainder still resolves it as an unresolved global —
-        needs a [fused-mat] trace + the real sweep-child argv to repro;
-        the simple shape passes). Then re-measure, then typed unboxing +
-        direct native->native calls.
+        The scan/runningReduce family (8 sweep fails) is FIXED: a fused
+        body invoked with the chain DETACHED dropped its subject pushes —
+        the walker now owns a framed-parity chain window, and
+        materialization transfers subjects in framed order (seeded own
+        receiver below the base, subjects above). REMAINING before MAT
+        defaults on, same resolution-context family: windowed `capacity`
+        x2, Base64 qualified-this, compose `isClosed`. Then re-measure,
+        then typed unboxing + direct native->native calls.
 - A2 (bake-time AOT registration) and A3 (retire the hand serves) only
   matter once A1d exists; the hand serves (`snapshot_fast`, `compose_fast`,
   `persistent_map_mut`) stay as the working instances.
