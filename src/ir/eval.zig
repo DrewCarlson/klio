@@ -11141,29 +11141,56 @@ threadlocal var fused_bank: [FUSED_BANK_DEPTH][FUSED_MAX_REGS]Value = undefined;
 threadlocal var fused_depth: usize = 0;
 
 var fused_enabled_state: u8 = 0;
-var fused_enabled_val: bool = false;
-/// OPT-IN while the tier hardens (`KLIO_FUSED=1`): fusing the kotlinx
-/// lock-free-list and JobSupport accessors hung a composition test, and
-/// that family needs per-op verification before the tier can default on.
+var fused_enabled_val: bool = true;
+var fused_sel: ?[]const u8 = null;
+/// `KLIO_FUSED=0` disables the tier; a comma list fuses ONLY those simple
+/// names; a list starting with `!` fuses all BUT those — the same bisect
+/// grammar as KLIO_MEMBER_INLINE.
 pub fn fusedEnabled() bool {
     if (fused_enabled_state == 0) {
-        fused_enabled_val = std.mem.eql(u8, runtime.envOnce("KLIO_FUSED") orelse "0", "1");
+        const raw = runtime.envOnce("KLIO_FUSED") orelse "1";
+        if (std.mem.eql(u8, raw, "0")) {
+            fused_enabled_val = false;
+        } else {
+            fused_enabled_val = true;
+            if (!std.mem.eql(u8, raw, "1")) fused_sel = raw;
+        }
         fused_enabled_state = 1;
     }
     return fused_enabled_val;
 }
 
+fn fusedNameSelected(name: []const u8) bool {
+    const sel = fused_sel orelse return true;
+    const inverted = std.mem.startsWith(u8, sel, "!");
+    var it = std.mem.splitScalar(u8, if (inverted) sel[1..] else sel, ',');
+    while (it.next()) |tok| {
+        if (tok.len != 0 and std.mem.eql(u8, tok, name)) return !inverted;
+    }
+    return inverted;
+}
+
 /// Transitive closed-world classification, memoized on the Func. A cycle
 /// (mutual recursion) reads as eligible while the root classification runs
-/// and settles with the root's verdict.
-fn fusedEligible(module: *const Module, func: *const Func) bool {
+/// and settles with the root's verdict. The host is part of the verdict: a
+/// body that (transitively) calls a HOST-OWNED function must not fuse —
+/// `KlioContinuation.resumeWith` runs its own lowered body but calls the
+/// host's `__klio_co_resume`, and the resume machinery assumes a framed
+/// caller (fusing it stalled the pump).
+fn fusedEligible(comptime H: type, host: *H, module: *const Module, func: *const Func) bool {
     switch (func.fuse_state) {
         1, 3 => return true,
         2 => return false,
         else => {},
     }
+    if (comptime @hasDecl(H, "funcRunsItsBody")) {
+        if (!host.funcRunsItsBody(func.id)) {
+            @constCast(func).fuse_state = 2;
+            return false;
+        }
+    }
     @constCast(func).fuse_state = 3;
-    const verdict = fusedClassify(module, func);
+    const verdict = fusedClassify(H, host, module, func);
     @constCast(func).fuse_state = if (verdict) 1 else 2;
     return verdict;
 }
@@ -11173,7 +11200,7 @@ fn bareTypeVarHead(name: []const u8) bool {
     return head.len > 0 and head.len <= 2 and std.ascii.isUpper(head[0]);
 }
 
-fn fusedClassify(module: *const Module, func: *const Func) bool {
+fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const Func) bool {
     if (func.is_suspend or func.is_lambda) return false;
     // A generic body's `as T` / `is T` consults the frame's reified
     // context (`typeParamCastPasses`), which the fused walker does not
@@ -11211,7 +11238,7 @@ fn fusedClassify(module: *const Module, func: *const Func) bool {
                     const callee = module.funcById(c.func) orelse return false;
                     _ = module.ensureFuncBody(@constCast(callee));
                     if (callee.params.len != c.n_args) return false;
-                    if (!fusedEligible(module, callee)) return false;
+                    if (!fusedEligible(H, host, module, callee)) return false;
                 },
                 else => return false,
             }
@@ -11246,11 +11273,19 @@ pub fn fusedExec(
     // intended to run. The coroutine bridge (`__klio_co_resume`,
     // `KlioContinuation.resumeWith`) is exactly this shape, and fusing it
     // leaked the pump's per-resume state until the RSS cap fired.
-    if (comptime @hasDecl(H, "funcRunsItsBody")) {
-        if (!host.funcRunsItsBody(func.id)) return null;
-    }
-    if (!fusedEligible(module, func)) return null;
+    if (!fusedNameSelected(func.name)) return null;
+    if (!fusedEligible(H, host, module, func)) return null;
     if (args.len != func.params.len) return null;
+    // An INNER-class member's bare reads reach the enclosing instance
+    // (`hasNext(): Boolean = index < size` reads the OUTER list's size),
+    // context the walker does not model — the framed path resolves it
+    // through the enclosing chain. A receiver carrying an outer declines.
+    if (args.len > 0 and args[0] == .Instance) {
+        const g = args[0].Instance.borrow();
+        const has_outer = g.get().outer != null;
+        g.deinit();
+        if (has_outer) return null;
+    }
     if (fused_depth >= FUSED_BANK_DEPTH) return null;
     if (frame_count_on) frame_count_total += 1;
     if (runtime.envOnce("KLIO_FUSED_TRACE") != null) {
@@ -11302,11 +11337,16 @@ fn fusedRun(
 
     var cur: BlockId = func.entry;
     walk: while (true) {
-        // The framed loop's GC safe point, once per block: a fused-only hot
-        // loop otherwise allocates without ever letting a collection run
+        // The framed loop's GC safe point, once per block, UNCONDITIONAL:
+        // `pending()` never sees another thread's stop_flag, so gating on it
+        // let a fused spin-loop (JobSupport's state machine waiting on a
+        // sibling thread) skip the stop-the-world rendezvous — the collector
+        // waited on this thread while this thread waited on a parked mutator.
+        // `safePoint()` itself parks on a raised stop and no-ops otherwise;
+        // a fused-only hot loop also needs it so allocations ever collect
         // (DeepRecursiveTest grew past the RSS cap). The bank is pinned, so
         // stopping here is root-exact.
-        if (runtime.gc.gc_enabled and runtime.gc.pending()) runtime.gc.safePoint();
+        if (runtime.gc.gc_enabled) runtime.gc.safePoint();
         const blk = &func.blocks[cur.int()];
         for (blk.insts) |*inst| {
             try fusedInst(H, allocator, module, eff_args, host, inst, regs, reclaim, &pushed_enclosing);
