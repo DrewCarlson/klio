@@ -4700,7 +4700,7 @@ pub fn evalWithCapturesChained(
         captures.items.len == 0 and
         (!nativeModuleOk(module) or nativeFor(func.id.int(), func.fqn) == null))
     {
-        if (try fusedExec(H, allocator, module, func, args.items, host)) |fr| {
+        if (try fusedExecOpt(H, allocator, module, func, args.items, host, fusedMaterializeEnabled())) |fr| {
             var a = args;
             a.deinit(allocator);
             var c = captures;
@@ -11180,6 +11180,20 @@ pub fn fusedEnabled() bool {
     return fused_enabled_val;
 }
 
+var fused_mat_state: u8 = 0;
+var fused_mat_val: bool = false;
+/// `KLIO_FUSED_MAT=1` lets a PARTIAL body materialize mid-flight —
+/// OPT-IN while the materialized frame's resolution context hardens
+/// (a bare `add` inside a materialized remainder resolved as an
+/// unresolved global; four CompositionTests regressed).
+fn fusedMaterializeEnabled() bool {
+    if (fused_mat_state == 0) {
+        fused_mat_val = std.mem.eql(u8, runtime.envOnce("KLIO_FUSED_MAT") orelse "0", "1");
+        fused_mat_state = 1;
+    }
+    return fused_mat_val;
+}
+
 fn fusedNameSelected(name: []const u8) bool {
     const sel = fused_sel orelse return true;
     const inverted = std.mem.startsWith(u8, sel, "!");
@@ -11197,21 +11211,31 @@ fn fusedNameSelected(name: []const u8) bool {
 /// `KlioContinuation.resumeWith` runs its own lowered body but calls the
 /// host's `__klio_co_resume`, and the resume machinery assumes a framed
 /// caller (fusing it stalled the pump).
+/// fuse_state: 0 unasked, 1 FULL (every op in the fast set, callees
+/// transitively full — flat and recursive seams), 2 no, 3 in progress,
+/// 4 PARTIAL (structurally sound; runs fused until the first heavy op,
+/// then MATERIALIZES a real frame and continues framed — recursive seam
+/// only, because a flat caller cannot adopt the materialized remainder's
+/// suspension).
 fn fusedEligible(comptime H: type, host: *H, module: *const Module, func: *const Func) bool {
+    return fusedVerdict(H, host, module, func) == 1;
+}
+
+fn fusedVerdict(comptime H: type, host: *H, module: *const Module, func: *const Func) u8 {
     switch (func.fuse_state) {
-        1, 3 => return true,
-        2 => return false,
+        1, 2, 4 => return func.fuse_state,
+        3 => return 1,
         else => {},
     }
     if (comptime @hasDecl(H, "funcRunsItsBody")) {
         if (!host.funcRunsItsBody(func.id)) {
             @constCast(func).fuse_state = 2;
-            return false;
+            return 2;
         }
     }
     @constCast(func).fuse_state = 3;
     const verdict = fusedClassify(H, host, module, func);
-    @constCast(func).fuse_state = if (verdict) 1 else 2;
+    @constCast(func).fuse_state = verdict;
     return verdict;
 }
 
@@ -11220,39 +11244,40 @@ fn bareTypeVarHead(name: []const u8) bool {
     return head.len > 0 and head.len <= 2 and std.ascii.isUpper(head[0]);
 }
 
-fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const Func) bool {
-    if (func.is_suspend or func.is_lambda) return false;
+fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const Func) u8 {
+    if (func.is_suspend or func.is_lambda) return 2;
     // A generic body's `as T` / `is T` consults the frame's reified
     // context (`typeParamCastPasses`), which the fused walker does not
     // carry — kotlinx's `systemProp<T>` silently failed its cast and the
     // DEFAULT_TIMEOUT initializer died with it. Func carries no type-param
     // list, so a parameter or return typed as a bare type variable is the
     // generic marker, and the Cast/InstanceOf ops are guarded below too.
-    if (bareTypeVarHead(func.return_ty.name)) return false;
+    if (bareTypeVarHead(func.return_ty.name)) return 2;
     for (func.params) |*p| {
-        if (bareTypeVarHead(p.ty.name)) return false;
+        if (bareTypeVarHead(p.ty.name)) return 2;
     }
-    if (func.blocks.len == 0 or func.blocks.len > FUSED_MAX_BLOCKS) return false;
-    if (func.n_locals > FUSED_MAX_REGS) return false;
+    if (func.blocks.len == 0 or func.blocks.len > FUSED_MAX_BLOCKS) return 2;
+    if (func.n_locals > FUSED_MAX_REGS) return 2;
     for (func.params) |*p| {
-        if (p.is_vararg or p.default != null) return false;
+        if (p.is_vararg or p.default != null) return 2;
     }
+    var heavy = false;
     var total: usize = 0;
     for (func.blocks) |*b| {
-        if (b.catches.len != 0 or b.finally != null or b.lr_absorb != null) return false;
+        if (b.catches.len != 0 or b.finally != null or b.lr_absorb != null) return 2;
         total += b.insts.len;
-        if (total > FUSED_MAX_INSTS) return false;
+        if (total > FUSED_MAX_INSTS) return 2;
         switch (b.terminator) {
             .Return, .Goto, .Branch, .Switch, .Throw, .Unreachable => {},
-            else => return false,
+            else => return 2,
         }
         for (b.insts) |*inst| {
             switch (inst.*) {
                 .Trace, .Const, .Move, .LoadParam, .BinOp, .Not, .GetField, .SetField,
                 .Index, .IndexSet, .NotNullAssert, .MakeCell,
                 .CellGet, .CellSet, .EnclosingPush, .EnclosingPop => {},
-                .Cast => |ct| if (bareTypeVarHead(ct.ty.name)) return false,
-                .InstanceOf => |io| if (bareTypeVarHead(io.ty.name)) return false,
+                .Cast => |ct| if (bareTypeVarHead(ct.ty.name)) return 2,
+                .InstanceOf => |io| if (bareTypeVarHead(io.ty.name)) return 2,
                 // Non-suspending open-world ops: a global read may run a
                 // lazy initializer and a construction runs ctor bodies, but
                 // neither can suspend (Kotlin forbids suspend there), so no
@@ -11261,25 +11286,37 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
                 .NewInstance => |ni| {
                     if (ni.arg_names.len != 0) {
                         for (ni.arg_names) |an| {
-                            if (an != null) return false;
+                            if (an != null) heavy = true;
                         }
                     }
                 },
-                .Call => |c| {
-                    if (c.arg_names.len != 0 or c.type_args.len != 0) return false;
-                    const callee = module.funcById(c.func) orelse return false;
+                .Call => |c| blk: {
+                    if (c.arg_names.len != 0 or c.type_args.len != 0) {
+                        heavy = true;
+                        break :blk;
+                    }
+                    const callee = module.funcById(c.func) orelse {
+                        heavy = true;
+                        break :blk;
+                    };
                     _ = module.ensureFuncBody(@constCast(callee));
-                    if (callee.params.len != c.n_args) return false;
-                    if (!fusedEligible(H, host, module, callee)) return false;
+                    if (callee.params.len != c.n_args) {
+                        heavy = true;
+                        break :blk;
+                    }
+                    if (fusedVerdict(H, host, module, callee) != 1) heavy = true;
                 },
-                else => return false,
+                // A SuspendResumePoint marks a resumable body: never fused,
+                // never materialized mid-flight.
+                .SuspendResumePoint => return 2,
+                else => heavy = true,
             }
         }
     }
-    return true;
+    return if (heavy) 4 else 1;
 }
 
-const FusedFail = error{Raise} || Allocator.Error;
+const FusedFail = error{ Raise, Materialize } || Allocator.Error;
 threadlocal var fused_err: EvalError = undefined;
 
 inline fn fusedRaise(e: EvalError) FusedFail {
@@ -11298,6 +11335,22 @@ pub fn fusedExec(
     args: []const Value,
     host: *H,
 ) Allocator.Error!?EvalResult {
+    return fusedExecOpt(H, allocator, module, func, args, host, false);
+}
+
+/// `allow_materialize`: a PARTIAL body runs its fused prefix and then
+/// builds the real Frame and continues framed — only the recursive seam
+/// may allow it (a flat caller cannot adopt the remainder's suspension,
+/// and a fused .Call parent must never sit above a parkable callee).
+pub fn fusedExecOpt(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    func: *const Func,
+    args: []const Value,
+    host: *H,
+    allow_materialize: bool,
+) Allocator.Error!?EvalResult {
     if (comptime !@hasDecl(H, "fieldSiteRoute")) return null;
     if (!fusedEnabled()) return null;
     // A symbol the host settled onto a native binding or a redirect does
@@ -11306,7 +11359,9 @@ pub fn fusedExec(
     // `KlioContinuation.resumeWith`) is exactly this shape, and fusing it
     // leaked the pump's per-resume state until the RSS cap fired.
     if (!fusedNameSelected(func.name)) return null;
-    if (!fusedEligible(H, host, module, func)) return null;
+    const verdict = fusedVerdict(H, host, module, func);
+    if (verdict == 2) return null;
+    if (verdict == 4 and !allow_materialize) return null;
     if (args.len != func.params.len) return null;
     // An INNER-class member's bare reads reach the enclosing instance
     // (`hasNext(): Boolean = index < size` reads the OUTER list's size),
@@ -11323,11 +11378,7 @@ pub fn fusedExec(
     if (runtime.envOnce("KLIO_FUSED_TRACE") != null) {
         std.debug.print("[fused] {s}\n", .{if (func.fqn.len != 0) func.fqn else func.name});
     }
-    const r = fusedRun(H, allocator, module, func, args, host) catch |e| switch (e) {
-        error.Raise => return .{ .err = fused_err },
-        else => |oe| return oe,
-    };
-    return .{ .ok = r };
+    return try fusedRun(H, allocator, module, func, args, host);
 }
 
 fn fusedRun(
@@ -11337,7 +11388,7 @@ fn fusedRun(
     func: *const Func,
     args_in: []const Value,
     host: *H,
-) FusedFail!Value {
+) Allocator.Error!EvalResult {
     const reclaim = runtime.reclaimEnabled();
     var eff_args = args_in;
     {
@@ -11380,8 +11431,27 @@ fn fusedRun(
         // stopping here is root-exact.
         if (runtime.gc.gc_enabled) runtime.gc.safePoint();
         const blk = &func.blocks[cur.int()];
-        for (blk.insts) |*inst| {
-            try fusedInst(H, allocator, module, func, eff_args, host, inst, regs, reclaim, &pushed_enclosing);
+        for (blk.insts, 0..) |*inst, idx| {
+            fusedInst(H, allocator, module, func, eff_args, host, inst, regs, reclaim, &pushed_enclosing) catch |e| switch (e) {
+                error.Raise => return .{ .err = fused_err },
+                // A heavy op: build the real Frame from the bank and run
+                // the remainder framed, starting AT this instruction (no
+                // side effect of it has run). The framed machinery then
+                // owns the heavy op — including any suspension beneath it.
+                error.Materialize => return try fusedMaterializeAndRun(
+                    H,
+                    allocator,
+                    module,
+                    func,
+                    args_in,
+                    regs,
+                    cur,
+                    idx,
+                    pushed_enclosing,
+                    host,
+                ),
+                else => |oe| return oe,
+            };
         }
         switch (blk.terminator) {
             .Goto => |next| cur = next,
@@ -11389,7 +11459,7 @@ fn fusedRun(
                 const v = fusedRead(regs, br.cond);
                 switch (try valueTruthy(allocator, &v)) {
                     .ok => |b| cur = if (b) br.t else br.f,
-                    .err => |e| return fusedRaise(e),
+                    .err => |e| return .{ .err = e },
                 }
             },
             .Switch => |sw| {
@@ -11406,18 +11476,88 @@ fn fusedRun(
             .Return => |maybe_r| {
                 const v = if (maybe_r) |r| fusedRead(regs, r) else Value.Unit;
                 v.retain();
-                return v;
+                return ok(v);
             },
             .Throw => |r| {
                 const exc = fusedRead(regs, r);
                 exc.retain();
-                return fusedRaise(.{ .Throw = exc });
+                return .{ .err = .{ .Throw = exc } };
             },
-            .Unreachable => return fusedRaise(.{ .Type = "unreachable block executed" }),
+            .Unreachable => return .{ .err = .{ .Type = "unreachable block executed" } },
             else => unreachable,
         }
         continue :walk;
     }
+}
+
+/// Build the real Frame from the bank at (cur, idx) and run the remainder
+/// through the framed engine — the same startup sequence the recursive
+/// seam performs, resumed mid-body. Bank slots are copied with their own
+/// retains (the bank's teardown and the frame's teardown each release
+/// one), and subject pushes the fused prefix made are mirrored onto the
+/// frame's own chain, with the walker's caller-chain originals still
+/// popped by its defer.
+fn fusedMaterializeAndRun(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    func: *const Func,
+    args_in: []const Value,
+    regs: []Value,
+    cur: BlockId,
+    idx: usize,
+    pushed_enclosing: usize,
+    host: *H,
+) Allocator.Error!EvalResult {
+    const ev: *EvalTls = &evtls;
+    var arg_list: std.ArrayList(Value) = .empty;
+    try arg_list.appendSlice(allocator, args_in);
+    if (runtime.reclaimEnabled()) for (arg_list.items) |v| v.retain();
+    var try_stack: std.ArrayList(TryFrame) = .empty;
+    defer try_stack.deinit(allocator);
+    var frame = try Frame.newWithCaptures(ev, allocator, module, func, arg_list, .empty);
+    defer frame.deinit();
+    gcPushFrame(&frame);
+    defer gcPopFrame(&frame);
+    try frame.activateChain(&.{});
+    defer frame.deactivateChain();
+    if (pushed_enclosing > 0) {
+        if (ev.active_chain) |chain| {
+            _ = chain;
+        }
+        // The walker's own subject pushes live at the tail of the CALLER's
+        // chain (the walker had no chain of its own). Mirror them onto the
+        // materialized frame's chain so the framed remainder sees them; the
+        // walker's defer still pops the originals.
+        // NOTE: activateChain repointed the active chain to this frame, so
+        // read the originals from the frame's prev chain.
+        if (frame.prev_chain) |prev| {
+            const items = prev.items;
+            const start = items.len -| pushed_enclosing;
+            for (items[start..]) |e| {
+                try frame.enclosing_this.append(chainAllocator(), e);
+            }
+        }
+    }
+    const ctx_mark: usize = if (comptime @hasDecl(H, "ctxStackLen")) host.ctxStackLen() else 0;
+    if (comptime @hasDecl(H, "ctxPush")) {
+        if (module.has_context_decls) {
+            if (comptime @hasDecl(H, "ctxActivate")) host.ctxActivate(true);
+            if (func.has_receiver_param and frame.params.items.len > 0) {
+                host.ctxPush(frame.params.items[0]) catch {};
+            }
+        }
+    }
+    defer if (comptime @hasDecl(H, "ctxStackTruncate")) host.ctxStackTruncate(ctx_mark);
+    const n = @min(regs.len, frame.regs.items.len);
+    for (regs[0..n], 0..) |v, i| {
+        v.retain();
+        if (runtime.reclaimEnabled()) frame.regs.items[i].release(allocator);
+        frame.regs.items[i] = v;
+    }
+    frame.wmask.setAll();
+    const result = try runFrame(H, allocator, module, &frame, &try_stack, cur, idx, host);
+    return frameBoundary(func, result);
 }
 
 inline fn fusedRead(regs: []const Value, r: Reg) Value {
@@ -11668,7 +11808,7 @@ fn fusedInst(
         },
         .Call => |c| {
             const callee = module.funcById(c.func) orelse
-                return fusedRaise(.{ .Type = "fused: unknown callee" });
+                return error.Materialize;
             var argv: [FUSED_MAX_REGS]Value = undefined;
             if (c.n_args > FUSED_MAX_REGS)
                 return fusedRaise(.{ .Type = "fused: too many call args" });
@@ -11676,12 +11816,16 @@ fn fusedInst(
             while (i < c.n_args) : (i += 1) {
                 argv[i] = fusedRead(regs, Reg.from(c.args.int() + i));
             }
+            if (c.arg_names.len != 0 or c.type_args.len != 0 or callee.params.len != c.n_args)
+                return error.Materialize;
             const direct = try fusedExec(H, allocator, module, callee, argv[0..c.n_args], host);
             const r = direct orelse blk: {
-                // The runtime gates (bank depth, a host-owned callee) can
-                // decline what the classifier admitted; the callee then runs
-                // through the ordinary seam. Transitive classification keeps
-                // it non-suspending either way.
+                // The runtime gates (bank depth, a host-owned callee, a
+                // PARTIAL callee) can decline what the classifier admitted.
+                // A FULL-classified callee run framed stays non-suspending
+                // (its calls are transitively full), so the seam fallback
+                // is sound; anything else materializes this body instead.
+                if (fusedVerdict(H, host, module, callee) != 1) return error.Materialize;
                 var arg_list: std.ArrayList(Value) = .empty;
                 try arg_list.appendSlice(allocator, argv[0..c.n_args]);
                 if (runtime.reclaimEnabled()) for (arg_list.items) |v| v.retain();
@@ -11692,6 +11836,6 @@ fn fusedInst(
                 .err => |e| return fusedRaise(e),
             }
         },
-        else => unreachable,
+        else => return error.Materialize,
     }
 }
