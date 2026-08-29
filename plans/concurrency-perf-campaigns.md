@@ -37,7 +37,15 @@ It now declares its own budget (900s test / 1200s class), a ratchet that must
 only shrink. The cost is Task 2's metric — the two are ONE piece of work:
 recomposition throughput.
 
-## Task 2 — compose suite wall time — OPEN (~640s, target 364s)
+## Task 2 — compose suite wall time — OPEN (~620s, target 364s)
+
+WRAPPER SERVE LANDED (f79ca3cf): throw-capable host serves
+(hostRouteServeThrowing beside hostRouteServe at the recursive + flat
+seams; a flat throw rides rthrow) with one resident — the changelist
+executeWithComposeStackTrace for NULL errorContext (the catch rethrows
+unchanged; the serve forwards getGroupAnchor/getGroupHandle + execute
+against the live chain and drops the 24-reg wrapper frame). COMPOSE_FAST
+bit6, mask 63->127. Replica 194->186us; gate 1390/0/0, vpd child 637->608s.
 
 RELEASEFAST GATE POLICY ADOPTED 2026-08-29 (e2192a48): the compose gate
 spawns `klio-harness-fast` (ReleaseFast, own binary name; only suites
