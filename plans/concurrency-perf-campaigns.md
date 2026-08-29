@@ -1,10 +1,11 @@
 # Four campaigns: concurrency correctness + the three performance fronts
 
-STATUS 2026-08-29: **all four tasks and all three fronts are closed.** The
-standing gate is 1390 passed / 0 failed / 0 DNC, vpd child 602s on the
-ReleaseFast gate harness, budget ratchet 700s. What remains is not open
-work in this plan but the hand-off below: the ratchet that banks future
-throughput wins, the recorded future veins, and the traps.
+STATUS 2026-08-29 (follow-up round complete): **all four tasks, all three
+fronts, and every follow-up item are closed.** The standing gate is 1390
+passed / 0 failed / 0 DNC, vpd child 577s on the ReleaseFast gate
+harness, budget ratchet 650s (the serve round's win banked). What remains
+is the hand-off below: the ratchet that banks future throughput wins and
+the traps.
 
 Discipline that got it here: root-cause only, peel one root at a time,
 full battery before every commit, example + pinned output per interpreter
@@ -108,30 +109,59 @@ pins every shape; `KLIO_MEMBER_INLINE` / `KLIO_PMI_TRACE` bisect.
 
 ---
 
-## Remaining / future work (nothing open; recorded for the next campaign)
+## ACTIVE — follow-up campaign (reopened 2026-08-29; done when every item lands or closes by measurement)
 
-1. **The vpd budget ratchet (700s) is the permanent guard.** Every future
-   recomposition-throughput win must bank into it — shrink the budget,
-   never let it grow.
-2. **B2 — id-keyed dispatch**: intern symbol ids at bake and key the
-   string-keyed cache probes on them (`eqlBytes` ~5% of the interpreter
-   profile). Cross-cutting refactor, single-digit yield; first vein for a
-   future interpreter-floor campaign.
-3. **B3 — allocation rate / typed storage**: the structural boxing cut
-   needs typed collections — the compiler direction measured dead three
-   times; only worth revisiting with a genuinely new architecture
-   (inlined dispatch + native frames).
-4. **Value stage 5c (24 -> 16B)**: Array pointer-bit tag + IrClosure
-   boxing. Re-opens only when a profile shows Value-copy traffic
-   dominating (IrClosure boxing adds an allocation to compose's hottest
-   creation path).
-5. **A2/A3 (bake-time AOT registration; retiring the hand serves)**:
-   only meaningful after a compiler tier that actually wins; the hand
-   serves (`snapshot_fast`, `compose_fast`, `persistent_map_mut`) stay
-   as the working instances.
-6. **Push-block serve precondition**: `push(op) { args }` can be served
-   only with a boxed WriteScope receiver (value-class member dispatch
-   belongs to the framed machinery); ~2% if ever built.
+1. **B2 — id-keyed dispatch — CLOSED BY MEASUREMENT 2026-08-29.** The
+   eqlBytes vein is dry. Landed (kept — one-time at prepare, zero
+   steady-state cost, `KLIO_CANON=0` bisects): program-wide name
+   canonicalization through the image intern
+   (`canonicalizeProgramNames`: const pools, ClassDef param/prop names,
+   ir.Class/Func name/fqn/package, re-keyed accessor pair maps +
+   member_name_index), InstanceData ptr-first `define`, the
+   `extDeclRecvIsUserClass` StaticStringMap, and `KLIO_PROF_RAW` caller-PC
+   dumps (addr2line pins anon map instantiations to file:line). Field
+   probes flipped 0.3% -> 97% ptr-hits — and the replica wall moved ZERO
+   (135-137 vs 134-137us, fast harness, 4x reps, both A/B rounds). The
+   remaining eqlBytes (~5% ReleaseSafe profile) is length-gated misses
+   and short compares diluted across 15+ sites; the hash half (getIndex
+   ~2.2%) is bounded below the same noise floor. Full id-keyed map
+   conversion would buy <1% for a cross-cutting key-type refactor — do
+   not re-try. (Do not re-learn: the harness `run` default profile has
+   the loop JIT ON and it costs ~27% on compose shapes — measure replica
+   with KLIO_JIT=0 to mirror the gate.)
+2. **Push-block serve — LANDED 2026-08-29** (grew into a serve round):
+   `Operations.push(op) { args }` serves whole on the throwing seam —
+   pure pushOp serve (link variant keeps the `requiresApplication`
+   aggregation — the recorded MovableContentTests trap re-hit and
+   re-fixed), then the block runs against a BOXED WriteScope
+   (`newInstanceNamed` + `callValueWithThis`). Same round, from the frame
+   census: generic `Stack<T>` serves (pure isEmpty/isNotEmpty/peek;
+   push/pop forward to the backing MutableList intrinsic on the host
+   seam) and the non-root `CompositionObserverHolder.current()` refresh
+   through the host getter ladder. `KLIO_COMPOSE_FAST` default 127 ->
+   255 (bit7 = push-block). Replica 136 -> ~130us (-5%), activations
+   205K -> 146K (-29%). Movable 44/44, CompositionObserver 13/13,
+   CompositionTests 148/148, Pausable 25/25.
+3. **Ratchet banking — DONE 2026-08-29.** Full gate after the serve
+   round: 1390/0/0, vpd child 577s (from 602). Budget ratcheted
+   700 -> 650s (12.6% headroom), shrink-only as ever.
+4. **Value stage 5c — CLOSED BY MEASUREMENT 2026-08-29.** The reopen
+   condition (Value-copy traffic dominating a profile) is disproven: the
+   replica profile's only copy-family symbols are copyFixedLength 0.68%
+   and copyBlocks 0.54%; the top costs are dispatch (runFrameExec 9.2%,
+   execInst 2.5%, leafWalkStream 2.4%), eql+hash ~7%, RC traffic ~4%.
+   Value stays 24B; 5c reopens only if a future profile shows a
+   copy-family symbol above ~5%.
+5. **B3 — typed storage — STAYS CLOSED 2026-08-29.** Gate re-checked:
+   alloc family (allocSmall ~1.7%, allocLockedOne ~1.2%) sits far behind
+   dispatch (~15%); the big memset in ReleaseSafe profiles is the
+   safe-mode undefined-fill, absent from the ReleaseFast gate build —
+   not an allocation cost at all. Typed collections stay gated on a
+   genuinely new compiler architecture.
+6. **A2/A3 — CLOSED 2026-08-29.** No compiler tier wins on this workload
+   (measured three ways), so bake-time AOT registration has no substrate;
+   the hand serves (`snapshot_fast`, `compose_fast`, `persistent_map_mut`)
+   are the permanent instances.
 
 ## The serve seams (how to add the next serve)
 
