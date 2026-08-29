@@ -264,8 +264,21 @@ re-try a wider op selector.
         the gate wrapper's EXIT CODE, not its output — zig build prints
         a dim 'failed command:' context line even on exit-0 runs, and a
         piped tail + echo masks the code (two green runs were misread
-        red). NEXT: typed unboxing + direct native->native calls (the
-        remaining ~1.9x to the 364s wall).
+        red). DYNAMIC-CALL ARMS LANDED FLAGGED (KLIO_FUSED_DYN=1,
+        default off): CallMember/CallVirtual on the walker via the
+        recursive host entries + primitiveMemberOp/range-iter semantics
+        + site-memo replay; measured ~5% SLOWER on the replica because
+        fused-first execution never stamps the site memos framed runs
+        earn — the arms earn the default when calls go native->native.
+        Unconditional fixes that came out of it: the fused .Call
+        ambiguous-site gate (fuseSiteBinds — a host binding beat the
+        baked pack body for convertDurationUnit), walker Trace spans on
+        the mark (file-private extension visibility; slotAnchor), and
+        package answers from the mark. Replica standing: fused-on ~198,
+        MAT=0 ~189, FUSED=0 ~186 (jitter ±6) — the tier is ~neutral on
+        the replica and the wall (708-712s), carried by coverage. NEXT:
+        typed unboxing + direct native->native member calls on the
+        walker (the remaining ~1.9x to the 364s wall).
 - A2 (bake-time AOT registration) and A3 (retire the hand serves) only
   matter once A1d exists; the hand serves (`snapshot_fast`, `compose_fast`,
   `persistent_map_mut`) stay as the working instances.
