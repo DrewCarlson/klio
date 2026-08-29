@@ -50,6 +50,18 @@ changelist drain executeAndFlushAllPendingOperations 6.7%,
 executeWithComposeStackTrace 4.6%, Operations.push 4.0%,
 endRestartGroup 3.8%, startReplaceGroup 3.2%, composer group family
 ~15% combined — a flat tail of upstream composer bodies.
+NEXT-ROUND FACTS (frame census + KLIO_CF_TRACE decline tracing):
+- `Operations.push` frames are the BLOCK variant `push(op) { args }` —
+  the lambda must run, so the whole-record serve legitimately cannot
+  take it; the 2-param pushOp serve HITS 6196/6206 (declines are real
+  growth bails). Interior setInt/setObject/ensure-args already served.
+- `executeWithComposeStackTrace` is the standing frame item: 6201
+  frames x a 24-register fill + TWO unbound CMG dispatches
+  (getGroupAnchor, execute) per op; the serve needs the enclosing-chain
+  owner (member-extension dispatch receiver), sketched but not landed.
+- Gate on the 700s ratchet: EXIT=0, 1389/1386 (one
+  resumeOnBackgroundThread budget graze under a concurrent rebuild),
+  vpd child 637s.
 
 The wall EQUALS `validatePotentialDeadlock` (its slowest child), so
 scheduling cannot move it; only recomposition throughput can. The wall target

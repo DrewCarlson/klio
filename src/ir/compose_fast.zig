@@ -317,8 +317,12 @@ fn readOpCounts(op: *const Value) ?OpCounts {
 /// body performs, then record the operation and advance the cursors. Any
 /// stack that must grow bails to the interpreted body, which resizes.
 pub fn servePushOp(allocator: std.mem.Allocator, args: []const Value) ?Value {
+    if (runtime.envOnce("KLIO_CF_TRACE") != null) std.debug.print("[cf] pushOp enter a0={s} a1={s}\n", .{ @tagName(std.meta.activeTag(args[0])), @tagName(std.meta.activeTag(args[1])) });
     if (args[0] != .Instance) return null;
-    const counts = readOpCounts(&args[1]) orelse return null;
+    const counts = readOpCounts(&args[1]) orelse {
+        if (runtime.envOnce("KLIO_CF_TRACE") != null) std.debug.print("[cf] pushOp DECLINE counts\n", .{});
+        return null;
+    };
     if (counts.ints < 0 or counts.objects < 0) return null;
 
     var op_codes: runtime.ArrayData = undefined;
@@ -329,12 +333,25 @@ pub fn servePushOp(allocator: std.mem.Allocator, args: []const Value) ?Value {
         const g = args[0].Instance.borrow();
         defer g.deinit();
         const inst = g.get();
-        const codes_v = inst.getCached(&fn_opcodes, "opCodes") orelse return null;
-        if (codes_v != .Array or codes_v.Array.prim != null) return null;
+        const tr = runtime.envOnce("KLIO_CF_TRACE") != null;
+        const codes_v = inst.getCached(&fn_opcodes, "opCodes") orelse {
+            if (tr) std.debug.print("[cf] pushOp DECLINE opCodes-missing\n", .{});
+            return null;
+        };
+        if (codes_v != .Array or codes_v.Array.prim != null) {
+            if (tr) std.debug.print("[cf] pushOp DECLINE opCodes-shape {s}\n", .{@tagName(std.meta.activeTag(codes_v))});
+            return null;
+        }
         const int_args_v = inst.getCached(&fn_int_args, "intArgs") orelse return null;
-        if (int_args_v != .Array or int_args_v.Array.prim != .Int) return null;
+        if (int_args_v != .Array or int_args_v.Array.prim != .Int) {
+            if (tr) std.debug.print("[cf] pushOp DECLINE intArgs-shape\n", .{});
+            return null;
+        }
         const obj_args_v = inst.getCached(&fn_obj_args, "objectArgs") orelse return null;
-        if (obj_args_v != .Array or obj_args_v.Array.prim != null) return null;
+        if (obj_args_v != .Array or obj_args_v.Array.prim != null) {
+            if (tr) std.debug.print("[cf] pushOp DECLINE objArgs-shape\n", .{});
+            return null;
+        }
 
         const os = inst.getCached(&fn_opcodes_size, "opCodesSize") orelse return null;
         const is = inst.getCached(&fn_int_args_size, "intArgsSize") orelse return null;
@@ -344,9 +361,18 @@ pub fn servePushOp(allocator: std.mem.Allocator, args: []const Value) ?Value {
         obj_size = asI32(&bs) orelse return null;
 
         if (op_size < 0 or int_size < 0 or obj_size < 0) return null;
-        if (@as(usize, @intCast(op_size)) >= codes_v.Array.len()) return null;
-        if (@as(i64, int_size) + counts.ints > @as(i64, @intCast(int_args_v.Array.len()))) return null;
-        if (@as(i64, obj_size) + counts.objects > @as(i64, @intCast(obj_args_v.Array.len()))) return null;
+        if (@as(usize, @intCast(op_size)) >= codes_v.Array.len()) {
+            if (tr) std.debug.print("[cf] pushOp DECLINE grow-codes\n", .{});
+            return null;
+        }
+        if (@as(i64, int_size) + counts.ints > @as(i64, @intCast(int_args_v.Array.len()))) {
+            if (tr) std.debug.print("[cf] pushOp DECLINE grow-ints\n", .{});
+            return null;
+        }
+        if (@as(i64, obj_size) + counts.objects > @as(i64, @intCast(obj_args_v.Array.len()))) {
+            if (tr) std.debug.print("[cf] pushOp DECLINE grow-objs\n", .{});
+            return null;
+        }
         op_codes = codes_v.Array;
     }
     // The boxed store retains through `ArrayData.set` and its mutable borrow
