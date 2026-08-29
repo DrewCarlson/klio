@@ -258,8 +258,14 @@ re-try a wider op selector.
         erased-target leniency leg (typeParamCastPassesIn; '<function>'
         heads never match instanceOf for closures). Fixtures:
         fused_private_companion_ext.kt, fused_erased_cast.kt.
-        NEXT: gate + wall re-measure, then typed unboxing + direct
-        native->native calls.
+        GATE GREEN with MAT ON: 1390/0/0 (direct child twice; wrapper
+        exit 0), vpd child 708-712s (~pre-MAT 700s — MAT is
+        wall-neutral, the coverage is the point). MEASUREMENT TRAP: read
+        the gate wrapper's EXIT CODE, not its output — zig build prints
+        a dim 'failed command:' context line even on exit-0 runs, and a
+        piped tail + echo masks the code (two green runs were misread
+        red). NEXT: typed unboxing + direct native->native calls (the
+        remaining ~1.9x to the 364s wall).
 - A2 (bake-time AOT registration) and A3 (retire the hand serves) only
   matter once A1d exists; the hand serves (`snapshot_fast`, `compose_fast`,
   `persistent_map_mut`) stay as the working instances.
