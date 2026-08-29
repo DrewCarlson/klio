@@ -37,7 +37,19 @@ It now declares its own budget (900s test / 1200s class), a ratchet that must
 only shrink. The cost is Task 2's metric — the two are ONE piece of work:
 recomposition throughput.
 
-## Task 2 — compose suite wall time — OPEN (797s, target 364s)
+## Task 2 — compose suite wall time — OPEN (~640s, target 364s)
+
+RELEASEFAST GATE POLICY ADOPTED 2026-08-29 (e2192a48): the compose gate
+spawns `klio-harness-fast` (ReleaseFast, own binary name; only suites
+marked `fast_exe`); every other suite/sweep keeps ReleaseSafe. Measured:
+replica 191 -> 163us (1.17x), vpd child 708-712 -> 623s, gate 1390/0/0,
+vpd budget ratcheted 800 -> 700s. Remaining to 364s: vpd child ~1.8x =
+continued profile rounds. Corrected-attribution profile (fn-prof now
+stamped by fused bodies too; ghost-name caveat printed by the report):
+changelist drain executeAndFlushAllPendingOperations 6.7%,
+executeWithComposeStackTrace 4.6%, Operations.push 4.0%,
+endRestartGroup 3.8%, startReplaceGroup 3.2%, composer group family
+~15% combined — a flat tail of upstream composer bodies.
 
 The wall EQUALS `validatePotentialDeadlock` (its slowest child), so
 scheduling cannot move it; only recomposition throughput can. The wall target

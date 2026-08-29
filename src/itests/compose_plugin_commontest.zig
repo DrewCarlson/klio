@@ -169,7 +169,7 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     // 8-way contention both cross the 90s hang window while still passing.
     try map.put(
         "KLIO_TEST_WALL_CAP_FOR",
-        "validatePotentialDeadlock=800,resumeOnBackgroundThread=300,pausingTheFrameClockStopShouldBlockWithFrameNanos=300",
+        "validatePotentialDeadlock=700,resumeOnBackgroundThread=300,pausingTheFrameClockStopShouldBlockWithFrameNanos=300",
     );
     // Four children each defaulting to a half-the-cores compute pool
     // oversubscribe the box 2x and inflate the concurrent classes'
