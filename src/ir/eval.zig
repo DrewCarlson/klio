@@ -5606,12 +5606,22 @@ fn runFlatLoop(
                         ridx = site.ret_idx;
                         continue;
                     },
-                    .err => |e| {
-                        runwind = e;
-                        cur = site.ret_block;
-                        ridx = site.ret_idx;
-                        _ = &runwind;
-                        continue;
+                    .err => |e| switch (e) {
+                        // The flat protocol: a throw re-enters the caller
+                        // through `rthrow` so its catch handlers dispatch;
+                        // only the non-catchable unwinds ride `runwind`.
+                        .Throw => |v| {
+                            rthrow = v;
+                            cur = site.ret_block;
+                            ridx = site.ret_idx;
+                            continue;
+                        },
+                        else => {
+                            runwind = e;
+                            cur = site.ret_block;
+                            ridx = site.ret_idx;
+                            continue;
+                        },
                     },
                 }
             }
@@ -8453,83 +8463,10 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
         },
         .StoreToThisOrGlobal => |stg| return execArmStoreToThisOrGlobal(H, allocator, frame, stg, host),
         .LoadGlobal => |lg| {
-            const name_str = constStr(frame.module, lg.name) orelse
-                return raiseStep(frame, .{ .Type = "LoadGlobal: name not a string const" });
-            // A lowering-resolved identity binds that exact declaration;
-            // the name string is only the unresolved-shape fallback.
-            const by_id: ?Value = if (lg.func != null or lg.class != null)
-                host.lookupGlobalById(allocator, lg.func, lg.class, lg.ctor_ref)
-            else
-                null;
-            const lg_r: MaybeValueResult = if (by_id != null) .{ .ok = by_id } else try host.lookupGlobalThrowing(allocator, name_str);
-            const found = switch (lg_r) {
-                .ok => |maybe| maybe,
+            switch (try loadGlobalValue(H, allocator, frame.module, lg, host)) {
+                .ok => |v| try frame.write(lg.dst, v),
                 .err => |e| return raiseStep(frame, e),
-            };
-            // No receiver probe here: a `LoadGlobal` is emitted only where
-            // no implicit receiver can shadow the name, and kotlinc
-            // rejects resolving it against a *caller's* receiver (dynamic
-            // scope), so a miss is a hard unresolved reference.
-            var v: Value = undefined;
-            if (found) |fv| {
-                v = fv;
-            } else if (comptime @hasDecl(H, "callFunc")) {
-                // A top-level `val`/`var` declared with only a custom getter
-                // has no global binding; re-run its 0-arg getter on each read.
-                if (frame.module.registry.top_level_prop_getters.get(name_str)) |getter_fid| {
-                    switch (try host.callFunc(allocator, frame.module, getter_fid, &.{})) {
-                        .ok => |gv| {
-                            try frame.write(lg.dst, gv);
-                            return .cont;
-                        },
-                        .err => |e| return raiseStep(frame, e),
-                    }
-                }
-                // A qualified class/companion member the lowering flattened to
-                // one global name (`import X.Companion.Y` baked as the FQN
-                // `pkg.X.Y`): no such global binding exists, but the owner
-                // class does — split at the last dot and read the member off
-                // the class value (which serves companion fields), so the
-                // import aliases the SAME value `X.Y` reads.
-                if (std.mem.lastIndexOfScalar(u8, name_str, '.')) |dot| {
-                    if (dot != 0 and dot + 1 < name_str.len) {
-                        const owner_v: ?Value = switch (try host.lookupGlobalThrowing(allocator, name_str[0..dot])) {
-                            .ok => |maybe| maybe,
-                            .err => null,
-                        };
-                        if (owner_v) |ov| {
-                            if (ov == .Class or ov == .Instance) {
-                                switch (try host.getField(allocator, &ov, name_str[dot + 1 ..])) {
-                                    .ok => |fv| {
-                                        fv.retain();
-                                        try frame.write(lg.dst, fv);
-                                        return .cont;
-                                    },
-                                    .err => {},
-                                }
-                            }
-                        }
-                    }
-                }
-                if (envVarSet("KLIO_UNRESOLVED_TRACE")) {
-                    std.debug.print("[unresolved] `{s}` in fn {s} (fqn={s}) span={any}\n", .{ name_str, frame.func.name, frame.func.fqn, frame.cur_span });
-                }
-                const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
-                if (missTraceWant()) |w| {
-                    if (std.mem.eql(u8, w, name_str)) std.debug.print("[lg-tail-a] name={s} func={?} class={?} span={d}:{d} in_fn={s}\n", .{ name_str, if (lg.func) |f| f.int() else null, if (lg.class) |c| c.int() else null, if (frame.cur_span) |sp| sp.file.int() else 0, if (frame.cur_span) |sp| sp.start else 0, frame.func.name });
-                }
-                dumpFrameChainForDiag();
-                return raiseStep(frame, .{ .Unbound = msg });
-            } else {
-                const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
-                if (missTraceWant()) |w| {
-                    if (std.mem.eql(u8, w, name_str)) std.debug.print("[lg-tail-b] name={s} func={?} class={?}\n", .{ name_str, if (lg.func) |f| f.int() else null, if (lg.class) |c| c.int() else null });
-                }
-                dumpFrameChainForDiag();
-                return raiseStep(frame, .{ .Unbound = msg });
             }
-            v.retain();
-            try frame.write(lg.dst, v);
         },
         .LoadCapture => |lc| {
             const v = if (lc.idx < frame.captures.items.len) frame.captures.items[lc.idx] else Value.Unit;
@@ -11122,6 +11059,89 @@ test {
     testing.refAllDecls(@This());
 }
 
+/// The full `LoadGlobal` semantics with no frame coupling — the framed arm
+/// and the fused tier both call this. The result is RETAINED for the
+/// caller's register.
+fn loadGlobalValue(comptime H: type, allocator: Allocator, module: *const Module, lg: anytype, host: *H) Allocator.Error!EvalResult {
+    {
+            const name_str = constStr(module, lg.name) orelse
+                return errResult(.{ .Type = "LoadGlobal: name not a string const" });
+            // A lowering-resolved identity binds that exact declaration;
+            // the name string is only the unresolved-shape fallback.
+            const by_id: ?Value = if (lg.func != null or lg.class != null)
+                host.lookupGlobalById(allocator, lg.func, lg.class, lg.ctor_ref)
+            else
+                null;
+            const lg_r: MaybeValueResult = if (by_id != null) .{ .ok = by_id } else try host.lookupGlobalThrowing(allocator, name_str);
+            const found = switch (lg_r) {
+                .ok => |maybe| maybe,
+                .err => |e| return errResult(e),
+            };
+            // No receiver probe here: a `LoadGlobal` is emitted only where
+            // no implicit receiver can shadow the name, and kotlinc
+            // rejects resolving it against a *caller's* receiver (dynamic
+            // scope), so a miss is a hard unresolved reference.
+            var v: Value = undefined;
+            if (found) |fv| {
+                v = fv;
+            } else if (comptime @hasDecl(H, "callFunc")) {
+                // A top-level `val`/`var` declared with only a custom getter
+                // has no global binding; re-run its 0-arg getter on each read.
+                if (module.registry.top_level_prop_getters.get(name_str)) |getter_fid| {
+                    switch (try host.callFunc(allocator, module, getter_fid, &.{})) {
+                        .ok => |gv| {
+                            return ok(gv);
+                        },
+                        .err => |e| return errResult(e),
+                    }
+                }
+                // A qualified class/companion member the lowering flattened to
+                // one global name (`import X.Companion.Y` baked as the FQN
+                // `pkg.X.Y`): no such global binding exists, but the owner
+                // class does — split at the last dot and read the member off
+                // the class value (which serves companion fields), so the
+                // import aliases the SAME value `X.Y` reads.
+                if (std.mem.lastIndexOfScalar(u8, name_str, '.')) |dot| {
+                    if (dot != 0 and dot + 1 < name_str.len) {
+                        const owner_v: ?Value = switch (try host.lookupGlobalThrowing(allocator, name_str[0..dot])) {
+                            .ok => |maybe| maybe,
+                            .err => null,
+                        };
+                        if (owner_v) |ov| {
+                            if (ov == .Class or ov == .Instance) {
+                                switch (try host.getField(allocator, &ov, name_str[dot + 1 ..])) {
+                                    .ok => |fv| {
+                                        fv.retain();
+                                        return ok(fv);
+                                    },
+                                    .err => {},
+                                }
+                            }
+                        }
+                    }
+                }
+                if (envVarSet("KLIO_UNRESOLVED_TRACE")) {
+                    std.debug.print("[unresolved] `{s}`\n", .{name_str});
+                }
+                const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
+                if (missTraceWant()) |w| {
+                    if (std.mem.eql(u8, w, name_str)) std.debug.print("[lg-tail-a] name={s}\n", .{name_str});
+                }
+                dumpFrameChainForDiag();
+                return errResult(.{ .Unbound = msg });
+            } else {
+                const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
+                if (missTraceWant()) |w| {
+                    if (std.mem.eql(u8, w, name_str)) std.debug.print("[lg-tail-b] name={s} func={?} class={?}\n", .{ name_str, if (lg.func) |f| f.int() else null, if (lg.class) |c| c.int() else null });
+                }
+                dumpFrameChainForDiag();
+                return errResult(.{ .Unbound = msg });
+            }
+            v.retain();
+            return ok(v);
+    }
+}
+
 // ---- The fused execution tier -----------------------------------------------
 //
 // A body the classifier accepts runs with its registers in a per-thread
@@ -11233,6 +11253,18 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
                 .CellGet, .CellSet, .EnclosingPush, .EnclosingPop => {},
                 .Cast => |ct| if (bareTypeVarHead(ct.ty.name)) return false,
                 .InstanceOf => |io| if (bareTypeVarHead(io.ty.name)) return false,
+                // Non-suspending open-world ops: a global read may run a
+                // lazy initializer and a construction runs ctor bodies, but
+                // neither can suspend (Kotlin forbids suspend there), so no
+                // materialization is needed beneath them.
+                .LoadGlobal => {},
+                .NewInstance => |ni| {
+                    if (ni.arg_names.len != 0) {
+                        for (ni.arg_names) |an| {
+                            if (an != null) return false;
+                        }
+                    }
+                },
                 .Call => |c| {
                     if (c.arg_names.len != 0 or c.type_args.len != 0) return false;
                     const callee = module.funcById(c.func) orelse return false;
@@ -11349,7 +11381,7 @@ fn fusedRun(
         if (runtime.gc.gc_enabled) runtime.gc.safePoint();
         const blk = &func.blocks[cur.int()];
         for (blk.insts) |*inst| {
-            try fusedInst(H, allocator, module, eff_args, host, inst, regs, reclaim, &pushed_enclosing);
+            try fusedInst(H, allocator, module, func, eff_args, host, inst, regs, reclaim, &pushed_enclosing);
         }
         switch (blk.terminator) {
             .Goto => |next| cur = next,
@@ -11414,6 +11446,7 @@ fn fusedInst(
     comptime H: type,
     allocator: Allocator,
     module: *const Module,
+    func: *const Func,
     args: []const Value,
     host: *H,
     inst: *const Inst,
@@ -11573,6 +11606,56 @@ fn fusedInst(
                 },
                 else => return fusedRaise(.{ .Type = "CellSet on non-cell" }),
             }
+        },
+        .LoadGlobal => |lg| {
+            switch (try loadGlobalValue(H, allocator, module, lg, host)) {
+                .ok => |v| fusedWrite(allocator, regs, lg.dst, v, reclaim, false),
+                .err => |e| return fusedRaise(e),
+            }
+        },
+        .NewInstance => |ni| {
+            var argv: [FUSED_MAX_REGS]Value = undefined;
+            if (ni.n_args > FUSED_MAX_REGS)
+                return fusedRaise(.{ .Type = "fused: too many ctor args" });
+            var i: u32 = 0;
+            while (i < ni.n_args) : (i += 1) {
+                argv[i] = fusedRead(regs, Reg.from(ni.args.int() + i));
+            }
+            const names = try exec_call.resolveArgNames(allocator, module, ni.arg_names);
+            defer exec_call.freeArgNames(allocator, names);
+            const static_heads = try exec_call.resolveArgNames(allocator, module, ni.arg_static_heads);
+            defer exec_call.freeArgNames(allocator, static_heads);
+            if (comptime @hasDecl(H, "setCtorArgStaticHeads")) {
+                host.setCtorArgStaticHeads(static_heads);
+            }
+            // A bare `Inner(args)` inside a member is `this@Outer.Inner`:
+            // the fused body's own `this` parameter is the outer hint,
+            // exactly as the framed arm passes its frame's `this`.
+            var outer_hint: ?Value = null;
+            if (args.len > 0 and func.params.len > 0 and
+                std.mem.eql(u8, func.params[0].name, "this")) outer_hint = args[0];
+            const hint_ptr: ?*const Value = if (outer_hint) |*h| h else null;
+            const result = switch (try host.newInstanceNamed(allocator, ni.class, argv[0..ni.n_args], names, hint_ptr)) {
+                .ok => |v| v,
+                .err => |e| return fusedRaise(e),
+            };
+            if (result == .Instance) {
+                const inst_ref = result.Instance;
+                const needs_outer = blk: {
+                    const g = inst_ref.borrow();
+                    defer g.deinit();
+                    const cg = g.get().class.borrow();
+                    defer cg.deinit();
+                    break :blk cg.get().is_inner and g.get().outer == null;
+                };
+                if (needs_outer and outer_hint != null) {
+                    outer_hint.?.retain();
+                    const g = inst_ref.borrowMut();
+                    defer g.deinit();
+                    g.get().outer = outer_hint.?;
+                }
+            }
+            fusedWrite(allocator, regs, ni.dst, result, reclaim, false);
         },
         .EnclosingPush => |x| {
             const v = fusedRead(regs, x.src);

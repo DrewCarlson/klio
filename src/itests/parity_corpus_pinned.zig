@@ -449,6 +449,15 @@ test "internal_props_cross_package" {
     }
 }
 
+test "fused_throw_catch" {
+    try check("fused_throw_catch",
+        \\ok=15
+        \\caught=Invalid radix: 37
+        \\failed=true
+        \\
+    );
+}
+
 test "splice_hygiene_shadow" {
     try check("splice_hygiene_shadow",
         \\member=6
