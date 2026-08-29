@@ -466,6 +466,21 @@ test "fused_member_ext_owner" {
     );
 }
 
+test "fused_private_companion_ext" {
+    try check("fused_private_companion_ext",
+        \\-2147483648|-9223372036854775808|true|true
+        \\
+    );
+}
+
+test "fused_erased_cast" {
+    try check("fused_erased_cast",
+        \\42
+        \\15
+        \\
+    );
+}
+
 test "splice_hygiene_shadow" {
     try check("splice_hygiene_shadow",
         \\member=6

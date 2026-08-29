@@ -330,8 +330,23 @@ pub const ThisChainIter = struct {
     cur: ?*Frame,
     steps: usize = 0,
     prev: ?Value = null,
+    /// Active fused walkers' receivers, yielded innermost-first before the
+    /// frames: a fused body binds its receiver in the walker's args, never
+    /// in a frame, so without these a member-extension owner executing
+    /// FUSED is invisible to the receiver-tower walks.
+    fused_i: usize = 0,
 
     pub fn next(self: *ThisChainIter) ?Value {
+        while (self.fused_i > 0) {
+            self.fused_i -= 1;
+            const v = fused_marks[self.fused_i].recv orelse continue;
+            if (self.prev) |p| {
+                if (p == .Instance and v == .Instance and
+                    ObjRef(InstanceData).ptrEq(p.Instance, v.Instance)) continue;
+            }
+            self.prev = v;
+            return v;
+        }
         while (self.cur) |f| {
             self.cur = f.gc_link;
             if (self.steps > 256) return null;
@@ -349,7 +364,7 @@ pub const ThisChainIter = struct {
 };
 
 pub fn frameThisChainIter() ThisChainIter {
-    return .{ .cur = evtls.frame_chain };
+    return .{ .cur = evtls.frame_chain, .fused_i = fused_depth };
 }
 
 pub fn frameThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
@@ -418,15 +433,31 @@ pub fn currentFuncName() ?[]const u8 {
 /// The function the innermost active frame is executing. A bare-name field read
 /// consults it to learn whether the reader is a member-extension body, whose
 /// declaring class is an implicit receiver the read must prefer.
+/// The innermost EXECUTING function — a real frame, or the fused walker's
+/// body when it is what runs on top of the frame chain. The fused marker
+/// records the chain head at fused entry: while no frame has been pushed
+/// above it, the fused body is the executing code (private-member
+/// visibility, self-serve guards, and file scoping all key off this); the
+/// moment a callee pushes a real frame, that frame wins again.
 pub fn currentFrameFunc() ?*const ir.Func {
+    if (fused_depth > 0 and fused_marks[fused_depth - 1].head == evtls.frame_chain)
+        return fused_marks[fused_depth - 1].func;
     return if (evtls.frame_chain) |fr| fr.func else null;
 }
+
+const FusedMark = struct { func: *const ir.Func, mod: *const Module, head: ?*Frame, recv: ?Value };
+threadlocal var fused_marks: [FUSED_BANK_DEPTH]FusedMark = undefined;
 
 /// Type-parameter names declared by the innermost frame's function. An
 /// `object` expression lowered at run time inherits these as its members'
 /// type variables (`ConcurrentSet<Key>()`'s literal declares `add(element:
 /// Key)` against the factory's `Key`, not a nominal class of that name).
 pub fn currentFrameTypeParams() []const []const u8 {
+    if (fused_depth > 0 and fused_marks[fused_depth - 1].head == evtls.frame_chain) {
+        const mk = &fused_marks[fused_depth - 1];
+        const tps = mk.mod.registry.func_type_params.get(mk.func.id) orelse return &.{};
+        return tps.items;
+    }
     const fr = evtls.frame_chain orelse return &.{};
     const tps = fr.module.registry.func_type_params.get(fr.func.id) orelse return &.{};
     return tps.items;
@@ -11425,6 +11456,12 @@ fn fusedRun(
     // bank so the register file is always well-formed, and pin it for the
     // collector for the whole run (fused bodies allocate and call).
     for (regs) |*v| v.* = .Unit;
+    fused_marks[fused_depth - 1] = .{
+        .func = func,
+        .mod = module,
+        .head = evtls.frame_chain,
+        .recv = if (func.has_receiver_param and eff_args.len > 0 and eff_args[0] == .Instance) eff_args[0] else null,
+    };
     if (runtime.gc.gc_enabled) gcInstallFrameRoot();
     const pin_mark = runtime.keepaliveMark();
     runtime.keepalivePushSlice(regs);
@@ -11706,6 +11743,19 @@ fn fusedInst(
                 fusedWrite(allocator, regs, gf.dst, bv, reclaim, false);
                 return;
             }
+            // Framed parity: the executing body's receiver stays reachable as
+            // an enclosing `this` while the field/property resolves — a
+            // member-extension property on another receiver (the negative-zero
+            // `Double.Companion.NegativeZero` shape) needs it as its owner.
+            var pushed_access = false;
+            if (func.has_receiver_param and args.len > 0 and args[0] == .Instance) {
+                const same = recv == .Instance and ObjRef(InstanceData).ptrEq(args[0].Instance, recv.Instance);
+                if (!same) {
+                    pushEnclosingAccess(&args[0]);
+                    pushed_access = true;
+                }
+            }
+            defer if (pushed_access) popEnclosing();
             switch (try host.getField(allocator, &recv, fname)) {
                 .ok => |v| fusedWrite(allocator, regs, gf.dst, v, reclaim, true),
                 .err => |e| return fusedRaise(e),
@@ -11756,9 +11806,14 @@ fn fusedInst(
             const v = fusedRead(regs, cast.src);
             if (host.instanceOf(&v, cast.ty)) {
                 fusedWrite(allocator, regs, cast.dst, v, reclaim, true);
+            } else if (exec_call.typeParamCastPassesIn(H, module, func, cast.ty, host)) {
+                fusedWrite(allocator, regs, cast.dst, v, reclaim, true);
             } else if (cast.safe) {
                 fusedWrite(allocator, regs, cast.dst, .Null, reclaim, false);
             } else {
+                if (runtime.envOnce("KLIO_THROW_TRACE") != null) {
+                    std.debug.print("[throw-trace] from fused fn {s}: ClassCastException cast to {s} (value tag {s})\n", .{ func.name, cast.ty.name, @tagName(std.meta.activeTag(v)) });
+                }
                 const msg = try std.fmt.allocPrint(allocator, "cast to `{s}` failed", .{cast.ty.name});
                 const exc = try Value.newException(allocator, .{
                     .fqn = try runtime.strInit(allocator, "kotlin.ClassCastException"),

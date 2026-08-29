@@ -3781,7 +3781,14 @@ fn isErasedTypeParamName(name: []const u8) bool {
 /// Whether a non-`instance_of` cast still passes because the target is
 /// an erased type parameter (unchecked cast on the JVM).
 fn typeParamCastPasses(comptime H: type, frame: *const Frame, ty: TypeRef, host: *H) bool {
-    if (frame.module.registry.func_type_params.get(frame.func.id)) |tps| {
+    return typeParamCastPassesIn(H, frame.module, frame.func, ty, host);
+}
+
+/// Frame-free core of `typeParamCastPasses`, shared with the fused walker's
+/// Cast arm — the leniency for erased/type-parameter cast targets is part of
+/// Cast semantics, not of having a frame.
+pub fn typeParamCastPassesIn(comptime H: type, module: *const Module, func: *const ir.Func, ty: TypeRef, host: *H) bool {
+    if (module.registry.func_type_params.get(func.id)) |tps| {
         for (tps.items) |t| {
             if (std.mem.eql(u8, t, ty.name)) return true;
         }
