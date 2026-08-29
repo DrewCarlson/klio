@@ -1751,7 +1751,7 @@ pub fn fnProfDump(module: *const Module) void {
             return a.n > b.n;
         }
     }.lt);
-    std.debug.print("[fn-prof] samples={d} distinct={d}\n", .{ total, list.items.len });
+    std.debug.print("[fn-prof] samples={d} distinct={d} (names resolve through ONE module; a pack/anon-module body with the same numeric id reports under the wrong name — verify a surprising item with KLIO_TRACE_PATH or a frame-push count before chasing it)\n", .{ total, list.items.len });
     const top = @min(list.items.len, 40);
     for (list.items[0..top]) |e| {
         const pct = @as(f64, @floatFromInt(e.n)) * 100.0 / @as(f64, @floatFromInt(total));
@@ -11580,6 +11580,14 @@ fn fusedRun(
     }
     var pushed_enclosing: usize = 0;
     defer while (pushed_enclosing > 0) : (pushed_enclosing -= 1) popEnclosing();
+
+    // KLIO_FN_PROF: a fused body is the executing function — without this
+    // stamp its samples billed to the last FRAMED caller.
+    const fn_prof_prev = runtime.prof.current_fn;
+    if (runtime.prof.fn_prof_active) runtime.prof.current_fn = func.id.int();
+    defer if (runtime.prof.fn_prof_active) {
+        runtime.prof.current_fn = fn_prof_prev;
+    };
 
     var cur: BlockId = func.entry;
     walk: while (true) {
