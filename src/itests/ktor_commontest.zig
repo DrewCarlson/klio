@@ -29,7 +29,7 @@ test "ktor commonTest pass count holds at or above the ratchet baseline" {
         // and which accepts digits where the stdlib's letter-only one does
         // not. Measured solo: 450 passed, 0 failed — held one below because
         // `WriterReaderTest.testWriterOnCancelled` still flakes.
-        .baseline = 449,
+        .baseline = 450, // tightened 2026-08-31: every census at ZERO (red-mass closeout); floor holds margin for loaded test-all
         // Measured 2. Both are `URLBuilderTest.testParseSchemeWith{Digits,
         // DotsPlusAndMinusSigns}`, and both are UPSTREAM VERSION SKEW in the
         // sparse checkout rather than interpreter gaps: the tests expect a
@@ -46,7 +46,7 @@ test "ktor commonTest pass count holds at or above the ratchet baseline" {
         // deterministic. A ceiling at 2 would red the gate on roughly a
         // third of runs; failing test names are printed, so a genuine new
         // failure is still identifiable rather than absorbed.
-        .max_failed = 1,
+        .max_failed = 0,
         .max_incomplete = 2,
     });
 }

@@ -10971,6 +10971,11 @@ fn privateFnHiddenHere(self: *VmHost, mod: *const Module, fid: FuncId) bool {
     // reference site, not the dynamic caller, decides private visibility.
     if (ir.eval.refSiteFile()) |f| return f.int() != decl_file.int();
     const sp = ir.eval.currentCallSiteSpan() orelse return false;
+    if (missTraceEnv() != null) {
+        if (mod.funcById(fid)) |f| {
+            if (missTraceWant(f.name)) std.debug.print("[priv-hidden] {s} decl_file={d} site_file={d} hidden={} exec={s}\n", .{ f.name, decl_file.int(), sp.file.int(), sp.file.int() != decl_file.int(), if (ir.eval.currentFrameFunc()) |cf| (if (cf.fqn.len != 0) cf.fqn else cf.name) else "<none>" });
+        }
+    }
     return sp.file.int() != decl_file.int();
 }
 

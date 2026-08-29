@@ -180,19 +180,194 @@ pub fn hostRouteServe(comptime H: type, allocator: Allocator, f: *const ir.Func,
 /// answered by the host at the same seam. Classified once per body, and any
 /// shape the serve cannot prove falls through to the interpreted body.
 var compose_fast_state: u8 = 0;
-var compose_fast_mask: u8 = 63;
+var compose_fast_mask: u8 = 255;
 
 /// `KLIO_COMPOSE_FAST` is a bisect mask over the compose serves: bit0 the
-/// stack/key helpers, bit1 the changelist push, bit2 its argument assertion,
-/// bit3 the write scope, bit4 the slot-table index math, bit5 the reader /
-/// writer / drain-cursor family. 0 keeps every helper interpreted.
+/// stack/key helpers (IntStack and the generic `Stack<T>` family), bit1 the
+/// changelist push, bit2 its argument assertion, bit3 the write scope, bit4
+/// the slot-table index math, bit5 the reader / writer / drain-cursor
+/// family (and the observer-holder refresh), bit6 the throw-capable
+/// changelist wrapper serve, bit7 the whole `Operations.push(op) { args }`
+/// serve (boxed WriteScope receiver). 0 keeps every helper interpreted.
 fn composeFastMask() u8 {
     if (compose_fast_state == 0) {
-        const raw = runtime.envOnce("KLIO_COMPOSE_FAST") orelse "63";
-        compose_fast_mask = std.fmt.parseInt(u8, raw, 10) catch 63;
+        const raw = runtime.envOnce("KLIO_COMPOSE_FAST") orelse "255";
+        compose_fast_mask = std.fmt.parseInt(u8, raw, 10) catch 255;
         compose_fast_state = 1;
     }
     return compose_fast_mask;
+}
+
+/// Serves that can RAISE — reached from the same seams as `hostRouteServe`
+/// but with the full result channel. Null = decline (the framed body runs).
+/// One resident: the changelist wrapper `executeWithComposeStackTrace`,
+/// whose body with a NULL errorContext is exactly
+/// `getGroupAnchor(slots); execute(applier, slots, rememberManager, null)`
+/// with a catch that RETHROWS UNCHANGED (`attachComposeStackTrace` returns
+/// `this` for a null context) — so forwarding the two member dispatches
+/// preserves semantics while dropping the wrapper's frame. Both dispatches
+/// re-resolve against the live enclosing chain (the operation object the
+/// wrapper's own dispatch pushed), exactly as the interpreted body's
+/// CallMemberOrGlobal arms would. A non-null errorContext declines.
+pub fn hostRouteServeThrowing(comptime H: type, allocator: Allocator, module: *const Module, f: *const ir.Func, args: []const Value, host: *H) Allocator.Error!?EvalResult {
+    if (comptime !@hasDecl(H, "callMemberNamed")) return null;
+    const mask = composeFastMask();
+    if (mask & (64 | 128 | 32 | 1) == 0) return null;
+    if (f.throw_route == 0) {
+        const r: u8 = blk: {
+            if (f.params.len == 5) {
+                if (std.mem.endsWith(u8, f.fqn, "gapbuffer.changelist.Operation.executeWithComposeStackTrace"))
+                    break :blk 2;
+                if (std.mem.endsWith(u8, f.fqn, "linkbuffer.changelist.Operation.executeWithComposeStackTrace"))
+                    break :blk 3;
+            }
+            if (f.params.len == 3) {
+                if (std.mem.endsWith(u8, f.fqn, "gapbuffer.changelist.Operations.push")) break :blk 4;
+                // The link-buffer push additionally aggregates the op's
+                // visibility into `requiresApplication` — it must ride its
+                // own pure serve, never the gap one (the recorded
+                // MovableContentTests trap).
+                if (std.mem.endsWith(u8, f.fqn, "linkbuffer.changelist.Operations.push")) break :blk 5;
+            }
+            if (f.params.len == 1) {
+                if (std.mem.endsWith(u8, f.fqn, ".CompositionObserverHolder.current")) break :blk 6;
+                if (std.mem.eql(u8, f.fqn, "androidx.compose.runtime.Stack.pop")) break :blk 8;
+            }
+            if (f.params.len == 2) {
+                if (std.mem.eql(u8, f.fqn, "androidx.compose.runtime.Stack.push")) break :blk 7;
+            }
+            break :blk 1;
+        };
+        @constCast(f).throw_route = r;
+    }
+    switch (f.throw_route) {
+        2, 3 => {
+            if (mask & 64 == 0) return null;
+            if (args.len != 5) return null;
+            if (args[4] != .Null) return null;
+            if (args[0] != .Instance) return null;
+            const anchor_name: []const u8 = if (f.throw_route == 2) "getGroupAnchor" else "getGroupHandle";
+            switch (try host.callMemberNamed(allocator, &args[0], anchor_name, args[2..3], &.{})) {
+                .ok => |anchor| anchor.release(allocator),
+                .err => |e| return .{ .err = e },
+            }
+            return try host.callMemberNamed(allocator, &args[0], "execute", args[1..5], &.{});
+        },
+        4, 5 => {
+            // `Operations.push(operation) { args }` with the upstream debug
+            // checks compiled out is exactly `pushOp(operation);
+            // WriteScope(this).args()`. The pushOp half is the pure serve
+            // (which declines, side-effect free, when a stack must grow) —
+            // the LINK-buffer variant, which also aggregates the op's
+            // visibility into `requiresApplication`; the block then runs
+            // against a BOXED WriteScope — value-class member dispatch
+            // resolves on the instance, not on the wrapped Operations — so
+            // `setObject`/`setInt` inside it route to their own serves. A
+            // block throw propagates exactly as the inline body's would.
+            if (comptime !(@hasDecl(H, "callValueWithThis") and @hasDecl(H, "newInstanceNamed"))) return null;
+            if (mask & 128 == 0) return null;
+            if (args.len != 3) return null;
+            if (args[0] != .Instance) return null;
+            var fqn_buf: [256]u8 = undefined;
+            const base = f.fqn[0 .. f.fqn.len - "push".len];
+            if (base.len + "WriteScope".len > fqn_buf.len) return null;
+            @memcpy(fqn_buf[0..base.len], base);
+            @memcpy(fqn_buf[base.len..][0.."WriteScope".len], "WriteScope");
+            const ws_fqn = fqn_buf[0 .. base.len + "WriteScope".len];
+            const ws_cid = module.classIdByFqn(ws_fqn) orelse return null;
+            const pushed = if (f.throw_route == 4)
+                compose_fast.servePushOp(allocator, args[0..2])
+            else
+                compose_fast.servePushOpLink(allocator, args[0..2]);
+            if (pushed == null) return null;
+            // The op is already pushed; from here nothing may decline —
+            // fail loud through the error channel instead.
+            const ws = switch (try host.newInstanceNamed(allocator, ws_cid, args[0..1], &.{}, null)) {
+                .ok => |v| v,
+                .err => |e| return .{ .err = e },
+            };
+            defer ws.release(allocator);
+            switch (try host.callValueWithThis(allocator, &args[2], &ws, &.{}, &.{})) {
+                .ok => |v| v.release(allocator),
+                .err => |e| return .{ .err = e },
+            }
+            return .{ .ok = .{ .Unit = {} } };
+        },
+        6 => {
+            // Non-root `CompositionObserverHolder.current()`: the parent
+            // context's `observerHolder` is usually the base class's
+            // COMPUTED null (the pure serve declines on field absence), so
+            // read it through the host's getter ladder, refresh the cached
+            // observer on change, and answer the parent's observer. The
+            // root arm is the pure serve's.
+            if (comptime !@hasDecl(H, "getField")) return null;
+            if (mask & 32 == 0) return null;
+            if (args.len != 1) return null;
+            if (args[0] != .Instance) return null;
+            var observer: Value = .Null;
+            var parent: Value = .Null;
+            {
+                const g = args[0].Instance.borrow();
+                defer g.deinit();
+                const inst = g.get();
+                const root_v = inst.get("root") orelse return null;
+                if (root_v != .Bool or root_v.Bool) return null;
+                observer = inst.get("observer") orelse return null;
+                parent = inst.get("parent") orelse return null;
+            }
+            if (parent != .Instance) return null;
+            const ph = switch (try host.getField(allocator, &parent, "observerHolder")) {
+                .ok => |v| v,
+                .err => |e| return .{ .err = e },
+            };
+            defer ph.release(allocator);
+            var parent_obs: Value = .Null;
+            if (ph == .Instance) {
+                const pg = ph.Instance.borrow();
+                defer pg.deinit();
+                parent_obs = pg.get().get("observer") orelse .Null;
+            } else if (ph != .Null) return null;
+            const same = (parent_obs == .Null and observer == .Null) or
+                (parent_obs == .Instance and observer == .Instance and
+                    parent_obs.Instance.cell == observer.Instance.cell);
+            if (!same) {
+                parent_obs.retain();
+                const g = args[0].Instance.borrowMut();
+                defer g.deinit();
+                g.get().define(allocator, "observer", parent_obs) catch {
+                    parent_obs.release(allocator);
+                    return .{ .err = .{ .Type = "compose observer serve: refresh failed" } };
+                };
+            }
+            parent_obs.retain();
+            return .{ .ok = parent_obs };
+        },
+        7, 8 => {
+            // `Stack<T>.push` / `Stack<T>.pop` forward to the backing
+            // MutableList's own `add` / `removeAt` intrinsic, dropping the
+            // wrapper frame while keeping every list-mutation guard
+            // (read-only, view, comodification, mod-count) exactly as the
+            // interpreted body would hit them.
+            if (mask & 1 == 0) return null;
+            const want_args: usize = if (f.throw_route == 7) 2 else 1;
+            if (args.len != want_args) return null;
+            const backing = compose_fast.stackTBacking(&args[0]) orelse return null;
+            if (f.throw_route == 7) {
+                return try host.callMemberNamed(allocator, &backing, "add", args[1..2], &.{});
+            }
+            const idx: i64 = blk: {
+                const g = backing.List.items.borrow();
+                defer g.deinit();
+                break :blk @as(i64, @intCast(g.get().items.len)) - 1;
+            };
+            const idx_v: Value = if (idx >= 0 and idx <= std.math.maxInt(i32))
+                .{ .Int = @intCast(idx) }
+            else
+                .{ .Int = -1 };
+            return try host.callMemberNamed(allocator, &backing, "removeAt", &.{idx_v}, &.{});
+        },
+        else => return null,
+    }
 }
 
 fn composeRouteServe(allocator: Allocator, f: *const ir.Func, args: []const Value) ?Value {
@@ -254,6 +429,10 @@ fn composeRouteServe(allocator: Allocator, f: *const ir.Func, args: []const Valu
         .obs_holder_current => compose_fast.serveObserverHolderCurrent(allocator, args),
         .sw_slot_index => compose_fast.serveSlotWriterSlotIndex(args),
         .sr_group_object_key => compose_fast.serveSlotReaderGroupObjectKey(args),
+        .stack_t_is_empty => compose_fast.serveStackTIsEmpty(args),
+        .stack_t_is_not_empty => compose_fast.serveStackTIsNotEmpty(args),
+        .stack_t_peek => compose_fast.serveStackTPeek(args, null),
+        .stack_t_peek_at => if (args[1] == .Int) compose_fast.serveStackTPeek(args, args[1].Int) else null,
         else => null,
     };
 }
@@ -2199,8 +2378,18 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
             // to an inner receiver-lambda subject (`apply { minusAssign(k) }`
             // inside `Map.minus`) refutes the very candidates the subject
             // satisfies.
+            // With a DIRECT SPLICE RECEIVER on the instruction, `this_val`
+            // is the spliced SUBJECT — the frame-derived head must anchor to
+            // the frame's own `this` (a `with(period)` subject inside
+            // `Instant.plus` must not inherit the extension's `Instant`
+            // proof, or the strict probe binds the Instant extension to the
+            // period and its body reads the wrong fields).
+            const hint_anchor: Value = if (!static_from_instr and cmg.recv != null)
+                implicitThisValue(frame, cmg.this_idx, true)
+            else
+                this_val;
             const hint: ?[]const u8 = if (static_recv_ty != null and
-                (sameReceiver(c.v, this_val) or (static_from_instr and ci == 0)))
+                (sameReceiver(c.v, hint_anchor) or (static_from_instr and ci == 0)))
                 static_recv_ty
             else
                 null;
@@ -3781,7 +3970,14 @@ fn isErasedTypeParamName(name: []const u8) bool {
 /// Whether a non-`instance_of` cast still passes because the target is
 /// an erased type parameter (unchecked cast on the JVM).
 fn typeParamCastPasses(comptime H: type, frame: *const Frame, ty: TypeRef, host: *H) bool {
-    if (frame.module.registry.func_type_params.get(frame.func.id)) |tps| {
+    return typeParamCastPassesIn(H, frame.module, frame.func, ty, host);
+}
+
+/// Frame-free core of `typeParamCastPasses`, shared with the fused walker's
+/// Cast arm — the leniency for erased/type-parameter cast targets is part of
+/// Cast semantics, not of having a frame.
+pub fn typeParamCastPassesIn(comptime H: type, module: *const Module, func: *const ir.Func, ty: TypeRef, host: *H) bool {
+    if (module.registry.func_type_params.get(func.id)) |tps| {
         for (tps.items) |t| {
             if (std.mem.eql(u8, t, ty.name)) return true;
         }

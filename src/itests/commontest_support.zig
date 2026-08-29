@@ -449,12 +449,34 @@ pub fn runSuite(cfg: Config) !void {
                 const i = pnext.fetchAdd(1, .monotonic);
                 if (i >= queue.len) return;
                 _ = arena.reset(.retain_capacity);
+                const ct_t0 = runtime.clockMonotonicNanos();
                 const r = runKlio(arena.allocator(), penv, queue[i], timeout_ms) catch {
                     _ = phung.fetchAdd(1, .monotonic);
                     continue;
                 };
+                // Latency census: per-child wall, argv size, and pass count —
+                // the budget table's raw rows (KLIO_CENSUS_TIMES=1).
+                if (std.c.getenv("KLIO_CENSUS_TIMES") != null) {
+                    std.debug.print("[census-time] {d}ms files={d} passed={d} target={s}\n", .{
+                        (runtime.clockMonotonicNanos() -% ct_t0) / std.time.ns_per_ms,
+                        queue[i].len - 2,
+                        passedLineCount(r.stdout),
+                        queue[i][queue[i].len - 1],
+                    });
+                }
                 _ = ppassed.fetchAdd(passedLineCount(r.stdout), .monotonic);
-                _ = pfailed.fetchAdd(failedCount(r.stdout), .monotonic);
+                const nf = failedCount(r.stdout);
+                _ = pfailed.fetchAdd(nf, .monotonic);
+                // Census diagnosis: name every failing case (and its file) so
+                // a red census is actionable without a by-hand re-run.
+                if (nf != 0 and std.c.getenv("KLIO_CENSUS_NAMES") != null) {
+                    var itn = std.mem.splitScalar(u8, r.stdout, '\n');
+                    while (itn.next()) |line| {
+                        if (std.mem.endsWith(u8, line, " FAILED")) {
+                            std.debug.print("[census-fail] {s} <- {s}\n", .{ line, queue[i][queue[i].len - 1] });
+                        }
+                    }
+                }
                 if (std.mem.indexOf(u8, r.stdout, " passed,") == null) _ = phung.fetchAdd(1, .monotonic);
             }
         }

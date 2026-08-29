@@ -1270,6 +1270,9 @@ pub const Func = struct {
     /// Compose fast-path verdict for this body (`compose_fast.Route`),
     /// classified once on first execution like `host_route`.
     compose_route: u8 = 0,
+    /// Throw-capable host-serve route (`hostRouteServeThrowing`): 0 unasked,
+    /// 1 none, 2 the gap-buffer changelist wrapper, 3 the link-buffer one.
+    throw_route: u8 = 0,
     /// Cached `frameNoFill` verdict: 0 = unasked, 1 = must fill,
     /// 2 = register file may start unfilled.
     frame_fill_state: u8 = 0,
@@ -7729,7 +7732,7 @@ pub const Module = struct {
     /// allocator, or OOM); callers then run their scan. `class_index` is
     /// append-only with immutable names, so a growth-counter top-up keeps
     /// the cache an exact mirror.
-    fn classNameCandidates(self: *const Module, name: []const u8) ?[]const ClassId {
+    pub fn classNameCandidates(self: *const Module, name: []const u8) ?[]const ClassId {
         if (self.class_id_map != null) return null;
         const gpa = self.lookup_cache_gpa orelse return null;
         const mut: *Module = @constCast(self);
