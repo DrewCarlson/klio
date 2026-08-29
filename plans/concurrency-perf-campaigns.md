@@ -213,15 +213,25 @@ re-try a wider op selector.
       MEASURED NEUTRAL on the replica at closed-world coverage — the
       skeleton is the deliverable.
       - [ ] A1d slice 2 (IN PROGRESS): LoadGlobal + NewInstance LANDED
-        (3c7fef99 — non-suspending, so no materialization needed;
-        loadGlobalValue extracted as a shared frame-free core; the
-        load-bearing find was the flat seam routing every fused error
-        through runwind, bypassing catch dispatch — a throw rides rthrow;
-        fixture fused_throw_catch.kt). REMAINING: LoadFromThisOrGlobal
-        (needs the implicit-candidate walk extracted from its frame
-        coupling), CallMemberOrGlobal + dynamic calls (need SUSPENSION
-        MATERIALIZATION), then typed unboxing + direct native->native
-        calls — the slices that carry the ~25% ceiling and beyond.
+        (3c7fef99; loadGlobalValue as a shared frame-free core; the
+        load-bearing find: the flat seam routed every fused error through
+        runwind, BYPASSING CATCH DISPATCH — a throw rides rthrow; fixture
+        fused_throw_catch.kt). MATERIALIZE-ON-DEMAND LANDED OPT-IN
+        (354f50ee, KLIO_FUSED_MAT=1): a PARTIAL body runs its fused
+        prefix, then builds the real Frame from the bank at the first
+        heavy op and continues framed — the framed engine then owns the
+        heavy op and any suspension beneath it. This subsumes the
+        LoadFromThisOrGlobal/CMG extraction question entirely (no arm
+        duplication needed). Recursive seam only; a fused .Call parent
+        materializes ITSELF rather than sitting above a parkable callee.
+        REMAINING before MAT defaults on: ONE failure family — bare `add`
+        inside a spliced `apply{}` subject lambda when materialization
+        lands mid-splice (scan/runningReduce ×8 in the sweep; the fused
+        prefix's subject push is mirrored onto the frame's chain but the
+        framed remainder still resolves it as an unresolved global —
+        needs a [fused-mat] trace + the real sweep-child argv to repro;
+        the simple shape passes). Then re-measure, then typed unboxing +
+        direct native->native calls.
 - A2 (bake-time AOT registration) and A3 (retire the hand serves) only
   matter once A1d exists; the hand serves (`snapshot_fast`, `compose_fast`,
   `persistent_map_mut`) stay as the working instances.
