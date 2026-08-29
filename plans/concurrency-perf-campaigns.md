@@ -197,22 +197,26 @@ re-try a wider op selector.
         Slice 1 (the walker + materialization) does NOT close Task 2 by
         itself; slice 2 is typed unboxing + direct native->native calls on
         the same skeleton.
-      SLICE 1a LANDED, OPT-IN (78457be1): the fused walker exists — C-bank
-      registers, GC safe point per block, pinned bank, no abandon (errors
-      RAISE; binopValue extracted as the shared frame-free operator core),
-      transitive closed-world classification + runtime rejection of
-      host-owned bodies and generic markers, seam fallback for declined
-      callees. Hardening found by battery, in order: no GC safe point
-      (RSS blowup), fused coroutine bridge (host-owned bodies leak
-      per-resume state), generic `as T` (frame reified context), and —
-      still OPEN, why the tier defaults off — fusing the kotlinx
-      lock-free-list/JobSupport accessors hangs a composition test.
-      - [ ] A1d slice 1b: root-cause the lock-free/JobSupport hang under
-        KLIO_FUSED=1 (suspect: memory-ordering or spin semantics the
-        framed path provides that the walker's borrow path does not),
-        then default the tier on and extend to the open-world ops
-        (LoadGlobal/LoadFromThisOrGlobal/CMG/NewInstance) with suspension
-        materialization.
+      SLICE 1a+1b LANDED, DEFAULT ON (78457be1, 8c148d3b): the fused
+      walker — C-bank registers, unconditional GC safe point per block
+      (pending() never sees another thread's stop_flag; gating on it let
+      a fused spin-loop skip the STW rendezvous), pinned bank, no abandon
+      (errors RAISE; binopValue extracted as the shared frame-free
+      operator core), TRANSITIVE host-in-the-verdict classification
+      (KlioContinuation.resumeWith runs its own body but calls the
+      host-owned __klio_co_resume, and the resume machinery assumes a
+      framed caller — the pump-stall root), generic markers excluded
+      (frame reified context), INNER-class receivers excluded (bare reads
+      reach the enclosing instance — IteratorImpl.hasNext reads the outer
+      list's size; the subList CME root), seam fallback for declined
+      callees. KLIO_FUSED=0 / name-list bisect; KLIO_FUSED_TRACE.
+      MEASURED NEUTRAL on the replica at closed-world coverage — the
+      skeleton is the deliverable.
+      - [ ] A1d slice 2: open-world ops (LoadGlobal /
+        LoadFromThisOrGlobal / CallMemberOrGlobal / NewInstance via host
+        entries) with SUSPENSION MATERIALIZATION, then typed unboxing +
+        direct native->native calls — the slices that carry the ~25%
+        ceiling and beyond.
 - A2 (bake-time AOT registration) and A3 (retire the hand serves) only
   matter once A1d exists; the hand serves (`snapshot_fast`, `compose_fast`,
   `persistent_map_mut`) stay as the working instances.
