@@ -227,11 +227,29 @@ re-try a wider op selector.
         The scan/runningReduce family (8 sweep fails) is FIXED: a fused
         body invoked with the chain DETACHED dropped its subject pushes —
         the walker now owns a framed-parity chain window, and
-        materialization transfers subjects in framed order (seeded own
-        receiver below the base, subjects above). REMAINING before MAT
-        defaults on, same resolution-context family: windowed `capacity`
-        x2, Base64 qualified-this, compose `isClosed`. Then re-measure,
-        then typed unboxing + direct native->native calls.
+        materialization transfers subjects in framed order.
+        MAT NOW DEFAULT ON (both seams; KLIO_FUSED_MAT=0 bisects): the
+        whole remaining resolution family (windowed capacity, Base64
+        qualified-this, compose isClosed) was ONE root — the window's
+        SEED (member-ext owner, receiver scope) sits below its base, and
+        materialization re-derived the frame chain from in-flight entries
+        only, dropping it; the frame now inherits the window whole (base
+        restored to seed length). KLIO_FUSED name-lists match fqn now
+        (they matched only func.name — every fqn bisect was a no-op).
+        Fixture: fused_member_ext_owner.kt. GC-STRESS roots (the gate's
+        KLIO_GC_STRESS map-copy probe caught all three, poison oracle
+        `root shaded a swept cell` + poison_ctx frame/reg naming): (1)
+        the walker chain windows are thread roots now (anchor-marked);
+        (2) a materialized frame takes the bank's references MOVED (bank
+        zeroed — the pinned bank kept re-rooting objects the remainder
+        dropped) and claims only the copied wmask prefix (setAll rooted
+        pool garbage); (3) eff_args is PINNED for the fused run — a
+        defaulted call's argv lives in a scratch buffer with no other
+        reference, and unlike a framed call the fused body crosses safe
+        points before params are rooted (validateWrite default-map root).
+        Replica: MAT ~192us vs 187us off (~3% window cost, buys the
+        coverage). NEXT: re-measure vpd/wall, then typed unboxing +
+        direct native->native calls.
 - A2 (bake-time AOT registration) and A3 (retire the hand serves) only
   matter once A1d exists; the hand serves (`snapshot_fast`, `compose_fast`,
   `persistent_map_mut`) stay as the working instances.
