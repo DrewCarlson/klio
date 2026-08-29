@@ -5596,7 +5596,7 @@ fn runFlatLoop(
                     }
                     break :blk_cm2 f.module;
                 };
-                const fr = (try fusedExec(H, allocator, callee_mod2, site.req.func, site.req.args.items, host)) orelse break :fused;
+                const fr = (try fusedExecOpt(H, allocator, callee_mod2, site.req.func, site.req.args.items, host, fusedMaterializeEnabled())) orelse break :fused;
                 const dst = site.req.dst;
                 discardFlatReq(H, allocator, site.req, host);
                 switch (fr) {
@@ -11189,7 +11189,7 @@ var fused_mat_val: bool = false;
 /// unresolved global; four CompositionTests regressed).
 fn fusedMaterializeEnabled() bool {
     if (fused_mat_state == 0) {
-        fused_mat_val = std.mem.eql(u8, runtime.envOnce("KLIO_FUSED_MAT") orelse "0", "1");
+        fused_mat_val = !std.mem.eql(u8, runtime.envOnce("KLIO_FUSED_MAT") orelse "1", "0");
         fused_mat_state = 1;
     }
     return fused_mat_val;
@@ -11359,7 +11359,7 @@ pub fn fusedExecOpt(
     // intended to run. The coroutine bridge (`__klio_co_resume`,
     // `KlioContinuation.resumeWith`) is exactly this shape, and fusing it
     // leaked the pump's per-resume state until the RSS cap fired.
-    if (!fusedNameSelected(func.name)) return null;
+    if (!fusedNameSelected(if (func.fqn.len != 0) func.fqn else func.name)) return null;
     const verdict = fusedVerdict(H, host, module, func);
     if (verdict == 2) return null;
     if (verdict == 4 and !allow_materialize) return null;
@@ -11556,43 +11556,22 @@ fn fusedMaterializeAndRun(
     defer frame.deinit();
     gcPushFrame(&frame);
     defer gcPopFrame(&frame);
-    // The walker's subject pushes move to the FRAME as its own in-flight
-    // pushes, in framed order: [seeded own receiver][subjects...] with the
-    // base between — the remainder's EnclosingPop ops pop the subjects
-    // from the top exactly as if the frame had pushed them itself. Strip
-    // them from the walker's chain first so activateChain's caller-copy
-    // does not double them (and the walker's own defer has nothing left
-    // to pop).
-    var moved: [8]EnclosingEntry = undefined;
-    var moved_n: usize = 0;
-    if (pushed_enclosing > 0) {
-        if (ev.active_chain) |wchain| {
-            var k: usize = @min(pushed_enclosing, moved.len);
-            while (k > 0 and wchain.items.len > 0) : (k -= 1) {
-                moved[moved_n] = wchain.items[wchain.items.len - 1];
-                moved_n += 1;
-                _ = wchain.pop();
-            }
-        }
+    // The frame inherits the walker's chain window WHOLE — the window IS
+    // what activateChain would have built for this frame (caller in-flight
+    // copies + own receiver), and the walker's own subject pushes sit above
+    // its base exactly as framed in-flight pushes would. Re-deriving via
+    // activateChain here dropped the seeded portion (it lives BELOW the
+    // window's base, invisible to the in-flight copy): the member-extension
+    // owner vanished and `this@Outer` in the remainder missed. The base is
+    // restored to the window's seed length so a callee of the remainder
+    // still sees the prefix's pushes as in-flight.
+    const wbase = ev.active_chain_base;
+    if (ev.active_chain) |wchain| {
+        try frame.enclosing_this.appendSlice(chainAllocator(), wchain.items);
     }
-    try frame.activateChain(&.{});
+    frame.activateAs();
+    ev.active_chain_base = @min(wbase, frame.enclosing_this.items.len);
     defer frame.deactivateChain();
-    {
-        var k: usize = moved_n;
-        while (k > 0) : (k -= 1) {
-            try frame.enclosing_this.append(chainAllocator(), moved[k - 1]);
-        }
-    }
-    if (runtime.envOnce("KLIO_FUSED_TRACE") != null) {
-        const prev_len: usize = if (frame.prev_chain) |pc| pc.items.len else 999;
-        std.debug.print("[fused-mat-chain] len={d} base={d} prev_len={d} prev_base={d} entries:", .{
-            frame.enclosing_this.items.len, evtls.active_chain_base, prev_len, frame.prev_chain_base,
-        });
-        for (frame.enclosing_this.items) |e| {
-            std.debug.print(" {s}/{s}", .{ @tagName(e.kind), @tagName(std.meta.activeTag(e.v)) });
-        }
-        std.debug.print("\n", .{});
-    }
     const ctx_mark: usize = if (comptime @hasDecl(H, "ctxStackLen")) host.ctxStackLen() else 0;
     if (comptime @hasDecl(H, "ctxPush")) {
         if (module.has_context_decls) {

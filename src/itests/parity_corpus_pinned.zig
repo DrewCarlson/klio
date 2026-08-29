@@ -458,6 +458,14 @@ test "fused_throw_catch" {
     );
 }
 
+test "fused_member_ext_owner" {
+    try check("fused_member_ext_owner",
+        \\PRESENT,OPTIONAL|2|h:ABSENT=false
+        \\PRESENT,OPTIONAL|2|k:ABSENT=false
+        \\
+    );
+}
+
 test "splice_hygiene_shadow" {
     try check("splice_hygiene_shadow",
         \\member=6
