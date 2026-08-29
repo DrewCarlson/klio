@@ -7732,7 +7732,7 @@ pub const Module = struct {
     /// allocator, or OOM); callers then run their scan. `class_index` is
     /// append-only with immutable names, so a growth-counter top-up keeps
     /// the cache an exact mirror.
-    fn classNameCandidates(self: *const Module, name: []const u8) ?[]const ClassId {
+    pub fn classNameCandidates(self: *const Module, name: []const u8) ?[]const ClassId {
         if (self.class_id_map != null) return null;
         const gpa = self.lookup_cache_gpa orelse return null;
         const mut: *Module = @constCast(self);

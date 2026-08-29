@@ -46,6 +46,12 @@ executeWithComposeStackTrace for NULL errorContext (the catch rethrows
 unchanged; the serve forwards getGroupAnchor/getGroupHandle + execute
 against the live chain and drops the 24-reg wrapper frame). COMPOSE_FAST
 bit6, mask 63->127. Replica 194->186us; gate 1390/0/0, vpd child 637->608s.
+A whole-DRAIN serve (OpIterator via newInstanceNamed, do-while next(),
+subject-pushed per-op dispatch) was built and MEASURED NEUTRAL —
+reverted: the drain's 7.8% profile share was its CALLEES' dispatch cost
+billed under its stamp (the drain itself frames only ~124x/run). TRAP:
+a body's fn-prof share includes host-serve work its dispatches trigger;
+check the FRAME CENSUS count before serving a "hot" body.
 
 RELEASEFAST GATE POLICY ADOPTED 2026-08-29 (e2192a48): the compose gate
 spawns `klio-harness-fast` (ReleaseFast, own binary name; only suites

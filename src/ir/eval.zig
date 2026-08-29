@@ -4790,7 +4790,7 @@ pub fn evalWithCapturesChained(
             c.deinit(allocator);
             return ok(served);
         }
-        if (try exec_call.hostRouteServeThrowing(H, allocator, func, args.items, host)) |r| {
+        if (try exec_call.hostRouteServeThrowing(H, allocator, module, func, args.items, host)) |r| {
             var a = args;
             a.deinit(allocator);
             var c = captures;
@@ -5653,7 +5653,7 @@ fn runFlatLoop(
                     ridx = site.ret_idx;
                     continue;
                 }
-                if (try exec_call.hostRouteServeThrowing(H, allocator, site.req.func, site.req.args.items, host)) |r| {
+                if (try exec_call.hostRouteServeThrowing(H, allocator, callee_mod, site.req.func, site.req.args.items, host)) |r| {
                     const dst = site.req.dst;
                     discardFlatReq(H, allocator, site.req, host);
                     switch (r) {

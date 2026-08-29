@@ -207,7 +207,8 @@ fn composeFastMask() u8 {
 /// re-resolve against the live enclosing chain (the operation object the
 /// wrapper's own dispatch pushed), exactly as the interpreted body's
 /// CallMemberOrGlobal arms would. A non-null errorContext declines.
-pub fn hostRouteServeThrowing(comptime H: type, allocator: Allocator, f: *const ir.Func, args: []const Value, host: *H) Allocator.Error!?EvalResult {
+pub fn hostRouteServeThrowing(comptime H: type, allocator: Allocator, module: *const Module, f: *const ir.Func, args: []const Value, host: *H) Allocator.Error!?EvalResult {
+    _ = module;
     if (comptime !@hasDecl(H, "callMemberNamed")) return null;
     if (composeFastMask() & 64 == 0) return null;
     if (f.throw_route == 0) {
@@ -222,16 +223,20 @@ pub fn hostRouteServeThrowing(comptime H: type, allocator: Allocator, f: *const 
         };
         @constCast(f).throw_route = r;
     }
-    if (f.throw_route != 2 and f.throw_route != 3) return null;
-    if (args.len != 5) return null;
-    if (args[4] != .Null) return null;
-    if (args[0] != .Instance) return null;
-    const anchor_name: []const u8 = if (f.throw_route == 2) "getGroupAnchor" else "getGroupHandle";
-    switch (try host.callMemberNamed(allocator, &args[0], anchor_name, args[2..3], &.{})) {
-        .ok => |anchor| anchor.release(allocator),
-        .err => |e| return .{ .err = e },
+    switch (f.throw_route) {
+        2, 3 => {
+            if (args.len != 5) return null;
+            if (args[4] != .Null) return null;
+            if (args[0] != .Instance) return null;
+            const anchor_name: []const u8 = if (f.throw_route == 2) "getGroupAnchor" else "getGroupHandle";
+            switch (try host.callMemberNamed(allocator, &args[0], anchor_name, args[2..3], &.{})) {
+                .ok => |anchor| anchor.release(allocator),
+                .err => |e| return .{ .err = e },
+            }
+            return try host.callMemberNamed(allocator, &args[0], "execute", args[1..5], &.{});
+        },
+        else => return null,
     }
-    return try host.callMemberNamed(allocator, &args[0], "execute", args[1..5], &.{});
 }
 
 fn composeRouteServe(allocator: Allocator, f: *const ir.Func, args: []const Value) ?Value {
