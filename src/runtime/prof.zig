@@ -440,6 +440,30 @@ pub fn maybeReport() void {
             std.debug.print("  {d:>8}  {s}\n", .{ nc.count, nc.name });
             cshown += 1;
         }
+        // With KLIO_PROF_RAW, also dump the caller PCs themselves so an
+        // opaque anon instantiation can be pinned to file:line offline
+        // (addr2line -e <binary> <pc - load_base>).
+        if (builtin.link_libc and std.c.getenv("KLIO_PROF_RAW") != null) {
+            const AddrCount = struct {
+                addr: usize,
+                count: u32,
+                fn lt(_: void, a: @This(), b: @This()) bool {
+                    return a.count > b.count;
+                }
+            };
+            var alist = std.ArrayList(AddrCount).empty;
+            defer alist.deinit(gpa);
+            var ait = caller_counts.iterator();
+            while (ait.next()) |e| {
+                if (e.key_ptr.* != 0) alist.append(gpa, .{ .addr = e.key_ptr.*, .count = e.value_ptr.* }) catch {};
+            }
+            std.mem.sort(AddrCount, alist.items, {}, AddrCount.lt);
+            std.debug.print("[prof-raw] caller PCs (top 25):\n", .{});
+            for (alist.items, 0..) |ac, i| {
+                if (i >= 25) break;
+                std.debug.print("  0x{x}  {d}\n", .{ ac.addr, ac.count });
+            }
+        }
     }
 }
 

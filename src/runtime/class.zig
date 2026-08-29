@@ -484,12 +484,40 @@ pub const InstanceData = struct {
     pub const Capture = struct { name: []const u8, value: Value };
 
     pub fn get(self: *const InstanceData, name: []const u8) ?Value {
+        if (field_stats_on) return getStats(self, name);
         for (self.fields.items) |f| {
             // Field names are interned program-lifetime strings, so an identical
             // pointer is an identical name — a cheap integer compare that skips
             // the byte scan on the common hit. The `eql` keeps correctness when
             // the lookup name was not interned from the same table.
             if (f.name.ptr == name.ptr or std.mem.eql(u8, f.name, name)) return f.value;
+        }
+        return null;
+    }
+
+    pub var field_stats_on: bool = false;
+    pub fn initFieldStats() void {
+        field_stats_on = objcell.envOnce("KLIO_FIELD_ID_STATS") != null;
+    }
+    var fs_probes = std.atomic.Value(u64).init(0);
+    var fs_ptr_hits = std.atomic.Value(u64).init(0);
+    var fs_eql_hits = std.atomic.Value(u64).init(0);
+    var fs_eql_calls = std.atomic.Value(u64).init(0);
+    fn getStats(self: *const InstanceData, name: []const u8) ?Value {
+        const n = fs_probes.fetchAdd(1, .monotonic) + 1;
+        if (n % (1 << 16) == 0) {
+            std.debug.print("[field-id] probes={d} ptr_hits={d} eql_hits={d} eql_calls={d}\n", .{ n, fs_ptr_hits.load(.monotonic), fs_eql_hits.load(.monotonic), fs_eql_calls.load(.monotonic) });
+        }
+        for (self.fields.items) |f| {
+            if (f.name.ptr == name.ptr) {
+                _ = fs_ptr_hits.fetchAdd(1, .monotonic);
+                return f.value;
+            }
+            _ = fs_eql_calls.fetchAdd(1, .monotonic);
+            if (std.mem.eql(u8, f.name, name)) {
+                _ = fs_eql_hits.fetchAdd(1, .monotonic);
+                return f.value;
+            }
         }
         return null;
     }
@@ -541,7 +569,7 @@ pub const InstanceData = struct {
     /// arena fast path.
     pub fn define(self: *InstanceData, allocator: std.mem.Allocator, name: []const u8, v: Value) !void {
         for (self.fields.items) |*f| {
-            if (std.mem.eql(u8, f.name, name)) {
+            if (f.name.ptr == name.ptr or std.mem.eql(u8, f.name, name)) {
                 if (objcell.reclaimEnabled()) f.value.release(allocator);
                 f.value = v;
                 return;
