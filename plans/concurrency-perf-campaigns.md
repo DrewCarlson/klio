@@ -197,6 +197,22 @@ re-try a wider op selector.
         Slice 1 (the walker + materialization) does NOT close Task 2 by
         itself; slice 2 is typed unboxing + direct native->native calls on
         the same skeleton.
+      SLICE 1a LANDED, OPT-IN (78457be1): the fused walker exists — C-bank
+      registers, GC safe point per block, pinned bank, no abandon (errors
+      RAISE; binopValue extracted as the shared frame-free operator core),
+      transitive closed-world classification + runtime rejection of
+      host-owned bodies and generic markers, seam fallback for declined
+      callees. Hardening found by battery, in order: no GC safe point
+      (RSS blowup), fused coroutine bridge (host-owned bodies leak
+      per-resume state), generic `as T` (frame reified context), and —
+      still OPEN, why the tier defaults off — fusing the kotlinx
+      lock-free-list/JobSupport accessors hangs a composition test.
+      - [ ] A1d slice 1b: root-cause the lock-free/JobSupport hang under
+        KLIO_FUSED=1 (suspect: memory-ordering or spin semantics the
+        framed path provides that the walker's borrow path does not),
+        then default the tier on and extend to the open-world ops
+        (LoadGlobal/LoadFromThisOrGlobal/CMG/NewInstance) with suspension
+        materialization.
 - A2 (bake-time AOT registration) and A3 (retire the hand serves) only
   matter once A1d exists; the hand serves (`snapshot_fast`, `compose_fast`,
   `persistent_map_mut`) stay as the working instances.
