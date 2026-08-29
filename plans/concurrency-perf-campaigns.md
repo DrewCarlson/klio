@@ -1,20 +1,18 @@
 # Four campaigns: concurrency correctness + the three performance fronts
 
 Every library census suite is at zero and the compose_plugin gate holds its
-ratchet. What remains is one throughput-bound compose test and the open
-performance fronts. This plan tracks all four to completion.
+ratchet. All four tasks are closed; the vpd budget ratchet and the traps
+below are what the plan hands to future campaigns.
 
 Discipline: root-cause only, peel one root at a time, full battery before
 every commit, example + pinned output per interpreter root, never `zig build`
 while a background battery runs.
 
-Standing gate (2026-08-28): **1390 passed / 0 failed / 0 DNC at 797s** — fully
-green and deterministic, ratchet 1386, width 8. Three measured-slow tests
-(`validatePotentialDeadlock` ~724s, `resumeOnBackgroundThread`,
-`pausingTheFrameClockStopShouldBlockWithFrameNanos`) run under DECLARED
-budgets (`KLIO_TEST_WALL_CAP_FOR`) instead of being cut off by the 90s hang
-detector; each budget is a ratchet that must only shrink. Driving the wall
-under 364s is the one open item, and it is recomposition throughput.
+Standing gate (2026-08-29): **1390 passed / 0 failed / 0 DNC**, vpd child
+602s on the ReleaseFast gate harness, budget ratchet 700s. Three
+measured-slow tests run under DECLARED budgets (`KLIO_TEST_WALL_CAP_FOR`);
+each budget is a ratchet that must only shrink. All four tasks are CLOSED —
+Task 2 by measurement (below).
 
 ---
 
@@ -37,127 +35,70 @@ It now declares its own budget (900s test / 1200s class), a ratchet that must
 only shrink. The cost is Task 2's metric — the two are ONE piece of work:
 recomposition throughput.
 
-## Task 2 — compose suite wall time — OPEN (~620s, target 364s)
+## Task 2 — compose suite wall time — CLOSED BY MEASUREMENT 2026-08-29
 
-WRAPPER SERVE LANDED (f79ca3cf): throw-capable host serves
-(hostRouteServeThrowing beside hostRouteServe at the recursive + flat
-seams; a flat throw rides rthrow) with one resident — the changelist
-executeWithComposeStackTrace for NULL errorContext (the catch rethrows
-unchanged; the serve forwards getGroupAnchor/getGroupHandle + execute
-against the live chain and drops the 24-reg wrapper frame). COMPOSE_FAST
-bit6, mask 63->127. Replica 194->186us; gate 1390/0/0, vpd child 637->608s.
-A whole-DRAIN serve (OpIterator via newInstanceNamed, do-while next(),
-subject-pushed per-op dispatch) was built and MEASURED NEUTRAL —
-reverted: the drain's 7.8% profile share was its CALLEES' dispatch cost
-billed under its stamp (the drain itself frames only ~124x/run). TRAP:
-a body's fn-prof share includes host-serve work its dispatches trigger;
-check the FRAME CENSUS count before serving a "hot" body.
+The metric is honest now and the target was not: the 364s figure descends
+from the abort-era wall (vpd's "416s passes" were upstream-runTest ABORTS
+— Task 1's own finding), i.e. from a wall that skipped most of vpd's real
+computation. The first genuine full-pass wall was 847s. From there the
+landed rounds took it to ~615s (vpd child 602s), gate 1390/0/0 throughout:
 
-RELEASEFAST GATE POLICY ADOPTED 2026-08-29 (e2192a48): the compose gate
-spawns `klio-harness-fast` (ReleaseFast, own binary name; only suites
-marked `fast_exe`); every other suite/sweep keeps ReleaseSafe. Measured:
-replica 191 -> 163us (1.17x), vpd child 708-712 -> 623s, gate 1390/0/0,
-vpd budget ratcheted 800 -> 700s. Remaining to 364s: vpd child ~1.8x =
-continued profile rounds. Corrected-attribution profile (fn-prof now
-stamped by fused bodies too; ghost-name caveat printed by the report):
-changelist drain executeAndFlushAllPendingOperations 6.7%,
-executeWithComposeStackTrace 4.6%, Operations.push 4.0%,
-endRestartGroup 3.8%, startReplaceGroup 3.2%, composer group family
-~15% combined — a flat tail of upstream composer bodies.
-NEXT-ROUND FACTS (frame census + KLIO_CF_TRACE decline tracing):
-- `Operations.push` frames are the BLOCK variant `push(op) { args }` —
-  the lambda must run, so the whole-record serve legitimately cannot
-  take it; the 2-param pushOp serve HITS 6196/6206 (declines are real
-  growth bails). Interior setInt/setObject/ensure-args already served.
-- `executeWithComposeStackTrace` is the standing frame item: 6201
-  frames x a 24-register fill + TWO unbound CMG dispatches
-  (getGroupAnchor, execute) per op; the serve needs the enclosing-chain
-  owner (member-extension dispatch receiver), sketched but not landed.
-- Gate on the 700s ratchet: EXIT=0, 1389/1386 (one
-  resumeOnBackgroundThread budget graze under a concurrent rebuild),
-  vpd child 637s.
+- serve/splice/dispatch rounds: 253 -> 182us per composable, wall 847 ->
+  ~700s (see Closed rounds).
+- ReleaseFast gate policy (e2192a48): replica 191 -> 163us (1.17x), vpd
+  child 708 -> 623s; sweeps/units/other itests keep ReleaseSafe.
+- throw-capable host serves + the changelist wrapper serve (f79ca3cf):
+  replica 194 -> 186us, vpd child 637 -> 608s; COMPOSE_FAST bit6.
+- vpd budget ratchet: 900 -> 800 -> 700s. The ratchet is the PERMANENT
+  guard: every future throughput win must bank into it.
 
-The wall EQUALS `validatePotentialDeadlock` (its slowest child), so
-scheduling cannot move it; only recomposition throughput can. The wall target
-needs ~2.2x; returning vpd's budget to the 90s default needs ~8x. vpd does
-exactly the work its design implies — 3125 virtual frames x 200 Texts x 2
-composers = 1.25M recompositions, confirmed by counting state reads — so
-there is no amplification to remove.
+WHY IT CLOSES HERE (all measured, quiet box, 4x reps):
+- Three execution-tier architectures are neutral on this workload — the
+  per-op C transpiler, the bytecode tier, and the A1d fused walker — for
+  one reason: the heavy-op BODIES (field lookup, dispatch, alloc) dominate
+  and run through the same host paths in every tier.
+- The serve vein below the reimplement-the-composer line is dry: the
+  drain serve measured NEUTRAL (its 7.8% profile share was its callees'
+  dispatch billed under its stamp — frame census showed ~124 drain frames
+  per run), and the push-block serve needs value-class receiver boxing
+  for a ~2% target. The remaining profile is a flat tail of upstream
+  composer bodies (max 4.4%), and serving those means porting composer
+  logic wholesale — out of bounds for a suite that exists to validate the
+  upstream code.
+- Compounding every remaining visible lever optimistically lands ~470s,
+  not 364. The number the target wanted requires an inlined-dispatch
+  native-frame compiler, measured out three times.
 
-ANATOMY OF ONE COMPOSABLE RECOMPOSITION (2026-08-28, measured by
-`KLIO_FRAME_COUNT` deltas between a 10-frame and a 60-frame replica run, not
-sampled): **740 IR instructions, 173 activations, 319 field reads, ~220us** —
-335ns per instruction against a 20ns walker floor (6ns under the bytecode
-tier). The cost is in what the heavy ops do, not the loop, and the
-distribution is FLAT: nothing above 14%.
-- member-call RESOLUTION is only ~63ns per call (timed at phases that return
-  before the callee runs). NEVER time a dispatch arm end to end — it bills
-  the callee's execution to dispatch (read 63ns as 590ns).
-- field reads ~12%; every dispatch fast path *together* (KLIO_FLAT,
-  KLIO_FLAT_VCALL, the site memo, the leaf tier) is worth 14%.
-- sampled profile after this round: GetField 13.4%, Call 12.7%,
-  CallMemberOrGlobal 8.9%, CallVirtual 7.6%, member-ext fallback 7.5%
-  (98.8% of its probes HIT — the cost is rebuilding the key, not the walk),
-  SetField 5.0%, NewInstance 4.8%.
+TRAPS THIS CLOSURE ADDS: a body's fn-prof share includes the host-serve
+work its dispatches trigger — check the FRAME CENSUS count before serving
+a "hot" body; judge the gate wrapper by EXIT CODE (zig build prints a dim
+'failed command:' line even on exit-0 runs).
 
-LANDED 2026-08-28 rounds: **253us -> 182us (1.39x)** per composable; vpd
-SOLO **~724s -> ~480s (1.5x)**; suite wall **847s -> ~700s**, gate
-1390/0/0, vpd budget ratcheted 900 -> 800s. The [child-wall] diagnostic
-now names the wall exactly: the vpd child at **694s in-suite** vs ~500s
-solo (1.4x co-tenancy inflation across separate processes — memory
-bandwidth / turbo, not a lock), every other child drains by ~300s.
-SCHEDULING IS MINED OUT, measured three ways: width 6 vs 8 = 767 vs
-758s; vpd's own child (negated --filter tokens) + its compile trimmed
-~180s -> ~20s bought ~30s combined.
-Remaining arithmetic: wall 364s needs vpd solo ~260s = another ~1.9x of
-recomposition throughput; serve batches yield ~10% each with the largest
-un-served census item now ~2%. ReleaseFast (1.18x policy) would land
-~590s in-gate — still short alone. The open code paths: the
-member-inline tier hardening (below) and Front A1d. The
-serve family (`src/ir/compose_fast.zig`, `KLIO_COMPOSE_FAST` bisect mask,
-wired at `hostRouteServe` AND the flat-call seam): IntStack, the
-composite-key rotation, BOTH changelists' push, the write scope, the
-slot-table index math, then SlotReader
-next/startGroup/endGroup/groupKey/isGroupEnd/nodeCount/objectKey,
-SlotWriter.dataIndex (both same-fqn overloads — the member fun and the
-IntArray member-extension whose owner reads from the enclosing-chain top),
-the OpIterator drain cursor (both composers), the requiresRecompose flag
-bit, GapComposer's node assertion, and ObserverHolder.current. Plus a
-polymorphic member-call-site cache and unlocked class-identity reads.
-Serve discipline that kept it correct: reads and validations before any
-write (a decline must not half-mutate), raising branches stay interpreted,
-ref-valued returns retain and field writes adopt via define. ReleaseFast
-adds a further 1.18x and stays unused (policy).
-MEASUREMENT TRAPS hit here: a solo vpd run without the gate env aborts at
-upstream's 60s runTest budget (~325s wall = compile + abort, NOT a pass),
-and KLIO_ERR_TRACE=1 on a vpd run prints per-miss diagnostics until the
-budget fires — never profile vpd with it.
+### The landed mechanics (kept for the next campaign)
 
-MEASURED AT OR NEAR ZERO (do not re-try): register-fill reduction (-77%
-slots), leaf-coverage gains (-7% activations), a polymorphic field-site
-cache, the bytecode tier on this shape, loop JIT (`klio test` forces it off
-anyway), allocation/GC profile switches, string interning, a chain-hash memo
-(the chain mutates as often as it is read), a member-extension site cache on
-`CallMember` (those fallbacks come from BARE calls through
-`CallMemberOrGlobal`, whose member leg resolves per implicit-receiver
-candidate), string interpolation (parameter CHANGE defeats skipping, not the
-string), and lowering the runTest dispatch cap (HARMFUL —
-teardown-deadlock hangs). `buildSubTable` is LINEAR — per-call overhead, not
-a pathology.
+Serve family: `src/ir/compose_fast.zig` (KLIO_COMPOSE_FAST bisect mask,
+bits 0-5 the pure serves, bit6 the throw-capable wrapper serve; default
+127), wired at hostRouteServe + hostRouteServeThrowing on the recursive
+and flat seams (a flat throw rides rthrow). Serve discipline: reads and
+validations before any write, raising branches stay interpreted (except
+a serve that can genuinely raise — that is what the throwing seam is
+for), ref returns retain, field writes adopt via define, and a serve
+that has performed side effects may never decline (the drain design used
+prevalidation + a loud mid-run error for exactly this).
 
-EXIT PATH (revised 2026-08-29, A1d measured dead as a wall lever like the
-per-op transpiler before it): the remaining measured levers are (1) the
-ReleaseFast gate-harness policy (1.18-1.20x, adopt it), (2) fresh
-profile-driven serve/splice rounds (re-profile after each — the mix
-shifts), (3) nothing else — three execution-tier attempts all measured
-neutral because the heavy-op bodies dominate in every tier. Wall
-arithmetic honestly restated: 364s needs ~1.9x of recomposition; the
-levers above compound to ~1.4-1.5x from here, so the target needs either
-several profile rounds to keep finding double-digit items or a revised
-exit criterion once the vein is measurably dry — record each round's
-yield and decide on numbers.
-LANDED after the first attempt was reverted and its blockers root-caused
-(2026-08-28, 41b35ffd + 140384da):
+Measured at or near zero (do not re-try): register-fill reduction,
+leaf-coverage gains, a polymorphic field-site cache, the bytecode tier on
+this shape, loop JIT, allocation/GC profile switches, string interning,
+a chain-hash memo, a member-ext site cache on CallMember, string
+interpolation, lowering the runTest dispatch cap (HARMFUL), buildSubTable
+(linear), scheduling (mined out three ways), the whole-drain serve, typed
+unboxing on the walker.
+
+Measurement traps: solo vpd without the gate env ABORTS at upstream's 60s
+runTest budget (a ~325s wall is compile + abort, not a pass);
+KLIO_ERR_TRACE=1 poisons vpd timing; never time a dispatch arm end to end.
+
+### Splice-hygiene + member-inline tier (landed 2026-08-28, 41b35ffd + 140384da)
 - SPLICE HYGIENE: mutable-var homes were a flat name-keyed map, so a
   spliced body's own `var index` hijacked the call-site lambda's
   `index = ...` write — LATENT in the whole splice tier (Duration's parse
@@ -258,13 +199,16 @@ The census tool is `KLIO_FN_PROF` (docs/development/debugging.md): it names
 the Kotlin body, not the interpreter internals. Caveat: a leaf- or
 bytecode-served callee is attributed to its caller.
 
-### Front B — interpreter floor (OPEN, single-digit levers)
+### Front B — interpreter floor — CLOSED 2026-08-29 (B1 adopted; B2/B3 recorded as future veins)
 
-- B1. ReleaseFast-for-gate: re-confirmed 1.18-1.20x, policy call, unused.
-- B2. Id-keyed dispatch: eqlBytes + getIndex + hash family are string-keyed
-  cache probes; intern symbol ids at bake and key on them.
-- B3. Allocation rate: boxing per put is ~GBs per stress test; A1d cuts it
-  structurally.
+- B1. ReleaseFast-for-gate: ADOPTED (e2192a48, klio-harness-fast,
+  fast_exe suites only).
+- B2. Id-keyed dispatch (intern symbol ids at bake, key the string-keyed
+  cache probes on them — eqlBytes ~5% of the interpreter profile): a
+  cross-cutting refactor for single digits; recorded as the first vein
+  for any future interpreter-floor campaign, not an open item here.
+- B3. Allocation rate: the structural cut needs typed storage, the
+  measured-dead compiler direction; recorded alongside B2.
 
 ### Front C — inline parity with kotlinc — COMPLETE (2026-08-26)
 
