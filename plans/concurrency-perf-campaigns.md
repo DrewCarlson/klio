@@ -274,11 +274,23 @@ re-try a wider op selector.
         ambiguous-site gate (fuseSiteBinds — a host binding beat the
         baked pack body for convertDurationUnit), walker Trace spans on
         the mark (file-private extension visibility; slotAnchor), and
-        package answers from the mark. Replica standing: fused-on ~198,
-        MAT=0 ~189, FUSED=0 ~186 (jitter ±6) — the tier is ~neutral on
-        the replica and the wall (708-712s), carried by coverage. NEXT:
-        typed unboxing + direct native->native member calls on the
-        walker (the remaining ~1.9x to the 364s wall).
+        package answers from the mark.
+        SLICE-2 PERF VERDICT (measured 4x reps, quiet box): the walker
+        cannot win the wall. Replica: no-minprefix ~204, minprefix=24
+        ~195, PARTIAL-off ~195, FUSED=0 ~191 — near-entry
+        materialization was pure overhead (the [fused-mat] b0:1..b0:5
+        family paid walker entry + a full frame build per call; a
+        MINPREFIX gate now classifies those bodies framed, default 24,
+        KLIO_FUSED_MINPREFIX overrides), and even at full coverage the
+        tier is ~2% overhead: the heavy op BODIES (field lookup,
+        dispatch, alloc) dominate and run through the same host paths in
+        every tier — the same lesson the per-op C transpiler measured.
+        Typed unboxing would optimize scalar ops that are ALREADY inline
+        (scalarBin): dropped as a wall lever. A1d stands as landed
+        infrastructure (correctness-hardened, ~neutral); the wall work
+        returns to the PROVEN vein — profile-driven serve/splice rounds
+        (253 -> 182us came from exactly that) + the ReleaseFast gate
+        policy (measured 1.18-1.20x standing option).
 - A2 (bake-time AOT registration) and A3 (retire the hand serves) only
   matter once A1d exists; the hand serves (`snapshot_fast`, `compose_fast`,
   `persistent_map_mut`) stay as the working instances.

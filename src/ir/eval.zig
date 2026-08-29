@@ -11336,7 +11336,14 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
     }
     var heavy = false;
     var total: usize = 0;
-    for (func.blocks) |*b| {
+    // How much fused progress the ENTRY block makes before its first heavy
+    // op. A body whose entry hits a heavy op almost immediately gains
+    // nothing from a fused prefix — materialization then pays walker entry
+    // PLUS the full frame build on nearly every call (the observed
+    // [fused-mat] b0:1..b0:5 family) — so it runs framed outright.
+    var entry_prefix: usize = 0;
+    var entry_heavy = false;
+    for (func.blocks, 0..) |*b, bi| {
         if (b.catches.len != 0 or b.finally != null or b.lr_absorb != null) return 2;
         total += b.insts.len;
         if (total > FUSED_MAX_INSTS) return 2;
@@ -11344,7 +11351,19 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
             .Return, .Goto, .Branch, .Switch, .Throw, .Unreachable => {},
             else => return 2,
         }
+        const is_entry = bi == func.entry.int();
         for (b.insts) |*inst| {
+            const was_heavy = heavy;
+            _ = was_heavy;
+            const heavy_before = heavy;
+            defer if (is_entry and !entry_heavy) {
+                if (heavy != heavy_before) {
+                    entry_heavy = true;
+                } else switch (inst.*) {
+                    .Trace => {},
+                    else => entry_prefix += 1,
+                }
+            };
             switch (inst.*) {
                 .Trace, .Const, .Move, .LoadParam, .BinOp, .Not, .GetField, .SetField,
                 .Index, .IndexSet, .NotNullAssert, .MakeCell,
@@ -11404,7 +11423,20 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
             }
         }
     }
+    if (heavy and entry_heavy and entry_prefix < fusedMinPrefix()) return 2;
     return if (heavy) 4 else 1;
+}
+
+var fused_minprefix_state: u8 = 0;
+var fused_minprefix_val: usize = 24;
+fn fusedMinPrefix() usize {
+    if (fused_minprefix_state == 0) {
+        if (runtime.envOnce("KLIO_FUSED_MINPREFIX")) |raw| {
+            fused_minprefix_val = std.fmt.parseInt(usize, raw, 10) catch 24;
+        }
+        fused_minprefix_state = 1;
+    }
+    return fused_minprefix_val;
 }
 
 const FusedFail = error{ Raise, Materialize } || Allocator.Error;
