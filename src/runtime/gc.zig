@@ -68,7 +68,7 @@ pub const Marker = struct {
 
     pub fn shade(self: *Marker, h: *GcHeader) void {
         if (gc_poison and h.gc_trace == poisonTrap) {
-            std.debug.print("\n[GC-POISON-SHADE] root reached SWEPT cell: type={s}\n", .{h.gc_type});
+            std.debug.print("\n[GC-POISON-SHADE] root reached SWEPT cell: type={s} ctx={s}:{d}\n", .{ h.gc_type, poison_ctx_name, poison_ctx_idx });
             trace.dumpCurrent(.{});
             @panic("KGC: root shaded a swept cell (incomplete root)");
         }
@@ -874,6 +874,11 @@ pub fn cellSweepFate(h: *const GcHeader, major: bool) enum { marked, tenured, wh
 /// collection re-shades + traces it, firing the trap with the cell's type and a
 /// stack trace: the exact swept-while-live cell that an incomplete root missed.
 pub var gc_poison: bool = false;
+/// Diagnostic context for `[GC-POISON-SHADE]`: which root walk (a frame's
+/// func name / structure label, plus a slot index) was marking when the
+/// swept cell was shaded. Set by the root walkers, read only in the panic.
+pub threadlocal var poison_ctx_name: []const u8 = "";
+pub threadlocal var poison_ctx_idx: usize = 0;
 
 /// Diagnostics: whether `h` is a cell the (poison-mode) sweep already
 /// freed — its trace fn was replaced by the trap. Host walks can probe

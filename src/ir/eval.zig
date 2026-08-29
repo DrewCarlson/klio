@@ -760,6 +760,13 @@ const ResumeFrames = struct {
 const FrameAnchor = struct {
     chain: *const ?*Frame,
     resuming: *const ?*ResumeFrames,
+    /// The fused walker's active chain windows — enclosing entries a
+    /// frameless body owns. A window entry can be the only reference to
+    /// its object once the register it was pushed from is overwritten, so
+    /// the collector must mark the live windows exactly as it marks a
+    /// frame's `enclosing_this`.
+    fused_chains: *const [FUSED_BANK_DEPTH]std.ArrayList(EnclosingEntry),
+    fused_depth: *const usize,
     /// Owning thread, for the frame-walk audit (`KLIO_GC_FRAME_AUDIT=1`):
     /// a collector marking ANOTHER thread's chain must find that thread
     /// parked, so a torn frame there names an unparked mutator.
@@ -806,12 +813,17 @@ inline fn gcPopFrame(f: *Frame) void {
 /// never written — an unfilled slot holds whatever the pooled buffer last
 /// carried and must never reach the collector.
 fn gcMarkFrameRegs(f: *const Frame, m: *runtime.gc.Marker) void {
+    runtime.gc.poison_ctx_name = f.func.name;
     const mask = f.wmask;
     if (mask.isAll()) {
-        for (f.regs.items) |v| v.gcMark(m);
+        for (f.regs.items, 0..) |v, i| {
+            runtime.gc.poison_ctx_idx = i;
+            v.gcMark(m);
+        }
         return;
     }
     for (f.regs.items, 0..) |v, i| {
+        runtime.gc.poison_ctx_idx = i;
         if (mask.has(i)) v.gcMark(m);
     }
 }
@@ -849,6 +861,9 @@ fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
         f.pending_finally.gcMark(m);
         markFrameClosure(f.closure_id, m);
     }
+    for (anchor.fused_chains[0..@min(anchor.fused_depth.*, FUSED_BANK_DEPTH)]) |*w| {
+        for (w.items) |e| e.v.gcMark(m);
+    }
     // Not-yet-rebuilt snapshots of every in-flight resume on this thread.
     var r = anchor.resuming.*;
     while (r) |node| : (r = node.prev) {
@@ -883,7 +898,7 @@ inline fn markFrameClosure(closure_id: ?u64, m: *runtime.gc.Marker) void {
 pub fn gcInstallFrameRoot() void {
     if (frame_troot_inited) return;
     frame_troot_inited = true;
-    frame_anchor = .{ .chain = &evtls.frame_chain, .resuming = &evtls.resuming, .tid = @bitCast(std.Thread.getCurrentId()) };
+    frame_anchor = .{ .chain = &evtls.frame_chain, .resuming = &evtls.resuming, .fused_chains = &fused_chain, .fused_depth = &fused_depth, .tid = @bitCast(std.Thread.getCurrentId()) };
     frame_troot = .{ .ctx = @ptrCast(&frame_anchor), .mark = gcMarkFramesCtx };
     runtime.gc.registerThreadRoot(&frame_troot);
 }
@@ -11410,8 +11425,15 @@ fn fusedRun(
     // bank so the register file is always well-formed, and pin it for the
     // collector for the whole run (fused bodies allocate and call).
     for (regs) |*v| v.* = .Unit;
+    if (runtime.gc.gc_enabled) gcInstallFrameRoot();
     const pin_mark = runtime.keepaliveMark();
     runtime.keepalivePushSlice(regs);
+    // The args slice is NOT otherwise a root: a dispatch that assembled it
+    // in a scratch buffer (a defaulted call's argv) may hold the only
+    // reference to a value in it, and unlike a framed call — which moves
+    // argv into rooted params before any safe point — the fused body runs
+    // through safe points with argv still in the scratch buffer.
+    runtime.keepalivePushSlice(eff_args);
     defer runtime.keepaliveRestore(pin_mark);
     defer if (reclaim) {
         for (regs) |*v| v.release(allocator);
@@ -11568,6 +11590,10 @@ fn fusedMaterializeAndRun(
     const wbase = ev.active_chain_base;
     if (ev.active_chain) |wchain| {
         try frame.enclosing_this.appendSlice(chainAllocator(), wchain.items);
+        // The frame owns the entries now; a populated window would keep
+        // rooting them (it is marked as a thread root) long after the
+        // remainder dropped them.
+        wchain.clearRetainingCapacity();
     }
     frame.activateAs();
     ev.active_chain_base = @min(wbase, frame.enclosing_this.items.len);
@@ -11582,13 +11608,18 @@ fn fusedMaterializeAndRun(
         }
     }
     defer if (comptime @hasDecl(H, "ctxStackTruncate")) host.ctxStackTruncate(ctx_mark);
+    // Bank slots MOVE into the frame (no retain): the walker never resumes
+    // after a materialization, so the frame takes the bank's reference and
+    // the bank is zeroed behind it. Leaving the values in the pinned bank
+    // kept re-rooting objects the remainder had already dropped — the
+    // keepalive pin shaded swept cells collection after collection.
     const n = @min(regs.len, frame.regs.items.len);
     for (regs[0..n], 0..) |v, i| {
-        v.retain();
         if (runtime.reclaimEnabled()) frame.regs.items[i].release(allocator);
         frame.regs.items[i] = v;
+        frame.wmask.set(i);
     }
-    frame.wmask.setAll();
+    for (regs) |*v| v.* = .Unit;
     const result = try runFrame(H, allocator, module, &frame, &try_stack, cur, idx, host);
     return frameBoundary(func, result);
 }
