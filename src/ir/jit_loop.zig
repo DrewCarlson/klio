@@ -1456,7 +1456,7 @@ fn isNullCheckBinOp(types: []const RegType, b: anytype) bool {
     return (lt == .object and rt == .null_) or (lt == .null_ and rt == .object) or (lt == .object and rt == .object);
 }
 
-fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[4]Reg, n_reads: *usize, def: *?Reg, types: []const RegType) void {
+fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[8]Reg, n_reads: *usize, def: *?Reg, types: []const RegType) void {
     n_reads.* = 0;
     def.* = null;
     if (arrayOpOf(module, inst)) |op| {
@@ -1614,7 +1614,7 @@ fn computeSets(a: Allocator, module: *const Module, func: *const Func, body: []c
         @memset(u, false);
         @memset(d, false);
         const blk = &func.blocks[bid.int()];
-        var reads: [4]Reg = undefined;
+        var reads: [8]Reg = undefined;
         var nr: usize = 0;
         var df: ?Reg = null;
         for (blk.insts) |*inst| {
@@ -2885,7 +2885,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     // as a plain scalar anywhere in the loop (only via CellGet/CellSet). Reject
     // if any other instruction (or a branch cond) touches a cell register.
     {
-        var reads: [4]Reg = undefined;
+        var reads: [8]Reg = undefined;
         var nr: usize = 0;
         var df: ?Reg = null;
         for (body) |bid| {
