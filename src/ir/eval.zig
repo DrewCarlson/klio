@@ -4479,16 +4479,31 @@ fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype
     if (claimed == 0) {
         // First execution claims the site for this class when the shared
         // (class, name) memo already routes the read to a stored slot or to
-        // a getter that is itself a leaf.
+        // a getter that is itself a leaf. For a stored route the layout id
+        // is bound to the verified index under one borrow, so a replay
+        // matching BOTH class and shape skips the per-hit verify.
         if (host.fieldSiteRoute(recv, fname)) |route| {
             const usable = switch (route.route & 3) {
                 1, 3 => true,
                 2 => host.fieldGetterIsLeaf(@enumFromInt(route.route >> 2)),
                 else => false,
             };
+            const shp: u64 = blk2: {
+                const g = recv.Instance.borrow();
+                defer g.deinit();
+                const b = g.get();
+                if (route.route & 3 != 1) break :blk2 0;
+                const idx2: usize = @intCast(route.route >> 2);
+                if (idx2 >= b.fields.items.len) break :blk2 0;
+                const f2 = &b.fields.items[idx2];
+                if (!std.mem.eql(u8, f2.name, fname) and !leafSgetterMatches(fname, f2.name)) break :blk2 0;
+                const sp = b.shapeOf();
+                break :blk2 if (sp > 1) sp else 0;
+            };
             if (usable and
                 @cmpxchgStrong(u64, @constCast(&gf.site_cls), 0, route.cls, .acq_rel, .monotonic) == null)
             {
+                if (shp != 0) @atomicStore(u64, @constCast(&gf.site_shape), shp, .monotonic);
                 @atomicStore(u64, @constCast(&gf.site_route), route.route, .release);
             }
         }
@@ -4499,12 +4514,15 @@ fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype
     // then sees another on nearly every call. Declining there sent the whole
     // body — one of the hottest in a recomposition — to the frame path
     // forever. The per-site claim is only a fast path: on a miss, ask the
-    // shared (class, name) memo, which answers from its own cache.
+    // shared (class, name) memo, which answers from its own cache — its
+    // index is NOT shape-checked, so that path keeps the name verify.
     var route = @atomicLoad(u64, @constCast(&gf.site_route), .acquire);
+    var mono_claim = true;
     if (claimed != cls) {
         const alt = host.fieldSiteRoute(recv, fname) orelse return null;
         if (alt.cls != cls) return null;
         route = alt.route;
+        mono_claim = false;
     }
     // A property whose backing is another leaf property chains through it:
     // the callee is pure by construction, so re-running it if this serve is
@@ -4522,10 +4540,15 @@ fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype
     const idx: usize = @intCast(route >> 2);
     const g = recv.Instance.borrow();
     defer g.deinit();
-    const fields = g.get().fields.items;
+    const b = g.get();
+    const fields = b.fields.items;
     if (idx >= fields.len) return null;
     const f = &fields[idx];
-    if (!std.mem.eql(u8, f.name, fname) and !leafSgetterMatches(fname, f.name)) return null;
+    // A mono claim whose recorded LAYOUT matches the live receiver proves
+    // the index; anything else pays the name verify.
+    const shape_ok = mono_claim and
+        @atomicLoad(u64, @constCast(&gf.site_shape), .monotonic) == b.shapeOf();
+    if (!shape_ok and !std.mem.eql(u8, f.name, fname) and !leafSgetterMatches(fname, f.name)) return null;
     const v = f.value;
     if (v == .Null or v == .Delegate) return null;
     // Owned on the way out, matching the getter branch above: the register
@@ -4600,6 +4623,8 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
     if (want.len > 1 and want[0] == '#') {
         const id = std.fmt.parseInt(u32, want[1..], 10) catch return;
         if (func.id.int() != id) return;
+    } else if (std.mem.indexOfScalar(u8, want, '.') != null) {
+        if (!std.mem.eql(u8, func.fqn, want)) return;
     } else if (!std.mem.eql(u8, func.name, want)) return;
     // A deferred body has no blocks yet; wait for the post-materialize call.
     if (func.blocks.len == 0) return;
@@ -4755,6 +4780,45 @@ pub fn evalWithCapturesChained(
             return lr;
         }
     }
+    // The METHOD tier at the seam: a deopt-free compiled method body (pure
+    // native function over receiver fields + scalar args — no calls, no
+    // guards, RETURN its only outcome) runs with no frame regardless of the
+    // chain seed (it consults neither the chain nor any register file). The
+    // seam also counts and triggers the compile: member-dispatched bodies
+    // reach neither the framed entry hook nor (when fusable) any frame.
+    if (comptime @hasDecl(H, "plainStoredFieldIndex") and @hasDecl(H, "plainStoredScalarFieldNN") and @hasDecl(H, "resolveMemberFuncId")) {
+        switch (jit_loop.methodSeamProbe(func)) {
+            .run => |cl| if (args.items.len >= func.params.len and
+                evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and cl.n_slots <= 192)
+            {
+                const fslots: []i64 = &native_slot_bank[evtls.jit_native_depth];
+                const ftags: []u8 = &native_tag_bank[evtls.jit_native_depth];
+                evtls.jit_native_depth += 1;
+                const fo = jit_loop.runFunc(cl, &.{}, args.items, fslots[0..cl.n_slots], ftags[0..cl.n_regs], null, null);
+                evtls.jit_native_depth -= 1;
+                if (fo == null and runtime.envOnce("KLIO_JIT_DEBUG") != null) {
+                    std.debug.print("[jit]   seam run DECLINED {s}\n", .{func.name});
+                }
+                if (fo) |o| {
+                    if (o.code.inst == jit_loop.RETURN_INST) {
+                        var aa = args;
+                        aa.deinit(allocator);
+                        var cc = captures;
+                        cc.deinit(allocator);
+                        return ok(o.value);
+                    }
+                }
+                // Guard/kind decline: the body never executed — run it framed.
+            },
+            .compile => {
+                // Compile-only resolver context: the three resolvers read only
+                // host + allocator; the frame member is never touched here.
+                var cctx: LoopTramp(H).Ctx = .{ .host = host, .allocator = allocator, .module = module, .frame = undefined };
+                jit_loop.methodSeamCompile(module, func, args.items, &LoopTramp(H).resolveMember, &LoopTramp(H).resolveVirtual, &LoopTramp(H).resolveField, &LoopTramp(H).resolveFieldNN, @ptrCast(&cctx));
+            },
+            .no => {},
+        }
+    }
     // The fused tier at the same seam: a transitively closed body runs on
     // the C bank with no Frame at all, raising real errors (never
     // abandoning) — see `fusedExec`.
@@ -4762,7 +4826,7 @@ pub fn evalWithCapturesChained(
         captures.items.len == 0 and
         (!nativeModuleOk(module) or nativeFor(func.id.int(), func.fqn) == null))
     {
-        if (try fusedExecOpt(H, allocator, module, func, args.items, host, fusedMaterializeEnabled())) |fr| {
+        if (try fusedExecOpt(H, allocator, module, func, args.items, host, true)) |fr| {
             var a = args;
             a.deinit(allocator);
             var c = captures;
@@ -5645,6 +5709,30 @@ fn runFlatLoop(
             if (site.req.captures.items.len == 0 and site.req.closure_id == null and
                 site.req.type_args.len == 0 and !site.req.composer_pushed)
             {
+                // The seam method tier on the flat path: a deopt-free
+                // compiled method body serves the request natively (RETURN
+                // is its only outcome). Counting/compiling stays on the
+                // recursive seam; this arm only RUNS an already-compiled one.
+                if (comptime @hasDecl(H, "plainStoredFieldIndex")) run: {
+                    const cl = jit_loop.methodSeamPeek(site.req.func) orelse break :run;
+                    if (site.req.args.items.len < site.req.func.params.len or
+                        evtls.jit_native_depth >= NATIVE_SLOT_BANK_DEPTH or cl.n_slots > 192) break :run;
+                    const fslots: []i64 = &native_slot_bank[evtls.jit_native_depth];
+                    const ftags: []u8 = &native_tag_bank[evtls.jit_native_depth];
+                    evtls.jit_native_depth += 1;
+                    const fo = jit_loop.runFunc(cl, &.{}, site.req.args.items, fslots[0..cl.n_slots], ftags[0..cl.n_regs], null, null);
+                    evtls.jit_native_depth -= 1;
+                    if (fo) |o| {
+                        if (o.code.inst == jit_loop.RETURN_INST) {
+                            const dst = site.req.dst;
+                            discardFlatReq(H, allocator, site.req, host);
+                            try f.write(dst, o.value);
+                            cur = site.ret_block;
+                            ridx = site.ret_idx;
+                            continue;
+                        }
+                    }
+                }
                 if (exec_call.hostRouteServe(H, allocator, site.req.func, site.req.args.items, host)) |served| {
                     const dst = site.req.dst;
                     discardFlatReq(H, allocator, site.req, host);
@@ -5691,7 +5779,7 @@ fn runFlatLoop(
                     }
                     break :blk_cm2 f.module;
                 };
-                const fr = (try fusedExecOpt(H, allocator, callee_mod2, site.req.func, site.req.args.items, host, fusedMaterializeEnabled())) orelse break :fused;
+                const fr = (try fusedExecOpt(H, allocator, callee_mod2, site.req.func, site.req.args.items, host, true)) orelse break :fused;
                 const dst = site.req.dst;
                 discardFlatReq(H, allocator, site.req, host);
                 switch (fr) {
@@ -5763,6 +5851,91 @@ fn runFlatLoop(
             };
             cur = site.req.func.entry;
             ridx = 0;
+            // Function-tier attempt for the fresh activation: the framed
+            // entry hook lives only in runFrameExec's generic loop, and the
+            // flat driver is the path member- and bc-driven calls actually
+            // take. Function-mode bodies are suspension-free by
+            // construction, so the outcomes are exactly RETURN (deliver as
+            // the driver's own completion), a real throw, or a deopt that
+            // resumes interpretation at the outcome point in this frame.
+            if (comptime @hasDecl(H, "callFunc")) hook: {
+                if (!jit_loop.funcEnabled()) break :hook;
+                if (runtime.envOnce("KLIO_FJ_FLATHOOK")) |v| {
+                    if (v.len != 0 and v[0] == '0') break :hook;
+                }
+                var hctx: LoopTramp(H).Ctx = .{ .host = host, .allocator = allocator, .module = act.frame.module, .frame = &act.frame };
+                const mres: ?jit_loop.MemberResolver = if (comptime @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).resolveMember else null;
+                const vres: ?jit_loop.VirtResolver = if (comptime @hasDecl(H, "resolveVirtualFuncId")) &LoopTramp(H).resolveVirtual else null;
+                const fres: ?jit_loop.FieldResolver = if (comptime @hasDecl(H, "plainStoredFieldIndex")) &LoopTramp(H).resolveField else null;
+                const fnres: ?jit_loop.FieldResolver = if (comptime @hasDecl(H, "plainStoredScalarFieldNN")) &LoopTramp(H).resolveFieldNN else null;
+                const fo = jit_loop.maybeRunHotFunc(act.frame.module, site.req.func, &act.frame.regs, act.frame.params.items, act.frame.captures.items, allocator, &LoopTramp(H).call, @ptrCast(&hctx), mres, vres, fres, fnres) orelse break :hook;
+                if (fo.code.inst == jit_loop.RETURN_INST) {
+                    var res2: EvalResult = ok(fo.value);
+                    const act2 = stack.pop().?;
+                    ev.eval_depth -= 1;
+                    res2 = frameBoundary(act2.frame.func, res2);
+                    if (act2.root_pump) {
+                        if (comptime @hasDecl(H, "rootPumpFlatComplete")) {
+                            res2 = try host.rootPumpFlatComplete(allocator, res2, act2.keepalive orelse .Unit, act2.barrier_scope_base);
+                        }
+                    }
+                    if (act2.type_args.len > 0) {
+                        if (comptime @hasDecl(H, "typedCallBoundary")) host.typedCallBoundary(act2.frame.module, act2.frame.func, act2.type_args, &res2);
+                    }
+                    const rb2 = act2.ret_block;
+                    const rix2 = act2.ret_idx;
+                    const rd2 = act2.ret_dst;
+                    teardownActivation(H, allocator, act2, host);
+                    actFree(ev, allocator, act2);
+                    const pf2: *Frame = if (stack.items.len > 0) &stack.items[stack.items.len - 1].frame else frame;
+                    switch (res2) {
+                        .ok => |v| {
+                            try pf2.write(rd2, v);
+                            cur = rb2;
+                            ridx = rix2;
+                        },
+                        .err => |e2| switch (e2) {
+                            .Throw => |v| {
+                                rthrow = v;
+                                cur = rb2;
+                                ridx = rix2;
+                            },
+                            else => {
+                                runwind = e2;
+                                cur = rb2;
+                                ridx = rix2;
+                            },
+                        },
+                    }
+                    continue;
+                }
+                if (fo.code.inst == jit_loop.THROW_INST) {
+                    if (runtime.envOnce("KLIO_JIT_DEBUG") != null) std.debug.print("[jit-dbg] flat THROW {s}\n", .{site.req.func.fqn});
+                    const e2 = hctx.pending.?;
+                    hctx.pending = null;
+                    switch (e2) {
+                        .Throw => |exc| {
+                            rthrow = exc;
+                            cur = fo.code.block;
+                            ridx = 0;
+                        },
+                        else => {
+                            runwind = e2;
+                            cur = fo.code.block;
+                            ridx = 0;
+                        },
+                    }
+                    continue;
+                }
+                // Deopt: resume interpretation at the outcome point (the
+                // frame's written scalar registers were reboxed by runFunc).
+                // A handler-issued deopt carries the sentinel and records the
+                // resume instruction on the context; a native one (div by
+                // zero) encodes the instruction directly.
+                if (runtime.envOnce("KLIO_JIT_DEBUG") != null) std.debug.print("[jit-dbg] flat DEOPT {s} b={d} i={d}\n", .{ site.req.func.fqn, fo.code.block, fo.code.inst });
+                cur = fo.code.block;
+                ridx = if (fo.code.inst == jit_loop.DEOPT_INST) hctx.pending_deopt_inst else fo.code.inst;
+            }
             continue;
         }
         // A suspension: park the current frame at its own suspension point,
@@ -5941,6 +6114,66 @@ fn LoopTramp(comptime H: type) type {
         /// The three TINY hot sites (object move, null test, field read) deliberately
         /// stay inline in `call`: they fire once per JIT'd loop iteration, and
         /// outlining them too cost ~3% throughput for no extra depth.
+        /// ESCAPE: run the interpreter's own arm for one instruction against
+        /// the live frame. Full scalar sync both ways — before: every
+        /// scalar-typed register's slot reboxes into the frame; after: each
+        /// reboxes back (a kind change deopts AT THE NEXT instruction — the
+        /// arm's effects are real and the frame is already correct).
+        noinline fn execEscapeSite(tctx: *jit_loop.TrampCtx, lc: *Ctx, cl: anytype, site: anytype) ?u64 {
+            const n = cl.n_regs;
+            var r: u32 = 0;
+            while (r < n) : (r += 1) {
+                switch (cl.reg_types[r]) {
+                    .i32, .i64, .f64, .f32, .boolean => {
+                        if (r < lc.frame.regs.items.len)
+                            lc.frame.regs.items[r] = jit_loop.valueFromSlotTagged(cl.reg_types[r], tctx.tags[r], tctx.slots[r]);
+                    },
+                    else => {},
+                }
+            }
+            if (site.span) |sp| lc.frame.cur_span = sp;
+            const step = execInst(H, lc.allocator, lc.frame, site.exec_inst.?, lc.host) catch {
+                lc.pending = .{ .Type = "out of memory in JIT escape" };
+                return jit_loop.throwCode(site.block);
+            };
+            switch (step) {
+                .cont => {},
+                .raised => {
+                    const e = lc.frame.step_err.?;
+                    lc.frame.step_err = null;
+                    stashErr(lc, e, site.inst, null);
+                    return jit_loop.throwCode(site.block);
+                },
+                .flat_call => {
+                    // The arm prepared a flat request but ran nothing:
+                    // discard it and deopt AT this instruction so the
+                    // interpreter re-runs it with its own flat machinery.
+                    const req = lc.frame.flat_call.?;
+                    lc.frame.flat_call = null;
+                    discardFlatReq(H, lc.allocator, req, lc.host);
+                    lc.pending_deopt_inst = site.inst;
+                    return jit_loop.deoptCode(site.block);
+                },
+            }
+            r = 0;
+            while (r < n) : (r += 1) {
+                switch (cl.reg_types[r]) {
+                    .i32, .i64, .f64, .f32, .boolean => {
+                        if (r >= lc.frame.regs.items.len) continue;
+                        const v = lc.frame.regs.items[r];
+                        const sv = jit_loop.cellSlotIn(cl.reg_types[r], v) orelse {
+                            lc.pending_deopt_inst = site.inst + 1;
+                            return jit_loop.deoptCode(site.block);
+                        };
+                        tctx.slots[r] = sv;
+                        if (cl.reg_types[r] == .i32) tctx.tags[r] = @intFromEnum(std.meta.activeTag(v));
+                    },
+                    else => {},
+                }
+            }
+            return 0;
+        }
+
         noinline fn bulkySite(tctx: *jit_loop.TrampCtx, lc: *Ctx, cl: anytype, site: anytype) ?u64 {
             if (site.is_field_set) {
                 const recv = lc.frame.regs.items[site.recv_reg];
@@ -6098,6 +6331,10 @@ fn LoopTramp(comptime H: type) type {
             const lc: *Ctx = @ptrCast(@alignCast(tctx.user));
             const cl = tctx.compiled;
             const site = cl.call_sites[@intCast(site_idx)];
+            if (site.is_exec) {
+                if (execEscapeSite(tctx, lc, cl, site)) |code| return code;
+                return 0;
+            }
             // Object move: copy one boxed register into another (both in `regs`).
             // A `.null_`-typed source is the null literal, not a live register, so
             // write `.Null` directly (its slot-backed register is not maintained
@@ -6148,14 +6385,28 @@ fn LoopTramp(comptime H: type) type {
             // effect, so a deopt is safe (the interpreter re-reads).
             if (site.is_field) {
                 const recv = lc.frame.regs.items[site.recv_reg];
-                // A varying boxed receiver may be a different class this iteration
-                // (or null after a `?.` chain step); deopt unless it matches.
-                if (recv != .Instance or (site.recv_varies and jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
+                // A by-name site resolves the stored index on the live
+                // receiver per call (a getter property or missing member
+                // deopts — the read is pure, the interpreter re-runs it).
+                // A fixed-index site's varying boxed receiver may be a
+                // different class this iteration (or null after a `?.` chain
+                // step); deopt unless it matches.
+                if (recv != .Instance or (!site.field_named and site.recv_varies and jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
                     lc.pending_deopt_inst = site.inst;
                     return jit_loop.deoptCode(site.block);
                 }
+                const fidx: u32 = if (site.field_named) blk_fn: {
+                    if (comptime !@hasDecl(H, "plainStoredFieldIndex")) {
+                        lc.pending_deopt_inst = site.inst;
+                        return jit_loop.deoptCode(site.block);
+                    }
+                    break :blk_fn lc.host.plainStoredFieldIndex(lc.allocator, &recv, site.name) orelse {
+                        lc.pending_deopt_inst = site.inst;
+                        return jit_loop.deoptCode(site.block);
+                    };
+                } else site.field_idx;
                 const g = recv.Instance.borrow();
-                const fv: ?Value = if (site.field_idx < g.get().fields.items.len) g.get().fields.items[site.field_idx].value else null;
+                const fv: ?Value = if (fidx < g.get().fields.items.len) g.get().fields.items[fidx].value else null;
                 g.deinit();
                 if (cl.reg_types[site.dst_reg] == .object) {
                     // Object field: write the boxed value straight into the frame.
@@ -6213,7 +6464,9 @@ fn LoopTramp(comptime H: type) type {
             if (!site.is_member and !site.is_virtual and !runtime.shouldAbandon()) {
                 if (lc.module.funcById(site.func)) |callee| {
                     if (jit_loop.compiledFunc(callee)) |callee_cl| {
-                        if (evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and callee_cl.n_slots <= 192) {
+                        if (!callee_cl.no_native_recurse and
+                            evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and callee_cl.n_slots <= 192)
+                        {
                             // Per-depth rows from the thread's static bank: a
                             // stack `undefined` array here is 0xaa-filled per
                             // CALL under the safe build — it was 70% of a
@@ -6334,12 +6587,18 @@ fn LoopTramp(comptime H: type) type {
                     }
                 }
                 var names: [6]?[]const u8 = .{ null, null, null, null, null, null };
-                const r = lc.host.callMemberNamed(lc.allocator, &recv, site.name, argbuf[0..site.n_args], names[0..site.n_args]) catch {
+                const r = (if (site.declared_name.len != 0)
+                    lc.host.callMemberNamedDeclared(lc.allocator, &recv, site.name, argbuf[0..site.n_args], names[0..site.n_args], site.declared_name)
+                else
+                    lc.host.callMemberNamed(lc.allocator, &recv, site.name, argbuf[0..site.n_args], names[0..site.n_args])) catch {
                     if (pushed) popEnclosing();
                     lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
                     return jit_loop.throwCode(site.block);
                 };
                 if (pushed) popEnclosing();
+                if (r == .err and r.err == .Unimplemented and runtime.envOnce("KLIO_JIT_DEBUG") != null) {
+                    std.debug.print("[jit-dbg] member miss: body={s} name={s} declared={s} recv_reg={d} n_params={d}\n", .{ lc.frame.func.fqn, site.name, site.declared_name, site.recv_reg, lc.frame.params.items.len });
+                }
                 break :member r;
             } else lc.host.callFunc(lc.allocator, lc.module, site.func, argbuf[0..site.n_args]) catch {
                 lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
@@ -6356,7 +6615,18 @@ fn LoopTramp(comptime H: type) type {
                             };
                         } else {
                             const s = jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v) orelse {
-                                lc.pending_deopt_inst = site.inst;
+                                // The call ALREADY RAN — a deopt that re-runs
+                                // the instruction would double its effects.
+                                // Deliver the boxed result into the frame
+                                // register (the rebox pass skips it) and
+                                // resume interpretation AFTER the site.
+                                v.retain();
+                                lc.frame.write(Reg.from(site.dst_reg), v) catch {
+                                    lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
+                                    return jit_loop.throwCode(site.block);
+                                };
+                                tctx.deopt_skip_reg = site.dst_reg;
+                                lc.pending_deopt_inst = site.inst + 1;
                                 return jit_loop.deoptCode(site.block);
                             };
                             tctx.slots[site.dst_reg] = s;
@@ -6627,9 +6897,18 @@ fn runFrameExec(
             // trampoline). A `Return` yields the value; a callee throw / div-by-
             // zero deopt resumes interpretation with registers reboxed.
             if (comptime tramp_ok) {
-                if (cur.int() == func.entry.int()) {
-                    if (jit_loop.maybeRunHotFunc(frame.module, func, &frame.regs, frame.params.items, allocator, tramp_fn, tramp_user, member_resolver, virt_resolver, field_resolver, field_nn_resolver)) |fo| {
-                        if (fo.code.inst == jit_loop.RETURN_INST) return ok(fo.value);
+                // FRESH entry only: a deopt/throw resume (or a loop whose
+                // back-edge targets the entry block) arrives here with
+                // resume state set, and re-running the whole body from
+                // scratch would double its effects and drop the pending
+                // throw.
+                if (cur.int() == func.entry.int() and resume_idx == 0 and
+                    resume_throw == null and resume_unwind == null)
+                {
+                    if (jit_loop.maybeRunHotFunc(frame.module, func, &frame.regs, frame.params.items, frame.captures.items, allocator, tramp_fn, tramp_user, member_resolver, virt_resolver, field_resolver, field_nn_resolver)) |fo| {
+                        if (fo.code.inst == jit_loop.RETURN_INST) {
+                            return ok(fo.value);
+                        }
                         if (fo.code.inst == jit_loop.THROW_INST) {
                             const e = loop_ctx.pending.?;
                             loop_ctx.pending = null;
@@ -6642,9 +6921,11 @@ fn runFrameExec(
                                 else => return errResult(e),
                             }
                         }
-                        // A div-by-zero deopt: re-execute that instruction.
+                        // Deopt: a handler-issued one carries the sentinel and
+                        // records the resume instruction on the context; a
+                        // native one (div by zero) encodes it directly.
                         cur = fo.code.block;
-                        resume_idx = fo.code.inst;
+                        resume_idx = if (fo.code.inst == jit_loop.DEOPT_INST) loop_ctx.pending_deopt_inst else fo.code.inst;
                         continue;
                     }
                 }
@@ -9171,11 +9452,13 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                         const idx: usize = @intCast(route >> 2);
                         if (idx >= b.fields.items.len) break :fast;
                         const f = &b.fields.items[idx];
-                        // A scoped `$sgetter$<owner>\u{1f}<prop>` site stores
-                        // its slot under the bare property name; the
-                        // separator-guarded suffix match keeps the index-drift
-                        // guard exact.
-                        if (!sameFieldName(f.name, name)) break :fast;
+                        // A recorded LAYOUT match proves the index names this
+                        // property; only a drifted layout (dynamic define)
+                        // pays the name re-verify. The claim key stays the
+                        // CLASS — two classes can share a layout while
+                        // routing the same name differently.
+                        if (@atomicLoad(u64, @constCast(&gf.site_shape), .monotonic) != b.shapeOf() and
+                            !sameFieldName(f.name, name)) break :fast;
                         const v = f.value;
                         if (v == .Delegate) break :fast;
                         if (frame_count_on) gf_mono += 1;
@@ -9296,7 +9579,24 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                     // retry, or a warmup-executed hot site is pinned to the
                     // slow ladder for the whole run.
                     if (host.fieldSiteRoute(&recv, name)) |r| {
+                        // For a stored route, bind (shape, index, name) under
+                        // ONE borrow — the layout id recorded is exactly the
+                        // one the index was verified against, so the replay's
+                        // shape match can retire the per-hit verify. The
+                        // CLAIM key stays the class.
+                        const shp: u64 = blk: {
+                            const g2 = recv.Instance.borrow();
+                            defer g2.deinit();
+                            const b2 = g2.get();
+                            if (r.route & 3 != 1) break :blk 0;
+                            const idx2: usize = @intCast(r.route >> 2);
+                            if (idx2 >= b2.fields.items.len) break :blk 0;
+                            if (!sameFieldName(b2.fields.items[idx2].name, name)) break :blk 0;
+                            const sp = b2.shapeOf();
+                            break :blk if (sp > 1) sp else 0;
+                        };
                         if (@cmpxchgStrong(u64, @constCast(&gf.site_cls), 0, r.cls, .acq_rel, .monotonic) == null) {
+                            if (shp != 0) @atomicStore(u64, @constCast(&gf.site_shape), shp, .monotonic);
                             if (r.route != 0) @atomicStore(u64, @constCast(&gf.site_route), r.route, .release);
                         }
                     }
@@ -11313,19 +11613,6 @@ pub fn fusedEnabled() bool {
     return fused_enabled_val;
 }
 
-var fused_mat_state: u8 = 0;
-var fused_mat_val: bool = false;
-/// `KLIO_FUSED_MAT=1` lets a PARTIAL body materialize mid-flight —
-/// OPT-IN while the materialized frame's resolution context hardens
-/// (a bare `add` inside a materialized remainder resolved as an
-/// unresolved global; four CompositionTests regressed).
-fn fusedMaterializeEnabled() bool {
-    if (fused_mat_state == 0) {
-        fused_mat_val = !std.mem.eql(u8, runtime.envOnce("KLIO_FUSED_MAT") orelse "1", "0");
-        fused_mat_state = 1;
-    }
-    return fused_mat_val;
-}
 
 fn fusedNameSelected(name: []const u8) bool {
     const sel = fused_sel orelse return true;
@@ -11490,21 +11777,14 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
             }
         }
     }
-    if (heavy and entry_heavy and entry_prefix < fusedMinPrefix()) return 2;
+    if (heavy and entry_heavy and entry_prefix < fused_min_prefix) return 2;
     return if (heavy) 4 else 1;
 }
 
-var fused_minprefix_state: u8 = 0;
-var fused_minprefix_val: usize = 24;
-fn fusedMinPrefix() usize {
-    if (fused_minprefix_state == 0) {
-        if (runtime.envOnce("KLIO_FUSED_MINPREFIX")) |raw| {
-            fused_minprefix_val = std.fmt.parseInt(usize, raw, 10) catch 24;
-        }
-        fused_minprefix_state = 1;
-    }
-    return fused_minprefix_val;
-}
+
+/// A heavy body whose fusable entry prefix is shorter than this runs
+/// framed: the prefix win cannot pay for the materialize handoff.
+const fused_min_prefix: usize = 24;
 
 const FusedFail = error{ Raise, Materialize } || Allocator.Error;
 threadlocal var fused_err: EvalError = undefined;
@@ -11564,6 +11844,10 @@ pub fn fusedExecOpt(
         if (has_outer) return null;
     }
     if (fused_depth >= FUSED_BANK_DEPTH) return null;
+    // Function-tier handshake: a hot fully-fusable body yields to the framed
+    // path so the JIT can count and compile it (the walker otherwise starves
+    // the tier — a fused body never opens a frame).
+    if (jit_loop.fusedShouldYieldToFuncTier(func)) return null;
     // A memoized verdict travels between threads without ordering against
     // the body's lazy decode; re-ensure here (idempotent, serialized) so
     // the walker never indexes an empty block table.

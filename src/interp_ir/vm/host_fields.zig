@@ -661,7 +661,10 @@ fn lexicalReceiverFallback(
 /// class the call site was compiled against (re-checked by the entry class guard).
 pub fn plainStoredFieldIndex(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) ?u32 {
     if (receiver.* != .Instance) return null;
-    // Reject if any class in the hierarchy declares a custom getter or setter.
+    // Reject if any class in the hierarchy declares a custom getter/setter or
+    // DELEGATES the property (`by lazy` stores the delegate object under the
+    // property's name — a raw read would leak the wrapper).
+    if (runtimeClassDelegatesProp(receiver.Instance, name)) return null;
     {
         var cur: ?[]const u8 = className(receiver.Instance);
         var seen: std.ArrayList([]const u8) = .empty;
@@ -677,6 +680,7 @@ pub fn plainStoredFieldIndex(self: *VmHost, allocator: Allocator, receiver: *con
                 pg.deinit();
                 if (hit) return null;
             }
+            if (delegatedPropRegistered(self, cn, name)) return null;
             cur = firstSupertype(self, cn);
         }
     }
@@ -3584,27 +3588,30 @@ fn fieldWriteCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []const u8
 /// slot holds one, else (re)define the field owning its own reference.
 fn storePlainField(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), store_name: []const u8, value: Value) Allocator.Error!UnitResult {
     _ = self;
-    const existing: ?Value = blk: {
-        const g = inst.borrow();
-        defer g.deinit();
-        break :blk g.get().get(store_name);
-    };
-    if (existing) |ev| {
-        if (ev == .Cell) {
-            const cg = ev.Cell.borrowMut();
-            defer cg.deinit();
-            if (runtime.reclaimEnabled()) {
-                value.retain();
-                cg.get().release(allocator);
-            }
-            cg.get().* = value;
-            return .{ .ok = {} };
-        }
-    }
+    // One borrow, one scan: the probe-then-define shape paid two of each per
+    // plain write on the memo-hit path (`define` re-scanned what `get` had
+    // already located).
     value.retain();
     const g = inst.borrowMut();
     defer g.deinit();
-    try g.get().define(allocator, store_name, value);
+    const b = g.get();
+    for (b.fields.items) |*f| {
+        if (f.name.ptr == store_name.ptr or std.mem.eql(u8, f.name, store_name)) {
+            if (f.value == .Cell) {
+                const cg = f.value.Cell.borrowMut();
+                defer cg.deinit();
+                if (runtime.reclaimEnabled()) cg.get().release(allocator);
+                cg.get().* = value;
+                return .{ .ok = {} };
+            }
+            if (runtime.reclaimEnabled()) f.value.release(allocator);
+            f.value = value;
+            return .{ .ok = {} };
+        }
+    }
+    try b.ensureFieldsOwned(allocator, 1);
+    try b.fields.append(allocator, .{ .name = store_name, .value = value });
+    b.invalidateShape();
     return .{ .ok = {} };
 }
 

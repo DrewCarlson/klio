@@ -266,6 +266,13 @@ pub const Inst = union(enum) {
         /// site just stays on the slow path.
         site_cls: u64 = 0,
         site_route: u64 = 0,
+        /// The claiming receiver's LAYOUT identity (`InstanceData.shapeOf`)
+        /// recorded alongside a STORED route: when the live receiver matches
+        /// BOTH the class claim and this shape, the stored index provably
+        /// names the property and the per-hit name re-verify is skipped.
+        /// Shape alone is not a claim key — two classes can share a layout
+        /// while routing the same name differently (a custom getter on one).
+        site_shape: u64 = 0,
         /// Site verdict for serving a NULL stored slot: 0 = unasked, 1 = the
         /// property is an unset-`lateinit` shape the ladder must adjudicate,
         /// 2 = a plain null this site may serve.
@@ -1289,6 +1296,12 @@ pub const Func = struct {
     /// the shared-cache path. Benign-race fill.
     bc_memo: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     bc_memo_fuse: u8 = 0,
+    /// Function-JIT hotness probe, shared across threads so the per-activation
+    /// cost is one atomic load instead of a per-thread state-map lookup: low
+    /// bits count activations, bit 30 = some thread compiled a body (consult
+    /// the per-thread state), bit 31 = compilation declined (sticky; stop
+    /// probing). See `jit_loop` for the encoding.
+    func_jit_probe: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// `bc.streamGen()` at fill time; a cache reset frees the streams the
     /// memo points at, so a stale generation must fall to the shared path.
     bc_memo_gen: u32 = 0,

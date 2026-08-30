@@ -124,6 +124,11 @@ pub const TrampCtx = extern struct {
     /// return kind is unknowable statically (`toChar` on `Int`) still reboxes
     /// with the kind it actually produced.
     tags: [*]u8,
+    /// A register whose value the trampoline handler already delivered BOXED
+    /// into the frame (a call result whose runtime kind missed the slot's
+    /// static type). The post-run deopt rebox must not clobber it from the
+    /// never-filled slot. `maxInt` = none.
+    deopt_skip_reg: u32 = std.math.maxInt(u32),
 };
 /// `fn(trampctx, call_site_index) -> 0 to continue native, else a resume code`.
 pub const TrampFn = *const fn (*anyopaque, u64) callconv(.c) u64;
@@ -165,6 +170,8 @@ pub const CallSite = struct {
     name: []const u8 = "",
     resolved_member: ?FuncId = null,
     dispatch_recv_reg: ?u32 = null,
+    /// Declared-receiver head for by-name dispatch (empty = plain).
+    declared_name: []const u8 = "",
     recv_class: usize = 0,
     /// Field-read fields. `is_field` selects a direct stored-field read from the
     /// boxed receiver at `field_idx` (the field's stable position in the instance,
@@ -202,6 +209,10 @@ pub const CallSite = struct {
     /// inside an otherwise native object-control loop without putting a GC
     /// reference in the scalar slot file.
     is_load_global: bool = false,
+    /// `is_field` variant whose receiver varies per activation (function-JIT):
+    /// the handler resolves the stored index BY NAME on the live receiver each
+    /// call, deopting when the member is not a plain stored field.
+    field_named: bool = false,
     /// Call a loop-invariant callable value held in `recv_reg` with the scalar
     /// args at `args_reg`; the result is discarded.
     is_call_value: bool = false,
@@ -218,6 +229,18 @@ pub const CallSite = struct {
     /// so no class guard is needed.
     is_virtual: bool = false,
     virt_slot: u32 = 0,
+    /// NN-proven native field READ: the stored value can never be null and
+    /// its scalar kind is declared-stable, so the read carries no tag guard
+    /// (and therefore no deopt edge).
+    nn: bool = false,
+    /// ESCAPE site: run the interpreter's own arm for this instruction
+    /// against the live frame (full scalar spill before, unspill after —
+    /// an unspill kind-mismatch deopts with the frame already correct).
+    /// `.flat_call` from the arm discards the prepared request and deopts
+    /// (the arm is effect-free up to that point), so the interpreter
+    /// re-runs the instruction with its own flat machinery.
+    is_exec: bool = false,
+    exec_inst: ?*const Inst = null,
 };
 
 /// One packed array a compiled loop indexes: the register holding it, the
@@ -253,6 +276,15 @@ pub const NullableUnbox = struct {
 
 /// A loop-invariant Instance receiver whose field buffer pointer is cached in
 /// `ptr_slot` at loop entry, so native field reads/writes index it directly.
+pub const ObjParamLoad = struct { param_idx: u16, reg: u32 };
+
+/// One `this`-field the method body accesses natively: the stored index the
+/// body was compiled against and the field's name bytes, re-verified against
+/// the LIVE receiver at every entry — an instance's field ORDER is not
+/// class-static (dynamic `define`s append), and a shifted index would
+/// corrupt an unrelated field.
+pub const MethodFieldCheck = struct { idx: u32, name: []const u8 };
+
 pub const FieldBase = struct {
     recv_reg: u32,
     ptr_slot: u32,
@@ -297,6 +329,49 @@ pub const CompiledLoop = struct {
     /// Function-JIT: the scalar kind each param was specialized on. A later call
     /// whose arg is a different kind deopts to the interpreter.
     param_rt: []RegType = &.{},
+    /// Method mode (function-JIT over a `this` receiver): params[0] must be an
+    /// Instance of exactly `guard_class` (else the call declines to the
+    /// interpreter), and its field-buffer pointer is seeded into
+    /// `entry_fbase_slot` so `this`-field reads/writes run as native memory
+    /// accesses. A method body has effects and holds an object, so it never
+    /// runs as a native-recursed callee (`no_native_recurse`).
+    method_mode: bool = false,
+    guard_class: usize = 0,
+    entry_fbase_slot: u32 = 0,
+    no_native_recurse: bool = false,
+    /// False only for a method body PROVEN unable to deopt or throw: no
+    /// calls, no division, and every `this`-field read NN-proven (so reads
+    /// carry no tag guard). Such a body is a pure native function over
+    /// (receiver fields, scalar args) and may run at the RECURSIVE CALL SEAM
+    /// with no frame at all — its only outcome is RETURN.
+    can_deopt: bool = true,
+    /// Any call site that actually calls back through the trampoline (a
+    /// NATIVE field site is direct memory access and needs none).
+    has_tramp_sites: bool = true,
+    /// Object params: each `LoadParam` of an object-kind param maps its
+    /// destination FRAME register, seeded (borrowed — the frame's params
+    /// list keeps the value alive, and the unset write-mask means an
+    /// in-body overwrite releases nothing it does not own) before entry.
+    obj_param_loads: []ObjParamLoad = &.{},
+    /// Lambda captures whose LoadCapture destinations seed FRAME registers
+    /// (borrowed, like object params); `param_idx` is the capture index.
+    capture_loads: []ObjParamLoad = &.{},
+    method_fields: []MethodFieldCheck = &.{},
+    /// The compile-time receiver's LAYOUT identity, bound to the verified
+    /// `method_fields` (index, name) pairs under one borrow. An entry whose
+    /// live receiver matches it skips the per-field name loop (`shape is not
+    /// a claim key` — the class guard above still runs; the shape only
+    /// licenses the verify skip).
+    guard_shape: u64 = 0,
+    /// The return register to read from the LIVE FRAME on RETURN when the
+    /// escape chain left it untyped (result_rt then describes the declared
+    /// kind for the caller's rebox validation).
+    /// Function-JIT: slot holding the RETURNING REGISTER's index for a
+    /// frame-resident (object / escape-typed) result, written by each
+    /// `Return` emit; `maxInt(u32)` there means the scalar `result_slot`
+    /// (or Unit) carries the value instead.
+    result_reg_slot: u32 = 0,
+    self_dbg_name: []const u8 = "",
     allocator: Allocator,
 
     pub fn deinit(self: *CompiledLoop) void {
@@ -305,6 +380,9 @@ pub const CompiledLoop = struct {
         self.allocator.free(self.box_tags);
         self.allocator.free(self.read_set);
         self.allocator.free(self.def_set);
+        if (self.obj_param_loads.len != 0) self.allocator.free(self.obj_param_loads);
+        if (self.capture_loads.len != 0) self.allocator.free(self.capture_loads);
+        if (self.method_fields.len != 0) self.allocator.free(self.method_fields);
         self.allocator.free(self.arrays);
         self.allocator.free(self.cells);
         self.allocator.free(self.nullables);
@@ -724,6 +802,10 @@ const TrampGlobal = struct { dst: Reg, name: []const u8 };
 fn trampolinableGlobalOf(module: *const Module, inst: *const Inst) ?TrampGlobal {
     switch (inst.*) {
         .LoadGlobal => |lg| {
+            // An identity-resolved binding (a function/class value) reads by
+            // id, not by name — the by-name handler would find a different
+            // (or no) value.
+            if (lg.func != null or lg.class != null or lg.ctor_ref) return null;
             if (lg.name.int() >= module.consts.items.len) return null;
             const name = module.consts.items[lg.name.int()];
             if (name != .String) return null;
@@ -749,6 +831,10 @@ const TrampMember = struct {
     dst: Reg,
     resolved: ?FuncId,
     dispatch_recv: ?Reg,
+    /// Declared-receiver head for the dispatch (`callMemberNamedDeclared`);
+    /// empty = plain by-name dispatch. Dropping it re-resolved an interface
+    /// default's `this` call against the wrong surface.
+    declared: []const u8,
 };
 
 fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember {
@@ -764,6 +850,12 @@ fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember 
             if (cm.name.int() >= module.consts.items.len) return null;
             const name = module.consts.items[cm.name.int()];
             if (name != .String) return null;
+            var declared: []const u8 = "";
+            if (cm.declared_recv) |did| {
+                if (did.int() < module.consts.items.len and module.consts.items[did.int()] == .String) {
+                    declared = module.consts.items[did.int()].String;
+                } else return null;
+            }
             return .{
                 .recv = cm.receiver,
                 .name = name.String,
@@ -772,6 +864,7 @@ fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember 
                 .dst = cm.dst,
                 .resolved = cm.resolved,
                 .dispatch_recv = cm.dispatch_receiver,
+                .declared = declared,
             };
         },
         else => return null,
@@ -863,6 +956,17 @@ pub const FieldResolver = *const fn (*anyopaque, *const Value, []const u8) ?u32;
 /// reboxed; a used non-scalar result makes the loop uncompilable).
 fn isUnitReturn(ty: ir.TypeRef) bool {
     return !ty.nullable and (std.mem.eql(u8, ty.name, "Unit") or ty.name.len == 0);
+}
+
+/// Whether a declared return TYPE NAME is any scalar kind (nullable or not,
+/// exact or rebox-inexact). Such returns never take the frame-resident object
+/// protocol — their register may be slot-typed with a boxed form that does
+/// not round-trip the declaration.
+fn declaredScalarName(n: []const u8) bool {
+    return std.mem.eql(u8, n, "Int") or std.mem.eql(u8, n, "Long") or
+        std.mem.eql(u8, n, "Double") or std.mem.eql(u8, n, "Float") or
+        std.mem.eql(u8, n, "Boolean") or std.mem.eql(u8, n, "Char") or
+        std.mem.eql(u8, n, "Short") or std.mem.eql(u8, n, "Byte");
 }
 
 fn retRegType(ty: ir.TypeRef) RegType {
@@ -1403,7 +1507,21 @@ fn isNullCheckBinOp(types: []const RegType, b: anytype) bool {
     return (lt == .object and rt == .null_) or (lt == .null_ and rt == .object) or (lt == .object and rt == .object);
 }
 
-fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[4]Reg, n_reads: *usize, def: *?Reg, types: []const RegType) void {
+/// Instructions safe to run as an interpreter ESCAPE from a compiled
+/// function body: anything whose arm neither parks the coroutine machinery
+/// nor manipulates the try/finally stack (escaped bodies already exclude
+/// try-regions, and a non-suspend body's calls cannot suspend). `.flat_call`
+/// outcomes discard + deopt, so the flat driver forms are fine.
+fn execEscapable(inst: *const Inst) bool {
+    if (!fjEscapeEnabled()) return false;
+    return switch (inst.*) {
+        // The suspension machinery and structured jumps stay interpreted.
+        .SuspendResumePoint => false,
+        else => true,
+    };
+}
+
+fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[8]Reg, n_reads: *usize, def: *?Reg, types: []const RegType) void {
     n_reads.* = 0;
     def.* = null;
     if (arrayOpOf(module, inst)) |op| {
@@ -1561,7 +1679,7 @@ fn computeSets(a: Allocator, module: *const Module, func: *const Func, body: []c
         @memset(u, false);
         @memset(d, false);
         const blk = &func.blocks[bid.int()];
-        var reads: [4]Reg = undefined;
+        var reads: [8]Reg = undefined;
         var nr: usize = 0;
         var df: ?Reg = null;
         for (blk.insts) |*inst| {
@@ -1655,9 +1773,13 @@ const Compiler = struct {
     /// Function-JIT mode (whole-function compile): enables `LoadParam` (reads a
     /// param slot) and the `Return` terminator (writes `result_slot`, exits).
     func_mode: bool = false,
+    /// Method mode: `LoadParam 0` is the receiver — it lives in no slot (the
+    /// entry seeds its field-buffer pointer instead), so the load is a no-op.
+    method_mode: bool = false,
     param_slot_base: u32 = 0,
     n_params: u32 = 0,
     result_slot: u32 = 0,
+    result_reg_slot: u32 = 0,
     em: jit.Emitter,
     block_label: []?jit.Label,
     exit_targets: std.ArrayListUnmanaged(BlockId),
@@ -2028,10 +2150,14 @@ const Compiler = struct {
         try self.em.loadMem(T1, REGS, @intCast(@as(u64, site.fbase_slot) * 8));
         if (site.is_field) {
             const rt = typeOf(self.types, Reg.from(site.dst_reg));
-            // Tag guard: the field value must still hold the expected scalar kind.
-            try self.em.loadMemB(T0, T1, tag_off);
-            try self.em.cmpImm32(T0, site.tag);
-            try self.em.jcc(.ne, try self.deoptLabel());
+            // Tag guard: the field value must still hold the expected scalar
+            // kind. An NN-proven read (declared non-nullable scalar) skips it
+            // — no deopt edge.
+            if (!site.nn) {
+                try self.em.loadMemB(T0, T1, tag_off);
+                try self.em.cmpImm32(T0, site.tag);
+                try self.em.jcc(.ne, try self.deoptLabel());
+            }
             switch (rt) {
                 .f64 => {
                     try self.em.movsdLoad(X0, T1, payload_off);
@@ -2256,6 +2382,10 @@ const Compiler = struct {
                 try self.storeSlot(b.dst, T0);
             },
             .Not => |n| {
+                // The source must live in a typed scalar slot: an object-typed
+                // register (a boxed call result) keeps its value in the frame,
+                // and its slot holds garbage.
+                if (!isScalarRt(typeOf(self.types, n.src))) return jit.JitError.Unsupported;
                 try self.loadSlot(T0, n.src);
                 try self.em.cmpImm32(T0, 0); // src == 0 ? -> 1 (logical negation)
                 try self.em.setccReg(.e, T0);
@@ -2292,6 +2422,10 @@ const Compiler = struct {
             // Function-JIT: copy a scalar param from its entry-filled slot.
             .LoadParam => |lp| {
                 if (!self.func_mode or lp.idx >= self.n_params) return jit.JitError.Unsupported;
+                // An object param lives in a FRAME register (seeded before
+                // entry — the method receiver's field-buffer pointer
+                // likewise); the slot load is a no-op.
+                if (typeOf(self.types, lp.dst) == .object) return;
                 try self.em.loadMem(T0, REGS, @intCast(@as(u64, self.param_slot_base + lp.idx) * 8));
                 try self.storeSlot(lp.dst, T0);
             },
@@ -2319,10 +2453,24 @@ const Compiler = struct {
             // any scalar kind; `runFunc` reboxes it to the declared return type.
             .Return => |maybe_reg| {
                 if (!self.func_mode) return jit.JitError.Unsupported;
+                // Per-return delivery: a slot-typed value copies into
+                // `result_slot` (and clears the frame marker); a
+                // frame-resident one (object / escape-typed — its value lives
+                // in the frame register, written there by the handlers)
+                // records its REGISTER INDEX in `result_reg_slot` so
+                // `runFunc` reads the frame.
+                var frame_reg: i64 = -1;
                 if (maybe_reg) |r| {
-                    try self.loadSlot(T0, r);
-                    try self.em.storeMem(REGS, @intCast(@as(u64, self.result_slot) * 8), T0);
+                    const rt = typeOf(self.types, r);
+                    if (rt == .unknown or rt == .object) {
+                        frame_reg = @intCast(r.int());
+                    } else {
+                        try self.loadSlot(T0, r);
+                        try self.em.storeMem(REGS, @intCast(@as(u64, self.result_slot) * 8), T0);
+                    }
                 }
+                try self.em.movImm64(T0, @bitCast(frame_reg));
+                try self.em.storeMem(REGS, @intCast(@as(u64, self.result_reg_slot) * 8), T0);
                 try self.em.movImm64(.rax, returnCode());
                 try self.em.jmp(self.epilogue);
             },
@@ -2821,7 +2969,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     // as a plain scalar anywhere in the loop (only via CellGet/CellSet). Reject
     // if any other instruction (or a branch cond) touches a cell register.
     {
-        var reads: [4]Reg = undefined;
+        var reads: [8]Reg = undefined;
         var nr: usize = 0;
         var df: ?Reg = null;
         for (body) |bid| {
@@ -3169,8 +3317,9 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 const tc = trampolinableCallOf(inst).?;
                 const f = module.funcById(tc.func) orelse return null;
                 // The callee must run as a plain interpreted call: no suspend
-                // machinery, no implicit receiver to thread.
-                if (f.is_suspend or f.has_receiver_param) {
+                // machinery, no implicit receiver to thread, and a REAL body
+                // (a bodyless abstract anchor re-dispatches in the arm).
+                if (f.is_suspend or f.has_receiver_param or !f.hasBody()) {
                     if (debugEnabled()) std.debug.print("[jit]   bail: callee {s} suspend/receiver in {s}\n", .{ f.name, func.name });
                     return null;
                 }
@@ -3261,6 +3410,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .recv_tag_reg = argTagSourceReg(blk_insts, i, mc.recv.int()),
                     .name = mc.name,
                     .resolved_member = mc.resolved,
+                    .declared_name = mc.declared,
                     .dispatch_recv_reg = if (mc.dispatch_recv) |reg| reg.int() else null,
                     .recv_class = if (regs[mc.recv.int()] == .Instance) instanceClassIdentity(regs[mc.recv.int()]) else 0,
                     .recv_varies = recv_varies or regs[mc.recv.int()] != .Instance,
@@ -3603,10 +3753,12 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
     const target = BlockId.from(@intCast(code >> 32));
     const inst: u32 = @truncate(code & 0xffff_ffff);
 
+    const rebox_skip: u32 = if (self.call_sites.len != 0) tctx.deopt_skip_reg else std.math.maxInt(u32);
     r = 0;
     while (r < self.n_regs) : (r += 1) {
         if (!self.def_set[r]) continue;
         if (r >= regs.len) continue;
+        if (r == rebox_skip) continue;
         regs[r] = switch (self.reg_types[r]) {
             .i32 => valueFromSlotTagged(.i32, tags[r], slots[r]),
             .i64 => .{ .Long = slots[r] },
@@ -3708,6 +3860,28 @@ pub fn valueFromSlotTagged(rt: RegType, tag: u8, s: i64) Value {
 // --- per-function JIT state + the interpreter hook --------------------------
 
 const HOT_THRESHOLD: u32 = 64;
+
+/// `Func.func_jit_probe` encoding: low 30 bits count activations, bit 30 =
+/// COMPILED somewhere (consult the per-thread state), bit 31 = DECLINED
+/// (sticky — stop probing; the probe tax on never-compiled bodies measured
+/// ~2% of the compose replica when every activation walked the state map).
+const PROBE_COMPILED: u32 = 1 << 30;
+const PROBE_DECLINED: u32 = 1 << 31;
+const PROBE_COUNT_MASK: u32 = PROBE_COMPILED - 1;
+
+inline fn probeWord(func: *const Func) *std.atomic.Value(u32) {
+    return &@constCast(func).func_jit_probe;
+}
+
+/// Bump the shared activation count (bounded — the walker can outrun the
+/// compiling hook) and report whether the body is hot.
+inline fn probeCount(func: *const Func) bool {
+    const pw = probeWord(func);
+    const pr = pw.load(.monotonic);
+    const n = pr & PROBE_COUNT_MASK;
+    if (n < HOT_THRESHOLD * 2) _ = pw.fetchAdd(1, .monotonic);
+    return n + 1 >= HOT_THRESHOLD;
+}
 /// A loop whose receiver/field types are read from the live frame can bail when
 /// the snapshot catches an object register holding null (between traversals).
 /// Such a bail is transient, so retry a few times (spaced by re-reaching the
@@ -3762,6 +3936,30 @@ pub fn setEnabledForTest(on: bool) void {
 pub fn enabled() bool {
     if (jit_enabled_cache) |e| return e; // test override
     return runtime.perf.get().jit_loop;
+}
+
+var fj_fields_cache: ?bool = null;
+fn fjFieldsEnabled() bool {
+    if (fj_fields_cache) |v| return v;
+    const on = if (runtime.envOnce("KLIO_FJ_FIELDS")) |v| !(v.len != 0 and v[0] == '0') else true;
+    fj_fields_cache = on;
+    return on;
+}
+
+var fj_escape_cache: ?bool = null;
+fn fjEscapeEnabled() bool {
+    if (fj_escape_cache) |v| return v;
+    const on = if (runtime.envOnce("KLIO_FJ_ESCAPE")) |v| v.len != 0 and v[0] == '1' else false;
+    fj_escape_cache = on;
+    return on;
+}
+
+var fj_member_cache: ?bool = null;
+fn fjMemberEnabled() bool {
+    if (fj_member_cache) |v| return v;
+    const on = if (runtime.envOnce("KLIO_FJ_MEMBER")) |v| v.len != 0 and v[0] == '1' else true;
+    fj_member_cache = on;
+    return on;
 }
 
 fn debugEnabled() bool {
@@ -3969,20 +4167,26 @@ fn inferFuncTypes(a: Allocator, module: *const Module, func: *const Func, n_regs
 /// are positional top-level calls (so direct recursion stays native through the
 /// call trampoline). `params` are the live arguments at the hot call, used to
 /// specialize param kinds. Returns null for any unsupported shape.
-pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, params: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
-    _ = resolver;
-    _ = virt_resolver;
-    _ = field_resolver;
-    _ = field_nn_resolver;
-    _ = resolver_user;
-    if (func.blocks.len == 0) return null;
-    if (func.is_suspend or func.is_lambda or func.is_inline) return null;
+pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, params: []const Value, captures: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
+    if (func.blocks.len == 0) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4075\n", .{func.name}); return null; }
+    if (func.is_suspend or func.is_inline) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4076\n", .{func.name}); return null; }
+    // Bisect: KLIO_FJ_ONLY=name compiles only that body.
+    if (runtime.envOnce("KLIO_FJ_ONLY")) |only| {
+        if (!std.mem.eql(u8, only, func.name)) return null;
+    }
+    // Bisect: KLIO_FJ_SKIP=a,b declines the named bodies.
+    if (runtime.envOnce("KLIO_FJ_SKIP")) |skips| {
+        var it2 = std.mem.splitScalar(u8, skips, ',');
+        while (it2.next()) |nm| {
+            if (std.mem.eql(u8, nm, func.name)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4081\n", .{func.name}); return null; }
+        }
+    }
     // Only user-code functions: stdlib / kotlinx-pack bodies are left to the
     // interpreter so the whole-function tier never alters the runtime machinery
     // (coroutine dispatch, cancellation) that cooperative scheduling relies on.
-    if (std.mem.startsWith(u8, func.package, "kotlin")) return null;
+    if (std.mem.startsWith(u8, func.package, "kotlin")) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4087\n", .{func.name}); return null; }
     const n_params: u32 = @intCast(func.params.len);
-    if (n_params > 16 or params.len < n_params) return null;
+    if (n_params > 16 or params.len < n_params) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4089\n", .{func.name}); return null; }
     // Result must be scalar or Unit.
     const result_rt: RegType = retRegType(func.return_ty);
     // Only a return type whose boxed form `valueFromSlot` reproduces exactly:
@@ -3993,64 +4197,494 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         std.mem.eql(u8, func.return_ty.name, "Long") or std.mem.eql(u8, func.return_ty.name, "Double") or
         std.mem.eql(u8, func.return_ty.name, "Float") or std.mem.eql(u8, func.return_ty.name, "Boolean"));
     const result_scalar = isScalarRt(result_rt) and exact_ret;
-    if (!result_scalar and !(result_rt == .unknown and isUnitReturn(func.return_ty))) return null;
+    // A declared-object (or Unit) result is served by the frame-resident
+    // return protocol: every value `Return` records its register index and
+    // `runFunc` reads the frame register the handlers populated. Only the
+    // in-between shapes decline: an inexact scalar (Char/Short/Byte rebox as
+    // Int) and a nullable scalar (its Null arm has no slot form).
+    const result_object = !result_scalar and !declaredScalarName(func.return_ty.name) and !isUnitReturn(func.return_ty);
+    if (!result_scalar and !result_object and !(result_rt == .unknown and isUnitReturn(func.return_ty))) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4100\n", .{func.name}); return null; }
 
-    const body = (try collectFunc(a, func)) orelse return null;
+    const body = (try collectFunc(a, func)) orelse { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4102\n", .{func.name}); return null; };
     defer a.free(body);
 
-    // Validate shape: no try-regions; Goto/Branch/Return terminators; only scalar
-    // ops + positional top-level calls.
-    for (body) |bid| {
-        const blk = &func.blocks[bid.int()];
-        if (blk.catches.len != 0 or blk.finally != null) return null;
-        switch (blk.terminator) {
-            .Goto, .Branch, .Return => {},
-            else => return null,
-        }
+    // Method mode: a `this`-receiver whose ONLY use is native field access.
+    // The receiver's class is guarded at entry (a different class declines to
+    // the interpreter) and its field-buffer pointer is seeded into a slot, so
+    // the body's `this.x` reads/writes compile to direct memory ops. The body
+    // has effects and holds an object, so it never native-recurses; every
+    // deopt resumes through the TOP-LEVEL activation's real frame, exactly
+    // like a loop deopt.
+    const is_method = fjFieldsEnabled() and n_params >= 1 and func.params.len >= 1 and
+        std.mem.eql(u8, func.params[0].name, "this") and
+        params[0] == .Instance and field_resolver != null and resolver_user != null;
+    const n_regs: u32 = func.n_locals;
+
+    // Object params (an Instance argument at the hot call): their LoadParam
+    // destinations are FRAME registers, seeded borrowed before native entry.
+    // The method receiver's loads are the param-0 subset (its field ops are
+    // native; every object reg is additionally usable as a member/virtual
+    // receiver, an object move, or a null test — all trampoline sites).
+    var recv_regs_buf: [4]u32 = undefined;
+    var n_recv_regs: usize = 0;
+    var obj_loads_buf: [16]ObjParamLoad = undefined;
+    var n_obj_loads: usize = 0;
+    for (func.blocks) |*blk| {
         for (blk.insts) |*inst| {
-            if (numericConvOf(module, inst) != null) continue;
-            if (bitwiseOpOf(module, inst) != null) continue;
-            if (trampolinableCallOf(inst)) |tc| {
-                if (tc.n_args > 6) return null;
-                continue;
-            }
-            switch (inst.*) {
-                // `/` and `%` are excluded: a divide-by-zero is the only deopt a
-                // function-mode body could raise, and a native recursive callee has
-                // no frame to resume into — so without this the deopt fallback would
-                // re-run a (possibly impure) callee. Functions using `/`/`%` stay on
-                // the interpreter / loop-JIT path.
-                .BinOp => |b| if (isDivBinOp(b.op)) return null,
-                .Const, .Move, .Not, .UnOp, .Trace, .LoadParam => {},
-                else => return null,
+            if (inst.* != .LoadParam) continue;
+            const lp = inst.LoadParam;
+            if (lp.idx >= params.len or params[lp.idx] != .Instance) continue;
+            if (n_obj_loads >= obj_loads_buf.len) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4131\n", .{func.name}); return null; }
+            obj_loads_buf[n_obj_loads] = .{ .param_idx = @intCast(lp.idx), .reg = lp.dst.int() };
+            n_obj_loads += 1;
+            if (is_method and lp.idx == 0) {
+                if (n_recv_regs >= recv_regs_buf.len) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4135\n", .{func.name}); return null; }
+                recv_regs_buf[n_recv_regs] = lp.dst.int();
+                n_recv_regs += 1;
             }
         }
     }
+    const recv_regs = recv_regs_buf[0..n_recv_regs];
+    const obj_loads = obj_loads_buf[0..n_obj_loads];
 
-    const n_regs: u32 = func.n_locals;
+    // Lambda captures: every LoadCapture destination is a FRAME register
+    // seeded borrowed from the activation's capture vector (any value kind —
+    // a captured scalar stays boxed; a `var` capture's Cell declines at its
+    // CellGet). The capture INDEX layout is static per lambda body, so the
+    // compile-time snapshot only bounds the indexes.
+    var cap_loads_buf: [16]ObjParamLoad = undefined;
+    var n_cap_loads: usize = 0;
+    for (func.blocks) |*blk| {
+        for (blk.insts) |*inst| {
+            if (inst.* != .LoadCapture) continue;
+            const lcx = inst.LoadCapture;
+            if (lcx.idx >= captures.len or lcx.idx > std.math.maxInt(u16)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: cap-idx\n", .{func.name}); return null; }
+            if (n_cap_loads >= cap_loads_buf.len) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: cap-cap\n", .{func.name}); return null; }
+            cap_loads_buf[n_cap_loads] = .{ .param_idx = @intCast(lcx.idx), .reg = lcx.dst.int() };
+            n_cap_loads += 1;
+        }
+    }
+    const cap_loads = cap_loads_buf[0..n_cap_loads];
 
-    // Each param must be a scalar value; record its kind for the entry guard.
+    const isRecvReg = struct {
+        fn f(set: []const u32, r: u32) bool {
+            for (set) |x| {
+                if (x == r) return true;
+            }
+            return false;
+        }
+    }.f;
+
+    var has_div = false;
+    var n_escapes: u32 = 0;
+    const EscapePos = struct { b: u32, i: u32 };
+    var escape_pos: std.ArrayListUnmanaged(EscapePos) = .empty;
+    defer escape_pos.deinit(a);
+    // Validate shape: no try-regions; Goto/Branch/Return terminators; scalar
+    // ops + positional top-level calls (+ `this`-field access in method mode).
+    // A method receiver register may appear ONLY as a field-op receiver.
+    for (body) |bid| {
+        const blk = &func.blocks[bid.int()];
+        if (blk.catches.len != 0 or blk.finally != null) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4163\n", .{func.name}); return null; }
+        switch (blk.terminator) {
+            .Goto, .Branch, .Return => {},
+            else => { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4166\n", .{func.name}); return null; },
+        }
+        if (blk.terminator == .Return) {
+            if (blk.terminator.Return) |rr| {
+                if (isRecvReg(recv_regs, rr.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4170\n", .{func.name}); return null; }
+            }
+        }
+        for (blk.insts, 0..) |*inst, inst_i| {
+            if (numericConvOf(module, inst)) |nc| {
+                if (isRecvReg(recv_regs, nc.src.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4175\n", .{func.name}); return null; }
+                continue;
+            }
+            if (bitwiseOpOf(module, inst)) |bo| {
+                if (isRecvReg(recv_regs, bo.lhs.int()) or isRecvReg(recv_regs, bo.rhs.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4179\n", .{func.name}); return null; }
+                continue;
+            }
+            if (trampolinableCallOf(inst)) |tc| {
+                if (tc.n_args > 6) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4183\n", .{func.name}); return null; }
+                var k: u32 = 0;
+                while (k < tc.n_args) : (k += 1) {
+                    if (isRecvReg(recv_regs, tc.args_reg + k)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4186\n", .{func.name}); return null; }
+                }
+                continue;
+            }
+            // Member / virtual calls trampoline; the receiver must be one of
+            // the seeded object registers (an object param — including the
+            // method receiver — whose value the handler reads from the frame).
+            // An UNRESOLVED bare-name member with no declared head keeps the
+            // interpreter: its resolution consults the executing frame's
+            // receiver tower and visibility surface (an interface default's
+            // `isEmpty()` resolved a file-private extension there), context
+            // the trampoline's by-name dispatch does not carry.
+            // Member/virtual trampoline sites (KLIO_FJ_MEMBER=0 bisects):
+            // the receiver must be a seeded object-param register. (Both
+            // launch repros — Changes.isNotEmpty, dataIndexToDataAnchor —
+            // were ONE bug: the object-param seed table was never copied
+            // into the CompiledLoop, so receivers read stale pooled-frame
+            // registers.)
+            if (trampolinableMemberOf(module, inst)) |mc| {
+                if (!fjMemberEnabled()) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4205\n", .{func.name}); return null; }
+                // The receiver may be ANY object-typed register — a param, a
+                // prior call's boxed result, an object field read: every
+                // object def is handler-written, so its value is in the frame
+                // where the site handler reads it. The site build (post-
+                // typing) enforces the .object kind.
+                if (mc.dispatch_recv != null) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4211\n", .{func.name}); return null; }
+                continue;
+            }
+            if (trampolinableVirtualOf(inst)) |vc| {
+                if (!fjMemberEnabled()) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4215\n", .{func.name}); return null; }
+                _ = vc;
+                continue;
+            }
+            switch (inst.*) {
+                // `/` and `%` are excluded: a divide-by-zero deopt from a
+                // native-RECURSED callee has no frame to resume into. Method
+                // bodies never recurse natively, so they may divide.
+                .BinOp => |b| {
+                    if (isRecvReg(recv_regs, b.lhs.int()) or isRecvReg(recv_regs, b.rhs.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4228\n", .{func.name}); return null; }
+                    if (isDivBinOp(b.op)) {
+                        if (!is_method) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4230\n", .{func.name}); return null; }
+                        has_div = true;
+                    }
+                },
+                .Move => |m| if (isRecvReg(recv_regs, m.src.int()) or isRecvReg(recv_regs, m.dst.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4234\n", .{func.name}); return null; },
+                .Not => |nt| if (isRecvReg(recv_regs, nt.src.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4235\n", .{func.name}); return null; },
+                .UnOp => |u| if (isRecvReg(recv_regs, u.operand.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4236\n", .{func.name}); return null; },
+                .GetField => |gf| {
+                    if (!is_method or !isRecvReg(recv_regs, gf.receiver.int())) {
+                        if (!execEscapable(inst)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4239 inst={s}\n", .{ func.name, @tagName(std.meta.activeTag(inst.*)) }); return null; }
+                        n_escapes += 1;
+                        escape_pos.append(a, .{ .b = bid.int(), .i = @intCast(inst_i) }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4241\n", .{func.name}); return null; };
+                        continue;
+                    }
+                },
+                .SetField => |sf| {
+                    if (!is_method or !isRecvReg(recv_regs, sf.receiver.int())) {
+                        if (!execEscapable(inst)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4247 inst={s}\n", .{ func.name, @tagName(std.meta.activeTag(inst.*)) }); return null; }
+                        n_escapes += 1;
+                        escape_pos.append(a, .{ .b = bid.int(), .i = @intCast(inst_i) }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4249\n", .{func.name}); return null; };
+                        continue;
+                    }
+                    if (sf.super_owner != null) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4252\n", .{func.name}); return null; }
+                    if (isRecvReg(recv_regs, sf.value.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4253\n", .{func.name}); return null; }
+                },
+                .Const, .Trace, .LoadParam => {},
+                else => {
+                    // Anything the emitter has no native or trampoline form
+                    // for runs as an ESCAPE: the interpreter's own arm
+                    // against the live frame. Bounded per body so a mostly-
+                    // escaped body stays interpreted.
+                    if (!execEscapable(inst)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4261 inst={s}\n", .{ func.name, @tagName(std.meta.activeTag(inst.*)) }); return null; }
+                    n_escapes += 1;
+                    escape_pos.append(a, .{ .b = bid.int(), .i = @intCast(inst_i) }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4263\n", .{func.name}); return null; };
+                },
+            }
+        }
+    }
+    if (n_escapes > 24) {
+        if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: escape-cap\n", .{func.name});
+        { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4270\n", .{func.name}); return null; }
+    }
+
+    // Each param must be a scalar value (the method receiver is `.object`);
+    // record its kind for the entry guard.
     const param_rt = try a.alloc(RegType, n_params);
     var ok = false;
     defer if (!ok) a.free(param_rt);
     {
         var p: u32 = 0;
         while (p < n_params) : (p += 1) {
-            param_rt[p] = cellScalarType(params[p]) orelse return null;
+            if (params[p] == .Instance) {
+                param_rt[p] = .object;
+                continue;
+            }
+            param_rt[p] = cellScalarType(params[p]) orelse {
+                if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: param-kind\n", .{func.name});
+                { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4287\n", .{func.name}); return null; }
+            };
+        }
+    }
+
+    // Resolve every `this`-field op against the LIVE receiver: the stored
+    // index, the field's exact live scalar kind (only the exact-rebox kinds —
+    // a Char/Short/Byte field would rebox as Int on deopt), and the tag the
+    // native read guards on. These seed the type inference so field-read
+    // destinations type precisely.
+    const FieldPre = struct { block: u32, inst: u32, idx: u32, rt: RegType, tag: u8, is_set: bool, dst_or_src: u32, nn: bool, name: []const u8 };
+    var field_pres: std.ArrayListUnmanaged(FieldPre) = .empty;
+    defer field_pres.deinit(a);
+    if (is_method) {
+        for (body) |bid| {
+            const blk = &func.blocks[bid.int()];
+            for (blk.insts, 0..) |*inst, ii| {
+                const info: struct { name_id: ir.ConstId, is_set: bool, reg: u32, recv: u32 } = switch (inst.*) {
+                    .GetField => |gf| .{ .name_id = gf.field, .is_set = false, .reg = gf.dst.int(), .recv = gf.receiver.int() },
+                    .SetField => |sf| .{ .name_id = sf.field, .is_set = true, .reg = sf.value.int(), .recv = sf.receiver.int() },
+                    else => continue,
+                };
+                // Only the receiver's OWN fields take the native fixed-index
+                // route (the entry guard pins their class); any other object's
+                // field op goes through the by-name trampoline site below.
+                if (!isRecvReg(recv_regs, info.recv)) continue;
+                if (info.name_id.int() >= module.consts.items.len) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4309\n", .{func.name}); return null; }
+                const namec = module.consts.items[info.name_id.int()];
+                if (namec != .String) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4311\n", .{func.name}); return null; }
+                const fname = memberFieldName(namec.String);
+                const idx = field_resolver.?(resolver_user.?, &params[0], fname) orelse { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4313\n", .{func.name}); return null; };
+                const fv: Value = blk2: {
+                    const g = params[0].Instance.borrow();
+                    defer g.deinit();
+                    const items = g.get().fields.items;
+                    if (idx >= items.len) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4318\n", .{func.name}); return null; }
+                    break :blk2 items[idx].value;
+                };
+                const rt: RegType = switch (fv) {
+                    .Int => .i32,
+                    .Long => .i64,
+                    .Double => .f64,
+                    .Float => .f32,
+                    .Bool => .boolean,
+                    // An object-valued own field cannot live in a slot; its
+                    // READ is served by the by-name trampoline site (boxed
+                    // into the frame register). A store stays interpreted.
+                    else => {
+                        if (!info.is_set) continue;
+                        if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4327\n", .{func.name});
+                        return null;
+                    },
+                };
+                const nn = !info.is_set and field_nn_resolver != null and
+                    field_nn_resolver.?(resolver_user.?, &params[0], fname) != null;
+                field_pres.append(a, .{
+                    .block = bid.int(),
+                    .inst = @intCast(ii),
+                    .idx = idx,
+                    .rt = rt,
+                    .tag = @intFromEnum(std.meta.activeTag(fv)),
+                    .is_set = info.is_set,
+                    .dst_or_src = info.reg,
+                    .nn = nn,
+                    .name = fname,
+                }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4341\n", .{func.name}); return null; };
+            }
         }
     }
 
     const types = try inferFuncTypes(a, module, func, n_regs, params);
     defer if (!ok) a.free(types);
-
-    // The return register must carry the declared scalar kind.
-    if (result_scalar) {
-        for (body) |bid| {
-            const blk = &func.blocks[bid.int()];
-            if (blk.terminator == .Return) {
-                if (blk.terminator.Return) |rr| {
-                    if (rr.int() >= n_regs or typeAt(types, rr) != result_rt) return null;
+    // Seed field-read destination types, object-param registers, and
+    // member/virtual result types, then re-run the fixpoint so they
+    // propagate into the arithmetic that consumes them.
+    {
+        for (obj_loads) |opl| {
+            if (opl.reg >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4353\n", .{func.name}); return null; }
+            _ = setType(types, Reg.from(opl.reg), .object);
+        }
+        for (cap_loads) |cpl| {
+            if (cpl.reg >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: cap-reg\n", .{func.name}); return null; }
+            _ = setType(types, Reg.from(cpl.reg), .object);
+        }
+        // An escaped instruction's destination types by its statically known
+        // result kind where one exists, so consumers (a Branch condition, a
+        // scalar accumulate) stay native with the escape's unspill syncing
+        // the slot.
+        for (escape_pos.items) |ep2| {
+            const ei = &func.blocks[ep2.b].insts[ep2.i];
+            switch (ei.*) {
+                .InstanceOf => |io2| {
+                    if (io2.dst.int() < n_regs) _ = setType(types, io2.dst, .boolean);
+                },
+                else => {},
+            }
+        }
+        // Member/virtual result registers: resolve against the live param
+        // receiver for a precise scalar kind; anything unresolved is a
+        // boxed object write (always sound — the handler boxes the result
+        // into the frame register).
+        for (body) |bid2| {
+            for (func.blocks[bid2.int()].insts, 0..) |*inst2, ii2| {
+                var dstr: ?Reg = null;
+                var rt2: RegType = .object;
+                if (inst2.* == .GetField) {
+                    // Own-field reads seed their exact scalar kind below (the
+                    // FieldPre pass); every other field read is a by-name
+                    // trampoline site whose result boxes into the frame.
+                    var covered = false;
+                    for (field_pres.items) |fp2| {
+                        if (fp2.block == bid2.int() and fp2.inst == ii2) covered = true;
+                    }
+                    if (!covered) dstr = inst2.GetField.dst;
+                } else if (trampolinableGlobalOf(module, inst2)) |lg2| {
+                    dstr = lg2.dst;
+                } else if (trampolinableMemberOf(module, inst2)) |mc2| {
+                    dstr = mc2.dst;
+                    if (mc2.resolved) |fid2| {
+                        if (module.funcById(fid2)) |f2| rt2 = funcReturnRegType(module, f2);
+                    } else if (resolver != null) {
+                        for (obj_loads) |opl| {
+                            if (opl.reg == mc2.recv.int()) {
+                                var av2: [6]Value = undefined;
+                                var k2: u8 = 0;
+                                while (k2 < mc2.n_args and k2 < 6) : (k2 += 1) {
+                                    if (mc2.args_reg + k2 >= params.len) break;
+                                    av2[k2] = .Unit;
+                                }
+                                if (resolver.?(resolver_user.?, &params[opl.param_idx], mc2.name, av2[0..mc2.n_args])) |fid2| {
+                                    if (module.funcById(fid2)) |f2| rt2 = funcReturnRegType(module, f2);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                } else if (trampolinableVirtualOf(inst2)) |vc2| {
+                    dstr = vc2.dst;
+                    if (virt_resolver != null) {
+                        for (obj_loads) |opl| {
+                            if (opl.reg == vc2.recv.int()) {
+                                if (virt_resolver.?(resolver_user.?, &params[opl.param_idx], vc2.slot)) |fid2| {
+                                    if (module.funcById(fid2)) |f2| rt2 = funcReturnRegType(module, f2);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    // Receiver class outside the main module (the resolve memo
+                    // only sees main-module classes): the slot ROOT's declared
+                    // return type is still binding on every override — a
+                    // primitive return has no covariant widening — so a scalar
+                    // declaration types the destination without knowing the
+                    // target. A lying override deopts at the site (the handler
+                    // re-runs the instruction interpreted on a kind mismatch).
+                    if (rt2 == .object) {
+                        if (module.funcById(FuncId.from(vc2.slot))) |rootf| {
+                            const drt = retRegType(rootf.return_ty);
+                            if (drt != .unknown) rt2 = drt;
+                        }
+                    }
                 }
+                if (dstr) |d2| {
+                    if (d2.int() >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4398\n", .{func.name}); return null; }
+                    if (rt2 == .unknown) rt2 = .object;
+                    _ = setType(types, d2, rt2);
+                }
+            }
+        }
+        for (field_pres.items) |fp| {
+            if (!fp.is_set) {
+                if (fp.dst_or_src >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4406\n", .{func.name}); return null; }
+                _ = setType(types, Reg.from(fp.dst_or_src), fp.rt);
+            }
+        }
+        var changed = true;
+        var iters: usize = 0;
+        while (changed and iters < 16) : (iters += 1) {
+            changed = false;
+            for (func.blocks) |*blk| {
+                for (blk.insts) |*inst| {
+                    if (inst.* == .LoadParam) continue;
+                    if (setDefType(types, module, inst, &.{}, &.{})) changed = true;
+                }
+            }
+        }
+        // A field WRITE's source must be scalar of the field's exact kind.
+        for (field_pres.items) |fp| {
+            if (fp.is_set) {
+                if (fp.dst_or_src >= n_regs or typeAt(types, Reg.from(fp.dst_or_src)) != fp.rt) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4424\n", .{func.name}); return null; }
+            }
+        }
+    }
+
+    // CASCADE: any instruction reading a register the typing could not
+    // settle (an escaped producer's destination) escapes too — escaped
+    // instructions read the live frame, where the arm-written values are
+    // real. Fixpoint, bounded by the escape cap.
+    {
+        const inEscapes = struct {
+            fn f(list: []const EscapePos, b: u32, i: u32) bool {
+                for (list) |e| {
+                    if (e.b == b and e.i == i) return true;
+                }
+                return false;
+            }
+        }.f;
+        var grew = true;
+        while (grew) {
+            grew = false;
+            for (body) |bid| {
+                const blk = &func.blocks[bid.int()];
+                for (blk.insts, 0..) |*inst, ii| {
+                    if (inEscapes(escape_pos.items, bid.int(), @intCast(ii))) continue;
+                    var reads2: [8]Reg = undefined;
+                    var nr2: usize = 0;
+                    var df2: ?Reg = null;
+                    instReadsDef(module, inst, &reads2, &nr2, &df2, types);
+                    var unknown = false;
+                    for (reads2[0..nr2]) |rr2| {
+                        if (rr2.int() < n_regs and types[rr2.int()] == .unknown) unknown = true;
+                    }
+                    if (!unknown) continue;
+                    if (!execEscapable(inst)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4458 inst={s}\n", .{ func.name, @tagName(std.meta.activeTag(inst.*)) }); return null; }
+                    if (inst.* == .Trace or inst.* == .LoadParam) continue;
+                    n_escapes += 1;
+                    if (n_escapes > 24) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4461\n", .{func.name}); return null; }
+                    escape_pos.append(a, .{ .b = bid.int(), .i = @intCast(ii) }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4462\n", .{func.name}); return null; };
+                    grew = true;
+                }
+            }
+        }
+    }
+    // Post-cascade profitability re-check (the cascade grows the set).
+    if (n_escapes != 0) {
+        var total_insts2: u32 = 0;
+        for (body) |bid2| total_insts2 += @intCast(func.blocks[bid2.int()].insts.len);
+        if (n_escapes * 5 > total_insts2) {
+            if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: escape-heavy ({d}/{d})\n", .{ func.name, n_escapes, total_insts2 });
+            return null;
+        }
+    }
+
+    // The return register must carry the declared scalar kind — or, when the
+    // escape chain left it untyped, the return reads the LIVE FRAME (the
+    // escaped arm wrote the real value there). A Branch on an untyped
+    // condition has no such fallback: decline.
+    for (body) |bid| {
+        const blk = &func.blocks[bid.int()];
+        if (blk.terminator == .Return) {
+            if (blk.terminator.Return) |rr| {
+                if (rr.int() >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4478\n", .{func.name}); return null; }
+                const rt3 = typeAt(types, rr);
+                if (result_scalar) {
+                    // Slot-typed must match the declared kind; unknown reads
+                    // the frame (the escaped arm wrote the real value there).
+                    if (rt3 != .unknown and rt3 != result_rt) {
+                        if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: result-kind\n", .{func.name});
+                        return null;
+                    }
+                } else if (result_object) {
+                    // Every value return must be frame-resident: a scalar-
+                    // typed register's boxed form may not match the declared
+                    // type (e.g. Any with an Int arm), and `.null_` has no
+                    // frame-register backing.
+                    if (rt3 != .object and rt3 != .unknown) {
+                        if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: result-kind\n", .{func.name});
+                        return null;
+                    }
+                }
+            }
+        }
+    }
+    for (body) |bid| {
+        const blk = &func.blocks[bid.int()];
+        if (blk.terminator == .Branch) {
+            const cond = blk.terminator.Branch.cond;
+            if (cond.int() >= n_regs or !isScalarRt(typeAt(types, cond))) {
+                if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: branch-unknown\n", .{func.name});
+                return null;
             }
         }
     }
@@ -4074,11 +4708,23 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 if (d.int() < n_regs) def[d.int()] = true;
             }
             const tc = trampolinableCallOf(inst) orelse continue;
+            // A suspend callee would park through the trampoline; every
+            // function-mode body must be suspension-free so a flat-driver
+            // native run's outcomes stay RETURN / throw / deopt only.
+            if (module.funcById(tc.func)) |cf| {
+                // A bodyless callee is an abstract-member static anchor: the
+                // interpreted Call arm re-dispatches it virtually on the
+                // receiver, which a raw callFunc cannot.
+                if (cf.is_suspend or !cf.hasBody()) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4517\n", .{func.name}); return null; }
+            } else { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4518\n", .{func.name}); return null; }
             // Args must already live in typed scalar slots.
             var k: u8 = 0;
             while (k < tc.n_args) : (k += 1) {
                 const ar = tc.args_reg + k;
-                if (ar >= n_regs or !isScalarRt(types[ar])) return null;
+                if (ar >= n_regs or !isScalarRt(types[ar])) {
+                    if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: call-arg-kind\n", .{func.name});
+                    return null;
+                }
             }
             var span: ?ir.Span = null;
             var bj: usize = i;
@@ -4099,9 +4745,260 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 .block = bid,
                 .inst = @intCast(i),
                 .span = span,
-            }) catch return null;
+            }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4544\n", .{func.name}); return null; };
         }
     }
+
+    // Member / virtual trampoline sites (object receiver seeded in a frame
+    // register; scalar args from typed slots; an object result boxes into
+    // the frame register, a scalar one fills its slot). No entry class
+    // guard: dispatch is dynamic per receiver.
+    for (body) |bid| {
+        const blk = &func.blocks[bid.int()];
+        for (blk.insts, 0..) |*inst, i| {
+            if (inst.* == .Move) {
+                // An object move copies one boxed FRAME register into another
+                // — the handler does it; the native scalar Move would copy a
+                // garbage slot (object registers are not slot-backed).
+                const m = inst.Move;
+                const obj_mv = typeAt(types, m.dst) == .object or typeAt(types, m.src) == .object or
+                    typeAt(types, m.src) == .null_;
+                if (obj_mv) {
+                    if (m.dst.int() >= n_regs or m.src.int() >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: objmove-reg\n", .{func.name}); return null; }
+                    var span6: ?ir.Span = null;
+                    var bj6: usize = i;
+                    while (bj6 > 0) {
+                        bj6 -= 1;
+                        if (blk.insts[bj6] == .Trace) {
+                            span6 = blk.insts[bj6].Trace.span;
+                            break;
+                        }
+                    }
+                    call_sites.append(a, .{
+                        .dst_reg = m.dst.int(),
+                        .src_reg = m.src.int(),
+                        .block = bid,
+                        .inst = @intCast(i),
+                        .span = span6,
+                        .is_obj_move = true,
+                    }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4740\n", .{func.name}); return null; };
+                }
+                continue;
+            }
+            if (trampolinableGlobalOf(module, inst)) |lg| {
+                // Global read: the handler boxes the value into the frame
+                // register (a missing global deopts; the interpreter re-runs
+                // the read and raises properly).
+                if (lg.dst.int() >= n_regs or typeAt(types, lg.dst) != .object) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: global-kind\n", .{func.name}); return null; }
+                var span4: ?ir.Span = null;
+                var bj4: usize = i;
+                while (bj4 > 0) {
+                    bj4 -= 1;
+                    if (blk.insts[bj4] == .Trace) {
+                        span4 = blk.insts[bj4].Trace.span;
+                        break;
+                    }
+                }
+                call_sites.append(a, .{
+                    .dst_reg = lg.dst.int(),
+                    .name = lg.name,
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span4,
+                    .is_load_global = true,
+                }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4676\n", .{func.name}); return null; };
+                continue;
+            }
+            if (inst.* == .GetField) {
+                var covered = false;
+                for (field_pres.items) |fp3| {
+                    if (fp3.block == bid.int() and fp3.inst == i) covered = true;
+                }
+                if (!covered) {
+                    // By-name field read on a varying receiver: the handler
+                    // resolves the stored index on the live receiver per call
+                    // and boxes the value into the frame register; a getter
+                    // property or non-Instance receiver deopts (the read is
+                    // pure, so the interpreter re-runs it).
+                    if (field_resolver == null) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: field-host\n", .{func.name}); return null; }
+                    const tf = trampolinableFieldOf(module, inst) orelse { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: field-name\n", .{func.name}); return null; };
+                    if (tf.recv.int() >= n_regs or typeAt(types, tf.recv) != .object) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: field-recv\n", .{func.name}); return null; }
+                    if (tf.dst.int() >= n_regs or typeAt(types, tf.dst) != .object) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: field-dst\n", .{func.name}); return null; }
+                    var span5: ?ir.Span = null;
+                    var bj5: usize = i;
+                    while (bj5 > 0) {
+                        bj5 -= 1;
+                        if (blk.insts[bj5] == .Trace) {
+                            span5 = blk.insts[bj5].Trace.span;
+                            break;
+                        }
+                    }
+                    call_sites.append(a, .{
+                        .dst_reg = tf.dst.int(),
+                        .recv_reg = tf.recv.int(),
+                        .name = memberFieldName(tf.name),
+                        .block = bid,
+                        .inst = @intCast(i),
+                        .span = span5,
+                        .is_field = true,
+                        .field_named = true,
+                        .recv_varies = true,
+                        .has_result = true,
+                    }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4705\n", .{func.name}); return null; };
+                }
+                continue;
+            }
+            const kind: enum { member, virt } = if (trampolinableMemberOf(module, inst) != null) .member else if (trampolinableVirtualOf(inst) != null) .virt else continue;
+            // The receiver register must be object-typed: the handler reads
+            // its value from the FRAME, which holds every object def (handler
+            // deliveries, object moves, seeded params). An unknown-typed one
+            // has an unclassified def; a scalar one lives in a slot.
+            {
+                const rreg: Reg = if (kind == .member) trampolinableMemberOf(module, inst).?.recv else trampolinableVirtualOf(inst).?.recv;
+                if (rreg.int() >= n_regs or typeAt(types, rreg) != .object) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: recv-kind\n", .{func.name}); return null; }
+            }
+            const args_reg: u32 = if (kind == .member) trampolinableMemberOf(module, inst).?.args_reg else trampolinableVirtualOf(inst).?.args_reg;
+            const n_args: u32 = if (kind == .member) trampolinableMemberOf(module, inst).?.n_args else trampolinableVirtualOf(inst).?.n_args;
+            const dst: Reg = if (kind == .member) trampolinableMemberOf(module, inst).?.dst else trampolinableVirtualOf(inst).?.dst;
+            var k: u8 = 0;
+            while (k < n_args) : (k += 1) {
+                const ar = args_reg + k;
+                if (ar >= n_regs or !(isScalarRt(types[ar]) or types[ar] == .object or types[ar] == .null_)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4562\n", .{func.name}); return null; }
+            }
+            var span: ?ir.Span = null;
+            var bj: usize = i;
+            while (bj > 0) {
+                bj -= 1;
+                if (blk.insts[bj] == .Trace) {
+                    span = blk.insts[bj].Trace.span;
+                    break;
+                }
+            }
+            const has_result = dst.int() < n_regs and (isScalarRt(typeAt(types, dst)) or typeAt(types, dst) == .object);
+            if (kind == .member) {
+                const mc = trampolinableMemberOf(module, inst).?;
+                if (debugEnabled()) std.debug.print("[jit-dbg] fsite member {s}.{s} resolved={?} declared={s} recv_reg={d}\n", .{ func.name, mc.name, if (mc.resolved) |f2| f2.int() else null, mc.declared, mc.recv.int() });
+                call_sites.append(a, .{
+                    .func = @enumFromInt(0),
+                    .args_reg = args_reg,
+                    .n_args = n_args,
+                    .dst_reg = dst.int(),
+                    .has_result = has_result,
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span,
+                    .is_member = true,
+                    .recv_reg = mc.recv.int(),
+                    .name = mc.name,
+                    .resolved_member = mc.resolved,
+                    .declared_name = mc.declared,
+                    .recv_class = 0,
+                }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4591\n", .{func.name}); return null; };
+            } else {
+                const vc = trampolinableVirtualOf(inst).?;
+                call_sites.append(a, .{
+                    .func = @enumFromInt(0),
+                    .args_reg = args_reg,
+                    .n_args = n_args,
+                    .dst_reg = dst.int(),
+                    .has_result = has_result,
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span,
+                    .is_virtual = true,
+                    .virt_slot = vc.slot,
+                    .recv_reg = vc.recv.int(),
+                }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4606\n", .{func.name}); return null; };
+            }
+        }
+    }
+
+    // ESCAPE sites: one per instruction the scan marked; the callback runs
+    // the interpreter's own arm with a full scalar spill/unspill around it.
+    for (escape_pos.items) |ep| {
+        const blk = &func.blocks[ep.b];
+        var span3: ?ir.Span = null;
+        var bj: usize = ep.i;
+        while (bj > 0) {
+            bj -= 1;
+            if (blk.insts[bj] == .Trace) {
+                span3 = blk.insts[bj].Trace.span;
+                break;
+            }
+        }
+        call_sites.append(a, .{
+            .dst_reg = 0,
+            .block = BlockId.from(ep.b),
+            .inst = ep.i,
+            .span = span3,
+            .is_exec = true,
+            .exec_inst = &blk.insts[ep.i],
+        }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4631\n", .{func.name}); return null; };
+    }
+
+    // `this`-field sites: native memory accesses through the entry-seeded
+    // field-buffer pointer (the slot index is filled in below, after the
+    // layout is settled).
+    // Trampoline-density profitability: every non-native site is a host
+    // round-trip that costs about as much as the interpreted instruction it
+    // replaces, and a tiny body's native entry (slot setup, seeding, tag
+    // copy) costs more than its walk. Compile only when enough plain native
+    // instructions amortize the overhead; the measurement behind the
+    // thresholds is the compose replica, where the ungated tier ran a net
+    // ~3% SLOWER (KLIO_FJ_MINPROFIT=insts,K overrides for re-measurement).
+    {
+        var total_insts3: u32 = 0;
+        for (body) |bid3| total_insts3 += @intCast(func.blocks[bid3.int()].insts.len);
+        var min_insts: u32 = 8;
+        var site_k: u32 = 4;
+        if (runtime.envOnce("KLIO_FJ_MINPROFIT")) |raw| {
+            var it3 = std.mem.splitScalar(u8, raw, ',');
+            if (it3.next()) |x| min_insts = std.fmt.parseInt(u32, x, 10) catch min_insts;
+            if (it3.next()) |x| site_k = std.fmt.parseInt(u32, x, 10) catch site_k;
+        }
+        const tramp_sites: u32 = @intCast(call_sites.items.len);
+        if (tramp_sites != 0 and (total_insts3 < min_insts or tramp_sites * site_k > total_insts3)) {
+            if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: tramp-heavy ({d} sites / {d} insts)\n", .{ func.name, tramp_sites, total_insts3 });
+            return null;
+        }
+    }
+    const field_sites_base: usize = call_sites.items.len;
+    for (field_pres.items) |fp| {
+        var span2: ?ir.Span = null;
+        {
+            const blk = &func.blocks[fp.block];
+            var bj: usize = fp.inst;
+            while (bj > 0) {
+                bj -= 1;
+                if (blk.insts[bj] == .Trace) {
+                    span2 = blk.insts[bj].Trace.span;
+                    break;
+                }
+            }
+        }
+        call_sites.append(a, .{
+            .dst_reg = if (fp.is_set) 0 else fp.dst_or_src,
+            .src_reg = if (fp.is_set) fp.dst_or_src else 0,
+            .has_result = !fp.is_set,
+            .block = BlockId.from(fp.block),
+            .inst = fp.inst,
+            .span = span2,
+            .is_field = !fp.is_set,
+            .is_field_set = fp.is_set,
+            .native = true,
+            .field_idx = fp.idx,
+            .tag = fp.tag,
+            .nn = fp.nn,
+        }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4664\n", .{func.name}); return null; };
+    }
+
+    // Deopt-freedom: no tramp calls (the sites before `field_sites_base` are
+    // exactly the trampolined Calls), no division, every read NN-proven.
+    var all_reads_nn = true;
+    for (field_pres.items) |fp| {
+        if (!fp.is_set and !fp.nn) all_reads_nn = false;
+    }
+    const can_deopt = !(is_method and field_sites_base == 0 and !has_div and all_reads_nn);
 
     const has_calls = call_sites.items.len != 0;
     const param_slot_base: u32 = n_regs;
@@ -4109,8 +5006,11 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     const uc_slot: u32 = after_params;
     const tramp_slot: u32 = after_params + 1;
     const calls_base: u32 = after_params + (if (has_calls) @as(u32, 2) else 0);
-    const result_slot: u32 = calls_base;
-    const n_slots: u32 = calls_base + 1;
+    const fbase_slot: u32 = calls_base;
+    const result_slot: u32 = calls_base + (if (is_method) @as(u32, 1) else 0);
+    const result_reg_slot: u32 = result_slot + 1;
+    const n_slots: u32 = result_reg_slot + 1;
+    for (call_sites.items[field_sites_base..]) |*site| site.fbase_slot = fbase_slot;
 
     var c = Compiler{
         .a = a,
@@ -4131,9 +5031,11 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .val_payload_off = valuePayloadOffset(),
         .val_tag_off = valueTagOffset(),
         .func_mode = true,
+        .method_mode = is_method,
         .param_slot_base = param_slot_base,
         .n_params = n_params,
         .result_slot = result_slot,
+        .result_reg_slot = result_reg_slot,
         .em = jit.Emitter.init(a),
         .block_label = try a.alloc(?jit.Label, func.blocks.len),
         .exit_targets = .empty,
@@ -4150,23 +5052,59 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     defer c.deopt_labels.deinit(a);
     @memset(c.block_label, null);
 
-    for (body) |bid| c.block_label[bid.int()] = c.em.newLabel() catch return null;
-    c.epilogue = c.em.newLabel() catch return null;
+    for (body) |bid| c.block_label[bid.int()] = c.em.newLabel() catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4725\n", .{func.name}); return null; };
+    c.epilogue = c.em.newLabel() catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4726\n", .{func.name}); return null; };
 
     c.run() catch |e| {
         if (debugEnabled()) std.debug.print("[jit]   bail: func codegen {s} in {s}\n", .{ @errorName(e), func.name });
-        return null;
+        { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4730\n", .{func.name}); return null; }
     };
 
-    const exec = jit.finalize(c.em.code()) catch return null;
-    const sites_owned = call_sites.toOwnedSlice(a) catch return null;
+    const exec = jit.finalize(c.em.code()) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4733\n", .{func.name}); return null; };
+    const sites_owned = call_sites.toOwnedSlice(a) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4734\n", .{func.name}); return null; };
     // Function mode restricts returns/params to exact `Int`-boxing kinds (see
     // `exact_ret`), so the default `Int` tag is correct for every register.
     const fn_tags = a.alloc(u8, n_regs) catch {
         a.free(sites_owned);
-        return null;
+        { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4739\n", .{func.name}); return null; }
     };
     @memset(fn_tags, INT_TAG);
+    const obj_loads_owned: []ObjParamLoad = if (obj_loads.len != 0)
+        (a.dupe(ObjParamLoad, obj_loads) catch return null)
+    else
+        &.{};
+    const cap_loads_owned: []ObjParamLoad = if (cap_loads.len != 0)
+        (a.dupe(ObjParamLoad, cap_loads) catch return null)
+    else
+        &.{};
+    const method_fields_owned: []MethodFieldCheck = blk: {
+        if (field_pres.items.len == 0) break :blk &.{};
+        const out2 = a.alloc(MethodFieldCheck, field_pres.items.len) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4748\n", .{func.name}); return null; };
+        for (field_pres.items, out2) |fp, *o| o.* = .{ .idx = fp.idx, .name = fp.name };
+        break :blk out2;
+    };
+    // Re-verify every (index, name) pair and read the layout id under ONE
+    // borrow: an entry matching this shape at run time provably has each
+    // name at its index, so the per-entry loop is skipped.
+    var guard_shape: u64 = 0;
+    if (is_method and method_fields_owned.len != 0) {
+        const gsh = params[0].Instance.borrow();
+        defer gsh.deinit();
+        const bsh = gsh.get();
+        var all_ok = true;
+        for (method_fields_owned) |mf| {
+            if (mf.idx >= bsh.fields.items.len or
+                !(bsh.fields.items[mf.idx].name.ptr == mf.name.ptr or std.mem.eql(u8, bsh.fields.items[mf.idx].name, mf.name)))
+            {
+                all_ok = false;
+                break;
+            }
+        }
+        if (all_ok) {
+            const sp = bsh.shapeOf();
+            if (sp > 1) guard_shape = sp;
+        }
+    }
     ok = true;
     return CompiledLoop{
         .exec = exec,
@@ -4189,6 +5127,18 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .result_slot = result_slot,
         .result_rt = result_rt,
         .param_rt = param_rt,
+        .method_mode = is_method,
+        .guard_class = if (is_method) instanceClassIdentity(params[0]) else 0,
+        .entry_fbase_slot = fbase_slot,
+        .no_native_recurse = is_method,
+        .can_deopt = can_deopt,
+        .has_tramp_sites = field_sites_base != 0,
+        .obj_param_loads = obj_loads_owned,
+        .capture_loads = cap_loads_owned,
+        .method_fields = method_fields_owned,
+        .guard_shape = guard_shape,
+        .result_reg_slot = result_reg_slot,
+        .self_dbg_name = func.name,
         .allocator = a,
     };
 }
@@ -4206,14 +5156,48 @@ pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, 
     // / trampoline slots are seeded explicitly below. (The zero fill was
     // 70%+ of a native fib's per-call cost.)
     @memcpy(tags[0..self.n_regs], self.box_tags[0..self.n_regs]);
+    // Method mode: the receiver must be an Instance of exactly the class the
+    // body was specialized on (its stored-field indexes and kinds are that
+    // class's); anything else declines to the interpreter. The field-buffer
+    // pointer is stable for the run — the body never adds fields, and the
+    // buffer does not move (same contract as the loop tier's field bases).
+    if (self.method_mode) {
+        if (params.len == 0 or params[0] != .Instance) {
+            if (debugEnabled()) std.debug.print("[jit-dbg] method run: recv not instance (len={d} tag={s})\n", .{ params.len, if (params.len > 0) @tagName(std.meta.activeTag(params[0])) else "none" });
+            return null;
+        }
+        if (instanceClassIdentity(params[0]) != self.guard_class) {
+            if (debugEnabled()) std.debug.print("[jit-dbg] method run: class {x} != guard {x}\n", .{ instanceClassIdentity(params[0]), self.guard_class });
+            return null;
+        }
+        const g = params[0].Instance.borrow();
+        const bthis = g.get();
+        const items = bthis.fields.items;
+        // A layout match proves every (index, name) pair at once; a drifted
+        // or unshaped receiver pays the per-entry loop.
+        if (self.guard_shape == 0 or bthis.shapeOf() != self.guard_shape) {
+            for (self.method_fields) |mf| {
+                if (mf.idx >= items.len or !(items[mf.idx].name.ptr == mf.name.ptr or std.mem.eql(u8, items[mf.idx].name, mf.name))) {
+                    g.deinit();
+                    return null;
+                }
+            }
+        }
+        slots[self.entry_fbase_slot] = @bitCast(@intFromPtr(items.ptr));
+        g.deinit();
+    }
     var i: u32 = 0;
     while (i < self.n_params) : (i += 1) {
         if (i >= params.len) return null;
-        const sv = cellSlotIn(self.param_rt[i], params[i]) orelse return null; // kind changed: interpret
+        if (self.param_rt[i] == .object) continue; // seeded into a frame register
+        const sv = cellSlotIn(self.param_rt[i], params[i]) orelse {
+            if (self.method_mode and debugEnabled()) std.debug.print("[jit-dbg] method run: param {d} kind {s} rt {s}\n", .{ i, @tagName(std.meta.activeTag(params[i])), @tagName(self.param_rt[i]) });
+            return null; // kind changed: interpret
+        };
         slots[self.param_slot_base + i] = sv;
     }
     var tctx: TrampCtx = undefined;
-    if (self.call_sites.len != 0) {
+    if (self.call_sites.len != 0 and self.has_tramp_sites) {
         if (tramp == null or user == null) return null;
         tctx = .{ .slots = slots.ptr, .compiled = self, .user = user.?, .tags = tags.ptr };
         slots[self.uc_slot] = @bitCast(@intFromPtr(&tctx));
@@ -4224,12 +5208,27 @@ pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, 
     const target = BlockId.from(@intCast(code >> 32));
     const inst: u32 = @truncate(code & 0xffff_ffff);
     if (inst == RETURN_INST) {
+        // Frame-resident return (object / escape-typed): the taken `Return`
+        // recorded its register index; the handlers left the real value in
+        // that frame register. Hand it back owned (retain — the frame keeps
+        // its own reference until teardown).
+        const frame_reg = slots[self.result_reg_slot];
+        if (frame_reg >= 0) {
+            const rr: u64 = @intCast(frame_reg);
+            if (rr < regs.len) {
+                const v = regs[rr];
+                v.retain();
+                return .{ .code = .{ .block = target, .inst = inst }, .value = v };
+            }
+            return .{ .code = .{ .block = target, .inst = inst }, .value = .Unit };
+        }
         return .{ .code = .{ .block = target, .inst = inst }, .value = valueFromSlot(self.result_rt, slots[self.result_slot]) };
     }
     // Deopt / throw: rebox written scalar registers so the interpreter resumes.
+    const skip_reg: u32 = if (self.call_sites.len != 0 and self.has_tramp_sites) tctx.deopt_skip_reg else std.math.maxInt(u32);
     var r: u32 = 0;
     while (r < self.n_regs) : (r += 1) {
-        if (!self.def_set[r] or r >= regs.len) continue;
+        if (!self.def_set[r] or r >= regs.len or r == skip_reg) continue;
         switch (self.reg_types[r]) {
             .i32, .i64, .f64, .f32, .boolean => regs[r] = valueFromSlot(self.reg_types[r], slots[r]),
             else => {},
@@ -4247,16 +5246,103 @@ inline fn regsGrowAlloc(fallback: Allocator) Allocator {
     return fallback;
 }
 
-pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), params: []const Value, allocator: Allocator, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?FuncOutcome {
+/// Fused-walker tier-up handshake: a fully-fusable body never opens a frame,
+/// so the function tier's entry hook would never even count it — the walker
+/// starved the JIT. The walker asks here per activation; once the body runs
+/// hot it yields (runs framed) so the function tier can count, compile, and
+/// take over; a body the tier tried and declined keeps fusing.
+/// Recursive-seam method tier. A member-dispatched body reaches neither the
+/// framed entry hook (flat/member dispatch bypasses it) nor — when fusable —
+/// any frame at all, so the seam itself counts and runs it. Only a DEOPT-FREE
+/// method body (`can_deopt == false`) is served here: RETURN is its only
+/// possible outcome, so no frame, no trampoline, and no resume machinery
+/// exists to need.
+pub const SeamProbe = union(enum) { run: *const CompiledLoop, compile, no };
+
+/// Non-counting peek: the already-compiled deopt-free method body for
+/// `func`, if any. The flat driver consults this per request; counting and
+/// compiling stay on the recursive seam.
+pub fn methodSeamPeek(func: *const Func) ?*const CompiledLoop {
     if (!funcEnabled()) return null;
+    if (probeWord(func).load(.monotonic) & PROBE_COMPILED == 0) return null;
+    const fj = (states.get(@intFromPtr(func))) orelse return null;
+    if (func.blocks.len == 0 or fj.blocks_fp != @intFromPtr(func.blocks.ptr)) return null;
+    if (fj.func_jit) |*cl| {
+        if (cl.method_mode and !cl.can_deopt) return cl;
+    }
+    return null;
+}
+
+pub fn methodSeamProbe(func: *const Func) SeamProbe {
+    if (!funcEnabled()) return .no;
+    const pr = probeWord(func).load(.monotonic);
+    if (pr & PROBE_DECLINED != 0) return .no;
+    if (pr & PROBE_COMPILED != 0) {
+        const fj = forFunc(func) orelse return .no;
+        if (fj.func_jit) |*cl| {
+            if (cl.method_mode and !cl.can_deopt) return .{ .run = cl };
+            return .no;
+        }
+        // Another thread compiled; this one still needs its own copy.
+        if (fj.func_tried) return .no;
+        return .compile;
+    }
+    if (probeCount(func)) return .compile;
+    return .no;
+}
+
+/// One-shot compile for a seam-probed body (`.compile`). Marks the state
+/// tried either way, exactly like `maybeRunHotFunc`'s trigger.
+pub fn methodSeamCompile(module: *const Module, func: *const Func, params: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, user: ?*anyopaque) void {
+    // A lambda's captures are not in hand here; leave it untried so the
+    // framed/flat hooks (which have the activation's capture vector) compile it.
+    if (func.is_lambda) return;
+    const fj = forFunc(func) orelse return;
+    if (fj.func_tried) return;
+    fj.func_tried = true;
+    const compiled = tryCompileFunc(metadata_allocator, module, func, params, &.{}, resolver, virt_resolver, field_resolver, field_nn_resolver, user) catch null;
+    if (compiled) |cl| {
+        if (debugEnabled()) std.debug.print("[jit] compiled method {s} (fqn={s} mfields={d} sites={d} guard={x} deopt-free={})\n", .{ func.name, func.fqn, cl.method_fields.len, cl.call_sites.len, cl.guard_class, !cl.can_deopt });
+        fj.func_jit = cl;
+        noteCompiled();
+        _ = probeWord(func).fetchOr(PROBE_COMPILED, .monotonic);
+    } else {
+        if (debugEnabled()) std.debug.print("[jit]   method-tier declined {s}\n", .{func.name});
+        _ = probeWord(func).fetchOr(PROBE_DECLINED, .monotonic);
+    }
+}
+
+pub fn fusedShouldYieldToFuncTier(func: *const Func) bool {
+    if (!funcEnabled()) return false;
+    const pr = probeWord(func).load(.monotonic);
+    if (pr & PROBE_DECLINED != 0) return false;
+    if (pr & PROBE_COMPILED != 0) return true;
+    return probeCount(func);
+}
+
+pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), params: []const Value, captures: []const Value, allocator: Allocator, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?FuncOutcome {
+    if (!funcEnabled()) return null;
+    // Shared probe first: a declined body costs one atomic load per
+    // activation, a cold one an atomic add — never the state-map walk.
+    const pr = probeWord(func).load(.monotonic);
+    if (pr & PROBE_DECLINED != 0) return null;
+    if (pr & PROBE_COMPILED == 0) {
+        if (!probeCount(func)) return null;
+    }
     const fj = forFunc(func) orelse return null;
     if (!fj.func_tried) {
-        fj.func_count += 1;
-        if (fj.func_count < HOT_THRESHOLD) return null;
         fj.func_tried = true;
-        const compiled = tryCompileFunc(metadata_allocator, module, func, params, resolver, virt_resolver, field_resolver, field_nn_resolver, user) catch null;
-        if (compiled == null) return null;
-        if (debugEnabled()) std.debug.print("[jit] compiled function {s} n_slots={d} n_regs={d}\n", .{ func.name, compiled.?.n_slots, compiled.?.n_regs });
+        const compiled = tryCompileFunc(metadata_allocator, module, func, params, captures, resolver, virt_resolver, field_resolver, field_nn_resolver, user) catch |e| blk: {
+            if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: ERR {s}\n", .{ func.name, @errorName(e) });
+            break :blk null;
+        };
+        if (compiled == null) {
+            if (debugEnabled()) std.debug.print("[jit]   func-tier declined {s}\n", .{func.name});
+            _ = probeWord(func).fetchOr(PROBE_DECLINED, .monotonic);
+            return null;
+        }
+        _ = probeWord(func).fetchOr(PROBE_COMPILED, .monotonic);
+        if (debugEnabled()) std.debug.print("[jit] compiled function {s} (fqn={s} p0={s} mfields={d} sites={d} method={} guard={x}) n_slots={d} n_regs={d}\n", .{ func.name, func.fqn, if (func.params.len > 0) func.params[0].name else "-", compiled.?.method_fields.len, compiled.?.call_sites.len, compiled.?.method_mode, compiled.?.guard_class, compiled.?.n_slots, compiled.?.n_regs });
         fj.func_jit = compiled;
         noteCompiled();
     }
@@ -4265,6 +5351,20 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
     if (params.len < cl.n_params) return null;
     if (regs.items.len < cl.n_regs) {
         regs.appendNTimes(regsGrowAlloc(allocator), .Unit, cl.n_regs - regs.items.len) catch return null;
+    }
+    for (cl.obj_param_loads) |opl| {
+        if (opl.param_idx >= params.len or opl.reg >= regs.items.len) return null;
+        // The body was specialized on an Instance here (member dispatch,
+        // field routes); any other kind — an unboxed value-class receiver,
+        // a null — declines to the interpreter before anything runs.
+        if (params[opl.param_idx] != .Instance) return null;
+        regs.items[opl.reg] = params[opl.param_idx];
+    }
+    for (cl.capture_loads) |cpl| {
+        if (cpl.param_idx >= captures.len or cpl.reg >= regs.items.len) return null;
+        // Borrowed, like the object params: the activation's capture vector
+        // owns the value for the run.
+        regs.items[cpl.reg] = captures[cpl.param_idx];
     }
     var stack_slots: [128]i64 = undefined;
     var heap_slots: ?[]i64 = null;
