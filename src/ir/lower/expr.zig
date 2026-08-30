@@ -106,6 +106,9 @@ fn resolveThisRegKind(b: *FuncBuilder, in_lambda_body: bool, bind_local: bool) A
     if (b.knowsOuter("this") or (in_lambda_body and b.capturesThisSlot())) {
         const dst = try b.loadCaptureHoisted("this");
         if (bind_local) try b.bind("this", dst);
+        if (runtime.envOnce("KLIO_THIS_TRACE") != null) {
+            std.debug.print("[this-recover] bind={} reg={d} depth={d} in={s}\n", .{ bind_local, dst.int(), b.scopeDepth(), build.currentRealFn() orelse "-" });
+        }
         return dst;
     }
     return null;
@@ -2446,7 +2449,17 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // the declaring one, the field read on it is the answer.
             const receiver_is_owner = blk: {
                 if (!enclosing_only_member) break :blk false;
-                const rh = b.spliceRecvTy() orelse b.recvTy() orelse break :blk false;
+                // The splice head may only vouch for the resolved `this`
+                // when the window actually BOUND it (splice_recv_from_window)
+                // — a bare member-inline splice binds nothing, so the ambient
+                // `this` is whatever the enclosing lambda holds (a suspend
+                // lambda's dispatch coroutine), and pinning a field read on
+                // it with the OWNER's head read `job` off the runBlocking
+                // coroutine instead of the enclosing class.
+                const rh = (if (b.lambda_splice_resolve == null or b.splice_recv_from_window)
+                    b.spliceRecvTy()
+                else
+                    null) orelse b.recvTy() orelse break :blk false;
                 const decl_owner = sgetterOwner(b, name0) orelse break :blk false;
                 const rhh = typeHead(std.mem.trimEnd(u8, rh, "?"));
                 if (rhh.len == 0) break :blk false;
@@ -5837,6 +5850,31 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // stays an `it`-lambda and its bare member calls fall through to globals.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const cnm = callee.Path.segments[0].name;
+        // A bare call to an OWN MEMBER resolves to the member, not any
+        // same-named top-level fn — and the member is absent from
+        // func_name_index, so without this branch no arity is ever
+        // recorded and a `() -> Unit` trailing lambda keeps a phantom
+        // `it` that shadows the enclosing lambda's (`mrun { println(it) }`
+        // printed null). The registered member AST, keyed by (owner,
+        // name, arity), is the signature source; positional args only.
+        if (b.ownerClass() != null and b.hasOwnMember(cnm)) {
+            var any_named = false;
+            for (ast_arg_names) |n| {
+                if (n != null) any_named = true;
+            }
+            if (!any_named) {
+                if (inline_state.exprBodyMemberAst(b.ownerClass().?, cnm, args.len)) |mf| {
+                    for (args, 0..) |*a, i| {
+                        if (a.* != .Lambda and a.* != .AnonFun) continue;
+                        if (i >= mf.params.len) continue;
+                        const pt = &mf.params[i].ty;
+                        if (pt.function) |ft| {
+                            b.recordLambdaArgArity(a.span(), @intCast(ft.params.len));
+                        }
+                    }
+                }
+            }
+        }
         // Only when the callee name is UNAMBIGUOUS (a single same-named
         // function): the arity then definitely matches the resolved overload.
         // With overloads, `funcId` is a heuristic that may name the wrong one,
@@ -9672,6 +9710,14 @@ fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Functio
         // proofs read off the CALL; the splice would replace the call
         // with its body (`emptyList()`) and drop it. Keep those framed.
         if (has_explicit_type_args and !anyReified(f.type_params)) break :blk false;
+        // The splice stands in for OVERLOAD RESOLUTION, so it may only
+        // engage when resolution is trivial — a lone candidate under the
+        // name. Committing by name+inline picked the sole INLINE overload
+        // over its non-inline siblings: `plusAssign(element: E)` swallowed
+        // `plusAssign(elements: List<E>)` inside MutableObjectList.addAll
+        // (an unbounded E accepts the List, and the runtime rank that
+        // prefers the List form never ran).
+        if (b.module.funcsBySimpleName(nm).len != 1) break :blk false;
         for (f.params) |*p| {
             if (p.is_vararg) break :blk false;
         }
@@ -12139,7 +12185,7 @@ fn memoAlloc() std.mem.Allocator {
 }
 
 fn tyMemoOn() bool {
-    return !std.mem.eql(u8, runtime.envOnce("KLIO_TY_MEMO") orelse "1", "0");
+    return true;
 }
 
 pub const TyMemoHit = struct { ty: ?ir.TypeRef };

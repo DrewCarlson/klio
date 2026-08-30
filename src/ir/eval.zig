@@ -10961,6 +10961,18 @@ pub const NullHost = struct {
         const msg = try std.fmt.allocPrint(allocator, "no member `{s}`", .{name});
         return errResult(.{ .Unimplemented = msg });
     }
+    pub fn getMemberFieldNoExt(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
+        _ = self;
+        // Strict probe contract: a miss is an error, never a spurious
+        // `Null`/`Unit` value, so the walk's candidate order stays honest.
+        if (receiver.* == .Instance) {
+            const g = receiver.Instance.borrow();
+            defer g.deinit();
+            if (g.get().get(name)) |v| return ok(v);
+        }
+        const msg = try std.fmt.allocPrint(allocator, "no member `{s}`", .{name});
+        return errResult(.{ .Unimplemented = msg });
+    }
 
     pub fn getField(self: *NullHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
         _ = self;

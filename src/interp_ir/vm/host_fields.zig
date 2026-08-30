@@ -115,7 +115,7 @@ fn withFieldResolvePair(
     // capacity-retaining at run boundaries; a per-run-arena backing would
     // leave the retained capacity dangling once that arena is torn down).
     field_resolve_stack.append(std.heap.page_allocator, .{ .id = id, .name = name }) catch {};
-    const r = try getFieldInner(self, allocator, receiver, name, suppress_cc_redirect, member_probe);
+    const r = try getFieldInner(self, allocator, receiver, name, suppress_cc_redirect, member_probe, false);
     var i: usize = field_resolve_stack.items.len;
     while (i > 0) {
         i -= 1;
@@ -341,7 +341,7 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
 // -------------------------------------------------------------------------
 
 pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    return lexicalReceiverFallback(self, allocator, receiver, name, unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, false)));
+    return lexicalReceiverFallback(self, allocator, receiver, name, unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, false, false)));
 }
 
 /// A boxed capture (an anon-object method's captured outer `var` stored
@@ -426,7 +426,16 @@ fn freeMissErr(allocator: Allocator, e: EvalError) void {
 threadlocal var anon_recv_depth: usize = 0;
 
 pub fn getMemberField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
-    return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, true));
+    return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, true, false));
+}
+
+/// `getMemberField` with IMPORTED extension properties suppressed: the
+/// implicit-receiver walk's first pass, so an outer receiver's MEMBER wins
+/// over an inner receiver's imported extension (Kotlin resolves by lexical
+/// scope — a class member outranks an import). The walk retries with the
+/// plain form when no member answers anywhere.
+pub fn getMemberFieldNoExt(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
+    return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, true, true));
 }
 
 pub const FieldSiteClaim = struct { cls: u64, route: u64 };
@@ -792,7 +801,7 @@ fn fillCompanionReadMemo(cls: ObjRef(ClassDef), v: Value) void {
     d.companion_read_state.store(2, .release);
 }
 
-fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, suppress_cc_redirect: bool, member_probe: bool) Allocator.Error!EvalResult {
+fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, suppress_cc_redirect: bool, member_probe: bool, suppress_ext: bool) Allocator.Error!EvalResult {
     // Static-type-directed extension-property read. The lowerer emits this
     // marker when a read's STATIC receiver type resolves `name` to an in-scope
     // member-extension property rather than a member: Kotlin runs that getter,
@@ -802,14 +811,14 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     if (std.mem.startsWith(u8, name, "$extread$")) {
         const prop = name["$extread$".len..];
         if (try extensionPropRead(self, allocator, receiver, prop)) |v| return v;
-        return getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
+        return getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe, suppress_ext);
     }
     // A property of a `by`-delegated interface the class does not override is
     // the delegate's, even when the interface declares a default getter. The
     // ladder below would find that default first and answer with it.
     if (receiver.* == .Instance) {
         if (host_call_member.interfaceDelegateFor(self, allocator, receiver.Instance, name)) |d| {
-            switch (try getFieldInner(self, allocator, &d, name, suppress_cc_redirect, member_probe)) {
+            switch (try getFieldInner(self, allocator, &d, name, suppress_cc_redirect, member_probe, suppress_ext)) {
                 .ok => |v| if (v != .Unit) return ok(v),
                 .err => |e| if (e == .Unimplemented) freeFieldMiss(allocator, e) else return .{ .err = e },
             }
@@ -1091,7 +1100,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // Explicit `recv.coroutineContext` (lowered to this sentinel):
     // bypass the bare-`coroutineContext` redirect for this one read.
     if (std.mem.eql(u8, name, "$coroutineContext$explicit")) {
-        return getFieldInner(self, allocator, receiver, "coroutineContext", true, member_probe);
+        return getFieldInner(self, allocator, receiver, "coroutineContext", true, member_probe, suppress_ext);
     }
     // Scope-qualified property read (`$sgetter$<owner>\u{1f}<name>`): a bare
     // property read inside a method. Kotlin dispatches this virtually — an
@@ -1227,7 +1236,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                             std.debug.print("[sgw] cn={s} stored={} foreign_priv={}\n", .{ cn, stored_here, stored_foreign_private });
                     }
                     if (stored_here and !stored_foreign_private) {
-                        const r = try getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
+                        const r = try getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe, suppress_ext);
                         if (r == .ok and sgetterMemoSafe(self, className(receiver.Instance), rest, owner, prop)) {
                             sgetterCopyMemo(self, receiver, prop, name);
                         }
@@ -1333,7 +1342,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 }
             }
             {
-                const r = try getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe);
+                const r = try getFieldInner(self, allocator, receiver, prop, suppress_cc_redirect, member_probe, suppress_ext);
                 // Memoizable only when no lexical-owner getter exists at all
                 // (then both execution modes fall through to this recursion)
                 // and the class-static gates hold.
@@ -1375,10 +1384,10 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 // prefer a scope-owned `coroutineContext` and fall back to its
                 // `context`; the empty context is the last resort.
                 if (vmhost.host_call_member.hostHasProperty(self, &scope, "coroutineContext")) {
-                    return getFieldInner(self, allocator, &scope, "coroutineContext", suppress_cc_redirect, member_probe);
+                    return getFieldInner(self, allocator, &scope, "coroutineContext", suppress_cc_redirect, member_probe, suppress_ext);
                 }
                 if (vmhost.host_call_member.hostHasProperty(self, &scope, "context")) {
-                    return getFieldInner(self, allocator, &scope, "context", suppress_cc_redirect, member_probe);
+                    return getFieldInner(self, allocator, &scope, "context", suppress_cc_redirect, member_probe, suppress_ext);
                 }
                 switch (try host_globals.ensureObjectSingleton(self, "EmptyCoroutineContext")) {
                     .ok => |maybe| if (maybe) |v| return ok(v),
@@ -1595,7 +1604,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         break :blk found;
     };
     // Top-level / supertype / Any extension property.
-    if (!member_getter_shadows) {
+    if (!member_getter_shadows and !suppress_ext) {
         // For a class-value receiver (`X.name`), a `val X.Companion.name`
         // extension registers under `X`'s simple name; the getter `this`
         // is `X`'s companion instance, not the class value.
@@ -1610,6 +1619,12 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         };
         const ext_fid = try resolveExtensionProp(self, allocator, receiver, recv_simple, name);
         if (ext_fid) |fid| {
+            if (runtime.envOnce("KLIO_MISS_TRACE")) |w| {
+                if (std.mem.eql(u8, w, name)) {
+                    std.debug.print("[extprop-serve] {s} recv={s} fid={d} member_probe={} suppress_ext={}\n", .{ name, recv_simple, fid.int(), member_probe, suppress_ext });
+                    ir.eval.dumpFrameChainForDiagAlways();
+                }
+            }
             const mptr: *const Module = self.module.asPtr();
             if (fid.int() >= mptr.funcCount()) {
                 const msg = try std.fmt.allocPrint(allocator, "extension prop FuncId {d} out of range", .{fid.int()});
@@ -1868,7 +1883,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             }
         }
         for (delegates.items) |d| {
-            switch (try getFieldInner(self, allocator, &d, name, suppress_cc_redirect, member_probe)) {
+            switch (try getFieldInner(self, allocator, &d, name, suppress_cc_redirect, member_probe, suppress_ext)) {
                 .ok => |v| if (v != .Unit) return ok(v),
                 // Only the dispatch-miss sentinel means "no such member";
                 // a real throw from the delegate's accessor must propagate.
@@ -1968,7 +1983,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 };
                 if (singleton) |s| {
                     if (s == .Instance) {
-                        switch (try getFieldInner(self, allocator, &s, name, suppress_cc_redirect, member_probe)) {
+                        switch (try getFieldInner(self, allocator, &s, name, suppress_cc_redirect, member_probe, suppress_ext)) {
                             .ok => |v| if (v != .Unit) return ok(v),
                             .err => |e| freeFieldMiss(allocator, e),
                         }
@@ -2078,7 +2093,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         };
         while (cur) |o| {
             if (o == .Null or o == .Unit) break;
-            switch (try getFieldInner(self, allocator, &o, name, suppress_cc_redirect, member_probe)) {
+            switch (try getFieldInner(self, allocator, &o, name, suppress_cc_redirect, member_probe, suppress_ext)) {
                 .ok => |v| if (v != .Unit) return ok(v),
                 // Only the dispatch-miss sentinel is a walkable miss; a
                 // throw from an accessor that RAN (SubList.size's
@@ -2123,7 +2138,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 if (comp) |c| {
                     const same = c == .Instance and ObjRef(InstanceData).ptrEq(c.Instance, receiver.Instance);
                     if (!same) {
-                        switch (try getFieldInner(self, allocator, &c, name, suppress_cc_redirect, member_probe)) {
+                        switch (try getFieldInner(self, allocator, &c, name, suppress_cc_redirect, member_probe, suppress_ext)) {
                             .ok => |v| return ok(v),
                             .err => |e| freeFieldMiss(allocator, e),
                         }
@@ -2162,7 +2177,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // plugin fills in; `descriptor` is one of the properties it generates.
     if (try host_call_member.serializerForClassTarget(self, allocator, receiver)) |ser| {
         defer ser.release(allocator);
-        const forwarded = try getFieldInner(self, allocator, &ser, name, suppress_cc_redirect, member_probe);
+        const forwarded = try getFieldInner(self, allocator, &ser, name, suppress_cc_redirect, member_probe, suppress_ext);
         switch (forwarded) {
             .ok => return forwarded,
             .err => |e| freeFieldMiss(allocator, e),

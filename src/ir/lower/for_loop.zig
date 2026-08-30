@@ -26,17 +26,9 @@ pub fn lowerFor(
     return lowerForLabeled(b, vars, iter, body, null);
 }
 
-var counted_checked: bool = false;
-var counted_on: bool = true;
 
 fn countedEnabled() bool {
-    if (!counted_checked) {
-        counted_checked = true;
-        if (std.c.getenv("KLIO_COUNTED")) |v| {
-            counted_on = !std.mem.eql(u8, std.mem.span(v), "0");
-        }
-    }
-    return counted_on;
+    return true;
 }
 
 pub fn lowerForLabeled(

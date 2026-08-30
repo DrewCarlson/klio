@@ -1596,6 +1596,9 @@ pub const FuncBuilder = struct {
 
     /// Bind a name in the current scope.
     pub fn bind(self: *FuncBuilder, name: []const u8, reg: Reg) Allocator.Error!void {
+        if (std.c.getenv("KLIO_THIS_TRACE") != null and std.mem.eql(u8, name, "this")) {
+            std.debug.print("[bind-this] reg={d} depth={d}\n", .{ reg.int(), self.scopes.items.len });
+        }
         try self.scopes.items[self.scopes.items.len - 1].put(name, reg);
     }
 

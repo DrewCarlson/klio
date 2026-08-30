@@ -544,13 +544,6 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
     // runs. This is the only compose path. The oracle spans this module's decls
     // plus the baked base (pack composables the user calls, e.g. `Text`).
     {
-        // A/B gate for the skip emission (pace/correctness bisection).
-        if (runtime.envOnce("KLIO_COMPOSE_SKIP")) |v| {
-            compose_pass.emit_skip_calculus = v.len != 0 and !std.mem.eql(u8, v, "0");
-        }
-        if (runtime.envOnce("KLIO_COMPOSE_MEMO")) |v| {
-            compose_pass.emit_lambda_memo = v.len != 0 and !std.mem.eql(u8, v, "0");
-        }
         var names = try compose_pass.collectComposableNames(allocator, decls.items);
         defer names.deinit();
         var sinks = try compose_pass.collectComposableLambdaSinks(allocator, decls.items);

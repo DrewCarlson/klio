@@ -40,8 +40,7 @@ const Decl = ast.Decl;
 
 const dbg_lambda = false;
 
-/// Composable-lambda memoization emission (KLIO_COMPOSE_MEMO=0 disables,
-/// an A/B bisection switch like KLIO_COMPOSE_SKIP). ON by default: kotlinc
+/// Composable-lambda memoization emission. Always on: kotlinc
 /// always wraps composable lambda arguments in remembered
 /// `composableLambda` instances — without it an unchanged content lambda
 /// is a fresh closure every recomposition, `composer.changed(content)` is
@@ -59,7 +58,7 @@ pub const changed_param = "$changed";
 /// The skip-calculus accumulator local (`var $dirty = $changed and 1`).
 pub const dirty_local = "$dirty";
 /// Whether restartable composables emit the skip calculus (probes + skip
-/// branch). The integration point sets this from `KLIO_COMPOSE_SKIP=0` so a
+/// branch). Always on; a
 /// pace or correctness question can A/B the emission without a rebuild; the
 /// pass itself stays free of environment access (ast+span only).
 pub var emit_skip_calculus: bool = true;
