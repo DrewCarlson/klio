@@ -3,7 +3,7 @@
 
 Runs each test class as its own `klio-harness test <all sources> --filter=<Class>`
 child in the same environment the compose_plugin_commontest itest uses
-(HOME-scoped data home, KLIO_COMPOSE_PLUGIN=1, capped coroutine-test timeout,
+(HOME-scoped data home, capped coroutine-test timeout,
 per-test wall cap), and prints a per-class pass/fail summary plus a census of
 failure signatures. This is the measurement loop for compose stability: a
 one-class check is ~1 min, the full fleet ~10-15 min at 4 jobs, against the
@@ -93,7 +93,6 @@ def main():
     env = {
         **os.environ,
         "HOME": args.home,
-        "KLIO_COMPOSE_PLUGIN": "1",
         "kotlinx_coroutines_test_default_timeout": "10s",
         "KLIO_TEST_WALL_CAP": "90",
         # Bound each child's dispatcher pool: a concurrent-test class

@@ -1747,17 +1747,6 @@ fn discardArgs(allocator: Allocator, packed_args: std.ArrayList(Value)) void {
     list.deinit(allocator);
 }
 
-/// Run `f`'s body, bracketing a `@Composable` call with the current composer's
-/// group: `startGroup(key)` opens the positional group; `shouldRunGroup()`
-/// decides whether to (re)compose it — a group that was composed before and is
-/// not on an invalidated path is skipped (its slots/children reused, body not
-/// run), which is how a sibling that did not read the changed state avoids
-/// re-running. Plain calls, or a `@Composable` invoked with no active composer
-/// (e.g. directly from `main`), run the body unwrapped.
-/// The `@Composable` lowering plugin + upstream engine runtime is the only
-/// compose path; there is no implicit-composer fallback to switch to, so this
-/// is unconditionally true. Kept as a predicate because the compose threading
-/// sites read it and the image/pack cache key salts on it.
 /// `KLIO_MISS_TRACE`, resolved once. `getenvSlice` takes a global mutex and
 /// the env store scans linearly — measurable per interpreted call.
 var hcf_miss_trace_state: u8 = 0;

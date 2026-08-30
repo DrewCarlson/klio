@@ -5,7 +5,7 @@ fronts, and every follow-up item are closed.** The standing gate is 1390
 passed / 0 failed / 0 DNC, vpd child 577s on the ReleaseFast gate
 harness, budget ratchet 650s (the serve round's win banked). What remains
 is the hand-off below: the ratchet that banks future throughput wins and
-the traps.
+the traps. The successor campaign is `plans/interpreter-next-campaign.md`.
 
 Discipline that got it here: root-cause only, peel one root at a time,
 full battery before every commit, example + pinned output per interpreter

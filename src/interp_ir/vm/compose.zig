@@ -1,16 +1,13 @@
-//! Implicit-composer support for `@Composable` execution — klio's replacement
-//! for the Compose compiler plugin's `$composer` threading.
+//! Ambient-composer support for plugin-lowered `@Composable` execution.
 //!
-//! The plugin normally rewrites every `@Composable` function to take a synthetic
-//! `Composer` parameter and to bracket its body with positional group-key calls.
-//! klio has no plugin: instead this module keeps a per-thread stack of the
-//! active composer value (the klioMain `KlioComposer`), pushed by the klioMain
-//! `Composition` around the content lambda, and the call dispatcher brackets
-//! every `@Composable` call with `startGroup(key)` / `endGroup()` on the current
-//! composer (see `host_call_func.zig`). The positional key is derived from the
-//! call-site source span, so the same source position maps to the same slot
-//! group across recompositions. `currentComposer` (klioMain) resolves to the
-//! stack head via the `__compose_currentComposer` intrinsic.
+//! The `@Composable` lowering pass threads the synthetic `$composer, $changed`
+//! pair through every composable signature; this module keeps the per-thread
+//! AMBIENT composer stack that bridges the places the threaded argument cannot
+//! reach: a `@Composable` property getter has no composer parameter of its own,
+//! so the pass compiles its composer references to the
+//! `__compose_currentComposer` intrinsic, which reads this stack. The call
+//! dispatcher publishes each call's threaded `$composer` argument here for the
+//! body's dynamic extent (`threadedComposerArgFor` detects the pair).
 //!
 //! Modeled on the coroutine `active_scope_stack` (`coroutines.zig`): a
 //! page-allocator-backed threadlocal that is a GC thread-root for its lifetime.
@@ -19,7 +16,6 @@ const std = @import("std");
 const ir = @import("ir");
 const runtime = @import("runtime");
 const stdlib = @import("stdlib");
-const host_call_member = @import("host_call_member.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -131,79 +127,6 @@ pub fn resetAtRunBoundary() void {
     composer_stack.clearRetainingCapacity();
 }
 
-// ----- @Composable detection + positional key -----
-
-pub fn isComposable(f: *const ir.Func) bool {
-    for (f.annotation_names) |n| {
-        if (std.mem.eql(u8, n, "Composable")) return true;
-        if (std.mem.endsWith(u8, n, ".Composable")) return true;
-    }
-    return false;
-}
-
-/// A stable positional group key for the call currently being dispatched,
-/// derived from the caller frame's in-progress statement span. Deterministic
-/// and unique per source location, so the same call site yields the same key
-/// across recompositions (the basis of `remember` slot identity).
-pub fn callSiteKey() u64 {
-    const sp = ir.eval.currentCallSiteSpan() orelse return 0x9e3779b97f4a7c15;
-    var h = std.hash.Wyhash.init(0xc0117a5e);
-    h.update(std.mem.asBytes(&sp.file));
-    h.update(std.mem.asBytes(&sp.start));
-    h.update(std.mem.asBytes(&sp.end));
-    return h.final();
-}
-
-/// Hash one argument for the `@Composable` arg-changed check. Primitives and
-/// content types hash by value/content; reference types (instances, closures,
-/// `MutableState`, …) hash by identity — their value changing is observed via
-/// the snapshot read subscription, not the arg-changed path, matching Compose's
-/// stability model (a stable parameter is "unchanged" while its object is the
-/// same instance).
-fn argValueHash(v: *const Value) u64 {
-    return switch (v.*) {
-        .Null, .Unit => 0,
-        // Kotlin's `Set`/`Map` hashCode is the *sum* of element/entry hashes, so
-        // `setOf()` and `setOf(0)` both hash to 0 — using that as the @Composable
-        // "changed" signal wrongly skips recomposition when a set toggles an
-        // element whose hash the sum absorbs (element 0, or any element added to
-        // an empty set). Fold size + each element structurally instead so a
-        // content change is reflected.
-        .Set => |s| blk: {
-            const g = s.items.borrow();
-            defer g.deinit();
-            var h: u64 = 0xcbf29ce484222325 ^ 0x5e7;
-            h = (h ^ @as(u64, g.get().items.len)) *% 1099511628211;
-            for (g.get().items) |*e| h = (h ^ argValueHash(e)) *% 1099511628211;
-            break :blk h;
-        },
-        .Map => |m| blk: {
-            const g = m.entries.borrow();
-            defer g.deinit();
-            var h: u64 = 0xcbf29ce484222325 ^ 0x3a9;
-            h = (h ^ @as(u64, g.get().pairs.items.len)) *% 1099511628211;
-            for (g.get().pairs.items) |*p| {
-                h = (h ^ argValueHash(&p.key)) *% 1099511628211;
-                h = (h ^ argValueHash(&p.value)) *% 1099511628211;
-            }
-            break :blk h;
-        },
-        .Bool, .Char, .Byte, .Short, .Int, .Long, .UByte, .UShort, .UInt, .ULong, .Float, .Double, .String, .Pair, .Triple, .List, .Array, .Range, .MapEntry => @as(u64, @bitCast(@as(i64, host_call_member.kotlinHashCode(v)))),
-        else => if (v.lockIdentity()) |id| @as(u64, id) else @as(u64, @bitCast(@as(i64, host_call_member.kotlinHashCode(v)))),
-    };
-}
-
-/// FNV-1a combine of the call's argument hashes — the @Composable "changed"
-/// signal. A group whose args hash differs from last pass re-composes even if it
-/// was not directly invalidated (klio's stand-in for the plugin's `$changed`).
-pub fn argsHash(args: []const Value) i64 {
-    var h: u64 = 1469598103934665603;
-    for (args) |*a| {
-        h = (h ^ argValueHash(a)) *% 1099511628211;
-    }
-    return @bitCast(h);
-}
-
 // ----- host intrinsics (klioMain composer stack management) -----
 
 fn intrPushComposer(ctx: *CallCtx) Error!EvalResult {
@@ -303,14 +226,3 @@ test "threadedComposerArg finds the composer for free, value, and member call sh
     }
 }
 
-test "argsHash is stable, order-sensitive, and value-sensitive" {
-    const a = [_]Value{ Value.newInt(1), Value.newInt(2) };
-    const same = [_]Value{ Value.newInt(1), Value.newInt(2) };
-    const reordered = [_]Value{ Value.newInt(2), Value.newInt(1) };
-    const changed = [_]Value{ Value.newInt(1), Value.newInt(3) };
-    try testing.expectEqual(argsHash(&a), argsHash(&same));
-    try testing.expect(argsHash(&a) != argsHash(&reordered));
-    try testing.expect(argsHash(&a) != argsHash(&changed));
-    // No-arg call: a fixed seed, equal to itself.
-    try testing.expectEqual(argsHash(&.{}), argsHash(&.{}));
-}
