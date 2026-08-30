@@ -165,6 +165,8 @@ pub const CallSite = struct {
     name: []const u8 = "",
     resolved_member: ?FuncId = null,
     dispatch_recv_reg: ?u32 = null,
+    /// Declared-receiver head for by-name dispatch (empty = plain).
+    declared_name: []const u8 = "",
     recv_class: usize = 0,
     /// Field-read fields. `is_field` selects a direct stored-field read from the
     /// boxed receiver at `field_idx` (the field's stable position in the instance,
@@ -257,6 +259,8 @@ pub const NullableUnbox = struct {
 
 /// A loop-invariant Instance receiver whose field buffer pointer is cached in
 /// `ptr_slot` at loop entry, so native field reads/writes index it directly.
+pub const ObjParamLoad = struct { param_idx: u16, reg: u32 };
+
 pub const FieldBase = struct {
     recv_reg: u32,
     ptr_slot: u32,
@@ -320,6 +324,11 @@ pub const CompiledLoop = struct {
     /// Any call site that actually calls back through the trampoline (a
     /// NATIVE field site is direct memory access and needs none).
     has_tramp_sites: bool = true,
+    /// Object params: each `LoadParam` of an object-kind param maps its
+    /// destination FRAME register, seeded (borrowed — the frame's params
+    /// list keeps the value alive, and the unset write-mask means an
+    /// in-body overwrite releases nothing it does not own) before entry.
+    obj_param_loads: []ObjParamLoad = &.{},
     allocator: Allocator,
 
     pub fn deinit(self: *CompiledLoop) void {
@@ -328,6 +337,7 @@ pub const CompiledLoop = struct {
         self.allocator.free(self.box_tags);
         self.allocator.free(self.read_set);
         self.allocator.free(self.def_set);
+        if (self.obj_param_loads.len != 0) self.allocator.free(self.obj_param_loads);
         self.allocator.free(self.arrays);
         self.allocator.free(self.cells);
         self.allocator.free(self.nullables);
@@ -772,6 +782,10 @@ const TrampMember = struct {
     dst: Reg,
     resolved: ?FuncId,
     dispatch_recv: ?Reg,
+    /// Declared-receiver head for the dispatch (`callMemberNamedDeclared`);
+    /// empty = plain by-name dispatch. Dropping it re-resolved an interface
+    /// default's `this` call against the wrong surface.
+    declared: []const u8,
 };
 
 fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember {
@@ -787,6 +801,12 @@ fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember 
             if (cm.name.int() >= module.consts.items.len) return null;
             const name = module.consts.items[cm.name.int()];
             if (name != .String) return null;
+            var declared: []const u8 = "";
+            if (cm.declared_recv) |did| {
+                if (did.int() < module.consts.items.len and module.consts.items[did.int()] == .String) {
+                    declared = module.consts.items[did.int()].String;
+                } else return null;
+            }
             return .{
                 .recv = cm.receiver,
                 .name = name.String,
@@ -795,6 +815,7 @@ fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember 
                 .dst = cm.dst,
                 .resolved = cm.resolved,
                 .dispatch_recv = cm.dispatch_receiver,
+                .declared = declared,
             };
         },
         else => return null,
@@ -2322,10 +2343,10 @@ const Compiler = struct {
             // Function-JIT: copy a scalar param from its entry-filled slot.
             .LoadParam => |lp| {
                 if (!self.func_mode or lp.idx >= self.n_params) return jit.JitError.Unsupported;
-                // Method mode: the receiver lives in no slot — its field
-                // buffer pointer was seeded at entry instead; the register is
-                // only ever a field-op receiver, so the load is a no-op.
-                if (self.method_mode and lp.idx == 0) return;
+                // An object param lives in a FRAME register (seeded before
+                // entry — the method receiver's field-buffer pointer
+                // likewise); the slot load is a no-op.
+                if (typeOf(self.types, lp.dst) == .object) return;
                 try self.em.loadMem(T0, REGS, @intCast(@as(u64, self.param_slot_base + lp.idx) * 8));
                 try self.storeSlot(lp.dst, T0);
             },
@@ -3295,6 +3316,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .recv_tag_reg = argTagSourceReg(blk_insts, i, mc.recv.int()),
                     .name = mc.name,
                     .resolved_member = mc.resolved,
+                    .declared_name = mc.declared,
                     .dispatch_recv_reg = if (mc.dispatch_recv) |reg| reg.int() else null,
                     .recv_class = if (regs[mc.recv.int()] == .Instance) instanceClassIdentity(regs[mc.recv.int()]) else 0,
                     .recv_varies = recv_varies or regs[mc.recv.int()] != .Instance,
@@ -4004,10 +4026,15 @@ fn inferFuncTypes(a: Allocator, module: *const Module, func: *const Func, n_regs
 /// call trampoline). `params` are the live arguments at the hot call, used to
 /// specialize param kinds. Returns null for any unsupported shape.
 pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, params: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
-    _ = resolver;
-    _ = virt_resolver;
     if (func.blocks.len == 0) return null;
     if (func.is_suspend or func.is_lambda or func.is_inline) return null;
+    // Bisect: KLIO_FJ_SKIP=a,b declines the named bodies.
+    if (runtime.envOnce("KLIO_FJ_SKIP")) |skips| {
+        var it2 = std.mem.splitScalar(u8, skips, ',');
+        while (it2.next()) |nm| {
+            if (std.mem.eql(u8, nm, func.name)) return null;
+        }
+    }
     // Only user-code functions: stdlib / kotlinx-pack bodies are left to the
     // interpreter so the whole-function tier never alters the runtime machinery
     // (coroutine dispatch, cancellation) that cooperative scheduling relies on.
@@ -4041,21 +4068,33 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         params[0] == .Instance and field_resolver != null and resolver_user != null;
     const n_regs: u32 = func.n_locals;
 
-    // The receiver registers: every `LoadParam 0` destination.
+    // Object params (an Instance argument at the hot call): their LoadParam
+    // destinations are FRAME registers, seeded borrowed before native entry.
+    // The method receiver's loads are the param-0 subset (its field ops are
+    // native; every object reg is additionally usable as a member/virtual
+    // receiver, an object move, or a null test — all trampoline sites).
     var recv_regs_buf: [4]u32 = undefined;
     var n_recv_regs: usize = 0;
-    if (is_method) {
-        for (func.blocks) |*blk| {
-            for (blk.insts) |*inst| {
-                if (inst.* == .LoadParam and inst.LoadParam.idx == 0) {
-                    if (n_recv_regs >= recv_regs_buf.len) return null;
-                    recv_regs_buf[n_recv_regs] = inst.LoadParam.dst.int();
-                    n_recv_regs += 1;
-                }
+    var obj_loads_buf: [16]ObjParamLoad = undefined;
+    var n_obj_loads: usize = 0;
+    for (func.blocks) |*blk| {
+        for (blk.insts) |*inst| {
+            if (inst.* != .LoadParam) continue;
+            const lp = inst.LoadParam;
+            if (lp.idx >= params.len or params[lp.idx] != .Instance) continue;
+            if (n_obj_loads >= obj_loads_buf.len) return null;
+            obj_loads_buf[n_obj_loads] = .{ .param_idx = @intCast(lp.idx), .reg = lp.dst.int() };
+            n_obj_loads += 1;
+            if (is_method and lp.idx == 0) {
+                if (n_recv_regs >= recv_regs_buf.len) return null;
+                recv_regs_buf[n_recv_regs] = lp.dst.int();
+                n_recv_regs += 1;
             }
         }
     }
     const recv_regs = recv_regs_buf[0..n_recv_regs];
+    const obj_loads = obj_loads_buf[0..n_obj_loads];
+
     const isRecvReg = struct {
         fn f(set: []const u32, r: u32) bool {
             for (set) |x| {
@@ -4098,6 +4137,23 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 }
                 continue;
             }
+            // Member / virtual calls trampoline; the receiver must be one of
+            // the seeded object registers (an object param — including the
+            // method receiver — whose value the handler reads from the frame).
+            // An UNRESOLVED bare-name member with no declared head keeps the
+            // interpreter: its resolution consults the executing frame's
+            // receiver tower and visibility surface (an interface default's
+            // `isEmpty()` resolved a file-private extension there), context
+            // the trampoline's by-name dispatch does not carry.
+            // Member/virtual sites in FUNCTION mode are NOT accepted yet:
+            // two named repros broke under them (Changes.isNotEmpty — an
+            // interface default whose bare `isEmpty()` needs the executing
+            // frame's receiver tower + visibility surface; and
+            // SlotWriter.dataIndexToDataAnchor — an arg-dataflow hole that
+            // read Unit). The widening needs the framed-context parity
+            // family first; plans/interpreter-next-campaign.md carries it.
+            if (trampolinableMemberOf(module, inst) != null) return null;
+            if (trampolinableVirtualOf(inst) != null) return null;
             switch (inst.*) {
                 // `/` and `%` are excluded: a divide-by-zero deopt from a
                 // native-RECURSED callee has no frame to resume into. Method
@@ -4197,9 +4253,62 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
 
     const types = try inferFuncTypes(a, module, func, n_regs, params);
     defer if (!ok) a.free(types);
-    // Seed field-read destination types and re-run the fixpoint so they
+    // Seed field-read destination types, object-param registers, and
+    // member/virtual result types, then re-run the fixpoint so they
     // propagate into the arithmetic that consumes them.
-    if (field_pres.items.len != 0) {
+    if (field_pres.items.len != 0 or obj_loads.len != 0) {
+        for (obj_loads) |opl| {
+            if (opl.reg >= n_regs) return null;
+            _ = setType(types, Reg.from(opl.reg), .object);
+        }
+        // Member/virtual result registers: resolve against the live param
+        // receiver for a precise scalar kind; anything unresolved is a
+        // boxed object write (always sound — the handler boxes the result
+        // into the frame register).
+        for (body) |bid2| {
+            for (func.blocks[bid2.int()].insts) |*inst2| {
+                var dstr: ?Reg = null;
+                var rt2: RegType = .object;
+                if (trampolinableMemberOf(module, inst2)) |mc2| {
+                    dstr = mc2.dst;
+                    if (mc2.resolved) |fid2| {
+                        if (module.funcById(fid2)) |f2| rt2 = funcReturnRegType(module, f2);
+                    } else if (resolver != null) {
+                        for (obj_loads) |opl| {
+                            if (opl.reg == mc2.recv.int()) {
+                                var av2: [6]Value = undefined;
+                                var k2: u8 = 0;
+                                while (k2 < mc2.n_args and k2 < 6) : (k2 += 1) {
+                                    if (mc2.args_reg + k2 >= params.len) break;
+                                    av2[k2] = .Unit;
+                                }
+                                if (resolver.?(resolver_user.?, &params[opl.param_idx], mc2.name, av2[0..mc2.n_args])) |fid2| {
+                                    if (module.funcById(fid2)) |f2| rt2 = funcReturnRegType(module, f2);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                } else if (trampolinableVirtualOf(inst2)) |vc2| {
+                    dstr = vc2.dst;
+                    if (virt_resolver != null) {
+                        for (obj_loads) |opl| {
+                            if (opl.reg == vc2.recv.int()) {
+                                if (virt_resolver.?(resolver_user.?, &params[opl.param_idx], vc2.slot)) |fid2| {
+                                    if (module.funcById(fid2)) |f2| rt2 = funcReturnRegType(module, f2);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (dstr) |d2| {
+                    if (d2.int() >= n_regs) return null;
+                    if (rt2 == .unknown) rt2 = .object;
+                    _ = setType(types, d2, rt2);
+                }
+            }
+        }
         for (field_pres.items) |fp| {
             if (!fp.is_set) {
                 if (fp.dst_or_src >= n_regs) return null;
@@ -4288,6 +4397,69 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 .inst = @intCast(i),
                 .span = span,
             }) catch return null;
+        }
+    }
+
+    // Member / virtual trampoline sites (object receiver seeded in a frame
+    // register; scalar args from typed slots; an object result boxes into
+    // the frame register, a scalar one fills its slot). No entry class
+    // guard: dispatch is dynamic per receiver.
+    for (body) |bid| {
+        const blk = &func.blocks[bid.int()];
+        for (blk.insts, 0..) |*inst, i| {
+            const kind: enum { member, virt } = if (trampolinableMemberOf(module, inst) != null) .member else if (trampolinableVirtualOf(inst) != null) .virt else continue;
+            const args_reg: u32 = if (kind == .member) trampolinableMemberOf(module, inst).?.args_reg else trampolinableVirtualOf(inst).?.args_reg;
+            const n_args: u32 = if (kind == .member) trampolinableMemberOf(module, inst).?.n_args else trampolinableVirtualOf(inst).?.n_args;
+            const dst: Reg = if (kind == .member) trampolinableMemberOf(module, inst).?.dst else trampolinableVirtualOf(inst).?.dst;
+            var k: u8 = 0;
+            while (k < n_args) : (k += 1) {
+                const ar = args_reg + k;
+                if (ar >= n_regs or !(isScalarRt(types[ar]) or types[ar] == .object or types[ar] == .null_)) return null;
+            }
+            var span: ?ir.Span = null;
+            var bj: usize = i;
+            while (bj > 0) {
+                bj -= 1;
+                if (blk.insts[bj] == .Trace) {
+                    span = blk.insts[bj].Trace.span;
+                    break;
+                }
+            }
+            const has_result = dst.int() < n_regs and (isScalarRt(typeAt(types, dst)) or typeAt(types, dst) == .object);
+            if (kind == .member) {
+                const mc = trampolinableMemberOf(module, inst).?;
+                call_sites.append(a, .{
+                    .func = @enumFromInt(0),
+                    .args_reg = args_reg,
+                    .n_args = n_args,
+                    .dst_reg = dst.int(),
+                    .has_result = has_result,
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span,
+                    .is_member = true,
+                    .recv_reg = mc.recv.int(),
+                    .name = mc.name,
+                    .resolved_member = mc.resolved,
+                    .declared_name = mc.declared,
+                    .recv_class = 0,
+                }) catch return null;
+            } else {
+                const vc = trampolinableVirtualOf(inst).?;
+                call_sites.append(a, .{
+                    .func = @enumFromInt(0),
+                    .args_reg = args_reg,
+                    .n_args = n_args,
+                    .dst_reg = dst.int(),
+                    .has_result = has_result,
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span,
+                    .is_virtual = true,
+                    .virt_slot = vc.slot,
+                    .recv_reg = vc.recv.int(),
+                }) catch return null;
+            }
         }
     }
 
@@ -4465,7 +4637,7 @@ pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, 
     var i: u32 = 0;
     while (i < self.n_params) : (i += 1) {
         if (i >= params.len) return null;
-        if (self.method_mode and i == 0) continue; // receiver: no slot
+        if (self.param_rt[i] == .object) continue; // seeded into a frame register
         const sv = cellSlotIn(self.param_rt[i], params[i]) orelse {
             if (self.method_mode and debugEnabled()) std.debug.print("[jit-dbg] method run: param {d} kind {s} rt {s}\n", .{ i, @tagName(std.meta.activeTag(params[i])), @tagName(self.param_rt[i]) });
             return null; // kind changed: interpret
@@ -4581,7 +4753,7 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
             if (debugEnabled()) std.debug.print("[jit]   func-tier declined {s}\n", .{func.name});
             return null;
         }
-        if (debugEnabled()) std.debug.print("[jit] compiled function {s} n_slots={d} n_regs={d}\n", .{ func.name, compiled.?.n_slots, compiled.?.n_regs });
+        if (debugEnabled()) std.debug.print("[jit] compiled function {s} (fqn={s} p0={s}) n_slots={d} n_regs={d}\n", .{ func.name, func.fqn, if (func.params.len > 0) func.params[0].name else "-", compiled.?.n_slots, compiled.?.n_regs });
         fj.func_jit = compiled;
         noteCompiled();
     }
@@ -4590,6 +4762,14 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
     if (params.len < cl.n_params) return null;
     if (regs.items.len < cl.n_regs) {
         regs.appendNTimes(regsGrowAlloc(allocator), .Unit, cl.n_regs - regs.items.len) catch return null;
+    }
+    for (cl.obj_param_loads) |opl| {
+        if (opl.param_idx >= params.len or opl.reg >= regs.items.len) return null;
+        // The body was specialized on an Instance here (member dispatch,
+        // field routes); any other kind — an unboxed value-class receiver,
+        // a null — declines to the interpreter before anything runs.
+        if (params[opl.param_idx] != .Instance) return null;
+        regs.items[opl.reg] = params[opl.param_idx];
     }
     var stack_slots: [128]i64 = undefined;
     var heap_slots: ?[]i64 = null;

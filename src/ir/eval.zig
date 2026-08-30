@@ -6476,7 +6476,10 @@ fn LoopTramp(comptime H: type) type {
                     }
                 }
                 var names: [6]?[]const u8 = .{ null, null, null, null, null, null };
-                const r = lc.host.callMemberNamed(lc.allocator, &recv, site.name, argbuf[0..site.n_args], names[0..site.n_args]) catch {
+                const r = (if (site.declared_name.len != 0)
+                    lc.host.callMemberNamedDeclared(lc.allocator, &recv, site.name, argbuf[0..site.n_args], names[0..site.n_args], site.declared_name)
+                else
+                    lc.host.callMemberNamed(lc.allocator, &recv, site.name, argbuf[0..site.n_args], names[0..site.n_args])) catch {
                     if (pushed) popEnclosing();
                     lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
                     return jit_loop.throwCode(site.block);
