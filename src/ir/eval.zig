@@ -6387,6 +6387,15 @@ fn LoopTramp(comptime H: type) type {
             return lc.host.resolveMemberFuncId(lc.allocator, receiver, name, args);
         }
 
+        /// Compile-time virtual-slot resolver: the FuncId the slot dispatches
+        /// to on the receiver's class, so a loop-invariant virtual call can
+        /// inline its monomorphic target. Null keeps the site a trampoline.
+        fn resolveVirtual(user: *anyopaque, receiver: *const Value, slot: u32) ?FuncId {
+            if (comptime !@hasDecl(H, "resolveVirtualFuncId")) return null;
+            const lc: *Ctx = @ptrCast(@alignCast(user));
+            return lc.host.resolveVirtualFuncId(receiver, ir.MethodSlotId.from(slot));
+        }
+
         /// Compile-time field resolver: the stored-field index of `name` on the
         /// receiver, or null if it is not a plain stored property (so the read
         /// stays interpreted).
@@ -6502,6 +6511,8 @@ fn runFrameExec(
     const tramp_user: ?*anyopaque = if (comptime tramp_ok) @ptrCast(&loop_ctx) else null;
     const member_resolver: ?jit_loop.MemberResolver =
         if (comptime tramp_ok and @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).resolveMember else null;
+    const virt_resolver: ?jit_loop.VirtResolver =
+        if (comptime tramp_ok and @hasDecl(H, "resolveVirtualFuncId")) &LoopTramp(H).resolveVirtual else null;
     // The bytecode tier's per-func stream table, hoisted to one lookup per
     // activation; per block entry it is a plain array index.
     // Fused terminator ops only when the loop JIT is off: the JIT's
@@ -6563,7 +6574,7 @@ fn runFrameExec(
             // mask maintenance; hand it a fully-defined file. One fill per
             // frame at most — the mask saturates.
             frame.materializeRegs();
-            if (jit_loop.maybeRunHotPre(jit_fj.?, frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver, field_resolver, field_nn_resolver)) |res| {
+            if (jit_loop.maybeRunHotPre(jit_fj.?, frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver, virt_resolver, field_resolver, field_nn_resolver)) |res| {
                 if (res.inst == jit_loop.THROW_INST) {
                     // A trampolined call left an error pending: re-raise it. A
                     // throw resumes through the try-stack at the call's block;
@@ -6617,7 +6628,7 @@ fn runFrameExec(
             // zero deopt resumes interpretation with registers reboxed.
             if (comptime tramp_ok) {
                 if (cur.int() == func.entry.int()) {
-                    if (jit_loop.maybeRunHotFunc(frame.module, func, &frame.regs, frame.params.items, allocator, tramp_fn, tramp_user, member_resolver, field_resolver, field_nn_resolver)) |fo| {
+                    if (jit_loop.maybeRunHotFunc(frame.module, func, &frame.regs, frame.params.items, allocator, tramp_fn, tramp_user, member_resolver, virt_resolver, field_resolver, field_nn_resolver)) |fo| {
                         if (fo.code.inst == jit_loop.RETURN_INST) return ok(fo.value);
                         if (fo.code.inst == jit_loop.THROW_INST) {
                             const e = loop_ctx.pending.?;

@@ -39,12 +39,40 @@ do):
   binding shadowing (the `convertDurationUnit` trap), ambiguous sites
   (`FAST_CALL_AMBIG_FLAG` is the recorded precedent).
 
-Sequencing sketch (measure after every stage; the ratchet banks wins):
-1. Shape layout + guarded field access for a closed set of hot classes
-   (compose's slot-table/changelist family is the measured target).
-2. Monomorphic call specialization over the same set.
-3. Unboxed locals inside a compiled body.
-4. Widen by profile, not by ambition.
+THE SUBSTRATE (recognized 2026-08-30, do not rediscover): `jit_loop.zig`
+is already a real x86-64 JIT — W^X exec buffers, typed i32/i64/f32/f64
+register slots with box/unbox at boundaries, native field bases, inline
+sites for small callees, a rich trampoline (member calls, field
+read/write with class guards + deopt codes, map/list subscripts,
+suspension parking), and scalar native-to-native recursion. It loses on
+compose (JIT-on replica 146 vs 132us) because the composer-shaped
+bodies do not CLASSIFY (unsupported insts) and because every real op in
+a compiled loop still trampolines into host dispatch.
+
+Progress (each measured, gate-neutral — the gate runs JIT-off):
+- [x] CallVirtual trampoline (e81efce7): slot dispatch stays dynamic, no
+  class guard; suspension parks through the member-site stash. Litmus
+  `tl_virtual_jit_dispatch_loop` pins two-class exactness; virtbench
+  338 -> 260 ns/iter (the tramp still pays full dispatch).
+- [x] Tramp arg cap 3 -> 6 (1c7d1da8).
+- [ ] Stage 2 — THE CORE BET: object registers in native activations, so
+  a compiled callee with an object receiver can run native-to-native
+  (guarded direct call, no dispatch ladder, no interpreter frame).
+  Requires: a GC-rooted per-depth Value regs bank for recursed callees
+  (mirror the fused walker's FrameAnchor rooting), the tramp ctx
+  carrying that regs slice instead of reaching for `lc.frame.regs`, and
+  a per-site monomorphic (class -> compiled callee) cache (sites are
+  thread-private — `states` is threadlocal — so plain mutation is
+  sound). Measure on virtbench first: the win must show as ~260 -> tens
+  of ns/iter before any wider rollout.
+- [ ] Remaining classify blockers, in unblock order: CallMemberOrValue /
+  CallMemberOrGlobal, InstanceOf, EnclosingPush/Pop, StoreGlobal,
+  NewInstance, QualifiedThis (each is a tramp arm or a native check;
+  composer bodies `recomposeToGroupEnd`/`settle`/`compositeKeyOf` name
+  the exact needs).
+- [ ] Then: function-tier coverage of the composer straight-line bodies,
+  replica A/B, and only on a measured win the gate-policy question
+  (safe profile keeps JIT off today).
 
 Exit: vpd budget ratchets down with each landed stage; the tier is a win
 only if the CLOCK moves (the closed campaign's "activation cut does not

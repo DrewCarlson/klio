@@ -8326,6 +8326,51 @@ pub fn invokeResolvedMember(
         .{ .err = .{ .Type = "resolved member target is not executable" } };
 }
 
+/// Compile-time resolver for the loop JIT's virtual inline sites: the
+/// FuncId the slot dispatches to on `receiver`'s class, via the same
+/// resolved-id memo + main-module slot table the runtime path reads — with
+/// NO fallback arms (an anonymous class, a host-backed member, an unlinked
+/// or bodyless target all return null, so the site stays a trampoline and
+/// runtime behavior is unchanged). The only state touched is the class's
+/// own resolve memo, which the runtime path fills identically.
+pub fn resolveVirtualFuncId(self: *VmHost, receiver: *const Value, slot: ir.MethodSlotId) ?FuncId {
+    if (receiver.* != .Instance) return null;
+    const runtime_def = blk: {
+        const instance = receiver.Instance.borrow();
+        defer instance.deinit();
+        break :blk instance.get().class.clone();
+    };
+    defer runtime_def.deinit();
+    {
+        const class = runtime_def.borrow();
+        defer class.deinit();
+        if (class.get().is_anonymous) return null;
+    }
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    const memo_class_id: ?ir.ClassId = cid: {
+        const class = runtime_def.borrow();
+        defer class.deinit();
+        const cdef = class.get();
+        const mod_key = @intFromPtr(module);
+        if (cdef.resolve_mod.load(.monotonic) == mod_key) {
+            const plus1 = cdef.resolve_cid.load(.acquire);
+            if (plus1 != 0) break :cid ir.ClassId.from(plus1 - 1);
+        }
+        const found = module.classIdByFqn(cdef.fqn) orelse break :cid null;
+        const mut = @constCast(cdef);
+        if (mut.resolve_mod.cmpxchgStrong(0, mod_key, .acq_rel, .monotonic) == null) {
+            mut.resolve_cid.store(found.int() + 1, .release);
+        }
+        break :cid found;
+    };
+    const cls = memo_class_id orelse return null;
+    const target = module.methodSlotTarget(cls, slot) orelse return null;
+    if (!virtualTargetExecutable(module, target)) return null;
+    return target;
+}
+
 fn runtimeVirtualCacheGet(self: *VmHost, key: root_mod.ProgramImage.RuntimeVirtualKey) ?root_mod.ProgramImage.RuntimeVirtualTarget {
     const pg = self.prog.borrow();
     defer pg.deinit();

@@ -802,6 +802,12 @@ fn trampolinableVirtualOf(inst: *const Inst) ?TrampVirtual {
 /// the call is not trampolined.
 pub const MemberResolver = *const fn (*anyopaque, *const Value, []const u8, []const Value) ?FuncId;
 
+/// `fn(user, receiver, slot) -> the FuncId the virtual slot dispatches to on
+/// the receiver's class | null`. Compile-time only, like `MemberResolver`:
+/// it lets a loop-invariant virtual call inline its (monomorphic) target
+/// natively; null keeps the site a trampoline.
+pub const VirtResolver = *const fn (*anyopaque, *const Value, u32) ?FuncId;
+
 /// A `GetField` the loop JIT can trampoline: a property read on a loop-invariant
 /// boxed object, handled as a direct stored-field read (the receiver stays boxed
 /// in the frame's registers, exactly like a member call's receiver).
@@ -2350,7 +2356,7 @@ const Compiler = struct {
 /// Try to compile the natural loop whose header is `header`, specializing array
 /// accesses on the kinds observed in `regs` (the live frame). Returns a compiled
 /// loop, or null if the loop is not a supported shape.
-pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool) Allocator.Error!?CompiledLoop {
+pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool) Allocator.Error!?CompiledLoop {
     const body = (try collectLoop(a, func, header)) orelse return null;
     defer a.free(body);
 
@@ -2447,6 +2453,55 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                         .args_reg = tc.args_reg,
                         .n_args = tc.n_args,
                         .dst = tc.dst,
+                    }) catch return null;
+                    total_regs += callee.n_locals;
+                    if (total_regs > 4096) return null;
+                    continue;
+                }
+                // A loop-invariant VIRTUAL call resolves its monomorphic slot
+                // target at compile time and inlines it exactly like a member
+                // call (the entry class guard covers the invariant receiver, so
+                // the resolved body is the one the runtime dispatch would pick).
+                if (trampolinableVirtualOf(inst)) |vc| blk: {
+                    if (virt_resolver == null or field_resolver == null) break :blk;
+                    if (vc.recv.int() >= regs.len or regs[vc.recv.int()] != .Instance) break :blk;
+                    if (regWrittenInBody(func, body, vc.recv)) break :blk;
+                    const fid = virt_resolver.?(resolver_user.?, &regs[vc.recv.int()], vc.slot) orelse break :blk;
+                    const callee = module.funcById(fid) orelse break :blk;
+                    var this_reg: u32 = 0;
+                    if (!inlinableMemberCallee(module, callee, &this_reg)) break :blk;
+                    if (callee.params.len != @as(usize, vc.n_args) + 1) break :blk; // receiver + args
+                    var has_write = false;
+                    for (callee.blocks[0].insts) |*ci| {
+                        if (trampolinableFieldSetOf(module, ci) != null) has_write = true;
+                    }
+                    if (has_write) {
+                        if (field_nn_resolver == null) break :blk;
+                        var read_ok = true;
+                        for (callee.blocks[0].insts) |*ci| {
+                            if (trampolinableFieldOf(module, ci)) |fld| {
+                                if (field_nn_resolver.?(resolver_user.?, &regs[vc.recv.int()], memberFieldName(fld.name)) == null) {
+                                    read_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!read_ok) break :blk;
+                    }
+                    if (debugEnabled()) std.debug.print("[jit]   inlining virtual {s}\n", .{callee.name});
+                    const has_result = callee.blocks[0].terminator.Return != null;
+                    inline_sites.append(a, .{
+                        .block = bid,
+                        .inst = @intCast(ii),
+                        .callee = callee,
+                        .base = total_regs,
+                        .args_reg = vc.args_reg,
+                        .n_args = vc.n_args,
+                        .dst = vc.dst,
+                        .is_member = true,
+                        .recv_reg = vc.recv.int(),
+                        .this_reg = this_reg,
+                        .has_result = has_result,
                     }) catch return null;
                     total_regs += callee.n_locals;
                     if (total_regs > 4096) return null;
@@ -2600,9 +2655,18 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (trampolinableVirtualOf(inst)) |vc| {
                 if (arrays.items.len != 0) return null;
                 if (vc.recv.int() >= n_regs or vc.recv.int() >= regs.len) return null;
-                // Dispatch is dynamic (per-receiver), so the result type comes
-                // from the live loop state alone; the callback's result write
-                // validates the kind on every invocation.
+                // Resolve the slot's target on the live receiver for a precise
+                // return type (also what the inline path splices); fall back to
+                // the live loop state — the callback's result write validates
+                // the kind on every invocation.
+                if (vc.dst.int() < n_regs and regs[vc.recv.int()] == .Instance and virt_resolver != null) {
+                    if (virt_resolver.?(resolver_user.?, &regs[vc.recv.int()], vc.slot)) |fid| {
+                        if (module.funcById(fid)) |f| {
+                            if (f.is_suspend) return null;
+                            member_ret[vc.dst.int()] = funcReturnRegType(module, f);
+                        }
+                    }
+                }
                 if (vc.dst.int() < n_regs and member_ret[vc.dst.int()] == .unknown and vc.dst.int() < regs.len) {
                     if (liveValueRegType(regs[vc.dst.int()])) |rt| member_ret[vc.dst.int()] = rt;
                 }
@@ -3128,6 +3192,15 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .arg_tag_regs = arg_tag_regs,
                 }) catch return null;
             } else if (is_virtual) {
+                // An inlined virtual call is emitted in place, not trampolined.
+                var inlined_v = false;
+                for (inline_sites.items) |s| {
+                    if (s.block.int() == bid.int() and s.inst == i) {
+                        inlined_v = true;
+                        break;
+                    }
+                }
+                if (inlined_v) continue;
                 const vc = trampolinableVirtualOf(inst).?;
                 if (vc.recv.int() >= n_regs or vc.recv.int() >= regs.len) return null;
                 // The receiver must be a boxed object register: virtual slots
@@ -3896,8 +3969,9 @@ fn inferFuncTypes(a: Allocator, module: *const Module, func: *const Func, n_regs
 /// are positional top-level calls (so direct recursion stays native through the
 /// call trampoline). `params` are the live arguments at the hot call, used to
 /// specialize param kinds. Returns null for any unsupported shape.
-pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, params: []const Value, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
+pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, params: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
     _ = resolver;
+    _ = virt_resolver;
     _ = field_resolver;
     _ = field_nn_resolver;
     _ = resolver_user;
@@ -4173,14 +4247,14 @@ inline fn regsGrowAlloc(fallback: Allocator) Allocator {
     return fallback;
 }
 
-pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), params: []const Value, allocator: Allocator, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?FuncOutcome {
+pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), params: []const Value, allocator: Allocator, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?FuncOutcome {
     if (!funcEnabled()) return null;
     const fj = forFunc(func) orelse return null;
     if (!fj.func_tried) {
         fj.func_count += 1;
         if (fj.func_count < HOT_THRESHOLD) return null;
         fj.func_tried = true;
-        const compiled = tryCompileFunc(metadata_allocator, module, func, params, resolver, field_resolver, field_nn_resolver, user) catch null;
+        const compiled = tryCompileFunc(metadata_allocator, module, func, params, resolver, virt_resolver, field_resolver, field_nn_resolver, user) catch null;
         if (compiled == null) return null;
         if (debugEnabled()) std.debug.print("[jit] compiled function {s} n_slots={d} n_regs={d}\n", .{ func.name, compiled.?.n_slots, compiled.?.n_regs });
         fj.func_jit = compiled;
@@ -4216,15 +4290,15 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
 /// Interpreter hook: at the start of block `cur`, count the entry and — once
 /// hot — compile and run the natural loop with that header. Returns the resume
 /// point (registers reboxed) when a compiled loop ran, else null. KLIO_JIT only.
-pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?Resume {
+pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?Resume {
     const fj = forFunc(func) orelse return null;
-    return maybeRunHotPre(fj, module, func, regs, allocator, cur, tramp, user, resolver, field_resolver, field_nn_resolver);
+    return maybeRunHotPre(fj, module, func, regs, allocator, cur, tramp, user, resolver, virt_resolver, field_resolver, field_nn_resolver);
 }
 
 /// The per-block-entry probe with the per-FUNCTION state already resolved
 /// (the frame loop hoists `forFunc` to once per activation). The fast
 /// paths — already compiled, or known-dead — are two array loads.
-pub fn maybeRunHotPre(fj: *FuncJit, module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?Resume {
+pub fn maybeRunHotPre(fj: *FuncJit, module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?Resume {
     const bi = cur.int();
     if (bi >= fj.counts.len) return null;
 
@@ -4233,7 +4307,7 @@ pub fn maybeRunHotPre(fj: *FuncJit, module: *const Module, func: *const Func, re
         fj.counts[bi] += 1;
         if (fj.counts[bi] < HOT_THRESHOLD) return null;
         var transient = false;
-        const compiled = tryCompile(metadata_allocator, module, func, cur, regs.items, resolver, field_resolver, field_nn_resolver, user, &transient) catch null;
+        const compiled = tryCompile(metadata_allocator, module, func, cur, regs.items, resolver, virt_resolver, field_resolver, field_nn_resolver, user, &transient) catch null;
         if (compiled == null) {
             // A transient bail (an object register snapshot held null) is worth
             // retrying a few times; a permanent bail is cached immediately.
