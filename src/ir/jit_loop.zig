@@ -3860,6 +3860,14 @@ pub fn enabled() bool {
     return runtime.perf.get().jit_loop;
 }
 
+var fj_fields_cache: ?bool = null;
+fn fjFieldsEnabled() bool {
+    if (fj_fields_cache) |v| return v;
+    const on = if (runtime.envOnce("KLIO_FJ_FIELDS")) |v| !(v.len != 0 and v[0] == '0') else true;
+    fj_fields_cache = on;
+    return on;
+}
+
 var fj_escape_cache: ?bool = null;
 fn fjEscapeEnabled() bool {
     if (fj_escape_cache) |v| return v;
@@ -4119,7 +4127,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     // has effects and holds an object, so it never native-recurses; every
     // deopt resumes through the TOP-LEVEL activation's real frame, exactly
     // like a loop deopt.
-    const is_method = n_params >= 1 and func.params.len >= 1 and
+    const is_method = fjFieldsEnabled() and n_params >= 1 and func.params.len >= 1 and
         std.mem.eql(u8, func.params[0].name, "this") and
         params[0] == .Instance and field_resolver != null and resolver_user != null;
     const n_regs: u32 = func.n_locals;
@@ -4968,7 +4976,7 @@ pub fn methodSeamCompile(module: *const Module, func: *const Func, params: []con
     fj.func_tried = true;
     const compiled = tryCompileFunc(metadata_allocator, module, func, params, resolver, virt_resolver, field_resolver, field_nn_resolver, user) catch null;
     if (compiled) |cl| {
-        if (debugEnabled()) std.debug.print("[jit] compiled method {s} (deopt-free={})\n", .{ func.name, !cl.can_deopt });
+        if (debugEnabled()) std.debug.print("[jit] compiled method {s} (fqn={s} mfields={d} sites={d} guard={x} deopt-free={})\n", .{ func.name, func.fqn, cl.method_fields.len, cl.call_sites.len, cl.guard_class, !cl.can_deopt });
         fj.func_jit = cl;
         noteCompiled();
     } else if (debugEnabled()) std.debug.print("[jit]   method-tier declined {s}\n", .{func.name});
@@ -4998,7 +5006,7 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
             if (debugEnabled()) std.debug.print("[jit]   func-tier declined {s}\n", .{func.name});
             return null;
         }
-        if (debugEnabled()) std.debug.print("[jit] compiled function {s} (fqn={s} p0={s}) n_slots={d} n_regs={d}\n", .{ func.name, func.fqn, if (func.params.len > 0) func.params[0].name else "-", compiled.?.n_slots, compiled.?.n_regs });
+        if (debugEnabled()) std.debug.print("[jit] compiled function {s} (fqn={s} p0={s} mfields={d} sites={d} method={} guard={x}) n_slots={d} n_regs={d}\n", .{ func.name, func.fqn, if (func.params.len > 0) func.params[0].name else "-", compiled.?.method_fields.len, compiled.?.call_sites.len, compiled.?.method_mode, compiled.?.guard_class, compiled.?.n_slots, compiled.?.n_regs });
         fj.func_jit = compiled;
         noteCompiled();
     }

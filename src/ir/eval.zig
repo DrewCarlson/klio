@@ -5835,6 +5835,9 @@ fn runFlatLoop(
             // resumes interpretation at the outcome point in this frame.
             if (comptime @hasDecl(H, "callFunc")) hook: {
                 if (!jit_loop.funcEnabled()) break :hook;
+                if (runtime.envOnce("KLIO_FJ_FLATHOOK")) |v| {
+                    if (v.len != 0 and v[0] == '0') break :hook;
+                }
                 var hctx: LoopTramp(H).Ctx = .{ .host = host, .allocator = allocator, .module = act.frame.module, .frame = &act.frame };
                 const mres: ?jit_loop.MemberResolver = if (comptime @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).resolveMember else null;
                 const vres: ?jit_loop.VirtResolver = if (comptime @hasDecl(H, "resolveVirtualFuncId")) &LoopTramp(H).resolveVirtual else null;
@@ -5842,6 +5845,18 @@ fn runFlatLoop(
                 const fnres: ?jit_loop.FieldResolver = if (comptime @hasDecl(H, "plainStoredScalarFieldNN")) &LoopTramp(H).resolveFieldNN else null;
                 const fo = jit_loop.maybeRunHotFunc(act.frame.module, site.req.func, &act.frame.regs, act.frame.params.items, allocator, &LoopTramp(H).call, @ptrCast(&hctx), mres, vres, fres, fnres) orelse break :hook;
                 if (fo.code.inst == jit_loop.RETURN_INST) {
+                    if (runtime.envOnce("KLIO_JIT_DEBUG") != null and std.mem.eql(u8, site.req.func.name, "isNotEmpty")) {
+                        var size_dbg: i64 = -999;
+                        if (site.req.args.items.len > 0 and site.req.args.items[0] == .Instance) {
+                            const gdbg = site.req.args.items[0].Instance.borrow();
+                            for (gdbg.get().fields.items) |fdbg| {
+                                if (std.mem.eql(u8, fdbg.name, "_size") and fdbg.value == .Int) size_dbg = fdbg.value.Int;
+                            }
+                            gdbg.deinit();
+                        }
+                        const bval: i64 = if (fo.value == .Bool) @intFromBool(fo.value.Bool) else -1;
+                        std.debug.print("[jit-dbg] flat deliver {s} bool={d} _size={d} parent={s}\n", .{ site.req.func.fqn, bval, size_dbg, if (stack.items.len > 1) stack.items[stack.items.len - 2].frame.func.fqn else frame.func.fqn });
+                    }
                     var res2: EvalResult = ok(fo.value);
                     const act2 = stack.pop().?;
                     ev.eval_depth -= 1;
@@ -5882,6 +5897,7 @@ fn runFlatLoop(
                     continue;
                 }
                 if (fo.code.inst == jit_loop.THROW_INST) {
+                    if (runtime.envOnce("KLIO_JIT_DEBUG") != null) std.debug.print("[jit-dbg] flat THROW {s}\n", .{site.req.func.fqn});
                     const e2 = hctx.pending.?;
                     hctx.pending = null;
                     switch (e2) {
@@ -5900,6 +5916,7 @@ fn runFlatLoop(
                 }
                 // Deopt: resume interpretation at the outcome point (the
                 // frame's written scalar registers were reboxed by runFunc).
+                if (runtime.envOnce("KLIO_JIT_DEBUG") != null) std.debug.print("[jit-dbg] flat DEOPT {s} b={d} i={d}\n", .{ site.req.func.fqn, fo.code.block, fo.code.inst });
                 cur = fo.code.block;
                 ridx = fo.code.inst;
             }
@@ -6839,9 +6856,19 @@ fn runFrameExec(
             // trampoline). A `Return` yields the value; a callee throw / div-by-
             // zero deopt resumes interpretation with registers reboxed.
             if (comptime tramp_ok) {
-                if (cur.int() == func.entry.int()) {
+                // FRESH entry only: a deopt/throw resume (or a loop whose
+                // back-edge targets the entry block) arrives here with
+                // resume state set, and re-running the whole body from
+                // scratch would double its effects and drop the pending
+                // throw.
+                if (cur.int() == func.entry.int() and resume_idx == 0 and
+                    resume_throw == null and resume_unwind == null)
+                {
                     if (jit_loop.maybeRunHotFunc(frame.module, func, &frame.regs, frame.params.items, allocator, tramp_fn, tramp_user, member_resolver, virt_resolver, field_resolver, field_nn_resolver)) |fo| {
-                        if (fo.code.inst == jit_loop.RETURN_INST) return ok(fo.value);
+                        if (fo.code.inst == jit_loop.RETURN_INST) {
+                            if (runtime.envOnce("KLIO_JIT_DEBUG") != null) std.debug.print("[jit-dbg] entry RETURN {s}\n", .{func.fqn});
+                            return ok(fo.value);
+                        }
                         if (fo.code.inst == jit_loop.THROW_INST) {
                             const e = loop_ctx.pending.?;
                             loop_ctx.pending = null;
