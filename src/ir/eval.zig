@@ -5997,7 +5997,7 @@ fn LoopTramp(comptime H: type) type {
                 if (comptime !@hasDecl(H, "callValue")) return jit_loop.deoptCode(site.block);
                 if (site.span) |sp| lc.frame.cur_span = sp;
                 const callee = lc.frame.regs.items[site.recv_reg];
-                var argbuf2: [3]Value = undefined;
+                var argbuf2: [6]Value = undefined;
                 var k2: usize = 0;
                 while (k2 < site.n_args) : (k2 += 1) {
                     const ar = @as(usize, site.args_reg) + k2;
@@ -6192,7 +6192,7 @@ fn LoopTramp(comptime H: type) type {
             // The native loop does not run `.Trace`; refresh the calling frame's
             // position so a throw from the callee reports this call's line.
             if (site.span) |sp| lc.frame.cur_span = sp;
-            var argbuf: [3]Value = undefined;
+            var argbuf: [6]Value = undefined;
             var k: usize = 0;
             while (k < site.n_args) : (k += 1) {
                 const ar = @as(usize, site.args_reg) + k;
@@ -6257,7 +6257,7 @@ fn LoopTramp(comptime H: type) type {
                 };
                 recv.retain();
                 defer recv.release(lc.allocator);
-                var names: [3]?[]const u8 = .{ null, null, null };
+                var names: [6]?[]const u8 = .{ null, null, null, null, null, null };
                 break :virt lc.host.invokeVirtualMember(
                     lc.allocator,
                     &recv,
@@ -6333,7 +6333,7 @@ fn LoopTramp(comptime H: type) type {
                         pushed = true;
                     }
                 }
-                var names: [3]?[]const u8 = .{ null, null, null };
+                var names: [6]?[]const u8 = .{ null, null, null, null, null, null };
                 const r = lc.host.callMemberNamed(lc.allocator, &recv, site.name, argbuf[0..site.n_args], names[0..site.n_args]) catch {
                     if (pushed) popEnclosing();
                     lc.pending = .{ .Type = "out of memory in JIT-compiled call" };

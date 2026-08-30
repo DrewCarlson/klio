@@ -149,7 +149,7 @@ pub const CallSite = struct {
     /// through the move chain's SOURCE — `action(index++, item)` otherwise
     /// reboxed `item` (a Char produced by an unresolved `next()`) with the
     /// stale static Int tag and the closure received its code as an Int.
-    arg_tag_regs: [3]u32 = .{ 0, 0, 0 },
+    arg_tag_regs: [6]u32 = .{ 0, 0, 0, 0, 0, 0 },
     /// Live-tag source for the member receiver, through the same Move-chain
     /// walk as `arg_tag_regs`: a `Char` produced by an unresolved `next()`
     /// and MOVED into the receiver slot reboxes with the producer's runtime
@@ -695,7 +695,7 @@ fn trampolinableCallOf(inst: *const Inst) ?TrampCall {
     switch (inst.*) {
         .Call => |c| {
             if (c.arg_names.len != 0 or c.type_args.len != 0) return null;
-            if (c.n_args > 3) return null;
+            if (c.n_args > 6) return null;
             return .{ .func = c.func, .args_reg = c.args.int(), .n_args = c.n_args, .dst = c.dst };
         },
         else => return null,
@@ -712,7 +712,7 @@ fn trampolinableCallValueOf(inst: *const Inst) ?TrampCallValue {
     switch (inst.*) {
         .CallValue => |cv| {
             if (cv.arg_names.len != 0 or cv.type_args.len != 0) return null;
-            if (cv.n_args > 3) return null;
+            if (cv.n_args > 6) return null;
             return .{ .callee = cv.callee, .args_reg = cv.args.int(), .n_args = cv.n_args, .dst = cv.dst };
         },
         else => return null,
@@ -760,7 +760,7 @@ fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember 
     switch (inst.*) {
         .CallMember => |cm| {
             if (cm.arg_names.len != 0 or cm.static_recv != null) return null;
-            if (cm.n_args > 3) return null;
+            if (cm.n_args > 6) return null;
             if (cm.name.int() >= module.consts.items.len) return null;
             const name = module.consts.items[cm.name.int()];
             if (name != .String) return null;
@@ -789,7 +789,7 @@ fn trampolinableVirtualOf(inst: *const Inst) ?TrampVirtual {
         .CallVirtual => |cv| {
             if (cv.arg_names.len != 0 or cv.arg_params != null) return null;
             if (cv.trailing_lambda) return null;
-            if (cv.n_args > 3) return null;
+            if (cv.n_args > 6) return null;
             return .{ .recv = cv.receiver, .slot = cv.slot.int(), .args_reg = cv.args.int(), .n_args = cv.n_args, .dst = cv.dst };
         },
         else => return null,
@@ -1434,7 +1434,7 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[4]Reg, n_read
     // tracked, so it does not force the dst into the scalar type requirement).
     if (trampolinableCallOf(inst)) |tc| {
         var k: u8 = 0;
-        while (k < tc.n_args and k < 3) : (k += 1) reads[k] = Reg.from(tc.args_reg + k);
+        while (k < tc.n_args and k < 6) : (k += 1) reads[k] = Reg.from(tc.args_reg + k);
         n_reads.* = tc.n_args;
         if (isScalarRt(typeAt(types, tc.dst))) def.* = tc.dst;
         return;
@@ -1445,7 +1445,7 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[4]Reg, n_read
         const recv_scalar: usize = if (isScalarRt(typeAt(types, mc.recv))) 1 else 0;
         if (recv_scalar != 0) reads[0] = mc.recv;
         var k: u8 = 0;
-        while (k < mc.n_args and k < 3) : (k += 1) {
+        while (k < mc.n_args and k < 6) : (k += 1) {
             reads[recv_scalar + k] = Reg.from(mc.args_reg + k);
         }
         n_reads.* = recv_scalar + @as(usize, mc.n_args);
@@ -1457,7 +1457,7 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[4]Reg, n_read
     // when the result types scalar.
     if (trampolinableVirtualOf(inst)) |vc| {
         var k: u8 = 0;
-        while (k < vc.n_args and k < 3) : (k += 1) reads[k] = Reg.from(vc.args_reg + k);
+        while (k < vc.n_args and k < 6) : (k += 1) reads[k] = Reg.from(vc.args_reg + k);
         n_reads.* = vc.n_args;
         if (isScalarRt(typeAt(types, vc.dst))) def.* = vc.dst;
         return;
@@ -1480,7 +1480,7 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[4]Reg, n_read
     // register); its result is discarded, so it has no scalar def.
     if (trampolinableCallValueOf(inst)) |cvc| {
         var k: u8 = 0;
-        while (k < cvc.n_args and k < 3) : (k += 1) reads[k] = Reg.from(cvc.args_reg + k);
+        while (k < cvc.n_args and k < 6) : (k += 1) reads[k] = Reg.from(cvc.args_reg + k);
         n_reads.* = cvc.n_args;
         return;
     }
@@ -2460,9 +2460,9 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     if (resolver == null or field_resolver == null) continue;
                     if (mc.recv.int() >= regs.len or regs[mc.recv.int()] != .Instance) continue;
                     if (regWrittenInBody(func, body, mc.recv)) continue;
-                    var av: [3]Value = undefined;
+                    var av: [6]Value = undefined;
                     var k: u8 = 0;
-                    while (k < mc.n_args and k < 3) : (k += 1) {
+                    while (k < mc.n_args and k < 6) : (k += 1) {
                         if (mc.args_reg + k >= regs.len) break;
                         av[k] = regs[mc.args_reg + k];
                     }
@@ -2567,7 +2567,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (trampolinableMemberOf(module, inst)) |mc| {
                 if (arrays.items.len != 0) return null;
                 if (mc.recv.int() >= n_regs or mc.recv.int() >= regs.len) return null;
-                var av: [3]Value = undefined;
+                var av: [6]Value = undefined;
                 var k: u8 = 0;
                 while (k < mc.n_args) : (k += 1) {
                     const ar = mc.args_reg + k;
@@ -2926,10 +2926,10 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             }
             // Per-arg live-tag source through the move chain (see
             // `CallSite.arg_tag_regs`).
-            var arg_tag_regs: [3]u32 = .{ 0, 0, 0 };
+            var arg_tag_regs: [6]u32 = .{ 0, 0, 0, 0, 0, 0 };
             {
                 var q: u8 = 0;
-                while (q < n_args and q < 3) : (q += 1) {
+                while (q < n_args and q < 6) : (q += 1) {
                     arg_tag_regs[q] = argTagSourceReg(blk_insts, i, args_reg + q);
                 }
             }
@@ -3937,7 +3937,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
             if (numericConvOf(module, inst) != null) continue;
             if (bitwiseOpOf(module, inst) != null) continue;
             if (trampolinableCallOf(inst)) |tc| {
-                if (tc.n_args > 3) return null;
+                if (tc.n_args > 6) return null;
                 continue;
             }
             switch (inst.*) {
