@@ -4701,6 +4701,35 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     for (body) |bid| {
         const blk = &func.blocks[bid.int()];
         for (blk.insts, 0..) |*inst, i| {
+            if (inst.* == .Move) {
+                // An object move copies one boxed FRAME register into another
+                // — the handler does it; the native scalar Move would copy a
+                // garbage slot (object registers are not slot-backed).
+                const m = inst.Move;
+                const obj_mv = typeAt(types, m.dst) == .object or typeAt(types, m.src) == .object or
+                    typeAt(types, m.src) == .null_;
+                if (obj_mv) {
+                    if (m.dst.int() >= n_regs or m.src.int() >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: objmove-reg\n", .{func.name}); return null; }
+                    var span6: ?ir.Span = null;
+                    var bj6: usize = i;
+                    while (bj6 > 0) {
+                        bj6 -= 1;
+                        if (blk.insts[bj6] == .Trace) {
+                            span6 = blk.insts[bj6].Trace.span;
+                            break;
+                        }
+                    }
+                    call_sites.append(a, .{
+                        .dst_reg = m.dst.int(),
+                        .src_reg = m.src.int(),
+                        .block = bid,
+                        .inst = @intCast(i),
+                        .span = span6,
+                        .is_obj_move = true,
+                    }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4740\n", .{func.name}); return null; };
+                }
+                continue;
+            }
             if (trampolinableGlobalOf(module, inst)) |lg| {
                 // Global read: the handler boxes the value into the frame
                 // register (a missing global deopts; the interpreter re-runs
