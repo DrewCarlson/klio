@@ -107,6 +107,11 @@ Progress (each measured, gate-neutral — the gate runs JIT-off):
   value the caller saw — the same body ran via THREE routes (framed
   entry hook, flat-activation hook, recursive seam), and the bad value
   came from whichever compiled; print at delivery, not at dispatch.
+  Verified default-on with the full battery: gate 1390/0/0 vpd 577s
+  (exit 0 — zig 0.16's runner prints a "failed command:" line for ANY
+  step with stderr output, success included; the exit code is the only
+  verdict), threaded-litmus parity, examples, unit tests all green.
+  Gate-neutral on vpd so far — the wins land as composer bodies classify.
 - [x] Member/virtual sites in FUNCTION mode machinery (d5315202).
   Both launch repros dissolved as ONE bug: the object-param seed table
   was never copied into the CompiledLoop, so member receivers read
