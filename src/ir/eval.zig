@@ -4600,6 +4600,8 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
     if (want.len > 1 and want[0] == '#') {
         const id = std.fmt.parseInt(u32, want[1..], 10) catch return;
         if (func.id.int() != id) return;
+    } else if (std.mem.indexOfScalar(u8, want, '.') != null) {
+        if (!std.mem.eql(u8, func.fqn, want)) return;
     } else if (!std.mem.eql(u8, func.name, want)) return;
     // A deferred body has no blocks yet; wait for the post-materialize call.
     if (func.blocks.len == 0) return;
@@ -5845,18 +5847,6 @@ fn runFlatLoop(
                 const fnres: ?jit_loop.FieldResolver = if (comptime @hasDecl(H, "plainStoredScalarFieldNN")) &LoopTramp(H).resolveFieldNN else null;
                 const fo = jit_loop.maybeRunHotFunc(act.frame.module, site.req.func, &act.frame.regs, act.frame.params.items, allocator, &LoopTramp(H).call, @ptrCast(&hctx), mres, vres, fres, fnres) orelse break :hook;
                 if (fo.code.inst == jit_loop.RETURN_INST) {
-                    if (runtime.envOnce("KLIO_JIT_DEBUG") != null and std.mem.eql(u8, site.req.func.name, "isNotEmpty")) {
-                        var size_dbg: i64 = -999;
-                        if (site.req.args.items.len > 0 and site.req.args.items[0] == .Instance) {
-                            const gdbg = site.req.args.items[0].Instance.borrow();
-                            for (gdbg.get().fields.items) |fdbg| {
-                                if (std.mem.eql(u8, fdbg.name, "_size") and fdbg.value == .Int) size_dbg = fdbg.value.Int;
-                            }
-                            gdbg.deinit();
-                        }
-                        const bval: i64 = if (fo.value == .Bool) @intFromBool(fo.value.Bool) else -1;
-                        std.debug.print("[jit-dbg] flat deliver {s} bool={d} _size={d} parent={s}\n", .{ site.req.func.fqn, bval, size_dbg, if (stack.items.len > 1) stack.items[stack.items.len - 2].frame.func.fqn else frame.func.fqn });
-                    }
                     var res2: EvalResult = ok(fo.value);
                     const act2 = stack.pop().?;
                     ev.eval_depth -= 1;
@@ -6866,7 +6856,6 @@ fn runFrameExec(
                 {
                     if (jit_loop.maybeRunHotFunc(frame.module, func, &frame.regs, frame.params.items, allocator, tramp_fn, tramp_user, member_resolver, virt_resolver, field_resolver, field_nn_resolver)) |fo| {
                         if (fo.code.inst == jit_loop.RETURN_INST) {
-                            if (runtime.envOnce("KLIO_JIT_DEBUG") != null) std.debug.print("[jit-dbg] entry RETURN {s}\n", .{func.fqn});
                             return ok(fo.value);
                         }
                         if (fo.code.inst == jit_loop.THROW_INST) {

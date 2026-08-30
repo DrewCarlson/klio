@@ -2343,6 +2343,10 @@ const Compiler = struct {
                 try self.storeSlot(b.dst, T0);
             },
             .Not => |n| {
+                // The source must live in a typed scalar slot: an object-typed
+                // register (a boxed call result) keeps its value in the frame,
+                // and its slot holds garbage.
+                if (!isScalarRt(typeOf(self.types, n.src))) return jit.JitError.Unsupported;
                 try self.loadSlot(T0, n.src);
                 try self.em.cmpImm32(T0, 0); // src == 0 ? -> 1 (logical negation)
                 try self.em.setccReg(.e, T0);
@@ -3264,8 +3268,9 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 const tc = trampolinableCallOf(inst).?;
                 const f = module.funcById(tc.func) orelse return null;
                 // The callee must run as a plain interpreted call: no suspend
-                // machinery, no implicit receiver to thread.
-                if (f.is_suspend or f.has_receiver_param) {
+                // machinery, no implicit receiver to thread, and a REAL body
+                // (a bodyless abstract anchor re-dispatches in the arm).
+                if (f.is_suspend or f.has_receiver_param or !f.hasBody()) {
                     if (debugEnabled()) std.debug.print("[jit]   bail: callee {s} suspend/receiver in {s}\n", .{ f.name, func.name });
                     return null;
                 }
@@ -3879,7 +3884,7 @@ fn fjEscapeEnabled() bool {
 var fj_member_cache: ?bool = null;
 fn fjMemberEnabled() bool {
     if (fj_member_cache) |v| return v;
-    const on = if (runtime.envOnce("KLIO_FJ_MEMBER")) |v| v.len != 0 and v[0] == '1' else false;
+    const on = if (runtime.envOnce("KLIO_FJ_MEMBER")) |v| v.len != 0 and v[0] == '1' else true;
     fj_member_cache = on;
     return on;
 }
@@ -4092,6 +4097,10 @@ fn inferFuncTypes(a: Allocator, module: *const Module, func: *const Func, n_regs
 pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, params: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
     if (func.blocks.len == 0) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4075\n", .{func.name}); return null; }
     if (func.is_suspend or func.is_lambda or func.is_inline) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4076\n", .{func.name}); return null; }
+    // Bisect: KLIO_FJ_ONLY=name compiles only that body.
+    if (runtime.envOnce("KLIO_FJ_ONLY")) |only| {
+        if (!std.mem.eql(u8, only, func.name)) return null;
+    }
     // Bisect: KLIO_FJ_SKIP=a,b declines the named bodies.
     if (runtime.envOnce("KLIO_FJ_SKIP")) |skips| {
         var it2 = std.mem.splitScalar(u8, skips, ',');
@@ -4531,7 +4540,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         const blk = &func.blocks[bid.int()];
         if (blk.terminator == .Branch) {
             const cond = blk.terminator.Branch.cond;
-            if (cond.int() >= n_regs or typeAt(types, cond) == .unknown) {
+            if (cond.int() >= n_regs or !isScalarRt(typeAt(types, cond))) {
                 if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: branch-unknown\n", .{func.name});
                 return null;
             }
@@ -4561,7 +4570,10 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
             // function-mode body must be suspension-free so a flat-driver
             // native run's outcomes stay RETURN / throw / deopt only.
             if (module.funcById(tc.func)) |cf| {
-                if (cf.is_suspend) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4517\n", .{func.name}); return null; }
+                // A bodyless callee is an abstract-member static anchor: the
+                // interpreted Call arm re-dispatches it virtually on the
+                // receiver, which a raw callFunc cannot.
+                if (cf.is_suspend or !cf.hasBody()) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4517\n", .{func.name}); return null; }
             } else { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4518\n", .{func.name}); return null; }
             // Args must already live in typed scalar slots.
             var k: u8 = 0;
@@ -4623,6 +4635,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
             const has_result = dst.int() < n_regs and (isScalarRt(typeAt(types, dst)) or typeAt(types, dst) == .object);
             if (kind == .member) {
                 const mc = trampolinableMemberOf(module, inst).?;
+                if (debugEnabled()) std.debug.print("[jit-dbg] fsite member {s}.{s} resolved={?} declared={s} recv_reg={d}\n", .{ func.name, mc.name, if (mc.resolved) |f2| f2.int() else null, mc.declared, mc.recv.int() });
                 call_sites.append(a, .{
                     .func = @enumFromInt(0),
                     .args_reg = args_reg,
