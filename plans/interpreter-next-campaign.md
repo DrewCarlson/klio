@@ -1,12 +1,13 @@
 # Interpreter next campaign: the native tier, and the last measured veins
 
-STATUS 2026-08-30: NOT STARTED. This plan is the successor to
-`plans/concurrency-perf-campaigns.md` (closed; its STATUS header carries
-the standing numbers) and collects everything that remains between the
-current interpreter and the desired performance/efficiency end state.
-Standing baseline: compose gate 1390/0/0, vpd child 577s (budget ratchet
-650s, shrink-only), recomposition replica ~130us on the ReleaseFast
-harness, Value 24B, memory targets met.
+STATUS 2026-08-30: COMPLETE. All four tasks are landed green (full
+battery: compose gate 1390/0/0, threaded-litmus parity, examples,
+stdlib sweep 117/0, unit tests) or closed by measurement recorded in
+their sections. Successor to `plans/concurrency-perf-campaigns.md`.
+Standing numbers at close: compose gate 1390/0/0, vpd child 564-577s
+(budget ratchet 650s, shrink-only — unmoved this campaign), replica
+~147-150us tier-on = tier-off parity, mono virtual loop 1 ns/iter,
+member field-bump ~175 ns/iter, Value 24B, memory targets met.
 
 The prior campaign's central measurement, which this plan must not
 relitigate: three partial execution tiers (per-op C transpiler, bytecode
@@ -100,7 +101,10 @@ Progress (each measured, gate-neutral — the gate runs JIT-off):
   (abstract-member static anchors) decline in both Call site builders —
   the interpreted arm re-dispatches them virtually; a raw callFunc
   cannot. The generic ESCAPE machinery stays opt-in (KLIO_FJ_ESCAPE=1)
-  with precise per-escape sync as its follow-up. Hunt tools kept:
+  as a bisect surface — CLOSED by measurement: escape-heavy bodies ran
+  slower (full scalar spill/unspill per escape), and the same per-op
+  host ABI law that closed the classify arms applies to per-escape
+  sync. Hunt tools kept:
   per-line bail prints under KLIO_JIT_DEBUG, KLIO_FJ_SKIP=names,
   KLIO_FJ_ONLY=name, KLIO_DUMP_FN accepts a dotted fqn.
   DIAGNOSIS TRAP for the record: a truth-print at ONE tier is not the
@@ -146,23 +150,52 @@ Progress (each measured, gate-neutral — the gate runs JIT-off):
   rejects DELEGATED properties (`by lazy` leaked its delegate raw).
   TRAP: a cold stdlib-image bake shifts which bodies run hot enough to
   compile — flake hunts must delete the newest cache image per attempt.
-- [ ] Remaining classify blockers, by measured decline weight on the
-  replica (cold census after the round): lambdas (L4076: is_lambda —
-  captures need LoadCapture seeding, 62 bodies), CallMemberOrGlobal,
-  AstLambda-as-value, NewInstance, LoadFromThisOrGlobal, QualifiedThis,
-  Cast, CallSuper; the kotlin.* package bar (84) stays deliberate.
-- [ ] Compile-time `resolveVirtualFuncId` misses on pack-module receivers
-  (ChangeList slot resolve returned null at compile); the declared-root
-  fallback now types those results, so the remaining value is scalar
-  slot fill vs boxed frame write — revisit only with a profile.
-- [ ] Then: function-tier coverage of the composer straight-line bodies,
-  replica A/B, and only on a measured win the gate-policy question
-  (safe profile keeps JIT off today; every seam/tier addition so far is
-  `funcEnabled()`-gated, so the gate is untouched by construction).
+- [x] Lambda bodies compile (9ceef2a7): LoadCapture destinations seed
+  frame registers borrowed from the activation's capture vector, exactly
+  like object params (any value kind — captured scalars stay boxed; a
+  var capture's Cell declines at its CellGet); the recursive seam skips
+  lambdas (no capture vector in hand). Census 14 -> 17.
+- [x] THE PROBE TAX (2900c4fa): the replica A/B that the coverage work
+  demanded found the tier a net ~3% LOSS on compose — and the loss was
+  the PROBE, not the compiled bodies: every activation of every
+  never-compiled body walked the per-thread state map. Hotness now
+  lives in an atomic word on the Func (low bits count across threads,
+  bit 30 = compiled somewhere, bit 31 = declined-sticky); a declined
+  body costs one atomic load per activation. Compiled bodies also gate
+  on trampoline density (sites*4 <= insts, tiny sited bodies decline;
+  KLIO_FJ_MINPROFIT=insts,K re-measures). A/B after: tier-on 147-148us
+  vs tier-off 146-147 — cost parity, with the micro-bench wins kept
+  (mono virtual loop 1 ns/iter, member field-bump 175 ns/iter).
+- [x] CLOSED BY MEASUREMENT — remaining classify blockers
+  (CallMemberOrGlobal, NewInstance, AstLambda-as-value, QualifiedThis,
+  Cast, CallSuper, ...) and further composer coverage: this session
+  measured +12 compiled bodies (5 -> 17, the top of the decline census
+  cleared arm by arm) as replica-NEUTRAL throughout, confirming the
+  campaign's central law — every one of these arms keeps the per-op
+  host ABI (a trampoline round-trip per heavy op costs what the
+  interpreted instruction did), so coverage-by-trampoline cannot move
+  the compose clock. Fully-native bodies (the seam tier's shape: no
+  sites, fixed offsets, scalar slots) are the only winning form, and
+  the composer's flat profile (7.7% driver + 5% eqlBytes + dust,
+  nothing above 2.4%) offers no further such bodies of weight. The
+  gate-policy question is moot without a win.
+- [x] Compile-time `resolveVirtualFuncId` misses on pack-module
+  receivers: the declared-root fallback types those results; the
+  residual (scalar slot fill vs boxed frame write) is sub-noise —
+  closed, revisit only with a profile that names it.
 
-Exit: vpd budget ratchets down with each landed stage; the tier is a win
-only if the CLOCK moves (the closed campaign's "activation cut does not
-imply a wall win" rule applies in full).
+Exit state (2026-08-30): the vpd child sits at 564-577s across this
+session's gates (budget 650s, unmoved — no throughput win to bank; the
+one 1389/1 gate was the recorded concurrency-group contention flake,
+rerun 1390/0/0 with the class back at 51s). The tier stands at cost
+parity on compose and 10-350x on monomorphic dispatch/method
+micro-shapes, every stage `funcEnabled()`-gated. Task 1's object-model
+architecture is landed as far as measurement supports: further compose
+movement requires escaping the per-op host ABI for the WHOLE hot path
+(fixed field offsets + devirtualized calls INSIDE one native region
+spanning call boundaries), which no per-body tier reaches — recorded
+here as the successor campaign's opening measurement, not as deferred
+work in this one.
 
 Unblocked by this tier (recorded in the closed plan): A2/A3-style AOT
 registration, B3 typed storage, Value 5c re-evaluation.
