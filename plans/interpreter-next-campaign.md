@@ -176,16 +176,13 @@ the `fast` profile, so the whole-function tier is live in run mode. It
 stays, as does `KLIO_JIT` (loop JIT: 60-79x on numeric loops, -27% on
 compose shapes — a workload policy switch; `klio test` forces safe).
 
-Soak list — bisect knobs for landed defaults; after one further green
-gate cycle with no bisect use, delete the knob and keep the default:
-- `KLIO_CANON` (name canonicalization; landed 2026-08-29)
-- `KLIO_TY_MEMO` (typing memo; landed 2026-08-28)
-- `KLIO_BC` / `KLIO_COUNTED` (bytecode tier; default-on since the
-  static-dispatch campaign)
-- `KLIO_COMPOSE_MEMO` / `KLIO_COMPOSE_SKIP` (plugin emission; the plugin
-  is the only compose path)
-- `KLIO_FUSED_MAT` / `KLIO_FUSED_MINPREFIX` (fold into the walker;
-  `KLIO_FUSED=0` + the fqn name-list stay as the one permanent bisect)
+Soak finalization DONE 2026-08-30 (a79439af): `KLIO_CANON`,
+`KLIO_TY_MEMO`, `KLIO_BC`, `KLIO_COUNTED`, `KLIO_COMPOSE_MEMO`,
+`KLIO_COMPOSE_SKIP` removed — defaults unconditional, docs scrubbed.
+Still soaking (deliberately, while the walker sits adjacent to the live
+method-tier hunt): `KLIO_FUSED_MAT` / `KLIO_FUSED_MINPREFIX` (fold into
+the walker once the hunt closes; `KLIO_FUSED=0` + the fqn name-list stay
+as the one permanent bisect).
 
 Keep permanently (policy or active bisect, not soak): `KLIO_COMPOSE_FAST`
 mask (caught the linkbuffer trap twice), `KLIO_MEMBER_INLINE` name-list,
