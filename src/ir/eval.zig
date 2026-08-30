@@ -4803,7 +4803,7 @@ pub fn evalWithCapturesChained(
         captures.items.len == 0 and
         (!nativeModuleOk(module) or nativeFor(func.id.int(), func.fqn) == null))
     {
-        if (try fusedExecOpt(H, allocator, module, func, args.items, host, fusedMaterializeEnabled())) |fr| {
+        if (try fusedExecOpt(H, allocator, module, func, args.items, host, true)) |fr| {
             var a = args;
             a.deinit(allocator);
             var c = captures;
@@ -5756,7 +5756,7 @@ fn runFlatLoop(
                     }
                     break :blk_cm2 f.module;
                 };
-                const fr = (try fusedExecOpt(H, allocator, callee_mod2, site.req.func, site.req.args.items, host, fusedMaterializeEnabled())) orelse break :fused;
+                const fr = (try fusedExecOpt(H, allocator, callee_mod2, site.req.func, site.req.args.items, host, true)) orelse break :fused;
                 const dst = site.req.dst;
                 discardFlatReq(H, allocator, site.req, host);
                 switch (fr) {
@@ -11541,19 +11541,6 @@ pub fn fusedEnabled() bool {
     return fused_enabled_val;
 }
 
-var fused_mat_state: u8 = 0;
-var fused_mat_val: bool = false;
-/// `KLIO_FUSED_MAT=1` lets a PARTIAL body materialize mid-flight —
-/// OPT-IN while the materialized frame's resolution context hardens
-/// (a bare `add` inside a materialized remainder resolved as an
-/// unresolved global; four CompositionTests regressed).
-fn fusedMaterializeEnabled() bool {
-    if (fused_mat_state == 0) {
-        fused_mat_val = !std.mem.eql(u8, runtime.envOnce("KLIO_FUSED_MAT") orelse "1", "0");
-        fused_mat_state = 1;
-    }
-    return fused_mat_val;
-}
 
 fn fusedNameSelected(name: []const u8) bool {
     const sel = fused_sel orelse return true;
@@ -11718,21 +11705,14 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
             }
         }
     }
-    if (heavy and entry_heavy and entry_prefix < fusedMinPrefix()) return 2;
+    if (heavy and entry_heavy and entry_prefix < fused_min_prefix) return 2;
     return if (heavy) 4 else 1;
 }
 
-var fused_minprefix_state: u8 = 0;
-var fused_minprefix_val: usize = 24;
-fn fusedMinPrefix() usize {
-    if (fused_minprefix_state == 0) {
-        if (runtime.envOnce("KLIO_FUSED_MINPREFIX")) |raw| {
-            fused_minprefix_val = std.fmt.parseInt(usize, raw, 10) catch 24;
-        }
-        fused_minprefix_state = 1;
-    }
-    return fused_minprefix_val;
-}
+
+/// A heavy body whose fusable entry prefix is shorter than this runs
+/// framed: the prefix win cannot pay for the materialize handoff.
+const fused_min_prefix: usize = 24;
 
 const FusedFail = error{ Raise, Materialize } || Allocator.Error;
 threadlocal var fused_err: EvalError = undefined;
