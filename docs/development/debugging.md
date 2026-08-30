@@ -14,7 +14,7 @@ Four idioms cover almost every variable:
   switches work this way (`KLIO_ERR_TRACE=1`).
 - **Truthy flags**: non-empty and not `"0"` enables; `=0` or empty
   disables. Used where a default-on feature needs an off switch
-  (`KLIO_STDLIB_IMAGE=0`, `KLIO_COMPOSE_MEMO=0`) and by a few gates
+  (`KLIO_STDLIB_IMAGE=0`) and by a few gates
   (`KLIO_OR_AUDIT`, `KLIO_TRACE_PATH`, `KLIO_TRACE_INVARIANTS`).
   The tables below say "`0`/empty off" for these.
 - **Name filters**: the value is a function/type name the trace is
@@ -302,15 +302,12 @@ path — it always runs. These knobs bisect its two emissions.
 
 | Variable | Values | What it shows/does | Output tag |
 |----------|--------|--------------------|------------|
-| `KLIO_COMPOSE_MEMO` | `0` off (default on) | Whether composable-lambda arguments are wrapped in remembered `composableLambda` instances (matching kotlinc) | none |
-| `KLIO_COMPOSE_SKIP` | `0` off (default on) | Whether restartable composables emit the skip calculus (the `$dirty` probes and skip branch); an A/B bisection switch | none |
 | `KLIO_COMPOSE_DBG` | set | One activation summary line (oracle sizes) plus group-emission debug inside the pass | `[compose-pass]` |
 | `KLIO_COMPOSER_BIND_TRACE` | set | Each call that threads the `$composer, $changed` pair: the owning declaration and the composer's class (a non-Composer instance in the pair slot also dumps the frame chain) | `[composer-bind-fn]`, `[composer-bind]` |
 | `KLIO_RSS_LOG` | set | Prints process RSS on each rendered Compose UI frame | `[rss]` |
 
 ```sh
 ./zig-out/bin/klio run scene.kt      # plugin lowering
-KLIO_COMPOSE_MEMO=0 ./zig-out/bin/klio run scene.kt   # no lambda memoization
 KLIO_COMPOSE_SKIP=0 ./zig-out/bin/klio run scene.kt   # bisect the skip calculus
 ```
 
@@ -337,8 +334,6 @@ variables override individual fields on top of it.
 |----------|--------|--------------------|------------|
 | `KLIO_OPT` | `fast`/`safe`/`off` (aliases: `full`, `on`, `balanced`, `none`, `interp`) | Selects the performance profile: JIT tiers plus memory backend. `klio run` defaults to `fast`, `klio test` to `safe` | none |
 | `KLIO_JIT` | `1` on, `0` off | Loop-tier JIT override on top of the profile (on by default under `fast`) | none |
-| `KLIO_BC` | `0` off (default on) | The bytecode tier: dense per-block u32 op streams replacing the walker's union dispatch for the hot simple ops; `0` restores the pure tree walker for bisection | none |
-| `KLIO_COUNTED` | `0` off (default on) | Counted-range for-loop strength reduction (`for (i in a until b)` as a register loop); `0` restores the iterator lowering for bisection | none |
 | `KLIO_FLAT` | `0` off (default on) | The flat call driver; `0` falls back to native recursion for every call (bisect) | none |
 | `KLIO_FLAT_VCALL` | `0` off (default on) | The fused virtual flat path; `0` keeps slot-bound and lowering-resolved member calls on the recursive invoker (bisect) | none |
 | `KLIO_MEMBER_SITE` | `0` off (default on) | The `CallMember` instruction-site memo — the by-name replay path; `0` disables for bisection | none |
@@ -520,7 +515,6 @@ emissions:
 
 ```sh
 ./zig-out/bin/klio run scene.kt                                # plugin (always on)
-KLIO_COMPOSE_MEMO=0 ./zig-out/bin/klio run scene.kt            # no lambda memoization
 KLIO_COMPOSE_SKIP=0 ./zig-out/bin/klio run scene.kt            # no skip calculus
 ```
 

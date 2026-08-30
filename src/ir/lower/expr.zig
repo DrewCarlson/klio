@@ -12139,7 +12139,7 @@ fn memoAlloc() std.mem.Allocator {
 }
 
 fn tyMemoOn() bool {
-    return !std.mem.eql(u8, runtime.envOnce("KLIO_TY_MEMO") orelse "1", "0");
+    return true;
 }
 
 pub const TyMemoHit = struct { ty: ?ir.TypeRef };

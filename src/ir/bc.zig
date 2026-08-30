@@ -2,7 +2,7 @@
 //! tree-walker's per-instruction union dispatch for the hot simple ops,
 //! with an ESCAPE op executing everything else through the walker's own
 //! `execInst` — total coverage, shared semantics (see the frozen v1 spec
-//! in plans/bytecode-vm-plan.md). On by default; `KLIO_BC=0` restores
+//! in plans/bytecode-vm-plan.md). Always on; it
 //! the pure walker.
 //!
 //! FUSED terminators: a function with no try/catch/finally metadata
@@ -64,19 +64,11 @@ pub const Stream = struct {
     idx_pc: []const u32,
 };
 
-var gate_checked: bool = false;
-var gate_on: bool = true;
 
 /// The tier is ON by default; `KLIO_BC=0` restores the pure walker
 /// for bisection.
 pub fn enabled() bool {
-    if (!gate_checked) {
-        gate_checked = true;
-        if (std.c.getenv("KLIO_BC")) |v| {
-            gate_on = !std.mem.eql(u8, std.mem.span(v), "0");
-        }
-    }
-    return gate_on;
+    return true;
 }
 
 /// Per-FUNCTION stream tables (one entry per block, indexed by BlockId),

@@ -557,8 +557,7 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
     // shared borrow the callers hold guards nothing concurrent here —
     // prepare is single-threaded — so the const cast is sound.
     {
-        const canon_off = if (runtime.envOnce("KLIO_CANON")) |v| std.mem.eql(u8, v, "0") else false;
-        const need = !canon_off and blk: {
+        const need = blk: {
             const pg = self.prog.borrow();
             defer pg.deinit();
             break :blk pg.get().canonicalized_module_identity != self.module.identity();
