@@ -5845,7 +5845,7 @@ fn runFlatLoop(
                 const vres: ?jit_loop.VirtResolver = if (comptime @hasDecl(H, "resolveVirtualFuncId")) &LoopTramp(H).resolveVirtual else null;
                 const fres: ?jit_loop.FieldResolver = if (comptime @hasDecl(H, "plainStoredFieldIndex")) &LoopTramp(H).resolveField else null;
                 const fnres: ?jit_loop.FieldResolver = if (comptime @hasDecl(H, "plainStoredScalarFieldNN")) &LoopTramp(H).resolveFieldNN else null;
-                const fo = jit_loop.maybeRunHotFunc(act.frame.module, site.req.func, &act.frame.regs, act.frame.params.items, allocator, &LoopTramp(H).call, @ptrCast(&hctx), mres, vres, fres, fnres) orelse break :hook;
+                const fo = jit_loop.maybeRunHotFunc(act.frame.module, site.req.func, &act.frame.regs, act.frame.params.items, act.frame.captures.items, allocator, &LoopTramp(H).call, @ptrCast(&hctx), mres, vres, fres, fnres) orelse break :hook;
                 if (fo.code.inst == jit_loop.RETURN_INST) {
                     var res2: EvalResult = ok(fo.value);
                     const act2 = stack.pop().?;
@@ -6882,7 +6882,7 @@ fn runFrameExec(
                 if (cur.int() == func.entry.int() and resume_idx == 0 and
                     resume_throw == null and resume_unwind == null)
                 {
-                    if (jit_loop.maybeRunHotFunc(frame.module, func, &frame.regs, frame.params.items, allocator, tramp_fn, tramp_user, member_resolver, virt_resolver, field_resolver, field_nn_resolver)) |fo| {
+                    if (jit_loop.maybeRunHotFunc(frame.module, func, &frame.regs, frame.params.items, frame.captures.items, allocator, tramp_fn, tramp_user, member_resolver, virt_resolver, field_resolver, field_nn_resolver)) |fo| {
                         if (fo.code.inst == jit_loop.RETURN_INST) {
                             return ok(fo.value);
                         }

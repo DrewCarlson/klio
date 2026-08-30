@@ -353,6 +353,9 @@ pub const CompiledLoop = struct {
     /// list keeps the value alive, and the unset write-mask means an
     /// in-body overwrite releases nothing it does not own) before entry.
     obj_param_loads: []ObjParamLoad = &.{},
+    /// Lambda captures whose LoadCapture destinations seed FRAME registers
+    /// (borrowed, like object params); `param_idx` is the capture index.
+    capture_loads: []ObjParamLoad = &.{},
     method_fields: []MethodFieldCheck = &.{},
     /// The return register to read from the LIVE FRAME on RETURN when the
     /// escape chain left it untyped (result_rt then describes the declared
@@ -372,6 +375,7 @@ pub const CompiledLoop = struct {
         self.allocator.free(self.read_set);
         self.allocator.free(self.def_set);
         if (self.obj_param_loads.len != 0) self.allocator.free(self.obj_param_loads);
+        if (self.capture_loads.len != 0) self.allocator.free(self.capture_loads);
         if (self.method_fields.len != 0) self.allocator.free(self.method_fields);
         self.allocator.free(self.arrays);
         self.allocator.free(self.cells);
@@ -4135,9 +4139,9 @@ fn inferFuncTypes(a: Allocator, module: *const Module, func: *const Func, n_regs
 /// are positional top-level calls (so direct recursion stays native through the
 /// call trampoline). `params` are the live arguments at the hot call, used to
 /// specialize param kinds. Returns null for any unsupported shape.
-pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, params: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
+pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, params: []const Value, captures: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
     if (func.blocks.len == 0) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4075\n", .{func.name}); return null; }
-    if (func.is_suspend or func.is_lambda or func.is_inline) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4076\n", .{func.name}); return null; }
+    if (func.is_suspend or func.is_inline) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4076\n", .{func.name}); return null; }
     // Bisect: KLIO_FJ_ONLY=name compiles only that body.
     if (runtime.envOnce("KLIO_FJ_ONLY")) |only| {
         if (!std.mem.eql(u8, only, func.name)) return null;
@@ -4214,6 +4218,25 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     }
     const recv_regs = recv_regs_buf[0..n_recv_regs];
     const obj_loads = obj_loads_buf[0..n_obj_loads];
+
+    // Lambda captures: every LoadCapture destination is a FRAME register
+    // seeded borrowed from the activation's capture vector (any value kind —
+    // a captured scalar stays boxed; a `var` capture's Cell declines at its
+    // CellGet). The capture INDEX layout is static per lambda body, so the
+    // compile-time snapshot only bounds the indexes.
+    var cap_loads_buf: [16]ObjParamLoad = undefined;
+    var n_cap_loads: usize = 0;
+    for (func.blocks) |*blk| {
+        for (blk.insts) |*inst| {
+            if (inst.* != .LoadCapture) continue;
+            const lcx = inst.LoadCapture;
+            if (lcx.idx >= captures.len or lcx.idx > std.math.maxInt(u16)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: cap-idx\n", .{func.name}); return null; }
+            if (n_cap_loads >= cap_loads_buf.len) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: cap-cap\n", .{func.name}); return null; }
+            cap_loads_buf[n_cap_loads] = .{ .param_idx = @intCast(lcx.idx), .reg = lcx.dst.int() };
+            n_cap_loads += 1;
+        }
+    }
+    const cap_loads = cap_loads_buf[0..n_cap_loads];
 
     const isRecvReg = struct {
         fn f(set: []const u32, r: u32) bool {
@@ -4433,6 +4456,10 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         for (obj_loads) |opl| {
             if (opl.reg >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4353\n", .{func.name}); return null; }
             _ = setType(types, Reg.from(opl.reg), .object);
+        }
+        for (cap_loads) |cpl| {
+            if (cpl.reg >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: cap-reg\n", .{func.name}); return null; }
+            _ = setType(types, Reg.from(cpl.reg), .object);
         }
         // An escaped instruction's destination types by its statically known
         // result kind where one exists, so consumers (a Branch condition, a
@@ -4995,6 +5022,10 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         (a.dupe(ObjParamLoad, obj_loads) catch return null)
     else
         &.{};
+    const cap_loads_owned: []ObjParamLoad = if (cap_loads.len != 0)
+        (a.dupe(ObjParamLoad, cap_loads) catch return null)
+    else
+        &.{};
     const method_fields_owned: []MethodFieldCheck = blk: {
         if (field_pres.items.len == 0) break :blk &.{};
         const out2 = a.alloc(MethodFieldCheck, field_pres.items.len) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4748\n", .{func.name}); return null; };
@@ -5030,6 +5061,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .can_deopt = can_deopt,
         .has_tramp_sites = field_sites_base != 0,
         .obj_param_loads = obj_loads_owned,
+        .capture_loads = cap_loads_owned,
         .method_fields = method_fields_owned,
         .result_reg_slot = result_reg_slot,
         .self_dbg_name = func.name,
@@ -5177,10 +5209,13 @@ pub fn methodSeamProbe(func: *const Func) SeamProbe {
 /// One-shot compile for a seam-probed body (`.compile`). Marks the state
 /// tried either way, exactly like `maybeRunHotFunc`'s trigger.
 pub fn methodSeamCompile(module: *const Module, func: *const Func, params: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, user: ?*anyopaque) void {
+    // A lambda's captures are not in hand here; leave it untried so the
+    // framed/flat hooks (which have the activation's capture vector) compile it.
+    if (func.is_lambda) return;
     const fj = forFunc(func) orelse return;
     if (fj.func_tried) return;
     fj.func_tried = true;
-    const compiled = tryCompileFunc(metadata_allocator, module, func, params, resolver, virt_resolver, field_resolver, field_nn_resolver, user) catch null;
+    const compiled = tryCompileFunc(metadata_allocator, module, func, params, &.{}, resolver, virt_resolver, field_resolver, field_nn_resolver, user) catch null;
     if (compiled) |cl| {
         if (debugEnabled()) std.debug.print("[jit] compiled method {s} (fqn={s} mfields={d} sites={d} guard={x} deopt-free={})\n", .{ func.name, func.fqn, cl.method_fields.len, cl.call_sites.len, cl.guard_class, !cl.can_deopt });
         fj.func_jit = cl;
@@ -5197,14 +5232,14 @@ pub fn fusedShouldYieldToFuncTier(func: *const Func) bool {
     return fj.func_count >= HOT_THRESHOLD;
 }
 
-pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), params: []const Value, allocator: Allocator, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?FuncOutcome {
+pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), params: []const Value, captures: []const Value, allocator: Allocator, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?FuncOutcome {
     if (!funcEnabled()) return null;
     const fj = forFunc(func) orelse return null;
     if (!fj.func_tried) {
         fj.func_count += 1;
         if (fj.func_count < HOT_THRESHOLD) return null;
         fj.func_tried = true;
-        const compiled = tryCompileFunc(metadata_allocator, module, func, params, resolver, virt_resolver, field_resolver, field_nn_resolver, user) catch |e| blk: {
+        const compiled = tryCompileFunc(metadata_allocator, module, func, params, captures, resolver, virt_resolver, field_resolver, field_nn_resolver, user) catch |e| blk: {
             if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: ERR {s}\n", .{ func.name, @errorName(e) });
             break :blk null;
         };
@@ -5229,6 +5264,12 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
         // a null — declines to the interpreter before anything runs.
         if (params[opl.param_idx] != .Instance) return null;
         regs.items[opl.reg] = params[opl.param_idx];
+    }
+    for (cl.capture_loads) |cpl| {
+        if (cpl.param_idx >= captures.len or cpl.reg >= regs.items.len) return null;
+        // Borrowed, like the object params: the activation's capture vector
+        // owns the value for the run.
+        regs.items[cpl.reg] = captures[cpl.param_idx];
     }
     var stack_slots: [128]i64 = undefined;
     var heap_slots: ?[]i64 = null;
