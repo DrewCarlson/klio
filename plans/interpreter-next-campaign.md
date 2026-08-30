@@ -86,7 +86,21 @@ Progress (each measured, gate-neutral — the gate runs JIT-off):
   through callMemberNamedDeclared (latent loop-mode bug); object params
   seed frame registers borrowed (unset write-mask = clean overwrite);
   KLIO_FJ_SKIP bisects bodies.
-- [x] Member/virtual sites in FUNCTION mode, DEFAULT ON (d5315202).
+- [!] REGRESSION FOUND, DEFAULT REVERTED (d9da6346): the milestone's
+  32-clean validation ran on a build whose instReadsDef scratch
+  OVERFLOWED (the [4]Reg buffer vs 6-arg caps, fixed in 97d66d7e) — with
+  real read-sets computed, the compose replica fails reproducibly under
+  member sites (applyChanges runtimeCheck; live suspect =
+  androidx.collection.ScatterMap.isNotEmpty in method mode: _size read
+  field[5] name-verified returns 0, and a second same-name variant
+  compiles with EMPTY method_fields on another thread — chase THAT
+  variant first: which fid, why no field machinery, what it returns).
+  Member/virtual sites are opt-in (KLIO_FJ_MEMBER=1) until this
+  root-causes; the generic ESCAPE machinery landed opt-in too
+  (KLIO_FJ_ESCAPE=1) with precise per-escape sync as its follow-up.
+  Diagnostics that now exist for the hunt: every tryCompileFunc bail
+  prints its line under KLIO_JIT_DEBUG; KLIO_FJ_SKIP=names bisects.
+- [x] Member/virtual sites in FUNCTION mode machinery (d5315202).
   Both launch repros dissolved as ONE bug: the object-param seed table
   was never copied into the CompiledLoop, so member receivers read
   stale pooled-frame registers (the "GapComposer receiver" was pool
