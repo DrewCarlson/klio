@@ -75,13 +75,26 @@ Progress (each measured, gate-neutral — the gate runs JIT-off):
   TRAPS recorded: native field sites must not trip the tramp-required
   bail (has_tramp_sites); `\$sgetter\$` scoped names resolve through
   memberFieldName; the seam decline print is KLIO_JIT_DEBUG-gated.
-- [ ] NEXT — run `can_deopt` compiled bodies for member calls: the
-  framed entry hook (eval ~6630) already has FULL deopt-resume
-  semantics (`cur = fo.code.block; resume_idx = fo.code.inst`), but the
-  bc-stream/flat driver bypasses it — place the same maybeRunHotFunc
-  attempt at the bc/flat activation open. That unlocks the
-  calls-and-branches method shapes (IntStack.push with its resize()
-  branch; `asInt` compiles today but never runs).
+- [x] Flat-activation function-tier hook (2b35a8bb): the flat driver
+  makes the same attempt as the framed entry hook when an activation
+  opens (RETURN delivers as the driver's own completion; throw/deopt
+  resume in the fresh frame; function-mode bodies are suspension-free
+  by construction). Compose helpers and can-deopt methods now compile
+  and run from member dispatch.
+- [x] Object-param plumbing + the DECLARED-receiver tramp fix
+  (a10aab67): member tramp sites carry the declared head and dispatch
+  through callMemberNamedDeclared (latent loop-mode bug); object params
+  seed frame registers borrowed (unset write-mask = clean overwrite);
+  KLIO_FJ_SKIP bisects bodies.
+- [ ] NEXT — member/virtual sites in FUNCTION mode (held back, two named
+  repros): `Changes.isNotEmpty` — an interface default's bare
+  `isEmpty()` resolves through the executing frame's receiver tower +
+  visibility surface (a file-private extension), context the by-name
+  tramp lacks: the framed-context parity family (the fused walker's
+  currentFrameFunc/tower/span work is the template) must reach the
+  tramp handler first. And `SlotWriter.dataIndexToDataAnchor` — an
+  arg-dataflow hole that read Unit (diagnose with KLIO_FJ_SKIP +
+  KLIO_DUMP_FN before re-enabling).
 - [ ] Remaining classify blockers, in unblock order: CallMemberOrValue /
   CallMemberOrGlobal, InstanceOf, EnclosingPush/Pop, StoreGlobal,
   NewInstance, QualifiedThis (each is a tramp arm or a native check;
