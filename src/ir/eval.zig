@@ -6372,13 +6372,16 @@ fn LoopTramp(comptime H: type) type {
                     lc.pending_deopt_inst = site.inst;
                     return jit_loop.deoptCode(site.block);
                 }
-                const fidx: u32 = if (site.field_named)
-                    (lc.host.plainStoredFieldIndex(lc.allocator, &recv, site.name) orelse {
+                const fidx: u32 = if (site.field_named) blk_fn: {
+                    if (comptime !@hasDecl(H, "plainStoredFieldIndex")) {
                         lc.pending_deopt_inst = site.inst;
                         return jit_loop.deoptCode(site.block);
-                    })
-                else
-                    site.field_idx;
+                    }
+                    break :blk_fn lc.host.plainStoredFieldIndex(lc.allocator, &recv, site.name) orelse {
+                        lc.pending_deopt_inst = site.inst;
+                        return jit_loop.deoptCode(site.block);
+                    };
+                } else site.field_idx;
                 const g = recv.Instance.borrow();
                 const fv: ?Value = if (fidx < g.get().fields.items.len) g.get().fields.items[fidx].value else null;
                 g.deinit();

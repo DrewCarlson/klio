@@ -4736,6 +4736,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                     // and boxes the value into the frame register; a getter
                     // property or non-Instance receiver deopts (the read is
                     // pure, so the interpreter re-runs it).
+                    if (field_resolver == null) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: field-host\n", .{func.name}); return null; }
                     const tf = trampolinableFieldOf(module, inst) orelse { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: field-name\n", .{func.name}); return null; };
                     if (tf.recv.int() >= n_regs or typeAt(types, tf.recv) != .object) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: field-recv\n", .{func.name}); return null; }
                     if (tf.dst.int() >= n_regs or typeAt(types, tf.dst) != .object) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: field-dst\n", .{func.name}); return null; }
