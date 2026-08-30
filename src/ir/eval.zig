@@ -6210,7 +6210,7 @@ fn LoopTramp(comptime H: type) type {
             // callee runs its body directly — no interpreter frame, no dispatch.
             // The callee is pure (scalar in, scalar out), so a deopt/throw can
             // safely fall back to the frame-based path by re-running it below.
-            if (!site.is_member and !runtime.shouldAbandon()) {
+            if (!site.is_member and !site.is_virtual and !runtime.shouldAbandon()) {
                 if (lc.module.funcById(site.func)) |callee| {
                     if (jit_loop.compiledFunc(callee)) |callee_cl| {
                         if (evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and callee_cl.n_slots <= 192) {
@@ -6244,7 +6244,33 @@ fn LoopTramp(comptime H: type) type {
                     }
                 }
             }
-            const res = if (site.is_member) member: {
+            const res = if (site.is_virtual) virt: {
+                if (comptime !@hasDecl(H, "invokeVirtualMember")) {
+                    break :virt EvalResult{ .err = .{
+                        .Type = "host cannot dispatch virtual calls",
+                    } };
+                }
+                var recv = switch (cl.reg_types[site.recv_reg]) {
+                    .object, .unknown => lc.frame.regs.items[site.recv_reg],
+                    .null_ => Value.Null,
+                    else => jit_loop.valueFromSlotTagged(cl.reg_types[site.recv_reg], tctx.tags[site.recv_reg], tctx.slots[site.recv_reg]),
+                };
+                recv.retain();
+                defer recv.release(lc.allocator);
+                var names: [3]?[]const u8 = .{ null, null, null };
+                break :virt lc.host.invokeVirtualMember(
+                    lc.allocator,
+                    &recv,
+                    ir.MethodSlotId.from(site.virt_slot),
+                    argbuf[0..site.n_args],
+                    names[0..site.n_args],
+                    null,
+                    null,
+                ) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
+                    return jit_loop.throwCode(site.block);
+                };
+            } else if (site.is_member) member: {
                 const recv_tag_src: usize = if (site.recv_tag_reg != 0) site.recv_tag_reg else site.recv_reg;
                 var recv = switch (cl.reg_types[site.recv_reg]) {
                     .object, .unknown => lc.frame.regs.items[site.recv_reg],

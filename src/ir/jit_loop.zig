@@ -212,6 +212,12 @@ pub const CallSite = struct {
     is_map_get: bool = false,
     is_map_set: bool = false,
     map_flag_slot: u32 = 0,
+    /// Slot-resolved virtual dispatch (`CallVirtual`): the callback rebuilds
+    /// the receiver + args and runs the host's `invokeVirtualMember` with
+    /// `virt_slot` — dispatch stays dynamic (correct for any receiver class),
+    /// so no class guard is needed.
+    is_virtual: bool = false,
+    virt_slot: u32 = 0,
 };
 
 /// One packed array a compiled loop indexes: the register holding it, the
@@ -767,6 +773,24 @@ fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember 
                 .resolved = cm.resolved,
                 .dispatch_recv = cm.dispatch_receiver,
             };
+        },
+        else => return null,
+    }
+}
+
+/// A slot-resolved `CallVirtual` the loop JIT can trampoline: the callback
+/// runs the host's virtual dispatch with the recorded slot. Positional only
+/// (a param map, named args, or a trailing lambda keeps the interpreted arm's
+/// binding machinery), at most three args like the other tramp forms.
+const TrampVirtual = struct { recv: Reg, slot: u32, args_reg: u32, n_args: u32, dst: Reg };
+
+fn trampolinableVirtualOf(inst: *const Inst) ?TrampVirtual {
+    switch (inst.*) {
+        .CallVirtual => |cv| {
+            if (cv.arg_names.len != 0 or cv.arg_params != null) return null;
+            if (cv.trailing_lambda) return null;
+            if (cv.n_args > 3) return null;
+            return .{ .recv = cv.receiver, .slot = cv.slot.int(), .args_reg = cv.args.int(), .n_args = cv.n_args, .dst = cv.dst };
         },
         else => return null,
     }
@@ -1426,6 +1450,16 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[4]Reg, n_read
         }
         n_reads.* = recv_scalar + @as(usize, mc.n_args);
         if (isScalarRt(typeAt(types, mc.dst))) def.* = mc.dst;
+        return;
+    }
+    // A trampolined virtual call reads scalar args (its receiver is an object
+    // register, boxed for the host callback); its dst is a scalar def only
+    // when the result types scalar.
+    if (trampolinableVirtualOf(inst)) |vc| {
+        var k: u8 = 0;
+        while (k < vc.n_args and k < 3) : (k += 1) reads[k] = Reg.from(vc.args_reg + k);
+        n_reads.* = vc.n_args;
+        if (isScalarRt(typeAt(types, vc.dst))) def.* = vc.dst;
         return;
     }
     // A trampolined field read takes no scalar inputs (the receiver stays boxed);
@@ -2336,6 +2370,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (bitwiseOpOf(module, inst) != null) continue;
             if (trampolinableCallOf(inst) != null) continue;
             if (trampolinableMemberOf(module, inst) != null) continue;
+            if (trampolinableVirtualOf(inst) != null) continue;
             if (trampolinableFieldOf(module, inst) != null) continue;
             if (trampolinableFieldSetOf(module, inst) != null) continue;
             if (trampolinableCallValueOf(inst) != null) continue;
@@ -2559,6 +2594,17 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 // the callback validates that kind on every invocation.
                 if (mc.dst.int() < n_regs and member_ret[mc.dst.int()] == .unknown and mc.dst.int() < regs.len) {
                     if (liveValueRegType(regs[mc.dst.int()])) |rt| member_ret[mc.dst.int()] = rt;
+                }
+                continue;
+            }
+            if (trampolinableVirtualOf(inst)) |vc| {
+                if (arrays.items.len != 0) return null;
+                if (vc.recv.int() >= n_regs or vc.recv.int() >= regs.len) return null;
+                // Dispatch is dynamic (per-receiver), so the result type comes
+                // from the live loop state alone; the callback's result write
+                // validates the kind on every invocation.
+                if (vc.dst.int() < n_regs and member_ret[vc.dst.int()] == .unknown and vc.dst.int() < regs.len) {
+                    if (liveValueRegType(regs[vc.dst.int()])) |rt| member_ret[vc.dst.int()] = rt;
                 }
                 continue;
             }
@@ -2835,6 +2881,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         for (blk_insts, 0..) |*inst, i| {
             const is_call = trampolinableCallOf(inst) != null;
             const is_member = trampolinableMemberOf(module, inst) != null;
+            const is_virtual = trampolinableVirtualOf(inst) != null;
             const is_field = trampolinableFieldOf(module, inst) != null;
             const is_obj_move = switch (inst.*) {
                 .Move => |m| typeAt(types, m.dst) == .object or typeAt(types, m.src) == .object,
@@ -2851,14 +2898,14 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             const is_call_value = trampolinableCallValueOf(inst) != null;
             const is_load_global = trampolinableGlobalOf(module, inst) != null;
             const is_field_set = trampolinableFieldSetOf(module, inst) != null;
-            if (!is_call and !is_member and !is_field and !is_field_set and !is_obj_move and !is_null_check and !is_obj_index and !is_call_value and !is_load_global and !is_map_get and !is_map_set) continue;
+            if (!is_call and !is_member and !is_virtual and !is_field and !is_field_set and !is_obj_move and !is_null_check and !is_obj_index and !is_call_value and !is_load_global and !is_map_get and !is_map_set) continue;
             if (arrays.items.len != 0) {
                 if (debugEnabled()) std.debug.print("[jit]   bail: call + {d} arrays in {s}\n", .{ arrays.items.len, func.name });
                 return null;
             }
             // Every scalar arg must already live in a typed slot (field reads have none).
-            const args_reg: u32 = if (is_call) trampolinableCallOf(inst).?.args_reg else if (is_member) trampolinableMemberOf(module, inst).?.args_reg else if (is_call_value) trampolinableCallValueOf(inst).?.args_reg else 0;
-            const n_args: u32 = if (is_call) trampolinableCallOf(inst).?.n_args else if (is_member) trampolinableMemberOf(module, inst).?.n_args else if (is_call_value) trampolinableCallValueOf(inst).?.n_args else 0;
+            const args_reg: u32 = if (is_call) trampolinableCallOf(inst).?.args_reg else if (is_member) trampolinableMemberOf(module, inst).?.args_reg else if (is_virtual) trampolinableVirtualOf(inst).?.args_reg else if (is_call_value) trampolinableCallValueOf(inst).?.args_reg else 0;
+            const n_args: u32 = if (is_call) trampolinableCallOf(inst).?.n_args else if (is_member) trampolinableMemberOf(module, inst).?.n_args else if (is_virtual) trampolinableVirtualOf(inst).?.n_args else if (is_call_value) trampolinableCallValueOf(inst).?.n_args else 0;
             var k: u8 = 0;
             while (k < n_args) : (k += 1) {
                 const ar = args_reg + k;
@@ -3079,6 +3126,30 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .inst = @intCast(i),
                     .span = span,
                     .arg_tag_regs = arg_tag_regs,
+                }) catch return null;
+            } else if (is_virtual) {
+                const vc = trampolinableVirtualOf(inst).?;
+                if (vc.recv.int() >= n_regs or vc.recv.int() >= regs.len) return null;
+                // The receiver must be a boxed object register: virtual slots
+                // dispatch on instances, and the host reads it straight from
+                // the frame (no class guard — the dispatch itself is dynamic).
+                if (typeAt(types, vc.recv) != .object and typeAt(types, vc.recv) != .unknown) return null;
+                const rrt = member_ret[vc.dst.int()];
+                const has_result = rrt != .unknown;
+                if (has_result and (vc.dst.int() >= n_regs or types[vc.dst.int()] != rrt)) return null;
+                call_sites.append(a, .{
+                    .func = @enumFromInt(0),
+                    .args_reg = vc.args_reg,
+                    .n_args = vc.n_args,
+                    .dst_reg = vc.dst.int(),
+                    .has_result = has_result,
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span,
+                    .arg_tag_regs = arg_tag_regs,
+                    .is_virtual = true,
+                    .virt_slot = vc.slot,
+                    .recv_reg = vc.recv.int(),
                 }) catch return null;
             } else {
                 // An inlined member call is emitted in place, not trampolined.

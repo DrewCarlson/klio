@@ -53,12 +53,23 @@ imply a wall win" rule applies in full).
 Unblocked by this tier (recorded in the closed plan): A2/A3-style AOT
 registration, B3 typed storage, Value 5c re-evaluation.
 
-## Task 2 — transpiler speedup: the frozen scalar hot-view sub-ABI
+## Task 2 — transpiler frozen hot-view — LANDED 2026-08-30
 
-Already specified in `plans/c-transpiler-plan.md` § "Next: the speedup
-campaign (open)". Independent of Task 1 (targets numeric/scalar code the
-interpreter runs 1.32x slower than transpiled today, not compose
-dispatch). Work it as written there.
+The frozen scalar sub-ABI landed (0ebbe957; detail in
+`plans/c-transpiler-plan.md` § "The speedup campaign"): the layout fill
+moved to the shared `ir.hot_layout`, the generated C carries every
+offset/tag as `KVC_*` compile-time constants, and the runtime verifies a
+registered frozen copy (`klio_rt_register_hot_frozen`, ABI 5) — mismatch
+disables the view wholesale. Measured: fieldbench 57 -> 9.5 ns/iter (6x
+on the op-by-op shape, ~20x over the interpreter); rangebench already
+saturated by fused typed loops. Transpiler corpus 401/0 — the first
+fully clean run: the standing `dispatched_delay` flake was a REAL
+fused-classification race (cross-thread optimistic verdict before block
+decode; b496543b fixes decode serialization, seam re-ensure, and
+thread-local fixpoint), and the remaining parity noise was the ungated
+`[ext-fb]` stderr census (now behind KLIO_DISPATCH_STATS). The
+remaining "direct C-to-C calls + light frame-open" bullet is Task 1's
+architecture question and is evaluated there.
 
 ## Task 3 — refcount-traffic vein — CLOSED BY MEASUREMENT 2026-08-30
 

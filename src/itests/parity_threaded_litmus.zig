@@ -183,6 +183,7 @@ const RUNNABLE = [_][]const u8{
     "tl_runblocking_worker_visibility",
     "tl_early_error_with_thread",
     "tl_channel_jit_send_loop",
+    "tl_virtual_jit_dispatch_loop",
     "tl_yield_cross_thread_teardown",
     "nested_sibling_prop_head",
 };
