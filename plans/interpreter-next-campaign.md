@@ -123,16 +123,38 @@ Progress (each measured, gate-neutral — the gate runs JIT-off):
   561s. TRAP for the record: a `zig build ... >/dev/null 2>&1` hid a
   compile error and a whole diagnosis round ran against a STALE binary
   — always let build errors print.
-- [ ] Remaining classify blockers, in unblock order: CallMemberOrValue /
-  CallMemberOrGlobal, InstanceOf, EnclosingPush/Pop, StoreGlobal,
-  NewInstance, QualifiedThis (each is a tramp arm or a native check;
-  composer bodies `recomposeToGroupEnd`/`settle`/`compositeKeyOf` name
-  the exact needs).
+- [x] COVERAGE ROUND (97d57cec..ec9df1bc), replica compile census 5 -> 14
+  bodies, throughput-neutral so far (compiled bodies still trampoline
+  per heavy op — the wins land as bodies go fully native):
+  object results via the frame-resident return protocol (each Return
+  records its register index in a slot; replaced the single-register
+  result_from_frame which mis-delivered multi-return bodies); virtual
+  results type from the slot ROOT's declared return when the live
+  resolve misses (binding on every override — primitive returns have no
+  covariant widening); result-kind mismatch DELIVERS the boxed value and
+  resumes AFTER the site (the old deopt re-ran the call = double side
+  effects; TrampCtx.deopt_skip_reg shields it from the rebox); both
+  func-tier hooks translate the handler deopt sentinel to
+  pending_deopt_inst (they resumed at the raw sentinel); member/virtual
+  receivers may be any object-typed register; by-name field sites
+  (per-call plainStoredFieldIndex on the live receiver, deopt on
+  getter/miss — reads are pure) serve non-receiver and object-valued
+  own fields; plain-name LoadGlobal sites; OBJECT MOVES trampoline in
+  function mode (the native slot copy fed a member call a stale frame
+  register — cold-cache-only corrupt pendingModifications, root-caused
+  via the deterministic rm-stdlib-image repro); plainStoredFieldIndex
+  rejects DELEGATED properties (`by lazy` leaked its delegate raw).
+  TRAP: a cold stdlib-image bake shifts which bodies run hot enough to
+  compile — flake hunts must delete the newest cache image per attempt.
+- [ ] Remaining classify blockers, by measured decline weight on the
+  replica (cold census after the round): lambdas (L4076: is_lambda —
+  captures need LoadCapture seeding, 62 bodies), CallMemberOrGlobal,
+  AstLambda-as-value, NewInstance, LoadFromThisOrGlobal, QualifiedThis,
+  Cast, CallSuper; the kotlin.* package bar (84) stays deliberate.
 - [ ] Compile-time `resolveVirtualFuncId` misses on pack-module receivers
-  (ChangeList slot resolve returned null at compile while the runtime
-  dispatch resolves fine), so virt-call results type `.object` and box
-  through the frame instead of filling a scalar slot. Widening the
-  resolve to sub-module slot tables keeps such bodies fully native.
+  (ChangeList slot resolve returned null at compile); the declared-root
+  fallback now types those results, so the remaining value is scalar
+  slot fill vs boxed frame write — revisit only with a profile.
 - [ ] Then: function-tier coverage of the composer straight-line bodies,
   replica A/B, and only on a measured win the gate-policy question
   (safe profile keeps JIT off today; every seam/tier addition so far is
