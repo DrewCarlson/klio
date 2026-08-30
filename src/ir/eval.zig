@@ -5826,6 +5826,83 @@ fn runFlatLoop(
             };
             cur = site.req.func.entry;
             ridx = 0;
+            // Function-tier attempt for the fresh activation: the framed
+            // entry hook lives only in runFrameExec's generic loop, and the
+            // flat driver is the path member- and bc-driven calls actually
+            // take. Function-mode bodies are suspension-free by
+            // construction, so the outcomes are exactly RETURN (deliver as
+            // the driver's own completion), a real throw, or a deopt that
+            // resumes interpretation at the outcome point in this frame.
+            if (comptime @hasDecl(H, "callFunc")) hook: {
+                if (!jit_loop.funcEnabled()) break :hook;
+                var hctx: LoopTramp(H).Ctx = .{ .host = host, .allocator = allocator, .module = act.frame.module, .frame = &act.frame };
+                const mres: ?jit_loop.MemberResolver = if (comptime @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).resolveMember else null;
+                const vres: ?jit_loop.VirtResolver = if (comptime @hasDecl(H, "resolveVirtualFuncId")) &LoopTramp(H).resolveVirtual else null;
+                const fres: ?jit_loop.FieldResolver = if (comptime @hasDecl(H, "plainStoredFieldIndex")) &LoopTramp(H).resolveField else null;
+                const fnres: ?jit_loop.FieldResolver = if (comptime @hasDecl(H, "plainStoredScalarFieldNN")) &LoopTramp(H).resolveFieldNN else null;
+                const fo = jit_loop.maybeRunHotFunc(act.frame.module, site.req.func, &act.frame.regs, act.frame.params.items, allocator, &LoopTramp(H).call, @ptrCast(&hctx), mres, vres, fres, fnres) orelse break :hook;
+                if (fo.code.inst == jit_loop.RETURN_INST) {
+                    var res2: EvalResult = ok(fo.value);
+                    const act2 = stack.pop().?;
+                    ev.eval_depth -= 1;
+                    res2 = frameBoundary(act2.frame.func, res2);
+                    if (act2.root_pump) {
+                        if (comptime @hasDecl(H, "rootPumpFlatComplete")) {
+                            res2 = try host.rootPumpFlatComplete(allocator, res2, act2.keepalive orelse .Unit, act2.barrier_scope_base);
+                        }
+                    }
+                    if (act2.type_args.len > 0) {
+                        if (comptime @hasDecl(H, "typedCallBoundary")) host.typedCallBoundary(act2.frame.module, act2.frame.func, act2.type_args, &res2);
+                    }
+                    const rb2 = act2.ret_block;
+                    const rix2 = act2.ret_idx;
+                    const rd2 = act2.ret_dst;
+                    teardownActivation(H, allocator, act2, host);
+                    actFree(ev, allocator, act2);
+                    const pf2: *Frame = if (stack.items.len > 0) &stack.items[stack.items.len - 1].frame else frame;
+                    switch (res2) {
+                        .ok => |v| {
+                            try pf2.write(rd2, v);
+                            cur = rb2;
+                            ridx = rix2;
+                        },
+                        .err => |e2| switch (e2) {
+                            .Throw => |v| {
+                                rthrow = v;
+                                cur = rb2;
+                                ridx = rix2;
+                            },
+                            else => {
+                                runwind = e2;
+                                cur = rb2;
+                                ridx = rix2;
+                            },
+                        },
+                    }
+                    continue;
+                }
+                if (fo.code.inst == jit_loop.THROW_INST) {
+                    const e2 = hctx.pending.?;
+                    hctx.pending = null;
+                    switch (e2) {
+                        .Throw => |exc| {
+                            rthrow = exc;
+                            cur = fo.code.block;
+                            ridx = 0;
+                        },
+                        else => {
+                            runwind = e2;
+                            cur = fo.code.block;
+                            ridx = 0;
+                        },
+                    }
+                    continue;
+                }
+                // Deopt: resume interpretation at the outcome point (the
+                // frame's written scalar registers were reboxed by runFunc).
+                cur = fo.code.block;
+                ridx = fo.code.inst;
+            }
             continue;
         }
         // A suspension: park the current frame at its own suspension point,

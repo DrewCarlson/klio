@@ -4256,6 +4256,12 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 if (d.int() < n_regs) def[d.int()] = true;
             }
             const tc = trampolinableCallOf(inst) orelse continue;
+            // A suspend callee would park through the trampoline; every
+            // function-mode body must be suspension-free so a flat-driver
+            // native run's outcomes stay RETURN / throw / deopt only.
+            if (module.funcById(tc.func)) |cf| {
+                if (cf.is_suspend) return null;
+            } else return null;
             // Args must already live in typed scalar slots.
             var k: u8 = 0;
             while (k < tc.n_args) : (k += 1) {
