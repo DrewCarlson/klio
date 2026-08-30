@@ -261,6 +261,13 @@ pub const NullableUnbox = struct {
 /// `ptr_slot` at loop entry, so native field reads/writes index it directly.
 pub const ObjParamLoad = struct { param_idx: u16, reg: u32 };
 
+/// One `this`-field the method body accesses natively: the stored index the
+/// body was compiled against and the field's name bytes, re-verified against
+/// the LIVE receiver at every entry — an instance's field ORDER is not
+/// class-static (dynamic `define`s append), and a shifted index would
+/// corrupt an unrelated field.
+pub const MethodFieldCheck = struct { idx: u32, name: []const u8 };
+
 pub const FieldBase = struct {
     recv_reg: u32,
     ptr_slot: u32,
@@ -329,6 +336,7 @@ pub const CompiledLoop = struct {
     /// list keeps the value alive, and the unset write-mask means an
     /// in-body overwrite releases nothing it does not own) before entry.
     obj_param_loads: []ObjParamLoad = &.{},
+    method_fields: []MethodFieldCheck = &.{},
     allocator: Allocator,
 
     pub fn deinit(self: *CompiledLoop) void {
@@ -338,6 +346,7 @@ pub const CompiledLoop = struct {
         self.allocator.free(self.read_set);
         self.allocator.free(self.def_set);
         if (self.obj_param_loads.len != 0) self.allocator.free(self.obj_param_loads);
+        if (self.method_fields.len != 0) self.allocator.free(self.method_fields);
         self.allocator.free(self.arrays);
         self.allocator.free(self.cells);
         self.allocator.free(self.nullables);
@@ -3820,6 +3829,14 @@ pub fn enabled() bool {
     return runtime.perf.get().jit_loop;
 }
 
+var fj_member_cache: ?bool = null;
+fn fjMemberEnabled() bool {
+    if (fj_member_cache) |v| return v;
+    const on = if (runtime.envOnce("KLIO_FJ_MEMBER")) |v| !(v.len != 0 and v[0] == '0') else true;
+    fj_member_cache = on;
+    return on;
+}
+
 fn debugEnabled() bool {
     if (jit_debug_cache) |d| return d;
     const v = runtime.envOnce("KLIO_JIT_DEBUG");
@@ -4145,15 +4162,31 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
             // receiver tower and visibility surface (an interface default's
             // `isEmpty()` resolved a file-private extension there), context
             // the trampoline's by-name dispatch does not carry.
-            // Member/virtual sites in FUNCTION mode are NOT accepted yet:
-            // two named repros broke under them (Changes.isNotEmpty — an
-            // interface default whose bare `isEmpty()` needs the executing
-            // frame's receiver tower + visibility surface; and
-            // SlotWriter.dataIndexToDataAnchor — an arg-dataflow hole that
-            // read Unit). The widening needs the framed-context parity
-            // family first; plans/interpreter-next-campaign.md carries it.
-            if (trampolinableMemberOf(module, inst) != null) return null;
-            if (trampolinableVirtualOf(inst) != null) return null;
+            // Member/virtual trampoline sites (KLIO_FJ_MEMBER=0 bisects):
+            // the receiver must be a seeded object-param register. (Both
+            // launch repros — Changes.isNotEmpty, dataIndexToDataAnchor —
+            // were ONE bug: the object-param seed table was never copied
+            // into the CompiledLoop, so receivers read stale pooled-frame
+            // registers.)
+            if (trampolinableMemberOf(module, inst)) |mc| {
+                if (!fjMemberEnabled()) return null;
+                var found = false;
+                for (obj_loads) |opl| {
+                    if (opl.reg == mc.recv.int()) found = true;
+                }
+                if (!found) return null;
+                if (mc.dispatch_recv != null) return null;
+                continue;
+            }
+            if (trampolinableVirtualOf(inst)) |vc| {
+                if (!fjMemberEnabled()) return null;
+                var found = false;
+                for (obj_loads) |opl| {
+                    if (opl.reg == vc.recv.int()) found = true;
+                }
+                if (!found) return null;
+                continue;
+            }
             switch (inst.*) {
                 // `/` and `%` are excluded: a divide-by-zero deopt from a
                 // native-RECURSED callee has no frame to resume into. Method
@@ -4203,7 +4236,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     // a Char/Short/Byte field would rebox as Int on deopt), and the tag the
     // native read guards on. These seed the type inference so field-read
     // destinations type precisely.
-    const FieldPre = struct { block: u32, inst: u32, idx: u32, rt: RegType, tag: u8, is_set: bool, dst_or_src: u32, nn: bool };
+    const FieldPre = struct { block: u32, inst: u32, idx: u32, rt: RegType, tag: u8, is_set: bool, dst_or_src: u32, nn: bool, name: []const u8 };
     var field_pres: std.ArrayListUnmanaged(FieldPre) = .empty;
     defer field_pres.deinit(a);
     if (is_method) {
@@ -4246,6 +4279,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                     .is_set = info.is_set,
                     .dst_or_src = info.reg,
                     .nn = nn,
+                    .name = fname,
                 }) catch return null;
             }
         }
@@ -4571,6 +4605,16 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         return null;
     };
     @memset(fn_tags, INT_TAG);
+    const obj_loads_owned: []ObjParamLoad = if (obj_loads.len != 0)
+        (a.dupe(ObjParamLoad, obj_loads) catch return null)
+    else
+        &.{};
+    const method_fields_owned: []MethodFieldCheck = blk: {
+        if (field_pres.items.len == 0) break :blk &.{};
+        const out2 = a.alloc(MethodFieldCheck, field_pres.items.len) catch return null;
+        for (field_pres.items, out2) |fp, *o| o.* = .{ .idx = fp.idx, .name = fp.name };
+        break :blk out2;
+    };
     ok = true;
     return CompiledLoop{
         .exec = exec,
@@ -4599,6 +4643,8 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .no_native_recurse = is_method,
         .can_deopt = can_deopt,
         .has_tramp_sites = field_sites_base != 0,
+        .obj_param_loads = obj_loads_owned,
+        .method_fields = method_fields_owned,
         .allocator = a,
     };
 }
@@ -4631,7 +4677,14 @@ pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, 
             return null;
         }
         const g = params[0].Instance.borrow();
-        slots[self.entry_fbase_slot] = @bitCast(@intFromPtr(g.get().fields.items.ptr));
+        const items = g.get().fields.items;
+        for (self.method_fields) |mf| {
+            if (mf.idx >= items.len or !(items[mf.idx].name.ptr == mf.name.ptr or std.mem.eql(u8, items[mf.idx].name, mf.name))) {
+                g.deinit();
+                return null; // field order shifted on this instance: interpret
+            }
+        }
+        slots[self.entry_fbase_slot] = @bitCast(@intFromPtr(items.ptr));
         g.deinit();
     }
     var i: u32 = 0;

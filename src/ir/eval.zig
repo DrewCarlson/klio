@@ -6485,6 +6485,9 @@ fn LoopTramp(comptime H: type) type {
                     return jit_loop.throwCode(site.block);
                 };
                 if (pushed) popEnclosing();
+                if (r == .err and r.err == .Unimplemented and runtime.envOnce("KLIO_JIT_DEBUG") != null) {
+                    std.debug.print("[jit-dbg] member miss: body={s} name={s} declared={s} recv_reg={d} n_params={d}\n", .{ lc.frame.func.fqn, site.name, site.declared_name, site.recv_reg, lc.frame.params.items.len });
+                }
                 break :member r;
             } else lc.host.callFunc(lc.allocator, lc.module, site.func, argbuf[0..site.n_args]) catch {
                 lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
