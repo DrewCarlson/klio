@@ -86,15 +86,17 @@ Progress (each measured, gate-neutral — the gate runs JIT-off):
   through callMemberNamedDeclared (latent loop-mode bug); object params
   seed frame registers borrowed (unset write-mask = clean overwrite);
   KLIO_FJ_SKIP bisects bodies.
-- [ ] NEXT — member/virtual sites in FUNCTION mode (held back, two named
-  repros): `Changes.isNotEmpty` — an interface default's bare
-  `isEmpty()` resolves through the executing frame's receiver tower +
-  visibility surface (a file-private extension), context the by-name
-  tramp lacks: the framed-context parity family (the fused walker's
-  currentFrameFunc/tower/span work is the template) must reach the
-  tramp handler first. And `SlotWriter.dataIndexToDataAnchor` — an
-  arg-dataflow hole that read Unit (diagnose with KLIO_FJ_SKIP +
-  KLIO_DUMP_FN before re-enabling).
+- [x] Member/virtual sites in FUNCTION mode, DEFAULT ON (d5315202).
+  Both launch repros dissolved as ONE bug: the object-param seed table
+  was never copied into the CompiledLoop, so member receivers read
+  stale pooled-frame registers (the "GapComposer receiver" was pool
+  garbage). Shipped with instance-layout hardening: native method
+  field indexes re-verify BY NAME against the live receiver at every
+  entry (field order is not class-static — dynamic defines append).
+  KLIO_FJ_MEMBER=0 and KLIO_FJ_SKIP=names bisect. Gate 1390/0/0, vpd
+  561s. TRAP for the record: a `zig build ... >/dev/null 2>&1` hid a
+  compile error and a whole diagnosis round ran against a STALE binary
+  — always let build errors print.
 - [ ] Remaining classify blockers, in unblock order: CallMemberOrValue /
   CallMemberOrGlobal, InstanceOf, EnclosingPush/Pop, StoreGlobal,
   NewInstance, QualifiedThis (each is a tramp arm or a native check;
