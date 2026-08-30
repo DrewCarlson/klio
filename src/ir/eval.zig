@@ -6081,6 +6081,66 @@ fn LoopTramp(comptime H: type) type {
         /// The three TINY hot sites (object move, null test, field read) deliberately
         /// stay inline in `call`: they fire once per JIT'd loop iteration, and
         /// outlining them too cost ~3% throughput for no extra depth.
+        /// ESCAPE: run the interpreter's own arm for one instruction against
+        /// the live frame. Full scalar sync both ways — before: every
+        /// scalar-typed register's slot reboxes into the frame; after: each
+        /// reboxes back (a kind change deopts AT THE NEXT instruction — the
+        /// arm's effects are real and the frame is already correct).
+        noinline fn execEscapeSite(tctx: *jit_loop.TrampCtx, lc: *Ctx, cl: anytype, site: anytype) ?u64 {
+            const n = cl.n_regs;
+            var r: u32 = 0;
+            while (r < n) : (r += 1) {
+                switch (cl.reg_types[r]) {
+                    .i32, .i64, .f64, .f32, .boolean => {
+                        if (r < lc.frame.regs.items.len)
+                            lc.frame.regs.items[r] = jit_loop.valueFromSlotTagged(cl.reg_types[r], tctx.tags[r], tctx.slots[r]);
+                    },
+                    else => {},
+                }
+            }
+            if (site.span) |sp| lc.frame.cur_span = sp;
+            const step = execInst(H, lc.allocator, lc.frame, site.exec_inst.?, lc.host) catch {
+                lc.pending = .{ .Type = "out of memory in JIT escape" };
+                return jit_loop.throwCode(site.block);
+            };
+            switch (step) {
+                .cont => {},
+                .raised => {
+                    const e = lc.frame.step_err.?;
+                    lc.frame.step_err = null;
+                    stashErr(lc, e, site.inst, null);
+                    return jit_loop.throwCode(site.block);
+                },
+                .flat_call => {
+                    // The arm prepared a flat request but ran nothing:
+                    // discard it and deopt AT this instruction so the
+                    // interpreter re-runs it with its own flat machinery.
+                    const req = lc.frame.flat_call.?;
+                    lc.frame.flat_call = null;
+                    discardFlatReq(H, lc.allocator, req, lc.host);
+                    lc.pending_deopt_inst = site.inst;
+                    return jit_loop.deoptCode(site.block);
+                },
+            }
+            r = 0;
+            while (r < n) : (r += 1) {
+                switch (cl.reg_types[r]) {
+                    .i32, .i64, .f64, .f32, .boolean => {
+                        if (r >= lc.frame.regs.items.len) continue;
+                        const v = lc.frame.regs.items[r];
+                        const sv = jit_loop.cellSlotIn(cl.reg_types[r], v) orelse {
+                            lc.pending_deopt_inst = site.inst + 1;
+                            return jit_loop.deoptCode(site.block);
+                        };
+                        tctx.slots[r] = sv;
+                        if (cl.reg_types[r] == .i32) tctx.tags[r] = @intFromEnum(std.meta.activeTag(v));
+                    },
+                    else => {},
+                }
+            }
+            return 0;
+        }
+
         noinline fn bulkySite(tctx: *jit_loop.TrampCtx, lc: *Ctx, cl: anytype, site: anytype) ?u64 {
             if (site.is_field_set) {
                 const recv = lc.frame.regs.items[site.recv_reg];
@@ -6238,6 +6298,10 @@ fn LoopTramp(comptime H: type) type {
             const lc: *Ctx = @ptrCast(@alignCast(tctx.user));
             const cl = tctx.compiled;
             const site = cl.call_sites[@intCast(site_idx)];
+            if (site.is_exec) {
+                if (execEscapeSite(tctx, lc, cl, site)) |code| return code;
+                return 0;
+            }
             // Object move: copy one boxed register into another (both in `regs`).
             // A `.null_`-typed source is the null literal, not a live register, so
             // write `.Null` directly (its slot-backed register is not maintained
