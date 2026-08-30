@@ -86,20 +86,27 @@ Progress (each measured, gate-neutral — the gate runs JIT-off):
   through callMemberNamedDeclared (latent loop-mode bug); object params
   seed frame registers borrowed (unset write-mask = clean overwrite);
   KLIO_FJ_SKIP bisects bodies.
-- [!] REGRESSION FOUND, DEFAULT REVERTED (d9da6346): the milestone's
-  32-clean validation ran on a build whose instReadsDef scratch
-  OVERFLOWED (the [4]Reg buffer vs 6-arg caps, fixed in 97d66d7e) — with
-  real read-sets computed, the compose replica fails reproducibly under
-  member sites (applyChanges runtimeCheck; live suspect =
-  androidx.collection.ScatterMap.isNotEmpty in method mode: _size read
-  field[5] name-verified returns 0, and a second same-name variant
-  compiles with EMPTY method_fields on another thread — chase THAT
-  variant first: which fid, why no field machinery, what it returns).
-  Member/virtual sites are opt-in (KLIO_FJ_MEMBER=1) until this
-  root-causes; the generic ESCAPE machinery landed opt-in too
-  (KLIO_FJ_ESCAPE=1) with precise per-escape sync as its follow-up.
-  Diagnostics that now exist for the hunt: every tryCompileFunc bail
-  prints its line under KLIO_JIT_DEBUG; KLIO_FJ_SKIP=names bisects.
+- [x] REGRESSION ROOT-CAUSED AND FIXED (882dd3f2), member/virtual sites
+  DEFAULT ON. Two compounding causes: (1) the instReadsDef scratch
+  OVERFLOW (the [4]Reg buffer vs 6-arg caps, fixed in 97d66d7e) that
+  invalidated the original 32-clean validation; (2) the real miscompile —
+  `Changes.isNotEmpty` compiled its virtual `isEmpty()` with the dst
+  typed `.object` (compile-time slot resolve missed), the trampoline
+  boxed the result into the FRAME register, and the native `Not` read
+  the register's untyped SLOT: garbage vs 0 returned false with
+  operations pending, tripping the applyChanges runtimeCheck. `Not` now
+  declines a non-scalar source (UnOp/BinOp already did) and a Branch
+  condition must be scalar-typed, not merely known. Bodyless callees
+  (abstract-member static anchors) decline in both Call site builders —
+  the interpreted arm re-dispatches them virtually; a raw callFunc
+  cannot. The generic ESCAPE machinery stays opt-in (KLIO_FJ_ESCAPE=1)
+  with precise per-escape sync as its follow-up. Hunt tools kept:
+  per-line bail prints under KLIO_JIT_DEBUG, KLIO_FJ_SKIP=names,
+  KLIO_FJ_ONLY=name, KLIO_DUMP_FN accepts a dotted fqn.
+  DIAGNOSIS TRAP for the record: a truth-print at ONE tier is not the
+  value the caller saw — the same body ran via THREE routes (framed
+  entry hook, flat-activation hook, recursive seam), and the bad value
+  came from whichever compiled; print at delivery, not at dispatch.
 - [x] Member/virtual sites in FUNCTION mode machinery (d5315202).
   Both launch repros dissolved as ONE bug: the object-param seed table
   was never copied into the CompiledLoop, so member receivers read
@@ -116,6 +123,11 @@ Progress (each measured, gate-neutral — the gate runs JIT-off):
   NewInstance, QualifiedThis (each is a tramp arm or a native check;
   composer bodies `recomposeToGroupEnd`/`settle`/`compositeKeyOf` name
   the exact needs).
+- [ ] Compile-time `resolveVirtualFuncId` misses on pack-module receivers
+  (ChangeList slot resolve returned null at compile while the runtime
+  dispatch resolves fine), so virt-call results type `.object` and box
+  through the frame instead of filling a scalar slot. Widening the
+  resolve to sub-module slot tables keeps such bodies fully native.
 - [ ] Then: function-tier coverage of the composer straight-line bodies,
   replica A/B, and only on a measured win the gate-policy question
   (safe profile keeps JIT off today; every seam/tier addition so far is
