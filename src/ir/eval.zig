@@ -4755,6 +4755,45 @@ pub fn evalWithCapturesChained(
             return lr;
         }
     }
+    // The METHOD tier at the seam: a deopt-free compiled method body (pure
+    // native function over receiver fields + scalar args — no calls, no
+    // guards, RETURN its only outcome) runs with no frame regardless of the
+    // chain seed (it consults neither the chain nor any register file). The
+    // seam also counts and triggers the compile: member-dispatched bodies
+    // reach neither the framed entry hook nor (when fusable) any frame.
+    if (comptime @hasDecl(H, "plainStoredFieldIndex") and @hasDecl(H, "plainStoredScalarFieldNN") and @hasDecl(H, "resolveMemberFuncId")) {
+        switch (jit_loop.methodSeamProbe(func)) {
+            .run => |cl| if (args.items.len >= func.params.len and
+                evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and cl.n_slots <= 192)
+            {
+                const fslots: []i64 = &native_slot_bank[evtls.jit_native_depth];
+                const ftags: []u8 = &native_tag_bank[evtls.jit_native_depth];
+                evtls.jit_native_depth += 1;
+                const fo = jit_loop.runFunc(cl, &.{}, args.items, fslots[0..cl.n_slots], ftags[0..cl.n_regs], null, null);
+                evtls.jit_native_depth -= 1;
+                if (fo == null and runtime.envOnce("KLIO_JIT_DEBUG") != null) {
+                    std.debug.print("[jit]   seam run DECLINED {s}\n", .{func.name});
+                }
+                if (fo) |o| {
+                    if (o.code.inst == jit_loop.RETURN_INST) {
+                        var aa = args;
+                        aa.deinit(allocator);
+                        var cc = captures;
+                        cc.deinit(allocator);
+                        return ok(o.value);
+                    }
+                }
+                // Guard/kind decline: the body never executed — run it framed.
+            },
+            .compile => {
+                // Compile-only resolver context: the three resolvers read only
+                // host + allocator; the frame member is never touched here.
+                var cctx: LoopTramp(H).Ctx = .{ .host = host, .allocator = allocator, .module = module, .frame = undefined };
+                jit_loop.methodSeamCompile(module, func, args.items, &LoopTramp(H).resolveMember, &LoopTramp(H).resolveVirtual, &LoopTramp(H).resolveField, &LoopTramp(H).resolveFieldNN, @ptrCast(&cctx));
+            },
+            .no => {},
+        }
+    }
     // The fused tier at the same seam: a transitively closed body runs on
     // the C bank with no Frame at all, raising real errors (never
     // abandoning) — see `fusedExec`.
@@ -5645,6 +5684,30 @@ fn runFlatLoop(
             if (site.req.captures.items.len == 0 and site.req.closure_id == null and
                 site.req.type_args.len == 0 and !site.req.composer_pushed)
             {
+                // The seam method tier on the flat path: a deopt-free
+                // compiled method body serves the request natively (RETURN
+                // is its only outcome). Counting/compiling stays on the
+                // recursive seam; this arm only RUNS an already-compiled one.
+                if (comptime @hasDecl(H, "plainStoredFieldIndex")) run: {
+                    const cl = jit_loop.methodSeamPeek(site.req.func) orelse break :run;
+                    if (site.req.args.items.len < site.req.func.params.len or
+                        evtls.jit_native_depth >= NATIVE_SLOT_BANK_DEPTH or cl.n_slots > 192) break :run;
+                    const fslots: []i64 = &native_slot_bank[evtls.jit_native_depth];
+                    const ftags: []u8 = &native_tag_bank[evtls.jit_native_depth];
+                    evtls.jit_native_depth += 1;
+                    const fo = jit_loop.runFunc(cl, &.{}, site.req.args.items, fslots[0..cl.n_slots], ftags[0..cl.n_regs], null, null);
+                    evtls.jit_native_depth -= 1;
+                    if (fo) |o| {
+                        if (o.code.inst == jit_loop.RETURN_INST) {
+                            const dst = site.req.dst;
+                            discardFlatReq(H, allocator, site.req, host);
+                            try f.write(dst, o.value);
+                            cur = site.ret_block;
+                            ridx = site.ret_idx;
+                            continue;
+                        }
+                    }
+                }
                 if (exec_call.hostRouteServe(H, allocator, site.req.func, site.req.args.items, host)) |served| {
                     const dst = site.req.dst;
                     discardFlatReq(H, allocator, site.req, host);
@@ -6213,7 +6276,9 @@ fn LoopTramp(comptime H: type) type {
             if (!site.is_member and !site.is_virtual and !runtime.shouldAbandon()) {
                 if (lc.module.funcById(site.func)) |callee| {
                     if (jit_loop.compiledFunc(callee)) |callee_cl| {
-                        if (evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and callee_cl.n_slots <= 192) {
+                        if (!callee_cl.no_native_recurse and
+                            evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and callee_cl.n_slots <= 192)
+                        {
                             // Per-depth rows from the thread's static bank: a
                             // stack `undefined` array here is 0xaa-filled per
                             // CALL under the safe build — it was 70% of a
@@ -11564,6 +11629,10 @@ pub fn fusedExecOpt(
         if (has_outer) return null;
     }
     if (fused_depth >= FUSED_BANK_DEPTH) return null;
+    // Function-tier handshake: a hot fully-fusable body yields to the framed
+    // path so the JIT can count and compile it (the walker otherwise starves
+    // the tier — a fused body never opens a frame).
+    if (jit_loop.fusedShouldYieldToFuncTier(func)) return null;
     // A memoized verdict travels between threads without ordering against
     // the body's lazy decode; re-ensure here (idempotent, serialized) so
     // the walker never indexes an empty block table.

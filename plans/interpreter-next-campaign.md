@@ -52,19 +52,17 @@ a compiled loop still trampolines into host dispatch.
 Progress (each measured, gate-neutral — the gate runs JIT-off):
 - [x] CallVirtual trampoline (e81efce7): slot dispatch stays dynamic, no
   class guard; suspension parks through the member-site stash. Litmus
-  `tl_virtual_jit_dispatch_loop` pins two-class exactness; virtbench
-  338 -> 260 ns/iter (the tramp still pays full dispatch).
+  `tl_virtual_jit_dispatch_loop` pins two-class exactness.
 - [x] Tramp arg cap 3 -> 6 (1c7d1da8).
-- [ ] Stage 2 — THE CORE BET: object registers in native activations, so
-  a compiled callee with an object receiver can run native-to-native
-  (guarded direct call, no dispatch ladder, no interpreter frame).
-  Requires: a GC-rooted per-depth Value regs bank for recursed callees
-  (mirror the fused walker's FrameAnchor rooting), the tramp ctx
-  carrying that regs slice instead of reaching for `lc.frame.regs`, and
-  a per-site monomorphic (class -> compiled callee) cache (sites are
-  thread-private — `states` is threadlocal — so plain mutation is
-  sound). Measure on virtbench first: the win must show as ~260 -> tens
-  of ns/iter before any wider rollout.
+- [x] Stage 2 CORE BET PROVEN (7dba3fbc): a loop-invariant virtual call
+  inlines its monomorphic slot target natively (host
+  `resolveVirtualFuncId` = the class resolve memo + main-module slot
+  table, no fallbacks; member-inline machinery reused wholesale — entry
+  class guard, field-NN deopt rules). Monomorphic virtual loop
+  **349 -> 1 ns/iter**; a polymorphic later activation deopts exactly
+  (litmus). The attribution behind the prize: an interpreted virtual
+  call is ~26% leaf-tier serving + ~22% driver + ~10% dispatch — all of
+  which the devirtualized native body removes.
 - [ ] Remaining classify blockers, in unblock order: CallMemberOrValue /
   CallMemberOrGlobal, InstanceOf, EnclosingPush/Pop, StoreGlobal,
   NewInstance, QualifiedThis (each is a tramp arm or a native check;

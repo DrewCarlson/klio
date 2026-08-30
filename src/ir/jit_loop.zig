@@ -218,6 +218,10 @@ pub const CallSite = struct {
     /// so no class guard is needed.
     is_virtual: bool = false,
     virt_slot: u32 = 0,
+    /// NN-proven native field READ: the stored value can never be null and
+    /// its scalar kind is declared-stable, so the read carries no tag guard
+    /// (and therefore no deopt edge).
+    nn: bool = false,
 };
 
 /// One packed array a compiled loop indexes: the register holding it, the
@@ -297,6 +301,25 @@ pub const CompiledLoop = struct {
     /// Function-JIT: the scalar kind each param was specialized on. A later call
     /// whose arg is a different kind deopts to the interpreter.
     param_rt: []RegType = &.{},
+    /// Method mode (function-JIT over a `this` receiver): params[0] must be an
+    /// Instance of exactly `guard_class` (else the call declines to the
+    /// interpreter), and its field-buffer pointer is seeded into
+    /// `entry_fbase_slot` so `this`-field reads/writes run as native memory
+    /// accesses. A method body has effects and holds an object, so it never
+    /// runs as a native-recursed callee (`no_native_recurse`).
+    method_mode: bool = false,
+    guard_class: usize = 0,
+    entry_fbase_slot: u32 = 0,
+    no_native_recurse: bool = false,
+    /// False only for a method body PROVEN unable to deopt or throw: no
+    /// calls, no division, and every `this`-field read NN-proven (so reads
+    /// carry no tag guard). Such a body is a pure native function over
+    /// (receiver fields, scalar args) and may run at the RECURSIVE CALL SEAM
+    /// with no frame at all — its only outcome is RETURN.
+    can_deopt: bool = true,
+    /// Any call site that actually calls back through the trampoline (a
+    /// NATIVE field site is direct memory access and needs none).
+    has_tramp_sites: bool = true,
     allocator: Allocator,
 
     pub fn deinit(self: *CompiledLoop) void {
@@ -1655,6 +1678,9 @@ const Compiler = struct {
     /// Function-JIT mode (whole-function compile): enables `LoadParam` (reads a
     /// param slot) and the `Return` terminator (writes `result_slot`, exits).
     func_mode: bool = false,
+    /// Method mode: `LoadParam 0` is the receiver — it lives in no slot (the
+    /// entry seeds its field-buffer pointer instead), so the load is a no-op.
+    method_mode: bool = false,
     param_slot_base: u32 = 0,
     n_params: u32 = 0,
     result_slot: u32 = 0,
@@ -2028,10 +2054,14 @@ const Compiler = struct {
         try self.em.loadMem(T1, REGS, @intCast(@as(u64, site.fbase_slot) * 8));
         if (site.is_field) {
             const rt = typeOf(self.types, Reg.from(site.dst_reg));
-            // Tag guard: the field value must still hold the expected scalar kind.
-            try self.em.loadMemB(T0, T1, tag_off);
-            try self.em.cmpImm32(T0, site.tag);
-            try self.em.jcc(.ne, try self.deoptLabel());
+            // Tag guard: the field value must still hold the expected scalar
+            // kind. An NN-proven read (declared non-nullable scalar) skips it
+            // — no deopt edge.
+            if (!site.nn) {
+                try self.em.loadMemB(T0, T1, tag_off);
+                try self.em.cmpImm32(T0, site.tag);
+                try self.em.jcc(.ne, try self.deoptLabel());
+            }
             switch (rt) {
                 .f64 => {
                     try self.em.movsdLoad(X0, T1, payload_off);
@@ -2292,6 +2322,10 @@ const Compiler = struct {
             // Function-JIT: copy a scalar param from its entry-filled slot.
             .LoadParam => |lp| {
                 if (!self.func_mode or lp.idx >= self.n_params) return jit.JitError.Unsupported;
+                // Method mode: the receiver lives in no slot — its field
+                // buffer pointer was seeded at entry instead; the register is
+                // only ever a field-op receiver, so the load is a no-op.
+                if (self.method_mode and lp.idx == 0) return;
                 try self.em.loadMem(T0, REGS, @intCast(@as(u64, self.param_slot_base + lp.idx) * 8));
                 try self.storeSlot(lp.dst, T0);
             },
@@ -3972,9 +4006,6 @@ fn inferFuncTypes(a: Allocator, module: *const Module, func: *const Func, n_regs
 pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, params: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
     _ = resolver;
     _ = virt_resolver;
-    _ = field_resolver;
-    _ = field_nn_resolver;
-    _ = resolver_user;
     if (func.blocks.len == 0) return null;
     if (func.is_suspend or func.is_lambda or func.is_inline) return null;
     // Only user-code functions: stdlib / kotlinx-pack bodies are left to the
@@ -3998,8 +4029,46 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     const body = (try collectFunc(a, func)) orelse return null;
     defer a.free(body);
 
-    // Validate shape: no try-regions; Goto/Branch/Return terminators; only scalar
-    // ops + positional top-level calls.
+    // Method mode: a `this`-receiver whose ONLY use is native field access.
+    // The receiver's class is guarded at entry (a different class declines to
+    // the interpreter) and its field-buffer pointer is seeded into a slot, so
+    // the body's `this.x` reads/writes compile to direct memory ops. The body
+    // has effects and holds an object, so it never native-recurses; every
+    // deopt resumes through the TOP-LEVEL activation's real frame, exactly
+    // like a loop deopt.
+    const is_method = n_params >= 1 and func.params.len >= 1 and
+        std.mem.eql(u8, func.params[0].name, "this") and
+        params[0] == .Instance and field_resolver != null and resolver_user != null;
+    const n_regs: u32 = func.n_locals;
+
+    // The receiver registers: every `LoadParam 0` destination.
+    var recv_regs_buf: [4]u32 = undefined;
+    var n_recv_regs: usize = 0;
+    if (is_method) {
+        for (func.blocks) |*blk| {
+            for (blk.insts) |*inst| {
+                if (inst.* == .LoadParam and inst.LoadParam.idx == 0) {
+                    if (n_recv_regs >= recv_regs_buf.len) return null;
+                    recv_regs_buf[n_recv_regs] = inst.LoadParam.dst.int();
+                    n_recv_regs += 1;
+                }
+            }
+        }
+    }
+    const recv_regs = recv_regs_buf[0..n_recv_regs];
+    const isRecvReg = struct {
+        fn f(set: []const u32, r: u32) bool {
+            for (set) |x| {
+                if (x == r) return true;
+            }
+            return false;
+        }
+    }.f;
+
+    var has_div = false;
+    // Validate shape: no try-regions; Goto/Branch/Return terminators; scalar
+    // ops + positional top-level calls (+ `this`-field access in method mode).
+    // A method receiver register may appear ONLY as a field-op receiver.
     for (body) |bid| {
         const blk = &func.blocks[bid.int()];
         if (blk.catches.len != 0 or blk.finally != null) return null;
@@ -4007,41 +4076,154 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
             .Goto, .Branch, .Return => {},
             else => return null,
         }
+        if (blk.terminator == .Return) {
+            if (blk.terminator.Return) |rr| {
+                if (isRecvReg(recv_regs, rr.int())) return null; // `return this`
+            }
+        }
         for (blk.insts) |*inst| {
-            if (numericConvOf(module, inst) != null) continue;
-            if (bitwiseOpOf(module, inst) != null) continue;
+            if (numericConvOf(module, inst)) |nc| {
+                if (isRecvReg(recv_regs, nc.src.int())) return null;
+                continue;
+            }
+            if (bitwiseOpOf(module, inst)) |bo| {
+                if (isRecvReg(recv_regs, bo.lhs.int()) or isRecvReg(recv_regs, bo.rhs.int())) return null;
+                continue;
+            }
             if (trampolinableCallOf(inst)) |tc| {
                 if (tc.n_args > 6) return null;
+                var k: u32 = 0;
+                while (k < tc.n_args) : (k += 1) {
+                    if (isRecvReg(recv_regs, tc.args_reg + k)) return null; // `f(this)`
+                }
                 continue;
             }
             switch (inst.*) {
-                // `/` and `%` are excluded: a divide-by-zero is the only deopt a
-                // function-mode body could raise, and a native recursive callee has
-                // no frame to resume into — so without this the deopt fallback would
-                // re-run a (possibly impure) callee. Functions using `/`/`%` stay on
-                // the interpreter / loop-JIT path.
-                .BinOp => |b| if (isDivBinOp(b.op)) return null,
-                .Const, .Move, .Not, .UnOp, .Trace, .LoadParam => {},
+                // `/` and `%` are excluded: a divide-by-zero deopt from a
+                // native-RECURSED callee has no frame to resume into. Method
+                // bodies never recurse natively, so they may divide.
+                .BinOp => |b| {
+                    if (isRecvReg(recv_regs, b.lhs.int()) or isRecvReg(recv_regs, b.rhs.int())) return null;
+                    if (isDivBinOp(b.op)) {
+                        if (!is_method) return null;
+                        has_div = true;
+                    }
+                },
+                .Move => |m| if (isRecvReg(recv_regs, m.src.int()) or isRecvReg(recv_regs, m.dst.int())) return null,
+                .Not => |nt| if (isRecvReg(recv_regs, nt.src.int())) return null,
+                .UnOp => |u| if (isRecvReg(recv_regs, u.operand.int())) return null,
+                .GetField => |gf| {
+                    if (!is_method or !isRecvReg(recv_regs, gf.receiver.int())) return null;
+                },
+                .SetField => |sf| {
+                    if (!is_method or !isRecvReg(recv_regs, sf.receiver.int())) return null;
+                    if (sf.super_owner != null) return null;
+                    if (isRecvReg(recv_regs, sf.value.int())) return null;
+                },
+                .Const, .Trace, .LoadParam => {},
                 else => return null,
             }
         }
     }
 
-    const n_regs: u32 = func.n_locals;
-
-    // Each param must be a scalar value; record its kind for the entry guard.
+    // Each param must be a scalar value (the method receiver is `.object`);
+    // record its kind for the entry guard.
     const param_rt = try a.alloc(RegType, n_params);
     var ok = false;
     defer if (!ok) a.free(param_rt);
     {
         var p: u32 = 0;
         while (p < n_params) : (p += 1) {
+            if (is_method and p == 0) {
+                param_rt[p] = .object;
+                continue;
+            }
             param_rt[p] = cellScalarType(params[p]) orelse return null;
+        }
+    }
+
+    // Resolve every `this`-field op against the LIVE receiver: the stored
+    // index, the field's exact live scalar kind (only the exact-rebox kinds —
+    // a Char/Short/Byte field would rebox as Int on deopt), and the tag the
+    // native read guards on. These seed the type inference so field-read
+    // destinations type precisely.
+    const FieldPre = struct { block: u32, inst: u32, idx: u32, rt: RegType, tag: u8, is_set: bool, dst_or_src: u32, nn: bool };
+    var field_pres: std.ArrayListUnmanaged(FieldPre) = .empty;
+    defer field_pres.deinit(a);
+    if (is_method) {
+        for (body) |bid| {
+            const blk = &func.blocks[bid.int()];
+            for (blk.insts, 0..) |*inst, ii| {
+                const info: struct { name_id: ir.ConstId, is_set: bool, reg: u32 } = switch (inst.*) {
+                    .GetField => |gf| .{ .name_id = gf.field, .is_set = false, .reg = gf.dst.int() },
+                    .SetField => |sf| .{ .name_id = sf.field, .is_set = true, .reg = sf.value.int() },
+                    else => continue,
+                };
+                if (info.name_id.int() >= module.consts.items.len) return null;
+                const namec = module.consts.items[info.name_id.int()];
+                if (namec != .String) return null;
+                const fname = memberFieldName(namec.String);
+                const idx = field_resolver.?(resolver_user.?, &params[0], fname) orelse return null;
+                const fv: Value = blk2: {
+                    const g = params[0].Instance.borrow();
+                    defer g.deinit();
+                    const items = g.get().fields.items;
+                    if (idx >= items.len) return null;
+                    break :blk2 items[idx].value;
+                };
+                const rt: RegType = switch (fv) {
+                    .Int => .i32,
+                    .Long => .i64,
+                    .Double => .f64,
+                    .Float => .f32,
+                    .Bool => .boolean,
+                    else => return null,
+                };
+                const nn = !info.is_set and field_nn_resolver != null and
+                    field_nn_resolver.?(resolver_user.?, &params[0], fname) != null;
+                field_pres.append(a, .{
+                    .block = bid.int(),
+                    .inst = @intCast(ii),
+                    .idx = idx,
+                    .rt = rt,
+                    .tag = @intFromEnum(std.meta.activeTag(fv)),
+                    .is_set = info.is_set,
+                    .dst_or_src = info.reg,
+                    .nn = nn,
+                }) catch return null;
+            }
         }
     }
 
     const types = try inferFuncTypes(a, module, func, n_regs, params);
     defer if (!ok) a.free(types);
+    // Seed field-read destination types and re-run the fixpoint so they
+    // propagate into the arithmetic that consumes them.
+    if (field_pres.items.len != 0) {
+        for (field_pres.items) |fp| {
+            if (!fp.is_set) {
+                if (fp.dst_or_src >= n_regs) return null;
+                _ = setType(types, Reg.from(fp.dst_or_src), fp.rt);
+            }
+        }
+        var changed = true;
+        var iters: usize = 0;
+        while (changed and iters < 16) : (iters += 1) {
+            changed = false;
+            for (func.blocks) |*blk| {
+                for (blk.insts) |*inst| {
+                    if (inst.* == .LoadParam) continue;
+                    if (setDefType(types, module, inst, &.{}, &.{})) changed = true;
+                }
+            }
+        }
+        // A field WRITE's source must be scalar of the field's exact kind.
+        for (field_pres.items) |fp| {
+            if (fp.is_set) {
+                if (fp.dst_or_src >= n_regs or typeAt(types, Reg.from(fp.dst_or_src)) != fp.rt) return null;
+            }
+        }
+    }
 
     // The return register must carry the declared scalar kind.
     if (result_scalar) {
@@ -4103,14 +4285,57 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         }
     }
 
+    // `this`-field sites: native memory accesses through the entry-seeded
+    // field-buffer pointer (the slot index is filled in below, after the
+    // layout is settled).
+    const field_sites_base: usize = call_sites.items.len;
+    for (field_pres.items) |fp| {
+        var span2: ?ir.Span = null;
+        {
+            const blk = &func.blocks[fp.block];
+            var bj: usize = fp.inst;
+            while (bj > 0) {
+                bj -= 1;
+                if (blk.insts[bj] == .Trace) {
+                    span2 = blk.insts[bj].Trace.span;
+                    break;
+                }
+            }
+        }
+        call_sites.append(a, .{
+            .dst_reg = if (fp.is_set) 0 else fp.dst_or_src,
+            .src_reg = if (fp.is_set) fp.dst_or_src else 0,
+            .has_result = !fp.is_set,
+            .block = BlockId.from(fp.block),
+            .inst = fp.inst,
+            .span = span2,
+            .is_field = !fp.is_set,
+            .is_field_set = fp.is_set,
+            .native = true,
+            .field_idx = fp.idx,
+            .tag = fp.tag,
+            .nn = fp.nn,
+        }) catch return null;
+    }
+
+    // Deopt-freedom: no tramp calls (the sites before `field_sites_base` are
+    // exactly the trampolined Calls), no division, every read NN-proven.
+    var all_reads_nn = true;
+    for (field_pres.items) |fp| {
+        if (!fp.is_set and !fp.nn) all_reads_nn = false;
+    }
+    const can_deopt = !(is_method and field_sites_base == 0 and !has_div and all_reads_nn);
+
     const has_calls = call_sites.items.len != 0;
     const param_slot_base: u32 = n_regs;
     const after_params: u32 = n_regs + n_params;
     const uc_slot: u32 = after_params;
     const tramp_slot: u32 = after_params + 1;
     const calls_base: u32 = after_params + (if (has_calls) @as(u32, 2) else 0);
-    const result_slot: u32 = calls_base;
-    const n_slots: u32 = calls_base + 1;
+    const fbase_slot: u32 = calls_base;
+    const result_slot: u32 = calls_base + (if (is_method) @as(u32, 1) else 0);
+    const n_slots: u32 = result_slot + 1;
+    for (call_sites.items[field_sites_base..]) |*site| site.fbase_slot = fbase_slot;
 
     var c = Compiler{
         .a = a,
@@ -4131,6 +4356,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .val_payload_off = valuePayloadOffset(),
         .val_tag_off = valueTagOffset(),
         .func_mode = true,
+        .method_mode = is_method,
         .param_slot_base = param_slot_base,
         .n_params = n_params,
         .result_slot = result_slot,
@@ -4189,6 +4415,12 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .result_slot = result_slot,
         .result_rt = result_rt,
         .param_rt = param_rt,
+        .method_mode = is_method,
+        .guard_class = if (is_method) instanceClassIdentity(params[0]) else 0,
+        .entry_fbase_slot = fbase_slot,
+        .no_native_recurse = is_method,
+        .can_deopt = can_deopt,
+        .has_tramp_sites = field_sites_base != 0,
         .allocator = a,
     };
 }
@@ -4206,14 +4438,36 @@ pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, 
     // / trampoline slots are seeded explicitly below. (The zero fill was
     // 70%+ of a native fib's per-call cost.)
     @memcpy(tags[0..self.n_regs], self.box_tags[0..self.n_regs]);
+    // Method mode: the receiver must be an Instance of exactly the class the
+    // body was specialized on (its stored-field indexes and kinds are that
+    // class's); anything else declines to the interpreter. The field-buffer
+    // pointer is stable for the run — the body never adds fields, and the
+    // buffer does not move (same contract as the loop tier's field bases).
+    if (self.method_mode) {
+        if (params.len == 0 or params[0] != .Instance) {
+            if (debugEnabled()) std.debug.print("[jit-dbg] method run: recv not instance (len={d} tag={s})\n", .{ params.len, if (params.len > 0) @tagName(std.meta.activeTag(params[0])) else "none" });
+            return null;
+        }
+        if (instanceClassIdentity(params[0]) != self.guard_class) {
+            if (debugEnabled()) std.debug.print("[jit-dbg] method run: class {x} != guard {x}\n", .{ instanceClassIdentity(params[0]), self.guard_class });
+            return null;
+        }
+        const g = params[0].Instance.borrow();
+        slots[self.entry_fbase_slot] = @bitCast(@intFromPtr(g.get().fields.items.ptr));
+        g.deinit();
+    }
     var i: u32 = 0;
     while (i < self.n_params) : (i += 1) {
         if (i >= params.len) return null;
-        const sv = cellSlotIn(self.param_rt[i], params[i]) orelse return null; // kind changed: interpret
+        if (self.method_mode and i == 0) continue; // receiver: no slot
+        const sv = cellSlotIn(self.param_rt[i], params[i]) orelse {
+            if (self.method_mode and debugEnabled()) std.debug.print("[jit-dbg] method run: param {d} kind {s} rt {s}\n", .{ i, @tagName(std.meta.activeTag(params[i])), @tagName(self.param_rt[i]) });
+            return null; // kind changed: interpret
+        };
         slots[self.param_slot_base + i] = sv;
     }
     var tctx: TrampCtx = undefined;
-    if (self.call_sites.len != 0) {
+    if (self.call_sites.len != 0 and self.has_tramp_sites) {
         if (tramp == null or user == null) return null;
         tctx = .{ .slots = slots.ptr, .compiled = self, .user = user.?, .tags = tags.ptr };
         slots[self.uc_slot] = @bitCast(@intFromPtr(&tctx));
@@ -4247,6 +4501,68 @@ inline fn regsGrowAlloc(fallback: Allocator) Allocator {
     return fallback;
 }
 
+/// Fused-walker tier-up handshake: a fully-fusable body never opens a frame,
+/// so the function tier's entry hook would never even count it — the walker
+/// starved the JIT. The walker asks here per activation; once the body runs
+/// hot it yields (runs framed) so the function tier can count, compile, and
+/// take over; a body the tier tried and declined keeps fusing.
+/// Recursive-seam method tier. A member-dispatched body reaches neither the
+/// framed entry hook (flat/member dispatch bypasses it) nor — when fusable —
+/// any frame at all, so the seam itself counts and runs it. Only a DEOPT-FREE
+/// method body (`can_deopt == false`) is served here: RETURN is its only
+/// possible outcome, so no frame, no trampoline, and no resume machinery
+/// exists to need.
+pub const SeamProbe = union(enum) { run: *const CompiledLoop, compile, no };
+
+/// Non-counting peek: the already-compiled deopt-free method body for
+/// `func`, if any. The flat driver consults this per request; counting and
+/// compiling stay on the recursive seam.
+pub fn methodSeamPeek(func: *const Func) ?*const CompiledLoop {
+    if (!funcEnabled()) return null;
+    const fj = (states.get(@intFromPtr(func))) orelse return null;
+    if (func.blocks.len == 0 or fj.blocks_fp != @intFromPtr(func.blocks.ptr)) return null;
+    if (fj.func_jit) |*cl| {
+        if (cl.method_mode and !cl.can_deopt) return cl;
+    }
+    return null;
+}
+
+pub fn methodSeamProbe(func: *const Func) SeamProbe {
+    if (!funcEnabled()) return .no;
+    const fj = forFunc(func) orelse return .no;
+    if (fj.func_jit) |*cl| {
+        if (cl.method_mode and !cl.can_deopt) return .{ .run = cl };
+        return .no;
+    }
+    if (fj.func_tried) return .no;
+    fj.func_count += 1;
+    if (fj.func_count >= HOT_THRESHOLD) return .compile;
+    return .no;
+}
+
+/// One-shot compile for a seam-probed body (`.compile`). Marks the state
+/// tried either way, exactly like `maybeRunHotFunc`'s trigger.
+pub fn methodSeamCompile(module: *const Module, func: *const Func, params: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, user: ?*anyopaque) void {
+    const fj = forFunc(func) orelse return;
+    if (fj.func_tried) return;
+    fj.func_tried = true;
+    const compiled = tryCompileFunc(metadata_allocator, module, func, params, resolver, virt_resolver, field_resolver, field_nn_resolver, user) catch null;
+    if (compiled) |cl| {
+        if (debugEnabled()) std.debug.print("[jit] compiled method {s} (deopt-free={})\n", .{ func.name, !cl.can_deopt });
+        fj.func_jit = cl;
+        noteCompiled();
+    } else if (debugEnabled()) std.debug.print("[jit]   method-tier declined {s}\n", .{func.name});
+}
+
+pub fn fusedShouldYieldToFuncTier(func: *const Func) bool {
+    if (!funcEnabled()) return false;
+    const fj = forFunc(func) orelse return false;
+    if (fj.func_jit != null) return true;
+    if (fj.func_tried) return false;
+    fj.func_count += 1;
+    return fj.func_count >= HOT_THRESHOLD;
+}
+
 pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), params: []const Value, allocator: Allocator, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?FuncOutcome {
     if (!funcEnabled()) return null;
     const fj = forFunc(func) orelse return null;
@@ -4255,7 +4571,10 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
         if (fj.func_count < HOT_THRESHOLD) return null;
         fj.func_tried = true;
         const compiled = tryCompileFunc(metadata_allocator, module, func, params, resolver, virt_resolver, field_resolver, field_nn_resolver, user) catch null;
-        if (compiled == null) return null;
+        if (compiled == null) {
+            if (debugEnabled()) std.debug.print("[jit]   func-tier declined {s}\n", .{func.name});
+            return null;
+        }
         if (debugEnabled()) std.debug.print("[jit] compiled function {s} n_slots={d} n_regs={d}\n", .{ func.name, compiled.?.n_slots, compiled.?.n_regs });
         fj.func_jit = compiled;
         noteCompiled();
