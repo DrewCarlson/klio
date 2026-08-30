@@ -1289,6 +1289,12 @@ pub const Func = struct {
     /// the shared-cache path. Benign-race fill.
     bc_memo: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     bc_memo_fuse: u8 = 0,
+    /// Function-JIT hotness probe, shared across threads so the per-activation
+    /// cost is one atomic load instead of a per-thread state-map lookup: low
+    /// bits count activations, bit 30 = some thread compiled a body (consult
+    /// the per-thread state), bit 31 = compilation declined (sticky; stop
+    /// probing). See `jit_loop` for the encoding.
+    func_jit_probe: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// `bc.streamGen()` at fill time; a cache reset frees the streams the
     /// memo points at, so a stale generation must fall to the shared path.
     bc_memo_gen: u32 = 0,

@@ -3854,6 +3854,28 @@ pub fn valueFromSlotTagged(rt: RegType, tag: u8, s: i64) Value {
 // --- per-function JIT state + the interpreter hook --------------------------
 
 const HOT_THRESHOLD: u32 = 64;
+
+/// `Func.func_jit_probe` encoding: low 30 bits count activations, bit 30 =
+/// COMPILED somewhere (consult the per-thread state), bit 31 = DECLINED
+/// (sticky — stop probing; the probe tax on never-compiled bodies measured
+/// ~2% of the compose replica when every activation walked the state map).
+const PROBE_COMPILED: u32 = 1 << 30;
+const PROBE_DECLINED: u32 = 1 << 31;
+const PROBE_COUNT_MASK: u32 = PROBE_COMPILED - 1;
+
+inline fn probeWord(func: *const Func) *std.atomic.Value(u32) {
+    return &@constCast(func).func_jit_probe;
+}
+
+/// Bump the shared activation count (bounded — the walker can outrun the
+/// compiling hook) and report whether the body is hot.
+inline fn probeCount(func: *const Func) bool {
+    const pw = probeWord(func);
+    const pr = pw.load(.monotonic);
+    const n = pr & PROBE_COUNT_MASK;
+    if (n < HOT_THRESHOLD * 2) _ = pw.fetchAdd(1, .monotonic);
+    return n + 1 >= HOT_THRESHOLD;
+}
 /// A loop whose receiver/field types are read from the live frame can bail when
 /// the snapshot catches an object register holding null (between traversals).
 /// Such a bail is transient, so retry a few times (spaced by re-reaching the
@@ -4911,6 +4933,29 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     // `this`-field sites: native memory accesses through the entry-seeded
     // field-buffer pointer (the slot index is filled in below, after the
     // layout is settled).
+    // Trampoline-density profitability: every non-native site is a host
+    // round-trip that costs about as much as the interpreted instruction it
+    // replaces, and a tiny body's native entry (slot setup, seeding, tag
+    // copy) costs more than its walk. Compile only when enough plain native
+    // instructions amortize the overhead; the measurement behind the
+    // thresholds is the compose replica, where the ungated tier ran a net
+    // ~3% SLOWER (KLIO_FJ_MINPROFIT=insts,K overrides for re-measurement).
+    {
+        var total_insts3: u32 = 0;
+        for (body) |bid3| total_insts3 += @intCast(func.blocks[bid3.int()].insts.len);
+        var min_insts: u32 = 8;
+        var site_k: u32 = 4;
+        if (runtime.envOnce("KLIO_FJ_MINPROFIT")) |raw| {
+            var it3 = std.mem.splitScalar(u8, raw, ',');
+            if (it3.next()) |x| min_insts = std.fmt.parseInt(u32, x, 10) catch min_insts;
+            if (it3.next()) |x| site_k = std.fmt.parseInt(u32, x, 10) catch site_k;
+        }
+        const tramp_sites: u32 = @intCast(call_sites.items.len);
+        if (tramp_sites != 0 and (total_insts3 < min_insts or tramp_sites * site_k > total_insts3)) {
+            if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: tramp-heavy ({d} sites / {d} insts)\n", .{ func.name, tramp_sites, total_insts3 });
+            return null;
+        }
+    }
     const field_sites_base: usize = call_sites.items.len;
     for (field_pres.items) |fp| {
         var span2: ?ir.Span = null;
@@ -5185,6 +5230,7 @@ pub const SeamProbe = union(enum) { run: *const CompiledLoop, compile, no };
 /// compiling stay on the recursive seam.
 pub fn methodSeamPeek(func: *const Func) ?*const CompiledLoop {
     if (!funcEnabled()) return null;
+    if (probeWord(func).load(.monotonic) & PROBE_COMPILED == 0) return null;
     const fj = (states.get(@intFromPtr(func))) orelse return null;
     if (func.blocks.len == 0 or fj.blocks_fp != @intFromPtr(func.blocks.ptr)) return null;
     if (fj.func_jit) |*cl| {
@@ -5195,14 +5241,19 @@ pub fn methodSeamPeek(func: *const Func) ?*const CompiledLoop {
 
 pub fn methodSeamProbe(func: *const Func) SeamProbe {
     if (!funcEnabled()) return .no;
-    const fj = forFunc(func) orelse return .no;
-    if (fj.func_jit) |*cl| {
-        if (cl.method_mode and !cl.can_deopt) return .{ .run = cl };
-        return .no;
+    const pr = probeWord(func).load(.monotonic);
+    if (pr & PROBE_DECLINED != 0) return .no;
+    if (pr & PROBE_COMPILED != 0) {
+        const fj = forFunc(func) orelse return .no;
+        if (fj.func_jit) |*cl| {
+            if (cl.method_mode and !cl.can_deopt) return .{ .run = cl };
+            return .no;
+        }
+        // Another thread compiled; this one still needs its own copy.
+        if (fj.func_tried) return .no;
+        return .compile;
     }
-    if (fj.func_tried) return .no;
-    fj.func_count += 1;
-    if (fj.func_count >= HOT_THRESHOLD) return .compile;
+    if (probeCount(func)) return .compile;
     return .no;
 }
 
@@ -5220,24 +5271,32 @@ pub fn methodSeamCompile(module: *const Module, func: *const Func, params: []con
         if (debugEnabled()) std.debug.print("[jit] compiled method {s} (fqn={s} mfields={d} sites={d} guard={x} deopt-free={})\n", .{ func.name, func.fqn, cl.method_fields.len, cl.call_sites.len, cl.guard_class, !cl.can_deopt });
         fj.func_jit = cl;
         noteCompiled();
-    } else if (debugEnabled()) std.debug.print("[jit]   method-tier declined {s}\n", .{func.name});
+        _ = probeWord(func).fetchOr(PROBE_COMPILED, .monotonic);
+    } else {
+        if (debugEnabled()) std.debug.print("[jit]   method-tier declined {s}\n", .{func.name});
+        _ = probeWord(func).fetchOr(PROBE_DECLINED, .monotonic);
+    }
 }
 
 pub fn fusedShouldYieldToFuncTier(func: *const Func) bool {
     if (!funcEnabled()) return false;
-    const fj = forFunc(func) orelse return false;
-    if (fj.func_jit != null) return true;
-    if (fj.func_tried) return false;
-    fj.func_count += 1;
-    return fj.func_count >= HOT_THRESHOLD;
+    const pr = probeWord(func).load(.monotonic);
+    if (pr & PROBE_DECLINED != 0) return false;
+    if (pr & PROBE_COMPILED != 0) return true;
+    return probeCount(func);
 }
 
 pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), params: []const Value, captures: []const Value, allocator: Allocator, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?FuncOutcome {
     if (!funcEnabled()) return null;
+    // Shared probe first: a declined body costs one atomic load per
+    // activation, a cold one an atomic add — never the state-map walk.
+    const pr = probeWord(func).load(.monotonic);
+    if (pr & PROBE_DECLINED != 0) return null;
+    if (pr & PROBE_COMPILED == 0) {
+        if (!probeCount(func)) return null;
+    }
     const fj = forFunc(func) orelse return null;
     if (!fj.func_tried) {
-        fj.func_count += 1;
-        if (fj.func_count < HOT_THRESHOLD) return null;
         fj.func_tried = true;
         const compiled = tryCompileFunc(metadata_allocator, module, func, params, captures, resolver, virt_resolver, field_resolver, field_nn_resolver, user) catch |e| blk: {
             if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: ERR {s}\n", .{ func.name, @errorName(e) });
@@ -5245,8 +5304,10 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
         };
         if (compiled == null) {
             if (debugEnabled()) std.debug.print("[jit]   func-tier declined {s}\n", .{func.name});
+            _ = probeWord(func).fetchOr(PROBE_DECLINED, .monotonic);
             return null;
         }
+        _ = probeWord(func).fetchOr(PROBE_COMPILED, .monotonic);
         if (debugEnabled()) std.debug.print("[jit] compiled function {s} (fqn={s} p0={s} mfields={d} sites={d} method={} guard={x}) n_slots={d} n_regs={d}\n", .{ func.name, func.fqn, if (func.params.len > 0) func.params[0].name else "-", compiled.?.method_fields.len, compiled.?.call_sites.len, compiled.?.method_mode, compiled.?.guard_class, compiled.?.n_slots, compiled.?.n_regs });
         fj.func_jit = compiled;
         noteCompiled();
