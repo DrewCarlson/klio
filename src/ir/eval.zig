@@ -1475,6 +1475,7 @@ pub var dispatch_replay_hits: ?*const fn () u64 = null;
 pub var ext_fb_counts: ?*const fn () [4]u64 = null;
 
 pub fn dispatchStatsDump() void {
+    if (dispatch_stats_state != 2) return;
     if (ext_fb_counts) |f| {
         const c = f();
         if (c[0] != 0) std.debug.print(
@@ -1482,7 +1483,6 @@ pub fn dispatchStatsDump() void {
             .{ c[0], c[1], c[2], c[3] },
         );
     }
-    if (dispatch_stats_state != 2) return;
     var total: u64 = 0;
     for (&dispatch_counts) |*c| total += c.load(.monotonic);
     if (total == 0) return;
@@ -5997,7 +5997,7 @@ fn LoopTramp(comptime H: type) type {
                 if (comptime !@hasDecl(H, "callValue")) return jit_loop.deoptCode(site.block);
                 if (site.span) |sp| lc.frame.cur_span = sp;
                 const callee = lc.frame.regs.items[site.recv_reg];
-                var argbuf2: [3]Value = undefined;
+                var argbuf2: [6]Value = undefined;
                 var k2: usize = 0;
                 while (k2 < site.n_args) : (k2 += 1) {
                     const ar = @as(usize, site.args_reg) + k2;
@@ -6192,7 +6192,7 @@ fn LoopTramp(comptime H: type) type {
             // The native loop does not run `.Trace`; refresh the calling frame's
             // position so a throw from the callee reports this call's line.
             if (site.span) |sp| lc.frame.cur_span = sp;
-            var argbuf: [3]Value = undefined;
+            var argbuf: [6]Value = undefined;
             var k: usize = 0;
             while (k < site.n_args) : (k += 1) {
                 const ar = @as(usize, site.args_reg) + k;
@@ -6210,7 +6210,7 @@ fn LoopTramp(comptime H: type) type {
             // callee runs its body directly — no interpreter frame, no dispatch.
             // The callee is pure (scalar in, scalar out), so a deopt/throw can
             // safely fall back to the frame-based path by re-running it below.
-            if (!site.is_member and !runtime.shouldAbandon()) {
+            if (!site.is_member and !site.is_virtual and !runtime.shouldAbandon()) {
                 if (lc.module.funcById(site.func)) |callee| {
                     if (jit_loop.compiledFunc(callee)) |callee_cl| {
                         if (evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and callee_cl.n_slots <= 192) {
@@ -6244,7 +6244,33 @@ fn LoopTramp(comptime H: type) type {
                     }
                 }
             }
-            const res = if (site.is_member) member: {
+            const res = if (site.is_virtual) virt: {
+                if (comptime !@hasDecl(H, "invokeVirtualMember")) {
+                    break :virt EvalResult{ .err = .{
+                        .Type = "host cannot dispatch virtual calls",
+                    } };
+                }
+                var recv = switch (cl.reg_types[site.recv_reg]) {
+                    .object, .unknown => lc.frame.regs.items[site.recv_reg],
+                    .null_ => Value.Null,
+                    else => jit_loop.valueFromSlotTagged(cl.reg_types[site.recv_reg], tctx.tags[site.recv_reg], tctx.slots[site.recv_reg]),
+                };
+                recv.retain();
+                defer recv.release(lc.allocator);
+                var names: [6]?[]const u8 = .{ null, null, null, null, null, null };
+                break :virt lc.host.invokeVirtualMember(
+                    lc.allocator,
+                    &recv,
+                    ir.MethodSlotId.from(site.virt_slot),
+                    argbuf[0..site.n_args],
+                    names[0..site.n_args],
+                    null,
+                    null,
+                ) catch {
+                    lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
+                    return jit_loop.throwCode(site.block);
+                };
+            } else if (site.is_member) member: {
                 const recv_tag_src: usize = if (site.recv_tag_reg != 0) site.recv_tag_reg else site.recv_reg;
                 var recv = switch (cl.reg_types[site.recv_reg]) {
                     .object, .unknown => lc.frame.regs.items[site.recv_reg],
@@ -6307,7 +6333,7 @@ fn LoopTramp(comptime H: type) type {
                         pushed = true;
                     }
                 }
-                var names: [3]?[]const u8 = .{ null, null, null };
+                var names: [6]?[]const u8 = .{ null, null, null, null, null, null };
                 const r = lc.host.callMemberNamed(lc.allocator, &recv, site.name, argbuf[0..site.n_args], names[0..site.n_args]) catch {
                     if (pushed) popEnclosing();
                     lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
@@ -6359,6 +6385,15 @@ fn LoopTramp(comptime H: type) type {
             if (comptime !@hasDecl(H, "resolveMemberFuncId")) return null;
             const lc: *Ctx = @ptrCast(@alignCast(user));
             return lc.host.resolveMemberFuncId(lc.allocator, receiver, name, args);
+        }
+
+        /// Compile-time virtual-slot resolver: the FuncId the slot dispatches
+        /// to on the receiver's class, so a loop-invariant virtual call can
+        /// inline its monomorphic target. Null keeps the site a trampoline.
+        fn resolveVirtual(user: *anyopaque, receiver: *const Value, slot: u32) ?FuncId {
+            if (comptime !@hasDecl(H, "resolveVirtualFuncId")) return null;
+            const lc: *Ctx = @ptrCast(@alignCast(user));
+            return lc.host.resolveVirtualFuncId(receiver, ir.MethodSlotId.from(slot));
         }
 
         /// Compile-time field resolver: the stored-field index of `name` on the
@@ -6476,6 +6511,8 @@ fn runFrameExec(
     const tramp_user: ?*anyopaque = if (comptime tramp_ok) @ptrCast(&loop_ctx) else null;
     const member_resolver: ?jit_loop.MemberResolver =
         if (comptime tramp_ok and @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).resolveMember else null;
+    const virt_resolver: ?jit_loop.VirtResolver =
+        if (comptime tramp_ok and @hasDecl(H, "resolveVirtualFuncId")) &LoopTramp(H).resolveVirtual else null;
     // The bytecode tier's per-func stream table, hoisted to one lookup per
     // activation; per block entry it is a plain array index.
     // Fused terminator ops only when the loop JIT is off: the JIT's
@@ -6537,7 +6574,7 @@ fn runFrameExec(
             // mask maintenance; hand it a fully-defined file. One fill per
             // frame at most — the mask saturates.
             frame.materializeRegs();
-            if (jit_loop.maybeRunHotPre(jit_fj.?, frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver, field_resolver, field_nn_resolver)) |res| {
+            if (jit_loop.maybeRunHotPre(jit_fj.?, frame.module, func, &frame.regs, allocator, cur, tramp_fn, tramp_user, member_resolver, virt_resolver, field_resolver, field_nn_resolver)) |res| {
                 if (res.inst == jit_loop.THROW_INST) {
                     // A trampolined call left an error pending: re-raise it. A
                     // throw resumes through the try-stack at the call's block;
@@ -6591,7 +6628,7 @@ fn runFrameExec(
             // zero deopt resumes interpretation with registers reboxed.
             if (comptime tramp_ok) {
                 if (cur.int() == func.entry.int()) {
-                    if (jit_loop.maybeRunHotFunc(frame.module, func, &frame.regs, frame.params.items, allocator, tramp_fn, tramp_user, member_resolver, field_resolver, field_nn_resolver)) |fo| {
+                    if (jit_loop.maybeRunHotFunc(frame.module, func, &frame.regs, frame.params.items, allocator, tramp_fn, tramp_user, member_resolver, virt_resolver, field_resolver, field_nn_resolver)) |fo| {
                         if (fo.code.inst == jit_loop.RETURN_INST) return ok(fo.value);
                         if (fo.code.inst == jit_loop.THROW_INST) {
                             const e = loop_ctx.pending.?;
@@ -11290,16 +11327,6 @@ fn fusedMaterializeEnabled() bool {
     return fused_mat_val;
 }
 
-var fused_dyn_state: u8 = 0;
-var fused_dyn_val: bool = false;
-fn fusedDynEnabled() bool {
-    if (fused_dyn_state == 0) {
-        fused_dyn_val = std.mem.eql(u8, runtime.envOnce("KLIO_FUSED_DYN") orelse "0", "1");
-        fused_dyn_state = 1;
-    }
-    return fused_dyn_val;
-}
-
 fn fusedNameSelected(name: []const u8) bool {
     const sel = fused_sel orelse return true;
     const inverted = std.mem.startsWith(u8, sel, "!");
@@ -11327,10 +11354,26 @@ fn fusedEligible(comptime H: type, host: *H, module: *const Module, func: *const
     return fusedVerdict(H, host, module, func) == 1;
 }
 
+/// Funcs THIS thread is currently classifying, so a self-recursive body's
+/// own call site resolves optimistically (the fixpoint that lets fused
+/// recursion classify FULL) while ANOTHER thread's in-progress marker is
+/// a plain decline — handing the optimistic verdict across threads let a
+/// second core run a body fused before the classifying thread had even
+/// ensured its blocks were decoded (the dispatched_delay corpus panic).
+threadlocal var classify_stack: [128]u32 = undefined;
+threadlocal var classify_depth: usize = 0;
+
+fn classifyingHere(fid: u32) bool {
+    for (classify_stack[0..classify_depth]) |f| {
+        if (f == fid) return true;
+    }
+    return false;
+}
+
 fn fusedVerdict(comptime H: type, host: *H, module: *const Module, func: *const Func) u8 {
     switch (func.fuse_state) {
         1, 2, 4 => return func.fuse_state,
-        3 => return 1,
+        3 => return if (classifyingHere(func.id.int())) 1 else 2,
         else => {},
     }
     if (comptime @hasDecl(H, "funcRunsItsBody")) {
@@ -11339,8 +11382,12 @@ fn fusedVerdict(comptime H: type, host: *H, module: *const Module, func: *const 
             return 2;
         }
     }
+    if (classify_depth >= classify_stack.len) return 2; // depth guard: decline, no memo
     @constCast(func).fuse_state = 3;
+    classify_stack[classify_depth] = func.id.int();
+    classify_depth += 1;
     const verdict = fusedClassify(H, host, module, func);
+    classify_depth -= 1;
     @constCast(func).fuse_state = verdict;
     return verdict;
 }
@@ -11408,24 +11455,11 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
                 // neither can suspend (Kotlin forbids suspend there), so no
                 // materialization is needed beneath them.
                 .LoadGlobal => {},
-                // Dynamic member dispatch runs through the recursive host
-                // entries; a dynamic callee of a non-suspend body cannot
-                // suspend, so the walker may sit above it. OFF by default:
-                // the recursive entries lose the framed flat path's site
-                // memos (fused-first execution never stamps them), which
-                // measured ~5% slower on the recomposition replica —
-                // KLIO_FUSED_DYN=1 turns the arms on for the native-call
-                // work that will earn the default.
-                .CallVirtual => if (comptime !@hasDecl(H, "invokeVirtualMember")) {
-                    heavy = true;
-                } else if (!fusedDynEnabled()) {
-                    heavy = true;
-                },
-                .CallMember => if (comptime !@hasDecl(H, "invokeResolvedMember")) {
-                    heavy = true;
-                } else if (!fusedDynEnabled()) {
-                    heavy = true;
-                },
+                // Dynamic member dispatch stays framed: the recursive host
+                // entries lose the flat path's site memos (fused-first
+                // execution never stamps them), which measured ~5% slower
+                // on the recomposition replica.
+                .CallVirtual, .CallMember => heavy = true,
                 .NewInstance => |ni| {
                     if (ni.arg_names.len != 0) {
                         for (ni.arg_names) |an| {
@@ -11530,6 +11564,10 @@ pub fn fusedExecOpt(
         if (has_outer) return null;
     }
     if (fused_depth >= FUSED_BANK_DEPTH) return null;
+    // A memoized verdict travels between threads without ordering against
+    // the body's lazy decode; re-ensure here (idempotent, serialized) so
+    // the walker never indexes an empty block table.
+    if (func.blocks.len == 0 and !module.ensureFuncBody(@constCast(func))) return null;
     if (frame_count_on) frame_count_total += 1;
     if (runtime.envOnce("KLIO_FUSED_TRACE") != null) {
         std.debug.print("[fused] {s}\n", .{if (func.fqn.len != 0) func.fqn else func.name});
@@ -12126,158 +12164,6 @@ fn fusedInst(
                     }
                     fusedWrite(allocator, regs, c.dst, v, reclaim, false);
                 },
-                .err => |e| return fusedRaise(e),
-            }
-        },
-        // Dynamic member dispatch through the recursive host entries — the
-        // same terminals the framed arm reaches after its fast paths, so
-        // semantics match; only the flat-prep/site-memo accelerations are
-        // skipped. A dynamic callee of a non-suspend body cannot suspend
-        // (suspend bodies never classify), so the recursive path is sound.
-        .CallVirtual => |cv| {
-            if (comptime !@hasDecl(H, "invokeVirtualMember")) return error.Materialize;
-            const recv = fusedRead(regs, cv.receiver);
-            recv.retain();
-            defer recv.release(allocator);
-            if (cv.n_args > FUSED_MAX_REGS)
-                return fusedRaise(.{ .Type = "fused: too many call args" });
-            var argv: [FUSED_MAX_REGS]Value = undefined;
-            var i: u32 = 0;
-            while (i < cv.n_args) : (i += 1) {
-                argv[i] = fusedRead(regs, Reg.from(cv.args.int() + i));
-            }
-            const names = try exec_call.resolveArgNames(allocator, module, cv.arg_names);
-            defer exec_call.freeArgNames(allocator, names);
-            const prev_tl = if (cv.trailing_lambda and comptime @hasDecl(H, "setTrailingMemberCall"))
-                H.setTrailingMemberCall(true)
-            else
-                false;
-            const site: ?ir.VirtNativeSite = if (cv.arg_params == null and exec_call.argNamesAllNull(cv.arg_names))
-                .{
-                    .cls = @constCast(&cv.site_cls),
-                    .native = @constCast(&cv.site_native),
-                    .name_ptr = @constCast(&cv.site_name_ptr),
-                    .name_len = @constCast(&cv.site_name_len),
-                }
-            else
-                null;
-            const result = host.invokeVirtualMember(allocator, &recv, cv.slot, argv[0..cv.n_args], names, cv.arg_params, site);
-            if (cv.trailing_lambda) {
-                if (comptime @hasDecl(H, "setTrailingMemberCall")) _ = H.setTrailingMemberCall(prev_tl);
-            }
-            switch (try result) {
-                .ok => |v| fusedWrite(allocator, regs, cv.dst, v, reclaim, false),
-                .err => |e| return fusedRaise(e),
-            }
-        },
-        .CallMember => |cm| {
-            if (comptime !@hasDecl(H, "invokeResolvedMember")) return error.Materialize;
-            const recv = fusedRead(regs, cm.receiver);
-            recv.retain();
-            defer recv.release(allocator);
-            if (cm.n_args > FUSED_MAX_REGS)
-                return fusedRaise(.{ .Type = "fused: too many call args" });
-            var argv: [FUSED_MAX_REGS]Value = undefined;
-            var i: u32 = 0;
-            while (i < cm.n_args) : (i += 1) {
-                argv[i] = fusedRead(regs, Reg.from(cm.args.int() + i));
-            }
-            // Site-memo replay, exactly the framed arm's: the claimed
-            // (class, arg-signature) pair serves its recorded target — a
-            // host-serve kind directly, a FuncId through the resolved-member
-            // invoker (whose callee re-enters the fused tier at the seam).
-            // Sites are stamped by framed runs of the same instruction.
-            if (comptime @hasDecl(H, "memberSiteSig") and @hasDecl(H, "hostMemberServeKind")) {
-                if (recv == .Instance and exec_call.argNamesAllNull(cm.arg_names)) {
-                    const w0 = @atomicLoad(u64, @constCast(&cm.site_cls), .acquire);
-                    if (w0 > 1) site: {
-                        const cls_now: u64 = @intCast(runtime.InstanceData.classIdentityUnlocked(recv.Instance));
-                        if (w0 != cls_now) break :site;
-                        const route = @atomicLoad(u64, @constCast(&cm.site_route), .acquire);
-                        if (route == 0) break :site;
-                        const sig_now = host.memberSiteSig(argv[0..cm.n_args]) orelse break :site;
-                        if (sig_now != @atomicLoad(u64, @constCast(&cm.site_sig), .monotonic)) break :site;
-                        if (route & 1 == 0) {
-                            if (try host.hostMemberServeKind(allocator, @intCast(route >> 1), &recv, argv[0..cm.n_args])) |served| {
-                                fusedWrite(allocator, regs, cm.dst, served, reclaim, false);
-                                return;
-                            }
-                            break :site;
-                        }
-                        const names0 = try exec_call.resolveArgNames(allocator, module, cm.arg_names);
-                        defer exec_call.freeArgNames(allocator, names0);
-                        switch (try host.invokeResolvedMember(allocator, null, &recv, @enumFromInt(@as(u32, @intCast(route >> 1))), argv[0..cm.n_args], names0)) {
-                            .ok => |v| {
-                                fusedWrite(allocator, regs, cm.dst, v, reclaim, false);
-                                return;
-                            },
-                            .err => |e| return fusedRaise(e),
-                        }
-                    }
-                }
-            }
-            // The framed arm's primitive fast paths are SEMANTIC, not just
-            // fast: the ladder resolves `Long.inv`/`compareTo` shapes
-            // differently (saturatingFiniteDiff's overflow test read the
-            // wrong branch without this).
-            if (cm.arg_names.len == 0 and cm.n_args <= 1) {
-                if (constStr(module, cm.name)) |nm0| {
-                    const a0: ?Value = if (cm.n_args == 1) argv[0] else null;
-                    if (exec_call.primitiveMemberOp(&recv, nm0, a0)) |rv| {
-                        fusedWrite(allocator, regs, cm.dst, rv, reclaim, false);
-                        return;
-                    }
-                    if (recv == .RangeIter) {
-                        if (exec_call.rangeIterFast(allocator, &recv, nm0, cm.n_args)) |r0| {
-                            switch (r0) {
-                                .ok => |rv| {
-                                    fusedWrite(allocator, regs, cm.dst, rv, reclaim, false);
-                                    return;
-                                },
-                                .err => |e| return fusedRaise(e),
-                            }
-                        }
-                    }
-                }
-            }
-            const names = try exec_call.resolveArgNames(allocator, module, cm.arg_names);
-            defer exec_call.freeArgNames(allocator, names);
-            // Framed parity: the executing body's own receiver stays
-            // reachable while the dispatch resolves (member-extension
-            // visibility consults the chain); access-only, exactly as the
-            // framed arm pushes its params[0].
-            var pushed_access = false;
-            if (args.len > 0 and args[0] == .Instance) {
-                const same = recv == .Instance and ObjRef(InstanceData).ptrEq(args[0].Instance, recv.Instance);
-                if (!same) {
-                    pushEnclosingAccess(&args[0]);
-                    pushed_access = true;
-                }
-            }
-            defer if (pushed_access) popEnclosing();
-            if (cm.resolved) |fid| {
-                var dispatch_recv: ?Value = if (cm.dispatch_receiver) |reg| fusedRead(regs, reg) else null;
-                if (dispatch_recv) |value| value.retain();
-                defer if (dispatch_recv) |value| value.release(allocator);
-                const dispatch_ptr: ?*const Value = if (dispatch_recv) |*value| value else null;
-                switch (try host.invokeResolvedMember(allocator, dispatch_ptr, &recv, fid, argv[0..cm.n_args], names)) {
-                    .ok => |v| fusedWrite(allocator, regs, cm.dst, v, reclaim, false),
-                    .err => |e| return fusedRaise(e),
-                }
-                return;
-            }
-            const name_str = constStr(module, cm.name) orelse
-                return fusedRaise(.{ .Type = "CallMember: name not a string const" });
-            const static_recv: ?[]const u8 = if (cm.static_recv) |sid| constStr(module, sid) else null;
-            const declared_recv: ?[]const u8 = if (cm.declared_recv) |did| constStr(module, did) else null;
-            const r = if (static_recv) |sname|
-                host.callMemberNamedStatic(allocator, &recv, name_str, argv[0..cm.n_args], names, sname)
-            else if (declared_recv != null)
-                host.callMemberNamedDeclared(allocator, &recv, name_str, argv[0..cm.n_args], names, declared_recv)
-            else
-                host.callMemberNamed(allocator, &recv, name_str, argv[0..cm.n_args], names);
-            switch (try r) {
-                .ok => |v| fusedWrite(allocator, regs, cm.dst, v, reclaim, false),
                 .err => |e| return fusedRaise(e),
             }
         },

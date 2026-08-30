@@ -149,7 +149,7 @@ pub const CallSite = struct {
     /// through the move chain's SOURCE — `action(index++, item)` otherwise
     /// reboxed `item` (a Char produced by an unresolved `next()`) with the
     /// stale static Int tag and the closure received its code as an Int.
-    arg_tag_regs: [3]u32 = .{ 0, 0, 0 },
+    arg_tag_regs: [6]u32 = .{ 0, 0, 0, 0, 0, 0 },
     /// Live-tag source for the member receiver, through the same Move-chain
     /// walk as `arg_tag_regs`: a `Char` produced by an unresolved `next()`
     /// and MOVED into the receiver slot reboxes with the producer's runtime
@@ -212,6 +212,12 @@ pub const CallSite = struct {
     is_map_get: bool = false,
     is_map_set: bool = false,
     map_flag_slot: u32 = 0,
+    /// Slot-resolved virtual dispatch (`CallVirtual`): the callback rebuilds
+    /// the receiver + args and runs the host's `invokeVirtualMember` with
+    /// `virt_slot` — dispatch stays dynamic (correct for any receiver class),
+    /// so no class guard is needed.
+    is_virtual: bool = false,
+    virt_slot: u32 = 0,
 };
 
 /// One packed array a compiled loop indexes: the register holding it, the
@@ -689,7 +695,7 @@ fn trampolinableCallOf(inst: *const Inst) ?TrampCall {
     switch (inst.*) {
         .Call => |c| {
             if (c.arg_names.len != 0 or c.type_args.len != 0) return null;
-            if (c.n_args > 3) return null;
+            if (c.n_args > 6) return null;
             return .{ .func = c.func, .args_reg = c.args.int(), .n_args = c.n_args, .dst = c.dst };
         },
         else => return null,
@@ -706,7 +712,7 @@ fn trampolinableCallValueOf(inst: *const Inst) ?TrampCallValue {
     switch (inst.*) {
         .CallValue => |cv| {
             if (cv.arg_names.len != 0 or cv.type_args.len != 0) return null;
-            if (cv.n_args > 3) return null;
+            if (cv.n_args > 6) return null;
             return .{ .callee = cv.callee, .args_reg = cv.args.int(), .n_args = cv.n_args, .dst = cv.dst };
         },
         else => return null,
@@ -754,7 +760,7 @@ fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember 
     switch (inst.*) {
         .CallMember => |cm| {
             if (cm.arg_names.len != 0 or cm.static_recv != null) return null;
-            if (cm.n_args > 3) return null;
+            if (cm.n_args > 6) return null;
             if (cm.name.int() >= module.consts.items.len) return null;
             const name = module.consts.items[cm.name.int()];
             if (name != .String) return null;
@@ -772,11 +778,35 @@ fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember 
     }
 }
 
+/// A slot-resolved `CallVirtual` the loop JIT can trampoline: the callback
+/// runs the host's virtual dispatch with the recorded slot. Positional only
+/// (a param map, named args, or a trailing lambda keeps the interpreted arm's
+/// binding machinery), at most three args like the other tramp forms.
+const TrampVirtual = struct { recv: Reg, slot: u32, args_reg: u32, n_args: u32, dst: Reg };
+
+fn trampolinableVirtualOf(inst: *const Inst) ?TrampVirtual {
+    switch (inst.*) {
+        .CallVirtual => |cv| {
+            if (cv.arg_names.len != 0 or cv.arg_params != null) return null;
+            if (cv.trailing_lambda) return null;
+            if (cv.n_args > 6) return null;
+            return .{ .recv = cv.receiver, .slot = cv.slot.int(), .args_reg = cv.args.int(), .n_args = cv.n_args, .dst = cv.dst };
+        },
+        else => return null,
+    }
+}
+
 /// `fn(user, receiver, method_name, args) -> resolved method FuncId | null`. The
 /// loop JIT calls this at compile time (with the live receiver/args) to learn a
 /// trampolined member call's return type; null means unresolvable/intrinsic, so
 /// the call is not trampolined.
 pub const MemberResolver = *const fn (*anyopaque, *const Value, []const u8, []const Value) ?FuncId;
+
+/// `fn(user, receiver, slot) -> the FuncId the virtual slot dispatches to on
+/// the receiver's class | null`. Compile-time only, like `MemberResolver`:
+/// it lets a loop-invariant virtual call inline its (monomorphic) target
+/// natively; null keeps the site a trampoline.
+pub const VirtResolver = *const fn (*anyopaque, *const Value, u32) ?FuncId;
 
 /// A `GetField` the loop JIT can trampoline: a property read on a loop-invariant
 /// boxed object, handled as a direct stored-field read (the receiver stays boxed
@@ -1410,7 +1440,7 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[4]Reg, n_read
     // tracked, so it does not force the dst into the scalar type requirement).
     if (trampolinableCallOf(inst)) |tc| {
         var k: u8 = 0;
-        while (k < tc.n_args and k < 3) : (k += 1) reads[k] = Reg.from(tc.args_reg + k);
+        while (k < tc.n_args and k < 6) : (k += 1) reads[k] = Reg.from(tc.args_reg + k);
         n_reads.* = tc.n_args;
         if (isScalarRt(typeAt(types, tc.dst))) def.* = tc.dst;
         return;
@@ -1421,11 +1451,21 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[4]Reg, n_read
         const recv_scalar: usize = if (isScalarRt(typeAt(types, mc.recv))) 1 else 0;
         if (recv_scalar != 0) reads[0] = mc.recv;
         var k: u8 = 0;
-        while (k < mc.n_args and k < 3) : (k += 1) {
+        while (k < mc.n_args and k < 6) : (k += 1) {
             reads[recv_scalar + k] = Reg.from(mc.args_reg + k);
         }
         n_reads.* = recv_scalar + @as(usize, mc.n_args);
         if (isScalarRt(typeAt(types, mc.dst))) def.* = mc.dst;
+        return;
+    }
+    // A trampolined virtual call reads scalar args (its receiver is an object
+    // register, boxed for the host callback); its dst is a scalar def only
+    // when the result types scalar.
+    if (trampolinableVirtualOf(inst)) |vc| {
+        var k: u8 = 0;
+        while (k < vc.n_args and k < 6) : (k += 1) reads[k] = Reg.from(vc.args_reg + k);
+        n_reads.* = vc.n_args;
+        if (isScalarRt(typeAt(types, vc.dst))) def.* = vc.dst;
         return;
     }
     // A trampolined field read takes no scalar inputs (the receiver stays boxed);
@@ -1446,7 +1486,7 @@ fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[4]Reg, n_read
     // register); its result is discarded, so it has no scalar def.
     if (trampolinableCallValueOf(inst)) |cvc| {
         var k: u8 = 0;
-        while (k < cvc.n_args and k < 3) : (k += 1) reads[k] = Reg.from(cvc.args_reg + k);
+        while (k < cvc.n_args and k < 6) : (k += 1) reads[k] = Reg.from(cvc.args_reg + k);
         n_reads.* = cvc.n_args;
         return;
     }
@@ -2316,7 +2356,7 @@ const Compiler = struct {
 /// Try to compile the natural loop whose header is `header`, specializing array
 /// accesses on the kinds observed in `regs` (the live frame). Returns a compiled
 /// loop, or null if the loop is not a supported shape.
-pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool) Allocator.Error!?CompiledLoop {
+pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool) Allocator.Error!?CompiledLoop {
     const body = (try collectLoop(a, func, header)) orelse return null;
     defer a.free(body);
 
@@ -2336,6 +2376,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (bitwiseOpOf(module, inst) != null) continue;
             if (trampolinableCallOf(inst) != null) continue;
             if (trampolinableMemberOf(module, inst) != null) continue;
+            if (trampolinableVirtualOf(inst) != null) continue;
             if (trampolinableFieldOf(module, inst) != null) continue;
             if (trampolinableFieldSetOf(module, inst) != null) continue;
             if (trampolinableCallValueOf(inst) != null) continue;
@@ -2417,6 +2458,55 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     if (total_regs > 4096) return null;
                     continue;
                 }
+                // A loop-invariant VIRTUAL call resolves its monomorphic slot
+                // target at compile time and inlines it exactly like a member
+                // call (the entry class guard covers the invariant receiver, so
+                // the resolved body is the one the runtime dispatch would pick).
+                if (trampolinableVirtualOf(inst)) |vc| blk: {
+                    if (virt_resolver == null or field_resolver == null) break :blk;
+                    if (vc.recv.int() >= regs.len or regs[vc.recv.int()] != .Instance) break :blk;
+                    if (regWrittenInBody(func, body, vc.recv)) break :blk;
+                    const fid = virt_resolver.?(resolver_user.?, &regs[vc.recv.int()], vc.slot) orelse break :blk;
+                    const callee = module.funcById(fid) orelse break :blk;
+                    var this_reg: u32 = 0;
+                    if (!inlinableMemberCallee(module, callee, &this_reg)) break :blk;
+                    if (callee.params.len != @as(usize, vc.n_args) + 1) break :blk; // receiver + args
+                    var has_write = false;
+                    for (callee.blocks[0].insts) |*ci| {
+                        if (trampolinableFieldSetOf(module, ci) != null) has_write = true;
+                    }
+                    if (has_write) {
+                        if (field_nn_resolver == null) break :blk;
+                        var read_ok = true;
+                        for (callee.blocks[0].insts) |*ci| {
+                            if (trampolinableFieldOf(module, ci)) |fld| {
+                                if (field_nn_resolver.?(resolver_user.?, &regs[vc.recv.int()], memberFieldName(fld.name)) == null) {
+                                    read_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!read_ok) break :blk;
+                    }
+                    if (debugEnabled()) std.debug.print("[jit]   inlining virtual {s}\n", .{callee.name});
+                    const has_result = callee.blocks[0].terminator.Return != null;
+                    inline_sites.append(a, .{
+                        .block = bid,
+                        .inst = @intCast(ii),
+                        .callee = callee,
+                        .base = total_regs,
+                        .args_reg = vc.args_reg,
+                        .n_args = vc.n_args,
+                        .dst = vc.dst,
+                        .is_member = true,
+                        .recv_reg = vc.recv.int(),
+                        .this_reg = this_reg,
+                        .has_result = has_result,
+                    }) catch return null;
+                    total_regs += callee.n_locals;
+                    if (total_regs > 4096) return null;
+                    continue;
+                }
                 // Member call to a small `this`-field/scalar method: inline it.
                 // Only for a loop-invariant receiver — inlining resolves one method
                 // body, so a varying (polymorphic) receiver must keep dynamic dispatch.
@@ -2425,9 +2515,9 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     if (resolver == null or field_resolver == null) continue;
                     if (mc.recv.int() >= regs.len or regs[mc.recv.int()] != .Instance) continue;
                     if (regWrittenInBody(func, body, mc.recv)) continue;
-                    var av: [3]Value = undefined;
+                    var av: [6]Value = undefined;
                     var k: u8 = 0;
-                    while (k < mc.n_args and k < 3) : (k += 1) {
+                    while (k < mc.n_args and k < 6) : (k += 1) {
                         if (mc.args_reg + k >= regs.len) break;
                         av[k] = regs[mc.args_reg + k];
                     }
@@ -2532,7 +2622,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (trampolinableMemberOf(module, inst)) |mc| {
                 if (arrays.items.len != 0) return null;
                 if (mc.recv.int() >= n_regs or mc.recv.int() >= regs.len) return null;
-                var av: [3]Value = undefined;
+                var av: [6]Value = undefined;
                 var k: u8 = 0;
                 while (k < mc.n_args) : (k += 1) {
                     const ar = mc.args_reg + k;
@@ -2559,6 +2649,26 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 // the callback validates that kind on every invocation.
                 if (mc.dst.int() < n_regs and member_ret[mc.dst.int()] == .unknown and mc.dst.int() < regs.len) {
                     if (liveValueRegType(regs[mc.dst.int()])) |rt| member_ret[mc.dst.int()] = rt;
+                }
+                continue;
+            }
+            if (trampolinableVirtualOf(inst)) |vc| {
+                if (arrays.items.len != 0) return null;
+                if (vc.recv.int() >= n_regs or vc.recv.int() >= regs.len) return null;
+                // Resolve the slot's target on the live receiver for a precise
+                // return type (also what the inline path splices); fall back to
+                // the live loop state — the callback's result write validates
+                // the kind on every invocation.
+                if (vc.dst.int() < n_regs and regs[vc.recv.int()] == .Instance and virt_resolver != null) {
+                    if (virt_resolver.?(resolver_user.?, &regs[vc.recv.int()], vc.slot)) |fid| {
+                        if (module.funcById(fid)) |f| {
+                            if (f.is_suspend) return null;
+                            member_ret[vc.dst.int()] = funcReturnRegType(module, f);
+                        }
+                    }
+                }
+                if (vc.dst.int() < n_regs and member_ret[vc.dst.int()] == .unknown and vc.dst.int() < regs.len) {
+                    if (liveValueRegType(regs[vc.dst.int()])) |rt| member_ret[vc.dst.int()] = rt;
                 }
                 continue;
             }
@@ -2835,6 +2945,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         for (blk_insts, 0..) |*inst, i| {
             const is_call = trampolinableCallOf(inst) != null;
             const is_member = trampolinableMemberOf(module, inst) != null;
+            const is_virtual = trampolinableVirtualOf(inst) != null;
             const is_field = trampolinableFieldOf(module, inst) != null;
             const is_obj_move = switch (inst.*) {
                 .Move => |m| typeAt(types, m.dst) == .object or typeAt(types, m.src) == .object,
@@ -2851,14 +2962,14 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             const is_call_value = trampolinableCallValueOf(inst) != null;
             const is_load_global = trampolinableGlobalOf(module, inst) != null;
             const is_field_set = trampolinableFieldSetOf(module, inst) != null;
-            if (!is_call and !is_member and !is_field and !is_field_set and !is_obj_move and !is_null_check and !is_obj_index and !is_call_value and !is_load_global and !is_map_get and !is_map_set) continue;
+            if (!is_call and !is_member and !is_virtual and !is_field and !is_field_set and !is_obj_move and !is_null_check and !is_obj_index and !is_call_value and !is_load_global and !is_map_get and !is_map_set) continue;
             if (arrays.items.len != 0) {
                 if (debugEnabled()) std.debug.print("[jit]   bail: call + {d} arrays in {s}\n", .{ arrays.items.len, func.name });
                 return null;
             }
             // Every scalar arg must already live in a typed slot (field reads have none).
-            const args_reg: u32 = if (is_call) trampolinableCallOf(inst).?.args_reg else if (is_member) trampolinableMemberOf(module, inst).?.args_reg else if (is_call_value) trampolinableCallValueOf(inst).?.args_reg else 0;
-            const n_args: u32 = if (is_call) trampolinableCallOf(inst).?.n_args else if (is_member) trampolinableMemberOf(module, inst).?.n_args else if (is_call_value) trampolinableCallValueOf(inst).?.n_args else 0;
+            const args_reg: u32 = if (is_call) trampolinableCallOf(inst).?.args_reg else if (is_member) trampolinableMemberOf(module, inst).?.args_reg else if (is_virtual) trampolinableVirtualOf(inst).?.args_reg else if (is_call_value) trampolinableCallValueOf(inst).?.args_reg else 0;
+            const n_args: u32 = if (is_call) trampolinableCallOf(inst).?.n_args else if (is_member) trampolinableMemberOf(module, inst).?.n_args else if (is_virtual) trampolinableVirtualOf(inst).?.n_args else if (is_call_value) trampolinableCallValueOf(inst).?.n_args else 0;
             var k: u8 = 0;
             while (k < n_args) : (k += 1) {
                 const ar = args_reg + k;
@@ -2879,10 +2990,10 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             }
             // Per-arg live-tag source through the move chain (see
             // `CallSite.arg_tag_regs`).
-            var arg_tag_regs: [3]u32 = .{ 0, 0, 0 };
+            var arg_tag_regs: [6]u32 = .{ 0, 0, 0, 0, 0, 0 };
             {
                 var q: u8 = 0;
-                while (q < n_args and q < 3) : (q += 1) {
+                while (q < n_args and q < 6) : (q += 1) {
                     arg_tag_regs[q] = argTagSourceReg(blk_insts, i, args_reg + q);
                 }
             }
@@ -3079,6 +3190,39 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     .inst = @intCast(i),
                     .span = span,
                     .arg_tag_regs = arg_tag_regs,
+                }) catch return null;
+            } else if (is_virtual) {
+                // An inlined virtual call is emitted in place, not trampolined.
+                var inlined_v = false;
+                for (inline_sites.items) |s| {
+                    if (s.block.int() == bid.int() and s.inst == i) {
+                        inlined_v = true;
+                        break;
+                    }
+                }
+                if (inlined_v) continue;
+                const vc = trampolinableVirtualOf(inst).?;
+                if (vc.recv.int() >= n_regs or vc.recv.int() >= regs.len) return null;
+                // The receiver must be a boxed object register: virtual slots
+                // dispatch on instances, and the host reads it straight from
+                // the frame (no class guard — the dispatch itself is dynamic).
+                if (typeAt(types, vc.recv) != .object and typeAt(types, vc.recv) != .unknown) return null;
+                const rrt = member_ret[vc.dst.int()];
+                const has_result = rrt != .unknown;
+                if (has_result and (vc.dst.int() >= n_regs or types[vc.dst.int()] != rrt)) return null;
+                call_sites.append(a, .{
+                    .func = @enumFromInt(0),
+                    .args_reg = vc.args_reg,
+                    .n_args = vc.n_args,
+                    .dst_reg = vc.dst.int(),
+                    .has_result = has_result,
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span,
+                    .arg_tag_regs = arg_tag_regs,
+                    .is_virtual = true,
+                    .virt_slot = vc.slot,
+                    .recv_reg = vc.recv.int(),
                 }) catch return null;
             } else {
                 // An inlined member call is emitted in place, not trampolined.
@@ -3825,8 +3969,9 @@ fn inferFuncTypes(a: Allocator, module: *const Module, func: *const Func, n_regs
 /// are positional top-level calls (so direct recursion stays native through the
 /// call trampoline). `params` are the live arguments at the hot call, used to
 /// specialize param kinds. Returns null for any unsupported shape.
-pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, params: []const Value, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
+pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, params: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
     _ = resolver;
+    _ = virt_resolver;
     _ = field_resolver;
     _ = field_nn_resolver;
     _ = resolver_user;
@@ -3866,7 +4011,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
             if (numericConvOf(module, inst) != null) continue;
             if (bitwiseOpOf(module, inst) != null) continue;
             if (trampolinableCallOf(inst)) |tc| {
-                if (tc.n_args > 3) return null;
+                if (tc.n_args > 6) return null;
                 continue;
             }
             switch (inst.*) {
@@ -4102,14 +4247,14 @@ inline fn regsGrowAlloc(fallback: Allocator) Allocator {
     return fallback;
 }
 
-pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), params: []const Value, allocator: Allocator, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?FuncOutcome {
+pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), params: []const Value, allocator: Allocator, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?FuncOutcome {
     if (!funcEnabled()) return null;
     const fj = forFunc(func) orelse return null;
     if (!fj.func_tried) {
         fj.func_count += 1;
         if (fj.func_count < HOT_THRESHOLD) return null;
         fj.func_tried = true;
-        const compiled = tryCompileFunc(metadata_allocator, module, func, params, resolver, field_resolver, field_nn_resolver, user) catch null;
+        const compiled = tryCompileFunc(metadata_allocator, module, func, params, resolver, virt_resolver, field_resolver, field_nn_resolver, user) catch null;
         if (compiled == null) return null;
         if (debugEnabled()) std.debug.print("[jit] compiled function {s} n_slots={d} n_regs={d}\n", .{ func.name, compiled.?.n_slots, compiled.?.n_regs });
         fj.func_jit = compiled;
@@ -4145,15 +4290,15 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
 /// Interpreter hook: at the start of block `cur`, count the entry and — once
 /// hot — compile and run the natural loop with that header. Returns the resume
 /// point (registers reboxed) when a compiled loop ran, else null. KLIO_JIT only.
-pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?Resume {
+pub fn maybeRunHot(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?Resume {
     const fj = forFunc(func) orelse return null;
-    return maybeRunHotPre(fj, module, func, regs, allocator, cur, tramp, user, resolver, field_resolver, field_nn_resolver);
+    return maybeRunHotPre(fj, module, func, regs, allocator, cur, tramp, user, resolver, virt_resolver, field_resolver, field_nn_resolver);
 }
 
 /// The per-block-entry probe with the per-FUNCTION state already resolved
 /// (the frame loop hoists `forFunc` to once per activation). The fast
 /// paths — already compiled, or known-dead — are two array loads.
-pub fn maybeRunHotPre(fj: *FuncJit, module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?Resume {
+pub fn maybeRunHotPre(fj: *FuncJit, module: *const Module, func: *const Func, regs: *std.ArrayList(Value), allocator: Allocator, cur: BlockId, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?Resume {
     const bi = cur.int();
     if (bi >= fj.counts.len) return null;
 
@@ -4162,7 +4307,7 @@ pub fn maybeRunHotPre(fj: *FuncJit, module: *const Module, func: *const Func, re
         fj.counts[bi] += 1;
         if (fj.counts[bi] < HOT_THRESHOLD) return null;
         var transient = false;
-        const compiled = tryCompile(metadata_allocator, module, func, cur, regs.items, resolver, field_resolver, field_nn_resolver, user, &transient) catch null;
+        const compiled = tryCompile(metadata_allocator, module, func, cur, regs.items, resolver, virt_resolver, field_resolver, field_nn_resolver, user, &transient) catch null;
         if (compiled == null) {
             // A transient bail (an object register snapshot held null) is worth
             // retrying a few times; a permanent bail is cached immediately.

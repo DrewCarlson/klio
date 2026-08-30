@@ -349,6 +349,7 @@ pub const VmHost = struct {
     pub const committedExtReceiverDisproven = host_call_member.committedExtReceiverDisproven;
     pub const committedExtReceiverProven = host_call_member.committedExtReceiverProven;
     pub const resolveMemberFuncId = host_call_member.resolveMemberFuncId;
+    pub const resolveVirtualFuncId = host_call_member.resolveVirtualFuncId;
     pub const hostHasMember = host_call_member.hostHasMember;
     pub const cmgGlobalSkip = host_call_member.cmgGlobalSkip;
     pub const cmgGlobalRecord = host_call_member.cmgGlobalRecord;

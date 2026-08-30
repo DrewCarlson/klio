@@ -552,7 +552,6 @@ fn outcomeFromRuntime(self: *Vm, r: runtime.EvalResult) CallOutcome {
 /// top-level / enum-entry initializer. `module` and `sink` are already
 /// borrowed by the caller.
 fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Error!?VmError {
-    runtime.InstanceData.initFieldStats();
     // Canonicalize name-bearing strings once per module, before any user
     // code runs, so hot-path name compares exit on pointer equality. The
     // shared borrow the callers hold guards nothing concurrent here —
