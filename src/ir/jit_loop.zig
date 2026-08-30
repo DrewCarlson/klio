@@ -124,6 +124,11 @@ pub const TrampCtx = extern struct {
     /// return kind is unknowable statically (`toChar` on `Int`) still reboxes
     /// with the kind it actually produced.
     tags: [*]u8,
+    /// A register whose value the trampoline handler already delivered BOXED
+    /// into the frame (a call result whose runtime kind missed the slot's
+    /// static type). The post-run deopt rebox must not clobber it from the
+    /// never-filled slot. `maxInt` = none.
+    deopt_skip_reg: u32 = std.math.maxInt(u32),
 };
 /// `fn(trampctx, call_site_index) -> 0 to continue native, else a resume code`.
 pub const TrampFn = *const fn (*anyopaque, u64) callconv(.c) u64;
@@ -3704,10 +3709,12 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
     const target = BlockId.from(@intCast(code >> 32));
     const inst: u32 = @truncate(code & 0xffff_ffff);
 
+    const rebox_skip: u32 = if (self.call_sites.len != 0) tctx.deopt_skip_reg else std.math.maxInt(u32);
     r = 0;
     while (r < self.n_regs) : (r += 1) {
         if (!self.def_set[r]) continue;
         if (r >= regs.len) continue;
+        if (r == rebox_skip) continue;
         regs[r] = switch (self.reg_types[r]) {
             .i32 => valueFromSlotTagged(.i32, tags[r], slots[r]),
             .i64 => .{ .Long = slots[r] },
@@ -4433,6 +4440,19 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                             }
                         }
                     }
+                    // Receiver class outside the main module (the resolve memo
+                    // only sees main-module classes): the slot ROOT's declared
+                    // return type is still binding on every override — a
+                    // primitive return has no covariant widening — so a scalar
+                    // declaration types the destination without knowing the
+                    // target. A lying override deopts at the site (the handler
+                    // re-runs the instruction interpreted on a kind mismatch).
+                    if (rt2 == .object) {
+                        if (module.funcById(FuncId.from(vc2.slot))) |rootf| {
+                            const drt = retRegType(rootf.return_ty);
+                            if (drt != .unknown) rt2 = drt;
+                        }
+                    }
                 }
                 if (dstr) |d2| {
                     if (d2.int() >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4398\n", .{func.name}); return null; }
@@ -4922,9 +4942,10 @@ pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, 
         return .{ .code = .{ .block = target, .inst = inst }, .value = valueFromSlot(self.result_rt, slots[self.result_slot]) };
     }
     // Deopt / throw: rebox written scalar registers so the interpreter resumes.
+    const skip_reg: u32 = if (self.call_sites.len != 0 and self.has_tramp_sites) tctx.deopt_skip_reg else std.math.maxInt(u32);
     var r: u32 = 0;
     while (r < self.n_regs) : (r += 1) {
-        if (!self.def_set[r] or r >= regs.len) continue;
+        if (!self.def_set[r] or r >= regs.len or r == skip_reg) continue;
         switch (self.reg_types[r]) {
             .i32, .i64, .f64, .f32, .boolean => regs[r] = valueFromSlot(self.reg_types[r], slots[r]),
             else => {},

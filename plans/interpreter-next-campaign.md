@@ -196,10 +196,10 @@ compose shapes — a workload policy switch; `klio test` forces safe).
 Soak finalization DONE 2026-08-30 (a79439af): `KLIO_CANON`,
 `KLIO_TY_MEMO`, `KLIO_BC`, `KLIO_COUNTED`, `KLIO_COMPOSE_MEMO`,
 `KLIO_COMPOSE_SKIP` removed — defaults unconditional, docs scrubbed.
-Still soaking (deliberately, while the walker sits adjacent to the live
-method-tier hunt): `KLIO_FUSED_MAT` / `KLIO_FUSED_MINPREFIX` (fold into
-the walker once the hunt closes; `KLIO_FUSED=0` + the fqn name-list stay
-as the one permanent bisect).
+`KLIO_FUSED_MAT` / `KLIO_FUSED_MINPREFIX` folded 9c6b39b9 once the
+method-tier hunt closed (materialize unconditional, prefix floor a named
+constant; `KLIO_FUSED=0` + the fqn name-list stay as the one permanent
+bisect). Task 4 is COMPLETE.
 
 Keep permanently (policy or active bisect, not soak): `KLIO_COMPOSE_FAST`
 mask (caught the linkbuffer trap twice), `KLIO_MEMBER_INLINE` name-list,

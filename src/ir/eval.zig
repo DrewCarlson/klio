@@ -5906,9 +5906,12 @@ fn runFlatLoop(
                 }
                 // Deopt: resume interpretation at the outcome point (the
                 // frame's written scalar registers were reboxed by runFunc).
+                // A handler-issued deopt carries the sentinel and records the
+                // resume instruction on the context; a native one (div by
+                // zero) encodes the instruction directly.
                 if (runtime.envOnce("KLIO_JIT_DEBUG") != null) std.debug.print("[jit-dbg] flat DEOPT {s} b={d} i={d}\n", .{ site.req.func.fqn, fo.code.block, fo.code.inst });
                 cur = fo.code.block;
-                ridx = fo.code.inst;
+                ridx = if (fo.code.inst == jit_loop.DEOPT_INST) hctx.pending_deopt_inst else fo.code.inst;
             }
             continue;
         }
@@ -6575,7 +6578,18 @@ fn LoopTramp(comptime H: type) type {
                             };
                         } else {
                             const s = jit_loop.cellSlotIn(cl.reg_types[site.dst_reg], v) orelse {
-                                lc.pending_deopt_inst = site.inst;
+                                // The call ALREADY RAN — a deopt that re-runs
+                                // the instruction would double its effects.
+                                // Deliver the boxed result into the frame
+                                // register (the rebox pass skips it) and
+                                // resume interpretation AFTER the site.
+                                v.retain();
+                                lc.frame.write(Reg.from(site.dst_reg), v) catch {
+                                    lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
+                                    return jit_loop.throwCode(site.block);
+                                };
+                                tctx.deopt_skip_reg = site.dst_reg;
+                                lc.pending_deopt_inst = site.inst + 1;
                                 return jit_loop.deoptCode(site.block);
                             };
                             tctx.slots[site.dst_reg] = s;
@@ -6870,9 +6884,11 @@ fn runFrameExec(
                                 else => return errResult(e),
                             }
                         }
-                        // A div-by-zero deopt: re-execute that instruction.
+                        // Deopt: a handler-issued one carries the sentinel and
+                        // records the resume instruction on the context; a
+                        // native one (div by zero) encodes it directly.
                         cur = fo.code.block;
-                        resume_idx = fo.code.inst;
+                        resume_idx = if (fo.code.inst == jit_loop.DEOPT_INST) loop_ctx.pending_deopt_inst else fo.code.inst;
                         continue;
                     }
                 }
