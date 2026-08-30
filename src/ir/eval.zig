@@ -1475,6 +1475,7 @@ pub var dispatch_replay_hits: ?*const fn () u64 = null;
 pub var ext_fb_counts: ?*const fn () [4]u64 = null;
 
 pub fn dispatchStatsDump() void {
+    if (dispatch_stats_state != 2) return;
     if (ext_fb_counts) |f| {
         const c = f();
         if (c[0] != 0) std.debug.print(
@@ -1482,7 +1483,6 @@ pub fn dispatchStatsDump() void {
             .{ c[0], c[1], c[2], c[3] },
         );
     }
-    if (dispatch_stats_state != 2) return;
     var total: u64 = 0;
     for (&dispatch_counts) |*c| total += c.load(.monotonic);
     if (total == 0) return;
@@ -11317,10 +11317,26 @@ fn fusedEligible(comptime H: type, host: *H, module: *const Module, func: *const
     return fusedVerdict(H, host, module, func) == 1;
 }
 
+/// Funcs THIS thread is currently classifying, so a self-recursive body's
+/// own call site resolves optimistically (the fixpoint that lets fused
+/// recursion classify FULL) while ANOTHER thread's in-progress marker is
+/// a plain decline — handing the optimistic verdict across threads let a
+/// second core run a body fused before the classifying thread had even
+/// ensured its blocks were decoded (the dispatched_delay corpus panic).
+threadlocal var classify_stack: [128]u32 = undefined;
+threadlocal var classify_depth: usize = 0;
+
+fn classifyingHere(fid: u32) bool {
+    for (classify_stack[0..classify_depth]) |f| {
+        if (f == fid) return true;
+    }
+    return false;
+}
+
 fn fusedVerdict(comptime H: type, host: *H, module: *const Module, func: *const Func) u8 {
     switch (func.fuse_state) {
         1, 2, 4 => return func.fuse_state,
-        3 => return 1,
+        3 => return if (classifyingHere(func.id.int())) 1 else 2,
         else => {},
     }
     if (comptime @hasDecl(H, "funcRunsItsBody")) {
@@ -11329,8 +11345,12 @@ fn fusedVerdict(comptime H: type, host: *H, module: *const Module, func: *const 
             return 2;
         }
     }
+    if (classify_depth >= classify_stack.len) return 2; // depth guard: decline, no memo
     @constCast(func).fuse_state = 3;
+    classify_stack[classify_depth] = func.id.int();
+    classify_depth += 1;
     const verdict = fusedClassify(H, host, module, func);
+    classify_depth -= 1;
     @constCast(func).fuse_state = verdict;
     return verdict;
 }
@@ -11507,6 +11527,10 @@ pub fn fusedExecOpt(
         if (has_outer) return null;
     }
     if (fused_depth >= FUSED_BANK_DEPTH) return null;
+    // A memoized verdict travels between threads without ordering against
+    // the body's lazy decode; re-ensure here (idempotent, serialized) so
+    // the walker never indexes an empty block table.
+    if (func.blocks.len == 0 and !module.ensureFuncBody(@constCast(func))) return null;
     if (frame_count_on) frame_count_total += 1;
     if (runtime.envOnce("KLIO_FUSED_TRACE") != null) {
         std.debug.print("[fused] {s}\n", .{if (func.fqn.len != 0) func.fqn else func.name});

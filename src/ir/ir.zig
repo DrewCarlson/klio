@@ -27,6 +27,7 @@ pub const build = @import("build.zig");
 pub const eval = @import("eval.zig");
 pub const bc = @import("bc.zig");
 pub const lower = @import("lower.zig");
+pub const hot_layout = @import("hot_layout.zig");
 pub const jit_loop = @import("jit_loop.zig");
 pub const disasm = @import("disasm.zig");
 
@@ -2514,6 +2515,17 @@ pub const Module = struct {
         if (func.blocks.len != 0) return true;
         if (func.deferred_offset == 0) return false;
         const decode = self.deferred_func_decode orelse return false;
+        // Serialize the decode + publication: two threads first-touching the
+        // same deferred body raced the two-word `blocks` slice write (a
+        // reader could observe a torn ptr/len pair), and an unfenced
+        // publication let a second core see downstream state (a memoized
+        // fused verdict) before the blocks themselves. The header lock's
+        // acquire/release brackets are the ordering edge.
+        const mut: *Module = @constCast(self);
+        while (mut.func_header_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+        defer mut.func_header_lock.store(false, .release);
+        if (func.blocks.len != 0) return true;
+        if (func.deferred_offset == 0) return false;
         if (decode(self.deferred_func_arena, self.deferred_func_section, func.deferred_offset - 1)) |blocks| {
             func.blocks = blocks;
             func.deferred_offset = 0;
