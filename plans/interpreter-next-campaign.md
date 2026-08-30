@@ -63,6 +63,25 @@ Progress (each measured, gate-neutral — the gate runs JIT-off):
   (litmus). The attribution behind the prize: an interpreted virtual
   call is ~26% leaf-tier serving + ~22% driver + ~10% dispatch — all of
   which the devirtualized native body removes.
+- [x] SEAM METHOD TIER (f393319d): the tier-starvation family fixed —
+  a fusable body never framed (walker yields once hot,
+  `fusedShouldYieldToFuncTier`) and a member-dispatched one bypassed the
+  framed entry hook, so the recursive seam now counts, compiles, and
+  runs DEOPT-FREE method bodies (no calls, no division, NN-proven
+  `this`-field reads: native memory ops, no guards, RETURN-only) with
+  no frame at all; the flat driver serves them via a non-counting peek.
+  Member-call field-bump loop 353 -> 165 ns/iter, activations 3.0M ->
+  1.5K. `tl_method_jit_field_bump` pins the subclass guard-decline.
+  TRAPS recorded: native field sites must not trip the tramp-required
+  bail (has_tramp_sites); `\$sgetter\$` scoped names resolve through
+  memberFieldName; the seam decline print is KLIO_JIT_DEBUG-gated.
+- [ ] NEXT — run `can_deopt` compiled bodies for member calls: the
+  framed entry hook (eval ~6630) already has FULL deopt-resume
+  semantics (`cur = fo.code.block; resume_idx = fo.code.inst`), but the
+  bc-stream/flat driver bypasses it — place the same maybeRunHotFunc
+  attempt at the bc/flat activation open. That unlocks the
+  calls-and-branches method shapes (IntStack.push with its resize()
+  branch; `asInt` compiles today but never runs).
 - [ ] Remaining classify blockers, in unblock order: CallMemberOrValue /
   CallMemberOrGlobal, InstanceOf, EnclosingPush/Pop, StoreGlobal,
   NewInstance, QualifiedThis (each is a tramp arm or a native check;
@@ -70,7 +89,8 @@ Progress (each measured, gate-neutral — the gate runs JIT-off):
   the exact needs).
 - [ ] Then: function-tier coverage of the composer straight-line bodies,
   replica A/B, and only on a measured win the gate-policy question
-  (safe profile keeps JIT off today).
+  (safe profile keeps JIT off today; every seam/tier addition so far is
+  `funcEnabled()`-gated, so the gate is untouched by construction).
 
 Exit: vpd budget ratchets down with each landed stage; the tier is a win
 only if the CLOCK moves (the closed campaign's "activation cut does not
