@@ -661,7 +661,10 @@ fn lexicalReceiverFallback(
 /// class the call site was compiled against (re-checked by the entry class guard).
 pub fn plainStoredFieldIndex(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) ?u32 {
     if (receiver.* != .Instance) return null;
-    // Reject if any class in the hierarchy declares a custom getter or setter.
+    // Reject if any class in the hierarchy declares a custom getter/setter or
+    // DELEGATES the property (`by lazy` stores the delegate object under the
+    // property's name — a raw read would leak the wrapper).
+    if (runtimeClassDelegatesProp(receiver.Instance, name)) return null;
     {
         var cur: ?[]const u8 = className(receiver.Instance);
         var seen: std.ArrayList([]const u8) = .empty;
@@ -677,6 +680,7 @@ pub fn plainStoredFieldIndex(self: *VmHost, allocator: Allocator, receiver: *con
                 pg.deinit();
                 if (hit) return null;
             }
+            if (delegatedPropRegistered(self, cn, name)) return null;
             cur = firstSupertype(self, cn);
         }
     }

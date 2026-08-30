@@ -6362,14 +6362,25 @@ fn LoopTramp(comptime H: type) type {
             // effect, so a deopt is safe (the interpreter re-reads).
             if (site.is_field) {
                 const recv = lc.frame.regs.items[site.recv_reg];
-                // A varying boxed receiver may be a different class this iteration
-                // (or null after a `?.` chain step); deopt unless it matches.
-                if (recv != .Instance or (site.recv_varies and jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
+                // A by-name site resolves the stored index on the live
+                // receiver per call (a getter property or missing member
+                // deopts — the read is pure, the interpreter re-runs it).
+                // A fixed-index site's varying boxed receiver may be a
+                // different class this iteration (or null after a `?.` chain
+                // step); deopt unless it matches.
+                if (recv != .Instance or (!site.field_named and site.recv_varies and jit_loop.instanceClassIdentity(recv) != site.recv_class)) {
                     lc.pending_deopt_inst = site.inst;
                     return jit_loop.deoptCode(site.block);
                 }
+                const fidx: u32 = if (site.field_named)
+                    (lc.host.plainStoredFieldIndex(lc.allocator, &recv, site.name) orelse {
+                        lc.pending_deopt_inst = site.inst;
+                        return jit_loop.deoptCode(site.block);
+                    })
+                else
+                    site.field_idx;
                 const g = recv.Instance.borrow();
-                const fv: ?Value = if (site.field_idx < g.get().fields.items.len) g.get().fields.items[site.field_idx].value else null;
+                const fv: ?Value = if (fidx < g.get().fields.items.len) g.get().fields.items[fidx].value else null;
                 g.deinit();
                 if (cl.reg_types[site.dst_reg] == .object) {
                     // Object field: write the boxed value straight into the frame.

@@ -209,6 +209,10 @@ pub const CallSite = struct {
     /// inside an otherwise native object-control loop without putting a GC
     /// reference in the scalar slot file.
     is_load_global: bool = false,
+    /// `is_field` variant whose receiver varies per activation (function-JIT):
+    /// the handler resolves the stored index BY NAME on the live receiver each
+    /// call, deopting when the member is not a plain stored field.
+    field_named: bool = false,
     /// Call a loop-invariant callable value held in `recv_reg` with the scalar
     /// args at `args_reg`; the result is discarded.
     is_call_value: bool = false,
@@ -353,7 +357,11 @@ pub const CompiledLoop = struct {
     /// The return register to read from the LIVE FRAME on RETURN when the
     /// escape chain left it untyped (result_rt then describes the declared
     /// kind for the caller's rebox validation).
-    result_from_frame: ?u32 = null,
+    /// Function-JIT: slot holding the RETURNING REGISTER's index for a
+    /// frame-resident (object / escape-typed) result, written by each
+    /// `Return` emit; `maxInt(u32)` there means the scalar `result_slot`
+    /// (or Unit) carries the value instead.
+    result_reg_slot: u32 = 0,
     self_dbg_name: []const u8 = "",
     allocator: Allocator,
 
@@ -784,6 +792,10 @@ const TrampGlobal = struct { dst: Reg, name: []const u8 };
 fn trampolinableGlobalOf(module: *const Module, inst: *const Inst) ?TrampGlobal {
     switch (inst.*) {
         .LoadGlobal => |lg| {
+            // An identity-resolved binding (a function/class value) reads by
+            // id, not by name — the by-name handler would find a different
+            // (or no) value.
+            if (lg.func != null or lg.class != null or lg.ctor_ref) return null;
             if (lg.name.int() >= module.consts.items.len) return null;
             const name = module.consts.items[lg.name.int()];
             if (name != .String) return null;
@@ -934,6 +946,17 @@ pub const FieldResolver = *const fn (*anyopaque, *const Value, []const u8) ?u32;
 /// reboxed; a used non-scalar result makes the loop uncompilable).
 fn isUnitReturn(ty: ir.TypeRef) bool {
     return !ty.nullable and (std.mem.eql(u8, ty.name, "Unit") or ty.name.len == 0);
+}
+
+/// Whether a declared return TYPE NAME is any scalar kind (nullable or not,
+/// exact or rebox-inexact). Such returns never take the frame-resident object
+/// protocol — their register may be slot-typed with a boxed form that does
+/// not round-trip the declaration.
+fn declaredScalarName(n: []const u8) bool {
+    return std.mem.eql(u8, n, "Int") or std.mem.eql(u8, n, "Long") or
+        std.mem.eql(u8, n, "Double") or std.mem.eql(u8, n, "Float") or
+        std.mem.eql(u8, n, "Boolean") or std.mem.eql(u8, n, "Char") or
+        std.mem.eql(u8, n, "Short") or std.mem.eql(u8, n, "Byte");
 }
 
 fn retRegType(ty: ir.TypeRef) RegType {
@@ -1746,6 +1769,7 @@ const Compiler = struct {
     param_slot_base: u32 = 0,
     n_params: u32 = 0,
     result_slot: u32 = 0,
+    result_reg_slot: u32 = 0,
     em: jit.Emitter,
     block_label: []?jit.Label,
     exit_targets: std.ArrayListUnmanaged(BlockId),
@@ -2419,14 +2443,24 @@ const Compiler = struct {
             // any scalar kind; `runFunc` reboxes it to the declared return type.
             .Return => |maybe_reg| {
                 if (!self.func_mode) return jit.JitError.Unsupported;
+                // Per-return delivery: a slot-typed value copies into
+                // `result_slot` (and clears the frame marker); a
+                // frame-resident one (object / escape-typed — its value lives
+                // in the frame register, written there by the handlers)
+                // records its REGISTER INDEX in `result_reg_slot` so
+                // `runFunc` reads the frame.
+                var frame_reg: i64 = -1;
                 if (maybe_reg) |r| {
-                    // A frame-resident (escape-typed) return value is read by
-                    // `runFunc` from the frame; no slot to copy.
-                    if (typeOf(self.types, r) != .unknown) {
+                    const rt = typeOf(self.types, r);
+                    if (rt == .unknown or rt == .object) {
+                        frame_reg = @intCast(r.int());
+                    } else {
                         try self.loadSlot(T0, r);
                         try self.em.storeMem(REGS, @intCast(@as(u64, self.result_slot) * 8), T0);
                     }
                 }
+                try self.em.movImm64(T0, @bitCast(frame_reg));
+                try self.em.storeMem(REGS, @intCast(@as(u64, self.result_reg_slot) * 8), T0);
                 try self.em.movImm64(.rax, returnCode());
                 try self.em.jmp(self.epilogue);
             },
@@ -4131,7 +4165,13 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         std.mem.eql(u8, func.return_ty.name, "Long") or std.mem.eql(u8, func.return_ty.name, "Double") or
         std.mem.eql(u8, func.return_ty.name, "Float") or std.mem.eql(u8, func.return_ty.name, "Boolean"));
     const result_scalar = isScalarRt(result_rt) and exact_ret;
-    if (!result_scalar and !(result_rt == .unknown and isUnitReturn(func.return_ty))) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4100\n", .{func.name}); return null; }
+    // A declared-object (or Unit) result is served by the frame-resident
+    // return protocol: every value `Return` records its register index and
+    // `runFunc` reads the frame register the handlers populated. Only the
+    // in-between shapes decline: an inexact scalar (Char/Short/Byte rebox as
+    // Int) and a nullable scalar (its Null arm has no slot form).
+    const result_object = !result_scalar and !declaredScalarName(func.return_ty.name) and !isUnitReturn(func.return_ty);
+    if (!result_scalar and !result_object and !(result_rt == .unknown and isUnitReturn(func.return_ty))) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4100\n", .{func.name}); return null; }
 
     const body = (try collectFunc(a, func)) orelse { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4102\n", .{func.name}); return null; };
     defer a.free(body);
@@ -4237,21 +4277,17 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
             // registers.)
             if (trampolinableMemberOf(module, inst)) |mc| {
                 if (!fjMemberEnabled()) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4205\n", .{func.name}); return null; }
-                var found = false;
-                for (obj_loads) |opl| {
-                    if (opl.reg == mc.recv.int()) found = true;
-                }
-                if (!found) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4210\n", .{func.name}); return null; }
+                // The receiver may be ANY object-typed register — a param, a
+                // prior call's boxed result, an object field read: every
+                // object def is handler-written, so its value is in the frame
+                // where the site handler reads it. The site build (post-
+                // typing) enforces the .object kind.
                 if (mc.dispatch_recv != null) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4211\n", .{func.name}); return null; }
                 continue;
             }
             if (trampolinableVirtualOf(inst)) |vc| {
                 if (!fjMemberEnabled()) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4215\n", .{func.name}); return null; }
-                var found = false;
-                for (obj_loads) |opl| {
-                    if (opl.reg == vc.recv.int()) found = true;
-                }
-                if (!found) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4220\n", .{func.name}); return null; }
+                _ = vc;
                 continue;
             }
             switch (inst.*) {
@@ -4270,7 +4306,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 .UnOp => |u| if (isRecvReg(recv_regs, u.operand.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4236\n", .{func.name}); return null; },
                 .GetField => |gf| {
                     if (!is_method or !isRecvReg(recv_regs, gf.receiver.int())) {
-                        if (!execEscapable(inst)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4239\n", .{func.name}); return null; }
+                        if (!execEscapable(inst)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4239 inst={s}\n", .{ func.name, @tagName(std.meta.activeTag(inst.*)) }); return null; }
                         n_escapes += 1;
                         escape_pos.append(a, .{ .b = bid.int(), .i = @intCast(inst_i) }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4241\n", .{func.name}); return null; };
                         continue;
@@ -4278,7 +4314,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 },
                 .SetField => |sf| {
                     if (!is_method or !isRecvReg(recv_regs, sf.receiver.int())) {
-                        if (!execEscapable(inst)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4247\n", .{func.name}); return null; }
+                        if (!execEscapable(inst)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4247 inst={s}\n", .{ func.name, @tagName(std.meta.activeTag(inst.*)) }); return null; }
                         n_escapes += 1;
                         escape_pos.append(a, .{ .b = bid.int(), .i = @intCast(inst_i) }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4249\n", .{func.name}); return null; };
                         continue;
@@ -4292,7 +4328,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                     // for runs as an ESCAPE: the interpreter's own arm
                     // against the live frame. Bounded per body so a mostly-
                     // escaped body stays interpreted.
-                    if (!execEscapable(inst)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4261\n", .{func.name}); return null; }
+                    if (!execEscapable(inst)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4261 inst={s}\n", .{ func.name, @tagName(std.meta.activeTag(inst.*)) }); return null; }
                     n_escapes += 1;
                     escape_pos.append(a, .{ .b = bid.int(), .i = @intCast(inst_i) }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4263\n", .{func.name}); return null; };
                 },
@@ -4335,11 +4371,15 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         for (body) |bid| {
             const blk = &func.blocks[bid.int()];
             for (blk.insts, 0..) |*inst, ii| {
-                const info: struct { name_id: ir.ConstId, is_set: bool, reg: u32 } = switch (inst.*) {
-                    .GetField => |gf| .{ .name_id = gf.field, .is_set = false, .reg = gf.dst.int() },
-                    .SetField => |sf| .{ .name_id = sf.field, .is_set = true, .reg = sf.value.int() },
+                const info: struct { name_id: ir.ConstId, is_set: bool, reg: u32, recv: u32 } = switch (inst.*) {
+                    .GetField => |gf| .{ .name_id = gf.field, .is_set = false, .reg = gf.dst.int(), .recv = gf.receiver.int() },
+                    .SetField => |sf| .{ .name_id = sf.field, .is_set = true, .reg = sf.value.int(), .recv = sf.receiver.int() },
                     else => continue,
                 };
+                // Only the receiver's OWN fields take the native fixed-index
+                // route (the entry guard pins their class); any other object's
+                // field op goes through the by-name trampoline site below.
+                if (!isRecvReg(recv_regs, info.recv)) continue;
                 if (info.name_id.int() >= module.consts.items.len) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4309\n", .{func.name}); return null; }
                 const namec = module.consts.items[info.name_id.int()];
                 if (namec != .String) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4311\n", .{func.name}); return null; }
@@ -4358,7 +4398,14 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                     .Double => .f64,
                     .Float => .f32,
                     .Bool => .boolean,
-                    else => { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4327\n", .{func.name}); return null; },
+                    // An object-valued own field cannot live in a slot; its
+                    // READ is served by the by-name trampoline site (boxed
+                    // into the frame register). A store stays interpreted.
+                    else => {
+                        if (!info.is_set) continue;
+                        if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4327\n", .{func.name});
+                        return null;
+                    },
                 };
                 const nn = !info.is_set and field_nn_resolver != null and
                     field_nn_resolver.?(resolver_user.?, &params[0], fname) != null;
@@ -4382,7 +4429,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     // Seed field-read destination types, object-param registers, and
     // member/virtual result types, then re-run the fixpoint so they
     // propagate into the arithmetic that consumes them.
-    if (field_pres.items.len != 0 or obj_loads.len != 0) {
+    {
         for (obj_loads) |opl| {
             if (opl.reg >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4353\n", .{func.name}); return null; }
             _ = setType(types, Reg.from(opl.reg), .object);
@@ -4405,10 +4452,21 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         // boxed object write (always sound — the handler boxes the result
         // into the frame register).
         for (body) |bid2| {
-            for (func.blocks[bid2.int()].insts) |*inst2| {
+            for (func.blocks[bid2.int()].insts, 0..) |*inst2, ii2| {
                 var dstr: ?Reg = null;
                 var rt2: RegType = .object;
-                if (trampolinableMemberOf(module, inst2)) |mc2| {
+                if (inst2.* == .GetField) {
+                    // Own-field reads seed their exact scalar kind below (the
+                    // FieldPre pass); every other field read is a by-name
+                    // trampoline site whose result boxes into the frame.
+                    var covered = false;
+                    for (field_pres.items) |fp2| {
+                        if (fp2.block == bid2.int() and fp2.inst == ii2) covered = true;
+                    }
+                    if (!covered) dstr = inst2.GetField.dst;
+                } else if (trampolinableGlobalOf(module, inst2)) |lg2| {
+                    dstr = lg2.dst;
+                } else if (trampolinableMemberOf(module, inst2)) |mc2| {
                     dstr = mc2.dst;
                     if (mc2.resolved) |fid2| {
                         if (module.funcById(fid2)) |f2| rt2 = funcReturnRegType(module, f2);
@@ -4515,7 +4573,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                         if (rr2.int() < n_regs and types[rr2.int()] == .unknown) unknown = true;
                     }
                     if (!unknown) continue;
-                    if (!execEscapable(inst)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4458\n", .{func.name}); return null; }
+                    if (!execEscapable(inst)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4458 inst={s}\n", .{ func.name, @tagName(std.meta.activeTag(inst.*)) }); return null; }
                     if (inst.* == .Trace or inst.* == .LoadParam) continue;
                     n_escapes += 1;
                     if (n_escapes > 24) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4461\n", .{func.name}); return null; }
@@ -4539,16 +4597,25 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     // escape chain left it untyped, the return reads the LIVE FRAME (the
     // escaped arm wrote the real value there). A Branch on an untyped
     // condition has no such fallback: decline.
-    var result_from_frame: ?u32 = null;
-    if (result_scalar) {
-        for (body) |bid| {
-            const blk = &func.blocks[bid.int()];
-            if (blk.terminator == .Return) {
-                if (blk.terminator.Return) |rr| {
-                    if (rr.int() >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4478\n", .{func.name}); return null; }
-                    if (typeAt(types, rr) == .unknown) {
-                        result_from_frame = rr.int();
-                    } else if (typeAt(types, rr) != result_rt) {
+    for (body) |bid| {
+        const blk = &func.blocks[bid.int()];
+        if (blk.terminator == .Return) {
+            if (blk.terminator.Return) |rr| {
+                if (rr.int() >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4478\n", .{func.name}); return null; }
+                const rt3 = typeAt(types, rr);
+                if (result_scalar) {
+                    // Slot-typed must match the declared kind; unknown reads
+                    // the frame (the escaped arm wrote the real value there).
+                    if (rt3 != .unknown and rt3 != result_rt) {
+                        if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: result-kind\n", .{func.name});
+                        return null;
+                    }
+                } else if (result_object) {
+                    // Every value return must be frame-resident: a scalar-
+                    // typed register's boxed form may not match the declared
+                    // type (e.g. Any with an Int arm), and `.null_` has no
+                    // frame-register backing.
+                    if (rt3 != .object and rt3 != .unknown) {
                         if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: result-kind\n", .{func.name});
                         return null;
                     }
@@ -4634,7 +4701,77 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     for (body) |bid| {
         const blk = &func.blocks[bid.int()];
         for (blk.insts, 0..) |*inst, i| {
+            if (trampolinableGlobalOf(module, inst)) |lg| {
+                // Global read: the handler boxes the value into the frame
+                // register (a missing global deopts; the interpreter re-runs
+                // the read and raises properly).
+                if (lg.dst.int() >= n_regs or typeAt(types, lg.dst) != .object) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: global-kind\n", .{func.name}); return null; }
+                var span4: ?ir.Span = null;
+                var bj4: usize = i;
+                while (bj4 > 0) {
+                    bj4 -= 1;
+                    if (blk.insts[bj4] == .Trace) {
+                        span4 = blk.insts[bj4].Trace.span;
+                        break;
+                    }
+                }
+                call_sites.append(a, .{
+                    .dst_reg = lg.dst.int(),
+                    .name = lg.name,
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .span = span4,
+                    .is_load_global = true,
+                }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4676\n", .{func.name}); return null; };
+                continue;
+            }
+            if (inst.* == .GetField) {
+                var covered = false;
+                for (field_pres.items) |fp3| {
+                    if (fp3.block == bid.int() and fp3.inst == i) covered = true;
+                }
+                if (!covered) {
+                    // By-name field read on a varying receiver: the handler
+                    // resolves the stored index on the live receiver per call
+                    // and boxes the value into the frame register; a getter
+                    // property or non-Instance receiver deopts (the read is
+                    // pure, so the interpreter re-runs it).
+                    const tf = trampolinableFieldOf(module, inst) orelse { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: field-name\n", .{func.name}); return null; };
+                    if (tf.recv.int() >= n_regs or typeAt(types, tf.recv) != .object) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: field-recv\n", .{func.name}); return null; }
+                    if (tf.dst.int() >= n_regs or typeAt(types, tf.dst) != .object) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: field-dst\n", .{func.name}); return null; }
+                    var span5: ?ir.Span = null;
+                    var bj5: usize = i;
+                    while (bj5 > 0) {
+                        bj5 -= 1;
+                        if (blk.insts[bj5] == .Trace) {
+                            span5 = blk.insts[bj5].Trace.span;
+                            break;
+                        }
+                    }
+                    call_sites.append(a, .{
+                        .dst_reg = tf.dst.int(),
+                        .recv_reg = tf.recv.int(),
+                        .name = memberFieldName(tf.name),
+                        .block = bid,
+                        .inst = @intCast(i),
+                        .span = span5,
+                        .is_field = true,
+                        .field_named = true,
+                        .recv_varies = true,
+                        .has_result = true,
+                    }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4705\n", .{func.name}); return null; };
+                }
+                continue;
+            }
             const kind: enum { member, virt } = if (trampolinableMemberOf(module, inst) != null) .member else if (trampolinableVirtualOf(inst) != null) .virt else continue;
+            // The receiver register must be object-typed: the handler reads
+            // its value from the FRAME, which holds every object def (handler
+            // deliveries, object moves, seeded params). An unknown-typed one
+            // has an unclassified def; a scalar one lives in a slot.
+            {
+                const rreg: Reg = if (kind == .member) trampolinableMemberOf(module, inst).?.recv else trampolinableVirtualOf(inst).?.recv;
+                if (rreg.int() >= n_regs or typeAt(types, rreg) != .object) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: recv-kind\n", .{func.name}); return null; }
+            }
             const args_reg: u32 = if (kind == .member) trampolinableMemberOf(module, inst).?.args_reg else trampolinableVirtualOf(inst).?.args_reg;
             const n_args: u32 = if (kind == .member) trampolinableMemberOf(module, inst).?.n_args else trampolinableVirtualOf(inst).?.n_args;
             const dst: Reg = if (kind == .member) trampolinableMemberOf(module, inst).?.dst else trampolinableVirtualOf(inst).?.dst;
@@ -4763,7 +4900,8 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     const calls_base: u32 = after_params + (if (has_calls) @as(u32, 2) else 0);
     const fbase_slot: u32 = calls_base;
     const result_slot: u32 = calls_base + (if (is_method) @as(u32, 1) else 0);
-    const n_slots: u32 = result_slot + 1;
+    const result_reg_slot: u32 = result_slot + 1;
+    const n_slots: u32 = result_reg_slot + 1;
     for (call_sites.items[field_sites_base..]) |*site| site.fbase_slot = fbase_slot;
 
     var c = Compiler{
@@ -4789,6 +4927,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .param_slot_base = param_slot_base,
         .n_params = n_params,
         .result_slot = result_slot,
+        .result_reg_slot = result_reg_slot,
         .em = jit.Emitter.init(a),
         .block_label = try a.alloc(?jit.Label, func.blocks.len),
         .exit_targets = .empty,
@@ -4862,7 +5001,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .has_tramp_sites = field_sites_base != 0,
         .obj_param_loads = obj_loads_owned,
         .method_fields = method_fields_owned,
-        .result_from_frame = result_from_frame,
+        .result_reg_slot = result_reg_slot,
         .self_dbg_name = func.name,
         .allocator = a,
     };
@@ -4928,10 +5067,13 @@ pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, 
     const target = BlockId.from(@intCast(code >> 32));
     const inst: u32 = @truncate(code & 0xffff_ffff);
     if (inst == RETURN_INST) {
-        if (self.result_from_frame) |rr| {
-            // Escape-typed return: the arm left the real value in the frame
-            // register; hand it back owned (retain — the frame keeps its own
-            // reference until teardown).
+        // Frame-resident return (object / escape-typed): the taken `Return`
+        // recorded its register index; the handlers left the real value in
+        // that frame register. Hand it back owned (retain — the frame keeps
+        // its own reference until teardown).
+        const frame_reg = slots[self.result_reg_slot];
+        if (frame_reg >= 0) {
+            const rr: u64 = @intCast(frame_reg);
             if (rr < regs.len) {
                 const v = regs[rr];
                 v.retain();
