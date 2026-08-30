@@ -361,21 +361,27 @@ object/dispatch code needs inlined dispatch (inline caches in C),
 native-to-native calls and native frame management. Do not expect a wider op
 selector to get there.
 
-## Next: the speedup campaign (open)
+## The speedup campaign
 
-The opaque call-per-op ABI trades the stream's inlined switch dispatch
-for an exported function call per op, so it cannot beat the stream —
-the emitted C must INLINE the hot ops. The road, measure-first:
-- A frozen scalar "hot view" sub-ABI in the generated header:
-  static-inline C for const_int/move/load_param and the scalar bin/cmp
-  fast paths over exposed tag + Int/Long/Bool payload offsets of
-  `runtime.Value`, every offset comptime-checked against the real
-  struct at klio_rt build time (the Value layout campaign owns those
-  offsets; a mismatch must fail the build, not drift).
-- Under the GC profile retain/release are no-ops, so a hot-view register
-  write is a plain copy; the escape-op boundary keeps full semantics.
+2026-08-30 — THE FROZEN LAYOUT LANDED. The hot view's offsets/tags are
+now emitted as compile-time `KVC_*` constants: the fill logic moved to
+the shared `ir.hot_layout` (`fillLayout` serves both `klio_rt`'s runtime
+slot and `klio transpile`'s emit-time freeze), the generated file carries
+a `static const klio_hot_layout KVF` copy registered via the new
+`klio_rt_register_hot_frozen` (ABI 4 -> 5), and the runtime fill verifies
+it — any mismatch disables the whole view (`usable`/`obj_usable`/
+`span_usable` forced 0) so a .c linked against a different runtime falls
+back to the exported helpers (verified by corrupting a frozen tag:
+detected, disabled, byte-identical output). Only the three policy gates
+still read the runtime-filled KV. MEASURED: fieldbench (field-read loop,
+the op-by-op shape) 57 -> 9.5 ns/iter (6x; ~20x over the interpreter's
+195); rangebench unchanged 72ms (its loops fuse to typed C that LLVM
+closed-forms — that yardstick was already saturated at ~23x over the
+1.76s interpreted run).
+
+Remaining road (measure-first):
 - Direct C-to-C calls with a light frame-open helper (the tagged-table /
-  vararg-prologue ideas land here if the measurement wants them).
-- The loop JIT remains above the native check; the campaign's yardstick
-  is rangebench with the JIT off, and the JIT's own numbers (loops
-  10-13x) are the ceiling to respect.
+  vararg-prologue ideas land here if the measurement wants them). This
+  is the same architecture question as the native compiler tier in
+  `plans/interpreter-next-campaign.md` Task 1 — evaluate there.
+- The loop JIT remains above the native check.

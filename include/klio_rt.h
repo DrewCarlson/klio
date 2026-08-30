@@ -87,7 +87,15 @@ uint8_t *klio_op_span_slot(void *ctx);
  * `usable`) is chosen. Call before klio_rt_run_*. */
 void klio_rt_register_hot_layout(klio_hot_layout *slot);
 
-/* The library's ABI version (this header describes version 4). */
+/* Registers the generated file's EMIT-TIME copy of the layout, whose
+ * values its inline fast paths carry as compile-time constants. The run
+ * entries verify it against the live fill; on any mismatch the whole hot
+ * view is disabled (usable/obj_usable/span_usable forced 0) so the
+ * generated code falls back to the exported helpers instead of reading
+ * through wrong offsets. Call before klio_rt_run_*. */
+void klio_rt_register_hot_frozen(const klio_hot_layout *frozen);
+
+/* The library's ABI version (this header describes version 5). */
 int klio_rt_abi_version(void);
 
 /* A transpiled function body: runs the function's blocks starting at

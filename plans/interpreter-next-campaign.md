@@ -60,15 +60,21 @@ campaign (open)". Independent of Task 1 (targets numeric/scalar code the
 interpreter runs 1.32x slower than transpiled today, not compose
 dispatch). Work it as written there.
 
-## Task 3 — refcount-traffic vein (measure-first, ~4%)
+## Task 3 — refcount-traffic vein — CLOSED BY MEASUREMENT 2026-08-30
 
-`fetchAdd`/`fetchSub`/`borrow` total ~4% of the gate-like replica profile
-(JIT off, ReleaseSafe attribution). Candidate mechanisms, none yet tried:
-deferred/coalesced retain-release across a body, borrow-elision for
-provably frame-pinned receivers. Measure the honest ceiling first (a
-counting run: how many pairs cancel within one activation); implement
-only if the ceiling clears ~2% wall. The prior campaign's discipline
-holds: pin the A/B on the replica + gate, revert on neutral.
+The ~4% profile share was a RUN-MODE artifact (the arena-profile trap):
+`klio test` forces reclaim OFF (`commands.zig` testRunEntry seams), so
+the gate already skips every `clone`/`deinit` refcount atomic — those
+costs exist only under `klio run`'s GC profile. The gate-relevant
+remainder is the SpinRwLock shared borrow guards, and a direct
+noop-the-guards build (measurement only, reverted) moved the replica
+128-130 vs 128-131us — **at most ~1% wall**, below this plan's own >=2%
+implement threshold. Deferred RC / borrow elision would buy the gate
+nothing; do not re-try without a profile taken under gate-parity
+conditions (arena mode, KLIO_JIT=0, fast harness). The
+`interfaceDelegateFor` per-field-read scan rides inside the same
+sub-noise envelope (its class-static memo idea is recorded here should a
+future profile promote it).
 
 ## Task 4 — flag soak + finalization
 
