@@ -106,6 +106,9 @@ fn resolveThisRegKind(b: *FuncBuilder, in_lambda_body: bool, bind_local: bool) A
     if (b.knowsOuter("this") or (in_lambda_body and b.capturesThisSlot())) {
         const dst = try b.loadCaptureHoisted("this");
         if (bind_local) try b.bind("this", dst);
+        if (runtime.envOnce("KLIO_THIS_TRACE") != null) {
+            std.debug.print("[this-recover] bind={} reg={d} depth={d} in={s}\n", .{ bind_local, dst.int(), b.scopeDepth(), build.currentRealFn() orelse "-" });
+        }
         return dst;
     }
     return null;
@@ -2446,7 +2449,17 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // the declaring one, the field read on it is the answer.
             const receiver_is_owner = blk: {
                 if (!enclosing_only_member) break :blk false;
-                const rh = b.spliceRecvTy() orelse b.recvTy() orelse break :blk false;
+                // The splice head may only vouch for the resolved `this`
+                // when the window actually BOUND it (splice_recv_from_window)
+                // — a bare member-inline splice binds nothing, so the ambient
+                // `this` is whatever the enclosing lambda holds (a suspend
+                // lambda's dispatch coroutine), and pinning a field read on
+                // it with the OWNER's head read `job` off the runBlocking
+                // coroutine instead of the enclosing class.
+                const rh = (if (b.lambda_splice_resolve == null or b.splice_recv_from_window)
+                    b.spliceRecvTy()
+                else
+                    null) orelse b.recvTy() orelse break :blk false;
                 const decl_owner = sgetterOwner(b, name0) orelse break :blk false;
                 const rhh = typeHead(std.mem.trimEnd(u8, rh, "?"));
                 if (rhh.len == 0) break :blk false;

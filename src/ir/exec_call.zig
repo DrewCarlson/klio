@@ -1663,16 +1663,29 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
         }
         if (full_walk and resolved == null) {
             var winner: ?usize = null;
+            // Two passes, Kotlin's lexical rule: an outer receiver's MEMBER
+            // outranks an inner receiver's IMPORTED extension property
+            // (imports are the outermost scope), so pass 1 probes members
+            // only; extensions serve in pass 2 only when no member answered
+            // anywhere on the chain (`job` inside a CoroutineScope lambda of
+            // a class declaring `val job` reads the field, not
+            // kotlinx.coroutines' CoroutineScope.job).
+            var pass: u8 = 0;
+            walk: while (pass < 2) : (pass += 1) {
             for (cands, 0..) |c, ci| {
                 if (missTraceWant()) |w| if (std.mem.eql(u8, w, name_str)) {
-                    std.debug.print("[ltg-cand] name={s} ci={d} depth={d} tag={s} in_fn={s}\n", .{ name_str, ci, c.depth, @tagName(std.meta.activeTag(c.v)), frame.func.name });
+                    std.debug.print("[ltg-cand] name={s} pass={d} ci={d} depth={d} tag={s} in_fn={s}\n", .{ name_str, pass, ci, c.depth, @tagName(std.meta.activeTag(c.v)), frame.func.name });
                 };
-                switch (try host.getMemberField(allocator, &c.v, name_str)) {
+                switch (try (if (pass == 0)
+                    host.getMemberFieldNoExt(allocator, &c.v, name_str)
+                else
+                    host.getMemberField(allocator, &c.v, name_str)))
+                {
                     .ok => |v| {
                         orAudit("LoadFromThisOrGlobal", name_str, "member", c.depth, &c.v);
                         resolved = v;
                         winner = ci;
-                        break;
+                        break :walk;
                     },
                     // Only the dispatch-miss sentinel (`Unimplemented`)
                     // means "this candidate has no such member" — discard
@@ -1692,6 +1705,7 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
                         }
                     },
                 }
+            }
             }
             if (shape) |sh| {
                 const entry: u64 = if (winner) |w|
