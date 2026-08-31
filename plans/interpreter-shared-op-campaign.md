@@ -138,26 +138,28 @@ This is a core-path layout change: land it big, drive it green (the
 operating rule), with the delegate/getter rejection semantics carried
 over exactly. Budget comes from Task 1's field + lookup buckets.
 
-## Task 4 — native regions across call boundaries (the successor opening)
+## Task 4 — native regions across call boundaries — CLOSED 2026-08-31
 
-The one architecture no per-body tier reaches: a compiled body whose
-monomorphic member/virtual callee is itself compiled should SPLICE the
-callee inline (class-guarded, deopt to the call site), removing the
-host round-trip entirely for the pair — the loop tier's inline-site
-machinery (`inlineSiteAt` / `emitInlinedCall`, the member-inline entry
-guard + field-NN deopt rules) is the substrate, extended to the
-function tier. Start from the replica's hottest compiled-body call
-pairs (KLIO_JIT_DEBUG census names them). The probe-tax lesson applies
-in full: measure the NET effect (tier-on vs tier-off), not the spliced
-bodies; splice depth and code-size caps before breadth.
+Closed by census before building: the splice needs compiled-caller ->
+compiled-callee pairs with real call volume, and the replica's compiled
+set (17 bodies, KLIO_JIT_DEBUG census) contains essentially ONE such
+pair (`Changes.isNotEmpty -> ChangeList.isEmpty`), invoked at
+frame-batch frequency — dust. Compose's flat profile offers no pair
+above the >=2% threshold; the loop tier's inline machinery already
+serves the scalar workloads where pairs are hot (native recursion,
+member inlining, 349 -> 1 ns/iter precedent). Revisit only if a future
+census names a hot pair.
 
-## Task 5 — allocation fast path (~6% bucket, measure-first)
+## Task 5 — allocation fast path — CLOSED 2026-08-31
 
-allocSmall/allocLockedOne/newSlab under gate parity: if the arena
-profile already absorbs the bucket (the ReleaseSafe-memset trap says
-part of it is safe-mode fill, not alloc cost), close by measurement.
-Otherwise: a thread-local slab head for the dominant size class, no
-locks on the hit path.
+Closed by measurement on both fronts: (a) the proposed mechanism ALREADY
+EXISTS — `slab.zig` keeps threadlocal per-size-class magazines (~4KB
+each) refilled half-a-magazine per lock acquisition, so the profile's
+`allocLockedOne` 2.1% IS the ~32:1-amortized refill path, with
+`flushMagazines` at worker exit; and (b) the Task 1 A/B trilogy showed
+the memory subsystem is off vpd's critical path entirely (registry
+batching wall-neutral, cadence zero-or-negative). No lever above
+threshold remains in the bucket.
 
 ## Standing policy
 
