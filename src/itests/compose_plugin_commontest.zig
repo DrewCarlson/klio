@@ -481,6 +481,19 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                 if (keep) try trimmed.append(a, src);
             }
             var solo: std.ArrayList([]const u8) = .empty;
+            // vpd IS the suite wall (537s solo test body, JIT-negative,
+            // throughput-exhausted): it gets cores 0-5 to itself on a big
+            // box — scripts/stack.sh pins everything else off them — and
+            // every sibling child is spawned under nice so vpd's threads
+            // keep the scheduler wherever masks overlap (siblings had
+            // inflated the wall 554s solo -> 633s in-suite).
+            if ((std.Thread.getCpuCount() catch 1) >= 16)
+                try solo.appendSlice(a, &.{ "taskset", "-c", "0-5" });
+            // vpd's 537s body spends ~15-20% in GC (shade 6.7% + alloc
+            // paths, measured): a relaxed Appel factor + floor takes the
+            // solo body to 494s. The knobs are per-child via argv so the
+            // other children keep the default regime and RSS profile.
+            try solo.appendSlice(a, &.{ "env", "KLIO_GC_GROWTH=8", "KLIO_GC_THRESHOLD_KB=524288" });
             try solo.append(a, klioBin(&env));
             try solo.append(a, "test");
             try solo.appendSlice(a, trimmed.items);
@@ -488,6 +501,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             try jobs.append(a, try solo.toOwnedSlice(a));
             try job_names.append(a, "RecomposerTests.validatePotentialDeadlock");
             var rest: std.ArrayList([]const u8) = .empty;
+            try rest.appendSlice(a, &.{ "nice", "-n", "10" });
             try rest.append(a, klioBin(&env));
             try rest.append(a, "test");
             try rest.appendSlice(a, trimmed.items);
@@ -497,6 +511,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             continue;
         }
         var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(a, &.{ "nice", "-n", "10" });
         try argv.append(a, klioBin(&env));
         try argv.append(a, "test");
         try argv.appendSlice(a, sources.items);

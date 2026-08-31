@@ -1,47 +1,14 @@
 //! kotlinx-serialization's own `commonTest` sources run through a child
 //! `klio test` against the installed `kotlinx.serialization` pack.
 //! See `commontest_support.zig`.
+//!
+//! The suite CONFIG (roots, packs, ratchet floors/ceilings) lives in the
+//! shared registry `commontest_support.suites` — one source of truth for
+//! this CI gate and the link-free `klio-census` driver. The ratchet
+//! history that used to live here is in git; tighten floors there only.
 
 const support = @import("commontest_support.zig");
 
 test "kotlinx.serialization commonTest pass count holds at or above the ratchet baseline" {
-    try support.runSuite(.{
-        .name = "serialization",
-        .test_roots = &.{
-            "kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest",
-        },
-        .scratch_home = "/tmp/klio_itest_serialization_home",
-        .packs = &.{
-            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
-        },
-        .extra_support = &.{
-            "kotlin-klio/klio-kotlinx-serialization/klioTest/kotlinx/serialization/test/CurrentPlatform.kt",
-        },
-        // Every bound below TIGHTENS the gate. The floor rises 9 -> 60 as the
-        // pack widened to upstream's own serializer lookup; the two ceilings
-        // are new (the suite was floor-only before), so a run that clears the
-        // floor while growing failures or hangs now fails.
-        //
-        // 60 -> 62 and 78 -> 76: the reflective element descriptor now hands
-        // back the builtin serializers' own descriptors instead of minting a
-        // `PrimitiveSerialDescriptor` with a primitive's serial name, which
-        // upstream rejects outright.
-        //
-        // 62 -> 67 and 76 -> 71: the runtime class now retains its
-        // annotations' ARGUMENTS, so `@SerialName` on the class replaces the
-        // qualified-name default.
-        //
-        // 67 -> 69 and 71 -> 69: a descriptor reports the `@SerialInfo`
-        // annotations written on the class and on each property, built by
-        // running each annotation class's own constructor. Measured solo: 69
-        // passed, 69 failed, 0 did not complete.
-        // 69 -> 96 and 69 -> 42 after the harness stopped starving a target
-        // of its helper file, `+=` on a nested container stopped flattening,
-        // and a spliced inline extension started resolving against its own
-        // receiver. Measured solo: 98 passed, 40 failed.
-        .baseline = 138, // tightened 2026-08-31: every census at ZERO (red-mass closeout); floor holds margin for loaded test-all
-        .max_failed = 0,
-        .max_incomplete = 0,
-    });
+    try support.runSuiteNamed("serialization");
 }

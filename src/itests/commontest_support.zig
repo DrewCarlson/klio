@@ -52,6 +52,11 @@ pub const Config = struct {
     /// bound: a suite whose children start hanging is regressing even when
     /// the surviving cases still pass.
     max_incomplete: ?usize = null,
+    /// Files whose children are emitted ONE PER `@Test` (matched by path
+    /// suffix): a file with two 100s compute tests otherwise serializes the
+    /// suite wall behind one child. The split child compiles the same
+    /// closure and runs `--filter=Class.test`, so counting is unchanged.
+    split_files: []const []const u8 = &.{},
 };
 
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
@@ -67,6 +72,14 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
 }
 
 fn workerCount() usize {
+    // KLIO_ITEST_JOBS overrides (the compose gate honors the same env);
+    // the default clamp keeps a full-stack run from oversubscribing when
+    // every suite spawns its own pool.
+    if (std.c.getenv("KLIO_ITEST_JOBS")) |v| {
+        if (std.fmt.parseInt(usize, std.mem.span(v), 10) catch null) |n| {
+            if (n >= 1) return @min(n, 64);
+        }
+    }
     const cores = std.Thread.getCpuCount() catch 4;
     return std.math.clamp(cores, 1, 8);
 }
@@ -223,6 +236,38 @@ fn declaredName(tail: []const u8, is_fun: bool) ?[]const u8 {
     return name;
 }
 
+/// The first `class X` name in the file (the test class for --filter).
+fn classNameOf(src: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, "class ")) |p| {
+        i = p + 6;
+        if (p != 0 and isIdentByte(src[p - 1])) continue;
+        var e = i;
+        while (e < src.len and isIdentByte(src[e])) e += 1;
+        if (e > i) return src[i..e];
+    }
+    return null;
+}
+
+/// Every `fun NAME` following an `@Test` annotation (the split-file child
+/// list). Modifier lines between the annotation and the fn are tolerated.
+fn collectTestFns(a: std.mem.Allocator, src: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, "@Test")) |p| {
+        i = p + 5;
+        const fnp = std.mem.indexOfPos(u8, src, i, "fun ") orelse return;
+        // The fn must belong to this annotation: no further @Test between.
+        if (std.mem.indexOfPos(u8, src, i, "@Test")) |nxt| {
+            if (nxt < fnp) continue;
+        }
+        const e = fnp + 4;
+        var b2 = e;
+        while (b2 < src.len and isIdentByte(src[b2])) b2 += 1;
+        if (b2 > e) try out.append(a, src[e..b2]);
+        i = b2;
+    }
+}
+
 fn scanDecls(a: std.mem.Allocator, src: []const u8) !DeclScan {
     var declares: std.ArrayList([]const u8) = .empty;
     var words: std.ArrayList([]const u8) = .empty;
@@ -355,6 +400,129 @@ fn failedCount(stdout: []const u8) usize {
 var arena_inst = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 /// Run one library's commonTest suite and assert the pass-count ratchet.
+
+/// The suite registry: ONE source of truth for every commontest census
+/// config, consumed by the itest gates (CI authority) AND the link-free
+/// `klio-census` driver (`zig build klio-census`; iteration path per
+/// plans/verification-latency-campaign.md Task 2). Floors/ceilings are
+/// the ratchets — tighten only.
+pub const suites = [_]Config{
+    .{
+        .name = "coroutines",
+        .test_roots = &.{"kotlin-klio/klio-kotlinx-coroutines/upstream/kotlinx-coroutines-core/common/test"},
+        .scratch_home = "/tmp/klio_itest_coroutines_home",
+        .packs = &.{
+            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
+        },
+        .extra_support = &.{
+            "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/TestBase.common.kt",
+            "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/LaunchFlow.kt",
+            "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/MainDispatcherTestBase.kt",
+            "kotlin-klio/klio-kotlinx-coroutines/klioTestUtils/kotlinx/coroutines/testing/TestBase.kt",
+        },
+        .baseline = 1285,
+        .max_failed = 0,
+        .max_incomplete = 1,
+    },
+    .{
+        .name = "datetime",
+        .test_roots = &.{
+            "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test",
+            "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test",
+        },
+        .scratch_home = "/tmp/klio_itest_datetime_home",
+        .packs = &.{
+            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-datetime", .artifact = "target/packs/kotlinx.datetime.klio-pack" },
+        },
+        .whole_source_set = true,
+        .timeout_ms = 400_000,
+        // fromEpochDays (100s) + toEpochDays (56s) are dispatch-heavy
+        // compute (JIT-neutral, measured); split so they parallelize
+        // instead of walling the suite behind one 168s child.
+        .split_files = &.{"common/test/LocalDateTest.kt"},
+        .baseline = 519,
+        .max_failed = 0,
+        .max_incomplete = 1,
+    },
+    .{
+        .name = "serialization",
+        .test_roots = &.{"kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest"},
+        .scratch_home = "/tmp/klio_itest_serialization_home",
+        .packs = &.{
+            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
+        },
+        .extra_support = &.{"kotlin-klio/klio-kotlinx-serialization/klioTest/kotlinx/serialization/test/CurrentPlatform.kt"},
+        .baseline = 138,
+        .max_failed = 0,
+        .max_incomplete = 0,
+    },
+    .{
+        .name = "io",
+        .test_roots = &.{
+            "kotlin-klio/klio-kotlinx-io/upstream/core/common/test",
+            "kotlin-klio/klio-kotlinx-io/upstream/bytestring/common/test",
+        },
+        .extra_support = &.{"kotlin-klio/klio-kotlinx-io/klioTest/kotlinx/io/TestActuals.kt"},
+        .scratch_home = "/tmp/klio_itest_io_home",
+        .packs = &.{
+            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-io", .artifact = "target/packs/kotlinx.io.klio-pack" },
+        },
+        .baseline = 1191,
+        .max_failed = 0,
+        .max_incomplete = 0,
+    },
+    .{
+        .name = "atomicfu",
+        .test_roots = &.{"kotlin-klio/klio-kotlinx-atomicfu/upstream/atomicfu/src/commonTest/kotlin"},
+        .scratch_home = "/tmp/klio_itest_atomicfu_home",
+        .packs = &.{
+            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
+        },
+        .whole_source_set = true,
+        .baseline = 67,
+        .max_failed = 0,
+        .max_incomplete = 2,
+    },
+    .{
+        .name = "ktor",
+        .test_roots = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-io/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-utils/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-http/common/test",
+        },
+        .scratch_home = "/tmp/klio_itest_ktor_home",
+        .packs = &.{
+            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-io", .artifact = "target/packs/kotlinx.io.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-ktor", .artifact = "target/packs/io.ktor.klio-pack" },
+        },
+        // The WriterReaderTest.testWriterOnCancelled flake was an upstream
+        // ByteChannel race (awaitContent swallowing a close cause that
+        // landed between its entry rethrow and the sleep condition), fixed
+        // in the curated shim copy of ByteChannel.kt.
+        .baseline = 450,
+        .max_failed = 0,
+        .max_incomplete = 2,
+    },
+};
+
+pub fn runSuiteNamed(name: []const u8) !void {
+    for (&suites) |*cfg| {
+        if (std.mem.eql(u8, cfg.name, name)) return runSuite(cfg.*);
+    }
+    std.debug.print("unknown census suite: {s}\n", .{name});
+    return error.UnknownSuite;
+}
+
 pub fn runSuite(cfg: Config) !void {
     const a = arena_inst.allocator();
     defer _ = arena_inst.reset(.free_all);
@@ -405,7 +573,39 @@ pub fn runSuite(cfg: Config) !void {
     }
 
     var jobs: std.ArrayList([]const []const u8) = .empty;
+    // Split-file children carry the longest tests — the suite wall — so they
+    // go to the FRONT of the queue and start with the first free workers.
+    var split_jobs: std.ArrayList([]const []const u8) = .empty;
     for (targets.items, 0..) |target, ti| {
+        const split_this = blk: {
+            for (cfg.split_files) |sf| {
+                if (std.mem.endsWith(u8, target, sf)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (split_this) {
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, target, a, .unlimited) catch "";
+            const cls = classNameOf(bytes) orelse target;
+            var names: std.ArrayList([]const u8) = .empty;
+            try collectTestFns(a, bytes, &names);
+            for (names.items) |tn| {
+                var argv: std.ArrayList([]const u8) = .empty;
+                try argv.append(a, klioBin(&env));
+                try argv.append(a, "test");
+                if (cfg.whole_source_set) {
+                    try argv.appendSlice(a, support.items);
+                    try argv.appendSlice(a, targets.items);
+                } else {
+                    const bases = try providerClosure(a, scans.items, &owner, ti);
+                    try argv.appendSlice(a, support.items);
+                    for (bases) |bi| try argv.append(a, targets.items[bi]);
+                    try argv.append(a, target);
+                }
+                try argv.append(a, try std.fmt.allocPrint(a, "--filter={s}.{s}", .{ cls, tn }));
+                try split_jobs.append(a, try argv.toOwnedSlice(a));
+            }
+            if (names.items.len != 0) continue;
+        }
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, klioBin(&env));
         try argv.append(a, "test");
@@ -427,6 +627,10 @@ pub fn runSuite(cfg: Config) !void {
             try argv.append(a, target);
         }
         try jobs.append(a, try argv.toOwnedSlice(a));
+    }
+    if (split_jobs.items.len != 0) {
+        try split_jobs.appendSlice(a, jobs.items);
+        jobs = split_jobs;
     }
 
     var next = std.atomic.Value(usize).init(0);
@@ -457,11 +661,21 @@ pub fn runSuite(cfg: Config) !void {
                 // Latency census: per-child wall, argv size, and pass count —
                 // the budget table's raw rows (KLIO_CENSUS_TIMES=1).
                 if (std.c.getenv("KLIO_CENSUS_TIMES") != null) {
+                    // The child's TARGET: the value after --only-file when
+                    // present (whole_source_set argv ends with the whole
+                    // list), else the last argument.
+                    var tgt: []const u8 = queue[i][queue[i].len - 1];
+                    for (queue[i], 0..) |arg2, qi| {
+                        if (std.mem.eql(u8, arg2, "--only-file") and qi + 1 < queue[i].len) {
+                            tgt = queue[i][qi + 1];
+                            break;
+                        }
+                    }
                     std.debug.print("[census-time] {d}ms files={d} passed={d} target={s}\n", .{
                         (runtime.clockMonotonicNanos() -% ct_t0) / std.time.ns_per_ms,
                         queue[i].len - 2,
                         passedLineCount(r.stdout),
-                        queue[i][queue[i].len - 1],
+                        tgt,
                     });
                 }
                 _ = ppassed.fetchAdd(passedLineCount(r.stdout), .monotonic);
