@@ -448,10 +448,99 @@ pub const PropertyDef = struct {
     type_head: ?[]const u8 = null,
 };
 
+/// Interned instance-LAYOUT identity. Two instances carry the same shape id
+/// iff their field lists hold the same name POINTERS in the same order (field
+/// names are canonicalized program-lifetime strings, so pointer identity is
+/// name identity). A matching shape id therefore proves "field `name` is at
+/// index i" without reading any name — the field site memos and the JIT's
+/// per-entry name re-verify become one integer compare.
+///
+/// Ids are addresses of interned records in a program-lifetime arena; the
+/// table is bounded (`shape_cap`) so a pathological workload minting
+/// per-instance name buffers degrades to the UNSHAPED sentinel, never to
+/// unbounded growth. 0 = not computed yet, 1 = unshapeable.
+pub const SHAPE_UNSET: usize = 0;
+pub const SHAPE_NONE: usize = 1;
+
+const ShapeRec = struct {
+    /// (ptr, len) per field name, in field order. Hashed on both; equality
+    /// on the POINTERS (identical ptr vector => identical layout).
+    ptrs: [][*]const u8,
+    lens: []u32,
+};
+
+/// Test-and-set spinlock (Zig 0.16 std has no blocking Thread.Mutex); held
+/// only for the intern-table probe on a shape MISS.
+const ShapeLock = struct {
+    state: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    fn lock(self: *ShapeLock) void {
+        while (self.state.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+    fn unlock(self: *ShapeLock) void {
+        self.state.store(false, .release);
+    }
+};
+var shape_lock: ShapeLock = .{};
+var shape_table: std.HashMapUnmanaged(u64, std.ArrayListUnmanaged(*ShapeRec), std.hash_map.AutoContext(u64), 80) = .empty;
+var shape_count: usize = 0;
+const shape_cap: usize = 1 << 16;
+var shape_arena_state: ?std.heap.ArenaAllocator = null;
+
+fn shapeHash(fields: []const InstanceData.Field) u64 {
+    var h = std.hash.Wyhash.init(0x5a5a);
+    for (fields) |f| {
+        h.update(std.mem.asBytes(&f.name.ptr));
+        h.update(std.mem.asBytes(&f.name.len));
+    }
+    return h.final();
+}
+
+fn shapeMatches(rec: *const ShapeRec, fields: []const InstanceData.Field) bool {
+    if (rec.ptrs.len != fields.len) return false;
+    for (rec.ptrs, fields) |p, f| {
+        if (p != f.name.ptr) return false;
+    }
+    return true;
+}
+
+/// Intern the layout of `fields` and return its shape id (never SHAPE_UNSET;
+/// SHAPE_NONE when the table is at capacity).
+fn internShape(fields: []const InstanceData.Field) usize {
+    const h = shapeHash(fields);
+    shape_lock.lock();
+    defer shape_lock.unlock();
+    const arena = blk: {
+        if (shape_arena_state == null)
+            shape_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        break :blk shape_arena_state.?.allocator();
+    };
+    const gop = shape_table.getOrPut(std.heap.page_allocator, h) catch return SHAPE_NONE;
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    for (gop.value_ptr.items) |rec| {
+        if (shapeMatches(rec, fields)) return @intFromPtr(rec);
+    }
+    if (shape_count >= shape_cap) return SHAPE_NONE;
+    const rec = arena.create(ShapeRec) catch return SHAPE_NONE;
+    const ptrs = arena.alloc([*]const u8, fields.len) catch return SHAPE_NONE;
+    const lens = arena.alloc(u32, fields.len) catch return SHAPE_NONE;
+    for (fields, 0..) |f, i| {
+        ptrs[i] = f.name.ptr;
+        lens[i] = @intCast(f.name.len);
+    }
+    rec.* = .{ .ptrs = ptrs, .lens = lens };
+    gop.value_ptr.append(std.heap.page_allocator, rec) catch return SHAPE_NONE;
+    shape_count += 1;
+    return @intFromPtr(rec);
+}
+
 pub const InstanceData = struct {
     class: ObjRef(ClassDef),
     /// Field name -> value. Insertion ordered.
     fields: std.ArrayList(Field),
+    /// Interned layout identity (`SHAPE_UNSET` until computed; reset on any
+    /// field APPEND). Benign-race fill: every filler computes the same id
+    /// for the same layout. Read via `shapeOf`.
+    shape: std.atomic.Value(usize) = std.atomic.Value(usize).init(SHAPE_UNSET),
     /// For an `inner class` instance, the captured enclosing-class instance.
     outer: ?Value,
     /// Per-instance identity, assigned at construction from a monotonic
@@ -550,6 +639,25 @@ pub const InstanceData = struct {
         }
         try self.ensureFieldsOwned(allocator, 1);
         try self.fields.append(allocator, .{ .name = name, .value = v });
+        // The layout changed: any memoized shape id no longer describes it.
+        self.shape.store(SHAPE_UNSET, .release);
+    }
+
+    /// Any out-of-band field-list mutation (host-side appends, removes) must
+    /// drop the memoized layout id.
+    pub fn invalidateShape(self: *InstanceData) void {
+        self.shape.store(SHAPE_UNSET, .release);
+    }
+
+    /// The instance's interned layout identity, computing and memoizing it on
+    /// first use (and after any field append reset it). The caller must hold
+    /// a borrow on the instance (the field list must not grow mid-read).
+    pub fn shapeOf(self: *const InstanceData) usize {
+        const cached = self.shape.load(.acquire);
+        if (cached != SHAPE_UNSET) return cached;
+        const id = internShape(self.fields.items);
+        @constCast(self).shape.store(id, .release);
+        return id;
     }
 
     /// Re-buffer an image-arena field list with the runtime allocator before
@@ -1321,6 +1429,44 @@ test "TypeShape from a generic, nullable type ref" {
     try testing.expect(!shape.args[0].nullable);
     try testing.expectEqualStrings("Item", shape.args[1].name);
     try testing.expect(shape.args[1].nullable);
+}
+
+test "shape ids: intern by layout, reset on append, distinct layouts differ" {
+    const allocator = testing.allocator;
+    var fx = try ClassFixture.build(allocator, "S", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+
+    var a: InstanceData = .{ .class = fx.handle.clone(), .fields = .empty, .outer = null, .identity = 0, .native_state = null };
+    defer {
+        a.fields.deinit(allocator);
+        a.class.deinit();
+    }
+    var b: InstanceData = .{ .class = fx.handle.clone(), .fields = .empty, .outer = null, .identity = 1, .native_state = null };
+    defer {
+        b.fields.deinit(allocator);
+        b.class.deinit();
+    }
+    const n1: []const u8 = "alpha";
+    const n2: []const u8 = "beta";
+    try a.fields.append(allocator, .{ .name = n1, .value = .Unit });
+    try b.fields.append(allocator, .{ .name = n1, .value = .{ .Int = 7 } });
+
+    const sa = a.shapeOf();
+    try testing.expect(sa != SHAPE_UNSET and sa != SHAPE_NONE);
+    // Same name POINTERS in the same order => same id, values irrelevant.
+    try testing.expectEqual(sa, b.shapeOf());
+    // Memoized.
+    try testing.expectEqual(sa, a.shapeOf());
+
+    // Append changes the layout: id resets and re-interns differently.
+    try b.fields.append(allocator, .{ .name = n2, .value = .Unit });
+    b.shape.store(SHAPE_UNSET, .release);
+    const sb2 = b.shapeOf();
+    try testing.expect(sb2 != sa and sb2 != SHAPE_UNSET and sb2 != SHAPE_NONE);
+    // And the two-field layout interns stably too.
+    try a.fields.append(allocator, .{ .name = n2, .value = .Unit });
+    a.shape.store(SHAPE_UNSET, .release);
+    try testing.expectEqual(sb2, a.shapeOf());
 }
 
 test "ensureNativeState creates once and returns the same payload" {

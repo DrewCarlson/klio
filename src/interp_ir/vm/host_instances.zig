@@ -698,6 +698,7 @@ pub fn initLocalParentChain(
                 if (runtime.reclaimEnabled()) cur_args.items[i].retain();
                 try g.get().ensureFieldsOwned(allocator, 1);
                 try g.get().fields.append(allocator, .{ .name = pp.name, .value = cur_args.items[i] });
+                g.get().invalidateShape();
             }
         }
         // Body-property init thunks (static build map).
@@ -741,6 +742,7 @@ pub fn initLocalParentChain(
                 if (g.get().get(bp.name) == null) {
                     try g.get().ensureFieldsOwned(allocator, 1);
                     try g.get().fields.append(allocator, .{ .name = bp.name, .value = bp.primitive_zero orelse Value.Null });
+                    g.get().invalidateShape();
                 }
             }
         }
@@ -1053,6 +1055,7 @@ fn retainField(g: *InstanceData, allocator: Allocator, key: []const u8) void {
     while (i < g.fields.items.len) {
         if (std.mem.eql(u8, g.fields.items[i].name, key)) {
             _ = g.fields.orderedRemove(i);
+            g.invalidateShape();
         } else {
             i += 1;
         }
@@ -1063,6 +1066,7 @@ fn retainField(g: *InstanceData, allocator: Allocator, key: []const u8) void {
 fn pushField(g: *InstanceData, allocator: Allocator, key: []const u8, v: Value) Allocator.Error!void {
     try g.ensureFieldsOwned(allocator, 1);
     try g.fields.append(allocator, .{ .name = key, .value = v });
+    g.invalidateShape();
 }
 
 /// Bind the conventional `(message[, cause])` super-args onto a leaf
@@ -3501,6 +3505,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                                 if (!already) {
                                     try g.get().ensureFieldsOwned(allocator, 1);
                                     try g.get().fields.append(allocator, .{ .name = key, .value = v });
+                                    g.get().invalidateShape();
                                 }
                                 g.deinit();
                             },
@@ -3514,11 +3519,13 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
     if (throwable_message) |m| {
         const g = inst.borrowMut();
         try g.get().fields.append(allocator, .{ .name = "message", .value = m });
+        g.get().invalidateShape();
         g.deinit();
     }
     if (throwable_cause) |c| {
         const g = inst.borrowMut();
         try g.get().fields.append(allocator, .{ .name = "cause", .value = c });
+        g.get().invalidateShape();
         g.deinit();
     }
     // fillInStackTrace at construction (JVM order) for a user Throwable
@@ -3689,6 +3696,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                             if (!exists) {
                                 const g = inst.borrowMut();
                                 try g.get().fields.append(allocator, .{ .name = prop_name, .value = .Null });
+                                g.get().invalidateShape();
                                 g.deinit();
                             }
                         }
@@ -5133,6 +5141,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             const already = ig.get().get(key) != null;
             if (!already) {
                 try ig.get().fields.append(allocator, .{ .name = key, .value = v });
+                ig.get().invalidateShape();
             } else {
                 v.release(allocator);
             }
