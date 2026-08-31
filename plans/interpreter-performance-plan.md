@@ -1,5 +1,7 @@
 # Interpreter performance plan: the flat-eval restructure
 
+STATUS: HISTORICAL (superseded). The flat-eval restructure landed; every successor question is settled in the 2026-08 perf-era campaigns (see `open-campaigns.md` "THE PERF ERA IS CLOSED"). Do not plan new work from this doc.
+
 ## The verdict the measurements force
 
 After removing every incidental cost found in the 2026-07-26 investigation

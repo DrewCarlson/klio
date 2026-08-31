@@ -1,5 +1,7 @@
 # Memory parity campaign — get klio close to Python
 
+STATUS: CLOSED (RSS targets met — see memory campaign record). Memory-subsystem perf re-examined and re-closed 2026-08-31 (`interpreter-shared-op-campaign.md` Task 1: GC/alloc off the gate's critical path). Do not plan new work from this doc without new profile evidence.
+
 Standing goal: drive klio's memory characteristics as close to Python (CPython) as
 we can, in phases. This is the single source of truth for that campaign; it
 supersedes ad-hoc notes. Related docs: `LAZY-IMAGE.md` (the deep design for the

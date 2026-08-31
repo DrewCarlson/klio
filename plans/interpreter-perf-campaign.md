@@ -1,5 +1,7 @@
 # Low-level interpreter performance campaign
 
+STATUS: HISTORICAL (superseded). Its fronts landed across the CPU/exec-perf campaigns; the perf era closed 2026-08-31 (see `open-campaigns.md`). Do not plan new work from this doc.
+
 Goal: meaningfully improve raw interpreter throughput so CI's compute/coroutine-
 heavy suites finish well within budget on a 4-vCPU runner, and so the interpreter
 is viable for real workloads. Three fronts, per the user: (1) interpreter core

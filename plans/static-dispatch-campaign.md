@@ -1,5 +1,7 @@
 # Static dispatch campaign
 
+STATUS: COMPLETE (dispatch census 0, bytecode tier fused — see klio-static-dispatch-bake memory). Do not plan new work from this doc.
+
 Goal: bind every call at lowering time, so the runtime never resolves a
 member by name. That retires the dispatch ladders and the memoization
 layered over them, and it is the prerequisite a bytecode VM and a

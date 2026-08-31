@@ -1,5 +1,7 @@
 # CPU / EFFICIENCY CAMPAIGN
 
+STATUS: HISTORICAL (closed; loop JIT + packed arrays landed). The perf era closed 2026-08-31 (see `open-campaigns.md`). Do not plan new work from this doc.
+
 Goal: drive klio interpreter throughput up the same way the memory campaign drove
 RSS down — measure, attribute to a hot path, root-cause, fix, re-verify. No
 symptom hiding; match Kotlin semantics exactly.

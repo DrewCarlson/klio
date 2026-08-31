@@ -1,6 +1,24 @@
 # Plan Archive
 
-Historical record of completed work. The live register is `open-campaigns.md`; the active plan is `simplify-validate-accelerate.md`. Entries here are append-only — records retire into this file as they close out of the live register.
+Historical record of completed work. The live register is `open-campaigns.md`; the active plan is `census-gates-and-red-mass.md`. Entries here are append-only — records retire into this file as they close out of the live register.
+
+## The perf era (2026-08-29 .. 2026-08-31) — four closed campaign docs
+
+Read `open-campaigns.md` "THE PERF ERA IS CLOSED" for the one-paragraph
+summary. The docs, each terminal with its measurements inline:
+- `concurrency-perf-campaigns.md` — gate wall 847 -> ~615s; the
+  three-tiers-neutral law; name canonicalization; serve rounds.
+- `interpreter-next-campaign.md` — function-JIT coverage (census 5 -> 17),
+  the probe-tax fix (atomic hotness word on Func), cost parity on
+  compose, 1 ns/iter mono virtual dispatch.
+- `interpreter-shared-op-campaign.md` — instance-layout shapes (site
+  name-verify skip, fused store, JIT guard_shape), ratchet 650 -> 645;
+  the shape-is-not-a-class soundness trap; GC/alloc/dispatch veins
+  closed by measurement.
+- `interpreter-native-floor-campaign.md` — the kl_ C-to-C sub-ABI
+  measured 34.5x on fib (the ABI is escaped); suite wall proven
+  vpd-bound; Value 16B / frame-push / per-thread-prof closed below
+  threshold.
 
 ## Target version & scope
 
