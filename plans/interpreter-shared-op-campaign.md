@@ -89,6 +89,29 @@ banking measurement only.
 
 ## Task 3 — class-shape fixed field offsets (the object model itself)
 
+PROGRESS 2026-08-31 (first two rounds landed, battery pending):
+- Substrate (5279a790): interned instance-LAYOUT shapes — same
+  canonicalized name POINTERS in the same order => same id, so a match
+  proves (name at index) with one integer compare. Lazy per-instance
+  memo reset on append/remove (all 9 host-side mutation sites patched),
+  bounded intern table (overflow => UNSHAPED sentinel), unit-tested.
+- Conversions (92763900): the framed GetField site arm and the leaf
+  serve claim SHAPES and drop the per-hit name re-verify (the claim
+  binds shape/index/name under ONE borrow; the leaf re-checks the memo
+  word under its read borrow so a define between borrows declines);
+  the polymorphic class-memo fallback keeps its verify (unchecked
+  index). storePlainField fused its probe-then-define double scan into
+  one borrow + one scan.
+- Measured: replica 143-146us (median 144) vs the 146-152 pre-shape
+  band (~2-3%); vpd solo 539-540s vs 544-546 baseline (~1%) — BANKED:
+  ratchet 650 -> 645 (c415fc92). GC-stress smoke clean.
+- Residue attribution (KLIO_PROF_RAW + addr2line): the remaining eql
+  cost is smeared over a dozen string-keyed maps (overload scoreArg,
+  barrierSpec name probes, arm-inlined flat caches), each sub-1% — no
+  further single >=2% conversion exists in the field family. Remaining
+  ladder conversions (getFieldInner/getMemberField internals) are
+  ~0.3-0.5% each; do them only if a later profile promotes them.
+
 Instance fields today are an append-ordered array, name-verified per
 access (field order is NOT class-static — dynamic defines append; the
 method tier re-verifies BY NAME per entry because of exactly this).
