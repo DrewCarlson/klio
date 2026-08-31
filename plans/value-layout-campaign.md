@@ -147,4 +147,9 @@ until the last 48-byte payload boxes, so the wins land at stage ends:
       id-side-table trades that for a lifetime problem). DEFERRED
       measured-first: re-open when a measurement motivates it, and gate
       any candidate on the compose plugin suite wall as well as
-      rangebench.
+      rangebench. RE-EXAMINED AND RE-CLOSED 2026-08-31
+      (`interpreter-native-floor-campaign.md` Task 2): the attributable
+      copy bucket ceilings at ~2-3% of the recomposition replica and the
+      mandatory IrClosure boxing taxes compose's hottest creation path —
+      no motivating measurement exists. Do not reconsider without a
+      profile that names Value copies above the 2% threshold.

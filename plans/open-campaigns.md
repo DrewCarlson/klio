@@ -17,6 +17,16 @@ through `commontest_support.zig`; `stdlib`, `compose_plugin`, and
 never run at all because its sparse checkout omitted `commonTest`), then
 drive the tolerated failure mass down starting with serialization.
 
+THE PERF ERA IS CLOSED (2026-08-29 .. 2026-08-31, five campaigns, each
+doc terminal — do not reopen a per-op interpreter-perf campaign without
+NEW profile evidence): `concurrency-perf-campaigns.md`,
+`interpreter-next-campaign.md` (function-tier coverage + probe tax;
+cost parity), `interpreter-shared-op-campaign.md` (instance shapes;
+ratchet 650 -> 645), `interpreter-native-floor-campaign.md` (kl_
+sub-ABI measured 34x; suite wall proven vpd-bound; Value 16B,
+frame-push, and per-thread-prof closed below threshold). Standing:
+gate 1390/0/0, vpd ratchet 645s, replica 146us, fib native 34x AOT.
+
 `plans/conformance-and-hardening.md` CLOSED 2026-08-18 with every item
 landed and `scripts/gate.sh` GREEN; the record is summarised in
 `PLAN-archive.md`. Its predecessor `simplify-validate-accelerate.md`
@@ -39,14 +49,12 @@ edge-guard/trace store in the emitted C) took rangebench 13.8s ->
 fib 695ms -> 220ms, ahead of the interpreter. The landing record
 (boxing waves, hot-view handover) is in PLAN-archive.md.
 
-Open — measured-first recorded roads, NOT an active front (reopen only
-when a measurement motivates):
-
-- [ ] Deeper C-to-C frames (non-leaf callees) — `c-transpiler-plan.md`.
-- [ ] Wider hot-op coverage in the emitted C — `c-transpiler-plan.md`.
-- [ ] Value 24 -> 16 endgame (both IrClosure and Array must drop under
-      8B or it pays nothing) — `value-layout-campaign.md`; gate any
-      candidate on the compose suite wall as well as rangebench.
+CLOSED 2026-08-31 (`interpreter-native-floor-campaign.md`): the C-to-C
+road was already the landed `kl_` pass — measured 34.5x on fib, corpus
+401/0 — and Value 24 -> 16 re-closed on its own terms (copy bucket
+~2-3% ceiling, IrClosure boxing taxes compose's hottest path). The only
+recorded future vein is WIDENING kl_ eligibility, driven by a real
+program that misses it; details and traps in `c-transpiler-plan.md`.
 
 ## 2. Compose plugin residue
 

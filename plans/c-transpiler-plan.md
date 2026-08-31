@@ -379,9 +379,18 @@ the op-by-op shape) 57 -> 9.5 ns/iter (6x; ~20x over the interpreter's
 closed-forms — that yardstick was already saturated at ~23x over the
 1.76s interpreted run).
 
-Remaining road (measure-first):
-- Direct C-to-C calls with a light frame-open helper (the tagged-table /
-  vararg-prologue ideas land here if the measurement wants them). This
-  is the same architecture question as the native compiler tier in
-  `plans/interpreter-next-campaign.md` Task 1 — evaluate there.
-- The loop JIT remains above the native check.
+CLOSED 2026-08-31 (`plans/interpreter-native-floor-campaign.md` Task 1):
+the direct C-to-C road was ALREADY DRIVEN by the scalar-replay `kl_`
+pass (leafEligible + call-closure fixpoint + emitLeafFunc) — unboxed
+locals, direct recursive C calls, no frames. Measured fib(30)x5,
+byte-identical output: native 60ms vs 2073ms interpreted JIT-off
+(**34.5x**) vs 594ms with the function JIT (**9.9x**); corpus 401/0.
+The earlier "wash" measurement predated the kl_ pass. DO NOT REOPEN a
+generic C-to-C-frames campaign — the sub-ABI exists and delivers; the
+only future work here is WIDENING kl_ ELIGIBILITY (more inst kinds,
+more type groups, KLIO_TRANSPILE_PKGS pack bodies), driven by a real
+program that misses eligibility, never by the compose gate (which runs
+`klio test`, never a transpiled binary). Build trap: transpiled links
+need the ReleaseFast libzstd.a (`zig build zstd-lib
+-Doptimize=ReleaseFast`); a Debug archive fails on ubsan symbols.
+The loop JIT remains above the native check (deliberate).
