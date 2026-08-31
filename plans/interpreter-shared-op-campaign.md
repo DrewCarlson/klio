@@ -1,10 +1,12 @@
 # Interpreter shared-op campaign: the routines every tier funnels through
 
-STATUS 2026-08-31: NOT STARTED. Successor to
-`plans/interpreter-next-campaign.md` (COMPLETE; its exit state carries the
-standing numbers). Standing baseline: compose gate 1390/0/0, vpd child
-564-577s (budget ratchet 650s, shrink-only), replica ~147-150us with the
-function tier at cost parity, mono virtual loop 1 ns/iter, Value 24B.
+STATUS 2026-08-31: COMPLETE. All five tasks are landed green (final
+battery: compose gate 1390/0/0 under the TIGHTENED 645s ratchet with
+the vpd child at 562s in-gate, threaded-litmus parity, examples, stdlib
+sweep 117/0, unit tests) or closed by measurement recorded in their
+sections. Successor to `plans/interpreter-next-campaign.md`. Banked:
+ratchet 650 -> 645 (shape-verified field replays; vpd solo 540-541s vs
+the 544-546 baseline, replica median 146us vs the 146-152 band).
 
 THE LAW this campaign is built on (measured four times, never relitigate):
 every execution tier — per-op C transpiler, bytecode tier, fused walker,
@@ -87,9 +89,13 @@ METHOD KEEPER: the single-threaded replica is the composer-thread
 critical-path proxy (profile share = wall share there); vpd solo is the
 banking measurement only.
 
-## Task 3 — class-shape fixed field offsets (the object model itself)
+## Task 3 — class-shape fixed field offsets — LANDED GREEN 2026-08-31
 
-PROGRESS 2026-08-31 (first two rounds landed, battery pending):
+All consumers converted and green through the full battery: the shape
+substrate, the interpreted read-site conversions, the fused write, and
+the JIT method-field entry guard (811c2b01: the compile-time receiver's
+layout id binds to the verified (index, name) pairs; a matching entry
+skips the per-field name loop, the class guard still runs). The rounds:
 - Substrate (5279a790): interned instance-LAYOUT shapes — same
   canonicalized name POINTERS in the same order => same id, so a match
   proves (name at index) with one integer compare. Lazy per-instance
@@ -124,19 +130,9 @@ PROGRESS 2026-08-31 (first two rounds landed, battery pending):
   replica 146-148 (median 146, ~1%), vpd solo 540-541s vs 544-546 —
   the 645 ratchet stands.
 
-Instance fields today are an append-ordered array, name-verified per
-access (field order is NOT class-static — dynamic defines append; the
-method tier re-verifies BY NAME per entry because of exactly this).
-Give instances a SHAPE: a per-layout id (class + define history) with a
-name->index table computed once, so:
-- interpreted stored reads/writes become shape-check + O(1) index (kills
-  the name scans and their eqlBytes),
-- the JIT's method_fields per-entry name re-verify becomes one shape id
-  compare (today's guard_class + per-field memcmp),
-- `plainStoredFieldIndex` becomes a shape-table lookup.
-This is a core-path layout change: land it big, drive it green (the
-operating rule), with the delegate/getter rejection semantics carried
-over exactly. Budget comes from Task 1's field + lookup buckets.
+(`plainStoredFieldIndex` as a shape-table lookup was NOT converted: its
+callers are the JIT's by-name field sites on the ~17-body compiled set —
+sub-dust; recorded here should a census promote it.)
 
 ## Task 4 — native regions across call boundaries — CLOSED 2026-08-31
 
