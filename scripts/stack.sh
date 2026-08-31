@@ -15,6 +15,21 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export KLIO_ITEST_JOBS="${KLIO_ITEST_JOBS:-4}"
+
+# Green-tree memo (fail-OPEN): a stack that already ran green on this
+# exact tree content is a no-op. The key covers HEAD, every non-md
+# tracked change, and untracked non-md files; docs/plans edits do not
+# invalidate. STACK_NO_CACHE=1 forces a run.
+cache_file=.zig-cache/stack-green-key
+tree_key=$( {
+  git rev-parse HEAD
+  git diff HEAD -- . ':!:*.md'
+  git ls-files --others --exclude-standard -- . ':!:*.md' | sort | xargs -r sha256sum
+} 2>/dev/null | sha256sum | cut -d' ' -f1 ) || tree_key=""
+if [ -z "${STACK_NO_CACHE:-}" ] && [ -n "$tree_key" ] && [ -f "$cache_file" ]    && [ "$(cat "$cache_file" 2>/dev/null)" = "$tree_key" ]; then
+  echo "stack: cached-green (tree unchanged since last green run; STACK_NO_CACHE=1 to force)"
+  exit 0
+fi
 gate_steps=(itest-compose_plugin_commontest itest-parity_threaded_litmus)
 rest_steps=(
   itest-coroutines_commontest itest-datetime_commontest
@@ -39,5 +54,6 @@ rc=0
 if printf '%s\n' "$gate_out" | grep -qE "^error: '|exceeds the ceiling|transitive failure"; then rc=1; fi
 if grep -qE "^error: '|exceeds the ceiling|transitive failure" "$rest_log"; then rc=1; fi
 rm -f "$rest_log"
+if [ $rc -eq 0 ] && [ -n "$tree_key" ]; then printf '%s' "$tree_key" >"$cache_file"; fi
 echo "stack: wall=$((e-s))s rc=$rc"
 exit $rc

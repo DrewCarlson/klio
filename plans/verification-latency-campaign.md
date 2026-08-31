@@ -108,25 +108,24 @@ while the census suites stretch into vpd's tail slack.
   suite on an unchanged tree is a no-op — the full stack after a
   plans-only commit should cost seconds.
 
-## Task 5 — the production-runtime share of the floor
+## Task 5 — the production-runtime share of the floor (CLOSED by
+measurement 2026-08-31)
 
-The test-execution residue after Tasks 2-4 is interpreter/JIT/AOT
-throughput on real workloads — vpd's 562s above all. This half is NOT
-"perf is done" territory: the perf era closed per-op micro-veins, not
-the macro question of what a 9-minute single test costs the pipeline.
-Levers, measured-first per the standing law:
-- The kl_ scalar sub-ABI is proven at 34x; census children whose hot
-  bodies are kl_-eligible could run through transpiled binaries where
-  parity is byte-exact (the corpus check already does exactly this at
-  401/401). Evaluate AOT-backed census children for the compute-heavy
-  suites.
-- Widening kl_ eligibility (more inst kinds/type groups) driven by the
-  actual hot bodies of the slowest children — the recorded future vein
-  from the native-floor campaign, now with a concrete customer.
-- vpd itself: either its recomposition throughput moves (the 645
-  ratchet tracks it) or its ROLE moves (a shorter statistically-equal
-  variant for iteration with the full test kept for CI) — decided by
-  measurement, not by tolerance.
+Every wall-dominating test body was inspected against the kl_ scalar
+sub-ABI's eligibility: datetime's fromEpochDays/toEpochDays (LocalDate
+construction + equals dispatch per iteration), coroutines'
+SharedFlowTest/BufferedChannelTest (coroutine machinery), compose's
+SlotTable*/CompositionTests and vpd (recomposition + snapshot objects)
+— all object/dispatch-bound, none expressible in the scalar sub-ABI,
+so AOT-backed census children cannot move the measured floors today.
+Widening kl_ eligibility to object graphs is the C-transpiler speedup
+campaign already pinned open in plans/c-transpiler-plan.md — a perf
+campaign, not verification machinery. The JIT was re-checked directly
+on the hot datetime shape in BOTH run and test mode: neutral (budget
+notes). vpd's throughput is measured-exhausted across five campaigns
+(tiers neutral, per-op and macro-op profiles flat); its ROLE stays the
+full test — gates never weaken — so vpd's ~540-560s solo wall is the
+recorded full-stack floor term.
 
 ## Discovered items
 
@@ -145,11 +144,14 @@ Levers, measured-first per the standing law:
       when awaitContent returns short. 12-of-12 solo + 50-iteration
       repro clean; ktor ratchet tightened 449/1 -> 450/0 (census 62s
       link-free).
-- [ ] Full-parallel stacks oversubscribe (each suite spawns its own
-      8-worker pool): one coroutines child DNC'd and two litmus tests
-      wall-capped under 64 workers on 32 cores. A shared worker budget
-      across concurrently-running suites (or KLIO_ITEST_JOBS tuning in
-      scripts/stack.sh) removes the load flakes from the stack path.
+- [x] Oversubscription CLOSED by the priority-shield model instead of a
+      shared worker budget: stack.sh bounds census workers
+      (KLIO_ITEST_JOBS=4) and runs the census half under `nice -n 15`
+      while the compose gate keeps normal priority; inside the gate,
+      every sibling of vpd spawns under `nice -n 10`. Suites with slack
+      stretch into vpd's tail; the wall-owning threads keep the
+      scheduler. Verified green across three consecutive full stacks
+      (coroutines 1299/0/0, no DNCs, no litmus wall-caps).
 
 ## Standing policy
 

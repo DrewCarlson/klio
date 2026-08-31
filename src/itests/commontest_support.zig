@@ -573,6 +573,9 @@ pub fn runSuite(cfg: Config) !void {
     }
 
     var jobs: std.ArrayList([]const []const u8) = .empty;
+    // Split-file children carry the longest tests — the suite wall — so they
+    // go to the FRONT of the queue and start with the first free workers.
+    var split_jobs: std.ArrayList([]const []const u8) = .empty;
     for (targets.items, 0..) |target, ti| {
         const split_this = blk: {
             for (cfg.split_files) |sf| {
@@ -599,7 +602,7 @@ pub fn runSuite(cfg: Config) !void {
                     try argv.append(a, target);
                 }
                 try argv.append(a, try std.fmt.allocPrint(a, "--filter={s}.{s}", .{ cls, tn }));
-                try jobs.append(a, try argv.toOwnedSlice(a));
+                try split_jobs.append(a, try argv.toOwnedSlice(a));
             }
             if (names.items.len != 0) continue;
         }
@@ -624,6 +627,10 @@ pub fn runSuite(cfg: Config) !void {
             try argv.append(a, target);
         }
         try jobs.append(a, try argv.toOwnedSlice(a));
+    }
+    if (split_jobs.items.len != 0) {
+        try split_jobs.appendSlice(a, jobs.items);
+        jobs = split_jobs;
     }
 
     var next = std.atomic.Value(usize).init(0);

@@ -483,11 +483,15 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             var solo: std.ArrayList([]const u8) = .empty;
             try solo.append(a, klioBin(&env));
             try solo.append(a, "test");
+            // vpd IS the suite wall; every sibling child is spawned under
+            // nice so its threads keep the scheduler while they overlap it
+            // (siblings inflated the wall 540s solo -> 633s in-suite).
             try solo.appendSlice(a, trimmed.items);
             try solo.append(a, "--filter=RecomposerTests.validatePotentialDeadlock");
             try jobs.append(a, try solo.toOwnedSlice(a));
             try job_names.append(a, "RecomposerTests.validatePotentialDeadlock");
             var rest: std.ArrayList([]const u8) = .empty;
+            try rest.appendSlice(a, &.{ "nice", "-n", "10" });
             try rest.append(a, klioBin(&env));
             try rest.append(a, "test");
             try rest.appendSlice(a, trimmed.items);
@@ -497,6 +501,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             continue;
         }
         var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(a, &.{ "nice", "-n", "10" });
         try argv.append(a, klioBin(&env));
         try argv.append(a, "test");
         try argv.appendSlice(a, sources.items);
