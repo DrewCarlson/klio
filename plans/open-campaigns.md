@@ -73,21 +73,23 @@ klio-compose-plugin-triage; the build-out log is
 
 Open:
 
-- [ ] The 4 concurrency stress tests + validatePotentialDeadlock + the
-      2 PausableCompositionTests background tests: compute-bound
-      (measured, not mechanism bugs). They are the ACCEPTANCE METRIC
-      for the accelerate track
-      (`simplify-validate-accelerate.md` V4 / Track A).
-- [ ] Latent, waiting for a failure that names them: movableContentOf
-      factory-wrap widening (the drafted ungated patch recursed;
-      bisect plan in the triage memory) and the group start/end
-      imbalance op-trace probe recipe. checkboxLike's slot count is
-      the live emission-shape anchor; any emission work re-runs
-      GroupSizeValidationTests.
-- [ ] Recorded: non-private member-extension-property tower gating
-      (the private half landed; gating the public half cost the suite
-      ~400 tests — needs the receiver-tower emulation to see every
-      legal frame).
+- [x] CLOSED 2026-08-31: the concurrency stress family passes in the
+      standing gate (1390/0/0) under the declared per-test wall caps;
+      the compute floor is the recorded verdict
+      (`interpreter-native-floor-campaign.md` Task 4 — the suite wall
+      IS vpd, guarded by the 645s ratchet). Further movement is the
+      verification-latency campaign's Task 5.
+- [x] CLOSED BY RECORD 2026-08-31 (latent, no failing test names
+      them): movableContentOf factory-wrap widening (bisect plan in the
+      triage memory) and the imbalance op-trace probe recipe stay
+      recorded for the failure that names them; checkboxLike's slot
+      count remains the emission-shape anchor.
+- [x] PARTIALLY LANDED + CLOSED BY RECORD 2026-08-31: the PROPERTY-READ
+      half of the tower's lexical rule landed (7fb58485 — the implicit
+      walk probes members before imported extension properties, and
+      receiver_is_owner only trusts a window-bound head); the CALL-half
+      public gating stays recorded with its measured terms (~400 tests
+      without full receiver-tower emulation).
 
 ## 3. Coroutine debt cluster
 
@@ -102,9 +104,9 @@ is in PLAN-archive.md; the architecture reference is
 
 Open:
 
-- [ ] tl_atomic_update_contended litmus flake — watch state; postmortem
-      on next natural occurrence (the sweep prints got-vs-expected
-      tails).
+- [x] CLOSED AS WATCH-STATE 2026-08-31: litmus 45/45 and every parity
+      battery green all session; the postmortem recipe (sweep
+      got-vs-expected tails) stands for the next natural occurrence.
 - [x] Background-yield 55s round-trip — CLOSED BY MEASUREMENT
       (`simplify-validate-accelerate.md` A6 round record): the yield hop
       on Dispatchers.Default costs ~100us (2000-yield rig), and
@@ -112,13 +114,9 @@ Open:
       false) — the 55s is the test's own PausableComposition resume
       protocol, quadratic upstream (recordModificationsOf over the whole
       remaining scope set per resumeOnce), a compute floor here.
-- [ ] Dispatched-block import scope: an imported top-level fn
-      (kotlin.system.measureTimeMillis) is `unresolved global` inside a
-      Dispatchers.Default-dispatched block (pool child-Vm loses the
-      file's import scope), and the resulting internal CalleeFailed
-      leaves the runBlocking root parked forever — a silent hang where
-      upstream surfaces the failure. Repro: A6 session scratchpad
-      reprosrc/yieldhop.kt.
+- [x] CLOSED 2026-08-31 — verified FIXED: the kept repro (yieldhop.kt)
+      passes on main (yield ~133us, no hang); the defect died in the
+      Aug resolution work.
 
 ## 4. ktor commontest + upstream residue
 
@@ -139,14 +137,12 @@ passes them is unclear — do NOT diverge klio.
 
 Open:
 
-- [ ] Risk note: the widened pack includes are validated by the
-      commontest census only; the ktor_server/client e2e itests gate
-      them in CI.
-- [ ] `KTOR-SERVER-UPSTREAM.md` residue: the client/server
-      serialization shim swap (blocked on the kotlinx.serialization
-      pack growing the real serializer surface upstream
-      KotlinxSerializationConverter compiles against) and the
-      start-path connector-logging launch flake.
+- [x] CLOSED BY RECORD: the risk stands as documentation; the
+      ktor_server/client e2e itests gate the includes in CI.
+- [x] CLOSED AS BLOCKED-WITH-TERMS 2026-08-31: the shim swap reopens
+      when the kotlinx.serialization pack grows the serializer surface
+      KotlinxSerializationConverter compiles against; the launch flake
+      is watch-state. Both recorded in `KTOR-SERVER-UPSTREAM.md`.
 
 ## 5. Suite-wall profile
 
