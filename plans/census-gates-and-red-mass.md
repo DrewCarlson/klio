@@ -60,6 +60,42 @@ census cannot find its sources it currently prints and skips, which is right
 for a checkout without submodules but silent in a checkout that should have
 them. Any new census must state which it is.
 
+## Track C — the perf-era regression sweep (opened 2026-08-31)
+
+THE PROCESS HOLE, recorded first: the five perf campaigns (Aug 22-31)
+verified every round with compose gate + stdlib sweep + parity +
+examples — the seven LIBRARY censuses never ran, and a week of
+interpreter-shared-path changes accumulated ~80 invisible failures
+(serialization 1, datetime 9, io 4, androidx_collection 26, coroutines
+1, ktor 39; atomicfu clean). STANDING RULE from here: any round that
+touches shared interpreter paths (dispatch, fields, lowering, GC)
+includes the library census gates in its battery before the round is
+called green. `KLIO_CENSUS_NAMES=1` (landed 93d2ad1a) makes a red
+census name its failing cases.
+
+- [x] C1. datetime 510/9 -> root-caused and FIXED (93d2ad1a): the
+      receiver-formed splice default-on (29e052f5, Aug 24) let a bare
+      extension call inside a spliced receiver window pair the
+      frame-kind fallback head (the enclosing extension's declared
+      receiver) with the SUBJECT via sameReceiver — the strict probe
+      then treated `with(period)`'s subject as statically Instant and
+      bound Instant.offsetIn to the DateTimePeriod
+      (`Vm::get_field epochSeconds on DateTimePeriodImpl`). The
+      frame-derived hint now anchors to the frame's own implicit this.
+      Bisect trail: harness-fast target absent pre-e2192a48 made the
+      first git-bisect skip-blind — bisect scripts must fall back to
+      `zig build klio-harness`. 14-line repro kept (towersplice.kt).
+- [ ] C2. Re-census all six red suites post-fix (in flight) and
+      root-cause every remaining failure family; ceilings stay at their
+      Track B zeros (never raised).
+- [ ] C3. Discovered en route: a class named with 1-2 uppercase letters
+      (`I`, `P`) satisfies EVERY strict extension-receiver proof — the
+      type-parameter heuristic (`pn.len <= 2 and allUppercase`) in
+      strictReceiverProvenName cannot tell a short class name from an
+      unregistered type parameter. Needs a registered-class check ahead
+      of the heuristic (a registered class of that name is a class, not
+      a type param). Repro: rename towersplice.kt's classes to I/P.
+
 ## Track B — the red mass
 
 Failures tolerated by the ceilings, worst ratio first:
