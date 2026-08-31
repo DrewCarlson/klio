@@ -1,6 +1,9 @@
 # Interpreter native-floor campaign: the 300x compute floor and the last frames
 
-STATUS 2026-08-31: NOT STARTED. Successor to
+STATUS 2026-08-31: COMPLETE. All five tasks closed by measurement (no
+interpreter-code changes were needed — the standing green battery and
+the 401/0 transpiler corpus cover the tree; details per task).
+Successor to
 `plans/interpreter-shared-op-campaign.md` (COMPLETE; its exit state and
 method keepers carry forward). Standing baseline: compose gate 1390/0/0,
 vpd budget ratchet 645s (shrink-only; vpd solo 540-541s under the gate
@@ -83,19 +86,16 @@ above threshold.
 
 ## Task 3 — frame-push traffic (35% of dispatch events)
 
-The dispatch census shows 3.6M frame pushes per replica run
-(frame_push + frame_push_flattenable = 35% of events; ~6000 activations
-per composed frame), and the drivers bucket is ~15% of the replica
-profile. The fused walker already serves the fusable subset — the vein
-is the REMAINING framed opens: what share is `frame_push_flattenable`
-that the flat driver could take but does not, and what does a framed
-open actually cost (pool hit, register-file seed, chain wiring,
-teardown)? Measure first: a census of who opens frames (caller shape,
-body size, why-not-flat / why-not-fused reason codes), then attack the
-largest reason code only if it clears the threshold. The A1d
-materialize machinery and the flat driver are the substrates; no new
-tier (the law). Exit: banked win or the reason-code census recorded as
-dust-spread.
+CLOSED BY MEASUREMENT 2026-08-31: the 35%-of-events figure counts
+pushes, but the frame OPEN itself is cheap — `Frame.newWithCaptures` is
+~0.6% of the replica profile (KLIO_PROF_CALLERS census), its callers
+spread across the recursive seam, the materialize path, and the flat
+driver's own activations (already the cheap route), and none of the
+frame machinery (teardownActivation / actFree / frameBoundary) makes
+the top-35 rows. The real ~16% drivers bucket is the per-instruction
+DISPATCH LOOPS (runFrameExec 8.2, execInst 3.4, leafWalkStream 2.6,
+runFlatLoop 2.2) — the four-campaign law's territory, no lever without
+a new tier. Dust-spread; closed.
 
 ## Task 4 — the gate wall beyond vpd (suite-level)
 
@@ -103,33 +103,25 @@ The suite's wall floor is NOT one test: compute-heavy benchmark tests
 (SlotTableBuilderTests/SlotTableTests families) run interpreted ~300x
 native under 8-way contention (a 22s class costs 320s in the sweep era;
 KLIO_MAX_WORKERS=5 was the last fix), plus the coroutine timeout-tail.
-Levers, in measure-first order:
-- Re-census the per-class child walls in a current gate log: what is
-  the wall-clock-critical chain of children (the max, and what runs
-  beside it)? A smarter shard order (longest-first) or worker count may
-  buy minutes for free.
-- The benchmark-shaped tests are Task 1's natural beneficiary — if the
-  sub-ABI lands, evaluate AOT-ing the heavy bodies (or accept the tests
-  as the recorded compute floor).
-- The timeout-tail: which classes still spend wall in
-  waiting-for-timeout rather than computing (the wall-cap dump names
-  them)?
-TRAP: lowering the runTest dispatch cap is HARMFUL (teardown-deadlock
-hangs — recorded in the compose-suite-perf memory); per-test wall caps
-must never fire before klio's own hang guard. Exit: minutes banked into
-the gate wall (and the vpd ratchet where vpd itself moves), or the
-floor recorded as compute-bound pending Task 1.
+CLOSED BY MEASUREMENT 2026-08-31, from the last green gate log: the 47
+child walls sum to 2040s over 5 workers (408s ideal), while vpd alone
+is 562s — **the suite wall IS vpd**, and the suite already schedules
+vpd's solo child FIRST (the code comments the exact reasoning; the
+RecomposerTests remainder overlaps it). Workers never bind; no class
+shows a timeout-tail anomaly (all non-vpd walls <= 91s); AOT-ing the
+compute-heavy classes buys ZERO wall (they finish in vpd's shadow).
+Every future gate-wall win is therefore a vpd throughput win — exactly
+what the 645s ratchet already guards. TRAP kept on record: lowering the
+runTest dispatch cap is HARMFUL (teardown-deadlock hangs).
 
 ## Task 5 — per-thread critical-path attribution (conditional tooling)
 
-The recorded method gap: KLIO_PROF aggregates threads, so on
-multi-thread workloads a profile share is only a ceiling. Build this
-ONLY if Tasks 1-4's A/Bs come back flat against their profile-share
-predictions: extend prof.zig to bucket samples by thread (the composer
-thread vs workers — thread id is already in hand at sample time), so
-the critical path is read directly instead of inferred through the
-replica proxy. Small, bounded; exit is the tool existing and one
-attribution run recorded, or closure because Tasks 1-4 never needed it.
+CLOSED 2026-08-31 — never needed: Task 1 exceeded its prediction 17x,
+and Tasks 3/4 closed with unambiguous single-threaded (replica) and
+gate-log evidence. The build trigger ("only if Tasks 1-4 come back flat
+against prediction") never fired. The design note stands here for any
+future campaign that hits the aggregation wall: bucket prof.zig samples
+by thread id (in hand at sample time), composer vs workers.
 
 ## Standing policy
 
