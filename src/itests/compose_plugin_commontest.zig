@@ -73,7 +73,9 @@ const runtime = @import("runtime");
 // with the ONLY real failure validatePotentialDeadlock, and
 // SnapshotStateMapTests is 59/59 solo. Margin below 1389 covers the
 // load-flake band (Movable, the Pausable pair, frame-clock).
-const BASELINE: usize = 1386;
+// RAISED 1386 -> 1390 (2026-09-01): five consecutive full stacks at
+// 1390/0/0 under the L3-split structure.
+const BASELINE: usize = 1390;
 
 /// Ceiling on failing cases, the mirror of `BASELINE`. Measured solo at
 /// 1380 passed / 10 failed once companion extension properties resolved
@@ -158,18 +160,20 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     // benchmark tests under 8-way contention.
     try map.put("KLIO_TEST_WALL_CAP", "90");
     // `validatePotentialDeadlock` is throughput-bound, not wedged: it races
-    // two infinite writer loops against ~3120 frames of 200 composables and
-    // PASSES in ~724s. It gets a declared budget so the suite reports what it
-    // is (slow) rather than what it is not (stuck). The budget is a ratchet —
-    // it must only shrink as the recomposition path gets faster, and
-    // exceeding it still fails.
+    // two infinite writer loops against ~3120 frames of 200 composables.
+    // It gets a declared budget so the suite reports what it is (slow)
+    // rather than what it is not (stuck). The budget is a ratchet — it
+    // must only shrink as the recomposition path gets faster, and
+    // exceeding it still fails. 645 -> 580 (2026-09-01): GC-relaxed and
+    // L3-isolated it runs 510s solo, 525-535s in-stack across four
+    // consecutive stacks.
     // Two more measured-slow, not-stuck tests: `resumeOnBackgroundThread`
     // resumes 1000 pausable chunks one cross-thread round-trip at a time
     // (~40-55s solo, 25/25) and the frame-clock test is a timing test; under
     // 8-way contention both cross the 90s hang window while still passing.
     try map.put(
         "KLIO_TEST_WALL_CAP_FOR",
-        "validatePotentialDeadlock=645,resumeOnBackgroundThread=300,pausingTheFrameClockStopShouldBlockWithFrameNanos=300",
+        "validatePotentialDeadlock=580,resumeOnBackgroundThread=300,pausingTheFrameClockStopShouldBlockWithFrameNanos=300",
     );
     // Four children each defaulting to a half-the-cores compute pool
     // oversubscribe the box 2x and inflate the concurrent classes'
@@ -487,8 +491,11 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             // every sibling child is spawned under nice so vpd's threads
             // keep the scheduler wherever masks overlap (siblings had
             // inflated the wall 554s solo -> 633s in-suite).
-            if ((std.Thread.getCpuCount() catch 1) >= 16)
+            if (std.c.getenv("KLIO_VPD_CPUS")) |cpus| {
+                try solo.appendSlice(a, &.{ "taskset", "-c", std.mem.span(cpus) });
+            } else if ((std.Thread.getCpuCount() catch 1) >= 16) {
                 try solo.appendSlice(a, &.{ "taskset", "-c", "0-5" });
+            }
             // vpd's 537s body spends ~15-20% in GC (shade 6.7% + alloc
             // paths, measured): a relaxed Appel factor + floor takes the
             // solo body to 494s. The knobs are per-child via argv so the

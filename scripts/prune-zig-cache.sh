@@ -1,21 +1,73 @@
 #!/usr/bin/env bash
 # Prune stale .zig-cache entries. The cache has no GC and accumulates tens
 # of GB per day of iteration (each whole-program rebuild emits a fresh
-# object set); CI already wipes past 5 GB. Entries older than the cutoff
-# are removed; anything still referenced is recomputed on the next build
-# (zig cache entries self-validate, so partial deletion is always safe —
-# the first build after a prune pays a one-time revalidation pass).
+# object set); CI already wipes past 5 GB. Zig cache entries self-validate,
+# so partial deletion is always safe — a deleted entry that was still live
+# is recomputed on the next build (that recompute is the only churn).
 #
-# Usage: prune-zig-cache.sh [days]   (default: 2)
+# Two passes:
+#   1. Age: entries older than DAYS are removed (hits do not reliably
+#      refresh o/ or h/ mtimes, so age is a proxy, not truth).
+#   2. Size target: if the cache still exceeds TARGET_GB, oldest o/ dirs
+#      go first until it fits — but nothing younger than 6 hours is ever
+#      touched, so the current session's hot set survives both passes.
+#
+# Usage: prune-zig-cache.sh [days] [target_gb]   (default: 2, 60)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAYS="${1:-2}"
+TARGET_GB="${2:-60}"
 CACHE="$ROOT/.zig-cache"
 [ -d "$CACHE" ] || { echo "no cache at $CACHE"; exit 0; }
 
+# -x: match the zig binary itself, not wrappers whose command line
+# happens to contain the words (a pgrep -f self-match cost one run).
+if pgrep -x zig >/dev/null 2>&1; then
+  echo "refusing to prune: a zig process is running" >&2
+  exit 1
+fi
+
+# Sizes in KiB and mtimes through stat: `du -sb` and `find -printf` are GNU
+# only, and under `set -e` either one aborts the whole run on a BSD/macOS
+# toolchain — before the h/ wipe below, which is what leaves the dangling
+# manifests this script exists to clear.
+if stat -f '%m' "$CACHE" >/dev/null 2>&1; then
+  mtime_of() { stat -f '%m' "$1"; }
+else
+  mtime_of() { stat -c '%Y' "$1"; }
+fi
+
 before=$(du -sh "$CACHE" | cut -f1)
-find "$CACHE/o" -maxdepth 1 -type d -mtime "+$DAYS" -exec rm -rf {} + 2>/dev/null || true
-find "$CACHE/h" -type f -mtime "+$DAYS" -delete 2>/dev/null || true
+
+# Pass 1: age.
+find "$CACHE/o" -mindepth 1 -maxdepth 1 -type d -mtime "+$DAYS" -exec rm -rf {} + 2>/dev/null || true
 rm -rf "$CACHE/tmp"/* 2>/dev/null || true
+
+# Pass 2: size target, oldest first, sparing the last 6 hours.
+target_kb=$((TARGET_GB * 1000000))
+used_kb=$(du -sk "$CACHE/o" | cut -f1)
+if [ "$used_kb" -gt "$target_kb" ]; then
+  excess_kb=$((used_kb - target_kb))
+  freed_kb=0
+  while IFS= read -r dir; do
+    [ "$freed_kb" -ge "$excess_kb" ] && break
+    sz=$(du -sk "$dir" 2>/dev/null | cut -f1) || continue
+    rm -rf "$dir" 2>/dev/null || continue
+    freed_kb=$((freed_kb + sz))
+  done < <(
+    find "$CACHE/o" -mindepth 1 -maxdepth 1 -type d -mmin +360 2>/dev/null |
+      while IFS= read -r d; do printf '%s\t%s\n' "$(mtime_of "$d")" "$d"; done |
+      sort -n | cut -f2-
+  )
+fi
+
+# Manifests die whenever artifacts were pruned: h/ names do not map to
+# o/ names, and a surviving manifest whose artifact is gone DANGLES —
+# zig cc trusts the manifest hit without stat'ing the artifact and ld
+# then fails on the missing .o (cost one corpus-gate run). h/ is a few
+# hundred MB; wiping it costs one revalidation pass, not a rebuild of
+# anything whose artifact survived.
+rm -f "$CACHE/h"/* 2>/dev/null || true
+
 after=$(du -sh "$CACHE" | cut -f1)
-echo "pruned .zig-cache (> ${DAYS}d): $before -> $after"
+echo "pruned .zig-cache (> ${DAYS}d, target ${TARGET_GB}G): $before -> $after"

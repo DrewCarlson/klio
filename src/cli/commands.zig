@@ -492,6 +492,14 @@ fn transpileEmit(
     const mg = built.module.borrow();
     defer mg.deinit();
     const m = mg.get();
+    // KLIO_TRANSPILE_LEAVES=1: emit ONLY the scalar-replay leaf bodies
+    // plus a registration entry, as a self-contained C for a shared
+    // library the interpreter loads (KLIO_LEAVES). No program, no image
+    // pinning — leaves are named by fqn and pure, so they serve any
+    // process's bake.
+    if (runtime.envOnce("KLIO_TRANSPILE_LEAVES") != null) {
+        return transpileEmitLeaves(gpa, m, path, out_path);
+    }
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -727,7 +735,7 @@ fn transpileEmit(
         \\    if ((*ev->idle & 0xFFFFu) == 0) r |= 16u;
         \\    if (*ev->gc_pending) r |= 4u;
         \\  }}
-        \\  if (r) return klio_op_edge_rare(ctx, r);
+        \\  if (r) return ev->rare(ctx, r);
         \\  return 0;
         \\}}
         \\
@@ -772,18 +780,20 @@ fn transpileEmit(
         }
     }
 
-    var leaf_targets = std.AutoHashMap(u32, std.ArrayList(u32)).init(gpa);
+    var member_names = buildMemberNameSet(gpa, m);
+    defer member_names.deinit();
+    var leaf_targets = std.AutoHashMap(u32, LeafInfo).init(gpa);
     defer {
         var it = leaf_targets.valueIterator();
-        while (it.next()) |v| v.deinit(gpa);
+        while (it.next()) |v| v.targets.deinit(gpa);
         leaf_targets.deinit();
     }
     for (extra_funcs.items) |f| {
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
-        if (leafEligible(gpa, f, fs, m.consts.items)) |tg| {
+        if (leafEligible(gpa, m, &member_names, f, fs, m.consts.items)) |tg| {
             var tg2 = tg;
             leaf_targets.put(f.id.int(), tg2) catch {
-                tg2.deinit(gpa);
+                tg2.targets.deinit(gpa);
                 return 1;
             };
         }
@@ -792,18 +802,49 @@ fn transpileEmit(
         if (!emitFor(pkg_sel, f)) continue;
         if (f.blocks.len == 0 and !m.ensureFuncBody(@constCast(f))) continue;
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
-        if (leafEligible(gpa, f, fs, m.consts.items)) |tg| {
+        if (leafEligible(gpa, m, &member_names, f, fs, m.consts.items)) |tg| {
             leaf_targets.put(f.id.int(), tg) catch return 1;
         }
     }
+    // Fixpoint: (a) every call target must itself be eligible; (b) a
+    // target that may return an OBJECT (its tail is a construction, or
+    // it tail-calls such a fn) is only callable in tail position — the
+    // ctor-tail genre then forwards unchanged through the whole chain
+    // and only the gate materializes. Non-tail object calls prune the
+    // caller. The returns-object set is recomputed each round.
     var pruned = true;
     while (pruned) {
         pruned = false;
+        var obj = std.AutoHashMap(u32, void).init(gpa);
+        defer obj.deinit();
+        {
+            var grew = true;
+            while (grew) {
+                grew = false;
+                var oit = leaf_targets.iterator();
+                while (oit.next()) |e| {
+                    if (obj.contains(e.key_ptr.*)) continue;
+                    var is_obj = e.value_ptr.ctor_tail;
+                    if (!is_obj) for (e.value_ptr.targets.items) |t| {
+                        if (t.tail and obj.contains(t.fid)) {
+                            is_obj = true;
+                            break;
+                        }
+                    };
+                    if (is_obj) {
+                        obj.put(e.key_ptr.*, {}) catch return 1;
+                        grew = true;
+                    }
+                }
+            }
+        }
         var it = leaf_targets.iterator();
         var drop: ?u32 = null;
         while (it.next()) |e| {
-            for (e.value_ptr.items) |t| {
-                if (!leaf_targets.contains(t)) {
+            for (e.value_ptr.targets.items) |t| {
+                if (!leaf_targets.contains(t.fid) or
+                    (!t.tail and obj.contains(t.fid)))
+                {
                     drop = e.key_ptr.*;
                     break;
                 }
@@ -816,14 +857,14 @@ fn transpileEmit(
                 std.debug.print("[leaf-prune] {s}\n", .{if (df) |x| x.fqn else "?"});
             }
             var v = leaf_targets.fetchRemove(d).?.value;
-            v.deinit(gpa);
+            v.targets.deinit(gpa);
             pruned = true;
         }
     }
     {
         var it = leaf_targets.keyIterator();
         while (it.next()) |fid| {
-            w.print("static int32_t kl_{d}(void *ctx, klio_edge_view *ev, const int64_t *argv, const int32_t *argg, int64_t *ret, int32_t *retg, uint32_t depth);\n", .{fid.*}) catch return 1;
+            w.print("static int32_t kl_{d}(void *ctx, klio_edge_view *ev, const int64_t *argv, const int32_t *argg, int64_t *ret, int32_t *retg, uint32_t depth, int64_t *aux, int32_t *auxg);\n", .{fid.*}) catch return 1;
         }
         w.print("\n", .{}) catch return 1;
     }
@@ -840,7 +881,7 @@ fn transpileEmit(
         // the running binary builds the same streams this emission used.
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
         if (leaf_targets.contains(f.id.int())) {
-            emitLeafFunc(w, f, fs, m.consts.items) catch return 1;
+            emitLeafFunc(w, m, f, fs, m.consts.items) catch return 1;
             leaf_emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
         }
         emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
@@ -852,7 +893,7 @@ fn transpileEmit(
         // a recomposition is mostly one-line accessors, and the replay is the
         // only emitted form that skips the activation entirely.
         if (leaf_targets.contains(f.id.int())) {
-            emitLeafFunc(w, f, fs, m.consts.items) catch return 1;
+            emitLeafFunc(w, m, f, fs, m.consts.items) catch return 1;
             leaf_emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
         }
         emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
@@ -942,8 +983,279 @@ fn leafTrace(f: *const ir.Func, comptime why: []const u8) void {
     if (std.c.getenv("KLIO_LEAF_TRACE") != null) std.debug.print("[leaf-miss] {s}: " ++ why ++ "\n", .{f.fqn});
 }
 
-fn leafEligible(gpa: std.mem.Allocator, f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) ?std.ArrayList(u32) {
-    var targets: std.ArrayList(u32) = .empty;
+/// KLIO_LEAVES=<path.so>: load a scalar-replay leaf library and register
+/// its bodies by fqn (bakes are not cross-process fid-stable). Fail-open:
+/// a missing or malformed library just leaves the interpreter alone.
+/// The dlopened handle is deliberately leaked — the leaves live as long
+/// as the process.
+pub fn loadLeafLibrary() void {
+    const path = runtime.envOnce("KLIO_LEAVES") orelse return;
+    var lib = std.DynLib.open(path) catch {
+        std.debug.print("warning: KLIO_LEAVES: cannot open {s}\n", .{path});
+        return;
+    };
+    const Entry = *const fn (reg: *const fn (fqn: [*:0]const u8, f: ir.eval.NativeLeafFn) callconv(.c) void) callconv(.c) void;
+    const entry = lib.lookup(Entry, "klio_leaves_entry") orelse {
+        std.debug.print("warning: KLIO_LEAVES: {s} has no klio_leaves_entry\n", .{path});
+        return;
+    };
+    entry(&leafRegShim);
+}
+
+/// Print leaf-gate engagement counters at exit (KLIO_LEAF_DIAG=1).
+pub fn leafDiagDump() void {
+    ir.eval.leafDiagDump();
+}
+
+fn leafRegShim(fqn: [*:0]const u8, f: ir.eval.NativeLeafFn) callconv(.c) void {
+    ir.eval.registerNativeLeafFqn(std.mem.span(fqn), f);
+}
+
+fn leafEmitFor(sel: ?[]const u8, f: *const ir.Func) bool {
+    if (f.package.len == 0) return true;
+    const s2 = sel orelse return false;
+    var it = std.mem.splitScalar(u8, s2, ',');
+    while (it.next()) |pfx| {
+        if (pfx.len != 0 and std.mem.startsWith(u8, f.package, pfx)) return true;
+    }
+    return false;
+}
+
+/// Leaves-only emission (`KLIO_TRANSPILE_LEAVES=1`): the same
+/// eligibility fixpoint as the full program, then just the leaf
+/// bodies, a minimal helper preamble (twinned with the full-program
+/// preamble — keep them identical), and `klio_leaves_entry`, which
+/// registers every body BY FQN through the function pointer the host
+/// hands in. Self-contained: compile with
+/// `zig cc -shared -fPIC out.c -I<include> -o leaves.so` — no libklio_rt.
+fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []const u8, out_path: []const u8) u8 {
+    const pkg_sel: ?[]const u8 = runtime.envOnce("KLIO_TRANSPILE_PKGS");
+    var extra_funcs: std.ArrayList(*const ir.Func) = .empty;
+    defer extra_funcs.deinit(gpa);
+    if (pkg_sel != null) {
+        var fid: u32 = 0;
+        while (fid < m.func_header_offsets.len) : (fid += 1) {
+            const f = m.funcById(@enumFromInt(fid)) orelse continue;
+            if (!leafEmitFor(pkg_sel, f)) continue;
+            if (f.blocks.len == 0 and !m.ensureFuncBody(@constCast(f))) continue;
+            extra_funcs.append(gpa, f) catch return 1;
+        }
+    }
+    var member_names = buildMemberNameSet(gpa, m);
+    defer member_names.deinit();
+    var leaf_targets = std.AutoHashMap(u32, LeafInfo).init(gpa);
+    defer {
+        var it = leaf_targets.valueIterator();
+        while (it.next()) |v| v.targets.deinit(gpa);
+        leaf_targets.deinit();
+    }
+    for (extra_funcs.items) |f| {
+        const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
+        if (leafEligible(gpa, m, &member_names, f, fs, m.consts.items)) |tg| {
+            var tg2 = tg;
+            leaf_targets.put(f.id.int(), tg2) catch {
+                tg2.targets.deinit(gpa);
+                return 1;
+            };
+        }
+    }
+    for (m.funcs.items) |*f| {
+        if (!leafEmitFor(pkg_sel, f)) continue;
+        if (f.blocks.len == 0 and !m.ensureFuncBody(@constCast(f))) continue;
+        const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
+        if (leafEligible(gpa, m, &member_names, f, fs, m.consts.items)) |tg| {
+            leaf_targets.put(f.id.int(), tg) catch return 1;
+        }
+    }
+    var pruned = true;
+    while (pruned) {
+        pruned = false;
+        var obj = std.AutoHashMap(u32, void).init(gpa);
+        defer obj.deinit();
+        {
+            var grew = true;
+            while (grew) {
+                grew = false;
+                var oit = leaf_targets.iterator();
+                while (oit.next()) |e| {
+                    if (obj.contains(e.key_ptr.*)) continue;
+                    var is_obj = e.value_ptr.ctor_tail;
+                    if (!is_obj) for (e.value_ptr.targets.items) |t| {
+                        if (t.tail and obj.contains(t.fid)) {
+                            is_obj = true;
+                            break;
+                        }
+                    };
+                    if (is_obj) {
+                        obj.put(e.key_ptr.*, {}) catch return 1;
+                        grew = true;
+                    }
+                }
+            }
+        }
+        var it = leaf_targets.iterator();
+        var drop: ?u32 = null;
+        while (it.next()) |e| {
+            for (e.value_ptr.targets.items) |t| {
+                if (!leaf_targets.contains(t.fid) or
+                    (!t.tail and obj.contains(t.fid)))
+                {
+                    drop = e.key_ptr.*;
+                    break;
+                }
+            }
+            if (drop != null) break;
+        }
+        if (drop) |d| {
+            if (std.c.getenv("KLIO_LEAF_TRACE") != null) {
+                const df = m.funcById(ir.FuncId.from(d));
+                std.debug.print("[leaf-prune] {s}\n", .{if (df) |x| x.fqn else "?"});
+            }
+            var v = leaf_targets.fetchRemove(d).?.value;
+            v.targets.deinit(gpa);
+            pruned = true;
+        }
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const w = &aw.writer;
+    w.print(
+        \\/* Generated by `klio transpile {s}` (leaves mode). Do not edit.
+        \\ * Build: zig cc -shared -fPIC <this file> -I<include> -o leaves.so */
+        \\#include <klio_rt.h>
+        \\#include <string.h>
+        \\#include <math.h>
+        \\#include <stdint.h>
+        \\
+        \\/* Twin of the full-program preamble's scalar helpers — keep byte
+        \\ * identical with the copy in the program emission. */
+        \\static inline double kl_bits2d(int64_t l) {{ double d; memcpy(&d, &l, 8); return d; }}
+        \\static inline int64_t kl_d2bits(double d) {{ int64_t l; memcpy(&l, &d, 8); return l; }}
+        \\static inline float kl_bits2f(int64_t l) {{ uint32_t u = (uint32_t)l; float f; memcpy(&f, &u, 4); return f; }}
+        \\static inline int64_t kl_f2bits(float f) {{ uint32_t u; memcpy(&u, &f, 4); return (int64_t)u; }}
+        \\static inline double kl_asd(int64_t l, int g) {{
+        \\  if (g == 5) return kl_bits2d(l);
+        \\  if (g == 6) return (double)kl_bits2f(l);
+        \\  return (double)l;
+        \\}}
+        \\static inline float kl_asf(int64_t l, int g) {{
+        \\  if (g == 6) return kl_bits2f(l);
+        \\  return (float)l;
+        \\}}
+        \\static inline int32_t kv_edge(void *ctx, klio_edge_view *ev) {{
+        \\  uint32_t r = 0;
+        \\  *ev->counter += 1;
+        \\  if ((*ev->counter & 0xFFFFu) == 0) r |= 1u;
+        \\  if (*ev->abandon_req && (*ev->abandonable || *ev->rb_abandon)) r |= 2u;
+        \\  if (ev->always) r |= 8u;
+        \\  else if (ev->gc_on) {{
+        \\    *ev->idle += 1;
+        \\    if ((*ev->idle & 0xFFFFu) == 0) r |= 16u;
+        \\    if (*ev->gc_pending) r |= 4u;
+        \\  }}
+        \\  if (r) return ev->rare(ctx, r);
+        \\  return 0;
+        \\}}
+        \\
+        \\
+    , .{path}) catch return 1;
+    {
+        var it = leaf_targets.keyIterator();
+        while (it.next()) |fid| {
+            w.print("static int32_t kl_{d}(void *ctx, klio_edge_view *ev, const int64_t *argv, const int32_t *argg, int64_t *ret, int32_t *retg, uint32_t depth, int64_t *aux, int32_t *auxg);\n", .{fid.*}) catch return 1;
+        }
+        w.print("\n", .{}) catch return 1;
+    }
+    var reg_list: std.ArrayList(struct { fid: u32, fqn: []const u8 }) = .empty;
+    defer reg_list.deinit(gpa);
+    for (m.funcs.items) |*f| {
+        if (!leafEmitFor(pkg_sel, f)) continue;
+        if (!leaf_targets.contains(f.id.int())) continue;
+        const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
+        emitLeafFunc(w, m, f, fs, m.consts.items) catch return 1;
+        reg_list.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+    }
+    for (extra_funcs.items) |f| {
+        if (!leaf_targets.contains(f.id.int())) continue;
+        const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
+        emitLeafFunc(w, m, f, fs, m.consts.items) catch return 1;
+        reg_list.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+    }
+    w.print("\nvoid klio_leaves_entry(void (*reg)(const char *fqn, klio_leaf_fn f)) {{\n", .{}) catch return 1;
+    for (reg_list.items) |e| {
+        const kf = m.funcById(ir.FuncId.from(e.fid)) orelse continue;
+        const key = ir.eval.leafKeyAlloc(gpa, kf) orelse continue;
+        defer gpa.free(key);
+        w.print("  reg(\"{s}\", kl_{d});\n", .{ key, e.fid }) catch return 1;
+    }
+    w.print("}}\n", .{}) catch return 1;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io2 = threaded.io();
+    std.Io.Dir.cwd().writeFile(io2, .{ .sub_path = out_path, .data = aw.written() }) catch {
+        io.printStderr(gpa, "error: write {s} failed\n", .{out_path});
+        return 1;
+    };
+    io.printStderr(gpa, "wrote {s} ({d} leaves)\n", .{ out_path, reg_list.items.len });
+    return 0;
+}
+
+const LeafTarget = struct { fid: u32, tail: bool };
+const LeafInfo = struct { targets: std.ArrayList(LeafTarget), ctor_tail: bool };
+
+/// Whether the stream position `q` (just past an escape) is `ret dst` —
+/// the escaped instruction's result flows straight out. Trace ops may
+/// intervene; anything else means mid-body use.
+fn streamTailRet(code: []const u32, q0: usize, dst: u32) bool {
+    var q = q0;
+    while (q < code.len and @as(ir.bc.Op, @enumFromInt(code[q])) == .trace) q += 4;
+    if (q + 2 >= code.len) return false;
+    if (@as(ir.bc.Op, @enumFromInt(code[q])) != .ret) return false;
+    return code[q + 1] != 0 and code[q + 2] == dst;
+}
+
+fn leafConstStrOf(consts: []const ir.Const, cid: ir.ConstId) ?[]const u8 {
+    if (cid.int() >= consts.len) return null;
+    return switch (consts[cid.int()]) {
+        .String => |sv| sv,
+        else => null,
+    };
+}
+
+/// The scalar integer conversion a zero-arg virtual slot names, or null.
+/// Slot ids reuse the root declaration's FuncId, so the name is static.
+const ScalarConv = enum { to_int, to_long, to_short, to_byte, to_char };
+fn leafScalarConv(m: *const ir.Module, slot: ir.MethodSlotId) ?ScalarConv {
+    const rf = m.funcById(ir.FuncId.from(slot.int())) orelse return null;
+    const eq = std.mem.eql;
+    if (eq(u8, rf.name, "toInt")) return .to_int;
+    if (eq(u8, rf.name, "toLong")) return .to_long;
+    if (eq(u8, rf.name, "toShort")) return .to_short;
+    if (eq(u8, rf.name, "toByte")) return .to_byte;
+    if (eq(u8, rf.name, "toChar")) return .to_char;
+    return null;
+}
+
+/// Every class-method simple name in the module. A bare call the lowering
+/// bound to a top-level fn can still be shadowed at runtime by a member of
+/// an implicit receiver; a name NO class declares cannot be — the cheap
+/// global proof rung A uses.
+fn buildMemberNameSet(gpa: std.mem.Allocator, m: *const ir.Module) std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(gpa);
+    for (m.classes.items) |*cls| {
+        for (cls.methods) |mid| {
+            const mf = m.funcById(mid) orelse continue;
+            set.put(mf.name, {}) catch {};
+        }
+    }
+    return set;
+}
+
+fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *const std.StringHashMap(void), f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) ?LeafInfo {
+    var targets: std.ArrayList(LeafTarget) = .empty;
+    var ctor_tail = false;
     var ok = true;
     if (f.params.len > 8) {
         leafTrace(f, "arity");
@@ -960,6 +1272,12 @@ fn leafEligible(gpa: std.mem.Allocator, f: *const ir.Func, fs: *const ir.bc.Func
             ok = false;
             break;
         }
+        // A throw-terminated block never runs natively: the emitter
+        // replaces its whole body with `return 0` (bail), and the
+        // interpreter's exact re-run raises the real throwable. So the
+        // guard pattern (StringConcat + NewInstance + throw on the cold
+        // path) costs a body nothing.
+        if (blk.terminator == .Throw) continue;
         const st = (if (bi < fs.streams.len) fs.streams[bi] else null) orelse {
             leafTrace(f, "no-stream");
             ok = false;
@@ -1004,12 +1322,87 @@ fn leafEligible(gpa: std.mem.Allocator, f: *const ir.Func, fs: *const ir.bc.Func
                                 for (c.arg_names) |n| {
                                     if (n != null) names_null = false;
                                 }
-                                if (!names_null) ok = false else targets.append(gpa, c.func.int()) catch {
+                                if (!names_null) ok = false else targets.append(gpa, .{
+                                    .fid = c.func.int(),
+                                    .tail = streamTailRet(code, pc + 2, c.dst.int()),
+                                }) catch {
                                     ok = false;
                                 };
                             }
                         },
                         .UnOp => {},
+                        .CallMemberOrGlobal => |*cg| {
+                            // A bare constructor call the index bound to a
+                            // CLASS, in tail position of a receiver-less
+                            // top-level fn: no member leg can shadow (no
+                            // receiver chain; captures would have shown up
+                            // as cell ops), so the class leg is the whole
+                            // semantics — same ctor-tail protocol as
+                            // NewInstance, constructed once at the gate.
+            if (cg.func != null and cg.class == null) {
+                                // A bare call the lowering bound to a
+                                // top-level fn: safe as a direct target when
+                                // NO class in the module declares a member of
+                                // this name — then no implicit receiver can
+                                // shadow the global leg.
+                                const nm = leafConstStrOf(consts, cg.name);
+                                var names_null2 = true;
+                                for (cg.arg_names) |n2| {
+                                    if (n2 != null) names_null2 = false;
+                                }
+                                if (nm == null or member_names.contains(nm.?) or
+                                    !names_null2 or cg.n_args > 8)
+                                {
+                                    leafTrace(f, "member-shadow");
+                                    ok = false;
+                                } else targets.append(gpa, .{
+                                    .fid = cg.func.?.int(),
+                                    .tail = streamTailRet(code, pc + 2, cg.dst.int()),
+                                }) catch {
+                                    ok = false;
+                                };
+                            } else if (cg.class) |cls| {
+                                const inner = cls.int() < m.classes.items.len and
+                                    m.classes.items[cls.int()].is_inner;
+                                if (f.kind != .plain or
+                                    std.mem.indexOfScalar(u8, f.fqn, '<') != null or
+                                    cg.n_args > 8 or inner or
+                                    !streamTailRet(code, pc + 2, cg.dst.int()))
+                                {
+                                    leafTrace(f, "obj-mid");
+                                    ok = false;
+                                } else ctor_tail = true;
+                            } else {
+                                leafTrace(f, "escape-op");
+                                ok = false;
+                            }
+                        },
+                        .CallVirtual => |*cv| {
+                            // Zero-arg virtual on a receiver that is a
+                            // SCALAR by construction (every register in an
+                            // eligible body is): the slot id is the root
+                            // declaration's FuncId, so the method NAME is
+                            // known at emit time. Integer conversions emit
+                            // inline; everything else bails the body.
+                            if (cv.n_args != 0 or leafScalarConv(m, cv.slot) == null) {
+                                leafTrace(f, "virt");
+                                ok = false;
+                            }
+                        },
+                        .NewInstance => |*ni| {
+                            // Ctor-tail only: the leaf hands the scalar ctor
+                            // args back through aux and the gate constructs
+                            // once through the host (exact, throw included).
+                            // Mid-body objects have nowhere to live natively.
+                            const inner = ni.class.int() < m.classes.items.len and
+                                m.classes.items[ni.class.int()].is_inner;
+                            if (ni.n_args > 8 or inner or
+                                !streamTailRet(code, pc + 2, ni.dst.int()))
+                            {
+                                leafTrace(f, "obj-mid");
+                                ok = false;
+                            } else ctor_tail = true;
+                        },
                         else => {
                             leafTrace(f, "escape-op");
                             ok = false;
@@ -1040,13 +1433,17 @@ fn leafEligible(gpa: std.mem.Allocator, f: *const ir.Func, fs: *const ir.bc.Func
         targets.deinit(gpa);
         return null;
     }
-    return targets;
+    return .{ .targets = targets, .ctor_tail = ctor_tail };
 }
 
 /// One scalar bin op of the replay: dynamic genre/width arithmetic with
 /// `scalarBin`'s exact semantics over the modeled genre set; any combo
 /// outside the model bails (`return 0`), which purity makes exact.
 fn emitLeafBin(w: anytype, kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32) !void {
+    // Genre 7 is an OPAQUE value (a non-scalar the gate marshaled as dead
+    // cargo — an unused receiver param). Any operation on it bails; the
+    // per-kind guards below assume genres 0-6.
+    try w.print("  if (g{d} > 6 || g{d} > 6) return 0;\n", .{ lhs, rhs });
     switch (kind) {
         .Less, .LessEq, .Greater, .GreaterEq => {
             const sym: []const u8 = switch (kind) {
@@ -1186,11 +1583,11 @@ fn emitLeafUn(w: anytype, op: ir.UnOp, dst: u32, operand: u32) !void {
 }
 
 /// Emit the scalar-replay body `kl_<fid>` for an eligible function.
-fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) !void {
+fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) !void {
     const fid = f.id.int();
     var max_reg: u32 = 0;
     for (f.blocks, 0..) |*blk, bi| {
-        _ = blk;
+        if (blk.terminator == .Throw) continue;
         const st = fs.streams[bi] orelse continue;
         const code = st.code;
         var pc: usize = 0;
@@ -1219,6 +1616,18 @@ fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, con
                             if (u.dst.int() > max_reg) max_reg = u.dst.int();
                             if (u.operand.int() > max_reg) max_reg = u.operand.int();
                         },
+                        .NewInstance => |*ni| {
+                            if (ni.dst.int() > max_reg) max_reg = ni.dst.int();
+                            if (ni.args.int() + ni.n_args > max_reg) max_reg = ni.args.int() + ni.n_args;
+                        },
+                        .CallMemberOrGlobal => |*cg| {
+                            if (cg.dst.int() > max_reg) max_reg = cg.dst.int();
+                            if (cg.args.int() + cg.n_args > max_reg) max_reg = cg.args.int() + cg.n_args;
+                        },
+                        .CallVirtual => |*cv| {
+                            if (cv.dst.int() > max_reg) max_reg = cv.dst.int();
+                            if (cv.receiver.int() > max_reg) max_reg = cv.receiver.int();
+                        },
                         else => {},
                     }
                     pc += 2;
@@ -1239,14 +1648,17 @@ fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, con
             }
         }
     }
-    try w.print("static int32_t kl_{d}(void *ctx, klio_edge_view *ev, const int64_t *argv, const int32_t *argg, int64_t *ret, int32_t *retg, uint32_t depth) {{\n", .{fid});
+    try w.print("static int32_t kl_{d}(void *ctx, klio_edge_view *ev, const int64_t *argv, const int32_t *argg, int64_t *ret, int32_t *retg, uint32_t depth, int64_t *aux, int32_t *auxg) {{\n", .{fid});
     try w.print("  if (depth > 2000u) return 0;\n", .{});
     var r: u32 = 0;
     while (r <= max_reg) : (r += 1) {
         try w.print("  int64_t l{d} = 0; int g{d} = 3; (void)l{d}; (void)g{d};\n", .{ r, r, r, r });
     }
     for (f.blocks, 0..) |*blk2, bi| {
-        _ = blk2;
+        if (blk2.terminator == .Throw) {
+            try w.print("KLB{d}:;\n  return 0;\n", .{bi});
+            continue;
+        }
         try w.print("KLB{d}:;\n", .{bi});
         const st = fs.streams[bi] orelse return error.Unexpected;
         const code = st.code;
@@ -1285,6 +1697,67 @@ fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, con
                         pc += 2;
                         continue;
                     }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .CallMemberOrGlobal and
+                        f.blocks[bi].insts[code[pc + 1]].CallMemberOrGlobal.class == null)
+                    {
+                        // Rung A: a bare call bound to a top-level fn with the
+                        // no-member-shadow proof — a direct kl_ call.
+                        const cg = &f.blocks[bi].insts[code[pc + 1]].CallMemberOrGlobal;
+                        const cb = cg.args.int();
+                        try w.print("  {{ int64_t cav[{d}]; int32_t cag[{d}];\n", .{ @max(cg.n_args, 1), @max(cg.n_args, 1) });
+                        var ci: u32 = 0;
+                        while (ci < cg.n_args) : (ci += 1) {
+                            try w.print("    cav[{d}] = l{d}; cag[{d}] = g{d};\n", .{ ci, cb + ci, ci, cb + ci });
+                        }
+                        try w.print("    int32_t rg2; int64_t rl2;\n", .{});
+                        try w.print("    if (!kl_{d}(ctx, ev, cav, cag, &rl2, &rg2, depth + 1u, aux, auxg)) return 0;\n", .{cg.func.?.int()});
+                        try w.print("    l{d} = rl2; g{d} = rg2; }}\n", .{ cg.dst.int(), cg.dst.int() });
+                        pc += 2;
+                        continue;
+                    }
+                    const ctor_args: ?struct { base: u32, n: u32 } = switch (f.blocks[bi].insts[code[pc + 1]]) {
+                        .NewInstance => |*ni| .{ .base = ni.args.int(), .n = ni.n_args },
+                        .CallMemberOrGlobal => |*cg| .{ .base = cg.args.int(), .n = cg.n_args },
+                        else => null,
+                    };
+                    if (ctor_args) |ca| {
+                        // Ctor-tail (eligibility guaranteed `ret dst` follows):
+                        // hand the scalar args + the site DESCRIPTOR to the
+                        // gate, which resolves the owner by fqn once (bakes
+                        // are not cross-process id-stable) and constructs
+                        // through the host.
+                        var ai: u32 = 0;
+                        while (ai < ca.n) : (ai += 1) {
+                            try w.print("  aux[{d}] = l{d}; auxg[{d}] = g{d};\n", .{ ai, ca.base + ai, ai, ca.base + ai });
+                        }
+                        var kbuf: [512]u8 = undefined;
+                        var kfbs = std.heap.FixedBufferAllocator.init(&kbuf);
+                        const skey = ir.eval.leafKeyAlloc(kfbs.allocator(), f) orelse return error.Unexpected;
+                        try w.print("  {{ static klio_ctor_site KS = {{\"{s}\", {d}u, {d}u, 0}};\n", .{ skey, bi, code[pc + 1] });
+                        try w.print("    *ret = (int64_t)(uintptr_t)&KS; *retg = 200; return 1; }}\n", .{});
+                        pc += 2;
+                        continue;
+                    }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .CallVirtual) {
+                        const cv = &f.blocks[bi].insts[code[pc + 1]].CallVirtual;
+                        const conv = leafScalarConv(m, cv.slot).?;
+                        const rr = cv.receiver.int();
+                        const dd = cv.dst.int();
+                        // Integer/char conversions only (floats bail at
+                        // runtime by genre). Kotlin narrowing = low-bits
+                        // truncation with sign extension; toChar keeps the
+                        // low 16 bits unsigned.
+                        try w.print("  if (g{d} > 4 || g{d} == 2 || g{d} == 3) return 0;\n", .{ rr, rr, rr });
+                        switch (conv) {
+                            .to_int => try w.print("  l{d} = (int64_t)(int32_t)l{d}; g{d} = 0;\n", .{ dd, rr, dd }),
+                            .to_long => try w.print("  l{d} = l{d}; g{d} = 1;\n", .{ dd, rr, dd }),
+                            .to_short => try w.print("  l{d} = (int64_t)(int16_t)l{d}; g{d} = 0;\n", .{ dd, rr, dd }),
+                            .to_byte => try w.print("  l{d} = (int64_t)(int8_t)l{d}; g{d} = 0;\n", .{ dd, rr, dd }),
+                            .to_char => try w.print("  l{d} = (int64_t)(uint16_t)l{d}; g{d} = 4;\n", .{ dd, rr, dd }),
+                        }
+                        pc += 2;
+                        continue;
+                    }
                     const c = &f.blocks[bi].insts[code[pc + 1]].Call;
                     const base = c.args.int();
                     try w.print("  {{ int64_t cav[{d}]; int32_t cag[{d}];\n", .{ @max(c.n_args, 1), @max(c.n_args, 1) });
@@ -1293,7 +1766,7 @@ fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, con
                         try w.print("    cav[{d}] = l{d}; cag[{d}] = g{d};\n", .{ i, base + i, i, base + i });
                     }
                     try w.print("    int32_t rg2; int64_t rl2;\n", .{});
-                    try w.print("    if (!kl_{d}(ctx, ev, cav, cag, &rl2, &rg2, depth + 1u)) return 0;\n", .{c.func.int()});
+                    try w.print("    if (!kl_{d}(ctx, ev, cav, cag, &rl2, &rg2, depth + 1u, aux, auxg)) return 0;\n", .{c.func.int()});
                     try w.print("    l{d} = rl2; g{d} = rg2; }}\n", .{ c.dst.int(), c.dst.int() });
                     pc += 2;
                 },

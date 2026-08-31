@@ -8040,11 +8040,70 @@ pub const NativeLeafFn = *const fn (
     ret: *i64,
     retg: *i32,
     depth: u32,
+    aux: [*]i64,
+    auxg: [*]i32,
 ) callconv(.c) i32;
+
+/// A leaf's ctor-tail return (`*retg == leaf_ctor_tail_genre`): the body
+/// could not construct its result natively, so it hands back the site
+/// (`*ret` = block<<16 | inst index into the leaf FUNCTION's own IR) and
+/// the ctor's scalar arguments in `aux`/`auxg`. The gate constructs ONCE
+/// through the host with the inst's own names/static-heads — exact
+/// semantics including a throwing constructor, no re-run. A callee that
+/// may ctor-tail is only ever called in tail position (eligibility rule),
+/// so one shared aux buffer serves the whole native call chain.
+pub const leaf_ctor_tail_genre: i32 = 200;
+
+/// Zig mirror of the emitted C `klio_ctor_site` (see klio_rt.h).
+pub const CtorSite = extern struct {
+    fqn: [*:0]const u8,
+    block: u32,
+    inst: u32,
+    memo: u64,
+};
 
 const NativeLeafEntry = struct { f: NativeLeafFn, fqn: []const u8 };
 var native_leaf_table: std.AutoHashMapUnmanaged(u32, NativeLeafEntry) = .empty;
+/// FQN-keyed leaves (a loaded leaf LIBRARY: bakes are not cross-process
+/// fid-stable, so a prebuilt library can only name bodies by fqn).
+var native_leaf_by_fqn: std.StringHashMapUnmanaged(NativeLeafFn) = .empty;
 var native_leaf_any: std.atomic.Value(bool) = .init(false);
+
+/// One character per declared param type, appended to a leaf's fqn so
+/// OVERLOADS (which share the fqn) can never serve each other's calls.
+/// Computed from the same Func data on both the emitting and the
+/// serving side, so the spellings agree by construction.
+pub fn leafSigChar(ty: []const u8) u8 {
+    const base = if (std.mem.lastIndexOfScalar(u8, ty, '.')) |d| ty[d + 1 ..] else ty;
+    const eq = std.mem.eql;
+    if (eq(u8, base, "Int")) return 'i';
+    if (eq(u8, base, "Long")) return 'l';
+    if (eq(u8, base, "Boolean")) return 'b';
+    if (eq(u8, base, "Char")) return 'c';
+    if (eq(u8, base, "Double")) return 'd';
+    if (eq(u8, base, "Float")) return 'f';
+    if (eq(u8, base, "Short")) return 's';
+    if (eq(u8, base, "Byte")) return 'y';
+    return 'o';
+}
+
+/// `fqn#<sig>` — the collision-proof registration key for `f`.
+pub fn leafKeyAlloc(gpa2: std.mem.Allocator, f: *const Func) ?[]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    buf.appendSlice(gpa2, f.fqn) catch return null;
+    buf.append(gpa2, '#') catch return null;
+    for (f.params) |*p| buf.append(gpa2, leafSigChar(p.ty.name)) catch return null;
+    return buf.toOwnedSlice(gpa2) catch null;
+}
+
+/// Register a leaf by FQN alone (leaf-library loading).
+pub fn registerNativeLeafFqn(fqn: []const u8, f: NativeLeafFn) void {
+    native_mutex.lock();
+    defer native_mutex.unlock();
+    const owned = std.heap.smp_allocator.dupe(u8, fqn) catch return;
+    native_leaf_by_fqn.put(std.heap.smp_allocator, owned, f) catch return;
+    native_leaf_any.store(true, .release);
+}
 
 pub fn registerNativeLeaf(fid: u32, f: NativeLeafFn, fqn: []const u8) void {
     native_mutex.lock();
@@ -8054,13 +8113,241 @@ pub fn registerNativeLeaf(fid: u32, f: NativeLeafFn, fqn: []const u8) void {
     native_leaf_any.store(true, .release);
 }
 
+/// The scalar-replay leaf gate, shared by the transpiled program's
+/// native glue and the interpreter's call arm. Marshals scalar args,
+/// runs the registered `kl_` body, and unmarshals the result — a
+/// genre-200 ctor-tail constructs ONCE through the host with the site
+/// inst's own names/static-heads (exact, throw included). Returns null
+/// when the call is not leaf-served (no registration, non-scalar args,
+/// or the leaf bailed) — the caller falls through to the ordinary
+/// paths, which re-run the pure body exactly.
+var leaf_diag_serve = std.atomic.Value(u64).init(0);
+var leaf_diag_bail = std.atomic.Value(u64).init(0);
+pub fn leafDiagDump() void {
+    if (runtime.envOnce("KLIO_LEAF_DIAG") == null) return;
+    std.debug.print("[leaf-diag] served={d} bailed={d}\n", .{ leaf_diag_serve.load(.monotonic), leaf_diag_bail.load(.monotonic) });
+}
+
+pub const LeafOutcome = union(enum) { val: Value, raise: EvalError };
+
+/// Value-level scalar-replay leaf gate shared by the framed call arm,
+/// the fused driver, and the transpiled program's native glue. Null =
+/// not leaf-served (no registration, non-scalar args, or a pure bail);
+/// the caller falls through to its ordinary path, which re-runs the
+/// pure body exactly. A genre-200 ctor-tail constructs ONCE through
+/// the host with the site inst's own names/static-heads — a throwing
+/// constructor comes back as `.raise`, exact, never re-run.
+pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Module, cf: *const Func, args: []const Value, host: *H, nctx: ?*NativeCtx) Allocator.Error!?LeafOutcome {
+    if (!native_leaf_any.load(.acquire)) return null;
+    if (args.len > 8 or args.len != cf.params.len) return null;
+
+    // Per-Func route memo: the registry lookup (mutex + hash + fqn
+    // compare) priced every call by ~20% on a call-dense benchmark;
+    // the table is write-once, so one resolution is final.
+    const route = cf.leaf_route.load(.acquire);
+    const klf: NativeLeafFn = switch (route) {
+        0 => blk_r: {
+            // A symbol the link step settled onto a native binding (or a
+            // sibling redirect) never runs its lowered body — the leaf
+            // compiled that body, so serving it would bypass the host
+            // intrinsic (the clock stub __klio_time_systemMillis
+            // leaf-served 0). Checked once; the memo pins the verdict.
+            const runs_body = if (comptime @hasDecl(H, "funcRunsItsBody"))
+                host.funcRunsItsBody(cf.id)
+            else
+                true;
+            const f0: ?NativeLeafFn = if (!runs_body)
+                null
+            else
+                nativeLeafFor(cf.id.int(), cf.fqn) orelse nativeLeafForFunc(cf);
+            const enc: usize = if (f0) |fp| @intFromPtr(fp) else 1;
+            @constCast(cf).leaf_route.store(enc, .release);
+            break :blk_r f0 orelse return null;
+        },
+        1 => return null,
+        else => @ptrFromInt(route),
+    };
+    var argv: [8]i64 = undefined;
+    var argg: [8]i32 = undefined;
+    for (args, 0..) |a, i| {
+        switch (a) {
+            .Int => |v| {
+                argv[i] = v;
+                argg[i] = 0;
+            },
+            .Long => |v| {
+                argv[i] = v;
+                argg[i] = 1;
+            },
+            .Bool => |v| {
+                argv[i] = @intFromBool(v);
+                argg[i] = 2;
+            },
+            .Unit => {
+                argv[i] = 0;
+                argg[i] = 3;
+            },
+            .Char => |v| {
+                argv[i] = v;
+                argg[i] = 4;
+            },
+            .Double => |v| {
+                argv[i] = @bitCast(v);
+                argg[i] = 5;
+            },
+            .Float => |v| {
+                argv[i] = @as(u32, @bitCast(v));
+                argg[i] = 6;
+            },
+            else => {
+                // Opaque cargo (genre 7): an unused receiver param rides
+                // through; every emitted op on genre > 6 bails, so a body
+                // that actually touches it re-runs interpreted.
+                argv[i] = 0;
+                argg[i] = 7;
+            },
+        }
+    }
+    var ev: NativeEdgeView = undefined;
+    var local_counter: u64 = 0;
+    if (nctx) |nc| {
+        nativeEdgeView(nc, &ev);
+    } else {
+        ev = .{
+            .rare = &leafEdgeRareInterp,
+            .counter = &local_counter,
+            .idle = runtime.gc.idleTickPtr(),
+            .abandonable = runtime.abandonablePtr(),
+            .rb_abandon = runtime.runBoundaryAbandonPtr(),
+            .abandon_req = runtime.abandonRequestedPtr(),
+            .gc_pending = runtime.gc.pendingFlagPtr(),
+            .gc_on = @intFromBool(runtime.gc.gc_enabled),
+            .always = @intFromBool(runtime.gc.stressActive()),
+        };
+    }
+    var rl: i64 = 0;
+    var rg: i32 = 0;
+    var aux: [8]i64 = undefined;
+    var auxg: [8]i32 = undefined;
+    const cctx: ?*anyopaque = if (nctx) |nc| @ptrCast(nc) else null;
+    if (klf(cctx, &ev, &argv, &argg, &rl, &rg, 0, &aux, &auxg) == 0) {
+        _ = leaf_diag_bail.fetchAdd(1, .monotonic);
+        return null;
+    }
+    _ = leaf_diag_serve.fetchAdd(1, .monotonic);
+    if (runtime.envOnce("KLIO_LEAF_TRACE_SERVE") != null) {
+        std.debug.print("[leaf-serve] {s} rg={d} rl={d}\n", .{ cf.fqn, rg, rl });
+    }
+    if (rg == leaf_ctor_tail_genre) {
+        const sd: *CtorSite = @ptrFromInt(@as(usize, @bitCast(rl)));
+        const memo = @atomicLoad(u64, &sd.memo, .acquire);
+        const site_fid: u32 = if (memo != 0) @intCast(memo - 1) else fid_blk: {
+            const want = std.mem.span(sd.fqn);
+            const hash_pos = std.mem.lastIndexOfScalar(u8, want, '#') orelse return null;
+            const want_fqn = want[0..hash_pos];
+            const dot = std.mem.lastIndexOfScalar(u8, want_fqn, '.') orelse return null;
+            var found: ?u32 = null;
+            for (module.funcsBySimpleName(want_fqn[dot + 1 ..])) |cand| {
+                const cf2 = module.funcById(cand) orelse continue;
+                if (!std.mem.eql(u8, cf2.fqn, want_fqn)) continue;
+                var buf2: [512]u8 = undefined;
+                var fbs2 = std.heap.FixedBufferAllocator.init(&buf2);
+                const k2 = leafKeyAlloc(fbs2.allocator(), cf2) orelse continue;
+                if (std.mem.eql(u8, k2, want)) {
+                    found = cand.int();
+                    break;
+                }
+            }
+            const got = found orelse return null;
+            @atomicStore(u64, &sd.memo, @as(u64, got) + 1, .release);
+            break :fid_blk got;
+        };
+        const tbi: usize = sd.block;
+        const tii: usize = sd.inst;
+        const sf = module.funcById(ir.FuncId.from(site_fid)) orelse return null;
+        if (tbi >= sf.blocks.len or tii >= sf.blocks[tbi].insts.len) return null;
+        const SiteCtor = struct { class: ir.ClassId, n_args: u32, arg_names: []const ?ir.ConstId, heads: []const ?ir.ConstId };
+        const sc: SiteCtor = switch (sf.blocks[tbi].insts[tii]) {
+            .NewInstance => |*ni| .{ .class = ni.class, .n_args = ni.n_args, .arg_names = ni.arg_names, .heads = ni.arg_static_heads },
+            .CallMemberOrGlobal => |*cg| if (cg.class) |cl| SiteCtor{ .class = cl, .n_args = cg.n_args, .arg_names = cg.arg_names, .heads = &.{} } else return null,
+            else => return null,
+        };
+        var vals: [8]Value = undefined;
+        for (0..sc.n_args) |ai| {
+            vals[ai] = switch (auxg[ai]) {
+                0 => .{ .Int = @intCast(aux[ai]) },
+                1 => .{ .Long = aux[ai] },
+                2 => .{ .Bool = aux[ai] != 0 },
+                3 => .Unit,
+                4 => .{ .Char = @intCast(aux[ai]) },
+                5 => .{ .Double = @bitCast(aux[ai]) },
+                6 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(aux[ai]))))) },
+                else => return null,
+            };
+        }
+        const names = try resolveArgNames(allocator, module, sc.arg_names);
+        defer freeArgNames(allocator, names);
+        const static_heads = try resolveArgNames(allocator, module, sc.heads);
+        defer freeArgNames(allocator, static_heads);
+        if (comptime @hasDecl(H, "setCtorArgStaticHeads")) {
+            host.setCtorArgStaticHeads(static_heads);
+        }
+        switch (try host.newInstanceNamed(allocator, sc.class, vals[0..sc.n_args], names, null)) {
+            .ok => |v| return .{ .val = v },
+            .err => |e| return .{ .raise = e },
+        }
+    }
+    const v: Value = switch (rg) {
+        0 => .{ .Int = @intCast(rl) },
+        1 => .{ .Long = rl },
+        2 => .{ .Bool = rl != 0 },
+        3 => .Unit,
+        4 => .{ .Char = @intCast(rl) },
+        5 => .{ .Double = @bitCast(rl) },
+        6 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(rl))))) },
+        else => return null,
+    };
+    return .{ .val = v };
+}
+
+/// Frame-level wrapper over `tryLeafValues` for the framed call arm and
+/// the transpiled program's glue: args come straight from the frame's
+/// register file (they are Values already), the result writes the dst.
+pub fn tryLeafCall(comptime H: type, allocator: Allocator, frame: *Frame, c: anytype, host: *H, nctx: ?*NativeCtx) Allocator.Error!?Step {
+    if (!native_leaf_any.load(.acquire)) return null;
+    if (c.type_args.len != 0 or !argNamesAllNull(c.arg_names)) return null;
+    const cf = frame.module.funcById(c.func) orelse return null;
+    const base = c.args.int();
+    if (base + c.n_args > frame.regs.items.len) return null;
+    const outcome = (try tryLeafValues(H, allocator, frame.module, cf, frame.regs.items[base .. base + c.n_args], host, nctx)) orelse return null;
+    switch (outcome) {
+        .val => |v| {
+            try frame.write(c.dst, v);
+            return .cont;
+        },
+        .raise => |e| return raiseStep(frame, e),
+    }
+}
+
 fn nativeLeafFor(fid: u32, fqn: []const u8) ?NativeLeafFn {
     if (!native_leaf_any.load(.acquire)) return null;
     native_mutex.lock();
     defer native_mutex.unlock();
-    const e = native_leaf_table.get(fid) orelse return null;
-    if (!std.mem.eql(u8, e.fqn, fqn)) return null;
-    return e.f;
+    if (native_leaf_table.get(fid)) |e| {
+        if (std.mem.eql(u8, e.fqn, fqn)) return e.f;
+    }
+    return null;
+}
+
+/// Fqn-map lookup by the collision-proof key (fqn#sig).
+fn nativeLeafForFunc(cf: *const Func) ?NativeLeafFn {
+    if (!native_leaf_any.load(.acquire)) return null;
+    var buf: [512]u8 = undefined;
+    var fbs = std.heap.FixedBufferAllocator.init(&buf);
+    const key = leafKeyAlloc(fbs.allocator(), cf) orelse return null;
+    native_mutex.lock();
+    defer native_mutex.unlock();
+    return native_leaf_by_fqn.get(key);
 }
 
 var native_expect_funcs: usize = 0;
@@ -8235,79 +8522,9 @@ fn NativeGlue(comptime H: type) type {
                 // C over (int64, genre) pairs when every argument is a
                 // scalar. A zero return is a pure bail — fall through to
                 // the ordinary paths, which re-run the call exactly.
-                if (native_leaf_any.load(.acquire) and c.n_args <= 8 and
-                    c.n_args == cf.params.len)
-                klx: {
-                    // Per-Func route memo: the registry lookup (mutex +
-                    // hash + fqn compare) priced every call by ~20% on a
-                    // call-dense benchmark; the table is write-once, so
-                    // one resolution is final.
-                    const route = cf.leaf_route.load(.acquire);
-                    const klf: NativeLeafFn = switch (route) {
-                        0 => blk_r: {
-                            const f0 = nativeLeafFor(c.func.int(), cf.fqn);
-                            const enc: usize = if (f0) |fp| @intFromPtr(fp) else 1;
-                            @constCast(cf).leaf_route.store(enc, .release);
-                            break :blk_r f0 orelse break :klx;
-                        },
-                        1 => break :klx,
-                        else => @ptrFromInt(route),
-                    };
-                    var argv: [8]i64 = undefined;
-                    var argg: [8]i32 = undefined;
-                    const base = c.args.int();
-                    if (base + c.n_args > frame.regs.items.len) break :klx;
-                    for (0..c.n_args) |i| {
-                        switch (frame.regs.items[base + i]) {
-                            .Int => |v| {
-                                argv[i] = v;
-                                argg[i] = 0;
-                            },
-                            .Long => |v| {
-                                argv[i] = v;
-                                argg[i] = 1;
-                            },
-                            .Bool => |v| {
-                                argv[i] = @intFromBool(v);
-                                argg[i] = 2;
-                            },
-                            .Unit => {
-                                argv[i] = 0;
-                                argg[i] = 3;
-                            },
-                            .Char => |v| {
-                                argv[i] = v;
-                                argg[i] = 4;
-                            },
-                            .Double => |v| {
-                                argv[i] = @bitCast(v);
-                                argg[i] = 5;
-                            },
-                            .Float => |v| {
-                                argv[i] = @as(u32, @bitCast(v));
-                                argg[i] = 6;
-                            },
-                            else => break :klx,
-                        }
-                    }
-                    var ev: NativeEdgeView = undefined;
-                    nativeEdgeView(ctx, &ev);
-                    var rl: i64 = 0;
-                    var rg: i32 = 0;
-                    if (klf(@ptrCast(ctx), &ev, &argv, &argg, &rl, &rg, 0) != 0) {
-                        const v: Value = switch (rg) {
-                            0 => .{ .Int = @intCast(rl) },
-                            1 => .{ .Long = rl },
-                            2 => .{ .Bool = rl != 0 },
-                            3 => .Unit,
-                            4 => .{ .Char = @intCast(rl) },
-                            5 => .{ .Double = @bitCast(rl) },
-                            6 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(rl))))) },
-                            else => break :klx,
-                        };
-                        frame.write(c.dst, v) catch return .oom;
-                        return .cont;
-                    }
+                if (tryLeafCall(H, ctx.allocator, frame, c, host, ctx) catch return .oom) |st| {
+                    if (st == .cont) return .cont;
+                    return glueAfter(ctx, st, inst, idx, block);
                 }
                 if (!cf.leafExprBody()) break :direct;
                 var plan = cf.fast_call;
@@ -8415,10 +8632,34 @@ pub const NativeEdgeView = extern struct {
     gc_pending: *const bool,
     gc_on: u8,
     always: u8,
+    /// Rare-trigger handler for this view's context (see klio_rt.h).
+    rare: *const fn (ctx: ?*anyopaque, reasons: u32) callconv(.c) i32,
 };
+
+/// Rare handler for the INTERPRETER's leaf gate: no NativeCtx exists,
+/// so a persistent condition (abandon request, pending GC, an expired
+/// test wall deadline) bails the leaf — the interpreted re-run reaches
+/// its own safe point and services it; the condition persisting is what
+/// makes the bail loop-free. A bare cadence tick continues natively.
+fn leafEdgeRareInterp(ctx: ?*anyopaque, reasons: u32) callconv(.c) i32 {
+    _ = ctx;
+    if (reasons & 0x2 != 0 and runtime.shouldAbandon()) return 1;
+    if (reasons & 0x4 != 0) return 1;
+    if (reasons & 0x1 != 0) {
+        spinDumpMaybe();
+        const wall_dl = test_wall_deadline_ms.load(.monotonic);
+        if (wall_dl != 0 and nowMonotonicMs() > wall_dl) return 1;
+    }
+    return 0;
+}
+
+fn nativeOpEdgeRareC(ctx: ?*anyopaque, reasons: u32) callconv(.c) i32 {
+    return nativeOpEdgeRare(@ptrCast(@alignCast(ctx.?)), reasons);
+}
 
 pub fn nativeEdgeView(ctx: *NativeCtx, out: *NativeEdgeView) void {
     out.* = .{
+        .rare = &nativeOpEdgeRareC,
         .counter = &ctx.ftls.spin_check_counter,
         .idle = runtime.gc.idleTickPtr(),
         .abandonable = runtime.abandonablePtr(),
@@ -9755,6 +9996,16 @@ fn callPicPut(site: usize, cls: u64, sig: u64, gen: u64, fid: u32) void {
     e.fid = fid;
 }
 
+fn tryLeafMember(comptime H: type, allocator: Allocator, frame: *Frame, recv: Value, fid: ir.FuncId, args: []const Value, host: *H) Allocator.Error!?LeafOutcome {
+    if (recv == .Null) return null;
+    const lf = frame.module.funcById(fid) orelse return null;
+    if (args.len + 1 > 8) return null;
+    var all: [8]Value = undefined;
+    all[0] = recv;
+    for (args, 0..) |a, i| all[i + 1] = a;
+    return tryLeafValues(H, allocator, frame.module, lf, all[0 .. args.len + 1], host, null);
+}
+
 noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Frame, cm: anytype, host: *H) Allocator.Error!Step {
     const cm_t0 = gfNow();
     defer if (frame_count_on) {
@@ -9819,6 +10070,24 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             defer if (dispatch_recv) |value| value.release(allocator);
             const ra = try readArgRun(allocator, frame, cm.args, cm.n_args);
             defer allocator.free(ra);
+            // Scalar-replay leaf on the lowering-resolved member: the
+            // receiver rides as param 0 (opaque genre when non-scalar); a
+            // bail falls through to the ordinary invokers, which re-run
+            // the pure body exactly.
+            if (argNamesAllNull(cm.arg_names) and ra.len + 1 <= 8 and
+                cm.dispatch_receiver == null and recv != .Null) leaf: {
+                const lf = frame.module.funcById(fid) orelse break :leaf;
+                var all: [8]Value = undefined;
+                all[0] = recv;
+                for (ra, 0..) |a, i| all[i + 1] = a;
+                if (try tryLeafValues(H, allocator, frame.module, lf, all[0 .. ra.len + 1], host, null)) |lo| switch (lo) {
+                    .val => |v| {
+                        try frame.write(cm.dst, v);
+                        return .cont;
+                    },
+                    .raise => |e| return raiseStep(frame, e),
+                };
+            }
             // A lowering-resolved plain member at the fully-applied no-vararg
             // shape runs as a pushed activation; member extensions (which
             // seed the dispatch receiver) and every padded/vararg shape keep
@@ -9935,6 +10204,17 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                     const gen: u64 = if (comptime @hasDecl(H, "dispatchCacheGen")) H.dispatchCacheGen() else 0;
                     const sig_p = host.memberSiteSig(arg_values) orelse break :site;
                     const fid_p = callPicGet(@intFromPtr(cm), cls_now, sig_p, gen) orelse break :site;
+                    if (try tryLeafMember(H, allocator, frame, recv, @enumFromInt(fid_p), arg_values, host)) |lo| switch (lo) {
+                        .val => |v| {
+                            if (pushed_enclosing) popEnclosing();
+                            try frame.write(cm.dst, v);
+                            return .cont;
+                        },
+                        .raise => |e| {
+                            if (pushed_enclosing) popEnclosing();
+                            return raiseStep(frame, e);
+                        },
+                    };
                     if (try host.prepareMemberFlatFromFid(allocator, &recv, name_str, arg_values, @enumFromInt(fid_p))) |prep0| {
                         dispatchBump(.member_site_flat);
                         var prep = prep0;
@@ -9963,6 +10243,17 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                     }
                     break :site;
                 }
+                if (try tryLeafMember(H, allocator, frame, recv, @enumFromInt(@as(u32, @intCast(route >> 1))), arg_values, host)) |lo| switch (lo) {
+                    .val => |v| {
+                        if (pushed_enclosing) popEnclosing();
+                        try frame.write(cm.dst, v);
+                        return .cont;
+                    },
+                    .raise => |e| {
+                        if (pushed_enclosing) popEnclosing();
+                        return raiseStep(frame, e);
+                    },
+                };
                 if (try host.prepareMemberFlatFromFid(allocator, &recv, name_str, arg_values, @enumFromInt(@as(u32, @intCast(route >> 1))))) |prep0| {
                     dispatchBump(.member_site_flat);
                     var prep = prep0;
@@ -12431,6 +12722,17 @@ fn fusedInst(
             }
             if (c.arg_names.len != 0 or c.type_args.len != 0 or callee.params.len != c.n_args)
                 return error.Materialize;
+            // Scalar-replay leaf: a registered pure callee runs as direct
+            // C; a bail falls through to fusedExec, which re-runs the
+            // pure body exactly.
+            const leaf_served: ?Value = if (try tryLeafValues(H, allocator, module, callee, argv[0..c.n_args], host, null)) |lo| switch (lo) {
+                .val => |v| v,
+                .raise => |e| return fusedRaise(e),
+            } else null;
+            if (leaf_served) |lv| {
+                fusedWrite(allocator, regs, c.dst, lv, reclaim, false);
+                return;
+            }
             const direct = try fusedExec(H, allocator, module, callee, argv[0..c.n_args], host);
             const r = direct orelse blk: {
                 // The runtime gates (bank depth, a host-owned callee, a

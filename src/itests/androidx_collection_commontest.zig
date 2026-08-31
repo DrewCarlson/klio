@@ -33,7 +33,7 @@ const runtime = @import("runtime");
 // the builder its own body was appending to. The suite now reports 1841
 // passed, 0 failed, 0 did not complete — previously 1500/0 with 6 classes
 // timing out, which is how a real failure hid behind a green ceiling.
-const BASELINE: usize = 1830; // tightened 2026-08-31: measured 1841/0 (red-mass closeout)
+const BASELINE: usize = 1841; // tightened 2026-09-01: 1841/0 across five consecutive full stacks
 
 /// Ceiling on failing cases, the mirror of `BASELINE`. 15 -> 4 -> 0 as two
 /// resolution roots closed: overloaded inline extensions no longer bind by
@@ -82,6 +82,13 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
 /// Concurrent child count. Each child is one `klio test` process; the pool
 /// keeps the cores busy while the slowest files run.
 fn workerCount() usize {
+    // KLIO_ITEST_JOBS overrides, like the shared registry runner — the
+    // full-stack script bounds every suite to its share of the box.
+    if (std.c.getenv("KLIO_ITEST_JOBS")) |v| {
+        if (std.fmt.parseInt(usize, std.mem.span(v), 10) catch null) |n| {
+            if (n >= 1) return @min(n, 64);
+        }
+    }
     const cores = std.Thread.getCpuCount() catch 4;
     // Half the cores, capped low: suites run beside sweeps and editors,
     // and each child is itself a multi-threaded interpreter.

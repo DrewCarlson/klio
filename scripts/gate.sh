@@ -62,6 +62,15 @@ phase "litmus" zig build \
   itest-bundle_smoke \
   --summary failures
 
+echo "== compose-ui example family (fresh packs, cleared bake cache)"
+phase "compose-ui-gate" scripts/compose-ui-gate.sh
+
+echo "== full example corpus"
+# Pinned to the repo-local home the compose-ui gate just freshened —
+# the shared ~/.klio produced a six-example failure mirage from stale
+# packs once already.
+phase "corpus" env KLIO_HOME="$ROOT/.klio-local" python3 scripts/corpus_check.py --zig zig-out/bin/klio-harness --no-rust
+
 if [ "$NO_SWEEP" = 0 ]; then
   echo "== commontest dual eager gate"
   phase "harness-build" zig build klio-harness

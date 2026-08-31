@@ -114,6 +114,8 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
     // wall-clock run deadline. Both are call-once and default-safe.
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
+    commands.loadLeafLibrary();
+    defer commands.leafDiagDump();
 
     // A bundle payload appended to this executable takes over the whole
     // process: argv[1..] belongs to the embedded program and klio

@@ -479,6 +479,10 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
         try frame.write(call.dst, served);
         return .cont;
     }
+    // Scalar-replay leaf (`kl_`): when a leaf library is registered
+    // (KLIO_LEAVES), a pure scalar callee runs as direct C — bail is a
+    // pure no-op and the ordinary paths below re-run the call exactly.
+    if (try eval.tryLeafCall(H, allocator, frame, call, host, null)) |st| return st;
     // Monomorphic fast path: a plain top-level user function (single
     // overload, has body, non-extension, no varargs / defaults / type
     // params / native binding) called positionally at exact arity needs
@@ -2164,6 +2168,16 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                         try frame.write(cmg.dst, served);
                         return .cont;
                     }
+                    // Scalar-replay leaf on the claimed global: a bail
+                    // falls through to the flat activation, which re-runs
+                    // the pure body exactly.
+                    if (try eval.tryLeafValues(H, allocator, frame.module, gf, arg_values, host, null)) |lo| switch (lo) {
+                        .val => |v| {
+                            try frame.write(cmg.dst, v);
+                            return .cont;
+                        },
+                        .raise => |e| return raiseStep(frame, e),
+                    };
                     var args_list = try acquireArgsCap(allocator, arg_values.len);
                     args_list.appendSliceAssumeCapacity(arg_values);
                     frame.flat_call = .{
