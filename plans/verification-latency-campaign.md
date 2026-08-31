@@ -8,21 +8,34 @@ and correctly as it relates to all of our tests and verification
 infrastructure as well as the actual production runtime of the
 interpreter, jit code, and transpiled C."
 
-THE OPENING MEASUREMENT (the 2026-08-31 full stack, log-mtime timeline,
-total ~113 min):
-- coroutines census: **~60-88 min — the single dominator** (148 files,
-  weight 90, per-child compile + run of suspend-heavy tests).
-- the other six library censuses: ~10 min combined (ktor 71s,
-  serialization 24s, datetime 177s, io 80s, androidx 213s, atomicfu 22s
-  — several are ALREADY minutes-fast, proving the model works when
-  children are cheap).
-- compose gate: ~10 min (vpd child 562s IS the floor — the suite is
-  scheduling-optimal around it, measured in the native-floor campaign).
-- parity + examples + harness build + stdlib sweep: ~5 min.
-- Plus, on any iteration day: each `zig build itest-<suite>` pays a
-  whole-program LLVM link (~3-4 min; ten suites = ~35 min of pure
-  relinking when the tree changed), and every `zig build` re-bakes
-  packs (the recorded re-bake trap).
+THE BUDGET (Task 1 CORRECTED 2026-08-31 — the instrumented rows
+overturned the opening estimate):
+- The "~2 hour" experience decomposed as: sequential per-suite
+  invocations + serialized relinks after tree changes + THE SESSION
+  TOOLING'S OWN TASK-QUEUE DEFERRAL (background tasks sat queued for up
+  to an hour before starting — an agent-harness artifact, not project
+  cost). The project's true numbers:
+- Coroutines census, instrumented (KLIO_CENSUS_TIMES): **107s total**
+  — 148 children, sum 650s over 8 workers; hottest children
+  SharedFlowTest 37s, BufferedChannelTest 34s, ImmediateYield 19s.
+  The 157-file closure compiles in ~7s per child.
+- Datetime: wall == its hottest single child (TimeZoneRulesTest 171s,
+  compute); 56 children x 60 files, sum 614s. A one-child whole-suite
+  run reproduces the census exactly (519/0) in 236s serial — per-file
+  isolation costs ~56x redundant lowering but parallelism hides it.
+- **ONE-INVOCATION FULL STACK** (`zig build itest-a itest-b ...`, all
+  ten steps, links + runs parallel on 32 cores): **710s = 11.8 min**
+  WITH all ten binaries relinking (tree-changed worst case). The
+  sequential-scripts habit, not the project, made it hours.
+- Remaining structure inside the 710s: the compose gate (~10 min,
+  vpd 562s floor) IS the critical path; everything else overlaps it.
+- Library census workers clamp at 8 of 32 cores
+  (commontest_support.workerCount); full-parallel stacks oversubscribe
+  (64 workers dropped one coroutines child to DNC — floors carry load
+  margin, coroutines 1285 vs solo 1299).
+- MEASUREMENT TRAP (cost this table its first draft): `rc=$?` must be
+  captured BEFORE any further command (a date call overwrote it), and
+  log-mtime timelines lie when the task queue defers the start.
 
 ## Task 1 — measure where every minute goes (no guessing)
 
