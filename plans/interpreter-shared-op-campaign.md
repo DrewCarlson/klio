@@ -111,6 +111,18 @@ PROGRESS 2026-08-31 (first two rounds landed, battery pending):
   further single >=2% conversion exists in the field family. Remaining
   ladder conversions (getFieldInner/getMemberField internals) are
   ~0.3-0.5% each; do them only if a later profile promotes them.
+- SOUNDNESS TRAP, found by the gate (26 fails: GroupSize/SlotTable
+  source-info families, class-run-only) and fixed in 4075cf2d:
+  **shape is LAYOUT identity, not class identity** — two classes can
+  share a layout while routing the same name differently (a custom
+  getter on one, a plain slot on the other; the GroupSize mock View
+  subclasses are exactly this), so a shape-KEYED claim served one
+  class's getter route to another class. Site claims must stay
+  CLASS-keyed; the shape (`GetField.site_shape`, bound to the verified
+  index under one borrow at fill) only licenses skipping the per-hit
+  name verify when class AND shape both match. Sound-build numbers:
+  replica 146-148 (median 146, ~1%), vpd solo 540-541s vs 544-546 —
+  the 645 ratchet stands.
 
 Instance fields today are an append-ordered array, name-verified per
 access (field order is NOT class-static — dynamic defines append; the
