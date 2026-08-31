@@ -29,16 +29,45 @@ re-attributes under gate parity before anything is built):
 - field machinery (getFieldInner / execArmGetField / leafStoredField /
   fieldWriteCacheGet) ~4%
 
-## Task 1 — gate-parity profile attribution (measure FIRST)
+## Task 1 — gate-parity profile attribution — DONE 2026-08-31
 
-Re-profile under the exact conditions the ratchet pays for: the fast
-harness in `klio test` mode (arena, reclaim-off, the gate's JIT policy),
-on the replica AND on a `validatePotentialDeadlock` solo run. Produce a
-bucket table with percentages and a per-task budget line each following
-task must beat (the >=2% implement threshold from the closed campaigns
-applies). KLIO_PROF is the profiler; KLIO_PROF_RAW + addr2line pins
-anonymous maps. Any bucket that shrinks below its threshold under gate
-parity closes its task by measurement on the spot.
+CORRECTION to this plan's own premise, established first: `klio test`
+does NOT run arena/reclaim-off memory — BOTH the fast and safe profiles
+run `reclaim = .gc` (tracing GC, refcount neutralized; `perf.zig
+forProfile`). The gate's memory regime is the tracing GC.
+
+vpd solo profile (KLIO_PROF, gate env, fast harness; thread-aggregated
+samples): drivers ~10% (runFrameExec 4.9, execInst 1.7, runFlatLoop 1.2,
+fusedInst 1.1, leaf walkers ~1), GC ~12% (shade 5.8, gc-counter
+fetchAdd/fetchSub ~3.6, writeBarrier 0.8, sweepMinor 0.6, isUsed 0.9,
+memset ~1), string-keyed lookups ~8% (eqlBytes 3.7, mix 1.15, get 1.3,
+getIndex 1.0, getOrPut 0.65), alloc ~6% (allocLockedOne 2.1, allocSmall
+1.0, freeSmall 0.8, append 1.2, copyFixedLength 0.95), libc-unattributed
+8.5%, borrow (ObjRef guards, closed <=1% envelope) 1.3. Baseline vpd
+solo wall under gate env: 544-546s across 5 runs (tight).
+
+GC VEIN CLOSED BY MEASUREMENT (the ~12% bucket does not convert to
+wall — vpd's critical path is not the memory subsystem):
+- Appel growth factor 2 -> 8: 546 vs 544-545s (ZERO; with vpd's small
+  live set the trigger is FLOOR-driven, growth never engages).
+- Threshold floor 8MB -> 64MB (8x fewer collections): 564-566s, ~4%
+  SLOWER — the default floor is already right.
+- Batched per-thread nursery registration (register() had a global
+  spinlock + shared counter RMW per allocation): 544-545s, wall-NEUTRAL
+  despite ~5% of profile samples — committed for the record and
+  REVERTED (5f881573 / 32708759). SAFETY FACT banked in that commit for
+  any future revival: a cell left in a threadlocal segment across a
+  collection is a reachability hole (parent promotes, minor stops at
+  the unmutated tenured parent, next sweep frees the live child —
+  surfaced as `lazySet` on a recycled cell); segments must flush at the
+  STW rendezvous and at blocking-safe entry.
+
+METHOD NOTE (discovered work, applies to every later vein): the profile
+is thread-AGGREGATED while the wall follows the slowest chain, so a
+profile share is only a ceiling — each vein needs its own cheap A/B on
+the vpd solo before implementation effort, exactly as run here. If the
+Task 2/3 A/Bs also come back flat, build per-thread (critical-path)
+attribution before spending further.
 
 ## Task 2 — string-keyed lookups out of the hot ladders (~11% bucket)
 
