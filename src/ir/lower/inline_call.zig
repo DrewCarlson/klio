@@ -2970,6 +2970,22 @@ pub fn tryInlineCallWithTypeArgs(
     // member-shadowable dispatch on the bound `this`, exactly as the
     // declaration lowering scopes them: activate the owner class and its
     // hierarchy's member-name set for the splice.
+    // A spliced body resolves in its DECLARATION scope: park the caller's
+    // member sets and lexical owner so a bare `indices` inside a spliced
+    // `UByteArray.getOrElse` is the receiver's extension property, not a
+    // same-named METHOD of the calling class. MEMBER splices park too —
+    // their owner swap below installs the owner scope on top of the parked
+    // (cleared) sets, and the call-site LAMBDA swaps the parked caller
+    // scope back in (`enterCallerMemberScope` in spliceInlineLambda): a
+    // bare nested-class ctor in the lambda (`throw TestException()` inside
+    // `UnsafeBufferOperations.readFromHead(buffer) { ... }`) must see the
+    // CALLER class's nesteds, which the owner scope hid.
+    // `KLIO_SPLICE_HYG=0` disables.
+    var hyg_snap: build.FuncBuilder.MemberScopeSnapshot = undefined;
+    const hyg_active = (ext_splice or member_splice) and
+        !std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_SPLICE_HYG") orelse "1", "0");
+    if (hyg_active) b.beginSpliceDeclScope(&hyg_snap);
+    defer if (hyg_active) b.endSpliceDeclScope(&hyg_snap);
     var member_scope_prev_owner: ?[]const u8 = null;
     var member_scope_prev_members: ?build.StringSet = null;
     // The body's lexical scope is the owner class, not the call site: bare
@@ -3020,18 +3036,6 @@ pub fn tryInlineCallWithTypeArgs(
             b.enclosing_members = pm;
         }
     };
-    // A TOP-LEVEL extension's spliced body resolves in its declaration
-    // scope: park the caller's member sets and lexical owner so a bare
-    // `indices` inside a spliced `UByteArray.getOrElse` is the receiver's
-    // extension property, not a same-named METHOD of the calling class.
-    // Spliced caller-lambda content swaps the parked scope back in
-    // (`enterCallerMemberScope` in spliceInlineLambda). `KLIO_SPLICE_HYG=0`
-    // disables.
-    var hyg_snap: build.FuncBuilder.MemberScopeSnapshot = undefined;
-    const hyg_active = ext_splice and !member_splice and
-        !std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_SPLICE_HYG") orelse "1", "0");
-    if (hyg_active) b.beginSpliceDeclScope(&hyg_snap);
-    defer if (hyg_active) b.endSpliceDeclScope(&hyg_snap);
     var prev_splice_window: @TypeOf(b.lambda_splice_resolve) = null;
     if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
         if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} recv={} ext={} member={} this_arg={}\n", .{ fname, explicit_receiver != null, f.receiver_type != null, member_splice, this_arg != null });
