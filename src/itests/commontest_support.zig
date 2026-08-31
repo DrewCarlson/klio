@@ -52,6 +52,11 @@ pub const Config = struct {
     /// bound: a suite whose children start hanging is regressing even when
     /// the surviving cases still pass.
     max_incomplete: ?usize = null,
+    /// Files whose children are emitted ONE PER `@Test` (matched by path
+    /// suffix): a file with two 100s compute tests otherwise serializes the
+    /// suite wall behind one child. The split child compiles the same
+    /// closure and runs `--filter=Class.test`, so counting is unchanged.
+    split_files: []const []const u8 = &.{},
 };
 
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
@@ -231,6 +236,38 @@ fn declaredName(tail: []const u8, is_fun: bool) ?[]const u8 {
     return name;
 }
 
+/// The first `class X` name in the file (the test class for --filter).
+fn classNameOf(src: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, "class ")) |p| {
+        i = p + 6;
+        if (p != 0 and isIdentByte(src[p - 1])) continue;
+        var e = i;
+        while (e < src.len and isIdentByte(src[e])) e += 1;
+        if (e > i) return src[i..e];
+    }
+    return null;
+}
+
+/// Every `fun NAME` following an `@Test` annotation (the split-file child
+/// list). Modifier lines between the annotation and the fn are tolerated.
+fn collectTestFns(a: std.mem.Allocator, src: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, "@Test")) |p| {
+        i = p + 5;
+        const fnp = std.mem.indexOfPos(u8, src, i, "fun ") orelse return;
+        // The fn must belong to this annotation: no further @Test between.
+        if (std.mem.indexOfPos(u8, src, i, "@Test")) |nxt| {
+            if (nxt < fnp) continue;
+        }
+        const e = fnp + 4;
+        var b2 = e;
+        while (b2 < src.len and isIdentByte(src[b2])) b2 += 1;
+        if (b2 > e) try out.append(a, src[e..b2]);
+        i = b2;
+    }
+}
+
 fn scanDecls(a: std.mem.Allocator, src: []const u8) !DeclScan {
     var declares: std.ArrayList([]const u8) = .empty;
     var words: std.ArrayList([]const u8) = .empty;
@@ -403,6 +440,10 @@ pub const suites = [_]Config{
         },
         .whole_source_set = true,
         .timeout_ms = 400_000,
+        // fromEpochDays (100s) + toEpochDays (56s) are dispatch-heavy
+        // compute (JIT-neutral, measured); split so they parallelize
+        // instead of walling the suite behind one 168s child.
+        .split_files = &.{"common/test/LocalDateTest.kt"},
         .baseline = 519,
         .max_failed = 0,
         .max_incomplete = 1,
@@ -536,6 +577,35 @@ pub fn runSuite(cfg: Config) !void {
 
     var jobs: std.ArrayList([]const []const u8) = .empty;
     for (targets.items, 0..) |target, ti| {
+        const split_this = blk: {
+            for (cfg.split_files) |sf| {
+                if (std.mem.endsWith(u8, target, sf)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (split_this) {
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, target, a, .unlimited) catch "";
+            const cls = classNameOf(bytes) orelse target;
+            var names: std.ArrayList([]const u8) = .empty;
+            try collectTestFns(a, bytes, &names);
+            for (names.items) |tn| {
+                var argv: std.ArrayList([]const u8) = .empty;
+                try argv.append(a, klioBin(&env));
+                try argv.append(a, "test");
+                if (cfg.whole_source_set) {
+                    try argv.appendSlice(a, support.items);
+                    try argv.appendSlice(a, targets.items);
+                } else {
+                    const bases = try providerClosure(a, scans.items, &owner, ti);
+                    try argv.appendSlice(a, support.items);
+                    for (bases) |bi| try argv.append(a, targets.items[bi]);
+                    try argv.append(a, target);
+                }
+                try argv.append(a, try std.fmt.allocPrint(a, "--filter={s}.{s}", .{ cls, tn }));
+                try jobs.append(a, try argv.toOwnedSlice(a));
+            }
+            if (names.items.len != 0) continue;
+        }
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, klioBin(&env));
         try argv.append(a, "test");
@@ -587,11 +657,21 @@ pub fn runSuite(cfg: Config) !void {
                 // Latency census: per-child wall, argv size, and pass count —
                 // the budget table's raw rows (KLIO_CENSUS_TIMES=1).
                 if (std.c.getenv("KLIO_CENSUS_TIMES") != null) {
+                    // The child's TARGET: the value after --only-file when
+                    // present (whole_source_set argv ends with the whole
+                    // list), else the last argument.
+                    var tgt: []const u8 = queue[i][queue[i].len - 1];
+                    for (queue[i], 0..) |arg2, qi| {
+                        if (std.mem.eql(u8, arg2, "--only-file") and qi + 1 < queue[i].len) {
+                            tgt = queue[i][qi + 1];
+                            break;
+                        }
+                    }
                     std.debug.print("[census-time] {d}ms files={d} passed={d} target={s}\n", .{
                         (runtime.clockMonotonicNanos() -% ct_t0) / std.time.ns_per_ms,
                         queue[i].len - 2,
                         passedLineCount(r.stdout),
-                        queue[i][queue[i].len - 1],
+                        tgt,
                     });
                 }
                 _ = ppassed.fetchAdd(passedLineCount(r.stdout), .monotonic);
