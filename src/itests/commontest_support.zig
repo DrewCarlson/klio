@@ -454,7 +454,18 @@ pub fn runSuite(cfg: Config) !void {
                     continue;
                 };
                 _ = ppassed.fetchAdd(passedLineCount(r.stdout), .monotonic);
-                _ = pfailed.fetchAdd(failedCount(r.stdout), .monotonic);
+                const nf = failedCount(r.stdout);
+                _ = pfailed.fetchAdd(nf, .monotonic);
+                // Census diagnosis: name every failing case (and its file) so
+                // a red census is actionable without a by-hand re-run.
+                if (nf != 0 and std.c.getenv("KLIO_CENSUS_NAMES") != null) {
+                    var itn = std.mem.splitScalar(u8, r.stdout, '\n');
+                    while (itn.next()) |line| {
+                        if (std.mem.endsWith(u8, line, " FAILED")) {
+                            std.debug.print("[census-fail] {s} <- {s}\n", .{ line, queue[i][queue[i].len - 1] });
+                        }
+                    }
+                }
                 if (std.mem.indexOf(u8, r.stdout, " passed,") == null) _ = phung.fetchAdd(1, .monotonic);
             }
         }

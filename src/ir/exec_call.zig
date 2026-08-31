@@ -2378,8 +2378,18 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
             // to an inner receiver-lambda subject (`apply { minusAssign(k) }`
             // inside `Map.minus`) refutes the very candidates the subject
             // satisfies.
+            // With a DIRECT SPLICE RECEIVER on the instruction, `this_val`
+            // is the spliced SUBJECT — the frame-derived head must anchor to
+            // the frame's own `this` (a `with(period)` subject inside
+            // `Instant.plus` must not inherit the extension's `Instant`
+            // proof, or the strict probe binds the Instant extension to the
+            // period and its body reads the wrong fields).
+            const hint_anchor: Value = if (!static_from_instr and cmg.recv != null)
+                implicitThisValue(frame, cmg.this_idx, true)
+            else
+                this_val;
             const hint: ?[]const u8 = if (static_recv_ty != null and
-                (sameReceiver(c.v, this_val) or (static_from_instr and ci == 0)))
+                (sameReceiver(c.v, hint_anchor) or (static_from_instr and ci == 0)))
                 static_recv_ty
             else
                 null;
