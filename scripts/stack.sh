@@ -15,6 +15,11 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export KLIO_ITEST_JOBS="${KLIO_ITEST_JOBS:-4}"
+# Moderate GC relaxation for every interpreter child (the census suites
+# are allocation-churn workloads paying the same marking tax vpd does;
+# measured -8% on vpd solo at stronger settings). RSS caps unchanged.
+export KLIO_GC_GROWTH="${KLIO_GC_GROWTH:-4}"
+export KLIO_GC_THRESHOLD_KB="${KLIO_GC_THRESHOLD_KB:-65536}"
 
 # Green-tree memo (fail-OPEN): a stack that already ran green on this
 # exact tree content is a no-op. The key covers HEAD, every non-md

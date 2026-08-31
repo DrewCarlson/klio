@@ -65,14 +65,29 @@ overturned the opening estimate):
 - vpd SOLO A/B (harness-fast, gate env, 2026-08-31): wall 554s of
   which the TEST BODY is 537s (compile+setup only 17s — pinned images
   can't help it); KLIO_JIT=1 is NEGATIVE (573s wall / 557s body),
-  re-confirming the compose loop-JIT memory. vpd's floor is 537s of
-  measured-exhausted recomposition throughput. Stack arithmetic: with
-  zero co-scheduling penalty the stack bottoms at ~577-600s, so the
-  remaining levers are isolation (core-pinning vpd) and lead trim,
-  nothing else. Trap that cost two A/B attempts: a solo vpd run needs
-  the gate's FULL env (kotlinx_coroutines_test_default_timeout=900s +
+  re-confirming the compose loop-JIT memory. Trap that cost two A/B
+  attempts: a solo vpd run needs the gate's FULL env
+  (kotlinx_coroutines_test_default_timeout=900s +
   KLIO_TEST_WALL_CAP_FOR=validatePotentialDeadlock=645 +
   KLIO_MAX_WORKERS=5) or it dies at ~300s with a bare `exception`.
+- vpd GC vein (KLIO_PROF on the solo body): `shade` 6.7% + alloc
+  paths + libc = ~15-20% GC/alloc tax under the test-mode tracing GC.
+  Appel relaxation recovers it: KLIO_GC_GROWTH=4 +
+  KLIO_GC_THRESHOLD_KB=128M -> 525s; GROWTH=8 + 512M floor -> 510s
+  wall / 494s body (-8% total, diminishing beyond). Landed: strong
+  setting on the vpd child via argv env; moderate (4 / 64M) exported
+  stack-wide — census suites pay the same marking tax. RSS caps
+  unchanged; correctness untouched (same tests, caps, ceilings).
+- vpd IN-STACK is LLC/bandwidth-bound, not CPU-bound: it runs 5
+  threads at ~105% CPU; core-pinning it to idle reserved cores still
+  gave 652-653s (twice) while a controlled 2-minute-load pinned run
+  gave 564s — the inflation tracks the DURATION of co-running
+  interpreter load (~+90s under the full census window), which no
+  scheduler knob removes on a shared LLC.
+- Threaded-litmus under load: tl_cancel_via_coroutine_context lost a
+  pre-cancel dispatch (fixture legitimately racy — `yield()` is not a
+  barrier); passes solo. stack.sh now runs litmus in vpd's quiet tail
+  (after the census build drains), where the box is idle.
 
 ## Task 1 — measure where every minute goes (no guessing)
 
