@@ -47,30 +47,39 @@ generated code can carry
   across fifty statements),
 - direct C-to-C calls with light frame-open for bodies the transpiler
   proves closed (no dispatch escape, no suspension).
-Do it measure-first: transpile the replica and one compute-heavy gate
-body (a SlotTable benchmark test program), count the kv_ call sites the
-hot view could absorb (a static census, no codegen), and only then
-implement absorption in call-count order. TRAPS carried from the
-C-transpiler campaign: ids need the PINNED image artifact (bakes are
-not cross-process id-stable); the initial thread needs the 256MB runCli
-stack (GNU_STACK size is ignored); KLIO_NATIVE_TRACE is the engagement
-oracle. Exit: a measured speedup on a transpiled compute body (target:
-2x+ on a benchmark-shaped corpus program — anything less means the ABI
-was not actually escaped), or closure by a census showing the absorbable
-call share is too small.
+MEASURED 2026-08-31 — THE ROAD IS ALREADY DRIVEN: the emitter's
+scalar-replay `kl_` pass (leafEligible + call-closure fixpoint +
+emitLeafFunc) IS the direct C-to-C sub-ABI — unboxed int64+group locals,
+direct recursive C calls, no frames, kv_edge safe-point polls only. A
+fib(30)x5 corpus-shaped bench, byte-identical output: native 60ms vs
+2073ms interpreted JIT-off (**34.5x**) and 594ms with the function JIT
+on (**9.9x over the best interpreter tier**). The recorded stage-3 "wash"
+(2.78 vs 2.71s) predates the kl_ pass; the exit condition (2x+) is met
+17x over. Engagement verified via KLIO_NATIVE_TRACE (main native, the
+call sites dispatch native) and the wall itself. Remaining: the corpus
+parity re-run on this session's interpreter (in flight), then this task
+records DONE — the ABI is escaped where the program shape allows, and
+the compose gate is out of scope by construction (tests run through
+`klio test`, never a transpiled binary).
+TRAPS carried: ids need the PINNED image artifact; 256MB runCli stack;
+KLIO_NATIVE_TRACE oracle; libzstd.a must be the ReleaseFast build or
+the link fails on ubsan runtime symbols (rebuild via
+`zig build zstd-lib -Doptimize=ReleaseFast`).
 
 ## Task 2 — Value 24B -> 16B (stage 5b, measure-first)
 
-The value-layout campaign closed at 56B -> 40B -> 24B with stage 5b
-(16B: tag-in-pointer or split-bank encoding) recorded measure-first.
-Value size taxes EVERYTHING: frame register files, capture vectors,
-field storage, argument copies (`copyFixedLength` in every profile).
-First measure the ceiling: instrument (or estimate from the existing
-profiles) the share of replica time in Value moves/copies at 24B, and
-prototype the 16B encoding's decode cost on the hottest read path
-before committing to the representation change. This is a land-big
-change if it goes: every Value producer/consumer sees the layout. Exit:
-banked wall win, or the ceiling measurement recorded as too small.
+CLOSED BY MEASUREMENT 2026-08-31, on the value-layout campaign's own
+recorded terms (its stage 5c deferral: "re-open when a measurement
+motivates it, and gate any candidate on the compose plugin suite wall").
+No motivating measurement exists: the attributable copy bucket
+(copyFixedLength ~1% + bounded inline 24B moves) ceilings at ~2-3% of
+the replica, and the 24 -> 16 tail REQUIRES boxing IrClosure — an
+allocation added to compose's hottest creation path (closures built per
+execution) — so the gate-facing net is implausibly negative given this
+campaign's uniform memory-side results (every memory A/B neutral or
+worse). Stage 5c stays deferred in `plans/value-layout-campaign.md`
+with these terms; re-open only with a profile that names Value copies
+above threshold.
 
 ## Task 3 — frame-push traffic (35% of dispatch events)
 
