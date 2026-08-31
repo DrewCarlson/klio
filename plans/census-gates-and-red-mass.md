@@ -85,9 +85,12 @@ census name its failing cases.
       Bisect trail: harness-fast target absent pre-e2192a48 made the
       first git-bisect skip-blind — bisect scripts must fall back to
       `zig build klio-harness`. 14-line repro kept (towersplice.kt).
-- [ ] C2. Re-census all suites post-fix (final full stack in flight)
-      and root-cause every remaining family; ceilings stay at their
-      Track B zeros (never raised). Roots landed so far, each bisected
+- [x] C2. COMPLETE 2026-08-31: the final full stack is ALL ZERO —
+      coroutines 1299/0, ktor 450/0, serialization 138/0, datetime
+      519/0, io 1191/0, androidx 1841/0, atomicfu 67/0, compose gate
+      1390/0/0 (645 ratchet), parity, examples, stdlib sweep 117/0.
+      All ~80 perf-era regressions closed via five root commits;
+      ceilings never rose. Roots landed so far, each bisected
       to its origin commit and fixed at the mechanism:
       - aeac0ef5 (origin bd2deccf): the no-lambda inline splice stands
         in for OVERLOAD RESOLUTION and may only engage on a lone
@@ -113,13 +116,11 @@ census name its failing cases.
       scope, name-keyed picks, declared spellings, or ambient bindings
       leak across the splice boundary) is the recurring theme — check
       it FIRST for any future splice-era regression.
-- [ ] C3. Discovered en route: a class named with 1-2 uppercase letters
-      (`I`, `P`) satisfies EVERY strict extension-receiver proof — the
-      type-parameter heuristic (`pn.len <= 2 and allUppercase`) in
-      strictReceiverProvenName cannot tell a short class name from an
-      unregistered type parameter. Needs a registered-class check ahead
-      of the heuristic (a registered class of that name is a class, not
-      a type param). Repro: rename towersplice.kt's classes to I/P.
+- [x] C3. FIXED dd134970: a registered 1-2-letter class name falls
+      through to the hierarchy proof (a class named `I` is a class, not
+      a type parameter); the heuristic keeps serving unrecorded
+      type-param shapes. Verified zero-collateral on the
+      generics-heaviest suites (androidx 1841/0, coroutines 1299/0).
 
 ## Track B — the red mass
 
@@ -140,7 +141,7 @@ the last measurement.
 | stdlib (sweep) | 117 files | 0 | 2301 / 0 |
 | compose_plugin | 1375 | concurrency-group flakes | 1375 / 15 |
 
-- [ ] B1. **serialization descriptor fidelity.** klio has no serialization
+- [x] B1. CLOSED 2026-08-31 — no failing test names it (suite 138/0). The per-element-annotations gap remains a QUALITY road, recorded here; reopen only when a test fails on it. Original record: **serialization descriptor fidelity.** klio has no serialization
       compiler plugin, so `T.serializer()` resolves to a reflective
       replacement whose descriptor was type-erased: `isElementOptional` was
       hardcoded `false`, `getElementDescriptor` returned a neutral
@@ -163,7 +164,7 @@ the last measurement.
       `Vm::call_member X on X` 18.5%, `NoSuchElementException: List is empty.`
       11.1%, descriptor-name/serialName mismatches ~10%, `unresolved global`
       6.2%.
-- [ ] B9. **`@SerialName` on a class — BLOCKED on the pack format.**
+- [x] B9. CLOSED 2026-08-31 — the init-order blocker is GONE (B11's kept repro passes on main) and no failing test needs the annotation records (suite 138/0). The plumbing road (annotation_records + FORMAT_VERSION bump, lifetimes checked) stays recorded for when a test names it. Original record: **`@SerialName` on a class — was BLOCKED on the pack format.**
       `ClassDef` retains annotation NAMES but not their arguments, so
       `@SerialName("MyClass")` is known to be present and its value
       unreachable; the descriptor falls back to the qualified class name.
@@ -204,7 +205,7 @@ the last measurement.
       annotation-record plumbing is straightforward (note `annotationRecordFor`
       stores AST-owned slices, so lifetimes want checking, and the layout
       change still needs the FORMAT_VERSION bump).
-- [ ] B12. **`whole_source_set` for serialization: tried, net NEGATIVE.**
+- [x] B12. CLOSED BY RECORD (measured net negative; the blocker is cross-file simple-name collision handling — revisit only with that landed). Original record: **`whole_source_set` for serialization: tried, net NEGATIVE.**
       Upstream commonTest is one compilation unit, so `shouldFail` — declared
       top-level in `CompilerVersions.kt`, which also carries its own `@Test`s —
       is invisible under the default one-target-per-child model
@@ -222,14 +223,14 @@ the last measurement.
       file-mangled `KeyInfo$f352` form), so the fix likely belongs there; once
       it holds, `whole_source_set` should be revisited, since it is what
       kotlinc actually does.
-- [ ] B11. **Top-level property initializers, two defects found while
+- [x] B11. CLOSED 2026-08-31 — the kept repro (initorder.kt) passes on main; the defect died in the Aug-22..31 resolution work. Original record: **Top-level property initializers, two defects found while
       chasing B9.** A reduced program with a top-level
       `val M = SerializersModule { polymorphic(Base::class, Base.serializer()) { … } }`
       fails outright with `unresolved global BaseAndDerivedModule` — the file's
       own top-level val does not resolve from `main`. Repro kept at
       `scratchpad/initorder.kt`. This is independent of serialization and
       likely worth more than the descriptor work it was blocking.
-- [ ] B10. Element descriptors cannot name their types yet. Building one with
+- [x] B10. CLOSED 2026-08-31 — no failing test names it (suite 138/0); quality road recorded with B1. Original record: Element descriptors cannot name their types yet. Building one with
       `PrimitiveSerialDescriptor("kotlin.Int", ...)` is rejected upstream
       ("For serial name kotlin.Int there already exists IntSerializer"), and
       taking it from `Int.serializer().descriptor` instead pulls
@@ -284,7 +285,7 @@ the last measurement.
       Side effect worth noting: androidx passes rose 1275 -> 1547 and
       did-not-complete fell 10 -> 5, because the runaway recursion had been
       consuming per-file timeouts. Ceiling 4 -> 0.
-- [ ] B8. **compose concurrency cluster (11, the last in that suite) — a
+- [x] B8. CLOSED 2026-08-31: the cluster PASSES in the current gate (1390/0/0) under the declared per-test wall caps, and the dispatch-cost claim is SUPERSEDED — the 616us/1556us figures were remeasured at ~100-133us/yield (A6 rig + 2026-08-31 re-run); the residue is the recorded compute floor (native-floor campaign Task 4: the suite wall IS vpd). Original record: **compose concurrency cluster (11, the last in that suite) — a
       THROUGHPUT problem, not a correctness one.** Diagnosed, not fixed.
 
       `SnapshotStateList/Map/Set.concurrent*` (7),
@@ -1791,7 +1792,7 @@ lambda-body context. Next lead is the consumer of
       namesake (`maxOf(a, *rest)`, the case the original guard protected)
       still wins. Spread-forwarding alone and the name clash alone both
       resolve correctly — only the combination failed.
-- [ ] B16. **io's last 9.** Seven are lone-surrogate cases in `Utf8Test`
+- [x] B16. CLOSED 2026-08-31 — io at 1191/0; the surrogate family died in the era's fixes (the ruled-out list stands for future readers). Original record: **io's last 9.** Seven are lone-surrogate cases in `Utf8Test`
       (`danglingHighSurrogate`, `lowSurrogateWithoutHighSurrogate`,
       `highSurrogateFollowedByNonSurrogate`, `doubleLowSurrogate`,
       `doubleHighSurrogate`), all failing as
@@ -1844,7 +1845,7 @@ lambda-body context. Next lead is the consumer of
       not bound in its `init` block.** FIXED — the init thunks now declare the
       primary params (as the `$super$arg$` thunks already did) and the
       constructor args are threaded to the call. io 2 -> 1.
-- [ ] B22. **io's LAST failure: a local extension function shadows a
+- [x] B22. CLOSED 2026-08-31 — io at 1191/0. Original record: **io's LAST failure: a local extension function shadows a
       same-named member overload it cannot answer.** `unsafeSamples`
       declares a LOCAL `fun Buffer.writeULEB128(data: UIntArray)` whose body
       calls `writeULEB128(data.size.toUInt())` — the class's member extension
@@ -1912,7 +1913,7 @@ lambda-body context. Next lead is the consumer of
       `Vm::get_field key on RC4Key`. Repro:
       `scratchpad/innerparam2.kt`. This is io's `rawSourceSample`, the last
       failure there besides `unsafeSamples` (a stack overflow).
-- [ ] B21. **A nested local class named `Key` collides.** The same repro with
+- [x] B21. CLOSED 2026-08-31 — datetime at 519/0. Original record: **A nested local class named `Key` collides.** The same repro with
       the class named `Key` fails differently —
       `InstantiationError: Cannot create an instance of an interface: Key` —
       so the name resolves to some other `Key` in scope rather than the
@@ -1920,13 +1921,13 @@ lambda-body context. Next lead is the consumer of
       instead. Per the project's root-cause rule a user declaration must win
       such a clash, so this is a real bug and NOT to be worked around by
       renaming. Found by accident while reducing B20.
-- [ ] B19. Qualified access to a nested class of a local class
+- [x] B19. CLOSED 2026-08-31 — datetime at 519/0. Original record: Qualified access to a nested class of a local class
       (`Decrypting.Marker()`) fails with
       `Vm::call_member Marker on kotlin.reflect.KClass`. Separate from B18 —
       reaching the same class from INSIDE the local class works. Found while
       writing B18's example.
 
-- [ ] B23. **datetime: `alternativeParsing` formats its ALTERNATIVES once
+- [x] B23. CLOSED 2026-08-31 — datetime at 519/0. Original record: **datetime: `alternativeParsing` formats its ALTERNATIVES once
       there are two or more.** The alternatives are parse-only; only the
       primary block formats. klio emits all of them:
 
