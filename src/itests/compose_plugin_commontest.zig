@@ -487,8 +487,11 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             // every sibling child is spawned under nice so vpd's threads
             // keep the scheduler wherever masks overlap (siblings had
             // inflated the wall 554s solo -> 633s in-suite).
-            if ((std.Thread.getCpuCount() catch 1) >= 16)
+            if (std.c.getenv("KLIO_VPD_CPUS")) |cpus| {
+                try solo.appendSlice(a, &.{ "taskset", "-c", std.mem.span(cpus) });
+            } else if ((std.Thread.getCpuCount() catch 1) >= 16) {
                 try solo.appendSlice(a, &.{ "taskset", "-c", "0-5" });
+            }
             // vpd's 537s body spends ~15-20% in GC (shade 6.7% + alloc
             // paths, measured): a relaxed Appel factor + floor takes the
             // solo body to 494s. The knobs are per-child via argv so the

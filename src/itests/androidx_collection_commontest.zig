@@ -82,6 +82,13 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
 /// Concurrent child count. Each child is one `klio test` process; the pool
 /// keeps the cores busy while the slowest files run.
 fn workerCount() usize {
+    // KLIO_ITEST_JOBS overrides, like the shared registry runner — the
+    // full-stack script bounds every suite to its share of the box.
+    if (std.c.getenv("KLIO_ITEST_JOBS")) |v| {
+        if (std.fmt.parseInt(usize, std.mem.span(v), 10) catch null) |n| {
+            if (n >= 1) return @min(n, 64);
+        }
+    }
     const cores = std.Thread.getCpuCount() catch 4;
     // Half the cores, capped low: suites run beside sweeps and editors,
     // and each child is itself a multi-threaded interpreter.
