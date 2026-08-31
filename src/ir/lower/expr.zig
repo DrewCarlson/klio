@@ -9672,6 +9672,14 @@ fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Functio
         // proofs read off the CALL; the splice would replace the call
         // with its body (`emptyList()`) and drop it. Keep those framed.
         if (has_explicit_type_args and !anyReified(f.type_params)) break :blk false;
+        // The splice stands in for OVERLOAD RESOLUTION, so it may only
+        // engage when resolution is trivial — a lone candidate under the
+        // name. Committing by name+inline picked the sole INLINE overload
+        // over its non-inline siblings: `plusAssign(element: E)` swallowed
+        // `plusAssign(elements: List<E>)` inside MutableObjectList.addAll
+        // (an unbounded E accepts the List, and the runtime rank that
+        // prefers the List form never ran).
+        if (b.module.funcsBySimpleName(nm).len != 1) break :blk false;
         for (f.params) |*p| {
             if (p.is_vararg) break :blk false;
         }
