@@ -365,44 +365,9 @@ pub fn register(h: *GcHeader, bytes: usize) void {
         return;
     }
     h.gc_bytes = std.math.lossyCast(u32, bytes);
-    // Thread-local nursery segment, spliced into the shared list in batches.
-    // The unbatched form took the global `reg_lock` and RMW'd the shared
-    // trigger counter PER ALLOCATION — under concurrent mutators those two
-    // cachelines were the hottest in the run (the same lesson
-    // `noteExternalBytes` already banked for the external counters). A cell
-    // parked in an unflushed segment during a collection is simply not on
-    // the sweep list: it survives that cycle and joins the nursery at the
-    // next splice, so safety is unchanged; the trigger lags by at most one
-    // batch of bytes per thread.
-    h.gc_next = local_nursery;
-    local_nursery = h;
-    if (local_nursery_tail == null) local_nursery_tail = h;
-    local_nursery_count += 1;
-    local_nursery_bytes += bytes;
-    if (local_nursery_count >= REG_FLUSH_CELLS) flushLocalNursery();
-}
-
-threadlocal var local_nursery: ?*GcHeader = null;
-threadlocal var local_nursery_tail: ?*GcHeader = null;
-threadlocal var local_nursery_count: u32 = 0;
-threadlocal var local_nursery_bytes: usize = 0;
-const REG_FLUSH_CELLS: u32 = 64;
-
-/// Splice this thread's nursery segment into the shared registry and push its
-/// byte delta into the trigger counter. Called on the batch cadence, at
-/// worker-thread exit (`gcThreadExit`), and by the collector for its own
-/// thread before it marks.
-pub fn flushLocalNursery() void {
-    const head = local_nursery orelse return;
-    const tail = local_nursery_tail.?;
-    local_nursery = null;
-    local_nursery_tail = null;
-    local_nursery_count = 0;
-    const bytes = local_nursery_bytes;
-    local_nursery_bytes = 0;
     reg_lock.lock();
-    tail.gc_next = nursery;
-    nursery = head;
+    h.gc_next = nursery;
+    nursery = h;
     reg_lock.unlock();
     const prev = bytes_since_gc.fetchAdd(bytes, .monotonic);
     if (prev + bytes >= threshold) gc_pending.store(true, .monotonic);
@@ -795,15 +760,6 @@ fn parkForStop() void {
     // sees no stop simply returns and parks at its next safe point, which
     // the collector waits for.
     if (!stop_flag.load(.acquire)) return;
-    // The local nursery segment must join the shared list BEFORE this thread
-    // counts as stopped: the mark begins once every mutator is parked, and a
-    // cell left in a threadlocal segment across a collection is a
-    // reachability hole — its parent can PROMOTE in that collection, after
-    // which a minor mark stops at the (unmutated) tenured parent and the
-    // next sweep frees the still-live child. The collector holds no
-    // `reg_lock` while it waits for the rendezvous, so the splice cannot
-    // deadlock.
-    flushLocalNursery();
     // Counted for THIS stop only; the next stop's raise resets the tally,
     // so there is no decrement to lag behind the loop exit.
     _ = stopped_count.fetchAdd(1, .acq_rel);
@@ -871,10 +827,6 @@ fn parkUnpublish() void {
 
 pub fn enterBlockingSafe() void {
     if (!gc_enabled) return;
-    // A blocking-safe thread may sleep through whole collections; its
-    // segment must be on the shared list before it stops polling (it holds
-    // no unrooted values and allocates nothing until it exits the region).
-    flushLocalNursery();
     blocking_safe_depth += 1;
     parkPublish();
 }
@@ -966,12 +918,10 @@ fn collectImpl(force_major: bool) void {
     defer gc_lock.unlock();
     collector_tid.store(@bitCast(std.Thread.getCurrentId()), .release);
     defer collector_tid.store(0, .release);
-    // The collector's own buffered external delta and nursery segment join
-    // the shared state before the threshold math and sweep read them (other
-    // threads' buffers are unreachable threadlocals; their bounded lag is
-    // accepted — an unflushed cell is not on the sweep list and survives).
+    // The collector's own buffered external delta joins the shared counters
+    // before the threshold math reads them (other threads' buffers are
+    // unreachable threadlocals; their bounded lag is accepted).
     flushExternalDelta();
-    flushLocalNursery();
 
     // Stop the world: signal every other registered mutator to park at its next
     // safe point, then wait until all of them are parked (or in a blocking-safe

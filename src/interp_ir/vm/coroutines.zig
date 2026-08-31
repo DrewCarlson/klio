@@ -1572,7 +1572,6 @@ pub fn gcThreadEnter() void {
 pub fn gcThreadExit() void {
     if (!runtime.gc.gc_enabled) return;
     runtime.gc.flushExternalDelta();
-    runtime.gc.flushLocalNursery();
     runtime.gc.exitMutator();
     ir.eval.gcUninstallFrameRoot();
     runtime.gcUninstallKeepaliveRoot();
