@@ -85,9 +85,34 @@ census name its failing cases.
       Bisect trail: harness-fast target absent pre-e2192a48 made the
       first git-bisect skip-blind — bisect scripts must fall back to
       `zig build klio-harness`. 14-line repro kept (towersplice.kt).
-- [ ] C2. Re-census all six red suites post-fix (in flight) and
-      root-cause every remaining failure family; ceilings stay at their
-      Track B zeros (never raised).
+- [ ] C2. Re-census all suites post-fix (final full stack in flight)
+      and root-cause every remaining family; ceilings stay at their
+      Track B zeros (never raised). Roots landed so far, each bisected
+      to its origin commit and fixed at the mechanism:
+      - aeac0ef5 (origin bd2deccf): the no-lambda inline splice stands
+        in for OVERLOAD RESOLUTION and may only engage on a lone
+        candidate — the sole INLINE overload (plusAssign(element: E))
+        swallowed its non-inline List sibling; 26 androidx tests.
+      - e7754b8a (origin 41b35ffd): member-inline splices park the
+        caller member scope so call-site lambda content sees the
+        CALLER's nesteds (a private nested TestException ctor fell to
+        runtime member dispatch); io's Unsafe pair.
+      - e50f8c3b (origin c44295ee): a declared param type mentioning
+        the fn's type params records nothing (KSerializer<T> stamped a
+        raw T into the reified channel; subclass() registered nothing);
+        serialization single.
+      - 7fb58485 (origin fa1dc55c era): receiver_is_owner may only
+        trust the splice head when the window BOUND the subject, and
+        the implicit-receiver walk probes members-only before imported
+        extension properties (Kotlin lexical priority — a class member
+        outranks an import; CoroutineScope.job was hijacking an
+        enclosing val job through a suspend lambda's ambient this);
+        coroutines single.
+      All four origins are Aug 24-29 receiver-splice-era commits: the
+      splice family's hygiene contract (windows must not let owner
+      scope, name-keyed picks, declared spellings, or ambient bindings
+      leak across the splice boundary) is the recurring theme — check
+      it FIRST for any future splice-era regression.
 - [ ] C3. Discovered en route: a class named with 1-2 uppercase letters
       (`I`, `P`) satisfies EVERY strict extension-receiver proof — the
       type-parameter heuristic (`pn.len <= 2 and allUppercase`) in
