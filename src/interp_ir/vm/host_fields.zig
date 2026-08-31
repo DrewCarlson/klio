@@ -3588,27 +3588,30 @@ fn fieldWriteCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []const u8
 /// slot holds one, else (re)define the field owning its own reference.
 fn storePlainField(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), store_name: []const u8, value: Value) Allocator.Error!UnitResult {
     _ = self;
-    const existing: ?Value = blk: {
-        const g = inst.borrow();
-        defer g.deinit();
-        break :blk g.get().get(store_name);
-    };
-    if (existing) |ev| {
-        if (ev == .Cell) {
-            const cg = ev.Cell.borrowMut();
-            defer cg.deinit();
-            if (runtime.reclaimEnabled()) {
-                value.retain();
-                cg.get().release(allocator);
-            }
-            cg.get().* = value;
-            return .{ .ok = {} };
-        }
-    }
+    // One borrow, one scan: the probe-then-define shape paid two of each per
+    // plain write on the memo-hit path (`define` re-scanned what `get` had
+    // already located).
     value.retain();
     const g = inst.borrowMut();
     defer g.deinit();
-    try g.get().define(allocator, store_name, value);
+    const b = g.get();
+    for (b.fields.items) |*f| {
+        if (f.name.ptr == store_name.ptr or std.mem.eql(u8, f.name, store_name)) {
+            if (f.value == .Cell) {
+                const cg = f.value.Cell.borrowMut();
+                defer cg.deinit();
+                if (runtime.reclaimEnabled()) cg.get().release(allocator);
+                cg.get().* = value;
+                return .{ .ok = {} };
+            }
+            if (runtime.reclaimEnabled()) f.value.release(allocator);
+            f.value = value;
+            return .{ .ok = {} };
+        }
+    }
+    try b.ensureFieldsOwned(allocator, 1);
+    try b.fields.append(allocator, .{ .name = store_name, .value = value });
+    b.invalidateShape();
     return .{ .ok = {} };
 }
 
