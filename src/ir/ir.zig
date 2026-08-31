@@ -266,6 +266,13 @@ pub const Inst = union(enum) {
         /// site just stays on the slow path.
         site_cls: u64 = 0,
         site_route: u64 = 0,
+        /// The claiming receiver's LAYOUT identity (`InstanceData.shapeOf`)
+        /// recorded alongside a STORED route: when the live receiver matches
+        /// BOTH the class claim and this shape, the stored index provably
+        /// names the property and the per-hit name re-verify is skipped.
+        /// Shape alone is not a claim key — two classes can share a layout
+        /// while routing the same name differently (a custom getter on one).
+        site_shape: u64 = 0,
         /// Site verdict for serving a NULL stored slot: 0 = unasked, 1 = the
         /// property is an unset-`lateinit` shape the ladder must adjudicate,
         /// 2 = a plain null this site may serve.

@@ -4471,62 +4471,58 @@ fn leafWrite(allocator: Allocator, regs: []Value, r: Reg, v: Value, reclaim: boo
 /// cannot serve.
 fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype, recv: *const Value, fname: []const u8, pin: *?usize, regs: []Value, wmask: *u64) Allocator.Error!?Value {
     const claimed = @atomicLoad(u64, @constCast(&gf.site_cls), .acquire);
-    const shp: u64 = blk: {
+    const cls: u64 = blk: {
         const g = recv.Instance.borrow();
         defer g.deinit();
-        break :blk g.get().shapeOf();
+        break :blk @intCast(g.get().class.identity());
     };
     if (claimed == 0) {
-        // First execution claims the site for the receiver's LAYOUT (shape)
-        // when the shared (class, name) memo already routes the read to a
-        // stored slot or to a getter that is itself a leaf. For a stored
-        // route the index/name pairing is proven under the same borrow the
-        // shape is read from, so the replay needs no per-hit verify.
+        // First execution claims the site for this class when the shared
+        // (class, name) memo already routes the read to a stored slot or to
+        // a getter that is itself a leaf. For a stored route the layout id
+        // is bound to the verified index under one borrow, so a replay
+        // matching BOTH class and shape skips the per-hit verify.
         if (host.fieldSiteRoute(recv, fname)) |route| {
             const usable = switch (route.route & 3) {
                 1, 3 => true,
                 2 => host.fieldGetterIsLeaf(@enumFromInt(route.route >> 2)),
                 else => false,
             };
-            const claim: u64 = blk2: {
+            const shp: u64 = blk2: {
                 const g = recv.Instance.borrow();
                 defer g.deinit();
                 const b = g.get();
-                if (route.route & 3 == 1) {
-                    const idx2: usize = @intCast(route.route >> 2);
-                    if (idx2 >= b.fields.items.len) break :blk2 runtime.SHAPE_NONE;
-                    const f2 = &b.fields.items[idx2];
-                    if (!std.mem.eql(u8, f2.name, fname) and !leafSgetterMatches(fname, f2.name)) break :blk2 runtime.SHAPE_NONE;
-                }
-                break :blk2 b.shapeOf();
+                if (route.route & 3 != 1) break :blk2 0;
+                const idx2: usize = @intCast(route.route >> 2);
+                if (idx2 >= b.fields.items.len) break :blk2 0;
+                const f2 = &b.fields.items[idx2];
+                if (!std.mem.eql(u8, f2.name, fname) and !leafSgetterMatches(fname, f2.name)) break :blk2 0;
+                const sp = b.shapeOf();
+                break :blk2 if (sp > 1) sp else 0;
             };
-            if (usable and claim > 1 and
-                @cmpxchgStrong(u64, @constCast(&gf.site_cls), 0, claim, .acq_rel, .monotonic) == null)
+            if (usable and
+                @cmpxchgStrong(u64, @constCast(&gf.site_cls), 0, route.cls, .acq_rel, .monotonic) == null)
             {
+                if (shp != 0) @atomicStore(u64, @constCast(&gf.site_shape), shp, .monotonic);
                 @atomicStore(u64, @constCast(&gf.site_route), route.route, .release);
             }
         }
         return null;
     }
     // A POLYMORPHIC site (`op.ints` inside `Operations.pushOp`, where `op` is
-    // any of the changelist's ~40 Operation subclasses) claims one layout and
+    // any of the changelist's ~40 Operation subclasses) claims one class and
     // then sees another on nearly every call. Declining there sent the whole
     // body — one of the hottest in a recomposition — to the frame path
     // forever. The per-site claim is only a fast path: on a miss, ask the
     // shared (class, name) memo, which answers from its own cache — its
     // index is NOT shape-checked, so that path keeps the name verify.
     var route = @atomicLoad(u64, @constCast(&gf.site_route), .acquire);
-    var shape_hit = true;
-    if (claimed != shp) {
+    var mono_claim = true;
+    if (claimed != cls) {
         const alt = host.fieldSiteRoute(recv, fname) orelse return null;
-        const cls: u64 = blk: {
-            const g = recv.Instance.borrow();
-            defer g.deinit();
-            break :blk @intCast(g.get().class.identity());
-        };
         if (alt.cls != cls) return null;
         route = alt.route;
-        shape_hit = false;
+        mono_claim = false;
     }
     // A property whose backing is another leaf property chains through it:
     // the callee is pure by construction, so re-running it if this serve is
@@ -4544,14 +4540,15 @@ fn leafStoredField(comptime H: type, allocator: Allocator, host: *H, gf: anytype
     const idx: usize = @intCast(route >> 2);
     const g = recv.Instance.borrow();
     defer g.deinit();
-    // The shape was read under an earlier borrow; a define between the two
-    // resets the memo word, so an unchanged word under THIS borrow proves
-    // the layout the claim describes is the one being read.
-    if (shape_hit and g.get().shape.load(.acquire) != claimed) return null;
-    const fields = g.get().fields.items;
+    const b = g.get();
+    const fields = b.fields.items;
     if (idx >= fields.len) return null;
     const f = &fields[idx];
-    if (!shape_hit and !std.mem.eql(u8, f.name, fname) and !leafSgetterMatches(fname, f.name)) return null;
+    // A mono claim whose recorded LAYOUT matches the live receiver proves
+    // the index; anything else pays the name verify.
+    const shape_ok = mono_claim and
+        @atomicLoad(u64, @constCast(&gf.site_shape), .monotonic) == b.shapeOf();
+    if (!shape_ok and !std.mem.eql(u8, f.name, fname) and !leafSgetterMatches(fname, f.name)) return null;
     const v = f.value;
     if (v == .Null or v == .Delegate) return null;
     // Owned on the way out, matching the getter branch above: the register
@@ -9445,11 +9442,7 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                     const g = recv.Instance.borrow();
                     defer g.deinit();
                     const b = g.get();
-                    // The claim is the receiver's LAYOUT identity (shape), so
-                    // a match proves the stored index still names this
-                    // property — no per-hit name re-verify, and layout drift
-                    // (a dynamic define) misses instead of misreading.
-                    if (w0 != b.shapeOf()) {
+                    if (w0 != @as(u64, @intCast(b.class.identity()))) {
                         site_mismatch = true;
                         break :fast;
                     }
@@ -9459,6 +9452,13 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                         const idx: usize = @intCast(route >> 2);
                         if (idx >= b.fields.items.len) break :fast;
                         const f = &b.fields.items[idx];
+                        // A recorded LAYOUT match proves the index names this
+                        // property; only a drifted layout (dynamic define)
+                        // pays the name re-verify. The claim key stays the
+                        // CLASS — two classes can share a layout while
+                        // routing the same name differently.
+                        if (@atomicLoad(u64, @constCast(&gf.site_shape), .monotonic) != b.shapeOf() and
+                            !sameFieldName(f.name, name)) break :fast;
                         const v = f.value;
                         if (v == .Delegate) break :fast;
                         if (frame_count_on) gf_mono += 1;
@@ -9579,22 +9579,24 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
                     // retry, or a warmup-executed hot site is pinned to the
                     // slow ladder for the whole run.
                     if (host.fieldSiteRoute(&recv, name)) |r| {
-                        // Bind (shape, route) under ONE borrow: for a stored
-                        // route, the index and the name it serves are proven
-                        // against the very layout the claim records — the
-                        // per-hit verify this claim retires did that job.
-                        const shp = blk: {
+                        // For a stored route, bind (shape, index, name) under
+                        // ONE borrow — the layout id recorded is exactly the
+                        // one the index was verified against, so the replay's
+                        // shape match can retire the per-hit verify. The
+                        // CLAIM key stays the class.
+                        const shp: u64 = blk: {
                             const g2 = recv.Instance.borrow();
                             defer g2.deinit();
                             const b2 = g2.get();
-                            if (r.route & 3 == 1) {
-                                const idx2: usize = @intCast(r.route >> 2);
-                                if (idx2 >= b2.fields.items.len) break :blk runtime.SHAPE_NONE;
-                                if (!sameFieldName(b2.fields.items[idx2].name, name)) break :blk runtime.SHAPE_NONE;
-                            }
-                            break :blk b2.shapeOf();
+                            if (r.route & 3 != 1) break :blk 0;
+                            const idx2: usize = @intCast(r.route >> 2);
+                            if (idx2 >= b2.fields.items.len) break :blk 0;
+                            if (!sameFieldName(b2.fields.items[idx2].name, name)) break :blk 0;
+                            const sp = b2.shapeOf();
+                            break :blk if (sp > 1) sp else 0;
                         };
-                        if (shp > 1 and @cmpxchgStrong(u64, @constCast(&gf.site_cls), 0, shp, .acq_rel, .monotonic) == null) {
+                        if (@cmpxchgStrong(u64, @constCast(&gf.site_cls), 0, r.cls, .acq_rel, .monotonic) == null) {
+                            if (shp != 0) @atomicStore(u64, @constCast(&gf.site_shape), shp, .monotonic);
                             if (r.route != 0) @atomicStore(u64, @constCast(&gf.site_route), r.route, .release);
                         }
                     }
