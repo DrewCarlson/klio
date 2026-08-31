@@ -48,7 +48,11 @@ overturned the opening estimate):
   test-mode suppression bug. Per-test SPLITTING is the lever that
   works: `split_files` in the suite registry emits one child per @Test
   for named files; datetime census 168s -> 128s, same 519/0. Floor is
-  now fromEpochDays' own 100s of interpreted content.
+  now fromEpochDays' own 100s of interpreted content. With split
+  children FRONT-SCHEDULED (they carry the longest tests): **121s /
+  519-0**, measured pinned to 26 cores under nice 15 while vpd held
+  six cores — the WORST single suite is under the 2-minute target even
+  under adverse load.
 - Coroutine dispatch macro-costs (klio-harness-fast, 2026-08-31):
   yield 92us, launch+join 389us, fan-out dispatch 203us. KLIO_PROF on
   the bench is FLAT (libc 7%, fetchAdd 5.7%, eqlBytes 4.5%, rest dust)
@@ -58,6 +62,17 @@ overturned the opening estimate):
   (atomicfu 12ms .. engine 1.1s) — pack baking is NOT a sink on the
   gate path; the warm-stack floor is vpd under census contention
   (626-646s vs 540-562s solo).
+- vpd SOLO A/B (harness-fast, gate env, 2026-08-31): wall 554s of
+  which the TEST BODY is 537s (compile+setup only 17s — pinned images
+  can't help it); KLIO_JIT=1 is NEGATIVE (573s wall / 557s body),
+  re-confirming the compose loop-JIT memory. vpd's floor is 537s of
+  measured-exhausted recomposition throughput. Stack arithmetic: with
+  zero co-scheduling penalty the stack bottoms at ~577-600s, so the
+  remaining levers are isolation (core-pinning vpd) and lead trim,
+  nothing else. Trap that cost two A/B attempts: a solo vpd run needs
+  the gate's FULL env (kotlinx_coroutines_test_default_timeout=900s +
+  KLIO_TEST_WALL_CAP_FOR=validatePotentialDeadlock=645 +
+  KLIO_MAX_WORKERS=5) or it dies at ~300s with a bare `exception`.
 
 ## Task 1 — measure where every minute goes (no guessing)
 
@@ -97,16 +112,20 @@ the gate at normal priority and everything else under `nice -n 15` in
 a concurrent second `zig build`, so vpd's threads win the scheduler
 while the census suites stretch into vpd's tail slack.
 
-## Task 4 — caching across the stack
+## Task 4 — caching across the stack (DONE 2026-08-31)
 
-- Pack bakes: content-addressed and reused across `zig build`
-  invocations (the "every zig build = full re-bake" trap dies).
-- Baked base images for test children: a census run's children share
-  one pinned image instead of re-lowering the world (the transpiler's
-  pinned-image machinery is the precedent).
-- Suite-level result caching keyed on (tree hash, suite): an unchanged
-  suite on an unchanged tree is a no-op — the full stack after a
-  plans-only commit should cost seconds.
+- Suite-level result caching LANDED as the stack.sh green-tree memo:
+  a content key over HEAD + non-md tracked changes + untracked non-md
+  files; a stack that already ran green on identical content
+  short-circuits to `cached-green` in under a second (verified).
+  Fail-OPEN (any key error = run); STACK_NO_CACHE=1 forces.
+- Pack bakes: CLOSED by measurement — all five gate packs build in
+  2.2s total warm; not a sink anywhere on the stack path (census
+  suites install once per run into their scratch homes).
+- Pinned base images for census children: NOT NEEDED for the targets —
+  the worst suite is at 121s with compile shares already overlapped,
+  and vpd's compile+setup is 17s of its 554s. Recorded as an available
+  lever only.
 
 ## Task 5 — the production-runtime share of the floor (CLOSED by
 measurement 2026-08-31)

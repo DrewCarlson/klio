@@ -30,7 +30,22 @@ if [ -z "${STACK_NO_CACHE:-}" ] && [ -n "$tree_key" ] && [ -f "$cache_file" ]   
   echo "stack: cached-green (tree unchanged since last green run; STACK_NO_CACHE=1 to force)"
   exit 0
 fi
-gate_steps=(itest-compose_plugin_commontest itest-parity_threaded_litmus)
+# On a big box, cores 0-5 are reserved for the gate's vpd child (the
+# 537s wall): both builds and all their children stay off them via
+# taskset; the gate binary launches vpd itself with an explicit 0-5
+# mask that overrides the inherited one.
+pin=()
+nproc=$(nproc 2>/dev/null || echo 1)
+if [ "$nproc" -ge 16 ] && command -v taskset >/dev/null; then
+  pin=(taskset -c "6-$((nproc-1))")
+fi
+# The threaded-parity litmus is a timing-sensitive oracle comparison:
+# under full-stack load its legitimately-racy fixtures skew
+# (tl_cancel_via_coroutine_context lost a pre-cancel dispatch), so it
+# runs in vpd's QUIET TAIL — after the census build drains, while vpd
+# finishes alone on its reserved cores.
+gate_steps=(itest-compose_plugin_commontest)
+tail_steps=(itest-parity_threaded_litmus)
 rest_steps=(
   itest-coroutines_commontest itest-datetime_commontest
   itest-serialization_commontest itest-io_commontest
@@ -39,21 +54,28 @@ rest_steps=(
 )
 s=$(date +%s)
 rest_log=$(mktemp)
-nice -n 15 zig build "${rest_steps[@]}" "$@" >"$rest_log" 2>&1 &
+gate_log=$(mktemp)
+"${pin[@]}" nice -n 15 zig build "${rest_steps[@]}" "$@" >"$rest_log" 2>&1 &
 rest_pid=$!
-gate_out=$(zig build "${gate_steps[@]}" "$@" 2>&1)
-gate_rc=$?
+"${pin[@]}" zig build "${gate_steps[@]}" "$@" >"$gate_log" 2>&1 &
+gate_pid=$!
 wait "$rest_pid"
 rest_rc=$?
+tail_out=$("${pin[@]}" zig build "${tail_steps[@]}" "$@" 2>&1)
+tail_rc=$?
+wait "$gate_pid"
+gate_rc=$?
 e=$(date +%s)
-printf '%s\n' "$gate_out"
+cat "$gate_log"
 cat "$rest_log"
+printf '%s\n' "$tail_out"
 rc=0
 [ $gate_rc -ne 0 ] && rc=1
 [ $rest_rc -ne 0 ] && rc=1
-if printf '%s\n' "$gate_out" | grep -qE "^error: '|exceeds the ceiling|transitive failure"; then rc=1; fi
-if grep -qE "^error: '|exceeds the ceiling|transitive failure" "$rest_log"; then rc=1; fi
-rm -f "$rest_log"
+[ $tail_rc -ne 0 ] && rc=1
+if grep -qE "^error: '|exceeds the ceiling|transitive failure" "$gate_log" "$rest_log"; then rc=1; fi
+if printf '%s\n' "$tail_out" | grep -qE "^error: '|exceeds the ceiling|transitive failure"; then rc=1; fi
+rm -f "$rest_log" "$gate_log"
 if [ $rc -eq 0 ] && [ -n "$tree_key" ]; then printf '%s' "$tree_key" >"$cache_file"; fi
 echo "stack: wall=$((e-s))s rc=$rc"
 exit $rc
