@@ -357,6 +357,12 @@ pub const CompiledLoop = struct {
     /// (borrowed, like object params); `param_idx` is the capture index.
     capture_loads: []ObjParamLoad = &.{},
     method_fields: []MethodFieldCheck = &.{},
+    /// The compile-time receiver's LAYOUT identity, bound to the verified
+    /// `method_fields` (index, name) pairs under one borrow. An entry whose
+    /// live receiver matches it skips the per-field name loop (`shape is not
+    /// a claim key` — the class guard above still runs; the shape only
+    /// licenses the verify skip).
+    guard_shape: u64 = 0,
     /// The return register to read from the LIVE FRAME on RETURN when the
     /// escape chain left it untyped (result_rt then describes the declared
     /// kind for the caller's rebox validation).
@@ -5077,6 +5083,28 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         for (field_pres.items, out2) |fp, *o| o.* = .{ .idx = fp.idx, .name = fp.name };
         break :blk out2;
     };
+    // Re-verify every (index, name) pair and read the layout id under ONE
+    // borrow: an entry matching this shape at run time provably has each
+    // name at its index, so the per-entry loop is skipped.
+    var guard_shape: u64 = 0;
+    if (is_method and method_fields_owned.len != 0) {
+        const gsh = params[0].Instance.borrow();
+        defer gsh.deinit();
+        const bsh = gsh.get();
+        var all_ok = true;
+        for (method_fields_owned) |mf| {
+            if (mf.idx >= bsh.fields.items.len or
+                !(bsh.fields.items[mf.idx].name.ptr == mf.name.ptr or std.mem.eql(u8, bsh.fields.items[mf.idx].name, mf.name)))
+            {
+                all_ok = false;
+                break;
+            }
+        }
+        if (all_ok) {
+            const sp = bsh.shapeOf();
+            if (sp > 1) guard_shape = sp;
+        }
+    }
     ok = true;
     return CompiledLoop{
         .exec = exec,
@@ -5108,6 +5136,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .obj_param_loads = obj_loads_owned,
         .capture_loads = cap_loads_owned,
         .method_fields = method_fields_owned,
+        .guard_shape = guard_shape,
         .result_reg_slot = result_reg_slot,
         .self_dbg_name = func.name,
         .allocator = a,
@@ -5142,11 +5171,16 @@ pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, 
             return null;
         }
         const g = params[0].Instance.borrow();
-        const items = g.get().fields.items;
-        for (self.method_fields) |mf| {
-            if (mf.idx >= items.len or !(items[mf.idx].name.ptr == mf.name.ptr or std.mem.eql(u8, items[mf.idx].name, mf.name))) {
-                g.deinit();
-                return null;
+        const bthis = g.get();
+        const items = bthis.fields.items;
+        // A layout match proves every (index, name) pair at once; a drifted
+        // or unshaped receiver pays the per-entry loop.
+        if (self.guard_shape == 0 or bthis.shapeOf() != self.guard_shape) {
+            for (self.method_fields) |mf| {
+                if (mf.idx >= items.len or !(items[mf.idx].name.ptr == mf.name.ptr or std.mem.eql(u8, items[mf.idx].name, mf.name))) {
+                    g.deinit();
+                    return null;
+                }
             }
         }
         slots[self.entry_fbase_slot] = @bitCast(@intFromPtr(items.ptr));
