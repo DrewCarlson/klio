@@ -20,8 +20,10 @@ TARGET_GB="${2:-60}"
 CACHE="$ROOT/.zig-cache"
 [ -d "$CACHE" ] || { echo "no cache at $CACHE"; exit 0; }
 
-if pgrep -f "zig build" >/dev/null 2>&1; then
-  echo "refusing to prune: a zig build is running against this tree" >&2
+# -x: match the zig binary itself, not wrappers whose command line
+# happens to contain the words (a pgrep -f self-match cost one run).
+if pgrep -x zig >/dev/null 2>&1; then
+  echo "refusing to prune: a zig process is running" >&2
   exit 1
 fi
 

@@ -1,8 +1,25 @@
 # Verification-latency campaign: the full stack in minutes, not hours
 
-STATUS 2026-08-31: IN PROGRESS — Tasks 1-2 DONE, Task 3 datetime+
-coroutines drilled to measured floors, gate-shielded stack landed
-(measuring).
+STATUS 2026-08-31: TARGETS MET — full stack 591s (9.9 min) warm,
+ALL GREEN (compose 1390/0, coroutines 1299/0/0, androidx 1841, every
+floor held); worst single suite 121s. All five tasks landed or closed
+by measurement below. Remaining: none.
+
+FINAL BUDGET TABLE (warm tree, 32-core / 2-L3-domain box):
+| piece                         | before      | after  |
+|-------------------------------|-------------|--------|
+| full stack (all suites+gate)  | ~2h habit / 710s one-shot | 591s |
+| vpd in-stack (the wall)       | 646s        | 532s   |
+| vpd solo (GC-relaxed)         | 554s        | 510s   |
+| datetime census               | 236s serial / 168s | 121s |
+| coroutines census             | 107s        | 107s   |
+| single-suite via klio-census  | itest link (minutes) | run only (11-121s) |
+| unchanged-tree stack          | full run    | <1s cached-green |
+The stack structure that lands it: vpd owns one whole L3 domain
+(KLIO_VPD_CPUS from sysfs; LLC eviction was the entire in-stack
+inflation), the rest runs on the other domain in two width-4 waves,
+litmus last and alone, GC Appel relaxation stack-wide (growth 4) and
+strong on vpd (growth 8).
 MANDATE (user, 2026-08-31, verbatim intent): a full verification cycle
 taking ~2 hours is unacceptable; the next major focus after the current
 correctness work is shaving it to a few minutes — addressed "completely
@@ -89,29 +106,22 @@ overturned the opening estimate):
   barrier); passes solo. stack.sh now runs litmus in vpd's quiet tail
   (after the census build drains), where the box is idle.
 
-## Task 1 — measure where every minute goes (no guessing)
+## Task 1 — measure where every minute goes (DONE)
 
-Instrument one full stack run with per-phase wall times split into:
-binary link / pack bake / per-child Kotlin lowering / test execution /
-scheduler idle, per suite. The coroutines suite gets a per-child
-breakdown (which children, how long, compile vs run). Deliverable: a
-budget table in this plan naming the top five sinks with minutes
-attached. Everything below executes in measured-sink order, biggest
-first.
+Delivered as the budget notes above (per-suite censuses instrumented
+with KLIO_CENSUS_TIMES, per-child attribution fixed for
+whole_source_set, vpd A/B'd solo/pinned/under-load/GC-relaxed). Every
+subsequent lever was executed in measured-sink order.
 
-## Task 2 — kill the per-suite binary links for iteration
+## Task 2 — kill the per-suite binary links for iteration (DONE)
 
-The ten itest binaries exist for CI isolation; iteration should never
-pay ten LLVM links. Build ONE census driver on the installed
-`klio-harness` (the commontest_support logic — file collection,
-provider closures, per-class children, ceilings — extracted into a
-runnable form: a `klio census <suite>` subcommand or a script driving
-the harness the way `plugin1.sh` already does for compose classes).
-Target: tree-change -> any single suite census = harness rebuild
-(~1 min) + run; zero itest links outside CI. The itest gates remain the
-CI/pre-commit instrument, unchanged.
+Landed as the shared suite registry (`commontest_support.suites` +
+`runSuiteNamed`) and the `klio-census` exe (`zig build klio-census`,
+runs any suite or `all` against the installed harness, zero itest
+links). Single-suite iteration = harness rebuild + 11-121s run. The
+itest binaries remain the CI/pre-commit instrument, unchanged.
 
-## Task 3 — suite structure (DONE for the measured walls)
+## Task 3 — suite structure (DONE)
 
 Coroutines census 107s (already under target). Datetime drilled: the
 wall was one child with two 100s+56s compute tests; `split_files`
