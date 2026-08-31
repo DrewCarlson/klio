@@ -53,7 +53,7 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         // reported. 1254 -> 1260 and 43 -> 37 after the vararg-vs-container
         // overload pick and non-callable evidence following a local's static
         // type. Measured solo: 1265 passed, 34 failed, 0 incomplete.
-        .baseline = 1260,
+        .baseline = 1285, // tightened 2026-08-31: every census at ZERO (red-mass closeout; solo 1299). Floor holds margin for fully-parallel stacks (64 workers on 32 cores dropped one child to DNC at 1288)
         // Bound the red mass too: a floor alone cannot see a fixed case
         // traded for a broken one. Measured solo: 137 failing, 6 not
         // completing. Lower these as fixes land, never raise them.
@@ -68,7 +68,7 @@ test "kotlinx.coroutines commonTest pass count holds at or above the ratchet bas
         // whose initializer is an ordinary function call (`val flow =
         // flowOf(...)` beside the `flow { … }` builder). Measured solo: 1110
         // passed, 104 failed, 6 did not complete. Held two above.
-        .max_failed = 37,
+        .max_failed = 0,
         .max_incomplete = 1,
     });
 }

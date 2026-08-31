@@ -40,8 +40,8 @@ test "kotlinx.serialization commonTest pass count holds at or above the ratchet 
         // of its helper file, `+=` on a nested container stopped flattening,
         // and a spliced inline extension started resolving against its own
         // receiver. Measured solo: 98 passed, 40 failed.
-        .baseline = 96,
-        .max_failed = 42,
+        .baseline = 138, // tightened 2026-08-31: every census at ZERO (red-mass closeout); floor holds margin for loaded test-all
+        .max_failed = 0,
         .max_incomplete = 0,
     });
 }

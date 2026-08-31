@@ -34,11 +34,11 @@ test "kotlinx.datetime commonTest pass count holds at or above the ratchet basel
         // no longer starving a target of the file its helpers live in.
         // Measured solo: 517 passed, 2 failed, after natural ordering
         // reached a user `Comparable` and the pack grew the TZif reader.
-        .baseline = 515,
+        .baseline = 519, // tightened 2026-08-31: every census at ZERO (red-mass closeout); floor holds margin for loaded test-all
         // 70 -> 59: a call binding by class id is now treated as a
         // construction, so `LocalDateTime(y, m, d, h, min)` reaches the
         // constructor instead of the published companion's `invoke`.
-        .max_failed = 3,
+        .max_failed = 0,
         .max_incomplete = 1,
     });
 }
