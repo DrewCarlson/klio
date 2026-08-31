@@ -1,6 +1,8 @@
 # Verification-latency campaign: the full stack in minutes, not hours
 
-STATUS 2026-08-31: NOT STARTED (queued behind the red-mass closeout).
+STATUS 2026-08-31: IN PROGRESS — Tasks 1-2 DONE, Task 3 datetime+
+coroutines drilled to measured floors, gate-shielded stack landed
+(measuring).
 MANDATE (user, 2026-08-31, verbatim intent): a full verification cycle
 taking ~2 hours is unacceptable; the next major focus after the current
 correctness work is shaving it to a few minutes — addressed "completely
@@ -36,6 +38,26 @@ overturned the opening estimate):
 - MEASUREMENT TRAP (cost this table its first draft): `rc=$?` must be
   captured BEFORE any further command (a date call overwrote it), and
   log-mtime timelines lie when the task queue defers the start.
+- Datetime CORRECTED: the wall child is LocalDateTest 168s (the first
+  census-time table mis-attributed targets under whole_source_set —
+  fixed), inside it fromEpochDays 100s + toEpochDays 56s. Both are
+  dispatch-heavy compute: direct A/B (same body, run mode AND test
+  mode, klio-harness) shows the loop JIT NEUTRAL on the
+  assertEquals-dominated shape (7.7s vs 8.2s over 200k iters) while a
+  ctor+equals shape does JIT 1.78x — the four-campaign law, not a
+  test-mode suppression bug. Per-test SPLITTING is the lever that
+  works: `split_files` in the suite registry emits one child per @Test
+  for named files; datetime census 168s -> 128s, same 519/0. Floor is
+  now fromEpochDays' own 100s of interpreted content.
+- Coroutine dispatch macro-costs (klio-harness-fast, 2026-08-31):
+  yield 92us, launch+join 389us, fan-out dispatch 203us. KLIO_PROF on
+  the bench is FLAT (libc 7%, fetchAdd 5.7%, eqlBytes 4.5%, rest dust)
+  — diffuse interpreter work, no dominating macro cost to extract. vpd
+  throughput is measured-exhausted per-op AND per-macro-op.
+- Compose-gate lead-in: the five pack builds cost 2.2s TOTAL warm
+  (atomicfu 12ms .. engine 1.1s) — pack baking is NOT a sink on the
+  gate path; the warm-stack floor is vpd under census contention
+  (626-646s vs 540-562s solo).
 
 ## Task 1 — measure where every minute goes (no guessing)
 
@@ -59,16 +81,21 @@ Target: tree-change -> any single suite census = harness rebuild
 (~1 min) + run; zero itest links outside CI. The itest gates remain the
 CI/pre-commit instrument, unchanged.
 
-## Task 3 — the coroutines suite's own structure
+## Task 3 — suite structure (DONE for the measured walls)
 
-Whatever Task 1 shows, the known shapes: children re-lower the same
-source closure per target; per-directory batching (compile once, run
-each) took the stdlib sweep from hours-shaped to minutes and is the
-proven template; suite children run with bounded workers but the
-scheduling may leave the box idle behind stragglers. Apply batching /
-warm shared images / worker tuning until the suite's cost is its TEST
-EXECUTION, then attack that (below). Target: the coroutines census
-within a few minutes on a warm tree.
+Coroutines census 107s (already under target). Datetime drilled: the
+wall was one child with two 100s+56s compute tests; `split_files`
+(per-@Test children over the same closure) landed it at 128s / 519-0.
+JIT-neutrality of the hot bodies established by direct A/B in both
+modes (budget notes above), so the residue is interpreted content, not
+machinery. Remaining structural lever if 128s must shrink: shared
+pinned base images per suite (Task 4) to cut each child's closure
+lowering.
+
+The full-stack critical path is the compose gate: stack.sh now runs
+the gate at normal priority and everything else under `nice -n 15` in
+a concurrent second `zig build`, so vpd's threads win the scheduler
+while the census suites stretch into vpd's tail slack.
 
 ## Task 4 — caching across the stack
 
@@ -103,14 +130,21 @@ Levers, measured-first per the standing law:
 
 ## Discovered items
 
-- [ ] WriterReaderTest.testWriterOnCancelled is a real cancellation-race
-      flake (ktor): `GlobalScope.writer(coroutineContext = cancelledJob)`
-      then `channel.readByte()` must throw CancellationException; klio
-      sometimes doesn't (3-of-4 failing solo, then 0-of-5 — both
-      directions observed 2026-08-31). The writer's cancellation close
-      races the first channel read. Root-cause in the utils.io
-      writer/channel bridge; the ktor ceiling of 1 absorbs exactly this
-      until then.
+- [x] WriterReaderTest.testWriterOnCancelled root-caused and FIXED
+      (2026-08-31): an UPSTREAM ktor ByteChannel race — `awaitContent`
+      rethrows the close cause at entry, but a `cancel(cause)` landing
+      between that check and `sleepWhile`'s condition makes the sleep
+      no-op and awaitContent return false with the cause swallowed, so
+      `readByte` throws EOFException instead of CancellationException.
+      Nanoseconds wide on the JVM, wide interpreted (3-of-8 solo).
+      Chased via a cloned writer builder with path markers: the
+      completion handler ran with the right cause and DID cancel the
+      channel, closedCause read back correct — only the reader's window
+      lost it. Fix: curated shim copy of ByteChannel.kt (upstream file
+      dropped from the klio.toml include list) adding one line — rethrow
+      when awaitContent returns short. 12-of-12 solo + 50-iteration
+      repro clean; ktor ratchet tightened 449/1 -> 450/0 (census 62s
+      link-free).
 - [ ] Full-parallel stacks oversubscribe (each suite spawns its own
       8-worker pool): one coroutines child DNC'd and two litmus tests
       wall-capped under 64 workers on 32 cores. A shared worker budget

@@ -37,7 +37,6 @@ include = [
     "io/ktor/utils/io/ByteReadChannel.kt",
     "io/ktor/utils/io/ByteWriteChannel.kt",
     "io/ktor/utils/io/BufferedByteWriteChannel.kt",
-    "io/ktor/utils/io/ByteChannel.kt",
     "io/ktor/utils/io/Exceptions.kt",
     "io/ktor/utils/io/CloseToken.kt",
     "io/ktor/utils/io/SourceByteReadChannel.kt",

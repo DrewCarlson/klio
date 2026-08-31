@@ -505,15 +505,12 @@ pub const suites = [_]Config{
             .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
             .{ .dir = "kotlin-klio/klio-ktor", .artifact = "target/packs/io.ktor.klio-pack" },
         },
-        // 449/1, NOT 450/0: WriterReaderTest.testWriterOnCancelled is a
-        // real cancellation-race flake (launch on an already-cancelled job;
-        // readByte races the channel's cancellation close — observed 3-of-4
-        // failing solo, then 0-of-5; both directions seen 2026-08-31). The
-        // ceiling of 1 absorbs exactly it until the race is root-caused
-        // (tracked in plans/verification-latency-campaign.md discovered
-        // items); every OTHER ktor failure still trips the gate.
-        .baseline = 449,
-        .max_failed = 1,
+        // The WriterReaderTest.testWriterOnCancelled flake was an upstream
+        // ByteChannel race (awaitContent swallowing a close cause that
+        // landed between its entry rethrow and the sleep condition), fixed
+        // in the curated shim copy of ByteChannel.kt.
+        .baseline = 450,
+        .max_failed = 0,
         .max_incomplete = 2,
     },
 };
