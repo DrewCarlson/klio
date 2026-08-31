@@ -2151,6 +2151,30 @@ fn spliceBail(fname: []const u8, why: []const u8) void {
     }
 }
 
+/// Whether an AST type reference mentions any of `f`'s declared type
+/// parameters anywhere in its tree (head, generic arguments, or function
+/// shape). Such a declared type is not a concrete fact about the spliced
+/// parameter — its meaning depends on the call's inference.
+fn astTypeMentionsFnTypeParam(ty: *const ast.TypeRef, f: *const ast.Function) bool {
+    for (f.type_params) |*tp| {
+        if (std.mem.eql(u8, tp.name.name, ty.name.name)) return true;
+    }
+    for (ty.type_args) |*ta| {
+        if (ta.is_star) continue;
+        if (astTypeMentionsFnTypeParam(&ta.ty, f)) return true;
+    }
+    if (ty.function) |fnty| {
+        if (fnty.receiver) |*r| {
+            if (astTypeMentionsFnTypeParam(r, f)) return true;
+        }
+        for (fnty.params) |*pp| {
+            if (astTypeMentionsFnTypeParam(pp, f)) return true;
+        }
+        if (astTypeMentionsFnTypeParam(&fnty.ret, f)) return true;
+    }
+    return false;
+}
+
 pub fn tryInlineCallWithTypeArgs(
     b: *FuncBuilder,
     fname: []const u8,
@@ -2798,6 +2822,13 @@ pub fn tryInlineCallWithTypeArgs(
                 // stayed framed pack-wide for want of a head. Same
                 // shadow-save discipline as the tp arm.
                 if (dh.len == 0) break :tp_arg;
+                // A concrete HEAD can still carry the fn's type params in
+                // its ARGUMENTS (`serializer: KSerializer<T>`): recording
+                // the declared spelling verbatim feeds a raw `T` to the
+                // reified derivations, which then lower `T::class` as a
+                // global read. Those params keep the argument-derived
+                // channel (record nothing here).
+                if (astTypeMentionsFnTypeParam(&p.ty, f)) break :tp_arg;
                 try param_ty_saves.append(b.allocator, .{
                     .name = p.name.name,
                     .ty = if (b.localDeclTypeRef(p.name.name)) |t| try t.clone(b.allocator) else null,
