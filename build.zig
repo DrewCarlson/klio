@@ -616,6 +616,24 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // Link-free census driver: runs any commontest suite from the shared
+    // registry against the installed harness — one harness rebuild instead
+    // of a per-suite itest link (plans/verification-latency-campaign.md).
+    const census_exe = b.addExecutable(.{
+        .name = "klio-census",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/itests/census_main.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "runtime", .module = mods.get("runtime").? },
+            },
+        }),
+    });
+    const census_step = b.step("klio-census", "Build + install the link-free census driver");
+    census_step.dependOn(&b.addInstallArtifact(census_exe, .{}).step);
+
     const rt_step = b.step("klio-rt", "Build + install the C-ABI runtime static library");
     rt_step.dependOn(&b.addInstallArtifact(rt_lib, .{}).step);
     rt_step.dependOn(&b.addInstallHeaderFile(b.path("include/klio_rt.h"), "klio_rt.h").step);

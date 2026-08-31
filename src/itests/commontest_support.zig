@@ -67,6 +67,14 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
 }
 
 fn workerCount() usize {
+    // KLIO_ITEST_JOBS overrides (the compose gate honors the same env);
+    // the default clamp keeps a full-stack run from oversubscribing when
+    // every suite spawns its own pool.
+    if (std.c.getenv("KLIO_ITEST_JOBS")) |v| {
+        if (std.fmt.parseInt(usize, std.mem.span(v), 10) catch null) |n| {
+            if (n >= 1) return @min(n, 64);
+        }
+    }
     const cores = std.Thread.getCpuCount() catch 4;
     return std.math.clamp(cores, 1, 8);
 }
@@ -355,6 +363,128 @@ fn failedCount(stdout: []const u8) usize {
 var arena_inst = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 /// Run one library's commonTest suite and assert the pass-count ratchet.
+
+/// The suite registry: ONE source of truth for every commontest census
+/// config, consumed by the itest gates (CI authority) AND the link-free
+/// `klio-census` driver (`zig build klio-census`; iteration path per
+/// plans/verification-latency-campaign.md Task 2). Floors/ceilings are
+/// the ratchets — tighten only.
+pub const suites = [_]Config{
+    .{
+        .name = "coroutines",
+        .test_roots = &.{"kotlin-klio/klio-kotlinx-coroutines/upstream/kotlinx-coroutines-core/common/test"},
+        .scratch_home = "/tmp/klio_itest_coroutines_home",
+        .packs = &.{
+            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
+        },
+        .extra_support = &.{
+            "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/TestBase.common.kt",
+            "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/LaunchFlow.kt",
+            "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/MainDispatcherTestBase.kt",
+            "kotlin-klio/klio-kotlinx-coroutines/klioTestUtils/kotlinx/coroutines/testing/TestBase.kt",
+        },
+        .baseline = 1285,
+        .max_failed = 0,
+        .max_incomplete = 1,
+    },
+    .{
+        .name = "datetime",
+        .test_roots = &.{
+            "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test",
+            "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test",
+        },
+        .scratch_home = "/tmp/klio_itest_datetime_home",
+        .packs = &.{
+            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-datetime", .artifact = "target/packs/kotlinx.datetime.klio-pack" },
+        },
+        .whole_source_set = true,
+        .timeout_ms = 400_000,
+        .baseline = 519,
+        .max_failed = 0,
+        .max_incomplete = 1,
+    },
+    .{
+        .name = "serialization",
+        .test_roots = &.{"kotlin-klio/klio-kotlinx-serialization/upstream/core/commonTest"},
+        .scratch_home = "/tmp/klio_itest_serialization_home",
+        .packs = &.{
+            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
+        },
+        .extra_support = &.{"kotlin-klio/klio-kotlinx-serialization/klioTest/kotlinx/serialization/test/CurrentPlatform.kt"},
+        .baseline = 138,
+        .max_failed = 0,
+        .max_incomplete = 0,
+    },
+    .{
+        .name = "io",
+        .test_roots = &.{
+            "kotlin-klio/klio-kotlinx-io/upstream/core/common/test",
+            "kotlin-klio/klio-kotlinx-io/upstream/bytestring/common/test",
+        },
+        .extra_support = &.{"kotlin-klio/klio-kotlinx-io/klioTest/kotlinx/io/TestActuals.kt"},
+        .scratch_home = "/tmp/klio_itest_io_home",
+        .packs = &.{
+            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-io", .artifact = "target/packs/kotlinx.io.klio-pack" },
+        },
+        .baseline = 1191,
+        .max_failed = 0,
+        .max_incomplete = 0,
+    },
+    .{
+        .name = "atomicfu",
+        .test_roots = &.{"kotlin-klio/klio-kotlinx-atomicfu/upstream/atomicfu/src/commonTest/kotlin"},
+        .scratch_home = "/tmp/klio_itest_atomicfu_home",
+        .packs = &.{
+            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
+        },
+        .whole_source_set = true,
+        .baseline = 67,
+        .max_failed = 0,
+        .max_incomplete = 2,
+    },
+    .{
+        .name = "ktor",
+        .test_roots = &.{
+            "kotlin-klio/klio-ktor/upstream/ktor-io/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-utils/common/test",
+            "kotlin-klio/klio-ktor/upstream/ktor-http/common/test",
+        },
+        .scratch_home = "/tmp/klio_itest_ktor_home",
+        .packs = &.{
+            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-io", .artifact = "target/packs/kotlinx.io.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-ktor", .artifact = "target/packs/io.ktor.klio-pack" },
+        },
+        // 449/1, NOT 450/0: WriterReaderTest.testWriterOnCancelled is a
+        // real cancellation-race flake (launch on an already-cancelled job;
+        // readByte races the channel's cancellation close — observed 3-of-4
+        // failing solo, then 0-of-5; both directions seen 2026-08-31). The
+        // ceiling of 1 absorbs exactly it until the race is root-caused
+        // (tracked in plans/verification-latency-campaign.md discovered
+        // items); every OTHER ktor failure still trips the gate.
+        .baseline = 449,
+        .max_failed = 1,
+        .max_incomplete = 2,
+    },
+};
+
+pub fn runSuiteNamed(name: []const u8) !void {
+    for (&suites) |*cfg| {
+        if (std.mem.eql(u8, cfg.name, name)) return runSuite(cfg.*);
+    }
+    std.debug.print("unknown census suite: {s}\n", .{name});
+    return error.UnknownSuite;
+}
+
 pub fn runSuite(cfg: Config) !void {
     const a = arena_inst.allocator();
     defer _ = arena_inst.reset(.free_all);

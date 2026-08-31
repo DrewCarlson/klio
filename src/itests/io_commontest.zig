@@ -1,43 +1,13 @@
 //! kotlinx-io's own `commonTest` sources run through a child `klio test`
 //! against the installed `kotlinx.io` pack. See `commontest_support.zig`.
+//!
+//! The suite CONFIG (roots, packs, ratchet floors/ceilings) lives in the
+//! shared registry `commontest_support.suites` — one source of truth for
+//! this CI gate and the link-free `klio-census` driver. The ratchet
+//! history that used to live here is in git; tighten floors there only.
 
 const support = @import("commontest_support.zig");
 
 test "kotlinx.io commonTest pass count holds at or above the ratchet baseline" {
-    try support.runSuite(.{
-        .name = "io",
-        .test_roots = &.{
-            "kotlin-klio/klio-kotlinx-io/upstream/core/common/test",
-            "kotlin-klio/klio-kotlinx-io/upstream/bytestring/common/test",
-        },
-        // kotlinx-io's own common test sources declare two `expect`s
-        // (`tempFileName`, `String.asUtf8ToByteArray`) whose actuals live in the
-        // platform test source sets upstream. klio supplies them here; without
-        // them every temp-file test and every UTF-8 round-trip fails to resolve.
-        .extra_support = &.{
-            "kotlin-klio/klio-kotlinx-io/klioTest/kotlinx/io/TestActuals.kt",
-        },
-        .scratch_home = "/tmp/klio_itest_io_home",
-        .packs = &.{
-            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-io", .artifact = "target/packs/kotlinx.io.klio-pack" },
-        },
-        // Measured solo: 1157 passed / 34 failed / 0 incomplete. The floor is a minimum pass
-        // count; the ceilings bound the red mass so a fixed case
-        // traded for a broken one cannot pass unnoticed. Lower the
-        // ceilings as fixes land, never raise them.
-        .baseline = 1191,
-        // 45 -> 13 (klio supplied the two `expect`s kotlinx-io's own tests
-        // declare), -> 9 (an extension namesake stopped diverting a spread
-        // call away from the enclosing member), -> 2 (`lastIndex`/`indices`
-        // now agree with `length` for a string holding a lone surrogate),
-        // -> 1 (classes nested in a local class register, and an `init`
-        // block can read a constructor parameter), -> 0 (a scalar argument
-        // no longer satisfies a container parameter, so a local fn stopped
-        // shadowing the member overload it could not take).
-        //
-        // Zero: every case that runs, passes.
-        .max_failed = 0,
-        .max_incomplete = 0,
-    });
+    try support.runSuiteNamed("io");
 }

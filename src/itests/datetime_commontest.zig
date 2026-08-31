@@ -1,44 +1,13 @@
 //! kotlinx-datetime's own `commonTest` sources run through a child `klio test`
 //! against the installed `kotlinx.datetime` pack. See `commontest_support.zig`.
+//!
+//! The suite CONFIG (roots, packs, ratchet floors/ceilings) lives in the
+//! shared registry `commontest_support.suites` — one source of truth for
+//! this CI gate and the link-free `klio-census` driver. The ratchet
+//! history that used to live here is in git; tighten floors there only.
 
 const support = @import("commontest_support.zig");
 
 test "kotlinx.datetime commonTest pass count holds at or above the ratchet baseline" {
-    try support.runSuite(.{
-        .name = "datetime",
-        .test_roots = &.{
-            "kotlin-klio/klio-kotlinx-datetime/upstream/core/common/test",
-            "kotlin-klio/klio-kotlinx-datetime/upstream/core/commonKotlin/test",
-        },
-        .scratch_home = "/tmp/klio_itest_datetime_home",
-        .packs = &.{
-            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
-            .{ .dir = "kotlin-klio/klio-kotlinx-datetime", .artifact = "target/packs/kotlinx.datetime.klio-pack" },
-        },
-        .whole_source_set = true,
-        // `LocalDateTest.fromEpochDays` walks ~1.4M epoch days building a
-        // LocalDate per step; interpreted that is ~3 minutes of pure compute,
-        // and the default 60s budget dropped the whole file's results.
-        .timeout_ms = 400_000,
-        // Measured solo: 457 passed / 62 failed / 0 incomplete. The floor is a
-        // minimum pass count; the ceilings bound the red mass so a fixed case
-        // traded for a broken one cannot pass unnoticed. Lower the ceilings as
-        // fixes land, never raise them.
-        // 464 -> 480: receiver-lambda literals passed to a `vararg` now bind
-        // the receiver the call supplies, which is how RFC_1123 parses its
-        // optional day-of-week and alternative offsets.
-        // 482 -> 512 and 37 -> 6 after five datetime roots: extended ISO
-        // years, the earlier-offset rule for an ambiguous local time,
-        // single-digit-hour zone ids, cached UTC offsets, and the harness
-        // no longer starving a target of the file its helpers live in.
-        // Measured solo: 517 passed, 2 failed, after natural ordering
-        // reached a user `Comparable` and the pack grew the TZif reader.
-        .baseline = 519, // tightened 2026-08-31: every census at ZERO (red-mass closeout); floor holds margin for loaded test-all
-        // 70 -> 59: a call binding by class id is now treated as a
-        // construction, so `LocalDateTime(y, m, d, h, min)` reaches the
-        // constructor instead of the published companion's `invoke`.
-        .max_failed = 0,
-        .max_incomplete = 1,
-    });
+    try support.runSuiteNamed("datetime");
 }

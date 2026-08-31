@@ -101,6 +101,22 @@ Levers, measured-first per the standing law:
   variant for iteration with the full test kept for CI) — decided by
   measurement, not by tolerance.
 
+## Discovered items
+
+- [ ] WriterReaderTest.testWriterOnCancelled is a real cancellation-race
+      flake (ktor): `GlobalScope.writer(coroutineContext = cancelledJob)`
+      then `channel.readByte()` must throw CancellationException; klio
+      sometimes doesn't (3-of-4 failing solo, then 0-of-5 — both
+      directions observed 2026-08-31). The writer's cancellation close
+      races the first channel read. Root-cause in the utils.io
+      writer/channel bridge; the ktor ceiling of 1 absorbs exactly this
+      until then.
+- [ ] Full-parallel stacks oversubscribe (each suite spawns its own
+      8-worker pool): one coroutines child DNC'd and two litmus tests
+      wall-capped under 64 workers on 32 cores. A shared worker budget
+      across concurrently-running suites (or KLIO_ITEST_JOBS tuning in
+      scripts/stack.sh) removes the load flakes from the stack path.
+
 ## Standing policy
 
 - Budgets are wall-clock minutes; every landed task updates the budget
