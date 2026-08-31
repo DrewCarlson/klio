@@ -824,8 +824,20 @@ fn strictReceiverProvenName(self: *VmHost, allocator: Allocator, receiver: *cons
     // A short all-uppercase head that is not a registered type parameter
     // is still a type parameter in shapes the registry does not record
     // (class-level generics, member extensions); no bound is knowable, so
-    // it proves like an unbounded one.
-    if (pn.len > 0 and pn.len <= 2 and allUppercase(pn)) return true;
+    // it proves like an unbounded one — UNLESS a class of that exact name
+    // is registered: `class I` + `fun I.offsetIn(...)` declares a receiver
+    // on the CLASS, and reading it as a type param proved every receiver
+    // (any subject satisfied any short-named extension). A class-level
+    // generic colliding with a registered 1-2-letter class name loses this
+    // trade; kotlinc resolves the same spelling to the class there too.
+    if (pn.len > 0 and pn.len <= 2 and allUppercase(pn)) {
+        const registered = blk: {
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            break :blk cg.get().get(pn) != null;
+        };
+        if (!registered) return true;
+    }
     // Typealias expansion (the registry stores the target's simple head
     // name; its generic arguments are not recorded, so the expansion
     // proves on the head alone).
