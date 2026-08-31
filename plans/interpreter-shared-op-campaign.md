@@ -69,23 +69,23 @@ the vpd solo before implementation effort, exactly as run here. If the
 Task 2/3 A/Bs also come back flat, build per-thread (critical-path)
 attribution before spending further.
 
-## Task 2 — string-keyed lookups out of the hot ladders (~11% bucket)
+## Task 2 — string-keyed lookups out of the hot ladders — CLOSED 2026-08-31
 
-The dispatch and field ladders resolve through hash maps keyed by name
-strings (eqlBytes) and class-name pairs. The wins land as either:
-- per-SITE monomorphic inline caches on the interpreted CallMember /
-  CallVirtual / GetField arms: class identity -> resolved target stamped
-  on the site (the `stampVirtSite` low-bits verdict encoding is the
-  landed precedent; `ClassDef.resolve_mod/resolve_cid` is the memo
-  precedent), one identity compare per hit; or
-- widening KLIO_CANON ptr-keying (97% ptr-hits already) into the maps
-  the profile names — getIndex/mix time is map-walk cost even when the
-  final compare is a pointer hit.
-Traps: the field-write memo BORROWED-slice bug (klio-field-write-memo
-memory) is the canonical stamped-cache hazard — own every stamped key;
-host-binding shadowing must stay ahead of any stamped target (the
-convertDurationUnit trap); a stamp that skips the extension/visibility
-walk must only serve receivers proven to take the walked route.
+Closed by measurement: the member-dispatch site machinery this task
+proposed ALREADY EXISTS and has converged — `CallMember.site_cls/site_
+sig/site_route` single-fill memos, a per-site PIC (`callPicGet`), flat
+prepare caches, and `stampVirtSite` for host receivers, all landed in
+prior campaigns. The KLIO_DISPATCH_STATS census on the replica shows the
+full string ladder (`member_ladder`) at 0.37% of dispatch events; the
+dominant events are frame pushes (35%) and flat prepares. The residual
+eqlBytes cost attributes (KLIO_PROF_CALLERS) not to member NAME
+resolution but to the FIELD ladders (execArmGetField / setFieldInner /
+getFieldInner / getMemberField and their (class,name) memo probes plus
+the per-replay name re-verify) — which is Task 3's territory — and to
+sub-threshold dust (instanceOf, applicability, virtual flat prep).
+METHOD KEEPER: the single-threaded replica is the composer-thread
+critical-path proxy (profile share = wall share there); vpd solo is the
+banking measurement only.
 
 ## Task 3 — class-shape fixed field offsets (the object model itself)
 
