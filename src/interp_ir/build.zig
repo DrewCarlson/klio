@@ -4085,17 +4085,12 @@ fn buildModuleWithOverrides(
                     try extension_props.put(.{ .a = skey, .b = p.name.name }, fid);
                 }
                 try owner_keyed_ext_names.put(p.name.name, {});
-                // KLIO_MEXT_TOWER_STRICT=1: kotlinc-exact scoping — a
-                // NON-private member extension is also visible only where
-                // its owner is a receiver (the tower) or via import, never
-                // program-wide. The plain pair remains the default until
-                // the tower emulation's re-measured miss count clears
-                // (plans/native-floor-and-tower-campaign.md Task 2).
-                if (p.visibility != .Private and
-                    runtime.envOnce("KLIO_MEXT_TOWER_STRICT") == null)
-                {
-                    try extension_props.put(.{ .a = recv_key, .b = p.name.name }, fid);
-                }
+                // kotlinc-exact scoping: a member extension — private or
+                // not — is visible only where its owner is a receiver (the
+                // tower) or via import, never program-wide, so NO plain
+                // (recv, name) pair. The legal scopes resolve through the
+                // owner-keyed entries: the receiver tower (fqn and
+                // simple-owner keys) and the importing file.
             } else {
                 try extension_props.put(.{ .a = recv_key, .b = p.name.name }, fid);
             }
@@ -4177,9 +4172,8 @@ fn buildModuleWithOverrides(
                 }
                 try owner_keyed_ext_names.put(p.name.name, {});
                 try module.registry.member_ext_owner_class.put(fid, owner);
-                if (p.visibility != .Private) {
-                    try extension_prop_setters.put(.{ .a = recv_key, .b = p.name.name }, fid);
-                }
+                // Same kotlinc-exact scoping as the getter: owner-keyed
+                // only, no program-wide plain pair.
             } else {
                 try extension_prop_setters.put(.{ .a = recv_key, .b = p.name.name }, fid);
             }
