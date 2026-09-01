@@ -75,6 +75,12 @@ typedef struct {
   const uint8_t *gc_pending;
   uint8_t gc_on;
   uint8_t always;
+  /* Rare-trigger handler for THIS view's context: the transpiled
+   * program's views route to klio_op_edge_rare over its NativeCtx;
+   * the interpreter's leaf gate installs a ctx-free handler that
+   * bails the leaf on persistent conditions. Emitted kv_edge calls
+   * through this pointer, never the export directly. */
+  int32_t (*rare)(void *ctx, uint32_t reasons);
 } klio_edge_view;
 void klio_op_edge_view(void *ctx, klio_edge_view *out);
 int32_t klio_op_edge_rare(void *ctx, uint32_t reasons);
@@ -149,13 +155,22 @@ int32_t klio_op_call(void *ctx, uint32_t block, uint32_t inst_idx);
 /* Scalar-replay leaf body: the whole function over (int64 value, genre)
  * pairs — genres 0 Int, 1 Long, 2 Bool, 3 Unit, 4 Char. Nonzero = result
  * in (*ret, *retg); zero = pure bail, the runtime re-runs the call.
- * *retg == 200 is a ctor-tail: *ret names the construction site
- * (fid<<32 | block<<16 | inst) and aux/auxg carry the constructor's
- * scalar arguments; the runtime constructs once through the host. */
+ * *retg == 200 is a ctor-tail: *ret is the address of the site's
+ * klio_ctor_site and aux/auxg carry the constructor's scalar
+ * arguments; the runtime constructs once through the host. */
 typedef int32_t (*klio_leaf_fn)(void *ctx, klio_edge_view *ev,
                                 const int64_t *argv, const int32_t *argg,
                                 int64_t *ret, int32_t *retg, uint32_t depth,
                                 int64_t *aux, int32_t *auxg);
+/* One static descriptor per ctor-tail site; *ret carries its address.
+ * `memo` caches the runtime-resolved owner FuncId + 1 (bakes are not
+ * cross-process id-stable, so the C names the site by fqn). */
+typedef struct {
+  const char *fqn;
+  uint32_t block;
+  uint32_t inst;
+  uint64_t memo;
+} klio_ctor_site;
 void klio_rt_register_native_leaf(uint32_t fid, klio_leaf_fn f, const char *fqn);
 int32_t klio_op_edge(void *ctx);
 int32_t klio_op_br(void *ctx, uint32_t block, uint32_t cond);

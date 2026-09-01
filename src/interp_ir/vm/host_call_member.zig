@@ -9571,6 +9571,24 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
             }
         }
     }
+    // Scalar-replay leaf on the resolved member: the receiver rides as
+    // param 0 (opaque genre when non-scalar — a body that touches it
+    // bails); a bail falls through to the ordinary invoke, which re-runs
+    // the pure body exactly.
+    leaf: {
+        const mg2 = self.module.borrow();
+        defer mg2.deinit();
+        const m2 = mg2.get();
+        const lf = m2.funcById(fid) orelse break :leaf;
+        if (args_in.len + 1 > 8) break :leaf;
+        var all: [8]Value = undefined;
+        all[0] = receiver.*;
+        for (args_in, 0..) |a, i| all[i + 1] = a;
+        if (try ir.eval.tryLeafValues(VmHost, allocator, m2, lf, all[0 .. args_in.len + 1], self, null)) |lo| switch (lo) {
+            .val => |v| return .{ .ok = v },
+            .raise => |e| return .{ .err = e },
+        };
+    }
     ir.eval.dispatchNote(.served_user_body);
     runtime.prof.opRoute(4);
     const mg = self.module.borrow();

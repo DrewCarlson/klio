@@ -492,6 +492,14 @@ fn transpileEmit(
     const mg = built.module.borrow();
     defer mg.deinit();
     const m = mg.get();
+    // KLIO_TRANSPILE_LEAVES=1: emit ONLY the scalar-replay leaf bodies
+    // plus a registration entry, as a self-contained C for a shared
+    // library the interpreter loads (KLIO_LEAVES). No program, no image
+    // pinning — leaves are named by fqn and pure, so they serve any
+    // process's bake.
+    if (runtime.envOnce("KLIO_TRANSPILE_LEAVES") != null) {
+        return transpileEmitLeaves(gpa, m, path, out_path);
+    }
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -727,7 +735,7 @@ fn transpileEmit(
         \\    if ((*ev->idle & 0xFFFFu) == 0) r |= 16u;
         \\    if (*ev->gc_pending) r |= 4u;
         \\  }}
-        \\  if (r) return klio_op_edge_rare(ctx, r);
+        \\  if (r) return ev->rare(ctx, r);
         \\  return 0;
         \\}}
         \\
@@ -973,6 +981,220 @@ fn leafTrace(f: *const ir.Func, comptime why: []const u8) void {
     if (std.c.getenv("KLIO_LEAF_TRACE") != null) std.debug.print("[leaf-miss] {s}: " ++ why ++ "\n", .{f.fqn});
 }
 
+/// KLIO_LEAVES=<path.so>: load a scalar-replay leaf library and register
+/// its bodies by fqn (bakes are not cross-process fid-stable). Fail-open:
+/// a missing or malformed library just leaves the interpreter alone.
+/// The dlopened handle is deliberately leaked — the leaves live as long
+/// as the process.
+pub fn loadLeafLibrary() void {
+    const path = runtime.envOnce("KLIO_LEAVES") orelse return;
+    var lib = std.DynLib.open(path) catch {
+        std.debug.print("warning: KLIO_LEAVES: cannot open {s}\n", .{path});
+        return;
+    };
+    const Entry = *const fn (reg: *const fn (fqn: [*:0]const u8, f: ir.eval.NativeLeafFn) callconv(.c) void) callconv(.c) void;
+    const entry = lib.lookup(Entry, "klio_leaves_entry") orelse {
+        std.debug.print("warning: KLIO_LEAVES: {s} has no klio_leaves_entry\n", .{path});
+        return;
+    };
+    entry(&leafRegShim);
+}
+
+/// Print leaf-gate engagement counters at exit (KLIO_LEAF_DIAG=1).
+pub fn leafDiagDump() void {
+    ir.eval.leafDiagDump();
+}
+
+fn leafRegShim(fqn: [*:0]const u8, f: ir.eval.NativeLeafFn) callconv(.c) void {
+    ir.eval.registerNativeLeafFqn(std.mem.span(fqn), f);
+}
+
+fn leafEmitFor(sel: ?[]const u8, f: *const ir.Func) bool {
+    if (f.package.len == 0) return true;
+    const s2 = sel orelse return false;
+    var it = std.mem.splitScalar(u8, s2, ',');
+    while (it.next()) |pfx| {
+        if (pfx.len != 0 and std.mem.startsWith(u8, f.package, pfx)) return true;
+    }
+    return false;
+}
+
+/// Leaves-only emission (`KLIO_TRANSPILE_LEAVES=1`): the same
+/// eligibility fixpoint as the full program, then just the leaf
+/// bodies, a minimal helper preamble (twinned with the full-program
+/// preamble — keep them identical), and `klio_leaves_entry`, which
+/// registers every body BY FQN through the function pointer the host
+/// hands in. Self-contained: compile with
+/// `zig cc -shared -fPIC out.c -I<include> -o leaves.so` — no libklio_rt.
+fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []const u8, out_path: []const u8) u8 {
+    const pkg_sel: ?[]const u8 = runtime.envOnce("KLIO_TRANSPILE_PKGS");
+    var extra_funcs: std.ArrayList(*const ir.Func) = .empty;
+    defer extra_funcs.deinit(gpa);
+    if (pkg_sel != null) {
+        var fid: u32 = 0;
+        while (fid < m.func_header_offsets.len) : (fid += 1) {
+            const f = m.funcById(@enumFromInt(fid)) orelse continue;
+            if (!leafEmitFor(pkg_sel, f)) continue;
+            if (f.blocks.len == 0 and !m.ensureFuncBody(@constCast(f))) continue;
+            extra_funcs.append(gpa, f) catch return 1;
+        }
+    }
+    var leaf_targets = std.AutoHashMap(u32, LeafInfo).init(gpa);
+    defer {
+        var it = leaf_targets.valueIterator();
+        while (it.next()) |v| v.targets.deinit(gpa);
+        leaf_targets.deinit();
+    }
+    for (extra_funcs.items) |f| {
+        const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
+        if (leafEligible(gpa, m, f, fs, m.consts.items)) |tg| {
+            var tg2 = tg;
+            leaf_targets.put(f.id.int(), tg2) catch {
+                tg2.targets.deinit(gpa);
+                return 1;
+            };
+        }
+    }
+    for (m.funcs.items) |*f| {
+        if (!leafEmitFor(pkg_sel, f)) continue;
+        if (f.blocks.len == 0 and !m.ensureFuncBody(@constCast(f))) continue;
+        const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
+        if (leafEligible(gpa, m, f, fs, m.consts.items)) |tg| {
+            leaf_targets.put(f.id.int(), tg) catch return 1;
+        }
+    }
+    var pruned = true;
+    while (pruned) {
+        pruned = false;
+        var obj = std.AutoHashMap(u32, void).init(gpa);
+        defer obj.deinit();
+        {
+            var grew = true;
+            while (grew) {
+                grew = false;
+                var oit = leaf_targets.iterator();
+                while (oit.next()) |e| {
+                    if (obj.contains(e.key_ptr.*)) continue;
+                    var is_obj = e.value_ptr.ctor_tail;
+                    if (!is_obj) for (e.value_ptr.targets.items) |t| {
+                        if (t.tail and obj.contains(t.fid)) {
+                            is_obj = true;
+                            break;
+                        }
+                    };
+                    if (is_obj) {
+                        obj.put(e.key_ptr.*, {}) catch return 1;
+                        grew = true;
+                    }
+                }
+            }
+        }
+        var it = leaf_targets.iterator();
+        var drop: ?u32 = null;
+        while (it.next()) |e| {
+            for (e.value_ptr.targets.items) |t| {
+                if (!leaf_targets.contains(t.fid) or
+                    (!t.tail and obj.contains(t.fid)))
+                {
+                    drop = e.key_ptr.*;
+                    break;
+                }
+            }
+            if (drop != null) break;
+        }
+        if (drop) |d| {
+            if (std.c.getenv("KLIO_LEAF_TRACE") != null) {
+                const df = m.funcById(ir.FuncId.from(d));
+                std.debug.print("[leaf-prune] {s}\n", .{if (df) |x| x.fqn else "?"});
+            }
+            var v = leaf_targets.fetchRemove(d).?.value;
+            v.targets.deinit(gpa);
+            pruned = true;
+        }
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const w = &aw.writer;
+    w.print(
+        \\/* Generated by `klio transpile {s}` (leaves mode). Do not edit.
+        \\ * Build: zig cc -shared -fPIC <this file> -I<include> -o leaves.so */
+        \\#include <klio_rt.h>
+        \\#include <string.h>
+        \\#include <math.h>
+        \\#include <stdint.h>
+        \\
+        \\/* Twin of the full-program preamble's scalar helpers — keep byte
+        \\ * identical with the copy in the program emission. */
+        \\static inline double kl_bits2d(int64_t l) {{ double d; memcpy(&d, &l, 8); return d; }}
+        \\static inline int64_t kl_d2bits(double d) {{ int64_t l; memcpy(&l, &d, 8); return l; }}
+        \\static inline float kl_bits2f(int64_t l) {{ uint32_t u = (uint32_t)l; float f; memcpy(&f, &u, 4); return f; }}
+        \\static inline int64_t kl_f2bits(float f) {{ uint32_t u; memcpy(&u, &f, 4); return (int64_t)u; }}
+        \\static inline double kl_asd(int64_t l, int g) {{
+        \\  if (g == 5) return kl_bits2d(l);
+        \\  if (g == 6) return (double)kl_bits2f(l);
+        \\  return (double)l;
+        \\}}
+        \\static inline float kl_asf(int64_t l, int g) {{
+        \\  if (g == 6) return kl_bits2f(l);
+        \\  return (float)l;
+        \\}}
+        \\static inline int32_t kv_edge(void *ctx, klio_edge_view *ev) {{
+        \\  uint32_t r = 0;
+        \\  *ev->counter += 1;
+        \\  if ((*ev->counter & 0xFFFFu) == 0) r |= 1u;
+        \\  if (*ev->abandon_req && (*ev->abandonable || *ev->rb_abandon)) r |= 2u;
+        \\  if (ev->always) r |= 8u;
+        \\  else if (ev->gc_on) {{
+        \\    *ev->idle += 1;
+        \\    if ((*ev->idle & 0xFFFFu) == 0) r |= 16u;
+        \\    if (*ev->gc_pending) r |= 4u;
+        \\  }}
+        \\  if (r) return ev->rare(ctx, r);
+        \\  return 0;
+        \\}}
+        \\
+        \\
+    , .{path}) catch return 1;
+    {
+        var it = leaf_targets.keyIterator();
+        while (it.next()) |fid| {
+            w.print("static int32_t kl_{d}(void *ctx, klio_edge_view *ev, const int64_t *argv, const int32_t *argg, int64_t *ret, int32_t *retg, uint32_t depth, int64_t *aux, int32_t *auxg);\n", .{fid.*}) catch return 1;
+        }
+        w.print("\n", .{}) catch return 1;
+    }
+    var reg_list: std.ArrayList(struct { fid: u32, fqn: []const u8 }) = .empty;
+    defer reg_list.deinit(gpa);
+    for (m.funcs.items) |*f| {
+        if (!leafEmitFor(pkg_sel, f)) continue;
+        if (!leaf_targets.contains(f.id.int())) continue;
+        const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
+        emitLeafFunc(w, m, f, fs, m.consts.items) catch return 1;
+        reg_list.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+    }
+    for (extra_funcs.items) |f| {
+        if (!leaf_targets.contains(f.id.int())) continue;
+        const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
+        emitLeafFunc(w, m, f, fs, m.consts.items) catch return 1;
+        reg_list.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+    }
+    w.print("\nvoid klio_leaves_entry(void (*reg)(const char *fqn, klio_leaf_fn f)) {{\n", .{}) catch return 1;
+    for (reg_list.items) |e| {
+        w.print("  reg(\"{s}\", kl_{d});\n", .{ e.fqn, e.fid }) catch return 1;
+    }
+    w.print("}}\n", .{}) catch return 1;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io2 = threaded.io();
+    std.Io.Dir.cwd().writeFile(io2, .{ .sub_path = out_path, .data = aw.written() }) catch {
+        io.printStderr(gpa, "error: write {s} failed\n", .{out_path});
+        return 1;
+    };
+    io.printStderr(gpa, "wrote {s} ({d} leaves)\n", .{ out_path, reg_list.items.len });
+    return 0;
+}
+
 const LeafTarget = struct { fid: u32, tail: bool };
 const LeafInfo = struct { targets: std.ArrayList(LeafTarget), ctor_tail: bool };
 
@@ -1166,6 +1388,10 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, f: *const ir.Func, 
 /// `scalarBin`'s exact semantics over the modeled genre set; any combo
 /// outside the model bails (`return 0`), which purity makes exact.
 fn emitLeafBin(w: anytype, kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32) !void {
+    // Genre 7 is an OPAQUE value (a non-scalar the gate marshaled as dead
+    // cargo — an unused receiver param). Any operation on it bails; the
+    // per-kind guards below assume genres 0-6.
+    try w.print("  if (g{d} > 6 || g{d} > 6) return 0;\n", .{ lhs, rhs });
     switch (kind) {
         .Less, .LessEq, .Greater, .GreaterEq => {
             const sym: []const u8 = switch (kind) {
@@ -1426,14 +1652,16 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                     };
                     if (ctor_args) |ca| {
                         // Ctor-tail (eligibility guaranteed `ret dst` follows):
-                        // hand the scalar args + the owning site to the gate,
-                        // which constructs once through the host.
+                        // hand the scalar args + the site DESCRIPTOR to the
+                        // gate, which resolves the owner by fqn once (bakes
+                        // are not cross-process id-stable) and constructs
+                        // through the host.
                         var ai: u32 = 0;
                         while (ai < ca.n) : (ai += 1) {
                             try w.print("  aux[{d}] = l{d}; auxg[{d}] = g{d};\n", .{ ai, ca.base + ai, ai, ca.base + ai });
                         }
-                        const site: u64 = (@as(u64, fid) << 32) | (@as(u64, @intCast(bi)) << 16) | @as(u64, code[pc + 1]);
-                        try w.print("  *ret = (int64_t){d}ll; *retg = 200; return 1;\n", .{site});
+                        try w.print("  {{ static klio_ctor_site KS = {{\"{s}\", {d}u, {d}u, 0}};\n", .{ f.fqn, bi, code[pc + 1] });
+                        try w.print("    *ret = (int64_t)(uintptr_t)&KS; *retg = 200; return 1; }}\n", .{});
                         pc += 2;
                         continue;
                     }
