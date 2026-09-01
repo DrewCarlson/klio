@@ -96,8 +96,16 @@ gate_pid=$!
   [ $w1 -eq 0 ] && [ $w2 -eq 0 ]
 } >"$rest_log" 2>&1 &
 rest_pid=$!
+# The compose-ui example family gate overlaps the census waves on the
+# same domain (it works in .klio-local — no scratch-home overlap with
+# the census suites; fresh packs + cleared bake cache every run).
+uigate_log=$(mktemp)
+"${pin[@]}" nice -n 10 scripts/compose-ui-gate.sh >"$uigate_log" 2>&1 &
+uigate_pid=$!
 wait "$rest_pid"
 rest_rc=$?
+wait "$uigate_pid"
+uigate_rc=$?
 litmus_out=$("${pin[@]}" zig build itest-parity_threaded_litmus "$@" 2>&1)
 litmus_rc=$?
 wait "$gate_pid"
@@ -105,14 +113,16 @@ gate_rc=$?
 e=$(date +%s)
 cat "$gate_log"
 cat "$rest_log"
+cat "$uigate_log"
 printf '%s\n' "$litmus_out"
 rc=0
 [ $gate_rc -ne 0 ] && rc=1
 [ $rest_rc -ne 0 ] && rc=1
+[ $uigate_rc -ne 0 ] && rc=1
 [ $litmus_rc -ne 0 ] && rc=1
 if grep -qE "^error: '|exceeds the ceiling|transitive failure" "$gate_log" "$rest_log"; then rc=1; fi
 if printf '%s\n' "$litmus_out" | grep -qE "^error: '|exceeds the ceiling|transitive failure"; then rc=1; fi
-rm -f "$rest_log" "$gate_log"
+rm -f "$rest_log" "$gate_log" "$uigate_log"
 if [ $rc -eq 0 ] && [ -n "$tree_key" ]; then printf '%s' "$tree_key" >"$cache_file"; fi
 echo "stack: wall=$((e-s))s rc=$rc"
 exit $rc
