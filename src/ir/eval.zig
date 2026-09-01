@@ -8040,7 +8040,19 @@ pub const NativeLeafFn = *const fn (
     ret: *i64,
     retg: *i32,
     depth: u32,
+    aux: [*]i64,
+    auxg: [*]i32,
 ) callconv(.c) i32;
+
+/// A leaf's ctor-tail return (`*retg == leaf_ctor_tail_genre`): the body
+/// could not construct its result natively, so it hands back the site
+/// (`*ret` = block<<16 | inst index into the leaf FUNCTION's own IR) and
+/// the ctor's scalar arguments in `aux`/`auxg`. The gate constructs ONCE
+/// through the host with the inst's own names/static-heads — exact
+/// semantics including a throwing constructor, no re-run. A callee that
+/// may ctor-tail is only ever called in tail position (eligibility rule),
+/// so one shared aux buffer serves the whole native call chain.
+pub const leaf_ctor_tail_genre: i32 = 200;
 
 const NativeLeafEntry = struct { f: NativeLeafFn, fqn: []const u8 };
 var native_leaf_table: std.AutoHashMapUnmanaged(u32, NativeLeafEntry) = .empty;
@@ -8294,7 +8306,62 @@ fn NativeGlue(comptime H: type) type {
                     nativeEdgeView(ctx, &ev);
                     var rl: i64 = 0;
                     var rg: i32 = 0;
-                    if (klf(@ptrCast(ctx), &ev, &argv, &argg, &rl, &rg, 0) != 0) {
+                    var aux: [8]i64 = undefined;
+                    var auxg: [8]i32 = undefined;
+                    if (klf(@ptrCast(ctx), &ev, &argv, &argg, &rl, &rg, 0, &aux, &auxg) != 0) {
+                        if (rg == leaf_ctor_tail_genre) {
+                            // Ctor-tail: the leaf computed the constructor's
+                            // scalar arguments but cannot build the object;
+                            // construct ONCE here with the site inst's own
+                            // names/static-heads — exact semantics, a throwing
+                            // constructor raises like the interpreted run.
+                            // `rl` = owning fid << 32 | block << 16 | inst:
+                            // with nested tail calls the site belongs to the
+                            // INNERMOST leaf, not the fn this gate called.
+                            const site_fid: u32 = @intCast(@as(u64, @bitCast(rl)) >> 32);
+                            const site: u32 = @truncate(@as(u64, @bitCast(rl)));
+                            const tbi: usize = site >> 16;
+                            const tii: usize = site & 0xFFFF;
+                            const sf = frame.module.funcById(ir.FuncId.from(site_fid)) orelse break :klx;
+                            if (tbi >= sf.blocks.len or tii >= sf.blocks[tbi].insts.len) break :klx;
+                            // Two site shapes carry a ctor-tail: a NewInstance
+                            // inst, or a bare-name call the index bound to a
+                            // class (the receiver-less global leg).
+                            const SiteCtor = struct { class: ir.ClassId, n_args: u32, arg_names: []const ?ir.ConstId, heads: []const ?ir.ConstId };
+                            const sc: SiteCtor = switch (sf.blocks[tbi].insts[tii]) {
+                                .NewInstance => |*ni| .{ .class = ni.class, .n_args = ni.n_args, .arg_names = ni.arg_names, .heads = ni.arg_static_heads },
+                                .CallMemberOrGlobal => |*cg| if (cg.class) |cl| SiteCtor{ .class = cl, .n_args = cg.n_args, .arg_names = cg.arg_names, .heads = &.{} } else break :klx,
+                                else => break :klx,
+                            };
+                            var vals: [8]Value = undefined;
+                            for (0..sc.n_args) |ai| {
+                                vals[ai] = switch (auxg[ai]) {
+                                    0 => .{ .Int = @intCast(aux[ai]) },
+                                    1 => .{ .Long = aux[ai] },
+                                    2 => .{ .Bool = aux[ai] != 0 },
+                                    3 => .Unit,
+                                    4 => .{ .Char = @intCast(aux[ai]) },
+                                    5 => .{ .Double = @bitCast(aux[ai]) },
+                                    6 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(aux[ai]))))) },
+                                    else => break :klx,
+                                };
+                            }
+                            const names = resolveArgNames(ctx.allocator, frame.module, sc.arg_names) catch return .oom;
+                            defer freeArgNames(ctx.allocator, names);
+                            const static_heads = resolveArgNames(ctx.allocator, frame.module, sc.heads) catch return .oom;
+                            defer freeArgNames(ctx.allocator, static_heads);
+                            if (comptime @hasDecl(H, "setCtorArgStaticHeads")) {
+                                host.setCtorArgStaticHeads(static_heads);
+                            }
+                            const res = host.newInstanceNamed(ctx.allocator, sc.class, vals[0..sc.n_args], names, null) catch return .oom;
+                            switch (res) {
+                                .ok => |v| {
+                                    frame.write(c.dst, v) catch return .oom;
+                                    return .cont;
+                                },
+                                .err => |e| return glueAfter(ctx, raiseStep(frame, e), inst, idx, block),
+                            }
+                        }
                         const v: Value = switch (rg) {
                             0 => .{ .Int = @intCast(rl) },
                             1 => .{ .Long = rl },

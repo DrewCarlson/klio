@@ -1,6 +1,6 @@
 # Object-runtime campaign: move the interpreted floor itself
 
-STATUS 2026-09-01: Round 0 CLOSED green; Task 1 rung A/B in progress. Successor to the verification-latency
+STATUS 2026-09-01: Round 0 CLOSED green; rungs B/C landed (throw-block bail, ctor-tail via NewInstance + class-bound bare calls, inline scalar conversions); rung V (leaf vehicle) is the gating work. Successor to the verification-latency
 campaign (plans/verification-latency-campaign.md, closed targets-met):
 verification is fast; the floors that remain ARE the production
 runtime on object-heavy code.
@@ -107,6 +107,30 @@ on corpus parity 401/401 + measured on a named customer:
 Exit per rung: measured wall movement on at least one named customer
 (the datetime census's 119s / the vpd body / SlotTableTests), or a
 recorded closed-by-measurement verdict.
+
+VEHICLE FINDING (2026-09-01, the measurement that reshapes Task 1):
+whole-program transpiled binaries are NOT the delivery vehicle for the
+census floors — an object-heavy bench (epochbench: LocalDate ctor +
+equals per iteration) runs 41.6s native vs 4.0s interpreted, and the
+number is IDENTICAL with the rungs stashed: the per-op escape-helper C
+surround was always ~10x slower than the interpreter on object code
+(the per-op host ABI law, starkly). The leaves themselves are sound
+(output byte-correct) but swamped. The vehicle that reaches the
+census walls is LEAF-ONLY registration inside the interpreter
+harness: keep `klio test`/`klio run` fully interpreted, load a
+prebuilt leaf library that registers ONLY kl_ bodies, let the
+existing gate serve eligible calls (bail = exact, zero regression
+surface). Requirements discovered:
+- fqn-keyed leaf lookup (bakes are not cross-process fid-stable; the
+  current fid+fqn-guard registration silently never engages).
+- fid-drift-proof ctor-tail sites: emit one static site descriptor
+  per site {fqn, block, inst} in the C, pass its address as *ret;
+  the gate resolves fqn -> FuncId once and memoizes in the
+  descriptor.
+- [ ] Rung V — build the leaf vehicle (fqn keying + site descriptors
+      + a `klio transpile --leaves-only` emission mode + harness
+      loading), then measure the datetime census and epochbench with
+      leaves engaged. This is the gating rung for every customer.
 
 ## Task 2 — compose completeness residue (interleave when Task 1
 blocks on measurement)

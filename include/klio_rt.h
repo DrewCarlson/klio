@@ -148,10 +148,14 @@ int32_t klio_op_call(void *ctx, uint32_t block, uint32_t inst_idx);
 
 /* Scalar-replay leaf body: the whole function over (int64 value, genre)
  * pairs — genres 0 Int, 1 Long, 2 Bool, 3 Unit, 4 Char. Nonzero = result
- * in (*ret, *retg); zero = pure bail, the runtime re-runs the call. */
+ * in (*ret, *retg); zero = pure bail, the runtime re-runs the call.
+ * *retg == 200 is a ctor-tail: *ret names the construction site
+ * (fid<<32 | block<<16 | inst) and aux/auxg carry the constructor's
+ * scalar arguments; the runtime constructs once through the host. */
 typedef int32_t (*klio_leaf_fn)(void *ctx, klio_edge_view *ev,
                                 const int64_t *argv, const int32_t *argg,
-                                int64_t *ret, int32_t *retg, uint32_t depth);
+                                int64_t *ret, int32_t *retg, uint32_t depth,
+                                int64_t *aux, int32_t *auxg);
 void klio_rt_register_native_leaf(uint32_t fid, klio_leaf_fn f, const char *fqn);
 int32_t klio_op_edge(void *ctx);
 int32_t klio_op_br(void *ctx, uint32_t block, uint32_t cond);

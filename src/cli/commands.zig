@@ -772,18 +772,18 @@ fn transpileEmit(
         }
     }
 
-    var leaf_targets = std.AutoHashMap(u32, std.ArrayList(u32)).init(gpa);
+    var leaf_targets = std.AutoHashMap(u32, LeafInfo).init(gpa);
     defer {
         var it = leaf_targets.valueIterator();
-        while (it.next()) |v| v.deinit(gpa);
+        while (it.next()) |v| v.targets.deinit(gpa);
         leaf_targets.deinit();
     }
     for (extra_funcs.items) |f| {
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
-        if (leafEligible(gpa, f, fs, m.consts.items)) |tg| {
+        if (leafEligible(gpa, m, f, fs, m.consts.items)) |tg| {
             var tg2 = tg;
             leaf_targets.put(f.id.int(), tg2) catch {
-                tg2.deinit(gpa);
+                tg2.targets.deinit(gpa);
                 return 1;
             };
         }
@@ -792,18 +792,49 @@ fn transpileEmit(
         if (!emitFor(pkg_sel, f)) continue;
         if (f.blocks.len == 0 and !m.ensureFuncBody(@constCast(f))) continue;
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
-        if (leafEligible(gpa, f, fs, m.consts.items)) |tg| {
+        if (leafEligible(gpa, m, f, fs, m.consts.items)) |tg| {
             leaf_targets.put(f.id.int(), tg) catch return 1;
         }
     }
+    // Fixpoint: (a) every call target must itself be eligible; (b) a
+    // target that may return an OBJECT (its tail is a construction, or
+    // it tail-calls such a fn) is only callable in tail position — the
+    // ctor-tail genre then forwards unchanged through the whole chain
+    // and only the gate materializes. Non-tail object calls prune the
+    // caller. The returns-object set is recomputed each round.
     var pruned = true;
     while (pruned) {
         pruned = false;
+        var obj = std.AutoHashMap(u32, void).init(gpa);
+        defer obj.deinit();
+        {
+            var grew = true;
+            while (grew) {
+                grew = false;
+                var oit = leaf_targets.iterator();
+                while (oit.next()) |e| {
+                    if (obj.contains(e.key_ptr.*)) continue;
+                    var is_obj = e.value_ptr.ctor_tail;
+                    if (!is_obj) for (e.value_ptr.targets.items) |t| {
+                        if (t.tail and obj.contains(t.fid)) {
+                            is_obj = true;
+                            break;
+                        }
+                    };
+                    if (is_obj) {
+                        obj.put(e.key_ptr.*, {}) catch return 1;
+                        grew = true;
+                    }
+                }
+            }
+        }
         var it = leaf_targets.iterator();
         var drop: ?u32 = null;
         while (it.next()) |e| {
-            for (e.value_ptr.items) |t| {
-                if (!leaf_targets.contains(t)) {
+            for (e.value_ptr.targets.items) |t| {
+                if (!leaf_targets.contains(t.fid) or
+                    (!t.tail and obj.contains(t.fid)))
+                {
                     drop = e.key_ptr.*;
                     break;
                 }
@@ -816,14 +847,14 @@ fn transpileEmit(
                 std.debug.print("[leaf-prune] {s}\n", .{if (df) |x| x.fqn else "?"});
             }
             var v = leaf_targets.fetchRemove(d).?.value;
-            v.deinit(gpa);
+            v.targets.deinit(gpa);
             pruned = true;
         }
     }
     {
         var it = leaf_targets.keyIterator();
         while (it.next()) |fid| {
-            w.print("static int32_t kl_{d}(void *ctx, klio_edge_view *ev, const int64_t *argv, const int32_t *argg, int64_t *ret, int32_t *retg, uint32_t depth);\n", .{fid.*}) catch return 1;
+            w.print("static int32_t kl_{d}(void *ctx, klio_edge_view *ev, const int64_t *argv, const int32_t *argg, int64_t *ret, int32_t *retg, uint32_t depth, int64_t *aux, int32_t *auxg);\n", .{fid.*}) catch return 1;
         }
         w.print("\n", .{}) catch return 1;
     }
@@ -840,7 +871,7 @@ fn transpileEmit(
         // the running binary builds the same streams this emission used.
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
         if (leaf_targets.contains(f.id.int())) {
-            emitLeafFunc(w, f, fs, m.consts.items) catch return 1;
+            emitLeafFunc(w, m, f, fs, m.consts.items) catch return 1;
             leaf_emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
         }
         emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
@@ -852,7 +883,7 @@ fn transpileEmit(
         // a recomposition is mostly one-line accessors, and the replay is the
         // only emitted form that skips the activation entirely.
         if (leaf_targets.contains(f.id.int())) {
-            emitLeafFunc(w, f, fs, m.consts.items) catch return 1;
+            emitLeafFunc(w, m, f, fs, m.consts.items) catch return 1;
             leaf_emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
         }
         emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
@@ -942,8 +973,37 @@ fn leafTrace(f: *const ir.Func, comptime why: []const u8) void {
     if (std.c.getenv("KLIO_LEAF_TRACE") != null) std.debug.print("[leaf-miss] {s}: " ++ why ++ "\n", .{f.fqn});
 }
 
-fn leafEligible(gpa: std.mem.Allocator, f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) ?std.ArrayList(u32) {
-    var targets: std.ArrayList(u32) = .empty;
+const LeafTarget = struct { fid: u32, tail: bool };
+const LeafInfo = struct { targets: std.ArrayList(LeafTarget), ctor_tail: bool };
+
+/// Whether the stream position `q` (just past an escape) is `ret dst` —
+/// the escaped instruction's result flows straight out. Trace ops may
+/// intervene; anything else means mid-body use.
+fn streamTailRet(code: []const u32, q0: usize, dst: u32) bool {
+    var q = q0;
+    while (q < code.len and @as(ir.bc.Op, @enumFromInt(code[q])) == .trace) q += 4;
+    if (q + 2 >= code.len) return false;
+    if (@as(ir.bc.Op, @enumFromInt(code[q])) != .ret) return false;
+    return code[q + 1] != 0 and code[q + 2] == dst;
+}
+
+/// The scalar integer conversion a zero-arg virtual slot names, or null.
+/// Slot ids reuse the root declaration's FuncId, so the name is static.
+const ScalarConv = enum { to_int, to_long, to_short, to_byte, to_char };
+fn leafScalarConv(m: *const ir.Module, slot: ir.MethodSlotId) ?ScalarConv {
+    const rf = m.funcById(ir.FuncId.from(slot.int())) orelse return null;
+    const eq = std.mem.eql;
+    if (eq(u8, rf.name, "toInt")) return .to_int;
+    if (eq(u8, rf.name, "toLong")) return .to_long;
+    if (eq(u8, rf.name, "toShort")) return .to_short;
+    if (eq(u8, rf.name, "toByte")) return .to_byte;
+    if (eq(u8, rf.name, "toChar")) return .to_char;
+    return null;
+}
+
+fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) ?LeafInfo {
+    var targets: std.ArrayList(LeafTarget) = .empty;
+    var ctor_tail = false;
     var ok = true;
     if (f.params.len > 8) {
         leafTrace(f, "arity");
@@ -1010,12 +1070,65 @@ fn leafEligible(gpa: std.mem.Allocator, f: *const ir.Func, fs: *const ir.bc.Func
                                 for (c.arg_names) |n| {
                                     if (n != null) names_null = false;
                                 }
-                                if (!names_null) ok = false else targets.append(gpa, c.func.int()) catch {
+                                if (!names_null) ok = false else targets.append(gpa, .{
+                                    .fid = c.func.int(),
+                                    .tail = streamTailRet(code, pc + 2, c.dst.int()),
+                                }) catch {
                                     ok = false;
                                 };
                             }
                         },
                         .UnOp => {},
+                        .CallMemberOrGlobal => |*cg| {
+                            // A bare constructor call the index bound to a
+                            // CLASS, in tail position of a receiver-less
+                            // top-level fn: no member leg can shadow (no
+                            // receiver chain; captures would have shown up
+                            // as cell ops), so the class leg is the whole
+                            // semantics — same ctor-tail protocol as
+                            // NewInstance, constructed once at the gate.
+            if (cg.class) |cls| {
+                                const inner = cls.int() < m.classes.items.len and
+                                    m.classes.items[cls.int()].is_inner;
+                                if (f.kind != .plain or
+                                    std.mem.indexOfScalar(u8, f.fqn, '<') != null or
+                                    cg.n_args > 8 or inner or
+                                    !streamTailRet(code, pc + 2, cg.dst.int()))
+                                {
+                                    leafTrace(f, "obj-mid");
+                                    ok = false;
+                                } else ctor_tail = true;
+                            } else {
+                                leafTrace(f, "escape-op");
+                                ok = false;
+                            }
+                        },
+                        .CallVirtual => |*cv| {
+                            // Zero-arg virtual on a receiver that is a
+                            // SCALAR by construction (every register in an
+                            // eligible body is): the slot id is the root
+                            // declaration's FuncId, so the method NAME is
+                            // known at emit time. Integer conversions emit
+                            // inline; everything else bails the body.
+                            if (cv.n_args != 0 or leafScalarConv(m, cv.slot) == null) {
+                                leafTrace(f, "virt");
+                                ok = false;
+                            }
+                        },
+                        .NewInstance => |*ni| {
+                            // Ctor-tail only: the leaf hands the scalar ctor
+                            // args back through aux and the gate constructs
+                            // once through the host (exact, throw included).
+                            // Mid-body objects have nowhere to live natively.
+                            const inner = ni.class.int() < m.classes.items.len and
+                                m.classes.items[ni.class.int()].is_inner;
+                            if (ni.n_args > 8 or inner or
+                                !streamTailRet(code, pc + 2, ni.dst.int()))
+                            {
+                                leafTrace(f, "obj-mid");
+                                ok = false;
+                            } else ctor_tail = true;
+                        },
                         else => {
                             leafTrace(f, "escape-op");
                             ok = false;
@@ -1046,7 +1159,7 @@ fn leafEligible(gpa: std.mem.Allocator, f: *const ir.Func, fs: *const ir.bc.Func
         targets.deinit(gpa);
         return null;
     }
-    return targets;
+    return .{ .targets = targets, .ctor_tail = ctor_tail };
 }
 
 /// One scalar bin op of the replay: dynamic genre/width arithmetic with
@@ -1192,7 +1305,7 @@ fn emitLeafUn(w: anytype, op: ir.UnOp, dst: u32, operand: u32) !void {
 }
 
 /// Emit the scalar-replay body `kl_<fid>` for an eligible function.
-fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) !void {
+fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) !void {
     const fid = f.id.int();
     var max_reg: u32 = 0;
     for (f.blocks, 0..) |*blk, bi| {
@@ -1225,6 +1338,18 @@ fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, con
                             if (u.dst.int() > max_reg) max_reg = u.dst.int();
                             if (u.operand.int() > max_reg) max_reg = u.operand.int();
                         },
+                        .NewInstance => |*ni| {
+                            if (ni.dst.int() > max_reg) max_reg = ni.dst.int();
+                            if (ni.args.int() + ni.n_args > max_reg) max_reg = ni.args.int() + ni.n_args;
+                        },
+                        .CallMemberOrGlobal => |*cg| {
+                            if (cg.dst.int() > max_reg) max_reg = cg.dst.int();
+                            if (cg.args.int() + cg.n_args > max_reg) max_reg = cg.args.int() + cg.n_args;
+                        },
+                        .CallVirtual => |*cv| {
+                            if (cv.dst.int() > max_reg) max_reg = cv.dst.int();
+                            if (cv.receiver.int() > max_reg) max_reg = cv.receiver.int();
+                        },
                         else => {},
                     }
                     pc += 2;
@@ -1245,7 +1370,7 @@ fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, con
             }
         }
     }
-    try w.print("static int32_t kl_{d}(void *ctx, klio_edge_view *ev, const int64_t *argv, const int32_t *argg, int64_t *ret, int32_t *retg, uint32_t depth) {{\n", .{fid});
+    try w.print("static int32_t kl_{d}(void *ctx, klio_edge_view *ev, const int64_t *argv, const int32_t *argg, int64_t *ret, int32_t *retg, uint32_t depth, int64_t *aux, int32_t *auxg) {{\n", .{fid});
     try w.print("  if (depth > 2000u) return 0;\n", .{});
     var r: u32 = 0;
     while (r <= max_reg) : (r += 1) {
@@ -1294,6 +1419,44 @@ fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, con
                         pc += 2;
                         continue;
                     }
+                    const ctor_args: ?struct { base: u32, n: u32 } = switch (f.blocks[bi].insts[code[pc + 1]]) {
+                        .NewInstance => |*ni| .{ .base = ni.args.int(), .n = ni.n_args },
+                        .CallMemberOrGlobal => |*cg| .{ .base = cg.args.int(), .n = cg.n_args },
+                        else => null,
+                    };
+                    if (ctor_args) |ca| {
+                        // Ctor-tail (eligibility guaranteed `ret dst` follows):
+                        // hand the scalar args + the owning site to the gate,
+                        // which constructs once through the host.
+                        var ai: u32 = 0;
+                        while (ai < ca.n) : (ai += 1) {
+                            try w.print("  aux[{d}] = l{d}; auxg[{d}] = g{d};\n", .{ ai, ca.base + ai, ai, ca.base + ai });
+                        }
+                        const site: u64 = (@as(u64, fid) << 32) | (@as(u64, @intCast(bi)) << 16) | @as(u64, code[pc + 1]);
+                        try w.print("  *ret = (int64_t){d}ll; *retg = 200; return 1;\n", .{site});
+                        pc += 2;
+                        continue;
+                    }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .CallVirtual) {
+                        const cv = &f.blocks[bi].insts[code[pc + 1]].CallVirtual;
+                        const conv = leafScalarConv(m, cv.slot).?;
+                        const rr = cv.receiver.int();
+                        const dd = cv.dst.int();
+                        // Integer/char conversions only (floats bail at
+                        // runtime by genre). Kotlin narrowing = low-bits
+                        // truncation with sign extension; toChar keeps the
+                        // low 16 bits unsigned.
+                        try w.print("  if (g{d} > 4 || g{d} == 2 || g{d} == 3) return 0;\n", .{ rr, rr, rr });
+                        switch (conv) {
+                            .to_int => try w.print("  l{d} = (int64_t)(int32_t)l{d}; g{d} = 0;\n", .{ dd, rr, dd }),
+                            .to_long => try w.print("  l{d} = l{d}; g{d} = 1;\n", .{ dd, rr, dd }),
+                            .to_short => try w.print("  l{d} = (int64_t)(int16_t)l{d}; g{d} = 0;\n", .{ dd, rr, dd }),
+                            .to_byte => try w.print("  l{d} = (int64_t)(int8_t)l{d}; g{d} = 0;\n", .{ dd, rr, dd }),
+                            .to_char => try w.print("  l{d} = (int64_t)(uint16_t)l{d}; g{d} = 4;\n", .{ dd, rr, dd }),
+                        }
+                        pc += 2;
+                        continue;
+                    }
                     const c = &f.blocks[bi].insts[code[pc + 1]].Call;
                     const base = c.args.int();
                     try w.print("  {{ int64_t cav[{d}]; int32_t cag[{d}];\n", .{ @max(c.n_args, 1), @max(c.n_args, 1) });
@@ -1302,7 +1465,7 @@ fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, con
                         try w.print("    cav[{d}] = l{d}; cag[{d}] = g{d};\n", .{ i, base + i, i, base + i });
                     }
                     try w.print("    int32_t rg2; int64_t rl2;\n", .{});
-                    try w.print("    if (!kl_{d}(ctx, ev, cav, cag, &rl2, &rg2, depth + 1u)) return 0;\n", .{c.func.int()});
+                    try w.print("    if (!kl_{d}(ctx, ev, cav, cag, &rl2, &rg2, depth + 1u, aux, auxg)) return 0;\n", .{c.func.int()});
                     try w.print("    l{d} = rl2; g{d} = rg2; }}\n", .{ c.dst.int(), c.dst.int() });
                     pc += 2;
                 },
