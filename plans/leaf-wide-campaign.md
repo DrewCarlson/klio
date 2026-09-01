@@ -1,0 +1,102 @@
+# Leaf-wide campaign: real inline bodies, wider ops, cheaper doorway
+
+STATUS 2026-09-01: NOT STARTED. Successor to
+plans/native-floor-and-tower-campaign.md (closed complete). The one
+future vein `plans/open-campaigns.md` §1 records — "widening kl_
+eligibility, driven by a real program that misses it" — plus the
+doorway vein that campaign recorded under its Task 1.
+
+## Measured starting facts (do not re-derive)
+
+- Wide leaf surface today: 3200 bodies served (kotlin./kotlinx.).
+  Miss census over the same surface (KLIO_LEAF_TRACE=1 on the
+  build-leaf-packs transpile):
+  inline 2304, escape-op 1937, nonscalar-const 878, virt 746,
+  obj-mid 324, term 101, call-shape 95, bin-kind 51,
+  member-shadow 33, no-stream 29.
+- INLINE is the single biggest vein and it is a SOUNDNESS gate, not a
+  capability gap: an inline fn's standalone lowered body can be an
+  identity stub because call sites splice the AST (Map.iterator's
+  stub served the receiver map — the ktor 410/40 incident). The gate
+  is `f.is_inline` in leafEligible.
+- escape-op (1937) has NO per-inst breakdown: `[leaf-miss-inst]`
+  prints only when KLIO_LEAF_TRACE names one fn exactly.
+- Doorway: leaf-served micros are gate-bound, not body-bound.
+  toEpochDays 290ms/300k calls (~970ns/iter incl. loop+dispatch);
+  equals 420ms/600k (~700ns/call). Profile split on toepoch: leaf
+  body ~41% (kl_8 22.6 + kv_edge 8.7 + kl_getfield 6 + kv_tag 3.5),
+  doorway ~20% named (call 5.2, funcById 4.3, callMemberNamedInner
+  3.5, callMemberInnerStatic 3.5, tryLeafValues 2.6) + marshal dust.
+  Back-edge-only polling landed and measured noise-level.
+- The anon-invoker leaf_route memo already lives on the MODULE's Func
+  record (leaf-production campaign) — the doorway levers left are the
+  member-site memos / fast_call plans (route resolved per call today)
+  and the per-call interp edge-view build in tryLeafValues.
+- Traps in force: leaves .so must match the body-transforming env;
+  refresh zig-out/include/klio_rt.h after include/ edits (the pack cc
+  compiles against the installed copy); frozen-layout compare is
+  field-by-field; the field-route claim identity is not comparable to
+  the receiver's class word; never `zig build` while a battery runs.
+
+## Task 1 — inline standalone bodies made REAL
+
+- Root-fix the stub class: lower every inline fn's standalone body as
+  its true semantics (the same lowering a call-site splice produces,
+  minus the splice-only context), so `f.is_inline` stops being a
+  leaf-eligibility gate. Reified type parameters stay ineligible
+  (their semantics genuinely need the splice context) — gate THOSE,
+  not all inline fns.
+- This is a lowering change with blast radius beyond leaves (any
+  path that falls back to the standalone body gets better semantics);
+  land it whole, then drive the battery green.
+- Acceptance: the identity-stub shape is impossible by construction
+  (a probe test asserts Map.iterator's standalone body is not an
+  identity), the inline gate in leafEligible is deleted or narrowed
+  to reified-only, and the wide leaf count reflects the unlocked
+  bodies with the full battery green.
+
+## Task 2 — escape-op breakdown, top ops landed measured-first
+
+- First instrument: make `[leaf-miss-inst]` aggregate under
+  KLIO_LEAF_TRACE=1 (tag histogram over the wide surface), and rank
+  escape-op's 1937 by inst tag and by unlocked-body count (a body
+  blocked by two ops only unlocks when both land).
+- Then land the top 1-2 ops by the InstanceOf recipe (eligibility arm
+  + kl_ helper with per-site class-word binding + edge-view route
+  where resolution is needed), each with a named micro and a census
+  number, or close the tag by measurement (obj-mid-style verdicts are
+  acceptable: some tags have nowhere to live natively).
+- nonscalar-const (878) is in scope only if the breakdown shows a
+  cheap sound shape (e.g. string-const identity compare); do not
+  build a string runtime into leaves.
+
+## Task 3 — doorway: cheaper serve path
+
+- Measure first: split the serve path cost on the equals micro
+  (route lookup / funcRunsItsBody check / marshal / edge-view build /
+  the C call itself) with counters, not samples.
+- Levers, in recorded order: (a) leaf route hung off the member-site
+  memo / fast_call plan so a monomorphic site skips the fqn#sig
+  lookup entirely; (b) threadlocal cached interp edge view (rebuild
+  only on GC-relevant state change) so tryLeafValues stops
+  constructing it per call.
+- Target: the equals micro's ~700ns/call moves materially (the replay
+  path suggests low-100s ns is available) and the datetime census
+  wall confirms or bounds the win. Land what measures, record what
+  does not.
+
+## Standing policy
+
+- Measurement-first; every landed piece shows before/after on a named
+  number (micro wall, census wall, serve/bail counters, leaf count).
+- Correctness gates never weaken: corpus parity 401/0, every census
+  floor/ceiling, the compose gate, litmus. scripts/stack.sh is the
+  full battery; leaves stay fail-open at every layer.
+- Big changes land whole and are driven green (Task 1 especially).
+
+Exit: Task 1's inline bodies are real with the gate narrowed to
+reified-only and the battery green; Task 2's breakdown exists and its
+top tags are landed-with-numbers or closed by measurement; Task 3's
+doorway split is measured with each lever landed or its negative
+verdict recorded; the wide leaf count and at least one census wall
+carry the campaign's numbers. Full battery green throughout.
