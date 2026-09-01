@@ -1,10 +1,11 @@
 # Native-floor-and-tower campaign: transpiled output never loses; tower scoping goes exact
 
-STATUS 2026-09-01: NOT STARTED. Two fronts left standing by the leaf
-era: the C transpiler's object-code regression (recorded in
-plans/c-transpiler-plan.md as the pinned speedup campaign) and the
-receiver-tower call-half gating terms (recorded in
-plans/open-campaigns.md §2), which predate this week's tower machinery.
+STATUS 2026-09-01: Task 1 floor + rung D stage 1 LANDED and
+battery-verified (parity 401/0, every census floor, ktor 450/0
+restored after the inline-stub fix, gate 5/5, stack rc=0). Task 2
+LANDED strict-by-default (see below). Remaining: the closing normal
+battery after the default flip, rung D stage 2 (TypeTest -> equals)
+or its closure by measurement, and the doorway vein (recorded).
 
 ## Measured starting facts (do not re-derive)
 
@@ -71,6 +72,14 @@ plans/open-campaigns.md §2), which predate this week's tower machinery.
   the interpreter's frameless leaf evaluator already owns BRANCHLESS
   field readers, so kl_ field wins appear only where it declines
   (branchy bodies). Stage 2 (TypeTest -> equals) next.
+- DOORWAY VEIN (recorded, not chased): at 290ms/300k calls the
+  toEpochDays micro is doorway-bound (dispatch walk + marshal +
+  per-call edge-view build), ~41% in the leaf itself. Back-edge-only
+  safe-point polling in leaf bodies landed (forward jumps are bounded)
+  but measured noise-level (285-290ms) — profile granularity at this
+  scale cannot attribute further. The remaining levers (leaf route on
+  member-site memos / fast_call plans, threadlocal cached edge view)
+  stay recorded for a future campaign with a heavier customer.
 - INLINE-STUB TRAP (2026-09-01, caught by the ktor census floor at
   410/40 on the first engaged stack): an INLINE fn's standalone
   lowered body is NOT its semantics — call sites splice the AST and
@@ -83,19 +92,33 @@ plans/open-campaigns.md §2), which predate this week's tower machinery.
 
 ## Task 2 — receiver-tower call-half gating, re-measured
 
-- Gate the plain program-wide pair for NON-private member extensions
-  behind an env (KLIO_MEXT_TOWER_STRICT=1: register/resolve
-  owner-keyed only, the kotlinc-exact scoping), then run the full
-  battery + compose gate + corpus under it and COUNT the delta
-  against the recorded ~400.
-- Delta ~0: land strict as the default and delete the plain-pair
-  fallback (a correctness tightening — a bystander's `x.decorated`
-  must not see another class's member extension).
-- Small delta: fix the named misses (each is a tower frame the
-  emulation still cannot see — the failure names the frame shape),
-  then land.
-- Still large: record the refreshed terms with the named mechanisms
-  and keep the fallback; the count itself is the deliverable.
+- LANDED STRICT-BY-DEFAULT (2026-09-01): the first strict count was
+  540 (compose 384, ktor 92, coroutines 51, datetime 13 — larger than
+  the recorded ~400), and it decomposed into exactly FOUR named
+  mechanisms, each root-fixed in sequence with the count re-run after
+  each: (1) synthesized accessor/property-init fns had no decl_span,
+  so the import-scoped probe lost the declaring file (`1.seconds` in a
+  class property initializer; datetime 13 -> 4); (2) lambda bodies had
+  no decl_span (`300.milliseconds` inside `withVirtualTime { }`;
+  coroutines + datetime -> 0) — the lambda's file is where its body
+  was WRITTEN, and a frame-walk fallback would attribute the
+  invoker's file, which is wrong; (3) every remaining thunk shape via
+  pushFuncSpanned (an inline splice lands the extension site directly
+  in a `__top_prop_init_*` fn — DEFAULT_TIMEOUT's
+  `runCatching { 60.seconds }`; ktor + most of compose -> 0); (4) the
+  tower probe reaches an owner through supertype_names (simple names)
+  but registration keyed fqn only, so a member extension on an
+  implemented interface missed (PersistentCompositionLocalMap's
+  `CompositionLocal<T>.currentValue`, the last 8 compose) — fixed with
+  simple-owner alias keys (package segments stripped by case
+  convention). Strict full stack GREEN rc=0 (every census floor,
+  compose 1390/0, ui-gate 5/5), then the plain pair was deleted for
+  getters AND setters (the setter pair had never been env-gated) and
+  the env removed. A bystander's `x.decorated` can no longer see
+  another class's member extension.
+- Trace instrument kept: `KLIO_MISS_TRACE=<name>` now also prints
+  `[imp-ext]` (frame fn, file id, import-path count) at the
+  import-scoped probe.
 
 ## Standing policy
 
