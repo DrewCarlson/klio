@@ -8149,7 +8149,13 @@ pub const Module = struct {
     /// order breaks a same-tier tie, so a single-candidate lookup
     /// matches `classId` exactly while a cross-package collision binds
     /// the class the caller can actually see.
-    pub fn classIdIndexed(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId) ?ClassId {
+    pub fn classIdIndexed(self: *const Module, name: []const u8, caller_pkg_in: []const u8, caller_file: FileId) ?ClassId {
+        // Scope judgments follow the FILE: a spliced inline body carries
+        // donor-file spans, and the donor's own package is the
+        // same-package tier for names its body wrote (the geometry
+        // `Size(packFloats(...))` ctor inside the inline factory must
+        // rank geometry's class, not the recipient package's view).
+        const caller_pkg = self.packageOfFile(caller_file) orelse caller_pkg_in;
         var best: ?ClassId = null;
         var best_tier: u8 = 255;
         const cix_trace = blk: {
@@ -8167,6 +8173,7 @@ pub const Module = struct {
                 }
             }
             if (cix_trace) std.debug.print("[cix] {s} candidates-path best={?} tier={d}\n", .{ name, if (best) |b2| b2.int() else null, best_tier });
+            if (best_tier > 3 and self.importAliasPathsIn(caller_file, name).len != 0) return null;
             return best;
         }
         if (cix_trace) std.debug.print("[cix] {s} NO candidate list (flat scan)\n", .{name});
@@ -8179,6 +8186,14 @@ pub const Module = struct {
                 best = entry.id;
             }
         }
+        // An OUT-OF-SCOPE winner under an explicit import of this name is
+        // an incomplete index (cross-pack build order), never kotlinc's
+        // pick — the imported declaration would have won. Refuse, so the
+        // caller defers and the runtime's complete index decides. Without
+        // this the ui-unit pack baked `NewInstance androidx.annotation.Size`
+        // for a bare `Size(w, h)` under `import ...geometry.Size` on some
+        // bake orders.
+        if (best_tier > 3 and self.importAliasPathsIn(caller_file, name).len != 0) return null;
         return best;
     }
 

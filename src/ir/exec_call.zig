@@ -2869,6 +2869,53 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                 null;
             if (global) |found_callee| {
                 var callee = found_callee;
+                // Import rank for the by-name CLASS tier: the globals map
+                // holds ONE entry per simple name — whichever same-named
+                // class registered under the bake order in effect — while
+                // kotlinc scopes the pick to the call site's imports. A
+                // classifier serve whose fqn disagrees with an explicit
+                // import of this name in the executing file re-resolves
+                // through the imported fqn (functions got this rule in the
+                // explicit-import-wins fix; the class tier lacked it, and a
+                // bare `Size(w, h)` in ui-unit bound androidx.annotation.Size
+                // over the imported geometry factory's Size on some bakes).
+                if (callee == .Class) reclass: {
+                    const site_file = (frame.module.decl_span.get(frame.func.id.int()) orelse break :reclass).file;
+                    const cur_fqn = blk_f: {
+                        const g = callee.Class.borrow();
+                        defer g.deinit();
+                        break :blk_f g.get().fqn;
+                    };
+                    for (frame.module.importAliasPathsIn(site_file, name_str)) |path| {
+                        if (std.mem.eql(u8, path.fqn, cur_fqn)) break :reclass;
+                    }
+                    for (frame.module.importAliasPathsIn(site_file, name_str)) |path| {
+                        // The imported declaration may be a top-level
+                        // FACTORY FUNCTION sharing the class's name
+                        // (geometry's `fun Size(width, height)`): call it
+                        // directly — kotlinc's pick for this site.
+                        for (frame.module.funcsBySimpleName(name_str)) |ifid| {
+                            const inf = frame.module.funcById(ifid) orelse continue;
+                            if (!std.mem.eql(u8, inf.fqn, path.fqn)) continue;
+                            if (inf.params.len != arg_values.len) continue;
+                            if (inf.params.len != 0 and std.mem.eql(u8, inf.params[0].name, "this")) continue;
+                            switch (try host.callFuncNamed(allocator, frame.module, ifid, arg_values, names)) {
+                                .ok => |rv| {
+                                    try frame.write(cmg.dst, rv);
+                                    return .cont;
+                                },
+                                .err => |e| return raiseStep(frame, e),
+                            }
+                        }
+                        switch (try host.lookupGlobalThrowing(allocator, path.fqn)) {
+                            .ok => |maybe| if (maybe) |v| {
+                                callee = v;
+                                break :reclass;
+                            },
+                            .err => |e| return raiseStep(frame, e),
+                        }
+                    }
+                }
                 // A CALL is not served by a non-callable name binding: a
                 // captured `var key = 0` beside the `key(...) { }` composable
                 // does not shadow the function for an invocation — Kotlin

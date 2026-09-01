@@ -1538,6 +1538,19 @@ pub fn runAnonInitBlocksAt(
 /// inside ctor/init/default-param evaluation), and nested shell
 /// constructions see the same hint the entry call received.
 pub fn newInstanceNamed(self: *VmHost, allocator: Allocator, class: ClassId, args: []const Value, arg_names: []const ?[]const u8, outer_hint: ?*const Value) Allocator.Error!EvalResult {
+    // KLIO_CTOR_TRAP=<fqn>: print the executing frame when this exact
+    // class constructs — the instrument for a wrong-class pick whose
+    // instance only fails much later.
+    if (runtime.envOnce("KLIO_CTOR_TRAP")) |want| {
+        const mg0 = self.module.borrow();
+        const m0 = mg0.get();
+        const fqn0: []const u8 = if (class.int() < m0.classes.items.len) m0.classes.items[class.int()].fqn else "";
+        mg0.deinit();
+        if (std.mem.eql(u8, fqn0, want)) {
+            const cf0 = ir.eval.currentFrameFunc();
+            std.debug.print("[ctor-trap] {s} nargs={d} in={s}\n", .{ want, args.len, if (cf0) |c| (if (c.fqn.len != 0) c.fqn else c.name) else "<none>" });
+        }
+    }
     // Intrinsic-backed classes route through the host ctor.
     {
         const mg = self.module.borrow();
