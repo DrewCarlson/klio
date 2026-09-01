@@ -7512,9 +7512,13 @@ fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *const Va
 
     // Scalar-replay leaf on the anon/companion method (receiver rides as
     // opaque param 0); a bail falls through to the framed invoke, which
-    // re-runs the pure body exactly.
+    // re-runs the pure body exactly. The gate takes the MODULE'S Func
+    // record, not the local copy — the leaf_route memo written through a
+    // copy is discarded, re-pricing every companion dispatch with the
+    // registry mutex + fqn lookup the memo exists to kill.
     if (receiver.* != .Null and all.items.len == f.params.len) {
-        if (try ir.eval.tryLeafValues(VmHost, allocator, module_rc, &f, all.items, self, null)) |lo| {
+        const lfp = module_rc.funcById(hit.func) orelse unreachable;
+        if (try ir.eval.tryLeafValues(VmHost, allocator, module_rc, lfp, all.items, self, null)) |lo| {
             all.deinit(allocator);
             switch (lo) {
                 .val => |v| return .{ .ok = v },
