@@ -1419,6 +1419,14 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
         leafTrace(f, "suspend");
         ok = false;
     }
+    // An INLINE fn's standalone lowered body is not its semantics — call
+    // sites splice the AST, and the leftover body can be a bare identity
+    // stub (Map.iterator's leaf returned the receiver map itself, and a
+    // ktor iteration then called hasNext on a CaseInsensitiveMap).
+    if (f.is_inline) {
+        leafTrace(f, "inline");
+        ok = false;
+    }
     for (f.blocks, 0..) |*blk, bi| {
         if (!ok) break;
         if (blk.catches.len != 0 or blk.finally != null) {
