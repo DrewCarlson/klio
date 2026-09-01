@@ -19,10 +19,21 @@ KLIO="${KLIO_BIN:-zig-out/bin/klio}"
 # (complete) pack; skip them (see scripts/bootstrap.sh).
 skip_pack_dir() { case "$1" in kotlin-klio/klio-compose-runtime) return 0 ;; *) return 1 ;; esac; }
 
+# PACK_FILTER=<comma-separated dir-basename prefixes>: build only the
+# matching packs (the compose-ui gate trims to the compose closure).
 pack_dirs=()
 for d in kotlin-klio/*/; do
   d="${d%/}"; [ -f "$d/klio.toml" ] || continue
   skip_pack_dir "$d" && continue
+  if [ -n "${PACK_FILTER:-}" ]; then
+    base="${d#kotlin-klio/}"
+    keep=0
+    IFS=',' read -ra pfx <<< "$PACK_FILTER"
+    for x in "${pfx[@]}"; do
+      case "$base" in "$x"*) keep=1 ;; esac
+    done
+    [ $keep = 1 ] || continue
+  fi
   pack_dirs+=("$d")
 done
 remaining=("${pack_dirs[@]}")
