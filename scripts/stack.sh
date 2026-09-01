@@ -27,6 +27,9 @@ export KLIO_ITEST_JOBS="${KLIO_ITEST_JOBS:-4}"
 # measured -8% on vpd solo at stronger settings). RSS caps unchanged.
 export KLIO_GC_GROWTH="${KLIO_GC_GROWTH:-4}"
 export KLIO_GC_THRESHOLD_KB="${KLIO_GC_THRESHOLD_KB:-65536}"
+# Always name failing/incomplete cases — a one-in-N load DNC is
+# undiagnosable from a bare count.
+export KLIO_CENSUS_NAMES=1
 
 # Green-tree memo (fail-OPEN): a stack that already ran green on this
 # exact tree content is a no-op. The key covers HEAD, every non-md
