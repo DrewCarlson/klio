@@ -127,10 +127,29 @@ surface). Requirements discovered:
   per site {fqn, block, inst} in the C, pass its address as *ret;
   the gate resolves fqn -> FuncId once and memoizes in the
   descriptor.
-- [ ] Rung V — build the leaf vehicle (fqn keying + site descriptors
-      + a `klio transpile --leaves-only` emission mode + harness
-      loading), then measure the datetime census and epochbench with
-      leaves engaged. This is the gating rung for every customer.
+- [x] Rung V LANDED (2026-09-01): KLIO_TRANSPILE_LEAVES=1 emits a
+      self-contained leaves-only C (zig cc -shared, no libklio_rt);
+      KLIO_LEAVES=<so> loads + registers by fqn at CLI start;
+      tryLeafValues is the shared gate across the framed call arm, the
+      fused driver, the CMG global-leg replay, the resolved-member arm,
+      the resolved-member/anon/companion invokers, and both
+      member-site-memo replay arms; the rare-edge handler travels in
+      the edge view (interpreter installs a ctx-free bail-on-persistent
+      handler — no cadence livelock); genre 7 = opaque non-scalar
+      cargo. Rung A landed with the global no-member-of-this-name
+      shadow proof. MEASURED (all output-identical): scalar litmus
+      46.2s -> 9.7s (2M serves); dateFromEpochDays direct 1396 ->
+      804ms; LocalDate.fromEpochDays via its real companion shape
+      4.25s -> 1.73s warm (2.46x, 200k serves incl. per-call
+      ctor-tail); DATETIME CENSUS WITH LEAVES: 111s / 519-0 (from
+      119s), every leaf serve inside 519 upstream tests. Engagement
+      lesson: the member walk has MANY memoized replay paths — a gate
+      at the first-dispatch invoker alone serves exactly once.
+      Remaining leaf-side veins (not yet needed for targets): leaves
+      built from the TEST-source closure (assertEquals/next interpreted
+      today), per-suite leaf packs wired into stack.sh/census, the
+      anon-invoker route-memo copy (funcAt returns a Func copy so its
+      leaf_route memo is discarded per call).
 
 ## Task 2 — compose completeness residue (interleave when Task 1
 blocks on measurement)

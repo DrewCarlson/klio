@@ -1184,7 +1184,10 @@ fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []cons
     }
     w.print("\nvoid klio_leaves_entry(void (*reg)(const char *fqn, klio_leaf_fn f)) {{\n", .{}) catch return 1;
     for (reg_list.items) |e| {
-        w.print("  reg(\"{s}\", kl_{d});\n", .{ e.fqn, e.fid }) catch return 1;
+        const kf = m.funcById(ir.FuncId.from(e.fid)) orelse continue;
+        const key = ir.eval.leafKeyAlloc(gpa, kf) orelse continue;
+        defer gpa.free(key);
+        w.print("  reg(\"{s}\", kl_{d});\n", .{ key, e.fid }) catch return 1;
     }
     w.print("}}\n", .{}) catch return 1;
 
@@ -1727,7 +1730,10 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                         while (ai < ca.n) : (ai += 1) {
                             try w.print("  aux[{d}] = l{d}; auxg[{d}] = g{d};\n", .{ ai, ca.base + ai, ai, ca.base + ai });
                         }
-                        try w.print("  {{ static klio_ctor_site KS = {{\"{s}\", {d}u, {d}u, 0}};\n", .{ f.fqn, bi, code[pc + 1] });
+                        var kbuf: [512]u8 = undefined;
+                        var kfbs = std.heap.FixedBufferAllocator.init(&kbuf);
+                        const skey = ir.eval.leafKeyAlloc(kfbs.allocator(), f) orelse return error.Unexpected;
+                        try w.print("  {{ static klio_ctor_site KS = {{\"{s}\", {d}u, {d}u, 0}};\n", .{ skey, bi, code[pc + 1] });
                         try w.print("    *ret = (int64_t)(uintptr_t)&KS; *retg = 200; return 1; }}\n", .{});
                         pc += 2;
                         continue;

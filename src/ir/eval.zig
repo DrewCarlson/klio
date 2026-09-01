@@ -8069,6 +8069,33 @@ var native_leaf_table: std.AutoHashMapUnmanaged(u32, NativeLeafEntry) = .empty;
 var native_leaf_by_fqn: std.StringHashMapUnmanaged(NativeLeafFn) = .empty;
 var native_leaf_any: std.atomic.Value(bool) = .init(false);
 
+/// One character per declared param type, appended to a leaf's fqn so
+/// OVERLOADS (which share the fqn) can never serve each other's calls.
+/// Computed from the same Func data on both the emitting and the
+/// serving side, so the spellings agree by construction.
+pub fn leafSigChar(ty: []const u8) u8 {
+    const base = if (std.mem.lastIndexOfScalar(u8, ty, '.')) |d| ty[d + 1 ..] else ty;
+    const eq = std.mem.eql;
+    if (eq(u8, base, "Int")) return 'i';
+    if (eq(u8, base, "Long")) return 'l';
+    if (eq(u8, base, "Boolean")) return 'b';
+    if (eq(u8, base, "Char")) return 'c';
+    if (eq(u8, base, "Double")) return 'd';
+    if (eq(u8, base, "Float")) return 'f';
+    if (eq(u8, base, "Short")) return 's';
+    if (eq(u8, base, "Byte")) return 'y';
+    return 'o';
+}
+
+/// `fqn#<sig>` — the collision-proof registration key for `f`.
+pub fn leafKeyAlloc(gpa2: std.mem.Allocator, f: *const Func) ?[]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    buf.appendSlice(gpa2, f.fqn) catch return null;
+    buf.append(gpa2, '#') catch return null;
+    for (f.params) |*p| buf.append(gpa2, leafSigChar(p.ty.name)) catch return null;
+    return buf.toOwnedSlice(gpa2) catch null;
+}
+
 /// Register a leaf by FQN alone (leaf-library loading).
 pub fn registerNativeLeafFqn(fqn: []const u8, f: NativeLeafFn) void {
     native_mutex.lock();
@@ -8119,7 +8146,7 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
     const route = cf.leaf_route.load(.acquire);
     const klf: NativeLeafFn = switch (route) {
         0 => blk_r: {
-            const f0 = nativeLeafFor(cf.id.int(), cf.fqn);
+            const f0 = nativeLeafFor(cf.id.int(), cf.fqn) orelse nativeLeafForFunc(cf);
             const enc: usize = if (f0) |fp| @intFromPtr(fp) else 1;
             @constCast(cf).leaf_route.store(enc, .release);
             break :blk_r f0 orelse return null;
@@ -8200,11 +8227,17 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
         const memo = @atomicLoad(u64, &sd.memo, .acquire);
         const site_fid: u32 = if (memo != 0) @intCast(memo - 1) else fid_blk: {
             const want = std.mem.span(sd.fqn);
-            const dot = std.mem.lastIndexOfScalar(u8, want, '.') orelse return null;
+            const hash_pos = std.mem.lastIndexOfScalar(u8, want, '#') orelse return null;
+            const want_fqn = want[0..hash_pos];
+            const dot = std.mem.lastIndexOfScalar(u8, want_fqn, '.') orelse return null;
             var found: ?u32 = null;
-            for (module.funcsBySimpleName(want[dot + 1 ..])) |cand| {
+            for (module.funcsBySimpleName(want_fqn[dot + 1 ..])) |cand| {
                 const cf2 = module.funcById(cand) orelse continue;
-                if (std.mem.eql(u8, cf2.fqn, want)) {
+                if (!std.mem.eql(u8, cf2.fqn, want_fqn)) continue;
+                var buf2: [512]u8 = undefined;
+                var fbs2 = std.heap.FixedBufferAllocator.init(&buf2);
+                const k2 = leafKeyAlloc(fbs2.allocator(), cf2) orelse continue;
+                if (std.mem.eql(u8, k2, want)) {
                     found = cand.int();
                     break;
                 }
@@ -8287,7 +8320,18 @@ fn nativeLeafFor(fid: u32, fqn: []const u8) ?NativeLeafFn {
     if (native_leaf_table.get(fid)) |e| {
         if (std.mem.eql(u8, e.fqn, fqn)) return e.f;
     }
-    return native_leaf_by_fqn.get(fqn);
+    return null;
+}
+
+/// Fqn-map lookup by the collision-proof key (fqn#sig).
+fn nativeLeafForFunc(cf: *const Func) ?NativeLeafFn {
+    if (!native_leaf_any.load(.acquire)) return null;
+    var buf: [512]u8 = undefined;
+    var fbs = std.heap.FixedBufferAllocator.init(&buf);
+    const key = leafKeyAlloc(fbs.allocator(), cf) orelse return null;
+    native_mutex.lock();
+    defer native_mutex.unlock();
+    return native_leaf_by_fqn.get(key);
 }
 
 var native_expect_funcs: usize = 0;
