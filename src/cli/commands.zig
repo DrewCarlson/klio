@@ -1999,7 +1999,15 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                     pc += 2;
                 },
                 .jump => {
-                    try w.print("  if (kv_edge(ctx, ev)) return 0;\n  goto KLB{d};\n", .{code[pc + 1]});
+                    // Only a BACK-edge can loop, so only a back-edge polls
+                    // the safe-point guard — forward jumps in a leaf are
+                    // bounded and the poll was ~9% of a field-reading
+                    // leaf's samples.
+                    if (code[pc + 1] <= bi) {
+                        try w.print("  if (kv_edge(ctx, ev)) return 0;\n  goto KLB{d};\n", .{code[pc + 1]});
+                    } else {
+                        try w.print("  goto KLB{d};\n", .{code[pc + 1]});
+                    }
                     closed = true;
                     pc += 2;
                 },

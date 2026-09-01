@@ -53,6 +53,33 @@ plans/open-campaigns.md §2), which predate this week's tower machinery.
   (D-shape: reads; E-shape: stores) has a customer whose numbers
   justify it. Land or close-by-measurement per rung, exactly as the
   object-runtime campaign did.
+- FLOOR LANDED (2026-09-01): leaves-only emission by default
+  (KLIO_TRANSPILE_OPHELPERS=1 keeps the per-op emitter for bisection);
+  libklio_rt builds from the harness universe (the Debug universe made
+  the embedded interpreter 3x slow). Measured: epochbench 41.6s ->
+  2.0s (2x FASTER than interpreted; 1.77s on a ReleaseFast rt),
+  rangebench 5.1x (was neutral), fib 25.8x; parity 401/0.
+- RUNG D STAGE 1 LANDED (2026-09-01): genre-8 instance handles + plain
+  stored-field reads in leaves (KVC frozen layout, per-site class-word
+  guard, edge-view field_route resolver, one-level trivial-getter
+  chase, scoped $sgetter names) + one-arg bitwise/shift virtuals +
+  inv + Not. toEpochDays micro 721 -> 290ms (2.5x); datetime census
+  green 107s; wide surface 2310 -> 3298 leaves. TRAPS: the field-route
+  claim's identity value is NOT comparable to the receiver's class
+  word (different spaces — bind the slot to the receiver's word); the
+  layout check must compare field-by-field (memcmp trips on padding);
+  the interpreter's frameless leaf evaluator already owns BRANCHLESS
+  field readers, so kl_ field wins appear only where it declines
+  (branchy bodies). Stage 2 (TypeTest -> equals) next.
+- INLINE-STUB TRAP (2026-09-01, caught by the ktor census floor at
+  410/40 on the first engaged stack): an INLINE fn's standalone
+  lowered body is NOT its semantics — call sites splice the AST and
+  the leftover body can be a bare identity stub (Map.iterator's leaf
+  returned the receiver map). Inline fns are leaf-ineligible
+  (3298 -> 3096 leaves). Any future emission surface must honor the
+  same rule; the wide leaves had carried 202 such stubs through
+  several green datetime/coroutines stacks before ktor's iteration
+  paths exposed one.
 
 ## Task 2 — receiver-tower call-half gating, re-measured
 
