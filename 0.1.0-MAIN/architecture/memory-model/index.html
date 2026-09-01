@@ -1569,7 +1569,7 @@
 document states <em>what</em> is guaranteed, as numbered rules with a
 conformance litmus program for each. Litmus programs live in
 <code>tests/fixtures/conformance/</code> and run via
-<code>src/itests/parity_conformance.zig</code>.</p>
+<code>src/itests/parity_threaded_litmus.zig</code>.</p>
 <p>klio promises a model <strong>at least as strong as the Java Memory
 Model</strong>. Every correctly-synchronized Kotlin program behaves
 identically to the JVM; many racy programs behave <em>better</em> (defined,
@@ -1628,7 +1628,7 @@ never invokes it; the interceptor does, through the same operation
 <h2 id="conformance">Conformance<a class="headerlink" href="#conformance" title="Permanent link">&para;</a></h2>
 <p>The litmus suite is the executable form of this document: each rule
 maps to one program (<code>mm1</code>–<code>mm10</code>), and the matching <code>test "mmN_..."</code>
-block in <code>parity_conformance.zig</code> asserts every program's exact
+block in <code>parity_threaded_litmus.zig</code> asserts every program's exact
 stdout. The suite is the contract a parallel value-model backing must
 continue to satisfy.</p>
 

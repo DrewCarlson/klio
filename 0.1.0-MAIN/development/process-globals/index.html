@@ -10,13 +10,9 @@
       
       
       
-        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/architecture/stdlib/">
+        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/development/process-globals/">
       
       
-        <link rel="prev" href="../interpreter/">
-      
-      
-        <link rel="next" href="../concurrency/">
       
       
         
@@ -27,7 +23,7 @@
     
     
       
-        <title>Standard Library - Klio</title>
+        <title>Process-global state and the multi-program contract - Klio</title>
       
     
     
@@ -70,7 +66,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#standard-library" class="md-skip">
+        <a href="#process-global-state-and-the-multi-program-contract" class="md-skip">
           Skip to content
         </a>
       
@@ -110,7 +106,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Standard Library
+              Process-global state and the multi-program contract
             
           </span>
         </div>
@@ -467,10 +463,8 @@
       
   
   
-    
   
   
-  
     
     
       
@@ -497,11 +491,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
         
           
           <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
@@ -522,7 +516,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_3">
             <span class="md-nav__icon md-icon"></span>
             
@@ -540,7 +534,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../pipeline/" class="md-nav__link">
+      <a href="../../architecture/pipeline/" class="md-nav__link">
         
   
   
@@ -568,7 +562,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../interpreter/" class="md-nav__link">
+      <a href="../../architecture/interpreter/" class="md-nav__link">
         
   
   
@@ -593,37 +587,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Standard Library
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../../architecture/stdlib/" class="md-nav__link">
         
   
   
@@ -639,70 +606,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#symbol-registry" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Symbol registry
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#implicit-imports" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Implicit imports
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#adding-a-new-intrinsic" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Adding a new intrinsic
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#verification" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Verification
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -715,7 +618,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../concurrency/" class="md-nav__link">
+      <a href="../../architecture/concurrency/" class="md-nav__link">
         
   
   
@@ -743,7 +646,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../memory-model/" class="md-nav__link">
+      <a href="../../architecture/memory-model/" class="md-nav__link">
         
   
   
@@ -771,7 +674,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../diagnostics/" class="md-nav__link">
+      <a href="../../architecture/diagnostics/" class="md-nav__link">
         
   
   
@@ -799,7 +702,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../performance/" class="md-nav__link">
+      <a href="../../architecture/performance/" class="md-nav__link">
         
   
   
@@ -1378,7 +1281,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/workspace/" class="md-nav__link">
+      <a href="../workspace/" class="md-nav__link">
         
   
   
@@ -1406,7 +1309,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/testing/" class="md-nav__link">
+      <a href="../testing/" class="md-nav__link">
         
   
   
@@ -1434,7 +1337,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/debugging/" class="md-nav__link">
+      <a href="../debugging/" class="md-nav__link">
         
   
   
@@ -1462,7 +1365,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/contributing/" class="md-nav__link">
+      <a href="../contributing/" class="md-nav__link">
         
   
   
@@ -1517,10 +1420,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#symbol-registry" class="md-nav__link">
+  <a href="#the-four-defenses" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Symbol registry
+        The four defenses
       
     </span>
   </a>
@@ -1528,10 +1431,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#implicit-imports" class="md-nav__link">
+  <a href="#audit-2026-08-18" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Implicit imports
+        Audit (2026-08-18)
       
     </span>
   </a>
@@ -1539,21 +1442,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#adding-a-new-intrinsic" class="md-nav__link">
+  <a href="#the-contract-for-new-state" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Adding a new intrinsic
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#verification" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Verification
+        The contract for new state
       
     </span>
   </a>
@@ -1577,7 +1469,7 @@
 
 
   
-    <a href="https://drewcarlson.github.io/klio/edit/main/docs/architecture/stdlib.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+    <a href="https://drewcarlson.github.io/klio/edit/main/docs/development/process-globals.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
       
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
     </a>
@@ -1585,92 +1477,149 @@
   
 
 
-<h1 id="standard-library">Standard library<a class="headerlink" href="#standard-library" title="Permanent link">&para;</a></h1>
-<p>The Kotlin standard library is delivered as a pack
-(<code>stdlib.klio-pack</code>) that's embedded into the <code>klio</code> binary at build
-time. The pack's Kotlin source is the upstream stdlib itself
-(<code>kotlin/libraries/stdlib</code>, pinned at v2.4.0) plus klio-authored
-actuals under <code>kotlin-klio/</code>; that source is interpreted like any
-other Kotlin, and hand-written Zig intrinsics shadow individual
-functions at dispatch where a native implementation is needed for
-host access or speed. Three modules collaborate to produce the pack:</p>
+<h1 id="process-global-state-and-the-multi-program-contract">Process-global state and the multi-program contract<a class="headerlink" href="#process-global-state-and-the-multi-program-contract" title="Permanent link">&para;</a></h1>
+<p>klio's interpreter was built one-program-per-process: the <code>klio</code> CLI loads
+a program, runs it, and exits. The in-process drivers (the parity itests,
+e2e, differential, the commontest censuses) break that assumption — they
+run hundreds of programs in ONE process, reusing addresses, arenas and
+registries as they go.</p>
+<p>Every process-global mutable that outlives a program is therefore a
+potential contamination bug: program N+1 reads state program N left
+behind. That bug class produced seven distinct roots in one campaign
+(shared anon side-module and its clone crossing a boundary,
+generation-stamped dispatch caches, the bytecode stream cache, intrinsic
+intern keys, the GC remembered set, the expr-body member AST registry).
+This page is the audit that followed, and the contract new state must
+meet.</p>
+<h2 id="the-four-defenses">The four defenses<a class="headerlink" href="#the-four-defenses" title="Permanent link">&para;</a></h2>
+<p>A global that outlives a program must carry ONE of these. They are not
+interchangeable — pick by what the state is keyed on.</p>
+<ol>
+<li>
+<p><strong>Boundary reset.</strong> The state is per-program and is cleared when the
+   program ends. <code>interp_ir.resetRunGlobalCaches()</code> is the single wired
+   entry point (the anon-site cache, the static-applicability cache, the
+   bytecode stream cache, suspend liveness, the stdlib empty-collection
+   singletons), called by every in-process driver.
+   Use when: the state is meaningless to the next program.</p>
+</li>
+<li>
+<p><strong>Generation stamping.</strong> Entries carry a generation counter; a bump
+   invalidates every entry at once, including on parked worker threads a
+   per-thread clear could never reach. <code>host_call_member.dispatch_cache_gen</code>
+   with <code>bumpDispatchCacheGen()</code> is the reference implementation.
+   Use when: the cache is thread-local or too hot to walk, and a stale hit
+   would be silently wrong rather than merely stale.</p>
+</li>
+<li>
+<p><strong>Identity verification on lookup.</strong> The key alone is not trusted; the
+   entry re-verifies against content or a name before it is used.
+   <code>image.zig</code>'s <code>block_cache</code> keys on <code>(section ptr, offset, len, sig)</code>
+   where <code>sig</code> fingerprints the bytes — a freed section's ADDRESS gets
+   reused by a later pack image, and six installed packs once made
+   <code>"A".repeat</code> run another pack's one-arg body through a stale
+   <code>(ptr, offset)</code> hit. <code>eval.zig</code>'s <code>native_table</code> keys on <code>FuncId</code> but
+   compares the entry's FQN before dispatching, so a fid reused by a
+   different program falls back to interpretation instead of running the
+   wrong body.
+   Use when: the key is an address or an index that a later program can
+   legitimately reuse.</p>
+</li>
+<li>
+<p><strong>Scoped lifetime.</strong> The global is set for a bounded operation and
+   cleared on the way out, e.g. <code>image.zig</code>'s
+   <code>bake_forest_map = &amp;forest_map; defer bake_forest_map = null;</code>.
+   Use when: the pointer refers to a caller's storage.</p>
+</li>
+</ol>
+<p>Anything that is genuinely immortal and immutable after load — the
+interned intrinsic map (whose keys are duped into permanent storage
+precisely so a program's arena cannot own them), the known-package set,
+thread-name registries — needs no defense, but the audit should say so
+explicitly rather than leaving it implied.</p>
+<h2 id="audit-2026-08-18">Audit (2026-08-18)<a class="headerlink" href="#audit-2026-08-18" title="Permanent link">&para;</a></h2>
+<p>53 contamination-capable globals (containers, pointers, or module handles)
+across <code>src/ir</code>, <code>src/interp_ir</code>, <code>src/runtime</code>, <code>src/stdlib</code>. Every one
+carries a defense above or is immortal-by-construction; <strong>no undefended
+per-program global remained</strong> after the seven roots were fixed.</p>
+<p>Notable classifications:</p>
 <table>
 <thead>
 <tr>
-<th>Module</th>
-<th>Role</th>
+<th>state</th>
+<th>defense</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>stdlib</code></td>
-<td>Hand-written Zig intrinsics keyed by FQN, plus the <code>HostBindings</code> registry.</td>
+<td><code>host_instances.shared_anon_module</code> / <code>shared_anon_arena</code></td>
+<td>boundary reset (and the clone is dropped at every boundary — its identity gate compares run-module CELL ADDRESSES, which an arena-reusing driver reissues)</td>
 </tr>
 <tr>
-<td><code>stdlib_gen</code></td>
-<td>Mines upstream Kotlin's <code>kotlin/libraries/stdlib/</code> to produce the symbol index.</td>
+<td><code>host_instances.anon_site_names</code> / <code>anon_site_thunks</code></td>
+<td>boundary reset</td>
 </tr>
 <tr>
-<td><code>stdlib_pack</code></td>
-<td>Resolves the pack bytes the interpreter loads at startup: <code>KLIO_STDLIB_PACK</code> override, else a fresh <code>stdlib.build_stdlib_pack(...)</code> from the cwd checkout, else the bytes baked into the binary.</td>
+<td><code>ir.bc.cache</code></td>
+<td>boundary reset (entries freed, not just cleared)</td>
+</tr>
+<tr>
+<td><code>inline_state.expr_body_members</code></td>
+<td>reset in the build-start cluster (AST pointers into one build's arena)</td>
+</tr>
+<tr>
+<td>the thread-local dispatch caches, name-identity slots, perm slots</td>
+<td>generation stamping</td>
+</tr>
+<tr>
+<td><code>image.block_cache</code></td>
+<td>content fingerprint in the key</td>
+</tr>
+<tr>
+<td><code>eval.native_table</code></td>
+<td>FQN verified before dispatch</td>
+</tr>
+<tr>
+<td><code>image.bake_forest_map</code></td>
+<td>scoped <code>defer ... = null</code></td>
+</tr>
+<tr>
+<td><code>gc.nursery</code> / <code>tenured</code> / <code>remembered</code> / <code>program_perm</code></td>
+<td>collector-owned; drained at the run boundary while the cells are still mapped</td>
+</tr>
+<tr>
+<td><code>value.intrinsic_intern</code></td>
+<td>immortal, keys duped into permanent storage</td>
+</tr>
+<tr>
+<td><code>stdlib.known_packages</code>, <code>threads.hooks</code> / <code>names</code></td>
+<td>immortal registries</td>
+</tr>
+<tr>
+<td><code>image.decode_stats</code>, <code>eval.call_stats</code> / <code>probe_stats</code></td>
+<td>diagnostics; cumulative across programs by design</td>
 </tr>
 </tbody>
 </table>
-<p>The bake itself happens in build.zig: <code>src/stdlib_pack/embed_gen.zig</code>
-builds the pack from the repo checkout (every consumed <code>.kt</code> is a
-declared input of the step, so stdlib edits regenerate it) and the
-bytes flow in through the <code>stdlib_embedded</code> module. The cwd checkout
-outranks the embedded bytes so in-repo stdlib iteration needs no
-rebuild; the embedded bytes make the installed binary self-contained
-from any directory.</p>
-<h2 id="symbol-registry">Symbol registry<a class="headerlink" href="#symbol-registry" title="Permanent link">&para;</a></h2>
-<p>Every public symbol mined from upstream becomes a <code>SymbolEntry</code>:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kr">pub</span><span class="w"> </span><span class="kr">const</span><span class="w"> </span><span class="n">SymbolEntry</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">    </span><span class="n">fqn</span><span class="o">:</span><span class="w"> </span><span class="p">[]</span><span class="kr">const</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span><span class="w">         </span><span class="c1">// "kotlin.collections.listOf"</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">    </span><span class="n">package</span><span class="o">:</span><span class="w"> </span><span class="p">[]</span><span class="kr">const</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">    </span><span class="n">name</span><span class="o">:</span><span class="w"> </span><span class="p">[]</span><span class="kr">const</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">    </span><span class="n">kind</span><span class="o">:</span><span class="w"> </span><span class="n">SymbolKind</span><span class="p">,</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">    </span><span class="n">receiver</span><span class="o">:</span><span class="w"> </span><span class="o">?</span><span class="p">[]</span><span class="kr">const</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">    </span><span class="n">signature</span><span class="o">:</span><span class="w"> </span><span class="p">[]</span><span class="kr">const</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">    </span><span class="n">param_names</span><span class="o">:</span><span class="w"> </span><span class="p">[]</span><span class="kr">const</span><span class="w"> </span><span class="p">[]</span><span class="kr">const</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">    </span><span class="n">modifiers</span><span class="o">:</span><span class="w"> </span><span class="n">Modifiers</span><span class="p">,</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="w">    </span><span class="n">source</span><span class="o">:</span><span class="w"> </span><span class="n">SourceLoc</span><span class="p">,</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">    </span><span class="n">impl_fn</span><span class="o">:</span><span class="w"> </span><span class="o">?</span><span class="n">StdlibFn</span><span class="p">,</span>
-<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="p">};</span>
-</code></pre></div>
-<p>The registry serves two consumers:</p>
-<ol>
-<li><strong>Resolver</strong> — <code>is_known_package</code> and the symbol index validate
-   imports during <code>klio check</code>.</li>
-<li><strong>Vm</strong> — <code>stdlib.implementation(fqn)</code> looks up the runtime
-   function pointer at dispatch.</li>
-</ol>
-<p>Coverage is reported via <code>stdlib.coverage()</code> (<code>implemented</code>
-over <code>total</code>).</p>
-<h2 id="implicit-imports">Implicit imports<a class="headerlink" href="#implicit-imports" title="Permanent link">&para;</a></h2>
-<p>Spec §10.1 lists the packages every Kotlin file imports
-implicitly. <code>stdlib.IMPLICITLY_IMPORTED_PACKAGES</code> is the exact
-list. Loaded packs may extend it through <code>register_known_package</code>,
-which is what kotlinx packs use to declare their packages visible.</p>
-<h2 id="adding-a-new-intrinsic">Adding a new intrinsic<a class="headerlink" href="#adding-a-new-intrinsic" title="Permanent link">&para;</a></h2>
-<ol>
-<li>Add the function under <code>src/stdlib/implementations/</code> (or
-   <code>src/stdlib/implementations.zig</code>) keyed by its Kotlin FQN.</li>
-<li>Add a sibling entry in <code>src/stdlib_gen/</code> if the FQN is
-   not already mined.</li>
-<li>Update or add a corpus program covering it.</li>
-<li>Re-run <code>zig build test</code> and <code>klio pack verify</code>.</li>
-</ol>
-<p>For library-shaped surface area, prefer a pack over a stdlib
-intrinsic: the pack carries documentation, ships with a binding
-manifest, and stays out of <code>stdlib</code>'s static surface.</p>
-<h2 id="verification">Verification<a class="headerlink" href="#verification" title="Permanent link">&para;</a></h2>
-<p>The stdlib's behavior is held to upstream by running the upstream
-stdlib's own <code>commonTest</code> suite (117 files, ~2,150 tests) directly
-under the interpreter — <code>src/itests/stdlib_commontest.zig</code> enforces
-a ratcheted pass count, and <code>scripts/commontest-sweep.py</code> runs
-per-file sweeps during iteration. See
-<a href="../../development/testing/">Testing and verification</a>.</p>
+<p>Open, minor: <code>host_call_member.lenient_warned</code> is a warn-once set keyed by
+id and is not reset per program, so the second program in a process can
+lose a leniency warning the first already emitted. Cosmetic — it suppresses
+a diagnostic, never changes a result — but it is the one piece of
+per-program state deliberately left shared, and it is recorded here rather
+than left to be rediscovered.</p>
+<h2 id="the-contract-for-new-state">The contract for new state<a class="headerlink" href="#the-contract-for-new-state" title="Permanent link">&para;</a></h2>
+<p>Any new <code>var</code> at file scope that holds a container, a pointer, or a module
+handle must, in the same commit:</p>
+<ul>
+<li>state which defense it uses in a comment, and</li>
+<li>if it is per-program, be wired into <code>resetRunGlobalCaches</code> (or the
+  build-start reset cluster for lowering-phase tables) rather than given a
+  private reset that only one caller remembers to invoke.</li>
+</ul>
+<p>The oracles that catch a violation: <code>itest-differential</code> (its order test
+runs the corpus forward and backward, so state leaking between programs
+diverges), <code>itest-parity_corpus_pinned</code>, and <code>KLIO_GC_STRESS=1</code> /
+<code>KLIO_GC_STRESS_EVERY=N</code> over either.</p>
 
 
 

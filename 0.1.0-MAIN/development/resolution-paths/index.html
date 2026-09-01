@@ -10,13 +10,9 @@
       
       
       
-        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/architecture/stdlib/">
+        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/development/resolution-paths/">
       
       
-        <link rel="prev" href="../interpreter/">
-      
-      
-        <link rel="next" href="../concurrency/">
       
       
         
@@ -27,7 +23,7 @@
     
     
       
-        <title>Standard Library - Klio</title>
+        <title>The two resolution paths, and which one your runner uses - Klio</title>
       
     
     
@@ -70,7 +66,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#standard-library" class="md-skip">
+        <a href="#the-two-resolution-paths-and-which-one-your-runner-uses" class="md-skip">
           Skip to content
         </a>
       
@@ -110,7 +106,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Standard Library
+              The two resolution paths, and which one your runner uses
             
           </span>
         </div>
@@ -467,10 +463,8 @@
       
   
   
-    
   
   
-  
     
     
       
@@ -497,11 +491,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
         
           
           <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
@@ -522,7 +516,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_3">
             <span class="md-nav__icon md-icon"></span>
             
@@ -540,7 +534,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../pipeline/" class="md-nav__link">
+      <a href="../../architecture/pipeline/" class="md-nav__link">
         
   
   
@@ -568,7 +562,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../interpreter/" class="md-nav__link">
+      <a href="../../architecture/interpreter/" class="md-nav__link">
         
   
   
@@ -593,37 +587,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Standard Library
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../../architecture/stdlib/" class="md-nav__link">
         
   
   
@@ -639,70 +606,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#symbol-registry" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Symbol registry
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#implicit-imports" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Implicit imports
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#adding-a-new-intrinsic" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Adding a new intrinsic
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#verification" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Verification
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -715,7 +618,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../concurrency/" class="md-nav__link">
+      <a href="../../architecture/concurrency/" class="md-nav__link">
         
   
   
@@ -743,7 +646,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../memory-model/" class="md-nav__link">
+      <a href="../../architecture/memory-model/" class="md-nav__link">
         
   
   
@@ -771,7 +674,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../diagnostics/" class="md-nav__link">
+      <a href="../../architecture/diagnostics/" class="md-nav__link">
         
   
   
@@ -799,7 +702,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../performance/" class="md-nav__link">
+      <a href="../../architecture/performance/" class="md-nav__link">
         
   
   
@@ -1378,7 +1281,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/workspace/" class="md-nav__link">
+      <a href="../workspace/" class="md-nav__link">
         
   
   
@@ -1406,7 +1309,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/testing/" class="md-nav__link">
+      <a href="../testing/" class="md-nav__link">
         
   
   
@@ -1434,7 +1337,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/debugging/" class="md-nav__link">
+      <a href="../debugging/" class="md-nav__link">
         
   
   
@@ -1462,7 +1365,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/contributing/" class="md-nav__link">
+      <a href="../contributing/" class="md-nav__link">
         
   
   
@@ -1517,10 +1420,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#symbol-registry" class="md-nav__link">
+  <a href="#the-mechanisms" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Symbol registry
+        The mechanisms
       
     </span>
   </a>
@@ -1528,10 +1431,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#implicit-imports" class="md-nav__link">
+  <a href="#who-builds-the-eager-map" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Implicit imports
+        Who builds the eager map
       
     </span>
   </a>
@@ -1539,10 +1442,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#adding-a-new-intrinsic" class="md-nav__link">
+  <a href="#measured-divergence" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Adding a new intrinsic
+        Measured divergence
       
     </span>
   </a>
@@ -1550,10 +1453,21 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#verification" class="md-nav__link">
+  <a href="#the-coverage-asymmetry" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Verification
+        The coverage asymmetry
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#practical-rules" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Practical rules
       
     </span>
   </a>
@@ -1577,7 +1491,7 @@
 
 
   
-    <a href="https://drewcarlson.github.io/klio/edit/main/docs/architecture/stdlib.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+    <a href="https://drewcarlson.github.io/klio/edit/main/docs/development/resolution-paths.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
       
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
     </a>
@@ -1585,92 +1499,100 @@
   
 
 
-<h1 id="standard-library">Standard library<a class="headerlink" href="#standard-library" title="Permanent link">&para;</a></h1>
-<p>The Kotlin standard library is delivered as a pack
-(<code>stdlib.klio-pack</code>) that's embedded into the <code>klio</code> binary at build
-time. The pack's Kotlin source is the upstream stdlib itself
-(<code>kotlin/libraries/stdlib</code>, pinned at v2.4.0) plus klio-authored
-actuals under <code>kotlin-klio/</code>; that source is interpreted like any
-other Kotlin, and hand-written Zig intrinsics shadow individual
-functions at dispatch where a native implementation is needed for
-host access or speed. Three modules collaborate to produce the pack:</p>
+<h1 id="the-two-resolution-paths-and-which-one-your-runner-uses">The two resolution paths, and which one your runner uses<a class="headerlink" href="#the-two-resolution-paths-and-which-one-your-runner-uses" title="Permanent link">&para;</a></h1>
+<p>klio resolves a bare call through two mechanisms, and which are available
+depends on <strong>how the program was launched</strong>. This page states the
+precedence, the measured divergence, and the coverage asymmetry that falls
+out of it — because a bug once passed under <code>klio run</code> and failed in the
+in-process harness on the same source, and the reason was not in the
+program.</p>
+<h2 id="the-mechanisms">The mechanisms<a class="headerlink" href="#the-mechanisms" title="Permanent link">&para;</a></h2>
+<p><strong>The eager typeck map.</strong> Before lowering, the checker walks the program
+and records a resolved target per call site (<code>ir.pending_eager_calls</code>,
+keyed by span). At the lowering site it is <em>consumed</em> in preference to the
+lazy answer: it is type-derived and overload-precise where the lazy engine
+is shape-based, and it pins the pick against runtime value-typed re-picks
+(<code>res_final.target_final = true</code>).</p>
+<p><strong>The lazy resolution engine.</strong> Candidate scoring at lowering time from
+argument shapes, receiver heads, and scope tiers. Always present.</p>
+<p>Precedence is defined, not ambiguous: <strong>where the eager map has an entry,
+it wins.</strong> The one exception is guarded in <code>expr.zig</code> — a pick that
+resolves the call back to the ENCLOSING declaration is distrusted, because
+stdlib overload families delegate to same-name siblings and a mis-picked
+self-target recurses forever.</p>
+<h2 id="who-builds-the-eager-map">Who builds the eager map<a class="headerlink" href="#who-builds-the-eager-map" title="Permanent link">&para;</a></h2>
+<p><code>pending_eager_calls</code> is populated <strong>only under <code>src/cli/</code></strong> —
+<code>commands.zig</code> (run/check), <code>bundle.zig</code>, <code>bundle_boot.zig</code>,
+<code>stdlib_image.zig</code>. Grep is unambiguous: <code>src/parity/parity.zig</code> never
+builds it.</p>
 <table>
 <thead>
 <tr>
-<th>Module</th>
-<th>Role</th>
+<th>runner</th>
+<th>pipeline</th>
+<th>eager map</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>stdlib</code></td>
-<td>Hand-written Zig intrinsics keyed by FQN, plus the <code>HostBindings</code> registry.</td>
+<td><code>klio run</code> / <code>klio test</code> / bundles</td>
+<td>CLI</td>
+<td><strong>yes</strong></td>
 </tr>
 <tr>
-<td><code>stdlib_gen</code></td>
-<td>Mines upstream Kotlin's <code>kotlin/libraries/stdlib/</code> to produce the symbol index.</td>
+<td><code>corpus_check.py</code></td>
+<td>spawns the CLI</td>
+<td><strong>yes</strong></td>
 </tr>
 <tr>
-<td><code>stdlib_pack</code></td>
-<td>Resolves the pack bytes the interpreter loads at startup: <code>KLIO_STDLIB_PACK</code> override, else a fresh <code>stdlib.build_stdlib_pack(...)</code> from the cwd checkout, else the bytes baked into the binary.</td>
+<td>e2e, differential, every parity itest, the commontest censuses</td>
+<td>in-process <code>parity</code></td>
+<td><strong>no</strong></td>
 </tr>
 </tbody>
 </table>
-<p>The bake itself happens in build.zig: <code>src/stdlib_pack/embed_gen.zig</code>
-builds the pack from the repo checkout (every consumed <code>.kt</code> is a
-declared input of the step, so stdlib edits regenerate it) and the
-bytes flow in through the <code>stdlib_embedded</code> module. The cwd checkout
-outranks the embedded bytes so in-repo stdlib iteration needs no
-rebuild; the embedded bytes make the installed binary self-contained
-from any directory.</p>
-<h2 id="symbol-registry">Symbol registry<a class="headerlink" href="#symbol-registry" title="Permanent link">&para;</a></h2>
-<p>Every public symbol mined from upstream becomes a <code>SymbolEntry</code>:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kr">pub</span><span class="w"> </span><span class="kr">const</span><span class="w"> </span><span class="n">SymbolEntry</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">    </span><span class="n">fqn</span><span class="o">:</span><span class="w"> </span><span class="p">[]</span><span class="kr">const</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span><span class="w">         </span><span class="c1">// "kotlin.collections.listOf"</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">    </span><span class="n">package</span><span class="o">:</span><span class="w"> </span><span class="p">[]</span><span class="kr">const</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">    </span><span class="n">name</span><span class="o">:</span><span class="w"> </span><span class="p">[]</span><span class="kr">const</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">    </span><span class="n">kind</span><span class="o">:</span><span class="w"> </span><span class="n">SymbolKind</span><span class="p">,</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">    </span><span class="n">receiver</span><span class="o">:</span><span class="w"> </span><span class="o">?</span><span class="p">[]</span><span class="kr">const</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">    </span><span class="n">signature</span><span class="o">:</span><span class="w"> </span><span class="p">[]</span><span class="kr">const</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">    </span><span class="n">param_names</span><span class="o">:</span><span class="w"> </span><span class="p">[]</span><span class="kr">const</span><span class="w"> </span><span class="p">[]</span><span class="kr">const</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">    </span><span class="n">modifiers</span><span class="o">:</span><span class="w"> </span><span class="n">Modifiers</span><span class="p">,</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="w">    </span><span class="n">source</span><span class="o">:</span><span class="w"> </span><span class="n">SourceLoc</span><span class="p">,</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">    </span><span class="n">impl_fn</span><span class="o">:</span><span class="w"> </span><span class="o">?</span><span class="n">StdlibFn</span><span class="p">,</span>
-<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="p">};</span>
-</code></pre></div>
-<p>The registry serves two consumers:</p>
-<ol>
-<li><strong>Resolver</strong> — <code>is_known_package</code> and the symbol index validate
-   imports during <code>klio check</code>.</li>
-<li><strong>Vm</strong> — <code>stdlib.implementation(fqn)</code> looks up the runtime
-   function pointer at dispatch.</li>
-</ol>
-<p>Coverage is reported via <code>stdlib.coverage()</code> (<code>implemented</code>
-over <code>total</code>).</p>
-<h2 id="implicit-imports">Implicit imports<a class="headerlink" href="#implicit-imports" title="Permanent link">&para;</a></h2>
-<p>Spec §10.1 lists the packages every Kotlin file imports
-implicitly. <code>stdlib.IMPLICITLY_IMPORTED_PACKAGES</code> is the exact
-list. Loaded packs may extend it through <code>register_known_package</code>,
-which is what kotlinx packs use to declare their packages visible.</p>
-<h2 id="adding-a-new-intrinsic">Adding a new intrinsic<a class="headerlink" href="#adding-a-new-intrinsic" title="Permanent link">&para;</a></h2>
-<ol>
-<li>Add the function under <code>src/stdlib/implementations/</code> (or
-   <code>src/stdlib/implementations.zig</code>) keyed by its Kotlin FQN.</li>
-<li>Add a sibling entry in <code>src/stdlib_gen/</code> if the FQN is
-   not already mined.</li>
-<li>Update or add a corpus program covering it.</li>
-<li>Re-run <code>zig build test</code> and <code>klio pack verify</code>.</li>
-</ol>
-<p>For library-shaped surface area, prefer a pack over a stdlib
-intrinsic: the pack carries documentation, ships with a binding
-manifest, and stays out of <code>stdlib</code>'s static surface.</p>
-<h2 id="verification">Verification<a class="headerlink" href="#verification" title="Permanent link">&para;</a></h2>
-<p>The stdlib's behavior is held to upstream by running the upstream
-stdlib's own <code>commonTest</code> suite (117 files, ~2,150 tests) directly
-under the interpreter — <code>src/itests/stdlib_commontest.zig</code> enforces
-a ratcheted pass count, and <code>scripts/commontest-sweep.py</code> runs
-per-file sweeps during iteration. See
-<a href="../../development/testing/">Testing and verification</a>.</p>
+<p>So the configuration users run is not the configuration most of the test
+apparatus runs.</p>
+<h2 id="measured-divergence">Measured divergence<a class="headerlink" href="#measured-divergence" title="Permanent link">&para;</a></h2>
+<p><code>KLIO_EAGER_AUDIT=1</code> prints <code>[EAGER-AUDIT]</code> for every call where the two
+mechanisms disagree. Over 60 corpus examples:</p>
+<ul>
+<li><strong>4 disagreements, all of the shape <code>eager=&lt;fid&gt; lazy=-1</code></strong> — the lazy
+  engine declined and the eager map supplied a target
+  (<code>class_factory_overload.kt</code> ×3, <code>annotated_function_types.kt</code> ×1).</li>
+<li><strong>0 cases where both answered and answered differently.</strong></li>
+</ul>
+<p>That is the reassuring half: the paths do not contradict each other. The
+eager map supplements; it does not overrule a confident lazy answer.</p>
+<p>It is also the risk. Every one of those 4 is a call that resolves under the
+CLI and has no answer without the map. That is exactly the shape of the
+<code>positional_lambda_binding</code> failure: the program ran under <code>klio run</code>
+(eager supplied the target) and failed in base mode (no map, lazy declined,
+the call fell to the value route, which bound the wrong parameter to Null).
+The bug was real and lived in the lazy scorer — the eager map had been
+hiding it.</p>
+<h2 id="the-coverage-asymmetry">The coverage asymmetry<a class="headerlink" href="#the-coverage-asymmetry" title="Permanent link">&para;</a></h2>
+<ul>
+<li>The <strong>parity path</strong> is output-pinned: e2e enforces 320 expected outputs.</li>
+<li>The <strong>CLI path</strong> is mostly exit-code-checked: <code>corpus_check.py</code> runs all
+  335 examples but compares output for only the 16 under
+  <code>tests/corpus/expected-cli/</code>.</li>
+</ul>
+<p>So the resolution configuration users actually get has the weaker
+assertions, and the configuration with the strong assertions is one users
+never run. Neither is wrong on its own; the asymmetry is worth knowing
+before trusting a green corpus as proof about <code>klio run</code>.</p>
+<h2 id="practical-rules">Practical rules<a class="headerlink" href="#practical-rules" title="Permanent link">&para;</a></h2>
+<ul>
+<li>A bug reproducing under one runner and not the other is a resolution-path
+  difference until proven otherwise. Check <code>KLIO_EAGER_AUDIT=1</code> first.</li>
+<li>A lazy-engine fix is the real fix. If a call only works because the eager
+  map supplies it, the lazy scorer has a gap that every in-process driver
+  will hit.</li>
+<li>Do not "fix" a parity failure by teaching parity to build the eager map.
+  That would hide lazy-engine gaps from the only suites that currently
+  catch them.</li>
+</ul>
 
 
 
