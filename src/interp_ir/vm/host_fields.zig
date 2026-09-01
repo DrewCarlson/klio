@@ -2904,11 +2904,24 @@ fn ownerKeyedExtProp(comptime setters: bool, map: anytype, recv_key: []const u8,
 /// entries named by the executing frame's file imports: the import's fqn
 /// minus its leaf IS the declaring owner the registration keyed.
 fn importOwnedExtProp(self: *VmHost, map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
-    const f = ir.eval.currentFrameFunc() orelse return null;
+    const f = ir.eval.currentFrameFunc() orelse {
+        if (missTraceEnvCached()) |w| {
+            if (std.mem.eql(u8, w, name)) std.debug.print("[imp-ext] no frame func\n", .{});
+        }
+        return null;
+    };
     const mg = self.module.borrow();
     defer mg.deinit();
     const module = mg.get();
-    const file = (module.decl_span.get(f.id.int()) orelse return null).file;
+    const file = (module.decl_span.get(f.id.int()) orelse {
+        if (missTraceEnvCached()) |w| {
+            if (std.mem.eql(u8, w, name)) std.debug.print("[imp-ext] no decl_span for {s}#{d}\n", .{ f.name, f.id.int() });
+        }
+        return null;
+    }).file;
+    if (missTraceEnvCached()) |w| {
+        if (std.mem.eql(u8, w, name)) std.debug.print("[imp-ext] fn={s} file={any} paths={d}\n", .{ f.name, file, module.importAliasPathsIn(file, name).len });
+    }
     for (module.importAliasPathsIn(file, name)) |path| {
         if (path.fqn.len <= name.len + 1) continue;
         const owner = path.fqn[0 .. path.fqn.len - name.len - 1];

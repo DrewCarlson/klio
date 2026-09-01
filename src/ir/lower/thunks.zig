@@ -459,7 +459,13 @@ fn lowerAccessorExprFull(
     var func = try b.finish(name, name, try accessorReturnTy(allocator, expected));
     func.params = try accessorParams(allocator, params);
     func.has_receiver_param = leadsWithThis(params);
-    return pushFunc(module, func);
+    const fid = try pushFunc(module, func);
+    // A synthesized accessor/initializer carries its declaring file: the
+    // import-scoped member-extension probe resolves against the frame
+    // fn's decl_span file, and a property initializer using an imported
+    // companion extension (`val xs = listOf(1.seconds)`) is legal there.
+    try module.decl_span.put(fid.int(), expr.span());
+    return fid;
 }
 
 /// The accessor's declared property type as its IR return type, so the
@@ -542,7 +548,10 @@ pub fn lowerAccessorBlockRet(
     // followed the `outer` link).
     func.params = try accessorParams(allocator, params);
     func.has_receiver_param = leadsWithThis(params);
-    return pushFunc(module, func);
+    const fid = try pushFunc(module, func);
+    // Same declaring-file stamp as the expression form above.
+    try module.decl_span.put(fid.int(), block.span);
+    return fid;
 }
 
 /// `lowerAccessorBlock`/`lowerAccessorExpr` with the SETTER's value
