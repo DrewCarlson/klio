@@ -422,6 +422,12 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/MainDispatcherTestBase.kt",
             "kotlin-klio/klio-kotlinx-coroutines/klioTestUtils/kotlinx/coroutines/testing/TestBase.kt",
         },
+        // The hot children (SharedFlowTest 37s, BufferedChannelTest 34s
+        // solo) legitimately cross the 60s default child cap under the
+        // stack's shared-domain load — BufferedChannelTest (11 cases)
+        // DNC'd twice at exactly that line. The cap is a hang guard,
+        // not a wall ratchet; 150s keeps it one.
+        .timeout_ms = 150_000,
         // 1295 (2026-09-01): solo 1299; the 10-case margin covered the
         // pre-L3-split load DNCs, the isolated structure runs 1299/0/0.
         .baseline = 1295,
