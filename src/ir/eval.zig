@@ -9936,6 +9936,16 @@ fn callPicPut(site: usize, cls: u64, sig: u64, gen: u64, fid: u32) void {
     e.fid = fid;
 }
 
+fn tryLeafMember(comptime H: type, allocator: Allocator, frame: *Frame, recv: Value, fid: ir.FuncId, args: []const Value, host: *H) Allocator.Error!?LeafOutcome {
+    if (recv == .Null) return null;
+    const lf = frame.module.funcById(fid) orelse return null;
+    if (args.len + 1 > 8) return null;
+    var all: [8]Value = undefined;
+    all[0] = recv;
+    for (args, 0..) |a, i| all[i + 1] = a;
+    return tryLeafValues(H, allocator, frame.module, lf, all[0 .. args.len + 1], host, null);
+}
+
 noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Frame, cm: anytype, host: *H) Allocator.Error!Step {
     const cm_t0 = gfNow();
     defer if (frame_count_on) {
@@ -10000,6 +10010,24 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
             defer if (dispatch_recv) |value| value.release(allocator);
             const ra = try readArgRun(allocator, frame, cm.args, cm.n_args);
             defer allocator.free(ra);
+            // Scalar-replay leaf on the lowering-resolved member: the
+            // receiver rides as param 0 (opaque genre when non-scalar); a
+            // bail falls through to the ordinary invokers, which re-run
+            // the pure body exactly.
+            if (argNamesAllNull(cm.arg_names) and ra.len + 1 <= 8 and
+                cm.dispatch_receiver == null and recv != .Null) leaf: {
+                const lf = frame.module.funcById(fid) orelse break :leaf;
+                var all: [8]Value = undefined;
+                all[0] = recv;
+                for (ra, 0..) |a, i| all[i + 1] = a;
+                if (try tryLeafValues(H, allocator, frame.module, lf, all[0 .. ra.len + 1], host, null)) |lo| switch (lo) {
+                    .val => |v| {
+                        try frame.write(cm.dst, v);
+                        return .cont;
+                    },
+                    .raise => |e| return raiseStep(frame, e),
+                };
+            }
             // A lowering-resolved plain member at the fully-applied no-vararg
             // shape runs as a pushed activation; member extensions (which
             // seed the dispatch receiver) and every padded/vararg shape keep
@@ -10116,6 +10144,17 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                     const gen: u64 = if (comptime @hasDecl(H, "dispatchCacheGen")) H.dispatchCacheGen() else 0;
                     const sig_p = host.memberSiteSig(arg_values) orelse break :site;
                     const fid_p = callPicGet(@intFromPtr(cm), cls_now, sig_p, gen) orelse break :site;
+                    if (try tryLeafMember(H, allocator, frame, recv, @enumFromInt(fid_p), arg_values, host)) |lo| switch (lo) {
+                        .val => |v| {
+                            if (pushed_enclosing) popEnclosing();
+                            try frame.write(cm.dst, v);
+                            return .cont;
+                        },
+                        .raise => |e| {
+                            if (pushed_enclosing) popEnclosing();
+                            return raiseStep(frame, e);
+                        },
+                    };
                     if (try host.prepareMemberFlatFromFid(allocator, &recv, name_str, arg_values, @enumFromInt(fid_p))) |prep0| {
                         dispatchBump(.member_site_flat);
                         var prep = prep0;
@@ -10144,6 +10183,17 @@ noinline fn execArmCallMember(comptime H: type, allocator: Allocator, frame: *Fr
                     }
                     break :site;
                 }
+                if (try tryLeafMember(H, allocator, frame, recv, @enumFromInt(@as(u32, @intCast(route >> 1))), arg_values, host)) |lo| switch (lo) {
+                    .val => |v| {
+                        if (pushed_enclosing) popEnclosing();
+                        try frame.write(cm.dst, v);
+                        return .cont;
+                    },
+                    .raise => |e| {
+                        if (pushed_enclosing) popEnclosing();
+                        return raiseStep(frame, e);
+                    },
+                };
                 if (try host.prepareMemberFlatFromFid(allocator, &recv, name_str, arg_values, @enumFromInt(@as(u32, @intCast(route >> 1))))) |prep0| {
                     dispatchBump(.member_site_flat);
                     var prep = prep0;

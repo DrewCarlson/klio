@@ -7510,6 +7510,19 @@ fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *const Va
     try all.append(allocator, receiver.*);
     try all.appendSlice(allocator, args);
 
+    // Scalar-replay leaf on the anon/companion method (receiver rides as
+    // opaque param 0); a bail falls through to the framed invoke, which
+    // re-runs the pure body exactly.
+    if (receiver.* != .Null and all.items.len == f.params.len) {
+        if (try ir.eval.tryLeafValues(VmHost, allocator, module_rc, &f, all.items, self, null)) |lo| {
+            all.deinit(allocator);
+            switch (lo) {
+                .val => |v| return .{ .ok = v },
+                .raise => |e| return .{ .err = e },
+            }
+        }
+    }
+
     // Pad omitted trailing args from inherited defaults.
     if (padding_inst) |inst| {
         if (all.items.len < f.params.len) {
@@ -9576,6 +9589,7 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     // bails); a bail falls through to the ordinary invoke, which re-runs
     // the pure body exactly.
     leaf: {
+        if (receiver.* == .Null) break :leaf;
         const mg2 = self.module.borrow();
         defer mg2.deinit();
         const m2 = mg2.get();

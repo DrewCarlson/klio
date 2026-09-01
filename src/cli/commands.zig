@@ -780,6 +780,8 @@ fn transpileEmit(
         }
     }
 
+    var member_names = buildMemberNameSet(gpa, m);
+    defer member_names.deinit();
     var leaf_targets = std.AutoHashMap(u32, LeafInfo).init(gpa);
     defer {
         var it = leaf_targets.valueIterator();
@@ -788,7 +790,7 @@ fn transpileEmit(
     }
     for (extra_funcs.items) |f| {
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
-        if (leafEligible(gpa, m, f, fs, m.consts.items)) |tg| {
+        if (leafEligible(gpa, m, &member_names, f, fs, m.consts.items)) |tg| {
             var tg2 = tg;
             leaf_targets.put(f.id.int(), tg2) catch {
                 tg2.targets.deinit(gpa);
@@ -800,7 +802,7 @@ fn transpileEmit(
         if (!emitFor(pkg_sel, f)) continue;
         if (f.blocks.len == 0 and !m.ensureFuncBody(@constCast(f))) continue;
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
-        if (leafEligible(gpa, m, f, fs, m.consts.items)) |tg| {
+        if (leafEligible(gpa, m, &member_names, f, fs, m.consts.items)) |tg| {
             leaf_targets.put(f.id.int(), tg) catch return 1;
         }
     }
@@ -1039,6 +1041,8 @@ fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []cons
             extra_funcs.append(gpa, f) catch return 1;
         }
     }
+    var member_names = buildMemberNameSet(gpa, m);
+    defer member_names.deinit();
     var leaf_targets = std.AutoHashMap(u32, LeafInfo).init(gpa);
     defer {
         var it = leaf_targets.valueIterator();
@@ -1047,7 +1051,7 @@ fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []cons
     }
     for (extra_funcs.items) |f| {
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
-        if (leafEligible(gpa, m, f, fs, m.consts.items)) |tg| {
+        if (leafEligible(gpa, m, &member_names, f, fs, m.consts.items)) |tg| {
             var tg2 = tg;
             leaf_targets.put(f.id.int(), tg2) catch {
                 tg2.targets.deinit(gpa);
@@ -1059,7 +1063,7 @@ fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []cons
         if (!leafEmitFor(pkg_sel, f)) continue;
         if (f.blocks.len == 0 and !m.ensureFuncBody(@constCast(f))) continue;
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
-        if (leafEligible(gpa, m, f, fs, m.consts.items)) |tg| {
+        if (leafEligible(gpa, m, &member_names, f, fs, m.consts.items)) |tg| {
             leaf_targets.put(f.id.int(), tg) catch return 1;
         }
     }
@@ -1209,6 +1213,14 @@ fn streamTailRet(code: []const u32, q0: usize, dst: u32) bool {
     return code[q + 1] != 0 and code[q + 2] == dst;
 }
 
+fn leafConstStrOf(consts: []const ir.Const, cid: ir.ConstId) ?[]const u8 {
+    if (cid.int() >= consts.len) return null;
+    return switch (consts[cid.int()]) {
+        .String => |sv| sv,
+        else => null,
+    };
+}
+
 /// The scalar integer conversion a zero-arg virtual slot names, or null.
 /// Slot ids reuse the root declaration's FuncId, so the name is static.
 const ScalarConv = enum { to_int, to_long, to_short, to_byte, to_char };
@@ -1223,7 +1235,22 @@ fn leafScalarConv(m: *const ir.Module, slot: ir.MethodSlotId) ?ScalarConv {
     return null;
 }
 
-fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) ?LeafInfo {
+/// Every class-method simple name in the module. A bare call the lowering
+/// bound to a top-level fn can still be shadowed at runtime by a member of
+/// an implicit receiver; a name NO class declares cannot be — the cheap
+/// global proof rung A uses.
+fn buildMemberNameSet(gpa: std.mem.Allocator, m: *const ir.Module) std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(gpa);
+    for (m.classes.items) |*cls| {
+        for (cls.methods) |mid| {
+            const mf = m.funcById(mid) orelse continue;
+            set.put(mf.name, {}) catch {};
+        }
+    }
+    return set;
+}
+
+fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *const std.StringHashMap(void), f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) ?LeafInfo {
     var targets: std.ArrayList(LeafTarget) = .empty;
     var ctor_tail = false;
     var ok = true;
@@ -1309,7 +1336,29 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, f: *const ir.Func, 
                             // as cell ops), so the class leg is the whole
                             // semantics — same ctor-tail protocol as
                             // NewInstance, constructed once at the gate.
-            if (cg.class) |cls| {
+            if (cg.func != null and cg.class == null) {
+                                // A bare call the lowering bound to a
+                                // top-level fn: safe as a direct target when
+                                // NO class in the module declares a member of
+                                // this name — then no implicit receiver can
+                                // shadow the global leg.
+                                const nm = leafConstStrOf(consts, cg.name);
+                                var names_null2 = true;
+                                for (cg.arg_names) |n2| {
+                                    if (n2 != null) names_null2 = false;
+                                }
+                                if (nm == null or member_names.contains(nm.?) or
+                                    !names_null2 or cg.n_args > 8)
+                                {
+                                    leafTrace(f, "member-shadow");
+                                    ok = false;
+                                } else targets.append(gpa, .{
+                                    .fid = cg.func.?.int(),
+                                    .tail = streamTailRet(code, pc + 2, cg.dst.int()),
+                                }) catch {
+                                    ok = false;
+                                };
+                            } else if (cg.class) |cls| {
                                 const inner = cls.int() < m.classes.items.len and
                                     m.classes.items[cls.int()].is_inner;
                                 if (f.kind != .plain or
@@ -1642,6 +1691,24 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                     if (f.blocks[bi].insts[code[pc + 1]] == .UnOp) {
                         const u = &f.blocks[bi].insts[code[pc + 1]].UnOp;
                         try emitLeafUn(w, u.op, u.dst.int(), u.operand.int());
+                        pc += 2;
+                        continue;
+                    }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .CallMemberOrGlobal and
+                        f.blocks[bi].insts[code[pc + 1]].CallMemberOrGlobal.class == null)
+                    {
+                        // Rung A: a bare call bound to a top-level fn with the
+                        // no-member-shadow proof — a direct kl_ call.
+                        const cg = &f.blocks[bi].insts[code[pc + 1]].CallMemberOrGlobal;
+                        const cb = cg.args.int();
+                        try w.print("  {{ int64_t cav[{d}]; int32_t cag[{d}];\n", .{ @max(cg.n_args, 1), @max(cg.n_args, 1) });
+                        var ci: u32 = 0;
+                        while (ci < cg.n_args) : (ci += 1) {
+                            try w.print("    cav[{d}] = l{d}; cag[{d}] = g{d};\n", .{ ci, cb + ci, ci, cb + ci });
+                        }
+                        try w.print("    int32_t rg2; int64_t rl2;\n", .{});
+                        try w.print("    if (!kl_{d}(ctx, ev, cav, cag, &rl2, &rg2, depth + 1u, aux, auxg)) return 0;\n", .{cg.func.?.int()});
+                        try w.print("    l{d} = rl2; g{d} = rg2; }}\n", .{ cg.dst.int(), cg.dst.int() });
                         pc += 2;
                         continue;
                     }
