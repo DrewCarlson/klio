@@ -8246,11 +8246,13 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
         nativeEdgeView(nc, &ev);
         ev.route_ctx = @ptrCast(host);
         ev.field_route = &LeafFieldRoute(H).route;
+        ev.type_route = &LeafTypeRoute(H).route;
     } else {
         ev = .{
             .rare = &leafEdgeRareInterp,
             .route_ctx = @ptrCast(host),
             .field_route = &LeafFieldRoute(H).route,
+            .type_route = &LeafTypeRoute(H).route,
             .counter = &local_counter,
             .idle = runtime.gc.idleTickPtr(),
             .abandonable = runtime.abandonablePtr(),
@@ -8696,7 +8698,29 @@ pub const NativeEdgeView = extern struct {
     /// klio_rt.h); null outside the leaf gates.
     route_ctx: ?*anyopaque = null,
     field_route: ?*const fn (route_ctx: ?*anyopaque, recv_cell: ?*anyopaque, name: [*:0]const u8, cls48_out: *u64, slot_out: *i32) callconv(.c) i32 = null,
+    /// Instance-of verdict resolver for leaf genre-8 handles: 1 = the
+    /// receiver's class IS the named type, 2 = it is not, 0 = miss
+    /// (bail). The site binds the verdict to the receiver's class word.
+    type_route: ?*const fn (route_ctx: ?*anyopaque, recv_cell: ?*anyopaque, name: [*:0]const u8) callconv(.c) i32 = null,
 };
+
+/// Per-host instance-of thunk for leaf bodies: rebuilds a borrowed
+/// Instance view over the raw cell and asks the host's own `is`
+/// predicate against a plain non-nullable classifier name (eligibility
+/// rejected everything else). 1 = yes, 2 = no; the site caches the
+/// verdict keyed to the receiver's class word.
+fn LeafTypeRoute(comptime H: type) type {
+    return struct {
+        fn route(rctx: ?*anyopaque, recv_cell: ?*anyopaque, name: [*:0]const u8) callconv(.c) i32 {
+            if (comptime !@hasDecl(H, "instanceOf")) return 0;
+            const host: *H = @ptrCast(@alignCast(rctx orelse return 0));
+            const cell = recv_cell orelse return 0;
+            const v = Value{ .Instance = .{ .cell = @ptrCast(@alignCast(cell)) } };
+            const ty = TypeRef{ .name = std.mem.span(name), .nullable = false, .args = &.{} };
+            return if (host.instanceOf(&v, ty)) 1 else 2;
+        }
+    };
+}
 
 /// Per-host field-route thunk for leaf bodies: rebuilds a borrowed
 /// Instance view over the raw cell (no retain — the leaf's caller roots

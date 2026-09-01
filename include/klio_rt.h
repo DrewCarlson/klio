@@ -89,6 +89,9 @@ typedef struct {
    * the leaf bails. May be null (view built by a non-leaf path). */
   void *route_ctx;
   int32_t (*field_route)(void *route_ctx, void *recv_cell, const char *name, uint64_t *cls48_out, int32_t *slot_out);
+  /* Instance-of verdict for leaf genre-8 handles: 1 = yes, 2 = no,
+   * 0 = miss (bail). NULL outside the leaf gates. */
+  int32_t (*type_route)(void *route_ctx, void *recv_cell, const char *name);
 } klio_edge_view;
 void klio_op_edge_view(void *ctx, klio_edge_view *out);
 int32_t klio_op_edge_rare(void *ctx, uint32_t reasons);

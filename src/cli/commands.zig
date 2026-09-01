@@ -1110,6 +1110,29 @@ const leaf_getfield_c =
     \\  return 1;
     \\}
     \\
+    \\static inline int32_t kl_instanceof(klio_edge_view *ev, int64_t rl, int32_t rgv, uint64_t *site, const char *tyname, int64_t *ol, int32_t *og) {
+    \\  /* Only genre-8 handles have a class word to key the verdict on;
+    \\   * every other genre (null, scalar, cargo) bails to the exact
+    \\   * re-run, which owns the full `is` semantics. */
+    \\  if (rgv != 8) return 0;
+    \\  uint8_t *cell = (uint8_t *)(uintptr_t)rl;
+    \\  if (!cell) return 0;
+    \\  uint8_t *inst = cell + KVC_CELL_DATA_OFF;
+    \\  uint64_t cls;
+    \\  memcpy(&cls, inst + KVC_INST_CLASS_OFF, sizeof(uint64_t));
+    \\  uint64_t cls48 = cls & 0xFFFFFFFFFFFFull;
+    \\  uint64_t want = *site;
+    \\  if ((want >> 16) != cls48 || (want & 0xFFFFu) == 0) {
+    \\    if (!ev->type_route) return 0;
+    \\    int32_t verdict = ev->type_route(ev->route_ctx, cell, tyname);
+    \\    if (verdict != 1 && verdict != 2) return 0;
+    \\    want = (cls48 << 16) | (uint64_t)(uint32_t)verdict;
+    \\    *site = want;
+    \\  }
+    \\  *ol = ((want & 0xFFFFu) == 1u) ? 1 : 0; *og = 2;
+    \\  return 1;
+    \\}
+    \\
 ;
 
 fn leafEmitFor(sel: ?[]const u8, f: *const ir.Func) bool {
@@ -1565,6 +1588,20 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                                 ok = false;
                             }
                         },
+                        // A plain classifier test serves via a per-site
+                        // verdict bound to the receiver's class word;
+                        // generic args, nullable targets, and bare type
+                        // variables (reified context) bail eligibility —
+                        // the run-time route covers only (class, name).
+                        .InstanceOf => |*iot| {
+                            const head = std.mem.trimEnd(u8, iot.ty.name, "?");
+                            if (iot.ty.args.len != 0 or iot.ty.nullable or head.len == 0 or
+                                (head.len <= 2 and std.ascii.isUpper(head[0])))
+                            {
+                                leafTrace(f, "istest");
+                                ok = false;
+                            }
+                        },
                         .NewInstance => |*ni| {
                             // Ctor-tail only: the leaf hands the scalar ctor
                             // args back through aux and the gate constructs
@@ -1817,6 +1854,10 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                             if (nt.dst.int() > max_reg) max_reg = nt.dst.int();
                             if (nt.src.int() > max_reg) max_reg = nt.src.int();
                         },
+                        .InstanceOf => |*iot| {
+                            if (iot.dst.int() > max_reg) max_reg = iot.dst.int();
+                            if (iot.src.int() > max_reg) max_reg = iot.src.int();
+                        },
                         else => {},
                     }
                     pc += 2;
@@ -1932,6 +1973,13 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                         const fname = leafConstStrOf(consts, gf.field).?;
                         try w.print("  {{ static uint64_t KFS_{d}_{d} = 0;\n", .{ bi, code[pc + 1] });
                         try w.print("    if (!kl_getfield(ev, l{d}, g{d}, &KFS_{d}_{d}, \"{s}\", &l{d}, &g{d})) return 0; }}\n", .{ gf.receiver.int(), gf.receiver.int(), bi, code[pc + 1], fname, gf.dst.int(), gf.dst.int() });
+                        pc += 2;
+                        continue;
+                    }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .InstanceOf) {
+                        const iot = &f.blocks[bi].insts[code[pc + 1]].InstanceOf;
+                        try w.print("  {{ static uint64_t KIS_{d}_{d} = 0;\n", .{ bi, code[pc + 1] });
+                        try w.print("    if (!kl_instanceof(ev, l{d}, g{d}, &KIS_{d}_{d}, \"{s}\", &l{d}, &g{d})) return 0; }}\n", .{ iot.src.int(), iot.src.int(), bi, code[pc + 1], iot.ty.name, iot.dst.int(), iot.dst.int() });
                         pc += 2;
                         continue;
                     }
