@@ -1,6 +1,27 @@
 # Leaf-production campaign: gate the compose-ui surface, bank the leaves
 
-STATUS 2026-09-01: NOT STARTED. Successor to
+STATUS 2026-09-01: COMPLETE — closing battery green (parity 401/0,
+every census floor, compose 1390/0, gate 5/5, rc=0; warm standing
+stack 594s from ride 3, the closing run's 895s was nine relinks plus a
+cold pack cache). Task 1 landed: compose-ui family gate (5 examples, byte-strict,
+fresh packs + cleared bake cache, green-tree memo; 34-37s after the
+ReleaseSafe + compose-closure-filter fix — the first cut ran
+install-local-packs on the DEBUG cli, 136-341s) standing in stack.sh's
+vpd-tail window and gate.sh, with the full corpus_check in gate.sh
+pinned to the freshened repo-local home; rode THREE green full stacks
+(rides at 869s/902s while the gate cost was being cut, then 594s —
+under the 10-minute line with gate AND leaves live). Task 2 landed:
+scripts/build-leaf-packs.sh (wide kotlin./kotlinx. library, 2310
+leaves, ~1s warm) built in the stack prelude and exported to the
+census waves, fail-open at every layer — datetime census 119 -> 106s,
+coroutines 107 -> 96s, both at their floors. Veins: anon-invoker route
+memo FIXED (module Func record, not funcAt's copy); bail damper LANDED
+(never-served 64-bail cutoff, sticky serve bit; vpd experiment
+100,004 -> 50,001 bails, wall-neutral — protection, not speedup);
+test-closure leaves CAPABLE-BUT-UNWIRED (multi-file `klio transpile`
++ colon-list KLIO_LEAVES landed; measured 110 -> 107s on the datetime
+census — the residue is object dispatch, 3s does not justify standing
+wiring). Successor to
 plans/object-runtime-campaign.md (closed complete): the leaf vehicle
 works but lives on scratchpad probes, and the compose-ui examples still
 have no standing gate — the census-gap lesson fired twice on exactly
