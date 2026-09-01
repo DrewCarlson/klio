@@ -159,6 +159,17 @@ From the plugin triage plan (see it for detail): corpus 285/295 — the
 receiver-loss residue (entry 46); plus checkboxLike slot-exact anchor,
 factory wrap, imbalance. Feature-correctness work, well-mapped.
 
+## Discovered (2026-09-01, open)
+
+- [ ] dispatched_delay_loop_is_cancellable (transpiled corpus) failed
+      ONCE under 8-way corpus load with "IR eval: virtual method
+      target is not executable"; 8-of-8 solo-green immediately after,
+      and the gate had been 401/0 four times the same day including
+      twice after the leaf vehicle landed. A threaded coroutine
+      example's load flake by the evidence; root-cause when it recurs
+      — if it does not, it stays a recorded observation, never
+      papered over.
+
 ## Standing policy
 
 - Measurement-first: no rung lands without before/after on a named
@@ -169,6 +180,13 @@ factory wrap, imbalance. Feature-correctness work, well-mapped.
   image (bakes not cross-process id-stable); ReleaseFast libzstd.a
   for transpiled links; bench on klio-harness, never Debug; installed
   packs shadow sources.
+- LEAF-KEY TRAP: registration keys are fqn#<param-sig> — overloads
+  share fqns (fromEpochDays Int/Long collided benignly before the
+  fix). And the key does NOT capture body-transforming ENV: a leaves
+  library must be emitted from a bake with the same body-changing
+  flags as the consumer (KLIO_COMPOSE_PLUGIN above all — a non-plugin
+  leaf for a plugin-transformed fqn would serve the WRONG BODY).
+  Compose-surface leaves must build under KLIO_COMPOSE_PLUGIN=1.
 - NEW TRAP (2026-09-01, cost one corpus-gate run): zig cc trusts a
   cache-manifest hit WITHOUT stat'ing the artifact — pruning o/ dirs
   while their h/ manifests survive (names do not correspond) leaves
