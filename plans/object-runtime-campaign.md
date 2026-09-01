@@ -183,6 +183,26 @@ factory wrap, imbalance. Feature-correctness work, well-mapped.
 
 ## Discovered (2026-09-01, open)
 
+- [ ] BARE-`Size` CLASS-TIER MIS-PICK (the live Task 2 item; found by
+      corpus_check, which had not run since 2026-08-15 — the
+      census-gap lesson again for the compose-ui examples): on some
+      bake orders the ui-unit/geometry surface constructs
+      androidx.annotation.Size for a bare `Size(w,h)` whose lowering
+      carried the imported geometry factory as the LONE candidate
+      (count=1) yet deferred (`shadowed=true`), and the runtime global
+      leg then binds the unimported class. Bake-order-DEPENDENT (three
+      consecutive clean rebuilds green, the next clean state red), so
+      any fix must be verified across repeated cold rebuilds.
+      Evidence: [bare] Size -> NONE shadowed=true at f1571:1237;
+      site1202 serves Size$Companion$Companion getters. Affects
+      compose_window, compose_multiwindow, compose_material3_text,
+      compose_foundation_draw (whose other two roots ARE fixed:
+      targetConstraints, modifyConstraints — the dispatch-owner-scope
+      commit). Also pending: compose_foundation's expectation re-bake
+      (the getValue warning legitimately moved stdout -> stderr), and
+      compose_material3's corpus timeout was a cold-bake artifact
+      (passes warm, 61s).
+
 - [ ] dispatched_delay_loop_is_cancellable (transpiled corpus) failed
       ONCE under 8-way corpus load with "IR eval: virtual method
       target is not executable"; 8-of-8 solo-green immediately after,
