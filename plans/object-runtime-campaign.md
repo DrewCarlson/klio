@@ -194,7 +194,18 @@ factory wrap, imbalance. Feature-correctness work, well-mapped.
       consecutive clean rebuilds green, the next clean state red), so
       any fix must be verified across repeated cold rebuilds.
       Evidence: [bare] Size -> NONE shadowed=true at f1571:1237;
-      site1202 serves Size$Companion$Companion getters. Affects
+      site1202 serves Size$Companion$Companion getters. NARROWED
+      (2026-09-01): with candidates non-null the overload leg is
+      authoritative and cannot pick the class; the serving hole is the
+      candidates==null case (a host-boundary/incomplete-header verdict
+      from cmgCandidates at PACK-BUILD time — cross-pack visibility of
+      the geometry factory varies with pack/image build state, hence
+      the bake-order dependence), which falls to the legacy
+      lookupGlobalThrowing name tier that binds classes with NO import
+      awareness. Fix direction: give the name-tier class pick the same
+      imported-over-unimported rank the function tier got in a2fd712d,
+      and/or make cmgCandidates' cross-pack candidate collection
+      order-independent. Affects
       compose_window, compose_multiwindow, compose_material3_text,
       compose_foundation_draw (whose other two roots ARE fixed:
       targetConstraints, modifyConstraints — the dispatch-owner-scope
