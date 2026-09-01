@@ -414,10 +414,14 @@ pub fn runTranspileDump(
 /// `zig cc out.c -I<include> -L<lib> -lklio_rt -lzstd`.
 pub fn runTranspile(
     gpa: std.mem.Allocator,
-    path: []const u8,
+    paths: []const []const u8,
     out_path: ?[]const u8,
     features: *RequestedFeatures,
 ) u8 {
+    // Additional files join the bake/lowering (a leaves emission over a
+    // TEST-source closure passes the whole set); the first file names
+    // the outputs and stays the program entry.
+    const path = paths[0];
     // The emitted ids (fids, const ids, trace file ids) are only
     // meaningful against ONE exact module, and an in-process bake is not
     // id-stable across processes — so the deliverable pins the module:
@@ -434,9 +438,9 @@ pub fn runTranspile(
         const stem = if (std.mem.endsWith(u8, c_out, ".c")) c_out[0 .. c_out.len - 2] else c_out;
         break :blk std.fmt.allocPrint(gpa, "{s}.klio-image", .{stem}) catch return 1;
     };
-    const bake_rc = bundle.bakeImage(gpa, &.{path}, features, image_path);
+    const bake_rc = bundle.bakeImage(gpa, paths, features, image_path);
     if (bake_rc == 0) {
-        if (bundle.assembleImageBuild(gpa, image_path, &.{path})) |asm_r| {
+        if (bundle.assembleImageBuild(gpa, image_path, paths)) |asm_r| {
             var built = asm_r.built;
             return transpileEmit(gpa, &built, path, c_out, image_path);
         }
@@ -989,17 +993,23 @@ fn leafTrace(f: *const ir.Func, comptime why: []const u8) void {
 /// The dlopened handle is deliberately leaked — the leaves live as long
 /// as the process.
 pub fn loadLeafLibrary() void {
-    const path = runtime.envOnce("KLIO_LEAVES") orelse return;
-    var lib = std.DynLib.open(path) catch {
-        std.debug.print("warning: KLIO_LEAVES: cannot open {s}\n", .{path});
-        return;
-    };
-    const Entry = *const fn (reg: *const fn (fqn: [*:0]const u8, f: ir.eval.NativeLeafFn) callconv(.c) void) callconv(.c) void;
-    const entry = lib.lookup(Entry, "klio_leaves_entry") orelse {
-        std.debug.print("warning: KLIO_LEAVES: {s} has no klio_leaves_entry\n", .{path});
-        return;
-    };
-    entry(&leafRegShim);
+    const spec = runtime.envOnce("KLIO_LEAVES") orelse return;
+    // Colon-separated list; later libraries win on a key collision
+    // (registration overwrites), so order suite-specific after generic.
+    var it = std.mem.splitScalar(u8, spec, ':');
+    while (it.next()) |path| {
+        if (path.len == 0) continue;
+        var lib = std.DynLib.open(path) catch {
+            std.debug.print("warning: KLIO_LEAVES: cannot open {s}\n", .{path});
+            continue;
+        };
+        const Entry = *const fn (reg: *const fn (fqn: [*:0]const u8, f: ir.eval.NativeLeafFn) callconv(.c) void) callconv(.c) void;
+        const entry = lib.lookup(Entry, "klio_leaves_entry") orelse {
+            std.debug.print("warning: KLIO_LEAVES: {s} has no klio_leaves_entry\n", .{path});
+            continue;
+        };
+        entry(&leafRegShim);
+    }
 }
 
 /// Print leaf-gate engagement counters at exit (KLIO_LEAF_DIAG=1).

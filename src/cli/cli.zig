@@ -158,7 +158,8 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
         defer features.deinit();
         return commands.runTranspileDump(gpa, rest[0], &features);
     } else if (std.mem.eql(u8, cmd, "transpile")) {
-        var file: ?[]const u8 = null;
+        var files: std.ArrayList([]const u8) = .empty;
+        defer files.deinit(gpa);
         var out: ?[]const u8 = null;
         var bad = false;
         var i: usize = 0;
@@ -170,20 +171,17 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
                 }
                 out = rest[i + 1];
                 i += 1;
-            } else if (file == null) {
-                file = rest[i];
             } else {
-                bad = true;
-                break;
+                files.append(gpa, rest[i]) catch return 1;
             }
         }
-        if (bad or file == null) {
-            printErr(gpa, "usage: klio transpile <file.kt> [-o out.c]\n", .{});
+        if (bad or files.items.len == 0) {
+            printErr(gpa, "usage: klio transpile <file.kt> [more.kt ...] [-o out.c]\n", .{});
             return 2;
         }
         var features = commands.RequestedFeatures.init(gpa);
         defer features.deinit();
-        return commands.runTranspile(gpa, file.?, out, &features);
+        return commands.runTranspile(gpa, files.items, out, &features);
     } else if (std.mem.eql(u8, cmd, "run")) {
         return runRunCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "test")) {

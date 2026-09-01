@@ -1289,6 +1289,12 @@ pub const Func = struct {
     /// before the program runs, so the first resolution is final;
     /// benign-race fill.
     leaf_route: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Leaf bail damper: bit 31 = the leaf SERVED at least once (sticky —
+    /// a genre-mixed fn must never be disabled); low bits count bails
+    /// while never-served. A leaf that only ever bails is structural for
+    /// this program's call shapes, and every attempt still pays marshal +
+    /// a partial body — past the threshold the route flips to `none`.
+    leaf_bail_probe: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// The bytecode-stream table for this func (`bc.funcStreams` memo):
     /// 0 unresolved, 1 none, else a `*const bc.FuncStreams` address.
     /// `bc_memo_fuse` records which allow_fuse variant the memo holds

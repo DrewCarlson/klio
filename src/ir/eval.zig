@@ -8252,9 +8252,20 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
     const cctx: ?*anyopaque = if (nctx) |nc| @ptrCast(nc) else null;
     if (klf(cctx, &ev, &argv, &argg, &rl, &rg, 0, &aux, &auxg) == 0) {
         _ = leaf_diag_bail.fetchAdd(1, .monotonic);
+        // Bail damper: a leaf that has NEVER served and keeps bailing is
+        // structural for this program's call shapes — stop attempting it.
+        // The served bit is sticky, so a genre-mixed fn stays enabled.
+        const probe = @constCast(cf).leaf_bail_probe.fetchAdd(1, .monotonic);
+        if (probe & 0x8000_0000 == 0 and (probe & 0x7FFF_FFFF) >= 64) {
+            @constCast(cf).leaf_route.store(1, .release);
+        }
         return null;
     }
     _ = leaf_diag_serve.fetchAdd(1, .monotonic);
+    const probe0 = cf.leaf_bail_probe.load(.monotonic);
+    if (probe0 & 0x8000_0000 == 0) {
+        _ = @constCast(cf).leaf_bail_probe.fetchOr(0x8000_0000, .monotonic);
+    }
     if (runtime.envOnce("KLIO_LEAF_TRACE_SERVE") != null) {
         std.debug.print("[leaf-serve] {s} rg={d} rl={d}\n", .{ cf.fqn, rg, rl });
     }
