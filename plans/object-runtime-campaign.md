@@ -32,17 +32,30 @@ C". This campaign is the runtime half.
 
 ## Round 0 — hygiene (one short round, lock in last week's gains)
 
-- [ ] Tighten ratchet floors to the repeatedly-measured greens:
-      compose 1386 -> 1390, androidx 1830 -> 1841, coroutines 1285 ->
-      1295 (solo 1299; keep load margin), and shrink the vpd declared
-      budget 645 -> 580 (GC-relaxed in-stack 525-535 across four
-      stacks, solo 510).
-- [ ] The two absorbed load-flakes: root-cause or record-as-measured.
-      resumeOnBackgroundThread breached its 300s cap once under the
-      all-eight-width-4 census wave (structure since replaced);
-      tl_cancel_via_coroutine_context is a legitimately racy fixture
-      (yield() is not a barrier) structurally dodged by litmus-last.
-      Neither may be papered over silently.
+- [x] Ratchets tightened (2026-09-01): compose 1386 -> 1390, androidx
+      1830 -> 1841, coroutines 1285 -> 1295 (solo 1299; margin kept
+      for load), vpd declared budget 645 -> 580 (GC-relaxed in-stack
+      525-535 across four stacks, solo 510). Battery verdict below.
+- [x] The two absorbed load-flakes, recorded-as-measured
+      (2026-09-01), neither papered over:
+      * resumeOnBackgroundThread (1000 one-at-a-time cross-thread
+        round-trips, ~40-55s solo): breached its 300s wall-cap ONCE,
+        under the discarded all-eight-suites-at-width-4 wave that also
+        dropped androidx children to DNC — an oversubscription
+        casualty of a structure that no longer exists. Green in every
+        stack under the two-wave L3-split structure. Its per-test cap
+        stays 300s; a breach there again means the structure regressed,
+        which is exactly what the cap is for.
+      * tl_cancel_via_coroutine_context: the fixture itself is racy —
+        `yield()` does not guarantee the launched child's first
+        dispatch ran before `cancel()`, on the JVM oracle too; klio's
+        interpreted window is just wider. Under load the pre-cancel
+        dispatch loses the race and `c1-cancelled` never prints.
+        Structural remedy (litmus runs last, alone, on a quiet box)
+        matches the fixture's implicit assumption instead of hiding
+        the mismatch; solo it is deterministic-green. An interpreter
+        change to force yield-as-barrier would DIVERGE from Kotlin
+        semantics and is rejected.
 
 ## Task 1 — widen kl_ eligibility to object shapes (the campaign core)
 

@@ -33,7 +33,7 @@ const runtime = @import("runtime");
 // the builder its own body was appending to. The suite now reports 1841
 // passed, 0 failed, 0 did not complete — previously 1500/0 with 6 classes
 // timing out, which is how a real failure hid behind a green ceiling.
-const BASELINE: usize = 1830; // tightened 2026-08-31: measured 1841/0 (red-mass closeout)
+const BASELINE: usize = 1841; // tightened 2026-09-01: 1841/0 across five consecutive full stacks
 
 /// Ceiling on failing cases, the mirror of `BASELINE`. 15 -> 4 -> 0 as two
 /// resolution roots closed: overloaded inline extensions no longer bind by
