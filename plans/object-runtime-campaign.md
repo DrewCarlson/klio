@@ -149,7 +149,29 @@ surface). Requirements discovered:
       built from the TEST-source closure (assertEquals/next interpreted
       today), per-suite leaf packs wired into stack.sh/census, the
       anon-invoker route-memo copy (funcAt returns a Func copy so its
-      leaf_route memo is discarded per call).
+      leaf_route memo is discarded per call), and a repeated-bail
+      damper (vpd logged 100k bails; each is marshal + partial body).
+- [x] SHADOWED-BODY GUARD (2026-09-01, found by a census floor doing
+      its job): widening leaves to the kotlin.* surface leaf-served
+      the CLOCK STUB __klio_time_systemMillis — its pack body is a
+      dummy the link step shadows with a host intrinsic, and the leaf
+      compiled the dummy (InstantTest.testNow got epoch 0; census
+      519 -> 518/1 caught it). tryLeafValues now refuses any fn
+      `funcRunsItsBody` disowns (native binding or sibling redirect),
+      checked once at route resolution. Wide-surface census after the
+      guard: 519/0 at 109s. LESSON: leaf eligibility must mirror
+      EVERY dispatch-shadow the interpreter honors; the census floors
+      are the net that catches the ones it misses.
+- [x] COMPOSE CUSTOMERS CLOSED BY MEASUREMENT (2026-09-01, leaves
+      built under KLIO_COMPOSE_PLUGIN=1 per the trap): SlotTableTests
+      19,696 serves, wall 65 -> 66s NEUTRAL (480/480 both — the hot
+      code is gap-buffer array/object work, not leaf-shaped); vpd
+      513s wall / 497s body vs 510/494 baseline NEUTRAL (66,975
+      serves + 100,004 bails across a 9-minute body). Recomposition
+      has no scalar-leaf share; vpd's floor stands on the
+      verification campaign's terms. Rung D (object reads) is the
+      only shape that could reach these bodies — decide it from the
+      datetime wide-surface numbers, not from compose.
 
 ## Task 2 — compose completeness residue (interleave when Task 1
 blocks on measurement)

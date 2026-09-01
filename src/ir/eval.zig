@@ -8140,13 +8140,26 @@ pub const LeafOutcome = union(enum) { val: Value, raise: EvalError };
 pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Module, cf: *const Func, args: []const Value, host: *H, nctx: ?*NativeCtx) Allocator.Error!?LeafOutcome {
     if (!native_leaf_any.load(.acquire)) return null;
     if (args.len > 8 or args.len != cf.params.len) return null;
+
     // Per-Func route memo: the registry lookup (mutex + hash + fqn
     // compare) priced every call by ~20% on a call-dense benchmark;
     // the table is write-once, so one resolution is final.
     const route = cf.leaf_route.load(.acquire);
     const klf: NativeLeafFn = switch (route) {
         0 => blk_r: {
-            const f0 = nativeLeafFor(cf.id.int(), cf.fqn) orelse nativeLeafForFunc(cf);
+            // A symbol the link step settled onto a native binding (or a
+            // sibling redirect) never runs its lowered body — the leaf
+            // compiled that body, so serving it would bypass the host
+            // intrinsic (the clock stub __klio_time_systemMillis
+            // leaf-served 0). Checked once; the memo pins the verdict.
+            const runs_body = if (comptime @hasDecl(H, "funcRunsItsBody"))
+                host.funcRunsItsBody(cf.id)
+            else
+                true;
+            const f0: ?NativeLeafFn = if (!runs_body)
+                null
+            else
+                nativeLeafFor(cf.id.int(), cf.fqn) orelse nativeLeafForFunc(cf);
             const enc: usize = if (f0) |fp| @intFromPtr(fp) else 1;
             @constCast(cf).leaf_route.store(enc, .release);
             break :blk_r f0 orelse return null;
@@ -8222,6 +8235,9 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
         return null;
     }
     _ = leaf_diag_serve.fetchAdd(1, .monotonic);
+    if (runtime.envOnce("KLIO_LEAF_TRACE_SERVE") != null) {
+        std.debug.print("[leaf-serve] {s} rg={d} rl={d}\n", .{ cf.fqn, rg, rl });
+    }
     if (rg == leaf_ctor_tail_genre) {
         const sd: *CtorSite = @ptrFromInt(@as(usize, @bitCast(rl)));
         const memo = @atomicLoad(u64, &sd.memo, .acquire);
