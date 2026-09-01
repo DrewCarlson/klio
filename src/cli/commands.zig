@@ -878,6 +878,15 @@ fn transpileEmit(
     // walk to the image's library bodies. The fids the emitter registers must
     // match the fids the running binary resolves, which the pinned image
     // guarantees.
+    // THE NATIVE FLOOR (plans/native-floor-and-tower-campaign.md): the
+    // per-op op-helper bodies pay one host-ABI crossing per instruction
+    // and measured ~10x SLOWER than the runtime's own drivers on
+    // object-heavy code, while never beating them elsewhere — so by
+    // default only the kl_ leaves emit and register, and everything
+    // else runs through libklio_rt's interpreter over the pinned image
+    // (native >= interpreted by construction). The op-helper emitter
+    // stays behind KLIO_TRANSPILE_OPHELPERS=1 for bisection.
+    const emit_ophelpers = runtime.envOnce("KLIO_TRANSPILE_OPHELPERS") != null;
     for (m.funcs.items) |*f| {
         if (!emitFor(pkg_sel, f)) continue;
         if (f.blocks.len == 0 and !m.ensureFuncBody(@constCast(f))) continue;
@@ -888,8 +897,10 @@ fn transpileEmit(
             emitLeafFunc(w, m, f, fs, m.consts.items) catch return 1;
             leaf_emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
         }
-        emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
-        emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+        if (emit_ophelpers) {
+            emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
+            emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+        }
     }
     for (extra_funcs.items) |f| {
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
@@ -900,8 +911,10 @@ fn transpileEmit(
             emitLeafFunc(w, m, f, fs, m.consts.items) catch return 1;
             leaf_emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
         }
-        emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
-        emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+        if (emit_ophelpers) {
+            emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
+            emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+        }
     }
 
     w.print("void klio_transpiled_register(void) {{\n", .{}) catch return 1;

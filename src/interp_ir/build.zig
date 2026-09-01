@@ -4059,7 +4059,15 @@ fn buildModuleWithOverrides(
                 const okey = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ owner, recv_key });
                 try extension_props.put(.{ .a = okey, .b = p.name.name }, fid);
                 try owner_keyed_ext_names.put(p.name.name, {});
-                if (p.visibility != .Private) {
+                // KLIO_MEXT_TOWER_STRICT=1: kotlinc-exact scoping — a
+                // NON-private member extension is also visible only where
+                // its owner is a receiver (the tower) or via import, never
+                // program-wide. The plain pair remains the default until
+                // the tower emulation's re-measured miss count clears
+                // (plans/native-floor-and-tower-campaign.md Task 2).
+                if (p.visibility != .Private and
+                    runtime.envOnce("KLIO_MEXT_TOWER_STRICT") == null)
+                {
                     try extension_props.put(.{ .a = recv_key, .b = p.name.name }, fid);
                 }
             } else {
