@@ -31,7 +31,6 @@ before=$(du -sh "$CACHE" | cut -f1)
 
 # Pass 1: age.
 find "$CACHE/o" -mindepth 1 -maxdepth 1 -type d -mtime "+$DAYS" -exec rm -rf {} + 2>/dev/null || true
-find "$CACHE/h" -type f -mtime "+$DAYS" -delete 2>/dev/null || true
 rm -rf "$CACHE/tmp"/* 2>/dev/null || true
 
 # Pass 2: size target, oldest first, sparing the last 6 hours.
@@ -47,6 +46,14 @@ if [ "$used" -gt "$target_bytes" ]; then
     freed=$((freed + sz))
   done < <(find "$CACHE/o" -mindepth 1 -maxdepth 1 -type d -mmin +360 -printf '%T@\t%p\n' 2>/dev/null | sort -n)
 fi
+
+# Manifests die whenever artifacts were pruned: h/ names do not map to
+# o/ names, and a surviving manifest whose artifact is gone DANGLES —
+# zig cc trusts the manifest hit without stat'ing the artifact and ld
+# then fails on the missing .o (cost one corpus-gate run). h/ is a few
+# hundred MB; wiping it costs one revalidation pass, not a rebuild of
+# anything whose artifact survived.
+rm -f "$CACHE/h"/* 2>/dev/null || true
 
 after=$(du -sh "$CACHE" | cut -f1)
 echo "pruned .zig-cache (> ${DAYS}d, target ${TARGET_GB}G): $before -> $after"

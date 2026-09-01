@@ -960,6 +960,12 @@ fn leafEligible(gpa: std.mem.Allocator, f: *const ir.Func, fs: *const ir.bc.Func
             ok = false;
             break;
         }
+        // A throw-terminated block never runs natively: the emitter
+        // replaces its whole body with `return 0` (bail), and the
+        // interpreter's exact re-run raises the real throwable. So the
+        // guard pattern (StringConcat + NewInstance + throw on the cold
+        // path) costs a body nothing.
+        if (blk.terminator == .Throw) continue;
         const st = (if (bi < fs.streams.len) fs.streams[bi] else null) orelse {
             leafTrace(f, "no-stream");
             ok = false;
@@ -1190,7 +1196,7 @@ fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, con
     const fid = f.id.int();
     var max_reg: u32 = 0;
     for (f.blocks, 0..) |*blk, bi| {
-        _ = blk;
+        if (blk.terminator == .Throw) continue;
         const st = fs.streams[bi] orelse continue;
         const code = st.code;
         var pc: usize = 0;
@@ -1246,7 +1252,10 @@ fn emitLeafFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, con
         try w.print("  int64_t l{d} = 0; int g{d} = 3; (void)l{d}; (void)g{d};\n", .{ r, r, r, r });
     }
     for (f.blocks, 0..) |*blk2, bi| {
-        _ = blk2;
+        if (blk2.terminator == .Throw) {
+            try w.print("KLB{d}:;\n  return 0;\n", .{bi});
+            continue;
+        }
         try w.print("KLB{d}:;\n", .{bi});
         const st = fs.streams[bi] orelse return error.Unexpected;
         const code = st.code;
