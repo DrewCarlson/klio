@@ -37,6 +37,15 @@ fn moduleAllocator(module: *Module) Allocator {
     return module.func_name_index.allocator;
 }
 
+/// `pushFunc` + a decl_span stamp: a synthesized fn carries the file its
+/// body was written in, which the import-scoped member-extension probe
+/// (and any other frame-file attribution) reads at run time.
+fn pushFuncSpanned(module: *Module, func_in: Func, body_span: ast.Span) Allocator.Error!FuncId {
+    const id = try pushFunc(module, func_in);
+    try module.decl_span.put(id.int(), body_span);
+    return id;
+}
+
 /// Assign the next `FuncId` to `func` and append it to the module.
 fn pushFunc(module: *Module, func_in: Func) Allocator.Error!FuncId {
     // FuncId indexes module.funcs; the IR caps the func count at u32.
@@ -133,7 +142,7 @@ pub fn lowerExprAsThunkTyped(module: *Module, expr: *const Expr, name: []const u
     b.restoreExpected(prev);
     b.terminate(.{ .Return = v });
     const func = try b.finish(name, name, build.typeUnit());
-    return pushFunc(module, func);
+    return pushFuncSpanned(module, func, expr.span());
 }
 
 /// Lower a block as a 0-arg synthetic function. The block's trailing
@@ -145,7 +154,7 @@ pub fn lowerBlockAsThunk(module: *Module, block: *const ast.Block, name: []const
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     const func = try b.finish(name, name, build.typeUnit());
-    return pushFunc(module, func);
+    return pushFuncSpanned(module, func, block.span);
 }
 
 /// 1-arg block thunk for setter bodies.
@@ -162,7 +171,7 @@ pub fn lowerBlockAsUnaryThunk(
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     const func = try b.finish(name, name, build.typeUnit());
-    return pushFunc(module, func);
+    return pushFuncSpanned(module, func, block.span);
 }
 
 /// Lower an expression as a 2-arg synthetic function bound under
@@ -181,7 +190,7 @@ pub fn lowerBinaryExprAsThunk(
     const v = try lowerExpr(&b, expr);
     b.terminate(.{ .Return = v });
     const func = try b.finish(name, name, build.typeUnit());
-    return pushFunc(module, func);
+    return pushFuncSpanned(module, func, expr.span());
 }
 
 pub fn lowerExprAsParamThunk(
@@ -247,7 +256,7 @@ pub fn lowerExprAsParamThunkScopedEnclosing(
         func.params = try accessorParams(allocator, params);
     }
     func.has_receiver_param = leadsWithThis(params);
-    return pushFunc(module, func);
+    return pushFuncSpanned(module, func, expr.span());
 }
 
 /// Whether a synthesized param list leads with the implicit `this`
@@ -291,7 +300,7 @@ pub fn lowerInitBlockWithParams(
     var func = try b.finish(name, name, build.typeUnit());
     func.params = try accessorParams(allocator, params);
     func.has_receiver_param = leadsWithThis(params);
-    return pushFunc(module, func);
+    return pushFuncSpanned(module, func, block.span);
 }
 
 /// Lower a function shell that takes the named params and returns Unit.
@@ -325,7 +334,7 @@ pub fn lowerInitBlock(
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
     func.has_receiver_param = true;
-    return pushFunc(module, func);
+    return pushFuncSpanned(module, func, block.span);
 }
 
 /// Compute the set of `var`s (body decls plus params) that a nested lambda in
@@ -586,7 +595,7 @@ pub fn lowerSetterBlockTyped(
     var func = try b.finish(name, name, build.typeUnit());
     func.params = try accessorParams(allocator, params);
     func.has_receiver_param = leadsWithThis(params);
-    return pushFunc(module, func);
+    return pushFuncSpanned(module, func, block.span);
 }
 
 pub fn lowerSetterExprTyped(
@@ -616,7 +625,7 @@ pub fn lowerSetterExprTyped(
     var func = try b.finish(name, name, build.typeUnit());
     func.params = try accessorParams(allocator, params);
     func.has_receiver_param = leadsWithThis(params);
-    return pushFunc(module, func);
+    return pushFuncSpanned(module, func, expr.span());
 }
 
 pub fn lowerUnaryExprAsThunk(
@@ -631,7 +640,7 @@ pub fn lowerUnaryExprAsThunk(
     const v = try lowerExpr(&b, expr);
     b.terminate(.{ .Return = v });
     const func = try b.finish(name, name, build.typeUnit());
-    return pushFunc(module, func);
+    return pushFuncSpanned(module, func, expr.span());
 }
 
 // -------------------------------------------------------------------------
