@@ -1,6 +1,12 @@
 # Object-runtime campaign: move the interpreted floor itself
 
-STATUS 2026-09-01: Round 0 CLOSED green; rungs B/C landed (throw-block bail, ctor-tail via NewInstance + class-bound bare calls, inline scalar conversions); rung V (leaf vehicle) is the gating work. Successor to the verification-latency
+STATUS 2026-09-01: COMPLETE. Round 0 green; every Task 1 rung landed
+with a measured win or closed by measurement (A, B, C/C2/A2, V landed;
+D/E closed); Task 2's residue FIXED (the window/draw family green
+across three cold rebuilds via the file-scope class-pick root fix; the
+foundation expectation re-baked) with the corpus at 404/404. Full
+battery green throughout (parity 401/0, all census floors, compose
+1390/0). Exit conditions met. Successor to the verification-latency
 campaign (plans/verification-latency-campaign.md, closed targets-met):
 verification is fast; the floors that remain ARE the production
 runtime on object-heavy code.
@@ -96,14 +102,20 @@ on corpus parity 401/401 + measured on a named customer:
       collects it; purity holds). Customer: dateFromEpochDays
       complete -> the fromEpochDays test body's per-iteration
       LocalDate.
-- [ ] Rung D — read-only object access: SHAPES-guarded field loads +
-      array reads inside kl_ regions (guard miss = bail; loads are
-      side-effect-free so the bail contract survives). Customer:
-      LocalDate.equals (field compares), SlotTable IntArray reads.
-- [ ] Rung E (only if A-D measure well) — side-effecting stores with
-      real deopt points; breaks pure-replay, needs a materialization
-      contract. Decide from the D measurement whether the remaining
-      floor justifies it.
+- [x] Rung D CLOSED BY MEASUREMENT (2026-09-01): read-only object
+      access has no remaining customer above threshold. The datetime
+      census already stands at 109-111s with scalar leaves (target
+      120); its residue is assertEquals plumbing + LocalDate.equals +
+      `next` — D could shave perhaps 10-15s of an already-met target.
+      The other named customers cannot benefit: vpd and SlotTable are
+      WRITE-heavy (leaves measured 67k serves/100k bails and 19.7k
+      serves respectively, both wall-neutral), so loads alone never
+      reach their floors. D stays the recorded next lever (object
+      handles + SHAPES guards over the leaf ABI) for a future customer
+      that is read-dominated.
+- [x] Rung E closes with D (it was gated on D measuring well; the
+      write-heavy bodies that would need E are the same ones five perf
+      campaigns measured as exhausted through every tier).
 Exit per rung: measured wall movement on at least one named customer
 (the datetime census's 119s / the vpd body / SlotTableTests), or a
 recorded closed-by-measurement verdict.
