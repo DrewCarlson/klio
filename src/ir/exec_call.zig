@@ -1797,6 +1797,48 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
                             }
                         }
                     }
+                    // A scope-qualified read whose owner's property is a
+                    // MEMBER-EXTENSION property (`private val
+                    // Density.targetConstraints` inside SizeNode, read bare
+                    // in `MeasureScope.measure`) binds TWO receivers: the
+                    // owning candidate dispatches, and the innermost
+                    // candidate satisfying the getter's declared receiver
+                    // is `this`. Same bind as the bare member-extension
+                    // call arm, at arity zero.
+                    if (comptime @hasDecl(H, "memberExtOverridesFor") and @hasDecl(H, "receiverImplementsType")) {
+                        var cands3_l = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, bare_name, null);
+                        defer releaseCands(allocator, &cands3_l);
+                        const cands3 = cands3_l.items;
+                        const ka3 = pinImplicitCandidates(cands3);
+                        defer runtime.keepaliveRestore(ka3);
+                        for (cands3) |c3| {
+                            if (c3.v != .Instance) continue;
+                            var fids3: [4]ir.FuncId = @splat(@enumFromInt(0));
+                            const nf3 = host.memberExtOverridesFor(&c3.v, bare_name, 1, &fids3);
+                            for (fids3[0..nf3]) |gfid| {
+                                const gf = frame.module.funcById(gfid) orelse continue;
+                                var er3: ?Value = null;
+                                for (cands3) |c4| {
+                                    if (c4.v != .Instance) continue;
+                                    if (host.receiverImplementsType(&c4.v, gf.params[0].ty.name)) {
+                                        er3 = c4.v;
+                                        break;
+                                    }
+                                }
+                                const ev3 = er3 orelse continue;
+                                pushEnclosing(&c3.v);
+                                defer popEnclosing();
+                                orAudit("LoadFromThisOrGlobal", bare_name, "member_ext_prop", c3.depth, &ev3);
+                                switch (try host.callFuncNamed(allocator, frame.module, gfid, &.{ev3}, &.{})) {
+                                    .ok => |v3| {
+                                        try frame.write(lt.dst, v3);
+                                        return .cont;
+                                    },
+                                    .err => |e3| return raiseStep(frame, e3),
+                                }
+                            }
+                        }
+                    }
                     const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{bare_name});
                     if (missTraceWant()) |w| {
                         if (std.mem.eql(u8, w, bare_name)) {

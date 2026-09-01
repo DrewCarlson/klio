@@ -2169,6 +2169,26 @@ pub fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
 /// Push `v` as an enclosing implicit receiver for the about-to-be-invoked
 /// callable. Appends to the current frame's chain; the invoked frame picks
 /// it up at entry. A no-op (silently dropped) when no frame is active.
+/// Iterate the pushed enclosing receivers, innermost first. The values are
+/// borrowed from the live chain — do not retain past the call.
+pub const EnclosingChainIter = struct {
+    idx: usize,
+    pub fn next(self: *EnclosingChainIter) ?Value {
+        const chain = evtls.active_chain orelse return null;
+        while (self.idx > 0) {
+            self.idx -= 1;
+            const e = chain.items[self.idx];
+            if (e.kind == .receiver or e.kind == .subject) return e.v;
+        }
+        return null;
+    }
+};
+
+pub fn enclosingChainIter() EnclosingChainIter {
+    const chain = evtls.active_chain orelse return .{ .idx = 0 };
+    return .{ .idx = chain.items.len };
+}
+
 pub fn pushEnclosing(v: *const Value) void {
     const chain = evtls.active_chain orelse return;
     chain.append(chainAllocator(), .{ .v = v.*, .kind = .receiver }) catch {};

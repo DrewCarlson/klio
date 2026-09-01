@@ -2865,6 +2865,30 @@ fn ownerKeyedExtProp(comptime setters: bool, map: anytype, recv_key: []const u8,
         slot.* = .{ .key = k, .gen = gen, .hit = found != null, .fid = if (found) |f| f.int() else NO_FID };
         if (found) |fid| return fid;
     }
+    // The bare member-extension call arm passes its DISPATCH OWNER by
+    // pushing it on the enclosing chain, never as a frame `this` — inside
+    // `MeasureScope.measure` reached via `with(node) { measure(...) }`,
+    // the node (which owns `private val Density.targetConstraints`) is
+    // only there. Probe those receivers with the same memo.
+    var eit = ir.eval.enclosingChainIter();
+    while (eit.next()) |v| {
+        if (v != .Instance) continue;
+        const cls = blk: {
+            const g = v.Instance.borrow();
+            defer g.deinit();
+            break :blk g.get().class;
+        };
+        const k = ownerKeyedSlotKey(cls.identity(), recv_key, name);
+        const slot = &memo[(k >> 7) % memo.len];
+        const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
+        if (slot.key == k and slot.gen == gen) {
+            if (!slot.hit) continue;
+            return FuncId.from(slot.fid);
+        }
+        const found = ownerKeyedForClass(cls, map, recv_key, name);
+        slot.* = .{ .key = k, .gen = gen, .hit = found != null, .fid = if (found) |f| f.int() else NO_FID };
+        if (found) |fid| return fid;
+    }
     return null;
 }
 
