@@ -746,6 +746,8 @@ fn transpileEmit(
         \\
     , .{}) catch return 1;
 
+    w.print("{s}", .{leaf_getfield_c}) catch return 1;
+
     const Emitted = struct { fid: u32, fqn: []const u8 };
     var emitted: std.ArrayList(Emitted) = .empty;
     defer emitted.deinit(gpa);
@@ -858,7 +860,17 @@ fn transpileEmit(
         if (drop) |d| {
             if (std.c.getenv("KLIO_LEAF_TRACE") != null) {
                 const df = m.funcById(ir.FuncId.from(d));
-                std.debug.print("[leaf-prune] {s}\n", .{if (df) |x| x.fqn else "?"});
+                var why: []const u8 = "?";
+                if (leaf_targets.getPtr(d)) |ent| {
+                    for (ent.targets.items) |t| {
+                        if (!leaf_targets.contains(t.fid)) {
+                            const tf = m.funcById(ir.FuncId.from(t.fid));
+                            why = if (tf) |x| x.fqn else "<missing>";
+                            break;
+                        }
+                    }
+                }
+                std.debug.print("[leaf-prune] {s} <- {s}\n", .{ if (df) |x| x.fqn else "?", why });
             }
             var v = leaf_targets.fetchRemove(d).?.value;
             v.targets.deinit(gpa);
@@ -1021,6 +1033,24 @@ pub fn loadLeafLibrary() void {
             std.debug.print("warning: KLIO_LEAVES: {s} has no klio_leaves_entry\n", .{path});
             continue;
         };
+        // A library carrying frozen KVC layout constants (leaf field
+        // reads) must match THIS runtime's layout byte-for-byte; a
+        // mismatched library is refused whole (fail-open — the
+        // interpreter just runs leafless).
+        const Frozen = *const fn () callconv(.c) *const ir.hot_layout.HotLayout;
+        if (lib.lookup(Frozen, "klio_leaves_frozen")) |froz| {
+            var live: ir.hot_layout.HotLayout = undefined;
+            ir.hot_layout.fillLayout(&live);
+            const fr = froz();
+            var lay_ok = true;
+            inline for (@typeInfo(ir.hot_layout.HotLayout).@"struct".fields) |fld| {
+                if (@field(live, fld.name) != @field(fr, fld.name)) lay_ok = false;
+            }
+            if (!lay_ok) {
+                std.debug.print("warning: KLIO_LEAVES: {s} layout mismatch — refused\n", .{path});
+                continue;
+            }
+        }
         entry(&leafRegShim);
     }
 }
@@ -1033,6 +1063,54 @@ pub fn leafDiagDump() void {
 fn leafRegShim(fqn: [*:0]const u8, f: ir.eval.NativeLeafFn) callconv(.c) void {
     ir.eval.registerNativeLeafFqn(std.mem.span(fqn), f);
 }
+
+/// Leaf field read over a genre-8 instance handle, shared by the
+/// full-program and leaves-mode preambles (keep the two emissions
+/// byte-identical). Requires the KVC_* constants and kv_tag/kv_int/
+/// kv_long/kv_char/kv_inst helpers to be in scope.
+const leaf_getfield_c =
+    \\static inline int32_t kl_getfield(klio_edge_view *ev, int64_t rl, int32_t rgv, uint64_t *site, const char *name, int64_t *ol, int32_t *og) {
+    \\  if (rgv != 8) return 0;
+    \\  uint8_t *cell = (uint8_t *)(uintptr_t)rl;
+    \\  if (!cell) return 0;
+    \\  uint8_t *inst = cell + KVC_CELL_DATA_OFF;
+    \\  uint64_t cls;
+    \\  memcpy(&cls, inst + KVC_INST_CLASS_OFF, sizeof(uint64_t));
+    \\  uint64_t cls48 = cls & 0xFFFFFFFFFFFFull;
+    \\  uint64_t want = *site;
+    \\  if ((want >> 16) != cls48 || (want & 0xFFFFu) == 0) {
+    \\    if (!ev->field_route) return 0;
+    \\    uint64_t rcls = 0;
+    \\    int32_t rslot = -1;
+    \\    if (!ev->field_route(ev->route_ctx, cell, name, &rcls, &rslot)) return 0;
+    \\    /* The route was resolved against THIS receiver, so its slot binds
+    \\     * to this receiver's class word; the claim's own identity value
+    \\     * lives in a different space and is not comparable here. */
+    \\    (void)rcls;
+    \\    if (rslot < 0 || rslot >= 0xFFFE) return 0;
+    \\    want = (cls48 << 16) | (uint64_t)(rslot + 1);
+    \\    *site = want;
+    \\  }
+    \\  size_t slot = (size_t)((want & 0xFFFFu) - 1u);
+    \\  uint8_t *fields = inst + KVC_INST_FIELDS_OFF;
+    \\  uint8_t *items;
+    \\  size_t len;
+    \\  memcpy(&items, fields + KVC_FIELDS_PTR_OFF, sizeof(void *));
+    \\  memcpy(&len, fields + KVC_FIELDS_LEN_OFF, sizeof(size_t));
+    \\  if (slot >= len) return 0;
+    \\  const uint8_t *s = items + slot * KVC_FIELD_STRIDE + KVC_FIELD_VALUE_OFF;
+    \\  uint64_t t = kv_tag(s);
+    \\  if (t == KVC_TAG_INT) { *ol = (int64_t)kv_int(s); *og = 0; }
+    \\  else if (t == KVC_TAG_LONG) { *ol = kv_long(s); *og = 1; }
+    \\  else if (t == KVC_TAG_BOOL) { uint8_t b = 0; memcpy(&b, s + KVC_BOOL_OFF, 1); *ol = b; *og = 2; }
+    \\  else if (t == KVC_TAG_UNIT) { *ol = 0; *og = 3; }
+    \\  else if (t == KVC_TAG_CHAR) { *ol = (int64_t)kv_char(s); *og = 4; }
+    \\  else if (t == KVC_TAG_INSTANCE) { void *p = kv_inst(s); if (!p) return 0; *ol = (int64_t)(uintptr_t)p; *og = 8; }
+    \\  else return 0;
+    \\  return 1;
+    \\}
+    \\
+;
 
 fn leafEmitFor(sel: ?[]const u8, f: *const ir.Func) bool {
     if (f.package.len == 0) return true;
@@ -1132,7 +1210,17 @@ fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []cons
         if (drop) |d| {
             if (std.c.getenv("KLIO_LEAF_TRACE") != null) {
                 const df = m.funcById(ir.FuncId.from(d));
-                std.debug.print("[leaf-prune] {s}\n", .{if (df) |x| x.fqn else "?"});
+                var why: []const u8 = "?";
+                if (leaf_targets.getPtr(d)) |ent| {
+                    for (ent.targets.items) |t| {
+                        if (!leaf_targets.contains(t.fid)) {
+                            const tf = m.funcById(ir.FuncId.from(t.fid));
+                            why = if (tf) |x| x.fqn else "<missing>";
+                            break;
+                        }
+                    }
+                }
+                std.debug.print("[leaf-prune] {s} <- {s}\n", .{ if (df) |x| x.fqn else "?", why });
             }
             var v = leaf_targets.fetchRemove(d).?.value;
             v.targets.deinit(gpa);
@@ -1183,6 +1271,33 @@ fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []cons
         \\
         \\
     , .{path}) catch return 1;
+    // The KVC layout constants + slot helpers the leaf field read needs,
+    // frozen at emit time exactly like the full-program preamble; the
+    // loader refuses the library when the runtime's layout disagrees
+    // (klio_leaves_frozen below).
+    var kvf: ir.hot_layout.HotLayout = undefined;
+    ir.hot_layout.fillLayout(&kvf);
+    inline for (@typeInfo(ir.hot_layout.HotLayout).@"struct".fields) |fld| {
+        comptime if (std.mem.eql(u8, fld.name, "usable") or
+            std.mem.eql(u8, fld.name, "obj_usable") or
+            std.mem.eql(u8, fld.name, "span_usable")) continue;
+        var upper: [fld.name.len]u8 = undefined;
+        for (fld.name, 0..) |ch, i| upper[i] = std.ascii.toUpper(ch);
+        w.print("#define KVC_{s} {d}u\n", .{ upper, @field(kvf, fld.name) }) catch return 1;
+    }
+    w.print("static const klio_hot_layout KLF = {{\n", .{}) catch return 1;
+    inline for (@typeInfo(ir.hot_layout.HotLayout).@"struct".fields) |fld| {
+        w.print("  .{s} = {d}u,\n", .{ fld.name, @field(kvf, fld.name) }) catch return 1;
+    }
+    w.print("}};\n", .{}) catch return 1;
+    w.print("const klio_hot_layout *klio_leaves_frozen(void) {{ return &KLF; }}\n", .{}) catch return 1;
+    w.print("static inline uint64_t kv_tag(const uint8_t *s) {{ uint64_t t = 0; memcpy(&t, s + KVC_TAG_OFF, KVC_TAG_SIZE); return t; }}\n", .{}) catch return 1;
+    w.print("static inline int32_t kv_int(const uint8_t *s) {{ int32_t v; memcpy(&v, s + KVC_INT_OFF, 4); return v; }}\n", .{}) catch return 1;
+    w.print("static inline int64_t kv_long(const uint8_t *s) {{ int64_t v; memcpy(&v, s + KVC_LONG_OFF, 8); return v; }}\n", .{}) catch return 1;
+    w.print("static inline uint16_t kv_char(const uint8_t *s) {{ uint16_t v; memcpy(&v, s + KVC_CHAR_OFF, 2); return v; }}\n", .{}) catch return 1;
+    w.print("static inline void *kv_inst(const uint8_t *s) {{ void *p; memcpy(&p, s + KVC_INST_PTR_OFF, sizeof(void *)); return p; }}\n", .{}) catch return 1;
+
+    w.print("{s}", .{leaf_getfield_c}) catch return 1;
     {
         var it = leaf_targets.keyIterator();
         while (it.next()) |fid| {
@@ -1249,7 +1364,7 @@ fn leafConstStrOf(consts: []const ir.Const, cid: ir.ConstId) ?[]const u8 {
 
 /// The scalar integer conversion a zero-arg virtual slot names, or null.
 /// Slot ids reuse the root declaration's FuncId, so the name is static.
-const ScalarConv = enum { to_int, to_long, to_short, to_byte, to_char };
+const ScalarConv = enum { to_int, to_long, to_short, to_byte, to_char, inv };
 fn leafScalarConv(m: *const ir.Module, slot: ir.MethodSlotId) ?ScalarConv {
     const rf = m.funcById(ir.FuncId.from(slot.int())) orelse return null;
     const eq = std.mem.eql;
@@ -1258,6 +1373,22 @@ fn leafScalarConv(m: *const ir.Module, slot: ir.MethodSlotId) ?ScalarConv {
     if (eq(u8, rf.name, "toShort")) return .to_short;
     if (eq(u8, rf.name, "toByte")) return .to_byte;
     if (eq(u8, rf.name, "toChar")) return .to_char;
+    if (eq(u8, rf.name, "inv")) return .inv;
+    return null;
+}
+
+/// The scalar bitwise/shift infix a one-arg virtual slot names, or null
+/// (`x and y`, `shl`, ... lower as virtual calls on Int/Long receivers).
+const ScalarBit = enum { band, bor, bxor, shl, shr, ushr };
+fn leafScalarBit(m: *const ir.Module, slot: ir.MethodSlotId) ?ScalarBit {
+    const rf = m.funcById(ir.FuncId.from(slot.int())) orelse return null;
+    const eq = std.mem.eql;
+    if (eq(u8, rf.name, "and")) return .band;
+    if (eq(u8, rf.name, "or")) return .bor;
+    if (eq(u8, rf.name, "xor")) return .bxor;
+    if (eq(u8, rf.name, "shl")) return .shl;
+    if (eq(u8, rf.name, "shr")) return .shr;
+    if (eq(u8, rf.name, "ushr")) return .ushr;
     return null;
 }
 
@@ -1354,6 +1485,18 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                             }
                         },
                         .UnOp => {},
+                        .Not => {},
+                        // A field read serves only when the receiver is a
+                        // genre-8 handle AND the field resolves to a plain
+                        // stored slot at run time; every other case bails
+                        // pure, so eligibility always admits it. The name
+                        // must be a string const for the site's resolver.
+                        .GetField => |*gf| {
+                            if (leafConstStrOf(consts, gf.field) == null) {
+                                leafTrace(f, "field-name");
+                                ok = false;
+                            }
+                        },
                         .CallMemberOrGlobal => |*cg| {
                             // A bare constructor call the index bound to a
                             // CLASS, in tail position of a receiver-less
@@ -1401,13 +1544,15 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                             }
                         },
                         .CallVirtual => |*cv| {
-                            // Zero-arg virtual on a receiver that is a
-                            // SCALAR by construction (every register in an
-                            // eligible body is): the slot id is the root
+                            // Virtuals on receivers that are SCALARS by
+                            // construction: the slot id is the root
                             // declaration's FuncId, so the method NAME is
-                            // known at emit time. Integer conversions emit
-                            // inline; everything else bails the body.
-                            if (cv.n_args != 0 or leafScalarConv(m, cv.slot) == null) {
+                            // known at emit time. Zero-arg integer
+                            // conversions and one-arg bitwise/shift infixes
+                            // emit inline; everything else bails the body.
+                            const conv_ok = cv.n_args == 0 and leafScalarConv(m, cv.slot) != null;
+                            const bit_ok = cv.n_args == 1 and leafScalarBit(m, cv.slot) != null;
+                            if (!conv_ok and !bit_ok) {
                                 leafTrace(f, "virt");
                                 ok = false;
                             }
@@ -1426,7 +1571,11 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                                 ok = false;
                             } else ctor_tail = true;
                         },
-                        else => {
+                        else => |other| {
+                            if (runtime.envOnce("KLIO_LEAF_TRACE")) |w2| {
+                                if (std.mem.eql(u8, w2, f.name) or std.mem.eql(u8, w2, f.fqn))
+                                    std.debug.print("[leaf-miss-inst] {s}: {s}\n", .{ f.fqn, @tagName(std.meta.activeTag(other)) });
+                            }
                             leafTrace(f, "escape-op");
                             ok = false;
                         },
@@ -1650,6 +1799,15 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                         .CallVirtual => |*cv| {
                             if (cv.dst.int() > max_reg) max_reg = cv.dst.int();
                             if (cv.receiver.int() > max_reg) max_reg = cv.receiver.int();
+                            if (cv.args.int() + cv.n_args > max_reg) max_reg = cv.args.int() + cv.n_args;
+                        },
+                        .GetField => |*gf| {
+                            if (gf.dst.int() > max_reg) max_reg = gf.dst.int();
+                            if (gf.receiver.int() > max_reg) max_reg = gf.receiver.int();
+                        },
+                        .Not => |*nt| {
+                            if (nt.dst.int() > max_reg) max_reg = nt.dst.int();
+                            if (nt.src.int() > max_reg) max_reg = nt.src.int();
                         },
                         else => {},
                     }
@@ -1761,6 +1919,44 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                         pc += 2;
                         continue;
                     }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .GetField) {
+                        const gf = &f.blocks[bi].insts[code[pc + 1]].GetField;
+                        const fname = leafConstStrOf(consts, gf.field).?;
+                        try w.print("  {{ static uint64_t KFS_{d}_{d} = 0;\n", .{ bi, code[pc + 1] });
+                        try w.print("    if (!kl_getfield(ev, l{d}, g{d}, &KFS_{d}_{d}, \"{s}\", &l{d}, &g{d})) return 0; }}\n", .{ gf.receiver.int(), gf.receiver.int(), bi, code[pc + 1], fname, gf.dst.int(), gf.dst.int() });
+                        pc += 2;
+                        continue;
+                    }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .Not) {
+                        const nt = &f.blocks[bi].insts[code[pc + 1]].Not;
+                        try w.print("  if (g{d} != 2) return 0;\n", .{nt.src.int()});
+                        try w.print("  l{d} = !l{d}; g{d} = 2;\n", .{ nt.dst.int(), nt.src.int(), nt.dst.int() });
+                        pc += 2;
+                        continue;
+                    }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .CallVirtual and
+                        f.blocks[bi].insts[code[pc + 1]].CallVirtual.n_args == 1)
+                    {
+                        const cv = &f.blocks[bi].insts[code[pc + 1]].CallVirtual;
+                        const bit = leafScalarBit(m, cv.slot).?;
+                        const rr = cv.receiver.int();
+                        const aa = cv.args.int();
+                        const dd = cv.dst.int();
+                        // Int/Long receivers only; Kotlin masks shift counts
+                        // to the receiver width and shifts arithmetically for
+                        // shr, logically for ushr.
+                        try w.print("  if (g{d} > 1 || g{d} > 1) return 0;\n", .{ rr, aa });
+                        switch (bit) {
+                            .band => try w.print("  l{d} = (g{d} == 0) ? (int64_t)(int32_t)((uint32_t)l{d} & (uint32_t)l{d}) : (int64_t)((uint64_t)l{d} & (uint64_t)l{d}); g{d} = g{d};\n", .{ dd, rr, rr, aa, rr, aa, dd, rr }),
+                            .bor => try w.print("  l{d} = (g{d} == 0) ? (int64_t)(int32_t)((uint32_t)l{d} | (uint32_t)l{d}) : (int64_t)((uint64_t)l{d} | (uint64_t)l{d}); g{d} = g{d};\n", .{ dd, rr, rr, aa, rr, aa, dd, rr }),
+                            .bxor => try w.print("  l{d} = (g{d} == 0) ? (int64_t)(int32_t)((uint32_t)l{d} ^ (uint32_t)l{d}) : (int64_t)((uint64_t)l{d} ^ (uint64_t)l{d}); g{d} = g{d};\n", .{ dd, rr, rr, aa, rr, aa, dd, rr }),
+                            .shl => try w.print("  l{d} = (g{d} == 0) ? (int64_t)(int32_t)((uint32_t)l{d} << ((uint32_t)l{d} & 31u)) : (int64_t)((uint64_t)l{d} << ((uint64_t)l{d} & 63u)); g{d} = g{d};\n", .{ dd, rr, rr, aa, rr, aa, dd, rr }),
+                            .shr => try w.print("  l{d} = (g{d} == 0) ? (int64_t)((int32_t)l{d} >> ((uint32_t)l{d} & 31u)) : (l{d} >> ((uint64_t)l{d} & 63u)); g{d} = g{d};\n", .{ dd, rr, rr, aa, rr, aa, dd, rr }),
+                            .ushr => try w.print("  l{d} = (g{d} == 0) ? (int64_t)(int32_t)((uint32_t)l{d} >> ((uint32_t)l{d} & 31u)) : (int64_t)((uint64_t)l{d} >> ((uint64_t)l{d} & 63u)); g{d} = g{d};\n", .{ dd, rr, rr, aa, rr, aa, dd, rr }),
+                        }
+                        pc += 2;
+                        continue;
+                    }
                     if (f.blocks[bi].insts[code[pc + 1]] == .CallVirtual) {
                         const cv = &f.blocks[bi].insts[code[pc + 1]].CallVirtual;
                         const conv = leafScalarConv(m, cv.slot).?;
@@ -1777,6 +1973,7 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                             .to_short => try w.print("  l{d} = (int64_t)(int16_t)l{d}; g{d} = 0;\n", .{ dd, rr, dd }),
                             .to_byte => try w.print("  l{d} = (int64_t)(int8_t)l{d}; g{d} = 0;\n", .{ dd, rr, dd }),
                             .to_char => try w.print("  l{d} = (int64_t)(uint16_t)l{d}; g{d} = 4;\n", .{ dd, rr, dd }),
+                            .inv => try w.print("  l{d} = (g{d} == 0) ? (int64_t)(int32_t)~(uint32_t)l{d} : (int64_t)~(uint64_t)l{d}; g{d} = g{d};\n", .{ dd, rr, rr, rr, dd, rr }),
                         }
                         pc += 2;
                         continue;

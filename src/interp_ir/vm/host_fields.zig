@@ -603,6 +603,12 @@ pub fn fieldGetterIsLeaf(self: *VmHost, fid: FuncId) bool {
 /// step settled onto a native binding, or one that redirects to a sibling
 /// declaration, resolves elsewhere — the frameless leaf evaluator must not
 /// interpret the body in either case.
+/// The module as a stable plain pointer (the leaf gate's field-route
+/// thunk chases trivial accessor getters through it).
+pub fn hostModulePtr(self: *VmHost) *const Module {
+    return self.module.asPtr();
+}
+
 pub fn funcRunsItsBody(self: *VmHost, fid: FuncId) bool {
     const pg = self.prog.borrow();
     defer pg.deinit();

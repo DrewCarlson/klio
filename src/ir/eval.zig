@@ -8143,9 +8143,11 @@ pub fn registerNativeLeaf(fid: u32, f: NativeLeafFn, fqn: []const u8) void {
 /// paths, which re-run the pure body exactly.
 var leaf_diag_serve = std.atomic.Value(u64).init(0);
 var leaf_diag_bail = std.atomic.Value(u64).init(0);
+var leaf_diag_try = std.atomic.Value(u64).init(0);
+var leaf_diag_nokey = std.atomic.Value(u64).init(0);
 pub fn leafDiagDump() void {
     if (runtime.envOnce("KLIO_LEAF_DIAG") == null) return;
-    std.debug.print("[leaf-diag] served={d} bailed={d}\n", .{ leaf_diag_serve.load(.monotonic), leaf_diag_bail.load(.monotonic) });
+    std.debug.print("[leaf-diag] served={d} bailed={d} tried={d} nokey={d}\n", .{ leaf_diag_serve.load(.monotonic), leaf_diag_bail.load(.monotonic), leaf_diag_try.load(.monotonic), leaf_diag_nokey.load(.monotonic) });
 }
 
 pub const LeafOutcome = union(enum) { val: Value, raise: EvalError };
@@ -8164,6 +8166,7 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
     // Per-Func route memo: the registry lookup (mutex + hash + fqn
     // compare) priced every call by ~20% on a call-dense benchmark;
     // the table is write-once, so one resolution is final.
+    _ = leaf_diag_try.fetchAdd(1, .monotonic);
     const route = cf.leaf_route.load(.acquire);
     const klf: NativeLeafFn = switch (route) {
         0 => blk_r: {
@@ -8180,6 +8183,7 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
                 null
             else
                 nativeLeafFor(cf.id.int(), cf.fqn) orelse nativeLeafForFunc(cf);
+            if (f0 == null) _ = leaf_diag_nokey.fetchAdd(1, .monotonic);
             const enc: usize = if (f0) |fp| @intFromPtr(fp) else 1;
             @constCast(cf).leaf_route.store(enc, .release);
             break :blk_r f0 orelse return null;
@@ -8219,6 +8223,14 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
                 argv[i] = @as(u32, @bitCast(v));
                 argg[i] = 6;
             },
+            .Instance => |inst| {
+                // Genre 8: a borrowed instance HANDLE (the raw cell — the
+                // caller's frame roots it and the GC never moves cells).
+                // Leaf field reads resolve through the view's field_route;
+                // any other op on genre 8 bails.
+                argv[i] = @bitCast(@as(u64, @intFromPtr(inst.cell)));
+                argg[i] = 8;
+            },
             else => {
                 // Opaque cargo (genre 7): an unused receiver param rides
                 // through; every emitted op on genre > 6 bails, so a body
@@ -8232,9 +8244,13 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
     var local_counter: u64 = 0;
     if (nctx) |nc| {
         nativeEdgeView(nc, &ev);
+        ev.route_ctx = @ptrCast(host);
+        ev.field_route = &LeafFieldRoute(H).route;
     } else {
         ev = .{
             .rare = &leafEdgeRareInterp,
+            .route_ctx = @ptrCast(host),
+            .field_route = &LeafFieldRoute(H).route,
             .counter = &local_counter,
             .idle = runtime.gc.idleTickPtr(),
             .abandonable = runtime.abandonablePtr(),
@@ -8313,6 +8329,10 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
                 4 => .{ .Char = @intCast(aux[ai]) },
                 5 => .{ .Double = @bitCast(aux[ai]) },
                 6 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(aux[ai]))))) },
+                // A genre-8 aux is a borrowed handle used as a ctor arg;
+                // the construction retains what it stores, so no retain
+                // here — the caller's frame roots it for the call.
+                8 => .{ .Instance = .{ .cell = @ptrFromInt(@as(usize, @bitCast(aux[ai]))) } },
                 else => return null,
             };
         }
@@ -8336,6 +8356,13 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
         4 => .{ .Char = @intCast(rl) },
         5 => .{ .Double = @bitCast(rl) },
         6 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(rl))))) },
+        8 => blk8: {
+            // A genre-8 handle coming BACK is a borrowed cell becoming an
+            // owned Value: retain before it escapes the call window.
+            const iv = Value{ .Instance = .{ .cell = @ptrFromInt(@as(usize, @bitCast(rl))) } };
+            iv.retain();
+            break :blk8 iv;
+        },
         else => return null,
     };
     return .{ .val = v };
@@ -8665,7 +8692,56 @@ pub const NativeEdgeView = extern struct {
     always: u8,
     /// Rare-trigger handler for this view's context (see klio_rt.h).
     rare: *const fn (ctx: ?*anyopaque, reasons: u32) callconv(.c) i32,
+    /// Field-read route resolver for leaf genre-8 handles (see
+    /// klio_rt.h); null outside the leaf gates.
+    route_ctx: ?*anyopaque = null,
+    field_route: ?*const fn (route_ctx: ?*anyopaque, recv_cell: ?*anyopaque, name: [*:0]const u8, cls48_out: *u64, slot_out: *i32) callconv(.c) i32 = null,
 };
+
+/// Per-host field-route thunk for leaf bodies: rebuilds a borrowed
+/// Instance view over the raw cell (no retain — the leaf's caller roots
+/// it) and asks the host's single-fill field-site claim. Only a PLAIN
+/// STORED slot resolves; everything else bails the leaf.
+fn LeafFieldRoute(comptime H: type) type {
+    return struct {
+        fn route(rctx: ?*anyopaque, recv_cell: ?*anyopaque, name: [*:0]const u8, cls48_out: *u64, slot_out: *i32) callconv(.c) i32 {
+            if (comptime !@hasDecl(H, "fieldSiteRoute")) return 0;
+            const host: *H = @ptrCast(@alignCast(rctx orelse return 0));
+            const cell = recv_cell orelse return 0;
+            const v = Value{ .Instance = .{ .cell = @ptrCast(@alignCast(cell)) } };
+            var claim = host.fieldSiteRoute(&v, std.mem.span(name)) orelse {
+                if (runtime.envOnce("KLIO_LEAF_ROUTE_TRACE") != null)
+                    std.debug.print("[leaf-route] {s}: no claim\n", .{std.mem.span(name)});
+                return 0;
+            };
+            if (runtime.envOnce("KLIO_LEAF_ROUTE_TRACE") != null)
+                std.debug.print("[leaf-route] {s}: tag={d}\n", .{ std.mem.span(name), claim.route & 3 });
+            if (claim.route & 3 == 2) {
+                // A GETTER route whose body is the canonical trivial
+                // accessor (`get() = _backing`) chases through to the
+                // backing field's stored slot — one level, exactly the
+                // accessorFastGet shape. Anything else bails the leaf.
+                if (comptime !@hasDecl(H, "hostModulePtr")) return 0;
+                const mod2 = host.hostModulePtr();
+                const gfid: u32 = @intCast(claim.route >> 2);
+                const gf = mod2.funcById(ir.FuncId.from(gfid)) orelse return 0;
+                const fc = gf.accessorFieldConstIn(mod2) orelse return 0;
+                if (fc.int() >= mod2.consts.items.len) return 0;
+                const under: []const u8 = switch (mod2.consts.items[fc.int()]) {
+                    .String => |sv| sv,
+                    else => return 0,
+                };
+                claim = host.fieldSiteRoute(&v, under) orelse return 0;
+            }
+            if (claim.route & 3 != 1) return 0;
+            const slot = claim.route >> 2;
+            if (slot > std.math.maxInt(i32)) return 0;
+            cls48_out.* = claim.cls & 0xFFFF_FFFF_FFFF;
+            slot_out.* = @intCast(slot);
+            return 1;
+        }
+    };
+}
 
 /// Rare handler for the INTERPRETER's leaf gate: no NativeCtx exists,
 /// so a persistent condition (abandon request, pending GC, an expired
