@@ -71,7 +71,18 @@ or its closure by measurement, and the doorway vein (recorded).
   layout check must compare field-by-field (memcmp trips on padding);
   the interpreter's frameless leaf evaluator already owns BRANCHLESS
   field readers, so kl_ field wins appear only where it declines
-  (branchy bodies). Stage 2 (TypeTest -> equals) next.
+  (branchy bodies).
+- RUNG D STAGE 2 LANDED (2026-09-01): InstanceOf as a leaf op —
+  kl_instanceof caches a 1/2 verdict keyed to the receiver's class
+  word per site, resolved once through the edge-view type_route (the
+  host's `is` predicate over a borrowed cell view). Eligibility admits
+  only plain non-nullable classifiers (no generic args, no bare type
+  variables — reified context stays interpreted); non-genre-8 values
+  bail to the exact re-run. Unlocks 104 bodies (3096 -> 3200 wide
+  leaves), LocalDate.equals among them: the equals micro (600k calls)
+  950 -> 420ms (2.3x), 599,982/600,599 served. TRAP: the leaf pack cc
+  compiles against zig-out/include/klio_rt.h — refresh it after
+  editing include/ (zig build klio-harness does not reinstall it).
 - DOORWAY VEIN (recorded, not chased): at 290ms/300k calls the
   toEpochDays micro is doorway-bound (dispatch walk + marshal +
   per-call edge-view build), ~41% in the leaf itself. Back-edge-only
