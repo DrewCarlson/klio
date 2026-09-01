@@ -86,12 +86,26 @@ wave2_steps=(
 s=$(date +%s)
 rest_log=$(mktemp)
 gate_log=$(mktemp)
+# Leaf pack for the census waves (plans/leaf-production-campaign.md):
+# pure-scalar library bodies served natively inside the interpreter.
+# FAIL-OPEN — a build failure just runs the censuses leafless (and is
+# reported); correctness never depends on the artifact. The compose
+# gate and litmus stay leafless (plugin-env trap; timing fixtures).
+leaves_env=()
+zig build klio-harness >/dev/null 2>&1 || true
+if scripts/build-leaf-packs.sh >/tmp/stack-leaves.log 2>&1; then
+  leaves_env=(env KLIO_LEAVES="$PWD/.klio-local/leaves/library.so")
+  cat /tmp/stack-leaves.log
+else
+  echo "stack: leaf pack build failed — census waves run leafless"
+  cat /tmp/stack-leaves.log
+fi
 "${pin[@]}" zig build "${gate_steps[@]}" "$@" >"$gate_log" 2>&1 &
 gate_pid=$!
 {
-  "${pin[@]}" nice -n 10 zig build "${wave1_steps[@]}" "$@"
+  "${pin[@]}" nice -n 10 "${leaves_env[@]}" zig build "${wave1_steps[@]}" "$@"
   w1=$?
-  "${pin[@]}" nice -n 10 zig build "${wave2_steps[@]}" "$@"
+  "${pin[@]}" nice -n 10 "${leaves_env[@]}" zig build "${wave2_steps[@]}" "$@"
   w2=$?
   [ $w1 -eq 0 ] && [ $w2 -eq 0 ]
 } >"$rest_log" 2>&1 &
