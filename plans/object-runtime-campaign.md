@@ -183,7 +183,19 @@ factory wrap, imbalance. Feature-correctness work, well-mapped.
 
 ## Discovered (2026-09-01, open)
 
-- [ ] BARE-`Size` CLASS-TIER MIS-PICK (the live Task 2 item; found by
+- [x] FIXED (2026-09-01, battery-green, three consecutive cold
+      rebuilds green): the root was the inline geometry factory
+      splicing its 1-arg ctor call into cross-pack recipients with
+      donor-file spans while classIdIndexed ranked the donor class at
+      the RECIPIENT package tier — the arbitrary global same-name
+      winner (androidx.annotation.Size) got baked on some orders.
+      classIdIndexed now derives the package from the span's FILE
+      (donor bodies rank their own package), refuses out-of-scope
+      winners under an explicit import, and the runtime CMG serve
+      gained the matching import rank (imported factory functions
+      served directly). KLIO_CTOR_TRAP=<fqn> is the instrument that
+      pinned the construction site. Previously: BARE-`Size` CLASS-TIER
+      MIS-PICK (the live Task 2 item; found by
       corpus_check, which had not run since 2026-08-15 — the
       census-gap lesson again for the compose-ui examples): on some
       bake orders the ui-unit/geometry surface constructs
