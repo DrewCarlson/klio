@@ -1,11 +1,19 @@
 # Native-floor-and-tower campaign: transpiled output never loses; tower scoping goes exact
 
-STATUS 2026-09-01: Task 1 floor + rung D stage 1 LANDED and
-battery-verified (parity 401/0, every census floor, ktor 450/0
-restored after the inline-stub fix, gate 5/5, stack rc=0). Task 2
-LANDED strict-by-default (see below). Remaining: the closing normal
-battery after the default flip, rung D stage 2 (TypeTest -> equals)
-or its closure by measurement, and the doorway vein (recorded).
+STATUS 2026-09-01: COMPLETE. Closing battery green with everything in
+(parity 401/0, every census at its floor — coroutines 1299, compose
+1390/0, ktor 450/0, datetime 519/0 — ui-gate 5/5, stack rc=0). Task 1:
+floor landed (transpiled >= interpreted by construction; epochbench 2x
+FASTER than interpreted, rangebench 5.1x, fib 25.8x); rungs A/ctor-tail
+landed earlier, rung D stage 1 (field reads, 2.5x) and stage 2
+(InstanceOf, 2.3x) landed with numbers below; rung E (stores) CLOSED BY
+MEASUREMENT: the write-heavy surface (compose) measured leaf-neutral in
+the object-runtime campaign — heavy-store bodies are gate-bound, not
+replay-bound — and no floor-set program is store-bound (epochbench
+closed 2x-faster, fib/rangebench scalar); the doorway vein is recorded
+under Task 1 for a future heavier customer. Task 2: LANDED
+strict-by-default (four named mechanisms, all root-fixed; plain pairs
+deleted for getters and setters).
 
 ## Measured starting facts (do not re-derive)
 
