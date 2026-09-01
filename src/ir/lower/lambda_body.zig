@@ -666,6 +666,12 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     func.has_receiver_param = placed_params.len != 0 and
         std.mem.eql(u8, placed_params[0].name, "this");
     try module.funcs.append(b.allocator, func);
+    // A lambda body carries its declaring file: the import-scoped
+    // member-extension probe reads the frame fn's decl_span file, and an
+    // imported companion extension (`300.milliseconds` inside a
+    // `withVirtualTime { ... }` block) is in scope in the file that wrote
+    // the lambda, not in the file of the function that invokes it.
+    try module.decl_span.put(id.int(), body.span);
     return .{ .func = id, .captures = captured };
 }
 
