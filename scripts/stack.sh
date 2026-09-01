@@ -110,15 +110,14 @@ gate_pid=$!
   [ $w1 -eq 0 ] && [ $w2 -eq 0 ]
 } >"$rest_log" 2>&1 &
 rest_pid=$!
-# The compose-ui example family gate overlaps the census waves on the
-# same domain (it works in .klio-local — no scratch-home overlap with
-# the census suites; fresh packs + cleared bake cache every run).
-uigate_log=$(mktemp)
-"${pin[@]}" nice -n 10 scripts/compose-ui-gate.sh >"$uigate_log" 2>&1 &
-uigate_pid=$!
 wait "$rest_pid"
 rest_rc=$?
-wait "$uigate_pid"
+# The compose-ui example family gate runs in vpd's tail window (the
+# census waves have drained; vpd still owns its own domain) and stays
+# ahead of litmus, which must run alone. It works in .klio-local — no
+# scratch-home overlap with the census suites.
+uigate_log=$(mktemp)
+"${pin[@]}" scripts/compose-ui-gate.sh >"$uigate_log" 2>&1
 uigate_rc=$?
 litmus_out=$("${pin[@]}" zig build itest-parity_threaded_litmus "$@" 2>&1)
 litmus_rc=$?

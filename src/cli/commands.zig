@@ -414,10 +414,14 @@ pub fn runTranspileDump(
 /// `zig cc out.c -I<include> -L<lib> -lklio_rt -lzstd`.
 pub fn runTranspile(
     gpa: std.mem.Allocator,
-    path: []const u8,
+    paths: []const []const u8,
     out_path: ?[]const u8,
     features: *RequestedFeatures,
 ) u8 {
+    // Additional files join the bake/lowering (a leaves emission over a
+    // TEST-source closure passes the whole set); the first file names
+    // the outputs and stays the program entry.
+    const path = paths[0];
     // The emitted ids (fids, const ids, trace file ids) are only
     // meaningful against ONE exact module, and an in-process bake is not
     // id-stable across processes — so the deliverable pins the module:
@@ -434,9 +438,9 @@ pub fn runTranspile(
         const stem = if (std.mem.endsWith(u8, c_out, ".c")) c_out[0 .. c_out.len - 2] else c_out;
         break :blk std.fmt.allocPrint(gpa, "{s}.klio-image", .{stem}) catch return 1;
     };
-    const bake_rc = bundle.bakeImage(gpa, &.{path}, features, image_path);
+    const bake_rc = bundle.bakeImage(gpa, paths, features, image_path);
     if (bake_rc == 0) {
-        if (bundle.assembleImageBuild(gpa, image_path, &.{path})) |asm_r| {
+        if (bundle.assembleImageBuild(gpa, image_path, paths)) |asm_r| {
             var built = asm_r.built;
             return transpileEmit(gpa, &built, path, c_out, image_path);
         }
@@ -742,6 +746,8 @@ fn transpileEmit(
         \\
     , .{}) catch return 1;
 
+    w.print("{s}", .{leaf_getfield_c}) catch return 1;
+
     const Emitted = struct { fid: u32, fqn: []const u8 };
     var emitted: std.ArrayList(Emitted) = .empty;
     defer emitted.deinit(gpa);
@@ -854,7 +860,17 @@ fn transpileEmit(
         if (drop) |d| {
             if (std.c.getenv("KLIO_LEAF_TRACE") != null) {
                 const df = m.funcById(ir.FuncId.from(d));
-                std.debug.print("[leaf-prune] {s}\n", .{if (df) |x| x.fqn else "?"});
+                var why: []const u8 = "?";
+                if (leaf_targets.getPtr(d)) |ent| {
+                    for (ent.targets.items) |t| {
+                        if (!leaf_targets.contains(t.fid)) {
+                            const tf = m.funcById(ir.FuncId.from(t.fid));
+                            why = if (tf) |x| x.fqn else "<missing>";
+                            break;
+                        }
+                    }
+                }
+                std.debug.print("[leaf-prune] {s} <- {s}\n", .{ if (df) |x| x.fqn else "?", why });
             }
             var v = leaf_targets.fetchRemove(d).?.value;
             v.targets.deinit(gpa);
@@ -874,6 +890,15 @@ fn transpileEmit(
     // walk to the image's library bodies. The fids the emitter registers must
     // match the fids the running binary resolves, which the pinned image
     // guarantees.
+    // THE NATIVE FLOOR (plans/native-floor-and-tower-campaign.md): the
+    // per-op op-helper bodies pay one host-ABI crossing per instruction
+    // and measured ~10x SLOWER than the runtime's own drivers on
+    // object-heavy code, while never beating them elsewhere — so by
+    // default only the kl_ leaves emit and register, and everything
+    // else runs through libklio_rt's interpreter over the pinned image
+    // (native >= interpreted by construction). The op-helper emitter
+    // stays behind KLIO_TRANSPILE_OPHELPERS=1 for bisection.
+    const emit_ophelpers = runtime.envOnce("KLIO_TRANSPILE_OPHELPERS") != null;
     for (m.funcs.items) |*f| {
         if (!emitFor(pkg_sel, f)) continue;
         if (f.blocks.len == 0 and !m.ensureFuncBody(@constCast(f))) continue;
@@ -884,8 +909,10 @@ fn transpileEmit(
             emitLeafFunc(w, m, f, fs, m.consts.items) catch return 1;
             leaf_emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
         }
-        emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
-        emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+        if (emit_ophelpers) {
+            emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
+            emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+        }
     }
     for (extra_funcs.items) |f| {
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
@@ -896,8 +923,10 @@ fn transpileEmit(
             emitLeafFunc(w, m, f, fs, m.consts.items) catch return 1;
             leaf_emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
         }
-        emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
-        emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+        if (emit_ophelpers) {
+            emitNativeFunc(w, f, fs, m.consts.items) catch return 1;
+            emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
+        }
     }
 
     w.print("void klio_transpiled_register(void) {{\n", .{}) catch return 1;
@@ -983,23 +1012,74 @@ fn leafTrace(f: *const ir.Func, comptime why: []const u8) void {
     if (std.c.getenv("KLIO_LEAF_TRACE") != null) std.debug.print("[leaf-miss] {s}: " ++ why ++ "\n", .{f.fqn});
 }
 
+/// Escape-op tag histogram over one transpile's eligibility fixpoint
+/// (raw hits — a fn re-scanned by the fixpoint counts again, so this
+/// RANKS tags rather than counting blocked bodies). Printed sorted
+/// under KLIO_LEAF_TRACE=1 at the end of emission.
+var leaf_escape_histo = std.enums.EnumArray(std.meta.Tag(ir.Inst), u32).initFill(0);
+
+fn printLeafEscapeHisto() void {
+    if (std.c.getenv("KLIO_LEAF_TRACE") == null) return;
+    const Tag = std.meta.Tag(ir.Inst);
+    var entries: [std.meta.fields(Tag).len]struct { tag: Tag, n: u32 } = undefined;
+    var n_used: usize = 0;
+    var it = leaf_escape_histo.iterator();
+    while (it.next()) |e| {
+        if (e.value.* == 0) continue;
+        entries[n_used] = .{ .tag = e.key, .n = e.value.* };
+        n_used += 1;
+    }
+    std.mem.sort(@TypeOf(entries[0]), entries[0..n_used], {}, struct {
+        fn lt(_: void, a2: @TypeOf(entries[0]), b2: @TypeOf(entries[0])) bool {
+            return a2.n > b2.n;
+        }
+    }.lt);
+    for (entries[0..n_used]) |e| {
+        std.debug.print("[leaf-escape-histo] {s} {d}\n", .{ @tagName(e.tag), e.n });
+    }
+}
+
 /// KLIO_LEAVES=<path.so>: load a scalar-replay leaf library and register
 /// its bodies by fqn (bakes are not cross-process fid-stable). Fail-open:
 /// a missing or malformed library just leaves the interpreter alone.
 /// The dlopened handle is deliberately leaked — the leaves live as long
 /// as the process.
 pub fn loadLeafLibrary() void {
-    const path = runtime.envOnce("KLIO_LEAVES") orelse return;
-    var lib = std.DynLib.open(path) catch {
-        std.debug.print("warning: KLIO_LEAVES: cannot open {s}\n", .{path});
-        return;
-    };
-    const Entry = *const fn (reg: *const fn (fqn: [*:0]const u8, f: ir.eval.NativeLeafFn) callconv(.c) void) callconv(.c) void;
-    const entry = lib.lookup(Entry, "klio_leaves_entry") orelse {
-        std.debug.print("warning: KLIO_LEAVES: {s} has no klio_leaves_entry\n", .{path});
-        return;
-    };
-    entry(&leafRegShim);
+    const spec = runtime.envOnce("KLIO_LEAVES") orelse return;
+    // Colon-separated list; later libraries win on a key collision
+    // (registration overwrites), so order suite-specific after generic.
+    var it = std.mem.splitScalar(u8, spec, ':');
+    while (it.next()) |path| {
+        if (path.len == 0) continue;
+        var lib = std.DynLib.open(path) catch {
+            std.debug.print("warning: KLIO_LEAVES: cannot open {s}\n", .{path});
+            continue;
+        };
+        const Entry = *const fn (reg: *const fn (fqn: [*:0]const u8, f: ir.eval.NativeLeafFn) callconv(.c) void) callconv(.c) void;
+        const entry = lib.lookup(Entry, "klio_leaves_entry") orelse {
+            std.debug.print("warning: KLIO_LEAVES: {s} has no klio_leaves_entry\n", .{path});
+            continue;
+        };
+        // A library carrying frozen KVC layout constants (leaf field
+        // reads) must match THIS runtime's layout byte-for-byte; a
+        // mismatched library is refused whole (fail-open — the
+        // interpreter just runs leafless).
+        const Frozen = *const fn () callconv(.c) *const ir.hot_layout.HotLayout;
+        if (lib.lookup(Frozen, "klio_leaves_frozen")) |froz| {
+            var live: ir.hot_layout.HotLayout = undefined;
+            ir.hot_layout.fillLayout(&live);
+            const fr = froz();
+            var lay_ok = true;
+            inline for (@typeInfo(ir.hot_layout.HotLayout).@"struct".fields) |fld| {
+                if (@field(live, fld.name) != @field(fr, fld.name)) lay_ok = false;
+            }
+            if (!lay_ok) {
+                std.debug.print("warning: KLIO_LEAVES: {s} layout mismatch — refused\n", .{path});
+                continue;
+            }
+        }
+        entry(&leafRegShim);
+    }
 }
 
 /// Print leaf-gate engagement counters at exit (KLIO_LEAF_DIAG=1).
@@ -1010,6 +1090,108 @@ pub fn leafDiagDump() void {
 fn leafRegShim(fqn: [*:0]const u8, f: ir.eval.NativeLeafFn) callconv(.c) void {
     ir.eval.registerNativeLeafFqn(std.mem.span(fqn), f);
 }
+
+/// Leaf field read over a genre-8 instance handle, shared by the
+/// full-program and leaves-mode preambles (keep the two emissions
+/// byte-identical). Requires the KVC_* constants and kv_tag/kv_int/
+/// kv_long/kv_char/kv_inst helpers to be in scope.
+const leaf_getfield_c =
+    \\static inline int32_t kl_getfield(klio_edge_view *ev, int64_t rl, int32_t rgv, uint64_t *site, const char *name, int64_t *ol, int32_t *og) {
+    \\  if (rgv == 9) {
+    \\    /* Genre-9 class handle (the emitted class-name literal): an
+    \\     * enum-entry read resolves through the statics route. */
+    \\    if (!ev->statics_route) return 0;
+    \\    return ev->statics_route(ev->route_ctx, (const char *)(uintptr_t)rl, name, ol, og);
+    \\  }
+    \\  if (rgv != 8) return 0;
+    \\  uint8_t *cell = (uint8_t *)(uintptr_t)rl;
+    \\  if (!cell) return 0;
+    \\  uint8_t *inst = cell + KVC_CELL_DATA_OFF;
+    \\  uint64_t cls;
+    \\  memcpy(&cls, inst + KVC_INST_CLASS_OFF, sizeof(uint64_t));
+    \\  uint64_t cls48 = cls & 0xFFFFFFFFFFFFull;
+    \\  uint64_t want = *site;
+    \\  if ((want >> 16) != cls48 || (want & 0xFFFFu) == 0) {
+    \\    if (!ev->field_route) return 0;
+    \\    uint64_t rcls = 0;
+    \\    int32_t rslot = -1;
+    \\    if (!ev->field_route(ev->route_ctx, cell, name, &rcls, &rslot)) return 0;
+    \\    /* The route was resolved against THIS receiver, so its slot binds
+    \\     * to this receiver's class word; the claim's own identity value
+    \\     * lives in a different space and is not comparable here. */
+    \\    (void)rcls;
+    \\    if (rslot < 0 || rslot >= 0xFFFE) return 0;
+    \\    want = (cls48 << 16) | (uint64_t)(rslot + 1);
+    \\    *site = want;
+    \\  }
+    \\  size_t slot = (size_t)((want & 0xFFFFu) - 1u);
+    \\  uint8_t *fields = inst + KVC_INST_FIELDS_OFF;
+    \\  uint8_t *items;
+    \\  size_t len;
+    \\  memcpy(&items, fields + KVC_FIELDS_PTR_OFF, sizeof(void *));
+    \\  memcpy(&len, fields + KVC_FIELDS_LEN_OFF, sizeof(size_t));
+    \\  if (slot >= len) return 0;
+    \\  const uint8_t *s = items + slot * KVC_FIELD_STRIDE + KVC_FIELD_VALUE_OFF;
+    \\  uint64_t t = kv_tag(s);
+    \\  if (t == KVC_TAG_INT) { *ol = (int64_t)kv_int(s); *og = 0; }
+    \\  else if (t == KVC_TAG_LONG) { *ol = kv_long(s); *og = 1; }
+    \\  else if (t == KVC_TAG_BOOL) { uint8_t b = 0; memcpy(&b, s + KVC_BOOL_OFF, 1); *ol = b; *og = 2; }
+    \\  else if (t == KVC_TAG_UNIT) { *ol = 0; *og = 3; }
+    \\  else if (t == KVC_TAG_CHAR) { *ol = (int64_t)kv_char(s); *og = 4; }
+    \\  else if (t == KVC_TAG_INSTANCE) { void *p = kv_inst(s); if (!p) return 0; *ol = (int64_t)(uintptr_t)p; *og = 8; }
+    \\  else return 0;
+    \\  return 1;
+    \\}
+    \\
+    \\static inline int32_t kl_cast(klio_edge_view *ev, int64_t rl, int32_t rgv, uint64_t *site, const char *tyname, int64_t *ol, int32_t *og) {
+    \\  /* `as`/`as?` on a genre-8 handle: a POSITIVE verdict passes the
+    \\   * value through unchanged; anything else (failed cast = throw or
+    \\   * null, non-instance genres) bails to the exact re-run. Same
+    \\   * per-site class-word verdict cache as kl_instanceof. */
+    \\  if (rgv != 8) return 0;
+    \\  uint8_t *cell = (uint8_t *)(uintptr_t)rl;
+    \\  if (!cell) return 0;
+    \\  uint8_t *inst = cell + KVC_CELL_DATA_OFF;
+    \\  uint64_t cls;
+    \\  memcpy(&cls, inst + KVC_INST_CLASS_OFF, sizeof(uint64_t));
+    \\  uint64_t cls48 = cls & 0xFFFFFFFFFFFFull;
+    \\  uint64_t want = *site;
+    \\  if ((want >> 16) != cls48 || (want & 0xFFFFu) == 0) {
+    \\    if (!ev->type_route) return 0;
+    \\    int32_t verdict = ev->type_route(ev->route_ctx, cell, tyname);
+    \\    if (verdict != 1 && verdict != 2) return 0;
+    \\    want = (cls48 << 16) | (uint64_t)(uint32_t)verdict;
+    \\    *site = want;
+    \\  }
+    \\  if ((want & 0xFFFFu) != 1u) return 0;
+    \\  *ol = rl; *og = 8;
+    \\  return 1;
+    \\}
+    \\
+    \\static inline int32_t kl_instanceof(klio_edge_view *ev, int64_t rl, int32_t rgv, uint64_t *site, const char *tyname, int64_t *ol, int32_t *og) {
+    \\  /* Only genre-8 handles have a class word to key the verdict on;
+    \\   * every other genre (null, scalar, cargo) bails to the exact
+    \\   * re-run, which owns the full `is` semantics. */
+    \\  if (rgv != 8) return 0;
+    \\  uint8_t *cell = (uint8_t *)(uintptr_t)rl;
+    \\  if (!cell) return 0;
+    \\  uint8_t *inst = cell + KVC_CELL_DATA_OFF;
+    \\  uint64_t cls;
+    \\  memcpy(&cls, inst + KVC_INST_CLASS_OFF, sizeof(uint64_t));
+    \\  uint64_t cls48 = cls & 0xFFFFFFFFFFFFull;
+    \\  uint64_t want = *site;
+    \\  if ((want >> 16) != cls48 || (want & 0xFFFFu) == 0) {
+    \\    if (!ev->type_route) return 0;
+    \\    int32_t verdict = ev->type_route(ev->route_ctx, cell, tyname);
+    \\    if (verdict != 1 && verdict != 2) return 0;
+    \\    want = (cls48 << 16) | (uint64_t)(uint32_t)verdict;
+    \\    *site = want;
+    \\  }
+    \\  *ol = ((want & 0xFFFFu) == 1u) ? 1 : 0; *og = 2;
+    \\  return 1;
+    \\}
+    \\
+;
 
 fn leafEmitFor(sel: ?[]const u8, f: *const ir.Func) bool {
     if (f.package.len == 0) return true;
@@ -1109,7 +1291,17 @@ fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []cons
         if (drop) |d| {
             if (std.c.getenv("KLIO_LEAF_TRACE") != null) {
                 const df = m.funcById(ir.FuncId.from(d));
-                std.debug.print("[leaf-prune] {s}\n", .{if (df) |x| x.fqn else "?"});
+                var why: []const u8 = "?";
+                if (leaf_targets.getPtr(d)) |ent| {
+                    for (ent.targets.items) |t| {
+                        if (!leaf_targets.contains(t.fid)) {
+                            const tf = m.funcById(ir.FuncId.from(t.fid));
+                            why = if (tf) |x| x.fqn else "<missing>";
+                            break;
+                        }
+                    }
+                }
+                std.debug.print("[leaf-prune] {s} <- {s}\n", .{ if (df) |x| x.fqn else "?", why });
             }
             var v = leaf_targets.fetchRemove(d).?.value;
             v.targets.deinit(gpa);
@@ -1160,6 +1352,33 @@ fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []cons
         \\
         \\
     , .{path}) catch return 1;
+    // The KVC layout constants + slot helpers the leaf field read needs,
+    // frozen at emit time exactly like the full-program preamble; the
+    // loader refuses the library when the runtime's layout disagrees
+    // (klio_leaves_frozen below).
+    var kvf: ir.hot_layout.HotLayout = undefined;
+    ir.hot_layout.fillLayout(&kvf);
+    inline for (@typeInfo(ir.hot_layout.HotLayout).@"struct".fields) |fld| {
+        comptime if (std.mem.eql(u8, fld.name, "usable") or
+            std.mem.eql(u8, fld.name, "obj_usable") or
+            std.mem.eql(u8, fld.name, "span_usable")) continue;
+        var upper: [fld.name.len]u8 = undefined;
+        for (fld.name, 0..) |ch, i| upper[i] = std.ascii.toUpper(ch);
+        w.print("#define KVC_{s} {d}u\n", .{ upper, @field(kvf, fld.name) }) catch return 1;
+    }
+    w.print("static const klio_hot_layout KLF = {{\n", .{}) catch return 1;
+    inline for (@typeInfo(ir.hot_layout.HotLayout).@"struct".fields) |fld| {
+        w.print("  .{s} = {d}u,\n", .{ fld.name, @field(kvf, fld.name) }) catch return 1;
+    }
+    w.print("}};\n", .{}) catch return 1;
+    w.print("const klio_hot_layout *klio_leaves_frozen(void) {{ return &KLF; }}\n", .{}) catch return 1;
+    w.print("static inline uint64_t kv_tag(const uint8_t *s) {{ uint64_t t = 0; memcpy(&t, s + KVC_TAG_OFF, KVC_TAG_SIZE); return t; }}\n", .{}) catch return 1;
+    w.print("static inline int32_t kv_int(const uint8_t *s) {{ int32_t v; memcpy(&v, s + KVC_INT_OFF, 4); return v; }}\n", .{}) catch return 1;
+    w.print("static inline int64_t kv_long(const uint8_t *s) {{ int64_t v; memcpy(&v, s + KVC_LONG_OFF, 8); return v; }}\n", .{}) catch return 1;
+    w.print("static inline uint16_t kv_char(const uint8_t *s) {{ uint16_t v; memcpy(&v, s + KVC_CHAR_OFF, 2); return v; }}\n", .{}) catch return 1;
+    w.print("static inline void *kv_inst(const uint8_t *s) {{ void *p; memcpy(&p, s + KVC_INST_PTR_OFF, sizeof(void *)); return p; }}\n", .{}) catch return 1;
+
+    w.print("{s}", .{leaf_getfield_c}) catch return 1;
     {
         var it = leaf_targets.keyIterator();
         while (it.next()) |fid| {
@@ -1198,6 +1417,7 @@ fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []cons
         io.printStderr(gpa, "error: write {s} failed\n", .{out_path});
         return 1;
     };
+    printLeafEscapeHisto();
     io.printStderr(gpa, "wrote {s} ({d} leaves)\n", .{ out_path, reg_list.items.len });
     return 0;
 }
@@ -1226,7 +1446,7 @@ fn leafConstStrOf(consts: []const ir.Const, cid: ir.ConstId) ?[]const u8 {
 
 /// The scalar integer conversion a zero-arg virtual slot names, or null.
 /// Slot ids reuse the root declaration's FuncId, so the name is static.
-const ScalarConv = enum { to_int, to_long, to_short, to_byte, to_char };
+const ScalarConv = enum { to_int, to_long, to_short, to_byte, to_char, inv };
 fn leafScalarConv(m: *const ir.Module, slot: ir.MethodSlotId) ?ScalarConv {
     const rf = m.funcById(ir.FuncId.from(slot.int())) orelse return null;
     const eq = std.mem.eql;
@@ -1235,6 +1455,22 @@ fn leafScalarConv(m: *const ir.Module, slot: ir.MethodSlotId) ?ScalarConv {
     if (eq(u8, rf.name, "toShort")) return .to_short;
     if (eq(u8, rf.name, "toByte")) return .to_byte;
     if (eq(u8, rf.name, "toChar")) return .to_char;
+    if (eq(u8, rf.name, "inv")) return .inv;
+    return null;
+}
+
+/// The scalar bitwise/shift infix a one-arg virtual slot names, or null
+/// (`x and y`, `shl`, ... lower as virtual calls on Int/Long receivers).
+const ScalarBit = enum { band, bor, bxor, shl, shr, ushr };
+fn leafScalarBit(m: *const ir.Module, slot: ir.MethodSlotId) ?ScalarBit {
+    const rf = m.funcById(ir.FuncId.from(slot.int())) orelse return null;
+    const eq = std.mem.eql;
+    if (eq(u8, rf.name, "and")) return .band;
+    if (eq(u8, rf.name, "or")) return .bor;
+    if (eq(u8, rf.name, "xor")) return .bxor;
+    if (eq(u8, rf.name, "shl")) return .shl;
+    if (eq(u8, rf.name, "shr")) return .shr;
+    if (eq(u8, rf.name, "ushr")) return .ushr;
     return null;
 }
 
@@ -1265,6 +1501,14 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
         leafTrace(f, "suspend");
         ok = false;
     }
+    // Inline fns are ELIGIBLE: their standalone lowered bodies are real
+    // (the Map.iterator incident was a REGISTRATION KEY collision — the
+    // identity `Iterator<T>.iterator() = this` overwrote Map's entry
+    // under the shared single-char 'o' sig; leafKeyAlloc now keys
+    // non-scalar params by type head). The genuinely splice-dependent
+    // shapes are filtered at the op level: reified `is T` by the
+    // bare-type-var InstanceOf gate, `as T`/`::class`/`typeOf` as
+    // escape-ops, lambda-param calls as non-direct calls.
     for (f.blocks, 0..) |*blk, bi| {
         if (!ok) break;
         if (blk.catches.len != 0 or blk.finally != null) {
@@ -1331,6 +1575,18 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                             }
                         },
                         .UnOp => {},
+                        .Not => {},
+                        // A field read serves only when the receiver is a
+                        // genre-8 handle AND the field resolves to a plain
+                        // stored slot at run time; every other case bails
+                        // pure, so eligibility always admits it. The name
+                        // must be a string const for the site's resolver.
+                        .GetField => |*gf| {
+                            if (leafConstStrOf(consts, gf.field) == null) {
+                                leafTrace(f, "field-name");
+                                ok = false;
+                            }
+                        },
                         .CallMemberOrGlobal => |*cg| {
                             // A bare constructor call the index bound to a
                             // CLASS, in tail position of a receiver-less
@@ -1378,14 +1634,30 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                             }
                         },
                         .CallVirtual => |*cv| {
-                            // Zero-arg virtual on a receiver that is a
-                            // SCALAR by construction (every register in an
-                            // eligible body is): the slot id is the root
+                            // Virtuals on receivers that are SCALARS by
+                            // construction: the slot id is the root
                             // declaration's FuncId, so the method NAME is
-                            // known at emit time. Integer conversions emit
-                            // inline; everything else bails the body.
-                            if (cv.n_args != 0 or leafScalarConv(m, cv.slot) == null) {
+                            // known at emit time. Zero-arg integer
+                            // conversions and one-arg bitwise/shift infixes
+                            // emit inline; everything else bails the body.
+                            const conv_ok = cv.n_args == 0 and leafScalarConv(m, cv.slot) != null;
+                            const bit_ok = cv.n_args == 1 and leafScalarBit(m, cv.slot) != null;
+                            if (!conv_ok and !bit_ok) {
                                 leafTrace(f, "virt");
+                                ok = false;
+                            }
+                        },
+                        // A plain classifier test serves via a per-site
+                        // verdict bound to the receiver's class word;
+                        // generic args, nullable targets, and bare type
+                        // variables (reified context) bail eligibility —
+                        // the run-time route covers only (class, name).
+                        .InstanceOf => |*iot| {
+                            const head = std.mem.trimEnd(u8, iot.ty.name, "?");
+                            if (iot.ty.args.len != 0 or iot.ty.nullable or head.len == 0 or
+                                (head.len <= 2 and std.ascii.isUpper(head[0])))
+                            {
+                                leafTrace(f, "istest");
                                 ok = false;
                             }
                         },
@@ -1403,7 +1675,40 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                                 ok = false;
                             } else ctor_tail = true;
                         },
-                        else => {
+                        // Same admission filter as InstanceOf: a positive
+                        // verdict passes the value through, everything
+                        // else bails pure at run time.
+                        .Cast => |*ct| {
+                            const head = std.mem.trimEnd(u8, ct.ty.name, "?");
+                            if (ct.ty.args.len != 0 or ct.ty.nullable or head.len == 0 or
+                                (head.len <= 2 and std.ascii.isUpper(head[0])))
+                            {
+                                leaf_escape_histo.getPtr(.Cast).* += 1;
+                                leafTrace(f, "escape-op");
+                                ok = false;
+                            }
+                        },
+                        // A CLASS-bound global read serves as a genre-9
+                        // name handle (a string literal, zero-cost); the
+                        // only op that consumes genre 9 is a field read,
+                        // which resolves enum entries through the statics
+                        // route and bails everything else.
+                        .LoadGlobal => |*lg| {
+                            if (lg.class == null or lg.ctor_ref or
+                                leafConstStrOf(consts, lg.name) == null)
+                            {
+                                leaf_escape_histo.getPtr(.LoadGlobal).* += 1;
+                                leafTrace(f, "escape-op");
+                                ok = false;
+                            }
+                        },
+                        else => |other| {
+                            const tag = std.meta.activeTag(other);
+                            leaf_escape_histo.getPtr(tag).* += 1;
+                            if (runtime.envOnce("KLIO_LEAF_TRACE")) |w2| {
+                                if (std.mem.eql(u8, w2, f.name) or std.mem.eql(u8, w2, f.fqn))
+                                    std.debug.print("[leaf-miss-inst] {s}: {s}\n", .{ f.fqn, @tagName(tag) });
+                            }
                             leafTrace(f, "escape-op");
                             ok = false;
                         },
@@ -1627,6 +1932,26 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                         .CallVirtual => |*cv| {
                             if (cv.dst.int() > max_reg) max_reg = cv.dst.int();
                             if (cv.receiver.int() > max_reg) max_reg = cv.receiver.int();
+                            if (cv.args.int() + cv.n_args > max_reg) max_reg = cv.args.int() + cv.n_args;
+                        },
+                        .GetField => |*gf| {
+                            if (gf.dst.int() > max_reg) max_reg = gf.dst.int();
+                            if (gf.receiver.int() > max_reg) max_reg = gf.receiver.int();
+                        },
+                        .Not => |*nt| {
+                            if (nt.dst.int() > max_reg) max_reg = nt.dst.int();
+                            if (nt.src.int() > max_reg) max_reg = nt.src.int();
+                        },
+                        .InstanceOf => |*iot| {
+                            if (iot.dst.int() > max_reg) max_reg = iot.dst.int();
+                            if (iot.src.int() > max_reg) max_reg = iot.src.int();
+                        },
+                        .LoadGlobal => |*lg| {
+                            if (lg.dst.int() > max_reg) max_reg = lg.dst.int();
+                        },
+                        .Cast => |*ct| {
+                            if (ct.dst.int() > max_reg) max_reg = ct.dst.int();
+                            if (ct.src.int() > max_reg) max_reg = ct.src.int();
                         },
                         else => {},
                     }
@@ -1738,6 +2063,65 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                         pc += 2;
                         continue;
                     }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .GetField) {
+                        const gf = &f.blocks[bi].insts[code[pc + 1]].GetField;
+                        const fname = leafConstStrOf(consts, gf.field).?;
+                        try w.print("  {{ static uint64_t KFS_{d}_{d} = 0;\n", .{ bi, code[pc + 1] });
+                        try w.print("    if (!kl_getfield(ev, l{d}, g{d}, &KFS_{d}_{d}, \"{s}\", &l{d}, &g{d})) return 0; }}\n", .{ gf.receiver.int(), gf.receiver.int(), bi, code[pc + 1], fname, gf.dst.int(), gf.dst.int() });
+                        pc += 2;
+                        continue;
+                    }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .LoadGlobal) {
+                        const lg = &f.blocks[bi].insts[code[pc + 1]].LoadGlobal;
+                        const cname = m.classes.items[lg.class.?.int()].name;
+                        try w.print("  l{d} = (int64_t)(uintptr_t)\"{s}\"; g{d} = 9;\n", .{ lg.dst.int(), cname, lg.dst.int() });
+                        pc += 2;
+                        continue;
+                    }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .InstanceOf) {
+                        const iot = &f.blocks[bi].insts[code[pc + 1]].InstanceOf;
+                        try w.print("  {{ static uint64_t KIS_{d}_{d} = 0;\n", .{ bi, code[pc + 1] });
+                        try w.print("    if (!kl_instanceof(ev, l{d}, g{d}, &KIS_{d}_{d}, \"{s}\", &l{d}, &g{d})) return 0; }}\n", .{ iot.src.int(), iot.src.int(), bi, code[pc + 1], iot.ty.name, iot.dst.int(), iot.dst.int() });
+                        pc += 2;
+                        continue;
+                    }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .Cast) {
+                        const ct = &f.blocks[bi].insts[code[pc + 1]].Cast;
+                        try w.print("  {{ static uint64_t KCS_{d}_{d} = 0;\n", .{ bi, code[pc + 1] });
+                        try w.print("    if (!kl_cast(ev, l{d}, g{d}, &KCS_{d}_{d}, \"{s}\", &l{d}, &g{d})) return 0; }}\n", .{ ct.src.int(), ct.src.int(), bi, code[pc + 1], std.mem.trimEnd(u8, ct.ty.name, "?"), ct.dst.int(), ct.dst.int() });
+                        pc += 2;
+                        continue;
+                    }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .Not) {
+                        const nt = &f.blocks[bi].insts[code[pc + 1]].Not;
+                        try w.print("  if (g{d} != 2) return 0;\n", .{nt.src.int()});
+                        try w.print("  l{d} = !l{d}; g{d} = 2;\n", .{ nt.dst.int(), nt.src.int(), nt.dst.int() });
+                        pc += 2;
+                        continue;
+                    }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .CallVirtual and
+                        f.blocks[bi].insts[code[pc + 1]].CallVirtual.n_args == 1)
+                    {
+                        const cv = &f.blocks[bi].insts[code[pc + 1]].CallVirtual;
+                        const bit = leafScalarBit(m, cv.slot).?;
+                        const rr = cv.receiver.int();
+                        const aa = cv.args.int();
+                        const dd = cv.dst.int();
+                        // Int/Long receivers only; Kotlin masks shift counts
+                        // to the receiver width and shifts arithmetically for
+                        // shr, logically for ushr.
+                        try w.print("  if (g{d} > 1 || g{d} > 1) return 0;\n", .{ rr, aa });
+                        switch (bit) {
+                            .band => try w.print("  l{d} = (g{d} == 0) ? (int64_t)(int32_t)((uint32_t)l{d} & (uint32_t)l{d}) : (int64_t)((uint64_t)l{d} & (uint64_t)l{d}); g{d} = g{d};\n", .{ dd, rr, rr, aa, rr, aa, dd, rr }),
+                            .bor => try w.print("  l{d} = (g{d} == 0) ? (int64_t)(int32_t)((uint32_t)l{d} | (uint32_t)l{d}) : (int64_t)((uint64_t)l{d} | (uint64_t)l{d}); g{d} = g{d};\n", .{ dd, rr, rr, aa, rr, aa, dd, rr }),
+                            .bxor => try w.print("  l{d} = (g{d} == 0) ? (int64_t)(int32_t)((uint32_t)l{d} ^ (uint32_t)l{d}) : (int64_t)((uint64_t)l{d} ^ (uint64_t)l{d}); g{d} = g{d};\n", .{ dd, rr, rr, aa, rr, aa, dd, rr }),
+                            .shl => try w.print("  l{d} = (g{d} == 0) ? (int64_t)(int32_t)((uint32_t)l{d} << ((uint32_t)l{d} & 31u)) : (int64_t)((uint64_t)l{d} << ((uint64_t)l{d} & 63u)); g{d} = g{d};\n", .{ dd, rr, rr, aa, rr, aa, dd, rr }),
+                            .shr => try w.print("  l{d} = (g{d} == 0) ? (int64_t)((int32_t)l{d} >> ((uint32_t)l{d} & 31u)) : (l{d} >> ((uint64_t)l{d} & 63u)); g{d} = g{d};\n", .{ dd, rr, rr, aa, rr, aa, dd, rr }),
+                            .ushr => try w.print("  l{d} = (g{d} == 0) ? (int64_t)(int32_t)((uint32_t)l{d} >> ((uint32_t)l{d} & 31u)) : (int64_t)((uint64_t)l{d} >> ((uint64_t)l{d} & 63u)); g{d} = g{d};\n", .{ dd, rr, rr, aa, rr, aa, dd, rr }),
+                        }
+                        pc += 2;
+                        continue;
+                    }
                     if (f.blocks[bi].insts[code[pc + 1]] == .CallVirtual) {
                         const cv = &f.blocks[bi].insts[code[pc + 1]].CallVirtual;
                         const conv = leafScalarConv(m, cv.slot).?;
@@ -1754,6 +2138,7 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                             .to_short => try w.print("  l{d} = (int64_t)(int16_t)l{d}; g{d} = 0;\n", .{ dd, rr, dd }),
                             .to_byte => try w.print("  l{d} = (int64_t)(int8_t)l{d}; g{d} = 0;\n", .{ dd, rr, dd }),
                             .to_char => try w.print("  l{d} = (int64_t)(uint16_t)l{d}; g{d} = 4;\n", .{ dd, rr, dd }),
+                            .inv => try w.print("  l{d} = (g{d} == 0) ? (int64_t)(int32_t)~(uint32_t)l{d} : (int64_t)~(uint64_t)l{d}; g{d} = g{d};\n", .{ dd, rr, rr, rr, dd, rr }),
                         }
                         pc += 2;
                         continue;
@@ -1771,7 +2156,15 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                     pc += 2;
                 },
                 .jump => {
-                    try w.print("  if (kv_edge(ctx, ev)) return 0;\n  goto KLB{d};\n", .{code[pc + 1]});
+                    // Only a BACK-edge can loop, so only a back-edge polls
+                    // the safe-point guard — forward jumps in a leaf are
+                    // bounded and the poll was ~9% of a field-reading
+                    // leaf's samples.
+                    if (code[pc + 1] <= bi) {
+                        try w.print("  if (kv_edge(ctx, ev)) return 0;\n  goto KLB{d};\n", .{code[pc + 1]});
+                    } else {
+                        try w.print("  goto KLB{d};\n", .{code[pc + 1]});
+                    }
                     closed = true;
                     pc += 2;
                 },

@@ -208,6 +208,14 @@ fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: 
     // Frameless serve for the wider leaf-expression shape (a getter that
     // combines a couple of stored reads with primitive arithmetic).
     if (try ir.eval.leafExprServe(VmHost, allocator, mptr, func, &.{receiver}, self)) |r| return r;
+    // Compiled kl_ leaf gate: the getter path is a member-dispatch
+    // commit point like any other — a branchy accessor body the
+    // frameless evaluator declines (inWholeSeconds' unit chase) still
+    // serves natively when its leaf is registered.
+    if (try ir.eval.tryLeafValues(VmHost, allocator, mptr, func, &.{receiver}, self, null)) |lo| switch (lo) {
+        .val => |v| return .{ .ok = v },
+        .raise => |e| return errRes(e),
+    };
     // Pin the receiver as a GC root across the getter's re-entrant evaluation.
     // A getter body allocates and hits safe points; the only handle to the
     // receiver here is this native local (the frame-chain walk cannot see it
@@ -342,6 +350,28 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
 
 pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
     return lexicalReceiverFallback(self, allocator, receiver, name, unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, false, false)));
+}
+
+/// Leaf statics route backing: resolve `Owner.member` for a genre-9
+/// class handle inside a leaf body. ENUM ENTRIES ONLY — an entry is an
+/// eager singleton stored on the ClassDef itself (language-mandated
+/// identity), so its cell is rooted for the class's lifetime and
+/// borrow-safe for the leaf's duration. Anything else (companion vals,
+/// computed statics) returns null and the leaf bails to the exact
+/// re-run.
+pub fn leafStaticMember(self: *VmHost, owner: []const u8, member: []const u8) ?Value {
+    const def = blk: {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        break :blk cg.get().get(owner) orelse return null;
+    };
+    const dg = def.borrow();
+    defer dg.deinit();
+    if (!dg.get().is_enum) return null;
+    for (dg.get().enum_entries) |*e| {
+        if (std.mem.eql(u8, e.name, member)) return e.value;
+    }
+    return null;
 }
 
 /// A boxed capture (an anon-object method's captured outer `var` stored
@@ -603,6 +633,12 @@ pub fn fieldGetterIsLeaf(self: *VmHost, fid: FuncId) bool {
 /// step settled onto a native binding, or one that redirects to a sibling
 /// declaration, resolves elsewhere — the frameless leaf evaluator must not
 /// interpret the body in either case.
+/// The module as a stable plain pointer (the leaf gate's field-route
+/// thunk chases trivial accessor getters through it).
+pub fn hostModulePtr(self: *VmHost) *const Module {
+    return self.module.asPtr();
+}
+
 pub fn funcRunsItsBody(self: *VmHost, fid: FuncId) bool {
     const pg = self.prog.borrow();
     defer pg.deinit();
@@ -2865,6 +2901,30 @@ fn ownerKeyedExtProp(comptime setters: bool, map: anytype, recv_key: []const u8,
         slot.* = .{ .key = k, .gen = gen, .hit = found != null, .fid = if (found) |f| f.int() else NO_FID };
         if (found) |fid| return fid;
     }
+    // The bare member-extension call arm passes its DISPATCH OWNER by
+    // pushing it on the enclosing chain, never as a frame `this` — inside
+    // `MeasureScope.measure` reached via `with(node) { measure(...) }`,
+    // the node (which owns `private val Density.targetConstraints`) is
+    // only there. Probe those receivers with the same memo.
+    var eit = ir.eval.enclosingChainIter();
+    while (eit.next()) |v| {
+        if (v != .Instance) continue;
+        const cls = blk: {
+            const g = v.Instance.borrow();
+            defer g.deinit();
+            break :blk g.get().class;
+        };
+        const k = ownerKeyedSlotKey(cls.identity(), recv_key, name);
+        const slot = &memo[(k >> 7) % memo.len];
+        const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
+        if (slot.key == k and slot.gen == gen) {
+            if (!slot.hit) continue;
+            return FuncId.from(slot.fid);
+        }
+        const found = ownerKeyedForClass(cls, map, recv_key, name);
+        slot.* = .{ .key = k, .gen = gen, .hit = found != null, .fid = if (found) |f| f.int() else NO_FID };
+        if (found) |fid| return fid;
+    }
     return null;
 }
 
@@ -2874,11 +2934,24 @@ fn ownerKeyedExtProp(comptime setters: bool, map: anytype, recv_key: []const u8,
 /// entries named by the executing frame's file imports: the import's fqn
 /// minus its leaf IS the declaring owner the registration keyed.
 fn importOwnedExtProp(self: *VmHost, map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
-    const f = ir.eval.currentFrameFunc() orelse return null;
+    const f = ir.eval.currentFrameFunc() orelse {
+        if (missTraceEnvCached()) |w| {
+            if (std.mem.eql(u8, w, name)) std.debug.print("[imp-ext] no frame func\n", .{});
+        }
+        return null;
+    };
     const mg = self.module.borrow();
     defer mg.deinit();
     const module = mg.get();
-    const file = (module.decl_span.get(f.id.int()) orelse return null).file;
+    const file = (module.decl_span.get(f.id.int()) orelse {
+        if (missTraceEnvCached()) |w| {
+            if (std.mem.eql(u8, w, name)) std.debug.print("[imp-ext] no decl_span for {s}#{d}\n", .{ f.name, f.id.int() });
+        }
+        return null;
+    }).file;
+    if (missTraceEnvCached()) |w| {
+        if (std.mem.eql(u8, w, name)) std.debug.print("[imp-ext] fn={s} file={any} paths={d}\n", .{ f.name, file, module.importAliasPathsIn(file, name).len });
+    }
     for (module.importAliasPathsIn(file, name)) |path| {
         if (path.fqn.len <= name.len + 1) continue;
         const owner = path.fqn[0 .. path.fqn.len - name.len - 1];

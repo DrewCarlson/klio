@@ -81,6 +81,20 @@ typedef struct {
    * bails the leaf on persistent conditions. Emitted kv_edge calls
    * through this pointer, never the export directly. */
   int32_t (*rare)(void *ctx, uint32_t reasons);
+  /* Field-read route resolver for leaf bodies (genre-8 instance
+   * handles): resolves (receiver cell, field name) to the class
+   * identity (low 48 bits) plus the PLAIN STORED slot index, exactly
+   * the interpreter's own single-fill site claim. Returns 0 when the
+   * field is not a plain stored slot (getter, delegate, outer-hop) —
+   * the leaf bails. May be null (view built by a non-leaf path). */
+  void *route_ctx;
+  int32_t (*field_route)(void *route_ctx, void *recv_cell, const char *name, uint64_t *cls48_out, int32_t *slot_out);
+  /* Instance-of verdict for leaf genre-8 handles: 1 = yes, 2 = no,
+   * 0 = miss (bail). NULL outside the leaf gates. */
+  int32_t (*type_route)(void *route_ctx, void *recv_cell, const char *name);
+  /* Static-member read for leaf genre-9 class handles (enum entries
+   * only): fills (value, genre) and returns 1, or 0 to bail. */
+  int32_t (*statics_route)(void *route_ctx, const char *owner, const char *name, int64_t *out_v, int32_t *out_g);
 } klio_edge_view;
 void klio_op_edge_view(void *ctx, klio_edge_view *out);
 int32_t klio_op_edge_rare(void *ctx, uint32_t reasons);

@@ -1260,6 +1260,22 @@ fn constLiteralOf(e: *const ast.Expr) ?ir.Const {
     }
 }
 
+/// The classifier path of an owner fqn without its package: the leading
+/// lowercase-initial dotted segments are the package by Kotlin convention
+/// (`androidx.compose.runtime.PersistentCompositionLocalMap` ->
+/// `PersistentCompositionLocalMap`, `kotlin.time.Duration.Companion` ->
+/// `Duration.Companion`). Null when stripping changes nothing.
+fn ownerSimplePath(owner: []const u8) ?[]const u8 {
+    var rest = owner;
+    while (std.mem.indexOfScalar(u8, rest, '.')) |dot| {
+        const seg = rest[0..dot];
+        if (seg.len == 0 or !std.ascii.isLower(seg[0])) break;
+        rest = rest[dot + 1 ..];
+    }
+    if (rest.len == owner.len or rest.len == 0) return null;
+    return rest;
+}
+
 fn declPackage(a: Allocator, decl_pkg: *const SpanStrMap, overrides: *const SpanStrMap, decl_span: Span, package_prefix: []const u8, simple: []const u8) Allocator.Error![]const u8 {
     if (decl_pkg.get(decl_span)) |p| return p;
     const fqn = try resolveFqn(a, overrides, decl_span, package_prefix, simple);
@@ -4058,10 +4074,23 @@ fn buildModuleWithOverrides(
             if (epd.owner) |owner| {
                 const okey = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ owner, recv_key });
                 try extension_props.put(.{ .a = okey, .b = p.name.name }, fid);
-                try owner_keyed_ext_names.put(p.name.name, {});
-                if (p.visibility != .Private) {
-                    try extension_props.put(.{ .a = recv_key, .b = p.name.name }, fid);
+                // The receiver-tower probe reaches an owner through a frame
+                // class's supertype_names, which are SOURCE-WRITTEN simple
+                // names — an fqn-keyed entry alone is unreachable through an
+                // implemented interface (PersistentCompositionLocalMap's
+                // `CompositionLocal<T>.currentValue`). Key the classifier
+                // path without its package as an alias.
+                if (ownerSimplePath(owner)) |short| {
+                    const skey = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ short, recv_key });
+                    try extension_props.put(.{ .a = skey, .b = p.name.name }, fid);
                 }
+                try owner_keyed_ext_names.put(p.name.name, {});
+                // kotlinc-exact scoping: a member extension — private or
+                // not — is visible only where its owner is a receiver (the
+                // tower) or via import, never program-wide, so NO plain
+                // (recv, name) pair. The legal scopes resolve through the
+                // owner-keyed entries: the receiver tower (fqn and
+                // simple-owner keys) and the importing file.
             } else {
                 try extension_props.put(.{ .a = recv_key, .b = p.name.name }, fid);
             }
@@ -4136,11 +4165,15 @@ fn buildModuleWithOverrides(
             if (epd.owner) |owner| {
                 const okey = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ owner, recv_key });
                 try extension_prop_setters.put(.{ .a = okey, .b = p.name.name }, fid);
+                // Same simple-owner alias as the getter above.
+                if (ownerSimplePath(owner)) |short| {
+                    const skey = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ short, recv_key });
+                    try extension_prop_setters.put(.{ .a = skey, .b = p.name.name }, fid);
+                }
                 try owner_keyed_ext_names.put(p.name.name, {});
                 try module.registry.member_ext_owner_class.put(fid, owner);
-                if (p.visibility != .Private) {
-                    try extension_prop_setters.put(.{ .a = recv_key, .b = p.name.name }, fid);
-                }
+                // Same kotlinc-exact scoping as the getter: owner-keyed
+                // only, no program-wide plain pair.
             } else {
                 try extension_prop_setters.put(.{ .a = recv_key, .b = p.name.name }, fid);
             }

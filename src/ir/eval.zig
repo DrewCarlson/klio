@@ -2169,6 +2169,26 @@ pub fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
 /// Push `v` as an enclosing implicit receiver for the about-to-be-invoked
 /// callable. Appends to the current frame's chain; the invoked frame picks
 /// it up at entry. A no-op (silently dropped) when no frame is active.
+/// Iterate the pushed enclosing receivers, innermost first. The values are
+/// borrowed from the live chain — do not retain past the call.
+pub const EnclosingChainIter = struct {
+    idx: usize,
+    pub fn next(self: *EnclosingChainIter) ?Value {
+        const chain = evtls.active_chain orelse return null;
+        while (self.idx > 0) {
+            self.idx -= 1;
+            const e = chain.items[self.idx];
+            if (e.kind == .receiver or e.kind == .subject) return e.v;
+        }
+        return null;
+    }
+};
+
+pub fn enclosingChainIter() EnclosingChainIter {
+    const chain = evtls.active_chain orelse return .{ .idx = 0 };
+    return .{ .idx = chain.items.len };
+}
+
 pub fn pushEnclosing(v: *const Value) void {
     const chain = evtls.active_chain orelse return;
     chain.append(chainAllocator(), .{ .v = v.*, .kind = .receiver }) catch {};
@@ -8062,6 +8082,12 @@ pub const CtorSite = extern struct {
     memo: u64,
 };
 
+/// Threadlocal interp edge view for `tryLeafValues` (see the cache
+/// comment there); rebuilt only when the serving host changes.
+threadlocal var leaf_ev_cache: NativeEdgeView = undefined;
+threadlocal var leaf_ev_host: ?*anyopaque = null;
+threadlocal var leaf_ev_counter: u64 = 0;
+
 const NativeLeafEntry = struct { f: NativeLeafFn, fqn: []const u8 };
 var native_leaf_table: std.AutoHashMapUnmanaged(u32, NativeLeafEntry) = .empty;
 /// FQN-keyed leaves (a loaded leaf LIBRARY: bakes are not cross-process
@@ -8087,13 +8113,62 @@ pub fn leafSigChar(ty: []const u8) u8 {
     return 'o';
 }
 
-/// `fqn#<sig>` — the collision-proof registration key for `f`.
+/// `fqn#<sig>` — the collision-proof registration key for `f`. A
+/// non-scalar param contributes its declared type HEAD, not just 'o':
+/// `Map.iterator`, `MutableMap.iterator`, and the identity
+/// `Iterator<T>.iterator() = this` all share
+/// `kotlin.collections.iterator` and an object receiver, and the
+/// single-char sig let the LAST registration win — the identity body
+/// served Map callers and returned the receiver map.
 pub fn leafKeyAlloc(gpa2: std.mem.Allocator, f: *const Func) ?[]u8 {
     var buf: std.ArrayList(u8) = .empty;
     buf.appendSlice(gpa2, f.fqn) catch return null;
     buf.append(gpa2, '#') catch return null;
-    for (f.params) |*p| buf.append(gpa2, leafSigChar(p.ty.name)) catch return null;
+    for (f.params) |*p| {
+        const c = leafSigChar(p.ty.name);
+        if (c != 'o') {
+            buf.append(gpa2, c) catch return null;
+            continue;
+        }
+        const nm = p.ty.name;
+        const head = if (std.mem.lastIndexOfScalar(u8, nm, '.')) |d| nm[d + 1 ..] else nm;
+        if (head.len == 0) {
+            buf.append(gpa2, 'o') catch return null;
+        } else {
+            buf.append(gpa2, '{') catch return null;
+            buf.appendSlice(gpa2, head) catch return null;
+            buf.append(gpa2, '}') catch return null;
+        }
+    }
     return buf.toOwnedSlice(gpa2) catch null;
+}
+
+test "leafKeyAlloc separates object-receiver overloads by type head" {
+    const gpa2 = std.testing.allocator;
+    const mk = struct {
+        fn key(al: std.mem.Allocator, ty_name: []const u8) ![]u8 {
+            var params = [_]ir.Param{.{
+                .name = "this",
+                .ty = .{ .name = ty_name, .nullable = false, .args = &.{} },
+                .default = null,
+                .is_property = false,
+                .is_vararg = false,
+                .has_default = false,
+            }};
+            var f = std.mem.zeroInit(Func, .{
+                .fqn = "kotlin.collections.iterator",
+                .name = "iterator",
+                .params = params[0..],
+            });
+            return leafKeyAlloc(al, &f) orelse error.OutOfMemory;
+        }
+    };
+    const a2 = try mk.key(gpa2, "Map");
+    defer gpa2.free(a2);
+    const b2 = try mk.key(gpa2, "Iterator");
+    defer gpa2.free(b2);
+    try std.testing.expect(!std.mem.eql(u8, a2, b2));
+    try std.testing.expectEqualStrings("kotlin.collections.iterator#{Map}", a2);
 }
 
 /// Register a leaf by FQN alone (leaf-library loading).
@@ -8123,9 +8198,11 @@ pub fn registerNativeLeaf(fid: u32, f: NativeLeafFn, fqn: []const u8) void {
 /// paths, which re-run the pure body exactly.
 var leaf_diag_serve = std.atomic.Value(u64).init(0);
 var leaf_diag_bail = std.atomic.Value(u64).init(0);
+var leaf_diag_try = std.atomic.Value(u64).init(0);
+var leaf_diag_nokey = std.atomic.Value(u64).init(0);
 pub fn leafDiagDump() void {
     if (runtime.envOnce("KLIO_LEAF_DIAG") == null) return;
-    std.debug.print("[leaf-diag] served={d} bailed={d}\n", .{ leaf_diag_serve.load(.monotonic), leaf_diag_bail.load(.monotonic) });
+    std.debug.print("[leaf-diag] served={d} bailed={d} tried={d} nokey={d}\n", .{ leaf_diag_serve.load(.monotonic), leaf_diag_bail.load(.monotonic), leaf_diag_try.load(.monotonic), leaf_diag_nokey.load(.monotonic) });
 }
 
 pub const LeafOutcome = union(enum) { val: Value, raise: EvalError };
@@ -8144,6 +8221,7 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
     // Per-Func route memo: the registry lookup (mutex + hash + fqn
     // compare) priced every call by ~20% on a call-dense benchmark;
     // the table is write-once, so one resolution is final.
+    _ = leaf_diag_try.fetchAdd(1, .monotonic);
     const route = cf.leaf_route.load(.acquire);
     const klf: NativeLeafFn = switch (route) {
         0 => blk_r: {
@@ -8160,6 +8238,7 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
                 null
             else
                 nativeLeafFor(cf.id.int(), cf.fqn) orelse nativeLeafForFunc(cf);
+            if (f0 == null) _ = leaf_diag_nokey.fetchAdd(1, .monotonic);
             const enc: usize = if (f0) |fp| @intFromPtr(fp) else 1;
             @constCast(cf).leaf_route.store(enc, .release);
             break :blk_r f0 orelse return null;
@@ -8199,6 +8278,14 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
                 argv[i] = @as(u32, @bitCast(v));
                 argg[i] = 6;
             },
+            .Instance => |inst| {
+                // Genre 8: a borrowed instance HANDLE (the raw cell — the
+                // caller's frame roots it and the GC never moves cells).
+                // Leaf field reads resolve through the view's field_route;
+                // any other op on genre 8 bails.
+                argv[i] = @bitCast(@as(u64, @intFromPtr(inst.cell)));
+                argg[i] = 8;
+            },
             else => {
                 // Opaque cargo (genre 7): an unused receiver param rides
                 // through; every emitted op on genre > 6 bails, so a body
@@ -8209,32 +8296,62 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
         }
     }
     var ev: NativeEdgeView = undefined;
-    var local_counter: u64 = 0;
     if (nctx) |nc| {
         nativeEdgeView(nc, &ev);
+        ev.route_ctx = @ptrCast(host);
+        ev.field_route = &LeafFieldRoute(H).route;
+        ev.type_route = &LeafTypeRoute(H).route;
+        ev.statics_route = &LeafStaticsRoute(H).route;
     } else {
-        ev = .{
-            .rare = &leafEdgeRareInterp,
-            .counter = &local_counter,
-            .idle = runtime.gc.idleTickPtr(),
-            .abandonable = runtime.abandonablePtr(),
-            .rb_abandon = runtime.runBoundaryAbandonPtr(),
-            .abandon_req = runtime.abandonRequestedPtr(),
-            .gc_pending = runtime.gc.pendingFlagPtr(),
-            .gc_on = @intFromBool(runtime.gc.gc_enabled),
-            .always = @intFromBool(runtime.gc.stressActive()),
-        };
+        // Threadlocal cached interp edge view: every pointer in it is
+        // process- or thread-stable, so the per-call cost collapses to
+        // refreshing the two mode flags plus a host-identity check —
+        // the full 12-field build (four of them fn calls) priced every
+        // serve. The counter deliberately accumulates across calls;
+        // the guard only compares it against per-call thresholds.
+        if (leaf_ev_host != @as(?*anyopaque, @ptrCast(host))) {
+            leaf_ev_cache = .{
+                .rare = &leafEdgeRareInterp,
+                .route_ctx = @ptrCast(host),
+                .field_route = &LeafFieldRoute(H).route,
+                .type_route = &LeafTypeRoute(H).route,
+                .statics_route = &LeafStaticsRoute(H).route,
+                .counter = &leaf_ev_counter,
+                .idle = runtime.gc.idleTickPtr(),
+                .abandonable = runtime.abandonablePtr(),
+                .rb_abandon = runtime.runBoundaryAbandonPtr(),
+                .abandon_req = runtime.abandonRequestedPtr(),
+                .gc_pending = runtime.gc.pendingFlagPtr(),
+                .gc_on = 0,
+                .always = 0,
+            };
+            leaf_ev_host = @ptrCast(host);
+        }
+        leaf_ev_cache.gc_on = @intFromBool(runtime.gc.gc_enabled);
+        leaf_ev_cache.always = @intFromBool(runtime.gc.stressActive());
     }
+    const evp: *NativeEdgeView = if (nctx != null) &ev else &leaf_ev_cache;
     var rl: i64 = 0;
     var rg: i32 = 0;
     var aux: [8]i64 = undefined;
     var auxg: [8]i32 = undefined;
     const cctx: ?*anyopaque = if (nctx) |nc| @ptrCast(nc) else null;
-    if (klf(cctx, &ev, &argv, &argg, &rl, &rg, 0, &aux, &auxg) == 0) {
+    if (klf(cctx, evp, &argv, &argg, &rl, &rg, 0, &aux, &auxg) == 0) {
         _ = leaf_diag_bail.fetchAdd(1, .monotonic);
+        // Bail damper: a leaf that has NEVER served and keeps bailing is
+        // structural for this program's call shapes — stop attempting it.
+        // The served bit is sticky, so a genre-mixed fn stays enabled.
+        const probe = @constCast(cf).leaf_bail_probe.fetchAdd(1, .monotonic);
+        if (probe & 0x8000_0000 == 0 and (probe & 0x7FFF_FFFF) >= 64) {
+            @constCast(cf).leaf_route.store(1, .release);
+        }
         return null;
     }
     _ = leaf_diag_serve.fetchAdd(1, .monotonic);
+    const probe0 = cf.leaf_bail_probe.load(.monotonic);
+    if (probe0 & 0x8000_0000 == 0) {
+        _ = @constCast(cf).leaf_bail_probe.fetchOr(0x8000_0000, .monotonic);
+    }
     if (runtime.envOnce("KLIO_LEAF_TRACE_SERVE") != null) {
         std.debug.print("[leaf-serve] {s} rg={d} rl={d}\n", .{ cf.fqn, rg, rl });
     }
@@ -8282,6 +8399,10 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
                 4 => .{ .Char = @intCast(aux[ai]) },
                 5 => .{ .Double = @bitCast(aux[ai]) },
                 6 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(aux[ai]))))) },
+                // A genre-8 aux is a borrowed handle used as a ctor arg;
+                // the construction retains what it stores, so no retain
+                // here — the caller's frame roots it for the call.
+                8 => .{ .Instance = .{ .cell = @ptrFromInt(@as(usize, @bitCast(aux[ai]))) } },
                 else => return null,
             };
         }
@@ -8305,6 +8426,13 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
         4 => .{ .Char = @intCast(rl) },
         5 => .{ .Double = @bitCast(rl) },
         6 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(rl))))) },
+        8 => blk8: {
+            // A genre-8 handle coming BACK is a borrowed cell becoming an
+            // owned Value: retain before it escapes the call window.
+            const iv = Value{ .Instance = .{ .cell = @ptrFromInt(@as(usize, @bitCast(rl))) } };
+            iv.retain();
+            break :blk8 iv;
+        },
         else => return null,
     };
     return .{ .val = v };
@@ -8634,7 +8762,120 @@ pub const NativeEdgeView = extern struct {
     always: u8,
     /// Rare-trigger handler for this view's context (see klio_rt.h).
     rare: *const fn (ctx: ?*anyopaque, reasons: u32) callconv(.c) i32,
+    /// Field-read route resolver for leaf genre-8 handles (see
+    /// klio_rt.h); null outside the leaf gates.
+    route_ctx: ?*anyopaque = null,
+    field_route: ?*const fn (route_ctx: ?*anyopaque, recv_cell: ?*anyopaque, name: [*:0]const u8, cls48_out: *u64, slot_out: *i32) callconv(.c) i32 = null,
+    /// Instance-of verdict resolver for leaf genre-8 handles: 1 = the
+    /// receiver's class IS the named type, 2 = it is not, 0 = miss
+    /// (bail). The site binds the verdict to the receiver's class word.
+    type_route: ?*const fn (route_ctx: ?*anyopaque, recv_cell: ?*anyopaque, name: [*:0]const u8) callconv(.c) i32 = null,
+    /// Static-member resolver for leaf genre-9 class handles (`owner`
+    /// is the emitted class-name literal): fills (value, genre) and
+    /// returns 1, or 0 to bail. Enum entries only — see
+    /// leafStaticMember.
+    statics_route: ?*const fn (route_ctx: ?*anyopaque, owner: [*:0]const u8, name: [*:0]const u8, out_v: *i64, out_g: *i32) callconv(.c) i32 = null,
 };
+
+/// Per-host statics thunk for leaf bodies: a genre-9 class handle's
+/// member read resolves through the host's enum-entry table (the only
+/// borrow-safe static family) and marshals the entry like a leaf arg.
+fn LeafStaticsRoute(comptime H: type) type {
+    return struct {
+        fn route(rctx: ?*anyopaque, owner: [*:0]const u8, name: [*:0]const u8, out_v: *i64, out_g: *i32) callconv(.c) i32 {
+            if (comptime !@hasDecl(H, "leafStaticMember")) return 0;
+            const host: *H = @ptrCast(@alignCast(rctx orelse return 0));
+            const v = host.leafStaticMember(std.mem.span(owner), std.mem.span(name)) orelse return 0;
+            switch (v) {
+                .Int => |x| {
+                    out_v.* = x;
+                    out_g.* = 0;
+                },
+                .Long => |x| {
+                    out_v.* = x;
+                    out_g.* = 1;
+                },
+                .Bool => |x| {
+                    out_v.* = @intFromBool(x);
+                    out_g.* = 2;
+                },
+                .Char => |x| {
+                    out_v.* = x;
+                    out_g.* = 4;
+                },
+                .Instance => |inst| {
+                    out_v.* = @bitCast(@as(u64, @intFromPtr(inst.cell)));
+                    out_g.* = 8;
+                },
+                else => return 0,
+            }
+            return 1;
+        }
+    };
+}
+
+/// Per-host instance-of thunk for leaf bodies: rebuilds a borrowed
+/// Instance view over the raw cell and asks the host's own `is`
+/// predicate against a plain non-nullable classifier name (eligibility
+/// rejected everything else). 1 = yes, 2 = no; the site caches the
+/// verdict keyed to the receiver's class word.
+fn LeafTypeRoute(comptime H: type) type {
+    return struct {
+        fn route(rctx: ?*anyopaque, recv_cell: ?*anyopaque, name: [*:0]const u8) callconv(.c) i32 {
+            if (comptime !@hasDecl(H, "instanceOf")) return 0;
+            const host: *H = @ptrCast(@alignCast(rctx orelse return 0));
+            const cell = recv_cell orelse return 0;
+            const v = Value{ .Instance = .{ .cell = @ptrCast(@alignCast(cell)) } };
+            const ty = TypeRef{ .name = std.mem.span(name), .nullable = false, .args = &.{} };
+            return if (host.instanceOf(&v, ty)) 1 else 2;
+        }
+    };
+}
+
+/// Per-host field-route thunk for leaf bodies: rebuilds a borrowed
+/// Instance view over the raw cell (no retain — the leaf's caller roots
+/// it) and asks the host's single-fill field-site claim. Only a PLAIN
+/// STORED slot resolves; everything else bails the leaf.
+fn LeafFieldRoute(comptime H: type) type {
+    return struct {
+        fn route(rctx: ?*anyopaque, recv_cell: ?*anyopaque, name: [*:0]const u8, cls48_out: *u64, slot_out: *i32) callconv(.c) i32 {
+            if (comptime !@hasDecl(H, "fieldSiteRoute")) return 0;
+            const host: *H = @ptrCast(@alignCast(rctx orelse return 0));
+            const cell = recv_cell orelse return 0;
+            const v = Value{ .Instance = .{ .cell = @ptrCast(@alignCast(cell)) } };
+            var claim = host.fieldSiteRoute(&v, std.mem.span(name)) orelse {
+                if (runtime.envOnce("KLIO_LEAF_ROUTE_TRACE") != null)
+                    std.debug.print("[leaf-route] {s}: no claim\n", .{std.mem.span(name)});
+                return 0;
+            };
+            if (runtime.envOnce("KLIO_LEAF_ROUTE_TRACE") != null)
+                std.debug.print("[leaf-route] {s}: tag={d}\n", .{ std.mem.span(name), claim.route & 3 });
+            if (claim.route & 3 == 2) {
+                // A GETTER route whose body is the canonical trivial
+                // accessor (`get() = _backing`) chases through to the
+                // backing field's stored slot — one level, exactly the
+                // accessorFastGet shape. Anything else bails the leaf.
+                if (comptime !@hasDecl(H, "hostModulePtr")) return 0;
+                const mod2 = host.hostModulePtr();
+                const gfid: u32 = @intCast(claim.route >> 2);
+                const gf = mod2.funcById(ir.FuncId.from(gfid)) orelse return 0;
+                const fc = gf.accessorFieldConstIn(mod2) orelse return 0;
+                if (fc.int() >= mod2.consts.items.len) return 0;
+                const under: []const u8 = switch (mod2.consts.items[fc.int()]) {
+                    .String => |sv| sv,
+                    else => return 0,
+                };
+                claim = host.fieldSiteRoute(&v, under) orelse return 0;
+            }
+            if (claim.route & 3 != 1) return 0;
+            const slot = claim.route >> 2;
+            if (slot > std.math.maxInt(i32)) return 0;
+            cls48_out.* = claim.cls & 0xFFFF_FFFF_FFFF;
+            slot_out.* = @intCast(slot);
+            return 1;
+        }
+    };
+}
 
 /// Rare handler for the INTERPRETER's leaf gate: no NativeCtx exists,
 /// so a persistent condition (abandon request, pending GC, an expired

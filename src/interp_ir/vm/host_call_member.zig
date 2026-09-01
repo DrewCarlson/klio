@@ -7512,9 +7512,13 @@ fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *const Va
 
     // Scalar-replay leaf on the anon/companion method (receiver rides as
     // opaque param 0); a bail falls through to the framed invoke, which
-    // re-runs the pure body exactly.
+    // re-runs the pure body exactly. The gate takes the MODULE'S Func
+    // record, not the local copy — the leaf_route memo written through a
+    // copy is discarded, re-pricing every companion dispatch with the
+    // registry mutex + fqn lookup the memo exists to kill.
     if (receiver.* != .Null and all.items.len == f.params.len) {
-        if (try ir.eval.tryLeafValues(VmHost, allocator, module_rc, &f, all.items, self, null)) |lo| {
+        const lfp = module_rc.funcById(hit.func) orelse unreachable;
+        if (try ir.eval.tryLeafValues(VmHost, allocator, module_rc, lfp, all.items, self, null)) |lo| {
             all.deinit(allocator);
             switch (lo) {
                 .val => |v| return .{ .ok = v },
@@ -11445,11 +11449,16 @@ fn memberExtOverrideLookup(self: *VmHost, receiver: *const Value, name: []const 
         for ([2][]const u8{ cd.fqn, cd.name }) |owner| {
             if (owner.len == 0) continue;
             for (mod.memberDecls(owner, name)) |fid| {
-                const f = funcAt(mod, fid) orelse continue;
-                if (f.kind != .member_extension) continue;
-                if (f.params.len != nparams) continue;
-                if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
-                if (!f.hasBody()) continue;
+                const fp = mod.funcById(fid) orelse continue;
+                if (fp.kind != .member_extension) continue;
+                if (fp.params.len != nparams) continue;
+                if (fp.params.len == 0 or !std.mem.eql(u8, fp.params[0].name, "this")) continue;
+                // Pack functions are lazy-bodied: an unensured declaration
+                // reports no body and silently vanished from the pick
+                // (foundation-layout's Density.targetConstraints getter
+                // fell through to an unresolved global). Ensure first.
+                if (fp.blocks.len == 0) _ = mod.ensureFuncBody(@constCast(fp));
+                if (!fp.hasBody()) continue;
                 var dup = false;
                 for (out[0..n]) |seen_fid| {
                     if (seen_fid.int() == fid.int()) dup = true;
