@@ -1,6 +1,23 @@
 # Leaf-wide campaign: real inline bodies, wider ops, cheaper doorway
 
-STATUS 2026-09-01: NOT STARTED. Successor to
+STATUS 2026-09-02: Task 1 LANDED AND CORRECTED — the "inline stub"
+record was a MISDIAGNOSIS: standalone inline bodies are real; the
+Map.iterator incident was a registration KEY COLLISION (the identity
+`Iterator<T>.iterator() = this` overwrote Map's entry under the shared
+single-char 'o' sig). Fixed at the root: leafKeyAlloc keys non-scalar
+params by declared type head (`#{Map}` vs `#{Iterator}`, unit-tested),
+inline gate deleted, wide leaves 3200 -> 3402, full battery green
+(ktor 450/0 — the incident's own detector). Task 2 first rung LANDED:
+escape histogram (CallMember 710, LoadGlobal 589, LoadCapture 354,
+AstLambda 183, LoadFromThisOrGlobal 156, Cast 80, EnclosingPush 79,
+SetField 67, CallValue 56); genre-9 enum statics (class-bound
+LoadGlobal emits a name-handle literal; kl_getfield genre-9 resolves
+enum entries via the new statics_route — entries are eager ClassDef
+singletons, the one borrow-safe static family) unlocked 342 bodies
+(3402 -> 3744, Duration.inWhole* among them); PLUS the property-getter
+dispatch path gained the kl_ leaf gate it was missing (it had only the
+frameless evaluator) — inWhole* micro 9.5 -> 8.8s, 900k serves.
+Successor to
 plans/native-floor-and-tower-campaign.md (closed complete). The one
 future vein `plans/open-campaigns.md` §1 records — "widening kl_
 eligibility, driven by a real program that misses it" — plus the
