@@ -2911,6 +2911,20 @@ pub const FuncBuilder = struct {
         return false;
     }
 
+    /// `resolve` without the splice body floor: the binding a splice
+    /// SUBJECT record keeps for the receiver beneath it (`this` of the
+    /// frame the spliced body sits in), which the callee body itself must
+    /// not see but a subject-corrected read further in must reach.
+    pub fn resolveIgnoringFloor(self: *const FuncBuilder, name: []const u8) ?Reg {
+        if (self.lambda_splice_resolve != null) return self.resolve(name);
+        var i = self.scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.scopes.items[i].get(name)) |r| return r;
+        }
+        return null;
+    }
+
     pub fn resolve(self: *const FuncBuilder, name: []const u8) ?Reg {
         // Inside a spliced inline-argument lambda body, the inline fn's
         // parameter scopes are not in the lambda's lexical scope: search

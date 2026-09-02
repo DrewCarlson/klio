@@ -16,6 +16,7 @@ const build = @import("../build.zig");
 const FF = runtime.forest.ForestField;
 const VmHost = @import("vmhost.zig").VmHost;
 const host_instances = @import("host_instances.zig");
+const host_call_value = @import("host_call_value.zig");
 const host_call_func = @import("host_call_func.zig");
 
 const Allocator = std.mem.Allocator;
@@ -779,6 +780,16 @@ fn lowerAndRegisterMethods(
                 if (f.body == null) continue;
                 const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
                 const func = try ir.lower.lowerMethod(&sub_ref.cell.data, f, class.name.name, own_members);
+                // `KLIO_ANON_DUMP=<class>`: the runtime-lowered method IR.
+                if (runtime.envOnce("KLIO_ANON_DUMP")) |w| {
+                    std.debug.print("[anon-lower] {s}.{s}\n", .{ class.name.name, f.name.name });
+                    if (std.mem.eql(u8, w, class.name.name)) {
+                        var aw: std.Io.Writer.Allocating = .init(allocator);
+                        defer aw.deinit();
+                        ir.disasm.dumpModule(&aw.writer, &sub_ref.cell.data, .{ .all = true }) catch {};
+                        std.debug.print("[anon-dump] {s}.{s}: funcs={d} len={d}\n{s}\n", .{ class.name.name, f.name.name, sub_ref.cell.data.funcs.items.len, aw.written().len, aw.written() });
+                    }
+                }
                 const fid = func.id;
                 const caps = try allocator.dupe(NameValue, capture_pairs);
                 const entry: AnonMethodEntry = .{ .module = sub_ref, .func = fid, .captures = caps };
@@ -967,10 +978,63 @@ fn registerNestedClasses(self: *VmHost, allocator: Allocator, class: *const ast.
     for (class.members) |*m| {
         switch (m.*) {
             .Class => |*nested| {
+                if (nested.is_companion) {
+                    // A LOCAL class's companion: registered under a
+                    // mangled runtime name, constructed once here, and
+                    // published as the class's `$companion:<name>` global
+                    // so a member call on the class value forwards to it
+                    // (`W.serializer()` on a local `@Serializable` class).
+                    var renamed = nested.*;
+                    renamed.name = .{ .name = try std.fmt.allocPrint(allocator, "{s}$Companion", .{class.name.name}), .span = nested.name.span };
+                    renamed.is_companion = false;
+                    const owned = try allocator.create(ast.Class);
+                    owned.* = renamed;
+                    _ = try registerClass(self, allocator, owned);
+                    try publishLocalSingleton(self, allocator, owned.name.name, try std.fmt.allocPrint(allocator, "$companion:{s}", .{class.name.name}));
+                    continue;
+                }
                 _ = try registerClass(self, allocator, nested);
+            },
+            // A nested `object` of a local class: registered as a class,
+            // constructed once, and bound under its own name so the
+            // class's members reach it by bare name.
+            .Object => |*o| {
+                const synth = try allocator.create(ast.Class);
+                synth.* = try build.lift.synthesizeClassFromObject(allocator, o);
+                _ = try registerClass(self, allocator, synth);
+                try publishLocalSingleton(self, allocator, synth.name.name, synth.name.name);
             },
             else => {},
         }
+    }
+}
+
+/// Construct the runtime-registered class `class_name` with no arguments
+/// and bind the instance to the global `global_name`.
+fn publishLocalSingleton(self: *VmHost, allocator: Allocator, class_name: []const u8, global_name: []const u8) Allocator.Error!void {
+    const def: ?ObjRef(ClassDef) = blk: {
+        const g = self.classes.borrow();
+        defer g.deinit();
+        if (g.get().get(class_name)) |d| break :blk d.clone();
+        break :blk null;
+    };
+    const dbg = runtime.envOnce("KLIO_INIT_DEBUG") != null;
+    const d = def orelse {
+        if (dbg) std.debug.print("[init-debug] local singleton {s}: class not registered\n", .{class_name});
+        return;
+    };
+    const cv = Value{ .Class = d };
+    const r = try host_call_value.callValue(self, allocator, &cv, &.{});
+    switch (r) {
+        .ok => |inst| {
+            if (dbg) std.debug.print("[init-debug] local singleton {s} -> {s} ({s})\n", .{ class_name, global_name, @tagName(std.meta.activeTag(inst)) });
+            const g = self.globals.borrowMut();
+            defer g.deinit();
+            g.get().define(global_name, inst) catch {};
+        },
+        .err => |e| {
+            if (dbg) std.debug.print("[init-debug] local singleton {s} FAILED: {s}\n", .{ class_name, @tagName(std.meta.activeTag(e)) });
+        },
     }
 }
 
@@ -1043,6 +1107,34 @@ fn rewriteAccessorFieldRefs(allocator: Allocator, body: ast.FunctionBody, prop: 
     };
 }
 
+/// The class's nested singletons (its companion, its nested objects) sit
+/// in the same lexical scope as the class: their bare reads of the
+/// enclosing receiver's members walk the same outer.
+fn assignNestedOuters(self: *VmHost, allocator: Allocator, class: *const ast.Class, this_val: Value) Allocator.Error!void {
+    for (class.members) |*m| {
+        const global_name: ?[]const u8 = switch (m.*) {
+            .Object => |*o| o.name.name,
+            .Class => |*nc| if (nc.is_companion) try std.fmt.allocPrint(allocator, "$companion:{s}", .{class.name.name}) else null,
+            else => null,
+        };
+        const gname = global_name orelse continue;
+        const inst: ?Value = blk: {
+            const g = self.globals.borrow();
+            defer g.deinit();
+            break :blk g.get().lookup(gname);
+        };
+        if (inst) |iv| {
+            if (iv == .Instance) {
+                const ig = iv.Instance.borrowMut();
+                defer ig.deinit();
+                const has_outer = if (ig.get().outer) |o| (o != .Null and o != .Unit) else false;
+                if (!has_outer) ig.get().outer = this_val;
+                if (runtime.envOnce("KLIO_INIT_DEBUG") != null) std.debug.print("[init-debug] outer for {s}: set={}\n", .{ gname, !has_outer });
+            }
+        }
+    }
+}
+
 pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const ast.Class, captured_names: []const []const u8, captures: []const Value) Allocator.Error!UnitResult {
     host_instances.anonLowerEnter();
     defer host_instances.anonLowerExit();
@@ -1090,6 +1182,7 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
             // Same reason as the uncaptured path: a class nested inside a
             // local class is otherwise never registered.
             try registerNestedClasses(self, allocator, class);
+            try assignNestedOuters(self, allocator, class, tv);
             return .ok;
         }
     }

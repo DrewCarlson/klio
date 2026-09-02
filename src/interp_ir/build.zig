@@ -3612,6 +3612,7 @@ fn buildModuleWithOverrides(
         for (parent_args, 0..) |*e, idx| {
             const nm = try std.fmt.allocPrint(a, "__parent_ctor_arg_{s}_{d}", .{ c.name.name, idx });
             module.pending_param_types = parent_arg_types;
+            module.pending_thunk_expected = parentCtorParamExpected(a, module, c, first_idx, idx);
             fids[idx] = try ir.lower.lowerExprAsParamThunkScopedEnclosing(
                 module,
                 param_refs.items,
@@ -5251,6 +5252,53 @@ pub fn buildStdlibBase(allocator: Allocator, files: []const KotlinFile) Allocato
 /// lowered snapshot, but `files` includes the user program so `main` is
 /// present (and serialized). Boot then runs the loaded module directly —
 /// no parse, no extend.
+/// The declared type of the parent class's primary parameter at `idx`,
+/// instantiated by the supertype's written type arguments
+/// (`JsonTransformingSerializer<String>(serializer())` expects
+/// `KSerializer<String>`). Null when the parent or its parameter is unknown.
+fn parentCtorParamExpected(a: Allocator, module: *ir.Module, c: *const ast.Class, sup_idx: usize, idx: usize) ?ast.TypeRef {
+    if (sup_idx >= c.supertypes.len) return null;
+    const sup = &c.supertypes[sup_idx];
+    const file = sup.name.span.file;
+    const pkg = module.packageOfFile(file) orelse "";
+    const cid = (if (sup.qualified_path) |qp| module.classIdByQualifiedSuffix(qp) else null) orelse
+        module.classIdIndexed(sup.name.name, pkg, file) orelse module.classId(sup.name.name) orelse return null;
+    if (cid.int() >= module.classes.items.len) return null;
+    const pc = &module.classes.items[cid.int()];
+    if (idx >= pc.primary_params.len) return null;
+    const pty = pc.primary_params[idx].ty;
+    return irTypeToAstInstantiated(a, pty, pc.type_params, sup.type_args, sup.name.span) catch null;
+}
+
+fn irTypeToAstInstantiated(a: Allocator, ty: ir.TypeRef, tps: []const []const u8, written: []const ast.TypeArg, sp: ast.Span) Allocator.Error!ast.TypeRef {
+    var nm = std.mem.trimEnd(u8, ty.name, "?");
+    if (std.mem.startsWith(u8, nm, "in#")) nm = nm[3..];
+    if (std.mem.startsWith(u8, nm, "out#")) nm = nm[4..];
+    if (std.mem.indexOfScalar(u8, nm, '<')) |lt| nm = nm[0..lt];
+    // The parent's own type parameter: the written argument at its position.
+    for (tps, 0..) |tp, i| {
+        if (std.mem.eql(u8, tp, nm) and i < written.len and !written[i].is_star) {
+            var out = written[i].ty;
+            out.nullable = out.nullable or ty.nullable;
+            return out;
+        }
+    }
+    const args = try a.alloc(ast.TypeArg, ty.args.len);
+    for (ty.args, args) |arg, *out| {
+        out.* = .{ .variance = .Invariant, .is_star = false, .ty = try irTypeToAstInstantiated(a, arg, tps, written, sp), .span = sp };
+    }
+    return .{
+        .name = .{ .name = try a.dupe(u8, nm), .span = sp },
+        .nullable = ty.nullable,
+        .span = sp,
+        .type_args = args,
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+}
+
 pub fn buildProgramBase(allocator: Allocator, files: []const KotlinFile) Allocator.Error!?*StdlibBase {
     return buildBaseInner(allocator, files, true);
 }

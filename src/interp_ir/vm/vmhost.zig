@@ -326,6 +326,7 @@ pub const VmHost = struct {
     pub const valueCouldServeName = host_call_member.valueCouldServeName;
     pub const debugClassNameOf = host_call_member.debugClassNameOf;
     pub const bindTypeParamGlobal = host_globals.bindTypeParamGlobal;
+    pub const bindTypeParamSpelling = host_globals.bindTypeParamSpelling;
     pub const restoreGlobalBinding = host_globals.restoreGlobalBinding;
     pub const callMember = host_call_member.callMember;
     pub const prepareMemberFlatCall = host_call_member.prepareMemberFlatCall;

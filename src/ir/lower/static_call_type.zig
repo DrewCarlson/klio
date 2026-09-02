@@ -661,6 +661,13 @@ fn staticCallReturnTypeRefInner(
     b: *FuncBuilder,
     call_expr: *const Expr,
 ) Allocator.Error!?ir.TypeRef {
+    if (runtime.envOnce("KLIO_SCRT_TRACE")) |w| {
+        if (call_expr.* == .Call and call_expr.Call.callee.* == .Path and call_expr.Call.callee.Path.segments.len == 1 and
+            std.mem.eql(u8, w, call_expr.Call.callee.Path.segments[0].name))
+        {
+            std.debug.print("[scrt-in] {s} nargs={d}\n", .{ w, call_expr.Call.args.len });
+        }
+    }
     // The Any members' returns are fixed by their signatures — every
     // override keeps them — so a chain does not die at `.toString()` on a
     // receiver nothing could type (`(...).toString().substring(1)`). A

@@ -5272,6 +5272,12 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // target): Kotlin selects extensions statically, so only a true member
     // may shadow it — the by-name extension re-pick must not re-select a
     // sibling overload the static evidence excluded.
+    // A runtime-registered LOCAL class's companion serves a member call on
+    // the class value ahead of any extension on `KClass`, as a module
+    // class's companion does through the registry.
+    if (receiver.* == .Class) {
+        if (try localClassCompanionForward(self, allocator, receiver, name, args)) |r| return r;
+    }
     if (!no_ext) {
         if (try extensionFnFallback(self, allocator, receiver, name, args, strict_ext, static_recv, declared_recv)) |r| return r;
         // An enclosing SAM conversion of a fun interface whose single
@@ -12990,6 +12996,31 @@ fn enclosingChainClassOrder(self: *VmHost, allocator: Allocator) Allocator.Error
     return v;
 }
 
+/// A runtime-registered LOCAL class publishes its companion instance under
+/// the `$companion:<name>` global at registration; a member call on the
+/// class value forwards there.
+fn localClassCompanionForward(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    const cname: []const u8 = blk: {
+        const cg = receiver.Class.borrow();
+        defer cg.deinit();
+        if (!cg.get().is_local_runtime) return null;
+        break :blk cg.get().name;
+    };
+    var key_buf: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "$companion:{s}", .{cname}) catch return null;
+    const local_comp: ?Value = blk: {
+        const g = self.globals.borrow();
+        defer g.deinit();
+        break :blk g.get().lookup(key);
+    };
+    const lc = local_comp orelse return null;
+    if (lc != .Instance) return null;
+    const r = try callMemberRec(self, allocator, &lc, name, args);
+    if (r == .ok) return r;
+    freeDispatchMiss(allocator, r);
+    return null;
+}
+
 fn classCompanionForward(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const cls = receiver.Class;
     var cname: []const u8 = undefined;
@@ -13006,6 +13037,7 @@ fn classCompanionForward(self: *VmHost, allocator: Allocator, receiver: *const V
         cg.deinit();
     }
     const simple = simpleName(cname);
+    if (try localClassCompanionForward(self, allocator, receiver, name, args)) |r| return r;
     const cfqn: []const u8 = blk: {
         const cg = cls.borrow();
         defer cg.deinit();

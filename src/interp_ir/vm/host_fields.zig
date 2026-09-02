@@ -1965,6 +1965,24 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     },
                     .err => |e| return errRes(e),
                 }
+                // A private nested object lifts under `Outer$Name`: the
+                // object registry keys it by that lifted simple name.
+                const lifted: ?[]const u8 = blk: {
+                    const mg = self.module.borrow();
+                    defer mg.deinit();
+                    if (cid.int() >= mg.get().classes.items.len) break :blk null;
+                    break :blk mg.get().classes.items[cid.int()].name;
+                };
+                if (lifted) |ln| {
+                    if (!std.mem.eql(u8, ln, fqn)) {
+                        switch (try host_globals.ensureObjectSingleton(self, ln)) {
+                            .ok => |maybe| if (maybe) |v| {
+                                if (v == .Instance) return ok(v);
+                            },
+                            .err => |e| return errRes(e),
+                        }
+                    }
+                }
                 const def: ?ObjRef(ClassDef) = blk: {
                     const cg = self.classes.borrow();
                     defer cg.deinit();
@@ -2025,6 +2043,21 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                         }
                     }
                 }
+            }
+            // A PRIVATE nested object of this enclosing class lifts under
+            // the mangled `Owner$Name`: a bare reference from a body in
+            // its scope (a local class's generated serializer naming the
+            // test's `private object` serializer) resolves the singleton.
+            {
+                var mbuf: [256]u8 = undefined;
+                if (std.fmt.bufPrint(&mbuf, "{s}${s}", .{ cname, name })) |mangled| {
+                    switch (try host_globals.ensureObjectSingleton(self, mangled)) {
+                        .ok => |maybe| if (maybe) |v| {
+                            if (v == .Instance) return ok(v);
+                        },
+                        .err => |e| return errRes(e),
+                    }
+                } else |_| {}
             }
             // Walk the supertype chain first, then the lexically-enclosing
             // class chain: a member declared by an enclosing class's companion
@@ -3532,7 +3565,24 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         }
         const cg = self.classes.borrow();
         defer cg.deinit();
-        if (cg.get().get(name)) |def| return ok(.{ .Class = def });
+        if (cg.get().get(name)) |def| {
+            // A runtime-registered LOCAL object (a nested object of a local
+            // class) publishes its singleton under its name at
+            // registration: the value is the instance, never the class.
+            const local_runtime = blk: {
+                const dg = def.borrow();
+                defer dg.deinit();
+                break :blk dg.get().is_local_runtime;
+            };
+            if (local_runtime) {
+                const gg = self.globals.borrow();
+                defer gg.deinit();
+                if (gg.get().lookup(name)) |v| {
+                    if (v == .Instance) return ok(v);
+                }
+            }
+            return ok(.{ .Class = def });
+        }
     }
     // Top-level global / module-scoped fallback. An implicit receiver outranks a
     // top-level name, so the executing member-extension's declaring class goes first.

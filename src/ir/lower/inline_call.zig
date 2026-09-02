@@ -7,6 +7,7 @@ const ast = @import("ast");
 const ir = @import("../ir.zig");
 const build = @import("../build.zig");
 const expr_lower = @import("expr.zig");
+const static_call_type = @import("static_call_type.zig");
 const inline_state = @import("inline_state.zig");
 const ast_scan = @import("ast_scan.zig");
 const helpers = @import("helpers.zig");
@@ -1335,6 +1336,11 @@ fn inferReifiedTypeArgsRecv(
     // with no explicit `<User>`.
     if (expected) |exp| {
         if (f.return_type) |*ret| {
+            if (std.c.getenv("KLIO_UNIFY_TRACE") != null) {
+                std.debug.print("[unify-exp] {s} ret={s}<{d}> exp={s}<{d}>", .{ f.name.name, ret.name.name, ret.type_args.len, exp.name.name, exp.type_args.len });
+                for (exp.type_args) |*ta| std.debug.print(" [{s}{s}]", .{ if (ta.is_star) "*" else "", ta.ty.name.name });
+                std.debug.print("\n", .{});
+            }
             try unifyTypeParam(ret, exp, &tp_names, &subst);
         }
     }
@@ -1344,6 +1350,9 @@ fn inferReifiedTypeArgsRecv(
             if (subst.get(tp.name.name)) |t| {
                 out[i] = t;
             }
+        }
+        if (std.c.getenv("KLIO_UNIFY_TRACE") != null) {
+            std.debug.print("[unify-out] {s} {s} subst={s} enclosing={s}\n", .{ f.name.name, tp.name.name, if (subst.get(tp.name.name)) |t| t.name.name else "-", if (bb) |b| (b.resolveReifiedTypeName(tp.name.name) orelse "-") else "-" });
         }
     }
     // An enclosing splice that already bound a reified parameter of the SAME
@@ -1513,6 +1522,26 @@ fn unifyParamAgainstArg(
                 }
             }
         }
+        // A CONSTRUCTOR reference against `(...) -> T` solves `T` as the
+        // constructed class (`composerAs(::ComposerForUnsignedNumbers)`
+        // binds the reified composer type; the bound alone would answer
+        // `is T` for every composer).
+        if (ft.ret.type_args.len == 0 and ft.ret.function == null and
+            tp_names.contains(ft.ret.name.name) and !subst.contains(ft.ret.name.name))
+        {
+            if (typeConstructorRefName(arg)) |cls| {
+                try subst.put(ft.ret.name.name, .{
+                    .name = .{ .name = cls, .span = arg.span() },
+                    .nullable = false,
+                    .span = arg.span(),
+                    .type_args = &.{},
+                    .function = null,
+                    .definitely_non_null = false,
+                    .annotations = &.{},
+                    .qualified_path = null,
+                });
+            }
+        }
         return;
     }
     // The parameter IS a type parameter (`cause: T`). Its argument's own type
@@ -1526,6 +1555,10 @@ fn unifyParamAgainstArg(
         if (ctorArgTypeRef(allocator, arg, bb)) |aty| {
             try subst.put(param_ty.name.name, aty.*);
             return;
+        }
+        if (std.c.getenv("KLIO_UNIFY_TRACE") != null) {
+            const st = staticArgTypeRef(allocator, arg, bb);
+            std.debug.print("[unify-tp] {s} arg={s} static={s}<{d}>\n", .{ param_ty.name.name, @tagName(std.meta.activeTag(arg.*)), if (st) |t| t.name.name else "-", if (st) |t| t.type_args.len else 0 });
         }
         // Any argument whose static type lowering already knows solves it
         // too: a literal, a typed local, a declared parameter. Without this
@@ -1547,22 +1580,26 @@ fn unifyParamAgainstArg(
         !subst.contains(param_ty.type_args[0].ty.name.name))
     {
         if (arg.* == .Call and arg.Call.callee.* == .Member and
-            std.mem.eql(u8, arg.Call.callee.Member.name.name, "serializer") and
-            arg.Call.callee.Member.receiver.* == .Path)
+            std.mem.eql(u8, arg.Call.callee.Member.name.name, "serializer"))
         {
-            const segs = arg.Call.callee.Member.receiver.Path.segments;
-            if (segs.len >= 1) {
-                const cls_name = segs[segs.len - 1].name;
-                if (cls_name.len != 0 and std.ascii.isUpper(cls_name[0])) {
+            // The receiver names the class: a bare name, or a dotted path
+            // (`Proto.Message.IntMessage.serializer()`, parsed as a member
+            // chain) whose spelling the splice resolves as written.
+            if (classPathSpelling(allocator, arg.Call.callee.Member.receiver)) |cls_path| {
+                // The bound name is the LAST segment; a dotted spelling rides
+                // as the qualified path, which the splice resolves to the
+                // lifted class the table holds.
+                const last = if (std.mem.lastIndexOfScalar(u8, cls_path, '.')) |d| cls_path[d + 1 ..] else cls_path;
+                if (last.len != 0 and std.ascii.isUpper(last[0])) {
                     try subst.put(param_ty.type_args[0].ty.name.name, .{
-                        .name = .{ .name = cls_name, .span = arg.span() },
+                        .name = .{ .name = last, .span = arg.span() },
                         .nullable = false,
                         .span = arg.span(),
                         .type_args = &.{},
                         .function = null,
                         .definitely_non_null = false,
                         .annotations = &.{},
-                        .qualified_path = null,
+                        .qualified_path = if (last.len == cls_path.len) null else cls_path,
                     });
                     return;
                 }
@@ -1651,6 +1688,46 @@ fn unifyParamAgainstArg(
 /// The caller's lexical owner while a splice infers its reified bindings
 /// after the callee frame is pushed (`b.ownerClass()` is the callee's then).
 var splice_lexical_owner: ?[]const u8 = null;
+
+/// The caller's lexical owner while a splice binds its arguments (the
+/// callee frame is pushed by then), for derivations that rename nested
+/// classes through the scope the argument was written in.
+pub fn spliceLexicalOwner() ?[]const u8 {
+    return splice_lexical_owner;
+}
+
+/// The dotted class spelling an expression names when every segment is a
+/// capitalised identifier: `Outer.Inner` written as a path or parsed as a
+/// member chain. Null for anything else.
+pub fn classPathSpelling(allocator: Allocator, e: *const Expr) ?[]const u8 {
+    var chain: std.ArrayList([]const u8) = .empty;
+    defer chain.deinit(allocator);
+    var cur: *const Expr = e;
+    while (true) {
+        switch (cur.*) {
+            .Member => |*mm| {
+                chain.append(allocator, mm.name.name) catch return null;
+                cur = mm.receiver;
+            },
+            .Path => |*pp| {
+                var i = pp.segments.len;
+                while (i > 0) : (i -= 1) chain.append(allocator, pp.segments[i - 1].name) catch return null;
+                break;
+            },
+            else => return null,
+        }
+    }
+    if (chain.items.len == 0) return null;
+    var buf: std.ArrayList(u8) = .empty;
+    var i = chain.items.len;
+    while (i > 0) : (i -= 1) {
+        const seg = chain.items[i - 1];
+        if (seg.len == 0 or !std.ascii.isUpper(seg[0])) return null;
+        if (i != chain.items.len) buf.append(allocator, '.') catch return null;
+        buf.appendSlice(allocator, seg) catch return null;
+    }
+    return buf.toOwnedSlice(allocator) catch null;
+}
 
 pub fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilder) ?*const TypeRef {
     const call = switch (arg.*) {
@@ -1764,6 +1841,17 @@ pub fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBu
         }
         if (all) targs = inferred;
     }
+    // Still head-only for a generic class: the static constructor
+    // derivation knows shapes this position-by-parameter inference does
+    // not (`Array(1) { Box("foo") }` types by the initializer's tail).
+    if (targs.len == 0 and call.type_args.len == 0) fallback: {
+        const cls = if (cid.?.int() < b.module.classes.items.len) &b.module.classes.items[cid.?.int()] else break :fallback;
+        if (cls.type_params.len == 0) break :fallback;
+        const derived = (expr_lower.ctorInitTypeRef(@constCast(b), arg) catch null) orelse break :fallback;
+        if (derived.args.len == 0) break :fallback;
+        const as_ast = expr_lower.astTypeRefFromIr(@constCast(b), derived, head.span) orelse break :fallback;
+        targs = as_ast.type_args;
+    }
     const out = allocator.create(TypeRef) catch return null;
     out.* = .{
         .name = .{ .name = written_name, .span = head.span },
@@ -1785,11 +1873,30 @@ pub fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBu
 /// unresolved as before.
 pub fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilder) ?*const TypeRef {
     const b = bb orelse return null;
-    const ty = expr_lower.argDeclTypeRefLazy(@constCast(b), arg) orelse return null;
+    // A call argument (`listOf(42)`) types through the static call
+    // derivation when the lazy typer has no memo for it here: the reified
+    // consumer needs `List<Int>`, not an unbound `T`.
+    const ty = expr_lower.argDeclTypeRefLazy(@constCast(b), arg) orelse blk: {
+        if (arg.* != .Call) return null;
+        const derived = (static_call_type.staticCallReturnTypeRef(@constCast(b), arg) catch null) orelse return null;
+        // A derived return whose arguments are still the callee's own
+        // type parameters (`List<T>` for an un-inferred `listOf(...)`)
+        // says nothing the head does not; the reified consumer must not
+        // carry a dangling `T`.
+        for (derived.args) |a| {
+            var ah = std.mem.trimEnd(u8, a.name, "?");
+            if (std.mem.indexOfScalar(u8, ah, '<')) |lt| ah = ah[0..lt];
+            if (ah.len == 0 or (ah.len <= 2 and isAllUpper(ah)) or b.isTypeParam(ah) or ir.parseClassTypeParamIdentity(ah) != null) return null;
+        }
+        break :blk derived;
+    };
     const head = std.mem.trimEnd(u8, ty.name, "?");
     if (head.len == 0) return null;
     if (std.mem.indexOfAny(u8, head, "<>-(") != null) return null;
     if (head.len <= 2 and isAllUpper(head)) return null;
+    // A recorded type spelled nullable (`T1$A?` from a splice binding)
+    // is nullable whether or not the flag rode along.
+    const spelled_nullable = head.len != ty.name.len;
     const out = allocator.create(TypeRef) catch return null;
     // The recorded type keeps its arguments (`Collection<String>`): a
     // reified consumer (`typeOf<T>()` behind `serializer<T>()`) needs
@@ -1802,7 +1909,7 @@ pub fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const Func
     }
     out.* = .{
         .name = .{ .name = head, .span = arg.span() },
-        .nullable = ty.nullable,
+        .nullable = ty.nullable or spelled_nullable,
         .span = arg.span(),
         .type_args = &.{},
         .function = null,
@@ -2029,6 +2136,8 @@ fn unifyTypeParam(
     subst: *std.StringHashMap(TypeRef),
 ) Allocator.Error!void {
     if (decl.type_args.len == 0 and tp_names.contains(decl.name.name)) {
+        // A star projection binds nothing.
+        if (std.mem.eql(u8, actual.name.name, "*")) return;
         if (!subst.contains(decl.name.name)) {
             try subst.put(decl.name.name, actual.*);
         }
@@ -2548,9 +2657,15 @@ pub fn tryInlineCallWithTypeArgs(
     // fallback binds runtime type arguments. A body that never reads its
     // reified parameters (the `Json.encodeToString(value)` shape) splices
     // fine without a binding.
+    // The caller-frame inference: arguments are the CALLER's expressions,
+    // so their typing belongs here; the callee-frame pass below may lose
+    // a derivation that needs the caller's scope (`listOf(B(1))` where
+    // `B` nests in the caller's class), and then this answer stands.
+    var caller_probe: ?[]?TypeRef = null;
+    defer if (caller_probe) |cp| b.allocator.free(cp);
     {
         const probe = try inferReifiedTypeArgsRecv(b.allocator, f, type_args, expected, ordered, b, this_arg);
-        defer b.allocator.free(probe);
+        caller_probe = probe;
         var unbound_reified = false;
         for (f.type_params, 0..) |tp, i| {
             if (!(tp.is_reified and probe[i] == null)) continue;
@@ -3298,7 +3413,10 @@ pub fn tryInlineCallWithTypeArgs(
         try b.subject_binds.append(b.allocator, .{
             .reg = receiver,
             .head = b.spliceRecvTy(),
-            .prior_this = b.resolve("this"),
+            // The body floor hides the caller's `this` from the spliced
+            // body; the subject record keeps it for reads a nested
+            // window must bind beneath the subjects.
+            .prior_this = b.resolveIgnoringFloor("this"),
         });
         try b.bind("this", receiver);
         if (inline_state.runtime.envOnce("KLIO_THIS_TRACE") != null) {
@@ -3376,6 +3494,11 @@ pub fn tryInlineCallWithTypeArgs(
     defer splice_lexical_owner = prev_splice_owner;
     const effective_type_args = try inferReifiedTypeArgsRecv(b.allocator, f, type_args, expected, ordered, b, this_arg);
     defer b.allocator.free(effective_type_args);
+    if (caller_probe) |cp| {
+        for (effective_type_args, 0..) |*eff, i| {
+            if (eff.* == null and i < cp.len) eff.* = cp[i];
+        }
+    }
     if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
         if (std.mem.eql(u8, w, fname)) {
             for (f.type_params, 0..) |tp, i| {
@@ -3625,6 +3748,12 @@ pub fn tryInlineCallWithTypeArgs(
 /// the lexical scope-rename ladder unchanged.
 fn reifiedQualifiedName(b: *FuncBuilder, a: ast.TypeRef) ?[]const u8 {
     const qp = a.qualified_path orelse return null;
+    // The dotted spelling is a `.`-aligned suffix of the class's fqn
+    // (`Proto.Message.IntMessage` inside `Holder`): the registered name is
+    // the lifted one the class table holds.
+    if (b.module.classIdByQualifiedSuffix(qp)) |cid| {
+        if (cid.int() < b.module.classes.items.len) return b.module.classes.items[cid.int()].name;
+    }
     var segs: [8][]const u8 = undefined;
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, qp, '.');
@@ -3718,7 +3847,10 @@ pub fn inferReifiedNamesForCall(
             ordered[idx] = a;
         } else {
             while (next_pos < ordered.len and ordered[next_pos] != null) next_pos += 1;
-            if (next_pos >= ordered.len) return null;
+            if (next_pos >= ordered.len) {
+                if (inline_state.runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[irnfc] {s}: positional-overflow args={d} params={d}\n", .{ f.name.name, args.len, f.params.len });
+                return null;
+            }
             ordered[next_pos] = a;
             next_pos += 1;
         }
@@ -3729,11 +3861,22 @@ pub fn inferReifiedNamesForCall(
     for (f.type_params, 0..) |tp, i| {
         if (!tp.is_reified) continue;
         const t = probe[i] orelse {
+            if (inline_state.runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[irnfc] {s}: {s} unbound (args={d} params={d})\n", .{ f.name.name, tp.name.name, args.len, f.params.len });
             out.deinit(b.allocator);
             return null;
         };
-        const substituted = b.resolveReifiedTypeName(t.name.name) orelse
+        const head = b.resolveReifiedTypeName(t.name.name) orelse
             (expr_lower.scopeTypeRename(b, t.name.name, file) orelse t.name.name);
+        // The FULL generic spelling: a typed member call binds its reified
+        // parameter by name at runtime, and `typeOf<T>()` there needs the
+        // arguments (`ParametrizedData<Data>` asks the companion for the
+        // argument serializer).
+        const substituted = renderReifiedTypeName(b, head, &t) catch {
+            if (inline_state.runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[irnfc] {s}: {s} render-fail head={s}\n", .{ f.name.name, tp.name.name, head });
+            out.deinit(b.allocator);
+            return null;
+        };
+        if (inline_state.runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[irnfc] {s}: {s} := {s} (probe={s})\n", .{ f.name.name, tp.name.name, substituted, t.name.name });
         out.append(b.allocator, substituted) catch {
             out.deinit(b.allocator);
             return null;
@@ -3809,7 +3952,19 @@ fn callableRefParamFor(f: *const Function, ordered: []const ?*const Expr, tp_nam
 fn isTypeConstructorRef(e: *const Expr) bool {
     return switch (e.*) {
         .MemberRef => |mr| nameLooksLikeType(mr.name.name) and isTypeNamePath(mr.receiver),
+        // `::Name` — a bare constructor reference.
+        .PropertyRef => |pr| nameLooksLikeType(pr.name.name),
         else => false,
+    };
+}
+
+/// The class a constructor reference names (`::Sub`, `Outer::Sub`),
+/// null for anything else.
+fn typeConstructorRefName(e: *const Expr) ?[]const u8 {
+    return switch (e.*) {
+        .MemberRef => |mr| if (nameLooksLikeType(mr.name.name) and isTypeNamePath(mr.receiver)) mr.name.name else null,
+        .PropertyRef => |pr| if (nameLooksLikeType(pr.name.name)) pr.name.name else null,
+        else => null,
     };
 }
 
