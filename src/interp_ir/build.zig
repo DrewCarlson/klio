@@ -2117,7 +2117,6 @@ fn buildModuleWithOverrides(
             const c = kv.value_ptr.get();
             const cfqn = try resolveFqn(a, fqn_overrides, c.name.span, package_prefix, cname);
             const fqn_wanted = !std.mem.eql(u8, cfqn, cname) and
-                module.classIdByFqn(cfqn) != null and
                 !module.registry.hierarchy_methods.contains(cfqn);
             const simple_wanted = !module.registry.hierarchy_methods.contains(cname);
             if (!fqn_wanted and !simple_wanted) continue;
@@ -2351,7 +2350,20 @@ fn buildModuleWithOverrides(
             if (e.value_ptr.get().is_enum and !seen.contains("Enum")) {
                 try chain.append(a, "Enum");
             }
-            try module.registry.class_super_names.put(e.key_ptr.*, try chain.toOwnedSlice(a));
+            const super_chain = try chain.toOwnedSlice(a);
+            try module.registry.class_super_names.put(e.key_ptr.*, super_chain);
+            // Also key by fqn so a receiver whose simple name collides
+            // across packs (kotlinx.io.Buffer vs an okio stand-in named
+            // Buffer) resolves its OWN super chain (Buffer : Sink, Source)
+            // when the extension-receiver compatibility check walks it.
+            {
+                const cfqn = try resolveFqn(a, fqn_overrides, e.value_ptr.get().name.span, package_prefix, e.key_ptr.*);
+                if (!std.mem.eql(u8, cfqn, e.key_ptr.*) and
+                    !module.registry.class_super_names.contains(cfqn))
+                {
+                    try module.registry.class_super_names.put(cfqn, super_chain);
+                }
+            }
             // Declared upper bounds of the class's type parameters, for
             // the collection-stub bridge disproof at method dispatch.
             // Unbounded params are recorded with an `Any` bound (inert for

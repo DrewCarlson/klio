@@ -494,7 +494,7 @@ pub const suites = [_]Config{
         // 2026-09-02 census after round twenty-three: 688 / 744 (54 failed,
         // 2 did not complete); the floor keeps a small did-not-complete
         // margin below the observed count.
-        .baseline = 680,
+        .baseline = 685,
         .max_failed = null,
         .max_incomplete = null,
     },

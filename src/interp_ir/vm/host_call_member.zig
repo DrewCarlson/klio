@@ -2455,6 +2455,28 @@ fn companionOwnerMismatch(self: *VmHost, param_name: []const u8, receiver: *cons
     return true;
 }
 
+/// Whether the ClassDef `d` (or any supertype / resolved interface of it)
+/// is named `want`, walking the instance's REAL class rather than a
+/// name-keyed registry that collides across packs.
+fn classDefIsA(d: *const ClassDef, want: []const u8) bool {
+    return classDefIsAImpl(d, want, 0);
+}
+
+fn classDefIsAImpl(d: *const ClassDef, want: []const u8, depth: u32) bool {
+    if (depth > 24) return false;
+    if (std.mem.eql(u8, d.name, want) or std.mem.eql(u8, d.fqn, want) or
+        std.mem.eql(u8, simpleName(d.fqn), want)) return true;
+    for (d.supertype_names) |sn| {
+        if (std.mem.eql(u8, sn, want) or std.mem.eql(u8, simpleName(sn), want)) return true;
+    }
+    for (d.interfaces) |iface| {
+        const fg = iface.borrow();
+        defer fg.deinit();
+        if (classDefIsAImpl(fg.get(), want, depth + 1)) return true;
+    }
+    return false;
+}
+
 fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver: *const Value) bool {
     if (receiver.* == .Instance and companionOwnerMismatch(self, param_ty.name, receiver)) return true;
     // `fun Unit.f()` applies to `Unit` alone. An interpreted instance is never
@@ -2919,10 +2941,12 @@ fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef, ar
         else => return false,
     };
     var start: []const u8 = undefined;
+    var start_fqn: []const u8 = "";
     {
         const g = inst.borrow();
         const cg = g.get().class.borrow();
         start = cg.get().name;
+        start_fqn = cg.get().fqn;
         // The arg's own class must be known so its supertype closure is
         // complete; otherwise we cannot be definite.
         const known = blk: {
@@ -2934,6 +2958,21 @@ fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef, ar
         g.deinit();
         if (!known) return false;
     }
+    // Positive proof from the instance's OWN ClassDef, which carries the
+    // real supertype names and resolved interface handles. This is immune
+    // to the simple-name registry collision that defeats the name-keyed
+    // `class_super_names` lookup below (a receiver kotlinx.io.Buffer vs an
+    // unrelated okio Buffer both key "Buffer"): a Buffer really IS a Sink.
+    {
+        const g = inst.borrow();
+        const cd = g.get().class.clone();
+        g.deinit();
+        defer cd.deinit();
+        const dg = cd.borrow();
+        const isa = classDefIsA(dg.get(), pn) or classDefIsA(dg.get(), orig);
+        dg.deinit();
+        if (isa) return false;
+    }
     // The lowering-recorded transitive chain includes interface links the
     // runtime classes map never registers (interfaces are not instantiated),
     // so it decides cases the BFS below would silently truncate: a companion
@@ -2942,7 +2981,12 @@ fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef, ar
     {
         const mg = self.module.borrow();
         defer mg.deinit();
-        if (mg.get().registry.class_super_names.get(start)) |chain| {
+        // Prefer the fqn-keyed chain: a simple name that collides across
+        // packs (a receiver kotlinx.io.Buffer vs an unrelated okio Buffer)
+        // would otherwise read the wrong class's supers and miss Sink.
+        const chain_by_fqn = if (start_fqn.len != 0) mg.get().registry.class_super_names.get(start_fqn) else null;
+        if (chain_by_fqn orelse mg.get().registry.class_super_names.get(start)) |chain|
+        {
             const tailMatch = struct {
                 fn m(cur: []const u8, want: []const u8) bool {
                     if (std.mem.eql(u8, cur, want)) return true;

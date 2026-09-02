@@ -331,15 +331,25 @@ content-negotiation.
   With json-io packaged, `Json.encodeToSink(serializer, value, sink)`,
   the reified `encodeToSink<T>` / `decodeFromSource<T>`, and the
   explicit-serializer `decodeFromSource` all round-trip through the
-  real kotlinx.io Buffer. Census core 138 / 138; json now 520 / 744.
-  (2) Remaining KXIO failures are serializer-shape specific (custom
-  serializers, inline classes, discriminator modes, polymorphism):
-  the json-io codec runs but has shape gaps under the streaming reader
-  / writer. Largest buckets: JsonCustomSerializersTest 16,
-  InlineClassesTest 12, ClassDiscriminatorModeNoneTest 10,
-  SealedClassesSerializationTest 8, JsonMapKeysTest 7. JsonModesTest
-  KXIO NaN / Infinity / quoted-mode: 3 open (6 / 9). Drive KXIO green,
-  then re-ratchet the floor.
+  real kotlinx.io Buffer. Census core 138 / 138; json 358 -> 520 / 744.
+  (2) The remaining ~200 KXIO failures were ONE root, not shape gaps:
+  the json-io writer / reader dispatch a cross-pack kotlinx.io extension
+  (`sink.writeCodePointValue`, `Sink.writeString`) on a receiver typed
+  `Sink` holding a `kotlinx.io.Buffer`. Baked into the pack image the
+  call dispatches dynamically through extensionFnFallback, whose
+  argDefinitelyNotParamType decided Buffer-IS-A-Sink by reading
+  class_super_names.get("Buffer") -- a SIMPLE-name key colliding with the
+  okio stand-in Buffer (StreamSupport), whose chain lacks Sink, so every
+  quoted / string / codepoint write totally missed. Fixed by proving
+  IS-A from the instance's OWN runtime ClassDef (classDefIsA: real
+  supertype names + resolved interface handles), immune to the collision.
+  InlineClassesTest 1 -> 13, JsonCustomSerializersTest 17 -> 33,
+  JsonModesTest 6 -> 9. Census json 520 -> 688 / 744 -- the pre-KXIO
+  floor+8 WITH the real streaming surface running. Remaining 54 are the
+  same pre-KXIO buckets (ValueClassesInSealedHierarchyTest,
+  TrailingCommaTest, LocalClassesTest, JsonMapKeysTest,
+  GenericCustomSerializerTest): reified-T binding + generator fidelity,
+  the pre-existing 744 tail. Ratchet the floor to 688.
   Remaining core 3 (after round eighteen):
   BasicTypesSerializationTest.testKvSerialization,
   SealedGenericClassesTest.testQuery,
