@@ -9311,7 +9311,7 @@ fn inlineTargetForBareCall(
             if (std.mem.eql(u8, w, nm)) std.debug.print("[ipick-tail] {s} recv={s} hasOwn={} applicable={}\n", .{ nm, if (pf.receiver_type) |rt| rt.name.name else "-", b.hasOwnMember(nm), b.ownMemberApplicable(nm, args.len) });
         }
         if (pf.receiver_type != null and b.hasOwnMember(nm) and
-            b.ownMemberApplicable(nm, args.len) and !ownMemberRejectsLambdas(b, nm, args))
+            enclosingMemberTakes(b, nm, args.len) and !ownMemberRejectsLambdas(b, nm, args))
         {
             const rt_name = pf.receiver_type.?.name.name;
             var evidenced = false;
@@ -16152,12 +16152,31 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
             .Member => |m| m.name.name,
             else => continue,
         };
-        const pj = recv_off + j;
-        if (pj >= f.params.len) continue;
-        const tv = f.params[pj].ty.name;
-        // The declared param type must be a bare type variable shared with
-        // a sibling (`assertEquals(expected: T, actual: T)`).
-        if (tv.len > 2 or !allUppercase(tv)) continue;
+        // The outer overload judged here is the one whose parameter at this
+        // slot is a bare type variable: `assertEquals` also declares the
+        // `(Double, Double, tolerance)` forms, and the first arity match
+        // may be one of those.
+        var f_sel: *const ir.Func = f;
+        var pj = recv_off + j;
+        {
+            var found = false;
+            for (b.module.funcsBySimpleName(outer_name)) |fid2| {
+                const f2 = b.module.funcById(fid2) orelse continue;
+                if (!(f2.params.len == args.len or (f2.params.len > args.len and f2.params.len - args.len <= 1))) continue;
+                const ro2: usize = if (f2.params.len != 0 and std.mem.eql(u8, f2.params[0].name, "this")) 1 else 0;
+                const pj2 = ro2 + j;
+                if (pj2 >= f2.params.len) continue;
+                const tv2 = f2.params[pj2].ty.name;
+                if (tv2.len > 2 or !allUppercase(tv2)) continue;
+                f_sel = f2;
+                pj = pj2;
+                found = true;
+                break;
+            }
+            if (!found) continue;
+        }
+        const tv = f_sel.params[pj].ty.name;
+        const ro_sel: usize = if (f_sel.params.len != 0 and std.mem.eql(u8, f_sel.params[0].name, "this")) 1 else 0;
         // A nested reified-inline call with arguments (`assertEquals(
         // Holder(1), decodeFromString(text))`) takes the sibling's static
         // type (a constructor call, a typed local, a literal) as its
@@ -16178,12 +16197,12 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
             }
             for (args, 0..) |*sib, k| {
                 if (k == j) continue;
-                const pk = recv_off + k;
-                if (pk >= f.params.len) continue;
-                if (!std.mem.eql(u8, f.params[pk].ty.name, tv)) continue;
+                const pk = ro_sel + k;
+                if (pk >= f_sel.params.len) continue;
+                if (!std.mem.eql(u8, f_sel.params[pk].ty.name, tv)) continue;
                 const st = inline_call.ctorArgTypeRef(b.allocator, sib, b) orelse
                     inline_call.staticArgTypeRef(b.allocator, sib, b) orelse {
-                    if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) std.debug.print("[sibexp-why] sibling #{d} of `{s}` has no static type (tag={s})\n", .{ k, name, @tagName(std.meta.activeTag(sib.*)) });
+                    if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) std.debug.print("[sibexp-why] sibling #{d} of `{s}` has no static type (tag={s})\n", .{ k, outer_name, @tagName(std.meta.activeTag(sib.*)) });
                     continue;
                 };
                 return .{ .site = arg, .ty = st.* };
