@@ -441,6 +441,18 @@ pub fn liftClassRecursive(
                 try liftClassRecursive(ctx, &renamed, next_chain);
                 try ctx.out_decls.append(a, .{ .Class = renamed });
                 try ctx.companion_singletons.put(c.name.name, comp_name);
+                // Also under the enclosing-chain-qualified name (`Outer.C`):
+                // two nested `C`s in different outers otherwise share the
+                // bare key and the last registration wins for both.
+                if (enclosing_chain.len != 0) {
+                    var qual: std.ArrayList(u8) = .empty;
+                    for (enclosing_chain) |ec| {
+                        try qual.appendSlice(a, ec.name.name);
+                        try qual.append(a, '.');
+                    }
+                    try qual.appendSlice(a, c.name.name);
+                    try ctx.companion_singletons.put(try qual.toOwnedSlice(a), comp_name);
+                }
             } else {
                 var extras = StringSet.init(a);
                 // The enclosing class's own members AND its companion's members

@@ -121,6 +121,9 @@ pub const KotlinFile = struct {
     imports: []ImportDecl,
     decls: []Decl,
     span: Span,
+    /// `@file:` annotations (`@file:UseSerializers(...)`,
+    /// `@file:UseContextualSerialization(...)`), in source order.
+    file_annotations: []Annotation = &.{},
 };
 
 fn rewriteAliasedTypeName(ty: *TypeRef, aliases: *const std.StringHashMap([]const u8)) void {

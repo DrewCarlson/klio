@@ -5323,6 +5323,36 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     if (receiver.* == .Class) {
         if (try classCompanionForward(self, allocator, receiver, name, args)) |r| return r;
     }
+    // An enum's bare name is published as its COMPANION instance once it
+    // has one, so `Color.values()` written in another file arrives here
+    // with the companion as receiver. The enum statics (`values`,
+    // `valueOf`, `entries`) belong to the enum class: redirect.
+    if (receiver.* == .Instance and (std.mem.eql(u8, name, "values") or std.mem.eql(u8, name, "valueOf") or std.mem.eql(u8, name, "entries"))) {
+        const comp_cls: ObjRef(ClassDef) = blk: {
+            const ig = receiver.Instance.borrow();
+            defer ig.deinit();
+            break :blk ig.get().class.clone();
+        };
+        defer comp_cls.deinit();
+        const is_companion = blk: {
+            const cg = comp_cls.borrow();
+            defer cg.deinit();
+            const n = cg.get().name;
+            break :blk std.mem.endsWith(u8, n, "$Companion") or std.mem.endsWith(u8, n, ".Companion") or std.mem.eql(u8, n, "Companion");
+        };
+        if (is_companion) {
+            const cv = Value{ .Class = comp_cls };
+            if (try companionOwnerClassValue(self, &cv)) |owner| {
+                defer owner.release(allocator);
+                const owner_is_enum = blk: {
+                    const og = owner.Class.borrow();
+                    defer og.deinit();
+                    break :blk og.get().is_enum;
+                };
+                if (owner_is_enum) return try callMember(self, allocator, &owner, name, args);
+            }
+        }
+    }
 
     // `serializer()` on a `@Serializable` declaration is the GENERATED
     // companion member (src/serialization_pass), reached above through
@@ -12976,10 +13006,23 @@ fn classCompanionForward(self: *VmHost, allocator: Allocator, receiver: *const V
         cg.deinit();
     }
     const simple = simpleName(cname);
+    const cfqn: []const u8 = blk: {
+        const cg = cls.borrow();
+        defer cg.deinit();
+        break :blk cg.get().fqn;
+    };
     const comp_name = blk: {
         const mg = self.module.borrow();
         defer mg.deinit();
         const comp = &mg.get().registry.companion_singletons;
+        // Dotted fqn suffixes longest-first: a nested class with a
+        // same-named cousin elsewhere resolves its OWN companion.
+        var start: usize = 0;
+        while (true) {
+            if (comp.get(cfqn[start..])) |c| break :blk c;
+            const dot = std.mem.indexOfScalarPos(u8, cfqn, start, '.') orelse break;
+            start = dot + 1;
+        }
         if (comp.get(cname)) |c| break :blk c;
         if (comp.get(simple)) |c| break :blk c;
         break :blk null;
@@ -14511,9 +14554,29 @@ fn memberRefResolved(
     // instance receiver, reach into the runtime ClassDef.
     if (std.mem.eql(u8, name, "class")) {
         if (receiver.* == .Instance) {
-            const ig = receiver.Instance.borrow();
-            defer ig.deinit();
-            return .{ .ok = .{ .Class = ig.get().class.clone() } };
+            const cls: ObjRef(ClassDef) = blk: {
+                const ig = receiver.Instance.borrow();
+                defer ig.deinit();
+                break :blk ig.get().class.clone();
+            };
+            // `A::class` on a class that has a companion reaches here with
+            // the COMPANION instance (the bare name's global is the
+            // companion); the class literal is the owner, never the
+            // companion's own class.
+            const cv = Value{ .Class = cls };
+            const is_companion = blk: {
+                const cg = cls.borrow();
+                defer cg.deinit();
+                const n = cg.get().name;
+                break :blk std.mem.endsWith(u8, n, "$Companion") or std.mem.endsWith(u8, n, ".Companion") or std.mem.eql(u8, n, "Companion");
+            };
+            if (is_companion) {
+                if (try companionOwnerClassValue(self, &cv)) |owner| {
+                    cls.deinit();
+                    return .{ .ok = owner };
+                }
+            }
+            return .{ .ok = cv };
         }
         // A `Type::class` value is already a class literal.
         if (receiver.* == .Class) return .{ .ok = receiver.* };

@@ -16,6 +16,7 @@ const build = @import("../build.zig");
 const FF = runtime.forest.ForestField;
 const VmHost = @import("vmhost.zig").VmHost;
 const host_instances = @import("host_instances.zig");
+const host_call_func = @import("host_call_func.zig");
 
 const Allocator = std.mem.Allocator;
 const Module = ir.Module;
@@ -96,7 +97,7 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
             break :blk mg.get().classId(ty.name) != null;
         };
         if (!module_has_class) {
-            if (lookupGlobal(self, ty.name)) |bound| {
+            if (host_call_func.reifiedFromFrame(self, std.heap.smp_allocator, ty.name) orelse lookupGlobal(self, ty.name)) |bound| {
                 switch (bound) {
                     .Class => |cls| {
                         const cg = cls.borrow();

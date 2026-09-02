@@ -74,7 +74,7 @@ pub fn parseFile(p: *Parser) KotlinFile {
     // package header in Kotlin. Consume them up front; klio
     // doesn't act on them, but the parser must not treat them as
     // a declaration sitting before `package`.
-    skipFileAnnotations(p);
+    const file_annotations = parseFileAnnotations(p);
 
     const package = parsePackageHeader(p);
     const imports = parseImports(p);
@@ -117,6 +117,7 @@ pub fn parseFile(p: *Parser) KotlinFile {
     const end = support.currentSpan(p);
     return .{
         .package = package,
+        .file_annotations = file_annotations,
         .imports = imports,
         .decls = decls.toOwnedSlice(p.allocator) catch @panic("OOM in parseFile"),
         .span = start.join(end),
@@ -840,6 +841,14 @@ pub fn parseUnescapedAnnotationCtx(
 /// its annotation). Result is discarded — klio doesn't act on
 /// file annotations.
 pub fn skipFileAnnotations(p: *Parser) void {
+    _ = parseFileAnnotations(p);
+}
+
+/// Consume every leading `@file:` annotation set and return the flattened
+/// annotations (a serialization pass reads `@file:UseSerializers` /
+/// `@file:UseContextualSerialization`).
+pub fn parseFileAnnotations(p: *Parser) []Annotation {
+    var out: std.ArrayList(Annotation) = .empty;
     while (true) {
         support.skipNl(p);
         if (!support.peekKind(p).*.isAt()) {
@@ -853,10 +862,10 @@ pub fn skipFileAnnotations(p: *Parser) void {
         if (!is_file) {
             break;
         }
-        if (parseAnnotationSet(p) == null) {
-            break;
-        }
+        const set = parseAnnotationSet(p) orelse break;
+        out.appendSlice(p.allocator, set) catch @panic("OOM");
     }
+    return out.toOwnedSlice(p.allocator) catch @panic("OOM");
 }
 
 /// Parse zero or more annotation sets at the cursor. Returns the

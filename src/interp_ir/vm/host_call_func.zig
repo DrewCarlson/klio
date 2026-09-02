@@ -329,6 +329,50 @@ fn inferTypeArgFromArgs(self: *VmHost, allocator: Allocator, f: *const ir.Func, 
     return null;
 }
 
+/// A reified type variable named `name` in the innermost frame's function,
+/// resolved from that frame's own arguments (the first value parameter
+/// declared as the bare variable). Null when the frame's function does not
+/// declare it or no argument decides it. This is the READ-side binding:
+/// it is independent of how the call was dispatched, so a dynamically
+/// dispatched reified extension never reads a stale splice global.
+pub fn reifiedFromFrame(self: *VmHost, allocator: Allocator, name: []const u8) ?Value {
+    const fr = ir.eval.currentFrameFunc() orelse return null;
+    const names: []const []const u8 = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().registry.func_type_params.get(fr.id)) |l| break :blk l.items;
+        break :blk &.{};
+    };
+    var declared = false;
+    for (names) |n| {
+        if (std.mem.eql(u8, n, name)) declared = true;
+    }
+    if (!declared) return null;
+    for (fr.params, 0..) |*p, i| {
+        if (!std.mem.eql(u8, p.ty.name, name)) continue;
+        const v = ir.eval.currentFrameParam(i) orelse continue;
+        switch (v) {
+            .Instance => |inst| {
+                const g = inst.borrow();
+                defer g.deinit();
+                return Value{ .Class = g.get().class.clone() };
+            },
+            .Null => continue,
+            else => {
+                const fqn = v.typeFqn();
+                const head = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+                {
+                    const cg = self.classes.borrow();
+                    defer cg.deinit();
+                    if (cg.get().get(head)) |c| return Value{ .Class = c.clone() };
+                }
+                return host_call_member.syntheticClassFromFqn(allocator, fqn) catch null;
+            },
+        }
+    }
+    return null;
+}
+
 fn typeArgUnbound(arg_name: []const u8, names: []const []const u8) bool {
     if (arg_name.len == 0) return true;
     for (names) |n| {
@@ -377,6 +421,13 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
             if (std.mem.eql(u8, n, head)) is_tp = true;
         }
         if (!is_tp) break :blk head;
+        if (reifiedFromFrame(self, allocator, head)) |fv| {
+            if (fv == .Class) {
+                const fg = fv.Class.borrow();
+                defer fg.deinit();
+                break :blk try allocator.dupe(u8, fg.get().name);
+            }
+        }
         const g = self.globals.borrow();
         defer g.deinit();
         const bv = g.get().lookup(head) orelse break :blk head;
@@ -390,6 +441,72 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
             const cg = self.classes.borrow();
             defer cg.deinit();
             if (cg.get().get(bound_head)) |c| break :blk Value{ .Class = c.clone() };
+            // A LIFTED nested spelling (`Outer$Inner`) resolves through the
+            // dotted form or the innermost simple name the table holds.
+            if (std.mem.indexOfScalar(u8, bound_head, '$')) |_| {
+                const dotted = try allocator.dupe(u8, bound_head);
+                for (dotted) |*ch| {
+                    if (ch.* == '$') ch.* = '.';
+                }
+                if (cg.get().get(dotted)) |c| break :blk Value{ .Class = c.clone() };
+                const last = bound_head[std.mem.lastIndexOfScalar(u8, bound_head, '$').? + 1 ..];
+                if (cg.get().get(last)) |c| break :blk Value{ .Class = c.clone() };
+            }
+        }
+        // A DOTTED head (`Q.SQ`) walks nested-class tables segment by
+        // segment from a resolvable root.
+        if (std.mem.indexOfScalar(u8, bound_head, '.')) |_| {
+            var segs = std.mem.splitScalar(u8, bound_head, '.');
+            var cur: ?ObjRef(runtime.ClassDef) = null;
+            var ok_walk = true;
+            while (segs.next()) |seg| {
+                if (cur == null) {
+                    const cg = self.classes.borrow();
+                    defer cg.deinit();
+                    cur = cg.get().get(seg);
+                    if (cur == null) {
+                        // The root may itself be nested in an executing receiver.
+                        var it0 = ir.eval.frameThisChainIter();
+                        while (it0.next()) |v| {
+                            const owner0: ?ObjRef(runtime.ClassDef) = switch (v) {
+                                .Instance => |inst| ib: {
+                                    const g = inst.borrow();
+                                    defer g.deinit();
+                                    break :ib g.get().class;
+                                },
+                                .Class => |c| c,
+                                else => null,
+                            };
+                            const oc0 = owner0 orelse continue;
+                            const og0 = oc0.borrow();
+                            defer og0.deinit();
+                            for (og0.get().nested_classes) |nc| {
+                                if (std.mem.eql(u8, nc.name, seg)) cur = nc.class;
+                            }
+                            if (cur != null) break;
+                        }
+                    }
+                    if (cur == null) {
+                        ok_walk = false;
+                        break;
+                    }
+                } else {
+                    var found: ?ObjRef(runtime.ClassDef) = null;
+                    {
+                        const og = cur.?.borrow();
+                        defer og.deinit();
+                        for (og.get().nested_classes) |nc| {
+                            if (std.mem.eql(u8, nc.name, seg)) found = nc.class;
+                        }
+                    }
+                    if (found == null) {
+                        ok_walk = false;
+                        break;
+                    }
+                    cur = found;
+                }
+            }
+            if (ok_walk and cur != null) break :blk Value{ .Class = cur.?.clone() };
         }
         // A NESTED class written by its simple name inside its outer class
         // (`serializer<Parametrized<Int>>()` in a test class body): resolve

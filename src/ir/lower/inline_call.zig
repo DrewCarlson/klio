@@ -1247,6 +1247,24 @@ fn inferReifiedTypeArgs(
     ordered: []const ?*const Expr,
     bb: ?*const FuncBuilder,
 ) Allocator.Error![]?TypeRef {
+    return inferReifiedTypeArgsRecv(allocator, f, explicit, expected, ordered, bb, null);
+}
+
+/// `inferReifiedTypeArgs` with the RECEIVER expression: a reified
+/// parameter that only appears in receiver position (`SD.equalsImpl(...)`
+/// declared `<reified SD : SerialDescriptor> SD.equalsImpl`) binds from
+/// the receiver's static type, or — for an implicit receiver — from the
+/// enclosing declaration's receiver type. Left unbound it spliced `is SD`
+/// against nothing and every descriptor `equals` answered false.
+fn inferReifiedTypeArgsRecv(
+    allocator: Allocator,
+    f: *const Function,
+    explicit: []const TypeRef,
+    expected: ?*const TypeRef,
+    ordered: []const ?*const Expr,
+    bb: ?*const FuncBuilder,
+    recv_arg: ?*const Expr,
+) Allocator.Error![]?TypeRef {
     var out = try allocator.alloc(?TypeRef, f.type_params.len);
     for (f.type_params, 0..) |_, i| {
         out[i] = if (i < explicit.len) explicit[i] else null;
@@ -1281,6 +1299,29 @@ fn inferReifiedTypeArgs(
         try unifyParamAgainstArg(allocator, &p.ty, arg, &tp_names, &subst, bb);
     }
 
+    // Receiver position: unify the declared receiver type against the
+    // receiver expression, or the enclosing declaration's receiver type
+    // for an implicit `this`.
+    if (f.receiver_type) |*rt| {
+        if (recv_arg) |ra| {
+            try unifyParamAgainstArg(allocator, rt, ra, &tp_names, &subst, bb);
+        } else if (bb) |b| {
+            if (try inferReceiverType(b, null)) |head| {
+                const hd = std.mem.trimEnd(u8, head, "?");
+                const synth = TypeRef{
+                    .name = .{ .name = hd, .span = rt.span },
+                    .nullable = false,
+                    .span = rt.span,
+                    .type_args = &.{},
+                    .function = null,
+                    .definitely_non_null = false,
+                    .annotations = &.{},
+                    .qualified_path = null,
+                };
+                try unifyTypeParam(rt, &synth, &tp_names, &subst);
+            }
+        }
+    }
     // Fallback: unify the declared return type against the call's expected
     // (tail-position) type, so `val u: User = resp.body()` binds `T = User`
     // with no explicit `<User>`.
@@ -1612,11 +1653,37 @@ fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilde
     const head = path.segments[path.segments.len - 1];
     if (head.name.len == 0 or !std.ascii.isUpper(head.name[0])) return null;
     const b = bb orelse return null;
-    if (b.module.classId(head.name) == null and
-        b.module.classIdIndexed(head.name, b.self_package, head.span.file) == null) return null;
-    const targs = allocator.alloc(ast.TypeArg, call.type_args.len) catch return null;
+    const cid: ?ir.ClassId = b.module.classIdIndexed(head.name, b.self_package, head.span.file) orelse b.module.classId(head.name);
+    if (cid == null) return null;
+    var targs = allocator.alloc(ast.TypeArg, call.type_args.len) catch return null;
     for (call.type_args, 0..) |ta, i| {
         targs[i] = .{ .variance = .Invariant, .is_star = false, .ty = ta, .span = ta.span };
+    }
+    // A GENERIC class constructed without explicit type arguments infers
+    // them from the constructor arguments, as kotlinc does: `Box(1)` is a
+    // `Box<Int>` (each class type parameter binds through the first
+    // primary-constructor parameter declared as that bare variable whose
+    // argument has a statically known type).
+    if (call.type_args.len == 0) infer: {
+        const cls = if (cid.?.int() < b.module.classes.items.len) &b.module.classes.items[cid.?.int()] else break :infer;
+        if (cls.type_params.len == 0) break :infer;
+        const inferred = allocator.alloc(ast.TypeArg, cls.type_params.len) catch break :infer;
+        var all = true;
+        for (cls.type_params, 0..) |tp, ti| {
+            var solved: ?*const TypeRef = null;
+            for (cls.primary_params, 0..) |*pp, pi| {
+                if (pi >= call.args.len) break;
+                if (!std.mem.eql(u8, pp.ty.name, tp)) continue;
+                solved = staticArgTypeRef(allocator, &call.args[pi], bb) orelse ctorArgTypeRef(allocator, &call.args[pi], bb);
+                if (solved != null) break;
+            }
+            const st = solved orelse {
+                all = false;
+                break;
+            };
+            inferred[ti] = .{ .variance = .Invariant, .is_star = false, .ty = st.*, .span = st.span };
+        }
+        if (all) targs = inferred;
     }
     const out = allocator.create(TypeRef) catch return null;
     out.* = .{
@@ -2374,13 +2441,22 @@ pub fn tryInlineCallWithTypeArgs(
     // reified parameters (the `Json.encodeToString(value)` shape) splices
     // fine without a binding.
     {
-        const probe = try inferReifiedTypeArgs(b.allocator, f, type_args, expected, ordered, b);
+        const probe = try inferReifiedTypeArgsRecv(b.allocator, f, type_args, expected, ordered, b, this_arg);
         defer b.allocator.free(probe);
         var unbound_reified = false;
         for (f.type_params, 0..) |tp, i| {
             if (!(tp.is_reified and probe[i] == null)) continue;
             if (callableRefParamFor(f, ordered, tp.name.name) != null) continue;
             unbound_reified = true;
+        }
+        if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+            if (std.mem.eql(u8, w, fname)) {
+                for (f.type_params, 0..) |tp, i| {
+                    if (!tp.is_reified) continue;
+                    const bound: []const u8 = if (probe[i]) |t| t.name.name else "<unbound>";
+                    std.debug.print("[splice] {s} reified {s} probe={s}\n", .{ fname, tp.name.name, bound });
+                }
+            }
         }
         if (unbound_reified and !(try reifiedParamsUnusedInBody(b.allocator, f))) {
             spliceBail(fname, "unbound-reified");
@@ -2414,6 +2490,9 @@ pub fn tryInlineCallWithTypeArgs(
         }
         break :recv_blk try lowerExpr(b, this_arg.?);
     } else null;
+    // The caller's lexical owner, for scope-true renames of the reified
+    // type arguments bound below (the callee frame pushed next has none).
+    const lexical_owner = b.ownerClass();
     try b.pushInlineDecl(fname, f);
     // The spliced extension's declared receiver is receiver EVIDENCE for
     // the body's own inline gates (`filterIsInstance<T>()` inside
@@ -3175,8 +3254,17 @@ pub fn tryInlineCallWithTypeArgs(
     // unspecified is inferred by unifying the function's declared return
     // type against the call's expected (tail-position) type, so
     // `val u: User = resp.body()` binds `T = User` with no `<User>`.
-    const effective_type_args = try inferReifiedTypeArgs(b.allocator, f, type_args, expected, ordered, b);
+    const effective_type_args = try inferReifiedTypeArgsRecv(b.allocator, f, type_args, expected, ordered, b, this_arg);
     defer b.allocator.free(effective_type_args);
+    if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, fname)) {
+            for (f.type_params, 0..) |tp, i| {
+                if (!tp.is_reified) continue;
+                const bound: []const u8 = if (effective_type_args[i]) |t| t.name.name else "<unbound>";
+                std.debug.print("[splice] {s} reified {s} effective={s}\n", .{ fname, tp.name.name, bound });
+            }
+        }
+    }
     const ReifiedRestore = struct { name: []const u8, prev: ?Reg };
     var reified_restores: std.ArrayList(ReifiedRestore) = .empty;
     defer reified_restores.deinit(b.allocator);
@@ -3200,12 +3288,15 @@ pub fn tryInlineCallWithTypeArgs(
             // name the class table actually holds.
             const head_sub = b.resolveReifiedTypeName(a.name.name) orelse
                 reifiedQualifiedName(b, a) orelse
-                (expr_lower.scopeTypeRename(b, a.name.name, a.name.span.file.int()) orelse a.name.name);
+                (expr_lower.scopeTypeRenameFrom(b, lexical_owner, a.name.name, a.name.span.file.int()) orelse a.name.name);
             // Carry the FULL generic spelling, not just the head: a nested
             // reified consumer (`typeOf<T>()` inside a spliced
             // `typeInfo<List<Int>>()`) reads the stamped name at runtime and
             // must see `List<Int>` to materialise the KType's arguments.
             const substituted = try renderReifiedTypeName(b, head_sub, &a);
+            if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+                if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} bind-name {s} := {s} (head_sub={s}, written={s}, owner={?s})\n", .{ fname, tp.name.name, substituted, head_sub, a.name.name, b.ownerClass() });
+            }
             const nprev = try b.bindReifiedTypeName(tp.name.name, substituted);
             try reified_name_restores.append(b.allocator, .{ .name = tp.name.name, .prev = nprev });
         }
@@ -3230,11 +3321,15 @@ pub fn tryInlineCallWithTypeArgs(
                 // reified `() -> Unit` reifies as `Function0`, not a distinct
                 // class). Bind it to `Any` so the reified use (array creation,
                 // membership) resolves rather than loading an unresolved global.
+                // The bound CLASS is the head: a generic spelling carried in
+                // the name (`Box<Int>`, from an enclosing binding or ctor-arg
+                // inference) loads `Box`.
+                const bare_head = if (std.mem.indexOfScalar(u8, a.name.name, '<')) |lt| a.name.name[0..lt] else a.name.name;
                 const resolved_name = if (a.function != null)
                     "Any"
                 else
                     reifiedQualifiedName(b, a) orelse
-                        (expr_lower.scopeTypeRename(b, a.name.name, a.name.span.file.int()) orelse a.name.name);
+                        (expr_lower.scopeTypeRenameFrom(b, lexical_owner, bare_head, a.name.span.file.int()) orelse bare_head);
                 const arg_name = try b.module.internConst(b.allocator, .{ .String = resolved_name });
                 // Carry the resolved class identity so a builtin/stdlib type
                 // whose bare name otherwise resolves to a constructor
