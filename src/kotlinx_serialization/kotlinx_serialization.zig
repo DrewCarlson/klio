@@ -78,7 +78,7 @@ fn companionSerializer(ctx: *CallCtx) Error!EvalResult {
         const r = (try ctx.host.invokeMethod(&inst.ok, "serializer", args.items, ctx.out)) orelse return ok(.Null);
         return r;
     }
-    const comp = (try ctx.host.getProperty(&cls_val, "Companion", ctx.out)) orelse return ok(.Null);
+    const comp = (try ctx.host.getProperty(&cls_val, "$companion", ctx.out)) orelse return ok(.Null);
     if (comp != .ok) return ok(.Null);
     if (comp.ok == .Null) return ok(.Null);
     const r = (try ctx.host.invokeMethod(&comp.ok, "serializer", args.items, ctx.out)) orelse return ok(.Null);

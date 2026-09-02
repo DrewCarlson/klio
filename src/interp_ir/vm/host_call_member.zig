@@ -5326,7 +5326,33 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 
     // `serializer()` on a `@Serializable` declaration is the GENERATED
     // companion member (src/serialization_pass), reached above through
-    // classCompanionForward; nothing routes it dynamically.
+    // classCompanionForward. A CLASS VALUE receiver that has no such
+    // member is a `KClass` — `Foo::class.serializer()` — and resolves to
+    // kotlinx-serialization's `KClass<T>.serializer()` extension, exactly
+    // as any extension on a KClass receiver would.
+    if (receiver.* == .Class and std.mem.eql(u8, name, "serializer")) {
+        const ext_fid: ?FuncId = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const m = mg.get();
+            for (m.funcsBySimpleName("serializer")) |cand| {
+                const cf = m.funcById(cand) orelse continue;
+                if (!std.mem.eql(u8, cf.fqn, "kotlinx.serialization.serializer")) continue;
+                if (cf.params.len != args.len + 1) continue;
+                if (!std.mem.eql(u8, cf.params[0].name, "this")) continue;
+                if (!std.mem.eql(u8, simpleName(cf.params[0].ty.name), "KClass")) continue;
+                break :blk cand;
+            }
+            break :blk null;
+        };
+        if (ext_fid) |fid| {
+            var call_args: std.ArrayList(Value) = .empty;
+            defer call_args.deinit(allocator);
+            try call_args.append(allocator, receiver.*);
+            try call_args.appendSlice(allocator, args);
+            return try callFuncRec(self, allocator, self.module.asPtr(), fid, call_args.items);
+        }
+    }
 
     // `@Serializer(forClass = C::class)` marks a declaration the kotlinx
     // plugin fills in: the object IS C's serializer, and its `descriptor`,
@@ -12940,6 +12966,13 @@ fn classCompanionForward(self: *VmHost, allocator: Allocator, receiver: *const V
     {
         const cg = cls.borrow();
         cname = cg.get().name;
+        // An enum's synthetic statics (`values()`, `valueOf`, `entries`)
+        // belong to the enum class, never to its companion — `Color.values()`
+        // is legal with a companion present and must not forward there.
+        if (cg.get().is_enum and (std.mem.eql(u8, name, "values") or std.mem.eql(u8, name, "valueOf") or std.mem.eql(u8, name, "entries"))) {
+            cg.deinit();
+            return null;
+        }
         cg.deinit();
     }
     const simple = simpleName(cname);

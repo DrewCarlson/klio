@@ -4750,12 +4750,23 @@ fn buildClassDef(
     // supertype is what `is KSerializer` and `as KSerializer` read, and what
     // a serializer lookup casts its answer to.
     const serializer_supertype = c.supertypes.len == 0 and serializerForClassAnnotated(c.annotations);
-    const extra: usize = if (serializer_supertype) 1 else 0;
+    // An annotation class implicitly implements `kotlin.Annotation`: an
+    // instance passes an `Annotation`-typed parameter and `is Annotation`.
+    const annotation_supertype = c.is_annotation;
+    const extra: usize = @as(usize, @intFromBool(serializer_supertype)) + @as(usize, @intFromBool(annotation_supertype));
     var supertype_names = try a.alloc([]const u8, c.supertypes.len + extra);
     var supertype_paths = try a.alloc(?[]const u8, c.supertypes.len + extra);
-    if (serializer_supertype) {
-        supertype_names[c.supertypes.len] = "KSerializer";
-        supertype_paths[c.supertypes.len] = null;
+    {
+        var slot: usize = c.supertypes.len;
+        if (serializer_supertype) {
+            supertype_names[slot] = "KSerializer";
+            supertype_paths[slot] = null;
+            slot += 1;
+        }
+        if (annotation_supertype) {
+            supertype_names[slot] = "Annotation";
+            supertype_paths[slot] = null;
+        }
     }
     for (c.supertypes, 0..) |*t, i| {
         // A supertype naming a renamed file-private class resolves to the

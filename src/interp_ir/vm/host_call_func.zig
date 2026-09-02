@@ -386,9 +386,32 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
         break :blk try allocator.dupe(u8, cg2.get().name);
     };
     const classifier: Value = blk: {
-        const cg = self.classes.borrow();
-        defer cg.deinit();
-        if (cg.get().get(bound_head)) |c| break :blk Value{ .Class = c.clone() };
+        {
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            if (cg.get().get(bound_head)) |c| break :blk Value{ .Class = c.clone() };
+        }
+        // A NESTED class written by its simple name inside its outer class
+        // (`serializer<Parametrized<Int>>()` in a test class body): resolve
+        // through the executing receivers' nested-class tables.
+        var it = ir.eval.frameThisChainIter();
+        while (it.next()) |v| {
+            const owner: ?ObjRef(runtime.ClassDef) = switch (v) {
+                .Instance => |inst| ib: {
+                    const g = inst.borrow();
+                    defer g.deinit();
+                    break :ib g.get().class;
+                },
+                .Class => |c| c,
+                else => null,
+            };
+            const oc = owner orelse continue;
+            const og = oc.borrow();
+            defer og.deinit();
+            for (og.get().nested_classes) |nc| {
+                if (std.mem.eql(u8, nc.name, bound_head)) break :blk Value{ .Class = nc.class.clone() };
+            }
+        }
         break :blk try host_call_member.syntheticClassFromFqn(allocator, bound_head);
     };
     var args_accum: std.ArrayList(Value) = .empty;
