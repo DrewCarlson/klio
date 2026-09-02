@@ -3813,8 +3813,45 @@ fn buildModuleWithOverrides(
             // the declared types those parameters carry.
             const sc_param_types = try a.alloc(?ast.TypeRef, sc.params.len);
             for (sc.params, 0..) |*p, i| sc_param_types[i] = p.ty;
+            // Named delegation arguments (`this(message = m, cause = c,
+            // missingFields = f, serialName = null)`) bind the target's
+            // parameters by NAME; the thunks run in the target's declared
+            // order. Only a `this(...)` that fills every primary parameter
+            // is reordered; anything else stays positional.
+            var order = try a.alloc(usize, delegation_args.len);
+            for (order, 0..) |*o, i| o.* = i;
+            if (is_this and sc.delegation_arg_names.len == delegation_args.len and
+                delegation_args.len == c.primary_params.len)
+            reorder: {
+                var placed = try a.alloc(bool, delegation_args.len);
+                for (placed) |*x| x.* = false;
+                var slot: usize = 0;
+                for (sc.delegation_arg_names, 0..) |an, ai| {
+                    const name = an orelse {
+                        while (slot < placed.len and placed[slot]) slot += 1;
+                        if (slot >= placed.len) break :reorder;
+                        order[slot] = ai;
+                        placed[slot] = true;
+                        slot += 1;
+                        continue;
+                    };
+                    var idx: ?usize = null;
+                    for (c.primary_params, 0..) |*pp, pi| {
+                        if (std.mem.eql(u8, pp.name.name, name)) {
+                            idx = pi;
+                            break;
+                        }
+                    }
+                    const pi = idx orelse break :reorder;
+                    if (placed[pi]) break :reorder;
+                    order[pi] = ai;
+                    placed[pi] = true;
+                }
+                for (placed) |x| if (!x) break :reorder;
+            }
             var arg_fids = try a.alloc(FuncId, delegation_args.len);
-            for (delegation_args, 0..) |*e, arg_idx| {
+            for (order, 0..) |src_idx, arg_idx| {
+                const e = &delegation_args[src_idx];
                 const nm = try std.fmt.allocPrint(a, "__sec_ctor_{s}_{d}_arg{d}", .{ c.name.name, sc_idx, arg_idx });
                 module.pending_param_types = sc_param_types;
                 module.pending_own_member_arity = &own_arity;

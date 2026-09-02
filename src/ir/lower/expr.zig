@@ -1060,8 +1060,14 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (std.mem.eql(u8, mr.name.name, "class") and
                 mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1)
             {
-                const rn = mr.receiver.Path.segments[0].name;
-                if (b.resolve(rn) == null and !b.knowsOuter(rn)) {
+                const rn0 = mr.receiver.Path.segments[0].name;
+                if (b.resolve(rn0) == null and !b.knowsOuter(rn0)) {
+                    // A nested class referenced by bare name inside its
+                    // declaring subtree lives in the class table under its
+                    // lifted name: that alias outranks every same-named
+                    // class elsewhere (`A::class` inside a member extension
+                    // of the outer that declares `class A`).
+                    const rn = scopeTypeRename(b, rn0, mr.receiver.Path.segments[0].span.file.int()) orelse rn0;
                     // Resolve by the reference's own file and package first: a
                     // user declaration whose simple name collides with a
                     // builtin (`object Target` beside `kotlin.annotation
@@ -16094,9 +16100,45 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
     for (args, 0..) |*arg, j| {
         if (arg.* != .Call) continue;
         const c = arg.Call;
-        if (c.type_args.len != 0 or c.args.len != 0) continue;
-        if (c.callee.* != .Path or c.callee.Path.segments.len != 1) continue;
-        const nested_name = c.callee.Path.segments[0].name;
+        if (c.type_args.len != 0) continue;
+        const nested_name: []const u8 = switch (c.callee.*) {
+            .Path => |p| if (p.segments.len == 1) p.segments[0].name else continue,
+            .Member => |m| m.name.name,
+            else => continue,
+        };
+        const pj = recv_off + j;
+        if (pj >= f.params.len) continue;
+        const tv = f.params[pj].ty.name;
+        // The declared param type must be a bare type variable shared with
+        // a sibling (`assertEquals(expected: T, actual: T)`).
+        if (tv.len > 2 or !allUppercase(tv)) continue;
+        // A nested reified-inline call with arguments (`assertEquals(
+        // Holder(1), decodeFromString(text))`) takes the sibling's static
+        // type (a constructor call, a typed local, a literal) as its
+        // expected type: the reified parameter binds from it where the
+        // call's own arguments say nothing.
+        if (c.args.len != 0) {
+            var reified = false;
+            if (inline_state.candidatesForName(nested_name)) |cands| {
+                for (cands) |cf| {
+                    for (cf.type_params) |*tp| {
+                        if (tp.is_reified) reified = true;
+                    }
+                }
+            }
+            if (!reified) continue;
+            for (args, 0..) |*sib, k| {
+                if (k == j) continue;
+                const pk = recv_off + k;
+                if (pk >= f.params.len) continue;
+                if (!std.mem.eql(u8, f.params[pk].ty.name, tv)) continue;
+                const st = inline_call.ctorArgTypeRef(b.allocator, sib, b) orelse
+                    inline_call.staticArgTypeRef(b.allocator, sib, b) orelse continue;
+                return .{ .site = arg, .ty = st.* };
+            }
+            continue;
+        }
+        if (c.callee.* != .Path) continue;
         const nested_fid = b.module.funcId(nested_name) orelse continue;
         const tps = b.module.registry.func_type_params.get(nested_fid) orelse continue;
         if (tps.items.len != 1) continue;
@@ -16105,12 +16147,6 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
         // the splice unifies against the AST declaration's full
         // `Head<T>`, so the head is all the expected type needs here.
         if (nested_f.return_ty.name.len == 0) continue;
-        const pj = recv_off + j;
-        if (pj >= f.params.len) continue;
-        const tv = f.params[pj].ty.name;
-        // The declared param type must be a bare type variable shared with
-        // a sibling (`assertEquals(expected: T, actual: T)`).
-        if (tv.len > 2 or !allUppercase(tv)) continue;
         for (args, 0..) |*sib, k| {
             if (k == j) continue;
             const pk = recv_off + k;

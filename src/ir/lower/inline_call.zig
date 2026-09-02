@@ -1640,7 +1640,7 @@ fn unifyParamAgainstArg(
 /// whose type is evident without a type checker. `Foo(...)` names `Foo` when
 /// `Foo` resolves to a class; anything else (a factory function, a variable,
 /// a member call) stays unproven and returns null.
-fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilder) ?*const TypeRef {
+pub fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilder) ?*const TypeRef {
     const call = switch (arg.*) {
         .Call => |*c| c,
         else => return null,
@@ -1653,7 +1653,13 @@ fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilde
     const head = path.segments[path.segments.len - 1];
     if (head.name.len == 0 or !std.ascii.isUpper(head.name[0])) return null;
     const b = bb orelse return null;
-    const cid: ?ir.ClassId = b.module.classIdIndexed(head.name, b.self_package, head.span.file) orelse b.module.classId(head.name);
+    // A nested class referenced by bare name inside its declaring subtree
+    // lives in the class table under its lifted (mangled) name.
+    const cid: ?ir.ClassId = b.module.classIdIndexed(head.name, b.self_package, head.span.file) orelse
+        b.module.classId(head.name) orelse blk: {
+        const renamed = expr_lower.scopeTypeRenameFrom(@constCast(b), b.ownerClass(), head.name, head.span.file.int()) orelse break :blk null;
+        break :blk b.module.classId(renamed);
+    };
     if (cid == null) return null;
     var targs = allocator.alloc(ast.TypeArg, call.type_args.len) catch return null;
     for (call.type_args, 0..) |ta, i| {
@@ -1704,7 +1710,7 @@ fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilde
 /// `is T`, and both erase type arguments. A head that is itself a type
 /// parameter answers nothing — substituting it leaves the body's `T` as
 /// unresolved as before.
-fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilder) ?*const TypeRef {
+pub fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilder) ?*const TypeRef {
     const b = bb orelse return null;
     const ty = expr_lower.argDeclTypeRefLazy(@constCast(b), arg) orelse return null;
     const head = std.mem.trimEnd(u8, ty.name, "?");
