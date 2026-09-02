@@ -2464,6 +2464,9 @@ pub fn tryInlineCallWithTypeArgs(
         }
         break :recv_blk try lowerExpr(b, this_arg.?);
     } else null;
+    // The caller's lexical owner, for scope-true renames of the reified
+    // type arguments bound below (the callee frame pushed next has none).
+    const lexical_owner = b.ownerClass();
     try b.pushInlineDecl(fname, f);
     // The spliced extension's declared receiver is receiver EVIDENCE for
     // the body's own inline gates (`filterIsInstance<T>()` inside
@@ -3259,12 +3262,15 @@ pub fn tryInlineCallWithTypeArgs(
             // name the class table actually holds.
             const head_sub = b.resolveReifiedTypeName(a.name.name) orelse
                 reifiedQualifiedName(b, a) orelse
-                (expr_lower.scopeTypeRename(b, a.name.name, a.name.span.file.int()) orelse a.name.name);
+                (expr_lower.scopeTypeRenameFrom(b, lexical_owner, a.name.name, a.name.span.file.int()) orelse a.name.name);
             // Carry the FULL generic spelling, not just the head: a nested
             // reified consumer (`typeOf<T>()` inside a spliced
             // `typeInfo<List<Int>>()`) reads the stamped name at runtime and
             // must see `List<Int>` to materialise the KType's arguments.
             const substituted = try renderReifiedTypeName(b, head_sub, &a);
+            if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+                if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} bind-name {s} := {s} (head_sub={s}, written={s}, owner={?s})\n", .{ fname, tp.name.name, substituted, head_sub, a.name.name, b.ownerClass() });
+            }
             const nprev = try b.bindReifiedTypeName(tp.name.name, substituted);
             try reified_name_restores.append(b.allocator, .{ .name = tp.name.name, .prev = nprev });
         }
@@ -3293,7 +3299,7 @@ pub fn tryInlineCallWithTypeArgs(
                     "Any"
                 else
                     reifiedQualifiedName(b, a) orelse
-                        (expr_lower.scopeTypeRename(b, a.name.name, a.name.span.file.int()) orelse a.name.name);
+                        (expr_lower.scopeTypeRenameFrom(b, lexical_owner, a.name.name, a.name.span.file.int()) orelse a.name.name);
                 const arg_name = try b.module.internConst(b.allocator, .{ .String = resolved_name });
                 // Carry the resolved class identity so a builtin/stdlib type
                 // whose bare name otherwise resolves to a constructor

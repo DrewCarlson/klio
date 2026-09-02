@@ -1377,8 +1377,29 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
             .Class => |*c| {
                 const path = joinPath(ctx.a, outer, c.name.name);
                 try processDecls(ctx, c.members, path);
+                // A companion annotated @Serializer(forClass = X::class) is
+                // filled with X's generated body (splice + delegating members)
+                // and answers `serializer()` with itself.
+                if (companionForClassTarget(ctx.a, c.members)) |target_written| {
+                    if (findCompanion(c.members)) |comp| {
+                        try genForClassCompanion(ctx, comp, path, target_written);
+                    }
+                    continue;
+                }
                 if (!isSerializableIn(ctx.idx, c.annotations)) continue;
                 const info = ctx.idx.by_path.get(path) orelse continue;
+                // "Companion object as serializer": the companion implements
+                // KSerializer<Self>, so it IS the serializer — no generated
+                // `$serializer`; `serializer()` returns the companion.
+                if (companionIsSerializer(c.members)) {
+                    ctx.generated_any = true;
+                    const splice_src = try snippetPadded(ctx, try genSelfSerializerSplice(ctx.a, &info));
+                    if (parseSnippet(ctx.a, ctx.file.span.file, splice_src)) |snip_val| {
+                        var snip = snip_val;
+                        try spliceInto(ctx.a, &c.members, false, &snip);
+                    }
+                    continue;
+                }
                 var tps: std.ArrayList([]const u8) = .empty;
                 for (c.type_params) |*tp| try tps.append(ctx.a, tp.name.name);
                 const g = Gen{ .a = ctx.a, .idx = ctx.idx, .type_params = tps.items, .scope_path = path, .file = &ctx.settings };
@@ -1422,6 +1443,33 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
             else => {},
         }
     }
+}
+
+/// Whether `members` holds a companion whose supertypes include
+/// `KSerializer<…>` — the "companion object as serializer" pattern: the
+/// plugin uses the companion itself as the class's serializer.
+fn findCompanionConst(members: []const ast.Decl) ?*const ast.Decl {
+    for (members) |*m| {
+        switch (m.*) {
+            .Class => |*c| if (c.is_companion) return m,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn companionIsSerializer(members: []const ast.Decl) bool {
+    const comp = findCompanionConst(members) orelse return false;
+    for (comp.Class.supertypes) |*st| {
+        if (std.mem.eql(u8, simpleHead(st.name.name), "KSerializer")) return true;
+    }
+    return false;
+}
+
+/// A companion annotated `@Serializer(forClass = X::class)`, if any.
+fn companionForClassTarget(a: Allocator, members: []const ast.Decl) ?[]const u8 {
+    const comp = findCompanionConst(members) orelse return null;
+    return serializerForClassTarget(a, comp.Class.annotations);
 }
 
 /// `@Serializer(forClass = X::class)` target as written, if any.
@@ -1476,6 +1524,98 @@ fn genForClassObject(ctx: *Ctx, o: *ast.ObjectDecl, obj_path: []const u8, target
         var snip = snip_val;
         try spliceInto(a, &o.members, true, &snip);
     }
+}
+
+/// `companion object { fun serializer(): KSerializer<C> = this }` wrapped in
+/// the class's real nesting path (same splice shape as genMemberSplice).
+fn genSelfSerializerSplice(a: Allocator, info: *const Info) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var segs = std.mem.splitScalar(u8, info.path, '.');
+    var seg_list: std.ArrayList([]const u8) = .empty;
+    while (segs.next()) |sg| try seg_list.append(a, sg);
+    var depth: usize = 0;
+    var last: []const u8 = info.name;
+    for (seg_list.items, 0..) |sg, i| {
+        last = sg;
+        if (i + 1 < seg_list.items.len) {
+            try wp(&out, a, "class {s} {{ ", .{sg});
+            depth += 1;
+        }
+    }
+    try wp(&out, a, "class {s} {{ companion object {{ fun serializer(): KSerializer<{s}> = this }} }}", .{ last, info.path });
+    var k: usize = 0;
+    while (k < depth) : (k += 1) try out.appendSlice(a, " }");
+    return out.toOwnedSlice(a);
+}
+
+/// A companion annotated `@Serializer(forClass = X::class)`: emit X's
+/// generated serializer as a top-level object in the synthetic file and
+/// splice delegating members plus `serializer() = this` into the companion.
+fn genForClassCompanion(ctx: *Ctx, comp: *ast.Decl, class_path: []const u8, target_written: []const u8) Allocator.Error!void {
+    const a = ctx.a;
+    var g0 = Gen{ .a = a, .idx = ctx.idx, .type_params = &.{}, .scope_path = class_path };
+    const target_path = try g0.qualify(target_written);
+    const c = ctx.idx.class_nodes.get(target_path) orelse return;
+    const info = ctx.idx.by_path.get(target_path) orelse Info{
+        .name = c.name.name,
+        .path = target_path,
+        .pkg = ctx.pkg,
+        .kind = .class,
+        .type_params = c.type_params.len,
+    };
+    var tps: std.ArrayList([]const u8) = .empty;
+    for (c.type_params) |*tp| try tps.append(a, tp.name.name);
+    const g = Gen{ .a = a, .idx = ctx.idx, .type_params = tps.items, .scope_path = target_path, .file = &ctx.settings };
+    const impl_name = try std.fmt.allocPrint(a, "{s}$forClass", .{try genName(a, class_path)});
+    try wp(&ctx.gen, a, "object `{s}` : GeneratedSerializer<{s}> {{\n", .{ impl_name, info.path });
+    try genClassSerializerBody(&ctx.gen, a, &g, c, &info);
+    try ctx.gen.appendSlice(a, "}\n\n");
+    ctx.generated_any = true;
+    var out: std.ArrayList(u8) = .empty;
+    var segs = std.mem.splitScalar(u8, class_path, '.');
+    var seg_list: std.ArrayList([]const u8) = .empty;
+    while (segs.next()) |sg| try seg_list.append(a, sg);
+    var depth: usize = 0;
+    var last: []const u8 = class_path;
+    for (seg_list.items, 0..) |sg, i| {
+        last = sg;
+        if (i + 1 < seg_list.items.len) {
+            try wp(&out, a, "class {s} {{ ", .{sg});
+            depth += 1;
+        }
+    }
+    try wp(&out, a,
+        "class {s} {{ companion object {{ fun serializer(): kotlinx.serialization.KSerializer<{s}> = this\n" ++
+            "override val descriptor: kotlinx.serialization.descriptors.SerialDescriptor get() = `{s}`.descriptor\n" ++
+            "override fun serialize(encoder: kotlinx.serialization.encoding.Encoder, value: {s}) = `{s}`.serialize(encoder, value)\n" ++
+            "override fun deserialize(decoder: kotlinx.serialization.encoding.Decoder): {s} = `{s}`.deserialize(decoder) }} }}",
+        .{ last, info.path, impl_name, info.path, impl_name, info.path, impl_name });
+    var k: usize = 0;
+    while (k < depth) : (k += 1) try out.appendSlice(a, " }");
+    const splice_src = try snippetPadded(ctx, out.items);
+    if (parseSnippet(a, ctx.file.span.file, splice_src)) |snip_val| {
+        var snip = snip_val;
+        // Merge into the existing companion (comp is that companion).
+        const wrapper = innermostWrapper(&snip);
+        if (wrapper) |w| {
+            if (w.* == .Class) {
+                if (findCompanion(w.Class.members)) |gen_comp| {
+                    try appendMembers(a, companionMembers(comp), companionMembers(gen_comp).*);
+                }
+            }
+        }
+    }
+}
+
+fn innermostWrapper(snippet: *ast.KotlinFile) ?*ast.Decl {
+    if (snippet.decls.len == 0) return null;
+    var wrapper = &snippet.decls[0];
+    while (wrapper.* == .Class and wrapper.Class.members.len == 1 and
+        (wrapper.Class.members[0] == .Class and !wrapper.Class.members[0].Class.is_companion or wrapper.Class.members[0] == .Object))
+    {
+        wrapper = &wrapper.Class.members[0];
+    }
+    return wrapper;
 }
 
 /// Synthetic file id allocation: the generated sibling files get ids

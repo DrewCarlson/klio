@@ -1705,7 +1705,15 @@ fn enclosingMemberShadowsClass(b: *const FuncBuilder, name: []const u8) bool {
 /// file-private class/typealias declared by the reference's own file.
 /// Returns null when no rename applies.
 pub fn scopeTypeRename(b: *const FuncBuilder, name: []const u8, file: u32) ?[]const u8 {
-    var owner = b.ownerClass();
+    return scopeTypeRenameFrom(b, b.ownerClass(), name, file);
+}
+
+/// `scopeTypeRename` starting the enclosing-class walk at an explicit
+/// owner: an inline splice binds its reified names AFTER pushing the
+/// callee's frame (which drops the caller's owner), so the caller's
+/// lexical owner is passed in to keep a nested class's lifted name.
+pub fn scopeTypeRenameFrom(b: *const FuncBuilder, owner_start: ?[]const u8, name: []const u8, file: u32) ?[]const u8 {
+    var owner = owner_start;
     var hops: usize = 0;
     while (owner) |o| : (hops += 1) {
         if (hops > 32) break;
