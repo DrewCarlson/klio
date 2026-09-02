@@ -97,6 +97,49 @@ content-negotiation.
   never).
 - Ratchet the floor at the first stable green count; the plan records
   the count trajectory and the named roots.
+- TRAJECTORY 2026-09-02 (klio-census on the harness binary; core /
+  json passed): engine swap 68 / 149 -> round four 128 / 312 -> round
+  six 129 / 439 -> round seven 123 / 453 (six ModuleBuildersTest
+  regressions: a bare `A::class` inside a member extension of the
+  outer resolved another file's `A`) -> round eight 129 / 479.
+  Named roots landed on the way (each a shared interpreter mechanism,
+  no test edits):
+  - runtime member-overload pick: a trailing lambda never binds a
+    builtin-typed parameter (`cast(value, serialName, tag: String)`
+    took the lambda; the inline pick, the own-member preference and
+    the extension fallback all fell through to `cast(..., path)`);
+  - reified `T` in argument position binds from the callee's declared
+    parameter type (function or primary constructor) and from an
+    `assertEquals` sibling of statically known type (constructor call,
+    typed local); a nested class as a constructor argument renames
+    through the CALLER's lexical owner after the callee frame is pushed;
+  - a typed local keeps its type arguments into the reified binding
+    (`serializer<T>()` behind a `Collection<String>` argument);
+  - parser: a trailing lambda may start on the next line after a
+    parenthesised call (JsonExponentTest 4 -> 10 of 11);
+  - constructor delegation binds named arguments by the target's
+    parameter names (`MissingFieldException` swapped message and field
+    list; every "but it was missing" assertion depended on it);
+  - a type-form reference to an extension property
+    (`JsonPrimitive::booleanOrNull`) reads the property on its receiver;
+  - generator: an interface-typed property is polymorphic unless the
+    interface carries its own `@Serializable`; a generic `with=`
+    serializer receives the type-argument serializers;
+  - companion singletons register under the enclosing-chain-qualified
+    key and never fall to a top-level namesake; `TypeName::class`
+    applies the nested rename first;
+  - builtin serializer table matches the native platform (unsigned
+    types and arrays, Duration, Instant, Uuid).
+  Remaining core 9: InterfaceContextualSerializerTest x2,
+  ContextualGenericsTest x2, SerializersLookupNamedCompanionTest,
+  SerialDescriptorAnnotationsTest.testCustomAnnotationTransparentForContextual,
+  SealedGenericClassesTest.testQuery, SchemaTest.testEnumDescriptors,
+  BasicTypesSerializationTest.testKvSerialization. Largest json buckets
+  after round eight: JsonCustomSerializersTest (forClass companions +
+  nested named-arg ctor as a reified argument), InlineClassesTest (the
+  test base's TREE mode calls `encodeToString(tree)` on a local typed
+  only by the callee's declared return type: unbound `T` reads a stale
+  binding), SerializersLookupTest, JsonTreeTest.
 
 ## Task 3 — the coordinated ktor shim swap
 

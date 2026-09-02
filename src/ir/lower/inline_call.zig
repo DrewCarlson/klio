@@ -1640,6 +1640,10 @@ fn unifyParamAgainstArg(
 /// whose type is evident without a type checker. `Foo(...)` names `Foo` when
 /// `Foo` resolves to a class; anything else (a factory function, a variable,
 /// a member call) stays unproven and returns null.
+/// The caller's lexical owner while a splice infers its reified bindings
+/// after the callee frame is pushed (`b.ownerClass()` is the callee's then).
+var splice_lexical_owner: ?[]const u8 = null;
+
 pub fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilder) ?*const TypeRef {
     const call = switch (arg.*) {
         .Call => |*c| c,
@@ -1657,7 +1661,8 @@ pub fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBu
     // lives in the class table under its lifted (mangled) name.
     const cid: ?ir.ClassId = b.module.classIdIndexed(head.name, b.self_package, head.span.file) orelse
         b.module.classId(head.name) orelse blk: {
-        const renamed = expr_lower.scopeTypeRenameFrom(@constCast(b), b.ownerClass(), head.name, head.span.file.int()) orelse break :blk null;
+        const owner = splice_lexical_owner orelse b.ownerClass();
+        const renamed = expr_lower.scopeTypeRenameFrom(@constCast(b), owner, head.name, head.span.file.int()) orelse break :blk null;
         break :blk b.module.classId(renamed);
     };
     if (cid == null) return null;
@@ -3269,6 +3274,11 @@ pub fn tryInlineCallWithTypeArgs(
     // unspecified is inferred by unifying the function's declared return
     // type against the call's expected (tail-position) type, so
     // `val u: User = resp.body()` binds `T = User` with no `<User>`.
+    // The callee frame is pushed by now: argument-derived bindings rename
+    // nested classes through the CALLER's lexical owner.
+    const prev_splice_owner = splice_lexical_owner;
+    splice_lexical_owner = lexical_owner;
+    defer splice_lexical_owner = prev_splice_owner;
     const effective_type_args = try inferReifiedTypeArgsRecv(b.allocator, f, type_args, expected, ordered, b, this_arg);
     defer b.allocator.free(effective_type_args);
     if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
