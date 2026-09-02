@@ -2495,16 +2495,12 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     // (`companion object Named`), initialized on read — the lookup the
     // serialization runtime's KClass -> generated serializer path needs.
     if (std.mem.eql(u8, name, "$companion")) {
+        // A nested class registers under its lifted name and its
+        // enclosing-chain-qualified name; the bare simple name belongs to
+        // a top-level class and must never answer for a nested one
+        // (`Tst$B` without a companion is not `pb.B`).
         if (try companionInstanceForDef(self, cd.fqn, cd.name)) |v| return ok(v);
         if (try companionInstanceForClass(self, cd.name)) |v| return ok(v);
-        // A nested class registers its companion under its SOURCE simple
-        // name; the ClassDef carries the mangled `Outer$Inner`.
-        var simple = cd.name;
-        if (std.mem.lastIndexOfScalar(u8, simple, '$')) |d| simple = simple[d + 1 ..];
-        if (std.mem.lastIndexOfScalar(u8, simple, '.')) |d| simple = simple[d + 1 ..];
-        if (!std.mem.eql(u8, simple, cd.name)) {
-            if (try companionInstanceForClass(self, simple)) |v| return ok(v);
-        }
         return ok(.Null);
     }
     // An anonymous object's class has no name: both reflective names
