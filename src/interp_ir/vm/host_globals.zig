@@ -140,6 +140,17 @@ const ClaimOutcome = union(enum) {
     failed: ?Value,
 };
 
+/// The thread holding an in-flight construction claim for `key`, for
+/// the wait diagnostic.
+fn objectInitOwner(self: *VmHost, key: []const u8) ?std.Thread.Id {
+    const g = self.object_states.borrow();
+    defer g.deinit();
+    if (g.get().getPtr(key)) |entry| {
+        if (entry.* == .InProgress) return entry.InProgress.thread;
+    }
+    return null;
+}
+
 fn claimObjectInit(self: *VmHost, key: []const u8) ClaimOutcome {
     const tid = std.Thread.getCurrentId();
     const g = self.object_states.borrowMut();
@@ -255,6 +266,10 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
                 if (wait_rounds <= 64) {
                     std.Thread.yield() catch {};
                 } else {
+                    if (wait_rounds == 2000 and runtime.envOnce("KLIO_ERR_TRACE") != null) {
+                        std.debug.print("[init-wait] {s} owner={?d} self={d}\n", .{ name, objectInitOwner(self, name), std.Thread.getCurrentId() });
+                        runtime.trace.dumpCurrent(.{});
+                    }
                     runtime.clockSleepMillis(1);
                 }
                 continue;
@@ -429,6 +444,10 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
                 if (wait_rounds <= 64) {
                     std.Thread.yield() catch {};
                 } else {
+                    if (wait_rounds == 2000 and runtime.envOnce("KLIO_ERR_TRACE") != null) {
+                        std.debug.print("[init-wait] {s} owner={?d} self={d}\n", .{ fqn, objectInitOwner(self, fqn), std.Thread.getCurrentId() });
+                        runtime.trace.dumpCurrent(.{});
+                    }
                     runtime.clockSleepMillis(1);
                 }
                 continue;
@@ -893,6 +912,14 @@ fn funcValueById(self: *VmHost, allocator: Allocator, fid: FuncId) ?Value {
 /// the id carries no runtime value (the caller falls back to the
 /// name-keyed path).
 pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, class: ?ir.ClassId, ctor_ref: bool) ?Value {
+    if (runtime.envOnce("KLIO_GLOBAL_TRACE") != null) {
+        if (class) |cid| {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const m = mg.get();
+            if (cid.int() < m.classes.items.len and std.mem.eql(u8, runtime.envOnce("KLIO_GLOBAL_TRACE").?, m.classes.items[cid.int()].name)) std.debug.print("[global-by-id] class {s}\n", .{m.classes.items[cid.int()].name});
+        }
+    }
     if (func) |fid| {
         // A `@LowPriorityInOverloadResolution` / deprecated-stub function is
         // never bound by id: it must not outrank a same-name class constructor
@@ -1143,8 +1170,10 @@ fn bareGlobalFnVisible(self: *VmHost, m: *const Module, fid: FuncId, name: []con
 /// keep the normal member walk (its enclosing pushes) while a committed
 /// inline member's reified parameters stay live.
 pub fn bindTypeParamGlobal(self: *VmHost, tp_name: []const u8, arg_name_in: []const u8) ?Value {
-    // A stamped generic spelling (`List<Int>`) resolves its class by head.
-    const arg_name = if (std.mem.indexOfScalar(u8, arg_name_in, '<')) |lt| arg_name_in[0..lt] else arg_name_in;
+    // A stamped generic spelling (`List<Int>`) resolves its class by head;
+    // a nullable spelling (`A?`) by the class it names.
+    const arg_head = if (std.mem.indexOfScalar(u8, arg_name_in, '<')) |lt| arg_name_in[0..lt] else arg_name_in;
+    const arg_name = std.mem.trimEnd(u8, arg_head, "?");
     const cls_value: ?Value = blk: {
         const cg = self.classes.borrow();
         defer cg.deinit();
@@ -1162,6 +1191,32 @@ pub fn bindTypeParamGlobal(self: *VmHost, tp_name: []const u8, arg_name_in: []co
         g.get().define(tp_name, v) catch {};
     }
     return prev;
+}
+
+/// The FULL generic spelling of a bound type argument, kept beside the
+/// class binding under `<tp><>` so a `typeOf<T>()` reached through the
+/// framed body materialises the arguments. Returns the previous value of
+/// the spelling key; null when the spelling carries no arguments (nothing
+/// is bound then).
+pub fn bindTypeParamSpelling(self: *VmHost, allocator: Allocator, tp_name: []const u8, arg_name_in: []const u8) ?struct { key: []const u8, prev: ?Value } {
+    // Arguments or nullability: both are the KType's business, and the
+    // class binding alone carries neither.
+    if (std.mem.indexOfScalar(u8, arg_name_in, '<') == null and !std.mem.endsWith(u8, arg_name_in, "?")) return null;
+    const key = std.fmt.allocPrint(allocator, "{s}<>", .{tp_name}) catch return null;
+    const prev = blk: {
+        const g = self.globals.borrow();
+        defer g.deinit();
+        break :blk g.get().lookup(key);
+    };
+    const owned = allocator.dupe(u8, arg_name_in) catch return null;
+    const sv = runtime.strInitOwned(allocator, owned) catch return null;
+    if (runtime.envOnce("KLIO_KTYPE_TRACE") != null) std.debug.print("[ktype] bind {s} := {s}\n", .{ key, arg_name_in });
+    {
+        const g = self.globals.borrowMut();
+        defer g.deinit();
+        g.get().define(key, Value{ .String = sv }) catch {};
+    }
+    return .{ .key = key, .prev = prev };
 }
 
 pub fn restoreGlobalBinding(self: *VmHost, name: []const u8, prev: ?Value) void {
@@ -1196,9 +1251,12 @@ pub fn composeSnapshotGlobals(self: *VmHost) ?struct { ts: Value, gs: Value } {
     return .{ .ts = ts, .gs = gs };
 }
 
-pub fn lookupGlobal(self: *VmHost, name_in: []const u8) ?Value {
+pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
     const allocator = self.allocator;
     var top_prop_buf: [256]u8 = undefined;
+    // A NULLABLE type spelling (`A?` bound as a reified argument) names
+    // the same class; nullability is the KType's business.
+    const name_in = if (std.mem.endsWith(u8, name_in_raw, "?")) name_in_raw[0 .. name_in_raw.len - 1] else name_in_raw;
     const name = topPropReadKey(self, name_in, &top_prop_buf);
     const gtrace = blk: {
         const S = struct {
@@ -1660,6 +1718,9 @@ pub fn mainFuncNameMatches(self: *VmHost, fid: ir.FuncId, name: []const u8) bool
 pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []const u8) Allocator.Error!MaybeValueResult {
     var top_prop_buf: [256]u8 = undefined;
     const name = topPropReadKey(self, name_in, &top_prop_buf);
+    if (runtime.envOnce("KLIO_GLOBAL_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name)) std.debug.print("[global-throwing] {s}\n", .{name});
+    }
     const raw: ?Value = blk: {
         const g = self.globals.borrow();
         defer g.deinit();

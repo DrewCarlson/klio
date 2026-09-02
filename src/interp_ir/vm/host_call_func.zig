@@ -373,6 +373,13 @@ pub fn reifiedFromFrame(self: *VmHost, allocator: Allocator, name: []const u8) ?
     return null;
 }
 
+/// The globals key carrying a bound reified parameter's FULL generic
+/// spelling beside its `.Class` binding (`T` binds the class, `T<>` the
+/// `List<Int>` spelling a `typeOf<T>()` needs).
+fn reifiedSpellingKey(allocator: Allocator, type_name: []const u8) Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}<>", .{type_name});
+}
+
 fn typeArgUnbound(arg_name: []const u8, names: []const []const u8) bool {
     if (arg_name.len == 0) return true;
     for (names) |n| {
@@ -421,6 +428,26 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
             if (std.mem.eql(u8, n, head)) is_tp = true;
         }
         if (!is_tp) break :blk head;
+        {
+            const key = try reifiedSpellingKey(allocator, head);
+            // The globals borrow is released before the recursive
+            // materialisation below takes its own.
+            const spelled_owned: ?[]const u8 = blk2: {
+                const g = self.globals.borrow();
+                defer g.deinit();
+                const sv = g.get().lookup(key) orelse break :blk2 null;
+                if (sv != .String) break :blk2 null;
+                const sg = sv.String.borrow();
+                defer sg.deinit();
+                const spelled = sg.get().bytes;
+                if (std.mem.eql(u8, spelled, head) or (std.mem.indexOfScalar(u8, spelled, '<') == null and !std.mem.endsWith(u8, spelled, "?"))) break :blk2 null;
+                break :blk2 try allocator.dupe(u8, spelled);
+            };
+            if (runtime.envOnce("KLIO_KTYPE_TRACE") != null) std.debug.print("[ktype] spelling {s} -> {?s}\n", .{ key, spelled_owned });
+            if (spelled_owned) |sp| {
+                return makeKTypeValue(self, allocator, sp);
+            }
+        }
         if (reifiedFromFrame(self, allocator, head)) |fv| {
             if (fv == .Class) {
                 const fg = fv.Class.borrow();
@@ -440,6 +467,7 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
         {
             const cg = self.classes.borrow();
             defer cg.deinit();
+            if (runtime.envOnce("KLIO_KTYPE_TRACE") != null) std.debug.print("[ktype] classifier head='{s}' direct={}\n", .{ bound_head, cg.get().get(bound_head) != null });
             if (cg.get().get(bound_head)) |c| break :blk Value{ .Class = c.clone() };
             // A LIFTED nested spelling (`Outer$Inner`) resolves through the
             // dotted form or the innermost simple name the table holds.
@@ -2951,6 +2979,23 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
             const g = self.globals.borrowMut();
             defer g.deinit();
             g.get().define(type_name, v) catch {};
+        }
+        // The FULL generic spelling rides beside the class binding so a
+        // `typeOf<T>()` reached through this frame materialises the
+        // arguments (`ParametrizedData<Data>` asks the companion for the
+        // argument serializer); the class binding alone is head-only.
+        if (arg_name.len != arg_full.len or std.mem.endsWith(u8, arg_full, "?")) {
+            const key = try reifiedSpellingKey(allocator, type_name);
+            const prev_sp = blk: {
+                const g = self.globals.borrow();
+                defer g.deinit();
+                break :blk g.get().lookup(key);
+            };
+            try saved.append(allocator, .{ .name = key, .prev = prev_sp });
+            const owned = try allocator.dupe(u8, arg_full);
+            const g = self.globals.borrowMut();
+            defer g.deinit();
+            g.get().define(key, Value{ .String = try runtime.strInitOwned(allocator, owned) }) catch {};
         }
     }
 

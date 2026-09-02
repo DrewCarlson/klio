@@ -1794,6 +1794,10 @@ pub fn scopeTypeRenameFrom(b: *const FuncBuilder, owner_start: ?[]const u8, name
         if (b.module.registry.nested_object_aliases.get(o)) |m| {
             if (m.get(name)) |renamed| return renamed;
         }
+        // A supertype's nested classifiers are in scope in the subclass
+        // body (`Conflict("foo")` inside a test extending the base that
+        // declares `class Conflict`), lifted names included.
+        if (supertypeNestedAlias(b, o, name, 0)) |renamed| return renamed;
         owner = b.module.registry.enclosing_class.get(o);
     }
     // An anon-object member body lowering at runtime carries its lexical
@@ -1808,6 +1812,24 @@ pub fn scopeTypeRenameFrom(b: *const FuncBuilder, owner_start: ?[]const u8, name
     // Cross-package reference through an import of the declaring package
     // (internal visibility spans the whole module).
     if (decl_mod.importedPkgTypeRename(b.module, name, ir.FileId.from(file))) |renamed| return renamed;
+    return null;
+}
+
+/// The lifted name a supertype of `cls_name` registers for nested `name`,
+/// walking the declared supertype chain.
+fn supertypeNestedAlias(b: *const FuncBuilder, cls_name: []const u8, name: []const u8, depth: usize) ?[]const u8 {
+    if (depth > 16) return null;
+    const cid = b.module.classId(cls_name) orelse return null;
+    if (cid.int() >= b.module.classes.items.len) return null;
+    const cls = &b.module.classes.items[cid.int()];
+    for (cls.supertypes) |sid| {
+        if (sid.int() >= b.module.classes.items.len) continue;
+        const sup = &b.module.classes.items[sid.int()];
+        if (b.module.registry.nested_object_aliases.get(sup.name)) |m| {
+            if (m.get(name)) |renamed| return renamed;
+        }
+        if (supertypeNestedAlias(b, sup.name, name, depth + 1)) |renamed| return renamed;
+    }
     return null;
 }
 
@@ -2569,7 +2591,48 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             {
                 const dst = b.allocReg();
                 const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-                try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = nm } });
+                // The ambient `this` may be a spliced SUBJECT whose static
+                // class does not declare the name (`descriptor` inside
+                // `decoder.decodeStructure(descriptor) { … }`): kotlinc
+                // ranks implicit receivers by static type, so the read
+                // binds the innermost subject that declares it, else the
+                // receiver beneath the subjects — never the runtime
+                // object's same-named private field.
+                const target = subjectCorrectedBareThis(b, name0, this_reg);
+                try b.push(.{ .GetField = .{ .dst = dst, .receiver = target, .field = nm } });
+                return dst;
+            }
+            // Inside a spliced receiver lambda whose subject's STATIC class
+            // does not declare the name, the enclosing class's member is
+            // the binding — kotlinc ranks implicit receivers by their
+            // static types, never by what the runtime object happens to
+            // hold (`descriptor` inside `decoder.decodeStructure(...) { }`
+            // is the serializer's, not the decoder's private field).
+            const window_head_lacks = b.lambda_splice_resolve != null and b.splice_recv_from_window and blk: {
+                const rh = b.spliceRecvTy() orelse break :blk false;
+                const h = typeHead(std.mem.trimEnd(u8, rh, "?"));
+                const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk false;
+                if (!hs.complete) break :blk false;
+                break :blk !hs.names.contains(name0);
+            };
+            if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+                if (std.mem.eql(u8, w, name0)) {
+                    const rh0 = b.spliceRecvTy() orelse "-";
+                    const hs0 = b.module.registry.hierarchy_shadow_names.get(typeHead(std.mem.trimEnd(u8, rh0, "?")));
+                    std.debug.print("[bare-read-corr] {s} window_lacks={} encl_only={} window={} from_window={} recv={s} hs={} complete={} subjects={d} known_global={} recv_declares={}\n", .{ name0, window_head_lacks, enclosing_only_member, b.lambda_splice_resolve != null, b.splice_recv_from_window, rh0, hs0 != null, if (hs0) |h| h.complete else false, b.subject_binds.items.len, is_known_global, recv_declares });
+                }
+            }
+            if ((enclosing_only_member or window_head_lacks) and !recv_declares and !is_known_global) blk: {
+                const oc = b.ownerClass() orelse break :blk;
+                const ocid = b.module.classIdIndexed(oc, b.self_package, segments[0].span.file) orelse
+                    b.module.classId(oc) orelse break :blk;
+                if (!b.module.classHierarchyDeclaresMember(ocid, name0)) break :blk;
+                const corrected = subjectCorrectedBareThis(b, name0, this_reg);
+                if (corrected == this_reg) break :blk;
+                orEmitAudit(b, "subject_corrected_read", "GetField", name0);
+                const dst = b.allocReg();
+                const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+                try b.push(.{ .GetField = .{ .dst = dst, .receiver = corrected, .field = nm } });
                 return dst;
             }
         }
@@ -6466,6 +6529,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         for (b.module.funcsBySimpleName(mname)) |cand_fid| {
                             const ds = b.module.decl_span.get(cand_fid.int()) orelse continue;
                             if (ds.file.int() == cf.name.span.file.int() and ds.start == cf.name.span.start) {
+                                if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid by span -> {s}\n", .{ mname, if (b.module.funcById(cand_fid)) |cfn| cfn.fqn else "?" });
                                 break :blk cand_fid;
                             }
                         }
@@ -6488,7 +6552,10 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                                     }
                                 }
                             }
-                            if (all_match) break :blk mf.id;
+                            if (all_match) {
+                                if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid by param names -> {s}\n", .{ mname, mf.fqn });
+                                break :blk mf.id;
+                            }
                         }
                         break :blk null;
                     } orelse {
@@ -6499,6 +6566,18 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| return r;
                         continue;
                     };
+                    // A registered function that carries no type-parameter
+                    // record cannot bind the stamped names at runtime (the
+                    // image's header stub for a reified inline member): the
+                    // splice is the only form that honors `T` there.
+                    {
+                        const tp_rec = b.module.registry.func_type_params.get(fid);
+                        const n_rec: usize = if (tp_rec) |l| l.items.len else 0;
+                        if (n_rec < cf.type_params.len) {
+                            if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid without type params -> splice\n", .{mname});
+                            if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| return r;
+                        }
+                    }
                     const recv = try lowerReceiver(b, receiver);
                     const run = try lowerArgRun(b, args);
                     const arg_names_c = try internArgNames(b.allocator, b.module, ast_arg_names);
@@ -12078,6 +12157,7 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
     if (call.callee.* != .Path or call.callee.Path.segments.len != 1) return null;
     const ident = call.callee.Path.segments[0];
     const citr_trace = if (runtime.envOnce("KLIO_CITR_TRACE")) |w| std.mem.eql(u8, w, ident.name) else false;
+    if (citr_trace) std.debug.print("[citr] {s} enter\n", .{ident.name});
     // A LOCAL class registers only at runtime (`RegisterClass` with its
     // captures): no lowering-time row exists, and the module index would
     // answer an unrelated same-named class — the resolve() bail below
@@ -12108,7 +12188,10 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
     // simple-name index. A same-file/package reference reaches it through
     // the scope rename ladder; a cross-package one through its exact import,
     // which still resolves by FQN.
-    const ref_name = scopeTypeRename(b, ident.name, ident.span.file.int()) orelse ident.name;
+    // Inside a splice's argument binding the callee frame is already
+    // pushed: a nested class written in the CALLER (`listOf(B(1))` as a
+    // reified argument) renames through the caller's lexical owner.
+    const ref_name = scopeTypeRenameFrom(b, inline_call.spliceLexicalOwner() orelse b.ownerClass(), ident.name, ident.span.file.int()) orelse ident.name;
     const cid = b.module.classIdIndexed(ref_name, b.self_package, ident.span.file) orelse
         b.module.classIdExactImport(ident.name, ident.span.file) orelse {
         if (citr_trace) std.debug.print("[citr] {s} bail=no_class ref_name={s}\n", .{ ident.name, ref_name });
@@ -12118,9 +12201,85 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
     // the emission router decides it (`fun Foo(): Bar` inside Host makes a
     // bare `Foo()` the member call). Typing the local as the class here bound
     // later calls against the wrong receiver class.
-    if (enclosingHasMemberNamed(b, ident.name) and !classNestedInEnclosing(b, cid)) return null;
+    if (enclosingHasMemberNamed(b, ident.name) and !classNestedInEnclosing(b, cid)) {
+        if (citr_trace) std.debug.print("[citr] {s} bail=enclosing_member_shadow owner={s}\n", .{ ident.name, b.ownerClass() orelse "-" });
+        return null;
+    }
     if (cid.int() >= b.module.classes.items.len) return null;
     const class = &b.module.classes.items[cid.int()];
+    // A STUB generic class constructed positionally (`Triple("1", 2, x)`,
+    // `Pair(a, b)`): its header lists no primary parameters, so each type
+    // argument binds from the argument at its position when the counts
+    // line up — the reified consumer of the local needs `Triple<String,
+    // Int, Box<Int>>`, not the bare head.
+    if (citr_trace) std.debug.print("[citr] {s} class={s} stub={} tps={d} pps={d} nargs={d}\n", .{ ident.name, class.fqn, class.is_stub, class.type_params.len, class.primary_params.len, call.args.len });
+    // `Array(size) { init }`: the element type is the initializer
+    // lambda's tail expression (kotlinc infers `Array<Box<String>>` from
+    // `Array(1) { Box("foo") }`).
+    if (std.mem.eql(u8, class.fqn, "kotlin.Array") and call.type_args.len == 0 and call.args.len == 2 and
+        call.args[1] == .Lambda and call.args[1].Lambda.body.stmts.len != 0)
+    {
+        const stmts = call.args[1].Lambda.body.stmts;
+        const tail = &stmts[stmts.len - 1];
+        if (citr_trace) std.debug.print("[citr] Array tail={s}\n", .{@tagName(std.meta.activeTag(tail.*))});
+        if (tail.* == .Expr) {
+            if (citr_trace) std.debug.print("[citr] Array elem={?s}\n", .{if (try staticExprTypeRef(b, &tail.Expr)) |e| e.name else null});
+            if (try staticExprTypeRef(b, &tail.Expr)) |elem| {
+                var eh = std.mem.trimEnd(u8, elem.name, "?");
+                if (std.mem.indexOfScalar(u8, eh, '<')) |lt| eh = eh[0..lt];
+                const bare_tp = (eh.len > 0 and eh.len <= 2 and std.ascii.isUpper(eh[0])) or
+                    b.isTypeParam(eh) or ir.parseClassTypeParamIdentity(eh) != null;
+                if (eh.len != 0 and !bare_tp) {
+                    const args1 = try b.allocator.alloc(ir.TypeRef, 1);
+                    args1[0] = elem;
+                    return ir.TypeRef{ .name = try b.allocator.dupe(u8, class.fqn), .nullable = false, .args = args1 };
+                }
+                var e2 = elem;
+                e2.deinit(b.allocator);
+            }
+        }
+    }
+    if (class.is_stub and !class.is_object and !class.is_value and call.type_args.len == 0 and
+        class.type_params.len != 0 and class.primary_params.len == 0 and call.args.len == class.type_params.len)
+    {
+        const inferred = try b.allocator.alloc(ir.TypeRef, class.type_params.len);
+        var got: usize = 0;
+        var ok = true;
+        defer if (!ok) {
+            for (inferred[0..got]) |*t| t.deinit(b.allocator);
+            b.allocator.free(inferred);
+        };
+        for (call.args, 0..) |*a, ai| {
+            var bt = (try staticExprTypeRef(b, a)) orelse {
+                ok = false;
+                break;
+            };
+            var bh = std.mem.trimEnd(u8, bt.name, "?");
+            if (std.mem.indexOfScalar(u8, bh, '<')) |lt| bh = bh[0..lt];
+            const bare_tp = (bh.len > 0 and bh.len <= 2 and std.ascii.isUpper(bh[0])) or
+                b.isTypeParam(bh) or ir.parseClassTypeParamIdentity(bh) != null;
+            if (bh.len == 0 or bare_tp) {
+                bt.deinit(b.allocator);
+                ok = false;
+                break;
+            }
+            inferred[ai] = bt;
+            got += 1;
+        }
+        if (ok) {
+            var derived = ir.TypeRef{
+                .name = try b.allocator.dupe(u8, class.fqn),
+                .nullable = false,
+                .args = inferred,
+            };
+            if (!staticClassifierArgsComplete(b, derived)) {
+                derived.deinit(b.allocator);
+                return null;
+            }
+            return derived;
+        }
+        return null;
+    }
     // An object is not constructed; a stub or value class has no instance
     // identity for a member call to bind against.
     if (class.is_object or class.is_stub or class.is_value) return null;
@@ -12190,6 +12349,7 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
         .args = args,
     };
     if (!staticClassifierArgsComplete(b, derived)) {
+        if (citr_trace) std.debug.print("[citr] {s} bail=args_incomplete\n", .{ident.name});
         derived.deinit(b.allocator);
         return null;
     }
@@ -12366,7 +12526,8 @@ fn memoAlloc() std.mem.Allocator {
 }
 
 fn tyMemoOn() bool {
-    return true;
+    // `KLIO_TY_MEMO=0` disables the static-type memo (bisect aid).
+    return !std.mem.eql(u8, runtime.envOnce("KLIO_TY_MEMO") orelse "1", "0");
 }
 
 pub const TyMemoHit = struct { ty: ?ir.TypeRef };
@@ -12520,6 +12681,17 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
                 if (substitutedPropType(b, rh, rt, declared)) |sub| {
                     return try sub.clone(b.allocator);
                 }
+            }
+        }
+        // A generic CONSTRUCTOR call the eager typer answers head-only
+        // (`Triple("1", 2, x)` as `kotlin.Triple`): the constructor
+        // derivation instantiates the arguments the reified consumer of
+        // the local needs.
+        if (e.* == .Call and known.args.len == 0) {
+            if (try ctorInitTypeRef(b, e)) |t| {
+                if (t.args.len != 0) return t;
+                var tt = t;
+                tt.deinit(b.allocator);
             }
         }
         return try known.clone(b.allocator);
@@ -16070,6 +16242,22 @@ pub fn astTypeRefFromIr(b: *FuncBuilder, ty: ir.TypeRef, sp: ast.Span) ?ast.Type
     const owned = b.allocator.dupe(u8, nm) catch return null;
     const tas = b.allocator.alloc(ast.TypeArg, ty.args.len) catch return null;
     for (ty.args, tas) |a, *out| {
+        // A star projection is a projection, not a type named `*`: it
+        // binds nothing (`DeserializationStrategy<*>` as an expected type
+        // must not solve a reified `T := *`).
+        if (std.mem.eql(u8, std.mem.trimEnd(u8, a.name, "?"), "*")) {
+            out.* = .{ .variance = .Invariant, .is_star = true, .ty = .{
+                .name = .{ .name = "*", .span = sp },
+                .nullable = false,
+                .span = sp,
+                .type_args = &.{},
+                .function = null,
+                .definitely_non_null = false,
+                .annotations = &.{},
+                .qualified_path = null,
+            }, .span = sp };
+            continue;
+        }
         const inner = astTypeRefFromIr(b, a, sp) orelse return null;
         out.* = .{ .variance = .Invariant, .is_star = false, .ty = inner, .span = sp };
     }
@@ -16599,7 +16787,11 @@ fn subjectCorrectedBareThis(b: *FuncBuilder, name: []const u8, this_reg: Reg) Re
             return sbs[i].reg;
         }
     }
-    if (sct) std.debug.print("[sct] {s}: -> beneath-subjects this {?}\n", .{ name, sbs[0].prior_this });
+    if (sct) {
+        std.debug.print("[sct] {s}: -> beneath-subjects this {?} (subjects={d}):", .{ name, sbs[0].prior_this, sbs.len });
+        for (sbs) |sb| std.debug.print(" [reg=r{d} head={s} prior={?}]", .{ sb.reg.int(), sb.head orelse "-", sb.prior_this });
+        std.debug.print("\n", .{});
+    }
     return sbs[0].prior_this orelse this_reg;
 }
 

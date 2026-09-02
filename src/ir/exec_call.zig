@@ -2049,6 +2049,11 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                     if (arg_name.len == 0) continue;
                     const prev = host.bindTypeParamGlobal(tpn, arg_name);
                     try mit_saved.append(allocator, .{ .name = tpn, .prev = prev });
+                    if (comptime @hasDecl(H, "bindTypeParamSpelling")) {
+                        if (host.bindTypeParamSpelling(allocator, tpn, arg_name)) |sp| {
+                            try mit_saved.append(allocator, .{ .name = sp.key, .prev = sp.prev });
+                        }
+                    }
                 }
             }
         }

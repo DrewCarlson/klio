@@ -1985,6 +1985,10 @@ pub const Module = struct {
     /// NAMES only, so `seed1.inv()` inside `: this(..., seed1.inv(), ...)`
     /// had no receiver type at all. Not serialized.
     pending_param_types: ?[]const ?ast.TypeRef = null,
+    /// The EXPECTED type of the next parameter-thunk expression (a parent
+    /// constructor argument's declared parameter type, instantiated by the
+    /// written supertype arguments), consumed by the thunk lowering.
+    pending_thunk_expected: ?ast.TypeRef = null,
     /// Lowering-only scratch: the callable arity mask of the owner class's
     /// members, for a synthesized parameter thunk that also gets an
     /// `own_members` set. A member name that is a PROPERTY and never a
@@ -6086,7 +6090,9 @@ pub const Module = struct {
             // outranks any same-named extension, and treating it as
             // inapplicable let `Map<out K, V>.get` bind `map[key]` and call
             // itself from its own body.
-            if (f.params.len <= 1 and ds.arity.total != 0 and (!f.hasBody() or f.params.len < ds.arity.total + 1)) {
+            const lists_this = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+            const listed_values = f.params.len - @intFromBool(lists_this);
+            if (ds.arity.total != 0 and listed_values < ds.arity.required and (!f.hasBody() or listed_values < ds.arity.total)) {
                 if (args.len >= ds.arity.required and (args.len <= ds.arity.total or ds.arity.has_vararg)) {
                     any_applicable = true;
                     unknown = fid;
@@ -6219,8 +6225,17 @@ pub const Module = struct {
             (if (decl_owner.int() < self.classes.items.len) &self.classes.items[decl_owner.int()] else null)
         else
             null;
-        const declared_on_interface = if (declaring_class) |decl| decl.is_interface else true;
-        if (!class.is_interface and (!class.is_open and !class.is_abstract or (!declared_on_interface and methodIsFinal(f)))) {
+        // The DECLARING class may still be an unclaimed header when the
+        // owner's bodies lower ahead of it (a pack's `AbstractEncoder`
+        // lowered before `Encoder` was filled): its `is_interface` reads
+        // false and the interface default bound direct, so the implementing
+        // class's override never ran. Unknown declarer: virtual.
+        const declared_on_interface = if (declaring_class) |decl| (decl.is_interface or decl.is_stub) else true;
+        const direct = !class.is_interface and (!class.is_open and !class.is_abstract or (!declared_on_interface and methodIsFinal(f)));
+        if (std.c.getenv("KLIO_DISPATCH_TRACE")) |w| {
+            if (std.mem.eql(u8, std.mem.span(w), name)) std.debug.print("[dispatch] {s} owner={s} iface={} open={} abstract={} stub={} decl_owner={s} decl_iface={} decl_stub={} final={} -> {s}\n", .{ name, class.fqn, class.is_interface, class.is_open, class.is_abstract, class.is_stub, if (declaring_class) |d| d.fqn else "-", declared_on_interface, if (declaring_class) |d| d.is_stub else false, methodIsFinal(f), if (direct) "direct" else "virtual" });
+        }
+        if (direct) {
             return .{ .target = target, .dispatch = .direct, .applicable = true };
         }
         return .{ .target = target, .dispatch = .virtual, .applicable = true };
@@ -6255,7 +6270,7 @@ pub const Module = struct {
             (if (decl_owner.int() < self.classes.items.len) &self.classes.items[decl_owner.int()] else null)
         else
             null;
-        const declared_on_interface = if (declaring_class) |decl| decl.is_interface else true;
+        const declared_on_interface = if (declaring_class) |decl| (decl.is_interface or decl.is_stub) else true;
         if (!class.is_interface and (!class.is_open and !class.is_abstract or (!declared_on_interface and methodIsFinal(f)))) {
             return .direct;
         }
@@ -11060,6 +11075,9 @@ pub const Module = struct {
         const id = ClassId.from(@intCast(self.classes.items.len));
         class.id = id;
         try self.class_index.append(allocator, .{ .name = class.name, .id = id });
+        if (std.c.getenv("KLIO_CIDX_TRACE")) |w| {
+            if (std.mem.indexOf(u8, class.name, std.mem.span(w)) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ class.name, id.int() });
+        }
         try self.classes.append(allocator, class);
         return id;
     }
@@ -11240,6 +11258,9 @@ pub const Module = struct {
         if (self.classIndexEntryByName(name)) |id| return id;
         const id = ClassId.from(@intCast(self.classes.items.len));
         try self.class_index.append(allocator, .{ .name = name, .id = id });
+        if (std.c.getenv("KLIO_CIDX_TRACE")) |w| {
+            if (std.mem.indexOf(u8, name, std.mem.span(w)) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ name, id.int() });
+        }
         try self.classes.append(allocator, .{
             .id = id,
             .name = name,
@@ -11272,6 +11293,9 @@ pub const Module = struct {
         }
         const id = ClassId.from(@intCast(self.classes.items.len));
         try self.class_index.append(allocator, .{ .name = name, .id = id });
+        if (std.c.getenv("KLIO_CIDX_TRACE")) |w| {
+            if (std.mem.indexOf(u8, name, std.mem.span(w)) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ name, id.int() });
+        }
         try self.classes.append(allocator, .{
             .id = id,
             .name = name,

@@ -244,7 +244,14 @@ pub fn lowerExprAsParamThunkScopedEnclosing(
     }
     try consumePendingOwnMemberArity(&b);
     if (enclosing_members) |em| b.setEnclosingMembers(try cloneOwnMembers(allocator, em));
+    // The declared parameter type the thunk's expression must satisfy
+    // (`serializer()` as a parent constructor argument binds its reified
+    // parameter from it).
+    const expected = module.pending_thunk_expected;
+    module.pending_thunk_expected = null;
+    const prev_expected = b.pushExpected(expected);
     const v = try lowerExpr(&b, expr);
+    _ = b.pushExpected(prev_expected);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
     // Record the bound params for a `this`-leading thunk (an INNER class's

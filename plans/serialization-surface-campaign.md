@@ -155,7 +155,84 @@ content-negotiation.
   its parameter from the call's expected type and lowers as a typed member
   call; a nested class without a companion never answers with a top-level
   namesake's companion.
-  Remaining core 4: BasicTypesSerializationTest.testKvSerialization,
+  Rounds sixteen to eighteen: core 134 -> 135 / 138 (the one regression
+  from round fourteen root-fixed: the type-variable rule now lives in
+  the lowering's per-argument compatibility with the caller's bounds,
+  a bodyless member header is applicable by its declared arity so Map's
+  own `get` outranks the `Map<out K, V>.get` extension, a header stub
+  with a declared receiver is an extension for the declaration kind, a
+  receiver-formed pick checks the extension's receiver against the
+  enclosing body's receiver head); generator: a `@Serializable`
+  superclass's properties serialize first through the supertype
+  arguments (GenericOverrideTest 0 -> 2), `@KeepGeneratedSerializer`
+  emits the generated twin plus a companion `generatedSerializer()`
+  for classes, value classes, generic classes, enums, forClass
+  companions and objects (KeepGeneratedSerializerTest 0 -> 5 of 7);
+  lowering: the splice floor hides the caller's locals for extension
+  splices too, a narrowed member extension must be visible from the
+  enclosing hierarchy, a receiver's own reified inline member opens the
+  inline path (the image keeps it bodiless), a member without a
+  registered function id splices its AST, a nullable constructor
+  parameter binds the class type parameter.
+  Json after rounds sixteen to eighteen: 554 / 744.
+  Rounds nineteen and twenty (json buckets, all root fixes shared with
+  the interpreter): dispatch — an interface default called from a class
+  whose DECLARING interface was still an unfilled header bound direct,
+  so the json encoder's `encodeSerializableValue` override never ran
+  from `AbstractEncoder.encodeSerializableElement` and every sealed or
+  polymorphic PROPERTY encoded in array form (an unknown declarer now
+  dispatches virtual; SealedClassesSerializationTest 4 -> 11 of 11);
+  reads — a bare name inside a spliced receiver lambda binds by the
+  subject's STATIC class (kotlinc's implicit-receiver ranking), never
+  the runtime object's same-named private field (`descriptor` inside
+  `decoder.decodeStructure(descriptor) { }` read the decoder's), and a
+  splice subject record keeps the floor-hidden `this` beneath it
+  (ClassDiscriminatorModeAllObjectsTest 1 -> 9 of 9, None 11 of 11);
+  inference — a star projection never binds a reified parameter
+  (`DeserializationStrategy<*>` as an expected type solved `T := *` and
+  reached the runtime as a global named `*`), the dotted receiver of a
+  companion `serializer()` argument rides as a qualified path resolved
+  through the class fqn suffix (`subclass(A.B.C.serializer())`), a
+  supertype's nested classifiers are in scope in a subclass body (a
+  nested class with a companion lifts mangled, and the alias walk now
+  follows the supertype chain), and a typed member call carries the
+  full generic spelling to the runtime beside the class binding while
+  a registered member with no type-parameter record splices instead;
+  generator — the kept object serializer is fully qualified (a test's
+  own `object ObjectSerializer` shadowed the builtin) and cached, and
+  a generic sealed leaf's serializer takes `PolymorphicSerializer(Any::class)`
+  per type argument as the plugin emits.
+  Rounds twenty-one and twenty-two: two suite hangs were one root — the
+  typed-call KType spelling lookup released the globals borrow twice, so
+  the next borrow spun forever (KeepGeneratedSerializerTest 7 of 7,
+  SerializersLookupTest 22 -> 28 of 31); a constructor reference
+  (`composerAs(::ComposerForUnsignedNumbers)`) now solves the reified
+  parameter it returns, so the json encoder's unsigned composer is chosen
+  (UnsignedIntegersTest 0 -> 5 of 5); LOCAL `@Serializable` classes get
+  their generated shapes as nested members, and the runtime registers a
+  local class's companion and nested objects (constructed once, the
+  companion reachable through the class value ahead of any `KClass`
+  extension, a private nested object of an enclosing class reachable
+  through the mangled name) — 65 local declarations across the json
+  tests depended on it (JsonPathTest 14 of 14); a generic constructor
+  local (`val t = Triple("1", 2, Box(42))`) records its instantiated
+  type, a `listOf(42)` argument types through the static call
+  derivation without a dangling `T`, a nullable spelling rides the
+  typed-call side binding and the sibling solver keeps a spelled `?`;
+  descriptor annotations are `@SerialInfo` annotations only (the
+  plugin's rule — `@ExperimentalUnsignedTypes` reached the runtime as a
+  constructor); a custom or contextual serializer on a primitive-typed
+  property routes through the serializer instead of the primitive fast
+  path; a 36-field class's masks are signed literals; a `@Contextual`
+  element of a `@Serializable` class passes its generated serializer as
+  the contextual fallback (core: BasicTypesSerializationTest,
+  SerialDescriptorAnnotationsTest, SealedGenericClassesTest all green
+  in solos — core 138 of 138 pending the census).
+  Remaining core 3 (after round eighteen):
+  BasicTypesSerializationTest.testKvSerialization,
+  SealedGenericClassesTest.testQuery,
+  SerialDescriptorAnnotationsTest.testCustomAnnotationTransparentForContextual.
+  Remaining core 4 (after round fifteen): BasicTypesSerializationTest.testKvSerialization,
   SealedGenericClassesTest.testQuery,
   SerialDescriptorAnnotationsTest.testCustomAnnotationTransparentForContextual,
   SealedInterfacesSerializationTest.testResolved (to re-verify).

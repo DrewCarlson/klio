@@ -85,6 +85,9 @@ const Index = struct {
     /// Annotation classes annotated `@MetaSerializable`: a class annotated
     /// with one of these is serializable as if `@Serializable`.
     meta_serializable: std.StringHashMap(void),
+    /// Annotation classes the descriptor carries: `@SerialInfo`,
+    /// `@InheritableSerialInfo` and `@MetaSerializable` declarations.
+    serial_info: std.StringHashMap(void),
     /// Annotation classes annotated `@InheritableSerialInfo`: pushed into
     /// the class annotations of every subclass descriptor.
     inheritable: std.StringHashMap(void),
@@ -108,6 +111,7 @@ const Index = struct {
             .sub_records = .empty,
             .objects = std.StringHashMap(void).init(a),
             .meta_serializable = std.StringHashMap(void).init(a),
+            .serial_info = std.StringHashMap(void).init(a),
             .inheritable = std.StringHashMap(void).init(a),
             .supers = std.StringHashMap([]const []const u8).init(a),
             .class_annotations = std.StringHashMap([]const []const u8).init(a),
@@ -218,6 +222,18 @@ fn annotationCallText(a: Allocator, an: *const ast.Annotation) ?[]const u8 {
     return body;
 }
 
+/// Whether an annotation reaches the serial descriptor: only a
+/// `@SerialInfo`-marked annotation class does (the plugin's rule), so a
+/// stdlib marker such as `@ExperimentalUnsignedTypes` never becomes a
+/// runtime construction.
+fn isSerialInfoAnnotation(idx: *const Index, n: []const u8) bool {
+    if (idx.serial_info.contains(n)) return true;
+    const eq = std.mem.eql;
+    return eq(u8, n, "JsonNames") or eq(u8, n, "JsonClassDiscriminator") or eq(u8, n, "JsonIgnoreUnknownKeys") or
+        eq(u8, n, "ProtoNumber") or eq(u8, n, "ProtoType") or eq(u8, n, "ProtoPacked") or eq(u8, n, "ProtoOneOf") or
+        eq(u8, n, "CborLabel") or eq(u8, n, "ByteString") or eq(u8, n, "XmlElement");
+}
+
 fn isFrameworkAnnotation(n: []const u8) bool {
     const eq = std.mem.eql;
     return eq(u8, n, "Serializable") or eq(u8, n, "SerialName") or eq(u8, n, "Transient") or eq(u8, n, "Required") or
@@ -256,6 +272,8 @@ fn indexAnnotationClasses(idx: *Index, decls: []const ast.Decl) Allocator.Error!
                 if (c.is_annotation) {
                     if (hasAnnotation(c.annotations, "MetaSerializable")) try idx.meta_serializable.put(c.name.name, {});
                     if (hasAnnotation(c.annotations, "InheritableSerialInfo")) try idx.inheritable.put(c.name.name, {});
+                    if (hasAnnotation(c.annotations, "SerialInfo") or hasAnnotation(c.annotations, "InheritableSerialInfo") or
+                        hasAnnotation(c.annotations, "MetaSerializable")) try idx.serial_info.put(c.name.name, {});
                 }
                 try indexAnnotationClasses(idx, c.members);
             },
@@ -273,9 +291,37 @@ fn recordSupersAndAnnotations(idx: *Index, path: []const u8, supertypes: []const
     var anns: std.ArrayList([]const u8) = .empty;
     for (annotations) |*an| {
         if (isFrameworkAnnotation(annotationSimpleName(an))) continue;
+        if (!isSerialInfoAnnotation(idx, annotationSimpleName(an))) continue;
         if (annotationCallText(idx.a, an)) |t| try anns.append(idx.a, t);
     }
     try idx.class_annotations.put(path, try anns.toOwnedSlice(idx.a));
+}
+
+/// The index record for a `@Serializable` class declaration.
+fn classInfo(idx: *const Index, c: *const ast.Class, path: []const u8, pkg: []const u8) Info {
+    const with = serializableWith(idx.a, c.annotations);
+    const kind: Kind = if (with != null)
+        .with_custom
+    else if (c.is_enum)
+        .enum_class
+    else if (c.is_sealed)
+        (if (c.is_interface) .interface_sealed else .sealed)
+    else if (c.is_interface or c.is_abstract)
+        .polymorphic
+    else if (c.is_value)
+        .value_class
+    else
+        .class;
+    const sn: ?[]const u8 = if (findAnnotation(c.annotations, "SerialName")) |an| annotationStringArg(an) else null;
+    return Info{
+        .name = c.name.name,
+        .path = path,
+        .pkg = pkg,
+        .kind = kind,
+        .type_params = c.type_params.len,
+        .with = with,
+        .serial_name = sn,
+    };
 }
 
 fn indexDecls(idx: *Index, decls: []const ast.Decl, outer: []const u8, pkg: []const u8) Allocator.Error!void {
@@ -287,29 +333,7 @@ fn indexDecls(idx: *Index, decls: []const ast.Decl, outer: []const u8, pkg: []co
                 try idx.class_nodes.put(path, c);
                 try recordSupersAndAnnotations(idx, path, c.supertypes, c.annotations);
                 if (isSerializableIn(idx, c.annotations)) {
-                    const with = serializableWith(idx.a, c.annotations);
-                    const kind: Kind = if (with != null)
-                        .with_custom
-                    else if (c.is_enum)
-                        .enum_class
-                    else if (c.is_sealed)
-                        (if (c.is_interface) .interface_sealed else .sealed)
-                    else if (c.is_interface or c.is_abstract)
-                        .polymorphic
-                    else if (c.is_value)
-                        .value_class
-                    else
-                        .class;
-                    const sn: ?[]const u8 = if (findAnnotation(c.annotations, "SerialName")) |an| annotationStringArg(an) else null;
-                    const ci = Info{
-                        .name = c.name.name,
-                        .path = path,
-                        .pkg = pkg,
-                        .kind = kind,
-                        .type_params = c.type_params.len,
-                        .with = with,
-                        .serial_name = sn,
-                    };
+                    const ci = classInfo(idx, c, path, pkg);
                     try idx.by_name.put(c.name.name, ci);
                     try idx.by_path.put(path, ci);
                 }
@@ -523,6 +547,39 @@ const Gen = struct {
         return self.serializerExpr(&t.type_args[i].ty, &.{});
     }
 
+    /// `ContextualSerializer(X::class, fallback, args)`: a `@Serializable`
+    /// non-generic `X` supplies its generated serializer as the fallback,
+    /// as the plugin does — the contextual descriptor then carries `X`'s
+    /// annotations and a module without a contextual entry still decodes.
+    fn contextualSerializerExpr(self: *const Gen, t: *const ast.TypeRef) Allocator.Error![]const u8 {
+        const a = self.a;
+        const q = try self.qualify(t.name.name);
+        // The class IN SCOPE (the enclosing scopes of the declaration, then
+        // top level): the flat simple-name map would answer another file's
+        // same-named class.
+        if (self.serializableInScope(t.name.name)) |ci| {
+            if (ci.type_params == 0 and t.type_args.len == 0) {
+                return std.fmt.allocPrint(a, "ContextualSerializer({s}::class, {s}.serializer(), arrayOf())", .{ q, q });
+            }
+        }
+        return std.fmt.allocPrint(a, "ContextualSerializer({s}::class, null, arrayOf())", .{q});
+    }
+
+    /// The `@Serializable` declaration a written type name resolves to from
+    /// this generation's scope, walking the enclosing paths outward and
+    /// then the top level; null when nothing in scope is serializable.
+    fn serializableInScope(self: *const Gen, written: []const u8) ?Info {
+        const a = self.a;
+        var scope: []const u8 = self.scope_path;
+        while (true) {
+            const cand = if (scope.len == 0) written else std.fmt.allocPrint(a, "{s}.{s}", .{ scope, written }) catch return null;
+            if (self.idx.by_path.get(cand)) |ci| return ci;
+            if (scope.len == 0) break;
+            scope = if (std.mem.lastIndexOfScalar(u8, scope, '.')) |d| scope[0..d] else "";
+        }
+        return null;
+    }
+
     fn serializerExprNonNull(self: *const Gen, t: *const ast.TypeRef, annotations: []const ast.Annotation) Allocator.Error![]const u8 {
         const a = self.a;
         if (serializableWith(a, annotations)) |w| return self.customSerializerRef(w);
@@ -532,12 +589,12 @@ const Gen = struct {
             if (!hasAnnotation(annotations, "Contextual") and !hasAnnotation(annotations, "Polymorphic")) {
                 if (fs.use_serializers.get(head)) |ser| return self.customSerializerRef(ser);
                 if (fs.contextual.contains(head)) {
-                    return std.fmt.allocPrint(a, "ContextualSerializer({s}::class, null, arrayOf())", .{try self.qualify(t.name.name)});
+                    return self.contextualSerializerExpr(t);
                 }
             }
         }
         if (hasAnnotation(annotations, "Contextual")) {
-            return std.fmt.allocPrint(a, "ContextualSerializer({s}::class, null, arrayOf())", .{try self.qualify(t.name.name)});
+            return self.contextualSerializerExpr(t);
         }
         if (hasAnnotation(annotations, "Polymorphic")) {
             return std.fmt.allocPrint(a, "PolymorphicSerializer({s}::class)", .{try self.qualify(t.name.name)});
@@ -869,6 +926,16 @@ fn genClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c: *co
 /// The members of a generated serializer for `c` (descriptor, child
 /// serializers, serialize, deserialize) — the body of `<Name>$serializer`,
 /// and of a `@Serializer(forClass = Name::class)` object the plugin fills.
+/// The primitive fast path (`encodeIntElement` / `decodeStringElement`)
+/// applies only to a plainly-typed element: a custom or contextual
+/// serializer on the property routes through the serializer instead.
+fn elemPrim(e: *const Elem) Prim {
+    if (e.ty.nullable) return .none;
+    if (serializableWith(std.heap.page_allocator, e.annotations) != null) return .none;
+    if (hasAnnotation(e.annotations, "Contextual") or hasAnnotation(e.annotations, "Polymorphic")) return .none;
+    return primOf(simpleHead(e.ty.name.name));
+}
+
 fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c: *const ast.Class, info: *const Info) Allocator.Error!void {
     const elems = try collectElems(a, g, c);
     const serial = try serialNameOf(a, info);
@@ -885,6 +952,7 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
             if (std.mem.eql(u8, n, "SerialName") or std.mem.eql(u8, n, "Serializable") or std.mem.eql(u8, n, "Transient") or
                 std.mem.eql(u8, n, "Required") or std.mem.eql(u8, n, "EncodeDefault") or std.mem.eql(u8, n, "Contextual") or
                 std.mem.eql(u8, n, "Polymorphic") or std.mem.eql(u8, n, "OptIn") or std.mem.eql(u8, n, "Suppress")) continue;
+            if (!isSerialInfoAnnotation(g.idx, n)) continue;
             if (sourceOf(an.span)) |txt| {
                 // `@Foo(args)` -> `Foo(args)` (annotation classes are
                 // constructible like classes).
@@ -912,7 +980,7 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
     try wp(w, a, "    override fun serialize(encoder: Encoder, value: {s}) {{\n", .{self_ty});
     try w.appendSlice(a, "        val `$d` = descriptor\n        val `$out` = encoder.beginStructure(`$d`)\n");
     for (elems, 0..) |*e, i| {
-        const p = if (e.ty.nullable) Prim.none else primOf(simpleHead(e.ty.name.name));
+        const p = elemPrim(e);
         const enc = if (p != .none)
             try std.fmt.allocPrint(a, "`$out`.encode{s}Element(`$d`, {d}, value.{s})", .{ primSuffix(p), i, e.name })
         else if (e.ty.nullable)
@@ -940,7 +1008,7 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
         while (mi < n_masks) : (mi += 1) try wp(w, a, "        var `$seen{d}` = 0\n", .{mi});
     }
     for (elems, 0..) |*e, i| {
-        const p = if (e.ty.nullable) Prim.none else primOf(simpleHead(e.ty.name.name));
+        const p = elemPrim(e);
         if (p != .none) {
             try wp(w, a, "        var `$v{d}`: {s} = {s}\n", .{ i, primSuffix(p), primZero(p) });
         } else {
@@ -952,8 +1020,10 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
     // Per-element decode statements (shared by the sequential and looped paths).
     var dec_stmts: std.ArrayList([]const u8) = .empty;
     for (elems, 0..) |*e, i| {
-        const p = if (e.ty.nullable) Prim.none else primOf(simpleHead(e.ty.name.name));
-        const bit: u32 = @as(u32, 1) << @intCast(i % 32);
+        const p = elemPrim(e);
+        // Bit 31 and a full golden mask overflow a Kotlin Int literal;
+        // both are spelled as the signed value the `and` sees.
+        const bit: i32 = @bitCast(@as(u32, 1) << @intCast(i % 32));
         const mk = i / 32;
         const st = if (p != .none)
             try std.fmt.allocPrint(a, "`$v{d}` = `$c`.decode{s}Element(`$d`, {d}); `$seen{d}` = `$seen{d}` or {d}", .{ i, primSuffix(p), i, mk, mk, bit })
@@ -972,11 +1042,12 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
     {
         var mi: usize = 0;
         while (mi < n_masks) : (mi += 1) {
-            var golden: u32 = 0;
+            var golden_u: u32 = 0;
             for (elems, 0..) |*e, i| {
                 if (i / 32 != mi) continue;
-                if (!elemOptional(e)) golden |= @as(u32, 1) << @intCast(i % 32);
+                if (!elemOptional(e)) golden_u |= @as(u32, 1) << @intCast(i % 32);
             }
+            const golden: i32 = @bitCast(golden_u);
             if (golden != 0) {
                 try wp(w, a, "        if ((`$seen{d}` and {d}) != {d}) throwMissingFieldException(`$seen{d}`, {d}, `$d`)\n", .{ mi, golden, golden, mi, golden });
             }
@@ -989,7 +1060,7 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
     for (elems, 0..) |*e, i| {
         if (!e.in_ctor) continue;
         const tt = try g.typeText(e.ty);
-        const bit: u32 = @as(u32, 1) << @intCast(i % 32);
+        const bit: i32 = @bitCast(@as(u32, 1) << @intCast(i % 32));
         const val_expr = if (e.ty.nullable) try std.fmt.allocPrint(a, "`$v{d}`", .{i}) else blk: {
             const p = primOf(simpleHead(e.ty.name.name));
             break :blk if (p != .none) try std.fmt.allocPrint(a, "`$v{d}`", .{i}) else try std.fmt.allocPrint(a, "`$v{d}`!!", .{i});
@@ -1016,7 +1087,7 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
         // the decoded value never survives. Decode it (the element exists)
         // but leave the constructed value alone.
         if (e.default_text == null and !e.is_lateinit) continue;
-        const bit: u32 = @as(u32, 1) << @intCast(i % 32);
+        const bit: i32 = @bitCast(@as(u32, 1) << @intCast(i % 32));
         const val_expr = if (e.ty.nullable) try std.fmt.allocPrint(a, "`$v{d}`", .{i}) else blk: {
             const p = primOf(simpleHead(e.ty.name.name));
             break :blk if (p != .none) try std.fmt.allocPrint(a, "`$v{d}`", .{i}) else try std.fmt.allocPrint(a, "`$v{d}`!!", .{i});
@@ -1079,7 +1150,7 @@ fn genValueClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c
     const e = &elems[0];
     const gn = try genNameFor(a, info);
     const serial = try serialNameOf(a, info);
-    const p = if (e.ty.nullable) Prim.none else primOf(simpleHead(e.ty.name.name));
+    const p = elemPrim(e);
     try wp(w, a, "object `{s}` : GeneratedSerializer<{s}> {{\n", .{ gn, info.path });
     try wp(w, a, "    override val descriptor: SerialDescriptor = InlineClassDescriptor(\"{s}\", this).also {{ `$dd` -> `$dd`.addElement(\"{s}\", false) }}\n", .{ serial, e.serial_name });
     try wp(w, a, "    override fun childSerializers(): Array<KSerializer<*>> = arrayOf<KSerializer<*>>({s})\n", .{try g.serializerExpr(e.ty, e.annotations)});
@@ -1198,7 +1269,21 @@ fn genSealedFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, info
     try wp(w, a, "), arrayOf<KSerializer<out {s}>>(", .{info.path});
     for (subs, 0..) |sp, n| {
         if (n > 0) try w.appendSlice(a, ", ");
-        try wp(w, a, "{s}.serializer()", .{sp});
+        // A generic leaf's type arguments are star-projected in the sealed
+        // serializer: each binds the polymorphic `Any` serializer, as the
+        // plugin emits.
+        const leaf_tps: usize = if (idx.by_path.get(sp)) |li| li.type_params else 0;
+        if (leaf_tps == 0) {
+            try wp(w, a, "{s}.serializer()", .{sp});
+        } else {
+            try wp(w, a, "{s}.serializer(", .{sp});
+            var ti: usize = 0;
+            while (ti < leaf_tps) : (ti += 1) {
+                if (ti != 0) try w.appendSlice(a, ", ");
+                try w.appendSlice(a, "PolymorphicSerializer(Any::class)");
+            }
+            try w.appendSlice(a, ")");
+        }
     }
     const sanns = try classAnnotationCalls(a, idx, info.path);
     if (sanns.len != 0) {
@@ -1282,7 +1367,7 @@ fn genMemberSplice(a: Allocator, c: ?*const ast.Class, info: *const Info, kept: 
     if (info.is_object_decl) {
         // A kept object serializer is the builtin `ObjectSerializer`.
         if (kept != null) {
-            try wp(&out, a, "object {s} {{ fun serializer(): KSerializer<{s}> = `{s}Impl`()\nfun generatedSerializer(): KSerializer<{s}> = ObjectSerializer(\"{s}\", {s}) }}", .{ last, info.path, gn, info.path, try serialNameOf(a, info), info.path });
+            try wp(&out, a, "object {s} {{ fun serializer(): KSerializer<{s}> = `{s}Impl`()\nval `$generatedSerializerCache`: KSerializer<{s}> by lazy {{ kotlinx.serialization.internal.ObjectSerializer(\"{s}\", {s}) }}\nfun generatedSerializer(): KSerializer<{s}> = `$generatedSerializerCache` }}", .{ last, info.path, gn, info.path, try serialNameOf(a, info), info.path, info.path });
         } else {
             try wp(&out, a, "object {s} {{ fun serializer(): KSerializer<{s}> = `{s}Impl`() }}", .{ last, info.path, gn });
         }
@@ -1485,6 +1570,56 @@ fn snippetPadded(ctx: *Ctx, text: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(ctx.a, "{s}{s}{s}", .{ ctx.pad, extra, text });
 }
 
+/// A `@Serializable` LOCAL class (declared in a function body) gets the
+/// same generated shapes as a top-level one, but every artifact lives
+/// INSIDE the class as a nested member: the class is visible only in its
+/// body's scope, so nothing at file level could name it. The record is
+/// not entered into the index — two functions may declare same-named
+/// locals, and no other declaration can reference a local class.
+fn processFunctionLocals(ctx: *Ctx, f: *ast.Function) Allocator.Error!void {
+    const dbg = std.c.getenv("KLIO_SERIAL_DUMP") != null;
+    if (dbg) std.debug.print("[serial-pass] fn {s} body={s}\n", .{ f.name.name, if (f.body) |b| @tagName(std.meta.activeTag(b)) else "none" });
+    const body = f.body orelse return;
+    if (body != .Block) return;
+    for (body.Block.stmts) |*st| {
+        if (st.* != .Decl) continue;
+        if (dbg) std.debug.print("[serial-pass] local decl in {s}: {s}\n", .{ f.name.name, @tagName(std.meta.activeTag(st.Decl)) });
+        switch (st.Decl) {
+            .Class => |*c| {
+                if (companionForClassTarget(ctx.a, c.members) != null) continue;
+                if (dbg) std.debug.print("[serial-pass] local class {s} serializable={}\n", .{ c.name.name, isSerializableIn(ctx.idx, c.annotations) });
+                if (!isSerializableIn(ctx.idx, c.annotations)) continue;
+                if (companionIsSerializer(c.members)) continue;
+                const info = classInfo(ctx.idx, c, c.name.name, ctx.pkg);
+                var tps: std.ArrayList([]const u8) = .empty;
+                for (c.type_params) |*tp| try tps.append(ctx.a, tp.name.name);
+                const g = Gen{ .a = ctx.a, .idx = ctx.idx, .pkg = ctx.pkg, .type_params = tps.items, .scope_path = c.name.name, .file = &ctx.settings };
+                var local_gen: std.ArrayList(u8) = .empty;
+                switch (info.kind) {
+                    .class => try genClassSerializer(&local_gen, ctx.a, &g, c, &info),
+                    .value_class => try genValueClassSerializer(&local_gen, ctx.a, &g, c, &info),
+                    .enum_class => try genEnumFactory(&local_gen, ctx.a, ctx.idx, c, &info),
+                    .with_custom => try genWithFactory(&local_gen, ctx.a, &g, &info),
+                    .sealed, .interface_sealed, .polymorphic, .object => continue,
+                }
+                ctx.generated_any = true;
+                const artifacts = try snippetPadded(ctx, local_gen.items);
+                if (dbg) std.debug.print("[serial-pass] local artifacts for {s}:\n{s}\n", .{ c.name.name, local_gen.items });
+                if (parseSnippet(ctx.a, ctx.file.span.file, artifacts)) |snip_val| {
+                    if (dbg) std.debug.print("[serial-pass] local artifacts parsed: {d} decls\n", .{snip_val.decls.len});
+                    try appendMembers(ctx.a, &c.members, snip_val.decls);
+                } else if (dbg) std.debug.print("[serial-pass] local artifacts FAILED to parse\n", .{});
+                const splice_src = try snippetPadded(ctx, try genMemberSplice(ctx.a, c, &info, null));
+                if (parseSnippet(ctx.a, ctx.file.span.file, splice_src)) |snip_val| {
+                    var snip = snip_val;
+                    try spliceInto(ctx.a, &c.members, false, &snip);
+                }
+            },
+            else => {},
+        }
+    }
+}
+
 fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error!void {
     for (decls) |*d| {
         switch (d.*) {
@@ -1551,6 +1686,7 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
                     try spliceInto(ctx.a, &c.members, false, &snip);
                 }
             },
+            .Function => |*f| try processFunctionLocals(ctx, f),
             .Object => |*o| {
                 const path = joinPath(ctx.a, outer, o.name.name);
                 try processDecls(ctx, o.members, path);
@@ -1566,7 +1702,16 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
                     else => try genObjectFactory(&ctx.gen, ctx.a, ctx.idx, &info),
                 }
                 ctx.generated_any = true;
-                const splice_src = try snippetPadded(ctx, try genMemberSplice(ctx.a, null, &info, null));
+                // `@KeepGeneratedSerializer` on an object beside `with=`: the
+                // kept serializer is the builtin object serializer.
+                var kept_obj: ?Info = null;
+                if (info.kind == .with_custom and hasAnnotation(o.annotations, "KeepGeneratedSerializer")) {
+                    var kept = info;
+                    kept.with = null;
+                    kept.kind = .object;
+                    kept_obj = kept;
+                }
+                const splice_src = try snippetPadded(ctx, try genMemberSplice(ctx.a, null, &info, if (kept_obj) |*k| k else null));
                 if (parseSnippet(ctx.a, ctx.file.span.file, splice_src)) |snip_val| {
                     var snip = snip_val;
                     try spliceInto(ctx.a, &o.members, true, &snip);
@@ -1820,6 +1965,7 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
     try out.appendSlice(a, files_in);
     const dump = std.c.getenv("KLIO_SERIAL_DUMP") != null;
     for (out.items[0..files_in.len]) |*f| {
+        if (dump) std.debug.print("[serial-pass] file {} mentions={}\n", .{ f.span.file, fileMentionsSerializable(f) });
         if (!fileMentionsSerializable(f)) continue;
         // Work on a copy of the decl array so the original stays intact.
         const decls_copy = try a.alloc(ast.Decl, f.decls.len);
@@ -1882,6 +2028,15 @@ fn declsMentionSerializable(decls: []const ast.Decl) bool {
             .Object => |*o| {
                 if (isSerializableLiteral(o.annotations)) return true;
                 if (declsMentionSerializable(o.members)) return true;
+            },
+            // A LOCAL class in a function body.
+            .Function => |*f| {
+                const body = f.body orelse continue;
+                if (body != .Block) continue;
+                for (body.Block.stmts) |*st| {
+                    if (st.* != .Decl) continue;
+                    if (declsMentionSerializable(@as([*]const ast.Decl, @ptrCast(&st.Decl))[0..1])) return true;
+                }
             },
             else => {},
         }
