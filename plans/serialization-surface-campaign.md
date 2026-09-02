@@ -130,7 +130,36 @@ content-negotiation.
     applies the nested rename first;
   - builtin serializer table matches the native platform (unsigned
     types and arrays, Duration, Instant, Uuid).
-  Remaining core 9: InterfaceContextualSerializerTest x2,
+  Rounds nine to fifteen (2026-09-02, later): core 129 -> 134 / 138,
+  json 479 -> 536 / 744. Roots: a nested class constructed as a reified
+  argument renames through the CALLER's lexical owner (dotted and
+  member-chain constructor paths included); an unannotated enum
+  serializes through `createSimpleEnumSerializer`; a generic `with=`
+  class gets a factory taking the type-argument serializers; nested
+  type-argument heads rename through the caller's owner
+  (`ThirdPartyBox<Item>`); the sibling expected-type solver judges the
+  `assertEquals` overload whose parameter is a type variable; a member
+  property typed only by its initializer call (`val json = Json { }`)
+  gets its class at lowering time and the inline pick's receiver gate
+  types a bare property receiver through the owner's property heads; an
+  explicit-receiver call whose arguments disprove the receiver's own
+  member opens the inline path for the reified member extension (the
+  JsonTestBase `parametrizedTest` shape); a bare call inside a `Json.`
+  extension body splices Json's reified member when no enclosing member
+  takes the call by signature (`enclosingMemberTakes` consults registered
+  signatures where a lazily lowered body carries no arity mask); the
+  applicability scorer rejects a bare type-variable argument for a
+  concrete class parameter; a header stub with a declared receiver is an
+  extension for the index; the receiver-formed pass applies declared-type
+  compatibility; a reified member extension of the enclosing class binds
+  its parameter from the call's expected type and lowers as a typed member
+  call; a nested class without a companion never answers with a top-level
+  namesake's companion.
+  Remaining core 4: BasicTypesSerializationTest.testKvSerialization,
+  SealedGenericClassesTest.testQuery,
+  SerialDescriptorAnnotationsTest.testCustomAnnotationTransparentForContextual,
+  SealedInterfacesSerializationTest.testResolved (to re-verify).
+  Remaining core 9 (before round nine): InterfaceContextualSerializerTest x2,
   ContextualGenericsTest x2, SerializersLookupNamedCompanionTest,
   SerialDescriptorAnnotationsTest.testCustomAnnotationTransparentForContextual,
   SealedGenericClassesTest.testQuery, SchemaTest.testEnumDescriptors,
