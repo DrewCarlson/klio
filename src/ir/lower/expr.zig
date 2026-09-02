@@ -6420,10 +6420,28 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 // parameters bound from the inferred type-argument names
                 // (`c.visitNodes(Kinds.OnRe) { … }` binds `T = Lw`).
                 for (cands) |cf| {
-                    if (cf.receiver_type != null or inline_state.inlineMemberOwner(cf) == null) continue;
                     if (!anyReified(cf.type_params)) continue;
-                    if (!try memberOwnerOnReceiverChain(b, receiver, cf)) continue;
-                    const names = inline_call.inferReifiedNamesForCall(b, cf, args, ast_arg_names, callee.Member.name.span.file.int()) orelse {
+                    if (cf.receiver_type) |crt| {
+                        // A reified member EXTENSION on the receiver's static
+                        // type (`json.decodeFromString(text, mode)` against
+                        // the test base's `Json.decodeFromString`): its
+                        // owner must be in the enclosing hierarchy.
+                        if (inline_state.inlineMemberOwner(cf) == null) continue;
+                        const enclosing = b.ownerClass() orelse continue;
+                        if (!inlineOwnerInEnclosingHierarchy(b, enclosing, cf)) continue;
+                        const head = (try inline_call.gateReceiverHead(b, receiver)) orelse continue;
+                        var h = std.mem.trimEnd(u8, head, "?");
+                        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+                        const want = typeHead(std.mem.trimEnd(u8, crt.name.name, "?"));
+                        if (!std.mem.eql(u8, typeHead(h), want) and !b.module.classIsOrExtends(typeHead(h), want)) continue;
+                        if (cf.params.len != args.len) continue;
+                    } else {
+                        if (inline_state.inlineMemberOwner(cf) == null) continue;
+                        if (!try memberOwnerOnReceiverChain(b, receiver, cf)) continue;
+                    }
+                    const names = inline_call.inferReifiedNamesForCall(b, cf, args, ast_arg_names, callee.Member.name.span.file.int()) orelse
+                        (try reifiedNamesFromExpected(b, cf, exp_ptr)) orelse
+                    {
                         if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: names=null\n", .{mname});
                         continue;
                     };
@@ -23963,6 +23981,31 @@ fn receiverStaticMemberApplies(b: *FuncBuilder, receiver: *const Expr, name: []c
 }
 
 /// The scalar bitwise/logical infix members with intrinsic BinOp forms.
+/// The reified type-argument name a call binds from its EXPECTED type: a
+/// single reified parameter that is the declared return type takes the
+/// expected head (`assertEquals(obj, json.decodeFromString(text, mode))`
+/// binds `T := CList1` from the sibling). Spelled as the class table holds
+/// it (a nested class by its lifted name).
+fn reifiedNamesFromExpected(b: *FuncBuilder, cf: *const ast.Function, exp: ?*const ast.TypeRef) Allocator.Error!?[]const []const u8 {
+    const e = exp orelse return null;
+    const rt = cf.return_type orelse return null;
+    if (cf.type_params.len != 1 or !cf.type_params[0].is_reified) return null;
+    if (!std.mem.eql(u8, rt.name.name, cf.type_params[0].name.name)) return null;
+    const head0 = std.mem.trimEnd(u8, e.name.name, "?");
+    if (head0.len == 0) return null;
+    var head: []const u8 = head0;
+    if (std.mem.indexOfScalar(u8, head0, '.') != null) {
+        if (b.module.classIdByQualifiedSuffix(head0)) |cid| {
+            if (cid.int() < b.module.classes.items.len) head = b.module.classes.items[cid.int()].name;
+        }
+    } else if (scopeTypeRename(b, head0, e.name.span.file.int())) |renamed| {
+        head = renamed;
+    }
+    const out = try b.allocator.alloc([]const u8, 1);
+    out[0] = head;
+    return out;
+}
+
 fn scalarBitBinOp(name: []const u8) ?ir.BinOp {
     if (std.mem.eql(u8, name, "and")) return .And;
     if (std.mem.eql(u8, name, "or")) return .Or;
