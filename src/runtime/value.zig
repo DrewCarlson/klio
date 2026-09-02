@@ -3607,7 +3607,21 @@ fn classFqnEq(a: ObjRef(ClassDef), b: ObjRef(ClassDef)) bool {
     defer ga.deinit();
     const gb = b.borrow();
     defer gb.deinit();
-    return std.mem.eql(u8, ga.get().fqn, gb.get().fqn);
+    return classFqnSpellingEq(ga.get().fqn, gb.get().fqn);
+}
+
+/// One class may sit in the class table under two spellings of its fqn:
+/// the dotted nesting (`Outer.B`) and the lifted mangle (`Outer$B`). Both
+/// name the same class, so `KClass` equality reads them alike.
+pub fn classFqnSpellingEq(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x == y) continue;
+        const xs = if (x == '$') '.' else x;
+        const ys = if (y == '$') '.' else y;
+        if (xs != ys) return false;
+    }
+    return true;
 }
 
 fn listEqBoxed(a: ValueList, b: ValueList) bool {

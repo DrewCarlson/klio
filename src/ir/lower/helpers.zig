@@ -321,6 +321,7 @@ pub fn lowerArgRunFull(
         b.pending_lambda_broad_mask = 0;
         b.pending_ref_fn_generic = false;
         b.pending_ref_lambda_param_types = null;
+        b.pending_ref_lambda_unit = false;
         if (b.sib_expected_site != null) b.restoreExpected(null);
         try b.push(.{ .Move = .{ .dst = slot, .src = r } });
     }
@@ -335,6 +336,9 @@ pub fn lowerArgRunFull(
 /// explicitly rather than through builder state so a stale value can never
 /// leak into an unrelated call's arguments.
 pub fn lowerArgRunWithArity(b: *FuncBuilder, args: []const Expr, arg_arity: ?[]const i16) Allocator.Error!struct { Reg, u32 } {
+    const arg_lambda_unit = b.pending_arg_lambda_unit;
+    b.pending_arg_lambda_unit = null;
+    defer if (arg_lambda_unit) |m| b.allocator.free(m);
     const n = args.len;
     if (n == 0) {
         // Reserve a sentinel slot so the n_args=0 reads do not alias an
@@ -376,12 +380,14 @@ pub fn lowerArgRunWithArity(b: *FuncBuilder, args: []const Expr, arg_arity: ?[]c
             (if (j < types.len) types[j] else null)
         else
             null;
+        b.pending_ref_lambda_unit = if (arg_lambda_unit) |m| (j < m.len and m[j]) else false;
         const r = try expr_mod.lowerExpr(b, &args[j]);
         b.pending_lambda_label = null;
         b.pending_lambda_arity = -1;
         b.pending_lambda_broad_mask = 0;
         b.pending_ref_fn_generic = false;
         b.pending_ref_lambda_param_types = null;
+        b.pending_ref_lambda_unit = false;
         if (b.sib_expected_site != null) b.restoreExpected(null);
         try b.push(.{ .Move = .{ .dst = slot, .src = r } });
     }
@@ -442,6 +448,7 @@ pub fn internTypeArgsScoped(
         // spliced `typeInfo<List<Int>>()` stamps `List<Int>` even when the
         // callee's type params are registered in another module's registry.
         const nm = b.resolveReifiedTypeName(t.name.name) orelse
+            qualifiedClassName(b, &t) orelse
             (expr_mod.scopeTypeRename(b, t.name.name, t.name.span.file.int()) orelse t.name.name);
         // A nested-generic argument (`typeOf<List<Int>>()`) stamps its FULL
         // spelling so runtime KType materialisation sees the arguments;
@@ -460,6 +467,16 @@ pub fn internTypeArgsScoped(
     return out;
 }
 
+/// A DOTTED type spelling (`Outer.B`) names the class the fqn suffix
+/// resolves to; its registered (lifted) name is what the runtime class
+/// table holds — the bare tail would answer another same-named class.
+fn qualifiedClassName(b: *FuncBuilder, t: *const ast.TypeRef) ?[]const u8 {
+    const qp = t.qualified_path orelse return null;
+    const cid = b.module.classIdByQualifiedSuffix(qp) orelse return null;
+    if (cid.int() >= b.module.classes.items.len) return null;
+    return b.module.classes.items[cid.int()].name;
+}
+
 fn renderFullTypeArg(b: *FuncBuilder, head: []const u8, t: *const ast.TypeRef) Allocator.Error![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(b.allocator, head);
@@ -471,6 +488,7 @@ fn renderFullTypeArg(b: *FuncBuilder, head: []const u8, t: *const ast.TypeRef) A
             continue;
         }
         const inner_head = b.resolveReifiedTypeName(ta.ty.name.name) orelse
+            qualifiedClassName(b, &ta.ty) orelse
             (expr_mod.scopeTypeRename(b, ta.ty.name.name, ta.ty.name.span.file.int()) orelse ta.ty.name.name);
         const inner = if (ta.ty.type_args.len == 0) blk: {
             if (!ta.ty.nullable) break :blk inner_head;

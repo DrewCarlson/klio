@@ -228,6 +228,87 @@ content-negotiation.
   the contextual fallback (core: BasicTypesSerializationTest,
   SerialDescriptorAnnotationsTest, SealedGenericClassesTest all green
   in solos — core 138 of 138 pending the census).
+  Census after round twenty-two: core 138 / 138 (the core suite is
+  GREEN); json 554 -> 644 / 744 (100 remaining across 40 classes, the
+  largest bucket 4: SerialNameCollisionTest, PropertyInitializerTest,
+  JsonModesTest, JsonMapPolymorphismTest, JsonCoerceInputValuesTest,
+  InlineClassesCompleteTest, then 3s: ValueClassesInSealedHierarchyTest,
+  TrailingCommaTest, LocalClassesTest, JsonMapKeysTest,
+  JsonListPolymorphismTest, JsonEnumsCaseInsensitiveTest,
+  JsonDecodingErrorMessagesTest, GenericCustomSerializerTest,
+  BasicTypesSerializationTest). Floor ratcheted to 640 in
+  `src/itests/commontest_support.zig` (serialization_json baseline) and
+  the json census joins the standing battery.
+  Round twenty-three (suite-only failures, all roots shared with plain
+  Kotlin programs): (1) a reified inline call in argument position of a
+  bare call to an OWN member (`checkNotRegisteredMessage(a, b,
+  assertFailsWith { … })`) had no expected type — plain member functions
+  are not in the simple-name function index, so the sibling solver now
+  resolves the enclosing chain's member through the registered member
+  resolution (lambda bodies fall back to the thread's current owner
+  class); (2) explicit type arguments on a call to a reified MEMBER
+  EXTENSION inherited from a superclass (`json.decodeFromString<B>(text,
+  mode)` against JsonTestBase's `Json.decodeFromString`) skipped every
+  extension candidate and fell to the pack's one-parameter overload; the
+  member-inline pick now admits enclosing-hierarchy extensions, with a
+  receiver whose static head is unknown (a local bound from an
+  expression-bodied helper) still eligible; (3) a lambda literal bound to
+  a `(…) -> Unit` parameter returned its tail value, so JsonTestBase's
+  per-mode result comparison saw the four assertFailsWith exceptions
+  differ — lambdas now coerce to Unit through the same per-argument
+  channel that carries instantiated parameter types (both arg-run loops);
+  (4) the klio okio / kotlinx-io stream adapters decoded through the
+  string lexer; the test run now composes upstream's json-okio and
+  json-io modules unchanged over richer buffer stand-ins, so the stream
+  modes exercise ReaderJsonLexer ("Unexpected EOF" messages); (5) a
+  bare call `globalFun()` beside a primary-constructor property
+  `globalFun: Int` invoked the parameter value — a local whose declared
+  type is a plain value (primitive/String, or a class without `invoke`)
+  never binds a call, and own-member arity masks now record such
+  properties as taking no arity; (6) `Map<String, @Polymorphic InnerBase>`
+  ignored the type argument's use-site annotations (the pass passed none),
+  encoding `{}`; (7) a type-parameter element (`val boxed: T`) was
+  asserted non-null in the generated deserialize, breaking `Box<Int?>`
+  with a null payload — it is cast instead; (8) a generic-class parameter
+  (`serializer: KSerializer<T>`) against a call argument whose explicit
+  type arguments instantiate a dangling/star return
+  (`CustomIntSerializer(true).cast<IntBox>()`) now unifies structurally
+  (SerializersLookupTest contextual lookups); (9) a user class `E` lost
+  to `kotlin.math.E` — an in-scope class outranks an unimported
+  top-level property at lowering, and a class-bound `LoadGlobal` never
+  falls back to a same-named global of another package at runtime.
+  Round twenty-three continued: (10) inside an inner class, a member call
+  on an OWN property named like a package segment (`json.decodeFromString(
+  d, s, mode)` in JsonTestBase's SwitchableJson) lowered as a package-
+  qualified call and bound `Json.Default` as the extension receiver — the
+  every-mode coerce/lenient failures (JsonCoerceInputValuesTest,
+  JsonModesTest NaN/Infinity/unknown-keys); own members now block the
+  package-path route; (11) `@Transient` constructor defaults were absent
+  from the generated deserialize, so a later default referencing one
+  (`transientRefFromProp = constTransient + 4`) read a field off the
+  serializer object — constructor parameters now walk in declaration
+  order and transient ones bind their default as a local
+  (PropertyInitializerTest 4/4); (12) `KClass.simpleName` of a nested
+  class returned the lifted `Outer$Inner` spelling (SerialNameCollision
+  messages); (13) a file-private `const val` renamed for a cross-file
+  collision was not honored by `$name` string interpolation, and
+  `@SerialName("$prefix.Derived")` (a template over a `const val`) was not
+  folded to its compile-time string — the pass now collects top-level
+  string constants across files first; (14) a resolved extension whose
+  target is an image header stub of an inline function was CALLED (a
+  bodiless stub) instead of spliced. (15) A receiver's own applicable
+  MEMBER now outranks a same-named member extension declared elsewhere on
+  both member-inline routes (`Json.decodeFromString(serial, source)` and
+  `Json.encodeToString(serializer, value)` spliced JsonTestBase's
+  `(source, mode)` / `(value, mode)` extensions with the arguments bound
+  to the wrong parameters); the member-inline pick also checks arity, so a
+  one-parameter member never preempts a two-parameter sibling. Solo
+  verification after (1)-(15): PolymorphismWithAnyTest 7/7, JsonCustom
+  SerializersTest 33/33, JsonCommentsTest 9/9, JsonDecodingErrorMessages
+  Test 12/12, JsonMapPolymorphismTest 5/5, JsonListPolymorphismTest 3/3,
+  InlineClassesCompleteTest 4/4, PropertyInitializerTest 4/4,
+  SerialNameCollisionTest 6/6, JsonCoerceInputValuesTest 9/9,
+  JsonModesTest 7/9, SerializersLookupTest 29/31.
   Remaining core 3 (after round eighteen):
   BasicTypesSerializationTest.testKvSerialization,
   SealedGenericClassesTest.testQuery,

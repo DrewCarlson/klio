@@ -2519,6 +2519,18 @@ fn companionInstanceForClass(self: *VmHost, cls_simple: []const u8) Allocator.Er
     };
 }
 
+/// `KClass.simpleName` of a runtime class name: a nested class is stored
+/// lifted (`Outer$Inner`) and a local class under its function mangle
+/// (`Name$lc<fn>`); the simple name is the declared identifier alone.
+fn classSimpleName(name: []const u8) []const u8 {
+    var n = name;
+    if (std.mem.indexOf(u8, n, "$lc")) |i| n = n[0..i];
+    if (std.mem.lastIndexOfAny(u8, n, "$.")) |i| {
+        if (i + 1 < n.len) n = n[i + 1 ..];
+    }
+    return n;
+}
+
 fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?EvalResult {
     const cls = receiver.Class;
     const g = cls.borrow();
@@ -2540,7 +2552,7 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     // are null, matching kotlinc.
     if (std.mem.eql(u8, name, "simpleName")) {
         if (cd.is_anonymous) return ok(.Null);
-        return ok(.{ .String = try runtime.strInit(allocator, cd.name) });
+        return ok(.{ .String = try runtime.strInit(allocator, classSimpleName(cd.name)) });
     }
     if (std.mem.eql(u8, name, "qualifiedName")) {
         if (cd.is_anonymous) return ok(.Null);

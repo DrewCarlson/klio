@@ -82,6 +82,10 @@ const Index = struct {
     sub_records: std.ArrayList(SubRecord),
     /// Every `object` declaration path (for `with = X::class` object-vs-class).
     objects: std.StringHashMap(void),
+    /// Top-level `const val NAME = "literal"` values, so an annotation
+    /// argument spelled as a template (`@SerialName("$prefix.Derived")`)
+    /// folds to the compile-time string kotlinc sees.
+    const_strings: std.StringHashMap([]const u8),
     /// Annotation classes annotated `@MetaSerializable`: a class annotated
     /// with one of these is serializable as if `@Serializable`.
     meta_serializable: std.StringHashMap(void),
@@ -107,6 +111,7 @@ const Index = struct {
             .by_name = std.StringHashMap(Info).init(a),
             .by_path = std.StringHashMap(Info).init(a),
             .all_paths = std.StringHashMap(void).init(a),
+            .const_strings = std.StringHashMap([]const u8).init(a),
             .sealed_subs = std.StringHashMap(std.ArrayList(SealedSub)).init(a),
             .sub_records = .empty,
             .objects = std.StringHashMap(void).init(a),
@@ -146,12 +151,27 @@ fn annotationStringArg(an: *const ast.Annotation) ?[]const u8 {
     return exprStringLiteral(&an.args[0]);
 }
 
+threadlocal var active_index: ?*const Index = null;
+
 fn exprStringLiteral(e: *const ast.Expr) ?[]const u8 {
     switch (e.*) {
         .StringTemplate => |st| {
             if (st.parts.len == 0) return "";
             if (st.parts.len == 1 and st.parts[0] == .Text) return st.parts[0].Text;
-            return null;
+            // A template over `const val` strings is a compile-time constant.
+            const idx = active_index orelse return null;
+            var out: std.ArrayList(u8) = .empty;
+            for (st.parts) |part| {
+                switch (part) {
+                    .Text => |t| out.appendSlice(idx.a, t) catch return null,
+                    .ShortInterp => |id| {
+                        const v = idx.const_strings.get(id.name) orelse return null;
+                        out.appendSlice(idx.a, v) catch return null;
+                    },
+                    .Interp => return null,
+                }
+            }
+            return out.toOwnedSlice(idx.a) catch null;
         },
         else => return null,
     }
@@ -544,7 +564,10 @@ const Gen = struct {
         if (i >= t.type_args.len or t.type_args[i].is_star) {
             return "PolymorphicSerializer(Any::class)";
         }
-        return self.serializerExpr(&t.type_args[i].ty, &.{});
+        // A type argument carries its own use-site annotations
+        // (`Map<String, @Polymorphic InnerBase>`), which select the
+        // polymorphic / contextual serializer exactly as on a property.
+        return self.serializerExpr(&t.type_args[i].ty, t.type_args[i].ty.annotations);
     }
 
     /// `ContextualSerializer(X::class, fallback, args)`: a `@Serializable`
@@ -1057,13 +1080,37 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
     // in declaration order (shadowing so defaults can reference earlier
     // properties), then body properties assigned when seen.
     try w.appendSlice(a, "        return run {\n");
-    for (elems, 0..) |*e, i| {
-        if (!e.in_ctor) continue;
+    // Constructor parameters walk in DECLARATION order so a default may
+    // reference any earlier parameter, transient ones included: a
+    // `@Transient` property is never decoded, but its default still binds
+    // a local for the defaults that follow (`transientRefFromProp: Int =
+    // constTransient + 4`).
+    for (c.primary_params) |*pp| {
+        if (pp.property == null) continue;
+        if (hasAnnotation(pp.annotations, "Transient")) {
+            if (pp.default) |*d| {
+                if (exprText(d)) |dt| try wp(w, a, "            val {s}: {s} = ({s})\n", .{ pp.name.name, try g.typeText(&pp.ty), dt });
+            }
+            continue;
+        }
+        var ei: ?usize = null;
+        for (elems, 0..) |*cand, ci| {
+            if (cand.in_ctor and std.mem.eql(u8, cand.name, pp.name.name)) {
+                ei = ci;
+                break;
+            }
+        }
+        const i = ei orelse continue;
+        const e = &elems[i];
         const tt = try g.typeText(e.ty);
         const bit: i32 = @bitCast(@as(u32, 1) << @intCast(i % 32));
         const val_expr = if (e.ty.nullable) try std.fmt.allocPrint(a, "`$v{d}`", .{i}) else blk: {
             const p = primOf(simpleHead(e.ty.name.name));
-            break :blk if (p != .none) try std.fmt.allocPrint(a, "`$v{d}`", .{i}) else try std.fmt.allocPrint(a, "`$v{d}`!!", .{i});
+            if (p != .none) break :blk try std.fmt.allocPrint(a, "`$v{d}`", .{i});
+            // A type-parameter element (`val boxed: T`) may be instantiated
+            // nullable (`Box<Int?>`): the value is cast, never asserted.
+            if (g.typeParamIndex(simpleHead(e.ty.name.name)) != null) break :blk try std.fmt.allocPrint(a, "(`$v{d}` as {s})", .{ i, tt });
+            break :blk try std.fmt.allocPrint(a, "`$v{d}`!!", .{i});
         };
         if (e.default_text) |dflt| {
             try wp(w, a, "            val {s}: {s} = if ((`$seen{d}` and {d}) == 0) ({s}) else {s}\n", .{ e.name, tt, i / 32, bit, dflt, val_expr });
@@ -1090,7 +1137,11 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
         const bit: i32 = @bitCast(@as(u32, 1) << @intCast(i % 32));
         const val_expr = if (e.ty.nullable) try std.fmt.allocPrint(a, "`$v{d}`", .{i}) else blk: {
             const p = primOf(simpleHead(e.ty.name.name));
-            break :blk if (p != .none) try std.fmt.allocPrint(a, "`$v{d}`", .{i}) else try std.fmt.allocPrint(a, "`$v{d}`!!", .{i});
+            if (p != .none) break :blk try std.fmt.allocPrint(a, "`$v{d}`", .{i});
+            // A type-parameter element (`val boxed: T`) may be instantiated
+            // nullable (`Box<Int?>`): the value is cast, never asserted.
+            if (g.typeParamIndex(simpleHead(e.ty.name.name)) != null) break :blk try std.fmt.allocPrint(a, "(`$v{d}` as {s})", .{ i, try g.typeText(e.ty) });
+            break :blk try std.fmt.allocPrint(a, "`$v{d}`!!", .{i});
         };
         try wp(w, a, "            if ((`$seen{d}` and {d}) != 0) `$inst`.{s} = {s}\n", .{ i / 32, bit, e.name, val_expr });
     }
@@ -1151,10 +1202,19 @@ fn genValueClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c
     const gn = try genNameFor(a, info);
     const serial = try serialNameOf(a, info);
     const p = elemPrim(e);
-    try wp(w, a, "object `{s}` : GeneratedSerializer<{s}> {{\n", .{ gn, info.path });
+    const tps = try typeParamList(a, c);
+    const self_ty = try std.fmt.allocPrint(a, "{s}{s}", .{ info.path, tps });
+    // A generic value class (`value class MyList<T>(val list: List<T>)`)
+    // takes its type-argument serializers as constructor parameters, as
+    // a generic class's serializer does.
+    if (c.type_params.len != 0) {
+        try wp(w, a, "class `{s}`{s}({s}) : GeneratedSerializer<{s}> {{\n", .{ gn, tps, try typeSerialParams(a, c), self_ty });
+    } else {
+        try wp(w, a, "object `{s}` : GeneratedSerializer<{s}> {{\n", .{ gn, self_ty });
+    }
     try wp(w, a, "    override val descriptor: SerialDescriptor = InlineClassDescriptor(\"{s}\", this).also {{ `$dd` -> `$dd`.addElement(\"{s}\", false) }}\n", .{ serial, e.serial_name });
     try wp(w, a, "    override fun childSerializers(): Array<KSerializer<*>> = arrayOf<KSerializer<*>>({s})\n", .{try g.serializerExpr(e.ty, e.annotations)});
-    try wp(w, a, "    override fun serialize(encoder: Encoder, value: {s}) {{\n        val `$inl` = encoder.encodeInline(descriptor)\n", .{info.path});
+    try wp(w, a, "    override fun serialize(encoder: Encoder, value: {s}) {{\n        val `$inl` = encoder.encodeInline(descriptor)\n", .{self_ty});
     if (p != .none) {
         try wp(w, a, "        `$inl`.encode{s}(value.{s})\n", .{ primSuffix(p), e.name });
     } else if (e.ty.nullable) {
@@ -1163,7 +1223,7 @@ fn genValueClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c
         try wp(w, a, "        `$inl`.encodeSerializableValue({s}, value.{s})\n", .{ try g.serializerExpr(e.ty, e.annotations), e.name });
     }
     try w.appendSlice(a, "    }\n");
-    try wp(w, a, "    override fun deserialize(decoder: Decoder): {s} {{\n        val `$inl` = decoder.decodeInline(descriptor)\n", .{info.path});
+    try wp(w, a, "    override fun deserialize(decoder: Decoder): {s} {{\n        val `$inl` = decoder.decodeInline(descriptor)\n", .{self_ty});
     if (p != .none) {
         try wp(w, a, "        return {s}(`$inl`.decode{s}())\n", .{ info.path, primSuffix(p) });
     } else if (e.ty.nullable) {
@@ -1386,7 +1446,15 @@ fn genMemberSplice(a: Allocator, c: ?*const ast.Class, info: *const Info, kept: 
                 try wp(&out, a, "fun serializer(): KSerializer<{s}> = `{s}`", .{ info.path, gn });
             }
         },
-        .value_class => try wp(&out, a, "fun serializer(): KSerializer<{s}> = `{s}`", .{ info.path, gn }),
+        .value_class => {
+            if (c != null and c.?.type_params.len != 0) {
+                try wp(&out, a, "fun {s} serializer({s}): KSerializer<{s}{s}> = `{s}`{s}({s})", .{
+                    try typeParamList(a, c.?), try typeSerialParams(a, c.?), info.path, try typeParamList(a, c.?), gn, try typeParamList(a, c.?), try typeSerialArgs(a, c.?),
+                });
+            } else {
+                try wp(&out, a, "fun serializer(): KSerializer<{s}> = `{s}`", .{ info.path, gn });
+            }
+        },
         else => {
             if (c != null and c.?.type_params.len != 0 and info.with != null) {
                 // A generic class's custom serializer receives the
@@ -1681,7 +1749,9 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
                 }
                 ctx.generated_any = true;
                 const splice_src = try snippetPadded(ctx, try genMemberSplice(ctx.a, c, &info, if (kept_info) |*k| k else null));
-                if (parseSnippet(ctx.a, ctx.file.span.file, splice_src)) |snip_val| {
+                const parsed_splice = parseSnippet(ctx.a, ctx.file.span.file, splice_src);
+                if (std.c.getenv("KLIO_SERIAL_DUMP") != null) std.debug.print("[serial-pass] member splice for {s} parsed={}:\n{s}\n", .{ path, parsed_splice != null, splice_src });
+                if (parsed_splice) |snip_val| {
                     var snip = snip_val;
                     try spliceInto(ctx.a, &c.members, false, &snip);
                 }
@@ -1936,6 +2006,19 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
         return out;
     }
     var idx = Index.init(a);
+    active_index = &idx;
+    defer active_index = null;
+    // Top-level string constants first: an annotation argument in any
+    // file may reference a `const val` declared in another.
+    for (files_in) |*f| {
+        for (f.decls) |*d| {
+            if (d.* != .Property) continue;
+            const p = d.Property;
+            if (!p.is_const) continue;
+            const ini = p.init orelse continue;
+            if (exprStringLiteral(&ini)) |txt| try idx.const_strings.put(p.name.name, txt);
+        }
+    }
     for (files_in) |*f| try indexAnnotationClasses(&idx, f.decls);
     for (files_in) |*f| {
         try indexDecls(&idx, f.decls, "", packageText(a, f));

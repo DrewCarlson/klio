@@ -1042,7 +1042,18 @@ fn notePropScope(
     package_prefix: []const u8,
     p: *const ast.Property,
 ) Allocator.Error!void {
-    const fqn = try resolveFqn(a, func_fqn_overrides, p.span, package_prefix, p.name.name);
+    const fqn = blk: {
+        const resolved = try resolveFqn(a, func_fqn_overrides, p.span, package_prefix, p.name.name);
+        // A file-private collision rename (`prefix$f12`) happened after the
+        // span-keyed override was recorded: the registered fqn must carry
+        // the mangled simple name, or two files' consts share one key.
+        const last = if (std.mem.lastIndexOfScalar(u8, resolved, '.')) |d| resolved[d + 1 ..] else resolved;
+        if (std.mem.eql(u8, last, p.name.name)) break :blk resolved;
+        if (std.mem.lastIndexOfScalar(u8, resolved, '.')) |d| {
+            break :blk try std.fmt.allocPrint(a, "{s}.{s}", .{ resolved[0..d], p.name.name });
+        }
+        break :blk p.name.name;
+    };
     const pkg = try declPackage(a, decl_pkg, func_fqn_overrides, p.span, package_prefix, p.name.name);
     const gop = try module.registry.top_level_prop_pkgs.getOrPut(p.name.name);
     if (!gop.found_existing) gop.value_ptr.* = .empty;
