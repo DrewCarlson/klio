@@ -11686,6 +11686,8 @@ fn objectRefTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     const seg = arg.Path.segments[0];
     const nm = seg.name;
     if (nm.len == 0 or !std.ascii.isUpper(nm[0])) return null;
+    const tr = runtime.envOnce("KLIO_SIBEXP_TRACE") != null;
+    if (tr) std.debug.print("[objref] {s} resolve={} outer={} param={} decl={} owner={?s} cur={?s}\n", .{ nm, b.resolve(nm) != null, b.knowsOuter(nm), b.isParam(nm), b.localDeclTypeRef(nm) != null, b.ownerClass(), build.currentOwnerClass() });
     if (b.resolve(nm) != null or b.knowsOuter(nm) or b.isParam(nm)) return null;
     if (b.localDeclTypeRef(nm) != null) return null;
     var cid: ?ir.ClassId = null;
@@ -11693,17 +11695,29 @@ fn objectRefTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     var hops: usize = 0;
     while (owner) |o| : (hops += 1) {
         if (hops > 16) break;
-        const oid = b.module.classIdIndexed(o, b.self_package, seg.span.file) orelse b.module.classId(o) orelse break;
-        if (b.module.classIdNestedIn(oid, nm)) |n| {
-            cid = n;
-            break;
+        var qb: [192]u8 = undefined;
+        if (std.fmt.bufPrint(&qb, "{s}.{s}", .{ o, nm }) catch null) |qualified| {
+            if (b.module.classIdByQualifiedSuffix(qualified)) |n| {
+                cid = n;
+                break;
+            }
+        }
+        if (b.module.classIdIndexed(o, b.self_package, seg.span.file) orelse b.module.classId(o)) |oid| {
+            if (b.module.classIdNestedIn(oid, nm)) |n| {
+                cid = n;
+                break;
+            }
         }
         owner = b.module.registry.enclosing_class.get(o);
     }
     if (cid == null) cid = b.module.classIdIndexed(nm, b.self_package, seg.span.file);
-    const id = cid orelse return null;
+    const id = cid orelse {
+        if (tr) std.debug.print("[objref] {s} no class\n", .{nm});
+        return null;
+    };
     if (id.int() >= b.module.classes.items.len) return null;
     const cls = &b.module.classes.items[id.int()];
+    if (tr) std.debug.print("[objref] {s} -> {s} object={}\n", .{ nm, cls.name, cls.is_object });
     if (!cls.is_object) return null;
     return .{ .name = cls.name, .nullable = false, .args = &.{} };
 }
@@ -12371,7 +12385,10 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
                 if (b.module.classIdByQualifiedSuffix(qualified)) |ncid| {
                     if (ncid.int() < b.module.classes.items.len) {
                         const ncls = &b.module.classes.items[ncid.int()];
-                        if (!ncls.is_object and !ncls.is_stub and !ncls.is_value and !ncls.is_abstract) {
+                        // A class declared in a file whose bodies have not
+                        // lowered yet is still a header row (`is_stub`); the
+                        // constructed type is its name all the same.
+                        if (!ncls.is_object and !ncls.is_value and !ncls.is_abstract) {
                             return ir.TypeRef{
                                 .name = try b.allocator.dupe(u8, ncls.name),
                                 .nullable = false,

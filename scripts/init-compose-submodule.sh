@@ -28,6 +28,17 @@ sparse=(
   "compose/ui/ui-geometry/src/commonMain"
   "compose/ui/ui-unit/src/commonMain"
   "compose/ui/ui-graphics/src/commonMain"
+  # The ui modules' upstream conformance suites (commonTest) and the
+  # shared test utilities they import; run by the compose_ui_* census
+  # suites in src/itests/commontest_support.zig.
+  "compose/ui/ui-util/src/commonTest"
+  "compose/ui/ui-geometry/src/commonTest"
+  "compose/ui/ui-unit/src/commonTest"
+  "compose/ui/ui-graphics/src/commonTest"
+  "compose/ui/ui-text/src/commonTest"
+  "compose/ui/ui/src/commonTest"
+  "compose/ui/ui-test/src/commonMain"
+  "compose/ui/ui-test-junit4/src/commonMain"
   "compose/runtime/runtime-saveable/src/commonMain"
   "compose/ui/ui/src/commonMain"
   "compose/ui/ui/src/skikoMain"
