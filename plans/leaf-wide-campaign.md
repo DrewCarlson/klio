@@ -1,6 +1,8 @@
 # Leaf-wide campaign: real inline bodies, wider ops, cheaper doorway
 
-STATUS 2026-09-02: Task 1 LANDED AND CORRECTED — the "inline stub"
+STATUS 2026-09-02: COMPLETE — closing battery green (stack rc=0,
+every census at its floor, ui-gate 5/5, transpiler corpus 401/0) with
+every rung in. Wide leaves 3200 -> 3764. Task 1 LANDED AND CORRECTED — the "inline stub"
 record was a MISDIAGNOSIS: standalone inline bodies are real; the
 Map.iterator incident was a registration KEY COLLISION (the identity
 `Iterator<T>.iterator() = this` overwrote Map's entry under the shared

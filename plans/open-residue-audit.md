@@ -1,6 +1,9 @@
 # Open-residue audit: verify every standing OPEN, fix live, close stale
 
-STATUS 2026-09-01: NOT STARTED. Hygiene campaign: the memory/plan
+STATUS 2026-09-02: COMPLETE — all seven verdicts in (below), the two
+LIVE items root-fixed (nested-`it` member-call arity 7e9a5b2a,
+container toString render f654d377) and battery-verified (stack rc=0,
+transpiler corpus 401/0), registers updated. Hygiene campaign: the memory/plan
 registers carry OPEN items that predate weeks of resolution and
 coroutine work — some are certainly stale, some are live bugs with
 named repros. The census-gap lesson says untruthful registers cost
