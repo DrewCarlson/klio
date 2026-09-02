@@ -10,12 +10,15 @@ bottom and are not campaigns.
 
 ## The active plan
 
-`plans/census-gates-and-red-mass.md` — bound every census in both
-directions (the predecessor's C3 covered only the six suites that run
-through `commontest_support.zig`; `stdlib`, `compose_plugin`, and
-`androidx_collection` counted passes only, and androidx's ratchet had
-never run at all because its sparse checkout omitted `commonTest`), then
-drive the tolerated failure mass down starting with serialization.
+`plans/leaf-wide-campaign.md` (real inline bodies + wider leaf ops +
+cheaper doorway) followed by `plans/open-residue-audit.md` (verdict
+every standing OPEN item). Predecessors all closed:
+`census-gates-and-red-mass.md` (2026-08-31, every census at ZERO),
+`object-runtime-campaign.md` + `leaf-production-campaign.md`
+(2026-09-01, the kl_ leaf vehicle + standing gates), and
+`native-floor-and-tower-campaign.md` (2026-09-01, transpiled ≥
+interpreted by construction; member-extension tower scoping
+strict-by-default).
 
 THE PERF ERA IS CLOSED (2026-08-29 .. 2026-08-31, five campaigns, each
 doc terminal — do not reopen a per-op interpreter-perf campaign without
@@ -84,12 +87,13 @@ Open:
       triage memory) and the imbalance op-trace probe recipe stay
       recorded for the failure that names them; checkboxLike's slot
       count remains the emission-shape anchor.
-- [x] PARTIALLY LANDED + CLOSED BY RECORD 2026-08-31: the PROPERTY-READ
-      half of the tower's lexical rule landed (7fb58485 — the implicit
-      walk probes members before imported extension properties, and
-      receiver_is_owner only trusts a window-bound head); the CALL-half
-      public gating stays recorded with its measured terms (~400 tests
-      without full receiver-tower emulation).
+- [x] LANDED 2026-09-01 (`native-floor-and-tower-campaign.md` Task 2):
+      the CALL-half public gating is now kotlinc-exact BY DEFAULT — the
+      program-wide plain (recv, name) pair is deleted for member
+      extension getters and setters. The recorded ~400-test gap
+      measured 540 and decomposed into four root-fixed mechanisms
+      (three synthesized-fn decl_span attribution holes + the owner
+      fqn-vs-simple supertype key mismatch); full battery green.
 
 ## 3. Coroutine debt cluster
 
@@ -154,7 +158,8 @@ klio-compose-suite-perf; harness practice in `BENCHMARKS.md`.
 
 ## Doc register
 
-LIVE (open work tracked): `c-transpiler-plan.md`,
+LIVE (open work tracked): `leaf-wide-campaign.md`,
+`open-residue-audit.md`, `c-transpiler-plan.md`,
 `value-layout-campaign.md`, `KTOR-SERVER-UPSTREAM.md`, and this file.
 `conformance-and-hardening.md` is FINISHED (closed 2026-08-18) and kept
 as a log — it holds the census baselines, the process-global contract,
