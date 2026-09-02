@@ -33,12 +33,11 @@ main: FIXED-BY-INTERIM (close with the verifying commit/run), LIVE
    2026-09-01 during the tower campaign). Census suites print
    Duration correctly, so this is env-shaped: missing pack in the
    bare-run resolution or a real toString dispatch gap. Root it.
-7. Register hygiene (no code): `plans/open-campaigns.md` §2 still
-   records the call-half ~400 terms as open — landed strict-by-default
-   2026-09-01 (plans/native-floor-and-tower-campaign.md); its "active
-   plan" pointer predates the red-mass closeout; `klio-census-state`
-   memory is superseded by the red-mass zeros. Update all three, and
-   register the two new campaigns in the doc register.
+7. Register hygiene (no code) — DONE 2026-09-02: open-campaigns §2
+   call-half bullet marked LANDED with the four-mechanism record, the
+   active-plan pointer now names the two live campaigns, both are in
+   the doc register, and klio-census-state is marked SUPERSEDED in the
+   file and the memory index (evidence: the register commit on main).
 
 ## Method
 
