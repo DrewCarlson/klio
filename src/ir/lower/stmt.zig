@@ -1178,8 +1178,8 @@ fn initTypeIsNonInvokable(b: *FuncBuilder, e: *const Expr) Allocator.Error!bool 
     const cid = b.module.uniqueClassIdBySimpleName(head) orelse b.module.classId(head) orelse return false;
     if (cid.int() >= b.module.classes.items.len) return false;
     const cls = &b.module.classes.items[cid.int()];
-    const methods = b.module.registry.hierarchy_methods.get(cls.name) orelse
-        b.module.registry.hierarchy_methods.get(cls.fqn) orelse return false;
+    const methods = b.module.registry.hierarchy_methods.get(cls.fqn) orelse
+        b.module.registry.hierarchy_methods.get(cls.name) orelse return false;
     if (methods.contains("invoke")) return false;
     return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", 1) == .none;
 }

@@ -853,6 +853,19 @@ pub fn spliceInlineLambdaOn(
     try b.pushScope();
     const lambda_own_base = b.scopeDepth() - 1;
     if (receiver) |reg| try b.bind("this", reg) else if (recv_seat) try b.bind("this", arg_regs[0]);
+    // Inside a receiver lambda passed to inline `f`, `this@f` names the
+    // lambda's OWN receiver — the spliced subject — and shadows the fn
+    // splice's same-labeled binding (f's extension receiver). A closure
+    // created in the body captures its `this` under exactly this label, so
+    // without the shadow a nested `forEachIndexed { block(i, e) }` inside
+    // `encodeCollection`'s `composite.block()` captured the enclosing
+    // Encoder and ran the caller's element block against it.
+    if (receiver orelse (if (recv_seat) arg_regs[0] else null)) |subject| {
+        if (b.currentInlineFn()) |fname| {
+            const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{fname});
+            try b.bind(label, subject);
+        }
+    }
     if (inline_state.runtime.envOnce("KLIO_THIS_TRACE") != null) {
         std.debug.print("[lam-splice-bind] {s} recv={?d} own_base={d} depth={d}\n", .{ lambda_name, if (receiver) |r| r.int() else null, lambda_own_base, b.scopeDepth() });
     }
@@ -1898,6 +1911,12 @@ pub fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const Func
     // consumer needs `List<Int>`, not an unbound `T`.
     var explicit_needed = false;
     const ty = expr_lower.argDeclTypeRefLazy(@constCast(b), arg) orelse blk: {
+        // A bare `object` reference as an argument types as the object's
+        // class (a sibling `assertEquals(Object, decode(...))` solves the
+        // reified parameter). Argument typing only: the general lazy typer
+        // must not type the name, or receiver lowering reads it as a field
+        // of the enclosing `this`.
+        if (expr_lower.objectRefTypeRef(@constCast(b), arg)) |t| break :blk t;
         if (arg.* != .Call) return null;
         const derived_opt = static_call_type.staticCallReturnTypeRef(@constCast(b), arg) catch null;
         if (std.c.getenv("KLIO_UNIFY_TRACE") != null) std.debug.print("[satr] call callee={s} derived={?s} nta={d} dargs={d} darg0={s}\n", .{ @tagName(std.meta.activeTag(arg.Call.callee.*)), if (derived_opt) |d| d.name else null, arg.Call.type_args.len, if (derived_opt) |d| d.args.len else 0, if (derived_opt) |d| (if (d.args.len != 0) d.args[0].name else "-") else "-" });
@@ -2837,13 +2856,17 @@ pub fn tryInlineCallWithTypeArgs(
         const sh_bm = b.pending_arg_broad_masks;
         const sh_fg = b.pending_arg_fn_generic;
         const sh_lp = b.pending_arg_lambda_param_types;
+        const sh_lu = b.pending_arg_lambda_unit;
         b.pending_arg_broad_masks = null;
         b.pending_arg_fn_generic = null;
         b.pending_arg_lambda_param_types = null;
+        b.pending_arg_lambda_unit = null;
         defer {
             b.pending_arg_broad_masks = sh_bm;
             b.pending_arg_fn_generic = sh_fg;
             b.pending_arg_lambda_param_types = sh_lp;
+            if (b.pending_arg_lambda_unit) |m| b.allocator.free(m);
+            b.pending_arg_lambda_unit = sh_lu;
         }
         break :recv_blk try lowerExpr(b, this_arg.?);
     } else null;
@@ -3881,7 +3904,16 @@ pub fn tryInlineCallWithTypeArgs(
 /// nesting when two segments miss); an unqualified name falls back to
 /// the lexical scope-rename ladder unchanged.
 fn reifiedQualifiedName(b: *FuncBuilder, a: ast.TypeRef) ?[]const u8 {
-    const qp = a.qualified_path orelse return null;
+    // An INFERRED nested type argument (`T` = `Foo.Bar` derived from a
+    // `Foo.Bar(1)` argument) carries its dotted spelling in `name`, not
+    // `qualified_path`, so resolve either: the dotted head names a
+    // `.`-aligned suffix of the nested class's lifted fqn, and without it
+    // the reified bind loads a bare `Foo.Bar` global that does not exist.
+    const qp = a.qualified_path orelse
+        (if (std.mem.indexOfScalar(u8, a.name.name, '.') != null and a.name.name[0] != '.')
+            a.name.name
+        else
+            return null);
     // The dotted spelling is a `.`-aligned suffix of the class's fqn
     // (`Proto.Message.IntMessage` inside `Holder`): the registered name is
     // the lifted one the class table holds.

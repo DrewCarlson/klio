@@ -432,7 +432,7 @@ pub const suites = [_]Config{
         .timeout_ms = 150_000,
         // 1295 (2026-09-01): solo 1299; the 10-case margin covered the
         // pre-L3-split load DNCs, the isolated structure runs 1299/0/0.
-        .baseline = 1295,
+        .baseline = 1297,
         .max_failed = 0,
         .max_incomplete = 1,
     },
@@ -480,20 +480,21 @@ pub const suites = [_]Config{
         .scratch_home = "/tmp/klio_itest_serialization_json_home",
         .packs = &.{
             .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-io", .artifact = "target/packs/kotlinx.io.klio-pack" },
             .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
         },
         .extra_support = &.{
             "kotlin-klio/klio-kotlinx-serialization/klioTest/kotlinx/serialization/test/CurrentPlatform.kt",
             "kotlin-klio/klio-kotlinx-serialization/klioTest/json/StreamSupport.kt",
-            "kotlin-klio/klio-kotlinx-serialization/klioTest/json/KxioSupport.kt",
             "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-okio/commonMain/src/kotlinx/serialization/json/okio/OkioStreams.kt",
             "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-okio/commonMain/src/kotlinx/serialization/json/okio/internal/OkioJsonStreams.kt",
-            "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-io/commonMain/src/kotlinx/serialization/json/io/IoStreams.kt",
-            "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-io/commonMain/src/kotlinx/serialization/json/io/internal/IoJsonStreams.kt",
         },
         .extra_args = &.{ "--feature", "kotlinx.serialization/json" },
         .timeout_ms = 120_000,
-        .baseline = 640,
+        // 2026-09-03 census: 700 / 744 (42 failed, 2 did not complete);
+        // the floor keeps a small did-not-complete margin below the
+        // observed count.
+        .baseline = 698,
         .max_failed = null,
         .max_incomplete = null,
     },
@@ -534,6 +535,13 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-ktor/upstream/ktor-http/common/test",
         },
         .scratch_home = "/tmp/klio_itest_ktor_home",
+        // The commonTest surface is ktor-io / ktor-utils / ktor-http; pin
+        // the http feature (which pulls utils -> io) so the load does not
+        // also activate the content-negotiation / serialization features,
+        // whose sources need the kotlinx.serialization pack this home does
+        // not carry. The typed serialization surface is covered by the
+        // ktor_client_get / ktor_server e2e gates.
+        .extra_args = &.{ "--feature", "io.ktor/http", "--feature", "io.ktor/test-base" },
         .packs = &.{
             .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
             .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
@@ -582,7 +590,12 @@ pub const suites = [_]Config{
             "tests/compose_ui_commontest_actuals/androidx/kruth/Kruth.kt",
         },
         .timeout_ms = 120_000,
-        .baseline = 0,
+        // 2026-09-03 census: 451 / 452 (1 failed, 0 did not complete). The
+        // lone failure is ShadowTest.testLerp — a pack-image overload
+        // resolution that picks the same-package Color `lerp` for a Float
+        // argument; it does not reproduce from source. Floor holds the
+        // observed pass count.
+        .baseline = 451,
         .max_failed = null,
         .max_incomplete = null,
     },
@@ -759,10 +772,17 @@ pub fn runSuite(cfg: Config) !void {
                 // Census diagnosis: name every failing case (and its file) so
                 // a red census is actionable without a by-hand re-run.
                 if (nf != 0 and std.c.getenv("KLIO_CENSUS_NAMES") != null) {
+                    const want_err = std.c.getenv("KLIO_CENSUS_ERRS") != null;
                     var itn = std.mem.splitScalar(u8, r.stdout, '\n');
+                    var prev_failed = false;
                     while (itn.next()) |line| {
+                        if (want_err and prev_failed and line.len != 0 and (line[0] == ' ' or line[0] == '\t')) {
+                            std.debug.print("[census-err] {s}\n", .{std.mem.trim(u8, line, " \t")});
+                        }
+                        prev_failed = false;
                         if (std.mem.endsWith(u8, line, " FAILED")) {
                             std.debug.print("[census-fail] {s} <- {s}\n", .{ line, queue[i][queue[i].len - 1] });
+                            prev_failed = true;
                         }
                     }
                 }

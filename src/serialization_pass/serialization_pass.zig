@@ -104,6 +104,10 @@ const Index = struct {
     /// Declared supertypes (full TypeRefs) per class/object path, for
     /// `object X : KSerializer<T>` target resolution.
     super_refs: std.StringHashMap([]const ast.TypeRef),
+    /// `@Serializer(forClass = X::class)` target head per serializer path,
+    /// for a serializer object that names its target by annotation rather
+    /// than a `KSerializer<X>` supertype.
+    serializer_for_class: std.StringHashMap([]const u8),
 
     fn init(a: Allocator) Index {
         return .{
@@ -122,6 +126,7 @@ const Index = struct {
             .class_annotations = std.StringHashMap([]const []const u8).init(a),
             .class_nodes = std.StringHashMap(*const ast.Class).init(a),
             .super_refs = std.StringHashMap([]const ast.TypeRef).init(a),
+            .serializer_for_class = std.StringHashMap([]const u8).init(a),
         };
     }
 };
@@ -305,6 +310,9 @@ fn indexAnnotationClasses(idx: *Index, decls: []const ast.Decl) Allocator.Error!
 
 fn recordSupersAndAnnotations(idx: *Index, path: []const u8, supertypes: []const ast.TypeRef, annotations: []const ast.Annotation) Allocator.Error!void {
     try idx.super_refs.put(path, supertypes);
+    if (serializerForClassTarget(idx.a, annotations)) |target| {
+        try idx.serializer_for_class.put(path, simpleHead(target));
+    }
     var sup: std.ArrayList([]const u8) = .empty;
     for (supertypes) |*st| try sup.append(idx.a, simpleHead(st.name.name));
     try idx.supers.put(path, try sup.toOwnedSlice(idx.a));
@@ -477,8 +485,13 @@ fn primZero(p: Prim) []const u8 {
 const FileSettings = struct {
     /// Type heads listed in `@file:UseContextualSerialization(...)`.
     contextual: std.StringHashMap(void),
-    /// Type head -> serializer reference path from `@file:UseSerializers(...)`.
+    /// Type head -> serializer reference path from `@file:UseSerializers(...)`
+    /// whose target type is NON-nullable (`KSerializer<Int>`).
     use_serializers: std.StringHashMap([]const u8),
+    /// Type head -> serializer path whose target type is NULLABLE
+    /// (`KSerializer<Int?>`): the serializer handles null itself, so a
+    /// nullable property of that head binds it directly, not `.nullable`.
+    use_serializers_nullable: std.StringHashMap([]const u8),
 };
 
 const Gen = struct {
@@ -493,6 +506,14 @@ const Gen = struct {
     /// Package of the file being generated for (serial names of the
     /// unannotated enums it references).
     pkg: []const u8 = "",
+
+    /// Qualify a type REFERENCE, honoring an explicit dotted qualifier the
+    /// source wrote (`Outer.Nested` keeps `Outer.` — its `qualified_path` —
+    /// which the bare `name` alone drops, stranding a nested type's serializer
+    /// on an unresolvable simple name in the synthetic file).
+    fn qualifyTy(self: *const Gen, t: *const ast.TypeRef) Allocator.Error![]const u8 {
+        return self.qualify(t.qualified_path orelse t.name.name);
+    }
 
     /// Qualify a type reference as written in the class to the path the
     /// synthetic top-level file can name: a sibling nested class
@@ -534,7 +555,7 @@ const Gen = struct {
             // spelling opaque so the generated code still parses.
             try out.appendSlice(self.a, "Any");
         } else {
-            try out.appendSlice(self.a, try self.qualify(t.name.name));
+            try out.appendSlice(self.a, try self.qualifyTy(t));
             if (t.type_args.len != 0) {
                 try out.append(self.a, '<');
                 for (t.type_args, 0..) |*ta, i| {
@@ -554,7 +575,21 @@ const Gen = struct {
 
     /// The serializer expression for a type, honoring the property's own
     /// annotations (`@Serializable(with=)`, `@Contextual`, `@Polymorphic`).
+    /// A `@file:UseSerializers` serializer whose target type is the element's
+    /// type spelled nullable (`KSerializer<Int?>` for an `Int?` property):
+    /// the serializer handles null itself, so it binds DIRECTLY rather than
+    /// through a `.nullable` wrapper of a non-nullable serializer.
+    fn nullableTargetRef(self: *const Gen, t: *const ast.TypeRef, annotations: []const ast.Annotation) Allocator.Error!?[]const u8 {
+        if (!t.nullable) return null;
+        if (serializableWith(self.a, annotations) != null) return null;
+        if (hasAnnotation(annotations, "Contextual") or hasAnnotation(annotations, "Polymorphic")) return null;
+        const fs = self.file orelse return null;
+        const ser = fs.use_serializers_nullable.get(simpleHead(t.name.name)) orelse return null;
+        return try self.customSerializerRef(t, ser);
+    }
+
     fn serializerExpr(self: *const Gen, t: *const ast.TypeRef, annotations: []const ast.Annotation) Allocator.Error![]const u8 {
+        if (try self.nullableTargetRef(t, annotations)) |ref| return ref;
         const base = try self.serializerExprNonNull(t, annotations);
         if (t.nullable) return std.fmt.allocPrint(self.a, "({s}).nullable", .{base});
         return base;
@@ -576,7 +611,7 @@ const Gen = struct {
     /// annotations and a module without a contextual entry still decodes.
     fn contextualSerializerExpr(self: *const Gen, t: *const ast.TypeRef) Allocator.Error![]const u8 {
         const a = self.a;
-        const q = try self.qualify(t.name.name);
+        const q = try self.qualifyTy(t);
         // The class IN SCOPE (the enclosing scopes of the declaration, then
         // top level): the flat simple-name map would answer another file's
         // same-named class.
@@ -605,12 +640,12 @@ const Gen = struct {
 
     fn serializerExprNonNull(self: *const Gen, t: *const ast.TypeRef, annotations: []const ast.Annotation) Allocator.Error![]const u8 {
         const a = self.a;
-        if (serializableWith(a, annotations)) |w| return self.customSerializerRef(w);
+        if (serializableWith(a, annotations)) |w| return self.customSerializerRef(t, w);
         const head = simpleHead(t.name.name);
         // File-level policy applies after the property's own annotations.
         if (self.file) |fs| {
             if (!hasAnnotation(annotations, "Contextual") and !hasAnnotation(annotations, "Polymorphic")) {
-                if (fs.use_serializers.get(head)) |ser| return self.customSerializerRef(ser);
+                if (fs.use_serializers.get(head)) |ser| return self.customSerializerRef(t, ser);
                 if (fs.contextual.contains(head)) {
                     return self.contextualSerializerExpr(t);
                 }
@@ -620,7 +655,7 @@ const Gen = struct {
             return self.contextualSerializerExpr(t);
         }
         if (hasAnnotation(annotations, "Polymorphic")) {
-            return std.fmt.allocPrint(a, "PolymorphicSerializer({s}::class)", .{try self.qualify(t.name.name)});
+            return std.fmt.allocPrint(a, "PolymorphicSerializer({s}::class)", .{try self.qualifyTy(t)});
         }
         if (self.typeParamIndex(head)) |i| {
             return std.fmt.allocPrint(a, "typeSerial{d}", .{i});
@@ -661,7 +696,7 @@ const Gen = struct {
             return std.fmt.allocPrint(a, "TripleSerializer({s}, {s}, {s})", .{ try self.typeArgSerializer(t, 0), try self.typeArgSerializer(t, 1), try self.typeArgSerializer(t, 2) });
         }
         if (eq(u8, head, "Array")) {
-            const elem_head = if (t.type_args.len != 0 and !t.type_args[0].is_star) try self.qualify(t.type_args[0].ty.name.name) else "Any";
+            const elem_head = if (t.type_args.len != 0 and !t.type_args[0].is_star) try self.qualifyTy(&t.type_args[0].ty) else "Any";
             return std.fmt.allocPrint(a, "ArraySerializer({s}::class, {s})", .{ elem_head, try self.typeArgSerializer(t, 0) });
         }
         if (eq(u8, head, "IntArray") or eq(u8, head, "LongArray") or eq(u8, head, "ShortArray") or eq(u8, head, "ByteArray") or
@@ -673,7 +708,7 @@ const Gen = struct {
         // A user type: its companion `serializer(...)`, with type-argument
         // serializers for a generic one. Qualified to the path the
         // synthetic file can name.
-        const qn = try self.qualify(t.name.name);
+        const qn = try self.qualifyTy(t);
         // An interface type is polymorphic unless it carries its own
         // `@Serializable` (a sealed interface's generated serializer, or a
         // custom `with=`); `@Polymorphic` on the interface forces it.
@@ -703,12 +738,30 @@ const Gen = struct {
     }
 
     /// `S` for an object serializer, `S()` for a class serializer.
-    fn customSerializerRef(self: *const Gen, w: []const u8) Allocator.Error![]const u8 {
+    fn customSerializerRef(self: *const Gen, t: ?*const ast.TypeRef, w: []const u8) Allocator.Error![]const u8 {
         const q = try self.qualify(w);
         if (self.idx.objects.contains(q) or self.idx.objects.contains(w) or self.idx.objects.contains(simpleHead(w))) return q;
-        // A serializer CLASS for a generic declaration takes the
-        // type-argument serializers, exactly as the plugin constructs it
-        // (`ParametrizedSerializer(typeSerial0)`).
+        // A generic serializer CLASS named on a PROPERTY takes the annotated
+        // type's own type-argument serializers, exactly as the plugin builds
+        // it (`@Serializable(with = CheckedDataSerializer::class) CheckedData<Int>`
+        // -> `CheckedDataSerializer(Int.serializer())`). A type-parameter
+        // argument resolves through `serializerExpr` to the enclosing class's
+        // `typeSerial<i>`, so a generic class's own `with=` still works.
+        if (t) |ty| {
+            if (ty.type_args.len != 0 and self.serializerClassIsGeneric(q)) {
+                var out: std.ArrayList(u8) = .empty;
+                try out.appendSlice(self.a, q);
+                try out.append(self.a, '(');
+                for (ty.type_args, 0..) |_, i| {
+                    if (i > 0) try out.appendSlice(self.a, ", ");
+                    try out.appendSlice(self.a, try self.typeArgSerializer(ty, i));
+                }
+                try out.append(self.a, ')');
+                return out.toOwnedSlice(self.a);
+            }
+        }
+        // A serializer CLASS for a generic declaration being generated takes
+        // the enclosing class's type-argument serializers.
         if (self.type_params.len != 0) {
             var out: std.ArrayList(u8) = .empty;
             try out.appendSlice(self.a, q);
@@ -721,6 +774,14 @@ const Gen = struct {
             return out.toOwnedSlice(self.a);
         }
         return std.fmt.allocPrint(self.a, "{s}()", .{q});
+    }
+
+    /// Whether the named serializer declaration is generic (its constructor
+    /// takes type-argument serializers).
+    fn serializerClassIsGeneric(self: *const Gen, q: []const u8) bool {
+        if (self.idx.class_nodes.get(q)) |cn| return cn.type_params.len != 0;
+        if (self.idx.class_nodes.get(simpleHead(q))) |cn| return cn.type_params.len != 0;
+        return false;
     }
 };
 
@@ -765,7 +826,7 @@ fn collectElems(a: Allocator, g: *const Gen, c: *const ast.Class) Allocator.Erro
     // encodes `a` then `y`); a supertype argument instantiates the
     // superclass's type parameter for those elements.
     for (c.supertypes) |*st| {
-        const sup_path = try g.qualify(st.name.name);
+        const sup_path = try g.qualifyTy(st);
         const sup = g.idx.class_nodes.get(sup_path) orelse continue;
         if (sup.is_interface or !isSerializableIn(g.idx, sup.annotations)) continue;
         var tps: std.ArrayList([]const u8) = .empty;
@@ -1014,9 +1075,11 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
         const p = elemPrim(g, e);
         const enc = if (p != .none)
             try std.fmt.allocPrint(a, "`$out`.encode{s}Element(`$d`, {d}, value.{s})", .{ primSuffix(p), i, e.name })
-        else if (e.ty.nullable)
-            try std.fmt.allocPrint(a, "`$out`.encodeNullableSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, try g.serializerExprNonNull(e.ty, e.annotations), e.name })
-        else
+        else if (e.ty.nullable) blk: {
+            if (try g.nullableTargetRef(e.ty, e.annotations)) |ref|
+                break :blk try std.fmt.allocPrint(a, "`$out`.encodeSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, ref, e.name });
+            break :blk try std.fmt.allocPrint(a, "`$out`.encodeNullableSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, try g.serializerExprNonNull(e.ty, e.annotations), e.name });
+        } else
             try std.fmt.allocPrint(a, "`$out`.encodeSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, try g.serializerExpr(e.ty, e.annotations), e.name });
         if (elemOptional(e) and e.encode_default != .always) {
             const dflt = e.default_text.?;
@@ -1058,9 +1121,11 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
         const mk = i / 32;
         const st = if (p != .none)
             try std.fmt.allocPrint(a, "`$v{d}` = `$c`.decode{s}Element(`$d`, {d}); `$seen{d}` = `$seen{d}` or {d}", .{ i, primSuffix(p), i, mk, mk, bit })
-        else if (e.ty.nullable)
-            try std.fmt.allocPrint(a, "`$v{d}` = `$c`.decodeNullableSerializableElement(`$d`, {d}, {s}, `$v{d}`); `$seen{d}` = `$seen{d}` or {d}", .{ i, i, try g.serializerExprNonNull(e.ty, e.annotations), i, mk, mk, bit })
-        else
+        else if (e.ty.nullable) blk: {
+            if (try g.nullableTargetRef(e.ty, e.annotations)) |ref|
+                break :blk try std.fmt.allocPrint(a, "`$v{d}` = `$c`.decodeSerializableElement(`$d`, {d}, {s}, `$v{d}`); `$seen{d}` = `$seen{d}` or {d}", .{ i, i, ref, i, mk, mk, bit });
+            break :blk try std.fmt.allocPrint(a, "`$v{d}` = `$c`.decodeNullableSerializableElement(`$d`, {d}, {s}, `$v{d}`); `$seen{d}` = `$seen{d}` or {d}", .{ i, i, try g.serializerExprNonNull(e.ty, e.annotations), i, mk, mk, bit });
+        } else
             try std.fmt.allocPrint(a, "`$v{d}` = `$c`.decodeSerializableElement(`$d`, {d}, {s}, `$v{d}`); `$seen{d}` = `$seen{d}` or {d}", .{ i, i, try g.serializerExpr(e.ty, e.annotations), i, mk, mk, bit });
         try dec_stmts.append(a, st);
     }
@@ -1406,10 +1471,10 @@ fn genWithFactory(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, info: *con
             try tps.appendSlice(a, tp);
             try wp(&params, a, "typeSerial{d}: KSerializer<{s}>", .{ i, tp });
         }
-        try wp(w, a, "fun <{s}> `{s}Impl`({s}): KSerializer<{s}<{s}>> = {s}\n\n", .{ tps.items, gn, params.items, info.path, tps.items, try g.customSerializerRef(info.with.?) });
+        try wp(w, a, "fun <{s}> `{s}Impl`({s}): KSerializer<{s}<{s}>> = {s}\n\n", .{ tps.items, gn, params.items, info.path, tps.items, try g.customSerializerRef(null, info.with.?) });
         return;
     }
-    try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ {s} }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, try g.customSerializerRef(info.with.?), gn, info.path, gn });
+    try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ {s} }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, try g.customSerializerRef(null, info.with.?), gn, info.path, gn });
 }
 
 /// The member splice text for the class: a companion (or object member)
@@ -1603,18 +1668,26 @@ const Ctx = struct {
 
 /// The type a serializer declaration serializes: its `KSerializer<T>`
 /// supertype argument head, resolved through the index.
-fn serializerTargetHead(idx: *const Index, ser_path: []const u8) ?[]const u8 {
-    const sups = idx.super_refs.get(ser_path) orelse return null;
-    for (sups) |*st| {
-        if (!std.mem.eql(u8, simpleHead(st.name.name), "KSerializer")) continue;
-        if (st.type_args.len == 0 or st.type_args[0].is_star) continue;
-        return simpleHead(st.type_args[0].ty.name.name);
+const SerTarget = struct { head: []const u8, nullable: bool };
+
+fn serializerTargetHead(idx: *const Index, ser_path: []const u8) ?SerTarget {
+    if (idx.super_refs.get(ser_path)) |sups| {
+        for (sups) |*st| {
+            if (!std.mem.eql(u8, simpleHead(st.name.name), "KSerializer")) continue;
+            if (st.type_args.len == 0 or st.type_args[0].is_star) continue;
+            return .{ .head = simpleHead(st.type_args[0].ty.name.name), .nullable = st.type_args[0].ty.nullable };
+        }
+    }
+    // A `@Serializer(forClass = X::class)` object names its target through the
+    // annotation, not a `KSerializer<X>` supertype.
+    if (idx.serializer_for_class.get(ser_path)) |target| {
+        return .{ .head = target, .nullable = false };
     }
     return null;
 }
 
 fn fileSettings(a: Allocator, idx: *const Index, f: *const ast.KotlinFile) Allocator.Error!FileSettings {
-    var fs = FileSettings{ .contextual = std.StringHashMap(void).init(a), .use_serializers = std.StringHashMap([]const u8).init(a) };
+    var fs = FileSettings{ .contextual = std.StringHashMap(void).init(a), .use_serializers = std.StringHashMap([]const u8).init(a), .use_serializers_nullable = std.StringHashMap([]const u8).init(a) };
     for (f.file_annotations) |*an| {
         const n = annotationSimpleName(an);
         if (std.mem.eql(u8, n, "UseContextualSerialization")) {
@@ -1632,7 +1705,12 @@ fn fileSettings(a: Allocator, idx: *const Index, f: *const ast.KotlinFile) Alloc
                     }
                     break :blk c;
                 };
-                if (serializerTargetHead(idx, ser_path)) |target| try fs.use_serializers.put(target, ser_path);
+                if (serializerTargetHead(idx, ser_path)) |target| {
+                    if (target.nullable)
+                        try fs.use_serializers_nullable.put(target.head, ser_path)
+                    else
+                        try fs.use_serializers.put(target.head, ser_path);
+                }
             }
         }
     }

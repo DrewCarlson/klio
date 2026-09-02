@@ -25,6 +25,7 @@ const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
 const InstanceData = runtime.InstanceData;
+const ClassDef = runtime.ClassDef;
 const MapPair = runtime.MapPair;
 const RangeKind = runtime.RangeKind;
 const SeqOp = runtime.SeqOp;
@@ -2321,14 +2322,59 @@ pub fn seqIterMember(self: *VmHost, allocator: Allocator, receiver: *const Value
 
 /// Whether the class `name` (or any supertype, breadth-first) declares an
 /// IR method named `mname`.
-fn classHasUserMethod(self: *VmHost, allocator: Allocator, start: []const u8, mname: []const u8) bool {
+/// Whether the instance's own runtime ClassDef (or a supertype ClassDef
+/// reachable through resolved interface handles) declares a member method
+/// named `mname`. Authoritative where a name-keyed registry collides.
+/// True when the module's member index records a user-declared member `mname`
+/// on the class named by `owner_fqn`. `@JvmInline value class` (and other)
+/// members live in the member index, not the runtime ClassDef.methods list
+/// (a value class carries an empty methods list), so a value class's own
+/// `toString`/`equals` override is invisible to the ClassDef walk and the
+/// auto-generated structural form would wrongly preempt it.
+fn moduleMemberDeclares(self: *VmHost, owner_fqn: []const u8, mname: []const u8) bool {
+    if (owner_fqn.len == 0) return false;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    return mg.get().memberDecls(owner_fqn, mname).len != 0;
+}
+
+fn instanceClassDeclaresMethod(inst: ObjRef(InstanceData), mname: []const u8) bool {
+    const g = inst.borrow();
+    const cd = g.get().class.clone();
+    g.deinit();
+    defer cd.deinit();
+    const dg = cd.borrow();
+    defer dg.deinit();
+    return classDefDeclaresMethod(dg.get(), mname, 0);
+}
+
+fn classDefDeclaresMethod(d: *const ClassDef, mname: []const u8, depth: u32) bool {
+    if (depth > 24) return false;
+    for (d.methods) |m| {
+        if (std.mem.eql(u8, m.name, mname)) return true;
+    }
+    for (d.interfaces) |iface| {
+        const fg = iface.borrow();
+        defer fg.deinit();
+        if (classDefDeclaresMethod(fg.get(), mname, depth + 1)) return true;
+    }
+    return false;
+}
+
+fn classHasUserMethod(self: *VmHost, allocator: Allocator, start_in: []const u8, mname: []const u8) bool {
     // Fast path: the precomputed per-class hierarchy method-name set answers
     // this in O(1). It collects the same user-declared method names up the
     // supertype chain the walk below would. Built for every source class; a
     // class with no entry (a synthesized/anon shape) falls back to the walk.
+    // The qualified record is exact; the simple-name record is the union
+    // over same-named classes and only ever says "some class declares it".
+    const start = if (std.mem.lastIndexOfScalar(u8, start_in, '.')) |d| start_in[d + 1 ..] else start_in;
     {
         const mg = self.module.borrow();
         defer mg.deinit();
+        if (mg.get().registry.hierarchy_methods.get(start_in)) |set| {
+            return set.contains(mname);
+        }
         if (mg.get().registry.hierarchy_methods.get(start)) |set| {
             return set.contains(mname);
         }
@@ -2399,6 +2445,7 @@ pub fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *cons
     var is_value = false;
     var is_object = false;
     var class_name: []const u8 = undefined;
+    var class_fqn: []const u8 = undefined;
     {
         const g = inst.borrow();
         const cg = g.get().class.borrow();
@@ -2406,6 +2453,7 @@ pub fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *cons
         is_value = cg.get().is_value;
         is_object = cg.get().is_object;
         class_name = cg.get().name;
+        class_fqn = cg.get().fqn;
         cg.deinit();
         g.deinit();
     }
@@ -2413,7 +2461,12 @@ pub fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *cons
     // class has none, so skip the per-call hierarchy walk (which allocates a
     // queue + seen-set) that only feeds the `has_user_override` guards below.
     if (!is_data and !is_value and !is_object) return null;
-    const has_user_override = classHasUserMethod(self, allocator, class_name, name);
+    // The registry answer can be wrong when a simple class name collides
+    // across packs (geometry Size vs the annotation Size); the instance's
+    // OWN ClassDef is authoritative for whether it declares an override.
+    const has_user_override = classHasUserMethod(self, allocator, if (class_fqn.len != 0) class_fqn else class_name, name) or
+        instanceClassDeclaresMethod(inst, name) or
+        moduleMemberDeclares(self, class_fqn, name);
 
     if (is_data and is_object and !has_user_override and std.mem.eql(u8, name, "toString")) {
         return .{ .ok = try strVal(allocator, classDisplayName(class_name)) };

@@ -234,10 +234,18 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
         .InstanceOf => |c| try w.print("r{d} <- InstanceOf r{d}", .{ reg(c.dst), reg(c.src) }),
         .NotNullAssert => |c| try w.print("r{d} <- NotNullAssert r{d}", .{ reg(c.dst), reg(c.src) }),
         .Lambda => |c| try w.print("r{d} <- Lambda {s}#{d}", .{ reg(c.dst), funcName(m, c.body_func), c.body_func.int() }),
-        .AstLambda => |c| try w.print(
-            "r{d} <- AstLambda {s}#{d} captures={d}",
-            .{ reg(c.dst), if (c.body_func) |fid| funcName(m, fid) else "<deferred>", if (c.body_func) |fid| fid.int() else 0, c.captured_names.len },
-        ),
+        .AstLambda => |c| {
+            try w.print(
+                "r{d} <- AstLambda {s}#{d} captures={d}",
+                .{ reg(c.dst), if (c.body_func) |fid| funcName(m, fid) else "<deferred>", if (c.body_func) |fid| fid.int() else 0, c.captured_names.len },
+            );
+            // The capture list, register and name paired, so a wrong `this`
+            // capture is visible at the creation site.
+            for (c.captures, 0..) |cr, i| {
+                try w.print("{s}r{d}:{s}", .{ if (i == 0) " [" else ", ", reg(cr), if (i < c.captured_names.len) c.captured_names[i] else "?" });
+            }
+            if (c.captures.len != 0) try w.writeAll("]");
+        },
         else => try w.print("{s}", .{@tagName(inst.*)}),
     }
     try w.writeAll("\n");

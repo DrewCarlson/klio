@@ -838,6 +838,9 @@ fn fillCompanionReadMemo(cls: ObjRef(ClassDef), v: Value) void {
 }
 
 fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, suppress_cc_redirect: bool, member_probe: bool, suppress_ext: bool) Allocator.Error!EvalResult {
+    if (runtime.envOnce("KLIO_MISS_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name)) std.debug.print("[getfield-enter] recv={s}/{s} name={s} probe={} ext_suppressed={}\n", .{ host_call_member.debugClassNameOf(self, receiver), @tagName(receiver.*), name, member_probe, suppress_ext });
+    }
     // Static-type-directed extension-property read. The lowerer emits this
     // marker when a read's STATIC receiver type resolves `name` to an in-scope
     // member-extension property rather than a member: Kotlin runs that getter,
@@ -2362,12 +2365,24 @@ fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const Valu
             break :blk g.get().fqn;
         };
         if (cls_fqn.len != 0) {
-            const nested_fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name });
-            defer allocator.free(nested_fqn);
+            // A classifier nested in the class's COMPANION is reachable
+            // through the class name too (`A.Serializer` for
+            // `class A { companion object { object Serializer } }`); probe
+            // it here, before the bare-name fallbacks below can answer with
+            // an unrelated imported classifier of the same simple name.
+            const direct_fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name });
+            defer allocator.free(direct_fqn);
+            const companion_fqn = try std.fmt.allocPrint(allocator, "{s}.Companion.{s}", .{ cls_fqn, name });
+            defer allocator.free(companion_fqn);
+            var nested_fqn: []const u8 = direct_fqn;
             const nested: ?ObjRef(ClassDef) = blk: {
                 const cg = self.classes.borrow();
                 defer cg.deinit();
-                if (cg.get().get(nested_fqn)) |def| break :blk def.clone();
+                if (cg.get().get(direct_fqn)) |def| break :blk def.clone();
+                if (cg.get().get(companion_fqn)) |def| {
+                    nested_fqn = companion_fqn;
+                    break :blk def.clone();
+                }
                 break :blk null;
             };
             if (nested) |def| {

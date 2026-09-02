@@ -145,13 +145,20 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const sh_bm = b.pending_arg_broad_masks;
     const sh_fg = b.pending_arg_fn_generic;
     const sh_lp = b.pending_arg_lambda_param_types;
+    // The `-> Unit` coercion mask belongs to the enclosing call's args too:
+    // a receiver splicing a `-> Unit` operator (map -> unsafeTransform) must
+    // not tag the outer call's lambda (`X.map { }.firstOrNull { }`).
+    const sh_lu = b.pending_arg_lambda_unit;
     b.pending_arg_broad_masks = null;
     b.pending_arg_fn_generic = null;
     b.pending_arg_lambda_param_types = null;
+    b.pending_arg_lambda_unit = null;
     defer {
         b.pending_arg_broad_masks = sh_bm;
         b.pending_arg_fn_generic = sh_fg;
         b.pending_arg_lambda_param_types = sh_lp;
+        if (b.pending_arg_lambda_unit) |m| b.allocator.free(m);
+        b.pending_arg_lambda_unit = sh_lu;
     }
     if (expr.* == .Path and expr.Path.segments.len == 1) {
         const segments = expr.Path.segments;
@@ -2420,8 +2427,11 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // A class visible from this scope outranks a same-named top-level
         // property the file never imported (`E.serializer()` on a user
         // enum `E` is the class, never `kotlin.math.E`).
+        // Only a REAL top-level property with a scope tier can lose to the
+        // class; an `object` (published as a global, no property tier)
+        // stays on the top-level path that loads its singleton.
         const class_over_unimported_prop = b.module.classIdIndexed(name0, b.self_package, segments[0].span.file) != null and
-            (b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file) orelse 5) >= 4;
+            (b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file) orelse 0) >= 4;
         if (isTopLevelProp(name0) and !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
             !build.anonCaptureBinds(name0) and !class_over_unimported_prop and
             b.module.classIdExactImport(name0, segments[0].span.file) == null and
@@ -3539,6 +3549,13 @@ fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // at `return block()` the stack holds [apply, restore]; replaying
             // both would apply the snapshot twice.
             try replayFinallysForJump(b, ar.finally_base);
+            // Also pop the CATCH-ONLY try frames opened inside this inline body:
+            // the jump to the join bypasses their `catch_done` exit, so without
+            // this the catch stays armed over the code after the inlined call
+            // (`parseString("double") { toDouble() }` then rejecting NaN).
+            const catch_pops = try b.catchBodiesFrom(ar.catch_base);
+            defer b.allocator.free(catch_pops);
+            try b.appendPopOnExit(b.cur, catch_pops);
             b.terminate(.{ .Goto = ar.join });
             const dead = try b.allocBlock();
             b.switchTo(dead);
@@ -3631,7 +3648,12 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (finally_done) |done| b.setFinallyDoneFor(cur_id, done);
     if (finally_entry == null and t.catches.len != 0) b.setCatchDoneFor(cur_id, exit);
     if (t.finally) |blk| try b.pushFinally(blk, cur_id);
+    // A catch-only try (no finally) needs its body tracked so an inline
+    // `return` inside it pops the runtime catch frame on the way to its join.
+    const catch_only = finally_entry == null and t.catches.len != 0;
+    if (catch_only) try b.pushCatchBody(cur_id);
     const body_val = try lowerBlock(b, &t.body);
+    if (catch_only) b.popCatchBody();
     try b.push(.{ .Move = .{ .dst = result, .src = body_val } });
     if (finally_entry) |fin| {
         b.terminate(.{ .Goto = fin });
@@ -6020,7 +6042,12 @@ fn localValueNotInvokable(b: *FuncBuilder, name: []const u8) bool {
 /// that binds these arguments (the registered member resolution proves a
 /// unique target).
 fn receiverConcreteMemberTakes(b: *FuncBuilder, receiver: *const Expr, name: []const u8, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!bool {
-    const head = (try inline_call.gateReceiverHead(b, receiver)) orelse return false;
+    const head = (try inline_call.gateReceiverHead(b, receiver)) orelse {
+        if (runtime.envOnce("KLIO_INLINE_PICK")) |w| {
+            if (std.mem.eql(u8, w, name)) std.debug.print("[rcmt] {s} no receiver head (recv tag={s})\n", .{ name, @tagName(std.meta.activeTag(receiver.*)) });
+        }
+        return false;
+    };
     var h = std.mem.trimEnd(u8, head, "?");
     if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
     const file = exprSpan(receiver).file;
@@ -6038,7 +6065,18 @@ fn receiverConcreteMemberTakes(b: *FuncBuilder, receiver: *const Expr, name: []c
         .actual_type_param_bounds = owned_bounds orelse &.{},
         .receiver_type = recv_type,
     });
-    return res.target != null;
+    if (runtime.envOnce("KLIO_INLINE_PICK")) |w| {
+        if (std.mem.eql(u8, w, name)) {
+            std.debug.print("[rcmt] {s} head={s} target={?d} shapes:", .{ name, h, if (res.target) |t| t.int() else null });
+            for (shapes) |sh| std.debug.print(" {s}", .{if (sh.ty) |t| t.name else "?"});
+            std.debug.print("\n", .{});
+        }
+    }
+    // An applicable member shadows every same-named extension even when the
+    // overload set stays ambiguous for the statically known argument shapes
+    // (`matrix.map(Offset(1f, 1f))` among `map(Offset)`/`map(Rect)`/
+    // `map(MutableRect)` with the factory call's type unproven).
+    return res.target != null or res.applicable;
 }
 
 fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
@@ -8393,8 +8431,25 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // class with no `invoke` member, is never a callee.
     if (callee.* == .Path and callee.Path.segments.len == 1 and ast_type_args.len == 0) {
         const nm0 = callee.Path.segments[0].name;
+        // A member FUNCTION of the enclosing class chain still takes the
+        // call when a plain value shadows the name (`AbstractCoroutine`'s
+        // `if (initParentJob) initParentJob(parent)`: the Boolean property
+        // and the inherited `JobSupport.initParentJob(Job?)`).
+        var chain_buf: [8]FuncId = undefined;
+        const chain_fns = try enclosingChainMethodsNamed(b, nm0, callee.Path.segments[0].span.file, &chain_buf);
         if (b.resolve(nm0) != null and !b.isLocalFn(nm0) and !b.isLocalExtFn(nm0) and
             b.module.classIdIndexed(nm0, b.self_package, callee.Path.segments[0].span.file) == null and
+            chain_fns.len == 0 and
+            // Only redirect to a global when a global function/builder of this
+            // name actually exists to receive the call. Without this guard a
+            // local whose DECLARED type reads as non-invokable — a receiver
+            // lambda's value parameter mis-typed as its own receiver class
+            // (`{ block -> block(7) }` bound to `Cls.((Int) -> Unit) -> Unit`,
+            // where the receiver leaks into `block`'s type) — emitted a
+            // `LoadGlobal` for a name no global carries and failed at runtime
+            // with "unresolved global". The local IS the callee: fall through
+            // to the value-invocation path.
+            b.module.hasBareCallCandidate(nm0, callee.Path.segments[0].span.file) and
             localValueNotInvokable(b, nm0))
         {
             const gv = b.allocReg();
@@ -11265,8 +11320,8 @@ fn initTypeNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) Alloc
     const cid = b.module.uniqueClassIdBySimpleName(head) orelse b.module.classId(head) orelse return false;
     if (cid.int() >= b.module.classes.items.len) return false;
     const cls = &b.module.classes.items[cid.int()];
-    const methods = b.module.registry.hierarchy_methods.get(cls.name) orelse
-        b.module.registry.hierarchy_methods.get(cls.fqn) orelse return false;
+    const methods = b.module.registry.hierarchy_methods.get(cls.fqn) orelse
+        b.module.registry.hierarchy_methods.get(cls.name) orelse return false;
     if (methods.contains("invoke")) return false;
     return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", argc) == .none;
 }
@@ -11290,8 +11345,8 @@ fn callInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) bool 
     const cid = b.module.classId(head) orelse return false;
     if (cid.int() >= b.module.classes.items.len) return false;
     const cls = &b.module.classes.items[cid.int()];
-    const methods = b.module.registry.hierarchy_methods.get(cls.name) orelse
-        b.module.registry.hierarchy_methods.get(cls.fqn) orelse return false;
+    const methods = b.module.registry.hierarchy_methods.get(cls.fqn) orelse
+        b.module.registry.hierarchy_methods.get(cls.name) orelse return false;
     if (methods.contains("invoke")) return false;
     return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", argc) == .none;
 }
@@ -11319,8 +11374,8 @@ fn ctorInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) bool 
     if (cid.int() >= b.module.classes.items.len) return false;
     const cls = &b.module.classes.items[cid.int()];
     if (cls.is_abstract) return false;
-    const methods = b.module.registry.hierarchy_methods.get(cls.name) orelse
-        b.module.registry.hierarchy_methods.get(cls.fqn) orelse return false;
+    const methods = b.module.registry.hierarchy_methods.get(cls.fqn) orelse
+        b.module.registry.hierarchy_methods.get(cls.name) orelse return false;
     if (methods.contains("invoke")) return false;
     return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", argc) == .none;
 }
@@ -11681,7 +11736,7 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
 /// A bare name that denotes an `object` declaration visible from this
 /// scope (the enclosing class's nested object first, then the indexed
 /// top-level one) types as that object's class.
-fn objectRefTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+pub fn objectRefTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (arg.* != .Path or arg.Path.segments.len != 1) return null;
     const seg = arg.Path.segments[0];
     const nm = seg.name;
@@ -11723,7 +11778,6 @@ fn objectRefTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
 }
 
 fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
-    if (objectRefTypeRef(b, arg)) |t| return t;
     if (runtime.envOnce("KLIO_VALTY_TRACE")) |w| {
         if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
             std.debug.print("[valty] LAZY {s} decl={s} splice={} lsr={}\n", .{ w, if (b.localDeclTypeRef(w)) |t| t.name else "<unset>", b.spliceParamTy(w) != null, b.lambda_splice_resolve != null });
@@ -12199,6 +12253,27 @@ fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         var result = declared;
         result.nullable = result.nullable or b.localDeclNullable(p.segments[0].name);
         return result;
+    }
+    // A bare implicit-`this` property read: the name is the enclosing class's
+    // own `val`, not a local (`assertEquals(expected, decode(…))` where
+    // `expected` is a class-level property whose static type a sibling-driven
+    // reified inference needs). Resolve it against the receiver's own property
+    // table and QUALIFY a nested-class head through the enclosing scope so a
+    // reified `serializer<T>()` binds `Outer$Nested`, not a bare unresolvable
+    // name. A local would have won above.
+    {
+        const rhead: ?[]const u8 = if (b.recvTypeRef()) |rt|
+            typeHead(std.mem.trimEnd(u8, rt.name, "?"))
+        else
+            b.ownerClass() orelse b.enclosingRecvTy();
+        if (rhead) |rh| {
+            if (b.module.registry.class_prop_type_heads.get(.{ .a = rh, .b = p.segments[0].name })) |head| {
+                if (head.len != 0 and !b.isTypeParam(head)) {
+                    const qualified = scopeTypeRenameFrom(b, rh, head, p.segments[0].span.file.int()) orelse head;
+                    return .{ .name = qualified, .nullable = false, .args = &.{} };
+                }
+            }
+        }
     }
     if (b.localInitExpr(p.segments[0].name)) |init| {
         // Following a local's initializer can re-enter this local. Kotlin has
@@ -14918,9 +14993,33 @@ pub fn resolveCtxFor(
         // (`serializer(type)` inside `SerializersModule.serializer()` bound
         // the module-less overload). The splice channel carries the spliced
         // declaration's receiver; consult it only when the frame has none.
-        .recv_ty = b.thisNarrow() orelse b.recvTy() orelse spliceRecvForName(b, name0),
+        // During an ACTIVE splice the spliced body's bare calls resolve
+        // against the spliced declaration's OWN receiver, ahead of the
+        // frame's `recv_ty` — which is the CALLER's. A receiver-bearing
+        // caller (an inline fn spliced into an EXTENSION function) would
+        // otherwise shadow the splice receiver and a bare extension call in
+        // the spliced body (`transform { }` = `Flow.unsafeTransform` inside
+        // `Flow.map`, spliced into `List<T>.ext`) would resolve against the
+        // caller's receiver and miss. Mirrors `bareStaticRecvHead`: this
+        // narrow, then the splice receiver, then the frame's own.
+        // During an ACTIVE splice the frame's own `recv_ty` is the CALLER's
+        // (the inline body is hygienic). When the caller is itself a
+        // receiver-bearing function (an inline fn spliced into an EXTENSION
+        // function), that caller receiver would shadow the spliced
+        // declaration's own receiver and a bare extension call in the body
+        // (`transform { }` = `Flow.unsafeTransform` inside `Flow.map`,
+        // spliced into `List<T>.ext`) would resolve against the wrong
+        // receiver and miss. Prefer the splice receiver over the caller's,
+        // mirroring `bareStaticRecvHead`; `spliceRecvForName`'s local gate
+        // cannot serve here because the collided name (`transform`) is also
+        // a bound param, so consult the splice receiver directly.
+        .recv_ty = b.thisNarrow() orelse
+            (if (b.spliceHintActive() and b.recvTy() != null) b.spliceRecvTy() else b.recvTy()) orelse
+            spliceRecvForName(b, name0),
         .recv_type = if (b.thisNarrow()) |t|
             ir.TypeRef{ .name = t, .nullable = false, .args = &.{} }
+        else if (b.spliceHintActive() and b.recvTy() != null)
+            (if (b.spliceRecvTyRef()) |srt| srt.* else null)
         else if (b.recvTypeRef()) |rt|
             rt
         else if (spliceRecvForName(b, name0) != null)
@@ -16528,6 +16627,17 @@ pub fn astTypeRefFromIr(b: *FuncBuilder, ty: ir.TypeRef, sp: ast.Span) ?ast.Type
 /// same solve one level down for `compareByDescending`. Only a fully
 /// concrete instantiation is pushed: a partial one disproves more than it
 /// types.
+/// Whether `ty` (its head or any type argument, recursively) names one of
+/// `names`, or carries a star projection — the shape an unbound type
+/// variable is substituted to.
+fn irTypeMentionsAny(ty: ir.TypeRef, names: []const []const u8) bool {
+    const head = std.mem.trimEnd(u8, ty.name, "?");
+    if (std.mem.eql(u8, head, "*")) return true;
+    for (names) |n| if (std.mem.eql(u8, head, n)) return true;
+    for (ty.args) |a| if (irTypeMentionsAny(a, names)) return true;
+    return false;
+}
+
 fn solveInstantiatedArgExpected(
     b: *FuncBuilder,
     callee: *const Expr,
@@ -16628,6 +16738,17 @@ fn solveInstantiatedArgExpected(
             if (sib_why) std.debug.print("[sibexp-why] {s}#{d} skip=not_concrete sub={s}\n", .{ f.fqn, fid.int(), substituted.name });
             continue;
         }
+        // The outer's OWN type parameters are not type parameters of the
+        // caller's scope, so the concreteness check reads a still-unbound
+        // `T` as a concrete class named `T`. Pushing `KSerializer<T>` would
+        // bind the nested reified call to the literal `T`; yield to the
+        // sibling solvers, which take `T` from the argument that shares it.
+        if (b.module.registry.func_type_params.get(fid)) |own_tps| {
+            if (irTypeMentionsAny(substituted, own_tps.items)) {
+                if (sib_why) std.debug.print("[sibexp-why] {s}#{d} skip=own_type_param sub={s}\n", .{ f.fqn, fid.int(), substituted.name });
+                continue;
+            }
+        }
         const converted = astTypeRefFromIr(b, substituted, exprSpan(s)) orelse continue;
         if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) {
             std.debug.print("[sibexp-inst] outer={s} arg={d} pushed={s} args={d}\n", .{ f.fqn, arg_idx, converted.name.name, converted.type_args.len });
@@ -16647,8 +16768,18 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
         .Member => |m| m.name.name,
         else => return null,
     };
+    // A bare call naming a member of the lexically enclosing class (an
+    // inherited `assertJsonFormAndRestored(serializer(), value, …)`) is not
+    // in the simple-name index (only member extensions are): read the
+    // enclosing chain's method slots, as the reified solver does.
+    const own_member_outer = callee.* != .Member and b.hasEnclosingMember(outer_name);
+    var chain_buf: [32]FuncId = undefined;
+    const cand_fids: []const FuncId = if (own_member_outer)
+        enclosingChainMethodsNamed(b, outer_name, callee.Path.segments[0].span.file, &chain_buf) catch &.{}
+    else
+        b.module.funcsBySimpleName(outer_name);
     var outer: ?*const ir.Func = null;
-    for (b.module.funcsBySimpleName(outer_name)) |fid| {
+    for (cand_fids) |fid| {
         const f = b.module.funcById(fid) orelse continue;
         if (f.params.len == args.len or (f.params.len > args.len and f.params.len - args.len <= 1)) {
             outer = f;
@@ -16679,24 +16810,34 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
         // may be one of those.
         var f_sel: *const ir.Func = f;
         var pj = recv_off + j;
+        var tv_sel: []const u8 = "";
         {
             var found = false;
-            for (b.module.funcsBySimpleName(outer_name)) |fid2| {
+            for (cand_fids) |fid2| {
                 const f2 = b.module.funcById(fid2) orelse continue;
                 if (!(f2.params.len == args.len or (f2.params.len > args.len and f2.params.len - args.len <= 1))) continue;
                 const ro2: usize = if (f2.params.len != 0 and std.mem.eql(u8, f2.params[0].name, "this")) 1 else 0;
                 const pj2 = ro2 + j;
                 if (pj2 >= f2.params.len) continue;
-                const tv2 = f2.params[pj2].ty.name;
+                const slot2 = f2.params[pj2].ty;
+                var tv2 = slot2.name;
+                // A slot `C<T>` (`KSerializer<T>`) whose single argument is a
+                // bare type variable shares that variable with the sibling's
+                // plain `T` slot: the variable is the argument.
+                if (!(tv2.len <= 2 and allUppercase(tv2)) and slot2.args.len == 1) {
+                    const a0 = std.mem.trimEnd(u8, slot2.args[0].name, "?");
+                    if (a0.len != 0 and a0.len <= 2 and allUppercase(a0)) tv2 = a0;
+                }
                 if (tv2.len > 2 or !allUppercase(tv2)) continue;
                 f_sel = f2;
                 pj = pj2;
+                tv_sel = tv2;
                 found = true;
                 break;
             }
             if (!found) continue;
         }
-        const tv = f_sel.params[pj].ty.name;
+        const tv = tv_sel;
         const ro_sel: usize = if (f_sel.params.len != 0 and std.mem.eql(u8, f_sel.params[0].name, "this")) 1 else 0;
         // A nested reified-inline call with arguments (`assertEquals(
         // Holder(1), decodeFromString(text))`) takes the sibling's static
@@ -16731,9 +16872,20 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
             continue;
         }
         if (c.callee.* != .Path) continue;
-        const nested_fid = b.module.funcId(nested_name) orelse continue;
-        const tps = b.module.registry.func_type_params.get(nested_fid) orelse continue;
-        if (tps.items.len != 1) continue;
+        // The nested ZERO-argument reified overload — `serializer<T>()`
+        // beside `serializer(type: KType)` and `KClass<T>.serializer()` —
+        // is the receiver-less one with no value parameters and a single
+        // type parameter; the simple-name index alone may answer another.
+        var nested_pick: ?FuncId = null;
+        for (b.module.funcsBySimpleName(nested_name)) |nfid| {
+            const nf = b.module.funcById(nfid) orelse continue;
+            if (nf.params.len != 0) continue;
+            const ntps = b.module.registry.func_type_params.get(nfid) orelse continue;
+            if (ntps.items.len != 1) continue;
+            nested_pick = nfid;
+            break;
+        }
+        const nested_fid = nested_pick orelse continue;
         const nested_f = b.module.funcById(nested_fid) orelse continue;
         // The lowered ir return type keeps only the head (`EnumEntries`);
         // the splice unifies against the AST declaration's full
@@ -16741,23 +16893,32 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
         if (nested_f.return_ty.name.len == 0) continue;
         for (args, 0..) |*sib, k| {
             if (k == j) continue;
-            const pk = recv_off + k;
-            if (pk >= f.params.len) continue;
-            if (!std.mem.eql(u8, f.params[pk].ty.name, tv)) continue;
-            const enum_name = staticEnumElem(b, sib) orelse continue;
-            // Build `Head<Enum>` as the nested call's expected type; the
+            const pk = ro_sel + k;
+            if (pk >= f_sel.params.len) continue;
+            if (!std.mem.eql(u8, f_sel.params[pk].ty.name, tv)) continue;
+            const sp = c.callee.Path.segments[0].span;
+            // The sibling's static type: an enum-entries expression, else a
+            // constructor call / typed value (`check(serializer(), Holder(x), …)`
+            // solves `serializer<T>()` from `Holder(x)` at the `data: T` slot).
+            const sib_ty: ast.TypeRef = blk: {
+                if (staticEnumElem(b, sib)) |enum_name| {
+                    break :blk .{ .name = .{ .name = enum_name, .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null };
+                }
+                const st = inline_call.ctorArgTypeRef(b.allocator, sib, b) orelse
+                    inline_call.staticArgTypeRef(b.allocator, sib, b) orelse {
+                    if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) std.debug.print("[sibexp-why] zero-arg nested `{s}`: sibling #{d} of `{s}` has no static type (tag={s})\n", .{ nested_name, k, outer_name, @tagName(sib.*) });
+                    continue;
+                };
+                if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) std.debug.print("[sibexp-zero] outer={s} nested={s} sibling#{d} -> {s}\n", .{ outer_name, nested_name, k, st.name.name });
+                break :blk st.*;
+            };
+            // Build `Head<Sibling>` as the nested call's expected type; the
             // inline splice's return-type unification (the existing
             // reified oracle) solves T from it.
             var head = nested_f.return_ty.name;
             if (std.mem.lastIndexOfScalar(u8, head, '.')) |i| head = head[i + 1 ..];
-            const sp = c.callee.Path.segments[0].span;
             const ta = b.allocator.alloc(ast.TypeArg, 1) catch return null;
-            ta[0] = .{
-                .variance = .Invariant,
-                .is_star = false,
-                .ty = .{ .name = .{ .name = enum_name, .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null },
-                .span = sp,
-            };
+            ta[0] = .{ .variance = .Invariant, .is_star = false, .ty = sib_ty, .span = sp };
             return .{ .site = arg, .ty = .{ .name = .{ .name = head, .span = sp }, .nullable = false, .span = sp, .type_args = ta, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null } };
         }
     }
@@ -17134,6 +17295,35 @@ fn emitCallMember(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast:
 /// where `writable` is the enclosing class's member): the innermost
 /// subject whose class declares the member, else the receiver beneath
 /// the whole subject run. Anything unprovable keeps the supplied reg.
+/// Whether an extension property (or extension function) named `name` is
+/// declared for `head` or one of its registered supertypes: the getter is
+/// a registered function with a leading `this` whose declared receiver
+/// the head is or extends.
+fn extensionPropOnHead(b: *FuncBuilder, head_in: []const u8, name: []const u8) bool {
+    const head = typeHead(std.mem.trimEnd(u8, head_in, "?"));
+    if (head.len == 0) return false;
+    const simple = applicability.simpleName(head);
+    if (extPropExistsOn(b, simple, name)) return true;
+    for (applicability.builtinSupersOf(simple)) |sup| {
+        if (extPropExistsOn(b, sup, name)) return true;
+    }
+    if (b.module.registry.class_super_names.get(simple)) |chain| {
+        for (chain) |sup| {
+            if (extPropExistsOn(b, applicability.simpleName(sup), name)) return true;
+        }
+    }
+    return false;
+}
+
+/// An extension property `val <head>.<name>` is known either by its
+/// declared-type record or by its lowered getter `__ext_get_<head>_<name>`.
+fn extPropExistsOn(b: *const FuncBuilder, head: []const u8, name: []const u8) bool {
+    if (b.module.registry.ext_prop_type_heads.get(.{ .a = head, .b = name }) != null) return true;
+    var buf: [160]u8 = undefined;
+    const gname = std.fmt.bufPrint(&buf, "__ext_get_{s}_{s}", .{ head, name }) catch return false;
+    return b.module.funcsBySimpleName(gname).len != 0;
+}
+
 fn subjectCorrectedBareThis(b: *FuncBuilder, name: []const u8, this_reg: Reg) Reg {
     const sct = if (runtime.envOnce("KLIO_SCT_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     const sbs = b.subject_binds.items;
@@ -17159,6 +17349,14 @@ fn subjectCorrectedBareThis(b: *FuncBuilder, name: []const u8, this_reg: Reg) Re
             };
         if (b.module.classHierarchyDeclaresMember(cid, name)) {
             if (sct) std.debug.print("[sct] {s}: subject {d} ({s}) declares it\n", .{ name, i, h });
+            return sbs[i].reg;
+        }
+        // An EXTENSION property declared on the subject's type (or a
+        // supertype) binds the bare name to that subject the same way a
+        // member does: `isSpecified` inside a spliced `Dp.takeOrElse`,
+        // `indices` inside `List.fastForEach`.
+        if (extensionPropOnHead(b, h, name)) {
+            if (sct) std.debug.print("[sct] {s}: subject {d} ({s}) has an extension property\n", .{ name, i, h });
             return sbs[i].reg;
         }
     }
@@ -19741,10 +19939,14 @@ fn lowerResolvedMemberCall(
     var identity = std.mem.trimEnd(u8, ty.name, "?");
     if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
     const head = typeHead(identity);
+    // A simple head shared by several classes (geometry's `Size` value
+    // class and the `androidx.annotation.Size` annotation) is decided the
+    // way the source decides it: by the call site's imports and package.
     var owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
         b.module.classIdByFqn(identity)
     else
-        b.module.uniqueClassIdBySimpleName(head);
+        b.module.uniqueClassIdBySimpleName(head) orelse
+            (if (b.isTypeParam(head)) null else b.module.classIdIndexed(head, b.self_package, name.span.file));
     // A receiver typed by a TYPE PARAMETER names no class, and that was the
     // whole of the `no_class_id` bucket — `C`, `M`, `A`, `T`, `R` accounted for
     // 769 of 915 sites. Kotlin resolves a member call on such a value against
@@ -20590,6 +20792,14 @@ fn lowerResolvedExtensionCall(
         );
         defer if (inline_lambda_param_types) |types|
             deinitArgLambdaParamTypes(b.allocator, types);
+        // The splice binds its lambda arguments by expanding their bodies,
+        // not through `lowerArgRun`, so the `-> Unit` mask that typing set
+        // on `pending_arg_lambda_unit` has no consumer on this path. Clear
+        // it now: left set, it dangles into any call lowered inside the
+        // spliced body (a nested `accept { }` predicate) and is mistaken
+        // there for that call's own mask, coercing the lambda to Unit.
+        if (b.pending_arg_lambda_unit) |m| b.allocator.free(m);
+        b.pending_arg_lambda_unit = null;
         b.pending_arg_lambda_param_types = inline_lambda_param_types;
         defer b.pending_arg_lambda_param_types = null;
         // Engine step four: solve the callee's bindings ONCE (receiver +

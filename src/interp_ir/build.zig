@@ -1453,7 +1453,7 @@ fn propHeadSourceExpr(prop: *const ast.Property) ?*const ast.Expr {
 /// this file set (`val Traversable get() = NodeKind<T>(mask)` -> `NodeKind`).
 /// Only a name that IS a declared class counts — a same-shaped factory call
 /// may return a different type, so an unknown callee proves nothing.
-fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, module: *const ir.Module) ?[]const u8 {
+fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, module: *const ir.Module, enclosing: ?*const ast.Class) ?[]const u8 {
     const src = propHeadSourceExpr(prop) orelse return null;
     if (src.* != .Call) return null;
     const callee = src.Call.callee;
@@ -1469,6 +1469,15 @@ fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, modu
         // A class registered elsewhere (a pack's `Json { }` builder names
         // its type exactly as its constructor would).
         if (module.classId(nm) != null) return nm;
+        // A NESTED class of the enclosing class named exactly as its
+        // constructor (`val expected = MF(...)` where `MF` is nested in the
+        // property's own class): report the simple head; the reader qualifies
+        // it through the enclosing scope (`Outer$MF`).
+        if (enclosing) |ec| {
+            for (ec.members) |*m| {
+                if (m.* == .Class and std.mem.eql(u8, m.Class.name.name, nm)) return nm;
+            }
+        }
         return null;
     }
     // A FACTORY call names its type just as a constructor does, as long as
@@ -2106,14 +2115,32 @@ fn buildModuleWithOverrides(
     // Per-class transitive member-function-name set. Seeded base classes
     // already carry theirs in the cloned registry; only new keys compute.
     {
-        var it = file_classes.keyIterator();
-        while (it.next()) |cname| {
-            if (module.registry.hierarchy_methods.contains(cname.*)) continue;
+        // A top-level class also records its hierarchy's method names
+        // under its qualified name, so a reader holding the fqn gets an
+        // exact answer when two packages share a simple name (geometry's
+        // `Size` value class and the `androidx.annotation.Size`
+        // annotation). The simple-name entry keeps its first registration.
+        var it = file_classes.iterator();
+        while (it.next()) |kv| {
+            const cname = kv.key_ptr.*;
+            const c = kv.value_ptr.get();
+            const cfqn = try resolveFqn(a, fqn_overrides, c.name.span, package_prefix, cname);
+            const fqn_wanted = !std.mem.eql(u8, cfqn, cname) and
+                !module.registry.hierarchy_methods.contains(cfqn);
+            const simple_wanted = !module.registry.hierarchy_methods.contains(cname);
+            if (!fqn_wanted and !simple_wanted) continue;
             var methods = StringSet.init(a);
             var seen = StringSet.init(a);
             defer seen.deinit();
-            try collectHierarchyMethodNames(cname.*, &file_classes, &methods, &seen);
-            try module.registry.hierarchy_methods.put(cname.*, methods);
+            try collectHierarchyMethodNames(cname, &file_classes, &methods, &seen);
+            if (simple_wanted and fqn_wanted) {
+                try module.registry.hierarchy_methods.put(cname, try methods.clone());
+                try module.registry.hierarchy_methods.put(cfqn, methods);
+            } else if (simple_wanted) {
+                try module.registry.hierarchy_methods.put(cname, methods);
+            } else {
+                try module.registry.hierarchy_methods.put(cfqn, methods);
+            }
         }
     }
     // Per-class transitive shadow-name set (all member kinds) for the
@@ -2227,7 +2254,7 @@ fn buildModuleWithOverrides(
                         try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
                         try notePropTypeRef(a, module, c, prop.name.name, ty);
                     }
-                } else if (propCtorHeadEvidence(prop, decls, module)) |head| {
+                } else if (propCtorHeadEvidence(prop, decls, module, c)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
                 } else if (prop.init != null and memberSizedInitHead(c, &prop.init.?) != null) {
                     try module.registry.class_prop_type_heads.put(
@@ -2293,7 +2320,7 @@ fn buildModuleWithOverrides(
                     } else if (cprop.init) |*init| {
                         if (literalTypeHead(init)) |head| {
                             try module.registry.class_prop_type_heads.put(.{ .a = ckey, .b = cprop.name.name }, head);
-                        } else if (propCtorHeadEvidence(cprop, decls, module)) |head| {
+                        } else if (propCtorHeadEvidence(cprop, decls, module, c)) |head| {
                             // `val iso = LongParser(MAX_MILLIS, allowSign = true)`
                             // inside LongParser's own companion states the head
                             // exactly as a top-level object's would.
@@ -2309,7 +2336,7 @@ fn buildModuleWithOverrides(
                 const prop = m.Property;
                 if (prop.ty) |*ty| {
                     try module.registry.class_prop_type_heads.put(.{ .a = o.name.name, .b = prop.name.name }, ty.qualified_path orelse ty.name.name);
-                } else if (propCtorHeadEvidence(prop, decls, module)) |head| {
+                } else if (propCtorHeadEvidence(prop, decls, module, null)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = o.name.name, .b = prop.name.name }, head);
                 }
             }
@@ -2332,7 +2359,20 @@ fn buildModuleWithOverrides(
             if (e.value_ptr.get().is_enum and !seen.contains("Enum")) {
                 try chain.append(a, "Enum");
             }
-            try module.registry.class_super_names.put(e.key_ptr.*, try chain.toOwnedSlice(a));
+            const super_chain = try chain.toOwnedSlice(a);
+            try module.registry.class_super_names.put(e.key_ptr.*, super_chain);
+            // Also key by fqn so a receiver whose simple name collides
+            // across packs (kotlinx.io.Buffer vs an okio stand-in named
+            // Buffer) resolves its OWN super chain (Buffer : Sink, Source)
+            // when the extension-receiver compatibility check walks it.
+            {
+                const cfqn = try resolveFqn(a, fqn_overrides, e.value_ptr.get().name.span, package_prefix, e.key_ptr.*);
+                if (!std.mem.eql(u8, cfqn, e.key_ptr.*) and
+                    !module.registry.class_super_names.contains(cfqn))
+                {
+                    try module.registry.class_super_names.put(cfqn, super_chain);
+                }
+            }
             // Declared upper bounds of the class's type parameters, for
             // the collection-stub bridge disproof at method dispatch.
             // Unbounded params are recorded with an `Any` bound (inert for
