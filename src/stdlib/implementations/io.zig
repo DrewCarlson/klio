@@ -32,7 +32,14 @@ pub fn renderViaUserToString(ctx: *CallCtx, v: *const Value) std.mem.Allocator.E
     // the structural Display shape: the intrinsic interpolates the payload
     // via ITS overridden `toString()`, so `Failure($exception)` shows a
     // custom exception rendering exactly as Kotlin prints it.
-    if (v.* == .Instance or v.* == .Result) {
+    // Containers route the same way: the member-dispatch toString renders
+    // ELEMENTS through their own overrides (`listOf(5.seconds)` prints
+    // `[5s]`), where the structural Display walker cannot dispatch and
+    // printed `[Duration(rawValue=…)]`.
+    if (v.* == .Instance or v.* == .Result or
+        v.* == .List or v.* == .Set or v.* == .Map or
+        v.* == .Pair or v.* == .Triple or v.* == .MapEntry)
+    {
         if (try ctx.host.invokeMethod(v, "toString", &.{}, ctx.out)) |res| {
             if (res == .ok and res.ok == .String) {
                 const g = res.ok.String.borrow();
