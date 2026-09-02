@@ -2843,13 +2843,17 @@ pub fn tryInlineCallWithTypeArgs(
         const sh_bm = b.pending_arg_broad_masks;
         const sh_fg = b.pending_arg_fn_generic;
         const sh_lp = b.pending_arg_lambda_param_types;
+        const sh_lu = b.pending_arg_lambda_unit;
         b.pending_arg_broad_masks = null;
         b.pending_arg_fn_generic = null;
         b.pending_arg_lambda_param_types = null;
+        b.pending_arg_lambda_unit = null;
         defer {
             b.pending_arg_broad_masks = sh_bm;
             b.pending_arg_fn_generic = sh_fg;
             b.pending_arg_lambda_param_types = sh_lp;
+            if (b.pending_arg_lambda_unit) |m| b.allocator.free(m);
+            b.pending_arg_lambda_unit = sh_lu;
         }
         break :recv_blk try lowerExpr(b, this_arg.?);
     } else null;
