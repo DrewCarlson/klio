@@ -1,0 +1,5 @@
+1.5
+caught NumberFormatException for '1e-1e-1'
+-1.0
+int fallback (NumberFormatException)
+is IllegalArgumentException=true is RuntimeException=true is Exception=true

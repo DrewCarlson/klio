@@ -15410,13 +15410,35 @@ fn companionOwnerClassValue(self: *VmHost, kc: *const Value) Allocator.Error!?Va
         const mg = self.module.borrow();
         defer mg.deinit();
         const reg = &mg.get().registry;
-        var it = reg.companion_singletons.iterator();
-        while (it.next()) |e| {
-            if (std.mem.eql(u8, e.value_ptr.*, comp_name)) break :blk e.key_ptr.*;
+        // The instance's class may carry the `$Companion` suffix once more
+        // than the registered singleton name does; peel it until a
+        // registered owner appears.
+        var probe = comp_name;
+        var hops: usize = 0;
+        while (hops < 3) : (hops += 1) {
+            var it = reg.companion_singletons.iterator();
+            while (it.next()) |e| {
+                if (std.mem.eql(u8, e.value_ptr.*, probe)) break :blk e.key_ptr.*;
+            }
+            if (reg.enclosing_class.get(probe)) |o| break :blk o;
+            if (hops != 0 and mg.get().classId(probe) != null) break :blk probe;
+            if (std.mem.endsWith(u8, probe, "$Companion")) {
+                probe = probe[0 .. probe.len - "$Companion".len];
+            } else if (std.mem.endsWith(u8, probe, ".Companion")) {
+                probe = probe[0 .. probe.len - ".Companion".len];
+            } else break;
         }
-        break :blk reg.enclosing_class.get(comp_name);
+        break :blk null;
     };
     const name = owner orelse return null;
+    // The class table is the authority for the owner's class value: a
+    // by-name global may be a same-named property of another package
+    // (`kotlin.math.E` beside a user `enum class E`).
+    {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(name)) |def| return Value{ .Class = def.clone() };
+    }
     const v = host_globals.lookupGlobal(self, name) orelse return null;
     if (v != .Class) return null;
     return v;

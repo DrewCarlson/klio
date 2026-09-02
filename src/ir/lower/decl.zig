@@ -750,12 +750,39 @@ fn collectMemberArities(
     }
     for (c.members) |*m| {
         if (m.* == .Function) try mergeMemberArity(out, m.Function.name.name, funcArityMask(&m.Function));
+        // A property declared with a non-function type cannot bind a call:
+        // `globalFun()` next to `var globalFun: Int` is the top-level
+        // function, never an invocation of the property's value. Record an
+        // empty mask so the name is known but takes no arity (a same-named
+        // function overload ORs its own mask in).
+        if (m.* == .Property) {
+            if (m.Property.ty) |*pt| {
+                if (pt.function == null and !isFunctionTypeName(pt.name.name)) try mergeMemberArity(out, m.Property.name.name, 0);
+            }
+        }
+    }
+    for (c.primary_params) |*p| {
+        if (p.property == null) continue;
+        if (p.ty.function == null and !isFunctionTypeName(p.ty.name.name)) try mergeMemberArity(out, p.name.name, 0);
     }
     for (c.supertypes) |*sup| {
         if (file_classes.get(sup.name.name)) |parent| {
             try collectMemberArities(parent.get(), file_classes, out, seen);
         }
     }
+}
+
+/// A declared type head that may denote something invokable: a function
+/// type spelling, `Any`, a bare (single upper-case) type parameter, or a
+/// `K*` reflection type. Anything else is a plain value that a call
+/// cannot bind.
+fn isFunctionTypeName(name: []const u8) bool {
+    const head = std.mem.trimEnd(u8, name, "?");
+    if (std.mem.startsWith(u8, head, "Function") or std.mem.startsWith(u8, head, "KFunction") or std.mem.startsWith(u8, head, "Suspend")) return true;
+    if (std.mem.eql(u8, head, "Any") or std.mem.eql(u8, head, "Nothing")) return true;
+    if (head.len <= 2 and head.len != 0 and std.ascii.isUpper(head[0])) return true;
+    if (std.mem.startsWith(u8, head, "K") and head.len > 1 and std.ascii.isUpper(head[1])) return true;
+    return false;
 }
 
 /// Add enum-entry, nested-class, and companion-member names that are

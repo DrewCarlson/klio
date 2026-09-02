@@ -1570,6 +1570,26 @@ fn unifyParamAgainstArg(
             return;
         }
     }
+    // A generic-class parameter (`serializer: KSerializer<T>`) against an
+    // argument whose static type the call derivation knows
+    // (`CustomIntSerializer(true).cast<IntBox>()` -> `KSerializer<IntBox>`)
+    // unifies the type arguments positionally.
+    if (param_ty.type_args.len != 0 and param_ty.function == null and
+        !tp_names.contains(param_ty.name.name) and arg.* == .Call)
+    {
+        if (staticArgTypeRef(allocator, arg, bb)) |aty| {
+            const ph = std.mem.trimEnd(u8, param_ty.name.name, "?");
+            const ah = std.mem.trimEnd(u8, aty.name.name, "?");
+            const ph_s = if (std.mem.lastIndexOfScalar(u8, ph, '.')) |d| ph[d + 1 ..] else ph;
+            const ah_s = if (std.mem.lastIndexOfScalar(u8, ah, '.')) |d| ah[d + 1 ..] else ah;
+            if (std.mem.eql(u8, ph_s, ah_s) and aty.type_args.len == param_ty.type_args.len) {
+                for (param_ty.type_args, aty.type_args) |*pa, *aa| {
+                    if (pa.is_star or aa.is_star) continue;
+                    try unifyTypeParam(&pa.ty, &aa.ty, tp_names, subst);
+                }
+            }
+        }
+    }
     // A companion serializer-factory argument (`subclass(PolyDerived
     // .serializer())`) against a `KSerializer<T>` parameter solves
     // `T = PolyDerived`: the plugin's generated factory returns the
@@ -1876,17 +1896,32 @@ pub fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const Func
     // A call argument (`listOf(42)`) types through the static call
     // derivation when the lazy typer has no memo for it here: the reified
     // consumer needs `List<Int>`, not an unbound `T`.
+    var explicit_needed = false;
     const ty = expr_lower.argDeclTypeRefLazy(@constCast(b), arg) orelse blk: {
         if (arg.* != .Call) return null;
-        const derived = (static_call_type.staticCallReturnTypeRef(@constCast(b), arg) catch null) orelse return null;
+        const derived_opt = static_call_type.staticCallReturnTypeRef(@constCast(b), arg) catch null;
+        if (std.c.getenv("KLIO_UNIFY_TRACE") != null) std.debug.print("[satr] call callee={s} derived={?s} nta={d} dargs={d} darg0={s}\n", .{ @tagName(std.meta.activeTag(arg.Call.callee.*)), if (derived_opt) |d| d.name else null, arg.Call.type_args.len, if (derived_opt) |d| d.args.len else 0, if (derived_opt) |d| (if (d.args.len != 0) d.args[0].name else "-") else "-" });
+        const derived = derived_opt orelse return null;
         // A derived return whose arguments are still the callee's own
         // type parameters (`List<T>` for an un-inferred `listOf(...)`)
         // says nothing the head does not; the reified consumer must not
-        // carry a dangling `T`.
+        // carry a dangling `T`. An EXPLICIT type-argument list on the call
+        // instantiates them instead (`x.cast<IntBox>()` declared
+        // `KSerializer<T>` IS `KSerializer<IntBox>`).
         for (derived.args) |a| {
             var ah = std.mem.trimEnd(u8, a.name, "?");
             if (std.mem.indexOfScalar(u8, ah, '<')) |lt| ah = ah[0..lt];
-            if (ah.len == 0 or (ah.len <= 2 and isAllUpper(ah)) or b.isTypeParam(ah) or ir.parseClassTypeParamIdentity(ah) != null) return null;
+            const dangling = ah.len == 0 or (ah.len <= 2 and isAllUpper(ah)) or b.isTypeParam(ah) or ir.parseClassTypeParamIdentity(ah) != null;
+            // A star in the derived return (`KSerializer<*>` from a
+            // `KSerializer<*>.cast<X>()` receiver) is likewise only
+            // instantiated by the explicit list.
+            if (dangling or (std.mem.eql(u8, ah, "*") and arg.Call.type_args.len != 0)) {
+                if (arg.Call.type_args.len != 0) {
+                    explicit_needed = true;
+                    break;
+                }
+                return null;
+            }
         }
         break :blk derived;
     };
@@ -1898,11 +1933,27 @@ pub fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const Func
     // is nullable whether or not the flag rode along.
     const spelled_nullable = head.len != ty.name.len;
     const out = allocator.create(TypeRef) catch return null;
+    if (explicit_needed) {
+        if (explicitCallInstantiation(b, arg, head)) |full| {
+            out.* = full;
+            return out;
+        }
+        return null;
+    }
     // The recorded type keeps its arguments (`Collection<String>`): a
     // reified consumer (`typeOf<T>()` behind `serializer<T>()`) needs
     // them to materialise the KType's arguments.
     if (ty.args.len != 0) {
         if (expr_lower.astTypeRefFromIr(@constCast(b), ty, arg.span())) |full| {
+            out.* = full;
+            return out;
+        }
+    }
+    // An explicit type-argument list on the call instantiates the callee's
+    // generic return directly: `x.cast<IntBox>()` declared as
+    // `KSerializer<T>` IS `KSerializer<IntBox>`.
+    if (ty.args.len == 0 and arg.* == .Call and arg.Call.type_args.len != 0) {
+        if (explicitCallInstantiation(b, arg, head)) |full| {
             out.* = full;
             return out;
         }
@@ -1918,6 +1969,82 @@ pub fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const Func
         .qualified_path = null,
     };
     return out;
+}
+
+/// The callee's declared generic return instantiated by the call's
+/// explicit type arguments, when every same-named candidate that takes
+/// this many type arguments and returns `head` agrees on the shape.
+fn explicitCallInstantiation(b: *const FuncBuilder, arg: *const Expr, head: []const u8) ?TypeRef {
+    const call = arg.Call;
+    const cname: []const u8 = switch (call.callee.*) {
+        .Member => |m| m.name.name,
+        .Path => |p| p.segments[p.segments.len - 1].name,
+        else => return null,
+    };
+    const head_s = if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head[d + 1 ..] else head;
+    var found: ?TypeRef = null;
+    const tr = std.c.getenv("KLIO_UNIFY_TRACE") != null;
+    if (tr) std.debug.print("[eci] {s} head={s} cands={d} nta={d}\n", .{ cname, head, b.module.funcsBySimpleName(cname).len, call.type_args.len });
+    for (b.module.funcsBySimpleName(cname)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        const tp_opt = b.module.registry.func_type_params.get(fid);
+        if (tr) std.debug.print("[eci]   {s} tps={d} ret={s}<{d}>\n", .{ f.fqn, if (tp_opt) |l| l.items.len else 0, f.return_ty.name, f.return_ty.args.len });
+        const tp = tp_opt orelse continue;
+        if (tp.items.len != call.type_args.len) continue;
+        var rh = std.mem.trimEnd(u8, f.return_ty.name, "?");
+        if (std.mem.indexOfScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
+        const rh_s = if (std.mem.lastIndexOfScalar(u8, rh, '.')) |d| rh[d + 1 ..] else rh;
+        if (!std.mem.eql(u8, rh_s, head_s)) continue;
+        if (f.return_ty.args.len == 0) continue;
+        const targs = b.allocator.alloc(ast.TypeArg, f.return_ty.args.len) catch return null;
+        var ok = true;
+        for (f.return_ty.args, targs) |*ra, *ta| {
+            var rah = std.mem.trimEnd(u8, ra.name, "?");
+            if (std.mem.indexOfScalar(u8, rah, '<')) |lt| rah = rah[0..lt];
+            var pick: ?usize = null;
+            for (tp.items, 0..) |pn, pi| {
+                if (std.mem.eql(u8, pn, rah)) pick = pi;
+            }
+            const pi = pick orelse {
+                ok = false;
+                break;
+            };
+            const src = &call.type_args[pi];
+            if (src.name.name.len == 0 or b.isTypeParam(src.name.name)) {
+                ok = false;
+                break;
+            }
+            var t = src.*;
+            if (ra.nullable) t.nullable = true;
+            ta.* = .{ .variance = .Invariant, .is_star = false, .ty = t, .span = src.span };
+        }
+        if (!ok) {
+            b.allocator.free(targs);
+            continue;
+        }
+        const cand = TypeRef{
+            .name = .{ .name = head, .span = arg.span() },
+            .nullable = f.return_ty.nullable,
+            .span = arg.span(),
+            .type_args = targs,
+            .function = null,
+            .definitely_non_null = false,
+            .annotations = &.{},
+            .qualified_path = null,
+        };
+        if (found) |prev| {
+            // Same-shaped candidates (the pack's and a test's own
+            // `KSerializer<*>.cast()`) agree; a different shape is ambiguous.
+            if (prev.type_args.len != cand.type_args.len) return null;
+            for (prev.type_args, cand.type_args) |*pa, *ca| {
+                if (!std.mem.eql(u8, pa.ty.name.name, ca.ty.name.name) or pa.ty.nullable != ca.ty.nullable) return null;
+            }
+            b.allocator.free(targs);
+            continue;
+        }
+        found = cand;
+    }
+    return found;
 }
 
 fn isAllUpper(s: []const u8) bool {
@@ -2453,6 +2580,8 @@ fn astTypeMentionsFnTypeParam(ty: *const ast.TypeRef, f: *const ast.Function) bo
     return false;
 }
 
+pub var splice_route_tag: []const u8 = "?";
+
 pub fn tryInlineCallWithTypeArgs(
     b: *FuncBuilder,
     fname: []const u8,
@@ -2515,9 +2644,14 @@ pub fn tryInlineCallWithTypeArgs(
     // that does not extend JsonTestBase.
     if (target == null and f.receiver_type != null) {
         if (inline_state.inlineMemberOwner(f)) |owner| {
-            const enc = b.ownerClass() orelse return null;
+            const enc = b.ownerClass() orelse {
+                spliceBail(fname, "member-ext-owner-invisible (no enclosing class)");
+                return null;
+            };
             if (!expr_lower.classIsOrExtendsHosted(b, enc, owner)) {
-                spliceBail(fname, "member-ext-owner-invisible");
+                if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+                    if (std.mem.eql(u8, w, fname)) std.debug.print("[splice-why] {s}: member-ext-owner-invisible enc={s} owner={s}\n", .{ fname, enc, owner });
+                }
                 return null;
             }
         }
@@ -2550,7 +2684,7 @@ pub fn tryInlineCallWithTypeArgs(
     if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
         if (std.mem.eql(u8, w, fname)) {
             const site: ?u32 = if (this_arg) |r| helpers.exprSpan(r).start else null;
-            std.debug.print("[splice] {s} entered, params={d} decl={}:{} site={?}\n", .{ fname, f.params.len, f.name.span.file, f.name.span.start, site });
+            std.debug.print("[splice] {s} entered, params={d} decl={}:{} site={?} nta={d} route={s}\n", .{ fname, f.params.len, f.name.span.file, f.name.span.start, site, type_args.len, splice_route_tag });
         }
     }
     // Materialise the body if it is a deferred image marker before reading it.

@@ -81,6 +81,7 @@ wave1_steps=(
 )
 wave2_steps=(
   itest-datetime_commontest itest-serialization_commontest
+  itest-serialization_json_commontest
   itest-atomicfu_commontest itest-check_examples
 )
 s=$(date +%s)

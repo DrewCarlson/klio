@@ -944,6 +944,12 @@ pub const FuncBuilder = struct {
     /// Both borrow from the active call emitter.
     pending_ref_lambda_param_types: ?[]const TypeRef = null,
     pending_arg_lambda_param_types: ?[]const ?[]const TypeRef = null,
+    /// Per-call mask of lambda-literal arguments bound to a `-> Unit`
+    /// function parameter, and the entry selected for the argument
+    /// currently lowering. The mask is owned by the builder allocator and
+    /// freed by the argument-run consumer.
+    pending_arg_lambda_unit: ?[]bool = null,
+    pending_ref_lambda_unit: bool = false,
 
     /// See `setHasOwnTypeParams`.
     has_own_type_params: bool = false,

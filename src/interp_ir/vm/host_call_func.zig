@@ -410,6 +410,10 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
             }
         }
     }
+    // A `$lc<fn>`-mangled LOCAL class head is how lowering refers to a local
+    // class; the runtime class is registered under the simple declared name,
+    // which the KType (and the serializer lookup it feeds) needs.
+    if (std.mem.indexOf(u8, head, "$lc")) |lci| head = head[0..lci];
     // A bare TYPE-VARIABLE head (`typeOf<T>()` reached through an
     // unspliced reified body) resolves through the call's bound type-param
     // global — the class the enclosing call bound `T` to — never as a

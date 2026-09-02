@@ -113,8 +113,17 @@ root = "upstream/core/commonTest"
 root = "klioTest"
 
 # Upstream's JSON test suite (formats/json-tests), gated on the `json`
-# feature. Its streaming modes ride the klioTest/json stand-ins for the
-# okio / kotlinx-io buffer types the pack does not ship.
+# feature. Its streaming modes run upstream's json-okio / json-io adapter
+# modules unchanged over the klioTest/json stand-ins for the okio and
+# kotlinx-io buffer types the pack does not ship.
+[[test]]
+root = "upstream/formats/json-okio/commonMain/src"
+feature = "json"
+
+[[test]]
+root = "upstream/formats/json-io/commonMain/src"
+feature = "json"
+
 [[test]]
 root = "upstream/formats/json-tests/commonTest/src"
 feature = "json"

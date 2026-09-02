@@ -1100,6 +1100,17 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                     if (published) |v| {
                         if (v == .Instance) return v;
                     }
+                    // The companion is not published yet: the bound class
+                    // itself is the value (member dispatch on it reaches the
+                    // companion), never a same-named global of another
+                    // package.
+                    const again: ?ObjRef(ClassDef) = blk: {
+                        const cg = self.classes.borrow();
+                        defer cg.deinit();
+                        if (cg.get().get(f)) |d| break :blk d.clone();
+                        break :blk null;
+                    };
+                    if (again) |d| return .{ .Class = d };
                     return null;
                 }
                 return .{ .Class = def };

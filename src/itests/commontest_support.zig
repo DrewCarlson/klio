@@ -485,13 +485,15 @@ pub const suites = [_]Config{
         .extra_support = &.{
             "kotlin-klio/klio-kotlinx-serialization/klioTest/kotlinx/serialization/test/CurrentPlatform.kt",
             "kotlin-klio/klio-kotlinx-serialization/klioTest/json/StreamSupport.kt",
-            "kotlin-klio/klio-kotlinx-serialization/klioTest/json/OkioAdapters.kt",
             "kotlin-klio/klio-kotlinx-serialization/klioTest/json/KxioSupport.kt",
-            "kotlin-klio/klio-kotlinx-serialization/klioTest/json/KxioAdapters.kt",
+            "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-okio/commonMain/src/kotlinx/serialization/json/okio/OkioStreams.kt",
+            "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-okio/commonMain/src/kotlinx/serialization/json/okio/internal/OkioJsonStreams.kt",
+            "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-io/commonMain/src/kotlinx/serialization/json/io/IoStreams.kt",
+            "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-io/commonMain/src/kotlinx/serialization/json/io/internal/IoJsonStreams.kt",
         },
         .extra_args = &.{ "--feature", "kotlinx.serialization/json" },
         .timeout_ms = 120_000,
-        .baseline = 0,
+        .baseline = 640,
         .max_failed = null,
         .max_incomplete = null,
     },
@@ -546,6 +548,43 @@ pub const suites = [_]Config{
         .baseline = 450,
         .max_failed = 0,
         .max_incomplete = 2,
+    },
+    .{
+        // The compose ui modules' upstream conformance suites (commonTest of
+        // ui-util / ui-geometry / ui-unit / ui-graphics / ui-text / ui) run
+        // against the installed ui packs. Kruth's assertion surface is a
+        // klio-authored stand-in under tests/compose_ui_commontest_actuals.
+        // First count 2026-09-02: see plans/compose-ui-census-campaign.md.
+        .name = "compose_ui",
+        .test_roots = &.{
+            "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui-util/src/commonTest/kotlin",
+            "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui-geometry/src/commonTest/kotlin",
+            "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui-unit/src/commonTest/kotlin",
+            "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui-graphics/src/commonTest/kotlin",
+            "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui-text/src/commonTest/kotlin",
+            "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui/src/commonTest/kotlin",
+        },
+        .scratch_home = "/tmp/klio_itest_compose_ui_home",
+        .packs = &.{
+            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-androidx-collection", .artifact = "target/packs/androidx.collection.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-compose-runtime-engine", .artifact = "target/packs/androidx.compose.runtime.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-compose-ui-util", .artifact = "target/packs/androidx.compose.ui.util.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-compose-ui-geometry", .artifact = "target/packs/androidx.compose.ui.geometry.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-compose-ui-unit", .artifact = "target/packs/androidx.compose.ui.unit.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-compose-ui-graphics", .artifact = "target/packs/androidx.compose.ui.graphics.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-compose-ui-text", .artifact = "target/packs/androidx.compose.ui.text.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-compose-ui-core", .artifact = "target/packs/androidx.compose.ui.klio-pack" },
+        },
+        .extra_support = &.{
+            "tests/compose_ui_commontest_actuals/androidx/kruth/Kruth.kt",
+        },
+        .timeout_ms = 120_000,
+        .baseline = 0,
+        .max_failed = null,
+        .max_incomplete = null,
     },
 };
 

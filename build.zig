@@ -283,6 +283,21 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
     }, .weight = 90 },
+    .{ .name = "compose_ui_commontest", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-compose-runtime",
+        "kotlin-klio/klio-compose-runtime-engine",
+        "kotlin-klio/klio-compose-ui-util",
+        "kotlin-klio/klio-compose-ui-geometry",
+        "kotlin-klio/klio-compose-ui-unit",
+        "kotlin-klio/klio-compose-ui-graphics",
+        "kotlin-klio/klio-compose-ui-text",
+        "kotlin-klio/klio-compose-ui-core",
+        "kotlin-klio/klio-androidx-collection",
+        "kotlin-klio/klio-kotlinx-coroutines",
+        "kotlin-klio/klio-kotlinx-atomicfu",
+        "kotlin-klio/klio-kotlin-test",
+        "tests/compose_ui_commontest_actuals",
+    }, .weight = 60 },
 };
 
 /// Read by every parity-pipeline run: the stdlib pack is built at runtime from

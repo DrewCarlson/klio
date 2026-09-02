@@ -2031,6 +2031,10 @@ pub const Module = struct {
     /// `block?.invoke(c, 1) ?: error("Invalid restart scope")` elvis fired.
     /// Not serialized.
     pending_lambda_fn_block_body: bool = false,
+    /// The pending lambda literal binds a `(...) -> Unit` parameter: its
+    /// tail expression is evaluated for effect and the lambda returns Unit.
+    /// Consumed on entry to the lambda body so it never leaks inward.
+    pending_lambda_unit: bool = false,
     /// Non-reified type-parameter names in scope at the lambda body about to
     /// lower, carried into that body so an `x as T` cast inside the lambda is
     /// still erased (`forEachScopeOf(v) { scope -> scope as Scope }` inside a
