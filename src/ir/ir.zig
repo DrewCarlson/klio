@@ -4608,6 +4608,25 @@ pub const Module = struct {
                 return self.staticGenericArgCompatibility(fid, ty, param, 0);
             }
             if (typeContainsBoundParam(ty, actual_bounds)) {
+                // An UNBOUNDED type variable of the caller (`value: T` with
+                // bound `Any`) is only an `Any`: it never binds a concrete
+                // class parameter (`mode: Mode`), exactly as kotlinc rejects
+                // it. A bounded one is judged through its bound below.
+                if (ty.args.len == 0) {
+                    const ah0 = staticTypeHead(std.mem.trimEnd(u8, ty.name, "?"));
+                    for (actual_bounds) |ab| {
+                        if (!std.mem.eql(u8, ab.param, ah0)) continue;
+                        const bound_any = std.mem.eql(u8, applicability.simpleName(staticTypeHead(ab.bound)), "Any");
+                        if (bound_any and !std.mem.eql(u8, applicability.simpleName(declared), "Any") and
+                            self.staticTypeClassId(param) != null and
+                            self.funcTypeParamIndex(fid, declared) == null and !self.staticDeclTypeParam(fid, param))
+                        {
+                            sac_route = "unbounded-tv-vs-class";
+                            return .incompatible;
+                        }
+                        break;
+                    }
+                }
                 if (self.staticTypeIsSubtypeWithBounds(
                     self.registry.allocator,
                     ty,
@@ -6061,6 +6080,20 @@ pub const Module = struct {
             }
             if (ctx.private_only and ds.visibility != .Private) continue;
             const f = self.funcById(fid) orelse continue;
+            // A bodyless member header that lists no value parameters yet
+            // (an interface member such as `Map.get(key)` before its body
+            // lowers) is judged by its DECLARED arity: an applicable member
+            // outranks any same-named extension, and treating it as
+            // inapplicable let `Map<out K, V>.get` bind `map[key]` and call
+            // itself from its own body.
+            if (f.params.len <= 1 and ds.arity.total != 0 and (!f.hasBody() or f.params.len < ds.arity.total + 1)) {
+                if (args.len >= ds.arity.required and (args.len <= ds.arity.total or ds.arity.has_vararg)) {
+                    any_applicable = true;
+                    unknown = fid;
+                    unknown_count += 1;
+                }
+                continue;
+            }
             const sig = applicability.SigView{
                 .params = f.params,
                 // Member resolution may bind an abstract declaration to a
@@ -9623,6 +9656,29 @@ pub const Module = struct {
                 if (self.memberExtOutOfScope(id, ctx.owner_class)) continue;
                 if (ctx.receiver_known and
                     !self.extReceiverPlausible(id, f, ctx.owner_class)) continue;
+                // The enclosing extension body's own receiver head is
+                // evidence too: `get(index)` inside `Iterable<T>.elementAt`
+                // never binds `Map<out K, V>.get`, whatever the owner class.
+                if (kind == .top_level_extension) {
+                    if (ctx.recv_ty) |rt0| {
+                        var rh = applicability.simpleName(std.mem.trimEnd(u8, rt0, "?"));
+                        if (std.mem.indexOfScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
+                        var plausible = self.extReceiverPlausible(id, f, rh);
+                        if (!plausible and ctx.owner_class != null) plausible = self.extReceiverPlausible(id, f, ctx.owner_class);
+                        if (!plausible) {
+                            for (ctx.tower) |entry| {
+                                if (self.extReceiverPlausible(id, f, entry.head)) {
+                                    plausible = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!plausible) {
+                            if (drop_trace) std.debug.print("[drop] {s}#{d} ext-recv-implausible-body\n", .{ name, id.int() });
+                            continue;
+                        }
+                    }
+                }
                 // Inside a receiver LAMBDA the receiver types are not "known"
                 // in the plain-method-body sense, so the check above is
                 // skipped and an extension on an unrelated type can win over
@@ -9842,7 +9898,15 @@ pub const Module = struct {
     /// its default `.plain`; resolution must trust the canonical declaration
     /// record so extension headers never enter a receiverless global set.
     fn declarationKind(self: *const Module, id: FuncId, f: *const Func) FuncKind {
-        if (self.decl_sigs.get(id.int())) |ds| return ds.kind;
+        if (self.decl_sigs.get(id.int())) |ds| {
+            // A header stub registered plain but declaring a receiver
+            // (`Map<out K, V>.get(key)` before its body lowers) is an
+            // extension: judged receiver-formed, never as a bare
+            // function of its value parameters.
+            if (ds.kind == .plain and ds.receiver_ty != null) return .top_level_extension;
+            return ds.kind;
+        }
+        if (f.kind == .plain and f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) return .top_level_extension;
         return f.kind;
     }
 

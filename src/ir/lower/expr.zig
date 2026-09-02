@@ -1723,8 +1723,15 @@ fn enclosingMemberShadowsClass(b: *const FuncBuilder, name: []const u8) bool {
 /// (`Json.encodeToString(value, mode)` never takes one argument). Unknown
 /// stays applicable, as the mask's own default does.
 fn enclosingMemberTakes(b: *const FuncBuilder, name: []const u8, nargs: usize) bool {
-    if (b.own_member_arity.get(name) != null) return b.ownMemberApplicable(name, nargs);
-    const owner = b.ownerClass() orelse return true;
+    const tr = if (runtime.envOnce("KLIO_INLINE_PICK")) |w| std.mem.eql(u8, w, name) else false;
+    if (b.own_member_arity.get(name) != null) {
+        if (tr) std.debug.print("[emt] {s} mask -> {}\n", .{ name, b.ownMemberApplicable(name, nargs) });
+        return b.ownMemberApplicable(name, nargs);
+    }
+    const owner = b.ownerClass() orelse {
+        if (tr) std.debug.print("[emt] {s} no owner -> true\n", .{name});
+        return true;
+    };
     var found_any = false;
     for (b.module.funcsBySimpleName(name)) |fid| {
         const f = b.module.funcById(fid) orelse continue;
@@ -1740,8 +1747,12 @@ fn enclosingMemberTakes(b: *const FuncBuilder, name: []const u8, nargs: usize) b
             total += 1;
             if (!p.has_default) required += 1;
         }
-        if (nargs >= required and nargs <= total) return true;
+        if (nargs >= required and nargs <= total) {
+            if (tr) std.debug.print("[emt] {s} owner={s} sig {s} takes {d}\n", .{ name, owner, f.fqn, nargs });
+            return true;
+        }
     }
+    if (tr) std.debug.print("[emt] {s} owner={s} found_any={} -> {}\n", .{ name, owner, found_any, !found_any });
     return !found_any;
 }
 
@@ -23977,6 +23988,11 @@ fn receiverStaticMemberApplies(b: *FuncBuilder, receiver: *const Expr, name: []c
         .actual_type_param_bounds = &.{},
         .receiver_type = null,
     });
+    if (runtime.envOnce("KLIO_SAM_TRACE") != null) {
+        std.debug.print("[rsma] {s} head={s} applicable={} shapes:", .{ name, h, res.applicable });
+        for (shapes[0..argc]) |*sh| std.debug.print(" {s}", .{if (sh.ty) |t| t.name else "?"});
+        std.debug.print("\n", .{});
+    }
     return res.applicable;
 }
 
