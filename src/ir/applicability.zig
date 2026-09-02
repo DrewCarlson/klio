@@ -645,6 +645,24 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
         if (shape_callable) break :blk "$callable$";
         if (arg.ty) |aty| {
             if (tyEvidenceScore(nm, aty.name, member)) |s| return s;
+            // An argument typed by a bare TYPE VARIABLE of the enclosing
+            // declaration (`value: T`) is only an `Any`: it never binds a
+            // concrete class parameter (`mode: Mode`), so the candidate is
+            // out. A type-variable parameter, `Any`, or a function shape
+            // still accepts it.
+            {
+                const ah = evidenceHead(aty.name);
+                const ph = evidenceHead(nm);
+                const arg_is_tv = ah.len != 0 and ah.len <= 2 and std.ascii.isUpper(ah[0]) and
+                    (ah.len == 1 or std.ascii.isDigit(ah[1]) or std.ascii.isUpper(ah[1]));
+                const param_is_tv = ph.len != 0 and ph.len <= 2 and std.ascii.isUpper(ph[0]);
+                if (arg_is_tv and !param_is_tv and ph.len != 0 and !std.mem.eql(u8, ph, "Any") and
+                    !std.mem.startsWith(u8, ph, "Function") and !isFunctionTypeRef(param_ty) and
+                    std.mem.indexOfScalar(u8, nm, '<') == null)
+                {
+                    return null;
+                }
+            }
             // Hierarchy evidence: a declared head that is a SUBTYPE of the
             // parameter head proves the candidate the same way a matching
             // head does (`calculateNodeKindSetFrom(this)` inside

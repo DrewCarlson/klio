@@ -161,7 +161,11 @@ pub fn gateReceiverHead(b: *const FuncBuilder, receiver: *const Expr) Allocator.
             // An enclosing class's member property (`jsonNoAltNames.
             // decodeFromString(...)` inside the test class) types the
             // receiver through the owner's property heads.
-            if (expr_lower.staticBareReceiverType(b, name)) |h| return h;
+            const sb = expr_lower.staticBareReceiverType(b, name);
+            if (inline_state.runtime.envOnce("KLIO_EXT_TRACE")) |w| {
+                if (std.mem.eql(u8, w, name)) std.debug.print("[gate] {s}: local={} outer={} sbrt={?s}\n", .{ name, b.resolve(name) != null, b.knowsOuter(name), sb });
+            }
+            if (sb) |h| return h;
             return null;
         },
         .Member => |m| {
@@ -2488,13 +2492,17 @@ pub fn tryInlineCallWithTypeArgs(
         for (args[0..positional_n], 0..) |*a, i| {
             const nm: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
             if (nm) |name| {
-                const idx = paramIndex(f, name) orelse return null;
+                const idx = paramIndex(f, name) orelse {
+                    spliceBail(fname, "named-param-miss");
+                    return null;
+                };
                 ordered[idx] = a;
             } else {
                 while (next_pos < ordered.len and ordered[next_pos] != null) {
                     next_pos += 1;
                 }
                 if (next_pos >= ordered.len) {
+                    spliceBail(fname, "positional-overflow");
                     return null;
                 }
                 ordered[next_pos] = a;

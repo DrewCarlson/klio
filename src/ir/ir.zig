@@ -8683,6 +8683,17 @@ pub const Module = struct {
         return f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
     }
 
+    /// `funcHasImplicitThis` for a candidate whose header stub carries no
+    /// parameters yet (a pack's deferred inline extension): the declaration
+    /// signature's receiver says it takes an implicit `this`.
+    fn candidateHasImplicitThis(self: *const Module, id: FuncId, f: *const Func) bool {
+        if (funcHasImplicitThis(f)) return true;
+        // A header stub may list only the value parameters; its declared
+        // receiver still makes it an extension, never a plain function.
+        const ds = self.decl_sigs.get(id.int()) orelse return false;
+        return ds.receiver_ty != null;
+    }
+
     /// The applicability `SigView` for a candidate at LOWERING time
     /// (distinct from the module-internal `SigView` above, which the
     /// index uses only for the `sameUserSig` identity check). Strips a
@@ -9045,7 +9056,7 @@ pub const Module = struct {
         candidate_it = self.bareCallCandidateIterator(name, caller_file);
         while (candidate_it.next()) |id| {
             const f = self.funcById(id) orelse continue;
-            if (funcHasImplicitThis(f)) continue;
+            if (self.candidateHasImplicitThis(id, f)) continue;
             if (self.bareCallTier(f, name, caller_pkg, caller_file) != best_tier) continue;
             const is_stub = !f.hasBody();
             // The stub and body gates accept the same positional/default
@@ -9658,17 +9669,18 @@ pub const Module = struct {
                 if (drop_trace) std.debug.print("[drop] {s}#{d} inapplicable-shape\n", .{ name, id.int() });
                 continue;
             };
-            if (drop_trace) std.debug.print("[keep] {s}#{d} params={d} args={d} recv_formed={} defaults0={}\n", .{ name, id.int(), sig.params.len, args.len, receiver_formed, if (sig.params.len != 0) sig.params[sig.params.len - 1].has_default else false });
-            const static_compatibility = if (receiver_formed)
-                StaticCompatibility.unknown
-            else
-                self.staticBareArgsCompatibility(
-                    id,
-                    sig,
-                    args,
-                    score,
-                    ctx.actual_type_param_bounds,
-                );
+            if (drop_trace) std.debug.print("[keep] {s}#{d} params={d} args={d} recv_formed={} at={?d}\n", .{ name, id.int(), sig.params.len, args.len, receiver_formed, if (applicability.trace_call_span) |sp| sp.start else null });
+            // Declared-type evidence disproves a receiver-formed candidate
+            // exactly as a plain one: `decodeFromString(serializer, s)`
+            // with `s: String` never binds the enclosing `(s: String, mode:
+            // Mode)` member extension.
+            const static_compatibility = self.staticBareArgsCompatibility(
+                id,
+                sig,
+                args,
+                score,
+                ctx.actual_type_param_bounds,
+            );
             if (static_compatibility == .incompatible) {
                 if (drop_trace) std.debug.print("[drop] {s}#{d} static-incompatible\n", .{ name, id.int() });
                 continue;
@@ -10017,6 +10029,9 @@ pub const Module = struct {
                     .actual_type_param_bounds = ctx.actual_type_param_bounds,
                 });
                 receiver_extension_applicable = ext.applicable;
+                if (dropTraceEnv()) |w| {
+                    if (std.mem.eql(u8, w, name)) std.debug.print("[rcc] {s} ext.target={?d} applicable={} args={d}\n", .{ name, if (ext.target) |t| t.int() else null, ext.applicable, args.len });
+                }
                 if (ext.target) |id| {
                     target = id;
                     receiver_matched = true;
@@ -10560,7 +10575,7 @@ pub const Module = struct {
         var candidate_it = self.bareCallCandidateIterator(name, caller_file);
         while (candidate_it.next()) |id| {
             const f = self.funcById(id) orelse continue;
-            if (funcHasImplicitThis(f)) continue;
+            if (self.candidateHasImplicitThis(id, f)) continue;
             if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
             const t = self.bareCallTier(f, name, caller_pkg, caller_file);
             if (t < best_tier) best_tier = t;
@@ -10571,7 +10586,7 @@ pub const Module = struct {
         candidate_it = self.bareCallCandidateIterator(name, caller_file);
         while (candidate_it.next()) |id| {
             const f = self.funcById(id) orelse continue;
-            if (funcHasImplicitThis(f)) continue;
+            if (self.candidateHasImplicitThis(id, f)) continue;
             if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
             if (self.bareCallTier(f, name, caller_pkg, caller_file) != best_tier) continue;
             if (chosen == null) chosen = id;
@@ -10633,7 +10648,7 @@ pub const Module = struct {
         var candidate_it = self.bareCallCandidateIterator(name, caller_file);
         while (candidate_it.next()) |id| {
             const f = self.funcById(id) orelse continue;
-            if (funcHasImplicitThis(f)) continue;
+            if (self.candidateHasImplicitThis(id, f)) continue;
             if (!f.hasBody() and self.stubDeclArity(id) == null) continue;
             const t = self.bareCallTier(f, name, caller_pkg, caller_file);
             if (t < best_tier) best_tier = t;

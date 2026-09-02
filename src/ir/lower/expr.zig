@@ -6267,7 +6267,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // member — splicing the reified two-parameter respond EXTENSION
         // here committed the message into its HttpStatusCode parameter.
         if (inline_call.argsBindAllReified(b.allocator, callee.Member.name.name, args, b)) {
-            break :gate !(try receiverStaticMemberApplies(b, callee.Member.receiver, callee.Member.name.name, args.len, callee.Member.name.span.file));
+            break :gate !(try receiverStaticMemberApplies(b, callee.Member.receiver, callee.Member.name.name, args, ast_arg_names, callee.Member.name.span.file));
         }
         const recv = callee.Member.receiver;
         if (recv.* != .Path or recv.Path.segments.len != 1) break :gate false;
@@ -9253,9 +9253,11 @@ fn inlineTargetForBareCall(
                         // the dynamic path (where the reified `T` of Json's
                         // member reads a stale binding).
                         if (!replaced and b.hasEnclosingMember(nm) and
-                            (!b.hasOwnMember(nm) or
-                                (enclosingMemberTakes(b, nm, args.len) and !ownMemberRejectsLambdas(b, nm, args))))
+                            enclosingMemberTakes(b, nm, args.len) and !ownMemberRejectsLambdas(b, nm, args))
+                        {
+                            if (runtime.envOnce("KLIO_INLINE_PICK")) |w| { if (std.mem.eql(u8, w, nm)) std.debug.print("[ipick-why] {s} decline at L229\n", .{nm}); }
                             return null;
+                        }
                     }
                 }
             }
@@ -9308,6 +9310,7 @@ fn inlineTargetForBareCall(
         if (inline_takes_fn and lastArgIsObjectNotFunction(b, args) and
             b.resolve(nm) == null and b.hasOwnMember(nm))
         {
+            if (runtime.envOnce("KLIO_INLINE_PICK")) |w| { if (std.mem.eql(u8, w, nm)) std.debug.print("[ipick-why] {s} decline at L282\n", .{nm}); }
             return null;
         }
     }
@@ -9334,6 +9337,9 @@ fn inlineTargetForBareCall(
             }
             // No sibling fits either: decline the splice entirely so the
             // dynamic call path resolves on runtime values.
+            if (runtime.envOnce("KLIO_INLINE_PICK")) |w| {
+                if (std.mem.eql(u8, w, nm)) std.debug.print("[ipick-why] {s} evidence re-pick better={}\n", .{ nm, better != null });
+            }
             pick = better;
         }
     }
@@ -9379,6 +9385,7 @@ fn inlineTargetForBareCall(
         {
             if (runtime.envOnce("KLIO_ABSVETO_TRACE") != null)
                 std.debug.print("[absveto] {s} argc={d} in={s}\n", .{ nm, args.len, build.currentRealFn() orelse "-" });
+            if (runtime.envOnce("KLIO_INLINE_PICK")) |w| { if (std.mem.eql(u8, w, nm)) std.debug.print("[ipick-why] {s} decline at L353\n", .{nm}); }
             return null;
         }
     }
@@ -14332,7 +14339,7 @@ fn lowerPathCall(
                     @intFromEnum(segments[0].span.file),
                     segments[0].span.start,
                 });
-                std.debug.print("[bare-res] {s} tier={d} reason={?s} final={} tier_count={d}\n", .{ name0, res_final.tier, if (res_final.reason) |r| @tagName(r) else null, res_final.target_final, res_final.tier_count });
+                std.debug.print("[bare-res] {s} tier={d} reason={?s} final={} tier_count={d} index={s} lazy={?d}\n", .{ name0, res_final.tier, if (res_final.reason) |r| @tagName(r) else null, res_final.target_final, res_final.tier_count, @tagName(index_res.outcome), if (res.target) |t| t.int() else null });
             }
         }
         if (!shadowed_by_class) {
@@ -23929,7 +23936,7 @@ test "a member reference on a scope-renamed nested class loads the lifted name" 
 /// member of `name` applicable at `argc` unnamed arguments. kotlinc
 /// resolves members before extensions, so an applicable member blocks the
 /// inference-opened reified-extension splice.
-fn receiverStaticMemberApplies(b: *FuncBuilder, receiver: *const Expr, name: []const u8, argc: usize, caller_file: span.FileId) Allocator.Error!bool {
+fn receiverStaticMemberApplies(b: *FuncBuilder, receiver: *const Expr, name: []const u8, args: []const Expr, arg_names: []const ?[]const u8, caller_file: span.FileId) Allocator.Error!bool {
     const head = (try inline_call.gateReceiverHead(b, receiver)) orelse return false;
     var h = std.mem.trimEnd(u8, head, "?");
     if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
@@ -23938,8 +23945,14 @@ fn receiverStaticMemberApplies(b: *FuncBuilder, receiver: *const Expr, name: []c
         b.module.classIdByFqn(h)
     else
         b.module.uniqueClassIdBySimpleName(h)) orelse return false;
+    const argc = args.len;
     if (argc > 8) return false;
-    var shapes: [8]applicability.ArgShape = @splat(.{ .ty_authoritative = false });
+    // The arguments' declared-type evidence decides, not arity alone:
+    // `Json.encodeToString(P(1), mode)` never binds Json's
+    // `(serializer, value)` member, so the reified member extension is
+    // the target and must splice.
+    const shapes = try buildArgShapes(b, args, arg_names);
+    defer b.allocator.free(shapes);
     const res = b.module.resolveMemberCall(cid, name, shapes[0..argc], .{
         .caller_file = caller_file,
         .lexical_owner = null,
