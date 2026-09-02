@@ -2226,8 +2226,11 @@ fn renderReifiedTypeName(b: *FuncBuilder, head: []const u8, a: *const ast.TypeRe
             try out.append(b.allocator, '*');
             continue;
         }
+        // The CALLER's lexical owner renames a nested argument head
+        // (`ThirdPartyBox<Item>` inside the class declaring `Item`): the
+        // callee frame is pushed by the time the bindings render.
         const inner_head = b.resolveReifiedTypeName(ta.ty.name.name) orelse
-            (expr_lower.scopeTypeRename(b, ta.ty.name.name, ta.ty.name.span.file.int()) orelse ta.ty.name.name);
+            (expr_lower.scopeTypeRenameFrom(b, splice_lexical_owner orelse b.ownerClass(), ta.ty.name.name, ta.ty.name.span.file.int()) orelse ta.ty.name.name);
         const rendered = try renderReifiedTypeName(b, inner_head, &ta.ty);
         try out.appendSlice(b.allocator, rendered);
     }

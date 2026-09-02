@@ -1199,6 +1199,22 @@ fn genObjectFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, info
 
 fn genWithFactory(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, info: *const Info) Allocator.Error!void {
     const gn = try genName(a, info.path);
+    if (g.type_params.len != 0) {
+        // A generic class's custom serializer takes the type-argument
+        // serializers, so the factory is a function of them (no cache).
+        var tps: std.ArrayList(u8) = .empty;
+        var params: std.ArrayList(u8) = .empty;
+        for (g.type_params, 0..) |tp, i| {
+            if (i != 0) {
+                try tps.appendSlice(a, ", ");
+                try params.appendSlice(a, ", ");
+            }
+            try tps.appendSlice(a, tp);
+            try wp(&params, a, "typeSerial{d}: KSerializer<{s}>", .{ i, tp });
+        }
+        try wp(w, a, "fun <{s}> `{s}Impl`({s}): KSerializer<{s}<{s}>> = {s}\n\n", .{ tps.items, gn, params.items, info.path, tps.items, try g.customSerializerRef(info.with.?) });
+        return;
+    }
     try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ {s} }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, try g.customSerializerRef(info.with.?), gn, info.path, gn });
 }
 
@@ -1241,7 +1257,13 @@ fn genMemberSplice(a: Allocator, c: ?*const ast.Class, info: *const Info) Alloca
         },
         .value_class => try wp(&out, a, "fun serializer(): KSerializer<{s}> = `{s}`", .{ info.path, gn }),
         else => {
-            if (c != null and c.?.type_params.len != 0) {
+            if (c != null and c.?.type_params.len != 0 and info.with != null) {
+                // A generic class's custom serializer receives the
+                // type-argument serializers.
+                try wp(&out, a, "fun {s} serializer({s}): KSerializer<{s}{s}> = `{s}Impl`({s})", .{
+                    try typeParamList(a, c.?), try typeSerialParams(a, c.?), info.path, try typeParamList(a, c.?), gn, try typeSerialArgs(a, c.?),
+                });
+            } else if (c != null and c.?.type_params.len != 0) {
                 // A generic sealed/polymorphic/enum declaration still takes the
                 // type-argument serializers (and ignores them), exactly as
                 // the plugin's companion does.

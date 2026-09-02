@@ -5850,6 +5850,15 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (solveSiblingExpected(b, expr.Call.callee, expr.Call.args)) |solved| {
         b.sib_expected_site = @ptrCast(solved.site);
         b.sib_expected_ty = solved.ty;
+        if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null)
+            std.debug.print("[sibexp] solved ty={s} site={x}\n", .{ solved.ty.name.name, @intFromPtr(solved.site) & 0xffff });
+    } else if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null and expr.Call.args.len >= 2) {
+        const cn: []const u8 = switch (expr.Call.callee.*) {
+            .Path => |p| p.segments[p.segments.len - 1].name,
+            .Member => |m| m.name.name,
+            else => "?",
+        };
+        std.debug.print("[sibexp] none for `{s}` with {d} args\n", .{ cn, expr.Call.args.len });
     }
     defer {
         b.sib_expected_site = sib_prev_site;
@@ -16163,14 +16172,20 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
                     }
                 }
             }
-            if (!reified) continue;
+            if (!reified) {
+                if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) std.debug.print("[sibexp-why] nested `{s}` not reified-inline\n", .{nested_name});
+                continue;
+            }
             for (args, 0..) |*sib, k| {
                 if (k == j) continue;
                 const pk = recv_off + k;
                 if (pk >= f.params.len) continue;
                 if (!std.mem.eql(u8, f.params[pk].ty.name, tv)) continue;
                 const st = inline_call.ctorArgTypeRef(b.allocator, sib, b) orelse
-                    inline_call.staticArgTypeRef(b.allocator, sib, b) orelse continue;
+                    inline_call.staticArgTypeRef(b.allocator, sib, b) orelse {
+                    if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) std.debug.print("[sibexp-why] sibling #{d} of `{s}` has no static type (tag={s})\n", .{ k, name, @tagName(std.meta.activeTag(sib.*)) });
+                    continue;
+                };
                 return .{ .site = arg, .ty = st.* };
             }
             continue;
