@@ -1653,11 +1653,37 @@ fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilde
     const head = path.segments[path.segments.len - 1];
     if (head.name.len == 0 or !std.ascii.isUpper(head.name[0])) return null;
     const b = bb orelse return null;
-    if (b.module.classId(head.name) == null and
-        b.module.classIdIndexed(head.name, b.self_package, head.span.file) == null) return null;
-    const targs = allocator.alloc(ast.TypeArg, call.type_args.len) catch return null;
+    const cid: ?ir.ClassId = b.module.classIdIndexed(head.name, b.self_package, head.span.file) orelse b.module.classId(head.name);
+    if (cid == null) return null;
+    var targs = allocator.alloc(ast.TypeArg, call.type_args.len) catch return null;
     for (call.type_args, 0..) |ta, i| {
         targs[i] = .{ .variance = .Invariant, .is_star = false, .ty = ta, .span = ta.span };
+    }
+    // A GENERIC class constructed without explicit type arguments infers
+    // them from the constructor arguments, as kotlinc does: `Box(1)` is a
+    // `Box<Int>` (each class type parameter binds through the first
+    // primary-constructor parameter declared as that bare variable whose
+    // argument has a statically known type).
+    if (call.type_args.len == 0) infer: {
+        const cls = if (cid.?.int() < b.module.classes.items.len) &b.module.classes.items[cid.?.int()] else break :infer;
+        if (cls.type_params.len == 0) break :infer;
+        const inferred = allocator.alloc(ast.TypeArg, cls.type_params.len) catch break :infer;
+        var all = true;
+        for (cls.type_params, 0..) |tp, ti| {
+            var solved: ?*const TypeRef = null;
+            for (cls.primary_params, 0..) |*pp, pi| {
+                if (pi >= call.args.len) break;
+                if (!std.mem.eql(u8, pp.ty.name, tp)) continue;
+                solved = staticArgTypeRef(allocator, &call.args[pi], bb) orelse ctorArgTypeRef(allocator, &call.args[pi], bb);
+                if (solved != null) break;
+            }
+            const st = solved orelse {
+                all = false;
+                break;
+            };
+            inferred[ti] = .{ .variance = .Invariant, .is_star = false, .ty = st.*, .span = st.span };
+        }
+        if (all) targs = inferred;
     }
     const out = allocator.create(TypeRef) catch return null;
     out.* = .{
@@ -3295,11 +3321,15 @@ pub fn tryInlineCallWithTypeArgs(
                 // reified `() -> Unit` reifies as `Function0`, not a distinct
                 // class). Bind it to `Any` so the reified use (array creation,
                 // membership) resolves rather than loading an unresolved global.
+                // The bound CLASS is the head: a generic spelling carried in
+                // the name (`Box<Int>`, from an enclosing binding or ctor-arg
+                // inference) loads `Box`.
+                const bare_head = if (std.mem.indexOfScalar(u8, a.name.name, '<')) |lt| a.name.name[0..lt] else a.name.name;
                 const resolved_name = if (a.function != null)
                     "Any"
                 else
                     reifiedQualifiedName(b, a) orelse
-                        (expr_lower.scopeTypeRenameFrom(b, lexical_owner, a.name.name, a.name.span.file.int()) orelse a.name.name);
+                        (expr_lower.scopeTypeRenameFrom(b, lexical_owner, bare_head, a.name.span.file.int()) orelse bare_head);
                 const arg_name = try b.module.internConst(b.allocator, .{ .String = resolved_name });
                 // Carry the resolved class identity so a builtin/stdlib type
                 // whose bare name otherwise resolves to a constructor

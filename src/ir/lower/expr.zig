@@ -1704,6 +1704,34 @@ fn enclosingMemberShadowsClass(b: *const FuncBuilder, name: []const u8) bool {
 /// sibling/nested member keeps the outer on its chain — or a renamed
 /// file-private class/typealias declared by the reference's own file.
 /// Returns null when no rename applies.
+
+/// Whether the own member overload of `name` with this arity declares a
+/// NON-function parameter where the call passes a lambda literal — such a
+/// member cannot bind the call, so it must not outrank a same-named
+/// extension that can (`cast(value, name) { … }` picking the member
+/// `cast(value, name, tag: String)` bound the lambda to `tag`).
+fn ownMemberRejectsLambdas(b: *const FuncBuilder, name: []const u8, args: []const Expr) bool {
+    const owner = b.ownerClass() orelse return false;
+    // The registration key is the SOURCE class name; a file-private class
+    // lowers under a `$f<n>` mangle and a nested one under `Outer$Inner`.
+    const mf = inline_state.exprBodyMemberAst(owner, name, args.len) orelse blk: {
+        if (std.mem.indexOf(u8, owner, "$f")) |i| {
+            if (inline_state.exprBodyMemberAst(owner[0..i], name, args.len)) |m| break :blk m;
+        }
+        return false;
+    };
+    for (args, 0..) |*a, i| {
+        const is_lambda = switch (a.*) {
+            .Lambda, .AnonFun => true,
+            else => false,
+        };
+        if (!is_lambda) continue;
+        if (i >= mf.params.len) return false;
+        if (mf.params[i].ty.function == null and !std.mem.eql(u8, mf.params[i].ty.name.name, "Any")) return true;
+    }
+    return false;
+}
+
 pub fn scopeTypeRename(b: *const FuncBuilder, name: []const u8, file: u32) ?[]const u8 {
     return scopeTypeRenameFrom(b, b.ownerClass(), name, file);
 }
@@ -13919,7 +13947,7 @@ fn lowerPathCall(
     // function: defer to the member-dispatch path (`lowerImplicitThisCall`). A
     // cast at the call site commits to a specific overload and overrides.
     const prefer_member = b.resolve("this") != null and b.hasOwnMember(name0) and
-        b.ownMemberApplicable(name0, args.len) and
+        b.ownMemberApplicable(name0, args.len) and !ownMemberRejectsLambdas(b, name0, args) and
         b.resolve(name0) == null and !b.isLocalFn(name0) and !b.isLocalExtFn(name0);
 
     // Call-site evidence pre-picks a same-tier overload: an `as` cast names
@@ -16917,6 +16945,7 @@ fn lowerImplicitThisCall(
     // top-level function: defer to the global-resolution path instead of
     // emitting a `this.<member>` call that can't dispatch.
     if (!b.ownMemberApplicable(name0, args.len)) return null;
+    if (ownMemberRejectsLambdas(b, name0, args)) return null;
     const this_reg0 = b.resolve("this") orelse return null;
     const this_reg = subjectCorrectedBareThis(b, name0, this_reg0);
 

@@ -606,6 +606,20 @@ const Gen = struct {
     fn customSerializerRef(self: *const Gen, w: []const u8) Allocator.Error![]const u8 {
         const q = try self.qualify(w);
         if (self.idx.objects.contains(q) or self.idx.objects.contains(w) or self.idx.objects.contains(simpleHead(w))) return q;
+        // A serializer CLASS for a generic declaration takes the
+        // type-argument serializers, exactly as the plugin constructs it
+        // (`ParametrizedSerializer(typeSerial0)`).
+        if (self.type_params.len != 0) {
+            var out: std.ArrayList(u8) = .empty;
+            try out.appendSlice(self.a, q);
+            try out.append(self.a, '(');
+            for (self.type_params, 0..) |_, i| {
+                if (i > 0) try out.appendSlice(self.a, ", ");
+                try wp(&out, self.a, "typeSerial{d}", .{i});
+            }
+            try out.append(self.a, ')');
+            return out.toOwnedSlice(self.a);
+        }
         return std.fmt.allocPrint(self.a, "{s}()", .{q});
     }
 };

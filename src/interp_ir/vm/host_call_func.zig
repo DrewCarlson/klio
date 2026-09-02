@@ -441,6 +441,17 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
             const cg = self.classes.borrow();
             defer cg.deinit();
             if (cg.get().get(bound_head)) |c| break :blk Value{ .Class = c.clone() };
+            // A LIFTED nested spelling (`Outer$Inner`) resolves through the
+            // dotted form or the innermost simple name the table holds.
+            if (std.mem.indexOfScalar(u8, bound_head, '$')) |_| {
+                const dotted = try allocator.dupe(u8, bound_head);
+                for (dotted) |*ch| {
+                    if (ch.* == '$') ch.* = '.';
+                }
+                if (cg.get().get(dotted)) |c| break :blk Value{ .Class = c.clone() };
+                const last = bound_head[std.mem.lastIndexOfScalar(u8, bound_head, '$').? + 1 ..];
+                if (cg.get().get(last)) |c| break :blk Value{ .Class = c.clone() };
+            }
         }
         // A DOTTED head (`Q.SQ`) walks nested-class tables segment by
         // segment from a resolvable root.
