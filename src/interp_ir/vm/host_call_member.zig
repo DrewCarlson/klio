@@ -13022,6 +13022,9 @@ fn classCompanionForward(self: *VmHost, allocator: Allocator, receiver: *const V
             if (comp.get(cfqn[start..])) |c| break :blk c;
             const dot = std.mem.indexOfScalarPos(u8, cfqn, start, '.') orelse break;
             start = dot + 1;
+            // Never the bare simple name here: that key is a top-level
+            // class's; the class's own name is tried next.
+            if (std.mem.indexOfScalarPos(u8, cfqn, start, '.') == null) break;
         }
         if (comp.get(cname)) |c| break :blk c;
         if (comp.get(simple)) |c| break :blk c;

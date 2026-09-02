@@ -7,19 +7,25 @@
 
 package kotlinx.serialization.internal
 
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.__klsx_generatedSerializer
 import kotlinx.serialization.__klsx_generatedSerializerGeneric
 import kotlinx.serialization.__klsx_isInterfaceClass
 import kotlinx.serialization.builtins.serializer
+import kotlinx.serialization.builtins.*
 import kotlin.reflect.KClass
 import kotlin.reflect.KType
+import kotlin.time.Duration
+import kotlin.time.Instant
+import kotlin.uuid.ExperimentalUuidApi
+import kotlin.uuid.Uuid
+import kotlin.time.ExperimentalTime
 
 // The builtin serializer table upstream's `Primitives.kt` reads through
-// `initBuiltins()`. klio's stdlib has no unsigned-array / Uuid surface, so
-// this covers the primitives, `Unit` and `Nothing` — the entries the
-// descriptor-name guard and `builtinSerializerOrNull` are asked about.
+// `initBuiltins()`: the same entries as the native platform.
+@OptIn(ExperimentalUnsignedTypes::class, ExperimentalUuidApi::class, ExperimentalSerializationApi::class, ExperimentalTime::class)
 internal actual fun initBuiltins(): Map<KClass<*>, KSerializer<*>> = mapOf(
     String::class to String.serializer(),
     Char::class to Char.serializer(),
@@ -30,16 +36,27 @@ internal actual fun initBuiltins(): Map<KClass<*>, KSerializer<*>> = mapOf(
     FloatArray::class to FloatArraySerializer(),
     Long::class to Long.serializer(),
     LongArray::class to LongArraySerializer(),
+    ULong::class to ULong.serializer(),
+    ULongArray::class to ULongArraySerializer(),
     Int::class to Int.serializer(),
     IntArray::class to IntArraySerializer(),
+    UInt::class to UInt.serializer(),
+    UIntArray::class to UIntArraySerializer(),
     Short::class to Short.serializer(),
     ShortArray::class to ShortArraySerializer(),
+    UShort::class to UShort.serializer(),
+    UShortArray::class to UShortArraySerializer(),
     Byte::class to Byte.serializer(),
     ByteArray::class to ByteArraySerializer(),
+    UByte::class to UByte.serializer(),
+    UByteArray::class to UByteArraySerializer(),
     Boolean::class to Boolean.serializer(),
     BooleanArray::class to BooleanArraySerializer(),
     Unit::class to Unit.serializer(),
-    Nothing::class to NothingSerializer()
+    Nothing::class to NothingSerializer(),
+    Duration::class to Duration.serializer(),
+    Instant::class to Instant.serializer(),
+    Uuid::class to Uuid.serializer()
 )
 
 internal actual fun <T> Array<T>.getChecked(index: Int): T = get(index)
