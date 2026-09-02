@@ -9658,6 +9658,7 @@ pub const Module = struct {
                 if (drop_trace) std.debug.print("[drop] {s}#{d} inapplicable-shape\n", .{ name, id.int() });
                 continue;
             };
+            if (drop_trace) std.debug.print("[keep] {s}#{d} params={d} args={d} recv_formed={} defaults0={}\n", .{ name, id.int(), sig.params.len, args.len, receiver_formed, if (sig.params.len != 0) sig.params[sig.params.len - 1].has_default else false });
             const static_compatibility = if (receiver_formed)
                 StaticCompatibility.unknown
             else

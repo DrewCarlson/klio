@@ -1449,6 +1449,8 @@ fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, modu
     if (callee.* != .Path or callee.Path.segments.len != 1) return null;
     const nm = callee.Path.segments[0].name;
     if (nm.len == 0) return null;
+    if (std.c.getenv("KLIO_PROPHEAD_TRACE") != null)
+        std.debug.print("[prophead] {s} init-callee={s} class={} funcs={d}\n", .{ prop.name.name, nm, module.classId(nm) != null, module.funcsBySimpleName(nm).len });
     if (std.ascii.isUpper(nm[0])) {
         for (decls) |*d| {
             if (d.* == .Class and std.mem.eql(u8, d.Class.name.name, nm)) return nm;

@@ -3161,7 +3161,7 @@ fn staticBareReceiverTypeRef(b: *const FuncBuilder, recv_name: []const u8) ?ir.T
     return null;
 }
 
-fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const u8 {
+pub fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const u8 {
     // Inside `val writer = writer`'s initializer the local's own name is
     // free (recorded at the decl), so the reference is the enclosing
     // member, never the shadow being declared.
@@ -3186,7 +3186,7 @@ fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const
         };
         break :blk boundOwnerHead(b, typeHead(std.mem.trimEnd(u8, head, "?")));
     };
-    if (tr) std.debug.print("[sbrt] {s}: owner={s}\n", .{ recv_name, owner });
+    if (tr) std.debug.print("[sbrt] {s}: owner={s} head={?s} ext={?s}\n", .{ recv_name, owner, propTypeHeadOn(b, owner, recv_name), extPropReturnHead(b, owner, recv_name) });
     if (propTypeHeadOn(b, owner, recv_name)) |h| return h;
     if (extPropReturnHead(b, owner, recv_name)) |h| return h;
     // A receiver lambda rebinds `this`, so a bare name inside it can be the
@@ -3268,9 +3268,48 @@ fn propTypeHeadOn(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?[
     for (chain) |cls| {
         if (heads.get(.{ .a = cls, .b = name })) |h| return h;
     }
+    // A property typed only by its initializer call (`val json = Json {
+    // … }`): the class registration could not see a pack's factory or
+    // class, so the head is read from the initializer here, where every
+    // declaration is registered.
+    if (propInitCallHead(b, owner, name)) |h| return h;
+    for (chain) |cls| {
+        if (propInitCallHead(b, cls, name)) |h| return h;
+    }
     // A runtime anon-object member body's own property heads travel in the
     // installed snapshot — the synthesized class has no registry entries.
     return build.anonPropHead(owner, name);
+}
+
+/// The class a member property's initializer call names: a constructor
+/// (`Json { }` resolves to the class of that name) or a plain function
+/// whose same-named overloads agree on a declared, concrete return head.
+fn propInitCallHead(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?[]const u8 {
+    const p = inline_state.memberPropAst(owner, name) orelse {
+        if (std.c.getenv("KLIO_PROPHEAD_TRACE") != null) std.debug.print("[prophead-lazy] no ast for {s}.{s}\n", .{ owner, name });
+        return null;
+    };
+    if (std.c.getenv("KLIO_PROPHEAD_TRACE") != null) std.debug.print("[prophead-lazy] {s}.{s} ty={} init={}\n", .{ owner, name, p.ty != null, p.init != null });
+    if (p.ty != null) return null;
+    const init = p.init orelse return null;
+    if (init != .Call) return null;
+    const callee = init.Call.callee;
+    if (callee.* != .Path or callee.Path.segments.len != 1) return null;
+    const nm = callee.Path.segments[0].name;
+    if (nm.len == 0) return null;
+    if (std.ascii.isUpper(nm[0]) and b.module.classId(nm) != null) return nm;
+    var agreed: ?[]const u8 = null;
+    for (b.module.funcsBySimpleName(nm)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
+        var head = std.mem.trimEnd(u8, f.return_ty.name, "?");
+        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        if (head.len == 0 or std.mem.eql(u8, head, "Unit") or (head.len <= 2 and std.ascii.isUpper(head[0]))) return null;
+        if (agreed) |g| {
+            if (!std.mem.eql(u8, g, head)) return null;
+        } else agreed = head;
+    }
+    return agreed;
 }
 
 /// Whether `ty` (or a supertype) declares a member property named `name`.
@@ -14293,6 +14332,7 @@ fn lowerPathCall(
                     @intFromEnum(segments[0].span.file),
                     segments[0].span.start,
                 });
+                std.debug.print("[bare-res] {s} tier={d} reason={?s} final={} tier_count={d}\n", .{ name0, res_final.tier, if (res_final.reason) |r| @tagName(r) else null, res_final.target_final, res_final.tier_count });
             }
         }
         if (!shadowed_by_class) {

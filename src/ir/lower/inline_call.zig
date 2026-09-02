@@ -158,6 +158,10 @@ pub fn gateReceiverHead(b: *const FuncBuilder, receiver: *const Expr) Allocator.
                     if (classMemberDeclType(b, srt, name)) |t| return t;
                 }
             }
+            // An enclosing class's member property (`jsonNoAltNames.
+            // decodeFromString(...)` inside the test class) types the
+            // receiver through the owner's property heads.
+            if (expr_lower.staticBareReceiverType(b, name)) |h| return h;
             return null;
         },
         .Member => |m| {
