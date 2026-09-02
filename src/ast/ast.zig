@@ -586,6 +586,10 @@ pub const ClassParam = struct {
 pub const SecondaryCtor = struct {
     params: []Param,
     delegation: CtorDelegation,
+    /// Per delegation argument, the name a named argument (`this(message =
+    /// …)`) binds; null for a positional one. Empty when no argument is
+    /// named.
+    delegation_arg_names: []const ?[]const u8 = &.{},
     body: ?Block,
     visibility: Visibility,
     annotations: []Annotation,

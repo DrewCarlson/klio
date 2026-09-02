@@ -158,6 +158,14 @@ pub fn gateReceiverHead(b: *const FuncBuilder, receiver: *const Expr) Allocator.
                     if (classMemberDeclType(b, srt, name)) |t| return t;
                 }
             }
+            // An enclosing class's member property (`jsonNoAltNames.
+            // decodeFromString(...)` inside the test class) types the
+            // receiver through the owner's property heads.
+            const sb = expr_lower.staticBareReceiverType(b, name);
+            if (inline_state.runtime.envOnce("KLIO_EXT_TRACE")) |w| {
+                if (std.mem.eql(u8, w, name)) std.debug.print("[gate] {s}: local={} outer={} sbrt={?s}\n", .{ name, b.resolve(name) != null, b.knowsOuter(name), sb });
+            }
+            if (sb) |h| return h;
             return null;
         },
         .Member => |m| {
@@ -1640,20 +1648,90 @@ fn unifyParamAgainstArg(
 /// whose type is evident without a type checker. `Foo(...)` names `Foo` when
 /// `Foo` resolves to a class; anything else (a factory function, a variable,
 /// a member call) stays unproven and returns null.
-fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilder) ?*const TypeRef {
+/// The caller's lexical owner while a splice infers its reified bindings
+/// after the callee frame is pushed (`b.ownerClass()` is the callee's then).
+var splice_lexical_owner: ?[]const u8 = null;
+
+pub fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilder) ?*const TypeRef {
     const call = switch (arg.*) {
         .Call => |*c| c,
         else => return null,
     };
-    const path = switch (call.callee.*) {
-        .Path => |*p| p,
+    // The callee is a bare name (`D(...)`), a dotted path (`Outer.D(...)`),
+    // or a member chain over class names (`Outer.D` parsed as a member
+    // access); every spelling collapses to its segments.
+    var segs: std.ArrayList(ast.Ident) = .empty;
+    defer segs.deinit(allocator);
+    switch (call.callee.*) {
+        .Path => |*p| segs.appendSlice(allocator, p.segments) catch return null,
+        .Member => |*m| {
+            var cur: *const Expr = call.callee;
+            var chain: std.ArrayList(ast.Ident) = .empty;
+            defer chain.deinit(allocator);
+            while (true) {
+                switch (cur.*) {
+                    .Member => |*mm| {
+                        chain.append(allocator, mm.name) catch return null;
+                        cur = mm.receiver;
+                    },
+                    .Path => |*pp| {
+                        var i = pp.segments.len;
+                        while (i > 0) : (i -= 1) chain.append(allocator, pp.segments[i - 1]) catch return null;
+                        break;
+                    },
+                    else => return null,
+                }
+            }
+            _ = m;
+            var i = chain.items.len;
+            while (i > 0) : (i -= 1) {
+                const id = chain.items[i - 1];
+                if (id.name.len == 0 or !std.ascii.isUpper(id.name[0])) return null;
+                segs.append(allocator, id) catch return null;
+            }
+        },
         else => return null,
-    };
-    if (path.segments.len == 0) return null;
-    const head = path.segments[path.segments.len - 1];
+    }
+    if (segs.items.len == 0) return null;
+    const head = segs.items[segs.items.len - 1];
     if (head.name.len == 0 or !std.ascii.isUpper(head.name[0])) return null;
     const b = bb orelse return null;
-    const cid: ?ir.ClassId = b.module.classIdIndexed(head.name, b.self_package, head.span.file) orelse b.module.classId(head.name);
+    // A dotted constructor path (`Outer.D(...)`) names the nested class
+    // through its outer; the bound name keeps the dotted spelling so the
+    // splice resolves it the way a written `<Outer.D>` would.
+    var written_name: []const u8 = head.name;
+    var cid: ?ir.ClassId = null;
+    if (segs.items.len >= 2) {
+        var buf: std.ArrayList(u8) = .empty;
+        for (segs.items, 0..) |seg, si| {
+            if (si > 0) buf.append(allocator, '.') catch return null;
+            buf.appendSlice(allocator, seg.name) catch return null;
+        }
+        const dotted = buf.toOwnedSlice(allocator) catch return null;
+        // The nesting tree is built at VM setup; at lowering the dotted
+        // spelling resolves as a `.`-aligned suffix of a registered fqn.
+        if (b.module.classIdByQualifiedSuffix(dotted)) |nid| {
+            cid = nid;
+            written_name = dotted;
+        } else {
+            // The lifted class table keys a nested class `Outer$D`.
+            const mangled = std.mem.replaceOwned(u8, allocator, dotted, ".", "$") catch return null;
+            if (b.module.classId(mangled)) |nid| {
+                cid = nid;
+                written_name = dotted;
+            }
+        }
+        if (std.c.getenv("KLIO_CTORARG_TRACE") != null)
+            std.debug.print("[ctorarg] dotted={s} cid={?d}\n", .{ dotted, if (cid) |c| c.int() else null });
+    }
+    // A nested class referenced by bare name inside its declaring subtree
+    // lives in the class table under its lifted (mangled) name.
+    if (cid == null) cid = b.module.classIdIndexed(head.name, b.self_package, head.span.file) orelse
+        b.module.classId(head.name) orelse blk: {
+        const owner = splice_lexical_owner orelse b.ownerClass();
+        const renamed = expr_lower.scopeTypeRenameFrom(@constCast(b), owner, head.name, head.span.file.int()) orelse break :blk null;
+        break :blk b.module.classId(renamed);
+    };
     if (cid == null) return null;
     var targs = allocator.alloc(ast.TypeArg, call.type_args.len) catch return null;
     for (call.type_args, 0..) |ta, i| {
@@ -1673,7 +1751,8 @@ fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilde
             var solved: ?*const TypeRef = null;
             for (cls.primary_params, 0..) |*pp, pi| {
                 if (pi >= call.args.len) break;
-                if (!std.mem.eql(u8, pp.ty.name, tp)) continue;
+                // `value: T?` binds `T` from its argument as `value: T` does.
+                if (!std.mem.eql(u8, std.mem.trimEnd(u8, pp.ty.name, "?"), tp)) continue;
                 solved = staticArgTypeRef(allocator, &call.args[pi], bb) orelse ctorArgTypeRef(allocator, &call.args[pi], bb);
                 if (solved != null) break;
             }
@@ -1687,7 +1766,7 @@ fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilde
     }
     const out = allocator.create(TypeRef) catch return null;
     out.* = .{
-        .name = head,
+        .name = .{ .name = written_name, .span = head.span },
         .nullable = false,
         .span = head.span,
         .type_args = targs,
@@ -1704,7 +1783,7 @@ fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilde
 /// `is T`, and both erase type arguments. A head that is itself a type
 /// parameter answers nothing — substituting it leaves the body's `T` as
 /// unresolved as before.
-fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilder) ?*const TypeRef {
+pub fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuilder) ?*const TypeRef {
     const b = bb orelse return null;
     const ty = expr_lower.argDeclTypeRefLazy(@constCast(b), arg) orelse return null;
     const head = std.mem.trimEnd(u8, ty.name, "?");
@@ -2156,8 +2235,11 @@ fn renderReifiedTypeName(b: *FuncBuilder, head: []const u8, a: *const ast.TypeRe
             try out.append(b.allocator, '*');
             continue;
         }
+        // The CALLER's lexical owner renames a nested argument head
+        // (`ThirdPartyBox<Item>` inside the class declaring `Item`): the
+        // callee frame is pushed by the time the bindings render.
         const inner_head = b.resolveReifiedTypeName(ta.ty.name.name) orelse
-            (expr_lower.scopeTypeRename(b, ta.ty.name.name, ta.ty.name.span.file.int()) orelse ta.ty.name.name);
+            (expr_lower.scopeTypeRenameFrom(b, splice_lexical_owner orelse b.ownerClass(), ta.ty.name.name, ta.ty.name.span.file.int()) orelse ta.ty.name.name);
         const rendered = try renderReifiedTypeName(b, inner_head, &ta.ty);
         try out.appendSlice(b.allocator, rendered);
     }
@@ -2318,6 +2400,19 @@ pub fn tryInlineCallWithTypeArgs(
             this_arg != null,
         ) orelse return null;
     }
+    // A MEMBER extension narrowed by receiver and shape is visible only
+    // inside its declaring class hierarchy: JsonTestBase's
+    // `Json.encodeToString(value, mode)` never takes a call from a class
+    // that does not extend JsonTestBase.
+    if (target == null and f.receiver_type != null) {
+        if (inline_state.inlineMemberOwner(f)) |owner| {
+            const enc = b.ownerClass() orelse return null;
+            if (!expr_lower.classIsOrExtendsHosted(b, enc, owner)) {
+                spliceBail(fname, "member-ext-owner-invisible");
+                return null;
+            }
+        }
+    }
     if (b.inlineDeclInProgress(f)) {
         return null;
     }
@@ -2411,13 +2506,17 @@ pub fn tryInlineCallWithTypeArgs(
         for (args[0..positional_n], 0..) |*a, i| {
             const nm: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
             if (nm) |name| {
-                const idx = paramIndex(f, name) orelse return null;
+                const idx = paramIndex(f, name) orelse {
+                    spliceBail(fname, "named-param-miss");
+                    return null;
+                };
                 ordered[idx] = a;
             } else {
                 while (next_pos < ordered.len and ordered[next_pos] != null) {
                     next_pos += 1;
                 }
                 if (next_pos >= ordered.len) {
+                    spliceBail(fname, "positional-overflow");
                     return null;
                 }
                 ordered[next_pos] = a;
@@ -3126,7 +3225,14 @@ pub fn tryInlineCallWithTypeArgs(
     // that window still resolve above the floor.
     var prev_body_floor: ?usize = null;
     var body_floor_set = false;
-    if (member_splice) {
+    // A spliced body resolves bare names in the CALLEE's scope: the
+    // caller's locals sit below the floor for member AND extension
+    // splices alike (`serializer(typeOf<T>())` inside the pack's
+    // `SerializersModule.serializer<T>()` must never bind a caller's
+    // `serializer` parameter). The splice's own parameters are bound
+    // above the floor; an argument lambda's body keeps the caller
+    // window.
+    if (hyg_active) {
         prev_body_floor = b.splice_body_floor;
         b.splice_body_floor = caller_scope_depth;
         body_floor_set = true;
@@ -3263,6 +3369,11 @@ pub fn tryInlineCallWithTypeArgs(
     // unspecified is inferred by unifying the function's declared return
     // type against the call's expected (tail-position) type, so
     // `val u: User = resp.body()` binds `T = User` with no `<User>`.
+    // The callee frame is pushed by now: argument-derived bindings rename
+    // nested classes through the CALLER's lexical owner.
+    const prev_splice_owner = splice_lexical_owner;
+    splice_lexical_owner = lexical_owner;
+    defer splice_lexical_owner = prev_splice_owner;
     const effective_type_args = try inferReifiedTypeArgsRecv(b.allocator, f, type_args, expected, ordered, b, this_arg);
     defer b.allocator.free(effective_type_args);
     if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {

@@ -598,7 +598,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 if (rest.len == 0 and root.memberIsProperty(allocator, &self.classes, &first, name)) {
                     return host_fields.getField(self, allocator, &first, name);
                 }
-                return host_call_member.callMemberNamedStatic(
+                const mr = try host_call_member.callMemberNamedStatic(
                     self,
                     allocator,
                     &first,
@@ -607,6 +607,15 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                     &.{},
                     typeReferenceStaticReceiver(&rv),
                 );
+                // `JsonPrimitive::booleanOrNull` names an EXTENSION
+                // property: no member takes the call, so the reference
+                // reads the property on its receiver (the field-read path
+                // resolves extension getters).
+                if (rest.len == 0 and mr == .err and mr.err == .Unimplemented) {
+                    const pr = try host_fields.getField(self, allocator, &first, name);
+                    if (pr == .ok) return pr;
+                }
+                return mr;
             }
             if (args.len == 0 and root.memberIsProperty(allocator, &self.classes, &rv, name)) {
                 return host_fields.getField(self, allocator, &rv, name);
@@ -2174,7 +2183,7 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                 ref_pushed = true;
             }
             defer if (ref_pushed) ir.eval.popRefSiteFile(ref_prev);
-            return host_call_member.callMemberNamedStatic(
+            const mr = try host_call_member.callMemberNamedStatic(
                 self,
                 allocator,
                 this_value,
@@ -2183,6 +2192,14 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                 &.{},
                 boundReferenceStaticReceiver(callee),
             );
+            // `JsonPrimitive::booleanOrNull` as a receiver function names
+            // an EXTENSION property: no member takes the call, so the
+            // reference reads the property on the supplied receiver.
+            if (args.len == 0 and mr == .err and mr.err == .Unimplemented) {
+                const pr = try host_fields.getField(self, allocator, this_value, name);
+                if (pr == .ok) return pr;
+            }
+            return mr;
         }
     }
     var sink = self.out_sink.clone();

@@ -676,6 +676,7 @@ pub fn parseSecondaryCtor(
     _ = support.expect(p, .RParen, "`)`") orelse return null;
     support.skipNl(p);
     var delegation: CtorDelegation = .None;
+    var delegation_arg_names: []const ?[]const u8 = &.{};
     if (std.meta.activeTag(support.peekKind(p).*) == .Colon) {
         _ = support.bump(p);
         support.skipNl(p);
@@ -692,16 +693,19 @@ pub fn parseSecondaryCtor(
             _ = support.bump(p);
             _ = support.expect(p, .LParen, "`(`");
             var args: std.ArrayList(Expr) = .empty;
+            var arg_names: std.ArrayList(?[]const u8) = .empty;
+            var any_named = false;
             while (true) {
                 support.skipNl(p);
                 if (std.meta.activeTag(support.peekKind(p).*) == .RParen) {
                     break;
                 }
-                // A named delegation argument (`this(groups = …, slots = …)`):
-                // consume the `name =` prefix. The delegation AST carries
-                // only positional expressions, so the argument binds by
-                // its position in the call.
-                _ = expr.tryConsumeNamedArgName(p);
+                // A named delegation argument (`this(groups = …, slots = …)`)
+                // binds the target constructor's parameter of that name; the
+                // names ride beside the positional expressions.
+                const an = expr.tryConsumeNamedArgName(p);
+                if (an != null) any_named = true;
+                arg_names.append(p.allocator, an) catch @panic("OOM");
                 const a = expr.parseExpr(p) orelse break;
                 args.append(p.allocator, a) catch @panic("OOM");
                 support.skipNl(p);
@@ -713,6 +717,7 @@ pub fn parseSecondaryCtor(
             }
             _ = support.expect(p, .RParen, "`)`");
             const arg_slice = args.toOwnedSlice(p.allocator) catch @panic("OOM");
+            delegation_arg_names = if (any_named) (arg_names.toOwnedSlice(p.allocator) catch @panic("OOM")) else &.{};
             delegation = if (this_kind)
                 CtorDelegation{ .This = arg_slice }
             else
@@ -728,6 +733,7 @@ pub fn parseSecondaryCtor(
     return SecondaryCtor{
         .params = params,
         .delegation = delegation,
+        .delegation_arg_names = delegation_arg_names,
         .body = body,
         .visibility = visibility,
         .annotations = annotations,

@@ -1442,17 +1442,22 @@ fn propHeadSourceExpr(prop: *const ast.Property) ?*const ast.Expr {
 /// this file set (`val Traversable get() = NodeKind<T>(mask)` -> `NodeKind`).
 /// Only a name that IS a declared class counts — a same-shaped factory call
 /// may return a different type, so an unknown callee proves nothing.
-fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl) ?[]const u8 {
+fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, module: *const ir.Module) ?[]const u8 {
     const src = propHeadSourceExpr(prop) orelse return null;
     if (src.* != .Call) return null;
     const callee = src.Call.callee;
     if (callee.* != .Path or callee.Path.segments.len != 1) return null;
     const nm = callee.Path.segments[0].name;
     if (nm.len == 0) return null;
+    if (std.c.getenv("KLIO_PROPHEAD_TRACE") != null)
+        std.debug.print("[prophead] {s} init-callee={s} class={} funcs={d}\n", .{ prop.name.name, nm, module.classId(nm) != null, module.funcsBySimpleName(nm).len });
     if (std.ascii.isUpper(nm[0])) {
         for (decls) |*d| {
             if (d.* == .Class and std.mem.eql(u8, d.Class.name.name, nm)) return nm;
         }
+        // A class registered elsewhere (a pack's `Json { }` builder names
+        // its type exactly as its constructor would).
+        if (module.classId(nm) != null) return nm;
         return null;
     }
     // A FACTORY call names its type just as a constructor does, as long as
@@ -1468,7 +1473,21 @@ fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl) ?[]c
         if (rt.nullable or rt.function != null or rt.qualified_path != null) return null;
         found = rt.name.name;
     }
-    return found;
+    if (found != null) return found;
+    // A registered top-level function (a pack factory): every same-named
+    // plain function must agree on a declared, concrete return head.
+    var agreed: ?[]const u8 = null;
+    for (module.funcsBySimpleName(nm)) |fid| {
+        const f = module.funcById(fid) orelse continue;
+        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
+        var head = std.mem.trimEnd(u8, f.return_ty.name, "?");
+        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        if (head.len == 0 or std.mem.eql(u8, head, "Unit") or (head.len <= 2 and std.ascii.isUpper(head[0]))) return null;
+        if (agreed) |g| {
+            if (!std.mem.eql(u8, g, head)) return null;
+        } else agreed = head;
+    }
+    return agreed;
 }
 
 /// The materialized array head a `vararg` property has (mirrors the body-side
@@ -2197,7 +2216,7 @@ fn buildModuleWithOverrides(
                         try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
                         try notePropTypeRef(a, module, c, prop.name.name, ty);
                     }
-                } else if (propCtorHeadEvidence(prop, decls)) |head| {
+                } else if (propCtorHeadEvidence(prop, decls, module)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
                 } else if (prop.init != null and memberSizedInitHead(c, &prop.init.?) != null) {
                     try module.registry.class_prop_type_heads.put(
@@ -2263,7 +2282,7 @@ fn buildModuleWithOverrides(
                     } else if (cprop.init) |*init| {
                         if (literalTypeHead(init)) |head| {
                             try module.registry.class_prop_type_heads.put(.{ .a = ckey, .b = cprop.name.name }, head);
-                        } else if (propCtorHeadEvidence(cprop, decls)) |head| {
+                        } else if (propCtorHeadEvidence(cprop, decls, module)) |head| {
                             // `val iso = LongParser(MAX_MILLIS, allowSign = true)`
                             // inside LongParser's own companion states the head
                             // exactly as a top-level object's would.
@@ -2279,7 +2298,7 @@ fn buildModuleWithOverrides(
                 const prop = m.Property;
                 if (prop.ty) |*ty| {
                     try module.registry.class_prop_type_heads.put(.{ .a = o.name.name, .b = prop.name.name }, ty.qualified_path orelse ty.name.name);
-                } else if (propCtorHeadEvidence(prop, decls)) |head| {
+                } else if (propCtorHeadEvidence(prop, decls, module)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = o.name.name, .b = prop.name.name }, head);
                 }
             }
@@ -3813,8 +3832,45 @@ fn buildModuleWithOverrides(
             // the declared types those parameters carry.
             const sc_param_types = try a.alloc(?ast.TypeRef, sc.params.len);
             for (sc.params, 0..) |*p, i| sc_param_types[i] = p.ty;
+            // Named delegation arguments (`this(message = m, cause = c,
+            // missingFields = f, serialName = null)`) bind the target's
+            // parameters by NAME; the thunks run in the target's declared
+            // order. Only a `this(...)` that fills every primary parameter
+            // is reordered; anything else stays positional.
+            var order = try a.alloc(usize, delegation_args.len);
+            for (order, 0..) |*o, i| o.* = i;
+            if (is_this and sc.delegation_arg_names.len == delegation_args.len and
+                delegation_args.len == c.primary_params.len)
+            reorder: {
+                var placed = try a.alloc(bool, delegation_args.len);
+                for (placed) |*x| x.* = false;
+                var slot: usize = 0;
+                for (sc.delegation_arg_names, 0..) |an, ai| {
+                    const name = an orelse {
+                        while (slot < placed.len and placed[slot]) slot += 1;
+                        if (slot >= placed.len) break :reorder;
+                        order[slot] = ai;
+                        placed[slot] = true;
+                        slot += 1;
+                        continue;
+                    };
+                    var idx: ?usize = null;
+                    for (c.primary_params, 0..) |*pp, pi| {
+                        if (std.mem.eql(u8, pp.name.name, name)) {
+                            idx = pi;
+                            break;
+                        }
+                    }
+                    const pi = idx orelse break :reorder;
+                    if (placed[pi]) break :reorder;
+                    order[pi] = ai;
+                    placed[pi] = true;
+                }
+                for (placed) |x| if (!x) break :reorder;
+            }
             var arg_fids = try a.alloc(FuncId, delegation_args.len);
-            for (delegation_args, 0..) |*e, arg_idx| {
+            for (order, 0..) |src_idx, arg_idx| {
+                const e = &delegation_args[src_idx];
                 const nm = try std.fmt.allocPrint(a, "__sec_ctor_{s}_{d}_arg{d}", .{ c.name.name, sc_idx, arg_idx });
                 module.pending_param_types = sc_param_types;
                 module.pending_own_member_arity = &own_arity;
