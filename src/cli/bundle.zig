@@ -150,6 +150,7 @@ pub fn assembleImageBuild(gpa: Allocator, base_path: []const u8, paths: []const 
         return null;
     }
     if (commands.computeEagerCalls(gpa, user.asts, &.{})) |ec| ir.pending_eager_calls = ec;
+    span.active_map = map;
     const built = interp_ir.build.buildModuleFilesExtend(gpa, loaded.base, user.asts) catch return null;
     return .{ .built = built, .map = map, .binding_fqns = loaded.binding_fqns };
 }
@@ -365,6 +366,7 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
         map.* = SourceMap.init(gpa);
         map.files.appendSlice(map.arena.allocator(), bb.map.files.items) catch return 1;
         const user2 = stdlib_image.parseUserFiles(gpa, map, paths, user.texts) orelse return 1;
+        span.active_map = map;
         var built = interp_ir.build.buildModuleFilesExtend(gpa, bb.base, user2.asts) catch return 1;
         const mg = built.module.borrow();
         defer mg.deinit();
@@ -788,6 +790,7 @@ fn bakeProgramImage(
     defer all.deinit(gpa);
     all.appendSlice(gpa, deps.asts) catch return null;
     all.appendSlice(gpa, user.asts) catch return null;
+    span.active_map = deps.map;
     const pb = (interp_ir.build.buildProgramBase(gpa, all.items) catch return null) orelse return null;
     pb.user_file_start = @intCast(dep_file_count);
     return (image.bake(gpa, pb, deps.map, .{

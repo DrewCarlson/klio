@@ -10,6 +10,8 @@ package kotlinx.serialization.internal
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.__klsx_generatedSerializer
+import kotlinx.serialization.__klsx_generatedSerializerGeneric
+import kotlinx.serialization.__klsx_isInterfaceClass
 import kotlinx.serialization.builtins.serializer
 import kotlin.reflect.KClass
 import kotlin.reflect.KType
@@ -52,10 +54,9 @@ internal actual fun KClass<*>.platformSpecificSerializerNotRegistered(): Nothing
     )
 }
 
-// klio has no `findAssociatedObject`; a generic `@Serializable` class gets the
-// same reflective serializer as a non-generic one (its element values are
-// type-erased through the reflective path, so the argument serializers add
-// nothing).
+// klio's `findAssociatedObject`: the generated companion `serializer(...)`
+// reached through its KClass (see Generated.kt), with the type-argument
+// serializers of a generic class passed through.
 @Suppress("UNCHECKED_CAST")
 internal actual fun <T : Any> KClass<T>.constructSerializerForGivenTypeArgs(vararg args: KSerializer<Any?>): KSerializer<T>? {
     if (args.isEmpty()) {
@@ -68,12 +69,12 @@ internal actual fun <T : Any> KClass<T>.constructSerializerForGivenTypeArgs(vara
     return __klsx_generatedSerializerGeneric(this, list) as KSerializer<T>?
 }
 
-// klio's stand-in for the plugin-generated `Companion.serializer()`.
+// The plugin-generated `Companion.serializer()`, reached through the KClass.
 @Suppress("UNCHECKED_CAST")
 internal actual fun <T : Any> KClass<T>.compiledSerializerImpl(): KSerializer<T>? =
     __klsx_generatedSerializer(this) as KSerializer<T>?
 
-internal actual fun <T : Any> KClass<T>.isInterface(): Boolean = false
+internal actual fun <T : Any> KClass<T>.isInterface(): Boolean = __klsx_isInterfaceClass(this)
 
 internal actual fun <T> createCache(factory: (KClass<*>) -> KSerializer<T>?): SerializerCache<T> {
     return object : SerializerCache<T> {

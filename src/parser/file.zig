@@ -143,6 +143,11 @@ pub fn parsePackageHeader(p: *Parser) ?PackageHeader {
     }
     const last_span = if (path.items.len > 0) path.items[path.items.len - 1].span else pkg_tok.span;
     const sp = pkg_tok.span.join(last_span);
+    // `package a.b;` — a trailing semicolon is a legal statement
+    // terminator here exactly as a newline is (kotlinx-serialization's
+    // FormatLanguage.kt writes one); leaving it made the following
+    // `import` look like a post-declaration directive.
+    stmt.skipStmtSeparators(p);
     return .{
         .path = path.toOwnedSlice(p.allocator) catch @panic("OOM"),
         .span = sp,
@@ -152,7 +157,8 @@ pub fn parsePackageHeader(p: *Parser) ?PackageHeader {
 pub fn parseImports(p: *Parser) []ImportDecl {
     var imports: std.ArrayList(ImportDecl) = .empty;
     while (true) {
-        support.skipNl(p);
+        // Newlines AND semicolons separate directives (`import a.b;`).
+        stmt.skipStmtSeparators(p);
         if (!atKeyword(p, .Import)) {
             break;
         }

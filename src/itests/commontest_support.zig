@@ -57,6 +57,8 @@ pub const Config = struct {
     /// suite wall behind one child. The split child compiles the same
     /// closure and runs `--filter=Class.test`, so counting is unchanged.
     split_files: []const []const u8 = &.{},
+    /// Extra `klio test` arguments every child gets (`--feature …`).
+    extra_args: []const []const u8 = &.{},
 };
 
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
@@ -470,6 +472,30 @@ pub const suites = [_]Config{
         .max_incomplete = 0,
     },
     .{
+        // Upstream kotlinx-serialization's JSON suite against the real
+        // upstream json module + klio's generated serializers. First
+        // count 2026-09-02: see plans/serialization-surface-campaign.md.
+        .name = "serialization_json",
+        .test_roots = &.{"kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-tests/commonTest/src"},
+        .scratch_home = "/tmp/klio_itest_serialization_json_home",
+        .packs = &.{
+            .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
+        },
+        .extra_support = &.{
+            "kotlin-klio/klio-kotlinx-serialization/klioTest/kotlinx/serialization/test/CurrentPlatform.kt",
+            "kotlin-klio/klio-kotlinx-serialization/klioTest/json/StreamSupport.kt",
+            "kotlin-klio/klio-kotlinx-serialization/klioTest/json/OkioAdapters.kt",
+            "kotlin-klio/klio-kotlinx-serialization/klioTest/json/KxioSupport.kt",
+            "kotlin-klio/klio-kotlinx-serialization/klioTest/json/KxioAdapters.kt",
+        },
+        .extra_args = &.{ "--feature", "kotlinx.serialization/json" },
+        .timeout_ms = 120_000,
+        .baseline = 0,
+        .max_failed = null,
+        .max_incomplete = null,
+    },
+    .{
         .name = "io",
         .test_roots = &.{
             "kotlin-klio/klio-kotlinx-io/upstream/core/common/test",
@@ -600,6 +626,7 @@ pub fn runSuite(cfg: Config) !void {
                 var argv: std.ArrayList([]const u8) = .empty;
                 try argv.append(a, klioBin(&env));
                 try argv.append(a, "test");
+                try argv.appendSlice(a, cfg.extra_args);
                 if (cfg.whole_source_set) {
                     try argv.appendSlice(a, support.items);
                     try argv.appendSlice(a, targets.items);
@@ -617,6 +644,7 @@ pub fn runSuite(cfg: Config) !void {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, klioBin(&env));
         try argv.append(a, "test");
+        try argv.appendSlice(a, cfg.extra_args);
         if (cfg.whole_source_set) {
             try argv.append(a, "--only-file");
             try argv.append(a, target);

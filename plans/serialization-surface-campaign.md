@@ -72,6 +72,22 @@ content-negotiation.
 
 ## Task 2 — json census
 
+- FIRST COUNT 2026-09-02 (generating pass in, reflective engine gone):
+  serialization_json 149 passed / 595 failed / 1 DNC across 126 files
+  (klio-census, harness binary). Top failing classes: ContextualTest
+  120, JsonCustomSerializersTest 31, SerializersLookupTest 19,
+  JsonTreeTest 13, JsonPathTest 12, JsonEnumsCaseInsensitiveTest 12,
+  JsonExponentTest 11, JsonEncoderDecoderRecursiveTest 11,
+  JsonDecodingErrorMessagesTest 11, InlineClassesTest 10. The core
+  census (previously 138/0 on the reflective engine) regressed on the
+  swap and is the exit gate to drive back first.
+- Suite wiring: `serialization_json` in commontest_support.zig
+  (per-file children, `--feature kotlinx.serialization/json` via the
+  new `extra_args`), itest `serialization_json_commontest`, the
+  `[[test]] feature = "json"` block in klio.toml, and klioTest/json
+  stand-ins for the okio / kotlinx-io buffer types and the json-okio /
+  json-io adapters (string-backed; the same streaming codec runs).
+
 - Wire `formats/json-tests` (and the json format sources it needs)
   into the serialization suite (or a sibling `serialization_json`
   suite in commontest_support.zig with its own scratch home, packs,

@@ -292,6 +292,51 @@ fn narrowIntListArg(param_ty: *const TypeRef, arg: *const Value) void {
 /// Synthetic `KType` instance for a reified type name: `classifier` is the
 /// registered class when one exists (else a minimal KClass), `arguments` is
 /// the empty list, `isMarkedNullable` mirrors a trailing `?`.
+
+/// A reified type argument the call site could not spell — empty, or still
+/// the callee's own parameter NAME after a declined inline splice (the
+/// runtime then read a process-global `T`) — is bound from the ARGUMENTS
+/// instead: the first value parameter declared as that bare type variable
+/// binds it to the argument's runtime class, exactly the head-only binding
+/// the splice would have inferred. Null when no argument decides it.
+fn inferTypeArgFromArgs(self: *VmHost, allocator: Allocator, f: *const ir.Func, type_name: []const u8, args: []const Value) ?Value {
+    for (f.params, 0..) |*p, i| {
+        if (i >= args.len) break;
+        if (!std.mem.eql(u8, p.ty.name, type_name)) continue;
+        const v = args[i];
+        switch (v) {
+            .Instance => |inst| {
+                const g = inst.borrow();
+                defer g.deinit();
+                return Value{ .Class = g.get().class.clone() };
+            },
+            .Null => continue,
+            else => {
+                // A builtin value (List, String, Int, ...) binds its
+                // classifier so a `typeOf<T>()` downstream names the real
+                // type — arguments are not recoverable here (head-only).
+                const fqn = v.typeFqn();
+                const head = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+                {
+                    const cg = self.classes.borrow();
+                    defer cg.deinit();
+                    if (cg.get().get(head)) |c| return Value{ .Class = c.clone() };
+                }
+                return host_call_member.syntheticClassFromFqn(allocator, fqn) catch null;
+            },
+        }
+    }
+    return null;
+}
+
+fn typeArgUnbound(arg_name: []const u8, names: []const []const u8) bool {
+    if (arg_name.len == 0) return true;
+    for (names) |n| {
+        if (std.mem.eql(u8, n, arg_name)) return true;
+    }
+    return false;
+}
+
 fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Allocator.Error!Value {
     if (runtime.envOnce("KLIO_KTYPE_TRACE") != null) {
         const in_fn = if (ir.eval.currentFrameFunc()) |f| f.name else "-";
@@ -314,11 +359,37 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
             }
         }
     }
+    // A bare TYPE-VARIABLE head (`typeOf<T>()` reached through an
+    // unspliced reified body) resolves through the call's bound type-param
+    // global — the class the enclosing call bound `T` to — never as a
+    // class literally named `T`.
+    const bound_head: []const u8 = blk: {
+        if (std.mem.indexOfScalar(u8, head, '.') != null) break :blk head;
+        const fr = ir.eval.currentFrameFunc() orelse break :blk head;
+        const names: []const []const u8 = nb: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            if (mg.get().registry.func_type_params.get(fr.id)) |l| break :nb l.items;
+            break :nb &.{};
+        };
+        var is_tp = false;
+        for (names) |n| {
+            if (std.mem.eql(u8, n, head)) is_tp = true;
+        }
+        if (!is_tp) break :blk head;
+        const g = self.globals.borrow();
+        defer g.deinit();
+        const bv = g.get().lookup(head) orelse break :blk head;
+        if (bv != .Class) break :blk head;
+        const cg2 = bv.Class.borrow();
+        defer cg2.deinit();
+        break :blk try allocator.dupe(u8, cg2.get().name);
+    };
     const classifier: Value = blk: {
         const cg = self.classes.borrow();
         defer cg.deinit();
-        if (cg.get().get(head)) |c| break :blk Value{ .Class = c.clone() };
-        break :blk try host_call_member.syntheticClassFromFqn(allocator, head);
+        if (cg.get().get(bound_head)) |c| break :blk Value{ .Class = c.clone() };
+        break :blk try host_call_member.syntheticClassFromFqn(allocator, bound_head);
     };
     var args_accum: std.ArrayList(Value) = .empty;
     if (generic_args) |ga| {
@@ -2415,8 +2486,9 @@ pub fn prepareTypedFlatCall(self: *VmHost, allocator: Allocator, module: *const 
         errdefer saved.deinit(allocator);
         for (names, 0..) |type_name, idx| {
             const arg_name: []const u8 = if (idx < type_args.len) type_args[idx] else "";
-            if (arg_name.len == 0) continue;
-            const cls_value: ?Value = blk: {
+            const cls_value: ?Value = if (typeArgUnbound(arg_name, names))
+                (inferTypeArgFromArgs(self, allocator, f, type_name, call_args.items) orelse continue)
+            else blk: {
                 const cg = self.classes.borrow();
                 defer cg.deinit();
                 if (cg.get().get(arg_name)) |c| break :blk Value{ .Class = c.clone() };
@@ -2712,7 +2784,6 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
     defer saved.deinit(allocator);
     for (names, 0..) |type_name, idx| {
         const arg_full: []const u8 = if (idx < type_args.len) type_args[idx] else "";
-        if (arg_full.len == 0) continue;
         // A stamped generic spelling (`List<Int>`) resolves its CLASS by the
         // head; the full spelling is for KType materialisation only.
         const arg_name = if (std.mem.indexOfScalar(u8, arg_full, '<')) |lt| arg_full[0..lt] else arg_full;
@@ -2720,12 +2791,16 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
         // `.Class` value even when the bare name's global is a constructor
         // intrinsic (exception classes). This is the same identity the
         // inline splice resolves for its reified binding.
-        const cls_value: ?Value = blk: {
+        const cls_value: ?Value = if (typeArgUnbound(arg_name, names)) blk: {
+            const rf = funcAt(module, resolved) orelse break :blk null;
+            break :blk inferTypeArgFromArgs(self, allocator, rf, type_name, args);
+        } else blk: {
             const cg = self.classes.borrow();
             defer cg.deinit();
             if (cg.get().get(arg_name)) |c| break :blk Value{ .Class = c.clone() };
             break :blk host_globals.lookupGlobal(self, arg_name);
         };
+        if (cls_value == null and arg_full.len == 0) continue;
         const prev = blk: {
             const g = self.globals.borrow();
             defer g.deinit();

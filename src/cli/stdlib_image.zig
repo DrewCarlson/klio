@@ -876,6 +876,7 @@ fn finishFromLoaded(
     publishExternDecls(gpa, loaded.base);
     publishBaseEagerCalls(gpa, loaded.base);
     if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
+    span.active_map = map;
     const built = interp_ir.build.buildModuleFilesExtend(gpa, loaded.base, user2.asts) catch return null;
 
     var bindings = bindings_in;
@@ -977,6 +978,7 @@ fn bakeAndPrepare(
     publishExternDecls(gpa, base);
     publishBaseEagerCalls(gpa, base);
     if (@import("commands.zig").computeEagerCalls(gpa, user2.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
+    span.active_map = map;
     const built = interp_ir.build.buildModuleFilesExtend(gpa, base, user2.asts) catch return null;
     return .{ .built = built, .map = map, .bindings = deps.bindings, .user_asts = user2.asts };
 }
