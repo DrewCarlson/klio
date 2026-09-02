@@ -1716,6 +1716,35 @@ fn enclosingMemberShadowsClass(b: *const FuncBuilder, name: []const u8) bool {
 /// member cannot bind the call, so it must not outrank a same-named
 /// extension that can (`cast(value, name) { … }` picking the member
 /// `cast(value, name, tag: String)` bound the lambda to `tag`).
+/// Whether the enclosing class declares a member named `name` that a call
+/// with `nargs` arguments can bind. The own-member arity mask decides when
+/// it has an entry; a lazily lowered body carries none, and then the
+/// registered signatures of the owner's same-named members decide
+/// (`Json.encodeToString(value, mode)` never takes one argument). Unknown
+/// stays applicable, as the mask's own default does.
+fn enclosingMemberTakes(b: *const FuncBuilder, name: []const u8, nargs: usize) bool {
+    if (b.own_member_arity.get(name) != null) return b.ownMemberApplicable(name, nargs);
+    const owner = b.ownerClass() orelse return true;
+    var found_any = false;
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (f.fqn.len <= name.len + 1) continue;
+        const prefix = f.fqn[0 .. f.fqn.len - name.len - 1];
+        if (!std.mem.endsWith(u8, prefix, owner)) continue;
+        found_any = true;
+        var required: usize = 0;
+        var total: usize = 0;
+        for (f.params, 0..) |*p, i| {
+            if (i == 0 and std.mem.eql(u8, p.name, "this")) continue;
+            if (p.is_vararg) return true;
+            total += 1;
+            if (!p.has_default) required += 1;
+        }
+        if (nargs >= required and nargs <= total) return true;
+    }
+    return !found_any;
+}
+
 fn ownMemberRejectsLambdas(b: *const FuncBuilder, name: []const u8, args: []const Expr) bool {
     const owner = b.ownerClass() orelse return false;
     // The registration key is the SOURCE class name; a file-private class
@@ -9170,7 +9199,15 @@ fn inlineTargetForBareCall(
                         // member-call path binds it — a class's own `head`
                         // (even non-inline) wins over an unrelated class's
                         // inline `head`, whose body would run on the wrong `this`.
-                        if (!replaced and b.hasEnclosingMember(nm)) return null;
+                        // Only an APPLICABLE own member outranks the pick:
+                        // JsonTestBase's `encodeToString(value, mode)` must
+                        // not send a one-argument `encodeToString(tree)` to
+                        // the dynamic path (where the reified `T` of Json's
+                        // member reads a stale binding).
+                        if (!replaced and b.hasEnclosingMember(nm) and
+                            (!b.hasOwnMember(nm) or
+                                (enclosingMemberTakes(b, nm, args.len) and !ownMemberRejectsLambdas(b, nm, args))))
+                            return null;
                     }
                 }
             }

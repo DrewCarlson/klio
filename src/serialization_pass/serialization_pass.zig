@@ -443,6 +443,9 @@ const Gen = struct {
     /// type name resolves against its enclosing scopes first.
     scope_path: []const u8 = "",
     file: ?*const FileSettings = null,
+    /// Package of the file being generated for (serial names of the
+    /// unannotated enums it references).
+    pkg: []const u8 = "",
 
     /// Qualify a type reference as written in the class to the path the
     /// synthetic top-level file can name: a sibling nested class
@@ -594,6 +597,12 @@ const Gen = struct {
         if (self.idx.class_nodes.get(qn)) |cn| {
             if (cn.is_interface and (hasAnnotation(cn.annotations, "Polymorphic") or !isSerializableIn(self.idx, cn.annotations))) {
                 return std.fmt.allocPrint(a, "PolymorphicSerializer({s}::class)", .{qn});
+            }
+            // An enum is serializable without `@Serializable`: the plugin
+            // builds its serializer in place (no companion exists to ask).
+            if (cn.is_enum and !isSerializableIn(self.idx, cn.annotations)) {
+                const serial = if (self.pkg.len == 0) qn else try std.fmt.allocPrint(a, "{s}.{s}", .{ self.pkg, qn });
+                return std.fmt.allocPrint(a, "createSimpleEnumSerializer(\"{s}\", {s}.values())", .{ serial, qn });
             }
         }
         if (t.type_args.len != 0) {
@@ -1424,7 +1433,7 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
                 }
                 var tps: std.ArrayList([]const u8) = .empty;
                 for (c.type_params) |*tp| try tps.append(ctx.a, tp.name.name);
-                const g = Gen{ .a = ctx.a, .idx = ctx.idx, .type_params = tps.items, .scope_path = path, .file = &ctx.settings };
+                const g = Gen{ .a = ctx.a, .idx = ctx.idx, .pkg = ctx.pkg, .type_params = tps.items, .scope_path = path, .file = &ctx.settings };
                 switch (info.kind) {
                     .class => try genClassSerializer(&ctx.gen, ctx.a, &g, c, &info),
                     .value_class => try genValueClassSerializer(&ctx.gen, ctx.a, &g, c, &info),
@@ -1450,7 +1459,7 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
                 }
                 if (!isSerializableIn(ctx.idx, o.annotations)) continue;
                 const info = ctx.idx.by_path.get(path) orelse continue;
-                const g = Gen{ .a = ctx.a, .idx = ctx.idx, .type_params = &.{}, .scope_path = path, .file = &ctx.settings };
+                const g = Gen{ .a = ctx.a, .idx = ctx.idx, .pkg = ctx.pkg, .type_params = &.{}, .scope_path = path, .file = &ctx.settings };
                 switch (info.kind) {
                     .with_custom => try genWithFactory(&ctx.gen, ctx.a, &g, &info),
                     else => try genObjectFactory(&ctx.gen, ctx.a, ctx.idx, &info),
@@ -1510,7 +1519,7 @@ fn serializerForClassTarget(a: Allocator, annotations: []const ast.Annotation) ?
 fn genForClassObject(ctx: *Ctx, o: *ast.ObjectDecl, obj_path: []const u8, target_written: []const u8) Allocator.Error!void {
     const a = ctx.a;
     const scope = if (std.mem.lastIndexOfScalar(u8, obj_path, '.')) |d| obj_path[0..d] else "";
-    var g0 = Gen{ .a = a, .idx = ctx.idx, .type_params = &.{}, .scope_path = obj_path };
+    var g0 = Gen{ .a = a, .idx = ctx.idx, .pkg = ctx.pkg, .type_params = &.{}, .scope_path = obj_path };
     const target_path = try g0.qualify(target_written);
     _ = scope;
     const c = ctx.idx.class_nodes.get(target_path) orelse return;
@@ -1523,7 +1532,7 @@ fn genForClassObject(ctx: *Ctx, o: *ast.ObjectDecl, obj_path: []const u8, target
     };
     var tps: std.ArrayList([]const u8) = .empty;
     for (c.type_params) |*tp| try tps.append(a, tp.name.name);
-    const g = Gen{ .a = a, .idx = ctx.idx, .type_params = tps.items, .scope_path = target_path, .file = &ctx.settings };
+    const g = Gen{ .a = a, .idx = ctx.idx, .pkg = ctx.pkg, .type_params = tps.items, .scope_path = target_path, .file = &ctx.settings };
     var body: std.ArrayList(u8) = .empty;
     try wp(&body, a, "object {s} : GeneratedSerializer<{s}> {{\n", .{o.name.name, info.path});
     try genClassSerializerBody(&body, a, &g, c, &info);
@@ -1575,7 +1584,7 @@ fn genSelfSerializerSplice(a: Allocator, info: *const Info) Allocator.Error![]co
 /// splice delegating members plus `serializer() = this` into the companion.
 fn genForClassCompanion(ctx: *Ctx, comp: *ast.Decl, class_path: []const u8, target_written: []const u8) Allocator.Error!void {
     const a = ctx.a;
-    var g0 = Gen{ .a = a, .idx = ctx.idx, .type_params = &.{}, .scope_path = class_path };
+    var g0 = Gen{ .a = a, .idx = ctx.idx, .pkg = ctx.pkg, .type_params = &.{}, .scope_path = class_path };
     const target_path = try g0.qualify(target_written);
     const c = ctx.idx.class_nodes.get(target_path) orelse return;
     const info = ctx.idx.by_path.get(target_path) orelse Info{
@@ -1587,7 +1596,7 @@ fn genForClassCompanion(ctx: *Ctx, comp: *ast.Decl, class_path: []const u8, targ
     };
     var tps: std.ArrayList([]const u8) = .empty;
     for (c.type_params) |*tp| try tps.append(a, tp.name.name);
-    const g = Gen{ .a = a, .idx = ctx.idx, .type_params = tps.items, .scope_path = target_path, .file = &ctx.settings };
+    const g = Gen{ .a = a, .idx = ctx.idx, .pkg = ctx.pkg, .type_params = tps.items, .scope_path = target_path, .file = &ctx.settings };
     const impl_name = try std.fmt.allocPrint(a, "{s}$forClass", .{try genName(a, class_path)});
     try wp(&ctx.gen, a, "object `{s}` : GeneratedSerializer<{s}> {{\n", .{ impl_name, info.path });
     try genClassSerializerBody(&ctx.gen, a, &g, c, &info);
