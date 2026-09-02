@@ -705,6 +705,15 @@ pub fn parsePostfix(p: *Parser) ?Expr {
                     .is_infix = false,
                     .span = sp,
                 } };
+                // A trailing lambda may start on the next line
+                // (`assertFailsWith("x")\n{ ... }`): Kotlin's call suffix
+                // allows line breaks before the lambda literal. Consume the
+                // break so the postfix loop reaches the `{`.
+                if (!p.suppress_trailing_lambda and std.meta.activeTag(support.peekKind(p).*) == .Newline) {
+                    const save = p.pos;
+                    support.skipNl(p);
+                    if (std.meta.activeTag(support.peekKind(p).*) != .LBrace) p.pos = save;
+                }
             },
             .LBracket => {
                 _ = support.bump(p);

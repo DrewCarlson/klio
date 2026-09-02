@@ -1712,6 +1712,15 @@ fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBuil
     if (std.mem.indexOfAny(u8, head, "<>-(") != null) return null;
     if (head.len <= 2 and isAllUpper(head)) return null;
     const out = allocator.create(TypeRef) catch return null;
+    // The recorded type keeps its arguments (`Collection<String>`): a
+    // reified consumer (`typeOf<T>()` behind `serializer<T>()`) needs
+    // them to materialise the KType's arguments.
+    if (ty.args.len != 0) {
+        if (expr_lower.astTypeRefFromIr(@constCast(b), ty, arg.span())) |full| {
+            out.* = full;
+            return out;
+        }
+    }
     out.* = .{
         .name = .{ .name = head, .span = arg.span() },
         .nullable = ty.nullable,

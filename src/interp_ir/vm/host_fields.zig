@@ -2466,6 +2466,9 @@ fn companionInstanceForDef(self: *VmHost, fqn: []const u8, simple: []const u8) A
         }
         const dot = std.mem.indexOfScalarPos(u8, fqn, start, '.') orelse break;
         start = dot + 1;
+        // Never the bare simple name: that key belongs to a top-level
+        // class, and a nested class's own (mangled) name resolves below.
+        if (std.mem.indexOfScalarPos(u8, fqn, start, '.') == null) break;
     }
     return companionInstanceForClass(self, simple);
 }

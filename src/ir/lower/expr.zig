@@ -15922,7 +15922,7 @@ fn irTypeFullyConcrete(b: *const FuncBuilder, ty: ir.TypeRef) bool {
 
 /// A lowered type as source-shaped AST, for the expected-type stack.
 /// Variance mangles strip; a trailing-`?` spelling folds into `nullable`.
-fn astTypeRefFromIr(b: *FuncBuilder, ty: ir.TypeRef, sp: ast.Span) ?ast.TypeRef {
+pub fn astTypeRefFromIr(b: *FuncBuilder, ty: ir.TypeRef, sp: ast.Span) ?ast.TypeRef {
     var nm = std.mem.trimEnd(u8, ty.name, "?");
     const spelled_nullable = nm.len != ty.name.len;
     if (std.mem.startsWith(u8, nm, "in#")) nm = nm[3..];
