@@ -1,0 +1,89 @@
+# Serialization-surface campaign: real Json surface, json census, ktor shim swap
+
+STATUS 2026-09-02: NOT STARTED. One vein, two payouts: the
+kotlinx.serialization pack grows the real upstream serializer surface,
+which (a) lets the json test suite run as a standing census and (b)
+unblocks KTOR-SERVER-UPSTREAM.md Phase 2 — the ONE coordinated swap of
+the vendored client+server serialization shims for upstream
+content-negotiation.
+
+## Measured starting facts (do not re-derive)
+
+- The serialization census covers `core/commonTest` only: 34 files,
+  baseline 138, at zero failures. Upstream's json suite is ALREADY in
+  the checkout at
+  `kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-tests/`
+  (185 .kt files) and is completely uncensused; `formats/json/` (the
+  format sources) is checked out too.
+- The pack today serves JSON through the `__klsx_json*` intrinsics
+  behind a bridge (`Json.decodeToClass`); the REAL surface upstream
+  compiles against is: `Json : StringFormat`, `serializersModule`,
+  `serializerOrNull(KType)` / `getContextual`, and the builtin
+  serializers. That exact list is what KTOR-SERVER-UPSTREAM.md Phase 2
+  records as the swap blocker, plus: ClientSSESession in the
+  ktor-client-core include list, `io/ktor/server/plugins/Errors.kt`
+  in server-core, and a decision on `ExperimentalJsonConverter.kt`
+  (imports kotlinx-serialization-json-io, absent from the pack —
+  exclude it and record why, or pull json-io).
+- The census-growth recipe is banked (ktor 322 -> 465, memory
+  klio-ktor-commontest-campaign): pack-rebuild-first, add ONLY files a
+  failing test names to include lists, per-file children, ratchet the
+  floor as fixes land.
+- The shims being replaced (`shim/client-serialization`,
+  `shim/server-serialization`) both declare
+  `io.ktor.serialization.kotlinx.json.json()` on fake configs; they
+  must swap TOGETHER, and the ktor e2e gates (all green today) are
+  the acceptance harness.
+
+## Task 1 — the real serializer surface
+
+- Grow the pack so `Json : StringFormat` is genuine over the existing
+  `__klsx_json*` intrinsics: `serializersModule`,
+  `serializerOrNull(KType)`, `getContextual`, the builtin serializers
+  (primitives, String, collections, enums, nullable wrappers), and
+  `encodeToString`/`decodeFromString` running through the real
+  serializer plumbing where the surface demands it. Kotlin semantics
+  exactly; the intrinsics stay the engine underneath where they are
+  semantically equivalent, and real serializer code takes over where
+  they are not.
+- The `serializer(KType)` reflection entry needs whatever KType
+  surface the interpreter can honestly provide; a shape it cannot
+  honor throws the same SerializationException upstream does, never a
+  silent wrong answer.
+
+## Task 2 — json census
+
+- Wire `formats/json-tests` (and the json format sources it needs)
+  into the serialization suite (or a sibling `serialization_json`
+  suite in commontest_support.zig with its own scratch home, packs,
+  ratchet floor, and child caps). First full run = the count; then
+  drive failures down root-cause-first exactly like the ktor census
+  (each failure names an interpreter or pack-surface root; test edits
+  never).
+- Ratchet the floor at the first stable green count; the plan records
+  the count trajectory and the named roots.
+
+## Task 3 — the coordinated ktor shim swap
+
+- With Task 1's surface in place: replace BOTH serialization shims
+  with the vendored upstream modules in one move (same FQN, real
+  configs), add ClientSSESession + server Errors.kt to the include
+  lists, settle ExperimentalJsonConverter.kt (exclude-with-record or
+  pull json-io), delete the shims, and drive the ktor e2e gates +
+  ktor census back to green. `Json.decodeToClass` retires with the
+  shims unless something else consumes it (then record what).
+
+## Standing policy
+
+- Root-cause only; census floors/ceilings, corpus parity, compose
+  gate, litmus never weaken; scripts/stack.sh is the full battery and
+  the new json census joins it (or gate.sh) once ratcheted.
+- Traps in force: installed packs shadow sources (rebuild first),
+  clear the bake cache before pack builds when chasing staleness,
+  census = per-file/per-class children, never `zig build` during a
+  battery.
+
+Exit: the pack carries the real surface with the upstream converter
+modules compiling against it; the json census stands ratcheted in the
+verification path with its count trajectory recorded; both shims are
+deleted with ktor e2e + census green; full battery green throughout.

@@ -10,9 +10,13 @@ bottom and are not campaigns.
 
 ## The active plan
 
-`plans/leaf-wide-campaign.md` (real inline bodies + wider leaf ops +
-cheaper doorway) followed by `plans/open-residue-audit.md` (verdict
-every standing OPEN item). Predecessors all closed:
+`plans/serialization-surface-campaign.md` (real Json surface, json
+census, the coordinated ktor shim swap) followed by
+`plans/compose-ui-census-campaign.md` (upstream ui test suites become
+standing gates). Just closed 2026-09-02: `leaf-wide-campaign.md`
+(inline leaf eligibility via type-head keys, enum statics, the
+getter-path gate; wide leaves 3200 -> 3764) and
+`open-residue-audit.md` (all seven verdicts; two live root fixes). Predecessors all closed:
 `census-gates-and-red-mass.md` (2026-08-31, every census at ZERO),
 `object-runtime-campaign.md` + `leaf-production-campaign.md`
 (2026-09-01, the kl_ leaf vehicle + standing gates), and
@@ -158,8 +162,8 @@ klio-compose-suite-perf; harness practice in `BENCHMARKS.md`.
 
 ## Doc register
 
-LIVE (open work tracked): `leaf-wide-campaign.md`,
-`open-residue-audit.md`, `c-transpiler-plan.md`,
+LIVE (open work tracked): `serialization-surface-campaign.md`,
+`compose-ui-census-campaign.md`, `c-transpiler-plan.md`,
 `value-layout-campaign.md`, `KTOR-SERVER-UPSTREAM.md`, and this file.
 `conformance-and-hardening.md` is FINISHED (closed 2026-08-18) and kept
 as a log — it holds the census baselines, the process-global contract,
