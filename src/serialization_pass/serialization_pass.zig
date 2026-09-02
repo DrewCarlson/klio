@@ -588,6 +588,14 @@ const Gen = struct {
         // serializers for a generic one. Qualified to the path the
         // synthetic file can name.
         const qn = try self.qualify(t.name.name);
+        // An interface type is polymorphic unless it carries its own
+        // `@Serializable` (a sealed interface's generated serializer, or a
+        // custom `with=`); `@Polymorphic` on the interface forces it.
+        if (self.idx.class_nodes.get(qn)) |cn| {
+            if (cn.is_interface and (hasAnnotation(cn.annotations, "Polymorphic") or !isSerializableIn(self.idx, cn.annotations))) {
+                return std.fmt.allocPrint(a, "PolymorphicSerializer({s}::class)", .{qn});
+            }
+        }
         if (t.type_args.len != 0) {
             var out: std.ArrayList(u8) = .empty;
             try out.appendSlice(a, qn);

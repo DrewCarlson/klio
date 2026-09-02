@@ -9259,7 +9259,7 @@ fn inlineTargetForBareCall(
             if (std.mem.eql(u8, w, nm)) std.debug.print("[ipick-tail] {s} recv={s} hasOwn={} applicable={}\n", .{ nm, if (pf.receiver_type) |rt| rt.name.name else "-", b.hasOwnMember(nm), b.ownMemberApplicable(nm, args.len) });
         }
         if (pf.receiver_type != null and b.hasOwnMember(nm) and
-            b.ownMemberApplicable(nm, args.len))
+            b.ownMemberApplicable(nm, args.len) and !ownMemberRejectsLambdas(b, nm, args))
         {
             const rt_name = pf.receiver_type.?.name.name;
             var evidenced = false;
@@ -9338,6 +9338,14 @@ fn inlineEvidenceRejects(b: *FuncBuilder, f: *const ast.Function, args: []const 
         if (p_builtin == null and e_builtin != null and b.module.classId(phead) != null and
             !classHasBoundedTypeParam(b, phead) and
             !typeNameIsParam(f, phead)) return true;
+    }
+    // A trailing lambda binds the LAST parameter; a builtin-typed one
+    // (`cast(value, serialName, tag: String)`) can never take it, so the
+    // same-named overload whose last parameter is a function type is the
+    // target (`cast(value, serialName, path: () -> String)`).
+    if (positional_n + 1 == args.len and f.params.len > positional_n) {
+        const lp = &f.params[f.params.len - 1].ty;
+        if (lp.function == null and paramLitKind(std.mem.trimEnd(u8, lp.name.name, "?")) != null) return true;
     }
     return false;
 }
@@ -13825,7 +13833,7 @@ fn lowerPathCall(
     // companion members, so a plain member name is filtered by `hasOwnMember`.
     if (b.isParamThunk() and b.resolve("this") == null and
         b.hasOwnMember(name0) and b.ownMemberApplicable(name0, args.len) and
-        !classWithCompanion(b, name0))
+        !ownMemberRejectsLambdas(b, name0, args) and !classWithCompanion(b, name0))
     {
         if (b.ownerClass()) |owner| {
             const cls = b.allocReg();
@@ -16078,6 +16086,7 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
         if (solveComparatorSiblingByName(b, callee, outer_name, args)) |solved| return solved;
     }
     if (solveInstantiatedArgExpected(b, callee, outer_name, args)) |solved| return solved;
+    if (solveReifiedArgExpected(b, callee, outer_name, args)) |solved| return solved;
     if (callee.* == .Member) return null;
     if (args.len < 2) return null;
     const f = outer orelse return null;
@@ -16123,6 +16132,84 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
             };
             return .{ .site = arg, .ty = .{ .name = .{ .name = head, .span = sp }, .nullable = false, .span = sp, .type_args = ta, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null } };
         }
+    }
+    return null;
+}
+
+/// A nested reified-inline call argument (`JsonTreeDecoder(json,
+/// cast(currentObject(), descriptor), ...)`) takes the callee's DECLARED
+/// parameter type as its expected type: Kotlin infers the reified `T`
+/// from the expected type there, and the splice's return-type unification
+/// binds it the same way. Only a concrete head-only parameter type that
+/// every arity-matching overload agrees on is pushed.
+fn solveReifiedArgExpected(b: *FuncBuilder, callee: *const Expr, name: []const u8, args: []const Expr) ?SibSolved {
+    for (args, 0..) |*a, i| {
+        if (a.* != .Call) continue;
+        const c = a.Call;
+        if (c.type_args.len != 0) continue;
+        var sp: ast.Span = undefined;
+        const nested_name: []const u8 = switch (c.callee.*) {
+            .Path => |p| blk: {
+                if (p.segments.len != 1) continue;
+                sp = p.segments[0].span;
+                break :blk p.segments[0].name;
+            },
+            .Member => |m| blk: {
+                sp = m.name.span;
+                break :blk m.name.name;
+            },
+            else => continue,
+        };
+        const cands = inline_state.candidatesForName(nested_name) orelse continue;
+        var reified = false;
+        for (cands) |cf| {
+            for (cf.type_params) |*tp| {
+                if (tp.is_reified) reified = true;
+            }
+        }
+        if (!reified) continue;
+        var agreed: ?ir.TypeRef = null;
+        var conflict = false;
+        for (b.module.funcsBySimpleName(name)) |fid| {
+            const f = b.module.funcById(fid) orelse continue;
+            const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+            if (callee.* != .Member and recv_off == 1) continue;
+            if (f.params.len - recv_off < args.len) continue;
+            const pi = recv_off + i;
+            if (pi >= f.params.len) continue;
+            const pt = f.params[pi].ty;
+            const head = std.mem.trimEnd(u8, pt.name, "?");
+            if (head.len == 0 or pt.args.len != 0) {
+                conflict = true;
+                break;
+            }
+            if (std.mem.eql(u8, head, "Any") or std.mem.startsWith(u8, head, "Function") or !irTypeFullyConcrete(b, pt)) {
+                conflict = true;
+                break;
+            }
+            if (agreed) |g| {
+                if (!std.mem.eql(u8, std.mem.trimEnd(u8, g.name, "?"), head)) {
+                    conflict = true;
+                    break;
+                }
+            } else agreed = pt;
+        }
+        if (conflict) continue;
+        // A constructor call: the class's primary parameters.
+        if (agreed == null and callee.* != .Member) {
+            if (b.module.classId(name)) |cid| {
+                const cls = &b.module.classes.items[cid.int()];
+                if (i < cls.primary_params.len and cls.primary_params.len >= args.len) {
+                    const pt = cls.primary_params[i].ty;
+                    const head = std.mem.trimEnd(u8, pt.name, "?");
+                    if (head.len != 0 and pt.args.len == 0 and !std.mem.eql(u8, head, "Any") and
+                        !std.mem.startsWith(u8, head, "Function") and irTypeFullyConcrete(b, pt)) agreed = pt;
+                }
+            }
+        }
+        const pt = agreed orelse continue;
+        const ty = astTypeRefFromIr(b, pt, sp) orelse continue;
+        return .{ .site = a, .ty = ty };
     }
     return null;
 }

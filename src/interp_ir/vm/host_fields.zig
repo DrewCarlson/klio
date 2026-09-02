@@ -2446,6 +2446,30 @@ fn enclosingSimpleFromFqn(self: *VmHost, inst: ObjRef(InstanceData)) ?[]const u8
 /// The companion-object singleton instance for class `cls_simple`, or
 /// null when the class has no companion. Used to seed a companion
 /// extension property's getter `this`.
+/// The companion for a class DEF: its fqn's dotted suffixes longest-first
+/// (`a.b.Outer.C` -> `b.Outer.C`, `Outer.C`, `C`) so a nested class with a
+/// same-named cousin in another outer finds its own companion.
+fn companionInstanceForDef(self: *VmHost, fqn: []const u8, simple: []const u8) Allocator.Error!?Value {
+    var start: usize = 0;
+    while (true) {
+        const cand = fqn[start..];
+        const comp_name: ?[]const u8 = blk: {
+            const g = self.module.borrow();
+            defer g.deinit();
+            break :blk g.get().registry.companion_singletons.get(cand);
+        };
+        if (comp_name) |cn| {
+            return switch (try host_globals.ensureObjectSingleton(self, cn)) {
+                .ok => |maybe| maybe,
+                .err => null,
+            };
+        }
+        const dot = std.mem.indexOfScalarPos(u8, fqn, start, '.') orelse break;
+        start = dot + 1;
+    }
+    return companionInstanceForClass(self, simple);
+}
+
 fn companionInstanceForClass(self: *VmHost, cls_simple: []const u8) Allocator.Error!?Value {
     const comp_name: ?[]const u8 = blk: {
         const g = self.module.borrow();
@@ -2468,6 +2492,7 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     // (`companion object Named`), initialized on read — the lookup the
     // serialization runtime's KClass -> generated serializer path needs.
     if (std.mem.eql(u8, name, "$companion")) {
+        if (try companionInstanceForDef(self, cd.fqn, cd.name)) |v| return ok(v);
         if (try companionInstanceForClass(self, cd.name)) |v| return ok(v);
         // A nested class registers its companion under its SOURCE simple
         // name; the ClassDef carries the mangled `Outer$Inner`.

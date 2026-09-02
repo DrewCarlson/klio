@@ -13006,10 +13006,23 @@ fn classCompanionForward(self: *VmHost, allocator: Allocator, receiver: *const V
         cg.deinit();
     }
     const simple = simpleName(cname);
+    const cfqn: []const u8 = blk: {
+        const cg = cls.borrow();
+        defer cg.deinit();
+        break :blk cg.get().fqn;
+    };
     const comp_name = blk: {
         const mg = self.module.borrow();
         defer mg.deinit();
         const comp = &mg.get().registry.companion_singletons;
+        // Dotted fqn suffixes longest-first: a nested class with a
+        // same-named cousin elsewhere resolves its OWN companion.
+        var start: usize = 0;
+        while (true) {
+            if (comp.get(cfqn[start..])) |c| break :blk c;
+            const dot = std.mem.indexOfScalarPos(u8, cfqn, start, '.') orelse break;
+            start = dot + 1;
+        }
         if (comp.get(cname)) |c| break :blk c;
         if (comp.get(simple)) |c| break :blk c;
         break :blk null;
