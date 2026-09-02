@@ -16,6 +16,7 @@ const runtime = @import("runtime");
 const FF = runtime.forest.ForestField;
 const ast = @import("ast");
 const compose_pass = @import("compose_pass");
+const serialization_pass = @import("serialization_pass");
 const span = @import("span");
 const stdlib = @import("stdlib");
 
@@ -468,7 +469,7 @@ pub fn buildModuleFilesExtend(allocator: Allocator, base: *const StdlibBase, use
     return buildModuleFilesInner(allocator, user_files, base, null);
 }
 
-fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: ?*const StdlibBase, out_lifted: ?*[]Decl) Allocator.Error!BuiltModule {
+fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile, base: ?*const StdlibBase, out_lifted: ?*[]Decl) Allocator.Error!BuiltModule {
     const ComposeMaps = struct {
         names: std.StringHashMap(void),
         sinks: std.StringHashMap(void),
@@ -519,6 +520,12 @@ fn buildModuleFilesInner(allocator: Allocator, files: []const KotlinFile, base: 
         }
         break :blk next;
     } else 0;
+    // `@Serializable` lowering plugin: synthesize each serializable class's
+    // generated serializer declarations (the companion `serializer()`, the
+    // `$serializer` object, sealed/enum/object/value-class forms) as ordinary
+    // Kotlin before anything reads the decls, so packs and programs alike
+    // carry real generated serializers.
+    const files: []KotlinFile = try serialization_pass.transformFiles(allocator, files_in);
     for (files) |*f| {
         try file_modules.put(f.span.file, compilation_module);
         const prefix = try packagePrefix(allocator, f.package);
@@ -4743,12 +4750,23 @@ fn buildClassDef(
     // supertype is what `is KSerializer` and `as KSerializer` read, and what
     // a serializer lookup casts its answer to.
     const serializer_supertype = c.supertypes.len == 0 and serializerForClassAnnotated(c.annotations);
-    const extra: usize = if (serializer_supertype) 1 else 0;
+    // An annotation class implicitly implements `kotlin.Annotation`: an
+    // instance passes an `Annotation`-typed parameter and `is Annotation`.
+    const annotation_supertype = c.is_annotation;
+    const extra: usize = @as(usize, @intFromBool(serializer_supertype)) + @as(usize, @intFromBool(annotation_supertype));
     var supertype_names = try a.alloc([]const u8, c.supertypes.len + extra);
     var supertype_paths = try a.alloc(?[]const u8, c.supertypes.len + extra);
-    if (serializer_supertype) {
-        supertype_names[c.supertypes.len] = "KSerializer";
-        supertype_paths[c.supertypes.len] = null;
+    {
+        var slot: usize = c.supertypes.len;
+        if (serializer_supertype) {
+            supertype_names[slot] = "KSerializer";
+            supertype_paths[slot] = null;
+            slot += 1;
+        }
+        if (annotation_supertype) {
+            supertype_names[slot] = "Annotation";
+            supertype_paths[slot] = null;
+        }
     }
     for (c.supertypes, 0..) |*t, i| {
         // A supertype naming a renamed file-private class resolves to the

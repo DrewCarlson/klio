@@ -5324,86 +5324,33 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (try classCompanionForward(self, allocator, receiver, name, args)) |r| return r;
     }
 
-    // kotlinx-serialization's plugin generates `serializer()` on a
-    // `@Serializable` declaration's companion. klio has no plugin, so the pack
-    // supplies `__klsx_generatedSerializer(kClass)` and this tail routes the
-    // call to it. An OBJECT declaration is its own receiver at the call site
-    // (`PlainObject.serializer()` passes the singleton, not a class value), so
-    // both receiver shapes resolve through the declaration's KClass.
-    if (std.mem.eql(u8, name, "serializer")) {
-        const kclass: ?Value = switch (receiver.*) {
-            .Class => receiver.*,
-            .Instance => |inst| blk: {
-                const g = inst.borrow();
-                defer g.deinit();
-                const cg = g.get().class.borrow();
-                const is_object = cg.get().is_object;
-                cg.deinit();
-                break :blk if (is_object) Value{ .Class = g.get().class.clone() } else null;
-            },
-            else => null,
-        };
-        if (kclass) |kc| {
-            // `Foo.serializer(tSerializer, …)` on a generic declaration: the
-            // arguments stand for the type parameters, in order.
-            if (args.len != 0) {
-                const mg = self.module.borrow();
-                const fid = mg.get().funcIdByFqn("kotlinx.serialization.__klsx_generatedSerializerGeneric");
-                mg.deinit();
-                if (fid) |f| {
-                    var items: std.ArrayList(Value) = .empty;
-                    for (args) |a| {
-                        a.retain();
-                        try items.append(allocator, a);
-                    }
-                    const list = try listOf(allocator, items, false);
-                    const call_args = [_]Value{ kc, list };
-                    const r = try callFuncRec(self, allocator, self.module.asPtr(), f, &call_args);
-                    switch (r) {
-                        .ok => |v| if (v != .Null) return .{ .ok = v },
-                        .err => return r,
-                    }
-                    // A COMPANION (named or not) serves the plugin's
-                    // `serializer(...)` for its OWNER declaration; the
-                    // companion itself is not `@Serializable`.
-                    if (try companionOwnerClassValue(self, &kc)) |owner| {
-                        defer owner.release(allocator);
-                        list.retain();
-                        const owner_args = [_]Value{ owner, list };
-                        const r2 = try callFuncRec(self, allocator, self.module.asPtr(), f, &owner_args);
-                        switch (r2) {
-                            .ok => |v| if (v != .Null) return .{ .ok = v },
-                            .err => return r2,
-                        }
-                    }
-                }
-            } else {
-                const mg = self.module.borrow();
-                const fid = mg.get().funcIdByFqn("kotlinx.serialization.__klsx_generatedSerializer");
-                mg.deinit();
-                if (fid) |f| {
-                    const call_args = [_]Value{kc};
-                    const r = try callFuncRec(self, allocator, self.module.asPtr(), f, &call_args);
-                    switch (r) {
-                        .ok => |v| if (v != .Null) return .{ .ok = v },
-                        .err => return r,
-                    }
-                    // A COMPANION is where the plugin writes `serializer()`,
-                    // and the declaration it describes is the companion's
-                    // OWNER — `Data.Named.serializer()` is `Data`'s. The
-                    // companion itself is not `@Serializable`, so the probe
-                    // above answered null for it.
-                    if (try companionOwnerClassValue(self, &kc)) |owner| {
-                        defer owner.release(allocator);
-                        const owner_args = [_]Value{owner};
-                        const r2 = try callFuncRec(self, allocator, self.module.asPtr(), f, &owner_args);
-                        switch (r2) {
-                            .ok => |v| if (v != .Null) return .{ .ok = v },
-                            .err => return r2,
-                        }
-                    }
-                }
+    // `serializer()` on a `@Serializable` declaration is the GENERATED
+    // companion member (src/serialization_pass), reached above through
+    // classCompanionForward. A CLASS VALUE receiver that has no such
+    // member is a `KClass` — `Foo::class.serializer()` — and resolves to
+    // kotlinx-serialization's `KClass<T>.serializer()` extension, exactly
+    // as any extension on a KClass receiver would.
+    if (receiver.* == .Class and std.mem.eql(u8, name, "serializer")) {
+        const ext_fid: ?FuncId = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            const m = mg.get();
+            for (m.funcsBySimpleName("serializer")) |cand| {
+                const cf = m.funcById(cand) orelse continue;
+                if (!std.mem.eql(u8, cf.fqn, "kotlinx.serialization.serializer")) continue;
+                if (cf.params.len != args.len + 1) continue;
+                if (!std.mem.eql(u8, cf.params[0].name, "this")) continue;
+                if (!std.mem.eql(u8, simpleName(cf.params[0].ty.name), "KClass")) continue;
+                break :blk cand;
             }
+            break :blk null;
+        };
+        if (ext_fid) |fid| {
+            var call_args: std.ArrayList(Value) = .empty;
+            defer call_args.deinit(allocator);
+            try call_args.append(allocator, receiver.*);
+            try call_args.appendSlice(allocator, args);
+            return try callFuncRec(self, allocator, self.module.asPtr(), fid, call_args.items);
         }
     }
 
@@ -13019,6 +12966,13 @@ fn classCompanionForward(self: *VmHost, allocator: Allocator, receiver: *const V
     {
         const cg = cls.borrow();
         cname = cg.get().name;
+        // An enum's synthetic statics (`values()`, `valueOf`, `entries`)
+        // belong to the enum class, never to its companion — `Color.values()`
+        // is legal with a companion present and must not forward there.
+        if (cg.get().is_enum and (std.mem.eql(u8, name, "values") or std.mem.eql(u8, name, "valueOf") or std.mem.eql(u8, name, "entries"))) {
+            cg.deinit();
+            return null;
+        }
         cg.deinit();
     }
     const simple = simpleName(cname);

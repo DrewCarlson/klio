@@ -1307,11 +1307,22 @@ fn inferReifiedTypeArgs(
     // only the non-null elements).
     if (bb) |b| {
         for (f.type_params, 0..) |tp, i| {
-            if (out[i] != null or !tp.is_reified) continue;
-            const bound = b.resolveReifiedTypeName(tp.name.name) orelse continue;
+            if (!tp.is_reified) continue;
+            // An EXPLICIT `<T>` that names an enclosing splice's reified
+            // binding is that binding too: `serializer<T>()` written inside
+            // `encodeToString<reified T>` means the caller's T, and left as
+            // the bare name it reached the runtime as an unbound `T` —
+            // `typeOf<T>()` then asked for a class named `T`.
+            const lookup_name: []const u8 = if (out[i]) |o| blk: {
+                if (o.type_args.len != 0 or o.function != null) continue;
+                break :blk o.name.name;
+            } else tp.name.name;
+            const bound = b.resolveReifiedTypeName(lookup_name) orelse continue;
             const nullable = std.mem.endsWith(u8, bound, "?");
             const head = if (nullable) bound[0 .. bound.len - 1] else bound;
-            if (std.mem.indexOfScalar(u8, head, '<') != null) continue;
+            // A generic binding (`List<Color>`) keeps its full spelling as
+            // the name: head-reading consumers (`T::class`, `is T`) strip at
+            // `<`, and `typeOf<T>()` parses the arguments back out.
             out[i] = .{
                 .name = .{ .name = head, .span = tp.name.span },
                 .nullable = nullable,

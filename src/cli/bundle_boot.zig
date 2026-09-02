@@ -335,6 +335,7 @@ fn bootRest(
         return 1;
     }
     if (commands.computeEagerCalls(gpa, user.asts, &.{})) |ec| ir_mod.pending_eager_calls = ec;
+    span.active_map = map;
     const built = interp_ir.build.buildModuleFilesExtend(gpa, loaded.base, user.asts) catch return 1;
 
     const bindings = replayBindings(gpa, loaded.binding_fqns, manifest) orelse return 1;

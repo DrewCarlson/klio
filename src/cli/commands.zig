@@ -323,6 +323,7 @@ pub fn runDumpIr(
     all_asts.appendSlice(gpa, loaded.asts) catch return 1;
     all_asts.appendSlice(gpa, user_asts.items) catch return 1;
 
+    span.active_map = &map;
     var built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch {
         io.printStderr(gpa, "error: lowering failed\n", .{});
         return 1;
@@ -373,6 +374,7 @@ pub fn runTranspileDump(
     all_asts.appendSlice(gpa, loaded.asts) catch return 1;
     all_asts.appendSlice(gpa, user_asts.items) catch return 1;
 
+    span.active_map = &map;
     var built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch {
         io.printStderr(gpa, "error: lowering failed\n", .{});
         return 1;
@@ -477,6 +479,7 @@ pub fn runTranspile(
     all_asts.appendSlice(gpa, user_asts.items) catch return 1;
 
     if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
+    span.active_map = &map;
     span.active_map = &map;
     var built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch {
         io.printStderr(gpa, "error: lowering failed\n", .{});
@@ -3585,7 +3588,10 @@ fn runBuilt(
     // See the note in the test path: the map is installed before lowering so
     // lowering-time diagnostics can name a file and line.
     span.active_map = map;
-    const built = interp_ir.build.buildModuleFiles(gpa, all_asts) catch return 1;
+    const built = interp_ir.build.buildModuleFiles(gpa, all_asts) catch |e| {
+        io.printStderr(gpa, "error: lowering failed ({s})\n", .{@errorName(e)});
+        return 1;
+    };
     return runBuiltModule(gpa, built, bindings, map, no_main_msg);
 }
 

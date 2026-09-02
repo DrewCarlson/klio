@@ -2464,6 +2464,21 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     const g = cls.borrow();
     defer g.deinit();
     const cd = g.get();
+    // `$companion`: the class's companion instance whatever it is named
+    // (`companion object Named`), initialized on read — the lookup the
+    // serialization runtime's KClass -> generated serializer path needs.
+    if (std.mem.eql(u8, name, "$companion")) {
+        if (try companionInstanceForClass(self, cd.name)) |v| return ok(v);
+        // A nested class registers its companion under its SOURCE simple
+        // name; the ClassDef carries the mangled `Outer$Inner`.
+        var simple = cd.name;
+        if (std.mem.lastIndexOfScalar(u8, simple, '$')) |d| simple = simple[d + 1 ..];
+        if (std.mem.lastIndexOfScalar(u8, simple, '.')) |d| simple = simple[d + 1 ..];
+        if (!std.mem.eql(u8, simple, cd.name)) {
+            if (try companionInstanceForClass(self, simple)) |v| return ok(v);
+        }
+        return ok(.Null);
+    }
     // An anonymous object's class has no name: both reflective names
     // are null, matching kotlinc.
     if (std.mem.eql(u8, name, "simpleName")) {

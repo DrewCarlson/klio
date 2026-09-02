@@ -29,6 +29,10 @@ const mod_list = [_]Mod{
     .{ .name = "lexer", .deps = &.{ "diagnostics", "span" }, .tested = true },
     .{ .name = "pack", .deps = &.{ "ast", "span", "types" }, .tested = true },
     .{ .name = "parser", .deps = &.{ "ast", "diagnostics", "lexer", "span" }, .tested = true },
+    // The kotlinx-serialization compiler-plugin replacement: synthesizes the
+    // generated serializer declarations for every `@Serializable` class as
+    // ordinary Kotlin (parsed from generated source) before lowering.
+    .{ .name = "serialization_pass", .deps = &.{ "ast", "span", "lexer", "parser", "diagnostics" }, .src = "src/serialization_pass/serialization_pass.zig", .tested = true },
     .{ .name = "jit", .tested = true },
     .{ .name = "ir", .deps = &.{ "span", "ast", "types", "runtime", "diagnostics", "jit", "applicability", "compose_pass" }, .tested = true },
     // Shared overload-resolution applicability engine. Lives inside the ir
@@ -40,7 +44,7 @@ const mod_list = [_]Mod{
     .{ .name = "stdlib", .deps = &.{ "runtime", "pack" }, .tested = true },
     .{ .name = "cfa", .deps = &.{ "ast", "diagnostics", "lexer", "parser", "span", "types" }, .tested = true },
     .{ .name = "resolver", .deps = &.{ "span", "ast", "diagnostics", "types", "stdlib" }, .tested = true },
-    .{ .name = "interp_ir", .deps = &.{ "ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability", "compose_pass" }, .tested = true },
+    .{ .name = "interp_ir", .deps = &.{ "ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability", "compose_pass", "serialization_pass" }, .tested = true },
     .{ .name = "stdlib_pack", .deps = &.{ "pack", "stdlib" }, .tested = true },
     .{ .name = "stdlib_gen", .deps = &.{ "pack", "stdlib" }, .tested = true },
     .{ .name = "kotlinx_atomicfu", .deps = &.{ "runtime", "stdlib" }, .tested = true },
@@ -263,6 +267,10 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-kotlin-test",
     }, .weight = 40 },
+    .{ .name = "serialization_json_commontest", .needs_exe = true, .dirs = &.{
+        "kotlin-klio/klio-kotlinx-serialization",
+        "kotlin-klio/klio-kotlin-test",
+    }, .weight = 60 },
     .{ .name = "coroutines_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-atomicfu",

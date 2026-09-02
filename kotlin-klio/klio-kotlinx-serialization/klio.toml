@@ -73,6 +73,14 @@ include = [
     "kotlinx/serialization/modules/SerializersModuleCollector.kt",
 ]
 
+# Upstream kotlinx-serialization-json 1.11.0 commonMain, consumed
+# verbatim (Json : StringFormat, streaming/tree codecs, JsonElement,
+# builders, naming strategies). Packed here; the `json` feature below
+# gates it at load, together with the klio actuals for its `expect`s
+# under klioMain/kotlinx/serialization/json.
+[[source]]
+root = "upstream/formats/json/commonMain/src"
+
 # klio-supplied layer: marker annotations / runtime helpers that the
 # excluded reified-generic upstream files would otherwise provide,
 # plus actuals for the internal `expect`s in Platform.common.kt and
@@ -87,11 +95,13 @@ id = "stdlib"
 # Cargo-style features mirroring kotlinx-serialization's Gradle modules.
 # The reflective serialization-core (annotations, KSerializer,
 # descriptors, encoding) is the ungated core, always loaded. The JSON
-# format (kotlinx-serialization-json: `Json`, encodeToString /
-# decodeFromString) is opt-in via `--feature kotlinx.serialization/json`.
+# format is upstream kotlinx-serialization-json's commonMain verbatim
+# (Json : StringFormat, the streaming/tree codecs, JsonElement) plus the
+# klio actuals for its five `expect`s under klioMain/.../json; opt-in
+# via `--feature kotlinx.serialization/json`.
 [features]
 default = []
-json = { sources = ["klioMain/kotlinx/serialization/json"] }
+json = { sources = ["upstream/formats/json/commonMain/src", "klioMain/kotlinx/serialization/json"] }
 
 # commonTest sources for `klio test` (not packed).
 [[test]]
@@ -101,3 +111,10 @@ root = "upstream/core/commonTest"
 # (`expect val currentPlatform`); see klioTest/ for why NATIVE.
 [[test]]
 root = "klioTest"
+
+# Upstream's JSON test suite (formats/json-tests), gated on the `json`
+# feature. Its streaming modes ride the klioTest/json stand-ins for the
+# okio / kotlinx-io buffer types the pack does not ship.
+[[test]]
+root = "upstream/formats/json-tests/commonTest/src"
+feature = "json"
