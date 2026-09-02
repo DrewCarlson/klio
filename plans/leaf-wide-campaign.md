@@ -87,6 +87,22 @@ doorway vein that campaign recorded under its Task 1.
   cheap sound shape (e.g. string-const identity compare); do not
   build a string runtime into leaves.
 
+## Task 2 verdicts (2026-09-02)
+
+- LANDED: genre-9 enum statics (+342 bodies) and kl_cast pass-through
+  (+20, near-free InstanceOf sibling; failed casts bail to the exact
+  throw). Wide leaves 3200 -> 3764 across the rungs.
+- CLOSED BY MEASUREMENT — CallMember (710), LoadCapture (354),
+  AstLambda (183): the blocked-body sample is lambda-shaped (456 of
+  the escape-blocked fqns are `<lambda>` bodies, which LoadCapture
+  blocks anyway — leaf lambdas need a capture-marshal vehicle, a
+  different design) and generic-dispatch-shaped (minOf/maxOf families
+  need runtime fid resolution with BOTH sides leafed). No named census
+  family sits behind either; the hot datetime bodies already serve.
+  Revisit when a real customer names one. The remaining LoadGlobal
+  residue is fn-bound globals (589 raw hits incl. the served class
+  half) — same verdict.
+
 ## Task 3 — doorway: cheaper serve path
 
 - Measure first: split the serve path cost on the equals micro
@@ -101,6 +117,17 @@ doorway vein that campaign recorded under its Task 1.
   path suggests low-100s ns is available) and the datetime census
   wall confirms or bounds the win. Land what measures, record what
   does not.
+- VERDICTS (2026-09-02): threadlocal cached edge view LANDED —
+  rebuilt only on host change, per-call work = two mode-flag stores;
+  toEpochDays 290 -> 276ms (+5%), equals neutral. The site-memo
+  leaf-route lever is ALREADY EFFECTIVELY PRESENT: the route memo
+  lives on ir.Func (one atomic load post-resolution; tryLeafValues
+  was 2.6% of the profile), so there is no lookup left to kill. The
+  residual ~600ns/call is the interpreter's dispatch walk REACHING
+  the commit point plus marshal — the per-op law again; closed with
+  terms. NEW COMMIT POINT: the property-getter dispatch path gained
+  the kl_ gate it lacked (see STATUS) — gate coverage, not doorway
+  cost, was the real remaining lever.
 
 ## Standing policy
 
