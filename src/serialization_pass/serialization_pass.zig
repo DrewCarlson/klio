@@ -86,6 +86,11 @@ const Index = struct {
     supers: std.StringHashMap([]const []const u8),
     /// Class annotations (source text of each `@Foo(...)`) per class path.
     class_annotations: std.StringHashMap([]const []const u8),
+    /// The declaring AST node per class path (for `@Serializer(forClass)`).
+    class_nodes: std.StringHashMap(*const ast.Class),
+    /// Declared supertypes (full TypeRefs) per class/object path, for
+    /// `object X : KSerializer<T>` target resolution.
+    super_refs: std.StringHashMap([]const ast.TypeRef),
 
     fn init(a: Allocator) Index {
         return .{
@@ -99,6 +104,8 @@ const Index = struct {
             .inheritable = std.StringHashMap(void).init(a),
             .supers = std.StringHashMap([]const []const u8).init(a),
             .class_annotations = std.StringHashMap([]const []const u8).init(a),
+            .class_nodes = std.StringHashMap(*const ast.Class).init(a),
+            .super_refs = std.StringHashMap([]const ast.TypeRef).init(a),
         };
     }
 };
@@ -252,6 +259,7 @@ fn indexAnnotationClasses(idx: *Index, decls: []const ast.Decl) Allocator.Error!
 }
 
 fn recordSupersAndAnnotations(idx: *Index, path: []const u8, supertypes: []const ast.TypeRef, annotations: []const ast.Annotation) Allocator.Error!void {
+    try idx.super_refs.put(path, supertypes);
     var sup: std.ArrayList([]const u8) = .empty;
     for (supertypes) |*st| try sup.append(idx.a, simpleHead(st.name.name));
     try idx.supers.put(path, try sup.toOwnedSlice(idx.a));
@@ -269,6 +277,7 @@ fn indexDecls(idx: *Index, decls: []const ast.Decl, outer: []const u8, pkg: []co
             .Class => |*c| {
                 const path = joinPath(idx.a, outer, c.name.name);
                 try idx.all_paths.put(path, {});
+                try idx.class_nodes.put(path, c);
                 try recordSupersAndAnnotations(idx, path, c.supertypes, c.annotations);
                 if (isSerializableIn(idx, c.annotations)) {
                     const with = serializableWith(idx.a, c.annotations);
@@ -418,6 +427,14 @@ fn primZero(p: Prim) []const u8 {
     };
 }
 
+/// Per-file serializer policy from `@file:` annotations.
+const FileSettings = struct {
+    /// Type heads listed in `@file:UseContextualSerialization(...)`.
+    contextual: std.StringHashMap(void),
+    /// Type head -> serializer reference path from `@file:UseSerializers(...)`.
+    use_serializers: std.StringHashMap([]const u8),
+};
+
 const Gen = struct {
     a: Allocator,
     idx: *const Index,
@@ -426,6 +443,7 @@ const Gen = struct {
     /// Nested path of the class being generated (`Outer.Inner`); a bare
     /// type name resolves against its enclosing scopes first.
     scope_path: []const u8 = "",
+    file: ?*const FileSettings = null,
 
     /// Qualify a type reference as written in the class to the path the
     /// synthetic top-level file can name: a sibling nested class
@@ -504,6 +522,15 @@ const Gen = struct {
         const a = self.a;
         if (serializableWith(a, annotations)) |w| return self.customSerializerRef(w);
         const head = simpleHead(t.name.name);
+        // File-level policy applies after the property's own annotations.
+        if (self.file) |fs| {
+            if (!hasAnnotation(annotations, "Contextual") and !hasAnnotation(annotations, "Polymorphic")) {
+                if (fs.use_serializers.get(head)) |ser| return self.customSerializerRef(ser);
+                if (fs.contextual.contains(head)) {
+                    return std.fmt.allocPrint(a, "ContextualSerializer({s}::class, null, arrayOf())", .{try self.qualify(t.name.name)});
+                }
+            }
+        }
         if (hasAnnotation(annotations, "Contextual")) {
             return std.fmt.allocPrint(a, "ContextualSerializer({s}::class, null, arrayOf())", .{try self.qualify(t.name.name)});
         }
@@ -638,19 +665,45 @@ fn collectElems(a: Allocator, c: *const ast.Class) Allocator.Error![]Elem {
         if (p.receiver_type != null) continue;
         if (hasAnnotation(p.annotations, "Transient")) continue;
         if (p.is_abstract) continue;
-        // Backing field (the plugin's element rule): an initializer, a
-        // lateinit, a plain declaration without custom accessors, or a
-        // custom accessor that reads/writes `field`. A property whose
-        // accessors never touch `field` has no storage and is skipped.
+        // The plugin's element rule for body properties: an INITIALIZER
+        // (or lateinit) makes the property an element; a property assigned
+        // only in an init block, or one whose accessors compute the value,
+        // is not serialized (CustomPropertyAccessorsTest pins both).
         if (p.delegate != null) continue;
-        const getter_field = if (p.getter) |gt| ast.accessorUsesField(gt) else false;
-        const setter_field = if (p.setter) |st| ast.accessorUsesField(st) else false;
-        const has_field = p.init != null or p.is_lateinit or
-            (p.getter == null and p.setter == null) or getter_field or setter_field;
+        const has_field = p.init != null or p.is_lateinit;
         if (!has_field) continue;
-        if (p.ty == null) continue;
-        // Point INTO the AST (the property is boxed, so this outlives the loop).
-        const ty: *const ast.TypeRef = &p.ty.?;
+        // A property with no annotation carries an INFERRED type: name it
+        // from a literal initializer (the plugin's inference has the real
+        // answer; a non-literal initializer falls back to `Any`, which the
+        // polymorphic path reports honestly if it cannot serialize).
+        const ty: *const ast.TypeRef = if (p.ty) |*t| t else blk: {
+            const init = p.init orelse continue;
+            const inferred_name: []const u8 = switch (init) {
+                .StringTemplate => "String",
+                .IntLit => |lit| switch (lit.kind) {
+                    .Long => "Long",
+                    .UInt => "UInt",
+                    .ULong => "ULong",
+                    .Int => "Int",
+                },
+                .FloatLit => |lit| if (lit.kind == .Float) "Float" else "Double",
+                .BoolLit => "Boolean",
+                .CharLit => "Char",
+                else => "Any",
+            };
+            const t = try a.create(ast.TypeRef);
+            t.* = .{
+                .name = .{ .name = inferred_name, .span = p.name.span },
+                .nullable = false,
+                .span = p.name.span,
+                .type_args = &.{},
+                .function = null,
+                .definitely_non_null = false,
+                .annotations = &.{},
+                .qualified_path = null,
+            };
+            break :blk t;
+        };
         const sn: []const u8 = if (findAnnotation(p.annotations, "SerialName")) |an| (annotationStringArg(an) orelse p.name.name) else p.name.name;
         try out.append(a, .{
             .name = p.name.name,
@@ -721,9 +774,7 @@ fn typeSerialArgs(a: Allocator, c: *const ast.Class) Allocator.Error![]const u8 
 
 /// The full `$serializer` for a plain class.
 fn genClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c: *const ast.Class, info: *const Info) Allocator.Error!void {
-    const elems = try collectElems(a, c);
     const gn = try genName(a, info.path);
-    const serial = try serialNameOf(a, info);
     const tps = try typeParamList(a, c);
     const self_ty = try std.fmt.allocPrint(a, "{s}{s}", .{ info.path, tps });
     const generic = c.type_params.len != 0;
@@ -732,6 +783,19 @@ fn genClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c: *co
     } else {
         try wp(w, a, "object `{s}` : GeneratedSerializer<{s}> {{\n", .{ gn, self_ty });
     }
+    try genClassSerializerBody(w, a, g, c, info);
+    try w.appendSlice(a, "}\n\n");
+}
+
+/// The members of a generated serializer for `c` (descriptor, child
+/// serializers, serialize, deserialize) — the body of `<Name>$serializer`,
+/// and of a `@Serializer(forClass = Name::class)` object the plugin fills.
+fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c: *const ast.Class, info: *const Info) Allocator.Error!void {
+    const elems = try collectElems(a, c);
+    const serial = try serialNameOf(a, info);
+    const tps = try typeParamList(a, c);
+    const self_ty = try std.fmt.allocPrint(a, "{s}{s}", .{ info.path, tps });
+    const generic = c.type_params.len != 0;
     // Descriptor.
     try wp(w, a, "    override val descriptor: SerialDescriptor = PluginGeneratedSerialDescriptor(\"{s}\", this, {d}).also {{ `$dd` ->\n", .{ serial, elems.len });
     for (elems) |*e| {
@@ -875,7 +939,7 @@ fn genClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c: *co
         };
         try wp(w, a, "            if ((`$seen{d}` and {d}) != 0) `$inst`.{s} = {s}\n", .{ i / 32, bit, e.name, val_expr });
     }
-    try w.appendSlice(a, "            `$inst`\n        }\n    }\n}\n\n");
+    try w.appendSlice(a, "            `$inst`\n        }\n    }\n");
 }
 
 /// The class annotations a generated descriptor carries: the class's own
@@ -1019,25 +1083,38 @@ fn genEnumFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, c: *co
     try wp(w, a, "fun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, gn });
 }
 
+/// The concrete serializable subclasses of a sealed declaration, flattened
+/// through nested sealed / abstract / interface subtypes (the plugin lists
+/// leaves only), in declaration order, without duplicates.
+fn collectSealedLeaves(a: Allocator, idx: *const Index, parent_name: []const u8, out: *std.ArrayList([]const u8), seen: *std.StringHashMap(void)) Allocator.Error!void {
+    const subs: []const SealedSub = if (idx.sealed_subs.get(parent_name)) |l| l.items else &.{};
+    for (subs) |sub| {
+        if (seen.contains(sub.path)) continue;
+        try seen.put(sub.path, {});
+        const si = idx.by_path.get(sub.path) orelse continue;
+        switch (si.kind) {
+            .sealed, .interface_sealed, .polymorphic => try collectSealedLeaves(a, idx, si.name, out, seen),
+            else => try out.append(a, sub.path),
+        }
+    }
+}
+
 fn genSealedFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, info: *const Info) Allocator.Error!void {
     const gn = try genName(a, info.path);
     const serial = try serialNameOf(a, info);
-    const subs: []const SealedSub = if (idx.sealed_subs.get(info.name)) |l| l.items else &.{};
+    var leaves: std.ArrayList([]const u8) = .empty;
+    var seen = std.StringHashMap(void).init(a);
+    try collectSealedLeaves(a, idx, info.name, &leaves, &seen);
+    const subs: []const []const u8 = leaves.items;
     try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ SealedClassSerializer(\"{s}\", {s}::class, arrayOf<KClass<out {s}>>(", .{ gn, info.path, serial, info.path, info.path });
-    var n: usize = 0;
-    for (subs) |s| {
-        if (idx.by_name.get(simpleHead(s.path)) == null) continue;
+    for (subs, 0..) |sp, n| {
         if (n > 0) try w.appendSlice(a, ", ");
-        try wp(w, a, "{s}::class", .{s.path});
-        n += 1;
+        try wp(w, a, "{s}::class", .{sp});
     }
     try wp(w, a, "), arrayOf<KSerializer<out {s}>>(", .{info.path});
-    n = 0;
-    for (subs) |s| {
-        if (idx.by_name.get(simpleHead(s.path)) == null) continue;
+    for (subs, 0..) |sp, n| {
         if (n > 0) try w.appendSlice(a, ", ");
-        try wp(w, a, "{s}.serializer()", .{s.path});
-        n += 1;
+        try wp(w, a, "{s}.serializer()", .{sp});
     }
     const sanns = try classAnnotationCalls(a, idx, info.path);
     if (sanns.len != 0) {
@@ -1234,7 +1311,46 @@ const Ctx = struct {
     /// Extra padding so successive snippets in one file never share
     /// offsets either (span-keyed registries would merge them).
     next_pad: usize = 0,
+    settings: FileSettings,
 };
+
+/// The type a serializer declaration serializes: its `KSerializer<T>`
+/// supertype argument head, resolved through the index.
+fn serializerTargetHead(idx: *const Index, ser_path: []const u8) ?[]const u8 {
+    const sups = idx.super_refs.get(ser_path) orelse return null;
+    for (sups) |*st| {
+        if (!std.mem.eql(u8, simpleHead(st.name.name), "KSerializer")) continue;
+        if (st.type_args.len == 0 or st.type_args[0].is_star) continue;
+        return simpleHead(st.type_args[0].ty.name.name);
+    }
+    return null;
+}
+
+fn fileSettings(a: Allocator, idx: *const Index, f: *const ast.KotlinFile) Allocator.Error!FileSettings {
+    var fs = FileSettings{ .contextual = std.StringHashMap(void).init(a), .use_serializers = std.StringHashMap([]const u8).init(a) };
+    for (f.file_annotations) |*an| {
+        const n = annotationSimpleName(an);
+        if (std.mem.eql(u8, n, "UseContextualSerialization")) {
+            for (an.args) |*arg| {
+                if (exprClassRef(a, arg)) |c| try fs.contextual.put(simpleHead(c), {});
+            }
+        } else if (std.mem.eql(u8, n, "UseSerializers")) {
+            for (an.args) |*arg| {
+                const c = exprClassRef(a, arg) orelse continue;
+                // Resolve the serializer's path: as written, then by simple name.
+                const ser_path: []const u8 = if (idx.super_refs.contains(c)) c else blk: {
+                    var it = idx.super_refs.keyIterator();
+                    while (it.next()) |k| {
+                        if (std.mem.eql(u8, simpleHead(k.*), simpleHead(c))) break :blk k.*;
+                    }
+                    break :blk c;
+                };
+                if (serializerTargetHead(idx, ser_path)) |target| try fs.use_serializers.put(target, ser_path);
+            }
+        }
+    }
+    return fs;
+}
 
 fn snippetPadded(ctx: *Ctx, text: []const u8) Allocator.Error![]const u8 {
     const extra = try ctx.a.alloc(u8, ctx.next_pad);
@@ -1253,7 +1369,7 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
                 const info = ctx.idx.by_path.get(path) orelse continue;
                 var tps: std.ArrayList([]const u8) = .empty;
                 for (c.type_params) |*tp| try tps.append(ctx.a, tp.name.name);
-                const g = Gen{ .a = ctx.a, .idx = ctx.idx, .type_params = tps.items, .scope_path = path };
+                const g = Gen{ .a = ctx.a, .idx = ctx.idx, .type_params = tps.items, .scope_path = path, .file = &ctx.settings };
                 switch (info.kind) {
                     .class => try genClassSerializer(&ctx.gen, ctx.a, &g, c, &info),
                     .value_class => try genValueClassSerializer(&ctx.gen, ctx.a, &g, c, &info),
@@ -1273,9 +1389,13 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
             .Object => |*o| {
                 const path = joinPath(ctx.a, outer, o.name.name);
                 try processDecls(ctx, o.members, path);
+                if (serializerForClassTarget(ctx.a, o.annotations)) |target_written| {
+                    try genForClassObject(ctx, o, path, target_written);
+                    continue;
+                }
                 if (!isSerializableIn(ctx.idx, o.annotations)) continue;
                 const info = ctx.idx.by_path.get(path) orelse continue;
-                const g = Gen{ .a = ctx.a, .idx = ctx.idx, .type_params = &.{}, .scope_path = path };
+                const g = Gen{ .a = ctx.a, .idx = ctx.idx, .type_params = &.{}, .scope_path = path, .file = &ctx.settings };
                 switch (info.kind) {
                     .with_custom => try genWithFactory(&ctx.gen, ctx.a, &g, &info),
                     else => try genObjectFactory(&ctx.gen, ctx.a, ctx.idx, &info),
@@ -1289,6 +1409,60 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
             },
             else => {},
         }
+    }
+}
+
+/// `@Serializer(forClass = X::class)` target as written, if any.
+fn serializerForClassTarget(a: Allocator, annotations: []const ast.Annotation) ?[]const u8 {
+    const an = findAnnotation(annotations, "Serializer") orelse return null;
+    for (an.args) |*arg| {
+        if (exprClassRef(a, arg)) |c| return c;
+    }
+    return null;
+}
+
+/// Fill a `@Serializer(forClass = X::class)` object with X's generated
+/// serializer members (the plugin does exactly this for a bodiless
+/// object). The object keeps its own name and supertypes; the body text is
+/// parsed as a wrapper object and its members spliced in.
+fn genForClassObject(ctx: *Ctx, o: *ast.ObjectDecl, obj_path: []const u8, target_written: []const u8) Allocator.Error!void {
+    const a = ctx.a;
+    const scope = if (std.mem.lastIndexOfScalar(u8, obj_path, '.')) |d| obj_path[0..d] else "";
+    var g0 = Gen{ .a = a, .idx = ctx.idx, .type_params = &.{}, .scope_path = obj_path };
+    const target_path = try g0.qualify(target_written);
+    _ = scope;
+    const c = ctx.idx.class_nodes.get(target_path) orelse return;
+    const info = ctx.idx.by_path.get(target_path) orelse Info{
+        .name = c.name.name,
+        .path = target_path,
+        .pkg = ctx.pkg,
+        .kind = .class,
+        .type_params = c.type_params.len,
+    };
+    var tps: std.ArrayList([]const u8) = .empty;
+    for (c.type_params) |*tp| try tps.append(a, tp.name.name);
+    const g = Gen{ .a = a, .idx = ctx.idx, .type_params = tps.items, .scope_path = target_path, .file = &ctx.settings };
+    var body: std.ArrayList(u8) = .empty;
+    try wp(&body, a, "object {s} : GeneratedSerializer<{s}> {{\n", .{o.name.name, info.path});
+    try genClassSerializerBody(&body, a, &g, c, &info);
+    try body.appendSlice(a, "}\n");
+    // The body references the serialization surface by simple name, so it
+    // lives in the synthetic sibling file's import scope: emit it there as
+    // a top-level object `<Obj>$forClass` and delegate the object's members.
+    const impl_name = try std.fmt.allocPrint(a, "{s}$forClass", .{try genName(a, obj_path)});
+    try wp(&ctx.gen, a, "object `{s}` : GeneratedSerializer<{s}> {{\n", .{ impl_name, info.path });
+    try genClassSerializerBody(&ctx.gen, a, &g, c, &info);
+    try ctx.gen.appendSlice(a, "}\n\n");
+    ctx.generated_any = true;
+    const splice = try std.fmt.allocPrint(a,
+        "object {s} {{ override val descriptor: kotlinx.serialization.descriptors.SerialDescriptor get() = `{s}`.descriptor\n" ++
+            "override fun serialize(encoder: kotlinx.serialization.encoding.Encoder, value: {s}) = `{s}`.serialize(encoder, value)\n" ++
+            "override fun deserialize(decoder: kotlinx.serialization.encoding.Decoder): {s} = `{s}`.deserialize(decoder) }}",
+        .{ o.name.name, impl_name, info.path, impl_name, info.path, impl_name });
+    const splice_src = try snippetPadded(ctx, splice);
+    if (parseSnippet(a, ctx.file.span.file, splice_src)) |snip_val| {
+        var snip = snip_val;
+        try spliceInto(a, &o.members, true, &snip);
     }
 }
 
@@ -1342,7 +1516,7 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
         f.decls = decls_copy;
         const pad = try a.alloc(u8, f.span.end + 16);
         @memset(pad, ' ');
-        var ctx = Ctx{ .a = a, .idx = &idx, .file = f, .pkg = packageText(a, f), .gen = .empty, .pad = pad };
+        var ctx = Ctx{ .a = a, .idx = &idx, .file = f, .pkg = packageText(a, f), .gen = .empty, .pad = pad, .settings = try fileSettings(a, &idx, f) };
         try processDecls(&ctx, f.decls, "");
         if (!ctx.generated_any) continue;
         // The generated sibling file.

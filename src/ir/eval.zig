@@ -455,6 +455,16 @@ pub fn currentFuncName() ?[]const u8 {
 /// above it, the fused body is the executing code (private-member
 /// visibility, self-serve guards, and file scoping all key off this); the
 /// moment a callee pushes a real frame, that frame wins again.
+/// The innermost executing frame's i-th bound parameter value (borrowed),
+/// or null. Reified type-variable reads resolve through this: a type
+/// parameter that names a value parameter's declared type binds to that
+/// argument's runtime class, whatever dispatch path reached the frame.
+pub fn currentFrameParam(i: usize) ?Value {
+    const fr = evtls.frame_chain orelse return null;
+    if (i >= fr.params.items.len) return null;
+    return fr.params.items[i];
+}
+
 pub fn currentFrameFunc() ?*const ir.Func {
     if (fused_depth > 0 and fused_marks[fused_depth - 1].head == evtls.frame_chain)
         return fused_marks[fused_depth - 1].func;

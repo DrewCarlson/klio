@@ -3540,6 +3540,13 @@ fn buildModuleWithOverrides(
                 ifaces.deinit(a);
             }
         }
+        // Nested-class tables: a class's `nested_classes` names every class
+        // / object / interface declared in its body, resolved to the runtime
+        // defs registered above. The image loader restores this table for
+        // baked classes; a freshly built program must fill it the same way,
+        // or a reified `typeOf<Nested>()` inside the outer class cannot
+        // reach the nested def.
+        try fillNestedClassTables(a, decls, &classes, "");
     }
 
     // Parent-ctor argument thunks.
@@ -4660,6 +4667,49 @@ fn spanNamesObject(object_spans: []const Span, target: Span) bool {
         if (std.meta.eql(s, target)) return true;
     }
     return false;
+}
+
+/// See the nested-class-table comment at the link site.
+fn fillNestedClassTables(a: Allocator, decls_in: []const Decl, classes: *const std.StringHashMap(ObjRef(ClassDef)), outer_fqn: []const u8) Allocator.Error!void {
+    for (decls_in) |*d| {
+        const members: []const Decl = switch (d.*) {
+            .Class => |*c| c.members,
+            .Object => |*o| o.members,
+            else => continue,
+        };
+        const self_name: []const u8 = switch (d.*) {
+            .Class => |*c| c.name.name,
+            .Object => |*o| o.name.name,
+            else => unreachable,
+        };
+        const self_fqn = if (outer_fqn.len == 0) self_name else try std.fmt.allocPrint(a, "{s}.{s}", .{ outer_fqn, self_name });
+        const self_def: ?ObjRef(ClassDef) = classes.get(self_fqn) orelse classes.get(self_name);
+        if (self_def) |sd| {
+            var list: std.ArrayList(ClassDef.NestedClass) = .empty;
+            for (members) |*m| {
+                const nname: []const u8 = switch (m.*) {
+                    .Class => |*c| if (c.is_companion) continue else c.name.name,
+                    .Object => |*o| o.name.name,
+                    else => continue,
+                };
+                const nfqn = try std.fmt.allocPrint(a, "{s}.{s}", .{ self_fqn, nname });
+                const nd = classes.get(nfqn) orelse classes.get(nname) orelse continue;
+                try list.append(a, .{ .name = nname, .class = nd.clone() });
+            }
+            if (list.items.len != 0) {
+                const g = sd.borrowMut();
+                if (g.get().nested_classes.len == 0) {
+                    g.get().nested_classes = try list.toOwnedSlice(a);
+                } else {
+                    list.deinit(a);
+                }
+                g.deinit();
+            } else {
+                list.deinit(a);
+            }
+        }
+        try fillNestedClassTables(a, members, classes, self_fqn);
+    }
 }
 
 fn buildClassDef(

@@ -329,6 +329,50 @@ fn inferTypeArgFromArgs(self: *VmHost, allocator: Allocator, f: *const ir.Func, 
     return null;
 }
 
+/// A reified type variable named `name` in the innermost frame's function,
+/// resolved from that frame's own arguments (the first value parameter
+/// declared as the bare variable). Null when the frame's function does not
+/// declare it or no argument decides it. This is the READ-side binding:
+/// it is independent of how the call was dispatched, so a dynamically
+/// dispatched reified extension never reads a stale splice global.
+pub fn reifiedFromFrame(self: *VmHost, allocator: Allocator, name: []const u8) ?Value {
+    const fr = ir.eval.currentFrameFunc() orelse return null;
+    const names: []const []const u8 = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().registry.func_type_params.get(fr.id)) |l| break :blk l.items;
+        break :blk &.{};
+    };
+    var declared = false;
+    for (names) |n| {
+        if (std.mem.eql(u8, n, name)) declared = true;
+    }
+    if (!declared) return null;
+    for (fr.params, 0..) |*p, i| {
+        if (!std.mem.eql(u8, p.ty.name, name)) continue;
+        const v = ir.eval.currentFrameParam(i) orelse continue;
+        switch (v) {
+            .Instance => |inst| {
+                const g = inst.borrow();
+                defer g.deinit();
+                return Value{ .Class = g.get().class.clone() };
+            },
+            .Null => continue,
+            else => {
+                const fqn = v.typeFqn();
+                const head = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+                {
+                    const cg = self.classes.borrow();
+                    defer cg.deinit();
+                    if (cg.get().get(head)) |c| return Value{ .Class = c.clone() };
+                }
+                return host_call_member.syntheticClassFromFqn(allocator, fqn) catch null;
+            },
+        }
+    }
+    return null;
+}
+
 fn typeArgUnbound(arg_name: []const u8, names: []const []const u8) bool {
     if (arg_name.len == 0) return true;
     for (names) |n| {
@@ -377,6 +421,13 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
             if (std.mem.eql(u8, n, head)) is_tp = true;
         }
         if (!is_tp) break :blk head;
+        if (reifiedFromFrame(self, allocator, head)) |fv| {
+            if (fv == .Class) {
+                const fg = fv.Class.borrow();
+                defer fg.deinit();
+                break :blk try allocator.dupe(u8, fg.get().name);
+            }
+        }
         const g = self.globals.borrow();
         defer g.deinit();
         const bv = g.get().lookup(head) orelse break :blk head;

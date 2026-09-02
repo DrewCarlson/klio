@@ -1247,6 +1247,24 @@ fn inferReifiedTypeArgs(
     ordered: []const ?*const Expr,
     bb: ?*const FuncBuilder,
 ) Allocator.Error![]?TypeRef {
+    return inferReifiedTypeArgsRecv(allocator, f, explicit, expected, ordered, bb, null);
+}
+
+/// `inferReifiedTypeArgs` with the RECEIVER expression: a reified
+/// parameter that only appears in receiver position (`SD.equalsImpl(...)`
+/// declared `<reified SD : SerialDescriptor> SD.equalsImpl`) binds from
+/// the receiver's static type, or — for an implicit receiver — from the
+/// enclosing declaration's receiver type. Left unbound it spliced `is SD`
+/// against nothing and every descriptor `equals` answered false.
+fn inferReifiedTypeArgsRecv(
+    allocator: Allocator,
+    f: *const Function,
+    explicit: []const TypeRef,
+    expected: ?*const TypeRef,
+    ordered: []const ?*const Expr,
+    bb: ?*const FuncBuilder,
+    recv_arg: ?*const Expr,
+) Allocator.Error![]?TypeRef {
     var out = try allocator.alloc(?TypeRef, f.type_params.len);
     for (f.type_params, 0..) |_, i| {
         out[i] = if (i < explicit.len) explicit[i] else null;
@@ -1281,6 +1299,29 @@ fn inferReifiedTypeArgs(
         try unifyParamAgainstArg(allocator, &p.ty, arg, &tp_names, &subst, bb);
     }
 
+    // Receiver position: unify the declared receiver type against the
+    // receiver expression, or the enclosing declaration's receiver type
+    // for an implicit `this`.
+    if (f.receiver_type) |*rt| {
+        if (recv_arg) |ra| {
+            try unifyParamAgainstArg(allocator, rt, ra, &tp_names, &subst, bb);
+        } else if (bb) |b| {
+            if (try inferReceiverType(b, null)) |head| {
+                const hd = std.mem.trimEnd(u8, head, "?");
+                const synth = TypeRef{
+                    .name = .{ .name = hd, .span = rt.span },
+                    .nullable = false,
+                    .span = rt.span,
+                    .type_args = &.{},
+                    .function = null,
+                    .definitely_non_null = false,
+                    .annotations = &.{},
+                    .qualified_path = null,
+                };
+                try unifyTypeParam(rt, &synth, &tp_names, &subst);
+            }
+        }
+    }
     // Fallback: unify the declared return type against the call's expected
     // (tail-position) type, so `val u: User = resp.body()` binds `T = User`
     // with no explicit `<User>`.
@@ -2374,13 +2415,22 @@ pub fn tryInlineCallWithTypeArgs(
     // reified parameters (the `Json.encodeToString(value)` shape) splices
     // fine without a binding.
     {
-        const probe = try inferReifiedTypeArgs(b.allocator, f, type_args, expected, ordered, b);
+        const probe = try inferReifiedTypeArgsRecv(b.allocator, f, type_args, expected, ordered, b, this_arg);
         defer b.allocator.free(probe);
         var unbound_reified = false;
         for (f.type_params, 0..) |tp, i| {
             if (!(tp.is_reified and probe[i] == null)) continue;
             if (callableRefParamFor(f, ordered, tp.name.name) != null) continue;
             unbound_reified = true;
+        }
+        if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+            if (std.mem.eql(u8, w, fname)) {
+                for (f.type_params, 0..) |tp, i| {
+                    if (!tp.is_reified) continue;
+                    const bound: []const u8 = if (probe[i]) |t| t.name.name else "<unbound>";
+                    std.debug.print("[splice] {s} reified {s} probe={s}\n", .{ fname, tp.name.name, bound });
+                }
+            }
         }
         if (unbound_reified and !(try reifiedParamsUnusedInBody(b.allocator, f))) {
             spliceBail(fname, "unbound-reified");
@@ -3175,8 +3225,17 @@ pub fn tryInlineCallWithTypeArgs(
     // unspecified is inferred by unifying the function's declared return
     // type against the call's expected (tail-position) type, so
     // `val u: User = resp.body()` binds `T = User` with no `<User>`.
-    const effective_type_args = try inferReifiedTypeArgs(b.allocator, f, type_args, expected, ordered, b);
+    const effective_type_args = try inferReifiedTypeArgsRecv(b.allocator, f, type_args, expected, ordered, b, this_arg);
     defer b.allocator.free(effective_type_args);
+    if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, fname)) {
+            for (f.type_params, 0..) |tp, i| {
+                if (!tp.is_reified) continue;
+                const bound: []const u8 = if (effective_type_args[i]) |t| t.name.name else "<unbound>";
+                std.debug.print("[splice] {s} reified {s} effective={s}\n", .{ fname, tp.name.name, bound });
+            }
+        }
+    }
     const ReifiedRestore = struct { name: []const u8, prev: ?Reg };
     var reified_restores: std.ArrayList(ReifiedRestore) = .empty;
     defer reified_restores.deinit(b.allocator);

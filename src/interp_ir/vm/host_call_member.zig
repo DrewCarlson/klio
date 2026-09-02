@@ -14511,9 +14511,29 @@ fn memberRefResolved(
     // instance receiver, reach into the runtime ClassDef.
     if (std.mem.eql(u8, name, "class")) {
         if (receiver.* == .Instance) {
-            const ig = receiver.Instance.borrow();
-            defer ig.deinit();
-            return .{ .ok = .{ .Class = ig.get().class.clone() } };
+            const cls: ObjRef(ClassDef) = blk: {
+                const ig = receiver.Instance.borrow();
+                defer ig.deinit();
+                break :blk ig.get().class.clone();
+            };
+            // `A::class` on a class that has a companion reaches here with
+            // the COMPANION instance (the bare name's global is the
+            // companion); the class literal is the owner, never the
+            // companion's own class.
+            const cv = Value{ .Class = cls };
+            const is_companion = blk: {
+                const cg = cls.borrow();
+                defer cg.deinit();
+                const n = cg.get().name;
+                break :blk std.mem.endsWith(u8, n, "$Companion") or std.mem.endsWith(u8, n, ".Companion") or std.mem.eql(u8, n, "Companion");
+            };
+            if (is_companion) {
+                if (try companionOwnerClassValue(self, &cv)) |owner| {
+                    cls.deinit();
+                    return .{ .ok = owner };
+                }
+            }
+            return .{ .ok = cv };
         }
         // A `Type::class` value is already a class literal.
         if (receiver.* == .Class) return .{ .ok = receiver.* };

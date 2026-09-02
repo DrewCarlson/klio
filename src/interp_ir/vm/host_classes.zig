@@ -96,7 +96,7 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
             break :blk mg.get().classId(ty.name) != null;
         };
         if (!module_has_class) {
-            if (lookupGlobal(self, ty.name)) |bound| {
+            if (host_call_func.reifiedFromFrame(self, std.heap.smp_allocator, ty.name) orelse lookupGlobal(self, ty.name)) |bound| {
                 switch (bound) {
                     .Class => |cls| {
                         const cg = cls.borrow();
