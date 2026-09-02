@@ -5850,6 +5850,31 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // stays an `it`-lambda and its bare member calls fall through to globals.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const cnm = callee.Path.segments[0].name;
+        // A bare call to an OWN MEMBER resolves to the member, not any
+        // same-named top-level fn — and the member is absent from
+        // func_name_index, so without this branch no arity is ever
+        // recorded and a `() -> Unit` trailing lambda keeps a phantom
+        // `it` that shadows the enclosing lambda's (`mrun { println(it) }`
+        // printed null). The registered member AST, keyed by (owner,
+        // name, arity), is the signature source; positional args only.
+        if (b.ownerClass() != null and b.hasOwnMember(cnm)) {
+            var any_named = false;
+            for (ast_arg_names) |n| {
+                if (n != null) any_named = true;
+            }
+            if (!any_named) {
+                if (inline_state.exprBodyMemberAst(b.ownerClass().?, cnm, args.len)) |mf| {
+                    for (args, 0..) |*a, i| {
+                        if (a.* != .Lambda and a.* != .AnonFun) continue;
+                        if (i >= mf.params.len) continue;
+                        const pt = &mf.params[i].ty;
+                        if (pt.function) |ft| {
+                            b.recordLambdaArgArity(a.span(), @intCast(ft.params.len));
+                        }
+                    }
+                }
+            }
+        }
         // Only when the callee name is UNAMBIGUOUS (a single same-named
         // function): the arity then definitely matches the resolved overload.
         // With overloads, `funcId` is a heuristic that may name the wrong one,
