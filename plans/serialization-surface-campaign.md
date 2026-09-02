@@ -375,6 +375,20 @@ content-negotiation.
   a few json cases. The staged-mask experiment did not fix it (the leak
   is through the splice arg context, not the speculative-resolve path).
   Fix is in the map->unsafeTransform splice arg hygiene.
+
+  Update: the receiver-side bleed (`X.map { }.firstOrNull { }`, fm6) is
+  fixed — `lowerReceiver` shields pending_arg_broad_masks /
+  fn_generic / lambda_param_types but the round-23 unit mask
+  (pending_arg_lambda_unit) was never added to that shield; adding it
+  stops a receiver splice's `-> Unit` operator from tagging the outer
+  call's lambda. A SECOND path remains in CookieDateParser
+  (`lexer.capture { accept { it.isDigit() }.otherwise { } }`): the
+  trace shows `accept`'s OWN `(Char) -> Boolean` predicate flagged Unit
+  (`fnTypeReturnsUnit(func.params[pi].ty)` true for a Function1 whose
+  declared return is Boolean). Suspected `func` pointer read after the
+  module function table moved during a nested lambda-body lowering (the
+  same hazard the ext-call path warns about for `target`); confirm and
+  snapshot the param type before the receiver / block lowers.
   Remaining core 3 (after round eighteen):
   BasicTypesSerializationTest.testKvSerialization,
   SealedGenericClassesTest.testQuery,

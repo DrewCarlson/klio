@@ -145,13 +145,20 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const sh_bm = b.pending_arg_broad_masks;
     const sh_fg = b.pending_arg_fn_generic;
     const sh_lp = b.pending_arg_lambda_param_types;
+    // The `-> Unit` coercion mask belongs to the enclosing call's args too:
+    // a receiver splicing a `-> Unit` operator (map -> unsafeTransform) must
+    // not tag the outer call's lambda (`X.map { }.firstOrNull { }`).
+    const sh_lu = b.pending_arg_lambda_unit;
     b.pending_arg_broad_masks = null;
     b.pending_arg_fn_generic = null;
     b.pending_arg_lambda_param_types = null;
+    b.pending_arg_lambda_unit = null;
     defer {
         b.pending_arg_broad_masks = sh_bm;
         b.pending_arg_fn_generic = sh_fg;
         b.pending_arg_lambda_param_types = sh_lp;
+        if (b.pending_arg_lambda_unit) |m| b.allocator.free(m);
+        b.pending_arg_lambda_unit = sh_lu;
     }
     if (expr.* == .Path and expr.Path.segments.len == 1) {
         const segments = expr.Path.segments;
