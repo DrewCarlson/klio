@@ -208,6 +208,14 @@ fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: 
     // Frameless serve for the wider leaf-expression shape (a getter that
     // combines a couple of stored reads with primitive arithmetic).
     if (try ir.eval.leafExprServe(VmHost, allocator, mptr, func, &.{receiver}, self)) |r| return r;
+    // Compiled kl_ leaf gate: the getter path is a member-dispatch
+    // commit point like any other — a branchy accessor body the
+    // frameless evaluator declines (inWholeSeconds' unit chase) still
+    // serves natively when its leaf is registered.
+    if (try ir.eval.tryLeafValues(VmHost, allocator, mptr, func, &.{receiver}, self, null)) |lo| switch (lo) {
+        .val => |v| return .{ .ok = v },
+        .raise => |e| return errRes(e),
+    };
     // Pin the receiver as a GC root across the getter's re-entrant evaluation.
     // A getter body allocates and hits safe points; the only handle to the
     // receiver here is this native local (the frame-chain walk cannot see it
@@ -342,6 +350,28 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
 
 pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
     return lexicalReceiverFallback(self, allocator, receiver, name, unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, false, false)));
+}
+
+/// Leaf statics route backing: resolve `Owner.member` for a genre-9
+/// class handle inside a leaf body. ENUM ENTRIES ONLY — an entry is an
+/// eager singleton stored on the ClassDef itself (language-mandated
+/// identity), so its cell is rooted for the class's lifetime and
+/// borrow-safe for the leaf's duration. Anything else (companion vals,
+/// computed statics) returns null and the leaf bails to the exact
+/// re-run.
+pub fn leafStaticMember(self: *VmHost, owner: []const u8, member: []const u8) ?Value {
+    const def = blk: {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        break :blk cg.get().get(owner) orelse return null;
+    };
+    const dg = def.borrow();
+    defer dg.deinit();
+    if (!dg.get().is_enum) return null;
+    for (dg.get().enum_entries) |*e| {
+        if (std.mem.eql(u8, e.name, member)) return e.value;
+    }
+    return null;
 }
 
 /// A boxed capture (an anon-object method's captured outer `var` stored

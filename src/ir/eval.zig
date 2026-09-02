@@ -8296,12 +8296,14 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
         ev.route_ctx = @ptrCast(host);
         ev.field_route = &LeafFieldRoute(H).route;
         ev.type_route = &LeafTypeRoute(H).route;
+        ev.statics_route = &LeafStaticsRoute(H).route;
     } else {
         ev = .{
             .rare = &leafEdgeRareInterp,
             .route_ctx = @ptrCast(host),
             .field_route = &LeafFieldRoute(H).route,
             .type_route = &LeafTypeRoute(H).route,
+            .statics_route = &LeafStaticsRoute(H).route,
             .counter = &local_counter,
             .idle = runtime.gc.idleTickPtr(),
             .abandonable = runtime.abandonablePtr(),
@@ -8751,7 +8753,49 @@ pub const NativeEdgeView = extern struct {
     /// receiver's class IS the named type, 2 = it is not, 0 = miss
     /// (bail). The site binds the verdict to the receiver's class word.
     type_route: ?*const fn (route_ctx: ?*anyopaque, recv_cell: ?*anyopaque, name: [*:0]const u8) callconv(.c) i32 = null,
+    /// Static-member resolver for leaf genre-9 class handles (`owner`
+    /// is the emitted class-name literal): fills (value, genre) and
+    /// returns 1, or 0 to bail. Enum entries only — see
+    /// leafStaticMember.
+    statics_route: ?*const fn (route_ctx: ?*anyopaque, owner: [*:0]const u8, name: [*:0]const u8, out_v: *i64, out_g: *i32) callconv(.c) i32 = null,
 };
+
+/// Per-host statics thunk for leaf bodies: a genre-9 class handle's
+/// member read resolves through the host's enum-entry table (the only
+/// borrow-safe static family) and marshals the entry like a leaf arg.
+fn LeafStaticsRoute(comptime H: type) type {
+    return struct {
+        fn route(rctx: ?*anyopaque, owner: [*:0]const u8, name: [*:0]const u8, out_v: *i64, out_g: *i32) callconv(.c) i32 {
+            if (comptime !@hasDecl(H, "leafStaticMember")) return 0;
+            const host: *H = @ptrCast(@alignCast(rctx orelse return 0));
+            const v = host.leafStaticMember(std.mem.span(owner), std.mem.span(name)) orelse return 0;
+            switch (v) {
+                .Int => |x| {
+                    out_v.* = x;
+                    out_g.* = 0;
+                },
+                .Long => |x| {
+                    out_v.* = x;
+                    out_g.* = 1;
+                },
+                .Bool => |x| {
+                    out_v.* = @intFromBool(x);
+                    out_g.* = 2;
+                },
+                .Char => |x| {
+                    out_v.* = x;
+                    out_g.* = 4;
+                },
+                .Instance => |inst| {
+                    out_v.* = @bitCast(@as(u64, @intFromPtr(inst.cell)));
+                    out_g.* = 8;
+                },
+                else => return 0,
+            }
+            return 1;
+        }
+    };
+}
 
 /// Per-host instance-of thunk for leaf bodies: rebuilds a borrowed
 /// Instance view over the raw cell and asks the host's own `is`

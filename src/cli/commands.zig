@@ -1012,6 +1012,33 @@ fn leafTrace(f: *const ir.Func, comptime why: []const u8) void {
     if (std.c.getenv("KLIO_LEAF_TRACE") != null) std.debug.print("[leaf-miss] {s}: " ++ why ++ "\n", .{f.fqn});
 }
 
+/// Escape-op tag histogram over one transpile's eligibility fixpoint
+/// (raw hits — a fn re-scanned by the fixpoint counts again, so this
+/// RANKS tags rather than counting blocked bodies). Printed sorted
+/// under KLIO_LEAF_TRACE=1 at the end of emission.
+var leaf_escape_histo = std.enums.EnumArray(std.meta.Tag(ir.Inst), u32).initFill(0);
+
+fn printLeafEscapeHisto() void {
+    if (std.c.getenv("KLIO_LEAF_TRACE") == null) return;
+    const Tag = std.meta.Tag(ir.Inst);
+    var entries: [std.meta.fields(Tag).len]struct { tag: Tag, n: u32 } = undefined;
+    var n_used: usize = 0;
+    var it = leaf_escape_histo.iterator();
+    while (it.next()) |e| {
+        if (e.value.* == 0) continue;
+        entries[n_used] = .{ .tag = e.key, .n = e.value.* };
+        n_used += 1;
+    }
+    std.mem.sort(@TypeOf(entries[0]), entries[0..n_used], {}, struct {
+        fn lt(_: void, a2: @TypeOf(entries[0]), b2: @TypeOf(entries[0])) bool {
+            return a2.n > b2.n;
+        }
+    }.lt);
+    for (entries[0..n_used]) |e| {
+        std.debug.print("[leaf-escape-histo] {s} {d}\n", .{ @tagName(e.tag), e.n });
+    }
+}
+
 /// KLIO_LEAVES=<path.so>: load a scalar-replay leaf library and register
 /// its bodies by fqn (bakes are not cross-process fid-stable). Fail-open:
 /// a missing or malformed library just leaves the interpreter alone.
@@ -1070,6 +1097,12 @@ fn leafRegShim(fqn: [*:0]const u8, f: ir.eval.NativeLeafFn) callconv(.c) void {
 /// kv_long/kv_char/kv_inst helpers to be in scope.
 const leaf_getfield_c =
     \\static inline int32_t kl_getfield(klio_edge_view *ev, int64_t rl, int32_t rgv, uint64_t *site, const char *name, int64_t *ol, int32_t *og) {
+    \\  if (rgv == 9) {
+    \\    /* Genre-9 class handle (the emitted class-name literal): an
+    \\     * enum-entry read resolves through the statics route. */
+    \\    if (!ev->statics_route) return 0;
+    \\    return ev->statics_route(ev->route_ctx, (const char *)(uintptr_t)rl, name, ol, og);
+    \\  }
     \\  if (rgv != 8) return 0;
     \\  uint8_t *cell = (uint8_t *)(uintptr_t)rl;
     \\  if (!cell) return 0;
@@ -1359,6 +1392,7 @@ fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []cons
         io.printStderr(gpa, "error: write {s} failed\n", .{out_path});
         return 1;
     };
+    printLeafEscapeHisto();
     io.printStderr(gpa, "wrote {s} ({d} leaves)\n", .{ out_path, reg_list.items.len });
     return 0;
 }
@@ -1616,10 +1650,26 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                                 ok = false;
                             } else ctor_tail = true;
                         },
+                        // A CLASS-bound global read serves as a genre-9
+                        // name handle (a string literal, zero-cost); the
+                        // only op that consumes genre 9 is a field read,
+                        // which resolves enum entries through the statics
+                        // route and bails everything else.
+                        .LoadGlobal => |*lg| {
+                            if (lg.class == null or lg.ctor_ref or
+                                leafConstStrOf(consts, lg.name) == null)
+                            {
+                                leaf_escape_histo.getPtr(.LoadGlobal).* += 1;
+                                leafTrace(f, "escape-op");
+                                ok = false;
+                            }
+                        },
                         else => |other| {
+                            const tag = std.meta.activeTag(other);
+                            leaf_escape_histo.getPtr(tag).* += 1;
                             if (runtime.envOnce("KLIO_LEAF_TRACE")) |w2| {
                                 if (std.mem.eql(u8, w2, f.name) or std.mem.eql(u8, w2, f.fqn))
-                                    std.debug.print("[leaf-miss-inst] {s}: {s}\n", .{ f.fqn, @tagName(std.meta.activeTag(other)) });
+                                    std.debug.print("[leaf-miss-inst] {s}: {s}\n", .{ f.fqn, @tagName(tag) });
                             }
                             leafTrace(f, "escape-op");
                             ok = false;
@@ -1858,6 +1908,9 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                             if (iot.dst.int() > max_reg) max_reg = iot.dst.int();
                             if (iot.src.int() > max_reg) max_reg = iot.src.int();
                         },
+                        .LoadGlobal => |*lg| {
+                            if (lg.dst.int() > max_reg) max_reg = lg.dst.int();
+                        },
                         else => {},
                     }
                     pc += 2;
@@ -1973,6 +2026,13 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                         const fname = leafConstStrOf(consts, gf.field).?;
                         try w.print("  {{ static uint64_t KFS_{d}_{d} = 0;\n", .{ bi, code[pc + 1] });
                         try w.print("    if (!kl_getfield(ev, l{d}, g{d}, &KFS_{d}_{d}, \"{s}\", &l{d}, &g{d})) return 0; }}\n", .{ gf.receiver.int(), gf.receiver.int(), bi, code[pc + 1], fname, gf.dst.int(), gf.dst.int() });
+                        pc += 2;
+                        continue;
+                    }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .LoadGlobal) {
+                        const lg = &f.blocks[bi].insts[code[pc + 1]].LoadGlobal;
+                        const cname = m.classes.items[lg.class.?.int()].name;
+                        try w.print("  l{d} = (int64_t)(uintptr_t)\"{s}\"; g{d} = 9;\n", .{ lg.dst.int(), cname, lg.dst.int() });
                         pc += 2;
                         continue;
                     }
