@@ -86,6 +86,13 @@ root = "upstream/formats/json/commonMain/src"
 # plus actuals for the internal `expect`s in Platform.common.kt and
 # the reflective `serializer()` entrypoints (the compiler-plugin
 # replacement; backed by the host intrinsics in src/kotlinx_serialization).
+# json-io (formats/json-io): `Json.encodeToSink` / `decodeFromSource` over
+# kotlinx.io Source/Sink. Collected here; gated to the `json` feature so it
+# loads only with `--feature kotlinx.serialization/json` (which pulls the
+# kotlinx.io pack its Source/Sink/Buffer types come from).
+[[source]]
+root = "upstream/formats/json-io/commonMain/src"
+
 [[source]]
 root = "klioMain"
 
@@ -101,7 +108,7 @@ id = "stdlib"
 # via `--feature kotlinx.serialization/json`.
 [features]
 default = []
-json = { sources = ["upstream/formats/json/commonMain/src", "klioMain/kotlinx/serialization/json"] }
+json = { sources = ["upstream/formats/json/commonMain/src", "upstream/formats/json-io/commonMain/src", "klioMain/kotlinx/serialization/json"], deps = ["kotlinx.io"] }
 
 # commonTest sources for `klio test` (not packed).
 [[test]]
@@ -113,15 +120,12 @@ root = "upstream/core/commonTest"
 root = "klioTest"
 
 # Upstream's JSON test suite (formats/json-tests), gated on the `json`
-# feature. Its streaming modes run upstream's json-okio / json-io adapter
-# modules unchanged over the klioTest/json stand-ins for the okio and
-# kotlinx-io buffer types the pack does not ship.
+# feature. Its OKIO streaming mode runs upstream's json-okio adapter module
+# unchanged over the klioTest/json stand-in for the okio buffer type the
+# pack does not ship; the KXIO mode runs the pack's own json-io module over
+# the real kotlinx.io pack.
 [[test]]
 root = "upstream/formats/json-okio/commonMain/src"
-feature = "json"
-
-[[test]]
-root = "upstream/formats/json-io/commonMain/src"
 feature = "json"
 
 [[test]]

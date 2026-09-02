@@ -63,6 +63,18 @@ include = [
     "androidx/compose/ui/graphics/Brush.kt",
     # Shadow — a plain data holder (color/offset/blur) TextStyle references.
     "androidx/compose/ui/graphics/Shadow.kt",
+    "androidx/compose/ui/graphics/Interpolatable.kt",
+    "androidx/compose/ui/graphics/RenderEffect.kt",
+    "androidx/compose/ui/graphics/vector/PathNode.kt",
+    "androidx/compose/ui/graphics/vector/PathBuilder.kt",
+    "androidx/compose/ui/graphics/vector/FastFloatParser.kt",
+    "androidx/compose/ui/graphics/vector/PathParser.kt",
+    "androidx/compose/ui/graphics/shadow/Blur.kt",
+    "androidx/compose/ui/graphics/shadow/Shadow.kt",
+    "androidx/compose/ui/graphics/shadow/ShadowContext.kt",
+    "androidx/compose/ui/graphics/shadow/ShadowRenderer.kt",
+    "androidx/compose/ui/graphics/shadow/DropShadowPainter.kt",
+    "androidx/compose/ui/graphics/shadow/InnerShadowPainter.kt",
     # Pure drawing-parameter value classes (inline over Int; Immutable only).
     "androidx/compose/ui/graphics/BlendMode.kt",
     "androidx/compose/ui/graphics/ClipOp.kt",

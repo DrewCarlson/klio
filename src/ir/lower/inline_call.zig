@@ -1898,6 +1898,12 @@ pub fn staticArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const Func
     // consumer needs `List<Int>`, not an unbound `T`.
     var explicit_needed = false;
     const ty = expr_lower.argDeclTypeRefLazy(@constCast(b), arg) orelse blk: {
+        // A bare `object` reference as an argument types as the object's
+        // class (a sibling `assertEquals(Object, decode(...))` solves the
+        // reified parameter). Argument typing only: the general lazy typer
+        // must not type the name, or receiver lowering reads it as a field
+        // of the enclosing `this`.
+        if (expr_lower.objectRefTypeRef(@constCast(b), arg)) |t| break :blk t;
         if (arg.* != .Call) return null;
         const derived_opt = static_call_type.staticCallReturnTypeRef(@constCast(b), arg) catch null;
         if (std.c.getenv("KLIO_UNIFY_TRACE") != null) std.debug.print("[satr] call callee={s} derived={?s} nta={d} dargs={d} darg0={s}\n", .{ @tagName(std.meta.activeTag(arg.Call.callee.*)), if (derived_opt) |d| d.name else null, arg.Call.type_args.len, if (derived_opt) |d| d.args.len else 0, if (derived_opt) |d| (if (d.args.len != 0) d.args[0].name else "-") else "-" });

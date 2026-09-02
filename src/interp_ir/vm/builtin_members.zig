@@ -2321,14 +2321,20 @@ pub fn seqIterMember(self: *VmHost, allocator: Allocator, receiver: *const Value
 
 /// Whether the class `name` (or any supertype, breadth-first) declares an
 /// IR method named `mname`.
-fn classHasUserMethod(self: *VmHost, allocator: Allocator, start: []const u8, mname: []const u8) bool {
+fn classHasUserMethod(self: *VmHost, allocator: Allocator, start_in: []const u8, mname: []const u8) bool {
     // Fast path: the precomputed per-class hierarchy method-name set answers
     // this in O(1). It collects the same user-declared method names up the
     // supertype chain the walk below would. Built for every source class; a
     // class with no entry (a synthesized/anon shape) falls back to the walk.
+    // The qualified record is exact; the simple-name record is the union
+    // over same-named classes and only ever says "some class declares it".
+    const start = if (std.mem.lastIndexOfScalar(u8, start_in, '.')) |d| start_in[d + 1 ..] else start_in;
     {
         const mg = self.module.borrow();
         defer mg.deinit();
+        if (mg.get().registry.hierarchy_methods.get(start_in)) |set| {
+            return set.contains(mname);
+        }
         if (mg.get().registry.hierarchy_methods.get(start)) |set| {
             return set.contains(mname);
         }
@@ -2399,6 +2405,7 @@ pub fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *cons
     var is_value = false;
     var is_object = false;
     var class_name: []const u8 = undefined;
+    var class_fqn: []const u8 = undefined;
     {
         const g = inst.borrow();
         const cg = g.get().class.borrow();
@@ -2406,6 +2413,7 @@ pub fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *cons
         is_value = cg.get().is_value;
         is_object = cg.get().is_object;
         class_name = cg.get().name;
+        class_fqn = cg.get().fqn;
         cg.deinit();
         g.deinit();
     }
@@ -2413,7 +2421,7 @@ pub fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *cons
     // class has none, so skip the per-call hierarchy walk (which allocates a
     // queue + seen-set) that only feeds the `has_user_override` guards below.
     if (!is_data and !is_value and !is_object) return null;
-    const has_user_override = classHasUserMethod(self, allocator, class_name, name);
+    const has_user_override = classHasUserMethod(self, allocator, if (class_fqn.len != 0) class_fqn else class_name, name);
 
     if (is_data and is_object and !has_user_override and std.mem.eql(u8, name, "toString")) {
         return .{ .ok = try strVal(allocator, classDisplayName(class_name)) };

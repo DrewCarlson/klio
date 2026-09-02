@@ -7874,7 +7874,8 @@ fn closureHasMethodNamed(mod: *const Module, start_cid: ir.ClassId, name: []cons
     if (std.mem.eql(u8, name, "equals") or std.mem.eql(u8, name, "hashCode") or std.mem.eql(u8, name, "toString")) return true;
     if (@intFromEnum(start_cid) >= mod.classes.items.len) return true;
     const irc = mod.classes.items[@intFromEnum(start_cid)];
-    const hm = mod.registry.hierarchy_methods.get(irc.name) orelse
+    const hm = mod.registry.hierarchy_methods.get(irc.fqn) orelse
+        mod.registry.hierarchy_methods.get(irc.name) orelse
         mod.registry.hierarchy_methods.get(simpleName(irc.fqn)) orelse return true;
     return hm.contains(name);
 }

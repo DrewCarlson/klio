@@ -308,7 +308,38 @@ content-negotiation.
   Test 12/12, JsonMapPolymorphismTest 5/5, JsonListPolymorphismTest 3/3,
   InlineClassesCompleteTest 4/4, PropertyInitializerTest 4/4,
   SerialNameCollisionTest 6/6, JsonCoerceInputValuesTest 9/9,
-  JsonModesTest 7/9, SerializersLookupTest 29/31.
+  JsonModesTest 7/9, SerializersLookupTest 29/31. Then (16) a local
+  initialized from another file's nested constructor typed as nothing
+  because the class row was still a header when the caller lowered, and
+  a bare reference to a nested `object` had no static type — both feed
+  the sibling solver (JsonModesTest 9/9, SerializersLookupTest 31/31).
+  Census after round twenty-three: core 138 / 138; json 644 -> 688 / 744
+  (54 failed, 2 did not complete). Floor ratcheted 640 -> 680. Remaining
+  54 across 30 classes, largest 3: ValueClassesInSealedHierarchyTest,
+  TrailingCommaTest, LocalClassesTest, JsonMapKeysTest,
+  GenericCustomSerializerTest.
+
+  Real json-io streaming surface: the 688 count was measured with the
+  KXIO_STREAMS branch of upstream's JsonTestBase.parametrizedTest a
+  no-op (json-io was never packaged). Wiring the real surface exposed
+  two roots. (1) A pack `[features].sources` prefix only GATES already
+  collected files; it never adds a source root. json-io therefore
+  compiled into nothing (0 symbols in the pack) and every parametrized
+  test's KXIO branch hit `unresolved encodeToSink / decodeFromSource`,
+  cascading ~330 failures. Fixed with a real `[[source]]` root for
+  `upstream/formats/json-io/commonMain/src`, gated to the json feature.
+  With json-io packaged, `Json.encodeToSink(serializer, value, sink)`,
+  the reified `encodeToSink<T>` / `decodeFromSource<T>`, and the
+  explicit-serializer `decodeFromSource` all round-trip through the
+  real kotlinx.io Buffer. Census core 138 / 138; json now 520 / 744.
+  (2) Remaining KXIO failures are serializer-shape specific (custom
+  serializers, inline classes, discriminator modes, polymorphism):
+  the json-io codec runs but has shape gaps under the streaming reader
+  / writer. Largest buckets: JsonCustomSerializersTest 16,
+  InlineClassesTest 12, ClassDiscriminatorModeNoneTest 10,
+  SealedClassesSerializationTest 8, JsonMapKeysTest 7. JsonModesTest
+  KXIO NaN / Infinity / quoted-mode: 3 open (6 / 9). Drive KXIO green,
+  then re-ratchet the floor.
   Remaining core 3 (after round eighteen):
   BasicTypesSerializationTest.testKvSerialization,
   SealedGenericClassesTest.testQuery,
@@ -329,6 +360,31 @@ content-negotiation.
   binding), SerializersLookupTest, JsonTreeTest.
 
 ## Task 3 — the coordinated ktor shim swap
+
+STATUS 2026-09-02 (late): the swap is IN. Both shims
+(`shim/client-serialization`, `shim/server-serialization`) are deleted
+and `Json.decodeToClass` (JsonBridge.kt) retired with them. The ktor
+pack now vendors, unchanged: ktor-client-content-negotiation and
+ktor-server-content-negotiation (common + posix `DefaultIgnoredTypesNix`),
+ktor-serialization's ContentConverter contract (`ContentConverter.kt`,
+`ContentConvertException.kt` — the WebSocket converter pair
+`WebsocketContentConverter.kt` / `KotlinxWebsocketSerializationConverter.kt`
+is excluded WITH RECORD: it needs the websocket session surface the pack
+does not carry; the frame model `Frame`/`FrameType`/`CloseReason` rides
+along because `WebsocketDeserializeException` names it), the kotlinx
+converter (`KotlinxSerializationConverter`, `Extensions` +
+`ExtensionsNative`, `SerializerLookup`) and kotlinx-json
+(`JsonSupport`, `KotlinxSerializationJsonExtensions` +
+`JsonExtensionsNative`, and `ExperimentalJsonConverter` — settled by
+PULLING json-io: the serialization pack's `json` feature now includes
+upstream `formats/json-io` and depends on the real `kotlinx.io` pack, so
+the json census's KXIO mode runs the pack's own module and the klioTest
+kotlinx-io stand-in is gone). `ClientSSESession.kt` joined the client-core
+include list and ktor-sse's `ServerSentEvent.kt` a new source block.
+Verified in run mode: `KotlinxSerializationConverter(DefaultJson)`
+serializes/deserializes a @Serializable class through `typeInfo<T>()` and
+`HttpClient { install(ContentNegotiation) { json() } }` constructs; the
+ktor e2e gates and the ktor census run next.
 
 - With Task 1's surface in place: replace BOTH serialization shims
   with the vendored upstream modules in one move (same FQN, real

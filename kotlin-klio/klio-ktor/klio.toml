@@ -234,6 +234,73 @@ include = [
     "io/ktor/client/call/utils.kt",
 ]
 
+# Server-sent event model (`ServerSentEvent`) the client SSE session types
+# above are declared against.
+[[source]]
+root = "upstream/ktor-shared/ktor-sse/common/src"
+include = [
+    "io/ktor/sse/ServerSentEvent.kt",
+]
+
+# WebSocket frame model: `ContentConvertException.kt` declares
+# `WebsocketDeserializeException(frame: Frame)`, so the frame classes ride
+# along (the websocket sessions themselves stay out of the pack).
+[[source]]
+root = "upstream/ktor-shared/ktor-websockets/common/src"
+include = [
+    "io/ktor/websocket/FrameCommon.kt",
+    "io/ktor/websocket/FrameType.kt",
+    "io/ktor/websocket/CloseReason.kt",
+]
+[[source]]
+root = "upstream/ktor-shared/ktor-websockets/posix/src"
+include = [
+    "io/ktor/websocket/FrameNative.kt",
+]
+
+# ktor-serialization (the ContentConverter contract) + the kotlinx and
+# kotlinx-json converters, vendored unchanged. The WebSocket converter
+# pair is excluded with record: it needs the websocket session surface,
+# which the pack does not carry. Gated under the serialization features.
+[[source]]
+root = "upstream/ktor-shared/ktor-serialization/common/src"
+include = [
+    "ContentConverter.kt",
+    "ContentConvertException.kt",
+]
+[[source]]
+root = "upstream/ktor-shared/ktor-serialization/ktor-serialization-kotlinx/common/src"
+include = [
+    "io/ktor/serialization/kotlinx/KotlinxSerializationConverter.kt",
+    "io/ktor/serialization/kotlinx/Extensions.kt",
+    "io/ktor/serialization/kotlinx/SerializerLookup.kt",
+]
+[[source]]
+root = "upstream/ktor-shared/ktor-serialization/ktor-serialization-kotlinx/posix/src"
+include = [
+    "io/ktor/serialization/kotlinx/ExtensionsNative.kt",
+]
+[[source]]
+root = "upstream/ktor-shared/ktor-serialization/ktor-serialization-kotlinx/ktor-serialization-kotlinx-json/common/src"
+include = [
+    "io/ktor/serialization/kotlinx/json/JsonSupport.kt",
+    "io/ktor/serialization/kotlinx/json/KotlinxSerializationJsonExtensions.kt",
+    "io/ktor/serialization/kotlinx/json/ExperimentalJsonConverter.kt",
+]
+[[source]]
+root = "upstream/ktor-shared/ktor-serialization/ktor-serialization-kotlinx/ktor-serialization-kotlinx-json/posix/src"
+include = [
+    "io/ktor/serialization/kotlinx/json/JsonExtensionsNative.kt",
+]
+[[source]]
+root = "upstream/ktor-client/ktor-client-plugins/ktor-client-content-negotiation/common/src"
+[[source]]
+root = "upstream/ktor-client/ktor-client-plugins/ktor-client-content-negotiation/posix/src"
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-content-negotiation/common/src"
+[[source]]
+root = "upstream/ktor-server/ktor-server-plugins/ktor-server-content-negotiation/posix/src"
+
 # Event bus (`io.ktor.events.Events`) — `HttpClient.monitor`. Gated under `events`.
 [[source]]
 root = "upstream/ktor-shared/ktor-events/common/src"
@@ -311,6 +378,10 @@ include = [
     "io/ktor/client/plugins/SaveBody.kt",
     "io/ktor/client/plugins/DefaultTransform.kt",
     "io/ktor/client/plugins/HttpSend.kt",
+    # `ClientSSESession` / `ClientSSESessionWithDeserialization`: the
+    # content-negotiation plugin lists them among the body types it never
+    # converts; the session types themselves ride on ktor-sse's event model.
+    "io/ktor/client/plugins/sse/ClientSSESession.kt",
     # `HttpSend` reads `MaxRetriesPerRequestAttributeKey`, declared here.
     "io/ktor/client/plugins/HttpRequestRetry.kt",
     "io/ktor/client/plugins/HttpCallValidator.kt",
@@ -483,13 +554,19 @@ requires = ["http", "events"]
 # so the upstream `body<T>()` / `setBody(value)` round-trip typed JSON.
 # Pulls the serialization pack's `json` feature (its core alone has no Json).
 [features.client-serialization]
-sources = ["shim/client-serialization/"]
+sources = [
+    "upstream/ktor-client/ktor-client-plugins/ktor-client-content-negotiation/",
+    "upstream/ktor-shared/ktor-serialization/",
+]
 deps = ["kotlinx.serialization/json"]
 requires = ["client"]
 
 # ktor-server-content-negotiation + ktor-serialization-kotlinx-json:
 # typed `respond<T>()` / `receive<T>()` and `ContentNegotiation { json() }`.
 [features.server-serialization]
-sources = ["shim/server-serialization/"]
+sources = [
+    "upstream/ktor-server/ktor-server-plugins/ktor-server-content-negotiation/",
+    "upstream/ktor-shared/ktor-serialization/",
+]
 deps = ["kotlinx.serialization/json"]
 requires = ["server"]

@@ -2106,14 +2106,33 @@ fn buildModuleWithOverrides(
     // Per-class transitive member-function-name set. Seeded base classes
     // already carry theirs in the cloned registry; only new keys compute.
     {
-        var it = file_classes.keyIterator();
-        while (it.next()) |cname| {
-            if (module.registry.hierarchy_methods.contains(cname.*)) continue;
+        // A top-level class also records its hierarchy's method names
+        // under its qualified name, so a reader holding the fqn gets an
+        // exact answer when two packages share a simple name (geometry's
+        // `Size` value class and the `androidx.annotation.Size`
+        // annotation). The simple-name entry keeps its first registration.
+        var it = file_classes.iterator();
+        while (it.next()) |kv| {
+            const cname = kv.key_ptr.*;
+            const c = kv.value_ptr.get();
+            const cfqn = try resolveFqn(a, fqn_overrides, c.name.span, package_prefix, cname);
+            const fqn_wanted = !std.mem.eql(u8, cfqn, cname) and
+                module.classIdByFqn(cfqn) != null and
+                !module.registry.hierarchy_methods.contains(cfqn);
+            const simple_wanted = !module.registry.hierarchy_methods.contains(cname);
+            if (!fqn_wanted and !simple_wanted) continue;
             var methods = StringSet.init(a);
             var seen = StringSet.init(a);
             defer seen.deinit();
-            try collectHierarchyMethodNames(cname.*, &file_classes, &methods, &seen);
-            try module.registry.hierarchy_methods.put(cname.*, methods);
+            try collectHierarchyMethodNames(cname, &file_classes, &methods, &seen);
+            if (simple_wanted and fqn_wanted) {
+                try module.registry.hierarchy_methods.put(cname, try methods.clone());
+                try module.registry.hierarchy_methods.put(cfqn, methods);
+            } else if (simple_wanted) {
+                try module.registry.hierarchy_methods.put(cname, methods);
+            } else {
+                try module.registry.hierarchy_methods.put(cfqn, methods);
+            }
         }
     }
     // Per-class transitive shadow-name set (all member kinds) for the

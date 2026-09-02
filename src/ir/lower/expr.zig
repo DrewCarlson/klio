@@ -2420,8 +2420,11 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // A class visible from this scope outranks a same-named top-level
         // property the file never imported (`E.serializer()` on a user
         // enum `E` is the class, never `kotlin.math.E`).
+        // Only a REAL top-level property with a scope tier can lose to the
+        // class; an `object` (published as a global, no property tier)
+        // stays on the top-level path that loads its singleton.
         const class_over_unimported_prop = b.module.classIdIndexed(name0, b.self_package, segments[0].span.file) != null and
-            (b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file) orelse 5) >= 4;
+            (b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file) orelse 0) >= 4;
         if (isTopLevelProp(name0) and !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
             !build.anonCaptureBinds(name0) and !class_over_unimported_prop and
             b.module.classIdExactImport(name0, segments[0].span.file) == null and
@@ -6020,7 +6023,12 @@ fn localValueNotInvokable(b: *FuncBuilder, name: []const u8) bool {
 /// that binds these arguments (the registered member resolution proves a
 /// unique target).
 fn receiverConcreteMemberTakes(b: *FuncBuilder, receiver: *const Expr, name: []const u8, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!bool {
-    const head = (try inline_call.gateReceiverHead(b, receiver)) orelse return false;
+    const head = (try inline_call.gateReceiverHead(b, receiver)) orelse {
+        if (runtime.envOnce("KLIO_INLINE_PICK")) |w| {
+            if (std.mem.eql(u8, w, name)) std.debug.print("[rcmt] {s} no receiver head (recv tag={s})\n", .{ name, @tagName(std.meta.activeTag(receiver.*)) });
+        }
+        return false;
+    };
     var h = std.mem.trimEnd(u8, head, "?");
     if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
     const file = exprSpan(receiver).file;
@@ -6038,7 +6046,18 @@ fn receiverConcreteMemberTakes(b: *FuncBuilder, receiver: *const Expr, name: []c
         .actual_type_param_bounds = owned_bounds orelse &.{},
         .receiver_type = recv_type,
     });
-    return res.target != null;
+    if (runtime.envOnce("KLIO_INLINE_PICK")) |w| {
+        if (std.mem.eql(u8, w, name)) {
+            std.debug.print("[rcmt] {s} head={s} target={?d} shapes:", .{ name, h, if (res.target) |t| t.int() else null });
+            for (shapes) |sh| std.debug.print(" {s}", .{if (sh.ty) |t| t.name else "?"});
+            std.debug.print("\n", .{});
+        }
+    }
+    // An applicable member shadows every same-named extension even when the
+    // overload set stays ambiguous for the statically known argument shapes
+    // (`matrix.map(Offset(1f, 1f))` among `map(Offset)`/`map(Rect)`/
+    // `map(MutableRect)` with the factory call's type unproven).
+    return res.target != null or res.applicable;
 }
 
 fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
@@ -8393,8 +8412,15 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // class with no `invoke` member, is never a callee.
     if (callee.* == .Path and callee.Path.segments.len == 1 and ast_type_args.len == 0) {
         const nm0 = callee.Path.segments[0].name;
+        // A member FUNCTION of the enclosing class chain still takes the
+        // call when a plain value shadows the name (`AbstractCoroutine`'s
+        // `if (initParentJob) initParentJob(parent)`: the Boolean property
+        // and the inherited `JobSupport.initParentJob(Job?)`).
+        var chain_buf: [8]FuncId = undefined;
+        const chain_fns = try enclosingChainMethodsNamed(b, nm0, callee.Path.segments[0].span.file, &chain_buf);
         if (b.resolve(nm0) != null and !b.isLocalFn(nm0) and !b.isLocalExtFn(nm0) and
             b.module.classIdIndexed(nm0, b.self_package, callee.Path.segments[0].span.file) == null and
+            chain_fns.len == 0 and
             localValueNotInvokable(b, nm0))
         {
             const gv = b.allocReg();
@@ -11265,8 +11291,8 @@ fn initTypeNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) Alloc
     const cid = b.module.uniqueClassIdBySimpleName(head) orelse b.module.classId(head) orelse return false;
     if (cid.int() >= b.module.classes.items.len) return false;
     const cls = &b.module.classes.items[cid.int()];
-    const methods = b.module.registry.hierarchy_methods.get(cls.name) orelse
-        b.module.registry.hierarchy_methods.get(cls.fqn) orelse return false;
+    const methods = b.module.registry.hierarchy_methods.get(cls.fqn) orelse
+        b.module.registry.hierarchy_methods.get(cls.name) orelse return false;
     if (methods.contains("invoke")) return false;
     return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", argc) == .none;
 }
@@ -11290,8 +11316,8 @@ fn callInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) bool 
     const cid = b.module.classId(head) orelse return false;
     if (cid.int() >= b.module.classes.items.len) return false;
     const cls = &b.module.classes.items[cid.int()];
-    const methods = b.module.registry.hierarchy_methods.get(cls.name) orelse
-        b.module.registry.hierarchy_methods.get(cls.fqn) orelse return false;
+    const methods = b.module.registry.hierarchy_methods.get(cls.fqn) orelse
+        b.module.registry.hierarchy_methods.get(cls.name) orelse return false;
     if (methods.contains("invoke")) return false;
     return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", argc) == .none;
 }
@@ -11319,8 +11345,8 @@ fn ctorInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) bool 
     if (cid.int() >= b.module.classes.items.len) return false;
     const cls = &b.module.classes.items[cid.int()];
     if (cls.is_abstract) return false;
-    const methods = b.module.registry.hierarchy_methods.get(cls.name) orelse
-        b.module.registry.hierarchy_methods.get(cls.fqn) orelse return false;
+    const methods = b.module.registry.hierarchy_methods.get(cls.fqn) orelse
+        b.module.registry.hierarchy_methods.get(cls.name) orelse return false;
     if (methods.contains("invoke")) return false;
     return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", argc) == .none;
 }
@@ -11681,7 +11707,7 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
 /// A bare name that denotes an `object` declaration visible from this
 /// scope (the enclosing class's nested object first, then the indexed
 /// top-level one) types as that object's class.
-fn objectRefTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
+pub fn objectRefTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (arg.* != .Path or arg.Path.segments.len != 1) return null;
     const seg = arg.Path.segments[0];
     const nm = seg.name;
@@ -11723,7 +11749,6 @@ fn objectRefTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
 }
 
 fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
-    if (objectRefTypeRef(b, arg)) |t| return t;
     if (runtime.envOnce("KLIO_VALTY_TRACE")) |w| {
         if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
             std.debug.print("[valty] LAZY {s} decl={s} splice={} lsr={}\n", .{ w, if (b.localDeclTypeRef(w)) |t| t.name else "<unset>", b.spliceParamTy(w) != null, b.lambda_splice_resolve != null });
@@ -17134,6 +17159,35 @@ fn emitCallMember(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast:
 /// where `writable` is the enclosing class's member): the innermost
 /// subject whose class declares the member, else the receiver beneath
 /// the whole subject run. Anything unprovable keeps the supplied reg.
+/// Whether an extension property (or extension function) named `name` is
+/// declared for `head` or one of its registered supertypes: the getter is
+/// a registered function with a leading `this` whose declared receiver
+/// the head is or extends.
+fn extensionPropOnHead(b: *FuncBuilder, head_in: []const u8, name: []const u8) bool {
+    const head = typeHead(std.mem.trimEnd(u8, head_in, "?"));
+    if (head.len == 0) return false;
+    const simple = applicability.simpleName(head);
+    if (extPropExistsOn(b, simple, name)) return true;
+    for (applicability.builtinSupersOf(simple)) |sup| {
+        if (extPropExistsOn(b, sup, name)) return true;
+    }
+    if (b.module.registry.class_super_names.get(simple)) |chain| {
+        for (chain) |sup| {
+            if (extPropExistsOn(b, applicability.simpleName(sup), name)) return true;
+        }
+    }
+    return false;
+}
+
+/// An extension property `val <head>.<name>` is known either by its
+/// declared-type record or by its lowered getter `__ext_get_<head>_<name>`.
+fn extPropExistsOn(b: *const FuncBuilder, head: []const u8, name: []const u8) bool {
+    if (b.module.registry.ext_prop_type_heads.get(.{ .a = head, .b = name }) != null) return true;
+    var buf: [160]u8 = undefined;
+    const gname = std.fmt.bufPrint(&buf, "__ext_get_{s}_{s}", .{ head, name }) catch return false;
+    return b.module.funcsBySimpleName(gname).len != 0;
+}
+
 fn subjectCorrectedBareThis(b: *FuncBuilder, name: []const u8, this_reg: Reg) Reg {
     const sct = if (runtime.envOnce("KLIO_SCT_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     const sbs = b.subject_binds.items;
@@ -17159,6 +17213,14 @@ fn subjectCorrectedBareThis(b: *FuncBuilder, name: []const u8, this_reg: Reg) Re
             };
         if (b.module.classHierarchyDeclaresMember(cid, name)) {
             if (sct) std.debug.print("[sct] {s}: subject {d} ({s}) declares it\n", .{ name, i, h });
+            return sbs[i].reg;
+        }
+        // An EXTENSION property declared on the subject's type (or a
+        // supertype) binds the bare name to that subject the same way a
+        // member does: `isSpecified` inside a spliced `Dp.takeOrElse`,
+        // `indices` inside `List.fastForEach`.
+        if (extensionPropOnHead(b, h, name)) {
+            if (sct) std.debug.print("[sct] {s}: subject {d} ({s}) has an extension property\n", .{ name, i, h });
             return sbs[i].reg;
         }
     }
@@ -19741,10 +19803,14 @@ fn lowerResolvedMemberCall(
     var identity = std.mem.trimEnd(u8, ty.name, "?");
     if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
     const head = typeHead(identity);
+    // A simple head shared by several classes (geometry's `Size` value
+    // class and the `androidx.annotation.Size` annotation) is decided the
+    // way the source decides it: by the call site's imports and package.
     var owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
         b.module.classIdByFqn(identity)
     else
-        b.module.uniqueClassIdBySimpleName(head);
+        b.module.uniqueClassIdBySimpleName(head) orelse
+            (if (b.isTypeParam(head)) null else b.module.classIdIndexed(head, b.self_package, name.span.file));
     // A receiver typed by a TYPE PARAMETER names no class, and that was the
     // whole of the `no_class_id` bucket — `C`, `M`, `A`, `T`, `R` accounted for
     // 769 of 915 sites. Kotlin resolves a member call on such a value against

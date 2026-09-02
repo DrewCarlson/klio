@@ -480,20 +480,21 @@ pub const suites = [_]Config{
         .scratch_home = "/tmp/klio_itest_serialization_json_home",
         .packs = &.{
             .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
+            .{ .dir = "kotlin-klio/klio-kotlinx-io", .artifact = "target/packs/kotlinx.io.klio-pack" },
             .{ .dir = "kotlin-klio/klio-kotlinx-serialization", .artifact = "target/packs/kotlinx.serialization.klio-pack" },
         },
         .extra_support = &.{
             "kotlin-klio/klio-kotlinx-serialization/klioTest/kotlinx/serialization/test/CurrentPlatform.kt",
             "kotlin-klio/klio-kotlinx-serialization/klioTest/json/StreamSupport.kt",
-            "kotlin-klio/klio-kotlinx-serialization/klioTest/json/KxioSupport.kt",
             "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-okio/commonMain/src/kotlinx/serialization/json/okio/OkioStreams.kt",
             "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-okio/commonMain/src/kotlinx/serialization/json/okio/internal/OkioJsonStreams.kt",
-            "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-io/commonMain/src/kotlinx/serialization/json/io/IoStreams.kt",
-            "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-io/commonMain/src/kotlinx/serialization/json/io/internal/IoJsonStreams.kt",
         },
         .extra_args = &.{ "--feature", "kotlinx.serialization/json" },
         .timeout_ms = 120_000,
-        .baseline = 640,
+        // 2026-09-02 census after round twenty-three: 688 / 744 (54 failed,
+        // 2 did not complete); the floor keeps a small did-not-complete
+        // margin below the observed count.
+        .baseline = 680,
         .max_failed = null,
         .max_incomplete = null,
     },
