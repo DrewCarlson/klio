@@ -8082,6 +8082,12 @@ pub const CtorSite = extern struct {
     memo: u64,
 };
 
+/// Threadlocal interp edge view for `tryLeafValues` (see the cache
+/// comment there); rebuilt only when the serving host changes.
+threadlocal var leaf_ev_cache: NativeEdgeView = undefined;
+threadlocal var leaf_ev_host: ?*anyopaque = null;
+threadlocal var leaf_ev_counter: u64 = 0;
+
 const NativeLeafEntry = struct { f: NativeLeafFn, fqn: []const u8 };
 var native_leaf_table: std.AutoHashMapUnmanaged(u32, NativeLeafEntry) = .empty;
 /// FQN-keyed leaves (a loaded leaf LIBRARY: bakes are not cross-process
@@ -8290,7 +8296,6 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
         }
     }
     var ev: NativeEdgeView = undefined;
-    var local_counter: u64 = 0;
     if (nctx) |nc| {
         nativeEdgeView(nc, &ev);
         ev.route_ctx = @ptrCast(host);
@@ -8298,28 +8303,40 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
         ev.type_route = &LeafTypeRoute(H).route;
         ev.statics_route = &LeafStaticsRoute(H).route;
     } else {
-        ev = .{
-            .rare = &leafEdgeRareInterp,
-            .route_ctx = @ptrCast(host),
-            .field_route = &LeafFieldRoute(H).route,
-            .type_route = &LeafTypeRoute(H).route,
-            .statics_route = &LeafStaticsRoute(H).route,
-            .counter = &local_counter,
-            .idle = runtime.gc.idleTickPtr(),
-            .abandonable = runtime.abandonablePtr(),
-            .rb_abandon = runtime.runBoundaryAbandonPtr(),
-            .abandon_req = runtime.abandonRequestedPtr(),
-            .gc_pending = runtime.gc.pendingFlagPtr(),
-            .gc_on = @intFromBool(runtime.gc.gc_enabled),
-            .always = @intFromBool(runtime.gc.stressActive()),
-        };
+        // Threadlocal cached interp edge view: every pointer in it is
+        // process- or thread-stable, so the per-call cost collapses to
+        // refreshing the two mode flags plus a host-identity check —
+        // the full 12-field build (four of them fn calls) priced every
+        // serve. The counter deliberately accumulates across calls;
+        // the guard only compares it against per-call thresholds.
+        if (leaf_ev_host != @as(?*anyopaque, @ptrCast(host))) {
+            leaf_ev_cache = .{
+                .rare = &leafEdgeRareInterp,
+                .route_ctx = @ptrCast(host),
+                .field_route = &LeafFieldRoute(H).route,
+                .type_route = &LeafTypeRoute(H).route,
+                .statics_route = &LeafStaticsRoute(H).route,
+                .counter = &leaf_ev_counter,
+                .idle = runtime.gc.idleTickPtr(),
+                .abandonable = runtime.abandonablePtr(),
+                .rb_abandon = runtime.runBoundaryAbandonPtr(),
+                .abandon_req = runtime.abandonRequestedPtr(),
+                .gc_pending = runtime.gc.pendingFlagPtr(),
+                .gc_on = 0,
+                .always = 0,
+            };
+            leaf_ev_host = @ptrCast(host);
+        }
+        leaf_ev_cache.gc_on = @intFromBool(runtime.gc.gc_enabled);
+        leaf_ev_cache.always = @intFromBool(runtime.gc.stressActive());
     }
+    const evp: *NativeEdgeView = if (nctx != null) &ev else &leaf_ev_cache;
     var rl: i64 = 0;
     var rg: i32 = 0;
     var aux: [8]i64 = undefined;
     var auxg: [8]i32 = undefined;
     const cctx: ?*anyopaque = if (nctx) |nc| @ptrCast(nc) else null;
-    if (klf(cctx, &ev, &argv, &argg, &rl, &rg, 0, &aux, &auxg) == 0) {
+    if (klf(cctx, evp, &argv, &argg, &rl, &rg, 0, &aux, &auxg) == 0) {
         _ = leaf_diag_bail.fetchAdd(1, .monotonic);
         // Bail damper: a leaf that has NEVER served and keeps bailing is
         // structural for this program's call shapes — stop attempting it.

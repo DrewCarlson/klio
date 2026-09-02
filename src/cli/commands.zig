@@ -1143,6 +1143,31 @@ const leaf_getfield_c =
     \\  return 1;
     \\}
     \\
+    \\static inline int32_t kl_cast(klio_edge_view *ev, int64_t rl, int32_t rgv, uint64_t *site, const char *tyname, int64_t *ol, int32_t *og) {
+    \\  /* `as`/`as?` on a genre-8 handle: a POSITIVE verdict passes the
+    \\   * value through unchanged; anything else (failed cast = throw or
+    \\   * null, non-instance genres) bails to the exact re-run. Same
+    \\   * per-site class-word verdict cache as kl_instanceof. */
+    \\  if (rgv != 8) return 0;
+    \\  uint8_t *cell = (uint8_t *)(uintptr_t)rl;
+    \\  if (!cell) return 0;
+    \\  uint8_t *inst = cell + KVC_CELL_DATA_OFF;
+    \\  uint64_t cls;
+    \\  memcpy(&cls, inst + KVC_INST_CLASS_OFF, sizeof(uint64_t));
+    \\  uint64_t cls48 = cls & 0xFFFFFFFFFFFFull;
+    \\  uint64_t want = *site;
+    \\  if ((want >> 16) != cls48 || (want & 0xFFFFu) == 0) {
+    \\    if (!ev->type_route) return 0;
+    \\    int32_t verdict = ev->type_route(ev->route_ctx, cell, tyname);
+    \\    if (verdict != 1 && verdict != 2) return 0;
+    \\    want = (cls48 << 16) | (uint64_t)(uint32_t)verdict;
+    \\    *site = want;
+    \\  }
+    \\  if ((want & 0xFFFFu) != 1u) return 0;
+    \\  *ol = rl; *og = 8;
+    \\  return 1;
+    \\}
+    \\
     \\static inline int32_t kl_instanceof(klio_edge_view *ev, int64_t rl, int32_t rgv, uint64_t *site, const char *tyname, int64_t *ol, int32_t *og) {
     \\  /* Only genre-8 handles have a class word to key the verdict on;
     \\   * every other genre (null, scalar, cargo) bails to the exact
@@ -1650,6 +1675,19 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                                 ok = false;
                             } else ctor_tail = true;
                         },
+                        // Same admission filter as InstanceOf: a positive
+                        // verdict passes the value through, everything
+                        // else bails pure at run time.
+                        .Cast => |*ct| {
+                            const head = std.mem.trimEnd(u8, ct.ty.name, "?");
+                            if (ct.ty.args.len != 0 or ct.ty.nullable or head.len == 0 or
+                                (head.len <= 2 and std.ascii.isUpper(head[0])))
+                            {
+                                leaf_escape_histo.getPtr(.Cast).* += 1;
+                                leafTrace(f, "escape-op");
+                                ok = false;
+                            }
+                        },
                         // A CLASS-bound global read serves as a genre-9
                         // name handle (a string literal, zero-cost); the
                         // only op that consumes genre 9 is a field read,
@@ -1911,6 +1949,10 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                         .LoadGlobal => |*lg| {
                             if (lg.dst.int() > max_reg) max_reg = lg.dst.int();
                         },
+                        .Cast => |*ct| {
+                            if (ct.dst.int() > max_reg) max_reg = ct.dst.int();
+                            if (ct.src.int() > max_reg) max_reg = ct.src.int();
+                        },
                         else => {},
                     }
                     pc += 2;
@@ -2040,6 +2082,13 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                         const iot = &f.blocks[bi].insts[code[pc + 1]].InstanceOf;
                         try w.print("  {{ static uint64_t KIS_{d}_{d} = 0;\n", .{ bi, code[pc + 1] });
                         try w.print("    if (!kl_instanceof(ev, l{d}, g{d}, &KIS_{d}_{d}, \"{s}\", &l{d}, &g{d})) return 0; }}\n", .{ iot.src.int(), iot.src.int(), bi, code[pc + 1], iot.ty.name, iot.dst.int(), iot.dst.int() });
+                        pc += 2;
+                        continue;
+                    }
+                    if (f.blocks[bi].insts[code[pc + 1]] == .Cast) {
+                        const ct = &f.blocks[bi].insts[code[pc + 1]].Cast;
+                        try w.print("  {{ static uint64_t KCS_{d}_{d} = 0;\n", .{ bi, code[pc + 1] });
+                        try w.print("    if (!kl_cast(ev, l{d}, g{d}, &KCS_{d}_{d}, \"{s}\", &l{d}, &g{d})) return 0; }}\n", .{ ct.src.int(), ct.src.int(), bi, code[pc + 1], std.mem.trimEnd(u8, ct.ty.name, "?"), ct.dst.int(), ct.dst.int() });
                         pc += 2;
                         continue;
                     }
