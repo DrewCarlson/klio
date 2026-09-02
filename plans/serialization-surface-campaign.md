@@ -35,21 +35,40 @@ content-negotiation.
   must swap TOGETHER, and the ktor e2e gates (all green today) are
   the acceptance harness.
 
-## Task 1 — the real serializer surface
+## Task 1 — the serialization lowering pass (REDIRECTED 2026-09-02)
 
-- Grow the pack so `Json : StringFormat` is genuine over the existing
-  `__klsx_json*` intrinsics: `serializersModule`,
-  `serializerOrNull(KType)`, `getContextual`, the builtin serializers
-  (primitives, String, collections, enums, nullable wrappers), and
-  `encodeToString`/`decodeFromString` running through the real
-  serializer plumbing where the surface demands it. Kotlin semantics
-  exactly; the intrinsics stay the engine underneath where they are
-  semantically equivalent, and real serializer code takes over where
-  they are not.
-- The `serializer(KType)` reflection entry needs whatever KType
-  surface the interpreter can honestly provide; a shape it cannot
-  honor throws the same SerializationException upstream does, never a
-  silent wrong answer.
+- DECISION (user-directed, 2026-09-02): the reflective serializer
+  (klioMain Reflective.kt + the `__klsx_*` host intrinsics) is the
+  wrong engine and retires. Upstream's runtime and its json tests are
+  written against what the COMPILER PLUGIN generates — nested
+  `$serializer` objects over PluginGeneratedSerialDescriptor, the
+  element-mask `deserialize` loop, `childSerializers()`, sealed /
+  polymorphic / enum / object / value-class / generic forms, property
+  annotations pushed into descriptors — and reflection can only
+  approximate that contract while living in host intrinsics that the
+  static-dispatch, bytecode, leaf, and transpile tiers cannot see
+  through. The compose precedent is exact: the implicit hook capped
+  out; the lowering plugin made upstream's own tests pass.
+- Build a serialization pass that, for every `@Serializable`
+  declaration, synthesizes the real generated artifacts as ORDINARY
+  KOTLIN DECLARATIONS before lowering (generated source text parsed
+  and spliced into the class: the `$serializer` object implementing
+  GeneratedSerializer with descriptor/serialize/deserialize/
+  childSerializers, the companion `serializer()` (with type-argument
+  serializers for generics), the deserialization constructor with
+  the seen-mask + missing-field check + default evaluation, and the
+  enum/object/sealed/polymorphic/value-class/`with=` forms). One
+  choke point right after parse, shared by pack builds and program
+  loads, so packs carry generated serializers too. Dumpable under an
+  env var for debugging.
+- The upstream json module (formats/json/commonMain) is consumed
+  verbatim with klio actuals for its five `expect`s (landed
+  2026-09-02, plus the `package x;` parser fix it exposed).
+  `Json.decodeToClass` stays as a thin bridge over
+  `serializerOrNull` until Task 3 deletes the shims.
+- Exit for this task: Reflective.kt and the `__klsx_*` intrinsics
+  deleted; the core census (138) holds; the json census (Task 2)
+  measures fidelity.
 
 ## Task 2 — json census
 
