@@ -350,6 +350,31 @@ content-negotiation.
   TrailingCommaTest, LocalClassesTest, JsonMapKeysTest,
   GenericCustomSerializerTest): reified-T binding + generator fidelity,
   the pre-existing 744 tail. Ratchet the floor to 688.
+
+  Task 3 (ktor swap) status: the content-negotiation + serialization
+  sources are vendored and the shims deleted (committed). The ktor
+  commontest census regressed to 0/450 on the swap: `klio test` with no
+  --feature implicitly activates ALL of a pack's features, and the new
+  client-serialization / server-serialization features require the
+  kotlinx.serialization pack the ktor census home does not carry, so the
+  load failed pack-wide. The commonTest surface is ktor-io / ktor-utils /
+  ktor-http (+ the io.ktor.test dispatcher), so the census now pins
+  `--feature io.ktor/http --feature io.ktor/test-base`; the typed
+  serialization surface is covered by the ktor_client_get / ktor_server
+  e2e gates. With the pin and the ClassDef IS-A fix the ktor census is
+  438 -> (see census); the residue is the unit-mask bleed below.
+
+  OPEN root (pre-existing, round twenty-three): a chained flow terminal
+  `X.map { }.firstOrNull { }` mis-coerces the outer predicate to Unit
+  (`non-bool in branch: kotlin.Unit`). map inline-splices to
+  `unsafeTransform`, whose `-> Unit` transform legitimately sets the Unit
+  mask; the outer firstOrNull predicate, lowered in the same spliced arg
+  context, captures that mask. Standalone (`fm7`) it is correct; only the
+  two-statement / chained shape triggers it. Breaks CookieDateParserTest
+  (3), the ktor typed-body converter (asFlow().map{}.firstOrNull{}), and
+  a few json cases. The staged-mask experiment did not fix it (the leak
+  is through the splice arg context, not the speculative-resolve path).
+  Fix is in the map->unsafeTransform splice arg hygiene.
   Remaining core 3 (after round eighteen):
   BasicTypesSerializationTest.testKvSerialization,
   SealedGenericClassesTest.testQuery,

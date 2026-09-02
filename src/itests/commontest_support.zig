@@ -535,6 +535,13 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-ktor/upstream/ktor-http/common/test",
         },
         .scratch_home = "/tmp/klio_itest_ktor_home",
+        // The commonTest surface is ktor-io / ktor-utils / ktor-http; pin
+        // the http feature (which pulls utils -> io) so the load does not
+        // also activate the content-negotiation / serialization features,
+        // whose sources need the kotlinx.serialization pack this home does
+        // not carry. The typed serialization surface is covered by the
+        // ktor_client_get / ktor_server e2e gates.
+        .extra_args = &.{ "--feature", "io.ktor/http", "--feature", "io.ktor/test-base" },
         .packs = &.{
             .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
             .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
