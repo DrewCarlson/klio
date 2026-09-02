@@ -5323,6 +5323,36 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     if (receiver.* == .Class) {
         if (try classCompanionForward(self, allocator, receiver, name, args)) |r| return r;
     }
+    // An enum's bare name is published as its COMPANION instance once it
+    // has one, so `Color.values()` written in another file arrives here
+    // with the companion as receiver. The enum statics (`values`,
+    // `valueOf`, `entries`) belong to the enum class: redirect.
+    if (receiver.* == .Instance and (std.mem.eql(u8, name, "values") or std.mem.eql(u8, name, "valueOf") or std.mem.eql(u8, name, "entries"))) {
+        const comp_cls: ObjRef(ClassDef) = blk: {
+            const ig = receiver.Instance.borrow();
+            defer ig.deinit();
+            break :blk ig.get().class.clone();
+        };
+        defer comp_cls.deinit();
+        const is_companion = blk: {
+            const cg = comp_cls.borrow();
+            defer cg.deinit();
+            const n = cg.get().name;
+            break :blk std.mem.endsWith(u8, n, "$Companion") or std.mem.endsWith(u8, n, ".Companion") or std.mem.eql(u8, n, "Companion");
+        };
+        if (is_companion) {
+            const cv = Value{ .Class = comp_cls };
+            if (try companionOwnerClassValue(self, &cv)) |owner| {
+                defer owner.release(allocator);
+                const owner_is_enum = blk: {
+                    const og = owner.Class.borrow();
+                    defer og.deinit();
+                    break :blk og.get().is_enum;
+                };
+                if (owner_is_enum) return try callMember(self, allocator, &owner, name, args);
+            }
+        }
+    }
 
     // `serializer()` on a `@Serializable` declaration is the GENERATED
     // companion member (src/serialization_pass), reached above through

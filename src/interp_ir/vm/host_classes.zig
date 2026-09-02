@@ -16,6 +16,7 @@ const build = @import("../build.zig");
 const FF = runtime.forest.ForestField;
 const VmHost = @import("vmhost.zig").VmHost;
 const host_instances = @import("host_instances.zig");
+const host_call_func = @import("host_call_func.zig");
 
 const Allocator = std.mem.Allocator;
 const Module = ir.Module;

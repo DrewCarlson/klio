@@ -63,6 +63,7 @@ const Info = struct {
 };
 
 const SealedSub = struct { path: []const u8 };
+const SubRecord = struct { sub_path: []const u8, sup_head: []const u8, scope: []const u8 };
 
 const Index = struct {
     a: Allocator,
@@ -72,8 +73,10 @@ const Index = struct {
     /// Every class/object declaration path (serializable or not), for
     /// scope-aware qualification of type references.
     all_paths: std.StringHashMap(void),
-    /// Sealed parent simple name -> ordered subclass paths.
+    /// Sealed parent PATH -> ordered subclass paths (resolved after indexing).
     sealed_subs: std.StringHashMap(std.ArrayList(SealedSub)),
+    /// Raw (subclass, supertype head, scope) records collected while indexing.
+    sub_records: std.ArrayList(SubRecord),
     /// Every `object` declaration path (for `with = X::class` object-vs-class).
     objects: std.StringHashMap(void),
     /// Annotation classes annotated `@MetaSerializable`: a class annotated
@@ -99,6 +102,7 @@ const Index = struct {
             .by_path = std.StringHashMap(Info).init(a),
             .all_paths = std.StringHashMap(void).init(a),
             .sealed_subs = std.StringHashMap(std.ArrayList(SealedSub)).init(a),
+            .sub_records = .empty,
             .objects = std.StringHashMap(void).init(a),
             .meta_serializable = std.StringHashMap(void).init(a),
             .inheritable = std.StringHashMap(void).init(a),
@@ -307,12 +311,10 @@ fn indexDecls(idx: *Index, decls: []const ast.Decl, outer: []const u8, pkg: []co
                     try idx.by_path.put(path, ci);
                 }
                 // Sealed-parent registration: any class naming a supertype
-                // that is (or turns out to be) a sealed serializable class.
+                // that is (or turns out to be) a sealed serializable class;
+                // resolved to the parent's path once every path is known.
                 for (c.supertypes) |*st| {
-                    const parent = simpleHead(st.name.name);
-                    const gop = try idx.sealed_subs.getOrPut(parent);
-                    if (!gop.found_existing) gop.value_ptr.* = .empty;
-                    try gop.value_ptr.append(idx.a, .{ .path = path });
+                    try idx.sub_records.append(idx.a, .{ .sub_path = path, .sup_head = st.name.name, .scope = outer });
                 }
                 try indexDecls(idx, c.members, path, pkg);
             },
@@ -339,10 +341,7 @@ fn indexDecls(idx: *Index, decls: []const ast.Decl, outer: []const u8, pkg: []co
                     try idx.by_path.put(path, oi);
                 }
                 for (o.supertypes) |*st| {
-                    const parent = simpleHead(st.name.name);
-                    const gop = try idx.sealed_subs.getOrPut(parent);
-                    if (!gop.found_existing) gop.value_ptr.* = .empty;
-                    try gop.value_ptr.append(idx.a, .{ .path = path });
+                    try idx.sub_records.append(idx.a, .{ .sub_path = path, .sup_head = st.name.name, .scope = outer });
                 }
                 try indexDecls(idx, o.members, path, pkg);
             },
@@ -630,6 +629,7 @@ const Elem = struct {
     required: bool,
     encode_default: enum { unset, always, never },
     is_var: bool,
+    is_lateinit: bool = false,
 };
 
 fn encodeDefaultMode(annotations: []const ast.Annotation) @TypeOf(@as(Elem, undefined).encode_default) {
@@ -665,12 +665,18 @@ fn collectElems(a: Allocator, c: *const ast.Class) Allocator.Error![]Elem {
         if (p.receiver_type != null) continue;
         if (hasAnnotation(p.annotations, "Transient")) continue;
         if (p.is_abstract) continue;
-        // The plugin's element rule for body properties: an INITIALIZER
-        // (or lateinit) makes the property an element; a property assigned
-        // only in an init block, or one whose accessors compute the value,
-        // is not serialized (CustomPropertyAccessorsTest pins both).
+        // The plugin's element rule for body properties: a BACKING FIELD
+        // makes the property an element — an initializer, a lateinit, a
+        // plain declaration without custom accessors, or an accessor that
+        // reads/writes `field`. A property whose accessors never touch
+        // `field` has no storage and is skipped. (A field assigned only in
+        // an init block IS an element, but its decoded value is discarded —
+        // the init block runs after construction; see the assignment step.)
         if (p.delegate != null) continue;
-        const has_field = p.init != null or p.is_lateinit;
+        const getter_field = if (p.getter) |gt| ast.accessorUsesField(gt) else false;
+        const setter_field = if (p.setter) |st| ast.accessorUsesField(st) else false;
+        const has_field = p.init != null or p.is_lateinit or
+            (p.getter == null and p.setter == null) or getter_field or setter_field;
         if (!has_field) continue;
         // A property with no annotation carries an INFERRED type: name it
         // from a literal initializer (the plugin's inference has the real
@@ -715,6 +721,7 @@ fn collectElems(a: Allocator, c: *const ast.Class) Allocator.Error![]Elem {
             .required = hasAnnotation(p.annotations, "Required"),
             .encode_default = encodeDefaultMode(p.annotations),
             .is_var = p.mutable,
+            .is_lateinit = p.is_lateinit,
         });
     }
     return out.toOwnedSlice(a);
@@ -932,6 +939,11 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
     try w.appendSlice(a, ")\n");
     for (elems, 0..) |*e, i| {
         if (e.in_ctor) continue;
+        // A body property with no initializer and not lateinit is assigned
+        // by an init block, which the plugin runs AFTER field assignment —
+        // the decoded value never survives. Decode it (the element exists)
+        // but leave the constructed value alone.
+        if (e.default_text == null and !e.is_lateinit) continue;
         const bit: u32 = @as(u32, 1) << @intCast(i % 32);
         const val_expr = if (e.ty.nullable) try std.fmt.allocPrint(a, "`$v{d}`", .{i}) else blk: {
             const p = primOf(simpleHead(e.ty.name.name));
@@ -1086,14 +1098,14 @@ fn genEnumFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, c: *co
 /// The concrete serializable subclasses of a sealed declaration, flattened
 /// through nested sealed / abstract / interface subtypes (the plugin lists
 /// leaves only), in declaration order, without duplicates.
-fn collectSealedLeaves(a: Allocator, idx: *const Index, parent_name: []const u8, out: *std.ArrayList([]const u8), seen: *std.StringHashMap(void)) Allocator.Error!void {
-    const subs: []const SealedSub = if (idx.sealed_subs.get(parent_name)) |l| l.items else &.{};
+fn collectSealedLeaves(a: Allocator, idx: *const Index, parent_path: []const u8, out: *std.ArrayList([]const u8), seen: *std.StringHashMap(void)) Allocator.Error!void {
+    const subs: []const SealedSub = if (idx.sealed_subs.get(parent_path)) |l| l.items else &.{};
     for (subs) |sub| {
         if (seen.contains(sub.path)) continue;
         try seen.put(sub.path, {});
         const si = idx.by_path.get(sub.path) orelse continue;
         switch (si.kind) {
-            .sealed, .interface_sealed, .polymorphic => try collectSealedLeaves(a, idx, si.name, out, seen),
+            .sealed, .interface_sealed, .polymorphic => try collectSealedLeaves(a, idx, si.path, out, seen),
             else => try out.append(a, sub.path),
         }
     }
@@ -1104,7 +1116,7 @@ fn genSealedFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, info
     const serial = try serialNameOf(a, info);
     var leaves: std.ArrayList([]const u8) = .empty;
     var seen = std.StringHashMap(void).init(a);
-    try collectSealedLeaves(a, idx, info.name, &leaves, &seen);
+    try collectSealedLeaves(a, idx, info.path, &leaves, &seen);
     const subs: []const []const u8 = leaves.items;
     try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ SealedClassSerializer(\"{s}\", {s}::class, arrayOf<KClass<out {s}>>(", .{ gn, info.path, serial, info.path, info.path });
     for (subs, 0..) |sp, n| {
@@ -1504,6 +1516,27 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
     for (files_in) |*f| try indexAnnotationClasses(&idx, f.decls);
     for (files_in) |*f| {
         try indexDecls(&idx, f.decls, "", packageText(a, f));
+    }
+    // Resolve each subclass record's supertype to a declaration PATH (the
+    // subclass's enclosing scopes first, then top level) so two files'
+    // same-named sealed parents keep separate subclass lists.
+    for (idx.sub_records.items) |rec| {
+        const parent_path: ?[]const u8 = blk: {
+            var scope = rec.scope;
+            while (true) {
+                const cand = if (scope.len == 0) rec.sup_head else try std.fmt.allocPrint(a, "{s}.{s}", .{ scope, rec.sup_head });
+                if (idx.all_paths.contains(cand)) break :blk cand;
+                if (scope.len == 0) break;
+                scope = if (std.mem.lastIndexOfScalar(u8, scope, '.')) |d| scope[0..d] else "";
+            }
+            // A dotted supertype written from the top (`Outer.Base`).
+            if (idx.all_paths.contains(rec.sup_head)) break :blk rec.sup_head;
+            break :blk null;
+        };
+        const pp = parent_path orelse continue;
+        const gop = try idx.sealed_subs.getOrPut(pp);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(a, .{ .path = rec.sub_path });
     }
     var out: std.ArrayList(ast.KotlinFile) = .empty;
     try out.appendSlice(a, files_in);
