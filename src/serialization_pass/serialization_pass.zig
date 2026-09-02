@@ -1280,7 +1280,12 @@ fn genMemberSplice(a: Allocator, c: ?*const ast.Class, info: *const Info, kept: 
         }
     }
     if (info.is_object_decl) {
-        try wp(&out, a, "object {s} {{ fun serializer(): KSerializer<{s}> = `{s}Impl`() }}", .{ last, info.path, gn });
+        // A kept object serializer is the builtin `ObjectSerializer`.
+        if (kept != null) {
+            try wp(&out, a, "object {s} {{ fun serializer(): KSerializer<{s}> = `{s}Impl`()\nfun generatedSerializer(): KSerializer<{s}> = ObjectSerializer(\"{s}\", {s}) }}", .{ last, info.path, gn, info.path, try serialNameOf(a, info), info.path });
+        } else {
+            try wp(&out, a, "object {s} {{ fun serializer(): KSerializer<{s}> = `{s}Impl`() }}", .{ last, info.path, gn });
+        }
         var k: usize = 0;
         while (k < depth) : (k += 1) try out.appendSlice(a, " }");
         return out.toOwnedSlice(a);
@@ -1530,6 +1535,7 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
                     kept.with = null;
                     kept.gen_suffix = "$generatedSerializer";
                     kept.kind = if (c.is_value) .value_class else if (c.is_enum) .enum_class else .class;
+                    if (info.is_object_decl) kept.kind = .object;
                     switch (kept.kind) {
                         .class => try genClassSerializer(&ctx.gen, ctx.a, &g, c, &kept),
                         .value_class => try genValueClassSerializer(&ctx.gen, ctx.a, &g, c, &kept),
@@ -1710,12 +1716,18 @@ fn genForClassCompanion(ctx: *Ctx, comp: *ast.Decl, class_path: []const u8, targ
             depth += 1;
         }
     }
+    // `@KeepGeneratedSerializer` beside a `@Serializer(forClass)` companion:
+    // the generated body IS the kept serializer.
+    const kept_member: []const u8 = if (hasAnnotation(c.annotations, "KeepGeneratedSerializer"))
+        try std.fmt.allocPrint(a, "\nfun generatedSerializer(): kotlinx.serialization.KSerializer<{s}> = `{s}`", .{ info.path, impl_name })
+    else
+        "";
     try wp(&out, a,
         "class {s} {{ companion object {{ fun serializer(): kotlinx.serialization.KSerializer<{s}> = this\n" ++
             "override val descriptor: kotlinx.serialization.descriptors.SerialDescriptor get() = `{s}`.descriptor\n" ++
             "override fun serialize(encoder: kotlinx.serialization.encoding.Encoder, value: {s}) = `{s}`.serialize(encoder, value)\n" ++
-            "override fun deserialize(decoder: kotlinx.serialization.encoding.Decoder): {s} = `{s}`.deserialize(decoder) }} }}",
-        .{ last, info.path, impl_name, info.path, impl_name, info.path, impl_name });
+            "override fun deserialize(decoder: kotlinx.serialization.encoding.Decoder): {s} = `{s}`.deserialize(decoder){s} }} }}",
+        .{ last, info.path, impl_name, info.path, impl_name, info.path, impl_name, kept_member });
     var k: usize = 0;
     while (k < depth) : (k += 1) try out.appendSlice(a, " }");
     const splice_src = try snippetPadded(ctx, out.items);

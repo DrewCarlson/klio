@@ -6278,6 +6278,11 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // member — splicing the reified two-parameter respond EXTENSION
         // here committed the message into its HttpStatusCode parameter.
         if (inline_call.argsBindAllReified(b.allocator, callee.Member.name.name, args, b)) {
+            // The receiver's own applicable member wins over the inline
+            // extensions, unless that member IS a reified inline function
+            // (`Json.encodeToString(value)`): the image keeps it bodiless,
+            // so only the splice honors it.
+            if (try receiverMemberIsReifiedInline(b, callee.Member.receiver, callee.Member.name.name, args.len)) break :gate true;
             break :gate !(try receiverStaticMemberApplies(b, callee.Member.receiver, callee.Member.name.name, args, ast_arg_names, callee.Member.name.span.file));
         }
         const recv = callee.Member.receiver;
@@ -6439,6 +6444,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         // owner must be in the enclosing hierarchy.
                         if (inline_state.inlineMemberOwner(cf) == null) continue;
                         const enclosing = b.ownerClass() orelse continue;
+                        if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: ext-cand owner={s} enclosing={s} inHier={}\n", .{ mname, inline_state.inlineMemberOwner(cf).?, enclosing, inlineOwnerInEnclosingHierarchy(b, enclosing, cf) });
                         if (!inlineOwnerInEnclosingHierarchy(b, enclosing, cf)) continue;
                         const head = (try inline_call.gateReceiverHead(b, receiver)) orelse continue;
                         var h = std.mem.trimEnd(u8, head, "?");
@@ -6486,7 +6492,11 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         }
                         break :blk null;
                     } orelse {
-                        if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid=null\n", .{mname});
+                        // No registered function for the member (a pack's
+                        // reified inline member is a header stub): splice
+                        // its AST, the only form that honors it.
+                        if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid=null -> splice\n", .{mname});
+                        if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| return r;
                         continue;
                     };
                     const recv = try lowerReceiver(b, receiver);
@@ -8805,7 +8815,7 @@ fn memberOwnerOnReceiverChain(b: *FuncBuilder, receiver: *const Expr, cf: *const
 /// either side by reducing them to their host class: a bare call inside
 /// `ContentType.Companion` is in scope of `HeaderValueWithParameters`'s
 /// companion members exactly when `ContentType` extends it.
-fn classIsOrExtendsHosted(b: *FuncBuilder, sub: []const u8, super: []const u8) bool {
+pub fn classIsOrExtendsHosted(b: *FuncBuilder, sub: []const u8, super: []const u8) bool {
     if (b.module.classIsOrExtends(sub, super)) return true;
     const sub_host = hostClassOfCompanion(sub) orelse sub;
     const super_host = hostClassOfCompanion(super) orelse super;
@@ -23965,6 +23975,29 @@ test "a member reference on a scope-renamed nested class loads the lifted name" 
 /// member of `name` applicable at `argc` unnamed arguments. kotlinc
 /// resolves members before extensions, so an applicable member blocks the
 /// inference-opened reified-extension splice.
+/// Whether the receiver's static class (or a supertype) declares an inline
+/// member named `name` with a reified type parameter that takes `nargs`
+/// arguments: such a member is honored only by splicing.
+fn receiverMemberIsReifiedInline(b: *FuncBuilder, receiver: *const Expr, name: []const u8, nargs: usize) Allocator.Error!bool {
+    const head = (try inline_call.gateReceiverHead(b, receiver)) orelse return false;
+    var h = std.mem.trimEnd(u8, head, "?");
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    const cands = inline_state.candidatesForName(name) orelse return false;
+    for (cands) |cf| {
+        if (cf.receiver_type != null or !anyReified(cf.type_params)) continue;
+        const owner = inline_state.inlineMemberOwner(cf) orelse continue;
+        if (!std.mem.eql(u8, typeHead(h), owner) and !b.module.classIsOrExtends(typeHead(h), owner)) continue;
+        if (cf.params.len < nargs) continue;
+        var required: usize = 0;
+        for (cf.params) |*p| {
+            if (p.default == null and !p.is_vararg) required += 1;
+        }
+        if (nargs < required) continue;
+        return true;
+    }
+    return false;
+}
+
 fn receiverStaticMemberApplies(b: *FuncBuilder, receiver: *const Expr, name: []const u8, args: []const Expr, arg_names: []const ?[]const u8, caller_file: span.FileId) Allocator.Error!bool {
     const head = (try inline_call.gateReceiverHead(b, receiver)) orelse return false;
     var h = std.mem.trimEnd(u8, head, "?");
@@ -24007,8 +24040,20 @@ fn reifiedNamesFromExpected(b: *FuncBuilder, cf: *const ast.Function, exp: ?*con
     const rt = cf.return_type orelse return null;
     if (cf.type_params.len != 1 or !cf.type_params[0].is_reified) return null;
     if (!std.mem.eql(u8, rt.name.name, cf.type_params[0].name.name)) return null;
+    const rendered = try renderExpectedTypeName(b, e);
+    if (rendered.len == 0) return null;
+    const out = try b.allocator.alloc([]const u8, 1);
+    out[0] = rendered;
+    return out;
+}
+
+/// An expected type spelled as the class table holds it, WITH its type
+/// arguments (`GenericNullableBox<StringHolder>` keeps the argument the
+/// runtime `typeOf<T>()` needs): heads rename through the scope, dotted
+/// heads through the qualified-suffix lookup.
+fn renderExpectedTypeName(b: *FuncBuilder, e: *const ast.TypeRef) Allocator.Error![]const u8 {
     const head0 = std.mem.trimEnd(u8, e.name.name, "?");
-    if (head0.len == 0) return null;
+    if (head0.len == 0) return "";
     var head: []const u8 = head0;
     if (std.mem.indexOfScalar(u8, head0, '.') != null) {
         if (b.module.classIdByQualifiedSuffix(head0)) |cid| {
@@ -24017,9 +24062,24 @@ fn reifiedNamesFromExpected(b: *FuncBuilder, cf: *const ast.Function, exp: ?*con
     } else if (scopeTypeRename(b, head0, e.name.span.file.int())) |renamed| {
         head = renamed;
     }
-    const out = try b.allocator.alloc([]const u8, 1);
-    out[0] = head;
-    return out;
+    if (e.type_args.len == 0) {
+        if (!e.nullable) return head;
+        return std.fmt.allocPrint(b.allocator, "{s}?", .{head});
+    }
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(b.allocator, head);
+    try out.append(b.allocator, '<');
+    for (e.type_args, 0..) |*ta, i| {
+        if (i != 0) try out.appendSlice(b.allocator, ", ");
+        if (ta.is_star) {
+            try out.append(b.allocator, '*');
+            continue;
+        }
+        try out.appendSlice(b.allocator, try renderExpectedTypeName(b, &ta.ty));
+    }
+    try out.append(b.allocator, '>');
+    if (e.nullable) try out.append(b.allocator, '?');
+    return out.toOwnedSlice(b.allocator);
 }
 
 fn scalarBitBinOp(name: []const u8) ?ir.BinOp {

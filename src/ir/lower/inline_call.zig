@@ -1751,7 +1751,8 @@ pub fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBu
             var solved: ?*const TypeRef = null;
             for (cls.primary_params, 0..) |*pp, pi| {
                 if (pi >= call.args.len) break;
-                if (!std.mem.eql(u8, pp.ty.name, tp)) continue;
+                // `value: T?` binds `T` from its argument as `value: T` does.
+                if (!std.mem.eql(u8, std.mem.trimEnd(u8, pp.ty.name, "?"), tp)) continue;
                 solved = staticArgTypeRef(allocator, &call.args[pi], bb) orelse ctorArgTypeRef(allocator, &call.args[pi], bb);
                 if (solved != null) break;
             }
@@ -2398,6 +2399,19 @@ pub fn tryInlineCallWithTypeArgs(
             recv_chain,
             this_arg != null,
         ) orelse return null;
+    }
+    // A MEMBER extension narrowed by receiver and shape is visible only
+    // inside its declaring class hierarchy: JsonTestBase's
+    // `Json.encodeToString(value, mode)` never takes a call from a class
+    // that does not extend JsonTestBase.
+    if (target == null and f.receiver_type != null) {
+        if (inline_state.inlineMemberOwner(f)) |owner| {
+            const enc = b.ownerClass() orelse return null;
+            if (!expr_lower.classIsOrExtendsHosted(b, enc, owner)) {
+                spliceBail(fname, "member-ext-owner-invisible");
+                return null;
+            }
+        }
     }
     if (b.inlineDeclInProgress(f)) {
         return null;
@@ -3211,7 +3225,14 @@ pub fn tryInlineCallWithTypeArgs(
     // that window still resolve above the floor.
     var prev_body_floor: ?usize = null;
     var body_floor_set = false;
-    if (member_splice) {
+    // A spliced body resolves bare names in the CALLEE's scope: the
+    // caller's locals sit below the floor for member AND extension
+    // splices alike (`serializer(typeOf<T>())` inside the pack's
+    // `SerializersModule.serializer<T>()` must never bind a caller's
+    // `serializer` parameter). The splice's own parameters are bound
+    // above the floor; an argument lambda's body keeps the caller
+    // window.
+    if (hyg_active) {
         prev_body_floor = b.splice_body_floor;
         b.splice_body_floor = caller_scope_depth;
         body_floor_set = true;
