@@ -1442,14 +1442,14 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
         leafTrace(f, "suspend");
         ok = false;
     }
-    // An INLINE fn's standalone lowered body is not its semantics — call
-    // sites splice the AST, and the leftover body can be a bare identity
-    // stub (Map.iterator's leaf returned the receiver map itself, and a
-    // ktor iteration then called hasNext on a CaseInsensitiveMap).
-    if (f.is_inline) {
-        leafTrace(f, "inline");
-        ok = false;
-    }
+    // Inline fns are ELIGIBLE: their standalone lowered bodies are real
+    // (the Map.iterator incident was a REGISTRATION KEY collision — the
+    // identity `Iterator<T>.iterator() = this` overwrote Map's entry
+    // under the shared single-char 'o' sig; leafKeyAlloc now keys
+    // non-scalar params by type head). The genuinely splice-dependent
+    // shapes are filtered at the op level: reified `is T` by the
+    // bare-type-var InstanceOf gate, `as T`/`::class`/`typeOf` as
+    // escape-ops, lambda-param calls as non-direct calls.
     for (f.blocks, 0..) |*blk, bi| {
         if (!ok) break;
         if (blk.catches.len != 0 or blk.finally != null) {

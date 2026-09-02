@@ -8107,13 +8107,62 @@ pub fn leafSigChar(ty: []const u8) u8 {
     return 'o';
 }
 
-/// `fqn#<sig>` — the collision-proof registration key for `f`.
+/// `fqn#<sig>` — the collision-proof registration key for `f`. A
+/// non-scalar param contributes its declared type HEAD, not just 'o':
+/// `Map.iterator`, `MutableMap.iterator`, and the identity
+/// `Iterator<T>.iterator() = this` all share
+/// `kotlin.collections.iterator` and an object receiver, and the
+/// single-char sig let the LAST registration win — the identity body
+/// served Map callers and returned the receiver map.
 pub fn leafKeyAlloc(gpa2: std.mem.Allocator, f: *const Func) ?[]u8 {
     var buf: std.ArrayList(u8) = .empty;
     buf.appendSlice(gpa2, f.fqn) catch return null;
     buf.append(gpa2, '#') catch return null;
-    for (f.params) |*p| buf.append(gpa2, leafSigChar(p.ty.name)) catch return null;
+    for (f.params) |*p| {
+        const c = leafSigChar(p.ty.name);
+        if (c != 'o') {
+            buf.append(gpa2, c) catch return null;
+            continue;
+        }
+        const nm = p.ty.name;
+        const head = if (std.mem.lastIndexOfScalar(u8, nm, '.')) |d| nm[d + 1 ..] else nm;
+        if (head.len == 0) {
+            buf.append(gpa2, 'o') catch return null;
+        } else {
+            buf.append(gpa2, '{') catch return null;
+            buf.appendSlice(gpa2, head) catch return null;
+            buf.append(gpa2, '}') catch return null;
+        }
+    }
     return buf.toOwnedSlice(gpa2) catch null;
+}
+
+test "leafKeyAlloc separates object-receiver overloads by type head" {
+    const gpa2 = std.testing.allocator;
+    const mk = struct {
+        fn key(al: std.mem.Allocator, ty_name: []const u8) ![]u8 {
+            var params = [_]ir.Param{.{
+                .name = "this",
+                .ty = .{ .name = ty_name, .nullable = false, .args = &.{} },
+                .default = null,
+                .is_property = false,
+                .is_vararg = false,
+                .has_default = false,
+            }};
+            var f = std.mem.zeroInit(Func, .{
+                .fqn = "kotlin.collections.iterator",
+                .name = "iterator",
+                .params = params[0..],
+            });
+            return leafKeyAlloc(al, &f) orelse error.OutOfMemory;
+        }
+    };
+    const a2 = try mk.key(gpa2, "Map");
+    defer gpa2.free(a2);
+    const b2 = try mk.key(gpa2, "Iterator");
+    defer gpa2.free(b2);
+    try std.testing.expect(!std.mem.eql(u8, a2, b2));
+    try std.testing.expectEqualStrings("kotlin.collections.iterator#{Map}", a2);
 }
 
 /// Register a leaf by FQN alone (leaf-library loading).

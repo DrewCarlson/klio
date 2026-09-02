@@ -100,14 +100,18 @@ deleted for getters and setters).
   member-site memos / fast_call plans, threadlocal cached edge view)
   stay recorded for a future campaign with a heavier customer.
 - INLINE-STUB TRAP (2026-09-01, caught by the ktor census floor at
-  410/40 on the first engaged stack): an INLINE fn's standalone
-  lowered body is NOT its semantics — call sites splice the AST and
-  the leftover body can be a bare identity stub (Map.iterator's leaf
-  returned the receiver map). Inline fns are leaf-ineligible
-  (3298 -> 3096 leaves). Any future emission surface must honor the
-  same rule; the wide leaves had carried 202 such stubs through
-  several green datetime/coroutines stacks before ktor's iteration
-  paths exposed one.
+  410/40) — DIAGNOSIS CORRECTED 2026-09-02 (leaf-wide campaign): the
+  standalone lowered bodies of inline fns are REAL; the incident was a
+  REGISTRATION KEY COLLISION. `Map.iterator`, `MutableMap.iterator`,
+  and the identity `Iterator<T>.iterator() = this` all share fqn
+  `kotlin.collections.iterator` and the single-char 'o' object sig, so
+  the last registration won and the identity body served Map callers.
+  Fixed at the root: leafKeyAlloc keys non-scalar params by declared
+  type head (`#{Map}` vs `#{Iterator}`, unit-tested), and the blanket
+  inline ineligibility gate is deleted (3200 -> 3402 leaves) — the
+  genuinely splice-dependent shapes are already filtered at the op
+  level (reified `is T` by the bare-type-var gate, `as T`/`::class`
+  as escape-ops).
 
 ## Task 2 — receiver-tower call-half gating, re-measured
 
