@@ -389,6 +389,18 @@ content-negotiation.
   module function table moved during a nested lambda-body lowering (the
   same hazard the ext-call path warns about for `target`); confirm and
   snapshot the param type before the receiver / block lowers.
+
+  ktor typed-body e2e (client-serialization) remaining root: the
+  converter list `deserialize` (ContentConverter.kt:111) is
+  `asFlow().map { converter -> converter.deserialize(...) }
+  .firstOrNull { ... }` inside the extension `List<ContentConverter>
+  .deserialize`. The unit-mask shield unblocked the predicate coercion,
+  but `this.asFlow().map { }` on an EXTENSION receiver breaks the flow
+  collector: `Vm::call_member emit on $anon$1`. Plain
+  `list.asFlow().map { }.toList()` works; only the extension-receiver
+  `this.asFlow()` form fails (map's spliced `unsafeTransform` emits on
+  the wrong collector). This is the last blocker for the typed
+  client/server serialization gates; the plain GET path is green.
   Remaining core 3 (after round eighteen):
   BasicTypesSerializationTest.testKvSerialization,
   SealedGenericClassesTest.testQuery,
