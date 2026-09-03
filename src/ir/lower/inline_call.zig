@@ -1607,11 +1607,20 @@ fn unifyParamAgainstArg(
     // .serializer())`) against a `KSerializer<T>` parameter solves
     // `T = PolyDerived`: the plugin's generated factory returns the
     // declaration's own serializer, so the receiver names the type.
-    if (param_ty.type_args.len == 1 and !param_ty.type_args[0].is_star and
+    // A prior arm may have bound the parameter from the factory's declared
+    // return type, which keeps only a SIMPLE head (`Error` for
+    // `ApiResponse.Error.serializer()`): that spelling resolves to an
+    // unrelated classifier of the same name (`kotlin.Error`). The written
+    // receiver path is the authority for a nested class, so it overrides an
+    // unqualified binding.
+    const kser_tv: ?[]const u8 = if (param_ty.type_args.len == 1 and !param_ty.type_args[0].is_star and
         std.mem.eql(u8, std.mem.trimEnd(u8, param_ty.name.name, "?"), "KSerializer") and
-        tp_names.contains(param_ty.type_args[0].ty.name.name) and
-        !subst.contains(param_ty.type_args[0].ty.name.name))
-    {
+        tp_names.contains(param_ty.type_args[0].ty.name.name)) param_ty.type_args[0].ty.name.name else null;
+    const kser_open = if (kser_tv) |tv| blk: {
+        const prior = subst.get(tv) orelse break :blk true;
+        break :blk prior.qualified_path == null and std.mem.indexOfScalar(u8, prior.name.name, '.') == null;
+    } else false;
+    if (kser_open) kser: {
         if (arg.* == .Call and arg.Call.callee.* == .Member and
             std.mem.eql(u8, arg.Call.callee.Member.name.name, "serializer"))
         {
@@ -1624,6 +1633,20 @@ fn unifyParamAgainstArg(
                 // lifted class the table holds.
                 const last = if (std.mem.lastIndexOfScalar(u8, cls_path, '.')) |d| cls_path[d + 1 ..] else cls_path;
                 if (last.len != 0 and std.ascii.isUpper(last[0])) {
+                    const qualified: ?[]const u8 = if (last.len == cls_path.len) null else cls_path;
+                    // A prior binding of the same simple name
+                    // (`ParametrizedData<Data>` solved from `value: T`) keeps
+                    // its type arguments; the receiver spelling contributes
+                    // only the qualified path.
+                    if (subst.get(kser_tv.?)) |prior| {
+                        if (std.mem.eql(u8, prior.name.name, last)) {
+                            if (qualified == null) break :kser;
+                            var merged = prior;
+                            merged.qualified_path = qualified;
+                            try subst.put(kser_tv.?, merged);
+                            return;
+                        }
+                    }
                     try subst.put(param_ty.type_args[0].ty.name.name, .{
                         .name = .{ .name = last, .span = arg.span() },
                         .nullable = false,
@@ -1632,7 +1655,7 @@ fn unifyParamAgainstArg(
                         .function = null,
                         .definitely_non_null = false,
                         .annotations = &.{},
-                        .qualified_path = if (last.len == cls_path.len) null else cls_path,
+                        .qualified_path = qualified,
                     });
                     return;
                 }
@@ -2091,7 +2114,8 @@ fn argDeclSupertypeMatching(arg: *const Expr, want: []const u8) ?*const TypeRef 
     const sups = inline_state.classSupertypeRefs(name) orelse return null;
     for (sups) |*sup| {
         if (sup.type_args.len == 0) continue;
-        if (std.mem.eql(u8, sup.name.name, want)) return sup;
+        const sup_head = if (std.mem.lastIndexOfScalar(u8, sup.name.name, '.')) |d| sup.name.name[d + 1 ..] else sup.name.name;
+        if (std.mem.eql(u8, sup_head, want)) return sup;
     }
     return null;
 }
@@ -3917,8 +3941,18 @@ fn reifiedQualifiedName(b: *FuncBuilder, a: ast.TypeRef) ?[]const u8 {
     // The dotted spelling is a `.`-aligned suffix of the class's fqn
     // (`Proto.Message.IntMessage` inside `Holder`): the registered name is
     // the lifted one the class table holds.
-    if (b.module.classIdByQualifiedSuffix(qp)) |cid| {
-        if (cid.int() < b.module.classes.items.len) return b.module.classes.items[cid.int()].name;
+    // The dot-suffix hit's registered `name` can be the bare simple name
+    // (`Error` for `Tests.ApiResponse.Error`), which the bare index resolves
+    // to an unrelated classifier of that name (`kotlin.Error`): only a
+    // spelling that resolves BACK to this class may stand for it — else the
+    // lifted `Outer$Nested` candidates below, which the index keys, do.
+    const suffix_hit: ?ir.ClassId = b.module.classIdByQualifiedSuffix(qp);
+    if (suffix_hit) |cid| {
+        if (cid.int() < b.module.classes.items.len) {
+            const nm = b.module.classes.items[cid.int()].name;
+            const back = b.module.classIdIndexed(nm, b.self_package, a.name.span.file) orelse b.module.classId(nm);
+            if (back != null and back.?.int() == cid.int()) return nm;
+        }
     }
     var segs: [8][]const u8 = undefined;
     var n: usize = 0;
@@ -3937,7 +3971,10 @@ fn reifiedQualifiedName(b: *FuncBuilder, a: ast.TypeRef) ?[]const u8 {
             buf.appendSlice(b.allocator, seg) catch return null;
         }
         const cand = buf.toOwnedSlice(b.allocator) catch return null;
-        if (b.module.classIdIndexed(cand, b.self_package, a.name.span.file) != null) return cand;
+        const ccid_opt = b.module.classIdIndexed(cand, b.self_package, a.name.span.file);
+        if (ccid_opt) |ccid| {
+            if (suffix_hit == null or ccid.int() == suffix_hit.?.int()) return cand;
+        }
     }
     return null;
 }

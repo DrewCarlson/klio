@@ -2025,14 +2025,55 @@ fn genForClassObject(ctx: *Ctx, o: *ast.ObjectDecl, obj_path: []const u8, target
     try ctx.gen.appendSlice(a, "}\n\n");
     ctx.generated_any = true;
     const splice = try std.fmt.allocPrint(a,
-        "object {s} {{ override val descriptor: kotlinx.serialization.descriptors.SerialDescriptor get() = `{s}`.descriptor\n" ++
+        "object {s} : kotlinx.serialization.KSerializer<{s}> {{ override val descriptor: kotlinx.serialization.descriptors.SerialDescriptor get() = `{s}`.descriptor\n" ++
             "override fun serialize(encoder: kotlinx.serialization.encoding.Encoder, value: {s}) = `{s}`.serialize(encoder, value)\n" ++
             "override fun deserialize(decoder: kotlinx.serialization.encoding.Decoder): {s} = `{s}`.deserialize(decoder) }}",
-        .{ o.name.name, impl_name, info.path, impl_name, info.path, impl_name });
+        .{ o.name.name, info.path, impl_name, info.path, impl_name, info.path, impl_name });
     const splice_src = try snippetPadded(ctx, splice);
     if (parseSnippet(a, ctx.file.span.file, splice_src)) |snip_val| {
         var snip = snip_val;
+        // The plugin makes the object a `KSerializer<X>`; a bodiless object
+        // declares no serializer supertype, so the splice supplies one.
+        if (snip.decls.len != 0 and snip.decls[0] == .Object and !declaresSerializerSupertype(o.supertypes)) {
+            const so = &snip.decls[0].Object;
+            try appendSupertypes(a, o, so.supertypes);
+        }
         try spliceInto(a, &o.members, true, &snip);
+    }
+}
+
+fn declaresSerializerSupertype(supertypes: []const ast.TypeRef) bool {
+    for (supertypes) |*st| {
+        const head = simpleHead(st.name.name);
+        if (std.mem.eql(u8, head, "KSerializer") or std.mem.eql(u8, head, "GeneratedSerializer") or
+            std.mem.eql(u8, head, "SerializationStrategy") or std.mem.eql(u8, head, "DeserializationStrategy")) return true;
+    }
+    return false;
+}
+
+/// Append supertypes to an object, keeping the parallel per-supertype
+/// arrays (constructor args, arg names, delegates) aligned.
+fn appendSupertypes(a: Allocator, o: *ast.ObjectDecl, extra: []const ast.TypeRef) Allocator.Error!void {
+    if (extra.len == 0) return;
+    var sups: std.ArrayList(ast.TypeRef) = .empty;
+    try sups.appendSlice(a, o.supertypes);
+    try sups.appendSlice(a, extra);
+    o.supertypes = sups.items;
+    var sargs: std.ArrayList(?[]ast.Expr) = .empty;
+    try sargs.appendSlice(a, o.supertype_args);
+    while (sargs.items.len < o.supertypes.len) try sargs.append(a, null);
+    o.supertype_args = sargs.items;
+    if (o.supertype_arg_names.len != 0) {
+        var names: std.ArrayList(?[]const ?[]const u8) = .empty;
+        try names.appendSlice(a, o.supertype_arg_names);
+        while (names.items.len < o.supertypes.len) try names.append(a, null);
+        o.supertype_arg_names = names.items;
+    }
+    if (o.supertype_delegates.len != 0) {
+        var dels: std.ArrayList(?ast.Expr) = .empty;
+        try dels.appendSlice(a, o.supertype_delegates);
+        while (dels.items.len < o.supertypes.len) try dels.append(a, null);
+        o.supertype_delegates = dels.items;
     }
 }
 

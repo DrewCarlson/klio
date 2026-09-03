@@ -1,0 +1,4 @@
+Box: implicit=6 explicit=6 match=true
+decoded=Box(t=Data(i=6))
+Data: implicit=7 explicit=7 match=true
+decoded=Data(i=7)
