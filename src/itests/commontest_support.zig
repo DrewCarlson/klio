@@ -772,10 +772,17 @@ pub fn runSuite(cfg: Config) !void {
                 // Census diagnosis: name every failing case (and its file) so
                 // a red census is actionable without a by-hand re-run.
                 if (nf != 0 and std.c.getenv("KLIO_CENSUS_NAMES") != null) {
+                    const want_err = std.c.getenv("KLIO_CENSUS_ERRS") != null;
                     var itn = std.mem.splitScalar(u8, r.stdout, '\n');
+                    var prev_failed = false;
                     while (itn.next()) |line| {
+                        if (want_err and prev_failed and line.len != 0 and (line[0] == ' ' or line[0] == '\t')) {
+                            std.debug.print("[census-err] {s}\n", .{std.mem.trim(u8, line, " \t")});
+                        }
+                        prev_failed = false;
                         if (std.mem.endsWith(u8, line, " FAILED")) {
                             std.debug.print("[census-fail] {s} <- {s}\n", .{ line, queue[i][queue[i].len - 1] });
+                            prev_failed = true;
                         }
                     }
                 }
