@@ -399,7 +399,17 @@ content-negotiation.
   collector: `Vm::call_member emit on $anon$1`. Plain
   `list.asFlow().map { }.toList()` works; only the extension-receiver
   `this.asFlow()` form fails (map's spliced `unsafeTransform` emits on
-  the wrong collector). This is the last blocker for the typed
+  the wrong collector). NOTE (current): the inline-splice receiver shield now also covers the
+  unit mask (committed), fixing the simple accept.otherwise / flow-map
+  bleeds; ktor 447/3, json 688, core 138, compose 446/6 all hold. The
+  deeper CookieDateParser nesting (capture inside an inline `-> Unit`
+  param) needs a PER-ARGUMENT splice mask thread; a first attempt
+  over-reset pending_ref_lambda_unit for every splice param and regressed
+  ktor to 373 with DNCs, so it was reverted. The surgical version must
+  set the mask ONLY for the matched argument slot and leave every other
+  splice param's flag as the round-23 feature computed it.
+
+  This is the last blocker for the typed
   client/server serialization gates; the plain GET path is green.
   Remaining core 3 (after round eighteen):
   BasicTypesSerializationTest.testKvSerialization,
