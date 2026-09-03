@@ -3750,6 +3750,8 @@ fn recvFnPropHeadOf(self: *VmHost, receiver: *const Value, name: []const u8) ?[]
 /// cannot satisfy, or the whole `with(node) { … }` body is silently
 /// replaced by the field's lambda).
 fn recvFnReceiverFor(self: *VmHost, allocator: Allocator, receiver: *const Value, head: []const u8) Allocator.Error!?Value {
+    if (runtime.envOnce("KLIO_HEAD_TRACE") != null)
+        std.debug.print("[recvfn] head={s} passed={s}/{s} implements={} registered={}\n", .{ head, debugClassNameOf(self, receiver), @tagName(receiver.*), receiverImplementsHead(self, receiver, head), headNamesRegisteredClass(self, head) });
     if (head.len == 0 or receiverImplementsHead(self, receiver, head)) return receiver.*;
     // A head that names NO registered class (a bare type parameter --
     // `with`'s `T.()` block) proves nothing about any receiver: the value

@@ -853,6 +853,19 @@ pub fn spliceInlineLambdaOn(
     try b.pushScope();
     const lambda_own_base = b.scopeDepth() - 1;
     if (receiver) |reg| try b.bind("this", reg) else if (recv_seat) try b.bind("this", arg_regs[0]);
+    // Inside a receiver lambda passed to inline `f`, `this@f` names the
+    // lambda's OWN receiver — the spliced subject — and shadows the fn
+    // splice's same-labeled binding (f's extension receiver). A closure
+    // created in the body captures its `this` under exactly this label, so
+    // without the shadow a nested `forEachIndexed { block(i, e) }` inside
+    // `encodeCollection`'s `composite.block()` captured the enclosing
+    // Encoder and ran the caller's element block against it.
+    if (receiver orelse (if (recv_seat) arg_regs[0] else null)) |subject| {
+        if (b.currentInlineFn()) |fname| {
+            const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{fname});
+            try b.bind(label, subject);
+        }
+    }
     if (inline_state.runtime.envOnce("KLIO_THIS_TRACE") != null) {
         std.debug.print("[lam-splice-bind] {s} recv={?d} own_base={d} depth={d}\n", .{ lambda_name, if (receiver) |r| r.int() else null, lambda_own_base, b.scopeDepth() });
     }
