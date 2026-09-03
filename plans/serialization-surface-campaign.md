@@ -365,7 +365,16 @@ content-negotiation.
   fallback (invoke `serializer` straight on the class value when the
   `$companion` lookup is null) makes `serializer<Local>()` resolve but
   REGRESSES json 688->682 and core 138->132 — it fires for classes whose
-  null was correct. The fix must target local classes specifically.
+  null was correct. The fix must target local classes specifically. Precise encodeToString
+  root: the reified splice emits `Local$lcmain.serializer()` at the call
+  site; the local class registers at runtime under `Local` (simple name,
+  host_classes registerClass uses class.name.name) but is referenced by
+  the `$lc<fn>`-mangled name, so the member-call receiver classifier does
+  not find a class for `Local$lcmain` and lowers a bare `LoadGlobal`
+  (fails). `Local.serializer()` works because the source name resolves.
+  Fix candidates: register the local class under its mangled name too, or
+  have the member-receiver class classification strip / resolve the
+  `$lc<fn>` mangle to the class-table entry.
   (b) GenericCustomSerializerTest — IndexOutOfBounds (Index 0, length 0)
   in a generated serializer. Both are distinct from the suite-only enum /
   streaming failures.
