@@ -12106,6 +12106,21 @@ fn loadGlobalValue(comptime H: type, allocator: Allocator, module: *const Module
                         }
                     }
                 }
+                // A `$lc<fn>`-mangled LOCAL class name (`Local$lcmain`) is how
+                // lowering refers to a local class, but the runtime registers
+                // it under its simple declared name (`Local`). A reified
+                // splice that materialized the mangled name as a global —
+                // `Json.encodeToString(localValue)` -> `Local$lcmain.serializer()`
+                // — resolves through the simple name.
+                if (std.mem.indexOf(u8, name_str, "$lc")) |lci| {
+                    const simple = name_str[0..lci];
+                    if (simple.len != 0) {
+                        switch (try host.lookupGlobalThrowing(allocator, simple)) {
+                            .ok => |maybe| if (maybe) |lv| return ok(lv),
+                            .err => {},
+                        }
+                    }
+                }
                 if (envVarSet("KLIO_UNRESOLVED_TRACE")) {
                     std.debug.print("[unresolved] `{s}`\n", .{name_str});
                 }
