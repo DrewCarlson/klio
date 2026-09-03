@@ -3891,7 +3891,16 @@ pub fn tryInlineCallWithTypeArgs(
 /// nesting when two segments miss); an unqualified name falls back to
 /// the lexical scope-rename ladder unchanged.
 fn reifiedQualifiedName(b: *FuncBuilder, a: ast.TypeRef) ?[]const u8 {
-    const qp = a.qualified_path orelse return null;
+    // An INFERRED nested type argument (`T` = `Foo.Bar` derived from a
+    // `Foo.Bar(1)` argument) carries its dotted spelling in `name`, not
+    // `qualified_path`, so resolve either: the dotted head names a
+    // `.`-aligned suffix of the nested class's lifted fqn, and without it
+    // the reified bind loads a bare `Foo.Bar` global that does not exist.
+    const qp = a.qualified_path orelse
+        (if (std.mem.indexOfScalar(u8, a.name.name, '.') != null and a.name.name[0] != '.')
+            a.name.name
+        else
+            return null);
     // The dotted spelling is a `.`-aligned suffix of the class's fqn
     // (`Proto.Message.IntMessage` inside `Holder`): the registered name is
     // the lifted one the class table holds.
