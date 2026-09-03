@@ -1959,7 +1959,18 @@ pub fn loweredTypeName(b: *const FuncBuilder, ty: *const ast.TypeRef) []const u8
             if (b.module.registry.mangled_nested.get(key)) |m| return m;
         }
     }
-    return scopeTypeRename(b, ty.name.name, ty.span.file.int()) orelse ty.name.name;
+    if (scopeTypeRename(b, ty.name.name, ty.span.file.int())) |renamed| return renamed;
+    // A function-local class (`@Serializable data class Outer(...)` declared
+    // in the body) is keyed by its `$lc<fn>` alias; an explicit type argument
+    // naming it (`decodeFromString<Outer>(...)`) binds that alias, not the
+    // bare name another file's `Outer` would answer.
+    var lc_buf: [160]u8 = undefined;
+    if (std.fmt.bufPrint(&lc_buf, "{s}$lc{s}", .{ ty.name.name, build.currentRealFn() orelse "" }) catch null) |key| {
+        if (b.module.registry.class_super_names.get(key) != null) {
+            return b.allocator.dupe(u8, key) catch ty.name.name;
+        }
+    }
+    return ty.name.name;
 }
 
 /// Lower a source type into an owned structural type for builder metadata.
@@ -6798,6 +6809,21 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                             inline_call.splice_route_tag = "lowerCall:6590";
                             if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| return r;
                         }
+                    }
+                    // A REIFIED inline callee with no written type arguments
+                    // (`Json.encodeToString(origin)`) binds `T` only through the
+                    // splice: the typed member call below stamps the written
+                    // names, and with none the frame would read whatever
+                    // process-global `T` an earlier splice left behind.
+                    reified_splice: {
+                        var any_reified = false;
+                        for (cf.type_params) |*tp| {
+                            if (tp.is_reified) any_reified = true;
+                        }
+                        if (!any_reified) break :reified_splice;
+                        if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: reified -> splice first\n", .{mname});
+                        inline_call.splice_route_tag = "lowerCall:reified";
+                        if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| return r;
                     }
                     const recv = try lowerReceiver(b, receiver);
                     const run = try lowerArgRun(b, args);
@@ -11934,6 +11960,15 @@ fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
                 }
             }
         }
+        // An enum ENTRY (`AlternateEnumNames.VALUE_A`, `Cases.hasSerialName`)
+        // is a value of its enum class, nested enums included: a reified
+        // sibling beside it (`assertEquals(E.A, json.decodeFromString(...))`)
+        // solves `T` as the enum.
+        if (m.receiver.* == .Path and !std.mem.eql(u8, m.name.name, "entries")) {
+            if (enumClassOfPath(b, m.receiver)) |enum_name| {
+                return .{ .name = enum_name, .nullable = false, .args = &.{} };
+            }
+        }
         if (argDeclTypeRefLazy(b, m.receiver)) |rt| {
             var h = std.mem.trimEnd(u8, rt.name, "?");
             if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
@@ -16856,7 +16891,7 @@ fn instantiatedCallIrType(b: *FuncBuilder, e: *const Expr, depth: usize) ?ir.Typ
             }
         }
         if (shape.ty != null) continue;
-        shape.ty = staticExprTypeRef(b, a) catch null;
+        shape.ty = (staticExprTypeRef(b, a) catch null) orelse valueClassCtorTypeRef(b, a);
         shape.ty_authoritative = shape.ty != null;
     }
     const recv_ty: ?ir.TypeRef = if (receiver) |r|
@@ -16870,7 +16905,9 @@ fn instantiatedCallIrType(b: *FuncBuilder, e: *const Expr, depth: usize) ?ir.Typ
     // A bare name that constructs a generic class (`Pair(42, Pair("a", "b"))`)
     // instantiates the class's own parameters from its primary parameters.
     if (receiver == null) ctor: {
-        const cid = b.module.classIdIndexed(name, b.self_package, call.callee.Path.segments[0].span.file) orelse
+        const file = call.callee.Path.segments[0].span.file;
+        const scoped: ?ir.ClassId = if (scopeTypeRename(b, name, file.int())) |rn| b.module.classId(rn) else null;
+        const cid = scoped orelse b.module.classIdIndexed(name, b.self_package, file) orelse
             b.module.classId(name) orelse break :ctor;
         if (cid.int() >= b.module.classes.items.len) break :ctor;
         const cls = &b.module.classes.items[cid.int()];
@@ -17001,6 +17038,24 @@ fn outerArityFits(f: *const ir.Func, nargs: usize) bool {
         if (!f.params[i].has_default) return false;
     }
     return true;
+}
+
+/// The class a VALUE-class constructor call names (`Child1(Child1Value(1, "one"))`),
+/// resolved in scope: `ctorInitTypeRef` declines value classes, yet an
+/// element or argument typed by one still has that class as its static type
+/// (a sealed-interface `List<Parent>` of inline children).
+pub fn valueClassCtorTypeRef(b: *FuncBuilder, e: *const Expr) ?ir.TypeRef {
+    if (e.* != .Call) return null;
+    const call = e.Call;
+    if (call.callee.* != .Path or call.callee.Path.segments.len != 1) return null;
+    const seg = call.callee.Path.segments[0];
+    if (seg.name.len == 0 or !std.ascii.isUpper(seg.name[0])) return null;
+    const scoped: ?ir.ClassId = if (scopeTypeRename(b, seg.name, seg.span.file.int())) |rn| b.module.classId(rn) else null;
+    const cid = scoped orelse b.module.classIdIndexed(seg.name, b.self_package, seg.span.file) orelse b.module.classId(seg.name) orelse return null;
+    if (cid.int() >= b.module.classes.items.len) return null;
+    const cls = &b.module.classes.items[cid.int()];
+    if (!cls.is_value or cls.type_params.len != 0) return null;
+    return .{ .name = b.allocator.dupe(u8, cls.fqn) catch return null, .nullable = false, .args = &.{} };
 }
 
 fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr) ?SibSolved {
@@ -17140,12 +17195,21 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
             if (k == j) continue;
             const pk = ro_sel + k;
             if (pk >= f_sel.params.len) continue;
-            if (!std.mem.eql(u8, f_sel.params[pk].ty.name, tv)) continue;
+            // The sibling slot names `T` directly (`data: T`) or carries it as a
+            // type argument (`pair: Pair<K, V>` for a `vSer: KSerializer<V>`),
+            // in which case the sibling's instantiated type projects to it.
+            const proj: ?usize = blk_proj: {
+                if (std.mem.eql(u8, f_sel.params[pk].ty.name, tv)) break :blk_proj null;
+                for (f_sel.params[pk].ty.args, 0..) |pa, pi| {
+                    if (std.mem.eql(u8, std.mem.trimEnd(u8, pa.name, "?"), tv)) break :blk_proj pi;
+                }
+                continue;
+            };
             const sp = c.callee.Path.segments[0].span;
             // The sibling's static type: an enum-entries expression, else a
             // constructor call / typed value (`check(serializer(), Holder(x), …)`
             // solves `serializer<T>()` from `Holder(x)` at the `data: T` slot).
-            const sib_ty: ast.TypeRef = blk: {
+            const sib_ty_full: ast.TypeRef = blk: {
                 if (staticEnumElem(b, sib)) |enum_name| {
                     break :blk .{ .name = .{ .name = enum_name, .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null };
                 }
@@ -17158,6 +17222,10 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
                 if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) std.debug.print("[sibexp-zero] outer={s} nested={s} sibling#{d} -> {s}\n", .{ outer_name, nested_name, k, st.name.name });
                 break :blk st.*;
             };
+            const sib_ty: ast.TypeRef = if (proj) |pi| blk_p: {
+                if (pi >= sib_ty_full.type_args.len or sib_ty_full.type_args[pi].is_star) continue;
+                break :blk_p sib_ty_full.type_args[pi].ty;
+            } else sib_ty_full;
             // Build `Head<Sibling>` as the nested call's expected type; the
             // inline splice's return-type unification (the existing
             // reified oracle) solves T from it.

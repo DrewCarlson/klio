@@ -2507,6 +2507,7 @@ fn companionInstanceForDef(self: *VmHost, fqn: []const u8, simple: []const u8) A
             break :blk g.get().registry.companion_singletons.get(cand);
         };
         if (comp_name) |cn| {
+            if (runtime.envOnce("KLIO_COMPANION_TRACE") != null) std.debug.print("[companion] key -> {s}\n", .{cn});
             return switch (try host_globals.ensureObjectSingleton(self, cn)) {
                 .ok => |maybe| maybe,
                 .err => null,
@@ -2555,6 +2556,7 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
     // (`companion object Named`), initialized on read — the lookup the
     // serialization runtime's KClass -> generated serializer path needs.
     if (std.mem.eql(u8, name, "$companion")) {
+        if (runtime.envOnce("KLIO_COMPANION_TRACE") != null) std.debug.print("[companion] fqn={s} name={s}\n", .{ cd.fqn, cd.name });
         // A nested class registers under its lifted name and its
         // enclosing-chain-qualified name; the bare simple name belongs to
         // a top-level class and must never answer for a nested one

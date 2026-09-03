@@ -1859,13 +1859,27 @@ pub fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBu
     }
     // A nested class referenced by bare name inside its declaring subtree
     // lives in the class table under its lifted (mangled) name.
-    if (cid == null) cid = b.module.classIdIndexed(head.name, b.self_package, head.span.file) orelse
-        b.module.classId(head.name) orelse blk: {
+    // The enclosing scope's own classifier (a nested or local class the
+    // written name aliases to) wins over the package-level index, which would
+    // answer a same-named class from another file of the package.
+    if (cid == null) cid = blk: {
         const owner = splice_lexical_owner orelse b.ownerClass();
         const renamed = expr_lower.scopeTypeRenameFrom(@constCast(b), owner, head.name, head.span.file.int()) orelse break :blk null;
         break :blk b.module.classId(renamed);
     };
+    if (cid == null) cid = b.module.classIdIndexed(head.name, b.self_package, head.span.file) orelse
+        b.module.classId(head.name);
     if (cid == null) return null;
+    // A lifted class (`Local$lctestInLambda`, `Outer$Box`) is referenced by
+    // its lifted identity, which the flat name table cannot confuse.
+    if (cid.?.int() < b.module.classes.items.len) {
+        const lifted = b.module.classes.items[cid.?.int()].name;
+        if (!std.mem.eql(u8, lifted, written_name) and std.mem.indexOfScalar(u8, lifted, '$') != null and
+            std.mem.indexOfScalar(u8, written_name, '.') == null)
+        {
+            written_name = lifted;
+        }
+    }
     var targs = allocator.alloc(ast.TypeArg, call.type_args.len) catch return null;
     for (call.type_args, 0..) |ta, i| {
         targs[i] = .{ .variance = .Invariant, .is_star = false, .ty = ta, .span = ta.span };
@@ -1908,6 +1922,18 @@ pub fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBu
         const as_ast = expr_lower.astTypeRefFromIr(@constCast(b), derived, head.span) orelse break :fallback;
         targs = as_ast.type_args;
     }
+    // The class resolved IN SCOPE is the binding's identity: a bare
+    // written name shared with another class in the image (`Box(1)` inside
+    // `EncodingExtensionsTest`, beside other tests' `Box`es) carries the
+    // resolved class's qualified name, which the splice resolves to that
+    // class rather than to whichever `Box` the flat name table answers.
+    const qualified: ?[]const u8 = blk: {
+        const cls = if (cid.?.int() < b.module.classes.items.len) &b.module.classes.items[cid.?.int()] else break :blk null;
+        if (std.mem.eql(u8, cls.fqn, written_name)) break :blk null;
+        if (std.mem.indexOfScalar(u8, cls.fqn, '.') == null) break :blk null;
+        if (b.module.uniqueClassIdBySimpleName(head.name) != null) break :blk null;
+        break :blk cls.fqn;
+    };
     const out = allocator.create(TypeRef) catch return null;
     out.* = .{
         .name = .{ .name = written_name, .span = head.span },
@@ -1917,7 +1943,7 @@ pub fn ctorArgTypeRef(allocator: Allocator, arg: *const Expr, bb: ?*const FuncBu
         .function = null,
         .definitely_non_null = false,
         .annotations = &.{},
-        .qualified_path = null,
+        .qualified_path = qualified,
     };
     return out;
 }
@@ -2875,7 +2901,13 @@ pub fn tryInlineCallWithTypeArgs(
         }
     }
 
-    if (!inline_state.inlineExpandEnter()) {
+    const has_reified_tp = blk: {
+        for (f.type_params) |tp| {
+            if (tp.is_reified) break :blk true;
+        }
+        break :blk false;
+    };
+    if (!(if (has_reified_tp) inline_state.inlineExpandEnterReified() else inline_state.inlineExpandEnter())) {
         spliceBail(fname, "expand-depth");
         return null;
     }
@@ -3721,7 +3753,16 @@ pub fn tryInlineCallWithTypeArgs(
             // mangled nested class (`enumEntries<Item>()` where `Item`
             // lifted as `A$Item`) must reach the runtime as the lifted
             // name the class table actually holds.
-            const head_sub = b.resolveReifiedTypeName(a.name.name) orelse
+            // A function-local class named as the argument (`decodeFromString<Outer>(...)`
+            // beside `@Serializable data class Outer` in the body) is stamped by
+            // its `$lc<fn>` alias, the identity the class table holds.
+            const local_alias: ?[]const u8 = blk: {
+                var lc_buf: [160]u8 = undefined;
+                const key = std.fmt.bufPrint(&lc_buf, "{s}$lc{s}", .{ a.name.name, build.currentRealFn() orelse "" }) catch break :blk null;
+                if (b.module.registry.class_super_names.get(key) == null) break :blk null;
+                break :blk b.allocator.dupe(u8, key) catch null;
+            };
+            const head_sub = local_alias orelse b.resolveReifiedTypeName(a.name.name) orelse
                 reifiedQualifiedName(b, a) orelse
                 (expr_lower.scopeTypeRenameFrom(b, lexical_owner, a.name.name, a.name.span.file.int()) orelse a.name.name);
             // Carry the FULL generic spelling, not just the head: a nested

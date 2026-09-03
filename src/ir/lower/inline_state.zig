@@ -907,6 +907,15 @@ pub fn inlineExpandEnter() bool {
     return true;
 }
 
+/// A REIFIED inline callee past the ordinary depth still splices: unspliced,
+/// its body would read the process-global `T` of some outer splice. The
+/// higher cap only bounds runaway recursion.
+pub fn inlineExpandEnterReified() bool {
+    if (inline_expand_depth >= INLINE_EXPAND_MAX * 3) return false;
+    inline_expand_depth += 1;
+    return true;
+}
+
 pub fn inlineExpandLeave() void {
     inline_expand_depth -|= 1;
 }

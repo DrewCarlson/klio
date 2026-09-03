@@ -769,6 +769,19 @@ const Gen = struct {
             // builds its serializer in place (no companion exists to ask).
             if (cn.is_enum and !isSerializableIn(self.idx, cn.annotations)) {
                 const serial = if (self.pkg.len == 0) qn else try std.fmt.allocPrint(a, "{s}.{s}", .{ self.pkg, qn });
+                // Entries carrying serial annotations (`@JsonNames("ALTERNATIVE")
+                // VALUE_B`) keep them, as the plugin's in-place serializer does.
+                var marked = false;
+                for (cn.enum_entries) |*en| {
+                    if (en.annotations.len != 0) marked = true;
+                }
+                const class_anns = try classAnnotationCalls(a, self.idx, qn);
+                if (class_anns.len != 0) marked = true;
+                if (marked) {
+                    var out: std.ArrayList(u8) = .empty;
+                    try writeAnnotatedEnumSerializer(&out, a, cn, serial, qn, class_anns);
+                    return out.items;
+                }
                 return std.fmt.allocPrint(a, "createSimpleEnumSerializer(\"{s}\", {s}.values())", .{ serial, qn });
             }
         }
@@ -1361,21 +1374,11 @@ fn genValueClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c
     try w.appendSlice(a, "    }\n}\n\n");
 }
 
-/// Enum: a top-level factory the companion's `serializer()` calls.
-fn genEnumFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, c: *const ast.Class, info: *const Info) Allocator.Error!void {
-    const gn = try genNameFor(a, info);
-    const serial = try serialNameOf(a, info);
-    var marked = false;
-    for (c.enum_entries) |*en| {
-        if (en.annotations.len != 0) marked = true;
-    }
-    const class_anns = try classAnnotationCalls(a, idx, info.path);
-    if (class_anns.len != 0) marked = true;
-    if (!marked) {
-        try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ createSimpleEnumSerializer(\"{s}\", {s}.values()) }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, serial, info.path, gn, info.path, gn });
-        return;
-    }
-    try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ createAnnotatedEnumSerializer(\"{s}\", {s}.values(), arrayOf<String?>(", .{ gn, info.path, serial, info.path });
+/// `createAnnotatedEnumSerializer("serial", E.values(), names, entryAnnotations, classAnnotations)`
+/// for an enum whose entries or class carry serial annotations
+/// (`@SerialName`, `@JsonNames`, ...), written as an expression.
+fn writeAnnotatedEnumSerializer(w: *std.ArrayList(u8), a: Allocator, c: *const ast.Class, serial: []const u8, path: []const u8, class_anns: []const []const u8) Allocator.Error!void {
+    try wp(w, a, "createAnnotatedEnumSerializer(\"{s}\", {s}.values(), arrayOf<String?>(", .{ serial, path });
     for (c.enum_entries, 0..) |*en, i| {
         if (i > 0) try w.appendSlice(a, ", ");
         if (findAnnotation(en.annotations, "SerialName")) |an| {
@@ -1421,7 +1424,26 @@ fn genEnumFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, c: *co
         }
         try w.appendSlice(a, ")");
     }
-    try w.appendSlice(a, ") }\n");
+    try w.appendSlice(a, ")");
+}
+
+/// Enum: a top-level factory the companion's `serializer()` calls.
+fn genEnumFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, c: *const ast.Class, info: *const Info) Allocator.Error!void {
+    const gn = try genNameFor(a, info);
+    const serial = try serialNameOf(a, info);
+    var marked = false;
+    for (c.enum_entries) |*en| {
+        if (en.annotations.len != 0) marked = true;
+    }
+    const class_anns = try classAnnotationCalls(a, idx, info.path);
+    if (class_anns.len != 0) marked = true;
+    if (!marked) {
+        try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ createSimpleEnumSerializer(\"{s}\", {s}.values()) }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, serial, info.path, gn, info.path, gn });
+        return;
+    }
+    try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ ", .{ gn, info.path });
+    try writeAnnotatedEnumSerializer(w, a, c, serial, info.path, class_anns);
+    try w.appendSlice(a, " }\n");
     try wp(w, a, "fun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, gn });
 }
 
@@ -1847,12 +1869,105 @@ fn localScopePath(a: Allocator, outer: []const u8, local_name: []const u8) Alloc
 fn processFunctionLocals(ctx: *Ctx, f: *ast.Function, outer: []const u8) Allocator.Error!void {
     const dbg = std.c.getenv("KLIO_SERIAL_DUMP") != null;
     if (dbg) std.debug.print("[serial-pass] fn {s} body={s}\n", .{ f.name.name, if (f.body) |b| @tagName(std.meta.activeTag(b)) else "none" });
-    const body = f.body orelse return;
-    if (body != .Block) return;
-    for (body.Block.stmts) |*st| {
-        if (st.* != .Decl) continue;
+    if (f.body) |*fb| {
+        switch (fb.*) {
+            .Block => |*blk| try processLocalStmts(ctx, f, blk.stmts, outer),
+            .Expr => |*e| try walkLocalExpr(ctx, f, e, outer),
+        }
+    }
+}
+
+/// Descend an expression for local class declarations: a class declared
+/// inside a lambda body (`42.let { @Serializable data class Local(...) }`),
+/// a control-flow block, or a local function is local to the enclosing
+/// function exactly like one at its top level.
+fn walkLocalExpr(ctx: *Ctx, f: *ast.Function, e: *ast.Expr, outer: []const u8) Allocator.Error!void {
+    switch (e.*) {
+        .Call => |*c| {
+            try walkLocalExpr(ctx, f, c.callee, outer);
+            for (c.args) |*a| try walkLocalExpr(ctx, f, a, outer);
+        },
+        .Lambda => |*l| try processLocalStmts(ctx, f, l.body.stmts, outer),
+        .Block => |*blk| try processLocalStmts(ctx, f, blk.stmts, outer),
+        .If => |*i| {
+            try walkLocalExpr(ctx, f, i.cond, outer);
+            try walkLocalExpr(ctx, f, i.then_branch, outer);
+            if (i.else_branch) |eb| try walkLocalExpr(ctx, f, eb, outer);
+        },
+        .While => |*w| {
+            try walkLocalExpr(ctx, f, w.cond, outer);
+            try walkLocalExpr(ctx, f, w.body, outer);
+        },
+        .DoWhile => |*w| {
+            if (w.body) |wb| try walkLocalExpr(ctx, f, wb, outer);
+            try walkLocalExpr(ctx, f, w.cond, outer);
+        },
+        .For => |*fr| {
+            try walkLocalExpr(ctx, f, fr.iter, outer);
+            try walkLocalExpr(ctx, f, fr.body, outer);
+        },
+        .Try => |*t| {
+            try processLocalStmts(ctx, f, t.body.stmts, outer);
+            for (t.catches) |*cc| try processLocalStmts(ctx, f, cc.body.stmts, outer);
+            if (t.finally) |*fb| try processLocalStmts(ctx, f, fb.stmts, outer);
+        },
+        .When => |*w| {
+            if (w.subject) |sub| try walkLocalExpr(ctx, f, sub, outer);
+            for (w.branches) |*br| try walkLocalExpr(ctx, f, &br.body, outer);
+        },
+        .Return => |*r| if (r.value) |v| try walkLocalExpr(ctx, f, v, outer),
+        .Labeled => |*l| try walkLocalExpr(ctx, f, l.expr, outer),
+        .Throw => |*t| try walkLocalExpr(ctx, f, t.value, outer),
+        .Binary => |*bin| {
+            try walkLocalExpr(ctx, f, bin.lhs, outer);
+            try walkLocalExpr(ctx, f, bin.rhs, outer);
+        },
+        .Unary => |*u| try walkLocalExpr(ctx, f, u.expr, outer),
+        .Postfix => |*u| try walkLocalExpr(ctx, f, u.expr, outer),
+        .Member => |*m| try walkLocalExpr(ctx, f, m.receiver, outer),
+        .Index => |*ix| {
+            try walkLocalExpr(ctx, f, ix.receiver, outer);
+            for (ix.args) |*a| try walkLocalExpr(ctx, f, a, outer);
+        },
+        .Spread => |*sp| try walkLocalExpr(ctx, f, sp.expr, outer),
+        .IsCheck => |*ic| try walkLocalExpr(ctx, f, ic.expr, outer),
+        .As => |*ac| try walkLocalExpr(ctx, f, ac.expr, outer),
+        .AnonFun => |*af| if (af.body) |fb| switch (fb.*) {
+            .Block => |*blk| try processLocalStmts(ctx, f, blk.stmts, outer),
+            .Expr => |*ex| try walkLocalExpr(ctx, f, ex, outer),
+        },
+        else => {},
+    }
+}
+
+fn processLocalStmts(ctx: *Ctx, f: *ast.Function, stmts: []ast.Stmt, outer: []const u8) Allocator.Error!void {
+    const dbg = std.c.getenv("KLIO_SERIAL_DUMP") != null;
+    for (stmts) |*st| {
+        switch (st.*) {
+            .Expr => |*e| {
+                try walkLocalExpr(ctx, f, e, outer);
+                continue;
+            },
+            .Assign => |*a| {
+                try walkLocalExpr(ctx, f, &a.value, outer);
+                continue;
+            },
+            .DestructuringDecl => |*dd| {
+                try walkLocalExpr(ctx, f, &dd.init, outer);
+                continue;
+            },
+            .Decl => {},
+        }
         if (dbg) std.debug.print("[serial-pass] local decl in {s}: {s}\n", .{ f.name.name, @tagName(std.meta.activeTag(st.Decl)) });
         switch (st.Decl) {
+            .Property => |p| {
+                if (p.init) |*init| try walkLocalExpr(ctx, f, init, outer);
+                continue;
+            },
+            .Function => |*lf| {
+                try processFunctionLocals(ctx, lf, outer);
+                continue;
+            },
             .Class => |*c| {
                 if (companionForClassTarget(ctx.a, c.members) != null) continue;
                 if (dbg) std.debug.print("[serial-pass] local class {s} serializable={}\n", .{ c.name.name, isSerializableIn(ctx.idx, c.annotations) });
@@ -2350,7 +2465,12 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
 }
 
 fn fileMentionsSerializable(f: *const ast.KotlinFile) bool {
-    return declsMentionSerializable(f.decls);
+    if (declsMentionSerializable(f.decls)) return true;
+    // A class declared inside a lambda, a control-flow block, or an
+    // expression body is a local class too; the source text is the cheap
+    // authority over every nesting the declaration walk does not reach.
+    if (sourceOf(f.span)) |txt| return std.mem.indexOf(u8, txt, "@Serializable") != null;
+    return false;
 }
 
 fn declsMentionSerializable(decls: []const ast.Decl) bool {
