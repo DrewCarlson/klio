@@ -432,7 +432,7 @@ pub const suites = [_]Config{
         .timeout_ms = 150_000,
         // 1295 (2026-09-01): solo 1299; the 10-case margin covered the
         // pre-L3-split load DNCs, the isolated structure runs 1299/0/0.
-        .baseline = 1295,
+        .baseline = 1297,
         .max_failed = 0,
         .max_incomplete = 1,
     },
@@ -491,10 +491,10 @@ pub const suites = [_]Config{
         },
         .extra_args = &.{ "--feature", "kotlinx.serialization/json" },
         .timeout_ms = 120_000,
-        // 2026-09-03 census: 697 / 744 (45 failed, 2 did not complete);
+        // 2026-09-03 census: 700 / 744 (42 failed, 2 did not complete);
         // the floor keeps a small did-not-complete margin below the
         // observed count.
-        .baseline = 695,
+        .baseline = 698,
         .max_failed = null,
         .max_incomplete = null,
     },
