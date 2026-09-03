@@ -2941,7 +2941,11 @@ fn pickFactory(self: *VmHost, allocator: Allocator, class_name: []const u8, args
         const f = m.funcById(fid) orelse continue;
         if (!f.hasBody()) continue;
         if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
-        const score = (try host_call_func.runtimeFuncApplicability(self, allocator, m, fid, args)) orelse continue;
+        const score = (try host_call_func.runtimeFuncApplicability(self, allocator, m, fid, args)) orelse {
+            if (runtime.envOnce("KLIO_FACTORY_TRACE") != null) std.debug.print("[factory] {s}#{d} params={d} inapplicable\n", .{ f.fqn, fid.int(), f.params.len });
+            continue;
+        };
+        if (runtime.envOnce("KLIO_FACTORY_TRACE") != null) std.debug.print("[factory] {s}#{d} points={d} low={}\n", .{ f.fqn, fid.int(), score.points, score.low_priority });
         if (score.low_priority) {
             if (best_low == null or score.points > best_low_score) {
                 best_low = fid;

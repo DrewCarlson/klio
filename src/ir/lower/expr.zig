@@ -945,9 +945,24 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const ref_arity = b.pending_lambda_arity;
             const member_shadows_ref = enclosingDeclaresMember(b, pr.name.name) and
                 (ref_arity < 0 or b.ownMemberApplicable(pr.name.name, @intCast(ref_arity)));
-            const class_pick: ?ir.ClassId = b.module.classIdIndexed(pr.name.name, b.self_package, pr.name.span.file);
+            var class_pick: ?ir.ClassId = b.module.classIdIndexed(pr.name.name, b.self_package, pr.name.span.file);
             var ref_shapes = try callableRefArgShapes(b, ref_arity);
             defer if (ref_shapes) |*shapes| shapes.deinit(b.allocator);
+            // A sealed/abstract class constructs nothing through a reference:
+            // under a TYPED expected function type, the same-named function
+            // overloads are the reference's target, picked by those types
+            // (`val g: (String?) -> P = ::P` binds the `String?` overload,
+            // which a runtime `null` could never tell from `Number?`).
+            if (class_pick) |cid| typed: {
+                if (cid.int() >= b.module.classes.items.len or !b.module.classes.items[cid.int()].is_abstract) break :typed;
+                if (b.module.funcsBySimpleName(pr.name.name).len == 0) break :typed;
+                const shapes = ref_shapes orelse break :typed;
+                var typed_any = false;
+                for (shapes.shapes) |sh| {
+                    if (sh.ty != null) typed_any = true;
+                }
+                if (typed_any) class_pick = null;
+            }
             const ref_pick: ?FuncId = if (class_pick != null)
                 null
             else if (ref_shapes) |shapes|
@@ -2007,6 +2022,22 @@ pub fn loweredCheckTypeName(b: *const FuncBuilder, ty: *const ast.TypeRef) []con
     if (ty.qualified_path) |qp| {
         if (lastTwoSegments(qp)) |key| {
             if (b.module.registry.mangled_nested.get(key)) |m| return m;
+        }
+        // The path's first segment may itself be a nested class lifted under
+        // a mangled name (`S.A` written inside `Tests`, where the private
+        // `S` lifted as `Tests$S`): the lift keyed `A` by that lifted owner,
+        // so the reference resolves through the owner's scope alias.
+        if (std.mem.indexOfScalar(u8, qp, '.')) |d| {
+            if (scopeTypeRename(b, qp[0..d], ty.span.file.int())) |owner| {
+                if (std.fmt.allocPrint(b.allocator, "{s}.{s}", .{ owner, qp[d + 1 ..] })) |aliased| {
+                    if (lastTwoSegments(aliased)) |key| {
+                        if (b.module.registry.mangled_nested.get(key)) |m| return m;
+                    }
+                    if (b.module.classIdByFqn(aliased)) |cid| {
+                        if (cid.int() < b.module.classes.items.len) return b.module.classes.items[cid.int()].fqn;
+                    }
+                } else |_| {}
+            }
         }
         // Normalise to the canonical FQN when the dotted path resolves to a
         // registered class; otherwise carry the dotted path through so the
@@ -4818,7 +4849,7 @@ fn recordCallBoundLambdaReceiver(
         return;
     }
     if (std.c.getenv("KLIO_LAR_TRACE") != null)
-        std.debug.print("[lar-site] site=cbr fn={s} declared={s} resolved={s} s={d}..{d}\n", .{ func.name, declared_receiver.name, resolved.name, call_span.start, call_span.end });
+        std.debug.print("[lar-site] site=cbr fn={s} declared={s} resolved={s} s={d}..{d}\n", .{ func.fqn, declared_receiver.name, resolved.name, call_span.start, call_span.end });
     try b.recordLambdaArgRecvOwned(call_span, resolved);
 }
 
@@ -6202,7 +6233,17 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // With overloads, `funcId` is a heuristic that may name the wrong one,
         // whose arity would wrongly drop a needed `it`.
         const unambiguous = if (b.module.func_name_index.get(cnm)) |ids| ids.items.len == 1 else false;
-        const chosen: ?FuncId = if (unambiguous)
+        // An APPLICABLE own member shadows the same-named top-level function
+        // in Kotlin's scope order (`private fun Json(arrays: Boolean, build:
+        // PolymorphicModuleBuilder<Any>.() -> Unit)` beside the library's
+        // `Json { … }` builder): its lambda shapes come from the member, not
+        // from the global this pre-record would commit.
+        const own_shadows = b.ownerClass() != null and b.resolve("this") != null and
+            b.hasOwnMember(cnm) and b.ownMemberApplicable(cnm, args.len) and
+            !ownMemberRejectsLambdas(b, cnm, args);
+        const chosen: ?FuncId = if (own_shadows)
+            null
+        else if (unambiguous)
             b.module.funcId(cnm)
         else
             // Ambiguous name (`withCurrent` has a `SnapshotStateList.() ->` and a
@@ -8717,6 +8758,17 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 break :blk_alias b.module.classIdIndexed(rh, b.self_package, ctor_seg.span.file) orelse
                     b.module.classId(rh);
             };
+        // An APPLICABLE own member named like a class in scope (`private fun
+        // Json(arrays: Boolean, build: PolymorphicModuleBuilder<Any>.() -> Unit)`
+        // beside the library's `Json` class) wins the bare call in Kotlin's
+        // scope order: the implicit-this path binds the member's lambda
+        // shapes and receivers, where the constructor path below would not.
+        if (ctor_cid != null and b.ownerClass() != null and b.resolve("this") != null and
+            b.hasOwnMember(ctor_seg.name) and b.ownMemberApplicable(ctor_seg.name, args.len) and
+            !ownMemberRejectsLambdas(b, ctor_seg.name, args))
+        {
+            if (try lowerImplicitThisCall(b, callee, args, ast_arg_names, call.type_args)) |r| return r;
+        }
         if (ctor_cid) |class_id| {
             const ctor_arity = try ctorArgFnArities(b, class_id, args, ast_arg_names);
             defer if (ctor_arity) |ca| b.allocator.free(ca);
@@ -16758,6 +16810,73 @@ fn solveInstantiatedArgExpected(
     return null;
 }
 
+/// The INSTANTIATED static type of a sibling generic call (`mapOf(1 to 2)`
+/// is a `Map<Int, Int>`): the call's own type parameters solve from its
+/// arguments' static shapes and substitute into its declared return type.
+/// The head-only static type (`Map`) would hand a reified consumer beside
+/// it (`serializer<T>()`) a raw classifier.
+fn instantiatedSiblingCallTypeRef(b: *FuncBuilder, e: *const Expr) ?*const ast.TypeRef {
+    const inst = instantiatedCallIrType(b, e, 0) orelse return null;
+    const converted = astTypeRefFromIr(b, inst, exprSpan(e)) orelse return null;
+    const out = b.allocator.create(ast.TypeRef) catch return null;
+    out.* = converted;
+    if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) std.debug.print("[sibexp-zero-inst] -> {s} args={d}\n", .{ converted.name.name, converted.type_args.len });
+    return out;
+}
+
+/// The instantiated return type of a generic call, solved from its receiver
+/// and argument shapes: a bare call (`mapOf(1 to 2)`) or a receiver call,
+/// infix included (`1 to 2` is `Pair<Int, Int>`). Arguments that are
+/// themselves calls instantiate the same way, two levels deep.
+fn instantiatedCallIrType(b: *FuncBuilder, e: *const Expr, depth: usize) ?ir.TypeRef {
+    if (depth > 2 or e.* != .Call) return null;
+    const call = e.Call;
+    if (call.type_args.len != 0) return null;
+    const name: []const u8 = switch (call.callee.*) {
+        .Path => |p| if (p.segments.len == 1) p.segments[0].name else return null,
+        .Member => |m| m.name.name,
+        else => return null,
+    };
+    const receiver: ?*const Expr = if (call.callee.* == .Member) call.callee.Member.receiver else null;
+    var scratch = std.heap.ArenaAllocator.init(b.allocator);
+    defer scratch.deinit();
+    const shapes = buildStaticArgShapes(b, call.args, call.arg_names) catch return null;
+    defer b.allocator.free(shapes);
+    // An argument that is itself a call (`1 to 2`) carries no declared
+    // type; its instantiated (else derived) static type is the evidence.
+    for (call.args, shapes) |*a, *shape| {
+        if (shape.ty != null) continue;
+        shape.ty = instantiatedCallIrType(b, a, depth + 1) orelse (staticExprTypeRef(b, a) catch null);
+        shape.ty_authoritative = shape.ty != null;
+    }
+    const recv_ty: ?ir.TypeRef = if (receiver) |r|
+        (instantiatedCallIrType(b, r, depth + 1) orelse (staticExprTypeRef(b, r) catch null))
+    else
+        null;
+    if (receiver != null and recv_ty == null) return null;
+    if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) {
+        for (shapes, 0..) |sh, i| std.debug.print("[sibexp-zero-shape] call={s} arg{d} ty={s} recv={s}\n", .{ name, i, if (sh.ty) |t| t.name else "<null>", if (recv_ty) |t| t.name else "-" });
+    }
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        const ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+        if (ext != (receiver != null)) continue;
+        const value_params = if (ext) f.params.len - 1 else f.params.len;
+        const has_va = f.params.len != 0 and f.params[f.params.len - 1].is_vararg;
+        if (!(value_params == call.args.len or (has_va and call.args.len + 1 >= value_params))) continue;
+        if (f.return_ty.args.len == 0) continue;
+        const tps = b.module.registry.func_type_params.get(fid) orelse continue;
+        if (tps.items.len == 0) continue;
+        const solved = (b.module.solveCallBindings(scratch.allocator(), fid, f, recv_ty, null, shapes, &.{}, false) catch continue) orelse continue;
+        if (solved.bindings.len == 0) continue;
+        const substituted = ir.Module.substituteBoundType(scratch.allocator(), f.return_ty, solved.bindings) catch continue;
+        if (!irTypeFullyConcrete(b, substituted)) continue;
+        if (irTypeMentionsAny(substituted, tps.items)) continue;
+        return substituted.clone(b.allocator) catch null;
+    }
+    return null;
+}
+
 fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr) ?SibSolved {
     if (args.len == 0) return null;
     const outer_name: []const u8 = switch (callee.*) {
@@ -16904,7 +17023,8 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
                 if (staticEnumElem(b, sib)) |enum_name| {
                     break :blk .{ .name = .{ .name = enum_name, .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null };
                 }
-                const st = inline_call.ctorArgTypeRef(b.allocator, sib, b) orelse
+                const st = instantiatedSiblingCallTypeRef(b, sib) orelse
+                    inline_call.ctorArgTypeRef(b.allocator, sib, b) orelse
                     inline_call.staticArgTypeRef(b.allocator, sib, b) orelse {
                     if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) std.debug.print("[sibexp-why] zero-arg nested `{s}`: sibling #{d} of `{s}` has no static type (tag={s})\n", .{ nested_name, k, outer_name, @tagName(sib.*) });
                     continue;
@@ -17386,6 +17506,20 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
         call.has_trailing_lambda and !hasComposerArgPair(ast_arg_names),
     );
     defer _ = b.setCallTrailingLambda(prev_trailing);
+
+    // An APPLICABLE own member shadows the same-named top-level function in
+    // Kotlin's scope order (`private fun Json(arrays: Boolean, build:
+    // PolymorphicModuleBuilder<Any>.() -> Unit)` beside the library's
+    // `Json { … }` builder): the implicit-this path binds the MEMBER's
+    // lambda shapes and receivers, where the deferred form below would read
+    // them off the global candidate.
+    if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[emog-gate] {s} segs={d} this={} own={} applicable={} rejects={} args={d} call_args={d}\n", .{ name0, callee.Path.segments.len, b.resolve("this") != null, b.hasOwnMember(name0), b.ownMemberApplicable(name0, call.args.len), ownMemberRejectsLambdas(b, name0, call.args), args.len, call.args.len });
+    if (callee.Path.segments.len == 1 and b.resolve("this") != null and
+        b.hasOwnMember(name0) and b.ownMemberApplicable(name0, call.args.len) and
+        !ownMemberRejectsLambdas(b, name0, call.args))
+    {
+        if (try lowerImplicitThisCall(b, callee, call.args, call.arg_names, ast_type_args)) |r| return r;
+    }
 
     if (!isNonExt(b, func_id)) {
         if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, func_id)) |r| return r;

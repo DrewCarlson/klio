@@ -296,6 +296,12 @@ pub const ApplicabilityScope = struct {
 pub fn builtinSupersOf(concrete: []const u8) []const []const u8 {
     const eq = std.mem.eql;
     const s = simpleName(concrete);
+    // The boxed numerics are `Number`s: a runtime `Int` satisfies a
+    // `Number?` parameter (`JsonPrimitive(value: Number?)` picked for an
+    // `Int` through a callable reference).
+    if (eq(u8, s, "Int") or eq(u8, s, "Long") or eq(u8, s, "Short") or eq(u8, s, "Byte") or
+        eq(u8, s, "Double") or eq(u8, s, "Float"))
+        return &.{ "Number", "Comparable" };
     if (eq(u8, s, "List"))
         return &.{ "Collection", "Iterable", "MutableList", "MutableCollection", "MutableIterable" };
     if (eq(u8, s, "MutableList"))
@@ -778,7 +784,7 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
 
     // Builtin runtime types satisfy their nominal supertypes (§3 union table).
     const builtin_supers = builtinSupersOf(v_ty);
-    const nm_simple = simpleName(nm);
+    const nm_simple = std.mem.trimEnd(u8, simpleName(nm), "?");
     for (builtin_supers, 0..) |sup, pos| {
         if (std.mem.eql(u8, sup, nm) or std.mem.eql(u8, sup, nm_simple)) {
             const dist: i32 = if (pos > 20) 20 else @intCast(pos);

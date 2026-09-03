@@ -108,6 +108,9 @@ const Index = struct {
     /// for a serializer object that names its target by annotation rather
     /// than a `KSerializer<X>` supertype.
     serializer_for_class: std.StringHashMap([]const u8),
+    /// Class paths declared `@Polymorphic`: every property of that type
+    /// serializes polymorphically, as with the annotation on the property.
+    polymorphic_classes: std.StringHashMap(void),
 
     fn init(a: Allocator) Index {
         return .{
@@ -127,6 +130,7 @@ const Index = struct {
             .class_nodes = std.StringHashMap(*const ast.Class).init(a),
             .super_refs = std.StringHashMap([]const ast.TypeRef).init(a),
             .serializer_for_class = std.StringHashMap([]const u8).init(a),
+            .polymorphic_classes = std.StringHashMap(void).init(a),
         };
     }
 };
@@ -310,6 +314,7 @@ fn indexAnnotationClasses(idx: *Index, decls: []const ast.Decl) Allocator.Error!
 
 fn recordSupersAndAnnotations(idx: *Index, path: []const u8, supertypes: []const ast.TypeRef, annotations: []const ast.Annotation) Allocator.Error!void {
     try idx.super_refs.put(path, supertypes);
+    if (hasAnnotation(annotations, "Polymorphic")) try idx.polymorphic_classes.put(path, {});
     if (serializerForClassTarget(idx.a, annotations)) |target| {
         try idx.serializer_for_class.put(path, simpleHead(target));
     }
@@ -612,6 +617,14 @@ const Gen = struct {
     fn contextualSerializerExpr(self: *const Gen, t: *const ast.TypeRef) Allocator.Error![]const u8 {
         const a = self.a;
         const q = try self.qualifyTy(t);
+        // The type-argument serializers ride along (`CheckedData<String>`
+        // carries `arrayOf(String.serializer())`), so a contextual provider
+        // written over `args` receives them.
+        var args: std.ArrayList(u8) = .empty;
+        for (t.type_args, 0..) |_, i| {
+            if (i != 0) try args.appendSlice(a, ", ");
+            try args.appendSlice(a, try self.typeArgSerializer(t, i));
+        }
         // The class IN SCOPE (the enclosing scopes of the declaration, then
         // top level): the flat simple-name map would answer another file's
         // same-named class.
@@ -619,8 +632,11 @@ const Gen = struct {
             if (ci.type_params == 0 and t.type_args.len == 0) {
                 return std.fmt.allocPrint(a, "ContextualSerializer({s}::class, {s}.serializer(), arrayOf())", .{ q, q });
             }
+            if (ci.type_params != 0 and ci.type_params == t.type_args.len) {
+                return std.fmt.allocPrint(a, "ContextualSerializer({s}::class, {s}.serializer({s}), arrayOf({s}))", .{ q, q, args.items, args.items });
+            }
         }
-        return std.fmt.allocPrint(a, "ContextualSerializer({s}::class, null, arrayOf())", .{q});
+        return std.fmt.allocPrint(a, "ContextualSerializer({s}::class, null, arrayOf({s}))", .{ q, args.items });
     }
 
     /// The `@Serializable` declaration a written type name resolves to from
@@ -661,6 +677,13 @@ const Gen = struct {
             // under; the parameter itself is no runtime classifier.
             if (self.typeParamIndex(head) != null) return "PolymorphicSerializer(Any::class)";
             return std.fmt.allocPrint(a, "PolymorphicSerializer({s}::class)", .{try self.qualifyTy(t)});
+        }
+        // `@Polymorphic` on the CLASS declaration makes every property of
+        // that type polymorphic, exactly as the annotation on the property.
+        if (self.serializableInScope(t.name.name)) |ci| {
+            if (self.idx.polymorphic_classes.contains(ci.path)) {
+                return std.fmt.allocPrint(a, "PolymorphicSerializer({s}::class)", .{try self.qualifyTy(t)});
+            }
         }
         if (self.typeParamIndex(head)) |i| {
             return std.fmt.allocPrint(a, "typeSerial{d}", .{i});
