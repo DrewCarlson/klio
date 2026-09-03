@@ -1,0 +1,4 @@
+top: {"a":{"i":42}} -> Holder(a=Box(i=42), name=h)
+top: {"i":1} -> Box(i=1)
+member: {"a":{"i":7}} OK
+inline: {"a":null,"name":"n"} OK

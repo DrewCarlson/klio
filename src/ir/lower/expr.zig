@@ -16627,6 +16627,17 @@ pub fn astTypeRefFromIr(b: *FuncBuilder, ty: ir.TypeRef, sp: ast.Span) ?ast.Type
 /// same solve one level down for `compareByDescending`. Only a fully
 /// concrete instantiation is pushed: a partial one disproves more than it
 /// types.
+/// Whether `ty` (its head or any type argument, recursively) names one of
+/// `names`, or carries a star projection — the shape an unbound type
+/// variable is substituted to.
+fn irTypeMentionsAny(ty: ir.TypeRef, names: []const []const u8) bool {
+    const head = std.mem.trimEnd(u8, ty.name, "?");
+    if (std.mem.eql(u8, head, "*")) return true;
+    for (names) |n| if (std.mem.eql(u8, head, n)) return true;
+    for (ty.args) |a| if (irTypeMentionsAny(a, names)) return true;
+    return false;
+}
+
 fn solveInstantiatedArgExpected(
     b: *FuncBuilder,
     callee: *const Expr,
@@ -16727,6 +16738,17 @@ fn solveInstantiatedArgExpected(
             if (sib_why) std.debug.print("[sibexp-why] {s}#{d} skip=not_concrete sub={s}\n", .{ f.fqn, fid.int(), substituted.name });
             continue;
         }
+        // The outer's OWN type parameters are not type parameters of the
+        // caller's scope, so the concreteness check reads a still-unbound
+        // `T` as a concrete class named `T`. Pushing `KSerializer<T>` would
+        // bind the nested reified call to the literal `T`; yield to the
+        // sibling solvers, which take `T` from the argument that shares it.
+        if (b.module.registry.func_type_params.get(fid)) |own_tps| {
+            if (irTypeMentionsAny(substituted, own_tps.items)) {
+                if (sib_why) std.debug.print("[sibexp-why] {s}#{d} skip=own_type_param sub={s}\n", .{ f.fqn, fid.int(), substituted.name });
+                continue;
+            }
+        }
         const converted = astTypeRefFromIr(b, substituted, exprSpan(s)) orelse continue;
         if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) {
             std.debug.print("[sibexp-inst] outer={s} arg={d} pushed={s} args={d}\n", .{ f.fqn, arg_idx, converted.name.name, converted.type_args.len });
@@ -16746,8 +16768,18 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
         .Member => |m| m.name.name,
         else => return null,
     };
+    // A bare call naming a member of the lexically enclosing class (an
+    // inherited `assertJsonFormAndRestored(serializer(), value, …)`) is not
+    // in the simple-name index (only member extensions are): read the
+    // enclosing chain's method slots, as the reified solver does.
+    const own_member_outer = callee.* != .Member and b.hasEnclosingMember(outer_name);
+    var chain_buf: [32]FuncId = undefined;
+    const cand_fids: []const FuncId = if (own_member_outer)
+        enclosingChainMethodsNamed(b, outer_name, callee.Path.segments[0].span.file, &chain_buf) catch &.{}
+    else
+        b.module.funcsBySimpleName(outer_name);
     var outer: ?*const ir.Func = null;
-    for (b.module.funcsBySimpleName(outer_name)) |fid| {
+    for (cand_fids) |fid| {
         const f = b.module.funcById(fid) orelse continue;
         if (f.params.len == args.len or (f.params.len > args.len and f.params.len - args.len <= 1)) {
             outer = f;
@@ -16778,24 +16810,34 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
         // may be one of those.
         var f_sel: *const ir.Func = f;
         var pj = recv_off + j;
+        var tv_sel: []const u8 = "";
         {
             var found = false;
-            for (b.module.funcsBySimpleName(outer_name)) |fid2| {
+            for (cand_fids) |fid2| {
                 const f2 = b.module.funcById(fid2) orelse continue;
                 if (!(f2.params.len == args.len or (f2.params.len > args.len and f2.params.len - args.len <= 1))) continue;
                 const ro2: usize = if (f2.params.len != 0 and std.mem.eql(u8, f2.params[0].name, "this")) 1 else 0;
                 const pj2 = ro2 + j;
                 if (pj2 >= f2.params.len) continue;
-                const tv2 = f2.params[pj2].ty.name;
+                const slot2 = f2.params[pj2].ty;
+                var tv2 = slot2.name;
+                // A slot `C<T>` (`KSerializer<T>`) whose single argument is a
+                // bare type variable shares that variable with the sibling's
+                // plain `T` slot: the variable is the argument.
+                if (!(tv2.len <= 2 and allUppercase(tv2)) and slot2.args.len == 1) {
+                    const a0 = std.mem.trimEnd(u8, slot2.args[0].name, "?");
+                    if (a0.len != 0 and a0.len <= 2 and allUppercase(a0)) tv2 = a0;
+                }
                 if (tv2.len > 2 or !allUppercase(tv2)) continue;
                 f_sel = f2;
                 pj = pj2;
+                tv_sel = tv2;
                 found = true;
                 break;
             }
             if (!found) continue;
         }
-        const tv = f_sel.params[pj].ty.name;
+        const tv = tv_sel;
         const ro_sel: usize = if (f_sel.params.len != 0 and std.mem.eql(u8, f_sel.params[0].name, "this")) 1 else 0;
         // A nested reified-inline call with arguments (`assertEquals(
         // Holder(1), decodeFromString(text))`) takes the sibling's static
@@ -16830,9 +16872,20 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
             continue;
         }
         if (c.callee.* != .Path) continue;
-        const nested_fid = b.module.funcId(nested_name) orelse continue;
-        const tps = b.module.registry.func_type_params.get(nested_fid) orelse continue;
-        if (tps.items.len != 1) continue;
+        // The nested ZERO-argument reified overload — `serializer<T>()`
+        // beside `serializer(type: KType)` and `KClass<T>.serializer()` —
+        // is the receiver-less one with no value parameters and a single
+        // type parameter; the simple-name index alone may answer another.
+        var nested_pick: ?FuncId = null;
+        for (b.module.funcsBySimpleName(nested_name)) |nfid| {
+            const nf = b.module.funcById(nfid) orelse continue;
+            if (nf.params.len != 0) continue;
+            const ntps = b.module.registry.func_type_params.get(nfid) orelse continue;
+            if (ntps.items.len != 1) continue;
+            nested_pick = nfid;
+            break;
+        }
+        const nested_fid = nested_pick orelse continue;
         const nested_f = b.module.funcById(nested_fid) orelse continue;
         // The lowered ir return type keeps only the head (`EnumEntries`);
         // the splice unifies against the AST declaration's full
@@ -16840,23 +16893,32 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
         if (nested_f.return_ty.name.len == 0) continue;
         for (args, 0..) |*sib, k| {
             if (k == j) continue;
-            const pk = recv_off + k;
-            if (pk >= f.params.len) continue;
-            if (!std.mem.eql(u8, f.params[pk].ty.name, tv)) continue;
-            const enum_name = staticEnumElem(b, sib) orelse continue;
-            // Build `Head<Enum>` as the nested call's expected type; the
+            const pk = ro_sel + k;
+            if (pk >= f_sel.params.len) continue;
+            if (!std.mem.eql(u8, f_sel.params[pk].ty.name, tv)) continue;
+            const sp = c.callee.Path.segments[0].span;
+            // The sibling's static type: an enum-entries expression, else a
+            // constructor call / typed value (`check(serializer(), Holder(x), …)`
+            // solves `serializer<T>()` from `Holder(x)` at the `data: T` slot).
+            const sib_ty: ast.TypeRef = blk: {
+                if (staticEnumElem(b, sib)) |enum_name| {
+                    break :blk .{ .name = .{ .name = enum_name, .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null };
+                }
+                const st = inline_call.ctorArgTypeRef(b.allocator, sib, b) orelse
+                    inline_call.staticArgTypeRef(b.allocator, sib, b) orelse {
+                    if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) std.debug.print("[sibexp-why] zero-arg nested `{s}`: sibling #{d} of `{s}` has no static type (tag={s})\n", .{ nested_name, k, outer_name, @tagName(sib.*) });
+                    continue;
+                };
+                if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) std.debug.print("[sibexp-zero] outer={s} nested={s} sibling#{d} -> {s}\n", .{ outer_name, nested_name, k, st.name.name });
+                break :blk st.*;
+            };
+            // Build `Head<Sibling>` as the nested call's expected type; the
             // inline splice's return-type unification (the existing
             // reified oracle) solves T from it.
             var head = nested_f.return_ty.name;
             if (std.mem.lastIndexOfScalar(u8, head, '.')) |i| head = head[i + 1 ..];
-            const sp = c.callee.Path.segments[0].span;
             const ta = b.allocator.alloc(ast.TypeArg, 1) catch return null;
-            ta[0] = .{
-                .variance = .Invariant,
-                .is_star = false,
-                .ty = .{ .name = .{ .name = enum_name, .span = sp }, .nullable = false, .span = sp, .type_args = &.{}, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null },
-                .span = sp,
-            };
+            ta[0] = .{ .variance = .Invariant, .is_star = false, .ty = sib_ty, .span = sp };
             return .{ .site = arg, .ty = .{ .name = .{ .name = head, .span = sp }, .nullable = false, .span = sp, .type_args = ta, .function = null, .definitely_non_null = false, .annotations = &.{}, .qualified_path = null } };
         }
     }
