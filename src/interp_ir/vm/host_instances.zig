@@ -4893,6 +4893,17 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 .ok => {},
                 .err => |e| return .{ .err = e },
             }
+            // The object-expression's superclass constructor call may select a
+            // SECONDARY constructor (`object : Connector(source, source,
+            // intent)` hits Connector's 3-arg `this(...)` that delegates to the
+            // 6-arg primary). Expand it into the primary arguments before
+            // padding, so the primary's property fields (`renderIntent`) get
+            // the delegated value instead of a default — padding a secondary
+            // arg list to the primary width filled the tail with nulls.
+            switch (try expandParentSecondaryThisArgs(self, allocator, classDefFqn(pdef), classDefName(pdef), &ordered)) {
+                .ok => {},
+                .err => |e| return .{ .err = e },
+            }
             switch (try padParentCtorDefaults(self, allocator, pdef, classDefFqn(pdef), classDefName(pdef), &ordered, null)) {
                 .ok => {},
                 .err => |e| return .{ .err = e },
