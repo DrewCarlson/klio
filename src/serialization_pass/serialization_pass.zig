@@ -585,7 +585,7 @@ const Gen = struct {
         if (hasAnnotation(annotations, "Contextual") or hasAnnotation(annotations, "Polymorphic")) return null;
         const fs = self.file orelse return null;
         const ser = fs.use_serializers_nullable.get(simpleHead(t.name.name)) orelse return null;
-        return try self.customSerializerRef(ser);
+        return try self.customSerializerRef(t, ser);
     }
 
     fn serializerExpr(self: *const Gen, t: *const ast.TypeRef, annotations: []const ast.Annotation) Allocator.Error![]const u8 {
@@ -640,12 +640,12 @@ const Gen = struct {
 
     fn serializerExprNonNull(self: *const Gen, t: *const ast.TypeRef, annotations: []const ast.Annotation) Allocator.Error![]const u8 {
         const a = self.a;
-        if (serializableWith(a, annotations)) |w| return self.customSerializerRef(w);
+        if (serializableWith(a, annotations)) |w| return self.customSerializerRef(t, w);
         const head = simpleHead(t.name.name);
         // File-level policy applies after the property's own annotations.
         if (self.file) |fs| {
             if (!hasAnnotation(annotations, "Contextual") and !hasAnnotation(annotations, "Polymorphic")) {
-                if (fs.use_serializers.get(head)) |ser| return self.customSerializerRef(ser);
+                if (fs.use_serializers.get(head)) |ser| return self.customSerializerRef(t, ser);
                 if (fs.contextual.contains(head)) {
                     return self.contextualSerializerExpr(t);
                 }
@@ -738,12 +738,30 @@ const Gen = struct {
     }
 
     /// `S` for an object serializer, `S()` for a class serializer.
-    fn customSerializerRef(self: *const Gen, w: []const u8) Allocator.Error![]const u8 {
+    fn customSerializerRef(self: *const Gen, t: ?*const ast.TypeRef, w: []const u8) Allocator.Error![]const u8 {
         const q = try self.qualify(w);
         if (self.idx.objects.contains(q) or self.idx.objects.contains(w) or self.idx.objects.contains(simpleHead(w))) return q;
-        // A serializer CLASS for a generic declaration takes the
-        // type-argument serializers, exactly as the plugin constructs it
-        // (`ParametrizedSerializer(typeSerial0)`).
+        // A generic serializer CLASS named on a PROPERTY takes the annotated
+        // type's own type-argument serializers, exactly as the plugin builds
+        // it (`@Serializable(with = CheckedDataSerializer::class) CheckedData<Int>`
+        // -> `CheckedDataSerializer(Int.serializer())`). A type-parameter
+        // argument resolves through `serializerExpr` to the enclosing class's
+        // `typeSerial<i>`, so a generic class's own `with=` still works.
+        if (t) |ty| {
+            if (ty.type_args.len != 0 and self.serializerClassIsGeneric(q)) {
+                var out: std.ArrayList(u8) = .empty;
+                try out.appendSlice(self.a, q);
+                try out.append(self.a, '(');
+                for (ty.type_args, 0..) |_, i| {
+                    if (i > 0) try out.appendSlice(self.a, ", ");
+                    try out.appendSlice(self.a, try self.typeArgSerializer(ty, i));
+                }
+                try out.append(self.a, ')');
+                return out.toOwnedSlice(self.a);
+            }
+        }
+        // A serializer CLASS for a generic declaration being generated takes
+        // the enclosing class's type-argument serializers.
         if (self.type_params.len != 0) {
             var out: std.ArrayList(u8) = .empty;
             try out.appendSlice(self.a, q);
@@ -756,6 +774,14 @@ const Gen = struct {
             return out.toOwnedSlice(self.a);
         }
         return std.fmt.allocPrint(self.a, "{s}()", .{q});
+    }
+
+    /// Whether the named serializer declaration is generic (its constructor
+    /// takes type-argument serializers).
+    fn serializerClassIsGeneric(self: *const Gen, q: []const u8) bool {
+        if (self.idx.class_nodes.get(q)) |cn| return cn.type_params.len != 0;
+        if (self.idx.class_nodes.get(simpleHead(q))) |cn| return cn.type_params.len != 0;
+        return false;
     }
 };
 
@@ -1445,10 +1471,10 @@ fn genWithFactory(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, info: *con
             try tps.appendSlice(a, tp);
             try wp(&params, a, "typeSerial{d}: KSerializer<{s}>", .{ i, tp });
         }
-        try wp(w, a, "fun <{s}> `{s}Impl`({s}): KSerializer<{s}<{s}>> = {s}\n\n", .{ tps.items, gn, params.items, info.path, tps.items, try g.customSerializerRef(info.with.?) });
+        try wp(w, a, "fun <{s}> `{s}Impl`({s}): KSerializer<{s}<{s}>> = {s}\n\n", .{ tps.items, gn, params.items, info.path, tps.items, try g.customSerializerRef(null, info.with.?) });
         return;
     }
-    try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ {s} }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, try g.customSerializerRef(info.with.?), gn, info.path, gn });
+    try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ {s} }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, try g.customSerializerRef(null, info.with.?), gn, info.path, gn });
 }
 
 /// The member splice text for the class: a companion (or object member)
