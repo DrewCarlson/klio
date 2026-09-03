@@ -1971,6 +1971,16 @@ pub const FuncBuilder = struct {
     /// declares type parameters reports inapplicable, which lets a same-named
     /// top-level generic function resolve instead — kotlinc resolves by
     /// applicability, not by name.
+    /// Whether an own FUNCTION member of this name takes `want` arguments;
+    /// a nested class or a property of the name does not count, so a
+    /// nested-class constructor call keeps its constructor path.
+    pub fn ownFunctionApplicable(self: *const FuncBuilder, name: []const u8, want: usize) bool {
+        const mask = self.own_member_arity.get(name) orelse return false;
+        if (mask & (@as(u64, 1) << 63) != 0) return true;
+        if (want >= 62) return false;
+        return mask & (@as(u64, 1) << @intCast(want)) != 0;
+    }
+
     pub fn ownMemberAcceptsTypeArgs(self: *const FuncBuilder, name: []const u8) bool {
         const mask = self.own_member_arity.get(name) orelse return true;
         return mask & (@as(u64, 1) << 62) != 0;

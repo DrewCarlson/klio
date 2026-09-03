@@ -6239,7 +6239,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // `Json { … }` builder): its lambda shapes come from the member, not
         // from the global this pre-record would commit.
         const own_shadows = b.ownerClass() != null and b.resolve("this") != null and
-            b.hasOwnMember(cnm) and b.ownMemberApplicable(cnm, args.len) and
+            b.hasOwnMember(cnm) and b.ownFunctionApplicable(cnm, args.len) and
             !ownMemberRejectsLambdas(b, cnm, args);
         const chosen: ?FuncId = if (own_shadows)
             null
@@ -8764,7 +8764,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // scope order: the implicit-this path binds the member's lambda
         // shapes and receivers, where the constructor path below would not.
         if (ctor_cid != null and b.ownerClass() != null and b.resolve("this") != null and
-            b.hasOwnMember(ctor_seg.name) and b.ownMemberApplicable(ctor_seg.name, args.len) and
+            b.hasOwnMember(ctor_seg.name) and b.ownFunctionApplicable(ctor_seg.name, args.len) and
             !ownMemberRejectsLambdas(b, ctor_seg.name, args))
         {
             if (try lowerImplicitThisCall(b, callee, args, ast_arg_names, call.type_args)) |r| return r;
@@ -17513,9 +17513,8 @@ fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
     // `Json { … }` builder): the implicit-this path binds the MEMBER's
     // lambda shapes and receivers, where the deferred form below would read
     // them off the global candidate.
-    if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[emog-gate] {s} segs={d} this={} own={} applicable={} rejects={} args={d} call_args={d}\n", .{ name0, callee.Path.segments.len, b.resolve("this") != null, b.hasOwnMember(name0), b.ownMemberApplicable(name0, call.args.len), ownMemberRejectsLambdas(b, name0, call.args), args.len, call.args.len });
     if (callee.Path.segments.len == 1 and b.resolve("this") != null and
-        b.hasOwnMember(name0) and b.ownMemberApplicable(name0, call.args.len) and
+        b.hasOwnMember(name0) and b.ownFunctionApplicable(name0, call.args.len) and
         !ownMemberRejectsLambdas(b, name0, call.args))
     {
         if (try lowerImplicitThisCall(b, callee, call.args, call.arg_names, ast_type_args)) |r| return r;
