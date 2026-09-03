@@ -351,6 +351,21 @@ content-negotiation.
   GenericCustomSerializerTest): reified-T binding + generator fidelity,
   the pre-existing 744 tail. Ratchet the floor to 688.
 
+  Diagnosed json-tail roots (2026-09-03, each reproduces standalone):
+  (a) LocalClassesTest — reified `Json.encodeToString(localValue)` /
+  `serializer<Local>()` for a LOCAL `@Serializable` class fails
+  ("unresolved global `Local$lcmain`" / "Serializer for class 'Local'
+  not found"). `Local.serializer()` and `Local::class` both work
+  directly, but `__klsx_companionSerializer` resolves through the class's
+  `$companion` PROPERTY, which a local class's synthesized companion is
+  not reachable by; and the reified splice emits a bare `LoadGlobal
+  Local$lcmain` for the mangled local-class name. Fix: make the local
+  class's synthesized serializer companion reachable via `$companion`
+  (and/or map the `$lc<fn>`-mangled reified name to `<Name>$serializer`).
+  (b) GenericCustomSerializerTest — IndexOutOfBounds (Index 0, length 0)
+  in a generated serializer. Both are distinct from the suite-only enum /
+  streaming failures.
+
   Task 3 (ktor swap) status: the content-negotiation + serialization
   sources are vendored and the shims deleted (committed). The ktor
   commontest census regressed to 0/450 on the swap: `klio test` with no
