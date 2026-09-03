@@ -14950,9 +14950,33 @@ pub fn resolveCtxFor(
         // (`serializer(type)` inside `SerializersModule.serializer()` bound
         // the module-less overload). The splice channel carries the spliced
         // declaration's receiver; consult it only when the frame has none.
-        .recv_ty = b.thisNarrow() orelse b.recvTy() orelse spliceRecvForName(b, name0),
+        // During an ACTIVE splice the spliced body's bare calls resolve
+        // against the spliced declaration's OWN receiver, ahead of the
+        // frame's `recv_ty` — which is the CALLER's. A receiver-bearing
+        // caller (an inline fn spliced into an EXTENSION function) would
+        // otherwise shadow the splice receiver and a bare extension call in
+        // the spliced body (`transform { }` = `Flow.unsafeTransform` inside
+        // `Flow.map`, spliced into `List<T>.ext`) would resolve against the
+        // caller's receiver and miss. Mirrors `bareStaticRecvHead`: this
+        // narrow, then the splice receiver, then the frame's own.
+        // During an ACTIVE splice the frame's own `recv_ty` is the CALLER's
+        // (the inline body is hygienic). When the caller is itself a
+        // receiver-bearing function (an inline fn spliced into an EXTENSION
+        // function), that caller receiver would shadow the spliced
+        // declaration's own receiver and a bare extension call in the body
+        // (`transform { }` = `Flow.unsafeTransform` inside `Flow.map`,
+        // spliced into `List<T>.ext`) would resolve against the wrong
+        // receiver and miss. Prefer the splice receiver over the caller's,
+        // mirroring `bareStaticRecvHead`; `spliceRecvForName`'s local gate
+        // cannot serve here because the collided name (`transform`) is also
+        // a bound param, so consult the splice receiver directly.
+        .recv_ty = b.thisNarrow() orelse
+            (if (b.spliceHintActive() and b.recvTy() != null) b.spliceRecvTy() else b.recvTy()) orelse
+            spliceRecvForName(b, name0),
         .recv_type = if (b.thisNarrow()) |t|
             ir.TypeRef{ .name = t, .nullable = false, .args = &.{} }
+        else if (b.spliceHintActive() and b.recvTy() != null)
+            (if (b.spliceRecvTyRef()) |srt| srt.* else null)
         else if (b.recvTypeRef()) |rt|
             rt
         else if (spliceRecvForName(b, name0) != null)
