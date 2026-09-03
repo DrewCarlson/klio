@@ -2759,6 +2759,10 @@ pub const Value = union(enum) {
             matchesAny(tail, &.{ "ArrayIndexOutOfBoundsException", "StringIndexOutOfBoundsException" })) return true;
         // CancellationException : IllegalStateException : RuntimeException.
         if (std.mem.eql(u8, name, "IllegalStateException") and std.mem.eql(u8, tail, "CancellationException")) return true;
+        // `NumberFormatException : IllegalArgumentException` — a
+        // `catch (e: IllegalArgumentException)` around `toInt()`/`toDouble()`
+        // (kotlinx's `parseString`) must take the host-thrown failure.
+        if (std.mem.eql(u8, name, "IllegalArgumentException") and std.mem.eql(u8, tail, "NumberFormatException")) return true;
         return false;
     }
 
