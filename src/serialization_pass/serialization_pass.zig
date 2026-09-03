@@ -104,6 +104,10 @@ const Index = struct {
     /// Declared supertypes (full TypeRefs) per class/object path, for
     /// `object X : KSerializer<T>` target resolution.
     super_refs: std.StringHashMap([]const ast.TypeRef),
+    /// `@Serializer(forClass = X::class)` target head per serializer path,
+    /// for a serializer object that names its target by annotation rather
+    /// than a `KSerializer<X>` supertype.
+    serializer_for_class: std.StringHashMap([]const u8),
 
     fn init(a: Allocator) Index {
         return .{
@@ -122,6 +126,7 @@ const Index = struct {
             .class_annotations = std.StringHashMap([]const []const u8).init(a),
             .class_nodes = std.StringHashMap(*const ast.Class).init(a),
             .super_refs = std.StringHashMap([]const ast.TypeRef).init(a),
+            .serializer_for_class = std.StringHashMap([]const u8).init(a),
         };
     }
 };
@@ -305,6 +310,9 @@ fn indexAnnotationClasses(idx: *Index, decls: []const ast.Decl) Allocator.Error!
 
 fn recordSupersAndAnnotations(idx: *Index, path: []const u8, supertypes: []const ast.TypeRef, annotations: []const ast.Annotation) Allocator.Error!void {
     try idx.super_refs.put(path, supertypes);
+    if (serializerForClassTarget(idx.a, annotations)) |target| {
+        try idx.serializer_for_class.put(path, simpleHead(target));
+    }
     var sup: std.ArrayList([]const u8) = .empty;
     for (supertypes) |*st| try sup.append(idx.a, simpleHead(st.name.name));
     try idx.supers.put(path, try sup.toOwnedSlice(idx.a));
@@ -1629,11 +1637,17 @@ const Ctx = struct {
 const SerTarget = struct { head: []const u8, nullable: bool };
 
 fn serializerTargetHead(idx: *const Index, ser_path: []const u8) ?SerTarget {
-    const sups = idx.super_refs.get(ser_path) orelse return null;
-    for (sups) |*st| {
-        if (!std.mem.eql(u8, simpleHead(st.name.name), "KSerializer")) continue;
-        if (st.type_args.len == 0 or st.type_args[0].is_star) continue;
-        return .{ .head = simpleHead(st.type_args[0].ty.name.name), .nullable = st.type_args[0].ty.nullable };
+    if (idx.super_refs.get(ser_path)) |sups| {
+        for (sups) |*st| {
+            if (!std.mem.eql(u8, simpleHead(st.name.name), "KSerializer")) continue;
+            if (st.type_args.len == 0 or st.type_args[0].is_star) continue;
+            return .{ .head = simpleHead(st.type_args[0].ty.name.name), .nullable = st.type_args[0].ty.nullable };
+        }
+    }
+    // A `@Serializer(forClass = X::class)` object names its target through the
+    // annotation, not a `KSerializer<X>` supertype.
+    if (idx.serializer_for_class.get(ser_path)) |target| {
+        return .{ .head = target, .nullable = false };
     }
     return null;
 }
