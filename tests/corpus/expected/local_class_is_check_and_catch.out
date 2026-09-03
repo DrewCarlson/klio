@@ -1,0 +1,4 @@
+bases=[1, 2, 3, 5]
+subs=[2, 5]
+is=4
+caught null code=7

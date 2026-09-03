@@ -375,7 +375,7 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
                 saw_null = true;
                 continue;
             }
-            var t2 = (staticExprTypeRef(b, a2) catch null) orelse {
+            var t2 = (staticExprTypeRef(b, a2) catch null) orelse expr.valueClassCtorTypeRef(b, a2) orelse {
                 if (runtime.envOnce("KLIO_VARARG_TRACE") != null)
                     std.debug.print("[vaf] {s} elem underived tag={s}\n", .{ nm, @tagName(std.meta.activeTag(a2.*)) });
                 elem_ok = false;
@@ -390,7 +390,11 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
             }
             const th = typeHead(t2.name);
             if (nheads < heads_buf.len) {
-                heads_buf[nheads] = b.allocator.dupe(u8, std.mem.trimEnd(u8, th, "?")) catch th;
+                // The qualified head (`Holder.Child1`), not the simple one: a
+                // nested class resolves by its qualified name.
+                var full = std.mem.trimEnd(u8, t2.name, "?");
+                if (std.mem.indexOfScalar(u8, full, '<')) |lt| full = full[0..lt];
+                heads_buf[nheads] = b.allocator.dupe(u8, full) catch th;
                 nheads += 1;
             }
             const bare2 = (th.len > 0 and th.len <= 2 and std.ascii.isUpper(th[0])) or
@@ -649,6 +653,12 @@ fn scalarOverloadUnproven(b: *FuncBuilder, call: anytype, target: FuncId) Alloca
 /// `Any` is common to all of them.
 fn leastUpperBoundOfHeads(b: *const FuncBuilder, heads: []const []const u8) ?[]const u8 {
     if (heads.len < 2) return null;
+    const lub_trace = runtime.envOnce("KLIO_LUB_TRACE") != null;
+    if (lub_trace) {
+        std.debug.print("[lub] heads:", .{});
+        for (heads) |h| std.debug.print(" {s}", .{h});
+        std.debug.print("\n", .{});
+    }
     var queue: [64]ir.ClassId = undefined;
     var qlen: usize = 0;
     var qhead: usize = 0;
@@ -668,6 +678,7 @@ fn leastUpperBoundOfHeads(b: *const FuncBuilder, heads: []const []const u8) ?[]c
                 break;
             }
         }
+        if (lub_trace) std.debug.print("[lub] cand {s} (name={s}) supers={d} all={}\n", .{ cls.fqn, cls.name, cls.supertypes.len, all });
         if (all) return cls.fqn;
         for (cls.supertypes) |sup| {
             if (qlen < queue.len) {
@@ -679,13 +690,44 @@ fn leastUpperBoundOfHeads(b: *const FuncBuilder, heads: []const []const u8) ?[]c
     return null;
 }
 
+/// A bare type-parameter result (`decodeFromString<T>(...): T`, bare or
+/// member call) takes the EXPLICIT type argument written at the call
+/// (`json.decodeFromString<List<Cases>>(...)`), type arguments included, so
+/// a local initialized by the call is typed `List<Cases>` rather than `T`.
+fn explicitBareReturn(b: *FuncBuilder, call_expr: *const Expr, r: ?ir.TypeRef) Allocator.Error!?ir.TypeRef {
+    const t = r orelse return null;
+    if (call_expr.* != .Call) return r;
+    const c = call_expr.Call;
+    if (c.type_args.len == 0 or !bareTypeParamHead(t.name)) return r;
+    const cname: []const u8 = switch (c.callee.*) {
+        .Path => |p| if (p.segments.len == 1) p.segments[0].name else return r,
+        .Member => |m| m.name.name,
+        else => return r,
+    };
+    const tn = std.mem.trimEnd(u8, t.name, "?");
+    for (b.module.funcsBySimpleName(cname)) |fid| {
+        const tp = b.module.registry.func_type_params.get(fid) orelse continue;
+        if (tp.items.len != c.type_args.len) continue;
+        for (tp.items, 0..) |pn, pi| {
+            if (!std.mem.eql(u8, pn, tn)) continue;
+            const s = &c.type_args[pi];
+            if (s.name.name.len == 0 or b.isTypeParam(s.name.name)) return r;
+            var lowered = try decl_mod.loweredTypeRef(b.allocator, s, true);
+            if (t.nullable) lowered.nullable = true;
+            return lowered;
+        }
+    }
+    return r;
+}
+
 pub fn staticCallReturnTypeRef(
     b: *FuncBuilder,
     call_expr: *const Expr,
 ) Allocator.Error!?ir.TypeRef {
     if (expr.tyMemoCall(b, call_expr)) |hit| return hit.ty;
     const owns = expr.tyMemoCallEnter(b);
-    const r = try staticCallReturnTypeRefInner(b, call_expr);
+    var r = try staticCallReturnTypeRefInner(b, call_expr);
+    r = try explicitBareReturn(b, call_expr, r);
     expr.tyMemoCallLeave(b, owns, call_expr, r);
     if (runtime.envOnce("KLIO_SCRT_TRACE")) |w| {
         if (call_expr.* == .Call and call_expr.Call.callee.* == .Path and

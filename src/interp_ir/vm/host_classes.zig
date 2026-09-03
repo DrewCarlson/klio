@@ -82,6 +82,12 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     // `null is T?` is true for any nullable type. `null is T`
     // (non-null T) is false.
     if (value.* == .Null) return ty.nullable;
+    // A function-local class is spelled by its `$lc<fn>` alias in lowered
+    // type names; at runtime it registers under its bare name, so the check
+    // resolves the bare name (the frame's or the latest registered class).
+    if (std.mem.indexOf(u8, ty.name, "$lc")) |lci| {
+        return instanceOf(self, value, .{ .name = ty.name[0..lci], .nullable = ty.nullable, .args = ty.args });
+    }
 
     // Reified type parameter resolution: the inline-fn splice binds the
     // reified type-param name (e.g. `T`) to the call-site type
