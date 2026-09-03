@@ -693,3 +693,37 @@ Deferred roots now precisely diagnosed:
   TRANSITIVELY through a generic helper's type parameter
   (`testPair(pairInstance, kSer, serializer(), ...)` with V bound by
   `pairInstance`'s type) — deeper than the direct-sibling case already fixed.
+
+Round (2026-09-03 cont., inline catch-only-try fix): json **698 -> 700 / 744**
+(floor 698); coroutines **1295 -> 1299** (floor 1297); all other suites held
+(core 138/0, ktor 450/0, compose_ui 451/1, io 1191/0, datetime 519/0,
+atomicfu 67/0); fast unit tests green.
+
+Root (SpecialFloatingPointValuesTest testNans/testInfinities, and a GENERAL
+inline+try bug): an inline fn `try { return block() } catch (e) { … }`
+(kotlinx's `parseString`) left its runtime `TryFrame` armed after the inlined
+`return`. The inline return jumps straight to the call's join, bypassing the
+try's `catch_done` exit that normally pops the frame, so the catch stayed live
+over the code AFTER the inlined call — the decoder's
+`throwInvalidFloatingPointDecoded` (thrown after `parseString("double"){toDouble()}`
+returned NaN) was wrongly caught by parseString's `catch (IllegalArgumentException)`
+and re-reported as "Failed to parse type 'double'". Fix: track catch-only try
+bodies parallel to `finally_body_stack` (`catch_body_stack` in FuncBuilder),
+and on an inline return add them to the jumping block's `pop_on_exit` (order-free:
+the eval removes each `TryFrame` by body id). Repro: scratch inlcatch.kt
+(inline `try{return block()}catch`, then a throw after — was CAUGHT-WRONGLY).
+NOTE (open, same class): break/continue out of a catch-only try inside an
+inline lambda still leaks (they use replayFinallysForJump without the catch pop);
+not yet exercised by a census failure.
+
+Ktor shim swap VERIFIED complete (prior session): the real upstream
+`KotlinxSerializationConverter` + json `JsonSupport`/`ExperimentalJsonConverter`
+are vendored and included for client AND server content-negotiation; no
+serialization-converter shim (`decodeToClass` etc.) remains; ktor census 450/0
+and both e2e gates green. The residual `kotlin-klio/klio-ktor/shim/` is klio
+platform actuals (crypto, transport, dispatchers), not serialization shims.
+
+json 42 remain: reified serializer() transitive `{}` (~6), value-class mapkey
+Int-vs-Long literal typing (3), serialize-on-KClass (3), descriptor-on-Nothing
+(3), local-class (3), callable-ref `::JsonPrimitive` (2), JsonNamingStrategy
+nested-childSerializer `get_field SealedMid` (2), plus singletons.
