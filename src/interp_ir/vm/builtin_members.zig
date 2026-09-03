@@ -2325,6 +2325,19 @@ pub fn seqIterMember(self: *VmHost, allocator: Allocator, receiver: *const Value
 /// Whether the instance's own runtime ClassDef (or a supertype ClassDef
 /// reachable through resolved interface handles) declares a member method
 /// named `mname`. Authoritative where a name-keyed registry collides.
+/// True when the module's member index records a user-declared member `mname`
+/// on the class named by `owner_fqn`. `@JvmInline value class` (and other)
+/// members live in the member index, not the runtime ClassDef.methods list
+/// (a value class carries an empty methods list), so a value class's own
+/// `toString`/`equals` override is invisible to the ClassDef walk and the
+/// auto-generated structural form would wrongly preempt it.
+fn moduleMemberDeclares(self: *VmHost, owner_fqn: []const u8, mname: []const u8) bool {
+    if (owner_fqn.len == 0) return false;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    return mg.get().memberDecls(owner_fqn, mname).len != 0;
+}
+
 fn instanceClassDeclaresMethod(inst: ObjRef(InstanceData), mname: []const u8) bool {
     const g = inst.borrow();
     const cd = g.get().class.clone();
@@ -2452,7 +2465,8 @@ pub fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *cons
     // across packs (geometry Size vs the annotation Size); the instance's
     // OWN ClassDef is authoritative for whether it declares an override.
     const has_user_override = classHasUserMethod(self, allocator, if (class_fqn.len != 0) class_fqn else class_name, name) or
-        instanceClassDeclaresMethod(inst, name);
+        instanceClassDeclaresMethod(inst, name) or
+        moduleMemberDeclares(self, class_fqn, name);
 
     if (is_data and is_object and !has_user_override and std.mem.eql(u8, name, "toString")) {
         return .{ .ok = try strVal(allocator, classDisplayName(class_name)) };
