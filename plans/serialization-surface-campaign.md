@@ -411,6 +411,22 @@ content-negotiation.
 
   This is the last blocker for the typed
   client/server serialization gates; the plain GET path is green.
+
+  Narrowed 2026-09-03: the failure is the ENCLOSING EXTENSION-FUNCTION
+  CONTEXT, not the chaining. `items.asFlow().map { e -> ... }.toList()`
+  works verbatim inside a plain function OR a member method; the SAME
+  code inside a top-level extension (`List<T>.f() = asFlow().map{}...`)
+  binds the map lambda's parameter to a closure (`e = {ir-closure#N}`,
+  the flow only emits once with that closure). Assigning asFlow() to a
+  local first does NOT help, so it is the extension receiver in scope,
+  not `this.asFlow()`. The map inline expands to unsafeTransform (a
+  multi-level flow splice: map -> unsafeTransform -> flow/collect); one
+  of those spliced lambdas mis-binds its value parameter when an
+  extension receiver is present. The `resolve("this")` receiver fallback
+  in spliceInlineLambda was ruled out (the transform lambda traces
+  rlp=false, recv=null). Two prior speculative splice changes both
+  regressed (ktor 447 -> 373 with DNCs), so this needs the exact
+  register mis-bind identified before any change.
   Remaining core 3 (after round eighteen):
   BasicTypesSerializationTest.testKvSerialization,
   SealedGenericClassesTest.testQuery,
