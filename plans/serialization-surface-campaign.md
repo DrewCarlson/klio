@@ -582,3 +582,81 @@ testMultipleFields fail only in STREAMING mode within the class run (a
 generated `<Class>$serializer` object read as a getfield on a DOUBLE companion
 `X$Optional$Companion$Companion`, recovered for the first test but fatal under
 inter-test state); a lookupGlobal getfield-miss fallback is neutral there.
+
+Round (2026-09-03, sibling-property reified inference + census-err tooling):
+json census **685 -> 695 / 744** (floor ratcheted 685 -> 693). All other
+suites unchanged (core 138/0, ktor 450/0, compose_ui 451/1); corpus parity
+unaffected (the 16 corpus "fails" in an ad-hoc run are compose-plugin-pack
+gating — identical embedded vs .klio-local, need `KLIO_COMPOSE_PLUGIN=1`
+installed packs; NOT a regression).
+
+Root fixed (TrailingCommaTest testMultipleFields/testWithMap/testWithList/
+testMixed + SealedPolymorphismTest, canonical census): a reified `serializer<T>()`
+whose `T` is inferred from a SIBLING argument that is a class-level `val`
+(`assertEquals(expected, decode(...))`, `expected` a member property of a
+nested type) typed as nothing, because the lazy argument typer
+(`argDeclTypeRefLazyUncached`) knew only locals + splice params, not a bare
+implicit-`this` property read. Fix (three layers, all landed):
+1. type a bare one-segment name against the enclosing receiver's
+   `class_prop_type_heads` and qualify a nested head through `scopeTypeRenameFrom`
+   (expr.zig) — the guard must rely on `isTypeParam`, NOT a length<=2+uppercase
+   heuristic, or a real 2-letter class head (`MF`) is dropped as type-param-like;
+2. record INFERRED property heads for a `val x = MF(...)` initializer whose
+   ctor names a class NESTED in the property's own class — `propCtorHeadEvidence`
+   now takes the enclosing class and checks its nested members (build.zig);
+3. qualification via `scopeTypeRenameFrom` (layer 1).
+
+Tooling: `KLIO_CENSUS_ERRS=1` (with `KLIO_CENSUS_NAMES=1`) makes klio-census
+print each failing case's error line (`[census-err]`), so the census is
+diagnosable without by-hand re-runs.
+
+TRAP (measurement): an ad-hoc "compile every json-tests file + `--feature`"
+runner is UNRELIABLE — it batches all files so multiple same-named types
+(`Bar`, `SealedMid`) collide and produce PHANTOM failures (`get_field Bar on
+Foo$serializer`) the canonical census never sees. serialization_json is
+`whole_source_set=false`: the census compiles each target with only its
+providerClosure. ONLY `klio-census serialization_json` (with installed packs)
+counts. A default-value-qualification fix in serialization_pass.zig chased one
+such phantom and was correctly REVERTED as neutral on the canonical census.
+
+Remaining canonical census failures (47), by root family (from
+KLIO_CENSUS_ERRS):
+- Reified `serializer()` inference returns an empty/`{}` serializer (T inferred
+  transitively through a generic helper's type param): KeyValueSerializersTest
+  testPair/testTriple (`"second":{}`), SealedInterfacesJsonSerializationTest,
+  SealedInterfacesInlineSerialNameTest, JsonNullablePolymorphicTest,
+  JsonNumericKeysTest (`{}`). ~6 tests, likely one root.
+- File-level / typealias custom serializer not applied -> default encoding
+  off by the serializer's delta: SerializationForNullableTypeOnFileTest
+  (52 vs 50), NotNullSerializersCompatibilityOnFileTest (52 vs 50),
+  SerializableOnPropertyTypeAndTypealiasTest (`c#/d#` vs `c/d`),
+  UseSerializersTest (84 vs 21). ~4-5 tests.
+- Callable reference `::JsonPrimitive` to an OVERLOADED factory beside the
+  sealed class: the reference binds the (uninvocable) abstract-class ctor, so
+  `.map(::JsonPrimitive)` over `Collection<Number?>` crashes
+  `JsonPrimitive() expects 0 args, got 1` (JsonBuildersTest.testBuildJsonArrayAddAll,
+  JsonArraySerializerTest.testWhitespaces). REPRODUCED (scratch cref2.kt:
+  sealed class + same-named factory overloads + `::Name` in `.map`). Two-site
+  fix needed: (a) lowering — an abstract/sealed/interface class must not shadow
+  a same-named function in a `::` PropertyRef pick (expr.zig class_pick), AND
+  (b) runtime — the bare-name reference invocation must rank the function
+  overloads (with `Int <: Number?` subtyping) above the abstract class ctor.
+  Layer (a) alone is neutral; deferred as a coordinated fix.
+- Value-class map key equality: JsonMapKeysTest (3) decode == expect as
+  STRINGS yet assertEquals fails (value-class `equals`).
+- `Vm::call_member serialize on kotlin.reflect.KClass`:
+  ValueClassesInSealedHierarchyTest (3).
+- `Vm::get_field descriptor on kotlin.Nothing`: GenericCustomSerializerTest (3).
+- Local class serialization (`get_field base on Local`,
+  `unresolved global Local$serializerImpl`): LocalClassesTest (3).
+- `Vm::get_field SealedMid on Holder$serializer` (nested type in a generated
+  childSerializer): JsonNamingStrategyTest (2).
+- Special float parsing: SpecialFloatingPointValuesTest testNans/testInfinities
+  (decoder can't parse `NaN`/`-Infinity` tokens under
+  `allowSpecialFloatingPointValues=true`), JsonExponentTest (NumberFormatException
+  for `1e-1e-1` must be SerializationException).
+- Misc singletons: SealedDiamondTest (descriptor missing `E`),
+  PolymorphismForCustomTest (`unresolved global V`), JsonEncoderDecoderRecursiveTest
+  (`cast to Map failed`), PolymorphicOnClassesTest / PolymorphicSealedChildTest /
+  ObjectSerializationTest / JsonProhibitedPolymorphicKindsTest (`exception`) /
+  JsonNamesTest / JsonEnumsCaseInsensitiveTest testTopLevelList,testDocSample.
