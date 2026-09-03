@@ -820,3 +820,35 @@ SealedInterfaces (2) LUB `List<I>` (vararg LUB landed, verify);
 SerializableOnPropertyTypeAndTypealias (2) (typealias landed, verify);
 PolymorphicSealedChild (1) (leaf change landed, verify); NotNull contextual (1)
 (scope-alias supertype landed, verify).
+
+Round (2026-09-03, jc21): json **728 -> 738 / 744** (floor 725); the ten flips
+were closure-scoped: local-class identities (`$lc` aliases for explicit type
+arguments, lifted names for constructor-call bindings, scope-first class
+resolution ahead of the package index), lambda-local classes reached by the
+pass (recursive walk + source-text file gate), `subclassesOfSealed` past the
+inline expansion cap (reified callees get a 3x cap), a plain enum's annotated
+entries (`createAnnotatedEnumSerializer` in place), the sibling solver's
+generic-slot projection (`pair: Pair<K, V>` -> `V`), qualified LUB heads with
+value-class constructors, and the explicit-type-arg local typing through a
+member reified helper (`explicitBareReturn`).
+
+REGRESSIONS in the same run (coroutines 1299 -> 1296, ktor 450 -> 449), both
+from the "splice a reified inline callee first" rule and the `$lc` aliases
+reaching runtime-facing names:
+- `flow.catch { }` spliced `LaunchFlowBuilder.catch`'s body (a same-named
+  reified inline MEMBER found by simple name) onto a Flow receiver
+  (`get_field onEach on SubscribedStateFlow`); the splice-first rule now
+  requires the registered target's receiver head to match the declaration's.
+- `filterIsInstance<Super>()` and `catch (e: MyException)` over function-local
+  classes bound `Super$lc<fn>` / `MyException$lc<fn>`, which the runtime
+  (classes register under their bare name) never matched; `instanceOf` strips
+  the `$lc` alias before resolving.
+
+Parked residue (json 4): JsonMapKeys x3 (Int-vs-Long literal typing through
+`to`/`mapOf`/constructor expected types — interpreter-level expected-type
+propagation, not serialization) and JsonNamesTest.testThrowsAnErrorOnDuplicateNames
+(a NAMED argument inside a lambda handed to a reified inline wrapper
+(`assertFailsWithMessage<…> { json.decodeFromString(serializer, s,
+jsonTestingMode = streaming) }`) invokes the captured `serializer` object with
+one argument before any `decodeFromString` runs; positional form passes; the
+plain non-serialization shape passes — still open).

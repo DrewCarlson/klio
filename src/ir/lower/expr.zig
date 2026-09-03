@@ -6821,6 +6821,39 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                             if (tp.is_reified) any_reified = true;
                         }
                         if (!any_reified) break :reified_splice;
+                        // Only when the registered target IS this declaration:
+                        // `cf` was found by simple name, and a same-named inline
+                        // member of another class (`LaunchFlowBuilder.catch`
+                        // beside `Flow.catch`) must not be spliced onto this
+                        // receiver. The receiver heads decide.
+                        const cf_recv: ?[]const u8 = if (cf.receiver_type) |*rt|
+                            typeHead(std.mem.trimEnd(u8, rt.name.name, "?"))
+                        else
+                            inline_state.inlineMemberOwner(cf);
+                        const mf_reg = b.module.funcById(fid) orelse break :reified_splice;
+                        const mf_recv: ?[]const u8 = if (mf_reg.params.len != 0 and std.mem.eql(u8, mf_reg.params[0].name, "this"))
+                            typeHead(std.mem.trimEnd(u8, mf_reg.params[0].ty.name, "?"))
+                        else
+                            null;
+                        const same_target = blk_same: {
+                            const cr = cf_recv orelse break :blk_same mf_recv == null;
+                            const mr = mf_recv orelse break :blk_same false;
+                            break :blk_same std.mem.eql(u8, typeHead(cr), mr);
+                        };
+                        if (!same_target) break :reified_splice;
+                        // And the CALL-SITE receiver must be that type (or a
+                        // subtype): `flow.catch { }` is not a `LaunchFlowBuilder`
+                        // call even though that class declares a reified inline
+                        // `catch`. An untyped receiver keeps the typed member
+                        // call below.
+                        const site_ty: ?ir.TypeRef = staticExprTypeRef(b, receiver) catch null;
+                        const recv_ok = blk_recv: {
+                            const mr = mf_recv orelse break :blk_recv site_ty == null;
+                            const st = site_ty orelse break :blk_recv false;
+                            const sh = typeHead(std.mem.trimEnd(u8, st.name, "?"));
+                            break :blk_recv std.mem.eql(u8, sh, mr) or b.module.classIsOrExtends(sh, mr);
+                        };
+                        if (!recv_ok) break :reified_splice;
                         if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: reified -> splice first\n", .{mname});
                         inline_call.splice_route_tag = "lowerCall:reified";
                         if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| return r;
