@@ -564,3 +564,21 @@ Exit: the pack carries the real surface with the upstream converter
 modules compiling against it; the json census stands ratcheted in the
 verification path with its count trajectory recorded; both shims are
 deleted with ktor e2e + census green; full battery green throughout.
+
+Round (2026-09-03, reified nested-class): SealedPolymorphismTest 2/2 GREEN,
+json census 690 -> 692 / 744. Root: an INFERRED reified type argument for a
+sealed subclass nested in the test class (`T` = `Foo.Bar` from a `Foo.Bar(1)`
+value arg to `inline fun <reified T>`, exercised by
+`assertStringFormAndRestored(..., PolymorphicSerializer(Foo::class))`) arrived
+with its dotted spelling in the TypeRef `name`, not `qualified_path`, so
+`reifiedQualifiedName` missed it and the reified bind loaded a bare `Foo.Bar`
+global -> "unresolved global Foo.Bar". Fix = resolve a dotted `name` as a
+`.`-aligned suffix of the nested class's lifted fqn (inline_call.zig). Minimal
+repro: reified inline + PolymorphicSerializer + sealed class NESTED in the
+test class (top-level sealed Foo, concrete serializer, or a Foo-typed var all
+PASS). REMAINING json 50, largely SUITE/STATE-only (pass when filtered to one
+test, fail in the per-class census run): TrailingCommaTest testWithMap/
+testMultipleFields fail only in STREAMING mode within the class run (a
+generated `<Class>$serializer` object read as a getfield on a DOUBLE companion
+`X$Optional$Companion$Companion`, recovered for the first test but fatal under
+inter-test state); a lookupGlobal getfield-miss fallback is neutral there.
