@@ -2546,6 +2546,13 @@ fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, 
         // (`Tst$B` without a companion is not `pb.B`).
         if (try companionInstanceForDef(self, cd.fqn, cd.name)) |v| return ok(v);
         if (try companionInstanceForClass(self, cd.name)) |v| return ok(v);
+        // A LOCAL class's companion is not in the build-time
+        // `companion_singletons`; registerNestedClasses publishes it as the
+        // runtime global `$companion:<class>` instead.
+        var cbuf: [192]u8 = undefined;
+        if (std.fmt.bufPrint(&cbuf, "$companion:{s}", .{cd.name}) catch null) |ck| {
+            if (host_globals.lookupGlobal(self, ck)) |v| return ok(v);
+        }
         return ok(.Null);
     }
     // An anonymous object's class has no name: both reflective names
