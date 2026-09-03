@@ -507,6 +507,14 @@ const Gen = struct {
     /// unannotated enums it references).
     pkg: []const u8 = "",
 
+    /// Qualify a type REFERENCE, honoring an explicit dotted qualifier the
+    /// source wrote (`Outer.Nested` keeps `Outer.` — its `qualified_path` —
+    /// which the bare `name` alone drops, stranding a nested type's serializer
+    /// on an unresolvable simple name in the synthetic file).
+    fn qualifyTy(self: *const Gen, t: *const ast.TypeRef) Allocator.Error![]const u8 {
+        return self.qualify(t.qualified_path orelse t.name.name);
+    }
+
     /// Qualify a type reference as written in the class to the path the
     /// synthetic top-level file can name: a sibling nested class
     /// (`SimpleType` inside `Outer`) becomes `Outer.SimpleType`.
@@ -547,7 +555,7 @@ const Gen = struct {
             // spelling opaque so the generated code still parses.
             try out.appendSlice(self.a, "Any");
         } else {
-            try out.appendSlice(self.a, try self.qualify(t.name.name));
+            try out.appendSlice(self.a, try self.qualifyTy(t));
             if (t.type_args.len != 0) {
                 try out.append(self.a, '<');
                 for (t.type_args, 0..) |*ta, i| {
@@ -603,7 +611,7 @@ const Gen = struct {
     /// annotations and a module without a contextual entry still decodes.
     fn contextualSerializerExpr(self: *const Gen, t: *const ast.TypeRef) Allocator.Error![]const u8 {
         const a = self.a;
-        const q = try self.qualify(t.name.name);
+        const q = try self.qualifyTy(t);
         // The class IN SCOPE (the enclosing scopes of the declaration, then
         // top level): the flat simple-name map would answer another file's
         // same-named class.
@@ -647,7 +655,7 @@ const Gen = struct {
             return self.contextualSerializerExpr(t);
         }
         if (hasAnnotation(annotations, "Polymorphic")) {
-            return std.fmt.allocPrint(a, "PolymorphicSerializer({s}::class)", .{try self.qualify(t.name.name)});
+            return std.fmt.allocPrint(a, "PolymorphicSerializer({s}::class)", .{try self.qualifyTy(t)});
         }
         if (self.typeParamIndex(head)) |i| {
             return std.fmt.allocPrint(a, "typeSerial{d}", .{i});
@@ -688,7 +696,7 @@ const Gen = struct {
             return std.fmt.allocPrint(a, "TripleSerializer({s}, {s}, {s})", .{ try self.typeArgSerializer(t, 0), try self.typeArgSerializer(t, 1), try self.typeArgSerializer(t, 2) });
         }
         if (eq(u8, head, "Array")) {
-            const elem_head = if (t.type_args.len != 0 and !t.type_args[0].is_star) try self.qualify(t.type_args[0].ty.name.name) else "Any";
+            const elem_head = if (t.type_args.len != 0 and !t.type_args[0].is_star) try self.qualifyTy(&t.type_args[0].ty) else "Any";
             return std.fmt.allocPrint(a, "ArraySerializer({s}::class, {s})", .{ elem_head, try self.typeArgSerializer(t, 0) });
         }
         if (eq(u8, head, "IntArray") or eq(u8, head, "LongArray") or eq(u8, head, "ShortArray") or eq(u8, head, "ByteArray") or
@@ -700,7 +708,7 @@ const Gen = struct {
         // A user type: its companion `serializer(...)`, with type-argument
         // serializers for a generic one. Qualified to the path the
         // synthetic file can name.
-        const qn = try self.qualify(t.name.name);
+        const qn = try self.qualifyTy(t);
         // An interface type is polymorphic unless it carries its own
         // `@Serializable` (a sealed interface's generated serializer, or a
         // custom `with=`); `@Polymorphic` on the interface forces it.
@@ -792,7 +800,7 @@ fn collectElems(a: Allocator, g: *const Gen, c: *const ast.Class) Allocator.Erro
     // encodes `a` then `y`); a supertype argument instantiates the
     // superclass's type parameter for those elements.
     for (c.supertypes) |*st| {
-        const sup_path = try g.qualify(st.name.name);
+        const sup_path = try g.qualifyTy(st);
         const sup = g.idx.class_nodes.get(sup_path) orelse continue;
         if (sup.is_interface or !isSerializableIn(g.idx, sup.annotations)) continue;
         var tps: std.ArrayList([]const u8) = .empty;
