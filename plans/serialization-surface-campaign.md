@@ -470,6 +470,32 @@ content-negotiation.
   rlp=false, recv=null). Two prior speculative splice changes both
   regressed (ktor 447 -> 373 with DNCs), so this needs the exact
   register mis-bind identified before any change.
+
+  RESOLVED 2026-09-03 (both bleeds). Two root fixes landed:
+  (1) inline-splice Unit-mask clear. The deeper CookieDateParser nesting
+  (`capture { repeat(2) { accept { }.otherwise { } } }`) was NOT a
+  register mis-bind: an inline call binds its lambda arguments by
+  body-expansion, never through lowerArgRun, so the `-> Unit` mask that
+  argument typing writes to pending_arg_lambda_unit had no consumer on
+  the splice path and dangled. An enclosing `also { }` (in accept's body)
+  set the mask; the splice's own receiver shield then faithfully
+  save/restored that stale mask across the nested `accept { }` predicate,
+  coercing it to Unit. Fix = clear pending_arg_lambda_unit once typing is
+  done on the inlineSplice path (expr.zig, after argLambdaParamTypesRecv).
+  CookieDateParser 4/4; ktor commontest 447 -> 450 (GREEN).
+  (2) splice-receiver priority. The extension-function flow-map failure
+  was resolveCtxFor setting a bare call's receiver head from the frame's
+  own recv_ty AHEAD of the splice channel. Inside an active splice the
+  frame recv_ty is the CALLER's; when the caller is an extension function
+  its receiver shadowed the spliced map body's own Flow receiver, so the
+  bare `transform { }` (aliased Flow.unsafeTransform) resolved against
+  String/List, fell through to the bound `transform` param, and the map
+  lambda got a closure. Fix = during an active splice with a set frame
+  recv_ty, use spliceRecvTy() instead (mirrors bareStaticRecvHead);
+  spliceRecvForName's local gate cannot serve the collided `transform`.
+  `flowOf().map{}` / `asFlow().map{}` now work in extension functions.
+  Censuses after both: json 688, core 138, ktor 450/0, compose_ui 448/4 —
+  no regressions.
   Remaining core 3 (after round eighteen):
   BasicTypesSerializationTest.testKvSerialization,
   SealedGenericClassesTest.testQuery,
