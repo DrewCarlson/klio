@@ -494,7 +494,7 @@ pub const suites = [_]Config{
         // 2026-09-03 census: 700 / 744 (42 failed, 2 did not complete);
         // the floor keeps a small did-not-complete margin below the
         // observed count.
-        .baseline = 698,
+        .baseline = 725,
         .max_failed = null,
         .max_incomplete = null,
     },
@@ -689,6 +689,11 @@ pub fn runSuite(cfg: Config) !void {
                     try argv.append(a, target);
                 }
                 try argv.append(a, try std.fmt.allocPrint(a, "--filter={s}.{s}", .{ cls, tn }));
+                if (std.c.getenv("KLIO_CENSUS_ARGV") != null) {
+                    std.debug.print("[census-argv]", .{});
+                    for (argv.items) |arg| std.debug.print(" {s}", .{arg});
+                    std.debug.print("\n", .{});
+                }
                 try split_jobs.append(a, try argv.toOwnedSlice(a));
             }
             if (names.items.len != 0) continue;
@@ -714,7 +719,12 @@ pub fn runSuite(cfg: Config) !void {
             for (bases) |bi| try argv.append(a, targets.items[bi]);
             try argv.append(a, target);
         }
-        try jobs.append(a, try argv.toOwnedSlice(a));
+        if (std.c.getenv("KLIO_CENSUS_ARGV") != null) {
+                    std.debug.print("[census-argv]", .{});
+                    for (argv.items) |arg| std.debug.print(" {s}", .{arg});
+                    std.debug.print("\n", .{});
+                }
+                try jobs.append(a, try argv.toOwnedSlice(a));
     }
     if (split_jobs.items.len != 0) {
         try split_jobs.appendSlice(a, jobs.items);

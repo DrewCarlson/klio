@@ -727,3 +727,96 @@ json 42 remain: reified serializer() transitive `{}` (~6), value-class mapkey
 Int-vs-Long literal typing (3), serialize-on-KClass (3), descriptor-on-Nothing
 (3), local-class (3), callable-ref `::JsonPrimitive` (2), JsonNamingStrategy
 nested-childSerializer `get_field SealedMid` (2), plus singletons.
+
+Rounds (2026-09-03, sibling/receiver/collision series): json **700 -> 714 / 744**
+(canonical klio-census), then **714 -> 716** (jc17), then **716 -> 723** (jc18,
+floor still 693 in `commontest_support.zig` — ratchet pending the next clean
+run); coroutines 1299 (floor 1297); every other suite held (core 138/0,
+ktor 450/0, compose_ui 451/1 ShadowTest.testLerp, io 1191/0, datetime 519/0,
+atomicfu 67/0); unit tests green after every build.
+
+Roots landed (each with an example + baked output):
+- `Gen.qualifyTy` / generic custom serializer (`@Serializable(with =
+  Generic::class)` on a generic class passes the type-argument serializers);
+  `customSerializerRef(t, w)` takes the type.
+- Sibling reified inference: instantiated-solver yields on own-type-param or
+  star (`irTypeMentionsAny`); zero-arg branch solves from ctor/static siblings,
+  own-member outers through `enclosingChainMethodsNamed`
+  (reified_serializer_from_sibling).
+- Receiver-lambda labels: `spliceInlineLambdaOn` binds `this@<inlineFn>` to the
+  subject (receiver_lambda_label_shadow).
+- `NumberFormatException` is-a `IllegalArgumentException` in the builtin
+  throwable lattice (catch_number_format_as_iae).
+- `classReceiverField` probes `{cls}.Companion.{name}` for a bare companion
+  member read (companion_nested_object_vs_import).
+- Pass batch: `@Polymorphic` on a type parameter -> `PolymorphicSerializer(Any)`;
+  local `with=` classes get a spliced companion `serializer()`; sealed enum
+  leaves via `createSimpleEnumSerializer`; out-of-index `with=` stays a bare
+  reference; InstantComponentSerializer included
+  (serializable_local_with_and_polymorphic_param, sealed_enum_leaf_descriptor,
+  serializable_local_class_scope, instant_component_serializer).
+- `Error`-named polymorphic subclass: `reifiedQualifiedName` keeps the written
+  receiver path; the `KSerializer<T>` factory-receiver arm overrides a bare
+  prior binding of the same simple name, and MERGES the qualified path into a
+  prior binding that carries type arguments (`ParametrizedData<Data>` from
+  `value: T` stays intact) (polymorphic_subclass_named_error,
+  reified_serializer_generic_prior_binding).
+- Private member with a receiver-lambda parameter called bare: the direct
+  private-dispatch path records the lambda's declared receiver
+  (`recordLambdaArgReceivers`), so `subclass(Int::class)` inside splices with
+  `T` bound (private_member_receiver_lambda).
+- `@Serializer(forClass = X::class)` bodiless object gets the `KSerializer<X>`
+  supertype in the splice; declaration supertype matching compares the simple
+  head (serializer_for_class_object_subclass).
+- `@Contextual` on a generic type passes `arrayOf(typeArgSerializers)` and a
+  generic serializable fallback `X.serializer(args)` (contextual_generic_type_args).
+- `@Polymorphic` on a class declaration is indexed (`polymorphic_classes`) and
+  properties of that type serialize polymorphically (polymorphic_class_annotation).
+- Own-member scope order: an APPLICABLE own FUNCTION shadows a same-named
+  top-level function or class (`private fun Json(arrays, build:
+  PolymorphicModuleBuilder<Any>.() -> Unit)` beside the library `Json`): the
+  lowerCall pre-record, `emitMemberOrGlobal`, and the ctor/factory path route
+  through the implicit-this path first; the gate is `ownFunctionApplicable`
+  (functions only — nested-class ctor calls keep the ctor path; the permissive
+  `ownMemberApplicable` regressed `DiscriminatorHolder(...)`/`GenericClass(...)`
+  on the first jc18 launch) (own_member_over_library_function).
+- `is S.A` through a PRIVATE nested owner: `loweredCheckTypeName` renames the
+  path's first segment through the owner's scope alias before the two-segment
+  `mangled_nested` key (nested_private_sealed_is_check).
+- Callable reference to a sealed class + factory functions (`::JsonPrimitive`):
+  the boxed numerics list `Number`/`Comparable` as builtin supertypes
+  (`applicability.builtinSupersOf`, nullable param compare trims `?`), so
+  `pickFactory` accepts an `Int` for `Number?`; under a typed expected function
+  type the overload is picked statically (class_pick cleared for an abstract
+  class) (callable_ref_factory_over_sealed_class).
+- Zero-arg reified `serializer()` beside a generic sibling call instantiates the
+  sibling's return type (`instantiatedCallIrType`: `solveCallBindings` over
+  static arg shapes, infix/member callees, recursion two levels, constructor
+  instantiation by positional bind, vararg least-upper-bound head)
+  (reified_serializer_from_infix_sibling).
+
+Census mechanics learned: `klio-census` takes ONE comma-separated suite arg
+(`serialization_json,serialization,ktor,...`); a space-separated list silently
+runs only the first suite (jc17 ran json alone). `KLIO_CENSUS_ARGV=1` (added)
+echoes each job's argv so a closure-dependent failure can be replayed exactly.
+`corpus_check.py` needs `KLIO_HOME=$PWD/.klio-local` for `--feature` examples.
+
+In flight (edited, not yet censused): typealias + type-use `@Serializable(S::class)`
+in the pass (`type_aliases` index; `serializerExprNonNull` checks `t.annotations`
+then recurses on a non-generic alias target); abstract/open `@Serializable`
+children are sealed LEAVES with their polymorphic serializer (so
+`subclassesOfSealed<FooOpen>()` rejects the incomplete hierarchy as kotlinx
+does); `argDeclSupertypeMatching` consults the scope alias first (a nested
+object named `ContextualSerializer` no longer answers the library class's
+`KSerializer<T>`).
+
+Remaining json families (closure-dependent unless noted): LocalClassesTest (2)
+and EncodingExtensionsTest (1) and JsonEnumsCaseInsensitive (2) and JsonNames
+(2) pass in isolation — same-name collisions inside the census provider closure
+(replay via KLIO_CENSUS_ARGV); JsonMapKeys (3) = Int-vs-Long literal typing
+through `to`/`mapOf`/ctor expected type (interpreter, not serialization);
+KeyValue (2) transitive Pair (ctor instantiation now landed, verify);
+SealedInterfaces (2) LUB `List<I>` (vararg LUB landed, verify);
+SerializableOnPropertyTypeAndTypealias (2) (typealias landed, verify);
+PolymorphicSealedChild (1) (leaf change landed, verify); NotNull contextual (1)
+(scope-alias supertype landed, verify).

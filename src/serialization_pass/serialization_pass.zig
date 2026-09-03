@@ -111,6 +111,10 @@ const Index = struct {
     /// Class paths declared `@Polymorphic`: every property of that type
     /// serializes polymorphically, as with the annotation on the property.
     polymorphic_classes: std.StringHashMap(void),
+    /// Top-level `typealias` declarations by simple name: a property typed
+    /// through an alias serializes as the alias target, carrying the
+    /// target's type-use annotations (`typealias A = @Serializable(S::class) T`).
+    type_aliases: std.StringHashMap(*const ast.TypeAlias),
 
     fn init(a: Allocator) Index {
         return .{
@@ -131,6 +135,7 @@ const Index = struct {
             .super_refs = std.StringHashMap([]const ast.TypeRef).init(a),
             .serializer_for_class = std.StringHashMap([]const u8).init(a),
             .polymorphic_classes = std.StringHashMap(void).init(a),
+            .type_aliases = std.StringHashMap(*const ast.TypeAlias).init(a),
         };
     }
 };
@@ -405,6 +410,9 @@ fn indexDecls(idx: *Index, decls: []const ast.Decl, outer: []const u8, pkg: []co
                 }
                 try indexDecls(idx, o.members, path, pkg);
             },
+            .TypeAlias => |*ta| {
+                if (outer.len == 0) try idx.type_aliases.put(ta.name.name, ta);
+            },
             else => {},
         }
     }
@@ -657,6 +665,19 @@ const Gen = struct {
     fn serializerExprNonNull(self: *const Gen, t: *const ast.TypeRef, annotations: []const ast.Annotation) Allocator.Error![]const u8 {
         const a = self.a;
         if (serializableWith(a, annotations)) |w| return self.customSerializerRef(t, w);
+        // A type-use `@Serializable(S::class)` on the property's TYPE
+        // (`val b: @Serializable(S::class) B`) selects the serializer as the
+        // property annotation does.
+        if (serializableWith(a, t.annotations)) |w| return self.customSerializerRef(t, w);
+        // A non-generic typealias serializes as its target, whose own
+        // type-use annotations ride along (`typealias BS = @Serializable(S::class) B`).
+        if (t.function == null and t.type_args.len == 0 and self.typeParamIndex(simpleHead(t.name.name)) == null) {
+            if (self.idx.type_aliases.get(simpleHead(t.name.name))) |ta| {
+                if (ta.type_params.len == 0 and !std.mem.eql(u8, simpleHead(ta.target.name.name), simpleHead(t.name.name))) {
+                    return self.serializerExprNonNull(&ta.target, annotations);
+                }
+            }
+        }
         const head = simpleHead(t.name.name);
         // File-level policy applies after the property's own annotations.
         if (self.file) |fs| {
@@ -1421,8 +1442,12 @@ fn collectSealedLeaves(a: Allocator, idx: *const Index, parent_path: []const u8,
             }
             continue;
         };
+        // A sealed child flattens into the parent's hierarchy; an abstract or
+        // open `@Serializable` child stays a leaf carrying its polymorphic
+        // serializer, exactly as the plugin lists direct subclasses (which is
+        // what `subclassesOfSealed` rejects as an incomplete hierarchy).
         switch (si.kind) {
-            .sealed, .interface_sealed, .polymorphic => try collectSealedLeaves(a, idx, si.path, out, seen),
+            .sealed, .interface_sealed => try collectSealedLeaves(a, idx, si.path, out, seen),
             else => try out.append(a, sub.path),
         }
     }

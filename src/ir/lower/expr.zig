@@ -16831,6 +16831,7 @@ fn instantiatedSiblingCallTypeRef(b: *FuncBuilder, e: *const Expr) ?*const ast.T
 fn instantiatedCallIrType(b: *FuncBuilder, e: *const Expr, depth: usize) ?ir.TypeRef {
     if (depth > 2 or e.* != .Call) return null;
     const call = e.Call;
+    if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) std.debug.print("[sibexp-zero-enter] depth={d} callee={s} nargs={d} type_args={d}\n", .{ depth, @tagName(std.meta.activeTag(call.callee.*)), call.args.len, call.type_args.len });
     if (call.type_args.len != 0) return null;
     const name: []const u8 = switch (call.callee.*) {
         .Path => |p| if (p.segments.len == 1) p.segments[0].name else return null,
@@ -16845,8 +16846,17 @@ fn instantiatedCallIrType(b: *FuncBuilder, e: *const Expr, depth: usize) ?ir.Typ
     // An argument that is itself a call (`1 to 2`) carries no declared
     // type; its instantiated (else derived) static type is the evidence.
     for (call.args, shapes) |*a, *shape| {
+        if (a.* == .Call) {
+            // A nested generic call's instantiation (`Pair("a", "b")` is a
+            // `Pair<String, String>`) beats the head-only declared type.
+            if (instantiatedCallIrType(b, a, depth + 1)) |inst| {
+                shape.ty = inst;
+                shape.ty_authoritative = true;
+                continue;
+            }
+        }
         if (shape.ty != null) continue;
-        shape.ty = instantiatedCallIrType(b, a, depth + 1) orelse (staticExprTypeRef(b, a) catch null);
+        shape.ty = staticExprTypeRef(b, a) catch null;
         shape.ty_authoritative = shape.ty != null;
     }
     const recv_ty: ?ir.TypeRef = if (receiver) |r|
@@ -16856,6 +16866,31 @@ fn instantiatedCallIrType(b: *FuncBuilder, e: *const Expr, depth: usize) ?ir.Typ
     if (receiver != null and recv_ty == null) return null;
     if (runtime.envOnce("KLIO_SIBEXP_TRACE") != null) {
         for (shapes, 0..) |sh, i| std.debug.print("[sibexp-zero-shape] call={s} arg{d} ty={s} recv={s}\n", .{ name, i, if (sh.ty) |t| t.name else "<null>", if (recv_ty) |t| t.name else "-" });
+    }
+    // A bare name that constructs a generic class (`Pair(42, Pair("a", "b"))`)
+    // instantiates the class's own parameters from its primary parameters.
+    if (receiver == null) ctor: {
+        const cid = b.module.classIdIndexed(name, b.self_package, call.callee.Path.segments[0].span.file) orelse
+            b.module.classId(name) orelse break :ctor;
+        if (cid.int() >= b.module.classes.items.len) break :ctor;
+        const cls = &b.module.classes.items[cid.int()];
+        if (cls.type_params.len == 0 or cls.primary_params.len != call.args.len) break :ctor;
+        if (b.module.funcsBySimpleName(name).len != 0) break :ctor;
+        var bindings: std.ArrayList(ir.Module.TypeBinding) = .empty;
+        for (cls.primary_params, shapes) |pp, sh| {
+            const at = sh.ty orelse continue;
+            positionalBind(scratch.allocator(), pp.ty, at, cls.type_params, &bindings) catch break :ctor;
+        }
+        if (bindings.items.len != cls.type_params.len) break :ctor;
+        const out_args = scratch.allocator().alloc(ir.TypeRef, cls.type_params.len) catch break :ctor;
+        for (cls.type_params, 0..) |tp, i| {
+            out_args[i] = for (bindings.items) |bd| {
+                if (std.mem.eql(u8, bd.name, tp)) break bd.ty;
+            } else break :ctor;
+        }
+        const inst = ir.TypeRef{ .name = cls.fqn, .nullable = false, .args = out_args };
+        if (!irTypeFullyConcrete(b, inst)) break :ctor;
+        return inst.clone(b.allocator) catch null;
     }
     for (b.module.funcsBySimpleName(name)) |fid| {
         const f = b.module.funcById(fid) orelse continue;
@@ -16867,12 +16902,86 @@ fn instantiatedCallIrType(b: *FuncBuilder, e: *const Expr, depth: usize) ?ir.Typ
         if (f.return_ty.args.len == 0) continue;
         const tps = b.module.registry.func_type_params.get(fid) orelse continue;
         if (tps.items.len == 0) continue;
+        // A vararg run of DIFFERENT classes (`listOf(ResponseInt(10), NoResponse,
+        // ResponseString("foo"))`) binds the element parameter to their least
+        // upper bound (the sealed `I`), as kotlinc infers it.
+        if (has_va and value_params == 1 and tps.items.len == 1 and shapes.len > 1) {
+            if (leastUpperBoundHead(b, shapes)) |lub| {
+                for (shapes) |*sh| sh.ty = .{ .name = lub, .nullable = false, .args = &.{} };
+            }
+        }
         const solved = (b.module.solveCallBindings(scratch.allocator(), fid, f, recv_ty, null, shapes, &.{}, false) catch continue) orelse continue;
         if (solved.bindings.len == 0) continue;
         const substituted = ir.Module.substituteBoundType(scratch.allocator(), f.return_ty, solved.bindings) catch continue;
         if (!irTypeFullyConcrete(b, substituted)) continue;
         if (irTypeMentionsAny(substituted, tps.items)) continue;
         return substituted.clone(b.allocator) catch null;
+    }
+    return null;
+}
+
+/// Bind the class type parameters a declared parameter type mentions from
+/// the argument's static type, positionally (`second: B` against
+/// `Pair<String, String>` binds `B`; `items: List<T>` against `List<Int>`
+/// binds `T`). A parameter already bound to a different type is a conflict.
+fn positionalBind(a: Allocator, param: ir.TypeRef, arg: ir.TypeRef, tps: []const []const u8, out: *std.ArrayList(ir.Module.TypeBinding)) !void {
+    const pn = std.mem.trimEnd(u8, param.name, "?");
+    for (tps) |tp| {
+        if (!std.mem.eql(u8, pn, tp)) continue;
+        for (out.items) |bd| {
+            if (std.mem.eql(u8, bd.name, tp)) {
+                if (!std.mem.eql(u8, bd.ty.name, arg.name)) return error.Conflict;
+                return;
+            }
+        }
+        var owned = try arg.clone(a);
+        owned.nullable = false;
+        try out.append(a, .{ .name = tp, .ty = owned });
+        return;
+    }
+    if (param.args.len != 0 and param.args.len == arg.args.len) {
+        for (param.args, arg.args) |pa, aa| try positionalBind(a, pa, aa, tps, out);
+    }
+}
+
+/// The nearest class every argument shape's static head is or extends,
+/// walking the first head's supertype chain outward; null when the heads
+/// agree (nothing to widen) or when no common class short of `Any` exists.
+fn leastUpperBoundHead(b: *FuncBuilder, shapes: []const applicability.ArgShape) ?[]const u8 {
+    var heads_buf: [16][]const u8 = undefined;
+    if (shapes.len > heads_buf.len) return null;
+    var all_same = true;
+    for (shapes, 0..) |sh, i| {
+        const t = sh.ty orelse return null;
+        heads_buf[i] = typeHead(std.mem.trimEnd(u8, t.name, "?"));
+        if (i != 0 and !std.mem.eql(u8, heads_buf[i], heads_buf[0])) all_same = false;
+    }
+    if (all_same) return null;
+    const heads = heads_buf[0..shapes.len];
+    var queue_buf: [64]ir.ClassId = undefined;
+    var qlen: usize = 0;
+    var qhead: usize = 0;
+    const first = b.module.classIdByFqn(heads[0]) orelse b.module.classId(heads[0]) orelse return null;
+    queue_buf[qlen] = first;
+    qlen += 1;
+    while (qhead < qlen) : (qhead += 1) {
+        const cid = queue_buf[qhead];
+        if (cid.int() >= b.module.classes.items.len) continue;
+        const cls = &b.module.classes.items[cid.int()];
+        var all = true;
+        for (heads[1..]) |h| {
+            if (!(std.mem.eql(u8, h, cls.name) or std.mem.eql(u8, h, cls.fqn) or b.module.classIsOrExtends(h, cls.fqn) or b.module.classIsOrExtends(h, cls.name))) {
+                all = false;
+                break;
+            }
+        }
+        if (all) return cls.fqn;
+        for (cls.supertypes) |sup| {
+            if (qlen < queue_buf.len) {
+                queue_buf[qlen] = sup;
+                qlen += 1;
+            }
+        }
     }
     return null;
 }

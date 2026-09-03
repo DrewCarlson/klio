@@ -1706,7 +1706,7 @@ fn unifyParamAgainstArg(
         // The argument names a DECLARATION (`serializersModuleOf(BSerializer)`
         // where `object BSerializer : KSerializer<B>`): the parameter's type
         // argument is solved from the declaration's own supertype list.
-        if (argDeclSupertypeMatching(arg, param_ty.name.name)) |sup| {
+        if (argDeclSupertypeMatching(arg, param_ty.name.name, bb)) |sup| {
             try unifyTypeParam(param_ty, sup, tp_names, subst);
             return;
         }
@@ -2101,7 +2101,7 @@ fn isAllUpper(s: []const u8) bool {
 /// `want` — the declared instantiation (`KSerializer<B>`) an argument of that
 /// declaration's type satisfies. Null when the argument is not a plain
 /// declaration reference or declares no matching supertype.
-fn argDeclSupertypeMatching(arg: *const Expr, want: []const u8) ?*const TypeRef {
+fn argDeclSupertypeMatching(arg: *const Expr, want: []const u8, bb: ?*const FuncBuilder) ?*const TypeRef {
     const name: []const u8 = switch (arg.*) {
         .Path => |*p| blk: {
             if (p.segments.len == 0) break :blk "";
@@ -2111,7 +2111,18 @@ fn argDeclSupertypeMatching(arg: *const Expr, want: []const u8) ?*const TypeRef 
         else => "",
     };
     if (name.len == 0) return null;
-    const sups = inline_state.classSupertypeRefs(name) orelse return null;
+    // A nested declaration named like a library class (`object
+    // ContextualSerializer : KSerializer<ContextualType>` beside
+    // kotlinx's `ContextualSerializer`) lifts under a mangled name; the
+    // scope alias resolves the bare spelling to it ahead of the simple-name
+    // index, which would answer the library class.
+    const scoped: ?[]const ast.TypeRef = blk: {
+        const b = bb orelse break :blk null;
+        if (arg.* != .Path or arg.Path.segments.len != 1) break :blk null;
+        const renamed = expr_lower.scopeTypeRename(b, name, arg.Path.segments[0].span.file.int()) orelse break :blk null;
+        break :blk inline_state.classSupertypeRefs(renamed);
+    };
+    const sups = scoped orelse inline_state.classSupertypeRefs(name) orelse return null;
     for (sups) |*sup| {
         if (sup.type_args.len == 0) continue;
         const sup_head = if (std.mem.lastIndexOfScalar(u8, sup.name.name, '.')) |d| sup.name.name[d + 1 ..] else sup.name.name;

@@ -367,6 +367,8 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
         // contributes only nullability.
         var diverged = false;
         var saw_null = false;
+        var heads_buf: [16][]const u8 = undefined;
+        var nheads: usize = 0;
         expr.od_depth += 1;
         for (call.args[0..want]) |*a2| {
             if (a2.* == .NullLit) {
@@ -387,6 +389,10 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
                 break;
             }
             const th = typeHead(t2.name);
+            if (nheads < heads_buf.len) {
+                heads_buf[nheads] = b.allocator.dupe(u8, std.mem.trimEnd(u8, th, "?")) catch th;
+                nheads += 1;
+            }
             const bare2 = (th.len > 0 and th.len <= 2 and std.ascii.isUpper(th[0])) or
                 b.isTypeParam(th) or ir.parseClassTypeParamIdentity(th) != null;
             if (th.len == 0 or bare2) {
@@ -429,8 +435,13 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
             break :vararg_full;
         }
         if (diverged) {
+            // Unrelated element classes widen to their least upper bound
+            // (`listOf(ResponseInt(10), NoResponse, ResponseString("foo"))`
+            // is a `List<I>` over the sealed interface); `Any` only when no
+            // common class exists.
             elem_owned.?.deinit(b.allocator);
-            elem_owned = .{ .name = try b.allocator.dupe(u8, "Any"), .nullable = saw_null, .args = &.{} };
+            const lub = leastUpperBoundOfHeads(b, heads_buf[0..nheads]) orelse "Any";
+            elem_owned = .{ .name = try b.allocator.dupe(u8, lub), .nullable = saw_null, .args = &.{} };
         } else if (saw_null) {
             elem_owned.?.nullable = true;
         }
@@ -631,6 +642,41 @@ fn scalarOverloadUnproven(b: *FuncBuilder, call: anytype, target: FuncId) Alloca
         return !isPrimitiveTypeName(typeHead(std.mem.trimEnd(u8, t.name, "?")));
     }
     return true;
+}
+
+/// The nearest class every head is or extends, walking the first head's
+/// supertype chain outward (breadth first); null when no class short of
+/// `Any` is common to all of them.
+fn leastUpperBoundOfHeads(b: *const FuncBuilder, heads: []const []const u8) ?[]const u8 {
+    if (heads.len < 2) return null;
+    var queue: [64]ir.ClassId = undefined;
+    var qlen: usize = 0;
+    var qhead: usize = 0;
+    const first = b.module.classIdByFqn(heads[0]) orelse b.module.classId(heads[0]) orelse return null;
+    queue[qlen] = first;
+    qlen += 1;
+    while (qhead < qlen) : (qhead += 1) {
+        const cid = queue[qhead];
+        if (cid.int() >= b.module.classes.items.len) continue;
+        const cls = &b.module.classes.items[cid.int()];
+        var all = true;
+        for (heads[1..]) |h| {
+            if (!(std.mem.eql(u8, h, cls.name) or std.mem.eql(u8, h, cls.fqn) or
+                b.module.classIsOrExtends(h, cls.fqn) or b.module.classIsOrExtends(h, cls.name)))
+            {
+                all = false;
+                break;
+            }
+        }
+        if (all) return cls.fqn;
+        for (cls.supertypes) |sup| {
+            if (qlen < queue.len) {
+                queue[qlen] = sup;
+                qlen += 1;
+            }
+        }
+    }
+    return null;
 }
 
 pub fn staticCallReturnTypeRef(
