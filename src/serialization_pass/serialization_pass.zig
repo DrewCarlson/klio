@@ -952,10 +952,18 @@ fn genClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c: *co
 /// The primitive fast path (`encodeIntElement` / `decodeStringElement`)
 /// applies only to a plainly-typed element: a custom or contextual
 /// serializer on the property routes through the serializer instead.
-fn elemPrim(e: *const Elem) Prim {
+fn elemPrim(g: *const Gen, e: *const Elem) Prim {
     if (e.ty.nullable) return .none;
     if (serializableWith(std.heap.page_allocator, e.annotations) != null) return .none;
     if (hasAnnotation(e.annotations, "Contextual") or hasAnnotation(e.annotations, "Polymorphic")) return .none;
+    // A file-level `@file:UseSerializers` / `@file:UseContextualSerialization`
+    // serializer for this element's type routes through that serializer, so a
+    // primitive-typed element (`nonNullable: Int`) must NOT take the primitive
+    // element codec that would ignore it.
+    if (g.file) |fs| {
+        const head = simpleHead(e.ty.name.name);
+        if (fs.use_serializers.get(head) != null or fs.contextual.contains(head)) return .none;
+    }
     return primOf(simpleHead(e.ty.name.name));
 }
 
@@ -1003,7 +1011,7 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
     try wp(w, a, "    override fun serialize(encoder: Encoder, value: {s}) {{\n", .{self_ty});
     try w.appendSlice(a, "        val `$d` = descriptor\n        val `$out` = encoder.beginStructure(`$d`)\n");
     for (elems, 0..) |*e, i| {
-        const p = elemPrim(e);
+        const p = elemPrim(g, e);
         const enc = if (p != .none)
             try std.fmt.allocPrint(a, "`$out`.encode{s}Element(`$d`, {d}, value.{s})", .{ primSuffix(p), i, e.name })
         else if (e.ty.nullable)
@@ -1031,7 +1039,7 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
         while (mi < n_masks) : (mi += 1) try wp(w, a, "        var `$seen{d}` = 0\n", .{mi});
     }
     for (elems, 0..) |*e, i| {
-        const p = elemPrim(e);
+        const p = elemPrim(g, e);
         if (p != .none) {
             try wp(w, a, "        var `$v{d}`: {s} = {s}\n", .{ i, primSuffix(p), primZero(p) });
         } else {
@@ -1043,7 +1051,7 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
     // Per-element decode statements (shared by the sequential and looped paths).
     var dec_stmts: std.ArrayList([]const u8) = .empty;
     for (elems, 0..) |*e, i| {
-        const p = elemPrim(e);
+        const p = elemPrim(g, e);
         // Bit 31 and a full golden mask overflow a Kotlin Int literal;
         // both are spelled as the signed value the `and` sees.
         const bit: i32 = @bitCast(@as(u32, 1) << @intCast(i % 32));
@@ -1201,7 +1209,7 @@ fn genValueClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c
     const e = &elems[0];
     const gn = try genNameFor(a, info);
     const serial = try serialNameOf(a, info);
-    const p = elemPrim(e);
+    const p = elemPrim(g, e);
     const tps = try typeParamList(a, c);
     const self_ty = try std.fmt.allocPrint(a, "{s}{s}", .{ info.path, tps });
     // A generic value class (`value class MyList<T>(val list: List<T>)`)
