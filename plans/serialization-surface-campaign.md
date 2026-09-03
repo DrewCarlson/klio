@@ -660,3 +660,36 @@ KLIO_CENSUS_ERRS):
   (`cast to Map failed`), PolymorphicOnClassesTest / PolymorphicSealedChildTest /
   ObjectSerializationTest / JsonProhibitedPolymorphicKindsTest (`exception`) /
   JsonNamesTest / JsonEnumsCaseInsensitiveTest testTopLevelList,testDocSample.
+
+Round (2026-09-03 cont., file-level UseSerializers): json **695 -> 697 / 744**
+(floor 695). Two landed roots, both in serialization_pass.zig:
+- `@file:UseSerializers` serializer for a PRIMITIVE-typed element was recorded
+  in childSerializers but the generated serialize/deserialize took the
+  primitive element codec (`encodeIntElement`) and ignored it. `elemPrim` now
+  yields when the file-level policy names a serializer for the head, so the
+  element routes through `encodeSerializableElement`
+  (NotNullSerializersCompatibilityOnFileTest.testFileLevel).
+- Nullable-target distinction: `KSerializer<Int?>` vs `KSerializer<Int>` both
+  keyed a bare `Int`, so a nullable property picked whichever registered last.
+  `serializerTargetHead` now reports the target's nullability;
+  `use_serializers_nullable` holds `KSerializer<T?>` serializers; a nullable
+  property whose type matches binds it DIRECTLY (serializer handles null), not
+  a `.nullable` wrap (SerializationForNullableTypeOnFileTest.testFileLevel).
+
+Deferred roots now precisely diagnosed:
+- `@Serializer(forClass = X::class)` serializer objects have NO `KSerializer<X>`
+  supertype, so `serializerTargetHead` cannot find their target head; a
+  `@file:UseSerializers` listing such an object is not applied
+  (UseSerializersTest.testOnFile: `a:IntHolder` gets IntHolder's default
+  serializer -> 21, not the file's MultiplyingIntHolderSerializer -> 84). Fix =
+  read the `@Serializer(forClass=)` annotation for the target when no
+  KSerializer supertype is present.
+- JsonMapKeysTest (3) is NOT a serialization bug: `mapOf(k to 1)` flowing into
+  a `Map<_, Long>` parameter keeps the literal `1` as Int (decoded side is
+  correctly Long), so the boxed `Int(1) != Long(1)` and the map compares
+  unequal. Root = expected-type propagation of an integer literal to Long
+  through `to`/`mapOf`/the constructor (a general numeric-literal-typing gap).
+- The `{}`-empty family is reified `serializer()` whose T is inferred
+  TRANSITIVELY through a generic helper's type parameter
+  (`testPair(pairInstance, kSer, serializer(), ...)` with V bound by
+  `pairInstance`'s type) — deeper than the direct-sibling case already fixed.
