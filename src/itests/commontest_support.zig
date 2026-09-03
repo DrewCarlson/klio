@@ -590,7 +590,12 @@ pub const suites = [_]Config{
             "tests/compose_ui_commontest_actuals/androidx/kruth/Kruth.kt",
         },
         .timeout_ms = 120_000,
-        .baseline = 0,
+        // 2026-09-03 census: 451 / 452 (1 failed, 0 did not complete). The
+        // lone failure is ShadowTest.testLerp — a pack-image overload
+        // resolution that picks the same-package Color `lerp` for a Float
+        // argument; it does not reproduce from source. Floor holds the
+        // observed pass count.
+        .baseline = 451,
         .max_failed = null,
         .max_incomplete = null,
     },
