@@ -361,7 +361,11 @@ content-negotiation.
   not reachable by; and the reified splice emits a bare `LoadGlobal
   Local$lcmain` for the mangled local-class name. Fix: make the local
   class's synthesized serializer companion reachable via `$companion`
-  (and/or map the `$lc<fn>`-mangled reified name to `<Name>$serializer`).
+  (and/or map the `$lc<fn>`-mangled reified name to `<Name>$serializer`). A naive
+  fallback (invoke `serializer` straight on the class value when the
+  `$companion` lookup is null) makes `serializer<Local>()` resolve but
+  REGRESSES json 688->682 and core 138->132 — it fires for classes whose
+  null was correct. The fix must target local classes specifically.
   (b) GenericCustomSerializerTest — IndexOutOfBounds (Index 0, length 0)
   in a generated serializer. Both are distinct from the suite-only enum /
   streaming failures.
