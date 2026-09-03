@@ -981,14 +981,39 @@ pub fn gcUninstallFrameRoot() void {
 /// frame. The labels borrow program-lifetime module memory; only the frame
 /// slice is owned by the returned cell.
 fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
-    var n: usize = 0;
-    var cur = evtls.frame_chain;
-    while (cur) |f| : (cur = f.gc_link) n += 1;
-    if (n == 0) return null;
-    const frames = try allocator.alloc(runtime.StackFrame, n);
+    // The live call stack is the pushed frame chain (`frame_chain`) with the
+    // fully-fused activations (`fused_marks`) layered on top. A fused body
+    // never opens a Frame, so a trace built from `frame_chain` alone drops
+    // every fused call — and a small program that fuses end to end has NO
+    // pushed frames at all, so the trace comes out empty. Each fused mark
+    // records the `frame_chain` head it sits on; interleave them
+    // innermost-first (a higher `fused_marks` index is more inner, and a mark
+    // is more inner than the frame it is fused onto).
+    var frame_n: usize = 0;
+    {
+        var cur = evtls.frame_chain;
+        while (cur) |f| : (cur = f.gc_link) frame_n += 1;
+    }
+    const total = fused_depth + frame_n;
+    if (total == 0) return null;
+    const frames = try allocator.alloc(runtime.StackFrame, total);
+    errdefer allocator.free(frames);
     var i: usize = 0;
-    cur = evtls.frame_chain;
-    while (cur) |f| : (cur = f.gc_link) {
+    var fi: usize = fused_depth;
+    var fr = evtls.frame_chain;
+    while (true) {
+        while (fi > 0 and fused_marks[fi - 1].head == fr) {
+            const mk = &fused_marks[fi - 1];
+            const label = if (mk.func.fqn.len != 0) mk.func.fqn else mk.func.name;
+            if (mk.span) |sp| {
+                frames[i] = .{ .fqn = label, .file_id = @intFromEnum(sp.file), .offset = sp.start, .has_pos = true };
+            } else {
+                frames[i] = .{ .fqn = label, .file_id = 0, .offset = 0, .has_pos = false };
+            }
+            i += 1;
+            fi -= 1;
+        }
+        const f = fr orelse break;
         const label = if (f.func.fqn.len != 0) f.func.fqn else f.func.name;
         if (f.cur_span) |sp| {
             frames[i] = .{ .fqn = label, .file_id = @intFromEnum(sp.file), .offset = sp.start, .has_pos = true };
@@ -996,6 +1021,13 @@ fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
             frames[i] = .{ .fqn = label, .file_id = 0, .offset = 0, .has_pos = false };
         }
         i += 1;
+        fr = f.gc_link;
+    }
+    // Every fused mark's head is a live frame (or null), so the walk emits all
+    // of them and `i == total`; shrink defensively if a mark was ever skipped.
+    if (i != total) {
+        const shrunk = try allocator.realloc(frames, i);
+        return try runtime.StackRef.init(allocator, .{ .frames = shrunk });
     }
     return try runtime.StackRef.init(allocator, .{ .frames = frames });
 }
