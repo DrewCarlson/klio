@@ -20663,6 +20663,14 @@ fn lowerResolvedExtensionCall(
         );
         defer if (inline_lambda_param_types) |types|
             deinitArgLambdaParamTypes(b.allocator, types);
+        // The splice binds its lambda arguments by expanding their bodies,
+        // not through `lowerArgRun`, so the `-> Unit` mask that typing set
+        // on `pending_arg_lambda_unit` has no consumer on this path. Clear
+        // it now: left set, it dangles into any call lowered inside the
+        // spliced body (a nested `accept { }` predicate) and is mistaken
+        // there for that call's own mask, coercing the lambda to Unit.
+        if (b.pending_arg_lambda_unit) |m| b.allocator.free(m);
+        b.pending_arg_lambda_unit = null;
         b.pending_arg_lambda_param_types = inline_lambda_param_types;
         defer b.pending_arg_lambda_param_types = null;
         // Engine step four: solve the callee's bindings ONCE (receiver +
