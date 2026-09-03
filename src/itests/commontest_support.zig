@@ -491,10 +491,10 @@ pub const suites = [_]Config{
         },
         .extra_args = &.{ "--feature", "kotlinx.serialization/json" },
         .timeout_ms = 120_000,
-        // 2026-09-03 census: 695 / 744 (47 failed, 2 did not complete);
+        // 2026-09-03 census: 697 / 744 (45 failed, 2 did not complete);
         // the floor keeps a small did-not-complete margin below the
         // observed count.
-        .baseline = 693,
+        .baseline = 695,
         .max_failed = null,
         .max_incomplete = null,
     },
