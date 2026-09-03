@@ -70,6 +70,34 @@ null), ShadowTest.testLerp (lerp picks the wrong overload only in the
 multi-file suite), SizeTest.testSpecifiedSizeToString (value-class
 toString structural in the baked image). Ratchet the floor once these
 close.
+
+Round 3 (2026-09-03): three of the four closed by root fixes, floor
+ratcheted to 451.
+- SizeTest.testSpecifiedSizeToString: a @JvmInline value class carries an
+  EMPTY runtime ClassDef.methods list (its members live only in the module
+  member index), so has_user_override (builtin_members.zig) answered false
+  for Size's own toString and the auto-generated structural form
+  ("Size(packedValue=...)") preempted it. has_user_override now also
+  consults module.memberDecls(fqn, name). Reproduced in run mode. Also
+  moved json 688 -> 690.
+- ColorSpaceTest.testConnect / testIdentityConnector: an object expression
+  extending a class through a SECONDARY constructor
+  (`object : Connector(source, source, intent)` -> Connector's 3-arg
+  `this(...)`) padded the 3 secondary args to the 6-arg primary width with
+  defaults, so Connector.renderIntent (primary param 5) was null. The
+  anonymous-instance path now runs expandParentSecondaryThisArgs before
+  padParentCtorDefaults. Reproduced minimally: `object : Base(a,b,c)` on a
+  class with a secondary ctor loses the delegated property (named subclass
+  and direct secondary call both worked).
+- ShadowTest.testLerp REMAINS: `lerp(Float,Float,Float)` inside the pack
+  image's Shadow.lerp mis-resolves to the same-package
+  `lerp(Color,Color,Float)` (which does `.value`), yielding "get_field
+  value on kotlin.Float". IMAGE-ONLY — every source repro (two-file
+  package, value-class receiver, Float property arg) resolves correctly.
+  Needs the pack-build lowering context.
+Censuses held across all three fixes: core 138, ktor 450, json 690,
+parity_object_init 32/36 (the 4 pre-existing construction-frame stack-trace
+failures, untouched).
 Before that the family was guarded by
 five example byte-gates only — no upstream test suite ran. The
 census-gap lesson (perf batteries skipped libraries; example gates hid
