@@ -8428,6 +8428,16 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (b.resolve(nm0) != null and !b.isLocalFn(nm0) and !b.isLocalExtFn(nm0) and
             b.module.classIdIndexed(nm0, b.self_package, callee.Path.segments[0].span.file) == null and
             chain_fns.len == 0 and
+            // Only redirect to a global when a global function/builder of this
+            // name actually exists to receive the call. Without this guard a
+            // local whose DECLARED type reads as non-invokable — a receiver
+            // lambda's value parameter mis-typed as its own receiver class
+            // (`{ block -> block(7) }` bound to `Cls.((Int) -> Unit) -> Unit`,
+            // where the receiver leaks into `block`'s type) — emitted a
+            // `LoadGlobal` for a name no global carries and failed at runtime
+            // with "unresolved global". The local IS the callee: fall through
+            // to the value-invocation path.
+            b.module.hasBareCallCandidate(nm0, callee.Path.segments[0].span.file) and
             localValueNotInvokable(b, nm0))
         {
             const gv = b.allocReg();
