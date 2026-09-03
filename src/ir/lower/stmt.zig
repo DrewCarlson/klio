@@ -239,6 +239,16 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
     } else switch (p.init != null) {
         true => blk: {
             const e = &p.init.?;
+            // The declared type is the initializer's expectation, through
+            // generic factories too (`val m: Map<String, Long> = mapOf("a" to 1)`
+            // makes the `1` a `Long`).
+            if (p.ty) |*ty| {
+                if (expr_mod.loweredOwnedLocalTypeRef(b, ty)) |lt| {
+                    var owned = lt;
+                    defer owned.deinit(b.allocator);
+                    expr_mod.applyExpectedLiteralKinds(b, @constCast(e), owned);
+                } else |_| {}
+            }
             const widened: ?Expr = if (p.ty) |*ty| widenNumericLiteral(e, ty) else null;
             // A type-annotated initializer puts its declared type in
             // tail position so a reified inline call (`val u: User =

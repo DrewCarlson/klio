@@ -1672,6 +1672,14 @@ pub fn memberNameIdentity(self: *VmHost, name: []const u8) ?usize {
 }
 
 pub fn hostHasMember(self: *VmHost, receiver: *const Value, name: []const u8) bool {
+    // A CLASS receiver's members live on its companion (or object
+    // singleton): `X.serializer()` is a member call there, never a call of
+    // some same-named local value.
+    if (receiver.* == .Class) {
+        const comp = (host_fields.companionOfClassValue(self, receiver) catch null) orelse return false;
+        if (comp == .Null) return false;
+        return hostHasMember(self, &comp, name);
+    }
     if (receiver.* != .Instance) return false;
     const name_p = memberNameIdentity(self, name) orelse return hostHasMemberUncached(self, receiver, name);
     const key: root_mod.ProgramImage.MemberHasKey = .{

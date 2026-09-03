@@ -661,7 +661,24 @@ pub fn initLocalParentChain(
         defer g.deinit();
         break :blk if (g.get().parent) |p| p.clone() else null;
     };
-    if (cur_def == null) return null;
+    // A builtin throwable parent (`class MyException : Exception("...")`) has
+    // no ClassDef; its constructor arguments still bind `message`/`cause`.
+    const builtin_throwable_parent = blk: {
+        if (cur_def != null) break :blk false;
+        const g = cls.borrow();
+        defer g.deinit();
+        for (g.get().supertype_names) |sn| {
+            const simple = if (std.mem.lastIndexOfScalar(u8, sn, '.')) |d| sn[d + 1 ..] else sn;
+            if (isBuiltinThrowableName(simple)) break :blk true;
+        }
+        break :blk false;
+    };
+    if (runtime.envOnce("KLIO_INIT_DEBUG") != null) {
+        const g = cls.borrow();
+        defer g.deinit();
+        std.debug.print("[init-debug] local parent chain {s}: parent={} builtin_throwable={} supers={d}\n", .{ cls_name, cur_def != null, builtin_throwable_parent, g.get().supertype_names.len });
+    }
+    if (cur_def == null and !builtin_throwable_parent) return null;
     // Leaf-level super args via the anon `$super$arg$<i>` thunks.
     var cur_args: std.ArrayList(Value) = .empty;
     defer cur_args.deinit(allocator);
@@ -683,6 +700,21 @@ pub fn initLocalParentChain(
                 .err => |e| return e,
             }
         }
+    }
+    if (runtime.envOnce("KLIO_INIT_DEBUG") != null) std.debug.print("[init-debug] local parent chain {s}: super args evaluated={d}\n", .{ cls_name, cur_args.items.len });
+    if (builtin_throwable_parent) {
+        try bindThrowableArgs(self, inst, cur_args.items, true);
+        return null;
+    }
+    // The parent may be the stdlib's own `Exception`/`Throwable` class def,
+    // whose message and cause are bound by name rather than by primary
+    // parameters.
+    if (cur_def) |pd| {
+        const pg = pd.borrow();
+        const pn = pg.get().name;
+        pg.deinit();
+        const simple = if (std.mem.lastIndexOfScalar(u8, pn, '.')) |d| pn[d + 1 ..] else pn;
+        if (isBuiltinThrowableName(simple)) try bindThrowableArgs(self, inst, cur_args.items, true);
     }
     while (cur_def) |pd| {
         defer pd.deinit();
@@ -4868,6 +4900,10 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     defer super_args_by_class.deinit();
     var direct_parent: ?ObjRef(ClassDef) = null;
     defer if (direct_parent) |p| p.deinit();
+    // A builtin throwable base (`class MyException : Exception("...")`) has
+    // no ClassDef to run a constructor chain through; its arguments bind the
+    // instance's `message`/`cause` once the instance exists.
+    var throwable_args: ?[]const Value = null;
     for (supertypes, 0..) |*sup, idx| {
         const arg_exprs = if (idx < supertype_args.len) (supertype_args[idx] orelse continue) else continue;
         var vals = try allocator.alloc(Value, arg_exprs.len);
@@ -4889,6 +4925,10 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             break :blk if (idx < cg.get().supertype_names.len) cg.get().supertype_names[idx] else sup.name.name;
         };
         const parent_def = classDefByName(self, resolved_name);
+        if (parent_def == null) {
+            const simple = if (std.mem.lastIndexOfScalar(u8, resolved_name, '.')) |d| resolved_name[d + 1 ..] else resolved_name;
+            if (isBuiltinThrowableName(simple)) throwable_args = vals;
+        }
         if (parent_def) |pdef| {
             defer pdef.deinit();
             var ordered = std.ArrayList(Value).fromOwnedSlice(vals);
@@ -4960,6 +5000,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         .anon_captures = anon_caps,
         .anon_enclosing = anon_enclosing,
     });
+    if (throwable_args) |ta| try bindThrowableArgs(self, inst, ta, true);
     const inst_value: Value = .{ .Instance = inst.clone() };
 
     // Run the concrete superclass chain's body-property initializers.

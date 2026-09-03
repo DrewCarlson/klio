@@ -149,6 +149,11 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
                 try w.print("        [DYN member '{s}']", .{constStr(m, c.name)});
             }
         },
+        .CallMemberOrValue => |c| {
+            try w.print("r{d} <- CallMemberOrValue r{d}.'{s}' fallback=r{d} ", .{ reg(c.dst), reg(c.receiver), constStr(m, c.name), reg(c.fallback) });
+            try argRun(w, c.args, c.n_args);
+            try w.print("        [DYN member-or-value '{s}']", .{constStr(m, c.name)});
+        },
         .CallVirtual => |c| {
             try w.print("r{d} <- CallVirtual slot#{d} r{d} ", .{ reg(c.dst), c.slot.int(), reg(c.receiver) });
             try argRun(w, c.args, c.n_args);
