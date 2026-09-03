@@ -2547,6 +2547,29 @@ fn classSimpleName(name: []const u8) []const u8 {
     return n;
 }
 
+/// The companion object (or object singleton) a CLASS value carries its
+/// static members on: `X.serializer()` dispatches there. Null when the
+/// class has neither.
+pub fn companionOfClassValue(self: *VmHost, cls_val: *const Value) Allocator.Error!?Value {
+    if (cls_val.* != .Class) return null;
+    const g = cls_val.Class.borrow();
+    defer g.deinit();
+    const cd = g.get();
+    if (cd.is_object) {
+        return switch (try host_globals.ensureObjectSingleton(self, cd.name)) {
+            .ok => |maybe| maybe,
+            .err => null,
+        };
+    }
+    if (try companionInstanceForDef(self, cd.fqn, cd.name)) |v| return v;
+    if (try companionInstanceForClass(self, cd.name)) |v| return v;
+    var cbuf: [192]u8 = undefined;
+    if (std.fmt.bufPrint(&cbuf, "$companion:{s}", .{cd.name}) catch null) |ck| {
+        if (host_globals.lookupGlobal(self, ck)) |v| return v;
+    }
+    return null;
+}
+
 fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?EvalResult {
     const cls = receiver.Class;
     const g = cls.borrow();

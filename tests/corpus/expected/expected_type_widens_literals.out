@@ -1,0 +1,3 @@
+local=true map=true list=true pair=true
+param=42
+ctor=true equal=true

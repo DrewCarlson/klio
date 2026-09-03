@@ -5411,6 +5411,7 @@ fn argLambdaParamTypes(
     type_args: []const ast.TypeRef,
     recv_offset: usize,
 ) Allocator.Error!?[]?[]ir.TypeRef {
+    applyExpectedLiteralKindsToArgs(b, func, args, arg_names, recv_offset);
     return argLambdaParamTypesRecv(b, func, args, arg_names, type_args, recv_offset, null);
 }
 
@@ -8829,6 +8830,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (try lowerImplicitThisCall(b, callee, args, ast_arg_names, call.type_args)) |r| return r;
         }
         if (ctor_cid) |class_id| {
+            applyExpectedLiteralKindsToCtorArgs(b, class_id, args, ast_arg_names);
             const ctor_arity = try ctorArgFnArities(b, class_id, args, ast_arg_names);
             defer if (ctor_arity) |ca| b.allocator.free(ca);
             // P12's shape-repair contract for constructor calls: the compose
@@ -16267,6 +16269,7 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
     if (b.module.funcById(func_id)) |f| {
         const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, recv_off);
+        applyExpectedLiteralKindsToArgs(b, f, args, ast_arg_names, recv_off);
     }
 
     const needs_this = blk: {
@@ -17089,6 +17092,126 @@ pub fn valueClassCtorTypeRef(b: *FuncBuilder, e: *const Expr) ?ir.TypeRef {
     const cls = &b.module.classes.items[cid.int()];
     if (!cls.is_value or cls.type_params.len != 0) return null;
     return .{ .name = b.allocator.dupe(u8, cls.fqn) catch return null, .nullable = false, .args = &.{} };
+}
+
+/// Kotlin types an integer literal by its EXPECTED type: `1` under a `Long`
+/// parameter is a `Long`, and the expectation flows through a generic
+/// factory (`mapOf("a" to 1)` under `Map<String, Long>` makes the `1` a
+/// `Long` via `mapOf`'s `V` and `to`'s `B`). The literal node's kind is
+/// rewritten in place before lowering; nothing else changes.
+pub fn applyExpectedLiteralKinds(b: *FuncBuilder, e: *ast.Expr, expected: ir.TypeRef) void {
+    const head = typeHead(std.mem.trimEnd(u8, expected.name, "?"));
+    switch (e.*) {
+        .IntLit => |*lit| {
+            if (lit.kind == .Int and std.mem.eql(u8, head, "Long")) lit.kind = .Long;
+        },
+        .Unary => |*u| applyExpectedLiteralKinds(b, u.expr, expected),
+        .Call => |*c| applyExpectedToGenericCall(b, c, expected),
+        else => {},
+    }
+}
+
+fn applyExpectedToGenericCall(b: *FuncBuilder, c: anytype, expected: ir.TypeRef) void {
+    if (c.type_args.len != 0) return;
+    if (expected.args.len == 0) return;
+    const name: []const u8 = switch (c.callee.*) {
+        .Path => |p| if (p.segments.len == 1) p.segments[0].name else return,
+        .Member => |m| m.name.name,
+        else => return,
+    };
+    // An infix call (`"a" to 1`) parses as `to(lhs, rhs)`: the first
+    // argument is the extension receiver.
+    const infix = c.is_infix and c.callee.* == .Path and c.args.len == 2;
+    const receiver: ?*ast.Expr = if (c.callee.* == .Member) c.callee.Member.receiver else if (infix) &c.args[0] else null;
+    const value_args: []ast.Expr = if (infix) c.args[1..] else c.args;
+    var scratch = std.heap.ArenaAllocator.init(b.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    // A generic class constructor (`Pair(1, 2)` under `Pair<Long, Long>`).
+    if (receiver == null) ctor: {
+        const cid = b.module.classIdIndexed(name, b.self_package, c.callee.Path.segments[0].span.file) orelse
+            b.module.classId(name) orelse break :ctor;
+        if (cid.int() >= b.module.classes.items.len) break :ctor;
+        const cls = &b.module.classes.items[cid.int()];
+        if (cls.type_params.len == 0 or cls.type_params.len != expected.args.len) break :ctor;
+        if (b.module.funcsBySimpleName(name).len != 0) break :ctor;
+        var bindings: std.ArrayList(ir.Module.TypeBinding) = .empty;
+        for (cls.type_params, expected.args) |tp, ea| {
+            bindings.append(a, .{ .name = tp, .ty = ea }) catch return;
+        }
+        for (cls.primary_params, 0..) |pp, i| {
+            if (i >= c.args.len) break;
+            const sub = ir.Module.substituteBoundType(a, pp.ty, bindings.items) catch continue;
+            applyExpectedLiteralKinds(b, &c.args[i], sub);
+        }
+        return;
+    }
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        const ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
+        if (ext != (receiver != null)) continue;
+        const ro: usize = if (ext) 1 else 0;
+        const value_params = f.params.len - ro;
+        const has_va = f.params.len != 0 and f.params[f.params.len - 1].is_vararg;
+        if (!(value_params == value_args.len or (has_va and value_args.len + 1 >= value_params))) continue;
+        const tps = b.module.registry.func_type_params.get(fid) orelse continue;
+        if (tps.items.len == 0) continue;
+        var bindings: std.ArrayList(ir.Module.TypeBinding) = .empty;
+        positionalBind(a, f.return_ty, expected, tps.items, &bindings) catch continue;
+        if (bindings.items.len == 0) continue;
+        if (receiver) |r| {
+            const sub = ir.Module.substituteBoundType(a, f.params[0].ty, bindings.items) catch continue;
+            applyExpectedLiteralKinds(b, r, sub);
+        }
+        for (value_args, 0..) |*arg, i| {
+            const pi = ro + i;
+            const pt: ir.TypeRef = if (pi < f.params.len)
+                (if (f.params[pi].is_vararg) applicability.varargElementRef(&f.params[pi].ty) else f.params[pi].ty)
+            else if (has_va)
+                applicability.varargElementRef(&f.params[f.params.len - 1].ty)
+            else
+                continue;
+            const sub = ir.Module.substituteBoundType(a, pt, bindings.items) catch continue;
+            applyExpectedLiteralKinds(b, arg, sub);
+        }
+        return;
+    }
+}
+
+/// Rewrite integer literals in a call's arguments by the callee's declared
+/// parameter types (the expectation Kotlin applies), skipping parameters
+/// that still mention the callee's own type parameters.
+pub fn applyExpectedLiteralKindsToArgs(b: *FuncBuilder, f: *const ir.Func, args: []const Expr, ast_arg_names: []const ?[]const u8, recv_off: usize) void {
+    for (ast_arg_names) |n| {
+        if (n != null) return;
+    }
+    const own_tps: []const []const u8 = if (b.module.registry.func_type_params.get(f.id)) |l| l.items else &.{};
+    for (args, 0..) |*arg, i| {
+        const pi = recv_off + i;
+        if (pi >= f.params.len) return;
+        const p = f.params[pi];
+        if (p.is_vararg) return;
+        if (irTypeMentionsAny(p.ty, own_tps) or bareTypeParamHead(p.ty.name)) continue;
+        applyExpectedLiteralKinds(b, @constCast(arg), p.ty);
+    }
+}
+
+/// The constructor counterpart of `applyExpectedLiteralKindsToArgs`: the
+/// class's primary parameter types are the expectation
+/// (`WithValueKeyMap(mapOf(k to 1))` under `map: Map<K, Long>`).
+fn applyExpectedLiteralKindsToCtorArgs(b: *FuncBuilder, class_id: ir.ClassId, args: []const Expr, ast_arg_names: []const ?[]const u8) void {
+    for (ast_arg_names) |n| {
+        if (n != null) return;
+    }
+    if (class_id.int() >= b.module.classes.items.len) return;
+    const cls = &b.module.classes.items[class_id.int()];
+    for (args, 0..) |*arg, i| {
+        if (i >= cls.primary_params.len) return;
+        const p = cls.primary_params[i];
+        if (p.is_vararg) return;
+        if (irTypeMentionsAny(p.ty, cls.type_params) or bareTypeParamHead(p.ty.name)) continue;
+        applyExpectedLiteralKinds(b, @constCast(arg), p.ty);
+    }
 }
 
 fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr) ?SibSolved {

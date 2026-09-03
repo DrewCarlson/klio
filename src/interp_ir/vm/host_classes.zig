@@ -1095,6 +1095,7 @@ pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Clas
             const tbl = self.anon_methods.borrowMut();
             defer tbl.deinit();
             try tbl.get().put(try anonKey(allocator, class.name.name, thunk_name.name), .{ .module = sub_ref, .func = func.id, .captures = &.{} });
+            if (runtime.envOnce("KLIO_INIT_DEBUG") != null) std.debug.print("[init-debug] registered {s} for {s}\n", .{ thunk_name.name, class.name.name });
         }
         break;
     }
