@@ -1,0 +1,2 @@
+{"response":{"type":"ApiError"}} -> true
+{"response":{"type":"ApiResponse","message":"OK"}} -> true

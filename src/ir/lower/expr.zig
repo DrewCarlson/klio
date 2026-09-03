@@ -18032,6 +18032,10 @@ fn lowerImplicitThisCall(
         // the previous hand-rolled loop had, dropping local-variable args).
         const args_start = b.allocReg();
         b.pending_arg_broad_masks = itc_broad;
+        if (b.module.funcById(fid)) |pf| {
+            const recv_off: usize = if (pf.params.len != 0 and std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0;
+            try recordLambdaArgReceivers(b, pf, args, ast_arg_names, ast_type_args, recv_off);
+        }
         const priv_arity: ?[]const i16 = if (b.module.funcById(fid)) |pf|
             (try argFnArities(b, pf, args, ast_arg_names, if (pf.params.len != 0 and std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0))
         else
