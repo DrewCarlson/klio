@@ -380,7 +380,16 @@ content-negotiation.
   the mangled string (`makeKTypeValue("Local$lcmain")`), so
   serializerOrNull gets a synthetic KClass with the mangled name and its
   `$companion` lookup misses. The KType classifier must resolve the local
-  class (strip `$lc` when building the KType's KClass).
+  class (strip `$lc` when building the KType's KClass). THREE-part fix landed
+  (LoadGlobal `$lc` strip + `$companion` published-global fallback + KType
+  `$lc` strip): a SINGLE local `@Serializable` class now serializes reified
+  end to end (`serializer<Local>()` and `Json.encodeToString(localValue)`
+  round-trip; verified), core 138 / json 688 unchanged. LocalClassesTest
+  still fails on a SUITE-only `unresolved global Local$serializerImpl` — it
+  does NOT reproduce with same-named locals across functions or class
+  methods (those pass); it needs the full JsonTestBase + the file's
+  object/custom-serializer locals. Remaining root: the `$serializerImpl`
+  factory reference in the multi-local-class suite context.
   (b) GenericCustomSerializerTest — IndexOutOfBounds (Index 0, length 0)
   in a generated serializer. Both are distinct from the suite-only enum /
   streaming failures.
