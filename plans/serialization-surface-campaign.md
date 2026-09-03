@@ -374,7 +374,13 @@ content-negotiation.
   (fails). `Local.serializer()` works because the source name resolves.
   Fix candidates: register the local class under its mangled name too, or
   have the member-receiver class classification strip / resolve the
-  `$lc<fn>` mangle to the class-table entry.
+  `$lc<fn>` mangle to the class-table entry. PARTIAL fix landed: the
+  LoadGlobal miss path strips `$lc` and retries (so the mangled name
+  resolves the local class). Remaining: the reified KType classifier keeps
+  the mangled string (`makeKTypeValue("Local$lcmain")`), so
+  serializerOrNull gets a synthetic KClass with the mangled name and its
+  `$companion` lookup misses. The KType classifier must resolve the local
+  class (strip `$lc` when building the KType's KClass).
   (b) GenericCustomSerializerTest — IndexOutOfBounds (Index 0, length 0)
   in a generated serializer. Both are distinct from the suite-only enum /
   streaming failures.
