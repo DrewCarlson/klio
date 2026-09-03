@@ -12242,6 +12242,27 @@ fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         result.nullable = result.nullable or b.localDeclNullable(p.segments[0].name);
         return result;
     }
+    // A bare implicit-`this` property read: the name is the enclosing class's
+    // own `val`, not a local (`assertEquals(expected, decode(…))` where
+    // `expected` is a class-level property whose static type a sibling-driven
+    // reified inference needs). Resolve it against the receiver's own property
+    // table and QUALIFY a nested-class head through the enclosing scope so a
+    // reified `serializer<T>()` binds `Outer$Nested`, not a bare unresolvable
+    // name. A local would have won above.
+    {
+        const rhead: ?[]const u8 = if (b.recvTypeRef()) |rt|
+            typeHead(std.mem.trimEnd(u8, rt.name, "?"))
+        else
+            b.ownerClass() orelse b.enclosingRecvTy();
+        if (rhead) |rh| {
+            if (b.module.registry.class_prop_type_heads.get(.{ .a = rh, .b = p.segments[0].name })) |head| {
+                if (head.len != 0 and !b.isTypeParam(head)) {
+                    const qualified = scopeTypeRenameFrom(b, rh, head, p.segments[0].span.file.int()) orelse head;
+                    return .{ .name = qualified, .nullable = false, .args = &.{} };
+                }
+            }
+        }
+    }
     if (b.localInitExpr(p.segments[0].name)) |init| {
         // Following a local's initializer can re-enter this local. Kotlin has
         // no such cycle — a local cannot be initialized from one declared

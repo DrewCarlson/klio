@@ -1453,7 +1453,7 @@ fn propHeadSourceExpr(prop: *const ast.Property) ?*const ast.Expr {
 /// this file set (`val Traversable get() = NodeKind<T>(mask)` -> `NodeKind`).
 /// Only a name that IS a declared class counts — a same-shaped factory call
 /// may return a different type, so an unknown callee proves nothing.
-fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, module: *const ir.Module) ?[]const u8 {
+fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, module: *const ir.Module, enclosing: ?*const ast.Class) ?[]const u8 {
     const src = propHeadSourceExpr(prop) orelse return null;
     if (src.* != .Call) return null;
     const callee = src.Call.callee;
@@ -1469,6 +1469,15 @@ fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, modu
         // A class registered elsewhere (a pack's `Json { }` builder names
         // its type exactly as its constructor would).
         if (module.classId(nm) != null) return nm;
+        // A NESTED class of the enclosing class named exactly as its
+        // constructor (`val expected = MF(...)` where `MF` is nested in the
+        // property's own class): report the simple head; the reader qualifies
+        // it through the enclosing scope (`Outer$MF`).
+        if (enclosing) |ec| {
+            for (ec.members) |*m| {
+                if (m.* == .Class and std.mem.eql(u8, m.Class.name.name, nm)) return nm;
+            }
+        }
         return null;
     }
     // A FACTORY call names its type just as a constructor does, as long as
@@ -2245,7 +2254,7 @@ fn buildModuleWithOverrides(
                         try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
                         try notePropTypeRef(a, module, c, prop.name.name, ty);
                     }
-                } else if (propCtorHeadEvidence(prop, decls, module)) |head| {
+                } else if (propCtorHeadEvidence(prop, decls, module, c)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
                 } else if (prop.init != null and memberSizedInitHead(c, &prop.init.?) != null) {
                     try module.registry.class_prop_type_heads.put(
@@ -2311,7 +2320,7 @@ fn buildModuleWithOverrides(
                     } else if (cprop.init) |*init| {
                         if (literalTypeHead(init)) |head| {
                             try module.registry.class_prop_type_heads.put(.{ .a = ckey, .b = cprop.name.name }, head);
-                        } else if (propCtorHeadEvidence(cprop, decls, module)) |head| {
+                        } else if (propCtorHeadEvidence(cprop, decls, module, c)) |head| {
                             // `val iso = LongParser(MAX_MILLIS, allowSign = true)`
                             // inside LongParser's own companion states the head
                             // exactly as a top-level object's would.
@@ -2327,7 +2336,7 @@ fn buildModuleWithOverrides(
                 const prop = m.Property;
                 if (prop.ty) |*ty| {
                     try module.registry.class_prop_type_heads.put(.{ .a = o.name.name, .b = prop.name.name }, ty.qualified_path orelse ty.name.name);
-                } else if (propCtorHeadEvidence(prop, decls, module)) |head| {
+                } else if (propCtorHeadEvidence(prop, decls, module, null)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = o.name.name, .b = prop.name.name }, head);
                 }
             }
