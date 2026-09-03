@@ -803,7 +803,10 @@ fn evalParentCtorThunk(
 fn simpleLiteral(allocator: Allocator, e: *const ast.Expr) Allocator.Error!?Value {
     switch (e.*) {
         .IntLit => |l| return Value.newInt(l.value),
-        .FloatLit => |l| return Value{ .Double = l.value },
+        .FloatLit => |l| return if (l.kind == .Float)
+            Value{ .Float = @floatCast(l.value) }
+        else
+            Value{ .Double = l.value },
         .BoolLit => |l| return Value{ .Bool = l.value },
         .NullLit => return Value.Null,
         .CharLit => |l| return Value{ .Char = l.value },

@@ -10,6 +10,8 @@ actual fun floatFromBits(bits: Int): Float = Float.fromBits(bits)
 
 actual fun doubleFromBits(bits: Long): Double = Double.fromBits(bits)
 
-actual fun Float.fastRoundToInt(): Int = roundToInt()
+// Match Math.round semantics used by the upstream JVM/native actual:
+// NaN rounds to 0 rather than throwing (roundToInt throws on NaN).
+actual fun Float.fastRoundToInt(): Int = if (isNaN()) 0 else roundToInt()
 
-actual fun Double.fastRoundToInt(): Int = roundToInt()
+actual fun Double.fastRoundToInt(): Int = if (isNaN()) 0 else roundToInt()
