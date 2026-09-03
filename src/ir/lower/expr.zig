@@ -3549,6 +3549,13 @@ fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // at `return block()` the stack holds [apply, restore]; replaying
             // both would apply the snapshot twice.
             try replayFinallysForJump(b, ar.finally_base);
+            // Also pop the CATCH-ONLY try frames opened inside this inline body:
+            // the jump to the join bypasses their `catch_done` exit, so without
+            // this the catch stays armed over the code after the inlined call
+            // (`parseString("double") { toDouble() }` then rejecting NaN).
+            const catch_pops = try b.catchBodiesFrom(ar.catch_base);
+            defer b.allocator.free(catch_pops);
+            try b.appendPopOnExit(b.cur, catch_pops);
             b.terminate(.{ .Goto = ar.join });
             const dead = try b.allocBlock();
             b.switchTo(dead);
@@ -3641,7 +3648,12 @@ fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (finally_done) |done| b.setFinallyDoneFor(cur_id, done);
     if (finally_entry == null and t.catches.len != 0) b.setCatchDoneFor(cur_id, exit);
     if (t.finally) |blk| try b.pushFinally(blk, cur_id);
+    // A catch-only try (no finally) needs its body tracked so an inline
+    // `return` inside it pops the runtime catch frame on the way to its join.
+    const catch_only = finally_entry == null and t.catches.len != 0;
+    if (catch_only) try b.pushCatchBody(cur_id);
     const body_val = try lowerBlock(b, &t.body);
+    if (catch_only) b.popCatchBody();
     try b.push(.{ .Move = .{ .dst = result, .src = body_val } });
     if (finally_entry) |fin| {
         b.terminate(.{ .Goto = fin });

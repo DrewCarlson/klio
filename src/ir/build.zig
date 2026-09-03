@@ -85,6 +85,10 @@ pub const InlineReturn = struct {
     /// not run here (else a nested inline `try/finally` inside another
     /// inline `try/finally` runs the outer finally twice).
     finally_base: usize = 0,
+    /// Depth of `catch_body_stack` when this inline frame was pushed: a
+    /// `return` targeting it pops only the catch-only `TryFrame`s opened
+    /// inside it.
+    catch_base: usize = 0,
     /// Name of the inline function whose body this frame splices, so a
     /// `return@thatName` written in the body — including inside a lambda
     /// spliced from a NESTED inline call (`accept { … }.otherwise {
@@ -786,6 +790,12 @@ pub const FuncBuilder = struct {
     /// try each finally belongs to, so an inline `return` can pop exactly
     /// those runtime `TryFrame`s when it jumps to its join.
     finally_body_stack: std.ArrayList(BlockId) = .empty,
+    /// The body-entry block of each CATCH-ONLY try region currently enclosing
+    /// (a try with catches and no finally). An inline `return` jumping to its
+    /// join bypasses the try's normal `catch_done` exit, so it must pop these
+    /// runtime `TryFrame`s too — else the catch stays armed over code that
+    /// runs after the inlined call.
+    catch_body_stack: std.ArrayList(BlockId) = .empty,
     /// The splice-resolve window (and hidden-band depth) active when each
     /// finally was PUSHED. A finally body replayed at a jump site re-lowers
     /// under whatever window is active THERE — but its names belong to the
@@ -1144,6 +1154,7 @@ pub const FuncBuilder = struct {
         self.implicit_receiver_tower.deinit(a);
         self.finally_stack.deinit(a);
         self.finally_body_stack.deinit(a);
+        self.catch_body_stack.deinit(a);
         self.finally_window_stack.deinit(a);
         self.inline_return.deinit(a);
         self.inline_stack.deinit(a);
@@ -1204,7 +1215,7 @@ pub const FuncBuilder = struct {
         return self.inline_return.items[self.inline_return.items.len - 1];
     }
     pub fn pushInlineReturn(self: *FuncBuilder, r: Reg, join: BlockId, label: ?[]const u8) Allocator.Error!void {
-        try self.inline_return.append(self.allocator, .{ .reg = r, .join = join, .finally_base = self.finally_stack.items.len, .label = label });
+        try self.inline_return.append(self.allocator, .{ .reg = r, .join = join, .finally_base = self.finally_stack.items.len, .catch_base = self.catch_body_stack.items.len, .label = label });
     }
     /// Innermost active inline body-splice frame whose function name is
     /// `label`. Consulted after `inlineLambdaRetFor` misses: a labeled
@@ -2844,6 +2855,29 @@ pub const FuncBuilder = struct {
         const items = self.finally_body_stack.items;
         const start = @min(from, items.len);
         return self.allocator.dupe(BlockId, items[start..]);
+    }
+    pub fn pushCatchBody(self: *FuncBuilder, body_entry: BlockId) Allocator.Error!void {
+        try self.catch_body_stack.append(self.allocator, body_entry);
+    }
+    pub fn popCatchBody(self: *FuncBuilder) void {
+        _ = self.catch_body_stack.pop();
+    }
+    /// The catch-only try body-entry ids opened since `from`, for an inline
+    /// `return` to pop their `TryFrame`s as it jumps to its join.
+    pub fn catchBodiesFrom(self: *const FuncBuilder, from: usize) Allocator.Error![]BlockId {
+        const items = self.catch_body_stack.items;
+        const start = @min(from, items.len);
+        return self.allocator.dupe(BlockId, items[start..]);
+    }
+    /// Append `bodies` to a block's `pop_on_exit` list (concatenating with any
+    /// already recorded there, e.g. the finally-region bodies).
+    pub fn appendPopOnExit(self: *FuncBuilder, block: BlockId, bodies: []const BlockId) Allocator.Error!void {
+        if (bodies.len == 0) return;
+        const existing = self.blocks.items[block.int()].pop_on_exit;
+        const merged = try self.allocator.alloc(BlockId, existing.len + bodies.len);
+        @memcpy(merged[0..existing.len], existing);
+        @memcpy(merged[existing.len..], bodies);
+        self.blocks.items[block.int()].pop_on_exit = merged;
     }
     /// Record on `block` the try-region body-entry ids whose `TryFrame` the
     /// runtime pops when the block exits via `Goto` (see `Block.pop_on_exit`).
