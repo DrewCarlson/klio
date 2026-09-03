@@ -6,7 +6,7 @@ modules' commonTest: 46 files) via scripts/init-compose-submodule.sh,
 (roots for ui-util/ui-geometry/ui-unit/ui-graphics/ui-text/ui, the ui
 packs, a klio-authored `androidx.kruth` assertion stand-in under
 tests/compose_ui_commontest_actuals), `zig build itest-compose_ui_commontest`
-and `klio-census compose_ui` wired. FIRST COUNT: 389 passed, 63 failed; AFTER ROUND 1: 446 passed, 6 failed
+and `klio-census compose_ui` wired. FIRST COUNT: 389 passed, 63 failed; AFTER ROUND 2: 448 passed, 4 failed
 across 42 files, 0 did not complete (baseline 0). Failures by module:
 ui-graphics 38 (RenderEffectTest 12, MatrixTest 9, PathParserTest 7,
 ShadowParamsTest 6, ColorSpaceTest 2, ShadowTest 1, InlineClassHelperTest
@@ -60,6 +60,16 @@ structurally in the baked IMAGE path though it is correct in run mode
 -- the runtime `class_fqn` is empty for a value-class instance so the
 qualified `hierarchy_methods` key is not consulted; OPEN),
 InlineClassHelperTest 1. Ratchet the floor once these 6 close.
+
+Round 2: InlineClassHelperTest fastRoundNaNToInt (NaN-round actual guards
+NaN -> 0) and ShadowTest.defaultValue (constructor Float default stored as
+Float via FloatLitKind in simpleLiteral) fixed -> 448/4. Remaining 4 are
+SUITE / IMAGE-only (do not reproduce standalone): ColorSpaceTest
+testConnect / testIdentityConnector (Connector renderIntent value-class
+null), ShadowTest.testLerp (lerp picks the wrong overload only in the
+multi-file suite), SizeTest.testSpecifiedSizeToString (value-class
+toString structural in the baked image). Ratchet the floor once these
+close.
 Before that the family was guarded by
 five example byte-gates only — no upstream test suite ran. The
 census-gap lesson (perf batteries skipped libraries; example gates hid
