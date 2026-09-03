@@ -25,6 +25,7 @@ include = [
     "kotlinx/serialization/Annotations.kt",
     "kotlinx/serialization/ApiLevels.kt",
     "kotlinx/serialization/builtins/BuiltinSerializers.kt",
+    "kotlinx/serialization/builtins/InstantComponentSerializer.kt",
     "kotlinx/serialization/builtins/LongAsStringSerializer.kt",
     "kotlinx/serialization/ContextualSerializer.kt",
     "kotlinx/serialization/KSerializer.kt",

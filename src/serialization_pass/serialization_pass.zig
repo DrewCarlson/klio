@@ -655,6 +655,11 @@ const Gen = struct {
             return self.contextualSerializerExpr(t);
         }
         if (hasAnnotation(annotations, "Polymorphic")) {
+            // `@Polymorphic val value: V` on a TYPE PARAMETER: the plugin
+            // builds the polymorphic serializer over the parameter's bound —
+            // `Any` — which is also the base the caller's module registers
+            // under; the parameter itself is no runtime classifier.
+            if (self.typeParamIndex(head) != null) return "PolymorphicSerializer(Any::class)";
             return std.fmt.allocPrint(a, "PolymorphicSerializer({s}::class)", .{try self.qualifyTy(t)});
         }
         if (self.typeParamIndex(head)) |i| {
@@ -741,6 +746,11 @@ const Gen = struct {
     fn customSerializerRef(self: *const Gen, t: ?*const ast.TypeRef, w: []const u8) Allocator.Error![]const u8 {
         const q = try self.qualify(w);
         if (self.idx.objects.contains(q) or self.idx.objects.contains(w) or self.idx.objects.contains(simpleHead(w))) return q;
+        // A serializer the index does not declare at all lives in a pack
+        // (`InstantComponentSerializer`, `LongAsStringSerializer`, …): the
+        // library's builtin serializers are objects, referenced by name.
+        if (!self.idx.class_nodes.contains(q) and !self.idx.class_nodes.contains(w) and
+            !self.idx.class_nodes.contains(simpleHead(w))) return q;
         // A generic serializer CLASS named on a PROPERTY takes the annotated
         // type's own type-argument serializers, exactly as the plugin builds
         // it (`@Serializable(with = CheckedDataSerializer::class) CheckedData<Int>`
@@ -1379,12 +1389,42 @@ fn collectSealedLeaves(a: Allocator, idx: *const Index, parent_path: []const u8,
     for (subs) |sub| {
         if (seen.contains(sub.path)) continue;
         try seen.put(sub.path, {});
-        const si = idx.by_path.get(sub.path) orelse continue;
+        const si = idx.by_path.get(sub.path) orelse {
+            // An enum implementing the sealed interface is serializable
+            // without `@Serializable` (the plugin builds its serializer in
+            // place) and is a leaf of the hierarchy like any other subclass.
+            if (idx.class_nodes.get(sub.path)) |cn| {
+                if (cn.is_enum) try out.append(a, sub.path);
+            }
+            continue;
+        };
         switch (si.kind) {
             .sealed, .interface_sealed, .polymorphic => try collectSealedLeaves(a, idx, si.path, out, seen),
             else => try out.append(a, sub.path),
         }
     }
+}
+
+/// The serial name of a sealed leaf: its `@SerialName`, else the qualified
+/// class name under the declaring package — for the enum leaves that carry
+/// no `Info` (no `@Serializable`), the same rule `serialNameOf` applies.
+fn leafSerialName(a: Allocator, idx: *const Index, pkg: []const u8, path: []const u8) Allocator.Error![]const u8 {
+    if (idx.by_path.get(path)) |li| return serialNameOf(a, &li);
+    if (idx.class_nodes.get(path)) |cn| {
+        if (findAnnotation(cn.annotations, "SerialName")) |an| {
+            if (annotationStringArg(an)) |sn| return sn;
+        }
+    }
+    if (pkg.len == 0) return path;
+    return std.fmt.allocPrint(a, "{s}.{s}", .{ pkg, path });
+}
+
+/// Whether a sealed leaf path names an enum that carries no `Info`
+/// (serializable without `@Serializable`).
+fn leafIsPlainEnum(idx: *const Index, path: []const u8) bool {
+    if (idx.by_path.get(path) != null) return false;
+    const cn = idx.class_nodes.get(path) orelse return false;
+    return cn.is_enum;
 }
 
 fn genSealedFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, info: *const Info) Allocator.Error!void {
@@ -1393,6 +1433,21 @@ fn genSealedFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, info
     var leaves: std.ArrayList([]const u8) = .empty;
     var seen = std.StringHashMap(void).init(a);
     try collectSealedLeaves(a, idx, info.path, &leaves, &seen);
+    // The descriptor lists subclasses ordered by serial name, as the plugin
+    // does (`[E, X, Y]` for leaves declared X, Y, E).
+    {
+        const Ctx2 = struct {
+            a: Allocator,
+            idx: *const Index,
+            pkg: []const u8,
+            fn less(self: @This(), x: []const u8, y: []const u8) bool {
+                const sx = leafSerialName(self.a, self.idx, self.pkg, x) catch x;
+                const sy = leafSerialName(self.a, self.idx, self.pkg, y) catch y;
+                return std.mem.lessThan(u8, sx, sy);
+            }
+        };
+        std.sort.pdq([]const u8, leaves.items, Ctx2{ .a = a, .idx = idx, .pkg = info.pkg }, Ctx2.less);
+    }
     const subs: []const []const u8 = leaves.items;
     try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ SealedClassSerializer(\"{s}\", {s}::class, arrayOf<KClass<out {s}>>(", .{ gn, info.path, serial, info.path, info.path });
     for (subs, 0..) |sp, n| {
@@ -1406,7 +1461,9 @@ fn genSealedFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, info
         // serializer: each binds the polymorphic `Any` serializer, as the
         // plugin emits.
         const leaf_tps: usize = if (idx.by_path.get(sp)) |li| li.type_params else 0;
-        if (leaf_tps == 0) {
+        if (leafIsPlainEnum(idx, sp)) {
+            try wp(w, a, "createSimpleEnumSerializer(\"{s}\", {s}.values())", .{ try leafSerialName(a, idx, info.pkg, sp), sp });
+        } else if (leaf_tps == 0) {
             try wp(w, a, "{s}.serializer()", .{sp});
         } else {
             try wp(w, a, "{s}.serializer(", .{sp});
@@ -1730,7 +1787,16 @@ fn snippetPadded(ctx: *Ctx, text: []const u8) Allocator.Error![]const u8 {
 /// body's scope, so nothing at file level could name it. The record is
 /// not entered into the index — two functions may declare same-named
 /// locals, and no other declaration can reference a local class.
-fn processFunctionLocals(ctx: *Ctx, f: *ast.Function) Allocator.Error!void {
+/// A local class's qualification scope: the enclosing function's owner path
+/// under the local's own name, so a type it references resolves against the
+/// enclosing class's nested declarations too (`List<E>` inside a local
+/// `Outer` of a method of `T` reaches the enum `T.E`).
+fn localScopePath(a: Allocator, outer: []const u8, local_name: []const u8) Allocator.Error![]const u8 {
+    if (outer.len == 0) return local_name;
+    return std.fmt.allocPrint(a, "{s}.{s}", .{ outer, local_name });
+}
+
+fn processFunctionLocals(ctx: *Ctx, f: *ast.Function, outer: []const u8) Allocator.Error!void {
     const dbg = std.c.getenv("KLIO_SERIAL_DUMP") != null;
     if (dbg) std.debug.print("[serial-pass] fn {s} body={s}\n", .{ f.name.name, if (f.body) |b| @tagName(std.meta.activeTag(b)) else "none" });
     const body = f.body orelse return;
@@ -1747,23 +1813,34 @@ fn processFunctionLocals(ctx: *Ctx, f: *ast.Function) Allocator.Error!void {
                 const info = classInfo(ctx.idx, c, c.name.name, ctx.pkg);
                 var tps: std.ArrayList([]const u8) = .empty;
                 for (c.type_params) |*tp| try tps.append(ctx.a, tp.name.name);
-                const g = Gen{ .a = ctx.a, .idx = ctx.idx, .pkg = ctx.pkg, .type_params = tps.items, .scope_path = c.name.name, .file = &ctx.settings };
+                const g = Gen{ .a = ctx.a, .idx = ctx.idx, .pkg = ctx.pkg, .type_params = tps.items, .scope_path = try localScopePath(ctx.a, outer, c.name.name), .file = &ctx.settings };
                 var local_gen: std.ArrayList(u8) = .empty;
                 switch (info.kind) {
                     .class => try genClassSerializer(&local_gen, ctx.a, &g, c, &info),
                     .value_class => try genValueClassSerializer(&local_gen, ctx.a, &g, c, &info),
                     .enum_class => try genEnumFactory(&local_gen, ctx.a, ctx.idx, c, &info),
-                    .with_custom => try genWithFactory(&local_gen, ctx.a, &g, &info),
+                    // A local `@Serializable(with = X::class)` class: the
+                    // top-level-style `val Cache` / `fun Impl()` artifacts
+                    // would land as INSTANCE members of the class, which its
+                    // companion's `serializer()` cannot reach; the companion
+                    // names the custom serializer directly instead.
+                    .with_custom => {},
                     .sealed, .interface_sealed, .polymorphic, .object => continue,
                 }
                 ctx.generated_any = true;
-                const artifacts = try snippetPadded(ctx, local_gen.items);
-                if (dbg) std.debug.print("[serial-pass] local artifacts for {s}:\n{s}\n", .{ c.name.name, local_gen.items });
-                if (parseSnippet(ctx.a, ctx.file.span.file, artifacts)) |snip_val| {
-                    if (dbg) std.debug.print("[serial-pass] local artifacts parsed: {d} decls\n", .{snip_val.decls.len});
-                    try appendMembers(ctx.a, &c.members, snip_val.decls);
-                } else if (dbg) std.debug.print("[serial-pass] local artifacts FAILED to parse\n", .{});
-                const splice_src = try snippetPadded(ctx, try genMemberSplice(ctx.a, c, &info, null));
+                if (local_gen.items.len != 0) {
+                    const artifacts = try snippetPadded(ctx, local_gen.items);
+                    if (dbg) std.debug.print("[serial-pass] local artifacts for {s}:\n{s}\n", .{ c.name.name, local_gen.items });
+                    if (parseSnippet(ctx.a, ctx.file.span.file, artifacts)) |snip_val| {
+                        if (dbg) std.debug.print("[serial-pass] local artifacts parsed: {d} decls\n", .{snip_val.decls.len});
+                        try appendMembers(ctx.a, &c.members, snip_val.decls);
+                    } else if (dbg) std.debug.print("[serial-pass] local artifacts FAILED to parse\n", .{});
+                }
+                const splice_text: []const u8 = if (info.kind == .with_custom)
+                    try std.fmt.allocPrint(ctx.a, "class {s} {{ companion object {{ fun serializer(): KSerializer<{s}> = {s} }} }}", .{ c.name.name, c.name.name, try g.customSerializerRef(null, info.with.?) })
+                else
+                    try genMemberSplice(ctx.a, c, &info, null);
+                const splice_src = try snippetPadded(ctx, splice_text);
                 if (parseSnippet(ctx.a, ctx.file.span.file, splice_src)) |snip_val| {
                     var snip = snip_val;
                     try spliceInto(ctx.a, &c.members, false, &snip);
@@ -1842,7 +1919,7 @@ fn processDecls(ctx: *Ctx, decls: []ast.Decl, outer: []const u8) Allocator.Error
                     try spliceInto(ctx.a, &c.members, false, &snip);
                 }
             },
-            .Function => |*f| try processFunctionLocals(ctx, f),
+            .Function => |*f| try processFunctionLocals(ctx, f, outer),
             .Object => |*o| {
                 const path = joinPath(ctx.a, outer, o.name.name);
                 try processDecls(ctx, o.members, path);
