@@ -326,7 +326,7 @@ test "server: routing, params, headers, status codes, and typed JSON" {
 
     // POST typed JSON through ContentNegotiation -> 201 application/json.
     {
-        const req = try buildRequest(a, "POST", "/users", &.{}, "{\"id\":7,\"name\":\"Ada\"}");
+        const req = try buildRequest(a, "POST", "/users", &.{.{ "Content-Type", "application/json" }}, "{\"id\":7,\"name\":\"Ada\"}");
         const resp = try httpRequest(a, io, port, req);
         try std.testing.expectEqual(@as(?u16, 201), statusOf(resp));
         try std.testing.expectEqualStrings("application/json", headerOf(resp, "Content-Type") orelse "");
