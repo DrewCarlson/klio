@@ -1,0 +1,3 @@
+{"nullable":null,"nonNullable":"foo"}
+{"nullable":"foo","nonNullable":"bar"}
+Holder(nullable=Payload(text=foo), nonNullable=Payload(text=bar))

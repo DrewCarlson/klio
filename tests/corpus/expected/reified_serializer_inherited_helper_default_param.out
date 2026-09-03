@@ -1,0 +1,10 @@
+{"1":2} matches {"1":2}
+true
+{"1":2} matches {"1":2}
+true
+[{"type":"Num","i":10},{"type":"Silence"}] matches [{"type":"Num","i":10},{"type":"Silence"}]
+true
+{"first":42,"second":{"first":"a","second":"b"}} matches {"first":42,"second":{"first":"a","second":"b"}}
+true
+{"first":42,"second":{"first":"a","second":"b"}} matches {"first":42,"second":{"first":"a","second":"b"}}
+true
