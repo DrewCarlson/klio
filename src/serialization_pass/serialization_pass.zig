@@ -477,8 +477,13 @@ fn primZero(p: Prim) []const u8 {
 const FileSettings = struct {
     /// Type heads listed in `@file:UseContextualSerialization(...)`.
     contextual: std.StringHashMap(void),
-    /// Type head -> serializer reference path from `@file:UseSerializers(...)`.
+    /// Type head -> serializer reference path from `@file:UseSerializers(...)`
+    /// whose target type is NON-nullable (`KSerializer<Int>`).
     use_serializers: std.StringHashMap([]const u8),
+    /// Type head -> serializer path whose target type is NULLABLE
+    /// (`KSerializer<Int?>`): the serializer handles null itself, so a
+    /// nullable property of that head binds it directly, not `.nullable`.
+    use_serializers_nullable: std.StringHashMap([]const u8),
 };
 
 const Gen = struct {
@@ -554,7 +559,21 @@ const Gen = struct {
 
     /// The serializer expression for a type, honoring the property's own
     /// annotations (`@Serializable(with=)`, `@Contextual`, `@Polymorphic`).
+    /// A `@file:UseSerializers` serializer whose target type is the element's
+    /// type spelled nullable (`KSerializer<Int?>` for an `Int?` property):
+    /// the serializer handles null itself, so it binds DIRECTLY rather than
+    /// through a `.nullable` wrapper of a non-nullable serializer.
+    fn nullableTargetRef(self: *const Gen, t: *const ast.TypeRef, annotations: []const ast.Annotation) Allocator.Error!?[]const u8 {
+        if (!t.nullable) return null;
+        if (serializableWith(self.a, annotations) != null) return null;
+        if (hasAnnotation(annotations, "Contextual") or hasAnnotation(annotations, "Polymorphic")) return null;
+        const fs = self.file orelse return null;
+        const ser = fs.use_serializers_nullable.get(simpleHead(t.name.name)) orelse return null;
+        return try self.customSerializerRef(ser);
+    }
+
     fn serializerExpr(self: *const Gen, t: *const ast.TypeRef, annotations: []const ast.Annotation) Allocator.Error![]const u8 {
+        if (try self.nullableTargetRef(t, annotations)) |ref| return ref;
         const base = try self.serializerExprNonNull(t, annotations);
         if (t.nullable) return std.fmt.allocPrint(self.a, "({s}).nullable", .{base});
         return base;
@@ -1014,9 +1033,11 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
         const p = elemPrim(g, e);
         const enc = if (p != .none)
             try std.fmt.allocPrint(a, "`$out`.encode{s}Element(`$d`, {d}, value.{s})", .{ primSuffix(p), i, e.name })
-        else if (e.ty.nullable)
-            try std.fmt.allocPrint(a, "`$out`.encodeNullableSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, try g.serializerExprNonNull(e.ty, e.annotations), e.name })
-        else
+        else if (e.ty.nullable) blk: {
+            if (try g.nullableTargetRef(e.ty, e.annotations)) |ref|
+                break :blk try std.fmt.allocPrint(a, "`$out`.encodeSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, ref, e.name });
+            break :blk try std.fmt.allocPrint(a, "`$out`.encodeNullableSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, try g.serializerExprNonNull(e.ty, e.annotations), e.name });
+        } else
             try std.fmt.allocPrint(a, "`$out`.encodeSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, try g.serializerExpr(e.ty, e.annotations), e.name });
         if (elemOptional(e) and e.encode_default != .always) {
             const dflt = e.default_text.?;
@@ -1058,9 +1079,11 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
         const mk = i / 32;
         const st = if (p != .none)
             try std.fmt.allocPrint(a, "`$v{d}` = `$c`.decode{s}Element(`$d`, {d}); `$seen{d}` = `$seen{d}` or {d}", .{ i, primSuffix(p), i, mk, mk, bit })
-        else if (e.ty.nullable)
-            try std.fmt.allocPrint(a, "`$v{d}` = `$c`.decodeNullableSerializableElement(`$d`, {d}, {s}, `$v{d}`); `$seen{d}` = `$seen{d}` or {d}", .{ i, i, try g.serializerExprNonNull(e.ty, e.annotations), i, mk, mk, bit })
-        else
+        else if (e.ty.nullable) blk: {
+            if (try g.nullableTargetRef(e.ty, e.annotations)) |ref|
+                break :blk try std.fmt.allocPrint(a, "`$v{d}` = `$c`.decodeSerializableElement(`$d`, {d}, {s}, `$v{d}`); `$seen{d}` = `$seen{d}` or {d}", .{ i, i, ref, i, mk, mk, bit });
+            break :blk try std.fmt.allocPrint(a, "`$v{d}` = `$c`.decodeNullableSerializableElement(`$d`, {d}, {s}, `$v{d}`); `$seen{d}` = `$seen{d}` or {d}", .{ i, i, try g.serializerExprNonNull(e.ty, e.annotations), i, mk, mk, bit });
+        } else
             try std.fmt.allocPrint(a, "`$v{d}` = `$c`.decodeSerializableElement(`$d`, {d}, {s}, `$v{d}`); `$seen{d}` = `$seen{d}` or {d}", .{ i, i, try g.serializerExpr(e.ty, e.annotations), i, mk, mk, bit });
         try dec_stmts.append(a, st);
     }
@@ -1603,18 +1626,20 @@ const Ctx = struct {
 
 /// The type a serializer declaration serializes: its `KSerializer<T>`
 /// supertype argument head, resolved through the index.
-fn serializerTargetHead(idx: *const Index, ser_path: []const u8) ?[]const u8 {
+const SerTarget = struct { head: []const u8, nullable: bool };
+
+fn serializerTargetHead(idx: *const Index, ser_path: []const u8) ?SerTarget {
     const sups = idx.super_refs.get(ser_path) orelse return null;
     for (sups) |*st| {
         if (!std.mem.eql(u8, simpleHead(st.name.name), "KSerializer")) continue;
         if (st.type_args.len == 0 or st.type_args[0].is_star) continue;
-        return simpleHead(st.type_args[0].ty.name.name);
+        return .{ .head = simpleHead(st.type_args[0].ty.name.name), .nullable = st.type_args[0].ty.nullable };
     }
     return null;
 }
 
 fn fileSettings(a: Allocator, idx: *const Index, f: *const ast.KotlinFile) Allocator.Error!FileSettings {
-    var fs = FileSettings{ .contextual = std.StringHashMap(void).init(a), .use_serializers = std.StringHashMap([]const u8).init(a) };
+    var fs = FileSettings{ .contextual = std.StringHashMap(void).init(a), .use_serializers = std.StringHashMap([]const u8).init(a), .use_serializers_nullable = std.StringHashMap([]const u8).init(a) };
     for (f.file_annotations) |*an| {
         const n = annotationSimpleName(an);
         if (std.mem.eql(u8, n, "UseContextualSerialization")) {
@@ -1632,7 +1657,12 @@ fn fileSettings(a: Allocator, idx: *const Index, f: *const ast.KotlinFile) Alloc
                     }
                     break :blk c;
                 };
-                if (serializerTargetHead(idx, ser_path)) |target| try fs.use_serializers.put(target, ser_path);
+                if (serializerTargetHead(idx, ser_path)) |target| {
+                    if (target.nullable)
+                        try fs.use_serializers_nullable.put(target.head, ser_path)
+                    else
+                        try fs.use_serializers.put(target.head, ser_path);
+                }
             }
         }
     }
