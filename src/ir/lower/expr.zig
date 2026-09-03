@@ -16464,7 +16464,7 @@ fn solveComparatorSiblingByName(
     };
     for (b.module.funcsBySimpleName(name)) |fid| {
         const f = b.module.funcById(fid) orelse continue;
-        if (!(f.params.len == args.len or (f.params.len > args.len and f.params.len - args.len <= 1))) continue;
+        if (!outerArityFits(f, args.len)) continue;
         const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         if (recv_off == 1) {
             const ah = actual_head orelse continue;
@@ -16724,7 +16724,7 @@ fn solveInstantiatedArgExpected(
     defer scratch.deinit();
     for (b.module.funcsBySimpleName(name)) |fid| {
         const f = b.module.funcById(fid) orelse continue;
-        if (!(f.params.len == args.len or (f.params.len > args.len and f.params.len - args.len <= 1))) continue;
+        if (!outerArityFits(f, args.len)) continue;
         const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         if (recv_off == 1) {
             const ah = actual_head orelse continue;
@@ -16986,6 +16986,23 @@ fn leastUpperBoundHead(b: *FuncBuilder, shapes: []const applicability.ArgShape) 
     return null;
 }
 
+/// Whether an outer candidate can take `nargs` written arguments: its
+/// receiver slot does not count (`JsonTestBase.assertJsonFormAndRestored`
+/// called bare inside a subclass), and missing trailing parameters must
+/// carry defaults (`json: Json = default`).
+fn outerArityFits(f: *const ir.Func, nargs: usize) bool {
+    const ro: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    const vp = f.params.len - ro;
+    if (vp == nargs) return true;
+    if (vp < nargs) return false;
+    if (vp - nargs <= 1) return true;
+    var i: usize = ro + nargs;
+    while (i < f.params.len) : (i += 1) {
+        if (!f.params[i].has_default) return false;
+    }
+    return true;
+}
+
 fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr) ?SibSolved {
     if (args.len == 0) return null;
     const outer_name: []const u8 = switch (callee.*) {
@@ -17009,7 +17026,7 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
     var outer: ?*const ir.Func = null;
     for (cand_fids) |fid| {
         const f = b.module.funcById(fid) orelse continue;
-        if (f.params.len == args.len or (f.params.len > args.len and f.params.len - args.len <= 1)) {
+        if (outerArityFits(f, args.len)) {
             outer = f;
             break;
         }
@@ -17043,7 +17060,7 @@ fn solveSiblingExpected(b: *FuncBuilder, callee: *const Expr, args: []const Expr
             var found = false;
             for (cand_fids) |fid2| {
                 const f2 = b.module.funcById(fid2) orelse continue;
-                if (!(f2.params.len == args.len or (f2.params.len > args.len and f2.params.len - args.len <= 1))) continue;
+                if (!outerArityFits(f2, args.len)) continue;
                 const ro2: usize = if (f2.params.len != 0 and std.mem.eql(u8, f2.params[0].name, "this")) 1 else 0;
                 const pj2 = ro2 + j;
                 if (pj2 >= f2.params.len) continue;
