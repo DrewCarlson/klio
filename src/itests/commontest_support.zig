@@ -57,6 +57,13 @@ pub const Config = struct {
     /// suite wall behind one child. The split child compiles the same
     /// closure and runs `--filter=Class.test`, so counting is unchanged.
     split_files: []const []const u8 = &.{},
+    /// One child per MODULE directory (the path up to `/src/commonTest`),
+    /// running every file of that directory in one process. For a suite
+    /// whose per-child cost is loading large packs (the compose ui modules:
+    /// ~23 s per child against sub-second tests), this trades 42 pack loads
+    /// for six. Pure unit-test modules only: classes must not share state
+    /// across files.
+    batch_dirs: bool = false,
     /// Extra environment for every child of this suite (name/value pairs):
     /// a measured compute-heavy test declares its per-test wall budget
     /// through `KLIO_TEST_WALL_CAP_FOR` here rather than tripping the
@@ -604,6 +611,7 @@ pub const suites = [_]Config{
         .extra_support = &.{
             "tests/compose_ui_commontest_actuals/androidx/kruth/Kruth.kt",
         },
+        .batch_dirs = true,
         .timeout_ms = 120_000,
         // 2026-09-03 census: 451 / 452 (1 failed, 0 did not complete). The
         // lone failure is ShadowTest.testLerp — a pack-image overload
@@ -678,7 +686,38 @@ pub fn runSuite(cfg: Config) !void {
     // Split-file children carry the longest tests — the suite wall — so they
     // go to the FRONT of the queue and start with the first free workers.
     var split_jobs: std.ArrayList([]const []const u8) = .empty;
+    if (cfg.batch_dirs) {
+        var group_index = std.StringHashMap(usize).init(a);
+        var group_files: std.ArrayList(std.ArrayList([]const u8)) = .empty;
+        for (targets.items) |target| {
+            const key: []const u8 = if (std.mem.indexOf(u8, target, "/src/commonTest")) |ix|
+                target[0 .. ix + "/src/commonTest".len]
+            else
+                std.fs.path.dirname(target) orelse target;
+            const gop = try group_index.getOrPut(key);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = group_files.items.len;
+                try group_files.append(a, .empty);
+            }
+            try group_files.items[gop.value_ptr.*].append(a, target);
+        }
+        for (group_files.items) |files| {
+            var argv: std.ArrayList([]const u8) = .empty;
+            try argv.append(a, klioBin(&env));
+            try argv.append(a, "test");
+            try argv.appendSlice(a, cfg.extra_args);
+            try argv.appendSlice(a, support.items);
+            try argv.appendSlice(a, files.items);
+            if (std.c.getenv("KLIO_CENSUS_ARGV") != null) {
+                std.debug.print("[census-argv]", .{});
+                for (argv.items) |arg| std.debug.print(" {s}", .{arg});
+                std.debug.print("\n", .{});
+            }
+            try jobs.append(a, try argv.toOwnedSlice(a));
+        }
+    }
     for (targets.items, 0..) |target, ti| {
+        if (cfg.batch_dirs) break;
         const split_this = blk: {
             for (cfg.split_files) |sf| {
                 if (std.mem.endsWith(u8, target, sf)) break :blk true;

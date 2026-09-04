@@ -213,3 +213,14 @@ recorded above with its fix.
 - Full battery green with the new gates in (`stack: wall=1285s rc=0`; the
   earlier red runs of this closeout took 1061–1094 s — the difference is
   attributed in the serialization plan's wall note).
+
+Wall note (battery-neutral). Timed at the battery's width (4 workers), the
+census waves were wave1 167 s (coroutines) and wave2 276 s — set by this
+suite, ahead of datetime's 183 s. Every compose_ui child cost ~23 s
+regardless of its test count (a one-test file took 23 s): the per-child
+pack load of the ui modules, 42 children over 4 workers ≈ 240 s. The suite
+now runs one child per ui module (`batch_dirs`: every file of a module's
+`commonTest` in one process — pure unit-test modules, no cross-file
+state): 452 / 0 in **39 s** (graphics 30 s, util 24 s, geometry 23 s, unit
+23 s), so wave2 is bounded by datetime again and the compose-ui census
+adds nothing to the battery wall.
