@@ -1076,3 +1076,20 @@ are module constants) and `newInstance` snapshots the taken heads into its
 own frame so a nested construction cannot rewrite them; secondary-ctor
 entries also own their name/head strings instead of slicing the
 declaration's AST. Six of six runs pass on the ReleaseFast harness.
+
+### Exit conditions (state at the final battery)
+
+- Real surface: the pack's `Json : StringFormat` over the `__klsx_json*`
+  intrinsics, `serializersModule`, `serializerOrNull(KType)` /
+  `getContextual`, and the builtin serializers are the upstream converters'
+  compile targets; unsupported shapes raise `SerializationException`.
+- json census: standing at zero — 747 passed, 0 failed, 0 incomplete,
+  baseline 747 with `max_failed = 0` and `max_incomplete = 0`; the two
+  compute-heavy files run as per-test children under a measured budget.
+- ktor shim swap: both serialization shims deleted, the vendored upstream
+  client/server converters compile against the pack,
+  `ExperimentalJsonConverter` settled on record; ktor e2e gates and census
+  green (450/0).
+- Full battery: `scripts/stack.sh` green, including the compose plugin gate
+  that the campaign's per-suite census list never ran and that carried the
+  regressions recorded in the two battery rounds above.

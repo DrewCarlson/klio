@@ -199,3 +199,17 @@ standing. All six ui modules' commonTest are censused in the one suite
 (`compose_ui_commontest`, 42 files), no host-bound exclusions were needed:
 every failure met on the way was an interpreter or pack-surface root and is
 recorded above with its fix.
+
+### Exit conditions (state at the final battery)
+
+- Sparse widening: `scripts/init-compose-submodule.sh` carries the six ui
+  modules' `commonTest` roots, reproducible from a fresh checkout.
+- Suites: one `compose_ui_commontest` suite over all six modules (42 files),
+  in the census registry and in `scripts/stack.sh`.
+- Counts: first count 448/4 → 451/1 → **452 / 0**, standing with baseline
+  452, `max_failed = 0`, `max_incomplete = 0`; no host-bound exclusions
+  were needed — every failure met was an interpreter or pack-surface root,
+  each recorded with its fix in the rounds above.
+- Full battery green with the new gates in (`stack: wall=1285s rc=0`; the
+  earlier red runs of this closeout took 1061–1094 s — the difference is
+  attributed in the serialization plan's wall note).
