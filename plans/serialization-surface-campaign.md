@@ -923,3 +923,61 @@ collided under the bare `Item` key and `show(b.offset)` picked the `String`
 overload): the flattened nested declaration's override yields `Board.Item`,
 the twin key holds it, and the receiver type of the producing member already
 carries the dotted name. Example: `examples/nested_namesake_property_types.kt`.
+
+### Round jc24 → jc25: the two did-not-complete files, and what hid behind them
+
+jc24: json **742 / 744, 0 failed, 2 did not complete** (all other suites at
+floor; compose_ui 452/0). The census could not name the two silent jobs, so
+it now does (`[census-hung]` for a runner error, `[census-nosummary]` with
+the child's stderr tail for a timeout or crash): `JsonHugeDataSerializationTest`
+and `JsonUnicodeTest`, both killed at the 120s cap.
+
+Behind the Unicode timeout were three REAL failures the whole-file timeout
+had hidden: `testUnicodeKeys`, `testUnicodeValues`, `testLongEscapeSequence`
+all failed in 30ms with `get_field UnicodeKeys$serializer` — the
+serialization pass generated no serializer for the FILE because
+`@SerialName("\"")` was written back into generated Kotlin as `"""` (the
+lexer hands the pass the unescaped literal). Root fix: every serial name
+the pass writes into generated source is re-escaped (`kq`: quote,
+backslash, dollar, control characters). Example:
+`examples/serial_name_needs_escaping.kt`.
+
+The timeouts themselves were three string-runtime roots, all quadratic:
+- Non-ASCII `s[i]` walked from byte 0 on every read (2.6k chars 24ms → 10.6k
+  chars 377ms). `StringData` now carries an atomic UTF-16/byte cursor and the
+  builtins resume from it (`utf16UnitAt`, `utf16IndexToByte`,
+  `byteToCharIndex`), walking BACKWARDS when the cursor is ahead (an escaper
+  reads `text[i]` then appends `text[last, i)`).
+- `substring`, `startsWith`, `regionMatches`-style builtins rescanned the
+  whole receiver for ASCII-ness (`asciiScan`) or converted it to UTF-16
+  (`utf16Units`) per call: 400 `substring` calls over an 80k-char ASCII
+  string took 1.7s. The receiver's cached header meta (`ascii`, `u16_len`)
+  now reaches the builtins through a per-thread receiver memo re-pointed at
+  every receiver extraction; `substring` slices bytes between exact
+  boundaries and `startsWith` compares bytes for surrogate-free prefixes.
+- `StringBuilder.appendRange(String, from, to)` converted BOTH the value and
+  the whole builder to UTF-16, concatenated, and re-encoded the builder
+  (1.64s for 400 small ranges over an 80k builder; the `memset` at the top
+  of the profile). It now appends the value's byte range through the
+  string's cursor.
+Measured: JSON decode of the Huge shape n=50/100/200/400 went from
+174/443/1350ms (super-linear) to 103/198/400/778ms (linear); the
+random-escape shape (300 strings) 7.1s → 5.5s with a flat interpreter-bound
+profile (`fromHexChar`, `repeat`, `Random`, `printQuoted`). `JsonUnicodeTest`
+completes 5/5 in 195s solo. Example: `examples/string_index_paths_unicode.kt`.
+
+Census shape: both files are `split_files` (each test its own child, queued
+first) and the json `timeout_ms` is 400s (datetime's precedent for its
+100s+ compute children), so the fast tests count regardless and the heavy
+ones count when they fit.
+
+The Huge file's remaining time was the okio mode, whose reader shim
+(`klioTest/json/StreamSupport.kt`, a `StringBuilder`-backed `okio.Buffer`)
+reads the JSON one code point at a time through `sb[pos++]` and `sb.length`
+— and `StringBuilder.get` re-encoded the WHOLE buffer to UTF-16 per call
+while `length` re-counted it (n=25/50/100 okio decode: 0.43s → 1.57s →
+5.3s). A builder now carries a reader-side memo (ASCII-ness, UTF-16 length,
+a UTF-16/byte cursor) keyed by its cell and buffer identity, invalidated by
+every mutating builtin (`sbMut`) and by construction; `get`/`length` are
+O(1) on ASCII buffers and cursor-walked otherwise. okio decode: 0.16s →
+0.31s → 0.62s (linear). Example: `examples/stringbuilder_index_paths.kt`.

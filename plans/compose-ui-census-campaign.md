@@ -172,19 +172,15 @@ Round (2026-09-03, status): compose_ui census STANDING at **451 / 1** (floor
 451), all six ui modules censused in one suite. Serialization-pass changes
 this day (file-level UseSerializers) verified NEUTRAL here (451/1 unchanged).
 
-Sole remaining failure — ShadowTest.testLerp (ui-graphics):
-`Vm::get_field value on kotlin.Float`. `lerp(radiusA, radiusB, t)` with three
-Float args mis-dispatches to `lerp(Color, Color, Float)` (Color is a value
-class over `ULong value`), so it reads `radiusA.value` on a Float. The file
-imports three `lerp` overloads across packages
-(`androidx.compose.ui.util.lerp` for Float, `...geometry.lerp` for Offset,
-and the graphics-package Color `lerp`) plus `Shadow.lerp`. An ISOLATED repro
-(value class with `.value` + a Float `lerp`, same file) resolves correctly, so
-the mis-pick is specific to CROSS-PACKAGE imported overloads: with Float args
-the ranking must select the exact `lerp(Float,Float,Float)`, not the Color
-value-class overload. Deferred as a dispatch-ranking change (core path,
-regression-risky; needs a cross-package repro and a full compose-battery
-re-verify) rather than risk it for one test.
+Sole remaining failure at that round — ShadowTest.testLerp (ui-graphics):
+`Vm::get_field value on kotlin.Float`. The earlier reading (a runtime
+ranking of cross-package `lerp` overloads) was wrong: the test's own four
+`lerp` sites are static `Call`s bound correctly; the failing frame is the
+PACK body of `graphics.lerp(Shadow, Shadow, Float)`, whose Offset `lerp`
+call bound `unit.lerp(DpOffset, DpOffset, Float)` because the argument
+shape of `start.offset` was `DpOffset` (simple-name property-head index
+collision with `graphics.shadow.Shadow`). Root-fixed in 54b6b501; see the
+section below.
 
 ### ShadowTest.testLerp root (compose_ui 451/1 → 452/0 expected at jc24)
 

@@ -57,6 +57,11 @@ pub const Config = struct {
     /// suite wall behind one child. The split child compiles the same
     /// closure and runs `--filter=Class.test`, so counting is unchanged.
     split_files: []const []const u8 = &.{},
+    /// Extra environment for every child of this suite (name/value pairs):
+    /// a measured compute-heavy test declares its per-test wall budget
+    /// through `KLIO_TEST_WALL_CAP_FOR` here rather than tripping the
+    /// hang detector's default window.
+    extra_env: []const [2][]const u8 = &.{},
     /// Extra `klio test` arguments every child gets (`--feature …`).
     extra_args: []const []const u8 = &.{},
 };
@@ -490,11 +495,19 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-okio/commonMain/src/kotlinx/serialization/json/okio/internal/OkioJsonStreams.kt",
         },
         .extra_args = &.{ "--feature", "kotlinx.serialization/json" },
-        .timeout_ms = 120_000,
-        // 2026-09-03 census: 700 / 744 (42 failed, 2 did not complete);
-        // the floor keeps a small did-not-complete margin below the
-        // observed count.
-        .baseline = 725,
+        // Two files are compute-heavy (10,000 nested nodes round-tripped
+        // four ways; 10,000 random strings of up to 2047 chars escaped and
+        // restored): split so each test is its own child and the files'
+        // fast tests count regardless.
+        .split_files = &.{ "json/JsonHugeDataSerializationTest.kt", "json/JsonUnicodeTest.kt" },
+        .extra_env = &.{.{ "KLIO_TEST_WALL_CAP_FOR", "JsonUnicodeTest.testRandomEscapeSequences=390,JsonHugeDataSerializationTest.test=390" }},
+        // The two heavy children (10,000 random escaped strings; 10,000
+        // nested nodes round-tripped four ways) are interpreter-bound
+        // compute measured at ~3-5 min solo; they run first, in parallel
+        // with the rest, so the wider cap does not wall the suite.
+        .timeout_ms = 400_000,
+        // 2026-09-04 census: 742 / 744 (0 failed, 2 did not complete).
+        .baseline = 742,
         .max_failed = null,
         .max_incomplete = null,
     },
@@ -595,7 +608,7 @@ pub const suites = [_]Config{
         // resolution that picks the same-package Color `lerp` for a Float
         // argument; it does not reproduce from source. Floor holds the
         // observed pass count.
-        .baseline = 451,
+        .baseline = 452,
         .max_failed = null,
         .max_incomplete = null,
     },
@@ -627,6 +640,7 @@ pub fn runSuite(cfg: Config) !void {
 
     std.Io.Dir.cwd().createDirPath(io, cfg.scratch_home) catch {};
     var env = try envWithHome(a, cfg.scratch_home);
+    for (cfg.extra_env) |kv| try env.put(kv[0], kv[1]);
     try installPacks(a, &env, cfg);
 
     var all: std.ArrayList([]u8) = .empty;
@@ -752,8 +766,9 @@ pub fn runSuite(cfg: Config) !void {
                 if (i >= queue.len) return;
                 _ = arena.reset(.retain_capacity);
                 const ct_t0 = runtime.clockMonotonicNanos();
-                const r = runKlio(arena.allocator(), penv, queue[i], timeout_ms) catch {
+                const r = runKlio(arena.allocator(), penv, queue[i], timeout_ms) catch |e| {
                     _ = phung.fetchAdd(1, .monotonic);
+                    std.debug.print("[census-hung] {s} <- {s}\n", .{ @errorName(e), queue[i][queue[i].len - 1] });
                     continue;
                 };
                 // Latency census: per-child wall, argv size, and pass count —
@@ -796,7 +811,13 @@ pub fn runSuite(cfg: Config) !void {
                         }
                     }
                 }
-                if (std.mem.indexOf(u8, r.stdout, " passed,") == null) _ = phung.fetchAdd(1, .monotonic);
+                if (std.mem.indexOf(u8, r.stdout, " passed,") == null) {
+                    _ = phung.fetchAdd(1, .monotonic);
+                    // A child that produced no summary crashed or was cut
+                    // off: name it, with the tail of what it said.
+                    const tail_from = if (r.stderr.len > 400) r.stderr.len - 400 else 0;
+                    std.debug.print("[census-nosummary] <- {s}\n{s}\n", .{ queue[i][queue[i].len - 1], r.stderr[tail_from..] });
+                }
             }
         }
     };

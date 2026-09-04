@@ -159,6 +159,43 @@ fn findAnnotation(annotations: []const ast.Annotation, name: []const u8) ?*const
     return null;
 }
 
+/// `s` as the body of a Kotlin string literal: the lexer hands the pass
+/// the UNESCAPED text of a `@SerialName("...")`, so a quote, backslash,
+/// dollar, or control character must be re-escaped before it is written
+/// back into generated source (`@SerialName("\"")` is a legal serial
+/// name, and writing it raw left the whole file without serializers).
+fn kq(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
+    var needs = false;
+    for (s) |c| {
+        if (c == '"' or c == '\\' or c == '$' or c < 0x20) {
+            needs = true;
+            break;
+        }
+    }
+    if (!needs) return s;
+    var out: std.ArrayList(u8) = .empty;
+    for (s) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(a, "\\\""),
+            '\\' => try out.appendSlice(a, "\\\\"),
+            '$' => try out.appendSlice(a, "\\$"),
+            '\n' => try out.appendSlice(a, "\\n"),
+            '\r' => try out.appendSlice(a, "\\r"),
+            '\t' => try out.appendSlice(a, "\\t"),
+            '\x08' => try out.appendSlice(a, "\\b"),
+            else => {
+                if (c < 0x20) {
+                    var ub: [8]u8 = undefined;
+                    try out.appendSlice(a, std.fmt.bufPrint(&ub, "\\u{x:0>4}", .{c}) catch unreachable);
+                } else {
+                    try out.append(a, c);
+                }
+            },
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
 /// The literal string of a single-string-argument annotation (`@SerialName("x")`).
 fn annotationStringArg(an: *const ast.Annotation) ?[]const u8 {
     if (an.args.len == 0) return null;
@@ -782,7 +819,7 @@ const Gen = struct {
                     try writeAnnotatedEnumSerializer(&out, a, cn, serial, qn, class_anns);
                     return out.items;
                 }
-                return std.fmt.allocPrint(a, "createSimpleEnumSerializer(\"{s}\", {s}.values())", .{ serial, qn });
+                return std.fmt.allocPrint(a, "createSimpleEnumSerializer(\"{s}\", {s}.values())", .{ try kq(a, serial), qn });
             }
         }
         if (t.type_args.len != 0) {
@@ -1102,9 +1139,9 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
     const self_ty = try std.fmt.allocPrint(a, "{s}{s}", .{ info.path, tps });
     const generic = c.type_params.len != 0;
     // Descriptor.
-    try wp(w, a, "    override val descriptor: SerialDescriptor = PluginGeneratedSerialDescriptor(\"{s}\", this, {d}).also {{ `$dd` ->\n", .{ serial, elems.len });
+    try wp(w, a, "    override val descriptor: SerialDescriptor = PluginGeneratedSerialDescriptor(\"{s}\", this, {d}).also {{ `$dd` ->\n", .{ try kq(a, serial), elems.len });
     for (elems) |*e| {
-        try wp(w, a, "        `$dd`.addElement(\"{s}\", {s})\n", .{ e.serial_name, if (elemOptional(e)) "true" else "false" });
+        try wp(w, a, "        `$dd`.addElement(\"{s}\", {s})\n", .{ try kq(a, e.serial_name), if (elemOptional(e)) "true" else "false" });
         // Non-framework property annotations travel into the descriptor.
         for (e.annotations) |*an| {
             const n = annotationSimpleName(an);
@@ -1352,7 +1389,7 @@ fn genValueClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c
     } else {
         try wp(w, a, "object `{s}` : GeneratedSerializer<{s}> {{\n", .{ gn, self_ty });
     }
-    try wp(w, a, "    override val descriptor: SerialDescriptor = InlineClassDescriptor(\"{s}\", this).also {{ `$dd` -> `$dd`.addElement(\"{s}\", false) }}\n", .{ serial, e.serial_name });
+    try wp(w, a, "    override val descriptor: SerialDescriptor = InlineClassDescriptor(\"{s}\", this).also {{ `$dd` -> `$dd`.addElement(\"{s}\", false) }}\n", .{ try kq(a, serial), try kq(a, e.serial_name) });
     try wp(w, a, "    override fun childSerializers(): Array<KSerializer<*>> = arrayOf<KSerializer<*>>({s})\n", .{try g.serializerExpr(e.ty, e.annotations)});
     try wp(w, a, "    override fun serialize(encoder: Encoder, value: {s}) {{\n        val `$inl` = encoder.encodeInline(descriptor)\n", .{self_ty});
     if (p != .none) {
@@ -1378,12 +1415,12 @@ fn genValueClassSerializer(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c
 /// for an enum whose entries or class carry serial annotations
 /// (`@SerialName`, `@JsonNames`, ...), written as an expression.
 fn writeAnnotatedEnumSerializer(w: *std.ArrayList(u8), a: Allocator, c: *const ast.Class, serial: []const u8, path: []const u8, class_anns: []const []const u8) Allocator.Error!void {
-    try wp(w, a, "createAnnotatedEnumSerializer(\"{s}\", {s}.values(), arrayOf<String?>(", .{ serial, path });
+    try wp(w, a, "createAnnotatedEnumSerializer(\"{s}\", {s}.values(), arrayOf<String?>(", .{ try kq(a, serial), path });
     for (c.enum_entries, 0..) |*en, i| {
         if (i > 0) try w.appendSlice(a, ", ");
         if (findAnnotation(en.annotations, "SerialName")) |an| {
             if (annotationStringArg(an)) |s| {
-                try wp(w, a, "\"{s}\"", .{s});
+                try wp(w, a, "\"{s}\"", .{try kq(a, s)});
                 continue;
             }
         }
@@ -1438,7 +1475,7 @@ fn genEnumFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, c: *co
     const class_anns = try classAnnotationCalls(a, idx, info.path);
     if (class_anns.len != 0) marked = true;
     if (!marked) {
-        try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ createSimpleEnumSerializer(\"{s}\", {s}.values()) }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, serial, info.path, gn, info.path, gn });
+        try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ createSimpleEnumSerializer(\"{s}\", {s}.values()) }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, try kq(a, serial), info.path, gn, info.path, gn });
         return;
     }
     try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ ", .{ gn, info.path });
@@ -1519,7 +1556,7 @@ fn genSealedFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, info
         std.sort.pdq([]const u8, leaves.items, Ctx2{ .a = a, .idx = idx, .pkg = info.pkg }, Ctx2.less);
     }
     const subs: []const []const u8 = leaves.items;
-    try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ SealedClassSerializer(\"{s}\", {s}::class, arrayOf<KClass<out {s}>>(", .{ gn, info.path, serial, info.path, info.path });
+    try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ SealedClassSerializer(\"{s}\", {s}::class, arrayOf<KClass<out {s}>>(", .{ gn, info.path, try kq(a, serial), info.path, info.path });
     for (subs, 0..) |sp, n| {
         if (n > 0) try w.appendSlice(a, ", ");
         try wp(w, a, "{s}::class", .{sp});
@@ -1532,7 +1569,7 @@ fn genSealedFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, info
         // plugin emits.
         const leaf_tps: usize = if (idx.by_path.get(sp)) |li| li.type_params else 0;
         if (leafIsPlainEnum(idx, sp)) {
-            try wp(w, a, "createSimpleEnumSerializer(\"{s}\", {s}.values())", .{ try leafSerialName(a, idx, info.pkg, sp), sp });
+            try wp(w, a, "createSimpleEnumSerializer(\"{s}\", {s}.values())", .{ try kq(a, try leafSerialName(a, idx, info.pkg, sp)), sp });
         } else if (leaf_tps == 0) {
             try wp(w, a, "{s}.serializer()", .{sp});
         } else {
@@ -1577,9 +1614,9 @@ fn genObjectFactory(w: *std.ArrayList(u8), a: Allocator, idx: *const Index, info
     const serial = try serialNameOf(a, info);
     const oanns = try classAnnotationCalls(a, idx, info.path);
     if (oanns.len == 0) {
-        try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ ObjectSerializer(\"{s}\", {s}) }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, serial, info.path, gn, info.path, gn });
+        try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ ObjectSerializer(\"{s}\", {s}) }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, try kq(a, serial), info.path, gn, info.path, gn });
     } else {
-        try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ ObjectSerializer(\"{s}\", {s}, arrayOf<Annotation>({s})) }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, serial, info.path, try joinCalls(a, oanns), gn, info.path, gn });
+        try wp(w, a, "val `{s}Cache`: KSerializer<{s}> by lazy {{ ObjectSerializer(\"{s}\", {s}, arrayOf<Annotation>({s})) }}\nfun `{s}Impl`(): KSerializer<{s}> = `{s}Cache`\n\n", .{ gn, info.path, try kq(a, serial), info.path, try joinCalls(a, oanns), gn, info.path, gn });
     }
 }
 
