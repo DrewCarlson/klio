@@ -224,3 +224,9 @@ now runs one child per ui module (`batch_dirs`: every file of a module's
 state): 452 / 0 in **39 s** (graphics 30 s, util 24 s, geometry 23 s, unit
 23 s), so wave2 is bounded by datetime again and the compose-ui census
 adds nothing to the battery wall.
+
+Final battery (2026-09-04): `stack: wall=670s rc=0` — every census at
+floor with zero failures and zero incompletes, compose plugin gate
+1390 / 0 / 0, compose-ui gate 5/5 (39 s). The wall fell from 1285 s to
+670 s once the compose_ui suite stopped setting wave2. Both exit
+conditions hold; this plan is closed.

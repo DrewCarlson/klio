@@ -1105,3 +1105,8 @@ test's profile is flat interpreter work (hex-digit parsing, `repeat`,
 `Random`, the generator lambda) with no remaining super-linear path. The
 plugin gate now runs to completion instead of dying early, which is the other
 component of the last run's longer wall.
+
+Final battery (2026-09-04): `stack: wall=670s rc=0` — json 747 / 0 / 0
+standing, core 138 / 0, ktor 450 / 0, and every other suite at floor; the
+wall is 670 s against the 1061 s this closeout started from. All exit
+conditions hold; this plan is closed.
