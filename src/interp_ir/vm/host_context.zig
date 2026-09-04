@@ -69,5 +69,13 @@ pub fn ctxResolve(self: *VmHost, ty_name: []const u8, erased: bool) ?Value {
         if (erased) return v;
         if (self.instanceOf(&v, want)) return v;
     }
+    // Not a `context(...)` scope value: the innermost enclosing receiver or
+    // spliced receiver-lambda subject of that type (`with(3) { context("u")
+    // { f(true) } }` reads 3 for the Int context).
+    var chain = ir.eval.enclosingChainIter();
+    while (chain.next()) |v| {
+        if (erased) return v;
+        if (self.instanceOf(&v, want)) return v;
+    }
     return null;
 }

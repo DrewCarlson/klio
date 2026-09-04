@@ -384,6 +384,11 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
             try b.addTypeParamBoundRef(r.param, r.ref);
         }
     }
+    if (module.pending_lambda_ctx_fn_shapes) |shapes| {
+        module.pending_lambda_ctx_fn_shapes = null;
+        defer moduleAllocator(module).free(shapes);
+        for (shapes) |sh| try b.markContextFnParam(sh.name, sh.ctx_types, sh.n_regular);
+    }
     // Carry the lexically enclosing class (and its member-name set) so a
     // member reference inside the lambda resolves against the class that
     // declares it: a private getter (`closed`) reads the right field, and

@@ -460,7 +460,7 @@ pub const LocalFnOverload = struct {
 
 /// The split of a param's contextual function type `context(C..) (A..) -> R`
 /// into its context-parameter count and ordinary-parameter count.
-pub const ContextFnShape = struct { n_ctx: usize, n_regular: usize };
+pub const ContextFnShape = struct { n_ctx: usize, n_regular: usize, ctx_types: []const []const u8 = &.{} };
 
 pub const HiddenBinding = struct { frame: usize, reg: Reg };
 
@@ -2463,11 +2463,23 @@ pub const FuncBuilder = struct {
     /// `context(C..) (A..) -> R`: `n_ctx` leading context types and
     /// `n_regular` ordinary parameter types. A fully-positional call
     /// `name(c.., a..)` with `n_ctx + n_regular` args lowers to `CtxCall`.
-    pub fn markContextFnParam(self: *FuncBuilder, name: []const u8, n_ctx: usize, n_regular: usize) Allocator.Error!void {
-        try self.context_fn_params.put(name, .{ .n_ctx = n_ctx, .n_regular = n_regular });
+    pub fn markContextFnParam(self: *FuncBuilder, name: []const u8, ctx_types: []const []const u8, n_regular: usize) Allocator.Error!void {
+        try self.context_fn_params.put(name, .{ .n_ctx = ctx_types.len, .n_regular = n_regular, .ctx_types = ctx_types });
     }
     pub fn contextFnParam(self: *const FuncBuilder, name: []const u8) ?ContextFnShape {
         return self.context_fn_params.get(name);
+    }
+    /// Every contextual function-type parameter in scope, for a lambda
+    /// body's builder to inherit (null when there is none).
+    pub fn contextFnShapesSlice(self: *const FuncBuilder) Allocator.Error!?[]ir.PendingCtxFnShape {
+        if (self.context_fn_params.count() == 0) return null;
+        var out = try self.allocator.alloc(ir.PendingCtxFnShape, self.context_fn_params.count());
+        var it = self.context_fn_params.iterator();
+        var i: usize = 0;
+        while (it.next()) |kv| : (i += 1) {
+            out[i] = .{ .name = kv.key_ptr.*, .ctx_types = kv.value_ptr.ctx_types, .n_regular = kv.value_ptr.n_regular };
+        }
+        return out;
     }
     /// The OUTERMOST scope's binding for `name` (a function's own entry
     /// binding), ignoring inner shadowing — for `this@<ownFn>` inside a

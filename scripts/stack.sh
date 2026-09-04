@@ -108,7 +108,14 @@ gate_pid=$!
   w1=$?
   "${pin[@]}" nice -n 10 "${leaves_env[@]}" zig build "${wave2_steps[@]}" "$@"
   w2=$?
-  [ $w1 -eq 0 ] && [ $w2 -eq 0 ]
+  # The stdlib commontest sweep (117 upstream test files on the ReleaseSafe
+  # harness, per-directory batched) is the only stdlib coverage in the
+  # battery: stdlib_commontest is a CI shard suite, not a census here.
+  sw_s=$(date +%s)
+  "${pin[@]}" nice -n 10 python3 scripts/commontest-sweep.py zig-out/bin/klio-harness
+  w3=$?
+  echo "stdlib-sweep: rc=$w3 wall=$(( $(date +%s)-sw_s ))s"
+  [ $w1 -eq 0 ] && [ $w2 -eq 0 ] && [ $w3 -eq 0 ]
 } >"$rest_log" 2>&1 &
 rest_pid=$!
 wait "$rest_pid"
@@ -135,6 +142,7 @@ rc=0
 [ $uigate_rc -ne 0 ] && rc=1
 [ $litmus_rc -ne 0 ] && rc=1
 if grep -qE "^error: '|exceeds the ceiling|transitive failure" "$gate_log" "$rest_log"; then rc=1; fi
+if ! grep -qE "^== run: [0-9]+ files, 0 failures" "$rest_log"; then echo "stack: stdlib sweep did not report zero failures"; rc=1; fi
 if printf '%s\n' "$litmus_out" | grep -qE "^error: '|exceeds the ceiling|transitive failure"; then rc=1; fi
 rm -f "$rest_log" "$gate_log" "$uigate_log"
 if [ $rc -eq 0 ] && [ -n "$tree_key" ]; then printf '%s' "$tree_key" >"$cache_file"; fi

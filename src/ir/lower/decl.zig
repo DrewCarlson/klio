@@ -2400,7 +2400,9 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             // ordinary ones (`CtxCall`). Receiver-typed contextual types are
             // out of scope for the positional form.
             if (ft.context_params.len != 0 and ft.receiver == null) {
-                try b.markContextFnParam(p.name.name, ft.context_params.len, ft.params.len);
+                const ctx_types = try b.allocator.alloc([]const u8, ft.context_params.len);
+                for (ft.context_params, 0..) |cp, ci| ctx_types[ci] = cp.name.name;
+                try b.markContextFnParam(p.name.name, ctx_types, ft.params.len);
             }
         }
     }

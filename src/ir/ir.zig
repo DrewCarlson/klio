@@ -90,6 +90,13 @@ pub const Reg = enum(u32) {
 /// (`this@<label>` — the extension fn or receiver lambda name), when one
 /// is bound. A null label still serves resolution/derivation; only static
 /// EMISSION with an outer receiver needs the value channel.
+/// One contextual function-type parameter shape carried into a lambda body.
+pub const PendingCtxFnShape = struct {
+    name: []const u8,
+    ctx_types: []const []const u8,
+    n_regular: usize,
+};
+
 pub const ReceiverTowerEntry = struct {
     head: []const u8,
     label: ?[]const u8 = null,
@@ -2054,6 +2061,10 @@ pub const Module = struct {
     /// (`data.any { it.startsWith("f") }` in a test method's expect-lambda).
     /// Owned pairs; the lambda body takes ownership. Not serialized.
     pending_lambda_type_param_bound_refs: ?[]PendingBoundRef = null,
+    /// Contextual function-type parameters of the enclosing builder, handed
+    /// to a lambda body so an implicit call `f(a..)` inside it still splits
+    /// its context arguments.
+    pending_lambda_ctx_fn_shapes: ?[]PendingCtxFnShape = null,
     /// Receiver-lambda param names -> declared receiver heads of the
     /// ENCLOSING builder, carried into a nested lambda body so a captured
     /// receiver-fn param invoked bare there re-selects by its declared

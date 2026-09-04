@@ -29,6 +29,6 @@ phase "harness" zig build klio-harness
 phase "census" scripts/dispatch-census.sh
 phase "unit" zig build test
 phase "sweep" python3 scripts/commontest-sweep.py zig-out/bin/klio-harness
-phase "corpus" python3 scripts/corpus_check.py --no-rust
+phase "corpus" env KLIO_HOME="$ROOT/.klio-local" python3 scripts/corpus_check.py --no-rust
 phase "litmus" python3 scripts/litmus-sweep.py zig-out/bin/klio-harness
 exit "$fail"

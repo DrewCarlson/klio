@@ -592,6 +592,15 @@ fn scalarRetagName(name: []const u8) bool {
     return eq(u8, name, "Byte") or eq(u8, name, "Short") or eq(u8, name, "Long");
 }
 
+/// The simple head of a declared type name: no package qualifier, generic
+/// arguments, or nullability.
+fn typeHeadOfName(name: []const u8) []const u8 {
+    var t = std.mem.trimEnd(u8, name, "?");
+    if (std.mem.indexOfScalar(u8, t, '<')) |lt| t = t[0..lt];
+    if (std.mem.lastIndexOfScalar(u8, t, '.')) |d| t = t[d + 1 ..];
+    return t;
+}
+
 fn scalarRetag(name: []const u8, iv: i64) ?Value {
     const eq = std.mem.eql;
     if (eq(u8, name, "Byte")) return .{ .Byte = @truncate(iv) };
@@ -967,6 +976,16 @@ fn packPrimaryCtorVarargs(self: *VmHost, class_fqn: ?[]const u8, class_name: []c
     const ir_cls = &m.classes.items[cid.int()];
     const params = ir_cls.primary_params;
     if (params.len == 0) return args;
+    // Declared numeric parameter typing (kotlinc literal typing): an Int
+    // reaching a `Long`/`Short`/`Byte` parameter can only have been an
+    // integer literal, so it takes the declared type before the init body
+    // and the property stores see it (`LongRange(1, 0)` hands
+    // `LongProgression` two Longs).
+    for (args, 0..) |*arg, i| {
+        if (i >= params.len) break;
+        if (arg.* != .Int) continue;
+        if (scalarRetag(typeHeadOfName(params[i].ty.name), arg.Int)) |rv| arg.* = rv;
+    }
     const last = params[params.len - 1];
     if (!last.is_vararg) return args;
     const fixed = if (params.len == 0) 0 else params.len - 1;
@@ -1178,6 +1197,17 @@ fn runSuperCtorChain(
     }
     const entries = secondaryCtors(self, class_fqn, class_name);
     const chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(self, entries, args);
+    // The chosen constructor's declared numeric parameter types retag
+    // integer arguments the same way the primary path does.
+    const args_typed: []Value = try self.allocator.dupe(Value, args);
+    defer self.allocator.free(args_typed);
+    if (chosen) |e| {
+        for (args_typed, 0..) |*arg, i| {
+            if (i >= e.param_type_heads.len) break;
+            if (arg.* != .Int) continue;
+            if (scalarRetag(e.param_type_heads[i], arg.Int)) |rv| arg.* = rv;
+        }
+    }
     const entry = chosen orelse {
         // No secondary ctor takes this shape: the class delegates through
         // its PRIMARY ctor (`open class A(msg: String) : B(msg)`). Bind
@@ -1205,7 +1235,7 @@ fn runSuperCtorChain(
                 if (hasNonNullField(leaf.Instance, pp[target].name)) continue;
                 const g = leaf.Instance.borrowMut();
                 retainField(g.get(), self.allocator, pp[target].name);
-                try pushField(g.get(), self.allocator, pp[target].name, args[k]);
+                try pushField(g.get(), self.allocator, pp[target].name, adoptDeclaredNumeric(&pp[target], args[k]));
                 g.deinit();
             }
             dg.deinit();
@@ -1240,7 +1270,7 @@ fn runSuperCtorChain(
         switch (fr) {
             .err => |e| return .{ .err = e },
             .ok => |func| {
-                switch (try evalThunk(self, func, args)) {
+                switch (try evalThunk(self, func, args_typed)) {
                     .ok => |v| try next_args.append(self.allocator, v),
                     .err => |e| return .{ .err = e },
                 }
@@ -1283,7 +1313,7 @@ fn runSuperCtorChain(
                 var all: std.ArrayList(Value) = .empty;
                 defer all.deinit(self.allocator);
                 try all.append(self.allocator, leaf.*);
-                try all.appendSlice(self.allocator, args);
+                try all.appendSlice(self.allocator, args_typed);
                 switch (try evalThunk(self, body_func, all.items)) {
                     .ok => {},
                     .err => |e| return .{ .err = e },
