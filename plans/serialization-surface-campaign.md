@@ -1093,3 +1093,15 @@ declaration's AST. Six of six runs pass on the ReleaseFast harness.
 - Full battery: `scripts/stack.sh` green, including the compose plugin gate
   that the campaign's per-suite census list never ran and that carried the
   regressions recorded in the two battery rounds above.
+
+Battery wall note. The three closeout battery runs took 1061 s, 1094 s and
+1285 s (the last one green). The json census alone at the battery's width
+(4 workers) is bounded by its one heavy child,
+`JsonUnicodeTest.testRandomEscapeSequences` at 162 s (the Huge child 34 s,
+every other file ≤ 7 s, the rest of the suite ≈ 110 s on the other workers),
+so the split moved the json suite from ≈ 110 s to ≈ 162 s; the suite still
+finishes inside its census wave behind the longer suites, and the random
+test's profile is flat interpreter work (hex-digit parsing, `repeat`,
+`Random`, the generator lambda) with no remaining super-linear path. The
+plugin gate now runs to completion instead of dying early, which is the other
+component of the last run's longer wall.
