@@ -1038,3 +1038,25 @@ emitter of a field read / global load by return address (addr2line);
 `[lrm]`/`[rmc]` print the member resolver's verdicts and shapes;
 `[bare-member]`, `[bare-ctx]`, `[tlp]` print the bare-call decisions;
 `KLIO_DUMP_FN` shows `GetField`/`NewInstance`/`LoadFromThisOrGlobal` detail.
+
+### Battery round 2: the plugin gate's two "did not complete" children
+
+With the four lowering roots landed, `compose_plugin_commontest` stood at
+0 failed but two classes did not complete: `SnapshotIdSetTests` (child
+timeout after 15 tests, reproducible solo as a >10-minute hang) and
+`SlotTableAddressSpaceTests` (a silent SIGSEGV after 14 tests, only under
+the gate's load). The census driver now prints the child's termination
+(signal/exit code) and stderr tail for an incomplete class, and a forced
+`tgkill(SIGSEGV)` on the busy worker thread gave the hang's native stack:
+`collectImpl` → `Env.gcTrace` → `Value.gcMark` → `SharedClosures.getPtr`
+→ `borrowMut` → `writeBarrier` → `remembered_lock.lock()`. A minor
+collection traced the remembered set WHILE HOLDING `remembered_lock`, and a
+remembered cell's tracer reached the closure-spine accessor whose mutable
+borrow runs the write barrier, which takes the same ownerless spinlock: the
+collector thread spun on itself forever. The string-runtime changes
+(fewer allocations) only moved the collection points onto this path.
+Root fix (`gc.zig`): the minor mark traces a SNAPSHOT of the remembered set
+outside the lock (`traceRemembered`, with a unit test whose tracer runs the
+barrier), and the mark-only `SharedClosures.getPtr` takes a shared borrow
+so marking never runs the barrier at all. `SnapshotIdSetTests` completes in
+43 s; `SlotTableAddressSpaceTests` in 27 s.

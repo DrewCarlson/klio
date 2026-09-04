@@ -174,6 +174,21 @@ pub inline fn writeBarrier(h: *GcHeader) void {
     writeBarrierSlow(h);
 }
 
+/// Minor mark: trace every remembered (tenured, mutated) cell. Traces a
+/// SNAPSHOT of the set, outside its lock: a remembered cell's tracer can reach
+/// an accessor whose write barrier takes `remembered_lock` (a closure spine
+/// borrowed for its slot pointer), and the spinlock has no owner, so the
+/// collector thread spun on itself forever. Cells remembered during the trace
+/// are drained with the rest afterwards.
+fn traceRemembered(marker: *Marker) void {
+    remembered_lock.lock();
+    const snapshot = std.heap.page_allocator.dupe(*GcHeader, remembered.items) catch
+        @panic("KGC: remembered snapshot allocation failed");
+    remembered_lock.unlock();
+    defer std.heap.page_allocator.free(snapshot);
+    for (snapshot) |h| h.gc_trace(h, marker);
+}
+
 fn writeBarrierSlow(h: *GcHeader) void {
     remembered_lock.lock();
     defer remembered_lock.unlock();
@@ -969,11 +984,7 @@ fn collectImpl(force_major: bool) void {
     // Under the lock: a thread in a blocking-safe region is NOT parked by
     // the stop-the-world handshake, and its write barrier may append (and
     // resize) the list while the collector walks it.
-    if (!major) {
-        remembered_lock.lock();
-        for (remembered.items) |h| h.gc_trace(h, &marker);
-        remembered_lock.unlock();
-    }
+    if (!major) traceRemembered(&marker);
     const marked = marker.drainCounted();
     // Drain the remembered set under both kinds: after a minor every survivor
     // is tenured (old→young edges became old→old); after a major the fresh
@@ -1185,6 +1196,31 @@ test "minor mark stops at tenured cells; major stamps them" {
     major.shade(&a);
     try std.testing.expectEqual(@as(usize, 1), major.grey.items.len);
     try std.testing.expectEqual(@as(usize, 3), a.gc_mark);
+}
+
+test "a remembered cell's tracer may run the write barrier during a minor mark" {
+    const T = struct {
+        var other: GcHeader = .{ .gc_trace = idle, .gc_finalize = fin, .gc_gen = 1 };
+        fn idle(_: *GcHeader, _: *Marker) void {}
+        fn fin(_: *GcHeader) void {}
+        // A tracer that stores a reference into another tenured cell — the
+        // closure-spine accessor's mutable borrow does exactly this.
+        fn barrierTrace(_: *GcHeader, _: *Marker) void {
+            writeBarrier(&other);
+        }
+    };
+    var cell: GcHeader = .{ .gc_trace = T.barrierTrace, .gc_finalize = T.fin, .gc_gen = 1 };
+    writeBarrier(&cell);
+    try std.testing.expect(cell.gc_remembered);
+    var marker = Marker{ .epoch = 1, .arena = std.heap.page_allocator, .minor = true };
+    defer marker.grey.deinit(std.heap.page_allocator);
+    traceRemembered(&marker);
+    try std.testing.expect(T.other.gc_remembered);
+    remembered_lock.lock();
+    remembered.clearRetainingCapacity();
+    cell.gc_remembered = false;
+    T.other.gc_remembered = false;
+    remembered_lock.unlock();
 }
 
 test "write barrier records a tenured cell once and skips nursery cells" {

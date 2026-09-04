@@ -590,7 +590,23 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                 );
                 if (std.mem.indexOf(u8, r.stdout, " passed,") == null) {
                     _ = phung.fetchAdd(1, .monotonic);
-                    std.debug.print("compose_plugin_commontest: {s} did not complete ({d} streamed passes kept)\n", .{ names[i], n_passed });
+                    // Name the cause: the child's termination and the tail of
+                    // what it said, so a load-only incomplete is actionable.
+                    const tail_from = if (r.stderr.len > 600) r.stderr.len - 600 else 0;
+                    std.debug.print("compose_plugin_commontest: {s} did not complete ({d} streamed passes kept) term={s} code={d}\n{s}\n", .{
+                        names[i],
+                        n_passed,
+                        @tagName(std.meta.activeTag(r.term)),
+                        switch (r.term) {
+                            .exited => |c| @as(i64, c),
+                            .signal => |sg| @as(i64, @intCast(@intFromEnum(sg))),
+                            else => @as(i64, -1),
+                        },
+                        r.stderr[tail_from..],
+                    });
+                    std.debug.print("compose_plugin_commontest: [dnc-argv]", .{});
+                    for (queue[i]) |arg| std.debug.print(" {s}", .{arg});
+                    std.debug.print("\n", .{});
                 }
             }
         }

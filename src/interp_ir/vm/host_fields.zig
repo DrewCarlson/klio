@@ -314,6 +314,7 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         .singletons_by_id = self.singletons_by_id,
         .allocator = allocator,
     };
+    stdlib.implementations.string.clearRecvMemo();
     var ctx = CallCtx{
         .args = args,
         .out = self.out,

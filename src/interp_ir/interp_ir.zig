@@ -1349,11 +1349,14 @@ pub const SharedClosures = struct {
     /// spine only ever grows, and `push` cannot run concurrently with a
     /// collection (the world is stopped), so the returned pointer is stable.
     pub fn getPtr(self: SharedClosures, id: usize) ?*ClosureInfo {
-        const g = self.obj.borrowMut();
+        // A shared borrow: the mark phase reads the slot and must not run
+        // the mutable borrow's write barrier (which locks the remembered
+        // set the collector may hold).
+        const g = self.obj.borrow();
         defer g.deinit();
         const list = g.get();
         if (id >= list.items.len) return null;
-        return &list.items[id];
+        return @constCast(&list.items[id]);
     }
 
     /// Free the owned metadata of every slot not marked in `epoch` (no live

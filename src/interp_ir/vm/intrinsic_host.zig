@@ -10,6 +10,7 @@
 //! against the live globals / classes / closure table.
 
 const std = @import("std");
+const stdlib = @import("stdlib");
 
 const ir = @import("ir");
 const runtime = @import("runtime");
@@ -569,6 +570,7 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
 
     if (callable.* == .Intrinsic) {
         var child = childHost(self);
+        stdlib.implementations.string.clearRecvMemo();
         var ctx = runtime.CallCtx{
             .args = args,
             .out = out,
