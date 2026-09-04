@@ -723,6 +723,7 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
         intrinsic.threads.deinit();
         intrinsic.object_states.deinit();
     }
+    stdlib.implementations.string.clearRecvMemo();
     var ctx = CallCtx{
         .args = args,
         .out = self.out,

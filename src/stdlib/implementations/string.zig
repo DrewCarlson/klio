@@ -203,6 +203,14 @@ const RecvMemo = struct {
 };
 threadlocal var recv_memo: RecvMemo = .{};
 
+/// Forget the receiver memo: called at every host-builtin entry so a cell
+/// pointer never outlives the call whose argument kept it alive (a reclaimed
+/// or collected cell must never be written through `save`).
+pub fn clearRecvMemo() void {
+    recv_memo.valid = false;
+    recv_memo.cell = null;
+}
+
 fn memoFor(s: []const u8) ?*RecvMemo {
     if (!recv_memo.valid or recv_memo.ptr != s.ptr or recv_memo.len != s.len) return null;
     return &recv_memo;
