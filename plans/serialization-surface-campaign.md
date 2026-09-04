@@ -989,3 +989,52 @@ file's `ContextualTest`, hence 747 over the 744 universe). All other suites
 at or above floor: core 138/0, ktor 450/0, coroutines 1299/0, compose_ui
 452/0, io 1191/0, datetime 519/0, atomicfu 67/0. The json suite now stands
 at zero: baseline 747, `max_failed = 0`, `max_incomplete = 0`.
+
+### Battery round: the compose_plugin gate had regressed under the campaign
+
+`scripts/stack.sh` after jc26 was red on ONE step: `compose_plugin_commontest`
+1105 passed / 283 failed (baseline 1390). That suite is not in the census
+list the campaign drove, so the regression had accumulated silently since
+the campaign's start (dd34384a passes; a 3-round parallel worktree bisect
+pinned the first red to c4f4cb42, "fidelity rounds nineteen to twenty-two").
+The census now names hung children, and this gate is the reason the full
+battery — not the per-suite census — is the exit condition.
+
+Every failure was one runtime symptom, `get_field <name> on <outer object>`:
+a bare name inside a spliced inline body read on the wrong receiver. Four
+roots, each with a single-file example:
+- `resolveMemberCall` counted a `@Deprecated(level = HIDDEN)` overload as a
+  second "unknown" candidate for a type-parameter-shaped argument
+  (`Updater.set(value: Int, …)` beside `set(value: V, …)`), so the call had
+  no target and deferred; a deferred member call on a VALUE-CLASS receiver
+  can never bind at run time (the receiver is unboxed). HIDDEN members are
+  skipped while an ordinary same-name member exists (as the extension
+  resolver already did), and a value-class owner's only unrefuted member
+  binds directly. `examples/value_class_member_generic_arg.kt`.
+- A bare read of a member of the smart-cast `this` (`when (this) { is
+  ScatterSetWrapper<T> -> set… }`) lost to a same-named global in three
+  places: the top-level-property branch, the bare-read classification, and
+  `subjectCorrectedBareThis` (which walked the subjects' DECLARED heads —
+  `Set`, which has no `set` — and handed the read to the outer `this`).
+  One `narrowedThisDeclares` helper now serves all three, and the
+  dotted-FQN call path (`items.sum()` whose prefix is a default-package
+  top-level property) checks scope before treating the prefix as global.
+  `examples/smart_cast_this_member_over_global.kt`.
+- Two inner classes of one package sharing a simple name
+  (`LinkComposer.CompositionContextImpl` / `GapComposer.…`) with same-named
+  initializer-inferred properties (`composers = mutableSetOf()` vs
+  `mutableScatterSetOf()`): the simple-name property index and the
+  member-property AST table both answered with the other class's, so
+  `composers.forEach` bound `ScatterSet.forEach` and read `elements` on a
+  `MutableSet`. An unqualified nested name now resolves LEXICALLY
+  (`lexicalNestedClassFqn`: the enclosing class's own nested class first),
+  and member property ASTs register under the qualified owner too.
+  `examples/inner_class_namesake_init_inferred.kt`.
+- (Verified on the way) `MutableIntSet()` and the `IntSet.forEach` splices
+  were correct; the closure that read `elements` was `IntSet.forEach`'s own
+  body invoked on the mis-typed receiver.
+Tooling added: `KLIO_GF_TRACE=<field>` / `KLIO_LG_TRACE=<name>` name the
+emitter of a field read / global load by return address (addr2line);
+`[lrm]`/`[rmc]` print the member resolver's verdicts and shapes;
+`[bare-member]`, `[bare-ctx]`, `[tlp]` print the bare-call decisions;
+`KLIO_DUMP_FN` shows `GetField`/`NewInstance`/`LoadFromThisOrGlobal` detail.

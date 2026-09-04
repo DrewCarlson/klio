@@ -2474,7 +2474,11 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // stays on the top-level path that loads its singleton.
         const class_over_unimported_prop = b.module.classIdIndexed(name0, b.self_package, segments[0].span.file) != null and
             (b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file) orelse 0) >= 4;
+        if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+            if (std.mem.eql(u8, w, name0) and isTopLevelProp(name0)) std.debug.print("[tlp] {s} narrow={?s} recvTy={?s} in_recv_ctx={} narrowed_declares={}\n", .{ name0, b.thisNarrow(), b.recvTy(), inReceiverContext(b), narrowedThisDeclares(b, name0, segments[0].span.file) });
+        }
         if (isTopLevelProp(name0) and !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
+            !narrowedThisDeclares(b, name0, segments[0].span.file) and
             !build.anonCaptureBinds(name0) and !class_over_unimported_prop and
             b.module.classIdExactImport(name0, segments[0].span.file) == null and
             !(inReceiverContext(b) and anyReceiverClassDeclares(b, name0)))
@@ -2601,7 +2605,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 window_recv_declares;
             if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
                 if (std.mem.eql(u8, w, name0)) {
-                    std.debug.print("[bare-read] {s} in={s} known_global={} own={} encl={} splice_recv={s} owner={s}\n", .{
+                    std.debug.print("[bare-read] {s} in={s} known_global={} own={} encl={} splice_recv={s} owner={s} narrow={s} recvTy={s}\n", .{
                         name0,
                         build.currentRealFn() orelse "-",
                         is_known_global,
@@ -2609,6 +2613,8 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         b.hasEnclosingMember(name0),
                         b.spliceRecvTy() orelse "-",
                         b.ownerClass() orelse "-",
+                        b.thisNarrow() orelse "-",
+                        b.recvTy() orelse "-",
                     });
                 }
             }
@@ -2648,7 +2654,12 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // class's: inside `fun Scope.f()` declared in `class C`, a bare
             // name both `Scope` and `C` declare is `Scope`'s — kotlinc ranks
             // implicit receivers innermost first, and `this` is the receiver.
-            const recv_declares = blk: {
+            // A smart-cast `this` (`when (this) { is ScatterSetWrapper<T> ->
+            // set.forEach(block) }`) exposes the NARROWED class's members to
+            // a bare read ahead of any same-named global: the name is that
+            // class's property on `this`, never the top-level `set`.
+            const narrow_declares = narrowedThisDeclares(b, name0, segments[0].span.file);
+            const recv_declares = narrow_declares or blk: {
                 const rh = b.recvTy() orelse break :blk false;
                 const h = typeHead(std.mem.trimEnd(u8, rh, "?"));
                 const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk false;
@@ -3415,9 +3426,34 @@ fn extPropGetterReturn(b: *const FuncBuilder, head: []const u8, name: []const u8
 /// The property-head key for `owner` as the site's file sees it: the
 /// scope-resolved class's qualified name, which is exact when two packages
 /// share the simple name. Null when the simple key already is the class.
+/// An unqualified nested-class name resolves LEXICALLY first: written inside
+/// `LinkComposer`, `CompositionContextImpl` is LinkComposer's own nested
+/// class, never the same-named one nested in `GapComposer` of the same
+/// package (which the package-tiered index cannot tell apart). Walks the
+/// enclosing class's qualified name outwards, trying `<outer>.<simple>`.
+fn lexicalNestedClassFqn(b: *const FuncBuilder, simple: []const u8, file: ir.FileId) ?[]const u8 {
+    const oc = b.ownerClass() orelse return null;
+    const cid = b.module.classIdIndexed(oc, b.self_package, file) orelse b.module.classId(oc) orelse return null;
+    var fqn = b.module.classFqnById(cid) orelse return null;
+    var buf: [512]u8 = undefined;
+    while (fqn.len > b.self_package.len) {
+        const cand = std.fmt.bufPrint(&buf, "{s}.{s}", .{ fqn, simple }) catch return null;
+        if (b.module.classIdByFqn(cand)) |nid| return b.module.classFqnById(nid);
+        const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return null;
+        fqn = fqn[0..dot];
+    }
+    return null;
+}
+
 fn scopedPropOwnerKey(b: *const FuncBuilder, owner: []const u8, site_file: ?ir.FileId) ?[]const u8 {
     if (std.mem.indexOfScalar(u8, owner, '.') != null) return null;
     const file = site_file orelse (b.self_decl_span orelse return null).file;
+    if (lexicalNestedClassFqn(b, owner, file)) |nf| {
+        if (runtime.envOnce("KLIO_CIX_TRACE")) |w| {
+            if (std.mem.eql(u8, w, owner)) std.debug.print("[cix-prop] {s} file={d} -> {s} (lexical nested)\n", .{ owner, file.int(), nf });
+        }
+        return nf;
+    }
     const cid = b.module.classIdIndexed(owner, b.self_package, file) orelse return null;
     const fqn = b.module.classFqnById(cid) orelse return null;
     if (runtime.envOnce("KLIO_CIX_TRACE")) |w| {
@@ -12056,6 +12092,9 @@ fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
                 if (b.module.registry.class_prop_type_heads.get(.{ .a = key, .b = m.name.name })) |ph| {
                     return .{ .name = ph, .nullable = false, .args = &.{} };
                 }
+                if (propInitCallHead(b, key, m.name.name)) |ph| {
+                    return .{ .name = ph, .nullable = false, .args = &.{} };
+                }
             }
             // The property's FULL declared type, with the owner's type
             // parameters substituted from the receiver's own arguments:
@@ -15191,9 +15230,15 @@ pub fn resolveCtxFor(
         // mirroring `bareStaticRecvHead`; `spliceRecvForName`'s local gate
         // cannot serve here because the collided name (`transform`) is also
         // a bound param, so consult the splice receiver directly.
-        .recv_ty = b.thisNarrow() orelse
-            (if (b.spliceHintActive() and b.recvTy() != null) b.spliceRecvTy() else b.recvTy()) orelse
-            spliceRecvForName(b, name0),
+        .recv_ty = blk_recv: {
+            const chosen = b.thisNarrow() orelse
+                (if (b.spliceHintActive() and b.recvTy() != null) b.spliceRecvTy() else b.recvTy()) orelse
+                spliceRecvForName(b, name0);
+            if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+                if (std.mem.eql(u8, w, name0)) std.debug.print("[bare-ctx] {s} narrow={?s} splice_active={} recvTy={?s} spliceRecvTy={?s} hintRecv={?s} forName={?s} -> {?s}\n", .{ name0, b.thisNarrow(), b.spliceHintActive(), b.recvTy(), b.spliceRecvTy(), b.spliceHintRecv(), spliceRecvForName(b, name0), chosen });
+            }
+            break :blk_recv chosen;
+        },
         .recv_type = if (b.thisNarrow()) |t|
             ir.TypeRef{ .name = t, .nullable = false, .args = &.{} }
         else if (b.spliceHintActive() and b.recvTy() != null)
@@ -17850,6 +17895,19 @@ fn extPropExistsOn(b: *const FuncBuilder, head: []const u8, name: []const u8) bo
     return b.module.funcsBySimpleName(gname).len != 0;
 }
 
+/// Whether the smart-cast `this` (`when (this) { is ScatterSetWrapper<T> ->
+/// set… }`) declares `name` as a member or property: such a bare name is the
+/// narrowed receiver's own, ahead of any same-named global or outer `this`.
+fn narrowedThisDeclares(b: *const FuncBuilder, name: []const u8, file: ir.FileId) bool {
+    const nh = b.thisNarrow() orelse return false;
+    const h = typeHead(std.mem.trimEnd(u8, nh, "?"));
+    if (h.len == 0) return false;
+    if (staticTypeDeclaresProp(b, h, name)) return true;
+    const cid = b.module.classIdIndexed(h, b.self_package, file) orelse
+        b.module.classId(h) orelse return false;
+    return b.module.classHierarchyDeclaresMember(cid, name);
+}
+
 fn subjectCorrectedBareThis(b: *FuncBuilder, name: []const u8, this_reg: Reg) Reg {
     const sct = if (runtime.envOnce("KLIO_SCT_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     const sbs = b.subject_binds.items;
@@ -17858,6 +17916,14 @@ fn subjectCorrectedBareThis(b: *FuncBuilder, name: []const u8, this_reg: Reg) Re
     // otherwise scope already resolved beneath the subjects.
     if (sbs[sbs.len - 1].reg != this_reg) {
         if (sct) std.debug.print("[sct] {s}: this r{d} != innermost subject r{d}\n", .{ name, this_reg.int(), sbs[sbs.len - 1].reg.int() });
+        return this_reg;
+    }
+    // A smart-cast `this` (`when (this) { is ScatterSetWrapper<T> -> set… }`)
+    // narrows the innermost subject: the NARROWED class's member is this
+    // subject's, and the walk below (by the subjects' declared heads —
+    // `Set`, which has no `set`) must not hand the read to an outer `this`.
+    if (narrowedThisDeclares(b, name, ir.FileId.from(0))) {
+        if (sct) std.debug.print("[sct] {s}: narrowed this declares it\n", .{name});
         return this_reg;
     }
     var i = sbs.len;
@@ -19087,6 +19153,9 @@ fn lowerUnresolvedBareCall(
             recv_ty,
             .{ .reg = this_reg, .non_null = true },
         );
+        if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+            if (std.mem.eql(u8, w, name0)) std.debug.print("[bare-member] {s} outcome={s} recv_ty={s} this_reg={d}\n", .{ name0, @tagName(std.meta.activeTag(bare_member)), recv_ty.name, this_reg.int() });
+        }
         switch (bare_member) {
             .lowered => |reg| {
                 orEmitAudit(b, "unresolved_bare_call", "Call/bare-member", name0);
@@ -19571,6 +19640,20 @@ fn lowerFqnGlobalCall(
     if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| {
         const prefix = fqn[0..dot];
         const prefix_name = rsplitLast(prefix, '.');
+        // A single-segment prefix that scope binds first (a local, an own or
+        // enclosing member, a receiver's member, the smart-cast `this`'s
+        // member) is that binding, not the same-named top-level property,
+        // whose qualified name equals its simple name in the default package:
+        // `items.sum()` inside `is Wrapper ->` read the global `items`.
+        if (std.mem.indexOfScalar(u8, prefix, '.') == null and !head_is_real_pkg) {
+            const pfile = exprSpan(callee).file;
+            if (b.resolve(prefix) != null or b.knowsOuter(prefix) or b.hasOwnMember(prefix) or
+                b.hasEnclosingMember(prefix) or narrowedThisDeclares(b, prefix, pfile) or
+                (inReceiverContext(b) and anyReceiverClassDeclares(b, prefix)))
+            {
+                return null;
+            }
+        }
         // The suspend-intrinsic property has no registry row of its own; a
         // qualified call through it (`kotlin.coroutines.coroutineContext
         // .cancel()`) is a member call on the property's value exactly like
@@ -20773,6 +20856,13 @@ fn lowerResolvedMemberCall(
         }
         break :blk ep;
     } else null;
+    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name.name)) {
+            std.debug.print("[lrm] {s} owner={s} dispatch={s} applicable={} target={?d} eager={?d} nargs={d} shapes:", .{ name.name, b.module.classes.items[static_owner.int()].fqn, @tagName(resolved.dispatch), resolved.applicable, if (resolved.target) |t| t.int() else null, if (eager_pick) |e| e.int() else null, args.len });
+            for (shapes) |*sh| std.debug.print(" {s}{s}", .{ if (sh.ty) |t| t.name else "?", if (sh.is_lambda) "(lambda)" else "" });
+            std.debug.print("\n", .{});
+        }
+    }
     const func_id = eager_pick orelse resolved.target orelse {
         last_member_refuted = !resolved.applicable;
         return if (resolved.applicable) .deferred else .none;
@@ -20916,6 +21006,18 @@ fn lowerResolvedMemberCall(
             if (ef.params.len != 0 and std.mem.eql(u8, ef.params[0].name, "this")) {
                 resolved.dispatch = .direct;
             }
+        }
+    }
+    // A VALUE-CLASS owner has no runtime dispatch to defer to: its instances
+    // travel unboxed, so a deferred member call would look for the member on
+    // the underlying value's class and miss (`set(value) { … }` on
+    // `Updater<T>`, whose receiver is the Composer at run time). The class is
+    // final and the target is its only unrefuted member, so bind it directly.
+    if (resolved.dispatch == .deferred and resolved.target != null and resolved.applicable) {
+        const owner_cls = &b.module.classes.items[static_owner.int()];
+        if (owner_cls.is_value) {
+            resolved.dispatch = b.module.dispatchForTarget(static_owner, resolved.target.?) orelse .direct;
+            if (resolved.dispatch == .deferred) resolved.dispatch = .direct;
         }
     }
     if (resolved.dispatch == .deferred) {

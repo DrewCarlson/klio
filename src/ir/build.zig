@@ -3197,7 +3197,35 @@ pub const FuncBuilder = struct {
     }
 
     /// Append an instruction to the current block.
+    threadlocal var push_trace_checked: bool = false;
+    threadlocal var gf_trace: ?[]const u8 = null;
+    threadlocal var lg_trace: ?[]const u8 = null;
+    fn pushTraceInit() void {
+        if (push_trace_checked) return;
+        push_trace_checked = true;
+        if (std.c.getenv("KLIO_GF_TRACE")) |w| gf_trace = std.mem.span(w);
+        if (std.c.getenv("KLIO_LG_TRACE")) |w| lg_trace = std.mem.span(w);
+    }
+
     pub fn push(self: *FuncBuilder, inst: Inst) Allocator.Error!void {
+        // KLIO_GF_TRACE=<field> / KLIO_LG_TRACE=<name>: name the emitter of a
+        // field read or global load (the return address symbolizes with
+        // addr2line), for a read that lands on the wrong receiver.
+        pushTraceInit();
+        if (inst == .GetField) {
+            if (gf_trace) |w| {
+                const cs = self.module.consts.items;
+                const nm = if (inst.GetField.field.int() < cs.len and cs[inst.GetField.field.int()] == .String) cs[inst.GetField.field.int()].String else "?";
+                if (std.mem.eql(u8, w, nm)) std.debug.print("[gf] {s} recv=r{d} in={s} ret=0x{x}\n", .{ nm, inst.GetField.receiver.int(), currentRealFn() orelse "-", @returnAddress() });
+            }
+        }
+        if (inst == .LoadGlobal) {
+            if (lg_trace) |w| {
+                const cs = self.module.consts.items;
+                const nm = if (inst.LoadGlobal.name.int() < cs.len and cs[inst.LoadGlobal.name.int()] == .String) cs[inst.LoadGlobal.name.int()].String else "?";
+                if (std.mem.eql(u8, w, nm)) std.debug.print("[lg] {s} ret=0x{x}\n", .{ nm, @returnAddress() });
+            }
+        }
         if (emitTraceWant()) |want| {
             switch (inst) {
                 .Call => |c| {

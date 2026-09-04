@@ -209,7 +209,10 @@ fn memoFor(s: []const u8) ?*RecvMemo {
 }
 
 fn noteRecvData(d: *const runtime.StringData) void {
-    if (recv_memo.valid and recv_memo.ptr == d.bytes.ptr and recv_memo.len == d.bytes.len) return;
+    // Always refreshed from the live header: a collected string's bytes can
+    // be reused by a new string of the same length at the same address, so
+    // address and length alone never prove the cached meta still applies.
+    // The walk cursor lives on the cell, so nothing is lost by re-pointing.
     recv_memo = .{
         .ptr = d.bytes.ptr,
         .len = d.bytes.len,

@@ -6067,9 +6067,27 @@ pub const Module = struct {
         var unknown_count: usize = 0;
         var visibility_unknown = false;
         var any_applicable = false;
+        // A `@Deprecated(level = ERROR|HIDDEN)` member is not a source-level
+        // candidate while an ordinary same-name member exists: kotlinc never
+        // binds `Updater.set(value: Int, ...)` (HIDDEN) beside the generic
+        // `set(value: V, ...)`, and counting it as a second unknown for a
+        // type-parameter-shaped argument left the call with no target at all.
+        // Kept as the last resort for a name whose every overload is hidden,
+        // mirroring `funcId`.
+        var any_ordinary = false;
+        for (candidates.items) |candidate| {
+            const cf = self.funcById(candidate.fid) orelse continue;
+            if (!cf.deprecated_error) {
+                any_ordinary = true;
+                break;
+            }
+        }
         for (candidates.items) |candidate| {
             const fid = candidate.fid;
             const ds = self.decl_sigs.get(fid.int()) orelse continue;
+            if (any_ordinary) {
+                if (self.funcById(fid)) |cf| if (cf.deprecated_error) continue;
+            }
             if (ds.kind != .instance_method) continue;
             const declared_owner = ds.enclosing_class orelse owner;
             if (ds.visibility == .Private and
@@ -6098,6 +6116,9 @@ pub const Module = struct {
             const listed_values = f.params.len - @intFromBool(lists_this);
             if (ds.arity.total != 0 and listed_values < ds.arity.required and (!f.hasBody() or listed_values < ds.arity.total)) {
                 if (args.len >= ds.arity.required and (args.len <= ds.arity.total or ds.arity.has_vararg)) {
+                    if (std.c.getenv("KLIO_RMC_TRACE")) |w| {
+                        if (std.mem.eql(u8, std.mem.span(w), name)) std.debug.print("[rmc] {s} cand={s}#{d} STUB-UNKNOWN params={d} body={} required={d} total={d}\n", .{ name, f.fqn, fid.int(), f.params.len, f.hasBody(), ds.arity.required, ds.arity.total });
+                    }
                     any_applicable = true;
                     unknown = fid;
                     unknown_count += 1;
@@ -6140,7 +6161,7 @@ pub const Module = struct {
             );
             if (runtime.envOnce("KLIO_RMC_TRACE")) |w| {
                 if (std.mem.eql(u8, w, name))
-                    std.debug.print("[rmc] {s} cand={s} verdict={s}\n", .{ name, f.fqn, @tagName(rmc_verdict) });
+                    std.debug.print("[rmc] {s} cand={s}#{d} verdict={s} params={d} body={}\n", .{ name, f.fqn, fid.int(), @tagName(rmc_verdict), f.params.len, f.hasBody() });
             }
             switch (rmc_verdict) {
                 .incompatible => continue,
