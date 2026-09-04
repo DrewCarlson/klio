@@ -17899,7 +17899,6 @@ fn extPropExistsOn(b: *const FuncBuilder, head: []const u8, name: []const u8) bo
 /// set… }`) declares `name` as a member or property: such a bare name is the
 /// narrowed receiver's own, ahead of any same-named global or outer `this`.
 fn narrowedThisDeclares(b: *const FuncBuilder, name: []const u8, file: ir.FileId) bool {
-    if (runtime.envOnce("KLIO_NO_NARROW_THIS") != null) return false;
     const nh = b.thisNarrow() orelse return false;
     const h = typeHead(std.mem.trimEnd(u8, nh, "?"));
     if (h.len == 0) return false;
@@ -21014,9 +21013,7 @@ fn lowerResolvedMemberCall(
     // the underlying value's class and miss (`set(value) { … }` on
     // `Updater<T>`, whose receiver is the Composer at run time). The class is
     // final and the target is its only unrefuted member, so bind it directly.
-    if (resolved.dispatch == .deferred and resolved.target != null and resolved.applicable and
-        runtime.envOnce("KLIO_NO_VALUE_DIRECT") == null)
-    {
+    if (resolved.dispatch == .deferred and resolved.target != null and resolved.applicable) {
         const owner_cls = &b.module.classes.items[static_owner.int()];
         if (owner_cls.is_value) {
             resolved.dispatch = b.module.dispatchForTarget(static_owner, resolved.target.?) orelse .direct;

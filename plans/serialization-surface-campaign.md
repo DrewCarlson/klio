@@ -1060,3 +1060,19 @@ outside the lock (`traceRemembered`, with a unit test whose tracer runs the
 barrier), and the mark-only `SharedClosures.getPtr` takes a shared borrow
 so marking never runs the barrier at all. `SnapshotIdSetTests` completes in
 43 s; `SlotTableAddressSpaceTests` in 27 s.
+
+The remaining incomplete class, `SlotTableAddressSpaceTests`, was a silent
+SIGSEGV that only the gate's binary hit: the gate runs the **ReleaseFast**
+harness (`klio-harness-fast`), not the ReleaseSafe one the census uses, and
+the fault was flaky (about two runs in three) and vanished when a fault
+handler was attached. Localized by tier switches (`KLIO_BC=0` passes,
+`KLIO_LEAVES=0` passes, one worker thread passes) and then a
+`KLIO_SEGV_TRACE=1` trace: `scoreCtorHeads` compared a secondary-constructor
+head against `ctor_static_heads[i]`, a thread-local that the bytecode tier's
+`NewInstance` arms point at a per-call array freed when the site returns and
+never take back, so a later secondary-ctor ranking on that thread read freed
+memory. The site heads now live in a thread-owned buffer (the head strings
+are module constants) and `newInstance` snapshots the taken heads into its
+own frame so a nested construction cannot rewrite them; secondary-ctor
+entries also own their name/head strings instead of slicing the
+declaration's AST. Six of six runs pass on the ReleaseFast harness.

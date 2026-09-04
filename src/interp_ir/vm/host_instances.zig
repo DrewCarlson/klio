@@ -143,9 +143,32 @@ fn sideTableKey(fqn: ?[]const u8, name: []const u8) []const u8 {
 /// further instances underneath and must rank on its own terms.
 threadlocal var ctor_static_heads: ?[]const ?[]const u8 = null;
 
+/// The construction site's static heads live in this thread-owned buffer:
+/// the array a site hands over is freed when the site returns (the bytecode
+/// tier's NewInstance arm never takes it back), and a later secondary-ctor
+/// ranking on the same thread read the freed array. The head strings are
+/// module constants, so copying the slice array is enough. A site with more
+/// arguments than the buffer holds ranks without static heads.
+const CTOR_HEADS_MAX = 32;
+threadlocal var ctor_static_heads_buf: [CTOR_HEADS_MAX]?[]const u8 = undefined;
+
 pub fn setCtorArgStaticHeads(self: *VmHost, heads: []const ?[]const u8) void {
     _ = self;
-    ctor_static_heads = if (heads.len == 0) null else heads;
+    if (heads.len == 0 or heads.len > CTOR_HEADS_MAX) {
+        ctor_static_heads = null;
+        return;
+    }
+    @memcpy(ctor_static_heads_buf[0..heads.len], heads);
+    ctor_static_heads = ctor_static_heads_buf[0..heads.len];
+}
+
+/// Forget any construction-site heads left installed by a path that never
+/// took them (a host class, a factory, a value-class shortcut): the slice
+/// they name is freed when the site returns, and the next secondary-ctor
+/// ranking on this thread would read it.
+pub fn clearCtorArgStaticHeads(self: *VmHost) void {
+    _ = self;
+    ctor_static_heads = null;
 }
 
 fn takeCtorStaticHeads() ?[]const ?[]const u8 {
@@ -2075,7 +2098,13 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
     // are consumed here and re-installed only across the two ranking regions
     // below, so nothing evaluated underneath (a delegation, a default) ranks
     // against this site's types.
-    const site_heads = takeCtorStaticHeads();
+    // Snapshot the taken heads into this frame: a construction underneath (a
+    // delegation argument, a default) rewrites the thread's buffer.
+    var site_heads_buf: [CTOR_HEADS_MAX]?[]const u8 = undefined;
+    const site_heads: ?[]const ?[]const u8 = if (takeCtorStaticHeads()) |sh| blk: {
+        @memcpy(site_heads_buf[0..sh.len], sh);
+        break :blk site_heads_buf[0..sh.len];
+    } else null;
     ctor_static_heads = site_heads;
     defer ctor_static_heads = null;
     const zero_primary_secondary = n_primary_initial == 0 and blk: {

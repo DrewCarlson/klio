@@ -3870,8 +3870,11 @@ fn buildModuleWithOverrides(
         }
         var entries = try a.alloc(SecondaryCtorEntry, c.secondary_ctors.len);
         for (c.secondary_ctors, 0..) |*sc, sc_idx| {
+            // The entry outlives the declaration's AST (a pack's sources are
+            // released once their bindings are extracted), so its strings are
+            // the module's own copies, never slices into the parse.
             var param_names = try a.alloc([]const u8, sc.params.len);
-            for (sc.params, 0..) |*p, i| param_names[i] = p.name.name;
+            for (sc.params, 0..) |*p, i| param_names[i] = try a.dupe(u8, p.name.name);
             var param_type_heads = try a.alloc([]const u8, sc.params.len);
             for (sc.params, 0..) |*p, i| {
                 // A function-typed parameter's name field is empty; record
@@ -3881,7 +3884,7 @@ fn buildModuleWithOverrides(
                 param_type_heads[i] = if (p.ty.function != null)
                     try ir.lower.decl.loweredTypeName(a, &p.ty)
                 else
-                    simpleTypeHead(p.ty.name.name);
+                    try a.dupe(u8, simpleTypeHead(p.ty.name.name));
             }
 
             var delegation_args: []const ast.Expr = &.{};

@@ -6085,7 +6085,7 @@ pub const Module = struct {
         for (candidates.items) |candidate| {
             const fid = candidate.fid;
             const ds = self.decl_sigs.get(fid.int()) orelse continue;
-            if (any_ordinary and std.c.getenv("KLIO_NO_HIDDEN_SKIP") == null) {
+            if (any_ordinary) {
                 if (self.funcById(fid)) |cf| if (cf.deprecated_error) continue;
             }
             if (ds.kind != .instance_method) continue;

@@ -1326,6 +1326,9 @@ pub noinline fn execArmNewInstance(comptime H: type, allocator: Allocator, frame
     if (comptime @hasDecl(H, "setCtorArgStaticHeads")) {
         host.setCtorArgStaticHeads(static_heads);
     }
+    // Cleared on every exit: a construction path that never takes the heads
+    // must not leave this thread pointing at the slice freed above.
+    defer if (comptime @hasDecl(H, "clearCtorArgStaticHeads")) host.clearCtorArgStaticHeads();
     const result = switch (try host.newInstanceNamed(allocator, ni.class, arg_values, names, hint_ptr)) {
         .ok => |v| v,
         .err => |e| return raiseStep(frame, e),
