@@ -2817,6 +2817,10 @@ pub fn tryInlineCallWithTypeArgs(
             if (nm) |name| {
                 const idx = paramIndex(f, name) orelse return null;
                 if (idx == vi) return null;
+                if (ordered[idx] != null) {
+                    spliceBail(fname, "named-collision");
+                    return null;
+                }
                 ordered[idx] = a;
                 elem_end = @min(elem_end, ai);
             }
@@ -2833,6 +2837,14 @@ pub fn tryInlineCallWithTypeArgs(
                     spliceBail(fname, "named-param-miss");
                     return null;
                 };
+                // A name for a slot a positional argument already took is
+                // Kotlin's "argument passed twice" error, and the sign that
+                // this candidate is the wrong overload: three arguments with
+                // a trailing `mode = x` never fit a two-parameter body.
+                if (ordered[idx] != null) {
+                    spliceBail(fname, "named-collision");
+                    return null;
+                }
                 ordered[idx] = a;
             } else {
                 while (next_pos < ordered.len and ordered[next_pos] != null) {

@@ -688,6 +688,23 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                     switch (inst) {
                         .Trace => |t| std.debug.print("[dumpfn]   Trace {any}\n", .{t}),
                         .Call => |c| std.debug.print("[dumpfn]   Call func=#{d} n_args={d} exact={}\n", .{ c.func.int(), c.n_args, c.exact }),
+                        .CallMemberOrGlobal => |cg| {
+                            const nm = blk: {
+                                const cs = dmg.get().consts.items;
+                                if (cg.name.int() < cs.len and cs[cg.name.int()] == .String)
+                                    break :blk cs[cg.name.int()].String;
+                                break :blk "?";
+                            };
+                            std.debug.print("[dumpfn]   CallMemberOrGlobal dst=r{d} name={s} n_args={d} func={?d} final={} class={?d} cands={d}\n", .{
+                                cg.dst.int(),
+                                nm,
+                                cg.n_args,
+                                if (cg.func) |f| f.int() else null,
+                                cg.func_final,
+                                if (cg.class) |c| c.int() else null,
+                                if (cg.candidates) |cl| cl.len else 0,
+                            });
+                        },
                         .MakeCell => |mc| std.debug.print("[dumpfn]   MakeCell dst=r{d}\n", .{mc.dst.int()}),
                         .CellSet => |cs| std.debug.print("[dumpfn]   CellSet cell=r{d} value=r{d}\n", .{ cs.cell.int(), cs.value.int() }),
                         .CellGet => |cg2| std.debug.print("[dumpfn]   CellGet dst=r{d} cell=r{d}\n", .{ cg2.dst.int(), cg2.cell.int() }),

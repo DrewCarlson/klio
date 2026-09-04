@@ -185,3 +185,15 @@ the ranking must select the exact `lerp(Float,Float,Float)`, not the Color
 value-class overload. Deferred as a dispatch-ranking change (core path,
 regression-risky; needs a cross-package repro and a full compose-battery
 re-verify) rather than risk it for one test.
+
+### ShadowTest.testLerp root (compose_ui 451/1 → 452/0 expected at jc24)
+
+The sole compose_ui failure was a lowering shape bug in the ui-graphics pack
+body, not a test-side issue: `graphics.lerp(Shadow, Shadow, Float)` typed
+`start.offset` as `DpOffset` because the property-head index keyed classes by
+simple name and `graphics.shadow.Shadow` (a different class with
+`offset: DpOffset`) clobbered `graphics.Shadow`. The index now carries
+qualified keys and the member-read typing resolves the owner through the
+site's file scope. Full record in `plans/serialization-surface-campaign.md`
+(round jc23 → jc24). Once jc24 confirms 452/0 the compose_ui floor ratchets
+to 452 (baseline) and the suite is standing at zero.

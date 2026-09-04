@@ -852,3 +852,74 @@ propagation, not serialization) and JsonNamesTest.testThrowsAnErrorOnDuplicateNa
 jsonTestingMode = streaming) }`) invokes the captured `serializer` object with
 one argument before any `decodeFromString` runs; positional form passes; the
 plain non-serialization shape passes — still open).
+
+Round (2026-09-04, jc22 -> jc23): jc22 confirmed the regression fixes
+(coroutines 1299/0, ktor 450/0, json 738/4). Landed after it:
+- Expected-type integer literals (`applyExpectedLiteralKinds`): a declared
+  local type, a callee parameter type (`argLambdaParamTypes`/`emitCall`), or a
+  constructor primary parameter binds the factory's type parameters
+  (`positionalBind` of the return type against the expectation) and rewrites
+  the literal kinds inside, infix `to` and generic constructors included.
+  JsonMapKeys x3 pass in the closure replay.
+- Function-local class `: Exception("msg")` keeps its message: the local
+  parent chain binds throwable args for a builtin parent by name, whether or
+  not the stdlib `Exception` class def is the parent.
+- `hostHasMember` resolves a CLASS receiver through its companion/object
+  singleton (so `X.serializer()` beside a same-named local is a member call).
+Remaining json residue (1): JsonNamesTest.testThrowsAnErrorOnDuplicateNames —
+a reified inline splice (`assertFailsWithMessage<T> { }` or any user-defined
+reified inline wrapper) around `json.decodeFromString(serializer, s,
+jsonTestingMode = streaming)` (a member-extension of the test base with a
+NAMED argument) ends in `invoke` on the serializer object; positional form,
+non-inline wrappers, and non-reified inline wrappers all pass; the spliced IR
+is a plain `CallMember json.'decodeFromString'(serializer, s, streaming)` with
+consistent captures, so the fault is in the runtime named dispatch of the
+member-extension under the splice's global `T`. Open.
+
+### Round jc23 → jc24: the last json residue, plus the compose ShadowTest root
+
+`JsonNamesTest.testThrowsAnErrorOnDuplicateNames` (json 741 → 742/744 expected).
+The runtime-lowered lambda spliced JsonTestBase's TWO-parameter reified
+`Json.decodeFromString(source, jsonTestingMode)` for the THREE-argument call
+`json.decodeFromString(serializer, "...", jsonTestingMode = streaming)`: the
+splice placed arguments in written order, so the string literal took slot 1
+and the later named argument silently overwrote it (no overflow, no
+collision). The helper body then bound `source` to the serializer object and
+its `serializersModule.serializer<T>()` resolved the bare `serializer(typeOf<T>())`
+to the call-site local `serializer` — the `invoke` on the serializer object.
+Root fix (`inline_call.zig`): a named argument that names a slot a positional
+argument already filled is Kotlin's "argument passed twice" and marks the
+candidate as the wrong overload (`named-collision` bail, both the vararg and
+plain branches). The call then binds the three-parameter member extension.
+Example: `examples/named_arg_collision_reified_overload.kt`.
+
+Compose `ShadowTest.testLerp` (compose_ui 451/1 → 452/0 expected). Not a
+runtime re-rank: the PACK body of `graphics.lerp(Shadow, Shadow, Float)`
+(Shadow.kt:71, lowered lazily at first call) statically bound
+`lerp(start.offset, stop.offset, fraction)` to `unit.lerp(DpOffset, DpOffset, Float)`
+(tier 5, never imported) because the argument SHAPE of `start.offset` was
+`DpOffset`: `class_prop_type_heads` is keyed by SIMPLE class name, and
+`androidx.compose.ui.graphics.shadow.Shadow.offset: DpOffset` (indexed
+later) clobbered `androidx.compose.ui.graphics.Shadow.offset: Offset`.
+Root fix: the index records every class/object property head under the
+declaration's QUALIFIED name too (`declFqnAt`: override by decl span, else
+the decl file's package — the primary file's prefix is empty in a merged
+build), and the member-read typing route (`argDeclTypeRefLazyUncached`'s
+`.Member` block, `propTypeHeadOn`, the qualified-receiver arm) consults the
+site's own view of the owner first — the written `#qual:` marker when the
+declaration spelled a qualified type, else `classIdIndexed` through the
+site file. Single-file regression: `examples/namesake_class_property_types.kt`
+(user `demo.Regex.pattern: Int` vs `kotlin.text.Regex.pattern: String`; a
+read through the qualified type bound the user's `Int` overload before).
+Tooling: `KLIO_BARE_TRACE` now prints each candidate's parameter types
+(`[bare-cand-param]`) and the site's argument shapes (`[bare-shape]`);
+`KLIO_CIX_TRACE=<Class>` prints the scoped property-owner picks
+(`[cix-prop]`, `[cix-route]`); `KLIO_DUMP_FN` shows `CallMemberOrGlobal`
+name/func/candidate count.
+
+The same mechanism covers NESTED classes sharing a simple name across
+different outers (`Board.Item(val offset: Int)` / `Text.Item(val offset: String)`
+collided under the bare `Item` key and `show(b.offset)` picked the `String`
+overload): the flattened nested declaration's override yields `Board.Item`,
+the twin key holds it, and the receiver type of the producing member already
+carries the dotted name. Example: `examples/nested_namesake_property_types.kt`.

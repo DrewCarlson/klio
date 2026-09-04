@@ -1,0 +1,11 @@
+member extension explicit source=bad input mode=FAST on b1
+threw IllegalStateException: cannot decode bad input
+member extension explicit source=fine mode=FAST on b1
+ok=fine
+member extension explicit source=bad input mode=SLOW on b1
+threw IllegalStateException: cannot decode bad input
+member extension explicit source=fine mode=SLOW on b1
+ok=fine
+reified helper String source=plain mode=FAST
+member extension inferred source=plain mode=FAST on b1
+inferred=plain
