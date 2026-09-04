@@ -2538,7 +2538,7 @@ fn buildModuleWithOverrides(
         var fcit = file_classes.iterator();
         while (fcit.next()) |e| {
             registerInlineMemberOwners(e.value_ptr.get().members, e.value_ptr.get().name.name);
-            registerMemberPropAsts(a, e.value_ptr.get().members, e.value_ptr.get().name.name);
+            registerMemberPropAsts(a, e.value_ptr.get().members, e.value_ptr.get().name.name, resolveFqn(a, fqn_overrides, e.value_ptr.get().span, package_prefix, e.value_ptr.get().name.name) catch null);
             ir.lower.registerClassSupertypeRefs(e.value_ptr.get().name.name, e.value_ptr.get().supertypes);
             registerClassSupertypes(e.value_ptr.get().members);
         }
@@ -2546,8 +2546,8 @@ fn buildModuleWithOverrides(
         // build's decls — user files plus re-parsed pack sources.
         for (decls) |*d| {
             switch (d.*) {
-                .Object => |*o| registerMemberPropAsts(a, o.members, o.name.name),
-                .Class => |*c| registerMemberPropAsts(a, c.members, c.name.name),
+                .Object => |*o| registerMemberPropAsts(a, o.members, o.name.name, declFqnAt(a, module, fqn_overrides, o.span, package_prefix, o.name.name) catch null),
+                .Class => |*c| registerMemberPropAsts(a, c.members, c.name.name, declFqnAt(a, module, fqn_overrides, c.span, package_prefix, c.name.name) catch null),
                 else => {},
             }
         }
@@ -4524,11 +4524,18 @@ fn collectConsts(module: *Module, cls_name: []const u8, members: []const Decl) A
 /// Register each property AST in `members` under its owner class/object,
 /// recursing into nested types, so reified-type-argument inference can
 /// resolve a property-access argument's generic type.
-fn registerMemberPropAsts(a: Allocator, members: []const Decl, owner: []const u8) void {
+fn registerMemberPropAsts(a: Allocator, members: []const Decl, owner: []const u8, qualified: ?[]const u8) void {
     for (members) |*m| {
         switch (m.*) {
             .Property => |p| {
                 ir.lower.registerMemberPropAst(a, owner, p);
+                // The qualified owner too (`LinkComposer.CompositionContextImpl`):
+                // two inner classes of one package can share a simple name, and
+                // a read that resolved its owner lexically must find ITS
+                // initializer, not the other class's.
+                if (qualified) |q| {
+                    if (!std.mem.eql(u8, q, owner)) ir.lower.registerMemberPropAst(a, q, p);
+                }
                 // A member-EXTENSION property (`private val Composition.parent`)
                 // is recorded under a dedicated key so a same-named plain member
                 // of the same class does not hide it: a read whose static
@@ -4538,8 +4545,8 @@ fn registerMemberPropAsts(a: Allocator, members: []const Decl, owner: []const u8
                     ir.lower.registerMemberExtPropRecv(a, owner, p.name.name, rt.name.name);
                 }
             },
-            .Class => |*c| registerMemberPropAsts(a, c.members, c.name.name),
-            .Object => |*o| registerMemberPropAsts(a, o.members, o.name.name),
+            .Class => |*c| registerMemberPropAsts(a, c.members, c.name.name, nestedQualified(a, qualified, c.name.name)),
+            .Object => |*o| registerMemberPropAsts(a, o.members, o.name.name, nestedQualified(a, qualified, o.name.name)),
             else => {},
         }
     }
@@ -4548,6 +4555,11 @@ fn registerMemberPropAsts(a: Allocator, members: []const Decl, owner: []const u8
 /// Register the declared supertypes of every class/object in `decls`,
 /// recursing into nested types, so reified-type-argument inference can read
 /// an argument declaration's own type arguments.
+fn nestedQualified(a: Allocator, outer: ?[]const u8, simple: []const u8) ?[]const u8 {
+    const o = outer orelse return null;
+    return std.fmt.allocPrint(a, "{s}.{s}", .{ o, simple }) catch null;
+}
+
 fn registerClassSupertypes(members: []const Decl) void {
     for (members) |*m| {
         switch (m.*) {

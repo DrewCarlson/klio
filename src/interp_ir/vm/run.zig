@@ -688,6 +688,21 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                     switch (inst) {
                         .Trace => |t| std.debug.print("[dumpfn]   Trace {any}\n", .{t}),
                         .Call => |c| std.debug.print("[dumpfn]   Call func=#{d} n_args={d} exact={}\n", .{ c.func.int(), c.n_args, c.exact }),
+                        .NewInstance => |ni| {
+                            const cls = dmg.get().classes.items;
+                            const nm = if (ni.class.int() < cls.len) cls[ni.class.int()].fqn else "?";
+                            std.debug.print("[dumpfn]   NewInstance dst=r{d} class={s} n_args={d}\n", .{ ni.dst.int(), nm, ni.n_args });
+                        },
+                        .GetField => |gf| {
+                            const cs = dmg.get().consts.items;
+                            const nm = if (gf.field.int() < cs.len and cs[gf.field.int()] == .String) cs[gf.field.int()].String else "?";
+                            std.debug.print("[dumpfn]   GetField dst=r{d} recv=r{d} field={s}\n", .{ gf.dst.int(), gf.receiver.int(), nm });
+                        },
+                        .LoadFromThisOrGlobal => |lg| {
+                            const cs = dmg.get().consts.items;
+                            const nm = if (lg.name.int() < cs.len and cs[lg.name.int()] == .String) cs[lg.name.int()].String else "?";
+                            std.debug.print("[dumpfn]   LoadFromThisOrGlobal dst=r{d} name={s}\n", .{ lg.dst.int(), nm });
+                        },
                         .CallMemberOrGlobal => |cg| {
                             const nm = blk: {
                                 const cs = dmg.get().consts.items;
