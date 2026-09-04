@@ -74,6 +74,26 @@ pub const StringData = struct {
     bytes: []const u8,
     u16_len: u32,
     ascii: bool,
+    /// Cursor cache for UTF-16 index conversions on a non-ASCII string: a
+    /// UTF-16 index and the byte offset of the same boundary, packed into one
+    /// atomic word so a reader on another thread never sees a torn pair. A
+    /// sequential walk (`s[i]`, `substring(i, j)`, `append(s, from, to)` with
+    /// advancing positions) resumes from it instead of re-walking from byte 0,
+    /// which kept a JSON lexer over a long non-ASCII source linear.
+    cursor: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    pub const Cursor = struct { u16_pos: usize, byte_pos: usize };
+
+    pub fn cursorGet(self: *const StringData) Cursor {
+        const w = self.cursor.load(.monotonic);
+        return .{ .u16_pos = @intCast(w >> 32), .byte_pos = @intCast(w & 0xFFFF_FFFF) };
+    }
+
+    pub fn cursorSet(self: *const StringData, u16_pos: usize, byte_pos: usize) void {
+        if (u16_pos > 0xFFFF_FFFF or byte_pos > 0xFFFF_FFFF) return;
+        const w = (@as(u64, @intCast(u16_pos)) << 32) | @as(u64, @intCast(byte_pos));
+        @constCast(&self.cursor).store(w, .monotonic);
+    }
 
     /// A Kotlin `String` is immutable: `bytes`/`u16_len`/`ascii` are set once at
     /// construction and only ever read until teardown frees the bytes. Nothing

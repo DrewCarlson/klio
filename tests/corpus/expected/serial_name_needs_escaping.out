@@ -1,0 +1,5 @@
+{"\"":"1","back\\slash":"2","$price":"3","🤔?":"4","tab\tsep":"5"}
+true
+true
+outer "quoted" name
+Keys(quote=a, slash=b, dollar=c, thinking=d, tab=e)

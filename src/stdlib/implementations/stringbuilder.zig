@@ -123,6 +123,92 @@ fn charUnitToString(allocator: Allocator, unit: u16) Allocator.Error![]u8 {
 /// (a surrogate pair), a lone WTF-8 surrogate and any BMP scalar are one. For a
 /// surrogate-free string this equals the scalar count, so normal text is
 /// unaffected.
+/// Reader-side memo for ONE builder: ASCII-ness, UTF-16 length, and a
+/// UTF-16/byte cursor, keyed by the builder's cell and its buffer identity.
+/// Every mutating builtin (through `sbMut`) and every construction of a
+/// builder invalidates a memo on that cell, so a read-only phase — the okio
+/// shim's reader doing `sb[pos++]` and `sb.length` per code point over a
+/// 150 KB JSON buffer — costs O(1) per read instead of re-encoding the
+/// whole buffer, while any write simply recomputes on the next read.
+const SbMemo = struct {
+    cell: usize = 0,
+    ptr: [*]const u8 = undefined,
+    len: usize = 0,
+    ascii: bool = false,
+    u16_len: usize = 0,
+    u16_pos: usize = 0,
+    byte_pos: usize = 0,
+};
+threadlocal var sb_memo: SbMemo = .{};
+
+pub fn sbMemoInvalidate(cell: usize) void {
+    if (sb_memo.cell == cell) sb_memo.cell = 0;
+}
+
+fn sbMut(sb: anytype) @TypeOf(sb.borrowMut()) {
+    sbMemoInvalidate(@intFromPtr(sb.cell));
+    return sb.borrowMut();
+}
+
+fn sbMemoFor(sb: anytype, items: []const u8) *SbMemo {
+    const key = @intFromPtr(sb.cell);
+    if (sb_memo.cell == key and sb_memo.ptr == items.ptr and sb_memo.len == items.len) return &sb_memo;
+    var ascii = true;
+    for (items) |b| {
+        if (b >= 0x80) {
+            ascii = false;
+            break;
+        }
+    }
+    sb_memo = .{
+        .cell = key,
+        .ptr = items.ptr,
+        .len = items.len,
+        .ascii = ascii,
+        .u16_len = if (ascii) items.len else charCount(items),
+    };
+    return &sb_memo;
+}
+
+/// The UTF-16 unit at index `idx` of a non-ASCII buffer, resuming from the
+/// memo's cursor when it is at or before the target and leaving the cursor
+/// on the character found, so a sequential read stays linear.
+fn sbUnitAt(m: *SbMemo, s: []const u8, idx: usize) ?u16 {
+    var n: usize = 0;
+    var i: usize = 0;
+    if (m.u16_pos <= idx and m.byte_pos <= s.len) {
+        n = m.u16_pos;
+        i = m.byte_pos;
+    }
+    while (i < s.len) {
+        if (runtime.isWtf8SurrogateAt(s, i)) {
+            if (n == idx) {
+                m.u16_pos = n;
+                m.byte_pos = i;
+                const unit: u16 = (@as(u16, s[i] & 0x0F) << 12) | (@as(u16, s[i + 1] & 0x3F) << 6) | @as(u16, s[i + 2] & 0x3F);
+                return unit;
+            }
+            n += 1;
+            i += 3;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const end = @min(i + len, s.len);
+        const cp = std.unicode.utf8Decode(s[i..end]) catch s[i];
+        const units: usize = if (cp > 0xFFFF) 2 else 1;
+        if (idx < n + units) {
+            m.u16_pos = n;
+            m.byte_pos = i;
+            if (cp <= 0xFFFF) return @intCast(cp);
+            const v = cp - 0x10000;
+            return if (idx == n) @intCast(0xD800 + (v >> 10)) else @intCast(0xDC00 + (v & 0x3FF));
+        }
+        n += units;
+        i = end;
+    }
+    return null;
+}
+
 fn charCount(s: []const u8) usize {
     var n: usize = 0;
     var i: usize = 0;
@@ -522,7 +608,9 @@ pub fn string_builder_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
         buf.deinit(a);
         return errResult(.{ .Type = "StringBuilder takes 0 or 1 argument" });
     }
-    return ok(.{ .StringBuilder = try StringBuilderRef.init(a, buf) });
+    const ref = try StringBuilderRef.init(a, buf);
+    sbMemoInvalidate(@intFromPtr(ref.cell));
+    return ok(.{ .StringBuilder = ref });
 }
 
 // ============================================================
@@ -540,7 +628,7 @@ pub fn string_builder_set_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (value == null) return errResult(.{ .Type = "setRange value must be a String" });
     defer a.free(value.?);
 
-    const g = sb.borrowMut();
+    const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
     const units = try encodeUtf16(a, buf.items);
@@ -579,6 +667,28 @@ fn spliceUnits(allocator: Allocator, units: []const u16, start: usize, end: usiz
 pub fn string_builder_append_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.appendRange"));
+    // A `String` value appends its byte range directly: the range's bytes
+    // come from the string's own UTF-16 cursor, and the builder's buffer is
+    // never re-encoded (an escaper appending run after run of a long text
+    // was quadratic in both).
+    if (ctx.args.len > 1 and ctx.args[1] == .String) {
+        const g = ctx.args[1].String.borrow();
+        defer g.deinit();
+        const d = g.get();
+        const vlen: i64 = @intCast(d.u16_len);
+        const start = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse 0) else 0;
+        const end = if (ctx.args.len > 3) (ctx.args[3].asI64() orelse vlen) else vlen;
+        if (start < 0 or start > end or end > vlen) {
+            const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, vlen });
+            defer if (runtime.freeScratch()) a.free(msg);
+            return errResult(try rangeOob(a, msg));
+        }
+        const range = string.utf16RangeBytes(d, @intCast(start), @intCast(end));
+        const gb = sbMut(sb);
+        defer gb.deinit();
+        try gb.get().appendSlice(a, d.bytes[range[0]..range[1]]);
+        return okSb(sb);
+    }
     const value = if (ctx.args.len > 1) (try valueToUtf16(a, ctx.args[1])) else null;
     if (value == null) return errResult(.{ .Type = "appendRange value must be a CharArray/CharSequence" });
     defer a.free(value.?);
@@ -592,7 +702,7 @@ pub fn string_builder_append_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     const slice = value.?[@intCast(start)..@intCast(end)];
 
-    const g = sb.borrowMut();
+    const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
     const units = try encodeUtf16(a, buf.items);
@@ -623,7 +733,7 @@ pub fn string_builder_insert_range(ctx: *CallCtx) Allocator.Error!EvalResult {
         return errResult(try rangeOob(a, msg));
     }
 
-    const g = sb.borrowMut();
+    const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
     const units = try encodeUtf16(a, buf.items);
@@ -672,7 +782,7 @@ pub fn string_builder_append(ctx: *CallCtx) Allocator.Error!EvalResult {
         if (try appendOverflowGuard(ctx, sb, &v)) |oom| return oom;
         const piece = try renderPiece(ctx, v);
         defer a.free(piece);
-        const g = sb.borrowMut();
+        const g = sbMut(sb);
         defer g.deinit();
         try g.get().appendSlice(a, piece);
     }
@@ -698,7 +808,7 @@ pub fn string_builder_set(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     const unit = ctx.args[2].Char;
 
-    const g = sb.borrowMut();
+    const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
     var units = try encodeUtf16(a, buf.items);
@@ -721,12 +831,12 @@ pub fn string_builder_append_line(ctx: *CallCtx) Allocator.Error!EvalResult {
     for (ctx.args[1..]) |v| {
         const piece = try renderPiece(ctx, v);
         defer a.free(piece);
-        const g = sb.borrowMut();
+        const g = sbMut(sb);
         defer g.deinit();
         try g.get().appendSlice(a, piece);
     }
     {
-        const g = sb.borrowMut();
+        const g = sbMut(sb);
         defer g.deinit();
         try g.get().append(a, '\n');
     }
@@ -737,7 +847,7 @@ pub fn string_builder_length(ctx: *CallCtx) Allocator.Error!EvalResult {
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.length"));
     const g = sb.borrow();
     defer g.deinit();
-    return ok(Value.newInt(@intCast(charCount(g.get().items))));
+    return ok(Value.newInt(@intCast(sbMemoFor(sb, g.get().items).u16_len)));
 }
 
 /// `StringBuilder.capacity()` — the backing buffer's current capacity (always
@@ -757,7 +867,7 @@ pub fn string_builder_ensure_capacity(ctx: *CallCtx) Allocator.Error!EvalResult 
     if (ctx.args.len >= 2) {
         if (ctx.args[1].asI64()) |n| {
             if (n > 0) {
-                const g = sb.borrowMut();
+                const g = sbMut(sb);
                 defer g.deinit();
                 try g.get().ensureTotalCapacity(ctx.allocator, @intCast(n));
             }
@@ -802,15 +912,19 @@ pub fn string_builder_get(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = sb.borrow();
     defer g.deinit();
     const buf = g.get().items;
-    const units = try encodeUtf16(a, buf);
-    defer a.free(units);
-    const n: i64 = @intCast(units.len);
+    const m = sbMemoFor(sb, buf);
+    const n: i64 = @intCast(m.u16_len);
     if (idx.? < 0 or idx.? >= n) {
         const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ idx.?, n });
         defer if (runtime.freeScratch()) a.free(msg);
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
-    return ok(.{ .Char = units[@intCast(idx.?)] });
+    const ui: usize = @intCast(idx.?);
+    if (m.ascii) return ok(.{ .Char = buf[ui] });
+    if (sbUnitAt(m, buf, ui)) |u| return ok(.{ .Char = u });
+    const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ idx.?, n });
+    defer if (runtime.freeScratch()) a.free(msg);
+    return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
 }
 
 pub fn string_builder_is_empty(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -830,7 +944,7 @@ pub fn string_builder_is_not_empty(ctx: *CallCtx) Allocator.Error!EvalResult {
 pub fn string_builder_clear(ctx: *CallCtx) Allocator.Error!EvalResult {
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.clear"));
     {
-        const g = sb.borrowMut();
+        const g = sbMut(sb);
         defer g.deinit();
         g.get().clearRetainingCapacity();
     }
@@ -855,7 +969,7 @@ pub fn string_builder_insert(ctx: *CallCtx) Allocator.Error!EvalResult {
     defer piece.deinit(a);
     try piece.appendSlice(a, piece_bytes);
 
-    const g = sb.borrowMut();
+    const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
     // Splice in UTF-16-unit space so the insert index matches Kotlin even when
@@ -886,7 +1000,7 @@ pub fn string_builder_delete_at(ctx: *CallCtx) Allocator.Error!EvalResult {
     const idx = if (ctx.args.len > 1) ctx.args[1].asI64() else null;
     if (idx == null) return errResult(.{ .Type = "deleteAt index must be Int" });
 
-    const g = sb.borrowMut();
+    const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
     const units = try bufUnits(a, buf.items);
@@ -914,7 +1028,7 @@ pub fn string_builder_delete_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const end = if (ctx.args.len > 2) ctx.args[2].asI64() else null;
     if (end == null) return errResult(.{ .Type = "deleteRange end must be Int" });
 
-    const g = sb.borrowMut();
+    const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
     const units = try bufUnits(a, buf.items);
@@ -948,7 +1062,7 @@ pub fn string_builder_set_length(ctx: *CallCtx) Allocator.Error!EvalResult {
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
 
-    const g = sb.borrowMut();
+    const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
     const units = try bufUnits(a, buf.items);
@@ -971,7 +1085,7 @@ pub fn string_builder_set_length(ctx: *CallCtx) Allocator.Error!EvalResult {
 pub fn string_builder_reverse(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.reverse"));
-    const g = sb.borrowMut();
+    const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
     // Reverse by Kotlin `char` (UTF-8 scalar), mirroring `chars().rev()`.
@@ -1035,7 +1149,7 @@ pub fn string_builder_set_char_at(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     const ch = ctx.args[2].Char;
 
-    const g = sb.borrowMut();
+    const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
     const units = try bufUnits(a, buf.items);
@@ -1089,7 +1203,7 @@ pub fn string_builder_replace(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     defer a.free(repl);
 
-    const g = sb.borrowMut();
+    const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
     const units = try bufUnits(a, buf.items);
@@ -1131,7 +1245,9 @@ const testing = std.testing;
 fn newSb(a: Allocator, seed: []const u8) Allocator.Error!Value {
     var buf: Buffer = .empty;
     try buf.appendSlice(a, seed);
-    return .{ .StringBuilder = try StringBuilderRef.init(a, buf) };
+    const ref = try StringBuilderRef.init(a, buf);
+    sbMemoInvalidate(@intFromPtr(ref.cell));
+    return .{ .StringBuilder = ref };
 }
 
 /// Free a produced value and its backing heap. Under reclaim the `StringRef`

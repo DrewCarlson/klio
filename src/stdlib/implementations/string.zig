@@ -117,11 +117,13 @@ fn recvString(allocator: Allocator, args: []const Value, what: []const u8) Alloc
         .String => |s| {
             const g = s.borrow();
             defer g.deinit();
+            noteRecvData(g.get());
             return .{ .ok = g.get().bytes };
         },
         .StringBuilder => |sb| {
             const g = sb.borrow();
             defer g.deinit();
+            recv_memo.valid = false;
             return .{ .ok = g.get().items };
         },
         else => |other| {
@@ -165,13 +167,111 @@ fn argAsString(allocator: Allocator, v: Value, what: []const u8) Allocator.Error
 /// `utf8Decode` walks collapse to direct byte access. The scan itself is a simple
 /// byte loop the compiler vectorizes — far cheaper than decoding each codepoint.
 fn asciiScan(s: []const u8) bool {
+    if (memoFor(s)) |m| return m.ascii;
     for (s) |b| {
         if (b >= 0x80) return false;
     }
     return true;
 }
 
+/// The most recent `String` RECEIVER's cached header meta and its cell. The
+/// builtins receive bare bytes, so without this every `substring`/
+/// `startsWith`/`indexOf` rescanned the whole receiver for ASCII-ness, and
+/// a non-ASCII receiver was re-walked from byte 0 on each index conversion:
+/// a lexer stepping through a long source one token at a time was
+/// quadratic. Keyed by the immutable bytes' address and length; only
+/// `String` cells set it (a StringBuilder's buffer mutates in place and is
+/// never memoized), and every receiver extraction re-points it, so a slice
+/// that matches IS the live receiver's bytes. Walk positions live on the
+/// cell's own cursor (see `StringData.cursor`), so they carry across calls
+/// and across the other paths that read the same string.
+const RecvMemo = struct {
+    ptr: [*]const u8 = undefined,
+    len: usize = 0,
+    valid: bool = false,
+    ascii: bool = false,
+    u16_len: usize = 0,
+    cell: ?*const runtime.StringData = null,
+
+    fn cursor(self: *const RecvMemo) runtime.StringData.Cursor {
+        const c = self.cell orelse return .{ .u16_pos = 0, .byte_pos = 0 };
+        return c.cursorGet();
+    }
+    fn save(self: *const RecvMemo, u16_pos: usize, byte_pos: usize) void {
+        if (self.cell) |c| c.cursorSet(u16_pos, byte_pos);
+    }
+};
+threadlocal var recv_memo: RecvMemo = .{};
+
+fn memoFor(s: []const u8) ?*RecvMemo {
+    if (!recv_memo.valid or recv_memo.ptr != s.ptr or recv_memo.len != s.len) return null;
+    return &recv_memo;
+}
+
+fn noteRecvData(d: *const runtime.StringData) void {
+    if (recv_memo.valid and recv_memo.ptr == d.bytes.ptr and recv_memo.len == d.bytes.len) return;
+    recv_memo = .{
+        .ptr = d.bytes.ptr,
+        .len = d.bytes.len,
+        .valid = true,
+        .ascii = d.ascii,
+        .u16_len = d.u16_len,
+        .cell = d,
+    };
+}
+
+/// Byte offset of the boundary at UTF-16 index `target` in a non-ASCII
+/// string, walking from `from` (a known index/offset pair, `0/0` when none).
+fn unitBoundaryFrom(s: []const u8, from: runtime.StringData.Cursor, target: usize) runtime.StringData.Cursor {
+    var it = Utf16View{ .bytes = s };
+    var count: usize = 0;
+    if (from.byte_pos <= s.len and from.u16_pos > target) {
+        // The cursor is AHEAD of the target (an escaper reads `text[i]`, then
+        // appends `text[last, i)`): step back over whole code points from it
+        // rather than restarting at byte 0. A 4-byte sequence is one astral
+        // scalar (two units); a WTF-8 surrogate or any shorter sequence is
+        // one unit. A target inside an astral pair lands after the pair,
+        // as the forward walk does.
+        var c = from.u16_pos;
+        var pos = from.byte_pos;
+        while (c > target and pos > 0) {
+            var lead = pos - 1;
+            while (lead > 0 and (s[lead] & 0xC0) == 0x80) lead -= 1;
+            const units: usize = if (pos - lead == 4) 2 else 1;
+            if (c - units < target) break;
+            c -= units;
+            pos = lead;
+        }
+        return .{ .u16_pos = c, .byte_pos = pos };
+    }
+    if (from.u16_pos <= target and from.byte_pos <= s.len) {
+        count = from.u16_pos;
+        it.pos = from.byte_pos;
+    }
+    while (count < target) {
+        _ = it.next() orelse break;
+        count += 1;
+        if (it.pending_low != null) {
+            _ = it.next();
+            count += 1;
+        }
+    }
+    return .{ .u16_pos = count, .byte_pos = it.pos };
+}
+
+/// The byte range of `d.bytes[start, end)` in UTF-16 indices, through the
+/// string's own cursor: advancing ranges over one string (an escaper's
+/// `append(text, from, to)` runs) stay linear overall.
+pub fn utf16RangeBytes(d: *const runtime.StringData, start: usize, end: usize) [2]usize {
+    if (d.ascii) return .{ @min(start, d.bytes.len), @min(end, d.bytes.len) };
+    const lo = unitBoundaryFrom(d.bytes, d.cursorGet(), start);
+    const hi = unitBoundaryFrom(d.bytes, lo, end);
+    d.cursorSet(hi.u16_pos, hi.byte_pos);
+    return .{ lo.byte_pos, hi.byte_pos };
+}
+
 fn utf16Len(s: []const u8) usize {
+    if (memoFor(s)) |m| return m.u16_len;
     if (asciiScan(s)) return s.len; // ASCII: one unit per byte
     var n: usize = 0;
     var it = Utf16View{ .bytes = s };
@@ -180,14 +280,37 @@ fn utf16Len(s: []const u8) usize {
 }
 
 /// The UTF-16 code unit at index `i` (Kotlin `String` indexing), if any.
+/// On the memoized receiver the walk resumes from the last position, so a
+/// sequential `s[i]` loop over a non-ASCII string stays linear.
 fn utf16UnitAt(s: []const u8, i: usize) ?u16 {
     var n: usize = 0;
     var it = Utf16View{ .bytes = s };
-    while (it.next()) |u| {
-        if (n == i) return u;
-        n += 1;
+    const memo = memoFor(s);
+    if (memo) |m| {
+        const c = m.cursor();
+        if (c.u16_pos <= i and c.byte_pos <= s.len) {
+            n = c.u16_pos;
+            it.pos = c.byte_pos;
+        }
     }
-    return null;
+    while (true) {
+        const start = it.pos;
+        const u = it.next() orelse return null;
+        if (it.pending_low) |low| {
+            if (n == i or n + 1 == i) {
+                if (memo) |m| m.save(n, start);
+                return if (n == i) u else low;
+            }
+            _ = it.next();
+            n += 2;
+        } else {
+            if (n == i) {
+                if (memo) |m| m.save(n, start);
+                return u;
+            }
+            n += 1;
+        }
+    }
 }
 
 /// The UTF-16 code units of `s`, owned by the allocator.
@@ -222,6 +345,15 @@ fn charUnitsEqIgnoreCase(a: u16, b: u16) bool {
 /// The substring spanning UTF-16 units `[start, end)`. Owned by the
 /// allocator.
 fn utf16Slice(allocator: Allocator, s: []const u8, start: usize, end: usize) Allocator.Error![]u8 {
+    // Both boundaries on whole characters: the slice is the bytes between
+    // them, found through the receiver's cursor rather than by converting
+    // the whole string. A range that splits a surrogate pair keeps the
+    // unit path, which renders the lone halves.
+    const lo = utf16Boundary(s, start);
+    const hi = utf16Boundary(s, end);
+    if (lo.u16_pos == start and hi.u16_pos == end and lo.byte_pos <= hi.byte_pos) {
+        return allocator.dupe(u8, s[lo.byte_pos..hi.byte_pos]);
+    }
     const units = try utf16Units(allocator, s);
     defer allocator.free(units);
     return charUnitsToString(allocator, units[start..end]);
@@ -506,10 +638,12 @@ pub fn string_get(ctx: *CallCtx) Allocator.Error!EvalResult {
         u16len = sd.u16_len;
         // ASCII: the UTF-16 unit at `ui` is just byte `ui` — O(1), no walk (this
         // is what makes `for (i in indices) s[i]` linear instead of quadratic).
-        unit = if (sd.ascii)
-            (if (ui < sd.bytes.len) @as(u16, sd.bytes[ui]) else null)
-        else
-            utf16UnitAt(sd.bytes, ui);
+        if (sd.ascii) {
+            unit = if (ui < sd.bytes.len) @as(u16, sd.bytes[ui]) else null;
+        } else {
+            noteRecvData(sd);
+            unit = utf16UnitAt(sd.bytes, ui);
+        }
     }
     if (unit) |c| return .{ .ok = .{ .Char = c } };
     const msg = try std.fmt.allocPrint(ctx.allocator, "index {d} out of bounds (length {d})", .{ idx, u16len });
@@ -635,11 +769,22 @@ pub fn string_starts_with(ctx: *CallCtx) Allocator.Error!EvalResult {
             start_index = iv;
         }
     }
+    if (start_index < 0) return .{ .ok = .{ .Bool = false } };
+    // Case-sensitive with a prefix free of surrogate encodings (`ED ..`):
+    // unit-wise equality is byte-wise equality of the UTF-8, so compare the
+    // bytes at the start boundary instead of converting the whole receiver.
+    if (!ignore_case and std.mem.indexOfScalar(u8, prefix, 0xED) == null) {
+        const lo = utf16Boundary(s, @intCast(start_index));
+        if (lo.u16_pos == start_index) {
+            if (lo.byte_pos + prefix.len > s.len) return .{ .ok = .{ .Bool = false } };
+            return .{ .ok = .{ .Bool = std.mem.eql(u8, s[lo.byte_pos..][0..prefix.len], prefix) } };
+        }
+    }
     const sc = try utf16Units(ctx.allocator, s);
     defer ctx.allocator.free(sc);
     const pc = try utf16Units(ctx.allocator, prefix);
     defer ctx.allocator.free(pc);
-    if (start_index < 0 or start_index + @as(i64, @intCast(pc.len)) > @as(i64, @intCast(sc.len))) {
+    if (start_index + @as(i64, @intCast(pc.len)) > @as(i64, @intCast(sc.len))) {
         return .{ .ok = .{ .Bool = false } };
     }
     const off: usize = @intCast(start_index);
@@ -1064,19 +1209,23 @@ pub fn string_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
 /// Byte offset of the char boundary at or after the given UTF-16 code-unit
 /// index — the inverse of `byteToCharIndex`'s unit.
 fn utf16IndexToByte(s: []const u8, target: usize) usize {
-    if (target == 0) return 0;
-    if (asciiScan(s)) return @min(target, s.len); // ASCII: unit index == byte index
-    var u16count: usize = 0;
-    var i: usize = 0;
-    while (i < s.len) {
-        if (u16count >= target) return i;
-        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-        const end = @min(i + len, s.len);
-        const cp = std.unicode.utf8Decode(s[i..end]) catch s[i];
-        u16count += if (cp > 0xFFFF) 2 else 1;
-        i = end;
+    return utf16Boundary(s, target).byte_pos;
+}
+
+/// The boundary reached for UTF-16 index `target`: its byte offset and the
+/// unit index actually landed on (one past `target` when `target` names the
+/// low half of a surrogate pair, whose bytes cannot be split).
+fn utf16Boundary(s: []const u8, target: usize) runtime.StringData.Cursor {
+    if (target == 0) return .{ .u16_pos = 0, .byte_pos = 0 };
+    if (asciiScan(s)) {
+        const b = @min(target, s.len); // ASCII: unit index == byte index
+        return .{ .u16_pos = b, .byte_pos = b };
     }
-    return s.len;
+    const memo = memoFor(s);
+    const from: runtime.StringData.Cursor = if (memo) |m| m.cursor() else .{ .u16_pos = 0, .byte_pos = 0 };
+    const at = unitBoundaryFrom(s, from, target);
+    if (memo) |m| m.save(at.u16_pos, at.byte_pos);
+    return at;
 }
 
 pub fn string_last_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -1127,6 +1276,26 @@ pub fn string_last_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
 /// Kotlin indexOf/lastIndexOf return an Int code-unit index (or -1).
 fn byteToCharIndex(s: []const u8, byte: ?usize) i64 {
     const b = byte orelse return -1;
+    if (memoFor(s)) |m| {
+        if (m.ascii) return @intCast(@min(b, s.len));
+        var it = Utf16View{ .bytes = s };
+        var count: usize = 0;
+        const c = m.cursor();
+        if (c.byte_pos <= b) {
+            count = c.u16_pos;
+            it.pos = c.byte_pos;
+        }
+        while (it.pos < b) {
+            _ = it.next() orelse break;
+            count += 1;
+            if (it.pending_low != null) {
+                _ = it.next();
+                count += 1;
+            }
+        }
+        m.save(count, it.pos);
+        return @intCast(count);
+    }
     return @intCast(utf16Len(s[0..b]));
 }
 

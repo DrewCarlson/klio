@@ -4,6 +4,7 @@
 //! receiver is `args[0]`, with any further user arguments following.
 
 const std = @import("std");
+const stringbuilder_impl = @import("stringbuilder.zig");
 const runtime = @import("runtime");
 const collections = @import("collections.zig");
 
@@ -267,6 +268,7 @@ pub fn builders_build_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         else => return arityErr("buildString expects (block) or (capacity, block)"),
     };
     const sb = Value{ .StringBuilder = try ObjRef(std.ArrayList(u8)).init(ctx.allocator, .empty) };
+    stringbuilder_impl.sbMemoInvalidate(@intFromPtr(sb.StringBuilder.cell));
     {
         const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &sb, ctx.out);
         if (r == .err) {
@@ -395,6 +397,7 @@ const RecordingHost = struct {
                 }
             },
             .StringBuilder => |sb| {
+                stringbuilder_impl.sbMemoInvalidate(@intFromPtr(sb.cell));
                 const g = sb.borrowMut();
                 defer g.deinit();
                 try g.get().appendSlice(self.allocator, self.append_bytes);
