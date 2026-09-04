@@ -981,3 +981,11 @@ a UTF-16/byte cursor) keyed by its cell and buffer identity, invalidated by
 every mutating builtin (`sbMut`) and by construction; `get`/`length` are
 O(1) on ASCII buffers and cursor-walked otherwise. okio decode: 0.16s →
 0.31s → 0.62s (linear). Example: `examples/stringbuilder_index_paths.kt`.
+
+jc26 (after the string-runtime and escaping roots, both heavy files split):
+json **747 passed, 0 failed, 0 did not complete** — every test in the
+json-tests tree counts (the split children each re-count the support
+file's `ContextualTest`, hence 747 over the 744 universe). All other suites
+at or above floor: core 138/0, ktor 450/0, coroutines 1299/0, compose_ui
+452/0, io 1191/0, datetime 519/0, atomicfu 67/0. The json suite now stands
+at zero: baseline 747, `max_failed = 0`, `max_incomplete = 0`.

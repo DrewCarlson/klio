@@ -191,5 +191,11 @@ simple name and `graphics.shadow.Shadow` (a different class with
 `offset: DpOffset`) clobbered `graphics.Shadow`. The index now carries
 qualified keys and the member-read typing resolves the owner through the
 site's file scope. Full record in `plans/serialization-surface-campaign.md`
-(round jc23 → jc24). Once jc24 confirms 452/0 the compose_ui floor ratchets
-to 452 (baseline) and the suite is standing at zero.
+(round jc23 → jc24). jc24 confirmed **452 / 0**; the compose_ui floor is
+ratcheted to 452 (baseline) and the suite stands at zero.
+
+jc26 (2026-09-04): compose_ui **452 / 0** again with the floor at 452 —
+standing. All six ui modules' commonTest are censused in the one suite
+(`compose_ui_commontest`, 42 files), no host-bound exclusions were needed:
+every failure met on the way was an interpreter or pack-surface root and is
+recorded above with its fix.

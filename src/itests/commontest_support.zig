@@ -506,10 +506,12 @@ pub const suites = [_]Config{
         // compute measured at ~3-5 min solo; they run first, in parallel
         // with the rest, so the wider cap does not wall the suite.
         .timeout_ms = 400_000,
-        // 2026-09-04 census: 742 / 744 (0 failed, 2 did not complete).
-        .baseline = 742,
-        .max_failed = null,
-        .max_incomplete = null,
+        // 2026-09-04 census: 747 passed, 0 failed, 0 did not complete (the
+        // split children each count the support file's ContextualTest).
+        // Standing at zero: any failure or incomplete child fails the gate.
+        .baseline = 747,
+        .max_failed = 0,
+        .max_incomplete = 0,
     },
     .{
         .name = "io",
@@ -609,8 +611,8 @@ pub const suites = [_]Config{
         // argument; it does not reproduce from source. Floor holds the
         // observed pass count.
         .baseline = 452,
-        .max_failed = null,
-        .max_incomplete = null,
+        .max_failed = 0,
+        .max_incomplete = 0,
     },
 };
 
