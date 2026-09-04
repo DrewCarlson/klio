@@ -152,6 +152,160 @@ whether the other commontest baselines (ktor 292-fail debt, io, coroutines,
 serialization, datetime, atomicfu) hold under CI. Gating coroutines_commontest
 locally now (the with_timeout pump change is high-blast-radius).
 
+## Status @ 2026-09-04 (local main, not yet pushed): every shard failure root-caused
+
+CI run 33479633847 (main @ 26fa732b): shards 0/1/3 FAILED, 2/4 CANCELLED, units OK.
+Logs are admin-gated; the per-step API shows shard 0 failing after 27 min,
+shards 1 and 3 after 7-8 min (right after a cold compile), shards 2 and 4
+killed by the 30-minute job budget (`timeout-minutes: 30`, not fail-fast).
+`zig build` stops at the first failed step and marks the rest "transitive
+failure", so a shard log names only its FIRST failure; every suite was
+therefore rerun individually on a 4-core Debug-harness lane (the CI shape).
+
+Causes, all fixed locally:
+
+1. **e2e (shard 0): in-process route built with no active source map.**
+   `parity.runInMode` installed `span.active_map` only for the VM run; the
+   serialization pass reads default values and annotation arguments through
+   `sourceOf`, so in-process every `@Serializable` default and annotation
+   argument vanished (descriptor `optional=false`, `@InheritableSerialInfo`
+   lists empty, `@JsonNames` lost, local-class serializers missing). 8 of the
+   11 corpus failures. The map is now installed before all three parity
+   builds (base, extend, fallback).
+2. **e2e: the in-process route never folded in `klio-kotlin-test`.** Programs
+   importing `kotlin.test` lost `assertFailsWith`/`assertEquals` (2 corpus
+   failures). Added to `kotlinxPackDirs` (+ build.zig e2e data dirs); the
+   pack bitmask widened to `PackMask = u32` (17 packs no longer fit a u16
+   `baseKey`).
+3. **e2e: `interface_companion`.** A bare companion `Key` inside `interface
+   Element : CoroutineContext.Element` was rewritten to the path
+   `Element.Key`, whose head re-resolves through the class-body scope to the
+   inherited nested `CoroutineContext.Element` (correct Kotlin scoping for a
+   bare head), yielding the classifier `CoroutineContext.Key`. The arm now
+   loads the owner by exact class id (`LoadGlobal` bound + `GetField`).
+4. **Shard 3 build failure: `klio-harness-fast` link.** Under
+   `-Dharness-optimize=Debug` the vendored zstd compiles Debug, where zig
+   sanitizes C with the ubsan runtime; the ReleaseFast gate harness (and a
+   bundle link against the installed `libzstd.a`) carries no runtime →
+   `undefined symbol: __ubsan_handle_*`, 12 errors, whole shard aborted
+   minutes after the compile. `buildZstd` now sets `sanitize_c = .trap` in
+   Debug (checks kept, no runtime). Verified: `zig build klio-harness-fast
+   -Dharness-optimize=Debug` links.
+5. **Debug-harness deadlines (shards 1/2/4 and the 30-min budget).** Every
+   census child cap, pack build cap, the runner's 300s per-test wall cap and
+   the `KLIO_TEST_WALL_CAP_FOR` overrides were tuned on the ReleaseSafe
+   harness; the Debug harness interprets ~4x slower, so compose_ui's batched
+   children (~114s) hit their 120s cap (all four "did not complete"),
+   androidx lost 22 files, stdlib counted per-test deadline overruns as
+   failures (8 + 11), coroutines lost 2 files, ktor_server's 10s come-up
+   wait expired (the Debug child listens after ~51s). `commontest_support`
+   now scales every deadline by `harnessSlowdown` (4 when `KLIO_ITEST_BIN`
+   ends in `-Debug`; shared with the androidx/stdlib/ktor_server runners).
+   Measured after scaling (4 cores, Debug): compose_ui 452/0/0, coroutines
+   green, ktor green, compose_plugin green (fast harness), stdlib green
+   (both shards), io green, datetime 519/0/0 (with explicit
+   `KLIO_TEST_WALL_CAP_FOR` caps for `LocalDateTest.fromEpochDays` /
+   `toEpochDays`, 190s / 114s alone on ReleaseSafe), androidx with a 180s
+   per-file base cap (`ScatterMapTest`, `OrderedScatterSetTest`,
+   `SieveCacheTest` are the compute-heavy tail). Under five concurrent
+   local lanes the throughput-bound cases (`serialization_json` one case,
+   `RecomposerTests.validatePotentialDeadlock`, the androidx tail) still
+   slip their caps; each is green alone (json 747/0/0 named census on
+   ReleaseSafe), which is the CI shape (one suite at a time per shard).
+   `RecomposerTests.validatePotentialDeadlock` is the exception: replayed
+   with the gate's exact env on the PRE-SESSION fast harness against
+   pre-session packs it passes only after 744s (cap 580s), so it is a
+   throughput ceiling sitting at its cap, not a regression; the plugin
+   baseline is the documented 1389 (MAX_FAILED 5 still guards real
+   regressions) and that test's cap is 900s.
+6. **Interpreter bugs surfaced by the reruns (pre-existing at HEAD, verified
+   in a worktree):**
+   - `context_parameters t14`: an implicit call of a contextual function
+     type (`f(false)` inside `with(2)`) took its contexts only from the
+     runtime `context(...)` stack. The implicit form now lowers to `CtxCall`
+     with each context slot resolved innermost-first: a spliced
+     receiver-lambda subject (`subject_binds`), the declaration's own
+     receiver/owner, else `CtxLoad`, which at runtime also consults the
+     enclosing-receiver chain (a subject captured into a nested `context`
+     block). Shapes are handed into lambda bodies
+     (`pending_lambda_ctx_fn_shapes`) and a captured callee is loaded.
+   - `parity_inner_classes with_subject_of_enclosing_class_supplies_outer`:
+     a bare `Inner()` inside `with(w)` used the enclosing `this` as outer;
+     it now emits `CallMember` on the innermost subject whose static head
+     is (or extends) the inner class's outer, exactly what `w.Inner()`
+     lowers to.
+   Examples: `inner_class_with_subject_outer.kt`,
+   `context_parameters_implicit_receiver.kt` (+ `.out`, README rows).
+7. **stdlib_commontest (shards 1 and 2 of the chain): 19 pre-existing
+   failures with `MAX_FAILED = 0`** (identical on the pre-session HEAD
+   harness, so not Debug-specific). Four interpreter roots, each with a
+   guard example:
+   - A superclass-constructor delegation literal kept its Int type
+     (`LongProgression(start, endInclusive, 1)` inside the baked `LongRange`
+     handed the progression intrinsic a mixed Int/Long triple, so
+     `LongRange.EMPTY`'s file init failed and every RangeTest case died with
+     `FileFailedToInitializeException`). The runtime constructor binder
+     now retags an `Int` argument to a declared `Long`/`Short`/`Byte`
+     parameter for every constructor path: the primary args before the
+     init body (`packPrimaryCtorVarargs`), the primary-fallback field
+     pushes, and the selected secondary constructor by its declared heads
+     (`long_range_literal_step.kt`). A lowering-side variant (call-site +
+     parent-ctor thunk) was tried first and rejected: positional mapping
+     mis-typed a NAMED argument of a class with a secondary constructor
+     (`DatePeriod(days = 1)` became `months`), and re-typing before the
+     ctor-vs-factory choice made `Color(0xFFFF0000)` bind the value-class
+     constructor instead of `fun Color(Long)` (the in-process e2e caught
+     `compose_paint`/`compose_colorspace`; `check_examples` did not, because
+     the CLI route runs installed, pre-lowered pack IR). In valid Kotlin an
+     Int can only reach a Long parameter as a literal, so the runtime rule
+     is exact.
+   - A spliced inline extension's default parameter (`toIndex: Int = size`
+     on `List<T>.binarySearchBy`) resolved `size` against the caller's
+     `this` when the enclosing splice's subject (`Iterable` of
+     `forEachIndexed`) lacked the name: the default slot now binds its own
+     subject typed by the callee's declared receiver
+     (`inline_default_receiver_member.kt`).
+   - A reified parameter inferred from a use-site projection bound the
+     marker (`emptyArray<out#String>()` → "unresolved global `out#String`");
+     the receiver-derived inference now strips projections
+     (`reified_from_projected_receiver.kt`).
+   - `Irrelevant.Key` / `Top.Key` (a nested `object Key` on a context
+     element) resolved to `CoroutineContext.Key`: `instanceField`'s
+     nested-class fallback looked the simple name up in the VM class table
+     before the receiver's own nested classifier; it now defers to the
+     own-nested resolution (`nested_object_over_inherited_classifier.kt`).
+     This also fixes the AbstractCoroutineContextElementTest /
+     CoroutineContextTest key identity and element-count cases.
+   - `AbstractCoroutineContextElementTest` / `CoroutineContextTest` under
+     `klio test` only (they pass as programs): the test child compiles the
+     directory's siblings plus support files, which pulls the embedded
+     `kotlin.coroutines` source through the prefix gate, so
+     `CoroutineContext`'s nested-classifier alias map exists and
+     `scopeTypeRename` (which walks SUPERTYPE nested aliases before the
+     enclosing chain) rewrote the super-ctor argument `Key` of
+     `class DataElement : AbstractCoroutineContextElement(Key) { companion
+     object Key }` to `CoroutineContext$Key`; every element then shared one
+     key and combined contexts collapsed. An owner's own companion named
+     `name` now ends the alias walk (kotlinc: the class's static scope
+     outranks a supertype's nested classifier). Diagnosed by replaying the
+     sweep's argv (`KLIO_SWEEP_DEBUG=1`) as `klio run` and bisecting the
+     file set.
+   The stdlib runner now names every failing case (`[stdlib-fail]` +
+   first detail line); the androidx runner names a file that produced no
+   summary.
+8. **The 30-minute budget itself.** Suite walls on the CI shape (4 cores,
+   Debug harness) sum to ~190 minutes; five shards cannot fit 30 minutes
+   even when green, and the per-sha cache key never restored (every run
+   compiled cold, ~5-7 min). ci.yml now runs 8 shards with
+   `timeout-minutes: 60`; build.zig weights are the measured Debug seconds
+   ÷ 10 (compose_plugin 126, json 122, datetime 121, androidx 121, e2e 104,
+   coroutines 97, io 68, stdlib 66 per half, ...), packing each shard to
+   ~24 minutes of suite time.
+
+Tooling: `scripts/zigcheck.py`'s module graph is synced with build.zig
+(`serialization_pass` was missing, so `zigcheck parity` could not compile).
+The stdlib runner names every failing case (`[stdlib-fail]`/`[stdlib-err]`).
+
 ## Superseded in-flight (as of 3f3541df pushed)
 
 - **CI @ 65665357** (pre-fix): shards 0/3/4 FAIL, 1/2 CANCELLED (fail-fast), units OK.

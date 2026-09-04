@@ -10,6 +10,7 @@
 //! the typed JSON `receive<T>()` / `respond<T>()` content-negotiation path.
 
 const std = @import("std");
+const census_support = @import("commontest_support.zig");
 const runtime = @import("runtime");
 const net = std.Io.net;
 
@@ -101,9 +102,13 @@ fn sleepMs(io: std.Io, ms: u64) void {
 
 /// Poll-connect until the server accepts (or give up). A bare connect that
 /// closes without a request is handled by the serve loop as a dropped read.
-fn waitForServer(io: std.Io, port: u16) bool {
+fn waitForServer(io: std.Io, port: u16, slowdown: i64) bool {
+    // 30s on the ReleaseSafe harness (a healthy server answers within a
+    // second or two); a Debug harness loads the ktor packs several times
+    // slower, so the budget scales with it.
+    const attempts: usize = @intCast(1200 * slowdown);
     var i: usize = 0;
-    while (i < 400) : (i += 1) {
+    while (i < attempts) : (i += 1) {
         const addr = net.IpAddress.parse("127.0.0.1", port) catch return false;
         if (addr.connect(io, .{ .mode = .stream })) |stream| {
             stream.close(io);
@@ -302,7 +307,7 @@ test "server: routing, params, headers, status codes, and typed JSON" {
     // one call (a following `wait` would double-reap), so it stands alone.
     defer child.kill(io);
 
-    if (!waitForServer(io, port)) {
+    if (!waitForServer(io, port, census_support.harnessSlowdown(&env))) {
         std.debug.print("ktor_server: server never came up on port {d}\n", .{port});
         return error.ServerDidNotStart;
     }

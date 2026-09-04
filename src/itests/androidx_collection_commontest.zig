@@ -14,6 +14,7 @@
 //! static-dispatch work speeds the stress loops up, never lower it.
 
 const std = @import("std");
+const census_support = @import("commontest_support.zig");
 const runtime = @import("runtime");
 
 /// Minimum number of androidx commonTest cases that must pass. A ratchet: bump
@@ -119,12 +120,12 @@ fn runKlio(
 
 fn installPacks(allocator: std.mem.Allocator, env: *std.process.Environ.Map) !void {
     for (PACKS) |p| {
-        const b = try runKlio(allocator, env, &.{ klioBin(env), "pack", "build", p.dir }, 120_000);
+        const b = try runKlio(allocator, env, &.{ klioBin(env), "pack", "build", p.dir }, 120_000 * census_support.harnessSlowdown(env));
         if (b.term != .exited or b.term.exited != 0) {
             std.debug.print("androidx_commontest: pack build {s} failed:\n{s}\n", .{ p.dir, b.stderr });
             return error.PackBuildFailed;
         }
-        const i = try runKlio(allocator, env, &.{ klioBin(env), "pack", "install", p.artifact }, 120_000);
+        const i = try runKlio(allocator, env, &.{ klioBin(env), "pack", "install", p.artifact }, 120_000 * census_support.harnessSlowdown(env));
         if (i.term != .exited or i.term.exited != 0) {
             std.debug.print("androidx_commontest: pack install {s} failed:\n{s}\n", .{ p.artifact, i.stderr });
             return error.PackInstallFailed;
@@ -242,12 +243,16 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
 
     std.Io.Dir.cwd().createDirPath(io, SCRATCH_HOME) catch {};
     var env = try envWithHome(a, SCRATCH_HOME);
+    // A Debug harness interprets several times slower than the ReleaseSafe
+    // build these deadlines are tuned on; scale every child cap to match.
+    const slowdown = census_support.harnessSlowdown(&env);
+    if (slowdown != 1) try census_support.scaleWallCaps(a, &env, slowdown);
     try installPacks(a, &env);
     const smoke = try runKlio(
         a,
         &env,
         &.{ klioBin(&env), "run", INLINE_RECEIVER_FIXTURE, "--opt", "safe" },
-        120_000,
+        120_000 * slowdown,
     );
     if (smoke.term != .exited or smoke.term.exited != 0 or
         !std.mem.eql(u8, smoke.stdout, "0\n"))
@@ -309,14 +314,22 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
                 const i = pnext.fetchAdd(1, .monotonic);
                 if (i >= queue.len) return;
                 _ = arena.reset(.retain_capacity);
-                const r = runKlio(arena.allocator(), penv, queue[i], 60_000) catch {
+                // 180s per file: ScatterMapTest / OrderedScatterSetTest /
+                // SieveCacheTest are the compute-heavy tail (a healthy file
+                // returns long before), scaled for a Debug harness.
+                const r = runKlio(arena.allocator(), penv, queue[i], 180_000 * census_support.harnessSlowdown(penv)) catch {
                     _ = phung.fetchAdd(1, .monotonic);
                     continue;
                 };
                 _ = ppassed.fetchAdd(passedLineCount(r.stdout), .monotonic);
                 _ = pfailed.fetchAdd(failedLineCount(r.stdout), .monotonic);
                 pnames.addFrom(r.stdout);
-                if (std.mem.indexOf(u8, r.stdout, " passed,") == null) _ = phung.fetchAdd(1, .monotonic);
+                if (std.mem.indexOf(u8, r.stdout, " passed,") == null) {
+                    _ = phung.fetchAdd(1, .monotonic);
+                    // Name the file that produced no summary (crashed or
+                    // cut off) so a red run is actionable from the log.
+                    std.debug.print("[androidx-nosummary] <- {s}\n", .{queue[i][queue[i].len - 1]});
+                }
             }
         }
     };

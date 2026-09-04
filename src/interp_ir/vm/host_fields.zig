@@ -3607,6 +3607,27 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // class value (kotlinc: `val c = EmptyCoroutineContext` binds the
     // object). First access constructs it through the shared gate.
     if (!member_probe) {
+        const has_global_class = blk: {
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            break :blk cg.get().get(name) != null;
+        };
+        // The receiver's OWN nested classifier (or one of its enclosing
+        // classes') outranks a same-simple-name class elsewhere:
+        // `Irrelevant.Key` for `object Irrelevant : AbstractCoroutineContextElement(Key)
+        // { object Key : CoroutineContext.Key<Irrelevant> }` is the nested
+        // object, never `CoroutineContext.Key`. Leave it to the
+        // nested-classifier resolution in `getFieldInner` (which runs after
+        // this returns null). Checked only when the fallback would bind.
+        if (has_global_class) {
+            const own_nested = blk: {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                const oid = mg.get().classId(class_name) orelse break :blk false;
+                break :blk mg.get().classIdNestedIn(oid, name) != null;
+            };
+            if (own_nested) return null;
+        }
         const is_object = blk: {
             const cg = self.classes.borrow();
             defer cg.deinit();

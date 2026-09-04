@@ -40,7 +40,8 @@ GRAPH = {
     "stdlib": ["runtime", "pack"],
     "cfa": ["ast", "diagnostics", "lexer", "parser", "span", "types"],
     "resolver": ["span", "ast", "diagnostics", "types", "stdlib"],
-    "interp_ir": ["ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability", "compose_pass"],
+    "serialization_pass": ["ast", "span", "lexer", "parser", "diagnostics"],
+    "interp_ir": ["ir", "runtime", "ast", "span", "stdlib", "diagnostics", "applicability", "compose_pass", "serialization_pass"],
     "stdlib_pack": ["pack", "stdlib", "stdlib_embedded"],
     # build.zig generates the real embedded pack; isolated checks use the
     # no-bytes stub so the cwd source checkout stays the pack source.
@@ -59,7 +60,7 @@ GRAPH = {
     "cli": ["span", "diagnostics", "lexer", "parser", "resolver", "typeck", "ir", "interp_ir", "ast", "pack", "stdlib", "stdlib_pack", "kotlinx_atomicfu", "kotlinx_coroutines", "kotlinx_datetime", "kotlinx_io", "kotlinx_serialization", "compose_runtime", "compose_ui", "ktor_client", "runtime", "types", "test_runner"],
     "test_runner": ["ast", "ir", "runtime", "interp_ir", "span"],
     "parity": ["ast", "interp_ir", "kotlinx_atomicfu", "kotlinx_coroutines", "kotlinx_datetime", "kotlinx_io", "kotlinx_serialization", "compose_runtime", "compose_ui", "lexer", "pack", "parser", "resolver", "runtime", "span", "stdlib", "stdlib_pack", "typeck"],
-    "e2e": ["parity"],
+    "e2e": ["parity", "ir"],
     "itests": ["parity", "typeck", "resolver", "parser", "lexer", "cfa", "runtime", "ast", "span", "diagnostics", "types", "pack", "ir", "interp_ir", "stdlib"],
     "bench": ["ast", "interp_ir", "lexer", "parity", "parser", "resolver", "runtime", "span", "typeck"],
 }

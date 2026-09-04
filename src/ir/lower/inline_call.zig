@@ -2346,7 +2346,15 @@ fn unifyTypeParam(
         // A star projection binds nothing.
         if (std.mem.eql(u8, actual.name.name, "*")) return;
         if (!subst.contains(decl.name.name)) {
-            try subst.put(decl.name.name, actual.*);
+            // A use-site projection (`Array<out String>`) binds the projected
+            // type, never the projection marker: `T = String`.
+            var bound = actual.*;
+            if (std.mem.startsWith(u8, bound.name.name, "out#")) {
+                bound.name.name = bound.name.name["out#".len..];
+            } else if (std.mem.startsWith(u8, bound.name.name, "in#")) {
+                bound.name.name = bound.name.name["in#".len..];
+            }
+            try subst.put(decl.name.name, bound);
         }
         return;
     }
@@ -2891,6 +2899,7 @@ pub fn tryInlineCallWithTypeArgs(
     defer if (caller_probe) |cp| b.allocator.free(cp);
     {
         const probe = try inferReifiedTypeArgsRecv(b.allocator, f, type_args, expected, ordered, b, this_arg);
+        stripReifiedProjections(probe);
         caller_probe = probe;
         var unbound_reified = false;
         for (f.type_params, 0..) |tp, i| {
@@ -3289,9 +3298,29 @@ pub fn tryInlineCallWithTypeArgs(
             continue;
         }
         const r = if (slot_is_default[i] and explicit_receiver != null) blk: {
+            // The default is callee code: the receiver is its innermost
+            // implicit receiver, typed by the DECLARATION (`toIndex: Int =
+            // size` on `List<T>.binarySearchBy` reads the list's `size`)
+            // even when the call site could not type the receiver
+            // expression, and even inside an enclosing splice whose own
+            // subject (an `Iterable` of `forEachIndexed`) lacks the name.
+            const prior_this = b.resolveIgnoringFloor("this");
             try b.pushScope();
             try b.bind("this", explicit_receiver.?);
+            const prev_default_recv = b.spliceRecvTy();
+            const recv_head: ?[]const u8 = if (f.receiver_type) |rt|
+                expr_lower.typeHead(std.mem.trimEnd(u8, rt.name.name, "?"))
+            else
+                null;
+            if (recv_head) |h| b.setSpliceRecvTy(h);
+            try b.subject_binds.append(b.allocator, .{
+                .reg = explicit_receiver.?,
+                .head = recv_head,
+                .prior_this = prior_this,
+            });
             const rr = coerced orelse try lowerExpr(b, a);
+            _ = b.subject_binds.pop();
+            b.setSpliceRecvTy(prev_default_recv);
             try b.popScope();
             break :blk rr;
         } else if (slot_is_default[i]) coerced orelse try lowerExpr(b, a) else blk: {
@@ -3729,6 +3758,7 @@ pub fn tryInlineCallWithTypeArgs(
     splice_lexical_owner = lexical_owner;
     defer splice_lexical_owner = prev_splice_owner;
     const effective_type_args = try inferReifiedTypeArgsRecv(b.allocator, f, type_args, expected, ordered, b, this_arg);
+    stripReifiedProjections(effective_type_args);
     defer b.allocator.free(effective_type_args);
     if (caller_probe) |cp| {
         for (effective_type_args, 0..) |*eff, i| {
@@ -4418,4 +4448,19 @@ test "unify_type_param recurses through generic args" {
     try unifyTypeParam(&decl, &actual, &tp_names, &subst);
     const got = subst.get("T") orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("Int", got.name.name);
+}
+
+/// A reified parameter inferred from a use-site projection
+/// (`Array<out String>?.orEmpty()`) binds the projected type, never the
+/// projection marker: `T = String`, so `emptyArray<T>()` names a class.
+fn stripReifiedProjections(args: []?TypeRef) void {
+    for (args) |*slot| {
+        if (slot.*) |*t| {
+            if (std.mem.startsWith(u8, t.name.name, "out#")) {
+                t.name.name = t.name.name["out#".len..];
+            } else if (std.mem.startsWith(u8, t.name.name, "in#")) {
+                t.name.name = t.name.name["in#".len..];
+            }
+        }
+    }
 }

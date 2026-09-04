@@ -77,6 +77,54 @@ fn klioBin(env: *const std.process.Environ.Map) []const u8 {
     return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
 }
 
+/// Every child deadline here (per-child timeout, pack build caps, the
+/// runner's per-test wall caps) is tuned on the ReleaseSafe harness. A Debug
+/// harness interprets several times slower, so the same deadlines cut off
+/// healthy children; scale them by this factor when the itest binary is the
+/// Debug build.
+const debug_harness_slowdown: i64 = 4;
+
+pub fn harnessSlowdown(env: *const std.process.Environ.Map) i64 {
+    return if (std.mem.endsWith(u8, klioBin(env), "-Debug")) debug_harness_slowdown else 1;
+}
+
+/// `KLIO_TEST_WALL_CAP_FOR` is `name=secs,name=secs`; multiply every `secs`.
+fn scaleWallCapList(allocator: std.mem.Allocator, list: []const u8, factor: i64) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.splitScalar(u8, list, ',');
+    var first = true;
+    while (it.next()) |item| {
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        if (std.mem.lastIndexOfScalar(u8, item, '=')) |eq| {
+            if (std.fmt.parseInt(i64, item[eq + 1 ..], 10) catch null) |secs| {
+                const scaled = try std.fmt.allocPrint(allocator, "{s}={d}", .{ item[0..eq], secs * factor });
+                defer allocator.free(scaled);
+                try out.appendSlice(allocator, scaled);
+                continue;
+            }
+        }
+        try out.appendSlice(allocator, item);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn scaleWallCaps(allocator: std.mem.Allocator, env: *std.process.Environ.Map, factor: i64) !void {
+    const default_cap: i64 = 300;
+    const cap = if (env.get("KLIO_TEST_WALL_CAP")) |v| (std.fmt.parseInt(i64, v, 10) catch default_cap) else default_cap;
+    try env.put("KLIO_TEST_WALL_CAP", try std.fmt.allocPrint(allocator, "{d}", .{cap * factor}));
+    if (env.get("KLIO_TEST_WALL_CAP_FOR")) |list| {
+        try env.put("KLIO_TEST_WALL_CAP_FOR", try scaleWallCapList(allocator, list, factor));
+    }
+}
+
+test "wall cap list scaling multiplies every per-test cap" {
+    const a = std.testing.allocator;
+    const got = try scaleWallCapList(a, "A.t=390,B.test=10,odd", 4);
+    defer a.free(got);
+    try std.testing.expectEqualStrings("A.t=1560,B.test=40,odd", got);
+}
+
 fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Environ.Map {
     var map = std.process.Environ.Map.init(allocator);
     errdefer map.deinit();
@@ -121,13 +169,14 @@ fn runKlio(
 }
 
 fn installPacks(allocator: std.mem.Allocator, env: *std.process.Environ.Map, cfg: Config) !void {
+    const pack_cap: i64 = 120_000 * harnessSlowdown(env);
     for (cfg.packs) |p| {
-        const b = try runKlio(allocator, env, &.{ klioBin(env), "pack", "build", p.dir }, 120_000);
+        const b = try runKlio(allocator, env, &.{ klioBin(env), "pack", "build", p.dir }, pack_cap);
         if (b.term != .exited or b.term.exited != 0) {
             std.debug.print("{s}_commontest: pack build {s} failed:\n{s}\n", .{ cfg.name, p.dir, b.stderr });
             return error.PackBuildFailed;
         }
-        const i = try runKlio(allocator, env, &.{ klioBin(env), "pack", "install", p.artifact }, 120_000);
+        const i = try runKlio(allocator, env, &.{ klioBin(env), "pack", "install", p.artifact }, pack_cap);
         if (i.term != .exited or i.term.exited != 0) {
             std.debug.print("{s}_commontest: pack install {s} failed:\n{s}\n", .{ cfg.name, p.artifact, i.stderr });
             return error.PackInstallFailed;
@@ -462,6 +511,10 @@ pub const suites = [_]Config{
         },
         .whole_source_set = true,
         .timeout_ms = 400_000,
+        // LocalDateTest.fromEpochDays/toEpochDays are compute-bound (190s /
+        // 114s alone on the ReleaseSafe harness): give them their own
+        // per-test wall caps so a slower runner does not count them failed.
+        .extra_env = &.{.{ "KLIO_TEST_WALL_CAP_FOR", "LocalDateTest.fromEpochDays=900,LocalDateTest.toEpochDays=600" }},
         // fromEpochDays (100s) + toEpochDays (56s) are dispatch-heavy
         // compute (JIT-neutral, measured); split so they parallelize
         // instead of walling the suite behind one 168s child.
@@ -651,6 +704,8 @@ pub fn runSuite(cfg: Config) !void {
     std.Io.Dir.cwd().createDirPath(io, cfg.scratch_home) catch {};
     var env = try envWithHome(a, cfg.scratch_home);
     for (cfg.extra_env) |kv| try env.put(kv[0], kv[1]);
+    const slowdown = harnessSlowdown(&env);
+    if (slowdown != 1) try scaleWallCaps(a, &env, slowdown);
     try installPacks(a, &env, cfg);
 
     var all: std.ArrayList([]u8) = .empty;
@@ -865,7 +920,7 @@ pub fn runSuite(cfg: Config) !void {
     var threads: std.ArrayList(std.Thread) = .empty;
     for (0..workerCount()) |_| {
         try threads.append(a, try std.Thread.spawn(.{}, Pool.worker, .{
-            @as([]const []const []const u8, jobs.items), &env, &next, &total_passed, &total_failed, &hung, cfg.timeout_ms,
+            @as([]const []const []const u8, jobs.items), &env, &next, &total_passed, &total_failed, &hung, cfg.timeout_ms * slowdown,
         }));
     }
     for (threads.items) |t| t.join();

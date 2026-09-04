@@ -16,7 +16,7 @@ jobs:
   test:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -27,23 +27,34 @@ jobs:
             shard: unit
           # The integration suite fans across weight-balanced shards
           # (see -Ditest-shard in build.zig; weights are CI-runner-scaled).
-          # Each shard restores its own banked cache and runs ~a fifth of
-          # the suite.
+          # Each shard restores its own banked cache and runs ~an eighth of
+          # the suite. Weights are measured Debug-harness seconds on a
+          # 4-vCPU runner (÷10), so a shard lands near 25 minutes: the
+          # 60-minute budget absorbs a cold compile and a slow runner.
           - name: itest shard 0
-            step: itest -Ditest-shard=0/5
+            step: itest -Ditest-shard=0/8
             shard: itest0
           - name: itest shard 1
-            step: itest -Ditest-shard=1/5
+            step: itest -Ditest-shard=1/8
             shard: itest1
           - name: itest shard 2
-            step: itest -Ditest-shard=2/5
+            step: itest -Ditest-shard=2/8
             shard: itest2
           - name: itest shard 3
-            step: itest -Ditest-shard=3/5
+            step: itest -Ditest-shard=3/8
             shard: itest3
           - name: itest shard 4
-            step: itest -Ditest-shard=4/5
+            step: itest -Ditest-shard=4/8
             shard: itest4
+          - name: itest shard 5
+            step: itest -Ditest-shard=5/8
+            shard: itest5
+          - name: itest shard 6
+            step: itest -Ditest-shard=6/8
+            shard: itest6
+          - name: itest shard 7
+            step: itest -Ditest-shard=7/8
+            shard: itest7
     steps:
       # Submodules are populated explicitly below, NOT by actions/checkout's
       # recursive fetch. The vendored `update = none` trees (kotlin, compose,

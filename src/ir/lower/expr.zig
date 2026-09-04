@@ -1828,6 +1828,11 @@ pub fn scopeTypeRenameFrom(b: *const FuncBuilder, owner_start: ?[]const u8, name
         if (b.module.registry.nested_object_aliases.get(o)) |m| {
             if (m.get(name)) |renamed| return renamed;
         }
+        // The class's own companion object named `name` is its static
+        // scope's binding (`class DataElement : AbstractCoroutineContextElement(Key)
+        // { companion object Key }`): a same-named classifier nested in a
+        // supertype (`CoroutineContext.Key`) never outranks it.
+        if (ownCompanionNamed(b, o, name)) return null;
         // A supertype's nested classifiers are in scope in the subclass
         // body (`Conflict("foo")` inside a test extending the base that
         // declares `class Conflict`), lifted names included.
@@ -2295,24 +2300,29 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
         // A bare reference to the enclosing type's own companion object
         // (`Key` inside `interface I { companion object Key; … = Key }`)
-        // resolves to that companion singleton via the qualified `I.Key`
-        // form. Needed because a companion that has a supertype (e.g.
-        // `companion object Key : CoroutineContext.Key<I>`) is also
-        // registered as a classId under its simple name, which would
-        // otherwise route the bare name to the class reference below
-        // instead of the singleton.
+        // resolves to that companion singleton. Needed because a companion
+        // that has a supertype (e.g. `companion object Key :
+        // CoroutineContext.Key<I>`) is also registered as a classId under
+        // its simple name, which would otherwise route the bare name to the
+        // class reference below instead of the singleton. The owner is
+        // loaded by its exact class id rather than re-resolving a
+        // qualified `I.Key` path: inside the body of `interface Element :
+        // CoroutineContext.Element` a bare `Element` head names the
+        // inherited nested `CoroutineContext.Element`, not the enclosing
+        // type itself.
         if (b.ownerClass()) |owner| {
             const comp_mangled: ?[]const u8 = b.module.registry.companion_singletons.get(owner);
             if (comp_mangled) |cm| {
                 const simple = if (std.mem.lastIndexOfScalar(u8, cm, '$')) |i| cm[i + 1 ..] else cm;
                 if (std.mem.eql(u8, simple, name0)) {
-                    const sp = segments[0].span;
-                    var rsegs = [_]ast.Ident{
-                        .{ .name = owner, .span = sp },
-                        .{ .name = name0, .span = sp },
-                    };
-                    const qualified = Expr{ .Path = .{ .segments = &rsegs, .span = sp } };
-                    return lowerExpr(b, &qualified);
+                    const cls = b.allocReg();
+                    const on = try b.module.internConst(b.allocator, .{ .String = owner });
+                    const cid = b.module.classIdIndexed(owner, b.self_package, segments[0].span.file);
+                    try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = on, .class = cid } });
+                    const dst = b.allocReg();
+                    const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+                    try b.push(.{ .GetField = .{ .dst = dst, .receiver = cls, .field = nm } });
+                    return dst;
                 }
             }
         }
@@ -4012,6 +4022,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     b.module.pending_lambda_reified_names = try b.reifiedTypeNamesSlice();
     b.module.pending_lambda_type_param_bounds = try b.typeParamBoundsSlice();
     b.module.pending_lambda_type_param_bound_refs = try b.typeParamBoundRefsSlice();
+    b.module.pending_lambda_ctx_fn_shapes = try b.contextFnShapesSlice();
     // A lambda inside a local fn's body keeps that fn's self-identity (a
     // named local fn overrides this with its own before its body lowers).
     if (b.module.pending_lambda_self_fn == null) b.module.pending_lambda_self_fn = b.selfLocalFn();
@@ -6444,8 +6455,13 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1 and ast_type_args.len == 0) {
         const cname = callee.Path.segments[0].name;
         if (b.contextFnParam(cname)) |shape| {
-            if (b.resolve(cname)) |callee_reg| {
-                if (args.len == shape.n_ctx + shape.n_regular and !lastArgIsLambda(args)) {
+            const positional = args.len == shape.n_ctx + shape.n_regular and !lastArgIsLambda(args);
+            const implicit = shape.n_ctx != 0 and args.len == shape.n_regular and !lastArgIsLambda(args);
+            // The parameter itself, or its capture inside a lambda body.
+            const callee_opt: ?Reg = if (!positional and !implicit) null else b.resolve(cname) orelse
+                (if (b.knowsOuter(cname)) try b.loadCaptureHoisted(cname) else null);
+            if (callee_opt) |callee_reg| {
+                if (positional) {
                     b.module.has_context_decls = true;
                     const run = try lowerArgRun(b, args);
                     const dst = b.allocReg();
@@ -6454,6 +6470,42 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         .callee = callee_reg,
                         .args = run[0],
                         .n_args = run[1],
+                        .n_ctx = @intCast(shape.n_ctx),
+                    } });
+                    return dst;
+                }
+                // The implicit form `f(a..)`: each context argument is the
+                // innermost implicit receiver of that type when one is in
+                // scope (a spliced receiver-lambda subject such as
+                // `with(2) { f(false) }`, the enclosing `this`), else the
+                // runtime context stack (`context(...)` scopes, contextual
+                // function parameters).
+                if (implicit) {
+                    b.module.has_context_decls = true;
+                    const total = shape.n_ctx + shape.n_regular;
+                    const first = b.allocReg();
+                    var k: usize = 1;
+                    while (k < total) : (k += 1) _ = b.allocReg();
+                    for (shape.ctx_types, 0..) |ty, ci| {
+                        const slot = Reg.from(first.int() + @as(u32, @intCast(ci)));
+                        if (try implicitReceiverOfType(b, ty)) |r| {
+                            try b.push(.{ .Move = .{ .dst = slot, .src = r } });
+                        } else {
+                            const ty_const = try b.module.internConst(b.allocator, .{ .String = ty });
+                            try b.push(.{ .CtxLoad = .{ .dst = slot, .ty = ty_const, .erased = false } });
+                        }
+                    }
+                    for (args, 0..) |*arg, ai| {
+                        const slot = Reg.from(first.int() + @as(u32, @intCast(shape.n_ctx + ai)));
+                        const v = try lowerExpr(b, arg);
+                        try b.push(.{ .Move = .{ .dst = slot, .src = v } });
+                    }
+                    const dst = b.allocReg();
+                    try b.push(.{ .CtxCall = .{
+                        .dst = dst,
+                        .callee = callee_reg,
+                        .args = first,
+                        .n_args = @intCast(total),
                         .n_ctx = @intCast(shape.n_ctx),
                     } });
                     return dst;
@@ -8937,6 +8989,24 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const dst = b.allocReg();
             const static_sam = cls.is_fun_interface and args.len == 1 and !anyNamedArg(ast_arg_names);
             if (shadowed_by_class or force_static_class or static_sam) {
+                // `Inner()` inside a spliced receiver lambda whose subject is
+                // an instance of the inner class's outer (`with(w) { Inner()
+                // }`): the subject is the innermost implicit receiver of that
+                // type, so it is the new instance's outer, the same member
+                // call kotlinc emits for `w.Inner()`.
+                if (spliceSubjectOuterFor(b, class_id)) |subject| {
+                    const nm = try b.module.internConst(b.allocator, .{ .String = callee.Path.segments[0].name });
+                    orEmitAudit(b, "inner_ctor_on_splice_subject", "CallMember", callee.Path.segments[0].name);
+                    try b.push(.{ .CallMember = .{
+                        .dst = dst,
+                        .receiver = subject,
+                        .name = nm,
+                        .args = run[0],
+                        .n_args = run[1],
+                        .arg_names = arg_names,
+                    } });
+                    return dst;
+                }
                 // A bare `Inner()` uses the enclosing `this` as the new
                 // instance's outer. Inside a lambda body that `this` is
                 // only reachable through the closure's capture set, so
@@ -25525,4 +25595,70 @@ fn scalarBitBinOp(name: []const u8) ?ir.BinOp {
     if (std.mem.eql(u8, name, "shr")) return .Shr;
     if (std.mem.eql(u8, name, "ushr")) return .UShr;
     return null;
+}
+
+/// A receiver/context type's bare head: no nullability, type arguments,
+/// package or outer-class prefix.
+fn receiverTypeSimple(ty: []const u8) []const u8 {
+    const head = typeHead(std.mem.trimEnd(u8, ty, "?"));
+    return if (std.mem.lastIndexOfScalar(u8, head, '$')) |i| head[i + 1 ..] else head;
+}
+
+/// The innermost implicit receiver whose static type head is `ty`: a
+/// spliced receiver-lambda subject (bound as the innermost `this`), else the
+/// declaration's own receiver or owner instance. Null when no receiver in
+/// scope has that type.
+fn implicitReceiverOfType(b: *FuncBuilder, ty: []const u8) Allocator.Error!?Reg {
+    const want = receiverTypeSimple(ty);
+    // Spliced receiver-lambda subjects (`with(2) { … }`), innermost first.
+    var si = b.subject_binds.items.len;
+    while (si > 0) {
+        si -= 1;
+        const sb = b.subject_binds.items[si];
+        const h = sb.head orelse continue;
+        if (receiverHeadIs(b, h, want)) return sb.reg;
+    }
+    // The declaration's own receiver or owner instance.
+    if (b.resolve("this")) |this_reg| {
+        const head = b.recvTy() orelse b.ownerClass() orelse return null;
+        return if (receiverHeadIs(b, head, want)) this_reg else null;
+    }
+    if (b.capturesThisSlot()) {
+        const head = b.enclosingRecvTy() orelse b.ownerClass() orelse return null;
+        if (receiverHeadIs(b, head, want)) return try b.loadCaptureHoisted("this");
+    }
+    return null;
+}
+
+/// `head` names `want` or a class extending it.
+fn receiverHeadIs(b: *const FuncBuilder, head: []const u8, want: []const u8) bool {
+    const h = receiverTypeSimple(head);
+    return std.mem.eql(u8, h, want) or b.module.classIsOrExtends(h, want);
+}
+
+/// For a bare inner-class construction: the spliced receiver-lambda subject
+/// bound as the innermost `this` when its static type is the inner class's
+/// outer, else null.
+fn spliceSubjectOuterFor(b: *FuncBuilder, class_id: ir.ClassId) ?Reg {
+    if (class_id.int() >= b.module.classes.items.len) return null;
+    const cls = &b.module.classes.items[class_id.int()];
+    if (!cls.is_inner) return null;
+    const outer = b.module.registry.enclosing_class.get(cls.name) orelse
+        b.module.registry.enclosing_class.get(cls.fqn) orelse return null;
+    const want = receiverTypeSimple(outer);
+    var si = b.subject_binds.items.len;
+    while (si > 0) {
+        si -= 1;
+        const sb = b.subject_binds.items[si];
+        const h = sb.head orelse continue;
+        if (receiverHeadIs(b, h, want)) return sb.reg;
+    }
+    return null;
+}
+
+/// Whether `cls_name`'s companion object carries the simple name `name`.
+fn ownCompanionNamed(b: *const FuncBuilder, cls_name: []const u8, name: []const u8) bool {
+    const comp = b.module.registry.companion_singletons.get(cls_name) orelse return false;
+    const simple = if (std.mem.lastIndexOfScalar(u8, comp, '$')) |i| comp[i + 1 ..] else comp;
+    return std.mem.eql(u8, simple, name);
 }

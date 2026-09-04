@@ -13,6 +13,7 @@
 //! ratchet baseline. Raise `BASELINE` as interpreter gaps close; never lower it.
 
 const std = @import("std");
+const census_support = @import("commontest_support.zig");
 const runtime = @import("runtime");
 
 /// Minimum number of stdlib commonTest cases that must pass. A ratchet: bump it
@@ -64,7 +65,7 @@ fn runKlio(
         // coroutine resumes and needs ~300s solo — the unwind-cost residual
         // in the resolution-unification plan) so a slow-but-linear pass is
         // never miscounted as blocked.
-        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(480_000), .clock = .awake } },
+        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(480_000 * census_support.harnessSlowdown(env)), .clock = .awake } },
     }) catch |e| {
         // A timed-out (hanging) child is reported as a blocked file, not a
         // hard spawn failure.
@@ -209,6 +210,10 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
     };
 
     var env = try envWithHome(a, SCRATCH_HOME);
+    // A Debug harness interprets several times slower than the ReleaseSafe
+    // build the per-test wall caps are tuned on; scale them to match.
+    const slowdown = census_support.harnessSlowdown(&env);
+    if (slowdown != 1) try census_support.scaleWallCaps(a, &env, slowdown);
     try installKotlinTestPack(a, io, &env, SCRATCH_HOME);
 
     var all: std.ArrayList([]u8) = .empty;
@@ -381,7 +386,22 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
                 };
                 if (passedCount(r.stdout)) |p| {
                     _ = ppassed.fetchAdd(p, .monotonic);
-                    if (failedCount(r.stdout)) |f| _ = pfailed.fetchAdd(f, .monotonic);
+                    if (failedCount(r.stdout)) |f| {
+                        _ = pfailed.fetchAdd(f, .monotonic);
+                        // Name every failing case (with its first detail
+                        // line) so a red run is actionable from the log.
+                        if (f != 0) {
+                            var lines = std.mem.splitScalar(u8, r.stdout, '\n');
+                            var prev_failed = false;
+                            while (lines.next()) |line| {
+                                if (prev_failed and line.len != 0 and (line[0] == ' ' or line[0] == '\t')) {
+                                    std.debug.print("[stdlib-err] {s}\n", .{std.mem.trim(u8, line, " \t")});
+                                }
+                                prev_failed = std.mem.endsWith(u8, line, " FAILED");
+                                if (prev_failed) std.debug.print("[stdlib-fail] {s} <- {s}\n", .{ line, target });
+                            }
+                        }
+                    }
                 } else {
                     std.debug.print("build-blocked (no pass summary): {s}\n", .{target});
                     _ = pblocked.fetchAdd(1, .monotonic);
