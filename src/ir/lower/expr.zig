@@ -3412,8 +3412,40 @@ fn extPropGetterReturn(b: *const FuncBuilder, head: []const u8, name: []const u8
     return h;
 }
 
+/// The property-head key for `owner` as the site's file sees it: the
+/// scope-resolved class's qualified name, which is exact when two packages
+/// share the simple name. Null when the simple key already is the class.
+fn scopedPropOwnerKey(b: *const FuncBuilder, owner: []const u8, site_file: ?ir.FileId) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, owner, '.') != null) return null;
+    const file = site_file orelse (b.self_decl_span orelse return null).file;
+    const cid = b.module.classIdIndexed(owner, b.self_package, file) orelse return null;
+    const fqn = b.module.classFqnById(cid) orelse return null;
+    if (runtime.envOnce("KLIO_CIX_TRACE")) |w| {
+        if (std.mem.eql(u8, w, owner)) std.debug.print("[cix-prop] {s} file={d} -> {s}\n", .{ owner, file.int(), fqn });
+    }
+    if (std.mem.eql(u8, fqn, owner)) return null;
+    return fqn;
+}
+
+/// A declared receiver type's own property-head key: the written qualified
+/// name when the declaration spelled one (`r: kotlin.text.Regex` reads
+/// Regex's `pattern`, never a same-named user class's), else the head as
+/// the site's file resolves it.
+fn declTypePropOwnerKey(b: *const FuncBuilder, ty: *const ir.TypeRef, site_file: ?ir.FileId) ?[]const u8 {
+    for (ty.args) |*a| {
+        if (std.mem.startsWith(u8, a.name, "#qual:")) return a.name["#qual:".len..];
+    }
+    var t = std.mem.trimEnd(u8, ty.name, "?");
+    if (std.mem.indexOfScalar(u8, t, '<')) |lt| t = t[0..lt];
+    if (std.mem.indexOfScalar(u8, t, '.') != null) return t;
+    return scopedPropOwnerKey(b, t, site_file);
+}
+
 fn propTypeHeadOn(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?[]const u8 {
     const heads = b.module.registry.class_prop_type_heads;
+    if (scopedPropOwnerKey(b, owner, null)) |key| {
+        if (heads.get(.{ .a = key, .b = name })) |h| return h;
+    }
     if (heads.get(.{ .a = owner, .b = name })) |h| return h;
     const chain: []const []const u8 = b.module.registry.class_super_names.get(owner) orelse &.{};
     for (chain) |cls| {
@@ -12008,6 +12040,23 @@ fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             var h = std.mem.trimEnd(u8, rt.name, "?");
             if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
             const head = typeHead(h);
+            // The site's own view of the owner class first: two packages
+            // can share a simple name with a same-named property of
+            // different types (`graphics.Shadow.offset: Offset` beside
+            // `graphics.shadow.Shadow.offset: DpOffset`), and the simple
+            // key holds only one of them.
+            const scoped_key = declTypePropOwnerKey(b, &rt, m.name.span.file);
+            if (runtime.envOnce("KLIO_CIX_TRACE")) |w| {
+                if (std.mem.eql(u8, w, head)) {
+                    const hp = if (scoped_key) |k| b.module.registry.class_prop_type_heads.get(.{ .a = k, .b = m.name.name }) else null;
+                    std.debug.print("[cix-route] {s}.{s} rt={s} file={d} key={?s} hit={?s}\n", .{ head, m.name.name, rt.name, m.name.span.file.int(), scoped_key, hp });
+                }
+            }
+            if (scoped_key) |key| {
+                if (b.module.registry.class_prop_type_heads.get(.{ .a = key, .b = m.name.name })) |ph| {
+                    return .{ .name = ph, .nullable = false, .args = &.{} };
+                }
+            }
             // The property's FULL declared type, with the owner's type
             // parameters substituted from the receiver's own arguments:
             // `Map<K, V>.values` read off a `Map<String, Named>` is a
@@ -12298,6 +12347,11 @@ fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             if (receiver_ty.nullable and !safe_read) return null;
             const owner = typeHead(std.mem.trimEnd(u8, receiver_ty.name, "?"));
             const heads = b.module.registry.class_prop_type_heads;
+            if (declTypePropOwnerKey(b, &receiver_ty, arg.Member.name.span.file)) |key| {
+                if (heads.get(.{ .a = key, .b = arg.Member.name.name })) |head| {
+                    return .{ .name = head, .nullable = safe_read, .args = &.{} };
+                }
+            }
             if (heads.get(.{ .a = owner, .b = arg.Member.name.name })) |head| {
                 return .{ .name = head, .nullable = safe_read, .args = &.{} };
             }
@@ -14698,6 +14752,7 @@ fn lowerPathCall(
                         b.module.registry.member_ext_owner_class.get(fid) orelse "-",
                     },
                 );
+                for (f.params) |p| std.debug.print("  [bare-cand-param] {s}: {s}\n", .{ p.name, p.ty.name });
             }
         }
     }
@@ -14993,6 +15048,7 @@ fn lowerPathCall(
                     @intFromEnum(segments[0].span.file),
                     segments[0].span.start,
                 });
+                for (shapes) |*sh| std.debug.print("  [bare-shape] {s}\n", .{if (sh.ty) |t| t.name else "?"});
                 std.debug.print("[bare-res] {s} tier={d} reason={?s} final={} tier_count={d} index={s} lazy={?d}\n", .{ name0, res_final.tier, if (res_final.reason) |r| @tagName(r) else null, res_final.target_final, res_final.tier_count, @tagName(index_res.outcome), if (res.target) |t| t.int() else null });
             }
         }

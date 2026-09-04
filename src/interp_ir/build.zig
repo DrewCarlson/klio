@@ -1539,6 +1539,29 @@ fn varargPropArrayHead(elem: []const u8) []const u8 {
 /// (`Map<K, V>.values: Collection<V>` on a `Map<String, Named>` receiver is
 /// a `Collection<Named>`). Where the receiver carries no arguments the
 /// substitution declines and the head-only answer stands.
+/// Records a class property's declared type head under the class's simple
+/// name and, when it differs, under its qualified name too. A reader that
+/// resolved the owner through file scope then gets the exact class when two
+/// packages share a simple name: `graphics.Shadow.offset` is an `Offset`
+/// while `graphics.shadow.Shadow.offset` is a `DpOffset`, and the simple
+/// key can only hold one of them.
+/// A declaration's qualified name in a merged multi-file build: the
+/// recorded override for its declaration span, else its own file's package
+/// (the primary file's prefix covers only that file's declarations).
+fn declFqnAt(a: Allocator, module: *const Module, overrides: *const SpanStrMap, decl_span: Span, package_prefix: []const u8, simple: []const u8) Allocator.Error![]const u8 {
+    if (overrides.get(decl_span)) |f| return f;
+    const prefix = if (package_prefix.len != 0) package_prefix else (module.packageOfFile(decl_span.file) orelse "");
+    if (prefix.len == 0) return simple;
+    return std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, simple });
+}
+
+fn putClassPropHead(module: *Module, simple: []const u8, fqn: []const u8, prop: []const u8, head: []const u8) Allocator.Error!void {
+    try module.registry.class_prop_type_heads.put(.{ .a = simple, .b = prop }, head);
+    if (!std.mem.eql(u8, fqn, simple)) {
+        try module.registry.class_prop_type_heads.put(.{ .a = fqn, .b = prop }, head);
+    }
+}
+
 fn notePropTypeRef(
     a: Allocator,
     module: *Module,
@@ -2191,6 +2214,7 @@ fn buildModuleWithOverrides(
     for (decls) |*d| {
         if (d.* == .Class) {
             const c = &d.Class;
+            const cfqn = try declFqnAt(a, module, fqn_overrides, c.span, package_prefix, c.name.name);
             for (c.primary_params) |*pp| {
                 if (pp.property == null) continue;
                 // A `vararg val` property's OBSERVED type is the materialized
@@ -2199,12 +2223,9 @@ fn buildModuleWithOverrides(
                 // made `elements.any { ... }` resolve against the wrong
                 // receiver and decline the Array extension.
                 if (pp.is_vararg) {
-                    try module.registry.class_prop_type_heads.put(
-                        .{ .a = c.name.name, .b = pp.name.name },
-                        varargPropArrayHead(pp.ty.name.name),
-                    );
+                    try putClassPropHead(module, c.name.name, cfqn, pp.name.name, varargPropArrayHead(pp.ty.name.name));
                 } else if (classPropHead(c, &pp.ty)) |head| {
-                    try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = pp.name.name }, head);
+                    try putClassPropHead(module, c.name.name, cfqn, pp.name.name, head);
                     try notePropTypeRef(a, module, c, pp.name.name, &pp.ty);
                 }
             }
@@ -2251,23 +2272,20 @@ fn buildModuleWithOverrides(
                 };
                 if (ty_opt) |ty| {
                     if (classPropHead(c, ty)) |head| {
-                        try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
+                        try putClassPropHead(module, c.name.name, cfqn, prop.name.name, head);
                         try notePropTypeRef(a, module, c, prop.name.name, ty);
                     }
                 } else if (propCtorHeadEvidence(prop, decls, module, c)) |head| {
-                    try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
+                    try putClassPropHead(module, c.name.name, cfqn, prop.name.name, head);
                 } else if (prop.init != null and memberSizedInitHead(c, &prop.init.?) != null) {
-                    try module.registry.class_prop_type_heads.put(
-                        .{ .a = c.name.name, .b = prop.name.name },
-                        memberSizedInitHead(c, &prop.init.?).?,
-                    );
+                    try putClassPropHead(module, c.name.name, cfqn, prop.name.name, memberSizedInitHead(c, &prop.init.?).?);
                 } else if (prop.init) |*init| {
                     // An unannotated property states its type through a
                     // literal initializer — `private var index = 0` in the
                     // array iterators — and a bare read of one was the whole
                     // enclosing-member block of the unbound census.
                     if (literalTypeHead(init)) |head| {
-                        try module.registry.class_prop_type_heads.put(.{ .a = c.name.name, .b = prop.name.name }, head);
+                        try putClassPropHead(module, c.name.name, cfqn, prop.name.name, head);
                     }
                 }
             }
@@ -2331,13 +2349,14 @@ fn buildModuleWithOverrides(
             }
         } else if (d.* == .Object) {
             const o = &d.Object;
+            const ofqn = try declFqnAt(a, module, fqn_overrides, o.span, package_prefix, o.name.name);
             for (o.members) |*m| {
                 if (m.* != .Property) continue;
                 const prop = m.Property;
                 if (prop.ty) |*ty| {
-                    try module.registry.class_prop_type_heads.put(.{ .a = o.name.name, .b = prop.name.name }, ty.qualified_path orelse ty.name.name);
+                    try putClassPropHead(module, o.name.name, ofqn, prop.name.name, ty.qualified_path orelse ty.name.name);
                 } else if (propCtorHeadEvidence(prop, decls, module, null)) |head| {
-                    try module.registry.class_prop_type_heads.put(.{ .a = o.name.name, .b = prop.name.name }, head);
+                    try putClassPropHead(module, o.name.name, ofqn, prop.name.name, head);
                 }
             }
         }
