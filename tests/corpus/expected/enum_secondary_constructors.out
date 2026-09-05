@@ -1,0 +1,7 @@
+LOW(1, low)
+MID(2, level-2)
+HIGH(3, high)
+CUSTOM(9, custom)
+level-2
+3
+1

@@ -290,6 +290,29 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    private member `inline fun`'s lambda, which klio calls instead of
    splicing (an open mechanism, one test).
 
+9. **Bare accessors; enum secondary constructors** (2026-09-05): a
+   property accessor written as its keyword alone (`get` on its own line,
+   `; private set` after the declaration, `lateinit var x: T set`) was
+   left unparsed (5 tests); it now declares the default accessor when
+   nothing follows it on the line. An enum body could not declare
+   secondary constructors (5 tests); they parse after the entries, and
+   an enum with secondary constructors or a vararg primary parameter
+   builds its entries through the ordinary instantiation path at VM start
+   (the entry's arguments pick the constructor, delegation and bodies run,
+   an entry passing nothing to a vararg gets an empty array), the way
+   entries with bodies already did. Census 5,542 / 810 / 19. Examples
+   `examples/bare_accessors.kt`, `examples/enum_secondary_constructors.kt`.
+   Verdict: `companionBlocksAndExtensions/*` (3 tests) use `companion { }`
+   blocks, not Kotlin syntax klio targets.
+10. **Secondary constructors in class hierarchies** (next): 12 failing
+   tests in `secondaryConstructors/` plus `enums.kt`'s body entry — a
+   subclass header `class C : A(5)` binds its arguments to the parent's
+   primary parameters and never selects a parent secondary constructor
+   (`runSuperCtorChain` has the selection, delegation, and body logic but
+   only the `super(…)` path reaches it); defaults and named arguments
+   through `this(…)`; `super("0", *x, "4")` spread arguments; local and
+   inner classes with secondary constructors.
+
 ## Log
 
 - 2026-09-05: opened.
@@ -305,3 +328,5 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
 - 2026-09-05: Task 4 #6 corpus syntax gaps + #7 contextual anonymous
   functions landed: 5506 / 845.
 - 2026-09-05: Task 4 #8 tailrec self-calls landed: 5530 / 822.
+- 2026-09-05: Task 4 #9 bare accessors + enum secondary constructors
+  landed: 5542 / 810.

@@ -581,10 +581,21 @@ fn instantiateEnumEntryBodies(self: *Vm, module: *const Module, sink: Output) Al
             dg.deinit();
         }
         const enum_cid = module.classIdByFqn(enum_fqn) orelse continue;
+        const enum_simple = if (std.mem.lastIndexOfScalar(u8, enum_fqn, '.')) |dot| enum_fqn[dot + 1 ..] else enum_fqn;
+        const has_secondary = blk: {
+            const dg = cdef.borrow();
+            defer dg.deinit();
+            if (dg.get().secondary_ctors.len != 0) break :blk true;
+            // A vararg primary parameter needs the ordinary argument packing
+            // too (an entry passing nothing still gets an empty array).
+            for (module.classes.items[enum_cid.int()].primary_params) |prm| if (prm.is_vararg) break :blk true;
+            break :blk false;
+        };
         var replaced: ?[]runtime.ClassDef.EnumEntry = null;
         for (0..n_entries) |i| {
             var entry_name: []const u8 = undefined;
             var current_class: []const u8 = "";
+            var entry_rebuilt = false;
             {
                 const dg = cdef.borrow();
                 defer dg.deinit();
@@ -595,20 +606,43 @@ fn instantiateEnumEntryBodies(self: *Vm, module: *const Module, sink: Output) Al
                     const icg = ig.get().class.borrow();
                     current_class = icg.get().name;
                     icg.deinit();
+                    entry_rebuilt = ig.get().get("__enum_entry_built__") != null;
                     ig.deinit();
                 }
             }
             const synth = try std.fmt.allocPrint(self.allocator, "${s}", .{entry_name});
             defer self.allocator.free(synth);
-            const body_cid = module.classIdNestedIn(enum_cid, synth) orelse continue;
-            if (std.mem.eql(u8, current_class, synth)) continue;
+            const body_cid = module.classIdNestedIn(enum_cid, synth);
+            // An enum declaring secondary constructors builds its entries
+            // through the ordinary path too: the entry's arguments pick the
+            // constructor (`ENTRY(5)` may reach `constructor(n: Int) :
+            // this(n, "x")`), and its body runs as written.
+            if (body_cid == null and !has_secondary) continue;
+            if (body_cid != null and std.mem.eql(u8, current_class, synth)) continue;
+            if (body_cid == null and entry_rebuilt) continue;
             var host = vmMakeHost(self, sink);
+            var ctor_args: std.ArrayList(Value) = .empty;
+            defer ctor_args.deinit(self.allocator);
+            if (body_cid == null) {
+                for (self.enum_entry_arg_inits.items) |init_entry| {
+                    if (!std.mem.eql(u8, init_entry.class_name, enum_simple) or !std.mem.eql(u8, init_entry.entry_name, entry_name)) continue;
+                    for (init_entry.funcs) |fid| {
+                        const init_func = module.funcById(fid) orelse continue;
+                        switch (try ir.eval.evalWith(VmHost, self.allocator, module, init_func, .empty, &host)) {
+                            .ok => |val| try ctor_args.append(self.allocator, val),
+                            .err => |e| return vmErrorFromEval(self.allocator, e),
+                        }
+                    }
+                    break;
+                }
+            }
+            const target_cid = body_cid orelse enum_cid;
             host_instances.setEnumEntryPreset(.{
-                .class_fqn = module.classes.items[body_cid.int()].fqn,
+                .class_fqn = module.classes.items[target_cid.int()].fqn,
                 .name = .{ .String = try runtime.strInit(pa, entry_name) },
                 .ordinal = Value.newInt(@intCast(i)),
             });
-            const made = switch (try host_instances.newInstance(&host, self.allocator, body_cid, &.{}, null)) {
+            const made = switch (try host_instances.newInstance(&host, self.allocator, target_cid, ctor_args.items, null)) {
                 .ok => |v| v,
                 .err => |e| {
                     host_instances.setEnumEntryPreset(null);
@@ -617,6 +651,11 @@ fn instantiateEnumEntryBodies(self: *Vm, module: *const Module, sink: Output) Al
             };
             host_instances.setEnumEntryPreset(null);
             if (made != .Instance) continue;
+            if (body_cid == null) {
+                const g = made.Instance.borrowMut();
+                defer g.deinit();
+                try g.get().define(pa, "__enum_entry_built__", .{ .Bool = true });
+            }
             if (replaced == null) {
                 const dg = cdef.borrow();
                 defer dg.deinit();

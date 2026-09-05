@@ -58,6 +58,7 @@ pub const EnumClassBody = struct {
     init_blocks: []Block,
     init_block_positions: []usize,
     entries: []EnumEntry,
+    secondary_ctors: []SecondaryCtor,
 };
 
 pub fn parseClass(
@@ -129,7 +130,7 @@ pub fn parseClass(
         init_blocks = eb.init_blocks;
         init_block_positions = eb.init_block_positions;
         enum_entries = eb.entries;
-        secondary_ctors = &.{};
+        secondary_ctors = eb.secondary_ctors;
     } else {
         const cb = parseClassBody(p);
         class_members = cb.members;
@@ -311,6 +312,7 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
     var init_block_list: std.ArrayList(Block) = .empty;
     var init_block_positions: std.ArrayList(usize) = .empty;
     var entries: std.ArrayList(EnumEntry) = .empty;
+    var secondary_ctors: std.ArrayList(SecondaryCtor) = .empty;
     support.skipNl(p);
     if (std.meta.activeTag(support.peekKind(p).*) != .LBrace) {
         return .{
@@ -318,6 +320,7 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
             .init_blocks = ownedBlocks(p, &init_block_list),
             .init_block_positions = ownedUsizes(p, &init_block_positions),
             .entries = ownedEntries(p, &entries),
+            .secondary_ctors = ownedSecondaryCtors(p, &secondary_ctors),
         };
     }
     _ = support.bump(p);
@@ -454,6 +457,19 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
                 }
                 continue;
             }
+            // A secondary constructor in the enum body: `constructor(n: Int) :
+            // this(n, "x")`, called for the entries whose arguments fit it.
+            const mod_save = p.pos;
+            const flags = file.skipModifiersWithFlags(p);
+            if (std.meta.activeTag(support.peekKind(p).*) == .Ident and
+                std.mem.eql(u8, support.text(p, support.currentSpan(p)), "constructor"))
+            {
+                if (parseSecondaryCtor(p, flags.visibility, flags.annotations.items)) |sc| {
+                    secondary_ctors.append(p.allocator, sc) catch @panic("OOM");
+                }
+                continue;
+            }
+            p.pos = mod_save;
             if (file.parseTopDecl(p)) |d| {
                 member_list.append(p.allocator, d) catch @panic("OOM");
             } else {
@@ -467,6 +483,7 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
         .init_blocks = ownedBlocks(p, &init_block_list),
         .init_block_positions = ownedUsizes(p, &init_block_positions),
         .entries = ownedEntries(p, &entries),
+        .secondary_ctors = ownedSecondaryCtors(p, &secondary_ctors),
     };
 }
 
