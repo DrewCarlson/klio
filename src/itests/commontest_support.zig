@@ -665,7 +665,10 @@ pub const suites = [_]Config{
             "tests/compose_ui_commontest_actuals/androidx/kruth/Kruth.kt",
         },
         .batch_dirs = true,
-        .timeout_ms = 120_000,
+        // One child per ui module (batch_dirs): each compiles its module's
+        // whole commonTest set once (~115s on 4 local cores, longer on a
+        // CI runner), so the cap leaves room for a slower machine.
+        .timeout_ms = 600_000,
         // 2026-09-03 census: 451 / 452 (1 failed, 0 did not complete). The
         // lone failure is ShadowTest.testLerp — a pack-image overload
         // resolution that picks the same-package Color `lerp` for a Float

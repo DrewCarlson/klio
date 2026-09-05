@@ -358,6 +358,15 @@ job logs (now readable via `gh run view <id> --log-failed`) name the rest:
   shows. Baseline is now 1385 = 1390 - MAX_FAILED, the floor the ceiling
   already implied; a hang/crash (did-not-complete) still breaks it.
 
+## Status @ b1870d75 pushed: run 33951749933 — 8/9 green
+
+Every earlier cause held: gate, differential (drain fix), datetime
+519/0/0, json, e2e with mosaic, androidx, coroutines/stdlib, io/stdlib all
+green (walls 10-29 min). The one red is compose_ui_commontest: its four
+batched children (one per ui module, ~115s each on 4 local cores) crossed
+the 120s census child timeout on the slower runner and all reported "did
+not complete". The child timeout is 600s.
+
 ## Superseded in-flight (as of 3f3541df pushed)
 
 - **CI @ 65665357** (pre-fix): shards 0/3/4 FAIL, 1/2 CANCELLED (fail-fast), units OK.
