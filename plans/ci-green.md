@@ -367,6 +367,26 @@ batched children (one per ui module, ~115s each on 4 local cores) crossed
 the 120s census child timeout on the slower runner and all reported "did
 not complete". The child timeout is 600s.
 
+## GREEN @ 627c341e: run 33953220015
+
+Unit tests + all 8 itest shards green on the first try after the
+compose_ui child-timeout fix. Walls: unit 2 min; shards 6-26 min (gate
+shard 0: 26 min; the fastest, shard 5 with e2e/bench/litmus, 6 min).
+Budget headroom: the slowest shard uses under half of the 60-minute
+limit with a cold compile.
+
+Standing rules that got here (keep them when adding suites):
+- CI runs the ReleaseSafe harness; every ratchet and cap is tuned on it.
+- A census child timeout sits well above the slowest healthy child on a
+  4-vCPU runner (~1.5x the local 4-core wall); per-test wall caps sit
+  below the child timeout.
+- A suite's weight is its measured 4-core ReleaseSafe wall in tens of
+  seconds; the compose plugin gate keeps 126.
+- Every `update = none` submodule a suite or the examples corpus reads is
+  populated by ci.yml (kotlin, compose, androidx-collection, mosaic).
+- The census always names failing cases; the stdlib and androidx runners
+  do too. Logs: `gh run view <id> --log-failed`.
+
 ## Superseded in-flight (as of 3f3541df pushed)
 
 - **CI @ 65665357** (pre-fix): shards 0/3/4 FAIL, 1/2 CANCELLED (fail-fast), units OK.
