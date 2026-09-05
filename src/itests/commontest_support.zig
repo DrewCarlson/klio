@@ -510,7 +510,7 @@ pub const suites = [_]Config{
             .{ .dir = "kotlin-klio/klio-kotlinx-datetime", .artifact = "target/packs/kotlinx.datetime.klio-pack" },
         },
         .whole_source_set = true,
-        .timeout_ms = 400_000,
+        .timeout_ms = 1_000_000,
         // LocalDateTest.fromEpochDays/toEpochDays are compute-bound (190s /
         // 114s alone on the ReleaseSafe harness): give them their own
         // per-test wall caps so a slower runner does not count them failed.
@@ -560,12 +560,12 @@ pub const suites = [_]Config{
         // restored): split so each test is its own child and the files'
         // fast tests count regardless.
         .split_files = &.{ "json/JsonHugeDataSerializationTest.kt", "json/JsonUnicodeTest.kt" },
-        .extra_env = &.{.{ "KLIO_TEST_WALL_CAP_FOR", "JsonUnicodeTest.testRandomEscapeSequences=390,JsonHugeDataSerializationTest.test=390" }},
+        .extra_env = &.{.{ "KLIO_TEST_WALL_CAP_FOR", "JsonUnicodeTest.testRandomEscapeSequences=900,JsonHugeDataSerializationTest.test=900" }},
         // The two heavy children (10,000 random escaped strings; 10,000
         // nested nodes round-tripped four ways) are interpreter-bound
         // compute measured at ~3-5 min solo; they run first, in parallel
         // with the rest, so the wider cap does not wall the suite.
-        .timeout_ms = 400_000,
+        .timeout_ms = 1_000_000,
         // 2026-09-04 census: 747 passed, 0 failed, 0 did not complete (the
         // split children each count the support file's ContextualTest).
         // Standing at zero: any failure or incomplete child fails the gate.
@@ -892,7 +892,9 @@ pub fn runSuite(cfg: Config) !void {
                 _ = pfailed.fetchAdd(nf, .monotonic);
                 // Census diagnosis: name every failing case (and its file) so
                 // a red census is actionable without a by-hand re-run.
-                if (nf != 0 and std.c.getenv("KLIO_CENSUS_NAMES") != null) {
+                // Always name the failing cases: a red census on CI has no
+                // other way to say which test drifted.
+                if (nf != 0) {
                     const want_err = std.c.getenv("KLIO_CENSUS_ERRS") != null;
                     var itn = std.mem.splitScalar(u8, r.stdout, '\n');
                     var prev_failed = false;

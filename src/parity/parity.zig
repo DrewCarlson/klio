@@ -2125,9 +2125,13 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
         // entries pointing into it must not survive that, and the program's
         // permanent cells go with it (the Vm teardown already freed them on
         // the success path; this covers the diag/error exits).
+        // The write barrier records cells whatever the reclaim mode, so the
+        // remembered set is drained on every path out (an undrained set left
+        // entries into this arena for the next program's base eviction to
+        // write through, a SIGSEGV once the pages were returned to the OS).
+        runtime.gc.drainRemembered();
         if (gc_run) {
             runtime.gc.program_perm_collect = false;
-            runtime.gc.drainRemembered();
             runtime.gc.freeProgramPerm();
         }
         runtime.gc.external_accounting = prev_external_accounting;
@@ -2226,9 +2230,10 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
     defer {
         if (gc_run) interp_ir.resetRunGlobalCaches();
         // Before the VM frees its permanent cells: the remembered set may
-        // hold pointers into them, and the boundary collect below would
-        // otherwise clear flags through freed (possibly unmapped) memory.
-        if (gc_run) runtime.gc.drainRemembered();
+        // hold pointers into them (whatever the reclaim mode), and a later
+        // drain would otherwise clear flags through freed (possibly
+        // unmapped) memory.
+        runtime.gc.drainRemembered();
         vm.deinit();
         if (gc_run) {
             // The final collect runs with the program's closure/suspend hooks

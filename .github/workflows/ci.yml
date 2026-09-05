@@ -95,20 +95,22 @@ jobs:
       # shallow checkouts of the pinned compose-multiplatform-core tag. Without
       # them compose_plugin_commontest and androidx_collection_commontest find
       # no sources and fall below their baselines.
-      - name: cache compose + androidx-collection upstream sources
+      - name: cache compose + androidx-collection + mosaic upstream sources
         id: compose-src-cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             kotlin-klio/klio-compose-runtime/upstream
             kotlin-klio/klio-androidx-collection/upstream
-          key: compose-src-${{ hashFiles('.gitmodules') }}-v1.11.1
+            kotlin-klio/klio-mosaic/upstream
+          key: compose-src-${{ hashFiles('.gitmodules') }}-v1.11.1-mosaic
 
-      - name: populate compose + androidx-collection submodules (if not cached)
+      - name: populate compose + androidx-collection + mosaic submodules (if not cached)
         if: steps.compose-src-cache.outputs.cache-hit != 'true'
         run: |
           ./scripts/init-compose-submodule.sh
           ./scripts/init-androidx-collection-submodule.sh
+          ./scripts/init-mosaic-submodule.sh
 
       # Both zig caches: the global cache (package fetches like the vendored
       # zstd tarball, compiled artifacts) and the project-local .zig-cache

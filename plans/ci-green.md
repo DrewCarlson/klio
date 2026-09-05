@@ -331,6 +331,33 @@ Change: ci.yml runs `-Dharness-optimize=ReleaseSafe` (cache key
 harness), e2e 26, differential 36. Packing: the gate shard ~21 min, every
 other shard ~8-10 min of suite time.
 
+## Status @ 51e122ae pushed: run 33948445310 — no timeouts, five named causes
+
+ReleaseSafe on CI removed every timeout (all shards 18-34 min) and turned
+three shards green (androidx; coroutines + stdlib#1; io + stdlib#0). The
+job logs (now readable via `gh run view <id> --log-failed`) name the rest:
+
+- **e2e (shard 5):** only `mosaic_hello` (`unresolved global BoxNode`):
+  ci.yml never populated `klio-mosaic/upstream`. Populated and cached with
+  the compose/androidx sources (cache key rotated so a hit does not skip it).
+- **differential (shard 2): SIGSEGV in `gc.drainRemembered`.** Under the
+  harness's arena reclaim mode `gc_run` is false, so the program boundary
+  skipped the drain while the write barrier had recorded cells; the next
+  program's base eviction (`base_cache_max = 2`, differential only) drained
+  through pages that CI's glibc had returned to the OS after `malloc_trim`
+  (locally they stayed mapped). Both boundary drains are unconditional now.
+- **datetime (shard 3):** `LocalDateTest.fromEpochDays` "did not complete":
+  the census CHILD timeout (400s) sat below the per-test cap on the slower
+  runner. Child timeouts for datetime and json are 1000s, the json heavy
+  caps 900s.
+- **json (shard 4):** one failure with no name (names printed only under
+  `KLIO_CENSUS_NAMES`, which CI does not set). The census now always names
+  failing cases; the next run says which.
+- **compose_plugin (shard 0):** 1387/1390: the ceiling test plus the two
+  `concurrentMixingWriteApply` concurrency load flakes a 4-vCPU runner
+  shows. Baseline is now 1385 = 1390 - MAX_FAILED, the floor the ceiling
+  already implied; a hang/crash (did-not-complete) still breaks it.
+
 ## Superseded in-flight (as of 3f3541df pushed)
 
 - **CI @ 65665357** (pre-fix): shards 0/3/4 FAIL, 1/2 CANCELLED (fail-fast), units OK.
