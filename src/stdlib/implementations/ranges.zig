@@ -52,6 +52,25 @@ pub fn ranges_down_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }));
 }
 
+/// `Int.rangeTo` / `Long.rangeTo` / `Char.rangeTo` called by name
+/// (`0.rangeTo(2)`): the same value the `..` operator builds. Without a
+/// builtin the explicit call fell through to the generic
+/// `Comparable<T>.rangeTo` extension, whose `ComparableRange` has no
+/// iterator. Non-integral operands are not ours.
+pub fn ranges_range_to(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const pair = pairIntArgs(ctx, "rangeTo") orelse
+        return .{ .err = .{ .Unimplemented = "Vm::rangeTo non-integral operands" } };
+    return ok(try Value.newRange(ctx.allocator, .{
+        .start = pair[0],
+        .end = pair[1],
+        .step = 1,
+        .kind = rangeKindForArgs(ctx.args[0], ctx.args[1]),
+    }));
+}
+/// `Int.rangeUntil` by name is `until`.
+pub fn ranges_range_until(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    return ranges_until(ctx);
+}
 pub fn ranges_until(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // `until` is the integral range builtin, but the name is shared by user
     // extensions (e.g. `LocalDate.until(other, unit)`). Non-integral operands

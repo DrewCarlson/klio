@@ -194,6 +194,31 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    mutability in the full form (one `var` entry makes the whole group
    mutable).
 
+2. **Explicit primitive `rangeTo`** (2026-09-05): `0.rangeTo(2)` (and
+   `rangeUntil`) called by name on Int/Long/Char was deferred to the
+   extension fallback, which picked the generic `Comparable<T>.rangeTo`
+   and produced a `ComparableRange` with no `iterator` (17 tests, the
+   `multiDecl/forRange/explicitRangeTo*` families and the implicit-receiver
+   range tests). The builtin registry now serves `kotlin.Int|Long|Char.rangeTo`
+   and `rangeUntil` with the same range value the `..`/`..<` operators
+   build. Example `examples/explicit_range_to.kt`.
+3. **Invoked lambda arguments** (2026-09-05): a `{ … }` value argument was
+   parsed as a lambda literal and returned without its postfix tail, so
+   `f(b = { … }(), a = …)` ended the argument at `}` (the whole
+   `argumentOrder` directory, 15 tests, plus others: 27 "expected `,`").
+   `parsePostfix` is split so the postfix loop applies to an already-parsed
+   primary, and the argument lambda goes through it. Example
+   `examples/invoked_lambda_argument.kt`. Census after 2+3: 5,440 / 911 / 20.
+4. **Enum entries with bodies** (next): 33 failing tests. The runtime keeps
+   only the entry body's *functions* (an `anon_methods` side-table keyed by
+   a synthesized `X$B` name and an `__enum_entry_class__` tag on the
+   instance) and drops properties, `init` blocks, inner classes, and
+   super calls. Design: the parser synthesizes a real nested class per
+   entry body (`: X(entry args)`, the body as members); VM start
+   instantiates it through the normal class path and swaps the entry's
+   value in `ClassDef.enum_entries` (name/ordinal set as today); the
+   side-table, the tag, and their image serialization go away.
+
 ## Log
 
 - 2026-09-05: opened.
@@ -201,3 +226,5 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
   `box_conformance.zig`, `klio-census box`); Task 3 first census recorded
   above and the ratchet set; battery green with the suite (948 s).
 - 2026-09-05: Task 4 #1 destructuring forms landed: 5409 / 942.
+- 2026-09-05: Task 4 #2 explicit primitive rangeTo + #3 invoked lambda
+  arguments landed: 5440 / 911.

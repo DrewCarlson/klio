@@ -560,7 +560,17 @@ pub fn parsePrefix(p: *Parser) ?Expr {
 
 // Single match-dispatch loop over postfix tokens; splitting would fragment it.
 pub fn parsePostfix(p: *Parser) ?Expr {
-    var expr = parsePrimary(p) orelse return null;
+    const first = parsePrimary(p) orelse return null;
+    return parsePostfixFrom(p, first);
+}
+
+/// The postfix tail (`++`, `!!`, calls, indexing, member access, trailing
+/// lambdas) applied to an already-parsed primary. A `{ … }` value argument
+/// is parsed as a lambda literal directly and comes through here so that
+/// `f(b = { … }())` invokes the literal instead of ending the argument at
+/// its `}`.
+pub fn parsePostfixFrom(p: *Parser, first: Expr) ?Expr {
+    var expr = first;
     // Generic type args at a call site (`foo<String>(…)`) are captured here
     // and attached to the next `Call` constructed in this loop.
     var pending_type_args: []TypeRef = &.{};
@@ -892,8 +902,9 @@ pub fn parseValueArgument(p: *Parser) ?Expr {
     // explicit `->` header (binds an implicit `it`).
     if (std.meta.activeTag(support.peekKind(p).*) == .LBrace) {
         const lam = parseLambdaLiteral(p) orelse return null;
+        const e = parsePostfixFrom(p, lam) orelse return null;
         support.rejectTrailingAssignment(p);
-        return lam;
+        return e;
     }
     const e = parseExpr(p) orelse return null;
     support.rejectTrailingAssignment(p);
