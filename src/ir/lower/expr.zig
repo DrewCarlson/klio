@@ -530,6 +530,13 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (expr.* == .Call) {
         b.pending_lambda_label = calleeLabel(expr.Call.callee);
     }
+    // Tail position is consumed here and handed on only by the forms that
+    // keep it (`if`/`when` arms, an elvis right side, a block's last
+    // statement); every other child lowers outside tail position.
+    const tail_here = b.tail_pos;
+    b.tail_pos = false;
+    b.tail_here = tail_here;
+    b.call_tail = expr.* == .Call and tail_here;
     switch (expr.*) {
         .IntLit => |lit| {
             // Honour the literal's declared kind (`1L`, `1U`, `1uL`)
@@ -605,6 +612,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             var not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
             defer not_null.deinit(b.allocator);
             try narrowNullCheckAll(b, f.cond, true, &not_null);
+            b.tail_pos = tail_here;
             const t_val = try lowerExpr(b, f.then_branch);
             var nn = not_null.items.len;
             while (nn > 0) : (nn -= 1) b.restoreLocal(not_null.items[nn - 1]);
@@ -617,6 +625,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             var else_not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
             defer else_not_null.deinit(b.allocator);
             try narrowNullCheckAll(b, f.cond, false, &else_not_null);
+            b.tail_pos = tail_here;
             const f_val = if (f.else_branch) |e| try lowerExpr(b, e) else try b.emitConst(.Unit);
             var en = else_not_null.items.len;
             while (en > 0) : (en -= 1) b.restoreLocal(else_not_null.items[en - 1]);
@@ -625,7 +634,10 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.switchTo(join);
             return dst;
         },
-        .Block => |block| return lowerBlock(b, &block),
+        .Block => |block| {
+            b.tail_pos = tail_here;
+            return lowerBlock(b, &block);
+        },
         .Path => return lowerPath(b, expr),
         .StringTemplate => |st| return lowerStringTemplate(b, st.parts),
         .While => |w| {
@@ -728,6 +740,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return b.emitConst(.Unit);
         },
         .When => |w| {
+            b.tail_arm = tail_here;
             // `when (val v = subject) { ... }` binds `v` to the subject's
             // value so pattern arms can refer to it.
             if (w.subject != null and w.subject_binding != null) {
@@ -1436,6 +1449,7 @@ fn lowerResolvedBinaryOperator(
 }
 
 fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
+    const elvis_tail = b.tail_here;
     const op = bin.op;
     const lhs = bin.lhs;
     const rhs = bin.rhs;
@@ -1571,6 +1585,7 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
         const dst = b.allocReg();
         b.terminate(.{ .Branch = .{ .cond = is_null, .t = then_b, .f = else_b } });
         b.switchTo(then_b);
+        b.tail_pos = elvis_tail;
         const rv = try lowerExpr(b, rhs);
         try b.push(.{ .Move = .{ .dst = dst, .src = rv } });
         b.terminate(.{ .Goto = join });
@@ -1600,6 +1615,7 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
             var not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
             defer not_null.deinit(b.allocator);
             try narrowNullCheckAll(b, lhs, true, &not_null);
+            b.tail_pos = elvis_tail;
             const rv = try lowerExpr(b, rhs);
             var nn = not_null.items.len;
             while (nn > 0) : (nn -= 1) b.restoreLocal(not_null.items[nn - 1]);
@@ -1622,6 +1638,7 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
             var else_not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
             defer else_not_null.deinit(b.allocator);
             try narrowNullCheckAll(b, lhs, false, &else_not_null);
+            b.tail_pos = elvis_tail;
             const rv = try lowerExpr(b, rhs);
             var en = else_not_null.items.len;
             while (en > 0) : (en -= 1) b.restoreLocal(else_not_null.items[en - 1]);
@@ -3652,6 +3669,7 @@ fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         // bare `return` targets the enclosing fn.
         var prev: ?(?ast.TypeRef) = null;
         if (label == null) prev = b.pushExpected(b.declaredReturn());
+        if (label == null) b.tail_pos = true;
         const lowered = try lowerExpr(b, e);
         if (prev) |p| b.restoreExpected(p);
         r = lowered;
@@ -6202,7 +6220,121 @@ fn receiverConcreteMemberTakes(b: *FuncBuilder, receiver: *const Expr, name: []c
     return res.target != null or res.applicable;
 }
 
+/// The argument expressions a tailrec self-call re-binds the parameters
+/// from: the receiver first when the function carries an implicit `this`,
+/// the written arguments placed by name where the call names them, then
+/// the defaults of the parameters the call omits (Kotlin evaluates them in
+/// parameter order after the given arguments). Null when an omitted
+/// parameter has no default here (an override inheriting one): that call
+/// stays a call. Caller frees.
+/// Lower a tail jump's arguments in Kotlin's evaluation order — the written
+/// arguments as written, then the omitted parameters' defaults in parameter
+/// order — and lay the values out by parameter slot for `TailJump`. Null
+/// when the call cannot become a jump.
+fn emitTailJumpRun(b: *FuncBuilder, receiver: ?*const Expr, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!?[2]Reg {
+    const params = b.tailrecParams();
+    const lead: usize = if (receiver != null) 1 else 0;
+    var any_named = false;
+    for (arg_names) |n| if (n != null) {
+        any_named = true;
+    };
+    if (!any_named and args.len >= params.len) {
+        const all = try b.allocator.alloc(Expr, lead + args.len);
+        defer b.allocator.free(all);
+        if (receiver) |r| all[0] = r.*;
+        for (args, 0..) |arg, i| all[lead + i] = arg;
+        const run = try lowerArgRun(b, all);
+        return .{ run[0], Reg.from(@intCast(run[1])) };
+    }
+    const n_regular = params.len;
+    const slots = try b.allocator.alloc(?Reg, lead + n_regular);
+    defer b.allocator.free(slots);
+    @memset(slots, null);
+    if (receiver) |r| slots[0] = try lowerExpr(b, r);
+    var next_pos: usize = 0;
+    for (args, 0..) |*arg, i| {
+        const name: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
+        var slot: ?usize = null;
+        if (name) |nm| {
+            for (params, 0..) |p, pi| if (std.mem.eql(u8, p.name.name, nm)) {
+                slot = pi;
+                break;
+            };
+        } else {
+            while (next_pos < n_regular and slots[lead + next_pos] != null) next_pos += 1;
+            if (next_pos < n_regular) slot = next_pos;
+        }
+        const si = slot orelse return null;
+        slots[lead + si] = try lowerExpr(b, arg);
+    }
+    for (params, 0..) |p, pi| {
+        if (slots[lead + pi] != null) continue;
+        const d = p.default orelse return null;
+        slots[lead + pi] = try lowerExpr(b, d);
+    }
+    const first = b.allocReg();
+    var k: usize = 1;
+    while (k < slots.len) : (k += 1) _ = b.allocReg();
+    for (slots, 0..) |sv, si| {
+        try b.push(.{ .Move = .{ .dst = Reg.from(first.int() + @as(u32, @intCast(si))), .src = sv.? } });
+    }
+    return .{ first, Reg.from(@intCast(slots.len)) };
+}
+
+fn tailJumpArgs(b: *FuncBuilder, receiver: ?*const Expr, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!?[]Expr {
+    const params = b.tailrecParams();
+    const lead: usize = if (receiver != null) 1 else 0;
+    var any_named = false;
+    for (arg_names) |n| if (n != null) {
+        any_named = true;
+    };
+    if (!any_named and args.len > params.len) {
+        // More arguments than declared parameters (a vararg): keep them as
+        // written.
+        const all = try b.allocator.alloc(Expr, lead + args.len);
+        if (receiver) |r| all[0] = r.*;
+        for (args, 0..) |arg, i| all[lead + i] = arg;
+        return all;
+    }
+    const n_regular = params.len;
+    const all = try b.allocator.alloc(Expr, lead + n_regular);
+    errdefer b.allocator.free(all);
+    const filled = try b.allocator.alloc(bool, n_regular);
+    defer b.allocator.free(filled);
+    @memset(filled, false);
+    if (receiver) |r| all[0] = r.*;
+    var next_pos: usize = 0;
+    for (args, 0..) |arg, i| {
+        const name: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
+        var slot: ?usize = null;
+        if (name) |nm| {
+            for (params, 0..) |p, pi| if (std.mem.eql(u8, p.name.name, nm)) {
+                slot = pi;
+                break;
+            };
+        } else {
+            while (next_pos < n_regular and filled[next_pos]) next_pos += 1;
+            if (next_pos < n_regular) slot = next_pos;
+        }
+        const si = slot orelse return null;
+        all[lead + si] = arg;
+        filled[si] = true;
+    }
+    for (params, 0..) |p, pi| {
+        if (filled[pi]) continue;
+        const d = p.default orelse return null;
+        all[lead + pi] = d.*;
+    }
+    return all;
+}
+
 fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
+    const call_tail = b.call_tail;
+    // The call's tail flag for everything this call lowers (an inline
+    // splice, the general path), saved and restored across nested calls.
+    const prev_tail_ok = b.tail_call_ok;
+    b.tail_call_ok = call_tail;
+    defer b.tail_call_ok = prev_tail_ok;
     // Sibling-arg expected type: `assertEquals(EmptyEnum.entries,
     // enumEntries())` — a sibling argument bound to the same declared type
     // variable statically names an enum, which solves the nested reified
@@ -6263,6 +6395,17 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (is_infix and args.len == 2 and callee.* == .Path and
         callee.Path.segments.len == 1 and ast_type_args.len == 0)
     {
+        // An infix self-call in tail position (`(this - 1) test x` in
+        // `tailrec infix fun Int.test`) is a jump: the written receiver is
+        // the leading `this` parameter.
+        if (call_tail) if (b.tailrecSelf()) |ts| if (std.mem.eql(u8, ts, callee.Path.segments[0].name)) {
+            if (try emitTailJumpRun(b, null, args, expr.Call.arg_names)) |run| {
+                b.terminate(.{ .TailJump = .{ .args = run[0], .n_args = @intCast(run[1].int()) } });
+                const dead = try b.allocBlock();
+                b.switchTo(dead);
+                return b.emitConst(.Unit);
+            }
+        };
         if (scalarBitBinOp(callee.Path.segments[0].name)) |op| blk: {
             var lt = (try staticExprTypeRef(b, &args[0])) orelse break :blk;
             defer lt.deinit(b.allocator);
@@ -6602,6 +6745,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     if (try synthesizeContainerTypeArgs(b, exp, want_heads)) |synth| {
                         var rewritten = expr.*;
                         rewritten.Call.type_args = synth;
+                        b.call_tail = call_tail;
                         return lowerCallGeneral(b, &rewritten);
                     }
                 }
@@ -7436,6 +7580,7 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         return lowerCallSpread(b, callee, args, ast_arg_names);
     }
 
+    b.call_tail = call_tail;
     return lowerCallGeneral(b, expr);
 }
 
@@ -8052,7 +8197,33 @@ fn eagerAuditOn() bool {
     return on;
 }
 
+/// Lower a self-call as an ordinary call when it cannot become a jump.
+/// Whether a member self-call's written receiver names the function's own
+/// dispatch: for a top-level extension any receiver (the function is the
+/// same declaration), for a member `this`, `this@Owner`, or the owner
+/// object itself — `this@Outer.h2(…)` from an inner class calls the
+/// outer class's `h2`, not this one.
+fn tailrecReceiverIsSelf(b: *FuncBuilder, receiver: *const Expr) bool {
+    const owner = b.ownerClass() orelse return true;
+    const simple = if (std.mem.lastIndexOfScalar(u8, owner, '.')) |dot| owner[dot + 1 ..] else owner;
+    // kotlinc does not treat a companion member called through its outer
+    // class (`C.rec(…)` inside `C.Companion`) as a self-call; neither does
+    // this.
+    return switch (receiver.*) {
+        .This => |t| t.qualifier == null or std.mem.eql(u8, t.qualifier.?.name, simple),
+        .Path => |p| std.mem.eql(u8, p.segments[p.segments.len - 1].name, simple),
+        else => false,
+    };
+}
+
+fn lowerCallGeneralNoJump(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
+    b.call_tail = false;
+    return lowerCallGeneral(b, expr);
+}
+
 fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
+    const call_tail = b.call_tail;
+    b.call_tail = false;
     const call = expr.Call;
     const callee = call.callee;
     const args = call.args;
@@ -8591,21 +8762,37 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     // param, and a bare recursive call keeps the same receiver, so the
     // arg run must lead with `this` — dropping it would shift every
     // re-bound parameter by one.
-    if (callee.* == .Path and callee.Path.segments.len == 1) {
+    // The self-call may name its receiver: `1.foo(x - 1)` on an extension,
+    // `this foo x` as an infix call, `this@label.foo(…)`, or an object
+    // dispatcher `O.rec(…)`. The receiver expression is the re-bound
+    // leading `this` parameter.
+    if (call_tail and callee.* == .Member and !callee.Member.safe and b.tailrecSelfHasThis() and
+        tailrecReceiverIsSelf(b, callee.Member.receiver))
+    {
+        if (b.tailrecSelf()) |ts| {
+            if (std.mem.eql(u8, ts, callee.Member.name.name)) {
+                if (try emitTailJumpRun(b, callee.Member.receiver, args, expr.Call.arg_names)) |run| {
+                    b.terminate(.{ .TailJump = .{ .args = run[0], .n_args = @intCast(run[1].int()) } });
+                    const dead = try b.allocBlock();
+                    b.switchTo(dead);
+                    return b.emitConst(.Unit);
+                }
+            }
+        }
+    }
+    if (call_tail and callee.* == .Path and callee.Path.segments.len == 1) {
         if (b.tailrecSelf()) |ts| {
             if (std.mem.eql(u8, ts, callee.Path.segments[0].name)) {
-                const run = if (b.tailrecSelfHasThis()) blk: {
-                    const sp = exprSpan(callee);
-                    const all = try b.allocator.alloc(Expr, args.len + 1);
-                    defer b.allocator.free(all);
-                    const synth_segs = try b.allocator.alloc(ast.Ident, 1);
-                    defer b.allocator.free(synth_segs);
-                    synth_segs[0] = .{ .name = "this", .span = sp };
-                    all[0] = .{ .Path = .{ .segments = synth_segs, .span = sp } };
-                    for (args, 0..) |arg, i| all[i + 1] = arg;
-                    break :blk try lowerArgRun(b, all);
-                } else try lowerArgRun(b, args);
-                b.terminate(.{ .TailJump = .{ .args = run[0], .n_args = run[1] } });
+                const sp = exprSpan(callee);
+                const synth_segs = try b.allocator.alloc(ast.Ident, 1);
+                defer b.allocator.free(synth_segs);
+                synth_segs[0] = .{ .name = "this", .span = sp };
+                const this_expr = Expr{ .Path = .{ .segments = synth_segs, .span = sp } };
+                // An infix self-call (`(this - 1) test x`) carries its receiver
+                // as the first written argument.
+                const recv: ?*const Expr = if (b.tailrecSelfHasThis() and !is_infix) &this_expr else null;
+                const run = (try emitTailJumpRun(b, recv, args, expr.Call.arg_names)) orelse return lowerCallGeneralNoJump(b, expr);
+                b.terminate(.{ .TailJump = .{ .args = run[0], .n_args = @intCast(run[1].int()) } });
                 const dead = try b.allocBlock();
                 b.switchTo(dead);
                 return b.emitConst(.Unit);
@@ -16491,7 +16678,9 @@ fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool)
         }
         break :blk false;
     };
-    if (b.tailrecSelf() != null and callee_is_tailrec and allNull(ast_arg_names)) {
+    // Only a call in tail position is a tail call: `return 1 + f(x - 1)`
+    // recurses and adds.
+    if (b.tail_call_ok and b.tailrecSelf() != null and callee_is_tailrec and allNull(ast_arg_names)) {
         const run = try lowerArgRun(b, args);
         b.terminate(.{ .TailCallFunc = .{ .func = func_id, .args = run[0], .n_args = run[1] } });
         const dead = try b.allocBlock();
@@ -22383,7 +22572,16 @@ pub fn lowerBlock(b: *FuncBuilder, block: *const AstBlock) Allocator.Error!Reg {
     var guarded: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
     defer guarded.deinit(b.allocator);
     var last: ?Reg = null;
-    for (block.stmts) |*stmt| {
+    const block_tail = b.tail_pos;
+    b.tail_pos = false;
+    for (block.stmts, 0..) |*stmt, si| {
+        // The last statement, or one followed only by a bare `return`, is
+        // in tail position when the block is.
+        const is_last = si + 1 == block.stmts.len;
+        const before_bare_return = si + 2 == block.stmts.len and
+            block.stmts[si + 1] == .Expr and block.stmts[si + 1].Expr == .Return and
+            block.stmts[si + 1].Expr.Return.value == null;
+        b.tail_pos = block_tail and stmt.* == .Expr and (is_last or before_bare_return);
         last = try lowerStmt(b, stmt);
         try narrowAfterExitGuard(b, stmt, &guarded);
     }

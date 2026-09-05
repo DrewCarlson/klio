@@ -34,9 +34,10 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// `rangeTo` + invoked lambda arguments: 5440 / 911. Enum entries with
 /// bodies as real subclasses: 5461 / 890. Language feature flags and the
 /// name-based short form: 5477 / 874. Corpus syntax gaps and contextual
-/// anonymous functions: 5506 / 845.
-pub const BASELINE: usize = 5506;
-pub const MAX_FAILED: usize = 845;
+/// anonymous functions: 5506 / 845. Tailrec self-calls in tail position
+/// in every form: 5530 / 822.
+pub const BASELINE: usize = 5530;
+pub const MAX_FAILED: usize = 822;
 
 /// Directives that bind a test to a framework feature klio has no
 /// counterpart for: a backend restriction, a second module, reflection,

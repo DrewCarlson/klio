@@ -124,6 +124,7 @@ pub fn lowerWhenWithSubjectReg(
     branches: []const ast.WhenBranch,
     when_span: span.Span,
 ) Allocator.Error!Reg {
+    const when_tail = b.tail_arm;
     _ = when_span;
     const subject_r: ?Reg = if (pre_lowered) |r| r else if (subject) |s| try lowerExpr(b, s) else null;
     const join = try b.allocBlock();
@@ -149,6 +150,7 @@ pub fn lowerWhenWithSubjectReg(
             for (branches, arms.body_blocks) |branch, body_blk| {
                 if (body_blk) |blk| {
                     b.switchTo(blk);
+                    b.tail_pos = when_tail;
                     const v = try lowerExpr(b, &branch.body);
                     try b.push(.{ .Move = .{ .dst = result, .src = v } });
                     b.terminate(.{ .Goto = join });
@@ -165,6 +167,7 @@ pub fn lowerWhenWithSubjectReg(
             if (branch.patterns.len == 1 and branch.patterns[0].kind == .Else) {
                 b.terminate(.{ .Goto = body_blk });
                 b.switchTo(body_blk);
+                b.tail_pos = when_tail;
                 const v = try lowerExpr(b, &branch.body);
                 try b.push(.{ .Move = .{ .dst = result, .src = v } });
                 b.terminate(.{ .Goto = join });
@@ -232,6 +235,7 @@ pub fn lowerWhenWithSubjectReg(
             if (head.len == 0) break :blk null;
             break :blk b.setThisNarrow(head);
         };
+        b.tail_pos = when_tail;
         const v = try lowerExpr(b, &branch.body);
         if (narrowed_this) |prev| _ = b.setThisNarrow(prev);
         if (narrowed) |n| b.restoreLocal(n);

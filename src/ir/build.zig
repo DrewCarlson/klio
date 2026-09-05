@@ -664,6 +664,26 @@ pub const FuncBuilder = struct {
     /// param (instance method / extension). A bare recursive call keeps
     /// the same receiver, so the tail jump's arg run must lead with it.
     tailrec_self_this: bool = false,
+    /// Whether the expression lowered next sits in tail position of the
+    /// function — a `return` operand, an expression body, an `if`/`when`
+    /// arm or elvis right side that is itself in tail position, a Unit
+    /// body's last statement. Only there is a tailrec self-call a jump;
+    /// `return 1 + f(x - 1)` recurses.
+    tail_pos: bool = false,
+    /// The tail-position flag of the node `lowerExpr` is lowering now.
+    tail_here: bool = false,
+    /// The flag a `when` in tail position hands its arm bodies.
+    tail_arm: bool = false,
+    /// The call node's tail flag, carried from `lowerCall` into the general
+    /// call lowering where a tailrec self-call becomes a jump.
+    call_tail: bool = false,
+    /// The general call lowering's own tail flag for the call it is
+    /// emitting (saved and restored across nested calls), consulted where a
+    /// statically resolved tailrec-to-tailrec call becomes a tail call.
+    tail_call_ok: bool = false,
+    /// The tailrec function's parameters: a self-call that omits trailing
+    /// defaulted arguments re-binds them from their defaults.
+    tailrec_params: []const ast.Param = &.{},
     /// Names bound as parameters at the function entry (set by
     /// `bind_params`). Used by call-site lowering to recognise
     /// when an identifier-as-callee is a function-typed param.
@@ -2081,6 +2101,12 @@ pub const FuncBuilder = struct {
     }
     pub fn tailrecSelfHasThis(self: *const FuncBuilder) bool {
         return self.tailrec_self_this;
+    }
+    pub fn setTailrecParams(self: *FuncBuilder, params: []const ast.Param) void {
+        self.tailrec_params = params;
+    }
+    pub fn tailrecParams(self: *const FuncBuilder) []const ast.Param {
+        return self.tailrec_params;
     }
     /// Record a local's declared type / initializer for inline-overload
     /// receiver narrowing.

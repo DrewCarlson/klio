@@ -1222,6 +1222,9 @@ pub fn spliceInlineLambdaOn(
     if (!std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_NRG") orelse "1", "0")) {
         b.inline_stack_visible_base = b.inline_stack.items.len;
     }
+    // The spliced body sits where the call sits: a tail-position call
+    // hands its tail position to the last statement of the lambda.
+    b.tail_pos = b.tail_call_ok;
     const v = try lowerBlock(b, &body);
     b.inline_stack_visible_base = prev_decl_base;
     if (encl_pushed) {

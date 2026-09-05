@@ -266,10 +266,29 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    them whenever a context value was in scope at the call. `contextParameters/`
    25 → 21, `extensionFunctions/` 11 → 9; census 5,506 / 845 / 20. Example
    `examples/context_anonymous_function.kt`.
-8. **Tailrec with an explicit receiver** (next): nine `tailRecursion` tests
-   overflow because the self-call recognition accepts only the bare form;
-   `1.foo(x - 1)`, `this foo x`, `this@label.foo(…)`, and an object
-   dispatcher `O.rec(…)` are self-calls too.
+8. **`tailrec` self-calls** (2026-09-05): klio's tailrec lowering jumped on
+   every self-call and only recognized the bare form. Now a self-call is a
+   jump only in tail position — tracked by the lowering: a `return`
+   operand, an expression body, `if`/`when` arms, an elvis or `||`/`&&`
+   right side, an inline splice's body, a Unit body's last statement (or
+   one followed only by a bare `return`); `return 1 + f(x - 1)` recurses
+   and adds — and in every form: an explicit receiver (`(n - 1).f()`,
+   `this@C.f(…)`, an object dispatcher `O.f(…)`; `this@Outer.f(…)` from an
+   inner class names another function), infix (`(this - 1) f x`, the
+   written receiver being the leading parameter), omitted defaults filled
+   in parameter order after the written arguments, named arguments placed
+   by parameter, a local `tailrec` function's body in tail position. A
+   call whose omitted parameter has no default here (an override
+   inheriting one) stays a call. The statically resolved tailrec-to-tailrec
+   `TailCallFunc` emission carries the same tail-position condition.
+   `tailRecursion/` 25 → 44 of 46; census 5,530 / 822 / 19. Example
+   `examples/tailrec_forms.kt`.
+   Verdicts for the two left: `tailrecWithExplicitCompanionObjectDispatcher`
+   is not a tail call for kotlinc either (`C.rec(…)` through the outer
+   class) and needs 100,000 plain frames, klio's evaluation depth cap;
+   `recursiveCallInInlineLambda` is a non-local `return test()` inside a
+   private member `inline fun`'s lambda, which klio calls instead of
+   splicing (an open mechanism, one test).
 
 ## Log
 
@@ -285,3 +304,4 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
   landed: 5477 / 874.
 - 2026-09-05: Task 4 #6 corpus syntax gaps + #7 contextual anonymous
   functions landed: 5506 / 845.
+- 2026-09-05: Task 4 #8 tailrec self-calls landed: 5530 / 822.

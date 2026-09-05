@@ -2496,6 +2496,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     if (f.is_tailrec) {
         b.setTailrecSelf(f.name.name);
         b.setTailrecSelfHasThis(names.items.len != 0 and std.mem.eql(u8, names.items[0], "this"));
+        b.setTailrecParams(f.params);
     }
     b.setInline(f.is_inline);
     // The declared return type is the expected type for both an
@@ -2516,9 +2517,14 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
                 // Unit-typed call: Compose's `block?.invoke(c, 1) ?:
                 // error("Invalid restart scope")` saw the restart-wrapped
                 // body's trailing `endRestartGroup()?.updateScope(..)` null.
+                // A Unit body's last statement is in tail position; a
+                // value-returning body reaches its value only through
+                // `return`.
+                b.tail_pos = f.return_type == null or std.mem.eql(u8, f.return_type.?.name.name, "Unit");
                 _ = try mod.lowerBlock(&b, blk);
             },
             .Expr => |*e| {
+                b.tail_pos = true;
                 // An expression body has no statements, so mark its source
                 // position here (stack-trace support) — without this a frame
                 // running `fun f() = g()` would report no line.
