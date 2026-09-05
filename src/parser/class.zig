@@ -780,7 +780,8 @@ pub fn parseSecondaryCtor(
                 const an = expr.tryConsumeNamedArgName(p);
                 if (an != null) any_named = true;
                 arg_names.append(p.allocator, an) catch @panic("OOM");
-                const a = expr.parseExpr(p) orelse break;
+                // A delegation argument may be a spread (`super("0", *x, "4")`).
+                const a = expr.parseValueArgument(p) orelse break;
                 args.append(p.allocator, a) catch @panic("OOM");
                 support.skipNl(p);
                 if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {

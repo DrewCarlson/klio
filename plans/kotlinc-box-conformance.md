@@ -304,14 +304,33 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    `examples/bare_accessors.kt`, `examples/enum_secondary_constructors.kt`.
    Verdict: `companionBlocksAndExtensions/*` (3 tests) use `companion { }`
    blocks, not Kotlin syntax klio targets.
-10. **Secondary constructors in class hierarchies** (next): 12 failing
-   tests in `secondaryConstructors/` plus `enums.kt`'s body entry — a
-   subclass header `class C : A(5)` binds its arguments to the parent's
-   primary parameters and never selects a parent secondary constructor
-   (`runSuperCtorChain` has the selection, delegation, and body logic but
-   only the `super(…)` path reaches it); defaults and named arguments
-   through `this(…)`; `super("0", *x, "4")` spread arguments; local and
-   inner classes with secondary constructors.
+10. **Secondary constructors in class hierarchies** (2026-09-05): a
+   subclass header `class C : A(5)` bound its arguments to the parent's
+   primary parameters whenever the count matched and never ran a parent
+   secondary constructor's body; `runSuperCtorChain` had the selection,
+   delegation, and body logic but only the `super(…)` path reached it. The
+   header chain now resolves a parent's arguments through
+   `expandParentSecondaryThisArgs`: the constructor the arguments fit by
+   count, defaults, and argument type (the secondary wins a same-count tie
+   only when its parameter types fit strictly better), named arguments
+   bound by parameter with gaps filled from defaults in order, `this(…)`
+   delegation feeding the primary, `super(…)` feeding the grandparent, and
+   each chosen body run after that class's initializers in the parents-first
+   pass. Also: a class without a primary constructor dispatches `A()` to a
+   defaulted secondary constructor; `super("0", *x, "4")` parses; an enum
+   class is extensible for dispatch, so `open`/`abstract` members overridden
+   in entry bodies dispatch virtually (`is_enum` on the IR class).
+   `secondaryConstructors/` 18 → 22 of 30, `enum/` 66 → 70 of 95; census
+   5,553 / 799 / 19. Example `examples/parent_secondary_constructors.kt`. Verdicts for the rest of
+   the directory: `varargs.kt` (a vararg secondary constructor needs arity
+   packing in the chooser), `superCallSecondary.kt` (a subclass secondary
+   constructor's `super(…)` runs after the shell's initializers, so the
+   parent body follows the subclass's init blocks), `localClasses.kt`
+   (a local class's init blocks are not registered for its secondary
+   constructor path), `innerClasses*.kt` (an inner class's secondary
+   constructor body cannot see the outer instance), `callFromLocalSubClass`
+   / `clashingDefaultConstructors` (a local subclass loses the field its
+   parent secondary constructor sets), `fieldInitializerOptimization.kt`.
 
 ## Log
 
@@ -330,3 +349,5 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
 - 2026-09-05: Task 4 #8 tailrec self-calls landed: 5530 / 822.
 - 2026-09-05: Task 4 #9 bare accessors + enum secondary constructors
   landed: 5542 / 810.
+- 2026-09-05: Task 4 #10 parent secondary constructors + enum virtual
+  dispatch landed: 5553 / 799.

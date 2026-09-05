@@ -1839,6 +1839,9 @@ pub const Class = struct {
     /// `open` nor `is_abstract` (which folds in `abstract`/`interface`/`sealed`)
     /// is final: it can never be subclassed, so its members cannot be overridden.
     is_open: bool = false,
+    /// An enum class: its entries' bodies may override its `open`/`abstract`
+    /// members, so member dispatch stays virtual for those.
+    is_enum: bool = false,
     /// A named Kotlin `object`. Calling its classifier name resolves the
     /// singleton value and dispatches `operator fun invoke`; it is never a
     /// constructor call despite sharing the class table representation.
@@ -6270,7 +6273,10 @@ pub const Module = struct {
         // false and the interface default bound direct, so the implementing
         // class's override never ran. Unknown declarer: virtual.
         const declared_on_interface = if (declaring_class) |decl| (decl.is_interface or decl.is_stub) else true;
-        const direct = !class.is_interface and (!class.is_open and !class.is_abstract or (!declared_on_interface and methodIsFinal(f)));
+        // An enum class is extensible by its entries' bodies, which override
+        // its `open`/`abstract` members: only a final member is bound direct.
+        const closed_class = !class.is_open and !class.is_abstract and !class.is_enum;
+        const direct = !class.is_interface and (closed_class or (!declared_on_interface and methodIsFinal(f)));
         if (std.c.getenv("KLIO_DISPATCH_TRACE")) |w| {
             if (std.mem.eql(u8, std.mem.span(w), name)) std.debug.print("[dispatch] {s} owner={s} iface={} open={} abstract={} stub={} decl_owner={s} decl_iface={} decl_stub={} final={} -> {s}\n", .{ name, class.fqn, class.is_interface, class.is_open, class.is_abstract, class.is_stub, if (declaring_class) |d| d.fqn else "-", declared_on_interface, if (declaring_class) |d| d.is_stub else false, methodIsFinal(f), if (direct) "direct" else "virtual" });
         }
@@ -6310,7 +6316,7 @@ pub const Module = struct {
         else
             null;
         const declared_on_interface = if (declaring_class) |decl| (decl.is_interface or decl.is_stub) else true;
-        if (!class.is_interface and (!class.is_open and !class.is_abstract or (!declared_on_interface and methodIsFinal(f)))) {
+        if (!class.is_interface and ((!class.is_open and !class.is_abstract and !class.is_enum) or (!declared_on_interface and methodIsFinal(f)))) {
             return .direct;
         }
         return .virtual;
