@@ -442,6 +442,9 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         try b.inheritLocalFnOverloads(table);
     }
     if (tailrec_self) |name| {
+        // A local tailrec function body is in tail position: its last
+        // statement or `return` operand may jump.
+        b.tail_pos = true;
         b.setTailrecSelf(name);
     }
     var boxed = try ast_scan.computeBoxedVars(b.allocator, body.stmts);
