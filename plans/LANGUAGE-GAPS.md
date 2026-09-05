@@ -9,10 +9,13 @@ All tracked language gaps are closed. The earlier "landed" set (reified type par
 - sealed `when` exhaustiveness → `sealedLeafSubclasses` + "'when' expression must be exhaustive" (`src/typeck/check/narrowing.zig`).
 - user `contract { callsInPlace(...) }` → user-inline-contract registry (`src/cfa/analyses/contracts.zig`).
 
-## Open (owned by `resolution-residue-campaign.md`)
+## Open
 
-- **Bare factory vs value-class constructor**: `Color(0xFFFF0000)` inside `Color`'s own companion binds the `Color(ULong)` constructor instead of `fun Color(Long)`; kotlinc resolves by argument type. Task 1 there.
-- **Char ranges expose Int endpoints**: `('a'..'c').toString()` prints `97..99` and `.first` is an `Int`; kotlinc keeps `Char`. Task 2 there.
+None recorded. The last two (bare factory vs value-class constructor,
+Char range endpoints) closed 2026-09-05 in `resolution-residue-campaign.md`:
+inside the class the constructor wins when the argument types fit, else the
+same-named factory (`examples/value_class_factory_over_ctor.kt`); ranges
+render and contain their element type (`examples/char_range_endpoints.kt`).
 
 ## Pack-actual residuals
 
