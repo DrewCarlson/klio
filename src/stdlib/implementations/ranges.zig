@@ -335,6 +335,9 @@ pub fn range_contains(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const n: i64 = blk: {
         if (ctx.args.len > 1) {
             if (ctx.args[1].asI64()) |v| break :blk v;
+            // A Char range takes a Char (`'b' in 'a'..'c'` and
+            // `('a'..'c').contains('b')` are the same call).
+            if (ctx.args[1] == .Char) break :blk @as(i64, ctx.args[1].Char);
         }
         return typeErr("Range.contains requires an Int argument");
     };

@@ -2,4 +2,8 @@ true s 1
 false t 2
 true u 3
 false v 5
+true s 3
+false t 4
+true u 6
+false v 7
 holder Holder(7)
