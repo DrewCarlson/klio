@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const support = @import("commontest_support.zig");
+const box = @import("box_support.zig");
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -25,6 +26,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     if (args.len < 2) {
         std.debug.print("usage: klio-census <suite>[,<suite>...] | all\navailable:", .{});
         for (&support.suites) |*cfg| std.debug.print(" {s}", .{cfg.name});
+        std.debug.print(" box", .{});
         std.debug.print("\n", .{});
         return 2;
     }
@@ -38,6 +40,15 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     } else {
         var it = std.mem.splitScalar(u8, args[1], ',');
         while (it.next()) |name| {
+            if (std.mem.eql(u8, name, "box")) {
+                const s = box.runCensus(arena.allocator(), "box_conformance") catch {
+                    failed = true;
+                    continue;
+                };
+                box.printSummary("box_conformance", s, box.BASELINE, box.MAX_FAILED);
+                if (s.passed < box.BASELINE or s.failed > box.MAX_FAILED) failed = true;
+                continue;
+            }
             support.runSuiteNamed(name) catch |e| {
                 if (e == error.UnknownSuite) return 2;
                 failed = true;

@@ -82,7 +82,7 @@ wave1_steps=(
 wave2_steps=(
   itest-datetime_commontest itest-serialization_commontest
   itest-serialization_json_commontest itest-compose_ui_commontest
-  itest-atomicfu_commontest itest-check_examples
+  itest-atomicfu_commontest itest-check_examples itest-box_conformance
 )
 s=$(date +%s)
 rest_log=$(mktemp)

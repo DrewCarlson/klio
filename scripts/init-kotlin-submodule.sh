@@ -22,6 +22,8 @@ cd "$(git rev-parse --show-toplevel)"
 sparse=(
   "libraries/stdlib"
   "libraries/kotlin.test"
+  "compiler/testData/codegen/box"
+  "compiler/testData/diagnostics/helpers/coroutines"
 )
 
 url=$(git config -f .gitmodules submodule.kotlin.url)

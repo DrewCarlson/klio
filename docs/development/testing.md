@@ -94,6 +94,14 @@ points:
   `~/.klio` data home (its installed packs shadow the tree): run
   `scripts/refresh-local-packs.sh` and pass `KLIO_HOME=$PWD/.klio-local`, or
   `--allow-shared-home` on purpose. `--list-fail` names the failures.
+- `zig build itest-box_conformance` / `zig-out/bin/klio-census box` — the
+  kotlinc box-test corpus (`kotlin/compiler/testData/codegen/box`, populated
+  by `scripts/init-kotlin-submodule.sh`): one child `klio run` per selected
+  test, `box()` must return `"OK"`. Selection is by header directive
+  (`src/itests/box_support.zig`); every run prints the exclusion census
+  (`[box-excluded] reason: n`) and names each failure (`[box-fail] path:
+  first line`). `KLIO_BOX_FILTER=<substring>` runs a subset,
+  `KLIO_BOX_TIMEOUT_MS` sets the per-test wall.
 - `scripts/commontest-sweep.py BIN` — the iteration driver: per-file
   pass counts and failed test names for any klio binary.
   `--filter <File>` runs one file (~16 s), `--passes` prints

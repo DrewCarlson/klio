@@ -85,6 +85,97 @@ gate wiring: `census-gates-and-red-mass.md`.
 - A renamed or simplified copy of a failing test is for bisecting only;
   the corpus file must pass unmodified.
 
+## Runner facts (2026-09-05)
+
+- Populated: `scripts/init-kotlin-submodule.sh` now lists
+  `compiler/testData/codegen/box` and
+  `compiler/testData/diagnostics/helpers/coroutines` (the `WITH_COROUTINES`
+  helpers: CoroutineUtil, CoroutineHelpers, StateMachineChecker,
+  TailCallOptimizationChecker, all `package helpers`); 7,351 `.kt` files in
+  174 directories, 36 MB; CI's kotlin cache key carries `-codegen-box`.
+- Shape: one child `klio run` per selected test (a warm trivial run is
+  0.087 s, so the corpus is minutes on 4 cores), sections written as
+  numbered files under `/tmp/klio_itest_box_home/cases/<path>/`, a
+  synthesized `__box_main.kt` (`import <pkg>.box` when the box file has a
+  package) that throws unless `box() == "OK"` and prints `BOX-OK`; the
+  helpers appended for `WITH_COROUTINES`; `OPTIONAL_JVM_INLINE_ANNOTATION`
+  replaced by `@JvmInline` under `WORKS_WHEN_VALUE_CLASS`. Runner:
+  `src/itests/box_support.zig` (shared by the `box_conformance` itest and
+  `klio-census box`). Knobs: `KLIO_BOX_FILTER` (path substring),
+  `KLIO_ITEST_JOBS`, `KLIO_BOX_TIMEOUT_MS` (60 s, ×4 on a Debug harness).
+- Directive census over the corpus (files): WITH_STDLIB 3,582; LANGUAGE
+  1,708 (27 disable a feature → excluded); WORKS_WHEN_VALUE_CLASS 740;
+  WITH_COROUTINES 500; MODULE 491; TARGET_BACKEND 272; IGNORE_BACKEND 285;
+  WITH_REFLECT 109; CHECK_TYPE_WITH_EXACT 44 (framework helper → excluded);
+  Java sections 5; no `box()` 2. Header-only scan (directives before the
+  first code line) keeps body comments like `// TODO:` out of selection.
+- Ratchet semantics: `BASELINE` = measured pass count (floor),
+  `MAX_FAILED` = measured failure count (ceiling with no slack); a new
+  failure trips the ceiling even while old ones remain. "MAX_FAILED 0" in
+  the goal reads as zero slack, since the first census carries real
+  failures by construction.
+- Prototype sample (300 random files, before the Zig runner): 207 pass /
+  47 fail / 46 excluded; failure shapes: runtime misses (`call_member`,
+  `get_field`, unresolved globals), parser gaps (name-based destructuring,
+  `for` with destructuring in arrays), assertion mismatches (unsigned
+  stepped ranges, IEEE 754 equality, finally ordering).
+
+## Task 3 record — first full census (2026-09-05)
+
+ReleaseSafe harness, 12 workers, 147 s wall: **5,246 passed, 1,105 failed, 20 did
+not complete of 6,371 selected; 980 excluded of 7,351 files.** Ratchet:
+`BASELINE = 5246`, `MAX_FAILED = 1105` (`src/itests/box_support.zig`).
+
+Exclusion census (by directive): MODULE: 447; TARGET_BACKEND: 263; WITH_REFLECT: 88; CHECK_TYPE_WITH_EXACT: 44; LANGUAGE:-feature: 27; FREE_COMPILER_ARGS: 19; FULL_JDK: 18; IGNORE_BACKEND:ANY: 14; JVM_DEFAULT_MODE: 12; API_VERSION: 10; JVM_TARGET: 9; LAMBDAS: 7; IGNORE_BACKEND_K2:ANY: 6; STRING_CONCAT: 4; USE_OLD_INLINE_CLASSES_MANGLING_SCHEME: 4; ALLOW_KOTLIN_PACKAGE: 3; ASSERTIONS_MODE: 2; NATIVE_STANDALONE: 2; SAM_CONVERSIONS: 1.
+
+Failure shapes (first line of the child's stderr, normalized):
+
+| Count | Shape | Example |
+|-------|-------|---------|
+| 246 | `runtime error: uncaught kotlin.AssertionError: box() returned …` | `annotations/instances/annotationAnnotationParam.kt` |
+| 146 | `runtime error: IR eval: Vm::call_member `_` on `_`` | `associatedObjects/findAssociatedObject.kt` |
+| 113 | `<file> error: expected loop variable` | `arrays/forInUnsignedArray/forInUnsignedArrayWithIndex.kt` |
+| 92 | `runtime error: IR eval: Vm::get_field `_` on `_`` | `callableReference/adaptedReferences/adaptedVarargFunImportedFromObject.kt` |
+| 79 | `runtime error: IR eval: unresolved global `_`` | `callableReference/adaptedReferences/innerConstructorWithVararg.kt` |
+| 66 | `runtime error: uncaught kotlin.AssertionError: Expected …` | `annotations/instances/annotationWithTypeParameters.kt` |
+| 34 | `<file> error: expected `_`` | `argumentOrder/arguments.kt` |
+| 34 | `<file> error: expected property name` | `callableReference/function/genericCallableReferenceWithReifiedTypeParam.kt` |
+| 18 | `<file> error: expected expression` | `annotations/spreadOperatorInAnnotationArguments.kt` |
+| 17 | `<file> error: expected top-level declaration` | `bridges/propertyAccessorsWithoutBody.kt` |
+| 15 | `runtime error: IR eval: Vm::call_value on `_`` | `callableReference/function/local/constructorWithInitializer.kt` |
+| 12 | `runtime error: uncaught java.lang.StackOverflowError: Stack overflow: evaluation` | `builtinStubMethods/extendJavaClasses/arrayList.kt` |
+| 10 | `runtime error: uncaught kotlin.AssertionError` | `delegatedProperty/optimizedDelegatedProperties/mixedArgumentSizes.kt` |
+| 8 | `<file> error: expected newline or `_` between statements` | `contracts/lambdaParameter.kt` |
+| 7 | `<file> error: expecte` | `callableReference/adaptedReferences/suspendConversion/inlineWithContextParameterAsAPropertyType.kt` |
+| 6 | `<file> error: expected member name` | `extensionFunctions/executionOrder.kt` |
+
+Failures by corpus directory: callableReference 87, controlStructures 76, multiDecl 67, enum 54, ranges 52, delegatedProperty 48, coroutines 39, inlineClasses 37, contextParameters 28, diagnostics 28, annotations 26, casts 25, defaultArguments 25, arrays 23, closures 23, properties 22, evaluate 16, ieee754 16, objects 16, extensionFunctions 15, functions 15, localClasses 14, super 14, typealias 14.
+
+Did not complete: crashes `callableReference/function/innerConstructorFromClass.kt`, `callableReference/function/innerConstructorFromExtension.kt`, `callableReference/function/extensionFunctionWithExtensionInSAMInterface.kt`, `inlineClasses/defaultParameterValues/inlineClassSecondaryConstructorGeneric.kt`, `inlineClasses/secondaryConstructorsInsideInlineClassWithPrimitiveCarrierTypeGeneric.kt`, `functions/nothisnoclosure.kt`, `extensionFunctions/extensionFunctionWithExtensionInSAMInterface.kt`, `ranges/stepped/expression/downTo/maxValueToMinValueStepMaxValue.kt`, `ranges/stepped/expression/rangeTo/minValueToMaxValueStepMaxValue.kt`, `ranges/stepped/expression/until/minValueToMaxValueStepMaxValue.kt`, `ranges/stepped/literal/downTo/maxValueToMinValueStepMaxValue.kt`, `ranges/stepped/literal/rangeTo/minValueToMaxValueStepMaxValue.kt`, `ranges/stepped/literal/until/minValueToMaxValueStepMaxValue.kt`, `super/kt4173_2.kt`; timeouts `controlStructures/breakContinueInExpressions/continueInDoWhile.kt`, `controlStructures/breakContinueInExpressions/inlinedBreakContinue/withReturnValueDoWhileContinue.kt`, `controlStructures/breakContinueInExpressions/pathologicalDoWhile.kt`, `controlStructures/continueInWhen.kt`, `diagnostics/functions/tailRecursion/defaultArgsOverridden.kt`, `inline/loopWithInlinableCondition.kt`.
+
+Cluster reading (Task 4 order): (1) Kotlin 2.4 destructuring syntax —
+`[a, b]` positional short form and `(val a, val b = prop)` name-based full
+form in `val`, `for`, and lambda parameters (~150 files across
+`multiDecl`, `controlStructures`, `arrays`, `ranges`, `nameBasedDestructuring`,
+`coroutines`); (2) `box() returned …` assertion mismatches (237, heterogeneous:
+per-directory triage); (3) runtime dispatch misses — `call_member` (146),
+`get_field` (92), unresolved global (78), `call_value` (14) — mostly
+`callableReference`, `enum`, `delegatedProperty`, `contextParameters`;
+(4) parser gaps: immediately-invoked lambda arguments `f(b = { … }())` (34),
+extension properties on parenthesized function-type receivers
+`val (Int.() -> String).baz` (32), annotation spread arguments and empty
+`for (…);` bodies (30), accessor-only lines / `by` on its own line /
+`x!! infix y` (27), `receiver.(expr)(args)` (6), `label@for` without space,
+`context(String) () -> Unit` function types; (5) crashes: six
+`…StepMaxValue` progression tests segfault in libc (step arithmetic at
+`Long.MAX_VALUE`), four evaluation stack overflows (inline-class secondary
+constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`),
+`super/kt4173_2.kt`; timeouts: `continue` inside `do-while` / `when` bodies
+(five) and `inline/loopWithInlinableCondition.kt`.
+
 ## Log
 
 - 2026-09-05: opened.
+- 2026-09-05: Task 1 populated; Task 2 runner written (`box_support.zig`,
+  `box_conformance.zig`, `klio-census box`); Task 3 first census recorded
+  above and the ratchet set.

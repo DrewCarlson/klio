@@ -224,6 +224,12 @@ const itests_files = [_]Itest{
     }, .weight = 3 },
     // Bootstrapping proof: Kotlin's own stdlib commonTest sources run through
     // a child `klio test` against the installed kotlin.test pack.
+    // kotlinc's own box-test corpus (`fun box(): String` == "OK"), one
+    // child `klio run` per selected test; selection by header directive.
+    .{ .name = "box_conformance", .needs_exe = true, .dirs = &.{
+        "kotlin/compiler/testData/codegen/box",
+        "kotlin/compiler/testData/diagnostics/helpers/coroutines",
+    }, .weight = 35 },
     .{ .name = "stdlib_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlin-test",
         "kotlin/libraries/kotlin.test",
