@@ -15,14 +15,14 @@ verdicts that bound what a per-op lever can still buy:
 
 | Case | Wall | Cap it lives under | Command |
 |------|------|--------------------|---------|
-| `LocalDateTest.fromEpochDays` (kotlinx-datetime) | 190 s alone | `KLIO_TEST_WALL_CAP_FOR=…=900`, child 1000 s | `KLIO_ITEST_BIN=zig-out/bin/klio-harness KLIO_CENSUS_TIMES=1 zig-out/bin/klio-census datetime` |
-| `LocalDateTest.toEpochDays` | 114 s alone | same | same |
-| `JsonUnicodeTest.testRandomEscapeSequences` (json census) | ~195 s | 900 s | `… klio-census serialization_json` |
-| `JsonHugeDataSerializationTest.test` | ~ (split child) | 900 s | same |
+| `LocalDateTest.fromEpochDays` (kotlinx-datetime) | 113 s census child (was 166; user-method memo) | `KLIO_TEST_WALL_CAP_FOR=…=900`, child 1000 s | `KLIO_ITEST_BIN=zig-out/bin/klio-harness KLIO_CENSUS_TIMES=1 zig-out/bin/klio-census datetime` |
+| `LocalDateTest.toEpochDays` | 101 s census child (was 114) | same | same |
+| `JsonUnicodeTest.testRandomEscapeSequences` (json census) | 175 s census child; genuine compute | 900 s | `… klio-census serialization_json` |
+| `JsonHugeDataSerializationTest.test` | 33 s solo (4 cores); its own census child for scheduling, not for its wall | 900 s | same |
 | `RecomposerTests.validatePotentialDeadlock` (plugin gate, ReleaseFast) | 471 s solo (was 547) | 900 s; baseline 1385 tolerates it | `zig build itest-compose_plugin_commontest` |
 | `SnapshotStateListTests.concurrentMixingWriteApply_addAll_clear`, `SnapshotStateSetTests.concurrentMixingWriteApply_add` | load flakes on 4 vCPU | tolerated by `MAX_FAILED` | same |
-| androidx `ScatterMapTest`, `OrderedScatterSetTest`, `SieveCacheTest` | the compute-heavy tail; 180 s per-file base cap | 180 s ×4 on Debug | `zig build itest-androidx_collection_commontest` |
-| `differential` (kotlinx-pack examples in two load modes, in-process) | ~17 min | shard weight 36 | `zig build itest-differential -Dharness-optimize=ReleaseSafe` |
+| androidx `ScatterMapTest`, `OrderedScatterSetTest`, `SieveCacheTest` | ScatterMapTest 38 s solo; genuine compute; 180 s per-file base cap | 180 s ×4 on Debug | `zig build itest-androidx_collection_commontest` |
+| `differential` (kotlinx-pack examples in two load modes, in-process) | 176 s (ReleaseSafe test binary; the 17 min was a Debug lane) | shard weight 18 | `zig build itest-differential -Dharness-optimize=ReleaseSafe` |
 | stdlib `DeepRecursiveTest.testBadClass` | ~42 s today under the sampler (was ~150 s when `verification-speed-plan.md` recorded it) | 300 s default | sweep `--filter DeepRecursive` |
 
 CI context: with the ReleaseSafe harness every shard finishes in 6-26
@@ -86,6 +86,24 @@ profile to name a NEW emitter.
       per chain signature measured 631 s — chain signatures vary with
       recursion depth, so it missed and paid page-allocator churn).
       The remainder is (c): interpreted recomposition churn.
+- [x] `JsonHugeDataSerializationTest.test`: VERDICT (a), 2026-09-05. 33 s
+      alone under the sampler on 4 cores (ReleaseSafe): `memset` 21%, of
+      which 62% is the allocator's zero-fill of fresh blocks
+      (`allocBytesWithAlignment`) and 18% the free-path scrub — the test
+      builds and re-parses one huge document, so it is allocation volume
+      through the shared allocator, an allocator-policy lever, not a
+      pathology in the path; `runFrameExec` 5.4%, `snapshotRange` 4.7%
+      (string cursor snapshots), `eqlBytes` 4.1%. It is a separate census
+      child because the batched json directory child would otherwise
+      carry it, not because it nears a cap.
+- [x] `SnapshotStateListTests.concurrentMixingWriteApply_addAll_clear` /
+      `SnapshotStateSetTests.concurrentMixingWriteApply_add`: VERDICT
+      scheduling, not compute, 2026-09-05. They pass solo and in the local
+      battery (compose_plugin 1390/0 at 801c5eac); they fell only on the
+      4-vCPU runner under the gate's full load (`ci-green.md`, third run),
+      which is why the gate baseline is 1385 = 1390 − MAX_FAILED 5. No
+      profile lever: the wall is the runner's contention, and the
+      interpreter work is the ordinary snapshot apply path.
 - [x] androidx `ScatterMapTest`: VERDICT (c), 2026-09-05. 38 s alone under
       the sampler (4 cores); profile is the interpreter itself
       (`runFrameExec` 9.6%, `memset` 6.9%, `execInst`, `allocLockedOne`,

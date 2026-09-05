@@ -65,8 +65,10 @@ Example: `examples/value_class_factory_over_ctor.kt`.
       construction). `CornerRadiusTest.testRadiusCopy*` (compose-ui
       geometry) fell with the same first cut and stands again.
 - [x] example + `.out` + README row (`value_class_factory_over_ctor.kt`)
-- [ ] the compose graphics pack's `Color` initializers still resolve
-      (in-process e2e `compose_paint`, `compose_colorspace`) — running
+- [x] the compose graphics pack's `Color` initializers still resolve
+      (in-process e2e `compose_paint`, `compose_colorspace`): CI e2e shard
+      green at 5af20e29 (run 33962480447); gate-env corpus 453/453 at
+      801c5eac.
 
 ## Task 2 — Char ranges expose Int endpoints
 
@@ -89,8 +91,9 @@ Example: `examples/char_range_endpoints.kt`.
       character, ULong unsigned — a latent `ULongRange` display defect
       fixed in the same line); `contains` accepts a Char.
 - [x] example + `.out` + README row (`char_range_endpoints.kt`)
-- [ ] stdlib `ranges/RangeIterationTest.kt` and `RangeTest.kt` still
-      green (sweep `--filter Range`) — pending
+- [x] stdlib `ranges/RangeIterationTest.kt` and `RangeTest.kt` still
+      green: full stdlib sweep 117 files / 0 failures at 801c5eac; stdlib
+      itest halves green on CI (run 33962480447).
 
 ## Task 3 — implicit context arguments through nested subjects
 
