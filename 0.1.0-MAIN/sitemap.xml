@@ -2,126 +2,126 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/BUNDLE/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/testing/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/architecture/concurrency/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/architecture/diagnostics/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/architecture/interpreter/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/architecture/memory-model/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/architecture/performance/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/architecture/pipeline/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/architecture/stdlib/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/development/contributing/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/development/debugging/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/development/process-globals/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/development/resolution-paths/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/development/testing/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/development/workspace/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/getting-started/cli/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/getting-started/hello-world/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/getting-started/installation/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/packs/authoring/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/packs/format/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/packs/native-bindings/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/packs/overview/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/packs/using/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/packs/shipped/atomicfu/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/packs/shipped/compose-runtime/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/packs/shipped/coroutines/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/packs/shipped/datetime/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/packs/shipped/io/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/packs/shipped/ktor/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
     <url>
          <loc>https://klio.dev/0.1.0-MAIN/packs/shipped/serialization/</loc>
-         <lastmod>2026-09-01</lastmod>
+         <lastmod>2026-09-05</lastmod>
     </url>
 </urlset>

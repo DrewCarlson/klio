@@ -1873,8 +1873,12 @@ no <code>build.zig</code> edit, no rebuilding of unrelated modules. Pass
 <li><strong>One suite</strong>: <code>zig build itest-&lt;name&gt;</code>. Never build <code>itest-bin</code>
   (all standalone itest binaries) during iteration.</li>
 <li><strong>Full gate before a commit</strong>: <code>scripts/gate.sh</code> — unit tests, the
-  litmus/e2e/examples/ktor/concurrency suites, then the commontest
-  dual eager gate. <code>--no-sweep</code> skips the slow tail.</li>
+  litmus/e2e/examples/ktor/concurrency suites, the compose-ui gate, a
+  tree-keyed reinstall of every shipped pack into <code>.klio-local</code>
+  (<code>scripts/refresh-local-packs.sh</code>, so the CLI corpus check below runs
+  pack IR lowered from this tree, not whatever installed it last), the
+  full example corpus through the CLI, then the commontest dual eager
+  gate. <code>--no-sweep</code> skips the slow tail.</li>
 <li><strong>Cache</strong>: <code>scripts/prune-zig-cache.sh [days]</code> when <code>.zig-cache</code>
   grows unreasonably (Zig has no cache GC of its own).</li>
 </ul>
