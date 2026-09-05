@@ -10,7 +10,31 @@ const std = @import("std");
 const parity = @import("parity");
 const jit = @import("ir").jit_loop;
 
+const parser = @import("parser");
 const EXAMPLES = "examples";
+
+/// An example may document required flags in a header comment
+/// (`// Run with: klio run --language=+Feature examples/foo.kt`), the way
+/// `scripts/corpus_check.py` honors them on the CLI route. The in-process
+/// route applies the language specs to the parser for that example only.
+fn applyRunDirective(io: std.Io, a: std.mem.Allocator, path: []const u8) void {
+    const src = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| : (n += 1) {
+        if (n >= 12) break;
+        const at = std.mem.indexOf(u8, line, "Run with:") orelse continue;
+        var it = std.mem.tokenizeAny(u8, line[at + "Run with:".len ..], " \t");
+        while (it.next()) |arg| {
+            if (std.mem.startsWith(u8, arg, "--language=")) {
+                var specs = std.mem.tokenizeAny(u8, arg["--language=".len..], ",");
+                while (specs.next()) |spec| _ = parser.setLanguageFeature(spec);
+            }
+        }
+        return;
+    }
+}
+
 const EXPECTED = "tests/corpus/expected";
 
 /// `KLIO_E2E_SHARD=K/N` runs only the programs whose name hashes into
@@ -87,6 +111,8 @@ fn runCorpus(jit_on: bool) !void {
             continue;
         };
 
+        applyRunDirective(io, a, kt);
+        defer parser.language = .{};
         const res = parity.runWithPacks(a, io, kt) catch |e| {
             failures += 1;
             std.debug.print("e2e FAIL {s} (jit={}): run error {s}\n", .{ stem, jit_on, @errorName(e) });

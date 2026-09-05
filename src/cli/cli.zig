@@ -8,6 +8,7 @@
 //! `cli.run(gpa)`, which returns the process exit code.
 
 const std = @import("std");
+const parser = @import("parser");
 
 const ir = @import("ir");
 const interp_ir = @import("interp_ir");
@@ -52,6 +53,8 @@ const USAGE =
     \\  dump-ir <file> [--func N]  Lower a file and print its IR (no execution),
     \\                             tallying DIRECT vs DYNAMIC call sites.
     \\  run <file...> [options]    Run one or more `.kt` source files.
+    \\                             --language=+Feature[,+Other] enables a parser-gated
+    \\                             language feature (kotlinc `-XXLanguage:+Feature`).
     \\  test [path] [options]      Run `kotlin.test` `@Test` functions. A
     \\                             project dir (with klio.toml) tests its
     \\                             composed `[[test]]` sets; default `.`.
@@ -160,6 +163,11 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
     } else if (std.mem.eql(u8, cmd, "transpile")) {
         var files: std.ArrayList([]const u8) = .empty;
         defer files.deinit(gpa);
+        // A program that needs a pack feature or a language flag to RUN needs
+        // the same to transpile: the emitter lowers the same sources.
+        var feature_specs: std.ArrayList([]const u8) = .empty;
+        defer feature_specs.deinit(gpa);
+        if (std.c.getenv("KLIO_LANGUAGE")) |env_specs| applyLanguageSpecs(std.mem.span(env_specs));
         var out: ?[]const u8 = null;
         var bad = false;
         var i: usize = 0;
@@ -171,18 +179,31 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
                 }
                 out = rest[i + 1];
                 i += 1;
+            } else if (std.mem.eql(u8, rest[i], "--feature")) {
+                i += 1;
+                if (i >= rest.len) {
+                    printErr(gpa, "error: --feature requires a `<pack>/<feature>` value\n", .{});
+                    return 2;
+                }
+                feature_specs.append(gpa, rest[i]) catch return 1;
+            } else if (optionValue(rest[i], "--feature=")) |v| {
+                feature_specs.append(gpa, v) catch return 1;
+            } else if (optionValue(rest[i], "--language=")) |v| {
+                applyLanguageSpecs(v);
             } else {
                 files.append(gpa, rest[i]) catch return 1;
             }
         }
         if (bad or files.items.len == 0) {
-            printErr(gpa, "usage: klio transpile <file.kt> [more.kt ...] [-o out.c]\n", .{});
+            printErr(gpa, "usage: klio transpile <file.kt> [more.kt ...] [-o out.c] [--feature <pack>/<feat>] [--language=<spec>]\n", .{});
             return 2;
         }
-        var features = commands.RequestedFeatures.init(gpa);
-        defer features.deinit();
-        return commands.runTranspile(gpa, files.items, out, &features);
-    } else if (std.mem.eql(u8, cmd, "run")) {
+        var requested = parseRequestedFeatures(gpa, feature_specs.items);
+        defer deinitRequestedFeatures(&requested);
+        return commands.runTranspile(gpa, files.items, out, &requested);
+    }
+    if (std.c.getenv("KLIO_LANGUAGE")) |env_specs| applyLanguageSpecs(std.mem.span(env_specs));
+    if (std.mem.eql(u8, cmd, "run")) {
         return runRunCmd(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "test")) {
         return runTestCmd(gpa, rest, argv[0]);
@@ -317,6 +338,8 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             feature_specs.append(gpa, args[i]) catch return 2;
         } else if (optionValue(a, "--feature=")) |v| {
             feature_specs.append(gpa, v) catch return 2;
+        } else if (optionValue(a, "--language=")) |v| {
+            applyLanguageSpecs(v);
         } else if (perfOptValue(a, args, &i)) |v| {
             // Applied at startup; validate here so a typo is rejected, not run.
             if (runtime.perf.parseProfile(v) == null) {
@@ -583,6 +606,8 @@ fn runBakeCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             feature_specs.append(gpa, args[i]) catch return 2;
         } else if (optionValue(a, "--feature=")) |v| {
             feature_specs.append(gpa, v) catch return 2;
+        } else if (optionValue(a, "--language=")) |v| {
+            applyLanguageSpecs(v);
         } else if (perfOptValue(a, args, &i)) |v| {
             // Applied at startup; validate here so a typo is rejected, not run.
             if (runtime.perf.parseProfile(v) == null) {
@@ -639,6 +664,8 @@ fn runCheckCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             feature_specs.append(gpa, args[i]) catch return 2;
         } else if (optionValue(a, "--feature=")) |v| {
             feature_specs.append(gpa, v) catch return 2;
+        } else if (optionValue(a, "--language=")) |v| {
+            applyLanguageSpecs(v);
         } else if (perfOptValue(a, args, &i)) |v| {
             // Applied at startup; validate here so a typo is rejected, not run.
             if (runtime.perf.parseProfile(v) == null) {
@@ -726,6 +753,13 @@ fn parseFormat(s: []const u8) ?DiagFormat {
 }
 
 /// `--name=value` -> `value`, else null.
+/// `+Feature[,+Other]` language specs (`--language=` or `KLIO_LANGUAGE`),
+/// applied to the parser's process-wide toggles.
+fn applyLanguageSpecs(specs: []const u8) void {
+    var it = std.mem.tokenizeAny(u8, specs, ", ");
+    while (it.next()) |spec| _ = parser.setLanguageFeature(spec);
+}
+
 fn optionValue(arg: []const u8, prefix: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, arg, prefix)) return arg[prefix.len..];
     return null;

@@ -32,9 +32,10 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// 6371 selected, 980 excluded by directive — `plans/kotlinc-box-conformance.md`.
 /// Kotlin 2.4 destructuring forms: 5409 / 942. Explicit primitive
 /// `rangeTo` + invoked lambda arguments: 5440 / 911. Enum entries with
-/// bodies as real subclasses: 5461 / 890.
-pub const BASELINE: usize = 5461;
-pub const MAX_FAILED: usize = 890;
+/// bodies as real subclasses: 5461 / 890. Language feature flags and the
+/// name-based short form: 5477 / 874.
+pub const BASELINE: usize = 5477;
+pub const MAX_FAILED: usize = 874;
 
 /// Directives that bind a test to a framework feature klio has no
 /// counterpart for: a backend restriction, a second module, reflection,
@@ -130,6 +131,8 @@ pub const Case = struct {
     reason: ?[]const u8 = null,
     with_coroutines: bool = false,
     value_class_placeholder: bool = false,
+    /// `// LANGUAGE: +Feature …` specs, passed to the child as `--language=`.
+    language: []const u8 = "",
     /// The package of the file that declares `box()`, for the import in
     /// the synthesized main.
     package: ?[]const u8 = null,
@@ -179,6 +182,7 @@ pub fn parseCase(a: std.mem.Allocator, rel: []const u8, src: []const u8) !Case {
                     reason = reason orelse d.name;
                 } else if (std.mem.eql(u8, d.name, "LANGUAGE")) {
                     if (languageDisablesFeature(d.value)) reason = reason orelse "LANGUAGE:-feature";
+                    c.language = d.value;
                 } else if ((std.mem.eql(u8, d.name, "IGNORE_BACKEND") or std.mem.eql(u8, d.name, "IGNORE_BACKEND_K2")) and
                     std.mem.indexOf(u8, d.value, "ANY") != null)
                 {
@@ -470,6 +474,7 @@ pub fn runCensus(a: std.mem.Allocator, label: []const u8) !Summary {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, bin);
         try argv.append(a, "run");
+        if (case.language.len != 0) try argv.append(a, try std.fmt.allocPrint(a, "--language={s}", .{case.language}));
         for (case.sections, 0..) |s, si| {
             const base = std.fs.path.basename(s.name);
             const fname = try std.fmt.allocPrint(a, "{d}_{s}", .{ si, base });
