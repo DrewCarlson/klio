@@ -16,6 +16,7 @@ const file = @import("file.zig");
 const class = @import("class.zig");
 const members = @import("members.zig");
 const types = @import("types.zig");
+const control = @import("control.zig");
 
 const Parser = root.Parser;
 const ClassModifiers = root.ClassModifiers;
@@ -73,12 +74,22 @@ pub fn parseStmt(p: *Parser) ?Stmt {
     const save = p.pos;
     const flags = file.skipModifiersWithFlagsLevel(p, true);
     switch (support.peekKind(p).*) {
+        .LParen => {
+            // `(val a, val b) = expr` — the name-based destructuring form,
+            // which carries no leading keyword. Anything else that opens
+            // with `(` is an expression statement.
+            const next: ?TokenKind = if (p.pos + 1 < p.tokens.len) p.tokens[p.pos + 1].kind else null;
+            if (next != null and std.meta.activeTag(next.?) == .Keyword and (next.?.Keyword == .Val or next.?.Keyword == .Var)) {
+                return parseNameBasedDestructuringStmt(p);
+            }
+            return parseFallthroughStmt(p, save);
+        },
         .Keyword => |kw| switch (kw) {
             .Val, .Var => {
                 // `val (a, b) = expr` — destructuring declaration. Falls through
                 // to plain property parsing on a single name.
                 const next: ?TokenKind = if (p.pos + 1 < p.tokens.len) p.tokens[p.pos + 1].kind else null;
-                if (next != null and std.meta.activeTag(next.?) == .LParen) {
+                if (next != null and (std.meta.activeTag(next.?) == .LParen or std.meta.activeTag(next.?) == .LBracket)) {
                     return parseDestructuringDecl(p);
                 }
                 const prop = members.parseLocalProperty(p, flags) orelse return null;
@@ -233,42 +244,44 @@ fn parseFallthroughStmt(p: *Parser, save: usize) ?Stmt {
 
 pub fn parseDestructuringDecl(p: *Parser) ?Stmt {
     const kw = support.bump(p); // val/var
-    const mutable = std.meta.activeTag(kw.kind) == .Keyword and kw.kind.Keyword == .Var;
-    _ = support.expect(p, .LParen, "`(`") orelse return null;
-    var names: std.ArrayList(Ident) = .empty;
-    while (true) {
-        support.skipNl(p);
-        if (std.meta.activeTag(support.peekKind(p).*) == .RParen) {
-            break;
-        }
-        const sp = support.currentSpan(p);
-        const txt = support.text(p, sp);
-        // Underscore-discard binding is parsed as an ident named `_`.
-        const id = if (std.mem.eql(u8, txt, "_") and std.meta.activeTag(support.peekKind(p).*) == .Ident) blk: {
-            _ = support.bump(p);
-            break :blk Ident{ .name = "_", .span = sp };
-        } else (support.parseIdent(p, "destructured name") orelse return null);
-        // Optional type annotation per name — consumed and discarded.
-        if (std.meta.activeTag(support.peekKind(p).*) == .Colon) {
-            _ = support.bump(p);
-            _ = types.parseType(p);
-        }
-        names.append(p.allocator, id) catch @panic("OOM in parseDestructuringDecl");
-        support.skipNl(p);
-        if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
-            _ = support.bump(p);
-        } else {
-            break;
-        }
-    }
-    _ = support.expect(p, .RParen, "`)`") orelse return null;
+    var mutable = std.meta.activeTag(kw.kind) == .Keyword and kw.kind.Keyword == .Var;
+    const bracket = std.meta.activeTag(support.peekKind(p).*) == .LBracket;
+    if (!bracket) _ = support.expect(p, .LParen, "`(` or `[`") orelse return null else _ = support.bump(p);
+    const entries = control.parseDestructEntries(
+        p,
+        if (bracket) .RBracket else .RParen,
+        bracket,
+        "destructured name",
+    ) orelse return null;
+    if (entries.any_var) mutable = true;
     _ = support.expect(p, .Eq, "`=`") orelse return null;
     support.skipNl(p);
     const init = expr.parseExpr(p) orelse return null;
     const sp = kw.span.join(init.span());
     return Stmt{ .DestructuringDecl = .{
         .mutable = mutable,
-        .names = names.toOwnedSlice(p.allocator) catch @panic("OOM in parseDestructuringDecl"),
+        .names = entries.names,
+        .by_name = entries.by_name,
+        .sources = entries.sources,
+        .init = init,
+        .span = sp,
+    } };
+}
+
+/// The name-based full form at statement level, `(val a, var n = prop) = x`,
+/// which opens with `(` followed by `val`/`var`.
+pub fn parseNameBasedDestructuringStmt(p: *Parser) ?Stmt {
+    const open = support.bump(p); // `(`
+    const entries = control.parseDestructEntries(p, .RParen, false, "destructured name") orelse return null;
+    _ = support.expect(p, .Eq, "`=`") orelse return null;
+    support.skipNl(p);
+    const init = expr.parseExpr(p) orelse return null;
+    const sp = open.span.join(init.span());
+    return Stmt{ .DestructuringDecl = .{
+        .mutable = entries.any_var,
+        .names = entries.names,
+        .by_name = entries.by_name,
+        .sources = entries.sources,
         .init = init,
         .span = sp,
     } };

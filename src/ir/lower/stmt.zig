@@ -145,7 +145,7 @@ pub fn lowerStmt(b: *FuncBuilder, stmt: *const Stmt) Allocator.Error!?Reg {
             }
             return lowerAssign(b, &a.target, a.op, &a.value);
         },
-        .DestructuringDecl => |dd| return lowerDestructuringDecl(b, dd.names, &dd.init),
+        .DestructuringDecl => |dd| return lowerDestructuringDecl(b, dd.names, dd.by_name, dd.sources, dd.mutable, &dd.init),
     }
 }
 
@@ -1768,9 +1768,33 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
     return null;
 }
 
+/// A destructured name binds like a local: a `var` gets a home register the
+/// way `lowerPropertyDecl` gives one to `var x = …`, so `p += 1` updates the
+/// slot instead of dispatching `plusAssign` on the value.
+fn bindDestructured(b: *FuncBuilder, name: []const u8, value: Reg, mutable: bool) Allocator.Error!void {
+    if (b.isBoxed(name)) {
+        // Captured `var`: a shared cell, so writes from a nested closure or
+        // coroutine are visible here.
+        const home = b.allocReg();
+        try b.push(.{ .MakeCell = .{ .dst = home, .src = value } });
+        try b.setMutableHome(name, home);
+        try b.markMutable(name);
+        return b.bind(name, home);
+    }
+    if (!mutable) return b.bind(name, value);
+    const home = b.allocReg();
+    try b.push(.{ .Move = .{ .dst = home, .src = value } });
+    try b.setMutableHome(name, home);
+    try b.markMutable(name);
+    try b.bind(name, home);
+}
+
 fn lowerDestructuringDecl(
     b: *FuncBuilder,
     names: []const ast.Ident,
+    by_name: bool,
+    sources: []const ast.Ident,
+    mutable: bool,
     init: *const Expr,
 ) Allocator.Error!?Reg {
     // `val (a, b, ...) = expr` desugars to repeated
@@ -1784,6 +1808,18 @@ fn lowerDestructuringDecl(
     // dispatch instead of arriving untyped.
     var recv_ty = try expr_mod.staticExprTypeRef(b, init);
     defer if (recv_ty) |*t| t.deinit(b.allocator);
+    // The name-based form reads each entry's property off the initializer
+    // (`(val a, val n = prop) = x` is `x.a` and `x.prop`).
+    if (by_name) {
+        for (names, 0..) |name, i| {
+            if (std.mem.eql(u8, name.name, "_")) continue;
+            const field = try b.module.internConst(b.allocator, .{ .String = sources[i].name });
+            const dst = b.allocReg();
+            try b.push(.{ .GetField = .{ .dst = dst, .receiver = recv, .field = field } });
+            try bindDestructured(b, name.name, dst, mutable);
+        }
+        return null;
+    }
     for (names, 0..) |name, i| {
         if (std.mem.eql(u8, name.name, "_")) continue;
         const comp_name = try std.fmt.allocPrint(b.allocator, "component{d}", .{i + 1});
@@ -1798,7 +1834,7 @@ fn lowerDestructuringDecl(
             .n_args = 0,
             .arg_names = &.{},
         } });
-        try b.bind(name.name, dst);
+        try bindDestructured(b, name.name, dst, mutable);
         if (recv_ty) |rty| {
             if (try expr_mod.nullaryMemberReturnTypeRef(b, rty, comp_name, name.span.file)) |ct| {
                 try b.setLocalDeclTypeOwned(name.name, ct);

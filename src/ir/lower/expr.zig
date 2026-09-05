@@ -773,7 +773,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
             return b.emitConst(.Unit);
         },
-        .For => |f| return lowerFor(b, f.vars, f.iter, f.body),
+        .For => |f| return lowerFor(b, f.vars, f.by_name, f.var_sources, f.iter, f.body),
         .IsCheck => |ck| {
             const s = try lowerExpr(b, ck.expr);
             const dst = b.allocReg();
@@ -6022,7 +6022,7 @@ fn lowerLabeled(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.switchTo(exit);
             return b.emitConst(.Unit);
         },
-        .For => |f| return lowerForLabeled(b, f.vars, f.iter, f.body, label.name),
+        .For => |f| return lowerForLabeled(b, f.vars, f.by_name, f.var_sources, f.iter, f.body, label.name),
         .DoWhile => |w| {
             const body_blk = try b.allocBlock();
             const exit = try b.allocBlock();

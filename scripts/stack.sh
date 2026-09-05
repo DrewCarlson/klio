@@ -30,6 +30,9 @@ export KLIO_GC_THRESHOLD_KB="${KLIO_GC_THRESHOLD_KB:-65536}"
 # Always name failing/incomplete cases — a one-in-N load DNC is
 # undiagnosable from a bare count.
 export KLIO_CENSUS_NAMES=1
+# The box conformance children are sub-second programs: run them wider
+# than the library censuses so wave 2 stays inside the compose gate.
+export KLIO_BOX_JOBS="${KLIO_BOX_JOBS:-12}"
 
 # Green-tree memo (fail-OPEN): a stack that already ran green on this
 # exact tree content is a no-op. The key covers HEAD, every non-md

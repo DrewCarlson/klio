@@ -55,6 +55,13 @@ moves on.
 ## Log
 
 - 2026-09-05: opened; the owning documents carry the task detail.
+- 2026-09-05: Stage 2 Tasks 1-3 landed (b5e42fd8) — corpus populated locally
+  and on CI, `box_support.zig` runner + `box_conformance` itest +
+  `klio-census box`, first census 5,246 / 1,105 / 20 of 6,371 selected
+  (980 excluded by directive), ratchet 5246 / 1105, shard weight 35,
+  stack.sh wave 2 (battery 948 s with the suite at 4 workers; the runner
+  now takes `KLIO_BOX_JOBS`, 12 in stack.sh). Task 4 (root-fix by
+  cluster) next.
 - 2026-09-05: Stage 1 landed — `stack.sh` runs the stdlib sweep after the
   census waves and scrapes its zero-failure line into the verdict;
   `corpus_check.py` refuses an unset or shared `KLIO_HOME` unless

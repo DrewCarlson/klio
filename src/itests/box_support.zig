@@ -30,8 +30,9 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// root-caused record). First census 2026-09-05 (build-2.4.10-RC corpus,
 /// ReleaseSafe harness): 5246 passed, 1105 failed, 20 did not complete of
 /// 6371 selected, 980 excluded by directive — `plans/kotlinc-box-conformance.md`.
-pub const BASELINE: usize = 5246;
-pub const MAX_FAILED: usize = 1105;
+/// Kotlin 2.4 destructuring forms: 5409 / 942.
+pub const BASELINE: usize = 5409;
+pub const MAX_FAILED: usize = 942;
 
 /// Directives that bind a test to a framework feature klio has no
 /// counterpart for: a backend restriction, a second module, reflection,
@@ -295,6 +296,11 @@ fn envUsize(name: []const u8, default: usize) usize {
 }
 
 fn workerCount() usize {
+    // Box children are sub-second programs, so the runner takes its own
+    // width before the census-wide `KLIO_ITEST_JOBS` (sized for heavy
+    // library children).
+    const own = envUsize("KLIO_BOX_JOBS", 0);
+    if (own >= 1) return @min(own, 64);
     const n = envUsize("KLIO_ITEST_JOBS", 0);
     if (n >= 1) return @min(n, 64);
     const cores = std.Thread.getCpuCount() catch 4;

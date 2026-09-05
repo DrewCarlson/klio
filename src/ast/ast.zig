@@ -715,6 +715,11 @@ pub const Stmt = union(enum) {
     DestructuringDecl: struct {
         mutable: bool,
         names: []Ident,
+        /// Name-based form `(val a, val n = prop) = x`: each name reads the
+        /// property in `sources` (its own name unless renamed with `=`).
+        /// Positional forms (`(a, b)`, `[a, b]`) read `componentN`.
+        by_name: bool = false,
+        sources: []Ident = &.{},
         init: Expr,
         span: Span,
     },
@@ -857,6 +862,9 @@ pub const Expr = union(enum) {
     /// from each iteration element (`Pair`/`Map.Entry`/general `componentN`).
     For: struct {
         vars: []Ident,
+        /// `for ((val k, val v) in xs)`: name-based, see `DestructuringDecl`.
+        by_name: bool = false,
+        var_sources: []Ident = &.{},
         var_ty: ?TypeRef,
         iter: *Expr,
         body: *Expr,

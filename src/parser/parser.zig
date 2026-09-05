@@ -326,6 +326,36 @@ test "foundation: modifier flag defaults" {
     try testing.expectEqual(@as(usize, 0), mf.annotations.items.len);
 }
 
+test "destructuring: bracket positional and name-based forms parse everywhere" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\data class P(val x: Int, val y: Int)
+        \\fun f(ps: List<P>) {
+        \\    val [a, b] = P(1, 2)
+        \\    var [c, _] = P(3, 4)
+        \\    (val y, val x) = P(5, 6)
+        \\    (val n = x, var m: Int = y) = P(7, 8)
+        \\    for ([i, p] in ps.withIndex()) println(i)
+        \\    for ((val x, val y) in ps) println(x + y)
+        \\    ps.map { [q, r] -> q + r }
+        \\    ps.map { (val total: Int = x) -> total }
+        \\    ps.map { [val u, val v] -> u }
+        \\}
+    ;
+    const out = try parse(arena.allocator(), src);
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+}
+
+test "destructuring: a renamed entry needs the name-based form" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(), "fun f() { val [a = b] = P() }");
+    try testing.expect(out.parser.diagnostics.hasErrors());
+}
+
 test "parses_hello_world" {
     try skipIfStubbed();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
