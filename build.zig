@@ -63,7 +63,7 @@ const mod_list = [_]Mod{
     .{ .name = "bench", .deps = &.{ "ast", "interp_ir", "lexer", "parity", "parser", "resolver", "runtime", "span", "typeck" }, .tested = true },
     // End-to-end corpus test: runs every examples/*.kt in-process via the
     // parity pipeline and asserts against tests/corpus/expected/.
-    .{ .name = "e2e", .deps = &.{ "parity", "ir" }, .tested = true },
+    .{ .name = "e2e", .deps = &.{ "parity", "ir", "parser" }, .tested = true },
     // Integration suites ported from crates/*/tests.
     .{ .name = "itests", .deps = &.{ "parity", "typeck", "resolver", "parser", "lexer", "cfa", "runtime", "ast", "span", "diagnostics", "types", "pack", "ir", "interp_ir", "stdlib" }, .tested = true },
 };

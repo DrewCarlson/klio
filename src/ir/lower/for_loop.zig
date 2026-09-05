@@ -48,7 +48,7 @@ pub fn lowerForLabeled(
     // calls per iteration. The iterator form dominated the interpreter's
     // loop profile (two CallVirtuals per iteration plus the range fields).
     // `KLIO_COUNTED=0` restores the iterator lowering for bisection.
-    if (vars.len == 1 and countedEnabled()) counted: {
+    if (vars.len == 1 and !by_name and countedEnabled()) counted: {
         var lo_e: ?*const Expr = null;
         var hi_e: ?*const Expr = null;
         var inclusive = false;
@@ -459,7 +459,7 @@ pub fn lowerForLabeled(
         .n_args = 0,
         .arg_names = &.{},
     } });
-    if (vars.len == 1) {
+    if (vars.len == 1 and !by_name) {
         try b.bind(vars[0].name, next_reg);
         if (try expr.iterableElementTypeName(b, iter)) |elem| {
             try b.setLocalDeclTypeOwned(vars[0].name, .{
@@ -474,10 +474,10 @@ pub fn lowerForLabeled(
         // `for ((val k, val v) in xs)`: each name reads its property off the
         // element.
         for (vars, 0..) |v, i| {
-            if (std.mem.eql(u8, v.name, "_")) continue;
             const dst = b.allocReg();
             const field = try b.module.internConst(b.allocator, .{ .String = sources[i].name });
             try b.push(.{ .GetField = .{ .dst = dst, .receiver = next_reg, .field = field } });
+            if (std.mem.eql(u8, v.name, "_")) continue;
             try b.bind(v.name, dst);
         }
     } else {

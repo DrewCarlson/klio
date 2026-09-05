@@ -53,6 +53,40 @@ const FileId = span.FileId;
 const Token = lexer.Token;
 const TokenKind = lexer.TokenKind;
 
+/// Language features that change how source parses, the way kotlinc's
+/// `-XXLanguage:+Feature` does. Set once per process from `klio run
+/// --language=+Feature` (or `KLIO_LANGUAGE`), read by the parser.
+pub const LanguageFeatures = struct {
+    /// Kotlin 2.4 name-based destructuring (`NameBasedDestructuring`): the
+    /// full form `(val a, val b = prop)` and the positional `[a, b]`, which
+    /// klio parses unconditionally.
+    name_based_destructuring: bool = false,
+    /// `EnableNameBasedDestructuringShortForm`: the parenthesized short
+    /// form `(a, b = prop)` binds by property name; off, `(a, b)` stays
+    /// positional (`componentN`).
+    name_based_short_form: bool = false,
+};
+pub var language: LanguageFeatures = .{};
+
+/// Apply one `+Feature` / `-Feature` spec. Unknown features are accepted
+/// and ignored (klio implements the current language by default); the
+/// return says whether the name was a known toggle.
+pub fn setLanguageFeature(spec: []const u8) bool {
+    const s = std.mem.trim(u8, spec, " \t");
+    if (s.len < 2) return false;
+    const on = s[0] == '+';
+    const name = if (s[0] == '+' or s[0] == '-') s[1..] else s;
+    if (std.mem.eql(u8, name, "NameBasedDestructuring")) {
+        language.name_based_destructuring = on;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "EnableNameBasedDestructuringShortForm")) {
+        language.name_based_short_form = on;
+        return true;
+    }
+    return false;
+}
+
 pub const Parser = struct {
     /// Arena used for every AST node and for owned diagnostic-message
     /// strings produced during the parse.
@@ -346,6 +380,20 @@ test "destructuring: bracket positional and name-based forms parse everywhere" {
     ;
     const out = try parse(arena.allocator(), src);
     try testing.expect(!out.parser.diagnostics.hasErrors());
+}
+
+test "destructuring: the parenthesized short form binds by name only under its language flag" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src = "fun f(x: T) { val (a = first, second) = x; for ((second) in xs) {} }";
+    const off = try parse(arena.allocator(), src);
+    try testing.expect(off.parser.diagnostics.hasErrors());
+    try testing.expect(setLanguageFeature("+EnableNameBasedDestructuringShortForm"));
+    defer language = .{};
+    const on = try parse(arena.allocator(), src);
+    try testing.expect(!on.parser.diagnostics.hasErrors());
+    try testing.expect(!setLanguageFeature("+SomethingKlioDoesNotToggle"));
 }
 
 test "destructuring: a renamed entry needs the name-based form" {

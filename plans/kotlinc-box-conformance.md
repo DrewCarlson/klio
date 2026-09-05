@@ -230,6 +230,21 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    `enum class E;` in the parser (4), entry init order with companion
    access (3), vararg entry constructors (3).
 
+5. **Language feature flags and the name-based short form** (2026-09-05):
+   under `// LANGUAGE: +NameBasedDestructuring +EnableNameBasedDestructuringShortForm`
+   the parenthesized short form `val (a = first, second) = x` binds by
+   property name (in declarations, `for` loops, lambdas); without the
+   second flag `(a, b)` stays positional, so klio needed kotlinc-style
+   feature flags. `klio run --language=+Feature[,+Other]` (and
+   `KLIO_LANGUAGE`) set process-wide parser toggles; the runner passes
+   each test's `LANGUAGE:` directive; `scripts/corpus_check.py` already
+   forwarded `// Run with:` args and the in-process e2e replay now applies
+   `--language=` from that directive too. Found alongside: a name-based
+   `_ = prop` entry still reads its property (the read is its effect), and
+   a one-entry parenthesized group must not take the loop lowering's
+   single-variable fast paths. `nameBasedDestructuring/` 0 → 15 of 15;
+   census 5,477 / 874 / 20. Example `examples/name_based_short_form.kt`.
+
 ## Log
 
 - 2026-09-05: opened.
@@ -240,3 +255,5 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
 - 2026-09-05: Task 4 #2 explicit primitive rangeTo + #3 invoked lambda
   arguments landed: 5440 / 911.
 - 2026-09-05: Task 4 #4 enum entries with bodies landed: 5461 / 890.
+- 2026-09-05: Task 4 #5 language feature flags + name-based short form
+  landed: 5477 / 874.

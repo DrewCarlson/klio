@@ -1811,11 +1811,14 @@ fn lowerDestructuringDecl(
     // The name-based form reads each entry's property off the initializer
     // (`(val a, val n = prop) = x` is `x.a` and `x.prop`).
     if (by_name) {
+        // A discarded name-based entry (`_ = prop`) still reads its
+        // property: the read is the entry's effect, unlike a positional
+        // `_`, which skips its `componentN` call.
         for (names, 0..) |name, i| {
-            if (std.mem.eql(u8, name.name, "_")) continue;
             const field = try b.module.internConst(b.allocator, .{ .String = sources[i].name });
             const dst = b.allocReg();
             try b.push(.{ .GetField = .{ .dst = dst, .receiver = recv, .field = field } });
+            if (std.mem.eql(u8, name.name, "_")) continue;
             try bindDestructured(b, name.name, dst, mutable);
         }
         return null;

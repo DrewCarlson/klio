@@ -311,7 +311,9 @@ pub const DestructEntries = struct {
 pub fn parseDestructEntries(p: *Parser, close: TokenKind, positional: bool, what: []const u8) ?DestructEntries {
     var names: std.ArrayList(Ident) = .empty;
     var sources: std.ArrayList(Ident) = .empty;
-    var by_name = false;
+    // Under `+NameBasedDestructuring` the parenthesized short form binds
+    // by name too (`(a, b = prop)`); `[a, b]` is the positional form.
+    var by_name = !positional and root.language.name_based_short_form;
     var any_var = false;
     while (true) {
         support.skipNl(p);
