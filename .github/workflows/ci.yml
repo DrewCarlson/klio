@@ -83,7 +83,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: kotlin
-          key: kotlin-src-${{ hashFiles('.gitmodules') }}-libraries-stdlib
+          key: kotlin-src-${{ hashFiles('.gitmodules') }}-libraries-stdlib-codegen-box
 
       - name: populate kotlin submodule (if not cached)
         if: steps.kotlin-src-cache.outputs.cache-hit != 'true'
