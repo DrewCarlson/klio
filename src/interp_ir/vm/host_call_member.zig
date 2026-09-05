@@ -7346,19 +7346,11 @@ fn argsListFromSlice(allocator: Allocator, slice: []const Value) Allocator.Error
 fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     var class_name: []const u8 = undefined;
-    var entry_tag: ?[]const u8 = null;
     {
         const g = inst.borrow();
         const cg = g.get().class.borrow();
         class_name = cg.get().name;
         cg.deinit();
-        if (g.get().get("__enum_entry_class__")) |t| {
-            if (t == .String) {
-                const sg = t.String.borrow();
-                entry_tag = sg.get().bytes;
-                sg.deinit();
-            }
-        }
         g.deinit();
     }
     const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ name, args.len });
@@ -7366,15 +7358,8 @@ fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const Valu
     defer if (runtime.freeScratch()) allocator.free(arity_name);
     if (missTraceEnv()) |want| if (std.mem.eql(u8, want, name)) {
         const hit0 = lookupAnonMethod(self, allocator, class_name, arity_name, name);
-        std.debug.print("[anon-disp] name={s} class={s} tag={s} hit={} dis={}\n", .{ name, class_name, entry_tag orelse "-", hit0 != null, if (hit0) |h| anonMethodDisproven(self, h, args) else false });
+        std.debug.print("[anon-disp] name={s} class={s} hit={} dis={}\n", .{ name, class_name, hit0 != null, if (hit0) |h| anonMethodDisproven(self, h, args) else false });
     };
-
-    // Enum-entry override class first.
-    if (entry_tag) |tag| {
-        if (lookupAnonMethod(self, allocator, tag, arity_name, name)) |hit| {
-            return try invokeAnonMethod(self, allocator, receiver, hit, args, null);
-        }
-    }
 
     if (lookupAnonMethod(self, allocator, class_name, arity_name, name)) |hit| {
         // Param-type disproof, mirroring the named-class member walk: an

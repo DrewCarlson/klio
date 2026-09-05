@@ -360,6 +360,24 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
 /// borrow-safe for the leaf's duration. Anything else (companion vals,
 /// computed statics) returns null and the leaf bails to the exact
 /// re-run.
+/// The class whose `enum_entries` describe `cls`'s entries: `cls` itself,
+/// or its parent when `cls` is the subclass synthesized for an entry with a
+/// body (`is_enum`, no entries of its own, an enum parent).
+pub fn enumTableClass(cls: runtime.ObjRef(runtime.ClassDef)) @TypeOf(cls.borrow()) {
+    const g = cls.borrow();
+    if (g.get().is_enum and g.get().enum_entries.len == 0) {
+        if (g.get().parent) |parent| {
+            const pg = parent.borrow();
+            if (pg.get().is_enum) {
+                g.deinit();
+                return pg;
+            }
+            pg.deinit();
+        }
+    }
+    return g;
+}
+
 pub fn leafStaticMember(self: *VmHost, owner: []const u8, member: []const u8) ?Value {
     const def = blk: {
         const cg = self.classes.borrow();
@@ -3564,10 +3582,11 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         // enclosing class's superclass companions.
         if (try enclosingCompanionWalk(self, allocator, inst, name)) |v| return v;
     }
-    // Enum entry bare-name access.
+    // Enum entry bare-name access. An entry declared with a body is an
+    // instance of its own subclass, whose entry table is the parent enum's.
     {
         const g = inst.borrow();
-        const cg = g.get().class.borrow();
+        const cg = enumTableClass(g.get().class);
         const is_enum = cg.get().is_enum;
         if (is_enum) {
             for (cg.get().enum_entries) |e| {

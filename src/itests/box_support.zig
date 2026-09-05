@@ -31,9 +31,10 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// ReleaseSafe harness): 5246 passed, 1105 failed, 20 did not complete of
 /// 6371 selected, 980 excluded by directive — `plans/kotlinc-box-conformance.md`.
 /// Kotlin 2.4 destructuring forms: 5409 / 942. Explicit primitive
-/// `rangeTo` + invoked lambda arguments: 5440 / 911.
-pub const BASELINE: usize = 5440;
-pub const MAX_FAILED: usize = 911;
+/// `rangeTo` + invoked lambda arguments: 5440 / 911. Enum entries with
+/// bodies as real subclasses: 5461 / 890.
+pub const BASELINE: usize = 5461;
+pub const MAX_FAILED: usize = 890;
 
 /// Directives that bind a test to a framework feature klio has no
 /// counterpart for: a backend restriction, a second module, reflection,

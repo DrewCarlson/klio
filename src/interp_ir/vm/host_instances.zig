@@ -64,6 +64,17 @@ fn typeErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Alloca
 
 threadlocal var ctor_guard: std.ArrayListUnmanaged([]const u8) = .empty;
 
+/// `name`/`ordinal` for the enum-entry subclass instance about to be
+/// constructed: Kotlin's `Enum` constructor sets them before the entry's
+/// own initializers and `init` blocks run (`init { println(this.name) }`
+/// inside an entry body sees the name). Set by the VM-start entry
+/// construction, consumed once by the matching class's materialization.
+pub const EnumEntryPreset = struct { class_fqn: []const u8, name: Value, ordinal: Value };
+threadlocal var enum_entry_preset: ?EnumEntryPreset = null;
+pub fn setEnumEntryPreset(p: ?EnumEntryPreset) void {
+    enum_entry_preset = p;
+}
+
 /// Assert (Debug) the constructor-shell guard is clear at a run boundary
 /// and reset it so leaked-across-runs state is a loud failure.
 pub fn resetReceiverTls() void {
@@ -3506,6 +3517,13 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         }
     }
 
+    if (enum_entry_preset) |preset| {
+        if (std.mem.eql(u8, preset.class_fqn, class_fqn)) {
+            try fields.append(allocator, .{ .name = "name", .value = preset.name });
+            try fields.append(allocator, .{ .name = "ordinal", .value = preset.ordinal });
+            enum_entry_preset = null;
+        }
+    }
     // Materialise the instance.
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = class_def.clone(),

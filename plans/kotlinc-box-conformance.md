@@ -209,15 +209,26 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    `parsePostfix` is split so the postfix loop applies to an already-parsed
    primary, and the argument lambda goes through it. Example
    `examples/invoked_lambda_argument.kt`. Census after 2+3: 5,440 / 911 / 20.
-4. **Enum entries with bodies** (next): 33 failing tests. The runtime keeps
-   only the entry body's *functions* (an `anon_methods` side-table keyed by
-   a synthesized `X$B` name and an `__enum_entry_class__` tag on the
-   instance) and drops properties, `init` blocks, inner classes, and
-   super calls. Design: the parser synthesizes a real nested class per
-   entry body (`: X(entry args)`, the body as members); VM start
-   instantiates it through the normal class path and swaps the entry's
-   value in `ClassDef.enum_entries` (name/ordinal set as today); the
-   side-table, the tag, and their image serialization go away.
+4. **Enum entries with bodies** (2026-09-05): the runtime kept only the
+   entry body's *functions* (an `anon_methods` side-table keyed by a
+   synthesized `X$B` name and an `__enum_entry_class__` tag on the
+   instance) and dropped properties, `init` blocks, inner classes, and
+   super calls (33 failing tests). The parser now synthesizes a real
+   nested class per entry body — `$B : X(entry args)` with the body as its
+   members, flagged `is_enum` so entry behaviors key off the instance's
+   own class — and VM start constructs it through the ordinary class path
+   (parent constructor arguments, property initializers, init blocks) and
+   makes it the entry's value; `name`/`ordinal` are preset before the
+   body's initializers run (`init { println(this.name) }` sees them), and
+   bare sibling-entry names on a body instance resolve through the parent
+   enum's entry table. The side-table lowering and the tag are gone.
+   `enum/` 54 → 34 failures; census 5,461 / 890 / 20. Example
+   `examples/enum_entry_bodies.kt`. Remaining enum sub-clusters: enum
+   companion statics (`PAPER on Game.Companion`, `X on G.O`, `entries on
+   MyEnum.Companion`: 6), bare entry names from lambdas / inner-class
+   constructors inside entry bodies (`FOO`: 7), secondary constructors and
+   `enum class E;` in the parser (4), entry init order with companion
+   access (3), vararg entry constructors (3).
 
 ## Log
 
@@ -228,3 +239,4 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
 - 2026-09-05: Task 4 #1 destructuring forms landed: 5409 / 942.
 - 2026-09-05: Task 4 #2 explicit primitive rangeTo + #3 invoked lambda
   arguments landed: 5440 / 911.
+- 2026-09-05: Task 4 #4 enum entries with bodies landed: 5461 / 890.
