@@ -245,6 +245,32 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    single-variable fast paths. `nameBasedDestructuring/` 0 → 15 of 15;
    census 5,477 / 874 / 20. Example `examples/name_based_short_form.kt`.
 
+6. **Corpus syntax gaps** (2026-09-05): a parenthesized callee invoked
+   on a receiver, `recv.(f)(args)`, lowers as `f(recv, args)` (Kotlin's
+   definition, the receiver being the callee's first parameter); an
+   extension property whose receiver is a parenthesized function type
+   (`val (Int.() -> String).baz`), registered under `Function` so a closure
+   receiver finds it; `!!` in prefix position as two negations; `for (…);`
+   as an empty body; `*spread` inside annotation arguments;
+   `suspend context(A) (P) -> R` with the context block after `suspend`.
+   Example `examples/parenthesized_callees_and_receivers.kt`.
+7. **Contextual anonymous functions** (2026-09-05): `context(x: A) fun (…)`
+   keeps its context parameters and binds each from the context stack at
+   entry, as a declared context function does; a local holding one, or
+   declared with a contextual function type, carries the call shape so
+   `f(ctx, arg)` lowers to `CtxCall`; and `CtxCall` passes the contexts
+   positionally when the callee declares every context as a leading
+   parameter (`fun (g: G, n: N)` passed where `context(G) (N) -> R` is
+   expected), the contextual type being that flattened function type. A
+   first cut that desugared the contexts into leading parameters misbound
+   them whenever a context value was in scope at the call. `contextParameters/`
+   25 → 21, `extensionFunctions/` 11 → 9; census 5,506 / 845 / 20. Example
+   `examples/context_anonymous_function.kt`.
+8. **Tailrec with an explicit receiver** (next): nine `tailRecursion` tests
+   overflow because the self-call recognition accepts only the bare form;
+   `1.foo(x - 1)`, `this foo x`, `this@label.foo(…)`, and an object
+   dispatcher `O.rec(…)` are self-calls too.
+
 ## Log
 
 - 2026-09-05: opened.
@@ -257,3 +283,5 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
 - 2026-09-05: Task 4 #4 enum entries with bodies landed: 5461 / 890.
 - 2026-09-05: Task 4 #5 language feature flags + name-based short form
   landed: 5477 / 874.
+- 2026-09-05: Task 4 #6 corpus syntax gaps + #7 contextual anonymous
+  functions landed: 5506 / 845.

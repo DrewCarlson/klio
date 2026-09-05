@@ -325,6 +325,20 @@ pub fn parseType(p: *Parser) ?TypeRef {
             }
         }
     }
+    // `suspend context(A) (P) -> R`: the context block may follow the
+    // `suspend` modifier as well as precede it.
+    if (is_suspend and support.peekKeywordIdent(p, "context") and
+        p.pos + 1 < p.tokens.len and isKind(p.tokens[p.pos + 1].kind, .LParen))
+    {
+        const ctx = parseFunctionTypeContextBlock(p);
+        support.skipNl(p);
+        const rest = parseType(p) orelse return null;
+        if (rest.function) |ft| {
+            ft.context_params = ctx;
+            ft.is_suspend = true;
+        }
+        return rest;
+    }
     // Type-use-site annotations: `@Foo @Bar Baz` / `@UnsafeVariance T`.
     // Accept zero or more annotation sets and stash them on the
     // resulting TypeRef. A `(` after the annotation name belongs to a

@@ -108,6 +108,11 @@ fn singleIdent(p: *Parser, id: Ident) []Ident {
 /// `if (c) x = v`.
 pub fn parseControlStructureBody(p: *Parser) ?Expr {
     // Kotlin grammar: `controlStructureBody : block | statement`.
+    // `for (x in xs);` — an empty statement is an empty body.
+    if (std.meta.activeTag(support.peekKind(p).*) == .Semicolon) {
+        const semi = support.bump(p);
+        return Expr{ .Block = .{ .stmts = &.{}, .span = semi.span } };
+    }
     // An annotation may prefix the body expression
     // (`NaturalOrderComparator -> @Suppress("UNCHECKED_CAST") (x as T)`
     // in `Comparator.reversed()`); strip it (runtime no-op) first.

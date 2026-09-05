@@ -819,7 +819,41 @@ fn nextSignificantIsBy(p: *const Parser) bool {
 /// Parse the optional extension receiver preceding a property name.
 /// Returns `.present(null)` when there is no receiver, `.present(ty)` for a
 /// receiver, and `.failure` to propagate a parse failure to the caller.
+/// At `(`: whether the balanced group is followed by `.` `Ident` — a
+/// parenthesized (function-type) extension receiver rather than anything
+/// else a declaration could start with.
+fn parenReceiverAhead(p: *const Parser) bool {
+    if (!is(peekKind(p), .LParen)) return false;
+    var j = p.pos;
+    var depth: usize = 0;
+    while (j < p.tokens.len) : (j += 1) {
+        switch (std.meta.activeTag(p.tokens[j].kind)) {
+            .LParen => depth += 1,
+            .RParen => {
+                depth -= 1;
+                if (depth == 0) {
+                    j += 1;
+                    break;
+                }
+            },
+            .Eof => return false,
+            else => {},
+        }
+    }
+    if (j >= p.tokens.len or std.meta.activeTag(p.tokens[j].kind) != .Dot) return false;
+    return j + 1 < p.tokens.len and std.meta.activeTag(p.tokens[j + 1].kind) == .Ident;
+}
+
 fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
+    // A parenthesized function-type receiver: `val (Int.() -> String).baz`,
+    // `var <T> (List<T>.() -> T).bar`. The group is a type when a `.` and
+    // the property name follow its closing `)`.
+    if (parenReceiverAhead(p)) {
+        const ty = types.parseType(p) orelse return .failure;
+        _ = expect(p, .Dot, "`.`") orelse return .failure;
+        skipNl(p);
+        return .{ .present = ty };
+    }
     if (looksLikeExtensionReceiver(p)) {
         const saved_sqp = p.suppress_qualified_path;
         p.suppress_qualified_path = true;

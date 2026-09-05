@@ -1394,16 +1394,28 @@ pub noinline fn execArmCtxCall(comptime H: type, allocator: Allocator, frame: *F
         try frame.write(cc.dst, .Null);
         return .cont;
     }
+    var callee_v = frame.read(cc.callee);
+    // A contextual function type is the flattened function type: a callee
+    // declared with every context as a leading parameter (`fun (g: G, n: N)`
+    // passed where `context(G) (N) -> R` is expected) takes them
+    // positionally; a context function (arity = its ordinary parameters)
+    // reads them from the context stack.
+    const positional = blk: {
+        if (cc.n_ctx == 0) break :blk false;
+        if (comptime !@hasDecl(H, "callableDeclaredArity")) break :blk false;
+        const declared = host.callableDeclaredArity(&callee_v) orelse break :blk false;
+        break :blk declared == cc.n_args;
+    };
     const mark = host.ctxStackLen();
+    const n_ctx: u32 = if (positional) 0 else cc.n_ctx;
     var i: u32 = 0;
-    while (i < cc.n_ctx) : (i += 1) {
+    while (i < n_ctx) : (i += 1) {
         const v = frame.read(Reg.from(cc.args.int() + i));
         try host.ctxPush(v);
     }
-    const call_n = cc.n_args - cc.n_ctx;
-    const call_args = try readArgRun(allocator, frame, Reg.from(cc.args.int() + cc.n_ctx), call_n);
+    const call_n = cc.n_args - n_ctx;
+    const call_args = try readArgRun(allocator, frame, Reg.from(cc.args.int() + n_ctx), call_n);
     defer allocator.free(call_args);
-    var callee_v = frame.read(cc.callee);
     const res = host.callValue(allocator, &callee_v, call_args);
     host.ctxStackTruncate(mark);
     switch (try res) {

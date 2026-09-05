@@ -35,6 +35,36 @@ fn box(p: *Parser, e: Expr) *Expr {
     return ptr;
 }
 
+/// At `context` `(`: whether the balanced parenthesized group is followed by
+/// the `fun` keyword (an anonymous context function) rather than being a
+/// call to a function named `context`.
+fn anonContextFunAhead(p: *const Parser) bool {
+    var j = p.pos + 1;
+    if (j >= p.tokens.len or std.meta.activeTag(p.tokens[j].kind) != .LParen) return false;
+    var depth: usize = 0;
+    while (j < p.tokens.len) : (j += 1) {
+        const k = p.tokens[j].kind;
+        switch (std.meta.activeTag(k)) {
+            .LParen => depth += 1,
+            .RParen => {
+                depth -= 1;
+                if (depth == 0) {
+                    j += 1;
+                    break;
+                }
+            },
+            .Eof => return false,
+            else => {},
+        }
+    }
+    while (j < p.tokens.len) : (j += 1) {
+        const k = p.tokens[j].kind;
+        if (std.meta.activeTag(k) == .Newline) continue;
+        return std.meta.activeTag(k) == .Keyword and k.Keyword == .Fun;
+    }
+    return false;
+}
+
 pub fn parsePrimary(p: *Parser) ?Expr {
     support.skipNl(p);
     const kind = support.peekKind(p).*;
@@ -117,6 +147,18 @@ pub fn parsePrimary(p: *Parser) ?Expr {
         .Ident => {
             if (control.tryParseLabelBinding(p)) |label_expr| {
                 return label_expr;
+            }
+            // `context(x: A) fun (p: P): R { … }` — an anonymous function with
+            // context parameters, which its body reads from the context stack
+            // like a declared context function. A `context(...)` not followed
+            // by `fun` is a call to a function named `context`.
+            if (support.peekKeywordIdent(p, "context") and anonContextFunAhead(p)) {
+                const clause = file.parseContextClause(p);
+                support.skipNl(p);
+                var anon = members.parseAnonFun(p) orelse return null;
+                anon.AnonFun.context_params = clause.params;
+                anon.AnonFun.span = clause.span.join(anon.AnonFun.span);
+                return anon;
             }
             const tok = support.bump(p);
             const ident = Ident{

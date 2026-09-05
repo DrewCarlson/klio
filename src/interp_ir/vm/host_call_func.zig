@@ -1212,7 +1212,7 @@ fn fnTypeArity(ty: *const TypeRef) ?usize {
 }
 
 /// Declared parameter count of a callable VALUE, when known.
-fn callableDeclaredArity(self: *VmHost, v: *const Value) ?usize {
+pub fn callableDeclaredArity(self: *VmHost, v: *const Value) ?usize {
     return switch (v.*) {
         .IrClosure => |c| if (self.closures.get(c.id)) |info| info.n_params else null,
                 // A memo-wrapped composable lambda: its block's user arity.
