@@ -9,6 +9,7 @@
 //! module root.
 
 const std = @import("std");
+const host_instances = @import("host_instances.zig");
 
 const ir = @import("ir");
 const runtime = @import("runtime");
@@ -551,6 +552,89 @@ fn outcomeFromRuntime(self: *Vm, r: runtime.EvalResult) CallOutcome {
 /// of `main`. Returns `null` on success, or the `VmError` of a failing
 /// top-level / enum-entry initializer. `module` and `sink` are already
 /// borrowed by the caller.
+
+fn instantiateEnumEntryBodies(self: *Vm, module: *const Module, sink: Output) Allocator.Error!?VmError {
+    var enum_defs: std.ArrayList(runtime.ObjRef(runtime.ClassDef)) = .empty;
+    defer {
+        for (enum_defs.items) |d| d.deinit();
+        enum_defs.deinit(self.allocator);
+    }
+    {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        var it = cg.get().valueIterator();
+        while (it.next()) |d| {
+            const dg = d.borrow();
+            const keep = dg.get().is_enum and dg.get().enum_entries.len != 0;
+            dg.deinit();
+            if (keep) try enum_defs.append(self.allocator, d.clone());
+        }
+    }
+    const pa = self.patch_allocator orelse self.allocator;
+    for (enum_defs.items) |cdef| {
+        var enum_fqn: []const u8 = undefined;
+        var n_entries: usize = 0;
+        {
+            const dg = cdef.borrow();
+            enum_fqn = dg.get().fqn;
+            n_entries = dg.get().enum_entries.len;
+            dg.deinit();
+        }
+        const enum_cid = module.classIdByFqn(enum_fqn) orelse continue;
+        var replaced: ?[]runtime.ClassDef.EnumEntry = null;
+        for (0..n_entries) |i| {
+            var entry_name: []const u8 = undefined;
+            var current_class: []const u8 = "";
+            {
+                const dg = cdef.borrow();
+                defer dg.deinit();
+                const e = dg.get().enum_entries[i];
+                entry_name = e.name;
+                if (e.value == .Instance) {
+                    const ig = e.value.Instance.borrow();
+                    const icg = ig.get().class.borrow();
+                    current_class = icg.get().name;
+                    icg.deinit();
+                    ig.deinit();
+                }
+            }
+            const synth = try std.fmt.allocPrint(self.allocator, "${s}", .{entry_name});
+            defer self.allocator.free(synth);
+            const body_cid = module.classIdNestedIn(enum_cid, synth) orelse continue;
+            if (std.mem.eql(u8, current_class, synth)) continue;
+            var host = vmMakeHost(self, sink);
+            host_instances.setEnumEntryPreset(.{
+                .class_fqn = module.classes.items[body_cid.int()].fqn,
+                .name = .{ .String = try runtime.strInit(pa, entry_name) },
+                .ordinal = Value.newInt(@intCast(i)),
+            });
+            const made = switch (try host_instances.newInstance(&host, self.allocator, body_cid, &.{}, null)) {
+                .ok => |v| v,
+                .err => |e| {
+                    host_instances.setEnumEntryPreset(null);
+                    return vmErrorFromEval(self.allocator, e);
+                },
+            };
+            host_instances.setEnumEntryPreset(null);
+            if (made != .Instance) continue;
+            if (replaced == null) {
+                const dg = cdef.borrow();
+                defer dg.deinit();
+                const copy = try pa.alloc(runtime.ClassDef.EnumEntry, n_entries);
+                @memcpy(copy, dg.get().enum_entries);
+                replaced = copy;
+            }
+            replaced.?[i].value = made;
+        }
+        if (replaced) |r| {
+            const dg = cdef.borrowMut();
+            dg.get().enum_entries = r;
+            dg.deinit();
+        }
+    }
+    return null;
+}
+
 fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Error!?VmError {
     // Canonicalize name-bearing strings once per module, before any user
     // code runs, so hot-path name compares exit on pointer equality. The
@@ -757,6 +841,12 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
             }
         }
     }
+    // An enum entry declared with a body (`B(args) { … }`) is an instance of
+    // the nested class `$B : Enum(args)` the parser synthesized for it.
+    // Construct it through the ordinary class path (parent constructor
+    // arguments, property initializers, init blocks), carry the entry's
+    // name and ordinal over, and make it the entry's value.
+    if (try instantiateEnumEntryBodies(self, module, sink)) |err| return err;
     // Patch enum-entry instance fields with evaluated ctor args.
     for (self.enum_entry_arg_inits.items) |entry| {
         const class_def: ?runtime.ObjRef(runtime.ClassDef) = blk: {

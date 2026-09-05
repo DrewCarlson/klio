@@ -124,7 +124,7 @@ pub fn parseClass(
     var enum_entries: []EnumEntry = undefined;
     var secondary_ctors: []SecondaryCtor = undefined;
     if (mods.is_enum) {
-        const eb = parseEnumClassBody(p);
+        const eb = parseEnumClassBody(p, name);
         class_members = eb.members;
         init_blocks = eb.init_blocks;
         init_block_positions = eb.init_block_positions;
@@ -303,7 +303,7 @@ fn parsePrimaryCtorHeader(p: *Parser) ?Visibility {
 /// Parse an enum class body: optional entry list (comma-separated, with
 /// optional `(...)` ctor args and optional `{...}` per-entry body),
 /// optional `;` then regular class-body members.
-pub fn parseEnumClassBody(p: *Parser) EnumClassBody {
+pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
     // Helper: enum-class body content (after the optional `;`) shares the
     // member-parsing shape of a regular class body, minus secondary
     // constructors.
@@ -356,15 +356,72 @@ pub fn parseEnumClassBody(p: *Parser) EnumClassBody {
             _ = support.expect(p, .RParen, "`)`");
         }
         var body_members: []Decl = &.{};
+        var body: ?ClassBody = null;
         support.skipNl(p);
         if (std.meta.activeTag(support.peekKind(p).*) == .LBrace) {
             const cb = parseClassBody(p);
             body_members = cb.members;
+            body = cb;
         }
         const end = p.tokens[p.pos -| 1].span;
+        const entry_args = args.toOwnedSlice(p.allocator) catch @panic("OOM");
+        if (body) |cb| {
+            // `B(args) { … }` declares an anonymous subclass of the enum whose
+            // instance is the entry: the body's properties, `init` blocks,
+            // functions, and nested classes become members of a synthesized
+            // nested class `$B : Enum(args)`, instantiated for the entry at
+            // VM start. The entry name itself stays the entry value.
+            const synth = std.fmt.allocPrint(p.allocator, "${s}", .{name.name}) catch @panic("OOM");
+            const sups = p.allocator.alloc(TypeRef, 1) catch @panic("OOM");
+            sups[0] = .{
+                .name = enum_name,
+                .nullable = false,
+                .span = name.span,
+                .type_args = &.{},
+                .function = null,
+                .definitely_non_null = false,
+                .annotations = &.{},
+                .qualified_path = null,
+            };
+            const sargs = p.allocator.alloc(?[]Expr, 1) catch @panic("OOM");
+            sargs[0] = entry_args;
+            const sdel = p.allocator.alloc(?Expr, 1) catch @panic("OOM");
+            sdel[0] = null;
+            member_list.append(p.allocator, .{ .Class = .{
+                .name = .{ .name = synth, .span = name.span },
+                .type_params = &.{},
+                .where_bounds = &.{},
+                .primary_params = &.{},
+                .init_blocks = cb.init_blocks,
+                .init_block_positions = cb.init_block_positions,
+                .supertypes = sups,
+                .supertype_args = sargs,
+                .supertype_delegates = sdel,
+                .is_data = false,
+                .is_companion = false,
+                .is_enum = true,
+                .is_sealed = false,
+                .is_open = false,
+                .is_abstract = false,
+                .is_inner = false,
+                .secondary_ctors = cb.secondary_ctors,
+                .is_interface = false,
+                .is_fun_interface = false,
+                .is_value = false,
+                .is_annotation = false,
+                .is_expect = false,
+                .is_actual = false,
+                .enum_entries = &.{},
+                .members = cb.members,
+                .visibility = .Public,
+                .primary_ctor_visibility = null,
+                .annotations = &.{},
+                .span = start.join(end),
+            } }) catch @panic("OOM");
+        }
         entries.append(p.allocator, .{
             .name = name,
-            .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
+            .args = entry_args,
             .body_members = body_members,
             .annotations = annotations,
             .span = start.join(end),

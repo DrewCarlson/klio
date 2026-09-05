@@ -3497,8 +3497,8 @@ fn buildModuleWithOverrides(
     // toString/hashCode renderings match the whole-program numbering.
     var next_id: u64 = if (base) |bs| bs.enum_id_next else 1;
     var enum_entry_arg_inits: std.ArrayList(EnumEntryArgInit) = if (seed) |*s| s.enum_entry_arg_inits else .empty;
-    var enum_entry_methods = if (seed) |*s| s.enum_entry_methods else std.HashMap(StrPair, EnumEntryMethod, StrPairContext, std.hash_map.default_max_load_percentage).init(a);
-    var enum_entry_synth_class = if (seed) |*s| s.enum_entry_synth_class else PairStrMap.init(a);
+    const enum_entry_methods = if (seed) |*s| s.enum_entry_methods else std.HashMap(StrPair, EnumEntryMethod, StrPairContext, std.hash_map.default_max_load_percentage).init(a);
+    const enum_entry_synth_class = if (seed) |*s| s.enum_entry_synth_class else PairStrMap.init(a);
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -3515,24 +3515,6 @@ fn buildModuleWithOverrides(
             var fields: std.ArrayList(InstanceData.Field) = .empty;
             try fields.append(a, .{ .name = "name", .value = .{ .String = try runtime.strInit(a, entry.name.name) } });
             try fields.append(a, .{ .name = "ordinal", .value = Value.newInt(@intCast(ordinal)) });
-
-            if (entry.body_members.len != 0) {
-                const synth_class_name = try std.fmt.allocPrint(a, "{s}${s}", .{ c.name.name, entry.name.name });
-                try enum_entry_synth_class.put(.{ .a = c.name.name, .b = entry.name.name }, synth_class_name);
-                for (entry.body_members) |*em| {
-                    if (em.* != .Function) continue;
-                    const f = &em.Function;
-                    if (f.body == null) continue;
-                    var sub_module = Module.default(a);
-                    var own = StringSet.init(a);
-                    defer own.deinit();
-                    const sub_func = try ir.lower.lowerMethod(&sub_module, f, synth_class_name, &own);
-                    const fid = sub_func.id;
-                    const module_rc = try ObjRef(Module).init(a, sub_module);
-                    try enum_entry_methods.put(.{ .a = synth_class_name, .b = f.name.name }, .{ .module = module_rc, .func = fid });
-                }
-                try fields.append(a, .{ .name = "__enum_entry_class__", .value = .{ .String = try runtime.strInit(a, synth_class_name) } });
-            }
 
             const inst = try ObjRef(InstanceData).init(a, .{
                 .class = class_def.clone(),

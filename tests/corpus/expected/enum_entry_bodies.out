@@ -1,0 +1,10 @@
+0 ADD + -> 9
+1 MUL * (neutral 1) -> 18
+2 NEG - -> -6
+-6
+20
+negative
+4
+true
+true
+SQUARE
