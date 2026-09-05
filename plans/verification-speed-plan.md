@@ -164,3 +164,28 @@ Two standing traps this re-confirmed:
   (152 GB → 68 GB on first run). Old Rust-era `klio-parity-sweep.sh` deleted
   (parity runs through the `itest-parity_*` suites and `corpus_check.py`);
   `klio-guard.sh` and `klio-smoke.sh` repointed at `zig-out/bin/klio`.
+
+
+## Root cause opened 2026-09-05 — `check_examples` runs stale pack IR
+
+`itest-check_examples` drives `scripts/corpus_check.py` through the CLI
+route, which loads the INSTALLED packs from the suite's scratch home:
+pre-lowered pack IR, built once by whichever klio installed them. A
+lowering change that only shows in pack code stays invisible to it — the
+CI campaign's constructor-literal coercion regressed `compose_paint` /
+`compose_colorspace` and only the in-process e2e (packs lowered from
+source, `.SourcePacks`) caught it. Two consumers, one blind.
+
+Fix (either, the first is cheaper): (a) `check_examples` rebuilds the
+shipped packs from source into its scratch home before running, the way
+the census suites' `installPacks` do, so the pack IR always carries the
+tree's lowering; or (b) give `corpus_check.py` a source-packs mode that
+mirrors `parity.runWithPacks`. Keep the CLI route (it is what users run);
+the point is that its pack IR is never older than the tree.
+
+Parent plan: `green-main-backlog.md`.
+
+- [ ] pack rebuild in `check_examples` (or the source-packs mode)
+- [ ] prove it: reintroduce the reverted call-site coercion on a scratch
+      branch and confirm `check_examples` now goes red on `compose_paint`
+- [ ] note the rule in `ci-green.md`

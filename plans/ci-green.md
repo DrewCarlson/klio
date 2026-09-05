@@ -386,6 +386,11 @@ Standing rules that got here (keep them when adding suites):
   populated by ci.yml (kotlin, compose, androidx-collection, mosaic).
 - The census always names failing cases; the stdlib and androidx runners
   do too. Logs: `gh run view <id> --log-failed`.
+- Follow-ups opened 2026-09-05 (`green-main-backlog.md`): ratchet every
+  baseline to its measured count (`census-gates-and-red-mass.md` Track
+  D — stdlib sits 151 below its count) and make `check_examples` lower
+  the shipped packs from the tree (`verification-speed-plan.md`), so the
+  green run guards what it appears to guard.
 
 ## Superseded in-flight (as of 3f3541df pushed)
 
