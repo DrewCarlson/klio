@@ -10,7 +10,11 @@ bottom and are not campaigns.
 
 ## The active plan
 
-None. `plans/green-main-backlog.md` (opened and closed 2026-09-05, after
+`plans/conformance-backlog.md` (opened 2026-09-05): the battery as the
+whole gate (`verification-speed-plan.md`), the kotlinc box-test
+conformance corpus (`kotlinc-box-conformance.md`, 7,351 programs), and
+the verification tier's allocation fill (`safe-tier-allocation-fill.md`).
+Just closed: `plans/green-main-backlog.md` (opened and closed 2026-09-05, after
 CI went green at 627c341e — `ci-green.md`) covered the ratchet audit and the `check_examples`
 pack-IR hole (`census-gates-and-red-mass.md` Track D,
 `verification-speed-plan.md`), the resolution residue

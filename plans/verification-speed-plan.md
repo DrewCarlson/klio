@@ -201,3 +201,27 @@ the "packs" phase right before "corpus". Parent plan:
       carried no `// Run with:` directive, so the CLI corpus had been
       failing it (the in-process e2e has no feature gating and passed).
       Directive added; the rest of the corpus is green with fresh packs.
+
+## Root cause opened 2026-09-05 — the battery is not the whole gate
+
+`scripts/stack.sh` (the "full battery" every stage runs once) executes the
+leaf-pack build, the compose plugin gate, ten library censuses, and the
+compose-ui gate. It runs NO stdlib sweep, NO example corpus check, and no
+litmus/e2e suites (its header claims litmus runs last; the 2026-09-05 log
+shows none). The Stage 3 push of `green-main-backlog.md` needed both the
+stdlib sweep (`commontest-sweep.py`, 117 files) and the gate-env corpus
+check by hand, and a bare `corpus_check.py` invocation reported 31 fake
+failures because it read the shared `~/.klio` packs instead of
+`.klio-local` (the trap `census-state` recorded).
+
+Task (parent: `conformance-backlog.md` Stage 1):
+- fold the stdlib sweep and the corpus check into `stack.sh`, the corpus
+  under `KLIO_HOME=$ROOT/.klio-local` after `refresh-local-packs.sh`, both
+  overlapping the compose gate on the non-vpd domain like the censuses;
+- make `corpus_check.py` refuse a shared data home unless told otherwise
+  (`--allow-shared-home`), so the trap cannot recur;
+- print one final line per phase and a battery verdict that includes them;
+- record the new battery wall here (977 s before).
+Exit: one `stack.sh` run is the whole local gate; a tree that fails the
+stdlib sweep or the corpus cannot show a green battery.
+
