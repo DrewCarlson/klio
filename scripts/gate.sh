@@ -62,14 +62,22 @@ phase "litmus" zig build \
   itest-bundle_smoke \
   --summary failures
 
+echo "== every shipped pack reinstalled from this tree"
+# The corpus phase below runs the CLI route, which loads installed pack
+# IR; the compose-ui gate refreshes only the compose family. Reinstall
+# everything first (tree-keyed, a no-op when unchanged), ahead of the
+# compose-ui gate so its example runs warm the bake cache the corpus
+# then reuses. The shared ~/.klio produced a six-example failure mirage
+# from stale packs once already, and a stale datetime pack hid a real
+# lowering regression once too.
+phase "packs" env KLIO_BIN=zig-out/bin/klio-harness scripts/refresh-local-packs.sh
+
 echo "== compose-ui example family (fresh packs, cleared bake cache)"
 phase "compose-ui-gate" scripts/compose-ui-gate.sh
 
 echo "== full example corpus"
-# Pinned to the repo-local home the compose-ui gate just freshened —
-# the shared ~/.klio produced a six-example failure mirage from stale
-# packs once already.
-phase "corpus" env KLIO_HOME="$ROOT/.klio-local" python3 scripts/corpus_check.py --zig zig-out/bin/klio-harness --no-rust
+# 180 s per example: a cold compose bake is ~70 s even locally (warm ~2 s).
+phase "corpus" env KLIO_HOME="$ROOT/.klio-local" python3 scripts/corpus_check.py --zig zig-out/bin/klio-harness --no-rust --timeout 180
 
 if [ "$NO_SWEEP" = 0 ]; then
   echo "== commontest dual eager gate"

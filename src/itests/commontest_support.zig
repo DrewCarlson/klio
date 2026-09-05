@@ -493,7 +493,7 @@ pub const suites = [_]Config{
         .timeout_ms = 150_000,
         // 1295 (2026-09-01): solo 1299; the 10-case margin covered the
         // pre-L3-split load DNCs, the isolated structure runs 1299/0/0.
-        .baseline = 1297,
+        .baseline = 1299,
         .max_failed = 0,
         .max_incomplete = 1,
     },

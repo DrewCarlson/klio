@@ -386,11 +386,14 @@ Standing rules that got here (keep them when adding suites):
   populated by ci.yml (kotlin, compose, androidx-collection, mosaic).
 - The census always names failing cases; the stdlib and androidx runners
   do too. Logs: `gh run view <id> --log-failed`.
-- Follow-ups opened 2026-09-05 (`green-main-backlog.md`): ratchet every
-  baseline to its measured count (`census-gates-and-red-mass.md` Track
-  D — stdlib sits 151 below its count) and make `check_examples` lower
-  the shipped packs from the tree (`verification-speed-plan.md`), so the
-  green run guards what it appears to guard.
+- Baselines move up with the measured count and down only with a
+  root-caused record (`census-gates-and-red-mass.md` Track D: stdlib
+  2301, coroutines 1299, the rest exact as of run 33953220015).
+- The CLI corpus check (`gate.sh` "corpus") runs installed pack IR, so
+  the "packs" phase before it reinstalls every shipped pack from the
+  tree (`scripts/refresh-local-packs.sh`, tree-keyed, ~36 s); the
+  compose-ui gate alone refreshes only the compose family
+  (`verification-speed-plan.md`, root cause 2026-09-05).
 
 ## Superseded in-flight (as of 3f3541df pushed)
 

@@ -18,7 +18,11 @@ const runtime = @import("runtime");
 
 /// Minimum number of stdlib commonTest cases that must pass. A ratchet: bump it
 /// up as fixes land, never down. (Total discovered is ~2082.)
-const BASELINE: usize = 2150;
+/// 2301 = the measured pass count (1024 + 1277 across the two shards) with
+/// a zero failure ceiling: CI run 33953220015 and the local ReleaseSafe
+/// shards agree. A baseline moves up with the count; down only with a
+/// root-caused record.
+const BASELINE: usize = 2301;
 
 /// Ceiling on *failing* cases, the mirror of `BASELINE`. A pass floor cannot
 /// see a regression inside the red mass; this bounds the other direction.

@@ -2205,16 +2205,15 @@ baseline is only a gate if it sits at the measured pass count. Audit
 every suite's baseline against its current count and ratchet the ones
 with slack. Parent plan: `green-main-backlog.md`.
 
-- [ ] `stdlib_commontest`: passes 2301 (1024 + 1277 across the two
-      shards, `MAX_FAILED = 0`), baseline 2150 — 151 tests of slack. Set
-      `BASELINE = 2301`; the sharded coarse minimum follows the
-      proportional rule already in the runner.
-- [ ] every other suite: compare `baseline` / `BASELINE` with the last
-      green run's count (`gh run view <id> --log-failed` prints the
-      summaries only on failure; a local `zig build itest-<suite>
-      -Dharness-optimize=ReleaseSafe` prints it always). Known exact:
-      json 747, datetime 519, compose_ui 452, androidx 1841, coroutines
-      1299 (verify), ktor 440 vs census 465 (recorded margin), plugin
-      gate 1385 = 1390 − MAX_FAILED (intentional, see the runner comment).
+- [x] `stdlib_commontest`: passes 2301 (1024 + 1277 across the two
+      shards, `MAX_FAILED = 0`), baseline was 2150 — 151 tests of slack.
+      `BASELINE = 2301` (2026-09-05); the sharded coarse minimum follows
+      the proportional rule already in the runner.
+- [x] every other suite, audited against CI run 33953220015 (`gh run view
+      33953220015 --log` prints every summary): coroutines 1299 vs
+      baseline 1297 → ratcheted to 1299; exact already: androidx 1841,
+      atomicfu 67, compose_ui 452, datetime 519, io 1191, ktor 450,
+      serialization 138, json 747; plugin gate 1385 = 1390 − MAX_FAILED
+      (intentional, see the runner comment).
 - [ ] record the ratchet rule in `ci-green.md`: a baseline moves UP with
       the count; it moves down only with a root-caused record.

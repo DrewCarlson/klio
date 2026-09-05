@@ -17,10 +17,12 @@ Order of work (each stage ends with the standing gates green:
    stdlib's baseline is 151 tests below its pass count; audit every
    suite and ratchet to the measured count. Exit: every baseline equals
    its last green count (or carries a root-caused record for the gap).
-2. **`check_examples` lowers the shipped packs from the tree** —
-   `verification-speed-plan.md`, root cause opened 2026-09-05. Exit: a
-   pack-only lowering regression turns `check_examples` red (proved by
-   reintroducing the reverted coercion on a scratch branch).
+2. **The corpus check runs packs lowered from the tree** —
+   `verification-speed-plan.md`, root cause opened 2026-09-05 (the CLI
+   corpus check is `gate.sh`'s "corpus" phase, not the `check_examples`
+   itest, which is a resolver cleanliness test). Exit: a pack-only
+   lowering regression turns the corpus phase red (proved by
+   reintroducing the reverted coercion in a scratch worktree).
 
 ## Stage 2 — resolution residue (`resolution-residue-campaign.md`)
 
@@ -60,3 +62,8 @@ when Stages 1-3 have their exit conditions met and the register's
 ## Log
 
 - 2026-09-05: opened; the owning documents carry the task detail.
+- 2026-09-05: Stage 1 landed — stdlib 2301 / coroutines 1299 ratchets
+  (every other baseline already exact), `scripts/refresh-local-packs.sh`
+  as gate.sh's "packs" phase ahead of the compose-ui gate, proof via the
+  regression worktree, and the corpus defect it exposed
+  (`channel_segment_namesake.kt` lacked its feature directive).

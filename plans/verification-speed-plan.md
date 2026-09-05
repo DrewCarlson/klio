@@ -166,26 +166,38 @@ Two standing traps this re-confirmed:
   `klio-guard.sh` and `klio-smoke.sh` repointed at `zig-out/bin/klio`.
 
 
-## Root cause opened 2026-09-05 — `check_examples` runs stale pack IR
+## Root cause opened 2026-09-05 — the corpus check runs stale pack IR
 
-`itest-check_examples` drives `scripts/corpus_check.py` through the CLI
-route, which loads the INSTALLED packs from the suite's scratch home:
-pre-lowered pack IR, built once by whichever klio installed them. A
-lowering change that only shows in pack code stays invisible to it — the
-CI campaign's constructor-literal coercion regressed `compose_paint` /
-`compose_colorspace` and only the in-process e2e (packs lowered from
-source, `.SourcePacks`) caught it. Two consumers, one blind.
+The CLI-route corpus check is `scripts/corpus_check.py`, run by
+`scripts/gate.sh`'s "corpus" phase against the repo-local data home (the
+itest named `check_examples` is a resolver/typecheck cleanliness test on
+four files, and CI has no CLI-route corpus run; the in-process e2e covers
+the corpus there with packs lowered from source). The CLI loads the
+INSTALLED packs: pre-lowered pack IR built by whichever klio installed
+them. The compose-ui gate refreshes only its family (`PACK_FILTER`:
+compose-*, kotlin-test, coroutines, atomicfu, androidx-collection), so a
+lowering change that shows only inside another pack stays invisible:
+the CI campaign's constructor-literal coercion broke `DatePeriod(days =
+1)` in the datetime pack, and the corpus check kept passing on the stale
+installed copy while the census (fresh pack) failed.
 
-Fix (either, the first is cheaper): (a) `check_examples` rebuilds the
-shipped packs from source into its scratch home before running, the way
-the census suites' `installPacks` do, so the pack IR always carries the
-tree's lowering; or (b) give `corpus_check.py` a source-packs mode that
-mirrors `parity.runWithPacks`. Keep the CLI route (it is what users run);
-the point is that its pack IR is never older than the tree.
+Fix (landed 2026-09-05): `scripts/refresh-local-packs.sh` reinstalls
+EVERY shipped pack into `.klio-local` from the tree, keyed on the tree
+content + installer binary (a no-op when unchanged); `gate.sh` runs it as
+the "packs" phase right before "corpus". Parent plan:
+`green-main-backlog.md`.
 
-Parent plan: `green-main-backlog.md`.
-
-- [ ] pack rebuild in `check_examples` (or the source-packs mode)
-- [ ] prove it: reintroduce the reverted call-site coercion on a scratch
-      branch and confirm `check_examples` now goes red on `compose_paint`
-- [ ] note the rule in `ci-green.md`
+- [x] the refresh script + gate phase (ordered BEFORE the compose-ui
+      gate so its example runs warm the bake cache the corpus reuses;
+      corpus timeout 180 s — a cold compose bake is ~70 s locally, warm
+      ~2 s)
+- [x] proved 2026-09-05: a scratch worktree carrying the reverted
+      call-site coercion, packs refreshed from that tree, turns the
+      corpus phase red on `compose_colorspace` (`compose_paint` happens
+      to survive on the CLI route; the in-process e2e caught both)
+- [x] the rule in `ci-green.md`
+- [x] what the refreshed corpus found on `main` itself:
+      `channel_segment_namesake.kt` needs `--feature io.ktor/io` and
+      carried no `// Run with:` directive, so the CLI corpus had been
+      failing it (the in-process e2e has no feature gating and passed).
+      Directive added; the rest of the corpus is green with fresh packs.

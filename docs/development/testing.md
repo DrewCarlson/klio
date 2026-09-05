@@ -200,8 +200,12 @@ Match the check to the size of the change
 - **One suite**: `zig build itest-<name>`. Never build `itest-bin`
   (all standalone itest binaries) during iteration.
 - **Full gate before a commit**: `scripts/gate.sh` — unit tests, the
-  litmus/e2e/examples/ktor/concurrency suites, then the commontest
-  dual eager gate. `--no-sweep` skips the slow tail.
+  litmus/e2e/examples/ktor/concurrency suites, the compose-ui gate, a
+  tree-keyed reinstall of every shipped pack into `.klio-local`
+  (`scripts/refresh-local-packs.sh`, so the CLI corpus check below runs
+  pack IR lowered from this tree, not whatever installed it last), the
+  full example corpus through the CLI, then the commontest dual eager
+  gate. `--no-sweep` skips the slow tail.
 - **Cache**: `scripts/prune-zig-cache.sh [days]` when `.zig-cache`
   grows unreasonably (Zig has no cache GC of its own).
 
