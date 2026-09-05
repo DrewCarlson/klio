@@ -478,6 +478,18 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     }
     b.setBoxedVars(boxed);
     try decl.bindParams(&b, names.items);
+    // An anonymous context function binds its context names from the
+    // context stack, which the caller's `CtxCall` fills.
+    if (module.pending_lambda_ctx_params) |ctx_params| {
+        module.pending_lambda_ctx_params = null;
+        module.has_context_decls = true;
+        for (ctx_params) |cp| {
+            const r = b.allocReg();
+            const ty_c = try b.module.internConst(b.allocator, .{ .String = cp.ty.name.name });
+            try b.push(.{ .CtxLoad = .{ .dst = r, .ty = ty_c, .erased = false } });
+            try b.bind(cp.name.name, r);
+        }
+    }
     // Parameter names shadow inherited enclosing-local records: without
     // this, `let { it.sortedBy { it.nonEmptyLength() } }` typed the inner
     // lambda's `it` from the OUTER `it`'s List record and refuted the

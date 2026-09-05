@@ -555,6 +555,15 @@ pub fn parsePrefix(p: *Parser) ?Expr {
             .span = sp,
         } };
     }
+    // `!!p` in prefix position is two negations (the lexer folds `!!` into
+    // one token for the postfix not-null assertion).
+    if (std.meta.activeTag(support.peekKind(p).*) == .BangBang) {
+        _ = support.bump(p);
+        const e = parsePrefix(p) orelse return null;
+        const inner_sp = start.join(e.span());
+        const inner = Expr{ .Unary = .{ .op = .Not, .expr = boxExpr(p, e), .span = inner_sp } };
+        return Expr{ .Unary = .{ .op = .Not, .expr = boxExpr(p, inner), .span = inner_sp } };
+    }
     return parsePostfix(p);
 }
 
@@ -607,6 +616,46 @@ pub fn parsePostfixFrom(p: *Parser, first: Expr) ?Expr {
                 const safe = std.meta.activeTag(support.peekKind(p).*) == .QuestionDot;
                 _ = support.bump(p);
                 support.skipNl(p);
+                // `recv.(f)(args)`: a parenthesized callee invoked with `recv`
+                // as its extension receiver, which Kotlin defines as
+                // `f(recv, args)` — the receiver is the callee's first
+                // parameter, exactly as `f.invoke(recv, args)` would pass it.
+                if (!safe and std.meta.activeTag(support.peekKind(p).*) == .LParen) {
+                    const callee = parsePrimary(p) orelse return null;
+                    support.skipNl(p);
+                    if (std.meta.activeTag(support.peekKind(p).*) != .LParen) {
+                        _ = support.expect(p, .LParen, "`(` (a parenthesized callee after `.` must be invoked)") orelse return null;
+                        return null;
+                    }
+                    _ = support.bump(p);
+                    var args: std.ArrayList(Expr) = .empty;
+                    var arg_names: std.ArrayList(?[]const u8) = .empty;
+                    args.append(p.allocator, expr) catch @panic("OOM");
+                    arg_names.append(p.allocator, null) catch @panic("OOM");
+                    while (true) {
+                        support.skipNl(p);
+                        if (std.meta.activeTag(support.peekKind(p).*) == .RParen) break;
+                        const name = tryConsumeNamedArgName(p);
+                        const arg = parseValueArgument(p) orelse return null;
+                        args.append(p.allocator, arg) catch @panic("OOM");
+                        arg_names.append(p.allocator, name) catch @panic("OOM");
+                        support.skipNl(p);
+                        if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
+                            _ = support.bump(p);
+                        } else break;
+                    }
+                    const rparen = support.expect(p, .RParen, "`)`") orelse return null;
+                    const sp = expr.span().join(rparen.span);
+                    expr = Expr{ .Call = .{
+                        .callee = boxExpr(p, callee),
+                        .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
+                        .arg_names = arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"),
+                        .type_args = &.{},
+                        .is_infix = false,
+                        .span = sp,
+                    } };
+                    continue;
+                }
                 const name = support.parseIdent(p, "member name") orelse return expr;
                 const sp = expr.span().join(name.span);
                 expr = Expr{ .Member = .{

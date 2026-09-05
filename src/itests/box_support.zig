@@ -33,9 +33,10 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// Kotlin 2.4 destructuring forms: 5409 / 942. Explicit primitive
 /// `rangeTo` + invoked lambda arguments: 5440 / 911. Enum entries with
 /// bodies as real subclasses: 5461 / 890. Language feature flags and the
-/// name-based short form: 5477 / 874.
-pub const BASELINE: usize = 5477;
-pub const MAX_FAILED: usize = 874;
+/// name-based short form: 5477 / 874. Corpus syntax gaps and contextual
+/// anonymous functions: 5506 / 845.
+pub const BASELINE: usize = 5506;
+pub const MAX_FAILED: usize = 845;
 
 /// Directives that bind a test to a framework feature klio has no
 /// counterpart for: a backend restriction, a second module, reflection,

@@ -300,6 +300,7 @@ pub const VmHost = struct {
     // no `{ctx, vtable}` indirection. `interp_ir` supplies `H = VmHost` at
     // every `ir.eval.evalWith(VmHost, ...)` call site.
     pub const callValue = host_call_value.callValue;
+    pub const callableDeclaredArity = host_call_func.callableDeclaredArity;
     pub const prepareClosureFlatCall = host_call_value.prepareClosureFlatCall;
     pub const callClosureFast = host_call_value.callClosureFast;
     pub const prepareClosureWithThisFlatCall = host_call_value.prepareClosureWithThisFlatCall;

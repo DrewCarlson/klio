@@ -4185,6 +4185,7 @@ fn lowerAnonFun(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
     b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
     if (std.c.getenv("KLIO_LAMINH") != null) std.debug.print("[laminh] produce anonfun b={x} n={d}\n", .{ @intFromPtr(b) & 0xffff, b.localDeclTypeCount() });
+    if (af.context_params.len != 0) b.module.pending_lambda_ctx_params = af.context_params;
     const lowered = try lowerLambdaBodyCapturingKind(
         b.module,
         param_idents,

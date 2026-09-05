@@ -4165,6 +4165,10 @@ fn buildModuleWithOverrides(
         // A `val X.Companion.foo` records `qualified_path = "X.Companion"`; key
         // it under that path so it never collides with a plain `val X.foo` type
         // extension (which applies to instances of `X`, not its companion).
+        // A function-type receiver (`val (Int.() -> String).twice`) is keyed
+        // under `Function`, the runtime name of every callable value, so the
+        // walk from a closure receiver finds it.
+        if (recv.function != null) recv_name = "Function";
         const recv_key: []const u8 = if (recv.qualified_path) |qp|
             (if (std.mem.endsWith(u8, qp, ".Companion")) qp else recv_name)
         else

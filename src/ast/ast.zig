@@ -993,6 +993,9 @@ pub const Expr = union(enum) {
     /// out of this function rather than the enclosing one.
     AnonFun: struct {
         receiver_ty: ?TypeRef,
+        /// `context(x: A) fun (…)`: the body binds each context name from
+        /// the context stack at entry, as a declared context function does.
+        context_params: []ContextParam = &.{},
         params: []Param,
         return_ty: ?TypeRef,
         body: ?*FunctionBody,

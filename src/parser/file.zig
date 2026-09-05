@@ -577,12 +577,12 @@ fn contextParenIsClause(p: *const Parser) bool {
     return false;
 }
 
-const ContextClause = struct { params: []ast.ContextParam, span: Span };
+pub const ContextClause = struct { params: []ast.ContextParam, span: Span };
 
 /// Parse a `context(name: Type, ...)` modifier clause. The cursor is at the
 /// `context` soft keyword; the `(` follows. Bad forms are diagnosed but the
 /// clause is still consumed so the following declaration parses.
-fn parseContextClause(p: *Parser) ContextClause {
+pub fn parseContextClause(p: *Parser) ContextClause {
     const kw = support.bump(p); // `context`
     _ = support.bump(p); // `(`
     var list: std.ArrayList(ast.ContextParam) = .empty;
@@ -813,7 +813,7 @@ pub fn parseUnescapedAnnotationCtx(
                 else => {},
             }
             const name = expr.tryConsumeNamedArgName(p);
-            const e = expr.parseExpr(p) orelse break;
+            const e = expr.parseValueArgument(p) orelse break;
             args.append(p.allocator, e) catch @panic("OOM");
             arg_names.append(p.allocator, name) catch @panic("OOM");
             support.skipNl(p);

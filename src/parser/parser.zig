@@ -412,6 +412,26 @@ test "a lambda value argument takes postfix operators" {
     try testing.expect(!out.parser.diagnostics.hasErrors());
 }
 
+test "parser gaps from the box corpus: dot callee, prefix bang pairs, suspend context types, context anonymous functions, parenthesized receivers, empty bodies, annotation spreads" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\@A(*arrayOf("O"), "K")
+        \\val (Int.() -> String).baz: String get() = this(1)
+        \\var <T> (List<T>.() -> T).bar: T get() = this(listOf())
+        \\fun f(fn: suspend context(Int) () -> Unit, p: Boolean) {
+        \\    for (x in 1..5);
+        \\    if (!!!!!p) return
+        \\    val a = context(x: String) fun (): String { return x }
+        \\    val r = "O".(fun String.(y: String): String = this + y)("K")
+        \\    getReceiver().(getFun({ 1 }))(1)
+        \\}
+    ;
+    const out = try parse(arena.allocator(), src);
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+}
+
 test "parses_hello_world" {
     try skipIfStubbed();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

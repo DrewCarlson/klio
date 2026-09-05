@@ -190,6 +190,22 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
     // `val x = expr` / `var x = expr`. The init is lowered
     // into a fresh register and bound in the current scope;
     // mutability is enforced by typeck, not the IR.
+    // A local holding a contextual function — declared with a contextual
+    // function type, or initialized by an anonymous context function — has
+    // a call shape: `name(c.., a..)` splits its leading context args
+    // (`CtxCall`), as a parameter of that type does.
+    if (p.ty) |ty| {
+        if (ty.function) |ft| if (ft.context_params.len != 0 and ft.receiver == null) {
+            const ctx_types = try b.allocator.alloc([]const u8, ft.context_params.len);
+            for (ft.context_params, 0..) |cp, ci| ctx_types[ci] = cp.name.name;
+            try b.markContextFnParam(p.name.name, ctx_types, ft.params.len);
+        };
+    } else if (p.init) |*ie| if (ie.* == .AnonFun and ie.AnonFun.context_params.len != 0) {
+        const af = ie.AnonFun;
+        const ctx_types = try b.allocator.alloc([]const u8, af.context_params.len);
+        for (af.context_params, 0..) |cp, ci| ctx_types[ci] = cp.ty.name.name;
+        try b.markContextFnParam(p.name.name, ctx_types, af.params.len);
+    };
     const init: Reg = if (p.delegate) |de| blk: {
         // `val x by D` — lower the delegate, then invoke its
         // `getValue(null, ::x)` once at decl time. For a

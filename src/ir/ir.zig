@@ -2080,6 +2080,9 @@ pub const Module = struct {
     /// derived from its resolved call-argument slot. The lambda body takes
     /// ownership and records them as ordinary local declared types.
     pending_lambda_param_types: ?[]TypeRef = null,
+    /// Context parameters of the anonymous function whose body is lowered
+    /// next; the body lowering binds each from the context stack at entry.
+    pending_lambda_ctx_params: ?[]const ast.ContextParam = null,
     /// The LOCAL `fun` whose body (or a lambda nested in it) is about to
     /// lower: its declared name and its mangled overload-cell binding. A bare
     /// self-reference in that body must call through the mangled cell — the
