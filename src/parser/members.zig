@@ -1082,7 +1082,21 @@ fn parsePropertyAccessors(p: *Parser) ?PropertyAccessors {
     var setter_visibility: ?Visibility = null;
     while (true) {
         const save = p.pos;
-        const scan = scanAccessorModifiers(p, p.pos);
+        // An accessor may follow a `;` on the property's line
+        // (`var x = "OK"; private set`).
+        var scan_from = p.pos;
+        if (kindAt(p, scan_from)) |k| if (is(&k, .Semicolon)) {
+            var j = scan_from + 1;
+            while (kindAt(p, j)) |kk| : (j += 1) {
+                if (!is(&kk, .Newline)) break;
+            }
+            const after_mods = scanAccessorModifiers(p, j);
+            if (kindAt(p, after_mods.index)) |ak| if (is(&ak, .Ident)) {
+                const t = text(p, p.tokens[after_mods.index].span);
+                if (std.mem.eql(u8, t, "get") or std.mem.eql(u8, t, "set")) scan_from = j;
+            };
+        };
+        const scan = scanAccessorModifiers(p, scan_from);
         const i = scan.index;
         const acc_visibility = scan.visibility;
         const acc_inline = scan.inlined;
@@ -1098,10 +1112,13 @@ fn parsePropertyAccessors(p: *Parser) ?PropertyAccessors {
         // accessor whose presence carries only the visibility.
         const is_bodyless = !(next != null and is(&next.?, .LParen));
         if (is_bodyless and acc_visibility == null and !acc_inline and !scan.had_annotation) {
-            // No modifier, no annotation, and no `(` — not an accessor
-            // (e.g. a following statement that calls a `get`/`set`
-            // function). Bail.
-            break;
+            // A bare `get` / `set` declares the default accessor. It is one
+            // only when nothing follows it on the line: an identifier named
+            // `set` used in a statement (`set = 5`, `set.add(x)`) is not.
+            const after = kindAt(p, i + 1);
+            const alone = after == null or is(&after.?, .Newline) or is(&after.?, .Semicolon) or
+                is(&after.?, .RBrace) or is(&after.?, .Eof);
+            if (!alone) break;
         }
         // Commit — consume the newlines, optional vis/annotation, and accessor.
         // The leading annotations are parsed for real (`@Composable get()`
