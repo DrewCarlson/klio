@@ -152,7 +152,7 @@ const itests_files = [_]Itest{
     .{ .name = "runtime_objref_threads", .parity_data = false, .interprets = false },
     .{ .name = "typeck_negative", .parity_data = false, .interprets = false, .dirs = &.{"tests/fixtures/typeck_negative"} },
     .{ .name = "check_examples", .dirs = &.{"examples"}, .weight = 2 },
-    .{ .name = "differential", .dirs = &.{ "examples", "tests/fixtures/coroutine_smoke" }, .weight = 36 },
+    .{ .name = "differential", .dirs = &.{ "examples", "tests/fixtures/coroutine_smoke" }, .weight = 18 },
     .{ .name = "fuzz_closures_suspend", .fuzz_env = true, .weight = 2 },
     // End-to-end ktor gate: child `klio` + in-test HTTP server + installed packs.
     .{ .name = "ktor_client_get", .parity_data = false, .needs_exe = true, .dirs = &.{

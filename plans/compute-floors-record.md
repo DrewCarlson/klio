@@ -19,11 +19,11 @@ verdicts that bound what a per-op lever can still buy:
 | `LocalDateTest.toEpochDays` | 114 s alone | same | same |
 | `JsonUnicodeTest.testRandomEscapeSequences` (json census) | ~195 s | 900 s | `… klio-census serialization_json` |
 | `JsonHugeDataSerializationTest.test` | ~ (split child) | 900 s | same |
-| `RecomposerTests.validatePotentialDeadlock` (plugin gate, ReleaseFast) | ~590-750 s | 900 s; baseline 1385 tolerates it | `zig build itest-compose_plugin_commontest` |
+| `RecomposerTests.validatePotentialDeadlock` (plugin gate, ReleaseFast) | 471 s solo (was 547) | 900 s; baseline 1385 tolerates it | `zig build itest-compose_plugin_commontest` |
 | `SnapshotStateListTests.concurrentMixingWriteApply_addAll_clear`, `SnapshotStateSetTests.concurrentMixingWriteApply_add` | load flakes on 4 vCPU | tolerated by `MAX_FAILED` | same |
 | androidx `ScatterMapTest`, `OrderedScatterSetTest`, `SieveCacheTest` | the compute-heavy tail; 180 s per-file base cap | 180 s ×4 on Debug | `zig build itest-androidx_collection_commontest` |
 | `differential` (kotlinx-pack examples in two load modes, in-process) | ~17 min | shard weight 36 | `zig build itest-differential -Dharness-optimize=ReleaseSafe` |
-| stdlib `DeepRecursiveTest.testBadClass` | ~150 s (recorded in `verification-speed-plan.md`) | 300 s default | sweep `--filter DeepRecursive` |
+| stdlib `DeepRecursiveTest.testBadClass` | ~42 s today under the sampler (was ~150 s when `verification-speed-plan.md` recorded it) | 300 s default | sweep `--filter DeepRecursive` |
 
 CI context: with the ReleaseSafe harness every shard finishes in 6-26
 minutes (`ci-green.md`); these floors set the slowest shards and the caps
@@ -40,18 +40,71 @@ interpreted compute (the suite-wall verdict), in which case the record
 stands and the cap is the answer. Only (b) opens a fix; (a) needs the
 profile to name a NEW emitter.
 
-- [ ] `fromEpochDays` / `toEpochDays`: profile; the epoch-day arithmetic
-      is a tight Long loop — check whether the loop JIT engages
-      (`KLIO_NATIVE_TRACE`, `KLIO_JIT`)
-- [ ] `testRandomEscapeSequences`: profile; the serialization campaign's
-      string fixes moved it from 195 s to the current wall — see whether
-      a StringBuilder or escape path remains quadratic
-- [ ] `validatePotentialDeadlock`: profile; recomposition churn — compare
-      against the suite-wall verdict before assuming a lever exists
-- [ ] the androidx tail: profile one file; hash-map probing in
-      interpreted code — likely (c)
-- [ ] `differential`: it is two full corpus runs; the only lever is
-      base-image reuse across load modes (`LAZY-IMAGE.md`)
+- [x] `fromEpochDays`: VERDICT (b) then (a), 2026-09-05. Profile:
+      `memset` 11.3%, `classHasUserMethod` 6.3%, `eqlBytes` 5.0%,
+      allocSmall/freeSmall ~3%. `classHasUserMethod` (asked on every
+      builtin member call of a data/value/object instance, here
+      `assertEquals`' `equals`) had no precomputed `hierarchy_methods` set
+      for the pack's `LocalDate` and walked the hierarchy per call with a
+      fresh hash map and a LINEAR scan of every module class per hop.
+      Fixed: a (class, method) memo keyed by the dispatch generation and
+      an index lookup per hop (`builtin_members.zig`). Wall 166 s -> 113 s
+      (census child, 4 cores). What remains: `memset` 12% = allocation
+      zero-fill (`allocBytesWithAlignment`), fused-runner register
+      windows, and free poisoning — per-op costs the perf era already
+      priced; `runFrameExec`/`fusedInst`/`getIndex` are the interpreter
+      itself. Genuine compute from here.
+- [x] `toEpochDays`: 114 s -> 101 s after the memo (fewer `equals` calls
+      per iteration than its sibling: the loop compares Longs). Same
+      verdict: genuine interpreted compute from here.
+- [x] `JsonUnicodeTest.testRandomEscapeSequences`: VERDICT (c), 2026-09-05.
+      175 s (census child), 181 s under the sampler: `runFrameExec` 11.5%,
+      `eqlBytes` 3.8% (hash-map hits on name keys), `execInst`,
+      `runFlatLoop`, `deinit`, `memset` 1.8%, `callMemberInnerStatic`,
+      `afterStep`, `write`, `newWithCaptures` — a flat interpreter
+      profile with no quadratic string path left (the serialization
+      campaign's cursor/memo fixes took the quadratics). 10,000 strings
+      of up to 2,047 chars encoded and decoded: genuine interpreted
+      compute; the 900 s cap stands.
+- [x] `RecomposerTests.validatePotentialDeadlock`: profile 2026-09-05 (770 s
+      under the sampler on 4 cores, ReleaseSafe): `memset` 11.5%
+      (allocation zero-fill + register windows), `runFrameExec` 4.5%,
+      `eqlBytes` 3.4% + `getIndex` 3.1% (name-keyed hash probes on
+      dispatch), libc 2.6%, `allocLockedOne`/`allocSmall`/`freeSmall`
+      ~4%, `putAssumeCapacityNoClobberContext` 1.4% + `collectClassClosure`
+      1.3% — the one non-interpreter pair. VERDICT (b) for that share,
+      fixed 2026-09-05: `extensionFnFallback` asked `enclosingOwnerSet`
+      on every extension call not served by the inline cache (any call
+      with a member-extension candidate is never cached), and the set was
+      rebuilt per call — a supertype-closure walk of every enclosing
+      `this` and every frame receiver plus a fresh hash map of every
+      name — so its cost grew with the nesting depth of the composition.
+      The set is now the chain's class identities probing per-class
+      memoized closure-name sets (nothing allocated per call). Solo on 4
+      cores, gate env, ReleaseFast: 547 s → 471 s (before measured twice
+      on both core sets: 547/547; a first cut that cached the whole set
+      per chain signature measured 631 s — chain signatures vary with
+      recursion depth, so it missed and paid page-allocator churn).
+      The remainder is (c): interpreted recomposition churn.
+- [x] androidx `ScatterMapTest`: VERDICT (c), 2026-09-05. 38 s alone under
+      the sampler (4 cores); profile is the interpreter itself
+      (`runFrameExec` 9.6%, `memset` 6.9%, `execInst`, `allocLockedOne`,
+      `eqlBytes` 2.5%, `invokeVirtualMember`), no dominant user frame and
+      no pathological helper. Genuine interpreted compute; the 180 s
+      per-file cap stands.
+- [x] stdlib `DeepRecursiveTest`: VERDICT (c), 2026-09-05. 42 s under the
+      sampler: libc (memcpy/malloc) 12.7%, `memset` 11.8%,
+      `runFrameExec`, `allocLockedOne`, the minor GC (`sweepMinor`,
+      `gcMarkFrameRegs`, `shade`) — deep recursion is frame-allocation
+      churn, per-op costs already priced by the perf era. Genuine
+      interpreted compute.
+- [x] `differential`: VERDICT (c) by construction, 2026-09-05. Run directly
+      as its test binary on the ReleaseSafe universe it takes 176 s (the
+      17 min in the record was a Debug lane); it is every kotlinx-pack
+      example run in two load modes, the sum of the corpus programs'
+      own walls, and the in-process binary installs no sampler. The
+      only lever is base-image reuse across load modes (`LAZY-IMAGE.md`),
+      a design item, not a pathology. Shard weight corrected to 18.
 
 ## Log
 

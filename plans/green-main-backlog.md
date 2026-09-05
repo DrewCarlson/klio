@@ -44,7 +44,13 @@ Order of work (each stage ends with the standing gates green:
    genuine compute). Only an algorithmic pathology opens a fix; the rest
    stand as records under their caps. Exit: every row in the record
    carries a verdict; any fix ships with its before/after wall and a
-   corpus example.
+   corpus example. Done 2026-09-05: seven rows classified; two
+   algorithmic per-call rebuilds fixed (`classHasUserMethod` walk +
+   allocations on every builtin member call, fromEpochDays 166→113 s;
+   `enclosingOwnerSet` rebuilt on every uncached extension call,
+   validatePotentialDeadlock 547→471 s solo); the rest stand as genuine
+   interpreted compute; `examples/nested_receiver_extension_scope.kt`
+   guards the memoized paths.
 
 ## Not in this plan
 
@@ -55,13 +61,19 @@ closed, not deferred.
 
 ## Register
 
-Listed as the active plan in `open-campaigns.md`. Close this document
-when Stages 1-3 have their exit conditions met and the register's
-"active plan" moves on.
+CLOSED 2026-09-05: Stages 1-3 met their exit conditions (see the Log);
+`open-campaigns.md` no longer lists an active plan.
 
 ## Log
 
 - 2026-09-05: opened; the owning documents carry the task detail.
+- 2026-09-05: Stage 3 landed — every floor profiled under `KLIO_PROF`
+  and classified in `compute-floors-record.md`; two per-call rebuilds
+  memoized (user-method answer behind builtin member dispatch; the
+  enclosing-owner set behind member-extension visibility), the others
+  recorded as the interpreter itself; `differential` re-measured on the
+  ReleaseSafe universe (176 s, shard weight 18). Battery green, CI
+  green. Plan closed.
 - 2026-09-05: Stage 2 landed — bare factory vs value-class constructor
   (inside the class the constructor wins when the argument types fit;
   named arguments must name a candidate's parameters), Char ranges

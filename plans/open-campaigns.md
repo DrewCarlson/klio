@@ -10,14 +10,15 @@ bottom and are not campaigns.
 
 ## The active plan
 
-`plans/green-main-backlog.md` (opened 2026-09-05, after CI went green at
-627c341e — `ci-green.md`): the ratchet audit and the `check_examples`
+None. `plans/green-main-backlog.md` (opened and closed 2026-09-05, after
+CI went green at 627c341e — `ci-green.md`) covered the ratchet audit and the `check_examples`
 pack-IR hole (`census-gates-and-red-mass.md` Track D,
 `verification-speed-plan.md`), the resolution residue
 (`resolution-residue-campaign.md`: bare factory vs value-class ctor, Char
 range endpoints, nested-subject context arguments), then the named
 compute floors as the perf era's requested profile evidence
-(`compute-floors-record.md`). Just closed: `serialization-surface-campaign.md`
+(`compute-floors-record.md`: every row carries a verdict; two per-call
+rebuilds memoized, the rest genuine interpreted compute). Just closed: `serialization-surface-campaign.md`
 and `compose-ui-census-campaign.md` (2026-09-04, json 747/0/0 and
 compose_ui 452/0/0 standing) and the CI campaign (`ci-green.md`,
 2026-09-05, unit + 8 shards green). Just closed 2026-09-02: `leaf-wide-campaign.md`

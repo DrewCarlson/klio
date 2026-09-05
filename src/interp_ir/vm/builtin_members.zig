@@ -2361,13 +2361,60 @@ fn classDefDeclaresMethod(d: *const ClassDef, mname: []const u8, depth: u32) boo
     return false;
 }
 
+/// Memo for `classHasUserMethod` past the precomputed `hierarchy_methods`
+/// sets: one hierarchy walk per (class, method) per dispatch generation.
+/// Every builtin member call on a data/value/object instance asks this
+/// question, and a class without a precomputed set (a pack class, a
+/// runtime-registered local class) otherwise paid the walk on each call:
+/// with a linear scan of every module class per hierarchy hop, 11% of the
+/// `LocalDateTest.fromEpochDays` wall went to `memset`/`eqlBytes` alone.
+const UserMethodMemoEntry = struct { has: bool, gen: u32 };
+const UserMethodMemoLock = struct {
+    locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    fn lock(self: *UserMethodMemoLock) void {
+        while (self.locked.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+    fn unlock(self: *UserMethodMemoLock) void {
+        self.locked.store(false, .release);
+    }
+};
+var user_method_memo_lock: UserMethodMemoLock = .{};
+var user_method_memo: ?std.StringHashMap(UserMethodMemoEntry) = null;
+
+fn userMethodMemoGet(key: []const u8, gen: u32) ?bool {
+    user_method_memo_lock.lock();
+    defer user_method_memo_lock.unlock();
+    const memo = &(user_method_memo orelse return null);
+    const e = memo.get(key) orelse return null;
+    if (e.gen != gen) return null;
+    return e.has;
+}
+
+fn userMethodMemoPut(key: []const u8, gen: u32, has: bool) void {
+    user_method_memo_lock.lock();
+    defer user_method_memo_lock.unlock();
+    if (user_method_memo == null) user_method_memo = std.StringHashMap(UserMethodMemoEntry).init(std.heap.page_allocator);
+    const memo = &user_method_memo.?;
+    if (memo.getPtr(key)) |e| {
+        e.* = .{ .has = has, .gen = gen };
+        return;
+    }
+    if (memo.count() >= 65536) return;
+    const owned = std.heap.page_allocator.dupe(u8, key) catch return;
+    memo.put(owned, .{ .has = has, .gen = gen }) catch {};
+}
+
+test "user-method memo answers per dispatch generation" {
+    userMethodMemoPut("pkg.C\x1fequals", 7, true);
+    try std.testing.expectEqual(@as(?bool, true), userMethodMemoGet("pkg.C\x1fequals", 7));
+    // A newer generation invalidates the answer; the walk runs again.
+    try std.testing.expectEqual(@as(?bool, null), userMethodMemoGet("pkg.C\x1fequals", 8));
+    userMethodMemoPut("pkg.C\x1fequals", 8, false);
+    try std.testing.expectEqual(@as(?bool, false), userMethodMemoGet("pkg.C\x1fequals", 8));
+    try std.testing.expectEqual(@as(?bool, null), userMethodMemoGet("pkg.C\x1fhashCode", 8));
+}
+
 fn classHasUserMethod(self: *VmHost, allocator: Allocator, start_in: []const u8, mname: []const u8) bool {
-    // Fast path: the precomputed per-class hierarchy method-name set answers
-    // this in O(1). It collects the same user-declared method names up the
-    // supertype chain the walk below would. Built for every source class; a
-    // class with no entry (a synthesized/anon shape) falls back to the walk.
-    // The qualified record is exact; the simple-name record is the union
-    // over same-named classes and only ever says "some class declares it".
     const start = if (std.mem.lastIndexOfScalar(u8, start_in, '.')) |d| start_in[d + 1 ..] else start_in;
     {
         const mg = self.module.borrow();
@@ -2379,6 +2426,21 @@ fn classHasUserMethod(self: *VmHost, allocator: Allocator, start_in: []const u8,
             return set.contains(mname);
         }
     }
+    const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
+    var key_buf: [512]u8 = undefined;
+    const key: ?[]const u8 = std.fmt.bufPrint(&key_buf, "{s}\x1f{s}", .{ start_in, mname }) catch null;
+    if (key) |k| {
+        if (userMethodMemoGet(k, gen)) |has| return has;
+    }
+    const has = classHasUserMethodWalk(self, allocator, start, mname);
+    if (key) |k| userMethodMemoPut(k, gen, has);
+    return has;
+}
+
+/// The uncached answer: breadth-first over the runtime class defs'
+/// supertype names, each class looked up through the module's class index
+/// (never a scan of every class).
+fn classHasUserMethodWalk(self: *VmHost, allocator: Allocator, start: []const u8, mname: []const u8) bool {
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);
@@ -2386,30 +2448,30 @@ fn classHasUserMethod(self: *VmHost, allocator: Allocator, start_in: []const u8,
     queue.append(allocator, start) catch return false;
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
-        const cur = queue.items[head];
+        const cur_raw = queue.items[head];
+        const cur = if (std.mem.lastIndexOfScalar(u8, cur_raw, '.')) |d| cur_raw[d + 1 ..] else cur_raw;
         if (seen.contains(cur)) continue;
         seen.put(cur, {}) catch {};
         {
             const mg = self.module.borrow();
+            defer mg.deinit();
             const mod = mg.get();
-            for (mod.classes.items) |c| {
-                if (std.mem.eql(u8, c.name, cur)) {
-                    for (c.methods) |fid| {
+            if (mod.registry.hierarchy_methods.get(cur)) |set| {
+                if (set.contains(mname)) return true;
+            } else if (mod.classId(cur)) |cid| {
+                if (cid.int() < mod.classes.items.len) {
+                    for (mod.classes.items[cid.int()].methods) |fid| {
                         if (funcAt(mod, fid)) |f| {
-                            if (std.mem.eql(u8, f.name, mname)) {
-                                mg.deinit();
-                                return true;
-                            }
+                            if (std.mem.eql(u8, f.name, mname)) return true;
                         }
                     }
                 }
             }
-            mg.deinit();
         }
         const cg = self.classes.borrow();
         if (cg.get().get(cur)) |def| {
             const dg = def.borrow();
-            for (dg.get().supertype_names) |s| queue.append(allocator, s) catch {};
+            for (dg.get().supertype_names) |sup| queue.append(allocator, sup) catch {};
             dg.deinit();
         }
         cg.deinit();
