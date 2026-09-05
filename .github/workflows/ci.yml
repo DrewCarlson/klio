@@ -28,9 +28,9 @@ jobs:
           # The integration suite fans across weight-balanced shards
           # (see -Ditest-shard in build.zig; weights are CI-runner-scaled).
           # Each shard restores its own banked cache and runs ~an eighth of
-          # the suite. Weights are measured Debug-harness seconds on a
-          # 4-vCPU runner (÷10), so a shard lands near 25 minutes: the
-          # 60-minute budget absorbs a cold compile and a slow runner.
+          # the suite. Weights are measured ReleaseSafe-harness seconds on
+          # 4 cores (÷10); the 60-minute budget absorbs the cold compile of
+          # the harness universe and a slow runner.
           - name: itest shard 0
             step: itest -Ditest-shard=0/8
             shard: itest0
@@ -125,10 +125,10 @@ jobs:
           path: |
             ~/.cache/zig
             .zig-cache
-          key: zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-${{ matrix.shard }}-${{ github.sha }}
+          key: zig-0.16.0-safe-${{ hashFiles('build.zig.zon') }}-${{ matrix.shard }}-${{ github.sha }}
           restore-keys: |
-            zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-${{ matrix.shard }}-
-            zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-
+            zig-0.16.0-safe-${{ hashFiles('build.zig.zon') }}-${{ matrix.shard }}-
+            zig-0.16.0-safe-${{ hashFiles('build.zig.zon') }}-
 
       # The zig caches only ever grow (zig has no cache GC): a restored cache
       # near the runner's free-disk budget leaves no room for this shard's
@@ -147,15 +147,15 @@ jobs:
           done
           df -h / | tail -1
 
-      # -Dharness-optimize=Debug: locally the program-running harness binaries
-      # compile a second ReleaseSafe module universe so interpreted test
-      # programs run ~5x faster across thousands of iterations. CI runs each
-      # step once, so the slower Debug interpreter costs minutes while the
-      # second universe's optimizing compiles cost tens of minutes on a
-      # 4-vCPU runner. One universe here; the ReleaseSafe configuration runs
-      # in the harness-release workflow (manual / weekly).
+      # -Dharness-optimize=ReleaseSafe, the same harness the local battery
+      # runs: the interpreting suites are compute-bound (stdlib, coroutines,
+      # androidx, datetime, the json census, the in-process e2e/differential
+      # corpora) and the Debug interpreter runs them ~4x slower, which on a
+      # 4-vCPU runner turned every heavy suite into a ratchet miss or a
+      # shard timeout. The optimizing compile of the harness universe costs
+      # ~5 minutes cold per shard, far less than it saves.
       - name: zig build ${{ matrix.step }}
-        run: zig build ${{ matrix.step }} -Dharness-optimize=Debug --summary all
+        run: zig build ${{ matrix.step }} -Dharness-optimize=ReleaseSafe --summary all
 
       - name: save zig build + test state
         if: always()
@@ -164,4 +164,4 @@ jobs:
           path: |
             ~/.cache/zig
             .zig-cache
-          key: zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-${{ matrix.shard }}-${{ github.sha }}
+          key: zig-0.16.0-safe-${{ hashFiles('build.zig.zon') }}-${{ matrix.shard }}-${{ github.sha }}

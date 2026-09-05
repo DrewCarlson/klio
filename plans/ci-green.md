@@ -306,6 +306,31 @@ Tooling: `scripts/zigcheck.py`'s module graph is synced with build.zig
 (`serialization_pass` was missing, so `zigcheck parity` could not compile).
 The stdlib runner names every failing case (`[stdlib-fail]`/`[stdlib-err]`).
 
+## Status @ e6740915 pushed: run 33937478042 — Debug harness still too slow
+
+Result: unit OK; shard 6 (io, compose_ui, ktor, bundles, small) OK in
+28.5 min; shards 1/2/4/5 FAILED at 33-48 min; shards 0/3/7 hit the
+60-minute budget (androidx alone; datetime + `differential`; stdlib's two
+halves). Logs stay admin-gated; the per-step API and the packing say:
+
+- `differential` runs every kotlinx-pack example in two load modes
+  in-process (~1400s locally); its weight was 5 (assumed skipped without
+  kotlinc). Corrected.
+- Even with scaled caps, the Debug interpreter (~4x slower) on a 4-vCPU
+  runner turns the compute-bound suites into ratchet misses (zero
+  incomplete-tolerance on json/androidx/stdlib) or shard timeouts; the
+  caps only convert "failed" into "did not finish in 60 minutes".
+- Cold on 4 cores: the ReleaseSafe harness universe compiles in 270s, the
+  Debug itest+harness in 66s. Paying ~5 minutes per shard buys a 4x faster
+  run for every interpreting suite (the in-process e2e/differential/parity
+  binaries compile with the harness optimize mode too).
+
+Change: ci.yml runs `-Dharness-optimize=ReleaseSafe` (cache key
+`zig-0.16.0-safe-…`); build.zig weights are the Debug measurements ÷ 4
+(the compose plugin gate keeps 126, it already runs the ReleaseFast
+harness), e2e 26, differential 36. Packing: the gate shard ~21 min, every
+other shard ~8-10 min of suite time.
+
 ## Superseded in-flight (as of 3f3541df pushed)
 
 - **CI @ 65665357** (pre-fix): shards 0/3/4 FAIL, 1/2 CANCELLED (fail-fast), units OK.

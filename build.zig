@@ -100,9 +100,9 @@ const Itest = struct {
     /// stay on the default optimize mode.
     interprets: bool = true,
     /// Relative run cost for `-Ditest-shard` bin packing: the suite's
-    /// measured wall on the CI configuration (4 cores, Debug harness) in
-    /// tens of seconds. Re-measure a heavy suite when its shape changes so
-    /// the shards stay balanced.
+    /// measured wall on the CI configuration (4 cores, ReleaseSafe harness)
+    /// in tens of seconds. Re-measure a heavy suite when its shape changes
+    /// so the shards stay balanced.
     weight: u16 = 2,
     /// Split this suite into N run steps, each with KLIO_COMMONTEST_SHARD=i/N
     /// so a single heavy suite can spread across CI shard jobs. `weight`
@@ -119,29 +119,29 @@ const itests_files = [_]Itest{
     // parity_conformance runs inside parity_threaded_litmus now (same
     // fixture-driver shape, one binary, both fixture dirs declared there and
     // its weight folded in); the deleted entry is not a dropped suite.
-    .{ .name = "parity_corpus_pinned", .dirs = &.{ "tests/fixtures/parity_corpus", "examples/file_private_collision" }, .weight = 18 },
-    .{ .name = "parity_coroutines_realistic", .dirs = &.{"tests/fixtures/coroutine_smoke"}, .weight = 5 },
+    .{ .name = "parity_corpus_pinned", .dirs = &.{ "tests/fixtures/parity_corpus", "examples/file_private_collision" }, .weight = 4 },
+    .{ .name = "parity_coroutines_realistic", .dirs = &.{"tests/fixtures/coroutine_smoke"}, .weight = 2 },
     .{ .name = "parity_data_class_features" },
     .{ .name = "parity_dsl_operators" },
     .{ .name = "parity_exceptions_and_flow" },
-    .{ .name = "parity_extension_resolution", .weight = 4 },
+    .{ .name = "parity_extension_resolution", .weight = 2 },
     .{ .name = "parity_generics_advanced" },
     .{ .name = "parity_inheritance_dispatch" },
     .{ .name = "parity_inner_classes" },
-    .{ .name = "parity_lambdas_and_dispatch", .weight = 3 },
+    .{ .name = "parity_lambdas_and_dispatch", .weight = 2 },
     .{ .name = "parity_named_args_defaults" },
     .{ .name = "parity_nullability_deep" },
-    .{ .name = "parity_object_init", .weight = 3 },
+    .{ .name = "parity_object_init", .weight = 2 },
     .{ .name = "parity_operator_edge_cases" },
     .{ .name = "parity_properties_accessors" },
     .{ .name = "parity_sealed_when_patterns" },
     .{ .name = "parity_strings_numbers" },
-    .{ .name = "parity_stdlib_isolation", .weight = 4 },
+    .{ .name = "parity_stdlib_isolation", .weight = 2 },
     .{ .name = "parity_suspend_shapes" },
     // needs_exe: the eager-parity test spawns the harness (`run` + `dump-ir`)
     // — without it the child fell back to a stale `zig-out/bin/klio` and the
     // pins tested weeks-old lowering.
-    .{ .name = "parity_threaded_litmus", .dirs = &.{ "tests/fixtures/threaded_litmus", "tests/fixtures/conformance" }, .weight = 12, .needs_exe = true },
+    .{ .name = "parity_threaded_litmus", .dirs = &.{ "tests/fixtures/threaded_litmus", "tests/fixtures/conformance" }, .weight = 3, .needs_exe = true },
     .{ .name = "parity_type_system_shapes" },
     .{ .name = "parity_visibility_modifiers" },
     .{ .name = "explicit_backing_fields" },
@@ -151,9 +151,9 @@ const itests_files = [_]Itest{
     .{ .name = "parser_corpus", .parity_data = false, .interprets = false },
     .{ .name = "runtime_objref_threads", .parity_data = false, .interprets = false },
     .{ .name = "typeck_negative", .parity_data = false, .interprets = false, .dirs = &.{"tests/fixtures/typeck_negative"} },
-    .{ .name = "check_examples", .dirs = &.{"examples"}, .weight = 3 },
-    .{ .name = "differential", .dirs = &.{ "examples", "tests/fixtures/coroutine_smoke" }, .weight = 5 },
-    .{ .name = "fuzz_closures_suspend", .fuzz_env = true, .weight = 7 },
+    .{ .name = "check_examples", .dirs = &.{"examples"}, .weight = 2 },
+    .{ .name = "differential", .dirs = &.{ "examples", "tests/fixtures/coroutine_smoke" }, .weight = 36 },
+    .{ .name = "fuzz_closures_suspend", .fuzz_env = true, .weight = 2 },
     // End-to-end ktor gate: child `klio` + in-test HTTP server + installed packs.
     .{ .name = "ktor_client_get", .parity_data = false, .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-atomicfu",
@@ -161,7 +161,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-ktor",
-    }, .weight = 8 },
+    }, .weight = 2 },
     // Async ByteChannel gate: upstream channel write side (Slot suspension
     // protocol) through child `klio` + installed packs.
     .{ .name = "ktor_channel_async", .parity_data = false, .needs_exe = true, .dirs = &.{
@@ -169,7 +169,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-ktor",
-    }, .weight = 3 },
+    }, .weight = 2 },
     // End-to-end ktor server gate: a background child `klio` runs
     // `embeddedServer` (routing, params, headers, status, typed JSON) while
     // the test drives it as the HTTP client over real sockets.
@@ -179,7 +179,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-ktor",
-    }, .weight = 6 },
+    }, .weight = 2 },
     // Threaded stress gate for the pack concurrency primitives
     // (ConcurrentMap/Attributes computeIfAbsent once-only, the ktor locks
     // actuals, ByteChannel written from a Default worker) through child
@@ -189,7 +189,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-ktor",
-    }, .weight = 3 },
+    }, .weight = 2 },
     // Reified inline Json extension shapes through the installed pack
     // (kotlinc-verified expected output; the in-process parity harness
     // does not fold in the serialization pack).
@@ -199,18 +199,18 @@ const itests_files = [_]Itest{
     // Baked stdlib image gate: bake -> hit -> fallback -> staleness ->
     // corruption through a child `klio` against a scratch HOME, plus the
     // in-process bake/load round trip.
-    .{ .name = "stdlib_image", .needs_exe = true, .weight = 18 },
+    .{ .name = "stdlib_image", .needs_exe = true, .weight = 4 },
     // Single-executable bundle gate: `klio bundle` output runs against an
     // empty HOME byte-identically to `klio run` (argv, resources, exit
     // code, stdin, corruption refusal, inspect, determinism).
     .{ .name = "bundle_smoke", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-bundle",
-    }, .weight = 13 },
+    }, .weight = 3 },
     // Cross-target bundling gate: stub + shim resolve via KLIO_STUB_DIR
     // (no network), assembly is byte surgery, the fake-target bundle
     // boots; the offline hint and --stub override are asserted.
-    .{ .name = "bundle_cross", .needs_exe = true, .weight = 4 },
+    .{ .name = "bundle_cross", .needs_exe = true, .weight = 2 },
     // UI bundle gate: the Skia shim embeds, extracts to the per-user
     // cache on first launch, and renders the headless pixel gate
     // byte-identically to a direct run (skips without the built shim).
@@ -221,7 +221,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-androidx-collection",
         "kotlin-klio/klio-compose-runtime-engine",
         "kotlin-klio/klio-compose-ui",
-    }, .weight = 11 },
+    }, .weight = 3 },
     // Bootstrapping proof: Kotlin's own stdlib commonTest sources run through
     // a child `klio test` against the installed kotlin.test pack.
     .{ .name = "stdlib_commontest", .needs_exe = true, .dirs = &.{
@@ -229,14 +229,14 @@ const itests_files = [_]Itest{
         "kotlin/libraries/kotlin.test",
         "kotlin/libraries/stdlib/test",
         "tests/stdlib_commontest_actuals",
-    }, .weight = 66, .shards = 2 },
+    }, .weight = 16, .shards = 2 },
     // androidx.collection's own commonTest sources run through a child
     // `klio test` against the installed androidx.collection pack.
     .{ .name = "androidx_collection_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-androidx-collection",
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 248 },
+    }, .weight = 62 },
     // The upstream Compose runtime's own test suite (CompositionTests,
     // RestartTests, MovableContentTests, the snapshot suites) run through a
     // child `klio test` against the ENGINE pack with the `@Composable` lowering
@@ -253,36 +253,36 @@ const itests_files = [_]Itest{
     .{ .name = "atomicfu_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 11 },
+    }, .weight = 3 },
     .{ .name = "io_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 68 },
+    }, .weight = 17 },
     .{ .name = "datetime_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-datetime",
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 121 },
+    }, .weight = 30 },
     .{ .name = "serialization_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 12 },
+    }, .weight = 3 },
     .{ .name = "serialization_json_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 122 },
+    }, .weight = 30 },
     .{ .name = "coroutines_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 97 },
+    }, .weight = 24 },
     .{ .name = "ktor_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-ktor",
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 21 },
+    }, .weight = 5 },
     .{ .name = "compose_ui_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-compose-runtime",
         "kotlin-klio/klio-compose-runtime-engine",
@@ -297,7 +297,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
         "tests/compose_ui_commontest_actuals",
-    }, .weight = 23 },
+    }, .weight = 6 },
 };
 
 /// Read by every parity-pipeline run: the stdlib pack is built at runtime from
@@ -966,7 +966,7 @@ const ItestShards = struct {
     /// null = no sharding (every suite included).
     selected: ?std.StringHashMap(void),
 
-    const e2e_weight: u16 = 104;
+    const e2e_weight: u16 = 26;
     const bench_weight: u16 = 12;
 
     fn fromOption(b: *std.Build) ItestShards {
