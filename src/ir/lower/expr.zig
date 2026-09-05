@@ -7826,7 +7826,7 @@ fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?R
     // `MutableVector(arr, size)` inside the class body binds the internal
     // constructor, not the reified `MutableVector(size, init)` factory that
     // happens to fit the arity.
-    if (try shadowedByClass(b, callee, args)) return null;
+    if (try shadowedByClass(b, callee, args, ast_arg_names)) return null;
     const inline_call_shape = CallShape{
         .want = args.len,
         .last_is_lambda = lastArgIsLambdaOrAnon(args),
@@ -8843,7 +8843,7 @@ fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         false;
 
     // Whether a single-segment class-name call resolves to the constructor.
-    const shadowed_by_class = if (callee_is_object) false else try shadowedByClass(b, callee, args);
+    const shadowed_by_class = if (callee_is_object) false else try shadowedByClass(b, callee, args, ast_arg_names);
     var force_static_class = false;
     // A constructible same-named class competes with the function candidates.
     // Until constructors participate in the shared applicability set, the
@@ -14411,7 +14411,7 @@ fn factorySigRejectsArgs(b: *FuncBuilder, sig: []const ir.TypeRef, args: []const
     return false;
 }
 
-fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) Allocator.Error!bool {
+fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!bool {
     if (callee.* != .Path or callee.Path.segments.len != 1) return false;
     const name = callee.Path.segments[0].name;
     // A LOCAL fn of the name (declared in an enclosing body — a test's
@@ -14483,7 +14483,20 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
                 }
                 if (!p.has_default) required += 1;
             }
-            if (nargs >= required and (has_vararg or nargs <= ps.len)) return true;
+            // Inside the class's own scope the constructor is the innermost
+            // candidate, so it wins whenever the arguments fit it (kotlinc
+            // resolves the closest scope level with an applicable
+            // candidate: `Path(pathString)` inside `class Path` is the
+            // private constructor even though `fun Path(path: String)`
+            // would take the call). Only when the argument types cannot
+            // fit the constructor (`Color(0xFFFF0000)` in `Color`'s
+            // companion: a Long literal, a `ULong` parameter) does an
+            // applicable same-named function take over, deferred to the
+            // runtime choice exactly as from any other site.
+            if (nargs >= required and (has_vararg or nargs <= ps.len)) {
+                if (!ctorSigRejectsArgs(b, ps, args)) return true;
+                if (!anyFactoryApplicable(b, name, args, arg_names, callee.Path.segments[0].span.file)) return true;
+            }
         }
     }
     // Scope rule: a MEMBER of the enclosing class hierarchy is a nearer-scope
@@ -14537,29 +14550,36 @@ fn shadowedByClass(b: *FuncBuilder, callee: *const Expr, args: []const Expr) All
             canonical_cant_take = !last_vararg and nargs > f.params.len;
         }
     }
-    var any_factory_applicable = false;
+    const any_factory_applicable = anyFactoryApplicable(b, name, args, arg_names, call_file);
+    return canonical_cant_take or !any_factory_applicable;
+}
+
+/// Whether a same-named function in scope (tier <= 3) can take these
+/// arguments: the arity fits, every named argument names one of its
+/// parameters (`Color(value = …)` inside `fun Color(color: Long)` names
+/// only the constructor's parameter, so the function is out), and its
+/// declared parameter types do not definitely reject the literal argument
+/// types (what tells `Box(5)`, ctor `Box(Int)`, from the same-arity
+/// factory `fun Box(s: String)`).
+fn anyFactoryApplicable(b: *FuncBuilder, name: []const u8, args: []const Expr, arg_names: []const ?[]const u8, call_file: ir.FileId) bool {
+    const nargs = args.len;
     for (b.module.func_index.items) |entry| {
         if (!std.mem.eql(u8, entry.name, name)) continue;
         if (b.module.funcById(entry.id)) |ff| {
             if (b.module.scopeTier(ff.fqn, ff.package, name, b.self_package, call_file) > 3) continue;
+            if (!namedArgsNameParams(ff.params, arg_names)) continue;
         }
         if (b.module.decl_user_arity.get(entry.id.int())) |arity| {
             const n: u32 = @intCast(nargs);
             if (n >= arity.required and (arity.has_vararg or n <= arity.total)) {
-                // A same-arity factory whose declared parameter types
-                // definitely cannot accept the literal argument types is not
-                // applicable — the call constructs the class instead. This is
-                // what tells `Box(5)` (ctor `Box(Int)`) from the same-arity
-                // factory `fun Box(s: String)`.
                 if (b.module.decl_user_sig.get(entry.id.int())) |sig| {
                     if (factorySigRejectsArgs(b, sig, args)) continue;
                 }
-                any_factory_applicable = true;
-                break;
+                return true;
             }
         }
     }
-    return canonical_cant_take or !any_factory_applicable;
+    return false;
 }
 
 /// Whether the enclosing class scope (own members, outer-class members, or
@@ -25661,4 +25681,39 @@ fn ownCompanionNamed(b: *const FuncBuilder, cls_name: []const u8, name: []const 
     const comp = b.module.registry.companion_singletons.get(cls_name) orelse return false;
     const simple = if (std.mem.lastIndexOfScalar(u8, comp, '$')) |i| comp[i + 1 ..] else comp;
     return std.mem.eql(u8, simple, name);
+}
+
+/// Every named argument names a declared parameter (Kotlin binds named
+/// arguments by parameter name; a candidate lacking the name is not
+/// applicable).
+fn namedArgsNameParams(params: []const ir.Param, arg_names: []const ?[]const u8) bool {
+    for (arg_names) |maybe| {
+        const an = maybe orelse continue;
+        var found = false;
+        for (params) |*p| {
+            if (std.mem.eql(u8, p.name, an)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+/// Whether the primary constructor's declared parameter types definitely
+/// cannot accept the literal argument types (the constructor-side twin of
+/// `factorySigRejectsArgs`).
+fn ctorSigRejectsArgs(b: *FuncBuilder, params: []const ir.Param, args: []const Expr) bool {
+    for (args, 0..) |*a, i| {
+        if (i >= params.len) break;
+        var ak_opt = argEvidenceLitKind(b, a);
+        if (ak_opt == null) {
+            if (argDeclTypeRef(b, a)) |ty| ak_opt = paramLitKind(ty.name);
+        }
+        const ak = ak_opt orelse continue;
+        const pk = paramLitKind(params[i].ty.name) orelse continue;
+        if (ak != pk) return true;
+    }
+    return false;
 }

@@ -10,6 +10,13 @@ fun call(f: context(String, Int) (Boolean) -> Unit) {
     context("t") { with(2) { f(false) } }
     with(3) { context("u") { f(true) } }
     with(4) { context("v", 5) { f(false) } }
+    // Subjects nested in subjects: the innermost of each type wins, whether
+    // the other one sits outside (`with(3) { with("s") … }`), inside a
+    // `context(...)` scope, or inside a spliced `forEach` body.
+    with(3) { with("s") { f(true) } }
+    with("t") { with(4) { f(false) } }
+    with(5) { with("u") { context(6) { f(true) } } }
+    with(7) { listOf(1).forEach { with("v") { f(false) } } }
 }
 
 class Holder(val n: Int) {

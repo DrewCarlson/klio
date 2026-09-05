@@ -1,0 +1,17 @@
+a..c
+a
+c
+true
+true
+true
+false
+a..c
+c downTo a step 1
+a..e step 2
+[a, c, e]
+c downTo a step 1
+[A, B, C]
+xyz
+true
+true
+A|B|C

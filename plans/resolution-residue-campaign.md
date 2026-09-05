@@ -45,10 +45,28 @@ typing").
 
 Example: `examples/value_class_factory_over_ctor.kt`.
 
-- [ ] root fix in the ctor arm
-- [ ] example + `.out` + README row
+- [x] root fix (2026-09-05): two halves. `shadowedByClass`'s own-scope
+      shortcut committed to the constructor on arity alone. The first
+      cut ("defer whenever an applicable same-named function exists")
+      broke kotlinx-io's `Path` (28 `SmokeFileTest` cases in the
+      battery): inside `class Path`, `Path(pathString)` must bind the
+      PRIVATE constructor although `fun Path(path: String)` would take
+      the call — kotlinc resolves the closest scope level that has an
+      applicable candidate, and the constructor sits in the class's own
+      scope. Final rule: inside the class, the constructor wins whenever
+      the argument types fit it (`ctorSigRejectsArgs`, the constructor
+      twin of `factorySigRejectsArgs`); only when they cannot (`Color
+      (0xFFFF0000)`: Long literal, `ULong` parameter) does an applicable
+      same-named function defer the choice to the runtime, as from any
+      other site. And that probe now honours named arguments: a
+      candidate lacking a parameter of that name is out (`Color(value =
+      …)` inside `fun Color(color: Long)` names only the constructor's
+      parameter, so the statically bound self-call became a
+      construction). `CornerRadiusTest.testRadiusCopy*` (compose-ui
+      geometry) fell with the same first cut and stands again.
+- [x] example + `.out` + README row (`value_class_factory_over_ctor.kt`)
 - [ ] the compose graphics pack's `Color` initializers still resolve
-      (in-process e2e `compose_paint`, `compose_colorspace`)
+      (in-process e2e `compose_paint`, `compose_colorspace`) — running
 
 ## Task 2 — Char ranges expose Int endpoints
 
@@ -63,10 +81,16 @@ in the `CharRange` class. Check `CharProgression` (`'a'..'e' step 2`),
 
 Example: `examples/char_range_endpoints.kt`.
 
-- [ ] root fix in the char range construction / `first`/`last` kind
-- [ ] example + `.out` + README row
+- [x] root fix (2026-09-05): the kind was right all along (`first`/`last`
+      and iteration were `Char`); `Value.display` printed every endpoint
+      with `{d}`, so `..`, `step` and `downTo` forms showed codes, and the
+      `contains` builtin rejected a `Char` argument (`in` took another
+      path). Endpoints now render in the element type (Char as the
+      character, ULong unsigned — a latent `ULongRange` display defect
+      fixed in the same line); `contains` accepts a Char.
+- [x] example + `.out` + README row (`char_range_endpoints.kt`)
 - [ ] stdlib `ranges/RangeIterationTest.kt` and `RangeTest.kt` still
-      green (sweep `--filter Range`)
+      green (sweep `--filter Range`) — pending
 
 ## Task 3 — implicit context arguments through nested subjects
 
@@ -81,10 +105,13 @@ through the runtime chain. Verify the runtime chain always sees it
 answer; if a shape misses, extend `implicitReceiverOfType` to walk every
 `subject_binds` entry (already innermost-first) before falling back.
 
-- [ ] probe program with two and three nested subjects, mixed with a
-      `context(...)` scope in between; add it to
-      `examples/context_parameters_implicit_receiver.kt` if it passes,
-      as its own example if it needed a fix
+- [x] verified 2026-09-05, no fix needed: `with(3) { with("s") { f(true) } }`,
+      `with("t") { with(4) { f(false) } }`, `with(5) { with("u") {
+      context(6) { f(true) } } }` and `with(7) { listOf(1).forEach {
+      with("v") { f(false) } } }` all bind the innermost subject of each
+      type (the intermediate subject reaches the call through the runtime
+      enclosing chain). The four shapes are appended to
+      `examples/context_parameters_implicit_receiver.kt`.
 
 ## Not tasks (already settled)
 

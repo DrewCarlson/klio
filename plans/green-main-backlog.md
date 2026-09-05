@@ -62,6 +62,11 @@ when Stages 1-3 have their exit conditions met and the register's
 ## Log
 
 - 2026-09-05: opened; the owning documents carry the task detail.
+- 2026-09-05: Stage 2 landed — bare factory vs value-class constructor
+  (inside the class the constructor wins when the argument types fit;
+  named arguments must name a candidate's parameters), Char ranges
+  render and contain Chars, nested-subject context arguments verified
+  (no fix). Battery green, every suite at baseline.
 - 2026-09-05: Stage 1 landed — stdlib 2301 / coroutines 1299 ratchets
   (every other baseline already exact), `scripts/refresh-local-packs.sh`
   as gate.sh's "packs" phase ahead of the compose-ui gate, proof via the

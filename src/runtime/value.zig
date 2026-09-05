@@ -863,6 +863,24 @@ pub const CollBackingRef = objcell.ObjRef(CollBacking);
 pub const CollBackingCell = CollBackingRef.Cell;
 
 /// Distinguishes integer ranges (`IntRange`) from long/char ranges.
+/// One endpoint of a range in its element type: a Char kind writes the
+/// character, a ULong kind the unsigned value, the rest the signed value.
+pub fn writeRangeEndpoint(writer: anytype, kind: RangeKind, v: i64) !void {
+    switch (kind) {
+        .Char => {
+            var buf: [4]u8 = undefined;
+            const cp: u21 = if (v >= 0 and v <= 0x10FFFF) @intCast(v) else 0xFFFD;
+            const n = std.unicode.utf8Encode(cp, &buf) catch {
+                try writer.writeAll("\u{FFFD}");
+                return;
+            };
+            try writer.writeAll(buf[0..n]);
+        },
+        .ULong => try writer.print("{d}", .{@as(u64, @bitCast(v))}),
+        else => try writer.print("{d}", .{v}),
+    }
+}
+
 pub const RangeKind = enum {
     Int,
     Long,
@@ -3223,12 +3241,22 @@ pub const Value = union(enum) {
             .Char => |v| try writeChar(writer, v),
             .Null => try writer.writeAll("null"),
             .Range => |r| {
+                // Endpoints render in the range's element type: a Char
+                // range shows its characters (`a..c`), a ULong range its
+                // unsigned values (kotlinc's `CharProgression.toString` /
+                // `ULongProgression.toString`).
+                try writeRangeEndpoint(writer, r.kind, r.start);
                 if (r.step == 1 and !r.progression) {
-                    try writer.print("{d}..{d}", .{ r.start, r.end });
+                    try writer.writeAll("..");
+                    try writeRangeEndpoint(writer, r.kind, r.end);
                 } else if (r.step > 0) {
-                    try writer.print("{d}..{d} step {d}", .{ r.start, r.end, r.step });
+                    try writer.writeAll("..");
+                    try writeRangeEndpoint(writer, r.kind, r.end);
+                    try writer.print(" step {d}", .{r.step});
                 } else {
-                    try writer.print("{d} downTo {d} step {d}", .{ r.start, r.end, -r.step });
+                    try writer.writeAll(" downTo ");
+                    try writeRangeEndpoint(writer, r.kind, r.end);
+                    try writer.print(" step {d}", .{-r.step});
                 }
             },
             .IrClosure => |c| try writer.print("{{ir-closure#{d}}}", .{c.id}),
