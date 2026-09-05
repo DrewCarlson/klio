@@ -173,9 +173,31 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
 `super/kt4173_2.kt`; timeouts: `continue` inside `do-while` / `when` bodies
 (five) and `inline/loopWithInlinableCondition.kt`.
 
+## Task 4 record — root fixes by cluster
+
+1. **Kotlin 2.4 destructuring forms** (2026-09-05): the positional short
+   form `[a, b]` and the name-based full form `(val a, var n: T = prop)` in
+   declarations (the full form opens the statement with `(`), `for`
+   loops, and lambda parameters. Parser: one entry grammar
+   (`control.parseDestructEntries`) behind all three sites; AST: `by_name`
+   + `sources` on `DestructuringDecl` and `For`; lowering: name-based
+   entries read their property with `GetField`, positional ones keep
+   `componentN`; typeck skips the `componentN` operator check for the
+   name-based form. Root cause found alongside: a destructured `var` was
+   bound as a plain register, so `p += 1` dispatched `plusAssign` on an
+   Int — the old `var (p, q)` form failed the same way; destructured names
+   now bind like `var x = …` (home slot, `markMutable`, a shared cell when
+   captured). Census 5,246 → 5,409 passed, 1,105 → 942 failed, 20
+   incomplete unchanged (two stack-overflow crashes crossed the cap under
+   load and were counted as timeouts). Example
+   `examples/destructuring_forms.kt`. Not modeled yet: per-entry
+   mutability in the full form (one `var` entry makes the whole group
+   mutable).
+
 ## Log
 
 - 2026-09-05: opened.
 - 2026-09-05: Task 1 populated; Task 2 runner written (`box_support.zig`,
   `box_conformance.zig`, `klio-census box`); Task 3 first census recorded
-  above and the ratchet set.
+  above and the ratchet set; battery green with the suite (948 s).
+- 2026-09-05: Task 4 #1 destructuring forms landed: 5409 / 942.

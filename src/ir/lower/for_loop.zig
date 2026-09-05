@@ -20,10 +20,12 @@ const lowerExpr = expr.lowerExpr;
 pub fn lowerFor(
     b: *FuncBuilder,
     vars: []const ast.Ident,
+    by_name: bool,
+    sources: []const ast.Ident,
     iter: *const Expr,
     body: *const Expr,
 ) Allocator.Error!Reg {
-    return lowerForLabeled(b, vars, iter, body, null);
+    return lowerForLabeled(b, vars, by_name, sources, iter, body, null);
 }
 
 
@@ -34,6 +36,8 @@ fn countedEnabled() bool {
 pub fn lowerForLabeled(
     b: *FuncBuilder,
     vars: []const ast.Ident,
+    by_name: bool,
+    sources: []const ast.Ident,
     iter: *const Expr,
     body: *const Expr,
     label: ?[]const u8,
@@ -465,6 +469,16 @@ pub fn lowerForLabeled(
             });
         } else if (std.c.getenv("KLIO_FORVAR_TRACE") != null) {
             std.debug.print("[forvar] {s} elem=null iter_tag={s} fn={s} splice={s}\n", .{ vars[0].name, @tagName(std.meta.activeTag(iter.*)), build.currentRealFn() orelse "-", b.spliceRecvTy() orelse "-" });
+        }
+    } else if (by_name) {
+        // `for ((val k, val v) in xs)`: each name reads its property off the
+        // element.
+        for (vars, 0..) |v, i| {
+            if (std.mem.eql(u8, v.name, "_")) continue;
+            const dst = b.allocReg();
+            const field = try b.module.internConst(b.allocator, .{ .String = sources[i].name });
+            try b.push(.{ .GetField = .{ .dst = dst, .receiver = next_reg, .field = field } });
+            try b.bind(v.name, dst);
         }
     } else {
         // Each destructured name is bound to the element's `componentN()`, so

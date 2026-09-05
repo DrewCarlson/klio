@@ -139,9 +139,11 @@ pub fn checkStmt(self: *Checker, stmt: *const Stmt, expected: ?*const Type) Allo
             const init_cls = self.expr_class.get(d.init.span());
             for (d.names, 0..) |*n, idx| {
                 if (std.mem.eql(u8, n.name, "_")) continue;
-                const comp = try std.fmt.allocPrint(self.allocator, "component{d}", .{idx + 1});
-                defer self.allocator.free(comp);
-                try expr_calls.checkUserOperatorKeyword(self, init_cls, comp, n.span);
+                if (!d.by_name) {
+                    const comp = try std.fmt.allocPrint(self.allocator, "component{d}", .{idx + 1});
+                    defer self.allocator.free(comp);
+                    try expr_calls.checkUserOperatorKeyword(self, init_cls, comp, n.span);
+                }
                 try narrowing.currentFrame(self).bindings.put(n.name, .{
                     .ty = .Unresolved,
                     .mutable = d.mutable,

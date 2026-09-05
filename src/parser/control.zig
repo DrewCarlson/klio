@@ -19,6 +19,7 @@ const AssignOp = ast.AssignOp;
 const Block = ast.Block;
 const Catch = ast.Catch;
 const Expr = ast.Expr;
+const TokenKind = @import("lexer").TokenKind;
 const Ident = ast.Ident;
 const Stmt = ast.Stmt;
 const WhenBinding = ast.WhenBinding;
@@ -293,6 +294,75 @@ pub fn parseDoWhile(p: *Parser) ?Expr {
     } };
 }
 
+pub const DestructEntries = struct {
+    names: []Ident,
+    /// The property each name reads in the name-based form; empty otherwise.
+    sources: []Ident,
+    by_name: bool,
+    /// Any entry declared `var` (the name-based form declares per entry).
+    any_var: bool,
+};
+
+/// The entries of a destructuring group after its opener, up to and
+/// including `close`: positional `a, b: T, _` (each name reads
+/// `componentN`; inside `[ ]` an entry may also carry `val`/`var`), or the
+/// name-based form `val a, var n: T = prop` inside `( )`, where each name
+/// reads the property it names, or the one written after `=`.
+pub fn parseDestructEntries(p: *Parser, close: TokenKind, positional: bool, what: []const u8) ?DestructEntries {
+    var names: std.ArrayList(Ident) = .empty;
+    var sources: std.ArrayList(Ident) = .empty;
+    var by_name = false;
+    var any_var = false;
+    while (true) {
+        support.skipNl(p);
+        if (std.meta.activeTag(support.peekKind(p).*) == std.meta.activeTag(close)) break;
+        _ = parseAnnotations(p);
+        if (std.meta.activeTag(support.peekKind(p).*) == .Keyword) {
+            const kw = support.peekKind(p).Keyword;
+            if (kw == .Val or kw == .Var) {
+                _ = support.bump(p);
+                if (kw == .Var) any_var = true;
+                if (!positional) by_name = true;
+            }
+        }
+        const id_span = support.currentSpan(p);
+        const id_text = support.text(p, id_span);
+        const id: Ident = if (std.mem.eql(u8, id_text, "_") and std.meta.activeTag(support.peekKind(p).*) == .Ident) blk: {
+            _ = support.bump(p);
+            break :blk Ident{ .name = "_", .span = id_span };
+        } else (support.parseIdent(p, what) orelse return null);
+        if (std.meta.activeTag(support.peekKind(p).*) == .Colon) {
+            _ = support.bump(p);
+            _ = parseType(p);
+        }
+        var source = id;
+        if (std.meta.activeTag(support.peekKind(p).*) == .Eq) {
+            if (!by_name) {
+                _ = support.expect(p, close, "`,` or the closing bracket (renaming needs the name-based form `(val n = prop)`)") orelse return null;
+                return null;
+            }
+            _ = support.bump(p);
+            support.skipNl(p);
+            source = support.parseIdent(p, "property name") orelse return null;
+        }
+        names.append(p.allocator, id) catch @panic("OOM in parser");
+        sources.append(p.allocator, source) catch @panic("OOM in parser");
+        support.skipNl(p);
+        if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
+            _ = support.bump(p);
+            continue;
+        }
+        break;
+    }
+    _ = support.expect(p, close, if (std.meta.activeTag(close) == .RBracket) "`]`" else "`)`") orelse return null;
+    return .{
+        .names = names.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
+        .sources = sources.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
+        .by_name = by_name,
+        .any_var = any_var,
+    };
+}
+
 pub fn parseFor(p: *Parser) ?Expr {
     const kw = support.bump(p);
     _ = support.expect(p, .LParen, "`(`") orelse return null;
@@ -301,36 +371,23 @@ pub fn parseFor(p: *Parser) ?Expr {
     // Annotations on the iteration variable are accepted and consumed
     // syntactically; no semantics yet.
     _ = parseAnnotations(p);
-    // Destructuring: `for ((a, b) in iter)`. Plain: `for (x in iter)`.
+    // Destructuring: `for ((a, b) in iter)`, `for ([a, b] in iter)`, or the
+    // name-based `for ((val k, val v) in iter)`. Plain: `for (x in iter)`.
     var vars: []Ident = undefined;
-    if (std.meta.activeTag(support.peekKind(p).*) == .LParen) {
+    var for_by_name = false;
+    var var_sources: []Ident = &.{};
+    const opener = std.meta.activeTag(support.peekKind(p).*);
+    if (opener == .LParen or opener == .LBracket) {
         _ = support.bump(p);
-        var names: std.ArrayList(Ident) = .empty;
-        while (true) {
-            support.skipNl(p);
-            if (std.meta.activeTag(support.peekKind(p).*) == .RParen) {
-                break;
-            }
-            // Per-component annotations + optional type ascription.
-            _ = parseAnnotations(p);
-            const id = support.parseIdent(p, "destructured loop variable") orelse break;
-            // Type ascription on individual component is consumed and
-            // discarded — the AST currently models one type slot for the
-            // whole destructuring binding.
-            if (std.meta.activeTag(support.peekKind(p).*) == .Colon) {
-                _ = support.bump(p);
-                _ = parseType(p);
-            }
-            names.append(p.allocator, id) catch @panic("OOM in parser");
-            support.skipNl(p);
-            if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
-                _ = support.bump(p);
-            } else {
-                break;
-            }
-        }
-        _ = support.expect(p, .RParen, "`)`") orelse return null;
-        vars = names.toOwnedSlice(p.allocator) catch @panic("OOM in parser");
+        const entries = parseDestructEntries(
+            p,
+            if (opener == .LBracket) .RBracket else .RParen,
+            opener == .LBracket,
+            "destructured loop variable",
+        ) orelse return null;
+        vars = entries.names;
+        for_by_name = entries.by_name;
+        var_sources = entries.sources;
     } else {
         const id = support.parseIdent(p, "loop variable") orelse return null;
         vars = singleIdent(p, id);
@@ -352,6 +409,8 @@ pub fn parseFor(p: *Parser) ?Expr {
     const body = parseControlStructureBody(p) orelse return null;
     return Expr{ .For = .{
         .vars = vars,
+        .by_name = for_by_name,
+        .var_sources = var_sources,
         .var_ty = var_ty,
         .iter = box(p, iter),
         .body = box(p, body),
@@ -894,7 +953,7 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
     // `(ident (: Type)?, …)` destructured param OR
     // `ident (: Type)?, ident (: Type)?, … ->`
     const at_param_start = switch (support.peekKind(p).*) {
-        .Ident, .LParen => true,
+        .Ident, .LParen, .LBracket => true,
         else => false,
     };
     if (at_param_start) {
@@ -903,6 +962,8 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
         const Pending = struct {
             idx: usize,
             names: []Ident,
+            sources: []Ident,
+            by_name: bool,
             span: Span,
         };
         var pending_dest: std.ArrayList(Pending) = .empty;
@@ -923,53 +984,28 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
                     }
                     local_tys.append(p.allocator, pty) catch @panic("OOM in parser");
                 },
-                .LParen => {
+                .LParen, .LBracket => {
                     const lparen = support.bump(p);
-                    var names: std.ArrayList(Ident) = .empty;
-                    while (true) {
-                        support.skipNl(p);
-                        if (std.meta.activeTag(support.peekKind(p).*) == .RParen) {
-                            break;
-                        }
-                        const id_span = support.currentSpan(p);
-                        const id_text = support.text(p, id_span);
-                        const id: Ident = if (std.mem.eql(u8, id_text, "_") and
-                            std.meta.activeTag(support.peekKind(p).*) == .Ident)
-                        blk: {
-                            _ = support.bump(p);
-                            break :blk Ident{
-                                .name = "_",
-                                .span = id_span,
-                            };
-                        } else if (support.parseIdent(p, "destructured lambda param")) |id|
-                            id
-                        else
-                            break;
-                        // Optional per-slot type annotation — recorded by the
-                        // parser but not yet typeck-enforced.
-                        if (std.meta.activeTag(support.peekKind(p).*) == .Colon) {
-                            _ = support.bump(p);
-                            _ = parseType(p);
-                        }
-                        names.append(p.allocator, id) catch @panic("OOM in parser");
-                        support.skipNl(p);
-                        if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
-                            _ = support.bump(p);
-                            continue;
-                        }
-                        break;
-                    }
-                    const rparen = support.expect(p, .RParen, "`)`") orelse {
+                    const bracket = std.meta.activeTag(lparen.kind) == .LBracket;
+                    const entries = parseDestructEntries(
+                        p,
+                        if (bracket) .RBracket else .RParen,
+                        bracket,
+                        "destructured lambda param",
+                    ) orelse {
                         p.pos = save;
                         return empty;
                     };
+                    const rparen = p.tokens[p.pos - 1];
                     const sp = lparen.span.join(rparen.span);
                     const outer = std.fmt.allocPrint(p.allocator, "$$dest_{d}", .{local.items.len}) catch @panic("OOM in parser");
                     local.append(p.allocator, .{ .name = outer, .span = sp }) catch @panic("OOM in parser");
                     local_tys.append(p.allocator, null) catch @panic("OOM in parser");
                     pending_dest.append(p.allocator, .{
                         .idx = local.items.len - 1,
-                        .names = names.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
+                        .names = entries.names,
+                        .sources = entries.sources,
+                        .by_name = entries.by_name,
                         .span = sp,
                     }) catch @panic("OOM in parser");
                     support.skipNl(p);
@@ -997,6 +1033,8 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
                 dest_stmts.append(p.allocator, .{ .DestructuringDecl = .{
                     .mutable = false,
                     .names = pd.names,
+                    .by_name = pd.by_name,
+                    .sources = pd.sources,
                     .init = init,
                     .span = pd.span,
                 } }) catch @panic("OOM in parser");
