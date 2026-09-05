@@ -30,9 +30,10 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// root-caused record). First census 2026-09-05 (build-2.4.10-RC corpus,
 /// ReleaseSafe harness): 5246 passed, 1105 failed, 20 did not complete of
 /// 6371 selected, 980 excluded by directive — `plans/kotlinc-box-conformance.md`.
-/// Kotlin 2.4 destructuring forms: 5409 / 942.
-pub const BASELINE: usize = 5409;
-pub const MAX_FAILED: usize = 942;
+/// Kotlin 2.4 destructuring forms: 5409 / 942. Explicit primitive
+/// `rangeTo` + invoked lambda arguments: 5440 / 911.
+pub const BASELINE: usize = 5440;
+pub const MAX_FAILED: usize = 911;
 
 /// Directives that bind a test to a framework feature klio has no
 /// counterpart for: a backend restriction, a second module, reflection,

@@ -356,6 +356,14 @@ test "destructuring: a renamed entry needs the name-based form" {
     try testing.expect(out.parser.diagnostics.hasErrors());
 }
 
+test "a lambda value argument takes postfix operators" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(), "fun f() { test(b = { r += \"2\"; \"b\" }(), a = { \"a\" }().length) }");
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+}
+
 test "parses_hello_world" {
     try skipIfStubbed();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
