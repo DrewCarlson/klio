@@ -9,10 +9,11 @@ d0d1541d, every census at baseline, every compute floor classified).
 
 ## Stage 1 — the battery is the whole gate (`verification-speed-plan.md`)
 
-1. Fold the stdlib sweep and the gate-env example corpus check into
-   `scripts/stack.sh`; make `corpus_check.py` refuse the shared data home
-   by default. Exit: one `stack.sh` run is the whole local gate, its wall
-   recorded (977 s before).
+1. Fold the stdlib sweep into `scripts/stack.sh` (the example corpus was
+   already there as `itest-check_examples`, and the litmus runs last);
+   make `corpus_check.py` refuse the shared data home by default. Exit: one
+   `stack.sh` run is the whole local gate, its wall recorded (977 s
+   before).
 
 ## Stage 2 — kotlinc box-test conformance (`kotlinc-box-conformance.md`)
 
@@ -54,3 +55,8 @@ moves on.
 ## Log
 
 - 2026-09-05: opened; the owning documents carry the task detail.
+- 2026-09-05: Stage 1 landed — `stack.sh` runs the stdlib sweep after the
+  census waves and scrapes its zero-failure line into the verdict;
+  `corpus_check.py` refuses an unset or shared `KLIO_HOME` unless
+  `--allow-shared-home`; `quick-gate.sh` passes the local home. Battery
+  728 s, every suite at baseline, sweep 117/0.

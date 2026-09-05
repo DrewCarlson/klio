@@ -76,8 +76,19 @@ def main():
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--jobs", type=int, default=min(12, os.cpu_count() or 1))
     ap.add_argument("--list-fail", action="store_true")
+    ap.add_argument("--allow-shared-home", action="store_true",
+                    help="run against the shared ~/.klio data home (its installed packs shadow the tree)")
     ap.add_argument("pattern", nargs="?", default="examples/*.kt")
     args = ap.parse_args()
+    home = os.environ.get("KLIO_HOME")
+    shared = os.path.expanduser("~/.klio")
+    if not args.allow_shared_home and (not home or os.path.realpath(home) == os.path.realpath(shared)):
+        print("corpus_check: KLIO_HOME is unset or the shared ~/.klio; its installed packs shadow the tree",
+              file=sys.stderr)
+        print("  run: scripts/refresh-local-packs.sh && KLIO_HOME=$PWD/.klio-local python3 scripts/corpus_check.py ...",
+              file=sys.stderr)
+        print("  or pass --allow-shared-home to use ~/.klio on purpose", file=sys.stderr)
+        return 2
 
     files = sorted(glob.glob(os.path.join(ROOT, args.pattern)))
     if not files:

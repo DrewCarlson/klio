@@ -83,6 +83,17 @@ points:
 - `zig build itest-stdlib_commontest` — the canonical ratcheted
   suite (`src/itests/stdlib_commontest.zig` enforces a minimum pass
   count that only goes up).
+- `scripts/stack.sh` — the full local battery, run once per stage: the
+  leaf-pack build, the compose plugin gate on its own L3 domain, ten library
+  censuses in two waves plus `itest-check_examples`, the stdlib commontest
+  sweep (117 upstream files, scraped for `0 failures`), the compose-ui gate,
+  and the threaded litmus last. `STACK_NO_CACHE=1` forces a run on an
+  unchanged tree.
+- `scripts/corpus_check.py` — every `examples/*.kt` through the CLI route
+  against `tests/corpus/expected/`. It refuses to run against the shared
+  `~/.klio` data home (its installed packs shadow the tree): run
+  `scripts/refresh-local-packs.sh` and pass `KLIO_HOME=$PWD/.klio-local`, or
+  `--allow-shared-home` on purpose. `--list-fail` names the failures.
 - `scripts/commontest-sweep.py BIN` — the iteration driver: per-file
   pass counts and failed test names for any klio binary.
   `--filter <File>` runs one file (~16 s), `--passes` prints

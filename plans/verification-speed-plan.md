@@ -202,26 +202,26 @@ the "packs" phase right before "corpus". Parent plan:
       failing it (the in-process e2e has no feature gating and passed).
       Directive added; the rest of the corpus is green with fresh packs.
 
-## Root cause opened 2026-09-05 — the battery is not the whole gate
+## Root cause opened 2026-09-05 — the battery had no stdlib coverage
 
 `scripts/stack.sh` (the "full battery" every stage runs once) executes the
-leaf-pack build, the compose plugin gate, ten library censuses, and the
-compose-ui gate. It runs NO stdlib sweep, NO example corpus check, and no
-litmus/e2e suites (its header claims litmus runs last; the 2026-09-05 log
-shows none). The Stage 3 push of `green-main-backlog.md` needed both the
-stdlib sweep (`commontest-sweep.py`, 117 files) and the gate-env corpus
-check by hand, and a bare `corpus_check.py` invocation reported 31 fake
-failures because it read the shared `~/.klio` packs instead of
-`.klio-local` (the trap `census-state` recorded).
+leaf-pack build, the compose plugin gate, ten library censuses,
+`itest-check_examples` (the example corpus, lowered from the tree), the
+compose-ui gate, and the threaded litmus last. It ran NO stdlib coverage:
+`stdlib_commontest` is a CI shard suite, not a census in the battery, so a
+tree could show a green battery while a stdlib test regressed. The Stage 3
+push of `green-main-backlog.md` needed the stdlib sweep by hand, and a bare
+`corpus_check.py` invocation reported 31 fake failures because it read the
+shared `~/.klio` packs instead of `.klio-local` (the trap `census-state`
+recorded).
 
-Task (parent: `conformance-backlog.md` Stage 1):
-- fold the stdlib sweep and the corpus check into `stack.sh`, the corpus
-  under `KLIO_HOME=$ROOT/.klio-local` after `refresh-local-packs.sh`, both
-  overlapping the compose gate on the non-vpd domain like the censuses;
-- make `corpus_check.py` refuse a shared data home unless told otherwise
-  (`--allow-shared-home`), so the trap cannot recur;
-- print one final line per phase and a battery verdict that includes them;
-- record the new battery wall here (977 s before).
-Exit: one `stack.sh` run is the whole local gate; a tree that fails the
-stdlib sweep or the corpus cannot show a green battery.
-
+Landed (parent: `conformance-backlog.md` Stage 1):
+- `stack.sh` runs `commontest-sweep.py` (117 stdlib files, per-directory
+  batched) after the census waves on the non-vpd domain and scrapes its
+  `== run: N files, 0 failures` line into the verdict;
+- `corpus_check.py` refuses an unset or shared `KLIO_HOME` (exit 2 with the
+  `refresh-local-packs.sh` + `KLIO_HOME=$PWD/.klio-local` recipe) unless
+  `--allow-shared-home`; `quick-gate.sh` passes the local home.
+Battery wall: 977 s before; 728 s after with the sweep folded in (118 s,
+fully overlapped by the compose gate; the drop is warm caches, not the
+sweep). Every suite at baseline, `== run: 117 files, 0 failures`.
