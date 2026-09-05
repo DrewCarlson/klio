@@ -591,7 +591,23 @@ fn instantiateEnumEntryBodies(self: *Vm, module: *const Module, sink: Output) Al
             for (module.classes.items[enum_cid.int()].primary_params) |prm| if (prm.is_vararg) break :blk true;
             break :blk false;
         };
-        var replaced: ?[]runtime.ClassDef.EnumEntry = null;
+        // The rebuilt entries are installed on the class before any is
+        // constructed: an entry's construction runs user code (safe points),
+        // and an instance held only in a local array between iterations is
+        // unreachable to the collector, which swept the first entry while
+        // the second was being built and left its fields dangling.
+        const replaced: []runtime.ClassDef.EnumEntry = blk: {
+            const dg = cdef.borrow();
+            defer dg.deinit();
+            const copy = try pa.alloc(runtime.ClassDef.EnumEntry, n_entries);
+            @memcpy(copy, dg.get().enum_entries);
+            break :blk copy;
+        };
+        {
+            const dg = cdef.borrowMut();
+            dg.get().enum_entries = replaced;
+            dg.deinit();
+        }
         for (0..n_entries) |i| {
             var entry_name: []const u8 = undefined;
             var current_class: []const u8 = "";
@@ -637,9 +653,17 @@ fn instantiateEnumEntryBodies(self: *Vm, module: *const Module, sink: Output) Al
                 }
             }
             const target_cid = body_cid orelse enum_cid;
+            if (runtime.envOnce("KLIO_ENUM_INIT_TRACE") != null) std.debug.print("[enum-init] build {s}.{s} via {s} (body={}, secondary={}, nargs={d})\n", .{ enum_fqn, entry_name, module.classes.items[target_cid.int()].fqn, body_cid != null, has_secondary, ctor_args.items.len });
+            // The name string and the constructor arguments are pinned until
+            // the instance owns them: the header thunks run user code first.
+            const preset_name: Value = .{ .String = try runtime.strInit(self.allocator, entry_name) };
+            const entry_keepalive = runtime.keepaliveMark();
+            defer runtime.keepaliveRestore(entry_keepalive);
+            runtime.keepalivePush(preset_name);
+            runtime.keepalivePushSlice(ctor_args.items);
             host_instances.setEnumEntryPreset(.{
                 .class_fqn = module.classes.items[target_cid.int()].fqn,
-                .name = .{ .String = try runtime.strInit(pa, entry_name) },
+                .name = preset_name,
                 .ordinal = Value.newInt(@intCast(i)),
             });
             const made = switch (try host_instances.newInstance(&host, self.allocator, target_cid, ctor_args.items, null)) {
@@ -652,23 +676,14 @@ fn instantiateEnumEntryBodies(self: *Vm, module: *const Module, sink: Output) Al
             host_instances.setEnumEntryPreset(null);
             if (made != .Instance) continue;
             if (body_cid == null) {
+                // The marker is appended through the instance's own allocator:
+                // a field list grown with the patch allocator is freed through
+                // the slab at sweep.
                 const g = made.Instance.borrowMut();
                 defer g.deinit();
-                try g.get().define(pa, "__enum_entry_built__", .{ .Bool = true });
+                try g.get().define(self.allocator, "__enum_entry_built__", .{ .Bool = true });
             }
-            if (replaced == null) {
-                const dg = cdef.borrow();
-                defer dg.deinit();
-                const copy = try pa.alloc(runtime.ClassDef.EnumEntry, n_entries);
-                @memcpy(copy, dg.get().enum_entries);
-                replaced = copy;
-            }
-            replaced.?[i].value = made;
-        }
-        if (replaced) |r| {
-            const dg = cdef.borrowMut();
-            dg.get().enum_entries = r;
-            dg.deinit();
+            replaced[i].value = made;
         }
     }
     return null;
@@ -780,7 +795,10 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                 // property is past its turn, so later reads inside this
                 // window drive it rather than defaulting it.
                 .err => |e| switch (e) {
-                    .Unbound, .Unimplemented, .CalleeFailed => vmhost.host_impl.noteStartupDeferred(nf.name),
+                    .Unbound, .Unimplemented, .CalleeFailed => {
+                        if (runtime.envOnce("KLIO_TOPPROP_TRACE") != null) std.debug.print("[topprop-defer] {s}: {s}\n", .{ nf.name, @tagName(e) });
+                        vmhost.host_impl.noteStartupDeferred(nf.name);
+                    },
                     else => return vmErrorFromEval(self.allocator, e),
                 },
             }
@@ -913,6 +931,18 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
         }
         const inst = entry_inst orelse continue;
         defer inst.deinit();
+        // An entry rebuilt through the ordinary instantiation path (a body
+        // subclass, a secondary or vararg constructor) bound its constructor
+        // fields there; patching those in again would define page-allocated
+        // values into a slab-owned instance.
+        {
+            const g = inst.borrow();
+            defer g.deinit();
+            const icg = g.get().class.borrow();
+            const built_class = icg.get().is_enum and icg.get().enum_entries.len == 0;
+            icg.deinit();
+            if (built_class or g.get().get("__enum_entry_built__") != null) continue;
+        }
         // A cached base shares these instances across per-program Vms, and
         // the ctor args are per-class constants: once one Vm has patched the
         // fields, re-evaluating them would only swap equal values — and the

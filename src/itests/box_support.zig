@@ -36,9 +36,10 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// name-based short form: 5477 / 874. Corpus syntax gaps and contextual
 /// anonymous functions: 5506 / 845. Tailrec self-calls in tail position
 /// in every form: 5530 / 822. Bare accessors, enum secondary
-/// constructors, vararg enum entries: 5542 / 810.
-pub const BASELINE: usize = 5542;
-pub const MAX_FAILED: usize = 810;
+/// constructors, vararg enum entries: 5542 / 810. Parent secondary
+/// constructors from subclass headers, enum overrides virtual: 5553 / 799.
+pub const BASELINE: usize = 5553;
+pub const MAX_FAILED: usize = 799;
 
 /// Directives that bind a test to a framework feature klio has no
 /// counterpart for: a backend restriction, a second module, reflection,

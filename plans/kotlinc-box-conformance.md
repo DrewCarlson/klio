@@ -304,16 +304,80 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    `examples/bare_accessors.kt`, `examples/enum_secondary_constructors.kt`.
    Verdict: `companionBlocksAndExtensions/*` (3 tests) use `companion { }`
    blocks, not Kotlin syntax klio targets.
-10. **Secondary constructors in class hierarchies** (next): 12 failing
-   tests in `secondaryConstructors/` plus `enums.kt`'s body entry — a
-   subclass header `class C : A(5)` binds its arguments to the parent's
-   primary parameters and never selects a parent secondary constructor
-   (`runSuperCtorChain` has the selection, delegation, and body logic but
-   only the `super(…)` path reaches it); defaults and named arguments
-   through `this(…)`; `super("0", *x, "4")` spread arguments; local and
-   inner classes with secondary constructors.
+10. **Secondary constructors in class hierarchies** (2026-09-05): a
+   subclass header `class C : A(5)` bound its arguments to the parent's
+   primary parameters whenever the count matched and never ran a parent
+   secondary constructor's body; `runSuperCtorChain` had the selection,
+   delegation, and body logic but only the `super(…)` path reached it. The
+   header chain now resolves a parent's arguments through
+   `expandParentSecondaryThisArgs`: the constructor the arguments fit by
+   count, defaults, and argument type (the secondary wins a same-count tie
+   only when its parameter types fit strictly better), named arguments
+   bound by parameter with gaps filled from defaults in order, `this(…)`
+   delegation feeding the primary, `super(…)` feeding the grandparent, and
+   each chosen body run after that class's initializers in the parents-first
+   pass. Also: a class without a primary constructor dispatches `A()` to a
+   defaulted secondary constructor; `super("0", *x, "4")` parses; an enum
+   class is extensible for dispatch, so `open`/`abstract` members overridden
+   in entry bodies dispatch virtually (`is_enum` on the IR class).
+   `secondaryConstructors/` 18 → 22 of 30, `enum/` 66 → 70 of 95; census
+   5,553 / 799 / 19. Example `examples/parent_secondary_constructors.kt`. Verdicts for the rest of
+   the directory: `varargs.kt` (a vararg secondary constructor needs arity
+   packing in the chooser), `superCallSecondary.kt` (a subclass secondary
+   constructor's `super(…)` runs after the shell's initializers, so the
+   parent body follows the subclass's init blocks), `localClasses.kt`
+   (a local class's init blocks are not registered for its secondary
+   constructor path), `innerClasses*.kt` (an inner class's secondary
+   constructor body cannot see the outer instance), `callFromLocalSubClass`
+   / `clashingDefaultConstructors` (a local subclass loses the field its
+   parent secondary constructor sets), `fieldInitializerOptimization.kt`.
 
-## Log
+11. **CI red after #10 (2026-09-06), three mechanisms**: (a) the compose
+   examples failed with `unresolved global globalSnapshot`: the header
+   expansion of #10 let `Snapshot`'s `@Deprecated(level = HIDDEN)`
+   secondary `(Int, SnapshotIdSet)` win over the primary because the
+   runtime `snapshotId` arrives Int-tagged and scored better than the
+   `Long` head; the HIDDEN constructor's delegation re-entered the file's
+   `<clinit>`, the initializer deferred silently (`Unbound`), and the reader
+   missed. kotlinc never resolves a HIDDEN/low-priority constructor: header
+   resolution now considers only ordinary secondaries, and an integral
+   value scores equally against any integral head when a same-count
+   secondary is weighed against the primary. `KLIO_TOPPROP_TRACE=1` now
+   names a deferred top-level initializer and its error tag. (b) the e2e
+   in-process route panicked in `sweepFull → freeSmall` on
+   `enum_secondary_constructors`: entries rebuilt through `newInstance` are
+   slab-owned, and the VM-start constructor-arg patch then defined
+   page-allocated strings into them; the patch now skips rebuilt entries and
+   the name preset uses the VM allocator. (c) the compose plugin gate's
+   GC-stress preflight crashed in the marker: `keepalivePushSlice` stores the
+   slice by reference and the expansion pinned lists it then freed; pins
+   now cover only the final argument list. Bisect recipe: a worktree at the
+   last green commit with `kotlin`/`kotlin-klio` symlinked, `zig build
+   klio-harness`, the example on both binaries; then revert one hunk at a
+   time in the worktree. (d) A fourth mechanism sat behind (b): the
+   rebuilt entries were held only in a local array until the loop ended,
+   so an entry's instance was unreachable to the collector while the next
+   entry's header thunks ran user code; under `KLIO_GC_STRESS=1` the first
+   entry's fields were swept and their slots reused (`S.A.sym` read the
+   next entry's string). The rebuilt entry array is installed on the class
+   before any entry is constructed, and the name preset and constructor
+   arguments are pinned until the instance owns them. Bisect recipe for a
+   GC hole: the Debug harness with `KLIO_GC_STRESS=1` on a five-line enum,
+   then `KLIO_GC_GEN=0` / `KLIO_GC_MINOR_STOP=0` to tell a remembered-set
+   hole (vanishes) from an unrooted value (persists). (e) The in-process
+   e2e route still panicked in the program's boundary collection: the
+   "rebuilt" marker field was defined through the patch allocator, which
+   grew the instance's field list with page memory that the sweep later
+   freed through the slab (`freeSmall` on a foreign block reads the
+   0xAA-filled header as a size-class index). A field list is grown only
+   through the instance's own allocator. The CLI never sweeps a
+   still-referenced entry, so only a multi-program process showed it
+   (`KLIO_E2E_FILTER=enum_` on the cached test binary reproduces in 30 s).
+   Verified: e2e CI-shape green, GC-stress preflight green, every box
+   example under `KLIO_GC_STRESS=1` on the Debug harness, census unchanged
+   at 5,553 / 799 / 19, sweep 117/0, unit green. Landed 45b99090.
+
+# Log
 
 - 2026-09-05: opened.
 - 2026-09-05: Task 1 populated; Task 2 runner written (`box_support.zig`,
@@ -330,3 +394,5 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
 - 2026-09-05: Task 4 #8 tailrec self-calls landed: 5530 / 822.
 - 2026-09-05: Task 4 #9 bare accessors + enum secondary constructors
   landed: 5542 / 810.
+- 2026-09-05: Task 4 #10 parent secondary constructors + enum virtual
+  dispatch landed: 5553 / 799.
