@@ -11123,16 +11123,18 @@ pub fn boundRefFile(callee: *const Value) ?ir.FileId {
     return ir.FileId.from(@intCast(v.Int));
 }
 
-fn memberExtVisible(self: *VmHost, mod: *const Module, fid: FuncId, visible_owners: *const std.StringHashMap(void)) bool {
+fn memberExtVisible(self: *VmHost, mod: *const Module, fid: FuncId, visible_owners: *const OwnerSet) bool {
     if (!isMemberExt(mod, fid)) return true;
     const owner = mod.registry.member_ext_owner_class.get(fid) orelse return true;
     if (nuTraceEnv()) |want| {
         if (funcAt(mod, fid)) |f| {
             if (std.mem.eql(u8, f.name, want) or std.mem.eql(u8, want, "1")) {
                 std.debug.print("[mev] fid={d} owner={s} vis={}\n", .{ fid.int(), owner, visible_owners.contains(owner) });
-                var it = visible_owners.keyIterator();
-                std.debug.print("[mev] set:", .{});
-                while (it.next()) |k| std.debug.print(" {s}", .{k.*});
+                std.debug.print("[mev] receivers:", .{});
+                for (visible_owners.sig[0..visible_owners.n]) |p| {
+                    const cd: *const ClassDef = @ptrFromInt(p);
+                    std.debug.print(" {s}", .{cd.fqn});
+                }
                 std.debug.print("\n", .{});
             }
         }
@@ -11515,8 +11517,125 @@ fn memberExtOverrideLookup(self: *VmHost, receiver: *const Value, name: []const 
 
 /// Set of class names (with the full supertype closure — superclasses AND
 /// interfaces) reachable through the enclosing-this chain, including each
-/// instance's `outer` links.
-fn enclosingOwnerSet(self: *VmHost, allocator: Allocator) Allocator.Error!std.StringHashMap(void) {
+/// instance's `outer` links, and through the executing frames' own
+/// receivers, which the dynamic chain does not carry (an extension body
+/// binds its receiver in `params[0]`, never by pushing it; inside
+/// `ColumnMeasurePolicy.measure(MeasureScope)` the `MeasureScope` is a
+/// `Density`, which is what makes `Dp.roundToPx()` visible there).
+///
+/// Held as the chain's class identities; a membership probe asks each
+/// class's memoized closure-name set (`classClosureNames`). An extension
+/// call whose candidates include a member-extension is never served by the
+/// inline cache, so it asks for this set on every call, and building it —
+/// a closure walk per receiver plus a fresh hash map of every name — grew
+/// with the nesting depth of the composition it ran in. Nothing is
+/// allocated per call now beyond the chain snapshot.
+const OwnerSet = struct {
+    sig: [OWNER_SIG_MAX]usize = @splat(0),
+    n: u32 = 0,
+    /// The walked set for a chain longer than `sig` holds.
+    owned: ?std.StringHashMap(void) = null,
+    fn contains(self: *const OwnerSet, key: []const u8) bool {
+        if (self.owned) |*m| return m.contains(key);
+        for (self.sig[0..self.n]) |p| {
+            if (classClosureNames(@ptrFromInt(p)).contains(key)) return true;
+        }
+        return false;
+    }
+    fn deinit(self: *OwnerSet) void {
+        if (self.owned) |*m| m.deinit();
+    }
+    fn add(self: *OwnerSet, cls: usize) bool {
+        for (self.sig[0..self.n]) |p| if (p == cls) return true;
+        if (self.n == OWNER_SIG_MAX) return false;
+        self.sig[self.n] = cls;
+        self.n += 1;
+        return true;
+    }
+};
+const OWNER_SIG_MAX = 48;
+/// One memoized closure-name set. Class definitions are arena-backed and
+/// immutable after linking, so the set is built once per class for the
+/// process and shared; the entry is validated by the class's `fqn` slice,
+/// which keeps it sound should a definition's address ever be reused.
+const ClosureNamesEntry = struct { fqn_p: usize, fqn_len: usize, set: *const std.StringHashMap(void) };
+const ClosureNamesFront = struct { cls: usize = 0, fqn_p: usize = 0, fqn_len: usize = 0, set: ?*const std.StringHashMap(void) = null };
+const CLOSURE_NAMES_FRONT_SLOTS = 512;
+threadlocal var closure_names_front: [CLOSURE_NAMES_FRONT_SLOTS]ClosureNamesFront = @splat(.{});
+var closure_names_lock = std.atomic.Value(bool).init(false);
+var closure_names_map: ?std.AutoHashMap(usize, ClosureNamesEntry) = null;
+fn classClosureNames(cls: *const ClassDef) *const std.StringHashMap(void) {
+    const key = @intFromPtr(cls);
+    const fqn_p = @intFromPtr(cls.fqn.ptr);
+    const front = &closure_names_front[((key *% 0x9E3779B97F4A7C15) >> 32) % CLOSURE_NAMES_FRONT_SLOTS];
+    if (front.cls == key and front.fqn_p == fqn_p and front.fqn_len == cls.fqn.len) {
+        if (front.set) |s| return s;
+    }
+    const pa = std.heap.page_allocator;
+    while (closure_names_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+    defer closure_names_lock.store(false, .release);
+    if (closure_names_map == null) closure_names_map = .init(pa);
+    const map = &closure_names_map.?;
+    const set: *const std.StringHashMap(void) = blk: {
+        if (map.get(key)) |e| {
+            if (e.fqn_p == fqn_p and e.fqn_len == cls.fqn.len) break :blk e.set;
+        }
+        const s = pa.create(std.StringHashMap(void)) catch @panic("out of memory");
+        s.* = .init(pa);
+        var closure: std.ArrayList(*const ClassDef) = .empty;
+        defer closure.deinit(pa);
+        var seen: std.ArrayList(*const ClassDef) = .empty;
+        defer seen.deinit(pa);
+        collectClassClosure(cls, &closure, &seen, pa);
+        for (closure.items) |cd| {
+            s.put(cd.name, {}) catch {};
+            s.put(cd.fqn, {}) catch {};
+        }
+        map.put(key, .{ .fqn_p = fqn_p, .fqn_len = cls.fqn.len, .set = s }) catch {};
+        break :blk s;
+    };
+    front.* = .{ .cls = key, .fqn_p = fqn_p, .fqn_len = cls.fqn.len, .set = set };
+    return set;
+}
+fn enclosingOwnerSet(self: *VmHost, allocator: Allocator) Allocator.Error!OwnerSet {
+    var out: OwnerSet = .{};
+    var overflow = false;
+    {
+        const chain = try enclosingThisChain(self, allocator);
+        defer allocator.free(chain);
+        for (chain) |v| {
+            var cur: ?Value = v;
+            while (cur) |cv| {
+                if (cv != .Instance) break;
+                const g = cv.Instance.borrow();
+                const cls = @intFromPtr(g.get().class.asPtr());
+                const outer = g.get().outer;
+                g.deinit();
+                if (!out.add(cls)) overflow = true;
+                cur = outer;
+            }
+        }
+        var fit = ir.eval.frameThisChainIter();
+        while (fit.next()) |fv| {
+            var cur: ?Value = fv;
+            while (cur) |cv| {
+                if (cv != .Instance) break;
+                const g = cv.Instance.borrow();
+                const cls = @intFromPtr(g.get().class.asPtr());
+                const outer = g.get().outer;
+                g.deinit();
+                if (!out.add(cls)) overflow = true;
+                cur = outer;
+            }
+        }
+    }
+    if (!overflow) return out;
+    out.owned = try enclosingOwnerSetWalk(self, allocator);
+    return out;
+}
+/// The walked form of `enclosingOwnerSet`: every closure name of every
+/// receiver in scope, in one caller-owned map.
+fn enclosingOwnerSetWalk(self: *VmHost, allocator: Allocator) Allocator.Error!std.StringHashMap(void) {
     var set: std.StringHashMap(void) = .init(allocator);
     const chain = try enclosingThisChain(self, allocator);
     defer allocator.free(chain);
@@ -11527,25 +11646,19 @@ fn enclosingOwnerSet(self: *VmHost, allocator: Allocator) Allocator.Error!std.St
     for (chain) |v| {
         var cur: ?Value = v;
         while (cur) |cv| {
-            if (cv == .Instance) {
-                const g = cv.Instance.borrow();
-                closure.clearRetainingCapacity();
-                collectClassClosure(g.get().class.asPtr(), &closure, &seen, allocator);
-                for (closure.items) |cd| {
-                    set.put(cd.name, {}) catch {};
-                    set.put(cd.fqn, {}) catch {};
-                }
-                const outer = g.get().outer;
-                g.deinit();
-                cur = outer;
-            } else break;
+            if (cv != .Instance) break;
+            const g = cv.Instance.borrow();
+            closure.clearRetainingCapacity();
+            collectClassClosure(g.get().class.asPtr(), &closure, &seen, allocator);
+            for (closure.items) |cd| {
+                set.put(cd.name, {}) catch {};
+                set.put(cd.fqn, {}) catch {};
+            }
+            const outer = g.get().outer;
+            g.deinit();
+            cur = outer;
         }
     }
-    // The executing frames' own receivers are implicit receivers too, and
-    // the dynamic chain does not carry them: an extension body binds its
-    // receiver in `params[0]`, never by pushing it. Inside
-    // `ColumnMeasurePolicy.measure(MeasureScope)` the `MeasureScope` is a
-    // `Density`, which is what makes `Dp.roundToPx()` visible there.
     var fit = ir.eval.frameThisChainIter();
     while (fit.next()) |fv| {
         var cur: ?Value = fv;
