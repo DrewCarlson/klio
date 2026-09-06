@@ -102,7 +102,10 @@ pub fn resolveCapture(b: *FuncBuilder, name: []const u8) Allocator.Error!Reg {
     // forward it through this builder's capture slot — the anon method's
     // captures are supplied by name from the instance at dispatch. The
     // silent-Unit tail below would bind the lambda's capture to nothing.
-    if (decl.isLowerAnonCapture(name)) {
+    // A local class's methods and parent-constructor argument thunks carry
+    // the same enclosing locals under the capture-name list, so a lambda in
+    // either (`class Local(k: String) : Base({ o + k })`) captures them too.
+    if (decl.isLowerAnonCapture(name) or build.anonCaptureBinds(name)) {
         return try b.loadCaptureHoisted(name);
     }
     // A zero-parameter / receiver lambda whose `it` was deliberately not

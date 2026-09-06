@@ -566,6 +566,9 @@ pub const EnumEntry = struct {
     name: Ident,
     /// Constructor arguments — present when the enum declares a primary ctor.
     args: []Expr,
+    /// Per argument, the parameter a named argument binds (`A(b = 1, a = 0)`);
+    /// null for a positional argument.
+    arg_names: []const ?[]const u8 = &.{},
     /// Per-entry body declarations (overrides like `override fun apply(...)`).
     /// Empty for bare entries.
     body_members: []Decl,

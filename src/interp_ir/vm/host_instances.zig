@@ -71,6 +71,15 @@ threadlocal var ctor_guard: std.ArrayListUnmanaged([]const u8) = .empty;
 /// construction, consumed once by the matching class's materialization.
 pub const EnumEntryPreset = struct { class_fqn: []const u8, name: Value, ordinal: Value };
 threadlocal var enum_entry_preset: ?EnumEntryPreset = null;
+/// The enum whose entries are being constructed: its companion waits until
+/// every entry exists (kotlinc initializes the entries first, then the
+/// companion), so the first entry's construction must not trigger it.
+threadlocal var enum_under_init: ?[]const u8 = null;
+pub fn setEnumUnderInit(fqn: ?[]const u8) ?[]const u8 {
+    const prev = enum_under_init;
+    enum_under_init = fqn;
+    return prev;
+}
 pub fn setEnumEntryPreset(p: ?EnumEntryPreset) void {
     enum_entry_preset = p;
 }
@@ -486,6 +495,7 @@ fn expandParentSecondaryThisArgs(
     var names = arg_names;
     while (depth < 64) : (depth += 1) {
         const def = classDefByName(self, sideTableKey(class_fqn, class_name)) orelse return .{ .ok = {} };
+        defer def.deinit();
         const primary_count = classDefPrimaryParamCount(def);
         const entries = secondaryCtors(self, class_fqn, class_name);
         // Named header arguments (`A(y = 2, x = 4)`) bind to a secondary
@@ -539,11 +549,9 @@ fn expandParentSecondaryThisArgs(
                         switch (fr) {
                             .err => |err| return .{ .err = err },
                             .ok => |func| {
-                                var thunk_args: std.ArrayList(Value) = .empty;
-                                defer thunk_args.deinit(allocator);
-                                try thunk_args.appendSlice(allocator, ordered.items);
-                                while (thunk_args.items.len < e.param_count) try thunk_args.append(allocator, .Null);
-                                switch (try evalThunk(self, func, thunk_args.items)) {
+                                const thunk_args = try ctorThunkArgs(allocator, def, null, ordered.items, e.param_count);
+                                defer allocator.free(thunk_args);
+                                switch (try evalThunk(self, func, thunk_args)) {
                                     .ok => |v| try ordered.append(allocator, v),
                                     .err => |err| return .{ .err = err },
                                 }
@@ -566,7 +574,6 @@ fn expandParentSecondaryThisArgs(
         // a `@Deprecated(level = HIDDEN)` or low-priority secondary (kept for
         // binary compatibility, `Snapshot(id: Int, …)`) is never a candidate.
         const entry = entry_opt orelse chooseOrdinarySecondaryCtor(self, entries, args.items) orelse {
-            def.deinit();
             return .{ .ok = {} };
         };
         if (args.items.len == primary_count and primary_count != 0) {
@@ -583,11 +590,9 @@ fn expandParentSecondaryThisArgs(
             const heads = entry.param_type_heads[0..@min(args.items.len, entry.param_type_heads.len)];
             const secondary_score = scoreCtorHeadsWidening(self, heads, args.items) orelse -1;
             if (secondary_score <= primary_score) {
-                def.deinit();
                 return .{ .ok = {} };
             }
         }
-        def.deinit();
         var full_args: std.ArrayList(Value) = .empty;
         try full_args.appendSlice(allocator, args.items);
         {
@@ -599,11 +604,9 @@ fn expandParentSecondaryThisArgs(
                 switch (fr) {
                     .err => |e| return .{ .err = e },
                     .ok => |func| {
-                        var thunk_args: std.ArrayList(Value) = .empty;
-                        defer thunk_args.deinit(allocator);
-                        try thunk_args.appendSlice(allocator, full_args.items);
-                        while (thunk_args.items.len < entry.param_count) try thunk_args.append(allocator, .Null);
-                        switch (try evalThunk(self, func, thunk_args.items)) {
+                        const thunk_args = try ctorThunkArgs(allocator, def, null, full_args.items, entry.param_count);
+                        defer allocator.free(thunk_args);
+                        switch (try evalThunk(self, func, thunk_args)) {
                             .ok => |v| try full_args.append(allocator, v),
                             .err => |e| return .{ .err = e },
                         }
@@ -625,12 +628,14 @@ fn expandParentSecondaryThisArgs(
             try bodies.append(allocator, .{ .fqn = class_fqn, .name = class_name, .body = body_fid, .args = body_args });
         }
         var target: std.ArrayList(Value) = .empty;
+        const full_with_recv = try ctorThunkArgs(allocator, def, null, full_args.items, 0);
+        defer allocator.free(full_with_recv);
         for (entry.delegation_arg_thunks) |fid| {
             const fr = try funcAt(self, fid, "secondary ctor arg");
             switch (fr) {
                 .err => |e| return .{ .err = e },
                 .ok => |func| {
-                    switch (try evalThunk(self, func, full_args.items)) {
+                    switch (try evalThunk(self, func, full_with_recv)) {
                         .ok => |v| try target.append(allocator, v),
                         .err => |e| return .{ .err = e },
                     }
@@ -691,6 +696,25 @@ fn ctorThunkThisSlot(class_def: ObjRef(ClassDef), outer_hint: ?*const Value) Val
     defer dg.deinit();
     if (!dg.get().is_inner) return .Null;
     return oh.*;
+}
+
+/// The argument vector of a secondary-constructor delegation or default
+/// thunk: an inner class's thunks declare a leading receiver slot holding
+/// the enclosing instance; any other class's thunks take the parameters
+/// only. `pad_to` is the thunk's parameter count without the slot.
+fn ctorThunkArgs(allocator: Allocator, class_def: ?ObjRef(ClassDef), outer_hint: ?*const Value, args: []const Value, pad_to: usize) Allocator.Error![]Value {
+    const inner = blk: {
+        const d = class_def orelse break :blk false;
+        const dg = d.borrow();
+        defer dg.deinit();
+        break :blk dg.get().is_inner;
+    };
+    const lead: usize = if (inner) 1 else 0;
+    const out = try allocator.alloc(Value, lead + @max(args.len, pad_to));
+    if (inner) out[0] = if (outer_hint) |oh| oh.* else .Null;
+    @memcpy(out[lead .. lead + args.len], args);
+    for (out[lead + args.len ..]) |*slot| slot.* = .Null;
+    return out;
 }
 
 fn primaryDefaultThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?[]const ?FuncId {
@@ -1416,10 +1440,33 @@ fn runSuperCtorChain(
     leaf: *const Value,
     class_fqn: ?[]const u8,
     class_name: []const u8,
-    args: []const Value,
+    args_in: []const Value,
     arg_names: ?[]const ?[]const u8,
     outer_hint: ?*const Value,
 ) Allocator.Error!UnitOrErr {
+    // An omitted trailing vararg is the empty array on this route too: an
+    // entry body class `OK { … }` of `enum class Test(vararg xs: Int)`
+    // delegates with no arguments and `xs` must still be empty, not absent.
+    const args: []const Value = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const cid = (if (class_fqn) |f| mg.get().classIdByFqn(f) else null) orelse mg.get().classId(class_name) orelse break :blk args_in;
+        const irc = mg.get().classes.items[cid.int()];
+        if (args_in.len >= irc.primary_params.len) break :blk args_in;
+        var need = false;
+        for (irc.primary_params[args_in.len..]) |ip| {
+            if (ip.is_vararg) need = true;
+        }
+        if (!need) break :blk args_in;
+        var padded: std.ArrayList(Value) = .empty;
+        try padded.appendSlice(self.allocator, args_in);
+        for (irc.primary_params[args_in.len..]) |ip| {
+            if (!ip.is_vararg) break;
+            try padded.append(self.allocator, try host_call_func.packVarargArray(self.allocator, ip.ty.name, .empty));
+        }
+        break :blk try padded.toOwnedSlice(self.allocator);
+    };
+    defer if (args.ptr != args_in.ptr) self.allocator.free(args);
     if (isBuiltinThrowableName(class_name)) {
         if (leaf.* == .Instance) {
             try bindThrowableArgs(self, leaf.Instance, args, true);
@@ -1500,12 +1547,16 @@ fn runSuperCtorChain(
 
     var next_args: std.ArrayList(Value) = .empty;
     defer next_args.deinit(self.allocator);
+    const chain_def = classDefByName(self, sideTableKey(class_fqn, class_name));
+    defer if (chain_def) |d| d.deinit();
+    const args_with_recv = try ctorThunkArgs(self.allocator, chain_def, outer_hint, args_typed, 0);
+    defer self.allocator.free(args_with_recv);
     for (entry.delegation_arg_thunks) |fid| {
         const fr = try funcAt(self, fid, "secondary ctor arg");
         switch (fr) {
             .err => |e| return .{ .err = e },
             .ok => |func| {
-                switch (try evalThunk(self, func, args_typed)) {
+                switch (try evalThunk(self, func, args_with_recv)) {
                     .ok => |v| try next_args.append(self.allocator, v),
                     .err => |e| return .{ .err = e },
                 }
@@ -2336,6 +2387,11 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
         while (cur) |c| {
             const cname = classDefName(c);
             const comp_name: ?[]const u8 = blk: {
+                if (enum_under_init) |ef| {
+                    const g = c.borrow();
+                    defer g.deinit();
+                    if (std.mem.eql(u8, g.get().fqn, ef)) break :blk null;
+                }
                 const mg = self.module.borrow();
                 defer mg.deinit();
                 break :blk mg.get().registry.companion_singletons.get(cname);
@@ -2705,15 +2761,11 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
             switch (fr) {
                 .err => |e| return EvalResult{ .err = e },
                 .ok => |func| {
-                    var thunk_args: std.ArrayList(Value) = .empty;
-                    defer thunk_args.deinit(allocator);
-                    try thunk_args.appendSlice(allocator, full_args.items);
-                    while (thunk_args.items.len < entry.param_count) {
-                        try thunk_args.append(allocator, .Null);
-                    }
+                    const thunk_args = try ctorThunkArgs(allocator, class_def, outer_hint, full_args.items, entry.param_count);
+                    defer allocator.free(thunk_args);
                     const full_keepalive = runtime.keepaliveMark();
                     runtime.keepalivePushSlice(full_args.items);
-                    const evaluated = evalThunk(self, func, thunk_args.items);
+                    const evaluated = evalThunk(self, func, thunk_args);
                     runtime.keepaliveRestore(full_keepalive);
                     switch (try evaluated) {
                         .ok => |v| try full_args.append(allocator, v),
@@ -2728,6 +2780,8 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
     // Evaluate the delegation args.
     var target_args: std.ArrayList(Value) = .empty;
     defer target_args.deinit(allocator);
+    const full_with_recv = try ctorThunkArgs(allocator, class_def, outer_hint, full_args.items, 0);
+    defer allocator.free(full_with_recv);
     for (entry.delegation_arg_thunks) |fid| {
         const fr = try funcAt(self, fid, "secondary ctor arg");
         switch (fr) {
@@ -2735,7 +2789,7 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
             .ok => |func| {
                 const target_keepalive = runtime.keepaliveMark();
                 runtime.keepalivePushSlice(target_args.items);
-                const evaluated = evalThunk(self, func, full_args.items);
+                const evaluated = evalThunk(self, func, full_with_recv);
                 runtime.keepaliveRestore(target_keepalive);
                 switch (try evaluated) {
                     .ok => |v| try target_args.append(allocator, v),

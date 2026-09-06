@@ -1846,6 +1846,8 @@ pub const Class = struct {
     /// that declares secondary constructors has no implicit zero-argument
     /// constructor.
     has_primary_ctor: bool = true,
+    /// An `annotation class`: instances compare, hash, and render by value.
+    is_annotation: bool = false,
     /// A named Kotlin `object`. Calling its classifier name resolves the
     /// singleton value and dispatches `operator fun invoke`; it is never a
     /// constructor call despite sharing the class table representation.

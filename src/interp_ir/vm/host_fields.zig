@@ -393,6 +393,102 @@ pub fn leafStaticMember(self: *VmHost, owner: []const u8, member: []const u8) ?V
     return null;
 }
 
+/// A bare name read inside an enum's companion object, nested object, or
+/// entry body resolves to the enum's entry of that name: the enum's static
+/// scope encloses those bodies. `receiver` is an implicit-receiver
+/// candidate of the read; the enclosing enum is found through the
+/// companion link, the dotted class name, or the registry's enclosing map.
+pub fn enclosingEnumEntry(self: *VmHost, receiver: *const Value, name: []const u8) ?Value {
+    if (receiver.* != .Instance) return null;
+    var cls_name: []const u8 = undefined;
+    var linked: ?runtime.ObjRef(runtime.ClassDef) = null;
+    {
+        const ig = receiver.Instance.borrow();
+        defer ig.deinit();
+        const cg = ig.get().class.borrow();
+        defer cg.deinit();
+        cls_name = cg.get().name;
+        const eg = cg.get().enclosing_class.borrow();
+        defer eg.deinit();
+        if (eg.get().*) |e| linked = e.clone();
+    }
+    if (linked) |e| {
+        defer e.deinit();
+        const eg = e.borrow();
+        const owner = eg.get().name;
+        eg.deinit();
+        if (leafStaticMember(self, owner, name)) |v| return v;
+    }
+    return enclosingEnumEntryByOwner(self, cls_name, name);
+}
+
+/// The enum whose static scope encloses `receiver`'s class (a companion,
+/// nested object or entry body of the enum), if any.
+pub fn enclosingEnumDef(self: *VmHost, receiver: *const Value) ?runtime.ObjRef(runtime.ClassDef) {
+    if (receiver.* != .Instance) return null;
+    var current: []const u8 = undefined;
+    {
+        const ig = receiver.Instance.borrow();
+        defer ig.deinit();
+        const cg = ig.get().class.borrow();
+        defer cg.deinit();
+        current = cg.get().name;
+        const eg = cg.get().enclosing_class.borrow();
+        defer eg.deinit();
+        if (eg.get().*) |e| {
+            const e2 = e.borrow();
+            const is_enum = e2.get().is_enum;
+            e2.deinit();
+            if (is_enum) return e.clone();
+        }
+    }
+    var hops: u8 = 0;
+    while (hops < 8) : (hops += 1) {
+        const enclosing: []const u8 = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            if (mg.get().registry.enclosing_class.get(current)) |e| break :blk e;
+            if (std.mem.lastIndexOfScalar(u8, current, '.')) |d| break :blk current[0..d];
+            return null;
+        };
+        const def: ?runtime.ObjRef(runtime.ClassDef) = blk: {
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            break :blk if (cg.get().get(enclosing)) |d| d.clone() else null;
+        };
+        if (def) |d| {
+            const dg = d.borrow();
+            const is_enum = dg.get().is_enum;
+            dg.deinit();
+            if (is_enum) return d;
+            d.deinit();
+        }
+        current = enclosing;
+    }
+    return null;
+}
+
+/// The entry `name` of the enum whose static scope encloses the class
+/// `owner` (the owner itself when it is the enum, else its enclosing
+/// classes by the registry's map or the dotted class name).
+pub fn enclosingEnumEntryByOwner(self: *VmHost, owner: []const u8, name: []const u8) ?Value {
+    if (leafStaticMember(self, owner, name)) |v| return v;
+    var current: []const u8 = owner;
+    var hops: u8 = 0;
+    while (hops < 8) : (hops += 1) {
+        const enclosing: []const u8 = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            if (mg.get().registry.enclosing_class.get(current)) |e| break :blk e;
+            if (std.mem.lastIndexOfScalar(u8, current, '.')) |d| break :blk current[0..d];
+            return null;
+        };
+        if (leafStaticMember(self, enclosing, name)) |v| return v;
+        current = enclosing;
+    }
+    return null;
+}
+
 /// A boxed capture (an anon-object method's captured outer `var` stored
 /// in its capture env as a shared Cell) reads THROUGH the cell — the cell
 /// is a carrier, never a user value.
@@ -2272,6 +2368,36 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         switch (forwarded) {
             .ok => return forwarded,
             .err => |e| freeFieldMiss(allocator, e),
+        }
+    }
+    // An enum's static scope encloses its companion, nested objects and
+    // entry bodies: a bare entry name read on one of those instances is
+    // the entry.
+    {
+        const plain = blk: {
+            const prefix = "$sgetter$";
+            if (std.mem.startsWith(u8, name, prefix)) {
+                const rest = name[prefix.len..];
+                if (std.mem.indexOfScalar(u8, rest, '\u{1f}')) |sep| break :blk rest[sep + 1 ..];
+            }
+            break :blk name;
+        };
+        if (enclosingEnumEntry(self, receiver, plain)) |ev| {
+            if (runtime.reclaimEnabled()) ev.retain();
+            return .{ .ok = ev };
+        }
+        // The synthesized statics (`entries`) read the same way.
+        if (std.mem.eql(u8, plain, "entries")) {
+            if (enclosingEnumDef(self, receiver)) |def| {
+                defer def.deinit();
+                const cls_val: Value = .{ .Class = def.clone() };
+                defer if (runtime.reclaimEnabled()) cls_val.release(allocator);
+                const forwarded = try getFieldInner(self, allocator, &cls_val, plain, suppress_cc_redirect, member_probe, suppress_ext);
+                switch (forwarded) {
+                    .ok => return forwarded,
+                    .err => |e| freeFieldMiss(allocator, e),
+                }
+            }
         }
     }
     const tf = try allocator.dupe(u8, receiverLabel(receiver));

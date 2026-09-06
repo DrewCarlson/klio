@@ -135,7 +135,7 @@ fn varargPrimKind(elem: []const u8) ?runtime.PrimitiveArrayKind {
 /// Build the packed vararg value from an owned list of element values: a
 /// primitive `ByteArray`/`IntArray`/… when `elem_ty` is a primitive, else a
 /// boxed `Array`. Mirrors `collections.makeArrayFromArrayList`'s ownership.
-fn packVarargArray(allocator: Allocator, elem_ty: []const u8, list: std.ArrayList(Value)) Allocator.Error!Value {
+pub fn packVarargArray(allocator: Allocator, elem_ty: []const u8, list: std.ArrayList(Value)) Allocator.Error!Value {
     if (varargPrimKind(elem_ty)) |k| {
         var l = list;
         const v = try runtime.ArrayData.initPacked(allocator, k, l.items);

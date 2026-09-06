@@ -3539,14 +3539,56 @@ fn buildModuleWithOverrides(
             // the entry omits (`enum E(val n:Int, val f:Boolean=false){A(1)}`
             // must still initialize `f`). Kotlin requires the provided args to
             // be a prefix, so defaults fill the suffix and stay index-aligned.
-            var slot_count: usize = entry.args.len;
-            while (slot_count < c.primary_params.len and c.primary_params[slot_count].default != null) : (slot_count += 1) {}
+            // A named entry argument binds its parameter (`B(b = 1, a = 0)`);
+            // a positional one takes the next unfilled slot. Every slot up to
+            // the last provided or defaulted parameter gets a thunk.
+            // An enum without a primary constructor passes its entry
+            // arguments to a secondary constructor: they stay positional.
+            const n_slots = @max(c.primary_params.len, entry.args.len);
+            const slot_exprs = try a.alloc(?*const ast.Expr, n_slots);
+            for (slot_exprs) |*se| se.* = null;
+            {
+                var next_slot: usize = 0;
+                for (entry.args, 0..) |*arg, ai| {
+                    const label: ?[]const u8 = if (ai < entry.arg_names.len) entry.arg_names[ai] else null;
+                    var slot: ?usize = null;
+                    if (label) |nm| {
+                        for (c.primary_params, 0..) |*pp, pi| {
+                            if (std.mem.eql(u8, pp.name.name, nm)) {
+                                slot = pi;
+                                break;
+                            }
+                        }
+                    }
+                    if (slot == null) {
+                        while (next_slot < slot_exprs.len and slot_exprs[next_slot] != null) next_slot += 1;
+                        slot = next_slot;
+                    }
+                    const si = slot.?;
+                    if (si < slot_exprs.len) {
+                        slot_exprs[si] = arg;
+                        if (si == next_slot) next_slot += 1;
+                    }
+                }
+            }
+            var slot_count: usize = 0;
+            while (slot_count < n_slots and
+                (slot_exprs[slot_count] != null or
+                    (slot_count < c.primary_params.len and c.primary_params[slot_count].default != null))) : (slot_count += 1)
+            {}
             if (slot_count != 0) {
                 var fids = try a.alloc(FuncId, slot_count);
+                // The arguments sit in the enum's static scope: an entry name
+                // or companion member is visible by its bare name (`FOO("O",
+                // { FOO.x })`), so the thunks take the enum class as `this`.
+                var enum_scope = StringSet.init(a);
+                defer enum_scope.deinit();
+                try ir.lower.decl.addVisibleMemberNames(c, &enum_scope);
+                const enum_this = [_][]const u8{"this"};
                 for (0..slot_count) |idx| {
                     const nm = try std.fmt.allocPrint(a, "__enum_arg_{s}_{s}_{d}", .{ c.name.name, entry.name.name, idx });
-                    const arg_expr = if (idx < entry.args.len) &entry.args[idx] else &c.primary_params[idx].default.?;
-                    fids[idx] = try ir.lower.lowerExprAsThunk(module, arg_expr, nm);
+                    const arg_expr = slot_exprs[idx] orelse &c.primary_params[idx].default.?;
+                    fids[idx] = try ir.lower.lowerExprAsParamThunkScoped(module, &enum_this, arg_expr, nm, c.name.name, &enum_scope);
                 }
                 try enum_entry_arg_inits.append(a, .{ .class_name = c.name.name, .entry_name = entry.name.name, .funcs = fids });
             }
@@ -3888,6 +3930,22 @@ fn buildModuleWithOverrides(
             // the declared types those parameters carry.
             const sc_param_types = try a.alloc(?ast.TypeRef, sc.params.len);
             for (sc.params, 0..) |*p, i| sc_param_types[i] = p.ty;
+            // An inner class's thunks take the enclosing instance as a
+            // leading receiver slot, like its primary constructor's default
+            // thunks; any other class's thunks see only the parameters, so a
+            // companion member named in a delegation stays a static call.
+            var sc_thunk_params: []const []const u8 = param_names;
+            var sc_thunk_types: []const ?ast.TypeRef = sc_param_types;
+            if (c.is_inner) {
+                const with_recv = try a.alloc([]const u8, param_names.len + 1);
+                with_recv[0] = "this";
+                for (param_names, 0..) |pn, i| with_recv[i + 1] = pn;
+                sc_thunk_params = with_recv;
+                const with_recv_types = try a.alloc(?ast.TypeRef, sc.params.len + 1);
+                with_recv_types[0] = null;
+                for (sc.params, 0..) |*p, i| with_recv_types[i + 1] = p.ty;
+                sc_thunk_types = with_recv_types;
+            }
             // Named delegation arguments (`this(message = m, cause = c,
             // missingFields = f, serialName = null)`) bind the target's
             // parameters by NAME; the thunks run in the target's declared
@@ -3924,21 +3982,25 @@ fn buildModuleWithOverrides(
                 }
                 for (placed) |x| if (!x) break :reorder;
             }
+            // An inner class's delegation arguments and defaults see the
+            // enclosing instance's members the way its primary defaults do
+            // (`constructor() : super({ ok })` reads `this@Outer.ok`).
+            const sc_enclosing: ?*const StringSet = nested_outer_members.getPtr(c.name.name);
             var arg_fids = try a.alloc(FuncId, delegation_args.len);
             for (order, 0..) |src_idx, arg_idx| {
                 const e = &delegation_args[src_idx];
                 const nm = try std.fmt.allocPrint(a, "__sec_ctor_{s}_{d}_arg{d}", .{ c.name.name, sc_idx, arg_idx });
-                module.pending_param_types = sc_param_types;
+                module.pending_param_types = sc_thunk_types;
                 module.pending_own_member_arity = &own_arity;
-                arg_fids[arg_idx] = try ir.lower.lowerExprAsParamThunkScoped(module, param_names, e, nm, c.name.name, &own_members);
+                arg_fids[arg_idx] = try ir.lower.lowerExprAsParamThunkScopedEnclosing(module, sc_thunk_params, e, nm, c.name.name, &own_members, sc_enclosing);
             }
             var default_arg_thunks = try a.alloc(?FuncId, sc.params.len);
             for (sc.params, 0..) |*p, p_idx| {
                 if (p.default) |e| {
                     const nm = try std.fmt.allocPrint(a, "__sec_ctor_{s}_{d}_def{d}", .{ c.name.name, sc_idx, p_idx });
-                    module.pending_param_types = sc_param_types;
+                    module.pending_param_types = sc_thunk_types;
                     module.pending_own_member_arity = &own_arity;
-                    default_arg_thunks[p_idx] = try ir.lower.lowerExprAsParamThunkScoped(module, param_names, e, nm, c.name.name, &own_members);
+                    default_arg_thunks[p_idx] = try ir.lower.lowerExprAsParamThunkScopedEnclosing(module, sc_thunk_params, e, nm, c.name.name, &own_members, sc_enclosing);
                 } else {
                     default_arg_thunks[p_idx] = null;
                 }
@@ -4984,6 +5046,7 @@ fn buildClassDef(
         .is_value = c.is_value,
         .is_object = is_object,
         .is_enum = c.is_enum,
+        .is_annotation = c.is_annotation,
         .is_sealed = c.is_sealed,
         .supertype_names = supertype_names,
         .supertype_paths = supertype_paths,
