@@ -3219,6 +3219,30 @@ backend (the default for <code>fast</code>/<code>safe</code>).</p>
 <td><code>[kgc-hist]</code></td>
 </tr>
 <tr>
+<td><code>KLIO_ENUM_INIT_TRACE</code></td>
+<td>set</td>
+<td>VM-start enum entry construction: which entries are rebuilt through the class path and the header thunk chain per class</td>
+<td><code>[enum-init]</code>, <code>[chain]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_CTOR_TRACE</code></td>
+<td>set</td>
+<td>Each secondary-constructor default-argument thunk as it is evaluated (class, parameter, thunk id, argument count)</td>
+<td><code>[ctor-default]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_TOPPROP_TRACE</code></td>
+<td>set</td>
+<td>A top-level property initializer that deferred to on-access during the startup pass, with its error tag</td>
+<td><code>[topprop-defer]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_BOX_FILTER</code> / <code>KLIO_BOX_JOBS</code> / <code>KLIO_BOX_TIMEOUT_MS</code></td>
+<td>substring / count / ms</td>
+<td>The box conformance runner's test subset, worker width, and per-test wall</td>
+<td><code>[box-fail]</code>, <code>[box-excluded]</code></td>
+</tr>
+<tr>
 <td><code>KLIO_GC_STRESS</code></td>
 <td>set; <code>0</code>/empty off</td>
 <td>Collects at every safe point; surfaces incomplete roots/tracers immediately</td>
