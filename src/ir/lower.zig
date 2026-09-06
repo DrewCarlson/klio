@@ -88,6 +88,7 @@ pub const lowerExprAsParamThunk = mod.lowerExprAsParamThunk;
 pub const lowerExprAsParamThunkScoped = mod.lowerExprAsParamThunkScoped;
 pub const lowerExprAsParamThunkScopedEnclosing = mod.lowerExprAsParamThunkScopedEnclosing;
 pub const lowerExprAsThunk = mod.lowerExprAsThunk;
+pub const lowerDelegateExprAsThunk = mod.lowerDelegateExprAsThunk;
 pub const lowerExprAsThunkTyped = mod.lowerExprAsThunkTyped;
 pub const lowerInitBlock = mod.lowerInitBlock;
 pub const lowerInitBlockWithParams = mod.lowerInitBlockWithParams;

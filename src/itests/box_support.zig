@@ -41,8 +41,9 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// Omitted varargs empty on every route, SAM context parameters: 5560 / 792.
 /// Annotation instances by value, captured locals in super calls, enum
 /// static scope and initialization: 5623 / 729.
-pub const BASELINE: usize = 5623;
-pub const MAX_FAILED: usize = 729;
+/// The `provideDelegate` convention at every delegated property: 5647 / 705.
+pub const BASELINE: usize = 5647;
+pub const MAX_FAILED: usize = 705;
 
 /// Directives that bind a test to a framework feature klio has no
 /// counterpart for: a backend restriction, a second module, reflection,

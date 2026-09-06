@@ -4090,7 +4090,7 @@ fn buildModuleWithOverrides(
         } else if (p.delegate) |delegate| {
             try top_level_delegated_props.put(p.name.name, {});
             const nm = try std.fmt.allocPrint(a, "__top_prop_delegate_{s}", .{p.name.name});
-            const fid = try ir.lower.lowerExprAsThunk(module, delegate, nm);
+            const fid = try ir.lower.lowerDelegateExprAsThunk(module, delegate, nm, p.name.name);
             try top_level_props.append(a, .{ .name = p.name.name, .func = fid, .file = p.span.file.int() });
         }
         if (p.delegate == null) {

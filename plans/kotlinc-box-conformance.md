@@ -503,6 +503,32 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    an inner class constructed during that entry's own initialization,
    and four singles remain.
 
+16. **`provideDelegate` convention (2026-09-06)**:
+   `delegatedProperty/provideDelegate` failed 16 of 24. Three mechanisms.
+   (a) The convention was applied only to class body properties and only
+   when the delegate's own runtime class chain declared the operator, so an
+   extension `provideDelegate` and every local or top-level delegated
+   property never saw it. One host hook now offers `provideDelegate(thisRef,
+   ::p)` to the delegate value through the ordinary member-or-extension
+   dispatch at every creation site — the lowering emits a `$provideDelegate`
+   member call the dispatcher serves with the fallback (only its own
+   dispatch miss keeps the value; a miss raised inside an operator that ran
+   is the initialization failure), the top-level delegate thunk ends with
+   it, and the body-property hook dropped its class-chain gate. (b) The
+   top-level read and write routes dispatched `getValue`/`setValue` only
+   for `Instance`/`PropertyRef` delegates; any delegate value dispatches
+   (a `String` delegate reads through `String.getValue`). (c) A local
+   delegated property called `getValue` at its declaration, which kotlinc
+   never does; the local binds the delegate and every read goes through the
+   delegate read. A property-reference delegate (`by contents::zone`,
+   `by ::top`) forwards every member call to its target, so it is never
+   offered the convention. Example `provide_delegate_convention`. Subset
+   8 → 21 of 24; census 5,647 / 705 / 19; sweep 117/0; corpus 469/469;
+   unit green. Left: a companion's delegated property read through the class
+   (`TestClass.test` returns the raw delegate), a member-extension
+   delegated property, and an extension property whose delegate names a
+   member of the enclosing object.
+
  Log
 
 - 2026-09-05: opened.
@@ -525,3 +551,4 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
 - 2026-09-06: Task 4 #12 adapted callable references landed: 5560 / 792.
 - 2026-09-06: Task 4 #13 annotation instances, #14 captured locals in
   super constructor calls, #15 enum static scope landed: 5623 / 729.
+- 2026-09-06: Task 4 #16 provideDelegate convention landed: 5647 / 705.

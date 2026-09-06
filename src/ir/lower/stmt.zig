@@ -207,51 +207,26 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         try b.markContextFnParam(p.name.name, ctx_types, af.params.len);
     };
     const init: Reg = if (p.delegate) |de| blk: {
-        // `val x by D` — lower the delegate, then invoke its
-        // `getValue(null, ::x)` once at decl time. For a
-        // `lazy { producer }` this drives the producer; for
-        // any custom delegate the dispatched method runs.
-        // Each subsequent path read of `x` returns the bound
-        // value, so this is eager-once semantics (sufficient
-        // for `val`-style use; a `var x by D` mutating
-        // delegate would need a true read-through dispatch
-        // and is tracked separately).
-        const delegate = try lowerExpr(b, de);
-        // Keep the delegate under a hidden binding (`x$klio_delegate`) for BOTH
+        // `val x by D` binds the delegate (after the `provideDelegate`
+        // convention) under a hidden binding (`x$klio_delegate`) for BOTH
         // `val` and `var`. Kotlin dispatches `getValue` on every read (and
-        // `setValue` on every write), so a read of `x` goes through
-        // `lowerDelegateRead` -> `D.getValue(null, ::x)`, not the eager-once
-        // cache below. A `val x by derivedStateOf { … }` (or any State-backed
-        // `val`) must re-read the delegate: its value changes over time and is
-        // never written, so a cached decl-time value would stay stale. A
-        // `lazy { … }` delegate still caches internally, so read-through only
-        // costs a method call. Bound as an immutable val — the delegate
-        // reference itself does not change — so a nested lambda captures it by
-        // value; `var` additionally uses it for setValue write-through (see
-        // storeCombinedToTarget).
+        // `setValue` on every write) and never at the declaration, so a read
+        // of `x` goes through `lowerDelegateRead` -> `D.getValue(null, ::x)`.
+        // A `val x by derivedStateOf { … }` must re-read the delegate: its
+        // value changes over time and is never written; a `lazy { … }`
+        // delegate caches internally, so read-through only costs a method
+        // call. Bound as an immutable val — the delegate reference itself
+        // does not change — so a nested lambda captures it by value; `var`
+        // additionally uses it for setValue write-through (see
+        // storeCombinedToTarget). The plain name binds the delegate too, for
+        // the paths that resolve the name without the delegate read.
+        const delegate_expr = try lowerExpr(b, de);
+        const delegate = try emitProvideDelegate(b, delegate_expr, p.name.name);
         {
             const dname = try std.fmt.allocPrint(b.allocator, "{s}$klio_delegate", .{p.name.name});
             try b.bind(dname, delegate);
         }
-        const null_arg = try b.emitConst(.Null);
-        const prop_ref = b.allocReg();
-        const pname = try b.module.internConst(b.allocator, .{ .String = p.name.name });
-        try b.push(.{ .PropertyRef = .{ .dst = prop_ref, .name = pname } });
-        const args_start = b.allocReg();
-        try b.push(.{ .Move = .{ .dst = args_start, .src = null_arg } });
-        _ = b.allocReg();
-        try b.push(.{ .Move = .{ .dst = Reg.from(args_start.int() + 1), .src = prop_ref } });
-        const dst = b.allocReg();
-        const name_c = try b.module.internConst(b.allocator, .{ .String = "getValue" });
-        try b.push(.{ .CallMember = .{
-            .dst = dst,
-            .receiver = delegate,
-            .name = name_c,
-            .args = args_start,
-            .n_args = 2,
-            .arg_names = &.{},
-        } });
-        break :blk dst;
+        break :blk delegate;
     } else switch (p.init != null) {
         true => blk: {
             const e = &p.init.?;
@@ -1782,6 +1757,33 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
         }
     }
     return null;
+}
+
+/// The `provideDelegate` convention at a delegated property's creation:
+/// `val x by e` first offers `e` the call `provideDelegate(thisRef, ::x)`,
+/// and the delegate is its result when a member or extension operator
+/// applies (a miss keeps `e`). The host serves the `$provideDelegate` name
+/// with exactly that fallback, so the lowering needs no static resolution.
+pub fn emitProvideDelegate(b: *FuncBuilder, delegate: Reg, prop_name: []const u8) Allocator.Error!Reg {
+    const null_arg = try b.emitConst(.Null);
+    const prop_ref = b.allocReg();
+    const pname = try b.module.internConst(b.allocator, .{ .String = prop_name });
+    try b.push(.{ .PropertyRef = .{ .dst = prop_ref, .name = pname } });
+    const args_start = b.allocReg();
+    try b.push(.{ .Move = .{ .dst = args_start, .src = null_arg } });
+    _ = b.allocReg();
+    try b.push(.{ .Move = .{ .dst = Reg.from(args_start.int() + 1), .src = prop_ref } });
+    const dst = b.allocReg();
+    const name_c = try b.module.internConst(b.allocator, .{ .String = "$provideDelegate" });
+    try b.push(.{ .CallMember = .{
+        .dst = dst,
+        .receiver = delegate,
+        .name = name_c,
+        .args = args_start,
+        .n_args = 2,
+        .arg_names = &.{},
+    } });
+    return dst;
 }
 
 /// A destructured name binds like a local: a `var` gets a home register the

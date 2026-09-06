@@ -112,6 +112,7 @@ pub const lowerExprAsParamThunk = thunks.lowerExprAsParamThunk;
 pub const lowerExprAsParamThunkScoped = thunks.lowerExprAsParamThunkScoped;
 pub const lowerExprAsParamThunkScopedEnclosing = thunks.lowerExprAsParamThunkScopedEnclosing;
 pub const lowerExprAsThunk = thunks.lowerExprAsThunk;
+pub const lowerDelegateExprAsThunk = thunks.lowerDelegateExprAsThunk;
 pub const lowerExprAsThunkTyped = thunks.lowerExprAsThunkTyped;
 pub const lowerInitBlock = thunks.lowerInitBlock;
 pub const lowerInitBlockWithParams = thunks.lowerInitBlockWithParams;
