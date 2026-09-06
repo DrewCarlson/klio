@@ -1028,6 +1028,7 @@ pub fn lowerClassWithExtras(
         .is_fun_interface = c.is_fun_interface,
         .is_open = c.is_open,
         .is_enum = c.is_enum,
+        .has_primary_ctor = c.has_primary_ctor,
         .is_value = c.is_value,
         .receiver_abi = runtime.classifierReceiverAbi(class_fqn),
     });

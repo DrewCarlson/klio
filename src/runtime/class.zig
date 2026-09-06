@@ -65,6 +65,8 @@ pub const ClassDef = struct {
     is_object: bool,
     /// `true` for an `enum class`.
     is_enum: bool,
+    /// Whether the declaration has a primary constructor (see `ir.Class`).
+    has_primary_ctor: bool = true,
     /// `true` when the declaration carried the `sealed` modifier.
     is_sealed: bool,
     /// Simple supertype names recorded from `class Foo : Bar(), Baz`.

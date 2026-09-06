@@ -363,7 +363,19 @@ fn isCallableArg(v: *const Value) bool {
     };
 }
 
+/// A secondary constructor taking more parameters than arguments (the
+/// rest defaulted) is a candidate only where kotlinc would consider it:
+/// when no primary constructor takes the call. Exact-arity callers (a
+/// class with a zero-parameter primary, the super chain) keep
+/// `exact_arity`, so `LazyLayoutPrefetchState()` reaches its primary and
+/// not the two-default secondary whose delegation re-enters the same call.
 fn chooseSecondaryCtor(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
+    return chooseSecondaryCtorArity(self, entries, args, true);
+}
+fn chooseSecondaryCtorDefaulted(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
+    return chooseSecondaryCtorArity(self, entries, args, false);
+}
+fn chooseSecondaryCtorArity(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value, exact_arity: bool) ?root.build.SecondaryCtorEntry {
     // Two passes. A `@Deprecated(level = HIDDEN)` constructor is not a
     // source-level candidate in kotlinc at all — it exists only for binary
     // compatibility — so it must never beat an ordinary one. It stays reachable
@@ -380,6 +392,7 @@ fn chooseSecondaryCtor(self: *VmHost, entries: []const root.build.SecondaryCtorE
             // from `A()`); an exact count still outranks it.
             if (e.param_count < args.len) continue;
             if (e.param_count > args.len) {
+                if (exact_arity) continue;
                 var all_defaulted = true;
                 var di: usize = args.len;
                 while (di < e.param_count) : (di += 1) {
@@ -426,7 +439,7 @@ fn chooseOrdinarySecondaryCtor(self: *VmHost, entries: []const root.build.Second
     for (entries) |e| if (!e.low_priority) {
         ordinary.append(self.allocator, e) catch return null;
     };
-    return chooseSecondaryCtor(self, ordinary.items, args);
+    return chooseSecondaryCtorDefaulted(self, ordinary.items, args);
 }
 
 /// `scoreCtorHeads` where an integral value scores its full match against
@@ -2362,8 +2375,21 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
     // A class without a primary constructor dispatches to the secondary
     // constructor its arguments fit, defaults included (`A()` reaching
     // `constructor(arg1: String = global)`).
-    const zero_primary_secondary = n_primary_initial == 0 and
-        chooseSecondaryCtor(self, secondaryCtors(self, classDefFqn(class_def), class_name), args) != null;
+    const zero_primary_secondary = n_primary_initial == 0 and blk: {
+        const entries = secondaryCtors(self, classDefFqn(class_def), class_name);
+        const declares_primary = blk2: {
+            const dg = class_def.borrow();
+            defer dg.deinit();
+            break :blk2 dg.get().has_primary_ctor;
+        };
+        // A class declaring a zero-parameter primary keeps it for `A()`;
+        // one without a primary takes the secondary its arguments fit,
+        // defaults included.
+        break :blk if (declares_primary)
+            chooseSecondaryCtor(self, entries, args) != null
+        else
+            chooseSecondaryCtorDefaulted(self, entries, args) != null;
+    };
     // A same-arity primary/secondary pair selects by TYPE, like any other
     // overload set: when the best-fitting secondary scores strictly better
     // than the primary's declared heads (a lambda meeting the secondary's
@@ -2606,7 +2632,21 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
     runtime.keepalivePushSlice(args);
     const class_name = classDefName(class_def);
     const entries = secondaryCtors(self, classDefFqn(class_def), class_name);
-    var chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(self, entries, args);
+    // A defaulted secondary is a candidate only when the primary cannot
+    // take the call (a class without a primary, or an arity the primary and
+    // its own defaults do not cover).
+    const primary_takes = blk: {
+        const dg = class_def.borrow();
+        defer dg.deinit();
+        if (!dg.get().has_primary_ctor) break :blk false;
+        const n_primary = dg.get().primary_params.len;
+        if (n_primary == 0) break :blk args.len == 0;
+        break :blk args.len <= n_primary;
+    };
+    var chosen: ?root.build.SecondaryCtorEntry = if (primary_takes)
+        chooseSecondaryCtor(self, entries, args)
+    else
+        chooseSecondaryCtorDefaulted(self, entries, args);
     // Everything below constructs further values; the site's static heads
     // describe THIS call's arguments only.
     ctor_static_heads = null;
@@ -2660,6 +2700,7 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
                 return EvalResult{ .err = try typeErr(allocator, "secondary ctor param {d} has no default to apply", .{idx}) };
             }
             const dfid = entry.default_arg_thunks[idx].?;
+            if (runtime.envOnce("KLIO_CTOR_TRACE") != null) std.debug.print("[ctor-default] class={s} param={d}/{d} fid={d} args={d}\n", .{ class_name, idx, entry.param_count, dfid.int(), args.len });
             const fr = try funcAt(self, dfid, "secondary ctor default");
             switch (fr) {
                 .err => |e| return EvalResult{ .err = e },

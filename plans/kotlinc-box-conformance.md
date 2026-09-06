@@ -376,8 +376,19 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    Verified: e2e CI-shape green, GC-stress preflight green, every box
    example under `KLIO_GC_STRESS=1` on the Debug harness, census unchanged
    at 5,553 / 799 / 19, sweep 117/0, unit green. Landed 45b99090.
+   (f) Landing 45b99090 exposed one more in the corpus check:
+   `compose_foundation_lazy` aborted in a stack overflow because
+   `LazyLayoutPrefetchState()` — a class declaring a zero-parameter
+   primary and a deprecated two-default secondary — now reached the
+   secondary (the chooser accepted a defaulted arity) whose delegation
+   re-entered the same call. kotlinc keeps an applicable primary; a class
+   declaring one (`class A()`) is told apart from a class with none
+   (`class A { constructor(x: T = …) }`) by a new `has_primary_ctor` flag
+   carried from the parser through the IR class to the runtime
+   definition, and a defaulted secondary is a candidate only when no
+   primary takes the call.
 
-# Log
+ Log
 
 - 2026-09-05: opened.
 - 2026-09-05: Task 1 populated; Task 2 runner written (`box_support.zig`,

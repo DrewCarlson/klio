@@ -112,10 +112,12 @@ pub fn parseClass(
     skipPrimaryCtorAnnotations(p);
     const primary_ctor_visibility = parsePrimaryCtorHeader(p);
     var primary_params: []ClassParam = &.{};
+    var has_primary_ctor = false;
     if (std.meta.activeTag(support.peekKind(p).*) == .LParen) {
         _ = support.bump(p);
         primary_params = parseClassParamList(p);
         _ = support.expect(p, .RParen, "`)`");
+        has_primary_ctor = true;
     }
     const sup = parseOptionalSupertypesFull(p);
     const where_bounds = types.parseWhereClause(p);
@@ -145,6 +147,7 @@ pub fn parseClass(
         .type_params = type_params,
         .where_bounds = where_bounds,
         .primary_params = primary_params,
+        .has_primary_ctor = has_primary_ctor,
         .primary_ctor_visibility = primary_ctor_visibility,
         .init_blocks = init_blocks,
         .init_block_positions = init_block_positions,

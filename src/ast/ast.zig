@@ -467,6 +467,11 @@ pub const Class = struct {
     /// Primary-constructor parameters. Entries marked `val`/`var` also
     /// become member properties on the instance.
     primary_params: []ClassParam,
+    /// Whether the header declares a primary constructor (`class A()` /
+    /// `class A(x: Int)`), as opposed to a class with none (`class A {
+    /// constructor(...) }`), which has no implicit zero-argument constructor
+    /// once it declares a secondary.
+    has_primary_ctor: bool = true,
     /// `init { … }` blocks in declaration order. Executed during
     /// construction interleaved with body-property initializers per
     /// `init_block_positions`, matching Kotlin's source-order rule.
