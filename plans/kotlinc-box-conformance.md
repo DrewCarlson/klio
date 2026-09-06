@@ -332,6 +332,48 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    / `clashingDefaultConstructors` (a local subclass loses the field its
    parent secondary constructor sets), `fieldInitializerOptimization.kt`.
 
+11. **CI red after #10 (2026-09-06), three mechanisms**: (a) the compose
+   examples failed with `unresolved global globalSnapshot`: the header
+   expansion of #10 let `Snapshot`'s `@Deprecated(level = HIDDEN)`
+   secondary `(Int, SnapshotIdSet)` win over the primary because the
+   runtime `snapshotId` arrives Int-tagged and scored better than the
+   `Long` head; the HIDDEN constructor's delegation re-entered the file's
+   `<clinit>`, the initializer deferred silently (`Unbound`), and the reader
+   missed. kotlinc never resolves a HIDDEN/low-priority constructor: header
+   resolution now considers only ordinary secondaries, and an integral
+   value scores equally against any integral head when a same-count
+   secondary is weighed against the primary. `KLIO_TOPPROP_TRACE=1` now
+   names a deferred top-level initializer and its error tag. (b) the e2e
+   in-process route panicked in `sweepFull → freeSmall` on
+   `enum_secondary_constructors`: entries rebuilt through `newInstance` are
+   slab-owned, and the VM-start constructor-arg patch then defined
+   page-allocated strings into them; the patch now skips rebuilt entries and
+   the name preset uses the VM allocator. (c) the compose plugin gate's
+   GC-stress preflight crashed in the marker: `keepalivePushSlice` stores the
+   slice by reference and the expansion pinned lists it then freed; pins
+   now cover only the final argument list. Bisect recipe: a worktree at the
+   last green commit with `kotlin`/`kotlin-klio` symlinked, `zig build
+   klio-harness`, the example on both binaries; then revert one hunk at a
+   time in the worktree. (d) A fourth mechanism sat behind (b): the
+   rebuilt entries were held only in a local array until the loop ended,
+   so an entry's instance was unreachable to the collector while the next
+   entry's header thunks ran user code; under `KLIO_GC_STRESS=1` the first
+   entry's fields were swept and their slots reused (`S.A.sym` read the
+   next entry's string). The rebuilt entry array is installed on the class
+   before any entry is constructed, and the name preset and constructor
+   arguments are pinned until the instance owns them. Bisect recipe for a
+   GC hole: the Debug harness with `KLIO_GC_STRESS=1` on a five-line enum,
+   then `KLIO_GC_GEN=0` / `KLIO_GC_MINOR_STOP=0` to tell a remembered-set
+   hole (vanishes) from an unrooted value (persists). (e) The in-process
+   e2e route still panicked in the program's boundary collection: the
+   "rebuilt" marker field was defined through the patch allocator, which
+   grew the instance's field list with page memory that the sweep later
+   freed through the slab (`freeSmall` on a foreign block reads the
+   0xAA-filled header as a size-class index). A field list is grown only
+   through the instance's own allocator. The CLI never sweeps a
+   still-referenced entry, so only a multi-program process showed it
+   (`KLIO_E2E_FILTER=enum_` on the cached test binary reproduces in 30 s).
+
 ## Log
 
 - 2026-09-05: opened.

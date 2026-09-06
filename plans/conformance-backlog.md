@@ -55,6 +55,18 @@ moves on.
 ## Log
 
 - 2026-09-05: opened; the owning documents carry the task detail.
+- 2026-09-06: CI red on 84e43df9 (shards 0 and 5): three mechanisms root-fixed
+  (hidden secondary constructors in header resolution, page-allocated fields
+  in slab entries, keepalive slices freed under the marker); record #11 in
+  `kotlinc-box-conformance.md`.
+- 2026-09-05: Stage 2 Task 4 in progress — ten cluster fixes landed
+  (destructuring forms, explicit primitive rangeTo, invoked lambda
+  arguments, enum entry bodies as subclasses, language feature flags and
+  the name-based short form, corpus syntax gaps, contextual anonymous
+  functions, tailrec in every form, bare accessors and enum secondary
+  constructors, parent secondary constructors and enum virtual dispatch):
+  census 5,246 / 1,105 → 5,553 / 799 / 19. Records and verdicts in
+  `kotlinc-box-conformance.md`.
 - 2026-09-05: Stage 2 Tasks 1-3 landed (b5e42fd8) — corpus populated locally
   and on CI, `box_support.zig` runner + `box_conformance` itest +
   `klio-census box`, first census 5,246 / 1,105 / 20 of 6,371 selected

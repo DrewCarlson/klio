@@ -419,6 +419,46 @@ const DeferredCtorBody = struct { fqn: ?[]const u8, name: []const u8, body: Func
 /// supplies the grandparent's arguments instead (`super_args`); each chosen
 /// constructor's body is queued to run on the finished instance. Without a
 /// fitting secondary constructor the arguments stay the primary's.
+/// `chooseSecondaryCtor` restricted to the constructors source can name.
+fn chooseOrdinarySecondaryCtor(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
+    var ordinary: std.ArrayList(root.build.SecondaryCtorEntry) = .empty;
+    defer ordinary.deinit(self.allocator);
+    for (entries) |e| if (!e.low_priority) {
+        ordinary.append(self.allocator, e) catch return null;
+    };
+    return chooseSecondaryCtor(self, ordinary.items, args);
+}
+
+/// `scoreCtorHeads` where an integral value scores its full match against
+/// any integral head: a literal's runtime tag is not a type distinction
+/// between overloads whose parameters are both integral.
+fn scoreCtorHeadsWidening(self: *VmHost, heads: []const []const u8, args: []const Value) ?i32 {
+    // Per parameter: an exact head (or an exact typealias target) and an
+    // integral value against an integral head both score the full match, so
+    // `Long` and `Int` parameters tie for a Long argument and the primary
+    // keeps the call; everything else falls back to the ordinary scorer's
+    // verdict for that position.
+    var score: i32 = 0;
+    var i: usize = 0;
+    while (i < args.len and i < heads.len) : (i += 1) {
+        const got = valueTypeHead(args[i]);
+        const declared = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().registry.type_aliases.get(heads[i]) orelse heads[i];
+        };
+        if (std.mem.eql(u8, declared, got) or
+            (headInSet(declared, &integral_heads) and headInSet(got, &integral_heads)))
+        {
+            score += 2;
+            continue;
+        }
+        const one = scoreCtorHeads(self, heads[i .. i + 1], args[i .. i + 1]) orelse return null;
+        score += one;
+    }
+    return score;
+}
+
 fn expandParentSecondaryThisArgs(
     self: *VmHost,
     allocator: Allocator,
@@ -503,28 +543,32 @@ fn expandParentSecondaryThisArgs(
                     }
                     args.deinit(allocator);
                     args.* = ordered;
-                    runtime.keepalivePushSlice(args.items);
                     entry_opt = e;
                     names = null;
                     break;
                 }
             }
         }
-        const entry = entry_opt orelse chooseSecondaryCtor(self, entries, args.items) orelse {
+        // A header call resolves among the constructors source can name:
+        // a `@Deprecated(level = HIDDEN)` or low-priority secondary (kept for
+        // binary compatibility, `Snapshot(id: Int, …)`) is never a candidate.
+        const entry = entry_opt orelse chooseOrdinarySecondaryCtor(self, entries, args.items) orelse {
             def.deinit();
             return .{ .ok = {} };
         };
         if (args.items.len == primary_count and primary_count != 0) {
             // Same count as the primary: the primary keeps the call unless
-            // the secondary's parameter types fit strictly better.
+            // the secondary's parameter types fit strictly better. A scalar
+            // whose runtime tag narrows its declared type (an `Int`-tagged
+            // literal passed to a `Long` parameter) fits both equally.
             const dg = def.borrow();
             var primary_heads: std.ArrayList([]const u8) = .empty;
             defer primary_heads.deinit(allocator);
             for (dg.get().primary_params) |pp| try primary_heads.append(allocator, pp.declared_type orelse "");
             dg.deinit();
-            const primary_score = scoreCtorHeads(self, primary_heads.items, args.items) orelse -1;
+            const primary_score = scoreCtorHeadsWidening(self, primary_heads.items, args.items) orelse -1;
             const heads = entry.param_type_heads[0..@min(args.items.len, entry.param_type_heads.len)];
-            const secondary_score = scoreCtorHeads(self, heads, args.items) orelse -1;
+            const secondary_score = scoreCtorHeadsWidening(self, heads, args.items) orelse -1;
             if (secondary_score <= primary_score) {
                 def.deinit();
                 return .{ .ok = {} };
@@ -559,9 +603,13 @@ fn expandParentSecondaryThisArgs(
             if (arg.* != .Int) continue;
             if (scalarRetag(entry.param_type_heads[i], arg.Int)) |rv| arg.* = rv;
         }
-        runtime.keepalivePushSlice(full_args.items);
         if (entry.body) |body_fid| {
-            try bodies.append(allocator, .{ .fqn = class_fqn, .name = class_name, .body = body_fid, .args = try allocator.dupe(Value, full_args.items) });
+            // The body runs after initialization; its argument copy is pinned
+            // for the rest of the construction (the copy's storage outlives
+            // every list this loop frees).
+            const body_args = try allocator.dupe(Value, full_args.items);
+            runtime.keepalivePushSlice(body_args);
+            try bodies.append(allocator, .{ .fqn = class_fqn, .name = class_name, .body = body_fid, .args = body_args });
         }
         var target: std.ArrayList(Value) = .empty;
         for (entry.delegation_arg_thunks) |fid| {
@@ -582,13 +630,15 @@ fn expandParentSecondaryThisArgs(
             // an implicit `super()` for a class without a primary constructor.
             args.deinit(allocator);
             args.* = .empty;
-            runtime.keepalivePushSlice(target.items);
             super_args.* = target;
             return .{ .ok = {} };
         }
+        // The delegated arguments become this class's arguments; the values
+        // are pinned once by the caller's chain once the loop settles (a pin
+        // taken here would outlive the backing store the next iteration
+        // frees).
         args.deinit(allocator);
         args.* = target;
-        runtime.keepalivePushSlice(args.items);
     }
     return .{ .err = try typeErr(allocator, "secondary constructor delegation for `{s}` is recursive", .{class_name}) };
 }
@@ -3445,6 +3495,11 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         const thunks_opt = parentCtorArgThunks(self, cur_fqn, cur_class);
         if (thunks_opt == null and pending_super_args == null) break;
         const thunks: []const FuncId = thunks_opt orelse &.{};
+        if (runtime.envOnce("KLIO_ENUM_INIT_TRACE") != null) {
+            std.debug.print("[chain] class={s} fqn={s} key={s} thunks=", .{ cur_class, cur_fqn orelse "-", sideTableKey(cur_fqn, cur_class) });
+            for (thunks) |t| std.debug.print("{d} ", .{t.int()});
+            std.debug.print("\n", .{});
+        }
         const cur_def = classDefByName(self, sideTableKey(cur_fqn, cur_class));
         var parent_ref: ?SuperRef = null;
         if (cur_def) |d| {
