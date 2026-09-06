@@ -1535,12 +1535,16 @@ fn unifyParamAgainstArg(
                     // binding outlives it (a pack's IR keeps the spelling), so
                     // the type is copied into the module's own memory with its
                     // arguments intact (`List<Level>` must not bind bare `List`).
-                    if (expr_lower.astTypeRefFromIr(@constCast(b), decl_ref, arg.Path.segments[0].span)) |converted| {
+                    // A declared type spelled with the enclosing function's own
+                    // type parameter (`kind: Kind<T>` inside `<reified T> matches`)
+                    // has no static binding here; the splice that reifies the
+                    // outer `T` supplies it.
+                    if (expr_lower.astTypeRefFromIr(@constCast(b), decl_ref, arg.Path.segments[0].span)) |converted| if (!mentionsBareTypeParam(&converted)) {
                         var decl = try cloneAstTypeRef(b.module.registry.allocator, converted);
                         decl.nullable = decl.nullable or b.localDeclNullable(local_name);
                         try unifyTypeParam(param_ty, &decl, tp_names, subst);
                         return;
-                    }
+                    };
                 }
             }
         }
@@ -2357,6 +2361,15 @@ fn propGenericTypeRef(allocator: Allocator, owner: []const u8, name: []const u8,
 /// the declared type *is* a bare type parameter, it binds to the whole
 /// actual type; otherwise matching heads recurse positionally through
 /// generic arguments (`Box<T>` vs `Box<Int>` solves `T = Int`).
+/// Whether a type reference names a bare type parameter anywhere in its tree.
+fn mentionsBareTypeParam(t: *const ast.TypeRef) bool {
+    if (expr_lower.bareTypeParamHead(t.name.name)) return true;
+    for (t.type_args) |a| {
+        if (!a.is_star and mentionsBareTypeParam(&a.ty)) return true;
+    }
+    return false;
+}
+
 /// Deep-copies a type reference (name and type arguments) into `alloc`.
 fn cloneAstTypeRef(alloc: std.mem.Allocator, t: ast.TypeRef) std.mem.Allocator.Error!ast.TypeRef {
     var out = t;
