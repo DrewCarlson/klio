@@ -44,6 +44,12 @@ pub const ArgShape = struct {
     /// candidate only from authoritative evidence.
     ty_authoritative: bool = true,
 
+    /// The argument is written `expr as Any` / `as Any?`: its static type is
+    /// exactly `Any`, which no parameter of a concrete class type accepts
+    /// (`zs.contains(object {} as Any)` picks the `Iterable<T>.contains`
+    /// extension over the member `contains(element: Z)`).
+    cast_any: bool = false,
+
     /// The argument is callable per `valueIsCallable`
     /// (IrClosure/Function/Intrinsic/BoundMethod/PropertyRef) — drives the
     /// trailing-lambda binding gate.

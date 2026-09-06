@@ -55,6 +55,9 @@ moves on.
 ## Log
 
 - 2026-09-05: opened; the owning documents carry the task detail.
+- 2026-09-06: Stage 2 Task 4 #22 constructor references (local and inner
+  classes) and the explicit-`Any` static applicability rule; verdicts
+  recorded for context parameters (#20) and the inline-class survey (#21).
 - 2026-09-06: closure equality regression (compose remember keys) fixed:
   capturing lambdas keep identity; Task 4 #19 typealias partial (1):
   census 5,696 / 656 / 19; compose plugin lane 1389.

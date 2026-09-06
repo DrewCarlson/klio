@@ -2746,7 +2746,6 @@ fn buildModuleWithOverrides(
             .type_params = type_params,
             .target = try ir.lower.decl.loweredTypeRef(a, &ta.target, true),
         };
-        if (runtime.envOnce("KLIO_ALIAS_TRACE") != null) std.debug.print("[alias] {s} -> {s} (qp={?s})\n", .{ ta.name.name, alias_shape.target.name, ta.target.qualified_path });
         try module.registry.type_alias_types.put(ta.name.name, alias_shape);
         const alias_fqn = try resolveFqn(
             a,

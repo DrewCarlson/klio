@@ -46,8 +46,10 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// Delegated locals read through the delegate on every route: 5666 / 686.
 /// Floating-point comparisons follow the static type: 5695 / 657.
 /// Capturing lambdas keep identity, typealiases resolve as their class: 5696 / 656.
-pub const BASELINE: usize = 5696;
-pub const MAX_FAILED: usize = 656;
+/// Constructor references to local and inner classes, explicit `as Any`
+/// applicability: 5706 / 648.
+pub const BASELINE: usize = 5706;
+pub const MAX_FAILED: usize = 648;
 
 /// Directives that bind a test to a framework feature klio has no
 /// counterpart for: a backend restriction, a second module, reflection,
