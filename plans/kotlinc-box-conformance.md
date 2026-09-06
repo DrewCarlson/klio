@@ -615,6 +615,47 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
     anonymous object types and super calls, and alias-typed extension
     functions.
 
+20. **Context parameters (2026-09-06, surveyed)**: `contextParameters`
+    fails 21 of its files across several mechanisms, each under five: a
+    named argument naming a CONTEXT parameter on a member with context and
+    no-context overloads (`c.foo(scope = scope)`: the member picker does not
+    count context parameters); a context parameter shadowed by the
+    extension receiver's same-named member (`context(a: X) fun X.f() =
+    a.foo()` reads the receiver's `a`); a companion object as a context
+    value; a context parameter used as another parameter's default; and
+    an outer inline receiver splice's subject not feeding a contextual
+    callee's context (`with("c1") { with(listOf("c2")) { test(...) } }`
+    binds only the inner subject — the fused tier's chain window seeds the
+    callee with the in-flight pushes above its base, and the outer subject
+    sits below it). Carried as verdicts; no single mechanism reaches five.
+
+21. **Inline classes (2026-09-06, surveyed)**: `inlineClasses` fails 17.
+    Six share one shape: `zs.contains(object {} as Any)` on a value class
+    implementing `Collection<Z>` must bind the `Iterable<T>.contains`
+    extension (the member `contains(element: Z)` is inapplicable to an
+    `Any` argument); klio dispatches the member at runtime. Landed the
+    static half: an argument written `as Any` is inapplicable to a
+    parameter of concrete class type (`ArgShape.cast_any`), and the
+    member-syntax lowering then tries the extension. Left: the extension
+    resolver rejects `Iterable<T>.contains` because `T` bound from the
+    receiver (`Z`) conflicts with the `Any` argument; kotlinc unifies `T`
+    to the common supertype `Any`. The rest are pairs: `super.hashCode()`
+    on a value class, mangled SAM wrappers, constructor references with
+    inline-class parameters, `swap` on `UIntArray`.
+
+22. **Constructor references (2026-09-06)**: `::A` naming a local class
+    lowered to a property reference of the name (the local class's
+    declaration binds the class value under the name; the reference now
+    loads it, and a call constructs). `Outer::Inner` for an inner class is
+    the unbound form taking the outer instance as its first argument; the
+    invocation appended it to the constructor's own parameters
+    (`Inner() expects 0 args, got 1`); it now constructs through the outer
+    exactly as `outer.Inner(...)`, and the bound form `outer::Inner` keeps
+    its receiver instead of degrading to the bare class value. Example
+    `constructor_references`. `callableReference/function` 74 → 78 of 90,
+    `inlineClasses/callableReferences` 54 → 56 of 56; census 5,706 / 648 /
+    17; sweep 117/0; corpus 473/473; unit green.
+
  Log
 
 - 2026-09-05: opened.
@@ -641,3 +682,4 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
 - 2026-09-06: Task 4 #17 callable reference equality landed: 5665 / 687.
 - 2026-09-06: Task 4 #18 IEEE 754 comparisons landed: 5695 / 657.
 - 2026-09-06: capturing-lambda identity restored, #19 typealias partial: 5696 / 656.
+- 2026-09-06: Task 4 #22 constructor references + explicit-Any applicability landed: 5706 / 648.

@@ -552,6 +552,17 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 ref_pushed = true;
             }
             defer if (ref_pushed) ir.eval.popRefSiteFile(ref_prev);
+            // `A::Inner` names an INNER class's constructor: the unbound form
+            // takes the outer instance as its first argument and constructs
+            // through it (`(A::Inner)(a)` is `a.Inner()`).
+            if (rv == .Class and args.len != 0 and classHasInnerNamed(self, &rv, name)) {
+                return host_call_member.callMemberNamedStatic(self, allocator, &args[0], name, args[1..], &.{}, null);
+            }
+            // `outer::Inner` binds the outer instance: construct through it so
+            // the instance carries its `outer` link.
+            if (rv == .Instance and instanceHasInnerNamed(self, &rv, name)) {
+                return host_call_member.callMemberNamedStatic(self, allocator, &rv, name, args, &.{}, null);
+            }
             if (boundReferenceFunc(callee)) |func| {
                 var exact_args: std.ArrayList(Value) = .empty;
                 defer exact_args.deinit(allocator);
@@ -751,6 +762,24 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             break :blk null;
         };
         if (class_id) |cid| {
+            // `Outer::Inner` is the inner class's constructor in its unbound
+            // form: the first argument is the outer instance, the rest are
+            // the constructor's own (`(Outer::Inner)(outer, n)`).
+            const inner = blk: {
+                const g = cls.borrow();
+                defer g.deinit();
+                break :blk g.get().is_inner;
+            };
+            if (inner and args.len != 0 and args[0] == .Instance) {
+                const n_primary = blk: {
+                    const mg = self.module.borrow();
+                    defer mg.deinit();
+                    break :blk if (cid.int() < mg.get().classes.items.len) mg.get().classes.items[cid.int()].primary_params.len else 0;
+                };
+                if (args.len == n_primary + 1) {
+                    return host_instances.newInstance(self, allocator, cid, args[1..], &args[0]);
+                }
+            }
             return host_instances.newInstance(self, allocator, cid, args, null);
         }
         // Direct allocation for classes that aren't in the IR
@@ -2261,6 +2290,38 @@ pub fn callValueWithThisExact(self: *VmHost, allocator: Allocator, callee: *cons
         }
     }
     return callValueWithThisSel(self, allocator, callee, this_value, args, arg_names, false);
+}
+
+/// Whether the class value `cv` declares an `inner class` named `name`.
+fn classHasInnerNamed(self: *VmHost, cv: *const Value, name: []const u8) bool {
+    const fqn = blk: {
+        const g = cv.Class.borrow();
+        defer g.deinit();
+        break :blk if (g.get().fqn.len != 0) g.get().fqn else g.get().name;
+    };
+    return classFqnHasInnerNamed(self, fqn, name);
+}
+
+/// Whether the instance's class declares an `inner class` named `name`.
+fn instanceHasInnerNamed(self: *VmHost, iv: *const Value, name: []const u8) bool {
+    const fqn = blk: {
+        const g = iv.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk if (cg.get().fqn.len != 0) cg.get().fqn else cg.get().name;
+    };
+    return classFqnHasInnerNamed(self, fqn, name);
+}
+
+fn classFqnHasInnerNamed(self: *VmHost, fqn: []const u8, name: []const u8) bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const owner = mg.get().classIdByFqn(fqn) orelse mg.get().classId(fqn);
+    const nested = if (owner) |o| mg.get().classIdNestedIn(o, name) else null;
+    const n = nested orelse return false;
+    if (n.int() >= mg.get().classes.items.len) return false;
+    return mg.get().classes.items[n.int()].is_inner;
 }
 
 pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, body_func: FuncId, captures: []const Value) Allocator.Error!EvalResult {

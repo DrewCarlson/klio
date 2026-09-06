@@ -911,6 +911,15 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     return dst;
                 }
             }
+            // `::A` naming a LOCAL class is its constructor: the declaration
+            // bound the class value under the name, and calling a class value
+            // constructs it.
+            if (build.isLocalClassInScope(pr.name.name)) {
+                if (b.resolve(pr.name.name)) |reg| {
+                    try b.push(.{ .Move = .{ .dst = dst, .src = reg } });
+                    return dst;
+                }
+            }
             // `::rec` referencing the ENCLOSING local fn from inside its own
             // body (or a lambda nested in it): the plain name is unbound here
             // — and a later same-named sibling would rebind it — so the
@@ -1182,10 +1191,14 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
             // `Outer::Nested` where `Nested` is a class is a constructor
-            // reference, not a bound member ref — load the class value.
+            // reference, not a bound member ref — load the class value. A
+            // receiver naming a VALUE in scope (`outer::Inner`) is the bound
+            // form of an inner class's constructor and keeps the receiver.
             if (!std.mem.eql(u8, mr.name.name, "class") and
                 mr.receiver.* == .Path and
-                b.module.classId(mr.name.name) != null)
+                b.module.classId(mr.name.name) != null and
+                !(mr.receiver.Path.segments.len == 1 and
+                    (b.resolve(mr.receiver.Path.segments[0].name) != null or b.knowsOuter(mr.receiver.Path.segments[0].name))))
             {
                 const dst = b.allocReg();
                 const nm = try b.module.internConst(b.allocator, .{ .String = mr.name.name });
@@ -6371,7 +6384,6 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 if (cid.int() >= b.module.classes.items.len) break :blk false;
                 break :blk std.mem.indexOfScalar(u8, b.module.classes.items[cid.int()].fqn, '.') != null;
             };
-            if (runtime.envOnce("KLIO_ALIAS_TRACE") != null) std.debug.print("[alias-call] {s} -> {s} nested={}\n", .{ mn, simple, nested_target });
             if (!std.mem.eql(u8, simple, mn) and !fn_alias and nested_target) {
                 const callee_copy = try b.allocator.create(Expr);
                 callee_copy.* = expr.Call.callee.*;
@@ -7655,6 +7667,14 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
     b.call_tail = call_tail;
     return lowerCallGeneral(b, expr);
+}
+
+/// Whether any argument is written `expr as Any` / `as Any?`.
+fn anyCastToAny(args: []const Expr) bool {
+    for (args) |*a| {
+        if (a.* == .As and std.mem.eql(u8, std.mem.trimEnd(u8, a.As.ty.name.name, "?"), "Any")) return true;
+    }
+    return false;
 }
 
 fn anyReified(type_params: []const ast.TypeParam) bool {
@@ -14587,6 +14607,10 @@ pub fn buildStaticReturnArgShapes(
         } else {
             owned.* = try staticCallReturnTypeRef(b, arg);
         }
+        if (arg.* == .As) {
+            const cast_head = std.mem.trimEnd(u8, arg.As.ty.name.name, "?");
+            if (std.mem.eql(u8, cast_head, "Any")) shape.cast_any = true;
+        }
         if (owned.*) |ty| {
             shape.ty = ty;
             // A CALL-RETURN derivation whose head is a bare type parameter
@@ -21108,6 +21132,30 @@ fn lowerResolvedMemberCall(
         if (fhead) {
             lmNote(.dynamic_by_design);
             return .none;
+        }
+    }
+    // An argument written `expr as Any` fits no member whose parameter has
+    // a concrete class type: kotlinc binds the same-named extension instead
+    // (`zs.contains(object {} as Any)` on a `Collection<Z>` implementation
+    // is `Iterable<T>.contains`, never the member `contains(element: Z)`).
+    if (owner_id) |oid| {
+        if (recv_state.reg == null and ast_type_args.len == 0 and anyCastToAny(args) and
+            b.module.classHierarchyDeclaresMember(oid, name.name))
+        {
+            const cast_shapes = try buildStaticArgShapes(b, args, ast_arg_names);
+            defer b.allocator.free(cast_shapes);
+            const res = b.module.resolveMemberCall(oid, name.name, cast_shapes, .{
+                .caller_file = name.span.file,
+                .lexical_owner = if (b.ownerClass()) |owner_name| b.module.classId(owner_name) else null,
+                .receiver_type = ty,
+            });
+            if (!res.applicable and res.target == null) {
+                const ext = try lowerResolvedExtensionCall(b, receiver, name, args, ast_arg_names, ast_type_args, ty);
+                if (ext) |reg| {
+                    lmNote(.bound_static);
+                    return .{ .lowered = reg };
+                }
+            }
         }
     }
     // A LOCAL-CLASS typing record: no class row, but the mangled head

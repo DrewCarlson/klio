@@ -4585,6 +4585,13 @@ pub const Module = struct {
                         }
                         if (ah.len > 0 and ah.len <= 2 and std.ascii.isUpper(ah[0])) return .unknown;
                     }
+                    // An explicit `as Any` argument fits only an `Any`
+                    // parameter or a type parameter.
+                    if (arg.cast_any) {
+                        const rh = staticTypeHead(std.mem.trimEnd(u8, required.?.name, "?"));
+                        const type_param = rh.len > 0 and rh.len <= 2 and std.ascii.isUpper(rh[0]);
+                        if (!std.mem.eql(u8, rh, "Any") and !type_param) return .incompatible;
+                    }
                     if (self.staticTypeIsSubtypeWithBounds(
                         self.registry.allocator,
                         arg.ty.?,
