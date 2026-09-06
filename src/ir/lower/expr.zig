@@ -6334,6 +6334,27 @@ fn tailJumpArgs(b: *FuncBuilder, receiver: ?*const Expr, args: []const Expr, arg
 
 fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call_tail = b.call_tail;
+    // A bare call of a delegated local (`val handler by rememberUpdatedState(f)`
+    // then `handler()`) invokes the value the delegate's `getValue` yields,
+    // never the delegate object bound under the plain name.
+    if (expr.Call.callee.* == .Path and expr.Call.callee.Path.segments.len == 1 and expr.Call.type_args.len == 0) {
+        const dn = expr.Call.callee.Path.segments[0].name;
+        if (b.resolve(dn) != null or b.knowsOuter(dn) or isLowerAnonCapture(dn) or build.anonCaptureBinds(dn)) {
+            if (try lowerDelegateRead(b, dn)) |delegate_value| {
+                const run = try lowerArgRun(b, expr.Call.args);
+                const arg_names = try internArgNames(b.allocator, b.module, expr.Call.arg_names);
+                const dst = b.allocReg();
+                try b.push(.{ .CallValue = .{
+                    .dst = dst,
+                    .callee = delegate_value,
+                    .args = run[0],
+                    .n_args = run[1],
+                    .arg_names = arg_names,
+                } });
+                return dst;
+            }
+        }
+    }
     // The call's tail flag for everything this call lowers (an inline
     // splice, the general path), saved and restored across nested calls.
     const prev_tail_ok = b.tail_call_ok;
@@ -14856,12 +14877,22 @@ fn lowerDelegateRead(b: *FuncBuilder, name: []const u8) Allocator.Error!?Reg {
     const dname_stack = std.fmt.bufPrint(&namebuf, "{s}$klio_delegate", .{name}) catch return null;
     const in_scope = b.resolve(dname_stack) != null;
     const outer = b.knowsOuter(dname_stack);
-    if (!in_scope and !outer) return null;
+    // An anonymous object's or local class's method closes over the
+    // delegate binding like any other enclosing local.
+    const anon = !in_scope and !outer and (isLowerAnonCapture(dname_stack) or build.anonCaptureBinds(dname_stack));
+    if (!in_scope and !outer and !anon) return null;
     // An inner plain binding (a lambda/splice parameter, a shadowing
     // local) named like the delegated var outranks the delegate read.
     if (b.plainShadowsDelegate(name, dname_stack)) return null;
     const dname = try b.allocator.dupe(u8, dname_stack);
-    const delegate = if (in_scope) b.resolve(dname).? else try resolveCapture(b, dname);
+    const delegate = if (in_scope)
+        b.resolve(dname).?
+    else if (anon) blk: {
+        const cell = try b.loadCaptureHoisted(dname);
+        const dst = b.allocReg();
+        try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
+        break :blk dst;
+    } else try resolveCapture(b, dname);
     const null_arg = try b.emitConst(.Null);
     const prop_ref = b.allocReg();
     const pname = try b.module.internConst(b.allocator, .{ .String = name });

@@ -557,6 +557,18 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
     visible expectation at the reference site; 2), a vararg-as-array
     member reference in a receiver-form slot, a Unit coercion combined
     with a vararg spread, and a companion member reference.
+    CI after #16/#17 (compose plugin commontest 1385 → 1373): binding a
+    delegated local to its delegate exposed three routes that read the
+    plain binding: a bare call of the local (`handler()` for `val handler
+    by rememberUpdatedState(f)`) invoked the delegate object, a read inside
+    an anonymous object's method saw the delegate as an ordinary anonymous
+    capture, and an anonymous object's body property initialized from the
+    bare name took the captured value through the runtime's
+    literal-initializer shortcut. All three now read through the delegate
+    (example `delegated_local_calls`); `CompositionReusingTests` 25/25 and
+    `rememberObserverThrashing` pass again. The shard's other named
+    failures (`validatePotentialDeadlock`, the `concurrentMixingWriteApply`
+    pair) are the itest's documented allowed failures.
 
  Log
 
