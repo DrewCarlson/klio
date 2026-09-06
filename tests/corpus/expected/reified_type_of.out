@@ -1,0 +1,11 @@
+kotlin.String
+kotlin.collections.List<kotlin.Int>
+true
+true
+false
+true
+true
+kotlin.Number
+true
+kotlin.collections.Map<kotlin.String, kotlin.collections.List<kotlin.Int>>
+true

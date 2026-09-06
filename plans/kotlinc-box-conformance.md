@@ -656,6 +656,24 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
     `inlineClasses/callableReferences` 54 → 56 of 56; census 5,706 / 648 /
     17; sweep 117/0; corpus 473/473; unit green.
 
+23. **Reified `typeOf` (2026-09-06)**: `typeErasure` failed 12 of 24, ten
+    of them `inline fun <reified T> foo(a: T) = typeOf<T>()` compared
+    against `typeOf<X>()`. Two mechanisms. (a) `typeOf<T>()` yielded
+    synthetic `KType` instances that compared by identity, so even
+    `typeOf<String>() == typeOf<String>()` was false; a `KType` now
+    compares by classifier, arguments and nullability, hashes
+    consistently, and renders as the qualified type. (b) A reified
+    parameter unified against a bare local argument consulted only splice
+    parameter types, binding `T` to the runtime class; a caller local with
+    a declared type binds the static type (`val n: Number` → `T :=
+    Number`) with its type arguments intact (a local typed `List<Level>`
+    binds `List<Level>`, never bare `List`, which turned a
+    `serializer<T>()` into a polymorphic `List` lookup), and a nullable
+    bound spells its `?`. Example
+    `reified_type_of`. Subset 12 → 21 of 24. Left: a local declared
+    `Any?` reaches the binder as `Any` (its nullability record is not
+    visible at the unification site), and two context-parameter shapes.
+
  Log
 
 - 2026-09-05: opened.
@@ -683,3 +701,4 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
 - 2026-09-06: Task 4 #18 IEEE 754 comparisons landed: 5695 / 657.
 - 2026-09-06: capturing-lambda identity restored, #19 typealias partial: 5696 / 656.
 - 2026-09-06: Task 4 #22 constructor references + explicit-Any applicability landed: 5706 / 648.
+- 2026-09-06: Task 4 #23 KType structural equality + reified binding from a local's declared type landed: 5716 / 638.

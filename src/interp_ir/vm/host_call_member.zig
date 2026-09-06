@@ -10562,7 +10562,118 @@ fn samIterableInstance(self: *VmHost, allocator: Allocator, receiver: *const Val
     return lookupAnonMethod(self, allocator, cn, "iterator/0", "iterator") != null;
 }
 
+fn isKTypeSynth(v: *const Value) bool {
+    if (v.* != .Instance) return false;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    return std.mem.eql(u8, cg.get().name, "kotlin.reflect.KType") or std.mem.eql(u8, cg.get().fqn, "kotlin.reflect.KType");
+}
+
+fn ktypeField(v: *const Value, name: []const u8) Value {
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    return g.get().get(name) orelse Value.Null;
+}
+
+fn ktypeClassifierName(v: *const Value) []const u8 {
+    const c = ktypeField(v, "classifier");
+    switch (c) {
+        .Class => |cd| {
+            const g = cd.borrow();
+            defer g.deinit();
+            return if (g.get().fqn.len != 0) g.get().fqn else g.get().name;
+        },
+        .String => |s| {
+            const g = s.borrow();
+            defer g.deinit();
+            return g.get().bytes;
+        },
+        else => return "",
+    }
+}
+
+fn ktypeEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: *const Value) Allocator.Error!bool {
+    if (!isKTypeSynth(b)) return false;
+    if (!std.mem.eql(u8, ktypeClassifierName(a), ktypeClassifierName(b))) return false;
+    const na = ktypeField(a, "isMarkedNullable");
+    const nb = ktypeField(b, "isMarkedNullable");
+    if ((na == .Bool and na.Bool) != (nb == .Bool and nb.Bool)) return false;
+    const aa = ktypeField(a, "arguments");
+    const ab = ktypeField(b, "arguments");
+    if (aa != .List or ab != .List) return aa == .Null and ab == .Null;
+    const ga = aa.List.items.borrow();
+    defer ga.deinit();
+    const gb = ab.List.items.borrow();
+    defer gb.deinit();
+    if (ga.get().items.len != gb.get().items.len) return false;
+    for (ga.get().items, gb.get().items) |*pa, *pb| {
+        if (pa.* != .Instance or pb.* != .Instance) return false;
+        const ta = ktypeField(pa, "type");
+        const tb = ktypeField(pb, "type");
+        if (ta == .Null and tb == .Null) continue;
+        if (ta != .Instance or tb != .Instance) return false;
+        if (!try ktypeEquals(self, allocator, &ta, &tb)) return false;
+    }
+    return true;
+}
+
+fn ktypeHash(self: *VmHost, allocator: Allocator, v: *const Value) Allocator.Error!i32 {
+    var h: i32 = builtin_members.javaStringHash(ktypeClassifierName(v));
+    const n = ktypeField(v, "isMarkedNullable");
+    h = h *% 31 +% @as(i32, if (n == .Bool and n.Bool) 1 else 0);
+    const args = ktypeField(v, "arguments");
+    if (args == .List) {
+        const g = args.List.items.borrow();
+        defer g.deinit();
+        for (g.get().items) |*pa| {
+            if (pa.* != .Instance) continue;
+            const t = ktypeField(pa, "type");
+            h = h *% 31 +% (if (t == .Instance) try ktypeHash(self, allocator, &t) else 0);
+        }
+    }
+    return h;
+}
+
+fn ktypeRender(self: *VmHost, allocator: Allocator, v: *const Value, buf: *std.ArrayList(u8)) Allocator.Error!void {
+    try buf.appendSlice(allocator, ktypeClassifierName(v));
+    const args = ktypeField(v, "arguments");
+    if (args == .List) {
+        const g = args.List.items.borrow();
+        defer g.deinit();
+        if (g.get().items.len != 0) {
+            try buf.append(allocator, '<');
+            for (g.get().items, 0..) |*pa, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                const t = if (pa.* == .Instance) ktypeField(pa, "type") else Value.Null;
+                if (t == .Instance) try ktypeRender(self, allocator, &t, buf) else try buf.append(allocator, '*');
+            }
+            try buf.append(allocator, '>');
+        }
+    }
+    const n = ktypeField(v, "isMarkedNullable");
+    if (n == .Bool and n.Bool) try buf.append(allocator, '?');
+}
+
 fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    // A `KType` (`typeOf<T>()`) compares structurally: same classifier,
+    // same arguments, same nullability; it renders as its classifier's
+    // name with `?` for a nullable type.
+    if (isKTypeSynth(receiver)) {
+        if (args.len == 1 and std.mem.eql(u8, name, "equals")) {
+            return .{ .ok = boolVal(try ktypeEquals(self, allocator, receiver, &args[0])) };
+        }
+        if (args.len == 0 and std.mem.eql(u8, name, "hashCode")) {
+            return .{ .ok = Value.newInt(@as(i64, try ktypeHash(self, allocator, receiver))) };
+        }
+        if (args.len == 0 and std.mem.eql(u8, name, "toString")) {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            try ktypeRender(self, allocator, receiver, &buf);
+            return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, try buf.toOwnedSlice(allocator)) } };
+        }
+    }
     // A bound or qualified callable reference (`v::m`, `V::m`, `Foo::ext`)
     // compares by name, receiver and adaptation, and hashes the same way.
     if (host_fields.boundRefParts(receiver)) |mine| {
