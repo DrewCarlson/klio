@@ -28,9 +28,20 @@ const StringSet = std.StringHashMap(void);
 /// in `ast_scan.zig`.)
 pub fn isAnyTypedPath(b: *const FuncBuilder, e: *const Expr) bool {
     return switch (e.*) {
-        .Path => |p| p.segments.len == 1 and b.isAnyTyped(p.segments[0].name),
+        .Path => |p| p.segments.len == 1 and b.isAnyTyped(p.segments[0].name) and
+            !narrowedToNumeric(b, p.segments[0].name),
         else => false,
     };
+}
+
+/// A smart cast (`x is Double && x == y`) narrows an `Any`-typed local to a
+/// numeric type for the branch: comparisons there are the primitive IEEE
+/// ones, not the boxed `equals`.
+pub fn narrowedToNumeric(b: *const FuncBuilder, name: []const u8) bool {
+    const t = b.localDeclType(name) orelse return false;
+    const heads = [_][]const u8{ "Double", "Float", "Int", "Long", "Short", "Byte" };
+    for (heads) |h| if (std.mem.eql(u8, t, h)) return true;
+    return false;
 }
 
 /// True when `e` is a bare name bound to a non-nullable generic type-parameter

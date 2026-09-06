@@ -570,6 +570,26 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
     failures (`validatePotentialDeadlock`, the `concurrentMixingWriteApply`
     pair) are the itest's documented allowed failures.
 
+18. **IEEE 754 comparisons (2026-09-06)**: `ieee754` failed 16 of 39. Four
+    mechanisms, all static-type-directed. (a) A smart cast (`x is Double
+    && x == y` on an `Any` local) narrows the local for the branch, but the
+    `==` lowering consulted only the local's declared-`Any` record and
+    emitted the boxed comparison, so `-0.0 == 0.0` was false and `NaN ==
+    NaN` true after the cast; a numeric narrowing now makes the operand
+    primitive, and a Double meets a Float as a Double at runtime (the
+    scalar arm promotes for the ordering and IEEE equality operators
+    only). (b) `Double.equals`/`Float.equals` as member calls compared
+    with the IEEE operator; they compare the boxed representation. (c) A
+    value read through `Comparable<Double>` (a cast or a parameter declared
+    so) orders by `compareTo` and compares by `equals`. (d) `Int`/`Long`
+    `compareTo` with a floating argument, and `Float.compareTo` with a
+    Double, convert to Double and follow the total order (`0.compareTo(
+    -0.0) == 1`, `compareTo(NaN) == -1`). Example `ieee754_comparisons`.
+    Subset 23 → 36 of 39; census 5,695 / 657 / 19; sweep 117/0; corpus
+    472/472; unit green. Left: generic and reified `Comparable` receivers
+    inside inline functions, an unstable smart cast (`var`) on NaN, and a
+    smart cast with numeric promotion between integer and floating types.
+
  Log
 
 - 2026-09-05: opened.
@@ -594,3 +614,4 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
   super constructor calls, #15 enum static scope landed: 5623 / 729.
 - 2026-09-06: Task 4 #16 provideDelegate convention landed: 5647 / 705.
 - 2026-09-06: Task 4 #17 callable reference equality landed: 5665 / 687.
+- 2026-09-06: Task 4 #18 IEEE 754 comparisons landed: 5695 / 657.

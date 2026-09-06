@@ -44,8 +44,9 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// The `provideDelegate` convention at every delegated property: 5647 / 705.
 /// Callable references compare by target, receiver and adaptation: 5665 / 687.
 /// Delegated locals read through the delegate on every route: 5666 / 686.
-pub const BASELINE: usize = 5666;
-pub const MAX_FAILED: usize = 686;
+/// Floating-point comparisons follow the static type: 5695 / 657.
+pub const BASELINE: usize = 5695;
+pub const MAX_FAILED: usize = 657;
 
 /// Directives that bind a test to a framework feature klio has no
 /// counterpart for: a backend restriction, a second module, reflection,

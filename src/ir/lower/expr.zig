@@ -1515,7 +1515,10 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
     if ((op == .Eq or op == .Neq) and
         (isBoxedToAnyForm(lhs) or isBoxedToAnyForm(rhs) or
             isAnyTypedPath(b, lhs) or isAnyTypedPath(b, rhs) or
-            isGenericTypedPath(b, lhs) or isGenericTypedPath(b, rhs)))
+            isGenericTypedPath(b, lhs) or isGenericTypedPath(b, rhs) or
+            isComparableCast(lhs) or isComparableCast(rhs) or
+            (lhs.* == .Path and lhs.Path.segments.len == 1 and comparableTypedLocal(b, lhs.Path.segments[0].name)) or
+            (rhs.* == .Path and rhs.Path.segments.len == 1 and comparableTypedLocal(b, rhs.Path.segments[0].name))))
     {
         const l = try lowerExpr(b, lhs);
         const r = try lowerExpr(b, rhs);
@@ -1702,8 +1705,23 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
 }
 
 fn isGenericOperand(b: *FuncBuilder, e: *const Expr) bool {
-    return e.* == .Path and e.Path.segments.len == 1 and
-        b.isGenericTypedParam(e.Path.segments[0].name);
+    return (e.* == .Path and e.Path.segments.len == 1 and
+        (b.isGenericTypedParam(e.Path.segments[0].name) or comparableTypedLocal(b, e.Path.segments[0].name))) or
+        isComparableCast(e);
+}
+
+/// A local or parameter declared as `Comparable<…>` orders by `compareTo`
+/// and compares by `equals`, like a value read through a `Comparable` cast.
+fn comparableTypedLocal(b: *FuncBuilder, name: []const u8) bool {
+    const t = b.localDeclType(name) orelse return false;
+    return std.mem.eql(u8, simpleTypeHead(t), "Comparable");
+}
+
+/// `(x as Comparable<Double>) >= y`: a value read through `Comparable`
+/// orders by `compareTo` (the total order) and compares by `equals`.
+fn isComparableCast(e: *const Expr) bool {
+    if (e.* != .As) return false;
+    return std.mem.eql(u8, simpleTypeHead(e.As.ty.name.name), "Comparable");
 }
 
 /// A comparison operand with an established concrete static type: a literal,
