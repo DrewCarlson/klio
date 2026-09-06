@@ -55,10 +55,11 @@ moves on.
 ## Log
 
 - 2026-09-05: opened; the owning documents carry the task detail.
-- 2026-09-06: CI red on 84e43df9 (shards 0 and 5): three mechanisms root-fixed
-  (hidden secondary constructors in header resolution, page-allocated fields
-  in slab entries, keepalive slices freed under the marker); record #11 in
-  `kotlinc-box-conformance.md`.
+- 2026-09-06: CI red on a8a753a3/84e43df9 (shards 0 and 5): five mechanisms
+  root-fixed in 45b99090 (hidden secondary constructors in header resolution,
+  keepalive slices freed under the marker, entries unreachable between
+  constructions, page-allocated name preset, marker field grown through the
+  patch allocator); record #11 in `kotlinc-box-conformance.md`.
 - 2026-09-05: Stage 2 Task 4 in progress — ten cluster fixes landed
   (destructuring forms, explicit primitive rangeTo, invoked lambda
   arguments, enum entry bodies as subclasses, language feature flags and

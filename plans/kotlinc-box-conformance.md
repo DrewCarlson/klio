@@ -373,8 +373,11 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    through the instance's own allocator. The CLI never sweeps a
    still-referenced entry, so only a multi-program process showed it
    (`KLIO_E2E_FILTER=enum_` on the cached test binary reproduces in 30 s).
+   Verified: e2e CI-shape green, GC-stress preflight green, every box
+   example under `KLIO_GC_STRESS=1` on the Debug harness, census unchanged
+   at 5,553 / 799 / 19, sweep 117/0, unit green. Landed 45b99090.
 
-## Log
+# Log
 
 - 2026-09-05: opened.
 - 2026-09-05: Task 1 populated; Task 2 runner written (`box_support.zig`,
