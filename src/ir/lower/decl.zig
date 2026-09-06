@@ -1118,6 +1118,16 @@ pub fn lowerClassWithExtras(
                 if (f.receiver_type) |*rt| {
                     try module.registry.iface_member_ext_recv.put(.{ .a = c.name.name, .b = f.name.name }, rt.name.name);
                 }
+                // Likewise its `context(...)` parameter types: the SAM
+                // dispatch resolves each from the call site's context scope.
+                if (f.context_params.len != 0) {
+                    var joined: std.ArrayList(u8) = .empty;
+                    for (f.context_params, 0..) |*cp, ci| {
+                        if (ci != 0) try joined.append(a, '|');
+                        try joined.appendSlice(a, cp.ty.name.name);
+                    }
+                    try module.registry.iface_member_ctx_types.put(.{ .a = c.name.name, .b = f.name.name }, try joined.toOwnedSlice(a));
+                }
                 // A bodyless EXPECT-class member IS the declaration of a
                 // host-backed API (`expect class StringBuilder { fun
                 // toString(): String }`): retain it as a HEADER row whose

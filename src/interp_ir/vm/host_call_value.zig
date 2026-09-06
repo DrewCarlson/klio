@@ -1304,7 +1304,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 const last_p = &func.params[np - 1];
                 if (root.isFunctionType(&last_p.ty) and root.valueIsCallable(&args[args.len - 1])) {
                     const leading = args[0 .. args.len - 1];
-                    var ca = switch (try padArgsWithDefaults(self, allocator, module_ref, np, leading, defaults)) {
+                    var ca = switch (try padArgsWithDefaultsFor(self, allocator, module_ref, np, leading, defaults, func.params)) {
                         .ok => |v| v,
                         .err => |e| return .{ .err = e },
                     };
@@ -1312,7 +1312,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                     break :blk ca;
                 }
             }
-            break :blk switch (try padArgsWithDefaults(self, allocator, module_ref, info.n_params, args, defaults)) {
+            break :blk switch (try padArgsWithDefaultsFor(self, allocator, module_ref, info.n_params, args, defaults, func.params)) {
                 .ok => |v| v,
                 .err => |e| return .{ .err = e },
             };
@@ -1367,7 +1367,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                     try prefix.appendSlice(allocator, args[0..vi]);
                     try prefix.append(allocator, runtime.ArrayData.fromBoxedList(items));
                     call_args.deinit(allocator);
-                    call_args = switch (try padArgsWithDefaults(self, allocator, module_ref, info.n_params, prefix.items, defaults)) {
+                    call_args = switch (try padArgsWithDefaultsFor(self, allocator, module_ref, info.n_params, prefix.items, defaults, func.params)) {
                         .ok => |v| v,
                         .err => |e| return .{ .err = e },
                     };
@@ -2668,6 +2668,24 @@ fn padArgsWithDefaults(
     provided: []const Value,
     defaults: ?[]?FuncId,
 ) Allocator.Error!PadResult {
+    return padArgsWithDefaultsFor(self, allocator, module_ref, n_params, provided, defaults, &.{});
+}
+
+/// `padArgsWithDefaults` with the callee's parameters: an omitted `vararg`
+/// parameter takes an empty array (a callable reference to
+/// `foo(vararg a: String, result: String = "OK")` invoked as `() -> String`
+/// is kotlinc's adapted reference, which supplies the empty vararg and the
+/// default), so the default thunks of the parameters after it see their
+/// slots in place.
+fn padArgsWithDefaultsFor(
+    self: *VmHost,
+    allocator: Allocator,
+    module_ref: ObjRef(Module),
+    n_params: usize,
+    provided: []const Value,
+    defaults: ?[]?FuncId,
+    params: []const ir.Param,
+) Allocator.Error!PadResult {
     var call_args: std.ArrayList(Value) = .empty;
     var i: usize = 0;
     while (i < n_params) : (i += 1) {
@@ -2676,6 +2694,15 @@ fn padArgsWithDefaults(
             continue;
         }
         const dfid: ?FuncId = if (defaults) |d| (if (i < d.len) d[i] else null) else null;
+        // An omitted vararg with no default of its own is the empty array;
+        // one declared with a default (`vararg y: T = arrayOf(...)`) takes
+        // that default below like any other parameter.
+        if (dfid == null and i < params.len and params[i].is_vararg) {
+            const empty: std.ArrayList(Value) = .empty;
+            const items = try ValueList.init(allocator, empty);
+            try call_args.append(allocator, runtime.ArrayData.fromBoxedList(items));
+            continue;
+        }
         if (dfid) |fid| {
             // A default-arg thunk lowered inside an extension fn body that
             // references the receiver (`toIndex = size` on `IntArray.fill`)

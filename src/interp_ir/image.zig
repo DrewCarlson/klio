@@ -622,6 +622,7 @@ const RegistryImage = struct {
     top_level_prop_type_refs: []NameTypeEntry = &.{},
     ext_prop_type_heads: []PairStrEntry,
     iface_member_ext_recv: []PairStrEntry,
+    iface_member_ctx_types: []PairStrEntry = &.{},
     abstract_member_arity: []PairU64Entry = &.{},
     private_fn_files: []KV(FuncId, FileId),
     file_packages: []KV(FileId, []const u8),
@@ -1543,6 +1544,7 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
         },
         .ext_prop_type_heads = try pairMapToSlice(a, &r.ext_prop_type_heads),
         .iface_member_ext_recv = try pairMapToSlice(a, &r.iface_member_ext_recv),
+        .iface_member_ctx_types = try pairMapToSlice(a, &r.iface_member_ctx_types),
         .abstract_member_arity = blk: {
             var out2 = try a.alloc(PairU64Entry, r.abstract_member_arity.count());
             var it2 = r.abstract_member_arity.iterator();
@@ -2310,6 +2312,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
     for (ri.top_level_prop_type_refs) |entry| try r.top_level_prop_type_refs.put(entry.name, entry.v);
     for (ri.ext_prop_type_heads) |entry| try r.ext_prop_type_heads.put(.{ .a = entry.a, .b = entry.b }, entry.v);
     for (ri.iface_member_ext_recv) |entry| try r.iface_member_ext_recv.put(.{ .a = entry.a, .b = entry.b }, entry.v);
+    for (ri.iface_member_ctx_types) |entry| try r.iface_member_ctx_types.put(.{ .a = entry.a, .b = entry.b }, entry.v);
     for (ri.abstract_member_arity) |entry| try r.abstract_member_arity.put(.{ .a = entry.a, .b = entry.b }, entry.v);
     for (ri.private_fn_files) |kv| try r.private_fn_files.put(kv.k, kv.v);
     for (ri.file_packages) |kv| try r.file_packages.put(kv.k, kv.v);

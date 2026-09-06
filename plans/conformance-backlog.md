@@ -55,6 +55,9 @@ moves on.
 ## Log
 
 - 2026-09-05: opened; the owning documents carry the task detail.
+- 2026-09-06: Stage 2 Task 4 #12 adapted callable references (omitted
+  varargs empty on every call route, SAM methods pass their context
+  parameters): census 5,560 / 792 / 19, sweep 117/0, corpus 465/465.
 - 2026-09-06: CI red on a8a753a3/84e43df9 (shards 0 and 5): five mechanisms
   root-fixed in 45b99090 (hidden secondary constructors in header resolution,
   keepalive slices freed under the marker, entries unreachable between

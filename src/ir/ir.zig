@@ -11702,6 +11702,10 @@ pub const ModuleRegistry = struct {
     /// slot lowers no func, so the SAM dispatch reads the receiver type
     /// here to bind the lambda's implicit `this`.
     iface_member_ext_recv: StrPairMap([]const u8),
+    /// (interface, method) -> the method's declared `context(...)` parameter
+    /// type names joined by `|`: a SAM conversion of the fun interface supplies
+    /// each context from the call site's context scope as a leading argument.
+    iface_member_ctx_types: StrPairMap([]const u8),
     /// (class simple name, member name) → arity BITMASK (bit n = declared
     /// with n params, capped at 63) for BODYLESS member declarations
     /// (abstract interface/class members). The abstract slot lowers no
@@ -11891,6 +11895,7 @@ pub const ModuleRegistry = struct {
             .member_ext_owner_class = std.AutoHashMap(FuncId, []const u8).init(allocator),
             .private_fn_files = std.AutoHashMap(FuncId, FileId).init(allocator),
             .iface_member_ext_recv = StrPairMap([]const u8).init(allocator),
+            .iface_member_ctx_types = StrPairMap([]const u8).init(allocator),
             .abstract_member_arity = StrPairMap(u64).init(allocator),
             .top_level_const_vals = std.StringHashMap(Const).init(allocator),
             .local_fn_defaults = std.AutoHashMap(FuncId, std.ArrayList(?FuncId)).init(allocator),
@@ -11976,6 +11981,7 @@ pub const ModuleRegistry = struct {
         self.member_ext_owner_class.deinit();
         self.private_fn_files.deinit();
         self.iface_member_ext_recv.deinit();
+        self.iface_member_ctx_types.deinit();
         self.abstract_member_arity.deinit();
         self.top_level_const_vals.deinit();
         {
@@ -12145,6 +12151,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.iface_member_ext_recv.iterator();
             while (it.next()) |e| try out.iface_member_ext_recv.put(e.key_ptr.*, e.value_ptr.*);
+        }
+        {
+            var it = self.iface_member_ctx_types.iterator();
+            while (it.next()) |e| try out.iface_member_ctx_types.put(e.key_ptr.*, e.value_ptr.*);
         }
         {
             var it = self.top_level_const_vals.iterator();

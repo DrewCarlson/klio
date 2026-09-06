@@ -1921,6 +1921,11 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
                                 .err => |e| return .{ .err = e },
                             }
                             _ = &thunk_args;
+                        } else if (f.params[idx].is_vararg) {
+                            // An omitted vararg is the empty array, never a
+                            // placeholder the packer would take as an element.
+                            const empty: std.ArrayList(Value) = .empty;
+                            try args.append(allocator, try packVarargArray(allocator, f.params[idx].ty.name, empty));
                         } else {
                             try args.append(allocator, .Null);
                         }
@@ -1952,6 +1957,11 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
                         .ok => |v| try args.append(allocator, v),
                         .err => |e| return .{ .err = e },
                     }
+                } else if (f.params[idx].is_vararg) {
+                    // An omitted vararg is the empty array, never a
+                    // placeholder the packer would take as an element.
+                    const empty: std.ArrayList(Value) = .empty;
+                    try args.append(allocator, try packVarargArray(allocator, f.params[idx].ty.name, empty));
                 } else {
                     try args.append(allocator, .Null);
                 }
