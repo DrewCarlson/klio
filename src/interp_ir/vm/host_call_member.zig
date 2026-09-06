@@ -6769,6 +6769,24 @@ fn samInstanceDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
             break :blk true;
         };
         if (dispatch_lambda) {
+            // A SAM method declared with `context(A, …)` parameters passes
+            // each context, resolved from the call site's context scope, as
+            // a leading argument of the wrapped callable (kotlinc's adapted
+            // reference `valueParamFun(a: A, i: String)` for
+            // `context(i: A) fun accept(s: String)`).
+            var with_ctx: std.ArrayList(Value) = .empty;
+            defer with_ctx.deinit(allocator);
+            const call_args: []const Value = blk: {
+                const ctx_types = samMemberCtxTypes(self, cls_name, name) orelse break :blk args;
+                var it = std.mem.splitScalar(u8, ctx_types, '|');
+                while (it.next()) |ty| {
+                    if (ty.len == 0) continue;
+                    const v = self.ctxResolve(ty, false) orelse break :blk args;
+                    try with_ctx.append(allocator, v);
+                }
+                try with_ctx.appendSlice(allocator, args);
+                break :blk with_ctx.items;
+            };
             // A fun interface whose single abstract method is a MEMBER
             // EXTENSION (`fun interface MeasurePolicy { fun
             // MeasureScope.measure(...) }`): kotlinc scopes the SAM lambda's
@@ -6782,11 +6800,11 @@ fn samInstanceDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
                 for (entries) |e| {
                     if (e.v != .Instance) continue;
                     if (receiverImplementsType(self, &e.v, recv_ty)) {
-                        return try host_call_value.callValueWithThis(self, allocator, &t, &e.v, args, &.{});
+                        return try host_call_value.callValueWithThis(self, allocator, &t, &e.v, call_args, &.{});
                     }
                 }
             }
-            return try callValueRec(self, allocator, &t, args);
+            return try callValueRec(self, allocator, &t, call_args);
         }
     }
     return null;
@@ -6994,6 +7012,11 @@ fn enclosingSamLambdaDispatch(self: *VmHost, allocator: Allocator, receiver: *co
 /// The declared extension-receiver type head of `cls`'s abstract member
 /// extension named `name`, when the class (a fun interface serving a SAM
 /// conversion) declares one — null otherwise.
+fn samMemberCtxTypes(self: *VmHost, cls: []const u8, name: []const u8) ?[]const u8 {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    return mg.get().registry.iface_member_ctx_types.get(.{ .a = cls, .b = name });
+}
 fn samMemberExtRecvType(self: *VmHost, cls: []const u8, name: []const u8) ?[]const u8 {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -7563,7 +7586,7 @@ fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *const Va
             if (try inheritedMemberDefaults(self, allocator, supertypes, f.name)) |defaults| {
                 const mmg = self.module.borrow();
                 const main_mod = mmg.get();
-                const padded = try padArgsWithDefaults(self, allocator, main_mod, f.params.len, all.items, defaults);
+                const padded = try padArgsWithDefaultsFor(self, allocator, main_mod, f.params.len, all.items, defaults, f.params);
                 mmg.deinit();
                 switch (padded) {
                     .ok => |p| {
@@ -7641,6 +7664,9 @@ fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *const Va
 /// Build the `n_params`-length argument vector, filling positions past
 /// the provided args from default-arg thunks.
 fn padArgsWithDefaults(self: *VmHost, allocator: Allocator, module: *const Module, n_params: usize, provided: []const Value, defaults: ?[]const ?FuncId) Allocator.Error!union(enum) { ok: []Value, err: EvalError } {
+    return padArgsWithDefaultsFor(self, allocator, module, n_params, provided, defaults, &.{});
+}
+fn padArgsWithDefaultsFor(self: *VmHost, allocator: Allocator, module: *const Module, n_params: usize, provided: []const Value, defaults: ?[]const ?FuncId, params: []const ir.Param) Allocator.Error!union(enum) { ok: []Value, err: EvalError } {
     // Kotlin binds a trailing lambda to the LAST parameter. When the
     // positional layout would leave a default-less last parameter empty
     // while the last provided arg is callable, the call was the
@@ -7669,6 +7695,15 @@ fn padArgsWithDefaults(self: *VmHost, allocator: Allocator, module: *const Modul
         }
         if (i < pos_len) {
             try call_args.append(allocator, provided[i]);
+            continue;
+        }
+        // An omitted vararg with no default of its own is the empty array —
+        // never a placeholder the packer would take as an element.
+        if (i < params.len and params[i].is_vararg and
+            (defaults == null or i >= defaults.?.len or defaults.?[i] == null))
+        {
+            const empty: std.ArrayList(Value) = .empty;
+            try call_args.append(allocator, runtime.ArrayData.fromBoxedList(try ObjRef(std.ArrayList(Value)).init(allocator, empty)));
             continue;
         }
         const dfid: ?FuncId = if (defaults) |d| (if (i < d.len) d[i] else null) else null;
@@ -9807,7 +9842,7 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
     };
     defer if (defaults) |d| if (runtime.freeScratch()) allocator.free(d);
     if (defaults != null and all.len < f.params.len) {
-        const padded = try padArgsWithDefaults(self, allocator, mod, f.params.len, all, defaults);
+        const padded = try padArgsWithDefaultsFor(self, allocator, mod, f.params.len, all, defaults, f.params);
         switch (padded) {
             .ok => |p| {
                 if (runtime.freeScratch()) allocator.free(all);

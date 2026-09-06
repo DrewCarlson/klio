@@ -388,6 +388,34 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    definition, and a defaulted secondary is a candidate only when no
    primary takes the call.
 
+12. **Adapted callable references (2026-09-06)**: `callableReference/
+   adaptedReferences` sat at 57 of 81. Two mechanisms. (a) A call that
+   omits a trailing vararg after a defaulted parameter (`m(1)` for
+   `fun m(i: Int, s: String = "", vararg t: String)`) packed the padding
+   placeholder into the vararg, so `t` arrived as `[null]` — on the
+   direct-call route, the closure/reference route, and the member route,
+   each of which pads missing slots before packing. An omitted vararg
+   with no default of its own is now the empty typed array at all three
+   padding sites, and a vararg declared with a default takes that
+   default (the first cut regressed `varargWithDefaultValue` by padding
+   before consulting the default). This is what kotlinc's adapted
+   references need: `::foo` for `foo(vararg a: String, result: String =
+   "OK")` used as `() -> String` supplies the empty vararg and the
+   default, bound and unbound alike. (b) A fun interface whose method
+   declares `context(A, …)` parameters dropped the contexts when the
+   SAM-wrapped callable ran; the method's context types are now recorded
+   at lowering beside the receiver registry (`iface_member_ctx_types`,
+   serialized in the image) and `samInstanceDispatch` prepends each
+   context resolved from the call site's context scope. Example
+   `adapted_callable_references`. Subset 57 → 63 of 81; census
+   5,560 / 792 / 19; sweep 117/0; corpus 465/465; unit green. Left in the
+   subset: `varargOverloads` (`(Array<String>) -> Int = ::foo` picks the
+   `vararg Int` overload), `manyDefaultsAndVararg` (a default `= E` after
+   the vararg resolves to `kotlin.math.E` instead of the file's
+   `object E` on the adapted route), the suspend-conversion and
+   inner-constructor shapes, and three context-function shapes — carried
+   into the next clusters.
+
  Log
 
 - 2026-09-05: opened.
@@ -407,3 +435,4 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
   landed: 5542 / 810.
 - 2026-09-05: Task 4 #10 parent secondary constructors + enum virtual
   dispatch landed: 5553 / 799.
+- 2026-09-06: Task 4 #12 adapted callable references landed: 5560 / 792.
