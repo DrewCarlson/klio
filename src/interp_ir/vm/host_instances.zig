@@ -4338,7 +4338,19 @@ fn bareCaptureResolvable(expr: *const ast.Expr, pairs: []const NameValue) bool {
     // constructed with `left = null`. The runtime fills still read the
     // captured `this` directly where that resolves; the thunk is the
     // fallback that works for every receiver shape.
+    // A delegated local (`var key by state`) is captured as its delegate
+    // beside the plain name: its value comes from `getValue`, which only the
+    // lowered thunk performs.
+    if (capturedDelegateOf(pairs, nm)) return false;
     return findCapture(pairs, nm) != null;
+}
+
+/// Whether `name` is a delegated local in the captured env (its
+/// `name$klio_delegate` companion capture is present).
+fn capturedDelegateOf(pairs: []const NameValue, name: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    const dname = std.fmt.bufPrint(&buf, "{s}$klio_delegate", .{name}) catch return false;
+    return findCapture(pairs, dname) != null;
 }
 
 /// Like `synthThunk` but carrying the custom setter's single value parameter,
