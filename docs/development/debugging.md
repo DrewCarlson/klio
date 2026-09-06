@@ -372,6 +372,10 @@ backend (the default for `fast`/`safe`).
 | `KLIO_GC_MINOR_STOP` | `1` on (default), `0` off | Whether a minor mark stops at tenured cells; `0` full-traces minors to bisect a missed-barrier suspicion | none |
 | `KLIO_GC_REMEMBER_TRACE` | set | Logs, with a native stack, any remembered-set cell as it is swept | `[gc-freed-remembered]` |
 | `KLIO_GC_HIST` | set; `0`/empty off | Top-16 live-cell payload types per collection | `[kgc-hist]` |
+| `KLIO_ENUM_INIT_TRACE` | set | VM-start enum entry construction: which entries are rebuilt through the class path and the header thunk chain per class | `[enum-init]`, `[chain]` |
+| `KLIO_CTOR_TRACE` | set | Each secondary-constructor default-argument thunk as it is evaluated (class, parameter, thunk id, argument count) | `[ctor-default]` |
+| `KLIO_TOPPROP_TRACE` | set | A top-level property initializer that deferred to on-access during the startup pass, with its error tag | `[topprop-defer]` |
+| `KLIO_BOX_FILTER` / `KLIO_BOX_JOBS` / `KLIO_BOX_TIMEOUT_MS` | substring / count / ms | The box conformance runner's test subset, worker width, and per-test wall | `[box-fail]`, `[box-excluded]` |
 | `KLIO_GC_STRESS` | set; `0`/empty off | Collects at every safe point; surfaces incomplete roots/tracers immediately | none |
 | `KLIO_GC_STRESS_EVERY` | number (`0` off) | Collects every N safe points (cheaper sampled stress) | none |
 | `KLIO_GC_THRESHOLD_KB` | KiB (default 8192) | The collection-trigger floor; a small floor collects frequently | none |

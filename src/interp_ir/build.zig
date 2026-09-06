@@ -4993,6 +4993,7 @@ fn buildClassDef(
         .is_fun_interface = c.is_fun_interface,
         .parent_ctor_args = &.{},
         .is_open = c.is_open,
+        .has_primary_ctor = c.has_primary_ctor,
         .is_abstract = c.is_abstract,
         .is_inner = c.is_inner,
         .is_anonymous = false,
