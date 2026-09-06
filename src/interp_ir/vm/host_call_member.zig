@@ -2263,6 +2263,21 @@ fn applicExtOwnerRankCb(ctx: *anyopaque, fid: FuncId) i32 {
     return 0;
 }
 
+/// Whether the range's own `contains(element)` member takes this argument:
+/// the element kind of the range (Char for a Char range, an integral value
+/// otherwise). Any other argument (`10L in 1..10`, `"s" in 0..1`) resolves
+/// to an extension `contains`, which a user declaration may provide, so the
+/// host member yields to the extension tiers.
+fn rangeContainsArgKindMatches(kind: runtime.RangeKind, arg: *const Value) bool {
+    return switch (kind) {
+        .Char => arg.* == .Char,
+        .Int => arg.* == .Int or arg.* == .Short or arg.* == .Byte,
+        .Long => arg.* == .Long or arg.* == .Int or arg.* == .Short or arg.* == .Byte,
+        .UInt => arg.* == .UInt or arg.* == .UShort or arg.* == .UByte,
+        .ULong => arg.* == .ULong or arg.* == .UInt or arg.* == .UShort or arg.* == .UByte,
+    };
+}
+
 /// `ApplicabilityScope.ext_known_package`: `stdlib.isKnownPackage`.
 fn applicKnownPackageCb(pkg: []const u8) bool {
     return stdlib.isKnownPackage(pkg);
@@ -5156,7 +5171,14 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 
     // `r.contains(x)` on a Range.
     if (std.mem.eql(u8, name, "contains") and args.len == 1 and receiver.* == .Range and
-        args[0] != .Range)
+        args[0] != .Range and !rangeContainsArgKindMatches(receiver.Range.kind, &args[0]))
+    {
+        if (try extensionFnFallback(self, allocator, receiver, name, args, strict_ext, static_recv, declared_recv)) |r| return r;
+        // `ClosedRange<Int>.contains(element: Int?)`: a null element is never in the range.
+        if (args[0] == .Null) return .{ .ok = boolVal(false) };
+    }
+    if (std.mem.eql(u8, name, "contains") and args.len == 1 and receiver.* == .Range and
+        args[0] != .Range and rangeContainsArgKindMatches(receiver.Range.kind, &args[0]))
     {
         const r = receiver.Range;
         // A descending progression (step < 0) has start > end; the membership
@@ -5176,8 +5198,10 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                     (if (args[0].asI64()) |sv| @as(u64, @bitCast(sv)) else break :blk false);
                 const us: u64 = @bitCast(r.start);
                 const ue: u64 = @bitCast(r.end);
-                const ulo = @min(us, ue);
-                const uhi = @max(us, ue);
+                // Bounds follow the step direction, so an ascending `3u..1u`
+                // stays empty rather than reading as `1u..3u`.
+                const ulo = if (r.step > 0) us else ue;
+                const uhi = if (r.step > 0) ue else us;
                 const diff = @as(i128, uv) - @as(i128, us);
                 break :blk uv >= ulo and uv <= uhi and @rem(diff, @as(i128, r.step)) == 0;
             }
@@ -9066,6 +9090,31 @@ fn stampVirtSite(site: ?ir.VirtNativeSite, receiver: *const Value, encoded: u64,
 }
 
 
+/// The simple name of the class or interface declaring a virtual slot's
+/// method (`ClosedRange` for `kotlin.ranges.ClosedRange.contains`).
+fn slotOwnerSimpleName(self: *VmHost, slot: MethodSlotId) ?[]const u8 {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const f = mg.get().funcById(FuncId.from(slot.int())) orelse return null;
+    const fqn = f.fqn;
+    const last_dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return null;
+    const owner = fqn[0..last_dot];
+    const owner_dot = std.mem.lastIndexOfScalar(u8, owner, '.');
+    const simple = if (owner_dot) |d| owner[d + 1 ..] else owner;
+    return if (simple.len == 0) null else simple;
+}
+
+/// The element type name of a host Range value's kind.
+fn rangeElemTypeName(kind: runtime.RangeKind) []const u8 {
+    return switch (kind) {
+        .Int => "Int",
+        .Long => "Long",
+        .Char => "Char",
+        .UInt => "UInt",
+        .ULong => "ULong",
+    };
+}
+
 fn slotNameOrNull(self: *VmHost, slot: MethodSlotId) ?[]const u8 {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -9162,7 +9211,7 @@ pub fn invokeVirtualMember(
                 const op: HostSlotOp = @enumFromInt(@as(u8, @intCast(opv)));
                 if (try runHostSlotOp(self, allocator, op, receiver, mname, args)) |r| return r;
             }
-            return callMemberNamed(self, allocator, receiver, mname, args, arg_names_in);
+            return callMemberNamedDeclared(self, allocator, receiver, mname, args, arg_names_in, slotOwnerSimpleName(self, slot));
         }
         const native: StdlibFn = @ptrFromInt(native_raw);
         var fqn_buf: [192]u8 = undefined;
@@ -9250,7 +9299,10 @@ pub fn invokeVirtualMember(
             switch (decided) {
                 .err => |msg| return .{ .err = .{ .Type = msg } },
                 .by_name => |mname| {
-                    const named = try callMemberNamed(self, allocator, receiver, mname, args, arg_names);
+                    // The slot's owner is the call's static receiver type:
+                    // `(this as ClosedRange<Int>).contains(value)` must bind the
+                    // `ClosedRange` extension, not a runtime subtype's twin.
+                    const named = try callMemberNamedDeclared(self, allocator, receiver, mname, args, arg_names, slotOwnerSimpleName(self, slot));
                     switch (named) {
                         .ok => return named,
                         .err => return .{ .err = .{ .Type = "virtual call receiver is not an instance" } },
@@ -9420,7 +9472,7 @@ pub fn invokeVirtualMember(
         }
         if (noinst.name) |mname| {
             noteSlotByName2(self, slot, mname, receiver);
-            return callMemberNamed(self, allocator, receiver, mname, args, arg_names);
+            return callMemberNamedDeclared(self, allocator, receiver, mname, args, arg_names, slotOwnerSimpleName(self, slot));
         }
         if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
             const mg = self.module.borrow();
@@ -12901,6 +12953,31 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
         if (candidates.items.len == 0) return null;
     }
 
+    // A Range receiver carries its element kind, which decides between
+    // extensions on `ClosedRange<Int>` and `ClosedRange<UInt>` (an erased
+    // type-argument twin pair for any other receiver).
+    if (candidates.items.len > 1 and receiver.* == .Range) {
+        const elem = rangeElemTypeName(receiver.Range.kind);
+        var n_match: usize = 0;
+        var n_typed: usize = 0;
+        for (candidates.items) |c| {
+            const rty = &c.func.params[0].ty;
+            if (rty.args.len != 1 or !numericWidthKind(rty.args[0].name)) continue;
+            n_typed += 1;
+            if (std.mem.eql(u8, std.mem.trimEnd(u8, rty.args[0].name, "?"), elem)) n_match += 1;
+        }
+        if (n_typed != 0 and n_match != 0 and n_match != n_typed) {
+            var filtered: std.ArrayList(Candidate) = .empty;
+            for (candidates.items) |c| {
+                const rty = &c.func.params[0].ty;
+                const typed = rty.args.len == 1 and numericWidthKind(rty.args[0].name);
+                if (!typed or std.mem.eql(u8, std.mem.trimEnd(u8, rty.args[0].name, "?"), elem)) filtered.append(allocator, c) catch {};
+            }
+            candidates.deinit(allocator);
+            candidates = filtered;
+        }
+    }
+
     // Unique-exact-arity pick — only when every supplied argument can
     // bind its parameter. An arity-exact candidate whose param types the
     // args definitely don't satisfy is inapplicable (kotlinc drops it),
@@ -13008,8 +13085,12 @@ fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const
     // extension (`operator LongRange.contains(LongRange)`) as the only
     // applicable candidate — same predicate as the ladder's
     // `range_in_range` standdown.
+    // A range's own `contains(element)` member takes only its element kind;
+    // any other argument (a Range, a Long on an Int range, a String) is the
+    // extension's to serve.
     const member_could_take_args = !(receiver.* == .Range and args.len == 1 and
-        args[0] == .Range and std.mem.eql(u8, name, "contains"));
+        std.mem.eql(u8, name, "contains") and
+        (args[0] == .Range or !rangeContainsArgKindMatches(receiver.Range.kind, &args[0])));
     const defer_to_member = bound_thinned and member_could_take_args and
         receiverHasMemberNamed(self, receiver, name);
     if (!defer_to_property and !defer_to_iterable and !defer_to_member) {

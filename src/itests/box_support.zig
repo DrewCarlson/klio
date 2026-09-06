@@ -48,9 +48,11 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// Capturing lambdas keep identity, typealiases resolve as their class: 5696 / 656.
 /// Constructor references to local and inner classes, explicit `as Any`
 /// applicability: 5706 / 648. KType structural equality and reified binding
-/// from a local's declared type: 5716 / 638.
-pub const BASELINE: usize = 5716;
-pub const MAX_FAILED: usize = 638;
+/// from a local's declared type: 5716 / 638. Ranges: `in` desugars to
+/// `contains`, extensions serve non-element arguments, progression math in
+/// the element domain: 5751 / 609.
+pub const BASELINE: usize = 5751;
+pub const MAX_FAILED: usize = 609;
 
 /// Directives that bind a test to a framework feature klio has no
 /// counterpart for: a backend restriction, a second module, reflection,

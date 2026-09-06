@@ -135,10 +135,17 @@ pub fn normalizeProgressionEnd(start: i64, end: i64, step: i64, kind: RangeKind)
     // empty/one-element progression, unsigned for ULong), the closed-range bound
     // stays as `last`.
     if (!kind.inBounds(start, end, step)) return end;
+    // The distance between the bounds can exceed `i64` (`MIN..MAX`, or ULong
+    // bounds stored as negative bit patterns), so the remainder is taken in
+    // the unsigned domain, where the wrapped difference is exact.
     if (step > 0) {
-        return end - @rem(end - start, step);
+        const dist: u64 = @bitCast(end -% start);
+        const st: u64 = @intCast(step);
+        return end -% @as(i64, @bitCast(dist % st));
     } else {
-        return end + @rem(start - end, -step);
+        const dist: u64 = @bitCast(start -% end);
+        const st: u64 = @intCast(-step);
+        return end +% @as(i64, @bitCast(dist % st));
     }
 }
 
@@ -351,6 +358,8 @@ pub fn range_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 pub fn range_contains(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const view = rangeViewArg(ctx, "contains") orelse return typeErr("contains requires a Range receiver");
+    // `ClosedRange<Int>.contains(element: Int?)`: a null element is never in the range.
+    if (ctx.args.len > 1 and ctx.args[1] == .Null) return ok(.{ .Bool = false });
     const n: i64 = blk: {
         if (ctx.args.len > 1) {
             if (ctx.args[1].asI64()) |v| break :blk v;
@@ -371,7 +380,10 @@ pub fn range_contains(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return ok(.{ .Bool = false });
     }
     const s = intAbs(view.step);
-    return ok(.{ .Bool = intAbs(@rem(n - view.start, s)) == 0 or s == 1 });
+    // The distance to `start` can exceed i64 for a range spanning most of
+    // the type (`MIN..MAX`), so the alignment test is widened.
+    const diff = @as(i128, n) - @as(i128, view.start);
+    return ok(.{ .Bool = s == 1 or @rem(diff, @as(i128, s)) == 0 });
 }
 
 pub fn range_is_empty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {

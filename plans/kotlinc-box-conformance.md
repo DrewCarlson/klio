@@ -701,4 +701,32 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
 - 2026-09-06: Task 4 #18 IEEE 754 comparisons landed: 5695 / 657.
 - 2026-09-06: capturing-lambda identity restored, #19 typealias partial: 5696 / 656.
 - 2026-09-06: Task 4 #22 constructor references + explicit-Any applicability landed: 5706 / 648.
+24. **Ranges: `in` resolution and progression arithmetic (2026-09-06)**:
+    `ranges/` failed 31 with 6 more crashing. Five mechanisms. (a) `x in
+    lo..hi` evaluated the element before the bounds and compared
+    numerically whatever the operand types; it now lowers as the desugared
+    `(lo..hi).contains(x)` member call (bounds first), keeping the scalar
+    compare only for provably non-null numeric operands with no user
+    `rangeTo`/`contains` declared. (b) A range's `contains` served every
+    argument as its own member; the member takes only the element kind,
+    and any other argument (a Long on an Int range, a String) goes to the
+    extension tiers, where a null element reads false and the Range value's
+    element kind decides between `ClosedRange<Int>` and `ClosedRange<UInt>`
+    twins. (c) A virtual call on a builtin receiver dropped its slot's
+    owner, so the stdlib's `(this as ClosedRange<Int>).contains(value)`
+    re-bound the `IntRange` twin and recursed; the slot owner is now the
+    declared receiver. (d) Unsigned `contains` on a host route took
+    `min/max` of the bounds, reading an empty `3u..1u` as `1u..3u`. (e) The
+    progression last element and the `contains` alignment test overflowed
+    i64 (`MIN..MAX step MAX`, ULong bounds above `Long.MAX_VALUE`); both
+    now run in the unsigned/widened domain, and the ULong iterator wraps
+    unsigned. Example `range_contains_resolution`. Subset 784 → 818 of 821.
+    Left (verdict): `inComparableRange` and `forInCharSequenceWithCustomIterator`
+    pick an extension by the runtime receiver where kotlinc binds by the
+    static type inside a generic or supertype-typed body (the same
+    static-receiver tower as #20's nested subjects), and
+    `inDoubleRangeLiteralVsComparableRangeLiteral` needs a `Comparable`-typed
+    `..` to build a `ComparableRange` rather than a numeric range.
+
 - 2026-09-06: Task 4 #23 KType structural equality + reified binding from a local's declared type landed: 5716 / 638.
+- 2026-09-06: Task 4 #24 ranges (`in` desugar, extension `contains`, progression arithmetic) landed: 5751 / 609.
