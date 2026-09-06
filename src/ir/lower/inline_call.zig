@@ -1525,6 +1525,24 @@ fn unifyParamAgainstArg(
                 }
                 return;
             };
+            // A caller LOCAL with a declared type binds the parameter to that
+            // static type (`val a: Any? = "s"; foo(a)` makes `T := Any?`, as
+            // kotlinc infers), never to the value's runtime class.
+            if (!in_lambda_window and param_ty.function == null) {
+                const local_name = arg.Path.segments[0].name;
+                if (b.localDeclTypeRef(local_name)) |decl_ref| {
+                    // The declared-type record dies with the builder; the
+                    // binding outlives it (a pack's IR keeps the spelling), so
+                    // the type is copied into the module's own memory with its
+                    // arguments intact (`List<Level>` must not bind bare `List`).
+                    if (expr_lower.astTypeRefFromIr(@constCast(b), decl_ref, arg.Path.segments[0].span)) |converted| {
+                        var decl = try cloneAstTypeRef(b.module.registry.allocator, converted);
+                        decl.nullable = decl.nullable or b.localDeclNullable(local_name);
+                        try unifyTypeParam(param_ty, &decl, tp_names, subst);
+                        return;
+                    }
+                }
+            }
         }
     }
     if (param_ty.function) |ft| {
@@ -2339,6 +2357,19 @@ fn propGenericTypeRef(allocator: Allocator, owner: []const u8, name: []const u8,
 /// the declared type *is* a bare type parameter, it binds to the whole
 /// actual type; otherwise matching heads recurse positionally through
 /// generic arguments (`Box<T>` vs `Box<Int>` solves `T = Int`).
+/// Deep-copies a type reference (name and type arguments) into `alloc`.
+fn cloneAstTypeRef(alloc: std.mem.Allocator, t: ast.TypeRef) std.mem.Allocator.Error!ast.TypeRef {
+    var out = t;
+    out.name.name = try alloc.dupe(u8, t.name.name);
+    const args = try alloc.alloc(ast.TypeArg, t.type_args.len);
+    for (t.type_args, args) |a, *o| {
+        o.* = a;
+        o.ty = try cloneAstTypeRef(alloc, a.ty);
+    }
+    out.type_args = args;
+    return out;
+}
+
 fn unifyTypeParam(
     decl: *const TypeRef,
     actual: *const TypeRef,

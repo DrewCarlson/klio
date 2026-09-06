@@ -55,6 +55,9 @@ moves on.
 ## Log
 
 - 2026-09-05: opened; the owning documents carry the task detail.
+- 2026-09-06: Stage 2 Task 4 #23 typeErasure (KType structural equality; a
+  reified parameter binds from a local's declared type): census 5716 / 638;
+  typeErasure 12 → 21 of 24; example `reified_type_of`.
 - 2026-09-06: Stage 2 Task 4 #22 constructor references (local and inner
   classes) and the explicit-`Any` static applicability rule; verdicts
   recorded for context parameters (#20) and the inline-class survey (#21).
