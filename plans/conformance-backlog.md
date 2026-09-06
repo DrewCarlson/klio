@@ -55,6 +55,8 @@ moves on.
 ## Log
 
 - 2026-09-05: opened; the owning documents carry the task detail.
+- 2026-09-06: Stage 2 Task 4 #16 `provideDelegate` convention (13):
+  census 5,647 / 705 / 19.
 - 2026-09-06: Stage 2 Task 4 #13-#15 annotation instances (24), captured
   locals in super constructor calls (14), enum static scope and
   initialization (10): records in `kotlinc-box-conformance.md`.

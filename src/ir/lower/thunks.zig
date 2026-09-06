@@ -28,6 +28,7 @@ const StringSet = std.StringHashMap(void);
 const FuncBuilder = build.FuncBuilder;
 const bindParams = decl.bindParams;
 const lowerExpr = expr_mod.lowerExpr;
+const stmt_mod = @import("stmt.zig");
 const lowerBlock = expr_mod.lowerBlock;
 
 /// The allocator backing a `Module`'s growable tables. The module's
@@ -127,6 +128,19 @@ fn consumePendingCtx(b: *FuncBuilder) Allocator.Error!void {
 
 pub fn lowerExprAsThunk(module: *Module, expr: *const Expr, name: []const u8) Allocator.Error!FuncId {
     return lowerExprAsThunkTyped(module, expr, name, null);
+}
+
+/// A top-level delegated property's delegate thunk: the expression, then
+/// the `provideDelegate` convention with a null receiver.
+pub fn lowerDelegateExprAsThunk(module: *Module, expr: *const Expr, name: []const u8, prop_name: []const u8) Allocator.Error!FuncId {
+    var b = try FuncBuilder.init(moduleAllocator(module), module);
+    defer b.deinit();
+    try consumePendingCtx(&b);
+    const v = try lowerExpr(&b, expr);
+    const provided = try stmt_mod.emitProvideDelegate(&b, v, prop_name);
+    b.terminate(.{ .Return = provided });
+    const func = try b.finish(name, name, build.typeUnit());
+    return pushFuncSpanned(module, func, expr.span());
 }
 
 /// As [`lowerExprAsThunk`], seeding the declared type as the body's

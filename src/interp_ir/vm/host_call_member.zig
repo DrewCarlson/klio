@@ -3483,6 +3483,40 @@ fn instanceInvokeWantsPair(self: *VmHost, receiver: *const Value, nargs: usize) 
     return paired;
 }
 
+/// The `provideDelegate` convention at a delegated property's creation:
+/// the delegate expression's value receives `provideDelegate(thisRef, ::p)`
+/// when a member or extension operator applies; a dispatch miss keeps the
+/// value, any other failure is the property's initialization failure.
+pub fn provideDelegateFor(self: *VmHost, allocator: Allocator, this_ref: Value, prop_ref: Value, v: Value) Allocator.Error!EvalResult {
+    // A property reference delegate (`by contents::zone`) forwards every
+    // member call to its target, so it is never offered the convention.
+    switch (v) {
+        .PropertyRef => return .{ .ok = v },
+        .Instance => |inst| {
+            const forwards = blk: {
+                const g = inst.borrow();
+                defer g.deinit();
+                const cg = g.get().class.borrow();
+                defer cg.deinit();
+                break :blk std.mem.startsWith(u8, cg.get().name, "$bound_ref$");
+            };
+            if (forwards) return .{ .ok = v };
+        },
+        else => {},
+    }
+    const r = try callMemberInner(self, allocator, &v, "provideDelegate", &.{ this_ref, prop_ref }, false);
+    switch (r) {
+        .ok => return r,
+        .err => |e| {
+            // Only the dispatch miss for `provideDelegate` itself means the
+            // convention does not apply; a miss raised inside an operator
+            // that ran is the property's initialization failure.
+            if (e == .Unimplemented and std.mem.indexOf(u8, e.Unimplemented, "`provideDelegate`") != null) return .{ .ok = v };
+            return r;
+        },
+    }
+}
+
 pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!EvalResult {
     const r = try callMemberInner(self, allocator, receiver, name, args, false);
     // A raw callable value asked for a member nothing serves: the value
@@ -4415,6 +4449,11 @@ pub fn replayHits() u64 {
 }
 
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
+    // The delegated-property creation convention, served with its own
+    // fallback (a dispatch miss keeps the delegate).
+    if (args.len == 2 and name.len == "$provideDelegate".len and name[0] == '$' and std.mem.eql(u8, name, "$provideDelegate")) {
+        return provideDelegateFor(self, allocator, args[0], args[1], receiver.*);
+    }
     // Vendored persistent-map equality: answered host-side with trie
     // node-identity pruning (see persistent_map_eq.zig). Bails (null) for
     // any operand or element the host does not own equality for.

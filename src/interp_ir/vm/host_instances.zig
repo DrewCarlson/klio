@@ -4067,7 +4067,10 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                                     .err => |e| return .{ .err = e },
                                 };
                             };
-                            v = try maybeProvideDelegate(self, allocator, cls_name, prop_name, &inst_value, v);
+                            v = switch (try maybeProvideDelegate(self, allocator, cls_name, prop_name, &inst_value, v)) {
+                                .ok => |pv| pv,
+                                .err => |e| return .{ .err = e },
+                            };
                             const g = inst.borrowMut();
                             try g.get().define(allocator, shadowFieldKey(self, cls_name, prop_name), v);
                             g.deinit();
@@ -4217,8 +4220,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
 }
 
 /// `provideDelegate` hook for a delegated body property.
-fn maybeProvideDelegate(self: *VmHost, allocator: Allocator, cls_name: []const u8, prop_name: []const u8, inst_value: *const Value, v: Value) Allocator.Error!Value {
-    if (v != .Instance) return v;
+fn maybeProvideDelegate(self: *VmHost, allocator: Allocator, cls_name: []const u8, prop_name: []const u8, inst_value: *const Value, v: Value) Allocator.Error!EvalResult {
     const is_delegated = blk: {
         const mg = self.module.borrow();
         defer mg.deinit();
@@ -4232,44 +4234,12 @@ fn maybeProvideDelegate(self: *VmHost, allocator: Allocator, cls_name: []const u
         }
         break :blk false;
     };
-    if (!is_delegated) return v;
-    // The delegate provides a `provideDelegate` operator when its OWN runtime
-    // class chain declares one — including a SAM-converted `fun interface`
-    // (e.g. `PropertyDelegateProvider { … }`), whose abstract method carries a
-    // `sam_lambda` rather than a module-level `FuncId`. Checking the instance's
-    // runtime class (not the static IR class) catches both forms; a plain
-    // `ReadOnlyProperty`/`ReadWriteProperty` delegate has only `getValue`/
-    // `setValue`, so it is left untouched.
-    const has_provide = blk: {
-        const g = v.Instance.borrow();
-        defer g.deinit();
-        const cls_ref = g.get().class;
-        // A concrete `provideDelegate` somewhere on the runtime class chain.
-        if (ClassDef.findMethod(cls_ref, allocator, "provideDelegate")) |hit| {
-            hit.class.deinit();
-            break :blk true;
-        }
-        // A SAM-converted `fun interface` carries no materialized method; its
-        // abstract surface is recorded in `hierarchy_methods` (the same table
-        // `samInstanceDispatch` consults to route a call to the lambda).
-        const dcls = blk2: {
-            const cg = cls_ref.borrow();
-            defer cg.deinit();
-            break :blk2 cg.get().name;
-        };
-        const mg = self.module.borrow();
-        defer mg.deinit();
-        if (mg.get().registry.hierarchy_methods.get(dcls)) |methods| {
-            break :blk methods.contains("provideDelegate");
-        }
-        break :blk false;
-    };
-    if (!has_provide) return v;
+    if (!is_delegated) return .{ .ok = v };
+    // A member operator (including a SAM-converted `PropertyDelegateProvider`)
+    // or an extension operator in scope provides the delegate; a plain
+    // `ReadOnlyProperty` has neither and keeps the value.
     const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInitOwned(allocator, try allocator.dupe(u8, prop_name)) } };
-    switch (try self.callMember(allocator, &v, "provideDelegate", &.{ inst_value.*, prop_ref })) {
-        .ok => |rep| return rep,
-        .err => return v,
-    }
+    return host_call_member.provideDelegateFor(self, allocator, inst_value.*, prop_ref, v);
 }
 
 fn retainFieldList(fields: *std.ArrayList(InstanceData.Field), allocator: Allocator, key: []const u8) void {
