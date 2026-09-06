@@ -1894,13 +1894,17 @@ pub fn rangeIterMember(self: *VmHost, allocator: Allocator, receiver: *const Val
     if (isIteratorNext(name) and args.len == 0) {
         if (!more) return .{ .err = try throwExc(allocator, "kotlin.NoSuchElementException", "iterator exhausted") };
         const c = snap.cur;
-        const adv = c +| snap.step;
+        // A ULong cursor wraps in the unsigned domain (its bit pattern is an
+        // i64); a wrap past the top reads as `adv == c` below via `wrapped`.
+        const adv = if (snap.kind == .ULong) c +% snap.step else c +| snap.step;
+        const wrapped = snap.kind == .ULong and
+            (if (snap.step > 0) @as(u64, @bitCast(adv)) < @as(u64, @bitCast(c)) else @as(u64, @bitCast(adv)) > @as(u64, @bitCast(c)));
         // `end` is the exact final element; once it is yielded, stop. Also stop
         // if the cursor saturates (`adv == c`). Both avoid advancing past the
         // end — a Long.MAX overflow or a ULong wrap past MaxUL that `more`
         // (unsigned for ULong) would otherwise read as still in-bounds.
         const sg = ri.borrowMut();
-        if (c == snap.end or adv == c) {
+        if (c == snap.end or adv == c or wrapped) {
             sg.get().done = true;
         } else {
             sg.get().cur = adv;

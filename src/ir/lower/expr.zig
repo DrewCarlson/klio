@@ -1549,14 +1549,16 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
         // (an in-scope `operator LongRange.contains(LongRange)` decides
         // range-in-range; the element compare would be wrong for it).
         if (rhs.* == .Binary and (rhs.Binary.op == .Range or rhs.Binary.op == .RangeUntil) and
-            !lhsIsRangeShaped(b, lhs))
+            !lhsIsRangeShaped(b, lhs) and try rangeCompareApplies(b, lhs, rhs.Binary.lhs, rhs.Binary.rhs))
         {
             const r_op = rhs.Binary.op;
             const lo = rhs.Binary.lhs;
             const hi = rhs.Binary.rhs;
-            const x = try lowerExpr(b, lhs);
+            // `(lo..hi).contains(x)`: the bounds are evaluated before the
+            // element, as kotlinc orders the desugared call.
             const lo_r = try lowerExpr(b, lo);
             const hi_r = try lowerExpr(b, hi);
+            const x = try lowerExpr(b, lhs);
             const ge = b.allocReg();
             try b.push(.{ .BinOp = .{ .dst = ge, .op = .LessEq, .lhs = lo_r, .rhs = x } });
             const upper: BinOp = if (r_op == .RangeUntil) .Less else .LessEq;
@@ -1571,20 +1573,30 @@ fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
             }
             return both;
         }
-        const recv = try lowerExpr(b, rhs);
-        const arg_slot = b.allocReg();
-        const l = try lowerExpr(b, lhs);
-        try b.push(.{ .Move = .{ .dst = arg_slot, .src = l } });
-        const contains = b.allocReg();
-        const nm = try b.module.internConst(b.allocator, .{ .String = "contains" });
-        try b.push(.{ .CallMember = .{
-            .dst = contains,
-            .receiver = recv,
-            .name = nm,
-            .args = arg_slot,
-            .n_args = 1,
-            .arg_names = &.{},
-        } });
+        // `x in y` is `y.contains(x)`: lower the written-out member call so
+        // it binds statically like the explicit form (a user extension
+        // `IntRange.contains(String)` is a direct call, not a name walk).
+        const callee_node = try b.allocator.create(Expr);
+        callee_node.* = .{ .Member = .{
+            .receiver = @constCast(rhs),
+            .name = .{ .name = "contains", .span = bin.span },
+            .safe = false,
+            .span = bin.span,
+        } };
+        const call_args = try b.allocator.alloc(Expr, 1);
+        call_args[0] = lhs.*;
+        const call_names = try b.allocator.alloc(?[]const u8, 1);
+        call_names[0] = null;
+        const call_node = try b.allocator.create(Expr);
+        call_node.* = .{ .Call = .{
+            .callee = callee_node,
+            .args = call_args,
+            .arg_names = call_names,
+            .type_args = &.{},
+            .is_infix = false,
+            .span = bin.span,
+        } };
+        const contains = try lowerExpr(b, call_node);
         if (op == .NotIn) {
             const dst = b.allocReg();
             try b.push(.{ .Not = .{ .dst = dst, .src = contains } });
@@ -20266,6 +20278,72 @@ pub fn typeHead(s: []const u8) []const u8 {
 /// literal, or a binding declared with a range-family type), so the
 /// element-compare inline for `x in lo..hi` must stand down in favor of a
 /// `contains` dispatch.
+/// Whether `x in lo..hi` may lower to the scalar compare `lo <= x && x <= hi`:
+/// every operand is provably a non-null numeric scalar and no user operator
+/// `rangeTo`/`contains` is declared that could take the call instead. Any
+/// other shape dispatches `contains` on the range value.
+fn rangeCompareApplies(b: *FuncBuilder, x: *const Expr, lo: *const Expr, hi: *const Expr) Allocator.Error!bool {
+    if (userFunctionDeclared(b, "rangeTo") or userFunctionDeclared(b, "contains")) return false;
+    return try scalarNumericShaped(b, x, 0) and try scalarNumericShaped(b, lo, 0) and try scalarNumericShaped(b, hi, 0);
+}
+
+fn userFunctionDeclared(b: *const FuncBuilder, name: []const u8) bool {
+    for (b.module.funcsBySimpleName(name)) |fid| {
+        const f = b.module.funcById(fid) orelse continue;
+        if (!shippedPackage(f.package)) return true;
+    }
+    return false;
+}
+
+/// A declaring package that belongs to the shipped stdlib or a library pack
+/// rather than to the program being lowered.
+fn shippedPackage(pkg: []const u8) bool {
+    if (pkg.len == 0) return false;
+    for ([_][]const u8{ "kotlin", "kotlinx", "androidx", "io.ktor", "org.jetbrains" }) |root| {
+        if (std.mem.eql(u8, pkg, root)) return true;
+        if (pkg.len > root.len and std.mem.startsWith(u8, pkg, root) and pkg[root.len] == '.') return true;
+    }
+    return false;
+}
+
+fn numericScalarHead(head: []const u8) bool {
+    for ([_][]const u8{
+        "Int",   "Long",  "Short",  "Byte",   "Char",  "Double",
+        "Float", "UInt",  "ULong",  "UShort", "UByte",
+    }) |n| {
+        if (std.mem.eql(u8, head, n)) return true;
+    }
+    return false;
+}
+
+fn scalarNumericShaped(b: *FuncBuilder, e: *const Expr, depth: u8) Allocator.Error!bool {
+    if (depth > 6) return false;
+    switch (e.*) {
+        .IntLit, .FloatLit, .CharLit => return true,
+        .Unary => |u| return try scalarNumericShaped(b, u.expr, depth + 1),
+        .Binary => |bin| return switch (bin.op) {
+            .Add, .Sub, .Mul, .Div, .Rem => try scalarNumericShaped(b, bin.lhs, depth + 1) and try scalarNumericShaped(b, bin.rhs, depth + 1),
+            else => false,
+        },
+        .Path => |p| {
+            if (p.segments.len != 1) return false;
+            const nm = p.segments[0].name;
+            if (b.localDeclType(nm)) |t| {
+                if (std.mem.endsWith(u8, t, "?") or b.localDeclNullable(nm)) return false;
+                return numericScalarHead(typeHead(t));
+            }
+            if (b.localInitExpr(nm)) |init| return try scalarNumericShaped(b, init, depth + 1);
+            return false;
+        },
+        .Call => {
+            const ty = try static_call_type.staticCallReturnTypeRef(b, e) orelse return false;
+            if (ty.nullable or std.mem.endsWith(u8, ty.name, "?")) return false;
+            return numericScalarHead(typeHead(ty.name));
+        },
+        else => return false,
+    }
+}
+
 fn lhsIsRangeShaped(b: *FuncBuilder, lhs: *const Expr) bool {
     if (lhs.* == .Binary and (lhs.Binary.op == .Range or lhs.Binary.op == .RangeUntil)) return true;
     const head = argStaticHead(b, lhs) orelse return false;

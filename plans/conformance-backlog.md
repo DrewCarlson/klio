@@ -55,6 +55,15 @@ moves on.
 ## Log
 
 - 2026-09-05: opened; the owning documents carry the task detail.
+- 2026-09-06: Stage 2 Task 4 #24 ranges (`in` desugars to `contains` with bounds
+  first; range `contains` member takes only its element kind, other arguments go
+  to extensions with the file's own declaration outranking the stdlib; virtual
+  calls on builtin receivers carry the slot owner as declared receiver; unsigned
+  and full-width progression math): ranges 784 → 818 of 821; example
+  `range_contains_resolution`; census 5751 / 609. CI regression from #23 (a declared type spelled
+  with the enclosing function's own type parameter bound the inner reified `T`
+  to bare `T`: 20 coroutine `combine` tests, one pinned parity fixture) root-fixed
+  in the same push.
 - 2026-09-06: Stage 2 Task 4 #23 typeErasure (KType structural equality; a
   reified parameter binds from a local's declared type): census 5716 / 638;
   typeErasure 12 → 21 of 24; example `reified_type_of`.
