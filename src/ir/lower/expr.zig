@@ -944,7 +944,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 if (!b.module.classHierarchyDeclaresMember(cid, pr.name.name))
                     break :receiver_member;
                 if (try resolveThisRegKind(b, true, false)) |this_reg| {
-                    try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = this_reg, .name = nm } });
+                    try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = this_reg, .name = nm, .adapt_arity = b.pending_lambda_arity, .adapt_unit = b.pending_ref_lambda_unit, .adapt_heads = try expectedHeadsConst(b) } });
                     return dst;
                 }
             }
@@ -1026,6 +1026,10 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = class_pick.?, .ctor_ref = true } });
             } else if (ref_pick != null and !member_shadows_ref) {
                 const fid = ref_pick.?;
+                if (try adaptedRefClosure(b, pr.name.name, pr.name.span, fid)) |r| {
+                    try b.push(.{ .Move = .{ .dst = dst, .src = r } });
+                    return dst;
+                }
                 const n = blk: {
                     if (b.module.funcById(fid)) |f| {
                         break :blk try b.module.internConst(b.allocator, .{ .String = f.fqn });
@@ -1072,7 +1076,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                             }
                         }
                     }
-                    try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = recv_reg, .name = nm } });
+                    try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = recv_reg, .name = nm, .adapt_arity = b.pending_lambda_arity, .adapt_unit = b.pending_ref_lambda_unit, .adapt_heads = try expectedHeadsConst(b) } });
                 } else {
                     try b.push(.{ .PropertyRef = .{ .dst = dst, .name = nm } });
                 }
@@ -1127,7 +1131,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         try b.push(.{ .LoadGlobal = .{ .dst = recv, .name = rnm, .class = cid, .ctor_ref = true } });
                         const dst = b.allocReg();
                         const cnm = try b.module.internConst(b.allocator, .{ .String = "class" });
-                        try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = recv, .name = cnm } });
+                        try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = recv, .name = cnm, .adapt_arity = b.pending_lambda_arity, .adapt_unit = b.pending_ref_lambda_unit, .adapt_heads = try expectedHeadsConst(b) } });
                         return dst;
                     }
                 }
@@ -1212,14 +1216,14 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     try b.push(.{ .LoadGlobal = .{ .dst = rr, .name = rnm } });
                     const dst = b.allocReg();
                     const cnm = try b.module.internConst(b.allocator, .{ .String = mr.name.name });
-                    try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = rr, .name = cnm } });
+                    try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = rr, .name = cnm, .adapt_arity = b.pending_lambda_arity, .adapt_unit = b.pending_ref_lambda_unit, .adapt_heads = try expectedHeadsConst(b) } });
                     return dst;
                 }
             }
             const recv = try lowerReceiver(b, mr.receiver);
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = mr.name.name });
-            try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = recv, .name = nm } });
+            try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = recv, .name = nm, .adapt_arity = b.pending_lambda_arity, .adapt_unit = b.pending_ref_lambda_unit, .adapt_heads = try expectedHeadsConst(b) } });
             return dst;
         },
         .ObjectExpr => {
@@ -5565,7 +5569,7 @@ fn argLambdaParamTypesRecv(
             const callable_ref = arg.* == .PropertyRef or arg.* == .MemberRef;
             if (arg.* != .Lambda and arg.* != .AnonFun and !callable_ref) continue;
             const pi = mapped orelse continue;
-            if (arg.* == .Lambda and fnTypeReturnsUnit(b, params[pi].ty)) unit_mask[ai] = true;
+            if ((arg.* == .Lambda or callable_ref) and fnTypeReturnsUnit(b, params[pi].ty)) unit_mask[ai] = true;
             slot.* = try instantiatedLambdaValueParams(
                 b,
                 func,
@@ -5591,7 +5595,7 @@ fn argLambdaParamTypesRecv(
             else
                 null;
             if (pi) |param_index| {
-                if (arg.* == .Lambda and fnTypeReturnsUnit(b, params[param_index].ty)) unit_mask[i] = true;
+                if ((arg.* == .Lambda or callable_ref) and fnTypeReturnsUnit(b, params[param_index].ty)) unit_mask[i] = true;
                 slot.* = try instantiatedLambdaValueParams(
                     b,
                     func,
@@ -16853,6 +16857,97 @@ fn localExtRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Allocator
         .span = sp,
         .implicit_it = false,
     } };
+    return try lowerExpr(b, boxed);
+}
+
+/// A callable reference used as a function type that differs from the
+/// target's signature — fewer parameters through defaults or a vararg, or
+/// a result coerced to Unit — is an adapted reference: a distinct callable
+/// per adaptation, equal to any other adaptation of the same kind of the
+/// same target. Lower it as a forwarding lambda of the expected arity,
+/// keyed by target and shape; a reference whose shape matches keeps the
+/// plain function value.
+/// The expected parameter type heads at a reference site (`Int|String`),
+/// interned for the instruction; null when the site has no function type.
+fn expectedHeadsConst(b: *FuncBuilder) Allocator.Error!?ConstId {
+    const types = b.pending_ref_lambda_param_types orelse return null;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(b.allocator);
+    for (types, 0..) |*t, i| {
+        if (i > 0) try buf.append(b.allocator, '|');
+        try buf.appendSlice(b.allocator, simpleTypeHead(t.name));
+    }
+    return try b.module.internConst(b.allocator, .{ .String = try b.allocator.dupe(u8, buf.items) });
+}
+
+/// Whether the expected type head at a vararg parameter's position is an
+/// array (`(Array<String>) -> Unit` takes the vararg as written).
+fn isArrayHead(head: []const u8) bool {
+    return std.mem.eql(u8, head, "Array") or std.mem.endsWith(u8, head, "Array");
+}
+
+fn adaptedRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span, fid: FuncId) Allocator.Error!?Reg {
+    const f = b.module.funcById(fid) orelse return null;
+    if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) return null;
+    if (b.pending_lambda_arity < 0) return null;
+    const n: usize = @intCast(b.pending_lambda_arity);
+    const returns_unit = std.mem.eql(u8, simpleTypeHead(f.return_ty.name), "Unit");
+    const unit = b.pending_ref_lambda_unit and !returns_unit;
+    var vararg_at: ?usize = null;
+    for (f.params, 0..) |*prm, i| if (prm.is_vararg) {
+        vararg_at = i;
+    };
+    // A vararg parameter adapts unless the slot expects the array itself.
+    const vararg_adapts = blk: {
+        const vi = vararg_at orelse break :blk false;
+        const types = b.pending_ref_lambda_param_types orelse break :blk n != f.params.len;
+        if (vi >= types.len) break :blk true;
+        break :blk !isArrayHead(simpleTypeHead(types[vi].name));
+    };
+    if (n == f.params.len and !unit and !vararg_adapts) return null;
+    if (n > f.params.len and vararg_at == null) return null;
+    const ma = b.module.func_name_index.allocator;
+    const params = try ma.alloc(ast.Ident, n);
+    const args = try ma.alloc(ast.Expr, n);
+    for (0..n) |i| {
+        const pn = try std.fmt.allocPrint(ma, "$ref$p{d}", .{i});
+        params[i] = .{ .name = pn, .span = sp };
+        const segs_i = try ma.alloc(ast.Ident, 1);
+        segs_i[0] = .{ .name = pn, .span = sp };
+        args[i] = .{ .Path = .{ .segments = segs_i, .span = sp } };
+    }
+    const anames = try ma.alloc(?[]const u8, n);
+    for (anames) |*a| a.* = null;
+    const segs = try ma.alloc(ast.Ident, 1);
+    segs[0] = .{ .name = try ma.dupe(u8, name), .span = sp };
+    const callee = try ma.create(ast.Expr);
+    callee.* = .{ .Path = .{ .segments = segs, .span = sp } };
+    const stmts = try ma.alloc(ast.Stmt, 1);
+    stmts[0] = .{ .Expr = .{ .Call = .{
+        .callee = callee,
+        .args = args,
+        .arg_names = anames,
+        .type_args = &.{},
+        .is_infix = false,
+        .span = sp,
+    } } };
+    const boxed = try ma.create(ast.Expr);
+    boxed.* = .{ .Lambda = .{
+        .params = params,
+        .body = .{ .stmts = stmts, .span = sp },
+        .span = sp,
+        .implicit_it = false,
+    } };
+    const heads: []const u8 = blk: {
+        const types = b.pending_ref_lambda_param_types orelse break :blk "";
+        var buf: std.ArrayList(u8) = .empty;
+        for (types, 0..) |*t, i| {
+            if (i > 0) try buf.append(ma, '|');
+            try buf.appendSlice(ma, simpleTypeHead(t.name));
+        }
+        break :blk try buf.toOwnedSlice(ma);
+    };
+    b.module.pending_ref_key = try std.fmt.allocPrint(ma, "{s}|{d}|{s}|{s}", .{ f.fqn, n, heads, if (unit) "unit" else "value" });
     return try lowerExpr(b, boxed);
 }
 

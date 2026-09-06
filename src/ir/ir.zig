@@ -610,6 +610,16 @@ pub const Inst = union(enum) {
         /// Exact top-level extension declaration selected at lowering. Null
         /// keeps ordinary member/property reference dispatch by name.
         func: ?FuncId = null,
+        /// The expected function shape at the reference site (a
+        /// function-typed argument slot): value-parameter count, -1 when
+        /// unknown, and whether the result is coerced to Unit. The runtime
+        /// stamps the reference as adapted when the shape differs from the
+        /// target's signature.
+        adapt_arity: i16 = -1,
+        adapt_unit: bool = false,
+        /// The expected parameter type heads joined by `|` (a vararg slot
+        /// expecting an array is not an adaptation); null when unknown.
+        adapt_heads: ?ConstId = null,
     },
     /// Binary primitive operation. Operands are guaranteed to be
     /// the right type by typeck.
@@ -1203,6 +1213,10 @@ pub const Func = struct {
     /// and `""` is the ordinary "no package" case, not a separate code
     /// path.
     package: []const u8 = "",
+    /// For the forwarding lambda of an adapted callable reference: the
+    /// target and the adaptation (`fqn|arity|unit`), so two wrappers of
+    /// the same adaptation of the same target compare and hash equal.
+    ref_key: []const u8 = "",
     params: []Param,
     return_ty: TypeRef,
     /// Whether `return_ty` came from an explicit `: T` in the source. A
@@ -1994,6 +2008,9 @@ pub const Module = struct {
     /// lambda-body path and consumed there to emit the context-load
     /// prologue. Not serialized.
     pending_ctx: ?PendingCtx = null,
+    /// The reference key the next lowered lambda receives (an adapted
+    /// callable reference's wrapper); consumed at that lambda's finish.
+    pending_ref_key: ?[]const u8 = null,
     /// Lowering-only scratch: the DECLARED types of the parameters a
     /// synthesized parameter thunk is about to bind, parallel to its name
     /// list. A constructor-delegation argument or a default-value

@@ -42,8 +42,9 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// Annotation instances by value, captured locals in super calls, enum
 /// static scope and initialization: 5623 / 729.
 /// The `provideDelegate` convention at every delegated property: 5647 / 705.
-pub const BASELINE: usize = 5647;
-pub const MAX_FAILED: usize = 705;
+/// Callable references compare by target, receiver and adaptation: 5665 / 687.
+pub const BASELINE: usize = 5665;
+pub const MAX_FAILED: usize = 687;
 
 /// Directives that bind a test to a framework feature klio has no
 /// counterpart for: a backend restriction, a second module, reflection,

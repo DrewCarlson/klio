@@ -2006,7 +2006,15 @@ pub noinline fn execArmMemberRef(comptime H: type, allocator: Allocator, frame: 
     else
         try host.memberRef(allocator, &recv, name_str);
     switch (result) {
-        .ok => |v| try frame.write(mr.dst, v),
+        .ok => |v| {
+            if (comptime @hasDecl(H, "stampRefAdaptation")) {
+                if (mr.adapt_arity >= 0) {
+                    const heads: ?[]const u8 = if (mr.adapt_heads) |hc| constStr(frame.module, hc) else null;
+                    try host.stampRefAdaptation(allocator, &v, name_str, mr.func, mr.adapt_arity, mr.adapt_unit, heads);
+                }
+            }
+            try frame.write(mr.dst, v);
+        },
         .err => |e| return raiseStep(frame, e),
     }
     return .cont;

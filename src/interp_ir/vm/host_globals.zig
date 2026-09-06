@@ -887,6 +887,7 @@ fn funcValueById(self: *VmHost, allocator: Allocator, fid: FuncId) ?Value {
         const caps = ObjRef(std.ArrayList(Value)).init(allocator, .empty) catch return null;
         const id = self.closures.push(.{
             .body_func = fid,
+            .is_ref = true,
             .n_params = func.params.len,
             .receiver_shape_known = func.lambda_receiver_shape_known,
             .has_receiver = func.lambda_has_receiver,
