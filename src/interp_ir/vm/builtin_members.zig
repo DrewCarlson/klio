@@ -2761,55 +2761,72 @@ fn annotationHash(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData
 pub fn closureRefEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: *const Value) Allocator.Error!bool {
     const ca = a.IrClosure;
     const cb = b.IrClosure;
-    if (ca.id != cb.id) {
-        // Distinct closure records: the same body function is the same
-        // reference (two loads of `::f`); otherwise only two wrappers with
-        // the same reference key are.
-        const ia = self.closures.get(@intCast(ca.id)) orelse return Value.structuralEq(a, b);
-        const ib = self.closures.get(@intCast(cb.id)) orelse return Value.structuralEq(a, b);
-        if (ia.body_func != ib.body_func) {
-            const key_eq = blk: {
-                const mg = self.module.borrow();
-                defer mg.deinit();
-                const ma = ia.module orelse mg.get();
-                const mb = ib.module orelse mg.get();
-                const fa = ma.funcById(ia.body_func) orelse break :blk false;
-                const fb = mb.funcById(ib.body_func) orelse break :blk false;
-                break :blk fa.ref_key.len != 0 and std.mem.eql(u8, fa.ref_key, fb.ref_key);
-            };
-            if (!key_eq) return false;
-        }
-    }
+    if (ca.id == cb.id) return true;
+    // Distinct closure records. A function value loaded from a declaration
+    // (`::f`) equals every load of the same function; two forwarding
+    // wrappers of the same adaptation carry the same reference key; a
+    // non-capturing lambda literal is a singleton, so two evaluations of the
+    // same literal are the same value. A capturing lambda literal keeps
+    // identity: two evaluations are two objects.
+    const ia = self.closures.get(@intCast(ca.id)) orelse return Value.structuralEq(a, b);
+    const ib = self.closures.get(@intCast(cb.id)) orelse return Value.structuralEq(a, b);
+    const same_body = ia.body_func == ib.body_func and
+        (@intFromPtr(ia.module orelse @as(*const ir.Module, @ptrFromInt(8))) == @intFromPtr(ib.module orelse @as(*const ir.Module, @ptrFromInt(8))));
+    if (ia.is_ref and ib.is_ref) return same_body;
     const ga = ca.captures.borrow();
     defer ga.deinit();
     const gb = cb.captures.borrow();
     defer gb.deinit();
     const xa = ga.get().*;
     const xb = gb.get().*;
-    if (xa.len != xb.len) return false;
-    for (xa, xb) |*x, *y| {
-        if (!try deepValueEquals(self, allocator, x, y)) return false;
+    const key_eq = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const ma = ia.module orelse mg.get();
+        const mb = ib.module orelse mg.get();
+        const fa = ma.funcById(ia.body_func) orelse break :blk false;
+        const fb = mb.funcById(ib.body_func) orelse break :blk false;
+        break :blk fa.ref_key.len != 0 and std.mem.eql(u8, fa.ref_key, fb.ref_key);
+    };
+    if (key_eq) {
+        if (xa.len != xb.len) return false;
+        for (xa, xb) |*x, *y| {
+            if (!try deepValueEquals(self, allocator, x, y)) return false;
+        }
+        return true;
     }
-    return true;
+    if (same_body and xa.len == 0 and xb.len == 0 and ia.capture_names.len == 0 and ib.capture_names.len == 0) return true;
+    return false;
 }
 
-/// The hash of a callable reference, consistent with `closureRefEquals`.
+/// The hash of a callable reference, consistent with `closureRefEquals`:
+/// a function value hashes by its function, a wrapper by its reference
+/// key, a non-capturing literal by its body, a capturing literal by
+/// identity.
 pub fn closureRefHash(self: *VmHost, allocator: Allocator, v: *const Value) Allocator.Error!i32 {
     const c = v.IrClosure;
-    var h: i32 = blk: {
-        const info = self.closures.get(@intCast(c.id)) orelse break :blk kotlinHashCode(v);
+    const info = self.closures.get(@intCast(c.id)) orelse return kotlinHashCode(v);
+    const by_body: i32 = @truncate(@as(i64, @intCast(info.body_func.int())) *% 31 +% 17);
+    if (info.is_ref) return by_body;
+    const key_hash: ?i32 = blk: {
         const mg = self.module.borrow();
         defer mg.deinit();
         const mod = info.module orelse mg.get();
-        if (mod.funcById(info.body_func)) |f| {
-            if (f.ref_key.len != 0) break :blk javaStringHash(f.ref_key);
-        }
-        break :blk @as(i32, @truncate(@as(i64, @intCast(info.body_func.int()))));
+        const f = mod.funcById(info.body_func) orelse break :blk null;
+        if (f.ref_key.len == 0) break :blk null;
+        break :blk javaStringHash(f.ref_key);
     };
+    if (key_hash) |kh| {
+        var h = kh;
+        const g = c.captures.borrow();
+        defer g.deinit();
+        for (g.get().*) |*x| h = h *% 31 +% try hashWithDispatch(self, allocator, x);
+        return h;
+    }
     const g = c.captures.borrow();
     defer g.deinit();
-    for (g.get().*) |*x| h = h *% 31 +% try hashWithDispatch(self, allocator, x);
-    return h;
+    if (g.get().len == 0 and info.capture_names.len == 0) return by_body;
+    return kotlinHashCode(v);
 }
 
 /// `String.hashCode()` over UTF-16 code units.

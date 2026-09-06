@@ -55,6 +55,9 @@ moves on.
 ## Log
 
 - 2026-09-05: opened; the owning documents carry the task detail.
+- 2026-09-06: closure equality regression (compose remember keys) fixed:
+  capturing lambdas keep identity; Task 4 #19 typealias partial (1):
+  census 5,696 / 656 / 19; compose plugin lane 1389.
 - 2026-09-06: Stage 2 Task 4 #18 IEEE 754 comparisons (13): census
   5,695 / 657 / 19.
 - 2026-09-06: CI red on 697a9ad6/1b171137 (compose plugin shard): delegated

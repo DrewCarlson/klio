@@ -2746,6 +2746,7 @@ fn buildModuleWithOverrides(
             .type_params = type_params,
             .target = try ir.lower.decl.loweredTypeRef(a, &ta.target, true),
         };
+        if (runtime.envOnce("KLIO_ALIAS_TRACE") != null) std.debug.print("[alias] {s} -> {s} (qp={?s})\n", .{ ta.name.name, alias_shape.target.name, ta.target.qualified_path });
         try module.registry.type_alias_types.put(ta.name.name, alias_shape);
         const alias_fqn = try resolveFqn(
             a,
@@ -2760,6 +2761,36 @@ fn buildModuleWithOverrides(
             try module.registry.type_aliases.put(ta.name.name, tag);
             if (ft.receiver != null) {
                 try module.registry.recv_fn_aliases.put(ta.name.name, @intCast(@min(ft.params.len, 255)));
+            }
+        }
+    }
+    // A `typealias` declared in a class body is in scope inside that class
+    // (and reachable as `Owner.Alias`); its target is written in the
+    // class's own scope, so `typealias TAtoInner = Inner` names the nested
+    // class.
+    var alias_class_it = file_classes.valueIterator();
+    while (alias_class_it.next()) |fc| {
+        const c: *const ast.Class = fc.get();
+        for (c.members) |*m| {
+            if (m.* != .TypeAlias) continue;
+            const ta = &m.TypeAlias;
+            const type_params = try a.alloc([]const u8, ta.type_params.len);
+            for (ta.type_params, type_params) |*param, *out| out.* = param.name.name;
+            var target = try ir.lower.decl.loweredTypeRef(a, &ta.target, true);
+            if (std.mem.indexOfScalar(u8, target.name, '.') == null) {
+                // The target is written in the class's scope: a nested class
+                // of the owner resolves to that class's index name.
+                if (module.classId(c.name.name)) |owner_id| {
+                    if (module.classIdNestedIn(owner_id, target.name)) |nested_id| {
+                        if (nested_id.int() < module.classes.items.len) target.name = module.classes.items[nested_id.int()].name;
+                    }
+                }
+            }
+            const alias_shape = ir.ModuleRegistry.TypeAliasShape{ .type_params = type_params, .target = target };
+            const qualified = try std.fmt.allocPrint(a, "{s}.{s}", .{ c.name.name, ta.name.name });
+            try module.registry.type_alias_types.put(qualified, alias_shape);
+            if (!module.registry.type_alias_types.contains(ta.name.name)) {
+                try module.registry.type_alias_types.put(ta.name.name, alias_shape);
             }
         }
     }

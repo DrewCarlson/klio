@@ -6352,6 +6352,36 @@ fn tailJumpArgs(b: *FuncBuilder, receiver: ?*const Expr, args: []const Expr, arg
 
 fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call_tail = b.call_tail;
+    // `c.TA(args)` where `TA` aliases a nested or inner class of `c`'s
+    // class constructs the aliased class: the member call takes the
+    // target's own name, which the inner-constructor route serves.
+    if (expr.Call.callee.* == .Member and !expr.Call.callee.Member.safe) {
+        const mn = expr.Call.callee.Member.name.name;
+        if (b.module.registry.type_alias_types.get(mn)) |shape| {
+            const target = shape.target.name;
+            const simple = if (std.mem.lastIndexOfScalar(u8, target, '.')) |dot| target[dot + 1 ..] else target;
+            const fn_alias = if (b.module.registry.type_aliases.get(mn)) |tag| std.mem.startsWith(u8, tag, "Function") else false;
+            // Only an alias whose target is a NESTED class of some owner
+            // (an inner or nested class reached through an instance), and
+            // never one whose target name is itself an alias (a rewrite
+            // chain would loop).
+            const nested_target = blk: {
+                if (b.module.registry.type_alias_types.contains(simple)) break :blk false;
+                const cid = b.module.classIdIndexed(simple, b.self_package, expr.Call.callee.Member.name.span.file) orelse break :blk false;
+                if (cid.int() >= b.module.classes.items.len) break :blk false;
+                break :blk std.mem.indexOfScalar(u8, b.module.classes.items[cid.int()].fqn, '.') != null;
+            };
+            if (runtime.envOnce("KLIO_ALIAS_TRACE") != null) std.debug.print("[alias-call] {s} -> {s} nested={}\n", .{ mn, simple, nested_target });
+            if (!std.mem.eql(u8, simple, mn) and !fn_alias and nested_target) {
+                const callee_copy = try b.allocator.create(Expr);
+                callee_copy.* = expr.Call.callee.*;
+                callee_copy.Member.name = .{ .name = simple, .span = expr.Call.callee.Member.name.span };
+                var rewritten = expr.*;
+                rewritten.Call.callee = callee_copy;
+                return lowerCall(b, &rewritten);
+            }
+        }
+    }
     // A bare call of a delegated local (`val handler by rememberUpdatedState(f)`
     // then `handler()`) invokes the value the delegate's `getValue` yields,
     // never the delegate object bound under the plain name.
