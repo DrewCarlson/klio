@@ -2506,6 +2506,7 @@ pub fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *cons
     var is_data = false;
     var is_value = false;
     var is_object = false;
+    var is_annotation = false;
     var class_name: []const u8 = undefined;
     var class_fqn: []const u8 = undefined;
     {
@@ -2514,15 +2515,17 @@ pub fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *cons
         is_data = cg.get().is_data;
         is_value = cg.get().is_value;
         is_object = cg.get().is_object;
+        is_annotation = cg.get().is_annotation;
         class_name = cg.get().name;
         class_fqn = cg.get().fqn;
         cg.deinit();
         g.deinit();
     }
-    // Auto members are only synthesized for data/value/object classes; a plain
-    // class has none, so skip the per-call hierarchy walk (which allocates a
-    // queue + seen-set) that only feeds the `has_user_override` guards below.
-    if (!is_data and !is_value and !is_object) return null;
+    // Auto members are only synthesized for data/value/object/annotation
+    // classes; a plain class has none, so skip the per-call hierarchy walk
+    // (which allocates a queue + seen-set) that only feeds the
+    // `has_user_override` guards below.
+    if (!is_data and !is_value and !is_object and !is_annotation) return null;
     // The registry answer can be wrong when a simple class name collides
     // across packs (geometry Size vs the annotation Size); the instance's
     // OWN ClassDef is authoritative for whether it declares an override.
@@ -2532,6 +2535,18 @@ pub fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *cons
 
     if (is_data and is_object and !has_user_override and std.mem.eql(u8, name, "toString")) {
         return .{ .ok = try strVal(allocator, classDisplayName(class_name)) };
+    }
+    if (is_annotation and !has_user_override) {
+        if (args.len == 0 and std.mem.eql(u8, name, "toString")) {
+            return .{ .ok = try renderAnnotation(self, allocator, inst) };
+        }
+        if (args.len == 0 and std.mem.eql(u8, name, "hashCode")) {
+            return .{ .ok = Value.newInt(@as(i64, try annotationHash(self, allocator, inst))) };
+        }
+        if (args.len == 1 and std.mem.eql(u8, name, "equals")) {
+            return .{ .ok = boolVal(try annotationInstanceEquals(self, allocator, inst, &args[0])) };
+        }
+        return null;
     }
     if ((is_data or is_value) and !has_user_override and args.len == 0) {
         if (is_data and std.mem.startsWith(u8, name, "component")) {
@@ -2626,6 +2641,171 @@ pub fn dataClassAutoMembers(self: *VmHost, allocator: Allocator, receiver: *cons
         return .{ .ok = boolVal(try dataValueInstanceEquals(self, allocator, inst, &args[0])) };
     }
     return null;
+}
+
+/// The parameter names and values of an annotation instance, collected
+/// under one borrow so the comparisons and hashes that dispatch back into
+/// the interpreter never run with the instance or its class borrowed. The
+/// values are retained; the caller releases them.
+const AnnotationFields = struct {
+    names: std.ArrayList([]const u8) = .empty,
+    values: std.ArrayList(Value) = .empty,
+    fqn: []const u8 = "",
+
+    fn collect(allocator: Allocator, inst: ObjRef(InstanceData)) Allocator.Error!AnnotationFields {
+        var out: AnnotationFields = .{};
+        const g = inst.borrow();
+        const cg = g.get().class.borrow();
+        defer {
+            cg.deinit();
+            g.deinit();
+        }
+        out.fqn = if (cg.get().fqn.len != 0) cg.get().fqn else cg.get().name;
+        try out.names.ensureTotalCapacity(allocator, cg.get().primary_params.len);
+        try out.values.ensureTotalCapacity(allocator, cg.get().primary_params.len);
+        for (cg.get().primary_params) |p| {
+            const v = g.get().get(p.name) orelse Value.Null;
+            if (runtime.reclaimEnabled()) v.retain();
+            out.names.appendAssumeCapacity(p.name);
+            out.values.appendAssumeCapacity(v);
+        }
+        return out;
+    }
+
+    fn release(self: *AnnotationFields, allocator: Allocator) void {
+        if (runtime.reclaimEnabled()) {
+            for (self.values.items) |v| v.release(allocator);
+        }
+        self.names.deinit(allocator);
+        self.values.deinit(allocator);
+    }
+};
+
+/// Annotation instances follow Kotlin's rules for an instantiated
+/// annotation: `equals` holds when every parameter is equal, arrays by
+/// content and floating-point values by bit pattern (NaN equals NaN, 0.0
+/// differs from -0.0); `hashCode` is the sum over parameters of
+/// `(127 * name.hashCode()) xor value.hashCode()` with arrays hashed by
+/// content; `toString` renders `@fqn(name=value, ...)`.
+pub fn annotationInstanceEquals(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), other: *const Value) Allocator.Error!bool {
+    if (other.* != .Instance) return false;
+    const rhs = other.Instance;
+    var lhs_fields = try AnnotationFields.collect(allocator, inst);
+    defer lhs_fields.release(allocator);
+    var rhs_fields = try AnnotationFields.collect(allocator, rhs);
+    defer rhs_fields.release(allocator);
+    if (!std.mem.eql(u8, lhs_fields.fqn, rhs_fields.fqn)) return false;
+    if (lhs_fields.values.items.len != rhs_fields.values.items.len) return false;
+    for (lhs_fields.values.items, rhs_fields.values.items) |*l, *r| {
+        if (!try annotationValueEquals(self, allocator, l, r)) return false;
+    }
+    return true;
+}
+
+fn annotationValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: *const Value) Allocator.Error!bool {
+    switch (a.*) {
+        .Float => |x| {
+            if (b.* == .Float) return @as(u32, @bitCast(x)) == @as(u32, @bitCast(b.Float));
+        },
+        .Double => |x| {
+            if (b.* == .Double) return @as(u64, @bitCast(x)) == @as(u64, @bitCast(b.Double));
+        },
+        .Array => |xa| {
+            if (b.* == .Array) {
+                const ya = b.Array;
+                const n = xa.len();
+                if (n != ya.len()) return false;
+                var i: usize = 0;
+                while (i < n) : (i += 1) {
+                    var ex = xa.get(i);
+                    var ey = ya.get(i);
+                    if (!try annotationValueEquals(self, allocator, &ex, &ey)) return false;
+                }
+                return true;
+            }
+        },
+        else => {},
+    }
+    return deepValueEquals(self, allocator, a, b);
+}
+
+fn annotationHash(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) Allocator.Error!i32 {
+    var fields = try AnnotationFields.collect(allocator, inst);
+    defer fields.release(allocator);
+    var h: i32 = 0;
+    for (fields.names.items, fields.values.items) |n, *v| {
+        h +%= (javaStringHash(n) *% 127) ^ (try hashWithDispatch(self, allocator, v));
+    }
+    return h;
+}
+
+/// `String.hashCode()` over UTF-16 code units.
+fn javaStringHash(s: []const u8) i32 {
+    var h: i32 = 0;
+    var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp >= 0x10000) {
+            const c = cp - 0x10000;
+            h = h *% 31 +% @as(i32, @intCast(0xD800 + (c >> 10)));
+            h = h *% 31 +% @as(i32, @intCast(0xDC00 + (c & 0x3FF)));
+        } else {
+            h = h *% 31 +% @as(i32, @intCast(cp));
+        }
+    }
+    return h;
+}
+
+fn renderAnnotation(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData)) Allocator.Error!Value {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try renderAnnotationInto(self, allocator, inst, &buf);
+    return .{ .String = try runtime.strInitOwned(allocator, try buf.toOwnedSlice(allocator)) };
+}
+
+fn renderAnnotationInto(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), buf: *std.ArrayList(u8)) Allocator.Error!void {
+    var fields = try AnnotationFields.collect(allocator, inst);
+    defer fields.release(allocator);
+    try buf.append(allocator, '@');
+    try buf.appendSlice(allocator, fields.fqn);
+    try buf.append(allocator, '(');
+    for (fields.names.items, fields.values.items, 0..) |n, *v, idx| {
+        if (idx > 0) try buf.appendSlice(allocator, ", ");
+        try buf.appendSlice(allocator, n);
+        try buf.append(allocator, '=');
+        try renderAnnotationValue(self, allocator, v, buf);
+    }
+    try buf.append(allocator, ')');
+}
+
+fn renderAnnotationValue(self: *VmHost, allocator: Allocator, v: *const Value, buf: *std.ArrayList(u8)) Allocator.Error!void {
+    switch (v.*) {
+        .Array => |arr| {
+            try buf.append(allocator, '[');
+            const n = arr.len();
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                var e = arr.get(i);
+                try renderAnnotationValue(self, allocator, &e, buf);
+            }
+            try buf.append(allocator, ']');
+        },
+        .Instance => |ii| {
+            const nested = blk: {
+                const g = ii.borrow();
+                defer g.deinit();
+                const cg = g.get().class.borrow();
+                defer cg.deinit();
+                break :blk cg.get().is_annotation;
+            };
+            if (nested) return renderAnnotationInto(self, allocator, ii, buf);
+            switch (try callMember(self, allocator, v, "toString", &.{})) {
+                .ok => |sv| try buf.appendSlice(allocator, try sv.display(allocator)),
+                .err => try buf.appendSlice(allocator, try v.display(allocator)),
+            }
+        },
+        else => try buf.appendSlice(allocator, try v.display(allocator)),
+    }
 }
 
 /// `Name(p1=v1, …)` structural rendering of a data class.

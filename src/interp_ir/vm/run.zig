@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const host_instances = @import("host_instances.zig");
+const host_globals = @import("host_globals.zig");
 
 const ir = @import("ir");
 const runtime = @import("runtime");
@@ -552,7 +553,6 @@ fn outcomeFromRuntime(self: *Vm, r: runtime.EvalResult) CallOutcome {
 /// of `main`. Returns `null` on success, or the `VmError` of a failing
 /// top-level / enum-entry initializer. `module` and `sink` are already
 /// borrowed by the caller.
-
 fn instantiateEnumEntryBodies(self: *Vm, module: *const Module, sink: Output) Allocator.Error!?VmError {
     var enum_defs: std.ArrayList(runtime.ObjRef(runtime.ClassDef)) = .empty;
     defer {
@@ -582,6 +582,8 @@ fn instantiateEnumEntryBodies(self: *Vm, module: *const Module, sink: Output) Al
         }
         const enum_cid = module.classIdByFqn(enum_fqn) orelse continue;
         const enum_simple = if (std.mem.lastIndexOfScalar(u8, enum_fqn, '.')) |dot| enum_fqn[dot + 1 ..] else enum_fqn;
+        const prev_under_init = host_instances.setEnumUnderInit(enum_fqn);
+        defer _ = host_instances.setEnumUnderInit(prev_under_init);
         const has_secondary = blk: {
             const dg = cdef.borrow();
             defer dg.deinit();
@@ -589,6 +591,10 @@ fn instantiateEnumEntryBodies(self: *Vm, module: *const Module, sink: Output) Al
             // A vararg primary parameter needs the ordinary argument packing
             // too (an entry passing nothing still gets an empty array).
             for (module.classes.items[enum_cid.int()].primary_params) |prm| if (prm.is_vararg) break :blk true;
+            // `init` blocks and body property initializers are user code
+            // that runs per entry: only the ordinary path runs them.
+            if (dg.get().init_blocks.len != 0) break :blk true;
+            for (dg.get().body_properties) |bp| if (bp.init != null) break :blk true;
             break :blk false;
         };
         // The rebuilt entries are installed on the class before any is
@@ -644,7 +650,9 @@ fn instantiateEnumEntryBodies(self: *Vm, module: *const Module, sink: Output) Al
                     if (!std.mem.eql(u8, init_entry.class_name, enum_simple) or !std.mem.eql(u8, init_entry.entry_name, entry_name)) continue;
                     for (init_entry.funcs) |fid| {
                         const init_func = module.funcById(fid) orelse continue;
-                        switch (try ir.eval.evalWith(VmHost, self.allocator, module, init_func, .empty, &host)) {
+                        var thunk_args: std.ArrayList(Value) = .empty;
+                        try thunk_args.append(self.allocator, .{ .Class = cdef.clone() });
+                        switch (try ir.eval.evalWith(VmHost, self.allocator, module, init_func, thunk_args, &host)) {
                             .ok => |val| try ctor_args.append(self.allocator, val),
                             .err => |e| return vmErrorFromEval(self.allocator, e),
                         }
@@ -684,6 +692,17 @@ fn instantiateEnumEntryBodies(self: *Vm, module: *const Module, sink: Output) Al
                 try g.get().define(self.allocator, "__enum_entry_built__", .{ .Bool = true });
             }
             replaced[i].value = made;
+        }
+        // Every entry exists: the companion initializes now, after the
+        // entries and before any other use of the class.
+        if (module.registry.companion_singletons.get(enum_simple)) |cn| {
+            var host = vmMakeHost(self, sink);
+            _ = host_instances.setEnumUnderInit(prev_under_init);
+            defer _ = host_instances.setEnumUnderInit(enum_fqn);
+            switch (try host_globals.ensureObjectSingleton(&host, cn)) {
+                .ok => {},
+                .err => |e| return vmErrorFromEval(self.allocator, e),
+            }
         }
     }
     return null;
@@ -898,12 +917,9 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
             }
         }
     }
-    // An enum entry declared with a body (`B(args) { … }`) is an instance of
-    // the nested class `$B : Enum(args)` the parser synthesized for it.
-    // Construct it through the ordinary class path (parent constructor
-    // arguments, property initializers, init blocks), carry the entry's
-    // name and ordinal over, and make it the entry's value.
-    if (try instantiateEnumEntryBodies(self, module, sink)) |err| return err;
+    // A body-less entry is a build-time instance whose constructor
+    // arguments are evaluated here, BEFORE any entry body or companion
+    // runs user code that may read it (`entries.map { it.symbol }`).
     // Patch enum-entry instance fields with evaluated ctor args.
     for (self.enum_entry_arg_inits.items) |entry| {
         const class_def: ?runtime.ObjRef(runtime.ClassDef) = blk: {
@@ -961,7 +977,9 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
             const init_func = module.funcById(fid) orelse continue;
             const v = blk: {
                 var host = vmMakeHost(self, sink);
-                switch (try ir.eval.evalWith(VmHost, self.allocator, module, init_func, .empty, &host)) {
+                var thunk_args: std.ArrayList(Value) = .empty;
+                try thunk_args.append(self.allocator, .{ .Class = cdef.clone() });
+                switch (try ir.eval.evalWith(VmHost, self.allocator, module, init_func, thunk_args, &host)) {
                     .ok => |val| break :blk val,
                     .err => |e| return vmErrorFromEval(self.allocator, e),
                 }
@@ -997,6 +1015,12 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
             }
         }
     }
+    // An enum entry declared with a body (`B(args) { … }`) is an instance of
+    // the nested class `$B : Enum(args)` the parser synthesized for it.
+    // Construct it through the ordinary class path (parent constructor
+    // arguments, property initializers, init blocks), carry the entry's
+    // name and ordinal over, and make it the entry's value.
+    if (try instantiateEnumEntryBodies(self, module, sink)) |err| return err;
     return null;
 }
 

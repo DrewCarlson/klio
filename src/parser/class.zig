@@ -338,6 +338,7 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
         const name = support.parseIdent(p, "enum entry name") orelse break;
         const start = name.span;
         var args: std.ArrayList(Expr) = .empty;
+        var arg_names: std.ArrayList(?[]const u8) = .empty;
         support.skipNl(p);
         if (std.meta.activeTag(support.peekKind(p).*) == .LParen) {
             _ = support.bump(p);
@@ -347,11 +348,12 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
                     break;
                 }
                 // An enum entry may pass named constructor arguments
-                // (`ENTRY(1, "x", viaBroadcast = true)`); consume and drop the
-                // `name =` label — entry args bind positionally here.
-                _ = expr.tryConsumeNamedArgName(p);
+                // (`ENTRY(1, "x", viaBroadcast = true)`, `A(b = 1, a = 0)`);
+                // the label names the parameter the argument binds.
+                const label = expr.tryConsumeNamedArgName(p);
                 const a = expr.parseExpr(p) orelse break;
                 args.append(p.allocator, a) catch @panic("OOM");
+                arg_names.append(p.allocator, label) catch @panic("OOM");
                 support.skipNl(p);
                 if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
                     _ = support.bump(p);
@@ -371,6 +373,7 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
         }
         const end = p.tokens[p.pos -| 1].span;
         const entry_args = args.toOwnedSlice(p.allocator) catch @panic("OOM");
+        const entry_arg_names: []const ?[]const u8 = arg_names.toOwnedSlice(p.allocator) catch @panic("OOM");
         if (body) |cb| {
             // `B(args) { … }` declares an anonymous subclass of the enum whose
             // instance is the entry: the body's properties, `init` blocks,
@@ -391,6 +394,8 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
             };
             const sargs = p.allocator.alloc(?[]Expr, 1) catch @panic("OOM");
             sargs[0] = entry_args;
+            const sarg_names = p.allocator.alloc(?[]const ?[]const u8, 1) catch @panic("OOM");
+            sarg_names[0] = entry_arg_names;
             const sdel = p.allocator.alloc(?Expr, 1) catch @panic("OOM");
             sdel[0] = null;
             member_list.append(p.allocator, .{ .Class = .{
@@ -402,6 +407,7 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
                 .init_block_positions = cb.init_block_positions,
                 .supertypes = sups,
                 .supertype_args = sargs,
+                .supertype_arg_names = sarg_names,
                 .supertype_delegates = sdel,
                 .is_data = false,
                 .is_companion = false,
@@ -428,6 +434,7 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
         entries.append(p.allocator, .{
             .name = name,
             .args = entry_args,
+            .arg_names = entry_arg_names,
             .body_members = body_members,
             .annotations = annotations,
             .span = start.join(end),

@@ -215,17 +215,17 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
         },
         .List => {
             if (matchesAny(ty.name, &.{
-                "List",            "Collection",          "Iterable",
-                "AbstractList",    "AbstractCollection",  "MutableList",
-                "MutableCollection", "MutableIterable",   "ArrayList",
+                "List",                "Collection",         "Iterable",
+                "AbstractList",        "AbstractCollection", "MutableList",
+                "MutableCollection",   "MutableIterable",    "ArrayList",
                 "AbstractMutableList",
             })) return true;
         },
         .Set => {
             if (matchesAny(ty.name, &.{
-                "Set",               "Collection",      "Iterable",
-                "AbstractSet",       "MutableSet",      "MutableCollection",
-                "MutableIterable",   "HashSet",         "LinkedHashSet",
+                "Set",             "Collection", "Iterable",
+                "AbstractSet",     "MutableSet", "MutableCollection",
+                "MutableIterable", "HashSet",    "LinkedHashSet",
             })) return true;
         },
         .Map => {
@@ -332,12 +332,12 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     switch (value.*) {
         .Instance => |inst| {
             const builtin_exception_names = [_][]const u8{
-                "Throwable",                  "Exception",
-                "RuntimeException",           "Error",
-                "IllegalArgumentException",   "IllegalStateException",
-                "IndexOutOfBoundsException",  "NoSuchElementException",
-                "NullPointerException",       "ArithmeticException",
-                "ClassCastException",         "NumberFormatException",
+                "Throwable",                     "Exception",
+                "RuntimeException",              "Error",
+                "IllegalArgumentException",      "IllegalStateException",
+                "IndexOutOfBoundsException",     "NoSuchElementException",
+                "NullPointerException",          "ArithmeticException",
+                "ClassCastException",            "NumberFormatException",
                 "UnsupportedOperationException", "Any",
             };
             // Resolve the target once: its simple name (for a same-name
@@ -685,6 +685,7 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         .is_value = class.is_value,
         .is_object = false,
         .is_enum = class.is_enum,
+        .is_annotation = class.is_annotation,
         .is_sealed = class.is_sealed,
         .supertype_names = supertype_names,
         .supertype_paths = supertype_paths,
@@ -1150,6 +1151,16 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
     // prop/const of that name and must stay a dynamic read/write.
     const prev_caps = ir.build.setLowerAnonCaptureNames(captured_names);
     defer _ = ir.build.setLowerAnonCaptureNames(prev_caps);
+    // The same names go into the capture SET the member lowerings consult
+    // (an anonymous object installs it too): a lambda inside a method or a
+    // parent-constructor argument then captures `o` through the method's
+    // own capture slot, filled by name at dispatch, instead of reading a
+    // global that only exists while the method runs.
+    var cap_set = StringSet.init(allocator);
+    for (captured_names) |n| try cap_set.put(n, {});
+    const prev_set = ir.lower.takeLowerAnonCaptures();
+    ir.lower.setLowerAnonCaptures(cap_set);
+    defer ir.lower.setLowerAnonCaptures(prev_set);
     switch (try registerClass(self, allocator, class)) {
         .ok => {},
         .err => |e| return .{ .err = e },
@@ -1190,6 +1201,7 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
             // local class is otherwise never registered.
             try registerNestedClasses(self, allocator, class);
             try assignNestedOuters(self, allocator, class, tv);
+            try patchCaptureEntries(self, allocator, class, capture_pairs);
             return .ok;
         }
     }
@@ -1198,52 +1210,75 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
     // under globals.
     const capture_pairs = try buildCapturePairs(allocator, captured_names, captures);
     if (capture_pairs.len == 0) return .ok;
-    const tbl = self.anon_methods.borrowMut();
-    defer tbl.deinit();
-    for (class.members) |*m| {
-        switch (m.*) {
-            .Function => |*f| {
-                const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ f.name.name, f.params.len });
-                for ([_][]const u8{ arity_name, f.name.name }) |member| {
-                    const key = try anonKey(allocator, class.name.name, member);
-                    if (tbl.get().getPtr(key)) |entry| {
-                        entry.captures = capture_pairs;
-                    }
-                }
-                // The indexed keys of a same-arity overload family are dense
-                // from zero, so patch until one is missing.
-                var overload_index: usize = 0;
-                while (true) : (overload_index += 1) {
-                    const member = try root.anonOverloadMemberName(allocator, arity_name, overload_index);
-                    const key = try anonKey(allocator, class.name.name, member);
-                    const entry = tbl.get().getPtr(key) orelse break;
-                    entry.captures = capture_pairs;
-                }
-            },
-            // Accessor / property-initializer thunks capture the same outer
-            // env: `val doubled = count * 2` reads the enclosing fn's cell.
-            .Property => |p| {
-                for ([_][]const u8{ "$get$", "$set$", "$init$" }) |prefix| {
-                    const nm = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, p.name.name });
-                    const key = try anonKey(allocator, class.name.name, nm);
-                    if (tbl.get().getPtr(key)) |entry| {
-                        entry.captures = capture_pairs;
-                    }
-                }
-            },
-            else => {},
-        }
-    }
-    // The `$init$block$<idx>` thunks capture the same outer env: an
-    // `init { count++ }` writes through the enclosing fn's boxed cell.
-    for (class.init_blocks, 0..) |_, idx| {
-        const nm = try std.fmt.allocPrint(allocator, "$init$block${d}", .{idx});
-        const key = try anonKey(allocator, class.name.name, nm);
-        if (tbl.get().getPtr(key)) |entry| {
-            entry.captures = capture_pairs;
-        }
-    }
+    try patchCaptureEntries(self, allocator, class, capture_pairs);
     return .ok;
+}
+
+/// Point every registry entry the class registered (methods, accessor and
+/// initializer thunks, init blocks, parent-constructor argument thunks) at
+/// the captured enclosing env, and the same for its nested classes: an
+/// inner class's `Base({ o + k })` closes over the function's `o` too.
+fn patchCaptureEntries(self: *VmHost, allocator: Allocator, class: *const ast.Class, capture_pairs: []NameValue) Allocator.Error!void {
+    {
+        const tbl = self.anon_methods.borrowMut();
+        defer tbl.deinit();
+        {
+            var ai: usize = 0;
+            while (true) : (ai += 1) {
+                const nm = try std.fmt.allocPrint(allocator, "$super$arg${d}", .{ai});
+                const key = try anonKey(allocator, class.name.name, nm);
+                const entry = tbl.get().getPtr(key) orelse break;
+                entry.captures = capture_pairs;
+            }
+        }
+        for (class.members) |*m| {
+            switch (m.*) {
+                .Function => |*f| {
+                    const arity_name = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ f.name.name, f.params.len });
+                    for ([_][]const u8{ arity_name, f.name.name }) |member| {
+                        const key = try anonKey(allocator, class.name.name, member);
+                        if (tbl.get().getPtr(key)) |entry| {
+                            entry.captures = capture_pairs;
+                        }
+                    }
+                    // The indexed keys of a same-arity overload family are dense
+                    // from zero, so patch until one is missing.
+                    var overload_index: usize = 0;
+                    while (true) : (overload_index += 1) {
+                        const member = try root.anonOverloadMemberName(allocator, arity_name, overload_index);
+                        const key = try anonKey(allocator, class.name.name, member);
+                        const entry = tbl.get().getPtr(key) orelse break;
+                        entry.captures = capture_pairs;
+                    }
+                },
+                // Accessor / property-initializer thunks capture the same outer
+                // env: `val doubled = count * 2` reads the enclosing fn's cell.
+                .Property => |p| {
+                    for ([_][]const u8{ "$get$", "$set$", "$init$" }) |prefix| {
+                        const nm = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, p.name.name });
+                        const key = try anonKey(allocator, class.name.name, nm);
+                        if (tbl.get().getPtr(key)) |entry| {
+                            entry.captures = capture_pairs;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        // The `$init$block$<idx>` thunks capture the same outer env: an
+        // `init { count++ }` writes through the enclosing fn's boxed cell.
+        for (class.init_blocks, 0..) |_, idx| {
+            const nm = try std.fmt.allocPrint(allocator, "$init$block${d}", .{idx});
+            const key = try anonKey(allocator, class.name.name, nm);
+            if (tbl.get().getPtr(key)) |entry| {
+                entry.captures = capture_pairs;
+            }
+        }
+    }
+    for (class.members) |*m| {
+        if (m.* != .Class or m.Class.is_companion) continue;
+        try patchCaptureEntries(self, allocator, &m.Class, capture_pairs);
+    }
 }
 
 /// The `.Class` value for a local class just registered under `name`, so the
@@ -1352,7 +1387,7 @@ fn lastSegment(fqn: []const u8) []const u8 {
 
 fn isReflectionTypeName(name: []const u8) bool {
     return matchesAny(name, &.{
-        "KProperty",  "KCallable",  "KFunction",  "KFunction0",
+        "KProperty",  "KCallable",  "KFunction",        "KFunction0",
         "KFunction1", "KFunction2", "KMutableProperty",
     });
 }
@@ -1364,35 +1399,29 @@ fn isReflectionTypeName(name: []const u8) bool {
 fn isBuiltinTypeName(name: []const u8) bool {
     const builtins = [_][]const u8{
         // Primitives + their boxed/number forms.
-        "Int",    "Long",   "Short",   "Byte",    "Double",  "Float",   "Char",   "Boolean",
-        "UInt",   "ULong",  "UShort",  "UByte",   "Number",  "Unit",    "Nothing", "Any",
+        "Int",                           "Long",                                 "Short",                           "Byte",                         "Double",              "Float",                      "Char",                     "Boolean",
+        "UInt",                          "ULong",                                "UShort",                          "UByte",                        "Number",              "Unit",                       "Nothing",                  "Any",
         // Strings / char sequences.
-        "String", "CharSequence", "StringBuilder",
+        "String",                        "CharSequence",                         "StringBuilder",
         // Comparison / common interfaces.
-        "Comparable", "Comparator", "Pair", "Triple",
+                          "Comparable",                   "Comparator",          "Pair",                       "Triple",
         // Collections + arrays (read-only and mutable).
-        "Array",      "IntArray",   "LongArray",  "ShortArray", "ByteArray",  "DoubleArray",
-        "FloatArray", "CharArray",  "BooleanArray", "UIntArray", "ULongArray",
-        "UShortArray", "UByteArray",
-        "List",       "MutableList", "ArrayList",  "AbstractList", "AbstractMutableList",
-        "Collection", "MutableCollection", "AbstractCollection",
-        "Iterable",   "MutableIterable", "Iterator", "MutableIterator", "ListIterator",
-        "Set",        "MutableSet", "HashSet",    "LinkedHashSet", "AbstractSet",
-        "Map",        "MutableMap", "HashMap",    "LinkedHashMap", "AbstractMap",
-        "Sequence",   "EnumEntries",
+                          "Array",
+        "IntArray",                      "LongArray",                            "ShortArray",                      "ByteArray",                    "DoubleArray",         "FloatArray",                 "CharArray",                "BooleanArray",
+        "UIntArray",                     "ULongArray",                           "UShortArray",                     "UByteArray",                   "List",                "MutableList",                "ArrayList",                "AbstractList",
+        "AbstractMutableList",           "Collection",                           "MutableCollection",               "AbstractCollection",           "Iterable",            "MutableIterable",            "Iterator",                 "MutableIterator",
+        "ListIterator",                  "Set",                                  "MutableSet",                      "HashSet",                      "LinkedHashSet",       "AbstractSet",                "Map",                      "MutableMap",
+        "HashMap",                       "LinkedHashMap",                        "AbstractMap",                     "Sequence",                     "EnumEntries",
         // Ranges / progressions.
-        "IntRange",       "LongRange",       "CharRange", "IntProgression", "LongProgression",
-        "CharProgression", "ClosedRange",    "OpenEndRange",
+                "IntRange",                   "LongRange",                "CharRange",
+        "IntProgression",                "LongProgression",                      "CharProgression",                 "ClosedRange",                  "OpenEndRange",
         // Reflection.
-        "KClass", "KProperty", "KCallable", "KFunction", "KMutableProperty",
+               "KClass",                     "KProperty",                "KCallable",
+        "KFunction",                     "KMutableProperty",
         // Throwable hierarchy.
-        "Throwable",                  "Exception",            "RuntimeException", "Error",
-        "IllegalArgumentException",   "IllegalStateException", "IndexOutOfBoundsException",
-        "ArrayIndexOutOfBoundsException", "StringIndexOutOfBoundsException",
-        "NullPointerException",       "ArithmeticException",  "ClassCastException",
-        "NoSuchElementException",     "NumberFormatException", "UnsupportedOperationException",
-        "UninitializedPropertyAccessException", "ConcurrentModificationException",
-        "NoWhenBranchMatchedException", "AssertionError", "NegativeArraySizeException",
+                            "Throwable",                       "Exception",                    "RuntimeException",    "Error",                      "IllegalArgumentException", "IllegalStateException",
+        "IndexOutOfBoundsException",     "ArrayIndexOutOfBoundsException",       "StringIndexOutOfBoundsException", "NullPointerException",         "ArithmeticException", "ClassCastException",         "NoSuchElementException",   "NumberFormatException",
+        "UnsupportedOperationException", "UninitializedPropertyAccessException", "ConcurrentModificationException", "NoWhenBranchMatchedException", "AssertionError",      "NegativeArraySizeException",
     };
     if (containsStr(&builtins, name)) return true;
     return std.mem.startsWith(u8, name, "Function");

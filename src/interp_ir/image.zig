@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 55;
+pub const FORMAT_VERSION: u32 = 56;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -769,6 +769,7 @@ const ClassDefImage = struct {
     is_value: bool,
     is_object: bool,
     is_enum: bool,
+    is_annotation: bool,
     is_sealed: bool,
     supertype_names: []const []const u8,
     parent: ?u32,
@@ -1984,6 +1985,7 @@ fn classDefToImage(
         .is_value = cd.is_value,
         .is_object = cd.is_object,
         .is_enum = cd.is_enum,
+        .is_annotation = cd.is_annotation,
         .is_sealed = cd.is_sealed,
         .supertype_names = cd.supertype_names,
         .parent = if (cd.parent) |p| (def_index.get(@intFromPtr(p.cell)) orelse return false) else null,
@@ -2384,6 +2386,7 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
             .is_value = ci.is_value,
             .is_object = ci.is_object,
             .is_enum = ci.is_enum,
+            .is_annotation = ci.is_annotation,
             .is_sealed = ci.is_sealed,
             .supertype_names = ci.supertype_names,
             .parent = null,

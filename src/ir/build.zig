@@ -3137,6 +3137,10 @@ pub const FuncBuilder = struct {
         // chain.
         var oit = self.outer_names.keyIterator();
         while (oit.next()) |k| try out.put(k.*, {});
+        // Inside a local class's or anonymous object's members the enclosing
+        // function's captured locals are reachable too, so an object
+        // expression or nested local class declared there closes over them.
+        for (lower_anon_capture_names) |n| try out.put(n, {});
         return out;
     }
 

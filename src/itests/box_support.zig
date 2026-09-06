@@ -39,8 +39,10 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// constructors, vararg enum entries: 5542 / 810. Parent secondary
 /// constructors from subclass headers, enum overrides virtual: 5553 / 799.
 /// Omitted varargs empty on every route, SAM context parameters: 5560 / 792.
-pub const BASELINE: usize = 5560;
-pub const MAX_FAILED: usize = 792;
+/// Annotation instances by value, captured locals in super calls, enum
+/// static scope and initialization: 5623 / 729.
+pub const BASELINE: usize = 5623;
+pub const MAX_FAILED: usize = 729;
 
 /// Directives that bind a test to a framework feature klio has no
 /// counterpart for: a backend restriction, a second module, reflection,

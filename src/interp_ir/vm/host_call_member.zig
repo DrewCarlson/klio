@@ -68,6 +68,7 @@ const compareValuesBuiltin = builtin_members.compareValuesBuiltin;
 const componentMembers = builtin_members.componentMembers;
 const dataClassAutoMembers = builtin_members.dataClassAutoMembers;
 const dataValueInstanceEquals = builtin_members.dataValueInstanceEquals;
+const annotationInstanceEquals = builtin_members.annotationInstanceEquals;
 pub const deepValueEquals = builtin_members.deepValueEquals;
 const drainIterableToList = builtin_members.drainIterableToList;
 const hashWithDispatch = builtin_members.hashWithDispatch;
@@ -4811,6 +4812,17 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                     }
                     return r;
                 }
+                // An inner class of a LOCAL class has no module index entry:
+                // its runtime definition is the class (`Local().Inner(k)`).
+                const cls_val: Value = .{ .Class = def.clone() };
+                defer if (runtime.reclaimEnabled()) cls_val.release(allocator);
+                const r = try host_call_value.callValue(self, allocator, &cls_val, args);
+                if (r == .ok and r.ok == .Instance) {
+                    const ig = r.ok.Instance.borrowMut();
+                    ig.get().outer = .{ .Instance = receiver.Instance.clone() };
+                    ig.deinit();
+                }
+                return r;
             }
         }
     }
@@ -10556,8 +10568,12 @@ fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Val
             const g = inst.borrow();
             const cg = g.get().class.borrow();
             const structural = cg.get().is_data or cg.get().is_value;
+            const annotation = cg.get().is_annotation;
             cg.deinit();
             g.deinit();
+            if (annotation) {
+                return .{ .ok = boolVal(try annotationInstanceEquals(self, allocator, inst, &args[0])) };
+            }
             if (structural) {
                 return .{ .ok = boolVal(try dataValueInstanceEquals(self, allocator, inst, &args[0])) };
             }

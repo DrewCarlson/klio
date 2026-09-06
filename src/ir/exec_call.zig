@@ -1726,6 +1726,18 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
                 }
             }
             }
+            // The enum's static scope encloses its companion, nested objects
+            // and entry bodies: a bare entry name read there is the entry.
+            if (resolved == null and comptime @hasDecl(H, "enclosingEnumEntry")) {
+                for (cands) |c| {
+                    if (host.enclosingEnumEntry(&c.v, stripScopeGetter(name_str))) |ev| {
+                        if (runtime.reclaimEnabled()) ev.retain();
+                        orAudit("LoadFromThisOrGlobal", name_str, "enum_entry", c.depth, &c.v);
+                        resolved = ev;
+                        break;
+                    }
+                }
+            }
             if (shape) |sh| {
                 const entry: u64 = if (winner) |w|
                     (if (w <= 0xFF) (sh & SITE_SHAPE_MASK) | (@as(u64, @intCast(w)) << 2) | SITE_WIN else 0)
@@ -1789,6 +1801,20 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
                     // an implicit receiver's own member is the only
                     // Kotlin-legal binding left: retry the candidates with
                     // the PLAIN property name before failing.
+                    // A read lowered inside an enum's entry body, companion
+                    // or nested object (the scoped getter names that owner)
+                    // reaches the enum's entries even from a lambda with no
+                    // live receiver: the enum's static scope encloses it.
+                    if (comptime @hasDecl(H, "enclosingEnumEntryByOwner")) {
+                        if (scopeGetterOwner(constStr(frame.module, lt.name) orelse bare_name)) |owner| {
+                            if (host.enclosingEnumEntryByOwner(owner, bare_name)) |ev| {
+                                if (runtime.reclaimEnabled()) ev.retain();
+                                orAudit("LoadFromThisOrGlobal", bare_name, "enum_entry_owner", -1, null);
+                                try frame.write(lt.dst, ev);
+                                return .cont;
+                            }
+                        }
+                    }
                     if (!std.mem.eql(u8, bare_name, constStr(frame.module, lt.name) orelse bare_name)) {
                         var cands2_l = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, bare_name, null);
                         defer releaseCands(allocator, &cands2_l);
@@ -3656,6 +3682,19 @@ fn orAudit(inst_tag: []const u8, name: []const u8, arm: []const u8, depth: i32, 
         "[KLIO_OR_AUDIT] run inst={s} name={s} arm={s} depth={d} recv={s}\n",
         .{ inst_tag, name, arm, depth, recv_tag },
     );
+}
+
+/// The owner class a scope-qualified getter name carries, or null for a
+/// plain name.
+fn scopeGetterOwner(name: []const u8) ?[]const u8 {
+    const prefix = "$sgetter$";
+    if (std.mem.startsWith(u8, name, prefix)) {
+        const rest = name[prefix.len..];
+        if (std.mem.indexOfScalar(u8, rest, '\u{1f}')) |sep| {
+            return rest[0..sep];
+        }
+    }
+    return null;
 }
 
 fn stripScopeGetter(name: []const u8) []const u8 {

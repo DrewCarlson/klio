@@ -650,6 +650,14 @@ pub fn setLowerAnonCaptures(names: ?StringSet) void {
     lower_anon_captures = names;
 }
 
+/// Hand the installed capture set back to the caller (ownership included)
+/// so a nested lowering window can install its own and restore this one.
+pub fn takeLowerAnonCaptures() ?StringSet {
+    const cur = lower_anon_captures;
+    lower_anon_captures = null;
+    return cur;
+}
+
 pub fn isLowerAnonCapture(name: []const u8) bool {
     if (lower_anon_captures) |*c| return c.contains(name);
     return false;
@@ -1029,6 +1037,7 @@ pub fn lowerClassWithExtras(
         .is_open = c.is_open,
         .is_enum = c.is_enum,
         .has_primary_ctor = c.has_primary_ctor,
+        .is_annotation = c.is_annotation,
         .is_value = c.is_value,
         .receiver_abi = runtime.classifierReceiverAbi(class_fqn),
     });

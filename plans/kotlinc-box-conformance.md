@@ -416,6 +416,93 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    inner-constructor shapes, and three context-function shapes — carried
    into the next clusters.
 
+13. **Annotation instances (2026-09-06)**: `annotations/instances` failed
+   24 of 30 because an instantiated annotation compared by identity. The
+   runtime never knew a class was an annotation: `is_annotation` now
+   travels from the AST through `ir.Class` and the image (format 56) to
+   the runtime definition, and the synthesized-member path serves
+   `equals` (every parameter, arrays by content, floating-point values by
+   bit pattern so NaN equals NaN and 0.0 differs from -0.0), `hashCode`
+   (the sum of `(127 * name.hashCode()) xor value.hashCode()`, arrays
+   hashed by content) and `toString` (`@fqn(name=value, ...)`, nested
+   annotations and arrays inline). The `==` operator's instance route
+   takes the same equality. Example `annotation_instances`. Subset 6 →
+   30 of 30.
+
+14. **Captured locals in super constructor calls (2026-09-06)**:
+   `closures/captureInSuperConstructorCall` failed 15 of 32. Four
+   mechanisms. (a) The anonymous-object path installs the capture SET the
+   member lowerings consult while the local-class path installed only the
+   name slice the bare-name lowering reads, so a lambda inside a local
+   class's method or parent-constructor argument read the captured `o` as
+   a global that exists only while the method runs; `registerClassCaptured`
+   now installs the set for its window (with a take/restore pair), the
+   lambda capture resolver accepts either list, and `visibleNames` lists
+   the captured names so an object expression declared there closes over
+   them. (b) `registerClass` registered the `$super$arg$<i>` thunks
+   without captures and the patch loop covered only the class's own
+   members; a `patchCaptureEntries` helper now covers the thunks and
+   recurses into nested classes on both registration paths. (c)
+   `Local().Inner(k)` failed because the inner-constructor member route
+   only constructed module classes; a runtime-registered inner class now
+   constructs through the class value with `outer` set. (d) An inner
+   class's secondary-constructor delegation arguments and defaults were
+   lowered without the enclosing members and without a receiver slot, so
+   `constructor() : super({ ok })` read `ok` as a global; the thunks now
+   take a leading receiver slot (the enclosing instance for an inner
+   class, like the primary defaults) and see the enclosing member set.
+   Example `captured_locals_in_super_calls`. Subset 17 → 31 of 32.
+   Verdict on the last, `properValueCapturedByClosure2`: `inner class
+   Inner : Outer({ ok })` must read the superclass companion's `ok` (the
+   superclass's static scope is part of the subclass's own scope, inner to
+   the outer instance's members); kotlinc confirmed. Not fixed here: the
+   bare-name lowering ranks the outer instance member first.
+   Known gap outside the corpus: a local class's primary-constructor
+   default that reads a captured local (`class L(x: String = o)`) is not
+   evaluated on the runtime-registered construction route.
+
+15. **Enum static scope (2026-09-06)**: `enum/` failed 23 of 95. Five
+   mechanisms. (a) Inside an enum's methods the entry names are own
+   members, but the companion object, a nested object and an entry body
+   are separate classes whose bare `B` became a field read on their own
+   instance; a bare read that misses on such an instance now resolves to
+   the entry of the enclosing enum (companion link, dotted class name, or
+   the registry's enclosing map), and `entries` reads forward to the enum
+   class the same way. (b) A lambda in an entry's constructor argument
+   (`FOO("O", { FOO.x })`) was lowered as a plain thunk with no scope; the
+   argument thunks now take the enum class as `this` with the enum's
+   visible member names, and the implicit-receiver walk's tail resolves a
+   scoped-getter owner's enclosing enum when no live receiver exists (the
+   entry-body class's lambdas). (c) The parser consumed and dropped the
+   labels of named entry arguments (`B(b = 1, a = 0)`); they are now kept
+   on the entry (and on the synthesized body class's supertype call) and
+   the argument thunks bind by parameter with defaults for the gaps. (d)
+   A body-declaring entry of `enum class Test(vararg xs: Int)` delegated
+   with no arguments and `xs` was absent; the super-constructor chain pads
+   an omitted trailing vararg with the empty typed array like every call
+   route. (e) A body-less enum's `init` blocks and body property
+   initializers never ran: its entries were built at build time and only
+   their fields were patched at start; an enum declaring either now
+   constructs its entries through the ordinary path. (f) The companion
+   of an enum initialized at the first entry's construction, before the
+   other entries had fields (`entries.map { it.symbol }` in the companion
+   read a placeholder); the body-less entries' fields are now patched
+   before any entry body runs, the companion waits while the entries are
+   under construction and initializes right after the last one. An enum
+   without a primary constructor keeps its entry arguments positional for
+   the secondary constructor (the reorder sizes its slots by the larger
+   of the parameter and argument counts). Example `enum_static_scope`.
+   Subset 72 → 82 of 95. Records #13-#15 together: census 5,623 / 729 /
+   19; sweep 117/0; corpus 468/468; unit green.
+   Left in the subset, next: six initialization-order tests
+   (`initEntriesInCompanionObject`, `initEntriesInValueOf`,
+   `enumCompanionInit`, `initEnumAfterObjectAccess`) need kotlinc's
+   lazy class initialization: an enum initializes at its first use, so
+   two enums' side effects interleave with the program's own statements
+   rather than all running at start. Three tests reference an entry from
+   an inner class constructed during that entry's own initialization,
+   and four singles remain.
+
  Log
 
 - 2026-09-05: opened.
@@ -436,3 +523,5 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
 - 2026-09-05: Task 4 #10 parent secondary constructors + enum virtual
   dispatch landed: 5553 / 799.
 - 2026-09-06: Task 4 #12 adapted callable references landed: 5560 / 792.
+- 2026-09-06: Task 4 #13 annotation instances, #14 captured locals in
+  super constructor calls, #15 enum static scope landed: 5623 / 729.
