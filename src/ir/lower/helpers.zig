@@ -294,9 +294,12 @@ pub fn lowerArgRunFull(
     const arg_broad_masks = b.pending_arg_broad_masks;
     const arg_fn_generic = b.pending_arg_fn_generic;
     const arg_lambda_param_types = b.pending_arg_lambda_param_types;
+    const arg_lambda_unit = b.pending_arg_lambda_unit;
     b.pending_arg_broad_masks = null;
     b.pending_arg_fn_generic = null;
     b.pending_arg_lambda_param_types = null;
+    b.pending_arg_lambda_unit = null;
+    defer if (arg_lambda_unit) |m| b.allocator.free(m);
     const prev_expected = b.pushExpected(null);
     for (slots, 0..) |slot, j| {
         // A sibling-solved expected type applies to exactly one arg node.
@@ -311,6 +314,7 @@ pub fn lowerArgRunFull(
             (if (j < types.len) types[j] else null)
         else
             null;
+        b.pending_ref_lambda_unit = if (arg_lambda_unit) |m| (j < m.len and m[j]) else false;
         const coerced: ?Reg = if (param_ty_names) |pts|
             (if (j < pts.len) (if (pts[j]) |tn| try coerceNumericLiteralArg(b, &args[j], tn) else null) else null)
         else

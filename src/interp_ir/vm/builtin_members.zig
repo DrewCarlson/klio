@@ -65,6 +65,16 @@ const typeErr = host_call_member.typeErr;
 /// compared under a live borrow (never a heap snapshot, which the GC would not
 /// root across the nested VM dispatch), mirroring `collectionsEqualHostAware`.
 pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: *const Value) Allocator.Error!bool {
+    // A property reference (`::x`) is equal to another reference to the
+    // same property.
+    if (a.* == .PropertyRef and b.* == .PropertyRef) {
+        const ga = a.PropertyRef.name.borrow();
+        defer ga.deinit();
+        const gb = b.PropertyRef.name.borrow();
+        defer gb.deinit();
+        return std.mem.eql(u8, ga.get().bytes, gb.get().bytes);
+    }
+    if (a.* == .IrClosure and b.* == .IrClosure) return closureRefEquals(self, allocator, a, b);
     // A NATIVE collection on the left compares against a user Instance
     // implementing the matching collection interface by the Kotlin
     // collection contract (same size, equal elements/entries) — that is
@@ -265,6 +275,12 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
 /// does. Non-container scalars delegate to the pure hash.
 pub fn hashWithDispatch(self: *VmHost, allocator: Allocator, v: *const Value) Allocator.Error!i32 {
     switch (v.*) {
+        .IrClosure => return closureRefHash(self, allocator, v),
+        .PropertyRef => |pr| {
+            const g = pr.name.borrow();
+            defer g.deinit();
+            return javaStringHash(g.get().bytes);
+        },
         .Instance, .Exception => {
             const r = try callMember(self, allocator, v, "hashCode", &.{});
             switch (r) {
@@ -2739,8 +2755,65 @@ fn annotationHash(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData
     return h;
 }
 
+/// Callable references compare by target, captures and adaptation: two
+/// loads of `::f` are the same function, and two forwarding wrappers of
+/// the same adaptation of the same target carry the same reference key.
+pub fn closureRefEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: *const Value) Allocator.Error!bool {
+    const ca = a.IrClosure;
+    const cb = b.IrClosure;
+    if (ca.id != cb.id) {
+        // Distinct closure records: the same body function is the same
+        // reference (two loads of `::f`); otherwise only two wrappers with
+        // the same reference key are.
+        const ia = self.closures.get(@intCast(ca.id)) orelse return Value.structuralEq(a, b);
+        const ib = self.closures.get(@intCast(cb.id)) orelse return Value.structuralEq(a, b);
+        if (ia.body_func != ib.body_func) {
+            const key_eq = blk: {
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                const ma = ia.module orelse mg.get();
+                const mb = ib.module orelse mg.get();
+                const fa = ma.funcById(ia.body_func) orelse break :blk false;
+                const fb = mb.funcById(ib.body_func) orelse break :blk false;
+                break :blk fa.ref_key.len != 0 and std.mem.eql(u8, fa.ref_key, fb.ref_key);
+            };
+            if (!key_eq) return false;
+        }
+    }
+    const ga = ca.captures.borrow();
+    defer ga.deinit();
+    const gb = cb.captures.borrow();
+    defer gb.deinit();
+    const xa = ga.get().*;
+    const xb = gb.get().*;
+    if (xa.len != xb.len) return false;
+    for (xa, xb) |*x, *y| {
+        if (!try deepValueEquals(self, allocator, x, y)) return false;
+    }
+    return true;
+}
+
+/// The hash of a callable reference, consistent with `closureRefEquals`.
+pub fn closureRefHash(self: *VmHost, allocator: Allocator, v: *const Value) Allocator.Error!i32 {
+    const c = v.IrClosure;
+    var h: i32 = blk: {
+        const info = self.closures.get(@intCast(c.id)) orelse break :blk kotlinHashCode(v);
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const mod = info.module orelse mg.get();
+        if (mod.funcById(info.body_func)) |f| {
+            if (f.ref_key.len != 0) break :blk javaStringHash(f.ref_key);
+        }
+        break :blk @as(i32, @truncate(@as(i64, @intCast(info.body_func.int()))));
+    };
+    const g = c.captures.borrow();
+    defer g.deinit();
+    for (g.get().*) |*x| h = h *% 31 +% try hashWithDispatch(self, allocator, x);
+    return h;
+}
+
 /// `String.hashCode()` over UTF-16 code units.
-fn javaStringHash(s: []const u8) i32 {
+pub fn javaStringHash(s: []const u8) i32 {
     var h: i32 = 0;
     var it = std.unicode.Utf8View.initUnchecked(s).iterator();
     while (it.nextCodepoint()) |cp| {

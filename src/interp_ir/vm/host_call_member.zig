@@ -4449,6 +4449,17 @@ pub fn replayHits() u64 {
 }
 
 fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, no_ext: bool, declared_recv: ?[]const u8) Allocator.Error!EvalResult {
+    // A callable reference's `equals`/`hashCode` follow reference equality
+    // (target, receiver, adaptation), never the string or scalar builtins.
+    if (receiver.* == .IrClosure or receiver.* == .PropertyRef) {
+        if (args.len == 1 and std.mem.eql(u8, name, "equals")) {
+            const eq = if (args[0] == .IrClosure or args[0] == .PropertyRef) try builtin_members.deepValueEquals(self, allocator, receiver, &args[0]) else false;
+            return .{ .ok = boolVal(eq) };
+        }
+        if (args.len == 0 and std.mem.eql(u8, name, "hashCode")) {
+            return .{ .ok = Value.newInt(@as(i64, try builtin_members.hashWithDispatch(self, allocator, receiver))) };
+        }
+    }
     // The delegated-property creation convention, served with its own
     // fallback (a dispatch miss keeps the delegate).
     if (args.len == 2 and name.len == "$provideDelegate".len and name[0] == '$' and std.mem.eql(u8, name, "$provideDelegate")) {
@@ -10546,6 +10557,21 @@ fn samIterableInstance(self: *VmHost, allocator: Allocator, receiver: *const Val
 }
 
 fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    // A bound or qualified callable reference (`v::m`, `V::m`, `Foo::ext`)
+    // compares by name, receiver and adaptation, and hashes the same way.
+    if (host_fields.boundRefParts(receiver)) |mine| {
+        if (args.len == 1 and std.mem.eql(u8, name, "equals")) {
+            const other = host_fields.boundRefParts(&args[0]) orelse return .{ .ok = boolVal(false) };
+            if (!std.mem.eql(u8, mine.name, other.name) or !std.mem.eql(u8, mine.adapt, other.adapt)) return .{ .ok = boolVal(false) };
+            return .{ .ok = boolVal(try builtin_members.deepValueEquals(self, allocator, &mine.receiver, &other.receiver)) };
+        }
+        if (args.len == 0 and std.mem.eql(u8, name, "hashCode")) {
+            var h: i32 = builtin_members.javaStringHash(mine.name);
+            h = h *% 31 +% try builtin_members.hashWithDispatch(self, allocator, &mine.receiver);
+            h = h *% 31 +% builtin_members.javaStringHash(mine.adapt);
+            return .{ .ok = Value.newInt(@as(i64, h)) };
+        }
+    }
     const inst = receiver.Instance;
     if (args.len == 0 and std.mem.eql(u8, name, "toString")) {
         if (instanceIsThrowable(self, allocator, inst)) {

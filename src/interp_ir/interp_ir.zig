@@ -1176,6 +1176,10 @@ pub const SharedOutput = struct {
 /// One element of the lambda/closure side-table.
 pub const ClosureInfo = struct {
     body_func: FuncId,
+    /// A function VALUE loaded from a declaration (`::f`): equal to every
+    /// other load of the same function, but never the same object (a
+    /// non-capturing lambda literal is; a reference is not).
+    is_ref: bool = false,
     /// The module `body_func` indexes when the closure was created inside
     /// a body lowered into a per-method *sub-module* (an anonymous-object
     /// method, property-init thunk, or `init` block). Null means the main
@@ -1272,7 +1276,7 @@ fn closureSingletonThunk(id: u64) u64 {
     const info = sc.get(id) orelse return 0;
     // A reclaimed slot's metadata is gone; a captured closure keeps per-instance
     // identity (Kotlin makes only non-capturing lambdas singletons).
-    if (info.reclaimed or info.capture_names.len != 0 or info.chain.len != 0) return 0;
+    if (info.reclaimed or info.is_ref or info.capture_names.len != 0 or info.chain.len != 0) return 0;
     const mod_bits: u64 = if (info.module) |m| @intFromPtr(m) else 0;
     var h: u64 = 1469598103934665603;
     h = (h ^ mod_bits) *% 1099511628211;

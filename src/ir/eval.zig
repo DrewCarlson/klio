@@ -9688,6 +9688,22 @@ fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Value, 
             return ok(.{ .Bool = if (neg) !eq else eq });
         }
     }
+    // Callable references compare by target, bound receiver and adaptation
+    // (two loads of `::f` are equal; two wrappers of the same adaptation of
+    // the same target are equal), never by closure identity alone.
+    if ((bo.op == .Eq or bo.op == .NotEq or bo.op == .BoxedEq or bo.op == .BoxedNotEq) and
+        (l == .IrClosure or r == .IrClosure or l == .PropertyRef or r == .PropertyRef) and
+        comptime @hasDecl(H, "deepValueEquals"))
+    {
+        // A callable against a non-callable, non-instance value is never
+        // equal (`::foo == "foo"`); an instance keeps its own `equals`.
+        const eq = if (l != .Instance and r != .Instance)
+            try host.deepValueEquals(allocator, &l, &r)
+        else
+            false;
+        const neg = bo.op == .NotEq or bo.op == .BoxedNotEq;
+        if (l != .Instance and r != .Instance) return ok(.{ .Bool = if (neg) !eq else eq });
+    }
     if (operatorMethod(bo.op)) |method| {
         if (l == .Instance or r == .Instance) {
             // A `fun interface` SAM wrapper has no equality of its own —

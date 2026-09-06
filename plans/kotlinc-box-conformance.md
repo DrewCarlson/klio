@@ -529,6 +529,35 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
    delegated property, and an extension property whose delegate names a
    member of the enclosing object.
 
+17. **Callable reference equality (2026-09-06)**: `callableReference/
+    equality` failed 15 of 21. Four mechanisms. (a) Two loads of `::f` are
+    distinct closure records that compared by identity; closures now
+    compare by body function (through the host's closure table) and
+    captures, and a function value loaded from a declaration is marked so
+    the non-capturing-lambda singleton rule leaves `::f === ::f` false. (b)
+    A bound or class-qualified reference (`v::m`, `V::m`, `Foo::ext`) is a
+    `$bound_ref$` synth that compared by identity; its `equals`/`hashCode`
+    now use name, receiver (by `equals`) and adaptation. (c) An adapted
+    reference (fewer parameters through defaults, a vararg spread, a
+    result coerced to Unit) was the raw function value, so every
+    adaptation of a target compared equal; a top-level reference at a
+    function-typed slot whose shape differs now lowers as a forwarding
+    lambda stamped with a reference key (`fqn|arity|heads|unit`) that
+    equality and hashing compare, and a member reference carries the
+    slot's shape on the `MemberRef` instruction so the runtime stamps the
+    synth when the shape differs from the member's signature (a vararg
+    slot expecting the array itself is not an adaptation). The Unit mask
+    the call lowering computes for lambda arguments now covers reference
+    arguments too. (d) `equals`/`hashCode` called on a closure or property
+    reference resolved to the string builtins; they follow reference
+    equality, and a property reference equals another to the same
+    property. Example `callable_reference_equality`. Subset 6 → 16 of 21;
+    census 5,665 / 687 / 19; sweep 117/0; corpus 470/470; unit green.
+    Left: suspend conversion (a `suspend` function-typed slot is not a
+    visible expectation at the reference site; 2), a vararg-as-array
+    member reference in a receiver-form slot, a Unit coercion combined
+    with a vararg spread, and a companion member reference.
+
  Log
 
 - 2026-09-05: opened.
@@ -552,3 +581,4 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
 - 2026-09-06: Task 4 #13 annotation instances, #14 captured locals in
   super constructor calls, #15 enum static scope landed: 5623 / 729.
 - 2026-09-06: Task 4 #16 provideDelegate convention landed: 5647 / 705.
+- 2026-09-06: Task 4 #17 callable reference equality landed: 5665 / 687.

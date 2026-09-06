@@ -657,6 +657,10 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     const id = module.nextFuncId();
     func.id = id;
     func.is_lambda = is_lambda;
+    if (module.pending_ref_key) |key| {
+        func.ref_key = key;
+        module.pending_ref_key = null;
+    }
     // The receiver head may alias a span-keyed `lambda_arg_recv` entry the
     // builder frees at teardown; the Func outlives the builder, so it must
     // own its copy (reading the alias at run time observed whatever string

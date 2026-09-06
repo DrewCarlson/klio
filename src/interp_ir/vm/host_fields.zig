@@ -489,6 +489,147 @@ pub fn enclosingEnumEntryByOwner(self: *VmHost, owner: []const u8, name: []const
     return null;
 }
 
+fn typeHeadOf(name: []const u8) []const u8 {
+    var h = std.mem.trimEnd(u8, name, "?");
+    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (std.mem.lastIndexOfScalar(u8, h, '.')) |d| h = h[d + 1 ..];
+    return h;
+}
+
+/// The parts of a bound/qualified callable reference synth
+/// (`recv::name`): its name, receiver and adaptation stamp.
+pub const BoundRefParts = struct { name: []const u8, receiver: Value, adapt: []const u8 };
+
+pub fn boundRefParts(v: *const Value) ?BoundRefParts {
+    if (v.* != .Instance) return null;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    {
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        if (!std.mem.startsWith(u8, cg.get().name, "$bound_ref$")) return null;
+    }
+    const name_v = g.get().get("__bound_name__") orelse return null;
+    if (name_v != .String) return null;
+    const name = blk: {
+        const sg = name_v.String.borrow();
+        defer sg.deinit();
+        break :blk sg.get().bytes;
+    };
+    const recv = g.get().get("__bound_receiver__") orelse Value.Null;
+    const adapt: []const u8 = blk: {
+        const av = g.get().get("__adapt__") orelse break :blk "";
+        if (av != .String) break :blk "";
+        const ag = av.String.borrow();
+        defer ag.deinit();
+        break :blk ag.get().bytes;
+    };
+    return .{ .name = name, .receiver = recv, .adapt = adapt };
+}
+
+/// A reference taken at a function-typed slot whose shape differs from the
+/// target's signature (fewer values through defaults or a vararg, more
+/// through a vararg, or a result coerced to Unit) is an adapted reference:
+/// stamp the synth so equality tells the adaptations apart.
+pub fn stampRefAdaptation(self: *VmHost, allocator: Allocator, v: *const Value, name: []const u8, exact: ?ir.FuncId, arity: i16, unit: bool, heads: ?[]const u8) Allocator.Error!void {
+    if (v.* != .Instance) return;
+    const parts = boundRefParts(v) orelse return;
+    const bound = parts.receiver != .Class;
+    var declared: ?usize = null;
+    var returns_unit = true;
+    var has_vararg = false;
+    var vararg_at: ?usize = null;
+    if (exact) |fid| {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().funcById(fid)) |f| {
+            const skip: usize = if (bound and f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+            declared = f.params.len - skip;
+            returns_unit = std.mem.eql(u8, typeHeadOf(f.return_ty.name), "Unit");
+            for (f.params, 0..) |*prm, i| if (prm.is_vararg) {
+                has_vararg = true;
+                vararg_at = i - skip + @as(usize, if (bound) 0 else 1);
+            };
+        }
+    } else {
+        const cls: ?runtime.ObjRef(runtime.ClassDef) = switch (parts.receiver) {
+            .Instance => |inst| blk: {
+                const ig = inst.borrow();
+                defer ig.deinit();
+                break :blk ig.get().class.clone();
+            },
+            .Class => |c| c.clone(),
+            else => null,
+        };
+        if (cls) |c| {
+            defer c.deinit();
+            if (runtime.ClassDef.findMethod(c, allocator, name)) |hit| {
+                defer hit.class.deinit();
+                const decl = hit.method.decl.get();
+                declared = decl.params.len + @as(usize, if (bound) 0 else 1);
+                returns_unit = if (decl.return_type) |*rt| std.mem.eql(u8, typeHeadOf(rt.name.name), "Unit") else (if (decl.body) |bd| bd == .Block else false);
+                for (decl.params, 0..) |*prm, i| if (prm.is_vararg) {
+                    has_vararg = true;
+                    vararg_at = i + @as(usize, if (bound) 0 else 1);
+                };
+            } else {
+                // A module class keeps its methods in the IR module: walk the
+                // class chain by fqn through the member index.
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                var cur: ?runtime.ObjRef(runtime.ClassDef) = c.clone();
+                while (cur) |cd| {
+                    const fqn = blk: {
+                        const dg = cd.borrow();
+                        defer dg.deinit();
+                        break :blk if (dg.get().fqn.len != 0) dg.get().fqn else dg.get().name;
+                    };
+                    const ids = mg.get().memberDecls(fqn, name);
+                    if (ids.len != 0) {
+                        if (mg.get().funcById(ids[0])) |f| {
+                            const skip: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+                            declared = (f.params.len - skip) + @as(usize, if (bound) 0 else 1);
+                            returns_unit = std.mem.eql(u8, typeHeadOf(f.return_ty.name), "Unit");
+                            for (f.params, 0..) |*prm, i| if (prm.is_vararg) {
+                                has_vararg = true;
+                                vararg_at = (i - skip) + @as(usize, if (bound) 0 else 1);
+                            };
+                        }
+                        cd.deinit();
+                        break;
+                    }
+                    const next: ?runtime.ObjRef(runtime.ClassDef) = blk: {
+                        const dg = cd.borrow();
+                        defer dg.deinit();
+                        break :blk if (dg.get().parent) |pp| pp.clone() else null;
+                    };
+                    cd.deinit();
+                    cur = next;
+                }
+            }
+        }
+    }
+    const want: usize = @intCast(arity);
+    const decl = declared orelse return;
+    // A vararg parameter adapts unless the slot expects the array itself.
+    const vararg_adapts = blk: {
+        const vi = vararg_at orelse break :blk false;
+        const hs = heads orelse break :blk want != decl;
+        var it = std.mem.splitScalar(u8, hs, '|');
+        var idx: usize = 0;
+        while (it.next()) |h| : (idx += 1) {
+            if (idx == vi) break :blk !(std.mem.eql(u8, h, "Array") or std.mem.endsWith(u8, h, "Array"));
+        }
+        break :blk true;
+    };
+    const adapted = (want != decl and (want < decl or has_vararg)) or (unit and !returns_unit) or vararg_adapts;
+    if (!adapted) return;
+    const stamp = try std.fmt.allocPrint(allocator, "{d}|{s}", .{ want, if (unit and !returns_unit) "unit" else "value" });
+    const g = v.Instance.borrowMut();
+    defer g.deinit();
+    try g.get().define(allocator, "__adapt__", .{ .String = try runtime.strInitOwned(allocator, stamp) });
+}
+
 /// A boxed capture (an anon-object method's captured outer `var` stored
 /// in its capture env as a shared Cell) reads THROUGH the cell — the cell
 /// is a carrier, never a user value.
