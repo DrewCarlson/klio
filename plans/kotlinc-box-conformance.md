@@ -551,7 +551,12 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
     arguments too. (d) `equals`/`hashCode` called on a closure or property
     reference resolved to the string builtins; they follow reference
     equality, and a property reference equals another to the same
-    property. Example `callable_reference_equality`. Subset 6 → 16 of 21;
+    property. The first cut compared two distinct lambda objects with the
+    same body and equal captures as equal, which broke compose's remember
+    keys (three test classes); Kotlin reserves structural equality for
+    non-capturing literals and function references, so a capturing literal
+    keeps identity for `==` and `hashCode`. Example
+    `callable_reference_equality`. Subset 6 → 16 of 21;
     census 5,665 / 687 / 19; sweep 117/0; corpus 470/470; unit green.
     Left: suspend conversion (a `suspend` function-typed slot is not a
     visible expectation at the reference site; 2), a vararg-as-array
@@ -569,6 +574,46 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
     `rememberObserverThrashing` pass again. The shard's other named
     failures (`validatePotentialDeadlock`, the `concurrentMixingWriteApply`
     pair) are the itest's documented allowed failures.
+
+18. **IEEE 754 comparisons (2026-09-06)**: `ieee754` failed 16 of 39. Four
+    mechanisms, all static-type-directed. (a) A smart cast (`x is Double
+    && x == y` on an `Any` local) narrows the local for the branch, but the
+    `==` lowering consulted only the local's declared-`Any` record and
+    emitted the boxed comparison, so `-0.0 == 0.0` was false and `NaN ==
+    NaN` true after the cast; a numeric narrowing now makes the operand
+    primitive, and a Double meets a Float as a Double at runtime (the
+    scalar arm promotes for the ordering and IEEE equality operators
+    only). (b) `Double.equals`/`Float.equals` as member calls compared
+    with the IEEE operator; they compare the boxed representation. (c) A
+    value read through `Comparable<Double>` (a cast or a parameter declared
+    so) orders by `compareTo` and compares by `equals`. (d) `Int`/`Long`
+    `compareTo` with a floating argument, and `Float.compareTo` with a
+    Double, convert to Double and follow the total order (`0.compareTo(
+    -0.0) == 1`, `compareTo(NaN) == -1`). Example `ieee754_comparisons`.
+    Subset 23 → 36 of 39; census 5,695 / 657 / 19; sweep 117/0; corpus
+    472/472; unit green. Left: generic and reified `Comparable` receivers
+    inside inline functions, an unstable smart cast (`var`) on NaN, and a
+    smart cast with numeric promotion between integer and floating types.
+
+19. **Typealiases (2026-09-06, partial)**: `typealias` failed 14 of 28.
+    (a) A `typealias` to a class was not a class name to the class pick, so
+    a generic alias constructor (`ST("a", 1)`), an alias of a companion
+    (`Alias.result`) and an alias in a supertype call were unresolved
+    references; the pick now follows an alias to its target's class head,
+    resolved in the reference's own scope (a bare simple-name lookup
+    across packs let kotlinx's `Node` alias answer other `Node`s and broke
+    every coroutine example).
+    (b) A `typealias` declared in a class body parsed as a member but was
+    never registered; it registers under `Owner.Alias` and the bare name
+    with its target resolved in the class's scope. (c) A member call
+    through an alias to an inner class (`c.TA()`) constructs the aliased
+    class. Subset 14 → 15 of 28; census 5,696 / 656 / 19; sweep 117/0;
+    corpus 472/472; compose plugin 1389 (baseline 1385); unit and e2e
+    green. Left: explicit type arguments on an alias
+    call reaching the constructor as values, alias targets inside a class
+    body from a method, an alias of a companion as a value, aliases in
+    anonymous object types and super calls, and alias-typed extension
+    functions.
 
  Log
 
@@ -594,3 +639,5 @@ constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`)
   super constructor calls, #15 enum static scope landed: 5623 / 729.
 - 2026-09-06: Task 4 #16 provideDelegate convention landed: 5647 / 705.
 - 2026-09-06: Task 4 #17 callable reference equality landed: 5665 / 687.
+- 2026-09-06: Task 4 #18 IEEE 754 comparisons landed: 5695 / 657.
+- 2026-09-06: capturing-lambda identity restored, #19 typealias partial: 5696 / 656.

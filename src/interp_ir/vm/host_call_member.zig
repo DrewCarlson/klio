@@ -5015,6 +5015,12 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 
     // `equals` on a builtin scalar/String.
     if (std.mem.eql(u8, name, "equals") and isBuiltinScalar(receiver)) {
+        // `Double.equals`/`Float.equals` compare the boxed representation:
+        // `(-0.0).equals(0.0)` is false and `NaN.equals(NaN)` is true, unlike
+        // the IEEE `==` on the primitive.
+        if ((receiver.* == .Double or receiver.* == .Float) and args.len == 1) {
+            return .{ .ok = boolVal(Value.structuralEqBoxed(receiver, &args[0])) };
+        }
         if (receiver.* == .String and args.len > 1 and args[1] == .Bool and args[1].Bool) {
             if (args.len > 0 and args[0] == .String) {
                 const eq = eqIgnoreCase(allocator, receiver.String, args[0].String);

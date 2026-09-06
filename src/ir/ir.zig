@@ -7784,12 +7784,14 @@ pub const Module = struct {
 
     /// Look up a class by simple name.
     pub fn classId(self: *const Module, name: []const u8) ?ClassId {
-        if (self.class_id_map) |*m| return m.get(name);
-        if (self.classNameCandidates(name)) |ids| {
-            return if (ids.len == 0) null else ids[0];
-        }
-        for (self.class_index.items) |entry| {
-            if (std.mem.eql(u8, entry.name, name)) return entry.id;
+        if (self.class_id_map) |*m| {
+            if (m.get(name)) |id| return id;
+        } else if (self.classNameCandidates(name)) |ids| {
+            if (ids.len != 0) return ids[0];
+        } else {
+            for (self.class_index.items) |entry| {
+                if (std.mem.eql(u8, entry.name, name)) return entry.id;
+            }
         }
         return null;
     }
@@ -8271,7 +8273,46 @@ pub const Module = struct {
     /// order breaks a same-tier tie, so a single-candidate lookup
     /// matches `classId` exactly while a cross-package collision binds
     /// the class the caller can actually see.
+    /// A `typealias` to a class is that class wherever a class name is
+    /// expected (`typealias ST<T> = Pair<String, T>` then `ST("a", 1)`,
+    /// `typealias Alias = A.Companion` then `Alias.result`): the alias
+    /// name resolves to its target's class head. The alias is looked up in
+    /// the reference's own scope — its file's imports, then its package —
+    /// never by bare simple name across packages (kotlinx's `Node` alias
+    /// must not answer a `Node` written elsewhere).
+    pub fn aliasTargetClassHead(self: *const Module, name: []const u8, caller_pkg: []const u8, caller_file: FileId) ?[]const u8 {
+        const shape: ModuleRegistry.TypeAliasShape = blk: {
+            var imported: ?[]const u8 = null;
+            for (self.importAliasPathsIn(caller_file, name)) |path| {
+                if (!self.registry.type_alias_types.contains(path.fqn)) continue;
+                if (imported != null and !std.mem.eql(u8, imported.?, path.fqn)) return null;
+                imported = path.fqn;
+            }
+            if (imported) |path| break :blk self.registry.type_alias_types.get(path).?;
+            if (caller_pkg.len != 0) {
+                var buf: [512]u8 = undefined;
+                const own = std.fmt.bufPrint(&buf, "{s}.{s}", .{ caller_pkg, name }) catch return null;
+                if (self.registry.type_alias_types.get(own)) |s| break :blk s;
+                return null;
+            }
+            // A default-package alias registers under its bare name, which
+            // is also its fqn.
+            break :blk self.registry.type_alias_types.get(name) orelse return null;
+        };
+        if (self.registry.type_aliases.get(name)) |tag| {
+            if (std.mem.startsWith(u8, tag, "Function")) return null;
+        }
+        const head = staticTypeHead(shape.target.name);
+        if (std.mem.eql(u8, head, name)) return null;
+        return head;
+    }
+
     pub fn classIdIndexed(self: *const Module, name: []const u8, caller_pkg_in: []const u8, caller_file: FileId) ?ClassId {
+        if (self.classNameCandidates(name) == null) {
+            if (self.aliasTargetClassHead(name, self.packageOfFile(caller_file) orelse caller_pkg_in, caller_file)) |target| {
+                return self.classIdIndexed(target, caller_pkg_in, caller_file);
+            }
+        }
         // Scope judgments follow the FILE: a spliced inline body carries
         // donor-file spans, and the donor's own package is the
         // same-package tier for names its body wrote (the geometry

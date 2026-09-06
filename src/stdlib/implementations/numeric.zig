@@ -704,15 +704,16 @@ pub fn float_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
-    const b = blk: {
+    const b: f64 = blk: {
         if (argAt(ctx, 1)) |arg| {
-            if (arg.asF32()) |v| break :blk v;
+            if (arg.asF64()) |v| break :blk v;
+            if (arg.asF32()) |v| break :blk @floatCast(v);
         }
         return .{ .err = .{ .Type = "Float.compareTo requires a number" } };
     };
     // `compareTo` is a total order (NaN greatest, -0.0 < 0.0), unlike the
-    // IEEE `<`/`>` operators.
-    return ok(Value.newInt(kotlinFloatTotalCmp(@floatCast(a), @floatCast(b))));
+    // IEEE `<`/`>` operators; a Double argument compares as Double.
+    return ok(Value.newInt(kotlinFloatTotalCmp(@floatCast(a), b)));
 }
 
 // ============================================================
@@ -912,6 +913,9 @@ pub fn long_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     const b = blk: {
         if (argAt(ctx, 1)) |arg| {
             if (arg.asI64()) |v| break :blk v;
+            // `Long.compareTo(Double)`: both convert to Double and follow
+            // the total order.
+            if (arg.asF64()) |f| return ok(.{ .Int = @intCast(kotlinFloatTotalCmp(@floatFromInt(a), f)) });
         }
         return .{ .err = .{ .Type = "Long.compareTo requires a Long" } };
     };
@@ -1007,6 +1011,10 @@ pub fn int_compare_to(ctx: *CallCtx) Allocator.Error!EvalResult {
     const b = blk: {
         if (argAt(ctx, 1)) |arg| {
             if (arg.asI64()) |v| break :blk v;
+            // `Int.compareTo(Double)` / `Byte.compareTo(Float)`: both convert
+            // to Double and follow the total order (`0.compareTo(-0.0) == 1`,
+            // `0.compareTo(NaN) == -1`).
+            if (arg.asF64()) |f| return ok(.{ .Int = @intCast(kotlinFloatTotalCmp(@floatFromInt(a), f)) });
         }
         return .{ .err = .{ .Type = "Int.compareTo requires an Int" } };
     };

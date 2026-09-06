@@ -7976,6 +7976,21 @@ inline fn scalarBin(op: BinOp, lv: Value, rv: Value) ?Value {
             .NotEq, .BoxedNotEq => .{ .Bool = lv.Bool != rv.Bool },
             else => break :blk null,
         };
+    } else if ((lv == .Double and rv == .Float) or (lv == .Float and rv == .Double)) blk: {
+        // A Double against a Float (a smart cast to each in one condition)
+        // compares as Double under IEEE: `0.0 != -0.0F` is false. Boxed
+        // equality stays tag-sensitive and falls through.
+        const a: f64 = if (lv == .Double) lv.Double else @floatCast(lv.Float);
+        const b: f64 = if (rv == .Double) rv.Double else @floatCast(rv.Float);
+        break :blk switch (op) {
+            .Less => .{ .Bool = a < b },
+            .LessEq => .{ .Bool = a <= b },
+            .Greater => .{ .Bool = a > b },
+            .GreaterEq => .{ .Bool = a >= b },
+            .Eq => .{ .Bool = a == b },
+            .NotEq => .{ .Bool = a != b },
+            else => break :blk null,
+        };
     } else if ((lv == .Int or lv == .Long) and (rv == .Int or rv == .Long)) blk: {
         // Mixed widths promote to Long, as `applyBinop` does. Boxed
         // equality stays tag-sensitive (`(1 as Any) != (1L as Any)`)
