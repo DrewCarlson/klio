@@ -16163,6 +16163,25 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
             return .{ .ok = .{ .Bool = same } };
         }
     }
+    // `super.Inner(args)`: an inner class of a supertype constructs
+    // through `this` as its outer instance.
+    if (receiver.* == .Instance) {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const mod = mg.get();
+        var cur: ?ir.ClassId = mod.classId(owner_class) orelse mod.classIdByFqn(owner_class);
+        var depth: usize = 0;
+        while (cur) |cid| : (depth += 1) {
+            if (depth > 32 or cid.int() >= mod.classes.items.len) break;
+            const c = &mod.classes.items[cid.int()];
+            if (mod.classIdNestedIn(cid, name)) |nested| {
+                if (nested.int() < mod.classes.items.len and mod.classes.items[nested.int()].is_inner) {
+                    return try newInstanceById(self, allocator, nested, args, receiver);
+                }
+            }
+            cur = if (c.supertypes.len != 0) c.supertypes[0] else null;
+        }
+    }
     return .{ .err = try typeErr(allocator, "super.{s}: no matching method up the supertype chain from `{s}`", .{ name, owner_class }) };
 }
 

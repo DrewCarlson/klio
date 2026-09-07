@@ -114,6 +114,10 @@ residue list (every cluster under five) as the seed of the next campaign.
 - operatorConventions/kt4987 (1): `counter++` on a null `Int?` with a
   LOCAL `Int?.inc()` extension reaches the member call on a null
   receiver instead of the local closure.
+- classes/kt723, kt725, kt2711 (3): inside `operator fun Int?.inc()`,
+  `this.inc()` after a null check must bind the MEMBER `Int.inc` through
+  the smart cast; the lowering has no smart-cast record for `this`, so
+  the call re-enters the extension until the evaluation depth cap.
 - properties/fieldInsideField (1): an anonymous object's property with
   both an initializer and a `field`-reading getter stores the initializer
   under the plain name, not the raw backing slot.
