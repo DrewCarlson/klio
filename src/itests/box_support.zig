@@ -299,7 +299,7 @@ pub fn synthesizedMain(a: std.mem.Allocator, c: *const Case) ![]const u8 {
         \\{s}fun main() {{
         \\    val r = box()
         \\    if (r != "OK") throw AssertionError("box() returned " + r)
-        \\    println("BOX-OK")
+        \\    kotlin.io.println("BOX-OK")
         \\}}
         \\
     , .{import_line});

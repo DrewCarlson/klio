@@ -839,6 +839,13 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .As => |cast| {
             const s = try lowerExpr(b, cast.expr);
+            // `x as (T & Any)`: the definitely-non-null cast of a null throws
+            // NullPointerException; the type itself is erased.
+            if (cast.ty.definitely_non_null and !cast.safe) {
+                const dst = b.allocReg();
+                try b.push(.{ .NotNullAssert = .{ .dst = dst, .src = s } });
+                return dst;
+            }
             // A cast to a NON-reified type parameter (`x as T`) is erased: the
             // JVM `checkcast` targets the bound and passes any value (including
             // null), so it is a runtime no-op — a genuine mismatch surfaces
