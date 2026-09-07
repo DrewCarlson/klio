@@ -716,6 +716,7 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
             for (class.type_params, names) |*tp, *out| out.* = tp.name.name;
             break :blk names;
         },
+        .type_param_bounds = try build.classTypeParamBoundHeads(allocator, class.type_params, class.where_bounds),
         .primary_params = primary_params,
         .methods = &.{},
         .body_properties = try body_props.toOwnedSlice(allocator),

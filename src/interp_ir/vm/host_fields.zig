@@ -2678,6 +2678,12 @@ fn companionMemberOfClass(self: *VmHost, allocator: Allocator, class_name: []con
                 if (v == .Null and storedNullIsLateinit(s.Instance, name)) {
                     return try lateinitReadError(allocator, name);
                 }
+                // A `by`-delegated companion property stores its delegate
+                // in the slot; the read is the delegate's `getValue`.
+                if (runtimeClassDelegatesProp(s.Instance, name)) {
+                    const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
+                    return try self.callMember(allocator, &v, "getValue", &.{ s, prop_ref });
+                }
                 return ok(v);
             }
             // No plain backing field — the companion member may be a
@@ -3509,12 +3515,13 @@ fn ownerKeyedExtProp(comptime setters: bool, map: anytype, recv_key: []const u8,
         const slot = &memo[(k >> 7) % memo.len];
         const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
         if (slot.key == k and slot.gen == gen) {
-            if (!slot.hit) continue;
-            return FuncId.from(slot.fid);
+            if (slot.hit) return FuncId.from(slot.fid);
+        } else {
+            const found = ownerKeyedForClass(cls, map, recv_key, name);
+            slot.* = .{ .key = k, .gen = gen, .hit = found != null, .fid = if (found) |f| f.int() else NO_FID };
+            if (found) |fid| return fid;
         }
-        const found = ownerKeyedForClass(cls, map, recv_key, name);
-        slot.* = .{ .key = k, .gen = gen, .hit = found != null, .fid = if (found) |f| f.int() else NO_FID };
-        if (found) |fid| return fid;
+        if (ownerKeyedViaDelegates(&v, map, recv_key, name)) |fid| return fid;
     }
     // The bare member-extension call arm passes its DISPATCH OWNER by
     // pushing it on the enclosing chain, never as a frame `this` — inside
@@ -3533,12 +3540,31 @@ fn ownerKeyedExtProp(comptime setters: bool, map: anytype, recv_key: []const u8,
         const slot = &memo[(k >> 7) % memo.len];
         const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
         if (slot.key == k and slot.gen == gen) {
-            if (!slot.hit) continue;
-            return FuncId.from(slot.fid);
+            if (slot.hit) return FuncId.from(slot.fid);
+        } else {
+            const found = ownerKeyedForClass(cls, map, recv_key, name);
+            slot.* = .{ .key = k, .gen = gen, .hit = found != null, .fid = if (found) |f| f.int() else NO_FID };
+            if (found) |fid| return fid;
         }
-        const found = ownerKeyedForClass(cls, map, recv_key, name);
-        slot.* = .{ .key = k, .gen = gen, .hit = found != null, .fid = if (found) |f| f.int() else NO_FID };
-        if (found) |fid| return fid;
+        if (ownerKeyedViaDelegates(&v, map, recv_key, name)) |fid| return fid;
+    }
+    return null;
+}
+
+/// A member-extension property declared by a `by`-delegate of the receiver
+/// (`class Test : IFoo by impl`, `impl` overriding `val S.extVal`) is in
+/// scope through the wrapper. The delegate's runtime class can differ per
+/// instance, so this probe is never memoized by the wrapper's class.
+fn ownerKeyedViaDelegates(v: *const Value, map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
+    var di: usize = 0;
+    while (host_call_member.delegateFieldAt(v, di)) |d| : (di += 1) {
+        if (d != .Instance) continue;
+        const dcls = blk: {
+            const g = d.Instance.borrow();
+            defer g.deinit();
+            break :blk g.get().class;
+        };
+        if (ownerKeyedForClass(dcls, map, recv_key, name)) |fid| return fid;
     }
     return null;
 }
@@ -3731,6 +3757,24 @@ fn resolveExtensionPropImpl(
             {
                 if (lookupPairFunc(Pick.map(pg.get().*), recv_simple[0..dol], name)) |fid| return fid;
             }
+        }
+    }
+    // A builtin scalar receiver has builtin supertypes: `val Number.half`
+    // applies to an `Int`, `val CharSequence.n` to a `String`.
+    if (receiver.* != .Instance) {
+        const sups: []const []const u8 = switch (receiver.*) {
+            .Int, .Long, .Short, .Byte, .Float, .Double => &.{ "Number", "Comparable" },
+            .String => &.{ "CharSequence", "Comparable" },
+            .Char, .Bool, .UInt, .ULong, .UShort, .UByte => &.{"Comparable"},
+            else => &.{},
+        };
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        for (sups) |sup| {
+            if (pg.get().owner_keyed_ext_names.contains(name)) {
+                if (ownerKeyedExtProp(setters, Pick.map(pg.get().*), sup, name)) |fid| return fid;
+            }
+            if (lookupPairFunc(Pick.map(pg.get().*), sup, name)) |fid| return fid;
         }
     }
     // An extension property on a supertype applies to a subtype receiver.

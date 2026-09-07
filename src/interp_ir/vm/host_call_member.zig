@@ -5083,6 +5083,10 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         }
     }
 
+    // `equals` on an array is identity (`contentEquals` compares content).
+    if (receiver.* == .Array and std.mem.eql(u8, name, "equals") and args.len == 1) {
+        return .{ .ok = boolVal(Value.structuralEq(receiver, &args[0])) };
+    }
     // `equals` on a builtin scalar/String.
     if (std.mem.eql(u8, name, "equals") and isBuiltinScalar(receiver)) {
         // `Double.equals`/`Float.equals` compare the boxed representation:
@@ -6099,10 +6103,21 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             if (enc_fqn) |enc| {
                 const nested_fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ enc, name });
                 defer if (runtime.freeScratch()) allocator.free(nested_fqn);
+                // A class nested in the companion itself
+                // (`companion object { value class IC2(...) }`, reached as
+                // `C.Companion.IC2(...)`) is keyed under the companion's fqn.
+                const own_fqn = blk: {
+                    const ig = receiver.Instance.borrow();
+                    defer ig.deinit();
+                    const icg = ig.get().class.borrow();
+                    defer icg.deinit();
+                    break :blk try std.fmt.allocPrint(allocator, "{s}.{s}", .{ icg.get().fqn, name });
+                };
+                defer if (runtime.freeScratch()) allocator.free(own_fqn);
                 const cid = blk: {
                     const mg = self.module.borrow();
                     defer mg.deinit();
-                    break :blk mg.get().classIdByFqn(nested_fqn);
+                    break :blk mg.get().classIdByFqn(own_fqn) orelse mg.get().classIdByFqn(nested_fqn);
                 };
                 if (cid) |c| return newInstanceById(self, allocator, c, args, null);
             }
@@ -7153,6 +7168,51 @@ fn enclosingNamedMemberExtDispatch(self: *VmHost, allocator: Allocator, receiver
             defer ir.eval.popEnclosing();
             return try callFuncRec(self, allocator, mptr, fid, all);
         }
+        // `class Test : IFoo by impl` forwards the interface's member
+        // extensions to the delegate: inside `with(test)`, `S("O").f()`
+        // runs `impl`'s override with `impl` as the dispatch receiver.
+        var di: usize = 0;
+        while (delegateFieldAt(&e.v, di)) |d| : (di += 1) {
+            if (d != .Instance) continue;
+            var d_name: []const u8 = undefined;
+            var d_fqn: []const u8 = undefined;
+            {
+                const g = d.Instance.borrow();
+                defer g.deinit();
+                const cg = g.get().class.borrow();
+                defer cg.deinit();
+                d_name = cg.get().name;
+                d_fqn = cg.get().fqn;
+            }
+            for (candidates) |fid| {
+                const owner = mptr.registry.member_ext_owner_class.get(fid) orelse continue;
+                if (!std.mem.eql(u8, owner, d_name) and !std.mem.eql(u8, owner, d_fqn)) continue;
+                const f = mptr.funcById(fid) orelse continue;
+                if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
+                if (f.params.len - 1 != args.len) continue;
+                if (!receiverImplementsType(self, receiver, f.params[0].ty.name)) continue;
+                const all = try prependReceiver(allocator, receiver, args);
+                defer if (runtime.freeScratch()) allocator.free(all);
+                ir.eval.pushEnclosing(&d);
+                defer ir.eval.popEnclosing();
+                return try callFuncRec(self, allocator, mptr, fid, all);
+            }
+        }
+    }
+    return null;
+}
+
+/// The `idx`-th `by`-delegate stored on an instance (`__delegate__<iface>`
+/// fields, declaration order), or null past the last one.
+pub fn delegateFieldAt(v: *const Value, idx: usize) ?Value {
+    if (v.* != .Instance) return null;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    var seen: usize = 0;
+    for (g.get().fields.items) |f| {
+        if (!std.mem.startsWith(u8, f.name, "__delegate__")) continue;
+        if (seen == idx) return f.value;
+        seen += 1;
     }
     return null;
 }
@@ -12699,9 +12759,17 @@ pub fn builtinReceiverDisproven(receiver: *const Value, declared: []const u8) bo
         // A user instance can never be a builtin array (array types are
         // final): a `TestCollection` receiver must not bind
         // `UIntArray.toTypedArray`.
-        .Instance => {
+        .Instance => |inst| {
             if (overload_match.builtinParamKind(declared)) |pk| {
-                return pk == .array;
+                if (pk != .array) return false;
+                // A user class spelled like a builtin array
+                // (`value class UIntArray(private val intArray: IntArray)`)
+                // is the declared receiver of its own extensions.
+                const ig = inst.borrow();
+                defer ig.deinit();
+                const cg = ig.get().class.borrow();
+                defer cg.deinit();
+                return !std.mem.eql(u8, simpleName(cg.get().name), declared);
             }
             return false;
         },
@@ -13726,6 +13794,24 @@ pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *co
         for (lex) |v| {
             if (v != .Instance) continue;
             if (receiverImplementsOwnerIdentity(self, &v, owner)) return v;
+        }
+    }
+    // A `by`-delegate of an enclosing receiver stands in as the owner: the
+    // wrapper forwards the interface's member extensions to it.
+    for (entries) |e| {
+        var di: usize = 0;
+        while (delegateFieldAt(&e.v, di)) |d| : (di += 1) {
+            if (d == .Instance and receiverImplementsOwnerIdentity(self, &d, owner)) return d;
+        }
+    }
+    {
+        const lex = try ir.eval.frameThisChainAlloc(allocator);
+        defer allocator.free(lex);
+        for (lex) |v| {
+            var di: usize = 0;
+            while (delegateFieldAt(&v, di)) |d| : (di += 1) {
+                if (d == .Instance and receiverImplementsOwnerIdentity(self, &d, owner)) return d;
+            }
         }
     }
     // An `object`/companion owner is its own dispatch receiver: the
@@ -15832,17 +15918,9 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
         defer allocator.free(sups);
         try pending.appendSlice(allocator, sups);
     }
-    if (pending.items.len == 0) {
-        const owner_fqn: []const u8 = blk: {
-            const g = self.classes.borrow();
-            defer g.deinit();
-            const d = g.get().get(owner_class) orelse break :blk "<unregistered>";
-            const dg = d.borrow();
-            defer dg.deinit();
-            break :blk dg.get().fqn;
-        };
-        return .{ .err = try typeErr(allocator, "super.{s}: owner_class `{s}` (table entry `{s}`) has no parent", .{ name, owner_class, owner_fqn }) };
-    }
+    // A class with no declared supertype still has `Any` above it:
+    // `super.hashCode()` / `super.toString()` / `super.equals(x)` in a
+    // value class reach the identity implementations below.
     var visited: std.StringHashMap(void) = .init(allocator);
     defer visited.deinit();
 

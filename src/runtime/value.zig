@@ -3160,6 +3160,9 @@ pub const Value = union(enum) {
             // the JVM — the same builder equals itself, never a sibling
             // with equal contents.
             .StringBuilder => |x| b.* == .StringBuilder and x.identity() == b.StringBuilder.identity(),
+            // Arrays equal by identity: `intArrayOf(1) == intArrayOf(1)` is
+            // false, an array equals itself (`contentEquals` compares content).
+            .Array => |x| b.* == .Array and x.identity() == b.Array.identity(),
             .Sequence => |x| b.* == .Sequence and ObjRef(SequenceData).ptrEq(x, b.Sequence),
             else => false,
         };

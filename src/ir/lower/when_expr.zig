@@ -62,12 +62,18 @@ pub fn collectSwitchArms(
             }
             const value_expr = pat.kind.Value;
             const const_id: ConstId = switch (value_expr) {
-                // i32-representable literal narrows to Int (guarded above).
-                .IntLit => |lit| blk: {
-                    if (lit.value >= std.math.minInt(i32) and lit.value <= std.math.maxInt(i32)) {
-                        break :blk try b.module.internConst(b.allocator, .{ .Int = @intCast(lit.value) });
-                    }
-                    break :blk try b.module.internConst(b.allocator, .{ .Long = lit.value });
+                // The literal's declared kind (`42L`, `42u`, `42UL`) is the
+                // key's kind; an unsuffixed i32-representable literal is Int.
+                .IntLit => |lit| switch (lit.kind) {
+                    .Long => try b.module.internConst(b.allocator, .{ .Long = lit.value }),
+                    .UInt => try b.module.internConst(b.allocator, .{ .UInt = @intCast(lit.value) }),
+                    .ULong => try b.module.internConst(b.allocator, .{ .ULong = @bitCast(lit.value) }),
+                    .Int => blk: {
+                        if (lit.value >= std.math.minInt(i32) and lit.value <= std.math.maxInt(i32)) {
+                            break :blk try b.module.internConst(b.allocator, .{ .Int = @intCast(lit.value) });
+                        }
+                        break :blk try b.module.internConst(b.allocator, .{ .Long = lit.value });
+                    },
                 },
                 .StringTemplate => |st| blk: {
                     if (st.parts.len == 1 and st.parts[0] == .Text) {

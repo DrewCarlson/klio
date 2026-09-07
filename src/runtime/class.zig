@@ -53,6 +53,11 @@ pub const ClassDef = struct {
     /// the rendered declared types of the properties to know which element a
     /// given argument describes.
     type_params: []const []const u8 = &.{},
+    /// Parallel to `type_params`: the simple head of each parameter's
+    /// declared upper bound (`<T : Int>` / `where T : Int` gives `Int`),
+    /// empty when unbounded. Constructor ranking scores a parameter
+    /// declared as the type parameter against this bound.
+    type_param_bounds: []const []const u8 = &.{},
     primary_params: []ClassParamDef,
     /// Member functions keyed by simple name.
     methods: []MethodDef,

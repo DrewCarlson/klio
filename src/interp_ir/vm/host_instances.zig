@@ -195,6 +195,35 @@ pub fn clearCtorArgStaticHeads(self: *VmHost) void {
     ctor_static_heads = null;
 }
 
+/// The class under construction's type-parameter bounds, so a constructor
+/// parameter declared as a class type parameter (`Z<T : Int>(val x: T)`)
+/// ranks as its bound: `this(n as T)` from a `constructor(vararg ys: Long)`
+/// must reach the primary, not re-select the vararg secondary.
+const CtorBounds = struct { names: []const []const u8, bounds: []const []const u8 };
+threadlocal var ctor_bounds: ?CtorBounds = null;
+
+fn installCtorBounds(class_def: ObjRef(ClassDef)) ?CtorBounds {
+    const prev = ctor_bounds;
+    const g = class_def.borrow();
+    defer g.deinit();
+    const d = g.get();
+    ctor_bounds = if (d.type_params.len != 0 and d.type_param_bounds.len != 0)
+        .{ .names = d.type_params, .bounds = d.type_param_bounds }
+    else
+        null;
+    return prev;
+}
+
+/// `declared` with a class type parameter replaced by the head of its bound.
+fn boundHead(declared: []const u8) []const u8 {
+    const cb = ctor_bounds orelse return declared;
+    for (cb.names, 0..) |n, i| {
+        if (i >= cb.bounds.len) break;
+        if (std.mem.eql(u8, n, declared) and cb.bounds[i].len != 0) return cb.bounds[i];
+    }
+    return declared;
+}
+
 fn takeCtorStaticHeads() ?[]const ?[]const u8 {
     const v = ctor_static_heads;
     ctor_static_heads = null;
@@ -252,7 +281,8 @@ const collectionish_heads = [_][]const u8{ "Collection", "MutableCollection", "I
 /// silently bind the wrong slot. Type parameters (`T`, `E`) and `Any` accept
 /// anything; non-instance values (primitives, null, lambdas) are left to the
 /// arity/family logic.
-fn paramAcceptsArg(self: *VmHost, declared: []const u8, arg: *const Value) bool {
+fn paramAcceptsArg(self: *VmHost, declared_in: []const u8, arg: *const Value) bool {
+    const declared = boundHead(declared_in);
     if (std.mem.eql(u8, declared, "Any")) return true;
     if (declared.len <= 2 and isAllUpper(declared)) return true;
     // A function-typed parameter accepts any callable argument regardless of
@@ -319,7 +349,7 @@ fn scoreCtorHeads(self: *VmHost, heads: []const []const u8, args: []const Value)
     var i: usize = 0;
     const static_heads = ctor_static_heads;
     while (i < args.len and i < heads.len) : (i += 1) {
-        const declared = heads[i];
+        const declared = boundHead(heads[i]);
         const got = valueTypeHead(args[i]);
         // The argument's DECLARED head, where the call site knew one. An
         // interpreted instance reports no class of its own at run time, so
@@ -484,9 +514,10 @@ fn scoreCtorHeadsWidening(self: *VmHost, heads: []const []const u8, args: []cons
     while (i < args.len and i < heads.len) : (i += 1) {
         const got = valueTypeHead(args[i]);
         const declared = blk: {
+            const head = boundHead(heads[i]);
             const mg = self.module.borrow();
             defer mg.deinit();
-            break :blk mg.get().registry.type_aliases.get(heads[i]) orelse heads[i];
+            break :blk mg.get().registry.type_aliases.get(head) orelse head;
         };
         if (std.mem.eql(u8, declared, got) or
             (headInSet(declared, &integral_heads) and headInSet(got, &integral_heads)))
@@ -515,6 +546,8 @@ fn expandParentSecondaryThisArgs(
     while (depth < 64) : (depth += 1) {
         const def = classDefByName(self, sideTableKey(class_fqn, class_name)) orelse return .{ .ok = {} };
         defer def.deinit();
+        const prev_bounds = installCtorBounds(def);
+        defer ctor_bounds = prev_bounds;
         const primary_count = classDefPrimaryParamCount(def);
         const entries = secondaryCtors(self, class_fqn, class_name);
         // Named header arguments (`A(y = 2, x = 4)`) bind to a secondary
@@ -1584,6 +1617,8 @@ fn runSuperCtorChain(
     const entries = secondaryCtors(self, class_fqn, class_name);
     const chain_def = classDefByName(self, sideTableKey(class_fqn, class_name));
     defer if (chain_def) |d| d.deinit();
+    const prev_bounds = if (chain_def) |d| installCtorBounds(d) else ctor_bounds;
+    defer ctor_bounds = prev_bounds;
     // A secondary constructor takes the call when the primary cannot (its
     // arity, defaults and vararg considered); otherwise only an exact fit.
     const primary_takes = if (chain_def) |d| primaryCanTake(self, d, args.len) else true;
@@ -2499,6 +2534,8 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
         return .{ .err = .{ .Unimplemented = try std.fmt.allocPrint(allocator, "Vm::new_instance: no runtime ClassDef registered for `{s}`", .{ir_name}) } };
     };
     defer class_def.deinit();
+    const prev_bounds = installCtorBounds(class_def);
+    defer ctor_bounds = prev_bounds;
 
     if (classDefIsAbstract(class_def)) {
         return throwInstantiation(self, allocator, "Cannot create an instance of an abstract class: {s}", classDefName(class_def));
@@ -2818,6 +2855,8 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
     const ctor_keepalive = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(ctor_keepalive);
     runtime.keepalivePushSlice(args);
+    const prev_bounds = installCtorBounds(class_def);
+    defer ctor_bounds = prev_bounds;
     const class_name = classDefName(class_def);
     const entries = secondaryCtors(self, classDefFqn(class_def), class_name);
     // A defaulted secondary is a candidate only when the primary cannot

@@ -2914,15 +2914,53 @@ fn renderStructural(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceDa
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, classDisplayName(cg.get().name));
     try buf.append(allocator, '(');
-    for (cg.get().primary_params, 0..) |p, idx| {
-        if (idx > 0) try buf.appendSlice(allocator, ", ");
+    // Field values are collected first: rendering dispatches back into the
+    // interpreter, and the instance and its class must not stay borrowed
+    // across a member call.
+    var fields: std.ArrayList(Value) = .empty;
+    defer {
+        if (runtime.reclaimEnabled()) {
+            for (fields.items) |v| v.release(allocator);
+        }
+        fields.deinit(allocator);
+    }
+    try fields.ensureTotalCapacity(allocator, cg.get().primary_params.len);
+    for (cg.get().primary_params) |p| {
+        const v = g.get().get(p.name) orelse Value.Null;
+        if (runtime.reclaimEnabled()) v.retain();
+        fields.appendAssumeCapacity(v);
+    }
+    for (cg.get().primary_params, fields.items) |p, *v| {
+        if (buf.items[buf.items.len - 1] != '(') try buf.appendSlice(allocator, ", ");
         try buf.appendSlice(allocator, p.name);
         try buf.append(allocator, '=');
-        const v = g.get().get(p.name) orelse Value.Null;
-        const s = try v.display(allocator);
+        const s = try displayWithDispatch(self, allocator, v);
         try buf.appendSlice(allocator, s);
     }
     try buf.append(allocator, ')');
-    _ = self;
     return .{ .String = try runtime.strInitOwned(allocator, try buf.toOwnedSlice(allocator)) };
+}
+
+/// `Value.display` with member dispatch: a data/value class renders each
+/// property through the property's OWN `toString()` override
+/// (`AugmentedAndAsAny(a=1, b=AsAny: 42)`), as does a container element.
+/// Arrays keep their identity rendering.
+pub fn displayWithDispatch(self: *VmHost, allocator: Allocator, v: *const Value) Allocator.Error![]const u8 {
+    switch (v.*) {
+        .Instance, .Exception, .Result, .List, .Set, .Map, .Pair, .Triple, .MapEntry => {
+            const r = try callMember(self, allocator, v, "toString", &.{});
+            switch (r) {
+                .ok => |sv| {
+                    if (sv == .String) {
+                        const sg = sv.String.borrow();
+                        defer sg.deinit();
+                        return try allocator.dupe(u8, sg.get().bytes);
+                    }
+                    return try v.display(allocator);
+                },
+                .err => return try v.display(allocator),
+            }
+        },
+        else => return try v.display(allocator),
+    }
 }
