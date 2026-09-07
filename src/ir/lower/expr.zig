@@ -577,6 +577,10 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // Prefix ++ / -- need both an Inc/Dec UnOp AND a write-back to
             // the lvalue; return the NEW value.
             if (u.op == .PreInc or u.op == .PreDec) {
+                if (try nullableIncDecCall(b, u.expr, u.op == .PreInc)) |r| {
+                    try writeBackLvalue(b, u.expr, r);
+                    return r;
+                }
                 const operand = try lowerExpr(b, u.expr);
                 const dst = b.allocReg();
                 const uo: UnOp = if (u.op == .PreInc) .Inc else .Dec;
@@ -700,11 +704,14 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .Call => return lowerCall(b, expr),
         .DoWhile => |w| {
             const body_blk = try b.allocBlock();
+            // `continue` in a do-while goes to the condition, never back to
+            // the body's start.
+            const cond_blk = try b.allocBlock();
             const exit = try b.allocBlock();
             b.terminate(.{ .Goto = body_blk });
 
             b.switchTo(body_blk);
-            try b.pushLoop(null, body_blk, exit);
+            try b.pushLoop(null, cond_blk, exit);
             // Kotlin scopes the do-body's declarations into the `while`
             // condition; when the body is a block, lower its statements and the
             // condition in one shared scope so `do { val x = … } while (x …)`
@@ -716,6 +723,8 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     try hoistMutualLocalFns(b, block);
                     for (block.stmts) |*stmt| _ = try lowerStmt(b, stmt);
                     b.popLoop();
+                    b.terminate(.{ .Goto = cond_blk });
+                    b.switchTo(cond_blk);
                     const c = try lowerExpr(b, w.cond);
                     try b.popScope();
                     b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
@@ -725,6 +734,8 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 _ = try lowerExpr(b, body);
             }
             b.popLoop();
+            b.terminate(.{ .Goto = cond_blk });
+            b.switchTo(cond_blk);
             const c = try lowerExpr(b, w.cond);
             b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
 
@@ -762,6 +773,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const lbl: ?[]const u8 = if (brk.label) |i| i.name else null;
             if (b.loopFor(lbl)) |frame| {
                 const target = frame.break_target;
+                try leaveTryFramesForJump(b, frame.finally_base, frame.catch_base);
                 try replayFinallysForJump(b, frame.finally_base);
                 try emitTowerPopsForJump(b, frame.encl_tower_base);
                 b.terminate(.{ .Goto = target });
@@ -776,6 +788,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const lbl: ?[]const u8 = if (cont.label) |i| i.name else null;
             if (b.loopFor(lbl)) |frame| {
                 const target = frame.continue_target;
+                try leaveTryFramesForJump(b, frame.finally_base, frame.catch_base);
                 try replayFinallysForJump(b, frame.finally_base);
                 try emitTowerPopsForJump(b, frame.encl_tower_base);
                 b.terminate(.{ .Goto = target });
@@ -826,6 +839,13 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .As => |cast| {
             const s = try lowerExpr(b, cast.expr);
+            // `x as (T & Any)`: the definitely-non-null cast of a null throws
+            // NullPointerException; the type itself is erased.
+            if (cast.ty.definitely_non_null and !cast.safe) {
+                const dst = b.allocReg();
+                try b.push(.{ .NotNullAssert = .{ .dst = dst, .src = s } });
+                return dst;
+            }
             // A cast to a NON-reified type parameter (`x as T`) is erased: the
             // JVM `checkcast` targets the bound and passes any value (including
             // null), so it is a runtime no-op — a genuine mismatch surfaces
@@ -3053,7 +3073,7 @@ fn sgetterName(b: *FuncBuilder, name: []const u8) Allocator.Error!ConstId {
     return b.module.internConst(b.allocator, .{ .String = name });
 }
 
-const ImportRewrite = struct { segs: []const []const u8 };
+pub const ImportRewrite = struct { segs: []const []const u8 };
 
 /// Resolve a bare name imported via `import a.b.C…MEMBER` into the qualified
 /// access path starting at the rightmost segment naming a class this module
@@ -3063,7 +3083,7 @@ const ImportRewrite = struct { segs: []const []const u8 };
 /// because a companion member is reached through the class itself
 /// (`import X.Companion.member` → `X.member`). Returns null when the path names
 /// no declared class, or the class is the leaf (a bare type reference).
-fn importCompanionRewrite(b: *FuncBuilder, file: ir.FileId, name: []const u8) ?ImportRewrite {
+pub fn importCompanionRewrite(b: *FuncBuilder, file: ir.FileId, name: []const u8) ?ImportRewrite {
     const segs = b.module.importAliasIn(file, name) orelse return null;
     // Find the rightmost segment naming a class the module declares (skips the
     // leading package), then extend left across any enclosing-class chain so the
@@ -3205,6 +3225,15 @@ fn lowerShortInterp(b: *FuncBuilder, ident: ast.Ident) Allocator.Error!Reg {
         var segs = [_]ast.Ident{.{ .name = renamed, .span = ident.span }};
         const path = Expr{ .Path = .{ .segments = &segs, .span = ident.span } };
         return lowerExpr(b, &path);
+    }
+    // `$x` for an `import Object.x` member reads the object's property.
+    if (!b.hasOwnMember(ident.name)) {
+        if (importCompanionRewrite(b, ident.span.file, ident.name)) |rw| {
+            const rsegs = try b.allocator.alloc(ast.Ident, rw.segs.len);
+            for (rw.segs, 0..) |sname, k| rsegs[k] = .{ .name = sname, .span = ident.span };
+            const path = Expr{ .Path = .{ .segments = rsegs, .span = ident.span } };
+            return lowerExpr(b, &path);
+        }
     }
     if (b.hasOwnMember(ident.name) and b.resolve("this") != null) {
         const this_reg = b.resolve("this").?;
@@ -3776,6 +3805,53 @@ fn superBase(b: *FuncBuilder, sup: anytype) Allocator.Error!?SuperBase {
 /// within the finally body still unwinds correctly. The bypassed try
 /// regions' runtime `TryFrame`s are popped when the current block exits —
 /// the jump bypasses the finally sentinel that would pop them.
+/// A `break`/`continue` leaves every try entered inside the loop: their
+/// runtime frames are popped when the current block exits, and the finally
+/// bodies replayed for the jump then run OUTSIDE them, so an exception one
+/// of them throws is neither caught by a catch the jump already left nor
+/// routed back into the finally itself.
+fn leaveTryFramesForJump(b: *FuncBuilder, finally_base: usize, catch_base: usize) Allocator.Error!void {
+    const fin = try b.finallyBodiesFrom(finally_base);
+    defer b.allocator.free(fin);
+    const cat = try b.catchBodiesFrom(catch_base);
+    defer b.allocator.free(cat);
+    if (fin.len == 0 and cat.len == 0) return;
+    try b.appendPopOnExit(b.cur, fin);
+    try b.appendPopOnExit(b.cur, cat);
+    const next = try b.allocBlock();
+    b.terminate(.{ .Goto = next });
+    b.switchTo(next);
+}
+
+/// Among same-named LOCAL function overloads (`f`, `f$ovl0`, …) the
+/// declaration whose parameter count matches the call; the plain name when
+/// it fits or when nothing does.
+fn localOverloadPick(b: *FuncBuilder, name: []const u8, argc: usize) []const u8 {
+    if (!b.isLocalFn(name)) return name;
+    var buf: [4][96]u8 = undefined;
+    var any_sibling = false;
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        const m = std.fmt.bufPrint(&buf[i], "{s}$ovl{d}", .{ name, i }) catch break;
+        if (b.isLocalFn(m)) any_sibling = true;
+    }
+    if (!any_sibling) return name;
+    if (localFnArity(b, name) == argc) return name;
+    i = 0;
+    while (i < 4) : (i += 1) {
+        const m = std.fmt.bufPrint(&buf[i], "{s}$ovl{d}", .{ name, i }) catch break;
+        if (!b.isLocalFn(m)) continue;
+        if (localFnArity(b, m) == argc) return b.module.func_name_index.allocator.dupe(u8, m) catch name;
+    }
+    return name;
+}
+
+fn localFnArity(b: *const FuncBuilder, name: []const u8) usize {
+    if (b.localFnParamTys(name)) |tys| return tys.len;
+    if (b.localExtFnArity(name)) |n| return @intCast(n);
+    return 0;
+}
+
 fn replayFinallysForJump(b: *FuncBuilder, base_raw: usize) Allocator.Error!void {
     const base = @min(base_raw, b.finally_stack.items.len);
     const pop_bodies = try b.finallyBodiesFrom(base);
@@ -6083,6 +6159,25 @@ fn ctorRealignedArgNames(b: *FuncBuilder, class_id: ir.ClassId, args: []const Ex
     return out;
 }
 
+/// `x++`/`--x` on a local declared NULLABLE (`var i: Int? = …`): the
+/// builtin `inc`/`dec` members do not take a nullable receiver, so the
+/// program's `T?.inc()`/`T?.dec()` extension is the target — lowered as the
+/// call it is. Null when the operand is not such a local or no extension is
+/// declared.
+fn nullableIncDecCall(b: *FuncBuilder, operand: *const Expr, inc: bool) Allocator.Error!?Reg {
+    if (operand.* != .Path or operand.Path.segments.len != 1) return null;
+    const name = operand.Path.segments[0].name;
+    if (!b.localDeclNullable(name)) return null;
+    const op_name: []const u8 = if (inc) "inc" else "dec";
+    if (!userFunctionDeclared(b, op_name) and !b.isLocalExtFn(op_name)) return null;
+    const sp = operand.Path.span;
+    const ma = b.module.func_name_index.allocator;
+    const callee = try ma.create(ast.Expr);
+    callee.* = .{ .Member = .{ .receiver = @constCast(operand), .name = .{ .name = op_name, .span = sp }, .safe = false, .span = sp } };
+    const call = ast.Expr{ .Call = .{ .callee = callee, .args = &.{}, .arg_names = &.{}, .type_args = &.{}, .is_infix = false, .span = sp } };
+    return try lowerExpr(b, &call);
+}
+
 fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const pf = expr.Postfix;
     const inner = pf.expr;
@@ -6095,6 +6190,15 @@ fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .Inc, .Dec => {
             const uo: UnOp = if (pf.op == .Inc) .Inc else .Dec;
+            if (inner.* == .Path and inner.Path.segments.len == 1 and
+                b.localDeclNullable(inner.Path.segments[0].name) and
+                (userFunctionDeclared(b, if (pf.op == .Inc) "inc" else "dec") or b.isLocalExtFn(if (pf.op == .Inc) "inc" else "dec")))
+            {
+                const old = try lowerExpr(b, inner);
+                const call = (try nullableIncDecCall(b, inner, pf.op == .Inc)).?;
+                try writeBackLvalue(b, inner, call);
+                return old;
+            }
             // Index target: evaluate receiver + keys once.
             if (inner.* == .Index) {
                 const ix = inner.Index;
@@ -11611,7 +11715,7 @@ fn lowerValueInvocation(
     args: []const Expr,
     ast_arg_names: []const ?[]const u8,
 ) Allocator.Error!?Reg {
-    const name0 = callee.Path.segments[0].name;
+    const name0 = localOverloadPick(b, callee.Path.segments[0].name, args.len);
 
     // A bare call to a receiver-lambda param reached as a capture. The
     // declared receiver HEAD rides the instruction: the captured `this`

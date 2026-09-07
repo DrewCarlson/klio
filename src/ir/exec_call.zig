@@ -1434,6 +1434,15 @@ pub noinline fn execArmCast(comptime H: type, allocator: Allocator, frame: *Fram
     } else if (typeParamCastPasses(H, frame, cast.ty, host)) {
         v.retain();
         try frame.write(cast.dst, v);
+    } else if (v == .Null and !cast.ty.nullable and !cast.safe) {
+        // `null as T` for a concrete non-null `T` is a NullPointerException,
+        // not a ClassCastException (an erased parameter passed above).
+        const exc = try Value.newException(allocator, .{
+            .fqn = try runtime.strInit(allocator, "kotlin.NullPointerException"),
+            .message = .from(try runtime.strInit(allocator, "null cannot be cast to non-null type")),
+            .cause = null,
+        });
+        return raiseStep(frame, .{ .Throw = exc });
     } else if (cast.safe) {
         try frame.write(cast.dst, .Null);
     } else {
@@ -4206,7 +4215,11 @@ pub fn typeParamCastPassesIn(comptime H: type, module: *const Module, func: *con
             if (std.mem.eql(u8, t, ty.name)) return true;
         }
     }
-    if (isErasedTypeParamName(ty.name)) return true;
+    // A short uppercase name is an erased parameter unless the program
+    // DECLARES a class of that name (`a as? B` against `class B` is a real
+    // check); a reified binding published under the name still erases.
+    const declared = if (comptime @hasDecl(H, "isDeclaredClassName")) host.isDeclaredClassName(ty.name) else false;
+    if (isErasedTypeParamName(ty.name) and !declared) return true;
     if (!host.isConcreteCastTarget(ty.name)) return true;
     return false;
 }

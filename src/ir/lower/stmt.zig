@@ -1499,6 +1499,21 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                 return;
             }
             const seg = p.segments[0].name;
+            // A bare name brought in by `import Object.member` writes the
+            // object's property, exactly as its read goes through the object.
+            if (b.resolve(seg) == null and !b.knowsOuter(seg) and !b.hasOwnMember(seg)) {
+                if (expr_mod.importCompanionRewrite(b, p.segments[0].span.file, seg)) |rw| {
+                    if (rw.segs.len >= 2) {
+                        const sp = p.segments[0].span;
+                        const rsegs = try b.allocator.alloc(ast.Ident, rw.segs.len - 1);
+                        for (rw.segs[0 .. rw.segs.len - 1], 0..) |sname, k| rsegs[k] = .{ .name = sname, .span = sp };
+                        const recv = try b.allocator.create(Expr);
+                        recv.* = .{ .Path = .{ .segments = rsegs, .span = sp } };
+                        const member = Expr{ .Member = .{ .receiver = recv, .name = .{ .name = rw.segs[rw.segs.len - 1], .span = sp }, .safe = false, .span = sp } };
+                        return storeCombinedToTarget(b, &member, combined);
+                    }
+                }
+            }
             // The boxed set is computed for the whole body and carries no
             // declaration POSITION, so a name is "boxed" even at sites that
             // precede its `var`. Require the name to actually be in scope as a

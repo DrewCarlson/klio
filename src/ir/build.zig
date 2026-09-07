@@ -1644,6 +1644,7 @@ pub const FuncBuilder = struct {
             .continue_target = cont_t,
             .break_target = brk_t,
             .finally_base = self.finally_stack.items.len,
+            .catch_base = self.catch_body_stack.items.len,
             .encl_tower_base = self.encl_tower_depth,
         });
     }
@@ -3580,6 +3581,9 @@ pub const SubjectBind = struct {
 pub const LoopFrame = struct {
     label: ?[]const u8,
     continue_target: BlockId,
+    /// Depth of `catch_body_stack` at loop entry: a jump out of the loop
+    /// leaves every catch-only try entered inside it.
+    catch_base: usize = 0,
     /// The frame's spliced-subject tower depth at loop entry: a
     /// `break`/`continue` from inside a spliced receiver-lambda region
     /// jumps past the region's `EnclosingPop`, and without unwinding the
