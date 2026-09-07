@@ -820,6 +820,63 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // bind primary-param properties; init blocks + custom
         // getters land when local-class lowering grows them.
         const identity = nextInstanceId(self);
+        const default_outer: ?Value = blk: {
+            const g = self.class_default_outer.borrow();
+            defer g.deinit();
+            break :blk g.get().get(cls_name);
+        };
+        // An omitted trailing primary parameter takes its default: a plain
+        // literal inline, anything else through the `$default$<i>` thunk
+        // registered with the class, run in the class's captured scope with
+        // the arguments before it. Every consumer below (fields, property
+        // initializers, init blocks, the parent chain) sees the full vector.
+        var full_args: std.ArrayList(Value) = .empty;
+        defer full_args.deinit(allocator);
+        try full_args.appendSlice(allocator, args);
+        {
+            const n_primary = blk: {
+                const g = cls.borrow();
+                defer g.deinit();
+                break :blk g.get().primary_params.len;
+            };
+            var pi: usize = args.len;
+            while (pi < n_primary) : (pi += 1) {
+                const dflt: ?*const ast.Expr = blk: {
+                    const g = cls.borrow();
+                    defer g.deinit();
+                    break :blk if (g.get().primary_params[pi].default) |e| e.get() else null;
+                };
+                const e = dflt orelse {
+                    try full_args.append(allocator, .Null);
+                    continue;
+                };
+                if (simpleLiteral(allocator, e)) |v| {
+                    try full_args.append(allocator, v);
+                    continue;
+                }
+                const thunk_name = try std.fmt.allocPrint(allocator, "$default${d}", .{pi});
+                defer allocator.free(thunk_name);
+                // The thunk's `this` is the declaration scope's innermost
+                // receiver: the captured enclosing instance, else the last
+                // implicit receiver in scope at the declaration.
+                const recv: Value = default_outer orelse blk: {
+                    const g = cls.borrow();
+                    defer g.deinit();
+                    const encl = g.get().local_enclosing;
+                    var k: usize = encl.len;
+                    while (k > 0) {
+                        k -= 1;
+                        if (encl[k].kind == .receiver or encl[k].kind == .subject) break :blk encl[k].v;
+                    }
+                    break :blk .Null;
+                };
+                switch (try host_call_member.invokeLocalClassThunk(self, allocator, cls, thunk_name, &recv, full_args.items)) {
+                    .ok => |v| try full_args.append(allocator, v),
+                    .err => |err| return .{ .err = err },
+                }
+            }
+        }
+        const ctor_args: []const Value = full_args.items;
         var fields: std.ArrayList(InstanceData.Field) = .empty;
         {
             const g = cls.borrow();
@@ -828,20 +885,13 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             var i: usize = 0;
             while (i < cdef.primary_params.len) : (i += 1) {
                 if (cdef.primary_params[i].property == null) continue;
-                if (i < args.len) {
+                if (i < ctor_args.len) {
                     // The instance owns one ref per primary-ctor field; `args[i]`
                     // is a borrow of the caller's register, so retain.
-                    if (runtime.reclaimEnabled()) args[i].retain();
-                    try fields.append(allocator, .{ .name = cdef.primary_params[i].name, .value = args[i] });
+                    if (runtime.reclaimEnabled()) ctor_args[i].retain();
+                    try fields.append(allocator, .{ .name = cdef.primary_params[i].name, .value = ctor_args[i] });
                 } else {
-                    // An omitted trailing parameter takes its (literal) default;
-                    // without this the field is simply absent (a later access
-                    // fails "get_field" instead of reading the default value).
-                    const dv: Value = if (cdef.primary_params[i].default) |e|
-                        (simpleLiteral(allocator, e.get()) orelse Value.Null)
-                    else
-                        Value.Null;
-                    try fields.append(allocator, .{ .name = cdef.primary_params[i].name, .value = dv });
+                    try fields.append(allocator, .{ .name = cdef.primary_params[i].name, .value = Value.Null });
                 }
             }
             // Body-property defaults for runtime-registered local
@@ -858,11 +908,6 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 }
             }
         }
-        const default_outer: ?Value = blk: {
-            const g = self.class_default_outer.borrow();
-            defer g.deinit();
-            break :blk g.get().get(cls_name);
-        };
         const inst = try ObjRef(InstanceData).init(allocator, .{
             .class = cls.clone(),
             .fields = fields,
@@ -875,7 +920,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         // binds its primary-param fields and runs its body-property inits
         // through the registered `$super$arg$<i>` thunks and the static
         // per-class init maps.
-        if (try host_instances.initLocalParentChain(self, allocator, inst, inst_value, cls, cls_name, args)) |e| {
+        if (try host_instances.initLocalParentChain(self, allocator, inst, inst_value, cls, cls_name, ctor_args)) |e| {
             return .{ .err = e };
         }
         // Interleave `init { … }` blocks (lowered as `$init$block$<idx>` anon
@@ -888,7 +933,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         };
         var prop_idx: usize = 0;
         while (prop_idx < n_props) : (prop_idx += 1) {
-            switch (try host_instances.runAnonInitBlocksAt(self, cls, cls_name, prop_idx, &inst_value, args)) {
+            switch (try host_instances.runAnonInitBlocksAt(self, cls, cls_name, prop_idx, &inst_value, ctor_args)) {
                 .ok => {},
                 .err => |e| return .{ .err = e },
             }
@@ -922,28 +967,8 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             // Both delegate and plain-initializer thunks declare the primary
             // params so the expression can read plain ctor params — including
             // one the property itself shadows (`class N(property: String) {
-            // var property = property }`). Pass the args, filling omitted
-            // trailing params from their literal defaults.
-            var eff_args: std.ArrayList(Value) = .empty;
-            defer eff_args.deinit(allocator);
-            {
-                const g = cls.borrow();
-                defer g.deinit();
-                const pps = g.get().primary_params;
-                for (pps, 0..) |*pp, ai| {
-                    if (ai < args.len) {
-                        try eff_args.append(allocator, args[ai]);
-                    } else {
-                        const dv: Value = if (pp.default) |e|
-                            (simpleLiteral(allocator, e.get()) orelse Value.Null)
-                        else
-                            Value.Null;
-                        try eff_args.append(allocator, dv);
-                    }
-                }
-            }
-            const thunk_args: []const Value = eff_args.items;
-            switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, thunk_args)) {
+            // var property = property }`).
+            switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, ctor_args)) {
                 .ok => |rv| {
                     const ig = inst.borrowMut();
                     defer ig.deinit();
@@ -956,7 +981,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 .err => |e| return .{ .err = e },
             }
         }
-        switch (try host_instances.runAnonInitBlocksAt(self, cls, cls_name, n_props, &inst_value, args)) {
+        switch (try host_instances.runAnonInitBlocksAt(self, cls, cls_name, n_props, &inst_value, ctor_args)) {
             .ok => {},
             .err => |e| return .{ .err = e },
         }
@@ -2846,7 +2871,7 @@ fn padArgsWithDefaultsFor(
 
 /// Literal-only constant folder for a body-property initializer on a
 /// runtime-registered local class (no lowered init thunk available).
-fn simpleLiteral(allocator: Allocator, e: *const ast.Expr) ?Value {
+pub fn simpleLiteral(allocator: Allocator, e: *const ast.Expr) ?Value {
     switch (e.*) {
         .IntLit => |x| return Value.newInt(x.value),
         .FloatLit => |x| return .{ .Double = x.value },

@@ -4285,10 +4285,19 @@ fn buildModuleWithOverrides(
 
         const prev_ep_pkg = ir.lower.decl.setLowerSelfPackage(ep_pkg);
         defer _ = ir.lower.decl.setLowerSelfPackage(prev_ep_pkg);
+        // The accessor's receiver answers to `this@<prop>`, and a local
+        // class declared in the body reaches the declaring class as
+        // `this@<Owner>`.
+        const dispatch_owner: ?[]const u8 = if (epd.owner) |o|
+            (if (std.mem.lastIndexOfScalar(u8, o, '.')) |dot| o[dot + 1 ..] else o)
+        else
+            null;
         if (p.getter) |getter| {
             var empty_members = StringSet.init(a);
             defer empty_members.deinit();
             const nm = try std.fmt.allocPrint(a, "__ext_get_{s}_{s}", .{ recv_name, p.name.name });
+            module.pending_accessor_this_label = p.name.name;
+            module.pending_accessor_dispatch_owner = dispatch_owner;
             const fid = switch (getter.body) {
                 .Expr => |body| try ir.lower.lowerAccessorExprWithExpected(module, recv_name, &empty_members, &.{"this"}, &body, nm, p.ty),
                 .Block => |blk| try ir.lower.lowerAccessorBlockRet(module, recv_name, &empty_members, &.{"this"}, &blk, nm, p.ty),
@@ -4395,6 +4404,8 @@ fn buildModuleWithOverrides(
                 }
             }
             const nm = try std.fmt.allocPrint(a, "__ext_set_{s}_{s}", .{ recv_name, p.name.name });
+            module.pending_accessor_this_label = p.name.name;
+            module.pending_accessor_dispatch_owner = dispatch_owner;
             const fid = switch (setter.body) {
                 .Expr => |body| try ir.lower.lowerAccessorExpr(module, recv_name, &recv_members, &.{ "this", setter_param_name }, &body, nm),
                 .Block => |blk| try ir.lower.lowerAccessorBlock(module, recv_name, &recv_members, &.{ "this", setter_param_name }, &blk, nm),

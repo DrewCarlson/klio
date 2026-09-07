@@ -133,6 +133,19 @@ pub const ClassDef = struct {
     /// redirected through the module class index, where an unrelated
     /// same-simple-name class (a nested class of another owner) can shadow it.
     is_local_runtime: bool = false,
+    /// For a runtime-local class, the scope captured by the declaration
+    /// that produced this def: the enclosing function's locals, the class
+    /// itself, and the classes nested in it, by name. One registration is
+    /// one scope, so an instance keeps the scope it was declared in even
+    /// after the same declaration runs again (a local class in a loop
+    /// body), and a method's `C()` or an `outer.D()` resolves to this
+    /// registration's family. Shared by every def of the family.
+    local_captures: []const InstanceData.Capture = &.{},
+    /// For a runtime-local class, the implicit receivers in scope where the
+    /// declaration ran (a receiver lambda's subject, an enclosing member's
+    /// dispatch receiver): its member bodies and constructor thunks resolve
+    /// bare names against them, as the declaration scope would.
+    local_enclosing: []const ImplicitReceiver = &.{},
 
     /// Single-fill memo for the ctor chain's first non-interface supertype
     /// (`host_instances.firstNonInterfaceSuper`): the per-call string
@@ -193,6 +206,8 @@ pub const ClassDef = struct {
         m.shade(&self.enclosing_class.cell.hdr);
         m.shade(&self.captured_env.cell.hdr);
         m.shade(&self.object_singleton.cell.hdr);
+        for (self.local_captures) |c| c.value.gcMark(m);
+        for (self.local_enclosing) |e| e.v.gcMark(m);
     }
 
     /// Walk the class chain (self, then parent, then grandparent, …) and

@@ -1516,7 +1516,7 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
             // through the cell, so `resolve` is null there even though the
             // write must still go to it.
             const boxed_in_scope = b.isBoxed(seg) and
-                (b.resolve(seg) != null or b.knowsOuter(seg));
+                (b.resolve(seg) != null or b.knowsOuter(seg) or decl_mod.isLowerAnonCapture(seg));
             if (boxed_in_scope) {
                 // A captured-and-written outer var is boxed into a shared
                 // `Value.Cell` at its binding site (var decl, function /
@@ -1713,12 +1713,36 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
     // from the enclosing fn (`val factor = 10; class Scaled { … n * factor … }`).
     var visible = try b.visibleNames();
     defer visible.deinit();
-    const captured_names = try b.allocator.alloc([]const u8, visible.count());
+    // Inside a member extension (`class C { fun A.a() { class B { … this@C … } } }`)
+    // the body's `this` is the extension receiver and the dispatch receiver
+    // lives only on the runtime receiver chain, so it is not a visible name.
+    // Read it here through the qualified-this walk and capture it under its
+    // label, so `this@C` inside the class body reads the capture.
+    var owner_label: ?[]const u8 = null;
+    var owner_reg: Reg = undefined;
+    if (b.dispatchClass()) |oc| {
+        const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{oc});
+        if (!visible.contains(label)) {
+            if (b.resolve("this")) |this_reg| {
+                const nm = try b.module.internConst(b.allocator, .{ .String = oc });
+                const dst = b.allocReg();
+                try b.push(.{ .QualifiedThis = .{ .dst = dst, .receiver = this_reg, .qualifier = nm, .soft = true } });
+                owner_label = label;
+                owner_reg = dst;
+            }
+        }
+    }
+    const n_extra: usize = if (owner_label != null) 1 else 0;
+    const captured_names = try b.allocator.alloc([]const u8, visible.count() + n_extra);
     var it = visible.keyIterator();
     var i: usize = 0;
     while (it.next()) |k| : (i += 1) captured_names[i] = k.*;
     const captures = try b.allocator.alloc(Reg, captured_names.len);
-    for (captured_names, captures) |n, *slot| slot.* = try resolveCapture(b, n);
+    for (captured_names[0..visible.count()], captures[0..visible.count()]) |n, *slot| slot.* = try resolveCapture(b, n);
+    if (owner_label) |label| {
+        captured_names[visible.count()] = label;
+        captures[visible.count()] = owner_reg;
+    }
     // Bind the class name to its registered `.Class` value so a `C(args)` call
     // in scope constructs the local class. Kotlin: a local class shadows a
     // same-named top-level function; without the binding the call resolved the

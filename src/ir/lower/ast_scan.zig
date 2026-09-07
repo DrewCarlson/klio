@@ -95,23 +95,7 @@ fn collectIdents(e: *const Expr, out: *StringSet, member_out: ?*StringSet) Alloc
         // as referenced, the enclosing lambda skipped boxing it, and the
         // object captured a dead value copy.
         .ObjectExpr => |o| {
-            for (o.members) |*d| switch (d.*) {
-                .Function => |*f| {
-                    if (f.body) |fb| switch (fb) {
-                        .Block => |blk| {
-                            for (blk.stmts) |*st| try collectIdentsStmt(st, out, member_out);
-                        },
-                        .Expr => |ex| try collectIdents(&ex, out, member_out),
-                    };
-                },
-                .Property => |p| {
-                    if (p.init) |*pi| try collectIdents(pi, out, member_out);
-                },
-                else => {},
-            };
-            for (o.init_blocks) |*blk| {
-                for (blk.stmts) |*st| try collectIdentsStmt(st, out, member_out);
-            }
+            try classBodyIdents(o.members, o.init_blocks, out, member_out);
             for (o.supertype_args) |sa| if (sa) |sargs| {
                 for (sargs) |*sarg| try collectIdents(sarg, out, member_out);
             };
@@ -171,27 +155,49 @@ fn collectIdentsStmt(s: *const Stmt, out: *StringSet, member_out: ?*StringSet) A
             },
             // A nested local class's member / init-block bodies reference
             // captured outer locals exactly as an anonymous object's do.
-            .Class => |*c| {
-                for (c.members) |*m| switch (m.*) {
-                    .Function => |*f| {
-                        if (f.body) |fb| switch (fb) {
-                            .Block => |blk| {
-                                for (blk.stmts) |*st| try collectIdentsStmt(st, out, member_out);
-                            },
-                            .Expr => |ex| try collectIdents(&ex, out, member_out),
-                        };
-                    },
-                    .Property => |p| {
-                        if (p.init) |*pi| try collectIdents(pi, out, member_out);
-                    },
-                    else => {},
-                };
-                for (c.init_blocks) |*blk| {
-                    for (blk.stmts) |*st| try collectIdentsStmt(st, out, member_out);
-                }
-            },
+            .Class => |*c| try classBodyIdents(c.members, c.init_blocks, out, member_out),
+            .Object => |*o| try classBodyIdents(o.members, o.init_blocks, out, member_out),
             else => {},
         },
+    }
+}
+
+/// Every identifier referenced inside a class or object body: method
+/// bodies, property initializers / delegates / accessors, init blocks, and
+/// the bodies of the classes and objects nested inside it. A nested class
+/// reaches the enclosing function's locals through the same capture, so
+/// its references count against the same names.
+fn classBodyIdents(members: []const ast.Decl, init_blocks: []const ast.Block, out: *StringSet, member_out: ?*StringSet) Allocator.Error!void {
+    for (members) |*m| switch (m.*) {
+        .Function => |*f| {
+            if (f.body) |fb| switch (fb) {
+                .Block => |blk| {
+                    for (blk.stmts) |*st| try collectIdentsStmt(st, out, member_out);
+                },
+                .Expr => |ex| try collectIdents(&ex, out, member_out),
+            };
+        },
+        .Property => |p| {
+            if (p.init) |*pi| try collectIdents(pi, out, member_out);
+            if (p.delegate) |e| try collectIdents(e, out, member_out);
+            if (p.getter) |g| try accessorIdents(g, out, member_out);
+            if (p.setter) |st| try accessorIdents(st, out, member_out);
+        },
+        .Class => |*c| try classBodyIdents(c.members, c.init_blocks, out, member_out),
+        .Object => |*o| try classBodyIdents(o.members, o.init_blocks, out, member_out),
+        else => {},
+    };
+    for (init_blocks) |*blk| {
+        for (blk.stmts) |*st| try collectIdentsStmt(st, out, member_out);
+    }
+}
+
+fn accessorIdents(acc: *const ast.Accessor, out: *StringSet, member_out: ?*StringSet) Allocator.Error!void {
+    switch (acc.body) {
+        .Block => |blk| {
+            for (blk.stmts) |*st| try collectIdentsStmt(st, out, member_out);
+        },
+        .Expr => |ex| try collectIdents(&ex, out, member_out),
     }
 }
 
@@ -226,28 +232,48 @@ pub fn namesReferencedInLambdas(stmts: []const Stmt, out: *StringSet) Allocator.
                 // A LOCAL class's member bodies reference (and write)
                 // captured outer locals exactly as an anonymous object's
                 // do; a written capture must box, so its references count.
-                .Class => |*c| {
-                    for (c.members) |*m| switch (m.*) {
-                        .Function => |*f| {
-                            if (f.body) |fb| switch (fb) {
-                                .Block => |blk| {
-                                    for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
-                                },
-                                .Expr => |ex| try collectPathIdents(&ex, out),
-                            };
-                        },
-                        .Property => |p| {
-                            if (p.init) |*pi| try scanLambdaRefsExpr(pi, out);
-                        },
-                        else => {},
-                    };
-                    for (c.init_blocks) |*blk| {
-                        for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
-                    }
-                },
+                .Class => |*c| try classBodyPathIdents(c.members, c.init_blocks, out),
+                .Object => |*o| try classBodyPathIdents(o.members, o.init_blocks, out),
                 else => {},
             },
         }
+    }
+}
+
+/// The closure-side reference scan of a class or object body (see
+/// `classBodyIdents` for the walk): every body inside it runs as a
+/// closure over the enclosing function's locals.
+fn classBodyPathIdents(members: []const ast.Decl, init_blocks: []const ast.Block, out: *StringSet) Allocator.Error!void {
+    for (members) |*m| switch (m.*) {
+        .Function => |*f| {
+            if (f.body) |fb| switch (fb) {
+                .Block => |blk| {
+                    for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+                },
+                .Expr => |ex| try collectPathIdents(&ex, out),
+            };
+        },
+        .Property => |p| {
+            if (p.init) |*pi| try collectPathIdents(pi, out);
+            if (p.delegate) |e| try collectPathIdents(e, out);
+            if (p.getter) |g| try accessorPathIdents(g, out);
+            if (p.setter) |st| try accessorPathIdents(st, out);
+        },
+        .Class => |*c| try classBodyPathIdents(c.members, c.init_blocks, out),
+        .Object => |*o| try classBodyPathIdents(o.members, o.init_blocks, out),
+        else => {},
+    };
+    for (init_blocks) |*blk| {
+        for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+    }
+}
+
+fn accessorPathIdents(acc: *const ast.Accessor, out: *StringSet) Allocator.Error!void {
+    switch (acc.body) {
+        .Block => |blk| {
+            for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
+        },
+        .Expr => |ex| try collectPathIdents(&ex, out),
     }
 }
 
@@ -292,25 +318,7 @@ fn scanLambdaRefsExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
         // An anonymous object's member bodies reference (and write)
         // captured outer locals exactly as a lambda body does; a written
         // capture must box, so its references count here.
-        .ObjectExpr => |o| {
-            for (o.members) |*d| switch (d.*) {
-                .Function => |*f| {
-                    if (f.body) |fb| switch (fb) {
-                        .Block => |blk| {
-                            for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
-                        },
-                        .Expr => |ex| try collectPathIdents(&ex, out),
-                    };
-                },
-                .Property => |p| {
-                    if (p.init) |*pi| try scanLambdaRefsExpr(pi, out);
-                },
-                else => {},
-            };
-            for (o.init_blocks) |*blk| {
-                for (blk.stmts) |*st| try collectPathIdentsStmt(st, out);
-            }
-        },
+        .ObjectExpr => |o| try classBodyPathIdents(o.members, o.init_blocks, out),
         .Unary => |u| try scanLambdaRefsExpr(u.expr, out),
         .Postfix => |u| try scanLambdaRefsExpr(u.expr, out),
         .Spread => |u| try scanLambdaRefsExpr(u.expr, out),
@@ -475,23 +483,42 @@ fn assignedInLambdasStmt(s: *const Stmt, out: *StringSet) Allocator.Error!void {
             // is never boxed and the write lands on a transient capture
             // copy (a local `class Bumper { fun bump() { count++ } }`
             // silently dropped the increment).
-            .Class => |*c| {
-                for (c.members) |*m| switch (m.*) {
-                    .Function => |*f| {
-                        if (f.body) |fb| switch (fb) {
-                            .Block => |blk| try collectLambdaBodyAssigns(blk.stmts, out),
-                            .Expr => |ex| try collectAssignTargets(&ex, out),
-                        };
-                    },
-                    .Property => |p| {
-                        if (p.init) |*pi| try assignedInLambdasExpr(pi, out);
-                    },
-                    else => {},
-                };
-                for (c.init_blocks) |*blk| try collectLambdaBodyAssigns(blk.stmts, out);
-            },
+            .Class => |*c| try classBodyAssigns(c.members, c.init_blocks, out),
+            .Object => |*o| try classBodyAssigns(o.members, o.init_blocks, out),
             else => {},
         },
+    }
+}
+
+/// The assignment targets inside a class or object body (see
+/// `classBodyIdents` for the walk): a write anywhere inside it, including
+/// an inner class's method or a property accessor, lands on the enclosing
+/// function's variable.
+fn classBodyAssigns(members: []const ast.Decl, init_blocks: []const ast.Block, out: *StringSet) Allocator.Error!void {
+    for (members) |*m| switch (m.*) {
+        .Function => |*f| {
+            if (f.body) |fb| switch (fb) {
+                .Block => |blk| try collectLambdaBodyAssigns(blk.stmts, out),
+                .Expr => |ex| try collectAssignTargets(&ex, out),
+            };
+        },
+        .Property => |p| {
+            if (p.init) |*pi| try assignedInLambdasExpr(pi, out);
+            if (p.delegate) |e| try assignedInLambdasExpr(e, out);
+            if (p.getter) |g| try accessorAssigns(g, out);
+            if (p.setter) |st| try accessorAssigns(st, out);
+        },
+        .Class => |*c| try classBodyAssigns(c.members, c.init_blocks, out),
+        .Object => |*o| try classBodyAssigns(o.members, o.init_blocks, out),
+        else => {},
+    };
+    for (init_blocks) |*blk| try collectLambdaBodyAssigns(blk.stmts, out);
+}
+
+fn accessorAssigns(acc: *const ast.Accessor, out: *StringSet) Allocator.Error!void {
+    switch (acc.body) {
+        .Block => |blk| try collectLambdaBodyAssigns(blk.stmts, out),
+        .Expr => |ex| try collectAssignTargets(&ex, out),
     }
 }
 
@@ -514,21 +541,7 @@ fn assignedInLambdasExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
         // `object : Continuation<T> { override fun resumeWith(...) }`);
         // without this the local is never boxed and the write lands on a
         // transient capture copy.
-        .ObjectExpr => |o| {
-            for (o.members) |*d| switch (d.*) {
-                .Function => |*f| {
-                    if (f.body) |fb| switch (fb) {
-                        .Block => |blk| try collectLambdaBodyAssigns(blk.stmts, out),
-                        .Expr => |ex| try collectAssignTargets(&ex, out),
-                    };
-                },
-                .Property => |p| {
-                    if (p.init) |*pi| try assignedInLambdasExpr(pi, out);
-                },
-                else => {},
-            };
-            for (o.init_blocks) |*blk| try collectLambdaBodyAssigns(blk.stmts, out);
-        },
+        .ObjectExpr => |o| try classBodyAssigns(o.members, o.init_blocks, out),
         .Unary => |u| try assignedInLambdasExpr(u.expr, out),
         .Postfix => |u| try assignedInLambdasExpr(u.expr, out),
         .Spread => |u| try assignedInLambdasExpr(u.expr, out),

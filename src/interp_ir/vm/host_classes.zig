@@ -581,6 +581,19 @@ fn anonKey(allocator: Allocator, class_name: []const u8, member: []const u8) All
     return std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ class_name, member });
 }
 
+/// The captured scope of the local class being registered. A supertype
+/// naming a sibling local class resolves to the captured `.Class` value:
+/// that is the registration in scope at the declaration, where the by-name
+/// class table holds only the latest one.
+threadlocal var registering_captures: []const NameValue = &.{};
+
+fn capturedClass(name: []const u8) ?ObjRef(ClassDef) {
+    for (registering_captures) |nv| {
+        if (nv.value == .Class and std.mem.eql(u8, nv.name, name)) return nv.value.Class;
+    }
+    return null;
+}
+
 /// Synthesize a runtime `ClassDef` matching `build_module`'s shape for a
 /// local (function-body) class lowered at runtime.
 fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Class) Allocator.Error!ObjRef(ClassDef) {
@@ -650,7 +663,9 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
                 if (id.int() >= module.classes.items.len) break :static null;
                 break :static module.classes.items[id.int()].fqn;
             };
-            const super_def = if (resolved_fqn) |fqn|
+            const super_def = if (qualified == null and capturedClass(name) != null)
+                capturedClass(name)
+            else if (resolved_fqn) |fqn|
                 classes.get().get(fqn) orelse classes.get().get(name)
             else if (qualified) |path|
                 classes.get().get(path) orelse classByQualifiedSuffix(classes.get(), path)
@@ -941,6 +956,40 @@ fn lowerAndRegisterMethods(
             else => {},
         }
     }
+    // A primary-constructor default that is not a plain literal lowers as a
+    // `$default$<i>` thunk declaring the parameters before it, so a default
+    // that reads a captured local (`class Local(val t: String = x)`) or an
+    // earlier parameter evaluates in the class's captured scope at
+    // construction; a literal default stays inline (`simpleLiteral`).
+    for (class.primary_params, 0..) |*pp, pi| {
+        const dexpr: ast.Expr = pp.default orelse continue;
+        if (host_call_value.simpleLiteral(allocator, &dexpr) != null) continue;
+        const thunk_name: ast.Ident = .{
+            .name = try std.fmt.allocPrint(allocator, "$default${d}", .{pi}),
+            .span = pp.name.span,
+        };
+        var thunk = host_instances.synthThunk(thunk_name, .{ .Expr = dexpr }, null, false);
+        const tparams = try allocator.alloc(ast.Param, pi);
+        for (class.primary_params[0..pi], 0..) |*prev, k| {
+            tparams[k] = .{
+                .name = prev.name,
+                .ty = prev.ty,
+                .default = null,
+                .is_vararg = false,
+                .is_crossinline = false,
+                .is_noinline = false,
+                .annotations = &.{},
+                .span = prev.name.span,
+            };
+        }
+        thunk.params = tparams;
+        const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
+        const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, class.name.name, own_members);
+        const caps = try allocator.dupe(NameValue, capture_pairs);
+        const tbl = self.anon_methods.borrowMut();
+        defer tbl.deinit();
+        try tbl.get().put(try anonKey(allocator, class.name.name, thunk_name.name), .{ .module = sub_ref, .func = func.id, .captures = caps });
+    }
     // `init { … }` blocks lower as 0-arg thunks over `this`, registered under
     // `$init$block$<idx>` — the same shape the anonymous-object materializer
     // uses — so construction can run them (with the class's captured cells
@@ -1013,6 +1062,8 @@ fn registerNestedClasses(self: *VmHost, allocator: Allocator, class: *const ast.
 /// Register the classes and objects declared in the body of a runtime
 /// class (a local class, an anonymous object) under `owner`: each becomes
 /// a runtime class the body's members construct by bare name.
+pub const registerNestedClassMembers = registerNestedMembers;
+
 pub fn registerNestedMembers(self: *VmHost, allocator: Allocator, owner: []const u8, members: []const ast.Decl) Allocator.Error!void {
     for (members) |*m| {
         switch (m.*) {
@@ -1183,6 +1234,17 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
     // prop/const of that name and must stay a dynamic read/write.
     const prev_caps = ir.build.setLowerAnonCaptureNames(captured_names);
     defer _ = ir.build.setLowerAnonCaptureNames(prev_caps);
+    // A captured value that is a shared cell is a `var` the enclosing
+    // function boxed because a closure writes it; the member lowerings box
+    // it too, so a write inside a method (or a lambda nested in one) lands
+    // on the cell.
+    var boxed_names: std.ArrayList([]const u8) = .empty;
+    defer boxed_names.deinit(allocator);
+    for (captured_names, 0..) |n, i| {
+        if (i < captures.len and captures[i] == .Cell) try boxed_names.append(allocator, n);
+    }
+    const prev_boxed = ir.build.setLowerAnonBoxedNames(boxed_names.items);
+    defer _ = ir.build.setLowerAnonBoxedNames(prev_boxed);
     // The same names go into the capture SET the member lowerings consult
     // (an anonymous object installs it too): a lambda inside a method or a
     // parent-constructor argument then captures `o` through the method's
@@ -1193,6 +1255,10 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
     const prev_set = ir.lower.takeLowerAnonCaptures();
     ir.lower.setLowerAnonCaptures(cap_set);
     defer ir.lower.setLowerAnonCaptures(prev_set);
+    const capture_pairs = try buildCapturePairs(allocator, captured_names, captures);
+    const prev_registering = registering_captures;
+    registering_captures = capture_pairs;
+    defer registering_captures = prev_registering;
     switch (try registerClass(self, allocator, class)) {
         .ok => {},
         .err => |e| return .{ .err = e },
@@ -1227,23 +1293,65 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
                 for (cg.get().body_properties) |p| try own_members.put(p.name, {});
             }
             try collectOwnMembers(class, &own_members);
-            const capture_pairs = try buildCapturePairs(allocator, captured_names, captures);
             try lowerAndRegisterMethods(self, allocator, class, &own_members, capture_pairs);
             // Same reason as the uncaptured path: a class nested inside a
             // local class is otherwise never registered.
             try registerNestedClasses(self, allocator, class);
             try assignNestedOuters(self, allocator, class, tv);
             try patchCaptureEntries(self, allocator, class, capture_pairs);
+            try bindClassFamily(self, allocator, class, capture_pairs);
             return .ok;
         }
     }
     // No `this` instance captured: patch the just-registered method
     // entries with the captured outer-env so dispatch can layer them
     // under globals.
-    const capture_pairs = try buildCapturePairs(allocator, captured_names, captures);
-    if (capture_pairs.len == 0) return .ok;
-    try patchCaptureEntries(self, allocator, class, capture_pairs);
+    if (capture_pairs.len != 0) try patchCaptureEntries(self, allocator, class, capture_pairs);
+    try bindClassFamily(self, allocator, class, capture_pairs);
     return .ok;
+}
+
+/// Publish the registration's scope on every def of the class family (the
+/// class and the classes nested in it): the captured pairs, then each
+/// family member by name. Dispatch layers the list under globals, so a
+/// method's bare `C(...)` and an `outer.D()` construct this registration's
+/// defs, and an instance keeps reading the scope it was declared in.
+fn bindClassFamily(self: *VmHost, allocator: Allocator, class: *const ast.Class, capture_pairs: []const NameValue) Allocator.Error!void {
+    var list: std.ArrayList(InstanceData.Capture) = .empty;
+    for (capture_pairs) |nv| try list.append(allocator, .{ .name = nv.name, .value = nv.value });
+    var defs: std.ArrayList(ObjRef(ClassDef)) = .empty;
+    defer {
+        for (defs.items) |d| d.deinit();
+        defs.deinit(allocator);
+    }
+    try collectFamilyDefs(self, allocator, class, &list, &defs);
+    const shared = try list.toOwnedSlice(allocator);
+    const enclosing = try ir.eval.captureChainAlloc(allocator);
+    if (runtime.reclaimEnabled()) {
+        for (enclosing) |e| e.v.retain();
+    }
+    for (defs.items) |d| {
+        const g = d.borrowMut();
+        defer g.deinit();
+        g.get().local_captures = shared;
+        g.get().local_enclosing = enclosing;
+    }
+}
+
+fn collectFamilyDefs(
+    self: *VmHost,
+    allocator: Allocator,
+    class: *const ast.Class,
+    list: *std.ArrayList(InstanceData.Capture),
+    defs: *std.ArrayList(ObjRef(ClassDef)),
+) Allocator.Error!void {
+    const def = classDefByNameLocal(self, class.name.name) orelse return;
+    try list.append(allocator, .{ .name = class.name.name, .value = .{ .Class = def.clone() } });
+    try defs.append(allocator, def);
+    for (class.members) |*m| {
+        if (m.* != .Class or m.Class.is_companion) continue;
+        try collectFamilyDefs(self, allocator, &m.Class, list, defs);
+    }
 }
 
 /// Point every registry entry the class registered (methods, accessor and
@@ -1262,6 +1370,11 @@ fn patchCaptureEntries(self: *VmHost, allocator: Allocator, class: *const ast.Cl
                 const entry = tbl.get().getPtr(key) orelse break;
                 entry.captures = capture_pairs;
             }
+        }
+        for (class.primary_params, 0..) |_, pi| {
+            const nm = try std.fmt.allocPrint(allocator, "$default${d}", .{pi});
+            const key = try anonKey(allocator, class.name.name, nm);
+            if (tbl.get().getPtr(key)) |entry| entry.captures = capture_pairs;
         }
         for (class.members) |*m| {
             switch (m.*) {

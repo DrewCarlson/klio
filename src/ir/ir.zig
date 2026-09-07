@@ -596,6 +596,11 @@ pub const Inst = union(enum) {
         dst: Reg,
         receiver: Reg,
         qualifier: ConstId,
+        /// A miss writes Null instead of raising: a local class declaration
+        /// snapshots the enclosing member extension's dispatch receiver for
+        /// its `this@Owner` reads, and the snapshot must not fail a body
+        /// that never reads it.
+        soft: bool = false,
     },
     /// `::name` — produce a `KProperty`-shaped reference value
     /// carrying the property name. Reflection target.
@@ -2038,6 +2043,13 @@ pub const Module = struct {
     /// constructor argument's declared parameter type, instantiated by the
     /// written supertype arguments), consumed by the thunk lowering.
     pending_thunk_expected: ?ast.TypeRef = null,
+    /// A member extension property accessor's own receiver label (the
+    /// property name) and its dispatch owner, stashed by the declaration
+    /// lowering for the accessor builder: `this@<prop>` binds the
+    /// receiver, and a local class declared in the body captures
+    /// `this@<Owner>`. Not serialized.
+    pending_accessor_this_label: ?[]const u8 = null,
+    pending_accessor_dispatch_owner: ?[]const u8 = null,
     /// Lowering-only scratch: the callable arity mask of the owner class's
     /// members, for a synthesized parameter thunk that also gets an
     /// `own_members` set. A member name that is a PROPERTY and never a
@@ -2681,6 +2693,7 @@ pub const Module = struct {
             try self.funcs.append(a, func);
         }
     }
+
 
     /// The id the next appended func will take (first id past the lazy base
     /// range + already-appended funcs).

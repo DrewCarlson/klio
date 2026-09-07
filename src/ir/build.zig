@@ -416,6 +416,23 @@ pub fn anonCaptureBinds(name: []const u8) bool {
     return false;
 }
 
+/// The captured enclosing locals whose runtime value is a shared `Cell`
+/// (a `var` the enclosing function boxed because a closure writes it).
+/// The runtime registration knows the captured VALUES, so it tells the
+/// member lowerings which names are cells: a write inside a method, an
+/// init block, or a lambda nested in one lands on the cell.
+threadlocal var lower_anon_boxed_names: []const []const u8 = &.{};
+
+pub fn setLowerAnonBoxedNames(ns: []const []const u8) []const []const u8 {
+    const prev = lower_anon_boxed_names;
+    lower_anon_boxed_names = ns;
+    return prev;
+}
+
+pub fn anonBoxedCaptureNames() []const []const u8 {
+    return lower_anon_boxed_names;
+}
+
 /// Classifier identities carried into runtime anonymous-object lowering.
 threadlocal var lower_anon_scope_classes: []const ir.ScopeClassRef = &.{};
 
@@ -623,6 +640,11 @@ pub const FuncBuilder = struct {
     /// entry): the fn name for an extension declaration, the callee name
     /// for a receiver lambda. Null when the body owns no labeled receiver.
     own_this_label: ?[]const u8 = null,
+    /// The class whose member this body is when `owner_class` names the
+    /// EXTENSION receiver instead (a member extension property accessor
+    /// runs with the receiver as `this` and its declaring class as the
+    /// dispatch receiver). Null when `owner_class` is the dispatch owner.
+    dispatch_owner: ?[]const u8 = null,
     /// The LOCAL `fun` this builder is lowering the body of (or a lambda
     /// nested inside that body). A bare call to `self_local_fn.name` binds
     /// the fn ITSELF through its mangled cell — the shared plain-name slot
@@ -1771,6 +1793,14 @@ pub const FuncBuilder = struct {
     }
     pub fn setOwnThisLabel(self: *FuncBuilder, label: ?[]const u8) void {
         self.own_this_label = label;
+    }
+    pub fn setDispatchOwner(self: *FuncBuilder, owner: ?[]const u8) void {
+        self.dispatch_owner = owner;
+    }
+    /// The declaring class a `this@<Class>` inside this body names: the
+    /// dispatch owner of a member extension accessor, else the owner class.
+    pub fn dispatchClass(self: *const FuncBuilder) ?[]const u8 {
+        return self.dispatch_owner orelse self.ownerClass();
     }
     /// Append `entry` unless its head is already present; a duplicate head
     /// BACKFILLS a missing label so the labeled occurrence always survives

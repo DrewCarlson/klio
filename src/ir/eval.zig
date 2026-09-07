@@ -465,6 +465,14 @@ pub fn currentFrameParam(i: usize) ?Value {
     return fr.params.items[i];
 }
 
+/// The module the innermost frame's body is read against: a side module
+/// for an anonymous-object or local-class member (and the closures lowered
+/// inside one), else the main module.
+pub fn currentFrameModule() ?*const Module {
+    const fr = evtls.frame_chain orelse return null;
+    return fr.module;
+}
+
 pub fn currentFrameFunc() ?*const ir.Func {
     if (fused_depth > 0 and fused_marks[fused_depth - 1].head == evtls.frame_chain)
         return fused_marks[fused_depth - 1].func;
