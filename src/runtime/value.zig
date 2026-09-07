@@ -2860,7 +2860,7 @@ pub const Value = union(enum) {
                 matchesAny(name, &.{ "Map", "Any" }),
             .Pair => matchesAny(name, &.{ "Pair", "Any" }),
             .Triple => matchesAny(name, &.{ "Triple", "Any" }),
-            .MapEntry => matchesAny(name, &.{ "Entry", "MapEntry", "Map.Entry", "Any" }),
+            .MapEntry => matchesAny(name, &.{ "Entry", "MapEntry", "Map.Entry", "MutableEntry", "MutableMap.MutableEntry", "Any" }),
             .Result => matchesAny(name, &.{ "Result", "Any" }),
             .Sequence => matchesAny(name, &.{ "Sequence", "Any" }),
             .SeqIter => matchesAny(name, &.{ "Iterator", "Any" }),

@@ -47,6 +47,11 @@ const UnitResult = ir.eval.UnitResult;
 pub fn isConcreteCastTarget(self: *VmHost, name: []const u8) bool {
     const n = std.mem.trimEnd(u8, name, "?");
     if (n.len == 0) return false;
+    // A nested spelling (`MutableMap.MutableEntry`) is as concrete as its
+    // last segment.
+    if (std.mem.lastIndexOfScalar(u8, n, '.')) |dot| {
+        if (dot + 1 < n.len and isBuiltinTypeName(n[dot + 1 ..])) return true;
+    }
     // A user / pack class declaration.
     {
         const mg = self.module.borrow();
@@ -1432,6 +1437,7 @@ fn isBuiltinTypeName(name: []const u8) bool {
         "String",                        "CharSequence",                         "StringBuilder",
         // Comparison / common interfaces.
                           "Comparable",                   "Comparator",          "Pair",                       "Triple",
+        "Entry",                         "MutableEntry",
         // Collections + arrays (read-only and mutable).
                           "Array",
         "IntArray",                      "LongArray",                            "ShortArray",                      "ByteArray",                    "DoubleArray",         "FloatArray",                 "CharArray",                "BooleanArray",

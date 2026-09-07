@@ -1029,8 +1029,15 @@ fn collectDeclPkgs(allocator: Allocator, d: *const Decl, pkg: []const u8, out: *
 fn noteExtPropTypeHead(module: *Module, p: *const ast.Property) Allocator.Error!void {
     const recv = &(p.receiver_type orelse return);
     const ty = &(p.ty orelse return);
-    if (ty.function != null or ty.name.name.len == 0) return;
     if (recv.name.name.len == 0) return;
+    // A function-typed property records the `<function>` marker: no class
+    // answers a bare read's type from it, but the member-call route knows
+    // `recv.name(args)` invokes the property's value.
+    if (ty.function != null) {
+        try module.registry.ext_prop_type_heads.put(.{ .a = recv.name.name, .b = p.name.name }, "<function>");
+        return;
+    }
+    if (ty.name.name.len == 0) return;
     try module.registry.ext_prop_type_heads.put(
         .{ .a = recv.name.name, .b = p.name.name },
         ty.name.name,
