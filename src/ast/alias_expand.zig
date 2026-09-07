@@ -140,6 +140,16 @@ fn packageOf(a: Allocator, f: *const KotlinFile) Allocator.Error![]const u8 {
 }
 
 /// Expand every typealias reference in `files` in place.
+/// A package of the shipped stdlib or a library pack rather than the
+/// program being built.
+fn shippedPackage(pkg: []const u8) bool {
+    for ([_][]const u8{ "kotlin", "kotlinx", "androidx", "io.ktor", "org.jetbrains" }) |root| {
+        if (std.mem.eql(u8, pkg, root)) return true;
+        if (pkg.len > root.len and std.mem.startsWith(u8, pkg, root) and pkg[root.len] == '.') return true;
+    }
+    return false;
+}
+
 pub fn expandFiles(a: Allocator, files: []const KotlinFile) Allocator.Error!void {
     var any = false;
     for (files) |*f| {
@@ -159,6 +169,7 @@ pub fn expandFiles(a: Allocator, files: []const KotlinFile) Allocator.Error!void
         var collector = Walker{ .idx = &idx, .a = a, .mode = .collect, .file = 0, .pkg = "", .imports = &.{} };
         defer collector.deinit();
         for (files, 0..) |*f, i| {
+            if (shippedPackage(idx.file_pkgs[i])) continue;
             collector.file = i;
             collector.pkg = idx.file_pkgs[i];
             collector.imports = f.imports;
@@ -168,6 +179,11 @@ pub fn expandFiles(a: Allocator, files: []const KotlinFile) Allocator.Error!void
     var w = Walker{ .idx = &idx, .a = a, .mode = .rewrite, .file = 0, .pkg = "", .imports = &.{} };
     defer w.deinit();
     for (files, 0..) |*f, i| {
+        // The program's own files are rewritten; a shipped library keeps its
+        // source spelling (its aliases are still collected, so a program
+        // that uses them expands them), because a library's private
+        // extension on an aliased scalar resolves by the alias head today.
+        if (shippedPackage(idx.file_pkgs[i])) continue;
         w.file = i;
         w.pkg = idx.file_pkgs[i];
         w.imports = f.imports;

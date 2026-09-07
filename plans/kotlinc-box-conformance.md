@@ -104,6 +104,13 @@ residue list (every cluster under five) as the seed of the next campaign.
   (a stub-class instance, not a host list) reaches the stdlib `get`
   intrinsic through the instance route before the user extension; the
   arity gate (`memberDeclArityMisfit`) covers host receivers only.
+- typealias expansion on shipped sources (scope): the AST alias pass
+  rewrites the program's files only; expanding a library's aliases
+  (compose's `VirtualGroupHandle` = `GroupHandle` = `Long`) made a
+  file-private extension property on the aliased scalar, read bare inside
+  a spliced inline extension, miss (`isInsertHandle` on `LinkComposer`,
+  291 compose plugin tests). A library's aliases are still collected, so
+  a program using them expands them.
 - properties/fieldInsideField (1): an anonymous object's property with
   both an initializer and a `field`-reading getter stores the initializer
   under the plain name, not the raw backing slot.
