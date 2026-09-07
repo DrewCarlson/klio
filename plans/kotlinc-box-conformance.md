@@ -6,12 +6,20 @@ selected by directive, 980 excluded) run through `klio`, each asserting
 ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
 git history under this file's name.
 
-## State (2026-09-07, eb4d1fcc)
+## State (2026-09-07, a1f95fb5)
 
-Census 5751 passed / 609 failed / 11 did not complete. Ratchet
-`BASELINE = 5751`, `MAX_FAILED = 609` in `src/itests/box_support.zig`
-(pass floor and failure ceiling, no slack). The suite stands in
-`scripts/stack.sh` and in CI at shard weight 35.
+Census 5951 passed / 398 failed / 8 did not complete (994 excluded: the
+runner now also skips `DONT_TARGET_EXACT_BACKEND: JVM*` files). Ratchet
+`BASELINE = 5951`, `MAX_FAILED = 398` in `src/itests/box_support.zig`.
+Landed since 5751/609: function-type `is`/`as` by arity, companion and
+enum-entry `invoke`, inner constructor refs, bound extension and vararg
+refs, property references reading extension properties, callable-typed
+properties invoked by name, enclosing-companion reads from nested classes,
+`MutableMap.MutableEntry` checks, lateinit (27/27), enums (93/93, lazy
+initialization), super (38/38), localClasses (41/41), typealias (28/28,
+an alias expansion pass), value classes (38 → 12), Char arithmetic by
+name, mixed Char comparisons, collection type-check bridges,
+`Throwable(cause)`, `field` inside nested objects.
 
 ## How to work it
 
@@ -40,51 +48,34 @@ Census 5751 passed / 609 failed / 11 did not complete. Ratchet
   stdlib sweep does not cover the coroutines census or the pinned parity
   corpus, and both have caught lowering regressions the sweep passed.
 
-## Left: clusters of five or more (2026-09-07 census)
+## Left: clusters of five or more (2026-09-07 census, a1f95fb5)
 
 Fix each, or record a verdict here, until none remains; then write the
 residue list (every cluster under five) as the seed of the next campaign.
 
 | Cluster | Fails | Dominant shape |
 | --- | --- | --- |
-| callableReference/adaptedReferences | 18 | `invoke_callable_with_this` on a `KClass` value; `startCoroutine` on the receiver of a suspend reference |
-| inlineClasses | 18 (+2 crash) | field read on an anonymous object standing for a value class; member extension on a value class; secondary constructors of generic value classes crash |
-| typealias | 13 | explicit type arguments on an alias call reaching the constructor as values; alias targets from a class body; an alias of a companion as a value; aliases in anonymous object types and super calls; alias-typed extensions |
-| coroutines | 13 | exception expected from a suspend path not thrown; intrinsic semantics and feature intersection |
-| callableReference/function | 12 (+1 crash) | `invoke_callable_with_this` on a `KClass`; a reference cast to `Function1` fails; an extension in a SAM interface recurses |
-| super | 12 (+1 crash) | `super` call resolving to the subclass override (`test1 B.bar`); a `super<Interface>` chain crashes |
-| casts/functions | 11 | `Function0` unresolved as a global (function-type `is`/`as` checks) |
-| localClasses | 11 | `this@C` unbound inside a local class; captured locals read null |
-| extensionFunctions | 11 | one recursion (SAM interface extension), the rest single-file mismatches |
-| enum | 11 | entry initialization order against companion and static init (`Foo.FOO;Foo.B…` order); lazy entry init |
-| properties/lateinit | 10 | `isInitialized` from another class; uninitialized access must throw; a Unit value where the property was expected |
-| fir | 10 | member call on an anonymous object; `Unit` rendered into a string |
-| diagnostics/functions | 10 | constant `ONE` read on a `KClass`; two recursions; constructor arity through a reference |
-| delegatedProperty | 10 | file initialization failure on a top-level delegate; `provideDelegate` inference cases |
-| properties | 9 | accessor shapes (see the file names) |
-| binaryOp | 9 | operator convention edges |
-| specialBuiltins | 8 | JVM builtin stubs (`extendJavaClasses`) |
-| objects/companionObjectAccess | 8 | companion members through the class value |
-| extensionProperties | 8 | extension property accessors |
-| callableReference | 8 | property, bound, equality subgroups (6, 5, 5) |
-| secondaryConstructors | 7 | delegation chains |
-| inline | 7 | inline function edges |
-| evaluate | 7 | unsigned constant operations (`plus1` unresolved), `kCallableName` |
-| collectionLiterals | 7 | array literals in annotations |
-| classes | 7 | class body shapes |
-| casts/mutableCollections | 7 | `as MutableList` checks on read-only collections |
+| contextParameters | 23 | verdict recorded below |
+| callableReference/adaptedReferences | 15 | context-parameter refs (5), suspend conversion of extension/context refs as supertypes (6: `startCoroutine` on the receiver), vararg/default adaptation (4) |
+| coroutines | 13 (+10 in subdirs) | intrinsic semantics (`startCoroutineUninterceptedOrReturn`, `intercepted`), suspend function types as supertypes, `handleResult` try/finally shapes |
+| extensionFunctions | 10 (+1 crash) | anonymous extension function values, extension in a value class, local extension in a SAM, `last` set on a builtin list |
+| fir | 9 | overloads differing only in type-parameter bounds (3), context-sensitive resolution of enum entries (2), anonymous/local override with defaults (3) |
+| delegatedProperty | 8 | `getValue`/`setValue` as member extensions of the enclosing class, delegate to a singleton/null, `Delegates.notNull` |
+| secondaryConstructors | 7 | field initializer order with secondary constructors, local subclass delegation, varargs |
+| inline | 7 | local inline extension functions inside lambdas, references to local functions |
+| evaluate | 7 (+4) | const evaluation of unsigned named operations (`plus1`), `kCallableName`, char ops, enum name in init |
+| collectionLiterals | 7 | the `[a, b]` collection literal syntax with the `of` operator convention (not parsed yet) |
+| casts | 7 | `Unit as Any`, definitely-not-null casts, generic `as` failures |
+| properties | 6 | eager initialization, private constructor properties, generic names |
 | operatorConventions | 6 | convention resolution edges |
-| increment | 6 | `++`/`--` on properties and indexed receivers |
+| objects | 6 | companion access from an anonymous object in a nested class, object init order |
+| inlineClasses/inlineClassCollection | 6 | anonymous object implementing `List<VC>` reading the value class's field |
 | functions/localFunctions | 6 | local function capture |
-| defaultArguments | 6 | default parameter evaluation |
-| controlStructures/breakContinueInExpressions | 6 | `break`/`continue` inside expressions |
-| closures | 6 | capture shapes |
-| builtinStubMethods/extendJavaClasses | 6 | JVM stub methods |
-| arrays | 6 | multi-index `get`/`set` (`collectionGetMultiIndex`) |
-| strings, intrinsics, finally | 5 each | single-file mismatches |
-
-The `functions/nothisnoclosure.kt` crash is an RSS-cap abort (6.4 GB); it
-is a memory blow-up, not a semantic miss.
+| controlStructures | 6 (+6 breakContinueInExpressions) | `break`/`continue` inside inlined lambdas and loop conditions, `finally` ordering |
+| callableReference/function | 6 | local extension refs by receiver type, `overloadedFunVsVal`, companion member refs |
+| defaultArguments | 5 (+8 in subdirs) | defaults on convention operators (`set`), fake overrides with defaults, 32-argument masks |
+| callableReference/equality | 5 | adapted references must not be equal to each other |
+| strings, intrinsics, increment, finally, arrays | 5 each | single-file mismatches; arrays: two-index `get`/`set` on an `ArrayList` instance and non-local return from an array constructor lambda |
 
 ## Verdicts recorded (closed; reopen only with a new mechanism)
 
@@ -109,3 +100,10 @@ is a memory blow-up, not a semantic miss.
 - typeErasure (3): a local declared `Any?` reaches the reified binder as
   `Any` (its nullability record is not visible at the unification site);
   two context-parameter shapes.
+- arrays two-index operators (2): `s[1, -1]` on an `ArrayList` INSTANCE
+  (a stub-class instance, not a host list) reaches the stdlib `get`
+  intrinsic through the instance route before the user extension; the
+  arity gate (`memberDeclArityMisfit`) covers host receivers only.
+- properties/fieldInsideField (1): an anonymous object's property with
+  both an initializer and a `field`-reading getter stores the initializer
+  under the plain name, not the raw backing slot.

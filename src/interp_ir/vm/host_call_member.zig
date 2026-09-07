@@ -11020,6 +11020,36 @@ fn builtinBridgeDefault(self: *VmHost, receiver: *const Value, f: *const Func, a
     const skip: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
     if (f.params.len != skip + 1) return null;
     const pty = &f.params[skip].ty;
+    // Only a CONCRETE narrower parameter type has a bridge: a type
+    // parameter of the class or the method (`contains(element: T)`,
+    // `ConcurrentSet<Key : Any>.contains(element: Key)`) takes every
+    // argument; `Any` excludes only null.
+    var head = std.mem.trimEnd(u8, pty.name, "?");
+    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (head.len == 0 or head[0] == '#' or ir.parseClassTypeParamIdentity(head) != null) return null;
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const mod = mg.get();
+        if (mod.registry.func_type_params.get(f.id)) |tps| {
+            for (tps.items) |tp| if (std.mem.eql(u8, tp, head)) return null;
+        }
+        const cls_fqn = blk: {
+            const g = receiver.Instance.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            break :blk if (cg.get().fqn.len != 0) cg.get().fqn else cg.get().name;
+        };
+        var cur: ?ir.ClassId = mod.classIdByFqn(cls_fqn) orelse mod.classId(cls_fqn);
+        var depth: usize = 0;
+        while (cur) |cid| : (depth += 1) {
+            if (depth > 32 or cid.int() >= mod.classes.items.len) break;
+            const c = &mod.classes.items[cid.int()];
+            for (c.type_params) |tp| if (std.mem.eql(u8, tp, head)) return null;
+            cur = if (c.supertypes.len != 0) c.supertypes[0] else null;
+        }
+    }
     const misfit = if (args[0] == .Null) !pty.nullable else argDefinitelyNotParamType(self, pty, &args[0]);
     if (!misfit) return null;
     if (on_map and (std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "remove"))) return .Null;
