@@ -1204,6 +1204,14 @@ fn lowerAssign(
     // Restricted to lambda values: only they consume the receiver context,
     // and the Member arm's receiver-type derivation is too costly to run
     // on every member assignment in a re-lowering pack.
+    if (indexNeedsCaching(target)) {
+        // `getArray()[getIndex()] += v` evaluates the receiver and every
+        // index once, before the value, for the read and the write.
+        try b.pushScope();
+        defer b.popScope() catch {};
+        const cached = try cacheIndexTarget(b, &target.Index);
+        return lowerAssign(b, &cached, op, value);
+    }
     const value_is_lambda = value.* == .Lambda or value.* == .AnonFun;
     const assign_expected: ?ast.TypeRef = if (op != .Assign or !value_is_lambda) null else switch (target.*) {
         .Path => |pth| blk: {
@@ -1505,6 +1513,47 @@ fn emitDelegateSetValue(b: *FuncBuilder, dname: []const u8, prop: []const u8, va
 // Path name (local / cell / capture / member / global), a Member field,
 // or an Index `set` call. Shared by compound-assign, prefix ++/--, and
 // postfix ++/-- so the write-back decision lives in exactly one place.
+fn exprMayHaveSideEffects(e: *const Expr) bool {
+    return switch (e.*) {
+        .Path, .This, .Super, .IntLit, .FloatLit, .BoolLit, .NullLit, .CharLit => false,
+        else => true,
+    };
+}
+
+/// An `recv[args]` target whose receiver or an index is an expression
+/// that must be evaluated exactly once for a read-modify-write.
+pub fn indexNeedsCaching(e: *const Expr) bool {
+    if (e.* != .Index) return false;
+    const ix = e.Index;
+    if (exprMayHaveSideEffects(ix.receiver)) return true;
+    for (ix.args) |*a| if (exprMayHaveSideEffects(a)) return true;
+    return false;
+}
+
+fn cachedPath(b: *FuncBuilder, name: []const u8, sp: @FieldType(ast.Ident, "span")) Allocator.Error!Expr {
+    const segs = try b.allocator.alloc(ast.Ident, 1);
+    segs[0] = .{ .name = name, .span = sp };
+    return .{ .Path = .{ .segments = segs, .span = sp } };
+}
+
+/// Evaluate an index target's receiver and indices into registers bound
+/// under scoped names (the caller owns the scope) and return the same
+/// target rewritten to read those locals.
+pub fn cacheIndexTarget(b: *FuncBuilder, ix: *const @FieldType(ast.Expr, "Index")) Allocator.Error!Expr {
+    const recv_reg = try lowerExpr(b, ix.receiver);
+    try b.bind("$lv$recv", recv_reg);
+    const recv = try b.allocator.create(Expr);
+    recv.* = try cachedPath(b, "$lv$recv", ix.span);
+    const args = try b.allocator.alloc(Expr, ix.args.len);
+    for (ix.args, 0..) |*a, i| {
+        const reg = try lowerExpr(b, a);
+        const name = try std.fmt.allocPrint(b.allocator, "$lv$arg{d}", .{i});
+        try b.bind(name, reg);
+        args[i] = try cachedPath(b, name, ix.span);
+    }
+    return .{ .Index = .{ .receiver = recv, .args = args, .span = ix.span } };
+}
+
 /// Store `value` into member `m` of an ALREADY EVALUATED receiver: the
 /// register is bound under a scoped name so the member store lowers a
 /// plain local read instead of re-evaluating the receiver expression.
